@@ -4668,10 +4668,17 @@ export function renderTextBody(
       }
     }
     const baselineOffset = useResolvedFontMetrics && resolvedFontHeight > 0
-      ? Math.max(
-          maxAscent,
-          resolvedFontAscent + Math.max(0, lineHeight - resolvedFontHeight) / 2,
-        )
+      ? anchor === 't' && maxAscent > 0
+        // PowerPoint's spAutoFit recalculation seats the visible ink at the
+        // top inset for a top-anchored body. fontBoundingBoxAscent includes
+        // leading above that ink; using it here leaves the exact downward gap
+        // spAutoFit is meant to remove. Keep the font box for line advance and
+        // required height, but use the actual glyph ascent for this origin.
+        ? maxAscent
+        : Math.max(
+            maxAscent,
+            resolvedFontAscent + Math.max(0, lineHeight - resolvedFontHeight) / 2,
+          )
       : Math.max(lineHeight * 0.8, maxAscent);
     const baseline = cursorY + baselineOffset;
 
