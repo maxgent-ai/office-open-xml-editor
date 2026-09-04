@@ -5,7 +5,13 @@ import type { Paragraph, TextBody } from './types.js';
 
 const SCALE = 1 / 12700; // 1 point => 1 canvas unit
 
-function recordingContext(ascent: number, descent: number, exposeFontMetrics = true) {
+function recordingContext(
+  actualAscent: number,
+  actualDescent: number,
+  exposeFontMetrics = true,
+  fontAscent = actualAscent,
+  fontDescent = actualDescent,
+) {
   const draws: Array<{ text: string; y: number }> = [];
   let font = '';
   let fillStyle = '';
@@ -19,10 +25,10 @@ function recordingContext(ascent: number, descent: number, exposeFontMetrics = t
     set direction(value: CanvasDirection) { direction = value; },
     measureText: (text: string) => ({
       width: [...text].length * 20,
-      actualBoundingBoxAscent: ascent,
-      actualBoundingBoxDescent: descent,
+      actualBoundingBoxAscent: actualAscent,
+      actualBoundingBoxDescent: actualDescent,
       ...(exposeFontMetrics
-        ? { fontBoundingBoxAscent: ascent, fontBoundingBoxDescent: descent }
+        ? { fontBoundingBoxAscent: fontAscent, fontBoundingBoxDescent: fontDescent }
         : {}),
     }),
     fillText: (text: string, _x: number, y: number) => draws.push({ text, y }),
@@ -105,9 +111,17 @@ describe('pptx spAutoFit top anchoring', () => {
     // The resolved browser font can have a shorter font box than Meiryo's
     // 1.596em saved-design line. spAutoFit must recalculate from those live
     // metrics instead of reusing the document font's stale design-height floor.
-    const ascent = fontSize * 0.98;
-    const descent = fontSize * 0.37;
-    const { ctx, draws } = recordingContext(ascent, descent);
+    const actualAscent = fontSize * 0.78;
+    const actualDescent = fontSize * 0.18;
+    const fontAscent = fontSize * 0.98;
+    const fontDescent = fontSize * 0.37;
+    const { ctx, draws } = recordingContext(
+      actualAscent,
+      actualDescent,
+      true,
+      fontAscent,
+      fontDescent,
+    );
     renderTextBody(
       ctx,
       body(latin as string, eastAsian as string, fontSize as number),
@@ -119,7 +133,10 @@ describe('pptx spAutoFit top anchoring', () => {
     );
 
     expect(draws).toHaveLength(1);
-    expect(draws[0]!.y).toBeCloseTo(ascent, 5);
+    // PowerPoint PDF output places the visible glyph top at the top inset.
+    // Canvas therefore needs the actual glyph ascent for the first baseline,
+    // not the larger font-box ascent that includes leading above the ink.
+    expect(draws[0]!.y).toBeCloseTo(actualAscent, 5);
 
     const neededHeight = renderTextBody(
       ctx,
@@ -139,7 +156,39 @@ describe('pptx spAutoFit top anchoring', () => {
       undefined,
       true,
     );
-    expect(neededHeight).toBeCloseTo(ascent + descent, 5);
+    expect(neededHeight).toBeCloseTo(fontAscent + fontDescent, 5);
+  });
+
+  it.each(['ctr', 'b'] as const)(
+    'keeps the font-box baseline for explicitly %s-anchored spAutoFit text',
+    (verticalAnchor) => {
+      const fontSize = 32;
+      const actualAscent = fontSize * 0.78;
+      const fontAscent = fontSize * 0.98;
+      const fontDescent = fontSize * 0.37;
+      const { ctx, draws } = recordingContext(
+        actualAscent,
+        fontSize * 0.18,
+        true,
+        fontAscent,
+        fontDescent,
+      );
+      const textBody = { ...body('Meiryo', 'Meiryo', fontSize), verticalAnchor };
+      renderTextBody(ctx, textBody, 0, 0, 400, fontAscent + fontDescent, SCALE);
+
+      expect(draws[0]!.y).toBeCloseTo(fontAscent, 5);
+    },
+  );
+
+  it('falls back to the font-box baseline when Canvas exposes no glyph ascent', () => {
+    const fontSize = 32;
+    const fontAscent = fontSize * 0.98;
+    const fontDescent = fontSize * 0.37;
+    const { ctx, draws } = recordingContext(0, 0, true, fontAscent, fontDescent);
+
+    renderTextBody(ctx, body('Meiryo', 'Meiryo', fontSize), 0, 0, 400, 46, SCALE);
+
+    expect(draws[0]!.y).toBeCloseTo(fontAscent, 5);
   });
 
   it('falls back to the authored font design box when Canvas has no font metrics', () => {
