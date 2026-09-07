@@ -4,7 +4,6 @@ import {
   preloadGoogleFonts,
   releaseOwnedBitmap,
   unloadGoogleFonts,
-  unloadLocalFontMetrics,
   unregisterEmbeddedFonts,
   WorkerBridge,
   defaultDpr,
@@ -45,7 +44,7 @@ import { createLayoutServices } from './layout-runtime.js';
 import { buildBookmarkPageMap } from './bookmark-nav';
 import { DOCX_GOOGLE_FONTS, docxFontPreloadNames } from './google-fonts';
 import { loadEmbeddedFonts } from './embedded-fonts';
-import { loadDocxLocalFontMetrics } from './local-font-metrics';
+import { docxResolvedFontMetricCandidates } from './document-content.js';
 import {
   attachDocumentLayoutRuntime,
   documentLayoutRuntimeOf,
@@ -183,10 +182,12 @@ export interface LoadOptions extends CoreLoadOptions {
    */
   progressiveLayout?: boolean;
   /**
-   * Called once the full layout has replaced the provisional one, or with the
-   * failure if background layout threw. Only fires when
-   * {@link progressiveLayout} actually deferred work. Observer failures are
-   * reported and isolated from the layout result.
+   * Called exactly once when a successful {@link progressiveLayout} load has
+   * reached its authoritative full layout, whether that happens before or
+   * after `load()` resolves. A failure after an early publication is delivered
+   * as the argument; a failure before the first publication rejects `load()`
+   * directly and does not call this observer. Observer failures are reported
+   * and isolated from the layout result.
    */
   onLayoutComplete?: (error?: unknown) => void;
   /**
@@ -380,8 +381,6 @@ export class DocxDocument {
    *  shared FontFaceSet for the lifetime of the SPA (deduped + refcounted in core,
    *  so a web font shared with another open document survives until both go). */
   private _googleFontFaces: FontFace[] = [];
-  /** Exact local faces used for version-adaptive Office line metrics. */
-  private _localMetricFontFaces: FontFace[] = [];
   /** One stable closure per instance: core's path-keyed SVG cache namespaces on
    *  this identity, so two open documents never swap a shared zip path (e.g.
    *  word/media/image1.svg). Reusing one reference also lets the SVG cache hit
@@ -559,17 +558,15 @@ export class DocxDocument {
       // the worker's zip-entry extraction) before the lazy first pagination, so
       // text measures/draws with the authored typeface. Worker mode does this
       // inside the worker (before it paginates); here it runs on the main thread.
+      let embeddedMetrics: Awaited<ReturnType<typeof loadEmbeddedFonts>>['metrics'] | undefined;
       if (doc._mode === 'main' && doc._document?.embeddedFonts?.length) {
         const loadingDocument = doc;
-        doc._embeddedFontFaces = await loadEmbeddedFonts(
+        const loadedEmbedded = await loadEmbeddedFonts(
           doc._document,
           (p) => loadingDocument.getFontBytes(p),
         );
-      }
-      let localMetrics: Awaited<ReturnType<typeof loadDocxLocalFontMetrics>> | undefined;
-      if (doc._mode === 'main' && doc._document) {
-        localMetrics = await loadDocxLocalFontMetrics(doc._document);
-        doc._localMetricFontFaces = localMetrics.faces;
+        doc._embeddedFontFaces = loadedEmbedded.faces;
+        embeddedMetrics = loadedEmbedded.metrics;
       }
       // Equations are converted + rasterized before pagination (which reads their
       // extents synchronously). Requires the opt-in `math` engine; without it,
@@ -583,7 +580,12 @@ export class DocxDocument {
         const layoutDocument = doc;
         const runtime = documentLayoutRuntimeOf(doc);
         runtime.services = createLayoutServices(doc._source, {
-          localMetrics: localMetrics?.metrics,
+          fontMetrics: embeddedMetrics,
+          measureResolvedFontMetrics: true,
+          resolvedFontMetricCandidates: docxResolvedFontMetricCandidates(
+            doc._document,
+            doc._source.fontFamilyCharsets,
+          ),
           useGoogleFonts: !!opts.useGoogleFonts,
           embeddedFaces: doc._embeddedFontFaces,
           googleFaces: doc._googleFontFaces,
@@ -703,11 +705,12 @@ export class DocxDocument {
               exact: true,
               complete: true,
             });
-            if (publishedLayout !== null) {
-              progressiveDocument._layoutObservers.notify(
-                'onLayoutComplete', opts.onLayoutComplete,
-              );
-            }
+            // The terminal success callback fires exactly once per load,
+            // whether or not any partial was published — consumers must not
+            // have to infer completion from document speed.
+            progressiveDocument._layoutObservers.notify(
+              'onLayoutComplete', opts.onLayoutComplete,
+            );
             // Nothing was published: there was nothing to show early, so
             // load() resolves here, on the layout that would have been built
             // anyway. Resolving an already-resolved deferred is a no-op.
@@ -965,9 +968,10 @@ export class DocxDocument {
     // A load whose worker published nothing resolves here instead — there was
     // never anything to show early, so `load()` waited for the real document.
     progressive.firstPublication.resolve();
-    if (progressive.published) {
-      this._layoutObservers.notify('onLayoutComplete', progressive.onComplete);
-    }
+    // The terminal success callback fires exactly once per load, published
+    // partials or not; `settled` above keeps the failure path from ever
+    // adding a second notification.
+    this._layoutObservers.notify('onLayoutComplete', progressive.onComplete);
   }
 
   /** Bookmark pages and the review anchor projections are derived from the
@@ -1215,10 +1219,6 @@ export class DocxDocument {
       unloadGoogleFonts(this._googleFontFaces);
       this._googleFontFaces = [];
     }
-    if (this._localMetricFontFaces.length > 0) {
-      unloadLocalFontMetrics(this._localMetricFontFaces);
-      this._localMetricFontFaces = [];
-    }
     // Release both image owners keyed by this document's stable loader: the
     // shared decoded owner (base + derived colour surfaces) and the SVG lookup
     // owner. SVG object URLs are revoked immediately after decode; dropping its
@@ -1281,12 +1281,15 @@ export class DocxDocument {
   }
 
   /**
-   * Project the document to GitHub-flavoured markdown: headings (from
+   * Produce a best-effort, text-focused GitHub-flavoured markdown projection:
+   * headings (from
    * `<w:outlineLvl>`), bullet / numbered lists, tables (with vMerge
    * continuation), and rich-text formatting (bold / italic / strikethrough /
-   * hyperlink), with footnotes / endnotes / comments collated at the end.
+   * hyperlink), with footnotes / endnotes collated at the end and review
+   * comments kept in a final quoted appendix.
    * Positioning, section properties, fonts, and drawing shapes are discarded —
-   * the projection is meant for AI ingestion and full-text search, not layout.
+   * the projection is meant for AI ingestion and full-text search, not an
+   * authoritative semantic or reading-order representation.
    *
    * Runs entirely in the worker off the archive opened at {@link load} (no
    * re-copy of the file, no re-parse of the model on the main thread), so it

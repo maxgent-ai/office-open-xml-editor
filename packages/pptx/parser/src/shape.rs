@@ -1077,6 +1077,7 @@ pub(crate) fn parse_shape(
         inherited_reflection,
         inherited_anchor,
         inherited_text_insets,
+        inherited_auto_fit,
         inherited_alignment,
         inherited_ea_ln_brk,
         inherited_space_before,
@@ -1092,15 +1093,16 @@ pub(crate) fn parse_shape(
             lph.lookup_reflection(&ph_type),
             lph.lookup_anchor(&ph_type, ph_idx),
             lph.lookup_text_insets(&ph_type, ph_idx),
+            lph.lookup_auto_fit(&ph_type, ph_idx),
             lph.lookup_alignment(&ph_type, ph_idx),
             lph.lookup_ea_ln_brk(&ph_type),
-            lph.lookup_space_before(&ph_type),
-            lph.lookup_space_after(&ph_type),
+            lph.lookup_space_before(&ph_type, ph_idx),
+            lph.lookup_space_after(&ph_type, ph_idx),
             lph.lookup_line_spacing(&ph_type, ph_idx),
         )
     } else {
         (
-            None, None, None, None, None, None, None, None, None, None, None, None, None,
+            None, None, None, None, None, None, None, None, None, None, None, None, None, None,
         )
     };
     let inherited_level_font_sizes: LevelFontSizes = if ph_node.is_some() {
@@ -1136,6 +1138,15 @@ pub(crate) fn parse_shape(
     } else {
         empty_level_bullets()
     };
+    let inherited_level_colors = if ph_node.is_some()
+        && style_node
+            .and_then(|style| child(style, "fontRef"))
+            .is_none()
+    {
+        lph.lookup_level_colors(&ph_type, ph_idx)
+    } else {
+        std::array::from_fn(|_| None)
+    };
     let text_body = child(sp_node, "txBody").map(|n| {
         parse_text_body(
             n,
@@ -1145,6 +1156,7 @@ pub(crate) fn parse_shape(
             inherited_font_size,
             inherited_font_family,
             inherited_level_font_sizes,
+            inherited_level_colors,
             inherited_level_indents,
             &inherited_level_bullets,
             inherited_bold,
@@ -1153,6 +1165,7 @@ pub(crate) fn parse_shape(
             inherited_reflection.clone(),
             inherited_anchor,
             inherited_text_insets,
+            inherited_auto_fit,
             inherited_alignment,
             inherited_ea_ln_brk,
             inherited_space_before,
@@ -2207,6 +2220,7 @@ pub(crate) fn parse_table_cell(
             None,
             None,
             [None; 9],
+            std::array::from_fn(|_| None),
             Default::default(), // inherited_level_indents
             &empty_level_bullets(),
             None,
@@ -2215,12 +2229,13 @@ pub(crate) fn parse_table_cell(
             None, // inherited_reflection
             anchor,
             text_insets,
+            None, // inherited_auto_fit
             None, // inherited_alignment
             None, // inherited_ea_ln_brk
             None, // inherited_space_before
             None, // inherited_space_after
             None, // inherited_line_spacing
-            ShapeKind::Sp,
+            ShapeKind::TableCell,
             zip,
         );
         // Table-cell text direction is authored on tcPr rather than txBody's
@@ -3469,6 +3484,54 @@ mod style_ref_tests {
     }
 
     #[test]
+    fn slide_font_ref_replaces_placeholder_list_level_color() {
+        let theme = PptxTheme::default();
+        let mut placeholders = LayoutPlaceholders::default();
+        placeholders.by_idx_level_colors.insert(
+            7,
+            std::array::from_fn(|level| {
+                if level == 1 {
+                    Some("68217A".to_owned())
+                } else {
+                    None
+                }
+            }),
+        );
+        let doc = roxmltree::Document::parse(
+            r#"<p:sp xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+              <p:nvSpPr><p:cNvPr id="1" name="Placeholder"/><p:cNvSpPr/><p:nvPr><p:ph type="body" idx="7"/></p:nvPr></p:nvSpPr>
+              <p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="100000" cy="100000"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></p:spPr>
+              <p:style><a:fontRef idx="minor"><a:srgbClr val="FFFFFF"/></a:fontRef></p:style>
+              <p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:pPr lvl="1"/><a:r><a:t>Styled text</a:t></a:r></a:p></p:txBody>
+            </p:sp>"#,
+        )
+        .unwrap();
+        let mut zip = empty_zip();
+
+        let shape = parse_shape(
+            doc.root_element(),
+            &placeholders,
+            &theme,
+            &HashMap::new(),
+            "ppt/slides",
+            None,
+            &mut zip,
+        )
+        .expect("shape");
+
+        assert_eq!(shape.default_text_color.as_deref(), Some("FFFFFF"));
+        assert_eq!(
+            shape
+                .text_body
+                .as_ref()
+                .and_then(|body| body.paragraphs.first())
+                .and_then(|paragraph| paragraph.def_color.as_deref()),
+            None,
+            "an explicit slide fontRef must remain authoritative over placeholder list styles"
+        );
+    }
+
+    #[test]
     fn table_cell_projects_tcpr_vertical_text_and_margins_into_the_text_body() {
         let doc = roxmltree::Document::parse(
             r#"<a:tc xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
@@ -3492,6 +3555,32 @@ mod style_ref_tests {
             (body.l_ins, body.t_ins, body.r_ins, body.b_ins),
             (100, 200, 300, 400)
         );
+    }
+
+    #[test]
+    fn table_cell_does_not_inherit_shape_object_default_insets() {
+        let doc = roxmltree::Document::parse(
+            r#"<a:tc xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+              <a:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:t>Cell</a:t></a:r></a:p></a:txBody>
+              <a:tcPr/>
+            </a:tc>"#,
+        )
+        .unwrap();
+        let theme = HashMap::from([
+            ("+spDef-bodyPr-tIns".to_owned(), "146304".to_owned()),
+            ("+spDef-bodyPr-bIns".to_owned(), "146304".to_owned()),
+        ]);
+        let mut zip = empty_zip();
+        let cell = parse_table_cell(
+            doc.root_element(),
+            &theme,
+            &HashMap::new(),
+            "ppt/slides",
+            &mut zip,
+        );
+        let body = cell.text_body.expect("table cell text body");
+
+        assert_eq!((body.t_ins, body.b_ins), (45_720, 45_720));
     }
 
     #[test]

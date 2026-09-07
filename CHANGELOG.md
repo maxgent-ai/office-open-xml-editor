@@ -7,6 +7,61 @@ the corresponding minor release.
 
 ## Unreleased
 
+## 0.86.1 — 2026-09-06
+
+Compatible patch release improving older PowerPoint compatibility, curved-text
+layout, Word pagination fidelity, and rendering resource bounds.
+
+- **older PowerPoint fidelity:** legacy reflected text, preset shapes, diagram
+  fallbacks, table fills and borders, authored row heights, and inherited text
+  colors now follow the saved presentation more closely.
+- **curved PowerPoint text:** Follow Path WordArt uses concentric per-line paths,
+  keeps authored Latin hyphens as valid wrap points in ordinary text, and avoids
+  overlap or excessive rotation in no-wrap curved text.
+- **resilient presentation loading:** primary slides use a measured complexity
+  allowance for dense but valid content while dependency parts retain their
+  stricter limit, and file opening uses the same modern loading indicator as the
+  rest of the viewer.
+- **resolved Word font metrics:** CJK line allocation is derived from the font
+  resource actually selected by the browser or embedded in the document. This
+  removes the previous Meiryo-only resource override without guessing a
+  substitute when the authored font is unavailable.
+- **Word page fields:** complex fields whose markers share a run preserve their
+  authored order, so page-dependent footer values such as page numbers remain
+  visible after pagination.
+- **bounded rendering work:** crafted EMF path brackets, hyphen-rich curved text,
+  and empty WordArt lines can no longer multiply Canvas work beyond the
+  renderer's established resource envelope.
+- **compatibility:** no existing option or method is removed or renamed, and no
+  application changes are required.
+
+## 0.86.0 — 2026-09-05
+
+Compatible minor release improving PowerPoint text fidelity, Markdown review
+workflows, and resilience when opening varied Excel files. A small delimited-text
+preview convenience is included for applications that already use the sheet
+viewer.
+
+- **PowerPoint text fidelity:** explicit percentage line spacing and tall
+  fallback-font metrics now keep top-anchored, auto-fit text closer to
+  PowerPoint, while multiline and mixed CJK/Latin text retain more natural
+  spacing and wrapping.
+- **Markdown review workflows:** DOCX, XLSX and PPTX exports collect review
+  comments and replies in a final quoted appendix, separate from document text;
+  PowerPoint speaker notes remain with their slide.
+- **safer Markdown projection:** DOCX and PPTX enforce one bounded output budget,
+  including deeply nested review threads and the combined presentation body and
+  comments.
+- **steadier Excel viewing:** model-backed workbooks, legacy dialog sheets,
+  unsupported TIFF pictures and compatible ZIP descriptors no longer prevent
+  otherwise usable sheet content from opening.
+- **delimited-text preview:** `XlsxSheetViewer` can display CSV, TSV or another
+  explicitly selected single-character delimiter as authored text. This is a
+  small preview convenience; `XlsxWorkbook` and `XlsxViewer` remain OOXML-only.
+- **compatibility:** no viewer option or method is removed or renamed. Existing
+  viewer integrations require no migration. Applications that parse generated
+  Markdown should account for review comments moving to the final appendix.
+
 ## 0.85.3 — 2026-09-04
 
 Compatible patch release improving progressive Word opening, PowerPoint text
