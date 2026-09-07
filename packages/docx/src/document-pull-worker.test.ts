@@ -12,6 +12,7 @@ import {
   createLocalDocumentPullTransport,
   DocumentPullWorker,
   MaterializedDocumentCursorArchive,
+  readDocxDocumentCursorUsage,
   type DocxDocumentCursorArchive,
 } from './document-pull-worker.js';
 import type { DocxDocumentModel } from './types.js';
@@ -68,6 +69,23 @@ const identity: PullSessionIdentity<number> = {
 };
 
 describe('DOCX document pull integration', () => {
+  it('allows only the degraded-container missing usage checkpoint', () => {
+    const unavailable = {
+      document_cursor_resource_usage: () => {
+        throw new Error('document cursor usage is unavailable');
+      },
+    } as unknown as DocxDocumentCursorArchive;
+    expect(readDocxDocumentCursorUsage((operation) => operation(unavailable))).toBeUndefined();
+
+    const violation = {
+      document_cursor_resource_usage: () => {
+        throw new Error('OOXML_RESOURCE_LIMIT: usage checkpoint failed');
+      },
+    } as unknown as DocxDocumentCursorArchive;
+    expect(() => readDocxDocumentCursorUsage((operation) => operation(violation)))
+      .toThrow('OOXML_RESOURCE_LIMIT: usage checkpoint failed');
+  });
+
   it('materializes acknowledged body units and a body-free terminal envelope', async () => {
     const archive = new FakeArchive();
     const worker = new DocumentPullWorker(() => archive);
