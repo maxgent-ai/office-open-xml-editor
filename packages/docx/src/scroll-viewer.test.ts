@@ -1676,6 +1676,8 @@ describe('DocxScrollViewer — self-load path (T7 story)', () => {
     const v = new DocxScrollViewer(container as unknown as HTMLElement, {
       gap: 10,
       password: 'secret',
+      useGoogleFonts: true,
+      googleFontsCssOrigin: 'https://fonts.internal.example:8443',
       tiff,
     });
     const scrollHost = (container.children[0] as FakeEl).children[0] as FakeEl;
@@ -1685,7 +1687,12 @@ describe('DocxScrollViewer — self-load path (T7 story)', () => {
     expect(loadSpy).toHaveBeenCalledTimes(1);
     expect(loadSpy).toHaveBeenCalledWith(
       'sample.docx',
-      expect.objectContaining({ password: 'secret', tiff }),
+      expect.objectContaining({
+        password: 'secret',
+        useGoogleFonts: true,
+        googleFontsCssOrigin: 'https://fonts.internal.example:8443',
+        tiff,
+      }),
     );
     // Layout happened: slots mounted and the spacer was sized.
     expect(v.mountedPageIndicesForTest().length).toBeGreaterThan(0);

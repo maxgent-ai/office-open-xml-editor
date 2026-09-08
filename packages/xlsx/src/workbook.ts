@@ -2,6 +2,7 @@ import InlineWorker from './worker.ts?worker&inline';
 import wasmAssetUrl from './wasm/xlsx_parser_bg.wasm?url';
 import {
   preloadGoogleFonts,
+  normalizeGoogleFontsCssOrigin,
   unloadGoogleFonts,
   WorkerBridge,
   defaultDpr,
@@ -170,6 +171,7 @@ export class XlsxWorkbook {
   /** Web-font registrations are per FontFaceSet. Same-origin child windows have
    * their own set even when they share this workbook instance. */
   private googleFontNames: string[] = [];
+  private googleFontsCssOrigin: string | undefined;
   private readonly retainedFontSets = new Map<FontFaceSet, RetainedFontSet>();
   private fontsDestroyed = false;
   private _mode: 'main' | 'worker' = 'main';
@@ -407,6 +409,9 @@ export class XlsxWorkbook {
     this.worksheetPullClient = null;
     this.generation = (this.generation ?? 0) + 1;
     this.resourcePolicy = resourcePolicy;
+    this.googleFontsCssOrigin = opts.useGoogleFonts
+      ? normalizeGoogleFontsCssOrigin(opts.googleFontsCssOrigin)
+      : undefined;
     this.workerTimeoutMs = opts.workerTimeoutMs;
     this.math = this._mode === 'worker' ? undefined : opts.math;
     this.threeD = this._mode === 'worker' ? undefined : opts.threeD;
@@ -457,6 +462,7 @@ export class XlsxWorkbook {
               data: workerData,
               resourcePolicy,
               useGoogleFonts: !!opts.useGoogleFonts,
+              googleFontsCssOrigin: this.googleFontsCssOrigin,
               renderers: rendererDescriptors,
             } satisfies RenderWorkerRequest)
           : ({
@@ -516,6 +522,9 @@ export class XlsxWorkbook {
     const bridge = this.requireBridge();
     this.delimitedTextBacked = true;
     this.resourcePolicy = resourcePolicy;
+    this.googleFontsCssOrigin = opts.useGoogleFonts
+      ? normalizeGoogleFontsCssOrigin(opts.googleFontsCssOrigin)
+      : undefined;
     this.workerTimeoutMs = opts.workerTimeoutMs;
     this.generation++;
     this.math = this._mode === 'worker' ? undefined : opts.math;
@@ -533,6 +542,7 @@ export class XlsxWorkbook {
         data,
         options,
         useGoogleFonts: !!opts.useGoogleFonts,
+        googleFontsCssOrigin: this.googleFontsCssOrigin,
         renderers: rendererDescriptors,
       } satisfies DelimitedTextParseRequest),
       [data],
@@ -567,7 +577,12 @@ export class XlsxWorkbook {
     if (retained) {
       retained.refs++;
     } else {
-      const loading = preloadGoogleFonts(this.googleFontNames, XLSX_GOOGLE_FONTS, fontSet);
+      const loading = preloadGoogleFonts(
+        this.googleFontNames,
+        XLSX_GOOGLE_FONTS,
+        fontSet,
+        this.googleFontsCssOrigin,
+      );
       retained = { refs: 1, faces: null, loading };
       this.retainedFontSets.set(fontSet, retained);
       loading.then((faces) => {
@@ -1100,6 +1115,7 @@ export class XlsxWorkbook {
     }
     this.retainedFontSets.clear();
     this.googleFontNames = [];
+    this.googleFontsCssOrigin = undefined;
     // Frame-local lookup maps never escape the renderer; drop the owning core
     // caches to release decoded surfaces and SVG references.
     dropDecodedBitmapCache(this._fetchImage);

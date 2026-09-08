@@ -67,6 +67,16 @@ export interface LoadOptions {
    */
   useGoogleFonts?: boolean;
   /**
+   * Override the Google Fonts-compatible CSS service origin used when
+   * `useGoogleFonts` is enabled. Must be an HTTP(S) origin (a scheme, host, and
+   * optional port, with no path/query/hash). The built-in stylesheet paths and
+   * family queries are preserved. Defaults to `https://fonts.googleapis.com`.
+   *
+   * The service controls the font-file URLs returned by its CSS. Relative font
+   * URLs are resolved against the stylesheet's final URL after redirects.
+   */
+  googleFontsCssOrigin?: string;
+  /**
    * Password for an encrypted OOXML file ([MS-OFFCRYPTO] Agile Encryption).
    *
    * Password-protected Office documents are CFB (OLE2) containers, not ZIPs.
