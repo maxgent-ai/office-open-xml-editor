@@ -13,6 +13,7 @@ import {
 } from './slide-nav';
 import {
   preloadGoogleFonts,
+  normalizeGoogleFontsCssOrigin,
   releaseOwnedBitmap,
   unloadGoogleFonts,
   unregisterEmbeddedFonts,
@@ -332,6 +333,9 @@ export class PptxPresentation {
     opts: LoadOptions = {},
   ): Promise<PptxPresentation> {
     const resourceOptions = normalizeLoadResourceOptions(opts);
+    const googleFontsCssOrigin = opts.useGoogleFonts
+      ? normalizeGoogleFontsCssOrigin(opts.googleFontsCssOrigin)
+      : undefined;
     const mode = opts.mode ?? 'main';
     const metrics = new OoxmlResourceMetricsSession({
       enabled: true,
@@ -421,6 +425,7 @@ export class PptxPresentation {
         (usage) => metrics.observeUsage(usage),
         rendererDescriptors,
         progressive,
+        googleFontsCssOrigin,
       );
       metrics.checkpoint('presentation preflight ready');
       if (mode === 'main' && opts.useGoogleFonts && pres._preflight && !progressive) {
@@ -430,6 +435,8 @@ export class PptxPresentation {
             pres._embeddedFontAliases,
           ),
           PPTX_GOOGLE_FONTS,
+          undefined,
+          googleFontsCssOrigin,
         );
       }
       metrics.succeed({ slides: pres.slideCount });
@@ -453,16 +460,17 @@ export class PptxPresentation {
     onUsage?: (usage: import('@silurus/ooxml-core').OoxmlResourceUsageSnapshot) => void,
     renderers?: WorkerRendererDescriptors,
     progressive?: ProgressiveLoad,
+    googleFontsCssOrigin?: string,
   ): Promise<void> {
     if (progressive) {
       this._progressive = progressive;
       if (this._mode === 'worker') {
         await this._parseWorkerProgressively(
-          buffer, resourcePolicy, useGoogleFonts, timeoutMs, onUsage, renderers, progressive,
+          buffer, resourcePolicy, useGoogleFonts, timeoutMs, onUsage, renderers, progressive, googleFontsCssOrigin,
         );
       } else {
         await this._parseMainProgressively(
-          buffer, resourcePolicy, useGoogleFonts, timeoutMs, onUsage, progressive,
+          buffer, resourcePolicy, useGoogleFonts, timeoutMs, onUsage, progressive, googleFontsCssOrigin,
         );
       }
       return;
@@ -470,7 +478,7 @@ export class PptxPresentation {
     const response = await this._bridge.request(
       (id) =>
         this._mode === 'worker'
-          ? ({ kind: 'parse', id, buffer, resourcePolicy, useGoogleFonts, renderers } satisfies RenderWorkerRequest)
+          ? ({ kind: 'parse', id, buffer, resourcePolicy, useGoogleFonts, googleFontsCssOrigin, renderers } satisfies RenderWorkerRequest)
           : ({ kind: 'parse', id, buffer, resourcePolicy } satisfies PptxWorkerRequest),
       [buffer],
       { timeoutMs },
@@ -563,6 +571,7 @@ export class PptxPresentation {
     timeoutMs: number | undefined,
     onUsage: ((usage: import('@silurus/ooxml-core').OoxmlResourceUsageSnapshot) => void) | undefined,
     progressive: ProgressiveLoad,
+    googleFontsCssOrigin: string | undefined,
   ): Promise<void> {
     const response = await this._bridge.request(
       (id) => ({
@@ -608,7 +617,12 @@ export class PptxPresentation {
       ).filter((name): name is string => !!name && !loadedGoogleFonts.has(name));
       if (requested.length === 0) return;
       for (const name of requested) loadedGoogleFonts.add(name);
-      this._googleFontFaces.push(...await preloadGoogleFonts(requested, PPTX_GOOGLE_FONTS));
+      this._googleFontFaces.push(...await preloadGoogleFonts(
+        requested,
+        PPTX_GOOGLE_FONTS,
+        undefined,
+        googleFontsCssOrigin,
+      ));
     };
     const full = (async () => {
       for (let slideIndex = 0; slideIndex < bootstrap.slideCount; slideIndex += 1) {
@@ -642,13 +656,14 @@ export class PptxPresentation {
     onUsage: ((usage: import('@silurus/ooxml-core').OoxmlResourceUsageSnapshot) => void) | undefined,
     renderers: WorkerRendererDescriptors | undefined,
     progressive: ProgressiveLoad,
+    googleFontsCssOrigin: string | undefined,
   ): Promise<void> {
     this._progressiveWatchdogMs = timeoutMs;
     const parsed = this._bridge.request(
       (id) => {
         this._parseRequestId = id;
         return {
-          kind: 'parse', id, buffer, resourcePolicy, useGoogleFonts, renderers,
+          kind: 'parse', id, buffer, resourcePolicy, useGoogleFonts, googleFontsCssOrigin, renderers,
           progressiveLayout: true,
         } satisfies RenderWorkerRequest;
       },

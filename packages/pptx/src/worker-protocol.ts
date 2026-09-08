@@ -88,6 +88,7 @@ export type RenderWorkerRequest =
       buffer: ArrayBuffer;
       resourcePolicy: NormalizedOoxmlResourcePolicy;
       useGoogleFonts?: boolean;
+      googleFontsCssOrigin?: string;
       renderers?: WorkerRendererDescriptors;
       progressiveLayout?: boolean;
     }
