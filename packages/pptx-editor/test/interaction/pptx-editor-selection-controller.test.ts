@@ -37,7 +37,7 @@ describe('PptxEditorSelectionController', () => {
     }));
 
     const ref = createElementRef(presentation.slides[0], target, 0);
-    const submission = session.submit({
+    session.apply({
       id: 'move-1',
       mutations: [new UpdateShapeMutation({
         target: ref,
@@ -63,7 +63,6 @@ describe('PptxEditorSelectionController', () => {
     expect(listener).toHaveBeenLastCalledWith(expect.objectContaining({
       reason: EDITOR_SELECTION_CHANGE_REASONS.UPDATED,
     }));
-    await submission.settled;
 
     controller.dispose();
     session.dispose();
@@ -126,7 +125,7 @@ describe('PptxEditorSelectionController', () => {
 
     canvas.pointerDown(20, 20);
     const ref = createElementRef(presentation.slides[0], target, 0);
-    const submission = session.submit({
+    session.apply({
       id: 'remove-1',
       mutations: [new RemoveElementMutation({ target: ref })],
     });
@@ -134,13 +133,12 @@ describe('PptxEditorSelectionController', () => {
     expect(listener).toHaveBeenLastCalledWith(expect.objectContaining({
       reason: EDITOR_SELECTION_CHANGE_REASONS.CLEARED,
     }));
-    await submission.settled;
 
     controller.dispose();
     session.dispose();
   });
 
-  it('restores a deleted selection when OfficeCLI rejects the command', async () => {
+  it('retains the deletion on save failure and restores selection on local undo', async () => {
     const target = shape('7', 'target');
     const presentation = deck([target]);
     const session = new PptxEditorSession({
@@ -149,7 +147,7 @@ describe('PptxEditorSelectionController', () => {
         status: OFFICECLI_BATCH_SEND_STATUSES.REJECTED,
         cause: new Error('path not found'),
       }),
-      createCommandId: () => 'unused',
+      createSaveId: () => 'save-1',
     });
     const canvas = new FakeCanvas();
     const controller = new PptxEditorSelectionController({
@@ -160,13 +158,16 @@ describe('PptxEditorSelectionController', () => {
 
     canvas.pointerDown(50, 50);
     const ref = createElementRef(presentation.slides[0], target, 0);
-    const submission = session.submit({
+    session.apply({
       id: 'remove-rejected',
       mutations: [new RemoveElementMutation({ target: ref })],
     });
 
     expect(controller.getSnapshot().selection).toBeNull();
-    await submission.settled;
+
+    await session.save();
+    expect(controller.getSnapshot().selection).toBeNull();
+    session.undo();
     expect(controller.getSnapshot().selection).toMatchObject({
       target: ref,
       element: target,
@@ -242,9 +243,9 @@ function createSession(presentation: Presentation): PptxEditorSession {
   return new PptxEditorSession({
     presentation,
     sendBatch: async () => ({ status: OFFICECLI_BATCH_SEND_STATUSES.CONFIRMED }),
-    createCommandId: ({ direction }) => {
+    createSaveId: () => {
       commandId += 1;
-      return `${direction}-${commandId}`;
+      return `save-${commandId}`;
     },
   });
 }

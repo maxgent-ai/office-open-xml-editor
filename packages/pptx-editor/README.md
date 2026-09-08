@@ -1,6 +1,6 @@
 # `@maxgent/ooxml-pptx-editor`
 
-Optimistic PPTX editing for Maxgent's `@maxgent/ooxml` fork: mutate an
+Local PPTX editing with explicit batch saves for Maxgent's `@maxgent/ooxml` fork: mutate an
 in-memory `Presentation`, translate commands to OfficeCLI batches, and paint
 through a `PptxEditorViewerHost` backed by a loaded `PptxPresentation`.
 
@@ -17,13 +17,11 @@ viewer syncs stay thin. Prefer the high-level `PptxEditorSession` +
 
 ```text
 UI / host app
-  │  submit(command) / undo() / redo()
+  │  apply(command) / undo() / redo() / save()
   ▼
-PptxEditorSession          ← snapshot, history, sync state, listeners
-  ├─ PptxEditorStore       ← optimistic Presentation + pending commands
-  ├─ UndoRedoStack         ← invert + stack; issues undo/redo command ids
-  └─ SerialOfficeCliSubmitter
-        │  sendBatch(OfficeCliBatch)
+PptxEditorSession          ← local history, saved position, save state, listeners
+  └─ save(): replay the path from saved position to current position
+        │  sendBatch(OfficeCliBatch), once per explicit save
         ▼
      your transport        ← confirmed | rejected | unknown
 
@@ -38,7 +36,7 @@ Data ownership:
 
 | Layer | Owns |
 | --- | --- |
-| Session | Optimistic `Presentation`, undo/redo, submission queue, sync halt |
+| Session | Local `Presentation`, undo/redo, saved position, save lock |
 | View host | Canvas, package media/theme plumbing, paint |
 | Transport | Persistence / OfficeCLI side effects |
 
@@ -61,7 +59,6 @@ import {
   UpdateTextMutation,
   createElementRef,
   OFFICECLI_BATCH_SEND_STATUSES,
-  COMMAND_SUBMISSION_STATUSES,
 } from '@maxgent/ooxml-pptx-editor';
 ```
 
@@ -79,8 +76,8 @@ slide replacement hook. Inside this monorepo, depend on the workspace package:
 ## Quick start
 
 Minimal loop: load a viewer in **main** mode, export editor JSON with
-`toEditorPresentation()`, open a session on that model, bind them, then submit
-commands.
+`toEditorPresentation()`, open a session on that model, bind them, then apply
+local commands. Call `save()` only from the save action.
 
 ```ts
 import {
@@ -89,7 +86,6 @@ import {
   PptxEditorViewerHost,
   UpdateTextMutation,
   createElementRef,
-  COMMAND_SUBMISSION_STATUSES,
   OFFICECLI_BATCH_SEND_STATUSES,
   type OfficeCliBatch,
   type OfficeCliBatchSendResult,
@@ -110,14 +106,10 @@ async function openEditor(args: {
   const presentation = await loadedPresentation.toEditorPresentation();
   const viewer = PptxViewer.fromPresentation(args.canvas, loadedPresentation);
 
-  let commandSeq = 0;
   const session = new PptxEditorSession({
     presentation,
     sendBatch: args.sendBatch,
-    createCommandId: ({ direction, sourceCommandId }) => {
-      commandSeq += 1;
-      return `${direction}:${sourceCommandId}:${commandSeq}`;
-    },
+    createSaveId: () => crypto.randomUUID(),
   });
 
   const host = new PptxEditorViewerHost(viewer, loadedPresentation);
@@ -135,7 +127,7 @@ async function openEditor(args: {
   return { viewer, loadedPresentation, session, binding };
 }
 
-async function editFirstShapeText(
+function editFirstShapeText(
   session: PptxEditorSession,
   presentation: Presentation,
   nextText: string,
@@ -144,29 +136,24 @@ async function editFirstShapeText(
   const element = slide.elements[0] as Presentation['slides'][number]['elements'][number];
   const target = createElementRef(slide, element, 0);
 
-  const submission = session.submit({
+  session.apply({
     id: 'edit-text-1',
     mutations: [new UpdateTextMutation({ target, value: nextText })],
   });
 
-  // Optimistic model is already updated.
-  const snapshot = session.getSnapshot();
-  console.log(snapshot.presentation.slides[0].elements[0]);
+  // The model and view update locally. This function sends no request.
+  console.log(session.getSnapshot().dirty);
+}
 
-  const result = await submission.settled;
-  if (result.status !== COMMAND_SUBMISSION_STATUSES.CONFIRMED) {
-    throw new Error(`edit did not confirm: ${result.status}`);
+async function onSaveClick(session: PptxEditorSession) {
+  const result = await session.save();
+  if (result.status === 'rejected' || result.status === 'unknown') {
+    console.error(result.cause);
   }
+  // Only confirmed (or unchanged) means the current position is saved.
 }
 
-async function sendBatch(batch: OfficeCliBatch): Promise<OfficeCliBatchSendResult> {
-  // Call your OfficeCLI / backend. Return one of:
-  //   { status: 'confirmed' }
-  //   { status: 'rejected', cause }
-  //   { status: 'unknown', cause }  → session sync halts until resync()
-  void batch;
-  return { status: OFFICECLI_BATCH_SEND_STATUSES.CONFIRMED };
-}
+// Supply a real sender. Never return confirmed before backend persistence.
 ```
 
 Teardown:
@@ -220,15 +207,14 @@ const target = createElementRef(slide, element, elementIndex);
 
 ## Commands and mutations
 
-A **command** is the atomic unit of optimistic update, history, and transport:
+A **command** groups one local edit and one history entry. A save combines multiple commands:
 
 ```ts
 import type { Command } from '@maxgent/ooxml-pptx-editor';
 
 const command: Command = {
-  id: 'cmd-1',                 // unique per submission
+  id: 'cmd-1',                 // identifier for the local edit
   mutations: [/* at least one */],
-  mergeKey: 'title-typing',    // optional history coalescing key
 };
 ```
 
@@ -239,9 +225,9 @@ Built-in mutations:
 | `UpdateTextMutation` | Replace shape plain text, whole-shape styles, or incremental paragraph/span edits (`text` and/or `style`) | `set` path + `{ text, bold, … }` and/or `range=` |
 | `UpdateShapeMutation` | Patch shape position, size, rotation, flips, fill, or outline | `set` path + changed shape props |
 | `InsertSlideMutation` | Insert an empty slide at a 0-based index | `add` under `/` with `type: 'slide'` and `index` |
-| `RemoveSlideMutation` | Remove a slide; direct removal is not undoable | `remove` at the current slide path |
+| `RemoveSlideMutation` | Remove a slide; undoable locally before saving | `remove` at the current slide path |
 | `AddElementMutation` | Insert a slide element at indexes | `add` under slide path |
-| `RemoveElementMutation` | Remove a slide-origin shape, picture, table, or chart; only shape removal is undoable | type-based stable `remove` path |
+| `RemoveElementMutation` | Remove a slide-origin shape, picture, table, or chart; undoable locally before saving | type-based stable `remove` path |
 
 Low-level apply without a session:
 
@@ -254,33 +240,38 @@ const { presentation, changedSlideIds, changedElements } = applyCommand(
 );
 ```
 
-## Session API
+## Session API and migration
+
+This is a breaking session API change. Migration is required:
+
+1. Replace `createCommandId` with `createSaveId: () => crypto.randomUUID()`.
+2. Replace `session.submit(command)` with synchronous `session.apply(command)`.
+3. Remove per-edit `settled` waits. Undo and redo are synchronous local operations.
+4. Call `await session.save()` from the save button.
+5. Render save indicators from `dirty` and `saveStatus`. Disable editing when `canEdit` is false.
 
 ```ts
-const session = new PptxEditorSession({
-  presentation,
-  sendBatch,
-  createCommandId,
-  onListenerError, // optional; defaults to console.error
-});
-
-session.getSnapshot();
-session.subscribe((change) => { /* UI / telemetry */ });
-session.submit(command);
+session.apply({ id: crypto.randomUUID(), mutations: [mutation] });
 session.undo();
 session.redo();
-session.resync(authoritativePresentation);
-session.dispose();
+const result = await session.save();
 ```
 
-### Snapshot
+`apply`, `undo`, and `redo` return a `PptxEditorSessionChange`. They send no requests.
+`save` returns `unchanged` without transport when the current history position is saved.
+Otherwise, it returns the sender result plus the batch `commandId`.
+Local compilation errors reject the save promise before transport and retain the draft.
+
+### Snapshot and events
 
 ```ts
 interface PptxEditorSessionSnapshot {
-  presentation: Presentation;       // optimistic current model
-  syncState: EditorSyncState;       // ready | halted
-  pendingCommandIds: readonly string[];
-  isSubmitting: boolean;
+  presentation: Presentation;
+  dirty: boolean;
+  saveStatus: 'idle' | 'saving' | 'failed' | 'unknown';
+  saveCommandId?: string;
+  saveError?: unknown;
+  canEdit: boolean;
   undoDepth: number;
   redoDepth: number;
   canUndo: boolean;
@@ -288,84 +279,85 @@ interface PptxEditorSessionSnapshot {
 }
 ```
 
-### Change events
+`dirty` compares history positions, not document bytes. An edit that sets the same
+value can still be dirty. Returning to the saved position through undo or redo is clean.
 
-`subscribe` receives a `PptxEditorSessionChange` after store or history updates.
-Useful fields:
+Subscribe with `session.subscribe(listener)`. Events include a post-operation snapshot,
+`changedSlideIds`, `changedElements`, and an optional command id.
+Reasons are `local.applied`, `history.changed`, `save.changed`, and `presentation.resynced`.
+The existing view binding consumes local changes without waiting for a save.
+Snapshots and mutation inputs must be treated as immutable by callers.
 
-- `reason` — `command.dispatched` / `command.confirmed` / `command.rejected` /
-  `submission.halted` / `presentation.resynced` / `history.changed`
-- `snapshot` — post-change session snapshot
-- `commandId`, `invalidatedCommandIds`
-- `changedSlideIds`, `changedElements` — for incremental UI (the view binding
-  already consumes these)
+### History and batch order
 
-Dispatch is optimistic: `submit` / `undo` / `redo` update the local presentation
-before transport settles. `submission.settled` resolves with the final
-submission status.
+The session stores structurally shared presentation snapshots and mutation history.
+Undo and redo move through local snapshots. A new edit discards the redo branch.
+The saved position remains reachable until the next successful save.
 
-### Undo / redo
+At save time, the session finds the common history ancestor of the saved and current positions.
+It collects inverse mutations from the saved branch, then forward mutations toward the current position.
+The existing translator replays that sequence from the saved presentation.
+Every mutation receives the resulting document state, the same batch id, and a global mutation index.
+There is no command compression, reordering, final-document diff, or business-owned queue.
 
-```ts
-if (session.getSnapshot().canUndo) {
-  await session.undo().settled;
-}
-if (session.getSnapshot().canRedo) {
-  await session.redo().settled;
-}
-```
+Unsaved deletes can be undone by restoring their snapshots, including populated slides.
+After saving, operations without a faithful OfficeCLI inverse form an undo boundary.
+This includes element deletion, slide deletion, and text operations whose existing inverter returns no inverse.
+Shape restoration currently loses rich formatting or geometry, so saved element deletion also forms a boundary.
+Later invertible edits remain undoable. Undoing saved text or transform edits creates a new dirty position.
 
-`createCommandId` must mint a **new** id for every undo/redo submission:
+History retains prior changed objects for the session lifetime; unchanged objects are shared.
+There is no persistent draft store. Dispose the session when closing the editor.
+`resync` also releases old history and explicitly discards the draft.
 
-```ts
-createCommandId: ({ direction, sourceCommandId }) =>
-  `${direction}:${sourceCommandId}:${crypto.randomUUID()}`,
-```
+### Save outcomes
 
-Undo and redo history advances optimistically with the local presentation.
-Pending invertible commands can be undone or redone immediately; the resulting
-commands remain serial in the OfficeCLI submission queue. A pending
-non-invertible command temporarily disables both operations. If a command is
-rejected, it and its invalidated optimistic tail are removed from history.
-
-### Submission outcomes
-
-Your `sendBatch` must return one of:
-
-| Status | Meaning | Session effect |
+| Sender result | Required evidence | Session effect |
 | --- | --- | --- |
-| `confirmed` | Server accepted the batch | Command leaves pending; optimistic history becomes confirmed |
-| `rejected` | Server rejected with known cause | Optimistic change rolled back for that command |
-| `unknown` | Outcome unclear (timeout, network ambiguity) | Sync **halts**; further submits blocked until `resync` |
+| `confirmed` | All commands and the resulting file are durably saved | Advance saved position; preserve history |
+| `rejected` | The authoritative file is unchanged | Retain draft and history; allow an explicit new save |
+| `unknown` | Outcome or partial application cannot be ruled out | Retain draft; lock editing, undo, redo, and save |
 
-Settled `CommandSubmissionResult` statuses:
+During `saving`, editing, undo, redo, resync, and another save are blocked.
+A thrown transport error or malformed result becomes `unknown`.
+The session never retries automatically. A batch id does not guarantee backend idempotency.
+Do not classify a timeout, partial batch, or uncertain upload as `rejected`.
 
-| Status | Meaning |
-| --- | --- |
-| `confirmed` | Applied and acknowledged |
-| `rejected` | Rolled back |
-| `invalidated` | Dropped because an earlier command in the serial queue failed |
-| `halted` | Queue stopped after an `unknown` send |
-
-### Halt and resync
-
-When transport returns `unknown`, the session enters
-`syncState.status === 'halted'`. Do not keep submitting. Fetch an authoritative
-presentation and reset:
+After independently verifying an unknown batch, resolve that exact id:
 
 ```ts
-import { EDITOR_SYNC_STATUSES } from '@maxgent/ooxml-pptx-editor';
-
-const { syncState } = session.getSnapshot();
-if (syncState.status === EDITOR_SYNC_STATUSES.HALTED) {
-  const authoritative = await fetchAuthoritativePresentation();
-  session.resync(authoritative);
-  // History and pending commands are cleared; sync returns to ready.
-}
+session.resolveUnknown(saveCommandId, { status: 'confirmed' });
+// Or, only after verifying that no authoritative change occurred:
+session.resolveUnknown(saveCommandId, { status: 'rejected', cause });
 ```
 
-If `resync` changes the slide count, the standard view binding replaces the
-in-memory slide list without reloading the PPTX package.
+Do not infer either result from `requestId` alone. If the outcome cannot be verified,
+keep the session locked. Alternatively, explicitly discard the draft and reload:
+
+```ts
+session.resync(authoritativePresentation); // Discards all local history and draft.
+```
+
+Only resync after the previous request has stopped changing the file.
+If authoritative media or package resources changed, reload the presentation and viewer too.
+
+### Business and backend integration
+
+The editor package owns local history, dirty tracking, batch generation, and save locking.
+The business frontend owns the save button, error display, navigation guards, and transport adapter.
+Flush any active text input into `session.apply` before calling `save`.
+Slide navigation can wait for `binding.whenIdle()` instead of waiting for backend confirmation.
+
+Keep the current `applyCommands` adapter: send `batch.commands` as `commands` and
+`batch.commandId` as `requestId`. Map results according to the evidence table above.
+No additional non-upload endpoint, Sandbox lifecycle change, or resident OfficeCLI service is required.
+
+File conflict detection requires backend cooperation. Capture the loaded file version in the sender closure.
+Send it as `expectedVersion`; the backend must atomically compare it before applying changes.
+On success, return the new version and update that closure before returning `confirmed`.
+A precondition conflict is `rejected` only if no change occurred.
+Disable further save attempts until the user resolves that conflict; do not silently adopt the newer version.
+The editor cannot provide cross-client conflict protection without that server-side check.
 
 ## View binding
 
@@ -518,11 +510,9 @@ Document these in product code rather than papering over them:
    maps pictures, tables, and charts from their frontend type. Media is rejected
    at translate time (`target.unsupportedElement`) because OfficeCLI has no
    stable `@id` selector for video/audio. A grouped,
-   wrapped, or projected element may produce a path that OfficeCLI rejects; a
-   rejected submission rolls the optimistic deletion back.
-   Removal of a non-shape element is not undoable because its binary parts and
-   relationships cannot be restored from the projected presentation model.
-   A confirmed non-undoable deletion clears command history.
+   wrapped, or projected element may produce a path that OfficeCLI rejects.
+   A rejected save retains the local draft. Saved deletions form an undo boundary
+   because full package content cannot be restored faithfully by the existing inverter.
    OfficeCLI `zorder` is derived from `origin: 'slide'` ordinals before
    `presentationElementIndex`; this matches spTree position for top-level 1:1
    shapes, not for groups / hidden nodes that expand or skip.
@@ -563,5 +553,15 @@ pnpm --filter @maxgent/ooxml-pptx-editor typecheck
 ```
 
 Focused suites live under `test/` (`session/`, `rendering/`, `history/`,
-`submission/`, `transport/`) and exercise optimistic dispatch, halt/resync,
+`submission/`, `transport/`) and exercise local history, explicit save outcomes,
 view coalescing, and OfficeCLI translation.
+
+Real OfficeCLI batch replay coverage:
+
+```bash
+OFFICECLI_LIVE=1 pnpm --filter @maxgent/ooxml-pptx-editor test:officecli-live -- test/officecli-live/manual-save.live.test.ts
+```
+
+Rebuild PPTX WASM from current source before parser-backed live tests.
+The live test compares editable content, geometry, and order with the saved file.
+It does not assert equality of backend-generated package identifiers or all OOXML formatting.

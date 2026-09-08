@@ -37,14 +37,13 @@ describe('PptxEditorViewBinding', () => {
     await binding.whenIdle();
     expect(applies).toEqual([{ text: 'before', changedSlideIndexes: undefined }]);
 
-    const submission = session.submit(updateTextCommand('edit-1', ref, 'after'));
+    session.apply(updateTextCommand('edit-1', ref, 'after'));
     await binding.whenIdle();
     expect(applies).toEqual([
       { text: 'before', changedSlideIndexes: undefined },
       { text: 'after', changedSlideIndexes: [0] },
     ]);
 
-    await submission.settled;
     await binding.whenIdle();
     expect(applies).toHaveLength(2);
   });
@@ -65,16 +64,16 @@ describe('PptxEditorViewBinding', () => {
     const binding = new PptxEditorViewBinding({ session, host });
     await binding.whenIdle();
 
-    const first = session.submit(updateTextCommand('edit-1', ref, 'one'));
-    const second = session.submit(updateTextCommand('edit-2', ref, 'two'));
-    const third = session.submit(updateTextCommand('edit-3', ref, 'three'));
+    session.apply(updateTextCommand('edit-1', ref, 'one'));
+    session.apply(updateTextCommand('edit-2', ref, 'two'));
+    session.apply(updateTextCommand('edit-3', ref, 'three'));
 
     expect(texts).toEqual(['before', 'one']);
     blocked.resolve(undefined);
     await binding.whenIdle();
 
     expect(texts).toEqual(['before', 'one', 'three']);
-    await Promise.all([first.settled, second.settled, third.settled]);
+
   });
 
   it('isolates host failures and remains usable for a later sync', async () => {
@@ -121,18 +120,18 @@ describe('PptxEditorViewBinding', () => {
 
     // A failed incremental apply leaves the host's state unknown…
     failNext = true;
-    session.submit(updateTextCommand('edit-first', firstRef, 'first-after'));
+    session.apply(updateTextCommand('edit-first', firstRef, 'first-after'));
     await binding.whenIdle();
     expect(onRenderError).toHaveBeenCalledTimes(1);
     expect(applies).toEqual([undefined]);
 
     // …so the next sync must be a full apply, not just the newly changed slide.
-    session.submit(updateTextCommand('edit-second', secondRef, 'second-after'));
+    session.apply(updateTextCommand('edit-second', secondRef, 'second-after'));
     await binding.whenIdle();
     expect(applies).toEqual([undefined, undefined]);
 
     // Once a full apply succeeded, incremental patches resume.
-    session.submit(updateTextCommand('edit-first-again', firstRef, 'first-final'));
+    session.apply(updateTextCommand('edit-first-again', firstRef, 'first-final'));
     await binding.whenIdle();
     expect(applies).toEqual([undefined, undefined, [0]]);
   });
@@ -155,8 +154,8 @@ describe('PptxEditorViewBinding', () => {
 
     binding.dispose();
     binding.dispose();
-    session.submit(updateTextCommand('edit-first', firstRef, 'first-after'));
-    session.submit(updateTextCommand('edit-second', secondRef, 'second-after'));
+    session.apply(updateTextCommand('edit-first', firstRef, 'first-after'));
+    session.apply(updateTextCommand('edit-second', secondRef, 'second-after'));
     await Promise.resolve();
     expect(hostApply).toHaveBeenCalledTimes(1);
 
@@ -180,12 +179,10 @@ describe('PptxEditorViewBinding', () => {
     binding.dispose();
   });
 
-  it('full-syncs an optimistic slide insertion and its undo', async () => {
-    const firstSend = deferred<OfficeCliBatchSendResult>();
+  it('full-syncs a local slide insertion and its undo without transport', async () => {
     const sendBatch = vi.fn<(
       batch: OfficeCliBatch,
     ) => Promise<OfficeCliBatchSendResult>>()
-      .mockReturnValueOnce(firstSend.promise)
       .mockResolvedValue({ status: OFFICECLI_BATCH_SEND_STATUSES.CONFIRMED });
     const session = createSession(deck([shape('7', 'first')]), sendBatch);
     const applies: Array<{
@@ -203,7 +200,7 @@ describe('PptxEditorViewBinding', () => {
     });
     await binding.whenIdle();
 
-    const insert = session.submit({
+    session.apply({
       id: 'insert-slide',
       mutations: [new InsertSlideMutation({
         index: 1,
@@ -216,7 +213,7 @@ describe('PptxEditorViewBinding', () => {
       { slideCount: 2, changedSlideIndexes: undefined },
     ]);
 
-    const undo = session.undo();
+    session.undo();
     await binding.whenIdle();
     expect(applies).toEqual([
       { slideCount: 1, changedSlideIndexes: undefined },
@@ -224,8 +221,8 @@ describe('PptxEditorViewBinding', () => {
       { slideCount: 1, changedSlideIndexes: undefined },
     ]);
 
-    firstSend.resolve({ status: OFFICECLI_BATCH_SEND_STATUSES.CONFIRMED });
-    await Promise.all([insert.settled, undo.settled]);
+    expect(sendBatch).not.toHaveBeenCalled();
+
   });
 });
 
@@ -240,7 +237,7 @@ function createSession(
   return new PptxEditorSession({
     presentation,
     sendBatch,
-    createCommandId: ({ direction, sourceCommandId }) => `${direction}-${sourceCommandId}`,
+    createSaveId: () => 'save-1',
   });
 }
 
