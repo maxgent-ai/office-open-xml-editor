@@ -1,4 +1,5 @@
 import type { ElementRef } from '../domain/mutation';
+import { EDITOR_SESSION_CHANGE_REASONS } from '../session/constants';
 import type { PptxEditorSessionChange } from '../session/types';
 import { EDITOR_SELECTION_CHANGE_REASONS } from './constants';
 import { PptxEditorSelectionControllerError } from './errors';
@@ -135,16 +136,14 @@ export class PptxEditorSelectionController {
       );
       if (restored) {
         this.#setSelection(restored, EDITOR_SELECTION_CHANGE_REASONS.UPDATED);
-      } else if (!change.snapshot.isSubmitting) {
+      } else if (change.reason === EDITOR_SESSION_CHANGE_REASONS.PRESENTATION_RESYNCED) {
         this.#unavailableSelectionTarget = undefined;
       }
       return;
     }
     const next = resolveElementSelection(change.snapshot.presentation, current.target);
     if (!next) {
-      this.#unavailableSelectionTarget = change.snapshot.isSubmitting
-        ? current.target
-        : undefined;
+      this.#unavailableSelectionTarget = current.target;
       this.#snapshot = Object.freeze({ selection: null });
       this.#publish(EDITOR_SELECTION_CHANGE_REASONS.CLEARED);
       return;

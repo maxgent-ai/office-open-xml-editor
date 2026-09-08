@@ -158,7 +158,8 @@ export type {
   PptxEditorSessionListenerErrorHandler,
   PptxEditorSessionOptions,
   PptxEditorSessionSnapshot,
-  PptxEditorSessionSubmission,
+  PptxEditorSaveResult,
+  PptxEditorSaveStatus,
 } from './session/types';
 
 export { PptxEditorViewBindingError } from './rendering/errors';
