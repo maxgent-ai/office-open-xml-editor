@@ -647,6 +647,7 @@ export class DocxScrollViewer implements ZoomableViewer {
         password: this._opts.password,
         useGoogleFonts: this._opts.useGoogleFonts,
         googleFontsCssOrigin: this._opts.googleFontsCssOrigin,
+        cjkFallback: this._opts.cjkFallback,
         maxZipEntryBytes: this._opts.maxZipEntryBytes,
         resourceLimits: this._opts.resourceLimits,
         debug: this._opts.debug,

@@ -330,6 +330,7 @@ export class PptxViewer implements ZoomableViewer {
         password: this.opts.password,
         useGoogleFonts: this.opts.useGoogleFonts,
         googleFontsCssOrigin: this.opts.googleFontsCssOrigin,
+        cjkFallback: this.opts.cjkFallback,
         maxZipEntryBytes: this.opts.maxZipEntryBytes,
         resourceLimits: this.opts.resourceLimits,
         debug: this.opts.debug,

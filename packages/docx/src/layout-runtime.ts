@@ -1,3 +1,4 @@
+import { classifyCjkFont, type CjkLang } from '@silurus/ooxml-core';
 import { withVertFeatureCanvasScope } from '@silurus/ooxml-core';
 import type { DocxDocumentModel } from './types.js';
 import type { ResolvedFontMetric } from './layout/text.js';
@@ -36,11 +37,13 @@ function createConcreteBodyLayoutKernel(
   source: LayoutSourceStore,
   measureContext: MeasurementTextContext | null,
   resolvedLocalFonts: Readonly<Record<string, ResolvedFontMetric>>,
+  cjkFallback?: CjkLang,
 ): BodyLayoutKernel {
   return createProductionBodyLayoutRuntime(
     source,
     measureContext,
     resolvedLocalFonts,
+    cjkFallback,
   ).kernel;
 }
 
@@ -50,6 +53,7 @@ export function createLayoutServices(
     readonly localMetrics?: Readonly<Record<string, ResolvedFontMetric>>;
     readonly fontMetrics?: Readonly<Record<string, ResolvedFontMetric>>;
     readonly useGoogleFonts?: boolean;
+    readonly cjkFallback?: CjkLang;
     readonly mathResources?: readonly MathLayoutResource[];
     readonly mathDrawables?: ReadonlyMap<string, CanvasImageSource>;
     readonly measureContext?: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D | null;
@@ -149,8 +153,11 @@ export function createLayoutServices(
     ...localMetrics,
     ...options.fontMetrics,
   });
+  const cjkFallback = source.fonts.scriptCjkLanguage
+    ?? classifyCjkFont(source.fonts.majorFamily) ?? classifyCjkFont(source.fonts.minorFamily) ?? options.cjkFallback;
   const services = createProductionLayoutServices(source, {
     ...options,
+    cjkFallback,
     resolvedFontMetricCandidates,
     localMetrics,
     fontMetrics: inputFontMetrics,
@@ -169,6 +176,7 @@ export function createLayoutServices(
       source,
       context,
       fontMetrics,
+      cjkFallback,
     ),
   );
   return services;

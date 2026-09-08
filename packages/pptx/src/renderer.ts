@@ -1,3 +1,5 @@
+import { pptxSlideCjkFallback } from './google-fonts.js';
+import type { CjkLang } from '@silurus/ooxml-core';
 import type {
   Slide,
   SlideElement,
@@ -151,6 +153,7 @@ import { drawEaVertRun } from './vertical-text.js';
 
 /** Theme font context threaded through the render call chain. */
 export interface RenderContext {
+  cjkFallback?: CjkLang;
   themeMajorFont: string | null;
   themeMinorFont: string | null;
   /** Lower-cased authored family → this presentation's isolated FontFace alias. */
@@ -818,7 +821,7 @@ function quoteAll(names: readonly string[]): string {
  *
  * Exported for unit testing the fallback ordering.
  */
-export function cssFontStack(normalized: string, authoredFamily = normalized): string {
+export function cssFontStack(normalized: string, authoredFamily = normalized, fallback?: CjkLang): string {
   const generic = genericFallback(authoredFamily);
   const sub = OFFICE_FONT_SUBSTITUTE[authoredFamily.toLowerCase()];
   const subPart = sub ? `"${sub}", ` : '';
@@ -827,17 +830,21 @@ export function cssFontStack(normalized: string, authoredFamily = normalized): s
   // Arabic faces keep the historical chain unchanged (Arabic leads; appending a
   // CJK or non-CJK tail would let Latin/digits leak away from the Arabic face).
   if (isArabicScriptFace(authoredFamily)) {
-    return `"${normalized}", ${subPart}${ARABIC_FALLBACKS}, ${generic}`;
+    const cjk = fallback ? cjkFallbackChain(fallback, 'sans') : [];
+    return `"${normalized}", ${subPart}${ARABIC_FALLBACKS}, ${cjk.length ? `${quoteAll(cjk)}, ` : ''}${generic}`;
   }
   const variant: 'sans' | 'serif' = generic === 'serif' ? 'serif' : 'sans';
-  const cjk = classifyCjkFont(authoredFamily);
+  const authoredCjk = classifyCjkFont(authoredFamily);
+  const cjk = authoredCjk ?? fallback;
   const cjkFamilies = cjk
     ? cjkFallbackChain(cjk, variant).filter((name) => name !== googleAlias)
     : [];
   const cjkPart = cjkFamilies.length > 0 ? `${quoteAll(cjkFamilies)}, ` : '';
   const nonCjk = variant === 'serif' ? NON_CJK_SERIF_FALLBACKS : NON_CJK_SANS_FALLBACKS;
   const nonCjkPart = `${quoteAll(nonCjk)}, `;
-  return `"${normalized}", ${subPart}${aliasPart}${cjkPart}${nonCjkPart}${generic}`;
+  return authoredCjk
+    ? `"${normalized}", ${subPart}${aliasPart}${cjkPart}${nonCjkPart}${generic}`
+    : `"${normalized}", ${subPart}${aliasPart}${nonCjkPart}${cjkPart}${generic}`;
 }
 
 /**
@@ -992,16 +999,30 @@ function applyTextRunReflection(
   liveCtx.restore();
 }
 
-export function buildFont(bold: boolean, italic: boolean, sizePx: number, family: string, rc: RenderContext): string {
+export function buildFont(
+  bold: boolean,
+  italic: boolean,
+  sizePx: number,
+  family: string,
+  rc: RenderContext,
+  text = '',
+): string {
   const style  = italic ? 'italic ' : '';
   const normalized = normalizeFontFamily(family, rc);
   const authoredFamily = rc.embeddedFontAuthoredFamilies?.get(normalized) ?? normalized;
   const inferredWeight = namedFaceWeight(authoredFamily);
   const weight = bold ? 'bold ' : inferredWeight ? `${inferredWeight} ` : '';
+  const fallback = /\p{Script=Han}/u.test(text)
+    ? rc.cjkFallback ?? classifyCjkFont(rc.themeMajorFont) ?? classifyCjkFont(rc.themeMinorFont) ?? undefined
+    : undefined;
   if (CSS_GENERIC_FAMILIES.has(normalized)) {
-    return `${style}${weight}${sizePx}px ${normalized}`;
+    const families = fallback ? cjkFallbackChain(fallback, normalized === 'serif' ? 'serif' : 'sans') : [];
+    const latin = normalized === 'monospace' ? ['Courier New', 'Liberation Mono']
+      : normalized === 'serif' ? [...NON_CJK_SERIF_FALLBACKS, 'Times New Roman', 'Liberation Serif']
+      : [...NON_CJK_SANS_FALLBACKS, 'Arial', 'Helvetica', 'Liberation Sans'];
+    return `${style}${weight}${sizePx}px ${families.length ? `${quoteAll([...latin, ...families])}, ` : ''}${normalized}`;
   }
-  return `${style}${weight}${sizePx}px ${cssFontStack(normalized, authoredFamily)}`;
+  return `${style}${weight}${sizePx}px ${cssFontStack(normalized, authoredFamily, fallback)}`;
 }
 
 /**
@@ -1183,7 +1204,14 @@ export function naturalWidthExceedsBbox(
       const family = normalizeFontFamily(run.fontFamily ?? para.defFontFamily ?? null, rc);
       const isBold = run.bold ?? para.defBold ?? body.defaultBold ?? false;
       const isItalic = run.italic ?? para.defItalic ?? body.defaultItalic ?? false;
-      ctx.font = buildFont(isBold, isItalic, baselineDrawSizePx(sizePx, run.baseline ?? undefined), family, rc);
+      ctx.font = buildFont(
+        isBold,
+        isItalic,
+        baselineDrawSizePx(sizePx, run.baseline ?? undefined),
+        family,
+        rc,
+        run.text,
+      );
       const letterSpacingPx = (run.letterSpacing ?? 0) * PT_TO_EMU * scale;
       lineW += measureTextAdvance(ctx, run.text, letterSpacingPx);
       if (lineW > textMaxW) return true;
@@ -1637,9 +1665,9 @@ export function layoutParagraph(
     // Cascade: run → paragraph defRPr → body/layout default → false
     const isBold   = run.bold   ?? para.defBold   ?? defaultBold;
     const isItalic = run.italic ?? para.defItalic ?? defaultItalic;
-    const font   = buildFont(isBold, isItalic, drawSizePx, family, rc);
+    const font   = buildFont(isBold, isItalic, drawSizePx, family, rc, run.text);
     const fontEa = familyEa
-      ? buildFont(isBold, isItalic, drawSizePx, familyEa, rc)
+      ? buildFont(isBold, isItalic, drawSizePx, familyEa, rc, run.text)
       : font;
     ctx.font = font;
 
@@ -1759,9 +1787,9 @@ export function layoutParagraph(
             const mapped = symbolFontToUnicode(ch, symName);
             if (mapped !== ch) {
               drawCh = mapped;
-              chFont = buildFont(isBold, isItalic, drawSizePx, 'sans-serif', rc);
+              chFont = buildFont(isBold, isItalic, drawSizePx, 'sans-serif', rc, drawCh);
             } else {
-              chFont = buildFont(isBold, isItalic, drawSizePx, symName, rc);
+              chFont = buildFont(isBold, isItalic, drawSizePx, symName, rc, drawCh);
             }
           }
           ctx.font = chFont;
@@ -4428,7 +4456,7 @@ export function renderTextBody(
       // If the char was mapped to a Unicode symbol, use sans-serif for reliable rendering.
       // Otherwise use the specified font (e.g. Wingdings on systems that have it).
       const convertedFamily = bulletLabel !== b.char ? 'sans-serif' : normalizeFontFamily(b.fontFamily ?? null, rc);
-      bulletFont  = buildFont(false, false, bSizePx, convertedFamily, rc);
+      bulletFont  = buildFont(false, false, bSizePx, convertedFamily, rc, bulletLabel);
       bulletColor = b.color ? hexToRgba(b.color) : bulletInheritedColor;
     } else if (bullet.type === 'autoNum') {
       const b = bullet;
@@ -4443,6 +4471,7 @@ export function renderTextBody(
         bSizePx,
         normalizeFontFamily(b.fontFamily ?? firstRunFontFamily, rc),
         rc,
+        bulletLabel,
       );
       // ECMA-376 §21.1.2.4.4 (buClr): an explicit `<a:buClr>` colours the
       // auto-number marker, mirroring the char-bullet branch above. Only when it
@@ -7020,6 +7049,7 @@ export type SlideRenderOptions = RenderOptions & {
  * render options. They are an implementation detail of embedded-font lifetime
  * isolation, not a caller-configurable rendering policy. */
 type InternalSlideRenderOptions = SlideRenderOptions & {
+  cjkFallback?: CjkLang;
   embeddedFontAliases?: ReadonlyMap<string, string>;
   embeddedFontAuthoredFamilies?: ReadonlyMap<string, string>;
   svgDecoder?: SvgBlobDecoder;
@@ -7252,6 +7282,7 @@ async function renderSlideLeased(
 
   const pictureBulletImages = new Map<string, SvgImageSource | null>();
   const rc: RenderContext = {
+    cjkFallback: opts.cjkFallback ? pptxSlideCjkFallback(slide, opts.majorFont ?? null, opts.minorFont ?? null, opts.cjkFallback) : undefined,
     themeMajorFont: opts.majorFont ?? null,
     themeMinorFont: opts.minorFont ?? null,
     themeHlinkColor: opts.hlinkColor ?? null,

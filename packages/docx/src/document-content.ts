@@ -13,6 +13,7 @@ import type {
 
 type InternalRenderedFontAxes = Readonly<{
   fontFamilyHighAnsi?: string | null;
+  langEastAsia?: string;
   fontFamilyEastAsia?: string | null;
   fontFamilyCs?: string | null;
   boldCs?: boolean;
@@ -24,6 +25,7 @@ type InternalRenderedFontAxes = Readonly<{
  * affect line metrics even when they paint no glyphs. */
 export interface DocxRenderedTextUsage {
   text: string;
+  eastAsiaLanguage?: string;
   fontFamilies: readonly (string | null | undefined)[];
   /** Families eligible for ASCII/high-ANSI scalars in this rendered string. */
   latinFontFamilies?: readonly (string | null | undefined)[];
@@ -95,6 +97,7 @@ function* runUsages(run: DocRun): Generator<DocxRenderedTextUsage> {
     const text = run as DocxTextRun & InternalRenderedFontAxes;
     yield {
       text: run.text,
+      eastAsiaLanguage: text.langEastAsia,
       fontFamilies: [run.fontFamily, text.fontFamilyHighAnsi, run.fontFamilyEastAsia],
       latinFontFamilies: [run.fontFamily, text.fontFamilyHighAnsi],
       eastAsianFontFamilies: [run.fontFamilyEastAsia ?? run.fontFamily],
@@ -103,6 +106,7 @@ function* runUsages(run: DocRun): Generator<DocxRenderedTextUsage> {
     };
     yield {
       text: run.text,
+      eastAsiaLanguage: text.langEastAsia,
       fontFamilies: [run.fontFamilyCs],
       bold: run.boldCs ?? false,
       italic: run.italicCs ?? false,
@@ -111,6 +115,7 @@ function* runUsages(run: DocRun): Generator<DocxRenderedTextUsage> {
     const field = run as FieldRun & InternalRenderedFontAxes;
     yield {
       text: field.fallbackText,
+      eastAsiaLanguage: field.langEastAsia,
       fontFamilies: [field.fontFamily, field.fontFamilyHighAnsi, field.fontFamilyEastAsia],
       latinFontFamilies: [field.fontFamily, field.fontFamilyHighAnsi],
       eastAsianFontFamilies: [field.fontFamilyEastAsia ?? field.fontFamily],
@@ -119,6 +124,7 @@ function* runUsages(run: DocRun): Generator<DocxRenderedTextUsage> {
     };
     yield {
       text: field.fallbackText,
+      eastAsiaLanguage: field.langEastAsia,
       fontFamilies: [field.fontFamilyCs],
       bold: field.boldCs ?? false,
       italic: field.italicCs ?? false,

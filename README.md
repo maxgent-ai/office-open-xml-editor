@@ -573,8 +573,36 @@ page count, or completion state changes), `onVisibleSlideChange` (fires when the
 top-most visible slide or PPTX completion state changes; its slide count is
 final from first paint), and `onError` (async per-page render failures are routed
 here instead of crashing the scroll loop). The parse/render knobs from the
-headless engines (`mode`, `useGoogleFonts`, `googleFontsCssOrigin`, `resourceLimits`, the deprecated
+headless engines (`mode`, `useGoogleFonts`, `googleFontsCssOrigin`, `cjkFallback`, `resourceLimits`, the deprecated
 `maxZipEntryBytes` alias, `math`, `dpr`) are accepted too.
+
+### CJK fallback region
+
+All document engines and viewers accept `cjkFallback: 'auto' | 'sc' | 'tc' | 'hk' | 'jp' | 'kr'`.
+It chooses the regional fallback for ambiguous Han text; authored fonts and
+recognized document font regions retain priority.
+
+```ts
+const viewer = new DocxViewer(canvas, { cjkFallback: 'sc' });
+```
+
+Omitting the option is equivalent to `'auto'`: at load time, resolve the first
+usable CJK language from `<html lang>`, then `navigator.languages` in order,
+then `navigator.language`. If none is available, use `'jp'`. For Chinese,
+explicit Hans/Hant maps to SC/TC and takes precedence over region; without an
+explicit script, HK/MO maps to HK and TW maps to TC. Bare `zh` maps to SC.
+Japanese and Korean map to JP and KR.
+The resolved preference is shared with workers and remains fixed for that load.
+
+No migration is required. Ambiguous Han text can now use different regional
+glyphs according to the host language. Set an explicit region for reproducible
+output, including in Node. This option does not enable Google Fonts; use
+`useGoogleFonts: true` or provide local/self-hosted fallback fonts as usual.
+HK retains the existing sans-only webfont support. This option covers document
+text, spreadsheet cells/shapes, and slide text; embedded chart and equation
+renderers retain their own font policies. XLSX automatic script inference uses
+the shared-string table; inline cell strings and shape text do not contribute
+to that workbook-level inference.
 
 ### Markdown export
 

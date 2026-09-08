@@ -1,3 +1,4 @@
+import { resolveCjkFallback, type CjkLang } from '@silurus/ooxml-core';
 import InlineWorker from './worker.ts?worker&inline';
 import wasmAssetUrl from './wasm/docx_parser_bg.wasm?url';
 import {
@@ -317,6 +318,7 @@ function snapshotReviewData(
 
 export class DocxDocument {
   private _metrics: OoxmlResourceMetricsSession | null = null;
+  private _cjkFallback: CjkLang = 'jp';
   private _document: DocxDocumentModel | null = null;
   private _source: LayoutSourceStore | null = null;
   private _meta: DocumentMeta | null = null;
@@ -436,6 +438,7 @@ export class DocxDocument {
   }
 
   static async load(source: string | ArrayBuffer, opts: LoadOptions = {}): Promise<DocxDocument> {
+    const cjkFallback = resolveCjkFallback(opts.cjkFallback);
     const resourceOptions = normalizeLoadResourceOptions(opts);
     const googleFontsCssOrigin = opts.useGoogleFonts
       ? normalizeGoogleFontsCssOrigin(opts.googleFontsCssOrigin)
@@ -480,6 +483,7 @@ export class DocxDocument {
     try {
       doc = new DocxDocument(worker, mode, defaultCurrentDateMs, opts.wasmUrl);
       doc._metrics = metrics;
+      doc._cjkFallback = cjkFallback;
       // The variant the caller will actually render, recorded for BOTH render
       // modes and recorded BEFORE the parse: geometry accessors and the
       // per-call option fill-in (`_withActiveView`) read it, the wire options
@@ -555,7 +559,7 @@ export class DocxDocument {
       doc._tiff = doc._mode === 'worker' ? undefined : opts.tiff;
       if (doc._mode === 'main' && opts.useGoogleFonts && doc._document) {
         doc._googleFontFaces = await preloadGoogleFonts(
-          docxFontPreloadNames(doc._document),
+          docxFontPreloadNames(doc._document, cjkFallback),
           DOCX_GOOGLE_FONTS,
           undefined,
           googleFontsCssOrigin,
@@ -594,6 +598,7 @@ export class DocxDocument {
             doc._source.fontFamilyCharsets,
           ),
           useGoogleFonts: !!opts.useGoogleFonts,
+          cjkFallback,
           embeddedFaces: doc._embeddedFontFaces,
           googleFaces: doc._googleFontFaces,
           mathResources: preparedMath?.records,
@@ -816,7 +821,7 @@ export class DocxDocument {
     const res = await this._bridge.request(
       (id) =>
         this._mode === 'worker'
-          ? ({ type: 'parse', id, data: buffer, resourcePolicy, useGoogleFonts, googleFontsCssOrigin, defaultCurrentDateMs: documentLayoutRuntimeOf(this).defaultCurrentDateMs, ...this._parseViewFields(), renderers } satisfies RenderWorkerRequest)
+          ? ({ type: 'parse', id, data: buffer, resourcePolicy, useGoogleFonts, googleFontsCssOrigin, cjkFallback: this._cjkFallback, defaultCurrentDateMs: documentLayoutRuntimeOf(this).defaultCurrentDateMs, ...this._parseViewFields(), renderers } satisfies RenderWorkerRequest)
           : ({ type: 'parse', id, data: buffer, resourcePolicy } satisfies WorkerRequest),
       [buffer],
       { timeoutMs },
@@ -1120,6 +1125,7 @@ export class DocxDocument {
           resourcePolicy,
           useGoogleFonts,
           googleFontsCssOrigin,
+          cjkFallback: this._cjkFallback,
           defaultCurrentDateMs: documentLayoutRuntimeOf(this).defaultCurrentDateMs,
           ...this._parseViewFields(),
           renderers,

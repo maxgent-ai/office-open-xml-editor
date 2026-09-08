@@ -1,3 +1,4 @@
+import type { CjkLang } from '@silurus/ooxml-core';
 import {
   defaultDpr,
   isHTMLCanvas,
@@ -732,6 +733,7 @@ export async function prefetchImages(
 }
 
 export interface RenderDeps {
+  cjkFallback?: CjkLang;
   ws: Worksheet;
   styles: ParsedWorkbook['styles'];
   math?: MathRenderer;
@@ -747,6 +749,7 @@ export function worksheetWithAutoRowHeights(
   ctx: CanvasRenderingContext2D,
   source: Worksheet,
   styles: ParsedWorkbook['styles'],
+  cjkFallback?: CjkLang,
 ): Worksheet {
   if (hasPreparedAutoRowHeights(source)) return source;
   const cached = autoHeightProjectionCache.get(source);
@@ -761,7 +764,7 @@ export function worksheetWithAutoRowHeights(
   // so worker/direct auto-fit wraps at the exact same column pixels.
   const mdw = getGridGeometryForWorksheet(source).maximumDigitWidth;
   GridGeometry.forWorksheet(projection, mdw);
-  applyAutoRowHeights(ctx, projection, styles);
+  applyAutoRowHeights(ctx, projection, styles, cjkFallback);
   // applyAutoRowHeights invalidates geometry after deriving row sizes; seed the
   // rebuilt row axis with the same authoritative MDW rather than remeasuring in
   // another Canvas realm.
@@ -817,7 +820,7 @@ async function renderWorksheetViewportLeased(
   if (!measurementCtx) throw new Error('XLSX render target does not provide a 2-D canvas context');
   const ws = deps.ws.isDialogSheet
     ? deps.ws
-    : worksheetWithAutoRowHeights(measurementCtx, deps.ws, styles);
+    : worksheetWithAutoRowHeights(measurementCtx, deps.ws, styles, deps.cjkFallback);
   const rawW = isHTMLCanvas(target) ? (target.clientWidth || 800) : target.width;
   const rawH = isHTMLCanvas(target) ? (target.clientHeight || 600) : target.height;
   const width = opts.width ?? rawW;
@@ -931,7 +934,7 @@ async function renderWorksheetViewportLeased(
     threeD: deps.threeD,
     regionMap: deps.regionMap,
     chartEx: deps.chartEx,
-  });
+  }, deps.cjkFallback);
 }
 
 /**

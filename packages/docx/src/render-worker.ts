@@ -255,7 +255,7 @@ self.onmessage = async (e: MessageEvent<RenderWorkerWireRequest | WorkerSvgDecod
         // Pagination measures text, so fonts must land before canonical layout —
         // same ordering the main-mode load() guarantees.
         googleFaces = await preloadGoogleFonts(
-          docxFontPreloadNames(model),
+          docxFontPreloadNames(model, req.cjkFallback),
           DOCX_GOOGLE_FONTS,
           undefined,
           req.googleFontsCssOrigin,
@@ -285,6 +285,7 @@ self.onmessage = async (e: MessageEvent<RenderWorkerWireRequest | WorkerSvgDecod
           source.fontFamilyCharsets,
         ),
         useGoogleFonts: !!req.useGoogleFonts,
+        cjkFallback: req.cjkFallback,
         embeddedFaces: embeddedFonts.faces,
         googleFaces,
         mathResources: preparedMath?.records,

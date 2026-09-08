@@ -119,3 +119,17 @@ describe('cssTailFor / fontStackFor — Latin serif & mono (bug fix)', () => {
     expect(cssTailFor('Microsoft YaHei').endsWith('sans-serif')).toBe(true);
   });
 });
+
+
+it('uses per-workbook fallback only for Han while preserving authored regions', () => {
+  for (const family of [null, 'Calibri', 'Arial']) {
+    const sc = fontStackFor(family, 'sc', '漢');
+    expect(sc.indexOf('"Carlito"')).toBeLessThan(sc.indexOf('"Noto Sans SC"'));
+    expect(sc.indexOf('"Noto Sans SC"')).toBeLessThan(sc.indexOf('"Noto Sans JP"'));
+    const tc = fontStackFor(family, 'tc', '漢');
+    expect(tc.indexOf('"Noto Sans TC"')).toBeLessThan(tc.indexOf('"Noto Sans SC"'));
+    expect(fontStackFor(family, 'sc', '→')).not.toContain('Noto Sans SC');
+  }
+  const jp = fontStackFor('Meiryo', 'sc', '→');
+  expect(jp.indexOf('"Noto Sans JP"')).toBeLessThan(jp.indexOf('"Noto Sans SC"'));
+});

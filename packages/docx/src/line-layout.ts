@@ -1,3 +1,4 @@
+import type { CjkLang } from '@silurus/ooxml-core';
 // DOCX line-layout engine — the pure segmentation + line-breaking + measurement
 // kernel that both the paginator and the paint pass call to turn a paragraph's
 // runs into laid-out lines and line-box heights (ECMA-376 §17.3.1.x line
@@ -760,10 +761,10 @@ export const ARABIC_TAIL_SANS = ['Noto Naskh Arabic', 'Noto Sans Arabic'] as con
  * collision so their position is immaterial; they sit before the generic so
  * the browser's per-glyph fallback can reach them.
  */
-export function sansTail(cjk: ReturnType<typeof classifyCjkFont>): string {
+export function sansTail(cjk: ReturnType<typeof classifyCjkFont>, fallback?: CjkLang): string {
   const cjkPart =
-    cjk && cjk !== 'jp'
-      ? cjkFallbackChain(cjk, 'sans')
+    (cjk ?? fallback) && (cjk ?? fallback) !== 'jp'
+      ? cjkFallbackChain((cjk ?? fallback) as CjkLang, 'sans')
       : // JP / stray-CJK sans faces: historical system-font hints, then the Noto
         // CJK siblings so a CJK glyph still resolves on hosts lacking them.
         ['Noto Sans JP', 'Hiragino Sans', 'Meiryo', ...cjkFallbackChain('jp', 'sans').slice(1)];
@@ -778,10 +779,10 @@ export function sansTail(cjk: ReturnType<typeof classifyCjkFont>): string {
 }
 
 /** Serif counterpart of {@link sansTail}. */
-export function serifTail(cjk: ReturnType<typeof classifyCjkFont>): string {
+export function serifTail(cjk: ReturnType<typeof classifyCjkFont>, fallback?: CjkLang): string {
   const cjkPart =
-    cjk && cjk !== 'jp'
-      ? cjkFallbackChain(cjk, 'serif')
+    (cjk ?? fallback) && (cjk ?? fallback) !== 'jp'
+      ? cjkFallbackChain((cjk ?? fallback) as CjkLang, 'serif')
       : // JP / stray-CJK serif faces: historical mincho system hints, then Noto
         // serif CJK siblings.
         [
@@ -888,8 +889,14 @@ export function normalizeFontFamilyUncached(
   family: string | null,
   fontFamilyClasses: Record<string, string>,
   fontFamilyPitches: Record<string, string> = {},
+  cjkFallback?: CjkLang,
 ): string {
-  if (!family) return sansTail(null);
+  if (!family || family === 'sans-serif') return sansTail(null, cjkFallback);
+  if (family === 'serif') return serifTail(null, cjkFallback);
+  const monoTail = cjkFallback
+    ? `"Courier New", ${quoteAll(cjkFallbackChain(cjkFallback, 'sans'))}, monospace`
+    : '"Courier New", monospace';
+  if (family === 'monospace') return monoTail;
 
   const escape = (s: string) => s.replace(/"/g, '\\"');
   const head = `"${escape(family)}"`;
@@ -917,9 +924,13 @@ export function normalizeFontFamilyUncached(
   //    geometric Arabic faces instead pair with a sans Latin fallback.
   if (isArabicSubstituteFont(family)) {
     if (NASKH_SERIF_ARABIC_FONTS.has(lower)) {
-      return `${head}, "Noto Naskh Arabic", "Noto Sans Arabic", "Noto Serif", "Noto Sans JP", "Hiragino Sans", serif`;
+      return cjkFallback
+        ? `${head}, "Noto Naskh Arabic", "Noto Sans Arabic", "Noto Serif", ${sansTail(null, cjkFallback).replace(/sans-serif$/, 'serif')}`
+        : `${head}, "Noto Naskh Arabic", "Noto Sans Arabic", "Noto Serif", "Noto Sans JP", "Hiragino Sans", serif`;
     }
-    return `${head}, "Noto Sans Arabic", "Noto Naskh Arabic", "Noto Sans JP", "Hiragino Sans", sans-serif`;
+    return cjkFallback
+      ? `${head}, "Noto Sans Arabic", "Noto Naskh Arabic", ${sansTail(null, cjkFallback)}`
+      : `${head}, "Noto Sans Arabic", "Noto Naskh Arabic", "Noto Sans JP", "Hiragino Sans", sans-serif`;
   }
 
   // 1) Authoritative classification from word/fontTable.xml §17.8.3.10.
@@ -927,9 +938,9 @@ export function normalizeFontFamilyUncached(
   if (tableClass && tableClass !== 'auto') {
     switch (tableClass) {
       case 'roman':
-        return `${head}, ${serifTail(cjk)}`;
+        return `${head}, ${serifTail(cjk, cjkFallback)}`;
       case 'swiss':
-        return `${head}, ${sansTail(cjk)}`;
+        return `${head}, ${sansTail(cjk, cjkFallback)}`;
       case 'modern': {
         // §17.8.3.10 `modern` is the "modern/monospace" typeface family, but the
         // family value classifies the DESIGN, not the pitch — §17.8.3.14
@@ -950,7 +961,7 @@ export function normalizeFontFamilyUncached(
               : cjkFallbackChain(cjk, 'sans');
             return `${head}, ${quoteAll([...cjkFallbacks, 'Courier New'])}, monospace`;
           }
-          return `${head}, "Courier New", monospace`;
+          return `${head}, ${monoTail}`;
         }
         break;
       }
@@ -972,31 +983,33 @@ export function normalizeFontFamilyUncached(
   //    mono on the name path), so no prior serif/sans coverage is lost.
   const generic = classifyFontGeneric(family);
   if (generic === 'serif') {
-    return `${head}, ${serifTail(cjk)}`;
+    return `${head}, ${serifTail(cjk, cjkFallback)}`;
   }
   if (generic === 'mono') {
     // Mirror the fontTable `modern` branch's monospace fallback. NEW for the
     // name path: core now detects consolas/courier/等幅 etc. as mono.
-    return `${head}, "Courier New", monospace`;
+    return `${head}, ${monoTail}`;
   }
 
   // Japanese system-font hints (only meaningful for JP / Latin faces; a non-JP
   // CJK face skips these so its matching Noto CJK leads the tail).
   if (cjk == null || cjk === 'jp') {
     if (lower.includes('meiryo') || family.includes('メイリオ')) {
-      return `${head}, "Meiryo UI", "Meiryo", ${sansTail(cjk)}`;
+      return `${head}, "Meiryo UI", "Meiryo", ${sansTail(cjk, cjkFallback)}`;
     }
     if (family.includes('游ゴシック') || /\byu\s*gothic\b/i.test(family) || lower.includes('yugothic')) {
-      return `${head}, "Yu Gothic", "YuGothic", ${sansTail(cjk)}`;
+      return `${head}, "Yu Gothic", "YuGothic", ${sansTail(cjk, cjkFallback)}`;
     }
     if (lower.includes('ipa')) {
-      return `${head}, "IPAexGothic", ${sansTail(cjk)}`;
+      return `${head}, "IPAexGothic", ${sansTail(cjk, cjkFallback)}`;
     }
     if (lower.includes('segoe')) {
-      return `${head}, "Segoe UI", ${quoteAll([...ARABIC_TAIL_SANS, ...NON_CJK_SANS_FALLBACKS])}, sans-serif`;
+      return cjkFallback
+        ? `${head}, "Segoe UI", ${sansTail(null, cjkFallback)}`
+        : `${head}, "Segoe UI", ${quoteAll([...ARABIC_TAIL_SANS, ...NON_CJK_SANS_FALLBACKS])}, sans-serif`;
     }
   }
-  return `${head}, ${sansTail(cjk)}`;
+  return `${head}, ${sansTail(cjk, cjkFallback)}`;
 }
 
 export function buildFont(

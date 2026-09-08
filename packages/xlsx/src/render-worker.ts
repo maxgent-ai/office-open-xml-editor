@@ -1,3 +1,5 @@
+import type { CjkLang } from '@silurus/ooxml-core';
+import { xlsxCjkFallback } from './google-fonts.js';
 /**
  * Render-capable worker entry: parse → font preload → (lazy) per-sheet parse →
  * render, all worker-side; renders a sheet viewport into an OffscreenCanvas and
@@ -61,6 +63,7 @@ const host = new WasmParserHost<XlsxArchive>(init, {
   // wasm-bindgen singleton). `reinit` forces fresh linear memory after a trap.
   reinit,
 });
+let cjkFallback: CjkLang = 'jp';
 let workbook: ParsedWorkbook | null = null;
 let archiveBacked = false;
 let renderers: LoadedWorkerRenderers = {};
@@ -208,6 +211,7 @@ self.onmessage = async (e: MessageEvent<
       // next document from being served a stale bitmap for an identically-named
       // zip path. Symmetric with XlsxWorkbook.destroy() and the docx/pptx render
       // workers (issue #781).
+      cjkFallback = req.cjkFallback ?? 'jp';
       sheetCache.clear();
       viewProjectionCache.clear();
       sheetCacheUsage.clear();
@@ -222,13 +226,14 @@ self.onmessage = async (e: MessageEvent<
         const { parseDelimitedWorksheet } = await delimitedTextModule;
         const parsed = parseDelimitedWorksheet(req.data, req.options);
         workbook = parsed.workbook;
+        cjkFallback = xlsxCjkFallback(workbook, cjkFallback);
         const measured = measureWorksheet(parsed.worksheet);
         retainedSheetUsage = measured;
         sheetCache.set(0, parsed.worksheet);
         sheetCacheUsage.set(0, measured);
         fontsLoaded = req.useGoogleFonts
           ? preloadGoogleFonts(
-              xlsxFontPreloadNames(parsed.workbook),
+              xlsxFontPreloadNames(parsed.workbook, cjkFallback),
               XLSX_GOOGLE_FONTS,
               undefined,
               req.googleFontsCssOrigin,
@@ -265,13 +270,14 @@ self.onmessage = async (e: MessageEvent<
         () => host.run(() => host.archive!.resource_usage()),
       );
       workbook = bootstrap.workbook;
+      cjkFallback = xlsxCjkFallback(workbook, cjkFallback);
       if (req.useGoogleFonts) {
         // Mirror XlsxWorkbook._load exactly: queue Google Fonts substitutes for
         // every styled font name, plus the generic Arabic fallbacks. Fonts must
         // land before rendering (which measures text), so we keep the promise
         // and await it in the renderViewport handler.
         fontsLoaded = preloadGoogleFonts(
-          xlsxFontPreloadNames(workbook),
+          xlsxFontPreloadNames(workbook, cjkFallback),
           XLSX_GOOGLE_FONTS,
           undefined,
           req.googleFontsCssOrigin,
@@ -311,7 +317,7 @@ self.onmessage = async (e: MessageEvent<
       }
       const canvas = new OffscreenCanvas(1, 1); // orchestrator resizes it
       await renderWorksheetViewport(
-        workerRenderDeps(renderWorksheet, workbook.styles, renderers),
+        { ...workerRenderDeps(renderWorksheet, workbook.styles, renderers), cjkFallback },
         canvas,
         req.viewport,
         // Supply the in-worker byte loader so embedded images decode straight

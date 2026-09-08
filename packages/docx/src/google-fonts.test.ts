@@ -128,3 +128,29 @@ describe('DOCX_GOOGLE_FONTS — shared registry consolidation (oracle)', () => {
     });
   });
 });
+
+
+it('preloads the configured fallback only for ambiguous Han', () => {
+  expect(docxFontPreloadNames(docWith('漢字'), 'sc')).toContain('Noto Sans SC');
+  expect(docxFontPreloadNames(docWith('漢字'), 'sc')).not.toContain('Noto Sans JP');
+  expect(docxFontPreloadNames(docWith('Hello'), 'sc')).toEqual(['Calibri', 'Calibri']);
+  expect(docxFontPreloadNames(docWith('漢字', 'Meiryo'), 'sc')).toContain('Noto Sans JP');
+  expect(docxFontPreloadNames(docWith('漢字かな'), 'sc')).toContain('Noto Sans JP');
+});
+
+
+it('preloads an explicitly authored East Asian run language ahead of host preference', () => {
+  const doc = docWith('漢字');
+  Object.assign((doc.body[0] as { runs: object[] }).runs[0], { langEastAsia: 'ja-JP' });
+  const names = docxFontPreloadNames(doc, 'sc');
+  expect(names).toContain('Noto Sans JP');
+  expect(names).not.toContain('Noto Sans SC');
+});
+
+
+it('preloads the explicit Chinese region even when the same run contains kana', () => {
+  const doc = docWith('漢字かな');
+  Object.assign((doc.body[0] as { runs: object[] }).runs[0], { langEastAsia: 'zh-CN' });
+  expect(docxFontPreloadNames(doc, 'tc')).toContain('Noto Sans SC');
+  expect(docxFontPreloadNames(doc, 'tc')).toContain('Noto Sans JP');
+});

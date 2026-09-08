@@ -1,3 +1,4 @@
+import { resolveCjkFallback, type CjkLang } from '@silurus/ooxml-core';
 import type { DimOptions, PptxComment } from './types';
 import {
   renderSlideWithEmbeddedFonts,
@@ -224,6 +225,7 @@ export interface PresentSlideOptions extends Omit<RenderSlideOptions, 'skipMedia
  * await pres.renderSlide(canvas, 0, { width: 960 });
  */
 export class PptxPresentation {
+  private _cjkFallback: CjkLang = 'jp';
   private _metrics: OoxmlResourceMetricsSession | null = null;
   private readonly _worker: Worker;
   private readonly _bridge: WorkerBridge<
@@ -332,6 +334,7 @@ export class PptxPresentation {
     source: string | ArrayBuffer,
     opts: LoadOptions = {},
   ): Promise<PptxPresentation> {
+    const cjkFallback = resolveCjkFallback(opts.cjkFallback);
     const resourceOptions = normalizeLoadResourceOptions(opts);
     const googleFontsCssOrigin = opts.useGoogleFonts
       ? normalizeGoogleFontsCssOrigin(opts.googleFontsCssOrigin)
@@ -386,6 +389,7 @@ export class PptxPresentation {
           "[ooxml] a custom 3-D chart renderer cannot cross the worker boundary; charts use their 2-D family fallback in mode: 'worker'. Use the renderer from @silurus/ooxml/three-d.",
         );
       }
+      pres._cjkFallback = cjkFallback;
       pres._math = mode === 'worker' ? undefined : opts.math;
       pres._threeD = mode === 'worker' ? undefined : opts.threeD;
       if (opts.regionMap && mode === 'worker' && !rendererDescriptors?.regionMap) {
@@ -478,7 +482,7 @@ export class PptxPresentation {
     const response = await this._bridge.request(
       (id) =>
         this._mode === 'worker'
-          ? ({ kind: 'parse', id, buffer, resourcePolicy, useGoogleFonts, googleFontsCssOrigin, renderers } satisfies RenderWorkerRequest)
+          ? ({ kind: 'parse', id, buffer, resourcePolicy, useGoogleFonts, googleFontsCssOrigin, cjkFallback: this._cjkFallback, renderers } satisfies RenderWorkerRequest)
           : ({ kind: 'parse', id, buffer, resourcePolicy } satisfies PptxWorkerRequest),
       [buffer],
       { timeoutMs },
@@ -606,7 +610,7 @@ export class PptxPresentation {
         return slide;
       },
     });
-    const builder = new PresentationPreflightBuilder(bootstrap);
+    const builder = new PresentationPreflightBuilder(bootstrap, { cjkFallback: this._cjkFallback });
     const loadedGoogleFonts = new Set<string>();
     const ensureFonts = async (): Promise<void> => {
       await embeddedFontLoad;
@@ -663,7 +667,7 @@ export class PptxPresentation {
       (id) => {
         this._parseRequestId = id;
         return {
-          kind: 'parse', id, buffer, resourcePolicy, useGoogleFonts, googleFontsCssOrigin, renderers,
+          kind: 'parse', id, buffer, resourcePolicy, useGoogleFonts, googleFontsCssOrigin, cjkFallback: this._cjkFallback, renderers,
           progressiveLayout: true,
         } satisfies RenderWorkerRequest;
       },
@@ -1065,6 +1069,7 @@ export class PptxPresentation {
             width,
             dpr,
             defaultTextColor: compact.defaultTextColor,
+            cjkFallback: this._cjkFallback,
             majorFont: compact.majorFont,
             minorFont: compact.minorFont,
             hlinkColor: compact.hlinkColor,

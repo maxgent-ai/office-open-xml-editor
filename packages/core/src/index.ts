@@ -167,8 +167,10 @@ export {
   type CanvasFontBoxProbeContext,
   type CanvasFontBoxProbeOptions,
 } from './fonts/canvas-font-box';
+export { resolveCjkFallback, cjkLangFromLanguage, type CjkFallback } from './fonts/cjk-fallback.js';
 export {
   classifyCjkFont,
+  cjkFallbackForText,
   classifyFontGeneric,
   GOOGLE_CJK_FONT_ALIASES,
   googleCjkFontAlias,
