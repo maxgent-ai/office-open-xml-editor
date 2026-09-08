@@ -1,3 +1,5 @@
+import { resolveCjkFallback, type CjkLang } from '@silurus/ooxml-core';
+import { xlsxCjkFallback } from './google-fonts.js';
 import InlineWorker from './worker.ts?worker&inline';
 import wasmAssetUrl from './wasm/xlsx_parser_bg.wasm?url';
 import {
@@ -71,7 +73,7 @@ import {
   XlsxWorksheetPullClient,
 } from './worksheet-pull-client.js';
 import { GridGeometry } from './internal/grid-geometry.js';
-import { applyAutoRowHeights, inheritSheetRenderCache } from './renderer.js';
+import { applyAutoRowHeights, inheritSheetRenderCache, getGridGeometryForWorksheet } from './renderer.js';
 import {
   assertDelimitedTextSourceBytes,
   resolveDelimitedTextOptions,
@@ -157,6 +159,7 @@ export class XlsxWorkbook {
   /** Opt-in OMML equation engine, injected once at {@link load}. Every
    *  `renderViewport` call reuses it — equations in shapes render when present,
    *  and are skipped when omitted. */
+  private cjkFallback: CjkLang = 'jp';
   private math: MathRenderer | undefined;
   /** Optional synchronous 3-D chart renderer. Worker mode reconstructs the
    * built-in implementation from its serializable identity. */
@@ -257,6 +260,7 @@ export class XlsxWorkbook {
     opts: LoadOptions,
     sourceOptions: Exclude<XlsxSheetLoadOptions, Readonly<{ format?: 'xlsx' }>>,
   ): Promise<XlsxWorkbook> {
+    opts = { ...opts, cjkFallback: resolveCjkFallback(opts.cjkFallback) };
     const delimited = resolveDelimitedTextOptions(sourceOptions);
     const resourceOptions = normalizeLoadResourceOptions(opts);
     const mode = opts.mode ?? 'main';
@@ -325,6 +329,7 @@ export class XlsxWorkbook {
 
   /** Parse an XLSX from a URL or ArrayBuffer. */
   static async load(source: string | ArrayBuffer, opts: LoadOptions = {}): Promise<XlsxWorkbook> {
+    opts = { ...opts, cjkFallback: resolveCjkFallback(opts.cjkFallback) };
     const resourceOptions = normalizeLoadResourceOptions(opts);
     const mode = opts.mode ?? 'main';
     const metrics = new OoxmlResourceMetricsSession({
@@ -413,6 +418,7 @@ export class XlsxWorkbook {
       ? normalizeGoogleFontsCssOrigin(opts.googleFontsCssOrigin)
       : undefined;
     this.workerTimeoutMs = opts.workerTimeoutMs;
+    this.cjkFallback = resolveCjkFallback(opts.cjkFallback);
     this.math = this._mode === 'worker' ? undefined : opts.math;
     this.threeD = this._mode === 'worker' ? undefined : opts.threeD;
     this.regionMap = this._mode === 'worker' ? undefined : opts.regionMap;
@@ -463,6 +469,7 @@ export class XlsxWorkbook {
               resourcePolicy,
               useGoogleFonts: !!opts.useGoogleFonts,
               googleFontsCssOrigin: this.googleFontsCssOrigin,
+              cjkFallback: this.cjkFallback,
               renderers: rendererDescriptors,
             } satisfies RenderWorkerRequest)
           : ({
@@ -490,6 +497,7 @@ export class XlsxWorkbook {
     }
     const parsedWorkbook = this.parsedWorkbook;
     if (!parsedWorkbook) throw new Error('XLSX worker returned no workbook metadata');
+    this.cjkFallback = xlsxCjkFallback(parsedWorkbook, this.cjkFallback);
     this.ensureWorksheetPullClient();
     // #773: a workbook-level degradation (a present-but-corrupt shared part such
     // as `xl/sharedStrings.xml`, which blanks every string cell across all sheets)
@@ -506,7 +514,7 @@ export class XlsxWorkbook {
       // realm even when paint runs in a worker. Register the same fallback
       // faces in both realms before any worksheet geometry snapshot is made so
       // ECMA-376 MDW is identical across paint and interaction.
-      this.googleFontNames = [...xlsxFontPreloadNames(parsedWorkbook)];
+      this.googleFontNames = [...xlsxFontPreloadNames(parsedWorkbook, this.cjkFallback)];
       if (typeof document !== 'undefined' && document.fonts) {
         await this.retainFontsInSet(document.fonts);
       }
@@ -526,6 +534,7 @@ export class XlsxWorkbook {
       ? normalizeGoogleFontsCssOrigin(opts.googleFontsCssOrigin)
       : undefined;
     this.workerTimeoutMs = opts.workerTimeoutMs;
+    this.cjkFallback = resolveCjkFallback(opts.cjkFallback);
     this.generation++;
     this.math = this._mode === 'worker' ? undefined : opts.math;
     this.threeD = this._mode === 'worker' ? undefined : opts.threeD;
@@ -543,6 +552,7 @@ export class XlsxWorkbook {
         options,
         useGoogleFonts: !!opts.useGoogleFonts,
         googleFontsCssOrigin: this.googleFontsCssOrigin,
+        cjkFallback: this.cjkFallback,
         renderers: rendererDescriptors,
       } satisfies DelimitedTextParseRequest),
       [data],
@@ -560,11 +570,12 @@ export class XlsxWorkbook {
     assertWorksheetJsonBytes(measured.jsonBytes, 'load-delimited-text', undefined);
     assertWorksheetCacheUsage(measured, 'load-delimited-text', undefined);
     this.parsedWorkbook = response.workbook;
+    this.cjkFallback = xlsxCjkFallback(response.workbook, this.cjkFallback);
     this.sheetCache.set(0, worksheet);
     this.retainedSheetUsage = measured;
 
     if (opts.useGoogleFonts) {
-      this.googleFontNames = [...xlsxFontPreloadNames(response.workbook)];
+      this.googleFontNames = [...xlsxFontPreloadNames(response.workbook, this.cjkFallback)];
       if (typeof document !== 'undefined' && document.fonts) {
         await this.retainFontsInSet(document.fonts);
       }
@@ -614,7 +625,8 @@ export class XlsxWorkbook {
    * measurement observes the same faces that the subsequent paint uses. */
   [prepareXlsxViewerRowHeights](worksheet: Worksheet, ctx: CanvasRenderingContext2D): void {
     if (!this.parsedWorkbook) return;
-    applyAutoRowHeights(ctx, worksheet, this.parsedWorkbook.styles);
+    getGridGeometryForWorksheet(worksheet);
+    applyAutoRowHeights(ctx, worksheet, this.parsedWorkbook.styles, this.cjkFallback);
   }
 
   get sheetNames(): string[] {
@@ -986,6 +998,7 @@ export class XlsxWorkbook {
         {
           ws,
           styles,
+          cjkFallback: this.cjkFallback,
           math: this.math,
           threeD: this.threeD,
           regionMap: this.regionMap,

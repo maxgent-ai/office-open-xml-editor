@@ -232,3 +232,27 @@ describe('buildFont — style encoded in a face name', () => {
     expect(font).toMatch(/^bold 48px "Franklin Gothic Medium"/);
   });
 });
+
+
+it('uses per-presentation fallback for neutral fonts while preserving named regions', () => {
+  const sc = cssFontStack('Calibri', 'Calibri', 'sc');
+  expect(sc.indexOf('"Carlito"')).toBeLessThan(sc.indexOf('"Noto Sans SC"'));
+  expect(sc.indexOf('"Noto Sans SC"')).toBeLessThan(sc.indexOf('"Noto Sans JP"'));
+  const tc = cssFontStack('Calibri', 'Calibri', 'tc');
+  expect(tc.indexOf('"Noto Sans TC"')).toBeLessThan(tc.indexOf('"Noto Sans SC"'));
+  const jp = cssFontStack('Meiryo', 'Meiryo', 'sc');
+  expect(jp.indexOf('"Noto Sans JP"')).toBeLessThan(jp.indexOf('"Noto Sans SC"'));
+  expect(buildFont(false, false, 12, 'Arial', {
+    themeMajorFont: 'Meiryo', themeMinorFont: 'Calibri', dpr: 1,
+  }, '漢')).toContain('"Noto Sans JP", "Noto Sans SC"');
+  expect(buildFont(false, false, 12, 'Arial', {
+    themeMajorFont: 'Meiryo', themeMinorFont: 'Calibri', dpr: 1,
+  }, '→')).not.toContain('Noto Sans JP');
+});
+
+
+it('keeps Arabic substitutes ahead of the configured CJK fallback', () => {
+  const stack = cssFontStack('Amiri', 'Amiri', 'sc');
+  expect(stack.indexOf('Noto Naskh Arabic')).toBeLessThan(stack.indexOf('Noto Sans SC'));
+  expect(stack).toContain('"Noto Sans SC", "Noto Sans TC"');
+});

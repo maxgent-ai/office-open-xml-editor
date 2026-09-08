@@ -145,6 +145,7 @@ export {
   type OoxmlResourceLimit,
   type OoxmlResourceLimitErrorDetails,
   type OoxmlResourceLimits,
+  type CjkFallback,
   type OoxmlResourceMetric,
   type OoxmlResourceMetrics,
   type OoxmlResourceMetricsCheckpoint,

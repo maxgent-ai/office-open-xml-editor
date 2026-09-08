@@ -1,3 +1,4 @@
+import { cjkLangFromLanguage, type CjkLang } from '@silurus/ooxml-core';
 import type { LayoutDiagnostic } from './types.js';
 import { stableFingerprint } from './fingerprint.js';
 import { createCanvasFontRoute, type CanvasFontRoute } from '@silurus/ooxml-core';
@@ -6,6 +7,8 @@ export type FontResolutionSource = 'embedded' | 'local' | 'google' | 'substitute
 export type FontStyle = 'normal' | 'italic';
 
 export interface FontRequest {
+  readonly cjkFallback?: CjkLang;
+  readonly language?: string;
   readonly requestedFamily?: string | null;
   readonly genericFamily?: 'serif' | 'sans-serif' | 'monospace';
   readonly weight?: number;
@@ -37,6 +40,8 @@ export interface FontInventoryFace {
 }
 
 export interface FontResolverOptions {
+  /** Immutable regional routes; their concrete outputs participate in cache identity. */
+  readonly regionalFamilyLists?: Partial<Record<CjkLang, Readonly<Record<string, string>>>>;
   /** Stable DOCX fallback routes derived from document metadata and rendered faces. */
   readonly nativeFamilyLists?: Readonly<Record<string, string>>;
 }
@@ -103,7 +108,24 @@ export function createFontResolver(
       .map(([family, familyList]) => [normalizeFamily(family), familyList] as const)
       .sort(([a], [b]) => a.localeCompare(b)),
   ));
-  const fingerprint = stableFingerprint('fonts', { faces, nativeFamilyLists });
+  const regionalFamilyLists = Object.freeze(Object.fromEntries(
+    Object.entries(options.regionalFamilyLists ?? {}).map(([region, lists]) => [
+      region,
+      Object.freeze(Object.fromEntries(Object.entries(lists)
+        .map(([family, list]) => [normalizeFamily(family), list])
+        .sort(([a], [b]) => a.localeCompare(b)))),
+    ]).sort(([a], [b]) => String(a).localeCompare(String(b))),
+  )) as Readonly<Partial<Record<CjkLang, Readonly<Record<string, string>>>>>;
+  const familyListFor = (
+    family: string,
+    language: string | undefined,
+    fallback: CjkLang | undefined,
+  ): string | undefined => {
+    const region = cjkLangFromLanguage(language) ?? fallback;
+    return (region ? regionalFamilyLists[region]?.[normalizeFamily(family)] : undefined)
+      ?? nativeFamilyLists[normalizeFamily(family)];
+  };
+  const fingerprint = stableFingerprint('fonts', { faces, nativeFamilyLists, regionalFamilyLists });
 
   return Object.freeze({
     fingerprint,
@@ -121,7 +143,10 @@ export function createFontResolver(
               message: `ECMA-376 §17.8.2 implementation-dependent font substitution: ${requestedFamily} resolved to ${face.resolvedFamily}`,
             }]
           : [];
-        const familyList = cssFamilyList(face.resolvedFamily, request.genericFamily ?? 'sans-serif');
+        const fallbackList = familyListFor(requestedFamily, request.language, request.cjkFallback);
+        const familyList = fallbackList
+          ? `${quoteCssFamily(face.resolvedFamily)}, ${fallbackList}`
+          : cssFamilyList(face.resolvedFamily, request.genericFamily ?? 'sans-serif');
         return freezeResolution({
           requestedFamily,
           resolvedFamily: face.resolvedFamily,
@@ -137,7 +162,7 @@ export function createFontResolver(
       const generic = request.genericFamily ?? 'sans-serif';
       const authored = request.requestedFamily?.trim();
       if (authored) {
-        const familyList = nativeFamilyLists[normalizeFamily(authored)]
+        const familyList = familyListFor(authored, request.language, request.cjkFallback)
           ?? cssFamilyList(authored, generic);
         return freezeResolution({
           requestedFamily,
@@ -153,7 +178,10 @@ export function createFontResolver(
       return freezeResolution({
         requestedFamily,
         resolvedFamily: generic,
-        route: createCanvasFontRoute(generic, 'generic'),
+        route: createCanvasFontRoute(
+          familyListFor(generic, request.language, request.cjkFallback) ?? generic,
+          'generic',
+        ),
         source: 'generic',
         weight,
         style,

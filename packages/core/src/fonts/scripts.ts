@@ -389,6 +389,15 @@ export class ScriptPreloadAccumulator {
 
   constructor(private readonly cjkLang: CjkLang | null) {}
 
+  scriptCjkLanguage(): CjkLang | null {
+    return this.hasHangul ? 'kr' : this.hasKana ? 'jp' : null;
+  }
+
+  /** Strong script evidence for ambiguous Han, shared with format font stacks. */
+  preferredCjkLanguage(): CjkLang {
+    return this.scriptCjkLanguage() ?? this.cjkLang ?? 'jp';
+  }
+
   clone(): ScriptPreloadAccumulator {
     const copy = new ScriptPreloadAccumulator(this.cjkLang);
     copy.hasHan = this.hasHan;
@@ -464,7 +473,7 @@ export class ScriptPreloadAccumulator {
     }
   }
 
-  names(): string[] {
+  names(explicitCjkHint = false): string[] {
     const names: string[] = [];
 
     // CJK: each detected language contributes its available Sans+Serif faces.
@@ -475,7 +484,7 @@ export class ScriptPreloadAccumulator {
     const cjkLangs = new Set<CjkLang>();
     if (this.hasHangul) cjkLangs.add('kr');
     if (this.hasKana) cjkLangs.add('jp');
-    if (this.hasHan && cjkLangs.size === 0) {
+    if (this.hasHan && (cjkLangs.size === 0 || explicitCjkHint)) {
       cjkLangs.add(this.cjkLang ?? 'jp');
     }
     // Stable order: kr, sc, tc, hk, jp. HK is sans-only because Google Fonts
@@ -501,8 +510,17 @@ export class ScriptPreloadAccumulator {
 export function scriptPreloadNamesForText(
   text: Iterable<string>,
   cjkLang: CjkLang | null,
+  explicitCjkHint = false,
 ): string[] {
   const accumulator = new ScriptPreloadAccumulator(cjkLang);
   accumulator.addText(text);
-  return accumulator.names();
+  return accumulator.names(explicitCjkHint);
+}
+
+
+/** Resolve a bounded format-owned text stream using the preloader's script facts. */
+export function cjkFallbackForText(text: Iterable<string>, fallback: CjkLang): CjkLang {
+  const scripts = new ScriptPreloadAccumulator(fallback);
+  scripts.addText(text);
+  return scripts.preferredCjkLanguage();
 }

@@ -1,5 +1,8 @@
+import type { CjkLang } from '@silurus/ooxml-core';
 import {
   classifyCjkFont,
+  cjkFallbackForText,
+  scriptPreloadNamesForText,
   GOOGLE_FONT_SUBSTITUTES,
   SCRIPT_GOOGLE_FONTS,
   type FontPreloadEntry,
@@ -76,8 +79,10 @@ export class PptxFontPreloadAccumulator {
     private readonly minorFont: string | null,
     scripts?: ScriptPreloadAccumulator,
     families?: Set<string>,
+    private readonly fallback?: CjkLang,
+    private readonly scriptNames = new Set<string>(),
   ) {
-    const cjkLang = classifyCjkFont(majorFont) ?? classifyCjkFont(minorFont) ?? null;
+    const cjkLang = classifyCjkFont(majorFont) ?? classifyCjkFont(minorFont) ?? fallback ?? null;
     this.scripts = scripts ?? new ScriptPreloadAccumulator(cjkLang);
     this.families = families ?? new Set();
     if (majorFont) this.families.add(majorFont);
@@ -86,6 +91,12 @@ export class PptxFontPreloadAccumulator {
 
   addSlide(slide: Slide): void {
     this.scripts.addText(pptxSlideTextRuns(slide));
+    // Keep the union of per-slide choices: later kana must not remove a Han-only
+    // slide's SC preload after that slide has already been published.
+    for (const name of scriptPreloadNamesForText(pptxSlideTextRuns(slide),
+      classifyCjkFont(this.majorFont) ?? classifyCjkFont(this.minorFont) ?? this.fallback ?? null)) {
+      this.scriptNames.add(name);
+    }
     for (const el of slide.elements as SlideElement[]) {
       if (el.type === 'shape') {
         for (const family of textBodyFontFamilies(el.textBody)) this.families.add(family);
@@ -100,7 +111,7 @@ export class PptxFontPreloadAccumulator {
   }
 
   names(): (string | null)[] {
-    return [...this.families, ...this.scripts.names()];
+    return [...new Set([...this.families, ...this.scripts.names(), ...this.scriptNames])];
   }
 
   withSlide(slide: Slide): PptxFontPreloadAccumulator {
@@ -109,6 +120,8 @@ export class PptxFontPreloadAccumulator {
       this.minorFont,
       this.scripts.clone(),
       new Set(this.families),
+      this.fallback,
+      new Set(this.scriptNames),
     );
     candidate.addSlide(slide);
     return candidate;
@@ -130,11 +143,19 @@ export class PptxFontPreloadAccumulator {
  */
 export function pptxFontPreloadNames(
   pres: Presentation,
+  fallback?: CjkLang,
 ): (string | null | undefined)[] {
   const accumulator = new PptxFontPreloadAccumulator(
     pres.majorFont,
     pres.minorFont,
+    undefined, undefined, fallback,
   );
   for (const slide of pres.slides) accumulator.addSlide(slide);
   return accumulator.names();
+}
+
+
+export function pptxSlideCjkFallback(slide: Slide, major: string | null, minor: string | null, fallback: CjkLang): CjkLang {
+  return cjkFallbackForText(pptxSlideTextRuns(slide),
+    classifyCjkFont(major) ?? classifyCjkFont(minor) ?? fallback);
 }

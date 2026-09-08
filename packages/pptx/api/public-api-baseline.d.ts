@@ -884,6 +884,8 @@ export interface ChartTrendline {
     lineHidden?: boolean | null;
 }
 export type ChartType = 'line' | 'stackedLine' | 'stackedLinePct' | 'clusteredBar' | 'clusteredBarH' | 'stackedBar' | 'stackedBarH' | 'stackedBarPct' | 'stackedBarHPct' | 'area' | 'stackedArea' | 'stackedAreaPct' | 'pie' | 'doughnut' | 'scatter' | 'bubble' | 'radar' | 'waterfall' | 'stock' | 'surface' | 'surface3D' | 'boxWhisker' | 'sunburst' | 'treemap' | string;
+export type CjkFallback = 'auto' | CjkLang;
+type CjkLang = 'kr' | 'sc' | 'tc' | 'hk' | 'jp';
 export type DecodedImageBudgetStrategy = 'adaptive' | 'strict';
 export interface DimOptions {
     color: string;
@@ -1002,6 +1004,7 @@ export type LoadOptions = LoadOptions__emitterCollision1 & {
 };
 interface LoadOptions__emitterCollision1 {
     useGoogleFonts?: boolean;
+    cjkFallback?: CjkFallback;
     googleFontsCssOrigin?: string;
     password?: string;
     wasmUrl?: string | URL;

@@ -89,6 +89,7 @@ export type RenderWorkerRequest =
       resourcePolicy: NormalizedOoxmlResourcePolicy;
       useGoogleFonts?: boolean;
       googleFontsCssOrigin?: string;
+      cjkFallback?: import('@silurus/ooxml-core').CjkLang;
       renderers?: WorkerRendererDescriptors;
       progressiveLayout?: boolean;
     }

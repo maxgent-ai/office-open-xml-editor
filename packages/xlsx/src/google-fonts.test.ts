@@ -1,3 +1,5 @@
+import { xlsxFontPreloadNames, xlsxCjkFallback } from './google-fonts.js';
+import type { ParsedWorkbook } from './types.js';
 import { describe, expect, it } from 'vitest';
 import type { FontPreloadEntry } from '@silurus/ooxml-core';
 import { XLSX_GOOGLE_FONTS } from './google-fonts.js';
@@ -69,4 +71,25 @@ describe('XLSX_GOOGLE_FONTS — shared registry consolidation (oracle)', () => {
       loadFamily: 'Libre Franklin',
     });
   });
+});
+
+
+it('matches workbook preload and render preferences without fetching fonts for Latin-only text', () => {
+  const wb = { styles: { fonts: [{ name: 'Calibri' }] }, sharedStrings: [{ text: '漢字' }] } as ParsedWorkbook;
+  expect(xlsxCjkFallback(wb, 'sc')).toBe('sc');
+  expect(xlsxFontPreloadNames(wb, 'sc')).toContain('Noto Sans SC');
+  expect(xlsxFontPreloadNames(wb, 'sc')).not.toContain('Noto Sans JP');
+  wb.styles.fonts[0].name = 'Meiryo';
+  expect(xlsxCjkFallback(wb, 'sc')).toBe('jp');
+  expect(xlsxFontPreloadNames(wb, 'sc')).toContain('Noto Sans JP');
+  wb.sharedStrings = [{ text: 'Hello' }];
+  expect([...xlsxFontPreloadNames(wb, 'sc')]).toEqual(['Meiryo']);
+});
+
+
+it('uses the same strong script evidence for workbook rendering and preload', () => {
+  const wb = { styles: { fonts: [{ name: 'Calibri' }] }, sharedStrings: [{ text: '漢字かな' }] } as ParsedWorkbook;
+  expect(xlsxCjkFallback(wb, 'sc')).toBe('jp');
+  expect(xlsxFontPreloadNames(wb, 'sc')).toContain('Noto Sans JP');
+  expect(xlsxFontPreloadNames(wb, 'sc')).not.toContain('Noto Sans SC');
 });

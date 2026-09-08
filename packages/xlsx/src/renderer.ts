@@ -1,3 +1,4 @@
+import type { CjkLang } from '@silurus/ooxml-core';
 import type {
   Worksheet, Styles, Cell, CellValue, CellFont, CellFill, Border, BorderEdge, CellXf,
   ViewportRange, RenderViewportOptions, XlsxTextRunInfo,
@@ -101,16 +102,20 @@ const DEFAULT_MONO_FONT_FAMILY = `"Courier New", "Liberation Mono", monospace`;
  * serif/mono face the host lacks degrades to the matching generic. Exported for
  * unit testing.
  */
-export function cssTailFor(name: string | null | undefined): string {
+export function cssTailFor(name: string | null | undefined, fallback?: CjkLang): string {
   const cjk = name ? classifyCjkFont(name) : null;
   const generic = classifyFontGeneric(name); // 'serif' | 'sans' | 'mono'
   if (!cjk) {
     // Non-CJK (Latin) cell font: choose the default chain by generic class so a
     // Latin serif/mono face the host lacks degrades to the matching generic
     // (Excel renders serif/mono, not the sans default).
-    if (generic === 'serif') return DEFAULT_SERIF_FONT_FAMILY;
-    if (generic === 'mono') return DEFAULT_MONO_FONT_FAMILY;
-    return DEFAULT_FONT_FAMILY;
+    const base = generic === 'serif' ? DEFAULT_SERIF_FONT_FAMILY
+      : generic === 'mono' ? DEFAULT_MONO_FONT_FAMILY : DEFAULT_FONT_FAMILY;
+    if (!fallback) return base;
+    const split = base.lastIndexOf(',');
+    const families = cjkFallbackChain(fallback, generic === 'serif' ? 'serif' : 'sans');
+    return families.length === 0 ? base
+      : `${base.slice(0, split)}, ${families.map(n => `"${n}"`).join(', ')}${base.slice(split)}`;
   }
   const serif = generic === 'serif';
   const googleAlias = googleCjkFontAlias(name);
@@ -129,10 +134,17 @@ export function cssTailFor(name: string | null | undefined): string {
   return `${cjkPrefix}"Calibri", "Carlito", "Cambria", "Caladea", Arial, "Noto Naskh Arabic", "Noto Sans Arabic", ${tail}, ${genericKeyword}`;
 }
 
-/** Full CSS font-family list for a cell font name (named face first). */
-export function fontStackFor(name: string | null | undefined): string {
+/** Full CSS font-family list for a cell font name (named face first). The
+ * consumer-selected region is relevant only to Han glyphs; authored CJK font
+ * names remain authoritative for every string. */
+export function fontStackFor(
+  name: string | null | undefined,
+  cjkFallback?: CjkLang,
+  text = '',
+): string {
   const normalized = name?.trim();
-  return normalized ? `"${normalized}", ${cssTailFor(normalized)}` : DEFAULT_FONT_FAMILY;
+  const fallback = /\p{Script=Han}/u.test(text) ? cjkFallback : undefined;
+  return normalized ? `"${normalized}", ${cssTailFor(normalized, fallback)}` : cssTailFor(null, fallback);
 }
 
 const DEFAULT_FONT_SIZE = 11;
@@ -616,11 +628,11 @@ function vMetricPx(sizePt: number, cs: number, factor = 1, family?: string): num
   return Math.max(base, Math.round(intendedSingleLinePx(family, sizePt * PT_TO_PX * cs)));
 }
 
-function buildFont(font: CellFont, cs = 1): string {
+function buildFont(font: CellFont, cs = 1, cjkFallback?: CjkLang, text = ''): string {
   const style = font.italic ? 'italic ' : '';
   const weight = font.bold ? 'bold ' : '';
   const sizePx = Math.max(1, Math.round(font.size * PT_TO_PX * cs));
-  return `${style}${weight}${sizePx}px ${fontStackFor(font.name)}`;
+  return `${style}${weight}${sizePx}px ${fontStackFor(font.name, cjkFallback, text)}`;
 }
 
 /**
@@ -651,6 +663,7 @@ export function drawPhoneticBand(
   cellTopY: number,
   cs: number,
   color: string,
+  cjkFallback?: CjkLang,
 ): void {
   if (runs.length === 0) return;
   // §18.4.3: fontId selects the reading font; out of bounds → font 0.
@@ -660,7 +673,7 @@ export function drawPhoneticBand(
   const alignment: PhoneticAlignment = pr?.alignment ?? 'left';
 
   ctx.save();
-  ctx.font = buildFont(phFont, cs);
+  ctx.font = buildFont(phFont, cs, cjkFallback, runs.map((run) => run.text).join(''));
   ctx.textBaseline = 'top';
   ctx.textAlign = 'left';
   ctx.fillStyle = color;
@@ -1030,6 +1043,7 @@ export function layoutRichTextLines(
   baseFont: CellFont,
   cs: number,
   maxWidth: number,
+  cjkFallback?: CjkLang,
 ): RichLine[] {
   const lines: RichLine[] = [];
   let cur: RichSeg[] = [];
@@ -1076,7 +1090,7 @@ export function layoutRichTextLines(
     lastTextFamily = font.name;
     // Measure at the *draw* font so a super/subscript token reserves its reduced
     // (~65%) glyph width; the segment keeps the run's full size for line height.
-    ctx.font = buildFont(vertAlignDrawFont(font), cs);
+    ctx.font = buildFont(vertAlignDrawFont(font), cs, cjkFallback, text);
     const w = ctx.measureText(text).width;
     if (cur.length > 0 && curW + w > maxWidth) {
       // Kinsoku at the wrap boundary (ECMA-376 §17.15.1.58–.60): retract
@@ -1117,16 +1131,17 @@ export function layoutRichTextLines(
       if (retract > 0) {
         const keepCps = lastCps.slice(0, lastCps.length - retract);
         const moveCps = lastCps.slice(lastCps.length - retract);
-        ctx.font = buildFont(vertAlignDrawFont(last.font), cs);
         if (keepCps.length === 0) {
           // The whole last segment moves down — drop it from the closing line.
           cur.pop();
         } else {
           const keepText = keepCps.join('');
+          ctx.font = buildFont(vertAlignDrawFont(last.font), cs, cjkFallback, keepText);
           last.text = keepText;
           last.width = ctx.measureText(keepText).width;
         }
         const moveText = moveCps.join('');
+        ctx.font = buildFont(vertAlignDrawFont(last.font), cs, cjkFallback, moveText);
         carry = { text: moveText, font: last.font, width: ctx.measureText(moveText).width };
       }
       flush();
@@ -1135,7 +1150,7 @@ export function layoutRichTextLines(
         curW += carry.width;
         if (carry.font.size > curMaxSize) { curMaxSize = carry.font.size; curMaxFamily = carry.font.name; }
       }
-      ctx.font = buildFont(vertAlignDrawFont(font), cs); // restore for the incoming token below
+      ctx.font = buildFont(vertAlignDrawFont(font), cs, cjkFallback, text); // restore for the incoming token below
     }
     cur.push({ text, font, width: w });
     curW += w;
@@ -1152,7 +1167,7 @@ export function layoutRichTextLines(
     // separate token in this path, so no mixed-CJK offsets are needed here).
     const seaBreaks = seaMixedBreakOffsets(text);
     if (seaBreaks.length === 0) { push(text, font); return; }
-    ctx.font = buildFont(vertAlignDrawFont(font), cs);
+    ctx.font = buildFont(vertAlignDrawFont(font), cs, cjkFallback, text);
     const measureSub = (sub: string): number => ctx.measureText(sub).width;
     // Grapheme-fill runs (Myanmar/Tibetan, #961) have dense per-cluster offsets:
     // O(log n) monotone binary-search fit. Dictionary runs keep the full scan.
@@ -1301,6 +1316,7 @@ export function drawResolvedRichLine(
   cs: number,
   dpr: number,
   opts: { fontColor?: string | null; needBidi?: boolean; baseRtl?: boolean },
+  cjkFallback?: CjkLang,
 ): void {
   ctx.textAlign = 'left';
   ctx.textBaseline = baseline;
@@ -1312,7 +1328,7 @@ export function drawResolvedRichLine(
     if (vis) { try { dctx.direction = vis.rtl[i] ? 'rtl' : 'ltr'; } catch { /* ignore */ } }
     const seg = segs[i];
     const drawFont = vertAlignDrawFont(seg.font);
-    ctx.font = buildFont(drawFont, cs);
+    ctx.font = buildFont(drawFont, cs, cjkFallback, seg.text);
     const segColor = opts.fontColor ?? seg.font.color;
     ctx.fillStyle = segColor ? hexToRgba(segColor) : '#000000';
     // Baseline shift for super/subscript, relative to the run's *base* size: up
@@ -1365,6 +1381,7 @@ function drawRichSegments(
   opts: { fontColor?: string | null; readingOrder?: number },
   textY: number,
   baseline: CanvasTextBaseline,
+  cjkFallback?: CjkLang,
 ): void {
   const { alignH, cx, cellW, leftPad, paddingX } = geom;
   const totalWidth = segs.reduce((a, s) => a + s.width, 0);
@@ -1373,7 +1390,7 @@ function drawRichSegments(
   else if (alignH === 'center') startX = cx + cellW / 2 - totalWidth / 2;
   else startX = cx + leftPad;
   const { needBidi, baseRtl } = resolveCellBidi(opts.readingOrder, segs.map((s) => s.text).join(''));
-  drawResolvedRichLine(ctx, segs, startX, textY, baseline, cs, dpr, { fontColor: opts.fontColor, needBidi, baseRtl });
+  drawResolvedRichLine(ctx, segs, startX, textY, baseline, cs, dpr, { fontColor: opts.fontColor, needBidi, baseRtl }, cjkFallback);
 }
 
 function drawRichLine(
@@ -1386,13 +1403,14 @@ function drawRichLine(
   opts: { fontColor?: string | null; readingOrder?: number },
   textY: number,
   baseline: CanvasTextBaseline,
+  cjkFallback?: CjkLang,
 ): void {
   const segs: RichSeg[] = lineRuns.map((r) => {
     const font = applyRunFont(baseFont, r);
-    ctx.font = buildFont(vertAlignDrawFont(font), cs);
+    ctx.font = buildFont(vertAlignDrawFont(font), cs, cjkFallback, r.text);
     return { text: r.text, font, width: ctx.measureText(r.text).width };
   });
-  drawRichSegments(ctx, segs, geom, cs, dpr, opts, textY, baseline);
+  drawRichSegments(ctx, segs, geom, cs, dpr, opts, textY, baseline, cjkFallback);
 }
 
 /**
@@ -1411,9 +1429,10 @@ function drawSingleLineRichText(
   cs: number,
   dpr: number,
   opts: { fontColor?: string | null; readingOrder?: number } = {},
+  cjkFallback?: CjkLang,
 ): void {
   const { baseline, textY } = singleLineVerticalAnchor(geom);
-  drawRichLine(ctx, runs, baseFont, geom, cs, dpr, opts, textY, baseline);
+  drawRichLine(ctx, runs, baseFont, geom, cs, dpr, opts, textY, baseline, cjkFallback);
 }
 
 /**
@@ -1432,6 +1451,7 @@ function drawMultiLineRichText(
   cs: number,
   dpr: number,
   opts: { fontColor?: string | null; readingOrder?: number } = {},
+  cjkFallback?: CjkLang,
 ): void {
   const { alignV, cy, cellH, paddingY } = geom;
 
@@ -1445,7 +1465,7 @@ function drawMultiLineRichText(
 
   for (const line of lines) {
     // A blank line draws nothing but still reserves its height.
-    if (line.runs.length > 0) drawRichLine(ctx, line.runs, baseFont, geom, cs, dpr, opts, yy, 'top');
+    if (line.runs.length > 0) drawRichLine(ctx, line.runs, baseFont, geom, cs, dpr, opts, yy, 'top', cjkFallback);
     yy += line.heightPx;
   }
 }
@@ -1470,11 +1490,12 @@ export function drawNonWrapRichText(
   cs: number,
   dpr: number,
   opts: { fontColor?: string | null; readingOrder?: number } = {},
+  cjkFallback?: CjkLang,
 ): void {
   if (runs.some((r) => r.text.includes('\n'))) {
-    drawMultiLineRichText(ctx, runs, baseFont, geom, cs, dpr, opts);
+    drawMultiLineRichText(ctx, runs, baseFont, geom, cs, dpr, opts, cjkFallback);
   } else {
-    drawSingleLineRichText(ctx, runs, baseFont, geom, cs, dpr, opts);
+    drawSingleLineRichText(ctx, runs, baseFont, geom, cs, dpr, opts, cjkFallback);
   }
 }
 
@@ -1537,14 +1558,15 @@ export function drawWrappedRichText(
   cs: number,
   dpr: number,
   opts: { fontColor?: string | null; readingOrder?: number } = {},
+  cjkFallback?: CjkLang,
 ): void {
   const { alignH, alignV, cx, cy, cellW, cellH, leftPad, paddingX, paddingY } = geom;
-  const rLines = layoutRichTextLines(ctx, runs, baseFont, cs, cellW - leftPad - paddingX);
+  const rLines = layoutRichTextLines(ctx, runs, baseFont, cs, cellW - leftPad - paddingX, cjkFallback);
   // layoutRichTextLines preserves leading, trailing, and consecutive hard-break
   // regions, so exactly one produced line also proves there was no hard break.
   if (rLines.length === 1) {
     const { baseline, textY } = singleLineVerticalAnchor(geom);
-    drawRichSegments(ctx, rLines[0].segments, geom, cs, dpr, opts, textY, baseline);
+    drawRichSegments(ctx, rLines[0].segments, geom, cs, dpr, opts, textY, baseline, cjkFallback);
     return;
   }
   const totalH = rLines.reduce((s, l) => s + vMetricPx(l.maxFontSize, cs, 1.2, l.maxFontFamily ?? undefined), 0);
@@ -1566,7 +1588,7 @@ export function drawWrappedRichText(
     else if (alignH === 'center') xx = cx + cellW / 2 - totalW / 2;
     else xx = cx + leftPad;
     const { needBidi, baseRtl } = paraBidi[line.para];
-    drawResolvedRichLine(ctx, line.segments, xx, yy, 'top', cs, dpr, { fontColor: opts.fontColor, needBidi, baseRtl });
+    drawResolvedRichLine(ctx, line.segments, xx, yy, 'top', cs, dpr, { fontColor: opts.fontColor, needBidi, baseRtl }, cjkFallback);
     yy += vMetricPx(line.maxFontSize, cs, 1.2, line.maxFontFamily ?? undefined);
   }
 }
@@ -1951,6 +1973,7 @@ function renderQuadrant(
   pixOffsetX: number, pixOffsetY: number,
   originX: number, originY: number,
   clipX: number, clipY: number, clipW: number, clipH: number,
+  cjkFallback?: CjkLang,
 ): void {
   if (clipW <= 0 || clipH <= 0) return;
 
@@ -2086,7 +2109,7 @@ function renderQuadrant(
       effectiveUnderline !== font.underline || effectiveStrike !== font.strike
     ) ? { ...font, bold: effectiveBold, italic: effectiveItalic, underline: effectiveUnderline, strike: effectiveStrike }
       : font;
-    ctx.font = buildFont(fontForDraw, cs);
+    ctx.font = buildFont(fontForDraw, cs, cjkFallback, text);
     const hyperlinkUrl = rc.hyperlinkMap.get(key);
     // Colour precedence: hyperlink theme colour > conditional-formatting font
     // colour > number-format section colour ([Red] etc., §18.8.30) > the cell's
@@ -2130,7 +2153,7 @@ function renderQuadrant(
       drawWrappedRichText(
         ctx, runs, fontForDraw,
         { alignH, alignV, cx: aCx, cy: aCy, cellW: cW, cellH: cH, leftPad, paddingX, paddingY },
-        cs, dpr, { fontColor: cf.fontColor, readingOrder: xf.readingOrder },
+        cs, dpr, { fontColor: cf.fontColor, readingOrder: xf.readingOrder }, cjkFallback
       );
     } else if (xf.wrapText) {
       drawWrappedPlainText(
@@ -2148,7 +2171,7 @@ function renderQuadrant(
       drawNonWrapRichText(
         ctx, runs, fontForDraw,
         { alignH, alignV, cx: aCx, cy: aCy, cellW: cW, cellH: cH, leftPad, paddingX, paddingY },
-        cs, dpr, { fontColor: cf.fontColor, readingOrder: xf.readingOrder },
+        cs, dpr, { fontColor: cf.fontColor, readingOrder: xf.readingOrder }, cjkFallback
       );
     } else {
       const { baseline, textY } = singleLineVerticalAnchor({
@@ -2514,7 +2537,7 @@ function renderQuadrant(
       )
         ? { ...font, bold: effectiveBold, italic: effectiveItalic, underline: effectiveUnderline, strike: effectiveStrike }
         : font;
-      ctx.font = buildFont(fontForDraw, cs);
+      ctx.font = buildFont(fontForDraw, cs, cjkFallback, text);
       const hyperlinkUrl = rc.hyperlinkMap.get(key);
       // Table-style element dxfs can override font color (ECMA-376 §18.8.83),
       // following the same element hierarchy as the fill/bold above.
@@ -2796,7 +2819,7 @@ function renderQuadrant(
         drawWrappedRichText(
           ctx, runs, fontForDraw,
           { alignH, alignV, cx, cy, cellW, cellH, leftPad, paddingX, paddingY },
-          cs, dpr, { fontColor: cf.fontColor, readingOrder: xf.readingOrder },
+          cs, dpr, { fontColor: cf.fontColor, readingOrder: xf.readingOrder }, cjkFallback
         );
       } else if (xf.wrapText) {
         drawWrappedPlainText(
@@ -2816,7 +2839,7 @@ function renderQuadrant(
         drawNonWrapRichText(
           ctx, runs, fontForDraw,
           { alignH, alignV, cx, cy, cellW, cellH, leftPad, paddingX, paddingY },
-          cs, dpr, { fontColor: cf.fontColor, readingOrder: xf.readingOrder },
+          cs, dpr, { fontColor: cf.fontColor, readingOrder: xf.readingOrder }, cjkFallback
         );
       } else {
         // ECMA-376 §18.4.14 vertAlign / ST_VerticalAlignRun §22.9.2.17 —
@@ -2833,7 +2856,7 @@ function renderQuadrant(
           ? { ...fontForDraw, size: fontForDraw.size * 0.65 }
           : fontForDraw;
         if (cellVertAlign) {
-          ctx.font = buildFont(drawFont, cs);
+          ctx.font = buildFont(drawFont, cs, cjkFallback, text);
         }
 
         // Measure once for both underline and strike
@@ -2909,7 +2932,7 @@ function renderQuadrant(
       // measured base width.
       const phRuns = cell.value.type === 'text' ? cell.value.phoneticRuns : undefined;
       if (cell.showPhonetic && phRuns && phRuns.length > 0 && !text.includes('\n')) {
-        const baseFontStr = buildFont(fontForDraw, cs);
+        const baseFontStr = buildFont(fontForDraw, cs, cjkFallback, text);
         const baseTextW = measureInFont(ctx, text, baseFontStr);
         let baseLeftX: number;
         if (alignH === 'right') baseLeftX = cx + cellW - paddingX - baseTextW;
@@ -2926,7 +2949,7 @@ function renderQuadrant(
           baseLeftX,
           cy,
           cs,
-          phColor,
+          phColor, cjkFallback
         );
       }
 
@@ -3177,6 +3200,7 @@ function requiredAutoCellHeightPx(
   mdw: number,
   iconSet: CfResult['iconSet'],
   currentRowHeightPx: number,
+  cjkFallback?: CjkLang,
 ): number {
   const paddingX = 3;
   const paddingY = 2;
@@ -3195,7 +3219,7 @@ function requiredAutoCellHeightPx(
   const hasRichText = !!runs?.length;
   const rotation = xf.textRotation ?? 0;
 
-  ctx.font = buildFont(font, 1);
+  ctx.font = buildFont(font, 1, cjkFallback, text);
   if (rotation === 255) {
     // Paint deliberately uses the compact 1.1 slot without a document-family
     // design-line floor for stacked glyphs; auto-fit must use the same metric.
@@ -3214,10 +3238,10 @@ function requiredAutoCellHeightPx(
 
   let lineHeights: number[];
   if (xf.wrapText && hasRichText) {
-    lineHeights = layoutRichTextLines(ctx, runs, font, 1, availableWidth)
+    lineHeights = layoutRichTextLines(ctx, runs, font, 1, availableWidth, cjkFallback)
       .map((line) => vMetricPx(line.maxFontSize, 1, 1.2, line.maxFontFamily ?? undefined));
   } else if (xf.wrapText) {
-    ctx.font = buildFont(font, 1);
+    ctx.font = buildFont(font, 1, cjkFallback, text);
     const lineHeight = vMetricPx(font.size, 1, 1.2, font.name ?? undefined);
     lineHeights = wrapTextLines(ctx, text, availableWidth).map(() => lineHeight);
   } else if (hasRichText) {
@@ -3277,6 +3301,7 @@ export function applyAutoRowHeights(
   ctx: CanvasRenderingContext2D,
   worksheet: Worksheet,
   styles: Styles,
+  cjkFallback?: CjkLang,
 ): boolean {
   if (autoRowHeightState.has(worksheet) || worksheet.isChartSheet) return false;
   if (worksheet.defaultRowHeightCustom === true) {
@@ -3344,7 +3369,7 @@ export function applyAutoRowHeights(
           cellWidthPx,
           geometry.maximumDigitWidth,
           cf.iconSet,
-          Math.ceil(requiredPx),
+          Math.ceil(requiredPx), cjkFallback
         ));
         if (cf.iconSet) {
           iconMeasurements.push({ cell, text, font: measuredFont, xf, cellWidthPx, iconSet: cf.iconSet });
@@ -3373,7 +3398,7 @@ export function applyAutoRowHeights(
             measurement.cellWidthPx,
             geometry.maximumDigitWidth,
             measurement.iconSet,
-            candidateHeightPx,
+            candidateHeightPx, cjkFallback
           ));
         }
         requiredPx = nextRequiredPx;
@@ -3390,7 +3415,7 @@ export function applyAutoRowHeights(
             measurement.cellWidthPx,
             geometry.maximumDigitWidth,
             measurement.iconSet,
-            measurement.cellWidthPx,
+            measurement.cellWidthPx, cjkFallback
           ));
         }
       }
@@ -3520,6 +3545,7 @@ function virtualizedTextOverflowOverscan(
   cs: number,
   mdw: number,
   rtl: boolean,
+  cjkFallback?: CjkLang,
 ): OverflowColumnOverscan {
   let startCol = visibleStartCol;
   let endCol = visibleEndCol;
@@ -3565,7 +3591,7 @@ function virtualizedTextOverflowOverscan(
     const effectiveFont = (effectiveBold !== font.bold || effectiveItalic !== font.italic)
       ? { ...font, bold: effectiveBold, italic: effectiveItalic }
       : font;
-    ctx.font = buildFont(effectiveFont, cs);
+    ctx.font = buildFont(effectiveFont, cs, cjkFallback, text);
 
     const alignH = xf.alignH ?? 'left';
     const paddingX = 3;
@@ -3647,6 +3673,7 @@ export function renderViewport(
   styles: Styles,
   viewport: ViewportRange,
   opts: RenderViewportOptions = {},
+  cjkFallback?: CjkLang,
 ): void {
   const dpr = opts.dpr ?? 1;
   const cs = opts.cellScale ?? 1;
@@ -3760,7 +3787,7 @@ export function renderViewport(
     freezeCols + 1,
     cs,
     mdw,
-    worksheet.rightToLeft === true,
+    worksheet.rightToLeft === true, cjkFallback
   );
   const renderScrollColBands = colAxis.bandsToCover(
     overflowOverscan.startCol,
@@ -3811,7 +3838,7 @@ export function renderViewport(
       frozenColIndices, frozenRowIndices,
       0, 0,
       cellAreaX, cellAreaY,
-      cellAreaX, cellAreaY, frozenW, frozenH,
+      cellAreaX, cellAreaY, frozenW, frozenH, cjkFallback
     );
   }
 
@@ -3822,7 +3849,7 @@ export function renderViewport(
       renderScrollColIndices, frozenRowIndices,
       renderScrollOffsetX, 0,
       scrollAreaX, cellAreaY,
-      scrollAreaX, cellAreaY, scrollAreaW, frozenH,
+      scrollAreaX, cellAreaY, scrollAreaW, frozenH, cjkFallback
     );
   }
 
@@ -3833,7 +3860,7 @@ export function renderViewport(
       frozenColIndices, scrollRowIndices,
       0, scrollOffsetY,
       cellAreaX, scrollAreaY,
-      cellAreaX, scrollAreaY, frozenW, scrollAreaH,
+      cellAreaX, scrollAreaY, frozenW, scrollAreaH, cjkFallback
     );
   }
 
@@ -3844,7 +3871,7 @@ export function renderViewport(
       renderScrollColIndices, scrollRowIndices,
       renderScrollOffsetX, scrollOffsetY,
       scrollAreaX, scrollAreaY,
-      scrollAreaX, scrollAreaY, scrollAreaW, scrollAreaH,
+      scrollAreaX, scrollAreaY, scrollAreaW, scrollAreaH, cjkFallback
     );
   }
 
@@ -3853,7 +3880,7 @@ export function renderViewport(
     ctx, worksheet, colAxis, rowAxis, opts.loadedImages, cs,
     startRow, startCol, scrollOffsetX, scrollOffsetY,
     scrollAreaX, scrollAreaY, scrollAreaW, scrollAreaH,
-    worksheet.rightToLeft === true, canvasW, opts.threeD, opts.regionMap, opts.chartEx,
+    worksheet.rightToLeft === true, canvasW, opts.threeD, opts.regionMap, opts.chartEx, cjkFallback
   );
 
   // ── Anchored slicers (Office 2010+ pivot/table filter buttons) ──
@@ -4162,6 +4189,7 @@ function renderAnchoredDrawings(
   threeD?: ChartThreeDRenderer,
   regionMap?: ChartRegionMapRenderer,
   chartEx?: ChartExRenderer,
+  cjkFallback?: CjkLang,
 ): void {
   const drawings: AnchoredDrawing[] = [];
   let fallbackOrder = 0;
@@ -4194,7 +4222,7 @@ function renderAnchoredDrawings(
         startRow, startCol, scrollOffsetX, scrollOffsetY,
         scrollAreaX, scrollAreaY, scrollAreaW, scrollAreaH,
         loadedImages, rtl, canvasW,
-        [{ ...drawing.anchor, shapes: [drawing.shape] }],
+        [{ ...drawing.anchor, shapes: [drawing.shape] }], cjkFallback
       );
     } else {
       renderCharts(
@@ -4351,6 +4379,7 @@ function renderShapeGroups(
   rtl: boolean,
   canvasW: number,
   anchors: readonly ShapeAnchor[] = ws.shapeGroups ?? [],
+  cjkFallback?: CjkLang,
 ): void {
   if (scrollAreaW <= 0 || scrollAreaH <= 0) return;
   if (anchors.length === 0) return;
@@ -4401,7 +4430,7 @@ function renderShapeGroups(
       const sw = shape.w * w;
       const sh = shape.h * h;
       if (sw <= 0 || sh <= 0) continue;
-      drawShape(ctx, shape, sx, sy, sw, sh, cs, loadedImages);
+      drawShape(ctx, shape, sx, sy, sw, sh, cs, loadedImages, cjkFallback);
     }
   }
 
@@ -4414,6 +4443,7 @@ function drawShape(
   sx: number, sy: number, sw: number, sh: number,
   cs: number,
   loadedImages?: Map<string, CanvasImageSource | null>,
+  cjkFallback?: CjkLang,
 ): void {
   ctx.save();
   if (shape.rot !== 0 || shape.flipH || shape.flipV) {
@@ -4565,7 +4595,7 @@ function drawShape(
   // Shape text body (ECMA-376 §20.5.2.34 `<xdr:txBody>`). Drawn after
   // fill/stroke so it sits on top of the shape's background.
   if (shape.text) {
-    drawShapeText(ctx, shape.text, sw, sh, cs);
+    drawShapeText(ctx, shape.text, sw, sh, cs, cjkFallback);
   }
   ctx.restore();
 }
@@ -4672,6 +4702,7 @@ export function drawShapeText(
   txt: import('./types.js').ShapeText,
   sw: number, sh: number,
   cs: number,
+  cjkFallback?: CjkLang,
 ): void {
   if (sw <= 0 || sh <= 0 || txt.paragraphs.length === 0) return;
   // The shape box (sw,sh) is already cellScale-scaled by the caller, but font
@@ -4708,7 +4739,7 @@ export function drawShapeText(
   const textFont = (run: Extract<import('./types.js').ShapeTextRun, { type: 'text' }>): { font: string; px: number } => {
     const size = run.size > 0 ? run.size : DEFAULT_FONT_SIZE;
     const px = size * PT_TO_PX * cs;
-    const family = fontStackFor(run.fontFace);
+    const family = fontStackFor(run.fontFace, cjkFallback, run.text);
     return { font: `${run.italic ? 'italic ' : ''}${run.bold ? 'bold ' : ''}${px}px ${family}`, px };
   };
 
@@ -4805,6 +4836,8 @@ export function drawShapeText(
         // to keep the Line shape consistent. Measure it the same way as text
         // runs — the nearest preceding face at the fallback size — rather than
         // the old 0.85×em constant.
+        // No glyph is painted for an empty line, so a regional Han fallback
+        // must not perturb its generic line metric.
         lineAscent = measuredAscent(`${fallbackPx}px ${fontStackFor(lastTextFace)}`, fallbackPx);
       }
       lineHeight = applyLineSpacing(lineHeight);

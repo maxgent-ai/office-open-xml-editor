@@ -1,3 +1,4 @@
+import type { CjkLang } from '@silurus/ooxml-core';
 import init, { PptxArchive, reinit } from './wasm/pptx_parser.js';
 import type { PptxTextRunInfo } from './renderer';
 import { PPTX_GOOGLE_FONTS } from './google-fonts';
@@ -60,6 +61,7 @@ const slidePull = new SlidePullWorker(
 );
 
 let preflight: PresentationPreflight | null = null;
+let cjkFallback: CjkLang | undefined;
 let preflightBuilder: PresentationPreflightBuilder | null = null;
 let slides: PptxSlideRepository | null = null;
 let availableSlideCount = 0;
@@ -179,7 +181,8 @@ async function openPresentation(request: Extract<RenderWorkerRequest, { kind: 'p
   // decoding can overlap the sequential slide preflight without sharing cursor
   // ownership. First paint still waits for `fontsLoaded` below.
   const embeddedFontsLoaded = loadEmbeddedFonts(bootstrap.embeddedFonts, getFontBytes);
-  preflightBuilder = new PresentationPreflightBuilder(bootstrap);
+  cjkFallback = request.cjkFallback;
+  preflightBuilder = new PresentationPreflightBuilder(bootstrap, { cjkFallback });
   slides = new PptxSlideRepository({
     slideCount: bootstrap.slideCount,
     maxCachedSlides: HARD_MAX_PPTX_CACHED_SLIDES,
@@ -342,6 +345,7 @@ self.onmessage = async (event: MessageEvent<RenderWorkerRequest | WorkerSvgDecod
           dpr: request.dpr,
           imageResources: request.imageResources,
           defaultTextColor: compact.defaultTextColor,
+          cjkFallback,
           majorFont: compact.majorFont,
           minorFont: compact.minorFont,
           hlinkColor: compact.hlinkColor,
@@ -374,6 +378,7 @@ self.onmessage = async (event: MessageEvent<RenderWorkerRequest | WorkerSvgDecod
         await renderSlideWithEmbeddedFonts(canvas, slide, compact.slideWidth, compact.slideHeight, {
           width: request.width,
           defaultTextColor: compact.defaultTextColor,
+          cjkFallback,
           majorFont: compact.majorFont,
           minorFont: compact.minorFont,
           hlinkColor: compact.hlinkColor,
