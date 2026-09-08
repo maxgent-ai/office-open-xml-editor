@@ -324,6 +324,12 @@ export const SCRIPT_PRELOAD_NAMES: string[] = [
   'Noto Sans Hebrew', 'Noto Serif Hebrew',
 ];
 
+/** Shared scalar predicate for the ambiguous Han policy. Kept internal to the
+ * workspace packages so preload, measurement, and paint cannot drift. */
+export function containsHanScript(text: string): boolean {
+  return /\p{Script=Han}/u.test(text);
+}
+
 /**
  * Decide WHICH of the script Noto families above actually need force-loading for
  * a document, by scanning its rendered text for the Unicode scripts that require
@@ -437,12 +443,7 @@ export class ScriptPreloadAccumulator {
           this.hasHangul = true;
         } else if (cp >= 0x3040 && cp <= 0x30ff) {
           this.hasKana = true;
-        } else if (
-          (cp >= 0x3400 && cp <= 0x4dbf) ||
-          (cp >= 0x4e00 && cp <= 0x9fff) ||
-          (cp >= 0xf900 && cp <= 0xfaff) ||
-          (cp >= 0x20000 && cp <= 0x2fa1f)
-        ) {
+        } else if (containsHanScript(ch)) {
           this.hasHan = true;
         } else if (
           (cp >= 0x0600 && cp <= 0x06ff) ||

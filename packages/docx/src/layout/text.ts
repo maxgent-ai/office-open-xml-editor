@@ -28,6 +28,7 @@ import type {
   SourceRef,
   VmlTextPathAcquisitionInput,
 } from './types.js';
+import { containsHanScript } from '@silurus/ooxml-core/internal/script-preload-accumulator';
 import type { TextBoxAcquisitionInput } from './textbox-input.js';
 import type { AnchorAcquisitionInput } from './anchor-input.js';
 
@@ -594,7 +595,7 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
       // consumer policy changes only the script classes covered by Word output
       // evidence; every authored direct/theme face remains authoritative above.
       : request.genericFamily ?? defaultGenericForSlot(request.slot);
-    const hasHan = /\p{Script=Han}/u.test(request.text ?? '');
+    const hasHan = containsHanScript(request.text ?? '');
     return input.fonts.resolve({
       requestedFamily: authoredFamily,
       cjkFallback: hasHan ? input.cjkFallback : undefined,
