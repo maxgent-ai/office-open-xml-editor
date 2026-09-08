@@ -1,4 +1,5 @@
 import type { CjkLang } from '@silurus/ooxml-core';
+import { containsHanScript } from '@silurus/ooxml-core/internal/script-preload-accumulator';
 import type {
   Worksheet, Styles, Cell, CellValue, CellFont, CellFill, Border, BorderEdge, CellXf,
   ViewportRange, RenderViewportOptions, XlsxTextRunInfo,
@@ -143,7 +144,7 @@ export function fontStackFor(
   text = '',
 ): string {
   const normalized = name?.trim();
-  const fallback = /\p{Script=Han}/u.test(text) ? cjkFallback : undefined;
+  const fallback = containsHanScript(text) ? cjkFallback : undefined;
   return normalized ? `"${normalized}", ${cssTailFor(normalized, fallback)}` : cssTailFor(null, fallback);
 }
 

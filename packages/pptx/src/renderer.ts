@@ -1,5 +1,6 @@
 import { pptxSlideCjkFallback } from './google-fonts.js';
 import type { CjkLang } from '@silurus/ooxml-core';
+import { containsHanScript } from '@silurus/ooxml-core/internal/script-preload-accumulator';
 import type {
   Slide,
   SlideElement,
@@ -1012,7 +1013,7 @@ export function buildFont(
   const authoredFamily = rc.embeddedFontAuthoredFamilies?.get(normalized) ?? normalized;
   const inferredWeight = namedFaceWeight(authoredFamily);
   const weight = bold ? 'bold ' : inferredWeight ? `${inferredWeight} ` : '';
-  const fallback = /\p{Script=Han}/u.test(text)
+  const fallback = containsHanScript(text)
     ? rc.cjkFallback ?? classifyCjkFont(rc.themeMajorFont) ?? classifyCjkFont(rc.themeMinorFont) ?? undefined
     : undefined;
   if (CSS_GENERIC_FAMILIES.has(normalized)) {
