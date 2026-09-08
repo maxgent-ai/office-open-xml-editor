@@ -200,6 +200,29 @@ per-render argument. (Excel stores "Insert > Equation" as OMML inside the shared
 DrawingML `<xdr:txBody>` grammar, so `XlsxViewer` renders equations embedded in
 shapes / text boxes the same way.)
 
+### Custom Google Fonts CSS service
+
+When `useGoogleFonts` is enabled, set `googleFontsCssOrigin` to use a regional
+mirror or an internal Google Fonts-compatible CSS service. The option works for
+DOCX, XLSX, and PPTX engines and self-loading viewers, including worker and
+progressive loading:
+
+```typescript
+await DocxDocument.load(data, {
+  useGoogleFonts: true,
+  googleFontsCssOrigin: 'https://fonts.internal.example',
+});
+```
+
+Supply an HTTP(S) origin only, without a path, query, fragment, or credentials.
+Built-in stylesheet paths and family queries are preserved. Relative font-file
+URLs in the returned CSS resolve against the stylesheet's final URL, including
+after redirects. A fully internal deployment must therefore host or proxy the
+font files as well as the CSS and return URLs reachable by the browser. Configure
+CORS and your application's `connect-src` and `font-src` CSP directives for the
+selected CSS and font hosts. Failures retain the existing system-font fallback
+and do not retry the public Google Fonts service.
+
 ### Optional rendering modules
 
 Classic DrawingML 2-D chart families are included in every format entry.

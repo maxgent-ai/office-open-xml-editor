@@ -54,15 +54,25 @@ describe('parseFontFaceRules', () => {
     expect(faces[1].descriptors.style).toBe('normal');
   });
 
-  it('resolves relative font files against the final stylesheet URL', () => {
+  it.each([
+    ['url(../files/a.woff2)', 'url("https://cdn.internal.example/files/a.woff2")'],
+    ["url('/files/a.woff2')", 'url("https://cdn.internal.example/files/a.woff2")'],
+    ['url(a.woff2)', 'url("https://cdn.internal.example/styles/a.woff2")'],
+    [
+      'url(//assets.internal.example/a.woff2)',
+      'url("https://assets.internal.example/a.woff2")',
+    ],
+    [
+      'local("Internal"), url(/files/a.woff2) format("woff2")',
+      'local("Internal"), url("https://cdn.internal.example/files/a.woff2") format("woff2")',
+    ],
+  ])('resolves font sources against the final stylesheet URL: %s', (src, expected) => {
     const faces = parseFontFaceRules(
-      "@font-face { font-family: 'Internal'; src: url(../files/internal.woff2) format('woff2'); }",
+      `@font-face { font-family: 'Internal'; src: ${src}; }`,
       'https://cdn.internal.example/styles/css2?family=Internal',
     );
 
-    expect(faces[0].src).toBe(
-      'url("https://cdn.internal.example/files/internal.woff2") format(\'woff2\')',
-    );
+    expect(faces[0].src).toBe(expected);
   });
 });
 
@@ -74,10 +84,14 @@ describe('normalizeGoogleFontsCssOrigin', () => {
   });
 
   it.each([
+    '',
+    'file:///fonts',
     'ftp://fonts.internal.example',
     'https://user@fonts.internal.example',
+    'https://user:pass@fonts.internal.example',
     'https://fonts.internal.example/css',
     'https://fonts.internal.example?tenant=a',
+    'https://fonts.internal.example#fragment',
     'not a URL',
   ])('rejects a value that is not an HTTP(S) origin: %s', (value) => {
     expect(() => normalizeGoogleFontsCssOrigin(value)).toThrow(TypeError);
@@ -169,13 +183,19 @@ describe('preloadGoogleFonts', () => {
     G.document = { fonts: set };
     delete G.self;
 
-    const [publicFaces, internalFaces] = await Promise.all([
+    const [publicFaces, internalFaces, internalFacesAgain] = await Promise.all([
       preloadGoogleFonts(['Calibri'], MAP, set as unknown as FontFaceSet),
       preloadGoogleFonts(
         ['Calibri'],
         MAP,
         set as unknown as FontFaceSet,
         'https://fonts.internal.example:8443',
+      ),
+      preloadGoogleFonts(
+        ['Calibri'],
+        MAP,
+        set as unknown as FontFaceSet,
+        'https://fonts.internal.example:8443/',
       ),
     ]);
 
@@ -187,6 +207,7 @@ describe('preloadGoogleFonts', () => {
       'https://fonts.internal.example:8443/css2?family=Carlito',
     );
     expect(publicFaces[0]).not.toBe(internalFaces[0]);
+    expect(internalFacesAgain[0]).toBe(internalFaces[0]);
   });
 
   it('uses the redirected stylesheet URL as the base for relative font files', async () => {
@@ -209,6 +230,28 @@ describe('preloadGoogleFonts', () => {
 
     expect(added[0].source).toContain(
       'url("https://assets.internal.example/fonts/carlito.woff2")',
+    );
+  });
+
+  it('uses the requested stylesheet URL when a response URL is unavailable', async () => {
+    const { set, added } = installFakes();
+    G.document = { fonts: set };
+    delete G.self;
+    G.fetch = vi.fn(async () => ({
+      ok: true,
+      text: async () =>
+        '@font-face { font-family: Carlito; src: local("Carlito"), url(/fonts/carlito.woff2) format("woff2"); }',
+    }));
+
+    await preloadGoogleFonts(
+      ['Calibri'],
+      MAP,
+      set as unknown as FontFaceSet,
+      'https://fonts.internal.example',
+    );
+
+    expect(added[0].source).toBe(
+      'local("Carlito"), url("https://fonts.internal.example/fonts/carlito.woff2") format("woff2")',
     );
   });
 
