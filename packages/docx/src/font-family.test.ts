@@ -221,3 +221,23 @@ describe('normalizeFontFamily — per-document memoization is transparent', () =
     expect(namedNull).not.toBe(nullChain);
   });
 });
+
+
+describe('document-scoped ambiguous CJK fallback', () => {
+  it('keeps Latin substitutes ahead of SC and preserves authored JP fonts', () => {
+    const sc = normalizeFontFamilyUncached('Arial', {}, {}, 'sc');
+    expect(sc.indexOf('"Arial"')).toBeLessThan(sc.indexOf('"Noto Sans SC"'));
+    expect(sc.indexOf('"Noto Sans SC"')).toBeLessThan(sc.indexOf('"Noto Sans JP"'));
+    const jp = normalizeFontFamilyUncached('Meiryo', {}, {}, 'sc');
+    expect(jp.indexOf('"Noto Sans JP"')).toBeLessThan(jp.indexOf('"Noto Sans SC"'));
+  });
+
+  it('builds regional routes without mutating shared source facts', () => {
+    const facts = { Arial: 'swiss' };
+    expect(normalizeFontFamilyUncached('Arial', facts, {}, 'sc'))
+      .toContain('"Noto Sans SC", "Noto Sans TC"');
+    expect(normalizeFontFamilyUncached('Arial', facts, {}, 'tc'))
+      .toContain('"Noto Sans TC", "Noto Sans SC"');
+    expect(facts).toEqual({ Arial: 'swiss' });
+  });
+});

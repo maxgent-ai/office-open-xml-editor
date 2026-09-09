@@ -19,6 +19,17 @@ const faces: readonly FontInventoryFace[] = [
 ];
 
 describe('font layout services', () => {
+  it('snapshots regional routes and includes their contents in the font fingerprint', () => {
+    const routes = { sc: { Calibri: 'Carlito, "Noto Sans SC", sans-serif' } };
+    const resolver = createFontResolver(faces, { regionalFamilyLists: routes });
+    routes.sc.Calibri = 'Carlito, "Noto Sans TC", sans-serif';
+    const changed = createFontResolver(faces, { regionalFamilyLists: routes });
+    const request = { requestedFamily: 'Calibri', language: 'zh-CN' };
+    expect(resolver.resolve(request).route.familyList).toContain('Noto Sans SC');
+    expect(changed.resolve(request).route.familyList).toContain('Noto Sans TC');
+    expect(resolver.fingerprint).not.toBe(changed.fingerprint);
+  });
+
   it('records embedded, local, Google, substitute, and generic resolution', () => {
     const resolver = createFontResolver(faces);
 

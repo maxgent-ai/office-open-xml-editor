@@ -1,3 +1,4 @@
+import { type CjkLang } from '@silurus/ooxml-core';
 import {
   canvasFontString,
   measureResolvedCanvasFontBoxRatio,
@@ -44,6 +45,7 @@ export interface ProductionLayoutServiceOptions {
   readonly localMetrics?: Readonly<Record<string, ResolvedFontMetric>>;
   readonly fontMetrics?: Readonly<Record<string, ResolvedFontMetric>>;
   readonly useGoogleFonts?: boolean;
+  readonly cjkFallback?: CjkLang;
   readonly mathResources?: readonly MathLayoutResource[];
   readonly mathDrawables?: ReadonlyMap<string, CanvasImageSource>;
   readonly measureContext: MeasurementTextContext | null;
@@ -200,6 +202,13 @@ export function createProductionLayoutServices(
   ])];
   const text = createTextLayoutService({
     fonts: createFontResolver(inventory, {
+      regionalFamilyLists: Object.fromEntries((['sc', 'tc', 'hk', 'jp', 'kr'] as const).map(region => [
+        region,
+        Object.fromEntries([...new Set([...routedFontFamilies, 'sans-serif', 'serif', 'monospace'])]
+          .map(family => [family, normalizeFontFamilyUncached(
+            family, source.fonts.familyClasses, source.fonts.familyPitches, region,
+          )])),
+      ])),
       nativeFamilyLists: Object.fromEntries(routedFontFamilies.map((family) => [
         family,
         normalizeFontFamilyUncached(
@@ -209,6 +218,7 @@ export function createProductionLayoutServices(
         ),
       ])),
     }),
+    cjkFallback: options.cjkFallback,
     fontMetrics,
     eastAsiaFontCharsets: fontFamilyCharsets,
     genericFamilies: Object.fromEntries(routedFontFamilies.map((family) => [

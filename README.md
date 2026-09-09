@@ -200,6 +200,29 @@ per-render argument. (Excel stores "Insert > Equation" as OMML inside the shared
 DrawingML `<xdr:txBody>` grammar, so `XlsxViewer` renders equations embedded in
 shapes / text boxes the same way.)
 
+### Custom Google Fonts CSS service
+
+When `useGoogleFonts` is enabled, set `googleFontsCssOrigin` to use a regional
+mirror or an internal Google Fonts-compatible CSS service. The option works for
+DOCX, XLSX, and PPTX engines and self-loading viewers, including worker and
+progressive loading:
+
+```typescript
+await DocxDocument.load(data, {
+  useGoogleFonts: true,
+  googleFontsCssOrigin: 'https://fonts.internal.example',
+});
+```
+
+Supply an HTTP(S) origin only, without a path, query, fragment, or credentials.
+Built-in stylesheet paths and family queries are preserved. Relative font-file
+URLs in the returned CSS resolve against the stylesheet's final URL, including
+after redirects. A fully internal deployment must therefore host or proxy the
+font files as well as the CSS and return URLs reachable by the browser. Configure
+CORS and your application's `connect-src` and `font-src` CSP directives for the
+selected CSS and font hosts. Failures retain the existing system-font fallback
+and do not retry the public Google Fonts service.
+
 ### Optional rendering modules
 
 Classic DrawingML 2-D chart families are included in every format entry.
@@ -573,8 +596,36 @@ page count, or completion state changes), `onVisibleSlideChange` (fires when the
 top-most visible slide or PPTX completion state changes; its slide count is
 final from first paint), and `onError` (async per-page render failures are routed
 here instead of crashing the scroll loop). The parse/render knobs from the
-headless engines (`mode`, `useGoogleFonts`, `resourceLimits`, the deprecated
+headless engines (`mode`, `useGoogleFonts`, `googleFontsCssOrigin`, `cjkFallback`, `resourceLimits`, the deprecated
 `maxZipEntryBytes` alias, `math`, `dpr`) are accepted too.
+
+### CJK fallback region
+
+All document engines and viewers accept `cjkFallback: 'auto' | 'sc' | 'tc' | 'hk' | 'jp' | 'kr'`.
+It chooses the regional fallback for ambiguous Han text; authored fonts and
+recognized document font regions retain priority.
+
+```ts
+const viewer = new DocxViewer(canvas, { cjkFallback: 'sc' });
+```
+
+Omitting the option is equivalent to `'auto'`: at load time, resolve the first
+usable CJK language from `<html lang>`, then `navigator.languages` in order,
+then `navigator.language`. If none is available, use `'jp'`. For Chinese,
+explicit Hans/Hant maps to SC/TC and takes precedence over region; without an
+explicit script, HK/MO maps to HK and TW maps to TC. Bare `zh` maps to SC.
+Japanese and Korean map to JP and KR.
+The resolved preference is shared with workers and remains fixed for that load.
+
+No migration is required. Ambiguous Han text can now use different regional
+glyphs according to the host language. Set an explicit region for reproducible
+output, including in Node. This option does not enable Google Fonts; use
+`useGoogleFonts: true` or provide local/self-hosted fallback fonts as usual.
+HK retains the existing sans-only webfont support. This option covers document
+text, spreadsheet cells/shapes, and slide text; embedded chart and equation
+renderers retain their own font policies. XLSX automatic script inference uses
+the shared-string table; inline cell strings and shape text do not contribute
+to that workbook-level inference.
 
 ### Markdown export
 
@@ -1099,7 +1150,7 @@ try {
   The package counters and raster-image guards are deterministic admission limits, not exact JavaScript/WASM process-memory accounting. XML trees, document models, canvas backing stores, browser decoder overhead, renderer state, and browser-managed SVG/vector parse or decoded storage can still require several times the measured input. SVG has no portable decoded-byte measure or explicit browser release primitive; the library count-bounds its cache and revokes owned object URLs, but cannot charge it as RGBA bytes. The defaults therefore reduce risk but cannot promise that an OOM is impossible on every device. Running parse and render work in `mode: 'worker'` can contain many failures away from the main UI thread, but a Worker is not a separate operating-system process or a strict memory sandbox.
 
   A measured limit crossing is reported as `OoxmlResourceLimitError`. A residual WASM failure that reaches a recognized trap-shaped boundary is reported conservatively as `parser-crashed`, not `parser-oom`: with the current aborting Rust/WASM boundary, panic, allocation failure, explicit `unreachable`, and stack overflow can lose their distinct causes and converge on the same generic runtime error. Inferring OOM from an exception class or message would misclassify some parser defects as large-file failures. Reliable OOM classification would require preserving a structured cause before the trap across every relevant allocation path; it cannot be recovered from the generic trap afterward. The WebAssembly JavaScript embedding also permits implementation-defined stack/OOM failures, including an indistinguishable plain `Error` or process termination, so converting and poisoning every engine-level failure cannot be guaranteed.
-- **No network by default.** The library does not send telemetry or analytics, and does not contact third-party services unless you ask it to. In particular, theme webfonts, Office font metric substitutes (Carlito/Caladea), and the script fallback fonts are **not** loaded from Google Fonts unless you pass `useGoogleFonts: true` to the relevant `Viewer` / `load(...)` options — supported uniformly by `DocxViewer`, `PptxViewer`, `XlsxViewer`, and `XlsxSheetViewer`. When enabled, fonts for non-Latin scripts are supplied on demand from Noto families so text does not fall back to tofu: Arabic (Noto Naskh/Sans Arabic), CJK (Noto Sans/Serif KR · SC · TC · JP, picked per document language so shared Han glyphs take the right shapes), Cyrillic (Noto Sans/Serif), Hebrew (Noto Sans/Serif Hebrew, RTL), Thai (Noto Sans Thai) and Devanagari (Noto Sans Devanagari). No font binaries ship in the bundle. Enabling this option causes the end-user's browser to send an HTTP request (IP and User-Agent) to `fonts.googleapis.com`, which may have GDPR implications for your application — consider self-hosting the required fonts via `@font-face` instead.
+- **No network by default.** The library does not send telemetry or analytics, and does not contact third-party services unless you ask it to. In particular, theme webfonts, Office font metric substitutes (Carlito/Caladea), and the script fallback fonts are **not** loaded from Google Fonts unless you pass `useGoogleFonts: true` to the relevant `Viewer` / `load(...)` options — supported uniformly by `DocxViewer`, `PptxViewer`, `XlsxViewer`, and `XlsxSheetViewer`. When enabled, fonts for non-Latin scripts are supplied on demand from Noto families so text does not fall back to tofu: Arabic (Noto Naskh/Sans Arabic), CJK (Noto Sans/Serif KR · SC · TC · JP, picked per document language so shared Han glyphs take the right shapes), Cyrillic (Noto Sans/Serif), Hebrew (Noto Sans/Serif Hebrew, RTL), Thai (Noto Sans Thai) and Devanagari (Noto Sans Devanagari). No font binaries ship in the bundle. By default this sends the end-user's IP and User-Agent to `fonts.googleapis.com`, which may have GDPR implications. Set `googleFontsCssOrigin` to an HTTP(S) origin for a Google Fonts-compatible regional mirror or internal service; built-in CSS paths and queries are retained, and relative font-file URLs are resolved against the final stylesheet URL. The configured service must provide the font assets itself, and failures fall back to system fonts without retrying Google's public service.
 - **XML parsing.** Uses `roxmltree`, which does not resolve external entities (XXE-safe by default).
 - **Encrypted OOXML ([MS-OFFCRYPTO] Agile Encryption).** Password-protected `.docx` / `.xlsx` / `.pptx` files are OLE2/CFB containers, not ZIPs. Pass `password` to `load(...)` and the file is decrypted **client-side** via WebCrypto — no bytes and no password leave the browser:
   ```ts

@@ -136,7 +136,13 @@ export {
   type AgileEncryptionDescriptor,
 } from './crypto';
 export { readCfbStream } from './errors/cfb-read';
-export { preloadGoogleFonts, unloadGoogleFonts, type FontPreloadEntry } from './fonts/preload';
+export {
+  DEFAULT_GOOGLE_FONTS_CSS_ORIGIN,
+  normalizeGoogleFontsCssOrigin,
+  preloadGoogleFonts,
+  unloadGoogleFonts,
+  type FontPreloadEntry,
+} from './fonts/preload';
 // Embedded-font registration: docx `.odttf` (§17.8.1 obfuscated) + pptx
 // `.fntdata` (raw sfnt) faces turned into FontFace objects in the active set.
 export {
@@ -161,8 +167,10 @@ export {
   type CanvasFontBoxProbeContext,
   type CanvasFontBoxProbeOptions,
 } from './fonts/canvas-font-box';
+export { resolveCjkFallback, cjkLangFromLanguage, type CjkFallback } from './fonts/cjk-fallback.js';
 export {
   classifyCjkFont,
+  cjkFallbackForText,
   classifyFontGeneric,
   GOOGLE_CJK_FONT_ALIASES,
   googleCjkFontAlias,

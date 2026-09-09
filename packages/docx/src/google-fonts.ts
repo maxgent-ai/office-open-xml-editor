@@ -1,5 +1,8 @@
+import { ScriptPreloadAccumulator } from '@silurus/ooxml-core/internal/script-preload-accumulator';
+import type { CjkLang } from '@silurus/ooxml-core';
 import {
   classifyCjkFont,
+  cjkLangFromLanguage,
   scriptPreloadNamesForText,
   GOOGLE_FONT_SUBSTITUTES,
   SCRIPT_GOOGLE_FONTS,
@@ -45,12 +48,26 @@ function* docxTextRuns(doc: DocxDocumentModel): Generator<string> {
  */
 export function docxFontPreloadNames(
   doc: DocxDocumentModel,
+  fallback?: CjkLang,
 ): (string | null | undefined)[] {
   const cjkLang =
-    classifyCjkFont(doc.majorFont) ?? classifyCjkFont(doc.minorFont) ?? null;
-  return [
-    doc.majorFont,
-    doc.minorFont,
-    ...scriptPreloadNamesForText(docxTextRuns(doc), cjkLang),
-  ];
+    classifyCjkFont(doc.majorFont) ?? classifyCjkFont(doc.minorFont) ?? fallback ?? null;
+  const scripts = new ScriptPreloadAccumulator(cjkLang);
+  const languageNames = new Set<string>();
+  for (const usage of docxRenderedTextUsages(doc)) {
+    const region = cjkLangFromLanguage(usage.eastAsiaLanguage);
+    if (region) {
+      for (const name of scriptPreloadNamesForText([usage.text], region, true)) languageNames.add(name);
+    } else {
+      scripts.addText([usage.text]);
+    }
+  }
+  return [doc.majorFont, doc.minorFont, ...new Set([...scripts.names(), ...languageNames])];
+}
+
+
+export function docxScriptCjkLanguage(doc: DocxDocumentModel): CjkLang | null {
+  const scripts = new ScriptPreloadAccumulator(null);
+  scripts.addText(docxTextRuns(doc));
+  return scripts.scriptCjkLanguage();
 }

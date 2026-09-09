@@ -1,3 +1,4 @@
+import { resolveCjkFallback, type CjkFallback, type CjkLang } from '@silurus/ooxml-core';
 import {
   dropDecodedBitmapCache,
   dropSvgImageCache,
@@ -37,7 +38,7 @@ const getPptxWasmModule = createLazyWasmModule(() => resolveWasm(
   ));
 
 /** Options for the bounded Node presentation session. */
-export type OpenPptxPresentationOptions = OoxmlNodeSessionOptions;
+export type OpenPptxPresentationOptions = OoxmlNodeSessionOptions & { cjkFallback?: CjkFallback };
 
 export interface PptxSessionRenderOptions {
   readonly width?: number;
@@ -85,6 +86,7 @@ async function openPptxPresentationImpl(
   buffer: ArrayBuffer | Uint8Array,
   options: OpenPptxPresentationOptions = {},
 ): Promise<PptxPresentationSessionImpl> {
+  const cjkFallback = resolveCjkFallback(options.cjkFallback);
   const acquired = await acquirePptxNodeSession(toUint8(buffer), getPptxWasmModule(), options);
   return new PptxPresentationSessionImpl(
     acquired.closeArchive,
@@ -92,6 +94,7 @@ async function openPptxPresentationImpl(
     acquired.bootstrap,
     acquired.metrics,
     options.signal,
+    cjkFallback,
   );
 }
 
@@ -125,6 +128,7 @@ class PptxPresentationSessionImpl implements PptxPresentationSession {
     private readonly bootstrap: PresentationBootstrap,
     private readonly metrics: OoxmlResourceMetricsSession,
     private readonly signal?: AbortSignal,
+    private readonly cjkFallback?: CjkLang,
   ) {
     this.slideCount = bootstrap.slideCount;
     this.slideWidth = bootstrap.slideWidth;
@@ -202,6 +206,7 @@ class PptxPresentationSessionImpl implements PptxPresentationSession {
       };
       await renderSlideNode(canvas, presentation, 0, {
         ...options,
+        cjkFallback: this.cjkFallback,
         fetchImage: this.fetchImage,
         fetchMedia: this.fetchMedia,
       });
