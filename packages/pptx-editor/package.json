@@ -13,12 +13,12 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/yukiyokotani/office-open-xml-viewer.git",
+    "url": "git+https://github.com/maxgent-ai/office-open-xml-editor.git",
     "directory": "packages/pptx-editor"
   },
-  "homepage": "https://github.com/yukiyokotani/office-open-xml-viewer/tree/main/packages/pptx-editor#readme",
+  "homepage": "https://github.com/maxgent-ai/office-open-xml-editor/tree/main/packages/pptx-editor#readme",
   "bugs": {
-    "url": "https://github.com/yukiyokotani/office-open-xml-viewer/issues"
+    "url": "https://github.com/maxgent-ai/office-open-xml-editor/issues"
   },
   "publishConfig": {
     "access": "public",

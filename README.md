@@ -10,7 +10,7 @@ add PPTX editing, local undo/redo, and explicit saves through OfficeCLI.
 
 **[Upstream preview demo](https://ooxml.silurus.dev)** ·
 **[Editor API guide](packages/pptx-editor/README.md)** ·
-**[Report a fork issue](https://github.com/maxgent-ai/office-open-xml-viewer/issues)** ·
+**[Report a fork issue](https://github.com/maxgent-ai/office-open-xml-editor/issues)** ·
 **[MIT license](LICENSE)**
 
 ## Upstream and this fork
@@ -216,8 +216,8 @@ Existing integrations using `submit()` must migrate to `apply()` and explicit
 Use Node.js 24, the pnpm version declared in `package.json`, Rust, and `wasm-pack`.
 
 ```bash
-git clone https://github.com/maxgent-ai/office-open-xml-viewer.git
-cd office-open-xml-viewer
+git clone https://github.com/maxgent-ai/office-open-xml-editor.git
+cd office-open-xml-editor
 pnpm install --frozen-lockfile
 pnpm build:wasm
 pnpm storybook
@@ -244,7 +244,7 @@ pnpm --filter @maxgent/ooxml-pptx-editor build
 ## Contributing and support
 
 Report fork-specific problems in
-[Maxgent's issue tracker](https://github.com/maxgent-ai/office-open-xml-viewer/issues).
+[Maxgent's issue tracker](https://github.com/maxgent-ai/office-open-xml-editor/issues).
 Include the package versions, reproduction steps, expected behavior, and a
 redistributable sample when possible. Keep private documents out of public issues and PRs.
 
