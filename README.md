@@ -35,20 +35,41 @@ packages do not include the fork's editor hooks.
 
 ## Editing capabilities
 
-The SDK supports these operations on eligible slide content:
+### Supported mutations
 
-| Capability | Available API |
-| --- | --- |
-| Change shape text and formatting | `UpdateTextMutation`: whole-shape text, paragraph text/style, and span style edits |
-| Move, resize, rotate, and flip shapes | `UpdateShapeMutation` |
-| Change shape fills and outlines | `UpdateShapeMutation` |
-| Add shapes | `AddElementMutation` |
-| Remove shapes, pictures, tables, and charts | `RemoveElementMutation` |
-| Insert empty slides and remove slides | `InsertSlideMutation`, `RemoveSlideMutation` |
-| Select elements on the canvas | `PptxEditorSelectionController` |
-| Undo and redo local changes | `PptxEditorSession.undo()` / `.redo()` |
-| Track unsaved changes and save state | `PptxEditorSession.getSnapshot()` / `.subscribe()` |
-| Save accumulated changes in one batch | `PptxEditorSession.save()` |
+The SDK exports six mutation classes. Each mutation describes a document change;
+`session.apply()` groups one or more mutations into a command and a local history entry.
+The table describes the current editing and OfficeCLI save support.
+
+| Mutation | Type | Supported capabilities | Scope and limits |
+| --- | --- | --- | --- |
+| `UpdateTextMutation` | `element.updateText` | Replace whole-shape plain text; replace paragraph text; apply whole-shape, paragraph, or span formatting | Direct slide shapes only. Span text replacement is not supported. Paragraph text replacement and span edits require separate mutations. |
+| `UpdateShapeMutation` | `element.updateShape` | Change position, size, rotation, horizontal/vertical flips, fill, and outline | Direct slide shapes only. Position and size use English Metric Units (EMU); rotation uses degrees. Supported paint values are listed below. |
+| `AddElementMutation` | `element.add` | Insert a shape at a specified element index, with text, geometry, and supported styling | OfficeCLI insertion supports shapes only and requires a stable numeric element ID. Custom geometry, adjustment values, and per-run rich formatting are not fully preserved. |
+| `RemoveElementMutation` | `element.remove` | Remove a shape, picture, table, or chart | Slide-origin elements only. Audio/video removal is not supported. Unsaved removal is undoable; saving creates an undo boundary. |
+| `InsertSlideMutation` | `slide.insert` | Insert an empty slide at a zero-based index | Does not duplicate a populated slide or import a template slide. |
+| `RemoveSlideMutation` | `slide.remove` | Remove a slide and its content | Unsaved removal is undoable; saving creates an undo boundary. |
+
+### Formatting support
+
+| Mutation | Capability | Supported values and limits |
+| --- | --- | --- |
+| `UpdateTextMutation` | Character formatting | Bold, italic, single/double underline and strikethrough, font size, text color, Latin and East Asian fonts, capitalization, letter spacing, and highlight color |
+| `UpdateTextMutation` | Text alignment | Left, center, right, or justified paragraphs; top, center, or bottom vertical alignment for whole-shape text |
+| `UpdateTextMutation` | Reset supported style properties | Nullable properties resolve inherited defaults before saving explicit values. This does not remove OOXML attributes to restore inheritance. |
+| `UpdateShapeMutation` | Fill | No fill, solid colors with optional alpha, opaque pattern colors, and two-stop linear gradients. Gradients require stops at 0 and 1, opaque colors, and an integer angle. Image fills are not supported for saving. |
+| `UpdateShapeMutation` | Outline | Solid color with optional alpha, width, dash style, line cap, compound style, and default-size arrowheads; `stroke: null` removes the outline. Gradient and pattern outlines are not supported for saving. |
+
+### Editor capabilities
+
+| Capability | Available API | Behavior |
+| --- | --- | --- |
+| Canvas element selection | `PptxEditorSelectionController` | Hit-test slide elements and expose a mutation target; the host app draws selection controls |
+| Immediate preview | `PptxEditorViewBinding`, `PptxEditorViewerHost` | Apply local session changes to the canvas and coalesce rapid updates |
+| Undo and redo | `PptxEditorSession.undo()` / `.redo()` | Move through local history without network requests, subject to saved-operation undo boundaries |
+| Draft and save indicators | `PptxEditorSession.getSnapshot()` / `.subscribe()` | Expose `dirty`, `saveStatus`, `canEdit`, `canUndo`, and `canRedo` |
+| Explicit batch save | `PptxEditorSession.save()` | Send accumulated history through the host's `sendBatch` adapter |
+| Uncertain save recovery | `PptxEditorSession.resolveUnknown()` / `.resync()` | Resolve a verified save outcome, or explicitly discard the draft and reload authoritative state |
 
 Edits update the in-memory presentation and canvas without a network request.
 An explicit save translates the pending editing history into one OfficeCLI batch.
