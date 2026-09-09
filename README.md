@@ -252,6 +252,10 @@ For changes, read [AGENTS.md](AGENTS.md), add focused regression coverage for bu
 fixes, and open a PR against this fork's `main` branch. Consult the applicable
 OOXML specification before changing document behavior.
 
+## Contributors
+
+- [@z2014](https://github.com/z2014) — Maintainer of the Maxgent fork and PPTX editing integration.
+
 ## License and acknowledgments
 
 Licensed under the [MIT License](LICENSE). See
