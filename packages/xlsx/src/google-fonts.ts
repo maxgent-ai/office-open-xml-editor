@@ -1,5 +1,6 @@
 import {
   classifyCjkFont,
+  cjkFallbackForText,
   scriptPreloadNamesForText,
   GOOGLE_FONT_SUBSTITUTES,
   SCRIPT_GOOGLE_FONTS,
@@ -55,7 +56,7 @@ function* xlsxTextRuns(wb: ParsedWorkbook | undefined): Generator<string> {
  * both modes preload an identical set — worker/main rendering must stay
  * pixel-equivalent.
  */
-export function xlsxFontPreloadNames(wb: ParsedWorkbook | undefined): Set<string> {
+export function xlsxFontPreloadNames(wb: ParsedWorkbook | undefined, fallback?: CjkLang): Set<string> {
   const names = new Set<string>();
   let cjkLang: CjkLang | null = null;
   for (const f of wb?.styles?.fonts ?? []) {
@@ -64,8 +65,17 @@ export function xlsxFontPreloadNames(wb: ParsedWorkbook | undefined): Set<string
       cjkLang ??= classifyCjkFont(f.name);
     }
   }
-  for (const n of scriptPreloadNamesForText(xlsxTextRuns(wb), cjkLang)) {
+  for (const n of scriptPreloadNamesForText(xlsxTextRuns(wb), cjkLang ?? fallback ?? null)) {
     names.add(n);
   }
   return names;
+}
+
+/** The same workbook hint is used for preloading and ambiguous cell fallback. */
+export function xlsxCjkFallback(wb: ParsedWorkbook | undefined, fallback: CjkLang): CjkLang {
+  for (const font of wb?.styles?.fonts ?? []) {
+    const region = classifyCjkFont(font.name);
+    if (region) return cjkFallbackForText(xlsxTextRuns(wb), region);
+  }
+  return cjkFallbackForText(xlsxTextRuns(wb), fallback);
 }

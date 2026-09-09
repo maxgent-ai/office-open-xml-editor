@@ -94,6 +94,7 @@ export function createLayoutServices(input, context, fontMetrics) {
     source,
     context,
     fontMetrics,
+    cjkFallback,
   ));
   return services;
 }
@@ -366,6 +367,10 @@ test('requires one private concrete body-kernel owner with exact loud attachment
     ['wrong owner arguments', canonicalLayoutRuntime.replace(
       '    context,\n    fontMetrics,',
       '    fontMetrics,',
+    )],
+    ['wrong CJK preference', canonicalLayoutRuntime.replace(
+      '    cjkFallback,',
+      '    unrelatedPreference,',
     )],
     ['wrong source', canonicalLayoutRuntime.replace(
       '    source,',

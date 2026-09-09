@@ -1,3 +1,4 @@
+import { resolveCjkFallback, type CjkFallback } from '@silurus/ooxml-core';
 import type { DocxDocumentModel, DocxTextRunInfo } from '@silurus/ooxml-docx';
 import type {
   OoxmlResourceUsageSnapshot,
@@ -39,6 +40,7 @@ const getDocxWasmModule = createLazyWasmModule(() => resolveWasm(
 
 /** Options for the bounded Node DOCX page session. */
 export interface OpenDocxDocumentOptions extends OoxmlNodeSessionOptions {
+  cjkFallback?: CjkFallback;
   /** Canvas implementation used for text measurement and page allocation. */
   factory: NodeCanvasFactory;
   /** Stable DATE/TIME field instant captured before pagination. */
@@ -85,6 +87,7 @@ export async function openDocxDocument(
   options: OpenDocxDocumentOptions,
 ): Promise<DocxDocumentSession> {
   if (!options?.factory) throw new TypeError('openDocxDocument requires a canvas factory');
+  const cjkFallback = resolveCjkFallback(options.cjkFallback);
   const acquired = await acquireDocxNodeDocument(
     toUint8(buffer),
     getDocxWasmModule(),
@@ -96,6 +99,7 @@ export async function openDocxDocument(
     throwIfAborted(options.signal);
     const measurementCanvas = options.factory.createCanvas(1, 1);
     const services = createLayoutServices(acquired.result, {
+      cjkFallback,
       measureContext: measurementCanvas.getContext('2d') as CanvasRenderingContext2D,
     });
     const defaultCurrentDateMs = normalizeCurrentDate(options.currentDate);

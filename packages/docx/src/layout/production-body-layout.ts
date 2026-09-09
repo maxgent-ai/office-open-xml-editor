@@ -1,3 +1,4 @@
+import type { CjkLang } from '@silurus/ooxml-core';
 import type { BodyElement, DocParagraph, DocTable, DocTableCell, DocRun, ImageRun, ChartRun, ShapeRun, SectionProps } from '../types';
 import type { ResolvedFontMetric } from '@silurus/ooxml-core';
 import { type FloatRect, FLOAT_OVERLAP_EPS, isWrapFloat } from '../float-layout.js';
@@ -73,6 +74,7 @@ export function createProductionBodyLayoutRuntime(
   source: LayoutSourceStore,
   measureContext: MeasurementTextContext | null,
   resolvedLocalFonts: Readonly<Record<string, ResolvedFontMetric>>,
+  cjkFallback?: CjkLang,
 ) {
   prepareBodyFrameMetadata(source.blocks.body);
   const model = source.acquisition;
@@ -3057,6 +3059,9 @@ function effCellMargins(
 // drift against the whole-string measure (約物半角 contextual collapse stays
 // honoured). See packages/core/src/text/justify-positions.ts.
 
+  // Keep the canonical layout-runtime transport explicit. Regional glyph
+  // selection itself belongs to the text service and is applied only to Han.
+  void cjkFallback;
   const kernel = buildConcreteBodyLayoutKernel(source, measureContext, resolvedLocalFonts);
   return Object.freeze({
     kernel,

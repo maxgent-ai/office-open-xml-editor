@@ -822,3 +822,41 @@ describe('production layout service integration', () => {
     expect(main.math.fingerprint).toBe(worker.math.fingerprint);
   });
 });
+
+
+it('retains CJK routes in registered and generic fonts with different service fingerprints', () => {
+  const document = model({ majorFont: 'Calibri', minorFont: 'Calibri' });
+  const options = { measureContext: measureContext(), useGoogleFonts: true,
+    googleFaces: [{ family: 'Carlito', status: 'loaded', weight: '400', style: 'normal' }] as FontFace[],
+  };
+  const sc = createLayoutServices(document, { ...options, cjkFallback: 'sc' });
+  const tc = createLayoutServices(document, { ...options, cjkFallback: 'tc' });
+  expect(sc.text.fingerprint).not.toBe(tc.text.fingerprint);
+  const request = { text: '漢', slot: 'eastAsia' as const, fonts: { eastAsia: 'Calibri' } };
+  // The resolved substitute must keep its CJK fallback during measurement and paint.
+  const scRun = sc.text.resolve(request);
+  expect(scRun.route.familyList).toContain('Noto Sans SC');
+  expect(tc.text.resolve(request).route.familyList).toContain('Noto Sans TC');
+});
+
+
+it('uses preserved DOCX language on Han-only runs and keeps authored fonts authoritative', () => {
+  const services = createLayoutServices(model({ majorFont: 'Calibri', fontFamilyClasses: { SimSun: 'roman' } }), {
+    measureContext: measureContext(), cjkFallback: 'sc',
+  });
+  const japanese = services.text.resolve({
+    text: '漢', fonts: { ascii: 'Calibri' }, slot: 'eastAsia', eastAsiaLanguage: 'ja-JP',
+  }).route.familyList;
+  expect(japanese.indexOf('Noto Sans JP')).toBeLessThan(japanese.indexOf('Noto Sans SC'));
+  const chinese = services.text.resolve({
+    text: '漢', fonts: { eastAsia: 'SimSun' }, slot: 'eastAsia', eastAsiaLanguage: 'ja-JP',
+  }).route.familyList;
+  expect(chinese.indexOf('Noto Serif SC')).toBeLessThan(chinese.indexOf('Noto Serif JP'));
+  const latin = services.text.resolve({
+    text: 'à', fonts: { ascii: 'Calibri' }, slot: 'eastAsia', eastAsiaLanguage: 'ja-JP',
+  }).route.familyList;
+  const neutralLatin = services.text.resolve({
+    text: 'à', fonts: { ascii: 'Calibri' }, slot: 'eastAsia',
+  }).route.familyList;
+  expect(latin).toBe(neutralLatin);
+});

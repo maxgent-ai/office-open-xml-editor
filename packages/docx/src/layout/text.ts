@@ -3,6 +3,7 @@ import {
   classifyFontGeneric,
   graphemeClusterOffsets,
   normalizeFontMetricFamily,
+  type CjkLang,
   type ResolvedFontMetric,
 } from '@silurus/ooxml-core';
 import type {
@@ -27,6 +28,7 @@ import type {
   SourceRef,
   VmlTextPathAcquisitionInput,
 } from './types.js';
+import { containsHanScript } from '@silurus/ooxml-core/internal/script-preload-accumulator';
 import type { TextBoxAcquisitionInput } from './textbox-input.js';
 import type { AnchorAcquisitionInput } from './anchor-input.js';
 
@@ -285,6 +287,10 @@ export interface TextShapeRequest {
 }
 
 export interface TextFontResolveRequest {
+  /** Text covered by this request. Language-selected regional fallback applies
+   * only when the text actually contains Han; it must not capture Latin glyphs. */
+  readonly text?: string;
+  readonly eastAsiaLanguage?: string;
   readonly fonts: TextFontSlots;
   readonly themeFonts?: TextFontSlots;
   readonly themeFontPresence?: TextFontSlotPresence;
@@ -368,6 +374,7 @@ export interface TextLayoutService {
 export interface TextLayoutServiceInput {
   readonly fonts: FontResolver;
   readonly measurer: GlyphMeasurer;
+  readonly cjkFallback?: CjkLang;
   readonly fontMetrics?: Readonly<Record<string, Readonly<ResolvedFontMetric>>>;
   /** Exact local aliases also participate in resolution; retained separately
    * from resource-only metrics so an embedded face is never mislabeled local. */
@@ -572,6 +579,7 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
   const fingerprint = stableFingerprint('text', {
     fonts: input.fonts.fingerprint,
     measurer: input.measurer.fingerprint,
+    cjkFallback: input.cjkFallback ?? null,
     fontMetrics,
     eastAsiaFontCharsets,
     genericFamilies,
@@ -587,8 +595,13 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
       // consumer policy changes only the script classes covered by Word output
       // evidence; every authored direct/theme face remains authoritative above.
       : request.genericFamily ?? defaultGenericForSlot(request.slot);
+    const hasHan = containsHanScript(request.text ?? '');
     return input.fonts.resolve({
       requestedFamily: authoredFamily,
+      cjkFallback: hasHan ? input.cjkFallback : undefined,
+      language: request.slot === 'eastAsia' && hasHan
+        ? request.eastAsiaLanguage
+        : undefined,
       genericFamily,
       weight: request.weight,
       style: request.style,
@@ -713,6 +726,8 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
           themeFonts: request.themeFonts,
           themeFontPresence: request.themeFontPresence,
           slot: group.script,
+          text: group.text,
+          eastAsiaLanguage: request.eastAsiaLanguage,
           weight: request.weight,
           style: request.style,
           genericFamily: request.genericFamily,

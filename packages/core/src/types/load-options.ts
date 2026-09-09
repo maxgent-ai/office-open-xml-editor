@@ -1,3 +1,4 @@
+import type { CjkFallback } from '../fonts/cjk-fallback.js';
 import type { MathRenderer } from '../math/mathjax';
 import type { ChartThreeDRenderer } from '../chart/three-d-contract';
 import type { ChartRegionMapRenderer } from '../chart/region-map-contract';
@@ -66,6 +67,24 @@ export interface LoadOptions {
    * via `@font-face` in your application CSS.
    */
   useGoogleFonts?: boolean;
+  /**
+   * Region for ambiguous CJK font fallback. Authored fonts and recognized
+   * document font regions retain priority. `auto` (also the omitted default)
+   * snapshots HTML lang, then navigator.languages / navigator.language;
+   * without a usable CJK language it uses `jp`. Bare `zh` uses `sc`.
+   * Set an explicit region for reproducible output. Does not enable webfonts.
+   */
+  cjkFallback?: CjkFallback;
+  /**
+   * Override the Google Fonts-compatible CSS service origin used when
+   * `useGoogleFonts` is enabled. Must be an HTTP(S) origin (a scheme, host, and
+   * optional port, with no path/query/hash). The built-in stylesheet paths and
+   * family queries are preserved. Defaults to `https://fonts.googleapis.com`.
+   *
+   * The service controls the font-file URLs returned by its CSS. Relative font
+   * URLs are resolved against the stylesheet's final URL after redirects.
+   */
+  googleFontsCssOrigin?: string;
   /**
    * Password for an encrypted OOXML file ([MS-OFFCRYPTO] Agile Encryption).
    *

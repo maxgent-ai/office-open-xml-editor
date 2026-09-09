@@ -983,6 +983,8 @@ export interface ChartTrendline {
     lineHidden?: boolean | null;
 }
 export type ChartType = 'line' | 'stackedLine' | 'stackedLinePct' | 'clusteredBar' | 'clusteredBarH' | 'stackedBar' | 'stackedBarH' | 'stackedBarPct' | 'stackedBarHPct' | 'area' | 'stackedArea' | 'stackedAreaPct' | 'pie' | 'doughnut' | 'scatter' | 'bubble' | 'radar' | 'waterfall' | 'stock' | 'surface' | 'surface3D' | 'boxWhisker' | 'sunburst' | 'treemap' | string;
+export type CjkFallback = 'auto' | CjkLang;
+type CjkLang = 'kr' | 'sc' | 'tc' | 'hk' | 'jp';
 export interface ConditionalFormat {
     sqref: WorksheetCellRange[];
     rules: CfRule[];
@@ -1147,6 +1149,8 @@ export interface LoadOptions extends LoadOptions__emitterCollision1 {
 }
 interface LoadOptions__emitterCollision1 {
     useGoogleFonts?: boolean;
+    cjkFallback?: CjkFallback;
+    googleFontsCssOrigin?: string;
     password?: string;
     wasmUrl?: string | URL;
     maxZipEntryBytes?: number;

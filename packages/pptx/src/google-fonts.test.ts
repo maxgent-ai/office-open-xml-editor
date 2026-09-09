@@ -4,6 +4,7 @@ import {
   PPTX_GOOGLE_FONTS,
   PptxFontPreloadAccumulator,
   pptxFontPreloadNames,
+  pptxSlideCjkFallback,
 } from './google-fonts';
 import type { Presentation, Slide } from './types';
 
@@ -134,4 +135,24 @@ describe('PptxFontPreloadAccumulator', () => {
       'Noto Sans Hebrew', 'Noto Serif Hebrew',
     ]);
   });
+});
+
+
+it('keeps the union of stable per-slide preferences during progressive preflight', () => {
+  const slideWith = (text: string) => ({ elements: [{ type: 'shape', textBody: {
+    paragraphs: [{ runs: [{ type: 'text', text }] }],
+  } }] } as Slide);
+  const han = slideWith('漢字');
+  const kana = slideWith('漢字かな');
+  const korean = slideWith('漢字한글');
+  const fonts = new PptxFontPreloadAccumulator('Calibri', 'Calibri', undefined, undefined, 'sc');
+  fonts.addSlide(han);
+  expect(fonts.names()).toContain('Noto Sans SC');
+  const next = fonts.withSlide(kana);
+  expect(next.names()).toContain('Noto Sans SC');
+  expect(next.names()).toContain('Noto Sans JP');
+  expect(fonts.names()).not.toContain('Noto Sans JP');
+  expect(pptxSlideCjkFallback(han, 'Calibri', 'Calibri', 'sc')).toBe('sc');
+  expect(pptxSlideCjkFallback(kana, 'Calibri', 'Calibri', 'sc')).toBe('jp');
+  expect(pptxSlideCjkFallback(korean, 'Calibri', 'Calibri', 'sc')).toBe('kr');
 });
