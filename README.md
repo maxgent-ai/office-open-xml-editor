@@ -1,6 +1,6 @@
-# Office Open XML Viewer — Maxgent Fork
+# Office Open XML Editor — Maxgent
 
-**Office document previews, with a PPTX editing SDK for your own application.**
+**Browser-based PPTX editing with DOCX, XLSX, and PPTX previews.**
 
 This repository is Maxgent's fork of
 [Yuki Yokotani's office-open-xml-viewer](https://github.com/yukiyokotani/office-open-xml-viewer).
