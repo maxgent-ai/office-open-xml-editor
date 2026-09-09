@@ -21,11 +21,11 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/yukiyokotani/office-open-xml-viewer.git"
+    "url": "git+https://github.com/maxgent-ai/office-open-xml-editor.git"
   },
-  "homepage": "https://ooxml.silurus.dev",
+  "homepage": "https://github.com/maxgent-ai/office-open-xml-editor#readme",
   "bugs": {
-    "url": "https://github.com/yukiyokotani/office-open-xml-viewer/issues"
+    "url": "https://github.com/maxgent-ai/office-open-xml-editor/issues"
   },
   "publishConfig": {
     "access": "public",
