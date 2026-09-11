@@ -19,6 +19,8 @@ For preview examples, rendering capabilities, and viewer documentation, visit th
 [upstream website](https://ooxml.silurus.dev) and
 [upstream README](https://github.com/yukiyokotani/office-open-xml-viewer#readme).
 The upstream demo showcases viewing; it does not include this fork's editor.
+See the [upstream bundle measurements](https://ooxml.silurus.dev/bundle-size/)
+for viewer package sizes. These measurements do not include this fork's editor.
 
 | Area | This fork |
 | --- | --- |
@@ -210,6 +212,25 @@ For unknown outcomes, file version checks, and recovery, follow the
 
 Existing integrations using `submit()` must migrate to `apply()` and explicit
 `save()` calls. See the [migration steps](packages/pptx-editor/README.md#session-api-and-migration).
+
+## Error handling
+
+Headless APIs (`DocxDocument`, `XlsxWorkbook`, and `PptxPresentation`) and
+Viewer APIs report failures from awaitable operations by rejecting the returned
+Promise. This includes `viewer.load()` parsing and its initial render, whether
+or not the Viewer has an `onError(error)` callback. A failure is never delivered
+through both channels.
+
+Use `onError` for later Viewer-managed work that has no directly awaitable
+result, such as virtualized scroll-view rendering or embedded-media playback.
+Those failures are logged with `console.error` when the callback is omitted.
+Keep the callback non-throwing.
+
+Use exported error classes and stable error codes for programmatic handling;
+messages are diagnostic text, not a programmatic API. See the
+[viewer error reference](https://ooxml.silurus.dev/errors/) for error types and
+recovery guidance. For editor saves, handle both the save result and Promise
+rejection as described in [Connect saving](#connect-saving).
 
 ## Development
 
