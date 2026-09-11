@@ -252,9 +252,15 @@ For changes, read [AGENTS.md](AGENTS.md), add focused regression coverage for bu
 fixes, and open a PR against this fork's `main` branch. Consult the applicable
 OOXML specification before changing document behavior.
 
+<div align="center">
+
 ## Contributors
 
-- [@z2014](https://github.com/z2014) — Maintainer of the Maxgent fork and PPTX editing integration.
+<a href="https://github.com/maxgent-ai/office-open-xml-editor/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=maxgent-ai/office-open-xml-editor" alt="Contributors" />
+</a>
+
+</div>
 
 ## License and acknowledgments
 
