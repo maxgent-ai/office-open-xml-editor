@@ -18,6 +18,7 @@ use roxmltree::Document as XmlDoc;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::BufReader;
 
+use crate::chart_compatibility::apply_word_classic_chart_space_frame;
 use crate::document_projector::{DocumentBodyPlan, DocumentBodyProjector};
 use crate::drawing_compatibility::apply_word_direct_group_rect;
 use crate::numbering::{LevelDef, NumberingMap};
@@ -4207,7 +4208,7 @@ fn load_chart_map(
         // A chartEx part reads its title font size from the associated
         // chartStyle sidecar (`styleN.xml`), reached via the chart part's OWN
         // rels (`word/charts/_rels/chartN.xml.rels`,
-        // `.../2011/relationships/chartStyle`). Resolve+read it best-effort;
+        // Office 2011 / MS-ODRAWXML 2012 `chartStyle`). Resolve+read it best-effort;
         // legacy `<c:>` charts ignore it (their title size is inline).
         let related_parts = load_chart_related_parts(zip, &path);
         let image_resolver = ooxml_common::chart::ChartImageResolverChain::new(
@@ -4246,7 +4247,7 @@ fn load_chart_map(
 /// Read the chartStyle part (`styleN.xml`) associated with a chart part at
 /// `chart_path` (e.g. `word/charts/chart6.xml`), following that part's own
 /// relationships (`word/charts/_rels/chart6.xml.rels`) to the
-/// `.../2011/relationships/chartStyle` target. Returns `None` when the chart
+/// Office 2011 or MS-ODRAWXML 2012 `chartStyle` target. Returns `None` when the chart
 /// has no chartStyle relationship or the part cannot be read (the chartEx
 /// title then falls back to its inline size, or the renderer's default).
 struct ChartRelatedParts {
@@ -4281,9 +4282,14 @@ fn load_chart_related_parts(zip: &mut Zip, chart_path: &str) -> ChartRelatedPart
                     .is_some_and(|kind| kind.ends_with(suffix))
         })
     };
-    if let Some(style_relationship) =
-        internal_target(ooxml_common::chart::CHART_STYLE_REL_TYPE_SUFFIX)
-    {
+    let style_relationship = relationships.values().find(|relationship| {
+        relationship.mode == ooxml_common::rels::TargetMode::Internal
+            && relationship
+                .relationship_type
+                .as_deref()
+                .is_some_and(ooxml_common::chart::is_chart_style_relationship_type)
+    });
+    if let Some(style_relationship) = style_relationship {
         let style_path = ooxml_common::rels::resolve_target(base_dir, &style_relationship.target);
         result.style_xml = read_zip_string(zip, &style_path).ok();
         let style_rels_path = ooxml_common::rels::relationship_part_path(&style_path);
@@ -12448,13 +12454,15 @@ fn parse_docx_chart_with_style_parts_and_images(
             image_resolver,
         )
     } else {
-        ooxml_common::chart::parse_chart_part_with_style_parts_and_images(
+        let mut chart = ooxml_common::chart::parse_chart_part_with_style_parts_and_images(
             root,
             &resolver,
             style_xml,
             color_style_xml,
             image_resolver,
-        )
+        )?;
+        apply_word_classic_chart_space_frame(&mut chart);
+        Some(chart)
     }
 }
 
@@ -20248,6 +20256,89 @@ mod anchor_image_relative_from_tests {
         );
     }
 
+    #[test]
+    fn word_classic_chart_space_frame_covers_the_complete_style_domain() {
+        let theme = ThemeColors::default();
+        let chart_xml = |style: Option<u8>, rounded: Option<bool>| {
+            let style = style
+                .map(|value| format!(r#"<c:style val="{value}"/>"#))
+                .unwrap_or_default();
+            let rounded = rounded
+                .map(|value| format!(r#"<c:roundedCorners val="{}"/>"#, u8::from(value)))
+                .unwrap_or_default();
+            format!(
+                r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">
+                  {style}{rounded}<c:chart><c:plotArea><c:lineChart>
+                    <c:grouping val="standard"/><c:ser><c:idx val="0"/><c:order val="0"/>
+                    <c:cat><c:strLit><c:ptCount val="1"/><c:pt idx="0"><c:v>A</c:v></c:pt></c:strLit></c:cat>
+                    <c:val><c:numLit><c:ptCount val="1"/><c:pt idx="0"><c:v>1</c:v></c:pt></c:numLit></c:val>
+                  </c:ser></c:lineChart></c:plotArea></c:chart>
+                </c:chartSpace>"#
+            )
+        };
+
+        for style in 1..=48 {
+            let chart = parse_docx_chart(&chart_xml(Some(style), None), None, &theme)
+                .expect("classic chart must parse");
+            assert_eq!(chart.rounded_corners, Some(true), "style {style}");
+            let frame = chart
+                .chart_style_roles
+                .as_ref()
+                .and_then(|roles| roles.get("chartArea"))
+                .expect("implicit chartArea frame");
+            assert_eq!(frame.fill_no_style, Some(true), "style {style}");
+            if style <= 40 {
+                assert_eq!(
+                    frame.line_colors.as_deref(),
+                    Some(&[Some("898989".to_string())][..]),
+                    "style {style}"
+                );
+                assert_eq!(frame.line_width_emu, Some(6_350), "style {style}");
+                assert_ne!(frame.line_hidden, Some(true), "style {style}");
+            } else {
+                assert_eq!(frame.line_hidden, Some(true), "style {style}");
+                assert!(frame.line_colors.is_none(), "style {style}");
+            }
+        }
+
+        let omitted = parse_docx_chart(&chart_xml(None, None), None, &theme)
+            .expect("chart with omitted style must parse");
+        let omitted_frame = &omitted.chart_style_roles.as_ref().unwrap()["chartArea"];
+        assert_eq!(omitted_frame.line_width_emu, Some(6_350));
+        assert_eq!(
+            omitted_frame.line_colors.as_deref(),
+            Some(&[Some("898989".to_string())][..])
+        );
+
+        let square = parse_docx_chart(&chart_xml(Some(2), Some(false)), None, &theme)
+            .expect("chart with explicit square corners must parse");
+        assert_eq!(square.rounded_corners, Some(false));
+    }
+
+    #[test]
+    fn word_classic_chart_space_frame_preserves_linked_chart_area_role() {
+        let theme = ThemeColors::default();
+        let chart_xml = r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">
+          <c:style val="2"/><c:chart><c:plotArea><c:lineChart>
+            <c:grouping val="standard"/><c:ser><c:idx val="0"/><c:order val="0"/>
+            <c:cat><c:strLit><c:ptCount val="1"/><c:pt idx="0"><c:v>A</c:v></c:pt></c:strLit></c:cat>
+            <c:val><c:numLit><c:ptCount val="1"/><c:pt idx="0"><c:v>1</c:v></c:pt></c:numLit></c:val>
+          </c:ser></c:lineChart></c:plotArea></c:chart>
+        </c:chartSpace>"#;
+        let style_xml = r#"<cs:chartStyle xmlns:cs="http://schemas.microsoft.com/office/drawing/2012/chartStyle" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+          <cs:chartArea><cs:spPr><a:ln w="25400"><a:solidFill><a:srgbClr val="FF0000"/></a:solidFill></a:ln></cs:spPr></cs:chartArea>
+        </cs:chartStyle>"#;
+
+        let chart = parse_docx_chart(chart_xml, Some(style_xml), &theme)
+            .expect("classic chart with linked style must parse");
+        let frame = &chart.chart_style_roles.as_ref().unwrap()["chartArea"];
+        assert_eq!(frame.line_width_emu, Some(25_400));
+        assert_eq!(
+            frame.line_colors.as_deref(),
+            Some(&[Some("FF0000".to_string())][..])
+        );
+    }
+
     /// ECMA-376 §21.2 — an inline `<w:drawing>` whose `<a:graphicData uri>` is the
     /// chart namespace and whose `<c:chart r:id>` resolves in the pre-built
     /// `chart_map` emits a `DocRun::Chart`, sized from `<wp:extent>` (EMU → pt),
@@ -20381,6 +20472,14 @@ mod anchor_image_relative_from_tests {
             ]
         );
         assert_eq!(chart.series.len(), 1);
+        assert_eq!(chart.rounded_corners, None);
+        assert!(
+            chart
+                .chart_style_roles
+                .as_ref()
+                .is_none_or(|roles| !roles.contains_key("chartArea")),
+            "classic-chart frame fallback must not leak into ChartEx"
+        );
     }
 
     #[test]
@@ -20479,7 +20578,7 @@ mod anchor_image_relative_from_tests {
         let document_xml = r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><w:body><w:p><w:r><w:drawing><wp:inline><wp:extent cx="4000000" cy="3000000"/><wp:docPr id="1" name="Chart 1"/><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart r:id="rIdChart"/></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p></w:body></w:document>"#;
         let document_rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdChart" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="charts/chart1.xml"/></Relationships>"#;
         let chart_xml = r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart><c:plotArea><c:lineChart><c:grouping val="standard"/><c:ser><c:idx val="0"/><c:order val="0"/><c:cat><c:strLit><c:ptCount val="2"/><c:pt idx="0"><c:v>A</c:v></c:pt><c:pt idx="1"><c:v>B</c:v></c:pt></c:strLit></c:cat><c:val><c:numLit><c:ptCount val="2"/><c:pt idx="0"><c:v>1</c:v></c:pt><c:pt idx="1"><c:v>2</c:v></c:pt></c:numLit></c:val></c:ser><c:dropLines/></c:lineChart></c:plotArea></c:chart></c:chartSpace>"#;
-        let chart_rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdStyle" Type="http://schemas.microsoft.com/office/2011/relationships/chartStyle" Target="style1.xml"/><Relationship Id="rIdColors" Type="http://schemas.microsoft.com/office/2011/relationships/chartColorStyle" Target="colors1.xml"/></Relationships>"#;
+        let chart_rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdStyle" Type="http://schemas.microsoft.com/office/2012/relationships/chartStyle" Target="style1.xml"/><Relationship Id="rIdColors" Type="http://schemas.microsoft.com/office/2011/relationships/chartColorStyle" Target="colors1.xml"/></Relationships>"#;
         let style_xml = r#"<cs:chartStyle xmlns:cs="http://schemas.microsoft.com/office/drawing/2012/chartStyle" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><cs:dropLine><cs:spPr><a:ln w="19050"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln></cs:spPr></cs:dropLine></cs:chartStyle>"#;
         let colors_xml = r#"<cs:colorStyle xmlns:cs="http://schemas.microsoft.com/office/drawing/2012/chartStyle" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" meth="cycle"><a:srgbClr val="336699"/></cs:colorStyle>"#;
 
