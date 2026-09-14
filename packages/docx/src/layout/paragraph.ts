@@ -1375,7 +1375,7 @@ function textPlacement(
       perGapPt: segment.fitTextPerGapPx ?? 0,
       trailingPadPt: segment.fitTextTrailingPadPx ?? 0,
     } } : {}),
-    ...(segment.kerning !== undefined ? { kerning: segment.fontSize >= segment.kerning } : {}),
+    kerning: segment.kerning !== undefined && segment.fontSize >= segment.kerning,
     ...(segment.position !== undefined ? { positionPt: segment.position } : {}),
     ...(segment.vertAlign ? { verticalAlign: segment.vertAlign } : {}),
     ...(segment.tateChuYoko ? { tateChuYoko: true } : {}),
@@ -1449,9 +1449,9 @@ function textPlacement(
       letterSpacingPt: effectiveCharacterSpacingPt(segment),
       scaleX: segment.charScale ?? 1,
       direction: segment.rtl ? 'rtl' : 'ltr',
-      kerning: segment.kerning === undefined
-        ? 'auto'
-        : segment.fontSize >= segment.kerning ? 'normal' : 'none',
+      kerning: segment.kerning !== undefined && segment.fontSize >= segment.kerning
+        ? 'normal'
+        : 'none',
       writingMode: segment.verticalRun ? 'vertical-rl' : 'horizontal-tb',
     }],
     ...(segment.hyperlink ? { hyperlink: segment.hyperlink } : {}),
@@ -1585,12 +1585,15 @@ function numberingMarkerPlacements(
         range: { start: rangeBase + span.start, end: rangeBase + span.end },
         offset: { xPt: 0, yPt: 0 }, letterSpacingPt: 0, scaleX: 1,
         direction: context.baseRtl ? 'rtl' : 'ltr',
-        kerning: 'auto', writingMode: 'horizontal-tb',
+        kerning: paragraph.numberingMarkerShapeInput?.kerning === true ? 'normal' : 'none',
+        writingMode: 'horizontal-tb',
       }],
       color, fontRoute: span.fontRoute,
       fontSizePt: paragraph.numberingMarkerShapeInput?.fontSizePt ?? span.ascentPt + span.descentPt,
       fontWeight: span.font.weight, fontStyle: span.font.style,
-      direction: context.baseRtl ? 'rtl' : 'ltr', decorations: [],
+      direction: context.baseRtl ? 'rtl' : 'ltr',
+      kerning: paragraph.numberingMarkerShapeInput?.kerning === true,
+      decorations: [],
     } satisfies TextPlacement;
   });
 }

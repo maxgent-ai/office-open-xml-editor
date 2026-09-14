@@ -276,8 +276,9 @@ export interface TextShapeRequest {
   readonly eastAsiaFontCharset?: string;
   readonly genericFamily?: 'serif' | 'sans-serif' | 'monospace';
   readonly letterSpacingPt?: number;
-  /** Resolved §17.3.2.19 w:kern state at this run size. Absent preserves the
-   * measurement adapter's inherited kerning policy. */
+  /** Resolved §17.3.2.19 w:kern state at this run size. WordprocessingML
+   * callers pass false when no hierarchy level applies the property; absence
+   * preserves the adapter policy for non-WordprocessingML text consumers. */
   readonly kerning?: boolean;
   /** Resolve script slots and faces without touching the measurement adapter. */
   readonly measure?: boolean;

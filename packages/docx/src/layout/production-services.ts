@@ -248,6 +248,9 @@ export function createProductionLayoutServices(
             request.style,
           );
           context.letterSpacing = `${request.letterSpacingPt}px`;
+          // WordprocessingML callers resolve §17.3.2.19 to an explicit boolean.
+          // Other DOCX text consumers (for example VML and parse-error UI) leave
+          // this absent and preserve their own Canvas kerning policy.
           if (request.kerning != null) context.fontKerning = request.kerning ? 'normal' : 'none';
           const metrics = context.measureText(request.text);
           const horizontalInkBoundsAreTight =
