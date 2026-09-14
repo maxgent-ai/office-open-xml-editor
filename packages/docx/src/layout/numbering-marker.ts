@@ -109,7 +109,9 @@ export function shapeNumberingMarkerText(
     complexScript: input.complexScript,
     fontHint: input.fontHint,
     eastAsiaLanguage: input.eastAsiaLanguage,
-    kerning: input.kerning,
+    // §17.3.2.19 makes omission equivalent to disabled kerning. Normalize at
+    // the service boundary so marker measurement and retained paint agree.
+    kerning: input.kerning === true,
     measure: true,
     clusterGeometry,
   });

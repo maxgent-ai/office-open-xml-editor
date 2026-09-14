@@ -1550,9 +1550,11 @@ describe('paragraphLayoutFromMeasurement retained authorities', () => {
         style: 'normal', complexScript: false,
       },
     } as unknown as DocParagraph & { numberingMarkerShapeInput: object };
+    const markerShapeRequests: Array<{ text: string; kerning?: boolean }> = [];
     const markerServices = {
       text: {
-        shape(request: { text: string }) {
+        shape(request: { text: string; kerning?: boolean }) {
+          markerShapeRequests.push(request);
           const advancePt = request.text.length * 5;
           return {
             text: request.text,
@@ -1588,10 +1590,15 @@ describe('paragraphLayoutFromMeasurement retained authorities', () => {
       physicalIndentLeftPt: 12, firstIndentPt: -12,
     }, markerServices);
 
+    expect(markerShapeRequests).toEqual([
+      expect.objectContaining({ text: '1.', kerning: false }),
+    ]);
     expect(node.lines[0]?.placements).toEqual([
       expect.objectContaining({
         kind: 'text', role: 'numbering-marker', text: '1.',
         range: { start: -2, end: 0 }, origin: { xPt: 10, yPt: expect.any(Number) },
+        kerning: false,
+        paintOps: [expect.objectContaining({ kerning: 'none' })],
       }),
       expect.objectContaining({
         kind: 'text', text: 'AB', range: { start: 0, end: 2 },
