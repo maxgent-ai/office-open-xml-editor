@@ -133,6 +133,11 @@ const VALIDATION_PANEL_MAX_W = 240;
 const VALIDATION_PANEL_MAX_H = 200;
 
 const TAB_BAR_H = 30;
+// Magnetic dead zone around the slider's 100% center notch. This is measured in
+// slider-position units rather than scale points because the two halves map
+// different scale spans (zoomMin→1 and 1→zoomMax); a position radius therefore
+// gives the thumb the same physical attraction distance from either direction.
+const ZOOM_SLIDER_100_SNAP_RADIUS = 2;
 // Footer chrome stays in screen pixels: sheet zoom scales grid cells and their
 // row/column headers, but must not resize the tab-navigation controls.
 const TAB_NAV_W = HEADER_W;
@@ -4655,9 +4660,14 @@ class XlsxViewerEngine implements ZoomableViewer {
     slider.title = 'Zoom';
     slider.classList.add('xlsx-zoom-slider');
     slider.style.cssText = `width:90px;cursor:pointer;`;
-    slider.addEventListener('input', () =>
-      this.setScale(this.zoomPosToScale(Number(slider.value), zoomMin, zoomMax)),
-    );
+    slider.addEventListener('input', () => {
+      const rawPos = Number(slider.value);
+      const pos = Math.abs(rawPos - 50) <= ZOOM_SLIDER_100_SNAP_RADIUS ? 50 : rawPos;
+      // Move the thumb as well as the scale. setScale may otherwise return early
+      // when the viewer is already at 100%, leaving the thumb beside the notch.
+      if (pos === 50) slider.value = '50';
+      this.setScale(this.zoomPosToScale(pos, zoomMin, zoomMax));
+    });
 
     const label = this.hostDocument.createElement('span');
     label.textContent = `${Math.round(cur * 100)}%`;
