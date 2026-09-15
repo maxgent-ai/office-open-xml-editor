@@ -475,7 +475,7 @@ export class PptxPresentation {
       (id) =>
         this._mode === 'worker'
           ? ({ kind: 'parse', id, buffer, resourcePolicy, useGoogleFonts, cjkFallback: this._cjkFallback, renderers } satisfies RenderWorkerRequest)
-          : ({ kind: 'parse', id, buffer, resourcePolicy } satisfies PptxWorkerRequest),
+          : ({ kind: 'parse', id, buffer, resourcePolicy, cjkFallback: this._cjkFallback } satisfies PptxWorkerRequest),
       [buffer],
       { timeoutMs },
     );
@@ -569,8 +569,12 @@ export class PptxPresentation {
     progressive: ProgressiveLoad,
   ): Promise<void> {
     const response = await this._bridge.request(
+      // The region is inert on this path — a progressive main-mode load builds
+      // its preflight in Window (below) rather than in the worker — but the
+      // request carries it so no parse can reach the worker without it.
       (id) => ({
-        kind: 'parse', id, buffer, resourcePolicy, progressiveLayout: true,
+        kind: 'parse', id, buffer, resourcePolicy, cjkFallback: this._cjkFallback,
+        progressiveLayout: true,
       }) satisfies PptxWorkerRequest,
       [buffer],
       { timeoutMs },
