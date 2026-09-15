@@ -368,12 +368,15 @@ function paintParagraphContents(node: ParagraphLayout, context: CanvasPaintConte
       }
       for (const path of placement.emphasis?.paths ?? []) paintRetainedMarkPath(path, context);
       for (const decoration of placement.decorations) paintStrokeSegment(decoration, context);
-      for (const border of placement.runBorderFragments ?? []) paintStrokeSegment(border, context);
+      for (const border of placement.runBorderFragments ?? []) {
+        paintStrokeSegment(border, context, oneDevicePixelCssWidth(context));
+      }
     }
   }
   // Keep authored paragraph-border geometry in retained layout, while matching
   // Word's raster treatment of subpixel rules with at least one device pixel
-  // of coverage. Text decorations and run borders retain their own widths.
+  // of coverage. Text decorations retain their authored widths; retained
+  // WordprocessingML borders share the border floor.
   const paragraphBorderMinimumCssWidthPx = oneDevicePixelCssWidth(context);
   for (const border of node.borders) {
     paintStrokeSegment(border, context, paragraphBorderMinimumCssWidthPx);

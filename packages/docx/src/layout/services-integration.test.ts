@@ -158,6 +158,66 @@ describe('production layout service integration', () => {
     expect(ctx.fontKerning).toBe('auto');
   });
 
+  it('measures an explicitly unkerned WordprocessingML run and restores the canvas state', () => {
+    let fontKerning: CanvasFontKerning = 'auto';
+    const states: CanvasFontKerning[] = [];
+    const ctx = {
+      font: '',
+      letterSpacing: '0px',
+      get fontKerning() { return fontKerning; },
+      set fontKerning(value: CanvasFontKerning) { fontKerning = value; },
+      measureText(text: string) {
+        states.push(fontKerning);
+        return {
+          width: text.length * 10,
+          actualBoundingBoxAscent: 8,
+          actualBoundingBoxDescent: 2,
+          fontBoundingBoxAscent: 8,
+          fontBoundingBoxDescent: 2,
+        } as TextMetrics;
+      },
+    } as unknown as CanvasRenderingContext2D;
+    const services = createLayoutServices(model(), { measureContext: ctx });
+
+    services.text.shape({
+      text: 'AV', fontSizePt: 10, weight: 400, style: 'normal', measure: true,
+      fonts: { ascii: 'Authored Sans' }, kerning: false,
+    });
+
+    expect(states).toContain('none');
+    expect(ctx.fontKerning).toBe('auto');
+  });
+
+  it('preserves the Canvas kerning policy for non-WordprocessingML text', () => {
+    let fontKerning: CanvasFontKerning = 'auto';
+    const states: CanvasFontKerning[] = [];
+    const ctx = {
+      font: '',
+      letterSpacing: '0px',
+      get fontKerning() { return fontKerning; },
+      set fontKerning(value: CanvasFontKerning) { fontKerning = value; },
+      measureText(text: string) {
+        states.push(fontKerning);
+        return {
+          width: text.length * 10,
+          actualBoundingBoxAscent: 8,
+          actualBoundingBoxDescent: 2,
+          fontBoundingBoxAscent: 8,
+          fontBoundingBoxDescent: 2,
+        } as TextMetrics;
+      },
+    } as unknown as CanvasRenderingContext2D;
+    const services = createLayoutServices(model(), { measureContext: ctx });
+
+    services.text.shape({
+      text: 'VML', fontSizePt: 10, weight: 400, style: 'normal', measure: true,
+      fonts: { ascii: 'Authored Sans' },
+    });
+
+    expect(states).toContain('auto');
+    expect(ctx.fontKerning).toBe('auto');
+  });
+
   it('projects finite Canvas ink metrics for retained trim geometry', () => {
     const ctx = {
       ...measureContext(),

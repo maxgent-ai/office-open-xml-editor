@@ -8,6 +8,7 @@ use ooxml_common::resource::{
 };
 use wasm_bindgen::prelude::*;
 
+mod chart_compatibility;
 mod document_projector;
 mod drawing_compatibility;
 mod markdown;

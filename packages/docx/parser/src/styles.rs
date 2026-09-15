@@ -516,7 +516,12 @@ impl StyleMap {
                 continue;
             }
 
-            if style_type == "paragraph" && attr_w(style_node, "default").as_deref() == Some("1") {
+            if style_type == "paragraph"
+                && attr_w(style_node, "default")
+                    .as_deref()
+                    .and_then(parse_on_off_lexical)
+                    == Some(true)
+            {
                 default_para_style_id = Some(style_id.clone());
             }
             if style_type == "paragraph" {
@@ -533,7 +538,12 @@ impl StyleMap {
             }
             // §17.7.4: track `<w:style w:type="table" w:default="1">` so
             // tables that omit `<w:tblStyle>` can inherit its tblCellMar etc.
-            if style_type == "table" && attr_w(style_node, "default").as_deref() == Some("1") {
+            if style_type == "table"
+                && attr_w(style_node, "default")
+                    .as_deref()
+                    .and_then(parse_on_off_lexical)
+                    == Some(true)
+            {
                 default_table_style_id = Some(style_id.clone());
             }
 
@@ -1619,13 +1629,17 @@ fn normalized_string_attr(
     typography_value(raw, value)
 }
 
-fn on_off_value(node: roxmltree::Node, name: &str) -> crate::types::TypographyValueWire<bool> {
-    let raw = attr_w(node, name);
-    let value = raw.as_deref().and_then(|value| match value {
+fn parse_on_off_lexical(value: &str) -> Option<bool> {
+    match value.trim() {
         "1" | "true" | "on" => Some(true),
         "0" | "false" | "off" => Some(false),
         _ => None,
-    });
+    }
+}
+
+fn on_off_value(node: roxmltree::Node, name: &str) -> crate::types::TypographyValueWire<bool> {
+    let raw = attr_w(node, name);
+    let value = raw.as_deref().and_then(parse_on_off_lexical);
     typography_value(raw, value)
 }
 
@@ -2963,6 +2977,42 @@ mod tests {
         // glyph color".
         let fmt = run_fmt_from(r#"<w:u w:val="single" w:color="Auto"/>"#);
         assert_eq!(fmt.underline_color.as_deref(), Some("auto"));
+    }
+
+    #[test]
+    fn default_style_accepts_xsd_boolean_lexicals() {
+        // CT_Style@default is ST_OnOff, whose strict schema is the xsd:boolean
+        // lexical space. Producers may therefore write either `1` or `true`.
+        // The latter is used by the issue #1507 reproduction and must select
+        // the implicit paragraph/table style exactly like the numeric spelling.
+        for lexical in ["1", "true", "on", " true "] {
+            let xml = format!(
+                r#"<w:styles xmlns:w="{ns}">
+                  <w:style w:type="paragraph" w:default="{lexical}" w:styleId="Normal">
+                    <w:pPr><w:spacing w:line="259" w:lineRule="auto"/></w:pPr>
+                  </w:style>
+                  <w:style w:type="table" w:default="{lexical}" w:styleId="TableNormal"/>
+                </w:styles>"#,
+                ns = W_NS,
+            );
+            let styles = StyleMap::parse(&xml);
+            assert_eq!(styles.default_para_style_id(), Some("Normal"));
+            assert_eq!(styles.default_table_style_id(), Some("TableNormal"));
+            let (paragraph, _) = styles.resolve_para(None, None);
+            assert_eq!(paragraph.line_spacing_rule.as_deref(), Some("auto"));
+            assert_eq!(paragraph.line_spacing_val, Some(259.0 / 240.0));
+            assert_eq!(paragraph.line_spacing_explicit, Some(true));
+        }
+
+        for lexical in ["0", "false", "off", " false "] {
+            let xml = format!(
+                r#"<w:styles xmlns:w="{ns}">
+                  <w:style w:type="paragraph" w:default="{lexical}" w:styleId="NotDefault"/>
+                </w:styles>"#,
+                ns = W_NS,
+            );
+            assert_eq!(StyleMap::parse(&xml).default_para_style_id(), None);
+        }
     }
 
     #[test]
