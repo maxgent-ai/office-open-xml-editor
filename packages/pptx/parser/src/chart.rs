@@ -6,6 +6,7 @@
 //! `PptxColorResolver`; both chart parsers now delegate their structure walk to
 //! `ooxml_common::chart`.
 
+use crate::chart_compatibility::apply_powerpoint_classic_chart_space_frame;
 use crate::parse_color_node;
 use crate::parse_preflighted_pptx_xml;
 use crate::theme::PptxRawSchemeResolver;
@@ -120,6 +121,7 @@ pub(crate) fn parse_legacy_chart_with_style_parts_and_images(
         color_style_xml,
         image_resolver,
     )?;
+    apply_powerpoint_classic_chart_space_frame(&mut chart);
     if let Some(user_shapes_xml) = user_shapes_xml {
         if let Ok(user_shapes_doc) = parse_preflighted_pptx_xml(user_shapes_xml) {
             let text_boxes = ooxml_common::chart::parse_chart_user_shapes_for_chart(
@@ -267,6 +269,92 @@ mod tests {
         assert_eq!(element.chart.series[1].color.as_deref(), Some("C0504D"));
         assert_eq!(element.chart.cat_axis_font_size_hpt, Some(900));
         assert_eq!(element.chart.val_axis_font_size_hpt, Some(1800));
+    }
+
+    #[test]
+    fn powerpoint_classic_chart_space_frame_tracks_style_boundaries() {
+        let chart_xml = |style: Option<u8>, rounded: Option<bool>| {
+            let style = style
+                .map(|value| format!(r#"<c:style val="{value}"/>"#))
+                .unwrap_or_default();
+            let rounded = rounded
+                .map(|value| format!(r#"<c:roundedCorners val="{}"/>"#, u8::from(value)))
+                .unwrap_or_default();
+            format!(
+                r#"<c:chartSpace xmlns:c="{C_NS}">{style}{rounded}<c:chart><c:plotArea><c:barChart><c:barDir val="col"/><c:ser><c:idx val="0"/><c:order val="0"/><c:val><c:numLit><c:pt idx="0"><c:v>1</c:v></c:pt></c:numLit></c:val></c:ser></c:barChart></c:plotArea></c:chart></c:chartSpace>"#
+            )
+        };
+        let parse = |style, rounded| {
+            parse_legacy_chart(&chart_xml(style, rounded), &HashMap::new())
+                .expect("classic chart")
+                .chart
+        };
+
+        for style in [1, 32] {
+            let chart = parse(Some(style), None);
+            assert_eq!(chart.rounded_corners, Some(true), "style {style}");
+            assert!(chart
+                .chart_style_roles
+                .as_ref()
+                .is_none_or(|roles| !roles.contains_key("chartArea")));
+        }
+        for style in [33, 40] {
+            let chart = parse(Some(style), None);
+            let frame = &chart.chart_style_roles.as_ref().unwrap()["chartArea"];
+            assert_eq!(
+                frame.fill_colors.as_deref(),
+                Some(&[Some("FFFFFF".to_string())][..]),
+                "style {style}"
+            );
+            assert_eq!(
+                frame.line_colors.as_deref(),
+                Some(&[Some("898989".to_string())][..]),
+                "style {style}"
+            );
+            assert_eq!(frame.line_width_emu, Some(9_525), "style {style}");
+        }
+        for style in [41, 48] {
+            let chart = parse(Some(style), None);
+            let frame = &chart.chart_style_roles.as_ref().unwrap()["chartArea"];
+            assert_eq!(
+                frame.fill_colors.as_deref(),
+                Some(&[Some("000000".to_string())][..]),
+                "style {style}"
+            );
+            assert_eq!(frame.line_hidden, Some(true), "style {style}");
+        }
+
+        let omitted = parse(None, None);
+        assert_eq!(omitted.rounded_corners, Some(true));
+        assert!(omitted
+            .chart_style_roles
+            .as_ref()
+            .is_none_or(|roles| !roles.contains_key("chartArea")));
+        assert_eq!(parse(Some(33), Some(false)).rounded_corners, Some(false));
+
+        let linked_style = format!(
+            r#"<cs:chartStyle xmlns:cs="http://schemas.microsoft.com/office/drawing/2012/chartStyle" xmlns:a="{A_NS}"><cs:chartArea><cs:spPr><a:solidFill><a:srgbClr val="00FF00"/></a:solidFill><a:ln w="25400"><a:solidFill><a:srgbClr val="FF0000"/></a:solidFill></a:ln></cs:spPr></cs:chartArea></cs:chartStyle>"#
+        );
+        let linked = parse_legacy_chart_with_style_parts(
+            &chart_xml(Some(33), None),
+            Some(&linked_style),
+            None,
+            None,
+            &HashMap::new(),
+            None,
+        )
+        .expect("classic chart with linked style")
+        .chart;
+        let linked_frame = &linked.chart_style_roles.as_ref().unwrap()["chartArea"];
+        assert_eq!(
+            linked_frame.fill_colors.as_deref(),
+            Some(&[Some("00FF00".to_string())][..])
+        );
+        assert_eq!(
+            linked_frame.line_colors.as_deref(),
+            Some(&[Some("FF0000".to_string())][..])
+        );
+        assert_eq!(linked_frame.line_width_emu, Some(25_400));
     }
 
     #[test]

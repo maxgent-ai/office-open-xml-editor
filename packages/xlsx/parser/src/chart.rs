@@ -1,3 +1,4 @@
+use crate::chart_compatibility::apply_excel_classic_chart_space_frame;
 use crate::read_zip_string;
 use crate::types::*;
 use crate::worksheet_reference::{
@@ -787,6 +788,9 @@ pub(crate) fn load_sheet_charts_with_theme_images(
                 let Some(mut chart) = chart_opt else {
                     continue;
                 };
+                if !is_chartex {
+                    apply_excel_classic_chart_space_frame(&mut chart);
+                }
                 if let Some(user_shapes_xml) = user_shapes_xml.as_deref() {
                     if let Ok(user_shapes_doc) = parse_guarded(user_shapes_xml) {
                         let text_boxes = ooxml_common::chart::parse_chart_user_shapes_for_chart(
@@ -1952,6 +1956,21 @@ mod chartex_tests {
         );
         let chart = &charts.first().expect("classic chart").chart;
         assert_eq!(chart.chart_type, "line");
+        assert_eq!(chart.rounded_corners, Some(true));
+        let frame = chart
+            .chart_style_roles
+            .as_ref()
+            .and_then(|roles| roles.get("chartArea"))
+            .expect("Excel implicit chart-area frame");
+        assert_eq!(
+            frame.fill_colors.as_deref(),
+            Some(&[Some("FFFFFF".to_string())][..]),
+        );
+        assert_eq!(
+            frame.line_colors.as_deref(),
+            Some(&[Some("898989".to_string())][..]),
+        );
+        assert_eq!(frame.line_width_emu, Some(12_700));
         assert_eq!(
             chart
                 .chart_style_roles
