@@ -1218,7 +1218,7 @@ describe('chart-space background', () => {
     expect(rec.rects[0]).toEqual({ x: 0, y: 0, w: 640, h: 360, fs: '#F2F2F2' });
   });
 
-  it('clips fill and chart content to one rounded path and strokes the same geometry', () => {
+  it('rounds chart-space paint without clipping chart content', () => {
     const rec = recordingCtx();
     renderChart(rec.ctx, baseModel({
       roundedCorners: true,
@@ -1227,10 +1227,11 @@ describe('chart-space background', () => {
       chartBorderWidthEmu: 25_400,
     }), RECT, 1);
 
-    expect(rec.clipCalls).toBe(1);
-    expect(rec.rects[0]).toEqual({ x: 0, y: 0, w: 640, h: 360, fs: '#F2F2F2' });
+    expect(rec.clipCalls).toBe(0);
+    expect(rec.rects).toHaveLength(0);
+    expect(rec.paintEvents).toContainEqual({ kind: 'fill', fillStyle: '#F2F2F2' });
     expect(rec.strokeRects).toHaveLength(0);
-    // Four corners for the outer clip plus four for the inset border.
+    // Four corners for the rounded fill plus four for the inset border.
     expect(rec.quadratics).toHaveLength(8);
     expect(rec.paintEvents).toContainEqual({ kind: 'stroke', strokeStyle: '#0055AA' });
   });
@@ -1262,7 +1263,7 @@ describe('chart-space background', () => {
     expect(tiny.quadratics[0]?.y).toBe(3);
   });
 
-  it('keeps both compound rails inside the rounded chart-space clip', () => {
+  it('keeps both compound rails inside the rounded chart-space frame', () => {
     const rec = recordingCtx();
     renderChart(rec.ctx, baseModel({
       roundedCorners: true,
@@ -1271,12 +1272,12 @@ describe('chart-space background', () => {
       chartBorderCompound: 'dbl',
     }), RECT, 1);
 
-    expect(rec.clipCalls).toBe(1);
-    // Four clip corners and four corners for each of the two border rails.
-    expect(rec.quadratics).toHaveLength(12);
+    expect(rec.clipCalls).toBe(0);
+    // Four corners for each of the two border rails.
+    expect(rec.quadratics).toHaveLength(8);
   });
 
-  it('keeps an explicit false rectangular and preserves rounded noFill clipping', () => {
+  it('keeps an explicit false rectangular and does not clip rounded noFill content', () => {
     const sharp = recordingCtx();
     renderChart(sharp.ctx, baseModel({
       roundedCorners: false,
@@ -1293,12 +1294,12 @@ describe('chart-space background', () => {
       chartBg: null,
       chartBorderColor: '0055AA',
     }), RECT, 1);
-    expect(noFill.clipCalls).toBe(1);
+    expect(noFill.clipCalls).toBe(0);
     expect(noFill.rects).toHaveLength(0);
-    expect(noFill.quadratics).toHaveLength(8);
+    expect(noFill.quadratics).toHaveLength(4);
   });
 
-  it('uses the shared gradient recipe inside the rounded clip and honors host rotation', () => {
+  it('uses the shared gradient recipe in the rounded frame and honors host rotation', () => {
     const rec = recordingCtx();
     renderChart(rec.ctx, baseModel({
       roundedCorners: true,
@@ -1314,7 +1315,7 @@ describe('chart-space background', () => {
       },
     }), RECT, 1, 30);
 
-    expect(rec.clipCalls).toBe(1);
+    expect(rec.clipCalls).toBe(0);
     expect(rec.gradients).toHaveLength(1);
     const [x1, y1, x2, y2] = rec.gradients[0].args;
     expect((y2 - y1) / (x2 - x1)).toBeCloseTo(Math.sqrt(3), 5);
@@ -1324,7 +1325,7 @@ describe('chart-space background', () => {
     ]);
   });
 
-  it('uses the shared pattern paint inside the rounded clip', () => {
+  it('uses the shared pattern paint in the rounded frame', () => {
     const rec = recordingCtx();
     renderChart(rec.ctx, baseModel({
       roundedCorners: true,
@@ -1333,10 +1334,35 @@ describe('chart-space background', () => {
       },
     }), RECT, 1);
 
-    expect(rec.clipCalls).toBe(1);
-    expect(rec.rects[0]).toMatchObject({
-      x: 0, y: 0, w: 640, h: 360, fs: 'rgba(17,34,51,1)',
+    expect(rec.clipCalls).toBe(0);
+    expect(rec.paintEvents).toContainEqual({
+      kind: 'fill', fillStyle: 'rgba(17,34,51,1)',
     });
+  });
+
+  it('clips only a rounded chart-space picture fill to the frame', () => {
+    const bitmap = { width: 8, height: 8 } as unknown as CanvasImageSource;
+    const render = (roundedCorners: boolean) => {
+      const rec = recordingCtx();
+      renderChartCore(rec.ctx, baseModel({
+        roundedCorners,
+        chartFill: {
+          fillType: 'image',
+          imagePath: 'xl/media/chart-background.png',
+          mimeType: 'image/png',
+          stretch: true,
+        },
+      }), RECT, 1, 0, testThreeD, undefined, () => bitmap);
+      return rec;
+    };
+    const square = render(false);
+    const rounded = render(true);
+
+    // paintChartImageFill owns one rectangular source clip. Rounding adds only
+    // the frame-local clip and must not clip subsequent chart content.
+    expect(rounded.clipCalls).toBe(square.clipCalls + 1);
+    expect(rounded.drawImages).toHaveLength(1);
+    expect(rounded.drawImages[0][0]).toBe(bitmap);
   });
 
   it('lets linked chart-area paint replace only an unauthored host default', () => {

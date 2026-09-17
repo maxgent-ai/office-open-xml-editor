@@ -39,6 +39,7 @@ use markdown::{
 };
 
 mod chart;
+mod chart_compatibility;
 
 mod theme;
 use theme::*;
