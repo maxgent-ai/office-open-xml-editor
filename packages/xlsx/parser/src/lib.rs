@@ -45,6 +45,7 @@ mod styles;
 use styles::*;
 mod chart;
 use chart::*;
+mod chart_compatibility;
 mod drawing;
 use drawing::*;
 mod slicer;

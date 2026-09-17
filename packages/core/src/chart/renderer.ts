@@ -15159,25 +15159,42 @@ function renderChartImpl(
     const { x, y, w, h } = rect;
     const rounded = chart.roundedCorners === true;
     const cornerRadius = rounded ? CHART_SPACE_CORNER_RADIUS_PT * ptToPx : 0;
-    if (rounded) {
-      chartSpaceRoundedPath(ctx, x, y, w, h, cornerRadius);
-      ctx.clip();
-    }
+    const fillChartSpace = () => {
+      if (rounded) {
+        chartSpaceRoundedPath(ctx, x, y, w, h, cornerRadius);
+        ctx.fill();
+      } else {
+        ctx.fillRect(x, y, w, h);
+      }
+    };
     // Only fill the outer chartSpace when chartBg is set; a null means noFill
     // (transparent) per OOXML, so the underlying slide/sheet shows through.
+    // `roundedCorners` rounds that frame; it does not clip labels or other chart
+    // content. Office-produced PPTX output keeps axis labels outside the rounded
+    // frame silhouette visible. Picture fill alone needs a temporary local clip.
     if (chart.chartFillHidden === true) {
       // Direct or linked `noFill`: retain the host surface beneath the chart.
     } else if (chart.chartFill?.fillType === 'image') {
-      paintChartImageFill(
-        ctx, chart.chartFill, x, y, w, h, ptToPx, shapeRotationDeg,
-      );
+      if (rounded) {
+        ctx.save();
+        chartSpaceRoundedPath(ctx, x, y, w, h, cornerRadius);
+        ctx.clip();
+        paintChartImageFill(
+          ctx, chart.chartFill, x, y, w, h, ptToPx, shapeRotationDeg,
+        );
+        ctx.restore();
+      } else {
+        paintChartImageFill(
+          ctx, chart.chartFill, x, y, w, h, ptToPx, shapeRotationDeg,
+        );
+      }
     } else if (chart.chartFill) {
       const fill = resolveFill(chart.chartFill, ctx, x, y, w, h, shapeRotationDeg);
       if (fill) ctx.fillStyle = fill;
-      if (fill) ctx.fillRect(x, y, w, h);
+      if (fill) fillChartSpace();
     } else if (chart.chartBg) {
       ctx.fillStyle = `#${chart.chartBg}`;
-      ctx.fillRect(x, y, w, h);
+      fillChartSpace();
     }
 
     // Explicit chart border — drawn only when DrawingML declares a paintable

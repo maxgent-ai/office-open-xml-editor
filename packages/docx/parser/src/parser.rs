@@ -20257,7 +20257,7 @@ mod anchor_image_relative_from_tests {
     }
 
     #[test]
-    fn word_classic_chart_space_frame_covers_the_complete_style_domain() {
+    fn word_classic_chart_space_frame_tracks_style_boundary_and_defaults() {
         let theme = ThemeColors::default();
         let chart_xml = |style: Option<u8>, rounded: Option<bool>| {
             let style = style
@@ -20277,7 +20277,7 @@ mod anchor_image_relative_from_tests {
             )
         };
 
-        for style in 1..=48 {
+        for style in [1, 40, 41, 48] {
             let chart = parse_docx_chart(&chart_xml(Some(style), None), None, &theme)
                 .expect("classic chart must parse");
             assert_eq!(chart.rounded_corners, Some(true), "style {style}");

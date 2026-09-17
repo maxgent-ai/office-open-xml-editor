@@ -1049,7 +1049,17 @@ pub(crate) fn parse_shape(
     let fill = if sp_pr_has_grp_fill {
         group_fill.cloned()
     } else {
-        let own = sp_pr.and_then(|p| parse_fill(p, theme));
+        // A resolvable p:sp blipFill is emitted as PictureElement by the tree
+        // walker before parse_shape. Reaching this branch with an authored
+        // blipFill means that its image relationship is unavailable. The direct
+        // fill component is still authoritative: leave the interior unpainted
+        // instead of replacing the missing image with fillRef or placeholder
+        // paint (which commonly produces a black rectangle).
+        let own = if sp_pr.and_then(|p| child(p, "blipFill")).is_some() {
+            Some(Fill::None)
+        } else {
+            sp_pr.and_then(|p| parse_fill(p, theme))
+        };
         let inherited = if own.is_none() && style_fill.is_none() && ph_node.is_some() {
             lph.lookup_fill(&ph_type, ph_idx)
         } else {
@@ -2404,101 +2414,93 @@ pub(crate) fn parse_sp_tree_node(
             if skip_placeholders && is_placeholder(node) {
                 return;
             }
-            // Image-filled shape: spPr > blipFill > blip r:embed → render as PictureElement
+            // Image-filled shape: render through the same source resolver as
+            // p:pic. [MS-ODRAWXML] §1.3.3 / §2.26.1.1 identify svgBlip as the
+            // SVG resource and the main blip raster as its compatibility copy.
+            // That copy can be absent or point at a missing part; in that case
+            // the surviving SVG is still the authored picture. Requiring the
+            // raster here used to fall through to parse_shape, where the shape's
+            // fillRef could paint a black rectangle instead.
             let sp_pr_node = child(node, "spPr");
             let blip_fill_node = sp_pr_node.and_then(|p| child(p, "blipFill"));
-            let blip_rid = blip_fill_node
-                .and_then(|bf| child(bf, "blip"))
-                .and_then(|b| attr_r(&b, "embed"));
-            if let Some(ref rid) = blip_rid {
+            let blip_source =
+                blip_fill_node.and_then(|bf| resolve_blip_source(bf, slide_dir, rels, zip));
+            if let Some(BlipSource {
+                image_path,
+                mime_type,
+                intrinsic_width_px,
+                intrinsic_height_px,
+                svg_image_path,
+            }) = blip_source
+            {
                 if let Some(xfrm_node) = sp_pr_node.and_then(|p| child(p, "xfrm")) {
                     let t = parse_xfrm(xfrm_node);
                     if t.cx > 0 && t.cy > 0 {
-                        if let Some(target) = rels.get(rid) {
-                            let image_path = resolve_path(slide_dir, target);
-                            if let Ok(bytes) = read_zip_head(zip, &image_path, 24) {
-                                let mime_type = mime_from_ext(&image_path).to_owned();
-                                let (intrinsic_width_px, intrinsic_height_px) =
-                                    match png_size_from_bytes(&bytes) {
-                                        Some((w, h)) => (Some(w), Some(h)),
-                                        None => (None, None),
-                                    };
-                                // Microsoft 2016 SVG extension — a blipFill-painted
-                                // sp can carry the same svgBlip vector original as a
-                                // real p:pic; surface it so the renderer prefers it.
-                                let svg_image_path = blip_fill_node
-                                    .and_then(|bf| child(bf, "blip"))
-                                    .and_then(|b| svg_blip_path(b, slide_dir, rels, zip));
-                                // §20.1.9.18 — the sp's prstGeom (any preset, not
-                                // just roundRect) is the picture's clip silhouette.
-                                let (prst_geom, prst_adjust) =
-                                    sp_pr_node.map(parse_pic_prst_geom).unwrap_or((None, None));
-                                let cust_geom =
-                                    sp_pr_node
-                                        .and_then(|p| child(p, "custGeom"))
-                                        .map(|geometry| {
-                                            parse_cust_geom(geometry, t.cx as f64, t.cy as f64)
-                                        });
-                                let PictureShapeProperties {
-                                    stroke,
-                                    shadow,
-                                    inner_shadow,
-                                    glow,
-                                    soft_edge,
-                                    reflection,
-                                    scene3d,
-                                    sp3d,
-                                } = resolve_picture_shape_properties(
-                                    sp_pr_node,
-                                    child(node, "style"),
-                                    None,
-                                    theme_source,
-                                );
-                                out.push(SlideElement::Picture(PictureElement {
-                                    id: own_cnv_pr(node).and_then(|cnv| attr(&cnv, "id")),
-                                    x: t.x,
-                                    y: t.y,
-                                    width: t.cx,
-                                    height: t.cy,
-                                    rotation: t.rot,
-                                    flip_h: t.flip_h,
-                                    flip_v: t.flip_v,
-                                    image_path,
-                                    mime_type,
-                                    svg_image_path,
-                                    intrinsic_width_px,
-                                    intrinsic_height_px,
-                                    stroke,
-                                    prst_geom,
-                                    prst_adjust,
-                                    src_rect: blip_fill_node.and_then(parse_src_rect),
-                                    alpha: blip_fill_node.and_then(parse_blip_alpha),
-                                    duotone: blip_fill_node.and_then(|bf| {
-                                        parse_blip_duotone(
-                                            bf,
-                                            &PptxSchemeResolver { theme },
-                                            ooxml_common::color::TintMode::PowerPointLinear,
-                                        )
-                                    }),
-                                    cust_geom,
-                                    shadow,
-                                    inner_shadow,
-                                    glow,
-                                    soft_edge,
-                                    reflection,
-                                    scene3d,
-                                    sp3d,
-                                }));
-                                return;
-                            }
-                        }
+                        // §20.1.9.18 — the sp's prstGeom (any preset, not just
+                        // roundRect) is the picture's clip silhouette.
+                        let (prst_geom, prst_adjust) =
+                            sp_pr_node.map(parse_pic_prst_geom).unwrap_or((None, None));
+                        let cust_geom = sp_pr_node
+                            .and_then(|p| child(p, "custGeom"))
+                            .map(|geometry| parse_cust_geom(geometry, t.cx as f64, t.cy as f64));
+                        let PictureShapeProperties {
+                            stroke,
+                            shadow,
+                            inner_shadow,
+                            glow,
+                            soft_edge,
+                            reflection,
+                            scene3d,
+                            sp3d,
+                        } = resolve_picture_shape_properties(
+                            sp_pr_node,
+                            child(node, "style"),
+                            None,
+                            theme_source,
+                        );
+                        out.push(SlideElement::Picture(PictureElement {
+                            id: own_cnv_pr(node).and_then(|cnv| attr(&cnv, "id")),
+                            x: t.x,
+                            y: t.y,
+                            width: t.cx,
+                            height: t.cy,
+                            rotation: t.rot,
+                            flip_h: t.flip_h,
+                            flip_v: t.flip_v,
+                            image_path,
+                            mime_type,
+                            svg_image_path,
+                            intrinsic_width_px,
+                            intrinsic_height_px,
+                            stroke,
+                            prst_geom,
+                            prst_adjust,
+                            src_rect: blip_fill_node.and_then(parse_src_rect),
+                            alpha: blip_fill_node.and_then(parse_blip_alpha),
+                            duotone: blip_fill_node.and_then(|bf| {
+                                parse_blip_duotone(
+                                    bf,
+                                    &PptxSchemeResolver { theme },
+                                    ooxml_common::color::TintMode::PowerPointLinear,
+                                )
+                            }),
+                            cust_geom,
+                            shadow,
+                            inner_shadow,
+                            glow,
+                            soft_edge,
+                            reflection,
+                            scene3d,
+                            sp3d,
+                        }));
+                        return;
                     }
                 }
             }
             // Picture-placeholder inheritance: slide sp has a ph but no own blipFill →
             // look up an inherited blipFill from the layout placeholder. Transform
             // comes from the slide's xfrm when present, otherwise from the layout.
-            if blip_rid.is_none() {
+            if blip_fill_node.is_none() {
                 if let Some(ph) = node
                     .descendants()
                     .find(|n| n.is_element() && n.tag_name().name() == "ph")
@@ -3630,6 +3632,7 @@ mod style_ref_tests {
 mod picture_property_resolution_tests {
     use super::*;
     use crate::master::{InheritedBlipFill, LayoutPlaceholders};
+    use crate::theme::PptxTheme;
     use std::io::{Cursor, Write};
 
     fn tiny_png() -> Vec<u8> {
@@ -3655,6 +3658,24 @@ mod picture_property_resolution_tests {
                 )
                 .unwrap();
             writer.write_all(&tiny_png()).unwrap();
+            writer.finish().unwrap();
+        }
+        PptxZip::new(Cursor::new(bytes)).unwrap()
+    }
+
+    fn svg_only_image_zip() -> PptxZip {
+        let mut bytes = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(Cursor::new(&mut bytes));
+            writer
+                .start_file(
+                    "ppt/media/image2.svg",
+                    zip::write::SimpleFileOptions::default(),
+                )
+                .unwrap();
+            writer
+                .write_all(br#"<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2"><rect width="2" height="2" fill="none" stroke="none"/></svg>"#)
+                .unwrap();
             writer.finish().unwrap();
         }
         PptxZip::new(Cursor::new(bytes)).unwrap()
@@ -3768,6 +3789,98 @@ mod picture_property_resolution_tests {
         );
         assert_eq!(blip_shape.id.as_deref(), Some("2"));
         assert_theme_properties(&blip_shape);
+    }
+
+    #[test]
+    fn blip_filled_shape_uses_svg_when_the_raster_fallback_part_is_missing() {
+        let doc = roxmltree::Document::parse(
+            r#"<p:sp xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+                           xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+                           xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+                           xmlns:asvg="http://schemas.microsoft.com/office/drawing/2016/SVG/main">
+              <p:nvSpPr><p:cNvPr id="7" name="SVG shape"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr>
+              <p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="1000" cy="1000"/></a:xfrm>
+                <a:blipFill><a:blip r:embed="rIdMissingRaster"><a:extLst>
+                  <a:ext uri="{96DAC541-7B7A-43D3-8B79-37D633B846F1}">
+                    <asvg:svgBlip r:embed="rIdSvg"/>
+                  </a:ext>
+                </a:extLst></a:blip></a:blipFill></p:spPr>
+              <p:style><a:fillRef idx="1"><a:srgbClr val="000000"/></a:fillRef></p:style>
+            </p:sp>"#,
+        )
+        .unwrap();
+        let rels = HashMap::from([
+            (
+                "rIdMissingRaster".to_owned(),
+                "../media/missing.png".to_owned(),
+            ),
+            ("rIdSvg".to_owned(), "../media/image2.svg".to_owned()),
+        ]);
+        let mut zip = svg_only_image_zip();
+        let mut out = Vec::new();
+
+        parse_sp_tree_node(
+            doc.root_element(),
+            &LayoutPlaceholders::default(),
+            "ppt/slides",
+            &rels,
+            &HashMap::new(),
+            &mut zip,
+            &PptxTheme::default(),
+            &mut out,
+            false,
+            None,
+            DepthGuard::root(),
+        );
+
+        let SlideElement::Picture(picture) = out.pop().expect("picture output") else {
+            panic!("the surviving SVG must not fall through to the black shape-style fill")
+        };
+        assert_eq!(picture.image_path, "ppt/media/image2.svg");
+        assert_eq!(picture.mime_type, "image/svg+xml");
+        assert_eq!(
+            picture.svg_image_path.as_deref(),
+            Some("ppt/media/image2.svg")
+        );
+        assert!(picture.stroke.is_none());
+    }
+
+    #[test]
+    fn unresolved_blip_filled_shape_does_not_fall_back_to_the_style_fill() {
+        let doc = roxmltree::Document::parse(
+            r#"<p:sp xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+                           xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+                           xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+              <p:nvSpPr><p:cNvPr id="8" name="Missing image"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr>
+              <p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="1000" cy="1000"/></a:xfrm>
+                <a:blipFill><a:blip r:embed="rIdMissing"/></a:blipFill></p:spPr>
+              <p:style><a:fillRef idx="1"><a:srgbClr val="000000"/></a:fillRef></p:style>
+            </p:sp>"#,
+        )
+        .unwrap();
+        let rels = HashMap::from([("rIdMissing".to_owned(), "../media/missing.png".to_owned())]);
+        let mut zip = svg_only_image_zip();
+        let mut out = Vec::new();
+
+        parse_sp_tree_node(
+            doc.root_element(),
+            &LayoutPlaceholders::default(),
+            "ppt/slides",
+            &rels,
+            &HashMap::new(),
+            &mut zip,
+            &PptxTheme::default(),
+            &mut out,
+            false,
+            None,
+            DepthGuard::root(),
+        );
+
+        let SlideElement::Shape(shape) = out.pop().expect("shape output") else {
+            panic!("an unresolved image fill must preserve the non-image shape properties")
+        };
+        assert!(matches!(shape.fill, Some(Fill::None)));
+        assert!(shape.stroke.is_none());
     }
 
     #[test]
