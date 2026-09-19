@@ -5608,6 +5608,17 @@ enum ChartStyleEffectRecipe {
     Xml(String),
 }
 
+type ParsedChartStyleEffects = (
+    Option<Vec<Option<crate::effect::Shadow>>>,
+    Option<Vec<Option<crate::effect::Shadow>>>,
+    Option<Vec<Option<crate::effect::Glow>>>,
+    Option<Vec<Option<crate::effect::SoftEdge>>>,
+    Option<Vec<Option<crate::effect::Reflection>>>,
+    Option<bool>,
+    Option<bool>,
+    Option<bool>,
+);
+
 fn chart_style_effect_ref_xml(
     effect_ref: Node,
     resolver: &dyn ColorResolver,
@@ -5640,16 +5651,7 @@ fn parse_chart_style_effects(
     placeholders: &[Option<&str>],
     accents: Option<&[Option<String>]>,
     color_style_method: Option<&str>,
-) -> (
-    Option<Vec<Option<crate::effect::Shadow>>>,
-    Option<Vec<Option<crate::effect::Shadow>>>,
-    Option<Vec<Option<crate::effect::Glow>>>,
-    Option<Vec<Option<crate::effect::SoftEdge>>>,
-    Option<Vec<Option<crate::effect::Reflection>>>,
-    Option<bool>,
-    Option<bool>,
-    Option<bool>,
-) {
+) -> ParsedChartStyleEffects {
     let direct_effect_list = local_sp_pr.and_then(|sp_pr| child(sp_pr, "effectLst"));
     let direct_effect_dag = local_sp_pr.and_then(|sp_pr| child(sp_pr, "effectDag"));
     let effect_ref = child(style_node, "effectRef");
@@ -10080,17 +10082,16 @@ fn parse_axis_display_units(axis: Node, resolver: &dyn ColorResolver) -> Option<
 /// them without overriding local formatting.
 /// `show` comes from the sibling `<c:showLeaderLines val>` (§21.2.2.183); the
 /// stroke style comes from `<c:leaderLines>` (§21.2.2.92) `<c:spPr><a:ln>`.
-fn parse_leader_lines(
-    d_lbls: Node,
-    resolver: &dyn ColorResolver,
-) -> (
+type ParsedLeaderLines = (
     bool,
     Option<String>,
     Option<u32>,
     Option<bool>,
     Option<String>,
     Option<bool>,
-) {
+);
+
+fn parse_leader_lines(d_lbls: Node, resolver: &dyn ColorResolver) -> ParsedLeaderLines {
     // §21.2.2.183 `<c:showLeaderLines>` — CT_Boolean, so a bare element ⇒ true;
     // absent ⇒ false (no leader lines by default).
     let show = bool_child(d_lbls, "showLeaderLines").unwrap_or(false);

@@ -1,6 +1,8 @@
 //! Isolated Excel deltas over ECMA-376 classic chart-space defaults.
 
-use ooxml_common::chart::{ChartExElementStyle, ChartModel};
+#[cfg(test)]
+use ooxml_common::chart::ChartExElementStyle;
+use ooxml_common::chart::ChartModel;
 use std::collections::BTreeMap;
 
 /// Apply Excel's observed host delta to the normative built-in `chartArea`
@@ -18,7 +20,7 @@ pub(crate) fn apply_excel_classic_chart_space_frame(chart: &mut ChartModel) {
         .classic_chart_style_roles
         .get_or_insert_with(BTreeMap::new)
         .entry("chartArea".to_string())
-        .or_insert_with(ChartExElementStyle::default);
+        .or_default();
     if chart.legacy_chart_style.unwrap_or(2) <= 40 {
         style.line_width_emu = Some(12_700);
         style.line_hidden = None;

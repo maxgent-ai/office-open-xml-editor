@@ -1,6 +1,6 @@
 //! Isolated Word deltas over ECMA-376 classic chart-space defaults.
 
-use ooxml_common::chart::{ChartCartesianAutoLayoutProfile, ChartExElementStyle, ChartModel};
+use ooxml_common::chart::{ChartCartesianAutoLayoutProfile, ChartModel};
 use std::collections::BTreeMap;
 
 /// Apply Word's observed host delta to the normative built-in `chartArea`
@@ -42,7 +42,7 @@ pub(crate) fn apply_word_classic_chart_space_frame(chart: &mut ChartModel) {
         .classic_chart_style_roles
         .get_or_insert_with(BTreeMap::new)
         .entry("chartArea".to_string())
-        .or_insert_with(ChartExElementStyle::default);
+        .or_default();
     if style_number <= 40 {
         style.fill_paints = None;
         style.fill_colors = None;

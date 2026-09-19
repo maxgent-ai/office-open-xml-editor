@@ -876,7 +876,7 @@ fn resolve_classic_chart_style_roles_selected(
     }
 
     let point_colors = data_palette(data.pattern);
-    let outline_colors = data.outline.map(data_palette).unwrap_or_else(Vec::new);
+    let outline_colors = data.outline.map(data_palette).unwrap_or_default();
     roles.insert(
         "dataPoint".to_owned(),
         make_role_style(
@@ -1039,10 +1039,7 @@ fn resolve_classic_chart_style_roles_selected(
                 role.to_owned(),
                 make_role_style(
                     Some((bars.fill, fixed(color))),
-                    Some((
-                        bars.line,
-                        bars.line_color.map(fixed).unwrap_or_else(Vec::new),
-                    )),
+                    Some((bars.line, bars.line_color.map(fixed).unwrap_or_default())),
                 ),
             );
         }
