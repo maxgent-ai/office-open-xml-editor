@@ -826,11 +826,15 @@ fn load_document_parse_environment(zip: &mut Zip) -> DocumentParseEnvironment {
             format!("word/{target}")
         }
     });
-    let mut theme = theme_path
-        .as_deref()
-        .and_then(|path| read_zip_string(zip, path).ok())
-        .map(|xml| ThemeColors::parse(&xml))
-        .unwrap_or_default();
+    let mut theme = match theme_path.as_deref() {
+        Some(path) => read_zip_string(zip, path)
+            .map(|xml| ThemeColors::parse(&xml))
+            .unwrap_or_else(|_| ThemeColors {
+                format_scheme_present: true,
+                ..ThemeColors::default()
+            }),
+        None => ThemeColors::default(),
+    };
     if let Some(theme_path) = theme_path.as_deref() {
         let rels_path = ooxml_common::rels::relationship_part_path(theme_path);
         if let Ok(theme_rels_xml) = read_zip_string(zip, &rels_path) {
@@ -1960,6 +1964,10 @@ pub struct ThemeColors {
     /// each omitted local line property can inherit independently (ECMA-376
     /// §20.1.4.1.30 and §20.1.2.2.24).
     format_scheme: ooxml_common::theme::ThemeFormatScheme,
+    /// Distinguishes an absent optional theme part from a present theme whose
+    /// style matrix is empty or malformed. Numeric chart styles may use host
+    /// semantic defaults only in the former case.
+    format_scheme_present: bool,
     /// Image relationships owned by the theme part. Chart Style `fillRef`
     /// recipes resolve `blipFill` rIds in this OPC scope.
     chart_images: ooxml_common::chart::ChartImageRelationships,
@@ -2032,6 +2040,7 @@ impl ThemeColors {
             fonts,
             script_fonts,
             format_scheme,
+            format_scheme_present: true,
             ..Default::default()
         }
     }
@@ -4291,7 +4300,8 @@ fn load_chart_related_parts(zip: &mut Zip, chart_path: &str) -> ChartRelatedPart
     });
     if let Some(style_relationship) = style_relationship {
         let style_path = ooxml_common::rels::resolve_target(base_dir, &style_relationship.target);
-        result.style_xml = read_zip_string(zip, &style_path).ok();
+        result.style_xml =
+            Some(read_zip_string(zip, &style_path).unwrap_or_else(|_| "\0".to_owned()));
         let style_rels_path = ooxml_common::rels::relationship_part_path(&style_path);
         if let Ok(style_rels_xml) = read_zip_string(zip, &style_rels_path) {
             let style_relationships = ooxml_common::rels::parse_rels(&style_rels_xml);
@@ -4306,7 +4316,8 @@ fn load_chart_related_parts(zip: &mut Zip, chart_path: &str) -> ChartRelatedPart
         internal_target(ooxml_common::chart::CHART_COLOR_STYLE_REL_TYPE_SUFFIX)
     {
         let color_path = ooxml_common::rels::resolve_target(base_dir, &color_relationship.target);
-        result.color_style_xml = read_zip_string(zip, &color_path).ok();
+        result.color_style_xml =
+            Some(read_zip_string(zip, &color_path).unwrap_or_else(|_| "\0".to_owned()));
     }
     result
 }
@@ -12382,6 +12393,14 @@ impl ooxml_common::chart::ColorResolver for DocxColorResolver<'_> {
         resolve_color_element(node, self.theme)
     }
 
+    fn resolve_scheme_color(&self, name: &str) -> Option<String> {
+        // Numeric classic styles are materialized through the same DrawingML
+        // theme matrix as linked chart styles. Expose arbitrary scheme slots
+        // here as the PPTX/XLSX adapters already do; `resolve_series_accent`
+        // alone is insufficient for Table 2/3 tx/bg and shaded colors.
+        self.theme.resolve(name)
+    }
+
     /// Chart shape fills (marker / dPt / errBars `<c:spPr>` / `<a:ln>`) sit one
     /// level below their container and want the FULL DrawingML grammar. The
     /// default trait impl finds the direct-child `<a:solidFill>` and delegates
@@ -12406,7 +12425,9 @@ impl ooxml_common::chart::ColorResolver for DocxColorResolver<'_> {
     }
 
     fn theme_format_scheme(&self) -> Option<&ooxml_common::theme::ThemeFormatScheme> {
-        Some(&self.theme.format_scheme)
+        self.theme
+            .format_scheme_present
+            .then_some(&self.theme.format_scheme)
     }
 }
 
@@ -17473,6 +17494,56 @@ mod cs_toggle_tests {
 }
 
 #[cfg(test)]
+mod theme_package_presence_tests {
+    use super::*;
+    use std::io::{Cursor, Write};
+
+    fn package_with_document_rels(rels: &str) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(Cursor::new(&mut bytes));
+            let options = zip::write::SimpleFileOptions::default();
+            writer
+                .start_file("word/_rels/document.xml.rels", options)
+                .unwrap();
+            writer.write_all(rels.as_bytes()).unwrap();
+            writer.finish().unwrap();
+        }
+        bytes
+    }
+
+    #[test]
+    fn absent_theme_and_broken_theme_relationship_keep_distinct_chart_semantics() {
+        let mut absent_zip = open_zip(package_with_document_rels(
+            r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>"#,
+        ))
+        .unwrap();
+        let absent = load_document_parse_environment(&mut absent_zip);
+        assert!(
+            ooxml_common::chart::ColorResolver::theme_format_scheme(&DocxColorResolver {
+                theme: &absent.theme,
+            })
+            .is_none()
+        );
+
+        let mut broken_zip = open_zip(package_with_document_rels(
+            r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rTheme" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme" Target="theme/missing.xml"/></Relationships>"#,
+        ))
+        .unwrap();
+        let broken = load_document_parse_environment(&mut broken_zip);
+        let broken_resolver = DocxColorResolver {
+            theme: &broken.theme,
+        };
+        let scheme = ooxml_common::chart::ColorResolver::theme_format_scheme(&broken_resolver)
+            .expect("a declared but unreadable theme must fail closed");
+        assert!(matches!(
+            scheme.lookup_fill_ref(1),
+            ooxml_common::theme::StyleMatrixLookup::Missing
+        ));
+    }
+}
+
+#[cfg(test)]
 mod theme_cs_tests {
     use super::*;
 
@@ -20237,13 +20308,26 @@ mod anchor_image_relative_from_tests {
                    <a:accent6><a:srgbClr val="70AD47"/></a:accent6>
                    <a:hlink><a:srgbClr val="0563C1"/></a:hlink>
                    <a:folHlink><a:srgbClr val="954F72"/></a:folHlink>
-                 </a:clrScheme></a:themeElements>
+                 </a:clrScheme><a:fmtScheme name="Office">
+                   <a:fillStyleLst>
+                     <a:solidFill><a:schemeClr val="phClr"/></a:solidFill>
+                     <a:solidFill><a:schemeClr val="phClr"/></a:solidFill>
+                     <a:solidFill><a:schemeClr val="phClr"/></a:solidFill>
+                   </a:fillStyleLst>
+                   <a:lnStyleLst>
+                     <a:ln w="6350"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln>
+                     <a:ln w="12700"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln>
+                     <a:ln w="19050"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln>
+                   </a:lnStyleLst>
+                   <a:effectStyleLst><a:effectStyle><a:effectLst/></a:effectStyle><a:effectStyle><a:effectLst/></a:effectStyle><a:effectStyle><a:effectLst/></a:effectStyle></a:effectStyleLst>
+                 </a:fmtScheme></a:themeElements>
                </a:theme>"#,
         );
         // Bar chart, one series with NO <c:spPr> fill so the accent default applies.
         let chart_xml = r#"<c:chartSpace
             xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"
             xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+          <c:style val="35"/>
           <c:chart><c:plotArea><c:barChart>
             <c:barDir val="col"/><c:grouping val="clustered"/>
             <c:ser>
@@ -20275,11 +20359,42 @@ mod anchor_image_relative_from_tests {
             Some("4472C4".to_string()),
             "series 0 default fill must be theme accent1"
         );
+        assert_eq!(
+            chart.classic_chart_style_roles.as_ref().unwrap()["plotArea"]
+                .fill_colors
+                .as_deref(),
+            Some(&[Some("4472C4".to_string())][..]),
+            "style 35 plotArea must resolve its Table 3 accent1 fill"
+        );
     }
 
     #[test]
     fn word_classic_chart_space_frame_tracks_style_boundary_and_defaults() {
-        let theme = ThemeColors::default();
+        // Numeric chart styles resolve through the document's actual theme
+        // matrix. Keep this fixture theme-backed: an absent optional theme is
+        // intentionally represented by unresolved semantic paint, not by an
+        // invented hard-coded Office palette.
+        let theme = ThemeColors::parse(
+            r#"<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:themeElements>
+              <a:clrScheme name="Office">
+                <a:dk1><a:srgbClr val="000000"/></a:dk1><a:lt1><a:srgbClr val="FFFFFF"/></a:lt1>
+                <a:dk2><a:srgbClr val="44546A"/></a:dk2><a:lt2><a:srgbClr val="E7E6E6"/></a:lt2>
+                <a:accent1><a:srgbClr val="4472C4"/></a:accent1><a:accent2><a:srgbClr val="ED7D31"/></a:accent2>
+                <a:accent3><a:srgbClr val="A5A5A5"/></a:accent3><a:accent4><a:srgbClr val="FFC000"/></a:accent4>
+                <a:accent5><a:srgbClr val="5B9BD5"/></a:accent5><a:accent6><a:srgbClr val="70AD47"/></a:accent6>
+                <a:hlink><a:srgbClr val="0563C1"/></a:hlink><a:folHlink><a:srgbClr val="954F72"/></a:folHlink>
+              </a:clrScheme>
+              <a:fmtScheme name="Office"><a:fillStyleLst>
+                <a:solidFill><a:schemeClr val="phClr"/></a:solidFill>
+                <a:solidFill><a:schemeClr val="phClr"/></a:solidFill>
+                <a:solidFill><a:schemeClr val="phClr"/></a:solidFill>
+              </a:fillStyleLst><a:lnStyleLst>
+                <a:ln w="6350"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln>
+                <a:ln w="12700"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln>
+                <a:ln w="19050"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln>
+              </a:lnStyleLst><a:effectStyleLst/><a:bgFillStyleLst/></a:fmtScheme>
+            </a:themeElements></a:theme>"#,
+        );
         let chart_xml = |style: Option<u8>, rounded: Option<bool>| {
             let style = style
                 .map(|value| format!(r#"<c:style val="{value}"/>"#))
@@ -20303,12 +20418,13 @@ mod anchor_image_relative_from_tests {
                 .expect("classic chart must parse");
             assert_eq!(chart.rounded_corners, Some(true), "style {style}");
             let frame = chart
-                .chart_style_roles
+                .classic_chart_style_roles
                 .as_ref()
                 .and_then(|roles| roles.get("chartArea"))
                 .expect("implicit chartArea frame");
-            assert_eq!(frame.fill_no_style, Some(true), "style {style}");
             if style <= 40 {
+                assert_eq!(frame.fill_paint_authored, Some(true), "style {style}");
+                assert_eq!(frame.fill_hidden, Some(true), "style {style}");
                 assert_eq!(
                     frame.line_colors.as_deref(),
                     Some(&[Some("898989".to_string())][..]),
@@ -20317,6 +20433,7 @@ mod anchor_image_relative_from_tests {
                 assert_eq!(frame.line_width_emu, Some(6_350), "style {style}");
                 assert_ne!(frame.line_hidden, Some(true), "style {style}");
             } else {
+                assert_ne!(frame.fill_hidden, Some(true), "style {style}");
                 assert_eq!(frame.line_hidden, Some(true), "style {style}");
                 assert!(frame.line_colors.is_none(), "style {style}");
             }
@@ -20324,7 +20441,7 @@ mod anchor_image_relative_from_tests {
 
         let omitted = parse_docx_chart(&chart_xml(None, None), None, &theme)
             .expect("chart with omitted style must parse");
-        let omitted_frame = &omitted.chart_style_roles.as_ref().unwrap()["chartArea"];
+        let omitted_frame = &omitted.classic_chart_style_roles.as_ref().unwrap()["chartArea"];
         assert_eq!(omitted_frame.line_width_emu, Some(6_350));
         assert_eq!(
             omitted_frame.line_colors.as_deref(),
@@ -20589,6 +20706,29 @@ mod anchor_image_relative_from_tests {
             Some(ooxml_common::chart::ChartStyleFill::Image { image_path, .. })
                 if image_path == "word/media/theme-marker.png"
         ));
+    }
+
+    #[test]
+    fn docx_chart_related_parts_preserve_missing_sidecar_relationships() {
+        use std::io::{Cursor, Write};
+        use zip::write::SimpleFileOptions;
+
+        let mut bytes = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(Cursor::new(&mut bytes));
+            writer
+                .start_file(
+                    "word/charts/_rels/chart9.xml.rels",
+                    SimpleFileOptions::default(),
+                )
+                .unwrap();
+            writer.write_all(br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rStyle" Type="http://schemas.microsoft.com/office/2011/relationships/chartStyle" Target="missing-style.xml"/><Relationship Id="rColors" Type="http://schemas.microsoft.com/office/2011/relationships/chartColorStyle" Target="missing-colors.xml"/></Relationships>"#).unwrap();
+            writer.finish().unwrap();
+        }
+        let mut archive = Zip::new(Cursor::new(bytes)).unwrap();
+        let related = load_chart_related_parts(&mut archive, "word/charts/chart9.xml");
+        assert_eq!(related.style_xml.as_deref(), Some("\0"));
+        assert_eq!(related.color_style_xml.as_deref(), Some("\0"));
     }
 
     #[test]

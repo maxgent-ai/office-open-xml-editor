@@ -374,6 +374,7 @@ struct WorkbookShared {
     /// sheet's shape tree. Keeping the complete recipes avoids the previous
     /// per-sheet theme re-inflate and width-only `lnStyleLst` projection.
     theme_format_scheme: Rc<ooxml_common::theme::ThemeFormatScheme>,
+    theme_format_scheme_present: bool,
     /// Image relationships owned by the workbook theme part. Chart Style
     /// `fillRef` recipes resolve `blipFill` rIds in this scope, not in the
     /// chart or style part.
@@ -404,6 +405,7 @@ struct WorkbookShared {
 struct XlsxThemeData {
     colors: Vec<String>,
     format_scheme: ooxml_common::theme::ThemeFormatScheme,
+    format_scheme_present: bool,
     fonts: (Option<String>, Option<String>),
     chart_images: ooxml_common::chart::ChartImageRelationships,
 }
@@ -415,7 +417,10 @@ impl XlsxThemeData {
         };
         let theme_path = resolve_zip_path("xl", &target);
         let Ok(xml) = read_zip_string(archive, &theme_path) else {
-            return Self::default();
+            return Self {
+                format_scheme_present: true,
+                ..Self::default()
+            };
         };
         let mut theme = Self::parse(&xml);
         let rels_path = ooxml_common::rels::relationship_part_path(&theme_path);
@@ -440,6 +445,7 @@ impl XlsxThemeData {
         Self {
             colors,
             format_scheme: ooxml_common::theme::ThemeFormatScheme::parse(xml),
+            format_scheme_present: true,
             fonts: (theme_fonts.major.latin, theme_fonts.minor.latin),
             chart_images: ooxml_common::chart::ChartImageRelationships::default(),
         }
@@ -483,6 +489,7 @@ impl WorkbookShared {
         let theme = XlsxThemeData::load(archive, &rels_xml);
         let theme_colors: Rc<[String]> = theme.colors.into();
         let theme_format_scheme = Rc::new(theme.format_scheme);
+        let theme_format_scheme_present = theme.format_scheme_present;
         let theme_fonts = theme.fonts;
         let theme_chart_images = Rc::new(theme.chart_images);
         let (default_font, chart_number_formats, styles) = if include_full_styles {
@@ -513,6 +520,7 @@ impl WorkbookShared {
                 sheets,
                 theme_colors,
                 theme_format_scheme,
+                theme_format_scheme_present,
                 theme_chart_images,
                 theme_fonts,
                 default_font,
@@ -725,7 +733,9 @@ fn finalize_projected_sheet(
             shared.theme_fonts.0.as_deref(),
             shared.theme_fonts.1.as_deref(),
         ),
-        Some(shared.theme_format_scheme.as_ref()),
+        shared
+            .theme_format_scheme_present
+            .then_some(shared.theme_format_scheme.as_ref()),
         shared.theme_chart_images.as_ref(),
     );
     ws.charts = charts;
@@ -5415,6 +5425,31 @@ mod workbook_theme_tests {
     fn external_theme_relationship_is_not_treated_as_a_package_part() {
         let rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rTheme" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme" Target="https://example.invalid/theme.xml" TargetMode="External"/></Relationships>"#;
         assert_eq!(find_internal_rel_target_by_type(rels, "/theme"), None);
+    }
+
+    #[test]
+    fn absent_theme_and_broken_theme_relationship_keep_distinct_chart_semantics() {
+        let mut bytes = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(Cursor::new(&mut bytes));
+            let options = zip::write::SimpleFileOptions::default();
+            writer.start_file("placeholder", options).unwrap();
+            writer.write_all(b"x").unwrap();
+            writer.finish().unwrap();
+        }
+        let mut archive = XlsxZip::new(Cursor::new(bytes)).unwrap();
+        archive.begin_operation("theme-presence-test").unwrap();
+
+        let absent = XlsxThemeData::load(&mut archive, "");
+        assert!(!absent.format_scheme_present);
+
+        let rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rTheme" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme" Target="themes/missing.xml"/></Relationships>"#;
+        let broken = XlsxThemeData::load(&mut archive, rels);
+        assert!(broken.format_scheme_present);
+        assert!(matches!(
+            broken.format_scheme.lookup_fill_ref(1),
+            ooxml_common::theme::StyleMatrixLookup::Missing
+        ));
     }
 }
 

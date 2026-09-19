@@ -414,7 +414,8 @@ fn load_chart_related_parts(archive: &mut crate::XlsxZip, chart_path: &str) -> C
     });
     if let Some(style_relationship) = style_relationship {
         let style_path = ooxml_common::rels::resolve_target(base_dir, &style_relationship.target);
-        result.style_xml = read_zip_string(archive, &style_path).ok();
+        result.style_xml =
+            Some(read_zip_string(archive, &style_path).unwrap_or_else(|_| "\0".to_owned()));
         let style_rels_path = ooxml_common::rels::relationship_part_path(&style_path);
         if let Ok(style_rels_xml) = read_zip_string(archive, &style_rels_path) {
             let style_relationships = ooxml_common::rels::parse_rels(&style_rels_xml);
@@ -429,7 +430,8 @@ fn load_chart_related_parts(archive: &mut crate::XlsxZip, chart_path: &str) -> C
         internal_target(ooxml_common::chart::CHART_COLOR_STYLE_REL_TYPE_SUFFIX)
     {
         let color_path = ooxml_common::rels::resolve_target(base_dir, &color_relationship.target);
-        result.color_style_xml = read_zip_string(archive, &color_path).ok();
+        result.color_style_xml =
+            Some(read_zip_string(archive, &color_path).unwrap_or_else(|_| "\0".to_owned()));
     }
     result
 }
@@ -1944,21 +1946,47 @@ mod chartex_tests {
     }
 
     #[test]
-    fn classic_graphicframe_loads_linked_chart_style_roles() {
+    fn classic_graphicframe_keeps_numeric_and_linked_chart_style_roles_separate() {
         let mut archive = archive_with_classic_chart_style();
+        let theme_colors = vec![
+            "#000000".into(),
+            "#FFFFFF".into(),
+            "#44546A".into(),
+            "#E7E6E6".into(),
+            "#4472C4".into(),
+            "#ED7D31".into(),
+            "#A5A5A5".into(),
+            "#FFC000".into(),
+            "#5B9BD5".into(),
+            "#70AD47".into(),
+            "#0563C1".into(),
+            "#954F72".into(),
+        ];
+        let theme_xml = r#"<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:themeElements>
+          <a:fmtScheme name="Office"><a:fillStyleLst>
+            <a:solidFill><a:schemeClr val="phClr"/></a:solidFill>
+            <a:solidFill><a:schemeClr val="phClr"/></a:solidFill>
+            <a:solidFill><a:schemeClr val="phClr"/></a:solidFill>
+          </a:fillStyleLst><a:lnStyleLst>
+            <a:ln w="6350"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln>
+            <a:ln w="12700"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln>
+            <a:ln w="19050"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln>
+          </a:lnStyleLst><a:effectStyleLst/><a:bgFillStyleLst/></a:fmtScheme>
+        </a:themeElements></a:theme>"#;
+        let format_scheme = ooxml_common::theme::ThemeFormatScheme::parse(theme_xml);
         let charts = load_sheet_charts(
             &mut archive,
             "worksheets/sheet1.xml",
             None,
-            &theme(),
+            &theme_colors,
             (None, None),
-            None,
+            Some(&format_scheme),
         );
         let chart = &charts.first().expect("classic chart").chart;
         assert_eq!(chart.chart_type, "line");
         assert_eq!(chart.rounded_corners, Some(true));
         let frame = chart
-            .chart_style_roles
+            .classic_chart_style_roles
             .as_ref()
             .and_then(|roles| roles.get("chartArea"))
             .expect("Excel implicit chart-area frame");
@@ -2038,5 +2066,25 @@ mod chartex_tests {
                 Some((expected_image_path.to_string(), "image/png".to_string())),
             );
         }
+    }
+
+    #[test]
+    fn chart_related_parts_preserve_missing_sidecar_relationships() {
+        let mut bytes = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(Cursor::new(&mut bytes));
+            writer
+                .start_file(
+                    "xl/charts/_rels/chart9.xml.rels",
+                    SimpleFileOptions::default(),
+                )
+                .unwrap();
+            writer.write_all(br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rStyle" Type="http://schemas.microsoft.com/office/2011/relationships/chartStyle" Target="missing-style.xml"/><Relationship Id="rColors" Type="http://schemas.microsoft.com/office/2011/relationships/chartColorStyle" Target="missing-colors.xml"/></Relationships>"#).unwrap();
+            writer.finish().unwrap();
+        }
+        let mut archive = crate::XlsxZip::new(Cursor::new(bytes)).unwrap();
+        let related = load_chart_related_parts(&mut archive, "xl/charts/chart9.xml");
+        assert_eq!(related.style_xml.as_deref(), Some("\0"));
+        assert_eq!(related.color_style_xml.as_deref(), Some("\0"));
     }
 }

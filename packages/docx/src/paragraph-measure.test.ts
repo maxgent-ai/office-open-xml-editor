@@ -424,6 +424,51 @@ describe('measureParagraph', () => {
     expect(result.contentEndYPt).toBe(40);
   });
 
+  it.each([
+    { language: 'en-gb', hint: undefined, expected: 12 },
+    { language: 'ja-jp', hint: undefined, expected: 12 },
+    { language: 'en-gb', hint: 'eastAsia', expected: 12 },
+    { language: undefined, hint: undefined, expected: 12 },
+  ] as const)(
+    'keeps an acquired empty mark on its Latin/default face (language=$language, hint=$hint)',
+    ({ language, hint, expected }) => {
+      const result = measureParagraph(
+        paragraph({
+          defaultFontSize: 10,
+          defaultFontFamily: 'Latin Mark',
+          defaultFontFamilyEastAsia: 'East Asian Mark',
+          spaceBefore: 0,
+          spaceAfter: 0,
+        }),
+        layoutContext({
+          lineGrid: { active: false, pitchPt: 18 },
+          spaceBeforePt: 0,
+          spaceAfterPt: 0,
+        }),
+        placement({ startYPt: 0 }),
+        measurer,
+        environment({
+          useFeLayout: true,
+          resolvedLocalFonts: {
+            'latin mark': { family: 'Latin Mark', lineHeightRatio: 1.2 },
+            'east asian mark': { family: 'East Asian Mark', eastAsianLineHeightRatio: 1.6 },
+          },
+          paragraphMarkShapeInput: {
+            fontSizePt: 10,
+            fonts: { ascii: 'Latin Mark', eastAsia: 'East Asian Mark' },
+            weight: 400,
+            style: 'normal',
+            complexScript: false,
+            fontHint: hint,
+            eastAsiaLanguage: language,
+          },
+        }),
+      );
+
+      expect(result.contentEndYPt).toBe(expected);
+    },
+  );
+
   it('uses resolved-resource Far East metrics for useFELayout empty marks', () => {
     const markAdvance = (
       fontSize: number,

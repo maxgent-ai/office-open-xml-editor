@@ -225,7 +225,11 @@ export function measureParagraph(
     };
   };
 
-  const segments = buildSegments(paragraph.runs, environment);
+  const authoredAutoLineSpacing = context.lineSpacing?.rule === 'auto'
+    && context.lineSpacing.explicit === true;
+  const segments = buildSegments(paragraph.runs, authoredAutoLineSpacing
+    ? { ...environment, authoredAutoLineSpacing: true }
+    : environment);
   if (segments.length === 0) return measureMarkOnly();
 
   const wrapContext: WrapLayoutCtx | undefined = placement.wrap

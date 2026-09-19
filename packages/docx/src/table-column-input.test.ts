@@ -18,6 +18,8 @@ describe('table column acquisition boundary', () => {
 
     expect(result.gridWidthsPt).toEqual([0, 0, 0]);
     expect(result.gridWidthKeys).toEqual(['0/1', '0/1', '0/1']);
+    expect(result.gridAuthoredComplete).toBe(false);
+    expect(result.tableWidthAutoAuthored).toBe(false);
   });
 
   it('repairs valid exact and over-budget measures with nonfinite geometry to definitional zero', () => {
@@ -346,6 +348,8 @@ describe('table column acquisition boundary', () => {
       // Exact authored grid identity: the '720' twip column is retained as its
       // exact point key (720/20), never re-derived from the IEEE-754 width.
       gridWidthKeys: ['36/1', '0/1', '0/1', '0/1', '0/1'],
+      gridAuthoredComplete: false,
+      tableWidthAutoAuthored: false,
       tablePreferredWidthPt: 150,
       rows: [{
         // wBefore/wAfter percentages use the page text extents (§17.4.85–86),
@@ -383,6 +387,46 @@ describe('table column acquisition boundary', () => {
       });
   });
 
+  it.each([
+    ['explicit auto', { kind: 'auto', value: '0' }, true],
+    ['explicit nil', { kind: 'nil', value: '0' }, false],
+    ['omitted tblW', null, false],
+  ] as const)(
+    'retains %s provenance separately from its null numeric width',
+    (_case, preferredWidth, expected) => {
+      const table = {
+        colWidths: [40],
+        rows: [{
+          cells: [{
+            content: [], colSpan: 1, vMerge: null, borders: emptyBorders(),
+            background: null, vAlign: 'top', widthPt: 40,
+            __tableCellLayout: {
+              preferredWidth: { kind: 'dxa', value: '800' },
+              margins: null,
+            },
+          }],
+          gridBefore: 0, gridAfter: 0,
+          __tableRowLayout: null,
+        }],
+        borders: emptyBorders(), cellMarginTop: 0, cellMarginRight: 0,
+        cellMarginBottom: 0, cellMarginLeft: 0, jc: 'left', layout: 'autofit',
+        __tableLayout: {
+          effectiveStyleId: null,
+          grid: { authored: true, columns: [{ width: '800' }], requiredColumnCount: 1 },
+          preferredWidth,
+          layout: { kind: 'autofit' }, cellSpacing: null,
+        },
+      } as unknown as DocTable;
+
+      expect(tableColumnLayoutInput(table, 40, () => ({ minWidthPt: 0, maxWidthPt: 0 })))
+        .toMatchObject({
+          gridAuthoredComplete: true,
+          tableWidthAutoAuthored: expected,
+          tablePreferredWidthPt: null,
+        });
+    },
+  );
+
   it('applies first-row tblPrEx fixed layout and width to the whole table in Word mode', () => {
     const table = {
       colWidths: [40],
@@ -413,7 +457,12 @@ describe('table column acquisition boundary', () => {
     } as unknown as DocTable;
 
     expect(tableColumnLayoutInput(table, 200, () => ({ minWidthPt: 10, maxWidthPt: 20 })))
-      .toMatchObject({ layout: 'fixed', tablePreferredWidthPt: 120 });
+      .toMatchObject({
+        layout: 'fixed',
+        tablePreferredWidthPt: 120,
+        gridAuthoredComplete: true,
+        tableWidthAutoAuthored: false,
+      });
   });
 
   it.each([

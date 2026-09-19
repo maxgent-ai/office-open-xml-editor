@@ -1,4 +1,8 @@
-import type { OpenTypeLineMetrics } from '@silurus/ooxml-core';
+import {
+  classifyCjkFont,
+  normalizeFontMetricFamily,
+  type OpenTypeLineMetrics,
+} from '@silurus/ooxml-core';
 import { defineCompatibilityRule } from './compatibility.js';
 import type { LineSpacing, TabStop } from '../types.js';
 
@@ -263,7 +267,19 @@ export const WORD_OVERFLOW_PUNCTUATION_LANGUAGE_SETS = defineCompatibilityRule({
     kind: 'microsoft-note',
     reference: '[MS-OE376] §2.1.56',
   },
-  description: 'Apply the language-specific punctuation sets documented for Word in [MS-OE376] §2.1.56, and let overflowPunct override kinsoku when both rules affect the same character.',
+  description: 'Apply the language-specific punctuation sets documented for Word in [MS-OE376] §2.1.56 to Chinese, Japanese, and Korean language runs, and let overflowPunct override kinsoku when both rules affect the same character. When an effective East Asian language is absent, content that actually selects the East Asian script path retains the union as a bounded fallback.',
+});
+
+export const WORD_OVERFLOW_PUNCTUATION_LATIN_PARENT_RUN = defineCompatibilityRule({
+  id: 'word-overflow-punctuation-latin-parent-run',
+  evidence: {
+    kind: 'office-observation',
+    syntheticFixtureId: 'overflow-punctuation-latin-parent-run-boundary-matrix',
+    application: 'Microsoft Word',
+    version: '16.111.1',
+    platform: 'macOS 26.5.2',
+  },
+  description: 'Although [MS-OE376] §2.1.56 presents concrete punctuation sets by CJK language, Word also applies the union\'s ASCII closing punctuation to Latin parent runs when overflowPunct is enabled. The observed matrix covers `.`, `,`, and `}` at 9, 10, 11, and 14 points in normal and mixed-style runs. Complex-script parent runs are the counterexample and remain excluded.',
 });
 
 export const WORD_FULL_WIDTH_CHARACTER_SPACING_SCOPE = defineCompatibilityRule({
@@ -416,6 +432,37 @@ export const WORD_MS_MINCHO_EMPTY_EAST_ASIAN_MARK_HEIGHT = defineCompatibilityRu
   description: 'In the observed compatibility fixture, an empty 12-point East-Asian paragraph mark routed to MS Mincho occupies a 15.6-point single-line box. Scope this 1.3-em floor to empty East-Asian paragraph marks; ordinary MS Mincho text lines and Latin marks retain their independently measured metrics.',
 });
 
+export const WORD_EMPTY_MARK_CONVERGED_CJK_FONT_SLOTS = defineCompatibilityRule({
+  id: 'word-empty-mark-converged-cjk-font-slots',
+  evidence: {
+    kind: 'office-observation',
+    syntheticFixtureId: 'empty-mark-font-slot-convergence-matrix',
+    application: 'Microsoft Word',
+    version: '16.111.1',
+    platform: 'macOS 26.5.2',
+  },
+  description: 'A content-less acquired paragraph mark normally stays on the Latin/default font route because no character selects an rFonts script slot. When its effective ASCII, high-ANSI, and East-Asian slots all converge on the same CJK face, every possible non-complex route selects the same resource and Word retains that face\'s East-Asian design-line allocation. Controls with distinct Latin and East-Asian slots are the counterexample: hint and language alone do not reroute the mark.',
+});
+
+/** Compatibility projection governed by
+ * {@link WORD_EMPTY_MARK_CONVERGED_CJK_FONT_SLOTS}. */
+export function wordEmptyMarkUsesEastAsianFace(input: Readonly<{
+  eastAsianLayout: boolean;
+  acquiredMarkFacts: boolean;
+  ascii?: string | null;
+  highAnsi?: string | null;
+  eastAsia?: string | null;
+}>): boolean {
+  if (!input.acquiredMarkFacts) return input.eastAsianLayout;
+  const ascii = input.ascii?.trim();
+  const highAnsi = input.highAnsi?.trim();
+  const eastAsia = input.eastAsia?.trim();
+  if (!ascii || !highAnsi || !eastAsia || classifyCjkFont(eastAsia) == null) return false;
+  const normalized = normalizeFontMetricFamily(eastAsia);
+  return normalizeFontMetricFamily(ascii) === normalized
+    && normalizeFontMetricFamily(highAnsi) === normalized;
+}
+
 /** Compatibility projection governed by
  * {@link WORD_JAPANESE_PUNCTUATION_COMPRESSION_CELL}. */
 export function wordJapanesePunctuationRetainedExtentPt(input: Readonly<{
@@ -466,10 +513,13 @@ const ALL_WORD_OVERFLOW_PUNCTUATION = new Set([
 ]);
 
 /** Compatibility projection governed by
- * {@link WORD_OVERFLOW_PUNCTUATION_LANGUAGE_SETS}. */
+ * {@link WORD_OVERFLOW_PUNCTUATION_LANGUAGE_SETS} and
+ * {@link WORD_OVERFLOW_PUNCTUATION_LATIN_PARENT_RUN}. */
 export function wordIsOverflowPunctuation(
   character: string,
   language: string | undefined,
+  parentRunHasEastAsianText = false,
+  parentRunHasLatinText = false,
 ): boolean {
   const normalized = language?.toLowerCase();
   if (normalized?.startsWith('ja')) return WORD_OVERFLOW_PUNCTUATION.ja.has(character);
@@ -479,7 +529,16 @@ export function wordIsOverflowPunctuation(
       ? WORD_OVERFLOW_PUNCTUATION.zhHant
       : WORD_OVERFLOW_PUNCTUATION.zhHans).has(character);
   }
-  return ALL_WORD_OVERFLOW_PUNCTUATION.has(character);
+  // ECMA-376 §17.3.1.21 is script-neutral. Although [MS-OE376] §2.1.56
+  // describes Word's concrete sets as CJK-language behavior, Office-produced
+  // boundary controls also hang the set's ASCII closing punctuation in Latin
+  // parent runs. The observed Latin controls cover `.`, `,`, and `}` across
+  // 9/10/11/14-point normal and mixed-style runs; complex-script controls are
+  // the counterexample and remain excluded. A CJK run carrying an inherited
+  // non-CJK language also uses the union, because its actual script route is
+  // more authoritative than that inherited language.
+  return (parentRunHasEastAsianText || parentRunHasLatinText)
+    && ALL_WORD_OVERFLOW_PUNCTUATION.has(character);
 }
 
 /** Compatibility projection governed by {@link WORD_JUSTIFIED_CANDIDATE_SEPARATOR_FIT}. */

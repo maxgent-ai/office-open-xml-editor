@@ -534,6 +534,8 @@ export interface LineLayout {
   readonly baselinePt: number;
   readonly advancePt: number;
   readonly placements: readonly ParagraphPlacement[];
+  /** The line ended at an authored `<w:br>` rather than an automatic wrap. */
+  readonly endsWithBreak?: boolean;
   /** §17.18.84 bar-tab vertical rules acquired independently of tab advances. */
   readonly barTabRules?: readonly BorderSegment[];
 }
@@ -1177,6 +1179,10 @@ export interface TableCellBlockInput {
   readonly layout: ParagraphLayout | TableLayout;
   /** Stable source index; continuation slices must not renumber field ownership. */
   readonly sourceBlockIndex: number;
+  /** Effective §17.3.1.14 policy for paragraph blocks. Absent for tables. */
+  readonly keepLines?: boolean;
+  /** Effective §17.3.1.44 policy for paragraph blocks. Absent for tables. */
+  readonly widowControl?: boolean;
   /** True when destination-page context can change the acquired child geometry. */
   readonly pageDependent?: boolean;
   /** The required empty paragraph after a nested table owns no row-height ink. */
@@ -1216,6 +1222,14 @@ export interface TableColumnLayoutInput {
   readonly availableWidthPt: number | null;
   readonly gridWidthsPt: readonly number[];
   readonly gridWidthKeys?: readonly (string | null)[];
+  /** True only when every shared track came from an authored `<w:tblGrid>`.
+   * Omitted grids and grids extended to satisfy semantic content must not
+   * acquire Word's saved-grid AutoFit compatibility behavior. */
+  readonly gridAuthoredComplete?: boolean;
+  /** True only for an effective authored `<w:tblW w:type="auto">` table
+   * width. Omitted/nil widths are geometrically null but are not equivalent
+   * provenance for Office compatibility rules. */
+  readonly tableWidthAutoAuthored?: boolean;
   readonly tablePreferredWidthPt: number | null;
   readonly rows: readonly TableColumnRowConstraint[];
 }

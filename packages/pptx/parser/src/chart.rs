@@ -6,7 +6,9 @@
 //! `PptxColorResolver`; both chart parsers now delegate their structure walk to
 //! `ooxml_common::chart`.
 
-use crate::chart_compatibility::apply_powerpoint_classic_chart_space_frame;
+use crate::chart_compatibility::{
+    apply_powerpoint_chartex_chart_space_frame, apply_powerpoint_classic_chart_space_frame,
+};
 use crate::parse_color_node;
 use crate::parse_preflighted_pptx_xml;
 use crate::theme::PptxRawSchemeResolver;
@@ -112,8 +114,6 @@ pub(crate) fn parse_legacy_chart_with_style_parts_and_images(
         theme,
         theme_format_scheme,
     };
-    let style_xml = style_xml.filter(|style| parse_preflighted_pptx_xml(style).is_ok());
-    let color_style_xml = color_style_xml.filter(|style| parse_preflighted_pptx_xml(style).is_ok());
     let mut chart = ooxml_common::chart::parse_chart_part_with_style_parts_and_images(
         root,
         &resolver,
@@ -191,17 +191,16 @@ pub(crate) fn parse_chartex_with_images(
     // The shared chart grammar reparses the optional style XML. Admit it
     // through the PPTX-local node ceiling first so the second parse only ever
     // sees an already bounded document.
-    let style_xml = style_xml.filter(|style| parse_preflighted_pptx_xml(style).is_ok());
-    let color_style_xml = color_style_xml.filter(|style| parse_preflighted_pptx_xml(style).is_ok());
     // chartEx (waterfall/boxWhisker/…) reads its title font size from the
     // associated chartStyle part when the `<cx:title>` itself carries none.
-    let chart = ooxml_common::chart::parse_chartex_part_with_style_parts_and_images(
+    let mut chart = ooxml_common::chart::parse_chartex_part_with_style_parts_and_images(
         root,
         &resolver,
         style_xml,
         color_style_xml,
         image_resolver,
     )?;
+    apply_powerpoint_chartex_chart_space_frame(root, &mut chart);
     Some(ChartElement {
         id: None,
         x: 0,
@@ -284,23 +283,46 @@ mod tests {
                 r#"<c:chartSpace xmlns:c="{C_NS}">{style}{rounded}<c:chart><c:plotArea><c:barChart><c:barDir val="col"/><c:ser><c:idx val="0"/><c:order val="0"/><c:val><c:numLit><c:pt idx="0"><c:v>1</c:v></c:pt></c:numLit></c:val></c:ser></c:barChart></c:plotArea></c:chart></c:chartSpace>"#
             )
         };
+        let theme = HashMap::from([
+            ("dk1".to_string(), "000000".to_string()),
+            ("lt1".to_string(), "FFFFFF".to_string()),
+        ]);
+        let theme_xml = r#"<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:themeElements>
+          <a:fmtScheme name="Office"><a:fillStyleLst>
+            <a:solidFill><a:schemeClr val="phClr"/></a:solidFill>
+            <a:solidFill><a:schemeClr val="phClr"/></a:solidFill>
+            <a:solidFill><a:schemeClr val="phClr"/></a:solidFill>
+          </a:fillStyleLst><a:lnStyleLst>
+            <a:ln w="6350"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln>
+            <a:ln w="12700"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln>
+            <a:ln w="19050"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln>
+          </a:lnStyleLst><a:effectStyleLst/><a:bgFillStyleLst/></a:fmtScheme>
+        </a:themeElements></a:theme>"#;
+        let format_scheme = ooxml_common::theme::ThemeFormatScheme::parse(theme_xml);
         let parse = |style, rounded| {
-            parse_legacy_chart(&chart_xml(style, rounded), &HashMap::new())
-                .expect("classic chart")
-                .chart
+            parse_legacy_chart_with_style_parts(
+                &chart_xml(style, rounded),
+                None,
+                None,
+                None,
+                &theme,
+                Some(&format_scheme),
+            )
+            .expect("classic chart")
+            .chart
         };
 
         for style in [1, 32] {
             let chart = parse(Some(style), None);
             assert_eq!(chart.rounded_corners, Some(true), "style {style}");
             assert!(chart
-                .chart_style_roles
+                .classic_chart_style_roles
                 .as_ref()
                 .is_none_or(|roles| !roles.contains_key("chartArea")));
         }
         for style in [33, 40] {
             let chart = parse(Some(style), None);
-            let frame = &chart.chart_style_roles.as_ref().unwrap()["chartArea"];
+            let frame = &chart.classic_chart_style_roles.as_ref().unwrap()["chartArea"];
             assert_eq!(
                 frame.fill_colors.as_deref(),
                 Some(&[Some("FFFFFF".to_string())][..]),
@@ -315,7 +337,7 @@ mod tests {
         }
         for style in [41, 48] {
             let chart = parse(Some(style), None);
-            let frame = &chart.chart_style_roles.as_ref().unwrap()["chartArea"];
+            let frame = &chart.classic_chart_style_roles.as_ref().unwrap()["chartArea"];
             assert_eq!(
                 frame.fill_colors.as_deref(),
                 Some(&[Some("000000".to_string())][..]),
@@ -327,7 +349,7 @@ mod tests {
         let omitted = parse(None, None);
         assert_eq!(omitted.rounded_corners, Some(true));
         assert!(omitted
-            .chart_style_roles
+            .classic_chart_style_roles
             .as_ref()
             .is_none_or(|roles| !roles.contains_key("chartArea")));
         assert_eq!(parse(Some(33), Some(false)).rounded_corners, Some(false));
