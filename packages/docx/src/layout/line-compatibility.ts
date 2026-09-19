@@ -243,7 +243,7 @@ export const WORD_CALIBRI_AUTHORED_DESIGN_LINE = defineCompatibilityRule({
     version: '16.111.1',
     platform: 'macOS 26.5.2',
   },
-  description: 'For visible Latin text with explicitly authored automatic line spacing, retain Calibri\'s 2500/2048-em hhea design line across regular, bold, italic, and bold-italic faces even when paint uses a substitute. Loaded Calibri and the registered metric-compatible Carlito tuple retain the same design line; selected glyph ink may expand it to avoid clipping. Omitted/default single spacing and content-less paragraph marks are counterexamples and remain governed by the selected face metrics.',
+  description: 'For ASCII-slot text with explicitly authored automatic line spacing and useFELayout disabled, retain Calibri\'s 2500/2048-em hhea design line across regular, bold, italic, and bold-italic faces even when paint uses an unresolved substitute. Separately, Canvas-proven Calibri and registered metric-compatible Carlito face tuples expose that same resource metric. Selected glyph ink may expand the design line to avoid clipping. Omitted/default single spacing, unresolved high-ANSI routes, useFELayout, and content-less paragraph marks are counterexamples and remain governed by their selected-face or Far-East metric paths.',
 });
 
 export const WORD_CALIBRI_AUTHORED_ADVANCE_ROUTE = defineCompatibilityRule({
