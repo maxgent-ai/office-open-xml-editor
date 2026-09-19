@@ -9,6 +9,7 @@
 
 import { describe, it, expect, vi } from 'vitest';
 import type {
+  ChartLabelBox,
   ChartModel,
   ChartRect,
   ChartSeries,
@@ -696,6 +697,33 @@ it('prefetches and paints one bubble picture for both plot and 3-D legend key', 
   renderChartCore(rec.ctx, model, RECT, 1, 0, testThreeD, undefined, () => bitmap);
   expect(rec.drawImages).toHaveLength(2);
   expect(rec.gradients.filter(gradient => gradient.kind === 'radial')).toHaveLength(6);
+});
+
+it('prefetches the linked bubble picture when an unmodified role rejects series noFill', () => {
+  const picture = {
+    fillType: 'image' as const,
+    imagePath: 'xl/media/modifier-gated-bubble.png',
+    mimeType: 'image/png',
+    stretch: true,
+  };
+  const model = baseModel({
+    chartType: 'bubble', showLegend: true, categories: ['0'],
+    chartStyleRoles: {
+      dataPoint: { fillPaints: [picture], fillPaintAuthored: true },
+    },
+    series: [series({
+      values: [1], bubbleSizes: [100],
+      chartexStyle: { fillHidden: true, fillPaintAuthored: true },
+    })],
+    catAxisMin: 0, catAxisMax: 1, valMin: 0, valMax: 2,
+  });
+  const bitmap = { width: 8, height: 8 } as unknown as CanvasImageSource;
+  expect(collectChartMarkerImageFills(model)).toEqual([picture]);
+  const rec = recordingCtx();
+  renderChartCore(rec.ctx, model, RECT, 1, 0, testThreeD, undefined, () => bitmap);
+  // One plotted bubble and its compound legend key select the same warmed
+  // source; the cache collector deliberately deduplicates it.
+  expect(rec.drawImages).toHaveLength(2);
 });
 const renderChart: typeof renderChartCore = (
   ctx,
@@ -11209,6 +11237,12 @@ describe('CH9 — line/area consume marker detail (§21.2.2.32)', () => {
     }))).toEqual([picture]);
     expect(collectChartMarkerImageFills(box({
       chartexStyle: { fillHidden: true, fillNoStyle: false },
+    }))).toEqual([picture]);
+    expect(collectChartMarkerImageFills(baseModel({
+      ...box({ chartexStyle: { fillHidden: true, fillPaintAuthored: true } }),
+      chartexDataPointMarkerStyle: {
+        fillPaints: [picture], fillPaintAuthored: true, allowNoFillOverride: true,
+      },
     }))).toEqual([]);
     expect(collectChartMarkerImageFills({
       ...box({}), chartStyleMarkerSymbol: 'none',
@@ -17434,6 +17468,64 @@ describe('CH6-follow — series trendlines (commit 3)', () => {
     expect(rec.strokeRects.some(rect => rect.ss === '#445566')).toBe(false);
   });
 
+  it.each([
+    ['alpha-zero solid paint', {
+      fill: 'FFFFFF00',
+      borderColor: '00000000',
+      fillPaintAuthored: true,
+      borderPaintAuthored: true,
+    }],
+    ['fully transparent structured paint', {
+      fillPaint: {
+        fillType: 'gradient' as const,
+        gradType: 'linear',
+        angle: 0,
+        stops: [
+          { position: 0, color: 'FF000000' },
+          { position: 1, color: '0000FF00' },
+        ],
+      },
+      borderFill: {
+        fillType: 'pattern' as const,
+        preset: 'pct50',
+        fg: '11223300',
+        bg: 'AABBCC00',
+      },
+      fillPaintAuthored: true,
+      borderPaintAuthored: true,
+    }],
+  ] satisfies Array<[string, ChartLabelBox]>)('keeps %s on the ordinary data-label role', (
+    _name,
+    labelBox,
+  ) => {
+    const rec = recordingCtx();
+    renderChart(rec.ctx, baseModel({
+      chartType: 'clusteredBar',
+      categories: ['A'],
+      series: [series({
+        values: [1],
+        seriesDataLabels: {
+          showVal: true, showCatName: false, showSerName: false, showPercent: false,
+          labelBox,
+        },
+      })],
+      chartStyleRoles: {
+        dataLabel: { fontColor: '112233' },
+        dataLabelCallout: {
+          fontColor: 'AABBCC',
+          fillColors: ['FFFFFF'],
+          lineColors: ['445566'],
+          lineWidthEmu: 25_400,
+        },
+      },
+    }), RECT, 1);
+
+    expect(rec.texts.some(text => text.text === '1' && text.fillStyle === '#112233')).toBe(true);
+    expect(rec.texts.some(text => text.text === '1' && text.fillStyle === '#AABBCC')).toBe(false);
+    expect(rec.rects.some(rect => rect.fs === '#FFFFFF')).toBe(false);
+    expect(rec.strokeRects.some(rect => rect.ss === '#445566')).toBe(false);
+  });
+
   it('does not turn an ordinary indexed data label into a linked callout', () => {
     const rec = recordingCtx();
     renderChart(rec.ctx, baseModel({
@@ -19735,6 +19827,44 @@ describe('surface contour charts', () => {
       'rgba(17,34,51,1)',
     ]);
     expect(rec.filledPaths.length).toBeGreaterThan(1);
+  });
+
+  it('retains linked Surface material lighting when a role rejects direct noFill', () => {
+    const model = baseModel({
+      chartType: 'surface',
+      categories: ['X1', 'X2'],
+      valMin: 0,
+      valMax: 10,
+      valAxisMajorUnit: 10,
+      surfaceWireframe: false,
+      chartStyleRoles: {
+        dataPoint3D: {
+          fillColors: ['808080'],
+          fillPaintAuthored: true,
+          allowNoFillOverride: false,
+        },
+      },
+      threeD: { rotationX: 15, rotationY: 20, perspective: 30, rightAngleAxes: false },
+      series: [
+        series({ name: 'Y1', values: [0, 10] }),
+        series({ name: 'Y2', values: [10, 0] }),
+      ],
+    });
+    const render = (surfaceBandFormats: ChartModel['surfaceBandFormats']) => {
+      const rec = recordingCtx();
+      renderChart(rec.ctx, { ...model, surfaceBandFormats }, RECT, 1);
+      return rec.filledPaths
+        .filter(path => path.points.length >= 3)
+        .map(path => path.fillStyle);
+    };
+    const linked = render(undefined);
+    const rejectedNoFill = render([{
+      idx: 0,
+      fillHidden: true,
+      style: { fillHidden: true, fillPaintAuthored: true },
+    }]);
+    expect(rejectedNoFill).toEqual(linked);
+    expect(linked.some(color => color !== '#808080')).toBe(true);
   });
 
   it('falls through a raw linked Surface NoStyle to the band-domain numeric role', () => {

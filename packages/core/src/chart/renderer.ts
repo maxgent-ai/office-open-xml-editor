@@ -9809,14 +9809,24 @@ function renderSurfaceChart(
     { length: bandCount }, (_, index) => {
       const format = bandFormats.get(index);
       let decision: Fill | null | undefined;
+      let fromRole = true;
       if (format?.fillHidden === true) {
         decision = chartStyleDirectNoFillDecision(linkedBandStyle);
+        if (decision !== undefined) fromRole = false;
       }
-      else if (format?.fill) decision = format.fill;
+      else if (format?.fill) {
+        decision = format.fill;
+        fromRole = false;
+      }
       else {
-        decision = chartStyleFillCascade(
-          linkedBandStyle, linkedBandStyle, index, format?.style,
+        const direct = chartStyleDirectFillDecision(
+          format?.style, linkedBandStyle, index,
         );
+        if (direct !== undefined) {
+          decision = direct;
+          fromRole = false;
+        }
+        else decision = chartStyleFillDecision(linkedBandStyle, index);
       }
       if (decision === undefined && format?.fillHidden === true) {
         decision = chartStyleFillDecision(linkedBandStyle, index);
@@ -9824,7 +9834,10 @@ function renderSurfaceChart(
       if (decision === undefined) decision = chartStyleFillDecision(numericBandStyle, index);
       return {
         recipe: decision,
-        fromRole: chartStyleFillDecision(format?.style, index) === undefined,
+        // Keep provenance from the same modifier-aware cascade that selected
+        // the recipe. A rejected local noFill leaves the linked/numeric role
+        // responsible for Office's observed Surface material lighting.
+        fromRole,
       };
     },
   );

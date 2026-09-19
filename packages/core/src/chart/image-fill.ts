@@ -489,6 +489,14 @@ function collectChartMarkerImageFillResult(
     const fill = chartStyleFillDecision(style, index);
     return fill?.fillType === 'image' ? fill : fill == null ? fill : null;
   };
+  const directStyleImageDecision = (
+    style: ChartExElementStyle | null | undefined,
+    rawLinked: ChartExElementStyle | null | undefined,
+    index: number,
+  ): ImageFill | null | undefined => {
+    const fill = chartStyleDirectFillDecision(style, rawLinked, index);
+    return fill?.fillType === 'image' ? fill : fill == null ? fill : null;
+  };
   const dataPointImageDecision = (
     local: ChartExElementStyle | null | undefined,
     legacyColor: string | null | undefined,
@@ -923,7 +931,10 @@ function collectChartMarkerImageFillResult(
     )) continue;
     if (seriesKeyVisible && markerSymbolConsumesFill(seriesKeySymbol)) {
       if (isBubble) {
-        const seriesShape = styleImageDecision(series.chartexStyle, sourceSeriesIndex);
+        const rawDataPointRole = rawLinkedChartStyleRole(chart, 'dataPoint');
+        const seriesShape = directStyleImageDecision(
+          series.chartexStyle, rawDataPointRole, sourceSeriesIndex,
+        );
         if (seriesShape) add(seriesShape);
         if (seriesShape === undefined && series.color == null) {
           const linkedShape = styleImageDecision(
@@ -994,7 +1005,9 @@ function collectChartMarkerImageFillResult(
         if (pointShape !== undefined || pointNoFill !== undefined
           || point?.color != null) continue;
         if (series.dataPointColors?.[index] != null) continue;
-        const seriesShape = styleImageDecision(series.chartexStyle, sourceSeriesIndex);
+        const seriesShape = directStyleImageDecision(
+          series.chartexStyle, rawDataPointRole, sourceSeriesIndex,
+        );
         if (seriesShape) add(seriesShape);
         if (seriesShape !== undefined || series.color != null) continue;
         const linkedShape = styleImageDecision(linkedPointRole, linkedPointIndex);
@@ -1037,11 +1050,16 @@ function collectChartMarkerImageFillResult(
     if (markerCount === 0) continue;
     const styleIndex = series.chartexFormatIdx ?? seriesIndex;
     const localStyle = series.chartexStyle;
-    const local = styleImageDecision(localStyle, styleIndex);
-    if (local) add(local);
-    if (local !== undefined || series.color != null) continue;
     const linkedStyle = chart.chartexDataPointMarkerStyle
       ?? chart.chartexDataPointStyle ?? undefined;
+    const rawLinkedStyle = chart.chartexDataPointMarkerStyle != null
+      ? rawLinkedChartStyleRole(chart, 'dataPointMarker')
+        ?? (chart.classicChartStyleRoles == null ? linkedStyle : undefined)
+      : rawLinkedChartStyleRole(chart, 'dataPoint')
+        ?? (chart.classicChartStyleRoles == null ? linkedStyle : undefined);
+    const local = directStyleImageDecision(localStyle, rawLinkedStyle, styleIndex);
+    if (local) add(local);
+    if (local !== undefined || series.color != null) continue;
     const linked = styleImageDecision(linkedStyle, styleIndex);
     if (linked) add(linked);
   }
