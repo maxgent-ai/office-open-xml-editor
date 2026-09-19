@@ -4,6 +4,7 @@ import {
 } from './layout-context.js';
 import {
   buildSegments,
+  calibriInlineImageParagraphSinglePx,
   getDefaultFontSize,
   isGridLineRule,
   layoutLines,
@@ -11,6 +12,7 @@ import {
   lineBoxHeight,
   paragraphMarkBelowBaselinePt,
   paragraphMarkLineHeight,
+  paragraphMarkLineMetrics,
   type DocGridCtx,
   type LineBoundary,
   type LayoutLine,
@@ -225,8 +227,40 @@ export function measureParagraph(
     };
   };
 
-  const segments = buildSegments(paragraph.runs, environment);
+  const authoredAutoLineSpacing = context.lineSpacing?.rule === 'auto'
+    && context.lineSpacing.explicit === true;
+  const segments = buildSegments(paragraph.runs, authoredAutoLineSpacing
+    ? { ...environment, authoredAutoLineSpacing: true }
+    : environment);
   if (segments.length === 0) return measureMarkOnly();
+
+  const hasInlineImage = paragraph.runs.some((run) =>
+    run.type === 'image' && run.anchor !== true);
+  const appliesInlineImageAutoMetrics = hasInlineImage
+    && context.lineSpacing?.rule === 'auto'
+    && context.lineSpacing.value >= 1
+    && !isGridLineRule(grid);
+  const inlineImageDefaultSinglePt = appliesInlineImageAutoMetrics
+    ? Math.max(
+        paragraphMarkLineMetrics(
+          paragraph,
+          1,
+          grid,
+          context.hasRuby,
+          markUsesEastAsianGrid,
+          measurer.context,
+          fontFamilyClasses,
+          null,
+          environment.resolvedLocalFonts,
+          environment.layoutServices?.text,
+          environment.paragraphMarkShapeInput,
+          environment.useFeLayout === true,
+        ).advancePx,
+        environment.useFeLayout === true
+          ? 0
+          : calibriInlineImageParagraphSinglePx(paragraph, 1),
+      )
+    : 0;
 
   const wrapContext: WrapLayoutCtx | undefined = placement.wrap
     ? {
@@ -243,7 +277,15 @@ export function measureParagraph(
           1,
         ),
         lineWindow: (input) => placement.wrap!.lineWindow(input),
-        lineBoxH: (ascent, descent, _hasRuby, intendedSingle, eastAsian, gridCountSingle) => lineBoxHeight(
+        lineBoxH: (
+          ascent,
+          descent,
+          _hasRuby,
+          intendedSingle,
+          eastAsian,
+          gridCountSingle,
+          lineHasInlineImage,
+        ) => lineBoxHeight(
           context.lineSpacing,
           ascent,
           descent,
@@ -255,6 +297,8 @@ export function measureParagraph(
           // ruby paragraphs retain their established uniform paragraph resolver.
           context.hasRuby ? context.hasEastAsianText : (eastAsian ?? false),
           gridCountSingle,
+          undefined,
+          lineHasInlineImage,
         ),
         pageH: placement.maximumYPt,
       }
@@ -282,6 +326,7 @@ export function measureParagraph(
     undefined,
     environment.verticalGlyphMeasurement,
     context.overflowPunct !== false,
+    inlineImageDefaultSinglePt,
   );
   if (lines.length === 0) return measureMarkOnly();
 
@@ -296,6 +341,9 @@ export function measureParagraph(
           true,
           line.intendedSingle,
           context.hasEastAsianText,
+          undefined,
+          undefined,
+          line.hasInlineImage,
         ))),
         grid,
       )
@@ -325,6 +373,8 @@ export function measureParagraph(
           // line in a CJK paragraph keeps its natural height.
           line.eastAsian ?? false,
           line.gridCountSingle,
+          undefined,
+          line.hasInlineImage,
         );
     measuredLines.push({ layout: line, topYPt, advancePt });
     cursorPt = topYPt + advancePt;

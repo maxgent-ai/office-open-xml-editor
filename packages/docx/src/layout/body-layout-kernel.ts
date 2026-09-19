@@ -136,6 +136,9 @@ export interface FollowingBodyBlockMeasurementInput {
     | BodyTableAcquisitionInput['input'];
   readonly location: BodyAcquisitionLocation;
   readonly availableInlineExtentPt: number;
+  /** Uses the same effective leading-spacing decision as normal paragraph
+   * acquisition. Always false for table inputs. */
+  readonly suppressSpaceBefore: boolean;
 }
 
 export interface FollowingBodyBlockMeasurement {

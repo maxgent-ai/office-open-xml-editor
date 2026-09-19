@@ -386,6 +386,11 @@ export function acquireRetainedTable<State>(
           return [{
             layout,
             sourceBlockIndex,
+            ...(sourceElement?.type === 'paragraph' ? {
+              keepLines: sourceElement.keepLines === true,
+              // ECMA-376 §17.3.1.44: omission enables widow/orphan control.
+              widowControl: sourceElement.widowControl !== false,
+            } : {}),
             ...((layout.kind === 'paragraph' && paragraphHasPageDependency(layout))
               ? { pageDependent: true }
               : {}),

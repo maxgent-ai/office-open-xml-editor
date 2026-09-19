@@ -86,6 +86,7 @@ import {
   EAST_ASIAN_RE,
   nextTabStop,
   nextTabStopRtl,
+  requestedFontFamilyForSlot,
   shapeRunToDocRun,
 } from './layout/text.js';
 import type { MathLayoutResource } from './layout/resources.js';
@@ -101,6 +102,7 @@ import {
   wordDocumentCharacterCompressionApplies,
   wordJapanesePunctuationRetainedExtentPt,
   wordMsMinchoEmptyEastAsianMarkSingleLinePx,
+  wordEmptyMarkUsesEastAsianFace,
   wordSnapToCharsEastAsianCellCount,
   wordSourceRunSpaceContinuesSequence,
   wordBalancedConsecutiveSpaceCellApplies,
@@ -110,8 +112,113 @@ import {
   wordUniformRunPositionPaintPt,
   wordUseFeLayoutParagraphMarkGridAdvancePx,
   wordExternalLinkSyntaxBreakOffsets,
+  wordInlineImageAutoLineHeightPx,
+  WORD_CALIBRI_AUTHORED_ADVANCE_ROUTE,
+  WORD_CALIBRI_AUTHORED_DESIGN_LINE,
+  WORD_INLINE_IMAGE_AUTO_LEADING,
 } from './layout/line-compatibility.js';
 import { wordNeutralAttachesToActiveScript } from './layout/script-compatibility.js';
+
+const CALIBRI_LINE_HEIGHT_RATIO = 2500 / 2048;
+const CALIBRI_DESCENT_RATIO = 550 / 2048;
+
+/**
+ * Compatibility projection governed by
+ * {@link WORD_CALIBRI_AUTHORED_DESIGN_LINE}. The supported Calibri face tuples
+ * all have a 2500/2048 hhea line. ECMA-376 §17.8.2 leaves glyph substitution
+ * implementation-defined, but substitution must not silently change the
+ * document's pagination metric. `resolvedDesignLineMetrics` still expands to
+ * the selected glyph ink when necessary, so this rule cannot clip a fallback.
+ */
+function calibriAuthoredLineHeightRatio(
+  font: TextShapeSpan['font'] | undefined,
+): number | undefined {
+  void WORD_CALIBRI_AUTHORED_DESIGN_LINE;
+  if (
+    !font
+    || (font.weight !== 400 && font.weight !== 700)
+    || (font.style !== 'normal' && font.style !== 'italic')
+  ) {
+    return undefined;
+  }
+  return normalizeFontMetricFamily(font.requestedFamily) === 'calibri'
+    ? CALIBRI_LINE_HEIGHT_RATIO
+    : undefined;
+}
+
+/** Compatibility projection governed by {@link WORD_INLINE_IMAGE_AUTO_LEADING}.
+ * When visible Calibri text shares an inline object's baseline, the authored
+ * face's hhea descent remains below the object even when Canvas paints through
+ * a substitute whose
+ * descent is smaller. All four Office-bundled Calibri faces use descent=550 at
+ * 2048 UPM. This value is consumed only by inline-image line union; ordinary
+ * text lines retain their established selected-face baseline. */
+function calibriInlineImageDescentRatio(
+  requestedFamily: string | null | undefined,
+  script: FontScriptSlot,
+): number | undefined {
+  void WORD_INLINE_IMAGE_AUTO_LEADING;
+  return script === 'ascii'
+    && normalizeFontMetricFamily(requestedFamily ?? '') === 'calibri'
+      ? CALIBRI_DESCENT_RATIO
+      : undefined;
+}
+
+/** Authored paragraph-mark metrics needed when an inline image is the line's
+ * only visible item. Auto-spacing leading is derived from the Calibri
+ * design line, but does not add the mark's descent to an image-only line. */
+export function calibriInlineImageParagraphSinglePx(
+  para: ParagraphLayoutSource,
+  scale: number,
+): number {
+  if (normalizeFontMetricFamily(getDefaultFontFamily(para) ?? '') !== 'calibri') {
+    return 0;
+  }
+  return CALIBRI_LINE_HEIGHT_RATIO * getDefaultFontSize(para) * scale;
+}
+
+/** Empty paragraph marks have no character whose font slot can inherit the
+ * authored Calibri design line. The compatibility boundary retains
+ * their measured mark allocation unless the resolver selected the registered
+ * metric-compatible Carlito face explicitly. */
+function calibriSelectedSubstituteLineHeightRatio(
+  font: TextShapeSpan['font'] | undefined,
+): number | undefined {
+  if (
+    !font
+    || font.source !== 'substitute'
+    || (font.weight !== 400 && font.weight !== 700)
+    || (font.style !== 'normal' && font.style !== 'italic')
+  ) {
+    return undefined;
+  }
+  return normalizeFontMetricFamily(font.requestedFamily) === 'calibri'
+    && normalizeFontMetricFamily(font.resolvedFamily) === 'carlito'
+    ? CALIBRI_LINE_HEIGHT_RATIO
+    : undefined;
+}
+
+/** Compatibility projection governed by
+ * {@link WORD_CALIBRI_AUTHORED_ADVANCE_ROUTE}. ECMA-376 §17.8.2 leaves substitution
+ * implementation-defined, so this compatibility boundary is intentionally
+ * narrow: the selected Calibri route must carry a positive resource-owned
+ * font-box metric, or the resolver must select the loaded regular Carlito route
+ * registered as Calibri's metric-compatible substitute. An unrelated face
+ * metric does not establish compatible advances. */
+function calibriAdvanceMatchesAuthoredFace(
+  font: TextShapeSpan['font'] | undefined,
+  metric: Readonly<ResolvedFontMetric> | undefined,
+): boolean {
+  void WORD_CALIBRI_AUTHORED_ADVANCE_ROUTE;
+  if (!font || font.weight !== 400 || font.style !== 'normal') return false;
+  if (normalizeFontMetricFamily(font.requestedFamily) !== 'calibri') return false;
+  const resolved = normalizeFontMetricFamily(font.resolvedFamily);
+  if (resolved === 'carlito') return font.source === 'substitute';
+  return resolved === 'calibri'
+    && metric?.fontBoxRatio != null
+    && Number.isFinite(metric.fontBoxRatio)
+    && metric.fontBoxRatio > 0;
+}
 
 export interface LineBoundary {
   segIndex: number;
@@ -175,6 +282,8 @@ export interface LayoutTextSeg extends LayoutSegSource {
   strikethrough: boolean;
   fontSize: number;  // pt
   color: string | null;
+  /** Concrete selected face used for Canvas measurement and paint, or the
+   * authored family when no registered route exists. */
   fontFamily: string | null;
   fontRoute?: CanvasFontRoute;
   /** Exact local face selected during async document loading. The family above
@@ -182,6 +291,18 @@ export interface LayoutTextSeg extends LayoutSegSource {
    * without a version-specific font constant. */
   resolvedLineHeightRatio?: number;
   resolvedEastAsianLineHeightRatio?: number;
+  /** Authored design descent used only when this visible text shares a line
+   * with an inline image. The object owns ascent; Word retains this descent
+   * below its baseline instead of substituting the selected Canvas descent. */
+  inlineImageDesignDescentRatio?: number;
+  /** The selected face's design line is exact enough to replace a larger,
+   * integer-quantized Canvas font box. Currently bounded to the observed
+   * Calibri/Carlito auto-spacing matrix; other resource metrics remain floors. */
+  designLineMayShrinkSelectedFontBox?: true;
+  /** Canvas advance is proven to match the authored Word face for the narrow
+   * compatibility matrix recorded by `calibriAdvanceMatchesAuthoredFace`.
+   * This is stronger than a registered route or a generic font-box probe. */
+  advanceMatchesAuthoredFace?: true;
   vertAlign: 'super' | 'sub' | null;
   measuredWidth: number;  // px (set during layout)
   /** A2 text authority captured during segmentation; production text width and
@@ -296,6 +417,10 @@ export interface LayoutTextSeg extends LayoutSegSource {
   /** Effective `w:lang/@w:eastAsia` consumed by the isolated
    *  {@link wordIsOverflowPunctuation} compatibility projection. */
   eastAsiaLanguage?: string;
+  /** The originating parent run contains East Asian-script content. When that
+   * run has no effective East-Asian language, this provides the bounded union
+   * fallback independently of the observed Latin-parent compatibility rule. */
+  overflowPunctuationEastAsianRun?: true;
   /** ECMA-376 §17.3.2.43 `<w:w>` — horizontal glyph-width scale as a FRACTION
    *  (0.67 = 67%). Measured widths are multiplied by it and the paint pass draws
    *  under `ctx.scale(charScale, 1)`; decorations follow the scaled extent.
@@ -473,6 +598,9 @@ export interface LayoutImageSeg extends LayoutSegSource {
   imagePath: string;
   /** MIME type of the blip at {@link LayoutImageSeg.imagePath}. */
   mimeType: string;
+  /** This segment came from `pic:pic`, rather than a chart/shape sentinel that
+   * shares the same line-breaking structure. */
+  inlinePicture?: true;
   widthPt: number;
   heightPt: number;
   rotation?: number;
@@ -562,6 +690,8 @@ export interface LayoutLine {
   /** px — intended single-line height (max over segments of the selected
    * resource ratio, with the established compatibility registry as fallback). */
   intendedSingle: number;
+  /** True only for a non-floating picture (`w:drawing/wp:inline/pic:pic`). */
+  hasInlineImage?: boolean;
   /** px — DESIGN grid-count height: the max over segments of each run's
    *  format-policy single-line height (a resolved resource's design height,
    *  or the generic East Asian fallback). Feeds docGrid cell
@@ -639,7 +769,15 @@ export interface WrapLayoutCtx {
   /** Per-line box-height resolver (line natural ascent+descent → total px box height).
    *  `gridCountSinglePx` (the line's design grid-count height) keeps the
    *  float-wrap advance consistent with the final render's docGrid cell count. */
-  lineBoxH: (ascentPx: number, descentPx: number, hasRuby?: boolean, intendedSinglePx?: number, eastAsian?: boolean, gridCountSinglePx?: number) => number;
+  lineBoxH: (
+    ascentPx: number,
+    descentPx: number,
+    hasRuby?: boolean,
+    intendedSinglePx?: number,
+    eastAsian?: boolean,
+    gridCountSinglePx?: number,
+    hasInlineImage?: boolean,
+  ) => number;
   /** Hard cap on Y to keep layout from running past the page. */
   pageH: number;
 }
@@ -699,6 +837,13 @@ export interface LineLayoutEnvironment {
    * the authored frame height remains authoritative even when glyph paint is
    * lowered beyond it. Folded into retained text segments during acquisition. */
   readonly positionExtendsLineBox?: boolean;
+  /** `word-calibri-authored-design-line` boundary for an explicitly authored
+   * `w:spacing/@w:line` with `lineRule="auto"`: the multiple is applied to
+   * the authored face's design line even when Canvas paints with an
+   * unregistered substitute. Omitted/default single spacing continues to use
+   * the selected face metrics; broadening this would change pagination for
+   * unrelated Calibri documents. */
+  readonly authoredAutoLineSpacing?: boolean;
 }
 
 // ── Math (OMML) rendering via MathJax ───────────────────────────────────────
@@ -1058,6 +1203,46 @@ export function segmentEastAsiaFloorSingleLinePx(
     intendedSingleLinePx(segment.eaFloorFamily, emPx, eastAsian),
     resourceRatio * emPx,
   );
+}
+
+/** Use a selected resource's design line metric as the single-line authority.
+ *
+ * Canvas fontBoundingBox values are device-pixel quantized even for an exact
+ * selected face. In Chromium, real Calibri Regular at 10px reports a 13px font
+ * box although its hhea line is 2500/2048em (12.207px); the compatibility
+ * projection advances by the latter. At 11px the same Canvas box is only 13px
+ * and the 13.428px design line remains the floor. The bounded routes are
+ * declared by `word-calibri-authored-design-line`. ECMA-376 §17.3.1.33 defines
+ * how auto spacing multiplies a line, but does not define browser metric routing.
+ *
+ * Restrict shrinking to a resolved metric carried by the selected face. Tight
+ * actual ink still extends either side, so this can never clip a glyph merely
+ * to compensate for fontBoundingBox quantization. */
+function resolvedDesignLineMetrics(
+  segment: LayoutTextSeg,
+  emPx: number,
+  eastAsian: boolean,
+  measured: TextMetrics,
+  corrected: Readonly<{ ascent: number; descent: number }>,
+): { ascent: number; descent: number } {
+  if (segment.designLineMayShrinkSelectedFontBox !== true) return { ...corrected };
+  const ratio = eastAsian
+    ? segment.resolvedEastAsianLineHeightRatio ?? segment.resolvedLineHeightRatio
+    : segment.resolvedLineHeightRatio;
+  if (!(ratio != null && Number.isFinite(ratio) && ratio > 0)) return { ...corrected };
+  const targetTotal = ratio * emPx;
+  const correctedTotal = corrected.ascent + corrected.descent;
+  if (!(correctedTotal > targetTotal)) return { ...corrected };
+  const actualAscent = measured.actualBoundingBoxAscent;
+  const actualDescent = measured.actualBoundingBoxDescent;
+  if (!(Number.isFinite(actualAscent) && Number.isFinite(actualDescent))) {
+    return { ...corrected };
+  }
+  const scale = correctedTotal > 0 ? targetTotal / correctedTotal : 0;
+  return {
+    ascent: Math.max(0, actualAscent, corrected.ascent * scale),
+    descent: Math.max(0, actualDescent, corrected.descent * scale),
+  };
 }
 
 export function getDefaultFontSize(para: ParagraphLayoutSource): number {
@@ -1648,6 +1833,10 @@ export function lineBoxHeight(
   // px — unresolved East Asian run em used only by direct/synthetic callers that
   // cannot provide the producer-computed per-line gridCountSinglePx.
   untabledEastAsianEmPx?: number,
+  // A non-floating picture participates in the line's natural ascent/descent
+  // union, but auto leading comes from the text design line rather than
+  // multiplying the picture itself.
+  hasInlineImage = false,
 ): number {
   const glyphNatural = ascentPx + descentPx;
   // For `auto`/single spacing the multiplier applies to the intended font's
@@ -1725,6 +1914,15 @@ export function lineBoxHeight(
       }
       return Math.max(glyphNatural, pitchPx * ls.value);
     }
+    if (hasInlineImage && ls.value >= 1) {
+      // Office-produced 5–255pt picture sweeps at 1.0, 1.079 and 1.15 line
+      // multiples establish this composition: first form the natural
+      // baseline union, floor it to one text design line, then add only the
+      // text line's authored leading. Multiplying the whole picture made the
+      // error grow with object height. ECMA-376 §17.3.1.33 specifies the auto
+      // multiple but not this inline-object composition.
+      return wordInlineImageAutoLineHeightPx(glyphNatural, intendedSinglePx, ls.value);
+    }
     return natural * ls.value;
   }
   if (ls.rule === 'exact') return ls.value * scale;
@@ -1782,6 +1980,37 @@ export interface MarkLineMetrics {
   readonly descentPx: number;
 }
 
+function paragraphMarkUsesEastAsianFace(
+  eastAsianLayout: boolean,
+  markShapeInput: NumberingMarkerShapeInput | undefined,
+): boolean {
+  // An empty mark has no code point on which `w:rFonts@w:hint` can operate.
+  // In Office-produced useFELayout controls with effective English language,
+  // changing the paragraph-mark ascii face, eastAsia face, or adding
+  // `hint="eastAsia"` left four shaded 11pt/1.15 marks byte-for-byte aligned:
+  // 25.44pt including 10pt after-spacing (15.36pt on the terminal mark).
+  // The same result held after independently setting eastAsia language to
+  // Japanese with a distinct EA face. Consequently useFELayout, hint, language,
+  // and an EA-family declaration affect grid/script handling for visible text,
+  // but do not route a content-less mark through the EA font slot. Acquired
+  // paragraph marks therefore retain the Latin/default route. Compatibility
+  // callers without acquired mark facts retain their prior paragraph-level
+  // script fallback.
+  return wordEmptyMarkUsesEastAsianFace({
+    eastAsianLayout,
+    acquiredMarkFacts: markShapeInput !== undefined,
+    ascii: markShapeInput
+      ? requestedFontFamilyForSlot(markShapeInput, 'ascii')
+      : undefined,
+    highAnsi: markShapeInput
+      ? requestedFontFamilyForSlot(markShapeInput, 'highAnsi')
+      : undefined,
+    eastAsia: markShapeInput
+      ? requestedFontFamilyForSlot(markShapeInput, 'eastAsia')
+      : undefined,
+  });
+}
+
 export function paragraphMarkLineMetrics(
   para: ParagraphLayoutSource,
   scale: number,
@@ -1797,12 +2026,15 @@ export function paragraphMarkLineMetrics(
   useFeLayout = false,
 ): MarkLineMetrics {
   const effectiveMarkShapeInput = markShapeInput;
-  // ECMA-376 §17.3.2.26 `w:rFonts@w:hint`: an empty paragraph has no code
-  // point from which to infer a script slot, so the paragraph-mark hint selects
-  // the face used to measure the mark. It does NOT make an otherwise Latin-only
-  // paragraph occupy East-Asian docGrid cells: grid-cell classification remains
-  // content/document based, independently of font routing.
-  const markUsesEastAsianFace = eastAsian || effectiveMarkShapeInput?.fontHint === 'eastAsia';
+  // ECMA-376 §17.3.2.26 `w:rFonts@w:hint` disambiguates the font slot of a
+  // character. An empty paragraph has no character to classify, and the Office
+  // controls documented below keep its mark on the Latin/default route even
+  // when the acquired mark carries an EA hint or language. This is independent
+  // from docGrid cell classification, which remains content/document based.
+  const markUsesEastAsianFace = paragraphMarkUsesEastAsianFace(
+    eastAsian,
+    effectiveMarkShapeInput,
+  );
   const forceCs = effectiveMarkShapeInput?.complexScript === true;
   const fs = effectiveMarkShapeInput?.fontSizePt ?? getDefaultFontSize(para);
   const authoredFamily = getDefaultFontFamily(para, markUsesEastAsianFace);
@@ -1820,6 +2052,7 @@ export function paragraphMarkLineMetrics(
   const measuredFamily = resolvedLocalFont?.family ?? authoredFamily;
   let asc: number;
   let desc: number;
+  let compatibleSubstituteRatio: number | undefined;
   if (textLayoutService) {
     const bold = markWeight >= 600;
     const italic = markStyle === 'italic';
@@ -1843,12 +2076,17 @@ export function paragraphMarkLineMetrics(
       kerning: effectiveMarkShapeInput?.kerning,
       measure: true,
     });
-    const face = shaped.spans[0]?.font.resolvedFamily ?? authoredFamily;
+    const selectedFont = shaped.spans[0]?.font;
+    const face = selectedFont?.resolvedFamily ?? authoredFamily;
+    compatibleSubstituteRatio = calibriSelectedSubstituteLineHeightRatio(selectedFont);
+    const mayShrinkSelectedFontBox = compatibleSubstituteRatio != null;
     ({ ascent: asc, descent: desc } = correctedLineMetrics(
       {
         width: shaped.advancePt,
-        actualBoundingBoxAscent: shaped.ascentPt,
-        actualBoundingBoxDescent: shaped.descentPt,
+        actualBoundingBoxAscent: mayShrinkSelectedFontBox
+          ? shaped.inkBounds?.ascentPt ?? shaped.ascentPt : shaped.ascentPt,
+        actualBoundingBoxDescent: mayShrinkSelectedFontBox
+          ? shaped.inkBounds?.descentPt ?? shaped.descentPt : shaped.descentPt,
         fontBoundingBoxAscent: shaped.ascentPt,
         fontBoundingBoxDescent: shaped.descentPt,
       } as TextMetrics,
@@ -1887,7 +2125,7 @@ export function paragraphMarkLineMetrics(
   }
   const resourceRatio = markUsesEastAsianFace
     ? resolvedLocalFont?.eastAsianLineHeightRatio ?? resolvedLocalFont?.lineHeightRatio
-    : resolvedLocalFont?.lineHeightRatio;
+    : resolvedLocalFont?.lineHeightRatio ?? compatibleSubstituteRatio;
   const intendedSingle = Math.max(
     (resourceRatio ?? 0) * fs * scale,
     emptyIntendedSingleForScriptPx(para, scale, markUsesEastAsianFace),
@@ -2503,18 +2741,17 @@ export function splitTextForLayout(text: string): string[] {
  *  numbered-list marker's retained trailing-tab advance. */
 export const DEFAULT_TAB_PT = 36;
 
-/** Knuth-Plass shrink tolerance: the fraction by which the line breaker may
- *  compress each inter-word space to keep a candidate word on the current line.
- *  ECMA-376 prescribes no line-breaking algorithm — tolerance-based fit is
- *  standard typography (TeX, InDesign, Word) and lets the layout absorb the
- *  canvas `measureText` vs Word advance-width discrepancy (~0.1–0.3 px/glyph)
- *  that would otherwise push a trailing word to the next line. Per ECMA-376
- *  §17.18.44, this tolerance is suppressed per line when the draw pass will
- *  fully justify it: non-final/non-manual-break lines of `both`/kashida, and
- *  every line of `distribute`/`thaiDistribute`. Lines the paint pass leaves
- *  non-justified keep the budget so measurement and paint agree (issue #698).
+/** Compatibility budget for unresolved browser-font advance bias. This is not
+ *  a general non-justified-line compression rule: ECMA-376 does not prescribe
+ *  that behavior, and resolved-face controls wrap at natural width. The
+ *  allowance is retained only when at least one visible segment lacks the
+ *  compatible advance proof defined by `word-calibri-authored-advance-route`.
+ *  A registered CSS family name and an unrelated exact-face metric are insufficient;
+ *  the allowance is removed only for the narrow routes projected by
+ *  `calibriAdvanceMatchesAuthoredFace`. Per §17.18.44 it is also suppressed
+ *  when the draw pass will fully justify the line (issue #698).
  *
- *  For eligible non-justified lines this is the ONE budget shared by both sides
+ *  For eligible unresolved non-justified lines this is the ONE budget shared by both sides
  *  of the fit contract: the wrap judgment below admits a word when the line's
  *  overflow Δ ≤ SPACE_SHRINK_RATIO · Σ(trailing-space widths), and the renderer's
  *  draw pass squeezes the same spaces by the same fraction so the admitted line
@@ -2831,6 +3068,7 @@ export function buildSegments(
     joinPreviousRun = false,
   ) => {
     const r: ParagraphTextBearingRun = base;
+    const overflowPunctuationEastAsianRun = EAST_ASIAN_RE.test(text) ? true : undefined;
     const acquiredTypography = (r as ParagraphTextBearingRun & Readonly<{
       typographyInput?: import('./layout/typography-input.js').RunTypographyAcquisitionInput;
     }>).typographyInput;
@@ -3184,13 +3422,33 @@ export function buildSegments(
       const resolvedEaFloorFamily = eaResolution?.resolvedFamily
         ?? localEaFloor?.family
         ?? eaFontFamily;
-      const useFeEastAsianMetric = environment.useFeLayout
-        && (r.fontHint === 'eastAsia' || Boolean(resolvedEaFloorFamily?.trim()));
       const resolvedScript = resolvedSpan?.script ?? authoritativeSpan?.script
         ?? (cs ? 'complexScript' : EAST_ASIAN_RE.test(text) ? 'eastAsia' : 'ascii');
+      // `word-use-fe-layout-inherited-grid-minimum`: with useFELayout enabled, a
+      // visible Latin line that has an effective eastAsia axis participates in
+      // Far-East grid metrics even when its own ASCII/high-ANSI face differs.
+      // The active-grid boundary matrix includes that mixed-slot counterexample;
+      // without useFELayout, merely declaring an EA family changes nothing.
+      const useFeEastAsianMetric = environment.useFeLayout
+        && (r.fontHint === 'eastAsia' || Boolean(resolvedEaFloorFamily?.trim()));
       const widthBalanceGridDeltaFactor = environment.balanceSingleByteDoubleByteWidth
         ? wordBalancedLinesAndCharsGridDeltaFactor(text, resolvedScript)
         : undefined;
+      const authoredCalibriRatio = environment.authoredAutoLineSpacing === true
+        && environment.useFeLayout !== true
+        && resolvedScript === 'ascii'
+        ? calibriAuthoredLineHeightRatio(resolvedSpan?.font)
+        : undefined;
+      const inlineImageDesignDescentRatio = environment.useFeLayout !== true
+        ? calibriInlineImageDescentRatio(
+            resolvedSpan?.font.requestedFamily ?? fontFamily,
+            resolvedScript,
+          )
+        : undefined;
+      const resolvedLineHeightRatio = familyLineMetric?.lineHeightRatio
+        ?? authoredCalibriRatio;
+      const mayShrinkToCalibriDesignLine = resolvedLineHeightRatio != null
+        && normalizeFontMetricFamily(resolvedSpan?.font.requestedFamily ?? '') === 'calibri';
       segs.push({
         text,
         script: resolvedScript,
@@ -3219,8 +3477,17 @@ export function buildSegments(
         color: base.color,
         fontFamily: resolvedSpan?.font.resolvedFamily ?? localFont?.family ?? fontFamily,
         fontRoute: resolvedSpan?.fontRoute,
-        resolvedLineHeightRatio: familyLineMetric?.lineHeightRatio,
+        resolvedLineHeightRatio,
         resolvedEastAsianLineHeightRatio: familyLineMetric?.eastAsianLineHeightRatio,
+        ...(inlineImageDesignDescentRatio !== undefined
+          ? { inlineImageDesignDescentRatio }
+          : {}),
+        ...(mayShrinkToCalibriDesignLine
+          ? { designLineMayShrinkSelectedFontBox: true as const }
+          : {}),
+        ...(calibriAdvanceMatchesAuthoredFace(resolvedSpan?.font, familyLineMetric)
+          ? { advanceMatchesAuthoredFace: true as const }
+          : {}),
         vertAlign: effectiveVertAlign,
         measuredWidth: 0,
         textLayoutService: environment.layoutServices?.text,
@@ -3276,6 +3543,7 @@ export function buildSegments(
         charSpacing: effectiveCharacterSpacing,
         punctuationCompressions,
         eastAsiaLanguage: r.langEastAsia,
+        overflowPunctuationEastAsianRun,
         charScale: effectiveCharacterScale,
         fitTextVal: fitTextRegionIndex === undefined ? undefined : r.fitTextVal,
         fitTextId: fitTextRegionIndex === undefined ? undefined : r.fitTextId,
@@ -3472,6 +3740,7 @@ export function buildSegments(
       segs.push({
         imagePath: img.imagePath,
         mimeType: img.mimeType,
+        inlinePicture: true,
         widthPt: img.widthPt,
         heightPt: img.heightPt,
         rotation: img.rotation,
@@ -3991,6 +4260,7 @@ export function layoutLines(
   widthPolicy?: 'bounded' | 'intrinsic',
   verticalGlyphMeasurement?: VerticalGlyphMeasurementService,
   overflowPunct?: boolean,
+  inlineImageDefaultSinglePx?: number,
 ): LayoutLine[];
 export function layoutLines(
   ctx: MeasurementTextContext,
@@ -4039,6 +4309,7 @@ export function layoutLines(
   widthPolicy: 'bounded' | 'intrinsic' = 'bounded',
   verticalGlyphMeasurement?: VerticalGlyphMeasurementService,
   overflowPunct = false,
+  inlineImageDefaultSinglePx = 0,
   passContext?: Readonly<{
     probeHeights: readonly number[] | null;
     preparedFloatWrap?: PreparedFloatWrap;
@@ -4075,6 +4346,7 @@ export function layoutLines(
       widthPolicy,
       verticalGlyphMeasurement,
       overflowPunct,
+      inlineImageDefaultSinglePx,
       { probeHeights, preparedFloatWrap },
     );
     if (!wrapCtx || widthPolicy === 'intrinsic') return runPass(null);
@@ -4090,6 +4362,7 @@ export function layoutLines(
         line.intendedSingle,
         line.eastAsian,
         line.gridCountSingle,
+        line.hasInlineImage,
       ),
     );
   }
@@ -4130,6 +4403,8 @@ export function layoutLines(
   let lineVisibleDescent = 0;
   let lineVisibleIntendedSingle = 0;
   let lineHasVisibleMetrics = false;
+  let lineHasInlineImage = false;
+  let lineInlineImageDesignDescent = 0;
   let isFirst = true;
   // Effective width/offset for the current line after float exclusion.
   let lineMaxWidth = maxWidth;
@@ -4304,6 +4579,13 @@ export function layoutLines(
   // the per-cluster greedy path. `word-dictionary-sea-natural-fit` gates the
   // trailing-space shrink budget for the dictionary scripts.
   let lineHasSea = false;
+  // Space-shrink exists to absorb an unresolved browser fallback's
+  // Canvas-vs-reference advance bias. Registration and an unrelated font-box
+  // metric do not prove compatible advances. The authored-route boundary establishes
+  // natural-width wrapping only for actual probed Calibri Regular and the
+  // resolver's regular Calibri→Carlito metric-compatible substitute; an
+  // unresolved substituted title is the counterexample retaining the budget.
+  let lineHasUnresolvedMeasurementRoute = false;
   const flush = (
     forceHeight?: number,
     brTerminated = false,
@@ -4357,7 +4639,11 @@ export function layoutLines(
     // stays consistent with non-empty lines.
     const hasContent = lineAscent > 0 || lineDescent > 0;
     const asc = hasContent ? lineAscent : h * scale * 0.8;
-    const desc = hasContent ? lineDescent : h * scale * 0.2;
+    const desc = hasContent
+      ? (lineHasInlineImage && inlineImageDefaultSinglePx > 0
+          ? Math.max(lineDescent, lineInlineImageDesignDescent)
+          : lineDescent)
+      : h * scale * 0.2;
     const visibleAscent = lineHasVisibleMetrics ? lineVisibleAscent : asc;
     const visibleDescent = lineHasVisibleMetrics ? lineVisibleDescent : desc;
     const visibleIntendedSingle = lineHasVisibleMetrics
@@ -4365,6 +4651,9 @@ export function layoutLines(
       : lineIntendedSingle;
     const gridCountSingle = lineGridCountSingle
       || (lineEastAsian ? eastAsianGridCountSinglePx(lineIntendedSingle, h * scale) : asc + desc);
+    const intendedSingle = lineHasInlineImage && inlineImageDefaultSinglePx > 0
+      ? Math.max(lineIntendedSingle, inlineImageDefaultSinglePx)
+      : lineIntendedSingle;
     lines.push({
       segments: currentLine,
       height: h,
@@ -4373,7 +4662,8 @@ export function layoutLines(
       visibleAscent,
       visibleDescent,
       visibleIntendedSingle,
-      intendedSingle: lineIntendedSingle,
+      intendedSingle,
+      ...(lineHasInlineImage ? { hasInlineImage: true as const } : {}),
       // Empty/synthetic East Asian lines use the same design-height rule as a
       // text run; their synthesized Canvas box must not reintroduce a
       // scale-dependent cell count.
@@ -4391,9 +4681,10 @@ export function layoutLines(
         asc,
         desc,
         lineHasRuby,
-        lineIntendedSingle,
+        intendedSingle,
         lineEastAsian,
         gridCountSingle,
+        lineHasInlineImage,
       );
     }
     currentLine = [];
@@ -4412,9 +4703,12 @@ export function layoutLines(
     lineVisibleDescent = 0;
     lineVisibleIntendedSingle = 0;
     lineHasVisibleMetrics = false;
+    lineHasInlineImage = false;
+    lineInlineImageDesignDescent = 0;
     lineHasRuby = false;
     lineEastAsian = false;
     lineHasSea = false;
+    lineHasUnresolvedMeasurementRoute = false;
     isFirst = false;
     startLine(minLineStartWidth());
   };
@@ -4444,6 +4738,12 @@ export function layoutLines(
   ): void => {
     if (/\S/.test(text)) routes.add(measurementRouteIdentity(s));
   };
+
+  const hasUnresolvedMeasurementRoute = (
+    s: LayoutTextSeg,
+    text: string = s.text,
+  ): boolean => /\S/.test(text)
+    && s.advanceMatchesAuthoredFace !== true;
 
   const measurementRouteCountWith = (candidateRoutes: ReadonlySet<string>): number => {
     let count = lineMeasurementRoutes.size;
@@ -4591,6 +4891,9 @@ export function layoutLines(
       }
       lineBiasBudget += biasBudgetContribution(s);
       noteMeasurementRoute(lineMeasurementRoutes, s);
+      if (hasUnresolvedMeasurementRoute(s)) {
+        lineHasUnresolvedMeasurementRoute = true;
+      }
     }
     if (h > lineHeight) lineHeight = h;
     if (asc > lineAscent) lineAscent = asc;
@@ -4600,6 +4903,18 @@ export function layoutLines(
       lineHasVisibleMetrics = true;
       if (asc > lineVisibleAscent) lineVisibleAscent = asc;
       if (desc > lineVisibleDescent) lineVisibleDescent = desc;
+    }
+    if ('imagePath' in s && !s.anchor && s.inlinePicture === true) {
+      lineHasInlineImage = true;
+    } else if (
+      'text' in s
+      && s.metricOnly !== true
+      && s.inlineImageDesignDescentRatio !== undefined
+    ) {
+      lineInlineImageDesignDescent = Math.max(
+        lineInlineImageDesignDescent,
+        s.inlineImageDesignDescentRatio * calcEffectiveFontPx(s, scale),
+      );
     }
     // Grid-count height for docGrid cell allocation (§17.6.5). Only East Asian
     // TEXT (and tall inline objects) drives the count — a Latin run keeps its
@@ -4710,8 +5025,10 @@ export function layoutLines(
       }
       return {
         width: shaped.advancePt,
-        actualBoundingBoxAscent: shaped.ascentPt,
-        actualBoundingBoxDescent: shaped.descentPt,
+        actualBoundingBoxAscent: s.designLineMayShrinkSelectedFontBox === true
+          ? shaped.inkBounds?.ascentPt ?? shaped.ascentPt : shaped.ascentPt,
+        actualBoundingBoxDescent: s.designLineMayShrinkSelectedFontBox === true
+          ? shaped.inkBounds?.descentPt ?? shaped.descentPt : shaped.descentPt,
         fontBoundingBoxAscent: shaped.ascentPt,
         fontBoundingBoxDescent: shaped.descentPt,
       } as TextMetrics;
@@ -5052,8 +5369,10 @@ export function layoutLines(
         });
         metricMeasurement = {
           width: shaped.advancePt,
-          actualBoundingBoxAscent: shaped.ascentPt,
-          actualBoundingBoxDescent: shaped.descentPt,
+          actualBoundingBoxAscent: s.designLineMayShrinkSelectedFontBox === true
+            ? shaped.inkBounds?.ascentPt ?? shaped.ascentPt : shaped.ascentPt,
+          actualBoundingBoxDescent: s.designLineMayShrinkSelectedFontBox === true
+            ? shaped.inkBounds?.descentPt ?? shaped.descentPt : shaped.descentPt,
           fontBoundingBoxAscent: shaped.ascentPt,
           fontBoundingBoxDescent: shaped.descentPt,
         } as TextMetrics;
@@ -5073,12 +5392,19 @@ export function layoutLines(
       metricEmPx = fullPx;
     }
 
-    const corrected = correctedLineMetrics(
+    const eastAsianMetric = (s.metricEastAsian === true || EAST_ASIAN_RE.test(s.text)) && !s.ruby;
+    const corrected = resolvedDesignLineMetrics(
+      s,
+      metricEmPx,
+      eastAsianMetric,
+      metricMeasurement,
+      correctedLineMetrics(
       metricMeasurement,
       s.fontFamily,
       fullPx,
       metricEmPx,
-      (s.metricEastAsian === true || EAST_ASIAN_RE.test(s.text)) && !s.ruby,
+      eastAsianMetric,
+      ),
     );
     let ascent = corrected.ascent;
     let descent = corrected.descent;
@@ -5812,12 +6138,13 @@ export function layoutLines(
       addToLine(s, w, h, asc, desc);
       continue;
     }
-    // Wrap-fit check uses two standard typographic allowances:
+    // Wrap-fit check uses two compatibility allowances:
     //   1. Trailing-space collapse: if this word becomes the last on the
     //      line, its trailing space (if any) collapses. We subtract it from
     //      the width used to test fit.
-    //   2. Knuth-Plass shrink tolerance: lines the paint pass leaves
-    //      non-justified keep the budget. Per §17.18.44, lines the paint pass
+    //   2. Unresolved-face advance-bias budget: lines the paint pass leaves
+    //      non-justified keep it only while at least one measurement route is
+    //      unresolved. Per §17.18.44, lines the paint pass
     //      fully justifies get no budget: non-final/non-manual-break `both`/kashida
     //      lines, and every `distribute`/`thaiDistribute` line (issue #698).
     const trimmed = s.text.replace(/ +$/, '');
@@ -5854,9 +6181,10 @@ export function layoutLines(
     //  - A line the paint pass will justify stretches to the column edge. Admit
     //    only the backend-specific per-font measurement bias there; suppress the
     //    trailing-space allowance.
-    //  - A line left NON-justified keeps the classic Knuth-Plass trailing-space
-    //    shrink allowance, whose 25% promise the draw pass spends through
-    //    `shrinkFitCompression`. Adding the bias would double-count tolerance.
+    //  - A line left NON-justified keeps the temporary unresolved-face advance-
+    //    bias budget, whose 25% promise the draw pass spends through
+    //    `shrinkFitCompression`. It is not a Word spacing rule. Adding the
+    //    justified-line bias would double-count tolerance.
     // Dictionary-SEA candidate (Thai/Lao/Khmer; grapheme-fill Myanmar/Tibetan
     // stays on its per-cluster greedy path). Per-codepoint scan: a rare segment
     // mixing both SEA families is not dictionary-SEA, so
@@ -5869,7 +6197,9 @@ export function layoutLines(
       next: LayoutSeg | undefined,
       biasBudget: number,
       measurementRoutes: ReadonlySet<string>,
+      candidateHasUnresolvedMeasurementRoute: boolean,
     ): number => {
+      if (!lineHasUnresolvedMeasurementRoute && !candidateHasUnresolvedMeasurementRoute) return 0;
       const lineWillJustify = prospectiveLineWillJustify(next);
       if (lineWillJustify) return wordJustifiedCandidateFitAllowancePx({
         biasBudgetPx: biasBudget,
@@ -5919,6 +6249,7 @@ export function layoutLines(
       let groupEnd = 0;
       let groupBiasBudget = lineBiasBudget;
       const groupMeasurementRoutes = new Set(candidateMeasurementRoutes);
+      let groupHasUnresolvedMeasurementRoute = hasUnresolvedMeasurementRoute(s, trimmed);
       // Keep one pending member so only the final member is trimmed. Committing
       // each previous member left-to-right preserves the former prospective-array
       // summation order exactly, without cloning or rescanning the current line.
@@ -5938,6 +6269,7 @@ export function layoutLines(
           groupW += prefixWidth;
           advanceGroupBias(f, prefix);
           noteMeasurementRoute(groupMeasurementRoutes, f, prefix);
+          groupHasUnresolvedMeasurementRoute ||= hasUnresolvedMeasurementRoute(f, prefix);
           groupTrail = prefix.endsWith(' ')
             ? prefixWidth - strAdvance(f, prefix.replace(/ +$/, ''))
             : 0;
@@ -5953,6 +6285,7 @@ export function layoutLines(
           groupW += prefixWidth;
           advanceGroupBias(f, prefix);
           noteMeasurementRoute(groupMeasurementRoutes, f, prefix);
+          groupHasUnresolvedMeasurementRoute ||= hasUnresolvedMeasurementRoute(f, prefix);
           groupTrail = 0;
           break;
         }
@@ -5980,6 +6313,7 @@ export function layoutLines(
             if (prefix.length > 0) {
               advanceGroupBias(f, prefix);
               noteMeasurementRoute(groupMeasurementRoutes, f, prefix);
+              groupHasUnresolvedMeasurementRoute ||= hasUnresolvedMeasurementRoute(f, prefix);
             }
             groupTrail = 0;
             break;
@@ -5990,6 +6324,7 @@ export function layoutLines(
         groupW += fw;
         advanceGroupBias(f);
         noteMeasurementRoute(groupMeasurementRoutes, f);
+        groupHasUnresolvedMeasurementRoute ||= hasUnresolvedMeasurementRoute(f);
         const ft = f.text.replace(/ +$/, '');
         const followerTrail = f.text.endsWith(' ') ? fw - strAdvance(f, ft) : 0;
         // UAX #14 LB7 makes a consecutive SP sequence one trailing suffix even
@@ -6011,6 +6346,7 @@ export function layoutLines(
           queue[groupEnd],
           groupBiasBudget,
           groupMeasurementRoutes,
+          groupHasUnresolvedMeasurementRoute,
         )
       ) {
         flush(undefined, false, s.src);
@@ -6043,6 +6379,7 @@ export function layoutLines(
       let chunkEnd = 0;
       let chunkBias = lineBiasBudget + biasBudgetContribution(s, trimmed);
       const chunkMeasurementRoutes = new Set(candidateMeasurementRoutes);
+      let chunkHasUnresolvedMeasurementRoute = hasUnresolvedMeasurementRoute(s, trimmed);
       if (!s.text.endsWith(' ')) {
         for (; chunkEnd < queue.length; chunkEnd++) {
           const f = queue[chunkEnd];
@@ -6055,6 +6392,7 @@ export function layoutLines(
           chunkTrail = ft.text.endsWith(' ') ? fw - strAdvance(ft, fTrim) : 0;
           chunkBias += biasBudgetContribution(ft, fTrim);
           noteMeasurementRoute(chunkMeasurementRoutes, ft, fTrim);
+          chunkHasUnresolvedMeasurementRoute ||= hasUnresolvedMeasurementRoute(ft, fTrim);
           if (ft.text.endsWith(' ')) { chunkEnd++; break; } // a space ends the chunk
         }
       }
@@ -6064,6 +6402,7 @@ export function layoutLines(
           queue[chunkEnd],
           chunkBias,
           chunkMeasurementRoutes,
+          chunkHasUnresolvedMeasurementRoute,
         ) &&
         chunkWForFit <= lineMaxWidth
       ) {
@@ -6075,12 +6414,15 @@ export function layoutLines(
       queue[0],
       lineBiasBudget + biasBudgetContribution(s, trimmed),
       candidateMeasurementRoutes,
+      hasUnresolvedMeasurementRoute(s, trimmed),
     );
-    // §17.3.1.21 is script-neutral: if the segment would fit without its final
-    // eligible punctuation character, admit that one character beyond the text
-    // extent before selecting a script-specific wrap algorithm. The isolated
-    // predicate owns the compatibility character sets. CJK segments that need
-    // an internal split retain their separate overflowPunct-vs-kinsoku rule.
+    // §17.3.1.21 permits one eligible punctuation character past the text
+    // extent. The isolated compatibility predicate owns both the CJK-language
+    // sets and the bounded Latin-parent extension owned by
+    // `wordIsOverflowPunctuation`, while excluding the complex-script
+    // counterexample. CJK
+    // segments that need an internal split retain their separate
+    // overflowPunct-vs-kinsoku rule.
     const visibleSegmentScalars = [...trimmed];
     const trailingOverflowCharacter = visibleSegmentScalars.at(-1);
     const textBeforeTrailingOverflow = visibleSegmentScalars.slice(0, -1).join('');
@@ -6091,6 +6433,8 @@ export function layoutLines(
       && wordIsOverflowPunctuation(
         trailingOverflowCharacter,
         s.eastAsiaLanguage,
+        s.overflowPunctuationEastAsianRun === true,
+        s.script === 'ascii' || s.script === 'highAnsi',
       )
       && currentWidth + strAdvance(s, textBeforeTrailingOverflow)
         <= availW() + shrinkBudget;
@@ -6168,7 +6512,12 @@ export function layoutLines(
       const hangingSplit = overflowPunct
         && rawSplit < allChars.length
         && (currentLine.length > 0 || rawSplit > 0)
-        && wordIsOverflowPunctuation(allChars[rawSplit], s.eastAsiaLanguage)
+        && wordIsOverflowPunctuation(
+          allChars[rawSplit],
+          s.eastAsiaLanguage,
+          s.overflowPunctuationEastAsianRun === true,
+          s.script === 'ascii' || s.script === 'highAnsi',
+        )
           ? rawSplit + 1
           : null;
       const proposedSplit = extendThroughTrailingIdeographicSpaces(

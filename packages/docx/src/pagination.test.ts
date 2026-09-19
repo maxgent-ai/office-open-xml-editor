@@ -248,7 +248,11 @@ function autoTableWithSingleWrappedParagraph(charCount: number, rowOverrides: Pa
   const row: DocTableRow = {
     cells: [
       {
-        content: [para({ text: 'あ'.repeat(charCount), fontSize: 20 }) as CellElement],
+        // These fixtures isolate greedy row slicing; widow behavior has its own
+        // boundary tests below and would deliberately rebalance the cut.
+        content: [para({
+          text: 'あ'.repeat(charCount), fontSize: 20, widowControl: false,
+        }) as CellElement],
         colSpan: 1,
         vMerge: null,
         borders: { top: null, bottom: null, left: null, right: null, insideH: null, insideV: null },
@@ -291,8 +295,10 @@ function autoTableWithIntroRowThenSpacedWrappedParagraph(): BodyElement {
     cells: [
       {
         content: [
-          para({ text: 'first', fontSize: 20, spaceAfter: 10 }) as CellElement,
-          para({ text: 'あ'.repeat(32), fontSize: 20, spaceBefore: 8 }) as CellElement,
+          para({ text: 'first', fontSize: 20, spaceAfter: 10, widowControl: false }) as CellElement,
+          para({
+            text: 'あ'.repeat(32), fontSize: 20, spaceBefore: 8, widowControl: false,
+          }) as CellElement,
         ],
         colSpan: 1,
         vMerge: null,
@@ -1039,7 +1045,9 @@ describe('layoutPages — mid-page split of rows with vMerge restart cells (§17
    *  short cell (20pt each). */
   const restartSpanTable = (labelParas: number, labelVAlign: 'top' | 'center' | 'bottom' = 'top'): BodyElement => {
     const label = mkCell(Array.from({ length: labelParas }, (_v, i) => shortPara(`L${i}`)), true, labelVAlign);
-    const content = mkCell([para({ text: 'あ'.repeat(24), fontSize: 20 }) as CellElement], null);
+    const content = mkCell([para({
+      text: 'あ'.repeat(24), fontSize: 20, widowControl: false,
+    }) as CellElement], null);
     const contRow = (t: string): DocTableRow => ({
       cells: [mkCell([para({}) as CellElement], false), mkCell([shortPara(t)], null)],
       rowHeight: null, rowHeightRule: 'auto', isHeader: false,

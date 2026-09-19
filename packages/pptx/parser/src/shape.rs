@@ -90,7 +90,7 @@ fn load_chart_related_parts(zip: &mut PptxZip, chart_path: &str) -> ChartRelated
     });
     if let Some(style_relationship) = style_relationship {
         let style_path = resolve_path(base_dir, &style_relationship.target);
-        result.style_xml = read_zip_str(zip, &style_path).ok();
+        result.style_xml = Some(read_zip_str(zip, &style_path).unwrap_or_else(|_| "\0".to_owned()));
         let style_rels_path = relationship_part_path(&style_path);
         if let Ok(style_rels_xml) = read_zip_str(zip, &style_rels_path) {
             let style_relationships = ooxml_common::rels::parse_rels(&style_rels_xml);
@@ -105,7 +105,8 @@ fn load_chart_related_parts(zip: &mut PptxZip, chart_path: &str) -> ChartRelated
         internal_target(ooxml_common::chart::CHART_COLOR_STYLE_REL_TYPE_SUFFIX)
     {
         let color_path = resolve_path(base_dir, &color_relationship.target);
-        result.color_style_xml = read_zip_str(zip, &color_path).ok();
+        result.color_style_xml =
+            Some(read_zip_str(zip, &color_path).unwrap_or_else(|_| "\0".to_owned()));
     }
     result
 }
@@ -201,6 +202,26 @@ mod chartex_sidecar_package_tests {
                 "stretch": true,
             }),
         );
+    }
+
+    #[test]
+    fn pptx_chart_related_parts_preserve_missing_sidecar_relationships() {
+        let mut bytes = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(Cursor::new(&mut bytes));
+            writer
+                .start_file(
+                    "ppt/charts/_rels/chart9.xml.rels",
+                    zip::write::SimpleFileOptions::default(),
+                )
+                .unwrap();
+            writer.write_all(br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rStyle" Type="http://schemas.microsoft.com/office/2011/relationships/chartStyle" Target="missing-style.xml"/><Relationship Id="rColors" Type="http://schemas.microsoft.com/office/2011/relationships/chartColorStyle" Target="missing-colors.xml"/></Relationships>"#).unwrap();
+            writer.finish().unwrap();
+        }
+        let mut archive = super::PptxZip::new(Cursor::new(bytes)).unwrap();
+        let related = super::load_chart_related_parts(&mut archive, "ppt/charts/chart9.xml");
+        assert_eq!(related.style_xml.as_deref(), Some("\0"));
+        assert_eq!(related.color_style_xml.as_deref(), Some("\0"));
     }
 
     #[test]
@@ -849,6 +870,7 @@ pub(crate) fn resolve_picture_shape_properties(
             glow: inherited.glow,
             soft_edge: inherited.soft_edge,
             reflection: inherited.reflection,
+            ..EffectLst::default()
         }
     };
 
@@ -1207,6 +1229,7 @@ pub(crate) fn parse_shape(
         glow,
         soft_edge,
         reflection,
+        ..
     } = if local_effect_node.is_some() {
         // MS-OI29500 §20.1.2.2.37(b): a local effect component replaces the
         // style component rather than merging missing fields from effectRef.
@@ -3202,6 +3225,7 @@ fn parse_connector(
         glow,
         soft_edge,
         reflection,
+        ..
     } = if local_effect_node.is_some() {
         parse_effect_lst(local_effect_node, theme)
     } else {

@@ -22,12 +22,16 @@ describe('legacy Pattern 2 generated colours', () => {
       .toEqual(['#156082', '#E97132', '#196B24', '#0F9ED5']);
   });
 
-  it('uses the registered six-object shade and tints the trailing seventh object', () => {
+  it('keeps registered set transforms independent of the final object count', () => {
     expect(Array.from({ length: 7 }, (_, index) =>
       legacyPattern2Color(ACCENTS, index, 7, 2)))
       .toEqual([
-        '#115473', '#CF642B', '#155E1F', '#0C8CBD', '#8E2582', '#449428', '#869AAA',
+        '#156082', '#E97132', '#196B24', '#0F9ED5', '#A02B93', '#4EA72E',
+        applyLinearTintOrShade('#156082', -0.4),
       ]);
+    expect(legacyPattern2Color(ACCENTS, 6, 13, 2))
+      .toBe(legacyPattern2Color(ACCENTS, 6, 7, 2));
+    expect(legacyPattern2Color(ACCENTS, 48, 49, 2)).toBeNull();
   });
 });
 

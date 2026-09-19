@@ -74,9 +74,13 @@ export function legacyPattern2Color(
   const base = accents[objectIndex % accentCount];
   if (!base) return null;
   if (![2, 10, 18, 26, 34, 42].includes(chartStyle ?? -1)) return `#${base}`.toUpperCase();
-  const completedSets = Math.floor(objectCount / accentCount);
   const setIndex = Math.floor(objectIndex / accentCount);
-  const amount = -0.70 + 1.40 * ((setIndex + 1) / (completedSets + 2));
+  // Excel's complete 48-object boundary matrix fixes eight transforms by set;
+  // 6/7/12/13-object controls establish that an existing object's transform is
+  // independent of the final object count. Index 48 starts an unobserved ninth
+  // set and therefore falls through instead of extrapolating a transform.
+  const amount = [0, -0.4, 0.2, -0.2, 0.4, -0.5, 0.3, -0.3][setIndex];
+  if (amount == null) return null;
   return applyLinearTintOrShade(base, amount);
 }
 

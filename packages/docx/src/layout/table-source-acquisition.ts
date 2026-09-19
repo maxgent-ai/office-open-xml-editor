@@ -322,6 +322,13 @@ export function projectTableColumnLayoutInput(
     availableWidthPt: maximumWidthPt === null ? null : Math.max(0, maximumWidthPt),
     gridWidthsPt,
     gridWidthKeys,
+    gridAuthoredComplete: authoredGridCount !== null
+      && authoredGridCount === contentGridCount
+      && authoredGridCount === gridWidthsPt.length,
+    tableWidthAutoAuthored: input.format.firstRowException?.preferredWidthAuthored !== true
+      && input.lexical.table?.preferredWidth !== null
+      && input.lexical.table?.preferredWidth !== undefined
+      && effectiveTableWidthKind(input.lexical.table.preferredWidth) === 'auto',
     tablePreferredWidthPt: tablePreferredWidthPt(input, availableWidthPt),
     rows: table.rows.map((row, rowIndex) => {
       const rowInput = input.lexical.rows[rowIndex];
