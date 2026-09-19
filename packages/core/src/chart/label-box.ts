@@ -1,7 +1,6 @@
-import type { Fill } from '../types/common.js';
 import type { ChartExElementStyle, ChartLabelBox, ChartRect } from '../types/chart.js';
 import { drawingmlLineDashArray } from '../draw/dash.js';
-import { resolveFill } from '../shape/paint.js';
+import { fillCanProduceVisiblePixels, resolveFill } from '../shape/paint.js';
 import { EMU_PER_PT } from '../units.js';
 import { chartStyleEffectOwner, paintChartStyleEffects } from './style-effects.js';
 import {
@@ -10,30 +9,6 @@ import {
   chartStyleFillDecision,
 } from './style-paint.js';
 import { paintActiveChartImageFill } from './image-fill-context.js';
-
-function chartColorHasVisibleAlpha(color: string): boolean {
-  const normalized = color.startsWith('#') ? color.slice(1) : color;
-  if (normalized.length < 8) return true;
-  const alpha = Number.parseInt(normalized.slice(6, 8), 16);
-  // Parsed OOXML colours are well formed. Treat malformed hand-authored
-  // public-model input conservatively as visible rather than silently
-  // changing its role selection.
-  return !Number.isFinite(alpha) || alpha !== 0;
-}
-
-function chartPaintHasVisibleAlpha(paint: Fill | null | undefined): boolean {
-  if (!paint || paint.fillType === 'none') return false;
-  if (paint.fillType === 'solid') return chartColorHasVisibleAlpha(paint.color);
-  if (paint.fillType === 'gradient') {
-    return paint.stops.some(stop => chartColorHasVisibleAlpha(stop.color));
-  }
-  if (paint.fillType === 'pattern') {
-    return chartColorHasVisibleAlpha(paint.fg) || chartColorHasVisibleAlpha(paint.bg);
-  }
-  // A decoded image may contain transparent pixels, but its alpha cannot be
-  // known from the OOXML carrier. It remains a visible authored paint role.
-  return true;
-}
 
 /** Resolve only the fill component of a label shape. Hosts use this same pure
  * decision before rendering to warm picture fills; the painter's full label
@@ -81,11 +56,12 @@ export function chartLabelBoxHasVisiblePaint(
 ): boolean {
   if (!box) return false;
   const hasFill = box.fillHidden !== true && (box.fillPaint != null
-    ? chartPaintHasVisibleAlpha(box.fillPaint)
-    : box.fill != null && chartColorHasVisibleAlpha(box.fill));
+    ? fillCanProduceVisiblePixels(box.fillPaint)
+    : box.fill != null && fillCanProduceVisiblePixels({ fillType: 'solid', color: box.fill }));
   const hasBorder = box.borderHidden !== true && (box.borderFill != null
-    ? chartPaintHasVisibleAlpha(box.borderFill)
-    : box.borderColor != null && chartColorHasVisibleAlpha(box.borderColor));
+    ? fillCanProduceVisiblePixels(box.borderFill)
+    : box.borderColor != null
+      && fillCanProduceVisiblePixels({ fillType: 'solid', color: box.borderColor }));
   return hasFill || hasBorder;
 }
 

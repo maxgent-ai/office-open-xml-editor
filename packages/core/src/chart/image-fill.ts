@@ -3,6 +3,7 @@ import type {
   ChartDataPointOverride, ChartExElementStyle, ChartModel, ChartSeries, ChartStockBarPaint,
 } from '../types/chart.js';
 import { drawImageCropped, imageNaturalSize, srcRectHasVisibleArea } from '../image/crop.js';
+import { fillCanProduceVisiblePixels } from '../shape/paint.js';
 import { EMU_PER_PT, PT_TO_PX } from '../units.js';
 import { computeBoxWhiskerStats } from './box-whisker.js';
 import {
@@ -191,7 +192,7 @@ function chartImageTileStaticMetrics(fill: ImageFill): ChartImageTileStaticMetri
 /** Return the synchronously preloaded source for a validated chart image fill.
  * Kept internal to chart modules; hosts still own all fetch/decode work. */
 export function chartImageFillSource(fill: ImageFill): CanvasImageSource | null {
-  if (!imageFillModeIsPaintable(fill)) return null;
+  if (!fillCanProduceVisiblePixels(fill) || !imageFillModeIsPaintable(fill)) return null;
   return activeLookup?.(fill) ?? null;
 }
 
@@ -270,7 +271,7 @@ export function chartImageFillPaintWork(
   ptToPx = PT_TO_PX,
 ): number {
   if (!(w > 0) || !(h > 0)) return 0;
-  if (!imageFillModeIsPaintable(fill)) return 0;
+  if (!fillCanProduceVisiblePixels(fill) || !imageFillModeIsPaintable(fill)) return 0;
   const image = (lookup ?? activeLookup)?.(fill);
   if (!image) return 0;
   if (!fill.tile) return 1;
@@ -291,7 +292,7 @@ export function chartImageFillPaintWorkUpperBound(
   ptToPx = PT_TO_PX,
 ): number {
   if (!(w > 0) || !(h > 0)) return 0;
-  if (!imageFillModeIsPaintable(fill)) return 0;
+  if (!fillCanProduceVisiblePixels(fill) || !imageFillModeIsPaintable(fill)) return 0;
   const image = (lookup ?? activeLookup)?.(fill);
   if (!image) return 0;
   if (!fill.tile) return 1;
@@ -372,7 +373,7 @@ export function chartImageFillUsageSize(
 }
 
 function chartImageFillOccurrence(fill: ImageFill): ChartImageFillOccurrence | null {
-  if (!imageFillModeIsPaintable(fill)) return null;
+  if (!fillCanProduceVisiblePixels(fill) || !imageFillModeIsPaintable(fill)) return null;
   const logicalWidth = fill.srcRect ? 1 - fill.srcRect.l - fill.srcRect.r : 1;
   const logicalHeight = fill.srcRect ? 1 - fill.srcRect.t - fill.srcRect.b : 1;
   if (!(Number.isFinite(logicalWidth) && logicalWidth > 0)
@@ -1186,9 +1187,10 @@ export function paintChartImageFill(
   ptToPx = PT_TO_PX,
   shapeRotationDeg = 0,
 ): boolean {
-  const image = activeLookup?.(fill);
-  if (!image || !(w > 0) || !(h > 0)) return false;
+  if (!fillCanProduceVisiblePixels(fill) || !(w > 0) || !(h > 0)) return false;
   if (!imageFillModeIsPaintable(fill)) return false;
+  const image = activeLookup?.(fill);
+  if (!image) return false;
   if (shapeRotationDeg !== 0 && fill.rotWithShape == null) return false;
   ctx.save();
   ctx.beginPath();

@@ -17526,6 +17526,48 @@ describe('CH6-follow — series trendlines (commit 3)', () => {
     expect(rec.strokeRects.some(rect => rect.ss === '#445566')).toBe(false);
   });
 
+  it('does not decode or select the callout role for an alpha-zero picture label', () => {
+    const picture = {
+      fillType: 'image' as const,
+      imagePath: 'xl/media/transparent-label.png',
+      mimeType: 'image/png',
+      stretch: true,
+      alpha: 0,
+    };
+    const model = baseModel({
+      chartType: 'clusteredBar',
+      categories: ['A'],
+      series: [series({
+        values: [1],
+        seriesDataLabels: {
+          showVal: true, showCatName: false, showSerName: false, showPercent: false,
+          labelBox: { fillPaint: picture, fillPaintAuthored: true },
+        },
+      })],
+      chartStyleRoles: {
+        dataLabel: { fontColor: '112233' },
+        dataLabelCallout: {
+          fontColor: 'AABBCC',
+          fillColors: ['FFFFFF'],
+          lineColors: ['445566'],
+          lineWidthEmu: 25_400,
+        },
+      },
+    });
+    expect(collectChartMarkerImageFills(model)).toEqual([]);
+    const lookup = vi.fn(() => ({ width: 8, height: 8 } as unknown as CanvasImageSource));
+    expect(chartLabelPaintWorkCount(model, undefined, lookup, 1, RECT)).toBe(0);
+    expect(lookup).not.toHaveBeenCalled();
+    const rec = recordingCtx();
+    renderChartCore(rec.ctx, model, RECT, 1, 0, testThreeD, undefined, lookup);
+
+    expect(lookup).not.toHaveBeenCalled();
+    expect(rec.texts.some(text => text.text === '1' && text.fillStyle === '#112233')).toBe(true);
+    expect(rec.texts.some(text => text.text === '1' && text.fillStyle === '#AABBCC')).toBe(false);
+    expect(rec.rects.some(rect => rect.fs === '#FFFFFF')).toBe(false);
+    expect(rec.strokeRects.some(rect => rect.ss === '#445566')).toBe(false);
+  });
+
   it('does not turn an ordinary indexed data label into a linked callout', () => {
     const rec = recordingCtx();
     renderChart(rec.ctx, baseModel({
@@ -22356,6 +22398,47 @@ describe('CH15 — chartEx sunburst', () => {
       ],
     };
     expect(chartExHierarchyLabelPaintWorkCount(sparse)).toBe(4096);
+  });
+
+  it('does not decode, charge, or select callout styling for alpha-zero hierarchy pictures', () => {
+    const picture = {
+      fillType: 'image' as const,
+      imagePath: 'xl/media/transparent-hierarchy-label.png',
+      mimeType: 'image/png',
+      stretch: true,
+      alpha: 0,
+    };
+    const model = sunburstModel({
+      series: [series({
+        values: [1],
+        seriesDataLabels: {
+          showVal: false,
+          showCatName: true,
+          showSerName: false,
+          showPercent: false,
+          labelBox: { fillPaint: picture, fillPaintAuthored: true },
+        },
+      })],
+      chartStyleRoles: {
+        dataLabel: { fontColor: '112233' },
+        dataLabelCallout: {
+          fontColor: 'AABBCC',
+          fillColors: ['FFFFFF'],
+          lineColors: ['445566'],
+        },
+      },
+    });
+    const lookup = vi.fn(() => ({ width: 8, height: 8 } as unknown as CanvasImageSource));
+    expect(collectChartMarkerImageFills(model)).toEqual([]);
+    expect(chartExHierarchyLabelPaintWorkCount(model, lookup, RECT)).toBe(0);
+    expect(lookup).not.toHaveBeenCalled();
+
+    const rec = ringRecordingCtx();
+    renderChartCore(rec.ctx, model, RECT, 1, 0, testThreeD, undefined, lookup, testChartEx);
+    expect(lookup).not.toHaveBeenCalled();
+    expect(rec.fontTexts.some(text => text.fill === '#112233')).toBe(true);
+    expect(rec.fontTexts.some(text => text.fill === '#AABBCC')).toBe(false);
+    expect(rec.fills).not.toContain('#FFFFFF');
   });
 
   it.each([
