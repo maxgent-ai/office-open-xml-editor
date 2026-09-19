@@ -1909,8 +1909,8 @@ export function lineBoxHeight(
       return Math.max(glyphNatural, pitchPx * ls.value);
     }
     if (hasInlineImage && ls.value >= 1) {
-      // Office-produced 5/10/20/28.346/50pt picture sweeps at 1.0, 1.079 and
-      // 1.15 line multiples establish this composition: first form the natural
+      // Office-produced 5–255pt picture sweeps at 1.0, 1.079 and 1.15 line
+      // multiples establish this composition: first form the natural
       // baseline union, floor it to one text design line, then add only the
       // text line's authored leading. Multiplying the whole picture made the
       // error grow with object height. ECMA-376 §17.3.1.33 specifies the auto

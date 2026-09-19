@@ -49,8 +49,13 @@ import {
   visitChartExHierarchyLabelSites,
 } from './chart-ex-hierarchy-labels.js';
 import { chartImageFillPaintWorkUpperBound, type ChartImageLookup } from './image-fill.js';
-import { effectiveChartLabelBoxFill } from './label-box.js';
-import { chartStyleLineDecision } from './style-paint.js';
+import { chartLabelBoxHasVisiblePaint, effectiveChartLabelBoxFill } from './label-box.js';
+import { rawLinkedChartStyleRole } from './effective-style.js';
+import {
+  chartStyleDirectLineDecision,
+  chartStyleDirectNoLineDecision,
+  chartStyleLineDecision,
+} from './style-paint.js';
 import { planWaterfallPaintSites } from './waterfall-plan.js';
 import { paintPlotAreaFrame } from './plot-area-frame.js';
 import { chartStyleEffectOwner, paintChartStyleEffects } from './style-effects.js';
@@ -118,20 +123,13 @@ function waterfallPointPaint(
     const pointStyle = point?.fillHidden === true
       ? { ...point.chartexStyle, fillHidden: true, fillPaintAuthored: true }
       : point?.chartexStyle;
-    return chartExMarkerPaint(
+    return chartExDataPointPaint(
       chart, semanticIndex, 3, pointStyle, point?.color,
-      // Prevent an authored-but-unresolved point paint from reviving a lower
-      // Chart Style or semantic fill.
-      { fillHidden: true, fillPaintAuthored: true },
     );
   }
   if (series?.chartexStyle?.fillPaintAuthored === true) {
-    return chartExMarkerPaint(
+    return chartExDataPointPaint(
       chart, semanticIndex, 3, series.chartexStyle, series.color,
-      // An explicitly authored CT_Series fill choice owns unresolved/noFill;
-      // the legacy fillHidden-only public shape lacks that provenance and is
-      // intentionally handled by chartExDataPointPaint below.
-      { fillHidden: true, fillPaintAuthored: true },
     );
   }
   // CT_Series.spPr formats the series carrier. ChartEx semantic data points
@@ -172,20 +170,28 @@ export function chartExHierarchyLabelPaintWorkCount(
   const destinationHeight = Math.max(1, chartRect?.h ?? 16 * ptToPx);
   const result = visitChartExHierarchyLabelSites(chart, ({ label, linkedStyleIndex }) => {
     const direct = label.labelBox;
-    const linked = direct != null
+    const usesCalloutRole = chartLabelBoxHasVisiblePaint(direct);
+    const linked = usesCalloutRole
       ? chart.chartStyleRoles?.dataLabelCallout ?? chart.chartStyleRoles?.dataLabel
       : chart.chartStyleRoles?.dataLabel;
+    const rawLinked = usesCalloutRole
+      ? rawLinkedChartStyleRole(chart, 'dataLabelCallout')
+        ?? rawLinkedChartStyleRole(chart, 'dataLabel')
+      : rawLinkedChartStyleRole(chart, 'dataLabel');
     const fill = effectiveChartLabelBoxFill(
-      direct, linked, linked != null, 0, linkedStyleIndex,
+      direct, linked, rawLinked, linked != null, 0, linkedStyleIndex,
     )?.fillPaint;
-    const directLine = chartStyleLineDecision(direct?.style, 0);
-    const directAuthorsLine = direct?.borderPaintAuthored === true
-      || direct?.borderHidden === true || direct?.borderColor != null
-      || direct?.borderFill != null || directLine !== undefined;
+    const directLine = chartStyleDirectLineDecision(direct?.style, rawLinked, 0);
+    const directNoLine = direct?.borderHidden === true
+      ? chartStyleDirectNoLineDecision(rawLinked) : undefined;
+    const directAuthorsLine = direct?.borderColor != null
+      || direct?.borderFill != null || directLine !== undefined
+      || directNoLine !== undefined
+      || direct?.borderPaintAuthored === true && direct?.borderHidden !== true;
     const border = directLine !== undefined
       ? directLine
-      : direct?.borderHidden === true
-        ? null
+      : directNoLine !== undefined
+        ? directNoLine
         : direct?.borderFill ?? (direct?.borderColor
           ? { fillType: 'solid' as const, color: direct.borderColor }
           : directAuthorsLine ? null : chartStyleLineDecision(linked, linkedStyleIndex));

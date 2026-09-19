@@ -4,8 +4,16 @@ import type {
   ChartSeries,
 } from '../types/chart.js';
 import type { Fill } from '../types/common.js';
-import { chartDataPointStyleRole, chartSeriesVariesByPoint } from './effective-style.js';
-import { chartStyleFillCascade, chartStyleFillDecision } from './style-paint.js';
+import {
+  chartDataPointStyleRole,
+  chartSeriesVariesByPoint,
+  rawLinkedChartStyleRole,
+} from './effective-style.js';
+import {
+  chartStyleDirectFillDecision,
+  chartStyleDirectNoFillDecision,
+  chartStyleFillCascade,
+} from './style-paint.js';
 
 export function threeDDatumStyleIndex(
   chart: ChartModel,
@@ -32,15 +40,25 @@ export function chartThreeDDatumFillDecision(
 ): Fill | null | undefined {
   const styleIndex = threeDDatumStyleIndex(chart, series, pointIndex, seriesIndex);
   const linked = chartDataPointStyleRole(chart, 'dataPoint3D', seriesIndex);
-  const pointDecision = chartStyleFillDecision(point?.chartexStyle, pointIndex);
+  const rawLinked = rawLinkedChartStyleRole(chart, 'dataPoint3D');
+  const pointDecision = chartStyleDirectFillDecision(
+    point?.chartexStyle, rawLinked, pointIndex,
+  );
   if (pointDecision !== undefined) return pointDecision;
-  if (point?.fillHidden === true || point?.color === '00000000') return null;
+  if (point?.fillHidden === true) {
+    const noFill = chartStyleDirectNoFillDecision(rawLinked);
+    if (noFill !== undefined) return noFill;
+  }
+  if (point?.color === '00000000') return null;
   if (point?.color) return { fillType: 'solid', color: point.color };
 
-  const seriesDecision = chartStyleFillDecision(series.chartexStyle, styleIndex);
+  const seriesDecision = chartStyleDirectFillDecision(
+    series.chartexStyle, rawLinked, styleIndex,
+  );
   if (seriesDecision !== undefined) return seriesDecision;
   return chartStyleFillCascade(
     linked,
+    rawLinked,
     styleIndex,
     point?.chartexStyle,
     series.chartexStyle,

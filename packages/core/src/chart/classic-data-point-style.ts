@@ -2,10 +2,14 @@ import type { Fill } from '../types/common.js';
 import type { ChartDataPointOverride, ChartModel, ChartSeries } from '../types/chart.js';
 import {
   chartDataPointStyleRole,
+  rawLinkedChartStyleRole,
   chartSeriesSourceIndex,
   chartStyleDashChoice,
 } from './effective-style.js';
 import {
+  chartStyleDirectFillDecision,
+  chartStyleDirectLineDecision,
+  chartStyleDirectNoFillDecision,
   chartStyleFillDecision,
   chartStyleLineDecision,
 } from './style-paint.js';
@@ -35,16 +39,29 @@ export function classicDataPointLineStyle(
   const linkedStyle = chartDataPointStyleRole(
     chart, role, sourceSeriesIndex >= 0 ? sourceSeriesIndex : styleIndex,
   ) ?? (role === 'dataPoint' ? chart.chartexDataPointStyle : chart.chartexDataPointLineStyle);
+  const rawLinked = rawLinkedChartStyleRole(chart, role);
 
-  let paint = chartStyleLineDecision(pointStyle, point?.idx ?? styleIndex);
+  // Classic `<c:dPt>` / `<c:ser>` `spPr/a:ln/a:noFill` removes the chart
+  // mark's own outline or connecting line. That semantic visibility decision
+  // happens before a Chart Style role supplies the formatting of a line that
+  // still exists: Excel keeps marker-only scatter series and borderless pie
+  // points borderless even when the linked dataPointLine/dataPoint entry has
+  // paint and no `allowNoLineOverride` modifier. By contrast, a no-line value
+  // coming from a structured style layer is a replacement while resolving
+  // CT_StyleEntry and remains modifier-gated below.
+  let paint = point?.lineHidden === true
+    ? null
+    : chartStyleDirectLineDecision(pointStyle, rawLinked, point?.idx ?? styleIndex);
   if (paint === undefined) {
-    if (point?.lineHidden === true) paint = null;
-    else if (point?.lineColor) paint = { fillType: 'solid', color: point.lineColor };
+    if (point?.lineColor) paint = { fillType: 'solid', color: point.lineColor };
   }
-  if (paint === undefined) paint = chartStyleLineDecision(seriesStyle, styleIndex);
   if (paint === undefined) {
-    if (series.lineHidden === true) paint = null;
-    else if (series.lineColor) paint = { fillType: 'solid', color: series.lineColor };
+    paint = series.lineHidden === true
+      ? null
+      : chartStyleDirectLineDecision(seriesStyle, rawLinked, styleIndex);
+  }
+  if (paint === undefined) {
+    if (series.lineColor) paint = { fillType: 'solid', color: series.lineColor };
   }
   if (paint === undefined) paint = chartStyleLineDecision(linkedStyle, styleIndex);
 
@@ -84,15 +101,24 @@ export function classicDataPointFillDecision(
   const linkedRole = chartDataPointStyleRole(
     chart, 'dataPoint', sourceSeriesIndex >= 0 ? sourceSeriesIndex : styleIndex,
   ) ?? chart.chartexDataPointStyle;
-  const pointDecision = chartStyleFillDecision(point?.chartexStyle, point?.idx ?? styleIndex);
+  const rawLinked = rawLinkedChartStyleRole(chart, 'dataPoint');
+  const pointDecision = chartStyleDirectFillDecision(
+    point?.chartexStyle, rawLinked, point?.idx ?? styleIndex,
+  );
   if (pointDecision !== undefined) return pointDecision;
-  if (point?.fillHidden === true || point?.color === '00000000') return null;
+  if (point?.fillHidden === true) {
+    const noFill = chartStyleDirectNoFillDecision(rawLinked);
+    if (noFill !== undefined) return noFill;
+  }
+  if (point?.color === '00000000') return null;
   if (point?.color) return { fillType: 'solid', color: point.color };
   const indexedPointColor = pointIndex != null ? series.dataPointColors?.[pointIndex] : null;
   if (indexedPointColor === '00000000') return null;
   if (indexedPointColor) return { fillType: 'solid', color: indexedPointColor };
 
-  const seriesDecision = chartStyleFillDecision(series.chartexStyle, styleIndex);
+  const seriesDecision = chartStyleDirectFillDecision(
+    series.chartexStyle, rawLinked, styleIndex,
+  );
   if (seriesDecision !== undefined) return seriesDecision;
   if (series.color === '00000000') return null;
   if (series.fillPattern) return series.fillPattern;

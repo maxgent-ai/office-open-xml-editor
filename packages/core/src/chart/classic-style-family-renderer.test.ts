@@ -88,7 +88,7 @@ function recordingContext(): {
 }
 
 describe('classic chart style family wiring', () => {
-  it('indexes a lone varyColors bar by point and preserves direct noFill', () => {
+  it('indexes a lone varyColors bar by point and honors permitted direct noFill', () => {
     const rec = recordingContext();
     renderChart(rec.ctx, model({
       chartType: 'clusteredBar',
@@ -101,6 +101,7 @@ describe('classic chart style family wiring', () => {
         dataPoint: {
           fillColors: ['888888', 'AA0000', '00AA00', '0000AA'],
           fillFormattingIndices: [8, 0, 1, 2],
+          allowNoFillOverride: true,
         },
       },
     }), RECT, 1);
@@ -217,7 +218,7 @@ describe('classic chart style family wiring', () => {
     expect(rec.strokes).toContain('#A1B2C3');
   });
 
-  it('keeps direct line paint and noFill above dataPointLine style paint', () => {
+  it('keeps positive direct line paint above linked style and gates style-layer noFill by its modifier', () => {
     const direct = recordingContext();
     renderChart(direct.ctx, model({
       series: [series({ lineColor: 'CC3300', showMarker: false })],
@@ -228,10 +229,63 @@ describe('classic chart style family wiring', () => {
 
     const hidden = recordingContext();
     renderChart(hidden.ctx, model({
-      series: [series({ lineHidden: true, showMarker: false })],
+      series: [series({ chartexStyle: { lineHidden: true }, showMarker: false })],
       chartStyleRoles: { dataPointLine: { lineColors: ['A1B2C3'] } },
     }), RECT, 1);
-    expect(hidden.strokes).not.toContain('#A1B2C3');
+    expect(hidden.strokes).toContain('#A1B2C3');
+
+    const permitted = recordingContext();
+    renderChart(permitted.ctx, model({
+      series: [series({ chartexStyle: { lineHidden: true }, showMarker: false })],
+      chartStyleRoles: {
+        dataPointLine: {
+          lineColors: ['A1B2C3'],
+          allowNoLineOverride: true,
+        },
+      },
+    }), RECT, 1);
+    expect(permitted.strokes).not.toContain('#A1B2C3');
+
+    const numericOnly = recordingContext();
+    renderChart(numericOnly.ctx, model({
+      series: [series({ chartexStyle: { lineHidden: true }, showMarker: false })],
+      classicChartStyleRoles: {
+        dataPointLine: { lineColors: ['A1B2C3'] },
+      },
+      linkedChartStyleRoles: {},
+    }), RECT, 1);
+    expect(numericOnly.strokes).not.toContain('#A1B2C3');
+  });
+
+  it('does not let linked paint revive classic series or point lines removed by direct spPr', () => {
+    const markerOnly = recordingContext();
+    renderChart(markerOnly.ctx, model({
+      chartType: 'scatter',
+      scatterStyle: 'lineMarker',
+      series: [series({
+        categories: ['1', '2', '3'],
+        lineHidden: true,
+        showMarker: true,
+      })],
+      chartStyleRoles: { dataPointLine: { lineColors: ['A1B2C3'] } },
+      linkedChartStyleRoles: { dataPointLine: { lineColors: ['A1B2C3'] } },
+    }), RECT, 1);
+    expect(markerOnly.strokes).not.toContain('#A1B2C3');
+
+    const borderlessSlice = recordingContext();
+    renderChart(borderlessSlice.ctx, model({
+      chartType: 'pie',
+      varyColors: true,
+      series: [series({
+        values: [1, 2, 3],
+        dataPointOverrides: [{ idx: 1, lineHidden: true }],
+      })],
+      chartStyleRoles: { dataPoint: { lineColors: ['A1B2C3'] } },
+      linkedChartStyleRoles: { dataPoint: { lineColors: ['A1B2C3'] } },
+    }), RECT, 1);
+    // The style still outlines the other two slices, but the direct no-line
+    // point must remove one of the three linked outlines.
+    expect(borderlessSlice.strokes.filter(color => color === '#A1B2C3')).toHaveLength(2);
   });
 
   it.each(['area', 'bar combo'] as const)(

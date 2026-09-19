@@ -119,7 +119,11 @@ it('prefetches only visible legend and label-frame picture fills after style pre
     legendFill: legendPicture,
     legendFillPaintAuthored: true,
     chartStyleRoles: {
-      dataLabel: { fillPaints: [dataLabelPicture], fillPaintAuthored: true },
+      dataLabel: {
+        fillPaints: [dataLabelPicture],
+        fillPaintAuthored: true,
+        allowNoFillOverride: true,
+      },
       trendlineLabel: { fillPaints: [trendlinePicture], fillPaintAuthored: true },
       axisTitle: { fillPaints: [axisTitlePicture], fillPaintAuthored: true },
     },
@@ -1816,6 +1820,8 @@ describe('chart-space background', () => {
           lineCompound: 'dbl',
           lineCap: 'sq',
           lineJoin: 'bevel',
+          allowNoFillOverride: true,
+          allowNoLineOverride: true,
         },
       },
     });
@@ -1837,6 +1843,25 @@ describe('chart-space background', () => {
     expect(directEmptyDash.strokeRects.find(rect => rect.ss === '#445566')?.dash)
       .toEqual([]);
 
+    const blockedNoFill = recordingCtx();
+    renderChart(blockedNoFill.ctx, {
+      ...chart,
+      chartStyleRoles: {
+        chartArea: {
+          ...chart.chartStyleRoles!.chartArea,
+          allowNoFillOverride: false,
+          allowNoLineOverride: false,
+        },
+      },
+      chartBg: null,
+      chartFillHidden: true,
+      chartFillPaintAuthored: true,
+      chartBorderHidden: true,
+      chartBorderPaintAuthored: true,
+    }, RECT, 1);
+    expect(blockedNoFill.gradients).toHaveLength(1);
+    expect(blockedNoFill.strokeRects.some(rect => rect.ss === '#445566')).toBe(true);
+
     const directNoFill = recordingCtx();
     renderChart(directNoFill.ctx, {
       ...chart,
@@ -1849,6 +1874,23 @@ describe('chart-space background', () => {
     expect(directNoFill.gradients).toHaveLength(0);
     expect(directNoFill.rects).toHaveLength(0);
     expect(directNoFill.strokeRects).toHaveLength(0);
+
+    const numericOnly = recordingCtx();
+    renderChart(numericOnly.ctx, {
+      ...chart,
+      classicChartStyleRoles: {
+        chartArea: chart.chartStyleRoles!.chartArea!,
+      },
+      linkedChartStyleRoles: {},
+      chartStyleRoles: undefined,
+      chartBg: null,
+      chartFillHidden: true,
+      chartFillPaintAuthored: true,
+      chartBorderHidden: true,
+      chartBorderPaintAuthored: true,
+    }, RECT, 1);
+    expect(numericOnly.gradients).toHaveLength(0);
+    expect(numericOnly.strokeRects).toHaveLength(0);
   });
 });
 
@@ -2946,7 +2988,11 @@ describe('classic 3-D compatibility projection', () => {
       categories: ['A', 'B'],
       valAxisMajorGridlines: false,
       chartStyleRoles: {
-        floor: { fillPaints: [gradient], fillPaintAuthored: true },
+        floor: {
+          fillPaints: [gradient],
+          fillPaintAuthored: true,
+          allowNoFillOverride: true,
+        },
         wall: { fillPaints: [gradient], fillPaintAuthored: true },
       },
       threeD: {
@@ -3015,6 +3061,8 @@ describe('classic 3-D compatibility projection', () => {
             linePaints: [gradient],
             linePaintAuthored: true,
             lineWidthEmu: 12_700,
+            allowNoFillOverride: true,
+            allowNoLineOverride: true,
           },
         },
         threeD: { rotationX: 15, rotationY: 20, perspective: 30 },
@@ -6760,6 +6808,8 @@ describe('bar chart authored layout and fills', () => {
           lineCompound: 'dbl',
           lineCap: 'sq',
           lineJoin: 'bevel',
+          allowNoFillOverride: true,
+          allowNoLineOverride: true,
         },
       },
     });
@@ -6830,6 +6880,8 @@ describe('bar chart authored layout and fills', () => {
           lineCompound: 'dbl',
           lineCap: 'sq',
           lineJoin: 'bevel',
+          allowNoFillOverride: true,
+          allowNoLineOverride: true,
         },
       },
     });
@@ -9803,6 +9855,8 @@ describe('ChartEx flat layouts dispatch to semantic renderers', () => {
       chartexDataPointStyle: {
         fillColors: ['E46970', '8977D7', 'A5A5A5'],
         fillPaintAuthored: true,
+        allowNoFillOverride: true,
+        allowNoLineOverride: true,
       },
       series: [series({
         values: [245, 235, -52, -40, -108, 280],
@@ -9832,6 +9886,7 @@ describe('ChartEx flat layouts dispatch to semantic renderers', () => {
     localStyle: ChartSeries['chartexStyle'],
     linkedStyle: ChartModel['chartexDataPointStyle'] = {
       lineColors: ['AA0000'], lineWidthEmu: 12700,
+      allowNoLineOverride: true,
     },
   ): ChartModel => {
     const owner = series({
@@ -11800,7 +11855,13 @@ describe('CH9 — line/area draw per-series error bars (§21.2.2.20)', () => {
           hidden,
         }],
       })],
-      chartStyleRoles: { errorBar: { lineColors: ['AABBCC'], lineHidden: roleHidden } },
+      chartStyleRoles: {
+        errorBar: {
+          lineColors: ['AABBCC'],
+          lineHidden: roleHidden,
+          allowNoLineOverride: true,
+        },
+      },
     });
     for (const model of [make(true, false), make(undefined, true)]) {
       const rec = segRecordingCtx();
@@ -17164,6 +17225,8 @@ describe('CH6-follow — series trendlines (commit 3)', () => {
           textRotation: 5_400_000,
           fillPaints: [{ fillType: 'solid', color: 'FF0000' }],
           lineColors: ['445566'],
+          allowNoFillOverride: true,
+          allowNoLineOverride: true,
         },
       },
     }, RECT, 1);
@@ -17311,7 +17374,7 @@ describe('CH6-follow — series trendlines (commit 3)', () => {
         values: [1, 1],
         seriesDataLabels: {
           showVal: false, showCatName: true, showSerName: false, showPercent: false,
-          labelBox: {},
+          labelBox: { borderColor: '010101' },
         },
       })],
       chartStyleRoles: {
@@ -17336,7 +17399,39 @@ describe('CH6-follow — series trendlines (commit 3)', () => {
     expect(labels.every(text => text.font?.includes('italic'))).toBe(true);
     expect(rec.rotations).toContainEqual(Math.PI / 4);
     expect(rec.gradients.length).toBeGreaterThan(0);
-    expect(rec.strokeRects).toContainEqual(expect.objectContaining({ ss: '#445566', lw: 2 }));
+    expect(rec.strokeRects).toContainEqual(expect.objectContaining({ ss: '#010101', lw: 2 }));
+  });
+
+  it('keeps transparent label spPr on the ordinary data-label role', () => {
+    const rec = recordingCtx();
+    renderChart(rec.ctx, baseModel({
+      chartType: 'clusteredBar',
+      categories: ['A'],
+      series: [series({
+        values: [1],
+        seriesDataLabels: {
+          showVal: true, showCatName: false, showSerName: false, showPercent: false,
+          labelBox: {
+            fillHidden: true,
+            fillPaintAuthored: true,
+            borderHidden: true,
+            borderPaintAuthored: true,
+          },
+        },
+      })],
+      chartStyleRoles: {
+        dataLabel: { fontColor: '112233' },
+        dataLabelCallout: {
+          fillColors: ['FFFFFF'],
+          lineColors: ['445566'],
+          lineWidthEmu: 25_400,
+        },
+      },
+    }), RECT, 1);
+
+    expect(rec.texts.some(text => text.text === '1' && text.fillStyle === '#112233')).toBe(true);
+    expect(rec.rects.some(rect => rect.fs === '#FFFFFF')).toBe(false);
+    expect(rec.strokeRects.some(rect => rect.ss === '#445566')).toBe(false);
   });
 
   it('does not turn an ordinary indexed data label into a linked callout', () => {
@@ -18528,7 +18623,13 @@ describe('CH13 — stock chart (high/low/close)', () => {
     const hidden = segRecordingCtx();
     renderChart(hidden.ctx, stockModel({
       stockHiLowLineStyle: { hidden: true },
-      chartStyleRoles: { hiLoLine: { lineColors: ['00AA00'], lineWidthEmu: 25400 } },
+      chartStyleRoles: {
+        hiLoLine: {
+          lineColors: ['00AA00'],
+          lineWidthEmu: 25400,
+          allowNoLineOverride: true,
+        },
+      },
     }), RECT, 1);
     expect(hidden.segs.some(segment => segment.ss === '#00AA00')).toBe(false);
 
@@ -18564,7 +18665,13 @@ describe('CH13 — stock chart (high/low/close)', () => {
     const hidden = segRecordingCtx();
     renderChart(hidden.ctx, stockModel({
       stockDropLines: { hidden: true },
-      chartStyleRoles: { dropLine: { lineColors: ['AABBCC'], lineWidthEmu: 25400 } },
+      chartStyleRoles: {
+        dropLine: {
+          lineColors: ['AABBCC'],
+          lineWidthEmu: 25400,
+          allowNoLineOverride: true,
+        },
+      },
     }), RECT, 1);
     expect(hidden.segs.some(segment => segment.ss === '#AABBCC')).toBe(false);
 
@@ -19594,7 +19701,12 @@ describe('surface contour charts', () => {
       valAxisMajorUnit: 10,
       surfaceWireframe: false,
       chartStyleRoles: {
-        dataPoint3D: { fillPaints: [gradient], fillPaintAuthored: true, lineHidden: true },
+        dataPoint3D: {
+          fillPaints: [gradient],
+          fillPaintAuthored: true,
+          lineHidden: true,
+          allowNoFillOverride: true,
+        },
       },
       surfaceBandFormats: [
         {
@@ -19715,7 +19827,11 @@ describe('surface contour charts', () => {
       valAxisMajorUnit: 10,
       surfaceWireframe: false,
       chartStyleRoles: {
-        floor: { fillPaints: [gradient], fillPaintAuthored: true },
+        floor: {
+          fillPaints: [gradient],
+          fillPaintAuthored: true,
+          allowNoFillOverride: true,
+        },
         wall: { fillPaints: [gradient], fillPaintAuthored: true },
       },
       threeD: {
@@ -22200,7 +22316,11 @@ describe('CH15 — chartEx sunburst', () => {
   it('honors explicit ChartEx series noFill over a visible linked outline', () => {
     const rec = ringRecordingCtx();
     renderChart(rec.ctx, sunburstModel({
-      chartexDataPointStyle: { lineColors: ['FFFFFF'], lineWidthEmu: 12700 },
+      chartexDataPointStyle: {
+        lineColors: ['FFFFFF'],
+        lineWidthEmu: 12700,
+        allowNoLineOverride: true,
+      },
       series: [series({ values: [], lineHidden: true })],
     }), RECT, 4 / 3);
 
@@ -22821,7 +22941,11 @@ describe('CH15 — chartEx treemap', () => {
     const model = treemapModel();
     model.chartBg = '112233';
     model.chartexTreemap!.parentLabelLayout = 'overlapping';
-    model.chartexDataPointStyle = { lineHidden: true, lineNoStyle: true };
+    model.chartexDataPointStyle = {
+      lineHidden: true,
+      lineNoStyle: true,
+      allowNoLineOverride: true,
+    };
     renderChart(rec.ctx, model, RECT, 1);
 
     const tiles = rec.rects.filter(rect => rect.fs !== '#112233');
@@ -22833,7 +22957,11 @@ describe('CH15 — chartEx treemap', () => {
     const rec = recordingCtx();
     const model = treemapModel();
     model.chartexTreemap!.parentLabelLayout = 'overlapping';
-    model.chartexDataPointStyle = { lineHidden: true, lineNoStyle: true };
+    model.chartexDataPointStyle = {
+      lineHidden: true,
+      lineNoStyle: true,
+      allowNoLineOverride: true,
+    };
     model.series[0].chartexStyle = { lineHidden: true };
     renderChart(rec.ctx, model, RECT, 1);
 

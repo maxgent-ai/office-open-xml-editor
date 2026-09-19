@@ -25,6 +25,7 @@ import {
   withChartEffectBudget,
 } from './style-effects.js';
 import {
+  chartLabelBoxHasVisiblePaint,
   effectiveChartLabelBoxFill,
   mergeChartLabelBoxes,
   paintChartLabelBox,
@@ -156,6 +157,7 @@ import {
   chartSeriesVariesByPoint,
   chartStyleDashChoice,
   effectiveChartStyleRole,
+  rawLinkedChartStyleRole,
   withChartStyleIndexCache,
   withEffectiveChartStyleRoles,
 } from './effective-style.js';
@@ -166,6 +168,10 @@ import { paintPlotAreaFrame } from './plot-area-frame.js';
 import {
   chartThreeDSurfacePaint,
   chartStyleColor,
+  chartStyleDirectFillDecision,
+  chartStyleDirectLineDecision,
+  chartStyleDirectNoFillDecision,
+  chartStyleDirectNoLineDecision,
   chartStyleFillCascade,
   chartStyleFillDecision,
   chartStyleFontColor,
@@ -639,6 +645,7 @@ export function drawAxisTitles(
       chart,
       directStyle ? { style: directStyle } : undefined,
       chart.chartStyleRoles?.axisTitle,
+      rawLinkedChartStyleRole(chart, 'axisTitle'),
       true,
     );
     if (side === 'left') {
@@ -1182,14 +1189,21 @@ function classicPointLegendMarker(
   const fallback = chartColor(sourceSeriesIndex, series).replace(/^#/, '');
   const styleIndex = series.chartexFormatIdx ?? sourceSeriesIndex;
   const linked = chartDataPointStyleRole(chart, 'dataPointMarker', sourceSeriesIndex);
+  const rawLinked = rawLinkedChartStyleRole(chart, 'dataPointMarker');
   const linkedIndex = chartSeriesVariesByPoint(chart, sourceSeriesIndex)
     ? pointIndex : styleIndex;
-  let pointFill = chartStyleFillDecision(point?.markerStyle, pointIndex);
-  let seriesFill = chartStyleFillDecision(series.markerStyle, styleIndex);
+  const pointFill = chartStyleDirectFillDecision(
+    point?.markerStyle, rawLinked, pointIndex,
+  );
+  const seriesFill = chartStyleDirectFillDecision(
+    series.markerStyle, rawLinked, styleIndex,
+  );
   const pointOwnsFill = pointFill !== undefined || point?.markerFill != null
-    || point?.markerFillPaint !== undefined || point?.markerFillPaintAuthored === true;
+    || point?.markerFillPaint !== undefined
+    || point?.markerFillPaintAuthored === true && point.markerStyle?.fillHidden !== true;
   const seriesOwnsFill = seriesFill !== undefined || series.markerFill != null
-    || series.markerFillPaint !== undefined || series.markerFillPaintAuthored === true;
+    || series.markerFillPaint !== undefined
+    || series.markerFillPaintAuthored === true && series.markerStyle?.fillHidden !== true;
   let fill = point
     ? markerFillColorFor(series, point, pointIndex, fallback)
     : seriesMarkerFillColor(series, fallback);
@@ -1210,19 +1224,25 @@ function classicPointLegendMarker(
     } else if (linkedFill !== undefined) fillPaint = linkedFill;
   }
 
-  let pointLine = chartStyleLineDecision(point?.markerStyle, pointIndex);
-  let seriesLine = chartStyleLineDecision(series.markerStyle, styleIndex);
+  const pointLine = chartStyleDirectLineDecision(
+    point?.markerStyle, rawLinked, pointIndex,
+  );
+  const seriesLine = chartStyleDirectLineDecision(
+    series.markerStyle, rawLinked, styleIndex,
+  );
   let line = point?.markerLine ?? series.markerLine ?? null;
   let linePaint: ChartModel['plotAreaLineFill'] | null | undefined;
   if (pointLine !== undefined) {
     if (pointLine?.fillType === 'solid') line = pointLine.color;
     else linePaint = pointLine;
-  } else if (point?.markerLinePaintAuthored === true && point.markerLine == null) {
+  } else if (point?.markerLinePaintAuthored === true
+    && point.markerStyle?.lineHidden !== true && point.markerLine == null) {
     linePaint = null;
   } else if (seriesLine !== undefined) {
     if (seriesLine?.fillType === 'solid') line = seriesLine.color;
     else linePaint = seriesLine;
-  } else if (series.markerLinePaintAuthored === true && series.markerLine == null) {
+  } else if (series.markerLinePaintAuthored === true
+    && series.markerStyle?.lineHidden !== true && series.markerLine == null) {
     linePaint = null;
   } else if (point?.markerLine == null && series.markerLine == null) {
     const linkedLine = chartStyleLineDecision(linked, linkedIndex);
@@ -2606,6 +2626,7 @@ function drawChartDisplayUnitLabels(
         chart,
         label.boxStyle,
         chart.chartStyleRoles?.axisTitle,
+        rawLinkedChartStyleRole(chart, 'axisTitle'),
         true,
       ),
       positioned,
@@ -2815,12 +2836,10 @@ function drawTrendlineLabel(
         h: naturalHeight,
       }
     : { x: placement.x, y: placement.y, w: placement.w, h: placement.h };
-  const labelBox = effectiveLinkedLabelBox(
-    chart,
-    tl.labelBox,
-    chart.chartStyleRoles?.trendlineLabel,
-    true,
-  );
+  // chartStyleRoleTrendlineLabel materializes the effective box before paint.
+  // Reapplying the linked role here would reinterpret an already-resolved
+  // fail-closed paint as a fresh direct noFill and could revive the fallback.
+  const labelBox = tl.labelBox;
   paintChartLabelBox(
     ctx,
     labelBox,
@@ -3464,6 +3483,7 @@ function drawSecondaryAxisTitle(
       chart,
       sec.titleStyle ? { style: sec.titleStyle } : undefined,
       chart.chartStyleRoles?.axisTitle,
+      rawLinkedChartStyleRole(chart, 'axisTitle'),
       true,
     ),
     ptToPx,
@@ -3568,6 +3588,7 @@ function drawSecondaryCategoryAxis(
         chart,
         axis.titleStyle ? { style: axis.titleStyle } : undefined,
         chart.chartStyleRoles?.axisTitle,
+        rawLinkedChartStyleRole(chart, 'axisTitle'),
         true,
       ),
       ptToPx,
@@ -3695,6 +3716,7 @@ function drawChartTitle(
     chart,
     chart.titleStyle ? { style: chart.titleStyle } : undefined,
     chart.chartStyleRoles?.title,
+    rawLinkedChartStyleRole(chart, 'title'),
     true,
   );
   const titlePtToPx = fontSize / Math.max(1, (chart.titleFontSizeHpt ?? 1_400) / 100);
@@ -5144,13 +5166,21 @@ export function renderBarChart(
           ? null
           : s.invertedFill
         : undefined;
-      const pointPaint = pointOverride?.fillHidden
-        ? null
-        : pointOverride?.color
-          ? { fillType: 'solid' as const, color: pointOverride.color }
-          : invertedPaint !== undefined
-            ? invertedPaint
-            : styleFill;
+      const rawDataPointStyle = rawLinkedChartStyleRole(chart, 'dataPoint');
+      const pointStructuredFill = chartStyleDirectFillDecision(
+        pointOverride?.chartexStyle, rawDataPointStyle, pointStyleIndex,
+      );
+      const pointNoFill = pointOverride?.fillHidden === true
+        ? chartStyleDirectNoFillDecision(rawDataPointStyle)
+        : undefined;
+      const pointOwnsFill = pointStructuredFill !== undefined
+        || pointNoFill !== undefined
+        || pointOverride?.color != null;
+      const pointPaint = pointOwnsFill
+        ? styleFill
+        : invertedPaint !== undefined
+          ? invertedPaint
+          : styleFill;
       const applyPointOutline = (target: CanvasRenderingContext2D): boolean => {
         const hasPointLine = pointOverride?.lineHidden != null
           || pointOverride?.lineColor != null
@@ -6108,16 +6138,19 @@ function chartStyleRoleLine(
         ),
       )
     : chart.chartStyleRoles?.[role];
+  const rawLinked = rawLinkedChartStyleRole(chart, role);
   const directPaintAuthored = direct.paintAuthored === true
     || direct.fill != null || direct.color != null || direct.hidden === true;
-  const directStyleLine = chartStyleLineDecision(direct.style, 0);
-  const lineDecision = direct.hidden === true ? null
+  const directStyleLine = chartStyleDirectLineDecision(direct.style, rawLinked, 0);
+  const directNoLine = direct.hidden === true
+    ? chartStyleDirectNoLineDecision(rawLinked) : undefined;
+  const lineDecision = directNoLine !== undefined ? directNoLine
     : direct.fill ?? (direct.color ? { fillType: 'solid' as const, color: direct.color }
       : directStyleLine !== undefined
         ? directStyleLine
-        : direct.paintAuthored === true
+        : direct.paintAuthored === true && direct.hidden !== true
         ? null
-        : chartStyleLineCascade(linked, 0, direct.style));
+        : chartStyleLineCascade(linked, rawLinked, 0, direct.style));
   const dash = chartStyleDashChoice(
     direct.dash != null ? { lineDash: direct.dash, lineDashAuthored: true } : undefined,
     direct.style,
@@ -6165,25 +6198,31 @@ function chartStyleRoleBarPaint(
         ),
       )
     : chart.chartStyleRoles?.[role];
+  const rawLinked = rawLinkedChartStyleRole(chart, role);
   const directFillAuthored = direct.fillPaintAuthored === true
     || direct.fillColor != null || direct.fill != null || direct.fillHidden === true;
   const directLineAuthored = direct.linePaintAuthored === true
     || direct.lineColor != null || direct.lineHidden === true;
-  const directStyleLine = chartStyleLineDecision(direct.style, 0);
-  const fillDecision = direct.fillHidden === true ? null
+  const directStyleFill = chartStyleDirectFillDecision(direct.style, rawLinked, 0);
+  const directStyleLine = chartStyleDirectLineDecision(direct.style, rawLinked, 0);
+  const directNoFill = direct.fillHidden === true
+    ? chartStyleDirectNoFillDecision(rawLinked) : undefined;
+  const directNoLine = direct.lineHidden === true
+    ? chartStyleDirectNoLineDecision(rawLinked) : undefined;
+  const fillDecision = directNoFill !== undefined ? directNoFill
     : direct.fill != null ? direct.fill
     : direct.fillColor != null ? { fillType: 'solid' as const, color: direct.fillColor }
-    : chartStyleFillDecision(direct.style, 0) !== undefined
-      ? chartStyleFillDecision(direct.style, 0)
-      : direct.fillPaintAuthored === true ? null
-      : chartStyleFillCascade(linked, 0, direct.style);
-  const lineDecision = direct.lineHidden === true ? null
+    : directStyleFill !== undefined
+      ? directStyleFill
+      : direct.fillPaintAuthored === true && direct.fillHidden !== true ? null
+      : chartStyleFillCascade(linked, rawLinked, 0, direct.style);
+  const lineDecision = directNoLine !== undefined ? directNoLine
     : direct.lineColor ? { fillType: 'solid' as const, color: direct.lineColor }
       : directStyleLine !== undefined
         ? directStyleLine
-        : direct.linePaintAuthored === true
+        : direct.linePaintAuthored === true && direct.lineHidden !== true
         ? null
-        : chartStyleLineCascade(linked, 0, direct.style);
+        : chartStyleLineCascade(linked, rawLinked, 0, direct.style);
   return {
     style: chartStyleEffectOwner(direct.style, linked),
     fillColor: fillDecision?.fillType === 'solid' ? fillDecision.color : null,
@@ -6303,6 +6342,7 @@ function chartStyleRoleDataTable(
   direct: NonNullable<ChartModel['dataTable']>,
 ): NonNullable<ChartModel['dataTable']> {
   const role = chart.chartStyleRoles?.dataTable;
+  const rawLinked = rawLinkedChartStyleRole(chart, 'dataTable');
   const linked = chartStyleRoleLine(chart, {
     style: direct.style,
     color: direct.lineColor,
@@ -6311,14 +6351,16 @@ function chartStyleRoleDataTable(
     dash: direct.lineDash,
     hidden: direct.lineHidden,
   }, 'dataTable');
-  const directStyleFill = chartStyleFillDecision(direct.style, 0);
-  const fillDecision = direct.fillHidden === true ? null
+  const directStyleFill = chartStyleDirectFillDecision(direct.style, rawLinked, 0);
+  const directNoFill = direct.fillHidden === true
+    ? chartStyleDirectNoFillDecision(rawLinked) : undefined;
+  const fillDecision = directNoFill !== undefined ? directNoFill
     : direct.fill ?? (direct.fillColor ? { fillType: 'solid' as const, color: direct.fillColor }
       : directStyleFill !== undefined
         ? directStyleFill
-        : direct.fillPaintAuthored === true
+        : direct.fillPaintAuthored === true && direct.fillHidden !== true
         ? null
-        : chartStyleFillCascade(role, 0, direct.style));
+        : chartStyleFillCascade(role, rawLinked, 0, direct.style));
   const fill = fillDecision != null && fillDecision.fillType !== 'solid'
     && fillDecision.fillType !== 'image' && fillDecision.fillType !== 'none'
     ? fillDecision : null;
@@ -6639,17 +6681,23 @@ function chartStyleRoleMarker(
   const linked = chartSeriesVariesByPoint(chart, index)
     ? undefined
     : chart.chartStyleRoles?.dataPointMarker;
+  const rawLinked = chartSeriesVariesByPoint(chart, index)
+    ? undefined
+    : rawLinkedChartStyleRole(chart, 'dataPointMarker');
   if (!isClassicMarkerSeries(chart, direct, group)
     || ((direct.showMarker === false || direct.markerSymbol === 'none')
       && !hasVisiblePointMarkerOverride(direct))) return direct;
   const styleIndex = chartExSeriesFormatIndex(direct, index);
-  const directStyleFill = chartStyleFillDecision(direct.markerStyle, styleIndex);
+  const directStyleFill = chartStyleDirectFillDecision(
+    direct.markerStyle, rawLinked, styleIndex,
+  );
   const directFillAuthored = direct.markerFillPaintAuthored === true
+      && direct.markerStyle?.fillHidden !== true
     || direct.markerFill != null || direct.markerFillPaint !== undefined
     || directStyleFill !== undefined;
   const effectiveFill = directFillAuthored
     ? directStyleFill
-    : chartStyleFillCascade(linked, styleIndex, direct.markerStyle);
+    : chartStyleFillCascade(linked, rawLinked, styleIndex, direct.markerStyle);
   const markerFill = direct.markerFill
     ?? (effectiveFill?.fillType === 'solid' ? effectiveFill.color
       : effectiveFill === null ? '00000000' : null);
@@ -6665,14 +6713,15 @@ function chartStyleRoleMarker(
     : effectiveFill !== undefined
       ? true
       : undefined;
+  const directStyleLine = chartStyleDirectLineDecision(
+    direct.markerStyle, rawLinked, styleIndex,
+  );
   const directLineAuthored = direct.markerLine != null
-    || direct.markerLinePaintAuthored === true
-    || direct.markerStyle?.linePaintAuthored === true
-    || direct.markerStyle?.lineHidden === true;
-  const directStyleLine = chartStyleLineDecision(direct.markerStyle, styleIndex);
+    || direct.markerLinePaintAuthored === true && direct.markerStyle?.lineHidden !== true
+    || directStyleLine !== undefined;
   const effectiveLine = directLineAuthored
     ? directStyleLine
-    : chartStyleLineCascade(linked, styleIndex, direct.markerStyle);
+    : chartStyleLineCascade(linked, rawLinked, styleIndex, direct.markerStyle);
   const markerLine = direct.markerLine
     ?? (effectiveLine?.fillType === 'solid' ? effectiveLine.color
       : effectiveLine === null ? '00000000'
@@ -6684,17 +6733,22 @@ function chartStyleRoleMarker(
   const markerSymbol = direct.markerSymbol ?? chart.chartStyleMarkerSymbol;
   const dataPointOverrides = direct.dataPointOverrides?.map(point => {
     if (!pointHasMarkerDetail(point)) return point;
-    const directPointStyleFill = chartStyleFillDecision(point.markerStyle, point.idx);
-    const directPointStyleLine = chartStyleLineDecision(point.markerStyle, point.idx);
+    const directPointStyleFill = chartStyleDirectFillDecision(
+      point.markerStyle, rawLinked, point.idx,
+    );
+    const directPointStyleLine = chartStyleDirectLineDecision(
+      point.markerStyle, rawLinked, point.idx,
+    );
     const pointFillAuthored = point.markerFillPaintAuthored === true
+        && point.markerStyle?.fillHidden !== true
       || point.markerFill != null || point.markerFillPaint !== undefined
       || directPointStyleFill !== undefined;
     const pointLineAuthored = point.markerLine != null
-      || point.markerLinePaintAuthored === true
+      || point.markerLinePaintAuthored === true && point.markerStyle?.lineHidden !== true
       || directPointStyleLine !== undefined;
     const linkedPointFill = !pointFillAuthored
       ? directFillAuthored ? effectiveFill
-          : chartStyleFillCascade(linked, styleIndex, direct.markerStyle)
+          : chartStyleFillCascade(linked, rawLinked, styleIndex, direct.markerStyle)
       : undefined;
     const nextFill = point.markerFill
       ?? (directPointStyleFill?.fillType === 'solid' ? directPointStyleFill.color
@@ -6787,27 +6841,55 @@ function effectiveFrameLineStyle(
   chart: ChartModel,
   direct: EffectiveFrameLineStyle,
   linked: ChartExStyle | null | undefined,
+  rawLinked: ChartExStyle | null | undefined,
   directIndex = 0,
   linkedIndex = directIndex,
 ): EffectiveFrameLineStyle {
   void chart;
   if (!linked) return direct;
   let { color, fill, hidden } = direct;
-  const directPaint = direct.paintAuthored === true
-    || fill != null || color != null || hidden === true;
+  const directNoLine = hidden === true
+    ? chartStyleDirectNoLineDecision(rawLinked) : undefined;
+  const directStyleLine = chartStyleDirectLineDecision(
+    direct.style, rawLinked, directIndex,
+  );
+  const directPaint = fill != null || color != null
+    || directNoLine !== undefined || directStyleLine !== undefined
+    || direct.paintAuthored === true && hidden !== true;
   const linkedPaint = linked.lineNoStyle !== true && (linked.linePaintAuthored === true
     || linked.lineHidden === true || linked.linePaints != null || linked.lineColors != null);
   if (!directPaint) {
-    let decision = chartStyleLineDecision(direct.style, directIndex);
-    if (decision === undefined) decision = chartStyleLineDecision(linked, linkedIndex);
+    const decision = chartStyleLineDecision(linked, linkedIndex);
     if (decision === null) {
       hidden = true;
     } else if (decision?.fillType === 'solid') {
       color = decision.color;
       fill = null;
+      hidden = null;
     } else if (decision !== undefined) {
       fill = decision;
       color = null;
+      hidden = null;
+    }
+  } else if (directNoLine !== undefined) {
+    hidden = true;
+    color = null;
+    fill = null;
+  } else if (fill != null || color != null) {
+    hidden = null;
+  } else if (fill == null && color == null) {
+    const decision = directStyleLine !== undefined
+      ? directStyleLine
+      : direct.paintAuthored === true ? null : undefined;
+    if (decision === null) hidden = true;
+    else if (decision?.fillType === 'solid') {
+      color = decision.color;
+      fill = null;
+      hidden = null;
+    } else if (decision !== undefined) {
+      fill = decision;
+      color = null;
+      hidden = null;
     }
   }
   let dash = direct.dash;
@@ -6837,13 +6919,14 @@ function effectiveLinkedLabelBox(
   chart: ChartModel,
   direct: ChartLabelBox | null | undefined,
   linked: ChartExStyle | null | undefined,
+  rawLinked: ChartExStyle | null | undefined,
   createFromLinked: boolean,
   linkedIndex = 0,
 ): ChartLabelBox | undefined {
   if (!linked || (!direct && !createFromLinked)) return direct ?? undefined;
   const source = direct ?? {};
   const effectiveFill = effectiveChartLabelBoxFill(
-    source, linked, createFromLinked, 0, linkedIndex,
+    source, linked, rawLinked, createFromLinked, 0, linkedIndex,
   );
   const line = effectiveFrameLineStyle(chart, {
     style: source.style,
@@ -6858,7 +6941,7 @@ function effectiveLinkedLabelBox(
     compound: source.borderCompound,
     hidden: source.borderHidden,
     paintAuthored: source.borderPaintAuthored,
-  }, linked, 0, linkedIndex);
+  }, linked, rawLinked, 0, linkedIndex);
   return {
     ...source,
     style: source.style,
@@ -6890,15 +6973,23 @@ function chartStyleRoleDataLabels(
   direct: ChartSeriesDataLabels,
   styleIndex: number,
 ): ChartSeriesDataLabels {
-  const linked = direct.labelBox
+  // A transparent dLbls/spPr is ordinary label formatting, not a request for
+  // Office's filled `dataLabelCallout` recipe. Select that role only when the
+  // directly authored box itself has visible paint.
+  const usesCalloutRole = chartLabelBoxHasVisiblePaint(direct.labelBox);
+  const linked = usesCalloutRole
     ? chart.chartStyleRoles?.dataLabelCallout ?? chart.chartStyleRoles?.dataLabel
     : chart.chartStyleRoles?.dataLabel;
+  const rawLinked = usesCalloutRole
+    ? rawLinkedChartStyleRole(chart, 'dataLabelCallout')
+      ?? rawLinkedChartStyleRole(chart, 'dataLabel')
+    : rawLinkedChartStyleRole(chart, 'dataLabel');
   // The role itself is a legitimate label-shape source. A paint-bearing
   // linked/numeric dataLabel role therefore materializes a box even when the
   // chart has no direct dLbls/spPr; an empty/no-style role still paints
   // nothing because the resulting carrier has no visible fill or outline.
   const labelBox = linked
-    ? effectiveLinkedLabelBox(chart, direct.labelBox, linked, true, styleIndex)
+    ? effectiveLinkedLabelBox(chart, direct.labelBox, linked, rawLinked, true, styleIndex)
     : direct.labelBox;
   const directFontPaint = direct.fontPaintAuthored === true
     || direct.fontColor != null || direct.fontHidden === true;
@@ -6949,6 +7040,7 @@ function chartStyleRoleTrendlineLabel(
   styleIndex: number,
 ): ChartTrendline {
   const linked = chart.chartStyleRoles?.trendlineLabel;
+  const rawLinked = rawLinkedChartStyleRole(chart, 'trendlineLabel');
   const directFontPaint = direct.labelFontPaintAuthored === true
     || direct.labelFontColor != null || direct.labelFontHidden === true;
   const textPaint = effectiveInheritedChartTextPaint(
@@ -6961,7 +7053,7 @@ function chartStyleRoleTrendlineLabel(
     // Materialize it before the chart-wide paint preflight so linked gradient
     // work is charged before any family starts painting.
     labelBox: linked
-      ? effectiveLinkedLabelBox(chart, direct.labelBox, linked, true, styleIndex)
+      ? effectiveLinkedLabelBox(chart, direct.labelBox, linked, rawLinked, true, styleIndex)
       : direct.labelBox,
     labelFontSizeHpt: direct.labelFontSizeHpt ?? chart.chartTextStyle?.fontSizeHpt
       ?? linked?.fontSizeHpt ?? undefined,
@@ -7007,17 +7099,26 @@ function chartStyleRoleDataLabelOverride(
   direct: ChartDataLabelOverride,
   seriesDirect: ChartSeriesDataLabels | null | undefined,
 ): ChartDataLabelOverride {
-  // `dataLabelCallout` is the style for a label that authors shape properties;
-  // an indexed `<dLbl>`/`<cx:dataLabel>` alone is still an ordinary data label.
-  // Applying the callout recipe merely because an indexed override exists
-  // invents a white box around every ordinary point label in Office styles.
-  const hasCalloutShape = direct.labelBox != null || seriesDirect?.labelBox != null;
+  // A visible directly-authored box opts into `dataLabelCallout`; a bare or
+  // transparent spPr remains an ordinary label. Applying the callout recipe
+  // merely because an indexed override exists invents a white box around
+  // ordinary point labels in Office styles.
+  const directAndSeriesBox = mergeChartLabelBoxes(
+    direct.labelBox, seriesDirect?.labelBox,
+  );
+  const hasCalloutShape = chartLabelBoxHasVisiblePaint(directAndSeriesBox);
   const linked = hasCalloutShape
     ? chart.chartStyleRoles?.dataLabelCallout ?? chart.chartStyleRoles?.dataLabel
     : chart.chartStyleRoles?.dataLabel;
-  const seriesAndLinkedBox = linked
-    ? effectiveLinkedLabelBox(chart, seriesDirect?.labelBox, linked, true, direct.idx)
-    : seriesDirect?.labelBox;
+  const rawLinked = hasCalloutShape
+    ? rawLinkedChartStyleRole(chart, 'dataLabelCallout')
+      ?? rawLinkedChartStyleRole(chart, 'dataLabel')
+    : rawLinkedChartStyleRole(chart, 'dataLabel');
+  const labelBox = linked
+    ? effectiveLinkedLabelBox(
+        chart, directAndSeriesBox, linked, rawLinked, true, direct.idx,
+      )
+    : directAndSeriesBox;
   const pointFontPaint = direct.fontPaintAuthored === true
     || direct.fontColor != null || direct.fontHidden === true;
   const seriesFontPaint = seriesDirect?.fontPaintAuthored === true
@@ -7071,29 +7172,35 @@ function chartStyleRoleDataLabelOverride(
       || chart.chartTextStyle?.textBodyAuthored === true
       || linked?.textBodyAuthored === true || undefined,
     textAlign: direct.textAlign ?? seriesDirect?.textAlign,
-    labelBox: mergeChartLabelBoxes(direct.labelBox, seriesAndLinkedBox),
+    labelBox,
   };
 }
 
 function chartStyleRoleLegend(chart: ChartModel): ChartModel {
   const linked = chart.chartStyleRoles?.legend;
+  const rawLinked = rawLinkedChartStyleRole(chart, 'legend');
   if (!linked && !chart.chartTextStyle) return chart;
   let legendFill = chart.legendFill;
   let legendFillColor = chart.legendFillColor;
   let legendFillHidden = chart.legendFillHidden;
   let legendFillPaintAuthored = chart.legendFillPaintAuthored;
-  const directFillPaint = chart.legendFillPaintAuthored === true
-    || legendFill != null || legendFillColor != null || legendFillHidden === true;
+  const directNoFill = legendFillHidden === true
+    ? chartStyleDirectNoFillDecision(rawLinked) : undefined;
+  const directFillPaint = legendFill != null || legendFillColor != null
+    || directNoFill !== undefined
+    || chart.legendFillPaintAuthored === true && legendFillHidden !== true;
   if (!directFillPaint) {
-    const decision = chartStyleFillCascade(linked, 0, chart.legendStyle);
+    const decision = chartStyleFillCascade(linked, rawLinked, 0, chart.legendStyle);
     if (decision === null) {
       legendFillHidden = true;
     } else if (decision?.fillType === 'solid') {
       legendFillColor = decision.color;
       legendFill = null;
+      legendFillHidden = null;
     } else if (decision !== undefined) {
       legendFill = decision;
       legendFillColor = null;
+      legendFillHidden = null;
     }
     if (decision !== undefined) {
       legendFillPaintAuthored = true;
@@ -7113,7 +7220,7 @@ function chartStyleRoleLegend(chart: ChartModel): ChartModel {
     compound: chart.legendLineCompound,
     hidden: chart.legendLineHidden,
     paintAuthored: chart.legendLinePaintAuthored,
-  }, linked);
+  }, linked, rawLinkedChartStyleRole(chart, 'legend'));
   const legendTextPaint = effectiveInheritedChartTextPaint(
     chart,
     chart.legendFontColor,
@@ -7232,24 +7339,32 @@ function chartStyleRolePlotArea(chart: ChartModel): ChartModel {
   const linked = chart.threeD
     ? chart.chartStyleRoles?.plotArea3D
     : chart.chartStyleRoles?.plotArea;
+  const rawLinked = rawLinkedChartStyleRole(
+    chart, chart.threeD ? 'plotArea3D' : 'plotArea',
+  );
   if (!linked) return chart;
   let plotAreaFill = chart.plotAreaFill;
   let plotAreaBg = chart.plotAreaBg;
   let plotAreaFillHidden = chart.plotAreaFillHidden;
   let plotAreaFillPaintAuthored = chart.plotAreaFillPaintAuthored;
-  const directPaint = chart.plotAreaFillPaintAuthored === true
-    || ((plotAreaFill != null || plotAreaBg != null) && chart.plotAreaFillAutomatic !== true)
-    || plotAreaFillHidden === true;
+  const directNoFill = plotAreaFillHidden === true
+    ? chartStyleDirectNoFillDecision(rawLinked) : undefined;
+  const directPaint = ((plotAreaFill != null || plotAreaBg != null)
+      && chart.plotAreaFillAutomatic !== true)
+    || directNoFill !== undefined
+    || chart.plotAreaFillPaintAuthored === true && plotAreaFillHidden !== true;
   if (!directPaint) {
-    const decision = chartStyleFillCascade(linked, 0, chart.plotAreaStyle);
+    const decision = chartStyleFillCascade(linked, rawLinked, 0, chart.plotAreaStyle);
     if (decision === null) {
       plotAreaFillHidden = true;
     } else if (decision?.fillType === 'solid') {
       plotAreaBg = decision.color;
       plotAreaFill = null;
+      plotAreaFillHidden = null;
     } else if (decision !== undefined) {
       plotAreaFill = decision;
       plotAreaBg = null;
+      plotAreaFillHidden = null;
     }
     if (decision !== undefined) {
       plotAreaFillPaintAuthored = true;
@@ -7269,7 +7384,9 @@ function chartStyleRolePlotArea(chart: ChartModel): ChartModel {
     compound: chart.plotAreaLineCompound,
     hidden: chart.plotAreaLineHidden,
     paintAuthored: chart.plotAreaLinePaintAuthored,
-  }, linked);
+  }, linked, rawLinkedChartStyleRole(
+    chart, chart.threeD ? 'plotArea3D' : 'plotArea',
+  ));
   if (plotAreaFill === chart.plotAreaFill
     && plotAreaBg === chart.plotAreaBg
     && plotAreaFillHidden === chart.plotAreaFillHidden
@@ -7307,15 +7424,18 @@ function chartStyleRolePlotArea(chart: ChartModel): ChartModel {
 
 function chartStyleRoleChartArea(chart: ChartModel): ChartModel {
   const linked = chart.chartStyleRoles?.chartArea;
+  const rawLinked = rawLinkedChartStyleRole(chart, 'chartArea');
   if (!linked) return chart;
   let chartFill = chart.chartFill;
   let chartBg = chart.chartBg;
   let chartFillHidden = chart.chartFillHidden;
   let chartFillPaintAuthored = chart.chartFillPaintAuthored;
-  const directPaint = chart.chartFillPaintAuthored === true
-    || chartFill != null || chartFillHidden === true;
+  const directNoFill = chartFillHidden === true
+    ? chartStyleDirectNoFillDecision(rawLinked) : undefined;
+  const directPaint = chartFill != null || directNoFill !== undefined
+    || chart.chartFillPaintAuthored === true && chartFillHidden !== true;
   if (!directPaint) {
-    const decision = chartStyleFillCascade(linked, 0, chart.chartAreaStyle);
+    const decision = chartStyleFillCascade(linked, rawLinked, 0, chart.chartAreaStyle);
     if (decision === null) {
       chartFill = null;
       chartBg = null;
@@ -7347,7 +7467,7 @@ function chartStyleRoleChartArea(chart: ChartModel): ChartModel {
     compound: chart.chartBorderCompound,
     hidden: chart.chartBorderHidden,
     paintAuthored: chart.chartBorderPaintAuthored,
-  }, linked);
+  }, linked, rawLinkedChartStyleRole(chart, 'chartArea'));
   if (chartFill === chart.chartFill
     && chartBg === chart.chartBg
     && chartFillHidden === chart.chartFillHidden
@@ -9689,9 +9809,18 @@ function renderSurfaceChart(
     { length: bandCount }, (_, index) => {
       const format = bandFormats.get(index);
       let decision: Fill | null | undefined;
-      if (format?.fillHidden === true) decision = null;
+      if (format?.fillHidden === true) {
+        decision = chartStyleDirectNoFillDecision(linkedBandStyle);
+      }
       else if (format?.fill) decision = format.fill;
-      else decision = chartStyleFillCascade(linkedBandStyle, index, format?.style);
+      else {
+        decision = chartStyleFillCascade(
+          linkedBandStyle, linkedBandStyle, index, format?.style,
+        );
+      }
+      if (decision === undefined && format?.fillHidden === true) {
+        decision = chartStyleFillDecision(linkedBandStyle, index);
+      }
       if (decision === undefined) decision = chartStyleFillDecision(numericBandStyle, index);
       return {
         recipe: decision,
@@ -9704,9 +9833,18 @@ function renderSurfaceChart(
     { length: bandCount }, (_, index) => {
       const format = bandFormats.get(index);
       let decision: ChartModel['plotAreaLineFill'] | null | undefined;
-      if (format?.lineHidden === true) decision = null;
+      if (format?.lineHidden === true) {
+        decision = chartStyleDirectNoLineDecision(linkedBandStyle);
+      }
       else if (format?.lineColor) decision = { fillType: 'solid', color: format.lineColor };
-      else decision = chartStyleLineCascade(linkedBandStyle, index, format?.style);
+      else {
+        decision = chartStyleLineCascade(
+          linkedBandStyle, linkedBandStyle, index, format?.style,
+        );
+      }
+      if (decision === undefined && format?.lineHidden === true) {
+        decision = chartStyleLineDecision(linkedBandStyle, index);
+      }
       if (decision === undefined) decision = chartStyleLineDecision(numericBandStyle, index);
       return decision;
     },
@@ -9781,11 +9919,15 @@ function renderSurfaceChart(
     };
   const firstSurfaceSeries = rows[0];
   let directSeriesPaint: ChartModel['plotAreaLineFill'] | null | undefined;
-  if (firstSurfaceSeries?.lineHidden === true) directSeriesPaint = null;
+  if (firstSurfaceSeries?.lineHidden === true) {
+    directSeriesPaint = chartStyleDirectNoLineDecision(linkedWireframeStyle);
+  }
   else if (firstSurfaceSeries?.lineColor != null) {
     directSeriesPaint = { fillType: 'solid', color: firstSurfaceSeries.lineColor };
   } else {
-    directSeriesPaint = chartStyleLineDecision(firstSurfaceSeries?.chartexStyle, 0);
+    directSeriesPaint = chartStyleDirectLineDecision(
+      firstSurfaceSeries?.chartexStyle, linkedWireframeStyle, 0,
+    );
   }
   const baseGeometry = styleGeometry(firstSurfaceSeries?.chartexStyle, linkedGeometry);
   const baseWireframeStyle: SurfaceWireframeLineStyle = {
@@ -9801,9 +9943,13 @@ function renderSurfaceChart(
   const directBandLineDecisions = Array.from({ length: bandCount }, (_, index) => {
     const format = bandFormats.get(index);
     if (!format) return undefined;
-    if (format.lineHidden === true) return null;
+    if (format.lineHidden === true) {
+      return chartStyleDirectNoLineDecision(linkedWireframeStyle);
+    }
     if (format.lineColor != null) return { fillType: 'solid' as const, color: format.lineColor };
-    const direct = chartStyleLineDecision(format.style, index);
+    const direct = chartStyleDirectLineDecision(
+      format.style, linkedWireframeStyle, index,
+    );
     return direct;
   });
   const wireframeLineStyles = directBandLineDecisions.map((directPaint, index) => {
@@ -13710,8 +13856,9 @@ function bubblePointFill(
       ? { color: 'FFFFFF', paint: undefined }
       : { color: '00000000', paint: null };
   }
-  const directPoint = chartExStylePaintDecision(
-    chart, point?.chartexStyle, pointIndex, series.values.length,
+  const rawLinked = rawLinkedChartStyleRole(chart, 'dataPoint');
+  const directPoint = chartStyleDirectFillDecision(
+    point?.chartexStyle, rawLinked, pointIndex,
   );
   if (directPoint !== undefined) {
     return {
@@ -13723,13 +13870,16 @@ function bubblePointFill(
   const linkedRole = chartDataPointStyleRole(chart, 'dataPoint', seriesIndex);
   const linkedIndex = chartSeriesVariesByPoint(chart, seriesIndex)
     ? pointIndex : seriesStyleIndex;
-  if (point?.fillHidden === true) return { color: '00000000', paint: null };
+  if (point?.fillHidden === true) {
+    const noFill = chartStyleDirectNoFillDecision(rawLinked);
+    if (noFill !== undefined) return { color: '00000000', paint: noFill };
+  }
   if (point?.color != null) return { color: point.color, paint: undefined };
   const pointColor = series.dataPointColors?.[pointIndex];
   if (pointColor != null) return { color: pointColor, paint: undefined };
 
-  const directSeries = chartExStylePaintDecision(
-    chart, series.chartexStyle, seriesStyleIndex, series.values.length,
+  const directSeries = chartStyleDirectFillDecision(
+    series.chartexStyle, rawLinked, seriesStyleIndex,
   );
   if (directSeries !== undefined) {
     return {
@@ -13775,6 +13925,7 @@ function bubblePointLine(
   const seriesStyle = series.chartexStyle;
   const seriesIndex = Math.max(0, chartSeriesSourceIndex(chart, series));
   const linkedStyle = chartDataPointStyleRole(chart, 'dataPoint', seriesIndex);
+  const rawLinked = rawLinkedChartStyleRole(chart, 'dataPoint');
   const linkedIndex = chartSeriesVariesByPoint(chart, seriesIndex)
     ? pointIndex : seriesStyleIndex;
   const linkedGeometry = linkedStyle;
@@ -13804,9 +13955,7 @@ function bubblePointLine(
     cap: pointStyle?.lineCap ?? seriesStyle?.lineCap ?? linkedGeometry?.lineCap,
     join: pointStyle?.lineJoin ?? seriesStyle?.lineJoin ?? linkedGeometry?.lineJoin,
   };
-  const pointPaint = chartExStyleLinePaintDecision(
-    chart, pointStyle, pointIndex, series.values.length,
-  );
+  const pointPaint = chartStyleDirectLineDecision(pointStyle, rawLinked, pointIndex);
   if (pointPaint !== undefined) {
     return {
       color: pointPaint?.fillType === 'solid' ? pointPaint.color : point?.lineColor ?? null,
@@ -13815,14 +13964,15 @@ function bubblePointLine(
     };
   }
   if (point?.lineHidden === true) {
-    return { color: null, paint: null, ...geometry };
+    const noLine = chartStyleDirectNoLineDecision(rawLinked);
+    if (noLine !== undefined) return { color: null, paint: noLine, ...geometry };
   }
   if (point?.lineColor != null) {
     return { color: point.lineColor, paint: undefined, ...geometry };
   }
 
-  const seriesPaint = chartExStyleLinePaintDecision(
-    chart, seriesStyle, seriesStyleIndex, series.values.length,
+  const seriesPaint = chartStyleDirectLineDecision(
+    seriesStyle, rawLinked, seriesStyleIndex,
   );
   if (seriesPaint !== undefined) {
     return {
@@ -13832,7 +13982,8 @@ function bubblePointLine(
     };
   }
   if (series.lineHidden === true) {
-    return { color: null, paint: null, ...geometry };
+    const noLine = chartStyleDirectNoLineDecision(rawLinked);
+    if (noLine !== undefined) return { color: null, paint: noLine, ...geometry };
   }
   if (series.lineColor != null) {
     return { color: series.lineColor, paint: undefined, ...geometry };
@@ -14860,14 +15011,21 @@ function drawChartMarker(
   const linkedMarkerStyle = chartDataPointStyleRole(
     chart, 'dataPointMarker', sourceSeriesIndex,
   );
+  const rawLinkedMarkerStyle = rawLinkedChartStyleRole(chart, 'dataPointMarker');
   const linkedStyleIndex = variesByPoint ? pointIndex : seriesStyleIndex;
 
-  const pointFillDecision = chartStyleFillDecision(point?.markerStyle, pointIndex);
-  const seriesFillDecision = chartStyleFillDecision(series.markerStyle, seriesStyleIndex);
+  const pointFillDecision = chartStyleDirectFillDecision(
+    point?.markerStyle, rawLinkedMarkerStyle, pointIndex,
+  );
+  const seriesFillDecision = chartStyleDirectFillDecision(
+    series.markerStyle, rawLinkedMarkerStyle, seriesStyleIndex,
+  );
   const pointOwnsFill = pointFillDecision !== undefined
-    || point?.markerFill != null || point?.markerFillPaintAuthored === true;
+    || point?.markerFill != null
+    || point?.markerFillPaintAuthored === true && point.markerStyle?.fillHidden !== true;
   const seriesOwnsFill = seriesFillDecision !== undefined
-    || series.markerFill != null || series.markerFillPaintAuthored === true;
+    || series.markerFill != null
+    || series.markerFillPaintAuthored === true && series.markerStyle?.fillHidden !== true;
   let effectiveFill = fill;
   let effectiveFillPaint = fillPaint;
   if (!bubble && !pointOwnsFill && !seriesOwnsFill) {
@@ -14876,6 +15034,7 @@ function drawChartMarker(
       : series.markerStyle;
     const linkedFillDecision = chartStyleFillCascade(
       linkedMarkerStyle,
+      rawLinkedMarkerStyle,
       linkedStyleIndex,
       directFillOwner,
     );
@@ -14889,8 +15048,12 @@ function drawChartMarker(
       effectiveFillPaint = linkedFillDecision;
     }
   }
-  const pointLineDecision = chartStyleLineDecision(point?.markerStyle, pointIndex);
-  const seriesLineDecision = chartStyleLineDecision(series.markerStyle, seriesStyleIndex);
+  const pointLineDecision = chartStyleDirectLineDecision(
+    point?.markerStyle, rawLinkedMarkerStyle, pointIndex,
+  );
+  const seriesLineDecision = chartStyleDirectLineDecision(
+    series.markerStyle, rawLinkedMarkerStyle, seriesStyleIndex,
+  );
   let effectiveLine = line;
   let effectiveLinePaint = linePaint;
   if (!bubble && effectiveLinePaint === undefined) {
@@ -14899,12 +15062,14 @@ function drawChartMarker(
     }
     else if (point?.markerLine != null) effectiveLinePaint = undefined;
     else if (point?.markerLinePaintAuthored === true
+      && point.markerStyle?.lineHidden !== true
       && (point.markerLine == null || point.markerLine === '00000000')) effectiveLinePaint = null;
     else if (seriesLineDecision !== undefined) {
       effectiveLinePaint = seriesLineDecision?.fillType === 'solid' ? undefined : seriesLineDecision;
     }
     else if (series.markerLine != null) effectiveLinePaint = undefined;
     else if (series.markerLinePaintAuthored === true
+      && series.markerStyle?.lineHidden !== true
       && (series.markerLine == null || series.markerLine === '00000000')) effectiveLinePaint = null;
     else {
       const directLineOwner = point?.markerStyle?.shapePropertiesPresent === true
@@ -14912,6 +15077,7 @@ function drawChartMarker(
         : series.markerStyle;
       const linkedLineDecision = chartStyleLineCascade(
         linkedMarkerStyle,
+        rawLinkedMarkerStyle,
         linkedStyleIndex,
         directLineOwner,
       );
@@ -16142,7 +16308,18 @@ export function chartExMarkerPaint(
   legacyColor: string | null | undefined,
   linkedStyle: ChartExStyle | null | undefined,
 ): Fill | null {
-  const local = chartExStylePaintDecision(chart, localStyle, index, count);
+  const role = linkedStyle === chart.chartexDataPointMarkerStyle
+    ? 'dataPointMarker'
+    : linkedStyle === chart.chartexDataPointStyle
+      ? 'dataPoint'
+      : (Object.entries(chart.chartStyleRoles ?? {}).find(
+          ([, style]) => style === linkedStyle,
+        )?.[0] as ChartStyleRole | undefined);
+  const rawLinkedStyle = role
+    ? rawLinkedChartStyleRole(chart, role)
+      ?? (chart.classicChartStyleRoles == null ? linkedStyle : undefined)
+    : linkedStyle;
+  const local = chartStyleDirectFillDecision(localStyle, rawLinkedStyle, index);
   if (local !== undefined) return local;
   if (legacyColor) return { fillType: 'solid', color: legacyColor };
   const linked = chartExStylePaintDecision(chart, linkedStyle, index, count);
@@ -16163,12 +16340,18 @@ export function chartExDataPointPaint(
   // paint from the dataPoint Chart Style. A conventional series-level
   // `<a:noFill>` therefore does not erase every point. Positive local series
   // fills remain direct formatting and do override the linked recipe.
+  const rawLinkedStyle = linkedStyle === chart.chartexDataPointStyle
+    ? rawLinkedChartStyleRole(chart, 'dataPoint')
+      ?? (chart.classicChartStyleRoles == null ? linkedStyle : undefined)
+    : linkedStyle;
   const local = localStyle?.fillHidden
-    ? (linkedStyle?.allowNoFillOverride === true ? null : undefined)
-    : chartStyleFillCascade(linkedStyle, index, localStyle);
+    ? chartStyleDirectNoFillDecision(rawLinkedStyle)
+    : chartStyleDirectFillDecision(localStyle, rawLinkedStyle, index);
   if (local !== undefined) return local;
   if (localStyle && legacyColor) return { fillType: 'solid', color: legacyColor };
   if (legacyColor) return { fillType: 'solid', color: legacyColor };
+  const linked = chartStyleFillDecision(linkedStyle, index);
+  if (linked !== undefined) return linked;
   return { fillType: 'solid', color: chartExSemanticFill(chart, index, count) };
 }
 
@@ -16278,17 +16461,29 @@ export function resolveChartExSeriesLineStyle(
   fallbackColor: string,
   options: { linkedNoStyleFallback?: boolean } = {},
 ): ResolvedChartExLineStyle {
-  void chart;
   void count;
   const local = series?.chartexStyle;
-  let localPaint = chartStyleLineDecision(local, index);
-  const legacyPaintAuthored = series?.lineHidden != null || series?.lineColor != null;
+  const role = linkedStyle === chart.chartexSeriesLineStyle
+    ? 'seriesLine'
+    : linkedStyle === chart.chartexDataPointLineStyle
+      ? 'dataPointLine'
+      : linkedStyle === chart.chartexDataPointMarkerStyle
+        ? 'dataPointMarker'
+        : (Object.entries(chart.chartStyleRoles ?? {}).find(
+            ([, style]) => style === linkedStyle,
+          )?.[0] as ChartStyleRole | undefined);
+  const rawLinkedStyle = role ? rawLinkedChartStyleRole(chart, role) : linkedStyle;
+  const localPaint = chartStyleDirectLineDecision(local, rawLinkedStyle, index);
+  const legacyNoLine = series?.lineHidden === true
+    ? chartStyleDirectNoLineDecision(rawLinkedStyle) : undefined;
+  const legacyPaintAuthored = series?.lineColor != null
+    || legacyNoLine !== undefined;
   const linkedPaint = chartStyleLineDecision(linkedStyle, index);
   const selectedPaint = localPaint !== undefined
     ? localPaint
     : legacyPaintAuthored
-      ? series?.lineHidden === true
-        ? null
+      ? legacyNoLine !== undefined
+        ? legacyNoLine
         : { fillType: 'solid' as const, color: series?.lineColor ?? fallbackColor }
       : linkedPaint !== undefined
         ? linkedPaint

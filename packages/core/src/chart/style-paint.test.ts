@@ -49,14 +49,54 @@ describe('compact classic chart-style palettes', () => {
       allowNoFillOverride: true,
       allowNoLineOverride: true,
     };
-    expect(chartStyleFillCascade(linked, 0)).toEqual({ fillType: 'solid', color: '112233' });
-    expect(chartStyleLineCascade(linked, 0)).toEqual({ fillType: 'solid', color: '445566' });
-    expect(chartStyleFillCascade(linked, 0, { shapePropertiesPresent: true }))
+    expect(chartStyleFillCascade(linked, linked, 0))
       .toEqual({ fillType: 'solid', color: '112233' });
-    expect(chartStyleLineCascade(linked, 0, { shapePropertiesPresent: true }))
+    expect(chartStyleLineCascade(linked, linked, 0))
       .toEqual({ fillType: 'solid', color: '445566' });
-    expect(chartStyleFillCascade({ ...linked, allowNoFillOverride: false }, 0,
+    expect(chartStyleFillCascade(linked, linked, 0, { shapePropertiesPresent: true }))
+      .toEqual({ fillType: 'solid', color: '112233' });
+    expect(chartStyleLineCascade(linked, linked, 0, { shapePropertiesPresent: true }))
+      .toEqual({ fillType: 'solid', color: '445566' });
+    expect(chartStyleFillCascade(linked, { ...linked, allowNoFillOverride: false }, 0,
       { shapePropertiesPresent: true })).toEqual({ fillType: 'solid', color: '112233' });
+  });
+
+  it('gates only explicit no-paint against raw linked role modifiers', () => {
+    const effective = {
+      fillColors: ['112233'],
+      lineColors: ['445566'],
+    };
+    const disallow = {
+      fillColors: ['112233'],
+      lineColors: ['445566'],
+      allowNoFillOverride: false,
+      allowNoLineOverride: false,
+    };
+    const allow = {
+      ...disallow,
+      allowNoFillOverride: true,
+      allowNoLineOverride: true,
+    };
+    expect(chartStyleFillCascade(effective, disallow, 0, { fillHidden: true }))
+      .toEqual({ fillType: 'solid', color: '112233' });
+    expect(chartStyleLineCascade(effective, disallow, 0, { lineHidden: true }))
+      .toEqual({ fillType: 'solid', color: '445566' });
+    expect(chartStyleFillCascade(effective, allow, 0, { fillHidden: true })).toBeNull();
+    expect(chartStyleLineCascade(effective, allow, 0, { lineHidden: true })).toBeNull();
+    expect(chartStyleFillCascade(effective, undefined, 0, { fillHidden: true })).toBeNull();
+    expect(chartStyleLineCascade(effective, undefined, 0, { lineHidden: true })).toBeNull();
+    expect(chartStyleFillCascade(effective, { fillNoStyle: true }, 0,
+      { fillHidden: true })).toBeNull();
+    expect(chartStyleLineCascade(effective, { lineNoStyle: true }, 0,
+      { lineHidden: true })).toBeNull();
+    expect(chartStyleFillCascade(effective, disallow, 0, { fillPaintAuthored: true }))
+      .toBeNull();
+    expect(chartStyleLineCascade(effective, disallow, 0, { linePaintAuthored: true }))
+      .toBeNull();
+    expect(chartStyleFillCascade(effective, disallow, 0, { fillColors: ['ABCDEF'] }))
+      .toEqual({ fillType: 'solid', color: 'ABCDEF' });
+    expect(chartStyleLineCascade(effective, disallow, 0, { lineColors: ['FEDCBA'] }))
+      .toEqual({ fillType: 'solid', color: 'FEDCBA' });
   });
 });
 

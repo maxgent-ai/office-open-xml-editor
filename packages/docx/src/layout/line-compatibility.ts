@@ -243,7 +243,7 @@ export const WORD_INLINE_IMAGE_AUTO_LEADING = defineCompatibilityRule({
     version: '16.111.1',
     platform: 'macOS 26.5.2',
   },
-  description: 'For an inline picture under automatic line spacing at or above one line, form the natural picture/text baseline union with a one-design-line floor, then add only the authored text design-line leading instead of multiplying the picture height.',
+  description: 'For an inline picture under automatic line spacing at or above one line, form the natural picture/text baseline union with a one-design-line floor, then add only the authored text design-line leading instead of multiplying the picture height. Controlled Office sweeps cover 5–255pt pictures at 1.0, 1.079, and 1.15 line multiples; the added leading stayed independent of picture height throughout that range.',
 });
 
 export function wordInlineImageAutoLineHeightPx(

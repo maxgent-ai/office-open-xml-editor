@@ -278,6 +278,23 @@ export function withEffectiveChartStyleRoles(chart: ChartModel): ChartModel {
   };
 }
 
+/**
+ * Return the raw Office 2013+ Chart Style role which owns CT_StyleEntry
+ * modifiers.  The renderer-facing role table may already be linked-over-
+ * numeric, so it cannot answer whether an authored noFill/no-line is allowed
+ * to replace the linked role.  Numeric-only classic styles deliberately
+ * return undefined here: their paint remains directly replaceable.
+ */
+export function rawLinkedChartStyleRole(
+  chart: ChartModel,
+  role: ChartStyleRole,
+): ChartExElementStyle | undefined {
+  return chart.linkedChartStyleRoles?.[role]
+    ?? (chart.classicChartStyleRoles == null
+      ? chart.chartStyleRoles?.[role]
+      : undefined);
+}
+
 /** Whether the classic plot group that owns one flattened series uses the
  * point formatting-index domain from ECMA-376 §21.2.3.46 Table 6. Keep this
  * group-local: a varying pie/bar group in a combo chart must not recolour an

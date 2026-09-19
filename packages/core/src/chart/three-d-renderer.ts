@@ -106,8 +106,10 @@ import { paintPlotAreaFrame } from './plot-area-frame.js';
 import { resolveFill } from '../shape/paint.js';
 import {
   chartThreeDSurfacePaint,
+  chartStyleDirectFillDecision,
+  chartStyleDirectLineDecision,
+  chartStyleDirectNoLineDecision,
   chartStyleFillCascade,
-  chartStyleFillDecision,
   chartStyleLineCascade,
   chartStyleLineDecision,
 } from './style-paint.js';
@@ -125,6 +127,7 @@ import {
   chartDataPointStyleRole,
   chartSeriesVariesByPoint,
   chartStyleDashChoice,
+  rawLinkedChartStyleRole,
 } from './effective-style.js';
 
 interface ThreeDLegendTextStyle {
@@ -559,6 +562,7 @@ function threeDDatumPaint(
     || family === 'stackedLine'
     || family === 'stackedLinePct';
   const linkedDataPointStyle = chartDataPointStyleRole(chart, 'dataPoint3D', seriesIndex);
+  const rawLinkedDataPointStyle = rawLinkedChartStyleRole(chart, 'dataPoint3D');
   let fill: Fill | null | undefined;
   let color = automaticColor;
   const fillDecision = chartThreeDDatumFillDecision(
@@ -568,18 +572,28 @@ function threeDDatumPaint(
 
   let lineFill: Fill | null | undefined;
   let lineColor: string | null = null;
-  const pointLine = chartStyleLineDecision(point?.chartexStyle, pointIndex);
+  let pointLine = chartStyleDirectLineDecision(
+    point?.chartexStyle, rawLinkedDataPointStyle, pointIndex,
+  );
+  if (pointLine === undefined && point?.lineHidden === true) {
+    pointLine = chartStyleDirectNoLineDecision(rawLinkedDataPointStyle);
+  }
   if (pointLine !== undefined) {
     if (pointLine?.fillType === 'solid') lineColor = `#${pointLine.color}`;
     else lineFill = pointLine;
-  } else if (point?.lineHidden === true) lineFill = null;
+  }
   else if (point?.lineColor) lineColor = `#${point.lineColor}`;
   else {
-    const seriesLine = chartStyleLineDecision(series.chartexStyle, styleIndex);
+    let seriesLine = chartStyleDirectLineDecision(
+      series.chartexStyle, rawLinkedDataPointStyle, styleIndex,
+    );
+    if (seriesLine === undefined && series.lineHidden === true) {
+      seriesLine = chartStyleDirectNoLineDecision(rawLinkedDataPointStyle);
+    }
     if (seriesLine !== undefined) {
       if (seriesLine?.fillType === 'solid') lineColor = `#${seriesLine.color}`;
       else lineFill = seriesLine;
-    } else if (series.lineHidden === true) lineFill = null;
+    }
     else if (series.lineColor) lineColor = `#${series.lineColor}`;
     else if (lineRibbonFamily) {
       // ECMA-376 §21.2.3.46 Table 1 classifies every 3-D chart mark under
@@ -590,7 +604,8 @@ function threeDDatumPaint(
       lineFill = fill === null ? null : fill;
     } else {
       const linkedLine = chartStyleLineCascade(
-        linkedDataPointStyle, styleIndex, point?.chartexStyle, series.chartexStyle,
+        linkedDataPointStyle, rawLinkedDataPointStyle, styleIndex,
+        point?.chartexStyle, series.chartexStyle,
       );
       if (linkedLine !== undefined) {
         if (linkedLine?.fillType === 'solid') lineColor = `#${linkedLine.color}`;
@@ -1977,16 +1992,22 @@ function threeDMarkerPaint(
   ptToPx: number,
 ): ThreeDMarkerPaint {
   const linked = chartDataPointStyleRole(chart, 'dataPointMarker', seriesIndex);
+  const rawLinked = rawLinkedChartStyleRole(chart, 'dataPointMarker');
   const seriesStyleIndex = series.chartexFormatIdx ?? seriesIndex;
-  const pointStyleFill = chartStyleFillDecision(point?.markerStyle, pointIndex);
-  const seriesStyleFill = chartStyleFillDecision(series.markerStyle, seriesStyleIndex);
+  const pointStyleFill = chartStyleDirectFillDecision(
+    point?.markerStyle, rawLinked, pointIndex,
+  );
+  const seriesStyleFill = chartStyleDirectFillDecision(
+    series.markerStyle, rawLinked, seriesStyleIndex,
+  );
   const pointFillAuthored = pointStyleFill !== undefined
     || point?.markerFillPaint !== undefined || point?.markerFill != null
-    || point?.color != null || point?.markerFillPaintAuthored === true;
+    || point?.color != null
+    || point?.markerFillPaintAuthored === true && point.markerStyle?.fillHidden !== true;
   const seriesFillAuthored = seriesStyleFill !== undefined
     || series.markerFillPaint !== undefined || series.markerFill != null
-    || series.markerFillPaintAuthored === true;
-  const linkedFill = chartStyleFillCascade(linked, seriesStyleIndex);
+    || series.markerFillPaintAuthored === true && series.markerStyle?.fillHidden !== true;
+  const linkedFill = chartStyleFillCascade(linked, rawLinked, seriesStyleIndex);
   const fillDecision = pointFillAuthored
     ? pointStyleFill ?? point?.markerFillPaint
     : seriesFillAuthored
@@ -1999,12 +2020,16 @@ function threeDMarkerPaint(
     fillPaint = undefined;
   } else if (fillDecision === null) fill = '00000000';
 
-  const pointLine = chartStyleLineDecision(point?.markerStyle, pointIndex);
-  const seriesLine = chartStyleLineDecision(series.markerStyle, seriesStyleIndex);
+  const pointLine = chartStyleDirectLineDecision(
+    point?.markerStyle, rawLinked, pointIndex,
+  );
+  const seriesLine = chartStyleDirectLineDecision(
+    series.markerStyle, rawLinked, seriesStyleIndex,
+  );
   const pointLineAuthored = pointLine !== undefined || point?.markerLine != null
-    || point?.markerLinePaintAuthored === true;
+    || point?.markerLinePaintAuthored === true && point.markerStyle?.lineHidden !== true;
   const seriesLineAuthored = seriesLine !== undefined || series.markerLine != null
-    || series.markerLinePaintAuthored === true;
+    || series.markerLinePaintAuthored === true && series.markerStyle?.lineHidden !== true;
   const linkedLine = chartStyleLineDecision(linked, seriesStyleIndex);
   const linePaint = pointLineAuthored
     ? pointLine ?? (point?.markerLinePaintAuthored === true ? null : undefined)
@@ -4799,8 +4824,12 @@ function renderPie(
   const categories = series.categories?.length ? series.categories : chart.categories;
   const legendPointColors = Array.from({ length: categories.length }, (_, index) => {
     const pointOverride = pointOverrides.get(index);
-    const authored = pointOverride?.fillHidden === true
-      ? '00000000'
+    const decision = chartThreeDDatumFillDecision(
+      chart, series, pointOverride, index, 0,
+    );
+    if (decision === null) return '00000000';
+    const authored = decision?.fillType === 'solid'
+      ? decision.color
       : pointOverride?.color ?? series.dataPointColors?.[index] ?? series.color;
     if (authored === '00000000') return '00000000';
     return scaleHexColor(authored ? `#${authored}` : colorFor(index), 0.80).replace(/^#/, '');

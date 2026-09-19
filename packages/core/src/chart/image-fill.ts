@@ -33,6 +33,8 @@ import {
 } from './resource-limits.js';
 import { indexChartPlotGroups, markerChartTypeForPlotGroup } from './plot-groups.js';
 import {
+  chartStyleDirectFillDecision,
+  chartStyleDirectNoFillDecision,
   chartStyleFillCascade,
   chartStockBarFillDecision,
   chartStyleFillDecision,
@@ -41,6 +43,7 @@ import {
 import {
   chartDataPointStyleRole,
   chartSeriesVariesByPoint,
+  rawLinkedChartStyleRole,
   withChartStyleIndexCache,
   withEffectiveChartStyleRoles,
 } from './effective-style.js';
@@ -48,7 +51,11 @@ import { withSparseStyleIndexCache } from './sparse-style-index.js';
 import { planChartThreeDSurfacePicture } from './three-d-surface-picture-plan.js';
 import { classicDataPointFillDecision } from './classic-data-point-style.js';
 import { dataLabelIsDeleted } from './data-label-style.js';
-import { effectiveChartLabelBoxFill, mergeChartLabelBoxes } from './label-box.js';
+import {
+  chartLabelBoxHasVisiblePaint,
+  effectiveChartLabelBoxFill,
+  mergeChartLabelBoxes,
+} from './label-box.js';
 import { effectiveLegendFrameFill } from './legend-frame.js';
 import { applyPlotVisibleOnly } from './source-visibility.js';
 import { withActiveChartImageFillPainter } from './image-fill-context.js';
@@ -486,14 +493,16 @@ function collectChartMarkerImageFillResult(
     local: ChartExElementStyle | null | undefined,
     legacyColor: string | null | undefined,
     linked: ChartExElementStyle | null | undefined,
+    rawLinked: ChartExElementStyle | null | undefined,
     index: number,
   ): ImageFill | null | undefined => {
     const fill = local?.fillHidden
-      ? (local.shapePropertiesPresent === true && linked?.allowNoFillOverride === true
-          ? null : undefined)
-      : chartStyleFillCascade(linked, index, local);
+      ? chartStyleDirectNoFillDecision(rawLinked)
+      : chartStyleDirectFillDecision(local, rawLinked, index);
     if (fill !== undefined) return fill?.fillType === 'image' ? fill : null;
-    return legacyColor ? null : undefined;
+    if (legacyColor) return null;
+    const fallback = chartStyleFillDecision(linked, index);
+    return fallback?.fillType === 'image' ? fallback : fallback == null ? fallback : null;
   };
   const waterfallBodyImageDecision = (
     point: ChartDataPointOverride | undefined,
@@ -505,12 +514,32 @@ function collectChartMarkerImageFillResult(
       || point?.chartexStyle?.fillHidden != null
       || point?.chartexStyle?.fillColors?.some(color => color != null) === true
       || point?.chartexStyle?.fillPaints?.some(paint => paint != null) === true;
-    if (pointAuthors) return styleImageDecision(point?.chartexStyle, semanticIndex);
+    if (pointAuthors) {
+      const pointStyle = point?.fillHidden === true
+        ? { ...point.chartexStyle, fillHidden: true, fillPaintAuthored: true }
+        : point?.chartexStyle;
+      return dataPointImageDecision(
+        pointStyle,
+        point?.color,
+        chart.chartexDataPointStyle,
+        rawLinkedChartStyleRole(chart, 'dataPoint')
+          ?? (chart.classicChartStyleRoles == null ? chart.chartexDataPointStyle : undefined),
+        semanticIndex,
+      );
+    }
     if (series?.chartexStyle?.fillPaintAuthored === true) {
-      return styleImageDecision(series.chartexStyle, semanticIndex);
+      return dataPointImageDecision(
+        series.chartexStyle,
+        series.color,
+        chart.chartexDataPointStyle,
+        rawLinkedChartStyleRole(chart, 'dataPoint')
+          ?? (chart.classicChartStyleRoles == null ? chart.chartexDataPointStyle : undefined),
+        semanticIndex,
+      );
     }
     return dataPointImageDecision(
-      series?.chartexStyle, series?.color, chart.chartexDataPointStyle, semanticIndex,
+      series?.chartexStyle, series?.color, chart.chartexDataPointStyle,
+      rawLinkedChartStyleRole(chart, 'dataPoint'), semanticIndex,
     );
   };
   const frameImageDecision = (
@@ -519,13 +548,18 @@ function collectChartMarkerImageFillResult(
     hidden: boolean | null | undefined,
     paintAuthored: boolean | null | undefined,
     linked: ChartExElementStyle | null | undefined,
+    rawLinked: ChartExElementStyle | null | undefined,
     directStyle: ChartExElementStyle | null | undefined,
   ): ImageFill | null | undefined => {
-    if (hidden === true) return null;
+    if (hidden === true) {
+      const noFill = chartStyleDirectNoFillDecision(rawLinked);
+      if (noFill !== undefined) return noFill;
+    }
     if (directFill?.fillType === 'image') return directFill;
-    if (directFill != null || directColor != null || paintAuthored === true) return null;
+    if (directFill != null || directColor != null
+      || paintAuthored === true && hidden !== true) return null;
     if (linked?.fillNoStyle === true) return undefined;
-    const fill = chartStyleFillCascade(linked, 0, directStyle);
+    const fill = chartStyleFillCascade(linked, rawLinked, 0, directStyle);
     return fill?.fillType === 'image' ? fill : fill == null ? fill : null;
   };
   const chartAreaImage = frameImageDecision(
@@ -536,6 +570,7 @@ function collectChartMarkerImageFillResult(
     chart.chartFillHidden,
     chart.chartFillPaintAuthored,
     chart.chartStyleRoles?.chartArea,
+    rawLinkedChartStyleRole(chart, 'chartArea'),
     chart.chartAreaStyle,
   );
   if (chartAreaImage) add(chartAreaImage);
@@ -545,6 +580,7 @@ function collectChartMarkerImageFillResult(
     chart.plotAreaFillHidden,
     chart.plotAreaFillPaintAuthored,
     chart.threeD ? chart.chartStyleRoles?.plotArea3D : chart.chartStyleRoles?.plotArea,
+    rawLinkedChartStyleRole(chart, chart.threeD ? 'plotArea3D' : 'plotArea'),
     chart.plotAreaStyle,
   );
   if (plotAreaImage) add(plotAreaImage);
@@ -555,26 +591,32 @@ function collectChartMarkerImageFillResult(
   const addLabelBoxFill = (
     direct: Parameters<typeof effectiveChartLabelBoxFill>[0],
     linked: Parameters<typeof effectiveChartLabelBoxFill>[1],
+    rawLinked: Parameters<typeof effectiveChartLabelBoxFill>[2],
     linkedIndex = 0,
   ): void => {
-    add(effectiveChartLabelBoxFill(direct, linked, true, 0, linkedIndex)?.fillPaint);
+    add(effectiveChartLabelBoxFill(
+      direct, linked, rawLinked, true, 0, linkedIndex,
+    )?.fillPaint);
   };
   if (chart.title) {
     addLabelBoxFill(
       chart.titleStyle ? { style: chart.titleStyle } : undefined,
       chart.chartStyleRoles?.title,
+      rawLinkedChartStyleRole(chart, 'title'),
     );
   }
   if (chart.catAxisTitle) {
     addLabelBoxFill(
       chart.catAxisTitleStyle ? { style: chart.catAxisTitleStyle } : undefined,
       chart.chartStyleRoles?.axisTitle,
+      rawLinkedChartStyleRole(chart, 'axisTitle'),
     );
   }
   if (chart.valAxisTitle) {
     addLabelBoxFill(
       chart.valAxisTitleStyle ? { style: chart.valAxisTitleStyle } : undefined,
       chart.chartStyleRoles?.axisTitle,
+      rawLinkedChartStyleRole(chart, 'axisTitle'),
     );
   }
   for (const axis of [chart.secondaryValAxis, chart.secondaryCatAxis]) {
@@ -582,10 +624,15 @@ function collectChartMarkerImageFillResult(
       addLabelBoxFill(
         axis.titleStyle ? { style: axis.titleStyle } : undefined,
         chart.chartStyleRoles?.axisTitle,
+        rawLinkedChartStyleRole(chart, 'axisTitle'),
       );
     }
     if (axis?.displayUnits?.label) {
-      addLabelBoxFill(axis.displayUnits.label.boxStyle, chart.chartStyleRoles?.axisTitle);
+      addLabelBoxFill(
+        axis.displayUnits.label.boxStyle,
+        chart.chartStyleRoles?.axisTitle,
+        rawLinkedChartStyleRole(chart, 'axisTitle'),
+      );
     }
   }
   if (chart.threeD?.seriesAxis?.title) {
@@ -593,10 +640,17 @@ function collectChartMarkerImageFillResult(
       chart.threeD.seriesAxis.titleStyle
         ? { style: chart.threeD.seriesAxis.titleStyle } : undefined,
       chart.chartStyleRoles?.axisTitle,
+      rawLinkedChartStyleRole(chart, 'axisTitle'),
     );
   }
   for (const units of [chart.valAxisDisplayUnits, chart.catAxisDisplayUnits]) {
-    if (units?.label) addLabelBoxFill(units.label.boxStyle, chart.chartStyleRoles?.axisTitle);
+    if (units?.label) {
+      addLabelBoxFill(
+        units.label.boxStyle,
+        chart.chartStyleRoles?.axisTitle,
+        rawLinkedChartStyleRole(chart, 'axisTitle'),
+      );
+    }
   }
   const finiteSurfaceValue = chart.series.some(series =>
     series.values.some(value => value != null && Number.isFinite(value))
@@ -743,10 +797,15 @@ function collectChartMarkerImageFillResult(
         chart, series, family, index, scatterHasNumericX, seriesIndex,
       )) continue;
       const direct = mergeChartLabelBoxes(label?.labelBox, series.seriesDataLabels?.labelBox);
-      const linked = (label?.labelBox != null || series.seriesDataLabels?.labelBox != null)
+      const usesCalloutRole = chartLabelBoxHasVisiblePaint(direct);
+      const linked = usesCalloutRole
         ? chart.chartStyleRoles?.dataLabelCallout ?? chart.chartStyleRoles?.dataLabel
         : chart.chartStyleRoles?.dataLabel;
-      addLabelBoxFill(direct, linked, label ? index : sourceSeriesIndex);
+      const rawLinked = usesCalloutRole
+        ? rawLinkedChartStyleRole(chart, 'dataLabelCallout')
+          ?? rawLinkedChartStyleRole(chart, 'dataLabel')
+        : rawLinkedChartStyleRole(chart, 'dataLabel');
+      addLabelBoxFill(direct, linked, rawLinked, label ? index : sourceSeriesIndex);
     }
     for (const trendline of series.trendLines ?? []) {
       const hasLabelContent = trendline.dispEq === true || trendline.dispRSqr === true
@@ -754,7 +813,10 @@ function collectChartMarkerImageFillResult(
         || trendline.labelRichRuns?.some(run => run.text.length > 0) === true;
       if (hasLabelContent) {
         addLabelBoxFill(
-          trendline.labelBox, chart.chartStyleRoles?.trendlineLabel, sourceSeriesIndex,
+          trendline.labelBox,
+          chart.chartStyleRoles?.trendlineLabel,
+          rawLinkedChartStyleRole(chart, 'trendlineLabel'),
+          sourceSeriesIndex,
         );
       }
     }
@@ -873,10 +935,12 @@ function collectChartMarkerImageFillResult(
       } else add(series.markerFillPaint);
       if (!isBubble
         && series.markerFillPaint === undefined && series.markerFill == null
-        && series.markerFillPaintAuthored !== true) {
+        && !(series.markerFillPaintAuthored === true
+          && series.markerStyle?.fillHidden !== true)) {
         if (!variesByPoint) {
           const linkedFill = chartStyleFillCascade(
             linkedMarkerStyle,
+            rawLinkedChartStyleRole(chart, 'dataPointMarker'),
             sourceSeriesIndex,
             series.markerStyle,
           );
@@ -917,9 +981,18 @@ function collectChartMarkerImageFillResult(
         const linkedPointRole = chartDataPointStyleRole(chart, 'dataPoint', seriesIndex);
         const linkedPointIndex = chartSeriesVariesByPoint(chart, seriesIndex)
           ? index : sourceSeriesIndex;
-        const pointShape = styleImageDecision(point?.chartexStyle, index);
+        const rawDataPointRole = rawLinkedChartStyleRole(chart, 'dataPoint');
+        const pointDecision = chartStyleDirectFillDecision(
+          point?.chartexStyle, rawDataPointRole, index,
+        );
+        const pointShape = pointDecision?.fillType === 'image'
+          ? pointDecision : pointDecision == null ? pointDecision : null;
         if (pointShape) add(pointShape);
-        if (pointShape !== undefined || point?.fillHidden === true || point?.color != null) continue;
+        const pointNoFill = point?.fillHidden === true
+          ? chartStyleDirectNoFillDecision(rawDataPointRole)
+          : undefined;
+        if (pointShape !== undefined || pointNoFill !== undefined
+          || point?.color != null) continue;
         if (series.dataPointColors?.[index] != null) continue;
         const seriesShape = styleImageDecision(series.chartexStyle, sourceSeriesIndex);
         if (seriesShape) add(seriesShape);
@@ -932,13 +1005,16 @@ function collectChartMarkerImageFillResult(
       add(paint);
       if (paint === undefined && point?.markerFill == null && point?.color == null
         && series.dataPointColors?.[index] == null && series.markerFill == null
-        && point?.markerFillPaintAuthored !== true
-        && series.markerFillPaintAuthored !== true) {
+        && !(point?.markerFillPaintAuthored === true
+          && point.markerStyle?.fillHidden !== true)
+        && !(series.markerFillPaintAuthored === true
+          && series.markerStyle?.fillHidden !== true)) {
         const directStyle = point?.markerStyle?.shapePropertiesPresent === true
           ? point.markerStyle
           : series.markerStyle;
         const linkedFill = chartStyleFillCascade(
           linkedMarkerStyle,
+          rawLinkedChartStyleRole(chart, 'dataPointMarker'),
           variesByPoint ? index : sourceSeriesIndex,
           directStyle,
         );
@@ -986,7 +1062,8 @@ function collectChartMarkerImageFillResult(
     const series = chart.series[0];
     if ((series?.values ?? []).some(value => value != null && value > 0)) {
       add(dataPointImageDecision(
-        series?.chartexStyle, series?.color, chart.chartexDataPointStyle, 0,
+        series?.chartexStyle, series?.color, chart.chartexDataPointStyle,
+        rawLinkedChartStyleRole(chart, 'dataPoint'), 0,
       ));
     }
   }
@@ -996,6 +1073,7 @@ function collectChartMarkerImageFillResult(
       computeBoxWhiskerStats(values, series.quartileMethod) != null)) continue;
     add(dataPointImageDecision(
       series.chartexStyle, series.color, chart.chartexDataPointStyle,
+      rawLinkedChartStyleRole(chart, 'dataPoint'),
       series.chartexFormatIdx ?? seriesIndex,
     ));
   }
@@ -1004,16 +1082,22 @@ function collectChartMarkerImageFillResult(
     if (!paintsBody) return;
     add(dataPointImageDecision(
       hierarchySeries?.chartexStyle, hierarchySeries?.color,
-      chart.chartexDataPointStyle, node.branchIndex,
+      chart.chartexDataPointStyle, rawLinkedChartStyleRole(chart, 'dataPoint'),
+      node.branchIndex,
     ));
   });
   visitChartExHierarchyLabelSites(chart, ({ label, linkedStyleIndex }) => {
     const direct = label.labelBox;
-    const linked = direct != null
+    const usesCalloutRole = chartLabelBoxHasVisiblePaint(direct);
+    const linked = usesCalloutRole
       ? chart.chartStyleRoles?.dataLabelCallout ?? chart.chartStyleRoles?.dataLabel
       : chart.chartStyleRoles?.dataLabel;
+    const rawLinked = usesCalloutRole
+      ? rawLinkedChartStyleRole(chart, 'dataLabelCallout')
+        ?? rawLinkedChartStyleRole(chart, 'dataLabel')
+      : rawLinkedChartStyleRole(chart, 'dataLabel');
     const effective = effectiveChartLabelBoxFill(
-      direct, linked, linked != null, 0, linkedStyleIndex,
+      direct, linked, rawLinked, linked != null, 0, linkedStyleIndex,
     );
     if (effective?.fillPaint?.fillType === 'image') add(effective.fillPaint);
   });

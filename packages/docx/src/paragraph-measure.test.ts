@@ -789,8 +789,12 @@ describe('measureParagraph', () => {
     { line: 240, multiple: 1, imageHeight: 28.3464567 },
     { line: 259, multiple: 259 / 240, imageHeight: 10 },
     { line: 259, multiple: 259 / 240, imageHeight: 28.3464567 },
+    { line: 259, multiple: 259 / 240, imageHeight: 61.8 },
     { line: 276, multiple: 276 / 240, imageHeight: 20 },
     { line: 276, multiple: 276 / 240, imageHeight: 50 },
+    { line: 276, multiple: 276 / 240, imageHeight: 105.4 },
+    { line: 240, multiple: 1, imageHeight: 188.2 },
+    { line: 276, multiple: 276 / 240, imageHeight: 255 },
   ])(
     'adds Calibri auto leading without scaling an image (line=$line, height=$imageHeight)',
     ({ multiple, imageHeight }) => {

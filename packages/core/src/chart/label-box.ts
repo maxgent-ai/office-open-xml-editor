@@ -3,7 +3,11 @@ import { drawingmlLineDashArray } from '../draw/dash.js';
 import { resolveFill } from '../shape/paint.js';
 import { EMU_PER_PT } from '../units.js';
 import { chartStyleEffectOwner, paintChartStyleEffects } from './style-effects.js';
-import { chartStyleFillDecision } from './style-paint.js';
+import {
+  chartStyleDirectFillDecision,
+  chartStyleDirectNoFillDecision,
+  chartStyleFillDecision,
+} from './style-paint.js';
 import { paintActiveChartImageFill } from './image-fill-context.js';
 
 /** Resolve only the fill component of a label shape. Hosts use this same pure
@@ -12,22 +16,27 @@ import { paintActiveChartImageFill } from './image-fill-context.js';
 export function effectiveChartLabelBoxFill(
   direct: ChartLabelBox | null | undefined,
   linked: ChartExElementStyle | null | undefined,
+  rawLinked: ChartExElementStyle | null | undefined,
   createFromLinked: boolean,
   directIndex = 0,
   linkedIndex = directIndex,
 ): Pick<ChartLabelBox, 'fill' | 'fillPaint' | 'fillHidden' | 'fillPaintAuthored'> | undefined {
   if (!linked || (!direct && !createFromLinked)) return direct ?? undefined;
   const source = direct ?? {};
-  const directFill = source.fillPaintAuthored === true
-    || source.fill != null || source.fillPaint != null || source.fillHidden === true;
   const linkedFill = linked.fillNoStyle !== true && (linked.fillPaintAuthored === true
     || linked.fillHidden === true || linked.fillPaints != null || linked.fillColors != null);
-  let directStyleFill = chartStyleFillDecision(source.style, directIndex);
-  const fillDecision = source.fillHidden === true ? null
+  const directNoFill = source.fillHidden === true
+    ? chartStyleDirectNoFillDecision(rawLinked) : undefined;
+  const directStyleFill = chartStyleDirectFillDecision(source.style, rawLinked, directIndex);
+  const directFill = source.fillPaint != null || source.fill != null
+    || directStyleFill !== undefined
+    || source.fillHidden === true && directNoFill !== undefined
+    || source.fillPaintAuthored === true && source.fillHidden !== true;
+  const fillDecision = directNoFill !== undefined ? directNoFill
     : source.fillPaint ?? (source.fill ? { fillType: 'solid' as const, color: source.fill }
       : directStyleFill !== undefined
         ? directStyleFill
-        : source.fillPaintAuthored === true
+        : source.fillPaintAuthored === true && source.fillHidden !== true
           ? null
           : chartStyleFillDecision(linked, linkedIndex));
   return {

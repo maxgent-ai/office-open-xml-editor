@@ -4,7 +4,11 @@ import { resolveFill } from '../shape/paint.js';
 import { axisLineWidthPx } from './axis-style.js';
 import { strokeChartFrameRect } from './compound-frame.js';
 import { paintChartStyleEffects } from './style-effects.js';
-import { chartStyleFillCascade } from './style-paint.js';
+import { rawLinkedChartStyleRole } from './effective-style.js';
+import {
+  chartStyleDirectNoFillDecision,
+  chartStyleFillCascade,
+} from './style-paint.js';
 import { paintActiveChartImageFill } from './image-fill-context.js';
 
 /** Effective legend-frame fill before renderer materialization. Kept beside
@@ -12,10 +16,16 @@ import { paintActiveChartImageFill } from './image-fill-context.js';
 export function effectiveLegendFrameFill(
   chart: ChartModel,
 ): ChartModel['legendFill'] | undefined {
-  if (chart.legendFillHidden === true) return undefined;
+  const rawLinked = rawLinkedChartStyleRole(chart, 'legend');
+  const blockedNoFill = chart.legendFillHidden === true
+    && chartStyleDirectNoFillDecision(rawLinked) === undefined;
+  if (chart.legendFillHidden === true && !blockedNoFill) return undefined;
   if (chart.legendFill != null) return chart.legendFill;
-  if (chart.legendFillColor != null || chart.legendFillPaintAuthored === true) return undefined;
-  return chartStyleFillCascade(chart.chartStyleRoles?.legend, 0, chart.legendStyle) ?? undefined;
+  if (chart.legendFillColor != null
+    || chart.legendFillPaintAuthored === true && !blockedNoFill) return undefined;
+  return chartStyleFillCascade(
+    chart.chartStyleRoles?.legend, rawLinked, 0, chart.legendStyle,
+  ) ?? undefined;
 }
 
 /** Paint the authored solid `<c:legend><c:spPr>` frame before legend content.

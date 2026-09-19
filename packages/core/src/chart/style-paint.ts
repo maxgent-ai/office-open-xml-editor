@@ -2,7 +2,7 @@ import type {
   ChartExElementStyle, ChartModel, ChartStockBarPaint,
 } from '../types/chart.js';
 import type { Fill } from '../types/common.js';
-import { chartStyleDashChoice } from './effective-style.js';
+import { chartStyleDashChoice, rawLinkedChartStyleRole } from './effective-style.js';
 import { compactStyleIndex, styleIndexSetHas } from './sparse-style-index.js';
 
 function chartStylePaletteIndex(
@@ -102,28 +102,88 @@ export function chartStyleLineDecision(
  * line in a present `spPr` still inherits: MS-ODRAWXML's `allowNo*Override`
  * permits an authored `noFill`/no-line choice to replace the style; it does
  * not turn an absent component into that choice. */
-export function chartStyleFillCascade(
+function linkedRoleAllowsNoPaint(
   linked: ChartExElementStyle | null | undefined,
+  kind: 'fill' | 'line',
+): boolean {
+  if (linked == null) return true;
+  if (kind === 'fill') {
+    // A NoStyle reference contributes no fill paint to replace. The modifier
+    // is required only when local noFill would suppress actual linked paint.
+    return linked.fillNoStyle === true || linked.allowNoFillOverride === true;
+  }
+  // Likewise, lnRef idx=0 leaves no linked line paint for a local no-line to
+  // override. This distinction is observable in Office-produced charts whose
+  // series carry a:noFill lines under an unmodified NoStyle data-point role.
+  return linked.lineNoStyle === true || linked.allowNoLineOverride === true;
+}
+
+/** Resolve a direct style paint against the raw linked CT_StyleEntry.
+ * Positive and authored-but-unresolved paint always owns the component.
+ * Explicit noFill/no-line may replace a present linked role only when that
+ * role carries the matching MS-ODRAWXML §2.8.4.8 allowNo*Override modifier.
+ */
+export function chartStyleDirectFillDecision(
+  direct: ChartExElementStyle | null | undefined,
+  rawLinked: ChartExElementStyle | null | undefined,
+  index: number,
+): Fill | null | undefined {
+  const decision = chartStyleFillDecision(direct, index);
+  return decision === null && direct?.fillHidden === true
+    && !linkedRoleAllowsNoPaint(rawLinked, 'fill')
+    ? undefined
+    : decision;
+}
+
+export function chartStyleDirectLineDecision(
+  direct: ChartExElementStyle | null | undefined,
+  rawLinked: ChartExElementStyle | null | undefined,
+  index: number,
+): ChartModel['plotAreaLineFill'] | null | undefined {
+  const decision = chartStyleLineDecision(direct, index);
+  return decision === null && direct?.lineHidden === true
+    && !linkedRoleAllowsNoPaint(rawLinked, 'line')
+    ? undefined
+    : decision;
+}
+
+/** Resolve a legacy/top-level explicit no-paint atom against the same rule. */
+export function chartStyleDirectNoFillDecision(
+  rawLinked: ChartExElementStyle | null | undefined,
+): null | undefined {
+  return linkedRoleAllowsNoPaint(rawLinked, 'fill') ? null : undefined;
+}
+
+export function chartStyleDirectNoLineDecision(
+  rawLinked: ChartExElementStyle | null | undefined,
+): null | undefined {
+  return linkedRoleAllowsNoPaint(rawLinked, 'line') ? null : undefined;
+}
+
+export function chartStyleFillCascade(
+  effective: ChartExElementStyle | null | undefined,
+  rawLinked: ChartExElementStyle | null | undefined,
   index: number,
   ...direct: Array<ChartExElementStyle | null | undefined>
 ): Fill | null | undefined {
   for (const style of direct) {
-    const paint = chartStyleFillDecision(style, index);
+    const paint = chartStyleDirectFillDecision(style, rawLinked, index);
     if (paint !== undefined) return paint;
   }
-  return chartStyleFillDecision(linked, index);
+  return chartStyleFillDecision(effective, index);
 }
 
 export function chartStyleLineCascade(
-  linked: ChartExElementStyle | null | undefined,
+  effective: ChartExElementStyle | null | undefined,
+  rawLinked: ChartExElementStyle | null | undefined,
   index: number,
   ...direct: Array<ChartExElementStyle | null | undefined>
 ): ChartModel['plotAreaLineFill'] | null | undefined {
   for (const style of direct) {
-    const paint = chartStyleLineDecision(style, index);
+    const paint = chartStyleDirectLineDecision(style, rawLinked, index);
     if (paint !== undefined) return paint;
   }
-  return chartStyleLineDecision(linked, index);
+  return chartStyleLineDecision(effective, index);
 }
 
 /** Resolve the fill atom of one classic up/down bar. Direct CT_UpDownBar
@@ -135,13 +195,17 @@ export function chartStockBarFillDecision(
   direct: ChartStockBarPaint,
   role: 'upBar' | 'downBar',
 ): Fill | null | undefined {
-  if (direct.fillHidden === true) return null;
+  const rawLinked = rawLinkedChartStyleRole(chart, role);
+  if (direct.fillHidden === true) {
+    const noFill = chartStyleDirectNoFillDecision(rawLinked);
+    if (noFill !== undefined) return noFill;
+  }
   if (direct.fill != null) return direct.fill;
   if (direct.fillColor != null) return { fillType: 'solid', color: direct.fillColor };
-  const directStyleFill = chartStyleFillDecision(direct.style, 0);
+  const directStyleFill = chartStyleDirectFillDecision(direct.style, rawLinked, 0);
   if (directStyleFill !== undefined) return directStyleFill;
-  if (direct.fillPaintAuthored === true) return null;
-  return chartStyleFillCascade(chart.chartStyleRoles?.[role], 0, direct.style);
+  if (direct.fillPaintAuthored === true && direct.fillHidden !== true) return null;
+  return chartStyleFillCascade(chart.chartStyleRoles?.[role], rawLinked, 0, direct.style);
 }
 
 export interface ChartThreeDSurfacePaint {
@@ -165,15 +229,22 @@ export function chartThreeDSurfacePaint(
 ): ChartThreeDSurfacePaint {
   const directStyle = surface?.style;
   const linkedStyle = chart.chartStyleRoles?.[role];
+  const rawLinked = rawLinkedChartStyleRole(chart, role);
   let fill: Fill | null | undefined;
-  if (surface?.fillHidden === true) fill = null;
+  if (surface?.fillHidden === true) {
+    fill = chartStyleDirectNoFillDecision(rawLinked);
+    if (fill === undefined) fill = chartStyleFillDecision(linkedStyle, 0);
+  }
   else if (surface?.fillColor) fill = { fillType: 'solid', color: surface.fillColor };
-  else fill = chartStyleFillCascade(linkedStyle, 0, directStyle);
+  else fill = chartStyleFillCascade(linkedStyle, rawLinked, 0, directStyle);
 
   let line: ChartModel['plotAreaLineFill'] | null | undefined;
-  if (surface?.lineHidden === true) line = null;
+  if (surface?.lineHidden === true) {
+    line = chartStyleDirectNoLineDecision(rawLinked);
+    if (line === undefined) line = chartStyleLineDecision(linkedStyle, 0);
+  }
   else if (surface?.lineColor) line = { fillType: 'solid', color: surface.lineColor };
-  else line = chartStyleLineCascade(linkedStyle, 0, directStyle);
+  else line = chartStyleLineCascade(linkedStyle, rawLinked, 0, directStyle);
   // NoStyle is a paint sentinel. A linked entry may still contribute local
   // DrawingML geometry (width/dash/cap/join) beside its NoStyle lnRef.
   const linkedGeometry = linkedStyle;

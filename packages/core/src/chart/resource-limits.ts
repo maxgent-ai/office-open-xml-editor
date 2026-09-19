@@ -28,6 +28,7 @@ import {
   visitChartExHierarchyLabelSites,
 } from './chart-ex-hierarchy-labels.js';
 import { planWaterfallPaintSites } from './waterfall-plan.js';
+import { chartLabelBoxHasVisiblePaint, mergeChartLabelBoxes } from './label-box.js';
 
 /** Shared synchronous Canvas chart point ceiling. Host prefetch and renderer
  * preflight must reject against the same bound before allocating per-point work. */
@@ -171,7 +172,7 @@ export function chartEffectConsumerUpperBound(chart: ChartModel): number {
   }
   visitChartExHierarchyLabelSites(chart, ({ label, linkedStyleIndex }) => {
     const direct = label.labelBox;
-    const linked = direct != null
+    const linked = chartLabelBoxHasVisiblePaint(direct)
       ? chart.chartStyleRoles?.dataLabelCallout ?? chart.chartStyleRoles?.dataLabel
       : chart.chartStyleRoles?.dataLabel;
     add(direct?.style, linked, 0, linkedStyleIndex);
@@ -527,9 +528,12 @@ export function chartEffectConsumerUpperBound(chart: ChartModel): number {
         || !classicDataLabelPointIsPainted(
           chart, series, family, label.idx, scatterHasNumericX, seriesIndex,
         )) continue;
+      const labelBox = mergeChartLabelBoxes(
+        label.labelBox, series.seriesDataLabels?.labelBox,
+      );
       add(
         chartStyleEffectOwner(label.labelBox?.style, series.seriesDataLabels?.labelBox?.style),
-        label.labelBox != null || series.seriesDataLabels?.labelBox != null
+        chartLabelBoxHasVisiblePaint(labelBox)
           ? chart.chartStyleRoles?.dataLabelCallout ?? chart.chartStyleRoles?.dataLabel
           : chart.chartStyleRoles?.dataLabel,
         0,
@@ -549,7 +553,7 @@ export function chartEffectConsumerUpperBound(chart: ChartModel): number {
         if (!dataLabelHasContent(chart, series, undefined)) continue;
         add(
           series.seriesDataLabels?.labelBox?.style,
-          series.seriesDataLabels?.labelBox != null
+          chartLabelBoxHasVisiblePaint(series.seriesDataLabels?.labelBox)
             ? chart.chartStyleRoles?.dataLabelCallout ?? chart.chartStyleRoles?.dataLabel
             : chart.chartStyleRoles?.dataLabel,
           0,
