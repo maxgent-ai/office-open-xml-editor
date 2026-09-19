@@ -10671,6 +10671,7 @@ fn parse_vml_pict(
     let text_box_node = shape
         .descendants()
         .find(|n| n.is_element() && n.tag_name().name() == "textbox");
+    let text_vert = vml_textbox_text_vert(text_box_node);
     let text_box_content_node = text_box_node.and_then(|text_box| {
         text_box
             .descendants()
@@ -10774,6 +10775,7 @@ fn parse_vml_pict(
         text_blocks,
         text_box_content,
         text_anchor: None,
+        text_vert,
         text_inset_l,
         text_inset_t,
         text_inset_r,
@@ -11109,6 +11111,25 @@ fn vml_textbox_insets(text_box: Option<roxmltree::Node>) -> [f64; 4] {
         return DEFAULTS;
     };
     parse_vml_textbox_inset(raw, DEFAULTS).unwrap_or(DEFAULTS)
+}
+
+/// ECMA-376 Part 4 §19.1.2.22 defines the legacy VML textbox
+/// `style:layout-flow` vocabulary. Normalize its vertical values to the
+/// DrawingML `bodyPr@vert` vocabulary already consumed by the DOCX layout
+/// pipeline. Word writes `layout-flow:vertical` in the VML fallback paired
+/// with `<wps:bodyPr vert="vert">`, so these two representations must produce
+/// the same all-glyphs-rotated text layout. The ideographic value has the
+/// corresponding `eaVert` semantics; horizontal values retain the default.
+fn vml_textbox_text_vert(text_box: Option<roxmltree::Node>) -> Option<String> {
+    let style = text_box?.attribute("style")?;
+    let layout_flow = vml_css_str(style, "layout-flow")?;
+    if layout_flow.eq_ignore_ascii_case("vertical") {
+        Some("vert".to_string())
+    } else if layout_flow.eq_ignore_ascii_case("vertical-ideographic") {
+        Some("eaVert".to_string())
+    } else {
+        None
+    }
 }
 
 /// Parse VML's `x,y` point-pair grammar used by `<v:line from/to>`.
@@ -24036,6 +24057,35 @@ mod txbx_block_wire_tests {
         )
         .expect("VML shape");
         assert_complete_wire(&shape);
+    }
+
+    #[test]
+    fn vml_textbox_vertical_layout_flow_maps_to_rotated_text() {
+        let xml = r##"<w:pict
+                  xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+                  xmlns:v="urn:schemas-microsoft-com:vml">
+                  <v:shape id="tb1" type="#_x0000_t202"
+                      style="position:relative;width:200pt;height:100pt">
+                    <v:textbox style="layout-flow:vertical"><w:txbxContent>
+                      <w:p><w:r><w:t>日本語文章</w:t></w:r></w:p>
+                    </w:txbxContent></v:textbox>
+                  </v:shape>
+                </w:pict>"##;
+        let document = roxmltree::Document::parse(xml).expect("VML fixture");
+        let mut num_map = NumberingMap::default();
+        let shape = parse_vml_pict(
+            &StyleMap::default(),
+            &mut num_map,
+            document.root_element(),
+            &ThemeColors::default(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            DepthGuard::root(),
+        )
+        .expect("VML shape");
+
+        assert_eq!(shape.text_vert.as_deref(), Some("vert"));
     }
 
     #[test]
