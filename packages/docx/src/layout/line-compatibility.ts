@@ -234,6 +234,28 @@ export const WORD_AUTO_MULTIPLE_BASELINE_PIN = defineCompatibilityRule({
   description: 'Paint a positive automatic line-spacing multiplier with its glyph baseline pinned inside the single design line, placing extra leading or compressed overflow toward block-end; this is draw-only and does not replace the centered trailing-mark pagination metric.',
 });
 
+export const WORD_INLINE_IMAGE_AUTO_LEADING = defineCompatibilityRule({
+  id: 'word-inline-image-auto-leading',
+  evidence: {
+    kind: 'office-observation',
+    syntheticFixtureId: 'inline-image-auto-leading-height-sweep',
+    application: 'Microsoft Word',
+    version: '16.111.1',
+    platform: 'macOS 26.5.2',
+  },
+  description: 'For an inline picture under automatic line spacing at or above one line, form the natural picture/text baseline union with a one-design-line floor, then add only the authored text design-line leading instead of multiplying the picture height.',
+});
+
+export function wordInlineImageAutoLineHeightPx(
+  glyphNaturalPx: number,
+  intendedSinglePx: number,
+  multiple: number,
+): number {
+  void WORD_INLINE_IMAGE_AUTO_LEADING;
+  return Math.max(glyphNaturalPx, intendedSinglePx)
+    + Math.max(0, intendedSinglePx * (multiple - 1));
+}
+
 export const WORD_MIXED_ANCHOR_VISIBLE_LINE_METRICS = defineCompatibilityRule({
   id: 'word-mixed-anchor-visible-line-metrics',
   evidence: {

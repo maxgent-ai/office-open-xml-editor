@@ -7387,7 +7387,36 @@ function chartStyleRoleChartArea(chart: ChartModel): ChartModel {
  * consumes directly from `ChartSeries`. Keeping this projection in core means
  * the 2-D, 3-D, DOCX, XLSX, and PPTX paths receive one effective precedence
  * result without teaching an optional renderer about package sidecars. */
-function applyLinkedChartStyleRoles(chart: ChartModel): ChartModel {
+function withOfficeStyleRasterLineFloor(chart: ChartModel, ptToPx: number): ChartModel {
+  const roles = chart.chartStyleRoles;
+  if (!roles || !(Number.isFinite(ptToPx) && ptToPx > 0)) return chart;
+  // Office keeps the authored/theme width in its vector output (for example,
+  // classic Style 2 emits a 6,350 EMU / 0.5pt black rule), then stroke-adjusts
+  // that vector to one opaque device pixel when an axis or gridline would
+  // otherwise land below a pixel. Canvas instead alpha-antialiases the
+  // subpixel stroke into a grey rule. Apply the observed raster floor only to
+  // those evidenced style roles in this render projection: direct `<a:ln w>`
+  // remains exact, other role families stay untouched, the source model keeps
+  // its ECMA-376 width, and zoomed widths naturally exceed the floor.
+  const minimumWidthEmu = EMU_PER_PT / ptToPx;
+  let changed = false;
+  const strokeAdjustedRoles = new Set<ChartStyleRole>([
+    'categoryAxis', 'seriesAxis', 'valueAxis', 'gridlineMajor', 'gridlineMinor',
+  ]);
+  const adjusted = Object.fromEntries(Object.entries(roles).map(([role, style]) => {
+    if (!strokeAdjustedRoles.has(role as ChartStyleRole)) return [role, style];
+    if (!style || style.lineWidthEmu == null
+      || !Number.isFinite(style.lineWidthEmu)
+      || style.lineWidthEmu <= 0
+      || style.lineWidthEmu >= minimumWidthEmu) return [role, style];
+    changed = true;
+    return [role, { ...style, lineWidthEmu: minimumWidthEmu }];
+  })) as typeof roles;
+  return changed ? { ...chart, chartStyleRoles: adjusted } : chart;
+}
+
+function applyLinkedChartStyleRoles(chart: ChartModel, ptToPx: number): ChartModel {
+  chart = withOfficeStyleRasterLineFloor(chart, ptToPx);
   if (!chart.chartStyleRoles?.errorBar
     && !chart.chartStyleRoles?.leaderLine
     && !chart.chartStyleRoles?.trendline
@@ -17043,7 +17072,7 @@ function renderChartImpl(
     // Parsed packages are already bounded, but the public ChartModel contract
     // can also be constructed directly by an application.
     if (rejectOversizedCanvasChart(ctx, rect, sourceStructureCount)) return;
-    chart = applyLinkedChartStyleRoles(chart);
+    chart = applyLinkedChartStyleRoles(chart, ptToPx);
     const { x, y, w, h } = rect;
     const rounded = chart.roundedCorners === true;
     const cornerRadius = rounded ? CHART_SPACE_CORNER_RADIUS_PT * ptToPx : 0;

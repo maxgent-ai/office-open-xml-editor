@@ -784,6 +784,82 @@ describe('measureParagraph', () => {
     expect(result.lines[0].advancePt).toBe(24);
   });
 
+  it.each([
+    { line: 240, multiple: 1, imageHeight: 5 },
+    { line: 240, multiple: 1, imageHeight: 28.3464567 },
+    { line: 259, multiple: 259 / 240, imageHeight: 10 },
+    { line: 259, multiple: 259 / 240, imageHeight: 28.3464567 },
+    { line: 276, multiple: 276 / 240, imageHeight: 20 },
+    { line: 276, multiple: 276 / 240, imageHeight: 50 },
+  ])(
+    'adds Calibri auto leading without scaling an image (line=$line, height=$imageHeight)',
+    ({ multiple, imageHeight }) => {
+      const auto = { value: multiple, rule: 'auto' as const, explicit: true };
+      const result = measureParagraph(
+        paragraph({
+          defaultFontFamily: 'Calibri',
+          defaultFontSize: 11,
+          spaceBefore: 0,
+          lineSpacing: auto,
+          runs: [{
+            type: 'image',
+            imagePath: 'word/media/inline.png',
+            mimeType: 'image/png',
+            widthPt: imageHeight,
+            heightPt: imageHeight,
+            anchor: false,
+          }],
+        }),
+        layoutContext({ spaceBeforePt: 0, lineSpacing: auto }),
+        placement(),
+        measurer,
+        environment(),
+      );
+
+      const designSingle = 11 * 2500 / 2048;
+      expect(result.lines[0].advancePt).toBeCloseTo(
+        Math.max(designSingle, imageHeight) + designSingle * (multiple - 1),
+        8,
+      );
+    },
+  );
+
+  it('retains authored Calibri descent below an inline-image baseline', () => {
+    const auto = { value: 259 / 240, rule: 'auto' as const, explicit: true };
+    const imageHeight = 28.3464567;
+    const result = measureParagraph(
+      paragraph({
+        defaultFontFamily: 'Calibri',
+        defaultFontSize: 11,
+        spaceBefore: 0,
+        lineSpacing: auto,
+        runs: [
+          { type: 'text', ...textRun('mixed', { fontFamily: 'Calibri', fontSize: 11 }) },
+          {
+            type: 'image',
+            imagePath: 'word/media/inline.png',
+            mimeType: 'image/png',
+            widthPt: imageHeight,
+            heightPt: imageHeight,
+            anchor: false,
+          },
+        ],
+      }),
+      layoutContext({ spaceBeforePt: 0, lineSpacing: auto }),
+      placement(),
+      measurer,
+      environment(),
+    );
+
+    const designSingle = 11 * 2500 / 2048;
+    const designDescent = 11 * 550 / 2048;
+    expect(result.lines[0].layout.descent).toBeCloseTo(designDescent, 8);
+    expect(result.lines[0].advancePt).toBeCloseTo(
+      imageHeight + designDescent + designSingle * (auto.value - 1),
+      8,
+    );
+  });
+
   it('preserves exact line spacing verbatim', () => {
     const exact = { value: 18, rule: 'exact' as const, explicit: true };
     const result = measureParagraph(

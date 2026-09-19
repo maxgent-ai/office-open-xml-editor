@@ -112,10 +112,12 @@ import {
   wordUniformRunPositionPaintPt,
   wordUseFeLayoutParagraphMarkGridAdvancePx,
   wordExternalLinkSyntaxBreakOffsets,
+  wordInlineImageAutoLineHeightPx,
 } from './layout/line-compatibility.js';
 import { wordNeutralAttachesToActiveScript } from './layout/script-compatibility.js';
 
 const CALIBRI_LINE_HEIGHT_RATIO = 2500 / 2048;
+const CALIBRI_DESCENT_RATIO = 550 / 2048;
 
 /**
  * The Office-bundled Calibri regular/bold/italic/bold-italic files all have a
@@ -139,6 +141,35 @@ function calibriAuthoredLineHeightRatio(
   return normalizeFontMetricFamily(font.requestedFamily) === 'calibri'
     ? CALIBRI_LINE_HEIGHT_RATIO
     : undefined;
+}
+
+/** Word aligns an inline DrawingML object to the text baseline. When visible
+ * Calibri text shares that line, the authored face's hhea descent therefore
+ * remains below the object even when Canvas paints through a substitute whose
+ * descent is smaller. All four Office-bundled Calibri faces use descent=550 at
+ * 2048 UPM. This value is consumed only by inline-image line union; ordinary
+ * text lines retain their established selected-face baseline. */
+function calibriInlineImageDescentRatio(
+  requestedFamily: string | null | undefined,
+  script: FontScriptSlot,
+): number | undefined {
+  return script === 'ascii'
+    && normalizeFontMetricFamily(requestedFamily ?? '') === 'calibri'
+      ? CALIBRI_DESCENT_RATIO
+      : undefined;
+}
+
+/** Authored paragraph-mark metrics needed when an inline image is the line's
+ * only visible item. Word still derives auto-spacing leading from the Calibri
+ * design line, but does not add the mark's descent to an image-only line. */
+export function calibriInlineImageParagraphSinglePx(
+  para: ParagraphLayoutSource,
+  scale: number,
+): number {
+  if (normalizeFontMetricFamily(getDefaultFontFamily(para) ?? '') !== 'calibri') {
+    return 0;
+  }
+  return CALIBRI_LINE_HEIGHT_RATIO * getDefaultFontSize(para) * scale;
 }
 
 /** Empty paragraph marks have no character whose font slot can inherit the
@@ -254,6 +285,10 @@ export interface LayoutTextSeg extends LayoutSegSource {
    * without a version-specific font constant. */
   resolvedLineHeightRatio?: number;
   resolvedEastAsianLineHeightRatio?: number;
+  /** Authored design descent used only when this visible text shares a line
+   * with an inline image. The object owns ascent; Word retains this descent
+   * below its baseline instead of substituting the selected Canvas descent. */
+  inlineImageDesignDescentRatio?: number;
   /** The selected face's design line is exact enough to replace a larger,
    * integer-quantized Canvas font box. Currently bounded to the observed
    * Calibri/Carlito auto-spacing matrix; other resource metrics remain floors. */
@@ -557,6 +592,9 @@ export interface LayoutImageSeg extends LayoutSegSource {
   imagePath: string;
   /** MIME type of the blip at {@link LayoutImageSeg.imagePath}. */
   mimeType: string;
+  /** This segment came from `pic:pic`, rather than a chart/shape sentinel that
+   * shares the same line-breaking structure. */
+  inlinePicture?: true;
   widthPt: number;
   heightPt: number;
   rotation?: number;
@@ -646,6 +684,8 @@ export interface LayoutLine {
   /** px — intended single-line height (max over segments of the selected
    * resource ratio, with the established compatibility registry as fallback). */
   intendedSingle: number;
+  /** True only for a non-floating picture (`w:drawing/wp:inline/pic:pic`). */
+  hasInlineImage?: boolean;
   /** px — DESIGN grid-count height: the max over segments of each run's
    *  format-policy single-line height (a resolved resource's design height,
    *  or the generic East Asian fallback). Feeds docGrid cell
@@ -723,7 +763,15 @@ export interface WrapLayoutCtx {
   /** Per-line box-height resolver (line natural ascent+descent → total px box height).
    *  `gridCountSinglePx` (the line's design grid-count height) keeps the
    *  float-wrap advance consistent with the final render's docGrid cell count. */
-  lineBoxH: (ascentPx: number, descentPx: number, hasRuby?: boolean, intendedSinglePx?: number, eastAsian?: boolean, gridCountSinglePx?: number) => number;
+  lineBoxH: (
+    ascentPx: number,
+    descentPx: number,
+    hasRuby?: boolean,
+    intendedSinglePx?: number,
+    eastAsian?: boolean,
+    gridCountSinglePx?: number,
+    hasInlineImage?: boolean,
+  ) => number;
   /** Hard cap on Y to keep layout from running past the page. */
   pageH: number;
 }
@@ -1779,6 +1827,10 @@ export function lineBoxHeight(
   // px — unresolved East Asian run em used only by direct/synthetic callers that
   // cannot provide the producer-computed per-line gridCountSinglePx.
   untabledEastAsianEmPx?: number,
+  // A non-floating picture participates in the line's natural ascent/descent
+  // union, but Word applies auto leading from the text design line rather than
+  // multiplying the picture itself.
+  hasInlineImage = false,
 ): number {
   const glyphNatural = ascentPx + descentPx;
   // For `auto`/single spacing the multiplier applies to the intended font's
@@ -1855,6 +1907,15 @@ export function lineBoxHeight(
           : allocated;
       }
       return Math.max(glyphNatural, pitchPx * ls.value);
+    }
+    if (hasInlineImage && ls.value >= 1) {
+      // Office-produced 5/10/20/28.346/50pt picture sweeps at 1.0, 1.079 and
+      // 1.15 line multiples establish this composition: first form the natural
+      // baseline union, floor it to one text design line, then add only the
+      // text line's authored leading. Multiplying the whole picture made the
+      // error grow with object height. ECMA-376 §17.3.1.33 specifies the auto
+      // multiple but not this inline-object composition.
+      return wordInlineImageAutoLineHeightPx(glyphNatural, intendedSinglePx, ls.value);
     }
     return natural * ls.value;
   }
@@ -3372,6 +3433,12 @@ export function buildSegments(
         && resolvedScript === 'ascii'
         ? calibriAuthoredLineHeightRatio(resolvedSpan?.font)
         : undefined;
+      const inlineImageDesignDescentRatio = environment.useFeLayout !== true
+        ? calibriInlineImageDescentRatio(
+            resolvedSpan?.font.requestedFamily ?? fontFamily,
+            resolvedScript,
+          )
+        : undefined;
       const resolvedLineHeightRatio = familyLineMetric?.lineHeightRatio
         ?? authoredCalibriRatio;
       const mayShrinkToCalibriDesignLine = resolvedLineHeightRatio != null
@@ -3406,6 +3473,9 @@ export function buildSegments(
         fontRoute: resolvedSpan?.fontRoute,
         resolvedLineHeightRatio,
         resolvedEastAsianLineHeightRatio: familyLineMetric?.eastAsianLineHeightRatio,
+        ...(inlineImageDesignDescentRatio !== undefined
+          ? { inlineImageDesignDescentRatio }
+          : {}),
         ...(mayShrinkToCalibriDesignLine
           ? { designLineMayShrinkSelectedFontBox: true as const }
           : {}),
@@ -3664,6 +3734,7 @@ export function buildSegments(
       segs.push({
         imagePath: img.imagePath,
         mimeType: img.mimeType,
+        inlinePicture: true,
         widthPt: img.widthPt,
         heightPt: img.heightPt,
         rotation: img.rotation,
@@ -4183,6 +4254,7 @@ export function layoutLines(
   widthPolicy?: 'bounded' | 'intrinsic',
   verticalGlyphMeasurement?: VerticalGlyphMeasurementService,
   overflowPunct?: boolean,
+  inlineImageDefaultSinglePx?: number,
 ): LayoutLine[];
 export function layoutLines(
   ctx: MeasurementTextContext,
@@ -4231,6 +4303,7 @@ export function layoutLines(
   widthPolicy: 'bounded' | 'intrinsic' = 'bounded',
   verticalGlyphMeasurement?: VerticalGlyphMeasurementService,
   overflowPunct = false,
+  inlineImageDefaultSinglePx = 0,
   passContext?: Readonly<{
     probeHeights: readonly number[] | null;
     preparedFloatWrap?: PreparedFloatWrap;
@@ -4267,6 +4340,7 @@ export function layoutLines(
       widthPolicy,
       verticalGlyphMeasurement,
       overflowPunct,
+      inlineImageDefaultSinglePx,
       { probeHeights, preparedFloatWrap },
     );
     if (!wrapCtx || widthPolicy === 'intrinsic') return runPass(null);
@@ -4282,6 +4356,7 @@ export function layoutLines(
         line.intendedSingle,
         line.eastAsian,
         line.gridCountSingle,
+        line.hasInlineImage,
       ),
     );
   }
@@ -4322,6 +4397,8 @@ export function layoutLines(
   let lineVisibleDescent = 0;
   let lineVisibleIntendedSingle = 0;
   let lineHasVisibleMetrics = false;
+  let lineHasInlineImage = false;
+  let lineInlineImageDesignDescent = 0;
   let isFirst = true;
   // Effective width/offset for the current line after float exclusion.
   let lineMaxWidth = maxWidth;
@@ -4556,7 +4633,11 @@ export function layoutLines(
     // stays consistent with non-empty lines.
     const hasContent = lineAscent > 0 || lineDescent > 0;
     const asc = hasContent ? lineAscent : h * scale * 0.8;
-    const desc = hasContent ? lineDescent : h * scale * 0.2;
+    const desc = hasContent
+      ? (lineHasInlineImage && inlineImageDefaultSinglePx > 0
+          ? Math.max(lineDescent, lineInlineImageDesignDescent)
+          : lineDescent)
+      : h * scale * 0.2;
     const visibleAscent = lineHasVisibleMetrics ? lineVisibleAscent : asc;
     const visibleDescent = lineHasVisibleMetrics ? lineVisibleDescent : desc;
     const visibleIntendedSingle = lineHasVisibleMetrics
@@ -4564,6 +4645,9 @@ export function layoutLines(
       : lineIntendedSingle;
     const gridCountSingle = lineGridCountSingle
       || (lineEastAsian ? eastAsianGridCountSinglePx(lineIntendedSingle, h * scale) : asc + desc);
+    const intendedSingle = lineHasInlineImage && inlineImageDefaultSinglePx > 0
+      ? Math.max(lineIntendedSingle, inlineImageDefaultSinglePx)
+      : lineIntendedSingle;
     lines.push({
       segments: currentLine,
       height: h,
@@ -4572,7 +4656,8 @@ export function layoutLines(
       visibleAscent,
       visibleDescent,
       visibleIntendedSingle,
-      intendedSingle: lineIntendedSingle,
+      intendedSingle,
+      ...(lineHasInlineImage ? { hasInlineImage: true as const } : {}),
       // Empty/synthetic East Asian lines use the same design-height rule as a
       // text run; their synthesized Canvas box must not reintroduce a
       // scale-dependent cell count.
@@ -4590,9 +4675,10 @@ export function layoutLines(
         asc,
         desc,
         lineHasRuby,
-        lineIntendedSingle,
+        intendedSingle,
         lineEastAsian,
         gridCountSingle,
+        lineHasInlineImage,
       );
     }
     currentLine = [];
@@ -4611,6 +4697,8 @@ export function layoutLines(
     lineVisibleDescent = 0;
     lineVisibleIntendedSingle = 0;
     lineHasVisibleMetrics = false;
+    lineHasInlineImage = false;
+    lineInlineImageDesignDescent = 0;
     lineHasRuby = false;
     lineEastAsian = false;
     lineHasSea = false;
@@ -4809,6 +4897,18 @@ export function layoutLines(
       lineHasVisibleMetrics = true;
       if (asc > lineVisibleAscent) lineVisibleAscent = asc;
       if (desc > lineVisibleDescent) lineVisibleDescent = desc;
+    }
+    if ('imagePath' in s && !s.anchor && s.inlinePicture === true) {
+      lineHasInlineImage = true;
+    } else if (
+      'text' in s
+      && s.metricOnly !== true
+      && s.inlineImageDesignDescentRatio !== undefined
+    ) {
+      lineInlineImageDesignDescent = Math.max(
+        lineInlineImageDesignDescent,
+        s.inlineImageDesignDescentRatio * calcEffectiveFontPx(s, scale),
+      );
     }
     // Grid-count height for docGrid cell allocation (§17.6.5). Only East Asian
     // TEXT (and tall inline objects) drives the count — a Latin run keeps its

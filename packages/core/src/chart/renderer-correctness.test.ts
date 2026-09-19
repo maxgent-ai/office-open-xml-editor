@@ -15459,6 +15459,33 @@ describe('CH6 — axis scale model', () => {
     )).toBe(true);
   });
 
+  it('stroke-adjusts subpixel style roles without widening direct line formatting', () => {
+    const styled = segRecordingCtx();
+    renderChart(styled.ctx, lineModel({
+      valAxisMajorGridlines: true,
+      chartStyleRoles: {
+        gridlineMajor: { lineColors: ['000000'], lineWidthEmu: 6_350 },
+      },
+    }), RECT, 1);
+    const styledLines = styled.segs.filter(segment =>
+      segment.ss === '#000000' && Math.abs(segment.x1 - segment.x0) > 50
+    );
+    expect(styledLines.length).toBeGreaterThan(0);
+    expect(styledLines.every(segment => segment.lw === 1)).toBe(true);
+
+    const direct = segRecordingCtx();
+    renderChart(direct.ctx, lineModel({
+      valAxisMajorGridlines: true,
+      valAxisGridlineColor: '000000',
+      valAxisGridlineWidthEmu: 6_350,
+    }), RECT, 1);
+    const directLines = direct.segs.filter(segment =>
+      segment.ss === '#000000' && Math.abs(segment.x1 - segment.x0) > 50
+    );
+    expect(directLines.length).toBeGreaterThan(0);
+    expect(directLines.every(segment => segment.lw === 0.5)).toBe(true);
+  });
+
   it('keeps direct gridline paint and noFill ahead of linked roles', () => {
     const direct = segRecordingCtx();
     renderChart(direct.ctx, lineModel({
