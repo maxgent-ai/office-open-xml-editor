@@ -113,6 +113,9 @@ import {
   wordUseFeLayoutParagraphMarkGridAdvancePx,
   wordExternalLinkSyntaxBreakOffsets,
   wordInlineImageAutoLineHeightPx,
+  WORD_CALIBRI_AUTHORED_ADVANCE_ROUTE,
+  WORD_CALIBRI_AUTHORED_DESIGN_LINE,
+  WORD_INLINE_IMAGE_AUTO_LEADING,
 } from './layout/line-compatibility.js';
 import { wordNeutralAttachesToActiveScript } from './layout/script-compatibility.js';
 
@@ -120,10 +123,9 @@ const CALIBRI_LINE_HEIGHT_RATIO = 2500 / 2048;
 const CALIBRI_DESCENT_RATIO = 550 / 2048;
 
 /**
- * The Office-bundled Calibri regular/bold/italic/bold-italic files all have a
- * 2500/2048 hhea line, and Word PDF controls confirm that the authored face's
- * design line remains the auto-line authority even when a browser has to paint
- * with a substitute. ECMA-376 §17.8.2 leaves glyph substitution
+ * Compatibility projection governed by
+ * {@link WORD_CALIBRI_AUTHORED_DESIGN_LINE}. The supported Calibri face tuples
+ * all have a 2500/2048 hhea line. ECMA-376 §17.8.2 leaves glyph substitution
  * implementation-defined, but substitution must not silently change the
  * document's pagination metric. `resolvedDesignLineMetrics` still expands to
  * the selected glyph ink when necessary, so this rule cannot clip a fallback.
@@ -131,6 +133,7 @@ const CALIBRI_DESCENT_RATIO = 550 / 2048;
 function calibriAuthoredLineHeightRatio(
   font: TextShapeSpan['font'] | undefined,
 ): number | undefined {
+  void WORD_CALIBRI_AUTHORED_DESIGN_LINE;
   if (
     !font
     || (font.weight !== 400 && font.weight !== 700)
@@ -143,9 +146,10 @@ function calibriAuthoredLineHeightRatio(
     : undefined;
 }
 
-/** Word aligns an inline DrawingML object to the text baseline. When visible
- * Calibri text shares that line, the authored face's hhea descent therefore
- * remains below the object even when Canvas paints through a substitute whose
+/** Compatibility projection governed by {@link WORD_INLINE_IMAGE_AUTO_LEADING}.
+ * When visible Calibri text shares an inline object's baseline, the authored
+ * face's hhea descent remains below the object even when Canvas paints through
+ * a substitute whose
  * descent is smaller. All four Office-bundled Calibri faces use descent=550 at
  * 2048 UPM. This value is consumed only by inline-image line union; ordinary
  * text lines retain their established selected-face baseline. */
@@ -153,6 +157,7 @@ function calibriInlineImageDescentRatio(
   requestedFamily: string | null | undefined,
   script: FontScriptSlot,
 ): number | undefined {
+  void WORD_INLINE_IMAGE_AUTO_LEADING;
   return script === 'ascii'
     && normalizeFontMetricFamily(requestedFamily ?? '') === 'calibri'
       ? CALIBRI_DESCENT_RATIO
@@ -160,7 +165,7 @@ function calibriInlineImageDescentRatio(
 }
 
 /** Authored paragraph-mark metrics needed when an inline image is the line's
- * only visible item. Word still derives auto-spacing leading from the Calibri
+ * only visible item. Auto-spacing leading is derived from the Calibri
  * design line, but does not add the mark's descent to an image-only line. */
 export function calibriInlineImageParagraphSinglePx(
   para: ParagraphLayoutSource,
@@ -173,7 +178,7 @@ export function calibriInlineImageParagraphSinglePx(
 }
 
 /** Empty paragraph marks have no character whose font slot can inherit the
- * authored Calibri design line. Office-produced empty-mark controls retain
+ * authored Calibri design line. The compatibility boundary retains
  * their measured mark allocation unless the resolver selected the registered
  * metric-compatible Carlito face explicitly. */
 function calibriSelectedSubstituteLineHeightRatio(
@@ -193,17 +198,18 @@ function calibriSelectedSubstituteLineHeightRatio(
     : undefined;
 }
 
-/** Whether the selected regular face can use its natural Canvas advance as
- * Word's line-fit authority. ECMA-376 §17.8.2 leaves substitution
+/** Compatibility projection governed by
+ * {@link WORD_CALIBRI_AUTHORED_ADVANCE_ROUTE}. ECMA-376 §17.8.2 leaves substitution
  * implementation-defined, so this compatibility boundary is intentionally
- * narrow: a Canvas probe must prove actual authored Calibri, or the resolver
- * must select the loaded regular Carlito route registered as Calibri's
- * metric-compatible substitute. Route registration and arbitrary caller font
- * metrics alone do not establish Word-compatible advances. */
+ * narrow: the selected Calibri route must carry a positive resource-owned
+ * font-box metric, or the resolver must select the loaded regular Carlito route
+ * registered as Calibri's metric-compatible substitute. An unrelated face
+ * metric does not establish compatible advances. */
 function calibriAdvanceMatchesAuthoredFace(
   font: TextShapeSpan['font'] | undefined,
   metric: Readonly<ResolvedFontMetric> | undefined,
 ): boolean {
+  void WORD_CALIBRI_AUTHORED_ADVANCE_ROUTE;
   if (!font || font.weight !== 400 || font.style !== 'normal') return false;
   if (normalizeFontMetricFamily(font.requestedFamily) !== 'calibri') return false;
   const resolved = normalizeFontMetricFamily(font.resolvedFamily);
@@ -831,7 +837,7 @@ export interface LineLayoutEnvironment {
    * the authored frame height remains authoritative even when glyph paint is
    * lowered beyond it. Folded into retained text segments during acquisition. */
   readonly positionExtendsLineBox?: boolean;
-  /** Observed Word compatibility boundary for an explicitly authored
+  /** `word-calibri-authored-design-line` boundary for an explicitly authored
    * `w:spacing/@w:line` with `lineRule="auto"`: the multiple is applied to
    * the authored face's design line even when Canvas paints with an
    * unregistered substitute. Omitted/default single spacing continues to use
@@ -1203,11 +1209,11 @@ export function segmentEastAsiaFloorSingleLinePx(
  *
  * Canvas fontBoundingBox values are device-pixel quantized even for an exact
  * selected face. In Chromium, real Calibri Regular at 10px reports a 13px font
- * box although its hhea line is 2500/2048em (12.207px); Word advances by the
- * latter. At 11px the same Canvas box is only 13px and the 13.428px design line
- * remains the floor. This boundary was observed with both Office Calibri and
- * its metric-compatible Carlito substitute. ECMA-376 §17.3.1.33 defines how
- * auto spacing multiplies a line, but does not define browser metric routing.
+ * box although its hhea line is 2500/2048em (12.207px); the compatibility
+ * projection advances by the latter. At 11px the same Canvas box is only 13px
+ * and the 13.428px design line remains the floor. The bounded routes are
+ * declared by `word-calibri-authored-design-line`. ECMA-376 §17.3.1.33 defines
+ * how auto spacing multiplies a line, but does not define browser metric routing.
  *
  * Restrict shrinking to a resolved metric carried by the selected face. Tight
  * actual ink still extends either side, so this can never clip a glyph merely
@@ -1828,7 +1834,7 @@ export function lineBoxHeight(
   // cannot provide the producer-computed per-line gridCountSinglePx.
   untabledEastAsianEmPx?: number,
   // A non-floating picture participates in the line's natural ascent/descent
-  // union, but Word applies auto leading from the text design line rather than
+  // union, but auto leading comes from the text design line rather than
   // multiplying the picture itself.
   hasInlineImage = false,
 ): number {
@@ -2736,13 +2742,13 @@ export function splitTextForLayout(text: string): string[] {
 export const DEFAULT_TAB_PT = 36;
 
 /** Compatibility budget for unresolved browser-font advance bias. This is not
- *  a claim that Word generally compresses non-justified lines: ECMA-376 does
- *  not prescribe that behavior, and Office-produced resolved-face controls
- *  wrap at natural width. The allowance is retained only when at least one
- *  visible segment has no Office-compatible advance proof. A registered CSS
- *  family name and a generic exact-face probe are not Word-geometry claims; the
- *  allowance is removed only for the narrow authored-Calibri routes documented
- *  by `calibriAdvanceMatchesAuthoredFace`. Per §17.18.44 it is also suppressed
+ *  a general non-justified-line compression rule: ECMA-376 does not prescribe
+ *  that behavior, and resolved-face controls wrap at natural width. The
+ *  allowance is retained only when at least one visible segment lacks the
+ *  compatible advance proof defined by `word-calibri-authored-advance-route`.
+ *  A registered CSS family name and an unrelated exact-face metric are insufficient;
+ *  the allowance is removed only for the narrow routes projected by
+ *  `calibriAdvanceMatchesAuthoredFace`. Per §17.18.44 it is also suppressed
  *  when the draw pass will fully justify the line (issue #698).
  *
  *  For eligible unresolved non-justified lines this is the ONE budget shared by both sides
@@ -3418,10 +3424,10 @@ export function buildSegments(
         ?? eaFontFamily;
       const resolvedScript = resolvedSpan?.script ?? authoritativeSpan?.script
         ?? (cs ? 'complexScript' : EAST_ASIAN_RE.test(text) ? 'eastAsia' : 'ascii');
-      // Observed Word compatibility boundary: with useFELayout enabled, a
+      // `word-use-fe-layout-inherited-grid-minimum`: with useFELayout enabled, a
       // visible Latin line that has an effective eastAsia axis participates in
       // Far-East grid metrics even when its own ASCII/high-ANSI face differs.
-      // The active-grid Office matrix includes that mixed-slot counterexample;
+      // The active-grid boundary matrix includes that mixed-slot counterexample;
       // without useFELayout, merely declaring an EA family changes nothing.
       const useFeEastAsianMetric = environment.useFeLayout
         && (r.fontHint === 'eastAsia' || Boolean(resolvedEaFloorFamily?.trim()));
@@ -4574,8 +4580,8 @@ export function layoutLines(
   // trailing-space shrink budget for the dictionary scripts.
   let lineHasSea = false;
   // Space-shrink exists to absorb an unresolved browser fallback's
-  // Canvas-vs-Word advance bias. Registration and a generic font-box probe do
-  // not prove Word-compatible advances. Office-produced 10pt controls establish
+  // Canvas-vs-reference advance bias. Registration and an unrelated font-box
+  // metric do not prove compatible advances. The authored-route boundary establishes
   // natural-width wrapping only for actual probed Calibri Regular and the
   // resolver's regular Calibri→Carlito metric-compatible substitute; an
   // unresolved substituted title is the counterexample retaining the budget.
@@ -6412,8 +6418,9 @@ export function layoutLines(
     );
     // §17.3.1.21 permits one eligible punctuation character past the text
     // extent. The isolated compatibility predicate owns both the CJK-language
-    // sets documented by [MS-OE376] §2.1.56 and Word's observed Latin-parent
-    // extension, while excluding the complex-script counterexample. CJK
+    // sets and the bounded Latin-parent extension owned by
+    // `wordIsOverflowPunctuation`, while excluding the complex-script
+    // counterexample. CJK
     // segments that need an internal split retain their separate
     // overflowPunct-vs-kinsoku rule.
     const visibleSegmentScalars = [...trimmed];

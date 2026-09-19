@@ -31,7 +31,10 @@ import {
   type GlyphMeasureRequest,
 } from './text.js';
 import type { LayoutServices } from './types.js';
-import { wordResolvedEastAsianSingleLineRatio } from './line-compatibility.js';
+import {
+  WORD_CALIBRI_AUTHORED_DESIGN_LINE,
+  wordResolvedEastAsianSingleLineRatio,
+} from './line-compatibility.js';
 import type { DocxResolvedFontMetricCandidate } from '../document-content.js';
 
 export interface LoadedFontFaceRecord {
@@ -62,6 +65,7 @@ function canvasResolvedFontMetrics(
   candidates: readonly DocxResolvedFontMetricCandidate[],
   context: MeasurementTextContext | null,
 ): Readonly<Record<string, ResolvedFontMetric>> {
+  void WORD_CALIBRI_AUTHORED_DESIGN_LINE;
   if (!context) return {};
   const metrics: Record<string, ResolvedFontMetric> = {};
   for (const candidate of candidates) {
@@ -87,8 +91,8 @@ function canvasResolvedFontMetrics(
     );
     if (!(fontBoxRatio != null && fontBoxRatio > 0)) continue;
     if (familyKey === 'calibri') {
-      // Observed Word compatibility rule, bounded to a face that the Canvas
-      // probe proved was actually selected. Office-bundled Calibri Regular,
+      // `word-calibri-authored-design-line`, bounded to a face that the Canvas
+      // probe proved was actually selected. Calibri Regular,
       // Bold, Italic and Bold Italic all have hhea ascent=1950, descent=-550,
       // lineGap=0 at 2048 UPM, hence (1950 - -550 + 0) / 2048 em. Applying
       // this by authored name or from a different face tuple is incorrect when

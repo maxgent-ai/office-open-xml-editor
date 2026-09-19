@@ -234,6 +234,30 @@ export const WORD_AUTO_MULTIPLE_BASELINE_PIN = defineCompatibilityRule({
   description: 'Paint a positive automatic line-spacing multiplier with its glyph baseline pinned inside the single design line, placing extra leading or compressed overflow toward block-end; this is draw-only and does not replace the centered trailing-mark pagination metric.',
 });
 
+export const WORD_CALIBRI_AUTHORED_DESIGN_LINE = defineCompatibilityRule({
+  id: 'word-calibri-authored-design-line',
+  evidence: {
+    kind: 'office-observation',
+    syntheticFixtureId: 'calibri-authored-design-line-boundary-matrix',
+    application: 'Microsoft Word',
+    version: '16.111.1',
+    platform: 'macOS 26.5.2',
+  },
+  description: 'For visible Latin text with explicitly authored automatic line spacing, retain Calibri\'s 2500/2048-em hhea design line across regular, bold, italic, and bold-italic faces even when paint uses a substitute. Loaded Calibri and the registered metric-compatible Carlito tuple retain the same design line; selected glyph ink may expand it to avoid clipping. Omitted/default single spacing and content-less paragraph marks are counterexamples and remain governed by the selected face metrics.',
+});
+
+export const WORD_CALIBRI_AUTHORED_ADVANCE_ROUTE = defineCompatibilityRule({
+  id: 'word-calibri-authored-advance-route',
+  evidence: {
+    kind: 'office-observation',
+    syntheticFixtureId: 'calibri-authored-advance-route-boundary-matrix',
+    application: 'Microsoft Word',
+    version: '16.111.1',
+    platform: 'macOS 26.5.2',
+  },
+  description: 'Use natural-width wrapping without fallback tolerance only when the selected Calibri Regular route carries a positive resource-owned font-box metric or the resolver selects the registered regular Carlito metric-compatible substitute. A merely authored Calibri name, an unrelated face metric, non-regular tuples, and an unresolved browser substitute retain the bounded advance-bias allowance.',
+});
+
 export const WORD_INLINE_IMAGE_AUTO_LEADING = defineCompatibilityRule({
   id: 'word-inline-image-auto-leading',
   evidence: {
@@ -243,7 +267,7 @@ export const WORD_INLINE_IMAGE_AUTO_LEADING = defineCompatibilityRule({
     version: '16.111.1',
     platform: 'macOS 26.5.2',
   },
-  description: 'For an inline picture under automatic line spacing at or above one line, form the natural picture/text baseline union with a one-design-line floor, then add only the authored text design-line leading instead of multiplying the picture height. Controlled Office sweeps cover 5–255pt pictures at 1.0, 1.079, and 1.15 line multiples; the added leading stayed independent of picture height throughout that range.',
+  description: 'For an inline picture under automatic line spacing at or above one line, align the object to the text baseline, form the natural picture/text union with a one-design-line floor, then add only the authored text design-line leading instead of multiplying the picture height. Calibri text retains its authored 550/2048-em descent below that shared baseline. Controlled Office sweeps cover 5–255pt pictures at 1.0, 1.079, and 1.15 line multiples; the added leading stayed independent of picture height throughout that range.',
 });
 
 export function wordInlineImageAutoLineHeightPx(

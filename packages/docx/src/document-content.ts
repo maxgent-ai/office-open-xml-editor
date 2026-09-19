@@ -306,9 +306,9 @@ export function docxResolvedFontMetricCandidates(
         const family = familyValue?.trim();
         if (!family) continue;
         const key = family.toLocaleLowerCase('en-US');
-        // Calibri is the one Latin family for which DOCX currently has an
-        // Office-observed design-line rule. All four Word-used face tuples
-        // share the same hhea line, but each rendered tuple is enrolled
+        // Compatibility enrollment for `word-calibri-authored-design-line`.
+        // All four supported face tuples share the same hhea line, but each
+        // rendered tuple is enrolled
         // separately so production must prove that Canvas selected that face
         // before applying it. Other Latin families remain regular-only and
         // charset-gated for the established FE path.

@@ -477,7 +477,7 @@ function solveTableColumnWidths(input: TableColumnLayoutInput): readonly number[
   const columnCount = requiredColumnCount(input);
   if (columnCount === 0) return Object.freeze([]);
   // Preserve the normative fixed-width pass as a standalone solver step. The
-  // observed Word rule chooses the authored grid as the AutoFit seed instead;
+  // compatibility predicate chooses the authored grid as the AutoFit seed;
   // all subsequent content constraints and occurrence fitting remain shared.
   const widths = wordKeepsFullBandGridForAutofitCellOverflow(input)
     ? Array.from({ length: columnCount }, (_unused, column) => (

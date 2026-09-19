@@ -1224,11 +1224,11 @@ export interface TableColumnLayoutInput {
   readonly gridWidthKeys?: readonly (string | null)[];
   /** True only when every shared track came from an authored `<w:tblGrid>`.
    * Omitted grids and grids extended to satisfy semantic content must not
-   * acquire Word's saved-grid AutoFit compatibility behavior. */
+   * acquire the saved-grid AutoFit compatibility behavior. */
   readonly gridAuthoredComplete?: boolean;
   /** True only for an effective authored `<w:tblW w:type="auto">` table
    * width. Omitted/nil widths are geometrically null but are not equivalent
-   * provenance for Office compatibility rules. */
+   * provenance for compatibility predicates. */
   readonly tableWidthAutoAuthored?: boolean;
   readonly tablePreferredWidthPt: number | null;
   readonly rows: readonly TableColumnRowConstraint[];
