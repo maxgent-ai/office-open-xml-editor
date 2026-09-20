@@ -3371,6 +3371,43 @@ fn parse_chart_title_rich_runs(
     (!runs.is_empty()).then_some(runs)
 }
 
+/// Detect the source-shape boundary observed for Office's automatic light
+/// title paint in classic styles 41–48. Only paragraph defaults on the rich
+/// paragraphs that actually supply title text participate. A sibling
+/// `<c:title><c:txPr>` and empty formatting-only paragraphs are different
+/// sources and must not enable the compatibility rule.
+///
+/// The Office-produced probes established the single-textual-paragraph case.
+/// Multi-paragraph titles remain on the normative numeric default until a
+/// per-paragraph Office rule is established and representable in the model.
+fn title_rich_text_has_observed_paragraph_default_run(title: Node) -> bool {
+    let Some(rich) = child(title, "tx").and_then(|tx| child(tx, "rich")) else {
+        return false;
+    };
+    let mut textual_paragraphs = rich
+        .children()
+        .filter(|node| node.is_element() && node.tag_name().name() == "p")
+        .filter(|paragraph| {
+            paragraph
+                .children()
+                .filter(|node| node.is_element() && matches!(node.tag_name().name(), "r" | "fld"))
+                .any(|run| {
+                    child(run, "t")
+                        .and_then(|text| text.text())
+                        .is_some_and(|text| !text.is_empty())
+                })
+        });
+    let Some(paragraph) = textual_paragraphs.next() else {
+        return false;
+    };
+    if textual_paragraphs.next().is_some() {
+        return false;
+    }
+    child(paragraph, "pPr")
+        .and_then(|properties| child(properties, "defRPr"))
+        .is_some()
+}
+
 /// Parse the Chart Drawing part referenced by `<c:userShapes r:id>`.
 ///
 /// ECMA-376 `dml-chartDrawing.xsd` defines each `cdr:relSizeAnchor` as `from`
@@ -14054,6 +14091,16 @@ pub fn parse_chart_part_with_references_style_parts_and_images(
             title.font_baseline = None;
         }
     }
+    if let (Some(style), Some(roles)) = (legacy_chart_style, classic_chart_style_roles.as_mut()) {
+        let title_has_paragraph_default_run =
+            title_node_opt.is_some_and(title_rich_text_has_observed_paragraph_default_run);
+        classic_style::apply_office_dark_text_contrast(
+            style,
+            title_has_paragraph_default_run,
+            color_resolver,
+            roles,
+        );
+    }
     // Surface value bands are neither source series nor source points. Their
     // count becomes final only after the Canvas renderer plans the value axis,
     // so preserve a bounded band-domain numeric role here instead of replaying
@@ -17179,6 +17226,110 @@ Subtitle</a:t></a:r></a:p>
 
         assert_eq!(chart.series[0].color.as_deref(), Some("ED7D31"));
         assert_eq!(chart.series[1].color.as_deref(), Some("ED7D31"));
+    }
+
+    #[test]
+    fn dark_classic_text_uses_office_contrast_with_the_observed_title_carrier_gate() {
+        let parse = |style: u8, paragraph_default_run: &str| {
+            let xml = format!(
+                r#"<c:chartSpace xmlns:c="{C_NS}" xmlns:a="{A_NS}">
+                  <c:style val="{style}"/><c:chart><c:title><c:tx><c:rich>
+                    <a:bodyPr/><a:lstStyle/><a:p>{paragraph_default_run}<a:r><a:t>Title</a:t></a:r></a:p>
+                  </c:rich></c:tx></c:title><c:plotArea><c:barChart>
+                    <c:barDir val="col"/><c:ser><c:idx val="0"/><c:order val="0"/>
+                      <c:cat><c:strLit><c:pt idx="0"><c:v>A</c:v></c:pt></c:strLit></c:cat>
+                      <c:val><c:numLit><c:pt idx="0"><c:v>1</c:v></c:pt></c:numLit></c:val>
+                    </c:ser>
+                  </c:barChart></c:plotArea><c:legend/></c:chart></c:chartSpace>"#,
+            );
+            let document = chart_space_of(&xml);
+            parse_chart_part(document.root_element(), &FixtureResolver)
+                .expect("classic dark chart parses")
+        };
+
+        let without_default_run = parse(41, "");
+        let roles = without_default_run.classic_chart_style_roles.unwrap();
+        assert_eq!(roles["categoryAxis"].font_color.as_deref(), Some("FFFFFF"));
+        assert_eq!(roles["legend"].font_color.as_deref(), Some("FFFFFF"));
+        assert_eq!(roles["title"].font_color.as_deref(), Some("000000"));
+
+        let with_default_run = parse(41, "<a:pPr><a:defRPr/></a:pPr>");
+        let roles = with_default_run.classic_chart_style_roles.unwrap();
+        assert_eq!(roles["title"].font_color.as_deref(), Some("FFFFFF"));
+
+        let light_style = parse(40, "<a:pPr><a:defRPr/></a:pPr>");
+        let roles = light_style.classic_chart_style_roles.unwrap();
+        assert_eq!(roles["title"].font_color.as_deref(), Some("000000"));
+        assert_eq!(roles["legend"].font_color.as_deref(), Some("000000"));
+    }
+
+    #[test]
+    fn dark_classic_title_carrier_gate_uses_only_textual_rich_paragraphs() {
+        let parse = |title_body: &str| {
+            let xml = format!(
+                r#"<c:chartSpace xmlns:c="{C_NS}" xmlns:a="{A_NS}">
+                  <c:style val="41"/><c:chart><c:title>{title_body}</c:title>
+                  <c:plotArea><c:barChart><c:barDir val="col"/>
+                    <c:ser><c:idx val="0"/><c:order val="0"/>
+                      <c:cat><c:strLit><c:pt idx="0"><c:v>A</c:v></c:pt></c:strLit></c:cat>
+                      <c:val><c:numLit><c:pt idx="0"><c:v>1</c:v></c:pt></c:numLit></c:val>
+                    </c:ser>
+                  </c:barChart></c:plotArea></c:chart></c:chartSpace>"#,
+            );
+            let document = chart_space_of(&xml);
+            parse_chart_part(document.root_element(), &FixtureResolver)
+                .expect("classic dark chart parses")
+                .classic_chart_style_roles
+                .expect("numeric roles")
+        };
+
+        let sibling_tx_pr = parse(
+            r#"<c:tx><c:rich><a:p><a:r><a:t>Title</a:t></a:r></a:p></c:rich></c:tx>
+               <c:txPr><a:p><a:pPr><a:defRPr/></a:pPr></a:p></c:txPr>"#,
+        );
+        assert_eq!(sibling_tx_pr["title"].font_color.as_deref(), Some("000000"));
+
+        let empty_formatted_paragraph = parse(
+            r#"<c:tx><c:rich>
+                 <a:p><a:pPr><a:defRPr/></a:pPr></a:p>
+                 <a:p><a:r><a:t>Title</a:t></a:r></a:p>
+               </c:rich></c:tx>"#,
+        );
+        assert_eq!(
+            empty_formatted_paragraph["title"].font_color.as_deref(),
+            Some("000000")
+        );
+
+        let run_properties_only = parse(
+            r#"<c:tx><c:rich><a:p><a:r><a:rPr lang="en" sz="1200" b="1"/>
+                 <a:t>Title</a:t></a:r></a:p></c:rich></c:tx>"#,
+        );
+        assert_eq!(
+            run_properties_only["title"].font_color.as_deref(),
+            Some("000000")
+        );
+
+        let multiple_paragraphs = parse(
+            r#"<c:tx><c:rich>
+                 <a:p><a:pPr><a:defRPr/></a:pPr><a:r><a:t>One</a:t></a:r></a:p>
+                 <a:p><a:pPr><a:defRPr/></a:pPr><a:fld><a:t>Two</a:t></a:fld></a:p>
+               </c:rich></c:tx>"#,
+        );
+        assert_eq!(
+            multiple_paragraphs["title"].font_color.as_deref(),
+            Some("000000")
+        );
+
+        let mixed_multiple_paragraphs = parse(
+            r#"<c:tx><c:rich>
+                 <a:p><a:pPr><a:defRPr/></a:pPr><a:r><a:t>One</a:t></a:r></a:p>
+                 <a:p><a:r><a:t>Two</a:t></a:r></a:p>
+               </c:rich></c:tx>"#,
+        );
+        assert_eq!(
+            mixed_multiple_paragraphs["title"].font_color.as_deref(),
+            Some("000000")
+        );
     }
 
     #[test]
