@@ -689,6 +689,68 @@ fn set_font_defaults(
     style.font_face = resolver.theme_minor_font_latin();
 }
 
+/// Apply the automatic light text used by current Office hosts for the dark
+/// built-in chart styles. ECMA-376 Part 1 §21.2.3.46 says that chart text
+/// follows the Axis & Major Gridlines colour, which is `dk1` for styles 41–48.
+/// Current Word, Excel, and PowerPoint instead use the same `lt1` colour as
+/// Table 2's Other Lines for automatic axis, legend, label, and table text.
+///
+/// Chart titles have one observed source-shape boundary: Office uses the light
+/// colour when the rich paragraph carries `a:pPr/a:defRPr`, including an empty
+/// carrier, but retains the ECMA dark colour when that carrier is absent.
+/// Office-produced style matrices across 41–48 and empty/language/size/bold
+/// run-property counterexamples establish this scope. Direct and linked text
+/// paint remain higher-precedence layers; this changes only the numeric role.
+pub(super) fn apply_office_dark_text_contrast(
+    style: u8,
+    title_has_paragraph_default_run: bool,
+    resolver: &dyn ColorResolver,
+    roles: &mut BTreeMap<String, ChartExElementStyle>,
+) {
+    if !(41..=48).contains(&style) {
+        return;
+    }
+
+    // Resolve the observed text token itself. The leader-line role also starts
+    // from Table 2's `lt1`, but its completed line style may add transforms or
+    // replace solid paint with a gradient/pattern. Reusing that role would make
+    // text depend on an unrelated theme format-list entry.
+    let default_resolver = OfficeDefaultClassicResolver { source: resolver };
+    let resolver: &dyn ColorResolver = if resolver.theme_format_scheme().is_none() {
+        &default_resolver
+    } else {
+        resolver
+    };
+    let light_color = resolver.resolve_scheme_color("lt1");
+    // A numeric style owns its automatic text paint even when a present theme
+    // has a malformed/unresolvable lt1 slot. This matches set_font_defaults:
+    // the renderer must not silently substitute semantic black in that case.
+    let light_paint_authored = Some(true);
+
+    for role in [
+        "categoryAxis",
+        "seriesAxis",
+        "valueAxis",
+        "axisTitle",
+        "dataLabel",
+        "dataLabelCallout",
+        "dataTable",
+        "legend",
+        "trendlineLabel",
+    ] {
+        if let Some(role_style) = roles.get_mut(role) {
+            role_style.font_color = light_color.clone();
+            role_style.font_paint_authored = light_paint_authored;
+        }
+    }
+    if title_has_paragraph_default_run {
+        if let Some(title) = roles.get_mut("title") {
+            title.font_color = light_color;
+            title.font_paint_authored = light_paint_authored;
+        }
+    }
+}
+
 /// Resolve one complete numeric style. `formatting_indices` is compact source
 /// order while each entry retains the index used by a renderer consumer. It is
 /// either the source `c:ser@idx` domain or, for an effectively varying chart,
@@ -1670,6 +1732,122 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn office_dark_text_contrast_covers_41_through_48_and_keeps_title_gate() {
+        let resolver = MatrixResolver::new();
+        let text_roles = [
+            "categoryAxis",
+            "seriesAxis",
+            "valueAxis",
+            "axisTitle",
+            "dataLabel",
+            "dataLabelCallout",
+            "dataTable",
+            "legend",
+            "trendlineLabel",
+        ];
+
+        let mut light = resolve_classic_chart_style_roles(40, &resolver, None, &[0], None).unwrap();
+        apply_office_dark_text_contrast(40, true, &resolver, &mut light);
+        assert_eq!(light["title"].font_color.as_deref(), Some("000000"));
+        assert_eq!(light["categoryAxis"].font_color.as_deref(), Some("000000"));
+
+        for style in 41..=48 {
+            let mut without_title_carrier =
+                resolve_classic_chart_style_roles(style, &resolver, None, &[0], None).unwrap();
+            apply_office_dark_text_contrast(style, false, &resolver, &mut without_title_carrier);
+            for role in text_roles {
+                assert_eq!(
+                    without_title_carrier[role].font_color.as_deref(),
+                    Some("FFFFFF"),
+                    "style {style} {role}",
+                );
+            }
+            assert_eq!(
+                without_title_carrier["title"].font_color.as_deref(),
+                Some("000000"),
+                "style {style} title without paragraph default run",
+            );
+
+            let mut with_title_carrier =
+                resolve_classic_chart_style_roles(style, &resolver, None, &[0], None).unwrap();
+            apply_office_dark_text_contrast(style, true, &resolver, &mut with_title_carrier);
+            assert_eq!(
+                with_title_carrier["title"].font_color.as_deref(),
+                Some("FFFFFF"),
+                "style {style} title with paragraph default run",
+            );
+        }
+    }
+
+    #[test]
+    fn office_dark_text_resolves_lt1_independently_of_theme_line_paint() {
+        struct CustomTheme {
+            format_scheme: crate::theme::ThemeFormatScheme,
+        }
+        impl ColorResolver for CustomTheme {
+            fn resolve_solid_fill(&self, _: roxmltree::Node) -> Option<String> {
+                None
+            }
+            fn resolve_scheme_color(&self, name: &str) -> Option<String> {
+                (name == "lt1").then(|| "A1B2C3".to_owned())
+            }
+            fn theme_format_scheme(&self) -> Option<&crate::theme::ThemeFormatScheme> {
+                Some(&self.format_scheme)
+            }
+        }
+
+        let resolver = CustomTheme {
+            // An empty/malformed format list stands in for a gradient, pattern,
+            // or otherwise unresolved line style. Text still resolves from the
+            // independent theme scheme slot rather than that completed line.
+            format_scheme: crate::theme::ThemeFormatScheme::default(),
+        };
+        let mut roles = resolve_classic_chart_style_roles(41, &resolver, None, &[0], None)
+            .expect("valid style");
+        assert_eq!(roles["leaderLine"].line_colors, None);
+
+        apply_office_dark_text_contrast(41, true, &resolver, &mut roles);
+        assert_eq!(roles["categoryAxis"].font_color.as_deref(), Some("A1B2C3"));
+        assert_eq!(roles["title"].font_color.as_deref(), Some("A1B2C3"));
+        assert_eq!(roles["categoryAxis"].font_paint_authored, Some(true));
+    }
+
+    #[test]
+    fn office_dark_text_preserves_absent_and_unresolved_theme_boundaries() {
+        struct NoTheme;
+        impl ColorResolver for NoTheme {
+            fn resolve_solid_fill(&self, _: roxmltree::Node) -> Option<String> {
+                None
+            }
+        }
+        let mut absent =
+            resolve_classic_chart_style_roles(41, &NoTheme, None, &[0], None).expect("valid style");
+        apply_office_dark_text_contrast(41, true, &NoTheme, &mut absent);
+        assert_eq!(absent["title"].font_color.as_deref(), Some("FFFFFF"));
+        assert_eq!(absent["title"].font_paint_authored, Some(true));
+
+        struct UnresolvedTheme {
+            format_scheme: crate::theme::ThemeFormatScheme,
+        }
+        impl ColorResolver for UnresolvedTheme {
+            fn resolve_solid_fill(&self, _: roxmltree::Node) -> Option<String> {
+                None
+            }
+            fn theme_format_scheme(&self) -> Option<&crate::theme::ThemeFormatScheme> {
+                Some(&self.format_scheme)
+            }
+        }
+        let resolver = UnresolvedTheme {
+            format_scheme: crate::theme::ThemeFormatScheme::default(),
+        };
+        let mut unresolved = resolve_classic_chart_style_roles(41, &resolver, None, &[0], None)
+            .expect("valid style");
+        apply_office_dark_text_contrast(41, true, &resolver, &mut unresolved);
+        assert_eq!(unresolved["title"].font_color, None);
+        assert_eq!(unresolved["title"].font_paint_authored, Some(true));
     }
 
     #[test]
