@@ -118,6 +118,16 @@ function createParagraphAcquisitionRuntimeCache(): ParagraphAcquisitionRuntimeCa
         results.set(input, byKey);
       }
       byKey.set(key, value);
+      // Acquisition cache keys carry the exact placement, so every
+      // keep-with-next preflight and every convergence pass adds fresh
+      // keys that are almost never re-read. Values stay reachable through
+      // the session-lived input objects, so without a bound the cache
+      // retains every measurement of the session (unbounded memory on
+      // pathological documents). Keep only the most recent placements per
+      // paragraph; a miss only costs a re-measurement.
+      while (byKey.size > 2) {
+        byKey.delete(byKey.keys().next().value!);
+      }
     },
   });
 }
