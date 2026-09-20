@@ -5,6 +5,7 @@ import type {
   PaintCanvas2D,
 } from './types.js';
 import { paintStrokeSegment } from './canvas-border.js';
+import { paintPageBorderLayout } from './page-border.js';
 
 function recordingContext(operations: unknown[]): PaintCanvas2D {
   return {
@@ -51,6 +52,24 @@ const dashedSegment = (widthPt: number, dashPatternPt: readonly number[]): Borde
 });
 
 describe('retained Canvas border paint', () => {
+  it('rasterizes a retained page-border hairline to one device pixel', () => {
+    const operations: unknown[] = [];
+    const context: CanvasPaintContext = {
+      ctx: recordingContext(operations),
+      scale: 1,
+      dpr: 1,
+      resources: { paint() {} },
+    };
+
+    paintPageBorderLayout({
+      zOrder: 'front',
+      logicalToPhysical: { a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 },
+      segments: [dashedSegment(0.5, [1.5, 1])],
+    }, context);
+
+    expect(operations).toContainEqual(['stroke', 1]);
+  });
+
   it('recomputes authored dash cadence when a minimum CSS width clamps a hairline', () => {
     const operations: unknown[] = [];
     const context: CanvasPaintContext = {

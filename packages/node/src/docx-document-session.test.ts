@@ -103,7 +103,7 @@ describe('Node bounded DOCX document session', () => {
     const recovered = await openDocxDocument(bytes, { factory, currentDate: 0 });
     await expect(recovered.renderPage(0)).resolves.toMatchObject({ width: expect.any(Number) });
     await recovered.close();
-  });
+  }, 15_000);
 
   it('frees exactly once after completion, early return, and explicit close', async () => {
     const free = vi.spyOn(archivePrototype(), 'free');

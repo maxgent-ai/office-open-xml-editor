@@ -1,3 +1,4 @@
+use crate::chart_compatibility::apply_excel_classic_chart_space_frame;
 use crate::read_zip_string;
 use crate::types::*;
 use crate::worksheet_reference::{
@@ -369,7 +370,7 @@ impl ooxml_common::chart::ChartReferenceResolver for XlsxChartReferenceResolver<
 /// Read the chartStyle part (`styleN.xml`) associated with a chart part at
 /// `chart_path` (e.g. `xl/charts/chart1.xml`), following that part's own
 /// relationships (`xl/charts/_rels/chart1.xml.rels`) to the
-/// `.../2011/relationships/chartStyle` target. Returns `None` when the chart
+/// Office 2011 or MS-ODRAWXML 2012 `chartStyle` target. Returns `None` when the chart
 /// has no chartStyle relationship or the part cannot be read (the chartEx
 /// title then falls back to its inline size, or the renderer's default).
 struct ChartRelatedParts {
@@ -404,9 +405,14 @@ fn load_chart_related_parts(archive: &mut crate::XlsxZip, chart_path: &str) -> C
                     .is_some_and(|kind| kind.ends_with(suffix))
         })
     };
-    if let Some(style_relationship) =
-        internal_target(ooxml_common::chart::CHART_STYLE_REL_TYPE_SUFFIX)
-    {
+    let style_relationship = relationships.values().find(|relationship| {
+        relationship.mode == ooxml_common::rels::TargetMode::Internal
+            && relationship
+                .relationship_type
+                .as_deref()
+                .is_some_and(ooxml_common::chart::is_chart_style_relationship_type)
+    });
+    if let Some(style_relationship) = style_relationship {
         let style_path = ooxml_common::rels::resolve_target(base_dir, &style_relationship.target);
         result.style_xml = read_zip_string(archive, &style_path).ok();
         let style_rels_path = ooxml_common::rels::relationship_part_path(&style_path);
@@ -697,7 +703,7 @@ pub(crate) fn load_sheet_charts_with_theme_images(
                 // A chartEx part reads its title font size from the associated
                 // chartStyle sidecar (`styleN.xml`), reached via the chart part's
                 // OWN rels (`xl/charts/_rels/chartN.xml.rels`,
-                // `.../2011/relationships/chartStyle`). Read it best-effort now
+                // Office 2011 / MS-ODRAWXML 2012 `chartStyle`). Read it best-effort now
                 // (before the chart doc is parsed, since both borrow `archive`);
                 // legacy `<c:>` charts ignore it (their title size is inline).
                 let related_parts = load_chart_related_parts(archive, &chart_path);
@@ -782,6 +788,9 @@ pub(crate) fn load_sheet_charts_with_theme_images(
                 let Some(mut chart) = chart_opt else {
                     continue;
                 };
+                if !is_chartex {
+                    apply_excel_classic_chart_space_frame(&mut chart);
+                }
                 if let Some(user_shapes_xml) = user_shapes_xml.as_deref() {
                     if let Ok(user_shapes_doc) = parse_guarded(user_shapes_xml) {
                         let text_boxes = ooxml_common::chart::parse_chart_user_shapes_for_chart(
@@ -1851,7 +1860,7 @@ mod chartex_tests {
                 ("xl/charts/chart1.xml", classic_line_chart_xml()),
                 (
                     "xl/charts/_rels/chart1.xml.rels",
-                    r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdStyle" Type="http://schemas.microsoft.com/office/2011/relationships/chartStyle" Target="style1.xml"/><Relationship Id="rIdColors" Type="http://schemas.microsoft.com/office/2011/relationships/chartColorStyle" Target="colors1.xml"/></Relationships>"#,
+                    r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdStyle" Type="http://schemas.microsoft.com/office/2012/relationships/chartStyle" Target="style1.xml"/><Relationship Id="rIdColors" Type="http://schemas.microsoft.com/office/2011/relationships/chartColorStyle" Target="colors1.xml"/></Relationships>"#,
                 ),
                 (
                     "xl/charts/style1.xml",
@@ -1947,6 +1956,21 @@ mod chartex_tests {
         );
         let chart = &charts.first().expect("classic chart").chart;
         assert_eq!(chart.chart_type, "line");
+        assert_eq!(chart.rounded_corners, Some(true));
+        let frame = chart
+            .chart_style_roles
+            .as_ref()
+            .and_then(|roles| roles.get("chartArea"))
+            .expect("Excel implicit chart-area frame");
+        assert_eq!(
+            frame.fill_colors.as_deref(),
+            Some(&[Some("FFFFFF".to_string())][..]),
+        );
+        assert_eq!(
+            frame.line_colors.as_deref(),
+            Some(&[Some("898989".to_string())][..]),
+        );
+        assert_eq!(frame.line_width_emu, Some(12_700));
         assert_eq!(
             chart
                 .chart_style_roles

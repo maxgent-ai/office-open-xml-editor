@@ -3620,11 +3620,16 @@ fn extract_chartex_title_size(root: Node) -> Option<i32> {
     })
 }
 
-/// Relationship-type suffix that a chart part's `.rels` uses to point at its
-/// chartStyle sidecar (`styleN.xml`). Matched by `ends_with` so both the
-/// Transitional and Strict namespace prefixes resolve. Shared by the pptx /
-/// xlsx / docx callers so they resolve the same relationship the same way.
-pub const CHART_STYLE_REL_TYPE_SUFFIX: &str = "office/2011/relationships/chartStyle";
+/// Whether a chart-part relationship targets its chartStyle sidecar. Office
+/// packages in the wild use the 2011 URI, while MS-ODRAWXML §2.1.2 specifies
+/// the 2012 URI; all three host parsers must accept both exact revisions.
+pub fn is_chart_style_relationship_type(value: &str) -> bool {
+    matches!(
+        value,
+        "http://schemas.microsoft.com/office/2011/relationships/chartStyle"
+            | "http://schemas.microsoft.com/office/2012/relationships/chartStyle"
+    )
+}
 /// Accepts both Office's 2011 and 2012 relationship namespace revisions.
 pub const CHART_COLOR_STYLE_REL_TYPE_SUFFIX: &str = "relationships/chartColorStyle";
 
@@ -3633,7 +3638,7 @@ pub const CHART_COLOR_STYLE_REL_TYPE_SUFFIX: &str = "relationships/chartColorSty
 ///
 /// A chartEx part almost never inlines the title size on its own `<cx:title>`;
 /// instead the size lives in the sibling `styleN.xml` reached via the chart
-/// part's `.../2011/relationships/chartStyle` relationship. Word's default
+/// part's Office 2011 / MS-ODRAWXML 2012 `chartStyle` relationship. Word's default
 /// modern chart style writes `<cs:title><cs:defRPr sz="1400">` (14pt). `None`
 /// when `style_xml` is absent, malformed, or declares no `<cs:title>` size; the
 /// renderer then uses its shared deterministic fallback.
@@ -13210,6 +13215,19 @@ mod tests {
 
     fn root_of(xml: &str) -> Document<'_> {
         Document::parse(xml).expect("parse fixture")
+    }
+
+    #[test]
+    fn chart_style_relationship_accepts_office_and_documented_revisions_only() {
+        assert!(is_chart_style_relationship_type(
+            "http://schemas.microsoft.com/office/2011/relationships/chartStyle"
+        ));
+        assert!(is_chart_style_relationship_type(
+            "http://schemas.microsoft.com/office/2012/relationships/chartStyle"
+        ));
+        assert!(!is_chart_style_relationship_type(
+            "https://example.invalid/office/2012/relationships/chartStyle"
+        ));
     }
 
     #[test]

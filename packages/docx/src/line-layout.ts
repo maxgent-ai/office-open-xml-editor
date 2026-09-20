@@ -331,8 +331,8 @@ export interface LayoutTextSeg extends LayoutSegSource {
   positionExtendsLineBox?: boolean;
   /** ECMA-376 §17.3.2.19 `<w:kern>` — font-kerning threshold in POINTS (smallest
    *  kerned size). Sets `ctx.fontKerning` on measure and paint when the run's
-   *  font size ≥ the threshold. Absent ⇒ kerning off (`ctx.fontKerning='none'`
-   *  is NOT forced globally; only a threshold-satisfied run enables it). */
+   *  font size ≥ the threshold. Absent ⇒ kerning off, so each run explicitly
+   *  overrides Canvas' `auto` state during measurement and paint. */
   kerning?: number;
   /** ECMA-376 §17.3.2.10 `<w:eastAsianLayout w:vert>` — horizontal-in-vertical
    *  (縦中横). Set by {@link buildSegments} ONLY when the run declares `w:vert`
@@ -3019,9 +3019,8 @@ export function buildSegments(
         complexScript: cs,
         fontHint: r.fontHint,
         eastAsiaLanguage: r.langEastAsia,
-        kerning: effectiveKerningThreshold == null
-          ? undefined
-          : (cs ? csFontSize : base.fontSize) >= effectiveKerningThreshold,
+        kerning: effectiveKerningThreshold != null
+          && (cs ? csFontSize : base.fontSize) >= effectiveKerningThreshold,
         measure: false,
       });
       const shaped = authoritativeSpan
@@ -3790,7 +3789,7 @@ export function buildSegments(
         effectiveFontSizePt,
         segment.bold ? 700 : 400,
         segment.italic ? 'italic' : 'normal',
-        segment.kerning ?? 'auto',
+        segment.kerning ?? 'off',
       ].join('|');
       const cached = metricCache.get(key);
       if (cached !== undefined) return cached;
@@ -4675,19 +4674,16 @@ export function layoutLines(
   // (measure==paint). Returns the value to restore afterwards (only when the run
   // opts in). Kerning is enabled only when the run declares `w:kern` and its font
   // size is at or above the threshold (the spec's "smallest font size which shall
-  // have its kerning automatically adjusted"). A run that does not opt in leaves
-  // `ctx.fontKerning` at its inherited value rather than forcing a document-wide
-  // default. Such a default is a separate unsupported policy, not part of this
-  // run-level implementation. `setSegKerning` mirrors the paint-side
-  // `paintSegKerning` in renderer.ts exactly.
-  const setSegKerning = (s: LayoutTextSeg): CanvasFontKerning | null => {
-    if (s.kerning == null) return null;
+  // have its kerning automatically adjusted"). If no hierarchy level declares
+  // it, §17.3.2.19 requires kerning off, so override Canvas' `auto` default for
+  // the measurement and restore the host state afterwards.
+  const setSegKerning = (s: LayoutTextSeg): CanvasFontKerning => {
     const prev = ctx.fontKerning;
-    ctx.fontKerning = s.fontSize >= s.kerning ? 'normal' : 'none';
+    ctx.fontKerning = s.kerning != null && s.fontSize >= s.kerning ? 'normal' : 'none';
     return prev;
   };
-  const restoreKerning = (prev: CanvasFontKerning | null): void => {
-    if (prev != null) ctx.fontKerning = prev;
+  const restoreKerning = (prev: CanvasFontKerning): void => {
+    ctx.fontKerning = prev;
   };
 
   const measureText = (s: LayoutTextSeg, clusterGeometry = false): TextMetrics => {
