@@ -138,12 +138,6 @@ export function createProductionLayoutServices(
         options.measureContext,
       )
     : {};
-  const localMetrics = snapshotFontMetrics(options.localMetrics);
-  const fontMetrics = snapshotFontMetrics({
-    ...measuredFontMetrics,
-    ...localMetrics,
-    ...options.fontMetrics,
-  });
   const fontFamilyCharsets = Object.freeze(Object.fromEntries(
     Object.entries(source.fontFamilyCharsets)
       .map(([family, charset]) => [family.trim().toLowerCase(), charset]),
@@ -190,6 +184,22 @@ export function createProductionLayoutServices(
       weight,
       style,
     }] : [];
+  });
+  // Caller resources are optional substitutes. An authored embedded face wins
+  // the same tuple even when its legacy loader supplies no numeric metric; do
+  // not overwrite that face's existing measured/default metrics with the
+  // caller alias's geometry. With no caller resource this is the old merge.
+  const embeddedTuples = new Set(inventory.map((face) =>
+    `${normalizedFaceFamily(face.requestedFamily)}:${face.weight}:${face.style}`));
+  const unshadowed = (metrics: Readonly<Record<string, ResolvedFontMetric>> = {}) =>
+    Object.fromEntries(Object.entries(metrics).filter(([key, metric]) =>
+      !metric.sourceIdentity?.startsWith('provided-sfnt:')
+      || !embeddedTuples.has(`${normalizedFaceFamily(metric.requestedFamily ?? key)}:${metric.weight ?? 400}:${metric.style ?? 'normal'}`)));
+  const localMetrics = snapshotFontMetrics(unshadowed(options.localMetrics));
+  const fontMetrics = snapshotFontMetrics({
+    ...measuredFontMetrics,
+    ...localMetrics,
+    ...unshadowed(options.fontMetrics),
   });
   for (const [requestedFamily, metric] of Object.entries(localMetrics)) {
     inventory.push({

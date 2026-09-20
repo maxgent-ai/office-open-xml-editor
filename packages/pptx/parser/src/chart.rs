@@ -51,6 +51,19 @@ impl ooxml_common::chart::ColorResolver for PptxColorResolver<'_> {
     fn theme_format_scheme(&self) -> Option<&ooxml_common::theme::ThemeFormatScheme> {
         self.theme_format_scheme
     }
+
+    fn office_dark_text_contrast_applies(&self, style: u8) -> bool {
+        style == 41
+    }
+
+    // PowerPoint-produced style-41 controls establish the same carrier
+    // boundary as Word for the tested single rich paragraph: a present
+    // a:pPr/a:defRPr receives automatic lt1 title text, while run-only lang
+    // and size properties retain the numeric dk1 result. Styles 40 and 42..48
+    // remain outside this host claim until separately observed.
+    fn office_dark_title_contrast_applies(&self, style: u8) -> bool {
+        style == 41
+    }
 }
 
 /// Parse a legacy OOXML chart (`c:` namespace) — barChart / lineChart etc.
@@ -222,6 +235,84 @@ mod tests {
     const A_NS: &str = "http://schemas.openxmlformats.org/drawingml/2006/main";
 
     #[test]
+    fn powerpoint_chart_host_style_scope_retains_seventh_point_fallback() {
+        let theme = HashMap::from([
+            ("dk1".to_string(), "111111".to_string()),
+            ("lt1".to_string(), "FEFEFE".to_string()),
+            ("accent1".to_string(), "808080".to_string()),
+        ]);
+        let points = (0..7)
+            .map(|index| format!(r#"<c:pt idx="{index}"><c:v>1</c:v></c:pt>"#))
+            .collect::<String>();
+        let parse = |style: u8| {
+            let xml = format!(
+                r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+                  <c:style val="{style}"/><c:chart><c:plotArea><c:pieChart><c:varyColors val="1"/>
+                    <c:ser><c:idx val="0"/><c:order val="0"/>
+                      <c:dPt><c:idx val="5"/><c:spPr><a:solidFill><a:srgbClr val="ABCDEF"/></a:solidFill><a:ln><a:solidFill><a:srgbClr val="123456"/></a:solidFill></a:ln></c:spPr></c:dPt>
+                      <c:val><c:numLit><c:ptCount val="7"/>{points}</c:numLit></c:val>
+                    </c:ser>
+                  </c:pieChart></c:plotArea></c:chart>
+                </c:chartSpace>"#,
+            );
+            parse_legacy_chart(&xml, &theme)
+                .expect("PowerPoint chart")
+                .chart
+        };
+        let chart = parse(2);
+        let role = &chart
+            .classic_varying_point_chart_style_roles
+            .as_ref()
+            .expect("point-domain numeric roles")["dataPoint"];
+        let colors = role
+            .fill_colors
+            .as_ref()
+            .unwrap_or_else(|| panic!("point palette: {role:?}"));
+        assert_eq!(colors[0].as_deref(), Some("808080"));
+        assert_eq!(colors[6].as_deref(), None);
+        assert_eq!(
+            role.fill_semantic_fallback_indices.as_deref(),
+            Some(&[6][..])
+        );
+        // Direct point paint stays separate from the automatic palette so
+        // the renderer can preserve its precedence at either host boundary.
+        assert_eq!(
+            chart.series[0]
+                .data_point_colors
+                .as_ref()
+                .expect("direct point color")[5]
+                .as_deref(),
+            Some("ABCDEF"),
+        );
+        let point = chart.series[0]
+            .data_point_overrides
+            .as_ref()
+            .expect("point formatting")
+            .iter()
+            .find(|point| point.idx == 5)
+            .expect("formatted point");
+        assert_eq!(point.line_color.as_deref(), Some("123456"));
+        for (style, expected) in [
+            (40, "111111"),
+            (41, "FEFEFE"),
+            (42, "111111"),
+            (48, "111111"),
+        ] {
+            let chart = parse(style);
+            assert_eq!(
+                chart
+                    .classic_chart_style_roles
+                    .as_ref()
+                    .expect("numeric roles")["categoryAxis"]
+                    .font_color
+                    .as_deref(),
+                Some(expected),
+                "style {style}",
+            );
+        }
+    }
+
+    #[test]
     fn legacy_chart_uses_theme_accents_and_chart_wide_text_defaults() {
         let xml = format!(
             r#"<c:chartSpace xmlns:c="{C_NS}" xmlns:a="{A_NS}">
@@ -377,6 +468,53 @@ mod tests {
             Some(&[Some("FF0000".to_string())][..])
         );
         assert_eq!(linked_frame.line_width_emu, Some(25_400));
+    }
+
+    #[test]
+    fn powerpoint_style_41_title_contrast_requires_paragraph_default_run() {
+        let chart_xml = |style: u8, paragraph_properties: &str, run_properties: &str| {
+            format!(
+                r#"<c:chartSpace xmlns:c="{C_NS}" xmlns:a="{A_NS}">
+                  <c:style val="{style}"/><c:chart><c:title><c:tx><c:rich>
+                    <a:bodyPr/><a:lstStyle/><a:p>{paragraph_properties}<a:r>{run_properties}<a:t>Title</a:t></a:r></a:p>
+                  </c:rich></c:tx></c:title><c:plotArea><c:barChart><c:barDir val="col"/>
+                    <c:ser><c:idx val="0"/><c:order val="0"/><c:val><c:numLit><c:pt idx="0"><c:v>1</c:v></c:pt></c:numLit></c:val></c:ser>
+                  </c:barChart></c:plotArea></c:chart></c:chartSpace>"#
+            )
+        };
+        let theme = HashMap::from([
+            ("dk1".to_string(), "000000".to_string()),
+            ("lt1".to_string(), "FFFFFF".to_string()),
+        ]);
+        let parse = |style, paragraph_properties: &str, run_properties: &str| {
+            parse_legacy_chart(
+                &chart_xml(style, paragraph_properties, run_properties),
+                &theme,
+            )
+            .expect("classic chart")
+            .chart
+            .classic_chart_style_roles
+            .expect("numeric roles")["title"]
+                .font_color
+                .clone()
+        };
+
+        assert_eq!(
+            parse(41, "<a:pPr><a:defRPr sz=\"1400\"/></a:pPr>", ""),
+            Some("FFFFFF".to_string()),
+        );
+        assert_eq!(
+            parse(41, "", "<a:rPr lang=\"en-US\"/>"),
+            Some("000000".to_string()),
+        );
+        assert_eq!(
+            parse(40, "<a:pPr><a:defRPr sz=\"1400\"/></a:pPr>", ""),
+            Some("000000".to_string()),
+        );
+        assert_eq!(
+            parse(42, "<a:pPr><a:defRPr sz=\"1400\"/></a:pPr>", ""),
+            Some("000000".to_string()),
+        );
     }
 
     #[test]

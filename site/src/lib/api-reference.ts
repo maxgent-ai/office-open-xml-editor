@@ -116,6 +116,10 @@ const VIEWER_ON_ERROR = {
   detailsHref: '/errors#delivery',
   detailsLabel: 'Error reference',
 };
+const DOCX_FONT_RESOURCES: ApiOption = {
+  name: 'fontResources', type: 'readonly DocxFontResource[]', def: 'undefined',
+  desc: 'Opt-in caller-owned static TTF/OTF bytes: { family, bytes: Uint8Array, weight?: 400 | 700, style?: "normal" | "italic" }. Selected resources supply line metrics and natural-width wrapping only for fully covered text spans. Embedded faces take precedence. Variable fonts, WOFF/WOFF2, and TTC are unsupported. At most 64 faces and 128 MiB total are admitted. Works in main and worker modes; destroy() releases owned faces. Omit to preserve existing font and pagination behavior. No migration is required.',
+};
 const DOCX_PROGRESSIVE_LAYOUT: ApiOption = {
   name: 'progressiveLayout',
   type: 'boolean',
@@ -397,6 +401,7 @@ export const apiReference: Record<'docx' | 'xlsx' | 'pptx', ApiClass[]> = {
         { name: 'width', type: 'number', desc: 'Canvas CSS width in px; height is auto-computed from the page aspect ratio.' },
         DPR,
         GFONTS,
+        DOCX_FONT_RESOURCES,
         CJK_FALLBACK,
         PASSWORD,
         { name: 'enableTextSelection', type: 'boolean', def: 'false', desc: 'Overlay a transparent text layer for native selection & copy.' },
@@ -451,7 +456,7 @@ export const apiReference: Record<'docx' | 'xlsx' | 'pptx', ApiClass[]> = {
       name: 'DocxDocument',
       ctor: 'await DocxDocument.load(source, options?)',
       note: 'Headless engine — render any page into any canvas you supply.',
-      options: [GFONTS, CJK_FALLBACK, PASSWORD, WASM_URL, ZIP, RESOURCE_LIMITS, RESOURCE_METRICS, DEBUG, WORKER_TIMEOUT, MATH, THREE_D, REGION_MAP, CHART_EX, TIFF, MODE, ...DOCX_LAYOUT_VIEW_OPTIONS, DOCX_PROGRESSIVE_LAYOUT, DOCX_SLICE_LAYOUT, DOCX_LAYOUT_PROGRESS, DOCX_LAYOUT_PARTIAL, DOCX_LAYOUT_COMPLETE],
+      options: [GFONTS, DOCX_FONT_RESOURCES, CJK_FALLBACK, PASSWORD, WASM_URL, ZIP, RESOURCE_LIMITS, RESOURCE_METRICS, DEBUG, WORKER_TIMEOUT, MATH, THREE_D, REGION_MAP, CHART_EX, TIFF, MODE, ...DOCX_LAYOUT_VIEW_OPTIONS, DOCX_PROGRESSIVE_LAYOUT, DOCX_SLICE_LAYOUT, DOCX_LAYOUT_PROGRESS, DOCX_LAYOUT_PARTIAL, DOCX_LAYOUT_COMPLETE],
       methods: [
         { sig: 'static load(source, options?): Promise<DocxDocument>', desc: 'Parse a document from a URL or ArrayBuffer. With progressiveLayout, resolve when the opening pages are paintable while pagination continues in the background.' },
         { sig: 'get comments(): readonly Readonly<DocComment>[]', desc: 'Immutable detached comments and replies stored in the document.' },
@@ -499,6 +504,7 @@ export const apiReference: Record<'docx' | 'xlsx' | 'pptx', ApiClass[]> = {
         ON_HYPERLINK_CLICK,
         ENABLE_HYPERLINKS,
         GFONTS,
+        DOCX_FONT_RESOURCES,
         CJK_FALLBACK,
         PASSWORD,
         ZIP,

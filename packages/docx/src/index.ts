@@ -6,6 +6,7 @@ export {
   type RenderPageToBitmapOptions,
 } from './document';
 export { DocxViewer, type DocxViewerOptions } from './viewer';
+export type { DocxFontResource } from './font-resources.js';
 export { DocxScrollViewer, type DocxScrollViewerOptions } from './scroll-viewer';
 export type { DocxCommentsOptions } from './comment-margin';
 export type {

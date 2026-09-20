@@ -1264,6 +1264,12 @@ export interface DocxElementContextOptions {
     readonly currentDate?: Date | number;
     readonly showTrackedChanges?: boolean;
 }
+export interface DocxFontResource {
+    readonly family: string;
+    readonly bytes: Uint8Array;
+    readonly weight?: 400 | 700;
+    readonly style?: 'normal' | 'italic';
+}
 export type DocxHighlightColors = FindHighlightColors;
 export interface DocxHighlightMatch {
     slices: MatchRunSlice[];
@@ -1681,6 +1687,7 @@ export interface LineSpacing {
     explicit?: boolean;
 }
 export interface LoadOptions extends LoadOptions__emitterCollision1 {
+    fontResources?: readonly DocxFontResource[];
     math?: MathRenderer;
     mode?: 'main' | 'worker';
     sliceLayout?: boolean;
