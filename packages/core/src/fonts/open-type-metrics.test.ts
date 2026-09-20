@@ -159,7 +159,7 @@ describe('parseOpenTypeLineMetrics', () => {
   });
 });
 
-function syntheticSfntWithRepeatedCmapRecords(recordCount: number): Uint8Array {
+function syntheticSfntWithRepeatedCmapRecords(recordCount: number, distinctTables = 1): Uint8Array {
   const tableCount = 4;
   const directorySize = 12 + tableCount * 16;
   const headOffset = directorySize;
@@ -172,7 +172,7 @@ function syntheticSfntWithRepeatedCmapRecords(recordCount: number): Uint8Array {
   // accidental parse-per-alias implementation do substantial duplicate work
   // and/or duplicate a 65,535-code-point result, while the intended path scans
   // the aliases and parses the shared subtable once.
-  const cmapLength = subtableOffset + 32;
+  const cmapLength = subtableOffset + 32 * distinctTables;
   const bytes = new Uint8Array(cmapOffset + cmapLength);
   const view = new DataView(bytes.buffer);
   view.setUint32(0, 0x00010000);
@@ -203,18 +203,20 @@ function syntheticSfntWithRepeatedCmapRecords(recordCount: number): Uint8Array {
     const at = cmapOffset + 4 + index * 8;
     view.setUint16(at, 3);
     view.setUint16(at + 2, 10);
-    view.setUint32(at + 4, subtableOffset);
+    view.setUint32(at + 4, subtableOffset + (index % distinctTables) * 32);
   }
-  const subtable = cmapOffset + subtableOffset;
-  view.setUint16(subtable, 4);
-  view.setUint16(subtable + 2, 32);
-  view.setUint16(subtable + 6, 4);
-  view.setUint16(subtable + 14, 0xfffe);
-  view.setUint16(subtable + 16, 0xffff);
-  view.setUint16(subtable + 20, 0x0000);
-  view.setUint16(subtable + 22, 0xffff);
-  view.setInt16(subtable + 24, 1);
-  view.setInt16(subtable + 26, 1);
+  for (let tableIndex = 0; tableIndex < distinctTables; tableIndex++) {
+    const subtable = cmapOffset + subtableOffset + tableIndex * 32;
+    view.setUint16(subtable, 4);
+    view.setUint16(subtable + 2, 32);
+    view.setUint16(subtable + 6, 4);
+    view.setUint16(subtable + 14, 0xfffe);
+    view.setUint16(subtable + 16, 0xffff);
+    view.setUint16(subtable + 20, 0x0000);
+    view.setUint16(subtable + 22, 0xffff);
+    view.setInt16(subtable + 24, 1);
+    view.setInt16(subtable + 26, 1);
+  }
   return bytes;
 }
 
@@ -257,6 +259,34 @@ describe('opt-in OpenType resource coverage', () => {
     view.setUint16(fvarOffset + 34, 256); // axis name id
     expect(parseOpenTypeLineMetrics(variableFace)).toEqual(parseOpenTypeLineMetrics(staticFace));
     expect(parseOpenTypeResourceMetrics(variableFace)).toBeNull();
+  });
+
+  it('certifies only shared coverage when browser-selectable cmap records disagree', () => {
+    const bytes = syntheticSfntWithRepeatedCmapRecords(2, 2);
+    const view = new DataView(bytes.buffer);
+    const cmapOffset = 12 + 4 * 16 + 54 + 36 + 78;
+    // Unicode platform 0/3 and Windows platform 3/1 are both accepted base
+    // maps. A has a glyph in the Unicode map but maps to .notdef in Windows.
+    view.setUint16(cmapOffset + 4, 0);
+    view.setUint16(cmapOffset + 6, 3);
+    view.setUint16(cmapOffset + 14, 1);
+    for (let index = 0; index < 2; index++) {
+      const subtable = cmapOffset + 20 + index * 32;
+      view.setUint16(subtable + 14, 0x42);
+      view.setUint16(subtable + 20, 0x41);
+      view.setInt16(subtable + 24, index === 0 ? -64 : -65);
+    }
+    expect(parseOpenTypeResourceMetrics(bytes)?.unicodeRanges).toEqual([[0x42, 0x42]]);
+    // An unreadable eligible base map cannot simply be omitted from the proof.
+    view.setUint16(cmapOffset + 20 + 32, 6);
+    expect(parseOpenTypeResourceMetrics(bytes)?.unicodeRanges).toEqual([]);
+  });
+
+  it('caps cumulative coverage work across distinct broad subtables', () => {
+    expect(parseOpenTypeResourceMetrics(syntheticSfntWithRepeatedCmapRecords(4, 4))?.unicodeRanges)
+      .toEqual([[0x0000, 0xfffe]]);
+    expect(parseOpenTypeResourceMetrics(syntheticSfntWithRepeatedCmapRecords(5, 5))?.unicodeRanges)
+      .toEqual([]);
   });
 
   it('bounds cmap alias fan-out at the accepted encoding-record boundary', () => {

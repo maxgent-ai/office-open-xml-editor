@@ -176,11 +176,17 @@ function cmapHasEastAsianGlyph(
 
 const MAX_CMAP_COVERAGE_RANGES = 32_768;
 const MAX_CMAP_ENCODING_RECORDS = 4_096;
+// Caller-resource governance, not a font-selection heuristic: limit unique
+// table fan-out and cumulative scalar/group/intersection visits independently.
+const MAX_CMAP_UNIQUE_SUBTABLES = 8;
+const MAX_CMAP_COVERAGE_WORK = 262_144;
+type CoverageWorkBudget = { remaining: number };
 
 function format4UnicodeCoverage(
   view: DataView,
   offset: number,
   availableLength: number,
+  budget: CoverageWorkBudget,
 ): Array<readonly [number, number]> | null {
   if (availableLength < 16) return null;
   const length = view.getUint16(offset + 2);
@@ -218,6 +224,7 @@ function format4UnicodeCoverage(
     const rangeOffsetPosition = rangeOffsets + index * 2;
     const rangeOffset = view.getUint16(rangeOffsetPosition);
     for (let codePoint = start; codePoint <= end && codePoint < 0xffff; codePoint++) {
+      if (--budget.remaining < 0) return null;
       const glyph = rangeOffset === 0
         ? (codePoint + delta) & 0xffff
         : (() => {
@@ -238,6 +245,7 @@ function format12Or13UnicodeCoverage(
   offset: number,
   availableLength: number,
   constantGlyph: boolean,
+  budget: CoverageWorkBudget,
 ): Array<readonly [number, number]> | null {
   if (availableLength < 16) return null;
   const length = view.getUint32(offset + 4);
@@ -247,6 +255,7 @@ function format12Or13UnicodeCoverage(
   const covered: Array<readonly [number, number]> = [];
   let previousEnd = -1;
   for (let index = 0; index < groupCount; index++) {
+    if (--budget.remaining < 0) return null;
     const group = offset + 16 + index * 12;
     const start = view.getUint32(group);
     const end = view.getUint32(group + 4);
@@ -263,6 +272,12 @@ function format12Or13UnicodeCoverage(
   return covered;
 }
 
+/** Coverage must hold regardless of the browser's choice of a Unicode base
+ * cmap. Browser selection differs between Unicode and Windows records, so a
+ * preferred-subtable ranking cannot establish resource authority. Intersect
+ * all eligible base maps; any malformed/unreadable candidate or exhausted work
+ * budget fails closed. Existing embedded-font parsing does not use this policy.
+ */
 function cmapUnicodeCoverage(
   view: DataView,
   table: Readonly<{ offset: number; length: number }> | undefined,
@@ -271,43 +286,69 @@ function cmapUnicodeCoverage(
   const recordCount = view.getUint16(table.offset + 2);
   if (recordCount > MAX_CMAP_ENCODING_RECORDS || 4 + recordCount * 8 > table.length) return [];
   const seenOffsets = new Set<number>();
-  let selected: Readonly<{
+  const candidates: Array<Readonly<{
     subtable: number;
     availableLength: number;
     format: number;
-    score: number;
-  }> | null = null;
+  }>> = [];
   for (let index = 0; index < recordCount; index++) {
     const record = table.offset + 4 + index * 8;
     const platform = view.getUint16(record);
     const encoding = view.getUint16(record + 2);
     if (platform !== 0 && !(platform === 3 && (encoding === 1 || encoding === 10))) continue;
     const relativeOffset = view.getUint32(record + 4);
-    if (relativeOffset > table.length - 2 || seenOffsets.has(relativeOffset)) continue;
-    seenOffsets.add(relativeOffset);
+    if (relativeOffset > table.length - 2) return [];
     const subtable = table.offset + relativeOffset;
     const availableLength = table.length - relativeOffset;
     const format = view.getUint16(subtable);
-    const formatScore = format === 12 ? 30 : format === 13 ? 20 : format === 4 ? 10 : 0;
-    if (formatScore === 0) continue;
-    const platformScore = platform === 0 ? 2 : encoding === 10 ? 1 : 0;
-    const score = formatScore + platformScore;
-    if (!selected || score > selected.score) {
-      selected = { subtable, availableLength, format, score };
-    }
+    // OpenType cmap format 14 (Unicode platform, encoding 5) augments a base
+    // map with variation sequences; it cannot independently select base glyphs.
+    // It does not certify scalar coverage for an unsupported variation selector.
+    if (platform === 0 && encoding === 5 && format === 14) continue;
+    if (format !== 4 && format !== 12 && format !== 13) return [];
+    if (seenOffsets.has(relativeOffset)) continue;
+    seenOffsets.add(relativeOffset);
+    if (seenOffsets.size > MAX_CMAP_UNIQUE_SUBTABLES) return [];
+    candidates.push({ subtable, availableLength, format });
   }
-  if (!selected) return [];
-  const parsed = selected.format === 4
-    ? format4UnicodeCoverage(view, selected.subtable, selected.availableLength)
-    : format12Or13UnicodeCoverage(
-        view,
-        selected.subtable,
-        selected.availableLength,
-        selected.format === 13,
-      );
-  return parsed == null
-    ? []
-    : Object.freeze(parsed.map((range) => Object.freeze(range)));
+  const budget: CoverageWorkBudget = { remaining: MAX_CMAP_COVERAGE_WORK };
+  let coverage: Array<readonly [number, number]> | null = null;
+  for (const candidate of candidates) {
+    const parsed = candidate.format === 4
+      ? format4UnicodeCoverage(view, candidate.subtable, candidate.availableLength, budget)
+      : format12Or13UnicodeCoverage(
+          view, candidate.subtable, candidate.availableLength, candidate.format === 13, budget,
+        );
+    if (!parsed?.length) return [];
+    if (coverage === null) {
+      coverage = parsed;
+      continue;
+    }
+    const intersection: Array<readonly [number, number]> = [];
+    let left = 0;
+    let right = 0;
+    while (left < coverage.length && right < parsed.length) {
+      if (--budget.remaining < 0) return [];
+      const a = coverage[left]!;
+      const b = parsed[right]!;
+      const start = Math.max(a[0], b[0]);
+      const end = Math.min(a[1], b[1]);
+      if (start <= end) {
+        const previous = intersection.at(-1);
+        if (previous && previous[1] + 1 === start) {
+          intersection[intersection.length - 1] = [previous[0], end];
+        } else {
+          if (intersection.length >= MAX_CMAP_COVERAGE_RANGES) return [];
+          intersection.push([start, end]);
+        }
+      }
+      if (a[1] <= b[1]) left++;
+      if (b[1] <= a[1]) right++;
+    }
+    if (!intersection.length) return [];
+    coverage = intersection;
+  }
+  return Object.freeze((coverage ?? []).map((range) => Object.freeze(range)));
 }
 
 function rangesContainEastAsianGlyph(
