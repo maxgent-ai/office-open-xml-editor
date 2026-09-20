@@ -220,6 +220,45 @@ function calibriAdvanceMatchesAuthoredFace(
     && metric.fontBoxRatio > 0;
 }
 
+function fontMetricCoversText(
+  metric: Readonly<ResolvedFontMetric> | undefined,
+  text: string,
+): metric is Readonly<ResolvedFontMetric> {
+  const ranges = metric?.unicodeRanges;
+  if (!ranges?.length) return false;
+  const covered = (codePoint: number): boolean => {
+    let low = 0;
+    let high = ranges.length - 1;
+    while (low <= high) {
+      const middle = (low + high) >>> 1;
+      const [start, end] = ranges[middle]!;
+      if (codePoint < start) high = middle - 1;
+      else if (codePoint > end) low = middle + 1;
+      else return true;
+    }
+    return false;
+  };
+  for (const scalar of text) {
+    const codePoint = scalar.codePointAt(0);
+    if (codePoint != null && !covered(codePoint)) return false;
+  }
+  return true;
+}
+
+/** ECMA-376 §17.8.2 leaves substitution policy to the consumer. The optional
+ * caller sfnt route replaces compatibility metrics only for the selected alias
+ * and complete cmap coverage; native/embedded defaults retain their existing
+ * policy. Resource identity is supplied by the bounded loader, never a font name. */
+function selectedProvidedMetric(
+  metric: Readonly<ResolvedFontMetric> | undefined,
+  selectedFamily: string | undefined,
+  text: string,
+): metric is Readonly<ResolvedFontMetric> {
+  return metric?.sourceIdentity?.startsWith('provided-sfnt:') === true
+    && normalizeFontMetricFamily(metric.family) === normalizeFontMetricFamily(selectedFamily ?? '')
+    && fontMetricCoversText(metric, text);
+}
+
 export interface LineBoundary {
   segIndex: number;
   charOffset: number;
@@ -290,6 +329,10 @@ export interface LayoutTextSeg extends LayoutSegSource {
    * is its isolated alias; this measured ratio supplies the design-line floor
    * without a version-specific font constant. */
   resolvedLineHeightRatio?: number;
+  /** Opt-in resource authority retained through wrap and paint acquisition. */
+  exactFontResource?: true;
+  resolvedDesignAscentRatio?: number;
+  resolvedDesignDescentRatio?: number;
   resolvedEastAsianLineHeightRatio?: number;
   /** Authored design descent used only when this visible text shares a line
    * with an inline image. The object owns ascent; Word retains this descent
@@ -1183,6 +1226,7 @@ export function segmentIntendedSingleLinePx(
   const resourceRatio = eastAsian
     ? segment.resolvedEastAsianLineHeightRatio ?? segment.resolvedLineHeightRatio ?? 0
     : segment.resolvedLineHeightRatio ?? 0;
+  if (segment.exactFontResource) return resourceRatio * emPx;
   return Math.max(
     intendedSingleLinePx(segment.fontFamily, emPx, eastAsian),
     resourceRatio * emPx,
@@ -1225,6 +1269,25 @@ function resolvedDesignLineMetrics(
   measured: TextMetrics,
   corrected: Readonly<{ ascent: number; descent: number }>,
 ): { ascent: number; descent: number } {
+  const actualAscent = measured.actualBoundingBoxAscent;
+  const actualDescent = measured.actualBoundingBoxDescent;
+  const designAscent = segment.resolvedDesignAscentRatio;
+  const designDescent = segment.resolvedDesignDescentRatio;
+  // Exact resources own each side of the baseline whether their design box is
+  // larger or smaller than Canvas's loose box. An unpainted anchor host has no
+  // ink to union; its measurement probe must not import fallback-glyph geometry.
+  if (segment.exactFontResource && designAscent != null && designDescent != null
+    && Number.isFinite(designAscent) && Number.isFinite(designDescent)
+    && designAscent >= 0 && designDescent >= 0
+    && designAscent + designDescent > 0
+    && (segment.metricOnly || (Number.isFinite(actualAscent) && Number.isFinite(actualDescent)))) {
+    return {
+      ascent: Math.max(0, segment.metricOnly ? 0 : actualAscent, designAscent * emPx),
+      descent: Math.max(0, segment.metricOnly ? 0 : actualDescent, designDescent * emPx),
+    };
+  }
+  // The existing native/substitute path retains its shrink-only compatibility
+  // boundary when no caller resource owns the selected span.
   if (segment.designLineMayShrinkSelectedFontBox !== true) return { ...corrected };
   const ratio = eastAsian
     ? segment.resolvedEastAsianLineHeightRatio ?? segment.resolvedLineHeightRatio
@@ -1233,8 +1296,6 @@ function resolvedDesignLineMetrics(
   const targetTotal = ratio * emPx;
   const correctedTotal = corrected.ascent + corrected.descent;
   if (!(correctedTotal > targetTotal)) return { ...corrected };
-  const actualAscent = measured.actualBoundingBoxAscent;
-  const actualDescent = measured.actualBoundingBoxDescent;
   if (!(Number.isFinite(actualAscent) && Number.isFinite(actualDescent))) {
     return { ...corrected };
   }
@@ -1975,6 +2036,8 @@ export function correctedLineMetrics(
  *  returns only the advance) and {@link paragraphMarkBelowBaselinePt} (which needs
  *  the ascent/descent to locate the mark baseline within the box). */
 export interface MarkLineMetrics {
+  /** Selected caller resource owns this unpainted mark design line. */
+  exactFontResource?: true;
   readonly advancePx: number;
   readonly ascentPx: number;
   readonly descentPx: number;
@@ -2053,6 +2116,7 @@ export function paragraphMarkLineMetrics(
   let asc: number;
   let desc: number;
   let compatibleSubstituteRatio: number | undefined;
+  let exactMarkMetric: Readonly<ResolvedFontMetric> | undefined;
   if (textLayoutService) {
     const bold = markWeight >= 600;
     const italic = markStyle === 'italic';
@@ -2078,6 +2142,15 @@ export function paragraphMarkLineMetrics(
     });
     const selectedFont = shaped.spans[0]?.font;
     const face = selectedFont?.resolvedFamily ?? authoredFamily;
+    // Acquired mark formatting can override the paragraph's default family.
+    // Match the selected alias and face tuple, not that earlier authored lookup.
+    if (selectedFont?.source === 'local') {
+      exactMarkMetric = Object.values(textLayoutService.fontMetrics
+        ?? textLayoutService.localMetrics ?? resolvedLocalFonts).find((metric) =>
+          (metric.weight ?? 400) === selectedFont.weight
+          && (metric.style ?? 'normal') === selectedFont.style
+          && selectedProvidedMetric(metric, selectedFont.resolvedFamily, ''));
+    }
     compatibleSubstituteRatio = calibriSelectedSubstituteLineHeightRatio(selectedFont);
     const mayShrinkSelectedFontBox = compatibleSubstituteRatio != null;
     ({ ascent: asc, descent: desc } = correctedLineMetrics(
@@ -2123,10 +2196,17 @@ export function paragraphMarkLineMetrics(
   } else {
     ({ asc, desc } = emptyLineNaturalPx(fs, scale));
   }
+  if (exactMarkMetric?.designAscentRatio != null && exactMarkMetric.designDescentRatio != null) {
+    asc = exactMarkMetric.designAscentRatio * fs * scale;
+    desc = exactMarkMetric.designDescentRatio * fs * scale;
+  }
+  const applicableMarkMetric = exactMarkMetric
+    ?? (resolvedLocalFont?.sourceIdentity?.startsWith('provided-sfnt:')
+      ? undefined : resolvedLocalFont);
   const resourceRatio = markUsesEastAsianFace
-    ? resolvedLocalFont?.eastAsianLineHeightRatio ?? resolvedLocalFont?.lineHeightRatio
-    : resolvedLocalFont?.lineHeightRatio ?? compatibleSubstituteRatio;
-  const intendedSingle = Math.max(
+    ? applicableMarkMetric?.eastAsianLineHeightRatio ?? applicableMarkMetric?.lineHeightRatio
+    : applicableMarkMetric?.lineHeightRatio ?? compatibleSubstituteRatio;
+  const intendedSingle = exactMarkMetric ? (resourceRatio ?? 0) * fs * scale : Math.max(
     (resourceRatio ?? 0) * fs * scale,
     emptyIntendedSingleForScriptPx(para, scale, markUsesEastAsianFace),
     wordMsMinchoEmptyEastAsianMarkSingleLinePx(
@@ -2189,7 +2269,9 @@ export function paragraphMarkLineMetrics(
         scale,
       })
     : ordinaryAdvancePx;
-  return { advancePx, ascentPx: asc, descentPx: desc };
+  return { advancePx, ascentPx: asc, descentPx: desc,
+    ...(exactMarkMetric ? { exactFontResource: true as const } : {}),
+  };
 }
 
 export function paragraphMarkLineHeight(
@@ -3417,8 +3499,18 @@ export function buildSegments(
       const localEaFloor = eaResolution
         ? serviceMetric(eaResolution.resolvedFamily, eaResolution.requestedFamily)
         : resolvedFont(eaFontFamily, weight, style);
-      const familyLineMetric = localFont ?? resolvedFont(fontFamily, weight, style);
-      const eaLineMetric = localEaFloor ?? resolvedFont(eaFontFamily, weight, style);
+      const candidateFamilyMetric = localFont ?? resolvedFont(fontFamily, weight, style);
+      const exactFontResource = selectedProvidedMetric(
+        candidateFamilyMetric, resolvedSpan?.font.resolvedFamily, text,
+      );
+      // A subset's missing glyphs use browser fallback. Do not lend the subset's
+      // OpenType box or natural-advance authority to those glyphs.
+      const familyLineMetric = candidateFamilyMetric?.sourceIdentity?.startsWith('provided-sfnt:')
+        && !exactFontResource ? undefined : candidateFamilyMetric;
+      const candidateEaMetric = localEaFloor ?? resolvedFont(eaFontFamily, weight, style);
+      const eaLineMetric = candidateEaMetric?.sourceIdentity?.startsWith('provided-sfnt:')
+        && !selectedProvidedMetric(candidateEaMetric, eaResolution?.resolvedFamily, text)
+        ? undefined : candidateEaMetric;
       const resolvedEaFloorFamily = eaResolution?.resolvedFamily
         ?? localEaFloor?.family
         ?? eaFontFamily;
@@ -3440,15 +3532,16 @@ export function buildSegments(
         ? calibriAuthoredLineHeightRatio(resolvedSpan?.font)
         : undefined;
       const inlineImageDesignDescentRatio = environment.useFeLayout !== true
-        ? calibriInlineImageDescentRatio(
+        ? exactFontResource ? familyLineMetric?.designDescentRatio : calibriInlineImageDescentRatio(
             resolvedSpan?.font.requestedFamily ?? fontFamily,
             resolvedScript,
           )
         : undefined;
       const resolvedLineHeightRatio = familyLineMetric?.lineHeightRatio
         ?? authoredCalibriRatio;
-      const mayShrinkToCalibriDesignLine = resolvedLineHeightRatio != null
-        && normalizeFontMetricFamily(resolvedSpan?.font.requestedFamily ?? '') === 'calibri';
+      const mayShrinkToSelectedDesignLine = resolvedLineHeightRatio != null
+        && (exactFontResource
+          || normalizeFontMetricFamily(resolvedSpan?.font.requestedFamily ?? '') === 'calibri');
       segs.push({
         text,
         script: resolvedScript,
@@ -3478,14 +3571,19 @@ export function buildSegments(
         fontFamily: resolvedSpan?.font.resolvedFamily ?? localFont?.family ?? fontFamily,
         fontRoute: resolvedSpan?.fontRoute,
         resolvedLineHeightRatio,
+        ...(exactFontResource ? {
+          exactFontResource: true as const,
+          resolvedDesignAscentRatio: familyLineMetric?.designAscentRatio,
+          resolvedDesignDescentRatio: familyLineMetric?.designDescentRatio,
+        } : {}),
         resolvedEastAsianLineHeightRatio: familyLineMetric?.eastAsianLineHeightRatio,
         ...(inlineImageDesignDescentRatio !== undefined
           ? { inlineImageDesignDescentRatio }
           : {}),
-        ...(mayShrinkToCalibriDesignLine
+        ...(mayShrinkToSelectedDesignLine
           ? { designLineMayShrinkSelectedFontBox: true as const }
           : {}),
-        ...(calibriAdvanceMatchesAuthoredFace(resolvedSpan?.font, familyLineMetric)
+        ...(exactFontResource || calibriAdvanceMatchesAuthoredFace(resolvedSpan?.font, familyLineMetric)
           ? { advanceMatchesAuthoredFace: true as const }
           : {}),
         vertAlign: effectiveVertAlign,
@@ -3882,9 +3980,22 @@ export function buildSegments(
       const style = italic ? 'italic' as const : 'normal' as const;
       const localFont = resolvedFont(authoredFamily, weight, style);
       const localEaFloor = resolvedFont(run.fontFamilyEastAsia ?? null, weight, style);
-      const familyLineMetric = localFont ?? (authoredFamily
+      const candidateFamilyMetric = localFont ?? (authoredFamily
         ? environment.resolvedLocalFonts?.[normalizeFontMetricFamily(authoredFamily)]
         : undefined);
+      const selectedFont = candidateFamilyMetric?.sourceIdentity?.startsWith('provided-sfnt:')
+        ? environment.layoutServices?.text.resolve({
+            fonts: { ascii: run.fontFamily ?? authoredFamily,
+              eastAsia: run.fontFamilyEastAsia ?? authoredFamily },
+            slot: eastAsian ? 'eastAsia' : 'ascii', weight, style,
+          })
+        : undefined;
+      const selectedFamily = selectedFont?.resolvedFamily ?? localFont?.family ?? authoredFamily;
+      const exactFontResource = selectedProvidedMetric(
+        candidateFamilyMetric, selectedFamily ?? undefined, '',
+      );
+      const familyLineMetric = candidateFamilyMetric?.sourceIdentity?.startsWith('provided-sfnt:')
+        && !exactFontResource ? undefined : candidateFamilyMetric;
       const eaLineMetric = localEaFloor ?? (run.fontFamilyEastAsia
         ? environment.resolvedLocalFonts?.[normalizeFontMetricFamily(run.fontFamilyEastAsia)]
         : undefined);
@@ -3898,7 +4009,13 @@ export function buildSegments(
         strikethrough: false,
         fontSize: run.fontSize,
         color: null,
-        fontFamily: localFont?.family ?? authoredFamily,
+        fontFamily: selectedFamily,
+        ...(exactFontResource ? {
+          exactFontResource: true as const,
+          designLineMayShrinkSelectedFontBox: true as const,
+          resolvedDesignAscentRatio: familyLineMetric?.designAscentRatio,
+          resolvedDesignDescentRatio: familyLineMetric?.designDescentRatio,
+        } : {}),
         resolvedLineHeightRatio: familyLineMetric?.lineHeightRatio,
         resolvedEastAsianLineHeightRatio: familyLineMetric?.eastAsianLineHeightRatio,
         vertAlign: null,

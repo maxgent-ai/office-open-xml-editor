@@ -240,23 +240,28 @@ export function measureParagraph(
     && context.lineSpacing?.rule === 'auto'
     && context.lineSpacing.value >= 1
     && !isGridLineRule(grid);
-  const inlineImageDefaultSinglePt = appliesInlineImageAutoMetrics
+  const inlineImageMark = appliesInlineImageAutoMetrics
+    ? paragraphMarkLineMetrics(
+        paragraph,
+        1,
+        grid,
+        context.hasRuby,
+        markUsesEastAsianGrid,
+        measurer.context,
+        fontFamilyClasses,
+        null,
+        environment.resolvedLocalFonts,
+        environment.layoutServices?.text,
+        environment.paragraphMarkShapeInput,
+        environment.useFeLayout === true,
+      )
+    : undefined;
+  const inlineImageDefaultSinglePt = inlineImageMark
     ? Math.max(
-        paragraphMarkLineMetrics(
-          paragraph,
-          1,
-          grid,
-          context.hasRuby,
-          markUsesEastAsianGrid,
-          measurer.context,
-          fontFamilyClasses,
-          null,
-          environment.resolvedLocalFonts,
-          environment.layoutServices?.text,
-          environment.paragraphMarkShapeInput,
-          environment.useFeLayout === true,
-        ).advancePx,
-        environment.useFeLayout === true
+        inlineImageMark.advancePx,
+        // The opt-in selected resource owns the mark's line; the legacy
+        // authored-family floor applies only to the existing default path.
+        environment.useFeLayout === true || inlineImageMark.exactFontResource
           ? 0
           : calibriInlineImageParagraphSinglePx(paragraph, 1),
       )

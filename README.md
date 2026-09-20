@@ -616,6 +616,33 @@ renderers retain their own font policies. XLSX automatic script inference uses
 the shared-string table; inline cell strings and shape text do not contribute
 to that workbook-level inference.
 
+### Optional DOCX font resources
+
+No migration is required. DOCX keeps its existing font and pagination behavior
+when `fontResources` is omitted. To use font files owned by your application,
+pass one static TTF/OTF (sfnt) resource per family, weight, and style:
+
+```typescript
+import { DocxDocument } from '@silurus/ooxml/docx';
+
+const fontBytes = new Uint8Array(await (await fetch('/fonts/example.ttf')).arrayBuffer());
+const document = await DocxDocument.load('/document.docx', {
+  fontResources: [{ family: 'Example Sans', bytes: fontBytes, weight: 400, style: 'normal' }],
+});
+```
+
+`DocxViewer` and `DocxScrollViewer` accept the same option. Supplied resources
+work in main and worker modes; input bytes are copied and owned font faces are
+released by `destroy()`. Accepted resources are limited to 64 faces and 128 MiB
+in total, with the existing per-font byte ceiling. WOFF/WOFF2, TTC collections, and variable fonts are unsupported. Invalid resources are
+ignored. Embedded document fonts take precedence for matching face tuples.
+
+Only a selected resource whose cmap covers the complete text span supplies
+its OpenType line metrics and natural-width wrapping. Uncovered text retains
+the fallback path. This option does not read installed font files or request
+Local Font Access permission, and it does not guarantee identical Office
+pagination for every font version.
+
 ### Markdown export
 
 Every headless engine can produce a best-effort, text-focused GitHub-flavoured
