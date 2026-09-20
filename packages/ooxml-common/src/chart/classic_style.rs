@@ -1044,12 +1044,20 @@ fn resolve_classic_chart_style_roles_selected(
     let point_fallbacks = point_indices
         .iter()
         .copied()
-        .filter(|index| resolver.classic_pattern2_set_transform(*index / 6).is_none())
+        .filter(|index| {
+            resolver
+                .classic_pattern2_set_transform(*index / 6)
+                .is_none()
+        })
         .collect::<Vec<_>>();
     let series_fallbacks = series_indices
         .iter()
         .copied()
-        .filter(|index| resolver.classic_pattern2_set_transform(*index / 6).is_none())
+        .filter(|index| {
+            resolver
+                .classic_pattern2_set_transform(*index / 6)
+                .is_none()
+        })
         .collect::<Vec<_>>();
     if data.pattern == PaletteRecipe::Pattern(2) {
         for role in ["dataPoint", "dataPoint3D"] {
@@ -1547,7 +1555,9 @@ mod tests {
                 )
             }
             fn classic_pattern2_set_transform(&self, set_index: usize) -> Option<f64> {
-                [0.0, -0.4, 0.2, -0.2, 0.4, -0.5, 0.3, -0.3].get(set_index).copied()
+                [0.0, -0.4, 0.2, -0.2, 0.4, -0.5, 0.3, -0.3]
+                    .get(set_index)
+                    .copied()
             }
         }
         let pattern2 = resolve_scheme_recipe(
@@ -1748,11 +1758,14 @@ mod tests {
         }
         let resolver = FirstSetOnly(MatrixResolver::new());
         for style in [2, 10, 34] {
-            let roles = resolve_classic_chart_style_roles(
-                style, &resolver, None, &[5, 6], Some(&[5, 6]),
-            ).unwrap();
+            let roles =
+                resolve_classic_chart_style_roles(style, &resolver, None, &[5, 6], Some(&[5, 6]))
+                    .unwrap();
             for role in ["dataPoint", "dataPoint3D"] {
-                assert_eq!(roles[role].fill_semantic_fallback_indices.as_deref(), Some(&[6][..]));
+                assert_eq!(
+                    roles[role].fill_semantic_fallback_indices.as_deref(),
+                    Some(&[6][..])
+                );
                 assert!(roles[role].fill_colors.as_ref().unwrap()[0].is_some());
                 assert!(roles[role].fill_colors.as_ref().unwrap()[1].is_none());
                 if style != 2 {
@@ -1760,7 +1773,12 @@ mod tests {
                     assert!(roles[role].line_colors.as_ref().unwrap()[1].is_some());
                 }
             }
-            assert_eq!(roles["dataPointLine"].line_semantic_fallback_indices.as_deref(), Some(&[6][..]));
+            assert_eq!(
+                roles["dataPointLine"]
+                    .line_semantic_fallback_indices
+                    .as_deref(),
+                Some(&[6][..])
+            );
         }
     }
 

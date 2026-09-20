@@ -20316,26 +20316,47 @@ mod anchor_image_relative_from_tests {
             parse_docx_chart(&xml, None, &theme).expect("Word chart")
         };
         let chart = parse(2);
-        let role = &chart.classic_varying_point_chart_style_roles.as_ref()
+        let role = &chart
+            .classic_varying_point_chart_style_roles
+            .as_ref()
             .expect("point-domain numeric roles")["dataPoint"];
-        let colors = role.fill_colors.as_ref().unwrap_or_else(|| panic!("point palette: {role:?}"));
+        let colors = role
+            .fill_colors
+            .as_ref()
+            .unwrap_or_else(|| panic!("point palette: {role:?}"));
         assert_eq!(colors[0].as_deref(), Some("808080"));
         assert_eq!(colors[6].as_deref(), None);
-        assert_eq!(role.fill_semantic_fallback_indices.as_deref(), Some(&[6][..]));
+        assert_eq!(
+            role.fill_semantic_fallback_indices.as_deref(),
+            Some(&[6][..])
+        );
         // Direct point paint stays separate from the automatic palette so
         // the renderer can preserve its precedence at either host boundary.
         assert_eq!(
-            chart.series[0].data_point_colors.as_ref().expect("direct point color")[5].as_deref(),
+            chart.series[0]
+                .data_point_colors
+                .as_ref()
+                .expect("direct point color")[5]
+                .as_deref(),
             Some("ABCDEF"),
         );
-        let point = chart.series[0].data_point_overrides.as_ref().expect("point formatting")
-            .iter().find(|point| point.idx == 5).expect("formatted point");
+        let point = chart.series[0]
+            .data_point_overrides
+            .as_ref()
+            .expect("point formatting")
+            .iter()
+            .find(|point| point.idx == 5)
+            .expect("formatted point");
         assert_eq!(point.line_color.as_deref(), Some("123456"));
         for (style, expected) in [(40, "111111"), (41, "FEFEFE"), (48, "FEFEFE")] {
             let chart = parse(style);
             assert_eq!(
-                chart.classic_chart_style_roles.as_ref().expect("numeric roles")["categoryAxis"]
-                    .font_color.as_deref(),
+                chart
+                    .classic_chart_style_roles
+                    .as_ref()
+                    .expect("numeric roles")["categoryAxis"]
+                    .font_color
+                    .as_deref(),
                 Some(expected),
                 "style {style}",
             );
