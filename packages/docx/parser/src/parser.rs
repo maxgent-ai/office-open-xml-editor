@@ -12429,6 +12429,14 @@ impl ooxml_common::chart::ColorResolver for DocxColorResolver<'_> {
             .format_scheme_present
             .then_some(&self.theme.format_scheme)
     }
+
+    fn office_dark_text_contrast_applies(&self, style: u8) -> bool {
+        (41..=48).contains(&style)
+    }
+
+    fn office_dark_title_contrast_applies(&self, style: u8) -> bool {
+        (41..=48).contains(&style)
+    }
 }
 
 /// Parse a `word/charts/chartN.xml` part into the shared [`ChartModel`].
@@ -20283,6 +20291,54 @@ mod anchor_image_relative_from_tests {
         ] {
             let doc = parse_from_bytes(&build_docx(&inline(dp))).expect("parse ok");
             assert_eq!(count_drawing_runs(&doc), 1, "visible inline dropped: {dp}");
+        }
+    }
+
+    #[test]
+    fn word_chart_host_style_scope_retains_seventh_point_fallback() {
+        let theme = ThemeColors::parse(
+            r#"<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:themeElements><a:clrScheme name="Test"><a:dk1><a:srgbClr val="111111"/></a:dk1><a:lt1><a:srgbClr val="FEFEFE"/></a:lt1><a:accent1><a:srgbClr val="808080"/></a:accent1></a:clrScheme><a:fmtScheme name="Test"><a:fillStyleLst><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:fillStyleLst></a:fmtScheme></a:themeElements></a:theme>"#,
+        );
+        let points = (0..7)
+            .map(|index| format!(r#"<c:pt idx="{index}"><c:v>1</c:v></c:pt>"#))
+            .collect::<String>();
+        let parse = |style: u8| {
+            let xml = format!(
+                r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+                  <c:style val="{style}"/><c:chart><c:plotArea><c:pieChart><c:varyColors val="1"/>
+                    <c:ser><c:idx val="0"/><c:order val="0"/>
+                      <c:dPt><c:idx val="5"/><c:spPr><a:solidFill><a:srgbClr val="ABCDEF"/></a:solidFill><a:ln><a:solidFill><a:srgbClr val="123456"/></a:solidFill></a:ln></c:spPr></c:dPt>
+                      <c:val><c:numLit><c:ptCount val="7"/>{points}</c:numLit></c:val>
+                    </c:ser>
+                  </c:pieChart></c:plotArea></c:chart>
+                </c:chartSpace>"#,
+            );
+            parse_docx_chart(&xml, None, &theme).expect("Word chart")
+        };
+        let chart = parse(2);
+        let role = &chart.classic_varying_point_chart_style_roles.as_ref()
+            .expect("point-domain numeric roles")["dataPoint"];
+        let colors = role.fill_colors.as_ref().unwrap_or_else(|| panic!("point palette: {role:?}"));
+        assert_eq!(colors[0].as_deref(), Some("808080"));
+        assert_eq!(colors[6].as_deref(), None);
+        assert_eq!(role.fill_semantic_fallback_indices.as_deref(), Some(&[6][..]));
+        // Direct point paint stays separate from the automatic palette so
+        // the renderer can preserve its precedence at either host boundary.
+        assert_eq!(
+            chart.series[0].data_point_colors.as_ref().expect("direct point color")[5].as_deref(),
+            Some("ABCDEF"),
+        );
+        let point = chart.series[0].data_point_overrides.as_ref().expect("point formatting")
+            .iter().find(|point| point.idx == 5).expect("formatted point");
+        assert_eq!(point.line_color.as_deref(), Some("123456"));
+        for (style, expected) in [(40, "111111"), (41, "FEFEFE"), (48, "FEFEFE")] {
+            let chart = parse(style);
+            assert_eq!(
+                chart.classic_chart_style_roles.as_ref().expect("numeric roles")["categoryAxis"]
+                    .font_color.as_deref(),
+                Some(expected),
+                "style {style}",
+            );
         }
     }
 

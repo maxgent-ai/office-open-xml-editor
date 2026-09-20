@@ -1,39 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import {
-  applyLinearTintOrShade,
   isObservedAutomaticSurfaceCamera,
-  legacyPattern2Color,
   surfaceMaterialFactor,
   surfacePerspectiveTangentGain,
 } from './material-color.js';
 import { automaticSurfaceMajorUnit } from './axis-scale.js';
-
-const ACCENTS = ['156082', 'E97132', '196B24', '0F9ED5', 'A02B93', '4EA72E'];
-
-describe('legacy Pattern 2 generated colours', () => {
-  it('matches the shared parser linear-sRGB transform parity fixtures', () => {
-    expect(applyLinearTintOrShade('#156082', -0.35)).toBe('#0F4E6A');
-    expect(applyLinearTintOrShade('#156082', 0)).toBe('#156082');
-    expect(applyLinearTintOrShade('#156082', 0.35)).toBe('#A1AFBB');
-  });
-  it('keeps a partial first set at the base accents', () => {
-    expect(Array.from({ length: 4 }, (_, index) =>
-      legacyPattern2Color(ACCENTS, index, 4, 2)))
-      .toEqual(['#156082', '#E97132', '#196B24', '#0F9ED5']);
-  });
-
-  it('keeps registered set transforms independent of the final object count', () => {
-    expect(Array.from({ length: 7 }, (_, index) =>
-      legacyPattern2Color(ACCENTS, index, 7, 2)))
-      .toEqual([
-        '#156082', '#E97132', '#196B24', '#0F9ED5', '#A02B93', '#4EA72E',
-        applyLinearTintOrShade('#156082', -0.4),
-      ]);
-    expect(legacyPattern2Color(ACCENTS, 6, 13, 2))
-      .toBe(legacyPattern2Color(ACCENTS, 6, 7, 2));
-    expect(legacyPattern2Color(ACCENTS, 48, 49, 2)).toBeNull();
-  });
-});
 
 describe('surface automatic material', () => {
   it('is winding-invariant and bounded to the surface compatibility range', () => {

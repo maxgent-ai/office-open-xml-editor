@@ -898,6 +898,21 @@ impl ooxml_common::chart::ColorResolver for XlsxColorResolver<'_> {
     fn implicit_outline_only_negative_column_style(&self) -> bool {
         true
     }
+
+    fn office_dark_text_contrast_applies(&self, style: u8) -> bool {
+        style == 41
+    }
+
+    fn classic_pattern2_set_transform(&self, set_index: usize) -> Option<f64> {
+        // ECMA-376 §21.2.3.46 Table 6 specifies the first six accents but
+        // leaves repeated-set tint/shade values to the application. Excel 16.111.1
+        // exports for 1–48 points establish these eight sets; 6/7/12/13-point
+        // controls establish count independence. The ninth set is unobserved.
+        // This evidence belongs to Excel and must not enroll Word/PowerPoint.
+        [0.0, -0.4, 0.2, -0.2, 0.4, -0.5, 0.3, -0.3]
+            .get(set_index)
+            .copied()
+    }
 }
 /// Locate the first resolvable `<a:solidFill>` among `parent`'s direct children
 /// (children only, not deep descendants — chart spPr is structured shallowly)
@@ -1014,6 +1029,61 @@ mod solid_fill_color_tests {
         let doc = Document::parse(&xml).unwrap();
         let out = extract_solid_fill_in_drawingml(&doc.root_element(), &theme());
         assert_eq!(out.as_deref(), Some("FF8000"));
+    }
+
+    #[test]
+    fn excel_chart_host_style_scope_preserves_seventh_point_transform() {
+        let mut colors = theme();
+        colors[4] = "#808080".to_string();
+        let resolver = XlsxColorResolver {
+            theme_colors: &colors,
+            theme_major_font_latin: None,
+            theme_minor_font_latin: None,
+            theme_format_scheme: None,
+        };
+        let points = (0..7)
+            .map(|index| format!(r#"<c:pt idx="{index}"><c:v>1</c:v></c:pt>"#))
+            .collect::<String>();
+        let parse = |style: u8| {
+            let xml = format!(
+                r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+                  <c:style val="{style}"/><c:chart><c:plotArea><c:pieChart><c:varyColors val="1"/>
+                    <c:ser><c:idx val="0"/><c:order val="0"/>
+                      <c:dPt><c:idx val="5"/><c:spPr><a:solidFill><a:srgbClr val="ABCDEF"/></a:solidFill><a:ln><a:solidFill><a:srgbClr val="123456"/></a:solidFill></a:ln></c:spPr></c:dPt>
+                      <c:val><c:numLit><c:ptCount val="7"/>{points}</c:numLit></c:val>
+                    </c:ser>
+                  </c:pieChart></c:plotArea></c:chart>
+                </c:chartSpace>"#,
+            );
+            {
+                let document = Document::parse(&xml).expect("chart XML");
+                ooxml_common::chart::parse_chart_part(document.root_element(), &resolver)
+                    .expect("Excel chart")
+            }
+        };
+        let chart = parse(2);
+        let role = &chart.classic_varying_point_chart_style_roles.as_ref()
+            .expect("point-domain numeric roles")["dataPoint"];
+        let colors = role.fill_colors.as_ref().unwrap_or_else(|| panic!("point palette: {role:?}"));
+        assert_eq!(colors[0].as_deref(), Some("808080"));
+        assert_eq!(colors[6].as_deref(), Some("656565"));
+        assert_eq!(role.fill_semantic_fallback_indices.as_deref(), None);
+        // Direct point paint stays separate from the automatic palette so
+        // the renderer can preserve its precedence at either host boundary.
+        assert!(chart.series[0].data_point_colors.as_ref().expect("direct point color")[5]
+            .as_deref().is_some_and(|color| color.eq_ignore_ascii_case("ABCDEF")));
+        let point = chart.series[0].data_point_overrides.as_ref().expect("point formatting")
+            .iter().find(|point| point.idx == 5).expect("formatted point");
+        assert_eq!(point.line_color.as_deref(), Some("123456"));
+        for (style, expected) in [(40, "111111"), (41, "FEFEFE"), (42, "111111"), (48, "111111")] {
+            let chart = parse(style);
+            assert_eq!(
+                chart.classic_chart_style_roles.as_ref().expect("numeric roles")["categoryAxis"]
+                    .font_color.as_deref().map(str::to_uppercase),
+                Some(expected.to_string()),
+                "style {style}",
+            );
+        }
     }
 
     /// A chart series is a DrawingML shape too: its `<c:spPr>` fill must retain

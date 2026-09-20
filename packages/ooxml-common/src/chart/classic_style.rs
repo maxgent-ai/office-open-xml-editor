@@ -99,9 +99,9 @@ fn office_default_scheme_color(name: &str) -> Option<String> {
     )
 }
 
-/// Adds only the application defaults that an absent theme would have
-/// supplied. All host-specific color transforms, shape resolution, implicit
-/// backgrounds, and compatibility policy still belong to the host resolver.
+/// Adds only the built-in color defaults used by classic chart-style recipes
+/// when the optional theme part is absent. Font faces are never invented: an
+/// absent theme carries no concrete font resource identity.
 struct OfficeDefaultClassicResolver<'a> {
     source: &'a dyn ColorResolver,
 }
@@ -126,21 +126,21 @@ impl ColorResolver for OfficeDefaultClassicResolver<'_> {
     }
 
     fn theme_major_font_latin(&self) -> Option<String> {
-        self.source
-            .theme_major_font_latin()
-            .or_else(|| Some("Calibri Light".to_owned()))
+        self.source.theme_major_font_latin()
     }
 
     fn theme_minor_font_latin(&self) -> Option<String> {
-        self.source
-            .theme_minor_font_latin()
-            .or_else(|| Some("Calibri".to_owned()))
+        self.source.theme_minor_font_latin()
     }
 
     fn resolve_series_accent(&self, idx: usize) -> Option<String> {
         self.source
             .resolve_series_accent(idx)
             .or_else(|| office_default_scheme_color(&format!("accent{}", idx % 6 + 1)))
+    }
+
+    fn classic_pattern2_set_transform(&self, set_index: usize) -> Option<f64> {
+        self.source.classic_pattern2_set_transform(set_index)
     }
 
     fn theme_format_scheme(&self) -> Option<&crate::theme::ThemeFormatScheme> {
@@ -157,6 +157,14 @@ impl ColorResolver for OfficeDefaultClassicResolver<'_> {
 
     fn implicit_outline_only_negative_column_style(&self) -> bool {
         self.source.implicit_outline_only_negative_column_style()
+    }
+
+    fn office_dark_text_contrast_applies(&self, style: u8) -> bool {
+        self.source.office_dark_text_contrast_applies(style)
+    }
+
+    fn office_dark_title_contrast_applies(&self, style: u8) -> bool {
+        self.source.office_dark_title_contrast_applies(style)
     }
 }
 
@@ -443,17 +451,12 @@ fn resolve_scheme_recipe(
                 // ECMA-376 §21.2.3.46 Table 6 fixes the first set at the six
                 // unmodified accents and requires changed tint/shade in each
                 // repeated set, but leaves those transforms host-defined.
-                // Excel 16.111.1 produced this eight-set cycle for the complete
-                // 48-point boundary matrix. Separate 6/7/12/13-point controls
-                // established that a point's transform is independent of the
-                // chart's final point count. Indexes outside that observed
-                // matrix stay unresolved and use the renderer's normal theme
-                // fallback; inventing a ninth transform would be a heuristic.
-                const OFFICE_PATTERN_2_AMOUNTS: [f64; 8] =
-                    [0.0, -0.4, 0.2, -0.2, 0.4, -0.5, 0.3, -0.3];
-                OFFICE_PATTERN_2_AMOUNTS
-                    .get(set_index)
-                    .and_then(|amount| apply(style_accent(slot as u8 + 1, 1), *amount))
+                // Excel's host resolver supplies its measured eight-set cycle.
+                // Other hosts keep repeated sets unresolved rather than
+                // inheriting Excel's application-defined endpoints.
+                resolver
+                    .classic_pattern2_set_transform(set_index)
+                    .and_then(|amount| apply(style_accent(slot as u8 + 1, 1), amount))
             }
             3 => apply(style_accent(slot as u8 + 1, 1), -0.5),
             4 => apply("dk1", 1.0 - P4[slot]),
@@ -689,25 +692,27 @@ fn set_font_defaults(
     style.font_face = resolver.theme_minor_font_latin();
 }
 
-/// Apply the automatic light text used by current Office hosts for the dark
-/// built-in chart styles. ECMA-376 Part 1 §21.2.3.46 says that chart text
-/// follows the Axis & Major Gridlines colour, which is `dk1` for styles 41–48.
-/// Current Word, Excel, and PowerPoint instead use the same `lt1` colour as
-/// Table 2's Other Lines for automatic axis, legend, label, and table text.
+/// Apply host-evidenced automatic light text for dark built-in chart styles.
+/// ECMA-376 Part 1 §21.2.3.46 says that chart text follows the Axis & Major
+/// Gridlines colour, which is `dk1` for styles 41–48. Cross-host evidence covers
+/// style 41; Word's host resolver opts the complete 41..=48 matrix into the
+/// same `lt1` projection.
 ///
 /// Chart titles have one observed source-shape boundary: Office uses the light
 /// colour when the rich paragraph carries `a:pPr/a:defRPr`, including an empty
 /// carrier, but retains the ECMA dark colour when that carrier is absent.
-/// Office-produced style matrices across 41–48 and empty/language/size/bold
-/// run-property counterexamples establish this scope. Direct and linked text
-/// paint remain higher-precedence layers; this changes only the numeric role.
+/// Word-produced style matrices across 41–48 and empty/language/size/bold
+/// run-property counterexamples establish its broader scope. Direct and linked
+/// text paint remain higher-precedence layers; this changes only the numeric role.
 pub(super) fn apply_office_dark_text_contrast(
     style: u8,
     title_has_paragraph_default_run: bool,
     resolver: &dyn ColorResolver,
     roles: &mut BTreeMap<String, ChartExElementStyle>,
 ) {
-    if !(41..=48).contains(&style) {
+    let ordinary_text = resolver.office_dark_text_contrast_applies(style);
+    let title_text = resolver.office_dark_title_contrast_applies(style);
+    if !ordinary_text && !title_text {
         return;
     }
 
@@ -727,23 +732,25 @@ pub(super) fn apply_office_dark_text_contrast(
     // the renderer must not silently substitute semantic black in that case.
     let light_paint_authored = Some(true);
 
-    for role in [
-        "categoryAxis",
-        "seriesAxis",
-        "valueAxis",
-        "axisTitle",
-        "dataLabel",
-        "dataLabelCallout",
-        "dataTable",
-        "legend",
-        "trendlineLabel",
-    ] {
-        if let Some(role_style) = roles.get_mut(role) {
-            role_style.font_color = light_color.clone();
-            role_style.font_paint_authored = light_paint_authored;
+    if ordinary_text {
+        for role in [
+            "categoryAxis",
+            "seriesAxis",
+            "valueAxis",
+            "axisTitle",
+            "dataLabel",
+            "dataLabelCallout",
+            "dataTable",
+            "legend",
+            "trendlineLabel",
+        ] {
+            if let Some(role_style) = roles.get_mut(role) {
+                role_style.font_color = light_color.clone();
+                role_style.font_paint_authored = light_paint_authored;
+            }
         }
     }
-    if title_has_paragraph_default_run {
+    if title_text && title_has_paragraph_default_run {
         if let Some(title) = roles.get_mut("title") {
             title.font_color = light_color;
             title.font_paint_authored = light_paint_authored;
@@ -1027,7 +1034,9 @@ fn resolve_classic_chart_style_roles_selected(
 
     // Table 6 requires a changed transform for every repeated Pattern 2 set,
     // but does not define that host transform. Excel evidence establishes the
-    // complete eight-set (48 object) cycle above. Beyond that boundary the
+    // complete eight-set (48 object) cycle in its host resolver; hosts without
+    // repeated-set evidence support only the first six accents. Beyond each
+    // host's supported boundary the
     // numeric style deliberately delegates to the mark's semantic automatic
     // paint. Keep those slots distinct from a theme colour that was authored
     // inside the observed range but could not be resolved: the latter remains
@@ -1035,12 +1044,12 @@ fn resolve_classic_chart_style_roles_selected(
     let point_fallbacks = point_indices
         .iter()
         .copied()
-        .filter(|index| *index >= 48)
+        .filter(|index| resolver.classic_pattern2_set_transform(*index / 6).is_none())
         .collect::<Vec<_>>();
     let series_fallbacks = series_indices
         .iter()
         .copied()
-        .filter(|index| *index >= 48)
+        .filter(|index| resolver.classic_pattern2_set_transform(*index / 6).is_none())
         .collect::<Vec<_>>();
     if data.pattern == PaletteRecipe::Pattern(2) {
         for role in ["dataPoint", "dataPoint3D"] {
@@ -1071,7 +1080,7 @@ fn resolve_classic_chart_style_roles_selected(
     }
     // The Table 5 body and outline recipes are independent. Styles 10 and 34
     // use Pattern 2 only for the body; their fixed-lt1 / Pattern 3 outlines
-    // remain valid above the observed eight-set Pattern 2 body boundary.
+    // remain valid beyond the host-supported Pattern 2 body boundary.
     if data.outline == Some(PaletteRecipe::Pattern(2)) {
         for role in ["dataPoint", "dataPoint3D"] {
             if let Some(role_style) = roles.get_mut(role) {
@@ -1254,6 +1263,20 @@ mod tests {
 
         fn theme_format_scheme(&self) -> Option<&crate::theme::ThemeFormatScheme> {
             Some(&self.format_scheme)
+        }
+
+        fn classic_pattern2_set_transform(&self, set_index: usize) -> Option<f64> {
+            [0.0, -0.4, 0.2, -0.2, 0.4, -0.5, 0.3, -0.3]
+                .get(set_index)
+                .copied()
+        }
+
+        fn office_dark_text_contrast_applies(&self, style: u8) -> bool {
+            (41..=48).contains(&style)
+        }
+
+        fn office_dark_title_contrast_applies(&self, style: u8) -> bool {
+            (41..=48).contains(&style)
         }
     }
 
@@ -1483,7 +1506,7 @@ mod tests {
         assert_eq!(roles["plotArea"].fill_paint_authored, Some(true));
         for role in ["categoryAxis", "title", "legend", "dataLabel"] {
             assert_eq!(roles[role].font_paint_authored, Some(true), "{role}");
-            assert_eq!(roles[role].font_face.as_deref(), Some("Calibri"), "{role}");
+            assert_eq!(roles[role].font_face, None, "{role}");
         }
         let moderate = resolve_classic_chart_style_roles(17, &NoTheme, None, &[0], None)
             .expect("moderate style");
@@ -1522,6 +1545,9 @@ mod tests {
                     }
                     .to_owned(),
                 )
+            }
+            fn classic_pattern2_set_transform(&self, set_index: usize) -> Option<f64> {
+                [0.0, -0.4, 0.2, -0.2, 0.4, -0.5, 0.3, -0.3].get(set_index).copied()
             }
         }
         let pattern2 = resolve_scheme_recipe(
@@ -1707,6 +1733,38 @@ mod tests {
     }
 
     #[test]
+    fn host_unresolved_pattern_two_sets_delegate_without_erasing_outlines() {
+        struct FirstSetOnly(MatrixResolver);
+        impl ColorResolver for FirstSetOnly {
+            fn resolve_solid_fill(&self, _: roxmltree::Node) -> Option<String> {
+                None
+            }
+            fn resolve_scheme_color(&self, name: &str) -> Option<String> {
+                self.0.resolve_scheme_color(name)
+            }
+            fn theme_format_scheme(&self) -> Option<&crate::theme::ThemeFormatScheme> {
+                self.0.theme_format_scheme()
+            }
+        }
+        let resolver = FirstSetOnly(MatrixResolver::new());
+        for style in [2, 10, 34] {
+            let roles = resolve_classic_chart_style_roles(
+                style, &resolver, None, &[5, 6], Some(&[5, 6]),
+            ).unwrap();
+            for role in ["dataPoint", "dataPoint3D"] {
+                assert_eq!(roles[role].fill_semantic_fallback_indices.as_deref(), Some(&[6][..]));
+                assert!(roles[role].fill_colors.as_ref().unwrap()[0].is_some());
+                assert!(roles[role].fill_colors.as_ref().unwrap()[1].is_none());
+                if style != 2 {
+                    assert_eq!(roles[role].line_semantic_fallback_indices, None);
+                    assert!(roles[role].line_colors.as_ref().unwrap()[1].is_some());
+                }
+            }
+            assert_eq!(roles["dataPointLine"].line_semantic_fallback_indices.as_deref(), Some(&[6][..]));
+        }
+    }
+
+    #[test]
     fn pattern_two_body_fallback_does_not_erase_independent_outlines() {
         let resolver = MatrixResolver::new();
         for style in [10, 34] {
@@ -1788,6 +1846,12 @@ mod tests {
             format_scheme: crate::theme::ThemeFormatScheme,
         }
         impl ColorResolver for CustomTheme {
+            fn office_dark_text_contrast_applies(&self, style: u8) -> bool {
+                (41..=48).contains(&style)
+            }
+            fn office_dark_title_contrast_applies(&self, style: u8) -> bool {
+                (41..=48).contains(&style)
+            }
             fn resolve_solid_fill(&self, _: roxmltree::Node) -> Option<String> {
                 None
             }
@@ -1819,6 +1883,12 @@ mod tests {
     fn office_dark_text_preserves_absent_and_unresolved_theme_boundaries() {
         struct NoTheme;
         impl ColorResolver for NoTheme {
+            fn office_dark_text_contrast_applies(&self, style: u8) -> bool {
+                (41..=48).contains(&style)
+            }
+            fn office_dark_title_contrast_applies(&self, style: u8) -> bool {
+                (41..=48).contains(&style)
+            }
             fn resolve_solid_fill(&self, _: roxmltree::Node) -> Option<String> {
                 None
             }
@@ -1833,6 +1903,12 @@ mod tests {
             format_scheme: crate::theme::ThemeFormatScheme,
         }
         impl ColorResolver for UnresolvedTheme {
+            fn office_dark_text_contrast_applies(&self, style: u8) -> bool {
+                (41..=48).contains(&style)
+            }
+            fn office_dark_title_contrast_applies(&self, style: u8) -> bool {
+                (41..=48).contains(&style)
+            }
             fn resolve_solid_fill(&self, _: roxmltree::Node) -> Option<String> {
                 None
             }

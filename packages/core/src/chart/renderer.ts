@@ -192,7 +192,6 @@ import { hexToRgba, resolveFill } from '../shape/paint.js';
 import { drawingmlLineDashArray, pptxPresetDashArray } from '../draw/dash.js';
 import {
   isObservedAutomaticSurfaceCamera,
-  legacyPattern2Color,
   scaleHexColor,
   surfaceMaterialFactor,
   surfacePerspectiveTangentGain,
@@ -9768,15 +9767,9 @@ function renderSurfaceChart(
     return fractions;
   };
   const bandColors = Array.from({ length: bandCount }, (_, index) =>
-    legacyPattern2Color(
-      chart.themeAccentColors ?? [],
-      index,
-      bandCount,
-      // Office's omitted classic chart style uses Pattern 2. Keep this
-      // compatibility default scoped to renderer-generated surface bands;
-      // authored series/point paint remains parser-owned.
-      chart.legacyChartStyle ?? 2,
-    ) ?? (rows[index]?.color ? `#${rows[index].color}` : chartColor(index, rows[index])),
+    chart.themeAccentColors?.[index % 6]
+      ? `#${chart.themeAccentColors[index % 6]}`
+      : rows[index]?.color ? `#${rows[index].color}` : chartColor(index, rows[index]),
   );
   const bandFormats = new Map((chart.surfaceBandFormats ?? []).map(format => [format.idx, format]));
   // Surface value bands have their own semantic formatting-index domain. A
