@@ -47,11 +47,6 @@ import { DOCX_GOOGLE_FONTS, docxFontPreloadNames } from './google-fonts';
 import { loadEmbeddedFonts } from './embedded-fonts';
 import { docxResolvedFontMetricCandidates } from './document-content.js';
 import {
-  loadDocxFontResources,
-  snapshotDocxFontResources,
-  type DocxFontResource,
-} from './font-resources.js';
-import {
   attachDocumentLayoutRuntime,
   documentLayoutRuntimeOf,
   layoutVariantStoreOf,
@@ -107,22 +102,11 @@ import {
 
 /** Options for {@link DocxDocument.load}. Extends the shared load-options type
  *  from `@silurus/ooxml-core` (`useGoogleFonts`, `resourceLimits`, and the
- *  deprecated `maxZipEntryBytes` alias) with the opt-in math engine. */
+ *  deprecated `maxZipEntryBytes` alias) with the opt-in math engine.
+ *  Font acquisition stays inside the document/browser paths: ordinary loading
+ *  must not require an application font catalog or device-font permission.
+ *  Embedded fonts and the existing optional web-font preload remain supported. */
 export interface LoadOptions extends CoreLoadOptions {
-  /**
-   * Opt-in, application-owned static sfnt font resources used for both Canvas
-   * selection and DOCX line metrics. Omit this option to preserve existing
-   * native, substitute, and embedded-font behavior. This is the scalable alternative to
-   * family-name-specific metric tables: layout is derived from the supplied
-   * OpenType tables for any static family. Variable fonts are unsupported until
-   * instance metrics can be resolved. Unsupported or invalid resources are
-   * ignored and the existing fallback behavior is retained.
-   *
-   * Pass one entry per regular/bold/italic/bold-italic tuple that the document
-   * may select. The resources are copied to a render worker when `mode` is
-   * `worker`; callers retain ownership of their input arrays.
-   */
-  fontResources?: readonly DocxFontResource[];
   /**
    * Opt-in OMML equation engine. Import it from the separate `@silurus/ooxml/math`
    * entry and pass it in: `import { math } from '@silurus/ooxml/math'`. When
@@ -396,7 +380,6 @@ export class DocxDocument {
    *  the shared FontFaceSet for the lifetime of the SPA (deduped + refcounted in
    *  core, so a font shared with another open document survives until both go). */
   private _embeddedFontFaces: FontFace[] = [];
-  private _providedFontFaces: FontFace[] = [];
   /** Google-Fonts `FontFace` objects this document preloaded into `document.fonts`
    *  (main mode only — in worker mode the worker owns them and terminates with its
    *  own FontFaceSet). Released in {@link destroy} so they do not leak into the
@@ -458,7 +441,6 @@ export class DocxDocument {
 
   static async load(source: string | ArrayBuffer, opts: LoadOptions = {}): Promise<DocxDocument> {
     const cjkFallback = resolveCjkFallback(opts.cjkFallback);
-    const fontResources = snapshotDocxFontResources(opts.fontResources);
     const resourceOptions = normalizeLoadResourceOptions(opts);
     const defaultCurrentDateMs = Date.now();
     const mode = opts.mode ?? 'main';
@@ -537,7 +519,6 @@ export class DocxDocument {
               settled: false,
             }
           : undefined,
-        mode === 'worker' ? fontResources : undefined,
       );
       if (mode === 'worker' && doc._mode === 'main') {
         metrics.setMode('main');
@@ -584,10 +565,6 @@ export class DocxDocument {
       // the worker's zip-entry extraction) before the lazy first pagination, so
       // text measures/draws with the authored typeface. Worker mode does this
       // inside the worker (before it paginates); here it runs on the main thread.
-      const providedFonts = doc._mode === 'main'
-        ? await loadDocxFontResources(fontResources)
-        : { faces: [], metrics: {} };
-      doc._providedFontFaces = providedFonts.faces;
       let embeddedMetrics: Awaited<ReturnType<typeof loadEmbeddedFonts>>['metrics'] | undefined;
       if (doc._mode === 'main' && doc._document?.embeddedFonts?.length) {
         const loadingDocument = doc;
@@ -610,9 +587,6 @@ export class DocxDocument {
         const layoutDocument = doc;
         const runtime = documentLayoutRuntimeOf(doc);
         runtime.services = createLayoutServices(doc._source, {
-          // Authored embedded faces have precedence over application-provided
-          // resources for the same tuple.
-          localMetrics: providedFonts.metrics,
           fontMetrics: embeddedMetrics,
           measureResolvedFontMetrics: true,
           resolvedFontMetricCandidates: docxResolvedFontMetricCandidates(
@@ -825,14 +799,12 @@ export class DocxDocument {
     onUsage?: (usage: import('@silurus/ooxml-core').OoxmlResourceUsageSnapshot) => void,
     renderers?: WorkerRendererDescriptors,
     progressive?: WorkerProgressiveLoad,
-    fontResources?: readonly DocxFontResource[],
   ): Promise<void> {
     if (progressive) {
       await this._parseProgressively(
         buffer,
         resourcePolicy,
         useGoogleFonts,
-        fontResources,
         timeoutMs,
         onUsage,
         renderers,
@@ -843,7 +815,7 @@ export class DocxDocument {
     const res = await this._bridge.request(
       (id) =>
         this._mode === 'worker'
-          ? ({ type: 'parse', id, data: buffer, resourcePolicy, useGoogleFonts, fontResources, cjkFallback: this._cjkFallback, defaultCurrentDateMs: documentLayoutRuntimeOf(this).defaultCurrentDateMs, ...this._parseViewFields(), renderers } satisfies RenderWorkerRequest)
+          ? ({ type: 'parse', id, data: buffer, resourcePolicy, useGoogleFonts, cjkFallback: this._cjkFallback, defaultCurrentDateMs: documentLayoutRuntimeOf(this).defaultCurrentDateMs, ...this._parseViewFields(), renderers } satisfies RenderWorkerRequest)
           : ({ type: 'parse', id, data: buffer, resourcePolicy } satisfies WorkerRequest),
       [buffer],
       { timeoutMs },
@@ -1128,7 +1100,6 @@ export class DocxDocument {
     buffer: ArrayBuffer,
     resourcePolicy: NormalizedOoxmlResourcePolicy,
     useGoogleFonts: boolean,
-    fontResources: readonly DocxFontResource[] | undefined,
     timeoutMs: number | undefined,
     onUsage: ((usage: import('@silurus/ooxml-core').OoxmlResourceUsageSnapshot) => void) | undefined,
     renderers: WorkerRendererDescriptors | undefined,
@@ -1146,7 +1117,6 @@ export class DocxDocument {
           data: buffer,
           resourcePolicy,
           useGoogleFonts,
-          fontResources,
           cjkFallback: this._cjkFallback,
           defaultCurrentDateMs: documentLayoutRuntimeOf(this).defaultCurrentDateMs,
           ...this._parseViewFields(),
@@ -1248,10 +1218,6 @@ export class DocxDocument {
     if (this._embeddedFontFaces.length > 0) {
       unregisterEmbeddedFonts(this._embeddedFontFaces);
       this._embeddedFontFaces = [];
-    }
-    if (this._providedFontFaces?.length > 0) {
-      unregisterEmbeddedFonts(this._providedFontFaces);
-      this._providedFontFaces = [];
     }
     // Release the Google-Fonts substitutes this document preloaded into the
     // shared FontFaceSet (main mode). Same refcount contract as the embedded
