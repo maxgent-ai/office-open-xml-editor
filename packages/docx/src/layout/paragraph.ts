@@ -3914,35 +3914,6 @@ interface AcquiredParagraphResult {
   readonly layout: ParagraphLayout;
 }
 
-/**
- * Operational fail-closed budget on cache-missed paragraph acquisitions
- * per document layout session. Acquisition cache keys carry the exact
- * placement, so keep-with-next preflight chains almost never hit the
- * cache: each chain member re-measures the shared following tail, and a
- * pathological document turns that into effectively unbounded work (the
- * host runs out of memory long before any per-paragraph guard fires).
- * The per-paragraph exclusion fixpoint keeps its own 16-pass guard; this
- * bounds the total acquisition work instead. Chosen ~15x above the
- * heaviest observed healthy document (~1.5k misses on a 58-page,
- * table-heavy file).
- */
-const PARAGRAPH_ACQUISITION_MISS_BUDGET = 25_000;
-const paragraphAcquisitionMissCounts = new WeakMap<object, number>();
-
-function noteParagraphAcquisitionMiss(
-  layoutServices: ParagraphAcquisitionOptions['environment']['layoutServices'],
-): void {
-  if (!layoutServices) return;
-  const count = (paragraphAcquisitionMissCounts.get(layoutServices) ?? 0) + 1;
-  paragraphAcquisitionMissCounts.set(layoutServices, count);
-  if (count > PARAGRAPH_ACQUISITION_MISS_BUDGET) {
-    throw new LayoutInvariantError(
-      'NON_CONVERGENCE',
-      `paragraph acquisition exceeded the operational miss budget ${PARAGRAPH_ACQUISITION_MISS_BUDGET}`,
-    );
-  }
-}
-
 function measurementPlacement(
   options: ParagraphAcquisitionOptions,
   exclusions: readonly WrapExclusion[],
@@ -4290,7 +4261,7 @@ export function acquireParagraphResult(
     ? undefined
     : cache!.get(paragraph, cacheKey) as AcquiredParagraphResult | undefined;
   if (cached) return cached;
-  noteParagraphAcquisitionMiss(options.environment.layoutServices);
+  cache?.noteMiss();
   const externallyOwnedOccurrenceIds = externalExclusionOccurrenceIds(options.exclusions);
   const occurrenceIds = new Set(paragraph.runs.flatMap((run) =>
     anchoredPayloadRun(run) ? [run.anchorAcquisitionInput!.occurrenceId] : []));

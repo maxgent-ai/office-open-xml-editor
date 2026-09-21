@@ -6,6 +6,7 @@ import type { LayoutVariantStore } from './variant-store.js';
 import type { VerticalGlyphMeasurementService } from './measurement-capabilities.js';
 import type { LayoutSourceStore } from './layout-source-store.js';
 import type { LayoutOptions } from './options.js';
+import { LayoutInvariantError } from './diagnostics.js';
 
 export interface DocumentLayoutRuntimeState {
   services: LayoutServices | null;
@@ -87,7 +88,15 @@ export interface ParagraphAcquisitionRuntimeCache {
   objectIdentity(value: object): number;
   get(input: object, key: string): unknown;
   set(input: object, key: string, value: unknown): void;
+  noteMiss(): void;
 }
+
+/**
+ * Fail closed before cache-missed paragraph acquisition can exhaust the host.
+ * The budget belongs to the pagination cache scope so field-convergence service
+ * views cannot reset it while sharing the same retained acquisition values.
+ */
+export const PARAGRAPH_ACQUISITION_MISS_BUDGET = 25_000;
 
 const paragraphAcquisitionCaches = new WeakMap<
   LayoutServices,
@@ -98,6 +107,7 @@ function createParagraphAcquisitionRuntimeCache(): ParagraphAcquisitionRuntimeCa
   const identities = new WeakMap<object, number>();
   const results = new WeakMap<object, Map<string, unknown>>();
   let nextIdentity = 1;
+  let missCount = 0;
   return Object.freeze({
     objectIdentity(value: object): number {
       let retained = identities.get(value);
@@ -127,6 +137,15 @@ function createParagraphAcquisitionRuntimeCache(): ParagraphAcquisitionRuntimeCa
       // paragraph; a miss only costs a re-measurement.
       while (byKey.size > 2) {
         byKey.delete(byKey.keys().next().value!);
+      }
+    },
+    noteMiss(): void {
+      missCount += 1;
+      if (missCount > PARAGRAPH_ACQUISITION_MISS_BUDGET) {
+        throw new LayoutInvariantError(
+          'NON_CONVERGENCE',
+          `paragraph acquisition exceeded the operational miss budget ${PARAGRAPH_ACQUISITION_MISS_BUDGET}`,
+        );
       }
     },
   });
