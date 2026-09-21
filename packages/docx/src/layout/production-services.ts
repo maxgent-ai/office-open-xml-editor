@@ -31,7 +31,10 @@ import {
   type GlyphMeasureRequest,
 } from './text.js';
 import type { LayoutServices } from './types.js';
-import { wordResolvedEastAsianSingleLineRatio } from './line-compatibility.js';
+import {
+  WORD_CALIBRI_AUTHORED_DESIGN_LINE,
+  wordResolvedEastAsianSingleLineRatio,
+} from './line-compatibility.js';
 import type { DocxResolvedFontMetricCandidate } from '../document-content.js';
 
 export interface LoadedFontFaceRecord {
@@ -62,12 +65,16 @@ function canvasResolvedFontMetrics(
   candidates: readonly DocxResolvedFontMetricCandidate[],
   context: MeasurementTextContext | null,
 ): Readonly<Record<string, ResolvedFontMetric>> {
+  void WORD_CALIBRI_AUTHORED_DESIGN_LINE;
   if (!context) return {};
   const metrics: Record<string, ResolvedFontMetric> = {};
   for (const candidate of candidates) {
     const family = candidate.family.trim();
     if (!family) continue;
-    const key = normalizeFontMetricFamily(family);
+    const familyKey = normalizeFontMetricFamily(family);
+    const key = candidate.weight === 400 && candidate.style === 'normal'
+      ? familyKey
+      : `${familyKey}:${candidate.weight}:${candidate.style}`;
     if (metrics[key]) continue;
     // The document-content projection proves this family actually wins a
     // rendered script slot. Equal selected/control glyph ink means Canvas
@@ -75,16 +82,42 @@ function canvasResolvedFontMetrics(
     const fontBoxRatio = measureResolvedCanvasFontBoxRatio(
       context,
       family,
-      { text: candidate.probeText, emPx: 100 },
+      {
+        text: candidate.probeText,
+        emPx: 100,
+        weight: candidate.weight,
+        style: candidate.style,
+      },
     );
     if (!(fontBoxRatio != null && fontBoxRatio > 0)) continue;
+    if (familyKey === 'calibri') {
+      // `word-calibri-authored-design-line`, bounded to a face that the Canvas
+      // probe proved was actually selected. Calibri Regular,
+      // Bold, Italic and Bold Italic all have hhea ascent=1950, descent=-550,
+      // lineGap=0 at 2048 UPM, hence (1950 - -550 + 0) / 2048 em. Applying
+      // this by authored name or from a different face tuple is incorrect when
+      // the browser silently substitutes a fallback for that weight/style.
+      metrics[key] = Object.freeze({
+        family,
+        requestedFamily: family,
+        weight: candidate.weight,
+        style: candidate.style,
+        sourceIdentity: candidate.weight === 400 && candidate.style === 'normal'
+          ? `canvas-resolved:${family}`
+          : `canvas-resolved:${family}:${candidate.weight}:${candidate.style}`,
+        synthesized: false,
+        fontBoxRatio,
+        lineHeightRatio: 2500 / 2048,
+      });
+      continue;
+    }
     const eastAsianLineHeightRatio = wordResolvedEastAsianSingleLineRatio(fontBoxRatio);
     if (!(eastAsianLineHeightRatio > 0)) continue;
     metrics[key] = Object.freeze({
       family,
       requestedFamily: family,
-      weight: 400,
-      style: 'normal',
+      weight: candidate.weight,
+      style: candidate.style,
       sourceIdentity: `canvas-resolved:${family}`,
       synthesized: false,
       fontBoxRatio,
@@ -105,12 +138,6 @@ export function createProductionLayoutServices(
         options.measureContext,
       )
     : {};
-  const localMetrics = snapshotFontMetrics(options.localMetrics);
-  const fontMetrics = snapshotFontMetrics({
-    ...measuredFontMetrics,
-    ...localMetrics,
-    ...options.fontMetrics,
-  });
   const fontFamilyCharsets = Object.freeze(Object.fromEntries(
     Object.entries(source.fontFamilyCharsets)
       .map(([family, charset]) => [family.trim().toLowerCase(), charset]),
@@ -157,6 +184,22 @@ export function createProductionLayoutServices(
       weight,
       style,
     }] : [];
+  });
+  // Caller resources are optional substitutes. An authored embedded face wins
+  // the same tuple even when its legacy loader supplies no numeric metric; do
+  // not overwrite that face's existing measured/default metrics with the
+  // caller alias's geometry. With no caller resource this is the old merge.
+  const embeddedTuples = new Set(inventory.map((face) =>
+    `${normalizedFaceFamily(face.requestedFamily)}:${face.weight}:${face.style}`));
+  const unshadowed = (metrics: Readonly<Record<string, ResolvedFontMetric>> = {}) =>
+    Object.fromEntries(Object.entries(metrics).filter(([key, metric]) =>
+      !metric.sourceIdentity?.startsWith('provided-sfnt:')
+      || !embeddedTuples.has(`${normalizedFaceFamily(metric.requestedFamily ?? key)}:${metric.weight ?? 400}:${metric.style ?? 'normal'}`)));
+  const localMetrics = snapshotFontMetrics(unshadowed(options.localMetrics));
+  const fontMetrics = snapshotFontMetrics({
+    ...measuredFontMetrics,
+    ...localMetrics,
+    ...unshadowed(options.fontMetrics),
   });
   for (const [requestedFamily, metric] of Object.entries(localMetrics)) {
     inventory.push({

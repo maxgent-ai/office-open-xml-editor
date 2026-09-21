@@ -57,6 +57,22 @@ describe('docx rendered text inventory', () => {
           type: 'text', text: '×', fontFamily: 'Punctuation Face',
           bold: false, italic: false,
         },
+        {
+          type: 'text', text: 'Calibri text', fontFamily: 'Calibri',
+          bold: false, italic: false,
+        },
+        {
+          type: 'text', text: 'Bold Calibri', fontFamily: 'Calibri',
+          bold: true, italic: false,
+        },
+        {
+          type: 'text', text: 'Italic Calibri', fontFamily: 'Calibri',
+          bold: false, italic: true,
+        },
+        {
+          type: 'text', text: 'Bold italic Calibri', fontFamily: 'Calibri',
+          bold: true, italic: true,
+        },
       ] }],
       headers: { default: null, first: null, even: null },
       footers: { default: null, first: null, even: null },
@@ -68,9 +84,13 @@ describe('docx rendered text inventory', () => {
       'Punctuation Face': '80',
       'Unused EA Default': '80',
     })).toEqual([
-      { family: 'EA Latin Face', probeText: '国', appliesToLatin: true },
-      { family: 'CJK Route', probeText: '国', appliesToLatin: false },
-      { family: 'Supplementary CJK', probeText: '𠀀', appliesToLatin: false },
+      { family: 'EA Latin Face', probeText: '国', weight: 400, style: 'normal', appliesToLatin: true },
+      { family: 'CJK Route', probeText: '国', weight: 400, style: 'normal', appliesToLatin: false },
+      { family: 'Supplementary CJK', probeText: '𠀀', weight: 400, style: 'normal', appliesToLatin: false },
+      { family: 'Calibri', probeText: 'C', weight: 400, style: 'normal', appliesToLatin: true },
+      { family: 'Calibri', probeText: 'B', weight: 700, style: 'normal', appliesToLatin: true },
+      { family: 'Calibri', probeText: 'I', weight: 400, style: 'italic', appliesToLatin: true },
+      { family: 'Calibri', probeText: 'B', weight: 700, style: 'italic', appliesToLatin: true },
     ]);
   });
 

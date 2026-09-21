@@ -172,6 +172,8 @@ function finiteNonNegative(value: number, name: string): number {
 export type MeasuredTextPlanSegment = Readonly<
   Omit<TextPlacement, 'origin' | 'bounds' | 'advancePt' | 'paintOps'> & {
     measuredWidthPt: number;
+    /** Acquisition-only: covered caller sfnt suppresses unresolved space shrink. */
+    exactFontResource?: true;
     basePaintOps: readonly import('./types.js').TextPaintOp[];
     /** Physical advance from the segment origin through the final glyph. Word
      * retains later grid slack for layout but excludes it from a terminal underline. */
@@ -792,7 +794,10 @@ export function planLine(input: PlanLineInput): LineLayout {
     stretchByIndex = distribution?.perSeg ?? null;
     perGapPt = distribution?.perGap ?? 0;
     distributedWidthPt = distributedDelta(distribution);
-  } else if (lineSlackPt < 0) {
+  } else if (lineSlackPt < 0 && !(segments.some((segment) =>
+    segment.kind === 'text' && segment.exactFontResource === true)
+    && segments.every((segment) => segment.kind !== 'text'
+      || !/\S/.test(segment.text) || segment.exactFontResource === true))) {
     const compression = keepGraphemeSafeCuts(shrinkFitCompression(
       distSegments,
       lineSlackPt,
@@ -1060,6 +1065,7 @@ export function planLine(input: PlanLineInput): LineLayout {
     baselinePt: line.baselinePt,
     advancePt: line.advancePt,
     placements,
+    ...(line.endsWithBreak ? { endsWithBreak: true } : {}),
   });
 }
 
@@ -2092,6 +2098,7 @@ function textPlanSegment(
   return {
     ...style,
     kind: 'text', measuredWidthPt: segment.measuredWidth,
+    ...(segment.exactFontResource ? { exactFontResource: true as const } : {}),
     clusters,
     basePaintOps: basePaintOps.map((operation) => ({
       ...operation,

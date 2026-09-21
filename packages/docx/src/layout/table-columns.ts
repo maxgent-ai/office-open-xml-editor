@@ -5,6 +5,7 @@ import type {
   TablePreferredWidthConstraint,
 } from './types.js';
 import { exactLengthKeyFromNumber, type ExactLengthKey } from './exact-length.js';
+import { wordKeepsFullBandGridForAutofitCellOverflow } from './table-compatibility.js';
 
 const EPSILON_PT = 1e-9;
 
@@ -467,14 +468,22 @@ function fitToAvailableWidth(
 }
 
 /**
- * ECMA-376 §17.18.87 fixed/autofit guidance expressed as a deterministic,
- * parser-independent constraint solver. `tblGrid` seeds widths; it never
- * suppresses authored row/cell preferences.
+ * ECMA-376 §17.18.87 fixed/autofit guidance expressed as a deterministic
+ * constraint solver. `tblGrid` normally seeds widths before row/cell
+ * preferences; the narrowly evidenced Word AutoFit rule above can retain a
+ * complete authored full-band grid when those preferences contradict it.
  */
 function solveTableColumnWidths(input: TableColumnLayoutInput): readonly number[] {
   const columnCount = requiredColumnCount(input);
   if (columnCount === 0) return Object.freeze([]);
-  const widths = fixedWidths(input, columnCount);
+  // Preserve the normative fixed-width pass as a standalone solver step. The
+  // compatibility predicate chooses the authored grid as the AutoFit seed;
+  // all subsequent content constraints and occurrence fitting remain shared.
+  const widths = wordKeepsFullBandGridForAutofitCellOverflow(input)
+    ? Array.from({ length: columnCount }, (_unused, column) => (
+        finiteNonNegative(input.gridWidthsPt[column] ?? 0)
+      ))
+    : fixedWidths(input, columnCount);
   if (input.layout === 'fixed') {
     if (input.availableWidthPt === null) {
       return Object.freeze(widths);

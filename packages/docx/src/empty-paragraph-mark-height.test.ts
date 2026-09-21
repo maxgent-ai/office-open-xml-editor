@@ -214,7 +214,7 @@ describe('empty paragraph mark line height (§17.3.1.29 / §17.3.1.33)', () => {
     expect(paragraphMarkLineHeight(p, 1, { type: null, linePitchPt: null }, false, true, ctx, {})).toBe(30);
   });
 
-  it('uses an arbitrary resolved font resource metric for an empty East Asian mark', () => {
+  it('does not route an acquired empty mark through an East Asian resource from hint/language', () => {
     const family = 'Arbitrary Embedded EA';
     const p = {
       ...para(''),
@@ -251,17 +251,11 @@ describe('empty paragraph mark line height (§17.3.1.29 / §17.3.1.33)', () => {
       undefined,
       {
         fontSizePt: 12,
-        fonts: { complexScript: 'Times New Roman' },
-        themeFonts: {
-          ascii: family,
-          highAnsi: family,
+        fonts: {
+          ascii: 'Century',
+          highAnsi: 'Century',
           eastAsia: family,
-        },
-        themeFontPresence: {
-          ascii: true,
-          highAnsi: true,
-          eastAsia: true,
-          complexScript: false,
+          complexScript: 'Times New Roman',
         },
         weight: 400,
         style: 'normal',
@@ -269,10 +263,10 @@ describe('empty paragraph mark line height (§17.3.1.29 / §17.3.1.33)', () => {
         fontHint: 'eastAsia',
         eastAsiaLanguage: 'ja-jp',
       },
-    )).toBeCloseTo(15.6, 5);
+    )).toBeCloseTo(12, 5);
   });
 
-  it('retains the observed MS Mincho height for an unresolved empty East Asian mark', () => {
+  it('does not apply the unresolved MS Mincho compatibility height to an acquired empty mark', () => {
     const p = {
       ...para(''),
       defaultFontSize: 12,
@@ -303,11 +297,64 @@ describe('empty paragraph mark line height (§17.3.1.29 / §17.3.1.33)', () => {
       undefined,
       {
         fontSizePt: 12,
-        fonts: { complexScript: 'Times New Roman' },
-        themeFonts: {
-          ascii: 'ＭＳ 明朝',
-          highAnsi: 'ＭＳ 明朝',
+        fonts: {
+          ascii: 'Century',
+          highAnsi: 'Century',
           eastAsia: 'ＭＳ 明朝',
+          complexScript: 'Times New Roman',
+        },
+        weight: 400,
+        style: 'normal',
+        complexScript: false,
+        fontHint: 'eastAsia',
+        eastAsiaLanguage: 'ja-jp',
+      },
+    )).toBeCloseTo(12, 5);
+  });
+
+  it('keeps East-Asian design height when theme-selected non-CS mark slots converge', () => {
+    const family = 'ＭＳ 明朝';
+    const p = {
+      ...para(''),
+      defaultFontSize: 12,
+      defaultFontFamily: family,
+      defaultFontFamilyEastAsia: family,
+    } as DocParagraph;
+    const ctx = {
+      font: '',
+      measureText: () => ({
+        width: 12,
+        fontBoundingBoxAscent: 10.3125,
+        fontBoundingBoxDescent: 1.6875,
+        actualBoundingBoxAscent: 10.3125,
+        actualBoundingBoxDescent: 1.6875,
+      } as TextMetrics),
+    } as unknown as CanvasRenderingContext2D;
+
+    expect(paragraphMarkLineHeight(
+      p,
+      1,
+      { type: null, linePitchPt: null },
+      false,
+      false,
+      ctx,
+      {},
+      null,
+      {},
+      undefined,
+      {
+        fontSizePt: 12,
+        fonts: {
+          ascii: 'Century',
+          highAnsi: 'Century',
+          eastAsia: 'Yu Mincho',
+          complexScript: 'Times New Roman',
+        },
+        themeFonts: {
+          ascii: family,
+          highAnsi: family,
+          eastAsia: family,
+          complexScript: 'Times New Roman',
         },
         themeFontPresence: {
           ascii: true,
@@ -315,11 +362,9 @@ describe('empty paragraph mark line height (§17.3.1.29 / §17.3.1.33)', () => {
           eastAsia: true,
           complexScript: false,
         },
-        weight: 400,
+        weight: 700,
         style: 'normal',
         complexScript: false,
-        fontHint: 'eastAsia',
-        eastAsiaLanguage: 'ja-jp',
       },
     )).toBeCloseTo(15.6, 5);
   });
@@ -513,10 +558,10 @@ describe('empty paragraph mark line height (§17.3.1.29 / §17.3.1.33)', () => {
           const substitute = font.includes('Carlito');
           return {
             width: 0,
-            fontBoundingBoxAscent: substitute ? 12 : 8,
-            fontBoundingBoxDescent: substitute ? 3 : 2,
-            actualBoundingBoxAscent: substitute ? 12 : 8,
-            actualBoundingBoxDescent: substitute ? 3 : 2,
+            fontBoundingBoxAscent: substitute ? 9.2 : 8,
+            fontBoundingBoxDescent: substitute ? 2.3 : 2,
+            actualBoundingBoxAscent: substitute ? 9.2 : 8,
+            actualBoundingBoxDescent: substitute ? 2.3 : 2,
           } as TextMetrics;
         },
       } as unknown as CanvasRenderingContext2D;
@@ -559,8 +604,8 @@ describe('empty paragraph mark line height (§17.3.1.29 / §17.3.1.33)', () => {
     );
 
     expect(main.text.fingerprint).toBe(worker.text.fingerprint);
-    expect(measureMark(mainContext.ctx, main.text)).toBe(15);
-    expect(measureMark(workerContext.ctx, worker.text)).toBe(15);
+    expect(measureMark(mainContext.ctx, main.text)).toBeCloseTo(2500 / 2048 * 10, 12);
+    expect(measureMark(workerContext.ctx, worker.text)).toBeCloseTo(2500 / 2048 * 10, 12);
     const expectedRoute = main.text.shape({
       text: 'x', fontSizePt: 10,
       fonts: { ascii: 'Legacy Direct' },

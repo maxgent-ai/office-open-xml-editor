@@ -49,6 +49,7 @@ export type {
   ChartSeriesDataLabels,
   ChartStockBarPaint,
   ChartStockUpDownBarStyle,
+  ChartClassicSurfaceBandStyles,
   ChartSurfaceBandFormat,
   ChartTextBox,
   ChartTextParagraph,
@@ -158,6 +159,7 @@ export { GOOGLE_FONT_SUBSTITUTES } from './fonts/google-fonts';
 export { canvasFontString, createCanvasFontRoute, type CanvasFontRoute } from './fonts/canvas-route';
 export {
   parseOpenTypeLineMetrics,
+  parseOpenTypeResourceMetrics,
   type OpenTypeLineMetrics,
 } from './fonts/open-type-metrics';
 export {
@@ -706,6 +708,7 @@ export {
 // browser-selected face.
 export {
   normalizeFontMetricFamily,
+  openTypeDesignLineRatios,
   type ResolvedFontMetric,
 } from './fonts/resource-metrics';
 // Backward-compatible exact-local resource loader. Format packages should not

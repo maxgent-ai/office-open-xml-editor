@@ -57,6 +57,7 @@ export type {
   ChartSeriesDataLabels,
   ChartStockBarPaint,
   ChartStockUpDownBarStyle,
+  ChartClassicSurfaceBandStyles,
   ChartSurfaceBandFormat,
   ChartTextBox,
   ChartTextParagraph,

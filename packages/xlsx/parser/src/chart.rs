@@ -414,7 +414,8 @@ fn load_chart_related_parts(archive: &mut crate::XlsxZip, chart_path: &str) -> C
     });
     if let Some(style_relationship) = style_relationship {
         let style_path = ooxml_common::rels::resolve_target(base_dir, &style_relationship.target);
-        result.style_xml = read_zip_string(archive, &style_path).ok();
+        result.style_xml =
+            Some(read_zip_string(archive, &style_path).unwrap_or_else(|_| "\0".to_owned()));
         let style_rels_path = ooxml_common::rels::relationship_part_path(&style_path);
         if let Ok(style_rels_xml) = read_zip_string(archive, &style_rels_path) {
             let style_relationships = ooxml_common::rels::parse_rels(&style_rels_xml);
@@ -429,7 +430,8 @@ fn load_chart_related_parts(archive: &mut crate::XlsxZip, chart_path: &str) -> C
         internal_target(ooxml_common::chart::CHART_COLOR_STYLE_REL_TYPE_SUFFIX)
     {
         let color_path = ooxml_common::rels::resolve_target(base_dir, &color_relationship.target);
-        result.color_style_xml = read_zip_string(archive, &color_path).ok();
+        result.color_style_xml =
+            Some(read_zip_string(archive, &color_path).unwrap_or_else(|_| "\0".to_owned()));
     }
     result
 }
@@ -896,6 +898,21 @@ impl ooxml_common::chart::ColorResolver for XlsxColorResolver<'_> {
     fn implicit_outline_only_negative_column_style(&self) -> bool {
         true
     }
+
+    fn office_dark_text_contrast_applies(&self, style: u8) -> bool {
+        style == 41
+    }
+
+    fn classic_pattern2_set_transform(&self, set_index: usize) -> Option<f64> {
+        // ECMA-376 §21.2.3.46 Table 6 specifies the first six accents but
+        // leaves repeated-set tint/shade values to the application. Excel 16.111.1
+        // exports for 1–48 points establish these eight sets; 6/7/12/13-point
+        // controls establish count independence. The ninth set is unobserved.
+        // This evidence belongs to Excel and must not enroll Word/PowerPoint.
+        [0.0, -0.4, 0.2, -0.2, 0.4, -0.5, 0.3, -0.3]
+            .get(set_index)
+            .copied()
+    }
 }
 /// Locate the first resolvable `<a:solidFill>` among `parent`'s direct children
 /// (children only, not deep descendants — chart spPr is structured shallowly)
@@ -1012,6 +1029,85 @@ mod solid_fill_color_tests {
         let doc = Document::parse(&xml).unwrap();
         let out = extract_solid_fill_in_drawingml(&doc.root_element(), &theme());
         assert_eq!(out.as_deref(), Some("FF8000"));
+    }
+
+    #[test]
+    fn excel_chart_host_style_scope_preserves_seventh_point_transform() {
+        let mut colors = theme();
+        colors[4] = "#808080".to_string();
+        let resolver = XlsxColorResolver {
+            theme_colors: &colors,
+            theme_major_font_latin: None,
+            theme_minor_font_latin: None,
+            theme_format_scheme: None,
+        };
+        let points = (0..7)
+            .map(|index| format!(r#"<c:pt idx="{index}"><c:v>1</c:v></c:pt>"#))
+            .collect::<String>();
+        let parse = |style: u8| {
+            let xml = format!(
+                r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+                  <c:style val="{style}"/><c:chart><c:plotArea><c:pieChart><c:varyColors val="1"/>
+                    <c:ser><c:idx val="0"/><c:order val="0"/>
+                      <c:dPt><c:idx val="5"/><c:spPr><a:solidFill><a:srgbClr val="ABCDEF"/></a:solidFill><a:ln><a:solidFill><a:srgbClr val="123456"/></a:solidFill></a:ln></c:spPr></c:dPt>
+                      <c:val><c:numLit><c:ptCount val="7"/>{points}</c:numLit></c:val>
+                    </c:ser>
+                  </c:pieChart></c:plotArea></c:chart>
+                </c:chartSpace>"#,
+            );
+            {
+                let document = Document::parse(&xml).expect("chart XML");
+                ooxml_common::chart::parse_chart_part(document.root_element(), &resolver)
+                    .expect("Excel chart")
+            }
+        };
+        let chart = parse(2);
+        let role = &chart
+            .classic_varying_point_chart_style_roles
+            .as_ref()
+            .expect("point-domain numeric roles")["dataPoint"];
+        let colors = role
+            .fill_colors
+            .as_ref()
+            .unwrap_or_else(|| panic!("point palette: {role:?}"));
+        assert_eq!(colors[0].as_deref(), Some("808080"));
+        assert_eq!(colors[6].as_deref(), Some("656565"));
+        assert_eq!(role.fill_semantic_fallback_indices.as_deref(), None);
+        // Direct point paint stays separate from the automatic palette so
+        // the renderer can preserve its precedence at either host boundary.
+        assert!(chart.series[0]
+            .data_point_colors
+            .as_ref()
+            .expect("direct point color")[5]
+            .as_deref()
+            .is_some_and(|color| color.eq_ignore_ascii_case("ABCDEF")));
+        let point = chart.series[0]
+            .data_point_overrides
+            .as_ref()
+            .expect("point formatting")
+            .iter()
+            .find(|point| point.idx == 5)
+            .expect("formatted point");
+        assert_eq!(point.line_color.as_deref(), Some("123456"));
+        for (style, expected) in [
+            (40, "111111"),
+            (41, "FEFEFE"),
+            (42, "111111"),
+            (48, "111111"),
+        ] {
+            let chart = parse(style);
+            assert_eq!(
+                chart
+                    .classic_chart_style_roles
+                    .as_ref()
+                    .expect("numeric roles")["categoryAxis"]
+                    .font_color
+                    .as_deref()
+                    .map(str::to_uppercase),
+                Some(expected.to_string()),
+                "style {style}",
+            );
+        }
     }
 
     /// A chart series is a DrawingML shape too: its `<c:spPr>` fill must retain
@@ -1944,21 +2040,47 @@ mod chartex_tests {
     }
 
     #[test]
-    fn classic_graphicframe_loads_linked_chart_style_roles() {
+    fn classic_graphicframe_keeps_numeric_and_linked_chart_style_roles_separate() {
         let mut archive = archive_with_classic_chart_style();
+        let theme_colors = vec![
+            "#000000".into(),
+            "#FFFFFF".into(),
+            "#44546A".into(),
+            "#E7E6E6".into(),
+            "#4472C4".into(),
+            "#ED7D31".into(),
+            "#A5A5A5".into(),
+            "#FFC000".into(),
+            "#5B9BD5".into(),
+            "#70AD47".into(),
+            "#0563C1".into(),
+            "#954F72".into(),
+        ];
+        let theme_xml = r#"<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:themeElements>
+          <a:fmtScheme name="Office"><a:fillStyleLst>
+            <a:solidFill><a:schemeClr val="phClr"/></a:solidFill>
+            <a:solidFill><a:schemeClr val="phClr"/></a:solidFill>
+            <a:solidFill><a:schemeClr val="phClr"/></a:solidFill>
+          </a:fillStyleLst><a:lnStyleLst>
+            <a:ln w="6350"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln>
+            <a:ln w="12700"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln>
+            <a:ln w="19050"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln>
+          </a:lnStyleLst><a:effectStyleLst/><a:bgFillStyleLst/></a:fmtScheme>
+        </a:themeElements></a:theme>"#;
+        let format_scheme = ooxml_common::theme::ThemeFormatScheme::parse(theme_xml);
         let charts = load_sheet_charts(
             &mut archive,
             "worksheets/sheet1.xml",
             None,
-            &theme(),
+            &theme_colors,
             (None, None),
-            None,
+            Some(&format_scheme),
         );
         let chart = &charts.first().expect("classic chart").chart;
         assert_eq!(chart.chart_type, "line");
         assert_eq!(chart.rounded_corners, Some(true));
         let frame = chart
-            .chart_style_roles
+            .classic_chart_style_roles
             .as_ref()
             .and_then(|roles| roles.get("chartArea"))
             .expect("Excel implicit chart-area frame");
@@ -2038,5 +2160,25 @@ mod chartex_tests {
                 Some((expected_image_path.to_string(), "image/png".to_string())),
             );
         }
+    }
+
+    #[test]
+    fn chart_related_parts_preserve_missing_sidecar_relationships() {
+        let mut bytes = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(Cursor::new(&mut bytes));
+            writer
+                .start_file(
+                    "xl/charts/_rels/chart9.xml.rels",
+                    SimpleFileOptions::default(),
+                )
+                .unwrap();
+            writer.write_all(br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rStyle" Type="http://schemas.microsoft.com/office/2011/relationships/chartStyle" Target="missing-style.xml"/><Relationship Id="rColors" Type="http://schemas.microsoft.com/office/2011/relationships/chartColorStyle" Target="missing-colors.xml"/></Relationships>"#).unwrap();
+            writer.finish().unwrap();
+        }
+        let mut archive = crate::XlsxZip::new(Cursor::new(bytes)).unwrap();
+        let related = load_chart_related_parts(&mut archive, "xl/charts/chart9.xml");
+        assert_eq!(related.style_xml.as_deref(), Some("\0"));
+        assert_eq!(related.color_style_xml.as_deref(), Some("\0"));
     }
 }
