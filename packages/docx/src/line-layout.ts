@@ -374,22 +374,21 @@ export interface LayoutTextSeg extends LayoutSegSource {
 /**
  * Map WordprocessingML's run-kerning rule onto Canvas without disabling the
  * required positioning used to shape complex scripts. §17.3.2.19 makes an
- * entirely absent `w:kern` hierarchy equivalent to kerning off. Canvas exposes
- * that choice only through `fontKerning="none"`, but Chromium also changes the
- * advances of contextually shaped Arabic/Hebrew text under that state. Word
- * keeps those required script positions while omitting optional font kerning.
- * Preserve Canvas' shaping policy for an absent complex-script setting; an
+ * entirely absent `w:kern` hierarchy equivalent to kerning off, but Canvas
+ * exposes no mode that removes only optional Word kerning: `none` also changes
+ * required shaping and the browser's selected-font advances. Retain the
+ * browser's established `auto` geometry when the setting is absent. An
  * authored threshold remains authoritative on both sides of its size boundary.
  */
 export function wordRunCanvasKerning(
   thresholdPt: number | undefined,
   fontSizePt: number,
-  complexScript: boolean,
+  _complexScript: boolean,
 ): CanvasFontKerning {
   if (thresholdPt !== undefined) {
     return fontSizePt >= thresholdPt ? 'normal' : 'none';
   }
-  return complexScript ? 'auto' : 'none';
+  return 'auto';
 }
 
 /** Shaping and line allocation are derived from the current text slice. A
@@ -4698,9 +4697,10 @@ export function layoutLines(
   // (measure==paint). Kerning is enabled only when the run declares `w:kern` and its font
   // size is at or above the threshold (the spec's "smallest font size which shall
   // have its kerning automatically adjusted"). If no hierarchy level declares
-  // it, §17.3.2.19 requires kerning off. Complex-script runs retain Canvas'
-  // shaping state because `none` also changes required Arabic/Hebrew positioning;
-  // {@link wordRunCanvasKerning} owns that API-boundary projection.
+  // it, §17.3.2.19 requires kerning off, but Canvas has no equivalent that
+  // preserves the selected face's shaping and advances. The compatibility
+  // projection therefore retains Canvas `auto` for an absent setting;
+  // {@link wordRunCanvasKerning} owns that API-boundary decision.
   const setSegKerning = (s: LayoutTextSeg): CanvasFontKerning => {
     const prev = ctx.fontKerning;
     ctx.fontKerning = wordRunCanvasKerning(
