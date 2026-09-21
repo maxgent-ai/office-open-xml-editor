@@ -11,6 +11,46 @@ const siteFooter = readFileSync(new URL('./components/SiteFooter.astro', import.
 const capabilities = readFileSync(new URL('./components/Capabilities.astro', import.meta.url), 'utf8');
 const readme = readFileSync(new URL('../../README.md', import.meta.url), 'utf8');
 
+describe('v0.88 chart fidelity and safer Word layout announcement', () => {
+  const announcement = announcements.find((item) => item.slug === 'v088-chart-fidelity-and-safer-word-layout');
+
+  it('leads with the release outcomes and gives explicit upgrade guidance', () => {
+    expect(announcement).toMatchObject({
+      label: 'Upcoming release',
+      version: 'v0.88.0',
+      date: '2026-09-21',
+      title: 'More faithful charts and safer Word layout in v0.88.0',
+    });
+    expect(announcement?.sections[0]).toMatchObject({ title: 'In short', kind: 'summary' });
+    expect(announcement?.sections.at(-2)?.title).toBe('Upgrading');
+    expect(announcement?.sections.at(-1)?.title).toBe('Technical note');
+
+    const text = announcement?.sections.flatMap((section) => [
+      section.title,
+      ...(section.modules ?? []),
+      ...section.paragraphs,
+      ...(section.bullets ?? []),
+    ]).join('\n') ?? '';
+
+    for (const outcome of ['DOCX', 'XLSX', 'PPTX', 'classic', 'browser memory', 'SVG', 'regional CJK fallback', '100%']) {
+      expect(text).toContain(outcome);
+    }
+    expect(text).toContain('most Viewer integrations require no code changes');
+    expect(text).toContain('intentionally changes rendering');
+    expect(text).toContain('low-level chart model');
+    expect(text).toContain('NON_CONVERGENCE');
+    expect(text).toContain('When Google Fonts loading is enabled');
+    expect(text).not.toContain('fontResources');
+    expect(text).not.toContain('one synchronous pagination run');
+    expect(text).not.toMatch(/private\/|sample-\d+/i);
+    const userFacingText = announcement?.sections.slice(0, -1).flatMap((section) => [
+      ...section.paragraphs,
+      ...(section.bullets ?? []),
+    ]).join('\n') ?? '';
+    expect(userFacingText).not.toMatch(/field-convergence|cache-miss|25,000|most recently used placement/i);
+  });
+});
+
 describe('v0.87 regional CJK fallback announcement', () => {
   const announcement = announcements.find((item) => item.slug === 'v087-regional-cjk-fallbacks');
 
