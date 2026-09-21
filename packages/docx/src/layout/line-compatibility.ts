@@ -1,6 +1,8 @@
 import {
   classifyCjkFont,
   normalizeFontMetricFamily,
+  openTypeDesignLineRatios,
+  type ResolvedFontMetric,
   type OpenTypeLineMetrics,
 } from '@silurus/ooxml-core';
 import { defineCompatibilityRule } from './compatibility.js';
@@ -816,6 +818,49 @@ export function wordRunVerticalAlignRaisePt(
 }
 
 export const WORD_FAR_EAST_SINGLE_LINE_FACTOR = 1.3;
+
+/** Select a DOCX design line from one concrete OpenType face.
+ *
+ * OpenType's USE_TYPO_METRICS bit selects the OS/2 typo triplet for default
+ * line spacing. Otherwise the OS/2 Windows ascent/descent pair is selected;
+ * hhea is only a malformed/legacy-resource fallback when that pair is absent.
+ * This is the opt-in resource policy; ECMA-376 §17.3.1.33 defines the
+ * spacing multiplier but does not prescribe which OpenType box to select.
+ * It does not claim identical pagination across all Office font versions. The returned
+ * leading stays separate from baseline descent so it cannot move inline
+ * objects. No branch consults a family name.
+ */
+export function wordOpenTypeDesignLineRatios(
+  metrics: Readonly<OpenTypeLineMetrics>,
+): Pick<ResolvedFontMetric,
+  'lineHeightRatio' | 'designAscentRatio' | 'designDescentRatio' | 'lineGapRatio'> | null {
+  const typoUsable = metrics.useTypoMetrics === true
+    && (metrics.typoAscent ?? 0) > 0
+    && (metrics.typoDescent ?? 0) <= 0
+    && (metrics.typoAscent ?? 0) - (metrics.typoDescent ?? 0) > 0
+    && Number.isFinite(metrics.typoLineGap);
+  if (typoUsable) {
+    return openTypeDesignLineRatios({
+      unitsPerEm: metrics.unitsPerEm,
+      hheaAscent: metrics.typoAscent as number,
+      hheaDescent: metrics.typoDescent as number,
+      hheaLineGap: metrics.typoLineGap as number,
+    });
+  }
+  if ((metrics.winAscent ?? 0) > 0 && (metrics.winDescent ?? 0) >= 0) {
+    return openTypeDesignLineRatios({
+      unitsPerEm: metrics.unitsPerEm,
+      hheaAscent: metrics.winAscent ?? 0,
+      hheaDescent: -(metrics.winDescent ?? 0),
+      hheaLineGap: 0,
+    });
+  }
+  if (metrics.hheaAscent > 0 && metrics.hheaDescent <= 0
+    && metrics.hheaAscent - metrics.hheaDescent > 0) {
+    return openTypeDesignLineRatios(metrics);
+  }
+  return null;
+}
 
 /** Word's observed Far-East line allocation applied to the selected face's
  * OpenType hhea glyph box. The face loader supplies the metrics; this rule does

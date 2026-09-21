@@ -2841,6 +2841,28 @@ pub trait ColorResolver {
     fn implicit_outline_only_negative_column_style(&self) -> bool {
         false
     }
+
+    /// Host-scoped compatibility boundary for automatic light text in dark
+    /// classic chart styles. Cross-host evidence currently covers style 41;
+    /// Word additionally proves the complete 41..=48 range. A host must opt in
+    /// to the broader range instead of inheriting it from the shared parser.
+    fn office_dark_text_contrast_applies(&self, _style: u8) -> bool {
+        false
+    }
+
+    /// Host-scoped title-carrier boundary for dark classic styles. Word has a
+    /// measured rich-title matrix; other hosts must opt in separately instead
+    /// of inheriting that source-shape rule from ordinary chart text.
+    fn office_dark_title_contrast_applies(&self, _style: u8) -> bool {
+        false
+    }
+
+    /// Application-defined tint/shade for a repeated six-accent Pattern 2 set
+    /// (ECMA-376 §21.2.3.46 Table 6). The first set is normative and unmodified;
+    /// later sets remain unresolved unless the host has measured evidence.
+    fn classic_pattern2_set_transform(&self, set_index: usize) -> Option<f64> {
+        (set_index == 0).then_some(0.0)
+    }
 }
 
 /// OPC relationship scope for a chart picture fill. A chart part and its
@@ -3080,6 +3102,18 @@ impl ColorResolver for ChartMappedColorResolver<'_> {
 
     fn implicit_outline_only_negative_column_style(&self) -> bool {
         self.base.implicit_outline_only_negative_column_style()
+    }
+
+    fn office_dark_text_contrast_applies(&self, style: u8) -> bool {
+        self.base.office_dark_text_contrast_applies(style)
+    }
+
+    fn office_dark_title_contrast_applies(&self, style: u8) -> bool {
+        self.base.office_dark_title_contrast_applies(style)
+    }
+
+    fn classic_pattern2_set_transform(&self, set_index: usize) -> Option<f64> {
+        self.base.classic_pattern2_set_transform(set_index)
     }
 }
 
@@ -14106,9 +14140,9 @@ pub fn parse_chart_part_with_references_style_parts_and_images(
     // so preserve a bounded band-domain numeric role here instead of replaying
     // a series-domain palette by modulo. Pattern roles are stable by index;
     // Table 5 Fade roles depend on the final highest band index and therefore
-    // retain the complete evidenced 1..48 count lattice. Index 48 and above
-    // deliberately return to semantic automatic paint rather than inventing an
-    // unobserved ninth Pattern-2 transform.
+    // retain the complete evidenced 1..48 count lattice. Unsupported Pattern-2 sets
+    // return to semantic automatic paint at each host's evidence boundary
+    // (after six objects for Word/PowerPoint, or 48 for Excel).
     let effective_classic_style = legacy_chart_style.unwrap_or(2);
     let classic_surface_band_styles = matches!(chart_type.as_str(), "surface" | "surface3D")
         .then(|| {
@@ -17228,6 +17262,24 @@ Subtitle</a:t></a:r></a:p>
         assert_eq!(chart.series[1].color.as_deref(), Some("ED7D31"));
     }
 
+    // These tests exercise the Word host's evidenced dark-text extension;
+    // the generic resolver deliberately leaves that extension disabled.
+    struct WordContrastFixtureResolver;
+    impl ColorResolver for WordContrastFixtureResolver {
+        fn resolve_solid_fill(&self, node: Node) -> Option<String> {
+            FixtureResolver.resolve_solid_fill(node)
+        }
+        fn resolve_scheme_color(&self, name: &str) -> Option<String> {
+            FixtureResolver.resolve_scheme_color(name)
+        }
+        fn office_dark_text_contrast_applies(&self, style: u8) -> bool {
+            (41..=48).contains(&style)
+        }
+        fn office_dark_title_contrast_applies(&self, style: u8) -> bool {
+            (41..=48).contains(&style)
+        }
+    }
+
     #[test]
     fn dark_classic_text_uses_office_contrast_with_the_observed_title_carrier_gate() {
         let parse = |style: u8, paragraph_default_run: &str| {
@@ -17243,7 +17295,7 @@ Subtitle</a:t></a:r></a:p>
                   </c:barChart></c:plotArea><c:legend/></c:chart></c:chartSpace>"#,
             );
             let document = chart_space_of(&xml);
-            parse_chart_part(document.root_element(), &FixtureResolver)
+            parse_chart_part(document.root_element(), &WordContrastFixtureResolver)
                 .expect("classic dark chart parses")
         };
 
@@ -17277,7 +17329,7 @@ Subtitle</a:t></a:r></a:p>
                   </c:barChart></c:plotArea></c:chart></c:chartSpace>"#,
             );
             let document = chart_space_of(&xml);
-            parse_chart_part(document.root_element(), &FixtureResolver)
+            parse_chart_part(document.root_element(), &WordContrastFixtureResolver)
                 .expect("classic dark chart parses")
                 .classic_chart_style_roles
                 .expect("numeric roles")
