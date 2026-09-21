@@ -25,6 +25,7 @@ import {
   effectiveCharacterSpacingPt,
   segLetterSpacingPx,
   widthBalanceSpaceAdjustmentForTextPt,
+  wordRunCanvasKerning,
 } from '../line-layout.js';
 import { calcEffectiveFontPx, EAST_ASIAN_RE, shapeRunToDocRun } from './text.js';
 import { wordTrackChangeDecoration } from './paint-compatibility.js';
@@ -1296,6 +1297,11 @@ function textPlacement(
     : segment.colorAuto
       ? { kind: 'auto', ...(segment.background ? { background: `#${segment.background}` } : {}) }
       : { kind: 'default' };
+  const canvasKerning = wordRunCanvasKerning(
+    segment.kerning,
+    segment.fontSize,
+    segment.script === 'complexScript',
+  );
   const fontRoute = segment.fontRoute ?? createCanvasFontRoute(
     segment.fontFamily ? `"${segment.fontFamily.replaceAll('"', '\\"')}"` : 'sans-serif',
     segment.fontFamily ? 'native' : 'generic',
@@ -1381,7 +1387,7 @@ function textPlacement(
       perGapPt: segment.fitTextPerGapPx ?? 0,
       trailingPadPt: segment.fitTextTrailingPadPx ?? 0,
     } } : {}),
-    kerning: segment.kerning !== undefined && segment.fontSize >= segment.kerning,
+    kerning: canvasKerning === 'normal',
     ...(segment.position !== undefined ? { positionPt: segment.position } : {}),
     ...(segment.vertAlign ? { verticalAlign: segment.vertAlign } : {}),
     ...(segment.tateChuYoko ? { tateChuYoko: true } : {}),
@@ -1455,9 +1461,7 @@ function textPlacement(
       letterSpacingPt: effectiveCharacterSpacingPt(segment),
       scaleX: segment.charScale ?? 1,
       direction: segment.rtl ? 'rtl' : 'ltr',
-      kerning: segment.kerning !== undefined && segment.fontSize >= segment.kerning
-        ? 'normal'
-        : 'none',
+      kerning: canvasKerning,
       writingMode: segment.verticalRun ? 'vertical-rl' : 'horizontal-tb',
     }],
     ...(segment.hyperlink ? { hyperlink: segment.hyperlink } : {}),
