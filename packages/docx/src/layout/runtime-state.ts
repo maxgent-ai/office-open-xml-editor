@@ -119,7 +119,12 @@ function createParagraphAcquisitionRuntimeCache(): ParagraphAcquisitionRuntimeCa
       return retained;
     },
     get(input: object, key: string): unknown {
-      return results.get(input)?.get(key);
+      const byKey = results.get(input);
+      if (!byKey?.has(key)) return undefined;
+      const value = byKey.get(key);
+      byKey.delete(key);
+      byKey.set(key, value);
+      return value;
     },
     set(input: object, key: string, value: unknown): void {
       let byKey = results.get(input);

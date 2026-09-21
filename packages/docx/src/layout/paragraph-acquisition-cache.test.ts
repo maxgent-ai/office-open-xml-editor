@@ -248,10 +248,11 @@ describe('paragraph acquisition cache', () => {
 
     const first = at(72);
     const second = at(73);
+    expect(at(72)).toBe(first);
     at(74);
 
-    expect(at(73)).toBe(second);
-    expect(at(72)).not.toBe(first);
+    expect(at(72)).toBe(first);
+    expect(at(73)).not.toBe(second);
   });
 
   it('keys every value that can change acquisition output', () => {
