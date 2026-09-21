@@ -93,7 +93,7 @@ export const announcements: readonly Announcement[] = [
         title: 'Technical note',
         paragraphs: [
           'The public chart model gains optional style and effect metadata, and a small number of paint fields accept the broader Fill union so picture fills can retain their authored form. Viewer integrations need no changes. Applications that exhaustively match the low-level chart model should account for the added optional data and image-fill case when upgrading.',
-          'Word paragraph acquisition now uses bounded internal caching and a pagination-scoped operational budget. Pathological repeated work fails with a NON_CONVERGENCE layout diagnostic instead of continuing to consume memory without a bound. The safety boundary does not change the successful layout contract for ordinary documents.',
+          'Word paragraph acquisition now uses bounded internal caching and a pagination-scoped operational budget. The budget counts cache misses within one pagination session: it permits 25,000 misses, returns a NON_CONVERGENCE layout diagnostic on miss 25,001, and retains only the two most recent placements for each paragraph. The safety boundary does not change the successful layout contract for ordinary documents.',
         ],
       },
     ],

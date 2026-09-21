@@ -39,6 +39,10 @@ describe('v0.88 chart fidelity and safer Word layout announcement', () => {
     expect(text).toContain('intentionally changes rendering');
     expect(text).toContain('low-level chart model');
     expect(text).toContain('NON_CONVERGENCE');
+    const technicalNote = announcement?.sections.at(-1)?.paragraphs.join('\n') ?? '';
+    expect(technicalNote).toContain('25,000 misses');
+    expect(technicalNote).toContain('miss 25,001');
+    expect(technicalNote).toContain('two most recent placements');
     expect(text).toContain('When Google Fonts loading is enabled');
     expect(text).not.toContain('fontResources');
     expect(text).not.toContain('one synchronous pagination run');
