@@ -81,9 +81,10 @@ const verticalGlyphMeasurementServices = new WeakMap<
 >();
 const layoutVariantStores = new WeakMap<LayoutServices, LayoutVariantStore>();
 
-/** One synchronous paginateBody invocation owns this memo. It never enters
- * LayoutServices or DocumentLayout; field-acquisition service views inherit the
- * same private handle through createLayoutServicesRuntimeView. */
+/** One paginateBodySteps execution owns this memo, whether a synchronous or
+ * progressive driver consumes it. It never enters LayoutServices or
+ * DocumentLayout; field-acquisition service views inherit the same private
+ * handle through createLayoutServicesRuntimeView. */
 export interface ParagraphAcquisitionRuntimeCache {
   objectIdentity(value: object): number;
   get(input: object, key: string): unknown;
