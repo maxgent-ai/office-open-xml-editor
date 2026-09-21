@@ -25,7 +25,6 @@ import {
   effectiveCharacterSpacingPt,
   segLetterSpacingPx,
   widthBalanceSpaceAdjustmentForTextPt,
-  wordRunCanvasKerning,
 } from '../line-layout.js';
 import { calcEffectiveFontPx, EAST_ASIAN_RE, shapeRunToDocRun } from './text.js';
 import { wordTrackChangeDecoration } from './paint-compatibility.js';
@@ -1292,11 +1291,6 @@ function textPlacement(
     : segment.colorAuto
       ? { kind: 'auto', ...(segment.background ? { background: `#${segment.background}` } : {}) }
       : { kind: 'default' };
-  const canvasKerning = wordRunCanvasKerning(
-    segment.kerning,
-    segment.fontSize,
-    segment.script === 'complexScript',
-  );
   const fontRoute = segment.fontRoute ?? createCanvasFontRoute(
     segment.fontFamily ? `"${segment.fontFamily.replaceAll('"', '\\"')}"` : 'sans-serif',
     segment.fontFamily ? 'native' : 'generic',
@@ -1382,7 +1376,7 @@ function textPlacement(
       perGapPt: segment.fitTextPerGapPx ?? 0,
       trailingPadPt: segment.fitTextTrailingPadPx ?? 0,
     } } : {}),
-    kerning: canvasKerning === 'normal',
+    ...(segment.kerning !== undefined ? { kerning: segment.fontSize >= segment.kerning } : {}),
     ...(segment.position !== undefined ? { positionPt: segment.position } : {}),
     ...(segment.vertAlign ? { verticalAlign: segment.vertAlign } : {}),
     ...(segment.tateChuYoko ? { tateChuYoko: true } : {}),
@@ -1456,7 +1450,9 @@ function textPlacement(
       letterSpacingPt: effectiveCharacterSpacingPt(segment),
       scaleX: segment.charScale ?? 1,
       direction: segment.rtl ? 'rtl' : 'ltr',
-      kerning: canvasKerning,
+      kerning: segment.kerning === undefined
+        ? 'auto'
+        : segment.fontSize >= segment.kerning ? 'normal' : 'none',
       writingMode: segment.verticalRun ? 'vertical-rl' : 'horizontal-tb',
     }],
     ...(segment.hyperlink ? { hyperlink: segment.hyperlink } : {}),
@@ -1590,15 +1586,12 @@ function numberingMarkerPlacements(
         range: { start: rangeBase + span.start, end: rangeBase + span.end },
         offset: { xPt: 0, yPt: 0 }, letterSpacingPt: 0, scaleX: 1,
         direction: context.baseRtl ? 'rtl' : 'ltr',
-        kerning: paragraph.numberingMarkerShapeInput?.kerning === true ? 'normal' : 'none',
-        writingMode: 'horizontal-tb',
+        kerning: 'auto', writingMode: 'horizontal-tb',
       }],
       color, fontRoute: span.fontRoute,
       fontSizePt: paragraph.numberingMarkerShapeInput?.fontSizePt ?? span.ascentPt + span.descentPt,
       fontWeight: span.font.weight, fontStyle: span.font.style,
-      direction: context.baseRtl ? 'rtl' : 'ltr',
-      kerning: paragraph.numberingMarkerShapeInput?.kerning === true,
-      decorations: [],
+      direction: context.baseRtl ? 'rtl' : 'ltr', decorations: [],
     } satisfies TextPlacement;
   });
 }
