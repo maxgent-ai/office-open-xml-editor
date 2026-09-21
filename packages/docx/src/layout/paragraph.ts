@@ -1060,7 +1060,6 @@ export function planLine(input: PlanLineInput): LineLayout {
     baselinePt: line.baselinePt,
     advancePt: line.advancePt,
     placements,
-    ...(line.endsWithBreak ? { endsWithBreak: true } : {}),
   });
 }
 
