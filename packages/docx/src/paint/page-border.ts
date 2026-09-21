@@ -1,6 +1,6 @@
 import type { PageBorderLayout } from '../layout/types.js';
 import { composeAffine, scaleAffine } from './affine.js';
-import { oneDevicePixelCssWidth, paintStrokeSegment } from './canvas-border.js';
+import { paintStrokeSegment } from './canvas-border.js';
 import { applyCanvasTransform } from './canvas-transform.js';
 import { canvasPaintFrame } from './deferred-paint-frame.js';
 import type { CanvasPaintContext } from './types.js';
@@ -22,9 +22,9 @@ export function paintPageBorderLayout(
   });
   frame(() => {
     for (const segment of pageBorder.segments) {
-      // Keep authored page-border layout geometry while sharing the raster
-      // floor used by the other retained WordprocessingML borders.
-      paintStrokeSegment(segment, borderContext, oneDevicePixelCssWidth(context));
+      // Preserve the historical half-CSS-pixel minimum used by DOCX page
+      // borders without changing the retained authored point width.
+      paintStrokeSegment(segment, borderContext, 0.5);
     }
   })();
 }

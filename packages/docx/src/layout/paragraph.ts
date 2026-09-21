@@ -172,8 +172,6 @@ function finiteNonNegative(value: number, name: string): number {
 export type MeasuredTextPlanSegment = Readonly<
   Omit<TextPlacement, 'origin' | 'bounds' | 'advancePt' | 'paintOps'> & {
     measuredWidthPt: number;
-    /** Acquisition-only: covered caller sfnt suppresses unresolved space shrink. */
-    exactFontResource?: true;
     basePaintOps: readonly import('./types.js').TextPaintOp[];
     /** Physical advance from the segment origin through the final glyph. Word
      * retains later grid slack for layout but excludes it from a terminal underline. */
@@ -794,10 +792,7 @@ export function planLine(input: PlanLineInput): LineLayout {
     stretchByIndex = distribution?.perSeg ?? null;
     perGapPt = distribution?.perGap ?? 0;
     distributedWidthPt = distributedDelta(distribution);
-  } else if (lineSlackPt < 0 && !(segments.some((segment) =>
-    segment.kind === 'text' && segment.exactFontResource === true)
-    && segments.every((segment) => segment.kind !== 'text'
-      || !/\S/.test(segment.text) || segment.exactFontResource === true))) {
+  } else if (lineSlackPt < 0) {
     const compression = keepGraphemeSafeCuts(shrinkFitCompression(
       distSegments,
       lineSlackPt,
@@ -1065,7 +1060,6 @@ export function planLine(input: PlanLineInput): LineLayout {
     baselinePt: line.baselinePt,
     advancePt: line.advancePt,
     placements,
-    ...(line.endsWithBreak ? { endsWithBreak: true } : {}),
   });
 }
 
@@ -1381,7 +1375,7 @@ function textPlacement(
       perGapPt: segment.fitTextPerGapPx ?? 0,
       trailingPadPt: segment.fitTextTrailingPadPx ?? 0,
     } } : {}),
-    kerning: segment.kerning !== undefined && segment.fontSize >= segment.kerning,
+    ...(segment.kerning !== undefined ? { kerning: segment.fontSize >= segment.kerning } : {}),
     ...(segment.position !== undefined ? { positionPt: segment.position } : {}),
     ...(segment.vertAlign ? { verticalAlign: segment.vertAlign } : {}),
     ...(segment.tateChuYoko ? { tateChuYoko: true } : {}),
@@ -1455,9 +1449,9 @@ function textPlacement(
       letterSpacingPt: effectiveCharacterSpacingPt(segment),
       scaleX: segment.charScale ?? 1,
       direction: segment.rtl ? 'rtl' : 'ltr',
-      kerning: segment.kerning !== undefined && segment.fontSize >= segment.kerning
-        ? 'normal'
-        : 'none',
+      kerning: segment.kerning === undefined
+        ? 'auto'
+        : segment.fontSize >= segment.kerning ? 'normal' : 'none',
       writingMode: segment.verticalRun ? 'vertical-rl' : 'horizontal-tb',
     }],
     ...(segment.hyperlink ? { hyperlink: segment.hyperlink } : {}),
@@ -1591,15 +1585,12 @@ function numberingMarkerPlacements(
         range: { start: rangeBase + span.start, end: rangeBase + span.end },
         offset: { xPt: 0, yPt: 0 }, letterSpacingPt: 0, scaleX: 1,
         direction: context.baseRtl ? 'rtl' : 'ltr',
-        kerning: paragraph.numberingMarkerShapeInput?.kerning === true ? 'normal' : 'none',
-        writingMode: 'horizontal-tb',
+        kerning: 'auto', writingMode: 'horizontal-tb',
       }],
       color, fontRoute: span.fontRoute,
       fontSizePt: paragraph.numberingMarkerShapeInput?.fontSizePt ?? span.ascentPt + span.descentPt,
       fontWeight: span.font.weight, fontStyle: span.font.style,
-      direction: context.baseRtl ? 'rtl' : 'ltr',
-      kerning: paragraph.numberingMarkerShapeInput?.kerning === true,
-      decorations: [],
+      direction: context.baseRtl ? 'rtl' : 'ltr', decorations: [],
     } satisfies TextPlacement;
   });
 }
@@ -2098,7 +2089,6 @@ function textPlanSegment(
   return {
     ...style,
     kind: 'text', measuredWidthPt: segment.measuredWidth,
-    ...(segment.exactFontResource ? { exactFontResource: true as const } : {}),
     clusters,
     basePaintOps: basePaintOps.map((operation) => ({
       ...operation,

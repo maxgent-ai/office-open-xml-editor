@@ -108,7 +108,7 @@ describe('paintParagraphLayout', () => {
     },
   );
 
-  it('keeps text-decoration width while flooring run and paragraph borders to one device pixel', () => {
+  it('does not widen retained text decorations with the paragraph-border hairline policy', () => {
     const widths: number[] = [];
     const ctx = {
       globalAlpha: 1, fillStyle: '', strokeStyle: '', lineWidth: 1,
@@ -139,15 +139,6 @@ describe('paintParagraphLayout', () => {
             widthPt: 0.5,
             style: 'solid' as const,
           }],
-          runBorderFragments: [{
-            edge: 'top' as const,
-            from: { xPt: 10, yPt: 9 },
-            to: { xPt: 30, yPt: 9 },
-            color: '#333333',
-            widthPt: 0.5,
-            authoredStyle: 'single',
-            style: 'solid' as const,
-          }],
         }],
       }],
       borders: [{
@@ -168,7 +159,7 @@ describe('paintParagraphLayout', () => {
       resources: noPaintResources,
     });
 
-    expect(widths).toEqual([0.5, 1, 1]);
+    expect(widths).toEqual([0.5, 1]);
   });
 
   it('resets an unthemed nested text box to the document default text color', () => {

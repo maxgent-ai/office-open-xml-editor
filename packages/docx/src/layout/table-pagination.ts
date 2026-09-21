@@ -9,7 +9,6 @@ import {
   convergeExactState,
 } from './convergence.js';
 import { LayoutInvariantError } from './diagnostics.js';
-import { adjustForWidowOrphan } from '../line-fit-policy.js';
 import { sliceParagraphLayout } from './paragraph.js';
 import {
   layoutTable,
@@ -20,7 +19,6 @@ import {
 import {
   wordClipsOverPageCantSplitRow,
   wordRelocatesParallelParagraphRowCut,
-  wordTableCellWidowLineCount,
 } from './table-compatibility.js';
 import type {
   FlowBlockPlacement,
@@ -711,67 +709,30 @@ function paragraphSlice(
 
 function selectParagraph(
   paragraph: ParagraphLayout,
-  sourceBlock: TableCellBlockInput,
+  sourceBlockIndex: number,
   start: number,
   selectedBlocks: readonly TableCellBlockInput[],
   availableHeightPt: number,
-  freshAvailableHeightPt: number,
-  canGainPageSpace: boolean,
-  compatibility: TableFragmentContext['compatibility'],
 ): Readonly<{
   block: TableCellBlockInput | null;
   range: BlockContinuationRange | null;
   lineEnd: number;
   advancePt: number;
 }> {
+  let selected: ParagraphLayout | null = null;
   let lineEnd = start;
   for (let candidateEnd = start + 1; candidateEnd <= paragraph.lines.length; candidateEnd += 1) {
     const candidate = paragraphSlice(paragraph, start, candidateEnd);
-    const candidateBlock = { ...sourceBlock, layout: candidate };
+    const candidateBlock = { layout: candidate, sourceBlockIndex } as const;
     if (measureTableCellBlockFlowHeightPt([...selectedBlocks, candidateBlock])
       > availableHeightPt + EPSILON_PT) break;
+    selected = candidate;
     lineEnd = candidateEnd;
   }
-  if (lineEnd === start) {
-    return { block: null, range: null, lineEnd: start, advancePt: 0 };
-  }
-  const canRelocate = start === 0 && (selectedBlocks.length > 0 || canGainPageSpace);
-  if (
-    sourceBlock.keepLines === true
-    && lineEnd < paragraph.lines.length
-    && canRelocate
-    && measureTableCellBlockFlowHeightPt([{ ...sourceBlock, layout: paragraph }])
-      <= freshAvailableHeightPt + EPSILON_PT
-  ) {
-    return { block: null, range: null, lineEnd: start, advancePt: 0 };
-  }
-  const widowLineCount = wordTableCellWidowLineCount({
-    compatibility,
-    lines: paragraph.lines,
-  });
-  for (;;) {
-    const widow = adjustForWidowOrphan({
-      widowControl: sourceBlock.widowControl === true,
-      start,
-      end: lineEnd,
-      totalLines: widowLineCount,
-      canRelocate,
-    });
-    if (widow.kind === 'relocate') {
-      return { block: null, range: null, lineEnd: start, advancePt: 0 };
-    }
-    if (widow.kind !== 'dropLastLine') break;
-    lineEnd -= 1;
-  }
-  const selected = paragraphSlice(paragraph, start, lineEnd);
+  if (!selected) return { block: null, range: null, lineEnd: start, advancePt: 0 };
   return {
-    block: { ...sourceBlock, layout: selected },
-    range: {
-      kind: 'paragraph',
-      blockIndex: sourceBlock.sourceBlockIndex,
-      lineStart: start,
-      lineEnd,
-    },
+    block: { layout: selected, sourceBlockIndex },
+    range: { kind: 'paragraph', blockIndex: sourceBlockIndex, lineStart: start, lineEnd },
     lineEnd,
     advancePt: selected.advancePt,
   };
@@ -782,8 +743,6 @@ function selectCell(
   cell: TableCellLayoutInput,
   cursor: TableCellFragmentCursor,
   availableContentHeightPt: number,
-  freshAvailableContentHeightPt: number,
-  canGainPageSpace: boolean,
   context: TableFragmentContext,
 ): SelectedCell {
   if (cell.verticalMerge === 'continue') {
@@ -821,13 +780,10 @@ function selectCell(
       }
       const selected = selectParagraph(
         child,
-        sourceBlock,
+        sourceBlock.sourceBlockIndex,
         paragraphLineStart,
         blocks,
         availableContentHeightPt,
-        freshAvailableContentHeightPt,
-        canGainPageSpace,
-        context.compatibility,
       );
       if (!selected.block || !selected.range) break;
       blocks.push({ ...selected.block, ...(sourceBlock.structuralTrailing
@@ -893,8 +849,6 @@ function partialRow(
   row: TableRowLayoutInput,
   cursor: TableFragmentCursor,
   availableHeightPt: number,
-  freshAvailableHeightPt: number,
-  canGainPageSpace: boolean,
   context: TableFragmentContext,
 ): Readonly<{
   selected: SelectedRow | null;
@@ -924,17 +878,11 @@ function partialRow(
     0,
     availableHeightPt - verticalInsetsPt - spacingInsetsPt - boundaryInsetsPt,
   );
-  const freshAvailableContentHeightPt = Math.max(
-    0,
-    freshAvailableHeightPt - verticalInsetsPt - spacingInsetsPt - boundaryInsetsPt,
-  );
   const selectedCells = row.cells.map((cell, index) => selectCell(
     source,
     cell,
     cellCursors[index]!,
     availableContentHeightPt,
-    freshAvailableContentHeightPt,
-    canGainPageSpace,
     context,
   ));
   const cellMadeProgress = (cell: SelectedCell, index: number) => (
@@ -1182,11 +1130,6 @@ export function takeTableFragment(
       availablePt -= heightPt;
     }
   }
-  const repeatedHeaderHeightPt = context.availableHeightPt - availablePt;
-  const freshSourceHeightPt = Math.max(
-    0,
-    context.freshPageHeightPt - repeatedHeaderHeightPt,
-  );
 
   let nextCursor: TableFragmentCursor | null = cursor;
   let rowIndex = cursor.rowIndex;
@@ -1309,16 +1252,8 @@ export function takeTableFragment(
       break;
     }
 
-    const canGainPageSpace = context.availableHeightPt + EPSILON_PT < context.freshPageHeightPt
-      || selected.some((item) => item.ownership === 'source');
     let partial = partialRow(
-      source,
-      acquiredRow,
-      rowCursor,
-      availablePt,
-      freshSourceHeightPt,
-      canGainPageSpace,
-      context,
+      source, acquiredRow, rowCursor, availablePt, context,
     );
     let selectedPrepared: ReturnType<typeof finalFrameRow> | null = null;
     const visitedOwnershipStates = new Set<string>();
@@ -1341,13 +1276,7 @@ export function takeTableFragment(
         (occurrence) => transactionInputs.has(occurrenceSelectionKey(occurrence)),
       );
       const reselection = partialRow(
-        source,
-        selectedPrepared.row,
-        rowCursor,
-        availablePt,
-        freshSourceHeightPt,
-        canGainPageSpace,
-        context,
+        source, selectedPrepared.row, rowCursor, availablePt, context,
       );
       if (!reselection.selected) {
         partial = reselection;

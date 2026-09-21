@@ -424,51 +424,6 @@ describe('measureParagraph', () => {
     expect(result.contentEndYPt).toBe(40);
   });
 
-  it.each([
-    { language: 'en-gb', hint: undefined, expected: 12 },
-    { language: 'ja-jp', hint: undefined, expected: 12 },
-    { language: 'en-gb', hint: 'eastAsia', expected: 12 },
-    { language: undefined, hint: undefined, expected: 12 },
-  ] as const)(
-    'keeps an acquired empty mark on its Latin/default face (language=$language, hint=$hint)',
-    ({ language, hint, expected }) => {
-      const result = measureParagraph(
-        paragraph({
-          defaultFontSize: 10,
-          defaultFontFamily: 'Latin Mark',
-          defaultFontFamilyEastAsia: 'East Asian Mark',
-          spaceBefore: 0,
-          spaceAfter: 0,
-        }),
-        layoutContext({
-          lineGrid: { active: false, pitchPt: 18 },
-          spaceBeforePt: 0,
-          spaceAfterPt: 0,
-        }),
-        placement({ startYPt: 0 }),
-        measurer,
-        environment({
-          useFeLayout: true,
-          resolvedLocalFonts: {
-            'latin mark': { family: 'Latin Mark', lineHeightRatio: 1.2 },
-            'east asian mark': { family: 'East Asian Mark', eastAsianLineHeightRatio: 1.6 },
-          },
-          paragraphMarkShapeInput: {
-            fontSizePt: 10,
-            fonts: { ascii: 'Latin Mark', eastAsia: 'East Asian Mark' },
-            weight: 400,
-            style: 'normal',
-            complexScript: false,
-            fontHint: hint,
-            eastAsiaLanguage: language,
-          },
-        }),
-      );
-
-      expect(result.contentEndYPt).toBe(expected);
-    },
-  );
-
   it('uses resolved-resource Far East metrics for useFELayout empty marks', () => {
     const markAdvance = (
       fontSize: number,
@@ -782,86 +737,6 @@ describe('measureParagraph', () => {
 
     expect(result.markOnly).toBe(false);
     expect(result.lines[0].advancePt).toBe(24);
-  });
-
-  it.each([
-    { line: 240, multiple: 1, imageHeight: 5 },
-    { line: 240, multiple: 1, imageHeight: 28.3464567 },
-    { line: 259, multiple: 259 / 240, imageHeight: 10 },
-    { line: 259, multiple: 259 / 240, imageHeight: 28.3464567 },
-    { line: 259, multiple: 259 / 240, imageHeight: 61.8 },
-    { line: 276, multiple: 276 / 240, imageHeight: 20 },
-    { line: 276, multiple: 276 / 240, imageHeight: 50 },
-    { line: 276, multiple: 276 / 240, imageHeight: 105.4 },
-    { line: 240, multiple: 1, imageHeight: 188.2 },
-    { line: 276, multiple: 276 / 240, imageHeight: 255 },
-  ])(
-    'adds Calibri auto leading without scaling an image (line=$line, height=$imageHeight)',
-    ({ multiple, imageHeight }) => {
-      const auto = { value: multiple, rule: 'auto' as const, explicit: true };
-      const result = measureParagraph(
-        paragraph({
-          defaultFontFamily: 'Calibri',
-          defaultFontSize: 11,
-          spaceBefore: 0,
-          lineSpacing: auto,
-          runs: [{
-            type: 'image',
-            imagePath: 'word/media/inline.png',
-            mimeType: 'image/png',
-            widthPt: imageHeight,
-            heightPt: imageHeight,
-            anchor: false,
-          }],
-        }),
-        layoutContext({ spaceBeforePt: 0, lineSpacing: auto }),
-        placement(),
-        measurer,
-        environment(),
-      );
-
-      const designSingle = 11 * 2500 / 2048;
-      expect(result.lines[0].advancePt).toBeCloseTo(
-        Math.max(designSingle, imageHeight) + designSingle * (multiple - 1),
-        8,
-      );
-    },
-  );
-
-  it('retains authored Calibri descent below an inline-image baseline', () => {
-    const auto = { value: 259 / 240, rule: 'auto' as const, explicit: true };
-    const imageHeight = 28.3464567;
-    const result = measureParagraph(
-      paragraph({
-        defaultFontFamily: 'Calibri',
-        defaultFontSize: 11,
-        spaceBefore: 0,
-        lineSpacing: auto,
-        runs: [
-          { type: 'text', ...textRun('mixed', { fontFamily: 'Calibri', fontSize: 11 }) },
-          {
-            type: 'image',
-            imagePath: 'word/media/inline.png',
-            mimeType: 'image/png',
-            widthPt: imageHeight,
-            heightPt: imageHeight,
-            anchor: false,
-          },
-        ],
-      }),
-      layoutContext({ spaceBeforePt: 0, lineSpacing: auto }),
-      placement(),
-      measurer,
-      environment(),
-    );
-
-    const designSingle = 11 * 2500 / 2048;
-    const designDescent = 11 * 550 / 2048;
-    expect(result.lines[0].layout.descent).toBeCloseTo(designDescent, 8);
-    expect(result.lines[0].advancePt).toBeCloseTo(
-      imageHeight + designDescent + designSingle * (auto.value - 1),
-      8,
-    );
   });
 
   it('preserves exact line spacing verbatim', () => {

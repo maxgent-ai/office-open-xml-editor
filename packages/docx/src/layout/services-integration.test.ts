@@ -305,53 +305,27 @@ describe('production layout service integration', () => {
       : false)).toEqual([true, false]);
   });
 
-  it('applies useFELayout metrics to an effective eastAsia axis even without a hint', () => {
-    const hinted = textRun('HintedLatin', {
+  it('classifies Latin runs with a resolved eastAsia axis only when useFELayout is active', () => {
+    const hinted = textRun('Hinted Latin title', {
       fontFamilyEastAsia: 'EA Face',
       fontHint: 'eastAsia',
       langEastAsia: 'ja-jp',
     });
-    const unhinted = textRun('UnhintedLatin', {
+    const unhinted = textRun('Unhinted Latin title', {
       fontFamilyEastAsia: 'EA Face',
       fontHint: null,
       langEastAsia: 'ja-jp',
     });
-    const japanese = textRun('国', {
-      fontFamilyEastAsia: 'EA Face',
-      fontHint: null,
-      langEastAsia: 'ja-jp',
-    });
-    const sameFace = textRun('SameFaceLatin', {
-      fontFamily: 'EA Face',
-      fontFamilyEastAsia: 'EA Face',
-      fontHint: null,
-      langEastAsia: 'ja-jp',
-    });
-    const mixed = textRun('Latin国', {
-      fontFamilyEastAsia: 'EA Face',
-      fontHint: null,
-      langEastAsia: 'ja-jp',
-    });
+    const off = buildSegments([hinted, unhinted], { pageIndex: 0, totalPages: 1 });
     const on = buildSegments(
-      [hinted, unhinted, sameFace, japanese, mixed],
-      {
-        pageIndex: 0,
-        totalPages: 1,
-        useFeLayout: true,
-      },
-    ).filter((segment) => 'text' in segment);
+      [hinted, unhinted],
+      { pageIndex: 0, totalPages: 1, useFeLayout: true },
+    );
 
-    expect(on.map((segment) => ({
-      text: segment.text,
-      metricEastAsian: segment.metricEastAsian ?? false,
-    }))).toEqual([
-      { text: 'HintedLatin', metricEastAsian: true },
-      { text: 'UnhintedLatin', metricEastAsian: true },
-      { text: 'SameFaceLatin', metricEastAsian: true },
-      { text: '国', metricEastAsian: true },
-      { text: 'Latin', metricEastAsian: true },
-      { text: '国', metricEastAsian: true },
-    ]);
+    expect(off.filter((segment) => 'text' in segment)
+      .every((segment) => !('metricEastAsian' in segment))).toBe(true);
+    expect(on.filter((segment) => 'text' in segment)
+      .every((segment) => 'metricEastAsian' in segment && segment.metricEastAsian === true)).toBe(true);
   });
 
   it('keeps a single pure-CJK hint-protected rtl span on non-cs formatting', () => {
@@ -594,248 +568,6 @@ describe('production layout service integration', () => {
       .toBeCloseTo(1.95, 12);
     expect(services.text.fontMetrics?.['fallback only face']).toBeUndefined();
     expect(font).toBe('12px serif');
-  });
-
-  it('uses each authored Calibri face design line even when Canvas substitutes a tuple', () => {
-    const document = model({
-      body: [{
-        type: 'paragraph',
-        runs: [
-          textRun('Regular', { fontFamily: 'Calibri' }),
-          textRun('Bold', { fontFamily: 'Calibri', bold: true }),
-          textRun('Italic', { fontFamily: 'Calibri', italic: true }),
-          textRun('Bold italic', { fontFamily: 'Calibri', bold: true, italic: true }),
-        ],
-      } as DocxDocumentModel['body'][number]],
-    });
-    const context = (selectedTuples: ReadonlySet<string>) => {
-      let font = '12px serif';
-      return {
-        ...measureContext(),
-        get font() { return font; },
-        set font(value: string) { font = value; },
-        measureText(text: string) {
-          const tuple = `${font.startsWith('italic') ? 'italic' : 'normal'}:${font.includes(' 700 ') ? 700 : 400}`;
-          const emPx = Number(font.match(/([\d.]+)px/)?.[1] ?? 10);
-          const selected = font.includes('"Calibri"') && selectedTuples.has(tuple);
-          const small = emPx <= 10;
-          return {
-            width: (selected ? 1.01 : 0.92) * emPx * Math.max(1, [...text].length),
-            actualBoundingBoxAscent: (selected ? 0.78 : 0.72) * emPx,
-            actualBoundingBoxDescent: 0.2 * emPx,
-            fontBoundingBoxAscent: small ? emPx : (selected ? 0.95 : 0.9) * emPx,
-            fontBoundingBoxDescent: small ? 0.3 * emPx : (selected ? 0.27 : 0.25) * emPx,
-          } as TextMetrics;
-        },
-      } as CanvasRenderingContext2D;
-    };
-
-    const allTuples = new Set(['normal:400', 'normal:700', 'italic:400', 'italic:700']);
-    const available = createLayoutServices(document, {
-      measureContext: context(allTuples),
-      measureResolvedFontMetrics: true,
-    });
-    const boldItalicFallback = createLayoutServices(document, {
-      measureContext: context(new Set(['normal:400', 'normal:700', 'italic:400'])),
-      measureResolvedFontMetrics: true,
-    });
-
-    expect(available.text.fontMetrics?.calibri?.lineHeightRatio)
-      .toBeCloseTo(2500 / 2048, 12);
-    expect(available.text.fontMetrics?.['calibri:700:normal']?.lineHeightRatio)
-      .toBeCloseTo(2500 / 2048, 12);
-    expect(available.text.fontMetrics?.['calibri:400:italic']?.lineHeightRatio)
-      .toBeCloseTo(2500 / 2048, 12);
-    expect(available.text.fontMetrics?.['calibri:700:italic']?.lineHeightRatio)
-      .toBeCloseTo(2500 / 2048, 12);
-    expect(available.text.fontMetrics?.calibri?.eastAsianLineHeightRatio).toBeUndefined();
-    expect(boldItalicFallback.text.fontMetrics?.['calibri:700:italic']).toBeUndefined();
-
-    const lineHeight = (
-      services: ReturnType<typeof createLayoutServices>,
-      bold: boolean,
-      italic: boolean,
-    ) => {
-      const measuringContext = context(allTuples);
-      const segments = buildSegments([
-        textRun('Calibri', { fontFamily: 'Calibri', bold, italic }),
-      ], {
-        pageIndex: 0,
-        totalPages: 1,
-        layoutServices: services,
-        authoredAutoLineSpacing: true,
-      });
-      const line = layoutLines(measuringContext, segments, 300, 0, 1)[0]!;
-      return line.ascent + line.descent;
-    };
-    expect(lineHeight(available, false, false)).toBeCloseTo(2500 / 2048 * 10, 9);
-    expect(lineHeight(available, true, false)).toBeCloseTo(2500 / 2048 * 10, 9);
-    expect(lineHeight(available, false, true)).toBeCloseTo(2500 / 2048 * 10, 9);
-    expect(lineHeight(available, true, true)).toBeCloseTo(2500 / 2048 * 10, 9);
-    expect(lineHeight(boldItalicFallback, true, true)).toBeCloseTo(2500 / 2048 * 10, 9);
-
-    const [defaultSpacingFallback] = buildSegments([
-      textRun('Calibri', { fontFamily: 'Calibri', bold: true, italic: true }),
-    ], {
-      pageIndex: 0,
-      totalPages: 1,
-      layoutServices: boldItalicFallback,
-    });
-    expect(defaultSpacingFallback).toMatchObject({ resolvedLineHeightRatio: undefined });
-  });
-
-  it('uses the Calibri design line for each exact loaded Carlito substitute tuple', () => {
-    const document = model({ majorFont: 'Calibri' });
-    const context = {
-      ...measureContext(),
-      measureText: (text: string) => ({
-        width: [...text].length * 8,
-        actualBoundingBoxAscent: 8,
-        actualBoundingBoxDescent: 2,
-        fontBoundingBoxAscent: 10,
-        fontBoundingBoxDescent: 3,
-      }),
-    } as CanvasRenderingContext2D;
-    const faces = [
-      { family: 'Carlito', weight: '400', style: 'normal', status: 'loaded' },
-      { family: 'Carlito', weight: '700', style: 'normal', status: 'loaded' },
-      { family: 'Carlito', weight: '400', style: 'italic', status: 'loaded' },
-      { family: 'Carlito', weight: '700', style: 'italic', status: 'loaded' },
-    ] as FontFace[];
-    const services = createLayoutServices(document, {
-      measureContext: context,
-      googleFaces: faces,
-      useGoogleFonts: true,
-    });
-    const missingBoldItalic = createLayoutServices(document, {
-      measureContext: context,
-      googleFaces: faces.slice(0, -1),
-      useGoogleFonts: true,
-    });
-    const lineHeight = (
-      target: ReturnType<typeof createLayoutServices>,
-      bold: boolean,
-      italic: boolean,
-    ) => {
-      const segments = buildSegments([
-        textRun('Calibri', { fontFamily: 'Calibri', bold, italic }),
-      ], {
-        pageIndex: 0,
-        totalPages: 1,
-        layoutServices: target,
-        authoredAutoLineSpacing: true,
-      });
-      const line = layoutLines(context, segments, 300, 0, 1)[0]!;
-      return line.ascent + line.descent;
-    };
-
-    expect(lineHeight(services, false, false)).toBeCloseTo(2500 / 2048 * 10, 9);
-    expect(lineHeight(services, true, false)).toBeCloseTo(2500 / 2048 * 10, 9);
-    expect(lineHeight(services, false, true)).toBeCloseTo(2500 / 2048 * 10, 9);
-    expect(lineHeight(services, true, true)).toBeCloseTo(2500 / 2048 * 10, 9);
-    expect(lineHeight(missingBoldItalic, true, true)).toBeCloseTo(2500 / 2048 * 10, 9);
-  });
-
-  it('removes fallback-width tolerance only for Word-compatible Calibri routes', () => {
-    const document = model();
-    const ctx = measureContext();
-    const layoutWith = (
-      services: ReturnType<typeof createLayoutServices>,
-      family: string,
-    ): string[] => {
-      const segments = buildSegments([
-        textRun('AAAA AAAA AAAA AAAA', { fontFamily: family }),
-      ], { pageIndex: 0, totalPages: 1, layoutServices: services });
-      return layoutLines(ctx, segments, 150, 0, 1).map((line) => line.segments
-        .filter((segment) => 'text' in segment)
-        .map((segment) => 'text' in segment ? segment.text : '')
-        .join(''));
-    };
-    const nativeCalibriLines = (fontBoxRatio?: number): string[] => {
-      const metric = {
-        family: 'Calibri',
-        requestedFamily: 'Calibri',
-        lineHeightRatio: 2500 / 2048,
-        ...(fontBoxRatio === undefined ? {} : { fontBoxRatio }),
-      };
-      const services = createLayoutServices(document, {
-        measureContext: ctx,
-        fontMetrics: { calibri: metric },
-      });
-      return layoutWith(services, 'Calibri');
-    };
-
-    // Four words naturally need 152px in this deterministic context. The old
-    // unresolved-face budget admits them into 150px; resource-owner font-box
-    // proof makes natural width authoritative even though the route is native.
-    expect(nativeCalibriLines()).toHaveLength(1);
-    expect(nativeCalibriLines(1.22)).toHaveLength(2);
-
-    let probeFont = '';
-    const probeContext = {
-      ...ctx,
-      get font() { return probeFont; },
-      set font(value: string) { probeFont = value; },
-      measureText(text: string) {
-        const selectedCalibri = probeFont.includes('"Calibri",');
-        const width = text === 'C' && selectedCalibri ? 9 : [...text].length * 8;
-        return {
-          width,
-          actualBoundingBoxAscent: selectedCalibri ? 9 : 8,
-          actualBoundingBoxDescent: 2,
-          fontBoundingBoxAscent: selectedCalibri ? 95 : 80,
-          fontBoundingBoxDescent: selectedCalibri ? 27 : 20,
-        } as TextMetrics;
-      },
-    } as CanvasRenderingContext2D;
-    const probedCalibri = createLayoutServices(document, {
-      measureContext: probeContext,
-      measureResolvedFontMetrics: true,
-      resolvedFontMetricCandidates: [{
-        family: 'Calibri', probeText: 'C', weight: 400, style: 'normal', appliesToLatin: true,
-      }],
-    });
-    expect(layoutWith(probedCalibri, 'Calibri')).toHaveLength(2);
-
-    const arbitraryExactFace = createLayoutServices(document, {
-      measureContext: ctx,
-      fontMetrics: {
-        'authored sans': {
-          family: 'Authored Sans',
-          requestedFamily: 'Authored Sans',
-          lineHeightRatio: 1.2,
-          fontBoxRatio: 1.2,
-        },
-      },
-    });
-    expect(layoutWith(arbitraryExactFace, 'Authored Sans')).toHaveLength(1);
-
-    const registeredDocument = model({
-      embeddedFonts: [{
-        fontName: 'Registered Sans',
-        partPath: 'word/fonts/registered.odttf',
-        fontKey: '',
-        style: 'regular',
-      }],
-    });
-    const registered = createLayoutServices(registeredDocument, {
-      measureContext: ctx,
-      embeddedFaces: [{
-        family: 'Registered Sans', weight: '400', style: 'normal', status: 'loaded',
-      } as FontFace],
-    });
-    expect(layoutWith(registered, 'Registered Sans')).toHaveLength(1);
-
-    const carlito = { family: 'Carlito', weight: '400', style: 'normal', status: 'loaded' } as FontFace;
-    const substituted = createLayoutServices(model({
-      majorFont: 'Calibri',
-      body: [{ type: 'paragraph', runs: [textRun('x', { fontFamily: 'Calibri' })] } as DocxDocumentModel['body'][number]],
-    }), {
-      measureContext: ctx,
-      googleFaces: [carlito],
-      useGoogleFonts: true,
-    });
-    expect(layoutWith(substituted, 'Calibri')).toHaveLength(2);
   });
 
   it('takes one deeply immutable font-resource metric snapshot at the document boundary', () => {

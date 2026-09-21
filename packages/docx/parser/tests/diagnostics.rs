@@ -448,14 +448,10 @@ fn follows_selected_mce_branch_and_remaps_removed_cover_breaks() {
         <w:p><w:r><w:rPr><w:effect w:val="sparkle"/></w:rPr></w:r></w:p>
         "#,
     );
-    assert_eq!(cover["body"].as_array().map(Vec::len), Some(3));
-    assert_eq!(cover["body"][0]["type"], "paragraph");
-    assert_eq!(cover["body"][1]["type"], "pageBreak");
-    assert_eq!(cover["body"][2]["type"], "paragraph");
     assert_eq!(
         cover["diagnostics"][0]["path"],
-        json!([2]),
-        "removing the synthetic cover break keeps the retained paragraph mark and remaps later source paths"
+        json!([1]),
+        "removing the redundant synthetic cover break remaps later source paths"
     );
 }
 
