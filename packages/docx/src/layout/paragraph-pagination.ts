@@ -45,8 +45,12 @@ export function selectParagraphFragment(
     keepLines: boolean;
     widowControl: boolean;
     /** Authored §17.3.1.33 trailing whitespace; final-fragment fit is governed
-     * by WORD_TRAILING_SPACE_AFTER_FIT_ADMISSION. */
+     * by WORD_TRAILING_SPACE_AFTER_FIT_ADMISSION unless a following authored
+     * hard break owns the next flow transition. */
     authoredSpaceAfterPt?: number;
+    /** A hard page break immediately follows this source paragraph. Its forced
+     * transition cannot absorb overflowing trailing paragraph whitespace. */
+    followsHardPageBreak?: boolean;
     /** Owning section-region flow axis. Vertical final-line admission is
      * governed by WORD_VERTICAL_RL_FINAL_LINE_BASELINE_ADMISSION. */
     writingMode?: WritingMode;
@@ -94,7 +98,7 @@ export function selectParagraphFragment(
     const logicalLineBoxExtentPt = wordFinalParagraphAdmissionExtentPt({
       advancePt: fragment.advancePt,
       retainedSpaceAfterPt: fragment.spacing.afterPt,
-      authoredSpaceAfterPt,
+      authoredSpaceAfterPt: policy.followsHardPageBreak ? 0 : authoredSpaceAfterPt,
     });
     return wordVerticalRlFinalLineAdmissionExtentPt({
       paragraph: fragment,
