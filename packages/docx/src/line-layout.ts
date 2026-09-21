@@ -499,8 +499,7 @@ export interface LayoutTextSeg extends LayoutSegSource {
   positionExtendsLineBox?: boolean;
   /** ECMA-376 §17.3.2.19 `<w:kern>` — font-kerning threshold in POINTS (smallest
    *  kerned size). Sets `ctx.fontKerning` on measure and paint when the run's
-   *  font size ≥ the threshold. Absent ⇒ kerning off, so each run explicitly
-   *  overrides Canvas' `auto` state during measurement and paint. */
+   *  font size ≥ the threshold. */
   kerning?: number;
   /** ECMA-376 §17.3.2.10 `<w:eastAsianLayout w:vert>` — horizontal-in-vertical
    *  (縦中横). Set by {@link buildSegments} ONLY when the run declares `w:vert`
@@ -531,6 +530,27 @@ export interface LayoutTextSeg extends LayoutSegSource {
    *  and re-queues the tail with the offsets rebased. Absent ⇒ not SEA text, or
    *  Intl.Segmenter unavailable (falls back to grapheme-safe emergency split). */
   seaBreaks?: readonly number[];
+}
+
+/**
+ * Map WordprocessingML's run-kerning rule onto Canvas without disabling the
+ * required positioning used to shape complex scripts. §17.3.2.19 makes an
+ * entirely absent `w:kern` hierarchy equivalent to kerning off. Canvas exposes
+ * that choice only through `fontKerning="none"`, but Chromium also changes the
+ * advances of contextually shaped Arabic/Hebrew text under that state. Word
+ * keeps those required script positions while omitting optional font kerning.
+ * Preserve Canvas' shaping policy for an absent complex-script setting; an
+ * authored threshold remains authoritative on both sides of its size boundary.
+ */
+export function wordRunCanvasKerning(
+  thresholdPt: number | undefined,
+  fontSizePt: number,
+  complexScript: boolean,
+): CanvasFontKerning {
+  if (thresholdPt !== undefined) {
+    return fontSizePt >= thresholdPt ? 'normal' : 'none';
+  }
+  return complexScript ? 'auto' : 'none';
 }
 
 /** Shaping and line allocation are derived from the current text slice. A
@@ -3339,8 +3359,14 @@ export function buildSegments(
         complexScript: cs,
         fontHint: r.fontHint,
         eastAsiaLanguage: r.langEastAsia,
-        kerning: effectiveKerningThreshold != null
-          && (cs ? csFontSize : base.fontSize) >= effectiveKerningThreshold,
+        kerning: (() => {
+          const mode = wordRunCanvasKerning(
+            effectiveKerningThreshold,
+            cs ? csFontSize : base.fontSize,
+            cs,
+          );
+          return mode === 'auto' ? undefined : mode === 'normal';
+        })(),
         measure: false,
       });
       const shaped = authoritativeSpan
@@ -4175,7 +4201,11 @@ export function buildSegments(
         effectiveFontSizePt,
         segment.bold ? 700 : 400,
         segment.italic ? 'italic' : 'normal',
-        segment.kerning ?? 'off',
+        wordRunCanvasKerning(
+          segment.kerning,
+          segment.fontSize,
+          segment.script === 'complexScript',
+        ),
       ].join('|');
       const cached = metricCache.get(key);
       if (cached !== undefined) return cached;
@@ -5103,15 +5133,19 @@ export function layoutLines(
 
   // ECMA-376 §17.3.2.19 `<w:kern>` — set `ctx.fontKerning` to match how the PAINT
   // pass will draw a run, so a kerned run measures exactly as it is drawn
-  // (measure==paint). Returns the value to restore afterwards (only when the run
-  // opts in). Kerning is enabled only when the run declares `w:kern` and its font
+  // (measure==paint). Kerning is enabled only when the run declares `w:kern` and its font
   // size is at or above the threshold (the spec's "smallest font size which shall
   // have its kerning automatically adjusted"). If no hierarchy level declares
-  // it, §17.3.2.19 requires kerning off, so override Canvas' `auto` default for
-  // the measurement and restore the host state afterwards.
+  // it, §17.3.2.19 requires kerning off. Complex-script runs retain Canvas'
+  // shaping state because `none` also changes required Arabic/Hebrew positioning;
+  // {@link wordRunCanvasKerning} owns that API-boundary projection.
   const setSegKerning = (s: LayoutTextSeg): CanvasFontKerning => {
     const prev = ctx.fontKerning;
-    ctx.fontKerning = s.kerning != null && s.fontSize >= s.kerning ? 'normal' : 'none';
+    ctx.fontKerning = wordRunCanvasKerning(
+      s.kerning,
+      s.fontSize,
+      s.script === 'complexScript',
+    );
     return prev;
   };
   const restoreKerning = (prev: CanvasFontKerning): void => {
