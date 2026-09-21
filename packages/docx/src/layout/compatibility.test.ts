@@ -59,6 +59,7 @@ import {
   WORD_NUMBERING_MARKER_PARAGRAPH_MARK_FALLBACK,
   WORD_NUMBERING_SUFFIX_COINCIDENT_LIST_TAB,
   WORD_NUMERIC_DECIMAL_TAB_INFERENCE,
+  WORD_OVERFLOW_PUNCTUATION_LATIN_PARENT_RUN,
   WORD_OVERFLOW_PUNCTUATION_LANGUAGE_SETS,
   WORD_OVERLONG_TOKEN_EMERGENCY_BREAK,
   WORD_RUBY_PARAGRAPH_UNIFORM_LINE_ADVANCE,
@@ -151,6 +152,7 @@ import {
   WORD_TABLE_INDENT_ALL_ALIGNMENTS,
   WORD_TABLE_MARGIN_SCOPE_SHADOW,
   WORD_TRAILING_STRUCTURAL_CELL_MARKER,
+  WORD_TRAILING_MANUAL_BREAK_WIDOW_COUNT,
   WORD_VERTICAL_MERGE_TERMINAL_BORDER,
   WORD_VERTICAL_SECTION_UPRIGHT_BLOCK_TABLE,
   wordAlignedTableOriginPt,
@@ -167,6 +169,7 @@ import {
   wordTableCellSpacingValuePt,
   wordTableMarginValuePt,
   wordTableRowHeightRule,
+  wordTableCellWidowLineCount,
 } from './table-compatibility.js';
 
 describe('defineCompatibilityRule', () => {
@@ -317,6 +320,23 @@ describe('Word table row-cut observations', () => {
       hasUnfinishedParagraphWithoutProgress: true,
     })).toBe(false);
   });
+
+  it('limits the trailing manual-break widow count to Word compatibility mode', () => {
+    expect(WORD_TRAILING_MANUAL_BREAK_WIDOW_COUNT.evidence).toEqual({
+      kind: 'office-observation',
+      syntheticFixtureId: 'trailing-manual-break-widow-boundary-matrix',
+      application: 'Microsoft Word',
+      version: '16.111.1',
+      platform: 'macOS 26.5.2',
+    });
+    const lines = [
+      { placements: [{ kind: 'tab' } as never], endsWithBreak: true },
+      { placements: [], endsWithBreak: true },
+      { placements: [] },
+    ];
+    expect(wordTableCellWidowLineCount({ compatibility: 'word', lines })).toBe(1);
+    expect(wordTableCellWidowLineCount({ compatibility: 'standard', lines })).toBe(3);
+  });
 });
 
 describe('float compatibility evidence', () => {
@@ -381,6 +401,7 @@ describe('layout compatibility inventory', () => {
       WORD_JUSTIFICATION_LEADING_INDENT_EXCLUSION,
       WORD_JUSTIFIED_CANDIDATE_SEPARATOR_FIT,
       WORD_OVERFLOW_PUNCTUATION_LANGUAGE_SETS,
+      WORD_OVERFLOW_PUNCTUATION_LATIN_PARENT_RUN,
       WORD_FULL_WIDTH_CHARACTER_SPACING_SCOPE,
       WORD_AUTHORED_CHARACTER_SPACING_PITCH_PRIORITY,
       WORD_RUBY_PARAGRAPH_UNIFORM_LINE_ADVANCE,
@@ -460,6 +481,13 @@ describe('layout compatibility inventory', () => {
     expect(WORD_OVERFLOW_PUNCTUATION_LANGUAGE_SETS.evidence).toEqual({
       kind: 'microsoft-note',
       reference: '[MS-OE376] §2.1.56',
+    });
+    expect(WORD_OVERFLOW_PUNCTUATION_LATIN_PARENT_RUN.evidence).toEqual({
+      kind: 'office-observation',
+      syntheticFixtureId: 'overflow-punctuation-latin-parent-run-boundary-matrix',
+      application: 'Microsoft Word',
+      version: '16.111.1',
+      platform: 'macOS 26.5.2',
     });
     expect(WORD_FULL_WIDTH_CHARACTER_SPACING_SCOPE.evidence).toEqual({
       kind: 'microsoft-note',

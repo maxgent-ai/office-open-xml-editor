@@ -71,6 +71,9 @@ function para(text: string, fontSize = 20): CellElement {
     spaceBefore: 0, spaceAfter: 0, lineSpacing: null, numbering: null, tabStops: [],
     runs: [textRun(text, fontSize)],
     defaultFontSize: fontSize, defaultFontFamily: 'NotInMetrics',
+    // Acquisition reuse is the assertion here; keep page cuts independent of
+    // the default widow/orphan policy covered by pagination tests.
+    widowControl: false,
   };
   return { type: 'paragraph', ...p } as CellElement;
 }

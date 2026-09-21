@@ -50,7 +50,7 @@ function context(): CanvasRenderingContext2D {
 
 function textRun(
   text: string,
-  eastAsiaLanguage = 'ja-jp',
+  eastAsiaLanguage: string | null = 'ja-jp',
 ): DocParagraph['runs'][number] {
   const run: DocxTextRun = {
     text,
@@ -72,7 +72,7 @@ function textRun(
     ...run,
     // Parser-only effective language input consumed by the isolated
     // overflow-punctuation compatibility projection.
-    langEastAsia: eastAsiaLanguage,
+    langEastAsia: eastAsiaLanguage ?? undefined,
   } as DocParagraph['runs'][number];
 }
 
@@ -578,25 +578,40 @@ describe('ECMA-376 East-Asian punctuation fit', () => {
     expect(lines(middleDot, 375, false)).toHaveLength(2);
   });
 
-  it('admits an eligible trailing punctuation character independently of script', () => {
+  it('hangs closing punctuation in Latin and East Asian, but not complex-script, parent runs', () => {
     const latin = buildSegments([textRun('A B.', 'en-us')], {
       pageIndex: 0,
       totalPages: 1,
     });
 
     expect(lines(latin, 30, true).map(textOf)).toEqual(['A B.']);
-    expect(lines(buildSegments([textRun('A B.', 'en-us')], {
+    expect(lines(buildSegments([textRun('A B.', null)], {
       pageIndex: 0,
       totalPages: 1,
-    }), 30, false).map(textOf)).toEqual(['A ', 'B.']);
+    }), 30, true).map(textOf)).toEqual(['A B.']);
+    expect(lines(buildSegments([textRun('A B.', 'ja-jp')], {
+      pageIndex: 0,
+      totalPages: 1,
+    }), 30, true).map(textOf)).toEqual(['A B.']);
+    expect(lines(buildSegments([textRun('甲 A)', null)], {
+      pageIndex: 0,
+      totalPages: 1,
+    }), 30, true).map(textOf)).toEqual(['甲 A)']);
+    expect(lines(buildSegments([textRun('甲 A)', 'en-us')], {
+      pageIndex: 0,
+      totalPages: 1,
+    }), 30, true).map(textOf)).toEqual(['甲 A)']);
+    expect(wordIsOverflowPunctuation('.', 'en-us', false, true)).toBe(true);
+    expect(wordIsOverflowPunctuation('}', undefined, false, true)).toBe(true);
+    expect(wordIsOverflowPunctuation('.', 'ar-sa', false, false)).toBe(false);
   });
 
   it('finds the final visible punctuation before a collapsible separator', () => {
-    const enabled = buildSegments([textRun('A B. C', 'en-us')], {
+    const enabled = buildSegments([textRun('A B. C', 'ja-jp')], {
       pageIndex: 0,
       totalPages: 1,
     });
-    const disabled = buildSegments([textRun('A B. C', 'en-us')], {
+    const disabled = buildSegments([textRun('A B. C', 'ja-jp')], {
       pageIndex: 0,
       totalPages: 1,
     });
