@@ -238,6 +238,25 @@ describe('paragraph page-local reserve selection', () => {
     });
   });
 
+  it('does not discount authored spaceAfter immediately before a hard page break', () => {
+    const selected = selectParagraphFragment(
+      twoLineParagraph(10), { boundary: null }, splittable(twoLineBoundaries),
+      20, 40, true,
+      {
+        keepLines: false,
+        widowControl: true,
+        authoredSpaceAfterPt: 10,
+        followsHardPageBreak: true,
+      },
+    );
+
+    expect(selected).toMatchObject({
+      fragment: null,
+      nextCursor: { boundary: null },
+      requiresFreshFlowRegion: true,
+    });
+  });
+
   it('relocates when final visible content itself crosses the region edge', () => {
     const selected = selectParagraphFragment(
       twoLineParagraph(10), { boundary: null }, splittable(twoLineBoundaries),

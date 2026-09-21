@@ -839,6 +839,35 @@ describe('layoutPages — empty-paragraph relocation (C2: §17.3.1.29)', () => {
     // no page holds more than its 5-line capacity (would mean an overflow)
     for (const page of pages) expect(page.layers.body.length).toBeLessThanOrEqual(5);
   });
+
+  it('fits a retained break-only paragraph mark and its after spacing before the page break', () => {
+    // The body region is 100pt high. Four 20pt marks leave 20pt, but the
+    // break-only source paragraph retains a 20pt mark plus 10pt after spacing.
+    // A forced boundary cannot consume the mark's trailing space on the same
+    // page and then erase its overflow. The complete 30pt mark moves to page 2;
+    // the authored break then moves following content to page 3.
+    const body = [
+      ...Array.from({ length: 4 }, () => para()),
+      para({ spaceAfter: 10 }),
+      // Hidden sources are consumed without owning flow. The paginator must
+      // still see the authored break as the next substantive event.
+      para({ markVanish: true }),
+      pageBreak(),
+      para({ text: 'after retained break mark' }),
+    ];
+    const pages = layoutPages(body, section(), makeCtx());
+
+    expect(pages).toHaveLength(3);
+    expect(pages[0]!.layers.body).toHaveLength(4);
+    expect(pages[1]!.layers.body).toHaveLength(1);
+    const retainedMark = pages[1]!.layers.body[0];
+    expect(retainedMark?.kind).toBe('paragraph');
+    expect(retainedMark?.advancePt).toBeCloseTo(30, 8);
+    if (retainedMark?.kind === 'paragraph') {
+      expect(retainedMark.spacing.afterPt).toBe(10);
+    }
+    expect(pages[2]!.layers.body).toHaveLength(1);
+  });
 });
 
 describe('layoutPages — tall header/footer reserve indexing (§17.6.11)', () => {
