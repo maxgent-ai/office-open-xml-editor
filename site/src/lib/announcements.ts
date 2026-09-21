@@ -36,6 +36,69 @@ export interface Announcement {
 
 export const announcements: readonly Announcement[] = [
   {
+    slug: 'v088-chart-fidelity-and-safer-word-layout',
+    date: '2026-09-21',
+    label: 'Release note',
+    version: 'v0.88.0',
+    title: 'More faithful charts and safer Word layout in v0.88.0',
+    summary: 'v0.88.0 brings classic Office charts closer to their authored appearance across Word, Excel and PowerPoint, while bounding runaway keep-with-next pagination in complex Word documents.',
+    audience: 'Applications that display Office charts, complex Word documents, presentation SVGs or multilingual PowerPoint text. Most Viewer integrations can upgrade without code changes.',
+    sections: [
+      {
+        title: 'In short',
+        kind: 'summary',
+        paragraphs: [
+          'This release concentrates on visual fidelity and dependable viewing. Classic charts now follow the built-in Office styles more closely across all three formats, and Word layout stays bounded when a document contains unusually long groups that must remain together.',
+        ],
+        bullets: [
+          'Render classic chart frames, colours, fills, outlines, labels and effects more like the Office host that authored them.',
+          'Bound repeated keep-with-next pagination work before it can exhaust browser memory.',
+          'Preserve PowerPoint SVG artwork when its compatibility image is unavailable.',
+          'Prepare the selected regional CJK fallback font consistently in PowerPoint main-thread loading.',
+        ],
+      },
+      {
+        title: 'Classic charts across Word, Excel and PowerPoint',
+        modules: ['DOCX', 'XLSX', 'PPTX'],
+        paragraphs: [
+          'Classic charts now resolve the built-in numeric style range 1 through 48 while retaining each host application\'s visual conventions. Chart frames, automatic text contrast, series and point styling, picture fills, markers, labels, legends, axes and three-dimensional surfaces all keep authored formatting ahead of built-in style defaults.',
+          'The change is intentionally visible in affected documents. Existing charts may gain the frame, palette, text contrast, transparency or outline that Word, Excel or PowerPoint applies to the saved style. Direct formatting and linked chart styles remain authoritative, and ChartEx continues through its existing optional entry point.',
+        ],
+      },
+      {
+        title: 'Safer and more faithful Word layout',
+        modules: ['DOCX', 'Node'],
+        paragraphs: [
+          'Word documents with very long keep-with-next groups now stop speculative measurement once the group cannot fit on a fresh page. Paragraph layout also keeps a bounded working set and fails with a layout diagnostic if repeated acquisition exceeds its operational limit, instead of continuing until the browser or Node process runs out of memory.',
+          'Default paragraph and table styles now participate in inheritance for every valid on/off form.',
+        ],
+      },
+      {
+        title: 'Presentation and spreadsheet details',
+        modules: ['PPTX', 'XLSX'],
+        paragraphs: [
+          'PowerPoint image-filled shapes can use their SVG source when the older compatibility raster is missing or unreadable. If neither source resolves, the authored image fill remains transparent instead of turning into an unrelated solid fill. When Google Fonts loading is enabled, main-thread PowerPoint loading also prepares the selected regional CJK fallback family, matching the other loading modes.',
+          'The built-in Excel zoom slider now settles naturally on its 100% centre mark when dragged nearby, while continuous zoom remains available immediately outside that small attraction zone. Programmatic zoom and the existing buttons and wheel controls keep their previous behaviour.',
+        ],
+      },
+      {
+        title: 'Upgrading',
+        paragraphs: [
+          'No public option or method is removed or renamed, and most Viewer integrations require no code changes. The release intentionally changes rendering for documents that rely on corrected Office chart styles, Word layout rules, SVG fallbacks or regional CJK font selection. Applications with pixel baselines should review those differences against the authored document or an Office-produced reference instead of expecting every pixel to match v0.87.0.',
+          'Applications that implement a custom chart renderer against the low-level public chart model should review the added optional style data and the broader image-capable fill type. Built-in chart rendering requires no setup change.',
+          'The Word layout limits apply only after unusually repeated acquisition work. Ordinary documents keep the same loading contract; a document that exceeds the limit now reports non-convergence instead of consuming memory without a bound.',
+        ],
+      },
+      {
+        title: 'Technical note',
+        paragraphs: [
+          'The public chart model gains optional style and effect metadata, and a small number of paint fields accept the broader Fill union so picture fills can retain their authored form. Viewer integrations need no changes. Applications that exhaustively match the low-level chart model should account for the added optional data and image-fill case when upgrading.',
+          'Word paragraph acquisition now uses bounded internal caching and a pagination-scoped operational budget. Pathological repeated work fails with a NON_CONVERGENCE layout diagnostic instead of continuing to consume memory without a bound. The safety boundary does not change the successful layout contract for ordinary documents.',
+        ],
+      },
+    ],
+  },
+  {
     slug: 'v087-regional-cjk-fallbacks',
     date: '2026-09-13',
     label: 'Release note',
