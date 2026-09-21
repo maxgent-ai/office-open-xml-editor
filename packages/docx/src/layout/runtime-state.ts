@@ -94,6 +94,8 @@ export interface ParagraphAcquisitionRuntimeCache {
 
 /**
  * Fail closed before cache-missed paragraph acquisition can exhaust the host.
+ * One pagination session may incur 25,000 misses; miss 25,001 throws
+ * NON_CONVERGENCE. Each paragraph retains only its two most recent placements.
  * The budget belongs to the pagination cache scope so field-convergence service
  * views cannot reset it while sharing the same retained acquisition values.
  */
