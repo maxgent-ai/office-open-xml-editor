@@ -4267,6 +4267,7 @@ export function acquireParagraphResult(
     ? undefined
     : cache!.get(paragraph, cacheKey) as AcquiredParagraphResult | undefined;
   if (cached) return cached;
+  cache?.noteMiss();
   const externallyOwnedOccurrenceIds = externalExclusionOccurrenceIds(options.exclusions);
   const occurrenceIds = new Set(paragraph.runs.flatMap((run) =>
     anchoredPayloadRun(run) ? [run.anchorAcquisitionInput!.occurrenceId] : []));

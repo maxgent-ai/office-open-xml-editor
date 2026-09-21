@@ -1315,6 +1315,14 @@ function* paginateBodyPassSteps(
               hasTerminalBlock = true;
               break;
             }
+            // The existing admission branch below can relocate only a
+            // complete keep set whose total charge fits a fresh page. Once
+            // the running block extent alone exceeds that bound, the branch
+            // cannot be taken and measuring the rest of the chain is wasted
+            // work. Long keep-with-next chains otherwise re-measure the shared
+            // tail once per member, which is effectively unbounded on
+            // pathological documents.
+            if (keepSetExtentPt > freshPageExtent(state)) break;
           }
           const keepSetReservePt = footnoteAdmissionForIds(
             [...keepSetReferenceIds],

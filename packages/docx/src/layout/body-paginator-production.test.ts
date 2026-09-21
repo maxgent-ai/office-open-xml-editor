@@ -207,6 +207,57 @@ describe('canonical body producer', () => {
     expect(Object.isFrozen(layout)).toBe(true);
   });
 
+  it('stops keep-with-next preflight once the set cannot fit a fresh page', () => {
+    const services = Object.freeze({
+      text: { fingerprint: 'text' }, images: { fingerprint: 'images' }, math: { fingerprint: 'math' },
+    }) as LayoutServices;
+    // 200 indivisible 10pt keepNext blocks; the 80pt body extent fits 8 per
+    // page. Without an early exit every block's preflight re-measures the
+    // whole remaining tail (~19900 following-block measurements).
+    const layouts = Array.from({ length: 200 }, (_, index) => paragraph(`p${index}`, source(index), 10));
+    let followingMeasurements = 0;
+    const kernel: SyntheticBodyLayoutKernel = {
+      openBodyLayoutSession: () => ({
+        hasPaginationFields: false,
+        measureParagraph: ({ input }) => ({
+          layout: layouts[input.source.path[0]!]!, blockExtentPt: 10, fragmentation: { kind: 'indivisible' },
+        }),
+        measureTable: () => { throw new Error('unused'); },
+        measureStoryExtent: () => 0,
+        measureFootnoteReserve: () => 0,
+        measureFollowingBlock: () => {
+          followingMeasurements += 1;
+          return { fullExtentPt: 10, leadContentExtentPt: 10 };
+        },
+        measureLineNumberGlyph: () => ({ widthPt: 0, ascentPt: 0, descentPt: 0 }),
+        resetPageAcquisition: () => undefined,
+        moveAcquisitionCursor: () => undefined,
+        flowRegistrySnapshot: emptyFlowRegistrySnapshot,
+        commitFlowRegistryDelta: () => undefined,
+      }),
+    };
+    attachBodyLayoutKernel(services, kernel);
+    const input: BodyLayoutInput = {
+      source: { story: 'body', storyInstance: 'body', path: [] },
+      initialSection: bodyOwner(),
+      sequence: layouts.map((_, index) => ({
+        kind: 'body-block' as const,
+        block: {
+          kind: 'paragraph' as const, source: source(index), pageBreakBefore: false,
+          keepLines: false, keepNext: true, widowControl: true,
+          spaceBeforePt: 0, spaceAfterPt: 0, contextualSpacing: false, styleId: null,
+        },
+      })),
+    };
+
+    const layout = paginateBody(input, services, { currentDateMs: 0 });
+
+    // Each preflight stops after one fresh page of following blocks (8 x 10pt),
+    // so the total stays far below the quadratic full-tail scan (~19900).
+    expect(followingMeasurements).toBeLessThan(1600);
+    expect(layout.pages.length).toBeGreaterThan(1);
+  });
+
   it('retains one canonical boundary across collapsed fractional paragraph spacing', () => {
     const services = Object.freeze({
       text: { fingerprint: 'text' }, images: { fingerprint: 'images' }, math: { fingerprint: 'math' },
