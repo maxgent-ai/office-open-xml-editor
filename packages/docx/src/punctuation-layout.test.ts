@@ -578,7 +578,7 @@ describe('ECMA-376 East-Asian punctuation fit', () => {
     expect(lines(middleDot, 375, false)).toHaveLength(2);
   });
 
-  it('hangs closing punctuation in Latin and East Asian, but not complex-script, parent runs', () => {
+  it('uses the bidi language boundary for complex-script closing punctuation', () => {
     const latin = buildSegments([textRun('A B.', 'en-us')], {
       pageIndex: 0,
       totalPages: 1,
@@ -604,6 +604,17 @@ describe('ECMA-376 East-Asian punctuation fit', () => {
     expect(wordIsOverflowPunctuation('.', 'en-us', false, true)).toBe(true);
     expect(wordIsOverflowPunctuation('}', undefined, false, true)).toBe(true);
     expect(wordIsOverflowPunctuation('.', 'ar-sa', false, false)).toBe(false);
+    expect(wordIsOverflowPunctuation('.', 'en-us', false, false, true, undefined)).toBe(true);
+    expect(wordIsOverflowPunctuation(':', 'en-us', false, false, true, 'en-us')).toBe(true);
+    expect(wordIsOverflowPunctuation(')', 'en-us', false, false, true, 'ar-sa')).toBe(false);
+
+    const complex = (bidiLanguage?: string) => buildSegments([{
+      ...textRun('اب.', 'en-us'),
+      rtl: true,
+      langBidi: bidiLanguage,
+    } as DocParagraph['runs'][number]], { pageIndex: 0, totalPages: 1 });
+    expect(lines(complex(), 20, true).map(textOf)).toEqual(['اب.']);
+    expect(lines(complex('ar-sa'), 20, true).map(textOf)).toEqual(['اب', '.']);
   });
 
   it('finds the final visible punctuation before a collapsible separator', () => {

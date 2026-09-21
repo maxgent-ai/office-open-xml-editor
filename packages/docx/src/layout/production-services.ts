@@ -31,10 +31,7 @@ import {
   type GlyphMeasureRequest,
 } from './text.js';
 import type { LayoutServices } from './types.js';
-import {
-  WORD_CALIBRI_AUTHORED_DESIGN_LINE,
-  wordResolvedEastAsianSingleLineRatio,
-} from './line-compatibility.js';
+import { wordResolvedEastAsianSingleLineRatio } from './line-compatibility.js';
 import type { DocxResolvedFontMetricCandidate } from '../document-content.js';
 
 export interface LoadedFontFaceRecord {
@@ -65,7 +62,6 @@ function canvasResolvedFontMetrics(
   candidates: readonly DocxResolvedFontMetricCandidate[],
   context: MeasurementTextContext | null,
 ): Readonly<Record<string, ResolvedFontMetric>> {
-  void WORD_CALIBRI_AUTHORED_DESIGN_LINE;
   if (!context) return {};
   const metrics: Record<string, ResolvedFontMetric> = {};
   for (const candidate of candidates) {

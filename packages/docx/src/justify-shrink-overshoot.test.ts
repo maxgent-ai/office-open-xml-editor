@@ -11,13 +11,12 @@ import type {
 } from './types';
 
 // Word-observed `both`/`distribute` line-fit behavior (issue #698 PDF) — the
-// unresolved-browser-face compatibility budget (`SPACE_SHRINK_RATIO`) must NOT
-// admit an extra word onto a line that the draw pass will justify. It remains a
-// temporary fallback-width correction on a non-justified line only until the
-// selected measurement face is positively identified. §17.18.44 classifies
-// ST_Jc values but does not mandate this fit gate. A separate per-font bias
-// applies exclusively on justified lines; this synthetic `serif` face has zero
-// bias:
+// Knuth-Plass space-shrink drawable-space tolerance (`SPACE_SHRINK_RATIO`) must
+// NOT admit an extra word onto a line that the draw pass will justify, and must
+// remain available on a line the draw pass treats as non-justified. §17.18.44
+// classifies ST_Jc values but does not mandate this fit gate. A separate per-font
+// bias applies exclusively on justified lines; this synthetic `serif` face has
+// zero bias:
 //
 // - A line that WILL justify (a non-final, non-manual-break line of a
 //   `both`/kashida paragraph, or ANY line of `distribute`/`thaiDistribute`)
@@ -28,8 +27,8 @@ import type {
 //   natural fit rather than pulling up one more word.
 // - A line the draw pass does NOT justify — the paragraph's true last line and a
 //   line ending at a manual `<w:br/>` (§17.3.3.1) under `both`/kashida, and every
-//   line of a non-justified paragraph — may use the fallback-only shrink-fit
-//   correction (`shrinkFitCompression`) when its selected face is unresolved.
+//   line of a non-justified paragraph — is drawn with the shrink-fit compression
+//   the budget promises (`shrinkFitCompression`).
 // - The allowances are exclusive per line: justified lines receive only the
 //   Canvas-vs-Word face bias; non-justified lines receive only drawable trailing-
 //   space shrink. Demo p3/p6 space-collapse evidence shows that adding both
@@ -206,46 +205,6 @@ function gluedFitLines(
     .join(''));
 }
 
-function routedClosingLine(
-  scope: CanvasFontRoute['scope'],
-  advanceMatchesAuthoredFace = false,
-): string[] {
-  const fontRoute = route('Test Face', scope);
-  const segments: LayoutSeg[] = [
-    fitSegment('AAAA ', fontRoute),
-    fitSegment('AAAA ', fontRoute),
-    fitSegment('AAAA ', fontRoute),
-    fitSegment('AAAA', fontRoute),
-  ];
-  if (advanceMatchesAuthoredFace) {
-    for (const segment of segments) {
-      (segment as LayoutTextSeg).advanceMatchesAuthoredFace = true;
-    }
-  }
-  const ctx = makeLinearCanvas().getContext('2d') as CanvasRenderingContext2D;
-  return layoutLines(
-    ctx,
-    segments,
-    COLUMN,
-    0,
-    1,
-    [],
-    undefined,
-    {},
-    undefined,
-    undefined,
-    undefined,
-    36,
-    COLUMN,
-    false,
-    false,
-    false,
-  ).map((line) => line.segments
-    .filter((segment): segment is LayoutTextSeg => 'text' in segment)
-    .map((segment) => segment.text)
-    .join(''));
-}
-
 // Fit arithmetic (linear stub): each "AAAA " token advances 5·12 = 60px, the
 // bare word 48px, its trailing space 12px. Testing the 4th word on a line
 // already holding three tokens: currentWidth = 180, wForFit = 48 ⇒ natural end
@@ -284,17 +243,6 @@ describe('§17.18.44 — per-font advance bias and drawable space shrink', () =>
       expect(lines.length, alignment).toBe(2);
       expect(tokens(lines[0]), alignment).toBe(4); // budget admits the 4th; 5th wraps
     }
-  });
-
-  it('wraps at natural width only when the selected advance matches the authored Word face', () => {
-    // Office-produced boundary: the same marginal closing word wraps once the
-    // selected face's advance is proven compatible with the authored Word face.
-    // Route scope by itself is insufficient: a registered family is merely CSS
-    // identity and may still differ from Word, just like an unprobed native family.
-    expect(routedClosingLine('registered').map(tokens)).toEqual([4]);
-    expect(routedClosingLine('registered', true).map(tokens)).toEqual([3, 1]);
-    expect(routedClosingLine('native', true).map(tokens)).toEqual([3, 1]);
-    expect(routedClosingLine('native').map(tokens)).toEqual([4]);
   });
 
   it("keeps the budget on a `both` paragraph's TRUE LAST line (paint draws it non-justified)", async () => {
