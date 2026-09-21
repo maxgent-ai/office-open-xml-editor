@@ -625,17 +625,6 @@ function hasFollowingInkContent(input: BodyLayoutInput, startIndex: number): boo
   return false;
 }
 
-function nextFlowEntry(
-  input: BodyLayoutInput,
-  startIndex: number,
-): BodyLayoutInput['sequence'][number] | undefined {
-  for (let index = startIndex; index < input.sequence.length; index += 1) {
-    const entry = input.sequence[index]!;
-    if (entry.kind !== 'consume-source') return entry;
-  }
-  return undefined;
-}
-
 function isUndecoratedInklessMark(layout: ParagraphLayout): boolean {
   return layout.paragraphMark !== undefined
     && layout.lines.length === 0
@@ -1268,7 +1257,6 @@ function* paginateBodyPassSteps(
           let keepSetExtentPt = acquired.blockExtentPt;
           const keepSetReferenceIds = new Set(footnoteIdsInRetainedSlice(acquired.layout));
           let hasTerminalBlock = false;
-          let keepSetPreviousParagraph = block;
           let bridgeSuccessor = wordEmptyKeepNextBridgesSuccessor({
             keepNext: block.keepNext,
             inkless: block.inkless === true,
@@ -1282,46 +1270,21 @@ function* paginateBodyPassSteps(
               ? nextEntry
               : nextEntry.block;
             if (nextBlock.kind === 'paragraph' && nextBlock.pageBreakBefore) break;
-            const forceSuppressBefore = nextBlock.kind === 'paragraph'
-              && nextBlock.continuousSectionRole === 'suppress-before';
-            const spacing = nextBlock.kind === 'paragraph'
-              ? paragraphGapAdjustment(
-                  keepSetPreviousParagraph,
-                  nextBlock,
-                  keepSetPreviousParagraph.spaceAfterPt,
-                  forceSuppressBefore ? 0 : nextBlock.spaceBeforePt,
-                )
-              : null;
-            const suppressSpaceBefore = nextBlock.kind === 'paragraph'
-              && (forceSuppressBefore || spacing?.suppressBefore === true);
-            const spacingOverlapPt = nextBlock.kind === 'paragraph'
-              ? nextBlock.continuousSectionRole === 'drop-previous-after'
-                ? keepSetPreviousParagraph.spaceAfterPt
-                : spacing?.overlap ?? 0
-              : 0;
             const following = session.measureFollowingBlock({
               input: nextBlock,
               location,
               availableInlineExtentPt: location.availableBounds.widthPt,
-              suppressSpaceBefore,
             });
             const continues = nextBlock.kind === 'paragraph'
               && (nextBlock.keepNext || bridgeSuccessor);
             bridgeSuccessor = false;
-            const followingExtentPt = continues
+            keepSetExtentPt += continues
               ? following.fullExtentPt
               : following.leadContentExtentPt;
-            // The normal acceptance path backs the cursor over the shared
-            // paragraph gap and tells acquisition whether the successor's
-            // spaceBefore is suppressed. Keep-set preflight must use both parts
-            // of that same contract or a physically fitting heading pair can
-            // be charged twice and relocate.
-            keepSetExtentPt += followingExtentPt - spacingOverlapPt;
             const referenceIds = continues
               ? following.fullFootnoteReferenceIds
               : following.leadFootnoteReferenceIds;
             referenceIds?.forEach((id) => keepSetReferenceIds.add(id));
-            if (nextBlock.kind === 'paragraph') keepSetPreviousParagraph = nextBlock;
             if (!continues) {
               hasTerminalBlock = true;
               break;
@@ -1398,12 +1361,8 @@ function* paginateBodyPassSteps(
           }
         }
         const followingEntry = input.sequence[entryIndex + 1];
-        // Hidden/consumed sources do not own flow. Look through them so a hard
-        // page break still disables trailing-space fit admission for the source
-        // paragraph immediately before that authored transition.
-        const followingFlowEntry = nextFlowEntry(input, entryIndex + 1);
-        const followedByHardPageBreak = followingFlowEntry?.kind === 'authored-break'
-          && followingFlowEntry.break === 'page';
+        const followedByHardPageBreak = followingEntry?.kind === 'authored-break'
+          && followingEntry.break === 'page';
         if (
           cursor.boundary === null
           && followedByHardPageBreak
@@ -1462,7 +1421,6 @@ function* paginateBodyPassSteps(
             keepLines: block.keepLines,
             widowControl: block.widowControl,
             authoredSpaceAfterPt: block.spaceAfterPt,
-            followsHardPageBreak: followedByHardPageBreak,
             writingMode: activeRegion(state).writingMode,
           },
           (fragment) => footnoteAdmission(

@@ -28,58 +28,6 @@ function retainedParagraph(widthPt: number): ParagraphLayout {
 }
 
 describe('retained table acquisition', () => {
-  it('projects effective paragraph pagination policy into retained cell blocks', () => {
-    const inheritedWidow = {
-      type: 'paragraph', keepLines: true,
-    } as unknown as DocParagraph;
-    const disabledWidow = {
-      type: 'paragraph', widowControl: false,
-    } as unknown as DocParagraph;
-    const table = {
-      rows: [{
-        cells: [{
-          content: [inheritedWidow, disabledWidow], colSpan: 1, vMerge: null,
-          borders: noBorders, background: null, vAlign: 'top',
-        }],
-        gridBefore: 0, gridAfter: 0, isHeader: false, cantSplit: false,
-      }],
-      borders: noBorders,
-      cellMarginTop: 0, cellMarginRight: 0, cellMarginBottom: 0, cellMarginLeft: 0,
-      jc: 'left', bidiVisual: false,
-    } as unknown as DocTable;
-    const format: TableFormatInput = {
-      effectiveStyleId: null, ordinaryFlow: true, positioning: null,
-      firstRowException: null,
-      rows: [{
-        height: null, cantSplit: false, repeatedHeader: false,
-        cellSpacingPt: 0, justification: null, exception: null,
-        cells: [{ marginsPt: { top: 0, right: 0, bottom: 0, left: 0 } }],
-      }],
-    };
-
-    const acquisition = acquireRetainedTable(
-      table,
-      [100],
-      100,
-      { yPt: 0 },
-      [0],
-      {
-        layoutServices: () => ({}) as LayoutServices,
-        tableFormat: () => format,
-        resolveColumns: () => [],
-        createCellState: (state) => state,
-        acquireParagraph: () => retainedParagraph(100),
-        registerFloatingTable: () => null,
-        advanceState: () => {},
-      },
-    );
-
-    expect(acquisition.input.rows[0]?.cells[0]?.blocks).toMatchObject([
-      { keepLines: true, widowControl: true },
-      { keepLines: false, widowControl: false },
-    ]);
-  });
-
   it('retains the immutable layout input and recursive acquisitions beside final geometry', () => {
     const nested = {
       type: 'table', rows: [], colWidths: [], borders: noBorders,

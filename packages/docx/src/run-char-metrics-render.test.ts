@@ -246,9 +246,8 @@ describe('WD4 run character metrics reach the glyph draw (measure==paint)', () =
     expect(drawOf(fills, 'عنوان').fontKerning).toBe('none');
   });
 
-  it('disables font kerning when w:kern is absent from the resolved style hierarchy', async () => {
+  it('retains Canvas auto geometry when w:kern is absent from the resolved style hierarchy', async () => {
     const { fills } = await render([textRun('WORD')]);
-    // ECMA-376 §17.3.2.19: when no hierarchy level applies w:kern, kerning is off.
-    expect(drawOf(fills, 'WORD').fontKerning).toBe('none');
+    expect(drawOf(fills, 'WORD').fontKerning).toBe('auto');
   });
 });

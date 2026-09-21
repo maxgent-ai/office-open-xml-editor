@@ -276,9 +276,8 @@ export interface TextShapeRequest {
   readonly eastAsiaFontCharset?: string;
   readonly genericFamily?: 'serif' | 'sans-serif' | 'monospace';
   readonly letterSpacingPt?: number;
-  /** Resolved §17.3.2.19 w:kern state at this run size. WordprocessingML
-   * callers pass false when no hierarchy level applies the property; absence
-   * preserves the adapter policy for non-WordprocessingML text consumers. */
+  /** Resolved §17.3.2.19 w:kern state at this run size. Absence preserves the
+   * measurement adapter's inherited kerning policy, matching the paint path. */
   readonly kerning?: boolean;
   /** Resolve script slots and faces without touching the measurement adapter. */
   readonly measure?: boolean;
@@ -429,18 +428,6 @@ export function snapshotFontMetrics(
         && (!Number.isFinite(metric.lineHeightRatio) || metric.lineHeightRatio < 0)) {
         throw new RangeError(`Font metric ${key} lineHeightRatio must be finite and non-negative`);
       }
-      if (metric.designAscentRatio !== undefined
-        && (!Number.isFinite(metric.designAscentRatio) || metric.designAscentRatio < 0)) {
-        throw new RangeError(`Font metric ${key} designAscentRatio must be finite and non-negative`);
-      }
-      if (metric.designDescentRatio !== undefined
-        && (!Number.isFinite(metric.designDescentRatio) || metric.designDescentRatio < 0)) {
-        throw new RangeError(`Font metric ${key} designDescentRatio must be finite and non-negative`);
-      }
-      if (metric.lineGapRatio !== undefined
-        && (!Number.isFinite(metric.lineGapRatio) || metric.lineGapRatio < 0)) {
-        throw new RangeError(`Font metric ${key} lineGapRatio must be finite and non-negative`);
-      }
       if (metric.eastAsianLineHeightRatio !== undefined
         && (!Number.isFinite(metric.eastAsianLineHeightRatio) || metric.eastAsianLineHeightRatio < 0)) {
         throw new RangeError(`Font metric ${key} eastAsianLineHeightRatio must be finite and non-negative`);
@@ -449,18 +436,6 @@ export function snapshotFontMetrics(
         && (!Number.isFinite(metric.fontBoxRatio) || metric.fontBoxRatio <= 0)) {
         throw new RangeError(`Font metric ${key} fontBoxRatio must be finite and positive`);
       }
-      if (metric.unicodeRanges !== undefined) {
-        let previousEnd = -1;
-        for (const range of metric.unicodeRanges) {
-          if (range.length !== 2 || !Number.isSafeInteger(range[0])
-            || !Number.isSafeInteger(range[1]) || range[0] < 0
-            || range[0] > range[1] || range[1] > 0x10ffff
-            || range[0] <= previousEnd) {
-            throw new RangeError(`Font metric ${key} unicodeRanges must be sorted scalar ranges`);
-          }
-          previousEnd = range[1];
-        }
-      }
       if (metric.weight !== undefined
         && (!Number.isFinite(metric.weight) || metric.weight < 1 || metric.weight > 1000)) {
         throw new RangeError(`Font metric ${key} weight must be finite and between 1 and 1000`);
@@ -468,19 +443,10 @@ export function snapshotFontMetrics(
       const copy: ResolvedFontMetric = {
         family: metric.family,
         ...(metric.lineHeightRatio === undefined ? {} : { lineHeightRatio: metric.lineHeightRatio }),
-        ...(metric.designAscentRatio === undefined
-          ? {} : { designAscentRatio: metric.designAscentRatio }),
-        ...(metric.designDescentRatio === undefined
-          ? {} : { designDescentRatio: metric.designDescentRatio }),
-        ...(metric.lineGapRatio === undefined ? {} : { lineGapRatio: metric.lineGapRatio }),
         ...(metric.eastAsianLineHeightRatio === undefined
           ? {}
           : { eastAsianLineHeightRatio: metric.eastAsianLineHeightRatio }),
         ...(metric.fontBoxRatio === undefined ? {} : { fontBoxRatio: metric.fontBoxRatio }),
-        ...(metric.unicodeRanges === undefined ? {} : {
-          unicodeRanges: Object.freeze(metric.unicodeRanges.map((range) =>
-            Object.freeze([range[0], range[1]] as const))),
-        }),
         ...(metric.requestedFamily === undefined ? {} : { requestedFamily: metric.requestedFamily }),
         ...(metric.weight === undefined ? {} : { weight: metric.weight }),
         ...(metric.style === undefined ? {} : { style: metric.style }),
@@ -575,7 +541,7 @@ function scriptSlot(
   return tableSlot;
 }
 
-export function requestedFontFamilyForSlot(
+function requestedFamily(
   request: Readonly<Pick<TextShapeRequest, 'fonts' | 'themeFonts' | 'themeFontPresence'>>,
   slot: FontScriptSlot,
 ): string | null | undefined {
@@ -619,7 +585,7 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
     genericFamilies,
   });
   const resolve = (request: Readonly<TextFontResolveRequest>): FontResolution => {
-    const authoredFamily = requestedFontFamilyForSlot(request, request.slot);
+    const authoredFamily = requestedFamily(request, request.slot);
     const genericFamily = authoredFamily
       ? genericFamilies[authoredFamily.trim().toLocaleLowerCase('en-US')]
         ?? request.genericFamily
@@ -732,7 +698,7 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
       let start = 0;
       for (const character of request.text) {
         const end = start + character.length;
-        const eastAsiaFamily = requestedFontFamilyForSlot(request, 'eastAsia');
+        const eastAsiaFamily = requestedFamily(request, 'eastAsia');
         const eastAsiaCharset = request.eastAsiaFontCharset
           ?? (eastAsiaFamily
             ? eastAsiaFontCharsets[eastAsiaFamily.trim().toLocaleLowerCase('en-US')]
