@@ -38,7 +38,7 @@ export const announcements: readonly Announcement[] = [
   {
     slug: 'v088-chart-fidelity-and-safer-word-layout',
     date: '2026-09-21',
-    label: 'Upcoming release',
+    label: 'Release note',
     version: 'v0.88.0',
     title: 'More faithful charts and safer Word layout in v0.88.0',
     summary: 'v0.88.0 brings classic Office charts closer to their authored appearance across Word, Excel and PowerPoint, while bounding runaway keep-with-next pagination in complex Word documents.',
@@ -70,7 +70,7 @@ export const announcements: readonly Announcement[] = [
         modules: ['DOCX', 'Node'],
         paragraphs: [
           'Word documents with very long keep-with-next groups now stop speculative measurement once the group cannot fit on a fresh page. Paragraph layout also keeps a bounded working set and fails with a layout diagnostic if repeated acquisition exceeds its operational limit, instead of continuing until the browser or Node process runs out of memory.',
-          'Default paragraph and table styles now participate in inheritance for every valid on/off form. Kerning defaults, fine borders, inline pictures, line spacing, table placement and legacy vertical text boxes also follow the saved Word content more closely.',
+          'Default paragraph and table styles now participate in inheritance for every valid on/off form.',
         ],
       },
       {
