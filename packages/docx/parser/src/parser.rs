@@ -755,11 +755,6 @@ struct DocumentParseEnvironment {
     document_settings: Option<crate::types::DocumentSettings>,
     page_layout_settings: Option<crate::types::PageLayoutSettingsWire>,
     note_layout_settings: Option<crate::types::NoteLayoutSettingsWire>,
-    /// ECMA-376 Part 4 §14.8.3.38. This setting changes which side of a
-    /// terminal run-level page break owns the paragraph mark, so it must be
-    /// available while body elements are normalized rather than deferred to
-    /// layout.
-    split_pg_break_and_para_mark: bool,
     even_and_odd_headers: bool,
 }
 
@@ -865,7 +860,6 @@ fn load_document_parse_environment(zip: &mut Zip) -> DocumentParseEnvironment {
     let mut document_settings: Option<crate::types::DocumentSettings> = None;
     let mut page_layout_settings: Option<crate::types::PageLayoutSettingsWire> = None;
     let mut note_layout_settings: Option<crate::types::NoteLayoutSettingsWire> = None;
-    let mut split_pg_break_and_para_mark = false;
     // §17.10.1 even/odd headers is a settings.xml flag (not a sectPr property), so
     // capture it here and stamp it onto the section below.
     let mut even_and_odd_headers = false;
@@ -876,7 +870,6 @@ fn load_document_parse_environment(zip: &mut Zip) -> DocumentParseEnvironment {
         document_settings = parse_document_settings(&settings_xml);
         page_layout_settings = parse_page_layout_settings(&settings_xml);
         note_layout_settings = parse_note_layout_settings(&settings_xml);
-        split_pg_break_and_para_mark = parse_split_pg_break_and_para_mark(&settings_xml);
         even_and_odd_headers = parse_even_and_odd_headers(&settings_xml);
     }
 
@@ -911,7 +904,6 @@ fn load_document_parse_environment(zip: &mut Zip) -> DocumentParseEnvironment {
         document_settings,
         page_layout_settings,
         note_layout_settings,
-        split_pg_break_and_para_mark,
         even_and_odd_headers,
     }
 }
@@ -1034,7 +1026,6 @@ pub fn parse(zip: &mut Zip) -> Result<Document, String> {
     let media_map = &environment.media_map;
     let chart_map = &environment.chart_map;
     let even_and_odd_headers = environment.even_and_odd_headers;
-    let split_pg_break_and_para_mark = environment.split_pg_break_and_para_mark;
 
     // RB7 partial degradation: `word/document.xml` is the body part. When it
     // can't be read (missing / zip error) or parsed (malformed / a `<w:body>`
@@ -1126,7 +1117,6 @@ pub fn parse(zip: &mut Zip) -> Result<Document, String> {
         rel_map,
         theme,
         &section_hf,
-        split_pg_break_and_para_mark,
     );
     let final_section_ordinal = body
         .iter()
@@ -1259,7 +1249,6 @@ impl DocxBodyCursor {
                 error,
                 theme: Box::new(degraded_theme.clone()),
             })?;
-        let split_pg_break_and_para_mark = environment.split_pg_break_and_para_mark;
         Ok(Self {
             environment: Some(environment),
             plan: preflight.plan,
@@ -1270,9 +1259,7 @@ impl DocxBodyCursor {
             body_headers,
             body_footers,
             projector,
-            semantic: BodyParseCursor::with_split_pg_break_and_para_mark(
-                split_pg_break_and_para_mark,
-            ),
+            semantic: BodyParseCursor::default(),
             diagnostics: Vec::new(),
             revisions: Vec::new(),
             section_cursor: 0,
@@ -1399,7 +1386,10 @@ impl DocxBodyCursor {
 
             if self.pending_cover_break && !body.is_empty() {
                 self.pending_cover_break = false;
-                if !starts_with_page_advancing_construct(&body) {
+                if !matches!(
+                    body.first(),
+                    Some(BodyElement::PageBreak { .. } | BodyElement::SectionBreak { .. })
+                ) {
                     body.insert(
                         0,
                         BodyElement::PageBreak {
@@ -1565,7 +1555,6 @@ fn finish_document(
                 &environment.style_map,
                 &mut environment.num_map,
                 &environment.theme,
-                environment.split_pg_break_and_para_mark,
             )
         })
         .unwrap_or_default();
@@ -1585,7 +1574,6 @@ fn finish_document(
                 &environment.style_map,
                 &mut environment.num_map,
                 &environment.theme,
-                environment.split_pg_break_and_para_mark,
             )
         })
         .unwrap_or_default();
@@ -1895,7 +1883,6 @@ fn parse_notes(
     style_map: &StyleMap,
     num_map: &mut NumberingMap,
     theme: &ThemeColors,
-    split_pg_break_and_para_mark: bool,
 ) -> Vec<crate::types::DocxNote> {
     let Ok(xml) = read_zip_string(zip, path) else {
         return Vec::new();
@@ -1950,7 +1937,6 @@ fn parse_notes(
             theme,
             &HashMap::new(),
             TablePositioningContext::IgnoredStory,
-            split_pg_break_and_para_mark,
             None,
         );
         out.push(crate::types::DocxNote { id, content });
@@ -2474,25 +2460,6 @@ fn parse_document_settings(settings_xml: &str) -> Option<crate::types::DocumentS
     })
 }
 
-/// ECMA-376 Part 4 §14.8.3.38 `w:splitPgBreakAndParaMark` controls the
-/// paragraph mark that follows a terminal run-level page break. Absent or
-/// false keeps the mark on the page containing the break; true moves it to a
-/// new line on the following page. Keep this parser-private: body
-/// normalization expresses the settled ordering directly as ordinary retained
-/// elements, so layout does not need a second compatibility-policy branch.
-fn parse_split_pg_break_and_para_mark(settings_xml: &str) -> bool {
-    let Ok(doc) = parse_guarded(settings_xml) else {
-        return false;
-    };
-    let compat = doc
-        .root_element()
-        .children()
-        .find(|node| node.is_element() && node.tag_name().name() == "compat");
-    compat
-        .and_then(|node| bool_prop(node, "splitPgBreakAndParaMark"))
-        .unwrap_or(false)
-}
-
 fn find_rel_target(rels_xml: &str, type_suffix: &str) -> Option<String> {
     if rels_xml.is_empty() {
         return None;
@@ -2991,7 +2958,6 @@ fn parse_body_elements(
         theme,
         section_hf,
         TablePositioningContext::Normal,
-        false,
         None,
     )
 }
@@ -3006,7 +2972,6 @@ fn parse_body_elements_with_diagnostics(
     rel_map: &HashMap<String, String>,
     theme: &ThemeColors,
     section_hf: &HashMap<roxmltree::NodeId, ResolvedSectionHf>,
-    split_pg_break_and_para_mark: bool,
 ) -> (Vec<BodyElement>, Vec<ParseDiagnostic>) {
     let mut diagnostics = Vec::new();
     let body = parse_body_elements_in_story(
@@ -3019,7 +2984,6 @@ fn parse_body_elements_with_diagnostics(
         theme,
         section_hf,
         TablePositioningContext::Normal,
-        split_pg_break_and_para_mark,
         Some(&mut diagnostics),
     );
     (body, diagnostics)
@@ -3199,16 +3163,6 @@ fn logical_table_sequence_contexts(
 struct BodyParseCursor {
     field: FieldState,
     section_ordinal: usize,
-    split_pg_break_and_para_mark: bool,
-}
-
-impl BodyParseCursor {
-    fn with_split_pg_break_and_para_mark(enabled: bool) -> Self {
-        Self {
-            split_pg_break_and_para_mark: enabled,
-            ..Self::default()
-        }
-    }
 }
 
 impl BodyParseCursor {
@@ -3245,58 +3199,21 @@ impl BodyParseCursor {
                     &mut self.field,
                     &mut child_diagnostics,
                 );
-                let lone_column_break = if result.runs.len() == 1 {
-                    matches!(
-                        &result.runs[0],
+                let lone_break = if result.runs.len() == 1 {
+                    match &result.runs[0] {
+                        DocRun::Break {
+                            break_type: BreakType::Page,
+                        } => Some(BreakType::Page),
                         DocRun::Break {
                             break_type: BreakType::Column,
-                        }
-                    )
+                        } => Some(BreakType::Column),
+                        _ => None,
+                    }
                 } else {
-                    false
+                    None
                 };
                 let paragraph_sect_pr =
                     child_w(child, "pPr").and_then(|ppr| child_w(ppr, "sectPr"));
-                // Part 4 §14.8.3.38 applies to every terminal page break, but
-                // this normalization is intentionally limited to one pure page
-                // break under the absent/false setting. That observed target is
-                // exactly representable as Paragraph(mark), PageBreak.
-                // `splitPgBreakAndParaMark=true`, multiple breaks, and
-                // pageBreakBefore require separate paragraph-start, run-break,
-                // and terminal-mark ownership: moving a full Paragraph after a
-                // break would wrongly move spaceBefore/borders/shading with the
-                // mark, while moving it before would violate the enabled
-                // setting. Those cases remain on the established path until a
-                // fragment/event model can express that ownership. Mixed-content paragraphs continue through
-                // `split_para_on_page_breaks`; broadening their existing chunk
-                // and spacing ownership requires a separate model because each
-                // visible chunk is currently a retained paragraph. A sectPr
-                // remains on the established path as well: whether its section
-                // transition can replace the terminal run break depends on
-                // mark ownership and section type. These structural gates avoid
-                // changing either class on break-only evidence alone.
-                let pure_single_page_break = paragraph_sect_pr.is_none()
-                    && !self.split_pg_break_and_para_mark
-                    && !result.page_break_before
-                    // Complex-field state is indexed to source-run boundaries;
-                    // do not discard or relocate it through the mark-only
-                    // normalization until terminal-field ownership is modeled.
-                    && result.complex_field_boundaries.is_empty()
-                    && result.runs.len() == 1
-                    && matches!(
-                        result.runs[0],
-                        DocRun::Break {
-                            break_type: BreakType::Page
-                        }
-                    );
-                let lone_page_break_with_section = paragraph_sect_pr.is_some()
-                    && result.runs.len() == 1
-                    && matches!(
-                        result.runs[0],
-                        DocRun::Break {
-                            break_type: BreakType::Page
-                        }
-                    );
                 let mut push_section_break = |output: &mut Vec<BodyElement>| {
                     if let Some(sect_pr) = paragraph_sect_pr {
                         output.push(section_break_element(
@@ -3307,35 +3224,16 @@ impl BodyParseCursor {
                         self.section_ordinal += 1;
                     }
                 };
-                match (pure_single_page_break, lone_page_break_with_section) {
-                    (true, _) => {
-                        let mut paragraph_mark = result;
-                        paragraph_mark.runs.clear();
-                        // `run_revisions` is a parser-private one-to-one
-                        // sidecar for `runs`; retaining entries after converting
-                        // the source runs into a mark-only paragraph would emit
-                        // an internally inconsistent model.
-                        paragraph_mark.run_revisions.clear();
-                        paragraph_mark.complex_field_boundaries.clear();
-                        let paragraph_mark = BodyElement::Paragraph(Box::new(paragraph_mark));
-                        let push_page_break = |output: &mut Vec<BodyElement>| {
-                            output.push(BodyElement::PageBreak {
-                                parity: None,
-                                same_paragraph_as_previous: None,
-                            });
-                        };
-
-                        // Absent/false: the resolved mark line and pPr spacing
-                        // stay on the page containing the terminal break,
-                        // immediately before that transition.
-                        output.push(paragraph_mark);
-                        push_page_break(&mut output);
-                    }
-                    (false, true) => {
-                        // Preserve the established section-boundary
-                        // normalization outside the break-only mark gate. A
-                        // page-advancing section transition subsumes the lone
-                        // run break; continuous/nextColumn sections retain it.
+                match lone_break {
+                    Some(BreakType::Page) => {
+                        // §17.6.17 + §17.18.77: sectPr on this paragraph is
+                        // still the section terminator even when the paragraph's
+                        // only run is normalized away as a hard break. A
+                        // page-advancing section mark already provides the same
+                        // physical transition, so retaining both would create a
+                        // spurious blank page. `continuous` and `nextColumn` do
+                        // not subsume the authored page break and therefore keep
+                        // both events in source order.
                         let section_subsumes_page_break =
                             paragraph_sect_pr.is_some_and(|sect_pr| {
                                 !matches!(
@@ -3351,11 +3249,11 @@ impl BodyParseCursor {
                         }
                         push_section_break(&mut output);
                     }
-                    (false, false) if lone_column_break => {
+                    Some(BreakType::Column) => {
                         output.push(BodyElement::ColumnBreak);
                         push_section_break(&mut output);
                     }
-                    (false, false) => {
+                    _ => {
                         for piece in split_para_on_page_breaks(result) {
                             match piece {
                                 ParaPiece::Para(paragraph) => {
@@ -3426,12 +3324,10 @@ fn parse_body_elements_in_story(
     theme: &ThemeColors,
     section_hf: &HashMap<roxmltree::NodeId, ResolvedSectionHf>,
     table_positioning_context: TablePositioningContext,
-    split_pg_break_and_para_mark: bool,
     mut diagnostics: Option<&mut Vec<ParseDiagnostic>>,
 ) -> Vec<BodyElement> {
     let mut body: Vec<BodyElement> = Vec::new();
-    let mut cursor =
-        BodyParseCursor::with_split_pg_break_and_para_mark(split_pg_break_and_para_mark);
+    let mut cursor = BodyParseCursor::default();
     // The body-level sectPr (the last element) defines the final section and
     // is not a page break. Mid-body sectPrs (nested in pPr) DO imply a page break.
     // The walk also flags the end of any "Cover Pages" building block so the
@@ -3609,8 +3505,7 @@ fn collect_text_effect_diagnostic(
 /// Drop a cover's synthetic page break (emitted at `cover_break_positions` by the
 /// `parse_body_elements` walk) when the cover's content ALREADY ends in a hard
 /// `<w:br w:type="page"/>`, or is immediately followed by a page-advancing
-/// construct — a PageBreak, a retained break-only paragraph mark followed by
-/// its PageBreak, or a section boundary. In either case the cover stands
+/// construct — a PageBreak or section boundary. In either case the cover stands
 /// alone via that construct, and the extra page break would leave a spurious BLANK page
 /// between the cover and the body (the renderer's pageBreak / page-advancing
 /// sectionBreak handlers push a page unconditionally — only `newPage()` coalesces
@@ -3642,7 +3537,10 @@ fn apply_cover_page_breaks(
                 .and_then(|index| body.get(index))
                 .is_some_and(|element| matches!(element, BodyElement::PageBreak { .. }));
             cover_ends_with_hard_break
-                || starts_with_page_advancing_construct(body.get(pos + 1..).unwrap_or_default())
+                || matches!(
+                    body.get(pos + 1),
+                    Some(BodyElement::PageBreak { .. }) | Some(BodyElement::SectionBreak { .. })
+                )
         })
         .collect();
     if drop.is_empty() {
@@ -3665,25 +3563,6 @@ fn apply_cover_page_breaks(
         .filter(|(i, _)| !drop.contains(i))
         .map(|(_, e)| e)
         .collect()
-}
-
-/// A retained break-only paragraph is represented as its ordinary mark block
-/// plus the authored break. Treat that pair as one page-advancing construct
-/// when de-duplicating the synthetic Cover Pages transition; otherwise the
-/// synthetic break would be inserted between the cover and the mark and create
-/// a blank page. This predicate is shared by materialized and streamed parsing
-/// so their body sequences cannot diverge.
-fn starts_with_page_advancing_construct(body: &[BodyElement]) -> bool {
-    matches!(
-        body.first(),
-        Some(BodyElement::PageBreak { .. } | BodyElement::SectionBreak { .. })
-    ) || matches!(
-        (body.first(), body.get(1)),
-        (
-            Some(BodyElement::Paragraph(paragraph)),
-            Some(BodyElement::PageBreak { .. })
-        ) if paragraph.runs.is_empty()
-    )
 }
 
 // Short-lived intermediate consumed immediately by the caller into BodyElement;
@@ -16948,24 +16827,6 @@ mod math_jc_tests {
         assert!(parse_document_settings(empty).is_none());
     }
 
-    #[test]
-    fn split_page_break_and_paragraph_mark_reads_on_off_and_absent() {
-        let settings = |value: &str| {
-            format!(
-                r#"<w:settings xmlns:w="{ns}"><w:compat>{value}</w:compat></w:settings>"#,
-                ns = W_NS,
-            )
-        };
-
-        assert!(parse_split_pg_break_and_para_mark(&settings(
-            "<w:splitPgBreakAndParaMark/>"
-        )));
-        assert!(!parse_split_pg_break_and_para_mark(&settings(
-            r#"<w:splitPgBreakAndParaMark w:val="false"/>"#
-        )));
-        assert!(!parse_split_pg_break_and_para_mark(&settings("")));
-    }
-
     // ECMA-376 §17.15.1.25: `<w:defaultTabStop>` (twips) surfaces as points; its
     // presence alone is enough to materialize DocumentSettings (sample-16 sets 360
     // twips = 18pt). Absence ⇒ None so the renderer applies the 720-twip default.
@@ -21695,13 +21556,6 @@ mod column_tests {
     /// Parse a minimal `<w:body>` document through the real body-parse path so we
     /// can assert how `<w:br w:type="column"/>` is hoisted to BodyElements.
     fn body_from(body_inner: &str) -> Vec<BodyElement> {
-        body_from_with_split_pg_break_and_para_mark(body_inner, false)
-    }
-
-    fn body_from_with_split_pg_break_and_para_mark(
-        body_inner: &str,
-        split_pg_break_and_para_mark: bool,
-    ) -> Vec<BodyElement> {
         let xml = format!(
             r#"<w:document xmlns:w="{ns}"><w:body>{inner}</w:body></w:document>"#,
             ns = W_NS,
@@ -21718,7 +21572,7 @@ mod column_tests {
         let media_map: HashMap<String, String> = HashMap::new();
         let rel_map: HashMap<String, String> = HashMap::new();
         let theme = ThemeColors::default();
-        parse_body_elements_in_story(
+        parse_body_elements(
             body_node,
             &style_map,
             &mut num_map,
@@ -21727,9 +21581,6 @@ mod column_tests {
             &rel_map,
             &theme,
             &HashMap::new(),
-            TablePositioningContext::Normal,
-            split_pg_break_and_para_mark,
-            None,
         )
     }
 
@@ -22149,173 +22000,6 @@ mod column_tests {
         assert!(matches!(body[0], BodyElement::ColumnBreak));
     }
 
-    /// ECMA-376 Part 4 §14.8.3.38 — when
-    /// `w:splitPgBreakAndParaMark` is absent, a terminal page break leaves its
-    /// parent paragraph mark on the page that contains the break. A paragraph
-    /// made only of that break therefore still contributes its resolved mark
-    /// line and paragraph spacing before the authored page transition.
-    #[test]
-    fn page_break_only_paragraph_keeps_its_mark_before_the_break() {
-        let body = body_from(
-            r#"<w:p>
-                 <w:pPr><w:spacing w:before="40" w:after="200"/></w:pPr>
-                 <w:r><w:br w:type="page"/></w:r>
-               </w:p>"#,
-        );
-
-        assert_eq!(body.len(), 2);
-        let BodyElement::Paragraph(mark) = &body[0] else {
-            panic!("paragraph mark must precede an authored page break");
-        };
-        assert!(mark.runs.is_empty());
-        assert_eq!(mark.space_before, 2.0);
-        assert_eq!(mark.space_after, 10.0);
-        assert!(matches!(
-            body[1],
-            BodyElement::PageBreak {
-                same_paragraph_as_previous: None,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn revision_wrapped_break_only_paragraph_clears_its_run_sidecar() {
-        let body = body_from(
-            r#"<w:p>
-                 <w:ins w:id="1" w:author="Author">
-                   <w:r><w:br w:type="page"/></w:r>
-                 </w:ins>
-               </w:p>"#,
-        );
-
-        let BodyElement::Paragraph(mark) = &body[0] else {
-            panic!("paragraph mark must precede the authored page break");
-        };
-        assert!(mark.runs.is_empty());
-        assert!(mark.run_revisions.is_empty());
-        let wire = serde_json::to_value(mark).expect("paragraph mark serializes");
-        assert!(wire.get("__runRevisions").is_none());
-    }
-
-    #[test]
-    fn split_page_break_setting_stays_on_the_existing_terminal_break_path() {
-        let body = body_from_with_split_pg_break_and_para_mark(
-            r#"<w:p>
-                 <w:pPr><w:spacing w:after="200"/></w:pPr>
-                 <w:r><w:br w:type="page"/></w:r>
-               </w:p>"#,
-            true,
-        );
-
-        assert_eq!(body.len(), 1);
-        assert!(matches!(body[0], BodyElement::PageBreak { .. }));
-        assert!(body
-            .iter()
-            .all(|element| !matches!(element, BodyElement::Paragraph(_))));
-    }
-
-    #[test]
-    fn consecutive_break_only_runs_stay_on_the_existing_split_path() {
-        let source = r#"<w:p>
-             <w:pPr><w:spacing w:after="200"/></w:pPr>
-             <w:r><w:br w:type="page"/></w:r>
-             <w:r><w:br w:type="page"/></w:r>
-           </w:p>"#;
-
-        let ordinary = body_from_with_split_pg_break_and_para_mark(source, false);
-        assert_eq!(ordinary.len(), 2);
-        assert!(matches!(ordinary[0], BodyElement::PageBreak { .. }));
-        assert!(matches!(ordinary[1], BodyElement::PageBreak { .. }));
-        assert_eq!(
-            ordinary
-                .iter()
-                .filter(|element| matches!(element, BodyElement::Paragraph(_)))
-                .count(),
-            0,
-        );
-
-        let split = body_from_with_split_pg_break_and_para_mark(source, true);
-        assert_eq!(split.len(), 2);
-        assert!(matches!(split[0], BodyElement::PageBreak { .. }));
-        assert!(matches!(split[1], BodyElement::PageBreak { .. }));
-        assert_eq!(
-            split
-                .iter()
-                .filter(|element| matches!(element, BodyElement::Paragraph(_)))
-                .count(),
-            0,
-        );
-    }
-
-    #[test]
-    fn break_only_mark_gate_does_not_reorder_section_transitions() {
-        let next_page = body_from_with_split_pg_break_and_para_mark(
-            r#"<w:p>
-                 <w:pPr><w:sectPr><w:type w:val="nextPage"/></w:sectPr></w:pPr>
-                 <w:r><w:br w:type="page"/></w:r>
-               </w:p>"#,
-            true,
-        );
-        assert_eq!(next_page.len(), 1);
-        assert!(matches!(next_page[0], BodyElement::SectionBreak { .. }));
-
-        let continuous = body_from_with_split_pg_break_and_para_mark(
-            r#"<w:p>
-                 <w:pPr><w:sectPr><w:type w:val="continuous"/></w:sectPr></w:pPr>
-                 <w:r><w:br w:type="page"/></w:r>
-               </w:p>"#,
-            true,
-        );
-        assert_eq!(continuous.len(), 2);
-        assert!(matches!(continuous[0], BodyElement::PageBreak { .. }));
-        assert!(matches!(continuous[1], BodyElement::SectionBreak { .. }));
-
-        let two_breaks = body_from_with_split_pg_break_and_para_mark(
-            r#"<w:p>
-                 <w:pPr><w:sectPr><w:type w:val="nextPage"/></w:sectPr></w:pPr>
-                 <w:r><w:br w:type="page"/></w:r>
-                 <w:r><w:br w:type="page"/></w:r>
-               </w:p>"#,
-            false,
-        );
-        assert_eq!(two_breaks.len(), 3);
-        assert!(matches!(two_breaks[0], BodyElement::PageBreak { .. }));
-        assert!(matches!(two_breaks[1], BodyElement::PageBreak { .. }));
-        assert!(matches!(two_breaks[2], BodyElement::SectionBreak { .. }));
-        assert!(two_breaks
-            .iter()
-            .all(|element| !matches!(element, BodyElement::Paragraph(_))));
-    }
-
-    #[test]
-    fn page_break_before_break_only_paragraph_stays_on_existing_path() {
-        let body = body_from(
-            r#"<w:p>
-                 <w:pPr><w:pageBreakBefore/><w:spacing w:after="200"/></w:pPr>
-                 <w:r><w:br w:type="page"/></w:r>
-               </w:p>"#,
-        );
-
-        assert_eq!(body.len(), 1);
-        assert!(matches!(body[0], BodyElement::PageBreak { .. }));
-
-        // With Part 4 §14.8.3.38 enabled, the normative order would require a
-        // separate paragraph-start event before the run break and the mark
-        // after it. Keep that combination outside this bounded normalization
-        // instead of producing the tempting but wrong PageBreak→mark(pBB)
-        // sequence, whose pBB becomes idempotent on the fresh page.
-        let split = body_from_with_split_pg_break_and_para_mark(
-            r#"<w:p>
-                 <w:pPr><w:pageBreakBefore/><w:spacing w:after="200"/></w:pPr>
-                 <w:r><w:br w:type="page"/></w:r>
-               </w:p>"#,
-            true,
-        );
-        assert_eq!(split.len(), 1);
-        assert!(matches!(split[0], BodyElement::PageBreak { .. }));
-    }
-
     #[test]
     fn mid_paragraph_column_break_splits_into_para_columnbreak_para() {
         let body = body_from(
@@ -22523,13 +22207,12 @@ mod column_tests {
                <w:p><w:r><w:br w:type="page"/></w:r></w:p>
                <w:p><w:r><w:t>body</w:t></w:r></w:p>"#,
         );
-        // Para(cover), Para(retained mark), PageBreak (the explicit one only),
-        // Para(body) — exactly ONE page break, not two.
-        assert_eq!(body.len(), 4);
+        // Para(cover), PageBreak (the explicit one only), Para(body) — exactly ONE
+        // page break, not two.
+        assert_eq!(body.len(), 3);
         assert!(matches!(body[0], BodyElement::Paragraph(_)));
-        assert!(matches!(body[1], BodyElement::Paragraph(ref mark) if mark.runs.is_empty()));
-        assert!(matches!(body[2], BodyElement::PageBreak { .. }));
-        assert!(matches!(body[3], BodyElement::Paragraph(_)));
+        assert!(matches!(body[1], BodyElement::PageBreak { .. }));
+        assert!(matches!(body[2], BodyElement::Paragraph(_)));
     }
 
     /// A hard page break authored as the cover building block's LAST child also
@@ -22548,13 +22231,11 @@ mod column_tests {
                </w:sdt>
                <w:p><w:r><w:t>body</w:t></w:r></w:p>"#,
         );
-        // Para(cover), Para(retained mark), PageBreak (the authored one only),
-        // Para(body).
-        assert_eq!(body.len(), 4);
+        // Para(cover), PageBreak (the authored one only), Para(body).
+        assert_eq!(body.len(), 3);
         assert!(matches!(body[0], BodyElement::Paragraph(_)));
-        assert!(matches!(body[1], BodyElement::Paragraph(ref mark) if mark.runs.is_empty()));
-        assert!(matches!(body[2], BodyElement::PageBreak { .. }));
-        assert!(matches!(body[3], BodyElement::Paragraph(_)));
+        assert!(matches!(body[1], BodyElement::PageBreak { .. }));
+        assert!(matches!(body[2], BodyElement::Paragraph(_)));
     }
 
     /// Likewise when the cover is immediately followed by a section boundary: the

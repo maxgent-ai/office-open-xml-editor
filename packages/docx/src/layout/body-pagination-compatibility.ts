@@ -79,7 +79,7 @@ export const WORD_TRAILING_SPACE_AFTER_FIT_ADMISSION = defineCompatibilityRule({
     kind: 'regression-test',
     reference: 'packages/docx/src/layout/paragraph-pagination.test.ts#admits final visible content when only authored spaceAfter crosses the region edge',
   },
-  description: 'Admit the final visible paragraph content at a flow-region edge when only its authored trailing space crosses the edge and ordinary content flow follows, while retaining that space for placement and paint. An immediately following authored page break instead requires the complete mark and trailing space to fit before that forced transition.',
+  description: 'Admit the final visible paragraph content at a flow-region edge when only its authored trailing space crosses the edge, while retaining that space for placement and paint.',
 });
 
 export const WORD_VERTICAL_RL_FINAL_LINE_BASELINE_ADMISSION = defineCompatibilityRule({

@@ -625,17 +625,6 @@ function hasFollowingInkContent(input: BodyLayoutInput, startIndex: number): boo
   return false;
 }
 
-function nextFlowEntry(
-  input: BodyLayoutInput,
-  startIndex: number,
-): BodyLayoutInput['sequence'][number] | undefined {
-  for (let index = startIndex; index < input.sequence.length; index += 1) {
-    const entry = input.sequence[index]!;
-    if (entry.kind !== 'consume-source') return entry;
-  }
-  return undefined;
-}
-
 function isUndecoratedInklessMark(layout: ParagraphLayout): boolean {
   return layout.paragraphMark !== undefined
     && layout.lines.length === 0
@@ -1372,12 +1361,8 @@ function* paginateBodyPassSteps(
           }
         }
         const followingEntry = input.sequence[entryIndex + 1];
-        // Hidden/consumed sources do not own flow. Look through them so a hard
-        // page break still disables trailing-space fit admission for the source
-        // paragraph immediately before that authored transition.
-        const followingFlowEntry = nextFlowEntry(input, entryIndex + 1);
-        const followedByHardPageBreak = followingFlowEntry?.kind === 'authored-break'
-          && followingFlowEntry.break === 'page';
+        const followedByHardPageBreak = followingEntry?.kind === 'authored-break'
+          && followingEntry.break === 'page';
         if (
           cursor.boundary === null
           && followedByHardPageBreak
@@ -1436,7 +1421,6 @@ function* paginateBodyPassSteps(
             keepLines: block.keepLines,
             widowControl: block.widowControl,
             authoredSpaceAfterPt: block.spaceAfterPt,
-            followsHardPageBreak: followedByHardPageBreak,
             writingMode: activeRegion(state).writingMode,
           },
           (fragment) => footnoteAdmission(
