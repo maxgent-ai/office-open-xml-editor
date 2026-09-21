@@ -67,10 +67,7 @@ function canvasResolvedFontMetrics(
   for (const candidate of candidates) {
     const family = candidate.family.trim();
     if (!family) continue;
-    const familyKey = normalizeFontMetricFamily(family);
-    const key = candidate.weight === 400 && candidate.style === 'normal'
-      ? familyKey
-      : `${familyKey}:${candidate.weight}:${candidate.style}`;
+    const key = normalizeFontMetricFamily(family);
     if (metrics[key]) continue;
     // The document-content projection proves this family actually wins a
     // rendered script slot. Equal selected/control glyph ink means Canvas
@@ -78,42 +75,16 @@ function canvasResolvedFontMetrics(
     const fontBoxRatio = measureResolvedCanvasFontBoxRatio(
       context,
       family,
-      {
-        text: candidate.probeText,
-        emPx: 100,
-        weight: candidate.weight,
-        style: candidate.style,
-      },
+      { text: candidate.probeText, emPx: 100 },
     );
     if (!(fontBoxRatio != null && fontBoxRatio > 0)) continue;
-    if (familyKey === 'calibri') {
-      // `word-calibri-authored-design-line`, bounded to a face that the Canvas
-      // probe proved was actually selected. Calibri Regular,
-      // Bold, Italic and Bold Italic all have hhea ascent=1950, descent=-550,
-      // lineGap=0 at 2048 UPM, hence (1950 - -550 + 0) / 2048 em. Applying
-      // this by authored name or from a different face tuple is incorrect when
-      // the browser silently substitutes a fallback for that weight/style.
-      metrics[key] = Object.freeze({
-        family,
-        requestedFamily: family,
-        weight: candidate.weight,
-        style: candidate.style,
-        sourceIdentity: candidate.weight === 400 && candidate.style === 'normal'
-          ? `canvas-resolved:${family}`
-          : `canvas-resolved:${family}:${candidate.weight}:${candidate.style}`,
-        synthesized: false,
-        fontBoxRatio,
-        lineHeightRatio: 2500 / 2048,
-      });
-      continue;
-    }
     const eastAsianLineHeightRatio = wordResolvedEastAsianSingleLineRatio(fontBoxRatio);
     if (!(eastAsianLineHeightRatio > 0)) continue;
     metrics[key] = Object.freeze({
       family,
       requestedFamily: family,
-      weight: candidate.weight,
-      style: candidate.style,
+      weight: 400,
+      style: 'normal',
       sourceIdentity: `canvas-resolved:${family}`,
       synthesized: false,
       fontBoxRatio,

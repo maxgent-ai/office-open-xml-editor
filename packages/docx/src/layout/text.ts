@@ -575,7 +575,7 @@ function scriptSlot(
   return tableSlot;
 }
 
-export function requestedFontFamilyForSlot(
+function requestedFamily(
   request: Readonly<Pick<TextShapeRequest, 'fonts' | 'themeFonts' | 'themeFontPresence'>>,
   slot: FontScriptSlot,
 ): string | null | undefined {
@@ -619,7 +619,7 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
     genericFamilies,
   });
   const resolve = (request: Readonly<TextFontResolveRequest>): FontResolution => {
-    const authoredFamily = requestedFontFamilyForSlot(request, request.slot);
+    const authoredFamily = requestedFamily(request, request.slot);
     const genericFamily = authoredFamily
       ? genericFamilies[authoredFamily.trim().toLocaleLowerCase('en-US')]
         ?? request.genericFamily
@@ -732,7 +732,7 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
       let start = 0;
       for (const character of request.text) {
         const end = start + character.length;
-        const eastAsiaFamily = requestedFontFamilyForSlot(request, 'eastAsia');
+        const eastAsiaFamily = requestedFamily(request, 'eastAsia');
         const eastAsiaCharset = request.eastAsiaFontCharset
           ?? (eastAsiaFamily
             ? eastAsiaFontCharsets[eastAsiaFamily.trim().toLocaleLowerCase('en-US')]
