@@ -239,6 +239,22 @@ describe('paragraph acquisition cache', () => {
     expect(second).not.toBe(first);
   });
 
+  it('retains only the two most recent placements for one paragraph input', () => {
+    const services = scopedServices();
+    const input = paragraphAcquisitionInput(textParagraph(), source);
+    const at = (startYPt: number) => acquireParagraphResult(input, options(services, {
+      placement: { ...options(services).placement, startYPt },
+    }));
+
+    const first = at(72);
+    const second = at(73);
+    expect(at(72)).toBe(first);
+    at(74);
+
+    expect(at(72)).toBe(first);
+    expect(at(73)).not.toBe(second);
+  });
+
   it('keys every value that can change acquisition output', () => {
     const services = scopedServices();
     const cache = paragraphAcquisitionCacheOf(services);

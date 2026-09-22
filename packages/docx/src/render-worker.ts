@@ -38,7 +38,6 @@ import { prepareMathRuns, renderLayoutSourceToCanvas } from './renderer';
 import { createLayoutServices } from './layout-runtime.js';
 import { DOCX_GOOGLE_FONTS, docxFontPreloadNames } from './google-fonts';
 import { loadEmbeddedFonts } from './embedded-fonts';
-import { loadDocxFontResources } from './font-resources.js';
 import { docxResolvedFontMetricCandidates } from './document-content.js';
 import type {
   RenderWorkerResponse,
@@ -106,7 +105,6 @@ const LAYOUT_PROGRESS_POST_INTERVAL_MS = 100;
 let renderers: LoadedWorkerRenderers = {};
 let googleFontFaces: FontFace[] = [];
 let embeddedFontFaces: FontFace[] = [];
-let providedFontFaces: FontFace[] = [];
 const rawParts = new BoundedRawPartCache({
   maxEntries: HARD_MAX_RAW_PART_CACHE_ENTRIES,
   maxBytes: HARD_MAX_RAW_PART_CACHE_BYTES,
@@ -185,10 +183,6 @@ self.onmessage = async (e: MessageEvent<RenderWorkerWireRequest | WorkerSvgDecod
         unregisterEmbeddedFonts(embeddedFontFaces);
         embeddedFontFaces = [];
       }
-      if (providedFontFaces.length > 0) {
-        unregisterEmbeddedFonts(providedFontFaces);
-        providedFontFaces = [];
-      }
       // Cached blobs belong to the previous document; serving them after a
       // re-parse would silently return the wrong file's image.
       rawParts.clear();
@@ -266,8 +260,6 @@ self.onmessage = async (e: MessageEvent<RenderWorkerWireRequest | WorkerSvgDecod
         );
       }
       googleFontFaces = googleFaces;
-      const providedFonts = await loadDocxFontResources(req.fontResources);
-      providedFontFaces = providedFonts.faces;
       // ECMA-376 §17.8.1 / §17.8.3 — register embedded fonts into the worker's
       // FontFaceSet (self.fonts) before pagination measures text. Bytes are read
       // straight from the retained archive (extract_image reads any zip entry).
@@ -284,7 +276,6 @@ self.onmessage = async (e: MessageEvent<RenderWorkerWireRequest | WorkerSvgDecod
         ? await prepareMathRuns(model, renderers.math)
         : undefined;
       const layoutServices = createLayoutServices(source, {
-        localMetrics: providedFonts.metrics,
         fontMetrics: embeddedFonts.metrics,
         measureResolvedFontMetrics: true,
         resolvedFontMetricCandidates: docxResolvedFontMetricCandidates(

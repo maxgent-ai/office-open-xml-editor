@@ -14,23 +14,6 @@ function input(overrides: Partial<TableColumnLayoutInput> = {}): TableColumnLayo
 }
 
 describe('ECMA-376 §17.18.87 table column solver', () => {
-  const completeDxaRow = (
-    firstPt: number,
-    secondPt: number,
-    firstMinimumPt = 0,
-  ) => ({ before: null, after: null, cells: [
-    {
-      columnStart: 0, columnSpan: 1,
-      preferredWidth: { kind: 'dxa' as const, value: firstPt },
-      minContentWidthPt: firstMinimumPt, maxContentWidthPt: firstMinimumPt,
-    },
-    {
-      columnStart: 1, columnSpan: 1,
-      preferredWidth: { kind: 'dxa' as const, value: secondPt },
-      minContentWidthPt: 0, maxContentWidthPt: 0,
-    },
-  ] });
-
   it('constructs a zero-width grid when tblGrid is omitted and extends it for gridSpan', () => {
     expect(resolveTableColumnWidths(input({
       gridWidthsPt: [],
@@ -120,113 +103,6 @@ describe('ECMA-376 §17.18.87 table column solver', () => {
         },
       ] }],
     }))).toEqual([40, 60]);
-  });
-
-  it('keeps an authored full-band grid when complete dxa cell preferences overflow it', () => {
-    expect(resolveTableColumnWidths(input({
-      layout: 'autofit',
-      availableWidthPt: 100,
-      gridWidthsPt: [40, 60],
-      gridAuthoredComplete: true,
-      tableWidthAutoAuthored: true,
-      rows: [completeDxaRow(50, 70)],
-    }))).toEqual([40, 60]);
-  });
-
-  it('uses the standard solver when one cell preference exceeds the entire grid', () => {
-    expect(resolveTableColumnWidths(input({
-      layout: 'autofit',
-      availableWidthPt: 100,
-      gridWidthsPt: [40, 60],
-      gridAuthoredComplete: true,
-      tableWidthAutoAuthored: true,
-      rows: [completeDxaRow(120, 5)],
-    }))).toEqual([96, 4]);
-  });
-
-  it('switches at the observed one-twip overflow boundary', () => {
-    expect(resolveTableColumnWidths(input({
-      layout: 'autofit',
-      availableWidthPt: 100,
-      gridWidthsPt: [40, 60],
-      gridAuthoredComplete: true,
-      tableWidthAutoAuthored: true,
-      rows: [completeDxaRow(40.05, 60)],
-    }))).toEqual([40, 60]);
-  });
-
-  it('keeps the authored grid when only a later complete row overflows it', () => {
-    expect(resolveTableColumnWidths(input({
-      layout: 'autofit',
-      availableWidthPt: 100,
-      gridWidthsPt: [40, 60],
-      gridAuthoredComplete: true,
-      tableWidthAutoAuthored: true,
-      rows: [completeDxaRow(30, 60), completeDxaRow(50, 70)],
-    }))).toEqual([40, 60]);
-  });
-
-  it('still applies content minimums after retaining the full-band grid', () => {
-    expect(resolveTableColumnWidths(input({
-      layout: 'autofit',
-      availableWidthPt: 100,
-      gridWidthsPt: [40, 60],
-      gridAuthoredComplete: true,
-      tableWidthAutoAuthored: true,
-      rows: [completeDxaRow(50, 70, 55)],
-    }))).toEqual([55, 45]);
-  });
-
-  it.each([
-    ['smaller cell total', { rows: [completeDxaRow(30, 60)] }, [30, 60]],
-    ['equal cell total', { rows: [completeDxaRow(30, 70)] }, [30, 70]],
-    ['non-authored or extended grid', { gridAuthoredComplete: false, rows: [completeDxaRow(50, 70)] }, [125 / 3, 175 / 3]],
-    ['omitted or nil table width', { tableWidthAutoAuthored: false, rows: [completeDxaRow(50, 70)] }, [125 / 3, 175 / 3]],
-    ['non-full-band grid', { availableWidthPt: 110, rows: [completeDxaRow(50, 70)] }, [275 / 6, 385 / 6]],
-    ['numeric table width', { tablePreferredWidthPt: 100, rows: [completeDxaRow(50, 70)] }, [125 / 3, 175 / 3]],
-    ['fixed table layout', { layout: 'fixed' as const, rows: [completeDxaRow(50, 70)] }, [125 / 3, 175 / 3]],
-    ['incomplete row', { rows: [{
-      before: null, after: null, cells: [completeDxaRow(50, 70).cells[0]!],
-    }] }, [500 / 11, 600 / 11]],
-    ['percentage cells', { rows: [{ before: null, after: null, cells: [
-      { ...completeDxaRow(50, 70).cells[0]!, preferredWidth: { kind: 'pct' as const, value: 0.5 } },
-      { ...completeDxaRow(50, 70).cells[1]!, preferredWidth: { kind: 'pct' as const, value: 0.5 } },
-    ] }] }, [50, 50]],
-    ['spanning cell', { rows: [
-      { before: null, after: null, cells: [{
-        columnStart: 0, columnSpan: 2,
-        preferredWidth: { kind: 'dxa' as const, value: 120 },
-        minContentWidthPt: 0, maxContentWidthPt: 0,
-      }] },
-      completeDxaRow(50, 60),
-    ] }, [2500 / 61, 3600 / 61]],
-  ] as const)(
-    'keeps the standard preference path for the observed %s boundary',
-    (_case, overrides, expected) => {
-      const result = resolveTableColumnWidths(input({
-        layout: 'autofit',
-        availableWidthPt: 100,
-        gridWidthsPt: [40, 60],
-        gridAuthoredComplete: true,
-        tableWidthAutoAuthored: true,
-        ...overrides,
-      }));
-      expect(result[0]).toBeCloseTo(expected[0]!, 9);
-      expect(result[1]).toBeCloseTo(expected[1]!, 9);
-    },
-  );
-
-  it('keeps a zero authored grid track on the standard preference path', () => {
-    const result = resolveTableColumnWidths(input({
-      layout: 'autofit',
-      availableWidthPt: 100,
-      gridWidthsPt: [0, 100],
-      gridAuthoredComplete: true,
-      tableWidthAutoAuthored: true,
-      rows: [completeDxaRow(50, 70)],
-    }));
-    expect(result[0]).toBeCloseTo(125 / 3, 9);
-    expect(result[1]).toBeCloseTo(175 / 3, 9);
   });
 
   it('autofit grows a spanning constraint to its minimum content width', () => {

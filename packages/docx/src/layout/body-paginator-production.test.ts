@@ -207,6 +207,57 @@ describe('canonical body producer', () => {
     expect(Object.isFrozen(layout)).toBe(true);
   });
 
+  it('stops keep-with-next preflight once the set cannot fit a fresh page', () => {
+    const services = Object.freeze({
+      text: { fingerprint: 'text' }, images: { fingerprint: 'images' }, math: { fingerprint: 'math' },
+    }) as LayoutServices;
+    // 200 indivisible 10pt keepNext blocks; the 80pt body extent fits 8 per
+    // page. Without an early exit every block's preflight re-measures the
+    // whole remaining tail (~19900 following-block measurements).
+    const layouts = Array.from({ length: 200 }, (_, index) => paragraph(`p${index}`, source(index), 10));
+    let followingMeasurements = 0;
+    const kernel: SyntheticBodyLayoutKernel = {
+      openBodyLayoutSession: () => ({
+        hasPaginationFields: false,
+        measureParagraph: ({ input }) => ({
+          layout: layouts[input.source.path[0]!]!, blockExtentPt: 10, fragmentation: { kind: 'indivisible' },
+        }),
+        measureTable: () => { throw new Error('unused'); },
+        measureStoryExtent: () => 0,
+        measureFootnoteReserve: () => 0,
+        measureFollowingBlock: () => {
+          followingMeasurements += 1;
+          return { fullExtentPt: 10, leadContentExtentPt: 10 };
+        },
+        measureLineNumberGlyph: () => ({ widthPt: 0, ascentPt: 0, descentPt: 0 }),
+        resetPageAcquisition: () => undefined,
+        moveAcquisitionCursor: () => undefined,
+        flowRegistrySnapshot: emptyFlowRegistrySnapshot,
+        commitFlowRegistryDelta: () => undefined,
+      }),
+    };
+    attachBodyLayoutKernel(services, kernel);
+    const input: BodyLayoutInput = {
+      source: { story: 'body', storyInstance: 'body', path: [] },
+      initialSection: bodyOwner(),
+      sequence: layouts.map((_, index) => ({
+        kind: 'body-block' as const,
+        block: {
+          kind: 'paragraph' as const, source: source(index), pageBreakBefore: false,
+          keepLines: false, keepNext: true, widowControl: true,
+          spaceBeforePt: 0, spaceAfterPt: 0, contextualSpacing: false, styleId: null,
+        },
+      })),
+    };
+
+    const layout = paginateBody(input, services, { currentDateMs: 0 });
+
+    // Each preflight stops after one fresh page of following blocks (8 x 10pt),
+    // so the total stays far below the quadratic full-tail scan (~19900).
+    expect(followingMeasurements).toBeLessThan(1600);
+    expect(layout.pages.length).toBeGreaterThan(1);
+  });
+
   it('retains one canonical boundary across collapsed fractional paragraph spacing', () => {
     const services = Object.freeze({
       text: { fingerprint: 'text' }, images: { fingerprint: 'images' }, math: { fingerprint: 'math' },
@@ -2559,291 +2610,6 @@ describe('canonical body producer', () => {
 
     expect(layout.pages.map((page) => page.layers.body.map((node) => node.source.path[0])))
       .toEqual([[0], [1, 2, 3]]);
-  });
-
-  it('collapses the paragraph gap when admitting a keepNext terminal line', () => {
-    const services = Object.freeze({
-      text: { fingerprint: 'text' }, images: { fingerprint: 'images' }, math: { fingerprint: 'math' },
-    }) as LayoutServices;
-    const heights = [43, 19, 24];
-    attachBodyLayoutKernel(services, {
-      openBodyLayoutSession: () => ({
-        hasPaginationFields: false,
-        measureParagraph: ({ input, suppressSpaceBefore }) => {
-          const index = input.source.path[0]!;
-          const heightPt = heights[index]! - (index === 2 && suppressSpaceBefore ? 6 : 0);
-          const beforePt = index === 2 && !suppressSpaceBefore ? 6 : 0;
-          const afterPt = index === 1 ? 6 : 0;
-          return {
-            layout: {
-              ...paragraph(`p${input.source.path[0]}`, input.source, heightPt - beforePt - afterPt),
-              spacing: { beforePt, afterPt },
-            },
-            blockExtentPt: heightPt,
-            fragmentation: { kind: 'indivisible' },
-          };
-        },
-        measureTable: () => { throw new Error('unused'); },
-        measureStoryExtent: () => 0,
-        measureFootnoteReserve: () => 0,
-        // Equal 6pt sides collapse by suppressing the successor's before side,
-        // exactly as normal acquisition does. The pair's physical charge is
-        // therefore 19 + (24 - 6) = 37pt, exactly the remaining band.
-        measureFollowingBlock: ({ suppressSpaceBefore }) => ({
-          fullExtentPt: 24 - (suppressSpaceBefore ? 6 : 0),
-          leadContentExtentPt: 24 - (suppressSpaceBefore ? 6 : 0),
-        }),
-        measureLineNumberGlyph: () => ({ widthPt: 0, ascentPt: 0, descentPt: 0 }),
-        resetPageAcquisition: () => undefined,
-        moveAcquisitionCursor: () => undefined,
-        flowRegistrySnapshot: emptyFlowRegistrySnapshot,
-        commitFlowRegistryDelta: () => undefined,
-      }),
-    });
-    const input: BodyLayoutInput = {
-      source: { story: 'body', storyInstance: 'body', path: [] }, initialSection: bodyOwner(),
-      sequence: heights.map((_height, index) => ({
-        kind: 'body-block' as const,
-        block: {
-          kind: 'paragraph' as const, source: source(index), pageBreakBefore: false,
-          keepLines: false, keepNext: index === 1, widowControl: false,
-          spaceBeforePt: index === 2 ? 6 : 0,
-          spaceAfterPt: index === 1 ? 6 : 0,
-          contextualSpacing: false, styleId: null,
-        },
-      })),
-    };
-
-    const layout = paginateBody(input, services, { currentDateMs: 0 });
-
-    expect(layout.pages.map((page) => page.layers.body.map((node) => node.source.path[0])))
-      .toEqual([[0, 1, 2]]);
-  });
-
-  it('keeps the larger successor spaceBefore and overlaps only the predecessor side', () => {
-    const services = Object.freeze({
-      text: { fingerprint: 'text' }, images: { fingerprint: 'images' }, math: { fingerprint: 'math' },
-    }) as LayoutServices;
-    const followingSuppressions: boolean[] = [];
-    attachBodyLayoutKernel(services, {
-      openBodyLayoutSession: () => ({
-        hasPaginationFields: false,
-        measureParagraph: ({ input, suppressSpaceBefore }) => {
-          const index = input.source.path[0]!;
-          const heightPt = index === 0 ? 45 : index === 1 ? 16 : 25 - (suppressSpaceBefore ? 10 : 0);
-          const beforePt = index === 2 && !suppressSpaceBefore ? 10 : 0;
-          const afterPt = index === 1 ? 6 : 0;
-          return {
-            layout: {
-              ...paragraph(`p${index}`, input.source, heightPt - beforePt - afterPt),
-              spacing: { beforePt, afterPt },
-            },
-            blockExtentPt: heightPt,
-            fragmentation: { kind: 'indivisible' },
-          };
-        },
-        measureTable: () => { throw new Error('unused'); },
-        measureStoryExtent: () => 0,
-        measureFootnoteReserve: () => 0,
-        measureFollowingBlock: ({ suppressSpaceBefore }) => {
-          followingSuppressions.push(suppressSpaceBefore);
-          const extentPt = 25 - (suppressSpaceBefore ? 10 : 0);
-          return { fullExtentPt: extentPt, leadContentExtentPt: extentPt };
-        },
-        measureLineNumberGlyph: () => ({ widthPt: 0, ascentPt: 0, descentPt: 0 }),
-        resetPageAcquisition: () => undefined,
-        moveAcquisitionCursor: () => undefined,
-        flowRegistrySnapshot: emptyFlowRegistrySnapshot,
-        commitFlowRegistryDelta: () => undefined,
-      }),
-    });
-    const input: BodyLayoutInput = {
-      source: { story: 'body', storyInstance: 'body', path: [] }, initialSection: bodyOwner(),
-      sequence: [0, 1, 2].map((index) => ({
-        kind: 'body-block' as const,
-        block: {
-          kind: 'paragraph' as const, source: source(index), pageBreakBefore: false,
-          keepLines: false, keepNext: index === 1, widowControl: false,
-          spaceBeforePt: index === 2 ? 10 : 0,
-          spaceAfterPt: index === 1 ? 6 : 0,
-          contextualSpacing: false, styleId: null,
-        },
-      })),
-    };
-
-    const layout = paginateBody(input, services, { currentDateMs: 0 });
-
-    expect(layout.pages.map((page) => page.layers.body.map((node) => node.source.path[0])))
-      .toEqual([[0, 1, 2]]);
-    expect(followingSuppressions).toContain(false);
-  });
-
-  it('suppresses both contextual sides for same-style keepNext paragraphs', () => {
-    const services = Object.freeze({
-      text: { fingerprint: 'text' }, images: { fingerprint: 'images' }, math: { fingerprint: 'math' },
-    }) as LayoutServices;
-    attachBodyLayoutKernel(services, {
-      openBodyLayoutSession: () => ({
-        hasPaginationFields: false,
-        measureParagraph: ({ input, suppressSpaceBefore }) => {
-          const index = input.source.path[0]!;
-          const heightPt = index === 0 ? 65 : index === 1 ? 16 : 15 - (suppressSpaceBefore ? 10 : 0);
-          const beforePt = index === 2 && !suppressSpaceBefore ? 10 : 0;
-          const afterPt = index === 1 ? 6 : 0;
-          return {
-            layout: {
-              ...paragraph(`p${index}`, input.source, heightPt - beforePt - afterPt),
-              spacing: { beforePt, afterPt },
-              contextualSpacing: index !== 0,
-            },
-            blockExtentPt: heightPt,
-            fragmentation: { kind: 'indivisible' },
-          };
-        },
-        measureTable: () => { throw new Error('unused'); },
-        measureStoryExtent: () => 0,
-        measureFootnoteReserve: () => 0,
-        measureFollowingBlock: ({ suppressSpaceBefore }) => {
-          const extentPt = 15 - (suppressSpaceBefore ? 10 : 0);
-          return { fullExtentPt: extentPt, leadContentExtentPt: extentPt };
-        },
-        measureLineNumberGlyph: () => ({ widthPt: 0, ascentPt: 0, descentPt: 0 }),
-        resetPageAcquisition: () => undefined,
-        moveAcquisitionCursor: () => undefined,
-        flowRegistrySnapshot: emptyFlowRegistrySnapshot,
-        commitFlowRegistryDelta: () => undefined,
-      }),
-    });
-    const input: BodyLayoutInput = {
-      source: { story: 'body', storyInstance: 'body', path: [] }, initialSection: bodyOwner(),
-      sequence: [0, 1, 2].map((index) => ({
-        kind: 'body-block' as const,
-        block: {
-          kind: 'paragraph' as const, source: source(index), pageBreakBefore: false,
-          keepLines: false, keepNext: index === 1, widowControl: false,
-          spaceBeforePt: index === 2 ? 10 : 0,
-          spaceAfterPt: index === 1 ? 6 : 0,
-          contextualSpacing: index !== 0, styleId: index === 0 ? null : 'same',
-        },
-      })),
-    };
-
-    const layout = paginateBody(input, services, { currentDateMs: 0 });
-
-    expect(layout.pages.map((page) => page.layers.body.map((node) => node.source.path[0])))
-      .toEqual([[0, 1, 2]]);
-  });
-
-  it('applies the spacing contract at every boundary in a three-paragraph keep chain', () => {
-    const services = Object.freeze({
-      text: { fingerprint: 'text' }, images: { fingerprint: 'images' }, math: { fingerprint: 'math' },
-    }) as LayoutServices;
-    const before = [0, 0, 6, 4];
-    const after = [0, 6, 10, 0];
-    const content = [34, 10, 10, 10];
-    attachBodyLayoutKernel(services, {
-      openBodyLayoutSession: () => ({
-        hasPaginationFields: false,
-        measureParagraph: ({ input, suppressSpaceBefore }) => {
-          const index = input.source.path[0]!;
-          const extentPt = content[index]! + after[index]! + (suppressSpaceBefore ? 0 : before[index]!);
-          const beforePt = suppressSpaceBefore ? 0 : before[index]!;
-          return {
-            layout: {
-              ...paragraph(`p${index}`, input.source, content[index]!),
-              spacing: { beforePt, afterPt: after[index]! },
-            },
-            blockExtentPt: extentPt,
-            fragmentation: { kind: 'indivisible' },
-          };
-        },
-        measureTable: () => { throw new Error('unused'); },
-        measureStoryExtent: () => 0,
-        measureFootnoteReserve: () => 0,
-        measureFollowingBlock: ({ input, suppressSpaceBefore }) => {
-          const index = input.source.path[0]!;
-          const extentPt = content[index]! + after[index]! + (suppressSpaceBefore ? 0 : before[index]!);
-          return { fullExtentPt: extentPt, leadContentExtentPt: extentPt };
-        },
-        measureLineNumberGlyph: () => ({ widthPt: 0, ascentPt: 0, descentPt: 0 }),
-        resetPageAcquisition: () => undefined,
-        moveAcquisitionCursor: () => undefined,
-        flowRegistrySnapshot: emptyFlowRegistrySnapshot,
-        commitFlowRegistryDelta: () => undefined,
-      }),
-    });
-    const input: BodyLayoutInput = {
-      source: { story: 'body', storyInstance: 'body', path: [] }, initialSection: bodyOwner(),
-      sequence: [0, 1, 2, 3].map((index) => ({
-        kind: 'body-block' as const,
-        block: {
-          kind: 'paragraph' as const, source: source(index), pageBreakBefore: false,
-          keepLines: false, keepNext: index === 1 || index === 2, widowControl: false,
-          spaceBeforePt: before[index]!, spaceAfterPt: after[index]!,
-          contextualSpacing: false, styleId: null,
-        },
-      })),
-    };
-
-    const layout = paginateBody(input, services, { currentDateMs: 0 });
-
-    expect(layout.pages.map((page) => page.layers.body.map((node) => node.source.path[0])))
-      .toEqual([[0, 1, 2, 3]]);
-  });
-
-  it('does not apply paragraph gap collapse to a terminal table', () => {
-    const services = Object.freeze({
-      text: { fingerprint: 'text' }, images: { fingerprint: 'images' }, math: { fingerprint: 'math' },
-    }) as LayoutServices;
-    const heights = [45, 20];
-    attachBodyLayoutKernel(services, {
-      openBodyLayoutSession: () => ({
-        hasPaginationFields: false,
-        measureParagraph: ({ input }) => {
-          const heightPt = heights[input.source.path[0]!]!;
-          return {
-            layout: paragraph(`p${input.source.path[0]}`, input.source, heightPt),
-            blockExtentPt: heightPt,
-            fragmentation: { kind: 'indivisible' },
-          };
-        },
-        measureTable: ({ input }) => ({
-          layout: table('terminal', input.source, 20),
-          blockExtentPt: 20,
-        }),
-        measureStoryExtent: () => 0,
-        measureFootnoteReserve: () => 0,
-        measureFollowingBlock: ({ suppressSpaceBefore }) => {
-          expect(suppressSpaceBefore).toBe(false);
-          return { fullExtentPt: 20, leadContentExtentPt: 20 };
-        },
-        measureLineNumberGlyph: () => ({ widthPt: 0, ascentPt: 0, descentPt: 0 }),
-        resetPageAcquisition: () => undefined,
-        moveAcquisitionCursor: () => undefined,
-        flowRegistrySnapshot: emptyFlowRegistrySnapshot,
-        commitFlowRegistryDelta: () => undefined,
-      }),
-    });
-    const input: BodyLayoutInput = {
-      source: { story: 'body', storyInstance: 'body', path: [] }, initialSection: bodyOwner(),
-      sequence: [
-        ...heights.map((_height, index) => ({
-          kind: 'body-block' as const,
-          block: {
-            kind: 'paragraph' as const, source: source(index), pageBreakBefore: false,
-            keepLines: false, keepNext: index === 1, widowControl: false,
-            spaceBeforePt: 0, spaceAfterPt: index === 1 ? 6 : 0,
-            contextualSpacing: false, styleId: null,
-          },
-        })),
-        { kind: 'body-block' as const, block: { kind: 'table' as const, source: source(2) } },
-      ],
-    };
-
-    const layout = paginateBody(input, services, { currentDateMs: 0 });
-
-    expect(layout.pages.map((page) => page.layers.body.map((node) => node.source.path[0])))
-      .toEqual([[0], [1, 2]]);
   });
 
   it('bridges an undecorated empty keepNext mark through the following paragraph', () => {

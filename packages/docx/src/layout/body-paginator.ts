@@ -1257,7 +1257,6 @@ function* paginateBodyPassSteps(
           let keepSetExtentPt = acquired.blockExtentPt;
           const keepSetReferenceIds = new Set(footnoteIdsInRetainedSlice(acquired.layout));
           let hasTerminalBlock = false;
-          let keepSetPreviousParagraph = block;
           let bridgeSuccessor = wordEmptyKeepNextBridgesSuccessor({
             keepNext: block.keepNext,
             inkless: block.inkless === true,
@@ -1271,50 +1270,33 @@ function* paginateBodyPassSteps(
               ? nextEntry
               : nextEntry.block;
             if (nextBlock.kind === 'paragraph' && nextBlock.pageBreakBefore) break;
-            const forceSuppressBefore = nextBlock.kind === 'paragraph'
-              && nextBlock.continuousSectionRole === 'suppress-before';
-            const spacing = nextBlock.kind === 'paragraph'
-              ? paragraphGapAdjustment(
-                  keepSetPreviousParagraph,
-                  nextBlock,
-                  keepSetPreviousParagraph.spaceAfterPt,
-                  forceSuppressBefore ? 0 : nextBlock.spaceBeforePt,
-                )
-              : null;
-            const suppressSpaceBefore = nextBlock.kind === 'paragraph'
-              && (forceSuppressBefore || spacing?.suppressBefore === true);
-            const spacingOverlapPt = nextBlock.kind === 'paragraph'
-              ? nextBlock.continuousSectionRole === 'drop-previous-after'
-                ? keepSetPreviousParagraph.spaceAfterPt
-                : spacing?.overlap ?? 0
-              : 0;
             const following = session.measureFollowingBlock({
               input: nextBlock,
               location,
               availableInlineExtentPt: location.availableBounds.widthPt,
-              suppressSpaceBefore,
             });
             const continues = nextBlock.kind === 'paragraph'
               && (nextBlock.keepNext || bridgeSuccessor);
             bridgeSuccessor = false;
-            const followingExtentPt = continues
+            keepSetExtentPt += continues
               ? following.fullExtentPt
               : following.leadContentExtentPt;
-            // The normal acceptance path backs the cursor over the shared
-            // paragraph gap and tells acquisition whether the successor's
-            // spaceBefore is suppressed. Keep-set preflight must use both parts
-            // of that same contract or a physically fitting heading pair can
-            // be charged twice and relocate.
-            keepSetExtentPt += followingExtentPt - spacingOverlapPt;
             const referenceIds = continues
               ? following.fullFootnoteReferenceIds
               : following.leadFootnoteReferenceIds;
             referenceIds?.forEach((id) => keepSetReferenceIds.add(id));
-            if (nextBlock.kind === 'paragraph') keepSetPreviousParagraph = nextBlock;
             if (!continues) {
               hasTerminalBlock = true;
               break;
             }
+            // The existing admission branch below can relocate only a
+            // complete keep set whose total charge fits a fresh page. Once
+            // the running block extent alone exceeds that bound, the branch
+            // cannot be taken and measuring the rest of the chain is wasted
+            // work. Long keep-with-next chains otherwise re-measure the shared
+            // tail once per member, which is effectively unbounded on
+            // pathological documents.
+            if (keepSetExtentPt > freshPageExtent(state)) break;
           }
           const keepSetReservePt = footnoteAdmissionForIds(
             [...keepSetReferenceIds],

@@ -1,67 +1,6 @@
 import { defineCompatibilityRule } from './compatibility.js';
 import type { ParagraphLayoutSource } from './text.js';
-import type { LayoutRect, LineLayout, TableColumnLayoutInput } from './types.js';
-
-const TABLE_WIDTH_EPSILON_PT = 1e-9;
-
-export const WORD_AUTOFIT_FULL_BAND_GRID_OVERFLOW = defineCompatibilityRule({
-  id: 'word-autofit-full-band-grid-overflow',
-  evidence: {
-    kind: 'office-observation',
-    syntheticFixtureId: 'autofit-full-band-grid-overflow-boundary-matrix',
-    application: 'Microsoft Word',
-    version: '16.111.1',
-    platform: 'macOS 26.5.2',
-  },
-  description: 'For an explicitly auto-width AutoFit table whose authored grid exactly fills its available inline band, Word keeps that grid when complete single-span dxa cell preferences overflow it collectively. Preferences at or below the grid total remain active, and content minimums may still resize the retained grid. A single cell preference wider than the entire authored grid and spanning cells are observed counterexamples; omitted/nil table widths and percentage, incomplete, zero-track, extended-grid, and non-full-band inputs remain on the standard solver path.',
-});
-
-/** Office compatibility governed by
- * {@link WORD_AUTOFIT_FULL_BAND_GRID_OVERFLOW}. ECMA-376 §17.18.87 describes
- * an application-defined AutoFit algorithm, so this deliberately encodes only
- * the synthetic boundary matrix observed in Word. */
-export function wordKeepsFullBandGridForAutofitCellOverflow(
-  input: TableColumnLayoutInput,
-): boolean {
-  if (
-    input.layout !== 'autofit'
-    || input.gridAuthoredComplete !== true
-    || input.tableWidthAutoAuthored !== true
-    || input.tablePreferredWidthPt !== null
-    || input.availableWidthPt === null
-    || input.gridWidthsPt.length === 0
-    || input.rows.length === 0
-  ) return false;
-
-  const gridTotalPt = input.gridWidthsPt.reduce((sum, width) => sum + width, 0);
-  if (
-    !input.gridWidthsPt.every((width) => Number.isFinite(width) && width > 0)
-    || !Number.isFinite(gridTotalPt)
-    || !Number.isFinite(input.availableWidthPt)
-    || Math.abs(gridTotalPt - input.availableWidthPt) > TABLE_WIDTH_EPSILON_PT
-  ) return false;
-
-  let hasOverflowingRow = false;
-  for (const row of input.rows) {
-    if (row.before !== null || row.after !== null || row.cells.length !== input.gridWidthsPt.length) {
-      return false;
-    }
-    let rowPreferredWidthPt = 0;
-    for (let column = 0; column < row.cells.length; column += 1) {
-      const cell = row.cells[column]!;
-      if (
-        cell.columnStart !== column
-        || cell.columnSpan !== 1
-        || cell.preferredWidth?.kind !== 'dxa'
-        || !Number.isFinite(cell.preferredWidth.value)
-        || cell.preferredWidth.value > gridTotalPt + TABLE_WIDTH_EPSILON_PT
-      ) return false;
-      rowPreferredWidthPt += Math.max(0, cell.preferredWidth.value);
-    }
-    hasOverflowingRow ||= rowPreferredWidthPt > gridTotalPt + TABLE_WIDTH_EPSILON_PT;
-  }
-  return hasOverflowingRow;
-}
+import type { LayoutRect } from './types.js';
 
 export const WORD_AUTOFIT_EMPTY_PARAGRAPH_CONTENT_WIDTH = defineCompatibilityRule({
   id: 'word-autofit-empty-paragraph-content-width',
@@ -145,18 +84,6 @@ export const WORD_PARALLEL_PARAGRAPH_ROW_CUT = defineCompatibilityRule({
     platform: 'macOS 26.5.2',
   },
   description: 'When a page cut crosses a row containing parallel paragraph content, Word emits no cell content unless every unfinished paragraph cell can reach at least its first legal line or block boundary in that page band. The observed rule does not cover nested-table child boundaries.',
-});
-
-export const WORD_TRAILING_MANUAL_BREAK_WIDOW_COUNT = defineCompatibilityRule({
-  id: 'word-trailing-manual-break-widow-count',
-  evidence: {
-    kind: 'office-observation',
-    syntheticFixtureId: 'trailing-manual-break-widow-boundary-matrix',
-    application: 'Microsoft Word',
-    version: '16.111.1',
-    platform: 'macOS 26.5.2',
-  },
-  description: 'Consecutive trailing manual line breaks retain their height and continuation geometry, but Word excludes break-only blank lines from the table-cell widow/orphan line count. Visible text, whitespace, tabs, drawings, and bar-tab rules remain content-bearing.',
 });
 
 export const WORD_POSITIONED_TABLE_ADJACENCY_EXCLUSION = defineCompatibilityRule({
@@ -360,27 +287,6 @@ export function wordRelocatesParallelParagraphRowCut(input: Readonly<{
   hasUnfinishedParagraphWithoutProgress: boolean;
 }>): boolean {
   return input.compatibility === 'word' && input.hasUnfinishedParagraphWithoutProgress;
-}
-
-/** Compatibility projection governed by
- * {@link WORD_TRAILING_MANUAL_BREAK_WIDOW_COUNT}. */
-export function wordTableCellWidowLineCount(input: Readonly<{
-  compatibility: 'word' | 'standard';
-  lines: readonly Pick<LineLayout, 'placements' | 'barTabRules' | 'endsWithBreak'>[];
-}>): number {
-  if (input.compatibility !== 'word') return input.lines.length;
-  let count = input.lines.length;
-  while (count > 0) {
-    const line = input.lines[count - 1]!;
-    const previous = input.lines[count - 2];
-    const hasVisibleOrAuthoredInline = line.placements.length > 0
-      || (line.barTabRules?.length ?? 0) > 0;
-    const forcedBreakOnly = !hasVisibleOrAuthoredInline
-      && (line.endsWithBreak === true || previous?.endsWithBreak === true);
-    if (!forcedBreakOnly) break;
-    count -= 1;
-  }
-  return count;
 }
 
 export const WORD_TABLE_BORDER_STYLE_PRECEDENCE = Object.freeze([

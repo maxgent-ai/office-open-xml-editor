@@ -227,9 +227,7 @@ export function docxRenderedFontFamilies(doc: DocxDocumentModel): string[] {
 export interface DocxResolvedFontMetricCandidate {
   readonly family: string;
   readonly probeText: string;
-  readonly weight: 400 | 700;
-  readonly style: 'normal' | 'italic';
-  /** The exact face tuple is selected by an ASCII/high-ANSI slot as well as
+  /** The exact regular face is selected by an ASCII/high-ANSI slot as well as
    * an East-Asian slot, so the observed single-line allocation can apply to
    * that Latin route. */
   readonly appliesToLatin: boolean;
@@ -276,48 +274,31 @@ export function docxResolvedFontMetricCandidates(
     familyValue: string | null | undefined,
     probeText: string | undefined,
     appliesToLatin: boolean,
-    weight: 400 | 700,
-    style: 'normal' | 'italic',
   ): void => {
     const family = familyValue?.trim();
     if (!family || !probeText) return;
-    const key = `${family.toLocaleLowerCase('en-US')}:${weight}:${style}`;
+    const key = family.toLocaleLowerCase('en-US');
     const previous = candidates.get(key);
     candidates.set(key, {
       family: previous?.family ?? family,
       probeText: previous?.probeText ?? probeText,
-      weight,
-      style,
       appliesToLatin: (previous?.appliesToLatin ?? false) || appliesToLatin,
     });
   };
 
   for (const usage of docxRenderedTextUsages(doc)) {
-    const weight = usage.bold ? 700 : 400;
-    const style = usage.italic ? 'italic' as const : 'normal' as const;
+    if (usage.bold || usage.italic) continue;
     const eastAsianText = firstMatchingScalar(usage.text, EAST_ASIAN_SCALAR);
-    if (eastAsianText && weight === 400 && style === 'normal') {
+    if (eastAsianText) {
       for (const family of usage.eastAsianFontFamilies ?? []) {
-        add(family, eastAsianText, false, weight, style);
+        add(family, eastAsianText, false);
       }
     }
     if (firstMatchingScalar(usage.text, LATIN_SCALAR)) {
       for (const familyValue of usage.latinFontFamilies ?? []) {
         const family = familyValue?.trim();
         if (!family) continue;
-        const key = family.toLocaleLowerCase('en-US');
-        // Compatibility enrollment for `word-calibri-authored-design-line`.
-        // All four supported face tuples share the same hhea line, but each
-        // rendered tuple is enrolled
-        // separately so production must prove that Canvas selected that face
-        // before applying it. Other Latin families remain regular-only and
-        // charset-gated for the established FE path.
-        const probe = key === 'calibri'
-          ? firstMatchingScalar(usage.text, LATIN_SCALAR)
-          : weight === 400 && style === 'normal'
-            ? charsetProbe(charsets[key])
-            : undefined;
-        add(family, probe, true, weight, style);
+        add(family, charsetProbe(charsets[family.toLocaleLowerCase('en-US')]), true);
       }
     }
   }

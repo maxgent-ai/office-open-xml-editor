@@ -10,6 +10,7 @@ import {
   documentLayoutRuntimeOf,
   fieldAcquisitionContextOf,
   paragraphAcquisitionCacheOf,
+  PARAGRAPH_ACQUISITION_MISS_BUDGET,
   paintResourceRegistryOf,
   privateResourceLookupOf,
 } from './runtime-state.js';
@@ -117,6 +118,24 @@ describe('document layout runtime state', () => {
       .not.toBe(paragraphAcquisitionCacheOf(firstScope));
     expect(paragraphAcquisitionCacheOf(services)).toBeUndefined();
     expect(Object.keys(firstScope)).toEqual(['text', 'images', 'math']);
+  });
+
+  it('shares one acquisition-miss budget across field convergence views', () => {
+    const services = {
+      text: {}, images: {}, math: {},
+    } as unknown as LayoutServices;
+    attachUnusedKernel(services);
+    const scope = createParagraphAcquisitionCacheServicesView(services);
+    const fieldView = createFieldAcquisitionServicesView(scope, { totalPages: 12 });
+    const scopeCache = paragraphAcquisitionCacheOf(scope)!;
+    const fieldCache = paragraphAcquisitionCacheOf(fieldView)!;
+
+    for (let index = 0; index < PARAGRAPH_ACQUISITION_MISS_BUDGET; index += 1) {
+      (index % 2 === 0 ? scopeCache : fieldCache).noteMiss();
+    }
+
+    expect(() => fieldCache.noteMiss())
+      .toThrow(/NON_CONVERGENCE.*operational miss budget 25000/i);
   });
 
   it('keeps destination-page resolution private to its immutable pagination iteration view', () => {

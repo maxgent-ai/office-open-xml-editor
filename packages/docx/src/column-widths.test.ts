@@ -223,7 +223,6 @@ describe('resolveColumnWidths — a tblW=auto table sizes to tcW/content, ignori
     const expectedShape = services.text.shape({
       text: 'é', fontSizePt: 10,
       fonts: { ascii: 'Legacy ASCII', highAnsi: 'Calibri' },
-      kerning: false,
     });
     const expectedFont = canvasFontString(
       expectedShape.spans[0]!.fontRoute, 10, 400, 'normal',

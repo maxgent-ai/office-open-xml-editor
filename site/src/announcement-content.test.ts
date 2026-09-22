@@ -11,6 +11,50 @@ const siteFooter = readFileSync(new URL('./components/SiteFooter.astro', import.
 const capabilities = readFileSync(new URL('./components/Capabilities.astro', import.meta.url), 'utf8');
 const readme = readFileSync(new URL('../../README.md', import.meta.url), 'utf8');
 
+describe('v0.88 chart fidelity and safer Word layout announcement', () => {
+  const announcement = announcements.find((item) => item.slug === 'v088-chart-fidelity-and-safer-word-layout');
+
+  it('leads with the release outcomes and gives explicit upgrade guidance', () => {
+    expect(announcement).toMatchObject({
+      label: 'Release note',
+      version: 'v0.88.0',
+      date: '2026-09-21',
+      title: 'More faithful charts and safer Word layout in v0.88.0',
+    });
+    expect(announcement?.sections[0]).toMatchObject({ title: 'In short', kind: 'summary' });
+    expect(announcement?.sections.at(-2)?.title).toBe('Upgrading');
+    expect(announcement?.sections.at(-1)?.title).toBe('Technical note');
+
+    const text = announcement?.sections.flatMap((section) => [
+      section.title,
+      ...(section.modules ?? []),
+      ...section.paragraphs,
+      ...(section.bullets ?? []),
+    ]).join('\n') ?? '';
+
+    for (const outcome of ['DOCX', 'XLSX', 'PPTX', 'classic', 'browser memory', 'SVG', 'regional CJK fallback', '100%']) {
+      expect(text).toContain(outcome);
+    }
+    expect(text).toContain('most Viewer integrations require no code changes');
+    expect(text).toContain('intentionally changes rendering');
+    expect(text).toContain('low-level chart model');
+    expect(text).toContain('NON_CONVERGENCE');
+    const technicalNote = announcement?.sections.at(-1)?.paragraphs.join('\n') ?? '';
+    expect(technicalNote).toContain('25,000 misses');
+    expect(technicalNote).toContain('miss 25,001');
+    expect(technicalNote).toContain('two most recent placements');
+    expect(text).toContain('When Google Fonts loading is enabled');
+    expect(text).not.toContain('fontResources');
+    expect(text).not.toContain('one synchronous pagination run');
+    expect(text).not.toMatch(/private\/|sample-\d+/i);
+    const userFacingText = announcement?.sections.slice(0, -1).flatMap((section) => [
+      ...section.paragraphs,
+      ...(section.bullets ?? []),
+    ]).join('\n') ?? '';
+    expect(userFacingText).not.toMatch(/field-convergence|cache-miss|25,000|most recently used placement/i);
+  });
+});
+
 describe('v0.87 regional CJK fallback announcement', () => {
   const announcement = announcements.find((item) => item.slug === 'v087-regional-cjk-fallbacks');
 
@@ -280,16 +324,16 @@ describe('v0.81 ChartEx migration guide', () => {
 
 describe('stable documentation boundaries', () => {
   it('keeps the current bundle measurements on one stable page', () => {
-    expect(bundleSizePage).toContain('Current production assets for v0.87.0');
+    expect(bundleSizePage).toContain('Current production assets for v0.88.0');
     expect(bundleSizePage).toContain('DOCX static JavaScript');
-    expect(bundleSizePage).toMatch(/<td>1,984 KiB<\/td>\s*<td>483 KiB<\/td>/);
+    expect(bundleSizePage).toMatch(/<td>2,082 KiB<\/td>\s*<td>508 KiB<\/td>/);
     expect(bundleSizePage).toContain('XLSX static JavaScript');
-    expect(bundleSizePage).toMatch(/<td>1,296 KiB<\/td>\s*<td>310 KiB<\/td>/);
+    expect(bundleSizePage).toMatch(/<td>1,389 KiB<\/td>\s*<td>333 KiB<\/td>/);
     expect(bundleSizePage).toContain('PPTX static JavaScript');
-    expect(bundleSizePage).toMatch(/<td>1,340 KiB<\/td>\s*<td>314 KiB<\/td>/);
-    expect(bundleSizePage).toContain('<tr><th>DOCX parser WASM</th><td>1,794 KiB</td><td>746 KiB</td></tr>');
-    expect(bundleSizePage).toContain('<tr><th>XLSX parser WASM</th><td>1,581 KiB</td><td>651 KiB</td></tr>');
-    expect(bundleSizePage).toContain('<tr><th>PPTX parser WASM</th><td>1,678 KiB</td><td>659 KiB</td></tr>');
+    expect(bundleSizePage).toMatch(/<td>1,432 KiB<\/td>\s*<td>336 KiB<\/td>/);
+    expect(bundleSizePage).toContain('<tr><th>DOCX parser WASM</th><td>1,900 KiB</td><td>787 KiB</td></tr>');
+    expect(bundleSizePage).toContain('<tr><th>XLSX parser WASM</th><td>1,683 KiB</td><td>690 KiB</td></tr>');
+    expect(bundleSizePage).toContain('<tr><th>PPTX parser WASM</th><td>1,782 KiB</td><td>700 KiB</td></tr>');
     expect(bundleSizePage).toContain('ChartEx');
     expect(bundleSizePage.match(/<th>TIFF image codec<\/th>/g)).toHaveLength(1);
     expect(bundleSizePage).toContain('<td>22.2 KiB</td><td>6.7 KiB</td>');
