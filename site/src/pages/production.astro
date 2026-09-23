@@ -91,12 +91,12 @@ if (bitmap) {
         </div>
         <p>
           Both modes need to start a module Worker, so opaque-origin iframes such as
-          <code>sandbox="allow-scripts"</code> are not a supported embedding setup. For trusted
-          iframe content, omit <code>sandbox</code>. To keep sandbox restrictions, serve the viewer
+          <code>sandbox="allow-scripts"</code> are not a supported embedding setup. For a regular
+          iframe, omit <code>sandbox</code>. To keep sandbox restrictions, serve the viewer
           from a dedicated origin separate from the parent and use
           <code>sandbox="allow-scripts allow-same-origin"</code> with a <code>src</code> URL.
-          Adding both flags to a same-origin or <code>srcdoc</code> frame can let it escape the
-          sandbox after reload. Cross-origin assets still need appropriate CORS permissions.
+          A <code>srcdoc</code> frame inherits the parent's origin in this setup and cannot provide
+          that separation. Cross-origin assets still need appropriate CORS permissions.
         </p>
         <p class="related"><a href="/bundle-size">See current bundle sizes →</a></p>
       </section>
