@@ -1013,6 +1013,16 @@ Promise. This includes `viewer.load()` parsing and its initial render, whether
 or not the Viewer has an `onError(error)` callback. A failure is never delivered
 through both channels.
 
+All three formats use a Web Worker for parsing, including the default
+`mode: 'main'`. An iframe with `sandbox="allow-scripts"` has an opaque origin;
+some browsers block its Worker scripts and report only an empty `error` event.
+Load the viewer in a normal-origin page, or serve the iframe from a separate
+origin and allow both scripts and same-origin access if that fits your embedding
+policy. Do not add `allow-scripts allow-same-origin` to a same-origin iframe as
+a security workaround: the embedded page can remove its sandbox and reload.
+The worker error message includes an opaque-origin hint when the browser gives
+no detail, but it cannot identify every Worker failure.
+
 Use `onError` for later Viewer-managed work that has no directly awaitable
 result, such as virtualized scroll-view rendering or embedded-media playback.
 Those failures are logged with `console.error` when the callback is omitted.
