@@ -175,8 +175,11 @@ export class WorkerBridge<TRes = unknown> {
     const detail = 'message' in e && e.message ? `: ${e.message}` : '';
     // HTML sandboxing gives frames without allow-same-origin an opaque origin.
     // Chromium reports a blocked Blob module-worker load there as an `error`
-    // with an empty message. Keep the normal error text when the browser supplies
-    // it, and treat this hint as diagnostic rather than a classified cause.
+    // with an empty message. Both rendering modes intentionally retain module
+    // Workers; opaque-origin frames are outside the supported browser setup,
+    // rather than a trigger for a classic-Worker or synchronous-parse fallback.
+    // Keep the normal error text when the browser supplies it, and treat this
+    // hint as diagnostic rather than a classified cause.
     const opaqueOriginHint = e.type === 'error' && !detail && globalThis.origin === 'null'
       ? ': this page has an opaque origin; a sandboxed iframe without allow-same-origin can block Worker loading'
       : '';
