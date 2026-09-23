@@ -174,14 +174,18 @@ await sheet.load('/report.dat', { format: 'delimited-text', delimiter: '|' });
 
 OMML equations (`m:oMath` / `m:oMathPara`) in `.docx`, `.pptx` and `.xlsx` are rendered with
 [MathJax](https://www.mathjax.org/) + [STIX Two Math](https://github.com/stipub/stixfonts).
-That engine is ~3 MB, so it is **opt-in**: import the `math` engine from the separate
+That engine is ~4 MB, so it is **opt-in**: import the `math` engine from the separate
 `@silurus/ooxml/math` entry and pass it to the viewer. Pass it and equations render;
 omit it and the engine asset is not fetched or evaluated (equations are simply skipped;
-the on-demand render-worker asset retains a small loader). When you *do* pass it, the ~3 MB engine ships
+the on-demand render-worker asset retains a small loader). When you *do* pass it, the ~4 MB engine ships
 as a **standalone asset file** next to the bundle rather than an inline data URL, and is
 fetched **on demand — only the first time a document actually contains an equation**, so
 equation-free documents never pay for it. It is fully self-contained: served from your own
 origin, no cross-origin requests.
+
+Accented Latin letters use STIX Two Math paths in normal, italic, bold and bold-italic
+equations. Less common Cyrillic, phonetic and dingbat characters use a system-font
+fallback, so their appearance can vary by platform.
 
 ```typescript
 import { DocxViewer } from '@silurus/ooxml/docx';
@@ -1183,7 +1187,7 @@ tarball) for the full list and license texts. Highlights:
   (Apache License 2.0) — the equation-rendering engine behind the
   opt-in `@silurus/ooxml/math` entry described in
   [Rendering equations](#rendering-equations). It ships in the tarball as
-  a standalone ~3 MB asset but is never loaded by a consuming app unless
+  a standalone ~4 MB asset but is never loaded by a consuming app unless
   that app imports `@silurus/ooxml/math` and the viewer is handed a
   document that actually contains an equation.
 - **Rust crate dependencies** of the WASM parsers (docx/pptx/xlsx) — all

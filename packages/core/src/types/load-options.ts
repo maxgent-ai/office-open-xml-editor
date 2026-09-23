@@ -178,7 +178,7 @@ export interface LoadOptions {
    */
   workerTimeoutMs?: number;
   /**
-   * Opt-in OMML equation engine (MathJax + STIX Two Math, ~3 MB). Inject it
+   * Opt-in OMML equation engine (MathJax + STIX Two Math, ~4 MB). Inject it
    * **once** here and every render of this document / presentation / workbook
    * uses it — the same dependency-injection contract across all three formats
    * and their viewers. Import it from the separate `@silurus/ooxml/math` entry
