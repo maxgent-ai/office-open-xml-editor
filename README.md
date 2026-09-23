@@ -1020,21 +1020,19 @@ non-opaque origin where Worker loading is permitted. An iframe with
 `sandbox="allow-scripts"` but no `allow-same-origin` has an opaque origin. Worker
 loading may fail there depending on the browser and Worker script, so this
 embedding setup is not supported even if it happens to work in one browser.
-There is no automatic no-Worker fallback for `mode: 'main'`.
+There is no classic-Worker or no-Worker fallback for this configuration.
 
-For trusted iframe content, omit `sandbox`. If the iframe needs sandbox
-restrictions, serve its viewer page from a dedicated origin distinct from the
-parent and use, for example,
+For a regular iframe, omit `sandbox`. To retain sandbox restrictions, serve
+the viewer page from a dedicated origin distinct from the parent and use, for
+example,
 `<iframe sandbox="allow-scripts allow-same-origin" src="https://viewer.example.net/viewer.html"></iframe>`.
 Here `allow-same-origin` retains the **iframe page's** origin; it does not give
-the iframe the parent's origin. Deliver the viewer from that URL rather than
-`srcdoc`: without origin sandboxing, `srcdoc` inherits the parent's origin.
-Do not combine these flags on a same-origin iframe as a security workaround:
-its content can remove the sandbox and reload. If module scripts or other
-resources are fetched across origins, configure CORS as required; the page's
-CSP must also allow its module Worker and required assets. The Worker error
-message includes an opaque-origin hint when the browser gives no detail, but
-it cannot identify every Worker failure.
+the iframe the parent's origin. This separate-origin setup requires a `src`
+URL; `srcdoc` inherits the parent's origin when origin sandboxing is disabled.
+If module scripts or other resources are fetched across origins, configure
+CORS as required; the page's CSP must also allow its module Worker and required
+assets. The Worker error message includes an opaque-origin hint when the
+browser gives no detail, but it cannot identify every Worker failure.
 
 Use `onError` for later Viewer-managed work that has no directly awaitable
 result, such as virtualized scroll-view rendering or embedded-media playback.
