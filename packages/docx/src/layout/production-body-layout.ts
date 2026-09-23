@@ -1819,7 +1819,7 @@ function buildConcreteBodyLayoutKernel(
               request.input.source,
               request.location,
               request.availableInlineExtentPt,
-              request.suppressSpaceBefore,
+              false,
               undefined,
               drawingCollisionRegistry.entries,
             );

@@ -7,6 +7,31 @@ the corresponding minor release.
 
 ## Unreleased
 
+## 0.88.0 — 2026-09-21
+
+Compatible minor release improving classic chart fidelity across Word, Excel and
+PowerPoint while making complex Word pagination safer and more faithful.
+
+- **classic Office charts:** apply the built-in style range 1 through 48 with
+  host-specific chart frames, automatic text contrast, series and point
+  styling, picture fills, markers, labels, legends, axes and three-dimensional
+  surface effects while preserving authored formatting and linked styles.
+- **bounded Word pagination:** stop keep-with-next preflight once a group cannot
+  fit on a fresh page, keep paragraph acquisition within a bounded working set,
+  and report non-convergence instead of allowing pathological repeated work to
+  exhaust browser or Node memory.
+- **more faithful Word styling:** apply default paragraph and table style
+  inheritance for every valid on/off form.
+- **steadier presentation and spreadsheet viewing:** preserve an SVG image fill
+  when its compatibility raster is unavailable, prepare the selected regional
+  CJK fallback consistently during main-thread PowerPoint loading, and let the
+  Excel zoom slider settle naturally on 100% when dragged nearby.
+- **compatibility:** no public option or method is removed or renamed, and most
+  Viewer integrations require no migration. Rendering changes are intentional
+  for affected documents. Custom renderers that exhaustively match the public
+  low-level chart model should account for added optional style/effect metadata
+  and image-capable fill values.
+
 ## 0.87.0 — 2026-09-13
 
 Compatible minor release making CJK fallback selection more predictable while

@@ -28,8 +28,6 @@ function paragraph(
   id: string,
   lineHeights: readonly number[],
   lineXPt = 0,
-  lineEndsWithBreak: readonly boolean[] = [],
-  lineHasContent: readonly boolean[] = [],
 ): ParagraphLayout {
   let yPt = 0;
   const lines = lineHeights.map((heightPt, index) => {
@@ -38,14 +36,7 @@ function paragraph(
       bounds: { xPt: lineXPt, yPt, widthPt: 20, heightPt },
       baselinePt: yPt + heightPt * 0.8,
       advancePt: heightPt,
-      placements: lineHasContent[index] ? [{
-        kind: 'tab' as const,
-        range: { start: index, end: index + 1 },
-        bounds: { xPt: lineXPt, yPt, widthPt: 0, heightPt },
-        advancePt: 0,
-        leader: 'none' as const,
-      }] : [],
-      ...(lineEndsWithBreak[index] ? { endsWithBreak: true } : {}),
+      placements: [],
     };
     yPt += heightPt;
     return line;
@@ -71,8 +62,6 @@ function row(
     repeatedHeader?: boolean;
     heightRule?: 'auto' | 'atLeast' | 'exact';
     paragraph?: ParagraphLayout;
-    keepLines?: boolean;
-    widowControl?: boolean;
     verticalMerge?: 'none' | 'restart' | 'continue';
   } = {},
 ): TableRowLayoutInput {
@@ -98,8 +87,6 @@ function row(
       blocks: options.verticalMerge === 'continue' ? [] : [{
         layout: p,
         sourceBlockIndex: 0,
-        keepLines: options.keepLines ?? false,
-        widowControl: options.widowControl ?? false,
       }],
     }],
   };
@@ -1213,114 +1200,6 @@ describe('retained table pagination', () => {
     expect(second.fragment?.rows[0]?.fragmentIndex).toBe(1);
     expect(second.nextCursor).toBeNull();
     expect(retained.continuation).toBeUndefined();
-  });
-
-  it('relocates a table-cell paragraph instead of leaving a one-line orphan', () => {
-    const source = acquisition([row(0, 20, {
-      paragraph: paragraph('widow-controlled', [10, 10]),
-      widowControl: true,
-    })]);
-    const cursor = startTableFragmentCursor();
-
-    const constrained = take(source, 10, cursor, { freshPageHeightPt: 100 });
-
-    expect(constrained.fragment).toBeNull();
-    expect(constrained.requiresFreshPage).toBe(true);
-    expect(constrained.nextCursor).toEqual(cursor);
-
-    const fresh = take(source, 100, cursor, { freshPageHeightPt: 100 });
-    expect(fresh.fragment?.rows[0]?.cells[0]?.contentRanges).toEqual([
-      { kind: 'whole', blockIndex: 0 },
-    ]);
-    expect(fresh.nextCursor).toBeNull();
-  });
-
-  it('does not count trailing forced-break-only blank lines as an orphan', () => {
-    const source = acquisition([row(0, 40, {
-      paragraph: paragraph(
-        'visible-line-with-trailing-breaks',
-        [10, 10, 10, 10],
-        0,
-        [true, true, true, false],
-        [true, false, false, false],
-      ),
-      widowControl: true,
-    })]);
-
-    const first = take(source, 10, startTableFragmentCursor(), { freshPageHeightPt: 100 });
-    expect(first.requiresFreshPage).toBe(false);
-    expect(first.fragment?.rows[0]?.cells[0]?.contentRanges).toEqual([
-      { kind: 'paragraph', blockIndex: 0, lineStart: 0, lineEnd: 1 },
-    ]);
-  });
-
-  it('balances a trailing table-cell widow as two lines plus two lines', () => {
-    const source = acquisition([row(0, 40, {
-      paragraph: paragraph('four-lines', [10, 10, 10, 10]),
-      widowControl: true,
-    })]);
-
-    const first = take(source, 30, startTableFragmentCursor(), { freshPageHeightPt: 100 });
-    expect(first.fragment?.rows[0]?.cells[0]?.contentRanges).toEqual([
-      { kind: 'paragraph', blockIndex: 0, lineStart: 0, lineEnd: 2 },
-    ]);
-
-    const second = take(source, 100, first.nextCursor!, { freshPageHeightPt: 100 });
-    expect(second.fragment?.rows[0]?.cells[0]?.contentRanges).toEqual([
-      { kind: 'paragraph', blockIndex: 0, lineStart: 2, lineEnd: 4 },
-    ]);
-  });
-
-  it('allows a one-line table-cell split when widow control is disabled', () => {
-    const source = acquisition([row(0, 20, {
-      paragraph: paragraph('widow-disabled', [10, 10]),
-      widowControl: false,
-    })]);
-
-    const first = take(source, 10, startTableFragmentCursor(), { freshPageHeightPt: 100 });
-    expect(first.fragment?.rows[0]?.cells[0]?.contentRanges).toEqual([
-      { kind: 'paragraph', blockIndex: 0, lineStart: 0, lineEnd: 1 },
-    ]);
-  });
-
-  it('keeps a table-cell paragraph together when keepLines fits a fresh page', () => {
-    const source = acquisition([row(0, 20, {
-      paragraph: paragraph('keep-lines', [10, 10]),
-      keepLines: true,
-      widowControl: false,
-    })]);
-    const cursor = startTableFragmentCursor();
-
-    const constrained = take(source, 10, cursor, { freshPageHeightPt: 100 });
-
-    expect(constrained.fragment).toBeNull();
-    expect(constrained.requiresFreshPage).toBe(true);
-    expect(constrained.nextCursor).toEqual(cursor);
-  });
-
-  it('makes progress after a repeated header when the paragraph exceeds the fresh band', () => {
-    const source = acquisition([
-      row(0, 10, { repeatedHeader: true }),
-      row(1, 120, {
-        paragraph: paragraph('over-fresh-band', [60, 60]),
-        keepLines: true,
-        widowControl: true,
-      }),
-    ]);
-    const cursor = Object.freeze({
-      rowIndex: 1,
-      rowFragmentIndex: 0,
-      cells: Object.freeze([]),
-    });
-
-    const first = take(source, 100, cursor, { freshPageHeightPt: 100 });
-    expect(first.requiresFreshPage).toBe(false);
-    expect(first.fragment?.rows.map((item) => item.ownership)).toEqual([
-      'repeated-header', 'source',
-    ]);
-    expect(first.fragment?.rows[1]?.cells[0]?.contentRanges).toEqual([
-      { kind: 'paragraph', blockIndex: 0, lineStart: 0, lineEnd: 1 },
-    ]);
   });
 
   it('repeats only the leading header prefix without consuming source ownership twice', () => {
