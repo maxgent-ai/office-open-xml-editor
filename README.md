@@ -1013,6 +1013,29 @@ Promise. This includes `viewer.load()` parsing and its initial render, whether
 or not the Viewer has an `onError(error)` callback. A failure is never delivered
 through both channels.
 
+All three formats use a module Web Worker for parsing, including the default
+`mode: 'main'`; the mode selects where rendering runs, not whether parsing uses
+a Worker. The supported browser setup requires a page with a normal,
+non-opaque origin where Worker loading is permitted. An iframe with
+`sandbox="allow-scripts"` but no `allow-same-origin` has an opaque origin. Worker
+loading may fail there depending on the browser and Worker script, so this
+embedding setup is not supported even if it happens to work in one browser.
+There is no automatic no-Worker fallback for `mode: 'main'`.
+
+For trusted iframe content, omit `sandbox`. If the iframe needs sandbox
+restrictions, serve its viewer page from a dedicated origin distinct from the
+parent and use, for example,
+`<iframe sandbox="allow-scripts allow-same-origin" src="https://viewer.example.net/viewer.html"></iframe>`.
+Here `allow-same-origin` retains the **iframe page's** origin; it does not give
+the iframe the parent's origin. Deliver the viewer from that URL rather than
+`srcdoc`: without origin sandboxing, `srcdoc` inherits the parent's origin.
+Do not combine these flags on a same-origin iframe as a security workaround:
+its content can remove the sandbox and reload. If module scripts or other
+resources are fetched across origins, configure CORS as required; the page's
+CSP must also allow its module Worker and required assets. The Worker error
+message includes an opaque-origin hint when the browser gives no detail, but
+it cannot identify every Worker failure.
+
 Use `onError` for later Viewer-managed work that has no directly awaitable
 result, such as virtualized scroll-view rendering or embedded-media playback.
 Those failures are logged with `console.error` when the callback is omitted.
