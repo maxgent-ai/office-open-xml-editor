@@ -3,6 +3,7 @@
 Legacy binary Office files can be opened with the ordinary viewers and
 loaders through optional model sources:
 
+- `.xls` with the XLSX loaders and `XlsxViewer`
 - `.ppt` with the PPTX loaders and `PptxViewer`
 
 Each reader is a separate opt-in entry. It reads a supported binary subset
@@ -36,9 +37,10 @@ await viewer.load(pptOrPptxBytes);
 
 | Input | Entry | Factory | Loaders and viewers |
 | --- | --- | --- | --- |
+| XLS | `@silurus/ooxml/legacy-xls` | `legacyXlsSource()` | `XlsxViewer`, `XlsxWorkbook.load`, `openXlsxWorkbook` |
 | PPT | `@silurus/ooxml/legacy-ppt` | `legacyPptSource()` | `PptxViewer`, `PptxPresentation.load`, `openPptxPresentation` |
 
-The factory accepts these optional settings:
+Each factory accepts the same optional settings:
 
 ```typescript
 interface LegacySourceOptions {
@@ -50,8 +52,9 @@ interface LegacySourceOptions {
 
 Creating a source fetches nothing. When a claimed file loads, the parser
 Worker (or Node) imports the source's self-contained ES module, emitted as
-`legacy-ppt-source-module*.mjs` next to the package files, and initializes
-the reader's dedicated WASM, `legacy_ppt_direct_bg.wasm`. Serve these files
+`legacy-<format>-source-module*.mjs` next to the package files, and initializes
+the reader's dedicated WASM: `legacy_xls_direct_bg.wasm` or
+`legacy_ppt_direct_bg.wasm`. Serve these files
 with the other package assets, and allow the module URL wherever a Content
 Security Policy restricts `script-src` or Worker imports. Applications with a
 custom asset pipeline pass absolute `moduleUrl` and `wasmUrl` values:
@@ -71,7 +74,7 @@ explicit caller option, then the source's view default, then the renderer
 default. Capabilities that a source lacks degrade the same way for every
 format: resource metrics are reported without a ZIP usage snapshot, and
 `toMarkdown()` rejects with an "... is unsupported for this source" error.
-The legacy PPT reader lacks Markdown export and ZIP accounting.
+Both legacy readers lack Markdown export and ZIP accounting.
 
 To cancel a load, destroy the document or viewer, or start another load in
 its place. Node sessions keep their `signal` option.
@@ -79,16 +82,16 @@ its place. Node sessions keep their `signal` option.
 ## Admission and failure behavior
 
 A source's synchronous `claim(bytes)` accepts only its own [MS-CFB] family:
-a compound file whose directory names `PowerPoint Document` (PPT). A container
-that names more than one binary family (`WordDocument` for DOC and `Workbook`
-or `Book` for XLS count too), or that carries `EncryptionInfo`, is not
-claimed. Every input a
+a compound file whose directory names `Workbook` or `Book` (XLS), or
+`PowerPoint Document` (PPT). A container that names more than one binary
+family (`WordDocument` for DOC counts too), or that carries `EncryptionInfo`,
+is not claimed. Every input a
 source does not claim takes the unchanged OOXML path, so:
 
 - a legacy file without a matching source rejects with the typed
   `legacy-binary-format` error;
 - encrypted OOXML packages keep their existing encryption errors;
-- configuring `legacyPptSource()` does not enable DOC or XLS input.
+- configuring `legacyXlsSource()` does not enable PPT or DOC input.
 
 Claimed input larger than `maxInputBytes` throws a `RangeError`. The limit is
 resource policy, not an Office format limit. After a source claims a file, a
@@ -199,13 +202,144 @@ A modern Office-saved PPT can retain paragraph properties in the OfficeArt
 `metroBlob` alternative shape XML rather than in its classic text ruler. The
 direct PPT source adopts that XML under the rule described below.
 
+## Experimental direct XLS source
+
+```typescript
+import { XlsxViewer } from '@silurus/ooxml/xlsx';
+import { legacyXlsSource } from '@silurus/ooxml/legacy-xls';
+
+const container = document.querySelector('#workbook') as HTMLElement;
+const viewer = new XlsxViewer(container, { modelSources: [legacyXlsSource()] });
+await viewer.load(legacyXlsBytes);
+```
+
+`XlsxWorkbook.load(bytes, { modelSources: [legacyXlsSource()] })` and the Node
+`openXlsxWorkbook(bytes, { modelSources: [legacyXlsSource()], factory })`
+accept the same source.
+
+The direct XLS source is experimental and bounded. It reads a BIFF8 workbook
+subset into the shared worksheet model: sheet names, cell values and cached
+formula results, merged ranges, the date system, number formats, fonts,
+palette and extension colors, fills, borders, alignment, rich-text runs, row
+heights and column widths, and row/column hiding and outlines. It also
+projects conditional formatting (classic CF with its CFEx extensions, CF12
+comparison, formula, color-scale, data-bar and icon-set rules, their
+differential formats and decompiled formulas), Excel tables with custom table
+styles, frozen panes, tab colors, XFExt gradient fills, hyperlinks, worksheet
+AutoFilter ranges (whose application-inserted drop-down objects become the
+renderer's filter buttons; active filter criteria reject), data validations
+and defined names, plus embedded charts, chart sheets, pictures, and
+rectangles, text boxes and their groups as shape anchors. Variants the shared
+model cannot show (for example inactive rules, suppressed list drop-downs,
+displayed phonetic guides, or table-style elements outside the model) reject
+the workbook instead of being dropped. Print areas and titles travel as
+defined names; page setup, headers and footers affect printing only and are
+not part of the model.
+
+Worksheet visibility, including very hidden sheets, is kept as model
+metadata; display follows the existing `XlsxViewer` `hiddenSheetMode` option,
+whose default remains `'show'`. Gridline visibility, zero-value display and
+right-to-left direction come from the sheet's window settings. Pane
+selections, scrolling, zoom and window placement are not reconstructed.
+
+Column widths and drawing anchors depend on the Normal font's maximum digit
+width (ECMA-376 §18.3.1.13). The XLS source asks the host for it through a
+generic host-layout capability, and the XLSX renderer answers with its own
+`computeMdw`, the same measurement that sizes the painted grid. It measures
+in the rendering realm: the render Worker in `mode: 'worker'`, the page in
+main mode, and the session canvas `factory` in Node. There is no measurement
+callback option. Without a measurable font (for example in Node without a
+`factory`), charts, pictures and shapes are omitted. On macOS the renderer
+quantizes the advance to whole points like Excel for Mac, so XLS drawings
+follow that platform's rule.
+
+## XLS drawing inspection for development
+
+A native-only inspection helper can
+extract the supported passive PNG, JPEG, EMF and WMF entries from a BIFF8 global
+image store without requiring font metrics:
+
+```sh
+cargo run -p legacy-office-converter --features inspection \
+  --example inspect_xls_images -- sample.xls fresh-output-directory
+```
+
+Omit the output directory to print catalog indices, formats and byte counts
+without saving images. The optional directory must not already exist. Extracted
+images can contain private document content and must remain local. A catalog
+entry is not proof that an image is displayed on a worksheet.
+
+The helper follows MS-XLS 2.4.58/171 and the documented first-continuation
+exception in 2.1.7.20.3 implementation note 6. It bounds the stream to workbook
+globals and requires one MS-ODRAW 2.2.12/20/22 drawing-group/image-store owner.
+Shared passive-image validation remains unchanged; malformed supported images
+fail inspection rather than being silently repaired. Unsupported encodings,
+unreferenced slots and unresolved delayed entries are not exposed. No external
+resource, macro, OLE object or drawing action is evaluated.
+
+Inspection caps the source at 256 MiB, assembled drawing data and retained media
+at 128 MiB each, and the drawing/decoding walk at two million records. Shared
+image limits also apply. These are independent resource ceilings, not a combined
+process-memory guarantee: source, workbook, assembled data and extracted images
+can coexist. The helper is excluded from production WASM even when its Cargo
+feature is enabled. It does not change the reader or renderer.
+
+The companion `inspect_xls_anchors` native example prints raw worksheet anchor
+metadata without extracting images:
+
+```sh
+cargo run -p legacy-office-converter --features inspection \
+  --example inspect_xls_anchors -- sample.xls
+```
+
+It uses BoundSheet tab order and disjoint worksheet substreams, excludes nested
+chart streams, and joins only owned drawing fragments. MS-XLS 2.5.194/195 client
+markers must end at the exact fragment boundary immediately preceding the
+matching Obj/TxO record. The inspector retains the shape identity, FtCmo object
+identity/type/flags, enclosing group depth and signed MS-XLS 2.5.193 endpoint
+fractions. It does not flatten groups or interpret client formulas and actions.
+The fractions are not pixels or EMUs; negative and beyond-cell fractions remain
+unchanged. Reserved anchor bits are ignored as specified. Invalid movement flags,
+duplicate identities, ambiguous clients and truncated streams fail inspection.
+The current subset does not reclassify Continue records following Obj/TxO as
+drawing data; producer output requiring that interleaving remains unsupported.
+
+For explicitly owned plain picture objects, anchor metadata also retains a
+one-based BStore reference, raw signed crop/rotation values, clipboard format and
+the aspect-preservation flag. The reference must be a scalar `pib` with `fBid`
+set in the shape's own FOPT; complex BLIPs and drawing-wide properties are not
+substituted. FtCf and FtPioGrbit must occupy their specified Obj fields. DDE,
+ActiveX, camera, icon, dynamic/default-sized, controls-stream and auto-load forms,
+additional client fields, linked BLIPs, explicit hidden/script anchors and
+deleted/OLE/group/background shape flags do not produce passive references.
+Unknown property content is never decoded as a script, URL or nested object.
+
+Use `inspect_xls_images --used sample.xls fresh-output-directory` with the same
+Cargo invocation to extract only supported images referenced by those objects.
+The native `inspect_xls_pictures` helper parses the workbook stream once, binds
+anchors to the global catalog by index, and decodes each requested image at most
+once. It returns only anchors with a corresponding supported image. Unused
+catalog entries are not inflated; an invalid referenced image or out-of-range
+index still fails inspection. There is no fallback to another image, file or URL.
+The anchor and media stages each retain their separate two-million-work budget.
+This raw inspection is not an assertion of complete inherited visibility or
+geometry. The direct XLS reader applies additional picture eligibility.
+
+Anchor inspection limits cumulative drawing bytes to 128 MiB, record work to
+two million, substream/group nesting to 32, retained anchors to 65,536, and
+per-sheet shape/client identities to 65,536. The disjoint ranges prevent repeated
+scanning through overlapping worksheet references. Native metadata does not prove
+visibility, image eligibility or complete object validity: non-picture objects,
+deleted shapes and OLE-marked shapes can have anchors too. These development
+helpers remain separate from the direct XLS reader.
+
 ## Current implementation boundary
 
 The repository contains only the direct readers; legacy input is never
 converted to OOXML. The Rust crate `legacy-office-converter` builds one reader
-per feature; this package has `direct-ppt`. Building it for `wasm32` without
-it is a compile error. The `inspection` feature adds a native-only PPT
-inspection example, and `fuzzing` exposes the fuzz entry points.
+per feature: `direct-xls` and `direct-ppt`. Building it for `wasm32` with
+neither enabled is a compile error. The `inspection` feature adds the
+native-only examples above, and `fuzzing` exposes the fuzz entry points.
 
 The local direct-render survey described below renders every installed
 legacy sample through its source and pairs it with the Office-exported PDF.
