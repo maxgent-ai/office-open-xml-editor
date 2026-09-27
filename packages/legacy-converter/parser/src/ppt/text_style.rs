@@ -109,32 +109,44 @@ fn read_runs(text: &str, style: &[u8], work_budget: &mut usize) -> Result<Runs, 
     })
 }
 
-/// Authored CFStyle font-size bits by UTF-16 text position, including the
-/// implicit final CR. A round-trip DrawingML alternative can override an
-/// inherited binary master size without contradicting a directly authored
-/// character size; the ordinary paragraph projector only retains effective
-/// sizes, so this short-lived sidecar preserves the distinction at the
-/// metroBlob comparison boundary.
-pub(in crate::ppt) fn direct_size_mask(
+/// Authored [MS-PPT] 2.9.15 CFMasks size and color bits by UTF-16 text
+/// position, including the implicit final CR. A round-trip DrawingML
+/// alternative can override an inherited binary master size without
+/// contradicting a directly authored character size. The ordinary paragraph
+/// projector retains only effective values, so this sidecar preserves direct
+/// size for metroBlob comparison and direct color for hyperlink inheritance.
+pub(in crate::ppt) struct DirectCharacterMasks {
+    pub size: Vec<bool>,
+    pub color: Vec<bool>,
+}
+
+pub(in crate::ppt) fn direct_character_masks(
     text: &str,
     style: &[u8],
     work_budget: &mut usize,
-) -> Result<Vec<bool>, String> {
+) -> Result<DirectCharacterMasks, String> {
     let length = text.encode_utf16().count() + 1;
     let runs = read_runs(text, style, work_budget)?;
-    let mut result = Vec::new();
-    result
-        .try_reserve_exact(length)
+    let mut size = Vec::new();
+    size.try_reserve_exact(length)
         .map_err(|_| unsupported("PowerPoint text size mask allocation failed"))?;
+    let mut color = Vec::new();
+    color
+        .try_reserve_exact(length)
+        .map_err(|_| unsupported("PowerPoint text color mask allocation failed"))?;
     let mut previous = 0;
     for (end, character) in runs.characters {
-        result.extend(std::iter::repeat_n(
+        size.extend(std::iter::repeat_n(
             character.mask & 0x20000 != 0,
+            end - previous,
+        ));
+        color.extend(std::iter::repeat_n(
+            character.mask & 0x40000 != 0,
             end - previous,
         ));
         previous = end;
     }
-    Ok(result)
+    Ok(DirectCharacterMasks { size, color })
 }
 
 struct Reader<'a, 'b> {
@@ -1222,6 +1234,19 @@ mod tests {
         );
         assert_eq!(run.color.as_deref(), Some("123456"));
         assert_eq!(run.font_family.as_deref(), Some("A & B\""));
+    }
+
+    #[test]
+    fn direct_character_masks_keep_authored_color_separate_from_inheritance() {
+        let data = style(3, [u32s(0x20000), u16s(36)].concat());
+        let mut budget = 100;
+        let masks = direct_character_masks("ab", &data, &mut budget).unwrap();
+        assert_eq!(masks.size, vec![true; 3]);
+        assert_eq!(masks.color, vec![false; 3]);
+        let data = style(3, [u32s(0x40000), u32s(0xfe563412)].concat());
+        let masks = direct_character_masks("ab", &data, &mut budget).unwrap();
+        assert_eq!(masks.size, vec![false; 3]);
+        assert_eq!(masks.color, vec![true; 3]);
     }
 
     #[test]

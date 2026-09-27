@@ -62,6 +62,7 @@ fn unprojected_blip_fill(kind: u32) -> String {
 fn apply_text_links(
     paragraphs: &mut [pptx_model::Paragraph],
     links: &[(usize, usize, String)],
+    direct_color_authored: &[bool],
 ) -> Result<(), String> {
     let mut position = 0usize;
     let mut seen = vec![false; links.len()];
@@ -77,9 +78,19 @@ fn apply_text_links(
             let end = position
                 .checked_add(len)
                 .ok_or_else(|| unsupported("PowerPoint text link range overflow"))?;
+            if end > direct_color_authored.len() {
+                return Err(unsupported("PowerPoint direct text color range"));
+            }
             match run {
                 TextRun::Text(data) if len > 0 => {
                     let mut cuts = vec![0, len];
+                    for offset in 1..len {
+                        if direct_color_authored[position + offset - 1]
+                            != direct_color_authored[position + offset]
+                        {
+                            cuts.push(offset);
+                        }
+                    }
                     for (begin, cutoff, _) in links {
                         for edge in [*begin, *cutoff] {
                             if position < edge && edge < end {
@@ -118,6 +129,14 @@ fn apply_text_links(
                                     return Err(unsupported("overlapping PowerPoint text links"));
                                 }
                                 part.hyperlink = Some(target.clone());
+                                // [MS-PPT] 2.9.15 CFMasks.color makes the run
+                                // color direct only when bit 0x40000 is set.
+                                // PowerPoint-saved hyperlink runs with an
+                                // inherited black fallback omit solidFill and
+                                // take the theme hlink color instead.
+                                if !direct_color_authored[begin] {
+                                    part.color = None;
+                                }
                                 seen[index] = true;
                             }
                         }
@@ -1134,13 +1153,16 @@ impl Context<'_> {
                 .as_deref()
                 .expect("constructed for absent style"),
         };
-        if shape.props.metro.is_some() {
-            *direct_size_authored = Some(text_style::direct_size_mask(
-                &blocks[0],
-                style_bytes,
-                self.work_budget,
-            )?);
-        }
+        let direct_color_authored = if shape.props.metro.is_some() || !text_links.is_empty() {
+            let masks =
+                text_style::direct_character_masks(&blocks[0], style_bytes, self.work_budget)?;
+            if shape.props.metro.is_some() {
+                *direct_size_authored = Some(masks.size);
+            }
+            Some(masks.color)
+        } else {
+            None
+        };
         let mut paragraphs = text_style::direct_model::paragraphs_with_axes(
             &blocks[0],
             style_bytes,
@@ -1171,7 +1193,10 @@ impl Context<'_> {
             self.model_budget,
         )?;
         if !text_links.is_empty() {
-            apply_text_links(&mut paragraphs, &text_links)?;
+            let colors = direct_color_authored
+                .as_deref()
+                .ok_or_else(|| unsupported("PowerPoint direct text color mask missing"))?;
+            apply_text_links(&mut paragraphs, &text_links, colors)?;
         }
         let p = &shape.props;
         Ok(Some(TextBody {
@@ -1269,6 +1294,58 @@ impl Context<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn links_clear_inherited_color_but_keep_explicit_color() {
+        let run = serde_json::json!({
+            "type": "text", "text": "abcd", "bold": null, "italic": null,
+            "underline": false, "underlineStyle": null, "underlineColor": null,
+            "strikethrough": false, "strikeDouble": false, "fontSize": 18.0,
+            "color": "000000", "fontFamily": "Arial", "fontFamilyEa": null,
+            "fontFamilySym": null, "baseline": null, "caps": null,
+            "letterSpacing": null, "fieldType": null, "hyperlink": null,
+            "hyperlinkAction": null, "shadow": null, "reflection": null,
+            "outline": null, "highlight": null
+        });
+        let mut paragraphs: Vec<pptx_model::Paragraph> =
+            vec![serde_json::from_value(serde_json::json!({
+                "alignment": "l", "marL": 0, "marR": 0, "indent": 0,
+                "spaceBefore": null, "spaceAfter": null, "spaceLine": null,
+                "lvl": 0, "bullet": {"type": "none"}, "defFontSize": null,
+                "defColor": null, "defBold": null, "defItalic": null,
+                "defFontFamily": null, "tabStops": [], "rtl": false,
+                "eaLnBrk": true, "runs": [run]
+            }))
+            .unwrap()];
+        apply_text_links(
+            &mut paragraphs,
+            &[(1, 3, "https://example.invalid".into())],
+            &[false, false, true, false, false],
+        )
+        .unwrap();
+        let text_runs: Vec<_> = paragraphs[0]
+            .runs
+            .iter()
+            .map(|run| match run {
+                TextRun::Text(text) => text,
+                _ => panic!("unexpected break"),
+            })
+            .collect();
+        assert_eq!(
+            text_runs
+                .iter()
+                .map(|run| run.text.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b", "c", "d"]
+        );
+        assert_eq!(text_runs[0].color.as_deref(), Some("000000"));
+        assert_eq!(text_runs[1].color, None);
+        assert_eq!(text_runs[2].color.as_deref(), Some("000000"));
+        assert_eq!(text_runs[3].color.as_deref(), Some("000000"));
+        assert!(text_runs[1].hyperlink.is_some());
+        assert!(text_runs[2].hyperlink.is_some());
+        assert!(text_runs[0].hyperlink.is_none());
+    }
 
     fn record(options: u16, kind: u16, payload: &[u8]) -> Vec<u8> {
         [

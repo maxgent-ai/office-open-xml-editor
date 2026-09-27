@@ -85,10 +85,44 @@ pub(in crate::ppt) enum Theme {
     Readable {
         theme_xml: String,
         clr_map: Option<String>,
+        /// A master theme is shared by many placeholders; resolve its style
+        /// matrix once when checking explicit line/effect references.
+        format_scheme: std::cell::OnceCell<ooxml_common::theme::ThemeFormatScheme>,
     },
     /// Malformed, oversized or ambiguous: no alternative XML on this
     /// master's slides can be resolved.
     Unreadable,
+}
+
+impl Theme {
+    #[cfg(feature = "direct-ppt")]
+    fn format_scheme(&self) -> Option<&ooxml_common::theme::ThemeFormatScheme> {
+        let Theme::Readable {
+            theme_xml,
+            format_scheme,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        Some(format_scheme.get_or_init(|| ooxml_common::theme::ThemeFormatScheme::parse(theme_xml)))
+    }
+    /// ECMA-376 §20.1.6.2 supplies hlink/folHlink in the theme color scheme.
+    /// PowerPoint-saved PPTX controls retain those slots for legacy slides;
+    /// an inherited binary text color must not hide them on linked text.
+    pub(in crate::ppt) fn hyperlink_colors(&self) -> Option<(String, String)> {
+        let Theme::Readable { theme_xml, .. } = self else {
+            return None;
+        };
+        let colors = ooxml_common::theme::ThemeColorScheme::parse(theme_xml);
+        let color = |slot| {
+            colors
+                .get(slot)
+                .filter(|value| value.len() == 6 && value.bytes().all(|b| b.is_ascii_hexdigit()))
+                .map(str::to_owned)
+        };
+        Some((color("hlink")?, color("folHlink")?))
+    }
 }
 
 /// Read the round-trip theme of a main master's child records; `None` when
@@ -109,6 +143,7 @@ pub(in crate::ppt) fn master_theme(records: &[Record<'_>]) -> Option<Theme> {
         Some(Theme::Readable {
             theme_xml: theme_part(theme.payload)?,
             clr_map,
+            format_scheme: std::cell::OnceCell::new(),
         })
     };
     Some(readable().unwrap_or(Theme::Unreadable))
@@ -841,7 +876,10 @@ pub(in crate::ppt) fn adopt(
     if !matches!(kind.as_str(), "shapeXml" | "connectorXml") {
         return Err(unverifiable("part"));
     }
-    let Theme::Readable { theme_xml, clr_map } = theme else {
+    let Theme::Readable {
+        theme_xml, clr_map, ..
+    } = theme
+    else {
         return Err(unverifiable("theme"));
     };
     let parsed = pptx_parser::parse_standalone_shape_part(
@@ -903,7 +941,7 @@ pub(in crate::ppt) fn adopt(
         (None, None, None)
     };
     let local = if parsed.placeholder {
-        Some(placeholder_locals(blob, &part)?)
+        Some(placeholder_locals(blob, &part, theme)?)
     } else {
         None
     };
@@ -1102,12 +1140,14 @@ struct PlaceholderLocals {
 }
 
 /// A standalone placeholder parser supplies schema defaults where the actual
-/// shape relies on a missing layout. Inspect only the direct `p:spPr` children
-/// to distinguish a local override from inherited geometry and fill. The
-/// archive and part sizes have already passed `inflated_size` and the PPTX
+/// shape relies on a missing layout. Inspect direct `p:spPr` components and
+/// authored `p:style` references to distinguish local style from inherited
+/// layout properties (ECMA-376 Annex L.3.2.3). The archive and part sizes
+/// have already passed `inflated_size` and the PPTX
 /// standalone parser's bounds; this second read is limited to placeholders.
 #[cfg(feature = "direct-ppt")]
-fn placeholder_locals(blob: &[u8], part: &str) -> Result<PlaceholderLocals, String> {
+fn placeholder_locals(blob: &[u8], part: &str, theme: &Theme) -> Result<PlaceholderLocals, String> {
+    use ooxml_common::ns::{is_a_ns, is_p_ns};
     use std::io::Read;
     let unreadable = || unsupported("unreadable PowerPoint alternative shape XML placeholder");
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(blob)).map_err(|_| unreadable())?;
@@ -1125,17 +1165,56 @@ fn placeholder_locals(blob: &[u8], part: &str) -> Result<PlaceholderLocals, Stri
         return Err(unreadable());
     }
     let doc = roxmltree::Document::parse(&xml).map_err(|_| unreadable())?;
-    let sp_pr = doc
-        .root_element()
-        .children()
-        .find(|n| n.is_element() && n.tag_name().name() == "spPr");
+    let sp_pr = doc.root_element().children().find(|n| {
+        n.is_element() && n.tag_name().name() == "spPr" && is_p_ns(n.tag_name().namespace())
+    });
+    let style = doc.root_element().children().find(|n| {
+        n.is_element() && n.tag_name().name() == "style" && is_p_ns(n.tag_name().namespace())
+    });
     let has = |names: &[&str]| {
         sp_pr.is_some_and(|sp_pr| {
-            sp_pr
-                .children()
-                .any(|n| n.is_element() && names.contains(&n.tag_name().name()))
+            sp_pr.children().any(|n| {
+                n.is_element()
+                    && is_a_ns(n.tag_name().namespace())
+                    && names.contains(&n.tag_name().name())
+            })
         })
     };
+    let style_has = |name| {
+        style.is_some_and(|style| {
+            style.children().any(|n| {
+                n.is_element() && is_a_ns(n.tag_name().namespace()) && n.tag_name().name() == name
+            })
+        })
+    };
+    if let Some(style) = style {
+        let format = theme
+            .format_scheme()
+            .ok_or_else(|| unverifiable("placeholder style theme"))?;
+        for reference in style
+            .children()
+            .filter(|node| node.is_element() && is_a_ns(node.tag_name().namespace()))
+        {
+            let selected = match reference.tag_name().name() {
+                "lnRef" => format.lookup_line_ref(
+                    reference
+                        .attribute("idx")
+                        .and_then(|idx| idx.parse().ok())
+                        .ok_or_else(|| unverifiable("placeholder line style"))?,
+                ),
+                "effectRef" => format.lookup_effect_ref(
+                    reference
+                        .attribute("idx")
+                        .and_then(|idx| idx.parse().ok())
+                        .ok_or_else(|| unverifiable("placeholder effect style"))?,
+                ),
+                _ => continue,
+            };
+            if matches!(selected, ooxml_common::theme::StyleMatrixLookup::Missing) {
+                return Err(unverifiable("placeholder style reference"));
+            }
+        }
+    }
     Ok(PlaceholderLocals {
         geometry: has(&["prstGeom", "custGeom"]),
         fill: has(&[
@@ -1146,8 +1225,11 @@ fn placeholder_locals(blob: &[u8], part: &str) -> Result<PlaceholderLocals, Stri
             "blipFill",
             "grpFill",
         ]),
-        stroke: has(&["ln"]),
-        effects: has(&["effectLst", "effectDag"]),
+        stroke: has(&["ln"]) || style_has("lnRef"),
+        // PowerPoint-saved placeholders with only an effectRef retain their
+        // theme-resolved shadow. The standalone parser resolves that style;
+        // replacing it with a shadowless binary fallback drops that shadow.
+        effects: has(&["effectLst", "effectDag"]) || style_has("effectRef"),
     })
 }
 
@@ -1833,6 +1915,19 @@ mod tests {
     use super::*;
     use pptx_model::{Fill, PathCmd};
 
+    #[test]
+    fn round_trip_theme_exposes_authored_hyperlink_colors() {
+        let theme = Theme::Readable {
+            theme_xml: "<a:theme xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\"><a:themeElements><a:clrScheme name=\"Office\"><a:hlink><a:srgbClr val=\"0000FF\"/></a:hlink><a:folHlink><a:srgbClr val=\"800080\"/></a:folHlink></a:clrScheme></a:themeElements></a:theme>".into(),
+            clr_map: None,
+            format_scheme: std::cell::OnceCell::new(),
+        };
+        assert_eq!(
+            theme.hyperlink_colors(),
+            Some(("0000FF".into(), "800080".into()))
+        );
+    }
+
     fn shape(geometry: &str) -> ShapeElement {
         serde_json::from_value(serde_json::json!({
             "x": 0, "y": 0, "width": 100, "height": 50, "rotation": 0.0,
@@ -2460,7 +2555,34 @@ mod tests {
                 alternative_part(&package).unwrap(),
                 Some(("shapeXml".into(), "DRS/shapeXML.xml".into()))
             );
-            assert!(placeholder_locals(&package, "DRS/shapeXML.xml").is_ok());
+            assert!(placeholder_locals(&package, "DRS/shapeXML.xml", &theme()).is_ok());
+        }
+
+        #[test]
+        fn placeholder_style_references_are_local_effects_and_lines() {
+            let shape = SHAPE_XML.replace(
+                "</p:spPr>",
+                "</p:spPr><p:style><a:lnRef idx=\"1\"/><a:effectRef idx=\"1\"/></p:style>",
+            );
+            let local = placeholder_locals(&blob(&shape), "drs/shapexml.xml", &theme()).unwrap();
+            assert!(local.stroke);
+            assert!(local.effects);
+            assert!(local.fill);
+            let foreign = SHAPE_XML.replace(
+                "</p:spPr>",
+                "</p:spPr><x:style xmlns:x=\"urn:foreign\"><x:lnRef/><x:effectRef/></x:style>",
+            );
+            let foreign =
+                placeholder_locals(&blob(&foreign), "drs/shapexml.xml", &theme()).unwrap();
+            assert!(!foreign.stroke);
+            assert!(!foreign.effects);
+            let missing = shape.replace("idx=\"1\"", "idx=\"99\"");
+            assert!(
+                placeholder_locals(&blob(&missing), "drs/shapexml.xml", &theme())
+                    .err()
+                    .unwrap()
+                    .contains("placeholder style reference")
+            );
         }
 
         #[test]
@@ -2521,6 +2643,7 @@ mod tests {
             Theme::Readable {
                 theme_xml: crate::ppt::theme(),
                 clr_map: None,
+                format_scheme: std::cell::OnceCell::new(),
             }
         }
 
@@ -2785,6 +2908,7 @@ mod tests {
                         r#"<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:{prefix}="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><a:themeElements><a:fmtScheme name="x"><a:fillStyleLst><a:blipFill><a:blip {prefix}:embed="rIdImage"/></a:blipFill></a:fillStyleLst></a:fmtScheme></a:themeElements></a:theme>"#
                     ),
                     clr_map: None,
+                    format_scheme: std::cell::OnceCell::new(),
                 };
                 let error = run_adopt(&element, &blob(&xml), &theme, AMPLE)
                     .0

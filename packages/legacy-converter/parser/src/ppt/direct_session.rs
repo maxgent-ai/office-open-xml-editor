@@ -145,6 +145,22 @@ impl DirectSession {
         self.presentation.size
     }
 
+    /// The bootstrap carries one theme hyperlink pair for the presentation.
+    /// A deck with differing or absent slide themes cannot use that global
+    /// field without assigning another slide's color to its links.
+    pub fn hyperlink_colors(&self) -> Option<(String, String)> {
+        let mut themes = self.presentation.metro_themes.iter();
+        let first_theme = themes.next()?.as_ref()?;
+        let first = first_theme.hyperlink_colors()?;
+        for theme in themes {
+            let theme = theme.as_ref()?;
+            if !std::rc::Rc::ptr_eq(theme, first_theme) && theme.hyperlink_colors()? != first {
+                return None;
+            }
+        }
+        Some(first)
+    }
+
     pub fn resource(&self, key: &str) -> Result<Resource<'_>, String> {
         if self.poisoned {
             return Err(unsupported("PowerPoint direct session is poisoned"));
@@ -368,6 +384,31 @@ mod tests {
 
     fn session(bytes: &[u8]) -> Result<DirectSession, String> {
         DirectSession::new(&CompoundFile::open(bytes).unwrap())
+    }
+
+    #[test]
+    fn presentation_link_colors_require_all_slide_themes_to_agree() {
+        let (mut session, _) = cursor_fixture();
+        let theme = |xml: String| {
+            std::rc::Rc::new(metro::Theme::Readable {
+                theme_xml: xml,
+                clr_map: None,
+                format_scheme: std::cell::OnceCell::new(),
+            })
+        };
+        let blue = theme(crate::ppt::theme());
+        session.presentation.metro_themes = vec![Some(blue.clone()), Some(blue)];
+        assert_eq!(
+            session.hyperlink_colors(),
+            Some(("0000FF".into(), "800080".into()))
+        );
+        session.presentation.metro_themes[1] = Some(theme(crate::ppt::theme().replace(
+            "<a:hlink><a:srgbClr val=\"0000FF\"/>",
+            "<a:hlink><a:srgbClr val=\"00FF00\"/>",
+        )));
+        assert_eq!(session.hyperlink_colors(), None);
+        session.presentation.metro_themes[1] = None;
+        assert_eq!(session.hyperlink_colors(), None);
     }
 
     #[test]

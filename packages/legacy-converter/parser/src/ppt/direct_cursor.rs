@@ -49,6 +49,7 @@ impl DirectCursor {
             index,
             part_name: None,
         }));
+        let link_colors = session.hyperlink_colors();
         let bootstrap = PresentationBootstrap {
             slide_count,
             slide_width: i64::from(slide_width),
@@ -56,8 +57,8 @@ impl DirectCursor {
             default_text_color: None,
             major_font: None,
             minor_font: None,
-            hlink_color: None,
-            fol_hlink_color: None,
+            hlink_color: link_colors.as_ref().map(|colors| colors.0.clone()),
+            fol_hlink_color: link_colors.map(|colors| colors.1),
             embedded_fonts: Vec::new(),
             slides,
         };

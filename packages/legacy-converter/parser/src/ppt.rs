@@ -331,6 +331,7 @@ pub(crate) fn fuzz_alternative(data: &[u8]) {
     let theme = metro::Theme::Readable {
         theme_xml: theme(),
         clr_map: None,
+        format_scheme: std::cell::OnceCell::new(),
     };
     let mut package = std::io::Cursor::new(Vec::new());
     {
