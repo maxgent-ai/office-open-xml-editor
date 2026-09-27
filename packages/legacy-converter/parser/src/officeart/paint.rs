@@ -26,6 +26,10 @@ pub(crate) struct Paint {
     pub(crate) fill_focus: Option<u32>,
     pub(crate) fill_shade_type: Option<u32>,
     pub(crate) fill_dztype: Option<u32>,
+    /// MS-ODRAW 2.3.7.12-13: signed lengths in the units named by fillDztype.
+    /// Preserve them even when the host has not yet chosen tile projection.
+    pub(crate) fill_width: Option<i32>,
+    pub(crate) fill_height: Option<i32>,
     pub(crate) fill_origins: [Option<u32>; 4],
     pub(crate) filled: Option<bool>,
     pub(crate) line_type: Option<u32>,
@@ -137,6 +141,8 @@ impl Paint {
             fill_focus: self.fill_focus.or(parent.fill_focus),
             fill_shade_type: self.fill_shade_type.or(parent.fill_shade_type),
             fill_dztype: self.fill_dztype.or(parent.fill_dztype),
+            fill_width: self.fill_width.or(parent.fill_width),
+            fill_height: self.fill_height.or(parent.fill_height),
             fill_origins: std::array::from_fn(|i| self.fill_origins[i].or(parent.fill_origins[i])),
             filled: self.filled.or(parent.filled),
             line_type: self.line_type.or(parent.line_type),
@@ -187,6 +193,8 @@ impl Paint {
                 }
             }
             0x195 => self.fill_dztype = Some(value),
+            0x189 => self.fill_width = Some(value as i32),
+            0x18a => self.fill_height = Some(value as i32),
             0x198..=0x19b => self.fill_origins[usize::from(id - 0x198)] = Some(value),
             // Boolean property's high word contains use bits, low word values.
             // MS-ODRAW 2.3.7.43 and 2.3.8.38: unused values cannot override paint.
@@ -299,6 +307,26 @@ impl Paint {
             && self.line_ok.unwrap_or(true)
             && self.line_type.unwrap_or(0) == 0)
             .then_some((self.line.unwrap_or(0), self.line_alpha.unwrap_or(65536)))
+    }
+}
+
+#[cfg(all(test, feature = "direct-ppt"))]
+mod tile_dimension_tests {
+    use super::Paint;
+
+    #[test]
+    fn signed_texture_dimensions_and_unit_survive_property_merge() {
+        let mut master = Paint::default();
+        master.property(0x189, (-914_400i32) as u32).unwrap();
+        master.property(0x18a, 457_200).unwrap();
+        master.property(0x195, 1).unwrap();
+        let mut local = Paint::default();
+        local.property(0x189, 914_400).unwrap();
+        let merged = local.inherit(&master);
+        assert_eq!(merged.fill_width, Some(914_400));
+        assert_eq!(merged.fill_height, Some(457_200));
+        assert_eq!(merged.fill_dztype, Some(1));
+        assert_eq!(master.fill_width, Some(-914_400));
     }
 }
 
