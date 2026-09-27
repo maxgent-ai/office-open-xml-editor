@@ -4,7 +4,7 @@ use super::*;
 use ooxml_common::blip::{BlipEffect, SrcRect};
 use pptx_model::{
     Fill, PictureElement, ShapeElement, Slide, SlideElement, SlideElementOrigin,
-    SlideElementSource, TextBody,
+    SlideElementSource, TextBody, TextRun,
 };
 
 const MAX_MODEL_SHAPES: usize = 100_000;
@@ -44,17 +44,99 @@ fn document_text_axes(
         .flatten()
 }
 
-/// Pattern and texture fills need tile semantics (the pattern bitmap's
-/// foreground/background colors, the texture's intrinsic tile size) that the
-/// direct model does not derive, and a picture fill with a separate fill
-/// rectangle or view-relative placement has no shape-local stretch. Reject
-/// them rather than leaving the shape or slide unfilled.
+/// Ordinary shape texture fills need placement evidence beyond the measured
+/// slide-background projection. A picture fill with a separate fill rectangle
+/// or view-relative placement has no shape-local stretch. Reject these rather
+/// than leaving the shape or slide unfilled.
 fn unprojected_blip_fill(kind: u32) -> String {
     unsupported(match kind {
         1 => "PowerPoint pattern fill is not projected",
         2 => "PowerPoint texture fill is not projected",
         _ => "PowerPoint picture fill placement is not projected",
     })
+}
+
+/// [MS-PPT] 2.9.59 ranges are UTF-16 positions in the original text atom;
+/// the paragraph separator occupies one position. A click range can cut a
+/// style run, so split that run at UTF-16-safe character boundaries.
+fn apply_text_links(
+    paragraphs: &mut [pptx_model::Paragraph],
+    links: &[(usize, usize, String)],
+) -> Result<(), String> {
+    let mut position = 0usize;
+    let mut seen = vec![false; links.len()];
+    let count = paragraphs.len();
+    for (paragraph_index, paragraph) in paragraphs.iter_mut().enumerate() {
+        let mut projected = Vec::new();
+        for run in std::mem::take(&mut paragraph.runs) {
+            let len = match &run {
+                TextRun::Text(data) => data.text.encode_utf16().count(),
+                TextRun::Break => 1,
+                TextRun::Math { .. } => return Err(unsupported("PowerPoint linked equation")),
+            };
+            let end = position
+                .checked_add(len)
+                .ok_or_else(|| unsupported("PowerPoint text link range overflow"))?;
+            match run {
+                TextRun::Text(data) if len > 0 => {
+                    let mut cuts = vec![0, len];
+                    for (begin, cutoff, _) in links {
+                        for edge in [*begin, *cutoff] {
+                            if position < edge && edge < end {
+                                cuts.push(edge - position);
+                            }
+                        }
+                    }
+                    cuts.sort_unstable();
+                    cuts.dedup();
+                    let mut positions = vec![(0, 0)];
+                    let mut unit = 0;
+                    for (byte, ch) in data.text.char_indices() {
+                        unit += ch.len_utf16();
+                        positions.push((unit, byte + ch.len_utf8()));
+                    }
+                    for pair in cuts.windows(2) {
+                        let byte_at = |offset| {
+                            positions
+                                .iter()
+                                .find(|(unit, _)| *unit == offset)
+                                .map(|(_, byte)| *byte)
+                        };
+                        let first = byte_at(pair[0]).ok_or_else(|| {
+                            unsupported("PowerPoint text link splits a surrogate")
+                        })?;
+                        let last = byte_at(pair[1]).ok_or_else(|| {
+                            unsupported("PowerPoint text link splits a surrogate")
+                        })?;
+                        let mut part = data.clone();
+                        part.text = data.text[first..last].to_owned();
+                        let begin = position + pair[0];
+                        let cutoff = position + pair[1];
+                        for (index, (link_begin, link_end, target)) in links.iter().enumerate() {
+                            if *link_begin <= begin && cutoff <= *link_end {
+                                if part.hyperlink.is_some() {
+                                    return Err(unsupported("overlapping PowerPoint text links"));
+                                }
+                                part.hyperlink = Some(target.clone());
+                                seen[index] = true;
+                            }
+                        }
+                        projected.push(TextRun::Text(part));
+                    }
+                }
+                other => projected.push(other),
+            }
+            position = end;
+        }
+        paragraph.runs = projected;
+        if paragraph_index + 1 < count {
+            position += 1;
+        }
+    }
+    if seen.iter().any(|seen| !seen) {
+        return Err(unsupported("PowerPoint text link range has no run"));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -113,12 +195,36 @@ impl Context<'_> {
         let background = match &self.presentation.backgrounds[self.index] {
             Some(background) => {
                 self.charge_shape_strings()?;
-                let image = background
-                    .paint
-                    .background_image()
-                    .map(|(id, alpha)| self.image_fill(id, alpha, false))
-                    .transpose()?
-                    .flatten();
+                let image = if let Some((id, alpha)) = background.paint.background_texture() {
+                    let mut image = self.image_fill(id, alpha, true)?;
+                    if let Some(Fill::Image {
+                        dpi, stretch, tile, ..
+                    }) = image.as_mut()
+                    {
+                        // PowerPoint 16 saved a slide-background msofillTexture
+                        // as a 100% intrinsic tile at (0,0), even when binary
+                        // origin and EMU tile dimensions were changed. These
+                        // controls do not establish ordinary shape textures.
+                        *dpi = Some(0);
+                        *stretch = false;
+                        *tile = Some(ooxml_common::fill::TileInfo {
+                            tx: Some(0),
+                            ty: Some(0),
+                            sx: Some(1.0),
+                            sy: Some(1.0),
+                            flip: Some("none".to_owned()),
+                            algn: Some("tl".to_owned()),
+                        });
+                    }
+                    image
+                } else {
+                    background
+                        .paint
+                        .background_image()
+                        .map(|(id, alpha)| self.image_fill(id, alpha, false))
+                        .transpose()?
+                        .flatten()
+                };
                 let gradient = background
                     .paint
                     .project_gradient(
@@ -391,10 +497,12 @@ impl Context<'_> {
         };
         let deferred_effect = std::cell::Cell::new(None);
         let mut raw_text = None;
+        let mut direct_size_authored = None;
         let text = self.text_body(
             &shape,
             inherited,
             &mut raw_text,
+            &mut direct_size_authored,
             metro_blob.as_ref().map(|_| &deferred_effect),
         )?;
         // Shape types map to presets as PowerPoint converts them; an unmapped
@@ -577,14 +685,28 @@ impl Context<'_> {
                     leaf: &local,
                     nested: !ancestors.is_empty(),
                     text: raw_text.as_deref(),
+                    direct_size_authored: direct_size_authored.as_deref(),
                     fill: recorded_fill,
                     path_paint: authored_paths.take(),
                     adjust_bounds,
+                    image_bytes: if matches!(element.fill, Some(Fill::Image { .. })) {
+                        let id = paint
+                            .foreground_image()
+                            .map(|(id, ..)| id)
+                            .or_else(|| paint.pattern_image().map(|(id, ..)| id));
+                        id.map(|id| self.media.image(id, self.backing, self.pictures))
+                            .transpose()?
+                            .flatten()
+                            .map(|(_, bytes)| bytes.to_vec())
+                    } else {
+                        None
+                    },
                 };
                 crate::ppt::metro::adopt(
                     &binary,
                     span.view(self.backing)?,
                     theme,
+                    self.media,
                     self.work_budget,
                     self.text_budget,
                     self.model_budget,
@@ -862,6 +984,7 @@ impl Context<'_> {
         shape: &SpannedShape,
         inherited: bool,
         raw_text: &mut Option<String>,
+        direct_size_authored: &mut Option<Vec<bool>>,
         deferred_effect: Option<&std::cell::Cell<Option<&'static str>>>,
     ) -> Result<Option<TextBody>, String> {
         let Some(textbox) = shape.textbox.as_ref() else {
@@ -874,9 +997,44 @@ impl Context<'_> {
         let mut outline_body = false;
         let mut local_ruler = None;
         let mut ruler_seen = false;
+        let mut pending_action = None;
+        let mut text_links = Vec::new();
         for atom in parse_record_spans(self.backing, textbox.payload_span(), self.work_budget)? {
             let view = atom.view(self.backing)?;
             match view.kind {
+                0x0ff2 if shape.props.metro.is_some() => {
+                    // [MS-PPT] 2.6.8-10: a click action immediately precedes
+                    // its 2.9.57 text-range atom in a client textbox.
+                    if view.version != 15 || pending_action.is_some() {
+                        return Err(unsupported("invalid PowerPoint text interaction"));
+                    }
+                    let children =
+                        parse_record_spans(self.backing, atom.payload_span(), self.work_budget)?;
+                    if children.len() != 1 {
+                        return Err(unsupported("invalid PowerPoint text interaction"));
+                    }
+                    let action = children[0].view(self.backing)?;
+                    if action.kind != 0x0ff3 || action.version != 0 || action.payload.len() != 16 {
+                        return Err(unsupported("invalid PowerPoint text interaction atom"));
+                    }
+                    pending_action = Some((u32_at(action.payload, 4)?, action.payload[8]));
+                }
+                0x0fdf if shape.props.metro.is_some() => {
+                    if view.version != 0 || view.instance != 0 || view.payload.len() != 8 {
+                        return Err(unsupported("invalid PowerPoint text link range"));
+                    }
+                    let (id, action) = pending_action
+                        .take()
+                        .ok_or_else(|| unsupported("orphan PowerPoint text link range"))?;
+                    if action == 4 {
+                        let begin = u32_at(view.payload, 0)? as usize;
+                        let end = u32_at(view.payload, 4)? as usize;
+                        if begin >= end {
+                            return Err(unsupported("invalid PowerPoint text link range"));
+                        }
+                        text_links.push((begin, end, self.presentation.hyperlinks.get(id)?));
+                    }
+                }
                 3999 => {
                     if text_type.is_some() || !blocks.is_empty() {
                         return Err(unsupported("ambiguous PowerPoint text header"));
@@ -976,7 +1134,14 @@ impl Context<'_> {
                 .as_deref()
                 .expect("constructed for absent style"),
         };
-        let paragraphs = text_style::direct_model::paragraphs_with_axes(
+        if shape.props.metro.is_some() {
+            *direct_size_authored = Some(text_style::direct_size_mask(
+                &blocks[0],
+                style_bytes,
+                self.work_budget,
+            )?);
+        }
+        let mut paragraphs = text_style::direct_model::paragraphs_with_axes(
             &blocks[0],
             style_bytes,
             text_style::Context {
@@ -1005,6 +1170,9 @@ impl Context<'_> {
             self.work_budget,
             self.model_budget,
         )?;
+        if !text_links.is_empty() {
+            apply_text_links(&mut paragraphs, &text_links)?;
+        }
         let p = &shape.props;
         Ok(Some(TextBody {
             vertical_anchor: p.anchor.to_owned(),
@@ -1215,6 +1383,7 @@ mod tests {
             schemes: vec![None],
             image_entries: Vec::new(),
             ole_objects: media::OleCatalog::default(),
+            hyperlinks: media::HyperlinkCatalog::default(),
             backgrounds: vec![None],
             object_masters: vec![std::rc::Rc::from([])],
             size: (720, 540),

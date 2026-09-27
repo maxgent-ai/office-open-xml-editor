@@ -162,6 +162,9 @@ impl Geometry<'_> {
                     3 if count == 1 => reader.close()?,
                     4 if count == 0 => reader.end(),
                     5 => match ((word >> 8) & 31, word & 255) {
+                        (3, n) if n != 0 && n % 4 == 0 => {
+                            reader.quarter_arcs(usize::from(n) / 4)?
+                        }
                         (10, 0) => reader.current.fill = false,
                         (11, 0) => reader.current.stroke = false,
                         // Arc/guide/editing escapes are not guessed as lines.
@@ -212,6 +215,13 @@ pub(crate) enum DecodedCommand {
     Move(Point),
     Line(Point),
     Cubic([Point; 3]),
+    /// A proven OfficeArt ArcTo quarter ellipse, in DrawingML degree units.
+    Arc {
+        wr: i64,
+        hr: i64,
+        start: i32,
+        end: Point,
+    },
     Close,
 }
 struct Path {
@@ -323,6 +333,73 @@ impl PathReader<'_, '_> {
         for _ in 0..count {
             let points = [self.point()?, self.point()?, self.point()?];
             self.current.commands.push(DecodedCommand::Cubic(points));
+        }
+        Ok(())
+    }
+    fn quarter_arcs(&mut self, count: usize) -> Result<(), String> {
+        if !self.open {
+            return Err(unsupported("OfficeArt arc without current point"));
+        }
+        for _ in 0..count {
+            // MS-ODRAW 2.4.31 ArcTo uses bounding-rectangle corners then
+            // radial points. PowerPoint 16 saves quarter arcs with these
+            // cardinal endpoints as DrawingML elliptical arcs. Other arcs
+            // remain unprojected rather than guessed from one control.
+            let [tl, br, start, end] = [self.point()?, self.point()?, self.point()?, self.point()?];
+            let (dx, dy) = (br[0] - tl[0], br[1] - tl[1]);
+            if dx <= 0 || dy <= 0 || dx % 2 != 0 || dy % 2 != 0 {
+                return Err(unsupported("OfficeArt non-quarter arc is not projected"));
+            }
+            let (wr, hr) = (dx / 2, dy / 2);
+            let (cx, cy) = (tl[0] + wr, tl[1] + hr);
+            let near = |a: i64, b: i64| (a - b).abs() <= 1;
+            let angle = if near(start[0], cx)
+                && near(start[1], tl[1])
+                && near(end[0], tl[0])
+                && near(end[1], cy)
+            {
+                270
+            } else if near(start[0], tl[0])
+                && near(start[1], cy)
+                && near(end[0], cx)
+                && near(end[1], br[1])
+            {
+                180
+            } else if near(start[0], cx)
+                && near(start[1], br[1])
+                && near(end[0], br[0])
+                && near(end[1], cy)
+            {
+                90
+            } else if near(start[0], br[0])
+                && near(start[1], cy)
+                && near(end[0], cx)
+                && near(end[1], tl[1])
+            {
+                0
+            } else {
+                return Err(unsupported("OfficeArt non-quarter arc is not projected"));
+            };
+            let current = self
+                .current
+                .commands
+                .iter()
+                .rev()
+                .find_map(|command| match command {
+                    DecodedCommand::Move(p) | DecodedCommand::Line(p) => Some(*p),
+                    DecodedCommand::Cubic(points) => Some(points[2]),
+                    DecodedCommand::Arc { end, .. } => Some(*end),
+                    DecodedCommand::Close => None,
+                });
+            if current != Some(start) {
+                self.current.commands.push(DecodedCommand::Line(start));
+            }
+            self.current.commands.push(DecodedCommand::Arc {
+                wr,
+                hr,
+                start: angle,
+                end,
+            });
         }
         Ok(())
     }
@@ -444,6 +521,9 @@ mod tests {
                         }
                     }
                     DecodedCommand::Close => out.push_str(" Z"),
+                    DecodedCommand::Arc { wr, hr, start, .. } => {
+                        out.push_str(&format!(" A{wr},{hr},{start}"))
+                    }
                 }
             }
         }
@@ -525,14 +605,23 @@ mod tests {
         assert!(geometry(&bad, None).decode(&mut 100).is_err());
     }
     #[test]
-    fn unsupported_compact_points_guides_and_arc_escapes_are_not_guessed() {
+    fn unsupported_compact_points_and_guides_are_not_guessed() {
         let compact = [1, 0, 1, 0, 0xf0, 0xff, 0, 0, 0, 0];
         assert!(geometry(&compact, None).decode(&mut 100).unwrap().is_none());
         let guide = vertices(&[[i32::MIN, 0]]);
         assert!(geometry(&guide, None).decode(&mut 100).unwrap().is_none());
         let v = vertices(&[[0, 0]]);
         let arc = segments(&[0x4000, 0xa304, 0x8000]);
-        assert!(geometry(&v, Some(&arc)).decode(&mut 100).unwrap().is_none());
+        assert!(geometry(&v, Some(&arc)).decode(&mut 100).is_err());
+    }
+    #[test]
+    fn quadrant_arc_escape_projects_its_cardinal_ellipse() {
+        let v = vertices(&[[10, 0], [0, 0], [20, 20], [10, 0], [0, 10], [10, 0]]);
+        let s = segments(&[0x4000, 0xa304, 1, 0x6001, 0x8000]);
+        let out = geometry(&v, Some(&s)).decode(&mut 100).unwrap().unwrap();
+        assert!(describe(&out).contains("A10,10,270"));
+        let invalid = vertices(&[[10, 0], [0, 0], [20, 20], [8, 0], [0, 10], [10, 0]]);
+        assert!(geometry(&invalid, Some(&s)).decode(&mut 100).is_err());
     }
     #[test]
     fn rejects_vertex_underflow_unused_points_and_malformed_segment_state() {

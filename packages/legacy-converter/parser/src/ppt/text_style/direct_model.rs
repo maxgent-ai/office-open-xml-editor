@@ -308,20 +308,40 @@ fn model_run(
         text.len(),
         "PowerPoint direct text model budget exceeded",
     )?;
-    // MS-PPT 2.9.16 CFStyle shadow and emboss are visible glyph effects whose
-    // appearance the format does not define (no offset, blur or color), and
-    // DrawingML has no equivalent flag. Office-saved decks keep the authored
-    // effect parameters only in the alternative shape XML, which the direct
-    // model does not read. Reject rather than drop the effect.
-    for (bit, name) in [(0x10u16, "shadow"), (0x200, "emboss")] {
-        if character.mask & u32::from(bit) != 0 && character.style & bit != 0 {
-            match context.deferred_effect {
-                Some(deferred) => deferred.set(Some(name)),
-                None => {
-                    return Err(unsupported(format!(
-                        "PowerPoint text {name} effect is not projected"
-                    )))
-                }
+    // MS-PPT 2.9.16 CFStyle records only the visible shadow bit, not its
+    // geometry. PowerPoint 16 saved runs on both the original and binary-only
+    // control with black 43.137% outer shadow, 38100-EMU blur/distance and
+    // 45-degree direction. An adopted alternative keeps its own run effect;
+    // this supplies the binary fallback when no alternative is adopted.
+    let shadow = if character.mask & 0x10 != 0 && character.style & 0x10 != 0 {
+        charge_units(
+            model_budget,
+            80,
+            "PowerPoint direct text model budget exceeded",
+        )?;
+        Some(ooxml_common::effect::Shadow {
+            color: "000000".to_owned(),
+            alpha: 0.43137,
+            blur: 38100,
+            dist: 38100,
+            dir: 45.0,
+            sx: None,
+            sy: None,
+            kx: None,
+            ky: None,
+            algn: Some("tl".to_owned()),
+            rot_with_shape: None,
+        })
+    } else {
+        None
+    };
+    if character.mask & 0x200 != 0 && character.style & 0x200 != 0 {
+        match context.deferred_effect {
+            Some(deferred) => deferred.set(Some("emboss")),
+            None => {
+                return Err(unsupported(
+                    "PowerPoint text emboss effect is not projected",
+                ))
             }
         }
     }
@@ -360,7 +380,7 @@ fn model_run(
         field_type: None,
         hyperlink: None,
         hyperlink_action: None,
-        shadow: None,
+        shadow,
         reflection: None,
         outline: None,
         highlight: None,
@@ -621,7 +641,7 @@ mod tests {
     }
 
     #[test]
-    fn text_shadow_and_emboss_reject_visible_runs_only() {
+    fn text_shadow_uses_the_measured_binary_fallback_and_emboss_stays_gated() {
         let mut base = Level::empty(0);
         base.paragraph.margin = Some(0);
         base.paragraph.indent = Some(0);
@@ -640,8 +660,21 @@ mod tests {
                 u16s(bit as u16),
             ]
             .concat();
-            let error = paragraphs("X", &effect, context, &mut 100, &mut 100_000).unwrap_err();
-            assert!(error.contains(name), "{error}");
+            if name == "shadow" {
+                let projected = paragraphs("X", &effect, context, &mut 100, &mut 100_000).unwrap();
+                let TextRun::Text(run) = &projected[0].runs[0] else {
+                    panic!("expected a visible text run");
+                };
+                let shadow = run.shadow.as_ref().unwrap();
+                assert_eq!(shadow.color, "000000");
+                assert_eq!(
+                    (shadow.alpha, shadow.blur, shadow.dist, shadow.dir),
+                    (0.43137, 38100, 38100, 45.0)
+                );
+            } else {
+                let error = paragraphs("X", &effect, context, &mut 100, &mut 100_000).unwrap_err();
+                assert!(error.contains(name), "{error}");
+            }
             // A cleared effect bit and effect-only empty text stay admitted.
             let cleared = [u32s(2), u16s(0), u32s(0), u32s(2), u32s(bit), u16s(0)].concat();
             assert!(paragraphs("X", &cleared, context, &mut 100, &mut 100_000).is_ok());

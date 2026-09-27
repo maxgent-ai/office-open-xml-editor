@@ -88,8 +88,10 @@ impl Paint {
         if self.fill_rect.unwrap_or(false) {
             return None;
         }
-        if self.fill_type.unwrap_or(0) == 3 {
-            return image_fill.filter(|_| self.background_image().is_some());
+        if matches!(self.fill_type.unwrap_or(0), 2 | 3) {
+            return image_fill.filter(|_| {
+                self.background_image().is_some() || self.background_texture().is_some()
+            });
         }
         (self.fill_type.unwrap_or(0) == 0)
             .then(|| {

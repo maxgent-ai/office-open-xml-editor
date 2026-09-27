@@ -33,7 +33,7 @@
 //!   omitted shape properties from the binary projection;
 //! - anything else fails closed as unsupported: an oversized, over-budget,
 //!   ambiguous or unreadable package or theme, a part that is not a shape or
-//!   connector, relationship references, and a compared attribute that the
+//!   connector, unverified relationship references, and a compared attribute that the
 //!   two forms state in ways this reader cannot equate. Placeholder shape
 //!   properties omitted locally inherit from the binary projection; their
 //!   transform always follows the binary anchor (PowerPoint 16 controls).
@@ -174,6 +174,9 @@ pub(in crate::ppt) struct BinaryShape<'a> {
     pub nested: bool,
     /// The binary text characters, if any.
     pub text: Option<&'a str>,
+    /// Direct CFStyle font-size bits, before master inheritance. Only used
+    /// when an XML picture bullet needs inherited-size normalization.
+    pub direct_size_authored: Option<&'a [bool]>,
     pub fill: RecordedFill,
     /// Authored per-path (fill, stroke) flags of custom geometry, before
     /// PowerPoint's open-path display rule (`officeart::geometry`).
@@ -181,6 +184,9 @@ pub(in crate::ppt) struct BinaryShape<'a> {
     /// The range of each converted preset adjust value under the rounding
     /// of the binary anchor (`officeart::preset::adjustment_bounds`).
     pub adjust_bounds: [Option<(f64, f64)>; 8],
+    /// Already admitted OfficeArt image bytes for a picture fill. The image
+    /// path in `element.fill` identifies the same retained resource.
+    pub image_bytes: Option<Vec<u8>>,
 }
 
 /// The fill a binary shape records (MS-ODRAW 2.3.7), as a model fill.
@@ -382,6 +388,424 @@ fn validate_blob_references(blob: &[u8], part: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Read one image that is the only reference in the alternative shape part.
+/// The ZIP and part size limits were checked at the adoption boundary. A
+/// non-image or second reference is left to the typed relationship gate.
+#[cfg(feature = "direct-ppt")]
+fn sole_blob_image(blob: &[u8], part: &str, image_path: &str) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let unreadable = || unverifiable("relationship");
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(blob)).map_err(|_| unreadable())?;
+    let xml = read_blob_reference_part(&mut archive, part)?;
+    let doc = ooxml_common::depth::parse_guarded(&xml).map_err(|_| unreadable())?;
+    let refs: Vec<_> = doc
+        .descendants()
+        .flat_map(|node| node.attributes().map(move |attribute| (node, attribute)))
+        .filter(|(_, attribute)| ooxml_common::ns::is_r_ns(attribute.namespace()))
+        .collect();
+    if refs.len() != 1 || refs[0].0.tag_name().name() != "blip" || refs[0].1.name() != "embed" {
+        return Err(unreadable());
+    }
+    let id = refs[0].1.value();
+    let rels_path = ooxml_common::rels::relationship_part_path(part);
+    let rels = read_blob_reference_part(&mut archive, &rels_path)?;
+    let rels = ooxml_common::depth::parse_guarded(&rels).map_err(|_| unreadable())?;
+    let mut matching = rels.descendants().filter(|node| {
+        node.is_element()
+            && node.tag_name().name() == "Relationship"
+            && node.attribute("Id") == Some(id)
+    });
+    let relationship = matching.next().ok_or_else(unreadable)?;
+    if matching.next().is_some()
+        || !relationship
+            .attribute("Type")
+            .is_some_and(|kind| kind.ends_with("/image"))
+        || relationship
+            .attribute("TargetMode")
+            .is_some_and(|mode| mode != "Internal")
+    {
+        return Err(unreadable());
+    }
+    let target = ooxml_common::rels::resolve_part_name(
+        part,
+        relationship.attribute("Target").ok_or_else(unreadable)?,
+    )
+    .ok_or_else(unreadable)?;
+    if target != image_path {
+        return Err(unreadable());
+    }
+    let index = crate::opc_part::entry_index(&archive, &target).ok_or_else(unreadable)?;
+    let entry = archive.by_index(index).map_err(|_| unreadable())?;
+    if entry.size() > MAX_PART_BYTES || entry.encrypted() {
+        return Err(unreadable());
+    }
+    let mut bytes = Vec::new();
+    entry
+        .take(MAX_PART_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| unreadable())?;
+    if bytes.len() as u64 > MAX_PART_BYTES {
+        return Err(unreadable());
+    }
+    Ok(bytes)
+}
+
+/// A shape whose only OPC dependencies are external click URLs can be
+/// compared to [MS-PPT] InteractiveInfoAtom/ExHyperlinkContainer targets.
+/// Other relationship classes still have no binary counterpart here.
+#[cfg(feature = "direct-ppt")]
+fn blob_hyperlinks_only(blob: &[u8], part: &str) -> Result<bool, String> {
+    use std::collections::BTreeSet;
+    let unreadable = || unverifiable("relationship");
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(blob)).map_err(|_| unreadable())?;
+    let xml = read_blob_reference_part(&mut archive, part)?;
+    let doc = ooxml_common::depth::parse_guarded(&xml).map_err(|_| unreadable())?;
+    let mut ids = BTreeSet::new();
+    for node in doc.descendants() {
+        for attr in node
+            .attributes()
+            .filter(|a| ooxml_common::ns::is_r_ns(a.namespace()))
+        {
+            if node.tag_name().name() != "hlinkClick" || attr.name() != "id" {
+                return Ok(false);
+            }
+            ids.insert(attr.value().to_owned());
+        }
+    }
+    if ids.is_empty() {
+        return Ok(false);
+    }
+    let rels_path = ooxml_common::rels::relationship_part_path(part);
+    let rels = read_blob_reference_part(&mut archive, &rels_path)?;
+    let rels = ooxml_common::depth::parse_guarded(&rels).map_err(|_| unreadable())?;
+    Ok(ids.iter().all(|id| {
+        rels.descendants()
+            .filter(|n| {
+                n.is_element()
+                    && n.tag_name().name() == "Relationship"
+                    && n.attribute("Id") == Some(id)
+            })
+            .count()
+            == 1
+            && rels.descendants().any(|n| {
+                n.is_element()
+                    && n.tag_name().name() == "Relationship"
+                    && n.attribute("Id") == Some(id)
+                    && n.attribute("Type")
+                        .is_some_and(|t| t.ends_with("/hyperlink"))
+                    && n.attribute("TargetMode") == Some("External")
+            })
+    }))
+}
+
+/// Return only image references used by DrawingML picture bullets. The
+/// presentation model already has a generic buBlip marker; this extracts its
+/// passive OPC targets for the legacy resource provider. Unrelated links are
+/// left at the typed gate.
+#[cfg(any(test, feature = "direct-ppt"))]
+type BlobBulletAsset = (String, &'static str, Vec<u8>);
+
+#[cfg(feature = "direct-ppt")]
+fn blob_bullet_images(blob: &[u8], part: &str) -> Result<Option<Vec<BlobBulletAsset>>, String> {
+    use std::collections::BTreeMap;
+    use std::io::Read;
+    let unreadable = || unverifiable("relationship");
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(blob)).map_err(|_| unreadable())?;
+    let xml = read_blob_reference_part(&mut archive, part)?;
+    let doc = ooxml_common::depth::parse_guarded(&xml).map_err(|_| unreadable())?;
+    let mut ids = Vec::new();
+    for node in doc.descendants() {
+        for attr in node
+            .attributes()
+            .filter(|a| ooxml_common::ns::is_r_ns(a.namespace()))
+        {
+            if node.tag_name().name() != "blip"
+                || node
+                    .parent()
+                    .is_none_or(|p| p.tag_name().name() != "buBlip")
+                || attr.name() != "embed"
+            {
+                return Ok(None);
+            }
+            ids.push(attr.value().to_owned());
+        }
+    }
+    if ids.is_empty() {
+        return Ok(None);
+    }
+    let rels_path = ooxml_common::rels::relationship_part_path(part);
+    let rels = read_blob_reference_part(&mut archive, &rels_path)?;
+    let rels = ooxml_common::depth::parse_guarded(&rels).map_err(|_| unreadable())?;
+    let mut images = BTreeMap::new();
+    for id in ids {
+        let mut matches = rels.descendants().filter(|n| {
+            n.is_element()
+                && n.tag_name().name() == "Relationship"
+                && n.attribute("Id") == Some(id.as_str())
+        });
+        let relation = matches.next().ok_or_else(unreadable)?;
+        if matches.next().is_some()
+            || !relation
+                .attribute("Type")
+                .is_some_and(|t| t.ends_with("/image"))
+            || relation
+                .attribute("TargetMode")
+                .is_some_and(|m| m != "Internal")
+        {
+            return Err(unreadable());
+        }
+        let path = ooxml_common::rels::resolve_part_name(
+            part,
+            relation.attribute("Target").ok_or_else(unreadable)?,
+        )
+        .ok_or_else(unreadable)?;
+        if images.contains_key(&path) {
+            continue;
+        }
+        let extension = match path
+            .rsplit_once('.')
+            .map(|(_, ext)| ext.to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("gif") => "gif",
+            Some("png") => "png",
+            Some("jpg" | "jpeg") => "jpg",
+            _ => return Err(unreadable()),
+        };
+        let index = crate::opc_part::entry_index(&archive, &path).ok_or_else(unreadable)?;
+        let entry = archive.by_index(index).map_err(|_| unreadable())?;
+        if entry.size() > MAX_PART_BYTES || entry.encrypted() {
+            return Err(unreadable());
+        }
+        let mut bytes = Vec::new();
+        entry
+            .take(MAX_PART_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| unreadable())?;
+        let signature = match extension {
+            "gif" => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
+            "png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+            _ => bytes.starts_with(&[0xff, 0xd8, 0xff]),
+        };
+        if !signature || bytes.len() as u64 > MAX_PART_BYTES {
+            return Err(unreadable());
+        }
+        images.insert(path, (extension, bytes));
+    }
+    Ok(Some(
+        images
+            .into_iter()
+            .map(|(path, (ext, bytes))| (path, ext, bytes))
+            .collect(),
+    ))
+}
+
+/// OfficeArt msofillPattern stores a 10x10 GIF but tiles only its upper-left
+/// 8x8 cells. PowerPoint 16 controls of pct30 and ltUpDiag show that white
+/// pixels map to the XML foreground and black to the background. Decode only
+/// a single bounded GIF image; other encodings remain unverifiable.
+#[cfg(any(test, feature = "direct-ppt"))]
+fn binary_pattern_cells(bytes: &[u8]) -> Option<[u8; 8]> {
+    if bytes.len() > 4096 || bytes.len() < 26 || !matches!(&bytes[..6], b"GIF87a" | b"GIF89a") {
+        return None;
+    }
+    let word = |at: usize| -> Option<u16> {
+        Some(u16::from_le_bytes(bytes.get(at..at + 2)?.try_into().ok()?))
+    };
+    if word(6)? != 10 || word(8)? != 10 {
+        return None;
+    }
+    let mut at = 13usize;
+    let table_len = |flag: u8| 3usize.checked_mul(1usize << (usize::from(flag & 7) + 1));
+    let mut palette = if bytes[10] & 0x80 != 0 {
+        let len = table_len(bytes[10])?;
+        let table = bytes.get(at..at + len)?.to_vec();
+        at += len;
+        table
+    } else {
+        return None;
+    };
+    let mut transparent = None;
+    let mut pixels = None;
+    while at < bytes.len() {
+        let kind = *bytes.get(at)?;
+        at += 1;
+        match kind {
+            0x21 => {
+                let label = *bytes.get(at)?;
+                at += 1;
+                if label == 0xf9 {
+                    if *bytes.get(at)? != 4 {
+                        return None;
+                    }
+                    let packed = *bytes.get(at + 1)?;
+                    transparent = (packed & 1 != 0).then_some(*bytes.get(at + 4)?);
+                }
+                loop {
+                    let size = usize::from(*bytes.get(at)?);
+                    at += 1;
+                    if size == 0 {
+                        break;
+                    }
+                    at = at.checked_add(size)?;
+                    bytes.get(..at)?;
+                }
+            }
+            0x2c if pixels.is_none() => {
+                if word(at)? != 0
+                    || word(at + 2)? != 0
+                    || word(at + 4)? != 10
+                    || word(at + 6)? != 10
+                {
+                    return None;
+                }
+                let flags = *bytes.get(at + 8)?;
+                if flags & 0x40 != 0 {
+                    return None; // interlaced cells need a different row order
+                }
+                at += 9;
+                if flags & 0x80 != 0 {
+                    let len = table_len(flags)?;
+                    palette = bytes.get(at..at + len)?.to_vec();
+                    at += len;
+                }
+                let min_code = *bytes.get(at)?;
+                at += 1;
+                if !(2..=8).contains(&min_code) {
+                    return None;
+                }
+                let mut data = Vec::new();
+                loop {
+                    let size = usize::from(*bytes.get(at)?);
+                    at += 1;
+                    if size == 0 {
+                        break;
+                    }
+                    data.extend_from_slice(bytes.get(at..at + size)?);
+                    at += size;
+                }
+                pixels = Some(decode_pattern_lzw(&data, min_code)?);
+            }
+            0x3b => break,
+            _ => return None,
+        }
+    }
+    let pixels = pixels?;
+    let mut rows = [0u8; 8];
+    for y in 0..8 {
+        for x in 0..8 {
+            let index = pixels[y * 10 + x];
+            if transparent == Some(index) {
+                return None;
+            }
+            let color = palette.get(usize::from(index) * 3..usize::from(index) * 3 + 3)?;
+            match color {
+                [255, 255, 255] => rows[y] |= 0x80 >> x,
+                [0, 0, 0] => {}
+                _ => return None,
+            }
+        }
+    }
+    Some(rows)
+}
+
+/// GIF LZW streams are little-endian bit packed. The 10x10 admission bound
+/// caps both output and dictionary work, independent of compressed input.
+#[cfg(any(test, feature = "direct-ppt"))]
+fn decode_pattern_lzw(data: &[u8], min_code: u8) -> Option<Vec<u8>> {
+    let clear = 1usize << min_code;
+    let end = clear + 1;
+    let initial = || {
+        let mut table: Vec<Vec<u8>> = (0..clear).map(|value| vec![value as u8]).collect();
+        table.extend([Vec::new(), Vec::new()]);
+        table
+    };
+    let mut table = initial();
+    let mut width = usize::from(min_code) + 1;
+    let mut bit = 0usize;
+    let mut previous: Option<Vec<u8>> = None;
+    let mut output = Vec::with_capacity(100);
+    for _ in 0..512 {
+        if bit + width > data.len() * 8 {
+            return None;
+        }
+        let mut code = 0usize;
+        for shift in 0..width {
+            let position = bit + shift;
+            code |= usize::from((data[position / 8] >> (position % 8)) & 1) << shift;
+        }
+        bit += width;
+        if code == clear {
+            table = initial();
+            width = usize::from(min_code) + 1;
+            previous = None;
+            continue;
+        }
+        if code == end {
+            return (output.len() == 100).then_some(output);
+        }
+        let entry = if code < table.len() && !table[code].is_empty() {
+            table[code].clone()
+        } else if code == table.len() {
+            let mut entry = previous.clone()?;
+            entry.push(*entry.first()?);
+            entry
+        } else {
+            return None;
+        };
+        if output.len().checked_add(entry.len())? > 100 {
+            return None;
+        }
+        output.extend_from_slice(&entry);
+        if let Some(mut prev) = previous {
+            if table.len() < 4096 {
+                prev.push(*entry.first()?);
+                table.push(prev);
+                if table.len() == 1 << width && width < 12 {
+                    width += 1;
+                }
+            }
+        }
+        previous = Some(entry);
+    }
+    None
+}
+
+#[cfg(any(test, feature = "direct-ppt"))]
+fn same_binary_pattern(binary: &BinaryShape<'_>, alternative: &ShapeElement) -> Option<Verdict> {
+    use pptx_model::Fill;
+    let (
+        Some(Fill::Image {
+            duotone: Some(colors),
+            ..
+        }),
+        Some(Fill::Pattern { fg, bg, preset }),
+    ) = (&binary.element.fill, &alternative.fill)
+    else {
+        return None;
+    };
+    let expected = match preset.as_str() {
+        "pct30" => [0xaa, 0x44, 0xaa, 0x11, 0xaa, 0x44, 0xaa, 0x11],
+        "ltUpDiag" => [0x11, 0x22, 0x44, 0x88, 0x11, 0x22, 0x44, 0x88],
+        _ => return Some(Verdict::Unverifiable("fill")),
+    };
+    let Some(cells) = binary.image_bytes.as_deref().and_then(binary_pattern_cells) else {
+        return Some(Verdict::Unverifiable("fill"));
+    };
+    // MS-ODRAW binary pattern BLIP: black is clr1/background; white is
+    // clr2/foreground. The XML pattern preset names the same 8x8 cells.
+    Some(
+        if cells == expected
+            && same_color(&colors.clr1, bg) == Some(true)
+            && same_color(&colors.clr2, fg) == Some(true)
+        {
+            Verdict::Same
+        } else {
+            Verdict::Differs("pattern fill")
+        },
+    )
+}
+
 /// Resolve the alternative shape XML of a binary shape: `Ok(Some)` adopts
 /// it; `Ok(None)` keeps the binary projection, because the package carries
 /// no alternative part or the alternative verifiably disagrees with the
@@ -393,6 +817,7 @@ pub(in crate::ppt) fn adopt(
     binary: &BinaryShape<'_>,
     blob: &[u8],
     theme: &Theme,
+    media: &mut super::media::SpanStore,
     work_budget: &mut usize,
     text_budget: &mut usize,
     model_budget: &mut usize,
@@ -434,24 +859,56 @@ pub(in crate::ppt) fn adopt(
             ))
         })?
         .ok_or_else(|| unverifiable("part"))?;
-    // Relationship references in the alternative part or a selected theme
-    // style name parts this projection does not compare. A PowerPoint 16
-    // control changes the rendered crop through an XML-only picture-fill
-    // edit, so keeping the binary here would silently discard visible
-    // information. A theme blip is likewise unverifiable without its owning
-    // package relationships, even when the shape XML has no r: attribute.
-    // The same flag includes a selected theme fragment that could not be
-    // inspected; it also needs this typed unverifiable result.
-    if parsed.relationship_references {
+    // PowerPoint 16 controls retain XML-only picture crop edits when the
+    // relationship-backed image bytes equal the binary BLIP, and switch to
+    // binary after a BLIP-index edit changes those bytes. Compare the passive
+    // package target with the already admitted binary resource. On adoption
+    // the XML crop uses that resource's path; no blob media is retained.
+    // External click hyperlinks use the binary text-action catalog. Other
+    // references, including theme styles, remain at the typed gate.
+    let (image_comparison, hyperlink_comparison, bullet_assets) = if parsed.relationship_references
+    {
         validate_blob_references(blob, &part)?;
-        return Err(unverifiable("relationship"));
-    }
+        let bullet_assets = blob_bullet_images(blob, &part)?;
+        match (
+            &parsed.element.fill,
+            &binary.element.fill,
+            binary.image_bytes.as_deref(),
+        ) {
+            (
+                Some(pptx_model::Fill::Image { image_path, .. }),
+                Some(pptx_model::Fill::Image { .. }),
+                Some(binary_bytes),
+            ) => {
+                let blob_bytes = sole_blob_image(blob, &part, image_path)?;
+                (
+                    Some(if blob_bytes == binary_bytes {
+                        Verdict::Same
+                    } else {
+                        Verdict::Differs("image content")
+                    }),
+                    None,
+                    None,
+                )
+            }
+            _ if blob_hyperlinks_only(blob, &part)? => (
+                None,
+                Some(same_hyperlinks(binary.element, &parsed.element)),
+                None,
+            ),
+            _ if bullet_assets.is_some() => (None, None, bullet_assets),
+            _ => return Err(unverifiable("relationship")),
+        }
+    } else {
+        (None, None, None)
+    };
     let local = if parsed.placeholder {
         Some(placeholder_locals(blob, &part)?)
     } else {
         None
     };
     let mut shape = parsed.element;
+    let pattern_comparison = same_binary_pattern(binary, &shape);
     // PowerPoint 16 controls with a binary OfficeArt freeform and an XML
     // preset (frame and trapezoid, including visibly matching outlines)
     // retain the binary outline when the XML preset alone changes. An XML
@@ -477,6 +934,10 @@ pub(in crate::ppt) fn adopt(
         }
     };
     let verdicts = [
+        hyperlink_comparison.unwrap_or(Verdict::Same),
+        bullet_assets.as_ref().map_or(Verdict::Same, |assets| {
+            same_bullet_fallback(binary.element, &shape, assets)
+        }),
         if binary_freeform_preset || local.is_some_and(|p| !p.geometry) {
             Verdict::Same
         } else {
@@ -495,12 +956,18 @@ pub(in crate::ppt) fn adopt(
             Verdict::Same
         } else {
             local_override(
-                same_fill(&binary.fill, &shape, binary.element.rotation),
+                image_comparison
+                    .or(pattern_comparison)
+                    .unwrap_or_else(|| same_fill(&binary.fill, &shape, binary.element.rotation)),
                 parsed.placeholder,
                 "placeholder fill precedence",
             )
         },
-        same_run_formatting(binary.element, &shape),
+        same_run_formatting(
+            binary.element,
+            &shape,
+            bullet_assets.as_ref().and(binary.direct_size_authored),
+        ),
         match &substituted {
             Ok(_) => Verdict::Same,
             Err(verdict) => *verdict,
@@ -510,7 +977,44 @@ pub(in crate::ppt) fn adopt(
         return Ok(None);
     }
     shape = substituted.unwrap_or_else(|_| unreachable!("text agreement was decided"));
+    if let Some(assets) = bullet_assets {
+        let mut retained = std::collections::BTreeMap::new();
+        for (path, extension, bytes) in assets {
+            let id = media.admit_blob_image(extension, bytes)?;
+            retained.insert(path, format!("legacy-ppt/image/{id}"));
+        }
+        let body = shape
+            .text_body
+            .as_mut()
+            .ok_or_else(|| unverifiable("picture bullet"))?;
+        for paragraph in &mut body.paragraphs {
+            if let pptx_model::Bullet::Blip { image_path, .. } = &mut paragraph.bullet {
+                *image_path = retained
+                    .get(image_path)
+                    .ok_or_else(|| unverifiable("picture bullet"))?
+                    .clone();
+            }
+        }
+    }
     let element = binary.element;
+    if image_comparison == Some(Verdict::Same) {
+        if let (
+            Some(pptx_model::Fill::Image {
+                image_path,
+                mime_type,
+                ..
+            }),
+            Some(pptx_model::Fill::Image {
+                image_path: binary_path,
+                mime_type: binary_mime,
+                ..
+            }),
+        ) = (&mut shape.fill, &element.fill)
+        {
+            *image_path = binary_path.clone();
+            *mime_type = binary_mime.clone();
+        }
+    }
     if binary_freeform_preset || local.is_some_and(|p| !p.geometry) {
         shape.geometry = element.geometry.clone();
         shape.cust_geom = element.cust_geom.clone();
@@ -523,6 +1027,26 @@ pub(in crate::ppt) fn adopt(
         shape.adj6 = element.adj6;
         shape.adj7 = element.adj7;
         shape.adj8 = element.adj8;
+    } else if shape.geometry != "custGeom" {
+        // PowerPoint 16 binary-only controls for an adjusted upArrow (the
+        // alternative has an empty avLst) write the binary guide on save;
+        // changing that binary value changes the PDF. An omitted XML guide
+        // leaves that guide to the binary shape, even when the preset's
+        // DrawingML default is unknown or the binary guide is non-default.
+        for (xml, binary) in [
+            (&mut shape.adj, element.adj),
+            (&mut shape.adj2, element.adj2),
+            (&mut shape.adj3, element.adj3),
+            (&mut shape.adj4, element.adj4),
+            (&mut shape.adj5, element.adj5),
+            (&mut shape.adj6, element.adj6),
+            (&mut shape.adj7, element.adj7),
+            (&mut shape.adj8, element.adj8),
+        ] {
+            if xml.is_none() {
+                *xml = binary;
+            }
+        }
     }
     if let Some(local) = local {
         // ECMA-376 Part 1 Annex L.3.2.3: a placeholder takes absent shape
@@ -635,6 +1159,7 @@ pub(in crate::ppt) fn adopt(
     _binary: &BinaryShape<'_>,
     _blob: &[u8],
     _theme: &Theme,
+    _media: &mut super::media::SpanStore,
     _work_budget: &mut usize,
     _text_budget: &mut usize,
     _model_budget: &mut usize,
@@ -696,12 +1221,12 @@ fn same_geometry(binary: &BinaryShape<'_>, alternative: &ShapeElement) -> Verdic
             return Verdict::Unverifiable("preset geometry");
         }
     }
-    // An omitted adjust means the preset default, so an explicit value equal
-    // to that default is the same geometry (ECMA-376 20.1.9.5). The binary
-    // value converts from a whole 21600-based unit on the binary anchor,
-    // which rounds PowerPoint's own extent to a master unit; the
-    // alternative's value, written in whole 1/100000 units from that exact
-    // extent, lies within the range this rounding allows.
+    // PowerPoint 16 saves/PDFs of an upArrow whose XML avLst is empty retain
+    // its adjusted binary guide, including after a binary-only edit. Omission
+    // therefore does not assert the DrawingML default against a stated binary
+    // guide. Two stated guides are compared within the rounding of the
+    // binary anchor; when only the XML states a guide, the normative preset
+    // default is the binary side of the comparison when defined.
     let defaults = crate::officeart::preset_defaults::defaults(&element.geometry);
     let mut verdict = Verdict::Same;
     for (index, (bounds, value)) in binary
@@ -711,16 +1236,18 @@ fn same_geometry(binary: &BinaryShape<'_>, alternative: &ShapeElement) -> Verdic
         .enumerate()
     {
         let default = defaults.and_then(|d| d.get(index)).map(|&v| f64::from(v));
-        match (bounds.or(default.map(|d| (d, d))), value.or(default)) {
-            (None, None) => {}
+        match (bounds, value) {
+            (_, None) => {}
             (Some((low, high)), Some(value)) => {
                 if value < low - 1.0 || high + 1.0 < value {
                     return Verdict::Differs("preset adjust values");
                 }
             }
-            // One side omits a value whose default the preset definitions
-            // do not state.
-            _ => verdict = Verdict::Unverifiable("preset adjust values"),
+            (None, Some(value)) => match default {
+                Some(default) if (value - default).abs() <= 1.0 => {}
+                Some(_) => return Verdict::Differs("preset adjust values"),
+                None => verdict = Verdict::Unverifiable("preset adjust values"),
+            },
         }
     }
     verdict
@@ -791,6 +1318,20 @@ fn same_paths(binary: &BinaryShape<'_>, alternative: &ShapeElement) -> Verdict {
                         y: ay,
                     },
                 ) => vec![(x1, ax1), (y1, ay1), (x2, ax2), (y2, ay2), (x, ax), (y, ay)],
+                (
+                    PathCmd::ArcTo {
+                        wr,
+                        hr,
+                        st_ang,
+                        sw_ang,
+                    },
+                    PathCmd::ArcTo {
+                        wr: awr,
+                        hr: ahr,
+                        st_ang: ast_ang,
+                        sw_ang: asw_ang,
+                    },
+                ) => vec![(wr, awr), (hr, ahr), (st_ang, ast_ang), (sw_ang, asw_ang)],
                 (PathCmd::Close, PathCmd::Close) => Vec::new(),
                 _ => return Verdict::Unverifiable("custom geometry"),
             };
@@ -861,11 +1402,11 @@ fn same_transform(
 /// off on one side and solid on the other is a different paint. Other
 /// fill kinds on either side have no common model representation this
 /// reader can equate (PowerPoint may restate a binary fill as another
-/// DrawingML kind), except comparable gradient and pattern projections. In a
-/// PowerPoint 16 control, an XML pattern over a binary duotone image changes
-/// when only its XML foreground changes; editing the binary uses its image.
-/// That image/pattern pair stays unverifiable until its bitmap can be
-/// compared. Rotated-gradient omission is handled by `same_paint` below.
+/// DrawingML kind), except comparable gradient and pattern projections.
+/// PowerPoint 16 controls show XML pattern edits and binary image edits both
+/// affect PDF output. `same_binary_pattern` compares the image/pattern pair
+/// using its decoded 8x8 bitmap and duotone endpoints. Rotated-gradient
+/// omission is handled by `same_paint` below.
 #[cfg(any(test, feature = "direct-ppt"))]
 fn same_fill(binary: &RecordedFill, alternative: &ShapeElement, rotation: f64) -> Verdict {
     use pptx_model::Fill;
@@ -1038,6 +1579,87 @@ fn same_paint(binary: &pptx_model::Fill, alternative: &pptx_model::Fill, rotatio
     }
 }
 
+/// PowerPoint 16 picture-bullet controls with two distinct embedded GIFs
+/// saved a plain U+2022 OfficeArt bullet as their down-revision fallback.
+/// XML-only image replacement changed the PDF, while changing that binary
+/// fallback to U+25A0 produced exactly the binary-only PDF. Thus only the
+/// observed U+2022 fallback is compatible with an XML buBlip; a different
+/// binary marker invalidates the alternative. This applies to picture bullet
+/// references only, with every target resolved and retained above.
+#[cfg(any(test, feature = "direct-ppt"))]
+fn same_bullet_fallback(
+    binary: &ShapeElement,
+    alternative: &ShapeElement,
+    assets: &[BlobBulletAsset],
+) -> Verdict {
+    let (Some(b), Some(a)) = (&binary.text_body, &alternative.text_body) else {
+        return Verdict::Unverifiable("picture bullet");
+    };
+    if b.paragraphs.len() != a.paragraphs.len() {
+        return Verdict::Unverifiable("picture bullet");
+    }
+    let mut found = false;
+    for (bp, ap) in b.paragraphs.iter().zip(&a.paragraphs) {
+        if let pptx_model::Bullet::Blip { image_path, .. } = &ap.bullet {
+            found = true;
+            if !assets.iter().any(|(path, _, _)| path == image_path) {
+                return Verdict::Unverifiable("picture bullet resource");
+            }
+            match &bp.bullet {
+                pptx_model::Bullet::Char { ch, .. } if ch == "•" => {}
+                _ => return Verdict::Differs("picture bullet fallback"),
+            }
+        }
+    }
+    if found {
+        Verdict::Same
+    } else {
+        Verdict::Unverifiable("picture bullet")
+    }
+}
+
+/// [MS-PPT] 2.6.10/2.9.57 text click ranges refer to the document's
+/// ExHyperlinkContainer targets. PowerPoint 16 ignores an XML-only r:id URL
+/// edit in a saved legacy deck, so a differing target selects binary. Compare
+/// per UTF-16 position because the encodings may split style runs differently.
+#[cfg(any(test, feature = "direct-ppt"))]
+fn same_hyperlinks(binary: &ShapeElement, alternative: &ShapeElement) -> Verdict {
+    if binary.hyperlink != alternative.hyperlink
+        || binary.hyperlink_action != alternative.hyperlink_action
+    {
+        return Verdict::Differs("shape hyperlink");
+    }
+    type Link<'a> = (Option<&'a str>, Option<&'a str>);
+    type LinkParagraphs<'a> = Vec<Vec<Link<'a>>>;
+    fn expand(shape: &ShapeElement) -> Option<Option<LinkParagraphs<'_>>> {
+        shape.text_body.as_ref().map(|body| {
+            body.paragraphs
+                .iter()
+                .map(|paragraph| {
+                    let mut units = Vec::new();
+                    for run in &paragraph.runs {
+                        match run {
+                            TextRun::Text(data) => units.extend(std::iter::repeat_n(
+                                (data.hyperlink.as_deref(), data.hyperlink_action.as_deref()),
+                                data.text.encode_utf16().count(),
+                            )),
+                            TextRun::Break => units.push((None, None)),
+                            TextRun::Math { .. } => return None,
+                        }
+                    }
+                    Some(units)
+                })
+                .collect::<Option<Vec<_>>>()
+        })
+    }
+    match (expand(binary), expand(alternative)) {
+        (Some(Some(a)), Some(Some(b))) if a == b => Verdict::Same,
+        (None, None) => Verdict::Same,
+        (Some(Some(_)), Some(Some(_))) => Verdict::Differs("text hyperlink"),
+        _ => Verdict::Unverifiable("text hyperlink"),
+    }
+}
+
 /// Run formatting both forms state must agree character by character: font
 /// size, bold and italic, where each side specifies them. The binary stores
 /// whole points only; a corpus deck whose alternative says 10.5 pt over a
@@ -1046,7 +1668,11 @@ fn same_paint(binary: &pptx_model::Fill, alternative: &pptx_model::Fill, rotatio
 /// renders them. A field compares as one unit, because the binary
 /// projection substitutes its displayed text.
 #[cfg(any(test, feature = "direct-ppt"))]
-fn same_run_formatting(binary: &ShapeElement, alternative: &ShapeElement) -> Verdict {
+fn same_run_formatting(
+    binary: &ShapeElement,
+    alternative: &ShapeElement,
+    direct_size_authored: Option<&[bool]>,
+) -> Verdict {
     #[derive(Clone, Copy, PartialEq)]
     enum Unit {
         Character,
@@ -1087,10 +1713,14 @@ fn same_run_formatting(binary: &ShapeElement, alternative: &ShapeElement) -> Ver
     };
     let agree_bool = |x: Option<bool>, y: Option<bool>| x.zip(y).is_none_or(|(x, y)| x == y);
     let mut verdict = Verdict::Same;
+    let mut position = 0;
     for (bp, ap) in b.paragraphs.iter().zip(&a.paragraphs) {
         let (Some(bx), Some(ax)) = (units(&bp.runs), units(&ap.runs)) else {
             return Verdict::Unverifiable("equation");
         };
+        if direct_size_authored.is_some_and(|mask| position + bx.len() > mask.len()) {
+            return Verdict::Unverifiable("run size origin");
+        }
         // A masked alternative states a line break as one text character
         // (see `substitute_text`); its formatting still aligns.
         let kind = |unit: Unit| {
@@ -1102,13 +1732,18 @@ fn same_run_formatting(binary: &ShapeElement, alternative: &ShapeElement) -> Ver
         };
         if bx.len() != ax.len() || bx.iter().zip(&ax).any(|(x, y)| kind(x.0) != kind(y.0)) {
             // `substitute_text` decides the text structure.
+            position += bx.len() + 1;
             continue;
         }
-        if !bx.iter().zip(&ax).all(|(x, y)| {
-            agree(x.1 .0, y.1 .0) && agree_bool(x.1 .1, y.1 .1) && agree_bool(x.1 .2, y.1 .2)
+        if !bx.iter().zip(&ax).enumerate().all(|(index, (x, y))| {
+            let size_stated = direct_size_authored.is_none_or(|mask| mask[position + index]);
+            (!size_stated || agree(x.1 .0, y.1 .0))
+                && agree_bool(x.1 .1, y.1 .1)
+                && agree_bool(x.1 .2, y.1 .2)
         }) {
             verdict = Verdict::Differs("run formatting");
         }
+        position += bx.len() + 1;
     }
     verdict
 }
@@ -1218,12 +1853,14 @@ mod tests {
             leaf,
             nested: false,
             text: None,
+            direct_size_authored: None,
             fill: RecordedFill::Stated(element.fill.clone().map(Box::new)),
             path_paint: element
                 .cust_geom
                 .as_ref()
                 .map(|paths| vec![(true, true); paths.len()]),
             adjust_bounds: adjusts(element).map(|v| v.map(|v| (v, v))),
+            image_bytes: None,
         }
     }
 
@@ -1255,14 +1892,11 @@ mod tests {
         let mut alternative = shape("roundRect");
         let mut shape = binary(&element, &leaf);
         assert_eq!(same_geometry(&shape, &alternative), Verdict::Same);
-        // An omitted adjust is the preset default (roundRect: 16667).
+        // An omitted XML guide leaves the binary adjusted guide in force.
         shape.adjust_bounds[0] = Some((16660.0, 16670.0));
         assert_eq!(same_geometry(&shape, &alternative), Verdict::Same);
         shape.adjust_bounds[0] = Some((29000.0, 31000.0));
-        assert_eq!(
-            same_geometry(&shape, &alternative),
-            Verdict::Differs("preset adjust values")
-        );
+        assert_eq!(same_geometry(&shape, &alternative), Verdict::Same);
         alternative.adj = Some(31001.0);
         assert_eq!(same_geometry(&shape, &alternative), Verdict::Same);
         alternative.adj = Some(31002.0);
@@ -1279,13 +1913,14 @@ mod tests {
             Verdict::Unverifiable("preset geometry")
         );
         // The preset definitions state no upArrow defaults (ECMA-376 lists
-        // upDownArrow twice instead), so an omitted value is unknown.
+        // upDownArrow twice instead), but XML omission is still verifiable
+        // because PowerPoint's binary-only control supplies the guide.
         let up = self::shape("upArrow");
         let mut shape = binary(&up, &leaf);
         shape.adjust_bounds[1] = Some((50000.0, 50000.0));
         assert_eq!(
             same_geometry(&shape, &self::shape("upArrow")),
-            Verdict::Unverifiable("preset adjust values")
+            Verdict::Same
         );
     }
 
@@ -1622,6 +2257,85 @@ mod tests {
     }
 
     #[test]
+    fn picture_bullet_requires_the_office_downrevision_marker_and_live_target() {
+        let mut binary = shape("rect");
+        binary.text_body = body(&[&[run("A")]]);
+        binary.text_body.as_mut().unwrap().paragraphs[0].bullet = pptx_model::Bullet::Char {
+            ch: "•".to_owned(),
+            color: None,
+            size_pct: None,
+            size_pts: None,
+            font_family: None,
+        };
+        let mut alternative = binary.clone();
+        alternative.text_body.as_mut().unwrap().paragraphs[0].bullet = pptx_model::Bullet::Blip {
+            image_path: "media/bullet.gif".to_owned(),
+            mime_type: "image/gif".to_owned(),
+            size_pct: None,
+            size_pts: None,
+        };
+        let assets = vec![("media/bullet.gif".to_owned(), "gif", b"GIF89a".to_vec())];
+        assert_eq!(
+            same_bullet_fallback(&binary, &alternative, &assets),
+            Verdict::Same
+        );
+        if let pptx_model::Bullet::Char { ch, .. } =
+            &mut binary.text_body.as_mut().unwrap().paragraphs[0].bullet
+        {
+            *ch = "■".to_owned();
+        }
+        assert_eq!(
+            same_bullet_fallback(&binary, &alternative, &assets),
+            Verdict::Differs("picture bullet fallback")
+        );
+        assert_eq!(
+            same_bullet_fallback(&binary, &alternative, &[]),
+            Verdict::Unverifiable("picture bullet resource")
+        );
+    }
+
+    #[test]
+    fn binary_pattern_cells_match_measured_drawingml_presets() {
+        // A synthetic single-frame GIF: clear before every literal keeps its
+        // LZW code width at three bits, independent of dictionary growth.
+        fn gif(rows: [u8; 8]) -> Vec<u8> {
+            let mut pixels = [0u8; 100];
+            for y in 0..8 {
+                for x in 0..8 {
+                    pixels[y * 10 + x] = u8::from(rows[y] & (0x80 >> x) != 0);
+                }
+            }
+            let mut codes = Vec::new();
+            for pixel in pixels {
+                codes.extend([4u8, pixel]);
+            }
+            codes.push(5);
+            let mut compressed = vec![0u8; (codes.len() * 3).div_ceil(8)];
+            for (i, code) in codes.into_iter().enumerate() {
+                for bit in 0..3 {
+                    let at = i * 3 + bit;
+                    compressed[at / 8] |= ((code >> bit) & 1) << (at % 8);
+                }
+            }
+            let mut gif = b"GIF87a\x0a\x00\x0a\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff\x2c\x00\x00\x00\x00\x0a\x00\x0a\x00\x00\x02".to_vec();
+            gif.push(compressed.len() as u8);
+            gif.extend(compressed);
+            gif.extend([0, 0x3b]);
+            gif
+        }
+        let pct30 = [0xaa, 0x44, 0xaa, 0x11, 0xaa, 0x44, 0xaa, 0x11];
+        let diagonal = [0x11, 0x22, 0x44, 0x88, 0x11, 0x22, 0x44, 0x88];
+        assert_eq!(binary_pattern_cells(&gif(pct30)), Some(pct30));
+        assert_eq!(binary_pattern_cells(&gif(diagonal)), Some(diagonal));
+        let mut changed = pct30;
+        changed[0] ^= 1;
+        assert_ne!(binary_pattern_cells(&gif(changed)), Some(pct30));
+        let mut truncated = gif(pct30);
+        truncated.truncate(32);
+        assert!(binary_pattern_cells(&truncated).is_none());
+    }
+
+    #[test]
     fn a_masked_vertical_tab_becomes_a_line_break_inside_its_run() {
         let mut alternative = shape("rect");
         alternative.text_body = body(&[&[run("__"), run("_"), run("___"), run("__")]]);
@@ -1649,16 +2363,32 @@ mod tests {
         let mut alternative = shape("rect");
         binary.text_body = sized(serde_json::json!(10.0));
         alternative.text_body = sized(serde_json::json!(10.0));
-        assert_eq!(same_run_formatting(&binary, &alternative), Verdict::Same);
+        assert_eq!(
+            same_run_formatting(&binary, &alternative, None),
+            Verdict::Same
+        );
         // Whole-point binary sizes cannot state 10.5 pt: not the same shape.
         alternative.text_body = sized(serde_json::json!(10.5));
         assert_eq!(
-            same_run_formatting(&binary, &alternative),
+            same_run_formatting(&binary, &alternative, None),
+            Verdict::Differs("run formatting")
+        );
+        // A picture-bullet alternative may restate an inherited master size;
+        // a directly authored CFStyle size still has to agree.
+        assert_eq!(
+            same_run_formatting(&binary, &alternative, Some(&[false; 5])),
+            Verdict::Same
+        );
+        assert_eq!(
+            same_run_formatting(&binary, &alternative, Some(&[true; 5])),
             Verdict::Differs("run formatting")
         );
         // An unstated size on either side is not a disagreement.
         binary.text_body = sized(serde_json::Value::Null);
-        assert_eq!(same_run_formatting(&binary, &alternative), Verdict::Same);
+        assert_eq!(
+            same_run_formatting(&binary, &alternative, None),
+            Verdict::Same
+        );
         // A field compares as one unit whatever its displayed text.
         let mut field = run("12");
         field["fieldType"] = serde_json::json!("slidenum");
@@ -1668,7 +2398,7 @@ mod tests {
         field["fontSize"] = serde_json::json!(18.0);
         alternative.text_body = body(&[&[run("A"), field]]);
         assert_eq!(
-            same_run_formatting(&binary, &alternative),
+            same_run_formatting(&binary, &alternative, None),
             Verdict::Differs("run formatting")
         );
     }
@@ -1747,6 +2477,11 @@ mod tests {
             ];
             let present = package(parts, &[]);
             assert!(validate_blob_references(&present, "drs/shapexml.xml").is_ok());
+            assert_eq!(
+                sole_blob_image(&present, "drs/shapexml.xml", "drs/media/image.jpeg").unwrap(),
+                b"passive: never decode"
+            );
+            assert!(sole_blob_image(&present, "drs/shapexml.xml", "drs/media/other.jpeg").is_err());
             let missing = package(&parts[..2], &[]);
             assert!(validate_blob_references(&missing, "drs/shapexml.xml").is_err());
 
@@ -1762,6 +2497,9 @@ mod tests {
                 &[],
             );
             assert!(validate_blob_references(&external, "drs/shapexml.xml").is_ok());
+            assert!(
+                sole_blob_image(&external, "drs/shapexml.xml", "drs/media/image.jpeg").is_err()
+            );
 
             let duplicate = rels.replacen(
                 "<Relationship ",
@@ -1807,7 +2545,15 @@ mod tests {
             };
             let shape = binary(element, &leaf);
             let (mut work, mut text, mut model) = budgets;
-            let result = adopt(&shape, blob, theme, &mut work, &mut text, &mut model);
+            let result = adopt(
+                &shape,
+                blob,
+                theme,
+                &mut super::media::SpanStore::new(Vec::new()),
+                &mut work,
+                &mut text,
+                &mut model,
+            );
             (result, model)
         }
 
@@ -1914,6 +2660,7 @@ mod tests {
                 &binary,
                 &blob(&xml),
                 &theme(),
+                &mut super::media::SpanStore::new(Vec::new()),
                 &mut work,
                 &mut text,
                 &mut model,

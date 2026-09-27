@@ -95,6 +95,12 @@ pub(super) fn project(
                     x: x as f64 / width,
                     y: y as f64 / height,
                 },
+                DecodedCommand::Arc { wr, hr, start, .. } => PathCmd::ArcTo {
+                    wr: wr as f64 / width,
+                    hr: hr as f64 / height,
+                    st_ang: start as f64,
+                    sw_ang: -90.0,
+                },
                 DecodedCommand::Close => PathCmd::Close,
             });
         }

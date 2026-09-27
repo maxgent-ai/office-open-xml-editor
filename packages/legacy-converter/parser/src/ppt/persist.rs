@@ -17,6 +17,7 @@ pub(super) struct PresentationStorage<R, S, B> {
     pub schemes: Vec<Option<scheme::Scheme>>,
     pub image_entries: Vec<R>,
     pub ole_objects: media::OleCatalog,
+    pub hyperlinks: media::HyperlinkCatalog,
     pub backgrounds: Vec<Option<B>>,
     pub object_masters: Vec<std::rc::Rc<[RecordSpan]>>,
     pub size: (u32, u32),
@@ -283,6 +284,7 @@ pub(super) fn resolve_owned(
             .collect::<Result<_, _>>()?,
         image_entries: media::catalog_spans(document, &child_spans, budget)?,
         ole_objects: media::ole_catalog(document, &child_spans, budget),
+        hyperlinks: media::hyperlink_catalog(document, &child_spans, budget),
         text_masters: slides
             .iter()
             .map(|(slide, _)| schemes.text_master(slide.view(document)?, budget))

@@ -158,6 +158,17 @@ enum Rule {
     Height(usize),
     /// (21600 - a) / 21600 of the height, as a fraction of the short side.
     HeightComplement(usize),
+    /// (10800 - a) / 21600 of the width/height, for the head of a
+    /// directional arrow callout.
+    WidthHalfComplement(usize),
+    HeightHalfComplement(usize),
+    /// Twice that distance, for the narrow shaft of the callout.
+    DoubleWidthHalfComplement(usize),
+    DoubleHeightHalfComplement(usize),
+    /// Curved-arrow shaft: [(21600-a0) - 2(21600-a1)] / 21600
+    /// of the width/height. The head width is a separate complement of a0.
+    CurvedWidth(usize, usize),
+    CurvedHeight(usize, usize),
     /// (21600 - 2a) / 21600: a symmetric band between a and 21600 - a.
     Band(usize),
     /// (10800 - a) / 10800 * 0.5: a star's inner radius.
@@ -192,6 +203,45 @@ fn rules(kind: u16) -> Option<&'static [Option<Rule>]> {
         70 => &[None, Some(Height(1))],
         85 | 86 => &[Some(Height(0))],
         87 | 88 => &[Some(Height(0)), Some(Scale(1))],
+        // PowerPoint 16 binary-only saves and PDFs for all nine types used
+        // ±1000 changes to every authored adjust, including both signs and
+        // both orientations. The resulting guides are dimension-normalized
+        // distances, not a one-to-one scaling of legacy adjust slots.
+        77 => &[None, None, Some(Width(2)), Some(Complement(0))],
+        78 => &[
+            Some(DoubleHeightHalfComplement(3)),
+            Some(HeightHalfComplement(1)),
+            Some(Complement(2)),
+            Some(Scale(0)),
+        ],
+        79 => &[None, None, Some(Height(2)), Some(Complement(0))],
+        80 => &[
+            Some(DoubleWidthHalfComplement(3)),
+            Some(WidthHalfComplement(1)),
+            Some(Complement(2)),
+            Some(Scale(0)),
+        ],
+        81 => &[None, None, Some(Width(2)), Some(Band(0))],
+        102 => &[
+            Some(CurvedHeight(0, 1)),
+            Some(HeightComplement(0)),
+            Some(Complement(2)),
+        ],
+        103 => &[
+            Some(CurvedHeight(0, 1)),
+            Some(HeightComplement(0)),
+            Some(Scale(2)),
+        ],
+        104 => &[
+            Some(CurvedWidth(0, 1)),
+            Some(WidthComplement(0)),
+            Some(Scale(2)),
+        ],
+        105 => &[
+            Some(CurvedWidth(0, 1)),
+            Some(WidthComplement(0)),
+            Some(Complement(2)),
+        ],
         // Callout1 family (callout1, accentCallout1, borderCallout1,
         // accentBorderCallout1): MS-ODRAW and ECMA-376 give the four members
         // the same adjust layout. callout1 is evidenced for all four values;
@@ -228,7 +278,7 @@ fn rules(kind: u16) -> Option<&'static [Option<Rule>]> {
 }
 
 #[cfg(any(test, feature = "direct-ppt"))]
-fn source(rule: Rule) -> usize {
+fn sources(rule: Rule) -> (usize, Option<usize>) {
     match rule {
         Rule::Scale(i)
         | Rule::Centred(i)
@@ -237,9 +287,14 @@ fn source(rule: Rule) -> usize {
         | Rule::WidthComplement(i)
         | Rule::Height(i)
         | Rule::HeightComplement(i)
+        | Rule::WidthHalfComplement(i)
+        | Rule::HeightHalfComplement(i)
+        | Rule::DoubleWidthHalfComplement(i)
+        | Rule::DoubleHeightHalfComplement(i)
         | Rule::Band(i)
         | Rule::Star(i)
-        | Rule::Midpoint(i) => i,
+        | Rule::Midpoint(i) => (i, None),
+        Rule::CurvedWidth(outer, inner) | Rule::CurvedHeight(outer, inner) => (outer, Some(inner)),
     }
 }
 
@@ -262,7 +317,12 @@ pub(crate) fn adjustments(
     let rules = rules(kind).ok_or_else(unsupported)?;
     // Every authored value must be consumed by a rule.
     for (index, value) in legacy.iter().enumerate() {
-        if value.is_some() && !rules.iter().flatten().any(|rule| source(*rule) == index) {
+        if value.is_some()
+            && !rules.iter().flatten().any(|rule| {
+                let (first, second) = sources(*rule);
+                first == index || second == Some(index)
+            })
+        {
             return Err(unsupported());
         }
     }
@@ -279,10 +339,12 @@ pub(crate) fn adjustments(
     let mut output = [None; 8];
     for (slot, rule) in rules.iter().enumerate() {
         let Some(rule) = rule else { continue };
-        let Some(a) = legacy[source(*rule)] else {
+        let (first, second) = sources(*rule);
+        let Some(a) = legacy[first] else {
             continue;
         };
         let a = f64::from(a);
+        let b = second.and_then(|index| legacy[index]).map(f64::from);
         let fraction = match *rule {
             Rule::Scale(_) => a / SPACE,
             Rule::Centred(_) => (a - SPACE / 2.0) / SPACE,
@@ -291,6 +353,18 @@ pub(crate) fn adjustments(
             Rule::WidthComplement(_) => (SPACE - a) / SPACE * w / short,
             Rule::Height(_) => a / SPACE * h / short,
             Rule::HeightComplement(_) => (SPACE - a) / SPACE * h / short,
+            Rule::WidthHalfComplement(_) => (SPACE / 2.0 - a) / SPACE * w / short,
+            Rule::HeightHalfComplement(_) => (SPACE / 2.0 - a) / SPACE * h / short,
+            Rule::DoubleWidthHalfComplement(_) => (SPACE - 2.0 * a) / SPACE * w / short,
+            Rule::DoubleHeightHalfComplement(_) => (SPACE - 2.0 * a) / SPACE * h / short,
+            Rule::CurvedWidth(_, _) => {
+                let Some(b) = b else { continue };
+                (2.0 * b - a - SPACE) / SPACE * w / short
+            }
+            Rule::CurvedHeight(_, _) => {
+                let Some(b) = b else { continue };
+                (2.0 * b - a - SPACE) / SPACE * h / short
+            }
             Rule::Band(_) => (SPACE - 2.0 * a) / SPACE,
             Rule::Star(_) => (SPACE / 2.0 - a) / (SPACE / 2.0) * 0.5,
             Rule::Midpoint(_) if a == SPACE / 2.0 => 0.5,
@@ -304,9 +378,9 @@ pub(crate) fn adjustments(
 /// The range each converted adjust value spans under the rounding of its
 /// inputs: each authored value is a whole 21600-based unit (so it varies by
 /// one unit), and the shape's width and height each vary by `slack` (the
-/// resolution of the anchor they come from). Every rule is monotonic in its
-/// one authored value and in each dimension, so the extremes lie at the
-/// corners of that box.
+/// resolution of the anchor they come from). Curved-arrow shaft guides use
+/// two authored values with opposite coefficients, so both correlated and
+/// opposing one-unit corners are included.
 #[cfg(any(test, feature = "direct-ppt"))]
 pub(crate) fn adjustment_bounds(
     kind: u16,
@@ -323,28 +397,36 @@ pub(crate) fn adjustment_bounds(
         bounds[slot] = value.map(|v| (v, v));
     }
     for step in [-1, 1] {
-        let shifted = legacy.map(|value| value.map(|v| v.saturating_add(step)));
-        for (dw, dh) in [
-            (-slack, -slack),
-            (-slack, slack),
-            (slack, -slack),
-            (slack, slack),
-        ] {
-            // A corner that leaves the conversion's domain (a degenerate or
-            // reoriented extent, or an exact midpoint rule) cannot be the
-            // shape's true value.
-            let Ok(Some(corner)) = adjustments(
-                kind,
-                &shifted,
-                width.saturating_add(dw),
-                height.saturating_add(dh),
-            ) else {
+        for opposite in [false, true] {
+            if opposite && !matches!(kind, 102..=105) {
                 continue;
-            };
-            for (bound, value) in bounds.iter_mut().zip(corner) {
-                if let (Some((low, high)), Some(value)) = (bound.as_mut(), value) {
-                    *low = low.min(value);
-                    *high = high.max(value);
+            }
+            let mut shifted = legacy.map(|value| value.map(|v| v.saturating_add(step)));
+            if opposite {
+                shifted[1] = legacy[1].map(|v| v.saturating_sub(step));
+            }
+            for (dw, dh) in [
+                (-slack, -slack),
+                (-slack, slack),
+                (slack, -slack),
+                (slack, slack),
+            ] {
+                // A corner that leaves the conversion's domain (a degenerate
+                // or reoriented extent, or an exact midpoint rule) cannot be
+                // the shape's true value.
+                let Ok(Some(corner)) = adjustments(
+                    kind,
+                    &shifted,
+                    width.saturating_add(dw),
+                    height.saturating_add(dh),
+                ) else {
+                    continue;
+                };
+                for (bound, value) in bounds.iter_mut().zip(corner) {
+                    if let (Some((low, high)), Some(value)) = (bound.as_mut(), value) {
+                        *low = low.min(value);
+                        *high = high.max(value);
+                    }
                 }
             }
         }
@@ -479,6 +561,134 @@ mod tests {
                 (value - expected).abs() < 2.5,
                 "{slot}: {value} vs {expected}"
             );
+        }
+    }
+
+    #[test]
+    fn nine_arrow_families_follow_binary_adjust_controls() {
+        // PowerPoint 16 saves of binary-only shapes: each authored adjust was
+        // changed independently by +1000. The negative controls moved the
+        // same guides in the opposite direction and their PDFs changed the
+        // corresponding outlines. Coordinates are DrawingML EMUs.
+        let cases: &[(u16, &[i32], i64, i64, &[(usize, &[f64])])] = &[
+            (
+                102,
+                &[11411, 19053, 16200],
+                663575,
+                703262,
+                &[
+                    (0, &[20092., 45086., 25000.]),
+                    (1, &[34812., 49993., 25000.]),
+                    (2, &[24999., 49993., 20370.]),
+                ],
+            ),
+            (
+                103,
+                &[11898, 19174, 5400],
+                701675,
+                782638,
+                &[
+                    (0, &[19881., 44936., 25000.]),
+                    (1, &[35372., 50099., 25000.]),
+                    (2, &[25045., 50099., 29630.]),
+                ],
+            ),
+            (
+                104,
+                &[12096, 19224, 5400],
+                663575,
+                584200,
+                &[
+                    (0, &[19730., 44720., 25000.]),
+                    (1, &[35506., 49978., 25000.]),
+                    (2, &[24989., 49978., 29630.]),
+                ],
+            ),
+            (
+                105,
+                &[14194, 19748, 16200],
+                927100,
+                636588,
+                &[
+                    (0, &[18218., 43192., 25000.]),
+                    (1, &[38445., 49934., 25000.]),
+                    (2, &[24960., 49934., 20370.]),
+                ],
+            ),
+            (
+                78,
+                &[14035, 8695, 16200, 9747],
+                304800,
+                782637,
+                &[
+                    (0, &[25035., 25023., 25000., 69606.]),
+                    (1, &[25035., 13136., 25000., 64977.]),
+                    (2, &[25035., 25023., 20370., 64977.]),
+                    (3, &[1260., 25023., 25000., 64977.]),
+                ],
+            ),
+            (
+                80,
+                &[14035, 6407, 16200, 8603],
+                781050,
+                635000,
+                &[
+                    (0, &[25021., 25016., 25000., 69606.]),
+                    (1, &[25021., 19321., 25000., 64977.]),
+                    (2, &[25021., 25016., 20370., 64977.]),
+                    (3, &[13633., 25016., 25000., 64977.]),
+                ],
+            ),
+            (
+                77,
+                &[7565, 0, 5200],
+                715962,
+                688975,
+                &[
+                    (0, &[0., 0., 25017., 60347.]),
+                    (2, &[0., 0., 29828., 64977.]),
+                ],
+            ),
+            (
+                79,
+                &[7565, 0, 5305],
+                742950,
+                755650,
+                &[
+                    (0, &[0., 0., 24980., 60347.]),
+                    (2, &[0., 0., 29689., 64977.]),
+                ],
+            ),
+            (
+                81,
+                &[5603, 0, 2743],
+                1670050,
+                847725,
+                &[
+                    (0, &[0., 0., 25018., 38861.]),
+                    (2, &[0., 0., 34138., 48120.]),
+                ],
+            ),
+        ];
+        for &(kind, values, w, h, probes) in cases {
+            let mut legacy = [None; 10];
+            for (index, &value) in values.iter().enumerate() {
+                if !(index == 1 && matches!(kind, 77 | 79 | 81)) {
+                    legacy[index] = Some(value);
+                }
+            }
+            for &(changed, expected) in probes {
+                let mut changed_values = legacy;
+                changed_values[changed] = changed_values[changed].map(|value| value + 1000);
+                let actual = adjustments(kind, &changed_values, w, h).unwrap().unwrap();
+                for (index, &value) in expected.iter().enumerate() {
+                    if index < 2 && matches!(kind, 77 | 79 | 81) {
+                        assert_eq!(actual[index], None);
+                    } else {
+                        close(actual[index], value);
+                    }
+                }
+            }
         }
     }
 

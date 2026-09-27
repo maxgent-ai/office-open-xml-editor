@@ -322,9 +322,11 @@ pub(crate) fn fuzz_alternative(data: &[u8]) {
         leaf: &leaf,
         nested: false,
         text: Some("AB\u{b}C\rD"),
+        direct_size_authored: None,
         fill: metro::RecordedFill::Stated(element.fill.clone().map(Box::new)),
         path_paint: None,
         adjust_bounds: [None; 8],
+        image_bytes: None,
     };
     let theme = metro::Theme::Readable {
         theme_xml: theme(),
@@ -350,7 +352,15 @@ pub(crate) fn fuzz_alternative(data: &[u8]) {
     }
     for blob in [data, package.get_ref().as_slice()] {
         let (mut work, mut text, mut model) = (64, 16 * 1024 * 1024, 64 * 1024 * 1024);
-        let _ = metro::adopt(&binary, blob, &theme, &mut work, &mut text, &mut model);
+        let _ = metro::adopt(
+            &binary,
+            blob,
+            &theme,
+            &mut media::SpanStore::new(Vec::new()),
+            &mut work,
+            &mut text,
+            &mut model,
+        );
     }
 }
 

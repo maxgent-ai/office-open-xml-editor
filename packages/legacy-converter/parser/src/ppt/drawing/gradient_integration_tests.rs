@@ -173,6 +173,7 @@ fn presentation(span: RecordSpan) -> persist::OwnedPresentation {
         schemes: vec![None],
         image_entries: Vec::new(),
         ole_objects: media::OleCatalog::default(),
+        hyperlinks: media::HyperlinkCatalog::default(),
         backgrounds: vec![None],
         object_masters: vec![Rc::from([])],
         size: (720, 540),

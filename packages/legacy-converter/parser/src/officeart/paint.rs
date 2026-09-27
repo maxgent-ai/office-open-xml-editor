@@ -239,6 +239,22 @@ impl Paint {
             self.fill_alpha.unwrap_or(65536),
         ))
     }
+    /// MS-ODRAW 2.4.11 msofillTexture on a slide background. PowerPoint 16
+    /// saves the tested background as an intrinsic 100% tile at slide origin,
+    /// including controls with nonzero fillOriginX/Y and EMU fillWidth/Height.
+    /// This is the background-only observation; ordinary shape texture
+    /// placement remains outside this projection.
+    #[cfg(feature = "direct-ppt")]
+    pub fn background_texture(&self) -> Option<(u32, u32)> {
+        (self.fill_type == Some(2)
+            && self.fill_blip.unwrap_or(0) != 0
+            && self.filled.unwrap_or(true)
+            && self.fill_ok.unwrap_or(true))
+        .then_some((
+            self.fill_blip.unwrap_or(0),
+            self.fill_alpha.unwrap_or(65536),
+        ))
+    }
     /// Plain foreground `msofillPicture` only. MS-ODRAW 2.3.7.43 defaults
     /// fillShape to 1, fillUseRect to 0, and fUseShapeAnchor to 0. A distinct
     /// fill rectangle or view-relative fill cannot be represented by this

@@ -96,14 +96,13 @@ it.each([
   expect(stroke).toHaveBeenCalled(); // The core metafile player receives visible geometry.
 });
 
-it('direct rejects a ppt picture whose WMF declares a payload after its EOF record', async () => {
-  // The converter omitted the picture with a warning; the direct reader does
-  // not drop authored drawing content (the Rust metafile validator returns
-  // no image for any post-EOF payload).
+it('retains a ppt WMF whose declared size includes post-EOF bytes', async () => {
   const tailed = concat(wmf, new Uint8Array(8).fill(0xa5));
   new DataView(tailed.buffer).setUint32(6, tailed.length / 2, true);
   const bytes = blip('wmf', tailed, true, false);
-  await expect(pptPictures(ppt(bytes, false, 'wmf'))).rejects.toMatchObject({ message: 'UNSUPPORTED:PowerPoint picture BLIP is not a supported image' });
+  const { pictures, extract } = await pptPictures(ppt(bytes, false, 'wmf'));
+  expect(pictures).toHaveLength(1);
+  expect(extract(pictures[0].imagePath)).toEqual(tailed);
 });
 
 it('rejects malformed WMF data before EOF through ppt', async () => {

@@ -96,6 +96,110 @@ const EX_OLE_LINK: u16 = 0x0fce;
 const EX_OLE_CONTROL: u16 = 0x0fee;
 const EX_OLE_OBJ_ATOM: u16 = 0x0fc3;
 
+// [MS-PPT] 2.10.16-20: the document's external-object list owns hyperlink
+// targets; text actions refer to its ExHyperlinkAtom id, never to a URL in the
+// OfficeArt textbox itself. Keep this catalog passive: targets are strings and
+// are never fetched.
+const EX_HYPERLINK: u16 = 0x0fd7;
+const EX_HYPERLINK_ATOM: u16 = 0x0fd3;
+const CSTRING: u16 = 0x0fba;
+const MAX_HYPERLINK_TEXT_BYTES: usize = 1 << 20;
+
+#[derive(Clone, Debug, Default)]
+pub(super) struct HyperlinkCatalog {
+    targets: BTreeMap<u32, Option<String>>,
+    error: Option<String>,
+}
+
+impl HyperlinkCatalog {
+    pub fn get(&self, id: u32) -> Result<String, String> {
+        if let Some(error) = &self.error {
+            return Err(error.clone());
+        }
+        match self.targets.get(&id) {
+            Some(Some(target)) => Ok(target.clone()),
+            Some(None) => Err(unsupported("ambiguous PowerPoint hyperlink reference")),
+            None => Err(unsupported("unresolved PowerPoint hyperlink reference")),
+        }
+    }
+}
+
+pub(super) fn hyperlink_catalog(
+    document: &[u8],
+    children: &[RecordSpan],
+    budget: &mut usize,
+) -> HyperlinkCatalog {
+    let mut catalog = HyperlinkCatalog::default();
+    if let Err(error) = read_hyperlink_catalog(document, children, budget, &mut catalog.targets) {
+        catalog.targets.clear();
+        catalog.error = Some(error);
+    }
+    catalog
+}
+
+fn read_hyperlink_catalog(
+    document: &[u8],
+    children: &[RecordSpan],
+    budget: &mut usize,
+    targets: &mut BTreeMap<u32, Option<String>>,
+) -> Result<(), String> {
+    let mut seen = false;
+    let mut remaining = MAX_HYPERLINK_TEXT_BYTES;
+    for list in children {
+        let view = list.view(document)?;
+        if view.kind != EX_OBJ_LIST {
+            continue;
+        }
+        if seen || view.version != 15 {
+            return Err(unsupported("invalid PowerPoint external object list"));
+        }
+        seen = true;
+        for container in parse_record_spans(document, list.payload_span(), budget)? {
+            let view = container.view(document)?;
+            if view.kind != EX_HYPERLINK {
+                continue;
+            }
+            if view.version != 15 {
+                return Err(unsupported("invalid PowerPoint hyperlink container"));
+            }
+            let mut id = None;
+            let mut target = None;
+            for child in parse_record_spans(document, container.payload_span(), budget)? {
+                let view = child.view(document)?;
+                match (view.kind, view.instance) {
+                    (EX_HYPERLINK_ATOM, 0) if view.version == 0 && view.payload.len() == 4 => {
+                        if id.replace(u32_at(view.payload, 0)?).is_some() {
+                            return Err(unsupported("duplicate PowerPoint hyperlink id"));
+                        }
+                    }
+                    (CSTRING, 1) if view.version == 0 && view.payload.len() % 2 == 0 => {
+                        remaining = remaining.checked_sub(view.payload.len()).ok_or_else(|| {
+                            unsupported("PowerPoint hyperlink text budget exceeded")
+                        })?;
+                        let units = view
+                            .payload
+                            .chunks_exact(2)
+                            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                            .collect::<Vec<_>>();
+                        let value = String::from_utf16(&units)
+                            .map_err(|_| unsupported("invalid PowerPoint hyperlink target"))?;
+                        if target.replace(value).is_some() {
+                            return Err(unsupported("duplicate PowerPoint hyperlink target"));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let id = id.ok_or_else(|| unsupported("PowerPoint hyperlink lacks id"))?;
+            targets
+                .entry(id)
+                .and_modify(|slot| *slot = None)
+                .or_insert(target);
+        }
+    }
+    Ok(())
+}
+
 /// exObjId -> OLE object. A malformed list does not reject presentations that
 /// never refer to it; the recorded error is returned to the first OLE shape
 /// that needs the list. Duplicate identifiers are ambiguous (MS-PPT 2.10.12:
@@ -207,6 +311,7 @@ type RetainedImage<'a> = (u32, &'static str, &'a [u8]);
 pub(super) struct SpanStore {
     entries: Vec<RecordSpan>,
     images: BTreeMap<u32, Option<StoreImageSpan>>,
+    blob_images: BTreeMap<u32, (&'static str, Vec<u8>)>,
     used: BTreeSet<u32>,
     remaining: usize,
 }
@@ -216,6 +321,7 @@ impl SpanStore {
         Self {
             entries,
             images: BTreeMap::new(),
+            blob_images: BTreeMap::new(),
             used: BTreeSet::new(),
             remaining: MAX_MEDIA_BYTES,
         }
@@ -223,6 +329,27 @@ impl SpanStore {
 
     pub fn begin_slide(&mut self) {
         self.used.clear();
+    }
+
+    /// Retain an image from a verified metroBlob OPC relationship. Resource
+    /// keys share the direct session's image namespace but cannot collide with
+    /// 1-based OfficeArt BSE indices. The session budget bounds total bytes.
+    pub fn admit_blob_image(
+        &mut self,
+        extension: &'static str,
+        bytes: Vec<u8>,
+    ) -> Result<u32, String> {
+        if self.blob_images.len() >= 1024 {
+            return Err(unsupported("too many PowerPoint blob images"));
+        }
+        self.remaining = self
+            .remaining
+            .checked_sub(bytes.len())
+            .ok_or_else(|| unsupported("PowerPoint retained media budget exceeded"))?;
+        let index = u32::try_from(self.entries.len() + self.blob_images.len() + 1)
+            .map_err(|_| unsupported("PowerPoint image index overflow"))?;
+        self.blob_images.insert(index, (extension, bytes));
+        Ok(index)
     }
 
     pub fn reference(
@@ -286,6 +413,9 @@ impl SpanStore {
         primary: &'a [u8],
         pictures: Option<&'a [u8]>,
     ) -> Result<Option<(&'static str, &'a [u8])>, String> {
+        if let Some((extension, bytes)) = self.blob_images.get(&index) {
+            return Ok(Some((*extension, bytes)));
+        }
         self.images
             .get(&index)
             .ok_or_else(|| unsupported("PowerPoint image was not admitted"))?
@@ -353,6 +483,22 @@ mod tests {
         record_span_with_end(bytes, offset, &mut 1000, "PowerPoint")
             .unwrap()
             .0
+    }
+
+    #[test]
+    fn external_hyperlink_id_resolves_to_its_utf16_target() {
+        let atom = record(EX_HYPERLINK_ATOM, 0, &7u32.to_le_bytes());
+        let url = "https://example.test/path";
+        let utf16 = url
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let target = record(CSTRING, 0x10, &utf16);
+        let link = record(EX_HYPERLINK, 0x0f, &[atom, target].concat());
+        let document = record(EX_OBJ_LIST, 0x0f, &link);
+        let catalog = hyperlink_catalog(&document, &[spanned(&document, 0)], &mut 100);
+        assert_eq!(catalog.get(7).unwrap(), url);
+        assert!(catalog.get(8).is_err());
     }
 
     /// Admit the single catalog entry `entry` through the session store, with

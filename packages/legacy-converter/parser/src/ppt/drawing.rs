@@ -981,6 +981,7 @@ mod tests {
             schemes: vec![None],
             image_entries: entries.clone(),
             ole_objects: media::OleCatalog::default(),
+            hyperlinks: media::HyperlinkCatalog::default(),
             backgrounds: vec![None],
             object_masters: vec![std::rc::Rc::from([])],
             size: (720, 540),

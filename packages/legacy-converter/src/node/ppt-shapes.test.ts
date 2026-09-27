@@ -231,11 +231,14 @@ describe('pictures and picture fills', () => {
     } finally { await session.close(); }
   });
 
-  it('rejects an unsupported metafile shape fill instead of silently dropping it', async () => {
+  it('retains a metafile shape fill with bytes after its EOF record', async () => {
     const rec = (fn: number, words: number[] = []) => concat(little32(3 + words.length), little16(fn), ...words.map(little16));
     const body = concat(rec(0x020c, [100, 100]), rec(0));
     const wmf = concat(little16(1), little16(9), little16(0x300), little32((18 + body.length + 2) / 2), little16(0), little32(5), little16(0), body, new Uint8Array(2));
-    await expect(materialize(buildPptShapeImageFillFixture(wmf))).rejects.toThrow(/fill BLIP is not a supported image/);
+    const presentation = await materialize(buildPptShapeImageFillFixture(wmf));
+    expect(presentation.slides[0].elements[0]).toMatchObject({
+      type: 'shape', fill: { fillType: 'image', mimeType: 'image/wmf' },
+    });
   });
 });
 

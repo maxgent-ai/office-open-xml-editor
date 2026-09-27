@@ -177,8 +177,8 @@ fn starts_with_emf_plus_header(bytes: &[u8]) -> bool {
 }
 
 fn validate_wmf(bytes: &[u8], budget: &mut usize) -> Result<bool, String> {
-    // MS-WMF 2.3.2.2-3/2.3: a placeable header is optional; the META_HEADER
-    // owns the file size, followed by bounded records and a terminal META_EOF.
+    // MS-WMF 2.3.2.2-3/2.3: a placeable header is optional; META_HEADER
+    // states a file size, followed by bounded records and a META_EOF.
     let start = if bytes.starts_with(&0x9ac6cdd7u32.to_le_bytes()) {
         let placeable = bytes
             .get(..22)
@@ -200,13 +200,16 @@ fn validate_wmf(bytes: &[u8], budget: &mut usize) -> Result<bool, String> {
         .ok_or_else(|| unsupported("truncated WMF header"))?;
     let word = |o| u16::from_le_bytes(header[o..o + 2].try_into().unwrap());
     let dword = |o| u32::from_le_bytes(header[o..o + 4].try_into().unwrap());
+    // PowerPoint 16 PDF controls with zero, nonzero and four-byte trailers,
+    // and with mtSize one word short through ten words long, all display the
+    // same metafile. Validate the declaration as a bounded WMF word count,
+    // but use physically bounded record envelopes and META_EOF for replay;
+    // Office does not use mtSize as an exact byte-length assertion.
+    let declared_words = dword(6) as usize;
     if !matches!(word(0), 1 | 2)
         || word(2) != 9
         || !matches!(word(4), 0x100 | 0x300)
-        || usize::try_from(dword(6))
-            .ok()
-            .and_then(|n| n.checked_mul(2))
-            != Some(bytes.len() - start)
+        || !(9..=MAX_METAFILE_BYTES / 2).contains(&declared_words)
         || dword(12) < 3
     {
         return Err(unsupported("invalid WMF header"));
@@ -236,12 +239,11 @@ fn validate_wmf(bytes: &[u8], budget: &mut usize) -> Result<bool, String> {
         }
         position += size;
         if eof {
-            // MS-WMF 2.3.2.1 defines EOF as the end of the record stream.
-            // A declared payload with trailing bytes is outside our supported
-            // subset: omit the entire image, never strip, interpret or forward
-            // the trailer. This keeps an unsupported image from rejecting an
-            // otherwise supported document without claiming a padding rule.
-            return Ok(position == bytes.len());
+            // MS-WMF 2.3.2.1 ends replay at META_EOF. PowerPoint's PDF is
+            // unchanged by the tested trailers; retain original bytes for
+            // the renderer, which also stops at META_EOF, without treating
+            // later bytes as another WMF record.
+            return Ok(true);
         }
     }
     Err(unsupported("missing WMF end record"))
@@ -414,7 +416,9 @@ pub(super) mod tests {
             assert!(parse_wmf(&payload(&bad, false), false, &mut 10, usize::MAX).is_err());
         }
         let mut bad = source.clone();
-        bad[6..10].copy_from_slice(&11u32.to_le_bytes());
+        bad[6..10].copy_from_slice(&0u32.to_le_bytes());
+        assert!(parse_wmf(&payload(&bad, false), false, &mut 10, usize::MAX).is_err());
+        bad[6..10].copy_from_slice(&((MAX_METAFILE_BYTES / 2 + 1) as u32).to_le_bytes());
         assert!(parse_wmf(&payload(&bad, false), false, &mut 10, usize::MAX).is_err());
         let mut bad = source;
         bad[22..24].copy_from_slice(&1u16.to_le_bytes());
@@ -501,10 +505,12 @@ pub(super) mod tests {
         let mut after_eof = wmf();
         after_eof.extend_from_slice(&[3, 0, 0, 0, 1, 0]);
         after_eof[6..10].copy_from_slice(&15u32.to_le_bytes());
-        assert!(
+        assert_eq!(
             parse_wmf(&payload(&after_eof, false), false, &mut 10, usize::MAX)
                 .unwrap()
-                .is_none()
+                .unwrap()
+                .as_ref(),
+            after_eof
         );
         let mut overflow = wmf();
         overflow[18..22].copy_from_slice(&u32::MAX.to_le_bytes());
@@ -520,7 +526,7 @@ pub(super) mod tests {
         assert!(parse_wmf(&payload(&disk, false), false, &mut 10, usize::MAX).is_ok());
     }
     #[test]
-    fn wmf_omits_the_whole_image_for_any_declared_post_eof_payload() {
+    fn wmf_stops_at_eof_and_keeps_the_bounded_original_payload() {
         for mut source in [wmf(), placeable_wmf()] {
             let start = if source.len() == 24 { 0 } else { 22 };
             let original_length = source.len();
@@ -532,14 +538,38 @@ pub(super) mod tests {
                     source[start + 6..start + 10].copy_from_slice(&words.to_le_bytes());
                     for two in [false, true] {
                         for bytes in [payload(&source, two), compressed(&source, two)] {
-                            assert!(parse_wmf(&bytes, two, &mut 1, source.len())
-                                .unwrap()
-                                .is_none());
+                            assert_eq!(
+                                parse_wmf(&bytes, two, &mut 1, source.len())
+                                    .unwrap()
+                                    .unwrap()
+                                    .as_ref(),
+                                source
+                            );
                         }
                     }
                 }
             }
         }
+        let mut stated_short = wmf();
+        stated_short[6..10].copy_from_slice(&11u32.to_le_bytes());
+        assert!(parse_wmf(
+            &payload(&stated_short, false),
+            false,
+            &mut 1,
+            stated_short.len()
+        )
+        .unwrap()
+        .is_some());
+        let mut stated_long = wmf();
+        stated_long[6..10].copy_from_slice(&22u32.to_le_bytes());
+        assert!(parse_wmf(
+            &payload(&stated_long, false),
+            false,
+            &mut 1,
+            stated_long.len()
+        )
+        .unwrap()
+        .is_some());
     }
     #[test]
     fn retains_uncompressed_emf_bytes_and_charges_record_work() {

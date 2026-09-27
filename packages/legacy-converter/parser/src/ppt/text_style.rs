@@ -109,6 +109,34 @@ fn read_runs(text: &str, style: &[u8], work_budget: &mut usize) -> Result<Runs, 
     })
 }
 
+/// Authored CFStyle font-size bits by UTF-16 text position, including the
+/// implicit final CR. A round-trip DrawingML alternative can override an
+/// inherited binary master size without contradicting a directly authored
+/// character size; the ordinary paragraph projector only retains effective
+/// sizes, so this short-lived sidecar preserves the distinction at the
+/// metroBlob comparison boundary.
+pub(in crate::ppt) fn direct_size_mask(
+    text: &str,
+    style: &[u8],
+    work_budget: &mut usize,
+) -> Result<Vec<bool>, String> {
+    let length = text.encode_utf16().count() + 1;
+    let runs = read_runs(text, style, work_budget)?;
+    let mut result = Vec::new();
+    result
+        .try_reserve_exact(length)
+        .map_err(|_| unsupported("PowerPoint text size mask allocation failed"))?;
+    let mut previous = 0;
+    for (end, character) in runs.characters {
+        result.extend(std::iter::repeat_n(
+            character.mask & 0x20000 != 0,
+            end - previous,
+        ));
+        previous = end;
+    }
+    Ok(result)
+}
+
 struct Reader<'a, 'b> {
     bytes: &'a [u8],
     pos: usize,
