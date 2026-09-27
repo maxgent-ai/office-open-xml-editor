@@ -97,6 +97,21 @@ pub(in crate::ppt) fn paragraphs_with_axes(
             .levels
             .and_then(|levels| levels.get(usize::from(pf[pi].1.level)));
         let mut properties = pf[pi].1.inherit(base.map(|v| &v.paragraph));
+        // [MS-PPT] 2.9.20-22 stores fHasBullet and bulletChar independently.
+        // In a PowerPoint PDF control, three level-1 paragraphs with omitted
+        // fHasBullet display the resolved master's dash; explicit on displays
+        // the same dash and explicit off removes it. Only activate a character
+        // obtained from the master: a local glyph without an enabled value
+        // remains unresolved by this observation.
+        if pf[pi].1.bullet.enabled.is_none()
+            && pf[pi].1.bullet.character.is_none()
+            && base.is_some_and(|level| {
+                level.paragraph.bullet.enabled.is_none()
+                    && level.paragraph.bullet.character.is_some()
+            })
+        {
+            properties.bullet.enabled = Some(true);
+        }
         // MS-PPT 2.9.30 supplies independent local ruler origins for the
         // paragraph's active level. Office-rendered binary counterfactuals
         // establish the document type-4 origin for ordinary level-0 freeform
@@ -1538,6 +1553,27 @@ mod tests {
             project(&read_bullet(0x80, &0x2022u16.to_le_bytes())),
             ModelBullet::Inherit
         ));
+    }
+
+    #[test]
+    fn omitted_enabled_bit_uses_a_resolved_master_bullet_character() {
+        let mut level = Level::empty(1);
+        level.paragraph.margin = Some(0);
+        level.paragraph.indent = Some(0);
+        level.paragraph.bullet.character = Some(0x2013);
+        let levels = [Level::empty(0), level];
+        let context = Context {
+            levels: Some(&levels),
+            ..Context::default()
+        };
+        let omitted = paragraphs("A", &plain_style(1), context, &mut 100, &mut 100_000).unwrap();
+        assert!(matches!(
+            omitted[0].bullet,
+            ModelBullet::Char { ref ch, .. } if ch == "\u{2013}"
+        ));
+        let disabled_style = [u32s(2), u16s(1), u32s(1), u16s(0), u32s(2), u32s(0)].concat();
+        let disabled = paragraphs("A", &disabled_style, context, &mut 100, &mut 100_000).unwrap();
+        assert!(matches!(disabled[0].bullet, ModelBullet::None));
     }
 
     #[test]
