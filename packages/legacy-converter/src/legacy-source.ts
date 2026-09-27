@@ -5,11 +5,11 @@
  * bytes and names a self-contained source module plus its WASM URL.
  */
 import {
-  cfbDirectoryNames,
   type ModelSource,
   type ModelSourceModuleDescriptor,
   type ModelSourceTarget,
 } from '@silurus/ooxml-core';
+import { cfbDirectoryNames } from '@silurus/ooxml-core/internal/cfb-directory-names';
 import { MODEL_SOURCE_MODULE_PROTOCOL } from '@silurus/ooxml-core/internal/model-source';
 
 import { MAX_LEGACY_SOURCE_BYTES } from './legacy-source-limits.js';
