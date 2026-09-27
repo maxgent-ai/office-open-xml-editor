@@ -759,11 +759,11 @@ fn same_transform(
 /// off on one side and solid on the other is a different paint. Other
 /// fill kinds on either side have no common model representation this
 /// reader can equate (PowerPoint may restate a binary fill as another
-/// DrawingML kind), except identical gradient and pattern projections. In a
+/// DrawingML kind), except comparable gradient and pattern projections. In a
 /// PowerPoint 16 control, an XML pattern over a binary duotone image changes
 /// when only its XML foreground changes; editing the binary uses its image.
-/// That pair stays unverifiable. So does a rotated gradient whose binary says
-/// `rotWithShape=false` while XML omits it: the schema has no default.
+/// That image/pattern pair stays unverifiable until its bitmap can be
+/// compared. Rotated-gradient omission is handled by `same_paint` below.
 #[cfg(any(test, feature = "direct-ppt"))]
 fn same_fill(binary: &RecordedFill, alternative: &ShapeElement, rotation: f64) -> Verdict {
     use pptx_model::Fill;
@@ -820,19 +820,25 @@ fn same_color(binary: &str, alternative: &str) -> Option<bool> {
     Some(b.iter().zip(&a).all(|(x, y)| (x - y).abs() <= 1))
 }
 
-/// Identical gradient or pattern paint. Gradient stop positions are 16.16
+/// Comparable gradient or pattern paint. Gradient stop positions are 16.16
 /// fractions in the binary (MS-ODRAW 2.3.7.17 fillShadeColors) and
 /// 1/100000 in DrawingML (ECMA-376 20.1.8.36), so each may round by one
 /// step of either unit; angles are whole degrees on both sides. PowerPoint 16
-/// uses the XML in an Office-saved multi-stop gradient whose binary duplicates
-/// a terminal color and whose XML has fewer, shifted stops; changing only the
-/// binary fill color makes it use the binary instead. That restatement has no
-/// established general mapping, so unequal stop arrays remain unverifiable.
+/// uses the XML in Office-saved multi-stop gradients whose binary duplicates
+/// the first colour at position zero and synthesizes a final stop from the
+/// scalar back colour. The XML omits the redundant first stop and retains the
+/// terminal colour at a position that the binary does not encode. Controls
+/// with three and five binary stops, two and four XML stops, and changed
+/// XML/binary colours establish this restatement; compare the authored
+/// interior positions and colours, and the terminal colour, without inventing
+/// a terminal position for the binary. Other unequal layouts stay unverifiable.
 /// ECMA-376 CT_GradientFillProperties gives `flip` the default `none`; a
 /// `tileRect` with all zero offsets covers the whole shape, like no tileRect.
-/// `rotWithShape` has no visible effect when the projected shape has no
-/// rotation; keep its absent/present distinction for rotated shapes because
-/// the schema declares no default.
+/// PowerPoint 16 PDF controls on 90- and 180-degree rotations show that an
+/// omitted XML `rotWithShape` renders like `1`, while the corresponding binary
+/// shapes carry no authored rotation flag and project the binary default `0`.
+/// This paired omission is a PowerPoint restatement, not visual equivalence of
+/// the two projections. An XML-only `rotWithShape="0"` edit changes both PDFs.
 #[cfg(any(test, feature = "direct-ppt"))]
 fn same_paint(binary: &pptx_model::Fill, alternative: &pptx_model::Fill, rotation: f64) -> bool {
     use pptx_model::Fill;
@@ -844,6 +850,34 @@ fn same_paint(binary: &pptx_model::Fill, alternative: &pptx_model::Fill, rotatio
             .collect();
         stops.sort_by(|a, b| a.0.total_cmp(&b.0));
         stops
+    }
+    fn comparable_stops(binary: &[(f64, &str)], alternative: &[(f64, &str)]) -> bool {
+        let matching = |b: &(f64, &str), a: &(f64, &str)| {
+            (b.0 - a.0).abs() <= POSITION && same_color(b.1, a.1) == Some(true)
+        };
+        if binary.len() == alternative.len() {
+            return binary.iter().zip(alternative).all(|(b, a)| matching(b, a));
+        }
+        // The 0 stop duplicates the first authored colour; the final binary
+        // stop is synthesized from fillBackColor at 1, not authored in
+        // fillShadeColors. PowerPoint's XML retains its independent terminal
+        // position, which must follow the last binary-authored stop.
+        if binary.len() != alternative.len() + 1 || binary.len() < 3 {
+            return false;
+        }
+        let redundant_start =
+            binary[0].0.abs() <= POSITION && same_color(binary[0].1, binary[1].1) == Some(true);
+        let authored = binary[1..binary.len() - 1]
+            .iter()
+            .zip(&alternative[..alternative.len() - 1])
+            .all(|(b, a)| matching(b, a));
+        let end = (binary.last().unwrap(), alternative.last().unwrap());
+        redundant_start
+            && authored
+            && (end.0 .0 - 1.0).abs() <= POSITION
+            && end.1 .0 + POSITION >= binary[binary.len() - 2].0
+            && end.1 .0 <= 1.0 + POSITION
+            && same_color(end.0 .1, end.1 .1) == Some(true)
     }
     let rect = |r: &Option<ooxml_common::fill::FillRect>| r.as_ref().map(|r| [r.l, r.t, r.r, r.b]);
     let tile_rect =
@@ -876,10 +910,7 @@ fn same_paint(binary: &pptx_model::Fill, alternative: &pptx_model::Fill, rotatio
         ) => {
             let (bs, as_) = (sorted(bs), sorted(as_));
             let turn = (ba - aa).rem_euclid(360.0);
-            bs.len() == as_.len()
-                && bs.iter().zip(&as_).all(|(b, a)| {
-                    (b.0 - a.0).abs() <= POSITION && same_color(b.1, a.1) == Some(true)
-                })
+            comparable_stops(&bs, &as_)
                 && turn.min(360.0 - turn) < 0.01
                 && bt == at
                 && bsc == asc
@@ -887,7 +918,7 @@ fn same_paint(binary: &pptx_model::Fill, alternative: &pptx_model::Fill, rotatio
                 && rect(bf) == rect(af)
                 && tile_rect(btr) == tile_rect(atr)
                 && bfl.as_deref().unwrap_or("none") == afl.as_deref().unwrap_or("none")
-                && (br == ar || rotation_irrelevant)
+                && (br == ar || ar.is_none() && *br == Some(false) || rotation_irrelevant)
         }
         (
             Fill::Pattern {
@@ -1323,6 +1354,79 @@ mod tests {
         );
         alternative.fill = gradient(&[(0.31, "FFFFFF"), (0.0, "000000")], Some(true));
         assert_eq!(same_fill(&recorded, &alternative, 90.0), Verdict::Same);
+        // PowerPoint's binary 0 stop may duplicate the first authored shade;
+        // its scalar back colour has no authored stop position. The XML keeps
+        // the latter position, including values short of 100%.
+        let resampled = RecordedFill::Stated(
+            gradient(
+                &[
+                    (0.0, "000000"),
+                    (0.18, "000000"),
+                    (0.39, "172DA6"),
+                    (0.61, "00B0F0"),
+                    (1.0, "20A472"),
+                ],
+                Some(false),
+            )
+            .map(Box::new),
+        );
+        alternative.fill = gradient(
+            &[
+                (0.18, "000000"),
+                (0.39, "172DA6"),
+                (0.61, "00B0F0"),
+                (0.92, "20A472"),
+            ],
+            None,
+        );
+        assert_eq!(same_fill(&resampled, &alternative, 180.0), Verdict::Same);
+        // The same restatement also occurs with three binary stops and two
+        // XML stops. A distinct colour at zero is not the redundant stop.
+        let short = RecordedFill::Stated(
+            gradient(
+                &[(0.0, "000000"), (0.31, "000000"), (1.0, "FFFFFF")],
+                Some(false),
+            )
+            .map(Box::new),
+        );
+        alternative.fill = gradient(&[(0.31, "000000"), (0.88, "FFFFFF")], None);
+        assert_eq!(same_fill(&short, &alternative, 90.0), Verdict::Same);
+        let nonredundant = RecordedFill::Stated(
+            gradient(
+                &[(0.0, "172DA6"), (0.31, "000000"), (1.0, "FFFFFF")],
+                Some(false),
+            )
+            .map(Box::new),
+        );
+        assert_eq!(
+            same_fill(&nonredundant, &alternative, 90.0),
+            Verdict::Unverifiable("fill")
+        );
+        alternative.fill = gradient(
+            &[
+                (0.18, "000000"),
+                (0.39, "172DA6"),
+                (0.61, "00B0F0"),
+                (0.92, "20A472"),
+            ],
+            None,
+        );
+        if let Some(Fill::Gradient { stops, .. }) = alternative.fill.as_mut() {
+            stops[1].position = 0.42;
+        }
+        assert_eq!(
+            same_fill(&resampled, &alternative, 180.0),
+            Verdict::Unverifiable("fill")
+        );
+        if let Some(Fill::Gradient { stops, .. }) = alternative.fill.as_mut() {
+            stops[1].position = 0.39;
+            stops[3].color = "FFFFFF".into();
+        }
+        assert_eq!(
+            same_fill(&resampled, &alternative, 180.0),
+            Verdict::Unverifiable("fill")
+        );
+        alternative.fill = gradient(&[(0.31, "FFFFFF"), (0.0, "000000")], Some(true));
         // ECMA-376 CT_GradientFillProperties defaults flip to "none";
         // tileRect with all-zero edges covers the same whole shape as none.
         if let Some(Fill::Gradient {
@@ -1338,12 +1442,8 @@ mod tests {
         );
         alternative.fill = gradient(&[(0.31, "FFFFFF"), (0.0, "000000")], None);
         assert_eq!(same_fill(&no_rotation, &alternative, 0.0), Verdict::Same);
-        assert_eq!(
-            same_fill(&no_rotation, &alternative, 90.0),
-            Verdict::Unverifiable("fill")
-        );
-        // Another stop layout or an unstated rotation may restate the same
-        // paint: not comparable.
+        assert_eq!(same_fill(&no_rotation, &alternative, 90.0), Verdict::Same);
+        // Another stop layout cannot be equated by this bounded rule.
         alternative.fill = gradient(&[(0.0, "000000"), (0.31, "FFFFFF")], None);
         assert_eq!(
             same_fill(&recorded, &alternative, 90.0),
