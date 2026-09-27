@@ -281,6 +281,107 @@ fn alternative_part(blob: &[u8]) -> Result<Option<(String, String)>, String> {
     Ok(found)
 }
 
+/// Check the OPC references used by the alternative without fetching an
+/// external target or treating a resolved target as evidence that the binary
+/// and XML agree. ECMA-376 Part 2 §6.5.2.3 locates the relationship part
+/// beside its source part; §6.5.3.4 keeps external targets outside the ZIP.
+/// PowerPoint precedence for these references still needs its control PDFs.
+#[cfg(feature = "direct-ppt")]
+fn read_blob_reference_part<R: std::io::Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    name: &str,
+) -> Result<String, String> {
+    use std::io::Read;
+    let unreadable = || unverifiable("relationship");
+    let index = crate::opc_part::entry_index(archive, name).ok_or_else(unreadable)?;
+    let entry = archive.by_index(index).map_err(|_| unreadable())?;
+    if entry.size() > MAX_PART_BYTES || entry.encrypted() {
+        return Err(unreadable());
+    }
+    let mut text = String::new();
+    entry
+        .take(MAX_PART_BYTES + 1)
+        .read_to_string(&mut text)
+        .map_err(|_| unreadable())?;
+    if text.len() as u64 > MAX_PART_BYTES {
+        return Err(unreadable());
+    }
+    Ok(text)
+}
+
+#[cfg(feature = "direct-ppt")]
+fn validate_blob_references(blob: &[u8], part: &str) -> Result<(), String> {
+    use std::collections::BTreeSet;
+
+    let unreadable = || unverifiable("relationship");
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(blob)).map_err(|_| unreadable())?;
+    // Resource policy: avoid a reference-by-entry quadratic scan of a ZIP
+    // with a huge number of tiny entries. Ordinary Office shape blobs are
+    // much smaller; this limit makes the passive check bounded.
+    if archive.len() > 128 {
+        return Err(unreadable());
+    }
+    let xml = read_blob_reference_part(&mut archive, part)?;
+    let doc = ooxml_common::depth::parse_guarded(&xml).map_err(|_| unreadable())?;
+    let ids: BTreeSet<&str> = doc
+        .descendants()
+        .flat_map(|node| node.attributes())
+        .filter(|attribute| ooxml_common::ns::is_r_ns(attribute.namespace()))
+        .map(|attribute| attribute.value())
+        .collect();
+    if ids.is_empty() {
+        // The selected theme style may own the reference instead. It is not
+        // in this blob and remains unverifiable at the adoption gate.
+        return Ok(());
+    }
+    let rels_path = ooxml_common::rels::relationship_part_path(part);
+    let rels = read_blob_reference_part(&mut archive, &rels_path)?;
+    let rels = ooxml_common::depth::parse_guarded(&rels).map_err(|_| unreadable())?;
+    let root = rels.root_element();
+    if root.tag_name().name() != "Relationships"
+        || root.tag_name().namespace()
+            != Some("http://schemas.openxmlformats.org/package/2006/relationships")
+    {
+        return Err(unreadable());
+    }
+    let mut seen = BTreeSet::new();
+    let mut matched = BTreeSet::new();
+    for relationship in root.children().filter(|node| node.is_element()) {
+        if relationship.tag_name().name() != "Relationship"
+            || relationship.tag_name().namespace() != root.tag_name().namespace()
+        {
+            return Err(unreadable());
+        }
+        let id = relationship.attribute("Id").ok_or_else(unreadable)?;
+        if !seen.insert(id) {
+            return Err(unreadable());
+        }
+        if !ids.contains(id) {
+            continue;
+        }
+        let target = relationship.attribute("Target").ok_or_else(unreadable)?;
+        if target.is_empty() || relationship.attribute("Type").is_none_or(str::is_empty) {
+            return Err(unreadable());
+        }
+        match relationship.attribute("TargetMode") {
+            None | Some("Internal") => {
+                let name =
+                    ooxml_common::rels::resolve_part_name(part, target).ok_or_else(unreadable)?;
+                if crate::opc_part::entry_index(&archive, &name).is_none() {
+                    return Err(unreadable());
+                }
+            }
+            Some("External") => {} // Opaque URI; never read or fetched.
+            _ => return Err(unreadable()),
+        }
+        matched.insert(id);
+    }
+    if matched != ids {
+        return Err(unreadable());
+    }
+    Ok(())
+}
+
 /// Resolve the alternative shape XML of a binary shape: `Ok(Some)` adopts
 /// it; `Ok(None)` keeps the binary projection, because the package carries
 /// no alternative part or the alternative verifiably disagrees with the
@@ -342,6 +443,7 @@ pub(in crate::ppt) fn adopt(
     // The same flag includes a selected theme fragment that could not be
     // inspected; it also needs this typed unverifiable result.
     if parsed.relationship_references {
+        validate_blob_references(blob, &part)?;
         return Err(unverifiable("relationship"));
     }
     let local = if parsed.placeholder {
@@ -1629,6 +1731,52 @@ mod tests {
                 Some(("shapeXml".into(), "DRS/shapeXML.xml".into()))
             );
             assert!(placeholder_locals(&package, "DRS/shapeXML.xml").is_ok());
+        }
+
+        #[test]
+        fn blob_relationship_targets_are_checked_passively() {
+            let shape = SHAPE_XML.replace(
+                "</p:spPr>",
+                "<a:blipFill><a:blip xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" r:embed=\"rIdImage\"/></a:blipFill></p:spPr>",
+            );
+            let rels = "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rIdImage\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/image\" Target=\"media/image.jpeg\"/></Relationships>";
+            let parts = &[
+                ("drs/shapexml.xml", shape.as_str()),
+                ("drs/_rels/shapexml.xml.rels", rels),
+                ("drs/media/image.jpeg", "passive: never decode"),
+            ];
+            let present = package(parts, &[]);
+            assert!(validate_blob_references(&present, "drs/shapexml.xml").is_ok());
+            let missing = package(&parts[..2], &[]);
+            assert!(validate_blob_references(&missing, "drs/shapexml.xml").is_err());
+
+            let external = rels.replace(
+                "Target=\"media/image.jpeg\"",
+                "Target=\"https://example.test/image\" TargetMode=\"External\"",
+            );
+            let external = package(
+                &[
+                    ("drs/shapexml.xml", &shape),
+                    ("drs/_rels/shapexml.xml.rels", &external),
+                ],
+                &[],
+            );
+            assert!(validate_blob_references(&external, "drs/shapexml.xml").is_ok());
+
+            let duplicate = rels.replacen(
+                "<Relationship ",
+                "<Relationship Id=\"rIdImage\" Type=\"image\" Target=\"media/image.jpeg\"/><Relationship ",
+                1,
+            );
+            let duplicate = package(
+                &[
+                    ("drs/shapexml.xml", &shape),
+                    ("drs/_rels/shapexml.xml.rels", &duplicate),
+                    ("drs/media/image.jpeg", "passive"),
+                ],
+                &[],
+            );
+            assert!(validate_blob_references(&duplicate, "drs/shapexml.xml").is_err());
         }
 
         fn theme() -> Theme {
