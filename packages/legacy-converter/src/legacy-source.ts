@@ -6,11 +6,11 @@
  */
 import {
   cfbDirectoryNames,
-  MODEL_SOURCE_MODULE_PROTOCOL,
   type ModelSource,
   type ModelSourceModuleDescriptor,
   type ModelSourceTarget,
 } from '@silurus/ooxml-core';
+import { MODEL_SOURCE_MODULE_PROTOCOL } from '@silurus/ooxml-core/internal/model-source';
 
 import { MAX_LEGACY_SOURCE_BYTES } from './legacy-source-limits.js';
 

@@ -138,6 +138,7 @@ async function bundleSelfContainedModule(entry: string): Promise<string> {
     resolve: {
       alias: {
         '@silurus/ooxml-core/worker': resolve(__dirname, 'packages/core/src/worker/index.ts'),
+        '@silurus/ooxml-core/internal/model-source': resolve(__dirname, 'packages/core/src/source/model-source.ts'),
         '@silurus/ooxml-core': resolve(__dirname, 'packages/core/src/index.ts'),
       },
       extensionAlias: { '.js': ['.ts', '.js'] },

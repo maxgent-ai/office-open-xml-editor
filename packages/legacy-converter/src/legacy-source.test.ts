@@ -1,10 +1,12 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
-  MODEL_SOURCE_MODULE_PROTOCOL,
-  validateModelSourceModuleDescriptor,
   type ModelSource,
   type ModelSourceTarget,
 } from '@silurus/ooxml-core';
+import {
+  MODEL_SOURCE_MODULE_PROTOCOL,
+  validateModelSourceModuleDescriptor,
+} from '@silurus/ooxml-core/internal/model-source';
 import { buildCfbFixture } from '@silurus/ooxml-core/testing';
 
 // Creating, claiming and describing a source must never load native code:
