@@ -56,6 +56,8 @@ describe.each(factories)('legacy $family source factory', ({ family, target, cre
       .toContain(`/wasm-direct-${family}/legacy_${family}_direct_bg.wasm`);
     // The core loader admits the descriptor for this target and no other.
     expect(validateModelSourceModuleDescriptor(module, target)).toEqual(module);
+    expect(load.transfer).toBeUndefined();
+    expect(() => load.release()).not.toThrow();
     expect(() => load.release()).not.toThrow();
   });
 

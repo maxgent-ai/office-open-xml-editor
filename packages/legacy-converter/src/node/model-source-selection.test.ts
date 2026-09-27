@@ -14,14 +14,14 @@ const cfb = (...streams: string[]) => new Uint8Array(buildCfbFixture(['Root Entr
 const legacyRejection = { code: 'legacy-binary-format' };
 
 describe('Node openers and legacy model sources', () => {
-  it('keep the typed legacy rejection for every binary family without model sources', async () => {
+  it('keeps the original Node OOXML rejection without model sources', async () => {
     for (const open of [
       () => materializeDocxDocument(cfb('WordDocument')),
       () => openXlsxWorkbook(cfb('Workbook')),
       () => openPptxPresentation(cfb('PowerPoint Document')),
     ]) {
       await expect(open()).rejects.toBeInstanceOf(OoxmlError);
-      await expect(open()).rejects.toMatchObject(legacyRejection);
+      await expect(open()).rejects.toMatchObject({ code: 'not-ooxml' });
     }
   });
 

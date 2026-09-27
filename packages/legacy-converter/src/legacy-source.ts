@@ -93,6 +93,9 @@ export function createLegacySource<T extends ModelSourceTarget>(
       return true;
     },
     beginLoad() {
+      // The calling realm retains no transfer or native handle. The opened
+      // archive belongs to the source module and is closed by its owner;
+      // release is therefore an idempotent no-op even on an open failure.
       return { module, release() {} };
     },
   });
