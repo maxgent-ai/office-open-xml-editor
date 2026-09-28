@@ -10,12 +10,14 @@
  * immutable snapshot, and then resumes the SAME generator state. No truncated
  * source, growing-prefix replay, or second paginator exists.
  *
- * Publications remain provisional because later anchor/header/footer/field
- * convergence can repaginate the document. They are nevertheless based on the
- * complete source input, so unbounded `keepNext` lookahead is no longer cut off
- * at an artificial preview boundary. Header/footer reserve and pagination-field
- * convergence can replace a preview; the public publication contract marks
- * these snapshots `exact:false` until the authoritative final layout arrives.
+ * Page-owned anchor convergence can repaginate a document, so its passes
+ * publish only the leading pages proven identical in every later anchor pass
+ * (`anchorStablePageLimit` in `body-paginator.ts`). Publications are based on
+ * the complete source input, so unbounded `keepNext` lookahead is not cut off
+ * at an artificial preview boundary. Continuous-section balancing and
+ * header/footer reserve or pagination-field convergence can still replace a
+ * preview; the public publication contract marks these snapshots
+ * `exact:false` until the authoritative final layout arrives.
  *
  * ## What is guaranteed
  *

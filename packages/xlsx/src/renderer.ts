@@ -305,13 +305,14 @@ export function fontStackFor(
 }
 
 const DEFAULT_FONT_SIZE = 11;
-// Fallback Max Digit Width of the Normal-style font when the workbook's
-// default font isn't known. Calibri 11 pt at 96 DPI ≈ 8 px (Canvas2D
-// measurement), matching the EMU offsets Excel 365 writes into
-// <xdr:twoCellAnchor>. ECMA-376 §18.3.1.13 defines MDW as the maximum
-// rendered width among the digits 0-9 in the workbook's Normal-style font,
-// so the spec-correct value depends on which font and point size that style
-// resolves to (e.g. Meiryo UI 10 pt yields MDW ≈ 6 px).
+// Fallback Max Digit Width when the workbook's default font isn't known.
+// Calibri 11 pt at 96 DPI ≈ 8 px (Canvas2D measurement), matching the EMU
+// offsets Excel 365 writes into <xdr:twoCellAnchor>. ECMA-376 §18.3.1.13
+// defines MDW as the maximum rendered width among the digits 0-9 of the
+// workbook's default font; measured in Excel, that is `<fonts>[0]`, not the
+// Normal cell style's font (which only sets the automatic row-height
+// baseline). The value depends on that font and size (e.g. Meiryo UI 10 pt
+// yields MDW ≈ 6 px).
 export const HEADER_W = 50;
 export const HEADER_H = 22;
 
@@ -416,12 +417,13 @@ function hasDeclaredFamilyFace(family: string, fontSet: FontFaceSet | null): boo
   return false;
 }
 
-/** Resolve the Max Digit Width from the face that paints this worksheet's
- *  Normal-style text. ECMA-376 §18.3.1.13 defines the source digit metric;
- *  when that face is unavailable, its catalog hmtx digit width cannot be used
- *  alongside a wider Canvas fallback without clipping cell text. The retained
+/** Resolve the Max Digit Width from the workbook's default font face
+ *  (`<fonts>[0]`, as Excel sizes columns). ECMA-376 §18.3.1.13 defines the
+ *  source digit metric; when that face is unavailable, its catalog hmtx digit
+ *  width cannot be used alongside a wider Canvas fallback without clipping
+ *  cell text. The retained
  *  exact local/application face still wins when available. If the parser did
- *  not identify a Normal font, use the conventional 8 px fallback. */
+ *  not identify a default font, use the conventional 8 px fallback. */
 export function getMdwForWorksheet(ws: Pick<Worksheet,
   'defaultFontFamily' | 'defaultFontSize' | 'defaultFontBold' | 'defaultFontItalic'>): number {
   if (!ws.defaultFontFamily || !ws.defaultFontSize) return MDW_FALLBACK;
@@ -1560,7 +1562,7 @@ interface RenderContext {
    *  neighbours. These anchors bypass the ordinary cell-rectangle cull so the
    *  existing overflow clip can paint the still-visible portion of the text. */
   overflowTextAnchors: Set<string>;
-  /** Max Digit Width resolved for the worksheet's Normal-style font
+  /** Max Digit Width resolved for the workbook's default font, `<fonts>[0]`
    *  (ECMA-376 §18.3.1.13). Used by `colWidthToPx` to convert character-
    *  unit column widths into pixels. */
   mdw: number;
@@ -3332,8 +3334,10 @@ export function applyAutoRowHeights(
 
   const geometry = getGridGeometryForWorksheet(worksheet);
   const defaultHeightPx = rowHeightToPx(worksheet.defaultRowHeight);
+  // Row auto-fit compares against the Normal style's font; column MDW uses
+  // the default font (`<fonts>[0]`), which may differ.
   const defaultFontLineHeightPx = vMetricPx(
-    worksheet.defaultFontSize ?? DEFAULT_FONT_SIZE,
+    worksheet.normalFontSize ?? worksheet.defaultFontSize ?? DEFAULT_FONT_SIZE,
     1,
     1.2,
   );
@@ -3707,7 +3711,7 @@ export function renderViewport(
   const cs = opts.cellScale ?? 1;
   const chartSheet = worksheet.isChartSheet === true;
   // Resolve MDW once per render — workbook-wide value derived from the
-  // Normal-style font (ECMA-376 §18.3.1.13).
+  // default font, `<fonts>[0]` (ECMA-376 §18.3.1.13).
   const geometry = getGridGeometryForWorksheet(worksheet);
   const mdw = geometry.maximumDigitWidth;
   const canvasW = ctx.canvas.width / dpr;

@@ -225,6 +225,25 @@ describe('XLSX automatic row height (ECMA-376 §18.3.1.73 / Office auto-fit)', (
     expect(measured.count()).toBe(0);
   });
 
+  it('gates automatic rows on the Normal font, not the larger default font', () => {
+    // <fonts>[0] (column MDW) is 20pt while the Normal style is 11pt: a 20pt
+    // cell still exceeds the Normal line box and must be measured.
+    const ws = worksheet();
+    ws.defaultFontFamily = 'Calibri';
+    ws.defaultFontSize = 20;
+    ws.normalFontSize = 11;
+    ws.rows = [{
+      index: 1,
+      height: null,
+      cells: [{ row: 1, col: 1, styleIndex: 2, value: { type: 'text', text: 'large' } }],
+    }];
+    ws.rowHeights = {};
+    ws.mergeCells = [];
+
+    expect(applyAutoRowHeights(measurementContext(), ws, styles)).toBe(true);
+    expect(ws.rowHeights[1]).toBeGreaterThan(ws.defaultRowHeight);
+  });
+
   it('uses the tallest rich run for an unwrapped automatic row', () => {
     const ws = worksheet();
     ws.rows = [{

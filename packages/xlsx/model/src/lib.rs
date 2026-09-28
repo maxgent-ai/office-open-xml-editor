@@ -223,24 +223,30 @@ pub struct Worksheet {
     /// extension `http://schemas.microsoft.com/office/spreadsheetml/2009/9/main`,
     /// element `<x14:sparklineGroup>`, ECMA-376 §18.2 / Part 4).
     pub sparkline_groups: Vec<SparklineGroup>,
-    /// Family name of the workbook's Normal-style font, resolved from
-    /// `<cellStyleXfs>[0].fontId` → `<fonts>[fontId].name.val`. Used by the
-    /// renderer to compute the Max Digit Width (ECMA-376 §18.3.1.13) for the
-    /// active sheet's column widths. Denormalized onto every worksheet for
-    /// renderer convenience; the value is workbook-wide.
+    /// Family name of the workbook's default font, `<fonts>[0].name.val`.
+    /// Used by the renderer to compute the Max Digit Width (ECMA-376
+    /// §18.3.1.13) for column widths: measured in Excel, columns follow
+    /// `<fonts>[0]` rather than the Normal cell style or `<cellStyleXfs>[0]`.
+    /// Denormalized onto every worksheet for renderer convenience; the value
+    /// is workbook-wide.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_font_family: Option<String>,
-    /// Point size of the workbook's Normal-style font (`<fonts>[N].sz.val`).
+    /// Point size of the workbook's default font (`<fonts>[0].sz.val`).
     /// Used together with `default_font_family` to compute Max Digit Width.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_font_size: Option<f64>,
-    /// `<fonts>[Normal.fontId]` style bits. Omitted when false so an ordinary
-    /// workbook keeps the compact worksheet model. MDW must use this exact
-    /// tuple rather than assuming the regular face.
+    /// `<fonts>[0]` style bits. Omitted when false so an ordinary workbook
+    /// keeps the compact worksheet model. MDW must use this exact tuple
+    /// rather than assuming the regular face.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_font_bold: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_font_italic: Option<bool>,
+    /// Point size of the Normal cell style's font (`builtinId="0"`, else
+    /// `<cellStyleXfs>[0]`): the automatic row-height baseline. A cell font
+    /// whose line box exceeds it may grow a row without `row@ht`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub normal_font_size: Option<f64>,
     /// Workbook DrawingML theme's Jpan faces for scheme-marked cell fonts.
     /// Excel for Mac with a Japanese UI locale selects this script face even
     /// for Latin cells; retain the authored scheme separately on each font.
@@ -309,6 +315,7 @@ impl Worksheet {
             default_font_size: None,
             default_font_bold: None,
             default_font_italic: None,
+            normal_font_size: None,
             theme_japanese_major_font: None,
             theme_japanese_minor_font: None,
             date1904: false,

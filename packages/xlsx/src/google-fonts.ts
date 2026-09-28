@@ -121,9 +121,9 @@ export function xlsxOfficeFontRequests(wb: ParsedWorkbook | undefined): OfficeFo
  * text run with a catalogued exact style; cell requests remain Calibri-only. */
 export function xlsxWorksheetOfficeFontRequests(ws: Worksheet): OfficeFontFallbackRequest[] {
   const found = new Map<string, OfficeFontFallbackRequest>();
-  // The parser resolves Normal through cellStyleXfs[0].fontId. Preflight that
-  // authored face before measuring column MDW, including families that occur
-  // nowhere in a cell's text. Exact local bytes win over catalog references.
+  // Column MDW uses the workbook default font, `<fonts>[0]`. Preflight that
+  // authored face before measuring it, including families that occur nowhere
+  // in a cell's text. Exact local bytes win over catalog references.
   const normalFamily = ws.defaultFontFamily?.trim();
   const normalWeight = ws.defaultFontBold ? 700 : 400;
   const normalStyle = ws.defaultFontItalic ? 'italic' : 'normal';

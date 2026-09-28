@@ -9,6 +9,7 @@ import type {
   BodyAcquisitionLocation,
   BodyLayoutSession,
   BodyTableContinuationCursor,
+  PageAnchorPrescanInput,
 } from './body-layout-kernel.js';
 import { NoteCapacityExceededError } from './body-layout-kernel.js';
 import {
@@ -758,11 +759,76 @@ export type BodyPaginationPassResult = Readonly<{
 interface BodyPaginationPassObserver {
   shouldPublish(committedPages: number): boolean;
   publish(pass: BodyPaginationPassResult, processedEntries: number): void;
+  /** Receives, in pass order, every value the pass reads from the page-anchor
+   * convergence carry (see `anchorStablePageLimit`). */
+  onPageAnchorInput?(event: PageAnchorInputEvent): void;
 }
 
-/** Optional observer for paintable snapshots produced by the first canonical
- * pagination pass. The generator itself continues from the same suspended
- * state after every publication; no source prefix is replayed. */
+type PageStartAnchors = PageAnchorPrescanInput['anchors'];
+
+/** One read of anchor-convergence state by a body pagination pass: the anchors
+ * prescanned when a flow domain opens, or the minimum-page floor looked up for
+ * a page-owned floating table when the flow reaches it. Everything else a pass
+ * reads is identical in every pass of one convergence run. */
+type PageAnchorInputEvent = Readonly<{
+  kind: 'prescan';
+  pageIndex: number;
+  flowDomainId: string;
+  anchors: PageStartAnchors;
+}> | Readonly<{
+  kind: 'page-owned-table';
+  pageIndex: number;
+  key: string;
+  floor: number | undefined;
+}>;
+
+/** Receives provisional snapshots of one or more passes of the canonical
+ * session; `pageIndexLimit` bounds the leading pages the caller may show. */
+interface BodyPagePublisher {
+  /** Pages already delivered; a publication must extend this prefix. */
+  readonly publishedPages: number;
+  readonly failed: boolean;
+  publish(pass: BodyPaginationPassResult, processedEntries: number, pageIndexLimit: number): void;
+}
+
+/** Checkpoint schedule for one pass: publish when the committed page count
+ * doubles, and only while the pass can still extend the published prefix. */
+function passPublicationObserver(
+  publisher: BodyPagePublisher,
+  pageIndexLimit: (pass: BodyPaginationPassResult) => number,
+  extra: Readonly<{
+    onPageAnchorInput?: (event: PageAnchorInputEvent) => void;
+    canExtend?: () => boolean;
+  }> = {},
+): BodyPaginationPassObserver {
+  let nextCheckpoint = 1;
+  return {
+    // One committed page beyond the published prefix is the live page, which
+    // is never published; a checkpoint needs at least one more.
+    shouldPublish: (committedPages) => (
+      !publisher.failed
+      && committedPages >= Math.max(nextCheckpoint, publisher.publishedPages + 2)
+      && (extra.canExtend?.() ?? true)
+    ),
+    publish: (pass, processedEntries) => {
+      const pages = pass.layout.pages.length;
+      nextCheckpoint = Math.max(pages + 1, pages * 2);
+      publisher.publish(pass, processedEntries, pageIndexLimit(pass));
+    },
+    ...(extra.onPageAnchorInput ? { onPageAnchorInput: extra.onPageAnchorInput } : {}),
+  };
+}
+
+/** The page index of a pass snapshot's live (last, still open) page. */
+function livePageIndex(pass: BodyPaginationPassResult): number {
+  return pass.layout.pages.at(-1)?.pageIndex ?? 0;
+}
+
+/** Optional observer for paintable snapshots of the canonical pagination
+ * session: the seed pass, or for a document with page-owned anchors each pass
+ * of the unseeded anchor convergence, limited to pages that convergence can no
+ * longer change. The generator continues from the same suspended state after
+ * every publication; no source prefix is replayed. */
 export interface BodyPaginationObserver {
   onPages(layout: DocumentLayout, processedEntries: number): void;
 }
@@ -893,26 +959,10 @@ function* paginateBodyPassSteps(
     // interval, not by that reduced current-page section band.
     return interval.blockEndPt - interval.blockStartPt;
   };
-  const pageStartAnchors = (target: BodyPaginationState, startIndex: number) => {
+  const pageStartAnchors = (target: BodyPaginationState, startIndex: number): PageStartAnchors => {
     if (anchorDestinations !== null) {
       const location = acquisitionLocation(target);
-      return Object.freeze([...anchorDestinations.values()]
-        .filter((destination) => (
-          destination.pageIndex === location.pageIndex
-          && destination.flowDomainId === location.flowDomainId
-        ))
-        .map((destination) => destination.kind === 'drawing'
-          ? Object.freeze({
-              kind: 'drawing' as const,
-              occurrenceId: destination.occurrenceId,
-              paragraphSource: destination.paragraphSource,
-            })
-          : Object.freeze({
-              kind: 'floating-table' as const,
-              occurrenceId: destination.occurrenceId,
-              tableSource: destination.tableSource,
-              bounds: destination.bounds,
-            })));
+      return plannedPageStartAnchors(anchorDestinations, location.pageIndex, location.flowDomainId);
     }
     const anchors: Array<Readonly<{
       kind: 'drawing'; occurrenceId: string; paragraphSource: SourceRef;
@@ -931,6 +981,17 @@ function* paginateBodyPassSteps(
   };
   const prescanPageAnchors = (target: BodyPaginationState, startIndex: number) => {
     const anchors = pageStartAnchors(target, startIndex);
+    if (observer?.onPageAnchorInput) {
+      // Recorded even when empty: a later pass that prescans anchors here
+      // would change this flow domain.
+      const at = acquisitionLocation(target);
+      observer.onPageAnchorInput(Object.freeze({
+        kind: 'prescan',
+        pageIndex: at.pageIndex,
+        flowDomainId: at.flowDomainId,
+        anchors,
+      }));
+    }
     if (anchors.length === 0) return;
     if (!session.prescanPageAnchors) {
       throw new Error('Page-owned anchors require canonical prescan acquisition');
@@ -1544,7 +1605,17 @@ function* paginateBodyPassSteps(
     } else {
       previousParagraph = null;
       if (block.kind === 'table') {
-        const minimumPage = minimumTablePageBySource?.get(`table:${sourceKey(block.source)}`);
+        const tableKey = `table:${sourceKey(block.source)}`;
+        const minimumPage = minimumTablePageBySource?.get(tableKey);
+        if ((block.pageOwnedFloatingTable === true || minimumPage !== undefined)
+          && observer?.onPageAnchorInput) {
+          observer.onPageAnchorInput(Object.freeze({
+            kind: 'page-owned-table',
+            pageIndex: state.flow.pageIndex,
+            key: tableKey,
+            floor: minimumPage,
+          }));
+        }
         if (minimumPage !== undefined) {
           // §17.4.57 gives the page-owned table a fixed position and a minimum
           // distance from adjacent text. Word controls show that a table whose
@@ -2279,6 +2350,119 @@ function pageAnchorDestinationPlan(layout: DocumentLayout) {
   return destinations;
 }
 
+/** The anchors a pass applying `plan` prescans when it opens this flow domain. */
+function plannedPageStartAnchors(
+  plan: ReadonlyMap<string, PageWrapDestination>,
+  pageIndex: number,
+  flowDomainId: string,
+): PageStartAnchors {
+  return Object.freeze([...plan.values()]
+    .filter((destination) => (
+      destination.pageIndex === pageIndex && destination.flowDomainId === flowDomainId
+    ))
+    .map((destination) => destination.kind === 'drawing'
+      ? Object.freeze({
+          kind: 'drawing' as const,
+          occurrenceId: destination.occurrenceId,
+          paragraphSource: destination.paragraphSource,
+        })
+      : Object.freeze({
+          kind: 'floating-table' as const,
+          occurrenceId: destination.occurrenceId,
+          tableSource: destination.tableSource,
+          bounds: destination.bounds,
+        })));
+}
+
+function pageStartAnchorsIdentity(anchors: PageStartAnchors): string {
+  return anchors.map((anchor) => (anchor.kind === 'drawing'
+    ? `drawing|${anchor.occurrenceId}|${sourceKey(anchor.paragraphSource)}`
+    : `table|${anchor.occurrenceId}|${sourceKey(anchor.tableSource)}|${anchor.bounds.xPt}|${
+      anchor.bounds.yPt}|${anchor.bounds.widthPt}|${anchor.bounds.heightPt}`)).join('\n');
+}
+
+/**
+ * The page-index bound below which a snapshot of an in-progress page-anchor
+ * pass is final: no later pass of this convergence run can change those pages.
+ *
+ * A pass is a deterministic function of the body input, the reserves and the
+ * balance plan — fixed for the whole run — and of the two values carried
+ * between passes: the anchor plan and the proven minimum table pages. The pass
+ * reads the carry only at the events it reports through `onPageAnchorInput`.
+ * Two passes whose event reads agree up to some moment are therefore in the
+ * same state at that moment, including every page closed by then.
+ *
+ * Pass k+1 applies the plan pass k observed (`pageAnchorDestinationPlan`), so
+ * each read can be predicted from closed pages of pass k:
+ *
+ * - A prescan of page p reads the plan's destinations on (p, flow domain). Once
+ *   p is closed, pass k's observed destinations there are final, and the read
+ *   agrees iff they equal what pass k prescanned.
+ * - A page-owned table floor read at page r changes the flow only when the
+ *   floor exceeds r. The next floor is absent, carried, or proven from a table
+ *   whose destination changed. The read agrees in every later pass iff the
+ *   current floor does not exceed r, the table's destination is unchanged,
+ *   and that destination lies on a page that itself stays final. A table
+ *   reached before the bound but placed at or after it could still move, and
+ *   its next floor could then act at r, so it lowers the bound to r.
+ *
+ * By induction every later pass, including the converged one, reproduces
+ * pages below the returned bound exactly. The bound never exceeds the live
+ * page, whose content is still open. The first pass, which prescans source
+ * order rather than a plan, is covered by the same comparison.
+ *
+ * Scope: this proves stability across anchor convergence only. Later
+ * continuous-section balancing and header/footer reserve or pagination-field
+ * convergence can still replace a provisional publication (`exact:false`).
+ */
+function anchorStablePageLimit(
+  events: readonly PageAnchorInputEvent[],
+  appliedPlan: ReadonlyMap<string, PageWrapDestination> | null,
+  snapshot: BodyPaginationPassResult,
+): Readonly<{ limit: number; prescanDisagreementPage: number }> {
+  const observed = pageAnchorDestinationPlan(snapshot.layout);
+  let limit = livePageIndex(snapshot);
+  // A disagreeing prescan on a closed page stays disagreeing for the rest of
+  // this pass, so its page also caps every later snapshot of the pass.
+  let prescanDisagreementPage = Number.POSITIVE_INFINITY;
+  const reachedTables: Array<Readonly<{ reachedPage: number; placedPage: number }>> = [];
+  for (const event of events) {
+    // Event pages never decrease: the flow only advances.
+    if (event.pageIndex >= limit) break;
+    if (event.kind === 'prescan') {
+      const next = plannedPageStartAnchors(observed, event.pageIndex, event.flowDomainId);
+      if (pageStartAnchorsIdentity(next) !== pageStartAnchorsIdentity(event.anchors)) {
+        limit = event.pageIndex;
+        prescanDisagreementPage = event.pageIndex;
+        break;
+      }
+      continue;
+    }
+    const placed = observed.get(event.key);
+    const prior = appliedPlan?.get(event.key);
+    if ((event.floor !== undefined && event.floor > event.pageIndex)
+      || placed?.kind !== 'floating-table'
+      || (prior !== undefined && JSON.stringify(prior) !== JSON.stringify(placed))) {
+      limit = event.pageIndex;
+      break;
+    }
+    reachedTables.push(Object.freeze({
+      reachedPage: event.pageIndex,
+      placedPage: placed.pageIndex,
+    }));
+  }
+  for (let lowered = true; lowered;) {
+    lowered = false;
+    for (const table of reachedTables) {
+      if (table.reachedPage < limit && table.placedPage >= limit) {
+        limit = table.reachedPage;
+        lowered = true;
+      }
+    }
+  }
+  return Object.freeze({ limit, prescanDisagreementPage });
+}
+
 function anchorPlanIdentity(plan: ReadonlyMap<string, unknown>): string {
   return JSON.stringify([...plan].sort(([left], [right]) => left.localeCompare(right)));
 }
@@ -2309,7 +2493,7 @@ function* paginateBodyWithAnchorConvergenceSteps(
   options: LayoutOptions,
   reserves: readonly HeaderFooterReserve[],
   balancePlan: BodyBalancePlan,
-  observer?: BodyPaginationPassObserver,
+  publisher?: BodyPagePublisher,
   seedPlan?: ReturnType<typeof pageAnchorDestinationPlan>,
 ): PaginationSteps<BodyPaginationPassResult> {
   const hasPageOwnedAnchors = input.sequence.some((entry) => (
@@ -2320,9 +2504,30 @@ function* paginateBodyWithAnchorConvergenceSteps(
   ));
   if (!hasPageOwnedAnchors) {
     return yield* paginateBodyPassSteps(
-      input, services, options, reserves, null, null, balancePlan, observer,
+      input, services, options, reserves, null, null, balancePlan,
+      publisher ? passPublicationObserver(publisher, livePageIndex) : undefined,
     );
   }
+  // Every anchor pass may publish, but only the leading pages
+  // `anchorStablePageLimit` proves every later pass of this run reproduces. A
+  // seeded run never publishes: it can be abandoned for an unseeded retry,
+  // whose passes form a different chain.
+  const anchorPassObserver = (
+    appliedPlan: ReturnType<typeof pageAnchorDestinationPlan> | null,
+  ): BodyPaginationPassObserver | undefined => {
+    if (!publisher || seedPlan) return undefined;
+    const events: PageAnchorInputEvent[] = [];
+    // A prescan disagreement on a closed page is permanent for this pass.
+    let ceiling = Number.POSITIVE_INFINITY;
+    return passPublicationObserver(publisher, (pass) => {
+      const stable = anchorStablePageLimit(events, appliedPlan, pass);
+      ceiling = Math.min(ceiling, stable.prescanDisagreementPage);
+      return stable.limit;
+    }, {
+      onPageAnchorInput: (event) => { events.push(event); },
+      canExtend: () => ceiling > publisher.publishedPages,
+    });
+  };
   const converge = function* (initialPlan?: ReturnType<typeof pageAnchorDestinationPlan>) {
     type AnchorPassCarry = Readonly<{
       plan: ReturnType<typeof pageAnchorDestinationPlan>;
@@ -2342,7 +2547,7 @@ function* paginateBodyWithAnchorConvergenceSteps(
           appliedPlan,
           previous?.minimumTablePageBySource ?? null,
           balancePlan,
-          previous === undefined ? observer : undefined,
+          anchorPassObserver(appliedPlan),
         );
         const plan = pageAnchorDestinationPlan(pass.layout);
         const minimumTablePageBySource = new Map<string, number>();
@@ -2450,7 +2655,7 @@ function* paginateBodyWithColumnBalancingSteps(
   services: LayoutServices,
   options: LayoutOptions,
   reserves: readonly HeaderFooterReserve[],
-  observer?: BodyPaginationPassObserver,
+  publisher?: BodyPagePublisher,
   seedPlan?: ReturnType<typeof pageAnchorDestinationPlan>,
 ): PaginationSteps<BodyPaginationPassResult> {
   let plan: BodyBalancePlan = new Map();
@@ -2460,7 +2665,7 @@ function* paginateBodyWithColumnBalancingSteps(
     options,
     reserves,
     plan,
-    observer,
+    publisher,
     seedPlan,
   );
   if (pass.terminalDiagnostic !== null) return pass;
@@ -2613,33 +2818,31 @@ export function* paginateBodySteps(
   // private memo, while a later variant/document pagination starts fresh.
   services = createParagraphAcquisitionCacheServicesView(services);
   const owners = ownerMap(input);
-  let nextPublicationPages = 1;
+  let publishedPages = 0;
   let publicationFailed = false;
-  const passObserver: BodyPaginationPassObserver | undefined = observer
+  const publisher: BodyPagePublisher | undefined = observer
     ? {
-        shouldPublish: (committedPages) => (
-          !publicationFailed && committedPages >= nextPublicationPages
-        ),
-        publish: (pass, processedEntries) => {
+        get publishedPages() { return publishedPages; },
+        get failed() { return publicationFailed; },
+        publish: (pass, processedEntries, pageIndexLimit) => {
+          // The live page still owns the transition edge: section-region and
+          // page-final composition can change when the following page opens.
+          // It is never published, and the pass-level rule may bound the
+          // prefix further (see `anchorStablePageLimit`).
+          const limit = Math.min(pageIndexLimit, livePageIndex(pass));
+          const count = pass.layout.pages.findIndex((page) => page.pageIndex >= limit);
+          if (count <= publishedPages) return;
           try {
             const composed = composeBodyPaginationResult(pass, input, owners, options, false);
-            // The newest committed page still owns the live transition edge:
-            // section-region and page-final composition can change when the
-            // following page becomes committed. Keep one page as the checkpoint
-            // guard and publish only the prefix before it. This publication is
-            // deliberately provisional: header/footer and pagination-field
-            // convergence may replace it, and consumers receive `exact:false`.
+            // This publication is deliberately provisional: header/footer and
+            // pagination-field convergence may replace it, and consumers
+            // receive `exact:false`.
             const publishable = Object.freeze({
               ...composed,
-              pages: Object.freeze(composed.pages.slice(0, -1)),
+              pages: Object.freeze(composed.pages.slice(0, count)),
             }) as DocumentLayout;
-            if (publishable.pages.length > 0) {
-              observer.onPages(publishable, processedEntries);
-            }
-            nextPublicationPages = Math.max(
-              pass.layout.pages.length + 1,
-              pass.layout.pages.length * 2,
-            );
+            observer.onPages(publishable, processedEntries);
+            publishedPages = count;
           } catch {
             // A provisional snapshot is best-effort. The same live pagination
             // session remains authoritative and must be allowed to finish.
@@ -2649,7 +2852,7 @@ export function* paginateBodySteps(
       }
     : undefined;
   let seed: BodyPaginationPassResult | null = yield* paginateBodyWithColumnBalancingSteps(
-    input, services, options, [], passObserver,
+    input, services, options, [], publisher,
   );
   const convergence = convergeHeaderFooterReserveSteps<
     BodyPaginationPassResult,

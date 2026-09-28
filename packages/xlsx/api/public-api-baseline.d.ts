@@ -2203,6 +2203,7 @@ export interface Worksheet {
     defaultFontSize?: number;
     defaultFontBold?: boolean;
     defaultFontItalic?: boolean;
+    normalFontSize?: number;
     themeJapaneseMajorFont?: string;
     themeJapaneseMinorFont?: string;
     date1904?: boolean;

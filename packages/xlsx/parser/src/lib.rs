@@ -353,6 +353,8 @@ struct WorkbookShared {
     /// workbook styles stay owned by the full-parse path instead of being
     /// retained and deeply cloned here.
     default_font: DefaultFont,
+    /// The Normal cell style font's point size (row-height baseline).
+    normal_font_size: Option<f64>,
     /// The Normal cell style font's authored color key (see
     /// `styles::normal_font_color_key`); marks rich-text runs' own colors.
     normal_font_color: Option<Option<String>>,
@@ -475,38 +477,38 @@ impl WorkbookShared {
         let theme_fonts = theme.fonts;
         let theme_japanese_fonts = theme.japanese_fonts;
         let theme_chart_images = Rc::new(theme.chart_images);
-        let (default_font, normal_font_color, chart_number_formats, styles) = if include_full_styles
-        {
-            match parse_styles(archive, theme_colors.as_ref()) {
-                Ok(parsed) => (
-                    parsed.default_font,
-                    parsed.normal_font_color,
-                    parsed.chart_number_formats,
-                    Some(Ok(parsed.styles)),
-                ),
-                Err(error) => (
-                    (None, None, false, false),
-                    None,
-                    ChartNumberFormatCache::default(),
-                    Some(Err(error)),
-                ),
-            }
-        } else {
-            match styles::parse_style_projection(archive) {
-                Ok(parsed) => (
-                    parsed.default_font,
-                    parsed.normal_font_color,
-                    parsed.chart_number_formats,
-                    None,
-                ),
-                Err(_) => (
-                    (None, None, false, false),
-                    None,
-                    ChartNumberFormatCache::default(),
-                    None,
-                ),
-            }
-        };
+        let ((default_font, normal_font_size), normal_font_color, chart_number_formats, styles) =
+            if include_full_styles {
+                match parse_styles(archive, theme_colors.as_ref()) {
+                    Ok(parsed) => (
+                        (parsed.default_font, parsed.normal_font_size),
+                        parsed.normal_font_color,
+                        parsed.chart_number_formats,
+                        Some(Ok(parsed.styles)),
+                    ),
+                    Err(error) => (
+                        ((None, None, false, false), None),
+                        None,
+                        ChartNumberFormatCache::default(),
+                        Some(Err(error)),
+                    ),
+                }
+            } else {
+                match styles::parse_style_projection(archive) {
+                    Ok(parsed) => (
+                        (parsed.default_font, parsed.normal_font_size),
+                        parsed.normal_font_color,
+                        parsed.chart_number_formats,
+                        None,
+                    ),
+                    Err(_) => (
+                        ((None, None, false, false), None),
+                        None,
+                        ChartNumberFormatCache::default(),
+                        None,
+                    ),
+                }
+            };
         let (mut shared_strings, shared_strings_error) =
             read_shared_strings(archive, theme_colors.as_ref());
         for string in &mut shared_strings {
@@ -524,6 +526,7 @@ impl WorkbookShared {
                 theme_fonts,
                 theme_japanese_fonts,
                 default_font,
+                normal_font_size,
                 normal_font_color,
                 chart_number_formats,
                 shared_strings: shared_strings.into(),
@@ -780,6 +783,7 @@ fn finalize_projected_sheet(
     ws.default_font_size = shared.default_font.1;
     ws.default_font_bold = shared.default_font.2.then_some(true);
     ws.default_font_italic = shared.default_font.3.then_some(true);
+    ws.normal_font_size = shared.normal_font_size;
     ws.theme_japanese_major_font = shared.theme_japanese_fonts.0.clone();
     ws.theme_japanese_minor_font = shared.theme_japanese_fonts.1.clone();
     // Denormalize the workbook-wide date system onto this sheet so the cell
@@ -2317,6 +2321,7 @@ fn parse_projected_worksheet(
         default_font_size: None,
         default_font_bold: None,
         default_font_italic: None,
+        normal_font_size: None,
         theme_japanese_major_font: None,
         theme_japanese_minor_font: None,
         // Set by `parse_sheet_with` from the workbook-level `<workbookPr

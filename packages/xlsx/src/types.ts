@@ -162,18 +162,22 @@ export interface Worksheet {
    *  Cross-sheet `<xm:f>` data references are resolved to numeric values at
    *  parse time, and theme + tint colors are flattened to `#RRGGBB`. */
   sparklineGroups?: SparklineGroup[];
-  /** Family name of the workbook's Normal-style font, resolved by the parser
-   *  from `<cellStyleXfs>[0].fontId` → `<fonts>[fontId].name.val`. The
-   *  renderer uses this together with `defaultFontSize` to compute the Max
-   *  Digit Width for column-width pixel conversion (ECMA-376 §18.3.1.13).
+  /** Family name of the workbook's default font, `<fonts>[0]`. The renderer
+   *  uses this together with `defaultFontSize` to compute the Max Digit Width
+   *  for column-width pixel conversion (ECMA-376 §18.3.1.13); measured in
+   *  Excel, columns follow `<fonts>[0]` rather than the Normal cell style.
    *  Workbook-wide value, denormalized onto every worksheet. */
   defaultFontFamily?: string;
-  /** Point size of the workbook's Normal-style font (`<fonts>[N].sz.val`). */
+  /** Point size of the workbook's default font (`<fonts>[0]`). */
   defaultFontSize?: number;
-  /** Bold/italic bits of the Normal-style font selected by cellStyleXfs[0].
+  /** Bold/italic bits of the default font (`<fonts>[0]`).
    * Omitted means false; MDW must use the same face tuple as Excel. */
   defaultFontBold?: boolean;
   defaultFontItalic?: boolean;
+  /** Point size of the Normal cell style's font (`builtinId="0"`, else
+   *  `<cellStyleXfs>[0]`): the automatic row-height baseline. Falls back to
+   *  `defaultFontSize` when absent. */
+  normalFontSize?: number;
   /** Workbook theme major Jpan face (`<a:majorFont><a:font script="Jpan">`).
    *  Used only for scheme-marked cells under the Japanese Mac Excel locale. */
   themeJapaneseMajorFont?: string;
