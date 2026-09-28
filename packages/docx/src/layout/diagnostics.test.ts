@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import rustDiagnosticTypes from '../../parser/src/types.rs?raw';
-import { createBodyLayoutInput } from '../body-layout-input.js';
+import rustDiagnosticTypes from '../../model/src/lib.rs?raw';
+import { bodyLayoutAcquisitionInput } from '../parser-model.js';
+import { projectBodyLayoutInput } from './body-layout-input.js';
 import { createLayoutServices } from '../layout-runtime.js';
 import { layoutDocument } from '../document-layout.js';
 import type { InternalDocxDocumentModel } from '../parser-model.js';
@@ -173,7 +174,7 @@ describe('private parser diagnostic mapping', () => {
     const model = document([
       wire('UNSUPPORTED_TEXT_EFFECT', 'warning', [0]),
     ]);
-    const input = createBodyLayoutInput(model as DocxDocumentModel);
+    const input = projectBodyLayoutInput(bodyLayoutAcquisitionInput(model as DocxDocumentModel));
 
     expect(structuredClone(input).parserDiagnostics).toEqual(input.parserDiagnostics);
     const services = createLayoutServices(model, { measureContext: measureContext() });

@@ -13,15 +13,14 @@ interface ValidationTestSeam {
   wb: XlsxWorkbook;
   selectionController: { select(cell: { row: number; col: number }): void };
   currentSheet: number;
-  openValidationPanel(
-    cell: { row: number; col: number },
-    formula: string,
-  ): Promise<void>;
   currentWorksheet: Worksheet;
-  toggleValidationPanel(): void;
   hideValidationPanel(): void;
-  validationPanelKey: string | null;
-  validationPanel: { style: { display: string } };
+  validation: {
+    open(cell: { row: number; col: number }, formula: string): Promise<void>;
+    toggle(): void;
+    panelKey: string | null;
+    panel: { style: { display: string } };
+  };
 }
 
 function pendingWorkbook() {
@@ -66,24 +65,24 @@ describe('XlsxViewer validation-list request lifecycle', () => {
     const { viewer, seam, pending } = mountPendingValidationViewer();
     seam.selectionController.select({ row: 1, col: 1 });
 
-    seam.toggleValidationPanel();
-    expect(seam.validationPanelKey).toBe('1:1');
-    seam.toggleValidationPanel();
-    expect(seam.validationPanelKey).toBeNull();
+    seam.validation.toggle();
+    expect(seam.validation.panelKey).toBe('1:1');
+    seam.validation.toggle();
+    expect(seam.validation.panelKey).toBeNull();
     pending[0]?.({ kind: 'values', values: ['A'] });
     await Promise.resolve();
     await Promise.resolve();
 
-    expect(seam.validationPanel.style.display).toBe('none');
+    expect(seam.validation.panel.style.display).toBe('none');
     viewer.destroy();
   });
 
   it('only the latest cell request may install the panel', async () => {
     const { viewer, seam, pending } = mountPendingValidationViewer();
     seam.selectionController.select({ row: 1, col: 1 });
-    seam.toggleValidationPanel();
+    seam.validation.toggle();
     seam.selectionController.select({ row: 1, col: 2 });
-    seam.toggleValidationPanel();
+    seam.validation.toggle();
 
     pending[1]?.({ kind: 'values', values: ['B'] });
     await Promise.resolve();
@@ -92,21 +91,21 @@ describe('XlsxViewer validation-list request lifecycle', () => {
     await Promise.resolve();
     await Promise.resolve();
 
-    expect(seam.validationPanelKey).toBe('1:2');
-    expect(seam.validationPanel.style.display).not.toBe('none');
+    expect(seam.validation.panelKey).toBe('1:2');
+    expect(seam.validation.panel.style.display).not.toBe('none');
     viewer.destroy();
   });
 
   it('hide cancels a pending resolution', async () => {
     const { viewer, seam, pending } = mountPendingValidationViewer();
     seam.selectionController.select({ row: 1, col: 1 });
-    seam.toggleValidationPanel();
+    seam.validation.toggle();
     seam.hideValidationPanel();
     pending[0]?.({ kind: 'values', values: ['A'] });
     await Promise.resolve();
     await Promise.resolve();
 
-    expect(seam.validationPanel.style.display).toBe('none');
+    expect(seam.validation.panel.style.display).toBe('none');
     viewer.destroy();
   });
 
@@ -122,9 +121,9 @@ describe('XlsxViewer validation-list request lifecycle', () => {
     seam.wb = workbook;
     seam.currentSheet = 0;
     seam.selectionController.select({ row: 1, col: 1 });
-    seam.validationPanelKey = '1:1';
+    seam.validation.panelKey = '1:1';
 
-    const opening = seam.openValidationPanel({ row: 1, col: 1 }, 'A1:A2');
+    const opening = seam.validation.open({ row: 1, col: 1 }, 'A1:A2');
     viewer.destroy();
     resolveList({ kind: 'values', values: ['A', 'B'] });
     await opening;

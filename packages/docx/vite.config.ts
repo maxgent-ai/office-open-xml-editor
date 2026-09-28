@@ -3,13 +3,14 @@ import wasm from 'vite-plugin-wasm';
 import topLevelAwait from 'vite-plugin-top-level-await';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { wasmAssetUrl } from '../../vite.config';
+import { legacyBundleBoundary, wasmAssetUrl } from '../../vite.config';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 export default defineConfig({
+  define: { __OOXML_MODEL_SOURCES__: 'true' },
   root: __dirname,
-  plugins: [wasm(), topLevelAwait()],
+  plugins: [wasmAssetUrl(), wasm(), topLevelAwait(), legacyBundleBoundary()],
   resolve: {
     alias: {
       '@ooxml-test-three-d-renderer': resolve(__dirname, '../../src/three-d.ts'),
@@ -36,7 +37,7 @@ export default defineConfig({
   },
   worker: {
     format: 'es',
-    plugins: () => [wasmAssetUrl(), wasm()],
+    plugins: () => [wasmAssetUrl(), wasm(), legacyBundleBoundary()],
     rollupOptions: {
       output: { assetFileNames: '[name][extname]' },
     },

@@ -69,11 +69,13 @@ export interface DocxDocumentModel {
    *  (kinsoku) configuration. Absent when settings.xml has no relevant
    *  elements (the renderer then uses spec defaults: kinsoku ON). */
   settings?: DocSettings;
-  /** RB7 partial degradation: set when `word/document.xml` (the body part) could
-   *  not be read or parsed. The document still "opens" — `body` is empty and this
-   *  part-tagged error (e.g. `"word/document.xml: <detail>"`) is carried — so the
-   *  viewer shows a visible placeholder page instead of throwing. Absent
-   *  (`undefined`) for every healthy document. */
+  /** RB7 partial degradation: set when `word/document.xml` (the body part) is
+   *  present but could not be parsed. The document still "opens" — `body` is
+   *  empty and this part-tagged error (e.g. `"word/document.xml: <detail>"`) is
+   *  carried — so the viewer shows a visible placeholder page instead of
+   *  throwing. Absent (`undefined`) for every healthy document. Input that is not
+   *  a WordprocessingML package (not a ZIP, no `[Content_Types].xml`, or no
+   *  `word/document.xml`) is rejected with `OoxmlError('not-ooxml')` instead. */
   parseError?: string;
 }
 
@@ -108,6 +110,11 @@ export interface DocSettings {
   /** §17.15.1.18 `w:characterSpacingControl@w:val` — East Asian punctuation /
    *  character-spacing control. */
   characterSpacingControl?: string;
+  /** §17.15.3.31 `w:compat/w:lineWrapLikeWord6` — fit at uncompressed width
+   * even when character-level whitespace is compressed for display. */
+  lineWrapLikeWord6?: boolean;
+  /** See WORD_OPENTYPE_FEATURES_COMPAT_KERNING for this compatibility flag. */
+  enableOpenTypeFeatures?: boolean;
   /** ECMA-376 Part 4 §14.8.3.50 `w:compat/w:useFELayout` — Far East layout
    * compatibility. */
   useFeLayout?: boolean;
@@ -406,6 +413,8 @@ export type BodyElement =
   | { type: 'table' } & DocTable
   | {
       type: 'pageBreak';
+      /** Parser provenance. Missing on older wire data; absence is not authored intent. */
+      origin?: 'authored' | 'coverPageSynthetic';
       parity?: 'odd' | 'even';
       /** The hard break followed visible content in the same source paragraph. */
       sameParagraphAsPrevious?: boolean;
@@ -875,6 +884,12 @@ export interface ShapeRun {
   /** Normalized [0,1] custom-geometry sub-paths. Empty when `presetGeometry`
    *  is set; the renderer chooses between buildCustomPath and buildShapePath. */
   subpaths: PathCmd[][];
+  /** ECMA-376 §20.1.9.15 per-path `fill` mode and `stroke` flag, parallel to
+   *  `subpaths`; absent when every path uses the defaults. */
+  subpathPaint?: Array<{
+    fill?: 'none' | 'lighten' | 'lightenLess' | 'darken' | 'darkenLess';
+    stroke?: false;
+  }>;
   /** OOXML <a:prstGeom prst> name (e.g. "rect", "ellipse", "rtTriangle").
    *  When set the renderer calls core's buildShapePath with `adjValues`. */
   presetGeometry?: string | null;
@@ -1587,6 +1602,12 @@ export interface DocTableCell {
   marginBottom?: number | null;
   marginLeft?: number | null;
   marginRight?: number | null;
+  /** ECMA-376 §17.4.72 `<w:textDirection>` as a transitional §17.18.93 value
+   *  (`tbRl`, `btLr`, `lrTbV`, `tbRlV`, `tbLrV`); absent for the default `lrTb`. */
+  textDirection?: string;
+  /** ECMA-376 §17.4.21 `<w:hideMark>`: the end-of-cell mark does not count
+   *  toward the row height. Absent when false. */
+  hideMark?: boolean;
 }
 
 export interface CellBorders {
@@ -1602,13 +1623,27 @@ export interface CellBorders {
    *  border" (e.g. banded data rows in Medium List 2 / Medium Shading 2). */
   insideH: BorderSpec | null;
   insideV: BorderSpec | null;
+  /** ECMA-376 §17.4.73 tl2br / §17.4.79 tr2bl: diagonal borders drawn from
+   *  the cell's physical top-left to bottom-right corner and from its
+   *  top-right to bottom-left corner. Absent = no diagonal. */
+  tl2br?: BorderSpec;
+  tr2bl?: BorderSpec;
 }
 
 // ===== Worker message protocol =====
 
 export type WorkerRequest =
   | { type: 'init'; wasmUrl: string }
-  | { type: 'parse'; id: number; data: ArrayBuffer; resourcePolicy: NormalizedOoxmlResourcePolicy }
+  | {
+      type: 'parse';
+      id: number;
+      data: ArrayBuffer;
+      resourcePolicy: NormalizedOoxmlResourcePolicy;
+      /** Application-selected model source (LoadOptions.modelSources). */
+      source?: import('@silurus/ooxml-core').ModelSourceModuleDescriptor;
+      sourceTransfer?: readonly Transferable[];
+      sourceOwnerUrl?: string;
+    }
   | { type: 'extractImage'; id: number; path: string }
   | { type: 'resourceUsage'; id: number }
   // Project the retained archive to GitHub-flavoured markdown (`DocxArchive.to_markdown`,
@@ -1617,9 +1652,15 @@ export type WorkerRequest =
   | { type: 'toMarkdown'; id: number };
 
 export type WorkerResponse =
-  | ({ type: 'documentSessionOpened'; id: number } & PullSessionIdentity<number>)
+  | ({
+      type: 'documentSessionOpened';
+      id: number;
+      /** The model source's own view preferences, validated in the worker. */
+      viewDefaults?: { showTrackedChanges?: boolean };
+    } & PullSessionIdentity<number>)
   | { type: 'imageExtracted'; id: number; bytes: ArrayBuffer }
-  | { type: 'resourceUsage'; id: number; usage: import('@silurus/ooxml-core').OoxmlResourceUsageSnapshot }
+  // `usage` is absent when the loaded model source has no ZIP accounting.
+  | { type: 'resourceUsage'; id: number; usage?: import('@silurus/ooxml-core').OoxmlResourceUsageSnapshot }
   | { type: 'markdownRendered'; id: number; markdown: string }
   | ({
       type: 'error';
@@ -1660,6 +1701,9 @@ export interface DocxTextRunInfo {
   y: number;
   /** Measured text width in CSS px. */
   w: number;
+  /** Final U+0020 reduction already included in `w`; limits the transparent
+   * selection/hyperlink hit box to the retained Canvas layout width. */
+  trailingSpaceCompressionPx?: number;
   /** Line height in CSS px. */
   h: number;
   /** Exact font-box rectangle used for Word-style highlighting. Falls back to

@@ -1,6 +1,6 @@
 import type { LayoutServices } from './types.js';
 import type { PaintResourceRegistry } from './types.js';
-import type { NumberFormat } from '@silurus/ooxml-core';
+import type { KinsokuRules, NumberFormat } from '@silurus/ooxml-core';
 import type { BodyLayoutKernel } from './body-layout-kernel.js';
 import type { LayoutVariantStore } from './variant-store.js';
 import type { VerticalGlyphMeasurementService } from './measurement-capabilities.js';
@@ -87,8 +87,16 @@ const layoutVariantStores = new WeakMap<LayoutServices, LayoutVariantStore>();
  * handle through createLayoutServicesRuntimeView. */
 export interface ParagraphAcquisitionRuntimeCache {
   objectIdentity(value: object): number;
+  /** Session-scoped ordinal that stands for one exact service fingerprint
+   * string inside acquisition keys (equal ordinals iff equal strings). */
+  fingerprintOrdinal(value: string | null): number | null;
+  /** Ordinal of the rule set's exact value (enabled flag plus sorted
+   * forbidden code points); equal values share one ordinal. */
+  kinsokuKey(rules: KinsokuRules): number;
   get(input: object, key: string): unknown;
   set(input: object, key: string, value: unknown): void;
+  getLineBreaking(input: object, key: string): unknown;
+  setLineBreaking(input: object, key: string, value: unknown): void;
   noteMiss(): void;
 }
 
@@ -109,6 +117,16 @@ const paragraphAcquisitionCaches = new WeakMap<
 function createParagraphAcquisitionRuntimeCache(): ParagraphAcquisitionRuntimeCache {
   const identities = new WeakMap<object, number>();
   const results = new WeakMap<object, Map<string, unknown>>();
+  const lineBreaks = new WeakMap<object, Map<string, unknown>>();
+  const kinsokuKeys = new WeakMap<KinsokuRules, number>();
+  const kinsokuOrdinals = new Map<string, number>();
+  // Service fingerprints are exact canonical identities, so they grow with the
+  // data they identify: the text-service fingerprint embeds the document's
+  // complete font-metric snapshot (tens of KB). Spelling it into every
+  // paragraph key made each retained key that large and re-allocated it on
+  // every acquisition. A session sees only a handful of distinct services, and
+  // this map keeps each string itself (no copy), so ordinals stay one-to-one.
+  const fingerprintOrdinals = new Map<string, number>();
   let nextIdentity = 1;
   let missCount = 0;
   return Object.freeze({
@@ -120,6 +138,37 @@ function createParagraphAcquisitionRuntimeCache(): ParagraphAcquisitionRuntimeCa
         identities.set(value, retained);
       }
       return retained;
+    },
+    fingerprintOrdinal(value: string | null): number | null {
+      if (value === null) return null;
+      let ordinal = fingerprintOrdinals.get(value);
+      if (ordinal === undefined) {
+        ordinal = fingerprintOrdinals.size;
+        fingerprintOrdinals.set(value, ordinal);
+      }
+      return ordinal;
+    },
+    kinsokuKey(rules: KinsokuRules) {
+      let key = kinsokuKeys.get(rules);
+      if (key === undefined) {
+        // Document layout settings own this §17.3.1.16 / §17.15.1.58-.59
+        // rule set for the whole pagination session. Its values are settled
+        // before any paragraph context is made. The spelled-out value (about
+        // 1 KB for the default East Asian sets) is kept once per session; keys
+        // carry its value-exact ordinal.
+        const value = JSON.stringify([
+          rules.enabled,
+          [...rules.lineStartForbidden].sort((left, right) => left - right),
+          [...rules.lineEndForbidden].sort((left, right) => left - right),
+        ]);
+        key = kinsokuOrdinals.get(value);
+        if (key === undefined) {
+          key = kinsokuOrdinals.size;
+          kinsokuOrdinals.set(value, key);
+        }
+        kinsokuKeys.set(rules, key);
+      }
+      return key;
     },
     get(input: object, key: string): unknown {
       const byKey = results.get(input);
@@ -146,6 +195,25 @@ function createParagraphAcquisitionRuntimeCache(): ParagraphAcquisitionRuntimeCa
       while (byKey.size > 2) {
         byKey.delete(byKey.keys().next().value!);
       }
+    },
+    getLineBreaking(input: object, key: string): unknown {
+      const byKey = lineBreaks.get(input);
+      if (!byKey?.has(key)) return undefined;
+      const value = byKey.get(key);
+      byKey.delete(key);
+      byKey.set(key, value);
+      return value;
+    },
+    setLineBreaking(input: object, key: string, value: unknown): void {
+      let byKey = lineBreaks.get(input);
+      if (!byKey) {
+        byKey = new Map();
+        lineBreaks.set(input, byKey);
+      }
+      byKey.set(key, value);
+      // Context/field variants can produce distinct line partitions for one
+      // paragraph. Bound them separately from its two retained placements.
+      while (byKey.size > 2) byKey.delete(byKey.keys().next().value!);
     },
     noteMiss(): void {
       missCount += 1;

@@ -7,15 +7,6 @@
     body { background: #ffffff; }
     canvas { display: block; }
   </style>
-  <!-- Pre-load common theme fonts used in OOXML presentations via fontsource -->
-  <style>
-    @import url('/node_modules/@fontsource/nunito-sans/400.css');
-    @import url('/node_modules/@fontsource/nunito-sans/400-italic.css');
-    @import url('/node_modules/@fontsource/nunito-sans/700.css');
-    @import url('/node_modules/@fontsource/nunito-sans/700-italic.css');
-    @import url('/node_modules/@fontsource/nunito-sans/300.css');
-    @import url('/node_modules/@fontsource/nunito-sans/600.css');
-  </style>
 </head>
 <body>
   <canvas id="canvas"></canvas>
@@ -26,11 +17,15 @@
     import { regionMap } from '@ooxml-test-region-map-renderer';
     import { tiff } from '@ooxml-test-tiff-renderer';
 
-    // Text rasterization must not depend on how quickly Vite serves the
-    // fontsource CSS and weight-specific WOFF files. Regression baselines compare
-    // renderer output, so wait for the declared fixture fonts before painting.
-    await document.fonts.ready;
-
+    const fixtureFontStylesheets = [
+      '/node_modules/@fontsource/nunito-sans/400.css',
+      '/node_modules/@fontsource/nunito-sans/400-italic.css',
+      '/node_modules/@fontsource/nunito-sans/700.css',
+      '/node_modules/@fontsource/nunito-sans/700-italic.css',
+      '/node_modules/@fontsource/nunito-sans/300.css',
+      '/node_modules/@fontsource/nunito-sans/600.css',
+    ];
+    const fontFamily = (family) => family.trim().replace(/^['"]|['"]$/g, '').toLowerCase();
     const params   = new URLSearchParams(location.search);
     const slideIdx = Math.max(0, parseInt(params.get('slide') ?? '0', 10));
     const pptxName = params.get('pptx') ?? 'sample';
@@ -60,6 +55,28 @@
     window.addEventListener('pagehide', destroy, { once: true });
 
     try {
+      // Fontsource partitions each weight/style into unicode-range faces.
+      // Loading a font shorthand only fetches the subset matching its sample
+      // text, so wait for the CSS and load every declared face directly.
+      const sheets = await Promise.all(fixtureFontStylesheets.map((href) => new Promise((resolve, reject) => {
+        const link = document.createElement('link');
+        link.rel = 'stylesheet';
+        link.href = href;
+        link.onload = () => link.sheet
+          ? resolve(link.sheet)
+          : reject(new Error(`fixture font stylesheet unavailable: ${href}`));
+        link.onerror = () => reject(new Error(`fixture font stylesheet failed: ${href}`));
+        document.head.append(link);
+      })));
+      const declaredCount = sheets.reduce((count, sheet) => count + [...sheet.cssRules].filter(
+        (rule) => rule instanceof CSSFontFaceRule && fontFamily(rule.style.fontFamily) === 'nunito sans',
+      ).length, 0);
+      const faces = [...document.fonts].filter((face) => fontFamily(face.family) === 'nunito sans');
+      if (declaredCount === 0 || faces.length !== declaredCount) {
+        throw new Error(`fixture Nunito Sans faces: declared ${declaredCount}, registered ${faces.length}`);
+      }
+      await Promise.all(faces.map((face) => face.load()));
+      await document.fonts.ready;
       const resp = await fetch(`/${pptxName}.pptx`);
       if (!resp.ok) throw new Error(`fetch failed: ${resp.status}`);
       const buf = await resp.arrayBuffer();

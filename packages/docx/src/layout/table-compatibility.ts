@@ -2,6 +2,18 @@ import { defineCompatibilityRule } from './compatibility.js';
 import type { ParagraphLayoutSource } from './text.js';
 import type { LayoutRect } from './types.js';
 
+export const WORD_ROTATED_CELL_AUTO_ROW_WRAP = defineCompatibilityRule({
+  id: 'word-rotated-cell-auto-row-wrap',
+  evidence: {
+    kind: 'office-observation',
+    syntheticFixtureId: 'rotated-cell-row-height-direction-rule-matrix',
+    application: 'Microsoft Word',
+    version: '16.113.2',
+    platform: 'macOS 27.0',
+  },
+  description: 'In a fixed-width table, btLr and tbRl cells with 1, 4, or 8 glyphs keep the same automatic row height as a one-line horizontal neighbor by wrapping into additional columns. Two paragraphs and an explicit line break also keep that height when their columns fit. A 20pt top/bottom margin sum adds 20pt, revealing a line-box minimum even when the glyph advance is narrower; a 60pt atLeast minimum and a five-line horizontal neighbor govern their rows; exact remains authored. A horizontal text-direction control keeps its ordinary line. These Word PDF observations cover short text fitting across a 225pt cell in compatibility mode 14; larger content and other compatibility modes are not Office-verified by this matrix.',
+});
+
 export const WORD_AUTOFIT_EMPTY_PARAGRAPH_CONTENT_WIDTH = defineCompatibilityRule({
   id: 'word-autofit-empty-paragraph-content-width',
   evidence: {
@@ -73,6 +85,55 @@ export const WORD_OVER_PAGE_CANT_SPLIT_CLIP = defineCompatibilityRule({
   },
   description: 'Word starts an over-page cantSplit row on a fresh page and clips its overflow instead of synthesizing a row continuation.',
 });
+
+export const WORD_OVER_PAGE_CELL_BREAK_OCCUPANCY = defineCompatibilityRule({
+  id: 'word-over-page-cell-break-occupancy',
+  evidence: {
+    kind: 'office-observation',
+    syntheticFixtureId: 'over-page-cell-followed-by-authored-break',
+    application: 'Microsoft Word',
+    version: '16.113.2',
+    platform: 'macOS 27.0',
+  },
+  description: 'A table-cell paragraph taller than the body band counts its invisible continuation page before a following authored page break. A fitting paragraph does not. This holds with and without cantSplit; without the authored break, the next paragraph starts at the top of the continuation page. Tested at 500pt and 800pt against a 648pt body band, so farther overflow remains an inferred geometric extension.',
+});
+
+export const WORD_AUTHORED_ROW_HEIGHT_PAGE_BOUNDARY = defineCompatibilityRule({
+  id: 'word-authored-row-height-page-boundary',
+  evidence: {
+    kind: 'office-observation',
+    syntheticFixtureId: 'ordinary-table-row-height-boundary-matrix',
+    application: 'Microsoft Word',
+    version: '16.113.2',
+    platform: 'macOS 27.0',
+  },
+  description: 'Word relocates an ordinary splittable exact-height row, or an atLeast row whose authored minimum governs its complete height, when that height exceeds the remaining page band and fits a fresh page. A shorter atLeast minimum permits content fragmentation; an auto row may fragment. Tested with cantSplit on/off, fitting/overflow bands, and keepLines/widow controls. Repeated headers and atLeast rows expanded by content are outside this observation.',
+});
+
+export const WORD_CELL_OWNED_ANCHOR_PAGE_CUT = defineCompatibilityRule({
+  id: 'word-cell-owned-anchor-page-cut',
+  evidence: {
+    kind: 'office-observation',
+    syntheticFixtureId: 'cell-owned-anchor-page-band-boundary',
+    application: 'Microsoft Word',
+    version: '16.113.2',
+    platform: 'macOS 27.0',
+  },
+  description: 'For an atLeast row without cantSplit containing a layoutInCell, allowOverlap wrapNone image, Word permits the image past its row border while the image stays in the page body band. Controlled preceding-spacing cases at 0pt and 40pt kept the row; at 80pt Word moved the complete row to the next page. A separate near-edge control confirmed that trailing empty cell paragraphs may still form an empty row continuation. Other anchor wrap/row-height combinations and over-page images are outside this observation.',
+});
+
+/** Compatibility choice governed by {@link WORD_CELL_OWNED_ANCHOR_PAGE_CUT}.
+ * Geometry detection remains in the table paginator; this gate only chooses
+ * the observed Word page cut when a fresh page offers more room. */
+export function wordDefersCellOwnedAnchorPastPageBand(input: Readonly<{
+  compatibility: 'word' | 'standard';
+  availableHeightPt: number;
+  freshPageHeightPt: number;
+  epsilonPt: number;
+}>): boolean {
+  return input.compatibility === 'word'
+    && input.availableHeightPt + input.epsilonPt < input.freshPageHeightPt;
+}
 
 export const WORD_PARALLEL_PARAGRAPH_ROW_CUT = defineCompatibilityRule({
   id: 'word-parallel-paragraph-row-cut',
@@ -279,6 +340,32 @@ export function wordClipsOverPageCantSplitRow(input: Readonly<{
 }>): boolean {
   return input.compatibility === 'word'
     && input.availableHeightPt + input.epsilonPt >= input.freshPageHeightPt;
+}
+
+/** Word observation under {@link WORD_AUTHORED_ROW_HEIGHT_PAGE_BOUNDARY}.
+ * ECMA-376 §§17.4.6, 17.4.80 define cantSplit and row-height constraints but
+ * do not prescribe this page-cut choice. Limit relocation to a first fragment
+ * whose complete row fits a fresh page. The atLeast observation covered rows
+ * whose content stayed below the authored minimum; content-expanded atLeast
+ * rows and over-page rows are outside the tested boundary. */
+export function wordRelocatesAuthoredHeightRowAtPageBoundary(input: Readonly<{
+  compatibility: 'word' | 'standard';
+  heightRule: 'auto' | 'atLeast' | 'exact';
+  repeatedHeader: boolean;
+  authoredHeightPt: number | null;
+  availableHeightPt: number;
+  wholeHeightPt: number;
+  freshAvailableHeightPt: number;
+  epsilonPt: number;
+}>): boolean {
+  return input.compatibility === 'word'
+    && !input.repeatedHeader
+    && (input.heightRule === 'exact' || input.heightRule === 'atLeast')
+    && input.authoredHeightPt !== null
+    && (input.heightRule === 'exact'
+      || input.wholeHeightPt <= input.authoredHeightPt + input.epsilonPt)
+    && input.authoredHeightPt > input.availableHeightPt + input.epsilonPt
+    && input.wholeHeightPt <= input.freshAvailableHeightPt + input.epsilonPt;
 }
 
 /** Compatibility projection governed by {@link WORD_PARALLEL_PARAGRAPH_ROW_CUT}. */

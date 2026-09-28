@@ -1,0 +1,126 @@
+import { describe, expect, it } from 'vitest';
+import type { TextRunData } from '@silurus/ooxml-core';
+import { layoutParagraph, renderTable, type PptxTextRunInfo } from './renderer.js';
+import type { Paragraph, TableCell, TableElement, TextBody } from './types.js';
+
+// ECMA-376 §21.1.2.2.7 a:pPr@eaLnBrk. PowerPoint controls E00–E12 (issue
+// #1562) show that eaLnBrk="0" still breaks ideographs per character; it lifts
+// the East Asian line-start/line-end rules, so a CJK bracket may end a line
+// and a break may follow an opening bracket before Latin text. Every glyph
+// measures 10 px in these probes.
+function measuringContext(): CanvasRenderingContext2D {
+  let font = '';
+  return {
+    get font() { return font; },
+    set font(value: string) { font = value; },
+    measureText: (text: string) => ({
+      width: [...text].length * 10,
+      actualBoundingBoxAscent: 8, actualBoundingBoxDescent: 2,
+      fontBoundingBoxAscent: 8, fontBoundingBoxDescent: 2,
+    } as TextMetrics),
+    canvas: { width: 1000, height: 1000 },
+    save() {}, restore() {}, beginPath() {}, closePath() {}, moveTo() {}, lineTo() {},
+    stroke() {}, fill() {}, fillRect() {}, strokeRect() {}, clip() {}, rect() {},
+    scale() {}, translate() {}, rotate() {}, setTransform() {}, transform() {},
+    setLineDash() {}, getLineDash() { return []; }, drawImage() {},
+    fillText() {}, strokeText() {},
+    fillStyle: '', strokeStyle: '', lineWidth: 1, globalAlpha: 1,
+    textAlign: 'left', textBaseline: 'alphabetic', direction: 'ltr', letterSpacing: '0px',
+  } as unknown as CanvasRenderingContext2D;
+}
+
+function run(text: string): TextRunData {
+  return {
+    type: 'text', text, bold: null, italic: null, underline: false,
+    strikethrough: false, fontSize: 20, color: '000000',
+    fontFamily: 'Arial', fontFamilyEa: 'Meiryo',
+  };
+}
+
+function paragraph(runs: TextRunData[], eaLnBrk: boolean): Paragraph {
+  return {
+    alignment: 'l', marL: 0, marR: 0, indent: 0,
+    spaceBefore: null, spaceAfter: null, spaceLine: null, lvl: 0,
+    bullet: { type: 'none' }, defFontSize: null, defColor: null,
+    defBold: null, defItalic: null, defFontFamily: null, tabStops: [],
+    eaLnBrk, runs,
+  } as Paragraph;
+}
+
+function lines(runs: TextRunData[], width: number, eaLnBrk: boolean): string[] {
+  return layoutParagraph(measuringContext(), paragraph(runs, eaLnBrk), width, 20, '000000', 1, 0)
+    .map((line) => line.segments.map((segment) => segment.text).join(''));
+}
+
+describe('pptx eaLnBrk (§21.1.2.2.7)', () => {
+  it('still breaks ideographs per character when eaLnBrk is false (control E00)', () => {
+    expect(lines([run('日本語')], 10, false)).toEqual(['日', '本', '語']);
+  });
+
+  it('lets a CJK opening bracket end a line only when eaLnBrk is false (E01)', () => {
+    expect(lines([run('日本語「'), run('日本語')], 20, false)).toEqual(['日本', '語「', '日本', '語']);
+    expect(lines([run('日本語「'), run('日本語')], 20, true)).toEqual(['日本', '語', '「日', '本語']);
+  });
+
+  it('breaks after an opening bracket before Latin text only when eaLnBrk is false (E08, E09)', () => {
+    expect(lines([run('「'), run('abc')], 30, false)).toEqual(['「', 'abc']);
+    expect(lines([run('「'), run('abc')], 30, true)).toEqual(['「ab', 'c']);
+  });
+
+  it('honours eaLnBrk in table cell text', () => {
+    const EMU = 12_700;
+    const body = (eaLnBrk: boolean) => ({
+      verticalAnchor: 't', paragraphs: [{ ...paragraph([run('「'), run('abc')], eaLnBrk) }],
+      defaultFontSize: null, defaultBold: null, defaultItalic: null,
+      lIns: 0, rIns: 0, tIns: 0, bIns: 0, wrap: 'square', vert: 'horz', autoFit: 'none',
+    }) as unknown as TextBody;
+    const cellTexts = (eaLnBrk: boolean): string[] => {
+      const cell = {
+        textBody: body(eaLnBrk), fill: null,
+        borderL: null, borderR: null, borderT: null, borderB: null,
+        diagonalTL: null, diagonalTR: null,
+        gridSpan: 1, rowSpan: 1, hMerge: false, vMerge: false,
+      } as TableCell;
+      const table: TableElement = {
+        type: 'table', x: 0, y: 0, width: 30 * EMU, height: 90 * EMU,
+        rotation: 0, flipH: false, flipV: false,
+        cols: [30 * EMU], rows: [{ height: 90 * EMU, cells: [cell] }],
+      };
+      const runs: PptxTextRunInfo[] = [];
+      renderTable(measuringContext(), table, 1 / EMU, undefined,
+        { themeMajorFont: null, themeMinorFont: null, dpr: 1 }, (info) => runs.push(info));
+      // Group the emitted runs into visual lines by their vertical position.
+      const byLine = new Map<number, string>();
+      for (const info of runs) byLine.set(info.inShapeY, (byLine.get(info.inShapeY) ?? '') + info.text);
+      return [...byLine.values()];
+    };
+    expect(cellTexts(false)).toEqual(['「', 'abc']);
+    expect(cellTexts(true)).toEqual(['「ab', 'c']);
+  });
+});
+
+describe('pptx line feed inside a:t (controls L00–L08)', () => {
+  it('breaks at the line feed; the next line takes the containing run size (L00)', () => {
+    const laid = layoutParagraph(measuringContext(), paragraph([
+      { ...run('Ab\nCd'), fontSize: 40 }, { ...run('Ef'), fontSize: 14 },
+    ], true), 1000, 20, '000000', 1, 0);
+    expect(laid.map((line) => line.segments.map((segment) => segment.text).join(''))).toEqual(['Ab', 'CdEf']);
+    expect(Math.max(...laid[1].segments.map((segment) => segment.sizePx))).toBe(40 * 12_700);
+  });
+
+  it('does not size the next line by a run that ends at the line feed (L02)', () => {
+    // Office L02: 40 pt `Ab⏎` then 14 pt `Cd`; the second line is a 14 pt line.
+    const laid = layoutParagraph(measuringContext(), paragraph([
+      { ...run('Ab\n'), fontSize: 40 }, { ...run('Cd'), fontSize: 14 },
+    ], true), 1000, 20, '000000', 1, 0);
+    expect(laid.map((line) => line.segments.map((segment) => segment.text).join(''))).toEqual(['Ab', 'Cd']);
+    expect(laid[1].segments.map((segment) => segment.sizePx)).toEqual([14 * 12_700]);
+  });
+
+  it('sizes an empty line opened by a line feed by that run (L07, L08)', () => {
+    const laid = layoutParagraph(measuringContext(), paragraph([{ ...run('Ab\n\nCd'), fontSize: 40 }], true),
+      1000, 20, '000000', 1, 0);
+    expect(laid.map((line) => line.segments.map((segment) => segment.text).join(''))).toEqual(['Ab', '', 'Cd']);
+    expect(laid[1].segments.map((segment) => segment.sizePx)).toEqual([40 * 12_700]);
+  });
+});

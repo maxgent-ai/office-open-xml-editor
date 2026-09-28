@@ -27,7 +27,7 @@ export const mainThreadOnlyWorkerStubs = {
       loader: 'js',
     }));
 
-    build.onResolve({ filter: /render-worker-host$/ }, (args) => ({
+    build.onResolve({ filter: /render-worker(?:-source)?-host(?:\.js)?$/ }, (args) => ({
       path: args.path,
       namespace: 'stub-render-worker-host',
     }));

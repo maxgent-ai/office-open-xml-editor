@@ -10,7 +10,7 @@ import {
 import { layoutDocumentInputAsync } from './document.js';
 import { layoutFingerprint } from './invariants.js';
 import { normalizeLayoutOptions } from './options.js';
-import { PaginationAbortError } from './pagination-scheduler.js';
+import { drainPaginationAsync, PaginationAbortError } from './pagination-scheduler.js';
 import { setDocumentLayoutValidation } from './validation-policy.js';
 import type { DocumentLayout } from './types.js';
 
@@ -132,4 +132,20 @@ describe('pagination scheduler', () => {
     await expect(layoutAdversarially('plain', 10, { signal: controller.signal }))
       .rejects.toBeInstanceOf(PaginationAbortError);
   }, 300_000);
+
+  it('does not publish a completed result after cancellation during the last host yield', async () => {
+    const controller = new AbortController();
+    function* completedAfterYield(): Generator<number, string, void> {
+      yield Number.NaN; // finalization suspension, without a progress event
+      return 'stale layout';
+    }
+    const onProgress = () => { throw new Error('finalization must not publish progress'); };
+    await expect(drainPaginationAsync(completedAfterYield(), {
+      signal: controller.signal,
+      sliceMs: 0,
+      now: () => 1,
+      yieldToHost: async () => { controller.abort(); },
+      onProgress,
+    })).rejects.toBeInstanceOf(PaginationAbortError);
+  });
 });

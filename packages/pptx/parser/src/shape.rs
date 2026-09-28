@@ -22,7 +22,9 @@ use crate::{
     table_style_presets, PptxZip, ResolvedTableCellStyle, TableCellBorderStyle, TableLineStyle,
     TablePartStyle, TableStyleDef, TableStyleFlags, TableTextStyle,
 };
-use ooxml_common::blip::{mime_from_ext, parse_blip_duotone, parse_src_rect, svg_blip_rid};
+use ooxml_common::blip::{
+    mime_from_ext, parse_blip_duotone, parse_blip_effects, parse_src_rect, svg_blip_rid,
+};
 use ooxml_common::depth::DepthGuard;
 use ooxml_common::line::{
     parse_line_properties, LineDash, LineEnd, LineJoin, LinePaint, LineProperties,
@@ -994,10 +996,12 @@ pub(crate) fn parse_shape(
         .unwrap_or_else(|| InheritedShapeGeometry {
             geometry: "rect".to_owned(),
             cust_geom: None,
+            cust_geom_paint: None,
             adjustments: [None; 8],
         });
     let geometry = shape_geometry.geometry;
     let cust_geom = shape_geometry.cust_geom;
+    let cust_geom_paint = shape_geometry.cust_geom_paint;
     let [adj, adj2, adj3, adj4, adj5, adj6, adj7, adj8] = shape_geometry.adjustments;
 
     // cy=0 means "auto-height" for body-text shapes, but connector-type
@@ -1252,6 +1256,7 @@ pub(crate) fn parse_shape(
         text_body,
         default_text_color,
         cust_geom,
+        cust_geom_paint,
         adj,
         adj2,
         adj3,
@@ -1487,6 +1492,7 @@ pub(crate) fn parse_picture(
         intrinsic_width_px,
         intrinsic_height_px,
         stroke,
+        fill: parse_fill(sp_pr, theme),
         prst_geom,
         prst_adjust,
         src_rect: parse_src_rect(blip_fill),
@@ -1494,6 +1500,11 @@ pub(crate) fn parse_picture(
         // §20.1.8.23 `<a:duotone>` recolour, resolved through the slide's theme
         // palette with PowerPoint's linear tint. `None` ⇒ no effect.
         duotone: parse_blip_duotone(
+            blip_fill,
+            &PptxSchemeResolver { theme },
+            ooxml_common::color::TintMode::PowerPointLinear,
+        ),
+        blip_effects: parse_blip_effects(
             blip_fill,
             &PptxSchemeResolver { theme },
             ooxml_common::color::TintMode::PowerPointLinear,
@@ -1552,11 +1563,17 @@ pub(crate) fn parse_ole_preview_picture(
         intrinsic_width_px,
         intrinsic_height_px,
         stroke: None,
+        fill: None,
         prst_geom: None,
         prst_adjust: None,
         src_rect: parse_src_rect(blip_fill),
         alpha: parse_blip_alpha(blip_fill),
         duotone: parse_blip_duotone(
+            blip_fill,
+            &PptxSchemeResolver { theme },
+            ooxml_common::color::TintMode::PowerPointLinear,
+        ),
+        blip_effects: parse_blip_effects(
             blip_fill,
             &PptxSchemeResolver { theme },
             ooxml_common::color::TintMode::PowerPointLinear,
@@ -2409,6 +2426,14 @@ pub(crate) fn extract_decorative_shapes(
 // nest would otherwise blow the fixed WASM stack and trap the whole parse. Past
 // the shared limit the group's children are dropped and parsing continues with
 // the rest of the slide (graceful degradation). See `ooxml_common::depth`.
+//
+// CT_GroupShape (ECMA-376 Part 4, pml.xsd) allows nested groups and every leaf
+// kind at each level. Keep leaf construction in non-inlined helpers: Rust reserves
+// stack for the largest match arm even while this function only visits a group.
+// The old debug frame was 813,120 bytes per level and a release WASM build trapped
+// on a synthetic nine-group slide with the linker's 1 MiB stack. The split
+// debug frame is 3,088 bytes; the same WASM build parses all 64 guarded levels.
+// The 64-level truncation is library resource policy, not an OOXML schema limit.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn parse_sp_tree_node(
     node: roxmltree::Node<'_, '_>,
@@ -2433,272 +2458,18 @@ pub(crate) fn parse_sp_tree_node(
         return;
     }
     match node.tag_name().name() {
-        "sp" => {
-            if skip_placeholders && is_placeholder(node) {
-                return;
-            }
-            // Image-filled shape: render through the same source resolver as
-            // p:pic. [MS-ODRAWXML] §1.3.3 / §2.26.1.1 identify svgBlip as the
-            // SVG resource and the main blip raster as its compatibility copy.
-            // That copy can be absent or point at a missing part; in that case
-            // the surviving SVG is still the authored picture. Requiring the
-            // raster here used to fall through to parse_shape, where the shape's
-            // fillRef could paint a black rectangle instead.
-            let sp_pr_node = child(node, "spPr");
-            let blip_fill_node = sp_pr_node.and_then(|p| child(p, "blipFill"));
-            let blip_source =
-                blip_fill_node.and_then(|bf| resolve_blip_source(bf, slide_dir, rels, zip));
-            if let Some(BlipSource {
-                image_path,
-                mime_type,
-                intrinsic_width_px,
-                intrinsic_height_px,
-                svg_image_path,
-            }) = blip_source
-            {
-                if let Some(xfrm_node) = sp_pr_node.and_then(|p| child(p, "xfrm")) {
-                    let t = parse_xfrm(xfrm_node);
-                    if t.cx > 0 && t.cy > 0 {
-                        // §20.1.9.18 — the sp's prstGeom (any preset, not just
-                        // roundRect) is the picture's clip silhouette.
-                        let (prst_geom, prst_adjust) =
-                            sp_pr_node.map(parse_pic_prst_geom).unwrap_or((None, None));
-                        let cust_geom = sp_pr_node
-                            .and_then(|p| child(p, "custGeom"))
-                            .map(|geometry| parse_cust_geom(geometry, t.cx as f64, t.cy as f64));
-                        let PictureShapeProperties {
-                            stroke,
-                            shadow,
-                            inner_shadow,
-                            glow,
-                            soft_edge,
-                            reflection,
-                            scene3d,
-                            sp3d,
-                        } = resolve_picture_shape_properties(
-                            sp_pr_node,
-                            child(node, "style"),
-                            None,
-                            theme_source,
-                        );
-                        out.push(SlideElement::Picture(PictureElement {
-                            id: own_cnv_pr(node).and_then(|cnv| attr(&cnv, "id")),
-                            x: t.x,
-                            y: t.y,
-                            width: t.cx,
-                            height: t.cy,
-                            rotation: t.rot,
-                            flip_h: t.flip_h,
-                            flip_v: t.flip_v,
-                            image_path,
-                            mime_type,
-                            svg_image_path,
-                            intrinsic_width_px,
-                            intrinsic_height_px,
-                            stroke,
-                            prst_geom,
-                            prst_adjust,
-                            src_rect: blip_fill_node.and_then(parse_src_rect),
-                            alpha: blip_fill_node.and_then(parse_blip_alpha),
-                            duotone: blip_fill_node.and_then(|bf| {
-                                parse_blip_duotone(
-                                    bf,
-                                    &PptxSchemeResolver { theme },
-                                    ooxml_common::color::TintMode::PowerPointLinear,
-                                )
-                            }),
-                            cust_geom,
-                            shadow,
-                            inner_shadow,
-                            glow,
-                            soft_edge,
-                            reflection,
-                            scene3d,
-                            sp3d,
-                        }));
-                        return;
-                    }
-                }
-            }
-            // Picture-placeholder inheritance: slide sp has a ph but no own blipFill →
-            // look up an inherited blipFill from the layout placeholder. Transform
-            // comes from the slide's xfrm when present, otherwise from the layout.
-            if blip_fill_node.is_none() {
-                if let Some(ph) = node
-                    .descendants()
-                    .find(|n| n.is_element() && n.tag_name().name() == "ph")
-                {
-                    let ph_type = attr(&ph, "type").unwrap_or_else(|| "body".into());
-                    let ph_idx: Option<u32> = attr(&ph, "idx")
-                        .and_then(|v| v.parse().ok())
-                        .filter(|idx| *idx != u32::MAX);
-                    if let Some(bf) = lph.lookup_blip_fill(&ph_type, ph_idx) {
-                        let slide_xfrm = sp_pr_node.and_then(|p| child(p, "xfrm")).map(parse_xfrm);
-                        let t = slide_xfrm.or_else(|| lph.lookup(&ph_type, ph_idx).cloned());
-                        if let Some(t) = t {
-                            if t.cx > 0 && t.cy > 0 {
-                                let PictureShapeProperties {
-                                    stroke,
-                                    shadow,
-                                    inner_shadow,
-                                    glow,
-                                    soft_edge,
-                                    reflection,
-                                    scene3d,
-                                    sp3d,
-                                } = resolve_picture_shape_properties(
-                                    sp_pr_node,
-                                    child(node, "style"),
-                                    lph.lookup_picture_properties(&ph_type, ph_idx),
-                                    theme_source,
-                                );
-                                out.push(SlideElement::Picture(PictureElement {
-                                    id: own_cnv_pr(node).and_then(|cnv| attr(&cnv, "id")),
-                                    x: t.x,
-                                    y: t.y,
-                                    width: t.cx,
-                                    height: t.cy,
-                                    rotation: t.rot,
-                                    flip_h: t.flip_h,
-                                    flip_v: t.flip_v,
-                                    image_path: bf.image_path,
-                                    mime_type: bf.mime_type,
-                                    // TODO: an inherited layout-placeholder blipFill
-                                    // (LayoutPlaceholders::lookup_blip_fill) does not
-                                    // yet carry the svgBlip extension. Picture
-                                    // placeholders pointing at an SVG are rare; thread
-                                    // the svg path through BlipFill if a sample needs it.
-                                    svg_image_path: None,
-                                    // Intrinsic size is only consumed by the ink
-                                    // fallback (PNG-IHDR centering); inherited
-                                    // placeholder pictures stretch to the box, so
-                                    // None matches the prior behaviour.
-                                    intrinsic_width_px: None,
-                                    intrinsic_height_px: None,
-                                    stroke,
-                                    prst_geom: None,
-                                    prst_adjust: None,
-                                    src_rect: bf.src_rect,
-                                    alpha: bf.alpha,
-                                    // §20.1.8.23 duotone inherited from the layout
-                                    // placeholder's blipFill (resolved through the
-                                    // theme in InheritedBlipFill); the PictureElement
-                                    // render applies it via the shared core cache.
-                                    duotone: bf.duotone,
-                                    cust_geom: None,
-                                    shadow,
-                                    inner_shadow,
-                                    glow,
-                                    soft_edge,
-                                    reflection,
-                                    scene3d,
-                                    sp3d,
-                                }));
-                                return;
-                            }
-                        }
-                    }
-                }
-            }
-            if let Some(shape) =
-                parse_shape(node, lph, theme_source, rels, slide_dir, group_fill, zip)
-            {
-                out.push(SlideElement::Shape(shape));
-            }
-        }
-        "pic" => {
-            if let Some(media) = parse_media(node, slide_dir, rels) {
-                out.push(SlideElement::Media(media));
-            } else if let Some(pic) = parse_picture(node, slide_dir, rels, theme_source, zip) {
-                out.push(SlideElement::Picture(pic));
-            } else {
-                // Placeholder pic: no xfrm in spPr — position comes from layout by_idx
-                let ph_node = node
-                    .descendants()
-                    .find(|n| n.is_element() && n.tag_name().name() == "ph");
-                let ph_type = ph_node
-                    .and_then(|ph| attr(&ph, "type"))
-                    .unwrap_or_else(|| "body".to_owned());
-                let ph_idx = ph_node
-                    .and_then(|ph| attr(&ph, "idx"))
-                    .and_then(|s| s.parse::<u32>().ok())
-                    .filter(|idx| *idx != u32::MAX);
-                if let Some(idx) = ph_idx {
-                    if let Some(t) = lph.by_idx.get(&idx) {
-                        let blip_fill = child(node, "blipFill");
-                        let blip = blip_fill.and_then(|bf| child(bf, "blip"));
-                        let r_id = blip.and_then(|b| attr_r(&b, "embed"));
-                        if let Some(rid) = r_id {
-                            if let Some(rel_target) = rels.get(&rid) {
-                                let image_path = resolve_path(slide_dir, rel_target);
-                                if let Ok(image_bytes) = read_zip_head(zip, &image_path, 24) {
-                                    let mime_type = mime_from_ext(&image_path).to_owned();
-                                    let (intrinsic_width_px, intrinsic_height_px) =
-                                        match png_size_from_bytes(&image_bytes) {
-                                            Some((w, h)) => (Some(w), Some(h)),
-                                            None => (None, None),
-                                        };
-                                    // Microsoft 2016 SVG extension on the placeholder
-                                    // p:pic's blip — prefer the vector original.
-                                    let svg_image_path =
-                                        blip.and_then(|b| svg_blip_path(b, slide_dir, rels, zip));
-                                    let PictureShapeProperties {
-                                        stroke,
-                                        shadow,
-                                        inner_shadow,
-                                        glow,
-                                        soft_edge,
-                                        reflection,
-                                        scene3d,
-                                        sp3d,
-                                    } = resolve_picture_shape_properties(
-                                        child(node, "spPr"),
-                                        child(node, "style"),
-                                        lph.lookup_picture_properties(&ph_type, Some(idx)),
-                                        theme_source,
-                                    );
-                                    out.push(SlideElement::Picture(PictureElement {
-                                        id: own_cnv_pr(node).and_then(|cnv| attr(&cnv, "id")),
-                                        x: t.x,
-                                        y: t.y,
-                                        width: t.cx,
-                                        height: t.cy,
-                                        rotation: t.rot,
-                                        flip_h: t.flip_h,
-                                        flip_v: t.flip_v,
-                                        image_path,
-                                        mime_type,
-                                        svg_image_path,
-                                        intrinsic_width_px,
-                                        intrinsic_height_px,
-                                        stroke,
-                                        prst_geom: None,
-                                        prst_adjust: None,
-                                        src_rect: blip_fill.and_then(parse_src_rect),
-                                        alpha: blip_fill.and_then(parse_blip_alpha),
-                                        duotone: blip_fill.and_then(|bf| {
-                                            parse_blip_duotone(
-                                                bf,
-                                                &PptxSchemeResolver { theme },
-                                                ooxml_common::color::TintMode::PowerPointLinear,
-                                            )
-                                        }),
-                                        cust_geom: None,
-                                        shadow,
-                                        inner_shadow,
-                                        glow,
-                                        soft_edge,
-                                        reflection,
-                                        scene3d,
-                                        sp3d,
-                                    }));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        "sp" => parse_sp_node(
+            node,
+            lph,
+            slide_dir,
+            rels,
+            zip,
+            theme_source,
+            out,
+            skip_placeholders,
+            group_fill,
+        ),
+        "pic" => parse_pic_node(node, lph, slide_dir, rels, zip, theme_source, out),
         "AlternateContent" => {
             let before = out.len();
             // ECMA-376 Part 3 §9.3 — select the first Choice whose Requires namespaces
@@ -2760,177 +2531,15 @@ pub(crate) fn parse_sp_tree_node(
                 }
             }
         }
-        "graphicFrame" => {
-            let xfrm_node = child(node, "xfrm");
-            let t = xfrm_node.map(parse_xfrm).unwrap_or_default();
-
-            // Table
-            let tbl_node = node
-                .descendants()
-                .find(|n| n.is_element() && n.tag_name().name() == "tbl");
-            if let Some(tbl_node) = tbl_node {
-                if let Some(mut table) =
-                    parse_table(tbl_node, &t, theme_source, rels, slide_dir, zip)
-                {
-                    table.id = own_cnv_pr(node).and_then(|cnv| attr(&cnv, "id"));
-                    out.push(SlideElement::Table(table));
-                }
-                return;
-            }
-
-            // SmartArt (ECMA-376 §21.4). Preferred path: replay the
-            // PowerPoint-prebaked drawing (`drawingN.xml` / `dsp:spTree`) when
-            // Office persisted one — that carries the true layout geometry.
-            //
-            // Fallback (PP3): when no drawing part exists, recover the diagram's
-            // *content* from its data model (`dataN.xml`) — every node's text,
-            // indented by its parent/child depth — as a bulleted list filling the
-            // frame. Layout-engine reconstruction (hierarchy/cycle geometry) is
-            // still not implemented; see `smartart_fallback`.
-            if let Some(gd) = node
-                .descendants()
-                .find(|n| n.is_element() && n.tag_name().name() == "graphicData")
-            {
-                let uri = attr(&gd, "uri").unwrap_or_default();
-                if is_diagram_uri(&uri) {
-                    if let Some(rel_ids) = child(gd, "relIds") {
-                        if let Some(dm_rid) = attr_r(&rel_ids, "dm") {
-                            if let Some(drawing_xml) = smartart_drawings.get(&dm_rid) {
-                                parse_smartart_drawing(drawing_xml, &t, theme, out, zip);
-                                return;
-                            }
-                            // No prebaked drawing → data-model fallback. `rels` are
-                            // the referencing part's, so `rels[dm_rid]` resolved
-                            // against `slide_dir` is the data part (§21.4.2.22
-                            // relIds `r:dm`). Emits M (content list) or S
-                            // (placeholder); either way this graphicData is a
-                            // diagram, so we return regardless of the outcome.
-                            crate::smartart_fallback::emit_smartart_fallback(
-                                &dm_rid, &t, slide_dir, rels, theme, zip, out,
-                            );
-                            return;
-                        }
-                    }
-                }
-            }
-
-            // Chart
-            if let Some(gd) = node
-                .descendants()
-                .find(|n| n.is_element() && n.tag_name().name() == "graphicData")
-            {
-                let uri = attr(&gd, "uri").unwrap_or_default();
-                // Both <c:chart> and <cx:chart> share the local name "chart"
-                let chart_rid = gd
-                    .descendants()
-                    .find(|n| n.is_element() && n.tag_name().name() == "chart")
-                    .and_then(|n| attr_r(&n, "id"));
-                if let Some(rid) = chart_rid {
-                    if let Some(rel_target) = rels.get(&rid) {
-                        let chart_path = resolve_path(slide_dir, rel_target);
-                        if let Ok(chart_xml) = read_zip_str(zip, &chart_path) {
-                            let related_parts = load_chart_related_parts(zip, &chart_path);
-                            let empty_theme_images =
-                                ooxml_common::chart::ChartImageRelationships::default();
-                            let image_resolver = ooxml_common::chart::ChartImageResolverChain::new(
-                                &related_parts.image_relationships,
-                                theme_source.chart_images().unwrap_or(&empty_theme_images),
-                            );
-                            let chart_opt = if uri.contains("chartex") || uri.contains("chartEx") {
-                                // chartEx title font size lives in the chart
-                                // part's associated chartStyle sidecar
-                                // (`styleN.xml`), reached via that part's OWN
-                                // rels. Read it best-effort before parsing.
-                                parse_chartex_with_images(
-                                    &chart_xml,
-                                    related_parts.style_xml.as_deref(),
-                                    related_parts.color_style_xml.as_deref(),
-                                    theme,
-                                    theme_source.format_scheme(),
-                                    &image_resolver,
-                                )
-                            } else {
-                                let user_shapes_xml =
-                                    load_chart_user_shapes_xml(zip, &chart_path, &chart_xml);
-                                parse_legacy_chart_with_style_parts_and_images(
-                                    &chart_xml,
-                                    related_parts.style_xml.as_deref(),
-                                    related_parts.color_style_xml.as_deref(),
-                                    user_shapes_xml.as_deref(),
-                                    theme,
-                                    theme_source.format_scheme(),
-                                    &image_resolver,
-                                )
-                            };
-                            if let Some(mut chart) = chart_opt {
-                                chart.id = own_cnv_pr(node).and_then(|cnv| attr(&cnv, "id"));
-                                chart.x = t.x;
-                                chart.y = t.y;
-                                chart.width = t.cx;
-                                chart.height = t.cy;
-                                chart.rotation = t.rot;
-                                chart.flip_h = t.flip_h;
-                                chart.flip_v = t.flip_v;
-                                out.push(SlideElement::Chart(chart));
-                            }
-                        }
-                    }
-                }
-            }
-
-            // OLE embedded object (§19.3.2.4 CT_OleObject). We can't run the
-            // embedded application, but the OOXML author bakes a preview `<p:pic>`
-            // inside `<p:oleObj>` for exactly this case. Route that picture through
-            // the ordinary image pipeline so the object is visible instead of a
-            // silent hole.
-            if let Some(gd) = node
-                .descendants()
-                .find(|n| n.is_element() && n.tag_name().name() == "graphicData")
-            {
-                let uri = attr(&gd, "uri").unwrap_or_default();
-                if is_pml_ole_uri(&uri) {
-                    // `<p:oleObj>` is commonly wrapped in `mc:AlternateContent`.
-                    // PowerPoint's canonical output puts a spid-only oleObj in the
-                    // `mc:Choice Requires="v"` (VML) branch and the drawable
-                    // `<p:pic>`-carrying oleObj in `mc:Fallback` — the `spid`
-                    // attribute and a `<p:pic>` child are mutually exclusive on
-                    // CT_OleObject (ECMA-376 Part 3 §B.1). Since we do not
-                    // understand the `v` (VML) namespace, MCE §9.3 says to take the
-                    // representation we can render, i.e. the Fallback's pic. Rather
-                    // than depend on document order or Choice/Fallback wrapping,
-                    // select the first oleObj that actually carries a `<p:pic>`
-                    // (the capability predicate "has something drawable"). This also
-                    // makes a bare, unwrapped `<p:oleObj><p:pic/>` work unchanged.
-                    let ole_pic = gd
-                        .descendants()
-                        .filter(|n| n.is_element() && n.tag_name().name() == "oleObj")
-                        .find_map(|ole| child(ole, "pic"));
-                    if let Some(pic_node) = ole_pic {
-                        // The preview pic's own `<a:xfrm>` is 0,0-relative (or
-                        // absent), so the graphicFrame's `<p:xfrm>` is authoritative
-                        // for placement. Parse the blip, then stamp gf geometry.
-                        if let Some(mut pic) =
-                            parse_picture(pic_node, slide_dir, rels, theme_source, zip)
-                        {
-                            pic.id = own_cnv_pr(node).and_then(|cnv| attr(&cnv, "id"));
-                            pic.x = t.x;
-                            pic.y = t.y;
-                            pic.width = t.cx;
-                            pic.height = t.cy;
-                            out.push(SlideElement::Picture(pic));
-                        } else if let Some(mut pic) =
-                            parse_ole_preview_picture(pic_node, &t, slide_dir, rels, theme, zip)
-                        {
-                            // The pic lacked an `<a:xfrm>` (parse_picture requires
-                            // one), but still carries a resolvable blip — build the
-                            // element directly on the graphicFrame geometry.
-                            pic.id = own_cnv_pr(node).and_then(|cnv| attr(&cnv, "id"));
-                            out.push(SlideElement::Picture(pic));
-                        }
-                    }
-                }
-            }
-        }
+        "graphicFrame" => parse_graphic_frame(
+            node,
+            slide_dir,
+            rels,
+            smartart_drawings,
+            zip,
+            theme_source,
+            out,
+        ),
         "grpSp" => {
             let grp_sp_pr = child(node, "grpSpPr");
             let gt: Option<GroupTransform> =
@@ -2999,16 +2608,520 @@ pub(crate) fn parse_sp_tree_node(
                 }
             }
         }
-        "cxnSp" => {
-            // Connector shape: parse as a line/shape element
-            if skip_placeholders && is_placeholder(node) {
+        "cxnSp" => parse_connector_node(node, rels, theme_source, out, skip_placeholders),
+        _ => {}
+    }
+}
+
+// Constructing SlideElement::Shape here would enlarge every recursive frame.
+#[inline(never)]
+fn parse_connector_node(
+    node: roxmltree::Node<'_, '_>,
+    rels: &HashMap<String, String>,
+    theme_source: &(impl PptxThemeSource + ?Sized),
+    out: &mut Vec<SlideElement>,
+    skip_placeholders: bool,
+) {
+    if skip_placeholders && is_placeholder(node) {
+        return;
+    }
+    if let Some(shape) = parse_connector(node, theme_source, rels) {
+        out.push(SlideElement::Shape(shape));
+    }
+}
+
+// Keep picture and shape temporaries out of the recursive shape-tree frame.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn parse_sp_node(
+    node: roxmltree::Node<'_, '_>,
+    lph: &LayoutPlaceholders,
+    slide_dir: &str,
+    rels: &HashMap<String, String>,
+    zip: &mut PptxZip,
+    theme_source: &(impl PptxThemeSource + ?Sized),
+    out: &mut Vec<SlideElement>,
+    skip_placeholders: bool,
+    group_fill: Option<&Fill>,
+) {
+    let theme = theme_source.colors();
+    if skip_placeholders && is_placeholder(node) {
+        return;
+    }
+    // Image-filled shape: render through the same source resolver as
+    // p:pic. [MS-ODRAWXML] §1.3.3 / §2.26.1.1 identify svgBlip as the
+    // SVG resource and the main blip raster as its compatibility copy.
+    // That copy can be absent or point at a missing part; in that case
+    // the surviving SVG is still the authored picture. Requiring the
+    // raster here used to fall through to parse_shape, where the shape's
+    // fillRef could paint a black rectangle instead.
+    let sp_pr_node = child(node, "spPr");
+    let blip_fill_node = sp_pr_node.and_then(|p| child(p, "blipFill"));
+    let blip_source = blip_fill_node.and_then(|bf| resolve_blip_source(bf, slide_dir, rels, zip));
+    if let Some(BlipSource {
+        image_path,
+        mime_type,
+        intrinsic_width_px,
+        intrinsic_height_px,
+        svg_image_path,
+    }) = blip_source
+    {
+        if let Some(xfrm_node) = sp_pr_node.and_then(|p| child(p, "xfrm")) {
+            let t = parse_xfrm(xfrm_node);
+            if t.cx > 0 && t.cy > 0 {
+                // §20.1.9.18 — the sp's prstGeom (any preset, not just
+                // roundRect) is the picture's clip silhouette.
+                let (prst_geom, prst_adjust) =
+                    sp_pr_node.map(parse_pic_prst_geom).unwrap_or((None, None));
+                let cust_geom = sp_pr_node
+                    .and_then(|p| child(p, "custGeom"))
+                    .map(|geometry| parse_cust_geom(geometry, t.cx as f64, t.cy as f64));
+                let PictureShapeProperties {
+                    stroke,
+                    shadow,
+                    inner_shadow,
+                    glow,
+                    soft_edge,
+                    reflection,
+                    scene3d,
+                    sp3d,
+                } = resolve_picture_shape_properties(
+                    sp_pr_node,
+                    child(node, "style"),
+                    None,
+                    theme_source,
+                );
+                out.push(SlideElement::Picture(PictureElement {
+                    id: own_cnv_pr(node).and_then(|cnv| attr(&cnv, "id")),
+                    x: t.x,
+                    y: t.y,
+                    width: t.cx,
+                    height: t.cy,
+                    rotation: t.rot,
+                    flip_h: t.flip_h,
+                    flip_v: t.flip_v,
+                    image_path,
+                    mime_type,
+                    svg_image_path,
+                    intrinsic_width_px,
+                    intrinsic_height_px,
+                    stroke,
+                    // The sp's spPr fill is this blipFill itself; there
+                    // is no separate backing fill.
+                    fill: None,
+                    prst_geom,
+                    prst_adjust,
+                    src_rect: blip_fill_node.and_then(parse_src_rect),
+                    alpha: blip_fill_node.and_then(parse_blip_alpha),
+                    duotone: blip_fill_node.and_then(|bf| {
+                        parse_blip_duotone(
+                            bf,
+                            &PptxSchemeResolver { theme },
+                            ooxml_common::color::TintMode::PowerPointLinear,
+                        )
+                    }),
+                    blip_effects: blip_fill_node
+                        .map(|bf| {
+                            parse_blip_effects(
+                                bf,
+                                &PptxSchemeResolver { theme },
+                                ooxml_common::color::TintMode::PowerPointLinear,
+                            )
+                        })
+                        .unwrap_or_default(),
+                    cust_geom,
+                    shadow,
+                    inner_shadow,
+                    glow,
+                    soft_edge,
+                    reflection,
+                    scene3d,
+                    sp3d,
+                }));
                 return;
             }
-            if let Some(shape) = parse_connector(node, theme_source, rels) {
-                out.push(SlideElement::Shape(shape));
+        }
+    }
+    // Picture-placeholder inheritance: slide sp has a ph but no own blipFill →
+    // look up an inherited blipFill from the layout placeholder. Transform
+    // comes from the slide's xfrm when present, otherwise from the layout.
+    if blip_fill_node.is_none() {
+        if let Some(ph) = node
+            .descendants()
+            .find(|n| n.is_element() && n.tag_name().name() == "ph")
+        {
+            let ph_type = attr(&ph, "type").unwrap_or_else(|| "body".into());
+            let ph_idx: Option<u32> = attr(&ph, "idx")
+                .and_then(|v| v.parse().ok())
+                .filter(|idx| *idx != u32::MAX);
+            if let Some(bf) = lph.lookup_blip_fill(&ph_type, ph_idx) {
+                let slide_xfrm = sp_pr_node.and_then(|p| child(p, "xfrm")).map(parse_xfrm);
+                let t = slide_xfrm.or_else(|| lph.lookup(&ph_type, ph_idx).cloned());
+                if let Some(t) = t {
+                    if t.cx > 0 && t.cy > 0 {
+                        let PictureShapeProperties {
+                            stroke,
+                            shadow,
+                            inner_shadow,
+                            glow,
+                            soft_edge,
+                            reflection,
+                            scene3d,
+                            sp3d,
+                        } = resolve_picture_shape_properties(
+                            sp_pr_node,
+                            child(node, "style"),
+                            lph.lookup_picture_properties(&ph_type, ph_idx),
+                            theme_source,
+                        );
+                        out.push(SlideElement::Picture(PictureElement {
+                            id: own_cnv_pr(node).and_then(|cnv| attr(&cnv, "id")),
+                            x: t.x,
+                            y: t.y,
+                            width: t.cx,
+                            height: t.cy,
+                            rotation: t.rot,
+                            flip_h: t.flip_h,
+                            flip_v: t.flip_v,
+                            image_path: bf.image_path,
+                            mime_type: bf.mime_type,
+                            // TODO: an inherited layout-placeholder blipFill
+                            // (LayoutPlaceholders::lookup_blip_fill) does not
+                            // yet carry the svgBlip extension. Picture
+                            // placeholders pointing at an SVG are rare; thread
+                            // the svg path through BlipFill if a sample needs it.
+                            svg_image_path: None,
+                            // Intrinsic size is only consumed by the ink
+                            // fallback (PNG-IHDR centering); inherited
+                            // placeholder pictures stretch to the box, so
+                            // None matches the prior behaviour.
+                            intrinsic_width_px: None,
+                            intrinsic_height_px: None,
+                            stroke,
+                            fill: None,
+                            prst_geom: None,
+                            prst_adjust: None,
+                            src_rect: bf.src_rect,
+                            alpha: bf.alpha,
+                            // §20.1.8.23 duotone inherited from the layout
+                            // placeholder's blipFill (resolved through the
+                            // theme in InheritedBlipFill); the PictureElement
+                            // render applies it via the shared core cache.
+                            duotone: bf.duotone,
+                            blip_effects: bf.blip_effects,
+                            cust_geom: None,
+                            shadow,
+                            inner_shadow,
+                            glow,
+                            soft_edge,
+                            reflection,
+                            scene3d,
+                            sp3d,
+                        }));
+                        return;
+                    }
+                }
             }
         }
-        _ => {}
+    }
+    if let Some(shape) = parse_shape(node, lph, theme_source, rels, slide_dir, group_fill, zip) {
+        out.push(SlideElement::Shape(shape));
+    }
+}
+
+// Keep picture and shape temporaries out of the recursive shape-tree frame.
+#[inline(never)]
+fn parse_pic_node(
+    node: roxmltree::Node<'_, '_>,
+    lph: &LayoutPlaceholders,
+    slide_dir: &str,
+    rels: &HashMap<String, String>,
+    zip: &mut PptxZip,
+    theme_source: &(impl PptxThemeSource + ?Sized),
+    out: &mut Vec<SlideElement>,
+) {
+    let theme = theme_source.colors();
+    if let Some(media) = parse_media(node, slide_dir, rels) {
+        out.push(SlideElement::Media(media));
+    } else if let Some(pic) = parse_picture(node, slide_dir, rels, theme_source, zip) {
+        out.push(SlideElement::Picture(pic));
+    } else {
+        // Placeholder pic: no xfrm in spPr — position comes from layout by_idx
+        let ph_node = node
+            .descendants()
+            .find(|n| n.is_element() && n.tag_name().name() == "ph");
+        let ph_type = ph_node
+            .and_then(|ph| attr(&ph, "type"))
+            .unwrap_or_else(|| "body".to_owned());
+        let ph_idx = ph_node
+            .and_then(|ph| attr(&ph, "idx"))
+            .and_then(|s| s.parse::<u32>().ok())
+            .filter(|idx| *idx != u32::MAX);
+        if let Some(idx) = ph_idx {
+            if let Some(t) = lph.by_idx.get(&idx) {
+                let blip_fill = child(node, "blipFill");
+                let blip = blip_fill.and_then(|bf| child(bf, "blip"));
+                let r_id = blip.and_then(|b| attr_r(&b, "embed"));
+                if let Some(rid) = r_id {
+                    if let Some(rel_target) = rels.get(&rid) {
+                        let image_path = resolve_path(slide_dir, rel_target);
+                        if let Ok(image_bytes) = read_zip_head(zip, &image_path, 24) {
+                            let mime_type = mime_from_ext(&image_path).to_owned();
+                            let (intrinsic_width_px, intrinsic_height_px) =
+                                match png_size_from_bytes(&image_bytes) {
+                                    Some((w, h)) => (Some(w), Some(h)),
+                                    None => (None, None),
+                                };
+                            // Microsoft 2016 SVG extension on the placeholder
+                            // p:pic's blip — prefer the vector original.
+                            let svg_image_path =
+                                blip.and_then(|b| svg_blip_path(b, slide_dir, rels, zip));
+                            let PictureShapeProperties {
+                                stroke,
+                                shadow,
+                                inner_shadow,
+                                glow,
+                                soft_edge,
+                                reflection,
+                                scene3d,
+                                sp3d,
+                            } = resolve_picture_shape_properties(
+                                child(node, "spPr"),
+                                child(node, "style"),
+                                lph.lookup_picture_properties(&ph_type, Some(idx)),
+                                theme_source,
+                            );
+                            out.push(SlideElement::Picture(PictureElement {
+                                id: own_cnv_pr(node).and_then(|cnv| attr(&cnv, "id")),
+                                x: t.x,
+                                y: t.y,
+                                width: t.cx,
+                                height: t.cy,
+                                rotation: t.rot,
+                                flip_h: t.flip_h,
+                                flip_v: t.flip_v,
+                                image_path,
+                                mime_type,
+                                svg_image_path,
+                                intrinsic_width_px,
+                                intrinsic_height_px,
+                                stroke,
+                                fill: child(node, "spPr").and_then(|sp| parse_fill(sp, theme)),
+                                prst_geom: None,
+                                prst_adjust: None,
+                                src_rect: blip_fill.and_then(parse_src_rect),
+                                alpha: blip_fill.and_then(parse_blip_alpha),
+                                duotone: blip_fill.and_then(|bf| {
+                                    parse_blip_duotone(
+                                        bf,
+                                        &PptxSchemeResolver { theme },
+                                        ooxml_common::color::TintMode::PowerPointLinear,
+                                    )
+                                }),
+                                blip_effects: blip_fill
+                                    .map(|bf| {
+                                        parse_blip_effects(
+                                            bf,
+                                            &PptxSchemeResolver { theme },
+                                            ooxml_common::color::TintMode::PowerPointLinear,
+                                        )
+                                    })
+                                    .unwrap_or_default(),
+                                cust_geom: None,
+                                shadow,
+                                inner_shadow,
+                                glow,
+                                soft_edge,
+                                reflection,
+                                scene3d,
+                                sp3d,
+                            }));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Keep chart/table/diagram temporaries out of the recursive shape-tree frame.
+// CT_GroupShape (ECMA-376 Part 4, pml.xsd) can contain graphicFrame at every
+// level, but these large locals are needed only when visiting that leaf.
+#[inline(never)]
+fn parse_graphic_frame(
+    node: roxmltree::Node<'_, '_>,
+    slide_dir: &str,
+    rels: &HashMap<String, String>,
+    smartart_drawings: &HashMap<String, String>,
+    zip: &mut PptxZip,
+    theme_source: &(impl PptxThemeSource + ?Sized),
+    out: &mut Vec<SlideElement>,
+) {
+    let theme = theme_source.colors();
+    let xfrm_node = child(node, "xfrm");
+    let t = xfrm_node.map(parse_xfrm).unwrap_or_default();
+
+    // Table
+    let tbl_node = node
+        .descendants()
+        .find(|n| n.is_element() && n.tag_name().name() == "tbl");
+    if let Some(tbl_node) = tbl_node {
+        if let Some(mut table) = parse_table(tbl_node, &t, theme_source, rels, slide_dir, zip) {
+            table.id = own_cnv_pr(node).and_then(|cnv| attr(&cnv, "id"));
+            out.push(SlideElement::Table(table));
+        }
+        return;
+    }
+
+    // SmartArt (ECMA-376 §21.4). Preferred path: replay the
+    // PowerPoint-prebaked drawing (`drawingN.xml` / `dsp:spTree`) when
+    // Office persisted one — that carries the true layout geometry.
+    //
+    // Fallback (PP3): when no drawing part exists, recover the diagram's
+    // *content* from its data model (`dataN.xml`) — every node's text,
+    // indented by its parent/child depth — as a bulleted list filling the
+    // frame. Layout-engine reconstruction (hierarchy/cycle geometry) is
+    // still not implemented; see `smartart_fallback`.
+    if let Some(gd) = node
+        .descendants()
+        .find(|n| n.is_element() && n.tag_name().name() == "graphicData")
+    {
+        let uri = attr(&gd, "uri").unwrap_or_default();
+        if is_diagram_uri(&uri) {
+            if let Some(rel_ids) = child(gd, "relIds") {
+                if let Some(dm_rid) = attr_r(&rel_ids, "dm") {
+                    if let Some(drawing_xml) = smartart_drawings.get(&dm_rid) {
+                        parse_smartart_drawing(drawing_xml, &t, theme, out, zip);
+                        return;
+                    }
+                    // No prebaked drawing → data-model fallback. `rels` are
+                    // the referencing part's, so `rels[dm_rid]` resolved
+                    // against `slide_dir` is the data part (§21.4.2.22
+                    // relIds `r:dm`). Emits M (content list) or S
+                    // (placeholder); either way this graphicData is a
+                    // diagram, so we return regardless of the outcome.
+                    crate::smartart_fallback::emit_smartart_fallback(
+                        &dm_rid, &t, slide_dir, rels, theme, zip, out,
+                    );
+                    return;
+                }
+            }
+        }
+    }
+
+    // Chart
+    if let Some(gd) = node
+        .descendants()
+        .find(|n| n.is_element() && n.tag_name().name() == "graphicData")
+    {
+        let uri = attr(&gd, "uri").unwrap_or_default();
+        // Both <c:chart> and <cx:chart> share the local name "chart"
+        let chart_rid = gd
+            .descendants()
+            .find(|n| n.is_element() && n.tag_name().name() == "chart")
+            .and_then(|n| attr_r(&n, "id"));
+        if let Some(rid) = chart_rid {
+            if let Some(rel_target) = rels.get(&rid) {
+                let chart_path = resolve_path(slide_dir, rel_target);
+                if let Ok(chart_xml) = read_zip_str(zip, &chart_path) {
+                    let related_parts = load_chart_related_parts(zip, &chart_path);
+                    let empty_theme_images =
+                        ooxml_common::chart::ChartImageRelationships::default();
+                    let image_resolver = ooxml_common::chart::ChartImageResolverChain::new(
+                        &related_parts.image_relationships,
+                        theme_source.chart_images().unwrap_or(&empty_theme_images),
+                    );
+                    let chart_opt = if uri.contains("chartex") || uri.contains("chartEx") {
+                        // chartEx title font size lives in the chart
+                        // part's associated chartStyle sidecar
+                        // (`styleN.xml`), reached via that part's OWN
+                        // rels. Read it best-effort before parsing.
+                        parse_chartex_with_images(
+                            &chart_xml,
+                            related_parts.style_xml.as_deref(),
+                            related_parts.color_style_xml.as_deref(),
+                            theme,
+                            theme_source.format_scheme(),
+                            &image_resolver,
+                        )
+                    } else {
+                        let user_shapes_xml =
+                            load_chart_user_shapes_xml(zip, &chart_path, &chart_xml);
+                        parse_legacy_chart_with_style_parts_and_images(
+                            &chart_xml,
+                            related_parts.style_xml.as_deref(),
+                            related_parts.color_style_xml.as_deref(),
+                            user_shapes_xml.as_deref(),
+                            theme,
+                            theme_source.format_scheme(),
+                            &image_resolver,
+                        )
+                    };
+                    if let Some(mut chart) = chart_opt {
+                        chart.id = own_cnv_pr(node).and_then(|cnv| attr(&cnv, "id"));
+                        chart.x = t.x;
+                        chart.y = t.y;
+                        chart.width = t.cx;
+                        chart.height = t.cy;
+                        chart.rotation = t.rot;
+                        chart.flip_h = t.flip_h;
+                        chart.flip_v = t.flip_v;
+                        out.push(SlideElement::Chart(chart));
+                    }
+                }
+            }
+        }
+    }
+
+    // OLE embedded object (§19.3.2.4 CT_OleObject). We can't run the
+    // embedded application, but the OOXML author bakes a preview `<p:pic>`
+    // inside `<p:oleObj>` for exactly this case. Route that picture through
+    // the ordinary image pipeline so the object is visible instead of a
+    // silent hole.
+    if let Some(gd) = node
+        .descendants()
+        .find(|n| n.is_element() && n.tag_name().name() == "graphicData")
+    {
+        let uri = attr(&gd, "uri").unwrap_or_default();
+        if is_pml_ole_uri(&uri) {
+            // `<p:oleObj>` is commonly wrapped in `mc:AlternateContent`.
+            // PowerPoint's canonical output puts a spid-only oleObj in the
+            // `mc:Choice Requires="v"` (VML) branch and the drawable
+            // `<p:pic>`-carrying oleObj in `mc:Fallback` — the `spid`
+            // attribute and a `<p:pic>` child are mutually exclusive on
+            // CT_OleObject (ECMA-376 Part 3 §B.1). Since we do not
+            // understand the `v` (VML) namespace, MCE §9.3 says to take the
+            // representation we can render, i.e. the Fallback's pic. Rather
+            // than depend on document order or Choice/Fallback wrapping,
+            // select the first oleObj that actually carries a `<p:pic>`
+            // (the capability predicate "has something drawable"). This also
+            // makes a bare, unwrapped `<p:oleObj><p:pic/>` work unchanged.
+            let ole_pic = gd
+                .descendants()
+                .filter(|n| n.is_element() && n.tag_name().name() == "oleObj")
+                .find_map(|ole| child(ole, "pic"));
+            if let Some(pic_node) = ole_pic {
+                // The preview pic's own `<a:xfrm>` is 0,0-relative (or
+                // absent), so the graphicFrame's `<p:xfrm>` is authoritative
+                // for placement. Parse the blip, then stamp gf geometry.
+                if let Some(mut pic) = parse_picture(pic_node, slide_dir, rels, theme_source, zip) {
+                    pic.id = own_cnv_pr(node).and_then(|cnv| attr(&cnv, "id"));
+                    pic.x = t.x;
+                    pic.y = t.y;
+                    pic.width = t.cx;
+                    pic.height = t.cy;
+                    out.push(SlideElement::Picture(pic));
+                } else if let Some(mut pic) =
+                    parse_ole_preview_picture(pic_node, &t, slide_dir, rels, theme, zip)
+                {
+                    // The pic lacked an `<a:xfrm>` (parse_picture requires
+                    // one), but still carries a resolvable blip — build the
+                    // element directly on the graphicFrame geometry.
+                    pic.id = own_cnv_pr(node).and_then(|cnv| attr(&cnv, "id"));
+                    out.push(SlideElement::Picture(pic));
+                }
+            }
+        }
     }
 }
 
@@ -3191,7 +3304,7 @@ fn offset_slide_element(el: &mut SlideElement, dx: i64, dy: i64) {
 }
 
 /// Parse a connector shape (p:cxnSp) as a ShapeElement with line geometry.
-fn parse_connector(
+pub(crate) fn parse_connector(
     node: roxmltree::Node<'_, '_>,
     theme_source: &(impl PptxThemeSource + ?Sized),
     rels: &HashMap<String, String>,
@@ -3291,6 +3404,7 @@ fn parse_connector(
         text_body: None,
         default_text_color: None,
         cust_geom: None,
+        cust_geom_paint: None,
         adj,
         adj2,
         adj3,
@@ -3937,6 +4051,7 @@ mod picture_property_resolution_tests {
             src_rect: None,
             alpha: None,
             duotone: None,
+            blip_effects: Vec::new(),
         };
         let mut placeholders = LayoutPlaceholders::default();
         placeholders.by_idx.insert(9, transform);

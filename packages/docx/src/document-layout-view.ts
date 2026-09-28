@@ -73,6 +73,43 @@ export async function selectDocxLayoutView(
     && active.showTrackedChanges === requested.showTrackedChanges;
 }
 
+/** Reconcile a viewer-owned candidate before TerminalResourceOwner commits it.
+ * The load signal also owns a selection already awaiting the document worker:
+ * terminating that uncommitted candidate lets a superseded load settle quietly.
+ */
+export async function reconcilePendingDocxLayoutView(
+  document: DocxDocument,
+  signal: AbortSignal,
+  requestedView: () => boolean | undefined,
+  currentDate: () => Date | number | undefined,
+  requester: object,
+): Promise<void> {
+  let disposed = false;
+  const disposePending = () => {
+    if (disposed) return;
+    disposed = true;
+    document.destroy();
+  };
+  try {
+    while (!signal.aborted) {
+      const requested = requestedView();
+      if (requested === undefined || activeDocxLayoutViewOf(document).showTrackedChanges === requested) break;
+      signal.addEventListener('abort', disposePending, { once: true });
+      try {
+        await selectDocxLayoutView(document, {
+          showTrackedChanges: requested,
+          currentDate: currentDate(),
+        }, requester);
+      } finally {
+        signal.removeEventListener('abort', disposePending);
+      }
+    }
+  } catch (error) {
+    disposePending();
+    throw error;
+  }
+}
+
 /** Publish an installed document-global view to every borrowing Viewer. Called
  * only after geometry and worker metadata have atomically adopted that view. */
 export function publishDocxLayoutView(

@@ -2,6 +2,7 @@ use anyhow::Result;
 use rmcp::{transport::stdio, ServiceExt};
 use tracing_subscriber::{self, EnvFilter};
 
+mod parsed_cache;
 mod server;
 mod tools;
 

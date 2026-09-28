@@ -2,7 +2,7 @@ import type { OoxmlResourceUsageSnapshot } from '@silurus/ooxml-core';
 import {
   normalizeLoadResourceOptions,
   OoxmlResourceMetricsSession,
-  parseResourceLimitError,
+  parseTypedParserError,
   resourcePolicyForWasm,
 } from '@silurus/ooxml-core/worker';
 import {
@@ -48,31 +48,42 @@ interface XlsxArchiveConstructor {
 let runtimeModule: WebAssembly.Module | undefined;
 let runtimeHost: WasmRuntimeGenerationHost<XlsxNodeArchive> | undefined;
 
-function formatRuntime(module: WebAssembly.Module): WasmRuntimeGenerationHost<XlsxNodeArchive> {
+function formatRuntime(wasmModule: WebAssembly.Module): WasmRuntimeGenerationHost<XlsxNodeArchive> {
   if (!runtimeHost) {
-    runtimeModule = module;
+    runtimeModule = wasmModule;
     runtimeHost = new WasmRuntimeGenerationHost(
       xlsxWasm as unknown as WasmModuleRuntime,
-      module,
+      wasmModule,
     );
-  } else if (runtimeModule !== module) {
+  } else if (runtimeModule !== wasmModule) {
     throw new Error('XLSX runtime was already initialized with another WebAssembly.Module');
   }
   return runtimeHost;
 }
 
 export interface XlsxNodeAcquisition {
-  readonly archive: XlsxNodeArchive;
+  readonly archive: XlsxNodeSessionArchive;
   readonly workbookIndex: ParsedWorkbook;
   readonly usage: OoxmlResourceUsageSnapshot | undefined;
   readonly metrics: OoxmlResourceMetricsSession;
   closeArchive(): void;
 }
 
+/**
+ * The archive a Node XLSX session reads after acquisition: the XLSX parser
+ * archive, or a model-source archive whose ZIP accounting is optional.
+ */
+export interface XlsxNodeSessionArchive
+  extends Omit<XlsxNodeArchive, 'free' | 'resource_usage' | 'sheet_cursor_resource_usage'> {
+  /** Absent when the source has no ZIP accounting; absence is not zero usage. */
+  resource_usage?(): Uint8Array;
+  sheet_cursor_resource_usage?(): Uint8Array;
+}
+
 /** Format-owned archive acquisition and workbook-index projection for Node. */
 export async function acquireXlsxNodeSession(
   bytes: Uint8Array,
-  module: WebAssembly.Module,
+  wasmModule: WebAssembly.Module,
   options: XlsxNodeAcquisitionOptions = {},
 ): Promise<XlsxNodeAcquisition> {
   const resourceOptions = normalizeLoadResourceOptions(options);
@@ -91,7 +102,7 @@ export async function acquireXlsxNodeSession(
     throwIfAborted(options.signal);
     const [maxEntry, maxTotal, maxEntries] = resourcePolicyForWasm(resourceOptions.policy);
     const Archive = (xlsxWasm as unknown as { XlsxArchive: XlsxArchiveConstructor }).XlsxArchive;
-    handle = await formatRuntime(module).open(
+    handle = await formatRuntime(wasmModule).open(
       () => new Archive(bytes, maxEntry, maxTotal, maxEntries),
       {
         signal: options.signal,
@@ -116,7 +127,7 @@ export async function acquireXlsxNodeSession(
     };
   } catch (error) {
     try { handle?.close((archive: XlsxNodeArchive) => archive.free()); } catch {}
-    const normalized = parseResourceLimitError(error) ?? error;
+    const normalized = parseTypedParserError(error) ?? error;
     metrics.fail(normalized);
     throw normalized;
   }

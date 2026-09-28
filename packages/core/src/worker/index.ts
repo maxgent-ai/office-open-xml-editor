@@ -9,6 +9,7 @@ export { decodeDataUrl } from './decode-data-url.js';
 export {
   WasmParserHost,
   WasmTrapError,
+  detachWasmBindgenResource,
   isWasmTrap,
   type WasmTrapErrorCode,
   type WasmInit,
@@ -21,6 +22,7 @@ export {
   decodeOoxmlResourceUsage,
   deserializeWorkerError,
   parseResourceLimitError,
+  parseTypedParserError,
   serializeWorkerError,
   type WorkerErrorPayload,
 } from './error-wire.js';

@@ -159,6 +159,23 @@ describe('DocxViewer IX9 zoom contract — fitWidth / fitPage', () => {
 // IX9 F1 — family-unified pre-load setScale semantics (pinned across all five
 // viewers): a setScale before load is LATCHED and applied to the first render.
 describe('DocxViewer IX9 zoom contract — pre-load setScale latch (F1)', () => {
+  it('uses a zoom selected while a sliced load is pending on its first render', async () => {
+    installDom();
+    const canvas = makeEl('canvas');
+    const engine = new FakeDocxEngine(3, PAGE);
+    let finish!: (document: DocxDocument) => void;
+    vi.spyOn(DocxDocument, 'load').mockImplementation(() => new Promise((resolve) => {
+      finish = resolve;
+    }));
+    const viewer = new DocxViewer(canvas as unknown as HTMLCanvasElement);
+    const loading = viewer.load('x.docx');
+    await viewer.setScale(1.5);
+    finish(engine.asDoc());
+    await loading;
+    expect(lastRenderWidth(engine)).toBe(Math.round(NATURAL_W * 1.5));
+    viewer.destroy();
+  });
+
   it('setScale before load/layout is latched and applied once established (IX9 F1)', async () => {
     installDom();
     const canvas = makeEl('canvas');

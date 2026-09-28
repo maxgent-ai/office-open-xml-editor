@@ -35,9 +35,9 @@ const DEFAULT_ITERS = 5;
 function loadParser(relJs, relWasm) {
   const wasmPath = resolve(HERE, relWasm);
   const bytes = readFileSync(wasmPath);
-  const module = new WebAssembly.Module(bytes);
+  const wasmModule = new WebAssembly.Module(bytes);
   return import(resolve(HERE, relJs)).then((mod) => {
-    mod.initSync({ module });
+    mod.initSync({ module: wasmModule });
     return mod;
   });
 }

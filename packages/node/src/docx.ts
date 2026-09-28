@@ -87,6 +87,10 @@ export async function openDocxDocument(
   options: OpenDocxDocumentOptions,
 ): Promise<DocxDocumentSession> {
   if (!options?.factory) throw new TypeError('openDocxDocument requires a canvas factory');
+  if (__OOXML_MODEL_SOURCES__ && options.modelSources !== undefined) {
+    const { openDocxSource } = await import('./docx-model-source.ts');
+    return openDocxSource(buffer, options, getDocxWasmModule);
+  }
   const cjkFallback = resolveCjkFallback(options.cjkFallback);
   const acquired = await acquireDocxNodeDocument(
     toUint8(buffer),
@@ -111,7 +115,7 @@ export async function openDocxDocument(
     const layout = retained.layoutVariants.defaultLayout;
     const session = new DocxDocumentSessionImpl(
       acquired.closeArchive,
-      acquired.archive,
+      acquired.archive as unknown as DocxNodeArchive,
       acquired.result,
       services,
       layout,
@@ -142,6 +146,10 @@ export async function materializeDocxDocument(
   buffer: ArrayBuffer | Uint8Array,
   options: OoxmlNodeSessionOptions = {},
 ): Promise<DocxDocumentModel> {
+  if (__OOXML_MODEL_SOURCES__ && options.modelSources !== undefined) {
+    const { materializeDocxSource } = await import('./docx-model-source.ts');
+    return materializeDocxSource(buffer, options, getDocxWasmModule);
+  }
   return usingOwnedSession(
     async () => {
       const acquired = await acquireDocxNodeDocument(
@@ -188,7 +196,7 @@ type SessionState = Readonly<{
 type DefaultDocumentLayout =
   ReturnType<typeof retainRenderWorkerDocumentLayout>['layoutVariants']['defaultLayout'];
 
-class DocxDocumentSessionImpl implements DocxDocumentSession {
+export class DocxDocumentSessionImpl implements DocxDocumentSession {
   readonly pageCount: number;
   private readonly sizes: ReadonlyArray<Readonly<{ widthPt: number; heightPt: number }>>;
   private lastResourceUsage: OoxmlResourceUsageSnapshot | undefined;
@@ -359,3 +367,4 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
   error.name = 'AbortError';
   throw error;
 }
+declare const __OOXML_MODEL_SOURCES__: boolean;

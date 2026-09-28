@@ -1,10 +1,25 @@
+import { setFlagsFromString } from 'node:v8';
+import { runInNewContext } from 'node:vm';
 import { describe, expect, it } from 'vitest';
 import {
   ExactConvergenceError,
   convergeExactState,
+  convergeExactStateSteps,
   convergeLayout,
+  convergeLayoutSteps,
   type LayoutIteration,
 } from './convergence.js';
+
+setFlagsFromString('--expose-gc');
+const collectGarbage = runInNewContext('gc') as () => void;
+
+/** Collect after the current job: a WeakRef keeps its target alive until the
+ * job that created or dereferenced it ends. */
+async function collectedAfterJob(ref: WeakRef<object>): Promise<boolean> {
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  collectGarbage();
+  return ref.deref() === undefined;
+}
 
 const iteration = (fingerprint: string, pageCount: number): LayoutIteration => ({
   fingerprint,
@@ -130,5 +145,82 @@ describe('convergeExactState', () => {
       stateOf: (value) => value.state,
       limit: 0,
     })).toThrow(RangeError);
+  });
+
+  it('hands the next pass only the carried projection and returns the fixed-point value', () => {
+    type Pass = Readonly<{ state: string; payload: readonly number[] }>;
+    const received: Array<string | null> = [];
+    const carried: Pass[] = [];
+    const steps = convergeExactStateSteps<Pass, never, string>({
+      step: function* pass(previous, index) {
+        received.push(previous);
+        return Object.freeze({ state: index === 1 ? 'A' : 'B', payload: Object.freeze([index]) });
+      },
+      stateOf: (value) => value.state,
+      carry: (value) => {
+        carried.push(value);
+        return `carried:${value.state}`;
+      },
+      limit: 8,
+    });
+    let step = steps.next();
+    while (!step.done) step = steps.next();
+
+    expect(received).toEqual([null, 'carried:A', 'carried:B']);
+    // The fixed-point value is returned whole and is never projected.
+    expect(carried.map((value) => value.payload[0])).toEqual([1, 2]);
+    expect(step.value.value.payload).toEqual([3]);
+    expect(step.value.passes).toBe(3);
+  });
+
+  it('does not keep a superseded pass alive while the next pass is suspended', async () => {
+    type Pass = Readonly<{ state: string; payload: object }>;
+    let superseded: WeakRef<object> | undefined;
+    const steps = convergeExactStateSteps<Pass, 'suspended', string>({
+      step: function* pass(_previous, index) {
+        if (index === 1) {
+          const payload = {};
+          superseded = new WeakRef(payload);
+          return Object.freeze({ state: 'A', payload });
+        }
+        yield 'suspended';
+        return Object.freeze({ state: 'A', payload: {} });
+      },
+      stateOf: (value) => value.state,
+      carry: (value) => value.state,
+      limit: 4,
+    });
+
+    expect(steps.next()).toEqual({ done: false, value: 'suspended' });
+    expect(await collectedAfterJob(superseded!)).toBe(true);
+    const done = steps.next();
+    expect(done.done && done.value.passes).toBe(2);
+  });
+
+  it('releases the layout seed once its state and carried projection are derived', async () => {
+    type Iteration = LayoutIteration & Readonly<{ payload: object }>;
+    let seedPayload: WeakRef<object> | undefined;
+    const makeSeed = (): Iteration => {
+      const payload = {};
+      seedPayload = new WeakRef(payload);
+      return Object.freeze({ fingerprint: 'a', pageCount: 1, payload });
+    };
+    const received: number[] = [];
+    const steps = convergeLayoutSteps<Iteration, 'suspended', number>(
+      makeSeed(),
+      function* pass(pageCount) {
+        received.push(pageCount);
+        yield 'suspended';
+        return Object.freeze({ fingerprint: 'a', pageCount: 2, payload: {} });
+      },
+      4,
+      (current) => current.pageCount,
+    );
+
+    expect(steps.next()).toEqual({ done: false, value: 'suspended' });
+    expect(await collectedAfterJob(seedPayload!)).toBe(true);
+    const done = steps.next();
+    expect(done.done && done.value.pageCount).toBe(2);
+    expect(received).toEqual([1]);
   });
 });

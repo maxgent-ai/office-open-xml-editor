@@ -48,14 +48,17 @@ const BASE_1904_MS = Date.UTC(1904, 0, 1);
  *                 date system.
  */
 export function excelSerialToUtcDate(serial: number, date1904 = false): Date {
+  // `new Date` truncates fractional milliseconds, and a stored time fraction
+  // is rarely exact in binary (8:00 is 0.33333333333333331, a hair under
+  // 28 800 000 ms), so round to the nearest millisecond first.
   if (date1904) {
-    return new Date(BASE_1904_MS + serial * MS_PER_DAY);
+    return new Date(BASE_1904_MS + Math.round(serial * MS_PER_DAY));
   }
   // 1900 system: apply the Lotus leap-year-bug compensation. Serials < 60 sit
   // before the phantom 1900-02-29 and are one day short under the bug-free
   // 1899-12-30 epoch, so add a day back. Serials ≥ 60 need no adjustment.
   const adjusted = serial < 60 ? serial + 1 : serial;
-  return new Date(BASE_1900_MS + adjusted * MS_PER_DAY);
+  return new Date(BASE_1900_MS + Math.round(adjusted * MS_PER_DAY));
 }
 
 /**

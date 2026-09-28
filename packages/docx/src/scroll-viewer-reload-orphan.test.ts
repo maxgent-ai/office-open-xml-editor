@@ -138,9 +138,7 @@ describe('DocxScrollViewer.load() — no orphaned engine on re-load (SC20)', () 
     vi.spyOn(DocxDocument, 'load').mockResolvedValue(engine.asDoc());
 
     const loading = v.load('one.docx');
-    await Promise.resolve();
-    await Promise.resolve();
-    expect(engine.renderCalls).toHaveLength(1);
+    await vi.waitFor(() => expect(engine.renderCalls).toHaveLength(1));
     engine.renderCalls[0].reject(failure);
 
     await expect(loading).rejects.toBe(failure);

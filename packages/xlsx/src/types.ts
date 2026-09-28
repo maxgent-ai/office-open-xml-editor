@@ -31,8 +31,8 @@ export interface Workbook {
    *  break it can't be attributed to one placeholder sheet. Tagged with the
    *  offending part (e.g. `"xl/sharedStrings.xml: <detail>"`) so the loss is
    *  surfaced instead of silent, while every sheet still renders its non-string
-   *  content. Absent (`undefined`) when every shared part read cleanly. Also set
-   *  (`"(zip container): <detail>"`) for a whole-container degradation (#774). */
+   *  content. Absent (`undefined`) when every shared part read cleanly. Input that
+   *  is not a SpreadsheetML package is rejected with `OoxmlError('not-ooxml')`. */
   parseError?: string;
 }
 
@@ -91,6 +91,9 @@ export interface Worksheet {
    *  `colWidths[c] === 0`. Only `true` entries. */
   colHidden?: Record<number, boolean>;
   defaultColWidth: number;
+  /** `<sheetFormatPr baseColWidth>` (§18.3.1.81), when no explicit
+   *  `defaultColWidth` is authored. */
+  baseColWidth?: number;
   defaultRowHeight: number;
   /** `<sheetFormatPr customHeight>` (ECMA-376 §18.3.1.81). When true, rows
    *  without their own `ht` use the manually authored sheet default instead of
@@ -167,6 +170,15 @@ export interface Worksheet {
   defaultFontFamily?: string;
   /** Point size of the workbook's Normal-style font (`<fonts>[N].sz.val`). */
   defaultFontSize?: number;
+  /** Bold/italic bits of the Normal-style font selected by cellStyleXfs[0].
+   * Omitted means false; MDW must use the same face tuple as Excel. */
+  defaultFontBold?: boolean;
+  defaultFontItalic?: boolean;
+  /** Workbook theme major Jpan face (`<a:majorFont><a:font script="Jpan">`).
+   *  Used only for scheme-marked cells under the Japanese Mac Excel locale. */
+  themeJapaneseMajorFont?: string;
+  /** Workbook theme minor Jpan face; see `themeJapaneseMajorFont`. */
+  themeJapaneseMinorFont?: string;
   /** Workbook date system (`<workbookPr date1904>`, ECMA-376 §18.2.28),
    *  denormalized onto every worksheet by the parser so the cell formatter can
    *  resolve serial dates (§18.17.4.1) without a workbook back-reference.
@@ -198,6 +210,37 @@ export interface PivotTableMetadata {
   cacheSource?: PivotCacheSource;
   status: PivotMetadataStatus;
   extensionUris?: string[];
+  /** ECMA-376 §18.10.1.97 applied PivotTable style, elements resolved. */
+  style?: PivotTableStyle;
+  /** ECMA-376 §18.10.1.84 row items, one per body row. */
+  rowItems?: PivotAxisItem[];
+  /** ECMA-376 §18.10.1.19 column items, one per data column. */
+  columnItems?: PivotAxisItem[];
+}
+
+export interface PivotTableStyle {
+  name: string;
+  showRowHeaders: boolean;
+  showColumnHeaders: boolean;
+  showRowStripes: boolean;
+  showColumnStripes: boolean;
+  showLastColumn: boolean;
+  elements: PivotTableStyleElement[];
+}
+
+export interface PivotTableStyleElement {
+  /** ECMA-376 §18.18.77 ST_TableStyleType. */
+  kind: string;
+  /** Stripe band size (§18.8.41). */
+  size: number;
+  dxf: Dxf;
+}
+
+export interface PivotAxisItem {
+  /** ECMA-376 §18.18.43 ST_ItemType (`data`, `default`, …, `grand`, `blank`). */
+  kind: string;
+  /** Zero-based field level of the item. */
+  depth: number;
 }
 
 export interface PivotLocation extends WorksheetCellRange {
@@ -476,6 +519,7 @@ export type {
   ChartErrBars,
   ChartManualLayout,
   LegendManualLayout,
+  BlipEffect,
 } from '@silurus/ooxml-core';
 export interface ChartAnchor {
   /** DrawingML document order; higher values paint above lower values. */
@@ -587,6 +631,10 @@ export interface ShapeParagraph {
   /** `<a:pPr@indent>` — first-line indent in EMU (negative = hanging),
    *  ECMA-376 §21.1.2.2.7. Omitted (undefined) when unset. */
   indent?: number;
+  /** `<a:pPr@defTabSz>` — default tab interval in EMU; omitted when unset. */
+  defTabSz?: number;
+  /** Authored `<a:pPr>/<a:tabLst>/<a:tab>` stops, in EMU. */
+  tabStops?: { pos: number; algn: string }[];
   /** `<a:pPr>/<a:lnSpc>` line spacing (ECMA-376 §21.1.2.2.5). Direct-only;
    *  omitted when unset. */
   spaceLine?: SpaceLine | null;
@@ -608,17 +656,13 @@ export type ShapeTextRun =
       size: number;
       color?: string;
       fontFace?: string;
-      /** East-Asian typeface (`<a:ea@typeface>`, ECMA-376 §21.1.2.3.1). The
-       *  common Japanese encoding sets Meiryo here while leaving `<a:latin>`
-       *  default; the renderer floors the line box by this face's design line
-       *  too (see `drawShapeText`). Undefined when the run declares no `<a:ea>`. */
+      /** East-Asian typeface (`<a:ea@typeface>`, ECMA-376 §21.1.2.3.1).
+       *  A distinct face is retained for future script-run routing; the
+       *  single-resource Office line projection declines mixed face slots. */
       fontFaceEa?: string;
       /** Complex-script typeface (`<a:cs@typeface>`, ECMA-376 §21.1.2.3.1).
-       *  Parsed/modeled but NOT used in the line-box floor: the cs face renders
-       *  only complex-script glyphs (Arabic/Hebrew/Thai), so flooring the whole
-       *  line box by it would over-grow Latin/CJK runs (deferred to per-glyph
-       *  handling — see `drawShapeText`). Undefined when the run declares no
-       *  `<a:cs>`. */
+       *  A distinct face is not applied to a whole-line metric until script
+       *  runs can be resolved independently. */
       fontFaceCs?: string;
     }
   | { type: 'break' }
@@ -686,6 +730,11 @@ export interface Duotone {
 export interface PathInfo {
   w: number;
   h: number;
+  /** ECMA-376 §20.1.9.15 `a:path@fill` when not `norm` (ST_PathFillMode
+   *  §20.1.10.37). `none` leaves the path unfilled. */
+  fill?: 'none' | 'lighten' | 'lightenLess' | 'darken' | 'darkenLess';
+  /** ECMA-376 §20.1.9.15 `a:path@stroke`; present only when `false`. */
+  stroke?: false;
   commands: PathCmd[];
 }
 
@@ -723,6 +772,10 @@ export interface ImageAnchor {
    *  size. Authoritative when `editAs === "oneCell"`. 0 = unavailable. */
   nativeExtCx: number;
   nativeExtCy: number;
+  /** Non-identity `<a:xfrm>` transform. Rotation is clockwise degrees. */
+  rotation?: number;
+  flipH?: boolean;
+  flipV?: boolean;
   /** Zip path of the blip inside the package (e.g. `xl/media/image1.png`). The
    *  blip's own `r:embed` raster fallback when an svgBlip extension is present;
    *  otherwise the only source. Falls back to the SVG part itself when the
@@ -782,15 +835,26 @@ export interface ConditionalFormat {
   rules: CfRule[];
 }
 
+/**
+ * One `<cfRule>` (ECMA-376 §18.3.1.10). `stopIfTrue`: once this rule matches
+ * a cell, no lower-priority rule applies to that cell. Every rule type carries
+ * it (`expression` always; the others only when set, so an absent value means
+ * false), including `colorScale` / `dataBar` / `iconSet`, which match every
+ * numeric cell they format while their optional `activeFormula` (the rule's
+ * own formula, [MS-XLSX] 2.6.27) is nonzero. Formulas are not evaluated: an
+ * activity formula or `cellIs` operand is used only when it is a literal or
+ * a single-cell reference to a cached value, and otherwise the rule does not
+ * match.
+ */
 export type CfRule =
-  | { type: 'cellIs'; operator: string; formulas: string[]; dxfId: number | null; priority: number }
+  | { type: 'cellIs'; operator: string; formulas: string[]; dxfId: number | null; priority: number; stopIfTrue?: boolean }
   | { type: 'expression'; formula: string; dxfId: number | null; priority: number; stopIfTrue: boolean }
-  | { type: 'colorScale'; stops: CfStop[]; priority: number }
-  | { type: 'dataBar'; color: string; min: CfValue; max: CfValue; priority: number; gradient: boolean }
-  | { type: 'top10'; top: boolean; percent: boolean; rank: number; dxfId: number | null; priority: number }
-  | { type: 'aboveAverage'; aboveAverage: boolean; equalAverage?: boolean; stdDev?: number; dxfId: number | null; priority: number }
-  | { type: 'iconSet'; iconSet: string; cfvos: CfValue[]; reverse: boolean; priority: number; customIcons?: CfIcon[] }
-  | { type: 'other'; kind: string; priority: number };
+  | { type: 'colorScale'; stops: CfStop[]; priority: number; activeFormula?: string; stopIfTrue?: boolean }
+  | { type: 'dataBar'; color: string; min: CfValue; max: CfValue; priority: number; gradient: boolean; activeFormula?: string; stopIfTrue?: boolean }
+  | { type: 'top10'; top: boolean; percent: boolean; rank: number; dxfId: number | null; priority: number; stopIfTrue?: boolean }
+  | { type: 'aboveAverage'; aboveAverage: boolean; equalAverage?: boolean; stdDev?: number; dxfId: number | null; priority: number; stopIfTrue?: boolean }
+  | { type: 'iconSet'; iconSet: string; cfvos: CfValue[]; reverse: boolean; priority: number; customIcons?: CfIcon[]; activeFormula?: string; stopIfTrue?: boolean }
+  | { type: 'other'; kind: string; priority: number; stopIfTrue?: boolean };
 
 export interface CfIcon {
   iconSet: string;
@@ -845,10 +909,9 @@ export interface Cell {
    *  its column's `<col style>` in the parser; absent here means Normal (0).
    *  Explicit `c/@s="0"` remains distinct while inheritance is resolved. */
   styleIndex?: number;
-  /** Raw `<f>` formula text (ECMA-376 §18.3.1.40), when present. The renderer
-   *  uses this to recompute volatile functions (TODAY, NOW) at display time
-   *  so the cached `<v>` — frozen when the file was last saved — doesn't
-   *  show a stale date. */
+  /** Raw `<f>` formula text (ECMA-376 §18.3.1.40), when present. It is
+   *  informational only (for example selection context): formulas are never
+   *  calculated, and the cell always renders its cached `value`. */
   formula?: string;
   /** Whether this cell displays its phonetic hint (furigana). The parser
    *  resolves it as `cell/@ph ?? row/@ph ?? false` — the per-cell `<c ph>`
@@ -945,6 +1008,10 @@ export interface RunFont {
    * Absent leaves the run on the baseline.
    */
   vertAlign?: 'superscript' | 'subscript';
+  /** The run's `<rPr>` color is confirmed to be authored exactly like the
+   *  Normal style font's color. Excel then draws a table style's font color
+   *  over it; any other run keeps its own color. Omitted = false. */
+  normalColor?: boolean;
 }
 
 export interface SharedString {
@@ -981,6 +1048,24 @@ export interface Dxf {
    *  style numFmt for rendering — e.g. switching a calendar cell from `d` to
    *  `m"月"d"日"` on the first day of each month. */
   numFmt?: NumFmt | null;
+  /** The dxf `<font>` toggles as authored, present when the dxf has a
+   *  `<font>`: `font.bold` etc. cannot tell an absent element from an
+   *  explicit off, which a differential format needs (see DxfFontToggles). */
+  fontToggles?: DxfFontToggles;
+}
+
+/**
+ * A differential font's toggles (ECMA-376 §18.8.14-15 dxf, §18.8.2 b
+ * CT_BooleanProperty `val` default true): a key is absent when the dxf's
+ * `<font>` omits the element (no change) and `false` for an explicit off
+ * (`val="0"`, or `<u val="none"/>`), which turns off what an earlier format
+ * turned on.
+ */
+export interface DxfFontToggles {
+  bold?: boolean;
+  italic?: boolean;
+  underline?: boolean;
+  strike?: boolean;
 }
 
 export interface CellFont {
@@ -991,6 +1076,10 @@ export interface CellFont {
   size: number;
   color: string | null;
   name: string | null;
+  /** ECMA-376 §18.8.33: authored major/minor theme reference, distinct from name. */
+  scheme?: 'major' | 'minor';
+  /** Authored SpreadsheetML charset metadata; it does not select a face alone. */
+  charset?: number;
   /** ECMA-376 §18.4.13 ST_UnderlineValues — see RunFont.underlineStyle. */
   underlineStyle?: string;
   /** ECMA-376 §18.4.6 ST_VerticalAlignRun on a cell-level <font>. */
@@ -1054,12 +1143,23 @@ export interface CellXf {
   /** `<alignment readingOrder>` (ECMA-376 §18.8.1) — 0 = context (default),
    *  1 = LTR, 2 = RTL. Drives canvas `direction`. */
   readingOrder?: number;
+  /** The font color is the cell's own formatting: the cell font's `<color>`,
+   *  or its cell style's, is authored differently from the Normal style font's.
+   *  Excel draws it over a table style's element font color. Omitted = false. */
+  ownFontColor?: boolean;
 }
 
 export interface ParsedWorkbook {
   workbook: Workbook;
   styles: Styles;
   sharedStrings: SharedString[];
+  /**
+   * Host layout settled before parsing for a model-source workbook whose
+   * archive asked the host to measure its Normal font (ECMA-376 §18.3.1.13
+   * maximum digit width, in CSS pixels). Absent for OOXML packages, whose grid
+   * measures the Normal font when it binds a worksheet.
+   */
+  layoutMetrics?: { maximumDigitWidth: number };
 }
 
 export interface ViewportRange {
@@ -1130,6 +1230,13 @@ export interface XlsxChromeColors {
  * frame-local decoded image map, so these fields are not part of its public
  * method contract. */
 export interface RenderViewportOptions extends XlsxRenderViewportOptions {
+  /** @internal Viewer/main-realm MDW for identical hit testing and worker paint.
+   * Reapply after every font bind, including render-local row-height clones. */
+  authoritativeMdw?: number;
+  /** @internal Exact local resources retained in this canvas's FontFaceSet. */
+  officeFontRoutes?: Readonly<Record<string, import('@silurus/ooxml-core').OfficeFontFallbackRoute>>;
+  /** @internal Preserve the caller's explicit Google Fonts substitution opt-in. */
+  googleSubstitutes?: boolean;
   /** @internal Viewer chrome only; never applied to authored worksheet content. */
   chromeColors?: XlsxChromeColors;
   loadedImages?: Map<string, CanvasImageSource | null>;
@@ -1149,6 +1256,10 @@ export type WorkerRequest =
       id: number;
       data: ArrayBuffer;
       resourcePolicy: NormalizedOoxmlResourcePolicy;
+      /** Application-selected model source (LoadOptions.modelSources). */
+      source?: import('@silurus/ooxml-core').ModelSourceModuleDescriptor;
+      sourceTransfer?: readonly Transferable[];
+      sourceOwnerUrl?: string;
     }
   | ({ type: 'openSheetSession'; id: number; sheetIndex: number; sheetName: string } &
       PullSessionIdentity<number>)
@@ -1173,9 +1284,12 @@ export type WorkerResponse =
       id: number;
       workbookJson: ArrayBuffer;
       usage?: OoxmlResourceUsageSnapshot;
+      /** Host layout settled for a model source (see ParsedWorkbook.layoutMetrics). */
+      layoutMetrics?: { maximumDigitWidth: number };
     }
   | ({ type: 'sheetSessionOpened'; id: number } & PullSessionIdentity<number>)
   | { type: 'imageExtracted'; id: number; bytes: ArrayBuffer }
-  | { type: 'resourceUsage'; id: number; usage: import('@silurus/ooxml-core').OoxmlResourceUsageSnapshot }
+  // `usage` is absent when the loaded model source has no ZIP accounting.
+  | { type: 'resourceUsage'; id: number; usage?: import('@silurus/ooxml-core').OoxmlResourceUsageSnapshot }
   | { type: 'markdownRendered'; id: number; markdown: string }
   | ({ type: 'error'; id: number } & WorkerErrorPayload);

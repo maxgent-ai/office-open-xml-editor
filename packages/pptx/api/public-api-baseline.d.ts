@@ -24,6 +24,25 @@ export interface BlipBullet {
     sizePct: number | null;
     sizePts?: number;
 }
+export type BlipEffect = {
+    type: 'grayscale';
+} | {
+    type: 'biLevel';
+    thresh: number;
+} | {
+    type: 'colorChange';
+    from: string;
+    fromAlpha: number;
+    to: string;
+    toAlpha: number;
+    useAlpha: boolean;
+} | {
+    type: 'luminance';
+    bright: number;
+    contrast: number;
+} | {
+    type: 'duotone';
+};
 export function buildPptxHighlightLayer(layer: HTMLDivElement, runs: PptxTextRunInfo[], matches: PptxHighlightMatch[], cssWidth: number, cssHeight: number, measureForFont: (font: string) => (s: string) => number, colors?: PptxHighlightColors): void;
 export function buildPptxTextLayer(layer: HTMLDivElement, runs: PptxTextRunInfo[], cssWidth: number, cssHeight: number, onHyperlinkClick?: (target: HyperlinkTarget) => void, slideIndex?: number): void;
 export type Bullet = Bullet__emitterCollision1 | BlipBullet;
@@ -56,6 +75,10 @@ export interface Camera3d {
 export interface ChartAreaGroupDecorations {
     groupIndex: number;
     dropLines?: ChartDecorationLineStyle | null;
+}
+export interface ChartAxisNumberFormat {
+    authoredCode: string;
+    sourceLinked?: boolean | null;
 }
 export interface ChartBarGroupDecorations {
     groupIndex: number;
@@ -384,6 +407,7 @@ export interface ChartModel {
     title: string | null;
     titleRichRuns?: ChartTextRun[] | null;
     titlePresent?: boolean;
+    authoredWithoutSeries?: boolean;
     categories: string[];
     categorySourceHidden?: boolean[] | null;
     categoryLevels?: string[][] | null;
@@ -463,6 +487,7 @@ export interface ChartModel {
     subtotalIndices: number[];
     legendManualLayout?: LegendManualLayout | null;
     valAxisFormatCode?: string | null;
+    valAxisNumberFormat?: ChartAxisNumberFormat | null;
     valAxisDisplayUnits?: ChartDisplayUnits | null;
     catAxisDisplayUnits?: ChartDisplayUnits | null;
     barGapWidth?: number | null;
@@ -551,6 +576,7 @@ export interface ChartModel {
     valAxisLineDash?: string | null;
     valAxisLinePaintAuthored?: boolean | null;
     catAxisFormatCode?: string | null;
+    catAxisNumberFormat?: ChartAxisNumberFormat | null;
     catAxisMin?: number | null;
     catAxisMax?: number | null;
     titleManualLayout?: ChartManualLayout | null;
@@ -1066,6 +1092,7 @@ export interface ImageFill {
     tile?: TileInfo;
     alpha?: number;
     duotone?: Duotone;
+    blipEffects?: BlipEffect[];
 }
 export interface ImageResourceOptions {
     decodedByteBudget?: number;
@@ -1103,6 +1130,7 @@ interface LoadOptions__emitterCollision1 {
     useGoogleFonts?: boolean;
     cjkFallback?: CjkFallback;
     password?: string;
+    modelSources?: readonly ModelSource[];
     wasmUrl?: string | URL;
     maxZipEntryBytes?: number;
     resourceLimits?: OoxmlResourceLimits;
@@ -1250,6 +1278,29 @@ export interface MediaElement {
     mediaPath: string;
     mimeType: string;
 }
+const MODEL_SOURCE_MODULE_PROTOCOL = 'ooxml-model-source-module/v1';
+export interface ModelSource<T extends ModelSourceTarget = ModelSourceTarget> {
+    readonly target: T;
+    claim(bytes: Uint8Array): boolean;
+    beginLoad(): ModelSourceLoad;
+}
+export type ModelSourceConfig = Readonly<Record<string, ModelSourceConfigValue>>;
+export type ModelSourceConfigValue = string | number | boolean | null;
+export interface ModelSourceLoad {
+    readonly module: ModelSourceModuleDescriptor;
+    readonly transfer?: readonly Transferable[];
+    release(): void;
+}
+export interface ModelSourceModule<TArchive = unknown> {
+    openModelSource(bytes: Uint8Array, config: ModelSourceConfig, signal?: AbortSignal, transfer?: readonly Transferable[]): Promise<OpenedModelSource<TArchive>>;
+}
+export interface ModelSourceModuleDescriptor {
+    readonly protocol: typeof MODEL_SOURCE_MODULE_PROTOCOL;
+    readonly target: ModelSourceTarget;
+    readonly moduleUrl: string;
+    readonly config: ModelSourceConfig;
+}
+export type ModelSourceTarget = 'docx' | 'xlsx' | 'pptx';
 export interface NoFill {
     fillType: 'none';
 }
@@ -1260,12 +1311,12 @@ export class OoxmlDecodedImageLimitError extends RangeError {
     readonly code: 'ooxml-decoded-image-limit';
     constructor(metric: OoxmlDecodedImageLimitMetric, limit: number, observed: number);
 }
-export type OoxmlDecodedImageLimitMetric = 'image-dimension' | 'image-pixels' | 'active-decoded-bytes';
+export type OoxmlDecodedImageLimitMetric = 'image-dimension' | 'image-pixels' | 'active-decoded-bytes' | 'image-effect-count' | 'image-effect-work';
 export class OoxmlError extends Error {
     readonly code: OoxmlErrorCode;
     constructor(code: OoxmlErrorCode, message: string);
 }
-export type OoxmlErrorCode = 'encrypted' | 'invalid-password' | 'unsupported-encryption' | 'legacy-binary-format' | 'not-ooxml';
+export type OoxmlErrorCode = 'encrypted' | 'invalid-password' | 'unsupported-encryption' | 'legacy-binary-format' | 'not-ooxml' | 'invalid-numbering';
 export type OoxmlErrorStage = 'container' | 'decompression' | 'parsing' | 'serialization' | 'layout' | 'rendering' | 'worker';
 export type OoxmlFormat = 'docx' | 'xlsx' | 'pptx';
 export type OoxmlResourceLimit = number | null;
@@ -1332,6 +1383,11 @@ export interface OoxmlResourceViolation {
     readonly configurable: boolean;
     readonly usage: OoxmlResourceUsageSnapshot;
 }
+export interface OpenedModelSource<TArchive> {
+    readonly archive: TArchive;
+    readonly viewDefaults?: Readonly<Record<string, boolean>>;
+    close(): void;
+}
 export function openExternalHyperlink(url: string, allowed?: readonly string[], win?: Pick<Window, 'open'> | undefined): boolean;
 export interface Paragraph extends Paragraph__emitterCollision1 {
     eaLnBrk: boolean;
@@ -1344,6 +1400,8 @@ interface Paragraph__emitterCollision1 {
     indent: number;
     spaceBefore: number | null;
     spaceAfter: number | null;
+    spaceBeforePct?: number;
+    spaceAfterPct?: number;
     spaceLine: SpaceLine | null;
     lvl: number;
     bullet: Bullet__emitterCollision1;
@@ -1409,6 +1467,7 @@ export interface PictureElement {
     intrinsicWidthPx?: number;
     intrinsicHeightPx?: number;
     stroke: Stroke | null;
+    fill?: Fill;
     prstGeom?: string;
     prstAdjust?: number[];
     srcRect?: {
@@ -1419,6 +1478,7 @@ export interface PictureElement {
     };
     alpha?: number;
     duotone?: Duotone;
+    blipEffects?: BlipEffect[];
     custGeom?: PathCmd[][] | null;
     shadow?: Shadow;
     innerShadow?: Shadow;
@@ -1812,6 +1872,7 @@ export interface SecondaryValueAxis {
     title: string | null;
     hidden: boolean;
     formatCode?: string | null;
+    numberFormat?: ChartAxisNumberFormat | null;
     displayUnits?: ChartDisplayUnits | null;
     fontColor?: string | null;
     fontPaintAuthored?: boolean | null;
@@ -1885,6 +1946,10 @@ export interface ShapeElement {
     textBody: TextBody | null;
     defaultTextColor: string | null;
     custGeom: PathCmd[][] | null;
+    custGeomPaint?: {
+        fill: string | null;
+        stroke: boolean;
+    }[];
     adj: number | null;
     adj2: number | null;
     adj3: number | null;
@@ -2018,6 +2083,7 @@ export interface TabStop {
 }
 export interface TextBody extends TextBody__emitterCollision1 {
     rtlCol?: boolean;
+    spcFirstLastPara?: boolean;
     textWarp?: {
         preset: string;
         adj?: number[];

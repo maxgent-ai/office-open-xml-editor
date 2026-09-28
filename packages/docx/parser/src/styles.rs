@@ -295,6 +295,10 @@ pub struct RawTblBorders {
     pub right: Option<EdgeBorder>,
     pub inside_h: Option<EdgeBorder>,
     pub inside_v: Option<EdgeBorder>,
+    /// §17.4.73 / §17.4.79 cell diagonals, meaningful only in a style's
+    /// `w:tcPr/w:tcBorders` (CT_TblBorders has no diagonal).
+    pub tl2br: Option<EdgeBorder>,
+    pub tr2bl: Option<EdgeBorder>,
 }
 
 /// Conditional formatting block (`w:tblStylePr`) — the subset we resolve.
@@ -1376,7 +1380,8 @@ pub fn parse_para_fmt(ppr: roxmltree::Node) -> ParaFmt {
         // ilvl defaults to 0 when absent
         fmt.num_level = child_w(pnpr, "ilvl")
             .and_then(|n| attr_w(n, "val"))
-            .and_then(|v| v.parse().ok())
+            .and_then(|v| crate::numbering::parse_word_ilvl(&v).ok())
+            .map(u32::from)
             .or(Some(0));
         if let Some(nid) = child_w(pnpr, "numId") {
             fmt.num_id = attr_w(nid, "val").and_then(|v| v.parse().ok());
@@ -1415,11 +1420,7 @@ pub fn parse_para_fmt(ppr: roxmltree::Node) -> ParaFmt {
 
     // Paragraph shading
     if let Some(shd) = child_w(ppr, "shd") {
-        if let Some(fill) = attr_w(shd, "fill") {
-            if fill != "auto" && fill.len() == 6 {
-                fmt.shading = Some(fill.to_lowercase());
-            }
-        }
+        fmt.shading = shading_fill(shd);
     }
 
     // Page break before paragraph
@@ -2082,16 +2083,13 @@ pub fn parse_run_fmt(rpr: roxmltree::Node) -> RunFmt {
             .or_else(|| fmt.font_family_cs_direct.clone());
     }
 
-    // Run shading (ECMA-376 §17.3.2.32 w:shd). We adopt `@w:fill` only; `@w:val`
-    // (the pattern) and `@w:color` are not modeled. `val="clear"` (inverse
-    // video) is exact since only the fill is visible, but `val="solid"` etc.
-    // drop information by ignoring the pattern foreground.
+    // ECMA-376 §17.3.2.32 / §17.18.78 names percentage shading patterns.
+    // Word for Mac PDF output paints run-level pct15/pct20/pct25 as a uniform
+    // foreground/fill blend, including explicit red and automatic-black
+    // foregrounds over white and blue fills. Keep this Office-observed rule
+    // local to runs; paragraph/cell/shape patterns have different paint paths.
     if let Some(shd) = child_w(rpr, "shd") {
-        if let Some(fill) = attr_w(shd, "fill") {
-            if fill != "auto" && fill.len() == 6 {
-                fmt.background = Some(fill.to_lowercase());
-            }
-        }
+        fmt.background = shading_fill(shd);
     }
 
     // Vertical alignment (superscript / subscript)
@@ -2254,11 +2252,83 @@ pub fn parse_run_fmt(rpr: roxmltree::Node) -> RunFmt {
 
 // ===== Table style parsing =====
 
+/// Table-style cell shading: the same ECMA-376 `w:shd` semantics as
+/// paragraph/run shading, so percentage patterns blend identically.
 fn shd_fill(node: roxmltree::Node) -> Option<String> {
-    child_w(node, "shd")
-        .and_then(|s| attr_w(s, "fill"))
-        .filter(|f| f != "auto" && f.len() == 6)
-        .map(|f| f.to_lowercase())
+    child_w(node, "shd").and_then(shading_fill)
+}
+
+fn shd_fill_color(shd: roxmltree::Node) -> Option<String> {
+    let fill = attr_w(shd, "fill")?;
+    if fill != "auto" && fill.len() == 6 && fill.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(fill.to_lowercase())
+    } else {
+        None
+    }
+}
+
+/// ECMA-376 `w:shd` (paragraph §17.3.1.31, run §17.3.2.32, table cell and
+/// table-style cell §17.4.32/§17.4.33) as one displayed fill. The element has
+/// the same semantics in every location: ST_Shd `pctN` (§17.18.78) is an N%
+/// `w:color` pattern over `w:fill`, which Word paints as one solid color (its
+/// PDF of a `pct15` run with an automatic pattern color over white is
+/// #D9D9D9). Other patterns keep the fill-only projection.
+pub(crate) fn shading_fill(shd: roxmltree::Node) -> Option<String> {
+    let fill = shd_fill_color(shd)?;
+    // ST_Shd's pct12/pct37/pct62/pct87 mean 12.5/37.5/62.5/87.5%,
+    // respectively (§17.18.78), not the integer encoded in their names.
+    // Represent every legal percentage shade in tenths of a percent so the
+    // Office-observed 8-bit coverage conversion below stays exact.
+    let Some(percent_tenths): Option<u16> =
+        attr_w(shd, "val").as_deref().and_then(|value| match value {
+            "pct5" => Some(50),
+            "pct10" => Some(100),
+            "pct12" => Some(125),
+            "pct15" => Some(150),
+            "pct20" => Some(200),
+            "pct25" => Some(250),
+            "pct30" => Some(300),
+            "pct35" => Some(350),
+            "pct37" => Some(375),
+            "pct40" => Some(400),
+            "pct45" => Some(450),
+            "pct50" => Some(500),
+            "pct55" => Some(550),
+            "pct60" => Some(600),
+            "pct62" => Some(625),
+            "pct65" => Some(650),
+            "pct70" => Some(700),
+            "pct75" => Some(750),
+            "pct80" => Some(800),
+            "pct85" => Some(850),
+            "pct87" => Some(875),
+            "pct90" => Some(900),
+            "pct95" => Some(950),
+            _ => None,
+        })
+    else {
+        return Some(fill);
+    };
+    let foreground = match attr_w(shd, "color") {
+        None => "000000".to_string(),
+        Some(color) if color == "auto" => "000000".to_string(),
+        Some(color) if color.len() == 6 && color.chars().all(|c| c.is_ascii_hexdigit()) => color,
+        _ => return Some(fill),
+    };
+    // PDF color operands reveal an 8-bit foreground coverage before mixing:
+    // pct50 over white is 127/255 (not the 128 from a direct 50% gray round).
+    let alpha = ((u32::from(percent_tenths) * 255 + 500) / 1000) as u16;
+    let blend = |index: usize| -> Option<u8> {
+        let bg = u8::from_str_radix(fill.get(index..index + 2)?, 16).ok()?;
+        let fg = u8::from_str_radix(foreground.get(index..index + 2)?, 16).ok()?;
+        Some(((u16::from(bg) * (255 - alpha) + u16::from(fg) * alpha + 127) / 255) as u8)
+    };
+    Some(format!(
+        "{:02x}{:02x}{:02x}",
+        blend(0)?,
+        blend(2)?,
+        blend(4)?
+    ))
 }
 
 fn parse_edge_border(node: roxmltree::Node) -> EdgeBorder {
@@ -2293,6 +2363,8 @@ fn parse_raw_tbl_borders(node: roxmltree::Node) -> RawTblBorders {
             "right" | "end" => b.right = Some(e),
             "insideH" => b.inside_h = Some(e),
             "insideV" => b.inside_v = Some(e),
+            "tl2br" => b.tl2br = Some(e),
+            "tr2bl" => b.tr2bl = Some(e),
             _ => {}
         }
     }
@@ -2317,6 +2389,12 @@ fn merge_raw_borders(dst: &mut RawTblBorders, src: &RawTblBorders) {
     }
     if src.inside_v.is_some() {
         dst.inside_v = src.inside_v.clone();
+    }
+    if src.tl2br.is_some() {
+        dst.tl2br = src.tl2br.clone();
+    }
+    if src.tr2bl.is_some() {
+        dst.tr2bl = src.tr2bl.clone();
     }
 }
 
@@ -2940,6 +3018,35 @@ mod tests {
     }
 
     #[test]
+    fn percentage_run_shading_uses_office_pdf_blend() {
+        // Word for Mac PDF: percentage run shading is a uniform blend, not
+        // the dotted bitmap illustrated by the ST_Shd enum examples.
+        for (value, color, fill, expected) in [
+            ("pct15", "auto", "FFFFFF", "d9d9d9"),
+            ("pct20", "auto", "FFFFFF", "cccccc"),
+            ("pct25", "auto", "FFFFFF", "bfbfbf"),
+            ("pct5", "auto", "FFFFFF", "f2f2f2"),
+            ("pct12", "auto", "FFFFFF", "dfdfdf"),
+            ("pct37", "auto", "FFFFFF", "9f9f9f"),
+            ("pct50", "auto", "FFFFFF", "7f7f7f"),
+            ("pct62", "auto", "FFFFFF", "606060"),
+            ("pct87", "auto", "FFFFFF", "202020"),
+            ("pct15", "FF0000", "FFFFFF", "ffd9d9"),
+            ("pct15", "auto", "0000FF", "0000d9"),
+        ] {
+            let fmt = run_fmt_from(&format!(
+                r#"<w:shd w:val="{value}" w:color="{color}" w:fill="{fill}"/>"#
+            ));
+            assert_eq!(fmt.background.as_deref(), Some(expected));
+        }
+        let mut inherited =
+            run_fmt_from(r#"<w:shd w:val="pct15" w:color="auto" w:fill="FFFFFF"/>"#);
+        let clear = run_fmt_from(r#"<w:shd w:val="clear" w:fill="EEEEEE"/>"#);
+        apply_run(&mut inherited, &clear);
+        assert_eq!(inherited.background.as_deref(), Some("eeeeee"));
+    }
+
+    #[test]
     fn explicit_hex_color_is_lowercased() {
         let fmt = run_fmt_from(r#"<w:color w:val="FF0000"/>"#);
         assert_eq!(fmt.color.as_deref(), Some("ff0000"));
@@ -3408,6 +3515,28 @@ mod tests {
         assert_eq!(fr.shd.as_deref(), Some("cccccc"));
     }
 
+    #[test]
+    fn table_style_cell_percentage_shading_blends_like_run_shading() {
+        let xml = format!(
+            r#"<w:styles xmlns:w="{ns}">
+              <w:style w:type="table" w:styleId="Pct">
+                <w:name w:val="Pct"/>
+                <w:tcPr><w:shd w:val="pct15" w:color="auto" w:fill="FFFFFF"/></w:tcPr>
+                <w:tblStylePr w:type="firstRow">
+                  <w:tcPr><w:shd w:val="pct25" w:color="00FF00" w:fill="FFFFFF"/></w:tcPr>
+                </w:tblStylePr>
+              </w:style>
+            </w:styles>"#,
+            ns = W_NS
+        );
+        let def = StyleMap::parse(&xml).resolve_table_style("Pct");
+        assert_eq!(def.cell_shd.as_deref(), Some("d9d9d9"));
+        assert_eq!(
+            def.cond.get("firstRow").unwrap().shd.as_deref(),
+            Some("bfffbf")
+        );
+    }
+
     // ── WD4: run-level character metrics (§17.3.2.35 / .43 / .24 / .19) ──────
 
     #[test]
@@ -3455,6 +3584,36 @@ mod tests {
             base.fit_text.and_then(|fit_text| fit_text.id).is_none(),
             "a direct fitText WITHOUT w:id must clear the inherited id"
         );
+    }
+
+    #[test]
+    fn percentage_run_shading_is_one_blended_fill() {
+        // Word PDF evidence: pct15, automatic pattern color over white = D9D9D9.
+        for (shd, expected) in [
+            (
+                r#"<w:shd w:val="pct15" w:color="auto" w:fill="FFFFFF"/>"#,
+                Some("d9d9d9"),
+            ),
+            (r#"<w:shd w:val="pct15" w:fill="FFFFFF"/>"#, Some("d9d9d9")),
+            (
+                r#"<w:shd w:val="pct25" w:color="00FF00" w:fill="FFFFFF"/>"#,
+                Some("bfffbf"),
+            ),
+            (
+                r#"<w:shd w:val="clear" w:color="auto" w:fill="DDDDDD"/>"#,
+                Some("dddddd"),
+            ),
+            (
+                r#"<w:shd w:val="horzStripe" w:color="FF0000" w:fill="00FF00"/>"#,
+                Some("00ff00"),
+            ),
+            (
+                r#"<w:shd w:val="pct15" w:color="auto" w:fill="auto"/>"#,
+                None,
+            ),
+        ] {
+            assert_eq!(run_fmt_from(shd).background.as_deref(), expected, "{shd}");
+        }
     }
 
     #[test]

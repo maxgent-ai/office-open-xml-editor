@@ -1,10 +1,11 @@
-import { DocxDocument } from '@silurus/ooxml/docx';
+import { DocxDocument, DocxViewer } from '@silurus/ooxml/docx';
 import { XlsxSheetViewer, XlsxWorkbook } from '@silurus/ooxml/xlsx';
 import { PptxPresentation } from '@silurus/ooxml/pptx';
 import { math } from '@silurus/ooxml/math';
 import { threeD } from '@silurus/ooxml/three-d';
 import { regionMap } from '@silurus/ooxml/region-map';
 import { chartEx } from '@silurus/ooxml/chart-ex';
+import { runModelSourceStages } from '../model-source-stages.mjs';
 
 const renderers = { math, threeD, regionMap, chartEx };
 const paint = (id, bitmap) => {
@@ -21,6 +22,7 @@ const bytes = async (url) => {
 };
 
 try {
+  const ordinaryLoads = [];
   const docx = await DocxDocument.load(
     await bytes('/packages/docx/public/demo/sample-1.docx'),
     { mode: 'worker', ...renderers },
@@ -28,6 +30,7 @@ try {
   if (docx.mode !== 'worker') throw new Error(`DOCX effective mode: ${docx.mode}`);
   paint('docx', await docx.renderPageToBitmap(0, { width: 360, dpr: 1 }));
   docx.destroy();
+  ordinaryLoads.push('docx-worker');
 
   const equation = await DocxDocument.load(
     await bytes('/consumer/equation.docx'),
@@ -46,6 +49,7 @@ try {
     { width: 360, height: 240, dpr: 1 },
   ));
   xlsx.destroy();
+  ordinaryLoads.push('xlsx-worker');
 
   const pptx = await PptxPresentation.load(
     await bytes('/packages/pptx/public/demo/sample-1.pptx'),
@@ -53,6 +57,7 @@ try {
   );
   paint('pptx', await pptx.renderSlideToBitmap(0, { width: 360, dpr: 1 }));
   pptx.destroy();
+  ordinaryLoads.push('pptx-worker');
 
   const textPptx = await PptxPresentation.load(
     await bytes('/consumer/text.pptx'),
@@ -114,6 +119,28 @@ try {
   );
   paint('pptx-chart-ex', await chartExPptx.renderSlideToBitmap(0, { width: 640, dpr: 1 }));
   chartExPptx.destroy();
+
+  for (const [format, Loader, url] of [
+    ['docx', DocxDocument, '/packages/docx/public/demo/sample-1.docx'],
+    ['xlsx', XlsxWorkbook, '/packages/xlsx/public/demo/sample-1.xlsx'],
+    ['pptx', PptxPresentation, '/packages/pptx/public/demo/sample-1.pptx'],
+  ]) {
+    const opened = await Loader.load(await bytes(url), { mode: 'main' });
+    opened.destroy();
+    ordinaryLoads.push(`${format}-main`);
+  }
+  document.body.dataset.ordinaryReady = 'true';
+  document.body.dataset.ordinaryLoads = ordinaryLoads.join(',');
+  if (new URLSearchParams(location.search).has('pause-sources')) {
+    await new Promise((resolve) => { window.resumeSourceStages = resolve; });
+  }
+  await runModelSourceStages({
+    DocxDocument,
+    DocxViewer,
+    XlsxWorkbook,
+    PptxPresentation,
+    bytes,
+  });
 
   document.body.dataset.status = 'ready';
 } catch (error) {

@@ -46,13 +46,40 @@ export function layoutOptionsForRender(input: LayoutRenderSelectionInput): Layou
   );
 }
 
-export function layoutOptionsKey(options: LayoutOptions, services: LayoutServices): string {
-  return stableFingerprint('layout', {
+/** Keys one geometry variant among the layouts of a single variant store. */
+export type LayoutOptionsKeyer = (options: LayoutOptions, services: LayoutServices) => string;
+
+/**
+ * Create a variant keyer whose keys are exact within its owner.
+ *
+ * A service fingerprint is an exact canonical identity, so it grows with the
+ * data it identifies: the text-service fingerprint embeds the document's
+ * complete font-metric snapshot (tens of KB). Spelling it into the key
+ * re-encoded that whole string on every variant lookup, which runs on every
+ * page render. Each distinct fingerprint string instead gets an ordinal, the
+ * same interning the paragraph acquisition keys use: the map keeps the string
+ * itself (no copy) and assigns ordinals one-to-one, so two keys from one keyer
+ * are equal exactly when the date, tracked-change view and every service
+ * fingerprint are equal. Keys from different keyers are not comparable; a
+ * variant store owns one keyer for its fixed services.
+ */
+export function createLayoutOptionsKeyer(): LayoutOptionsKeyer {
+  const fingerprintOrdinals = new Map<string, number>();
+  const ordinal = (fingerprint: string | undefined): number | null => {
+    if (fingerprint === undefined) return null;
+    let value = fingerprintOrdinals.get(fingerprint);
+    if (value === undefined) {
+      value = fingerprintOrdinals.size;
+      fingerprintOrdinals.set(fingerprint, value);
+    }
+    return value;
+  };
+  return (options, services) => stableFingerprint('layout', {
     currentDateMs: options.currentDateMs,
     showTrackedChanges: options.showTrackedChanges === true,
-    text: services.text.fingerprint,
-    images: services.images.fingerprint,
-    math: services.math.fingerprint,
-    verticalGlyphs: services.verticalGlyphFingerprint ?? null,
+    text: ordinal(services.text.fingerprint),
+    images: ordinal(services.images.fingerprint),
+    math: ordinal(services.math.fingerprint),
+    verticalGlyphs: ordinal(services.verticalGlyphFingerprint),
   });
 }

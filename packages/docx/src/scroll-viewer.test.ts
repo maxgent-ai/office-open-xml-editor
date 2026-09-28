@@ -209,7 +209,6 @@ describe('DocxScrollViewer — opt-in comment cards', () => {
       { comments: { side: 'left' }, overscan: 0 },
     ) as DocxScrollViewer;
     const state = viewer as unknown as {
-      _reviewOriginPx: number;
       _slots: Map<number, { wrapper: FakeEl }>;
     };
     const scrollHost = container.children[0]!.children[0]!;
@@ -225,7 +224,10 @@ describe('DocxScrollViewer — opt-in comment cards', () => {
     });
     const openingLeft = state._slots.get(0)!.wrapper.style.left;
     const authoredLeft = Number(openingLeft.match(/calc\(([-\d.]+)px/)?.[1]);
-    const openingScreenX = authoredLeft + state._reviewOriginPx - scrollHost.scrollLeft;
+    const reviewOrigin = () => Number.parseFloat(
+      (scrollHost.style as Record<string, string>)['--ooxml-review-origin-x'] || '0',
+    );
+    const openingScreenX = authoredLeft + reviewOrigin() - scrollHost.scrollLeft;
 
     engine.commentAnchors = [{
       commentId: 'later-left', source, startRunIndex: 0, endRunIndex: 1,
@@ -235,15 +237,15 @@ describe('DocxScrollViewer — opt-in comment cards', () => {
     publishDocxLayout(doc, { pageCount: 3, exact: true, complete: true });
 
     expect(state._slots.get(0)!.wrapper.style.left).toBe(openingLeft);
-    expect(state._reviewOriginPx).toBeGreaterThan(0);
-    expect(scrollHost.scrollLeft).toBe(state._reviewOriginPx);
-    expect(authoredLeft + state._reviewOriginPx - scrollHost.scrollLeft).toBe(openingScreenX);
+    expect(reviewOrigin()).toBeGreaterThan(0);
+    expect(scrollHost.scrollLeft).toBe(reviewOrigin());
+    expect(authoredLeft + reviewOrigin() - scrollHost.scrollLeft).toBe(openingScreenX);
     scrollHost.scrollTop = 10_000;
     scrollHost.dispatch('scroll');
     expect(state._slots.get(2)!.wrapper.style.left).toBe(openingLeft);
     viewer.relayout();
     expect(state._slots.get(2)!.wrapper.style.left).toBe(openingLeft);
-    expect(authoredLeft + state._reviewOriginPx - scrollHost.scrollLeft).toBe(openingScreenX);
+    expect(authoredLeft + reviewOrigin() - scrollHost.scrollLeft).toBe(openingScreenX);
     viewer.destroy();
   });
 
@@ -512,7 +514,6 @@ describe('DocxScrollViewer — opt-in comment cards', () => {
       { comments: true },
     );
     await vi.waitFor(() => expect(engine.renderCalls).toHaveLength(1));
-    expect((viewer as unknown as { _commentMarginExtent(): number })._commentMarginExtent()).toBe(0);
     const scrollHost = container.children[0]!.children[0]!;
     const page = scrollHost.children.find((child) => child !== scrollHost.children[0])!;
     const margin = page.children.find((child) => child.style.cssText.includes('overflow-y:auto'))!;
@@ -531,7 +532,10 @@ describe('DocxScrollViewer — opt-in comment cards', () => {
       { comments: true },
     );
     await vi.waitFor(() => expect(engine.renderCalls).toHaveLength(1));
-    expect((viewer as unknown as { _commentMarginExtent(): number })._commentMarginExtent()).toBe(0);
+    const scrollHost = container.children[0]!.children[0]!;
+    const page = scrollHost.children.find((child) => child !== scrollHost.children[0])!;
+    const margin = page.children.find((child) => child.style.cssText.includes('overflow-y:auto'))!;
+    expect(margin.style.display).toBe('none');
     viewer.destroy();
   });
 
@@ -572,12 +576,8 @@ describe('DocxScrollViewer — opt-in comment cards', () => {
     expect(margin.style.background).toBe('');
     expect(margin.dataset.ooxmlCommentUi).toBe('margin');
     const card = margin.children[0]!.children[0]!;
-    const geometry = vi.spyOn(
-      viewer as unknown as { _scheduleCommentGeometry(page: number, slot: unknown): void },
-      '_scheduleCommentGeometry',
-    );
     dom.resizeCb()?.();
-    expect(geometry).not.toHaveBeenCalled();
+    expect(margin.children[0]!.children[0]).toBe(card);
     const frame = card.children.find((child) => child.dataset.ooxmlCommentPart === 'frame')!;
     expect(card.dataset.ooxmlCommentCard).toBe('');
     expect(card.className).toBe('ooxml-comment-card');
@@ -644,20 +644,10 @@ describe('DocxScrollViewer — opt-in comment cards', () => {
     const marker = tintLayer.children.find((child) =>
       child.dataset.ooxmlCommentMarker !== undefined)!;
     const card = margin.children[0]!.children[0]!;
-    const fullRedraw = vi.spyOn(
-      viewer as unknown as { _redrawSlotComments(page: number, slot: unknown): void },
-      '_redrawSlotComments',
-    );
-    const connectorRedraw = vi.spyOn(
-      viewer as unknown as { _redrawSlotCommentConnectors(page: number, slot: unknown): void },
-      '_redrawSlotCommentConnectors',
-    );
     margin.scrollTop = 24;
     margin.dispatch('scroll');
     await Promise.resolve();
 
-    expect(fullRedraw).toHaveBeenCalledTimes(0);
-    expect(connectorRedraw).toHaveBeenCalledTimes(1);
     expect(tintLayer.children.filter((child) =>
       child.dataset.ooxmlCommentHighlight !== undefined)).toHaveLength(1);
     expect(tintLayer.children.find((child) =>
@@ -995,20 +985,6 @@ describe('DocxScrollViewer — layout + virtualization (T2)', () => {
     expect(parseFloat(spacer.style.height)).toBeCloseTo(expected, 3);
     v.destroy();
     void dom;
-  });
-
-  it('recycles slots on scroll without unbounded canvas growth (pool reuse)', () => {
-    const { v, scrollHost } = setup(50);
-    v.relayout();
-    const initialMount = scrollHost.children.length;
-    // Scroll far down and fire the scroll listener repeatedly.
-    for (let top = 0; top <= 4000; top += 400) {
-      scrollHost.scrollTop = top;
-      scrollHost.dispatch('scroll');
-    }
-    // The DOM child count (spacer + mounted slots) must stay bounded — the pool
-    // reuses slots rather than appending a new canvas per page.
-    expect(scrollHost.children.length).toBeLessThanOrEqual(initialMount + 2);
   });
 
   it('scrolling far then back reuses pooled slot wrappers (bounded distinct allocations)', () => {

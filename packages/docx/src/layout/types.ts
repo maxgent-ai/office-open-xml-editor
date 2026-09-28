@@ -196,6 +196,8 @@ export interface DrawingLayout extends LayoutNodeBase {
     sourceOrder: number;
     horizontalOwnership: 'page' | 'host';
     verticalOwnership: 'page' | 'host';
+    /** Authored §20.4.2.3 cell ownership, independent of row-height containment. */
+    layoutInCell?: true;
     /** @internal This occurrence contributes to its owning table-cell extent. */
     cellContainment?: true;
   }>;
@@ -362,6 +364,9 @@ export interface TextPlacement {
   readonly advancePt: number;
   /** Shaped cluster geometry for selection/hit testing. Always covers `range`. */
   readonly clusters: readonly TextClusterLayout[];
+  /** Final U+0020 advance removed by the registered Latin line-fit rule. The
+   * transparent browser overlay must not hit-test beyond this retained box. */
+  readonly trailingSpaceCompressionPt?: number;
   /** Immutable contextual paint operations. Normally one whole-run operation. */
   readonly paintOps: readonly TextPaintOp[];
   readonly color: TextColorPolicy;
@@ -677,6 +682,18 @@ export interface TableCellBlockLayout {
   readonly advancePt: number;
 }
 
+/** ECMA-376 §17.4.72 rotated cell text, expressed with the DrawingML text-box
+ * vertical modes that share its paint semantics: `vert` (§17.18.93 tbRl),
+ * `vert270` (btLr) and `eaVert` (tbRlV, East Asian glyphs upright). */
+export type TableCellVerticalMode = 'vert' | 'vert270' | 'eaVert';
+
+export interface TableCellVerticalTextLayout {
+  readonly mode: TableCellVerticalMode;
+  /** Maps the cell's local horizontal content frame (origin at the start of
+   * the first line, x along the line, y across lines) to table points. */
+  readonly transform: Matrix2DData;
+}
+
 export interface TableCellLayout extends LayoutNodeBase {
   readonly kind: 'table-cell';
   readonly contentBounds: LayoutRect;
@@ -684,6 +701,8 @@ export interface TableCellLayout extends LayoutNodeBase {
   readonly vAlign: 'top' | 'center' | 'bottom';
   readonly background?: FillPaint;
   readonly blocks: readonly TableCellBlockLayout[];
+  /** Present for rotated cell text: blocks are in the local frame. */
+  readonly verticalText?: TableCellVerticalTextLayout;
 }
 
 export interface TableRowLayout extends LayoutNodeBase {
@@ -1177,6 +1196,10 @@ export interface TableCellBlockInput {
   readonly layout: ParagraphLayout | TableLayout;
   /** Stable source index; continuation slices must not renumber field ownership. */
   readonly sourceBlockIndex: number;
+  /** Effective ECMA-376 §17.3.1.14 paragraph policy; absent for tables. */
+  readonly keepLines?: boolean;
+  /** Effective ECMA-376 §17.3.1.44 paragraph policy; absent for tables. */
+  readonly widowControl?: boolean;
   /** True when destination-page context can change the acquired child geometry. */
   readonly pageDependent?: boolean;
   /** The required empty paragraph after a nested table owns no row-height ink. */
@@ -1302,7 +1325,21 @@ export interface TableCellLayoutInput {
   readonly vAlign: 'top' | 'center' | 'bottom';
   readonly background?: FillPaint;
   readonly borders: TableEdgeInputs;
+  /** ECMA-376 §17.4.73 / §17.4.79 cell diagonals (outside edge conflict
+   * resolution). Absent when the cell authors neither. */
+  readonly diagonalBorders?: Readonly<{
+    tl2br: TableBorderInput | null;
+    tr2bl: TableBorderInput | null;
+  }>;
   readonly blocks: readonly TableCellBlockInput[];
+  /** ECMA-376 §17.4.72 rotated cell text. Blocks were acquired with
+   * `lineLengthPt` as their line width; the cell requires
+   * `requiredLineLengthPt` of physical content height. */
+  readonly verticalText?: Readonly<{
+    mode: TableCellVerticalMode;
+    lineLengthPt: number;
+    requiredLineLengthPt: number;
+  }>;
 }
 
 export interface TableRowLayoutInput {

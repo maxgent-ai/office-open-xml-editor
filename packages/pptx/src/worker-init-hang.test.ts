@@ -13,6 +13,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
  */
 
 const initMock = vi.fn();
+const openSourceMock = vi.fn();
 function deferred<T>() {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>((resolvePromise) => { resolve = resolvePromise; });
@@ -62,6 +63,31 @@ vi.mock('./wasm/pptx_parser.js', () => ({
   reinit: (arg: unknown) => initMock(arg),
   PptxArchive: FakePptxArchive,
 }));
+vi.mock('@silurus/ooxml-core', async (load) => ({
+  ...await load<typeof import('@silurus/ooxml-core')>(),
+}));
+vi.mock('@silurus/ooxml-core/internal/model-source', async (load) => ({
+  ...await load<typeof import('@silurus/ooxml-core/internal/model-source')>(),
+  openModelSourceModule: (...args: unknown[]) => openSourceMock(...args),
+}));
+
+const modelSource = {
+  protocol: 'ooxml-model-source-module/v1',
+  target: 'pptx',
+  moduleUrl: 'https://example.test/source.mjs',
+  config: {},
+} as const;
+
+/** A model-source archive: the parser archive's reads minus every optional capability. */
+function sourceArchive() {
+  const parser = new FakePptxArchive(new Uint8Array());
+  return {
+    presentation_bootstrap: () => parser.presentation_bootstrap(),
+    close_presentation_session: () => parser.close_presentation_session(),
+    assert_healthy: () => parser.assert_healthy(),
+    extract_image: (path: string) => parser.extract_image(path),
+  };
+}
 
 interface FakeSelf {
   onmessage: ((e: MessageEvent) => void) | null;
@@ -87,12 +113,13 @@ function installSelf(): FakeSelf {
 async function loadWorker(): Promise<FakeSelf> {
   const fake = installSelf();
   vi.resetModules();
-  await import('./worker.js');
+  await import('./worker-source.js');
   return fake;
 }
 
 beforeEach(() => {
   initMock.mockReset();
+  openSourceMock.mockReset();
 });
 
 afterEach(() => {
@@ -101,6 +128,82 @@ afterEach(() => {
 });
 
 describe('pptx worker.ts — init failure never hangs a request (AR4)', () => {
+  it('transfers only source-returned image, media and font subarray bytes', async () => {
+    const bytes = (middle: number) => new Uint8Array([91, middle, 92]).subarray(1, 2);
+    const archive = {
+      ...sourceArchive(),
+      extract_image: vi.fn(() => bytes(1)),
+      extract_media: vi.fn(() => bytes(2)),
+      extract_font: vi.fn(() => bytes(3)),
+    };
+    openSourceMock.mockResolvedValue({ archive, viewDefaults: {}, close: vi.fn() });
+    const fake = await loadWorker();
+    fake.onmessage?.({ data: {
+      kind: 'parse', id: 40, buffer: new ArrayBuffer(4), resourcePolicy, source: modelSource, sourceOwnerUrl: './internal/worker-presentation-source.js',
+    } } as MessageEvent);
+    await vi.waitFor(() => expect(fake.posted).toContainEqual(expect.objectContaining({ kind: 'presentationOpened', id: 40 })));
+    for (const [kind, response, id, expected] of [
+      ['extractImage', 'imageExtracted', 41, 1],
+      ['extractMedia', 'mediaExtracted', 42, 2],
+      ['extractFont', 'fontExtracted', 43, 3],
+    ] as const) {
+      fake.onmessage?.({ data: { kind, id, path: 'part' } } as MessageEvent);
+      await vi.waitFor(() => expect(fake.posted).toContainEqual(expect.objectContaining({ kind: response, id })));
+      const posted = fake.posted.find((item) => (item as { id?: number }).id === id) as { bytes: ArrayBuffer };
+      expect(Array.from(new Uint8Array(posted.bytes))).toEqual([expected]);
+    }
+  });
+  it('opens a model-source cursor without initializing OOXML WASM and closes it on a trap', async () => {
+    const archive = sourceArchive();
+    const close = vi.fn();
+    openSourceMock.mockResolvedValue({ archive, viewDefaults: {}, close });
+    const fake = await loadWorker();
+    fake.onmessage?.({ data: {
+      kind: 'parse', id: 30, buffer: new ArrayBuffer(4), resourcePolicy, source: modelSource, sourceOwnerUrl: './internal/worker-presentation-source.js',
+    } } as MessageEvent);
+    await vi.waitFor(() => expect(fake.posted).toContainEqual(expect.objectContaining({
+      kind: 'presentationOpened', id: 30,
+    })));
+    expect(initMock).not.toHaveBeenCalled();
+    expect(openSourceMock).toHaveBeenCalledTimes(1);
+
+    // Missing optional capabilities degrade instead of reaching for OOXML.
+    fake.onmessage?.({ data: { kind: 'resourceUsage', id: 31 } } as MessageEvent);
+    await vi.waitFor(() => expect(fake.posted).toContainEqual({ kind: 'resourceUsage', id: 31, usage: undefined }));
+    fake.onmessage?.({ data: { kind: 'extractMedia', id: 34, path: 'ppt/media/1' } } as MessageEvent);
+    await vi.waitFor(() => expect(fake.posted).toContainEqual(expect.objectContaining({
+      kind: 'error', id: 34, message: 'media extraction is unsupported for this source',
+    })));
+    expect(close).not.toHaveBeenCalled();
+
+    vi.spyOn(archive, 'extract_image').mockImplementation(() => {
+      throw new WebAssembly.RuntimeError('source trap');
+    });
+    fake.onmessage?.({ data: { kind: 'extractImage', id: 32, path: 'ppt/media/1' } } as MessageEvent);
+    await vi.waitFor(() => expect(fake.posted).toContainEqual(expect.objectContaining({
+      kind: 'error', id: 32, message: expect.stringContaining('source trap'),
+    })));
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  it('terminally closes a model source on bootstrap trap without losing the trap', async () => {
+    const archive = sourceArchive();
+    vi.spyOn(archive, 'presentation_bootstrap').mockImplementation(() => {
+      throw new WebAssembly.RuntimeError('bootstrap trap');
+    });
+    const close = vi.fn(() => { throw new Error('cleanup failed'); });
+    openSourceMock.mockResolvedValue({ archive, viewDefaults: {}, close });
+    const fake = await loadWorker();
+    fake.onmessage?.({ data: {
+      kind: 'parse', id: 33, buffer: new ArrayBuffer(4), resourcePolicy, source: modelSource, sourceOwnerUrl: './internal/worker-presentation-source.js',
+    } } as MessageEvent);
+    await vi.waitFor(() => expect(fake.posted).toContainEqual(expect.objectContaining({
+      kind: 'error', id: 33, message: expect.stringContaining('bootstrap trap'),
+    })));
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(initMock).not.toHaveBeenCalled();
+  });
+
   it('a parse after a REJECTED init responds with an error (not a hang)', async () => {
     initMock.mockRejectedValue(new Error('wasm boom'));
     const fake = await loadWorker();
@@ -141,6 +244,7 @@ describe('pptx worker.ts — init failure never hangs a request (AR4)', () => {
       id: number;
     };
     expect(parsed.id).toBe(3);
+    expect(initMock).toHaveBeenCalledTimes(1);
     // No `ready` handshake is emitted anymore (initPromise pattern replaces it).
     expect(fake.posted.some((m) => (m as { kind?: string }).kind === 'ready')).toBe(false);
 

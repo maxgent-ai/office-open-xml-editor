@@ -59,6 +59,8 @@ export interface SheetOverlayHostOptions {
 /** Format-owned overlay DOM. Geometry and state transitions remain in the
  *  XLSX engine, while node creation and stacking stay identical in both mounts. */
 export class SheetOverlayHost {
+  /** Keep wheel scrolling inside the value list from scrolling the grid. */
+  private readonly stopValidationWheel = (event: WheelEvent): void => event.stopPropagation();
   readonly selection: HTMLDivElement;
   readonly find: HTMLDivElement;
   readonly comment: HTMLDivElement;
@@ -110,7 +112,7 @@ export class SheetOverlayHost {
       `box-sizing:border-box;background:#fff;border:1px solid #7f7f7f;` +
       `box-shadow:1px 2px 5px rgba(0,0,0,0.25);` +
       `font:12px/1.4 sans-serif;color:#222;`;
-    this.validation.addEventListener('wheel', (event) => event.stopPropagation());
+    this.validation.addEventListener('wheel', this.stopValidationWheel);
 
     // The host owns the stable stacking contract for both public facades.
     area.appendChild(canvas);
@@ -123,7 +125,7 @@ export class SheetOverlayHost {
   }
 
   clearSelection(): void { this.selection.textContent = ''; }
-  appendSelection(element: HTMLElement): void { this.selection.appendChild(element); }
+  appendSelection(element: Element): void { this.selection.appendChild(element); }
   clearFind(): void { this.find.textContent = ''; }
   appendFind(element: HTMLElement): void { this.find.appendChild(element); }
 
@@ -145,5 +147,10 @@ export class SheetOverlayHost {
     this.validation.style.left = `${left}px`;
     this.validation.style.top = `${top}px`;
     this.validation.style.display = 'block';
+  }
+
+  /** Detach the overlay listeners (the nodes leave with the viewer subtree). */
+  destroy(): void {
+    this.validation.removeEventListener('wheel', this.stopValidationWheel);
   }
 }

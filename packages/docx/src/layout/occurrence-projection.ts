@@ -353,7 +353,11 @@ export function projectBodyOccurrence<T extends ParagraphLayout | TableLayout>(
   }
 
   const projected = projectBlock(translated, options.destination.flowDomainId);
-  const snapshot = snapshotPlainData(projected, 'DOCX body occurrence projection') as T;
+  // Translation and re-keying create new objects wherever geometry, domains or
+  // occurrence IDs differ. An object still aliased from a verified frozen
+  // acquisition root is unchanged source data, so the snapshot may share it.
+  // Mutable fragments and externally supplied layouts take the cloning path.
+  const snapshot = snapshotPlainData(projected, 'DOCX body occurrence projection', retained) as T;
   if (snapshot.kind !== 'table' || retained.kind !== 'table') return snapshot;
   // Pagination fragments rebuild occurrence-local rows, while their acquisition-owned
   // track vector is one canonical geometry value shared by every split occurrence.

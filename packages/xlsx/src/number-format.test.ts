@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { formatCellValue } from './number-format.js';
+import { formatCellValue, formatCellValueWithColor } from './number-format.js';
 import type { Cell, Styles } from './types.js';
 
 const FMT_ID = 164; // first free custom id
@@ -208,6 +208,83 @@ describe('date formats (Excel serial; 45292 = 2024-01-01)', () => {
   });
 });
 
+describe('time-only formats (§18.8.30 h / s / AM/PM without a date part)', () => {
+  it('formats the serial as a clock time instead of echoing the code', () => {
+    expect(fmt(0.29166666666666669, 'h:mm;@')).toBe('7:00');
+    expect(fmt(0.51041666666666663, 'h:mm:ss;@')).toBe('12:15:00');
+    expect(fmt(0.75, 'h:mm AM/PM')).toBe('6:00 PM');
+    expect(fmt(0.5, 's')).toBe('0');
+  });
+
+  it('rounds the float noise of a stored serial instead of truncating it', () => {
+    // 8:00 is stored as 0.33333333333333331, a hair under 28 800 000 ms.
+    expect(fmt(0.33333333333333331, 'h:mm;@')).toBe('8:00');
+    expect(fmt(0.79166666666666663, 'hh:mm')).toBe('19:00');
+  });
+
+  it('keeps escaped, padded and quoted time letters literal in numeric formats', () => {
+    expect(fmt(5, '0\\h')).toBe('5h');
+    expect(fmt(5, '0_h')).toBe('5 ');
+    expect(fmt(5, '0" hrs"')).toBe('5 hrs');
+    // An escaped or padded quote is not a string delimiter.
+    expect(fmt(5, '0\\""hours"\\"')).toBe('5"hours"');
+    expect(fmt(5, '0_""hours"')).toBe('5 hours');
+  });
+
+  it('reads Japanese era codes as dates, scientific exponents as numbers', () => {
+    expect(fmt(45292, '[$-411]ggge')).toBe('令和6');
+    // ja-JP locale codes (§18.8.30): r → ee, rr → gggee.
+    expect(fmt(45292, '[$-411]r')).toBe('06');
+    expect(fmt(45292, '[$-411]rr')).toBe('令和06');
+    expect(fmt(1234, '0.00E+00')).toBe('1.23E+03');
+    // An E after a numeric placeholder stays on the numeric path, as before.
+    expect(fmt(1234, '0.0E0')).toBe('1234.0E0');
+  });
+
+  it('ignores a quoted elapsed bracket', () => {
+    expect(fmt(-0.25, 'h:mm "[h]"')).toBe('18:00 [h]');
+  });
+
+  it('keeps a quoted AM/PM literal on the 24-hour clock', () => {
+    expect(fmt(45292.54166666667, 'h:mm "AM/PM"')).toBe('13:00 AM/PM');
+  });
+
+  it('reads era codes as the Japanese era only under [$-411], as Excel does', () => {
+    // Measured in Excel (ja-JP macOS): other LCIDs and no LCID render no era
+    // name and the four-digit year for e / ee / r / rr.
+    for (const code of ['[$-409]e', '[$-409]ee', '[$-409]rr', '[$-404]ggge', '[$-404]rr', 'ggge', 'ee', 'r']) {
+      expect(fmt(45292, code), code).toBe('2024');
+    }
+    expect(fmt(45292, '[$-411]ggge"/"m"/"d')).toBe('令和6/1/1');
+    expect(fmt(1, '[$-411]ggge"/"m"/"d')).toBe('明治33/1/1');
+  });
+
+  it('decides number vs time from the section the value selects', () => {
+    expect(fmt(5, '0.00;h:mm')).toBe('5.00');
+    expect(fmt(-0.5, '0.00;h:mm')).toBe('12:00');
+    expect(fmt(100, '[>=1]0.00;h:mm')).toBe('100.00');
+    expect(fmt(0, 'h:mm;h:mm;"zero"')).toBe('zero');
+    expect(formatCellValueWithColor(numCell(0.5), styles('[Red]h:mm'))).toEqual({ text: '12:00', color: '#FF0000' });
+  });
+
+  it('never formats a number with the text section', () => {
+    expect(fmt(-5, '0.00;@')).toBe('-5.00');
+    expect(fmt(45292, '[<1]yyyy;[>9999999]yyyy;@')).toBe('#');
+    expect(fmt(45292, '"@"0')).toBe('@45292');
+  });
+
+  it('keeps pad and fill operands out of section and bracket parsing', () => {
+    expect(formatCellValueWithColor(numCell(45292), styles('yyyy_";0'))).toEqual({ text: '2024' });
+    expect(formatCellValueWithColor(numCell(45292), styles('yyyy_""[Red]"'))).toEqual({ text: '2024[Red]' });
+  });
+
+  it('carries elapsed-time totals from the same rounded duration', () => {
+    // 45292.33333333333 is a hair under 1 087 016 hours.
+    expect(fmt(45292.33333333333, '[h]:mm')).toBe('1087016:00');
+    expect(fmt(45292.33333333333, '[m]:ss')).toBe('65220960:00');
+  });
+});
+
 describe('date formats — 1900 Lotus leap-year-bug compat (§18.17.4.1)', () => {
   // The cell formatter now delegates serial → date to the shared core
   // `excelSerialToUtcDate`, which shifts serials < 60 by +1 day to reproduce
@@ -249,99 +326,41 @@ describe('date formats — 1904 date system (§18.2.28 / §18.17.4.1)', () => {
   });
 });
 
-describe('volatile TODAY()/NOW() exemption from date1904 (§18.17.4.1)', () => {
-  // TODAY()/NOW() cells carry a cached <v> from the last save that the viewer
-  // recomputes at render time. `todaySerial`/`nowSerial` always emit a
-  // 1900-system serial (they encode "today" as a calendar concept), so even in
-  // a 1904 workbook the recomputed volatile must be formatted against the 1900
-  // epoch — otherwise it would render 1462 days LATE. This pins the
-  // `effectiveDate1904` branch that forces date1904=false for recomputed cells.
-  //
-  // `todaySerial`/`nowSerial` (formula.ts) each call `new Date()` internally,
-  // using the *local* Y/M/D. The previous version of this suite read
-  // `new Date()` itself (before and after calling `formatCellValue`) and
-  // accepted either reading, to tolerate a midnight rollover *during* the
-  // test. That guard only covered a rollover between its own two clock reads
-  // — it did not cover the implementation's own independent `new Date()` call
-  // landing on the other side of local midnight from both of them. With three
-  // separate, un-synchronized clock reads (before / inside todaySerial or
-  // nowSerial / after), a rollover close to any one of them could still make
-  // `rendered` fall outside the "acceptable" set (observed failing locally at
-  // 00:09 JST). Freezing the system clock for the whole test removes the race
-  // instead of trying to widen the acceptance window further.
-  const FROZEN_NOW = new Date('2024-03-15T12:00:00.000Z'); // clear of any DST/epoch edge
-
+describe('formula cells render their cached value, never a recalculation', () => {
+  // Library policy (number-format.ts): cell formulas are never calculated. A
+  // TODAY()/NOW() cell shows the cached `<v>` saved with the file, so it stays
+  // consistent with every cell derived from it. The clock is frozen far from
+  // the cached dates so a recalculation could not pass by coincidence.
   beforeEach(() => {
     vi.useFakeTimers();
-    vi.setSystemTime(FROZEN_NOW);
+    vi.setSystemTime(new Date('2031-07-20T12:00:00.000Z'));
   });
 
   afterEach(() => {
     vi.useRealTimers();
   });
 
-  /** The local calendar date `todaySerial`/`nowSerial` derive from the frozen
-   *  clock (Date.UTC of the local Y/M/D read off `new Date()`), as YYYY-MM-DD. */
-  function frozenTodayString(): string {
-    const d = new Date();
-    return `${d.getFullYear().toString().padStart(4, '0')}-${(d.getMonth() + 1)
-      .toString()
-      .padStart(2, '0')}-${d.getDate().toString().padStart(2, '0')}`;
+  function formulaCell(formula: string, value: Cell['value']): Cell {
+    return { row: 1, col: 1, value, styleIndex: 0, formula };
   }
 
-  function volatileCell(formula: string): Cell {
-    // The cached <v> is a stale 1900-system serial (its exact value is
-    // irrelevant — the volatile path recomputes it) and the style is a date
-    // format. We deliberately store a serial that would misrender if the flag
-    // were NOT overridden.
-    return { row: 1, col: 1, value: { type: 'number', number: 0 }, styleIndex: 0, formula };
-  }
-
-  it('TODAY() in a 1904 workbook renders the correct 1900-system today (not 1462 days off)', () => {
-    const rendered = formatCellValue(volatileCell('TODAY()'), styles('yyyy-mm-dd'), null, true);
-    expect(rendered).toBe(frozenTodayString());
+  it('renders the cached TODAY() serial in the workbook date system', () => {
+    // 1900-system serial 45306 = 2024-01-15; 1904-system serial 43830 = 2024-01-01.
+    const cell1900 = formulaCell('TODAY()', { type: 'number', number: 45306 });
+    expect(formatCellValue(cell1900, styles('yyyy-mm-dd'))).toBe('2024-01-15');
+    const cell1904 = formulaCell('TODAY()', { type: 'number', number: 43830 });
+    expect(formatCellValue(cell1904, styles('yyyy-mm-dd'), null, true)).toBe('2024-01-01');
   });
 
-  it('renders TODAY() through localized built-in short-date format 14', () => {
-    vi.stubGlobal('navigator', { language: 'ja-JP' });
-    try {
-      const [year, month, day] = frozenTodayString().split('-').map(Number);
-      const rendered = formatCellValue(volatileCell('TODAY()'), builtinStyles(14));
-      expect(rendered).toBe(`${year}/${month}/${day}`);
-    } finally {
-      vi.unstubAllGlobals();
-    }
+  it('renders the cached NOW() serial, including its time fraction', () => {
+    const cell = formulaCell('NOW()', { type: 'number', number: 45306.75 });
+    expect(formatCellValue(cell, styles('yyyy-mm-dd hh:mm'))).toBe('2024-01-15 18:00');
   });
 
-  it('tolerates a leading = and whitespace in the recomputed formula', () => {
-    const rendered = formatCellValue(volatileCell(' = TODAY() '), styles('yyyy-mm-dd'), null, true);
-    expect(rendered).toBe(frozenTodayString());
-  });
-
-  it('NOW() in a 1904 workbook renders the correct 1900-system date portion', () => {
-    // NOW() carries a time fraction; the date portion must still be today's
-    // 1900-system calendar date, not the 1904-shifted one.
-    const rendered = formatCellValue(volatileCell('NOW()'), styles('yyyy-mm-dd'), null, true);
-    expect(rendered).toBe(frozenTodayString());
-  });
-
-  it('a non-volatile stored serial in a 1904 workbook still honors the 1904 epoch', () => {
-    // Contrast: without a volatile formula the stored serial uses the workbook
-    // date system. 1904-system serial 43830 = 2024-01-01.
-    const cell: Cell = { row: 1, col: 1, value: { type: 'number', number: 43830 }, styleIndex: 0 };
-    expect(formatCellValue(cell, styles('yyyy-mm-dd'), null, true)).toBe('2024-01-01');
-  });
-
-  it('renders correctly right at a local-midnight boundary (23:59:59.900 -> 00:00:00.050)', () => {
-    // Regression guard for the exact race this suite used to be exposed to:
-    // pin the clock a hair before local midnight and confirm TODAY() reflects
-    // that frozen instant precisely (no dependence on wall-clock timing).
-    vi.setSystemTime(new Date('2024-03-15T23:59:59.900'));
-    const before = formatCellValue(volatileCell('TODAY()'), styles('yyyy-mm-dd'), null, true);
-    expect(before).toBe('2024-03-15');
-
-    vi.setSystemTime(new Date('2024-03-16T00:00:00.050'));
-    const after = formatCellValue(volatileCell('TODAY()'), styles('yyyy-mm-dd'), null, true);
-    expect(after).toBe('2024-03-16');
+  it('renders a TODAY() cell without a cached value like any other uncached formula', () => {
+    const empty: Cell['value'] = { type: 'empty' };
+    const uncachedSum = formatCellValue(formulaCell('SUM(A1:A2)', empty), styles('yyyy-mm-dd'));
+    expect(uncachedSum).toBe('');
+    expect(formatCellValue(formulaCell('TODAY()', empty), styles('yyyy-mm-dd'))).toBe(uncachedSum);
   });
 });

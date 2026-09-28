@@ -12,6 +12,8 @@ export default defineConfig({
   base: SITE_BASE,
   trailingSlash: 'ignore',
   vite: {
+    // Site demos compile the workspace package sources directly.
+    define: { __OOXML_MODEL_SOURCES__: 'true' },
     // Keep native module evaluation ordering for the WASM-backed Viewer
     // graph. Transforming top-level await into exported `__tla` promises can
     // leave Astro's separately emitted page scripts using Viewer exports before
@@ -36,8 +38,20 @@ export default defineConfig({
         // Keep core subpaths ahead of the package-root prefix alias; otherwise
         // Vite appends them to the root entry file (for example,
         // `src/index.ts/internal/resource-measurement`).
+        '@silurus/ooxml-core/internal/model-source': fileURLToPath(
+          new URL('../packages/core/src/source/model-source.ts', import.meta.url),
+        ),
+        '@silurus/ooxml-core/internal/drawingml-text': fileURLToPath(
+          new URL('../packages/core/src/drawingml-text/index.ts', import.meta.url),
+        ),
+        '@silurus/ooxml-core/internal/bidi-line': fileURLToPath(
+          new URL('../packages/core/src/text/bidi/segment-line.ts', import.meta.url),
+        ),
         '@silurus/ooxml-core/internal/resource-measurement': fileURLToPath(
           new URL('../packages/core/src/internal/resource-measurement.ts', import.meta.url),
+        ),
+        '@silurus/ooxml-core/internal/office-auto-line': fileURLToPath(
+          new URL('../packages/core/src/fonts/office-auto-line.ts', import.meta.url),
         ),
         '@silurus/ooxml-core/internal/bounded-async-lru-cache': fileURLToPath(
           new URL('../packages/core/src/internal/bounded-async-lru-cache.ts', import.meta.url),
@@ -80,6 +94,11 @@ export default defineConfig({
         ),
         '@silurus/ooxml-core/internal/script-preload-accumulator': fileURLToPath(
           new URL('../packages/core/src/internal/script-preload-accumulator.ts', import.meta.url),
+        ),
+        // Viewer collaborators have matching source and declaration shims in
+        // core/src/internal; resolve them before the bare core entry alias.
+        '@silurus/ooxml-core/internal/': fileURLToPath(
+          new URL('../packages/core/src/internal/', import.meta.url),
         ),
         '@silurus/ooxml-core/worker': fileURLToPath(
           new URL('../packages/core/src/worker/index.ts', import.meta.url),

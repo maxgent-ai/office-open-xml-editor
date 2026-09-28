@@ -256,3 +256,126 @@ describe('PPTX display-sized picture decode', () => {
     }
   });
 });
+
+describe('PPTX slide paint atomicity', () => {
+  beforeEach(() => {
+    coreMocks.decode.mockReset();
+  });
+
+  // Chrome rasterizes a canvas recording in chunks split at task boundaries,
+  // and antialiased-path coverage can depend on that chunking (issue #1580).
+  // A slide must therefore not be cleared or drawn until every decode it needs
+  // has settled, and must then be painted without yielding to another task.
+  it('paints nothing until all decodes settle, then paints in one task', async () => {
+    const pending = new Map<string, (bitmap: ImageBitmap) => void>();
+    coreMocks.decode.mockImplementation((path: string) => new Promise((resolve) => {
+      pending.set(path, resolve);
+    }));
+    const events: string[] = [];
+    let taskBoundarySinceFirstDraw = false;
+    const record = (name: string) => {
+      if (events.length === 0) setTimeout(() => { taskBoundarySinceFirstDraw = true; }, 0);
+      else if (taskBoundarySinceFirstDraw) events.push('<task boundary>');
+      events.push(name);
+    };
+    const context = new Proxy({} as Record<string, unknown>, {
+      get(target, property: string) {
+        if (property in target) return target[property];
+        if (['fillRect', 'drawImage', 'fill', 'stroke'].includes(property)) {
+          return () => record(property);
+        }
+        if (property === 'getTransform') {
+          return () => ({ a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 });
+        }
+        return () => undefined;
+      },
+      set(target, property: string, value) {
+        target[property] = value;
+        return true;
+      },
+    }) as unknown as CanvasRenderingContext2D;
+    const target = {
+      set width(_value: number) { record('clear'); },
+      height: 0,
+      style: {},
+      offsetWidth: 960,
+      getContext: () => context,
+    } as unknown as HTMLCanvasElement;
+    const picture = (imagePath: string) => ({
+      type: 'picture',
+      x: 0,
+      y: 0,
+      width: 4_572_000,
+      height: 3_429_000,
+      rotation: 0,
+      flipH: false,
+      flipV: false,
+      imagePath,
+      mimeType: 'image/png',
+    });
+    const slide = {
+      index: 0,
+      slideNumber: 1,
+      background: null,
+      elements: [picture('ppt/media/a.png'), picture('ppt/media/b.png')],
+    } as Slide;
+
+    const render = renderSlide(target, slide, 9_144_000, 6_858_000, {
+      width: 960,
+      dpr: 1,
+      fetchImage: vi.fn(async () => new Blob(['png'], { type: 'image/png' })),
+    });
+    await vi.waitFor(() => expect(pending.size).toBe(2));
+    pending.get('ppt/media/a.png')!(coreMocks.bitmap);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(events).toEqual([]);
+
+    pending.get('ppt/media/b.png')!(coreMocks.bitmap);
+    await render;
+    expect(events).toEqual(['clear', 'fillRect', 'drawImage', 'drawImage']);
+  });
+
+  const picturesSlide = (...paths: string[]) => ({
+    index: 0,
+    slideNumber: 1,
+    background: null,
+    elements: paths.map((imagePath) => ({
+      type: 'picture',
+      x: 0,
+      y: 0,
+      width: 4_572_000,
+      height: 3_429_000,
+      rotation: 0,
+      flipH: false,
+      flipV: false,
+      imagePath,
+      mimeType: imagePath.endsWith('.tiff') ? 'image/tiff' : 'image/png',
+    })),
+  }) as Slide;
+  const renderPictures = (slide: Slide) => renderSlide(canvas(), slide, 9_144_000, 6_858_000, {
+    width: 960,
+    dpr: 1,
+    fetchImage: vi.fn(async () => new Blob(['png'], { type: 'image/png' })),
+  });
+
+  it('rejects with a fatal decode error without waiting for later pictures', async () => {
+    const fatal = new TiffDecodeError('Unsupported TIFF compression');
+    coreMocks.decode.mockImplementation((path: string) => path.endsWith('a.tiff')
+      ? Promise.reject(fatal)
+      : new Promise(() => {}));
+
+    await expect(renderPictures(picturesSlide('ppt/media/a.tiff', 'ppt/media/b.png')))
+      .rejects.toBe(fatal);
+  });
+
+  it('reports the earliest fatal decode error in paint order', async () => {
+    const first = new TiffDecodeError('first picture');
+    const second = new TiffDecodeError('second picture');
+    coreMocks.decode.mockImplementation((path: string) => path.endsWith('a.tiff')
+      ? new Promise((_, reject) => setTimeout(() => reject(first), 10))
+      : Promise.reject(second));
+
+    await expect(renderPictures(picturesSlide('ppt/media/a.tiff', 'ppt/media/b.tiff')))
+      .rejects.toBe(first);
+  });
+});

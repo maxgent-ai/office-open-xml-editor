@@ -1,5 +1,6 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { DocxScrollViewer } from './scroll-viewer.js';
+import { DocxDocument } from './document.js';
 import { installDom, makeContainer, makeBorrowedDocxScrollViewer, FakeDocxEngine, type FakeEl } from './scroll-viewer-test-dom.js';
 
 afterEach(() => {
@@ -44,6 +45,24 @@ function setup(opts: Record<string, unknown> = {}, host = { w: 200, h: 400 }) {
 }
 
 describe('DocxScrollViewer IX9 zoom contract', () => {
+  it('applies zoom selected during a pending sliced load to the mounted page', async () => {
+    installDom();
+    const container = makeContainer(200, 400);
+    const engine = new FakeDocxEngine(5, [PAGE]);
+    let finish!: (document: DocxDocument) => void;
+    vi.spyOn(DocxDocument, 'load').mockImplementation(() => new Promise((resolve) => {
+      finish = resolve;
+    }));
+    const viewer = new DocxScrollViewer(container as unknown as HTMLElement, { gap: 10 });
+    const loading = viewer.load('x.docx');
+    viewer.setScale(2);
+    finish(engine.asDoc());
+    await loading;
+    expect(viewer.getScale()).toBe(2);
+    expect(engine.renderCalls.length).toBeGreaterThan(0);
+    viewer.destroy();
+  });
+
   it('getScale() returns the absolute factor (the base fit after load)', () => {
     const { v } = setup();
     // base = 200 / (100 × 4/3) = 1.5

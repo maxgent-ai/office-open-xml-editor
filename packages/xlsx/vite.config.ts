@@ -3,7 +3,7 @@ import wasm from 'vite-plugin-wasm';
 import { resolve } from 'path';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { wasmAssetUrl } from '../../vite.config';
+import { legacyBundleBoundary, wasmAssetUrl } from '../../vite.config';
 
 const dirname =
   typeof __dirname !== 'undefined'
@@ -11,7 +11,8 @@ const dirname =
     : path.dirname(fileURLToPath(import.meta.url));
 
 export default defineConfig({
-  plugins: [wasm()],
+  define: { __OOXML_MODEL_SOURCES__: 'true' },
+  plugins: [wasmAssetUrl(), wasm(), legacyBundleBoundary()],
   root: dirname,
   resolve: {
     alias: {
@@ -41,7 +42,7 @@ export default defineConfig({
   },
   worker: {
     format: 'es',
-    plugins: () => [wasmAssetUrl(), wasm()],
+    plugins: () => [wasmAssetUrl(), wasm(), legacyBundleBoundary()],
     rollupOptions: {
       output: { assetFileNames: '[name][extname]' },
     },

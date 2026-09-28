@@ -1,6 +1,6 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { DocxScrollViewer } from './scroll-viewer.js';
-import { DocxDocument } from './document.js';
+import { DocxDocument, docxViewerLoadSignal, type DocxViewerLoadControl } from './document.js';
 import { installDom, makeContainer, FakeDocxEngine, type FakeEl } from './scroll-viewer-test-dom.js';
 
 afterEach(() => {
@@ -130,5 +130,99 @@ describe('DocxScrollViewer.load() — concurrent-load latch', () => {
 
     await expect(v.load('late.docx')).rejects.toThrow('DocxScrollViewer is destroyed');
     expect(load).not.toHaveBeenCalled();
+  });
+
+  it('cancels a pending load on reload and forwards a view toggle to the active load', async () => {
+    const { v } = build();
+    const stale = deferredLoad(new FakeDocxEngine(4, SIZE));
+    const winner = deferredLoad(new FakeDocxEngine(4, SIZE));
+    const controls: DocxViewerLoadControl[] = [];
+    vi.spyOn(DocxDocument, 'load')
+      .mockImplementationOnce((_source, opts) => {
+        controls.push((opts as typeof opts & { [docxViewerLoadSignal]: DocxViewerLoadControl })[docxViewerLoadSignal]);
+        return stale.promise;
+      })
+      .mockImplementationOnce((_source, opts) => {
+        controls.push((opts as typeof opts & { [docxViewerLoadSignal]: DocxViewerLoadControl })[docxViewerLoadSignal]);
+        return winner.promise;
+      });
+    const first = v.load('old.docx');
+    const second = v.load('new.docx');
+    expect(controls[0]?.signal.aborted).toBe(true);
+    let changes = 0;
+    controls[1]?.subscribeViewChange(() => { changes += 1; });
+    await v.setShowTrackedChanges(true);
+    await v.setShowTrackedChanges(true);
+    expect(changes).toBe(1);
+    expect(controls[1]?.requestedView()).toBe(true);
+    v.destroy();
+    expect(controls[1]?.signal.aborted).toBe(true);
+    stale.resolve();
+    winner.resolve();
+    await expect(second).rejects.toThrow('DocxScrollViewer is destroyed');
+    await expect(first).rejects.toThrow('DocxScrollViewer is destroyed');
+  });
+
+  it('preserves a view requested during a pending load across its replacement', async () => {
+    const { v } = build();
+    const stale = deferredLoad(new FakeDocxEngine(4, SIZE));
+    const winner = deferredLoad(new FakeDocxEngine(4, SIZE));
+    const options: Parameters<typeof DocxDocument.load>[1][] = [];
+    vi.spyOn(DocxDocument, 'load')
+      .mockImplementationOnce((_source, opts) => { options.push(opts); return stale.promise; })
+      .mockImplementationOnce((_source, opts) => { options.push(opts); return winner.promise; });
+    const first = v.load('old.docx');
+    await v.setShowTrackedChanges(true);
+    const second = v.load('new.docx');
+    expect(options[1]?.showTrackedChanges).toBe(true);
+    winner.resolve();
+    await second;
+    stale.resolve();
+    await first;
+    expect(v.pageCount).toBe(4);
+    v.destroy();
+  });
+
+  it('settles a superseded view selection without surfacing its worker rejection', async () => {
+    const { v } = build();
+    const first = new FakeDocxEngine(2, SIZE);
+    const second = new FakeDocxEngine(3, SIZE);
+    let finishLoad!: (doc: DocxDocument) => void;
+    let rejectView!: (error: Error) => void;
+    let startedView!: () => void;
+    const selecting = new Promise<void>((resolve) => { startedView = resolve; });
+    first.setLayoutView = (async () => {
+      startedView();
+      await new Promise<void>((_resolve, reject) => { rejectView = reject; });
+    }) as typeof first.setLayoutView;
+    const originalDestroy = first.destroy.bind(first);
+    first.destroy = () => { originalDestroy(); rejectView(new Error('Worker terminated')); };
+    vi.spyOn(DocxDocument, 'load')
+      .mockImplementationOnce(() => new Promise((resolve) => { finishLoad = resolve; }))
+      .mockResolvedValueOnce(second.asDoc());
+    const loading = v.load('first.docx');
+    await v.setShowTrackedChanges(true);
+    finishLoad(first.asDoc());
+    await selecting;
+    await v.load('second.docx');
+    await expect(loading).resolves.toBeUndefined();
+    expect(v.pageCount).toBe(3);
+    v.destroy();
+  });
+
+  it('reconciles a pending toggle back to the initial view against the loaded document', async () => {
+    const { v } = build();
+    const engine = new FakeDocxEngine(4, SIZE);
+    engine.layoutView = { showTrackedChanges: true, currentDate: 0 };
+    const pending = deferredLoad(engine);
+    vi.spyOn(DocxDocument, 'load').mockImplementation(() => pending.promise);
+    const loading = v.load('pending.docx');
+    await v.setShowTrackedChanges(true);
+    await v.setShowTrackedChanges(false);
+    pending.resolve();
+    await loading;
+    expect(engine.layoutView.showTrackedChanges).toBe(false);
+    expect(v.pageCount).toBe(4);
+    v.destroy();
   });
 });

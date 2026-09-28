@@ -3,6 +3,7 @@ import {
   WorkerBridge,
   preloadGoogleFonts,
   registerEmbeddedFonts,
+  type ModelSource,
   type WorkerLike,
   type FontPreloadEntry,
 } from '@silurus/ooxml-core';
@@ -98,6 +99,7 @@ describe('PptxPresentation.destroy() — rejects in-flight worker requests', () 
     // Fields destroy() clears after terminate(); undefined would throw.
     instance._rawParts = new BoundedRawPartCache({ maxEntries: 2, maxBytes: 1024 });
     instance._googleFontFaces = [];
+    instance._officeFontLoads = new Map();
     instance._embeddedFontFaces = [];
     instance._layoutWaiters = new Set();
     instance._layoutLifecycle = new ProgressiveLayoutLifecycle();
@@ -119,6 +121,37 @@ describe('PptxPresentation.destroy() — rejects in-flight worker requests', () 
     expect(() => pres.destroy()).not.toThrow();
   });
 
+  it('does not start a font load when a pending slide read completes after destroy', async () => {
+    const { pres } = makePresentation();
+    const instance = pres as unknown as Record<string, unknown>;
+    instance._mode = 'main';
+    instance._preflight = {
+      slideCount: 1, slideWidth: 914400, slideHeight: 914400,
+      majorFont: null, minorFont: 'Calibri', defaultTextColor: null,
+    };
+    instance._availableSlideCount = 1;
+    let releaseSlide: (() => void) | undefined;
+    const slideReady = new Promise<void>((resolve) => { releaseSlide = resolve; });
+    const slide = { elements: [{ type: 'shape', textBody: { paragraphs: [
+      { bullet: { type: 'none' }, runs: [{ type: 'text', text: 'A', fontFamily: 'Calibri' }] },
+    ] } }] };
+    const withSlide = vi.fn(async (_index: number, read: (slide: unknown) => unknown) => {
+      await slideReady;
+      return read(slide);
+    });
+    instance._slides = { withSlide, clear: vi.fn() };
+    const loadRoutes = vi.spyOn(pres as unknown as {
+      _officeRoutesForRequests(requests: unknown[], set: FontFaceSet | null): Promise<object>;
+    }, '_officeRoutesForRequests').mockResolvedValue({});
+    const rendering = (pres as unknown as PptxPresentation).renderSlide({} as HTMLCanvasElement, 0);
+    await Promise.resolve();
+    pres.destroy();
+    releaseSlide?.();
+    await expect(rendering).rejects.toThrow(/destroyed/i);
+    expect(loadRoutes).not.toHaveBeenCalled();
+    expect(withSlide).toHaveBeenCalledTimes(1);
+  });
+
   it('terminates the owned worker when a partially initialized load rejects', async () => {
     G.Worker = SilentWorker;
     G.location = { href: 'http://localhost/' };
@@ -136,6 +169,33 @@ describe('PptxPresentation.destroy() — rejects in-flight worker requests', () 
     ).mockRejectedValueOnce(failure);
 
     await expect(PptxPresentation.load(new ArrayBuffer(0))).rejects.toBe(failure);
+    expect(SilentWorker.instances).toHaveLength(1);
+    expect(SilentWorker.instances[0].terminated).toBe(true);
+  });
+
+  it('terminates an opened model-source worker when release throws after parse', async () => {
+    G.Worker = SilentWorker;
+    G.location = { href: 'http://localhost/' };
+    const failure = new Error('release failed');
+    const release = vi.fn(() => { throw failure; });
+    const source: ModelSource<'pptx'> = {
+      target: 'pptx',
+      claim: () => true,
+      beginLoad: () => ({
+        module: {
+          protocol: 'ooxml-model-source-module/v1',
+          target: 'pptx', moduleUrl: 'https://example.test/source.mjs', config: {},
+        },
+        release,
+      }),
+    };
+    vi.spyOn(PptxPresentation.prototype as unknown as {
+      _parse(buffer: ArrayBuffer, resourcePolicy: object): Promise<void>;
+    }, '_parse').mockResolvedValueOnce(undefined);
+
+    await expect(PptxPresentation.load(new ArrayBuffer(0), { modelSources: [source] }))
+      .rejects.toBe(failure);
+    expect(release).toHaveBeenCalledOnce();
     expect(SilentWorker.instances).toHaveLength(1);
     expect(SilentWorker.instances[0].terminated).toBe(true);
   });

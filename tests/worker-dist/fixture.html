@@ -13,13 +13,14 @@
   <canvas id="xlsx-chart-ex"></canvas>
   <canvas id="pptx-chart-ex"></canvas>
   <script type="module">
-    import { DocxDocument } from '/dist/docx.mjs';
+    import { DocxDocument, DocxViewer } from '/dist/docx.mjs';
     import { XlsxSheetViewer, XlsxWorkbook } from '/dist/xlsx.mjs';
     import { PptxPresentation } from '/dist/pptx.mjs';
     import { math } from '/dist/math.mjs';
     import { threeD } from '/dist/three-d.mjs';
     import { regionMap } from '/dist/region-map.mjs';
     import { chartEx } from '/dist/chart-ex.mjs';
+    import { runModelSourceStages } from '/tests/worker-dist/model-source-stages.mjs';
 
     const renderers = { math, threeD, regionMap, chartEx };
     const paint = (id, bitmap) => {
@@ -36,6 +37,7 @@
     };
 
     try {
+      const ordinaryLoads = [];
       const docx = await DocxDocument.load(
         await bytes('/packages/docx/public/demo/sample-1.docx'),
         { mode: 'worker', ...renderers },
@@ -43,6 +45,7 @@
       if (docx.mode !== 'worker') throw new Error(`DOCX effective mode: ${docx.mode}`);
       paint('docx', await docx.renderPageToBitmap(0, { width: 360, dpr: 1 }));
       docx.destroy();
+      ordinaryLoads.push('docx-worker');
 
       const equation = await DocxDocument.load(
         await bytes('/consumer/equation.docx'),
@@ -61,6 +64,7 @@
         { width: 360, height: 240, dpr: 1 },
       ));
       xlsx.destroy();
+      ordinaryLoads.push('xlsx-worker');
 
       const pptx = await PptxPresentation.load(
         await bytes('/packages/pptx/public/demo/sample-1.pptx'),
@@ -68,6 +72,7 @@
       );
       paint('pptx', await pptx.renderSlideToBitmap(0, { width: 360, dpr: 1 }));
       pptx.destroy();
+      ordinaryLoads.push('pptx-worker');
 
       const textPptx = await PptxPresentation.load(
         await bytes('/consumer/text.pptx'),
@@ -129,6 +134,30 @@
       );
       paint('pptx-chart-ex', await chartExPptx.renderSlideToBitmap(0, { width: 640, dpr: 1 }));
       chartExPptx.destroy();
+
+      for (const [format, Loader, url] of [
+        ['docx', DocxDocument, '/packages/docx/public/demo/sample-1.docx'],
+        ['xlsx', XlsxWorkbook, '/packages/xlsx/public/demo/sample-1.xlsx'],
+        ['pptx', PptxPresentation, '/packages/pptx/public/demo/sample-1.pptx'],
+      ]) {
+        const opened = await Loader.load(await bytes(url), { mode: 'main' });
+        opened.destroy();
+        ordinaryLoads.push(`${format}-main`);
+      }
+      // Pause after ordinary OOXML main/worker loads, before optional source
+      // stages are allowed to request their chunks.
+      document.body.dataset.ordinaryReady = 'true';
+      document.body.dataset.ordinaryLoads = ordinaryLoads.join(',');
+      if (new URLSearchParams(location.search).has('pause-sources')) {
+        await new Promise((resolve) => { window.resumeSourceStages = resolve; });
+      }
+      await runModelSourceStages({
+        DocxDocument,
+        DocxViewer,
+        XlsxWorkbook,
+        PptxPresentation,
+        bytes,
+      });
 
       document.body.dataset.status = 'ready';
     } catch (error) {

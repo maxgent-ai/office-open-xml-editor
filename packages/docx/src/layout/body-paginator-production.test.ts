@@ -149,6 +149,291 @@ const bodyOwner = () => ({
 });
 
 describe('canonical body producer', () => {
+  it.each([
+    { kind: 'visible text', inkless: false, onlyVisibleText: true, expectedTopPt: 10 },
+    { kind: 'image only', inkless: false, onlyVisibleText: false, expectedTopPt: 16 },
+    { kind: 'mixed text and object', inkless: false, onlyVisibleText: false, expectedTopPt: 16 },
+    { kind: 'empty mark', inkless: true, onlyVisibleText: false, expectedTopPt: 16 },
+    { kind: 'unknown source', inkless: false, onlyVisibleText: undefined, expectedTopPt: 16 },
+  ])('suppresses automatic page-top spacing only for established $kind', ({ inkless, onlyVisibleText, expectedTopPt }) => {
+    const services = Object.freeze({
+      text: { fingerprint: 'text' }, images: { fingerprint: 'images' }, math: { fingerprint: 'math' },
+    }) as LayoutServices;
+    attachBodyLayoutKernel(services, {
+      openBodyLayoutSession: () => ({
+        hasPaginationFields: false,
+        measureParagraph: ({ input, location, suppressSpaceBefore }) => {
+          const beforePt = input.source.path[0] === 4 && !suppressSpaceBefore ? 6 : 0;
+          const retained = paragraph(`p${input.source.path[0]}`, input.source, 15);
+          return {
+            layout: {
+              ...retained,
+              flowBounds: { ...retained.flowBounds, yPt: location.cursorPt.yPt + beforePt },
+              inkBounds: { ...retained.inkBounds, yPt: location.cursorPt.yPt + beforePt },
+              spacing: { beforePt, afterPt: 0 },
+              advancePt: 15 + beforePt,
+            },
+            blockExtentPt: 15 + beforePt,
+            fragmentation: { kind: 'indivisible' },
+          };
+        },
+        measureTable: () => { throw new Error('unused'); },
+        measureStoryExtent: () => 0,
+        measureFootnoteReserve: () => 0,
+        measureFollowingBlock: () => ({ fullExtentPt: 0, leadContentExtentPt: 0 }),
+        measureLineNumberGlyph: () => ({ widthPt: 0, ascentPt: 0, descentPt: 0 }),
+        resetPageAcquisition: () => undefined,
+        moveAcquisitionCursor: () => undefined,
+        flowRegistrySnapshot: emptyFlowRegistrySnapshot,
+        commitFlowRegistryDelta: () => undefined,
+      }),
+    });
+    const layout = paginateBody({
+      source: { story: 'body', storyInstance: 'body', path: [] },
+      initialSection: bodyOwner(),
+      sequence: [0, 1, 2, 3, 4].map((index) => ({
+        kind: 'body-block' as const,
+        block: {
+          kind: 'paragraph' as const, source: source(index), pageBreakBefore: false,
+          keepLines: false, keepNext: false, widowControl: true,
+          spaceBeforePt: index === 4 ? 6 : 0, spaceAfterPt: 0,
+          contextualSpacing: false, styleId: null,
+          inkless: index === 4 && inkless,
+          ...(index === 4 && onlyVisibleText !== undefined ? { onlyVisibleText } : {}),
+        },
+      })),
+    }, services, { currentDateMs: 0 });
+
+    expect(layout.pages.map((page) => page.layers.body.map((node) => node.source.path[0])))
+      .toEqual([[0, 1, 2, 3], [4]]);
+    expect(layout.pages[1]!.layers.body[0]!.flowBounds.yPt).toBe(expectedTopPt);
+  });
+
+  it('prescans an anchored successor only on the final hidden-overflow page', () => {
+    const services = Object.freeze({
+      text: { fingerprint: 'text' }, images: { fingerprint: 'images' }, math: { fingerprint: 'math' },
+    }) as LayoutServices;
+    const prescannedPages: number[] = [];
+    const measuredPages: number[] = [];
+    attachBodyLayoutKernel(services, {
+      openBodyLayoutSession: () => ({
+        hasPaginationFields: false,
+        measureParagraph: ({ input, location }) => {
+          measuredPages.push(location.pageIndex);
+          return {
+            layout: paragraph('successor', input.source, 10),
+            blockExtentPt: 10,
+            fragmentation: { kind: 'indivisible' },
+          };
+        },
+        measureTable: ({ input }) => ({
+          layout: table('clipped', input.source, 80),
+          blockExtentPt: 80,
+          unpaintedOverflowPt: 80 * 20 + 1,
+        }),
+        measureStoryExtent: () => 0,
+        measureFootnoteReserve: () => 0,
+        measureFollowingBlock: () => ({ fullExtentPt: 10, leadContentExtentPt: 10 }),
+        prescanPageAnchors: ({ location }) => {
+          prescannedPages.push(location.pageIndex);
+          return null;
+        },
+        measureLineNumberGlyph: () => ({ widthPt: 0, ascentPt: 0, descentPt: 0 }),
+        resetPageAcquisition: () => undefined,
+        moveAcquisitionCursor: () => undefined,
+        flowRegistrySnapshot: emptyFlowRegistrySnapshot,
+        commitFlowRegistryDelta: () => undefined,
+      }),
+    });
+    const input = {
+      source: { story: 'body', storyInstance: 'body', path: [] },
+      initialSection: bodyOwner(),
+      sequence: [
+        { kind: 'body-block', block: { kind: 'table', source: source(0) } },
+        { kind: 'body-block', block: {
+          kind: 'paragraph', source: source(1), pageBreakBefore: false,
+          keepLines: false, keepNext: false, widowControl: true,
+          spaceBeforePt: 0, spaceAfterPt: 0, contextualSpacing: false, styleId: null,
+          pageOwnedAnchorOccurrenceIds: ['anchor:successor'],
+        } },
+      ],
+    } as unknown as BodyLayoutInput;
+    const layout = paginateBody(input, services, { currentDateMs: 0 });
+    expect(layout.pages).toHaveLength(22);
+    expect(new Set(prescannedPages)).toEqual(new Set([0, 21]));
+    expect(measuredPages).toContain(21);
+  });
+
+  it('charges each hidden table page by its own first/even/odd reserved body extent', () => {
+    const services = Object.freeze({
+      text: { fingerprint: 'text' }, images: { fingerprint: 'images' }, math: { fingerprint: 'math' },
+    }) as LayoutServices;
+    const defaultHeader = { story: 'header', storyInstance: 'default', path: [10] } as SourceRef;
+    const evenHeader = { story: 'header', storyInstance: 'even', path: [11] } as SourceRef;
+    attachBodyLayoutKernel(services, {
+      openBodyLayoutSession: () => ({
+        hasPaginationFields: false,
+        measureParagraph: ({ input }) => ({
+          layout: paragraph('successor', input.source, 10),
+          blockExtentPt: 10,
+          fragmentation: { kind: 'indivisible' },
+        }),
+        measureTable: ({ input }) => ({
+          layout: table('clipped', input.source, 80),
+          blockExtentPt: 80,
+          unpaintedOverflowPt: 125,
+        }),
+        layoutStory: ({ source: storySource, container }) => {
+          const heightPt = storySource.path[0] === 11 ? 25 : 0;
+          const bounds = { xPt: 0, yPt: 0, widthPt: 180, heightPt };
+          return {
+            story: 'header', flowBounds: bounds, inkBounds: bounds,
+            blocks: [{ ...table(`header-table:${container.id}`, storySource, heightPt), flowDomainId: container.id }],
+            advancePt: heightPt, diagnostics: [],
+          };
+        },
+        measureStoryExtent: () => 0,
+        measureFootnoteReserve: () => 0,
+        measureFollowingBlock: () => ({ fullExtentPt: 10, leadContentExtentPt: 10 }),
+        measureLineNumberGlyph: () => ({ widthPt: 0, ascentPt: 0, descentPt: 0 }),
+        resetPageAcquisition: () => undefined,
+        moveAcquisitionCursor: () => undefined,
+        flowRegistrySnapshot: emptyFlowRegistrySnapshot,
+        commitFlowRegistryDelta: () => undefined,
+      }),
+    });
+    const input = {
+      source: { story: 'body', storyInstance: 'body', path: [] },
+      initialSection: {
+        ...bodyOwner(), evenAndOddHeaders: true,
+        headers: { default: defaultHeader, first: null, even: evenHeader },
+      },
+      sequence: [
+        { kind: 'body-block', block: { kind: 'table', source: source(0) } },
+        { kind: 'body-block', block: {
+          kind: 'paragraph', source: source(1), pageBreakBefore: false,
+          keepLines: false, keepNext: false, widowControl: true,
+          spaceBeforePt: 0, spaceAfterPt: 0, contextualSpacing: false, styleId: null,
+        } },
+      ],
+    } as unknown as BodyLayoutInput;
+    const layout = paginateBody(input, services, { currentDateMs: 0 });
+    expect(layout.pages).toHaveLength(3);
+    expect(layout.pages[1]?.geometry.contentTopPt).toBe(30);
+    expect(layout.pages[2]?.geometry.contentTopPt).toBe(10);
+    expect(layout.pages[2]?.layers.body.find((node) => node.source.path[0] === 1)
+      ?.flowBounds.yPt).toBe(10);
+  });
+
+  it('rejects an over-page table beyond the document page budget before allocating blank pages', () => {
+    const services = Object.freeze({
+      text: { fingerprint: 'text' }, images: { fingerprint: 'images' }, math: { fingerprint: 'math' },
+    }) as LayoutServices;
+    attachBodyLayoutKernel(services, {
+      openBodyLayoutSession: () => ({
+        hasPaginationFields: false,
+        measureParagraph: () => { throw new Error('unused'); },
+        measureTable: ({ input }) => ({
+          layout: table('oversized', input.source, 80),
+          blockExtentPt: 80,
+          unpaintedOverflowPt: Number.MAX_SAFE_INTEGER,
+        }),
+        measureStoryExtent: () => 0,
+        measureFootnoteReserve: () => 0,
+        measureFollowingBlock: () => ({ fullExtentPt: 0, leadContentExtentPt: 0 }),
+        measureLineNumberGlyph: () => ({ widthPt: 0, ascentPt: 0, descentPt: 0 }),
+        resetPageAcquisition: () => undefined,
+        moveAcquisitionCursor: () => undefined,
+        flowRegistrySnapshot: emptyFlowRegistrySnapshot,
+        commitFlowRegistryDelta: () => undefined,
+      }),
+    });
+    const input = {
+      source: { story: 'body', storyInstance: 'body', path: [] },
+      initialSection: bodyOwner(),
+      sequence: [{ kind: 'body-block', block: { kind: 'table', source: source(0) } }],
+    } as unknown as BodyLayoutInput;
+    expect(() => paginateBody(input, services, { currentDateMs: 0 }))
+      .toThrowError('Document page budget exceeded (10000 pages)');
+  });
+
+  it('places a paragraph after a hard page break without its authored space-before', () => {
+    const services = Object.freeze({
+      text: { fingerprint: 'text' }, images: { fingerprint: 'images' }, math: { fingerprint: 'math' },
+    }) as LayoutServices;
+    attachBodyLayoutKernel(services, {
+      openBodyLayoutSession: () => ({
+        hasPaginationFields: false,
+        measureParagraph: ({ input, location, suppressSpaceBefore }) => {
+          const beforePt = suppressSpaceBefore ? 0 : 6;
+          const retained = paragraph(`p${input.source.path[0]}`, input.source, 10);
+          return {
+            layout: {
+              ...retained,
+              flowBounds: { ...retained.flowBounds, yPt: location.cursorPt.yPt + beforePt },
+              inkBounds: { ...retained.inkBounds, yPt: location.cursorPt.yPt + beforePt },
+              spacing: { beforePt, afterPt: 0 },
+              advancePt: 10 + beforePt,
+            },
+            blockExtentPt: 10 + beforePt,
+            fragmentation: { kind: 'indivisible' },
+          };
+        },
+        measureTable: () => { throw new Error('unused'); },
+        measureStoryExtent: () => 0,
+        measureFootnoteReserve: () => 0,
+        measureFollowingBlock: () => ({ fullExtentPt: 0, leadContentExtentPt: 0 }),
+        measureLineNumberGlyph: () => ({ widthPt: 0, ascentPt: 0, descentPt: 0 }),
+        resetPageAcquisition: () => undefined,
+        moveAcquisitionCursor: () => undefined,
+        flowRegistrySnapshot: emptyFlowRegistrySnapshot,
+        commitFlowRegistryDelta: () => undefined,
+      }),
+    });
+    const block = (index: number) => ({
+      kind: 'body-block' as const,
+      block: {
+        kind: 'paragraph' as const, source: source(index), pageBreakBefore: false,
+        keepLines: false, keepNext: false, widowControl: true,
+        spaceBeforePt: 6, spaceAfterPt: 0, contextualSpacing: false, styleId: null,
+      },
+    });
+    const layout = paginateBody({
+      source: { story: 'body', storyInstance: 'body', path: [] },
+      initialSection: bodyOwner(),
+      sequence: [
+        block(0),
+        { kind: 'authored-break', source: source(1), break: 'page', origin: 'authored', sameSourceParagraphAsPrevious: false },
+        block(2),
+      ],
+    }, services, { currentDateMs: 0 });
+
+    expect(layout.pages.map((page) => page.layers.body.map((node) => node.flowBounds.yPt)))
+      .toEqual([[16], [10]]);
+
+    const parityBreak = paginateBody({
+      source: { story: 'body', storyInstance: 'body', path: [] },
+      initialSection: bodyOwner(),
+      sequence: [
+        block(0),
+        { kind: 'authored-break', source: source(1), break: 'page', origin: 'authored', parity: 'odd' },
+        block(2),
+      ],
+    }, services, { currentDateMs: 0 });
+    expect(parityBreak.pages.at(-1)!.layers.body[0]!.flowBounds.yPt).toBe(16);
+
+    const coverBreak = paginateBody({
+      source: { story: 'body', storyInstance: 'body', path: [] },
+      initialSection: bodyOwner(),
+      sequence: [
+        block(0),
+        { kind: 'authored-break', source: source(1), break: 'page', origin: 'coverPageSynthetic' },
+        block(2),
+      ],
+    }, services, { currentDateMs: 0 });
+    expect(coverBreak.pages.at(-1)!.layers.body[0]!.flowBounds.yPt).toBe(16);
+  });
+
   it('is the sole page owner and returns retained page nodes', () => {
     const services = Object.freeze({
       text: { fingerprint: 'text' }, images: { fingerprint: 'images' }, math: { fingerprint: 'math' },
@@ -1347,6 +1632,125 @@ describe('canonical body producer', () => {
       .toEqual([[0], [1, 2]]);
   });
 
+  it('accumulates fractional note heights in retained order, independently of reference grouping', () => {
+    const services = Object.freeze({
+      text: { fingerprint: 'text' }, images: { fingerprint: 'images' }, math: { fingerprint: 'math' },
+    }) as LayoutServices;
+    const heights = new Map([['a', 0.1], ['b', 0.2], ['c', 0.3]]);
+    attachBodyLayoutKernel(services, {
+      openBodyLayoutSession: () => ({
+        hasPaginationFields: false,
+        measureParagraph: ({ input }) => {
+          const ids = input.source.path[0] === 0 ? ['a'] : ['b', 'c'];
+          const layout = paragraphWithFootnote('body', input.source, 10, ids[0]!);
+          const line = layout.lines[0]!;
+          return {
+            layout: { ...layout, lines: [{ ...line, placements: ids.map(id => ({
+              ...line.placements[0]!, noteReference: { kind: 'footnote' as const, id },
+            })) }] },
+            blockExtentPt: 10, fragmentation: { kind: 'indivisible' },
+          };
+        },
+        layoutNotes: request => request.referenceIds.map(id => {
+          const heightPt = heights.get(id)!;
+          const bounds = { ...request.container.bounds, heightPt };
+          return {
+            kind: 'note', id: `footnote:${id}:page:${request.pageIndex}`,
+            source: { story: 'footnote', storyInstance: id, path: [] },
+            flowDomainId: request.container.id, ordinaryFlow: true,
+            flowBounds: bounds, inkBounds: bounds, advancePt: heightPt, separator: [],
+            story: { story: 'footnote', blocks: [], flowBounds: bounds, inkBounds: bounds, advancePt: heightPt, diagnostics: [] },
+          };
+        }),
+        measureTable: () => { throw new Error('unused'); },
+        measureStoryExtent: () => 0,
+        measureFollowingBlock: () => ({ fullExtentPt: 10, leadContentExtentPt: 10 }),
+        measureLineNumberGlyph: () => ({ widthPt: 0, ascentPt: 0, descentPt: 0 }),
+        resetPageAcquisition: () => undefined,
+        moveAcquisitionCursor: () => undefined,
+        flowRegistrySnapshot: emptyFlowRegistrySnapshot,
+        commitFlowRegistryDelta: () => undefined,
+      }),
+    });
+    const layout = paginateBody({
+      source: { story: 'body', storyInstance: 'body', path: [] },
+      initialSection: bodyOwner(),
+      sequence: [0, 1].map(index => ({
+        kind: 'body-block', block: {
+          kind: 'paragraph', source: source(index), pageBreakBefore: false,
+          keepLines: false, keepNext: false, widowControl: false,
+          spaceBeforePt: 0, spaceAfterPt: 0, contextualSpacing: false, styleId: null,
+        },
+      })),
+    }, services, { currentDateMs: 0 });
+    expect(layout.pages).toHaveLength(1);
+    const page = layout.pages[0]!;
+    expect(page.layers.notes).toHaveLength(3);
+    expect(page.flowDomains.find(domain => domain.kind === 'footnote')?.logicalBounds.heightPt)
+      .toBe(0.1 + 0.2 + 0.3);
+  });
+
+  it.each([0, 16])('places page-bottom notes after all continuous regions with footer extent %s', (footerExtent) => {
+    // ECMA-376 17.11.21 / 17.18.34: pageBottom is the physical page's
+    // reserved body edge, not the end of an earlier continuous section.
+    const services = Object.freeze({
+      text: { fingerprint: 'text' }, images: { fingerprint: 'images' }, math: { fingerprint: 'math' },
+    }) as LayoutServices;
+    attachBodyLayoutKernel(services, {
+      openBodyLayoutSession: () => ({
+        hasPaginationFields: false,
+        measureParagraph: ({ input }) => ({
+          layout: input.source.path[0] === 2
+            ? paragraphWithFootnote('last-region-note', input.source, 10, 'last')
+            : paragraph(`prior-${input.source.path[0]}`, input.source, 10),
+          blockExtentPt: 10,
+          fragmentation: { kind: 'indivisible' },
+        }),
+        measureTable: () => { throw new Error('unused'); },
+        measureStoryExtent: () => footerExtent,
+        measureFootnoteReserve: () => 10,
+        measureFollowingBlock: () => ({ fullExtentPt: 10, leadContentExtentPt: 10 }),
+        measureLineNumberGlyph: () => ({ widthPt: 0, ascentPt: 0, descentPt: 0 }),
+        resetPageAcquisition: () => undefined,
+        moveAcquisitionCursor: () => undefined,
+        flowRegistrySnapshot: emptyFlowRegistrySnapshot,
+        commitFlowRegistryDelta: () => undefined,
+      }),
+    });
+    const owner = {
+      ...bodyOwner(),
+      footers: { default: { story: 'footer' as const, storyInstance: 'default', path: [] }, first: null, even: null },
+    };
+    const block = (index: number) => ({
+      kind: 'body-block' as const,
+      block: {
+        kind: 'paragraph' as const, source: source(index), pageBreakBefore: false,
+        keepLines: false, keepNext: false, widowControl: false,
+        spaceBeforePt: 0, spaceAfterPt: 0, contextualSpacing: false, styleId: null,
+      },
+    });
+    const incoming = (index: number) => ({
+      kind: 'begin-section' as const, source: source(index),
+      section: { ...owner, sectionOccurrenceId: `section:${index}`, startType: 'continuous' as const },
+    });
+    const layout = paginateBody({
+      source: { story: 'body', storyInstance: 'body', path: [] },
+      initialSection: owner,
+      sequence: [block(0), incoming(1), block(1), incoming(2), block(2)],
+    }, services, { currentDateMs: 0 });
+    expect(layout.pages).toHaveLength(1);
+    const page = layout.pages[0]!;
+    expect(page.sectionRegions).toHaveLength(3);
+    const lastRegion = page.sectionRegions.at(-1)!;
+    const note = page.layers.notes[0]!;
+    expect(note.flowBounds.yPt + note.flowBounds.heightPt).toBe(lastRegion.blockEndPt);
+    expect(note.flowBounds.yPt).toBe(footerExtent === 0 ? 80 : 69);
+    expect(page.flowDomains.find(domain => domain.kind === 'footnote')?.sectionRegionId)
+      .toBe(lastRegion.id);
+    expect(page.layers.body.every(node => node.flowBounds.yPt + node.flowBounds.heightPt <= note.flowBounds.yPt))
+      .toBe(true);
+  });
+
   it('retains a placed paragraph footnote across a continuous section boundary', () => {
     const services = Object.freeze({
       text: { fingerprint: 'text' }, images: { fingerprint: 'images' }, math: { fingerprint: 'math' },
@@ -2131,7 +2535,10 @@ describe('canonical body producer', () => {
       .toEqual([[0], [1, 2]]);
   });
 
-  it('suppresses leading spacing when a keepNext unit moves to an automatic page', () => {
+  it.each([
+    { kind: 'unknown-content', onlyVisibleText: undefined },
+    { kind: 'image-only', onlyVisibleText: false },
+  ])('suppresses leading spacing when a $kind keepNext unit moves to an automatic page', ({ onlyVisibleText }) => {
     const services = Object.freeze({
       text: { fingerprint: 'text' }, images: { fingerprint: 'images' }, math: { fingerprint: 'math' },
     }) as LayoutServices;
@@ -2177,6 +2584,7 @@ describe('canonical body producer', () => {
           keepLines: false, keepNext: index === 1, widowControl: true,
           spaceBeforePt: index === 1 ? 15 : 0,
           spaceAfterPt: 0, contextualSpacing: false, styleId: null,
+          ...(index === 1 && onlyVisibleText !== undefined ? { onlyVisibleText } : {}),
         },
       })),
     };
@@ -2883,7 +3291,9 @@ describe('canonical body producer', () => {
         measureFootnoteReserve: () => 0,
         measureFollowingBlock: () => ({ fullExtentPt: 20, leadContentExtentPt: 20 }),
         prescanPageAnchors: ({ anchors, location }) => {
-          events.push(`prescan:${anchors.map((anchor) => anchor.paragraphSource.path[0]).join(',')}`);
+          events.push(`prescan:${anchors.map((anchor) => (
+            anchor.kind === 'drawing' ? anchor.paragraphSource : anchor.tableSource
+          ).path[0]).join(',')}`);
           return {
             floats: {
               coordinateSpace: 'logical-page-points', flowDomainId: location.flowDomainId,

@@ -1,5 +1,5 @@
 import { deepFreezeDocumentLayout } from './invariants.js';
-import { layoutOptionsKey, type LayoutOptions } from './options.js';
+import { createLayoutOptionsKeyer, type LayoutOptions } from './options.js';
 import type { DeepReadonly, DocumentLayout, LayoutPage, LayoutServices } from './types.js';
 
 export type DocumentLayoutBuilder = (
@@ -28,6 +28,8 @@ export function requireLayoutPage(
  */
 export class LayoutVariantStore {
   readonly #services: LayoutServices;
+  // Store-scoped: keys are only ever compared with keys of this store.
+  readonly #key = createLayoutOptionsKeyer();
   readonly #build: DocumentLayoutBuilder;
   readonly #variants = new Map<string, DeepReadonly<DocumentLayout>>();
   readonly #defaultOptions: LayoutOptions;
@@ -42,7 +44,7 @@ export class LayoutVariantStore {
   ) {
     this.#services = services;
     this.#defaultOptions = Object.freeze({ ...defaultOptions });
-    this.#defaultKey = layoutOptionsKey(this.#defaultOptions, this.#services);
+    this.#defaultKey = this.#key(this.#defaultOptions, this.#services);
     this.#build = build;
   }
 
@@ -58,7 +60,7 @@ export class LayoutVariantStore {
     const normalized = Object.isFrozen(options)
       ? options
       : Object.freeze({ ...options });
-    const key = layoutOptionsKey(normalized, this.#services);
+    const key = this.#key(normalized, this.#services);
     let layout = this.#variants.get(key);
     if (!layout) {
       // Evict the previous explicit-date pair before constructing the next
@@ -99,7 +101,7 @@ export class LayoutVariantStore {
     layout: DocumentLayout,
   ): DeepReadonly<DocumentLayout> {
     const normalized = Object.isFrozen(options) ? options : Object.freeze({ ...options });
-    const key = layoutOptionsKey(normalized, this.#services);
+    const key = this.#key(normalized, this.#services);
     const existing = this.#variants.get(key);
     if (existing) return existing;
     return this.#store(key, normalized, layout);
@@ -120,7 +122,7 @@ export class LayoutVariantStore {
     layout: DocumentLayout,
   ): DeepReadonly<DocumentLayout> | null {
     const normalized = Object.isFrozen(options) ? options : Object.freeze({ ...options });
-    const key = layoutOptionsKey(normalized, this.#services);
+    const key = this.#key(normalized, this.#services);
     if ((this.#variants.get(key) ?? null) !== expected) return null;
     return this.#store(key, normalized, layout);
   }
@@ -152,10 +154,10 @@ export class LayoutVariantStore {
 
   /** Whether a layout for these options is already available synchronously. */
   hasLayoutFor(options: LayoutOptions): boolean {
-    return this.#variants.has(layoutOptionsKey(options, this.#services));
+    return this.#variants.has(this.#key(options, this.#services));
   }
 
   isDefault(options: LayoutOptions): boolean {
-    return layoutOptionsKey(options, this.#services) === this.#defaultKey;
+    return this.#key(options, this.#services) === this.#defaultKey;
   }
 }

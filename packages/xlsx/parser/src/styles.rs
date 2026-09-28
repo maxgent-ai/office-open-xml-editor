@@ -4,12 +4,14 @@ use crate::types::*;
 use ooxml_common::depth::parse_guarded;
 use ooxml_common::ns::is_x_ns;
 
-/// Resolve the workbook's Normal-style font (family name + point size) by
+/// Resolve the workbook's Normal-style font (family, point size, and style) by
 /// following `<cellStyleXfs>[0].fontId` → `<fonts>[fontId]`. Returns `(None,
 /// None)` if `xl/styles.xml` is missing or malformed. The renderer uses this
 /// to compute the Max Digit Width for column-width pixel conversion
 /// (ECMA-376 §18.3.1.13).
-fn parse_default_font(doc: &roxmltree::Document) -> (Option<String>, Option<f64>) {
+pub(crate) type DefaultFont = (Option<String>, Option<f64>, bool, bool);
+
+fn parse_default_font(doc: &roxmltree::Document) -> DefaultFont {
     let mut font_id: usize = 0;
     for n in doc.descendants() {
         if n.tag_name().name() == "cellStyleXfs" && is_x_ns(n.tag_name().namespace()) {
@@ -36,28 +38,34 @@ fn parse_default_font(doc: &roxmltree::Document) -> (Option<String>, Option<f64>
         {
             let mut name = None;
             let mut sz = None;
+            let mut bold = false;
+            let mut italic = false;
             for child in font_node.children() {
                 match child.tag_name().name() {
                     "name" => name = child.attribute("val").map(|s| s.to_string()),
                     "sz" => sz = child.attribute("val").and_then(|s| s.parse().ok()),
+                    "b" => bold = parse_st_on_off(&child),
+                    "i" => italic = parse_st_on_off(&child),
                     _ => {}
                 }
             }
-            return (name, sz);
+            return (name, sz, bold, italic);
         }
         break;
     }
-    (None, None)
+    (None, None, false, false)
 }
 
 pub(crate) struct ParsedStylesPart {
     pub(crate) styles: Styles,
-    pub(crate) default_font: (Option<String>, Option<f64>),
+    pub(crate) default_font: DefaultFont,
+    pub(crate) normal_font_color: Option<Option<String>>,
     pub(crate) chart_number_formats: crate::chart::ChartNumberFormatCache,
 }
 
 pub(crate) struct ParsedStyleProjection {
-    pub(crate) default_font: (Option<String>, Option<f64>),
+    pub(crate) default_font: DefaultFont,
+    pub(crate) normal_font_color: Option<Option<String>>,
     pub(crate) chart_number_formats: crate::chart::ChartNumberFormatCache,
 }
 
@@ -74,7 +82,10 @@ pub(crate) fn parse_styles(
     let fonts = parse_fonts(&doc, theme_colors);
     let fills = parse_fills(&doc, theme_colors);
     let borders = parse_borders(&doc, theme_colors);
-    let cell_xfs = parse_cell_xfs(&doc);
+    let mut cell_xfs = parse_cell_xfs(&doc);
+    for (xf, own) in cell_xfs.iter_mut().zip(own_font_color_flags(&doc)) {
+        xf.own_font_color = own;
+    }
     let dxfs = parse_dxfs(&doc, theme_colors);
 
     Ok(ParsedStylesPart {
@@ -87,6 +98,7 @@ pub(crate) fn parse_styles(
             dxfs,
         },
         default_font,
+        normal_font_color: normal_font_color_key(&doc),
         chart_number_formats,
     })
 }
@@ -101,135 +113,159 @@ pub(crate) fn parse_style_projection(
     let doc = parse_guarded(&xml).map_err(|e| e.to_string())?;
     Ok(ParsedStyleProjection {
         default_font: parse_default_font(&doc),
+        normal_font_color: normal_font_color_key(&doc),
         chart_number_formats: crate::chart::ChartNumberFormatCache::from_document(&doc),
     })
 }
 
 pub(crate) fn parse_dxfs(doc: &roxmltree::Document, theme_colors: &[String]) -> Vec<Dxf> {
-    let mut dxfs = Vec::new();
-    for dxfs_node in doc.descendants() {
-        if dxfs_node.tag_name().name() != "dxfs" || !is_x_ns(dxfs_node.tag_name().namespace()) {
-            continue;
-        }
-        for dxf_node in dxfs_node.children() {
-            if dxf_node.tag_name().name() != "dxf" {
-                continue;
-            }
-            let mut d = Dxf::default();
-            for child in dxf_node.children() {
-                match child.tag_name().name() {
-                    "font" => {
-                        let mut f = Font {
-                            size: 11.0,
-                            ..Default::default()
-                        };
-                        for fc in child.children() {
-                            match fc.tag_name().name() {
-                                "b" => f.bold = parse_st_on_off(&fc),
-                                "i" => f.italic = parse_st_on_off(&fc),
-                                "u" => {
-                                    let v = fc.attribute("val").unwrap_or("single");
-                                    if v != "none" {
-                                        f.underline = true;
-                                        if v != "single" {
-                                            f.underline_style = Some(v.to_string());
-                                        }
-                                    }
-                                }
-                                "strike" => f.strike = parse_st_on_off(&fc),
-                                "vertAlign" => {
-                                    if let Some(v) = fc.attribute("val") {
-                                        if v != "baseline" {
-                                            f.vert_align = Some(v.to_string());
-                                        }
-                                    }
-                                }
-                                "sz" => {
-                                    if let Some(v) =
-                                        fc.attribute("val").and_then(|s| s.parse().ok())
-                                    {
-                                        f.size = v;
-                                    }
-                                }
-                                "name" => {
-                                    f.name = fc.attribute("val").map(|s| s.to_string());
-                                }
-                                "color" => {
-                                    f.color = parse_color(&fc, theme_colors);
-                                }
-                                _ => {}
-                            }
+    doc.descendants()
+        .find(|node| node.tag_name().name() == "dxfs" && is_x_ns(node.tag_name().namespace()))
+        .map(|dxfs_node| {
+            dxfs_node
+                .children()
+                .filter(|node| node.tag_name().name() == "dxf")
+                .map(|dxf_node| parse_dxf(dxf_node, theme_colors))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// One `<dxf>` (ECMA-376 §18.8.14), read in its own document so every
+/// namespace declaration in scope applies.
+pub(crate) fn parse_dxf(dxf_node: roxmltree::Node, theme_colors: &[String]) -> Dxf {
+    let mut d = Dxf::default();
+    for child in dxf_node.children() {
+        match child.tag_name().name() {
+            "font" => {
+                let mut f = Font {
+                    size: 11.0,
+                    ..Default::default()
+                };
+                let mut toggles = DxfFontToggles::default();
+                for fc in child.children() {
+                    match fc.tag_name().name() {
+                        "b" => {
+                            f.bold = parse_st_on_off(&fc);
+                            toggles.bold = Some(f.bold);
                         }
-                        d.font = Some(f);
-                    }
-                    "fill" => {
-                        let mut f = Fill::default();
-                        for pf in child.children() {
-                            if pf.tag_name().name() == "patternFill" {
-                                f.pattern_type =
-                                    pf.attribute("patternType").unwrap_or("solid").to_string();
-                                for color_node in pf.children() {
-                                    match color_node.tag_name().name() {
-                                        "fgColor" => {
-                                            f.fg_color = parse_color(&color_node, theme_colors)
-                                        }
-                                        "bgColor" => {
-                                            f.bg_color = parse_color(&color_node, theme_colors)
-                                        }
-                                        _ => {}
-                                    }
+                        "i" => {
+                            f.italic = parse_st_on_off(&fc);
+                            toggles.italic = Some(f.italic);
+                        }
+                        "u" => {
+                            let v = fc.attribute("val").unwrap_or("single");
+                            if v != "none" {
+                                f.underline = true;
+                                if v != "single" {
+                                    f.underline_style = Some(v.to_string());
+                                }
+                            }
+                            toggles.underline = Some(v != "none");
+                        }
+                        "strike" => {
+                            f.strike = parse_st_on_off(&fc);
+                            toggles.strike = Some(f.strike);
+                        }
+                        "vertAlign" => {
+                            if let Some(v) = fc.attribute("val") {
+                                if v != "baseline" {
+                                    f.vert_align = Some(v.to_string());
                                 }
                             }
                         }
-                        // In dxf, conditional format fills often only have bgColor; mirror into fgColor
-                        if f.fg_color.is_none() && f.bg_color.is_some() {
-                            f.fg_color = f.bg_color.clone();
-                        }
-                        d.fill = Some(f);
-                    }
-                    "border" => {
-                        let mut b = Border::default();
-                        for edge_node in child.children() {
-                            let style = edge_node.attribute("style").unwrap_or("").to_string();
-                            if style.is_empty() {
-                                continue;
-                            }
-                            let color = edge_node
-                                .children()
-                                .find(|c| c.is_element())
-                                .and_then(|c| parse_color(&c, theme_colors));
-                            let edge = Some(BorderEdge { style, color });
-                            match edge_node.tag_name().name() {
-                                "left" => b.left = edge,
-                                "right" => b.right = edge,
-                                "top" => b.top = edge,
-                                "bottom" => b.bottom = edge,
-                                "horizontal" => b.horizontal = edge,
-                                "vertical" => b.vertical = edge,
-                                _ => {}
+                        "sz" => {
+                            if let Some(v) = fc.attribute("val").and_then(|s| s.parse().ok()) {
+                                f.size = v;
                             }
                         }
-                        d.border = Some(b);
+                        "name" => {
+                            f.name = fc.attribute("val").map(|s| s.to_string());
+                        }
+                        "scheme" => {
+                            f.scheme = fc
+                                .attribute("val")
+                                .filter(|value| matches!(*value, "major" | "minor"))
+                                .map(str::to_owned);
+                        }
+                        "charset" => {
+                            f.charset = fc
+                                .attribute("val")
+                                .and_then(|value| value.parse::<u8>().ok());
+                        }
+                        "color" => {
+                            f.color = parse_color(&fc, theme_colors);
+                        }
+                        _ => {}
                     }
-                    "numFmt" => {
-                        let num_fmt_id = child
-                            .attribute("numFmtId")
-                            .and_then(|v| v.parse().ok())
-                            .unwrap_or(0);
-                        let format_code = child.attribute("formatCode").unwrap_or("").to_string();
-                        d.num_fmt = Some(NumFmt {
-                            num_fmt_id,
-                            format_code,
-                        });
-                    }
-                    _ => {}
                 }
+                d.font = Some(f);
+                d.font_toggles = Some(toggles);
             }
-            dxfs.push(d);
+            "fill" => {
+                let mut f = Fill::default();
+                for pf in child.children() {
+                    if pf.tag_name().name() == "gradientFill" {
+                        // ECMA-376 §18.8.24 in a dxf, e.g. a table or
+                        // PivotTable style element's gradient.
+                        f.gradient = parse_gradient_fill(pf, theme_colors);
+                    }
+                    if pf.tag_name().name() == "patternFill" {
+                        f.pattern_type = pf.attribute("patternType").unwrap_or("solid").to_string();
+                        for color_node in pf.children() {
+                            match color_node.tag_name().name() {
+                                "fgColor" => f.fg_color = parse_color(&color_node, theme_colors),
+                                "bgColor" => f.bg_color = parse_color(&color_node, theme_colors),
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                // In dxf, conditional format fills often only have bgColor; mirror into fgColor
+                if f.fg_color.is_none() && f.bg_color.is_some() {
+                    f.fg_color = f.bg_color.clone();
+                }
+                d.fill = Some(f);
+            }
+            "border" => {
+                let mut b = Border::default();
+                for edge_node in child.children() {
+                    let style = edge_node.attribute("style").unwrap_or("").to_string();
+                    if style.is_empty() {
+                        continue;
+                    }
+                    let color = edge_node
+                        .children()
+                        .find(|c| c.is_element())
+                        .and_then(|c| parse_color(&c, theme_colors));
+                    let edge = Some(BorderEdge { style, color });
+                    match edge_node.tag_name().name() {
+                        "left" => b.left = edge,
+                        "right" => b.right = edge,
+                        "top" => b.top = edge,
+                        "bottom" => b.bottom = edge,
+                        "horizontal" => b.horizontal = edge,
+                        "vertical" => b.vertical = edge,
+                        _ => {}
+                    }
+                }
+                d.border = Some(b);
+            }
+            "numFmt" => {
+                let num_fmt_id = child
+                    .attribute("numFmtId")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                let format_code = child.attribute("formatCode").unwrap_or("").to_string();
+                d.num_fmt = Some(NumFmt {
+                    num_fmt_id,
+                    format_code,
+                });
+            }
+            _ => {}
         }
-        break;
     }
-    dxfs
+    d
 }
 
 pub(crate) fn parse_num_fmts(doc: &roxmltree::Document) -> Vec<NumFmt> {
@@ -309,6 +345,17 @@ pub(crate) fn parse_fonts(doc: &roxmltree::Document, theme_colors: &[String]) ->
                         "name" => {
                             f.name = child.attribute("val").map(|s| s.to_string());
                         }
+                        "scheme" => {
+                            f.scheme = child
+                                .attribute("val")
+                                .filter(|value| matches!(*value, "major" | "minor"))
+                                .map(str::to_owned);
+                        }
+                        "charset" => {
+                            f.charset = child
+                                .attribute("val")
+                                .and_then(|value| value.parse::<u8>().ok());
+                        }
                         "color" => {
                             f.color = parse_color(&child, theme_colors);
                         }
@@ -349,62 +396,7 @@ pub(crate) fn parse_fills(doc: &roxmltree::Document, theme_colors: &[String]) ->
                                 }
                             }
                         }
-                        "gradientFill" => {
-                            // ECMA-376 §18.8.24 gradientFill — linear (default) uses
-                            // `degree`, path uses top/bottom/left/right as a relative
-                            // bounding box; children <stop position="n"><color/></stop>.
-                            let gtype = pf.attribute("type").unwrap_or("linear").to_string();
-                            let degree = pf
-                                .attribute("degree")
-                                .and_then(|s| s.parse::<f64>().ok())
-                                .unwrap_or(0.0);
-                            let left = pf
-                                .attribute("left")
-                                .and_then(|s| s.parse::<f64>().ok())
-                                .unwrap_or(0.0);
-                            let right = pf
-                                .attribute("right")
-                                .and_then(|s| s.parse::<f64>().ok())
-                                .unwrap_or(0.0);
-                            let top = pf
-                                .attribute("top")
-                                .and_then(|s| s.parse::<f64>().ok())
-                                .unwrap_or(0.0);
-                            let bottom = pf
-                                .attribute("bottom")
-                                .and_then(|s| s.parse::<f64>().ok())
-                                .unwrap_or(0.0);
-                            let mut stops: Vec<GradientStopSpec> = pf
-                                .children()
-                                .filter(|n| n.is_element() && n.tag_name().name() == "stop")
-                                .filter_map(|stop| {
-                                    let position = stop
-                                        .attribute("position")
-                                        .and_then(|s| s.parse::<f64>().ok())?;
-                                    let color_node = stop.children().find(|c| {
-                                        c.is_element() && c.tag_name().name() == "color"
-                                    })?;
-                                    let color = parse_color(&color_node, theme_colors)?;
-                                    Some(GradientStopSpec { position, color })
-                                })
-                                .collect();
-                            stops.sort_by(|a, b| {
-                                a.position
-                                    .partial_cmp(&b.position)
-                                    .unwrap_or(std::cmp::Ordering::Equal)
-                            });
-                            if !stops.is_empty() {
-                                f.gradient = Some(GradientFillSpec {
-                                    gradient_type: gtype,
-                                    degree,
-                                    left,
-                                    right,
-                                    top,
-                                    bottom,
-                                    stops,
-                                });
-                            }
-                        }
+                        "gradientFill" => f.gradient = parse_gradient_fill(pf, theme_colors),
                         _ => {}
                     }
                 }
@@ -469,6 +461,193 @@ pub(crate) fn parse_borders(doc: &roxmltree::Document, theme_colors: &[String]) 
     borders
 }
 
+/// An authored attribute value in its schema type (whitespace-collapsed and
+/// numeric, so `theme="01"` equals `theme="1"`), or its trimmed text when it
+/// is not a valid value of that type.
+#[derive(Debug, Clone, PartialEq)]
+enum Typed<T> {
+    Value(T),
+    Invalid(String),
+}
+
+fn typed<T: std::str::FromStr>(value: Option<&str>) -> Option<Typed<T>> {
+    let value = value?.trim();
+    Some(
+        value
+            .parse()
+            .map(Typed::Value)
+            .unwrap_or_else(|_| Typed::Invalid(value.to_string())),
+    )
+}
+
+/// A font's `<color>` as authored (ECMA-376 §18.8.3 CT_Color), compared
+/// without resolving it: Excel treats `rgb="FF000000"`, `indexed="8"`,
+/// `auto="1"` and an absent `<color>` as colors distinct from the Normal
+/// font's `theme="1"`, although all of them draw black. A zero `tint` is the
+/// same as none.
+#[derive(Debug, Clone, PartialEq)]
+struct AuthoredColor {
+    auto: Typed<bool>,
+    rgb: Option<String>,
+    theme: Option<Typed<u32>>,
+    indexed: Option<Typed<u32>>,
+    tint: Option<Typed<f64>>,
+}
+
+/// One `<color>` element as authored (see AuthoredColor).
+fn authored_color(color: &roxmltree::Node) -> AuthoredColor {
+    let rgb = color.attribute("rgb").map(|v| {
+        let v = v.trim().to_ascii_uppercase();
+        if v.len() == 6 {
+            format!("FF{v}")
+        } else {
+            v
+        }
+    });
+    AuthoredColor {
+        // xsd:boolean: 1/true and 0/false; omitted means false.
+        auto: match color.attribute("auto").map(str::trim) {
+            None | Some("0" | "false") => Typed::Value(false),
+            Some("1" | "true") => Typed::Value(true),
+            Some(other) => Typed::Invalid(other.to_string()),
+        },
+        rgb,
+        theme: typed(color.attribute("theme")),
+        indexed: typed(color.attribute("indexed")),
+        // A non-finite tint stays text so equality remains reflexive.
+        tint: match typed::<f64>(color.attribute("tint")) {
+            Some(Typed::Value(0.0)) => None,
+            Some(Typed::Value(t)) if !t.is_finite() => color
+                .attribute("tint")
+                .map(|v| Typed::Invalid(v.trim().to_string())),
+            other => other,
+        },
+    }
+}
+
+/// A canonical key for an authored `<color>`, equal exactly when two colors
+/// are the same authored value. Rich-text runs carry it so their color can be
+/// compared with the Normal style's once styles are known.
+pub(crate) fn authored_color_key(color: &roxmltree::Node) -> String {
+    format!("{:?}", authored_color(color))
+}
+
+/// The Normal cell style font's authored color key: the outer `None` when
+/// Normal cannot be resolved, the inner `None` for a font without `<color>`.
+pub(crate) fn normal_font_color_key(doc: &roxmltree::Document) -> Option<Option<String>> {
+    let normal_xf = normal_style_xf(doc)?;
+    let font_id = doc
+        .descendants()
+        .find(|n| n.tag_name().name() == "cellStyleXfs" && is_x_ns(n.tag_name().namespace()))?
+        .children()
+        .filter(|n| n.tag_name().name() == "xf")
+        .nth(normal_xf)?
+        .attribute("fontId")
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(0) as usize;
+    authored_font_colors(doc)
+        .get(font_id)
+        .map(|color| color.as_ref().map(|c| format!("{c:?}")))
+}
+
+/// `<cellStyle builtinId="0">`'s `xfId` (ECMA-376 §18.8.7): the Normal style.
+fn normal_style_xf(doc: &roxmltree::Document) -> Option<usize> {
+    doc.descendants()
+        .find(|n| {
+            n.tag_name().name() == "cellStyle"
+                && is_x_ns(n.tag_name().namespace())
+                && n.attribute("builtinId")
+                    .is_some_and(|v| v.trim().parse::<u32>() == Ok(0))
+        })
+        .and_then(|n| n.attribute("xfId"))
+        .and_then(|v| v.trim().parse::<usize>().ok())
+}
+
+/// Each `<font>`'s authored color; the inner `None` is a font without a
+/// `<color>` element.
+fn authored_font_colors(doc: &roxmltree::Document) -> Vec<Option<AuthoredColor>> {
+    let Some(fonts) = doc
+        .descendants()
+        .find(|n| n.tag_name().name() == "fonts" && is_x_ns(n.tag_name().namespace()))
+    else {
+        return Vec::new();
+    };
+    fonts
+        .children()
+        .filter(|n| n.tag_name().name() == "font")
+        .map(|font| {
+            font.children()
+                .find(|c| c.tag_name().name() == "color")
+                .map(|color| authored_color(&color))
+        })
+        .collect()
+}
+
+/// `own_font_color` for every `<cellXfs>` entry, in order. The Normal cell
+/// style is `<cellStyle builtinId="0">` (ECMA-376 §18.8.7), whose `xfId`
+/// selects its `<cellStyleXfs>` entry. A cell's own color is one whose font
+/// color, or whose cell style's (`xf/@xfId`) font color, is authored
+/// differently from the Normal font color. Excel draws such a color over a
+/// table style's element font color — measured with Office-exported controls
+/// covering theme / rgb / indexed / auto / absent colors and cell-style
+/// inheritance.
+///
+/// The measurements cover resolvable references only. When the Normal style,
+/// a font or a parent style cannot be resolved, the cell keeps the previous
+/// precedence (the table color applies) rather than an unmeasured guess.
+fn own_font_color_flags(doc: &roxmltree::Document) -> Vec<bool> {
+    let colors = authored_font_colors(doc);
+    // `fontId` is read as parse_cell_xfs reads it, so the flag describes the
+    // font the cell actually renders with.
+    let xfs_in = |tag: &str| -> Vec<(usize, Option<usize>)> {
+        doc.descendants()
+            .find(|n| n.tag_name().name() == tag && is_x_ns(n.tag_name().namespace()))
+            .map(|list| {
+                list.children()
+                    .filter(|n| n.tag_name().name() == "xf")
+                    .map(|xf| {
+                        let font_id = xf
+                            .attribute("fontId")
+                            .and_then(|v| v.parse::<u32>().ok())
+                            .unwrap_or(0) as usize;
+                        let xf_id = match xf.attribute("xfId") {
+                            None => Some(0),
+                            Some(v) => v.trim().parse().ok(),
+                        };
+                        (font_id, xf_id)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let style_xfs = xfs_in("cellStyleXfs");
+    let normal_xf = normal_style_xf(doc);
+    // Normal's authored color, then one "differs from Normal" answer per font
+    // (None: the font index does not resolve), so each xf is a lookup.
+    let Some(normal) = normal_xf
+        .and_then(|id| style_xfs.get(id))
+        .and_then(|&(font_id, _)| colors.get(font_id))
+    else {
+        return Vec::new();
+    };
+    let differs: Vec<bool> = colors.iter().map(|color| color != normal).collect();
+    let font_differs = |font_id: usize| differs.get(font_id).copied();
+    let style_differs = |xf_id: Option<usize>| {
+        xf_id
+            .and_then(|id| style_xfs.get(id))
+            .and_then(|&(font_id, _)| font_differs(font_id))
+    };
+    xfs_in("cellXfs")
+        .into_iter()
+        .map(
+            |(font_id, xf_id)| match (font_differs(font_id), style_differs(xf_id)) {
+                (Some(own), Some(style)) => own || style,
+                _ => false,
+            },
+        )
+        .collect()
+}
+
 pub(crate) fn parse_cell_xfs(doc: &roxmltree::Document) -> Vec<CellXf> {
     let mut xfs = Vec::new();
     for xfs_node in doc.descendants() {
@@ -502,7 +681,13 @@ pub(crate) fn parse_cell_xfs(doc: &roxmltree::Document) -> Vec<CellXf> {
                 let mut reading_order: Option<u32> = None;
                 for child in xf_node.children() {
                     if child.tag_name().name() == "alignment" {
-                        align_h = child.attribute("horizontal").map(|s| s.to_string());
+                        // ECMA-376 §18.8.1: horizontal defaults to `general`,
+                        // so an explicit `general` is the same as omission and
+                        // leaves the value-type rule (§18.18.40) to the renderer.
+                        align_h = child
+                            .attribute("horizontal")
+                            .filter(|value| *value != "general")
+                            .map(|s| s.to_string());
                         align_v = child.attribute("vertical").map(|s| s.to_string());
                         wrap_text = child
                             .attribute("wrapText")
@@ -538,6 +723,7 @@ pub(crate) fn parse_cell_xfs(doc: &roxmltree::Document) -> Vec<CellXf> {
                     text_rotation,
                     shrink_to_fit,
                     reading_order,
+                    own_font_color: false,
                 });
             }
             break;
@@ -562,6 +748,24 @@ mod strict_namespace_tests {
 
     fn theme() -> Vec<String> {
         vec!["#111111".into(); 12]
+    }
+
+    #[test]
+    fn cell_font_retains_theme_scheme_and_charset_without_overriding_name() {
+        let xml = format!(
+            r#"<styleSheet xmlns="{X_NS_STRICT}"><fonts count="2">
+          <font><name val="Calibri"/><scheme val="minor"/><charset val="128"/></font>
+          <font><name val="Arial"/></font>
+        </fonts></styleSheet>"#
+        );
+        let doc = roxmltree::Document::parse(&xml).unwrap();
+        let fonts = parse_fonts(&doc, &theme());
+        assert_eq!(fonts[0].name.as_deref(), Some("Calibri"));
+        assert_eq!(fonts[0].scheme.as_deref(), Some("minor"));
+        assert_eq!(fonts[0].charset, Some(128));
+        assert_eq!(fonts[1].name.as_deref(), Some("Arial"));
+        assert_eq!(fonts[1].scheme, None);
+        assert_eq!(fonts[1].charset, None);
     }
 
     #[test]
@@ -614,5 +818,216 @@ mod strict_namespace_tests {
         assert_eq!(styled.fill_id, 1);
         assert_eq!(styled.align_h.as_deref(), Some("center"));
         assert!(styled.wrap_text);
+    }
+
+    #[test]
+    fn normal_font_style_follows_cell_style_font_id() {
+        let xml = r#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+          <fonts count="2">
+            <font><sz val="11"/><name val="Calibri"/></font>
+            <font><b/><i/><sz val="12"/><name val="Arial"/></font>
+          </fonts>
+          <cellStyleXfs count="1"><xf fontId="1"/></cellStyleXfs>
+        </styleSheet>"#;
+        let doc = roxmltree::Document::parse(xml).unwrap();
+        assert_eq!(
+            parse_default_font(&doc),
+            (Some("Arial".into()), Some(12.0), true, true)
+        );
+    }
+
+    #[test]
+    fn own_font_color_follows_excel_table_style_precedence() {
+        // Expectations measured in Excel (PDF export of control workbooks):
+        // only a color authored exactly like the Normal font's, with a cell
+        // style that keeps it, lets a table style's font color through.
+        // Normal is cellStyleXfs[1] here, found through builtinId="0".
+        let xml = r#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <fonts>
+    <font><sz val="11"/><color theme="1"/></font>
+    <font><sz val="11"/><color rgb="FF000000"/></font>
+    <font><b/><sz val="11"/><color theme="1"/></font>
+    <font><sz val="11"/><color rgb="FFFF0000"/></font>
+    <font><sz val="11"/></font>
+    <font><sz val="11"/><color auto="1"/></font>
+    <font><sz val="11"/><color indexed="8"/></font>
+    <font><sz val="11"/><color theme="1" tint="0"/></font>
+  </fonts>
+  <cellStyleXfs><xf fontId="3"/><xf fontId="0"/></cellStyleXfs>
+  <cellXfs>
+    <xf fontId="0" xfId="1"/><xf fontId="1" xfId="1"/><xf fontId="2" xfId="1"/>
+    <xf fontId="3" xfId="1"/><xf fontId="4" xfId="1"/><xf fontId="5" xfId="1"/>
+    <xf fontId="6" xfId="1"/><xf fontId="7" xfId="1"/>
+    <xf fontId="3" xfId="0"/><xf fontId="0" xfId="0"/>
+  </cellXfs>
+  <cellStyles><cellStyle name="Red" xfId="0"/><cellStyle name="Normal" xfId="1" builtinId="0"/></cellStyles>
+</styleSheet>"#;
+        let doc = roxmltree::Document::parse(xml).unwrap();
+        assert_eq!(
+            own_font_color_flags(&doc),
+            [
+                false, // Normal font
+                true,  // rgb black
+                false, // theme black, bold
+                true,  // red
+                true,  // no <color>
+                true,  // auto
+                true,  // indexed black
+                false, // theme black, zero tint
+                true,  // red from the cell style
+                true,  // Normal font under a red cell style
+            ]
+        );
+    }
+
+    #[test]
+    fn own_font_color_compares_typed_values_and_fails_safe() {
+        let sheet = |fonts: &str, style_xfs: &str, cell_xfs: &str, styles: &str| {
+            format!(
+                r#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <fonts>{fonts}</fonts><cellStyleXfs>{style_xfs}</cellStyleXfs>
+  <cellXfs>{cell_xfs}</cellXfs>{styles}</styleSheet>"#
+            )
+        };
+        let flags = |xml: String| own_font_color_flags(&roxmltree::Document::parse(&xml).unwrap());
+        let normal =
+            r#"<cellStyles><cellStyle name="Normal" xfId="1" builtinId="00"/></cellStyles>"#;
+        // Same values spelled differently are the same authored color; the
+        // Normal style is still found through a zero-padded builtinId.
+        assert_eq!(
+            flags(sheet(
+                r#"<font><color theme="1" tint=" 0.5 "/></font><font><color theme="01" tint="0.50"/></font><font><color rgb="FFFF0000"/></font>"#,
+                r#"<xf fontId="2"/><xf fontId="0"/>"#,
+                r#"<xf fontId="1" xfId="1"/><xf fontId="2" xfId="1"/>"#,
+                normal,
+            )),
+            [false, true]
+        );
+        // Without a resolvable Normal style nothing is classified as owned.
+        assert!(flags(sheet(
+            r#"<font><color theme="1"/></font><font><color rgb="FFFF0000"/></font>"#,
+            r#"<xf fontId="1"/><xf fontId="0"/>"#,
+            r#"<xf fontId="0" xfId="1"/>"#,
+            "",
+        ))
+        .is_empty());
+        // A non-finite tint compares equal to itself; auto spellings
+        // normalize, while an invalid auto value stays distinct.
+        assert_eq!(
+            flags(sheet(
+                r#"<font><color theme="1" tint="NaN" auto="0"/></font><font><color theme="1" tint=" NaN " auto="false"/></font><font><color theme="1" tint="NaN" auto="no"/></font>"#,
+                r#"<xf fontId="0"/>"#,
+                r#"<xf fontId="0" xfId="0"/><xf fontId="1" xfId="0"/><xf fontId="2" xfId="0"/>"#,
+                r#"<cellStyles><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>"#,
+            )),
+            [false, false, true]
+        );
+        // A fontId beyond u32 falls back to font 0, as parse_cell_xfs does,
+        // so the cell is classified by the red font it renders with.
+        assert_eq!(
+            flags(sheet(
+                r#"<font><color rgb="FFFF0000"/></font><font><color theme="1"/></font>"#,
+                r#"<xf fontId="1"/>"#,
+                r#"<xf fontId="4294967296" xfId="0"/>"#,
+                r#"<cellStyles><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>"#,
+            )),
+            [true]
+        );
+        // An unresolvable font or parent style keeps the table color.
+        assert_eq!(
+            flags(sheet(
+                r#"<font><color theme="1"/></font>"#,
+                r#"<xf fontId="0"/>"#,
+                r#"<xf fontId="9" xfId="0"/><xf fontId="0" xfId="7"/>"#,
+                r#"<cellStyles><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>"#,
+            )),
+            [false, false]
+        );
+    }
+
+    #[test]
+    fn explicit_general_horizontal_alignment_is_the_default() {
+        let xml = r#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <cellXfs count="2">
+    <xf numFmtId="0" fontId="0" fillId="0" borderId="0"><alignment horizontal="general"/></xf>
+    <xf numFmtId="0" fontId="0" fillId="0" borderId="0"><alignment horizontal="left"/></xf>
+  </cellXfs>
+</styleSheet>"#;
+        let doc = roxmltree::Document::parse(xml).unwrap();
+        let cell_xfs = parse_cell_xfs(&doc);
+        assert_eq!(cell_xfs[0].align_h, None);
+        assert_eq!(cell_xfs[1].align_h.as_deref(), Some("left"));
+    }
+}
+
+/// ECMA-376 §18.8.24 gradientFill as the model's gradient: linear (default)
+/// uses `degree`, path uses top/bottom/left/right as a relative bounding box;
+/// children <stop position="n"><color/></stop>. `None` without stops.
+fn parse_gradient_fill(pf: roxmltree::Node, theme_colors: &[String]) -> Option<GradientFillSpec> {
+    // ECMA-376 §18.8.24 gradientFill — linear (default) uses
+    // `degree`, path uses top/bottom/left/right as a relative
+    // bounding box; children <stop position="n"><color/></stop>.
+    let gtype = pf.attribute("type").unwrap_or("linear").to_string();
+    let degree = pf
+        .attribute("degree")
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    let left = pf
+        .attribute("left")
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    let right = pf
+        .attribute("right")
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    let top = pf
+        .attribute("top")
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    let bottom = pf
+        .attribute("bottom")
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    let mut stops: Vec<GradientStopSpec> = pf
+        .children()
+        .filter(|n| n.is_element() && n.tag_name().name() == "stop")
+        .filter_map(|stop| {
+            let position = stop
+                .attribute("position")
+                .and_then(|s| s.parse::<f64>().ok())?;
+            let color_node = stop
+                .children()
+                .find(|c| c.is_element() && c.tag_name().name() == "color")?;
+            let color = parse_color(&color_node, theme_colors)?;
+            Some(GradientStopSpec { position, color })
+        })
+        .collect();
+    stops.sort_by(|a, b| {
+        a.position
+            .partial_cmp(&b.position)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    (!stops.is_empty()).then_some(GradientFillSpec {
+        gradient_type: gtype,
+        degree,
+        left,
+        right,
+        top,
+        bottom,
+        stops,
+    })
+}
+
+#[cfg(test)]
+mod dxf_gradient_tests {
+    #[test]
+    fn dxf_gradient_fills_are_parsed_like_cell_gradients() {
+        let xml = r#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><dxfs count="1"><dxf><font><color rgb="FFFFFFFF"/></font><fill><gradientFill degree="90"><stop position="0"><color rgb="FF9F2121"/></stop><stop position="1"><color rgb="FF761818"/></stop></gradientFill></fill></dxf></dxfs></styleSheet>"#;
+        let doc = roxmltree::Document::parse(xml).unwrap();
+        let dxf = super::parse_dxfs(&doc, &[]).remove(0);
+        let gradient = dxf.fill.unwrap().gradient.unwrap();
+        assert_eq!(gradient.degree, 90.0);
+        assert_eq!(gradient.stops.len(), 2);
+        assert_eq!(gradient.stops[0].color, "#9F2121");
     }
 }

@@ -9,9 +9,19 @@ import {
 } from '@silurus/ooxml-core/worker';
 import type { ParsedWorkbook, Row, Worksheet } from './types.js';
 import { XLSX_WORKSHEET_PULL_BYTES } from './worksheet-pull-worker.js';
-import { decodeWorksheetPullChunk } from './worksheet-pull-codec.js';
+import { decodeWorksheetPullChunk, type WorksheetPreviewBlocker } from './worksheet-pull-codec.js';
 
 export type XlsxWorksheetPullUnit =
+  | {
+      readonly kind: 'preview';
+      readonly worksheet: Worksheet | null;
+      readonly reason: WorksheetPreviewBlocker | null;
+      readonly maxRow: number;
+      readonly maxCol: number;
+      readonly sequence: number;
+      readonly wireBytes: number;
+      readonly usage?: OoxmlResourceUsageSnapshot;
+    }
   | {
       readonly kind: 'rows';
       readonly rows: Row[];
@@ -101,7 +111,9 @@ export class XlsxWorksheetPullClient {
             chunk.done,
             this.options.sharedStrings,
           );
-          const unit: XlsxWorksheetPullUnit = decoded.kind === 'rows'
+          const unit: XlsxWorksheetPullUnit = decoded.kind === 'preview'
+            ? { ...decoded, sequence: chunk.sequence, wireBytes: chunk.byteLength, usage }
+            : decoded.kind === 'rows'
             ? {
                 kind: 'rows',
                 rows: decoded.rows,

@@ -1,0 +1,426 @@
+import { LineMeasurementAdapter } from './measurement-adapter.js';
+import type { TabStop } from '../types';
+import type { KinsokuRules } from '@silurus/ooxml-core';
+import { wordMinLineStartPx, type PreparedFloatWrap } from '../float-layout.js';
+import type {
+  MeasurementTextContext,
+  VerticalGlyphMeasurementService,
+} from '../layout/measurement-capabilities.js';
+import { calcEffectiveFontPx } from '../layout/text.js';
+import {
+  type DocGridCtx,
+  type LayoutImageSeg,
+  type LayoutLine,
+  type LayoutMathSeg,
+  type LayoutSeg,
+  type LayoutTabSeg,
+  type LayoutTextSeg,
+  type LineBoundary,
+  type WrapLayoutCtx,
+} from './model.js';
+import { createLineBreakerState, prepareBreakQueue } from './break-queue.js';
+import { buildFont } from './font-routes.js';
+import { type CrossRunKinsokuRetraction } from './kinsoku.js';
+import { iterateBreakOpportunities } from './break-opportunities.js';
+import { finalizeRetainedLineShapes } from './line-finalize.js';
+import {
+  performSameLatinSpaceFace,
+  performMaterializeLatinSpaceCompression,
+  performStartLine,
+  performAvailW,
+  performFitsMeasuredWidth,
+  performFlush,
+  performProspectiveSnapAdvance,
+  performAddToLine,
+  performSegNaturalAdvance,
+  performStandaloneSnapAdvance,
+  performSegAdvance,
+  performStrNaturalAdvance,
+  performEastAsianSnapCellCount,
+  performStrAdvance,
+  performFitHomogeneousLatinSpaces,
+  performTextSegmentBox,
+  performAppendQueuedIdeographicSpaceSegment,
+  performTabFollowWidth,
+  performDecimalAlignmentPoint,
+  performDecimalAlignmentPrefixWidth,
+  performTabFollowingMetrics,
+  performEmergencyTextSplit,
+  performExternalLinkSyntaxSplit,
+  performQueueEmergencyTail,
+  performRetractCurrentLineForLeadingKinsoku,
+  performKeepLeadingKinsokuWithCurrentLine,
+} from './pass-operations.js';
+import type { PassOperationState } from './pass-operations.js';
+
+export interface LineBreakerPassInput {
+  readonly ctx: MeasurementTextContext;
+  readonly segs: LayoutSeg[];
+  readonly maxWidth: number;
+  readonly firstIndent: number;
+  readonly scale: number;
+  readonly tabStops: TabStop[];
+  readonly wrapCtx?: WrapLayoutCtx;
+  readonly fontFamilyClasses: Record<string, string>;
+  readonly tabOriginPx: number;
+  readonly kinsoku: KinsokuRules;
+  readonly characterGrid?: DocGridCtx;
+  readonly defaultTabPt: number;
+  readonly marginRightPx: number;
+  readonly baseRtl: boolean;
+  readonly isJustified: boolean;
+  readonly stretchLastLine: boolean;
+  readonly startBoundary?: LineBoundary;
+  readonly widthPolicy: 'bounded' | 'intrinsic';
+  readonly verticalGlyphMeasurement?: VerticalGlyphMeasurementService;
+  readonly overflowPunct: boolean;
+  readonly passContext: Readonly<{
+    probeHeights: readonly number[] | null;
+    preparedFloatWrap?: PreparedFloatWrap;
+  }>;
+}
+
+/**
+ * One immutable-input line-break pass; all mutable line state is pass-local.
+ * This driver is deliberately a longer, flat wiring function: it binds the
+ * explicit pass state to the named measurement, fit, tab, and break operations.
+ * The decisions and mutations live in those operations and the iterator.
+ */
+export function runLineBreakerPass(input: LineBreakerPassInput): LayoutLine[] {
+  const {
+    ctx,
+    segs,
+    maxWidth,
+    firstIndent,
+    scale,
+    tabStops,
+    wrapCtx,
+    fontFamilyClasses,
+    tabOriginPx,
+    kinsoku,
+    characterGrid,
+    defaultTabPt,
+    marginRightPx,
+    baseRtl,
+    isJustified,
+    stretchLastLine,
+    startBoundary,
+    widthPolicy,
+    verticalGlyphMeasurement,
+    overflowPunct,
+    passContext,
+  } = input;
+
+  const { probeHeights, preparedFloatWrap } = passContext;
+  const breakerState = createLineBreakerState(maxWidth, wrapCtx);
+
+  let operationState: PassOperationState;
+  const sameLatinSpaceFace = performSameLatinSpaceFace;
+
+  const materializeLatinSpaceCompression = (): void =>
+    performMaterializeLatinSpaceCompression(operationState);
+  const snapPitchPx =
+    characterGrid?.type === 'snapToChars' &&
+    characterGrid.characterPitchPt != null &&
+    characterGrid.characterPitchPt > 0
+      ? characterGrid.characterPitchPt * scale
+      : null;
+
+  // Square-only compatibility side-space (px) a CONTENT line needs before it may
+  // START beside a square object rather than flow below its band.
+  // `word-square-line-start-one-inch` supplies the requirement through
+  // wordMinLineStartPx(scale), independent of a content line's text. The same
+  // threshold applies to a short token and a long word; a word that overruns
+  // the side gap is force-broken there by the overlong-word path. This replaced
+  // a per-line first-atomic-token
+  // width probe that wedged short-token lines into sub-inch gaps and refused
+  // ≥1-inch gaps to long-word lines (issue #676). Shared by the paint pass and the
+  // paginator's two mirror layouts (they call layoutLines with scale 1), so the
+  // flow/beside decision agrees across passes.
+  //
+  // NOTE — this 1-inch rule is the CONTENT-line threshold. A literally-empty
+  // paragraph's pilcrow is placed by resolveEmptyMarkTop / flowMarkLine
+  // (renderer.ts) against the NARROWER pilcrow-em threshold. An anchorHost-only
+  // paragraph still enters layoutLines so its anchor-character metrics size the
+  // mark line, but `isParagraphMarkOnlyFlow` selects the same narrow threshold
+  // for its first line. `word-empty-mark-float-side-gap` supplies that narrower
+  // threshold. #676 over-generalized one inch onto marks; inline
+  // content (including a content paragraph's trailing-break final line) keeps
+  // the square-only 1-inch rule. Tight/through are governed by their polygon
+  // openings (§20.4.2.18/.19), for which there is no corresponding evidence.
+  const minLineStartWidth = (): number => wordMinLineStartPx(scale);
+  const isParagraphMarkOnlyFlow =
+    segs.length > 0 &&
+    segs.every(
+      (segment) =>
+        ('text' in segment && segment.metricOnly === true) ||
+        ('imagePath' in segment && Boolean(segment.anchor)),
+    );
+
+  // Compute wrap constraints for a new line about to start. Mutates
+  // lineXOffset/lineMaxWidth/currentLineTopY. `minWidth` is the smallest clear
+  // square side-space the upcoming line must have to START here. Polygon wraps
+  // receive MIN_LINE_GAP separately so the compatibility policy cannot erase a
+  // through opening explicitly permitted by §20.4.2.18.
+  const startLine = (minWidth: number = 0): void => performStartLine(operationState, minWidth);
+
+  // Intrinsic acquisition deliberately disables automatic line wrapping while
+  // retaining the real paragraph/anchor width for tab and alignment reference
+  // frames. This is a semantic mode, not a synthetic oversized page.
+  const availW = () => performAvailW(operationState);
+
+  // AutoFit can set a table column to the measured text advance plus its
+  // first-line indent and grouped cell insets. Cell acquisition subtracts those
+  // same grouped insets. At exact equality, subtracting the indent from the
+  // line width may round down while adding it to the advance does not. Both
+  // inequalities are equivalent in real arithmetic; check both operation
+  // orders for a finite bounded line. This changes arithmetic order only;
+  // it adds no fixed overflow allowance.
+  const fitsMeasuredWidth = (used: number, available: number): boolean =>
+    performFitsMeasuredWidth(operationState, used, available);
+
+  // ECMA-376 §17.3.1.37 tab stops in leading-edge px, for the bidi post-pass.
+  const bidiCustomStopsPx = baseRtl
+    ? tabStops.map((t) => ({ pos: t.pos * scale, alignment: t.alignment, leader: t.leader }))
+    : [];
+  const bidiIntervalPx = defaultTabPt * scale;
+
+  // Rewrite a finalized bidi line's tab widths (+ leaders) in the VISUAL frame
+  // (§17.3.1.6 base RTL). The line's tabs were laid out with provisional width 0
+  // by the tab block below (the LTR pen math does not apply under an RTL base);
+  // here we place each tab-delimited cell at its mirrored stop. No-op for a line
+  // without tabs (LTR paragraphs skip this entirely — `baseRtl` is false).
+
+  const flush = (forceHeight?: number, brTerminated = false, nextStart?: LineBoundary) =>
+    performFlush(operationState, forceHeight, brTerminated, nextStart);
+
+  const prospectiveSnapAdvance = (s: LayoutTextSeg, naturalWidth: number): number =>
+    performProspectiveSnapAdvance(operationState, s, naturalWidth);
+
+  const addToLine = (
+    s: LayoutTextSeg | LayoutImageSeg | LayoutMathSeg | LayoutTabSeg,
+    w: number,
+    h: number,
+    asc: number,
+    desc: number,
+  ) => performAddToLine(operationState, s, w, h, asc, desc);
+
+  const measurement = new LineMeasurementAdapter(
+    ctx,
+    scale,
+    (segment) =>
+      buildFont(
+        segment.bold,
+        segment.italic,
+        calcEffectiveFontPx(segment, scale),
+        segment.fontFamily,
+        fontFamilyClasses,
+        segment.fontRoute,
+      ),
+    verticalGlyphMeasurement,
+  );
+  const effectiveFontPx = (s: LayoutTextSeg): number => calcEffectiveFontPx(s, scale);
+  const measureText = (s: LayoutTextSeg, clusterGeometry = false): TextMetrics =>
+    measurement.measureSegment(s, clusterGeometry);
+  const verticalInkExtra = (s: LayoutTextSeg, text: string): number =>
+    measurement.verticalInkExtra(s, text);
+  const setMeasureFont = (font: string): void => measurement.setFont(font);
+
+  const endBoundary: LineBoundary = { segIndex: segs.length, charOffset: 0 };
+  breakerState.queue = prepareBreakQueue(segs, startBoundary, kinsoku, scale, measurement);
+
+  // The segment's laid-out ADVANCE (= its measuredWidth): natural width plus the
+  // character-grid delta, the §17.3.2.43 horizontal glyph scale (w:w) and the
+  // §17.3.2.35 character-spacing pitch (w:spacing). This is the SINGLE source of
+  // truth shared with the draw paths (segAdvanceWidth) — every line-break / fit /
+  // tab measurement uses it so line wrapping packs the grid's char count and the
+  // box matches what is drawn (measure==paint). `kerning` (§17.3.2.19) is applied
+  // via `ctx.fontKerning` inside `withSegKerning`, wrapping the measureText call.
+  // The #1014 vo=Tr ink deficit (`verticalInkExtra`, defined above) is folded into
+  // the natural width so measure == paint on an under-reporting vertical run.
+  const segNaturalAdvance = (s: LayoutTextSeg): number =>
+    performSegNaturalAdvance(operationState, s);
+  const standaloneSnapAdvance = (s: LayoutTextSeg, naturalWidth: number): number =>
+    performStandaloneSnapAdvance(operationState, s, naturalWidth);
+  const segAdvance = (s: LayoutTextSeg): number => performSegAdvance(operationState, s);
+  // Grid advance of an arbitrary substring under a segment's font (for split
+  // prefixes/tails). Selects the font (and the run's kerning state), then applies
+  // the same width model as a whole segment BUT with the substring's own
+  // text/length so char-spacing scales with the piece — the split-prefix vs
+  // whole-segment advances must agree.
+  const strNaturalAdvance = (
+    s: LayoutTextSeg,
+    text: string,
+    retainTrailingPunctuationCompression = false,
+  ): number =>
+    performStrNaturalAdvance(operationState, s, text, retainTrailingPunctuationCompression);
+  const eastAsianSnapCellCount = (s: LayoutTextSeg): number =>
+    performEastAsianSnapCellCount(operationState, s);
+  const strAdvance = (
+    s: LayoutTextSeg,
+    text: string,
+    retainTrailingPunctuationCompression = false,
+  ): number => performStrAdvance(operationState, s, text, retainTrailingPunctuationCompression);
+
+  /** Compatibility projection governed by WORD_LATIN_INTERWORD_XAVG_FLOOR.
+   * The selected face's OS/2 xAvgCharWidth / 2 is the minimum inter-word
+   * advance. Equal-face gaps share the required deficit uniformly; a natural
+   * space narrower than that minimum retains its natural advance. This is not
+   * an ECMA-376 definition or a replacement for glyph advance.
+   * Mixed faces, authored spacing, and snap-to-character cells are outside
+   * the measured scope and retain their natural widths. The §17.6.5 grid
+   * pitch is additive to the selected-face floor. The Word 6 compatibility
+   * setting excludes the fit projection at segment acquisition. */
+  const fitHomogeneousLatinSpaces = (next: LayoutTextSeg, nextFitWidth: number): boolean =>
+    performFitHomogeneousLatinSpaces(operationState, next, nextFitWidth);
+
+  /** Measure one text segment's canonical advance and vertical contribution.
+   * Every path that commits a complete text segment to a line must use this
+   * authority so font fallback, small-caps, position, ruby and grid metrics do
+   * not diverge at internal segment seams. */
+  const textSegmentBox = (
+    s: LayoutTextSeg,
+  ): Readonly<{
+    width: number;
+    height: number;
+    ascent: number;
+    descent: number;
+  }> => performTextSegmentBox(operationState, s);
+
+  /** Continue the existing U+3000 line-end hanging rule across an internal
+   * width-balance segment seam. The split space keeps its own font/grid advance
+   * for measure == paint. UAX #14 classifies U+3000 as BA, so an internal seam
+   * before it must not become an authored break opportunity. Restrict
+   * consumption to the same authored run; an actual source boundary remains
+   * independently modeled. */
+  const appendQueuedIdeographicSpaceSegment = (source: LayoutTextSeg): void =>
+    performAppendQueuedIdeographicSpaceSegment(operationState, source);
+
+  // Width of a queued segment, for right/center tab look-ahead.
+  const tabFollowWidth = (q: LayoutSeg): number => performTabFollowWidth(operationState, q);
+
+  /** Resolve the registered decimal alignment point independently of run/style
+   * seams so both LTR and mirrored bidi tab paths consume one source boundary. */
+  const decimalAlignmentPoint = performDecimalAlignmentPoint;
+
+  const decimalAlignmentPrefixWidth = (segments: readonly LayoutSeg[]): number | undefined =>
+    performDecimalAlignmentPrefixWidth(operationState, segments);
+
+  const tabFollowingMetrics = (): Readonly<{
+    totalWidth: number;
+    decimalPrefixWidth?: number;
+  }> => performTabFollowingMetrics(operationState);
+
+  // A `<w:br/>` always starts a new line (§17.3.3.1) — when it is the LAST
+  // content of the paragraph, the new line is empty but still occupies one line
+  // height. Track the trailing break so it can be flushed after the loop.
+
+  // Establish the first line's wrap window now that the content queue exists.
+
+  /**
+   * Return the widest grapheme-safe UTF-16 prefix that fits an emergency
+   * break band. This is the single authority used whether the overlong token
+   * starts on an empty line or consumes the useful remainder of the current
+   * line. Keeping both cases here prevents measurement and retained paint
+   * partitions from drifting apart.
+   */
+  const emergencyTextSplit = (
+    segment: LayoutTextSeg,
+    available: number,
+    forceAtLeastOne = true,
+  ): number => performEmergencyTextSplit(operationState, segment, available, forceAtLeastOne);
+
+  /** Select the last semantic URL candidate that fits the prospective band.
+   * Every candidate is evaluated independently: signed character spacing can
+   * make prefix advances non-monotone, and snapToChars must include the current
+   * line's active script block rather than treating the prefix in isolation. */
+  const externalLinkSyntaxSplit = (segment: LayoutTextSeg, available: number): number =>
+    performExternalLinkSyntaxSplit(operationState, segment, available);
+
+  const queueEmergencyTail = (segment: LayoutTextSeg, split: number): void =>
+    performQueueEmergencyTail(operationState, segment, split);
+
+  /**
+   * Move a legal suffix of the current line ahead of a segment whose first
+   * glyph is forbidden at line start. This is the single cross-run 追い出し
+   * authority for both the CJK and SEA overflow paths.
+   *
+   * A source seam marked by `hardJoinPrev` is indivisible: moving the complete
+   * following segment would strand its owner on the previous line. Likewise,
+   * a split at either edge of an authored no-break range is not legal. When
+   * either constraint blocks retraction, the caller must keep the forbidden
+   * leader on the current line instead of weakening the authored constraint.
+   */
+  const retractCurrentLineForLeadingKinsoku = (next: LayoutTextSeg): CrossRunKinsokuRetraction =>
+    performRetractCurrentLineForLeadingKinsoku(operationState, next);
+
+  /** Keep one otherwise-forbidden line-start grapheme with the current line.
+   * This is the only legal fallback when cross-run retraction would split an
+   * authored hard/no-break group. Reprocessing the tail repeats the rule for a
+   * sequence of forbidden leaders while guaranteeing grapheme-safe progress. */
+  const keepLeadingKinsokuWithCurrentLine = (
+    segment: LayoutTextSeg,
+    h: number,
+    asc: number,
+    desc: number,
+  ): boolean => performKeepLeadingKinsokuWithCurrentLine(operationState, segment, h, asc, desc);
+
+  operationState = {
+    ...input,
+    probeHeights,
+    preparedFloatWrap,
+    breakerState,
+    sameLatinSpaceFace,
+    materializeLatinSpaceCompression,
+    snapPitchPx,
+    minLineStartWidth,
+    isParagraphMarkOnlyFlow,
+    startLine,
+    availW,
+    fitsMeasuredWidth,
+    bidiCustomStopsPx,
+    bidiIntervalPx,
+    flush,
+    prospectiveSnapAdvance,
+    addToLine,
+    measurement,
+    effectiveFontPx,
+    measureText,
+    verticalInkExtra,
+    setMeasureFont,
+    endBoundary,
+    segNaturalAdvance,
+    standaloneSnapAdvance,
+    segAdvance,
+    strNaturalAdvance,
+    eastAsianSnapCellCount,
+    strAdvance,
+    fitHomogeneousLatinSpaces,
+    textSegmentBox,
+    appendQueuedIdeographicSpaceSegment,
+    tabFollowWidth,
+    decimalAlignmentPoint,
+    decimalAlignmentPrefixWidth,
+    tabFollowingMetrics,
+    emergencyTextSplit,
+    externalLinkSyntaxSplit,
+    queueEmergencyTail,
+    retractCurrentLineForLeadingKinsoku,
+    keepLeadingKinsokuWithCurrentLine,
+  };
+  startLine(
+    isParagraphMarkOnlyFlow
+      ? (wrapCtx?.paragraphMarkLineStartWidth ?? minLineStartWidth())
+      : minLineStartWidth(),
+  );
+
+  iterateBreakOpportunities(operationState);
+
+  if (breakerState.currentLine.length > 0) flush();
+  // Trailing <w:br/>: emit the empty line it opened (§17.3.3.1).
+  else if (breakerState.trailingBreakFontSize !== null) flush(breakerState.trailingBreakFontSize);
+
+  finalizeRetainedLineShapes(breakerState.lines, widthPolicy, measureText);
+
+  return breakerState.lines;
+}

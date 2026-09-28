@@ -12,6 +12,25 @@ export function autoResize(render: (width: number, height: number) => void | Pro
 export interface AutoResizeOptions {
     pauseWhenHidden?: boolean;
 }
+export type BlipEffect = {
+    type: 'grayscale';
+} | {
+    type: 'biLevel';
+    thresh: number;
+} | {
+    type: 'colorChange';
+    from: string;
+    fromAlpha: number;
+    to: string;
+    toAlpha: number;
+    useAlpha: boolean;
+} | {
+    type: 'luminance';
+    bright: number;
+    contrast: number;
+} | {
+    type: 'duotone';
+};
 export interface Border {
     left: BorderEdge | null;
     right: BorderEdge | null;
@@ -53,6 +72,8 @@ export interface CellFont {
     size: number;
     color: string | null;
     name: string | null;
+    scheme?: 'major' | 'minor';
+    charset?: number;
     underlineStyle?: string;
     vertAlign?: 'superscript' | 'subscript';
 }
@@ -89,6 +110,7 @@ export interface CellXf {
     textRotation?: number;
     shrinkToFit?: boolean;
     readingOrder?: number;
+    ownFontColor?: boolean;
 }
 export interface CfIcon {
     iconSet: string;
@@ -100,6 +122,7 @@ export type CfRule = {
     formulas: string[];
     dxfId: number | null;
     priority: number;
+    stopIfTrue?: boolean;
 } | {
     type: 'expression';
     formula: string;
@@ -110,6 +133,8 @@ export type CfRule = {
     type: 'colorScale';
     stops: CfStop[];
     priority: number;
+    activeFormula?: string;
+    stopIfTrue?: boolean;
 } | {
     type: 'dataBar';
     color: string;
@@ -117,6 +142,8 @@ export type CfRule = {
     max: CfValue;
     priority: number;
     gradient: boolean;
+    activeFormula?: string;
+    stopIfTrue?: boolean;
 } | {
     type: 'top10';
     top: boolean;
@@ -124,6 +151,7 @@ export type CfRule = {
     rank: number;
     dxfId: number | null;
     priority: number;
+    stopIfTrue?: boolean;
 } | {
     type: 'aboveAverage';
     aboveAverage: boolean;
@@ -131,6 +159,7 @@ export type CfRule = {
     stdDev?: number;
     dxfId: number | null;
     priority: number;
+    stopIfTrue?: boolean;
 } | {
     type: 'iconSet';
     iconSet: string;
@@ -138,10 +167,13 @@ export type CfRule = {
     reverse: boolean;
     priority: number;
     customIcons?: CfIcon[];
+    activeFormula?: string;
+    stopIfTrue?: boolean;
 } | {
     type: 'other';
     kind: string;
     priority: number;
+    stopIfTrue?: boolean;
 };
 export interface CfStop {
     kind: string;
@@ -167,6 +199,10 @@ export interface ChartAnchor {
 export interface ChartAreaGroupDecorations {
     groupIndex: number;
     dropLines?: ChartDecorationLineStyle | null;
+}
+export interface ChartAxisNumberFormat {
+    authoredCode: string;
+    sourceLinked?: boolean | null;
 }
 export interface ChartBarGroupDecorations {
     groupIndex: number;
@@ -483,6 +519,7 @@ export interface ChartModel {
     title: string | null;
     titleRichRuns?: ChartTextRun[] | null;
     titlePresent?: boolean;
+    authoredWithoutSeries?: boolean;
     categories: string[];
     categorySourceHidden?: boolean[] | null;
     categoryLevels?: string[][] | null;
@@ -562,6 +599,7 @@ export interface ChartModel {
     subtotalIndices: number[];
     legendManualLayout?: LegendManualLayout | null;
     valAxisFormatCode?: string | null;
+    valAxisNumberFormat?: ChartAxisNumberFormat | null;
     valAxisDisplayUnits?: ChartDisplayUnits | null;
     catAxisDisplayUnits?: ChartDisplayUnits | null;
     barGapWidth?: number | null;
@@ -650,6 +688,7 @@ export interface ChartModel {
     valAxisLineDash?: string | null;
     valAxisLinePaintAuthored?: boolean | null;
     catAxisFormatCode?: string | null;
+    catAxisNumberFormat?: ChartAxisNumberFormat | null;
     catAxisMin?: number | null;
     catAxisMax?: number | null;
     titleManualLayout?: ChartManualLayout | null;
@@ -1120,6 +1159,13 @@ export interface Dxf {
     fill: CellFill | null;
     border: Border | null;
     numFmt?: NumFmt | null;
+    fontToggles?: DxfFontToggles;
+}
+export interface DxfFontToggles {
+    bold?: boolean;
+    italic?: boolean;
+    underline?: boolean;
+    strike?: boolean;
 }
 type ExtensibleLiteral<Known extends string> = Known | (string & Record<never, never>);
 type Fill = SolidFill | NoFill | GradientFill | PatternFill | ImageFill;
@@ -1203,6 +1249,9 @@ export interface ImageAnchor {
     editAs?: string;
     nativeExtCx: number;
     nativeExtCy: number;
+    rotation?: number;
+    flipH?: boolean;
+    flipV?: boolean;
     imagePath: string;
     mimeType: string;
     svgImagePath?: string;
@@ -1228,6 +1277,7 @@ export interface ImageFill {
     tile?: TileInfo;
     alpha?: number;
     duotone?: Duotone__emitterCollision1;
+    blipEffects?: BlipEffect[];
 }
 export interface ImageResourceOptions {
     decodedByteBudget?: number;
@@ -1253,6 +1303,7 @@ interface LoadOptions__emitterCollision1 {
     useGoogleFonts?: boolean;
     cjkFallback?: CjkFallback;
     password?: string;
+    modelSources?: readonly ModelSource[];
     wasmUrl?: string | URL;
     maxZipEntryBytes?: number;
     resourceLimits?: OoxmlResourceLimits;
@@ -1389,6 +1440,29 @@ export interface MergeCell {
     bottom: number;
     right: number;
 }
+const MODEL_SOURCE_MODULE_PROTOCOL = 'ooxml-model-source-module/v1';
+export interface ModelSource<T extends ModelSourceTarget = ModelSourceTarget> {
+    readonly target: T;
+    claim(bytes: Uint8Array): boolean;
+    beginLoad(): ModelSourceLoad;
+}
+export type ModelSourceConfig = Readonly<Record<string, ModelSourceConfigValue>>;
+export type ModelSourceConfigValue = string | number | boolean | null;
+export interface ModelSourceLoad {
+    readonly module: ModelSourceModuleDescriptor;
+    readonly transfer?: readonly Transferable[];
+    release(): void;
+}
+export interface ModelSourceModule<TArchive = unknown> {
+    openModelSource(bytes: Uint8Array, config: ModelSourceConfig, signal?: AbortSignal, transfer?: readonly Transferable[]): Promise<OpenedModelSource<TArchive>>;
+}
+export interface ModelSourceModuleDescriptor {
+    readonly protocol: typeof MODEL_SOURCE_MODULE_PROTOCOL;
+    readonly target: ModelSourceTarget;
+    readonly moduleUrl: string;
+    readonly config: ModelSourceConfig;
+}
+export type ModelSourceTarget = 'docx' | 'xlsx' | 'pptx';
 export interface NoFill {
     fillType: 'none';
 }
@@ -1403,12 +1477,12 @@ export class OoxmlDecodedImageLimitError extends RangeError {
     readonly code: 'ooxml-decoded-image-limit';
     constructor(metric: OoxmlDecodedImageLimitMetric, limit: number, observed: number);
 }
-export type OoxmlDecodedImageLimitMetric = 'image-dimension' | 'image-pixels' | 'active-decoded-bytes';
+export type OoxmlDecodedImageLimitMetric = 'image-dimension' | 'image-pixels' | 'active-decoded-bytes' | 'image-effect-count' | 'image-effect-work';
 export class OoxmlError extends Error {
     readonly code: OoxmlErrorCode;
     constructor(code: OoxmlErrorCode, message: string);
 }
-export type OoxmlErrorCode = 'encrypted' | 'invalid-password' | 'unsupported-encryption' | 'legacy-binary-format' | 'not-ooxml';
+export type OoxmlErrorCode = 'encrypted' | 'invalid-password' | 'unsupported-encryption' | 'legacy-binary-format' | 'not-ooxml' | 'invalid-numbering';
 export type OoxmlErrorStage = 'container' | 'decompression' | 'parsing' | 'serialization' | 'layout' | 'rendering' | 'worker';
 export type OoxmlFormat = 'docx' | 'xlsx' | 'pptx';
 export type OoxmlResourceLimit = number | null;
@@ -1475,6 +1549,11 @@ export interface OoxmlResourceViolation {
     readonly configurable: boolean;
     readonly usage: OoxmlResourceUsageSnapshot;
 }
+export interface OpenedModelSource<TArchive> {
+    readonly archive: TArchive;
+    readonly viewDefaults?: Readonly<Record<string, boolean>>;
+    close(): void;
+}
 export function openExternalHyperlink(url: string, allowed?: readonly string[], win?: Pick<Window, 'open'> | undefined): boolean;
 export interface OutlinePr {
     summaryBelow: boolean;
@@ -1484,6 +1563,9 @@ export interface ParsedWorkbook {
     workbook: Workbook;
     styles: Styles;
     sharedStrings: SharedString[];
+    layoutMetrics?: {
+        maximumDigitWidth: number;
+    };
 }
 export type PathCmd = {
     op: 'moveTo';
@@ -1519,6 +1601,8 @@ export type PathCmd = {
 export interface PathInfo {
     w: number;
     h: number;
+    fill?: 'none' | 'lighten' | 'lightenLess' | 'darken' | 'darkenLess';
+    stroke?: false;
     commands: PathCmd[];
 }
 export interface PatternFill {
@@ -1539,6 +1623,10 @@ export interface PhoneticRun {
     text: string;
 }
 export type PhoneticType = 'fullwidthKatakana' | 'halfwidthKatakana' | 'Hiragana' | 'noConversion';
+export interface PivotAxisItem {
+    kind: string;
+    depth: number;
+}
 export type PivotCacheSource = {
     kind: 'worksheet';
     sheet?: string;
@@ -1634,6 +1722,23 @@ export interface PivotTableMetadata {
     cacheSource?: PivotCacheSource;
     status: PivotMetadataStatus;
     extensionUris?: string[];
+    style?: PivotTableStyle;
+    rowItems?: PivotAxisItem[];
+    columnItems?: PivotAxisItem[];
+}
+export interface PivotTableStyle {
+    name: string;
+    showRowHeaders: boolean;
+    showColumnHeaders: boolean;
+    showRowStripes: boolean;
+    showColumnStripes: boolean;
+    showLastColumn: boolean;
+    elements: PivotTableStyleElement[];
+}
+export interface PivotTableStyleElement {
+    kind: string;
+    size: number;
+    dxf: Dxf;
 }
 export interface Reflection {
     blur: number;
@@ -1681,6 +1786,7 @@ export interface RunFont {
     name?: string | null;
     underlineStyle?: string;
     vertAlign?: 'superscript' | 'subscript';
+    normalColor?: boolean;
 }
 export interface SecondaryValueAxis {
     style?: ChartExElementStyle | null;
@@ -1692,6 +1798,7 @@ export interface SecondaryValueAxis {
     title: string | null;
     hidden: boolean;
     formatCode?: string | null;
+    numberFormat?: ChartAxisNumberFormat | null;
     displayUnits?: ChartDisplayUnits | null;
     fontColor?: string | null;
     fontPaintAuthored?: boolean | null;
@@ -1829,6 +1936,11 @@ export interface ShapeParagraph {
     marL?: number;
     marR?: number;
     indent?: number;
+    defTabSz?: number;
+    tabStops?: {
+        pos: number;
+        algn: string;
+    }[];
     spaceLine?: SpaceLine | null;
     runs: ShapeTextRun[];
 }
@@ -2061,6 +2173,7 @@ export interface Worksheet {
     colCollapsed?: Record<number, boolean>;
     colHidden?: Record<number, boolean>;
     defaultColWidth: number;
+    baseColWidth?: number;
     defaultRowHeight: number;
     defaultRowHeightCustom?: boolean;
     mergeCells: MergeCell[];
@@ -2088,6 +2201,10 @@ export interface Worksheet {
     sparklineGroups?: SparklineGroup[];
     defaultFontFamily?: string;
     defaultFontSize?: number;
+    defaultFontBold?: boolean;
+    defaultFontItalic?: boolean;
+    themeJapaneseMajorFont?: string;
+    themeJapaneseMinorFont?: string;
     date1904?: boolean;
     parseError?: string;
 }

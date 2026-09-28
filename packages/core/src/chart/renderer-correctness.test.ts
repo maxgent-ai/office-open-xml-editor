@@ -9179,6 +9179,16 @@ describe('ChartEx flat layouts dispatch to semantic renderers', () => {
     expect(rec.texts.map(text => text.text)).toEqual(['Unsupported chart']);
   });
 
+  it('treats inherited object names as unsupported chart types', () => {
+    const rec = recordingCtx();
+    renderChart(rec.ctx, baseModel({
+      chartType: 'toString',
+      series: [series({ values: [1] })],
+    }), RECT, 1);
+
+    expect(rec.texts.map(text => text.text)).toEqual(['Unsupported chart']);
+  });
+
   it('measures the same semantic ChartEx column legend that it paints', () => {
     const renderPlot = (extraSeries: ChartSeries[]): RectCall => {
       const rec = recordingCtx();
@@ -14127,6 +14137,19 @@ describe('classic chart data table (CT_DTable)', () => {
       && rect.y <= sales.y && rect.y + rect.h >= sales.y,
     )).toBe(false);
     expect(rec.arcs.length).toBeGreaterThan(0); // line-series key marker
+  });
+
+  it('formats data table values in the chart date system', () => {
+    const rec = recordingCtx();
+    renderChart(rec.ctx, baseModel({
+      chartType: 'line',
+      categories: ['Q1'],
+      date1904: true,
+      series: [series({ name: 'North', values: [43465], valFormatCode: 'yyyy-mm-dd', seriesType: 'line' })],
+      dataTable: { showHorizontalBorder: false, showVerticalBorder: false, showOutline: false, showKeys: false },
+    }), RECT, 1);
+    // 1904-system serial 43465 is 2023-01-01 (the 1900 system reads 2018-12-31).
+    expect(rec.texts.some(text => text.text === '2023-01-01')).toBe(true);
   });
 
   it('honors each authored border switch and an explicit noFill line independently', () => {
@@ -23520,6 +23543,15 @@ describe('canvas state leak (#766) — renderChart restores ctx state', () => {
     renderChart(ctx, baseModel({ chartType: 'pie', series: [] }), RECT, 1);
     expect(ctx.textAlign).toBe(before.textAlign);
     expect(ctx.textBaseline).toBe(before.textBaseline);
+  });
+
+  it('draws an authored series-less chart as its empty area, without the "(no data)" placeholder', () => {
+    const { ctx, texts } = stackfulMockCtx();
+    renderChart(ctx, baseModel({ chartType: 'bar', series: [], authoredWithoutSeries: true }), RECT, 1);
+    expect(texts.some((t) => String(t).includes('(no data)') || (t as { text?: string }).text === '(no data)')).toBe(false);
+    const placeholder = stackfulMockCtx();
+    renderChart(placeholder.ctx, baseModel({ chartType: 'bar', series: [] }), RECT, 1);
+    expect(JSON.stringify(placeholder.texts)).toContain('(no data)');
   });
 
   it('restores state via the unknown-chart-type default-case path', () => {

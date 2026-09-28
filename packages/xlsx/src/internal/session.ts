@@ -27,4 +27,5 @@ export {
   type XlsxNodeAcquisition,
   type XlsxNodeAcquisitionOptions,
   type XlsxNodeArchive,
+  type XlsxNodeSessionArchive,
 } from './node-acquisition.js';

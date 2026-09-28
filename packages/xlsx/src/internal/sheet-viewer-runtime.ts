@@ -1,4 +1,5 @@
 import type { Worksheet } from '../types.js';
+import { inheritWorksheetPreviewBounds } from './worksheet-content-bounds.js';
 import type { XlsxWorkbook } from '../workbook.js';
 import type { CellAddress, XlsxSelectionArea, XlsxSelectionState } from '../selection.js';
 import { areaContainsCell, MAX_SELECTION_AREAS, normalizeSelectionState } from '../selection.js';
@@ -37,13 +38,15 @@ export class SheetAcquisition {
  * Cell/content graphs remain shared and read-only; only the maps and row flags
  * changed by view-only resize/outline interactions are copied. */
 export function createSheetViewModel(source: Worksheet): Worksheet {
-  return {
+  const view = {
     ...source,
     rows: source.rows.map((row) => ({ ...row })),
     rowHeights: { ...source.rowHeights },
     colWidths: { ...source.colWidths },
     colCollapsed: source.colCollapsed ? { ...source.colCollapsed } : undefined,
   };
+  inheritWorksheetPreviewBounds(source, view);
+  return view;
 }
 
 /** Logical viewport independent of native browser scrolling. */

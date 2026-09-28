@@ -27,7 +27,8 @@
     },
     "./wasm": "./src/wasm/pptx_parser.js",
     "./wasm-binary": "./src/wasm/pptx_parser_bg.wasm",
-    "./internal/session": "./src/internal/session.ts"
+    "./internal/session": "./src/internal/session.ts",
+    "./internal/model-source-session": "./src/internal/model-source-session.ts"
   },
   "files": [
     "dist",
@@ -35,8 +36,8 @@
   ],
   "scripts": {
     "dev": "vite",
-    "build": "tsc --build && vite build && tsc -p tsconfig.declarations.json",
-    "build:ci": "vite build && tsc -p tsconfig.declarations.json",
+    "build": "tsc --build && vite build && node ../../scripts/build-model-source-sidecars.mjs pptx && tsc -p tsconfig.declarations.json",
+    "build:ci": "vite build && node ../../scripts/build-model-source-sidecars.mjs pptx && tsc -p tsconfig.declarations.json",
     "preview": "vite preview",
     "wasm": "cd parser && wasm-pack build --target web --out-dir ../src/wasm && node ../../../scripts/append-wasm-reinit.mjs ../src/wasm/pptx_parser.js",
     "vrt": "VRT_MODE=regression playwright test --config playwright.config.ts",

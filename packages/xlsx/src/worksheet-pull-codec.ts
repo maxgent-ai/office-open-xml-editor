@@ -2,8 +2,17 @@ import type { ParsedWorkbook, Row, Worksheet } from './types.js';
 import { resolveSharedStringRows } from './shared-strings.js';
 
 export type WorksheetWireChunk =
+  | { kind: 'preview'; worksheet: Worksheet | null; reason: WorksheetPreviewBlocker | null; maxRow: number; maxCol: number }
   | { kind: 'rows'; rows: Row[] }
   | { kind: 'finished'; worksheet: Worksheet };
+
+/** A closed list of facts that keep a sheet on the complete-model path. */
+export type WorksheetPreviewBlocker =
+  | 'outline' | 'merge' | 'conditional-format' | 'ancillary-content' | 'metadata-unavailable' | 'unordered-rows';
+
+const PREVIEW_BLOCKERS: ReadonlySet<string> = new Set<WorksheetPreviewBlocker>([
+  'outline', 'merge', 'conditional-format', 'ancillary-content', 'metadata-unavailable', 'unordered-rows',
+]);
 
 /** Decode and normalize one transferred worksheet unit. This is the single
  * format-owned wire boundary shared by the Browser and Node consumers and by
@@ -31,6 +40,17 @@ export function decodeWorksheetPullChunk(
     if (sharedStrings) resolveSharedStringRows(unit.rows, sharedStrings);
     prepareRows?.(unit.rows);
     return { kind: 'rows', rows: unit.rows };
+  }
+  if (unit.kind === 'preview') {
+    if (!Number.isSafeInteger(unit.maxRow) || !Number.isSafeInteger(unit.maxCol) ||
+        (unit.maxRow as number) < 0 || (unit.maxCol as number) < 0 ||
+        (unit.worksheet === null) === (unit.reason === null) ||
+        (unit.worksheet !== null && (typeof unit.worksheet !== 'object' || Array.isArray(unit.worksheet))) ||
+        (unit.reason !== null && !PREVIEW_BLOCKERS.has(unit.reason as string))) {
+      throw new Error('worksheet preview unit is invalid');
+    }
+    if (unit.worksheet) unit.worksheet.rows = [];
+    return unit as WorksheetWireChunk;
   }
   if (unit.kind === 'finished') {
     if (!unit.worksheet || typeof unit.worksheet !== 'object') {

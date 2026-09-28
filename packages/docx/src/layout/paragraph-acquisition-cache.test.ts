@@ -255,6 +255,103 @@ describe('paragraph acquisition cache', () => {
     expect(at(73)).not.toBe(second);
   });
 
+  it('reuses line breaking after a vertical move but remeasures position-sensitive lines', () => {
+    const services = scopedServices();
+    const input = paragraphAcquisitionInput(textParagraph('a paragraph long enough to wrap across lines'), source);
+    const base = options(services, {
+      context: { ...context, spaceBeforePt: 6 },
+      placement: { ...options(services).placement, availableWidthPt: 80 },
+    });
+    const at = (startYPt: number, overrides: Partial<ParagraphAcquisitionOptions> = {}) =>
+      acquireParagraphResult(input, {
+        ...base,
+        placement: { ...base.placement, startYPt },
+        ...overrides,
+      });
+
+    const first = at(72);
+    const moved = at(92);
+    expect(moved.measured.lines[0]!.layout).toBe(first.measured.lines[0]!.layout);
+    expect(moved.measured.lines.map((line) => line.layout))
+      .toEqual(first.measured.lines.map((line) => line.layout));
+    expect(moved.layout.flowBounds.yPt).toBe(92);
+    const withoutCache = acquireParagraphResult(
+      paragraphAcquisitionInput(textParagraph('a paragraph long enough to wrap across lines'), source),
+      { ...base, placement: { ...base.placement, startYPt: 92 } },
+    );
+    expect(moved.measured).toEqual(withoutCache.measured);
+    expect(moved.layout).toEqual(withoutCache.layout);
+
+    const suppressed = at(112, {
+      placement: {
+        ...base.placement, startYPt: 112, maximumYPt: 300, suppressSpaceBefore: true,
+      },
+    });
+    const suppressedFresh = acquireParagraphResult(
+      paragraphAcquisitionInput(textParagraph('a paragraph long enough to wrap across lines'), source),
+      {
+        ...base,
+        placement: {
+          ...base.placement, startYPt: 112, maximumYPt: 300, suppressSpaceBefore: true,
+        },
+      },
+    );
+    expect(suppressed.measured.lines[0]!.layout).toBe(first.measured.lines[0]!.layout);
+    expect(suppressed.measured).toEqual(suppressedFresh.measured);
+    expect(suppressed.layout).toEqual(suppressedFresh.layout);
+
+    const nextPage = at(92, {
+      flowDomainId: 'body:page:1:column:0',
+      environment: { ...base.environment, pageIndex: 1, displayPageNumber: 2 },
+    });
+    expect(nextPage.measured.lines[0]!.layout).toBe(first.measured.lines[0]!.layout);
+    expect(nextPage.layout.flowDomainId).toBe('body:page:1:column:0');
+
+    const wrap = {
+      skipTopAndBottomBands: ({ yPt }: { yPt: number }) => yPt,
+      lineWindow: ({ topYPt, maximumWidthPt }: { topYPt: number; maximumWidthPt: number }) => ({
+        topYPt,
+        xOffsetPt: 0,
+        maximumWidthPt: topYPt < 80 ? 30 : maximumWidthPt,
+      }),
+    };
+    const wrapped = (startYPt: number) => at(startYPt, {
+      placement: { ...base.placement, startYPt, wrap },
+    });
+    const high = wrapped(72);
+    const low = wrapped(92);
+    expect(high.measured.lines.length).toBeGreaterThan(low.measured.lines.length);
+    expect(low.measured.lines[0]!.layout).not.toBe(high.measured.lines[0]!.layout);
+  });
+
+  it('keeps page-field text in the line-breaking identity', () => {
+    const services = scopedServices();
+    const field = {
+      ...textParagraph().runs[0],
+      type: 'field', fieldType: 'page', instruction: 'PAGE', fallbackText: '1',
+    } as DocRun;
+    const input = paragraphAcquisitionInput({
+      ...textParagraph(), runs: [field],
+    } as DocParagraph, source);
+    const base = options(services);
+    const atPage = (pageIndex: number) => acquireParagraphResult(input, {
+      ...base,
+      environment: {
+        ...base.environment,
+        pageIndex,
+        displayPageNumber: pageIndex + 1,
+      },
+    });
+    const first = atPage(0);
+    const second = atPage(1);
+    const text = (result: typeof first) => result.measured.lines.flatMap((line) =>
+      line.layout.segments.flatMap((segment) => 'text' in segment ? [segment.text] : [])).join('');
+
+    expect(text(first)).toBe('1');
+    expect(text(second)).toBe('2');
+    expect(second.measured.lines[0]!.layout).not.toBe(first.measured.lines[0]!.layout);
+  });
+
   it('keys every value that can change acquisition output', () => {
     const services = scopedServices();
     const cache = paragraphAcquisitionCacheOf(services);
@@ -312,11 +409,19 @@ describe('paragraph acquisition cache', () => {
       key({ environment: { ...base.environment, currentDateMs: 101 } }),
       key({ environment: { ...base.environment, noteNumbers: new Map([['footnote:1', 1]]) } }),
       key({ environment: { ...base.environment, noteReferenceNumber: 1 } }),
+      key({ environment: {
+        ...base.environment,
+        noteNumbering: {
+          footnote: { format: 'decimal', start: 1 },
+          endnote: { format: 'lowerRoman', start: 1 },
+        },
+      } }),
       key({ environment: { ...base.environment, pageWritingMode: 'vertical-lr' } }),
       key({ environment: { ...base.environment, verticalCJK: true } }),
       key({ environment: { ...base.environment, verticalPageFrame: true } }),
       key({ environment: { ...base.environment, documentHasEastAsianText: true } }),
       key({ environment: { ...base.environment, useFeLayout: true } }),
+      key({ environment: { ...base.environment, lineWrapLikeWord6: true } }),
       key({ environment: {
         ...base.environment,
         balanceSingleByteDoubleByteWidth: true,
@@ -370,5 +475,38 @@ describe('paragraph acquisition cache', () => {
     ];
 
     expect(new Set(keys)).toHaveLength(keys.length);
+  });
+
+  it('keys service identities and kinsoku sets by exact session ordinals', () => {
+    const services = scopedServices();
+    const cache = paragraphAcquisitionCacheOf(services)!;
+    const input = paragraphAcquisitionInput(textParagraph(), source);
+    const base = options(services);
+    const key = (overrides: Partial<ParagraphAcquisitionOptions>) =>
+      paragraphAcquisitionCacheKey(cache, input, { ...base, ...overrides });
+    // A production text-service fingerprint spells out the document's whole
+    // font-metric snapshot; every retained key used to repeat it.
+    const withText = (fingerprint: string) => ({
+      environment: {
+        ...base.environment,
+        layoutServices: { ...services, text: { ...services.text, fingerprint } },
+      },
+    });
+    const large = `text:${'m'.repeat(60_000)}`;
+    const largeKey = key(withText(large));
+    expect(largeKey.length).toBeLessThan(4_096);
+    expect(key(withText(`${large.slice(0, -1)}n`))).not.toBe(largeKey);
+    expect(key(withText(large.slice()))).toBe(largeKey);
+
+    // A value-equal rule set from another object must still hit, or the
+    // session miss budget would be spent on a spurious re-acquisition.
+    const kinsoku = {
+      enabled: DEFAULT_KINSOKU_RULES.enabled,
+      lineStartForbidden: new Set([...DEFAULT_KINSOKU_RULES.lineStartForbidden].reverse()),
+      lineEndForbidden: new Set(DEFAULT_KINSOKU_RULES.lineEndForbidden),
+    };
+    expect(key({ context: { ...base.context, kinsoku } })).toBe(key({}));
+    expect(key({ context: { ...base.context, kinsoku: { ...kinsoku, enabled: !kinsoku.enabled } } }))
+      .not.toBe(key({}));
   });
 });

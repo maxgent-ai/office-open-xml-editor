@@ -1,21 +1,49 @@
 import type { CjkLang } from '@silurus/ooxml-core';
-import type { BodyElement, DocParagraph, DocTable, DocTableCell, DocRun, ImageRun, ChartRun, ShapeRun, SectionProps } from '../types';
+import type {
+  BodyElement,
+  DocParagraph,
+  DocTableCell,
+  ImageRun,
+  ChartRun,
+  ShapeRun,
+  SectionProps,
+} from '../types';
 import type { ResolvedFontMetric } from '@silurus/ooxml-core';
-import { type FloatRect, FLOAT_OVERLAP_EPS, isWrapFloat } from '../float-layout.js';
-import { type FrameBox, computeFrameBox, frameXContainer, pushFloatRect } from '../frame-geometry.js';
+import { type FloatRect, isWrapFloat } from '../float-layout.js';
+import { type FrameBox, computeFrameBox, frameXContainer, pushFloatRect, registerFrameFloat } from '../frame-geometry.js';
 import { resolveFloatingTableBoxPt } from '../float-table-geometry.js';
 import { xContainer, yContainer, resolveAnchorX, resolveAnchorY } from '../anchor-geometry.js';
 import { resolveParagraphLayoutContext, resolveSectionLayoutContext, type DocumentLayoutSettings, type SectionLayoutContext } from '../layout-context.js';
-import type { BlockLayoutAlgorithms, BodyFlowRegistryDeltaPt, BodyFlowRegistrySnapshotPt, DeepReadonly, DrawingMLCollisionRegistrySnapshotPt, LayoutServices, FloatRegistryEntryPt, FloatRegistrySnapshotPt, FloatingTablePlacementLayout, DrawingMLCollisionEntryPt, NoteLayout, ParagraphLayout, SourceRef, StoryBlockInput, StoryLayout, TableLayout, TableLayoutInput } from './types.js';
-import { beginFloatingTablePlacementTransaction, floatingTableRegistryDelta, resolveFloatingTablePlacementInTransaction, validateFloatingTableRegistryDelta } from './floating-table-transaction.js';
-import { floatRegistryParticipant, resolveBlockFlowAdmission, resolvePageAnchoredTableDeferral } from './floats.js';
-import { ExactConvergenceError, convergeExactState } from './convergence.js';
-import { LayoutInvariantError } from './diagnostics.js';
+import type {
+  BlockLayoutAlgorithms,
+  DeepReadonly,
+  DrawingMLCollisionRegistrySnapshotPt,
+  LayoutServices,
+  FloatRegistryEntryPt,
+  FloatRegistrySnapshotPt,
+  DrawingMLCollisionEntryPt,
+  NoteLayout,
+  ParagraphLayout,
+  SourceRef,
+  StoryBlockInput,
+  StoryLayout,
+  TableLayout,
+  TableLayoutInput,
+} from './types.js';
+import {
+  floatingTableRegistryDelta,
+  validateFloatingTableRegistryDelta,
+} from './floating-table-transaction.js';
 import type { LayoutOptions } from './options.js';
 import { createLayoutServicesRuntimeView, fieldAcquisitionContextOf, verticalGlyphMeasurementServiceOf } from './runtime-state.js';
 import { attachStoryBlockLayoutAlgorithms, layoutStory as layoutSharedStory } from './stories.js';
 import { buildNoteNumberMap, footnoteIdsInRetainedLines, footnoteIdsInRetainedSlice, indexNotes, noteReferenceIdsInDocumentOrder } from './note-reference-ownership.js';
-import type { BodyAcquisitionLocation, BodyLayoutKernel, BodyLayoutSession, PageAnchorPrescanInput, BodyParagraphAcquisitionInput, BodyTableAcquisitionInput } from './body-layout-kernel.js';
+import type {
+  BodyAcquisitionLocation,
+  BodyLayoutKernel,
+  BodyLayoutSession,
+  BodyParagraphAcquisitionInput,
+} from './body-layout-kernel.js';
 import { NoteCapacityExceededError } from './body-layout-kernel.js';
 import { FlowCapacityExceededError } from './flow.js';
 import { projectBodyOccurrence } from './occurrence-projection.js';
@@ -29,6 +57,7 @@ import { createRevisionAuthorColorResolver } from './track-changes.js';
 import { BODY_STORY_CONTEXT, bodyAnchorReferenceFrames, retainedTableRecord, resolveBodyParagraphLayoutContext, resolveStateParagraphLayoutContext, withTableCellStory } from './acquisition-state.js';
 import { applyNumberingBodyOffset, resolveNumberingMarkerGeometry } from './numbering-marker.js';
 import { measureTableIntrinsicWidths, resolveTableColumnWidths } from './table-columns.js';
+import { measureBodyTableEntry } from './body-table-measurement.js';
 import { measureParagraphIntrinsicWidths, measureTableCellIntrinsicWidths } from './intrinsic-width.js';
 // ── Line-layout engine (segmentation + line-breaking + measurement) ──────────
 // Body acquisition drives the pure root line-layout kernel through this
@@ -36,12 +65,15 @@ import { measureParagraphIntrinsicWidths, measureTableCellIntrinsicWidths } from
 import { buildFont, fontClassesWithPitches, getDefaultFontSize, paragraphMarkLineHeight } from '../line-layout.js';
 import type { DocGridCtx } from '../line-layout.js';
 import { measureParagraph } from '../paragraph-measure.js';
-import { acquireRetainedTable, retainedTableAcquisitionIsReusableAcrossPages, type RetainedTableAcquisition } from './table-acquisition.js';
+import {
+  acquireRetainedTable,
+  retainedTableAcquisitionIsReusableAcrossPages,
+} from './table-acquisition.js';
 import { combineAdjacentTableLayoutInputs } from './adjacent-table-layout-input.js';
 import { layoutTable as layoutRetainedTableInput } from './table.js';
-import { startTableFragmentCursor, takeTableFragment, type PageDependentTableBlockRequest } from './table-pagination.js';
+import { type PageDependentTableBlockRequest } from './table-pagination.js';
 import { paragraphGapAdjustment } from './paragraph-spacing.js';
-import { bottomBorderExtentPt, resolveParagraphBorderEdges } from './paragraph-border-adjacency.js';
+import { bottomBorderExtentPt, resolveParagraphBorderEdges, topBorderExtentPt, type ParagraphBorderEdges } from './paragraph-border-adjacency.js';
 import { acquireParagraphResult, acquireRetainedFrameGroup, bodyFrameGroupFor, bodyParagraphBorderEdgesFor, projectPhysicalAnchorResult, retainedFrameMaximumBaselineLoweringPt, type BodyFrameGroup } from './paragraph.js';
 import { wordLoweredDropCapAnchorLeadingPt } from './body-pagination-compatibility.js';
 import type { CompleteTextBoxStoryAcquirer } from './paragraph.js';
@@ -61,9 +93,9 @@ import type {
   LayoutStoryBlock,
   LayoutTableBlock,
 } from './layout-source-store.js';
-import type { ParagraphChartRun, ParagraphImageRun, ParagraphLayoutSource, ParagraphShapeRun } from './text.js';
+import type { ParagraphLayoutSource } from './text.js';
 import type { TableLayoutSource } from './table-source-acquisition.js';
-import { prepareBodyFrameMetadata } from './frame.js';
+import { collectBodyFrameGroups, prepareBodyFrameMetadata } from './frame.js';
 import {
   physicalToLogicalMatrix,
   uprightPhysicalExtent,
@@ -85,6 +117,11 @@ export function createProductionBodyLayoutRuntime(
     source.fonts.familyClasses,
     source.fonts.familyPitches,
   );
+  const concreteBodyKernelContext = Object.freeze({
+    source, measureContext, resolvedLocalFonts, documentFontFamilyClasses,
+    publicAnchorBridge, effectiveTablePositioning,
+  });
+  type ConcreteBodyKernelContext = typeof concreteBodyKernelContext;
   const anchoredImageCollisionKey = (
     imagePath: string,
     colorReplaceFrom?: string,
@@ -93,6 +130,27 @@ export function createProductionBodyLayoutRuntime(
     + `${duotone ? `|duo:${duotone.clr1}:${duotone.clr2}` : ''}`;
 /** Retained default separator leading used by the shared note story layout. */
 const FOOTNOTE_SEPARATOR_GAP_PT = 6;
+
+/** A visible §17.3.1.42 top border owns space above the first line in every
+ * paragraph container. Page/cell-start suppression removes authored w:before,
+ * never the border's own spacing or outer half-stroke. */
+function paragraphContextWithTopBorder<T extends { readonly spaceBeforePt: number }>(
+  context: T,
+  paragraph: { readonly borders?: DocParagraph['borders'] },
+  topEdge: ParagraphBorderEdges['top'],
+  suppressSpaceBefore: boolean,
+  continuing = false,
+): { context: T; suppressSpaceBefore: boolean } {
+  const reservePt = continuing ? 0 : topBorderExtentPt(paragraph.borders, topEdge);
+  if (reservePt === 0) return { context, suppressSpaceBefore };
+  return {
+    context: {
+      ...context,
+      spaceBeforePt: (suppressSpaceBefore ? 0 : context.spaceBeforePt) + reservePt,
+    },
+    suppressSpaceBefore: false,
+  };
+}
 
 function buildMeasureState(
   ctx: MeasurementTextContext,
@@ -187,6 +245,9 @@ function buildMeasureState(
           );
         }
         const context = resolveStateParagraphLayoutContext(cellState, paragraph);
+        const topBorder = paragraphContextWithTopBorder(
+          context, paragraph, paragraphBorderEdges?.top ?? 'top', true,
+        );
         const layout = acquireRegisteredParagraph(
           cellState,
           cellState.acquisitionInputs.paragraphAcquisitionInput(paragraph, source),
@@ -195,13 +256,13 @@ function buildMeasureState(
             source,
             flowDomainId,
             ordinaryFlow: true,
-            context,
+            context: topBorder.context,
             placement: {
               startYPt: cellState.y,
               paragraphXPt: 0,
               availableWidthPt: paragraphWidthPt,
               maximumYPt: cellState.pageH,
-              suppressSpaceBefore: true,
+              suppressSpaceBefore: topBorder.suppressSpaceBefore,
             },
             measurer: {
               context: cellState.ctx,
@@ -240,7 +301,7 @@ function buildMeasureState(
           advancePt: layout.advancePt + paragraph.spaceBefore,
           spacing: Object.freeze({
             ...layout.spacing,
-            beforePt: paragraph.spaceBefore,
+            beforePt: (layout.spacing?.beforePt ?? 0) + paragraph.spaceBefore,
           }),
         });
       },
@@ -351,1798 +412,1721 @@ function buildMeasureState(
   };
 }
 
-function buildConcreteBodyLayoutKernel(
-  source: LayoutSourceStore,
-  measureContext: MeasurementTextContext | null,
-  resolvedLocalFonts: Readonly<Record<string, ResolvedFontMetric>>,
-): BodyLayoutKernel {
-  const ordinaryAcquisitionInputForAdjacentGroup = (
-    group: ReturnType<typeof combineAdjacentTableLayoutInputs>,
-  ): TableLayoutInput => {
-    const noEdges = Object.freeze({
-      top: null, right: null, bottom: null, left: null, insideH: null, insideV: null,
-    });
-    return Object.freeze({
-      kind: 'table',
-      id: group.id,
-      source: group.source,
-      flowDomainId: group.flowDomainId,
-      ordinaryFlow: true,
-      alignment: group.alignment,
-      indentPt: group.indentPt,
-      bidiVisual: group.bidiVisual,
-      columnWidthsPt: group.columnWidthsPt,
-      columnWidthKeys: group.columnWidthKeys,
-      borders: noEdges,
-      rows: Object.freeze(group.rows.map((row) => Object.freeze({
-        ...row,
-        // §17.4.37 gives every authored member table ownership of its own outer
-        // border layer; the union grid carries that folded layer per source row.
-        exceptionBorders: row.sourceTableEdges,
-      }))),
-    });
-  };
-  const sourceElement = (
-    ref: SourceRef,
-  ): LayoutFlowBlock => {
-    if (ref.story !== 'body' || ref.storyInstance !== 'body' || ref.path.length !== 1) {
-      throw new Error('Body acquisition requires a top-level body source');
-    }
-    const element = source.blocks.resolve(ref);
-    if (!element || (element.type !== 'paragraph' && element.type !== 'table')) {
-      throw new Error(`Body source does not identify a flow block: ${ref.path.join('.')}`);
-    }
-    return element;
-  };
-  const nestedSourceElement = (ref: SourceRef): LayoutFlowBlock => source.blocks.resolve(ref);
+function ordinaryAcquisitionInputForAdjacentGroup(
+  group: ReturnType<typeof combineAdjacentTableLayoutInputs>,
+): TableLayoutInput {
+  const noEdges = Object.freeze({
+    top: null,
+    right: null,
+    bottom: null,
+    left: null,
+    insideH: null,
+    insideV: null,
+  });
+  return Object.freeze({
+    kind: 'table',
+    id: group.id,
+    source: group.source,
+    flowDomainId: group.flowDomainId,
+    ordinaryFlow: true,
+    alignment: group.alignment,
+    indentPt: group.indentPt,
+    bidiVisual: group.bidiVisual,
+    columnWidthsPt: group.columnWidthsPt,
+    columnWidthKeys: group.columnWidthKeys,
+    borders: noEdges,
+    rows: Object.freeze(
+      group.rows.map((row) =>
+        Object.freeze({
+          ...row,
+          // §17.4.37 gives every authored member table ownership of its own outer
+          // border layer; the union grid carries that folded layer per source row.
+          exceptionBorders: row.sourceTableEdges,
+        }),
+      ),
+    ),
+  });
+}
+function sourceElement(sourceStore: LayoutSourceStore, ref: SourceRef): LayoutFlowBlock {
+  if (ref.story !== 'body' || ref.storyInstance !== 'body' || ref.path.length !== 1) {
+    throw new Error('Body acquisition requires a top-level body source');
+  }
+  const element = sourceStore.blocks.resolve(ref);
+  if (!element || (element.type !== 'paragraph' && element.type !== 'table')) {
+    throw new Error(`Body source does not identify a flow block: ${ref.path.join('.')}`);
+  }
+  return element;
+}
+function nestedSourceElement(sourceStore: LayoutSourceStore, ref: SourceRef): LayoutFlowBlock {
+  return sourceStore.blocks.resolve(ref);
+}
   /** Body acquisition stays at the kernel adapter because it resolves renderer
    * state into retained paragraph inputs; layout-owned projections below it
    * receive only immutable structural values. */
-  const acquireBodyParagraphAtLocation = (
-    state: BodyAcquisitionState,
-    paragraph: LayoutParagraphBlock,
-    source: SourceRef,
-    location: BodyAcquisitionLocation,
-    availableInlineExtentPt: number,
-    suppressSpaceBefore: boolean,
-    continuation: BodyParagraphAcquisitionInput['continuation'] = Object.freeze({
-      boundary: null,
-    }),
-    retainedAnchorCollisions?: readonly DrawingMLCollisionEntryPt[],
-  ) => {
-    const edges = bodyParagraphBorderEdgesFor(paragraph) ?? {
-      top: 'top' as const,
-      bottom: 'bottom' as const,
-    };
-    const context = resolveBodyParagraphLayoutContext(state, paragraph);
-    return acquireParagraphResult(
-      paragraph,
-      {
-        id: `${source.story}:${source.storyInstance}:${source.path.join('.')}`,
-        source,
-        flowDomainId: location.flowDomainId,
-        ordinaryFlow: true,
-        context,
-        placement: {
-          startYPt: state.y,
-          paragraphXPt: location.availableBounds.xPt,
-          availableWidthPt: availableInlineExtentPt,
-          maximumYPt: state.pageH,
-          suppressSpaceBefore,
+function acquireBodyParagraphAtLocation(
+  state: BodyAcquisitionState,
+  paragraph: LayoutParagraphBlock,
+  source: SourceRef,
+  location: BodyAcquisitionLocation,
+  availableInlineExtentPt: number,
+  suppressSpaceBefore: boolean,
+  continuation: BodyParagraphAcquisitionInput['continuation'] = Object.freeze({
+    boundary: null,
+  }),
+  retainedAnchorCollisions?: readonly DrawingMLCollisionEntryPt[],
+) {
+  const edges = bodyParagraphBorderEdgesFor(paragraph) ?? {
+    top: 'top' as const,
+    bottom: 'bottom' as const,
+  };
+  const context = resolveBodyParagraphLayoutContext(state, paragraph);
+  const topBorder = paragraphContextWithTopBorder(
+    context,
+    paragraph,
+    edges.top,
+    suppressSpaceBefore,
+    continuation.boundary !== null,
+  );
+  return acquireParagraphResult(
+    paragraph,
+    {
+      id: `${source.story}:${source.storyInstance}:${source.path.join('.')}`,
+      source,
+      flowDomainId: location.flowDomainId,
+      ordinaryFlow: true,
+      context: topBorder.context,
+      placement: {
+        startYPt: state.y,
+        paragraphXPt: location.availableBounds.xPt,
+        availableWidthPt: availableInlineExtentPt,
+        maximumYPt: state.pageH,
+        suppressSpaceBefore: topBorder.suppressSpaceBefore,
+      },
+      measurer: { context: state.ctx, fontFamilyClasses: state.fontFamilyClasses },
+      environment: paragraphMeasurementEnvironment(state),
+      exclusions: paragraphWrapExclusions(state.floats, location.flowDomainId),
+      anchorCollisions: retainedAnchorCollisions ?? paragraphAnchorCollisions(state.floats),
+      containerShading: state.containerShading,
+      paragraphBorderEdges: edges,
+      trailingExtentPt: Math.max(
+        context.spaceAfterPt,
+        edges.bottom === 'none' ? 0 : bottomBorderExtentPt(paragraph.borders),
+      ),
+      continuesFromPrevious: continuation.boundary !== null,
+      ...(continuation.sourceRangeStart === undefined
+        ? {}
+        : {
+            sourceRangeStart: continuation.sourceRangeStart,
+          }),
+      anchorFrames: bodyAnchorReferenceFrames(state),
+      acquireCompleteStory: state.acquireCompleteTextBoxStory,
+    },
+    continuation.boundary === null
+      ? undefined
+      : {
+          boundary: continuation.boundary,
+          ...(continuation.uniformRubyAdvancePt === undefined
+            ? {}
+            : {
+                uniformRubyAdvancePt: continuation.uniformRubyAdvancePt,
+              }),
         },
-        measurer: { context: state.ctx, fontFamilyClasses: state.fontFamilyClasses },
-        environment: paragraphMeasurementEnvironment(state),
-        exclusions: paragraphWrapExclusions(state.floats, location.flowDomainId),
-        anchorCollisions: retainedAnchorCollisions
-          ?? paragraphAnchorCollisions(state.floats),
-        containerShading: state.containerShading,
-        paragraphBorderEdges: edges,
+  );
+}
+
+function bodyStoryRoot(source: LayoutSourceStore, ref: SourceRef): readonly LayoutStoryBlock[] {
+  if (ref.path.length !== 0) {
+    throw new Error('Story acquisition requires a story-root source');
+  }
+  return source.blocks.storyRoot(ref);
+}
+
+function bodyStoryElement(source: LayoutSourceStore, sourceRef: SourceRef): LayoutFlowBlock {
+  if (sourceRef.path.length === 0 || (sourceRef.path.length - 1) % 3 !== 0) {
+    throw new Error('Story block acquisition requires a canonical source path');
+  }
+  return source.blocks.resolve(sourceRef);
+}
+
+interface BodyStoryAcquisitionContext {
+  readonly state: BodyAcquisitionState;
+  readonly services: LayoutServices;
+  readonly storyLayoutCache: Map<string, StoryLayout>;
+  readonly source: LayoutSourceStore;
+  readonly publicAnchorBridge: typeof publicAnchorBridge;
+}
+
+/** Acquire one retained story from immutable source and session-owned context. */
+function acquireBodyStoryLayout(
+  dependencies: BodyStoryAcquisitionContext,
+  request: import('./body-layout-kernel.js').StoryLayoutAcquisitionInput,
+): StoryLayout {
+  const { source, state, services, storyLayoutCache, publicAnchorBridge } = dependencies;
+  const cacheKey = JSON.stringify({
+    source: request.source,
+    pageIndex: request.pageIndex,
+    section: request.section,
+    container: request.container,
+  });
+  const cached = storyLayoutCache.get(cacheKey);
+  if (cached) return cached;
+  const root = bodyStoryRoot(source, request.source);
+  const noteReferenceNumber =
+    request.source.story === 'footnote' || request.source.story === 'endnote'
+      ? state.noteNumbers?.get(`${request.source.story}:${request.source.storyInstance}`)
+      : undefined;
+  const fieldContext = fieldAcquisitionContextOf(services);
+  const pageFieldContext = fieldContext.resolveDestinationPage?.(request.pageIndex);
+  const storyVertical = isVerticalTextDirection(request.section.textDirection);
+  const candidate: BodyAcquisitionState = {
+    ...state,
+    sectionLayout: request.section as SectionLayoutContext,
+    pageIndex: request.pageIndex,
+    totalPages: fieldContext.totalPages,
+    displayPageNumber: pageFieldContext?.displayPageNumber ?? request.pageIndex + 1,
+    pageNumberFormat: pageFieldContext?.pageNumberFormat ?? state.pageNumberFormat,
+    pageWidth: request.section.geometry.pageWidth,
+    pageH:
+      request.container.capacity === 'unbounded'
+        ? Number.MAX_SAFE_INTEGER
+        : request.section.geometry.pageHeight,
+    marginLeft: request.section.geometry.marginLeft,
+    marginRight: request.section.geometry.marginRight,
+    marginTop: bodyMarginInsetPt(request.section.geometry.marginTop),
+    marginBottom: bodyMarginInsetPt(request.section.geometry.marginBottom),
+    contentX: request.container.bounds.xPt,
+    contentW: request.container.bounds.widthPt,
+    y: request.container.bounds.yPt,
+    floats: [],
+    floatParaSeq: 0,
+    retainedTablesBySourceIndex: new Map(),
+    pageAnchorPrescanned: new Set<ParagraphLayoutSource>(),
+    noteReferenceNumber,
+    verticalCJK: storyVertical,
+    verticalAllRotated:
+      storyVertical && isAllRotatedVerticalTextDirection(request.section.textDirection),
+    ...(storyVertical ? {} : { verticalPhys: undefined }),
+    storyContext: {
+      story: request.source.story,
+      containers: [],
+      lineNumberingEligible: false,
+    },
+  };
+  preRegisterPageFloats(root, 0, candidate);
+  const storyServices = createLayoutServicesRuntimeView(services);
+  candidate.layoutServices = storyServices;
+  const blockInputs: StoryBlockInput[] = root.flatMap((element, index): StoryBlockInput[] => {
+    const source: SourceRef = {
+      story: request.source.story,
+      storyInstance: request.source.storyInstance,
+      path: [index],
+    };
+    if (element.type === 'unsupportedTextBoxBlock') {
+      return [
+        {
+          type: 'unsupportedTextBoxBlock',
+          qName: element.qName,
+          sourcePath: element.sourcePath,
+        },
+      ];
+    }
+    if (element.type === 'paragraph') return [{ kind: 'paragraph', source }];
+    if (element.type !== 'table') {
+      throw new Error(`Unsupported ${request.source.story} story block: ${element.type}`);
+    }
+    const dependencies = candidate.retainedTableAcquisition;
+    const table: LayoutTableBlock = element;
+    const columns = resolveColumnWidths(table, request.container.bounds.widthPt, candidate);
+    return [
+      acquireRetainedTable(
+        table,
+        columns,
+        request.container.bounds.widthPt,
+        candidate,
+        source,
+        dependencies,
+      ).input,
+    ];
+  });
+  let previousParagraph: LayoutParagraphBlock | null = null;
+  // ECMA-376 §17.3.1.11 frames are story-local: adjacent paragraphs with
+  // identical framePr form one frame anchored to the next non-frame
+  // paragraph of the same story (headers and footers included).
+  const storyFrameGroups = collectBodyFrameGroups(root);
+  const storyFrameAcquisitions = new Map<
+    BodyFrameGroup<LayoutParagraphBlock>,
+    Readonly<{
+      box: FrameBox;
+      members: ReadonlyMap<
+        ParagraphLayoutSource,
+        ReturnType<typeof acquireRetainedFrameGroup>['members'][number]
+      >;
+    }>
+  >();
+  const algorithms: BlockLayoutAlgorithms = {
+    layoutParagraph(block, placement) {
+      const paragraph = bodyStoryElement(source, block.source);
+      if (paragraph.type !== 'paragraph') throw new Error('Story paragraph source kind mismatch');
+      const sourceIndex = block.source.path[0]!;
+      const frameGroup = paragraph.framePr
+        ? (storyFrameGroups.get(paragraph) as BodyFrameGroup<LayoutParagraphBlock> | undefined)
+        : undefined;
+      // Page stories are laid out at the top of a page-sized container and
+      // then translated into their header/footer band, so only frames whose
+      // vertical anchor moves with the story text (vAnchor="text") keep
+      // their authored geometry. Page/margin-anchored frames and drop caps
+      // retain the historical in-flow fallback.
+      if (
+        frameGroup &&
+        frameGroup.framePr.vAnchor === 'text' &&
+        frameGroup.framePr.dropCap === 'none'
+      ) {
+        // Acquire each group once, at its owner (the first member, whose
+        // cursor all members share because frames add no story advance),
+        // and reuse it for the remaining members: re-acquiring per member
+        // would re-fingerprint the whole group each time.
+        let acquisition = storyFrameAcquisitions.get(frameGroup);
+        if (!acquisition) {
+          candidate.y = placement.cursor.yPt;
+          candidate.contentX = placement.container.bounds.xPt;
+          candidate.contentW = placement.container.bounds.widthPt;
+          let acquiredGroup: ReturnType<typeof acquireRetainedFrameGroup> | undefined;
+          const box = resolveFrameBox(
+            frameGroup.owner,
+            frameGroup,
+            candidate,
+            frameAnchorLineHeightPx(root, frameGroup.owner, candidate),
+            {
+              onAcquired: (acquired) => {
+                acquiredGroup = acquired;
+              },
+              story: { story: block.source.story, storyInstance: block.source.storyInstance },
+              borderEdgesFor: (member) => storyFrameBorderEdges(frameGroup, member),
+            },
+          );
+          if (!acquiredGroup) throw new Error('Story frame acquisition omitted its retained group');
+          acquisition = {
+            box,
+            members: new Map(acquiredGroup.members.map((entry) => [entry.paragraph, entry])),
+          };
+          storyFrameAcquisitions.set(frameGroup, acquisition);
+          registerFrameFloat(box, frameGroup.framePr, candidate);
+        }
+        const member = acquisition.members.get(paragraph);
+        if (!member) throw new Error('Story frame acquisition omitted its retained member');
+        // The frame occupies no ordinary story flow; the anchor paragraph
+        // that follows starts at the same cursor and wraps around it.
+        // Story flow owns every retained root it returns (layoutFlowBlocks
+        // invariant); the positioned geometry itself is unchanged.
+        return {
+          layout: Object.freeze({ ...member.fragment, flowDomainId: placement.container.id }),
+          nextCursor: placement.cursor,
+        };
+      }
+      const previousCandidate = sourceIndex > 0 ? root[sourceIndex - 1] : undefined;
+      const previous: LayoutParagraphBlock | null =
+        previousCandidate?.type === 'paragraph' ? previousCandidate : null;
+      const nextCandidate = root[sourceIndex + 1];
+      const next: LayoutParagraphBlock | null =
+        nextCandidate?.type === 'paragraph' ? nextCandidate : null;
+      const previousAfterPt = previousParagraph?.spaceAfter ?? 0;
+      const spacing = paragraphGapAdjustment(
+        previousParagraph,
+        paragraph,
+        previousAfterPt,
+        paragraph.spaceBefore,
+      );
+      const startYPt = Math.max(
+        placement.container.bounds.yPt,
+        placement.cursor.yPt - spacing.overlap,
+      );
+      candidate.y = startYPt;
+      candidate.contentX = placement.container.bounds.xPt;
+      candidate.contentW = placement.container.bounds.widthPt;
+      const publicRuns = paragraph.runs.filter(
+        (run, runIndex) => publicAnchorBridge(block.source, runIndex) !== null,
+      );
+      if (publicRuns.length > 0) {
+        registerAnchorFloats(
+          Object.freeze({ ...paragraph, runs: Object.freeze(publicRuns) }),
+          candidate,
+          candidate.y,
+        );
+      }
+      const context = resolveStateParagraphLayoutContext(candidate, paragraph);
+      const borderEdges = resolveParagraphBorderEdges(previous, paragraph, next);
+      const topBorder = paragraphContextWithTopBorder(
+        context,
+        paragraph,
+        borderEdges.top,
+        spacing.suppressBefore,
+      );
+      const result = acquireRegisteredParagraph(candidate, paragraph, {
+        id: `${block.source.story}:${block.source.storyInstance}:${block.source.path.join('.')}`,
+        source: block.source,
+        flowDomainId: placement.container.id,
+        ordinaryFlow: true,
+        context: topBorder.context,
+        placement: {
+          startYPt,
+          paragraphXPt: placement.container.bounds.xPt,
+          availableWidthPt: placement.container.bounds.widthPt,
+          maximumYPt: placement.availableBounds.yPt + placement.availableBounds.heightPt,
+          suppressSpaceBefore: topBorder.suppressSpaceBefore,
+        },
+        measurer: {
+          context: candidate.ctx,
+          fontFamilyClasses: candidate.fontFamilyClasses,
+        },
+        environment: paragraphMeasurementEnvironment(candidate),
+        exclusions: paragraphWrapExclusions(candidate.floats, placement.container.id),
+        anchorCollisions: paragraphAnchorCollisions(candidate.floats),
+        containerShading: candidate.containerShading,
+        paragraphBorderEdges: borderEdges,
         trailingExtentPt: Math.max(
           context.spaceAfterPt,
-          edges.bottom === 'none' ? 0 : bottomBorderExtentPt(paragraph.borders),
+          borderEdges.bottom === 'none' ? 0 : bottomBorderExtentPt(paragraph.borders),
         ),
-        continuesFromPrevious: continuation.boundary !== null,
-        ...(continuation.sourceRangeStart === undefined ? {} : {
-          sourceRangeStart: continuation.sourceRangeStart,
-        }),
-        anchorFrames: bodyAnchorReferenceFrames(state),
-        acquireCompleteStory: state.acquireCompleteTextBoxStory,
-      },
-      continuation.boundary === null ? undefined : {
-        boundary: continuation.boundary,
-        ...(continuation.uniformRubyAdvancePt === undefined ? {} : {
-          uniformRubyAdvancePt: continuation.uniformRubyAdvancePt,
-        }),
+        continuesFromPrevious: false,
+        anchorFrames: bodyAnchorReferenceFrames(candidate),
+        acquireCompleteStory: candidate.acquireCompleteTextBoxStory,
+      });
+      previousParagraph = paragraph;
+      const nextCursor = {
+        xPt: placement.cursor.xPt,
+        yPt: startYPt + result.layout.advancePt,
+      };
+      candidate.y = nextCursor.yPt;
+      return { layout: result.layout, nextCursor };
+    },
+    layoutTable(block, placement) {
+      previousParagraph = null;
+      const normalizedInput: TableLayoutInput = {
+        ...block,
+        flowDomainId: placement.container.id,
+      };
+      const result = layoutRetainedTableInput(normalizedInput, placement, storyServices);
+      candidate.y = result.nextCursor.yPt;
+      return result;
+    },
+  };
+  attachStoryBlockLayoutAlgorithms(storyServices, algorithms);
+  const acquired = layoutSharedStory(
+    {
+      source: request.source,
+      container: request.container,
+      blocks: Object.freeze(blockInputs),
+    },
+    storyServices,
+  );
+  const retained = Object.freeze({
+    ...acquired,
+    blocks: Object.freeze(
+      acquired.blocks.map((block, index) => {
+        if (block.kind !== 'paragraph' && block.kind !== 'table') {
+          throw new Error(`Shared story emitted unsupported node: ${block.kind}`);
+        }
+        return projectBodyOccurrence(block, {
+          occurrenceId: `${request.container.id}:block:${index}`,
+          destination: {
+            coordinateSpace: 'logical-page-points',
+            flowDomainId: request.container.id,
+            translation: { xPt: 0, yPt: 0 },
+          },
+        });
+      }),
+    ),
+  });
+  storyLayoutCache.set(cacheKey, retained);
+  return retained;
+}
+
+function applyBodyAcquisitionLocationTo(
+  services: LayoutServices,
+  target: BodyAcquisitionState,
+  next: BodyAcquisitionLocation,
+): void {
+  const geometry = next.section.geometry;
+  target.sectionLayout = next.section as SectionLayoutContext;
+  target.pageIndex = next.pageIndex;
+  const page = fieldAcquisitionContextOf(services).resolveDestinationPage?.(next.pageIndex);
+  target.displayPageNumber = page?.displayPageNumber ?? next.pageIndex + 1;
+  target.pageNumberFormat = page?.pageNumberFormat ?? target.pageNumberFormat;
+  target.pageWidth = geometry.pageWidth;
+  target.pageH = geometry.pageHeight;
+  target.marginLeft = geometry.marginLeft;
+  target.marginRight = geometry.marginRight;
+  target.marginTop = bodyMarginInsetPt(geometry.marginTop);
+  target.marginBottom = bodyMarginInsetPt(geometry.marginBottom);
+  target.contentX = next.availableBounds.xPt;
+  target.contentW = next.availableBounds.widthPt;
+  target.y = next.cursorPt.yPt;
+}
+
+function setBodyAcquisitionLocation(
+  services: LayoutServices,
+  state: BodyAcquisitionState,
+  sessionState: BodySessionDependencies['sessionState'],
+  next: BodyAcquisitionLocation,
+): void {
+  sessionState.location = next;
+  applyBodyAcquisitionLocationTo(services, state, next);
+}
+
+interface BodySessionDependencies {
+  readonly source: LayoutSourceStore;
+  readonly dependencies: ConcreteBodyKernelContext;
+  readonly services: LayoutServices;
+  readonly state: BodyAcquisitionState;
+  readonly sessionState: {
+    location: BodyAcquisitionLocation;
+    floatRegistry: FloatRegistrySnapshotPt;
+    drawingCollisionRegistry: DrawingMLCollisionRegistrySnapshotPt;
+  };
+  readonly footnotesById: ReturnType<typeof indexNotes>;
+  readonly endnotesById: ReturnType<typeof indexNotes>;
+  readonly storyAcquisitionContext: BodyStoryAcquisitionContext;
+  readonly pageRegistryFlowDomainId: (pageIndex: number) => string;
+  readonly measureContext: MeasurementTextContext;
+  readonly publicAnchorBridge: typeof publicAnchorBridge;
+  readonly effectiveTablePositioning: typeof effectiveTablePositioning;
+}
+
+function measureBodyParagraphEntry(
+  context: BodySessionDependencies,
+  request: Parameters<NonNullable<BodyLayoutSession['measureParagraph']>>[0],
+): ReturnType<NonNullable<BodyLayoutSession['measureParagraph']>> {
+  const {
+    source,
+    dependencies,
+    services,
+    state,
+    sessionState,
+    footnotesById,
+    endnotesById,
+    storyAcquisitionContext,
+    pageRegistryFlowDomainId,
+    measureContext,
+    publicAnchorBridge,
+    effectiveTablePositioning,
+  } = context;
+  setBodyAcquisitionLocation(services, state, sessionState, request.location);
+  const paragraph = sourceElement(dependencies.source, request.input.source);
+  if (paragraph.type !== 'paragraph') throw new Error('Paragraph source kind mismatch');
+  if (paragraph.framePr) {
+    if (request.continuation.boundary !== null) {
+      throw new Error('Body frame acquisition cannot continue across flow regions');
+    }
+    let acquiredGroup: ReturnType<typeof acquireRetainedFrameGroup> | undefined;
+    const frameGroup = bodyFrameGroupFor(paragraph);
+    if (!frameGroup) {
+      throw new Error('Body frame acquisition requires an indexed adjacency group');
+    }
+    const box = resolveFrameBox(
+      paragraph,
+      frameGroup,
+      state,
+      frameAnchorLineHeightPx(source.blocks.body, paragraph, state),
+      {
+        onAcquired: (acquired) => {
+          acquiredGroup = acquired;
+        },
       },
     );
+    if (!acquiredGroup) throw new Error('Body frame acquisition omitted its retained group');
+    const member = acquiredGroup.members.find((candidate) => candidate.paragraph === paragraph);
+    if (!member) throw new Error('Body frame acquisition omitted its retained member');
+    const dropCapAnchorLeadingPt =
+      paragraph === frameGroup.members.at(-1) && frameGroup.framePr.dropCap !== 'none'
+        ? wordLoweredDropCapAnchorLeadingPt(retainedFrameMaximumBaselineLoweringPt(acquiredGroup))
+        : 0;
+    const absoluteVertical =
+      paragraph.framePr.vAnchor === 'page' || paragraph.framePr.vAnchor === 'margin';
+    const frameOccurrenceId = box.exclusionId ?? `frame:${request.input.source.path.join(':')}`;
+    const frameEntry: FloatRegistryEntryPt = Object.freeze({
+      kind: 'frame',
+      occurrenceId: frameOccurrenceId,
+      exclusionId: frameOccurrenceId,
+      paragraphId: sessionState.floatRegistry.nextParagraphId,
+      bounds: Object.freeze({
+        xPt: box.x,
+        yPt: box.y,
+        widthPt: box.w,
+        heightPt: box.h,
+      }),
+      exclusionBounds: Object.freeze({
+        xPt: box.exLeft,
+        yPt: box.exTop,
+        widthPt: box.exRight - box.exLeft,
+        heightPt: box.exBottom - box.exTop,
+      }),
+    });
+    return Object.freeze({
+      layout: member.fragment,
+      // The catalogued projection preserves the §17.3.1.11 authored
+      // exclusion height; see WORD_LOWERED_DROP_CAP_ANCHOR_LEADING.
+      blockExtentPt: dropCapAnchorLeadingPt,
+      fragmentation: Object.freeze({ kind: 'indivisible' as const }),
+      placement: Object.freeze({
+        coordinateSpace: 'logical-body' as const,
+        xPt: member.fragment.flowBounds.xPt,
+        yPt: member.fragment.flowBounds.yPt,
+        sectionFlowOwnership: absoluteVertical ? ('page' as const) : ('host-flow' as const),
+      }),
+      ...(paragraph === frameGroup.owner
+        ? {
+            // §17.3.1.11 makes identical adjacent framePr paragraphs one frame,
+            // so page admission belongs to the owner before any member is painted.
+            retainedFootnoteReferenceIds: Object.freeze([
+              ...new Set(
+                acquiredGroup.members.flatMap((candidate) =>
+                  footnoteIdsInRetainedSlice(candidate.fragment),
+                ),
+              ),
+            ]),
+          }
+        : {}),
+      ...(!absoluteVertical
+        ? {
+            relocationBlockExtentPt: Math.max(0, box.y + box.h - request.location.cursorPt.yPt),
+          }
+        : {}),
+      ...(box.registerExclusion === false
+        ? {}
+        : {
+            flowRegistryDelta: Object.freeze({
+              floats: floatingTableRegistryDelta(
+                sessionState.floatRegistry,
+                Object.freeze([frameEntry]),
+                sessionState.floatRegistry.nextParagraphId + 1,
+              ),
+            }),
+          }),
+    });
+  }
+  const candidate: BodyAcquisitionState = {
+    ...state,
+    floats: [...state.floats],
+    pageAnchorPrescanned: new Set(state.pageAnchorPrescanned),
   };
+  applyBodyAcquisitionLocationTo(services, candidate, request.location);
+  const publicFloats =
+    request.continuation.boundary === null
+      ? acquirePublicParagraphFloats(
+          sessionState,
+          publicAnchorBridge,
+          paragraph,
+          request.input.source,
+          candidate,
+        )
+      : Object.freeze([]);
+  const acquired = acquireBodyParagraphAtLocation(
+    candidate,
+    paragraph,
+    request.input.source,
+    request.location,
+    request.availableInlineExtentPt,
+    request.suppressSpaceBefore,
+    request.continuation,
+    sessionState.drawingCollisionRegistry.entries,
+  );
+  const { measured, layout } = acquired;
+  const markOnLineGrid =
+    measured.markOnly && resolveBodyParagraphLayoutContext(candidate, paragraph).lineGrid.active;
+  const allBoundaries = measured.lines.map((line) => {
+    const boundary = line.layout.consumedEnd;
+    if (!boundary) throw new Error('Measured line omitted its source boundary');
+    return boundary;
+  });
+  const retainedFloats = retainedBodyParagraphFloatEntries(sessionState, layout);
+  const floatEntries = Object.freeze([...publicFloats, ...retainedFloats]);
+  // This accepted-collision path is intentionally parser-owned. Hand-built
+  // public-model anchors still use the compatibility float bridge (and a
+  // public wrapNone run therefore has no collision entry) until the Series
+  // B/C bridge removal migrates those runs to the retained OOXML contract.
+  const collisionEntries = ownedParagraphAnchorCollisions(layout);
+  return Object.freeze({
+    layout,
+    blockExtentPt: layout.advancePt,
+    fragmentation: measured.markOnly
+      ? Object.freeze({ kind: 'indivisible' as const })
+      : Object.freeze({
+          kind: 'splittable' as const,
+          lineEndBoundaries: Object.freeze(allBoundaries),
+        }),
+    ...(measured.markOnly
+      ? {
+          markBelowBaselinePt: measured.lastLineBelowBaselinePt,
+          markOnLineGrid,
+        }
+      : {}),
+    ...(measured.uniformRubyAdvancePt == null
+      ? {}
+      : { uniformRubyAdvancePt: measured.uniformRubyAdvancePt }),
+    ...(floatEntries.length === 0 && collisionEntries.length === 0
+      ? {}
+      : {
+          flowRegistryDelta: Object.freeze({
+            ...(floatEntries.length === 0
+              ? {}
+              : {
+                  floats: floatingTableRegistryDelta(
+                    sessionState.floatRegistry,
+                    floatEntries,
+                    sessionState.floatRegistry.nextParagraphId + floatEntries.length,
+                  ),
+                }),
+            ...(collisionEntries.length === 0
+              ? {}
+              : {
+                  drawingCollisions: drawingMLCollisionRegistryDelta(
+                    sessionState.drawingCollisionRegistry,
+                    collisionEntries,
+                  ),
+                }),
+          }),
+        }),
+  });
+}
+
+function layoutBodyNotes(
+  context: BodySessionDependencies,
+  request: Parameters<NonNullable<BodyLayoutSession['layoutNotes']>>[0],
+): ReturnType<NonNullable<BodyLayoutSession['layoutNotes']>> {
+  const {
+    source,
+    dependencies,
+    services,
+    state,
+    sessionState,
+    footnotesById,
+    endnotesById,
+    storyAcquisitionContext,
+    pageRegistryFlowDomainId,
+    measureContext,
+    publicAnchorBridge,
+    effectiveTablePositioning,
+  } = context;
+  const notes: NoteLayout[] = [];
+  let cursorYPt = request.container.bounds.yPt;
+  let first = request.firstOnPage;
+  for (const id of request.referenceIds) {
+    const sourceNotes = request.kind === 'footnote' ? footnotesById : endnotesById;
+    if (!sourceNotes.has(id)) continue;
+    const source: SourceRef = {
+      story: request.kind,
+      storyInstance: id,
+      path: [],
+    };
+    const separatorHeightPt = first ? FOOTNOTE_SEPARATOR_GAP_PT : 0;
+    const storyContainer = {
+      ...request.container,
+      id: `${request.container.id}:${request.kind}:${id}`,
+      bounds: {
+        ...request.container.bounds,
+        yPt: cursorYPt + separatorHeightPt,
+        heightPt: Math.max(
+          0,
+          request.container.bounds.yPt +
+            request.container.bounds.heightPt -
+            cursorYPt -
+            separatorHeightPt,
+        ),
+      },
+    };
+    let story: StoryLayout;
+    try {
+      story = acquireBodyStoryLayout(storyAcquisitionContext, {
+        source,
+        pageIndex: request.pageIndex,
+        section: request.section,
+        container: storyContainer,
+      });
+    } catch (error) {
+      if (error instanceof FlowCapacityExceededError && error.containerId === storyContainer.id) {
+        throw new NoteCapacityExceededError(request.kind, request.pageIndex, request.container.id);
+      }
+      throw error;
+    }
+    const separator = first
+      ? Object.freeze([
+          Object.freeze({
+            edge: 'top' as const,
+            from: Object.freeze({
+              xPt: request.container.bounds.xPt,
+              yPt: cursorYPt + separatorHeightPt / 2,
+            }),
+            to: Object.freeze({
+              xPt: request.container.bounds.xPt + request.container.bounds.widthPt / 3,
+              yPt: cursorYPt + separatorHeightPt / 2,
+            }),
+            color: '#000000',
+            widthPt: 0.5,
+            authoredStyle: 'single',
+            style: 'solid' as const,
+          }),
+        ])
+      : Object.freeze([]);
+    const advancePt = separatorHeightPt + story.advancePt;
+    const flowBounds = Object.freeze({
+      xPt: request.container.bounds.xPt,
+      yPt: cursorYPt,
+      widthPt: request.container.bounds.widthPt,
+      heightPt: advancePt,
+    });
+    const note: NoteLayout = Object.freeze({
+      kind: 'note',
+      id: `${request.kind}:${id}:page:${request.pageIndex}`,
+      source,
+      flowDomainId: request.container.id,
+      ordinaryFlow: true,
+      flowBounds,
+      inkBounds: Object.freeze({
+        xPt: Math.min(flowBounds.xPt, story.inkBounds.xPt),
+        yPt: Math.min(flowBounds.yPt, story.inkBounds.yPt),
+        widthPt:
+          Math.max(
+            flowBounds.xPt + flowBounds.widthPt,
+            story.inkBounds.xPt + story.inkBounds.widthPt,
+          ) - Math.min(flowBounds.xPt, story.inkBounds.xPt),
+        heightPt:
+          Math.max(
+            flowBounds.yPt + flowBounds.heightPt,
+            story.inkBounds.yPt + story.inkBounds.heightPt,
+          ) - Math.min(flowBounds.yPt, story.inkBounds.yPt),
+      }),
+      clipBounds: request.container.bounds,
+      advancePt,
+      separator,
+      story,
+    });
+    notes.push(note);
+    cursorYPt += advancePt;
+    first = false;
+  }
+  return Object.freeze(notes);
+}
+
+function measureFollowingBodyBlock(
+  context: BodySessionDependencies,
+  request: Parameters<NonNullable<BodyLayoutSession['measureFollowingBlock']>>[0],
+): ReturnType<NonNullable<BodyLayoutSession['measureFollowingBlock']>> {
+  const {
+    source,
+    dependencies,
+    services,
+    state,
+    sessionState,
+    footnotesById,
+    endnotesById,
+    storyAcquisitionContext,
+    pageRegistryFlowDomainId,
+    measureContext,
+    publicAnchorBridge,
+    effectiveTablePositioning,
+  } = context;
+  const candidate: BodyAcquisitionState = {
+    ...state,
+    floats: [...state.floats],
+    retainedTablesBySourceIndex: new Map(state.retainedTablesBySourceIndex),
+  };
+  applyBodyAcquisitionLocationTo(services, candidate, request.location);
+  if (request.input.kind === 'adjacent-table-group') {
+    const records = request.input.tables.map((tableInput) => {
+      const table = sourceElement(dependencies.source, tableInput.source);
+      if (table.type !== 'table') throw new Error('Following table source kind mismatch');
+      const sourceIndex = tableInput.source.path[0]!;
+      computeTablePtLayout(candidate, table, request.availableInlineExtentPt, sourceIndex);
+      return retainedTableRecord(candidate, sourceIndex).acquisition;
+    });
+    const combinedInput = ordinaryAcquisitionInputForAdjacentGroup(
+      combineAdjacentTableLayoutInputs(
+        request.input.logicalSequenceId,
+        records.map((record) => record.input),
+      ),
+    );
+    const layout = layoutRetainedTableInput(
+      combinedInput,
+      {
+        container: {
+          id: request.location.flowDomainId,
+          kind: 'body',
+          bounds: request.location.availableBounds,
+        },
+        cursor: request.location.cursorPt,
+        availableBounds: request.location.availableBounds,
+      },
+      services,
+    ).layout;
+    return Object.freeze({
+      fullExtentPt: layout.advancePt,
+      leadContentExtentPt: layout.rows[0]?.advancePt ?? layout.advancePt,
+      fullFootnoteReferenceIds: footnoteIdsInRetainedSlice(layout),
+      leadFootnoteReferenceIds: footnoteIdsInRetainedSlice({
+        ...layout,
+        rows: layout.rows.slice(0, 1),
+      }),
+    });
+  }
+  const element = sourceElement(dependencies.source, request.input.source);
+  if (request.input.kind === 'paragraph') {
+    if (element.type !== 'paragraph') throw new Error('Following paragraph source kind mismatch');
+    const { layout } = acquireBodyParagraphAtLocation(
+      candidate,
+      element,
+      request.input.source,
+      request.location,
+      request.availableInlineExtentPt,
+      false,
+      undefined,
+      sessionState.drawingCollisionRegistry.entries,
+    );
+    const firstLine = layout.lines[0];
+    return Object.freeze({
+      fullExtentPt: layout.advancePt,
+      // keepNext admits the successor's first content line, including
+      // any retained wrap displacement before that line begins.
+      leadContentExtentPt: firstLine
+        ? firstLine.bounds.yPt + firstLine.advancePt - layout.flowBounds.yPt
+        : layout.advancePt,
+      fullFootnoteReferenceIds: footnoteIdsInRetainedSlice(layout),
+      leadFootnoteReferenceIds: firstLine ? footnoteIdsInRetainedLines([firstLine]) : [],
+    });
+  }
+  if (element.type !== 'table') throw new Error('Following table source kind mismatch');
+  const sourceIndex = request.input.source.path[0]!;
+  computeTablePtLayout(candidate, element, request.availableInlineExtentPt, sourceIndex);
+  const layout = retainedTableRecord(candidate, sourceIndex).acquisition.layout;
+  return Object.freeze({
+    fullExtentPt: layout.advancePt,
+    leadContentExtentPt: layout.rows[0]?.advancePt ?? layout.advancePt,
+    fullFootnoteReferenceIds: footnoteIdsInRetainedSlice(layout),
+    leadFootnoteReferenceIds: footnoteIdsInRetainedSlice({
+      ...layout,
+      rows: layout.rows.slice(0, 1),
+    }),
+  });
+}
+
+function prescanBodyPageAnchors(
+  context: BodySessionDependencies,
+  request: Parameters<NonNullable<BodyLayoutSession['prescanPageAnchors']>>[0],
+): ReturnType<NonNullable<BodyLayoutSession['prescanPageAnchors']>> {
+  const {
+    source,
+    dependencies,
+    services,
+    state,
+    sessionState,
+    footnotesById,
+    endnotesById,
+    storyAcquisitionContext,
+    pageRegistryFlowDomainId,
+    measureContext,
+    publicAnchorBridge,
+    effectiveTablePositioning,
+  } = context;
+  const geometry = request.location.section.geometry;
+  const marginTopPt = bodyMarginInsetPt(geometry.marginTop);
+  const marginBottomPt = bodyMarginInsetPt(geometry.marginBottom);
+  const frames = Object.freeze({
+    page: Object.freeze({
+      xPt: 0,
+      yPt: 0,
+      widthPt: geometry.pageWidth,
+      heightPt: geometry.pageHeight,
+    }),
+    margin: Object.freeze({
+      xPt: geometry.marginLeft,
+      yPt: marginTopPt,
+      widthPt: Math.max(0, geometry.pageWidth - geometry.marginLeft - geometry.marginRight),
+      heightPt: Math.max(0, geometry.pageHeight - marginTopPt - marginBottomPt),
+    }),
+    column: Object.freeze({
+      xPt: request.location.availableBounds.xPt,
+      yPt: marginTopPt,
+      widthPt: request.availableInlineExtentPt,
+      heightPt: Math.max(0, geometry.pageHeight - marginTopPt - marginBottomPt),
+    }),
+    paragraph: null,
+    line: null,
+    character: null,
+    pageParity: request.location.pageIndex % 2 === 0 ? ('odd' as const) : ('even' as const),
+  });
+  const publicParagraphs = new Set<ParagraphLayoutSource>();
+  const paragraphKey = (source: SourceRef) =>
+    `${source.story}:${source.storyInstance}:${source.path.join('.')}`;
+  const paragraphIds = new Map<string, number>();
+  const paragraphIdFor = (source: SourceRef): number => {
+    const key = paragraphKey(source);
+    if (!paragraphIds.has(key)) {
+      paragraphIds.set(key, sessionState.floatRegistry.nextParagraphId + paragraphIds.size);
+    }
+    return paragraphIds.get(key)!;
+  };
+  const entries = request.anchors.flatMap((anchor): readonly FloatRegistryEntryPt[] => {
+    if (anchor.kind === 'floating-table') {
+      // §17.4.57 topFromText is the minimum gap above a positioned
+      // table. In controlled Word output, a page-positioned table
+      // keeps its authored y while preceding paragraph lines that
+      // intersect its exclusion move below it. This holds with and
+      // without an intervening empty mark; increasing topFromText
+      // can move even the first line. Reuse the first pass's actual
+      // page/fragment bounds rather than guessing table height here.
+      const table = sourceElement(dependencies.source, anchor.tableSource);
+      if (table.type !== 'table') {
+        throw new Error('Page-positioned table prescan source kind mismatch');
+      }
+      const positioning = state.acquisitionInputs.tableFormatInput(table).positioning;
+      if (
+        !positioning ||
+        (positioning.vertAnchor !== 'page' && positioning.vertAnchor !== 'margin')
+      ) {
+        throw new Error('Page-positioned table prescan requires a page-owned vertical axis');
+      }
+      const { bounds } = anchor;
+      return [
+        Object.freeze({
+          kind: 'table' as const,
+          occurrenceId: anchor.occurrenceId,
+          overlap: table.overlap === 'never' ? ('never' as const) : ('overlap' as const),
+          paragraphId: paragraphIdFor(anchor.tableSource),
+          bounds,
+          exclusionBounds: Object.freeze({
+            xPt: bounds.xPt - positioning.leftFromTextPt,
+            yPt: bounds.yPt - positioning.topFromTextPt,
+            widthPt: bounds.widthPt + positioning.leftFromTextPt + positioning.rightFromTextPt,
+            heightPt: bounds.heightPt + positioning.topFromTextPt + positioning.bottomFromTextPt,
+          }),
+        }),
+      ];
+    }
+    const paragraph = sourceElement(dependencies.source, anchor.paragraphSource);
+    if (paragraph.type !== 'paragraph') {
+      throw new Error('Page-anchor prescan source kind mismatch');
+    }
+    const acquired = paragraph;
+    const hostMatches = acquired.runs.filter(
+      (run) => run.type === 'anchorHost' && run.anchorOccurrenceId === anchor.occurrenceId,
+    );
+    const payloads = acquired.runs
+      .map((run, runIndex) => ({ run, runIndex }))
+      .filter(
+        (
+          candidate,
+        ): candidate is typeof candidate & {
+          run: Extract<
+            typeof candidate.run,
+            {
+              type: 'image' | 'chart' | 'shape' | 'unavailableDrawing';
+            }
+          > & {
+            anchorAcquisitionInput: NonNullable<
+              Extract<
+                typeof candidate.run,
+                {
+                  type: 'image' | 'chart' | 'shape' | 'unavailableDrawing';
+                }
+              >['anchorAcquisitionInput']
+            >;
+          };
+        } =>
+          (candidate.run.type === 'image' ||
+            candidate.run.type === 'chart' ||
+            candidate.run.type === 'shape' ||
+            candidate.run.type === 'unavailableDrawing') &&
+          candidate.run.anchorAcquisitionInput?.occurrenceId === anchor.occurrenceId,
+      )
+      .sort(
+        (left, right) =>
+          (left.run.anchorAcquisitionInput.group?.sourceIndex ?? 0) -
+            (right.run.anchorAcquisitionInput.group?.sourceIndex ?? 0) ||
+          left.runIndex - right.runIndex,
+      );
+    if (hostMatches.length !== 1 || payloads.length === 0) {
+      const publicRun = paragraph.runs.find(
+        (run, runIndex) =>
+          publicAnchorBridge(anchor.paragraphSource, runIndex)?.occurrenceId ===
+          anchor.occurrenceId,
+      );
+      if (publicRun) {
+        if (
+          (publicRun.type === 'image' ||
+            publicRun.type === 'chart' ||
+            publicRun.type === 'shape') &&
+          publicRun.wrapMode === 'none'
+        )
+          return [];
+        const candidate: BodyAcquisitionState = {
+          ...state,
+          floats: [...state.floats],
+          pageAnchorPrescanned: new Set(state.pageAnchorPrescanned),
+        };
+        applyBodyAcquisitionLocationTo(services, candidate, request.location);
+        const publicEntries = acquirePublicParagraphFloats(
+          sessionState,
+          publicAnchorBridge,
+          paragraph,
+          anchor.paragraphSource,
+          candidate,
+          new Set([anchor.occurrenceId]),
+          paragraphIdFor(anchor.paragraphSource),
+        );
+        if (publicEntries.length !== 1) {
+          throw new Error(`Public page-anchor prescan occurrence mismatch: ${anchor.occurrenceId}`);
+        }
+        publicParagraphs.add(paragraph);
+        return publicEntries;
+      }
+      throw new Error(
+        `Page-anchor prescan occurrence acquisition mismatch: ${anchor.occurrenceId}`,
+      );
+    }
+    const result = resolveAnchorFrame({
+      acquisition: payloads[0]!.run.anchorAcquisitionInput,
+      frames,
+    });
+    if (result.status !== 'resolved') {
+      throw new Error(`Page-anchor prescan could not resolve occurrence: ${anchor.occurrenceId}`);
+    }
+    // ECMA-376 §17.6.20 + §§20.4.2.3/.7/.10/.11: positionH/V and
+    // extent resolve in the upright physical drawing frame. The page
+    // registry is section-logical, so page-start prescan must apply the
+    // section writing mode's canonical physical-to-logical affine
+    // inverse before the exclusion can affect earlier body content.
+    const retainedResult = isVerticalTextDirection(request.location.section.textDirection)
+      ? (() => {
+          const writingMode = writingModeFromTextDirection(
+            request.location.section.textDirection as string,
+          );
+          const physicalPage = uprightPhysicalExtent(
+            {
+              widthPt: frames.page.widthPt,
+              heightPt: frames.page.heightPt,
+            },
+            writingMode,
+          );
+          return projectPhysicalAnchorResult(
+            result,
+            physicalToLogicalMatrix(writingMode, physicalPage),
+          );
+        })()
+      : result;
+    const wrapBounds = retainedResult.geometry.wrapBounds;
+    if (wrapBounds === null || retainedResult.geometry.wrap.kind === 'none') {
+      return [];
+    }
+    const polygon =
+      retainedResult.geometry.wrap.polygon?.points ??
+      Object.freeze([
+        Object.freeze({ xPt: wrapBounds.xPt, yPt: wrapBounds.yPt }),
+        Object.freeze({ xPt: wrapBounds.xPt + wrapBounds.widthPt, yPt: wrapBounds.yPt }),
+        Object.freeze({
+          xPt: wrapBounds.xPt + wrapBounds.widthPt,
+          yPt: wrapBounds.yPt + wrapBounds.heightPt,
+        }),
+        Object.freeze({ xPt: wrapBounds.xPt, yPt: wrapBounds.yPt + wrapBounds.heightPt }),
+      ]);
+    return [
+      Object.freeze({
+        kind: 'shape' as const,
+        occurrenceId: anchor.occurrenceId,
+        paragraphId: paragraphIdFor(anchor.paragraphSource),
+        bounds: retainedResult.geometry.objectFrame,
+        exclusionBounds: wrapBounds,
+        wrap: retainedResult.geometry.wrap.kind,
+        wrapSide: retainedResult.geometry.wrap.side,
+        wrapDistances: retainedResult.geometry.wrap.distances,
+        wrapPolygon: Object.freeze([...polygon]),
+      }),
+    ];
+  });
+  publicParagraphs.forEach((paragraph) => state.pageAnchorPrescanned?.add(paragraph));
+  if (entries.length === 0) return null;
+  return Object.freeze({
+    floats: Object.freeze({
+      coordinateSpace: 'logical-page-points' as const,
+      // Page-owned wrap exclusions survive same-page column/section
+      // cutovers, so their transaction identity belongs to the physical
+      // page rather than the active body flow domain.
+      flowDomainId: sessionState.floatRegistry.flowDomainId,
+      baseEntries: sessionState.floatRegistry.entries,
+      baseNextParagraphId: sessionState.floatRegistry.nextParagraphId,
+      nextParagraphId: sessionState.floatRegistry.nextParagraphId + entries.length,
+      entries: Object.freeze(entries),
+    }),
+  });
+}
+
+function measureBodyLineNumberGlyph(
+  context: BodySessionDependencies,
+  text: Parameters<NonNullable<BodyLayoutSession['measureLineNumberGlyph']>>[0],
+): ReturnType<NonNullable<BodyLayoutSession['measureLineNumberGlyph']>> {
+  const {
+    source,
+    dependencies,
+    services,
+    state,
+    sessionState,
+    footnotesById,
+    endnotesById,
+    storyAcquisitionContext,
+    pageRegistryFlowDomainId,
+    measureContext,
+    publicAnchorBridge,
+    effectiveTablePositioning,
+  } = context;
+  const previousFont = measureContext.font;
+  try {
+    const fontSizePt = source.fonts.defaultBodyFontSizePt;
+    const font = buildFont(false, false, fontSizePt, null, {});
+    measureContext.font = font;
+    const metrics = measureContext.measureText(text);
+    return Object.freeze({
+      widthPt: metrics.width,
+      ascentPt:
+        metrics.fontBoundingBoxAscent ?? metrics.actualBoundingBoxAscent ?? fontSizePt * 0.8,
+      descentPt:
+        metrics.fontBoundingBoxDescent ?? metrics.actualBoundingBoxDescent ?? fontSizePt * 0.2,
+      font,
+    });
+  } finally {
+    measureContext.font = previousFont;
+  }
+}
+
+function resetBodyPageAcquisition(
+  context: BodySessionDependencies,
+  next: Parameters<NonNullable<BodyLayoutSession['resetPageAcquisition']>>[0],
+): ReturnType<NonNullable<BodyLayoutSession['resetPageAcquisition']>> {
+  const {
+    source,
+    dependencies,
+    services,
+    state,
+    sessionState,
+    footnotesById,
+    endnotesById,
+    storyAcquisitionContext,
+    pageRegistryFlowDomainId,
+    measureContext,
+    publicAnchorBridge,
+    effectiveTablePositioning,
+  } = context;
+  state.floats = [];
+  state.floatParaSeq = 0;
+  state.pageAnchorPrescanned = new Set();
+  sessionState.floatRegistry = Object.freeze({
+    coordinateSpace: 'logical-page-points' as const,
+    flowDomainId: pageRegistryFlowDomainId(next.pageIndex),
+    entries: Object.freeze([]),
+    nextParagraphId: 0,
+  });
+  sessionState.drawingCollisionRegistry = createDrawingMLCollisionRegistry(
+    pageRegistryFlowDomainId(next.pageIndex),
+    'logical-page-points',
+  );
+  setBodyAcquisitionLocation(services, state, sessionState, next);
+}
+
+function bodyFlowRegistrySnapshot(
+  context: BodySessionDependencies,
+): ReturnType<NonNullable<BodyLayoutSession['flowRegistrySnapshot']>> {
+  const {
+    source,
+    dependencies,
+    services,
+    state,
+    sessionState,
+    footnotesById,
+    endnotesById,
+    storyAcquisitionContext,
+    pageRegistryFlowDomainId,
+    measureContext,
+    publicAnchorBridge,
+    effectiveTablePositioning,
+  } = context;
+  return Object.freeze({
+    floats: sessionState.floatRegistry,
+    drawingCollisions: sessionState.drawingCollisionRegistry,
+  });
+}
+
+function commitBodyFlowRegistryDelta(
+  context: BodySessionDependencies,
+  delta: Parameters<NonNullable<BodyLayoutSession['commitFlowRegistryDelta']>>[0],
+): ReturnType<NonNullable<BodyLayoutSession['commitFlowRegistryDelta']>> {
+  const {
+    source,
+    dependencies,
+    services,
+    state,
+    sessionState,
+    footnotesById,
+    endnotesById,
+    storyAcquisitionContext,
+    pageRegistryFlowDomainId,
+    measureContext,
+    publicAnchorBridge,
+    effectiveTablePositioning,
+  } = context;
+  if (!delta.floats && !delta.drawingCollisions) {
+    throw new Error('Body flow registry delta must update at least one registry');
+  }
+  if (delta.floats) {
+    validateFloatingTableRegistryDelta(delta.floats, {
+      coordinateSpace: sessionState.floatRegistry.coordinateSpace,
+      flowDomainId: sessionState.floatRegistry.flowDomainId,
+      entries: sessionState.floatRegistry.entries,
+      nextParagraphId: sessionState.floatRegistry.nextParagraphId,
+    });
+  }
+  if (delta.drawingCollisions) {
+    validateDrawingMLCollisionRegistryDelta(
+      sessionState.drawingCollisionRegistry,
+      delta.drawingCollisions,
+    );
+  }
+  const nextDrawingCollisionRegistry = delta.drawingCollisions
+    ? applyDrawingMLCollisionRegistryDelta(
+        sessionState.drawingCollisionRegistry,
+        delta.drawingCollisions,
+      )
+    : sessionState.drawingCollisionRegistry;
+  const retainedFloats = (delta.floats?.entries ?? []).map((entry): FloatRect => {
+    const left = entry.wrapDistances?.leftPt ?? entry.bounds.xPt - entry.exclusionBounds.xPt;
+    const top = entry.wrapDistances?.topPt ?? entry.bounds.yPt - entry.exclusionBounds.yPt;
+    const right =
+      entry.wrapDistances?.rightPt ??
+      entry.exclusionBounds.xPt +
+        entry.exclusionBounds.widthPt -
+        entry.bounds.xPt -
+        entry.bounds.widthPt;
+    const bottom =
+      entry.wrapDistances?.bottomPt ??
+      entry.exclusionBounds.yPt +
+        entry.exclusionBounds.heightPt -
+        entry.bounds.yPt -
+        entry.bounds.heightPt;
+    const core = {
+      mode: (entry.wrap === 'topAndBottom' ? 'topAndBottom' : 'square') as FloatRect['mode'],
+      ...(entry.kind === 'shape'
+        ? {
+            anchorOccurrenceId: entry.occurrenceId,
+            acquisitionOccurrenceId: entry.occurrenceId,
+          }
+        : {}),
+      ...(entry.wrap
+        ? {
+            authoredWrap: entry.wrap,
+            wrapPolygon: entry.wrapPolygon,
+          }
+        : {}),
+      imageKey:
+        entry.exclusionId ?? (entry.kind === 'table' ? `body:float:${entry.paragraphId}` : ''),
+      imageX: entry.bounds.xPt,
+      imageY: entry.bounds.yPt,
+      imageW: entry.bounds.widthPt,
+      imageH: entry.bounds.heightPt,
+      xLeft: entry.exclusionBounds.xPt,
+      xRight: entry.exclusionBounds.xPt + entry.exclusionBounds.widthPt,
+      yTop: entry.exclusionBounds.yPt,
+      yBottom: entry.exclusionBounds.yPt + entry.exclusionBounds.heightPt,
+      side: entry.wrapSide ?? 'bothSides',
+      distLeft: left,
+      distRight: right,
+      distTop: top,
+      distBottom: bottom,
+      paraId: entry.paragraphId,
+    };
+    return entry.kind === 'table'
+      ? {
+          ...core,
+          kind: 'table',
+          tableOverlap: entry.overlap,
+        }
+      : { ...core, kind: entry.kind };
+  });
+  if (delta.floats) {
+    state.floats.push(...retainedFloats);
+    sessionState.floatRegistry = Object.freeze({
+      ...sessionState.floatRegistry,
+      entries: Object.freeze([...sessionState.floatRegistry.entries, ...delta.floats.entries]),
+      nextParagraphId: delta.floats.nextParagraphId,
+    });
+    state.floatParaSeq = delta.floats.nextParagraphId;
+  }
+  sessionState.drawingCollisionRegistry = nextDrawingCollisionRegistry;
+}
+
+function acquirePublicParagraphFloats(
+  sessionState: BodySessionDependencies['sessionState'],
+  publicAnchorBridge: ConcreteBodyKernelContext['publicAnchorBridge'],
+  paragraph: LayoutParagraphBlock,
+  source: SourceRef,
+  candidate: BodyAcquisitionState,
+  onlyOccurrenceIds?: ReadonlySet<string>,
+  paragraphId = sessionState.floatRegistry.nextParagraphId,
+): readonly FloatRegistryEntryPt[] {
+  const committedOccurrenceIds = new Set(
+    sessionState.floatRegistry.entries.map((entry) => entry.occurrenceId),
+  );
+  const publicRuns = paragraph.runs.flatMap((run, runIndex) => {
+    if (run.type !== 'shape' && run.type !== 'image' && run.type !== 'chart') return [];
+    const bridge = publicAnchorBridge(source, runIndex);
+    if (
+      !bridge ||
+      (onlyOccurrenceIds && !onlyOccurrenceIds.has(bridge.occurrenceId)) ||
+      committedOccurrenceIds.has(bridge.occurrenceId) ||
+      (bridge.pageOwned && candidate.pageAnchorPrescanned?.has(paragraph))
+    )
+      return [];
+    return [
+      {
+        run,
+        occurrenceId: bridge.occurrenceId,
+      },
+    ];
+  });
+  if (publicRuns.length === 0) return Object.freeze([]);
+  const baseFloatCount = candidate.floats.length;
+  registerAnchorFloats(
+    { ...paragraph, runs: publicRuns.map(({ run }) => run) },
+    candidate,
+    candidate.y,
+  );
+  const registered = candidate.floats.slice(baseFloatCount);
+  if (registered.length !== publicRuns.length) {
+    throw new Error('Public paragraph anchor acquisition did not retain every wrap float');
+  }
+  return Object.freeze(
+    registered.map((float, index): FloatRegistryEntryPt => {
+      const occurrenceId = publicRuns[index]!.occurrenceId;
+      return Object.freeze({
+        kind: 'shape',
+        occurrenceId,
+        exclusionId: occurrenceId,
+        paragraphId,
+        bounds: Object.freeze({
+          xPt: float.imageX,
+          yPt: float.imageY,
+          widthPt: float.imageW,
+          heightPt: float.imageH,
+        }),
+        exclusionBounds: Object.freeze({
+          xPt: float.xLeft,
+          yPt: float.yTop,
+          widthPt: float.xRight - float.xLeft,
+          heightPt: float.yBottom - float.yTop,
+        }),
+        wrap: publicRuns[index]!.run.wrapMode as NonNullable<FloatRegistryEntryPt['wrap']>,
+        wrapSide: float.side,
+        wrapDistances: Object.freeze({
+          topPt: float.distTop,
+          rightPt: float.distRight,
+          bottomPt: float.distBottom,
+          leftPt: float.distLeft,
+        }),
+        ...(float.wrapPolygon ? { wrapPolygon: Object.freeze([...float.wrapPolygon]) } : {}),
+      });
+    }),
+  );
+}
+
+function retainedBodyParagraphFloatEntries(
+  sessionState: BodySessionDependencies['sessionState'],
+  layout: ParagraphLayout,
+): readonly FloatRegistryEntryPt[] {
+  const hostFrames = new Map(
+    (layout.anchorFrames ?? []).flatMap((frame) => {
+      if (frame.status !== 'resolved') return [];
+      const isHostAxis = (axis: typeof frame.axes.horizontal) =>
+        axis.status === 'resolved' &&
+        (axis.referenceFrame === 'paragraph' ||
+          axis.referenceFrame === 'line' ||
+          axis.referenceFrame === 'character');
+      return isHostAxis(frame.axes.horizontal) || isHostAxis(frame.axes.vertical)
+        ? [[frame.occurrenceId, frame] as const]
+        : [];
+    }),
+  );
+  if (hostFrames.size === 0) return Object.freeze([]);
+  const exclusions = new Map(
+    layout.exclusions.flatMap((exclusion) =>
+      exclusion.anchorOccurrenceId ? [[exclusion.anchorOccurrenceId, exclusion] as const] : [],
+    ),
+  );
+  return Object.freeze(
+    (layout.anchorCollisions ?? []).flatMap((collision): FloatRegistryEntryPt[] => {
+      const frame = hostFrames.get(collision.occurrenceId);
+      if (!frame) return [];
+      if (frame.geometry.wrap.kind === 'none') return [];
+      const exclusion = exclusions.get(collision.occurrenceId);
+      if (!exclusion) {
+        throw new Error(`Wrapped anchor omitted exclusion geometry: ${collision.occurrenceId}`);
+      }
+      return [
+        Object.freeze({
+          kind: 'shape' as const,
+          occurrenceId: collision.occurrenceId,
+          exclusionId: collision.occurrenceId,
+          paragraphId: sessionState.floatRegistry.nextParagraphId,
+          bounds: collision.bounds,
+          exclusionBounds: exclusion.bounds,
+          horizontalOwnership: collision.horizontalOwnership,
+          verticalOwnership: collision.verticalOwnership,
+          wrap: frame.geometry.wrap.kind,
+          wrapSide: frame.geometry.wrap.side,
+          wrapDistances: frame.geometry.wrap.distances,
+          ...(frame.geometry.wrap.polygon
+            ? { wrapPolygon: frame.geometry.wrap.polygon.points }
+            : {}),
+        }),
+      ];
+    }),
+  );
+}
+
+function reacquireBodyTableBlock(
+  state: BodyAcquisitionState,
+  sourceStore: LayoutSourceStore,
+  request: PageDependentTableBlockRequest,
+): ParagraphLayout | TableLayout {
+  if (request.acquired.kind !== 'paragraph') return request.acquired;
+  const source = nestedSourceElement(sourceStore, request.acquired.source);
+  if (source.type !== 'paragraph') {
+    throw new Error('Table paragraph re-acquisition source kind mismatch');
+  }
+  const candidate: BodyAcquisitionState = {
+    ...withTableCellStory(state),
+    contentX: 0,
+    contentW: request.acquired.flowBounds.widthPt,
+    y: request.acquired.flowBounds.yPt,
+    floats: (request.floatingTableExclusions ?? []).map(
+      (bounds, index): FloatRect => ({
+        kind: 'table',
+        tableOverlap: 'never',
+        mode: 'square',
+        imageKey: `${TRANSIENT_TABLE_FINAL_FRAME_EXCLUSION_PREFIX}${index}`,
+        imageX: bounds.xPt,
+        imageY: bounds.yPt,
+        imageW: bounds.widthPt,
+        imageH: bounds.heightPt,
+        xLeft: bounds.xPt,
+        xRight: bounds.xPt + bounds.widthPt,
+        yTop: bounds.yPt,
+        yBottom: bounds.yPt + bounds.heightPt,
+        side: 'bothSides',
+        distLeft: 0,
+        distRight: 0,
+        distTop: 0,
+        distBottom: 0,
+        paraId: index,
+      }),
+    ),
+    floatParaSeq: request.floatingTableExclusions?.length ?? 0,
+    pageAnchorPrescanned: new Set<ParagraphLayoutSource>(),
+  };
+  const inheritedAuthority = inheritedParagraphAuthorityForReacquisition(request.acquired);
+  const tableAcquisition = state.retainedTableAcquisition;
+  return tableAcquisition.acquireParagraph(
+    candidate,
+    source,
+    request.acquired.flowBounds.widthPt,
+    request.acquired.source.path,
+    request.acquired.flowDomainId,
+    undefined,
+    inheritedAuthority,
+  );
+}
+
+function acquireCompleteBodyTextBoxStory(
+  state: BodyAcquisitionState,
+  storyAcquisitionContext: BodyStoryAcquisitionContext,
+  request: Parameters<CompleteTextBoxStoryAcquirer>[0],
+): ReturnType<CompleteTextBoxStoryAcquirer> {
+  const section =
+    request.coordinateSpace === 'upright-physical'
+      ? {
+          ...state.sectionLayout,
+          geometry: physicalSectionGeometry(state.sectionLayout.geometry),
+          textDirection: 'lrTb',
+        }
+      : state.sectionLayout;
+  return acquireBodyStoryLayout(storyAcquisitionContext, {
+    source: request.source,
+    pageIndex: state.pageIndex,
+    section,
+    container: request.container,
+  });
+}
+
+function openConcreteBodyLayoutSession(
+  dependencies: ConcreteBodyKernelContext,
+  input: import('./body-layout-kernel.js').BodyLayoutSessionInput,
+  services: LayoutServices,
+  options: LayoutOptions,
+): BodyLayoutSession {
+  const {
+    source,
+    measureContext,
+    resolvedLocalFonts,
+    documentFontFamilyClasses,
+    publicAnchorBridge,
+    effectiveTablePositioning,
+  } = dependencies;
+  if (!measureContext) throw new Error('Body layout acquisition requires a measurement context');
+  const physicalSection: SectionProps = {
+    ...source.section,
+    ...input.section.geometry,
+    textDirection: input.section.textDirection,
+    vAlign: input.section.verticalAlignment,
+  };
+  const section = isVerticalTextDirection(physicalSection.textDirection)
+    ? verticalLayoutSection(physicalSection)
+    : physicalSection;
+  const state = buildMeasureState(
+    measureContext,
+    section,
+    documentFontFamilyClasses,
+    source.documentLayoutSettings,
+    resolvedLocalFonts,
+    services,
+    options,
+  );
+  // Markup view only: resolve tracked-change author colours once per
+  // session from the main story's document run order (first-appearance
+  // policy, layout/track-changes.ts). The default final-view variant
+  // never builds or carries this.
+  if (options.showTrackedChanges === true) {
+    state.revisionAuthorColor = createRevisionAuthorColorResolver(source.blocks.body);
+  }
+  const sourceFootnotes = source.blocks.footnotes;
+  const sourceEndnotes = source.blocks.endnotes;
+  const noteSettings = source.bodyLayoutInput.noteLayoutSettings;
+  state.noteNumbering = {
+    footnote: noteSettings?.footnoteNumbering ?? { format: 'decimal', start: 1 },
+    endnote: noteSettings?.endnoteNumbering ?? { format: 'decimal', start: 1 },
+  };
+  const footnotesById = indexNotes(sourceFootnotes);
+  state.noteNumbers = new Map([
+    ...[
+      ...buildNoteNumberMap(
+        sourceFootnotes,
+        noteReferenceIdsInDocumentOrder(source.blocks.body, 'footnote'),
+      ),
+    ].map(([id, number]) => [`footnote:${id}`, number] as const),
+    ...[
+      ...buildNoteNumberMap(
+        sourceEndnotes,
+        noteReferenceIdsInDocumentOrder(source.blocks.body, 'endnote'),
+      ),
+    ].map(([id, number]) => [`endnote:${id}`, number] as const),
+  ]);
+  let location = input.initialLocation;
+  const pageRegistryFlowDomainId = (pageIndex: number) => `body:page:${pageIndex}:registry`;
+  let floatRegistry: FloatRegistrySnapshotPt = Object.freeze({
+    coordinateSpace: 'logical-page-points' as const,
+    flowDomainId: pageRegistryFlowDomainId(location.pageIndex),
+    entries: Object.freeze([]) as readonly FloatRegistryEntryPt[],
+    nextParagraphId: 0,
+  });
+  let drawingCollisionRegistry: DrawingMLCollisionRegistrySnapshotPt =
+    createDrawingMLCollisionRegistry(
+      pageRegistryFlowDomainId(location.pageIndex),
+      'logical-page-points',
+    );
+  const sessionState = { location, floatRegistry, drawingCollisionRegistry };
+  setBodyAcquisitionLocation(services, state, sessionState, sessionState.location);
+  const endnotesById = indexNotes(source.blocks.endnotes);
+  const storyLayoutCache = new Map<string, StoryLayout>();
+  const storyAcquisitionContext: BodyStoryAcquisitionContext = {
+    source,
+    state,
+    services,
+    storyLayoutCache,
+    publicAnchorBridge,
+  };
+  state.acquireCompleteTextBoxStory = (request) =>
+    acquireCompleteBodyTextBoxStory(state, storyAcquisitionContext, request);
+  const sessionDependencies = {
+    source,
+    dependencies,
+    services,
+    state,
+    sessionState,
+    footnotesById,
+    endnotesById,
+    storyAcquisitionContext,
+    pageRegistryFlowDomainId,
+    measureContext,
+    publicAnchorBridge,
+    effectiveTablePositioning,
+  };
+
+  const session: BodyLayoutSession = {
+    hasPaginationFields: source.hasPaginationFields,
+    measureParagraph(
+      request: Parameters<NonNullable<BodyLayoutSession['measureParagraph']>>[0],
+    ): ReturnType<NonNullable<BodyLayoutSession['measureParagraph']>> {
+      return measureBodyParagraphEntry(sessionDependencies, request);
+    },
+    measureTable(
+      request: Parameters<NonNullable<BodyLayoutSession['measureTable']>>[0],
+    ): ReturnType<NonNullable<BodyLayoutSession['measureTable']>> {
+      return measureBodyTableEntry(sessionDependencies, request, {
+        setBodyAcquisitionLocation, sourceElement, computeTablePtLayout,
+        ordinaryAcquisitionInputForAdjacentGroup, reacquireBodyTableBlock,
+      });
+    },
+    layoutStory: (request) => acquireBodyStoryLayout(storyAcquisitionContext, request),
+    layoutNotes(
+      request: Parameters<NonNullable<BodyLayoutSession['layoutNotes']>>[0],
+    ): ReturnType<NonNullable<BodyLayoutSession['layoutNotes']>> {
+      return layoutBodyNotes(sessionDependencies, request);
+    },
+    measureFollowingBlock(
+      request: Parameters<NonNullable<BodyLayoutSession['measureFollowingBlock']>>[0],
+    ): ReturnType<NonNullable<BodyLayoutSession['measureFollowingBlock']>> {
+      return measureFollowingBodyBlock(sessionDependencies, request);
+    },
+    prescanPageAnchors(
+      request: Parameters<NonNullable<BodyLayoutSession['prescanPageAnchors']>>[0],
+    ): ReturnType<NonNullable<BodyLayoutSession['prescanPageAnchors']>> {
+      return prescanBodyPageAnchors(sessionDependencies, request);
+    },
+    measureLineNumberGlyph(
+      text: Parameters<NonNullable<BodyLayoutSession['measureLineNumberGlyph']>>[0],
+    ): ReturnType<NonNullable<BodyLayoutSession['measureLineNumberGlyph']>> {
+      return measureBodyLineNumberGlyph(sessionDependencies, text);
+    },
+    resetPageAcquisition(
+      next: Parameters<NonNullable<BodyLayoutSession['resetPageAcquisition']>>[0],
+    ): ReturnType<NonNullable<BodyLayoutSession['resetPageAcquisition']>> {
+      return resetBodyPageAcquisition(sessionDependencies, next);
+    },
+    moveAcquisitionCursor: (next) =>
+      setBodyAcquisitionLocation(services, state, sessionState, next),
+    flowRegistrySnapshot(): ReturnType<NonNullable<BodyLayoutSession['flowRegistrySnapshot']>> {
+      return bodyFlowRegistrySnapshot(sessionDependencies);
+    },
+    commitFlowRegistryDelta(
+      delta: Parameters<NonNullable<BodyLayoutSession['commitFlowRegistryDelta']>>[0],
+    ): ReturnType<NonNullable<BodyLayoutSession['commitFlowRegistryDelta']>> {
+      return commitBodyFlowRegistryDelta(sessionDependencies, delta);
+    },
+  };
+  return Object.freeze(session);
+}
+
+function buildConcreteBodyLayoutKernel(dependencies: ConcreteBodyKernelContext): BodyLayoutKernel {
   return Object.freeze({
     openBodyLayoutSession(
       input: import('./body-layout-kernel.js').BodyLayoutSessionInput,
       services: LayoutServices,
       options: LayoutOptions,
     ) {
-      if (!measureContext) throw new Error('Body layout acquisition requires a measurement context');
-      const physicalSection: SectionProps = {
-        ...source.section,
-        ...input.section.geometry,
-        textDirection: input.section.textDirection,
-        vAlign: input.section.verticalAlignment,
-      };
-      const section = isVerticalTextDirection(physicalSection.textDirection)
-        ? verticalLayoutSection(physicalSection)
-        : physicalSection;
-      const state = buildMeasureState(
-        measureContext,
-        section,
-        documentFontFamilyClasses,
-        source.documentLayoutSettings,
-        resolvedLocalFonts,
-        services,
-        options,
-      );
-      // Markup view only: resolve tracked-change author colours once per
-      // session from the main story's document run order (first-appearance
-      // policy, layout/track-changes.ts). The default final-view variant
-      // never builds or carries this.
-      if (options.showTrackedChanges === true) {
-        state.revisionAuthorColor = createRevisionAuthorColorResolver(source.blocks.body);
-      }
-      const sourceFootnotes = source.blocks.footnotes;
-      const sourceEndnotes = source.blocks.endnotes;
-      const footnotesById = indexNotes(sourceFootnotes);
-      state.noteNumbers = new Map([
-        ...[...buildNoteNumberMap(
-          sourceFootnotes,
-          noteReferenceIdsInDocumentOrder(source.blocks.body, 'footnote'),
-        )].map(
-          ([id, number]) => [`footnote:${id}`, number] as const,
-        ),
-        ...[...buildNoteNumberMap(
-          sourceEndnotes,
-          noteReferenceIdsInDocumentOrder(source.blocks.body, 'endnote'),
-        )].map(
-          ([id, number]) => [`endnote:${id}`, number] as const,
-        ),
-      ]);
-      let location = input.initialLocation;
-      const pageRegistryFlowDomainId = (pageIndex: number) => `body:page:${pageIndex}:registry`;
-      let floatRegistry: FloatRegistrySnapshotPt = Object.freeze({
-        coordinateSpace: 'logical-page-points' as const,
-        flowDomainId: pageRegistryFlowDomainId(location.pageIndex),
-        entries: Object.freeze([]) as readonly FloatRegistryEntryPt[],
-        nextParagraphId: 0,
-      });
-      let drawingCollisionRegistry: DrawingMLCollisionRegistrySnapshotPt =
-        createDrawingMLCollisionRegistry(
-          pageRegistryFlowDomainId(location.pageIndex),
-          'logical-page-points',
-        );
-      const applyLocationTo = (target: BodyAcquisitionState, next: BodyAcquisitionLocation) => {
-        const geometry = next.section.geometry;
-        target.sectionLayout = next.section as SectionLayoutContext;
-        target.pageIndex = next.pageIndex;
-        const page = fieldAcquisitionContextOf(services).resolveDestinationPage?.(next.pageIndex);
-        target.displayPageNumber = page?.displayPageNumber ?? next.pageIndex + 1;
-        target.pageNumberFormat = page?.pageNumberFormat ?? target.pageNumberFormat;
-        target.pageWidth = geometry.pageWidth;
-        target.pageH = geometry.pageHeight;
-        target.marginLeft = geometry.marginLeft;
-        target.marginRight = geometry.marginRight;
-        target.marginTop = bodyMarginInsetPt(geometry.marginTop);
-        target.marginBottom = bodyMarginInsetPt(geometry.marginBottom);
-        target.contentX = next.availableBounds.xPt;
-        target.contentW = next.availableBounds.widthPt;
-        target.y = next.cursorPt.yPt;
-      };
-      const applyLocation = (next: BodyAcquisitionLocation) => {
-        location = next;
-        applyLocationTo(state, next);
-      };
-      applyLocation(location);
-      const publicParagraphFloatAcquisition = (
-        paragraph: LayoutParagraphBlock,
-        source: SourceRef,
-        candidate: BodyAcquisitionState,
-        onlyOccurrenceIds?: ReadonlySet<string>,
-        paragraphId = floatRegistry.nextParagraphId,
-      ): readonly FloatRegistryEntryPt[] => {
-        const committedOccurrenceIds = new Set(floatRegistry.entries.map((entry) => entry.occurrenceId));
-        const publicRuns = paragraph.runs.flatMap((run, runIndex) => {
-          if (run.type !== 'shape' && run.type !== 'image' && run.type !== 'chart') return [];
-          const bridge = publicAnchorBridge(source, runIndex);
-          if (!bridge
-            || (onlyOccurrenceIds && !onlyOccurrenceIds.has(bridge.occurrenceId))
-            || committedOccurrenceIds.has(bridge.occurrenceId)
-            || (bridge.pageOwned && candidate.pageAnchorPrescanned?.has(paragraph))) return [];
-          return [{
-            run,
-            occurrenceId: bridge.occurrenceId,
-          }];
-        });
-        if (publicRuns.length === 0) return Object.freeze([]);
-        const baseFloatCount = candidate.floats.length;
-        registerAnchorFloats(
-          { ...paragraph, runs: publicRuns.map(({ run }) => run) },
-          candidate,
-          candidate.y,
-        );
-        const registered = candidate.floats.slice(baseFloatCount);
-        if (registered.length !== publicRuns.length) {
-          throw new Error('Public paragraph anchor acquisition did not retain every wrap float');
-        }
-        return Object.freeze(registered.map((float, index): FloatRegistryEntryPt => {
-          const occurrenceId = publicRuns[index]!.occurrenceId;
-          return Object.freeze({
-            kind: 'shape',
-            occurrenceId,
-            exclusionId: occurrenceId,
-            paragraphId,
-            bounds: Object.freeze({
-              xPt: float.imageX,
-              yPt: float.imageY,
-              widthPt: float.imageW,
-              heightPt: float.imageH,
-            }),
-            exclusionBounds: Object.freeze({
-              xPt: float.xLeft,
-              yPt: float.yTop,
-              widthPt: float.xRight - float.xLeft,
-              heightPt: float.yBottom - float.yTop,
-            }),
-            wrap: publicRuns[index]!.run.wrapMode as NonNullable<FloatRegistryEntryPt['wrap']>,
-            wrapSide: float.side,
-            wrapDistances: Object.freeze({
-              topPt: float.distTop,
-              rightPt: float.distRight,
-              bottomPt: float.distBottom,
-              leftPt: float.distLeft,
-            }),
-            ...(float.wrapPolygon ? { wrapPolygon: Object.freeze([...float.wrapPolygon]) } : {}),
-          });
-        }));
-      };
-      const retainedParagraphFloatEntries = (
-        layout: ParagraphLayout,
-      ): readonly FloatRegistryEntryPt[] => {
-        const hostFrames = new Map((layout.anchorFrames ?? []).flatMap((frame) => {
-          if (frame.status !== 'resolved') return [];
-          const isHostAxis = (axis: typeof frame.axes.horizontal) => axis.status === 'resolved'
-            && (axis.referenceFrame === 'paragraph'
-              || axis.referenceFrame === 'line'
-              || axis.referenceFrame === 'character');
-          return isHostAxis(frame.axes.horizontal) || isHostAxis(frame.axes.vertical)
-            ? [[frame.occurrenceId, frame] as const]
-            : [];
-        }));
-        if (hostFrames.size === 0) return Object.freeze([]);
-        const exclusions = new Map(layout.exclusions.flatMap((exclusion) =>
-          exclusion.anchorOccurrenceId
-            ? [[exclusion.anchorOccurrenceId, exclusion] as const]
-            : []));
-        return Object.freeze((layout.anchorCollisions ?? []).flatMap(
-          (collision): FloatRegistryEntryPt[] => {
-          const frame = hostFrames.get(collision.occurrenceId);
-          if (!frame) return [];
-          if (frame.geometry.wrap.kind === 'none') return [];
-          const exclusion = exclusions.get(collision.occurrenceId);
-          if (!exclusion) {
-            throw new Error(`Wrapped anchor omitted exclusion geometry: ${collision.occurrenceId}`);
-          }
-          return [Object.freeze({
-            kind: 'shape' as const,
-            occurrenceId: collision.occurrenceId,
-            exclusionId: collision.occurrenceId,
-            paragraphId: floatRegistry.nextParagraphId,
-            bounds: collision.bounds,
-            exclusionBounds: exclusion.bounds,
-            horizontalOwnership: collision.horizontalOwnership,
-            verticalOwnership: collision.verticalOwnership,
-            wrap: frame.geometry.wrap.kind,
-            wrapSide: frame.geometry.wrap.side,
-            wrapDistances: frame.geometry.wrap.distances,
-            ...(frame.geometry.wrap.polygon
-              ? { wrapPolygon: frame.geometry.wrap.polygon.points }
-              : {}),
-          })];
-        }));
-      };
-      const reacquireTableBlock = (
-        request: PageDependentTableBlockRequest,
-      ): ParagraphLayout | TableLayout => {
-        if (request.acquired.kind !== 'paragraph') return request.acquired;
-        const source = nestedSourceElement(request.acquired.source);
-        if (source.type !== 'paragraph') {
-          throw new Error('Table paragraph re-acquisition source kind mismatch');
-        }
-        const candidate: BodyAcquisitionState = {
-          ...withTableCellStory(state),
-          contentX: 0,
-          contentW: request.acquired.flowBounds.widthPt,
-          y: request.acquired.flowBounds.yPt,
-          floats: (request.floatingTableExclusions ?? []).map((bounds, index): FloatRect => ({
-            kind: 'table', tableOverlap: 'never', mode: 'square',
-            imageKey: `${TRANSIENT_TABLE_FINAL_FRAME_EXCLUSION_PREFIX}${index}`,
-            imageX: bounds.xPt, imageY: bounds.yPt,
-            imageW: bounds.widthPt, imageH: bounds.heightPt,
-            xLeft: bounds.xPt,
-            xRight: bounds.xPt + bounds.widthPt,
-            yTop: bounds.yPt,
-            yBottom: bounds.yPt + bounds.heightPt,
-            side: 'bothSides', distLeft: 0, distRight: 0, distTop: 0, distBottom: 0,
-            paraId: index,
-          })),
-          floatParaSeq: request.floatingTableExclusions?.length ?? 0,
-          pageAnchorPrescanned: new Set<ParagraphLayoutSource>(),
-        };
-        const inheritedAuthority =
-          inheritedParagraphAuthorityForReacquisition(request.acquired);
-        const tableAcquisition = state.retainedTableAcquisition;
-        return tableAcquisition.acquireParagraph(
-          candidate,
-          source,
-          request.acquired.flowBounds.widthPt,
-          request.acquired.source.path,
-          request.acquired.flowDomainId,
-          undefined,
-          inheritedAuthority,
-        );
-      };
-      const endnotesById = indexNotes(source.blocks.endnotes);
-      const storyLayoutCache = new Map<string, StoryLayout>();
-      const storyRoot = (ref: SourceRef): readonly LayoutStoryBlock[] => {
-        if (ref.path.length !== 0) {
-          throw new Error('Story acquisition requires a story-root source');
-        }
-        return source.blocks.storyRoot(ref);
-      };
-      const storyElement = (sourceRef: SourceRef): LayoutFlowBlock => {
-        if (sourceRef.path.length === 0 || (sourceRef.path.length - 1) % 3 !== 0) {
-          throw new Error('Story block acquisition requires a canonical source path');
-        }
-        return source.blocks.resolve(sourceRef);
-      };
-      const acquireStoryLayout = (
-        request: import('./body-layout-kernel.js').StoryLayoutAcquisitionInput,
-      ): StoryLayout => {
-        const cacheKey = JSON.stringify({
-          source: request.source,
-          pageIndex: request.pageIndex,
-          section: request.section,
-          container: request.container,
-        });
-        const cached = storyLayoutCache.get(cacheKey);
-        if (cached) return cached;
-        const root = storyRoot(request.source);
-        const noteReferenceNumber = request.source.story === 'footnote'
-          || request.source.story === 'endnote'
-          ? state.noteNumbers?.get(
-              `${request.source.story}:${request.source.storyInstance}`,
-            )
-          : undefined;
-        const fieldContext = fieldAcquisitionContextOf(services);
-        const pageFieldContext = fieldContext.resolveDestinationPage?.(request.pageIndex);
-        const storyVertical = isVerticalTextDirection(request.section.textDirection);
-        const candidate: BodyAcquisitionState = {
-          ...state,
-          sectionLayout: request.section as SectionLayoutContext,
-          pageIndex: request.pageIndex,
-          totalPages: fieldContext.totalPages,
-          displayPageNumber: pageFieldContext?.displayPageNumber ?? request.pageIndex + 1,
-          pageNumberFormat: pageFieldContext?.pageNumberFormat ?? state.pageNumberFormat,
-          pageWidth: request.section.geometry.pageWidth,
-          pageH: request.container.capacity === 'unbounded'
-            ? Number.MAX_SAFE_INTEGER
-            : request.section.geometry.pageHeight,
-          marginLeft: request.section.geometry.marginLeft,
-          marginRight: request.section.geometry.marginRight,
-          marginTop: bodyMarginInsetPt(request.section.geometry.marginTop),
-          marginBottom: bodyMarginInsetPt(request.section.geometry.marginBottom),
-          contentX: request.container.bounds.xPt,
-          contentW: request.container.bounds.widthPt,
-          y: request.container.bounds.yPt,
-          floats: [],
-          floatParaSeq: 0,
-          retainedTablesBySourceIndex: new Map(),
-          pageAnchorPrescanned: new Set<ParagraphLayoutSource>(),
-          noteReferenceNumber,
-          verticalCJK: storyVertical,
-          verticalAllRotated: storyVertical
-            && isAllRotatedVerticalTextDirection(request.section.textDirection),
-          ...(storyVertical ? {} : { verticalPhys: undefined }),
-          storyContext: {
-            story: request.source.story,
-            containers: [],
-            lineNumberingEligible: false,
-          },
-        };
-        preRegisterPageFloats(root, 0, candidate);
-        const storyServices = createLayoutServicesRuntimeView(services);
-        candidate.layoutServices = storyServices;
-        const blockInputs: StoryBlockInput[] = root.flatMap((element, index): StoryBlockInput[] => {
-          const source: SourceRef = {
-            story: request.source.story,
-            storyInstance: request.source.storyInstance,
-            path: [index],
-          };
-          if (element.type === 'unsupportedTextBoxBlock') {
-            return [{
-              type: 'unsupportedTextBoxBlock',
-              qName: element.qName,
-              sourcePath: element.sourcePath,
-            }];
-          }
-          if (element.type === 'paragraph') return [{ kind: 'paragraph', source }];
-          if (element.type !== 'table') {
-            throw new Error(`Unsupported ${request.source.story} story block: ${element.type}`);
-          }
-          const dependencies = candidate.retainedTableAcquisition;
-          const table: LayoutTableBlock = element;
-          const columns = resolveColumnWidths(
-            table,
-            request.container.bounds.widthPt,
-            candidate,
-          );
-          return [acquireRetainedTable(
-            table,
-            columns,
-            request.container.bounds.widthPt,
-            candidate,
-            source,
-            dependencies,
-          ).input];
-        });
-        let previousParagraph: LayoutParagraphBlock | null = null;
-        const algorithms: BlockLayoutAlgorithms = {
-          layoutParagraph(block, placement) {
-            const paragraph = storyElement(block.source);
-            if (paragraph.type !== 'paragraph') throw new Error('Story paragraph source kind mismatch');
-            const sourceIndex = block.source.path[0]!;
-            const previousCandidate = sourceIndex > 0 ? root[sourceIndex - 1] : undefined;
-            const previous: LayoutParagraphBlock | null = previousCandidate?.type === 'paragraph'
-              ? previousCandidate : null;
-            const nextCandidate = root[sourceIndex + 1];
-            const next: LayoutParagraphBlock | null = nextCandidate?.type === 'paragraph'
-              ? nextCandidate : null;
-            const previousAfterPt = previousParagraph?.spaceAfter ?? 0;
-            const spacing = paragraphGapAdjustment(
-              previousParagraph,
-              paragraph,
-              previousAfterPt,
-              paragraph.spaceBefore,
-            );
-            const startYPt = Math.max(
-              placement.container.bounds.yPt,
-              placement.cursor.yPt - spacing.overlap,
-            );
-            candidate.y = startYPt;
-            candidate.contentX = placement.container.bounds.xPt;
-            candidate.contentW = placement.container.bounds.widthPt;
-            const publicRuns = paragraph.runs.filter((run, runIndex) =>
-              publicAnchorBridge(block.source, runIndex) !== null);
-            if (publicRuns.length > 0) {
-              registerAnchorFloats(
-                Object.freeze({ ...paragraph, runs: Object.freeze(publicRuns) }),
-                candidate,
-                candidate.y,
-              );
-            }
-            const context = resolveStateParagraphLayoutContext(candidate, paragraph);
-            const borderEdges = resolveParagraphBorderEdges(previous, paragraph, next);
-            const result = acquireRegisteredParagraph(
-              candidate,
-              paragraph,
-              {
-                id: `${block.source.story}:${block.source.storyInstance}:${block.source.path.join('.')}`,
-                source: block.source,
-                flowDomainId: placement.container.id,
-                ordinaryFlow: true,
-                context,
-                placement: {
-                  startYPt,
-                  paragraphXPt: placement.container.bounds.xPt,
-                  availableWidthPt: placement.container.bounds.widthPt,
-                  maximumYPt: placement.availableBounds.yPt + placement.availableBounds.heightPt,
-                  suppressSpaceBefore: spacing.suppressBefore,
-                },
-                measurer: {
-                  context: candidate.ctx,
-                  fontFamilyClasses: candidate.fontFamilyClasses,
-                },
-                environment: paragraphMeasurementEnvironment(candidate),
-                exclusions: paragraphWrapExclusions(candidate.floats, placement.container.id),
-                anchorCollisions: paragraphAnchorCollisions(candidate.floats),
-                containerShading: candidate.containerShading,
-                paragraphBorderEdges: borderEdges,
-                trailingExtentPt: Math.max(
-                  context.spaceAfterPt,
-                  borderEdges.bottom === 'none' ? 0 : bottomBorderExtentPt(paragraph.borders),
-                ),
-                continuesFromPrevious: false,
-                anchorFrames: bodyAnchorReferenceFrames(candidate),
-                acquireCompleteStory: candidate.acquireCompleteTextBoxStory,
-              },
-            );
-            previousParagraph = paragraph;
-            const nextCursor = {
-              xPt: placement.cursor.xPt,
-              yPt: startYPt + result.layout.advancePt,
-            };
-            candidate.y = nextCursor.yPt;
-            return { layout: result.layout, nextCursor };
-          },
-          layoutTable(block, placement) {
-            previousParagraph = null;
-            const normalizedInput: TableLayoutInput = {
-              ...block,
-              flowDomainId: placement.container.id,
-            };
-            const result = layoutRetainedTableInput(normalizedInput, placement, storyServices);
-            candidate.y = result.nextCursor.yPt;
-            return result;
-          },
-        };
-        attachStoryBlockLayoutAlgorithms(storyServices, algorithms);
-        const acquired = layoutSharedStory({
-          source: request.source,
-          container: request.container,
-          blocks: Object.freeze(blockInputs),
-        }, storyServices);
-        const retained = Object.freeze({
-          ...acquired,
-          blocks: Object.freeze(acquired.blocks.map((block, index) => {
-            if (block.kind !== 'paragraph' && block.kind !== 'table') {
-              throw new Error(`Shared story emitted unsupported node: ${block.kind}`);
-            }
-            return projectBodyOccurrence(block, {
-              occurrenceId: `${request.container.id}:block:${index}`,
-              destination: {
-                coordinateSpace: 'logical-page-points',
-                flowDomainId: request.container.id,
-                translation: { xPt: 0, yPt: 0 },
-              },
-            });
-          })),
-        });
-        storyLayoutCache.set(cacheKey, retained);
-        return retained;
-      };
-      const acquireCompleteTextBoxStory: CompleteTextBoxStoryAcquirer = (request) => {
-        const section = request.coordinateSpace === 'upright-physical'
-          ? {
-              ...state.sectionLayout,
-              geometry: physicalSectionGeometry(state.sectionLayout.geometry),
-              textDirection: 'lrTb',
-            }
-          : state.sectionLayout;
-        return acquireStoryLayout({
-          source: request.source,
-          pageIndex: state.pageIndex,
-          section,
-          container: request.container,
-        });
-      };
-      state.acquireCompleteTextBoxStory = acquireCompleteTextBoxStory;
-      const session: BodyLayoutSession = {
-        hasPaginationFields: source.hasPaginationFields,
-        measureParagraph(request: BodyParagraphAcquisitionInput) {
-          applyLocation(request.location);
-          const paragraph = sourceElement(request.input.source);
-          if (paragraph.type !== 'paragraph') throw new Error('Paragraph source kind mismatch');
-          if (paragraph.framePr) {
-            if (request.continuation.boundary !== null) {
-              throw new Error('Body frame acquisition cannot continue across flow regions');
-            }
-            let acquiredGroup: ReturnType<typeof acquireRetainedFrameGroup> | undefined;
-            const frameGroup = bodyFrameGroupFor(paragraph);
-            if (!frameGroup) {
-              throw new Error('Body frame acquisition requires an indexed adjacency group');
-            }
-            const box = resolveFrameBox(
-              paragraph,
-              frameGroup,
-              state,
-              frameAnchorLineHeightPx(source.blocks.body, paragraph, state),
-              (acquired) => { acquiredGroup = acquired; },
-            );
-            if (!acquiredGroup) throw new Error('Body frame acquisition omitted its retained group');
-            const member = acquiredGroup.members.find((candidate) => candidate.paragraph === paragraph);
-            if (!member) throw new Error('Body frame acquisition omitted its retained member');
-            const dropCapAnchorLeadingPt = paragraph === frameGroup.members.at(-1)
-              && frameGroup.framePr.dropCap !== 'none'
-              ? wordLoweredDropCapAnchorLeadingPt(
-                  retainedFrameMaximumBaselineLoweringPt(acquiredGroup),
-                )
-              : 0;
-            const absoluteVertical = paragraph.framePr.vAnchor === 'page'
-              || paragraph.framePr.vAnchor === 'margin';
-            const frameOccurrenceId = box.exclusionId
-              ?? `frame:${request.input.source.path.join(':')}`;
-            const frameEntry: FloatRegistryEntryPt = Object.freeze({
-              kind: 'frame',
-              occurrenceId: frameOccurrenceId,
-              exclusionId: frameOccurrenceId,
-              paragraphId: floatRegistry.nextParagraphId,
-              bounds: Object.freeze({
-                xPt: box.x,
-                yPt: box.y,
-                widthPt: box.w,
-                heightPt: box.h,
-              }),
-              exclusionBounds: Object.freeze({
-                xPt: box.exLeft,
-                yPt: box.exTop,
-                widthPt: box.exRight - box.exLeft,
-                heightPt: box.exBottom - box.exTop,
-              }),
-            });
-            return Object.freeze({
-              layout: member.fragment,
-              // The catalogued projection preserves the §17.3.1.11 authored
-              // exclusion height; see WORD_LOWERED_DROP_CAP_ANCHOR_LEADING.
-              blockExtentPt: dropCapAnchorLeadingPt,
-              fragmentation: Object.freeze({ kind: 'indivisible' as const }),
-              placement: Object.freeze({
-                coordinateSpace: 'logical-body' as const,
-                xPt: member.fragment.flowBounds.xPt,
-                yPt: member.fragment.flowBounds.yPt,
-                sectionFlowOwnership: absoluteVertical ? 'page' as const : 'host-flow' as const,
-              }),
-              ...(paragraph === frameGroup.owner ? {
-                // §17.3.1.11 makes identical adjacent framePr paragraphs one frame,
-                // so page admission belongs to the owner before any member is painted.
-                retainedFootnoteReferenceIds: Object.freeze([...new Set(
-                  acquiredGroup.members.flatMap((candidate) =>
-                    footnoteIdsInRetainedSlice(candidate.fragment)),
-                )]),
-              } : {}),
-              ...(!absoluteVertical ? {
-                relocationBlockExtentPt: Math.max(
-                  0,
-                  box.y + box.h - request.location.cursorPt.yPt,
-                ),
-              } : {}),
-              ...(box.registerExclusion === false ? {} : {
-                flowRegistryDelta: Object.freeze({
-                  floats: floatingTableRegistryDelta(
-                    floatRegistry,
-                    Object.freeze([frameEntry]),
-                    floatRegistry.nextParagraphId + 1,
-                  ),
-                }),
-              }),
-            });
-          }
-          const candidate: BodyAcquisitionState = {
-            ...state,
-            floats: [...state.floats],
-            pageAnchorPrescanned: new Set(state.pageAnchorPrescanned),
-          };
-          applyLocationTo(candidate, request.location);
-          const publicFloats = request.continuation.boundary === null
-            ? publicParagraphFloatAcquisition(paragraph, request.input.source, candidate)
-            : Object.freeze([]);
-          const acquired = acquireBodyParagraphAtLocation(
-            candidate,
-            paragraph,
-            request.input.source,
-            request.location,
-            request.availableInlineExtentPt,
-            request.suppressSpaceBefore,
-            request.continuation,
-            drawingCollisionRegistry.entries,
-          );
-          const { measured, layout } = acquired;
-          const allBoundaries = measured.lines.map((line) => {
-            const boundary = line.layout.consumedEnd;
-            if (!boundary) throw new Error('Measured line omitted its source boundary');
-            return boundary;
-          });
-          const retainedFloats = retainedParagraphFloatEntries(layout);
-          const floatEntries = Object.freeze([...publicFloats, ...retainedFloats]);
-          // This accepted-collision path is intentionally parser-owned. Hand-built
-          // public-model anchors still use the compatibility float bridge (and a
-          // public wrapNone run therefore has no collision entry) until the Series
-          // B/C bridge removal migrates those runs to the retained OOXML contract.
-          const collisionEntries = ownedParagraphAnchorCollisions(layout);
-          return Object.freeze({
-            layout,
-            blockExtentPt: layout.advancePt,
-            fragmentation: measured.markOnly
-              ? Object.freeze({ kind: 'indivisible' as const })
-              : Object.freeze({
-                  kind: 'splittable' as const,
-                  lineEndBoundaries: Object.freeze(allBoundaries),
-                }),
-            ...(measured.markOnly
-              ? { markBelowBaselinePt: measured.lastLineBelowBaselinePt }
-              : {}),
-            ...(measured.uniformRubyAdvancePt == null
-              ? {}
-              : { uniformRubyAdvancePt: measured.uniformRubyAdvancePt }),
-            ...(floatEntries.length === 0 && collisionEntries.length === 0
-              ? {}
-              : {
-                  flowRegistryDelta: Object.freeze({
-                    ...(floatEntries.length === 0 ? {} : {
-                      floats: floatingTableRegistryDelta(
-                        floatRegistry,
-                        floatEntries,
-                        floatRegistry.nextParagraphId + floatEntries.length,
-                      ),
-                    }),
-                    ...(collisionEntries.length === 0 ? {} : {
-                      drawingCollisions: drawingMLCollisionRegistryDelta(
-                        drawingCollisionRegistry,
-                        collisionEntries,
-                      ),
-                    }),
-                  }),
-                }),
-          });
-        },
-        measureTable(request: BodyTableAcquisitionInput) {
-          applyLocation(request.location);
-          if (request.input.kind === 'adjacent-table-group') {
-            if (request.cursor && request.cursor.kind !== 'adjacent-table-group') {
-              throw new Error('Adjacent table group acquisition received an ordinary table cursor');
-            }
-            const records = request.input.tables.map((tableInput) => {
-              const table = sourceElement(tableInput.source);
-              if (table.type !== 'table') throw new Error('Table source kind mismatch');
-              const sourceIndex = tableInput.source.path[0]!;
-              computeTablePtLayout(state, table, request.availableInlineExtentPt, sourceIndex);
-              return retainedTableRecord(state, sourceIndex).acquisition;
-            });
-            const combinedInput = ordinaryAcquisitionInputForAdjacentGroup(
-              combineAdjacentTableLayoutInputs(
-                request.input.logicalSequenceId,
-                records.map((record) => record.input),
-              ),
-            );
-            const placement = {
-              container: {
-                id: request.location.flowDomainId,
-                kind: 'body' as const,
-                bounds: {
-                  xPt: 0, yPt: 0,
-                  widthPt: request.availableInlineExtentPt,
-                  heightPt: request.freshPageBlockExtentPt,
-                },
-              },
-              cursor: { xPt: 0, yPt: 0 },
-              availableBounds: {
-                xPt: 0, yPt: 0,
-                widthPt: request.availableInlineExtentPt,
-                heightPt: request.freshPageBlockExtentPt,
-              },
-            };
-            const combinedLayout = layoutRetainedTableInput(
-              combinedInput,
-              placement,
-              services,
-            ).layout;
-            const nestedById: Record<string, RetainedTableAcquisition> = {};
-            records.forEach((record) => Object.entries(record.nestedById).forEach(([id, nested]) => {
-              if (nestedById[id] && nestedById[id] !== nested) {
-                throw new Error(`Adjacent table group has duplicate nested table id: ${id}`);
-              }
-              nestedById[id] = nested;
-            }));
-            const combined: RetainedTableAcquisition = Object.freeze({
-              input: combinedInput,
-              layout: combinedLayout,
-              nestedById: Object.freeze(nestedById),
-              floatingTables: Object.freeze(records.flatMap((record) => record.floatingTables)),
-            });
-            const groupCursor: import('./body-layout-kernel.js').AdjacentTableGroupCursor = request.cursor?.cursor ?? Object.freeze({
-              tableIndex: 0,
-              sourceRowIndex: 0,
-            });
-            const rowsBefore = request.input.tables
-              .slice(0, groupCursor.tableIndex)
-              .reduce((sum, tableInput) => sum + (tableInput.rowCount ?? 0), 0);
-            const globalRowIndex = rowsBefore + groupCursor.sourceRowIndex;
-            const cursor = groupCursor.tableCursor ?? Object.freeze({
-              ...startTableFragmentCursor(),
-              rowIndex: globalRowIndex,
-            });
-            if (cursor.rowIndex !== globalRowIndex) {
-              throw new Error('Adjacent-table group and table-fragment cursors disagree');
-            }
-            const result = takeTableFragment(combined, cursor, {
-              availableHeightPt: request.availableBlockExtentPt,
-              freshPageHeightPt: request.freshPageBlockExtentPt,
-              placement,
-              services,
-              compatibility: 'word',
-              page: {
-                physicalPageIndex: request.location.pageIndex,
-                displayPageNumber: request.location.pageIndex + 1,
-                occurrenceId: `${combinedInput.id}:body:${request.location.pageIndex}`,
-              },
-            });
-            if (!result.fragment || result.requiresFreshPage) {
-              return Object.freeze({
-                layout: combined.layout,
-                blockExtentPt: 0,
-                nextCursor: Object.freeze({
-                  kind: 'adjacent-table-group' as const,
-                  cursor: groupCursor,
-                }),
-                requiresFreshFlowRegion: true,
-              });
-            }
-            const nextGroupCursor = result.nextCursor
-              ? (() => {
-                  let tableIndex = 0;
-                  let firstRow = 0;
-                  while (tableIndex < request.input.tables.length) {
-                    const rowCount = request.input.tables[tableIndex]!.rowCount ?? 0;
-                    if (result.nextCursor!.rowIndex < firstRow + rowCount) break;
-                    firstRow += rowCount;
-                    tableIndex += 1;
-                  }
-                  if (tableIndex >= request.input.tables.length) return null;
-                  return Object.freeze({
-                    tableIndex,
-                    sourceRowIndex: result.nextCursor!.rowIndex - firstRow,
-                    tableCursor: result.nextCursor!,
-                  });
-                })()
-              : null;
-            return Object.freeze({
-              layout: result.fragment,
-              blockExtentPt: result.fragment.advancePt,
-              nextCursor: nextGroupCursor
-                ? Object.freeze({ kind: 'adjacent-table-group' as const, cursor: nextGroupCursor })
-                : null,
-              ...(result.floatingTableRegistryDelta
-                ? {
-                    flowRegistryDelta: Object.freeze({
-                      floats: result.floatingTableRegistryDelta,
-                    }),
-                  }
-                : {}),
-            });
-          }
-          const table = sourceElement(request.input.source);
-          if (table.type !== 'table') throw new Error('Table source kind mismatch');
-          const sourceIndex = request.input.source.path[0]!;
-          computeTablePtLayout(state, table, request.availableInlineExtentPt, sourceIndex);
-          const retained = retainedTableRecord(state, sourceIndex).acquisition;
-          if (request.cursor && request.cursor.kind !== 'table') {
-            throw new Error('Ordinary table acquisition received an adjacent-group cursor');
-          }
-          const cursor = request.cursor?.cursor ?? startTableFragmentCursor();
-          const pageHeightPt = state.pageH;
-          const authoredPositioning = state.acquisitionInputs.tableFormatInput(table).positioning;
-          if (authoredPositioning) {
-            const positioning = request.cursor?.kind === 'table'
-              && request.cursor.floatingContinuationFrame === 'fresh-text'
-              ? Object.freeze({ ...authoredPositioning, vertAnchor: 'text', yPt: 0, yAlign: undefined })
-              : authoredPositioning;
-            const tableWidthPt = retained.layout.columnWidthsPt.reduce((sum, width) => sum + width, 0);
-            const frames = Object.freeze({
-              page: Object.freeze({ xPt: 0, yPt: 0, widthPt: state.pageWidth, heightPt: pageHeightPt }),
-              margin: Object.freeze({
-                xPt: state.marginLeft, yPt: state.marginTop,
-                widthPt: Math.max(0, state.pageWidth - state.marginLeft - state.marginRight),
-                heightPt: Math.max(0, pageHeightPt - state.marginTop - state.marginBottom),
-              }),
-              text: Object.freeze({
-                xPt: request.location.cursorPt.xPt,
-                yPt: request.location.cursorPt.yPt,
-                widthPt: request.availableInlineExtentPt,
-                heightPt: retained.layout.advancePt,
-              }),
-            });
-            const raw = resolveFloatingTableBoxPt(
-              positioning,
-              frames,
-              tableWidthPt,
-              retained.layout.advancePt,
-            );
-            const pageAnchoredCollision = request.cursor?.kind !== 'table'
-              && (positioning.vertAnchor === 'page' || positioning.vertAnchor === 'margin')
-              && resolvePageAnchoredTableDeferral({
-                bounds: {
-                  xPt: raw.x,
-                  yPt: raw.y,
-                  widthPt: raw.w,
-                  heightPt: raw.h,
-                },
-                blockers: floatRegistry.entries.map(floatRegistryParticipant),
-                overlapEpsilonPt: FLOAT_OVERLAP_EPS,
-              }).defer;
-            if (pageAnchoredCollision) {
-              // `word-page-anchored-table-collision-deferral`: a fresh page
-              // preserves the authored absolute anchor instead of converting
-              // the colliding table to a text continuation.
-              return Object.freeze({
-                layout: retained.layout,
-                blockExtentPt: 0,
-                nextCursor: Object.freeze({
-                  kind: 'table' as const,
-                  cursor,
-                  floatingContinuationFrame: 'authored' as const,
-                }),
-                requiresFreshFlowRegion: true,
-              });
-            }
-            const absoluteAnchorMustSplit = (positioning.vertAnchor === 'page'
-              || positioning.vertAnchor === 'margin')
-              && retained.layout.advancePt > request.freshPageBlockExtentPt;
-            const admissionBlockEndPt = absoluteAnchorMustSplit
-              ? request.location.availableBounds.yPt
-                + request.location.availableBounds.heightPt
-              : positioning.vertAnchor === 'page'
-                ? frames.page.yPt + frames.page.heightPt
-                : positioning.vertAnchor === 'margin'
-                  ? frames.margin.yPt + frames.margin.heightPt
-                  : request.location.availableBounds.yPt
-                    + request.location.availableBounds.heightPt;
-            const freshAdmissionHeightPt = absoluteAnchorMustSplit
-              ? request.freshPageBlockExtentPt
-              : positioning.vertAnchor === 'page'
-              ? frames.page.heightPt
-              : positioning.vertAnchor === 'margin'
-                ? frames.margin.heightPt
-                : request.freshPageBlockExtentPt;
-            type FloatingParentTransactionPass =
-              | Readonly<{
-                  kind: 'fresh-flow-region';
-                  result: ReturnType<typeof takeTableFragment>;
-                }>
-              | Readonly<{
-                  kind: 'candidate';
-                  parentFrame: Readonly<{ xPt: number; yPt: number }>;
-                  result: ReturnType<typeof takeTableFragment>;
-                  fragment: NonNullable<ReturnType<typeof takeTableFragment>['fragment']>;
-                  resolved: ReturnType<typeof resolveFloatingTablePlacementInTransaction>;
-                  nestedEntries: readonly FloatRegistryEntryPt[];
-                  fingerprint: string;
-                }>;
-            let transaction: FloatingParentTransactionPass;
-            try {
-              transaction = convergeExactState<FloatingParentTransactionPass>({
-                step: (previous) => {
-                  if (previous?.kind === 'fresh-flow-region') return previous;
-                  if (previous?.kind === 'candidate'
-                    && previous.resolved.placement.xPt === previous.parentFrame.xPt
-                    && previous.resolved.placement.yPt === previous.parentFrame.yPt) {
-                    return previous;
-                  }
-                  const parentFrame = previous?.resolved.placement ?? {
-                    xPt: raw.x,
-                    yPt: raw.y,
-                  };
-                  const availableHeightPt = Math.max(
-                    0,
-                    admissionBlockEndPt - parentFrame.yPt,
-                  );
-                  const result = takeTableFragment(retained, cursor, {
-                    availableHeightPt,
-                    freshPageHeightPt: freshAdmissionHeightPt,
-                    placement: {
-                      container: {
-                        id: `${request.location.flowDomainId}:floating-table`,
-                        kind: 'body',
-                        bounds: {
-                          xPt: 0,
-                          yPt: 0,
-                          widthPt: request.availableInlineExtentPt,
-                          heightPt: availableHeightPt,
-                        },
-                      },
-                      cursor: { xPt: 0, yPt: 0 },
-                      availableBounds: {
-                        xPt: 0,
-                        yPt: 0,
-                        widthPt: request.availableInlineExtentPt,
-                        heightPt: availableHeightPt,
-                      },
-                    },
-                    services,
-                    compatibility: 'word',
-                    oversizedRowPolicy: 'atomic',
-                    page: {
-                      physicalPageIndex: request.location.pageIndex,
-                      displayPageNumber: state.displayPageNumber
-                        ?? request.location.pageIndex + 1,
-                      occurrenceId: `${retained.input.id}:fitting-outer:${request.location.pageIndex}:${cursor.rowIndex}:${cursor.rowFragmentIndex}`,
-                    },
-                    floatingTableFrames: {
-                      page: frames.page,
-                      margin: frames.margin,
-                      column: frames.text,
-                    },
-                    floatingTableRegistry: floatRegistry,
-                    finalPlacementTranslationPt: parentFrame,
-                    reacquirePageDependentBlock: reacquireTableBlock,
-                  });
-                  if (!result.fragment || result.requiresFreshPage) {
-                    return Object.freeze({
-                      kind: 'fresh-flow-region' as const,
-                      result,
-                    });
-                  }
-                  const sourcePlacement: FloatingTablePlacementLayout = Object.freeze({
-                    kind: 'floating-table-placement',
-                    occurrenceId: `${retained.input.id}:root:${request.location.pageIndex}:${cursor.rowIndex}:${cursor.rowFragmentIndex}`,
-                    ownership: 'source',
-                    physicalPageIndex: request.location.pageIndex,
-                    displayPageNumber: state.displayPageNumber
-                      ?? request.location.pageIndex + 1,
-                    hostCellId: request.location.flowDomainId,
-                    sourceBlockIndex: request.input.source.path[0]!,
-                    anchorBlockIndex: request.input.source.path[0]!,
-                    tableId: result.fragment.id,
-                    overlap: table.overlap === 'never' ? 'never' : 'overlap',
-                    positioning,
-                    anchorBounds: frames.text,
-                    child: result.fragment,
-                  });
-                  const nestedEntries = result.floatingTableRegistryDelta?.entries ?? [];
-                  const nestedNextParagraphId =
-                    result.floatingTableRegistryDelta?.nextParagraphId
-                    ?? floatRegistry.nextParagraphId;
-                  const resolved = resolveFloatingTablePlacementInTransaction(
-                    sourcePlacement,
-                    frames,
-                    beginFloatingTablePlacementTransaction(
-                      floatRegistry.entries,
-                      nestedNextParagraphId,
-                      floatRegistry.coordinateSpace,
-                      floatRegistry.flowDomainId,
-                    ),
-                  );
-                  const fingerprint = JSON.stringify({
-                    parentFrame: {
-                      xPt: resolved.placement.xPt,
-                      yPt: resolved.placement.yPt,
-                    },
-                    fragment: result.fragment,
-                    nestedEntries,
-                    resolvedBounds: resolved.placement.bounds,
-                  });
-                  return Object.freeze({
-                    kind: 'candidate' as const,
-                    parentFrame: Object.freeze({
-                      xPt: parentFrame.xPt,
-                      yPt: parentFrame.yPt,
-                    }),
-                    result,
-                    fragment: result.fragment,
-                    resolved,
-                    nestedEntries,
-                    fingerprint,
-                  });
-                },
-                stateOf: (value) => value.kind === 'fresh-flow-region'
-                  ? 'fresh-flow-region'
-                  : value.fingerprint,
-                limit: 16,
-              }).value;
-            } catch (error) {
-              if (error instanceof ExactConvergenceError) {
-                throw new LayoutInvariantError(
-                  'NON_CONVERGENCE',
-                  error.reason === 'cycle'
-                    ? 'Floating table parent/child transaction repeated an exact-state cycle'
-                    : 'Floating table parent/child transaction reached the operational pass limit 16',
-                );
-              }
-              throw error;
-            }
-            if (transaction.kind === 'fresh-flow-region') {
-              return Object.freeze({
-                layout: retained.layout,
-                blockExtentPt: 0,
-                nextCursor: Object.freeze({
-                  kind: 'table' as const,
-                  cursor,
-                  floatingContinuationFrame: 'fresh-text' as const,
-                }),
-                requiresFreshFlowRegion: true,
-              });
-            }
-            const {
-              result,
-              fragment,
-              resolved,
-              nestedEntries,
-            } = transaction;
-            const isFloatingContinuation = request.cursor?.kind === 'table'
-              && request.cursor.floatingContinuationFrame !== undefined;
-            const admittedBlockEndPt = request.location.availableBounds.yPt
-              + request.location.availableBounds.heightPt;
-            const hostFlowPlacements = [
-              ...fragment.resolvedFloatingTables ?? [],
-              resolved.placement,
-            ].filter((placement) => placement.source.positioning.vertAnchor === 'text');
-            if (!isFloatingContinuation && hostFlowPlacements.some((placement) => (
-              placement.exclusionBounds.yPt + placement.exclusionBounds.heightPt
-                > admittedBlockEndPt
-            ))) {
-              return Object.freeze({
-                layout: fragment,
-                blockExtentPt: 0,
-                nextCursor: Object.freeze({
-                  kind: 'table' as const,
-                  cursor,
-                  floatingContinuationFrame: 'fresh-text' as const,
-                }),
-                requiresFreshFlowRegion: true,
-              });
-            }
-            return Object.freeze({
-              layout: fragment,
-              blockExtentPt: 0,
-              nextCursor: result.nextCursor
-                ? Object.freeze({
-                    kind: 'table' as const,
-                    cursor: result.nextCursor,
-                    floatingContinuationFrame: 'fresh-text' as const,
-                  })
-                : null,
-              flowRegistryDelta: Object.freeze({
-                floats: floatingTableRegistryDelta(
-                  floatRegistry,
-                  Object.freeze([...nestedEntries, ...resolved.transaction.delta]),
-                  resolved.transaction.nextParagraphId,
-                ),
-              }),
-              placement: Object.freeze({
-                coordinateSpace: 'logical-body' as const,
-                xPt: resolved.placement.xPt,
-                yPt: resolved.placement.yPt,
-                sectionFlowOwnership: positioning.vertAnchor === 'page'
-                  || positioning.vertAnchor === 'margin'
-                  ? 'page' as const
-                  : 'host-flow' as const,
-              }),
-            });
-          }
-          if (state.verticalPhys && !effectiveTablePositioning(table)) {
-            if (request.cursor) {
-              throw new Error('An upright physical table must remain atomic');
-            }
-            const physical = state.verticalPhys;
-            const tableWidthPt = retained.layout.columnWidthsPt.reduce((sum, width) => sum + width, 0);
-            if (tableWidthPt > request.availableBlockExtentPt
-              && request.availableBlockExtentPt < request.freshPageBlockExtentPt) {
-              return Object.freeze({
-                layout: retained.layout,
-                blockExtentPt: 0,
-                nextCursor: Object.freeze({ kind: 'table' as const, cursor }),
-                requiresFreshFlowRegion: true,
-              });
-            }
-            const physicalLeftPt = physical.physicalPageWidthPt
-              - request.location.cursorPt.yPt - tableWidthPt;
-            const physicalTopPt = request.location.cursorPt.xPt;
-            const physicalBandHeightPt = Math.max(
-              retained.layout.advancePt,
-              physical.pageHeight - physical.marginTop - physical.marginBottom,
-            );
-            const flowDomainId = `upright-physical-page:${request.location.pageIndex}`;
-            const upright = takeTableFragment(retained, startTableFragmentCursor(), {
-              availableHeightPt: physicalBandHeightPt,
-              freshPageHeightPt: physicalBandHeightPt,
-              placement: {
-                container: {
-                  id: flowDomainId, kind: 'body',
-                  bounds: { xPt: 0, yPt: 0, widthPt: tableWidthPt, heightPt: physicalBandHeightPt },
-                },
-                cursor: { xPt: 0, yPt: 0 },
-                availableBounds: {
-                  xPt: 0, yPt: 0, widthPt: tableWidthPt, heightPt: physicalBandHeightPt,
-                },
-              },
-              services,
-              compatibility: 'word',
-              oversizedRowPolicy: 'atomic',
-              page: {
-                physicalPageIndex: request.location.pageIndex,
-                displayPageNumber: state.displayPageNumber ?? request.location.pageIndex + 1,
-                occurrenceId: `${retained.input.id}:upright-page:${request.location.pageIndex}`,
-              },
-              floatingTableFrames: {
-                page: { xPt: 0, yPt: 0, widthPt: physical.pageWidth, heightPt: physical.pageHeight },
-                margin: {
-                  xPt: physical.marginLeft, yPt: physical.marginTop,
-                  widthPt: Math.max(0, physical.pageWidth - physical.marginLeft - physical.marginRight),
-                  heightPt: Math.max(0, physical.pageHeight - physical.marginTop - physical.marginBottom),
-                },
-                column: {
-                  xPt: physical.marginLeft, yPt: physical.marginTop,
-                  widthPt: Math.max(0, physical.pageWidth - physical.marginLeft - physical.marginRight),
-                  heightPt: Math.max(0, physical.pageHeight - physical.marginTop - physical.marginBottom),
-                },
-              },
-              floatingTableRegistry: Object.freeze({
-                coordinateSpace: 'upright-physical-page-points' as const,
-                flowDomainId,
-                entries: Object.freeze([]),
-                nextParagraphId: 0,
-              }),
-              finalPlacementTranslationPt: { xPt: physicalLeftPt, yPt: physicalTopPt },
-              reacquirePageDependentBlock: reacquireTableBlock,
-            });
-            if (!upright.fragment || upright.nextCursor || upright.requiresFreshPage) {
-              throw new Error('Upright table final-frame layout must remain atomic');
-            }
-            return Object.freeze({
-              layout: upright.fragment,
-              blockExtentPt: tableWidthPt,
-              nextCursor: null,
-              placement: Object.freeze({
-                coordinateSpace: 'upright-physical' as const,
-                xPt: physicalLeftPt + upright.fragment.flowBounds.xPt,
-                yPt: physicalTopPt + upright.fragment.flowBounds.yPt,
-                sectionFlowOwnership: 'host-flow' as const,
-              }),
-            });
-          }
-          const result = takeTableFragment(retained, cursor, {
-            availableHeightPt: request.availableBlockExtentPt,
-            freshPageHeightPt: request.freshPageBlockExtentPt,
-            placement: {
-              container: {
-                id: request.location.flowDomainId,
-                kind: 'body',
-                bounds: {
-                  xPt: 0, yPt: 0,
-                  widthPt: request.availableInlineExtentPt,
-                  heightPt: request.availableBlockExtentPt,
-                },
-              },
-              cursor: { xPt: 0, yPt: 0 },
-              availableBounds: {
-                xPt: 0, yPt: 0,
-                widthPt: request.availableInlineExtentPt,
-                heightPt: request.availableBlockExtentPt,
-              },
-            },
-            services,
-            compatibility: 'word',
-            page: {
-              physicalPageIndex: request.location.pageIndex,
-              displayPageNumber: request.location.pageIndex + 1,
-              occurrenceId: `${retained.input.id}:body:${request.location.pageIndex}`,
-            },
-            floatingTableFrames: {
-              page: { xPt: 0, yPt: 0, widthPt: state.pageWidth, heightPt: pageHeightPt },
-              margin: {
-                xPt: state.marginLeft,
-                yPt: state.marginTop,
-                widthPt: Math.max(0, state.pageWidth - state.marginLeft - state.marginRight),
-                heightPt: Math.max(0, pageHeightPt - state.marginTop - state.marginBottom),
-              },
-              column: request.location.availableBounds,
-            },
-            floatingTableRegistry: floatRegistry,
-            finalPlacementTranslationPt: {
-              xPt: request.location.availableBounds.xPt,
-              yPt: request.location.cursorPt.yPt,
-            },
-            reacquirePageDependentBlock: reacquireTableBlock,
-          });
-          const tableInlineStartPt = request.location.availableBounds.xPt
-            + retained.layout.flowBounds.xPt;
-          const tableInlineEndPt = tableInlineStartPt + retained.layout.flowBounds.widthPt;
-          const remainingTableExtentPt = result.fragment?.advancePt ?? 0;
-          const retryAtBlockStartPt = resolveBlockFlowAdmission({
-            inlineStartPt: tableInlineStartPt,
-            inlineEndPt: tableInlineEndPt,
-            blockStartPt: request.location.cursorPt.yPt,
-            blockExtentPt: remainingTableExtentPt,
-            blockers: floatRegistry.entries.map(floatRegistryParticipant),
-            overlapEpsilonPt: FLOAT_OVERLAP_EPS,
-          }).blockStartPt;
-          if (retryAtBlockStartPt > request.location.cursorPt.yPt) {
-            return Object.freeze({
-              layout: retained.layout,
-              blockExtentPt: 0,
-              nextCursor: request.cursor ?? null,
-              retryAtBlockStartPt,
-            });
-          }
-          if (!result.fragment || result.requiresFreshPage) {
-            return Object.freeze({
-              layout: retained.layout,
-              blockExtentPt: 0,
-              nextCursor: Object.freeze({ kind: 'table' as const, cursor }),
-              requiresFreshFlowRegion: true,
-            });
-          }
-          return Object.freeze({
-            layout: result.fragment,
-            blockExtentPt: result.fragment.advancePt,
-            nextCursor: result.nextCursor
-              ? Object.freeze({ kind: 'table' as const, cursor: result.nextCursor })
-              : null,
-            ...(result.floatingTableRegistryDelta
-              ? {
-                  flowRegistryDelta: Object.freeze({
-                    floats: result.floatingTableRegistryDelta,
-                  }),
-                }
-              : {}),
-          });
-        },
-        layoutStory: acquireStoryLayout,
-        layoutNotes(request) {
-          const notes: NoteLayout[] = [];
-          let cursorYPt = request.container.bounds.yPt;
-          let first = request.firstOnPage;
-          for (const id of request.referenceIds) {
-            const sourceNotes = request.kind === 'footnote' ? footnotesById : endnotesById;
-            if (!sourceNotes.has(id)) continue;
-            const source: SourceRef = {
-              story: request.kind,
-              storyInstance: id,
-              path: [],
-            };
-            const separatorHeightPt = first ? FOOTNOTE_SEPARATOR_GAP_PT : 0;
-            const storyContainer = {
-              ...request.container,
-              id: `${request.container.id}:${request.kind}:${id}`,
-              bounds: {
-                ...request.container.bounds,
-                yPt: cursorYPt + separatorHeightPt,
-                heightPt: Math.max(
-                  0,
-                  request.container.bounds.yPt + request.container.bounds.heightPt
-                    - cursorYPt - separatorHeightPt,
-                ),
-              },
-            };
-            let story: StoryLayout;
-            try {
-              story = acquireStoryLayout({
-                source,
-                pageIndex: request.pageIndex,
-                section: request.section,
-                container: storyContainer,
-              });
-            } catch (error) {
-              if (error instanceof FlowCapacityExceededError
-                && error.containerId === storyContainer.id) {
-                throw new NoteCapacityExceededError(
-                  request.kind,
-                  request.pageIndex,
-                  request.container.id,
-                );
-              }
-              throw error;
-            }
-            const separator = first ? Object.freeze([Object.freeze({
-              edge: 'top' as const,
-              from: Object.freeze({
-                xPt: request.container.bounds.xPt,
-                yPt: cursorYPt + separatorHeightPt / 2,
-              }),
-              to: Object.freeze({
-                xPt: request.container.bounds.xPt + request.container.bounds.widthPt / 3,
-                yPt: cursorYPt + separatorHeightPt / 2,
-              }),
-              color: '#000000',
-              widthPt: 0.5,
-              authoredStyle: 'single',
-              style: 'solid' as const,
-            })]) : Object.freeze([]);
-            const advancePt = separatorHeightPt + story.advancePt;
-            const flowBounds = Object.freeze({
-              xPt: request.container.bounds.xPt,
-              yPt: cursorYPt,
-              widthPt: request.container.bounds.widthPt,
-              heightPt: advancePt,
-            });
-            const note: NoteLayout = Object.freeze({
-              kind: 'note',
-              id: `${request.kind}:${id}:page:${request.pageIndex}`,
-              source,
-              flowDomainId: request.container.id,
-              ordinaryFlow: true,
-              flowBounds,
-              inkBounds: Object.freeze({
-                xPt: Math.min(flowBounds.xPt, story.inkBounds.xPt),
-                yPt: Math.min(flowBounds.yPt, story.inkBounds.yPt),
-                widthPt: Math.max(
-                  flowBounds.xPt + flowBounds.widthPt,
-                  story.inkBounds.xPt + story.inkBounds.widthPt,
-                ) - Math.min(flowBounds.xPt, story.inkBounds.xPt),
-                heightPt: Math.max(
-                  flowBounds.yPt + flowBounds.heightPt,
-                  story.inkBounds.yPt + story.inkBounds.heightPt,
-                ) - Math.min(flowBounds.yPt, story.inkBounds.yPt),
-              }),
-              clipBounds: request.container.bounds,
-              advancePt,
-              separator,
-              story,
-            });
-            notes.push(note);
-            cursorYPt += advancePt;
-            first = false;
-          }
-          return Object.freeze(notes);
-        },
-        measureFollowingBlock(request) {
-          const candidate: BodyAcquisitionState = {
-            ...state,
-            floats: [...state.floats],
-            retainedTablesBySourceIndex: new Map(state.retainedTablesBySourceIndex),
-          };
-          applyLocationTo(candidate, request.location);
-          if (request.input.kind === 'adjacent-table-group') {
-            const records = request.input.tables.map((tableInput) => {
-              const table = sourceElement(tableInput.source);
-              if (table.type !== 'table') throw new Error('Following table source kind mismatch');
-              const sourceIndex = tableInput.source.path[0]!;
-              computeTablePtLayout(candidate, table, request.availableInlineExtentPt, sourceIndex);
-              return retainedTableRecord(candidate, sourceIndex).acquisition;
-            });
-            const combinedInput = ordinaryAcquisitionInputForAdjacentGroup(
-              combineAdjacentTableLayoutInputs(
-                request.input.logicalSequenceId,
-                records.map((record) => record.input),
-              ),
-            );
-            const layout = layoutRetainedTableInput(combinedInput, {
-              container: {
-                id: request.location.flowDomainId,
-                kind: 'body',
-                bounds: request.location.availableBounds,
-              },
-              cursor: request.location.cursorPt,
-              availableBounds: request.location.availableBounds,
-            }, services).layout;
-            return Object.freeze({
-              fullExtentPt: layout.advancePt,
-              leadContentExtentPt: layout.rows[0]?.advancePt ?? layout.advancePt,
-              fullFootnoteReferenceIds: footnoteIdsInRetainedSlice(layout),
-              leadFootnoteReferenceIds: footnoteIdsInRetainedSlice({
-                ...layout,
-                rows: layout.rows.slice(0, 1),
-              }),
-            });
-          }
-          const element = sourceElement(request.input.source);
-          if (request.input.kind === 'paragraph') {
-            if (element.type !== 'paragraph') throw new Error('Following paragraph source kind mismatch');
-            const { layout } = acquireBodyParagraphAtLocation(
-              candidate,
-              element,
-              request.input.source,
-              request.location,
-              request.availableInlineExtentPt,
-              false,
-              undefined,
-              drawingCollisionRegistry.entries,
-            );
-            const firstLine = layout.lines[0];
-            return Object.freeze({
-              fullExtentPt: layout.advancePt,
-              // keepNext admits the successor's first content line, including
-              // any retained wrap displacement before that line begins.
-              leadContentExtentPt: firstLine
-                ? firstLine.bounds.yPt + firstLine.advancePt - layout.flowBounds.yPt
-                : layout.advancePt,
-              fullFootnoteReferenceIds: footnoteIdsInRetainedSlice(layout),
-              leadFootnoteReferenceIds: firstLine
-                ? footnoteIdsInRetainedLines([firstLine])
-                : [],
-            });
-          }
-          if (element.type !== 'table') throw new Error('Following table source kind mismatch');
-          const sourceIndex = request.input.source.path[0]!;
-          computeTablePtLayout(candidate, element, request.availableInlineExtentPt, sourceIndex);
-          const layout = retainedTableRecord(candidate, sourceIndex).acquisition.layout;
-          return Object.freeze({
-            fullExtentPt: layout.advancePt,
-            leadContentExtentPt: layout.rows[0]?.advancePt ?? layout.advancePt,
-            fullFootnoteReferenceIds: footnoteIdsInRetainedSlice(layout),
-            leadFootnoteReferenceIds: footnoteIdsInRetainedSlice({
-              ...layout,
-              rows: layout.rows.slice(0, 1),
-            }),
-          });
-        },
-        prescanPageAnchors(request: PageAnchorPrescanInput) {
-          const geometry = request.location.section.geometry;
-          const marginTopPt = bodyMarginInsetPt(geometry.marginTop);
-          const marginBottomPt = bodyMarginInsetPt(geometry.marginBottom);
-          const frames = Object.freeze({
-            page: Object.freeze({
-              xPt: 0, yPt: 0,
-              widthPt: geometry.pageWidth, heightPt: geometry.pageHeight,
-            }),
-            margin: Object.freeze({
-              xPt: geometry.marginLeft, yPt: marginTopPt,
-              widthPt: Math.max(0, geometry.pageWidth - geometry.marginLeft - geometry.marginRight),
-              heightPt: Math.max(0, geometry.pageHeight - marginTopPt - marginBottomPt),
-            }),
-            column: Object.freeze({
-              xPt: request.location.availableBounds.xPt, yPt: marginTopPt,
-              widthPt: request.availableInlineExtentPt,
-              heightPt: Math.max(0, geometry.pageHeight - marginTopPt - marginBottomPt),
-            }),
-            paragraph: null,
-            line: null,
-            character: null,
-            pageParity: request.location.pageIndex % 2 === 0 ? 'odd' as const : 'even' as const,
-          });
-          const publicParagraphs = new Set<ParagraphLayoutSource>();
-          const paragraphKey = (source: SourceRef) =>
-            `${source.story}:${source.storyInstance}:${source.path.join('.')}`;
-          const paragraphIds = new Map<string, number>();
-          const paragraphIdFor = (source: SourceRef): number => {
-            const key = paragraphKey(source);
-            if (!paragraphIds.has(key)) {
-              paragraphIds.set(key, floatRegistry.nextParagraphId + paragraphIds.size);
-            }
-            return paragraphIds.get(key)!;
-          };
-          const entries = request.anchors.flatMap((anchor): readonly FloatRegistryEntryPt[] => {
-            const paragraph = sourceElement(anchor.paragraphSource);
-            if (paragraph.type !== 'paragraph') {
-              throw new Error('Page-anchor prescan source kind mismatch');
-            }
-            const acquired = paragraph;
-            const hostMatches = acquired.runs.filter((run) =>
-              run.type === 'anchorHost' && run.anchorOccurrenceId === anchor.occurrenceId);
-            const payloads = acquired.runs
-              .map((run, runIndex) => ({ run, runIndex }))
-              .filter((candidate): candidate is typeof candidate & {
-                run: Extract<typeof candidate.run, {
-                  type: 'image' | 'chart' | 'shape' | 'unavailableDrawing';
-                }> & {
-                  anchorAcquisitionInput: NonNullable<Extract<typeof candidate.run, {
-                    type: 'image' | 'chart' | 'shape' | 'unavailableDrawing';
-                  }>['anchorAcquisitionInput']>;
-                };
-              } => (
-                (candidate.run.type === 'image'
-                  || candidate.run.type === 'chart'
-                  || candidate.run.type === 'shape'
-                  || candidate.run.type === 'unavailableDrawing')
-                && candidate.run.anchorAcquisitionInput?.occurrenceId === anchor.occurrenceId
-              ))
-              .sort((left, right) => (
-                (left.run.anchorAcquisitionInput.group?.sourceIndex ?? 0)
-                  - (right.run.anchorAcquisitionInput.group?.sourceIndex ?? 0)
-                  || left.runIndex - right.runIndex
-              ));
-            if (hostMatches.length !== 1 || payloads.length === 0) {
-              const publicRun = paragraph.runs.find((run, runIndex) =>
-                publicAnchorBridge(anchor.paragraphSource, runIndex)?.occurrenceId
-                  === anchor.occurrenceId);
-              if (publicRun) {
-                if (
-                  (publicRun.type === 'image'
-                    || publicRun.type === 'chart'
-                    || publicRun.type === 'shape')
-                  && publicRun.wrapMode === 'none'
-                ) return [];
-                const candidate: BodyAcquisitionState = {
-                  ...state,
-                  floats: [...state.floats],
-                  pageAnchorPrescanned: new Set(state.pageAnchorPrescanned),
-                };
-                applyLocationTo(candidate, request.location);
-                const publicEntries = publicParagraphFloatAcquisition(
-                  paragraph,
-                  anchor.paragraphSource,
-                  candidate,
-                  new Set([anchor.occurrenceId]),
-                  paragraphIdFor(anchor.paragraphSource),
-                );
-                if (publicEntries.length !== 1) {
-                  throw new Error(`Public page-anchor prescan occurrence mismatch: ${anchor.occurrenceId}`);
-                }
-                publicParagraphs.add(paragraph);
-                return publicEntries;
-              }
-              throw new Error(`Page-anchor prescan occurrence acquisition mismatch: ${anchor.occurrenceId}`);
-            }
-            const result = resolveAnchorFrame({
-              acquisition: payloads[0]!.run.anchorAcquisitionInput,
-              frames,
-            });
-            if (result.status !== 'resolved') {
-              throw new Error(`Page-anchor prescan could not resolve occurrence: ${anchor.occurrenceId}`);
-            }
-            // ECMA-376 §17.6.20 + §§20.4.2.3/.7/.10/.11: positionH/V and
-            // extent resolve in the upright physical drawing frame. The page
-            // registry is section-logical, so page-start prescan must apply the
-            // section writing mode's canonical physical-to-logical affine
-            // inverse before the exclusion can affect earlier body content.
-            const retainedResult = isVerticalTextDirection(
-              request.location.section.textDirection,
-            )
-              ? (() => {
-                  const writingMode = writingModeFromTextDirection(
-                    request.location.section.textDirection as string,
-                  );
-                  const physicalPage = uprightPhysicalExtent({
-                    widthPt: frames.page.widthPt,
-                    heightPt: frames.page.heightPt,
-                  }, writingMode);
-                  return projectPhysicalAnchorResult(
-                    result,
-                    physicalToLogicalMatrix(writingMode, physicalPage),
-                  );
-                })()
-              : result;
-            const wrapBounds = retainedResult.geometry.wrapBounds;
-            if (wrapBounds === null || retainedResult.geometry.wrap.kind === 'none') {
-              return [];
-            }
-            const polygon = retainedResult.geometry.wrap.polygon?.points ?? Object.freeze([
-              Object.freeze({ xPt: wrapBounds.xPt, yPt: wrapBounds.yPt }),
-              Object.freeze({ xPt: wrapBounds.xPt + wrapBounds.widthPt, yPt: wrapBounds.yPt }),
-              Object.freeze({
-                xPt: wrapBounds.xPt + wrapBounds.widthPt,
-                yPt: wrapBounds.yPt + wrapBounds.heightPt,
-              }),
-              Object.freeze({ xPt: wrapBounds.xPt, yPt: wrapBounds.yPt + wrapBounds.heightPt }),
-            ]);
-            return [Object.freeze({
-              kind: 'shape' as const,
-              occurrenceId: anchor.occurrenceId,
-              paragraphId: paragraphIdFor(anchor.paragraphSource),
-              bounds: retainedResult.geometry.objectFrame,
-              exclusionBounds: wrapBounds,
-              wrap: retainedResult.geometry.wrap.kind,
-              wrapSide: retainedResult.geometry.wrap.side,
-              wrapDistances: retainedResult.geometry.wrap.distances,
-              wrapPolygon: Object.freeze([...polygon]),
-            })];
-          });
-          publicParagraphs.forEach((paragraph) => state.pageAnchorPrescanned?.add(paragraph));
-          if (entries.length === 0) return null;
-          return Object.freeze({
-            floats: Object.freeze({
-              coordinateSpace: 'logical-page-points' as const,
-              // Page-owned wrap exclusions survive same-page column/section
-              // cutovers, so their transaction identity belongs to the physical
-              // page rather than the active body flow domain.
-              flowDomainId: floatRegistry.flowDomainId,
-              baseEntries: floatRegistry.entries,
-              baseNextParagraphId: floatRegistry.nextParagraphId,
-              nextParagraphId: floatRegistry.nextParagraphId + entries.length,
-              entries: Object.freeze(entries),
-            }),
-          });
-        },
-        measureLineNumberGlyph(text) {
-          const previousFont = measureContext.font;
-          try {
-            const fontSizePt = source.fonts.defaultBodyFontSizePt;
-            const font = buildFont(false, false, fontSizePt, null, {});
-            measureContext.font = font;
-            const metrics = measureContext.measureText(text);
-            return Object.freeze({
-              widthPt: metrics.width,
-              ascentPt: metrics.fontBoundingBoxAscent
-                ?? metrics.actualBoundingBoxAscent
-                ?? fontSizePt * 0.8,
-              descentPt: metrics.fontBoundingBoxDescent
-                ?? metrics.actualBoundingBoxDescent
-                ?? fontSizePt * 0.2,
-              font,
-            });
-          } finally {
-            measureContext.font = previousFont;
-          }
-        },
-        resetPageAcquisition(next) {
-          state.floats = [];
-          state.floatParaSeq = 0;
-          state.pageAnchorPrescanned = new Set();
-          floatRegistry = Object.freeze({
-            coordinateSpace: 'logical-page-points' as const,
-            flowDomainId: pageRegistryFlowDomainId(next.pageIndex),
-            entries: Object.freeze([]),
-            nextParagraphId: 0,
-          });
-          drawingCollisionRegistry = createDrawingMLCollisionRegistry(
-            pageRegistryFlowDomainId(next.pageIndex),
-            'logical-page-points',
-          );
-          applyLocation(next);
-        },
-        moveAcquisitionCursor: applyLocation,
-        flowRegistrySnapshot(): BodyFlowRegistrySnapshotPt {
-          return Object.freeze({
-            floats: floatRegistry,
-            drawingCollisions: drawingCollisionRegistry,
-          });
-        },
-        commitFlowRegistryDelta(delta: BodyFlowRegistryDeltaPt) {
-          if (!delta.floats && !delta.drawingCollisions) {
-            throw new Error('Body flow registry delta must update at least one registry');
-          }
-          if (delta.floats) {
-            validateFloatingTableRegistryDelta(delta.floats, {
-              coordinateSpace: floatRegistry.coordinateSpace,
-              flowDomainId: floatRegistry.flowDomainId,
-              entries: floatRegistry.entries,
-              nextParagraphId: floatRegistry.nextParagraphId,
-            });
-          }
-          if (delta.drawingCollisions) {
-            validateDrawingMLCollisionRegistryDelta(
-              drawingCollisionRegistry,
-              delta.drawingCollisions,
-            );
-          }
-          const nextDrawingCollisionRegistry = delta.drawingCollisions
-            ? applyDrawingMLCollisionRegistryDelta(
-                drawingCollisionRegistry,
-                delta.drawingCollisions,
-              )
-            : drawingCollisionRegistry;
-          const retainedFloats = (delta.floats?.entries ?? []).map((entry): FloatRect => {
-            const left = entry.wrapDistances?.leftPt
-              ?? entry.bounds.xPt - entry.exclusionBounds.xPt;
-            const top = entry.wrapDistances?.topPt
-              ?? entry.bounds.yPt - entry.exclusionBounds.yPt;
-            const right = entry.wrapDistances?.rightPt
-              ?? entry.exclusionBounds.xPt + entry.exclusionBounds.widthPt
-                - entry.bounds.xPt - entry.bounds.widthPt;
-            const bottom = entry.wrapDistances?.bottomPt
-              ?? entry.exclusionBounds.yPt + entry.exclusionBounds.heightPt
-                - entry.bounds.yPt - entry.bounds.heightPt;
-            const core = {
-              mode: (entry.wrap === 'topAndBottom'
-                ? 'topAndBottom'
-                : 'square') as FloatRect['mode'],
-              ...(entry.kind === 'shape' ? {
-                anchorOccurrenceId: entry.occurrenceId,
-                acquisitionOccurrenceId: entry.occurrenceId,
-              } : {}),
-              ...(entry.wrap ? {
-                authoredWrap: entry.wrap,
-                wrapPolygon: entry.wrapPolygon,
-              } : {}),
-              imageKey: entry.exclusionId
-                ?? (entry.kind === 'table' ? `body:float:${entry.paragraphId}` : ''),
-              imageX: entry.bounds.xPt, imageY: entry.bounds.yPt,
-              imageW: entry.bounds.widthPt, imageH: entry.bounds.heightPt,
-              xLeft: entry.exclusionBounds.xPt,
-              xRight: entry.exclusionBounds.xPt + entry.exclusionBounds.widthPt,
-              yTop: entry.exclusionBounds.yPt,
-              yBottom: entry.exclusionBounds.yPt + entry.exclusionBounds.heightPt,
-              side: entry.wrapSide ?? 'bothSides',
-              distLeft: left, distRight: right,
-              distTop: top, distBottom: bottom,
-              paraId: entry.paragraphId,
-            };
-            return entry.kind === 'table'
-              ? {
-                  ...core,
-                  kind: 'table',
-                  tableOverlap: entry.overlap,
-                }
-              : { ...core, kind: entry.kind };
-          });
-          if (delta.floats) {
-            state.floats.push(...retainedFloats);
-            floatRegistry = Object.freeze({
-              ...floatRegistry,
-              entries: Object.freeze([...floatRegistry.entries, ...delta.floats.entries]),
-              nextParagraphId: delta.floats.nextParagraphId,
-            });
-            state.floatParaSeq = delta.floats.nextParagraphId;
-          }
-          drawingCollisionRegistry = nextDrawingCollisionRegistry;
-        },
-      };
-      return Object.freeze(session);
+      return openConcreteBodyLayoutSession(dependencies, input, services, options);
     },
   });
 }
@@ -2421,17 +2405,42 @@ function frameAnchorLineHeightPx(
   );
 }
 
+/** Border adjacency inside one story-local frame group (ECMA-376 §17.3.1.11). */
+function storyFrameBorderEdges(
+  group: BodyFrameGroup<LayoutParagraphBlock>,
+  paragraph: LayoutParagraphBlock,
+): ReturnType<typeof resolveParagraphBorderEdges> {
+  const index = group.members.indexOf(paragraph);
+  return resolveParagraphBorderEdges(
+    group.members[index - 1] ?? null,
+    paragraph,
+    group.members[index + 1] ?? null,
+    true,
+  );
+}
+
 /** Resolve a prepared body frame group and attach its retained member layouts. */
+/** How a frame box reports its retained group, and the story context when
+ * the frame lives in a header/footer story rather than the body. */
+type FrameBoxAcquisitionOptions = Readonly<{
+  onAcquired?: (acquired: ReturnType<typeof acquireRetainedFrameGroup>) => void;
+  story?: Readonly<{ story: SourceRef['story']; storyInstance: string }>;
+  borderEdgesFor?: (
+    paragraph: LayoutParagraphBlock,
+  ) => ReturnType<typeof bodyParagraphBorderEdgesFor>;
+}>;
+
 function resolveFrameBox(
   para: ParagraphLayoutSource,
   group: BodyFrameGroup<LayoutParagraphBlock>,
   state: BodyAcquisitionState,
   anchorLineHPt: number,
-  onAcquired?: (acquired: ReturnType<typeof acquireRetainedFrameGroup>) => void,
+  acquisition: FrameBoxAcquisitionOptions,
 ): FrameBox {
+  const { onAcquired, story, borderEdgesFor = bodyParagraphBorderEdgesFor } = acquisition;
   const measurer = { context: state.ctx, fontFamilyClasses: state.fontFamilyClasses };
   const environment = paragraphMeasurementEnvironment(state);
-  const borderEdges = group.members.map(bodyParagraphBorderEdgesFor);
+  const borderEdges = group.members.map(borderEdgesFor);
   const horizontalBand = frameXContainer(group.framePr.hAnchor, state);
   const pointPlacement = {
     contentXPt: state.contentX,
@@ -2452,6 +2461,7 @@ function resolveFrameBox(
     containerShading: state.containerShading,
     maximumWidthPt: Math.max(0, horizontalBand.right - horizontalBand.left),
     acquisitionSession: state,
+    ...(story ? { story } : {}),
     placementSignature: [
       pointPlacement.contentXPt,
       pointPlacement.contentWidthPt,
@@ -3062,7 +3072,7 @@ function effCellMargins(
   // Keep the canonical layout-runtime transport explicit. Regional glyph
   // selection itself belongs to the text service and is applied only to Han.
   void cjkFallback;
-  const kernel = buildConcreteBodyLayoutKernel(source, measureContext, resolvedLocalFonts);
+  const kernel = buildConcreteBodyLayoutKernel(concreteBodyKernelContext);
   return Object.freeze({
     kernel,
     internals: Object.freeze({

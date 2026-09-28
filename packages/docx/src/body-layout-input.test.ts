@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { createBodyLayoutInput } from './body-layout-input.js';
 import { bodyLayoutAcquisitionInput } from './parser-model.js';
+import { projectBodyLayoutInput } from './layout/body-layout-input.js';
 import type { BodyElement, DocxDocumentModel, SectionProps } from './types.js';
 
 const paragraph = (text: string, spaceBefore = 0, spaceAfter = 0): BodyElement => ({
@@ -37,7 +37,35 @@ const finalSection = (overrides: Partial<SectionProps> = {}): SectionProps => ({
   ...overrides,
 });
 
+const createBodyLayoutInput = (document: DocxDocumentModel) =>
+  projectBodyLayoutInput(bodyLayoutAcquisitionInput(document));
+
 describe('canonical body layout input', () => {
+  it('distinguishes ordinary visible text from inline-object and mark-only paragraphs', () => {
+    const image = { type: 'image', src: 'word/media/picture.png' };
+    const withRuns = (runs: readonly unknown[]): BodyElement => ({
+      ...paragraph(''), runs,
+    }) as unknown as BodyElement;
+    const document = {
+      body: [
+        paragraph('body text'),
+        withRuns([image]),
+        withRuns([{ type: 'text', text: 'caption' }, image]),
+        paragraph(''),
+      ],
+      section: finalSection(),
+      headers: { default: null, first: null, even: null },
+      footers: { default: null, first: null, even: null },
+      fontFamilyClasses: {},
+    } as DocxDocumentModel;
+
+    expect(bodyLayoutAcquisitionInput(document).sequence.map((entry) =>
+      entry.kind === 'body-block' && entry.block.kind === 'paragraph'
+        ? entry.block.onlyVisibleText
+        : undefined,
+    )).toEqual([true, false, false, false]);
+  });
+
   it('acquires clone-safe parser facts before resolving layout section owners', () => {
     const document = {
       body: [
@@ -74,6 +102,9 @@ describe('canonical body layout input', () => {
     expect(acquired.noteLayoutSettings).toEqual({
       footnotePosition: 'pageBottom',
       endnotePosition: 'docEnd',
+      // §17.11.17/.18/.20 defaults for both note kinds.
+      footnoteNumbering: { format: 'decimal', start: 1 },
+      endnoteNumbering: { format: 'decimal', start: 1 },
     });
   });
 
@@ -87,12 +118,17 @@ describe('canonical body layout input', () => {
       __noteLayoutSettings: {
         footnotePosition: 'beneathText',
         endnotePosition: 'sectEnd',
+        footnoteNumberFormat: 'upperLetter',
+        footnoteNumberStart: 4,
+        endnoteNumberFormat: 'lowerRoman',
       },
     } as unknown as DocxDocumentModel;
 
     expect(createBodyLayoutInput(document).noteLayoutSettings).toEqual({
       footnotePosition: 'beneathText',
       endnotePosition: 'sectEnd',
+      footnoteNumbering: { format: 'upperLetter', start: 4 },
+      endnoteNumbering: { format: 'lowerRoman', start: 1 },
     });
   });
 
@@ -178,11 +214,12 @@ describe('canonical body layout input', () => {
     expect(JSON.stringify(input)).not.toContain('__sectionPlacement');
   });
 
-  it('retains parity only on authored page breaks during acquisition', () => {
+  it('retains page-break parity and authored versus synthetic provenance during acquisition', () => {
     const document = {
       body: [
-        { type: 'pageBreak', parity: 'odd' },
-        { type: 'pageBreak' },
+        { type: 'pageBreak', parity: 'odd', origin: 'authored' },
+        { type: 'pageBreak', origin: 'coverPageSynthetic' },
+        { type: 'pageBreak', origin: 'authored' },
         { type: 'columnBreak', parity: 'even' },
       ] as unknown as BodyElement[],
       section: finalSection(),
@@ -192,12 +229,13 @@ describe('canonical body layout input', () => {
     } as DocxDocumentModel;
 
     expect(bodyLayoutAcquisitionInput(document).sequence).toMatchObject([
-      { kind: 'authored-break', break: 'page', parity: 'odd' },
-      { kind: 'authored-break', break: 'page' },
+      { kind: 'authored-break', break: 'page', parity: 'odd', origin: 'authored' },
+      { kind: 'authored-break', break: 'page', origin: 'coverPageSynthetic' },
+      { kind: 'authored-break', break: 'page', origin: 'authored' },
       { kind: 'authored-break', break: 'column' },
     ]);
     expect(bodyLayoutAcquisitionInput(document).sequence[1]).not.toHaveProperty('parity');
-    expect(bodyLayoutAcquisitionInput(document).sequence[2]).not.toHaveProperty('parity');
+    expect(bodyLayoutAcquisitionInput(document).sequence[3]).not.toHaveProperty('parity');
   });
 
   it('consumes a vanished empty paragraph without admitting a body block', () => {

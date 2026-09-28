@@ -8,6 +8,39 @@ import {
 import { XlsxWorksheetPullClient } from './worksheet-pull-client.js';
 
 describe('XlsxWorksheetPullClient', () => {
+  it('delivers the metadata preview before row chunks', async () => {
+    const transport = makeTransport((command) => command.kind === 'pull'
+      ? chunkResponse(command, command.sequence === 0
+        ? { kind: 'preview', worksheet: terminalWorksheet(), reason: null, maxRow: 70_000, maxCol: 1 }
+        : command.sequence === 1
+          ? { kind: 'rows', rows: [{ index: 1, height: null, cells: [] }] }
+          : { kind: 'finished', worksheet: terminalWorksheet() }, command.sequence === 2)
+      : acceptedResponse(command));
+    const client = new XlsxWorksheetPullClient({
+      transport, sharedStrings: [], open: async () => undefined,
+    });
+    const kinds: string[] = [];
+    for await (const unit of client.stream(0, 'Sheet1')) kinds.push(unit.kind);
+    expect(kinds).toEqual(['preview', 'rows', 'finished']);
+  });
+
+  it('cancels an unknown preview blocker instead of treating it as an exact sheet', async () => {
+    const commands: PullSessionCommand<number>[] = [];
+    const transport = makeTransport((command) => {
+      commands.push(command);
+      return command.kind === 'pull'
+        ? chunkResponse(command, {
+            kind: 'preview', worksheet: null, reason: 'unrecognized', maxRow: 1, maxCol: 1,
+          }, false)
+        : acceptedResponse(command);
+    });
+    const client = new XlsxWorksheetPullClient({
+      transport, sharedStrings: [], open: async () => undefined,
+    });
+    await expect(client.stream(0, 'Sheet1').next()).rejects.toThrow(/preview unit is invalid/);
+    expect(commands.some((command) => command.kind === 'cancel')).toBe(true);
+  });
+
   it('owns decode, shared-string normalization, ACK order, and transfer disposal', async () => {
     const commands: PullSessionCommand<number>[] = [];
     const disposeTransferred = vi.fn();

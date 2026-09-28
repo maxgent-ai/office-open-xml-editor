@@ -7,6 +7,7 @@ import type {
 import type { TableFragmentLayout, TableRowFragmentLayout } from './table-pagination.js';
 import type { AnchorFrameResult } from './anchor-frame.js';
 import { floatingTableAxesFollowHostFlow } from './retained-geometry-translation.js';
+import { deepFreezePlainData, snapshotPlainData } from './plain-data.js';
 
 const source = (path: readonly number[]) => ({ story: 'body' as const, storyInstance: 'body', path });
 const rect = (xPt: number, yPt: number, widthPt = 10, heightPt = 10) => ({ xPt, yPt, widthPt, heightPt });
@@ -199,6 +200,67 @@ describe('translateBodyOccurrence', () => {
 });
 
 describe('projectBodyOccurrence', () => {
+  it('shares verified unchanged source data while isolating occurrence-owned geometry and identity', () => {
+    const retained = snapshotPlainData(table(), 'table acquisition') as TableLayout;
+    const first = projectBodyOccurrence(retained, options);
+    const second = projectBodyOccurrence(retained, { ...options, occurrenceId: 'page-3' });
+
+    expect(first.source).toBe(retained.source);
+    expect(second.source).toBe(retained.source);
+    expect(first.source.path).toBe(retained.source.path);
+    expect(first.rows[0]).not.toBe(second.rows[0]);
+    expect(first.rows[0]!.cells[0]!.blocks[0]!.layout)
+      .not.toBe(second.rows[0]!.cells[0]!.blocks[0]!.layout);
+    expect(first.id).not.toBe(second.id);
+    expect(first.flowBounds).not.toBe(second.flowBounds);
+    expect(Object.isFrozen(first.source)).toBe(true);
+  });
+
+  it('shares a deep-frozen paragraph acquisition payload while isolating each occurrence', () => {
+    // Paragraph acquisition deep-freezes its result, and the acquisition memo
+    // keeps it for later convergence passes. Pages must reference its
+    // unchanged payload instead of holding a second copy of it.
+    const base = paragraph();
+    const text = base.lines[0]!.placements[0] as TextPlacement;
+    const retained = deepFreezePlainData({
+      ...base,
+      lines: [{ ...base.lines[0]!, placements: [{
+        ...text,
+        clusters: [{ range: { start: 0, end: 4 }, offset: { xPt: 0, yPt: 0 }, advancePt: 20 }],
+        paintOps: [{ text: 'PAGE', origin: { xPt: 0, yPt: 0 } }],
+      } as unknown as TextPlacement] }],
+    }) as ParagraphLayout;
+    const first = projectBodyOccurrence(retained, options);
+    const second = projectBodyOccurrence(retained, { ...options, occurrenceId: 'page-3' });
+    const retainedText = retained.lines[0]!.placements[0] as TextPlacement;
+    const firstText = first.lines[0]!.placements[0] as TextPlacement;
+    const secondText = second.lines[0]!.placements[0] as TextPlacement;
+
+    expect(firstText.clusters).toBe(retainedText.clusters);
+    expect(firstText.paintOps).toBe(retainedText.paintOps);
+    expect(firstText.color).toBe(retainedText.color);
+    expect(secondText.paintOps).toBe(retainedText.paintOps);
+    expect(first.spacing).toBe(retained.spacing);
+    // Occurrence-owned geometry and identity stay distinct per placement.
+    expect(firstText).not.toBe(secondText);
+    expect(firstText.origin).toEqual({ xPt: 21, yPt: 40 });
+    expect(retainedText.origin).toEqual({ xPt: 1, yPt: 10 });
+    expect(first.id).not.toBe(second.id);
+    expect(Object.isFrozen(first)).toBe(true);
+    expect(Object.isFrozen(firstText)).toBe(true);
+    expect(Object.isFrozen(firstText.origin)).toBe(true);
+    validateProjectedGraph(first, options.occurrenceId);
+  });
+
+  it('copies unchanged data from an unverified mutable source', () => {
+    const retained = table();
+    const projected = projectBodyOccurrence(retained, options);
+    (retained.source.path as number[])[0] = 99;
+
+    expect(projected.source.path).toEqual([1]);
+    expect(projected.source).not.toBe(retained.source);
+  });
+
   it('rejects two distinct drawing owners claiming one raw anchor occurrence ID', () => {
     const retained = paragraph();
     const drawing = (id: string) => ({

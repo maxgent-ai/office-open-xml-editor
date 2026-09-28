@@ -11,6 +11,9 @@ importers:
       '@ast-grep/cli':
         specifier: ^0.43.0
         version: 0.43.0
+      '@babel/parser':
+        specifier: 7.29.2
+        version: 7.29.2
       '@chromatic-com/storybook':
         specifier: ^5.1.2
         version: 5.1.2(storybook@10.3.5(@testing-library/dom@10.4.1)(react-dom@19.2.5(react@19.2.5))(react@19.2.5))
@@ -123,6 +126,9 @@ importers:
 
   packages/markdown:
     dependencies:
+      '@silurus/ooxml-core':
+        specifier: workspace:*
+        version: link:../core
       '@silurus/ooxml-docx':
         specifier: workspace:*
         version: link:../docx
@@ -136,6 +142,9 @@ importers:
       '@types/node':
         specifier: ^25.6.0
         version: 25.6.0
+      rolldown:
+        specifier: ^1.2.0
+        version: 1.2.0
       typescript:
         specifier: ^7.0.2
         version: 7.0.2
@@ -1978,6 +1987,7 @@ packages:
   '@xmldom/xmldom@0.9.10':
     resolution: {integrity: sha512-A9gOqLdi6cV4ibazAjcQufGj0B1y/vDqYrcuP6d/6x8P27gRS8643Dj9o1dEKtB6O7fwxb2FgBmJS2mX7gpvdw==}
     engines: {node: '>=14.6'}
+    deprecated: this version has critical issues, please update to the latest version
 
   '@yuku-codegen/binding-android-arm64@0.8.3':
     resolution: {integrity: sha512-/EKnnqwvN7xYoVDhQEIEJTdPDwGW1wkFz/2Eku3ES/IJd4lcQh/OaIDFBmoJKvpe12enrb1TIoYh1fxasGXolA==}
