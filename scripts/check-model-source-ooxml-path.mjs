@@ -1,28 +1,15 @@
 #!/usr/bin/env node
-// Compare the ordinary OOXML await path with the merge base using the AST.
-// Source-only branches are excluded; every remaining await must keep its
-// original order and callee. The XLSX render worker also retains one host.run
-// around archive construction and parse, as in the previous renderer.
-// This regression check covers accidental edits, not intentionally hostile code.
-import { execFileSync } from 'node:child_process';
+// Check ordinary OOXML awaits against a reviewed, versioned contract. A Git
+// merge base rejects intentional upstream loader changes and becomes a no-op
+// after merge. Update the baseline only after reviewing a loader's await order.
+// Source-only branches are excluded. XLSX construction and parse must still
+// share one host.run. This detects accidental edits, not hostile code.
+// The DOCX baseline loads embedded fonts before Office fallbacks, then Google
+// Fonts: embedded routes take precedence, and local Office faces avoid redundant
+// Google substitutions. The other nine loader sequences remain unchanged.
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { parse } from '@babel/parser';
-
-const git = (args) => execFileSync('git', args, { encoding: 'utf8' }).trimEnd();
-const base = git(['merge-base', 'HEAD', 'origin/main']);
-const cases = [
-  ['packages/docx/src/internal/node-acquisition.ts', 'acquireDocxNodeDocument'],
-  ['packages/xlsx/src/internal/node-acquisition.ts', 'acquireXlsxNodeSession'],
-  ['packages/pptx/src/internal/node-acquisition.ts', 'acquirePptxNodeSession'],
-  ['packages/node/src/docx.ts', 'openDocxDocument'],
-  ['packages/node/src/docx.ts', 'materializeDocxDocument'],
-  ['packages/node/src/xlsx.ts', 'openXlsxWorkbook'],
-  ['packages/node/src/pptx.ts', 'openPptxPresentationImpl'],
-  ['packages/docx/src/document.ts', 'load'],
-  ['packages/xlsx/src/workbook.ts', 'load'],
-  ['packages/pptx/src/presentation.ts', 'load'],
-];
 
 function children(node) {
   return Object.values(node).flatMap((value) =>
@@ -109,11 +96,10 @@ function ooxmlAwaits(node, code) {
   return awaits;
 }
 
-export function auditAwaitCase(file, name, previous, current) {
-  const baseline = ooxmlAwaits(findFunction(parse(previous, { sourceType: 'module', plugins: ['typescript', 'jsx'] }), name), previous);
+export function auditAwaitCase(file, name, baseline, current) {
   const candidate = ooxmlAwaits(findFunction(parse(current, { sourceType: 'module', plugins: ['typescript', 'jsx'] }), name), current);
   if (JSON.stringify(candidate) !== JSON.stringify(baseline)) {
-    throw new Error(`${file} ${name}: OOXML awaits changed\nmain ${JSON.stringify(baseline)}\nhead ${JSON.stringify(candidate)}`);
+    throw new Error(`${file} ${name}: OOXML awaits changed\nbaseline ${JSON.stringify(baseline)}\nhead ${JSON.stringify(candidate)}`);
   }
   return candidate.length;
 }
@@ -133,8 +119,9 @@ export function hasCombinedXlsxHostRun(code) {
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  for (const [file, name] of cases) {
-    const count = auditAwaitCase(file, name, git(['show', `${base}:${file}`]), readFileSync(file, 'utf8'));
+  const cases = JSON.parse(readFileSync(new URL('./model-source-ooxml-awaits.json', import.meta.url), 'utf8'));
+  for (const { file, name, awaits } of cases) {
+    const count = auditAwaitCase(file, name, awaits, readFileSync(file, 'utf8'));
     console.log(`${file} ${name}: ${count} OOXML awaits, unchanged`);
   }
   const xlsxRender = readFileSync('packages/xlsx/src/render-worker.ts', 'utf8');
