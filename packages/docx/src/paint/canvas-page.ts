@@ -225,8 +225,7 @@ function paintDrawingEntry(
   }
 }
 
-/** Paint a completed page into an already initialized point-space surface. */
-export function paintLayoutPageContent(
+function paintPageContents(
   page: LayoutPage,
   context: CanvasPaintContext,
 ): void {
@@ -288,6 +287,22 @@ export function paintLayoutPageContent(
   if (page.pageBorder?.zOrder !== 'back' && page.pageBorder) {
     paintPageBorderLayout(page.pageBorder, context);
   }
+}
+
+/** Paint a completed page into an already initialized point-space surface. */
+export function paintLayoutPageContent(
+  page: LayoutPage,
+  context: CanvasPaintContext,
+): void {
+  // word-drawingml-pattern-page-grid: capture the page frame before
+  // region, anchor, or shape transforms so the 8pt tile keeps page axes and
+  // phase. Only DrawingML shapes consume this frame; chart and VML hosts keep
+  // their separate fill-coordinate policies.
+  const canvas = context.ctx as CanvasRenderingContext2D;
+  const pageToDevice = canvas.getTransform?.() ?? {
+    a: context.scale * context.dpr, d: context.scale * context.dpr,
+  };
+  paintPageContents(page, { ...context, patternPageToDevice: pageToDevice });
 }
 
 export async function paintLayoutPage(

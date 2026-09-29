@@ -6,6 +6,12 @@
 // dates.
 
 import { excelSerialToUtcDate } from '../excel-date';
+import {
+  formatExcelDateTime,
+  isDateFormatSection,
+  splitFormatSections,
+  textSectionIndex,
+} from '../excel-number-format';
 import { roundDecimalHalfUp } from '../text/round-decimal';
 
 const localizedShortDateFormatters = new Map<string, Intl.DateTimeFormat>();
@@ -62,27 +68,28 @@ export function formatChartValWithCode(
   // `<c:numFmt formatCode="General">`; tokenizing it as a literal pattern would
   // render the word "General" instead of the value (issue #358).
   if (!code || code.trim().toLowerCase() === 'general') return formatChartVal(v);
-  // Detect Excel date format codes (m/d/y/h/s tokens outside quotes) and
-  // route to the date formatter. Charts use this on the X axis of scatter
-  // / time-series charts where the value is a serial date.
-  if (isDateFormatCode(code)) {
-    return formatExcelDate(v, code, date1904);
-  }
+  // Section selection per §18.8.30: positive;negative;zero, with the text
+  // section left out (it never formats a number). When the negative section
+  // is omitted, a negative number is formatted with the positive section and
+  // a leading minus.
   const sections = splitFormatSections(code);
-  // Section selection per §18.8.30: positive;negative;zero;text. When the
-  // negative section is omitted a negative number is formatted with the
-  // positive section and a leading minus, which the caller must prepend.
+  const textIndex = textSectionIndex(sections);
+  const numeric = sections.filter((_, i) => i !== textIndex);
+  if (numeric.length === 0) return formatChartVal(v);
   let section: string;
-  if (v > 0) section = sections[0] ?? code;
-  else if (v < 0) section = sections[1] ?? sections[0] ?? code;
-  else section = sections[2] ?? sections[0] ?? code;
+  if (v > 0) section = numeric[0];
+  else if (v < 0) section = numeric[1] ?? numeric[0];
+  else section = numeric[2] ?? numeric[0];
   if (section === '') return '';
-  // Negative-without-explicit-section: format absolute value with positive
-  // section and prepend '-' unless the section itself already begins with a
-  // literal minus.
-  const needsLeadingMinus = v < 0 && sections.length < 2;
-  const abs = Math.abs(v);
-  return (needsLeadingMinus ? '-' : '') + applyChartNumberSection(abs, section);
+  const explicitNegative = v < 0 && numeric.length >= 2;
+  // Date/time is a property of the selected section: the value is a serial
+  // date (scatter / time-series axes), rendered by the same formatter as
+  // worksheet cells.
+  if (isDateFormatSection(section)) {
+    return formatExcelDateTime(explicitNegative ? -v : v, section, date1904);
+  }
+  const needsLeadingMinus = v < 0 && !explicitNegative;
+  return (needsLeadingMinus ? '-' : '') + applyChartNumberSection(Math.abs(v), section);
 }
 
 /**
@@ -92,7 +99,7 @@ export function formatChartValWithCode(
  * (`c:numFmt`) lets the category axis carry a number-format code: Excel
  * applies it to the tick labels just as it does on the value axis. When the
  * axis has such a code AND the raw category parses to a finite number, format
- * it (which routes serial dates through `formatExcelDate` automatically); a
+ * it (which routes serial dates through `formatExcelDateTime` automatically); a
  * missing code, `"General"`, or a non-numeric category string falls through
  * to the raw text unchanged — no new interpretation is invented.
  */
@@ -111,143 +118,6 @@ export function formatCategoryLabel(
   const num = Number(raw);
   if (!Number.isFinite(num)) return raw;
   return formatChartValWithCode(num, code, date1904);
-}
-
-/**
- * True when `code` contains date tokens (m / d / y / h / s) outside of
- * quotes. Heuristic but robust: ECMA-376 number-format codes never use
- * those letters as numeric placeholders.
- */
-function isDateFormatCode(code: string): boolean {
-  let inQuote = false;
-  for (let i = 0; i < code.length; i++) {
-    const c = code[i];
-    if (c === '"') { inQuote = !inQuote; continue; }
-    if (inQuote) continue;
-    if (c === '\\') { i++; continue; }
-    if (c === '[') {
-      while (i < code.length && code[i] !== ']') i++;
-      continue;
-    }
-    if (c === 'y' || c === 'Y' || c === 'd' || c === 'D'
-        || c === 'm' || c === 'M' || c === 'h' || c === 'H' || c === 's' || c === 'S') {
-      return true;
-    }
-  }
-  return false;
-}
-
-/**
- * Format an Excel serial date with the supplied code. Delegates the serial →
- * calendar-date conversion to the shared core `excelSerialToUtcDate`
- * (ECMA-376 §18.17.4.1), which carries the 1900 Lotus leap-year-bug compat and
- * the 1900/1904 date-system select. `date1904` comes from `<c:date1904>`
- * (§21.2.2.38); it defaults to false so existing 1900-system charts are
- * unchanged.
- */
-function formatExcelDate(serial: number, code: string, date1904 = false): string {
-  const date = excelSerialToUtcDate(Math.floor(serial), date1904);
-  const yyyy = date.getUTCFullYear();
-  const M = date.getUTCMonth() + 1;
-  const D = date.getUTCDate();
-  const totalSeconds = (serial - Math.floor(serial)) * 86400;
-  const hh = Math.floor(totalSeconds / 3600);
-  const mm = Math.floor((totalSeconds % 3600) / 60);
-  const ss = Math.floor(totalSeconds % 60);
-  let out = '';
-  let inQuote = false;
-  let i = 0;
-  while (i < code.length) {
-    const c = code[i];
-    if (c === '"') { inQuote = !inQuote; i++; continue; }
-    if (inQuote) { out += c; i++; continue; }
-    if (c === '\\' && i + 1 < code.length) { out += code[i + 1]; i += 2; continue; }
-    if (c === '[') {
-      while (i < code.length && code[i] !== ']') i++;
-      if (i < code.length) i++;
-      continue;
-    }
-    // Token runs.
-    if (c === 'y' || c === 'Y') {
-      let n = 0; while (i < code.length && (code[i] === 'y' || code[i] === 'Y')) { n++; i++; }
-      out += n >= 3 ? String(yyyy) : String(yyyy % 100).padStart(2, '0');
-      continue;
-    }
-    if (c === 'm' || c === 'M') {
-      let n = 0; while (i < code.length && (code[i] === 'm' || code[i] === 'M')) { n++; i++; }
-      // `mm` after an h/hh switches to minutes; use a simple lookbehind.
-      const prev = (out.match(/[Hh]+\W*$/));
-      if (prev) {
-        out += n >= 2 ? String(mm).padStart(2, '0') : String(mm);
-      } else {
-        // ECMA-376 §18.8.30 date tokens: m/mm are numeric months, mmm is the
-        // abbreviated month name, mmmm the full name, and mmmmm its initial.
-        // Keep this invariant/English just like the existing numeric date
-        // formatter; locale substitution belongs to the host locale layer.
-        const shortMonths = [
-          'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
-          'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
-        ];
-        const longMonths = [
-          'January', 'February', 'March', 'April', 'May', 'June',
-          'July', 'August', 'September', 'October', 'November', 'December',
-        ];
-        out += n >= 5 ? longMonths[M - 1][0]
-          : n === 4 ? longMonths[M - 1]
-            : n === 3 ? shortMonths[M - 1]
-              : n === 2 ? String(M).padStart(2, '0') : String(M);
-      }
-      continue;
-    }
-    if (c === 'd' || c === 'D') {
-      let n = 0; while (i < code.length && (code[i] === 'd' || code[i] === 'D')) { n++; i++; }
-      out += n >= 2 ? String(D).padStart(2, '0') : String(D);
-      continue;
-    }
-    if (c === 'h' || c === 'H') {
-      let n = 0; while (i < code.length && (code[i] === 'h' || code[i] === 'H')) { n++; i++; }
-      out += n >= 2 ? String(hh).padStart(2, '0') : String(hh);
-      continue;
-    }
-    if (c === 's' || c === 'S') {
-      let n = 0; while (i < code.length && (code[i] === 's' || code[i] === 'S')) { n++; i++; }
-      out += n >= 2 ? String(ss).padStart(2, '0') : String(ss);
-      continue;
-    }
-    out += c; i++;
-  }
-  return out;
-}
-
-/**
- * Split a format code on unescaped semicolons. Quotes, `[...]` metadata, and
- * `\;` are treated as opaque so `"a;b"` and `\;` stay in a single section.
- */
-function splitFormatSections(code: string): string[] {
-  const out: string[] = [];
-  let buf = '';
-  for (let i = 0; i < code.length; i++) {
-    const c = code[i];
-    if (c === '\\' && i + 1 < code.length) { buf += c + code[i + 1]; i++; continue; }
-    if (c === '"') {
-      buf += c;
-      i++;
-      while (i < code.length && code[i] !== '"') { buf += code[i]; i++; }
-      if (i < code.length) buf += code[i];
-      continue;
-    }
-    if (c === '[') {
-      buf += c;
-      i++;
-      while (i < code.length && code[i] !== ']') { buf += code[i]; i++; }
-      if (i < code.length) buf += code[i];
-      continue;
-    }
-    if (c === ';') { out.push(buf); buf = ''; continue; }
-    buf += c;
-  }
-  out.push(buf);
-  return out;
 }
 
 function applyChartNumberSection(abs: number, section: string): string {

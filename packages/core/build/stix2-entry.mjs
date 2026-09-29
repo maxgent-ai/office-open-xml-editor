@@ -71,6 +71,7 @@ const doc = mathjax.document('', { InputJax: new MathML(), OutputJax: svgJax });
 // fraktur, double-struck, calligraphic, sans-serif, stretchy bars, …) render
 // as a `<path>` immediately — no `<text>` fallback (wrong font/metrics), no
 // "retry" exception, and no network request.
+// This constructor is MathJax font-class metadata, not a code generator.
 const dynamicFiles = svgJax.font.constructor.dynamicFiles;
 for (const name of Object.keys(dynamicFiles)) {
   try {

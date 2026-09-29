@@ -43,11 +43,15 @@ describe('VS Code webview math engine bundle', () => {
         '@silurus/ooxml-pptx': resolve(EXTENSION_ROOT, '../pptx/src/index.ts'),
       },
       external: ['*.wasm'],
-      loader: { '.wasm': 'file' },
+      loader: { '.wasm': 'file', '.ttf': 'file' },
+      assetNames: 'assets/[name]-[hash]',
       plugins: [mainThreadOnlyWorkerStubs],
     });
 
-    expect(result.warnings).toEqual([]);
+    // The optional model-source sidecars use import.meta.url only when a
+    // source is selected. This IIFE webview never selects one; esbuild still
+    // warns when it scans the source-only URL construction.
+    expect(result.warnings.filter((warning) => warning.id !== 'empty-import-meta')).toEqual([]);
     const bundle = result.outputFiles.find((file) => file.path.endsWith('/bootstrap.js'))?.text
       ?? result.outputFiles.find((file) => file.path.endsWith('.js'))?.text
       ?? '';
@@ -57,5 +61,6 @@ describe('VS Code webview math engine bundle', () => {
     expect(bundle).toContain('renderSimpleThreeDChart');
     expect(bundle).not.toContain('Failed to load math engine from');
     expect(bundle).not.toContain('ooxml-worker-renderer-module');
+    expect(result.outputFiles.filter((file) => /\.(?:ttf|otf|woff2?)$/.test(file.path))).toEqual([]);
   });
 });

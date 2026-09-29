@@ -80,12 +80,16 @@ interface ViewerPriv {
   currentSheet: number;
   canvasArea: FakeEl;
   scrollHost: FakeEl;
-  rowOutline: OutlineLayout | null;
+  outlineGutter: {
+    rowOutline: OutlineLayout | null;
+    applyGroupToggle(group: OutlineLayout['groups'][number], axis: 'row' | 'col'): void;
+  };
   scrollOutlineSummaryToStart(axis: 'row' | 'col', summary: number): void;
-  resizeDrag: { kind: 'col' | 'row'; index: number; originScaled: number; mdw: number } | null;
+  selectionInput: {
+    resizeDrag: { kind: 'col' | 'row'; index: number; originScaled: number; mdw: number } | null;
+    applyResize(clientX: number, clientY: number): void;
+  };
   buildOutline(ws: Worksheet): void;
-  applyGroupToggle(group: OutlineLayout['groups'][number], axis: 'row' | 'col'): void;
-  applyResize(clientX: number, clientY: number): void;
   renderCurrentSheet(): Promise<void>;
 }
 
@@ -132,11 +136,11 @@ function lastOverrides(fn: ReturnType<typeof vi.fn>): WireSizeOverrides | undefi
 describe('worker-mode outline collapse/expand reaches the grid bitmap', () => {
   it('expanding the collapsed group sends row overrides that reveal rows 4-7', () => {
     const { priv, renderViewportToBitmap } = buildWorker();
-    const l3 = priv.rowOutline?.groups.find((g) => g.level === 3);
+    const l3 = priv.outlineGutter.rowOutline?.groups.find((g) => g.level === 3);
     expect(l3?.collapsed).toBe(true);
 
     // Expand (the sync-render fallback fires renderCurrentSheet immediately).
-    priv.applyGroupToggle(l3 as OutlineLayout['groups'][number], 'row');
+    priv.outlineGutter.applyGroupToggle(l3 as OutlineLayout['groups'][number], 'row');
     expect(renderViewportToBitmap).toHaveBeenCalled();
     const o = lastOverrides(renderViewportToBitmap);
     // Rows 4-7 were revealed: the model has NO entry (default height) ⇒ null.
@@ -153,12 +157,12 @@ describe('worker-mode outline collapse/expand reaches the grid bitmap', () => {
 
   it('re-collapsing sends rows back as 0-height overrides', async () => {
     const { priv, renderViewportToBitmap, completeRender } = buildWorker();
-    const expand = priv.rowOutline?.groups.find((g) => g.level === 3);
-    priv.applyGroupToggle(expand as OutlineLayout['groups'][number], 'row');
+    const expand = priv.outlineGutter.rowOutline?.groups.find((g) => g.level === 3);
+    priv.outlineGutter.applyGroupToggle(expand as OutlineLayout['groups'][number], 'row');
     // The layout was rebuilt after the expand — fetch the group's new object.
-    const collapse = priv.rowOutline?.groups.find((g) => g.level === 3);
+    const collapse = priv.outlineGutter.rowOutline?.groups.find((g) => g.level === 3);
     expect(collapse?.collapsed).toBe(false);
-    priv.applyGroupToggle(collapse as OutlineLayout['groups'][number], 'row');
+    priv.outlineGutter.applyGroupToggle(collapse as OutlineLayout['groups'][number], 'row');
     completeRender({ close: vi.fn() } as unknown as ImageBitmap);
     await settleRenders();
 
@@ -177,11 +181,11 @@ describe('worker-mode outline collapse/expand reaches the grid bitmap', () => {
     priv.scrollHost.clientHeight = 60;
     priv.scrollHost.scrollWidth = 1000;
     priv.scrollHost.scrollHeight = 1000;
-    const expand = priv.rowOutline?.groups.find((g) => g.level === 3);
-    priv.applyGroupToggle(expand as OutlineLayout['groups'][number], 'row');
-    const collapse = priv.rowOutline?.groups.find((g) => g.level === 3);
+    const expand = priv.outlineGutter.rowOutline?.groups.find((g) => g.level === 3);
+    priv.outlineGutter.applyGroupToggle(expand as OutlineLayout['groups'][number], 'row');
+    const collapse = priv.outlineGutter.rowOutline?.groups.find((g) => g.level === 3);
 
-    priv.applyGroupToggle(collapse as OutlineLayout['groups'][number], 'row');
+    priv.outlineGutter.applyGroupToggle(collapse as OutlineLayout['groups'][number], 'row');
 
     // Rows 1-3 remain at the 15pt default (= 20 CSS px) and rows 4-7 collapse
     // to zero, so summary row 8 starts exactly 60px into the scrollable axis.
@@ -192,8 +196,8 @@ describe('worker-mode outline collapse/expand reaches the grid bitmap', () => {
 describe('worker-mode drag-to-resize reaches the grid bitmap (#567 hole)', () => {
   it('a column resize sends the new width as a col override', () => {
     const { priv, renderViewportToBitmap } = buildWorker();
-    priv.resizeDrag = { kind: 'col', index: 2, originScaled: 0, mdw: 7 };
-    priv.applyResize(100, 0); // drag column B's right border to x=100
+    priv.selectionInput.resizeDrag = { kind: 'col', index: 2, originScaled: 0, mdw: 7 };
+    priv.selectionInput.applyResize(100, 0); // drag column B's right border to x=100
 
     const o = lastOverrides(renderViewportToBitmap);
     const newWidth = priv.currentWorksheet.colWidths[2];
@@ -207,8 +211,8 @@ describe('worker-mode drag-to-resize reaches the grid bitmap (#567 hole)', () =>
 
   it('a row resize sends the new height as a row override', () => {
     const { priv, renderViewportToBitmap } = buildWorker();
-    priv.resizeDrag = { kind: 'row', index: 9, originScaled: 0, mdw: 7 };
-    priv.applyResize(0, 60);
+    priv.selectionInput.resizeDrag = { kind: 'row', index: 9, originScaled: 0, mdw: 7 };
+    priv.selectionInput.applyResize(0, 60);
 
     const o = lastOverrides(renderViewportToBitmap);
     const newHeight = priv.currentWorksheet.rowHeights[9];

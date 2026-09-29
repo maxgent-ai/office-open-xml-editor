@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { PULL_SESSION_PROTOCOL, type PullSessionCommand, type PullSessionResponse } from '@silurus/ooxml-core/worker';
 import { WorksheetPullWorker } from './worksheet-pull-worker.js';
+import { WorksheetPullWorker as SourceWorksheetPullWorker } from './worksheet-pull-source-worker.js';
 import { OoxmlResourceLimitError } from '@silurus/ooxml-core';
 import type { Worksheet } from './types.js';
 
@@ -13,7 +14,7 @@ const usageBytes = new TextEncoder().encode(JSON.stringify({
 }));
 
 async function openWorker(
-  worker: WorksheetPullWorker,
+  worker: Pick<WorksheetPullWorker, 'reserveOpen' | 'open'>,
   value: { sessionId: number; operationId: number; generation: number } = identity,
 ): Promise<void> {
   worker.reserveOpen(value);
@@ -31,6 +32,29 @@ function command(
 }
 
 describe('WorksheetPullWorker', () => {
+  it.each([
+    ['ordinary', WorksheetPullWorker],
+    ['source', SourceWorksheetPullWorker],
+  ] as const)('serves a visible image while a %s pull is paused for paint', async (_, Worker) => {
+    const archive = {
+      open_sheet_cursor: vi.fn(), pull_sheet_cursor: vi.fn(),
+      sheet_cursor_pull_finished: vi.fn(), sheet_cursor_resource_usage: vi.fn(() => usageBytes),
+      acknowledge_sheet_cursor_terminal: vi.fn(), cancel_sheet_cursor: vi.fn(),
+      close_sheet_cursor: vi.fn(),
+    };
+    const worker = new Worker(() => archive);
+    await openWorker(worker);
+    const ordinary = vi.fn(() => 'after terminal');
+    const queued = worker.run(ordinary);
+    const image = vi.fn(() => 'image bytes');
+    await expect(worker.runDuringPull(image)).resolves.toBe('image bytes');
+    expect(ordinary).not.toHaveBeenCalled();
+    await worker.dispatch(command(1, { kind: 'cancel', reason: 'request-error' }), () => undefined);
+    await expect(queued).resolves.toBe('after terminal');
+    expect(image).toHaveBeenCalledOnce();
+    expect(archive.cancel_sheet_cursor).toHaveBeenCalledOnce();
+  });
+
   it('latches an ordinary worker-side renderer violation for sibling operations', async () => {
     const fatal = new OoxmlResourceLimitError('renderer index limit', {
       stage: 'layout',
@@ -204,42 +228,43 @@ describe('WorksheetPullWorker', () => {
     expect(archive.cancel_sheet_cursor).toHaveBeenCalledOnce();
   });
 
-  it('allows only the deferred-container missing usage checkpoint', async () => {
+  it('rejects a failing usage checkpoint and reports none only without the capability', async () => {
     const terminal = new TextEncoder().encode(JSON.stringify({ kind: 'finished', worksheet: {
       name: 'Sheet1', rows: [], colWidths: {}, rowHeights: {}, defaultColWidth: 8.43,
       defaultRowHeight: 15, mergeCells: [], freezeRows: 0, freezeCols: 0,
       conditionalFormats: [], images: [], charts: [],
     } }));
-    const makeArchive = (usageError: Error) => ({
+    const makeArchive = (usageError?: Error) => ({
       open_sheet_cursor: vi.fn(),
       pull_sheet_cursor: vi.fn(() => terminal),
       sheet_cursor_pull_finished: vi.fn(() => true),
-      sheet_cursor_resource_usage: vi.fn(() => { throw usageError; }),
+      ...(usageError ? { sheet_cursor_resource_usage: vi.fn(() => { throw usageError; }) } : {}),
       acknowledge_sheet_cursor_terminal: vi.fn(),
       cancel_sheet_cursor: vi.fn(),
       close_sheet_cursor: vi.fn(),
     });
+    const pullOnce = async (archive: ReturnType<typeof makeArchive>, sessionId: number) => {
+      const worker = new SourceWorksheetPullWorker(() => archive);
+      const replies: PullSessionResponse<ArrayBuffer, number>[] = [];
+      await openWorker(worker, { ...identity, sessionId });
+      await worker.dispatch(
+        { ...command(2, { kind: 'pull', sequence: 0, byteCredit: 64 * 1024 * 1024 }), sessionId },
+        (response) => replies.push(response),
+      );
+      return replies[0];
+    };
 
-    const unavailable = makeArchive(new Error('worksheet cursor usage is unavailable'));
-    const deferred = new WorksheetPullWorker(() => unavailable);
-    const deferredReplies: PullSessionResponse<ArrayBuffer, number>[] = [];
-    await openWorker(deferred);
-    await deferred.dispatch(
-      command(1, { kind: 'pull', sequence: 0, byteCredit: 64 * 1024 * 1024 }),
-      (response) => deferredReplies.push(response),
-    );
-    expect(deferredReplies[0]).toMatchObject({ kind: 'chunk', done: true });
-    expect(deferredReplies[0]?.usage).toBeUndefined();
-
-    const violation = makeArchive(new Error('OOXML_RESOURCE_LIMIT: usage checkpoint failed'));
-    const rejected = new WorksheetPullWorker(() => violation);
-    const rejectedReplies: PullSessionResponse<ArrayBuffer, number>[] = [];
-    await openWorker(rejected, { ...identity, sessionId: 5 });
-    await rejected.dispatch(
-      { ...command(2, { kind: 'pull', sequence: 0, byteCredit: 64 * 1024 * 1024 }), sessionId: 5 },
-      (response) => rejectedReplies.push(response),
-    );
-    expect(rejectedReplies[0]).toMatchObject({ kind: 'error' });
+    // A parser archive's checkpoint is always fatal on failure, whatever the message.
+    for (const [sessionId, message] of [
+      [5, 'OOXML_RESOURCE_LIMIT: usage checkpoint failed'],
+      [6, 'worksheet cursor usage is unavailable'],
+    ] as const) {
+      expect(await pullOnce(makeArchive(new Error(message)), sessionId)).toMatchObject({ kind: 'error' });
+    }
+    // A model-source archive without ZIP accounting omits the capability.
+    const unaccounted = await pullOnce(makeArchive(), 7);
+    expect(unaccounted).toMatchObject({ kind: 'chunk', done: true });
+    expect(unaccounted?.usage).toBeUndefined();
   });
 
   it('closes the shared lifecycle before a reparse generation proceeds', async () => {

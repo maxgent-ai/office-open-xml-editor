@@ -40,6 +40,7 @@ import {
   chartStockBarFillDecision,
   chartStyleFillDecision,
   chartThreeDSurfacePaint,
+  chartExPointAuthorsFill,
 } from './style-paint.js';
 import {
   chartDataPointStyleRole,
@@ -498,57 +499,36 @@ function collectChartMarkerImageFillResult(
     const fill = chartStyleDirectFillDecision(style, rawLinked, index);
     return fill?.fillType === 'image' ? fill : fill == null ? fill : null;
   };
+  // ChartEx data points: direct point/series `spPr` owns each fill atom,
+  // including `a:noFill`, before the linked dataPoint role. This mirrors
+  // resolveChartExPointFill so preflight fetches exactly the painted sources.
   const dataPointImageDecision = (
     local: ChartExElementStyle | null | undefined,
     legacyColor: string | null | undefined,
     linked: ChartExElementStyle | null | undefined,
-    rawLinked: ChartExElementStyle | null | undefined,
     index: number,
   ): ImageFill | null | undefined => {
-    const fill = local?.fillHidden
-      ? chartStyleDirectNoFillDecision(rawLinked)
-      : chartStyleDirectFillDecision(local, rawLinked, index);
+    const fill = chartStyleFillDecision(local, index);
     if (fill !== undefined) return fill?.fillType === 'image' ? fill : null;
     if (legacyColor) return null;
     const fallback = chartStyleFillDecision(linked, index);
     return fallback?.fillType === 'image' ? fallback : fallback == null ? fallback : null;
   };
-  const waterfallBodyImageDecision = (
+  const chartExPointImageDecision = (
     point: ChartDataPointOverride | undefined,
-    series: ChartSeries | undefined,
-    semanticIndex: number,
+    series: Pick<ChartSeries, 'chartexStyle' | 'color'> | undefined,
+    index: number,
   ): ImageFill | null | undefined => {
-    const pointAuthors = point?.fillHidden === true || point?.color != null
-      || point?.chartexStyle?.fillPaintAuthored === true
-      || point?.chartexStyle?.fillHidden != null
-      || point?.chartexStyle?.fillColors?.some(color => color != null) === true
-      || point?.chartexStyle?.fillPaints?.some(paint => paint != null) === true;
-    if (pointAuthors) {
+    if (chartExPointAuthorsFill(point)) {
       const pointStyle = point?.fillHidden === true
         ? { ...point.chartexStyle, fillHidden: true, fillPaintAuthored: true }
         : point?.chartexStyle;
       return dataPointImageDecision(
-        pointStyle,
-        point?.color,
-        chart.chartexDataPointStyle,
-        rawLinkedChartStyleRole(chart, 'dataPoint')
-          ?? (chart.classicChartStyleRoles == null ? chart.chartexDataPointStyle : undefined),
-        semanticIndex,
-      );
-    }
-    if (series?.chartexStyle?.fillPaintAuthored === true) {
-      return dataPointImageDecision(
-        series.chartexStyle,
-        series.color,
-        chart.chartexDataPointStyle,
-        rawLinkedChartStyleRole(chart, 'dataPoint')
-          ?? (chart.classicChartStyleRoles == null ? chart.chartexDataPointStyle : undefined),
-        semanticIndex,
+        pointStyle, point?.color, chart.chartexDataPointStyle, index,
       );
     }
     return dataPointImageDecision(
-      series?.chartexStyle, series?.color, chart.chartexDataPointStyle,
-      rawLinkedChartStyleRole(chart, 'dataPoint'), semanticIndex,
+      series?.chartexStyle, series?.color, chart.chartexDataPointStyle, index,
     );
   };
   const frameImageDecision = (
@@ -1074,16 +1054,19 @@ function collectChartMarkerImageFillResult(
       for (let index = 0; index < plan.bars.length; index++) {
         const bar = plan.bars[index]!;
         if (!bar.paintSlot) continue;
-        add(waterfallBodyImageDecision(overrides.get(index), series, bar.semanticIndex));
+        add(chartExPointImageDecision(overrides.get(index), series, bar.semanticIndex));
       }
     }
   } else if (chart.chartType === 'funnel') {
     const series = chart.series[0];
-    if ((series?.values ?? []).some(value => value != null && value > 0)) {
-      add(dataPointImageDecision(
-        series?.chartexStyle, series?.color, chart.chartexDataPointStyle,
-        rawLinkedChartStyleRole(chart, 'dataPoint'), 0,
-      ));
+    const values = series?.values ?? [];
+    if (values.some(value => value != null && value > 0)) {
+      const overrides = new Map((series?.dataPointOverrides ?? []).map(point => [point.idx, point]));
+      const count = Math.max(values.length, chart.categories.length);
+      for (let index = 0; index < count; index++) {
+        if (!((values[index] ?? 0) > 0)) continue;
+        add(chartExPointImageDecision(overrides.get(index), series, 0));
+      }
     }
   }
   for (let seriesIndex = 0; seriesIndex < (chart.chartexBox?.series.length ?? 0); seriesIndex++) {
@@ -1092,17 +1075,17 @@ function collectChartMarkerImageFillResult(
       computeBoxWhiskerStats(values, series.quartileMethod) != null)) continue;
     add(dataPointImageDecision(
       series.chartexStyle, series.color, chart.chartexDataPointStyle,
-      rawLinkedChartStyleRole(chart, 'dataPoint'),
       series.chartexFormatIdx ?? seriesIndex,
     ));
   }
   const hierarchySeries = chart.series[0];
+  const hierarchyOverrides = new Map(
+    (hierarchySeries?.dataPointOverrides ?? []).map(point => [point.idx, point]),
+  );
   visitChartExHierarchyBodySites(chart, ({ node, paintsBody }) => {
     if (!paintsBody) return;
-    add(dataPointImageDecision(
-      hierarchySeries?.chartexStyle, hierarchySeries?.color,
-      chart.chartexDataPointStyle, rawLinkedChartStyleRole(chart, 'dataPoint'),
-      node.branchIndex,
+    add(chartExPointImageDecision(
+      hierarchyOverrides.get(node.labelIndex), hierarchySeries, node.branchIndex,
     ));
   });
   visitChartExHierarchyLabelSites(chart, ({ label, linkedStyleIndex }) => {

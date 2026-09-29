@@ -46,6 +46,15 @@ describe('excelSerialToUtcDate — 1900 date system (ECMA-376 §18.17.4.1)', () 
     expect(d.getUTCDate()).toBe(1);
     expect(d.getUTCHours()).toBe(12);
   });
+
+  it('rounds a stored time fraction to the nearest millisecond', () => {
+    // 8:00 is stored as 0.33333333333333331 (28 799 999.999… ms); `new Date`
+    // would truncate it to 7:59:59.999.
+    const d = excelSerialToUtcDate(45292.33333333333, false);
+    expect(d.getUTCHours()).toBe(8);
+    expect(d.getUTCMinutes()).toBe(0);
+    expect(excelSerialToUtcDate(45000.33333333333, true).getUTCHours()).toBe(8);
+  });
 });
 
 describe('excelSerialToUtcDate — 1904 date system (ECMA-376 §18.17.4.1)', () => {

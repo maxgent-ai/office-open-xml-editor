@@ -6,8 +6,22 @@ import {
   paintDrawingMLShape,
   resolveFill,
   withDrawingMLShapeTransform,
+  withPatternCoordinateSpace,
 } from '@silurus/ooxml-core';
 import { paintRetainedResource } from './canvas-resource.js';
+
+function paintPageAlignedDrawingMLShape(
+  plan: Parameters<typeof paintDrawingMLShape>[1],
+  context: CanvasPaintContext,
+): void {
+  const ctx = context.ctx as CanvasRenderingContext2D;
+  const paint = () => paintDrawingMLShape(ctx, plan, 1);
+  if (context.patternPageToDevice) {
+    withPatternCoordinateSpace(ctx, context.patternPageToDevice, paint);
+  } else {
+    paint();
+  }
+}
 
 export function paintDrawingLayout(node: DrawingLayout, context: CanvasPaintContext): void {
   for (const command of node.commands) {
@@ -15,11 +29,7 @@ export function paintDrawingLayout(node: DrawingLayout, context: CanvasPaintCont
     if (command.kind === 'drawingml-shape') {
       // Page setup already maps retained point coordinates to device pixels. A
       // second scale here would multiply stroke widths and arrowhead geometry.
-      paintDrawingMLShape(
-        context.ctx as CanvasRenderingContext2D,
-        command.plan,
-        1,
-      );
+      paintPageAlignedDrawingMLShape(command.plan, context);
       continue;
     }
     if (command.kind === 'drawingml-image-fill') {
@@ -53,11 +63,7 @@ export function paintDrawingLayout(node: DrawingLayout, context: CanvasPaintCont
       }
       // The retained plan has a null base fill; this second pass paints only
       // the authored outline/arrow decorations in the same transform.
-      paintDrawingMLShape(
-        context.ctx as CanvasRenderingContext2D,
-        command.plan,
-        1,
-      );
+      paintPageAlignedDrawingMLShape(command.plan, context);
       continue;
     }
     if (command.kind === 'resource') {

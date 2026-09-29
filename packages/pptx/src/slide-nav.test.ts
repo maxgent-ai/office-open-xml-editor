@@ -41,6 +41,10 @@ describe('resolveSlidePartTarget', () => {
     expect(resolveSlidePartTarget('/ppt/slides/slide2.xml', idx)).toBe(1);
   });
 
+  it('resolves a canonical target inherited from a master or layout part', () => {
+    expect(resolveSlidePartTarget('ppt/slides/slide2.xml', idx)).toBe(1);
+  });
+
   it('returns undefined for a target that names no known slide', () => {
     expect(resolveSlidePartTarget('../slides/slide9.xml', idx)).toBeUndefined();
     expect(resolveSlidePartTarget('https://example.com/', idx)).toBeUndefined();

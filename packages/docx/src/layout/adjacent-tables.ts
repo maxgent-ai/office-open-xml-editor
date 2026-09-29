@@ -67,33 +67,32 @@ function assertParserOwnedSequence(sequenceId: string, members: readonly Pending
  * only coalesces the maximal contiguous run sharing an id and validates the
  * parser-owned row totals; it does not compare derived geometry or style ids.
  */
-export function normalizeAdjacentTables(
-  body: readonly AdjacentTableSequenceInput[],
-): readonly NormalizedBodySequenceEntry[] {
-  const result: NormalizedBodySequenceEntry[] = [];
+export function* normalizeAdjacentTables(
+  body: Iterable<AdjacentTableSequenceInput>,
+): Generator<NormalizedBodySequenceEntry> {
   let pendingSequenceId: string | null = null;
   let pendingMembers: PendingMember[] = [];
 
-  const flush = () => {
+  function* flush(): Generator<NormalizedBodySequenceEntry> {
     if (pendingMembers.length > 0) {
       assertParserOwnedSequence(pendingSequenceId!, pendingMembers);
     }
     if (pendingMembers.length === 1) {
-      result.push(Object.freeze({ kind: 'body-element', element: pendingMembers[0]!.element }));
+      yield Object.freeze({ kind: 'body-element', element: pendingMembers[0]!.element });
     } else if (pendingMembers.length > 1) {
-      result.push(Object.freeze({
+      yield Object.freeze({
         kind: 'adjacent-table-group',
         logicalSequenceId: pendingSequenceId!,
         tables: Object.freeze(pendingMembers.map((member) => member.element)),
-      }));
+      });
     }
     pendingSequenceId = null;
     pendingMembers = [];
-  };
+  }
 
   for (const { element, table } of body) {
     if (element.type === 'table' && table !== null) {
-      if (pendingMembers.length > 0 && pendingSequenceId !== table.logicalSequenceId) flush();
+      if (pendingMembers.length > 0 && pendingSequenceId !== table.logicalSequenceId) yield* flush();
       pendingSequenceId = table.logicalSequenceId;
       pendingMembers.push(Object.freeze({
         element: element as TableBodyElement,
@@ -103,10 +102,8 @@ export function normalizeAdjacentTables(
       }));
       continue;
     }
-    flush();
-    result.push(Object.freeze({ kind: 'body-element', element }));
+    yield* flush();
+    yield Object.freeze({ kind: 'body-element', element });
   }
-  flush();
-
-  return Object.freeze(result);
+  yield* flush();
 }

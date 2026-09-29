@@ -21,6 +21,7 @@ function makeFakeWorkbook(): XlsxWorkbook {
     sheetCount: 1,
     sheetNames: ['Sheet1'],
     getWorksheet: () => Promise.resolve(ws),
+    acquireWorksheetLease: async () => ({ worksheet: ws, release: () => undefined }),
     cellText: () => 'hello world',
     destroy: vi.fn(),
     isHidden: () => false,

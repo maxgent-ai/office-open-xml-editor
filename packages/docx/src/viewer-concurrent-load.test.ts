@@ -1,6 +1,6 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { DocxViewer } from './viewer.js';
-import { DocxDocument } from './document.js';
+import { DocxDocument, docxViewerLoadSignal, type DocxViewerLoadControl } from './document.js';
 import { installDom, makeEl, FakeDocxEngine } from './scroll-viewer-test-dom.js';
 
 afterEach(() => {
@@ -160,5 +160,104 @@ describe('DocxViewer.load() — concurrent-load latch', () => {
 
     await expect(v.load('late.docx')).rejects.toThrow('DocxViewer is destroyed');
     expect(load).not.toHaveBeenCalled();
+  });
+
+  it('cancels the superseded sliced load while retaining the winning document', async () => {
+    const { canvas } = mount();
+    const stale = deferredLoad(new FakeDocxEngine(2, A4));
+    const winner = deferredLoad(new FakeDocxEngine(2, A4));
+    const controls: DocxViewerLoadControl[] = [];
+    vi.spyOn(DocxDocument, 'load')
+      .mockImplementationOnce((_source, opts) => {
+        controls.push((opts as typeof opts & { [docxViewerLoadSignal]: DocxViewerLoadControl })[docxViewerLoadSignal]);
+        return stale.promise;
+      })
+      .mockImplementationOnce((_source, opts) => {
+        controls.push((opts as typeof opts & { [docxViewerLoadSignal]: DocxViewerLoadControl })[docxViewerLoadSignal]);
+        return winner.promise;
+      });
+    const viewer = new DocxViewer(canvas as unknown as HTMLCanvasElement);
+    const oldLoad = viewer.load('old.docx');
+    const newLoad = viewer.load('new.docx');
+    expect(controls[0]?.signal.aborted).toBe(true);
+    expect(controls[1]?.signal.aborted).toBe(false);
+    winner.resolve();
+    await newLoad;
+    stale.resolve();
+    await oldLoad;
+    expect(viewer.pageCount).toBe(2);
+    viewer.destroy();
+  });
+
+  it('notifies a pending sliced load of a tracked-change toggle and aborts it on destroy', async () => {
+    const { canvas } = mount();
+    const pending = deferredLoad(new FakeDocxEngine(2, A4));
+    let control!: DocxViewerLoadControl;
+    vi.spyOn(DocxDocument, 'load').mockImplementation((_source, opts) => {
+      control = (opts as typeof opts & { [docxViewerLoadSignal]: DocxViewerLoadControl })[docxViewerLoadSignal];
+      return pending.promise;
+    });
+    const viewer = new DocxViewer(canvas as unknown as HTMLCanvasElement);
+    const loading = viewer.load('pending.docx');
+    let changes = 0;
+    const unsubscribe = control.subscribeViewChange(() => { changes += 1; });
+    await viewer.setShowTrackedChanges(true);
+    await viewer.setShowTrackedChanges(true);
+    expect(changes).toBe(1);
+    expect(control.requestedView()).toBe(true);
+    unsubscribe();
+    viewer.destroy();
+    expect(control.signal.aborted).toBe(true);
+    pending.resolve();
+    await expect(loading).rejects.toThrow('DocxViewer is destroyed');
+  });
+
+  it('carries a pending view toggle into a reload that supersedes the first layout', async () => {
+    const { canvas } = mount();
+    const stale = deferredLoad(new FakeDocxEngine(2, A4));
+    const winner = deferredLoad(new FakeDocxEngine(2, A4));
+    const options: Parameters<typeof DocxDocument.load>[1][] = [];
+    vi.spyOn(DocxDocument, 'load')
+      .mockImplementationOnce((_source, opts) => { options.push(opts); return stale.promise; })
+      .mockImplementationOnce((_source, opts) => { options.push(opts); return winner.promise; });
+    const viewer = new DocxViewer(canvas as unknown as HTMLCanvasElement);
+    const first = viewer.load('old.docx');
+    await viewer.setShowTrackedChanges(true);
+    const second = viewer.load('new.docx');
+    expect(options[1]?.showTrackedChanges).toBe(true);
+    winner.resolve();
+    await second;
+    stale.resolve();
+    await first;
+    expect(viewer.pageCount).toBe(2);
+    viewer.destroy();
+  });
+
+  it('settles a superseded view selection without surfacing its worker rejection', async () => {
+    const { canvas } = mount();
+    const first = new FakeDocxEngine(2, A4);
+    const second = new FakeDocxEngine(3, A4);
+    let finishLoad!: (doc: DocxDocument) => void;
+    let rejectView!: (error: Error) => void;
+    let startedView!: () => void;
+    const selecting = new Promise<void>((resolve) => { startedView = resolve; });
+    first.setLayoutView = (async () => {
+      startedView();
+      await new Promise<void>((_resolve, reject) => { rejectView = reject; });
+    }) as typeof first.setLayoutView;
+    const originalDestroy = first.destroy.bind(first);
+    first.destroy = () => { originalDestroy(); rejectView(new Error('Worker terminated')); };
+    vi.spyOn(DocxDocument, 'load')
+      .mockImplementationOnce(() => new Promise((resolve) => { finishLoad = resolve; }))
+      .mockResolvedValueOnce(second.asDoc());
+    const viewer = new DocxViewer(canvas as unknown as HTMLCanvasElement);
+    const loading = viewer.load('first.docx');
+    await viewer.setShowTrackedChanges(true);
+    finishLoad(first.asDoc());
+    await selecting;
+    await viewer.load('second.docx');
+    await expect(loading).resolves.toBeUndefined();
+    expect(viewer.pageCount).toBe(3);
+    viewer.destroy();
   });
 });

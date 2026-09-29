@@ -658,6 +658,31 @@ describe('canonical page-owned anchor prescan (§20.4.2.3/.17/.20)', () => {
     expectVerticalBounds('composition-trailing-host', 234.55, 121.45);
   });
 
+  it('does not displace an overlap-allowed anchor by its own paragraph\'s prescanned siblings', () => {
+    // Both page-owned square anchors sit in one paragraph and allow overlap
+    // (§20.4.2.3 allowOverlap=true). Prescan registers each one on the page
+    // before the paragraph lays out; that registration must not turn a
+    // same-paragraph sibling into a different-paragraph wrap blocker.
+    const upper = parserAnchor('same-paragraph-upper', {
+      xPt: 0, yPt: 0, widthPt: 160, heightPt: 60, wrap: 'square',
+    });
+    const lower = parserAnchor('same-paragraph-lower', {
+      xPt: 0, yPt: 40, widthPt: 160, heightPt: 40, wrap: 'square',
+    });
+    const layout = canonicalLayout([
+      paraWith([...parserAnchoredImage(upper), ...parserAnchoredImage(lower)]),
+    ]);
+    const drawings = sourceParagraphs(layout, 0).flatMap((paragraph) => paragraph.drawings);
+    const bounds = (suffix: string) => drawings.find((drawing) =>
+      drawing.anchorLayer?.occurrenceId.endsWith(suffix))?.flowBounds;
+    const upperBounds = bounds('same-paragraph-upper');
+    const lowerBounds = bounds('same-paragraph-lower');
+
+    expect(upperBounds).toBeDefined();
+    expect(lowerBounds).toBeDefined();
+    expect(lowerBounds!.yPt - upperBounds!.yPt).toBe(40);
+  });
+
   it('does not let a future prescanned text float displace an earlier object', () => {
     const earlier = parserAnchor('earlier-object', {
       xPt: 80, yPt: 0, widthPt: 80, heightPt: 60,
@@ -830,7 +855,16 @@ describe('canonical paragraph-owned anchor registry (§20.4.2.3/.20 + §20.4.3.5
     expect(carriesOccurrenceExclusion(anchored[0]!)).toBe(false);
     expect(ownsOccurrence(anchored[1]!)).toBe(true);
     expect(carriesOccurrenceExclusion(anchored[1]!)).toBe(true);
-    expect(following).toHaveLength(2);
+    // The remeasured continuation keeps its own wrap geometry: the image sits
+    // at the fragment top and its lines, and the fragment advance, stay below
+    // it instead of being rebased over it (or lifting the image off the page).
+    const drawing = anchored[1]!.drawings[0]!;
+    expect(drawing.flowBounds.yPt).toBe(anchored[1]!.flowBounds.yPt);
+    expect(anchored[1]!.lines[0]!.bounds.yPt)
+      .toBe(drawing.flowBounds.yPt + drawing.flowBounds.heightPt);
+    expect(anchored[1]!.flowBounds.heightPt)
+      .toBeGreaterThanOrEqual(drawing.flowBounds.heightPt);
+    expect(following).toHaveLength(1);
     expect(layout.pages).toHaveLength(3);
   });
 

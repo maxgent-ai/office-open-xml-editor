@@ -8,14 +8,30 @@ type CellAnchoredObject = {
   readonly toRow: number;
 };
 
+const previewBounds = new WeakMap<Worksheet, { maxRow: number; maxCol: number }>();
+
+/** The metadata pass derives these from every MCE-visible row and cell, so the
+ * scrollbars have their final extent while values are still arriving. */
+export function setWorksheetPreviewBounds(
+  worksheet: Worksheet, bounds: { maxRow: number; maxCol: number },
+): void {
+  previewBounds.set(worksheet, bounds);
+}
+
+export function inheritWorksheetPreviewBounds(source: Worksheet, target: Worksheet): void {
+  const bounds = previewBounds.get(source);
+  if (bounds) previewBounds.set(target, bounds);
+}
+
 /** Return the worksheet grid bounds needed to expose both cell content and
  * DrawingML objects. Two-cell anchors use zero-based markers (§20.5.2.33), so
  * an object ending at marker row 113 requires row 114 in the scroll extent.
  * Excel permits drawings well beyond the `<dimension>` / populated cell range;
  * ignoring them makes those authored objects unreachable in a viewer. */
 export function worksheetContentBounds(ws: Worksheet): { maxRow: number; maxCol: number } {
-  let maxRow = Math.max(50, ws.freezeRows ?? 0);
-  let maxCol = Math.max(26, ws.freezeCols ?? 0);
+  const preview = previewBounds.get(ws);
+  let maxRow = Math.max(50, ws.freezeRows ?? 0, preview?.maxRow ?? 0);
+  let maxCol = Math.max(26, ws.freezeCols ?? 0, preview?.maxCol ?? 0);
   for (const row of ws.rows) {
     if (row.index > maxRow) maxRow = row.index;
     for (const cell of row.cells) {

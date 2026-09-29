@@ -1,0 +1,95 @@
+[
+  {
+    "file": "packages/docx/src/internal/node-acquisition.ts",
+    "name": "acquireDocxNodeDocument",
+    "awaits": [
+      "formatRuntime.open",
+      "consume",
+      "pull.reset",
+      "pull.reset.catch"
+    ]
+  },
+  {
+    "file": "packages/xlsx/src/internal/node-acquisition.ts",
+    "name": "acquireXlsxNodeSession",
+    "awaits": [
+      "formatRuntime.open"
+    ]
+  },
+  {
+    "file": "packages/pptx/src/internal/node-acquisition.ts",
+    "name": "acquirePptxNodeSession",
+    "awaits": [
+      "formatRuntime.open"
+    ]
+  },
+  {
+    "file": "packages/node/src/docx.ts",
+    "name": "openDocxDocument",
+    "awaits": [
+      "acquireDocxNodeDocument"
+    ]
+  },
+  {
+    "file": "packages/node/src/docx.ts",
+    "name": "materializeDocxDocument",
+    "awaits": [
+      "acquireDocxNodeDocument"
+    ]
+  },
+  {
+    "file": "packages/node/src/xlsx.ts",
+    "name": "openXlsxWorkbook",
+    "awaits": [
+      "acquireXlsxNodeSession"
+    ]
+  },
+  {
+    "file": "packages/node/src/pptx.ts",
+    "name": "openPptxPresentationImpl",
+    "awaits": [
+      "acquirePptxNodeSession"
+    ]
+  },
+  {
+    "file": "packages/docx/src/document.ts",
+    "name": "load",
+    "awaits": [
+      "fetch",
+      "res.arrayBuffer",
+      "resolveOoxmlContainer",
+      "import",
+      "doc._parse",
+      "loadEmbeddedFonts",
+      "loadOfficeFontFallbacks",
+      "preloadGoogleFonts",
+      "prepareMathRuns",
+      "firstPublication.promise",
+      "layoutDocumentInputAsync",
+      "doc._resourceUsage.then"
+    ]
+  },
+  {
+    "file": "packages/xlsx/src/workbook.ts",
+    "name": "load",
+    "awaits": [
+      "fetch",
+      "res.arrayBuffer",
+      "resolveOoxmlContainer",
+      "import",
+      "wb._load"
+    ]
+  },
+  {
+    "file": "packages/pptx/src/presentation.ts",
+    "name": "load",
+    "awaits": [
+      "fetch",
+      "res.arrayBuffer",
+      "resolveOoxmlContainer",
+      "import",
+      "pres._parse",
+      "preloadGoogleFonts"
+    ]
+  }
+]

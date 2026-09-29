@@ -129,6 +129,10 @@ function renderLines(tb: TextBody, boxW: number): {
 const LATIN = '\tt01 t02 t03 t04 t05 t06 t07 t08 t09 t10 t11 t12';
 
 describe('issue #1006 — tab-led lines wrap; continuation re-anchors at text-left', () => {
+  it('keeps an authored Latin run seam inside the wrapped word (control C01)', () => {
+    const { lines } = renderLines(body([run('abc'), run('def')]), 90);
+    expect(lines.map((line) => line.text)).toEqual(['abcd', 'ef']);
+  });
   it('Latin leading tab wraps (tab-aware budget) and continuation starts at text-left', () => {
     // Left stop @100. Budget 280. Tab jumps to 100, leaving 180px on line 1:
     // "t01"(60)+" "(20)+"t02"(60) = 140 fits, +" "(20)=160, "t03" overflows.

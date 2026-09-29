@@ -2,7 +2,6 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { basename, dirname, resolve } from 'node:path';
 import { existsSync } from 'node:fs';
-import { createRequire } from 'node:module';
 
 const initializedWasm = new WeakMap<object, unknown>();
 
@@ -11,8 +10,8 @@ const initializedWasm = new WeakMap<object, unknown>();
  *  we sidestep that path by reading the .wasm bytes off disk and feeding them
  *  into the generated `initSync` helper. */
 export function loadWasmModule<T>(jsModule: T & { initSync: (init: { module: WebAssembly.Module }) => unknown }, wasmPath: string): T {
-  const module = compileWasmModule(wasmPath);
-  initializedWasm.set(jsModule as object, jsModule.initSync({ module }));
+  const wasmModule = compileWasmModule(wasmPath);
+  initializedWasm.set(jsModule as object, jsModule.initSync({ module: wasmModule }));
   return jsModule;
 }
 
@@ -56,5 +55,7 @@ export function resolveWasm(
   if (existsSync(workspacePath)) return workspacePath;
   const shippedPath = resolve(here, basename(relPath));
   if (existsSync(shippedPath) || !workspaceSpecifier) return shippedPath;
-  return createRequire(metaUrl).resolve(workspaceSpecifier);
+  // Node's ESM resolver handles the workspace package export directly; no
+  // CommonJS loader capability is needed in a checked OOXML package.
+  return fileURLToPath(import.meta.resolve(workspaceSpecifier));
 }

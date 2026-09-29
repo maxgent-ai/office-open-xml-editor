@@ -83,8 +83,6 @@ test.describe('pptx slide-6 sp3d bevel ring', () => {
           const msg = await page.evaluate(() => document.body.dataset.errorMessage ?? '');
           throw new Error(`Fixture error: ${msg}`);
         }
-        await page.waitForTimeout(200);
-
         // Sample the four apex cross-sections off the live canvas and classify
         // each ray's pixels into page-white / warm-rim / photo. Acceptance
         // contract, per the PDF ground truth:

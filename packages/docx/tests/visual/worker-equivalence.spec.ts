@@ -1,6 +1,8 @@
 import { test, expect } from '@playwright/test';
 import { PNG } from 'pngjs';
 import pixelmatch from 'pixelmatch';
+// @ts-ignore - shared plain-JS test fixture builder.
+import { chartExDocxBytes } from '../../../../tests/fixtures/chart-ex-packages.mjs';
 
 // Worker mode must produce (near-)identical pixels to main mode: same
 // renderer, same pagination, same fonts, different thread. The only expected
@@ -85,4 +87,43 @@ test('worker mode renders non-empty equation pixels through the same math render
   const pct = (diff / (main.width * main.height)) * 100;
   console.log(`  math renderer: worker-vs-main diff ${pct.toFixed(3)}%, ink ${inkPixels}`);
   expect(pct).toBeLessThanOrEqual(0.01);
+});
+
+// The optional ChartEx renderer crosses the worker boundary as a descriptor.
+// Public demo files carry no ChartEx part, so serve a self-authored waterfall
+// and require identical, coloured (not grayscale-placeholder) output.
+test('worker mode matches main mode › ChartEx waterfall', async ({ page }) => {
+  const bytes = chartExDocxBytes();
+  await page.route('**/generated/chart-ex.docx', (route) => route.fulfill({
+    status: 200, contentType: 'application/octet-stream', body: Buffer.from(bytes),
+  }));
+  await page.goto('/tests/visual/worker-fixture.html?docx=generated/chart-ex&page=0');
+  await page.waitForFunction(
+    () => document.body.dataset.status === 'ready' || document.body.dataset.status === 'error',
+    { timeout: 60_000 },
+  );
+  const status = await page.evaluate(() => document.body.dataset.status);
+  if (status === 'error') {
+    throw new Error(await page.evaluate(() => document.body.dataset.errorMessage ?? ''));
+  }
+  const [mainUrl, workerUrl] = await page.evaluate(() => [
+    (document.getElementById('main-canvas') as HTMLCanvasElement).toDataURL('image/png'),
+    (document.getElementById('worker-canvas') as HTMLCanvasElement).toDataURL('image/png'),
+  ]);
+  const main = PNG.sync.read(Buffer.from(mainUrl.split(',')[1], 'base64'));
+  const worker = PNG.sync.read(Buffer.from(workerUrl.split(',')[1], 'base64'));
+  expect(worker.width).toBe(main.width);
+  expect(worker.height).toBe(main.height);
+  const coloured = (png: PNG): number => {
+    let count = 0;
+    for (let offset = 0; offset < png.data.length; offset += 4) {
+      const r = png.data[offset], g = png.data[offset + 1], b = png.data[offset + 2];
+      if (Math.max(r, g, b) - Math.min(r, g, b) > 60) count++;
+    }
+    return count;
+  };
+  expect(coloured(main)).toBeGreaterThan(500);
+  expect(coloured(worker)).toBeGreaterThan(500);
+  const diff = pixelmatch(main.data, worker.data, undefined, main.width, main.height, { threshold: 0.1 });
+  expect((diff / (main.width * main.height)) * 100).toBeLessThanOrEqual(0.1);
 });

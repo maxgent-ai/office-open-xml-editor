@@ -88,6 +88,8 @@ export interface AcquiredParagraphBlock {
   readonly fragmentation: ParagraphFragmentation;
   readonly uniformRubyAdvancePt?: number;
   readonly markBelowBaselinePt?: number;
+  /** True when this mark's line box occupies a §17.6.5 document-grid cell. */
+  readonly markOnLineGrid?: boolean;
   readonly flowRegistryDelta?: BodyFlowRegistryDeltaPt;
   readonly placement?: Readonly<{
     coordinateSpace: 'logical-body';
@@ -103,6 +105,8 @@ export interface AcquiredParagraphBlock {
 export interface AcquiredTableBlock {
   readonly layout: TableLayout;
   readonly blockExtentPt: number;
+  /** Retained table height beyond an Office-clipped page band. */
+  readonly unpaintedOverflowPt?: number;
   readonly nextCursor?: BodyTableContinuationCursor | null;
   readonly flowRegistryDelta?: BodyFlowRegistryDeltaPt;
   readonly requiresFreshFlowRegion?: boolean;
@@ -145,13 +149,25 @@ export interface FollowingBodyBlockMeasurement {
   readonly fullFootnoteReferenceIds?: readonly string[];
   /** References painted by the first indivisible content admitted with keepNext. */
   readonly leadFootnoteReferenceIds?: readonly string[];
+  /** Paragraph only: page-owned drawing occurrence keys anchored on each
+   * measured line, so keepNext can honour an anchor-line deferral. */
+  readonly pageOwnedAnchorKeysByLine?: readonly (readonly string[])[];
 }
 
 export interface PageAnchorPrescanInput {
-  readonly anchors: readonly Readonly<{
-    occurrenceId: string;
-    paragraphSource: SourceRef;
-  }>[];
+  readonly anchors: readonly (
+    | Readonly<{
+        kind: 'drawing';
+        occurrenceId: string;
+        paragraphSource: SourceRef;
+      }>
+    | Readonly<{
+        kind: 'floating-table';
+        occurrenceId: string;
+        tableSource: SourceRef;
+        bounds: Readonly<{ xPt: number; yPt: number; widthPt: number; heightPt: number }>;
+      }>
+  )[];
   readonly location: BodyAcquisitionLocation;
   readonly availableInlineExtentPt: number;
 }

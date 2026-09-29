@@ -2,6 +2,7 @@ import { describe, it, expect, afterEach, vi } from 'vitest';
 import { XlsxViewer } from './viewer.js';
 import { XlsxWorkbook } from './workbook.js';
 import { installDom, makeContainer, type FakeDocument, type FakeEl } from './viewer-destroy-test-dom.js';
+import type { Worksheet } from './types.js';
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -83,6 +84,105 @@ describe('XlsxViewer.destroy() — subtree + listeners + style', () => {
     expect(doc.listenerCount('keydown')).toBe(0);
     // Dispatching a keydown after destroy must not throw (no live handler).
     expect(() => doc.dispatchEvent('keydown', { key: 'c', ctrlKey: true })).not.toThrow();
+  });
+
+  it('detaches every element, document, media and observer listener it installed', async () => {
+    const doc = installDom();
+    // Record every element the viewer creates, so listeners on nodes that are
+    // no longer attached (tab buttons, detached outline gutters, value-list
+    // items) are checked too, not only the live subtree.
+    const created: FakeEl[] = [];
+    const createElement = doc.createElement;
+    doc.createElement = (tag: string) => {
+      const element = createElement(tag);
+      created.push(element);
+      return element;
+    };
+    const observers: Array<{ observing: boolean }> = [];
+    class RecordingObserver {
+      observing = false;
+      constructor(_callback: () => void) { observers.push(this); }
+      observe(): void { this.observing = true; }
+      disconnect(): void { this.observing = false; }
+      unobserve(): void {}
+    }
+    const mediaListeners = new Set<unknown>();
+    Object.assign(doc.defaultView, {
+      ResizeObserver: RecordingObserver,
+      MutationObserver: RecordingObserver,
+      matchMedia: () => ({
+        addEventListener: (_type: string, listener: unknown) => mediaListeners.add(listener),
+        removeEventListener: (_type: string, listener: unknown) => mediaListeners.delete(listener),
+      }),
+    });
+    const workbook = {
+      mode: 'main',
+      sheetCount: 2,
+      sheetNames: ['Sheet1', 'Sheet2'],
+      tabColors: [null, null],
+      isHidden: () => false,
+      getWorksheet: () => new Promise(() => {}),
+      resolveValidationList: async () => ({ kind: 'values', values: ['A', 'B'] }),
+      destroy: vi.fn(),
+    } as unknown as XlsxWorkbook;
+    const viewer = XlsxViewer.fromWorkbook(
+      makeContainer() as unknown as HTMLElement,
+      workbook,
+      { onContextMenu: () => undefined },
+    );
+    const internals = viewer as unknown as {
+      currentSheet: number;
+      currentWorksheet: Worksheet;
+      canvasArea: FakeEl;
+      selectionController: { select(cell: { row: number; col: number }): void };
+      validation: { toggle(): void };
+    };
+    internals.currentSheet = 0;
+    internals.canvasArea.clientWidth = 800;
+    internals.canvasArea.clientHeight = 600;
+    internals.currentWorksheet = {
+      name: 'Sheet1', rows: [], colWidths: {}, rowHeights: {},
+      defaultColWidth: 8.43, defaultRowHeight: 15, freezeRows: 0, freezeCols: 0,
+      mergeCells: [], conditionalFormats: [], images: [], charts: [],
+      dataValidations: [{ validationType: 'list', sqref: 'A1', formula1: 'A1:A2' }],
+    } as unknown as Worksheet;
+    internals.selectionController.select({ row: 1, col: 1 });
+    internals.validation.toggle();
+    await vi.waitFor(() => expect(doc.listenerCount('pointerdown')).toBe(1));
+
+    const listenerCount = () => created.reduce((total, element) =>
+      total + [...element._listeners.values()].reduce((sum, list) => sum + list.length, 0), 0);
+    const listenedTypes = (predicate: (element: FakeEl) => boolean) => new Set(
+      created.filter(predicate).flatMap((element) =>
+        [...element._listeners].filter(([, list]) => list.length > 0).map(([type]) => type)),
+    );
+    // Precondition: the viewport, gutters, tab strip, zoom control, overlay and
+    // value-list items really did register listeners.
+    expect(listenedTypes((element) => element.hasAttribute('data-xlsx-viewport-input')))
+      .toEqual(new Set([
+        'scroll', 'contextmenu', 'pointerdown', 'pointermove', 'pointerup',
+        'pointercancel', 'wheel', 'pointerleave', 'focus', 'keydown',
+      ]));
+    expect(listenedTypes((element) => element.hasAttribute('data-xlsx-outline')))
+      .toEqual(new Set(['pointerdown']));
+    expect(listenedTypes((element) => element.tag === 'button').has('click')).toBe(true);
+    expect(listenedTypes((element) => element.tag === 'input')).toEqual(new Set(['input']));
+    expect(listenedTypes((element) => element.hasAttribute('data-xlsx-validation-item')))
+      .toEqual(new Set(['pointerenter', 'pointerleave']));
+    expect(listenedTypes((element) => element.hasAttribute('data-xlsx-validation-panel')))
+      .toEqual(new Set(['wheel']));
+    expect(mediaListeners.size).toBe(1);
+    expect(observers.some((observer) => observer.observing)).toBe(true);
+    expect(listenerCount()).toBeGreaterThan(0);
+
+    viewer.destroy();
+
+    expect(listenerCount()).toBe(0);
+    expect(doc.listenerCount('pointerdown')).toBe(0);
+    expect(doc.listenerCount('keydown')).toBe(0);
+    expect(mediaListeners.size).toBe(0);
+    expect(observers.filter((observer) => observer.observing)).toEqual([]);
+    expect(workbook.destroy).not.toHaveBeenCalled();
   });
 
   it('is safe to call destroy() twice', () => {

@@ -9,9 +9,11 @@ function recordingContext(width = 800, height = 400): {
   ctx: CanvasRenderingContext2D;
   fills: FillRectCall[];
   scales: Array<[number, number]>;
+  translations: Array<[number, number]>;
 } {
   const fills: FillRectCall[] = [];
   const scales: Array<[number, number]> = [];
+  const translations: Array<[number, number]> = [];
   const state: Record<string, unknown> = {
     canvas: { width, height },
     fillStyle: '#000000',
@@ -29,6 +31,9 @@ function recordingContext(width = 800, height = 400): {
     scale(x: number, y: number) {
       scales.push([x, y]);
     },
+    translate(x: number, y: number) {
+      translations.push([x, y]);
+    },
     createLinearGradient: () => ({ addColorStop: () => {} }),
   };
   const noOp = () => {};
@@ -41,7 +46,7 @@ function recordingContext(width = 800, height = 400): {
       return true;
     },
   });
-  return { ctx: ctx as unknown as CanvasRenderingContext2D, fills, scales };
+  return { ctx: ctx as unknown as CanvasRenderingContext2D, fills, scales, translations };
 }
 
 const STYLES: Styles = {
@@ -136,7 +141,7 @@ function chartBackground(rightToLeft: boolean) {
   );
   const fills = recording.fills.filter((call) => call.color === '#ABCDEF');
   expect(fills).toHaveLength(1);
-  return { background: fills[0], scales: recording.scales };
+  return { background: fills[0], scales: recording.scales, translations: recording.translations };
 }
 
 describe('RTL anchored chart rendering', () => {
@@ -146,6 +151,8 @@ describe('RTL anchored chart rendering', () => {
 
     expect(rtl.background.w).toBe(ltr.background.w);
     expect(rtl.background.h).toBe(ltr.background.h);
+    // The chart keeps its viewport rectangle; pattern phase is scoped
+    // separately so non-pattern chart geometry remains pixel-identical.
     expect(rtl.background.x).toBeCloseTo(800 - ltr.background.x - ltr.background.w);
   });
 

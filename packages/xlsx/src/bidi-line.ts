@@ -8,11 +8,8 @@
 // intra-run bidi.
 
 import {
-  getDefaultBidiEngine,
   resolveBaseDirection,
   hasStrongRtl,
-  OBJECT_PLACEHOLDER,
-  buildVisualOrder,
 } from '@silurus/ooxml-core';
 
 /**
@@ -25,22 +22,7 @@ export function cellBaseRtl(readingOrder: number | undefined, text: string): boo
   return resolveBaseDirection(undefined, text) === 'rtl';
 }
 
-/** A laid-out segment as seen here: only its optional text matters for bidi.
- *  Typed as `unknown` element so the renderer's LayoutSeg union (whose image /
- *  math / tab members carry no `text`) assigns cleanly. */
-const segText = (s: unknown): string | undefined => {
-  const t = (s as { text?: unknown }).text;
-  return typeof t === 'string' ? t : undefined;
-};
-
-/** Cheap test: does this run of segments contain any strong-RTL character? */
-export function segmentsHaveRtl(segments: readonly unknown[]): boolean {
-  for (const s of segments) {
-    const t = segText(s);
-    if (t !== undefined && hasStrongRtl(t)) return true;
-  }
-  return false;
-}
+import { computeSegmentLineVisualOrder, segmentLineHasRtl, type SegmentLineVisualOrder } from '@silurus/ooxml-core/internal/bidi-line';
 
 /**
  * Resolve whether one cell line / paragraph needs the bidi pass and its base
@@ -59,43 +41,9 @@ export function resolveCellBidi(
   return { needBidi, baseRtl: needBidi && cellBaseRtl(readingOrder, text) };
 }
 
-export interface LineVisualOrder {
-  /** Logical segment indices in visual (left-to-right) order. */
-  order: number[];
-  /** Per-LOGICAL-index resolved direction (true = RTL) for `ctx.direction`. */
-  rtl: boolean[];
-}
-
-/**
- * Compute the visual draw order of a line's segments under `baseRtl`. Text
- * segments contribute their text; non-text segments contribute one neutral
- * placeholder so they take the surrounding direction. Each segment is assigned
- * the embedding level of its first code unit (segments are single-script in
- * practice because they are space-split); Canvas resolves any residual
- * intra-segment bidi when the slice is drawn with the matching `ctx.direction`.
- */
-export function computeLineVisualOrder(
-  segments: readonly unknown[],
-  baseRtl: boolean,
-): LineVisualOrder {
-  const n = segments.length;
-  if (n === 0) return { order: [], rtl: [] };
-
-  let full = '';
-  const segStart: number[] = new Array(n);
-  for (let i = 0; i < n; i++) {
-    segStart[i] = full.length;
-    const t = segText(segments[i]) ?? '';
-    full += t.length > 0 ? t : OBJECT_PLACEHOLDER;
-  }
-
-  const { levels, paragraphLevel } = getDefaultBidiEngine().computeLevels(
-    full,
-    baseRtl ? 'rtl' : 'ltr',
-  );
-
-  const { order, segLevels } = buildVisualOrder(levels, paragraphLevel, segStart);
-  const rtl: boolean[] = new Array(n);
-  for (let i = 0; i < n; i++) rtl[i] = (segLevels[i] & 1) === 1;
-  return { order, rtl };
-}
+export type LineVisualOrder = SegmentLineVisualOrder;
+export const segmentsHaveRtl = (segments: readonly unknown[]): boolean =>
+  segmentLineHasRtl(segments);
+export const computeLineVisualOrder = (
+  segments: readonly unknown[], baseRtl: boolean,
+): LineVisualOrder => computeSegmentLineVisualOrder(segments, baseRtl);

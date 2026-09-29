@@ -4,7 +4,6 @@ import {
   attachDocumentLayoutVariants,
   selectDocumentLayoutPage,
 } from './layout/document-layout-variants.js';
-import { layoutOptionsKey } from './layout/options.js';
 import { layoutVariantStoreOf } from './layout/runtime-state.js';
 import type { DocumentLayout, LayoutServices } from './layout/types.js';
 import { ensureDocumentLayoutVariants } from './layout/document.js';
@@ -54,7 +53,12 @@ describe('document canonical layout variants', () => {
     }, 0);
 
     expect(selected.options).toEqual({ currentDateMs: 20 });
-    expect(selected.key).toBe(layoutOptionsKey(selected.options, services));
+    expect(selected.key).toBe(selectDocumentLayoutPage(services, {
+      currentDate: 20, defaultCurrentDateMs: 10,
+    }, 0).key);
+    expect(selected.key).not.toBe(selectDocumentLayoutPage(services, {
+      defaultCurrentDateMs: 10,
+    }, 0).key);
     expect(selected.page).toBe(selected.layout.pages[0]);
     expect(() => selectDocumentLayoutPage({ ...services }, {
       currentDate: 20, defaultCurrentDateMs: 10,

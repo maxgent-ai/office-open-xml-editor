@@ -20,77 +20,44 @@
 
 use crate::ns::is_a_ns;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::BTreeMap;
 use std::sync::Arc;
+
+type NamespaceDeclarations = Arc<[(Option<String>, Arc<str>)]>;
 
 /// One style-matrix entry retained for on-demand self-contained XML.
 ///
 /// A theme entry may use namespace prefixes declared only on `<a:theme>`
 /// (including extension namespaces such as `a14`). Keeping only the source
 /// range of `<a:ln>`/`<a:solidFill>` therefore produces an invalid fragment.
-/// This descriptor keeps the entry bytes and only the namespace prefixes the
-/// fragment actually references; namespace URIs are shared across entries.
-/// Consumers can therefore build a valid temporary wrapper without multiplying
-/// every root namespace by every style-matrix entry.
+/// This descriptor keeps the entry bytes and the parent style list's in-scope
+/// namespaces. The entry bytes contain declarations on the entry and its
+/// descendants. Prefixes can be any valid XML NCName, so scanning the bytes
+/// as ASCII would lose valid declarations. Sharing each list's parent scope
+/// keeps retained memory linear even when every entry declares a unique prefix.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StandaloneThemeStyleXml {
     fragment: String,
-    namespaces: Vec<(Option<String>, Arc<str>)>,
+    namespaces: NamespaceDeclarations,
 }
 
 impl StandaloneThemeStyleXml {
     fn from_node(
         node: roxmltree::Node<'_, '_>,
         source: &str,
-        namespace_pool: &mut HashMap<String, Arc<str>>,
+        namespaces: &NamespaceDeclarations,
     ) -> Self {
-        let fragment = source[node.range()].to_owned();
-        let mut prefixes = BTreeSet::new();
-        let bytes = fragment.as_bytes();
-        for colon in bytes
-            .iter()
-            .enumerate()
-            .filter_map(|(index, byte)| (*byte == b':').then_some(index))
-        {
-            let mut start = colon;
-            while start > 0 && is_xml_name_byte(bytes[start - 1]) {
-                start -= 1;
-            }
-            if start < colon {
-                prefixes.insert(fragment[start..colon].to_owned());
-            }
-        }
-
-        let intern = |uri: &str, pool: &mut HashMap<String, Arc<str>>| {
-            pool.entry(uri.to_owned())
-                .or_insert_with(|| Arc::<str>::from(uri))
-                .clone()
-        };
-        let mut namespaces = Vec::with_capacity(prefixes.len() + 1);
-        if let Some(uri) = node.lookup_namespace_uri(None) {
-            namespaces.push((None, intern(uri, namespace_pool)));
-        }
-        for prefix in prefixes {
-            if prefix == "xml" {
-                continue;
-            }
-            if let Some(uri) = node.lookup_namespace_uri(Some(&prefix)) {
-                namespaces.push((Some(prefix), intern(uri, namespace_pool)));
-            }
-        }
         Self {
-            fragment,
-            namespaces,
+            fragment: source[node.range()].to_owned(),
+            namespaces: Arc::clone(namespaces),
         }
     }
 
-    /// Build a self-contained wrapper on demand. Namespace URIs are interned
-    /// across all entries and only prefixes referenced by this fragment are
-    /// retained, so parsing a theme cannot expand O(namespaces × entries) in
-    /// memory. The temporary wrapper lives only for the caller's DOM parse.
+    /// Build a self-contained wrapper on demand. The temporary wrapper lives
+    /// only for the caller's DOM parse.
     pub fn to_xml(&self) -> String {
         let mut xml = String::from("<themeStyleRoot");
-        for (prefix, uri) in &self.namespaces {
+        for (prefix, uri) in self.namespaces.iter() {
             match prefix {
                 Some(prefix) => {
                     xml.push_str(" xmlns:");
@@ -107,10 +74,6 @@ impl StandaloneThemeStyleXml {
         xml.push_str("</themeStyleRoot>");
         xml
     }
-}
-
-fn is_xml_name_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')
 }
 
 /// Result of resolving a style-matrix index. `NoStyle` is an authored sentinel
@@ -152,19 +115,31 @@ impl ThemeFormatScheme {
             return Self::default();
         };
 
-        let mut namespace_pool = HashMap::new();
-        let mut collect = |list_name: &str| -> Vec<StandaloneThemeStyleXml> {
-            format_scheme
-                .children()
-                .find(|node| {
-                    node.is_element()
-                        && node.tag_name().name() == list_name
-                        && is_a_ns(node.tag_name().namespace())
+        let collect = |list_name: &str| -> Vec<StandaloneThemeStyleXml> {
+            let Some(list) = format_scheme.children().find(|node| {
+                node.is_element()
+                    && node.tag_name().name() == list_name
+                    && is_a_ns(node.tag_name().namespace())
+            }) else {
+                return Vec::new();
+            };
+            // CT_StyleMatrix has four lists. The list's inherited scope is
+            // shared by its entries; declarations on an entry stay in its
+            // source fragment and override this wrapper scope as XML requires.
+            let namespaces: NamespaceDeclarations = list
+                .namespaces()
+                .filter(|namespace| namespace.name() != Some("xml"))
+                .map(|namespace| {
+                    (
+                        namespace.name().map(str::to_owned),
+                        Arc::<str>::from(namespace.uri()),
+                    )
                 })
-                .into_iter()
-                .flat_map(|list| list.children())
+                .collect::<Vec<_>>()
+                .into();
+            list.children()
                 .filter(|node| node.is_element() && is_a_ns(node.tag_name().namespace()))
-                .map(|node| StandaloneThemeStyleXml::from_node(node, xml, &mut namespace_pool))
+                .map(|node| StandaloneThemeStyleXml::from_node(node, xml, &namespaces))
                 .collect()
         };
 
@@ -301,10 +276,10 @@ fn color_node_hex(node: roxmltree::Node<'_, '_>) -> Option<String> {
     }
 }
 
-/// The parsed `<a:fontScheme>`: the major (heading) and minor (body) typeface
-/// for each script axis. Stored as owned strings; a script with no `typeface`
-/// (or an empty one) is `None`. Each parser maps these onto its own key format
-/// (pptx `+mj-lt`, docx `major/latin`, …) in its adapter.
+/// The parsed `<a:fontScheme>`: major (heading) and minor (body) typefaces.
+/// ECMA-376 `CT_FontCollection` has the latin/ea/cs axes followed by zero or
+/// more `CT_SupplementalFont` entries keyed by script. Each host maps these
+/// authored facts onto its own font-selection policy.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThemeFonts {
@@ -314,19 +289,48 @@ pub struct ThemeFonts {
     pub minor: ThemeFontGroup,
 }
 
-/// The three script typefaces of one font group (`<a:majorFont>` or
-/// `<a:minorFont>`): Latin (`<a:latin>`), East-Asian (`<a:ea>`) and
-/// complex-script (`<a:cs>`). Empty `typeface=""` (common for `ea`/`cs`) is
-/// normalized to `None`.
+/// One `<a:majorFont>` or `<a:minorFont>` collection. Empty `typeface=""`
+/// (common for `ea`/`cs`) is normalized to `None` or omitted from the
+/// supplemental list. Supplemental entries retain source order so malformed
+/// duplicate script mappings are not silently resolved by parse order.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThemeFontGroup {
     pub latin: Option<String>,
     pub ea: Option<String>,
     pub cs: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supplemental: Vec<ThemeSupplementalFont>,
+}
+
+/// ECMA-376 `CT_SupplementalFont`: an authored script-to-typeface association.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThemeSupplementalFont {
+    pub script: String,
+    pub typeface: String,
+}
+
+impl ThemeFontGroup {
+    /// Return a unique supplemental face for `script`. A conflicting duplicate
+    /// is ambiguous input and must not be converted into a font-selection rule.
+    pub fn typeface_for_script(&self, script: &str) -> Option<&str> {
+        let mut selected = None;
+        for font in self
+            .supplemental
+            .iter()
+            .filter(|font| font.script == script)
+        {
+            match selected {
+                Some(previous) if previous != font.typeface => return None,
+                Some(_) => {}
+                None => selected = Some(font.typeface.as_str()),
+            }
+        }
+        selected
+    }
 }
 
 impl ThemeFonts {
-    /// Parse the `<a:fontScheme>` (major + minor × latin/ea/cs). Missing scheme
+    /// Parse the `<a:fontScheme>` collections. Missing scheme
     /// or malformed XML yields all-`None`.
     pub fn parse(xml: &str) -> Self {
         let Ok(doc) = crate::depth::parse_guarded(xml) else {
@@ -365,6 +369,18 @@ fn parse_font_group(scheme: roxmltree::Node<'_, '_>, group_name: &str) -> ThemeF
         latin: read("latin"),
         ea: read("ea"),
         cs: read("cs"),
+        supplemental: group
+            .children()
+            .filter(|n| n.is_element() && n.tag_name().name() == "font")
+            .filter_map(|n| {
+                let script = n.attribute("script").filter(|s| !s.is_empty())?;
+                let typeface = n.attribute("typeface").filter(|s| !s.is_empty())?;
+                Some(ThemeSupplementalFont {
+                    script: script.to_owned(),
+                    typeface: typeface.to_owned(),
+                })
+            })
+            .collect(),
     }
 }
 
@@ -807,6 +823,39 @@ mod tests {
     }
 
     #[test]
+    fn font_scheme_preserves_supplemental_scripts_and_rejects_ambiguous_duplicates() {
+        // ECMA-376 CT_FontCollection permits repeated CT_SupplementalFont
+        // children. Preserve their order while avoiding an arbitrary winner.
+        let xml = r#"<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+          <a:themeElements><a:fontScheme name="Test">
+            <a:majorFont><a:latin typeface="Heading"/><a:ea typeface=""/><a:cs typeface=""/>
+              <a:font script="Jpan" typeface="Yu Gothic"/>
+              <a:font script="Arab" typeface="Arabic Face"/>
+              <a:font script="Jpan" typeface="Yu Gothic"/>
+              <a:font script="" typeface="Ignored"/>
+              <a:font script="Hani" typeface=""/>
+            </a:majorFont>
+            <a:minorFont><a:latin typeface="Body"/><a:ea typeface=""/><a:cs typeface=""/>
+              <a:font script="Jpan" typeface="Yu Gothic"/>
+              <a:font script="Jpan" typeface="Meiryo"/>
+            </a:minorFont>
+          </a:fontScheme></a:themeElements>
+        </a:theme>"#;
+        let fonts = ThemeFonts::parse(xml);
+        assert_eq!(fonts.major.supplemental.len(), 3);
+        assert_eq!(fonts.major.supplemental[0].script, "Jpan");
+        assert_eq!(fonts.major.typeface_for_script("Jpan"), Some("Yu Gothic"));
+        assert_eq!(fonts.major.typeface_for_script("Arab"), Some("Arabic Face"));
+        assert_eq!(fonts.major.typeface_for_script("Hani"), None);
+        assert_eq!(fonts.minor.supplemental.len(), 2);
+        assert_eq!(fonts.minor.typeface_for_script("Jpan"), None);
+        assert_eq!(fonts.minor.typeface_for_script("Arab"), None);
+        let round_trip: ThemeFonts =
+            serde_json::from_str(&serde_json::to_string(&fonts).unwrap()).unwrap();
+        assert_eq!(round_trip, fonts);
+    }
+
+    #[test]
     fn format_scheme_preserves_in_scope_namespaces_and_lookup_semantics() {
         const XML: &str = r#"<a:theme
           xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
@@ -867,28 +916,57 @@ mod tests {
     }
 
     #[test]
-    fn format_scheme_does_not_copy_unused_root_namespaces_into_every_entry() {
-        let unused = (0..128)
-            .map(|index| {
-                format!(
-                    r#" xmlns:u{index}="urn:unused:{index}:{}""#,
-                    "x".repeat(128)
-                )
-            })
-            .collect::<String>();
-        let xml = format!(
-            r#"<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"{unused}><a:themeElements><a:fmtScheme name="bounded"><a:lnStyleLst><a:ln/><a:ln/></a:lnStyleLst></a:fmtScheme></a:themeElements></a:theme>"#
+    fn format_scheme_keeps_unicode_and_unused_in_scope_namespaces() {
+        let xml = r#"<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+          xmlns:関係="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+          xmlns:érel="urn:extension" xmlns:unused="urn:unused">
+          <a:themeElements><a:fmtScheme name="Unicode">
+            <a:fillStyleLst><a:blipFill><a:blip 関係:embed="rId1" érel:flag="yes"/></a:blipFill></a:fillStyleLst>
+          </a:fmtScheme></a:themeElements>
+        </a:theme>"#;
+        let scheme = ThemeFormatScheme::parse(xml);
+        let StyleMatrixLookup::Entry(entry) = scheme.lookup_fill_ref(1) else {
+            panic!("fill style should exist");
+        };
+        let standalone = entry.to_xml();
+        let parsed = roxmltree::Document::parse(&standalone).expect("all prefixes remain bound");
+        let blip = parsed
+            .descendants()
+            .find(|node| node.tag_name().name() == "blip")
+            .unwrap();
+        assert_eq!(
+            blip.attribute((
+                "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+                "embed"
+            )),
+            Some("rId1")
         );
-        let scheme = ThemeFormatScheme::parse(&xml);
-        for index in [1, 2] {
-            let StyleMatrixLookup::Entry(entry) = scheme.lookup_line_ref(index) else {
-                panic!("line style should exist");
-            };
-            let standalone = entry.to_xml();
-            assert!(standalone.contains("xmlns:a="));
-            assert!(!standalone.contains("urn:unused"));
-            roxmltree::Document::parse(&standalone).expect("bounded wrapper parses");
-        }
+        assert!(standalone.contains("xmlns:unused=\"urn:unused\""));
+    }
+
+    #[test]
+    fn format_scheme_keeps_list_scope_and_entry_local_rebinding() {
+        let xml = r#"<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+          xmlns:関係="urn:ancestor">
+          <a:themeElements><a:fmtScheme name="Bindings">
+            <a:fillStyleLst xmlns:érel="urn:list">
+              <a:solidFill xmlns:関係="urn:entry"><a:srgbClr val="123456" 関係:flag="yes" érel:mark="ok"/></a:solidFill>
+            </a:fillStyleLst>
+          </a:fmtScheme></a:themeElements>
+        </a:theme>"#;
+        let scheme = ThemeFormatScheme::parse(xml);
+        let StyleMatrixLookup::Entry(entry) = scheme.lookup_fill_ref(1) else {
+            panic!("fill style should exist");
+        };
+        let standalone = entry.to_xml();
+        let parsed = roxmltree::Document::parse(&standalone).expect("all prefixes remain bound");
+        let color = parsed
+            .descendants()
+            .find(|node| node.tag_name().name() == "srgbClr")
+            .unwrap();
+        assert_eq!(color.attribute(("urn:entry", "flag")), Some("yes"));
+        assert_eq!(color.attribute(("urn:list", "mark")), Some("ok"));
+        assert_eq!(color.attribute(("urn:ancestor", "flag")), None);
     }
 
     #[test]

@@ -129,6 +129,9 @@ pub(crate) fn parse_drawing_anchors(
         let mut svg_rid: Option<String> = None;
         let mut native_ext_cx: i64 = 0;
         let mut native_ext_cy: i64 = 0;
+        let mut rotation = None;
+        let mut flip_h = None;
+        let mut flip_v = None;
         // ECMA-376 §20.1.8.55 `<a:srcRect>` source-image crop (None ⇒ uncropped).
         let mut src_rect: Option<SrcRect> = None;
         // ECMA-376 §20.1.8.6 `<a:alphaModFix>` opacity (None ⇒ opaque) and
@@ -217,6 +220,18 @@ pub(crate) fn parse_drawing_anchors(
                         if let Some(xfrm_n) = sp_pr.children().find(|n| {
                             n.tag_name().name() == "xfrm" && is_a_ns(n.tag_name().namespace())
                         }) {
+                            // CT_Transform2D permits xfrm without an ext. The
+                            // anchor still supplies the destination bounds, so
+                            // preserve its independent transform attributes.
+                            rotation = xfrm_n
+                                .attribute("rot")
+                                .and_then(|value| value.parse::<i32>().ok())
+                                .filter(|value| *value != 0)
+                                .map(|value| value as f64 / 60000.0);
+                            flip_h = matches!(xfrm_n.attribute("flipH"), Some("1") | Some("true"))
+                                .then_some(true);
+                            flip_v = matches!(xfrm_n.attribute("flipV"), Some("1") | Some("true"))
+                                .then_some(true);
                             if let Some(xfrm) = parse_xfrm(&xfrm_n) {
                                 native_ext_cx = xfrm.ext_x as i64;
                                 native_ext_cy = xfrm.ext_y as i64;
@@ -276,6 +291,9 @@ pub(crate) fn parse_drawing_anchors(
             edit_as,
             native_ext_cx,
             native_ext_cy,
+            rotation,
+            flip_h,
+            flip_v,
             image_path,
             mime_type,
             svg_image_path,
@@ -748,6 +766,8 @@ fn parse_custom_paths(
             PathInfo {
                 w: path.width,
                 h: path.height,
+                fill: path.fill,
+                stroke: path.stroke,
                 commands,
             }
         })
@@ -908,7 +928,11 @@ pub(crate) fn parse_tx_body(
                 let mut mar_l: Option<i64> = None;
                 let mut mar_r: Option<i64> = None;
                 let mut indent: Option<i64> = None;
+                let mut def_tab_sz: Option<i64> = None;
+                let mut tab_stops: Vec<ShapeTabStop> = Vec::new();
                 let mut space_line: Option<SpaceLine> = None;
+                let mut space_before: Option<SpaceLine> = None;
+                let mut space_after: Option<SpaceLine> = None;
                 let mut runs: Vec<ShapeTextRun> = Vec::new();
                 for pc in c.children().filter(|n| n.is_element()) {
                     match pc.tag_name().name() {
@@ -929,6 +953,24 @@ pub(crate) fn parse_tx_body(
                             mar_l = pc.attribute("marL").and_then(|v| v.parse().ok());
                             mar_r = pc.attribute("marR").and_then(|v| v.parse().ok());
                             indent = pc.attribute("indent").and_then(|v| v.parse().ok());
+                            def_tab_sz = pc.attribute("defTabSz").and_then(|v| v.parse().ok());
+                            tab_stops = pc
+                                .children()
+                                .find(|n| n.is_element() && n.tag_name().name() == "tabLst")
+                                .into_iter()
+                                .flat_map(|list| {
+                                    list.children()
+                                        .filter(|n| n.is_element() && n.tag_name().name() == "tab")
+                                })
+                                .filter_map(|tab| {
+                                    tab.attribute("pos")?.parse::<i64>().ok().map(|pos| {
+                                        ShapeTabStop {
+                                            pos,
+                                            algn: tab.attribute("algn").unwrap_or("l").to_string(),
+                                        }
+                                    })
+                                })
+                                .collect();
                             // ECMA-376 §21.1.2.2.5 `<a:lnSpc>`: spcPct is a
                             // percentage of the natural single line; spcPts is an
                             // absolute per-line height (raw @val is hundredths of
@@ -938,6 +980,19 @@ pub(crate) fn parse_tx_body(
                                 .find(|n| n.is_element() && n.tag_name().name() == "lnSpc")
                             {
                                 space_line = ooxml_common::text::parse_lnspc(ln_spc);
+                            }
+                            // §21.1.2.2.10 `<a:spcBef>` / §21.1.2.2.9 `<a:spcAft>`
+                            // share lnSpc's CT_TextSpacing grammar (spcPct |
+                            // spcPts), so the same parser applies.
+                            for (tag, slot) in
+                                [("spcBef", &mut space_before), ("spcAft", &mut space_after)]
+                            {
+                                if let Some(node) = pc
+                                    .children()
+                                    .find(|n| n.is_element() && n.tag_name().name() == tag)
+                                {
+                                    *slot = ooxml_common::text::parse_lnspc(node);
+                                }
                             }
                         }
                         "r" => {
@@ -1027,7 +1082,11 @@ pub(crate) fn parse_tx_body(
                         mar_l,
                         mar_r,
                         indent,
+                        def_tab_sz,
+                        tab_stops,
                         space_line,
+                        space_before,
+                        space_after,
                         runs,
                     });
                 }
@@ -2242,6 +2301,9 @@ pub(crate) fn parse_ole_object_anchors(
             edit_as: Some("twoCell".to_string()),
             native_ext_cx: 0,
             native_ext_cy: 0,
+            rotation: None,
+            flip_h: None,
+            flip_v: None,
             image_path,
             mime_type,
             svg_image_path: None,
@@ -2472,6 +2534,27 @@ mod math_tests {
         );
     }
 
+    /// CT_TextParagraphProperties carries explicit tab geometry to the shared
+    /// DrawingML line breaker. A dropped stop would fall back to the 1-inch grid.
+    #[test]
+    fn parses_shape_paragraph_tab_geometry() {
+        let xml = format!(
+            r#"<xdr:txBody {NS}>
+              <a:p>
+                <a:pPr defTabSz="457200"><a:tabLst><a:tab pos="3200400" algn="l"/></a:tabLst></a:pPr>
+                <a:r><a:t>Label&#9;Value</a:t></a:r>
+              </a:p>
+            </xdr:txBody>"#
+        );
+        let doc = roxmltree::Document::parse(&xml).unwrap();
+        let text = parse_tx_body(&doc.root_element(), &[]).expect("txBody parses");
+        let p = &text.paragraphs[0];
+        assert_eq!(p.def_tab_sz, Some(457200));
+        assert_eq!(p.tab_stops.len(), 1);
+        assert_eq!(p.tab_stops[0].pos, 3200400);
+        assert_eq!(p.tab_stops[0].algn, "l");
+    }
+
     /// Absent indent attributes (or absent `<a:pPr>` entirely) leave all three
     /// fields `None` so the JSON output stays byte-identical (additive).
     #[test]
@@ -2523,7 +2606,9 @@ mod math_tests {
                 <a:r><a:t>pct</a:t></a:r>
               </a:p>
               <a:p>
-                <a:pPr><a:lnSpc><a:spcPts val="1800"/></a:lnSpc></a:pPr>
+                <a:pPr><a:lnSpc><a:spcPts val="1800"/></a:lnSpc>
+                  <a:spcBef><a:spcPts val="1200"/></a:spcBef>
+                  <a:spcAft><a:spcPct val="50000"/></a:spcAft></a:pPr>
                 <a:r><a:t>pts</a:t></a:r>
               </a:p>
             </xdr:txBody>"#
@@ -2540,6 +2625,12 @@ mod math_tests {
         assert_eq!(vp1["spaceLine"]["type"], "pts");
         // 1800 hundredths of a point → 18 pt.
         assert_eq!(vp1["spaceLine"]["val"], 18.0);
+        // spcBef / spcAft (§21.1.2.2.10 / .9) use the same CT_TextSpacing JSON.
+        assert_eq!(vp1["spaceBefore"]["type"], "pts");
+        assert_eq!(vp1["spaceBefore"]["val"], 12.0);
+        assert_eq!(vp1["spaceAfter"]["type"], "pct");
+        assert_eq!(vp1["spaceAfter"]["val"], 50000.0);
+        assert!(vp0.get("spaceBefore").is_none() && vp0.get("spaceAfter").is_none());
     }
 
     /// `<a:bodyPr>/<a:normAutofit>` (ECMA-376 §21.1.2.1.3): autoFit="norm" plus
@@ -3677,6 +3768,57 @@ mod blip_svg_tests {
         assert!(json.contains("\"srcRect\""), "emits srcRect: {json}");
     }
 
+    /// Part 1 §20.1.7.6 (`xfrm`, CT_Transform2D) and §20.1.10.3 ST_Angle: `rot` uses
+    /// signed 60000ths of a degree while flips are independent booleans. The
+    /// transform remains meaningful when optional `ext` is absent because the
+    /// spreadsheet anchor supplies the painted rectangle.
+    #[test]
+    fn picture_xfrm_preserves_rotation_and_flips_without_extent() {
+        let mut rels = HashMap::new();
+        rels.insert("rIdPng".to_string(), "../media/image1.png".to_string());
+        let xml = drawing_xml(r#"<a:blip r:embed="rIdPng"/>"#).replace(
+            "<a:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"300000\" cy=\"300000\"/></a:xfrm>",
+            "<a:xfrm rot=\"-5400000\" flipH=\"true\" flipV=\"1\"><a:off x=\"0\" y=\"0\"/></a:xfrm>",
+        );
+        let data = build_media_zip(PNG_1X1, SVG);
+        let mut archive = crate::XlsxZip::new(Cursor::new(data)).unwrap();
+        let anchor = parse_drawing_anchors(&xml, &rels, "xl/drawings", &mut archive, &[])
+            .into_iter()
+            .next()
+            .unwrap();
+
+        assert_eq!(anchor.native_ext_cx, 0);
+        assert_eq!(anchor.native_ext_cy, 0);
+        assert_eq!(anchor.rotation, Some(-90.0));
+        assert_eq!(anchor.flip_h, Some(true));
+        assert_eq!(anchor.flip_v, Some(true));
+    }
+
+    #[test]
+    fn picture_xfrm_omits_identity_and_rejects_non_integer_rotation() {
+        let mut rels = HashMap::new();
+        rels.insert("rIdPng".to_string(), "../media/image1.png".to_string());
+        for rot in ["0", "NaN", "inf", "5400000.5", "2147483648"] {
+            let xml = drawing_xml(r#"<a:blip r:embed="rIdPng"/>"#).replace(
+                "<a:xfrm>",
+                &format!("<a:xfrm rot=\"{rot}\" flipH=\"false\" flipV=\"0\">"),
+            );
+            let data = build_media_zip(PNG_1X1, SVG);
+            let mut archive = crate::XlsxZip::new(Cursor::new(data)).unwrap();
+            let anchor = parse_drawing_anchors(&xml, &rels, "xl/drawings", &mut archive, &[])
+                .into_iter()
+                .next()
+                .unwrap();
+            assert_eq!(anchor.rotation, None, "rot={rot}");
+            assert_eq!(anchor.flip_h, None);
+            assert_eq!(anchor.flip_v, None);
+            let json = serde_json::to_string(&anchor).unwrap();
+            assert!(!json.contains("rotation"), "rot={rot}: {json}");
+            assert!(!json.contains("flipH"), "rot={rot}: {json}");
+            assert!(!json.contains("flipV"), "rot={rot}: {json}");
+        }
+    }
+
     /// An uncropped `<xdr:pic>` (no `<a:srcRect>`) leaves `src_rect == None`, and
     /// the serialized JSON omits the key entirely (skip_serializing_if), so the
     /// common case stays on the cheap full-blip draw path.
@@ -3769,6 +3911,9 @@ mod blip_svg_tests {
             edit_as: Some("oneCell".to_string()),
             native_ext_cx: 300000,
             native_ext_cy: 200000,
+            rotation: None,
+            flip_h: None,
+            flip_v: None,
             image_path: "xl/media/image1.png".to_string(),
             mime_type: "image/png".to_string(),
             svg_image_path: Some("xl/media/image2.svg".to_string()),
@@ -3812,6 +3957,38 @@ mod custom_path_arc_tests {
     use super::*;
 
     const NS: &str = r#"xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main""#;
+
+    /// ECMA-376 §20.1.9.15: `a:path@fill` and `@stroke` are carried per path;
+    /// the defaults (`norm`, stroked) are omitted from the wire model.
+    #[test]
+    fn custom_paths_carry_fill_mode_and_stroke_flag() {
+        let xml = format!(
+            r#"<a:custGeom {NS}><a:pathLst>
+                 <a:path w="10" h="10"><a:moveTo><a:pt x="0" y="0"/></a:moveTo></a:path>
+                 <a:path w="10" h="10" fill="none"><a:moveTo><a:pt x="0" y="0"/></a:moveTo></a:path>
+                 <a:path w="10" h="10" fill="darkenLess" stroke="0"><a:moveTo><a:pt x="0" y="0"/></a:moveTo></a:path>
+               </a:pathLst></a:custGeom>"#
+        );
+        let doc = roxmltree::Document::parse(&xml).unwrap();
+        let json: Vec<_> = parse_custom_paths(doc.root_element(), 10.0, 10.0)
+            .iter()
+            .map(|path| {
+                let value = serde_json::to_value(path).unwrap();
+                (value.get("fill").cloned(), value.get("stroke").cloned())
+            })
+            .collect();
+        assert_eq!(
+            json,
+            vec![
+                (None, None),
+                (Some(serde_json::json!("none")), None),
+                (
+                    Some(serde_json::json!("darkenLess")),
+                    Some(serde_json::json!(false))
+                ),
+            ]
+        );
+    }
 
     /// `PathCmd`'s enum-level `rename_all = "camelCase"` (tag = "op") renames
     /// only the variant tags, not the fields. Without a per-variant

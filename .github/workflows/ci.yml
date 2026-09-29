@@ -144,6 +144,15 @@ jobs:
           node scripts/check-docx-layout-boundaries.mjs --final
           pnpm check:docx-compatibility
 
+      - name: Core legacy boundary
+        run: |
+          node --test scripts/check-core-legacy-boundary.test.mjs
+          pnpm check:core-legacy-boundary
+          node --test scripts/check-model-source-lazy-graph.test.mjs
+          node --test scripts/check-model-source-lazy-runtime.test.mjs
+          node --test scripts/check-model-source-ooxml-path.test.mjs
+          pnpm check:model-source-ooxml-path
+
       # The WASM parsers are git-ignored build output; the TypeScript packages
       # import their generated .d.ts/.js, so typecheck requires building them first.
       - name: Build WASM
@@ -171,6 +180,8 @@ jobs:
       - name: Public API compatibility
         run: |
           pnpm build
+          pnpm check:model-source-lazy-graph --packages
+          pnpm check:model-source-lazy-runtime
           pnpm check:production-render-workers
           pnpm check:optional-chart-ex
           pnpm check:optional-tiff
@@ -275,6 +286,8 @@ jobs:
           # compatibility has its own clean-build job; avoiding a second
           # rolldown-plugin-dts invocation also keeps this browser job focused.
           pnpm build:runtime
+          pnpm check:model-source-lazy-graph
+          pnpm check:model-source-lazy-runtime
           pnpm check:production-render-workers
           pnpm test:production-render-workers
 

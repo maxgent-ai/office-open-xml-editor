@@ -414,6 +414,29 @@ type FontMetricSnapshot = Readonly<Record<string, Readonly<ResolvedFontMetric>>>
   readonly [FONT_METRIC_SNAPSHOT]: true;
 };
 
+function snapshotUnicodeRanges(
+  ranges: readonly (readonly [number, number])[],
+): readonly (readonly [number, number])[] {
+  if (ranges.length > 32_768) throw new RangeError('Font cmap coverage has too many ranges');
+  const sorted = ranges.map(([start, end]) => {
+    if (!Number.isInteger(start) || !Number.isInteger(end)
+      || start < 0 || end > 0x10ffff || start > end) {
+      throw new RangeError('Font cmap coverage contains an invalid range');
+    }
+    return [start, end] as const;
+  }).sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  const merged: Array<readonly [number, number]> = [];
+  for (const [start, end] of sorted) {
+    const last = merged[merged.length - 1];
+    if (last && start <= last[1] + 1) {
+      merged[merged.length - 1] = [last[0], Math.max(last[1], end)];
+    } else {
+      merged.push([start, end]);
+    }
+  }
+  return Object.freeze(merged.map((range) => Object.freeze(range)));
+}
+
 /** Copy successful face routes once at the document boundary. The brand lets
  * downstream services share the same deeply frozen object without retaining
  * caller-owned mutable records. */
@@ -428,6 +451,14 @@ export function snapshotFontMetrics(
         && (!Number.isFinite(metric.lineHeightRatio) || metric.lineHeightRatio < 0)) {
         throw new RangeError(`Font metric ${key} lineHeightRatio must be finite and non-negative`);
       }
+      if (metric.designAscentRatio !== undefined
+        && (!Number.isFinite(metric.designAscentRatio) || metric.designAscentRatio < 0)) {
+        throw new RangeError(`Font metric ${key} designAscentRatio must be finite and non-negative`);
+      }
+      if (metric.designDescentRatio !== undefined
+        && (!Number.isFinite(metric.designDescentRatio) || metric.designDescentRatio < 0)) {
+        throw new RangeError(`Font metric ${key} designDescentRatio must be finite and non-negative`);
+      }
       if (metric.eastAsianLineHeightRatio !== undefined
         && (!Number.isFinite(metric.eastAsianLineHeightRatio) || metric.eastAsianLineHeightRatio < 0)) {
         throw new RangeError(`Font metric ${key} eastAsianLineHeightRatio must be finite and non-negative`);
@@ -436,6 +467,10 @@ export function snapshotFontMetrics(
         && (!Number.isFinite(metric.fontBoxRatio) || metric.fontBoxRatio <= 0)) {
         throw new RangeError(`Font metric ${key} fontBoxRatio must be finite and positive`);
       }
+      if (metric.averageCharWidthRatio !== undefined
+        && (!Number.isFinite(metric.averageCharWidthRatio) || metric.averageCharWidthRatio <= 0)) {
+        throw new RangeError(`Font metric ${key} averageCharWidthRatio must be finite and positive`);
+      }
       if (metric.weight !== undefined
         && (!Number.isFinite(metric.weight) || metric.weight < 1 || metric.weight > 1000)) {
         throw new RangeError(`Font metric ${key} weight must be finite and between 1 and 1000`);
@@ -443,10 +478,18 @@ export function snapshotFontMetrics(
       const copy: ResolvedFontMetric = {
         family: metric.family,
         ...(metric.lineHeightRatio === undefined ? {} : { lineHeightRatio: metric.lineHeightRatio }),
+        ...(metric.designAscentRatio === undefined ? {} : { designAscentRatio: metric.designAscentRatio }),
+        ...(metric.designDescentRatio === undefined ? {} : { designDescentRatio: metric.designDescentRatio }),
         ...(metric.eastAsianLineHeightRatio === undefined
           ? {}
           : { eastAsianLineHeightRatio: metric.eastAsianLineHeightRatio }),
         ...(metric.fontBoxRatio === undefined ? {} : { fontBoxRatio: metric.fontBoxRatio }),
+        ...(metric.averageCharWidthRatio === undefined
+          ? {}
+          : { averageCharWidthRatio: metric.averageCharWidthRatio }),
+        ...(metric.unicodeRanges === undefined
+          ? {}
+          : { unicodeRanges: snapshotUnicodeRanges(metric.unicodeRanges) }),
         ...(metric.requestedFamily === undefined ? {} : { requestedFamily: metric.requestedFamily }),
         ...(metric.weight === undefined ? {} : { weight: metric.weight }),
         ...(metric.style === undefined ? {} : { style: metric.style }),
@@ -556,6 +599,16 @@ function requestedFamily(
   return request.fonts.ascii;
 }
 
+/** Upper bound on distinct font routes a text service keeps ordinals for;
+ * reaching it retires the ordinals together with the measurement cache. */
+export const TEXT_ROUTE_ORDINAL_LIMIT = 4096;
+const routeOrdinalTableSizes = new WeakMap<object, () => number>();
+
+/** Internal diagnostic: live route-ordinal entries held by a text service. */
+export function textRouteOrdinalTableSize(service: TextLayoutService): number | undefined {
+  return routeOrdinalTableSizes.get(service)?.();
+}
+
 /**
  * Shape per script span because ECMA-376 §17.3.2.26 selects rFonts slots per
  * Unicode character; choosing one family for an entire mixed-script run loses
@@ -607,23 +660,72 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
       style: request.style,
     });
   };
-  // Pagination convergence reacquires equal paragraphs under equal service
-  // fingerprints. Native Canvas metrics are pure for this complete request
-  // tuple, so retain one immutable document-scoped result across those passes.
+  // Pagination convergence and later view variants revisit text under the same
+  // service fingerprint. Keep recent pure results for those passes, but cap
+  // document lifetime retention after long documents finish paginating.
+  // The 295-page relayout probe used 33,024 distinct measurements and 73,436
+  // shapes; a smaller cap caused sequential variant layouts to thrash.
+  const measurementCacheLimit = 40960;
+  const shapeCacheLimit = 81920;
   const measurementCache = new Map<string, Readonly<GlyphMeasurement>>();
+  const cached = <T>(cache: Map<string, T>, key: string): T | undefined => {
+    const value = cache.get(key);
+    if (value !== undefined) {
+      cache.delete(key);
+      cache.set(key, value);
+    }
+    return value;
+  };
+  const retain = <T>(cache: Map<string, T>, key: string, value: T, limit: number): void => {
+    cache.set(key, value);
+    if (cache.size > limit) cache.delete(cache.keys().next().value as string);
+  };
+  // A route's identity is its (familyList, scope, fingerprint) triple. Spelling
+  // that triple into every measurement key made each retained key ~1.8 KB for
+  // a registered local face, so the measurement cache was dominated by copies
+  // of three distinct routes. Keys carry a service-scoped ordinal assigned
+  // one-to-one to the exact triple instead; the object map only skips
+  // re-deriving the ordinal for the shared resolver routes.
+  //
+  // The ordinal table must not outlive the bounded cache it serves: a document
+  // with ever-new routes would otherwise grow it without limit after the
+  // measurement cache had evicted every key that used them. Only measurement
+  // keys carry ordinals, so when the table reaches its bound, the table, the
+  // object map and the measurement cache are dropped together. No key that
+  // uses a retired ordinal survives, so a re-issued ordinal can never alias
+  // two routes; the reset is a memoization miss, never a different result.
+  let routeOrdinals = new Map<string, number>();
+  let routeOrdinalByObject = new WeakMap<object, number>();
+  const routeOrdinal = (route: Readonly<CanvasFontRoute>): number => {
+    const known = routeOrdinalByObject.get(route);
+    if (known !== undefined) return known;
+    const identity = JSON.stringify([route.familyList, route.scope, route.fingerprint]);
+    let ordinal = routeOrdinals.get(identity);
+    if (ordinal === undefined) {
+      if (routeOrdinals.size >= TEXT_ROUTE_ORDINAL_LIMIT) {
+        routeOrdinals = new Map();
+        routeOrdinalByObject = new WeakMap();
+        measurementCache.clear();
+      }
+      ordinal = routeOrdinals.size;
+      routeOrdinals.set(identity, ordinal);
+    }
+    // Only frozen routes are memoized by object: a mutable route could change
+    // its triple after the ordinal was recorded.
+    if (Object.isFrozen(route)) routeOrdinalByObject.set(route, ordinal);
+    return ordinal;
+  };
   const measureGlyph = (request: Readonly<GlyphMeasureRequest>): Readonly<GlyphMeasurement> => {
     const key = JSON.stringify([
       request.text,
-      request.fontRoute.familyList,
-      request.fontRoute.scope,
-      request.fontRoute.fingerprint,
+      routeOrdinal(request.fontRoute),
       request.fontSizePt,
       request.weight,
       request.style,
       request.letterSpacingPt,
       request.kerning ?? null,
     ]);
-    const retained = measurementCache.get(key);
+    const retained = cached(measurementCache, key);
     if (retained) return retained;
     const measured = input.measurer.measure(request);
     const snapshot = Object.freeze({
@@ -632,7 +734,7 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
         inkBounds: Object.freeze({ ...measured.inkBounds }),
       } : {}),
     });
-    measurementCache.set(key, snapshot);
+    retain(measurementCache, key, snapshot, measurementCacheLimit);
     return snapshot;
   };
   // Contextual cluster geometry measures every grapheme prefix of a script
@@ -644,7 +746,7 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
     request: Readonly<GlyphMeasureRequest>,
   ): number => input.measurer.measure(request).advancePt;
   const shapeCache = new Map<string, TextShapeResult>();
-  return Object.freeze({
+  const service: TextLayoutService = Object.freeze({
     fingerprint,
     fontMetrics,
     localMetrics: fontMetrics,
@@ -686,7 +788,7 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
         request.measure ?? null,
         request.clusterGeometry ?? null,
       ]);
-      const retainedShape = shapeCache.get(shapeKey);
+      const retainedShape = cached(shapeCache, shapeKey);
       if (retainedShape) return retainedShape;
       const grouped: {
         text: string; start: number; end: number; script: FontScriptSlot; breakBefore: boolean;
@@ -826,8 +928,10 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
         ...(clusters ? { clusters } : {}),
         diagnostics: Object.freeze(diagnostics),
       });
-      shapeCache.set(shapeKey, result);
+      retain(shapeCache, shapeKey, result, shapeCacheLimit);
       return result;
     },
   });
+  routeOrdinalTableSizes.set(service, () => routeOrdinals.size);
+  return service;
 }

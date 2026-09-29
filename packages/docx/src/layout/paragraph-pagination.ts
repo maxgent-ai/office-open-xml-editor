@@ -50,6 +50,10 @@ export function selectParagraphFragment(
     /** Owning section-region flow axis. Vertical final-line admission is
      * governed by WORD_VERTICAL_RL_FINAL_LINE_BASELINE_ADMISSION. */
     writingMode?: WritingMode;
+    /** Lines at or after this index may not be admitted in this flow region:
+     * a proven anchor-line deferral (anchor-line-deferral.ts) ends the page
+     * just above that line. Keep and widow rules then act as for overflow. */
+    lineEndLimit?: number;
   }>,
   additionalReserveFor?: (fragment: ParagraphLayout) => number,
   uniformRubyAdvancePt?: number,
@@ -72,6 +76,11 @@ export function selectParagraphFragment(
     throw new RangeError('Authored paragraph spaceAfter must be finite and non-negative');
   }
   const total = acquired.lines.length;
+  const lineEndLimit = policy.lineEndLimit;
+  if (lineEndLimit !== undefined
+    && (!Number.isInteger(lineEndLimit) || lineEndLimit < 0 || lineEndLimit >= total)) {
+    throw new RangeError('Paragraph line end limit must name a retained line');
+  }
   const slice = (end: number) => sliceParagraphLayout(acquired, {
     lineStart: 0,
     lineEnd: end,
@@ -106,6 +115,12 @@ export function selectParagraphFragment(
   if (fragmentation.kind === 'indivisible') {
     const completeReserve = reserveFor(acquired);
     const completeExtentPt = admissionExtent(acquired, true);
+    if (canRelocate && lineEndLimit !== undefined) {
+      return {
+        fragment: null, nextCursor: cursor,
+        requiresFreshFlowRegion: true, additionalReservePt: 0, admittedBlockExtentPt: 0,
+      };
+    }
     if (canRelocate && (
       completeExtentPt + completeReserve > availableBlockExtentPt
       || !reserveFits(completeReserve)
@@ -146,7 +161,8 @@ export function selectParagraphFragment(
   const completeExtentPt = admissionExtent(acquired, true);
   if (cursor.boundary === null && policy.keepLines && canRelocate
     && (
-      completeExtentPt + completeReserve > availableBlockExtentPt
+      lineEndLimit !== undefined
+      || completeExtentPt + completeReserve > availableBlockExtentPt
       || !reserveFits(completeReserve)
     )
     && completeExtentPt + completeReserve <= freshFlowRegionBlockExtentPt) {
@@ -157,7 +173,7 @@ export function selectParagraphFragment(
   }
   let end = selectLargestFittingEnd(
     0,
-    total,
+    lineEndLimit ?? total,
     availableBlockExtentPt,
     (lineEnd) => (() => {
       const candidate = slice(lineEnd);

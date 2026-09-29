@@ -96,19 +96,25 @@ export async function drainPaginationAsync<T>(
   const yieldToHost = options.yieldToHost ?? defaultYieldToHost;
   const { signal, onProgress } = options;
   let sliceStart = now();
-  let step = steps.next();
-  while (!step.done) {
-    onProgress?.(step.value);
+  const checkAbort = () => {
     if (signal?.aborted) {
-      // Let the generator run its `finally` blocks before abandoning it.
       steps.return(undefined as never);
       throw new PaginationAbortError();
     }
+  };
+  checkAbort();
+  let step = steps.next();
+  while (!step.done) {
+    // Finalization suspends with an internal sentinel, not a page publication.
+    if (Number.isFinite(step.value)) onProgress?.(step.value);
+    checkAbort();
     if (now() - sliceStart >= sliceMs) {
       await yieldToHost();
       sliceStart = now();
+      checkAbort();
     }
     step = steps.next();
   }
+  checkAbort();
   return step.value;
 }

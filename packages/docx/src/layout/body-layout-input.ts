@@ -24,6 +24,8 @@ export interface BodyParagraphSourceInput {
   readonly styleId: string | null;
   /** Source-level visibility used only for pagination look-ahead across unmeasured blocks. */
   readonly inkless?: boolean;
+  /** Parser-established ordinary text, excluding inline objects and mark-only paragraphs. */
+  readonly onlyVisibleText?: boolean;
   /** Mutually exclusive Word/LibreOffice section-mark spacing interop role. */
   readonly continuousSectionRole?:
     | 'suppress-before'
@@ -36,6 +38,8 @@ export interface BodyTableSourceInput {
   readonly kind: 'table';
   readonly source: SourceRef;
   readonly rowCount?: number;
+  /** §17.4.57 page/margin-positioned table whose exclusion can affect earlier text. */
+  readonly pageOwnedFloatingTable?: boolean;
 }
 
 export interface BodyAdjacentTableGroupInput {
@@ -73,6 +77,7 @@ export type BodyLayoutSequenceEntryFor<TSection> =
       kind: 'authored-break';
       source: SourceRef;
       break: AuthoredBreak;
+      origin?: 'authored' | 'coverPageSynthetic';
       parity?: 'odd' | 'even';
       sameSourceParagraphAsPrevious?: boolean;
     }>
@@ -92,7 +97,17 @@ export interface BodyLayoutInput {
   readonly noteLayoutSettings?: Readonly<{
     footnotePosition: string;
     endnotePosition: string;
+    footnoteNumbering?: NoteNumberingInput;
+    endnoteNumbering?: NoteNumberingInput;
   }>;
+}
+
+/** ECMA-376 §17.11.17/.18 numFmt and §17.11.20 numStart for one note kind. */
+export interface NoteNumberingInput {
+  /** ST_NumberFormat (§17.18.59); `decimal` when not authored. */
+  readonly format: string;
+  /** First automatic note number; 1 when not authored. */
+  readonly start: number;
 }
 
 export interface BodyLayoutAcquisitionInput {
@@ -103,6 +118,8 @@ export interface BodyLayoutAcquisitionInput {
   readonly noteLayoutSettings: Readonly<{
     footnotePosition: string;
     endnotePosition: string;
+    footnoteNumbering?: NoteNumberingInput;
+    endnoteNumbering?: NoteNumberingInput;
   }>;
   readonly pageLayoutSettings: Readonly<{
     mirrorMargins: boolean;
@@ -217,15 +234,17 @@ export function projectBodyLayoutInput(acquired: BodyLayoutAcquisitionInput): Bo
   const initialOccurrence = acquired.sectionIndex.occurrences[0];
   if (!initialOccurrence) throw new Error('DOCX body requires a final section owner');
   const initialSection = sections.get(initialOccurrence.sectionOccurrenceId)!;
-  const resolved: BodyLayoutSequenceEntry[] = acquired.sequence.map((entry) => {
-    if (entry.kind !== 'begin-section') return entry;
-    const section = sections.get(entry.section.sectionOccurrenceId);
-    if (!section) throw new Error(`Missing body section owner: ${entry.section.sectionOccurrenceId}`);
-    return Object.freeze({ ...entry, section });
-  });
-  const sequence: BodyLayoutSequenceEntry[] = resolved.map((entry, index) => {
+  // The spacing role depends only on the authored section start type, already
+  // present in the acquisition sequence. Resolve section owners and roles in
+  // one pass so no second body-sized sequence is retained transiently.
+  const sequence: BodyLayoutSequenceEntry[] = acquired.sequence.map((entry, index) => {
+    if (entry.kind === 'begin-section') {
+      const section = sections.get(entry.section.sectionOccurrenceId);
+      if (!section) throw new Error(`Missing body section owner: ${entry.section.sectionOccurrenceId}`);
+      return Object.freeze({ ...entry, section });
+    }
     if (entry.kind !== 'body-block' || entry.block.kind !== 'paragraph') return entry;
-    const continuousSectionRole = wordContinuousSectionRole(resolved, index);
+    const continuousSectionRole = wordContinuousSectionRole(acquired.sequence, index);
     if (continuousSectionRole === undefined) return entry;
     return Object.freeze({
       ...entry,

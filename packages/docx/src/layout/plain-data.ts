@@ -9,15 +9,14 @@ import { documentLayoutValidationEnabled } from './validation-policy.js';
  *  contract, so these checks are fused into the walks that always run. */
 class PlainDataContractError extends TypeError {}
 
-/** Graph roots snapshotted by snapshotPlainData, plus every node sealed in
- * place by sealPlainData. Registered graphs are engine-owned and immutable, so
- * later layout boundaries can reuse them by reference instead of reprocessing
- * the same multi-megabyte structures on every call. */
+/** Verified graph roots from snapshotPlainData and sealPlainData. A root brand
+ * proves its entire graph is plain and immutable; branding each descendant
+ * would keep millions of WeakSet entries alive in large layouts. */
 const processedPlainData = new WeakSet<object>();
 
-/** Object graphs already deeply frozen by deepFreezePlainData. Freeze walks
- * use this only to skip re-walking; it never relaxes validation, because
- * deepFreezePlainData alone does not prove a graph is plain data. */
+/** Roots already deeply frozen by deepFreezePlainData. Descendants are tracked
+ * only by the traversal-local `seen` set; this brand never relaxes validation,
+ * because freezing alone does not prove a graph is plain data. */
 const frozenPlainData = new WeakSet<object>();
 
 function assertPlainData(
@@ -77,6 +76,34 @@ export function deepFreezePlainData<T>(
   value: T,
   seen = new WeakSet<object>(),
 ): DeepReadonly<T> {
+  const frozen = freezePlainDataGraph(value, seen, [], false);
+  if (value !== null && typeof value === 'object' && Object.isFrozen(value)) frozenPlainData.add(value);
+  return frozen;
+}
+
+/** The caller must construct a fresh root whose frozen aliases come only from
+ * the supplied previously deep-frozen source (or from separately sealed
+ * roots). This lets continuation builders skip revisiting immutable line
+ * payloads while keeping ordinary deepFreezePlainData conservative. */
+export function deepFreezePlainDataWithFrozenAliases<T>(
+  value: T,
+  source: object,
+  seen = new WeakSet<object>(),
+): DeepReadonly<T> {
+  if (!frozenPlainData.has(source) && !processedPlainData.has(source)) {
+    return deepFreezePlainData(value, seen);
+  }
+  const frozen = freezePlainDataGraph(value, seen, [], true);
+  if (value !== null && typeof value === 'object' && Object.isFrozen(value)) frozenPlainData.add(value);
+  return frozen;
+}
+
+function freezePlainDataGraph<T>(
+  value: T,
+  seen: WeakSet<object>,
+  frozenAncestors: object[],
+  skipFrozenAliases: boolean,
+): DeepReadonly<T> {
   if (value === null || typeof value !== 'object' || seen.has(value)) {
     // Non-finite geometry is fatal state; the check rides the walk that always
     // runs so it cannot be disabled with the development-only pre-pass.
@@ -88,31 +115,42 @@ export function deepFreezePlainData<T>(
   if (processedPlainData.has(value) || frozenPlainData.has(value)) {
     return value as DeepReadonly<T>;
   }
-  seen.add(value);
+  if (skipFrozenAliases && Object.isFrozen(value)) return value as DeepReadonly<T>;
+  // Already-frozen descendants may be shared by many independent roots. A
+  // traversal-local ancestry stack still terminates frozen cycles without
+  // allocating a WeakSet entry on every repeat visit. Mutable descendants
+  // retain `seen`'s DAG and cycle handling while they are sealed in place.
+  const alreadyFrozen = Object.isFrozen(value);
+  if (alreadyFrozen) {
+    if (frozenAncestors.includes(value)) return value as DeepReadonly<T>;
+    frozenAncestors.push(value);
+  } else {
+    seen.add(value);
+  }
   // Walked without `Object.values`, which allocates a fresh array for every
   // node: retained geometry is a deep graph of small objects, so that
   // array-per-node is pure garbage on a hot path.
   if (Array.isArray(value)) {
     for (let index = 0; index < value.length; index += 1) {
-      deepFreezePlainData(value[index], seen);
+      freezePlainDataGraph(value[index], seen, frozenAncestors, skipFrozenAliases);
     }
     // Plain-data arrays carry index properties only; walking any stray extra
     // property too (rather than assuming the contract) means its subgraph can
     // never be left unfrozen when the development pre-pass did not run.
     for (const key in value) {
       if (String(Number(key)) !== key && Object.prototype.hasOwnProperty.call(value, key)) {
-        deepFreezePlainData((value as unknown as Record<string, unknown>)[key], seen);
+        freezePlainDataGraph((value as unknown as Record<string, unknown>)[key], seen, frozenAncestors, skipFrozenAliases);
       }
     }
   } else {
     for (const key in value) {
       if (Object.prototype.hasOwnProperty.call(value, key)) {
-        deepFreezePlainData((value as Record<string, unknown>)[key], seen);
+        freezePlainDataGraph((value as Record<string, unknown>)[key], seen, frozenAncestors, skipFrozenAliases);
       }
     }
   }
-  Object.freeze(value);
-  frozenPlainData.add(value);
+  if (alreadyFrozen) frozenAncestors.pop();
+  else Object.freeze(value);
   return value as DeepReadonly<T>;
 }
 
@@ -194,7 +232,7 @@ function cloneAndFreezePlainData<T>(value: T, seen: Map<object, unknown>): DeepR
   return copy as DeepReadonly<T>;
 }
 
-export function snapshotPlainData<T>(value: T, label: string): DeepReadonly<T> {
+export function snapshotPlainData<T>(value: T, label: string, ownedProjectionOf?: object): DeepReadonly<T> {
   if (typeof value === 'object' && value !== null && processedPlainData.has(value)) {
     return value as DeepReadonly<T>;
   }
@@ -206,7 +244,23 @@ export function snapshotPlainData<T>(value: T, label: string): DeepReadonly<T> {
     validatePlainData(value, label);
   }
   try {
-    const snapshot = cloneAndFreezePlainData(value, new Map<object, unknown>());
+    // Projection owns every newly allocated node. With a deeply frozen source
+    // root, its remaining aliases are immutable source facts and the new
+    // nodes can be frozen in place. This avoids copying the entire occurrence
+    // after translation/re-keying already made its distinct nodes, so a
+    // paragraph acquisition and the pages that place it share one copy of
+    // its unchanged payload (glyph clusters, paint operations, typography).
+    // A deepFreezePlainData root qualifies as well as a processed one: the
+    // sharing needs immutability, which both brands prove for the whole
+    // graph. Plain-data validity of the shared payload is still enforced —
+    // by the development pre-pass above, and fatally by the unconditional
+    // assertDocumentLayout walk over every finished layout. Mutable sources
+    // still take the deep-copy path.
+    const snapshot = ownedProjectionOf && (
+      processedPlainData.has(ownedProjectionOf) || frozenPlainData.has(ownedProjectionOf)
+    )
+      ? deepFreezePlainData(value)
+      : cloneAndFreezePlainData(value, new Map<object, unknown>());
     if (typeof snapshot === 'object' && snapshot !== null) processedPlainData.add(snapshot);
     return snapshot;
   } catch (error) {
@@ -222,7 +276,9 @@ export function snapshotPlainData<T>(value: T, label: string): DeepReadonly<T> {
  * the supplied graph and must not expose it for later mutation. */
 export function sealPlainData<T>(value: T, label: string): DeepReadonly<T> {
   if (documentLayoutValidationEnabled()) validatePlainData(value, label);
-  return deepFreezeAndRegister(value, new WeakSet()) as DeepReadonly<T>;
+  const sealed = deepFreezePlainData(value);
+  if (value !== null && typeof value === 'object') processedPlainData.add(value);
+  return sealed;
 }
 
 function validatePlainData(value: unknown, label: string): void {
@@ -237,34 +293,4 @@ function validatePlainData(value: unknown, label: string): void {
     throw new TypeError(`${label} must be structured-clone-safe plain data`);
   }
   assertPlainData(value, label);
-}
-
-function deepFreezeAndRegister(value: unknown, seen: WeakSet<object>): unknown {
-  if (value === null || typeof value !== 'object' || seen.has(value)) {
-    if (typeof value === 'number' && !Number.isFinite(value)) {
-      throw new PlainDataContractError('must contain finite numbers');
-    }
-    return value;
-  }
-  if (processedPlainData.has(value)) return value;
-  seen.add(value);
-  if (Array.isArray(value)) {
-    for (let index = 0; index < value.length; index += 1) {
-      deepFreezeAndRegister(value[index], seen);
-    }
-    for (const key in value) {
-      if (String(Number(key)) !== key && Object.prototype.hasOwnProperty.call(value, key)) {
-        deepFreezeAndRegister((value as unknown as Record<string, unknown>)[key], seen);
-      }
-    }
-  } else {
-    for (const key in value) {
-      if (Object.prototype.hasOwnProperty.call(value, key)) {
-        deepFreezeAndRegister((value as Record<string, unknown>)[key], seen);
-      }
-    }
-  }
-  Object.freeze(value);
-  processedPlainData.add(value);
-  return value;
 }

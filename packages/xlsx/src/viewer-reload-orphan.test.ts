@@ -14,11 +14,15 @@ afterEach(() => {
  *  previous workbook (its worker + WASM) is torn down on a re-load. */
 function fakeWorkbook() {
   const destroy = vi.fn();
+  const getWorksheet = vi.fn().mockResolvedValue(undefined);
   const wb = {
     sheetNames: ['Sheet1'],
     tabColors: {} as Record<number, string>,
     destroy,
-    getWorksheet: vi.fn().mockResolvedValue(undefined),
+    getWorksheet,
+    acquireWorksheetLease: async (index: number) => ({
+      worksheet: await getWorksheet(index), release: () => undefined,
+    }),
   };
   return { wb: wb as unknown as XlsxWorkbook, destroy };
 }

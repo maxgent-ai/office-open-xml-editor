@@ -149,11 +149,13 @@ describe('XlsxViewer.getCellAt — AxisMetrics fast path matches old linear scan
     const v = mountViewer(ws, 37, 51);
     const internal = v as unknown as {
       viewport: { setScale(scale: number): void };
-      getHeaderHit(x: number, y: number):
-        | { kind: 'corner' }
-        | { kind: 'row'; row: number }
-        | { kind: 'col'; col: number }
-        | null;
+      selectionInput: {
+        getHeaderHit(x: number, y: number):
+          | { kind: 'corner' }
+          | { kind: 'row'; row: number }
+          | { kind: 'col'; col: number }
+          | null;
+      };
     };
     internal.viewport.setScale(1.25);
     const headerW = Math.round(HEADER_W * 1.25);
@@ -161,13 +163,13 @@ describe('XlsxViewer.getCellAt — AxisMetrics fast path matches old linear scan
 
     for (const y of [headerH + 1, headerH + 42, headerH + 103]) {
       const cell = v.getCellAt(headerW + 1, y);
-      const header = internal.getHeaderHit(1, y);
+      const header = internal.selectionInput.getHeaderHit(1, y);
       expect(header?.kind).toBe('row');
       if (header?.kind === 'row') expect(header.row).toBe(cell?.row);
     }
     for (const x of [headerW + 1, headerW + 90, headerW + 211]) {
       const cell = v.getCellAt(x, headerH + 1);
-      const header = internal.getHeaderHit(x, 1);
+      const header = internal.selectionInput.getHeaderHit(x, 1);
       expect(header?.kind).toBe('col');
       if (header?.kind === 'col') expect(header.col).toBe(cell?.col);
     }

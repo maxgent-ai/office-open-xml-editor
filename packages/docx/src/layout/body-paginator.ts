@@ -9,19 +9,20 @@ import type {
   BodyAcquisitionLocation,
   BodyLayoutSession,
   BodyTableContinuationCursor,
+  PageAnchorPrescanInput,
 } from './body-layout-kernel.js';
 import { NoteCapacityExceededError } from './body-layout-kernel.js';
 import {
   commitPageFlowTransition,
   createBodyPaginationState,
   createCanonicalPageDraft,
-  addPageFootnoteReserve,
+  addPageFootnoteReserves,
   setBodyBalanceTarget,
   type BodyPageTransitionFactory,
   type BodyPaginationState,
   type CanonicalPageDraft,
 } from './body-pagination.js';
-import { assertAndDeepFreezeDocumentLayout } from './invariants.js';
+import { assertAndDeepFreezeDocumentLayoutSteps } from './invariants.js';
 import {
   bodyLayoutKernelOf,
   createFieldAcquisitionServicesView,
@@ -50,6 +51,7 @@ import {
   UnsupportedPageFlowTransitionError,
   type PageFlowState,
 } from './paginator.js';
+
 import {
   createPageFlowSectionContext,
   physicalSectionGeometry,
@@ -61,6 +63,19 @@ import {
   writingModeFromTextDirection,
 } from './coordinate-space.js';
 import { selectParagraphFragment, type ParagraphFragmentCursor } from './paragraph-pagination.js';
+import {
+  anchorKeysId,
+  anchorLineDeferralApplies,
+  anchorLineDeferralKey,
+  anchorLineDeferralsIdentity,
+  createAnchorLineDeferralProof,
+  pageOwnedAnchorKeysByLine,
+  serializeAnchorInput,
+  type AnchorLineDeferralContext,
+  type AnchorLineDeferrals,
+  type AnchorLineDeferralProof,
+  type PageAnchorInputEvent,
+} from './anchor-line-deferral.js';
 import { paragraphGapAdjustment } from './paragraph-spacing.js';
 import {
   endnoteIdsInRetainedSlice,
@@ -85,9 +100,10 @@ import {
   wordContinuousSectionRestartDisplayNumber,
   wordTrailingEmptyMarkAdmissionAllowancePt,
 } from './section-compatibility.js';
-import { bodyOccurrenceKey } from './source-key.js';
+import { bodyOccurrenceKey, bodyRootFloatingTablePlacementKey, sourceKey } from './source-key.js';
 import {
   convergeHeaderFooterReserveSteps,
+  headerStoryBodyReserveExtentPt,
   headerFooterOverflowReservePt,
   reservedBodyInterval,
   selectedHeaderFooterStory,
@@ -100,6 +116,7 @@ import type {
   DeepReadonly,
   DocumentLayout,
   LayoutDiagnostic,
+  LayoutPage,
   LayoutServices,
   NoteLayout,
   PaintNode,
@@ -118,6 +135,10 @@ import {
   convergeExactStateSteps,
 } from './convergence.js';
 import { paginationFieldPageContexts } from './pagination-fields.js';
+
+// Resource governance independent of compatibility thresholds: each physical
+// page retains flow/paint state. Bound adversarial page generation globally.
+const MAX_BODY_LAYOUT_PAGES = 10_000;
 
 class FootnoteAdmissionOverflowError extends Error {
   readonly code = 'FOOTNOTE_RESERVE_EXCEEDS_FRESH_PAGE' as const;
@@ -747,16 +768,69 @@ export type BodyPaginationPassResult = Readonly<{
   footnoteReserveByPage: ReadonlyMap<number, number>;
   footnoteLayoutsByPage: ReadonlyMap<number, readonly NoteLayout[]>;
   terminalDiagnostic: LayoutDiagnostic | null;
+  /** Every read of the anchor-convergence carry, in pass order. */
+  anchorInputs: readonly PageAnchorInputEvent[];
+  /** `anchorInputs` serialized for exact comparison between passes. */
+  serializedAnchorInputs: readonly string[];
 }>;
 
 interface BodyPaginationPassObserver {
   shouldPublish(committedPages: number): boolean;
   publish(pass: BodyPaginationPassResult, processedEntries: number): void;
+  /** Receives, in pass order, every value the pass reads from the page-anchor
+   * convergence carry (see `anchorStablePageLimit`). */
+  onPageAnchorInput?(event: PageAnchorInputEvent): void;
 }
 
-/** Optional observer for paintable snapshots produced by the first canonical
- * pagination pass. The generator itself continues from the same suspended
- * state after every publication; no source prefix is replayed. */
+type PageStartAnchors = PageAnchorPrescanInput['anchors'];
+
+/** Receives provisional snapshots of one or more passes of the canonical
+ * session; `pageIndexLimit` bounds the leading pages the caller may show. */
+interface BodyPagePublisher {
+  /** Pages already delivered; a publication must extend this prefix. */
+  readonly publishedPages: number;
+  readonly failed: boolean;
+  publish(pass: BodyPaginationPassResult, processedEntries: number, pageIndexLimit: number): void;
+}
+
+/** Checkpoint schedule for one pass: publish when the committed page count
+ * doubles, and only while the pass can still extend the published prefix. */
+function passPublicationObserver(
+  publisher: BodyPagePublisher,
+  pageIndexLimit: (pass: BodyPaginationPassResult) => number,
+  extra: Readonly<{
+    onPageAnchorInput?: (event: PageAnchorInputEvent) => void;
+    canExtend?: () => boolean;
+  }> = {},
+): BodyPaginationPassObserver {
+  let nextCheckpoint = 1;
+  return {
+    // One committed page beyond the published prefix is the live page, which
+    // is never published; a checkpoint needs at least one more.
+    shouldPublish: (committedPages) => (
+      !publisher.failed
+      && committedPages >= Math.max(nextCheckpoint, publisher.publishedPages + 2)
+      && (extra.canExtend?.() ?? true)
+    ),
+    publish: (pass, processedEntries) => {
+      const pages = pass.layout.pages.length;
+      nextCheckpoint = Math.max(pages + 1, pages * 2);
+      publisher.publish(pass, processedEntries, pageIndexLimit(pass));
+    },
+    ...(extra.onPageAnchorInput ? { onPageAnchorInput: extra.onPageAnchorInput } : {}),
+  };
+}
+
+/** The page index of a pass snapshot's live (last, still open) page. */
+function livePageIndex(pass: BodyPaginationPassResult): number {
+  return pass.layout.pages.at(-1)?.pageIndex ?? 0;
+}
+
+/** Optional observer for paintable snapshots of the canonical pagination
+ * session: the seed pass, or for a document with page-owned anchors each pass
+ * of the unseeded anchor convergence, limited to pages that convergence can no
+ * longer change. The generator continues from the same suspended state after
+ * every publication; no source prefix is replayed. */
 export interface BodyPaginationObserver {
   onPages(layout: DocumentLayout, processedEntries: number): void;
 }
@@ -769,6 +843,8 @@ function paginationPassResult(
   footnoteReserveByPage: ReadonlyMap<number, number>,
   footnoteLayoutsByPage: ReadonlyMap<number, readonly NoteLayout[]>,
   terminalDiagnostic: LayoutDiagnostic | null,
+  anchorInputs: readonly PageAnchorInputEvent[] = [],
+  serializedAnchorInputs: readonly string[] = [],
 ): BodyPaginationPassResult {
   const layout = finalize(state, owners);
   const retainedPageIndexes = new Set(layout.pages.map((page) => page.pageIndex));
@@ -786,6 +862,8 @@ function paginationPassResult(
     footnoteLayoutsByPage: new Map([...footnoteLayoutsByPage]
       .filter(([pageIndex]) => retainedPageIndexes.has(pageIndex))),
     terminalDiagnostic,
+    anchorInputs: Object.freeze([...anchorInputs]),
+    serializedAnchorInputs: Object.freeze([...serializedAnchorInputs]),
   });
 }
 
@@ -814,19 +892,31 @@ export function drainPagination<T>(steps: PaginationSteps<T>): T {
   return step.value;
 }
 
+type PageWrapDestination = Readonly<{
+  kind: 'drawing';
+  occurrenceId: string;
+  paragraphSource: SourceRef;
+  pageIndex: number;
+  flowDomainId: string;
+}> | Readonly<{
+  kind: 'floating-table';
+  occurrenceId: string;
+  tableSource: SourceRef;
+  bounds: Readonly<{ xPt: number; yPt: number; widthPt: number; heightPt: number }>;
+  pageIndex: number;
+  flowDomainId: string;
+}>;
+
 function* paginateBodyPassSteps(
   input: BodyLayoutInput,
   services: LayoutServices,
   options: LayoutOptions,
   reserves: readonly HeaderFooterReserve[],
-  anchorDestinations: ReadonlyMap<string, Readonly<{
-    occurrenceId: string;
-    paragraphSource: SourceRef;
-    pageIndex: number;
-    flowDomainId: string;
-  }>> | null,
+  anchorDestinations: ReadonlyMap<string, PageWrapDestination> | null,
+  minimumTablePageBySource: ReadonlyMap<string, number> | null,
   balancePlan: BodyBalancePlan,
   observer?: BodyPaginationPassObserver,
+  anchorLineDeferrals: AnchorLineDeferrals | null = null,
 ): PaginationSteps<BodyPaginationPassResult> {
   const kernel = bodyLayoutKernelOf(services);
   if (!kernel) throw new Error('Body layout kernel is not attached to the supplied services');
@@ -849,11 +939,12 @@ function* paginateBodyPassSteps(
   };
   state = setBodyBalanceTarget(state, balanceTargetFor(state));
   const factory = transitionFactory(owners, reserves);
-  // Source entry whose keep-with-next set was relocated to a new physical page
-  // by automatic overflow. The compatibility projection suppresses that
-  // leading paragraph's space-before only for this grouped relocation;
-  // ordinary overflow and authored page/section breaks retain their own rules.
+  // Source entry whose paragraph or keep-with-next set was relocated to a new
+  // physical page by automatic overflow. Compatibility rules:
+  // word-automatic-paragraph-top-spacing and word-automatic-keep-next-start-spacing.
   let automaticPageStartEntryIndex: number | null = null;
+  // Compatibility rule: word-standalone-hard-page-break-top-spacing.
+  let standaloneHardPageStartEntryIndex: number | null = null;
   const session = kernel.openBodyLayoutSession({
     source: input.source,
     section: input.initialSection.context,
@@ -875,20 +966,14 @@ function* paginateBodyPassSteps(
     // interval, not by that reduced current-page section band.
     return interval.blockEndPt - interval.blockStartPt;
   };
-  const pageStartAnchors = (target: BodyPaginationState, startIndex: number) => {
+  const pageStartAnchors = (target: BodyPaginationState, startIndex: number): PageStartAnchors => {
     if (anchorDestinations !== null) {
       const location = acquisitionLocation(target);
-      return Object.freeze([...anchorDestinations.values()]
-        .filter((destination) => (
-          destination.pageIndex === location.pageIndex
-          && destination.flowDomainId === location.flowDomainId
-        ))
-        .map(({ occurrenceId, paragraphSource }) => Object.freeze({
-          occurrenceId,
-          paragraphSource,
-        })));
+      return plannedPageStartAnchors(anchorDestinations, location.pageIndex, location.flowDomainId);
     }
-    const anchors: Array<Readonly<{ occurrenceId: string; paragraphSource: SourceRef }>> = [];
+    const anchors: Array<Readonly<{
+      kind: 'drawing'; occurrenceId: string; paragraphSource: SourceRef;
+    }>> = [];
     for (let index = startIndex; index < input.sequence.length; index += 1) {
       const entry = input.sequence[index]!;
       if (entry.kind === 'authored-break' && entry.break !== 'column') break;
@@ -896,13 +981,43 @@ function* paginateBodyPassSteps(
       if (entry.kind !== 'body-block' || entry.block.kind !== 'paragraph') continue;
       if (index > startIndex && entry.block.pageBreakBefore) break;
       entry.block.pageOwnedAnchorOccurrenceIds?.forEach((occurrenceId) => anchors.push(
-        Object.freeze({ occurrenceId, paragraphSource: entry.block.source }),
+        Object.freeze({ kind: 'drawing', occurrenceId, paragraphSource: entry.block.source }),
       ));
     }
     return Object.freeze(anchors);
   };
+  // Every read of the anchor-convergence carry, in pass order. A later pass
+  // proves an anchor-line deferral against these reads, and the progressive
+  // observer bounds stable pages with them.
+  const anchorInputs: PageAnchorInputEvent[] = [];
+  const serializedAnchorInputs: string[] = [];
+  const recordAnchorInput = (event: PageAnchorInputEvent) => {
+    anchorInputs.push(event);
+    serializedAnchorInputs.push(serializeAnchorInput(event, pageStartAnchorsIdentity));
+    observer?.onPageAnchorInput?.(event);
+  };
+  // Page-owned anchors registered on the current physical page.
+  let registeredAnchorPage = -1;
+  const registeredAnchorKeys = new Set<string>();
+  // Anchor-line deferrals applied on the current physical page.
+  let deferralPage = -1;
+  const appliedDeferralKeys = new Set<string>();
   const prescanPageAnchors = (target: BodyPaginationState, startIndex: number) => {
     const anchors = pageStartAnchors(target, startIndex);
+    const at = acquisitionLocation(target);
+    // Recorded even when empty: a later pass that prescans anchors here
+    // would change this flow domain.
+    recordAnchorInput(Object.freeze({
+      kind: 'prescan',
+      pageIndex: at.pageIndex,
+      flowDomainId: at.flowDomainId,
+      anchors,
+    }));
+    if (registeredAnchorPage !== at.pageIndex) {
+      registeredAnchorPage = at.pageIndex;
+      registeredAnchorKeys.clear();
+    }
+    anchors.forEach((anchor) => registeredAnchorKeys.add(anchor.occurrenceId));
     if (anchors.length === 0) return;
     if (!session.prescanPageAnchors) {
       throw new Error('Page-owned anchors require canonical prescan acquisition');
@@ -915,12 +1030,56 @@ function* paginateBodyPassSteps(
     });
     if (delta) session.commitFlowRegistryDelta(delta);
   };
+  const deferralContext: AnchorLineDeferralContext = Object.freeze({
+    reads: serializedAnchorInputs,
+  });
+  /** Whether a proven anchor-line deferral (see anchor-line-deferral.ts)
+   * sends the line anchoring `keys` past the current physical page. */
+  const anchorLineDeferred = (keys: readonly string[]): boolean => {
+    if (anchorLineDeferrals === null || keys.length === 0) return false;
+    const pageIndex = state.flow.pageIndex;
+    if (registeredAnchorPage === pageIndex && keys.some((key) => registeredAnchorKeys.has(key))) {
+      return false;
+    }
+    const keysId = anchorKeysId(keys);
+    if (deferralPage === pageIndex && appliedDeferralKeys.has(keysId)) return true;
+    let proof: AnchorLineDeferralProof | undefined;
+    for (const key of keys) {
+      proof = anchorLineDeferrals.get(anchorLineDeferralKey(key, pageIndex));
+      if (proof) break;
+    }
+    if (!proof || !anchorLineDeferralApplies(proof, keys, pageIndex, deferralContext)) return false;
+    if (deferralPage !== pageIndex) {
+      deferralPage = pageIndex;
+      appliedDeferralKeys.clear();
+    }
+    appliedDeferralKeys.add(keysId);
+    recordAnchorInput(Object.freeze({
+      kind: 'anchor-line-deferral',
+      pageIndex,
+      keys: Object.freeze([...keys].sort()),
+    }));
+    return true;
+  };
+  /** First line of `layout` that a proven deferral keeps off this page. */
+  const deferredAnchorLineIndex = (layout: ParagraphLayout): number | undefined => {
+    if (anchorLineDeferrals === null) return undefined;
+    const keysByLine = pageOwnedAnchorKeysByLine(layout);
+    for (let index = 0; index < keysByLine.length; index += 1) {
+      if (anchorLineDeferred(keysByLine[index]!)) return index;
+    }
+    return undefined;
+  };
   prescanPageAnchors(state, 0);
   const commitTransition = (
     transition: ReturnType<typeof applyAuthoredBreak>,
     nextEntryIndex: number,
     suppressFirstParagraphSpaceBefore = false,
+    skipPageAnchorPrescan = false,
   ) => {
+    if (transition.state.pageIndex >= MAX_BODY_LAYOUT_PAGES) {
+      throw new Error(`Document page budget exceeded (${MAX_BODY_LAYOUT_PAGES} pages)`);
+    }
     const previousPageIndex = state.flow.pageIndex;
     const opensAutomaticPage = transition.events.some((event) => (
       event.type === 'next-page' && event.reason === 'overflow'
@@ -932,14 +1091,15 @@ function* paginateBodyPassSteps(
     ));
     state = commitPageFlowTransition(state, transition, factory);
     state = setBodyBalanceTarget(state, balanceTargetFor(state));
-    const nextLocation = acquisitionLocation(state);
     if (state.flow.pageIndex !== previousPageIndex) {
       automaticPageStartEntryIndex = opensAutomaticPage && suppressFirstParagraphSpaceBefore
         ? nextEntryIndex
         : null;
+      const nextLocation = acquisitionLocation(state);
       session.resetPageAcquisition(nextLocation);
-      prescanPageAnchors(state, nextEntryIndex);
+      if (!skipPageAnchorPrescan) prescanPageAnchors(state, nextEntryIndex);
     } else {
+      const nextLocation = acquisitionLocation(state);
       session.moveAcquisitionCursor(nextLocation);
       // §17.18.77 keeps the physical page but opens a distinct flow domain.
       // The outgoing source scan intentionally stopped at the section mark, so
@@ -1010,7 +1170,6 @@ function* paginateBodyPassSteps(
   const commitFootnotes = (
     ids: readonly string[],
     layouts: readonly NoteLayout[],
-    reservePt: number,
   ) => {
     let retained = footnoteIdsByPage.get(state.flow.pageIndex);
     if (!retained) {
@@ -1021,11 +1180,14 @@ function* paginateBodyPassSteps(
     const retainedLayouts = footnoteLayoutsByPage.get(state.flow.pageIndex) ?? [];
     retainedLayouts.push(...layouts);
     footnoteLayoutsByPage.set(state.flow.pageIndex, retainedLayouts);
+    // The retained note band sums individual advances in document order.
+    // Adding independently summed reference groups changes floating-point
+    // association and can disagree with that exact geometry authority.
+    state = addPageFootnoteReserves(state, layouts.map(note => note.advancePt));
     footnoteReserveByPage.set(
       state.flow.pageIndex,
-      (footnoteReserveByPage.get(state.flow.pageIndex) ?? 0) + reservePt,
+      state.footnoteReservePt,
     );
-    state = addPageFootnoteReserve(state, reservePt);
   };
   // §17.11.21 / §17.18.34 assign each note to the physical page that paints
   // its reference. Growing that page-wide band must not clip a deeper column
@@ -1070,10 +1232,18 @@ function* paginateBodyPassSteps(
       if (entry.break === 'column' && !activeColumnBreakIndexes.has(entryIndex)) {
         continue;
       }
+      const pageIndexBeforeBreak = state.flow.pageIndex;
       commitTransition(
         applyAuthoredBreak(state.flow, entry.break, entry.parity),
         entryIndex + 1,
       );
+      standaloneHardPageStartEntryIndex = entry.break === 'page'
+        && entry.origin === 'authored'
+        && entry.parity === undefined
+        && entry.sameSourceParagraphAsPrevious !== true
+        && state.flow.pageIndex !== pageIndexBeforeBreak
+        ? entryIndex + 1
+        : null;
       continue;
     }
     if (entry.kind === 'begin-section') {
@@ -1192,8 +1362,28 @@ function* paginateBodyPassSteps(
             || spacing.suppressBefore
             || (
               cursor.boundary === null
+              // Ordinary overflow suppresses top spacing only for ordinary
+              // text. Image-only and mixed-object paragraphs retain their
+              // authored spacing; `inkless` cannot distinguish these cases.
+              && block.inkless !== true
+              && block.onlyVisibleText === true
               && !state.flow.pageHasContent
               && automaticPageStartEntryIndex === entryIndex
+            )
+            || (
+              // Keep-with-next relocation owns a separate, content-independent
+              // leading-spacing rule for the complete group.
+              cursor.boundary === null
+              && block.keepNext
+              && block.inkless !== true
+              && !state.flow.pageHasContent
+              && automaticPageStartEntryIndex === entryIndex
+            )
+            || (
+              cursor.boundary === null
+              && !block.pageBreakBefore
+              && !state.flow.pageHasContent
+              && standaloneHardPageStartEntryIndex === entryIndex
             ),
           continuation: cursor,
         });
@@ -1245,7 +1435,7 @@ function* paginateBodyPassSteps(
             allocations,
             acquired.placement,
           );
-          commitFootnotes(notes.ids, notes.layouts, notes.reservePt);
+          commitFootnotes(notes.ids, notes.layouts);
           if (acquired.flowRegistryDelta) {
             session.commitFlowRegistryDelta(acquired.flowRegistryDelta);
           }
@@ -1257,6 +1447,7 @@ function* paginateBodyPassSteps(
           let keepSetExtentPt = acquired.blockExtentPt;
           const keepSetReferenceIds = new Set(footnoteIdsInRetainedSlice(acquired.layout));
           let hasTerminalBlock = false;
+          let keepSetBlockedByDeferral = false;
           let bridgeSuccessor = wordEmptyKeepNextBridgesSuccessor({
             keepNext: block.keepNext,
             inkless: block.inkless === true,
@@ -1278,6 +1469,15 @@ function* paginateBodyPassSteps(
             const continues = nextBlock.kind === 'paragraph'
               && (nextBlock.keepNext || bridgeSuccessor);
             bridgeSuccessor = false;
+            // A proven anchor-line deferral on a line this keep set must hold
+            // ends the page above it, like an overflow
+            // (word-page-anchor-line-deferral).
+            const keptLines = continues
+              ? following.pageOwnedAnchorKeysByLine
+              : following.pageOwnedAnchorKeysByLine?.slice(0, 1);
+            if (keptLines?.some((keys) => anchorLineDeferred(keys))) {
+              keepSetBlockedByDeferral = true;
+            }
             keepSetExtentPt += continues
               ? following.fullExtentPt
               : following.leadContentExtentPt;
@@ -1285,7 +1485,7 @@ function* paginateBodyPassSteps(
               ? following.fullFootnoteReferenceIds
               : following.leadFootnoteReferenceIds;
             referenceIds?.forEach((id) => keepSetReferenceIds.add(id));
-            if (!continues) {
+            if (!continues || keepSetBlockedByDeferral) {
               hasTerminalBlock = true;
               break;
             }
@@ -1305,7 +1505,7 @@ function* paginateBodyPassSteps(
           const keepSetAdmissionPt = keepSetExtentPt + keepSetReservePt;
           if (
             hasTerminalBlock
-            && keepSetAdmissionPt > location.availableBounds.heightPt
+            && (keepSetAdmissionPt > location.availableBounds.heightPt || keepSetBlockedByDeferral)
             && keepSetAdmissionPt <= freshPageExtent(state)
           ) {
             commitTransition(
@@ -1409,7 +1609,10 @@ function* paginateBodyPassSteps(
             followsNextPageSectionBoundary,
             markExtentPt: acquired.blockExtentPt,
             markBelowBaselinePt: acquired.markBelowBaselinePt ?? 0,
+            markOnLineGrid: acquired.markOnLineGrid === true,
           });
+        // A proven anchor-line deferral ends this page just above that line.
+        const anchorLineBreak = deferredAnchorLineIndex(acquired.layout);
         const selected = selectParagraphFragment(
           acquired.layout,
           cursor,
@@ -1422,6 +1625,7 @@ function* paginateBodyPassSteps(
             widowControl: block.widowControl,
             authoredSpaceAfterPt: block.spaceAfterPt,
             writingMode: activeRegion(state).writingMode,
+            ...(anchorLineBreak === undefined ? {} : { lineEndLimit: anchorLineBreak }),
           },
           (fragment) => footnoteAdmission(
             fragment,
@@ -1434,6 +1638,7 @@ function* paginateBodyPassSteps(
           commitTransition(
             advanceColumnOrPage(state.flow, 'overflow'),
             entryIndex,
+            true,
           );
           continue;
         }
@@ -1457,7 +1662,7 @@ function* paginateBodyPassSteps(
           selected.fragment.advancePt + notes.reservePt,
           freshPageExtent(state),
         );
-        commitFootnotes(notes.ids, notes.layouts, notes.reservePt);
+        commitFootnotes(notes.ids, notes.layouts);
         if (acquired.flowRegistryDelta) {
           const acceptedDelta = paragraphFlowRegistryDeltaForAcceptedFragment(
             acquired.flowRegistryDelta,
@@ -1478,6 +1683,32 @@ function* paginateBodyPassSteps(
       previousParagraph = block;
     } else {
       previousParagraph = null;
+      if (block.kind === 'table') {
+        const tableKey = `table:${sourceKey(block.source)}`;
+        const minimumPage = minimumTablePageBySource?.get(tableKey);
+        if (block.pageOwnedFloatingTable === true || minimumPage !== undefined) {
+          recordAnchorInput(Object.freeze({
+            kind: 'page-owned-table',
+            pageIndex: state.flow.pageIndex,
+            key: tableKey,
+            floor: minimumPage,
+          }));
+        }
+        if (minimumPage !== undefined) {
+          // §17.4.57 gives the page-owned table a fixed position and a minimum
+          // distance from adjacent text. Word controls show that a table whose
+          // own exclusion sends its preceding text past candidate page p is
+          // instead tried on p+1. Do not jump to the observed source page:
+          // intermediate pages may still admit the table. This floor belongs
+          // only to this exact convergence run.
+          while (state.flow.pageIndex < minimumPage) {
+            commitTransition(
+              advanceToPage(state.flow, state.flow.section, 'overflow'),
+              entryIndex,
+            );
+          }
+        }
+      }
       let cursor: import('./body-layout-kernel.js').BodyTableContinuationCursor | undefined;
       let complete = false;
       while (!complete) {
@@ -1626,7 +1857,7 @@ function* paginateBodyPassSteps(
           allocations,
           acquired.placement,
         );
-        commitFootnotes(notes.ids, notes.layouts, notes.reservePt);
+        commitFootnotes(notes.ids, notes.layouts);
         if (acquired.flowRegistryDelta) {
           session.commitFlowRegistryDelta(bindTableFlowRegistryDeltaToAcceptedOccurrence(
             acquired.flowRegistryDelta,
@@ -1636,7 +1867,46 @@ function* paginateBodyPassSteps(
         }
         cursor = acquired.nextCursor ?? undefined;
         complete = cursor === undefined;
-        if (cursor) {
+        // WORD_OVER_PAGE_CELL_BREAK_OCCUPANCY:
+        // clipped cell content counts a physical continuation page before a
+        // following authored page break. The continuation page's normal-flow
+        // cursor stays at its top: without a break, the next paragraph starts
+        // there, not after the invisible remainder. The 500pt/800pt controls
+        // bracketed a 648pt body band; use retained overflow height rather
+        // than a fixed extra-page allowance.
+        let hiddenOverflowPt = acquired.unpaintedOverflowPt ?? 0;
+        if (hiddenOverflowPt > 0) {
+          if (!Number.isFinite(hiddenOverflowPt)) throw new Error('Table overflow extent must be finite');
+          // A body's usable extent may differ on first/even/odd pages because
+          // header/footer reserves vary. For budget preflight, the full page
+          // dimension is only an upper bound; actual charging below uses each
+          // destination page's reserved body interval.
+          const maxPageExtentPt = Math.max(
+            state.flow.section.geometry.pageWidth,
+            state.flow.section.geometry.pageHeight,
+          );
+          if (!Number.isFinite(maxPageExtentPt) || maxPageExtentPt <= 0) {
+            throw new Error('Table overflow requires a finite positive page extent');
+          }
+          const minimumContinuationPages = Math.ceil(hiddenOverflowPt / maxPageExtentPt);
+          if (state.flow.pageIndex + minimumContinuationPages >= MAX_BODY_LAYOUT_PAGES) {
+            throw new Error(`Document page budget exceeded (${MAX_BODY_LAYOUT_PAGES} pages)`);
+          }
+          while (hiddenOverflowPt > 0) {
+            const pageExtentPt = freshPageExtent(state);
+            if (!Number.isFinite(pageExtentPt) || pageExtentPt <= 0) {
+              throw new Error('Table overflow requires a finite positive page extent');
+            }
+            const hasMoreHiddenPages = hiddenOverflowPt > pageExtentPt;
+            commitTransition(
+              advanceToPage(state.flow, state.flow.section, 'overflow'),
+              entryIndex,
+              false,
+              hasMoreHiddenPages,
+            );
+            hiddenOverflowPt -= pageExtentPt;
+          }
+        } else if (cursor) {
           commitTransition(
             advanceColumnOrPage(state.flow, 'overflow'),
             entryIndex,
@@ -1669,6 +1939,8 @@ function* paginateBodyPassSteps(
     footnoteReserveByPage,
     footnoteLayoutsByPage,
     terminalDiagnostic,
+    anchorInputs,
+    serializedAnchorInputs,
   );
 }
 
@@ -1705,7 +1977,7 @@ function headerFooterReserves(
       if (!pass.session.layoutStory) {
         throw new Error('Header/footer story layout requires a story-capable layout session');
       }
-      return pass.session.layoutStory({
+      const story = pass.session.layoutStory({
         source,
         pageIndex: page.pageIndex,
         section: page.section,
@@ -1719,7 +1991,8 @@ function headerFooterReserves(
             heightPt: page.section.geometry.pageHeight,
           },
         },
-      }).advancePt;
+      });
+      return kind === 'header' ? headerStoryBodyReserveExtentPt(story) : story.advancePt;
     };
     return Object.freeze({
       top: headerFooterOverflowReservePt(
@@ -1813,8 +2086,11 @@ function composePageStories(
     const footer = acquire('footer');
     const retainedNotes = footnotesByPage.get(page.pageIndex) ?? [];
     const noteAdvancePt = retainedNotes.reduce((sum, note) => sum + note.advancePt, 0);
-    const pageStoryRegion = page.sectionRegions[0];
-    const noteBlockEndPt = pageStoryRegion?.blockEndPt
+    // ECMA-376 17.11.21 / 17.18.34: pageBottom notes use the physical
+    // page's reserved body edge. Earlier continuous regions end inside the
+    // body and must not pull the page-wide note band into preceding text.
+    const noteRegion = page.sectionRegions.at(-1);
+    const noteBlockEndPt = noteRegion?.blockEndPt
       ?? Math.max(
         0,
         page.section.geometry.pageHeight - Math.abs(page.section.geometry.marginBottom),
@@ -1841,9 +2117,9 @@ function composePageStories(
       widthPt: noteInlineEndPt - noteInlineStartPt,
       heightPt: noteAdvancePt,
     });
-    const notePhysicalBounds = pageStoryRegion
+    const notePhysicalBounds = noteRegion
       ? Object.freeze(transformRect(
-          pageStoryRegion.coordinateSpace.logicalToPhysical,
+          noteRegion.coordinateSpace.logicalToPhysical,
           noteLogicalBounds,
         ))
       : noteLogicalBounds;
@@ -1867,7 +2143,7 @@ function composePageStories(
       ...(notes.length > 0 ? [Object.freeze({
         id: `notes:page:${page.pageIndex}`,
         kind: 'footnote' as const,
-        ...(pageStoryRegion ? { sectionRegionId: pageStoryRegion.id } : {}),
+        ...(noteRegion ? { sectionRegionId: noteRegion.id } : {}),
         logicalBounds: noteLogicalBounds,
         physicalBounds: notePhysicalBounds,
       })] : []),
@@ -2107,15 +2383,58 @@ function appendUnsupportedNotePositionDiagnostic(
   });
 }
 
-function pageAnchorDestinationPlan(layout: DocumentLayout) {
-  const destinations = new Map<string, Readonly<{
-    occurrenceId: string;
-    paragraphSource: SourceRef;
-    pageIndex: number;
-    flowDomainId: string;
-  }>>();
+/** The flow domain in which the section region holding `flowDomainId` opens
+ * on `page`; its page-start prescan is where page-owned anchors register. */
+function regionFlowDomainOpening(page: LayoutPage, flowDomainId: string): string {
+  return page.sectionRegions.find((region) => region.flowDomainIds.includes(flowDomainId))
+    ?.flowDomainIds[0] ?? flowDomainId;
+}
+
+/** Flow order and anchor line of each page-owned drawing in a pass. */
+function pageOwnedDrawingFlowPositions(layout: DocumentLayout) {
+  const positions = new Map<string, Readonly<{ order: number; lineKey: string }>>();
+  let order = 0;
   for (const page of layout.pages) {
     for (const node of page.layers.body) {
+      if (node.kind !== 'paragraph' || node.drawings.length === 0) continue;
+      pageOwnedAnchorKeysByLine(node).forEach((keys, lineIndex) => {
+        for (const key of keys) {
+          positions.set(key, Object.freeze({ order, lineKey: `${node.id}#${lineIndex}` }));
+          order += 1;
+        }
+      });
+    }
+  }
+  return positions;
+}
+
+function pageAnchorDestinationPlan(layout: DocumentLayout) {
+  const destinations = new Map<string, PageWrapDestination>();
+  for (const page of layout.pages) {
+    for (const node of page.layers.body) {
+      if (node.kind === 'table' && !node.ordinaryFlow
+        && node.sectionFlowOwnership === 'page') {
+        // §17.4.57 permits a page-positioned table to exclude text that
+        // precedes it in source order. The first pass owns its actual page and
+        // fragment extent; the next pass reserves exactly that page-local box.
+        // Continuations switch to text-owned flow, so only the first root
+        // fragment has page ownership and cursor (row 0, fragment 0).
+        // Scope: this resolves an accepted page/margin root's collision with
+        // preceding visible lines. It does not yet reinterpret §17.4.57's
+        // logical anchor at the following regular paragraph when that owner
+        // differs from the table's current source-page assignment.
+        const occurrenceId = bodyRootFloatingTablePlacementKey(node.source, page.pageIndex, 0, 0);
+        destinations.set(`table:${sourceKey(node.source)}`,
+          Object.freeze({
+            kind: 'floating-table',
+            occurrenceId,
+            tableSource: node.source,
+            bounds: Object.freeze({ ...node.flowBounds }),
+            pageIndex: page.pageIndex,
+            flowDomainId: node.flowDomainId,
+          }));
+        continue;
+      }
       if (node.kind !== 'paragraph') continue;
       for (const drawing of node.drawings) {
         const anchor = drawing.anchorLayer;
@@ -2124,10 +2443,14 @@ function pageAnchorDestinationPlan(layout: DocumentLayout) {
           || anchor.verticalOwnership !== 'page') continue;
         const occurrenceId = anchor.acquisitionOccurrenceId ?? anchor.occurrenceId;
         destinations.set(occurrenceId, Object.freeze({
+          kind: 'drawing',
           occurrenceId,
           paragraphSource: node.source,
           pageIndex: page.pageIndex,
-          flowDomainId: node.flowDomainId,
+          // word-page-anchor-region-registration: register the drawing where
+          // its section region opens on the page, so earlier columns of the
+          // region wrap around it too.
+          flowDomainId: regionFlowDomainOpening(page, node.flowDomainId),
         }));
       }
     }
@@ -2135,9 +2458,258 @@ function pageAnchorDestinationPlan(layout: DocumentLayout) {
   return destinations;
 }
 
+/** The anchors a pass applying `plan` prescans when it opens this flow domain. */
+function plannedPageStartAnchors(
+  plan: ReadonlyMap<string, PageWrapDestination>,
+  pageIndex: number,
+  flowDomainId: string,
+): PageStartAnchors {
+  return Object.freeze([...plan.values()]
+    .filter((destination) => (
+      destination.pageIndex === pageIndex && destination.flowDomainId === flowDomainId
+    ))
+    .map((destination) => destination.kind === 'drawing'
+      ? Object.freeze({
+          kind: 'drawing' as const,
+          occurrenceId: destination.occurrenceId,
+          paragraphSource: destination.paragraphSource,
+        })
+      : Object.freeze({
+          kind: 'floating-table' as const,
+          occurrenceId: destination.occurrenceId,
+          tableSource: destination.tableSource,
+          bounds: destination.bounds,
+        })));
+}
+
+function pageStartAnchorsIdentity(anchors: PageStartAnchors): string {
+  return anchors.map((anchor) => (anchor.kind === 'drawing'
+    ? `drawing|${anchor.occurrenceId}|${sourceKey(anchor.paragraphSource)}`
+    : `table|${anchor.occurrenceId}|${sourceKey(anchor.tableSource)}|${anchor.bounds.xPt}|${
+      anchor.bounds.yPt}|${anchor.bounds.widthPt}|${anchor.bounds.heightPt}`)).join('\n');
+}
+
+/**
+ * The page-index bound below which a snapshot of an in-progress page-anchor
+ * pass is final: no later pass of this convergence run can change those pages.
+ *
+ * A pass is a deterministic function of the body input, the reserves and the
+ * balance plan — fixed for the whole run — and of the values carried between
+ * passes: the anchor plan, the proven minimum table pages and the proven
+ * anchor-line deferrals. The pass reads the carry only at the events it
+ * reports through `onPageAnchorInput`; a deferral check that does not apply
+ * changes nothing and is not a read. Two passes whose event reads agree up to
+ * some moment are therefore in the same state at that moment, including every
+ * page closed by then.
+ *
+ * Pass k+1 applies the plan pass k observed (`pageAnchorDestinationPlan`),
+ * except that `resolveAnchorLineTests` may retest drawings on a page N, and
+ * may prove new deferrals for page N, only where a drawing registered on N
+ * did not land on N. Pass k's prescan of N then already disagrees with the
+ * observed plan (the drawing is observed later, or not yet placed), so both
+ * only affect pages at or after a disagreement. Each read can be predicted
+ * from closed pages of pass k:
+ *
+ * - A prescan of page p reads the plan's destinations on (p, flow domain). Once
+ *   p is closed, pass k's observed destinations there are final, and the read
+ *   agrees iff they equal what pass k prescanned.
+ * - A page-owned table floor read at page r changes the flow only when the
+ *   floor exceeds r. The next floor is absent, carried, or proven from a table
+ *   whose destination changed. The read agrees in every later pass iff the
+ *   current floor does not exceed r, the table's destination is unchanged,
+ *   and that destination lies on a page that itself stays final. A table
+ *   reached before the bound but placed at or after it could still move, and
+ *   its next floor could then act at r, so it lowers the bound to r.
+ * - An applied anchor-line deferral at page r ends r above the anchor line;
+ *   the bound stops at r. A carried proof for page p is verified only against
+ *   this pass's own reads up to its anchor line on p, which agree in the next
+ *   pass by induction; a new proof for the same anchor and page needs a
+ *   disagreeing prescan of p.
+ *
+ * By induction every later pass, including the converged one, reproduces
+ * pages below the returned bound exactly. The bound never exceeds the live
+ * page, whose content is still open. The first pass, which prescans source
+ * order rather than a plan, is covered by the same comparison.
+ *
+ * Scope: this proves stability across anchor convergence only. Later
+ * continuous-section balancing and header/footer reserve or pagination-field
+ * convergence can still replace a provisional publication (`exact:false`).
+ */
+function anchorStablePageLimit(
+  events: readonly PageAnchorInputEvent[],
+  appliedPlan: ReadonlyMap<string, PageWrapDestination> | null,
+  snapshot: BodyPaginationPassResult,
+): Readonly<{ limit: number; prescanDisagreementPage: number }> {
+  const observed = pageAnchorDestinationPlan(snapshot.layout);
+  let limit = livePageIndex(snapshot);
+  // A disagreeing prescan on a closed page stays disagreeing for the rest of
+  // this pass, so its page also caps every later snapshot of the pass.
+  let prescanDisagreementPage = Number.POSITIVE_INFINITY;
+  const reachedTables: Array<Readonly<{ reachedPage: number; placedPage: number }>> = [];
+  for (const event of events) {
+    // Event pages never decrease: the flow only advances.
+    if (event.pageIndex >= limit) break;
+    if (event.kind === 'prescan') {
+      const next = plannedPageStartAnchors(observed, event.pageIndex, event.flowDomainId);
+      if (pageStartAnchorsIdentity(next) !== pageStartAnchorsIdentity(event.anchors)) {
+        limit = event.pageIndex;
+        prescanDisagreementPage = event.pageIndex;
+        break;
+      }
+      continue;
+    }
+    if (event.kind === 'anchor-line-deferral') {
+      // A deferral ends its page above the anchor line. The pages before it
+      // are covered by the reads above; this page and later ones are not.
+      limit = event.pageIndex;
+      break;
+    }
+    const placed = observed.get(event.key);
+    const prior = appliedPlan?.get(event.key);
+    if ((event.floor !== undefined && event.floor > event.pageIndex)
+      || placed?.kind !== 'floating-table'
+      || (prior !== undefined && JSON.stringify(prior) !== JSON.stringify(placed))) {
+      limit = event.pageIndex;
+      break;
+    }
+    reachedTables.push(Object.freeze({
+      reachedPage: event.pageIndex,
+      placedPage: placed.pageIndex,
+    }));
+  }
+  for (let lowered = true; lowered;) {
+    lowered = false;
+    for (const table of reachedTables) {
+      if (table.reachedPage < limit && table.placedPage >= limit) {
+        limit = table.reachedPage;
+        lowered = true;
+      }
+    }
+  }
+  return Object.freeze({ limit, prescanDisagreementPage });
+}
+
+function anchorCarryIdentity(
+  plan: ReadonlyMap<string, unknown>,
+  deferrals: AnchorLineDeferrals,
+): string {
+  return `${anchorPlanIdentity(plan)}\u0004${anchorLineDeferralsIdentity(deferrals)}`;
+}
+
+/**
+ * The next pass's drawing plan and anchor-line deferrals after a planned pass
+ * (see anchor-line-deferral.ts for the Word rule).
+ *
+ * On each page N, the first anchor line in flow order whose page-owned
+ * anchors were registered on N but landed after N is Word's next test on N.
+ * When N registered exactly those anchors plus the anchors confirmed on N, the
+ * pass is Word's counterfactual and proves the deferral. Otherwise the next
+ * pass retests them on N with exactly that registration. A line reached later
+ * on N than a failed test is never tested on N, because the failed test ends
+ * the page above it.
+ */
+function resolveAnchorLineTests(
+  pass: BodyPaginationPassResult,
+  observed: Map<string, PageWrapDestination>,
+  previous: AnchorLineDeferrals,
+): Readonly<{ plan: ReadonlyMap<string, PageWrapDestination>; deferrals: AnchorLineDeferrals }> {
+  const events = pass.anchorInputs;
+  const prescansByPage = new Map<number, number[]>();
+  events.forEach((event, index) => {
+    if (event.kind !== 'prescan') return;
+    const indexes = prescansByPage.get(event.pageIndex);
+    if (indexes) indexes.push(index);
+    else prescansByPage.set(event.pageIndex, [index]);
+  });
+  let positions: ReturnType<typeof pageOwnedDrawingFlowPositions> | null = null;
+  let plan: Map<string, PageWrapDestination> | null = null;
+  let deferrals: Map<string, AnchorLineDeferralProof> | null = null;
+  for (const [pageIndex, indexes] of prescansByPage) {
+    const registeredAt = new Map<string, number>();
+    for (const index of indexes) {
+      const event = events[index] as Extract<PageAnchorInputEvent, { kind: 'prescan' }>;
+      for (const anchor of event.anchors) {
+        if (anchor.kind === 'drawing' && !registeredAt.has(anchor.occurrenceId)) {
+          registeredAt.set(anchor.occurrenceId, index);
+        }
+      }
+    }
+    const pushed = [...registeredAt.keys()].filter((key) => (
+      (observed.get(key)?.pageIndex ?? -1) > pageIndex
+    ));
+    if (pushed.length === 0) continue;
+    positions ??= pageOwnedDrawingFlowPositions(pass.layout);
+    let first: string | null = null;
+    for (const key of pushed) {
+      const order = positions.get(key)?.order;
+      if (order === undefined) continue;
+      if (first === null || order < positions.get(first)!.order) first = key;
+    }
+    if (first === null) continue;
+    const lineKey = positions.get(first)!.lineKey;
+    const line = [...positions].filter(([, position]) => position.lineKey === lineKey)
+      .map(([key]) => key);
+    const registrationIndex = registeredAt.get(first)!;
+    // Anchors on one line are tested together, in one registration.
+    if (line.some((key) => registeredAt.get(key) !== registrationIndex)) continue;
+    const tested = new Set(line);
+    const exact = indexes.every((index) => {
+      const event = events[index] as Extract<PageAnchorInputEvent, { kind: 'prescan' }>;
+      return pageStartAnchorsIdentity(event.anchors.filter((anchor) => !tested.has(anchor.occurrenceId)))
+        === pageStartAnchorsIdentity(plannedPageStartAnchors(observed, pageIndex, event.flowDomainId));
+    });
+    if (exact) {
+      const proof = createAnchorLineDeferralProof(
+        line,
+        pageIndex,
+        events,
+        pass.serializedAnchorInputs,
+        registrationIndex,
+        pageStartAnchorsIdentity,
+      );
+      deferrals ??= new Map(previous);
+      line.forEach((key) => deferrals!.set(anchorLineDeferralKey(key, pageIndex), proof));
+      continue;
+    }
+    plan ??= new Map(observed);
+    const registration = events[registrationIndex] as Extract<PageAnchorInputEvent, { kind: 'prescan' }>;
+    for (const key of line) {
+      const destination = observed.get(key)!;
+      plan.set(key, Object.freeze({
+        ...destination,
+        pageIndex,
+        flowDomainId: registration.flowDomainId,
+      }));
+    }
+  }
+  return Object.freeze({ plan: plan ?? observed, deferrals: deferrals ?? previous });
+}
+
 function anchorPlanIdentity(plan: ReadonlyMap<string, unknown>): string {
   return JSON.stringify([...plan].sort(([left], [right]) => left.localeCompare(right)));
 }
+
+function changedAnchorKeys(
+  applied: ReadonlyMap<string, PageWrapDestination>,
+  observed: ReadonlyMap<string, PageWrapDestination>,
+): ReadonlySet<string> {
+  const changed = new Set<string>();
+  for (const [key, destination] of applied) {
+    if (JSON.stringify(destination) !== JSON.stringify(observed.get(key))) changed.add(key);
+  }
+  for (const key of observed.keys()) {
+    if (!applied.has(key)) changed.add(key);
+  }
+  return changed;
+}
+
+/** What a header/footer reserve repagination reads of the previous pass. */
+type ReserveRepaginationCarry = Readonly<{
+  fieldContexts: ReturnType<typeof paginationFieldPageContexts>;
+  anchorPlan: ReturnType<typeof pageAnchorDestinationPlan>;
+}>;
+
+const ANCHOR_PASS_BASE_LIMIT = 16;
 
 function* paginateBodyWithAnchorConvergenceSteps(
   input: BodyLayoutInput,
@@ -2145,48 +2717,140 @@ function* paginateBodyWithAnchorConvergenceSteps(
   options: LayoutOptions,
   reserves: readonly HeaderFooterReserve[],
   balancePlan: BodyBalancePlan,
-  observer?: BodyPaginationPassObserver,
+  publisher?: BodyPagePublisher,
+  seedPlan?: ReturnType<typeof pageAnchorDestinationPlan>,
 ): PaginationSteps<BodyPaginationPassResult> {
-  const hasPageOwnedAnchors = input.sequence.some((entry) => (
-    entry.kind === 'body-block'
-    && entry.block.kind === 'paragraph'
-    && (entry.block.pageOwnedAnchorOccurrenceIds?.length ?? 0) > 0
-  ));
-  if (!hasPageOwnedAnchors) {
+  let pageOwnedAnchorCount = 0;
+  for (const entry of input.sequence) {
+    if (entry.kind !== 'body-block') continue;
+    pageOwnedAnchorCount += entry.block.kind === 'paragraph'
+      ? entry.block.pageOwnedAnchorOccurrenceIds?.length ?? 0
+      : entry.block.pageOwnedFloatingTable === true ? 1 : 0;
+  }
+  // Operational resource guard, not a claim about the state space. Pages
+  // before the first disagreeing read are final (`anchorStablePageLimit`), and
+  // once they are, one anchor line's Word test needs at most four passes:
+  // observe the line, retest it with exactly the anchors confirmed before it,
+  // prove the deferral, apply it. Anchor tests on later pages wait for the
+  // pages before them, so the budget grows with the anchors, not a constant.
+  const anchorPassLimit = ANCHOR_PASS_BASE_LIMIT + 4 * pageOwnedAnchorCount;
+  if (pageOwnedAnchorCount === 0) {
     return yield* paginateBodyPassSteps(
-      input, services, options, reserves, null, balancePlan, observer,
+      input, services, options, reserves, null, null, balancePlan,
+      publisher ? passPublicationObserver(publisher, livePageIndex) : undefined,
     );
   }
-  try {
-    return (yield* convergeExactStateSteps<Readonly<{
+  // Every anchor pass may publish, but only the leading pages
+  // `anchorStablePageLimit` proves every later pass of this run reproduces. A
+  // seeded run never publishes: it can be abandoned for an unseeded retry,
+  // whose passes form a different chain.
+  const anchorPassObserver = (
+    appliedPlan: ReadonlyMap<string, PageWrapDestination> | null,
+  ): BodyPaginationPassObserver | undefined => {
+    if (!publisher || seedPlan) return undefined;
+    const events: PageAnchorInputEvent[] = [];
+    // A prescan disagreement on a closed page is permanent for this pass.
+    let ceiling = Number.POSITIVE_INFINITY;
+    return passPublicationObserver(publisher, (pass) => {
+      const stable = anchorStablePageLimit(events, appliedPlan, pass);
+      ceiling = Math.min(ceiling, stable.prescanDisagreementPage);
+      return stable.limit;
+    }, {
+      onPageAnchorInput: (event) => { events.push(event); },
+      canExtend: () => ceiling > publisher.publishedPages,
+    });
+  };
+  const converge = function* (initialPlan?: ReturnType<typeof pageAnchorDestinationPlan>) {
+    type AnchorPassCarry = Readonly<{
+      plan: ReadonlyMap<string, PageWrapDestination>;
+      minimumTablePageBySource: ReadonlyMap<string, number>;
+      deferrals: AnchorLineDeferrals;
+    }>;
+    const noDeferrals: AnchorLineDeferrals = new Map();
+    return (yield* convergeExactStateSteps<AnchorPassCarry & Readonly<{
       pass: BodyPaginationPassResult;
-      plan: ReturnType<typeof pageAnchorDestinationPlan>;
-    }>, number>({
+    }>, number, AnchorPassCarry>({
+      ...(initialPlan ? { seedState: anchorCarryIdentity(initialPlan, noDeferrals) } : {}),
       step: function* anchorPass(previous) {
+        const appliedPlan = previous?.plan ?? initialPlan ?? null;
+        const appliedDeferrals = previous?.deferrals ?? noDeferrals;
         const pass = yield* paginateBodyPassSteps(
           input,
           services,
           options,
           reserves,
-          previous?.plan ?? null,
+          appliedPlan,
+          previous?.minimumTablePageBySource ?? null,
           balancePlan,
-          previous === undefined ? observer : undefined,
+          anchorPassObserver(appliedPlan),
+          appliedDeferrals.size > 0 ? appliedDeferrals : null,
         );
+        const observed = pageAnchorDestinationPlan(pass.layout);
+        // The unseeded pass registers source-order estimates, not anchor
+        // lines that reached their page, so it proves nothing about them.
+        const lineTests = appliedPlan === null
+          ? Object.freeze({ plan: observed, deferrals: appliedDeferrals })
+          : resolveAnchorLineTests(pass, observed, appliedDeferrals);
+        const minimumTablePageBySource = new Map<string, number>();
+        // Compare all destinations once. Testing every table against a fresh
+        // copy of the full plan would make table-heavy documents quadratic.
+        // A table floor needs the next pass to differ from this one only in
+        // that table's registration, so no drawing retest or new deferral.
+        const changedKeys = previous && appliedPlan
+          && lineTests.plan === observed && lineTests.deferrals === appliedDeferrals
+          ? changedAnchorKeys(appliedPlan, observed)
+          : null;
+        for (const [key, destination] of observed) {
+          if (destination.kind !== 'floating-table') continue;
+          const prior = appliedPlan?.get(key);
+          if (prior?.kind !== 'floating-table' || !changedKeys
+            || (changedKeys.size > 1 || (changedKeys.size === 1 && !changedKeys.has(key)))) {
+            continue;
+          }
+          // Only this table's changed exclusion can have moved its source in
+          // this run: input, reserves, and every other page anchor are fixed.
+          // Recheck the next candidate page, not the observed source page.
+          const provenPage = destination.pageIndex > prior.pageIndex
+            ? prior.pageIndex + 1
+            : previous?.minimumTablePageBySource.get(key);
+          if (provenPage !== undefined) minimumTablePageBySource.set(key, provenPage);
+        }
         return Object.freeze({
           pass,
-          plan: pageAnchorDestinationPlan(pass.layout),
+          plan: lineTests.plan,
+          minimumTablePageBySource,
+          deferrals: lineTests.deferrals,
         });
       },
-      stateOf: (value) => anchorPlanIdentity(value.plan),
-      limit: 16,
+      stateOf: (value) => anchorCarryIdentity(value.plan, value.deferrals),
+      // The next anchor pass reads only the plan, the proven table pages and
+      // the proven anchor-line deferrals; the superseded pass (its whole
+      // layout) is not carried into it.
+      carry: (value) => Object.freeze({
+        plan: value.plan,
+        minimumTablePageBySource: value.minimumTablePageBySource,
+        deferrals: value.deferrals,
+      }),
+      limit: anchorPassLimit,
     })).value.pass;
+  };
+  try {
+    try {
+      return yield* converge(seedPlan);
+    } catch (error) {
+      if (!seedPlan || !(error instanceof ExactConvergenceError)) throw error;
+      // A plan carried from another reserve/balance run is only a starting
+      // estimate. Its former page ownership may be invalid in this run; retry
+      // once from the unseeded source order before reporting non-convergence.
+      return yield* converge();
+    }
   } catch (error) {
     if (error instanceof ExactConvergenceError) {
       throw new LayoutInvariantError(
         'NON_CONVERGENCE',
         error.reason === 'cycle'
           ? 'Page-anchor destination acquisition repeated an exact-state cycle'
-          : 'Page-anchor destination acquisition reached the operational pass limit 16',
+          : `Page-anchor destination acquisition reached the operational pass limit ${anchorPassLimit}`,
       );
     }
     throw error;
@@ -2238,49 +2902,67 @@ function* paginateBodyWithColumnBalancingSteps(
   services: LayoutServices,
   options: LayoutOptions,
   reserves: readonly HeaderFooterReserve[],
-  observer?: BodyPaginationPassObserver,
+  publisher?: BodyPagePublisher,
+  seedPlan?: ReturnType<typeof pageAnchorDestinationPlan>,
 ): PaginationSteps<BodyPaginationPassResult> {
   let plan: BodyBalancePlan = new Map();
-  let pass = yield* paginateBodyWithAnchorConvergenceSteps(
+  let pass: BodyPaginationPassResult | null = yield* paginateBodyWithAnchorConvergenceSteps(
     input,
     services,
     options,
     reserves,
     plan,
-    observer,
+    publisher,
+    seedPlan,
   );
   if (pass.terminalDiagnostic !== null) return pass;
   for (const boundary of continuousBalanceBoundaries(input)) {
-    const baseline = sharedContinuousBoundaryPage(
-      pass.layout,
-      boundary.outgoingSectionOccurrenceId,
-      boundary.incomingSectionOccurrenceId,
-    );
-    if (baseline === null || baseline.outgoing.flowDomainIds.length < 2) continue;
-    const pageIndex = baseline.page.pageIndex;
-    const targetPt = exactRetainedColumnBalanceTarget(
-      input,
-      pass.allocations,
-      pass.footnoteReserveByPage,
-      baseline.page,
-      baseline.outgoing,
-    );
+    const target = continuousBalanceTarget(input, pass, boundary);
+    if (target === null) continue;
     const nextPlan = new Map(plan);
-    nextPlan.set(boundary.outgoingSectionOccurrenceId, Object.freeze({
-      pageIndex,
-      targetPt,
-    }));
+    nextPlan.set(boundary.outgoingSectionOccurrenceId, target);
     plan = nextPlan;
+    // The rebalanced pass reads only the balance plan and the accepted anchor
+    // plan of this one. Release this pass before the next one builds so two
+    // whole layouts are never live at once.
+    const anchorPlan = pageAnchorDestinationPlan(pass.layout);
+    pass = null;
     pass = yield* paginateBodyWithAnchorConvergenceSteps(
       input,
       services,
       options,
       reserves,
       plan,
+      undefined,
+      anchorPlan,
     );
     if (pass.terminalDiagnostic !== null) return pass;
   }
   return pass;
+}
+
+/** The exact column-balance target one continuous boundary adds to the plan,
+ * or null when the pass leaves nothing to balance there. */
+function continuousBalanceTarget(
+  input: BodyLayoutInput,
+  pass: BodyPaginationPassResult,
+  boundary: ReturnType<typeof continuousBalanceBoundaries>[number],
+): Readonly<{ pageIndex: number; targetPt: number }> | null {
+  const baseline = sharedContinuousBoundaryPage(
+    pass.layout,
+    boundary.outgoingSectionOccurrenceId,
+    boundary.incomingSectionOccurrenceId,
+  );
+  if (baseline === null || baseline.outgoing.flowDomainIds.length < 2) return null;
+  const pageIndex = baseline.page.pageIndex;
+  const targetPt = exactRetainedColumnBalanceTarget(
+    input,
+    pass.allocations,
+    pass.footnoteReserveByPage,
+    baseline.page,
+    baseline.outgoing,
+  );
+  return Object.freeze({ pageIndex, targetPt });
 }
 
 /** Compose one retained pass through the same layout-to-paint boundary used by
@@ -2383,33 +3065,31 @@ export function* paginateBodySteps(
   // private memo, while a later variant/document pagination starts fresh.
   services = createParagraphAcquisitionCacheServicesView(services);
   const owners = ownerMap(input);
-  let nextPublicationPages = 1;
+  let publishedPages = 0;
   let publicationFailed = false;
-  const passObserver: BodyPaginationPassObserver | undefined = observer
+  const publisher: BodyPagePublisher | undefined = observer
     ? {
-        shouldPublish: (committedPages) => (
-          !publicationFailed && committedPages >= nextPublicationPages
-        ),
-        publish: (pass, processedEntries) => {
+        get publishedPages() { return publishedPages; },
+        get failed() { return publicationFailed; },
+        publish: (pass, processedEntries, pageIndexLimit) => {
+          // The live page still owns the transition edge: section-region and
+          // page-final composition can change when the following page opens.
+          // It is never published, and the pass-level rule may bound the
+          // prefix further (see `anchorStablePageLimit`).
+          const limit = Math.min(pageIndexLimit, livePageIndex(pass));
+          const count = pass.layout.pages.findIndex((page) => page.pageIndex >= limit);
+          if (count <= publishedPages) return;
           try {
             const composed = composeBodyPaginationResult(pass, input, owners, options, false);
-            // The newest committed page still owns the live transition edge:
-            // section-region and page-final composition can change when the
-            // following page becomes committed. Keep one page as the checkpoint
-            // guard and publish only the prefix before it. This publication is
-            // deliberately provisional: header/footer and pagination-field
-            // convergence may replace it, and consumers receive `exact:false`.
+            // This publication is deliberately provisional: header/footer and
+            // pagination-field convergence may replace it, and consumers
+            // receive `exact:false`.
             const publishable = Object.freeze({
               ...composed,
-              pages: Object.freeze(composed.pages.slice(0, -1)),
+              pages: Object.freeze(composed.pages.slice(0, count)),
             }) as DocumentLayout;
-            if (publishable.pages.length > 0) {
-              observer.onPages(publishable, processedEntries);
-            }
-            nextPublicationPages = Math.max(
-              pass.layout.pages.length + 1,
-              pass.layout.pages.length * 2,
-            );
+            observer.onPages(publishable, processedEntries);
+            publishedPages = count;
           } catch {
             // A provisional snapshot is best-effort. The same live pagination
             // session remains authoritative and must be allowed to finish.
@@ -2418,19 +3098,30 @@ export function* paginateBodySteps(
         },
       }
     : undefined;
-  const seed = yield* paginateBodyWithColumnBalancingSteps(
-    input, services, options, [], passObserver,
+  let seed: BodyPaginationPassResult | null = yield* paginateBodyWithColumnBalancingSteps(
+    input, services, options, [], publisher,
   );
-  const converged = (yield* convergeHeaderFooterReserveSteps<
+  const convergence = convergeHeaderFooterReserveSteps<
     BodyPaginationPassResult,
-    number
-  >({
-    seed,
+    number,
+    ReserveRepaginationCarry
+  >(seed, {
     measure: (pass) => headerFooterReserves(pass, owners),
-    repaginate: function* reserveRepagination(reserves, current) {
-      const contexts = paginationFieldPageContexts(current.layout);
+    // A repagination reads only these facts of the pass before it (besides
+    // the measured reserves). Carrying them, rather than the pass, lets that
+    // pass's whole layout and pagination session be collected while the next
+    // one is built.
+    carry: (pass) => Object.freeze({
+      fieldContexts: paginationFieldPageContexts(pass.layout),
+      // Page-owned tables need one geometry-discovery pass and one exclusion
+      // pass. Reuse the accepted geometry for this later reserve iteration
+      // when stable; changed ownership still runs exact convergence anew.
+      anchorPlan: pageAnchorDestinationPlan(pass.layout),
+    }),
+    repaginate: function* reserveRepagination(reserves, carried) {
+      const contexts = carried.fieldContexts;
       const iterationServices = createFieldAcquisitionServicesView(services, {
-        totalPages: current.layout.pages.length,
+        totalPages: contexts.length,
         resolveDestinationPage: (pageIndex) => contexts[pageIndex],
       });
       return yield* paginateBodyWithColumnBalancingSteps(
@@ -2438,14 +3129,18 @@ export function* paginateBodySteps(
         iterationServices,
         options,
         reserves,
+        undefined,
+        carried.anchorPlan,
       );
     },
     identity: (pass) => paginationFieldPageContexts(pass.layout),
     requiresConvergence: seed.session.hasPaginationFields,
-  })).result;
-  return assertAndDeepFreezeDocumentLayout(
+  });
+  seed = null;
+  const converged = (yield* convergence).result;
+  return (yield* assertAndDeepFreezeDocumentLayoutSteps(
     composeBodyPaginationResult(converged, input, owners, options, true),
-  ) as DocumentLayout;
+  )) as DocumentLayout;
 }
 
 export function paginateBody(

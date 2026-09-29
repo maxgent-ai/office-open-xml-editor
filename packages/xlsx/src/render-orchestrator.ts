@@ -39,6 +39,8 @@ import {
 import type { ParsedWorkbook, Worksheet, ViewportRange, RenderViewportOptions } from './types.js';
 import {
   renderViewport,
+  bindXlsxOfficeFontRoutes,
+  pinXlsxGridGeometry,
   prepareWorksheetMath,
   worksheetHasUncachedMath,
   imageCacheKey,
@@ -51,6 +53,7 @@ import {
 } from './renderer.js';
 import { GridGeometry, type GridAxisGeometry } from './internal/grid-geometry.js';
 import { usesNativeOneCellExtent } from './internal/cell-anchor-geometry.js';
+import { rotatedImageBounds } from './internal/image-anchor-transform.js';
 import {
   clearOptionalImageUnavailable,
   markOptionalImageUnavailable,
@@ -174,6 +177,7 @@ interface CellAnchorRange {
   editAs?: string;
   nativeExtCx?: number;
   nativeExtCy?: number;
+  rotation?: number;
 }
 
 function anchorDisplaySize(
@@ -226,6 +230,10 @@ function anchorMayIntersectViewport(
     ? fromY + ((anchor.nativeExtCy as number) * scale) / EMU_PER_PX
     : marker(row, anchor.toRow, anchor.toRowOff);
   if (toX <= fromX || toY <= fromY) return false;
+  const bounds = rotatedImageBounds(
+    { x: fromX, y: fromY, width: toX - fromX, height: toY - fromY },
+    anchor.rotation,
+  );
   const effectiveFreeze = frame
     ? axes.effectiveFrozenBands({
         scale,
@@ -250,14 +258,14 @@ function anchorMayIntersectViewport(
       || (low < scrollEnd && high > scrollStart);
   };
   return intersects(
-    fromX,
-    toX,
+    bounds.x,
+    bounds.x + bounds.width,
     col.offsetOf(effectiveFreeze.cols + 1),
     col.offsetOf(viewport.col),
     col.offsetOf(viewport.col + viewport.cols),
   ) && intersects(
-    fromY,
-    toY,
+    bounds.y,
+    bounds.y + bounds.height,
     row.offsetOf(effectiveFreeze.rows + 1),
     row.offsetOf(viewport.row),
     row.offsetOf(viewport.row + viewport.rows),
@@ -818,6 +826,8 @@ async function renderWorksheetViewportLeased(
   const styles = deps.styles;
   const measurementCtx = target.getContext('2d') as CanvasRenderingContext2D | null;
   if (!measurementCtx) throw new Error('XLSX render target does not provide a 2-D canvas context');
+  bindXlsxOfficeFontRoutes(measurementCtx, deps.ws, opts.officeFontRoutes, opts.googleSubstitutes === true);
+  pinXlsxGridGeometry(deps.ws, opts.authoritativeMdw);
   const ws = deps.ws.isDialogSheet
     ? deps.ws
     : worksheetWithAutoRowHeights(measurementCtx, deps.ws, styles, deps.cjkFallback);

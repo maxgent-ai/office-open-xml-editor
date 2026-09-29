@@ -1,0 +1,16 @@
+<!doctype html><html><body><script type="module">
+import { PptxPresentation } from '/src/index.ts';
+window.renderPatternParserFixture = async (bytes, index, mode) => {
+  const presentation = await PptxPresentation.load(new Uint8Array(bytes).buffer, { mode });
+  try {
+    const bmp = await presentation.renderSlideToBitmap(index, { width: 1280, dpr: 1 });
+    const canvas = document.createElement('canvas');
+    canvas.width = bmp.width; canvas.height = bmp.height;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(bmp, 0, 0); bmp.close();
+    return { width: canvas.width, height: canvas.height,
+      bytes: Array.from(ctx.getImageData(0, 0, canvas.width, canvas.height).data) };
+  } finally { presentation.destroy(); }
+};
+document.body.dataset.ready = 'true';
+</script></body></html>

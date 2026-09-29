@@ -4,6 +4,7 @@ import { PNG } from 'pngjs';
 import pixelmatch from 'pixelmatch';
 import {
   captureOrComparePrivateItem,
+  clearPrivateCandidateItemOutput,
   preparePrivateCorpus,
   verifyPrivateItemManifest,
 } from '../../../../tests/visual/private-corpus.mjs';
@@ -110,9 +111,6 @@ test.describe('visual regression', () => {
           const msg = await page.evaluate(() => document.body.dataset.errorMessage ?? '');
           throw new Error(`Fixture error on ${name} slide ${slideNum}: ${msg}`);
         }
-
-        // Give the browser one extra frame to flush composite layers
-        await page.waitForTimeout(200);
 
         // ── Capture the canvas via toDataURL ──────────────────────────────
         const dataUrl = await page.evaluate(() => {
@@ -251,6 +249,7 @@ test.describe('private corpus self regression', () => {
     test(file, async ({ page }) => {
       test.setTimeout(600_000);
       const stem = file.slice(0, -'.pptx'.length);
+      if (!SNAPSHOT) clearPrivateCandidateItemOutput({ stem, itemKind: 'slide' });
       const openSlide = async (slideIndex: number) => {
         await page.goto(
           `/tests/visual/fixture.html?pptx=${encodeURIComponent(`private/${stem}`)}`
@@ -265,7 +264,6 @@ test.describe('private corpus self regression', () => {
           const message = await page.evaluate(() => document.body.dataset.errorMessage ?? '');
           throw new Error(`${stem} slide ${slideIndex + 1}: ${message}`);
         }
-        await page.waitForTimeout(200);
       };
 
       await openSlide(0);
@@ -280,7 +278,6 @@ test.describe('private corpus self regression', () => {
             }).renderPptxVrtSlide;
             await render(index);
           }, slideIndex);
-          await page.waitForTimeout(200);
         }
         const dataUrl = await page.evaluate(() =>
           (document.querySelector('canvas') as HTMLCanvasElement | null)?.toDataURL('image/png'));

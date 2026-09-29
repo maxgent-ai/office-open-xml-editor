@@ -51,11 +51,46 @@ function recordingContext() {
     createRadialGradient(...args: unknown[]) {
       operations.push({ name: 'createRadialGradient', args }); return gradient;
     },
+    createPattern() {
+      return {
+        setTransform(matrix: DOMMatrix2DInit) {
+          operations.push({ name: 'patternTransform', args: [matrix] });
+        },
+      };
+    },
   } as unknown as CanvasRenderingContext2D;
   return { ctx, operations, gradient };
 }
 
 describe('shared DrawingML shape painter', () => {
+  it('keeps a DOCX point-space pattern on the page-origin 8 pt grid', () => {
+    const previous = globalThis.OffscreenCanvas;
+    class TileCanvas {
+      constructor(public width: number, public height: number) {}
+      getContext() { return { fillStyle: '', fillRect() {} }; }
+    }
+    Object.defineProperty(globalThis, 'OffscreenCanvas', {
+      configurable: true, value: TileCanvas,
+    });
+    try {
+      const { ctx, operations } = recordingContext();
+      paintDrawingMLShape(ctx, {
+        rect: { x: 90, y: 62.18, w: 432, h: 72 },
+        geometry: { kind: 'preset', name: 'rect', adjustments: [] },
+        fill: { fillType: 'pattern', preset: 'pct30', fg: 'D21D54', bg: '12CED4' },
+        stroke: null,
+        transform: { rotationDeg: 0, flipH: false, flipV: false },
+      }, 1);
+      expect(operations).toContainEqual({
+        name: 'patternTransform', args: [{ a: 1 / 8, b: 0, c: 0, d: 1 / 8, e: 0, f: 0 }],
+      });
+    } finally {
+      Object.defineProperty(globalThis, 'OffscreenCanvas', {
+        configurable: true, value: previous,
+      });
+    }
+  });
+
   it('renders preset geometry, gradients, transforms, and point-width strokes once', () => {
     const plan: DrawingMLShapePaintPlan = {
       rect: { x: 10, y: 20, w: 100, h: 50 },
@@ -217,5 +252,42 @@ describe('shared DrawingML shape painter', () => {
     expect(operations.filter(({ name }) => name === 'clip')).toEqual([
       { name: 'clip', args: [] },
     ]);
+  });
+
+  // ECMA-376 §20.1.9.15: custom paths are filled and stroked on their own.
+  it('honours per-path fill modes and stroke flags of custom geometry', () => {
+    const square = (at: number) => [
+      { cmd: 'moveTo' as const, x: at, y: at },
+      { cmd: 'lineTo' as const, x: at + .2, y: at },
+      { cmd: 'lineTo' as const, x: at + .2, y: at + .2 },
+      { cmd: 'close' as const },
+    ];
+    const plan: DrawingMLShapePaintPlan = {
+      rect: { x: 0, y: 0, w: 100, h: 100 },
+      geometry: {
+        kind: 'custom',
+        subpaths: [square(0), square(.3), square(.6)],
+        paint: [{ fill: 'none' }, { stroke: false }, { fill: 'darken' }],
+      },
+      fill: { fillType: 'solid', color: 'FF0000' },
+      stroke: { color: '0000FF', width: 1 },
+      transform: { rotationDeg: 0, flipH: false, flipV: false },
+    };
+    const { ctx, operations } = recordingContext();
+    paintDrawingMLShape(ctx, plan, 1);
+    const paints = operations
+      .filter(({ name }) => name === 'fill' || name === 'stroke' || name === 'beginPath')
+      .map(({ name }) => name);
+    expect(paints).toEqual([
+      'beginPath', 'stroke',
+      'beginPath', 'fill',
+      'beginPath', 'fill', 'fill', 'stroke',
+    ]);
+    expect(operations.filter(({ name }) => name === 'fillStyle').map(({ args }) => args[0]))
+      .toContain('rgba(0,0,0,0.4)');
+
+    const clip = recordingContext();
+    clipDrawingMLShape(clip.ctx, plan);
+    expect(clip.operations.filter(({ name }) => name === 'moveTo')).toHaveLength(2);
   });
 });

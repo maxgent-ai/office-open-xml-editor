@@ -70,6 +70,8 @@ export function createAuxCanvasForContext(
     }
   }
   try {
+    // This canvas comes from the caller's rendering context. Its constructor
+    // preserves the host canvas class when document.createElement is unavailable.
     const constructor = ctx.canvas?.constructor;
     if (typeof constructor !== 'function') return null;
     const CanvasConstructor = constructor as new (width: number, height: number) => AuxCanvas;

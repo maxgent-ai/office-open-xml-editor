@@ -15,6 +15,9 @@ import init, { XlsxArchive, reinit } from './wasm/xlsx_parser.js';
 import {
   decodeDataUrl,
   preloadGoogleFonts,
+  loadOfficeFontFallbacks,
+  unloadOfficeFontFallbacks,
+  type OfficeFontFallbackRoute,
   WasmParserHost,
   dropDecodedBitmapCache,
   dropSvgImageCache,
@@ -36,7 +39,8 @@ import {
   type WorkerSvgDecodeResponse,
 } from '@silurus/ooxml-core/worker';
 import { workerRenderDeps } from './worker-render-deps.js';
-import { XLSX_GOOGLE_FONTS, xlsxFontPreloadNames } from './google-fonts.js';
+import { XLSX_GOOGLE_FONTS, xlsxFontPreloadNames, xlsxOfficeFontRequests, xlsxWorksheetOfficeFontRequests } from './google-fonts.js';
+import { officeRequestKey } from './shape-office-line.js';
 import { resolveSharedStringRows } from './shared-strings.js';
 import {
   addWorksheetCacheUsage,
@@ -46,7 +50,7 @@ import {
 } from './worksheet-resource-limits.js';
 import type { ParsedWorkbook, Worksheet } from './types.js';
 import { WorksheetViewProjectionCache } from './worker-protocol.js';
-import { GridGeometry } from './internal/grid-geometry.js';
+import { evictWorkerWorksheets } from './internal/worksheet-cache.js';
 import { readXlsxArchiveBootstrap } from './internal/archive-bootstrap.js';
 import type { RenderWorkerRequest, RenderWorkerResponse } from './worker-protocol.js';
 import { isWorksheetPullCommand, WorksheetPullWorker } from './worksheet-pull-worker.js';
@@ -72,7 +76,28 @@ let renderers: LoadedWorkerRenderers = {};
  *  FontFaceSet (`self.fonts`) and terminates with it, so there is nothing to
  *  release — only the sequencing (fonts landed before first paint) matters. */
 let fontsLoaded: Promise<unknown> = Promise.resolve();
+let officeFontFaces: FontFace[] = [];
+let officeFontRoutes: Record<string, OfficeFontFallbackRoute> = {};
+let checkedOfficeTupleSet = new Set<string>();
+let googleSubstitutes = false;
+let officeSheetLoads = new WeakMap<Worksheet, Promise<void>>();
+let officeSheetLoadQueue: Promise<void> = Promise.resolve();
+
+function startFontLoad(parsed: ParsedWorkbook, useGoogleFonts: boolean): void {
+  googleSubstitutes = useGoogleFonts;
+  fontsLoaded = Promise.all([
+    useGoogleFonts
+      ? preloadGoogleFonts(xlsxFontPreloadNames(parsed, cjkFallback), XLSX_GOOGLE_FONTS)
+      : Promise.resolve([]),
+    loadOfficeFontFallbacks(xlsxOfficeFontRequests(parsed)),
+  ]).then(([, office]) => {
+    officeFontFaces = office.faces;
+    officeFontRoutes = office.routes;
+    checkedOfficeTupleSet = new Set(office.checked);
+  });
+}
 const sheetCache = new Map<number, Worksheet>();
+const provisionalSheets = new Map<number, Worksheet>();
 const viewProjectionCache = new WorksheetViewProjectionCache();
 const sheetCacheUsage = new Map<number, WorksheetCacheUsage>();
 let retainedSheetUsage: WorksheetCacheUsage = {
@@ -127,6 +152,17 @@ const worksheetPull = new WorksheetPullWorker(
   (rows) => {
     if (workbook) resolveSharedStringRows(rows, workbook.sharedStrings);
   },
+  {
+    preview: (sheetIndex, worksheet) => {
+      provisionalSheets.set(sheetIndex, worksheet);
+      sheetCache.set(sheetIndex, worksheet);
+    },
+    stop: (sheetIndex) => {
+      const preview = provisionalSheets.get(sheetIndex);
+      provisionalSheets.delete(sheetIndex);
+      if (preview && sheetCache.get(sheetIndex) === preview) sheetCache.delete(sheetIndex);
+    },
+  },
 );
 
 const rawPost = (msg: unknown, transfer?: Transferable[]) =>
@@ -168,6 +204,17 @@ self.onmessage = async (e: MessageEvent<
     viewProjectionCache.release(req.projectionId);
     return;
   }
+  if (req.type === 'evictWorksheets') {
+    try {
+      retainedSheetUsage = evictWorkerWorksheets(
+        req.sheetIndices, sheetCache, sheetCacheUsage, retainedSheetUsage, viewProjectionCache,
+      );
+      post({ type: 'worksheetsEvicted', id: req.id });
+    } catch (error) {
+      post({ type: 'error', id: req.id, ...serializeWorkerError(error) });
+    }
+    return;
+  }
   const id = req.id;
   if (req.type === 'openSheetSession') worksheetPull.reserveOpen(req);
   try {
@@ -195,7 +242,7 @@ self.onmessage = async (e: MessageEvent<
     if (req.type === 'parse' || req.type === 'parseDelimitedText') {
       await worksheetPull.reset();
     }
-    await worksheetPull.run(async () => {
+    const runRequest = async (): Promise<void> => {
     if (req.type === 'parse' || archiveBacked) await host.ensureReady();
     if (req.type !== 'parse' && req.type !== 'parseDelimitedText' && host.archive) {
       const retained = host.archive;
@@ -212,6 +259,14 @@ self.onmessage = async (e: MessageEvent<
       // zip path. Symmetric with XlsxWorkbook.destroy() and the docx/pptx render
       // workers (issue #781).
       cjkFallback = req.cjkFallback ?? 'jp';
+      await fontsLoaded;
+      await officeSheetLoadQueue;
+      unloadOfficeFontFallbacks(officeFontFaces);
+      officeFontFaces = [];
+      officeFontRoutes = {};
+      checkedOfficeTupleSet = new Set();
+      officeSheetLoads = new WeakMap();
+      officeSheetLoadQueue = Promise.resolve();
       sheetCache.clear();
       viewProjectionCache.clear();
       sheetCacheUsage.clear();
@@ -231,12 +286,7 @@ self.onmessage = async (e: MessageEvent<
         retainedSheetUsage = measured;
         sheetCache.set(0, parsed.worksheet);
         sheetCacheUsage.set(0, measured);
-        fontsLoaded = req.useGoogleFonts
-          ? preloadGoogleFonts(
-              xlsxFontPreloadNames(parsed.workbook, cjkFallback),
-              XLSX_GOOGLE_FONTS,
-            )
-          : Promise.resolve();
+        startFontLoad(parsed.workbook, !!req.useGoogleFonts);
         const worksheetJson = new TextEncoder()
           .encode(JSON.stringify(parsed.worksheet)).buffer as ArrayBuffer;
         post({
@@ -269,16 +319,7 @@ self.onmessage = async (e: MessageEvent<
       );
       workbook = bootstrap.workbook;
       cjkFallback = xlsxCjkFallback(workbook, cjkFallback);
-      if (req.useGoogleFonts) {
-        // Mirror XlsxWorkbook._load exactly: queue Google Fonts substitutes for
-        // every styled font name, plus the generic Arabic fallbacks. Fonts must
-        // land before rendering (which measures text), so we keep the promise
-        // and await it in the renderViewport handler.
-        fontsLoaded = preloadGoogleFonts(
-          xlsxFontPreloadNames(workbook, cjkFallback),
-          XLSX_GOOGLE_FONTS,
-        );
-      }
+      startFontLoad(workbook, !!req.useGoogleFonts);
       post({ type: 'parsed', id, workbook, usage: bootstrap.usage });
       return;
     }
@@ -289,6 +330,29 @@ self.onmessage = async (e: MessageEvent<
       const { renderWorksheetViewport } = await orchestratorModule;
       const ws = sheetCache.get(req.sheetIndex);
       if (!ws) throw new Error('Worksheet is not loaded through its pull session');
+      let sheetFonts = officeSheetLoads.get(ws);
+      if (!sheetFonts) {
+        // Different sheets may be rendered concurrently. Serialize their
+        // worksheet-only probes so a completed missing tuple is tried once,
+        // while a tuple omitted by a preflight budget can be retried later.
+        sheetFonts = officeSheetLoadQueue.then(async () => {
+          const extraRequests = xlsxWorksheetOfficeFontRequests(ws).filter((request) => {
+            const key = officeRequestKey(request);
+            return !checkedOfficeTupleSet.has(key) && !(key in officeFontRoutes);
+          });
+          if (extraRequests.length === 0) return;
+          const extra = await loadOfficeFontFallbacks(extraRequests);
+          officeFontFaces.push(...extra.faces);
+          for (const key of extra.checked) {
+            if (checkedOfficeTupleSet.has(key)) continue;
+            checkedOfficeTupleSet.add(key);
+          }
+          Object.assign(officeFontRoutes, extra.routes);
+        });
+        officeSheetLoadQueue = sheetFonts.catch(() => {});
+        officeSheetLoads.set(ws, sheetFonts);
+      }
+      await sheetFonts;
       // Apply view-only size mutations to a render-local projection. Multiple
       // viewers may share this worker cache while retaining different outline
       // and resize state, so the cached worksheet itself must stay unchanged.
@@ -304,21 +368,18 @@ self.onmessage = async (e: MessageEvent<
       if (req.viewProjection?.autoRowHeightsPrepared) {
         markAutoRowHeightsPrepared(renderWorksheet);
       }
-      const maximumDigitWidth = req.layoutMetrics?.maximumDigitWidth;
-      if (maximumDigitWidth !== undefined) {
-        if (!Number.isFinite(maximumDigitWidth) || maximumDigitWidth <= 0) {
-          throw new Error('XLSX maximum digit width must be a finite positive number');
-        }
-        GridGeometry.forWorksheet(renderWorksheet, maximumDigitWidth);
-      }
       const canvas = new OffscreenCanvas(1, 1); // orchestrator resizes it
       await renderWorksheetViewport(
         { ...workerRenderDeps(renderWorksheet, workbook.styles, renderers), cjkFallback },
         canvas,
         req.viewport,
         // Supply the in-worker byte loader so embedded images decode straight
-        // from the retained archive (no main-thread round-trip).
-        { ...renderOpts, fetchImage: getImage },
+        // from the retained archive (no main-thread round-trip). Pass the
+        // viewer's MDW through the render bind: seeding GridGeometry before
+        // that bind is ineffective because the worker's FontFaceSet can
+        // invalidate it on first use.
+        { ...renderOpts, authoritativeMdw: req.layoutMetrics?.maximumDigitWidth,
+          officeFontRoutes, googleSubstitutes, fetchImage: getImage },
         svgDecodeClient.decode,
       );
       const bitmap = canvas.transferToImageBitmap();
@@ -354,7 +415,15 @@ self.onmessage = async (e: MessageEvent<
       post({ type: 'markdownRendered', id, markdown });
       return;
     }
-    });
+    };
+    // The provisional sheet has no archive-backed paint dependencies. Render
+    // its first frame while the cursor owns the unacknowledged covering chunk;
+    // the main-thread viewer releases that chunk after receiving the bitmap.
+    if (req.type === 'renderViewport' && provisionalSheets.has(req.sheetIndex)) {
+      await runRequest();
+    } else {
+      await worksheetPull.run(runRequest);
+    }
   } catch (err) {
     if (req.type === 'openSheetSession') worksheetPull.abandonOpen(req.sessionId);
     try {

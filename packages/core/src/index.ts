@@ -63,6 +63,7 @@ export type {
   ChartThreeDSeriesAxis,
   ChartDisplayUnits,
   ChartDisplayUnitsLabel,
+  ChartAxisNumberFormat,
   ChartExElementStyle,
   ChartLineDashSegment,
   ChartexHistogramBinning,
@@ -124,6 +125,23 @@ export { sniffCfb, type CfbKind } from './errors/cfb-sniff';
 // call: it returns plaintext ZIP bytes, decrypting an Agile-encrypted file when
 // a password is supplied ([MS-OFFCRYPTO], PD8).
 export { assertNotCfbContainer, resolveOoxmlContainer, toArrayBuffer } from './errors/cfb-guard';
+// Application-supplied model sources (LoadOptions.modelSources): a
+// format-generic contract for opening non-OOXML input into a renderer's own
+// model archive. Core and the format packages never name a concrete source.
+// A type-only root export keeps the optional source runtime out of every
+// ordinary OOXML entry. Selected sources load it through the internal subpath.
+export type {
+  AdmittedModelSourceLoad,
+  ModelSource,
+  ModelSourceConfig,
+  ModelSourceConfigValue,
+  ModelSourceLoad,
+  ModelSourceModule,
+  ModelSourceModuleDescriptor,
+  ModelSourceTarget,
+  OpenedModelSource,
+  OpenedModelSourceModule,
+} from './source/model-source';
 // Agile Encryption decryption ([MS-OFFCRYPTO]): `decryptOoxml` turns an
 // encrypted CFB + password into plaintext ZIP bytes. Lower-level primitives
 // (key derivation, EncryptionInfo parse) are exported for testing / advanced use.
@@ -140,6 +158,7 @@ export { readCfbStream } from './errors/cfb-read';
 export {
   preloadGoogleFonts,
   unloadGoogleFonts,
+  activeFontSet,
   type FontPreloadEntry,
 } from './fonts/preload';
 // Embedded-font registration: docx `.odttf` (§17.8.1 obfuscated) + pptx
@@ -155,7 +174,15 @@ export {
 // Cambria → Caladea, popular web fonts, Arabic Noto fallbacks). Each package
 // spreads this into its own map; script-fallback Noto faces live in
 // SCRIPT_GOOGLE_FONTS below.
-export { GOOGLE_FONT_SUBSTITUTES } from './fonts/google-fonts';
+export { GOOGLE_FONT_SUBSTITUTES, loadedGoogleRegularAliases } from './fonts/google-fonts';
+export {
+  fontFaceWeightCovers,
+  loadOfficeFontFallbacks,
+  unloadOfficeFontFallbacks,
+  type OfficeFontFallbackRequest,
+  type OfficeFontFallbackRoute,
+  type LoadedOfficeFontFallbacks,
+} from './fonts/office-fallback';
 export { canvasFontString, createCanvasFontRoute, type CanvasFontRoute } from './fonts/canvas-route';
 export {
   parseOpenTypeLineMetrics,
@@ -206,12 +233,13 @@ export {
   type CustGeomEndpoint,
   type CustGeomEndpoints,
 } from './shape/custgeom-endpoints';
-export { hexToRgba, relativeLuma, autoContrastColor, resolveFill, applyStroke } from './shape/paint';
+export { hexToRgba, relativeLuma, autoContrastColor, resolveFill, applyStroke, withPatternCoordinateSpace, withInheritedPatternScope } from './shape/paint';
 export { buildShapePath, drawStar, drawPolygon, ooxmlArcTo } from './shape/preset';
 export {
   paintDrawingMLShape,
   clipDrawingMLShape,
   withDrawingMLShapeTransform,
+  type DrawingMLPathPaint,
   type DrawingMLShapeFill,
   type DrawingMLShapeGeometry,
   type DrawingMLShapePaintPlan,
@@ -292,7 +320,12 @@ export {
 // Cross-format raster/metafile admission and decode boundary.
 export {
   decodeRasterOrMetafile,
+  getIncompleteMetafileReport,
+  isOoxmlIncompleteMetafileError,
+  OoxmlIncompleteMetafileError,
   type DecodeRasterOptions,
+  type IncompleteMetafilePolicy,
+  type IncompleteMetafileReport,
 } from './image/raster-or-metafile';
 export {
   TiffDecodeError,
@@ -314,6 +347,9 @@ export {
   HARD_MAX_DECODED_IMAGE_BYTES,
   MAX_CONCURRENT_IMAGE_DECODES,
   MAX_DECODED_IMAGE_BYTES,
+  MAX_IMAGE_EFFECT_BASE_PIXELS,
+  MAX_IMAGE_EFFECT_PASSES,
+  MAX_IMAGE_EFFECT_PIXEL_WORK,
   MAX_RASTER_DIMENSION,
   MAX_RASTER_SOURCE_DIMENSION,
   MAX_RASTER_PIXELS,
@@ -368,6 +404,15 @@ export {
 // applies its `<a:duotone>` recolour once per (path + colours). Shared by the
 // docx and pptx renderers so a duotone picture decodes + recolours once and is
 // reused across page/slide revisits. xlsx keeps its own worksheet-scoped map.
+// CT_Blip pixel effects (grayscl, biLevel, clrChange) applied in document
+// order with the duotone, through the same decode cache.
+export {
+  applyBlipPixelEffects,
+  assertBlipPixelEffectsBudget,
+  blipLuminance,
+  type BlipEffect,
+  type BlipPixelEffects,
+} from './image/blip-effects';
 export {
   getCachedDuotoneBitmapByPath,
   duotoneCacheKey,
@@ -390,6 +435,7 @@ export {
   buildPresetGeometryFillPath,
   getPresetGeometryBounds,
   getConnectorAnchors,
+  pathFillModeOverlay,
 } from './shape/preset-geometry';
 export { type PresetPath } from './shape/preset-geometry/path-executor';
 // ECMA-376 §20.1.9.19 WordArt text-warp envelopes (presetTextWarpDefinitions.xml).
@@ -628,6 +674,12 @@ export type { VerticalGlyphCellMetrics } from './text/vertical-vert-feature';
 // with the 1900 Lotus leap-year-bug compat and 1900/1904 date-system select.
 // Used by the xlsx cell formatter and the core chart date formatter.
 export { excelSerialToUtcDate, utcDateToExcelSerial } from './excel-date';
+export {
+  formatExcelDateTime,
+  isDateFormatSection,
+  splitFormatSections,
+  textSectionIndex,
+} from './excel-number-format';
 export { highlightBox } from './text/highlight-box';
 export {
   distributeLineSlack,
@@ -696,14 +748,6 @@ export {
   sanitizeHyperlinkUrl,
   openExternalHyperlink,
 } from './interaction/hyperlink';
-// Legacy family-name compatibility profiles retained for callers that cannot
-// inspect the selected font resource. New DOCX resource paths consume parsed or
-// measured metrics instead of adding more family-specific profiles here.
-export {
-  fontWinLineHeightRatio,
-  intendedSingleLinePx,
-  correctLineMetrics,
-} from './text/line-metrics';
 // Resolved font-resource metrics used when a loader owns concrete bytes or a
 // browser-selected face.
 export {
@@ -711,6 +755,13 @@ export {
   openTypeDesignLineRatios,
   type ResolvedFontMetric,
 } from './fonts/resource-metrics';
+export {
+  findReferenceFontMetrics,
+  type FindReferenceFontMetricsOptions,
+  type ReferenceFontMetricProfile,
+  type ReferenceFontSource,
+  type ReferenceFontStyle,
+} from './fonts/reference-font-metrics';
 // Backward-compatible exact-local resource loader. Format packages should not
 // add family-specific requests; DOCX now derives its metrics from resolved
 // resources and no longer uses this API for a Meiryo-only path.
@@ -722,9 +773,7 @@ export {
   type ResolvedLocalFontMetric,
   type LoadedLocalFontMetrics,
 } from './fonts/local-metrics';
-// Format-agnostic same-font Canvas-vs-Word line-fit bias. Consumers keep their
-// layout/paint wiring local, while the metric provenance and normalized family
-// matching remain shared data.
+// Deprecated compatibility export; production layout no longer calls it.
 export { fontAdvanceBiasEm } from './text/font-advance-metrics';
 // IX2 in-document text search (findText). Format-agnostic index + match →
 // run-slice resolution (buildTextIndex/findMatches), the pure highlight-extent

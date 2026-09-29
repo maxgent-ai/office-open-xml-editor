@@ -22,3 +22,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 xlsx-parser = { path = "../xlsx/parser" }
 docx-parser = { path = "../docx/parser" }
 pptx-parser = { path = "../pptx/parser" }
+docx-model = { path = "../docx/model" }
+xlsx-model = { path = "../xlsx/model" }
+pptx-model = { path = "../pptx/model" }
+ooxml-common = { path = "../ooxml-common" }
+
+[dev-dependencies]
+zip = { workspace = true }

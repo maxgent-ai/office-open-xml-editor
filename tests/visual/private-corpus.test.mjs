@@ -1,7 +1,14 @@
 import assert from 'node:assert/strict';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test from 'node:test';
 import { PNG } from 'pngjs';
-import { pngPixelsEqual } from './private-corpus.mjs';
+import {
+  clearPrivateCandidateItemOutput,
+  harnessBootstrapDiffViolations,
+  pngPixelsEqual,
+} from './private-corpus.mjs';
 
 test('private corpus self-VRT compares decoded pixels, not encoder bytes', () => {
   const image = new PNG({ width: 2, height: 1 });
@@ -20,4 +27,44 @@ test('private corpus self-VRT rejects a one-channel pixel change', () => {
   right.data.set([1, 2, 4, 255]);
 
   assert.equal(pngPixelsEqual(PNG.sync.write(left), PNG.sync.write(right)), false);
+});
+
+test('candidate capture discards stale pages without following local evidence symlinks', () => {
+  const root = mkdtempSync(join(realpathSync(tmpdir()), 'ooxml-private-vrt-output-'));
+  try {
+    const directory = join(root, 'docx', 'case');
+    mkdirSync(directory, { recursive: true });
+    writeFileSync(join(directory, 'page-29.png'), 'stale');
+    writeFileSync(join(directory, 'notes.json'), 'retain');
+    clearPrivateCandidateItemOutput({ stem: 'docx/case', itemKind: 'page', outputRoot: root });
+    assert.equal(existsSync(join(directory, 'page-29.png')), false);
+    assert.equal(readFileSync(join(directory, 'notes.json'), 'utf8'), 'retain');
+
+    symlinkSync(directory, join(root, 'docx', 'linked'), 'dir');
+    assert.throws(() => clearPrivateCandidateItemOutput({
+      stem: 'docx/linked', itemKind: 'page', outputRoot: root,
+    }), /symlinked private corpus output/);
+    assert.equal(readFileSync(join(directory, 'notes.json'), 'utf8'), 'retain');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('harness bootstrap allows only test-renderer alias lines in Vite configs', () => {
+  const header = [
+    'diff --git a/packages/pptx/vite.config.ts b/packages/pptx/vite.config.ts',
+    '--- a/packages/pptx/vite.config.ts',
+    '+++ b/packages/pptx/vite.config.ts',
+    '@@ -20,0 +21 @@',
+  ];
+  const alias = "+      '@ooxml-test-chart-ex-renderer': resolve(dirname, '../../src/chart-ex.ts'),";
+  assert.deepEqual(harnessBootstrapDiffViolations([...header, alias].join('\n')), []);
+  assert.deepEqual(
+    harnessBootstrapDiffViolations([
+      ...header,
+      alias,
+      "+  define: { __OOXML_MODEL_SOURCES__: 'false' },",
+    ].join('\n')),
+    ["+  define: { __OOXML_MODEL_SOURCES__: 'false' },"],
+  );
 });

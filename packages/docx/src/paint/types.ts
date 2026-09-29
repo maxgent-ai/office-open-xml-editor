@@ -23,6 +23,8 @@ export interface PaintCanvas2D {
   letterSpacing: string;
   fontKerning: CanvasFontKerning;
   fillRect(x: number, y: number, width: number, height: number): void;
+  /** Native Canvas pattern source; optional on test recording contexts. */
+  createPattern?(image: CanvasImageSource, repetition: string | null): CanvasPattern | null;
   strokeRect(x: number, y: number, width: number, height: number): void;
   setLineDash(segments: number[]): void;
   fillText(text: string, x: number, y: number): void;
@@ -65,6 +67,9 @@ export interface CanvasPaintContext {
   readonly ctx: PaintCanvas2D;
   readonly scale: number;
   readonly dpr: number;
+  /** Page-to-device frame for DrawingML pattern fills. Chart and VML hosts
+   * keep their own fill-coordinate policy. */
+  readonly patternPageToDevice?: DOMMatrix2DInit;
   /** Document-level fallback retained independently from any enclosing
    * DrawingML text-box `fontRef` color override. */
   readonly documentDefaultTextColor?: string;

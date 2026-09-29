@@ -27,10 +27,10 @@ export class WasmRuntimeGenerationHost<TArchive extends object> {
   private readonly realm: RuntimeGeneration<WasmTrapError>;
   private readonly live = new Set<WasmArchiveHandle<TArchive>>();
 
-  constructor(runtime: WasmModuleRuntime, module: WebAssembly.Module) {
+  constructor(runtime: WasmModuleRuntime, wasmModule: WebAssembly.Module) {
     this.realm = new RuntimeGeneration(
-      () => runtime.initSync({ module }),
-      () => runtime.reinit({ module_or_path: module }),
+      () => runtime.initSync({ module: wasmModule }),
+      () => runtime.reinit({ module_or_path: wasmModule }),
       normalizeTrap,
     );
     this.realm.onPoison((error) => {

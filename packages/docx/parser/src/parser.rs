@@ -9,6 +9,9 @@ use ooxml_common::ns::{attr_ns, is_w_ns, is_wp_ns, math, relationships, wordproc
 use ooxml_common::package_session::{
     PackageEntryStream, PackageOperation, PackageSessionHandle, RetainedPackageOperation,
 };
+use ooxml_common::rels::{
+    parse_rels as parse_opc_rels, relationship_part_path, resolve_part_name, RelTarget, TargetMode,
+};
 use ooxml_common::resource::ResourceUsage;
 // Production parses go through `ooxml_common::depth::parse_guarded` (depth-guarded
 // before roxmltree's recursive tree builder). The `XmlDoc` alias survives only for
@@ -21,13 +24,27 @@ use std::io::BufReader;
 use crate::chart_compatibility::apply_word_classic_chart_space_frame;
 use crate::document_projector::{DocumentBodyPlan, DocumentBodyProjector};
 use crate::drawing_compatibility::apply_word_direct_group_rect;
-use crate::numbering::{LevelDef, NumberingMap};
+use crate::numbering::{
+    validate_level_definitions, validate_paragraph_ilvls, word_level_use, LevelDef, NumberingMap,
+    WORD_ILVL_ERROR_PREFIX,
+};
+use crate::ref_bookmark_flow::{
+    apply_matching_leading_break, LeadingBreakCollector, RefInstructionCollector,
+};
 use crate::styles::{
     apply_para, apply_run, merge_cond_layers, merge_tab_stops, merge_table_margin_layer,
     parse_para_fmt, parse_run_fmt, CondFmt, EdgeBorder, ParaFmt, RawTblBorders, RunFmt, StyleMap,
 };
 use crate::types::*;
 use crate::xml_util::*;
+use docx_model::paragraph_breaks::{split_para_on_page_breaks, ParaPiece};
+
+#[cfg(test)]
+#[path = "parser/relationship_target_tests.rs"]
+mod relationship_target_tests;
+#[cfg(test)]
+#[path = "parser/word_ilvl_integration_tests.rs"]
+mod word_ilvl_integration_tests;
 
 const DEFAULT_FONT_SIZE: f64 = 10.0; // pt fallback
 
@@ -87,8 +104,11 @@ impl Zip {
         self.session.assert_healthy()
     }
 
-    fn index_for_name(&self, path: &str) -> Option<()> {
-        self.session.contains_entry(path).then_some(())
+    /// Stored ZIP item name of the part equivalent to `path` (ECMA-376 Part 2
+    /// §6.2.2.3: ASCII case folding and percent-encoded unreserved
+    /// characters). Consults only the central directory; nothing is inflated.
+    fn entry_name(&self, path: &str) -> Option<String> {
+        self.session.entry_name(path)
     }
 }
 
@@ -113,7 +133,9 @@ pub(crate) fn read_zip_bytes(zip: &mut Zip, path: &str) -> Result<Vec<u8>, Strin
 }
 
 /// Section-level header/footer references collected from sectPr.
-/// Maps reference type ("default" | "first" | "even") to the target xml path (e.g. "header1.xml").
+/// Maps reference type ("default" | "first" | "even") to the `r:id` of the
+/// document relationship naming the header/footer part. The part is resolved
+/// from that relationship (TargetMode and all) when the story is loaded.
 #[derive(Default, Clone)]
 struct SectionRefs {
     headers: HashMap<String, String>,
@@ -633,20 +655,15 @@ fn resolve_section_refs(
         .filter(|n| n.is_element() && n.tag_name().name() == "sectPr")
     {
         merge_section_refs(sp, rel_map, &mut running);
-        let title_page = child_w(sp, "titlePg").is_some();
+        let title_page = bool_prop(sp, "titlePg").unwrap_or(false);
         out.push((sp.id(), running.clone(), title_page));
     }
     out
 }
 
 /// Open a docx ZIP container, tagging a failure with the container part name.
-///
-/// RB7 (MAJOR): a truncated / corrupt ZIP is the MOST COMMON way a docx is broken
-/// (an incomplete download, a byte-mangled attachment). `ZipArchive::new` maps
-/// that to an opaque `zip::result::ZipError` that, if propagated, throws with no
-/// indication that the CONTAINER (not some inner part) is the problem. Naming the
-/// failure lets the caller build a `degraded_document` tagged with the container,
-/// symmetric with how a corrupt `word/document.xml` is tagged inside [`parse`].
+/// Internal and test helper only: public entry points admit input through
+/// [`open_document_package`], which also enforces the OPC shape.
 #[cfg(test)]
 pub(crate) fn open_zip(data: Vec<u8>) -> Result<Zip, String> {
     open_zip_with_limits(data, None, None)
@@ -685,12 +702,52 @@ pub(crate) fn open_zip_with_policy(
     .map_err(ooxml_common::zip::tag_container_error)
 }
 
-/// A placeholder [`Document`] for a docx whose ZIP CONTAINER could not be opened
-/// (truncated / corrupt / not a zip). No parts are readable, so there is no theme
-/// to derive fonts from — fall back to the theme defaults. Mirrors the per-part
-/// [`degraded_document`] used inside [`parse`], but for the whole-container case.
-pub(crate) fn degraded_container_document(parse_error: String) -> Document {
-    degraded_document(&ThemeColors::default(), parse_error)
+/// Test fixtures build packages through the public admission boundary, so each
+/// synthetic ZIP must carry the OPC Media Types stream.
+#[cfg(test)]
+pub(crate) fn write_test_content_types<W: std::io::Write + std::io::Seek>(
+    writer: &mut zip::ZipWriter<W>,
+) {
+    use std::io::Write;
+    writer
+        .start_file(
+            ooxml_common::opc::CONTENT_TYPES_ITEM,
+            zip::write::SimpleFileOptions::default(),
+        )
+        .expect("test fixture writes to an in-memory ZIP");
+    writer
+        .write_all(
+            br#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>"#,
+        )
+        .expect("test fixture writes to an in-memory ZIP");
+}
+
+/// Admit a public-boundary input as a WordprocessingML package.
+///
+/// Fails closed with the `ooxml_common::opc` not-OOXML envelope when the bytes
+/// are not a readable ZIP, the ZIP is not an OPC package, or the package lacks
+/// `word/document.xml`. None of these is a damaged document that Word would
+/// partially display, so no placeholder [`Document`] (which would carry a 0x0
+/// section) is produced. Damage inside an admitted package — for example a
+/// malformed `word/document.xml` — still degrades per part inside [`parse`].
+pub(crate) fn open_document_package(
+    data: Vec<u8>,
+    max_archive_entry_bytes: Option<u64>,
+    max_total_inflated_bytes: Option<u64>,
+    max_archive_entries: Option<u64>,
+) -> Result<Zip, String> {
+    let zip = open_zip_with_policy(
+        data,
+        max_archive_entry_bytes,
+        max_total_inflated_bytes,
+        max_archive_entries,
+    )
+    .map_err(ooxml_common::opc::container_open_error)?;
+    ooxml_common::opc::require_ooxml_package(
+        &zip.session,
+        ooxml_common::resource::OoxmlFormat::Docx,
+    )?;
+    Ok(zip)
 }
 
 /// Parse a docx from raw archive bytes. Thin wrapper that opens a fresh
@@ -699,9 +756,8 @@ pub(crate) fn degraded_container_document(parse_error: String) -> Document {
 /// keep their `&[u8]` signature; the stateful `DocxArchive` handle calls
 /// [`parse`] directly on its retained archive to avoid re-opening it per call.
 ///
-/// RB7 (MAJOR): a corrupt / truncated CONTAINER degrades to a placeholder
-/// (`degraded_container_document`) rather than erroring, consistent with a corrupt
-/// inner part — the viewer shows a "could not display" page instead of nothing.
+/// Input that is not a WordprocessingML package is rejected by
+/// [`open_document_package`].
 #[cfg(any(test, not(target_arch = "wasm32")))]
 pub fn parse_from_bytes(data: &[u8]) -> Result<Document, String> {
     parse_from_bytes_with_limits(data, None, None, "parse")
@@ -714,15 +770,12 @@ pub(crate) fn parse_from_bytes_with_limits(
     max_total_inflated_bytes: Option<u64>,
     operation: &str,
 ) -> Result<Document, String> {
-    let mut zip = match open_zip_with_limits(
+    let mut zip = open_document_package(
         data.to_vec(),
         max_archive_entry_bytes,
         max_total_inflated_bytes,
-    ) {
-        Ok(zip) => zip,
-        Err(e) if e.starts_with("OOXML_RESOURCE_LIMIT:") => return Err(e),
-        Err(e) => return Ok(degraded_container_document(e)),
-    };
+        None,
+    )?;
     zip.run_operation(operation, parse)
 }
 
@@ -732,21 +785,21 @@ pub(crate) fn parse_from_bytes_streamed_with_limits(
     max_total_inflated_bytes: Option<u64>,
     operation: &str,
 ) -> Result<Document, String> {
-    let mut zip = match open_zip_with_limits(
+    let mut zip = open_document_package(
         data.to_vec(),
         max_archive_entry_bytes,
         max_total_inflated_bytes,
-    ) {
-        Ok(zip) => zip,
-        Err(error) if error.starts_with("OOXML_RESOURCE_LIMIT:") => return Err(error),
-        Err(error) => return Ok(degraded_container_document(error)),
-    };
+        None,
+    )?;
     zip.run_operation(operation, parse_streamed_compatible)
 }
 
 struct DocumentParseEnvironment {
     rels_xml: String,
     rel_map: HashMap<String, String>,
+    /// `word/_rels/document.xml.rels` with TargetMode retained, for resolving
+    /// the parts the main document part references.
+    relationships: BTreeMap<String, RelTarget>,
     style_map: StyleMap,
     num_map: NumberingMap,
     theme: ThemeColors,
@@ -756,6 +809,76 @@ struct DocumentParseEnvironment {
     page_layout_settings: Option<crate::types::PageLayoutSettingsWire>,
     note_layout_settings: Option<crate::types::NoteLayoutSettingsWire>,
     even_and_odd_headers: bool,
+    word_ilvl_error: Option<String>,
+}
+
+/// ECMA-376 Part 2 §9.3 relationship types identify actual DOCX stories.
+/// Matching the complete URI matters: a vendor relationship ending in
+/// `/comments` is not a Word comments part and must not reject the package.
+const HEADER_RELATIONSHIP_TYPES: &[&str] = &[
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/header",
+    "http://purl.oclc.org/ooxml/officeDocument/relationships/header",
+];
+const FOOTER_RELATIONSHIP_TYPES: &[&str] = &[
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer",
+    "http://purl.oclc.org/ooxml/officeDocument/relationships/footer",
+];
+const FOOTNOTES_RELATIONSHIP_TYPES: &[&str] = &[
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes",
+    "http://purl.oclc.org/ooxml/officeDocument/relationships/footnotes",
+];
+const ENDNOTES_RELATIONSHIP_TYPES: &[&str] = &[
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/endnotes",
+    "http://purl.oclc.org/ooxml/officeDocument/relationships/endnotes",
+];
+
+fn is_story_relationship_type(kind: &str) -> bool {
+    [
+        HEADER_RELATIONSHIP_TYPES,
+        FOOTER_RELATIONSHIP_TYPES,
+        FOOTNOTES_RELATIONSHIP_TYPES,
+        ENDNOTES_RELATIONSHIP_TYPES,
+        COMMENTS_RELATIONSHIP_TYPES,
+    ]
+    .iter()
+    .any(|types| types.contains(&kind))
+}
+
+/// Every referenced story uses the same paragraph number parser. Validate its
+/// selected MC content before any story loader can turn a bad lexical value
+/// into the level-0 fallback. A textbox is nested inside one of those parts.
+fn validate_referenced_story_ilvls(zip: &mut Zip, rels_xml: &str) -> Option<String> {
+    let mut visited = HashSet::new();
+    for rel in parse_opc_rels(rels_xml).into_values() {
+        if rel.mode != TargetMode::Internal
+            || !rel
+                .relationship_type
+                .as_deref()
+                .is_some_and(is_story_relationship_type)
+        {
+            continue;
+        }
+        let Some(path) = rel.resolve_part(DOCUMENT_PART) else {
+            continue;
+        };
+        if !visited.insert(path.clone()) {
+            continue;
+        }
+        let Ok(xml) = read_zip_string(zip, &path) else {
+            continue;
+        };
+        if !xml.contains("ilvl") {
+            continue;
+        }
+        let Some(error) = parse_guarded(&xml)
+            .ok()
+            .and_then(|document| validate_paragraph_ilvls(document.root_element()).err())
+        else {
+            continue;
+        };
+        return Some(error);
+    }
+    None
 }
 
 /// Load document-wide package dependencies once. Both the compatibility
@@ -765,69 +888,49 @@ struct DocumentParseEnvironment {
 fn load_document_parse_environment(zip: &mut Zip) -> DocumentParseEnvironment {
     let rels_xml = read_zip_string(zip, "word/_rels/document.xml.rels").unwrap_or_default();
     let rel_map = parse_rels(&rels_xml);
+    let relationships = parse_opc_rels(&rels_xml);
 
     // Styles are referenced from the document relationships (Target may be
     // "styles.xml" or "styles2.xml"). Fall back to "word/styles.xml" for old files.
-    let styles_path = find_rel_target(&rels_xml, "styles")
-        .map(|t| {
-            if t.starts_with('/') {
-                t.trim_start_matches('/').to_string()
-            } else {
-                format!("word/{}", t)
-            }
-        })
-        .unwrap_or_else(|| "word/styles.xml".to_string());
-    let mut style_map = read_zip_string(zip, &styles_path)
-        .map(|s| StyleMap::parse(&s))
-        .unwrap_or_else(|_| StyleMap::parse(""));
+    let styles_path =
+        find_rel_part(&rels_xml, "styles").unwrap_or_else(|| Some("word/styles.xml".to_string()));
+    let styles_xml = read_part_string(zip, styles_path.as_deref()).unwrap_or_default();
+    let mut word_ilvl_error = parse_guarded(&styles_xml)
+        .ok()
+        .and_then(|document| validate_paragraph_ilvls(document.root_element()).err());
+    let mut style_map = StyleMap::parse(&styles_xml);
 
-    let numbering_path = find_rel_target(&rels_xml, "numbering")
-        .map(|t| {
-            if t.starts_with('/') {
-                t.trim_start_matches('/').to_string()
-            } else {
-                format!("word/{}", t)
-            }
-        })
-        .unwrap_or_else(|| "word/numbering.xml".to_string());
-    // The numbering part has its OWN relationships (`<part>.xml.rels`), needed to
+    let numbering_path = find_rel_part(&rels_xml, "numbering")
+        .unwrap_or_else(|| Some("word/numbering.xml".to_string()));
+    // The numbering part has its OWN relationships (Part 2 §6.5.2.3), needed to
     // resolve `<w:numPicBullet>` image r:ids (§17.9.26). Resolve them the same
-    // way headers/footers do their per-part media (parse_rels + load_media_map),
-    // derived from the numbering part's stem so a non-default numbering target
-    // (e.g. "numbering2.xml") still finds its sibling rels.
-    let numbering_media_map = {
-        let stem = numbering_path
-            .rsplit('/')
-            .next()
-            .unwrap_or(&numbering_path)
-            .trim_end_matches(".xml");
-        let dir = numbering_path
-            .rsplit_once('/')
-            .map(|(d, _)| d)
-            .unwrap_or("word");
-        let rels_path = format!("{}/_rels/{}.xml.rels", dir, stem);
-        let rels_xml = read_zip_string(zip, &rels_path).unwrap_or_default();
-        let rel_map = parse_rels(&rels_xml);
-        load_media_map(zip, &rel_map, &format!("{}/", dir))
-    };
-    let num_map = read_zip_string(zip, &numbering_path)
-        .map(|s| NumberingMap::parse(&s, &numbering_media_map))
+    // way headers/footers do their per-part media, so a non-default numbering
+    // target (e.g. "numbering2.xml") still finds its sibling rels.
+    let numbering_media_map = numbering_path
+        .as_deref()
+        .map(|path| load_part_media_map(zip, path))
         .unwrap_or_default();
+    let numbering_xml = read_part_string(zip, numbering_path.as_deref()).unwrap_or_default();
+    if word_ilvl_error.is_none() {
+        word_ilvl_error = parse_guarded(&numbering_xml).ok().and_then(|document| {
+            validate_level_definitions(document.root_element())
+                .and_then(|()| validate_paragraph_ilvls(document.root_element()))
+                .err()
+        });
+    }
+    if word_ilvl_error.is_none() {
+        word_ilvl_error = validate_referenced_story_ilvls(zip, &rels_xml);
+    }
+    let num_map = NumberingMap::parse(&numbering_xml, &numbering_media_map);
     // §17.9.23 — fold each `<w:lvl><w:pStyle>` backlink into its style's
     // numbering level, now that both parts exist (see the method doc).
     style_map.resolve_numbering_level_backlinks(&num_map);
 
     // Theme is referenced by a relationship with Type ending in "/theme" — resolve
-    // to word/<target> and parse the clrScheme.
-    let theme_path = find_rel_target(&rels_xml, "theme").map(|target| {
-        if target.starts_with('/') {
-            target.trim_start_matches('/').to_string()
-        } else {
-            format!("word/{target}")
-        }
-    });
-    let mut theme = match theme_path.as_deref() {
-        Some(path) => read_zip_string(zip, path)
+    // it against the main part and parse the clrScheme.
+    let theme_relationship = find_rel_part(&rels_xml, "theme");
+    let mut theme = match &theme_relationship {
+        Some(path) => read_part_string(zip, path.as_deref())
             .map(|xml| ThemeColors::parse(&xml))
             .unwrap_or_else(|_| ThemeColors {
                 format_scheme_present: true,
@@ -835,8 +938,8 @@ fn load_document_parse_environment(zip: &mut Zip) -> DocumentParseEnvironment {
             }),
         None => ThemeColors::default(),
     };
-    if let Some(theme_path) = theme_path.as_deref() {
-        let rels_path = ooxml_common::rels::relationship_part_path(theme_path);
+    if let Some(Some(theme_path)) = theme_relationship.as_ref() {
+        let rels_path = relationship_part_path(theme_path);
         if let Ok(theme_rels_xml) = read_zip_string(zip, &rels_path) {
             theme.chart_images.insert_part_relationships(
                 ooxml_common::chart::ChartImageSource::Theme,
@@ -848,22 +951,15 @@ fn load_document_parse_environment(zip: &mut Zip) -> DocumentParseEnvironment {
 
     // §17.15.1.88 w:themeFontLang — when the theme leaves a cs typeface empty,
     // the settings' bidi language decides the actual complex-script face.
-    let settings_path = find_rel_target(&rels_xml, "settings")
-        .map(|t| {
-            if t.starts_with('/') {
-                t.trim_start_matches('/').to_string()
-            } else {
-                format!("word/{}", t)
-            }
-        })
-        .unwrap_or_else(|| "word/settings.xml".to_string());
+    let settings_path = find_rel_part(&rels_xml, "settings")
+        .unwrap_or_else(|| Some("word/settings.xml".to_string()));
     let mut document_settings: Option<crate::types::DocumentSettings> = None;
     let mut page_layout_settings: Option<crate::types::PageLayoutSettingsWire> = None;
     let mut note_layout_settings: Option<crate::types::NoteLayoutSettingsWire> = None;
     // §17.10.1 even/odd headers is a settings.xml flag (not a sectPr property), so
     // capture it here and stamp it onto the section below.
     let mut even_and_odd_headers = false;
-    if let Ok(settings_xml) = read_zip_string(zip, &settings_path) {
+    if let Ok(settings_xml) = read_part_string(zip, settings_path.as_deref()) {
         if let Some(langs) = parse_theme_font_langs(&settings_xml) {
             theme.apply_theme_font_langs(&langs);
         }
@@ -884,18 +980,19 @@ fn load_document_parse_environment(zip: &mut Zip) -> DocumentParseEnvironment {
     }
     let theme = theme;
 
-    let media_map = load_media_map(zip, &rel_map, "word/");
+    let media_map = load_media_map(zip, &relationships, DOCUMENT_PART);
 
     // ECMA-376 §21.2 — pre-resolve every chart part referenced from the document
     // relationships into the shared `ChartModel`, keyed by the SAME rId a
     // `<c:chart r:id>` in a `<w:drawing>` uses. Mirrors `load_media_map`: the
     // model is resolved here (needs `zip` + the theme, neither of which is
     // threaded through the run walk) and looked up by rId during drawing parse.
-    let chart_map = load_chart_map(zip, &rel_map, &theme);
+    let chart_map = load_chart_map(zip, &relationships, DOCUMENT_PART, &theme);
 
     DocumentParseEnvironment {
         rels_xml,
         rel_map,
+        relationships,
         style_map,
         num_map,
         theme,
@@ -905,6 +1002,7 @@ fn load_document_parse_environment(zip: &mut Zip) -> DocumentParseEnvironment {
         page_layout_settings,
         note_layout_settings,
         even_and_odd_headers,
+        word_ilvl_error,
     }
 }
 
@@ -920,6 +1018,7 @@ struct DocumentBodyPreflight {
     sections: Vec<StreamedSectionFact>,
     final_body_block_ordinal: Option<usize>,
     section: SectionProps,
+    ref_leading_breaks: HashMap<String, String>,
 }
 
 /// First pass over `word/document.xml`. Only cross-block facts survive this
@@ -936,6 +1035,7 @@ fn preflight_document_body(
     let mut running_refs = SectionRefs::default();
     let mut final_candidate: Option<(usize, SectionProps, SectionPlacementWire)> = None;
     let mut emitted_section_break_candidates = 0usize;
+    let mut ref_instructions = RefInstructionCollector::default();
 
     while let Some(block) = projector.next_block()? {
         let xml = std::str::from_utf8(&block.xml)
@@ -943,6 +1043,12 @@ fn preflight_document_body(
         let document = parse_guarded(xml)
             .map_err(|error| format!("{DOCUMENT_PART}: projected block: {error}"))?;
         let root = document.root_element();
+        validate_paragraph_ilvls(root)?;
+        // The local names are independent of the namespace prefix. Reuse the
+        // existing sectPr descendant walk, and skip field checks entirely for
+        // the common no-field block. A begin and its instrText may occur in
+        // different projected blocks; either token independently opts in.
+        let possible_field = xml.contains("fldChar") || xml.contains("instrText");
         if (block.local_name == "p"
             && child_w(root, "pPr")
                 .and_then(|properties| child_w(properties, "sectPr"))
@@ -971,16 +1077,17 @@ fn preflight_document_body(
             _ => LogicalBodySequenceFact::Transparent,
         });
 
-        for sect_pr in root.descendants().filter(|node| {
-            node.is_element()
-                && is_w_ns(node.tag_name().namespace())
-                && node.tag_name().name() == "sectPr"
-        }) {
-            merge_section_refs(sect_pr, &environment.rel_map, &mut running_refs);
-            sections.push(StreamedSectionFact {
-                refs: running_refs.clone(),
-                title_page: child_w(sect_pr, "titlePg").is_some(),
-            });
+        for node in root.descendants().filter(roxmltree::Node::is_element) {
+            if possible_field {
+                ref_instructions.observe_node(node);
+            }
+            if is_w_ns(node.tag_name().namespace()) && node.tag_name().name() == "sectPr" {
+                merge_section_refs(node, &environment.rel_map, &mut running_refs);
+                sections.push(StreamedSectionFact {
+                    refs: running_refs.clone(),
+                    title_page: bool_prop(node, "titlePg").unwrap_or(false),
+                });
+            }
         }
 
         final_candidate = (block.local_name == "sectPr").then(|| {
@@ -1008,18 +1115,49 @@ fn preflight_document_body(
     placement.section_id = format!("section:{final_section_ordinal}");
     section.section_placement = Some(Box::new(placement));
 
+    // Only REF documents pay for a third bounded scan. The first pass retains
+    // requested bookmark names, not document runs or whole-block XML; this pass
+    // projects one block at a time and retains at most 1 MiB of matching text.
+    let mut ref_leading_breaks = HashMap::new();
+    if !ref_instructions.targets.is_empty() {
+        drop(projector);
+        let mut projector = open_document_body_projector(zip)?;
+        let mut collector = LeadingBreakCollector::new(&ref_instructions.targets);
+        while let Some(block) = projector.next_block()? {
+            if block.local_name != "p" {
+                collector.observe_other_block();
+                continue;
+            }
+            let xml = std::str::from_utf8(&block.xml).map_err(|error| {
+                format!("{DOCUMENT_PART}: projected block is not UTF-8: {error}")
+            })?;
+            let document = parse_guarded(xml)
+                .map_err(|error| format!("{DOCUMENT_PART}: projected block: {error}"))?;
+            collector.observe(document.root_element());
+        }
+        if projector.plan()? != plan {
+            return Err("document body changed between bounded passes".to_string());
+        }
+        ref_leading_breaks = collector.finish();
+    }
+
     Ok(DocumentBodyPreflight {
         plan,
         table_sequences,
         sections,
         final_body_block_ordinal,
         section,
+        ref_leading_breaks,
     })
 }
 
 pub fn parse(zip: &mut Zip) -> Result<Document, String> {
     let mut environment = load_document_parse_environment(zip);
+    if let Some(error) = environment.word_ilvl_error.take() {
+        return Err(error);
+    }
     let rel_map = &environment.rel_map;
+    let relationships = &environment.relationships;
     let style_map = &environment.style_map;
     let num_map = &mut environment.num_map;
     let theme = &environment.theme;
@@ -1047,6 +1185,7 @@ pub fn parse(zip: &mut Zip) -> Result<Document, String> {
         Ok(doc) => doc,
         Err(e) => return Ok(degraded_document(theme, format!("word/document.xml: {e}"))),
     };
+    validate_paragraph_ilvls(xml_doc.root_element())?;
 
     let body_node = match xml_doc
         .root_element()
@@ -1091,8 +1230,24 @@ pub fn parse(zip: &mut Zip) -> Result<Document, String> {
     let mut body_headers = HeadersFooters::default();
     let mut body_footers = HeadersFooters::default();
     for (node_id, refs, title_page) in &section_snapshots {
-        let headers = load_header_footer_set(zip, &refs.headers, "hdr", style_map, num_map, theme);
-        let footers = load_header_footer_set(zip, &refs.footers, "ftr", style_map, num_map, theme);
+        let headers = load_header_footer_set(
+            zip,
+            relationships,
+            &refs.headers,
+            "hdr",
+            style_map,
+            num_map,
+            theme,
+        );
+        let footers = load_header_footer_set(
+            zip,
+            relationships,
+            &refs.footers,
+            "ftr",
+            style_map,
+            num_map,
+            theme,
+        );
         if Some(*node_id) == body_level_sect_id {
             body_headers = headers;
             body_footers = footers;
@@ -1145,12 +1300,7 @@ pub fn parse(zip: &mut Zip) -> Result<Document, String> {
     )
 }
 
-#[derive(serde::Serialize)]
-#[serde(tag = "kind", rename_all = "camelCase")]
-pub(crate) enum StreamedDocumentUnit {
-    Body { body: Vec<BodyElement> },
-    Complete { document: Box<Document> },
-}
+pub(crate) use docx_model::StreamedDocumentUnit;
 
 /// Persistent semantic cursor for the second document pass. It owns exactly
 /// one temporary projected-block arena, the compact preflight facts, and the
@@ -1183,6 +1333,12 @@ pub(crate) struct DocumentCursorFailure {
 }
 
 impl DocumentCursorFailure {
+    pub(crate) fn word_ilvl_error(&self) -> Option<&str> {
+        self.error
+            .starts_with(WORD_ILVL_ERROR_PREFIX)
+            .then_some(&self.error)
+    }
+
     #[cfg(test)]
     pub(crate) fn into_error(self) -> String {
         self.error
@@ -1201,6 +1357,12 @@ impl DocumentCursorFailure {
 impl DocxBodyCursor {
     pub(crate) fn start(zip: &mut Zip) -> Result<Self, DocumentCursorFailure> {
         let mut environment = load_document_parse_environment(zip);
+        if let Some(error) = environment.word_ilvl_error.take() {
+            return Err(DocumentCursorFailure {
+                error,
+                theme: Box::new(environment.theme.clone()),
+            });
+        }
         let preflight =
             preflight_document_body(zip, &environment).map_err(|error| DocumentCursorFailure {
                 error,
@@ -1217,6 +1379,7 @@ impl DocxBodyCursor {
         for (index, fact) in preflight.sections.iter().enumerate() {
             let headers = load_header_footer_set(
                 zip,
+                &environment.relationships,
                 &fact.refs.headers,
                 "hdr",
                 &environment.style_map,
@@ -1225,6 +1388,7 @@ impl DocxBodyCursor {
             );
             let footers = load_header_footer_set(
                 zip,
+                &environment.relationships,
                 &fact.refs.footers,
                 "ftr",
                 &environment.style_map,
@@ -1259,7 +1423,10 @@ impl DocxBodyCursor {
             body_headers,
             body_footers,
             projector,
-            semantic: BodyParseCursor::default(),
+            semantic: BodyParseCursor {
+                ref_leading_breaks: preflight.ref_leading_breaks,
+                ..BodyParseCursor::default()
+            },
             diagnostics: Vec::new(),
             revisions: Vec::new(),
             section_cursor: 0,
@@ -1325,6 +1492,7 @@ impl DocxBodyCursor {
                     self.emitted_body_len = self.emitted_body_len.saturating_add(1);
                     return Ok(StreamedDocumentUnit::Body {
                         body: vec![BodyElement::PageBreak {
+                            origin: Some(PageBreakOrigin::CoverPageSynthetic),
                             parity: None,
                             same_paragraph_as_previous: None,
                         }],
@@ -1393,6 +1561,7 @@ impl DocxBodyCursor {
                     body.insert(
                         0,
                         BodyElement::PageBreak {
+                            origin: Some(PageBreakOrigin::CoverPageSynthetic),
                             parity: None,
                             same_paragraph_as_previous: None,
                         },
@@ -1458,6 +1627,7 @@ pub(crate) fn parse_streamed_compatible(zip: &mut Zip) -> Result<Document, Strin
         Ok(document) => Ok(document),
         Err(failure) => match zip.assert_healthy() {
             Err(resource_error) => Err(resource_error),
+            Ok(()) if failure.error.starts_with(WORD_ILVL_ERROR_PREFIX) => Err(failure.error),
             Ok(()) => Ok(failure.into_degraded_document()),
         },
     }
@@ -1489,38 +1659,37 @@ fn finish_document(
     // ECMA-376 §17.8.3.10: font family classification from fontTable.xml.
     // Resolve via relationship (Type ending in "/fontTable"); fall back to
     // "word/fontTable.xml" for documents that omit the relationship.
-    let font_table_path = find_rel_target(&environment.rels_xml, "fontTable")
-        .map(|target| {
-            if target.starts_with('/') {
-                target.trim_start_matches('/').to_string()
-            } else {
-                format!("word/{target}")
-            }
-        })
-        .unwrap_or_else(|| "word/fontTable.xml".to_string());
-    let font_table_xml = read_zip_string(zip, &font_table_path).unwrap_or_default();
+    let font_table_path = find_rel_part(&environment.rels_xml, "fontTable")
+        .unwrap_or_else(|| Some("word/fontTable.xml".to_string()));
+    let font_table_xml = read_part_string(zip, font_table_path.as_deref()).unwrap_or_default();
     let (font_family_classes, font_family_pitches, font_family_charsets) =
         parse_font_table(&font_table_xml);
     // ECMA-376 §17.8.3.3-.6 — embedded fonts. The `<w:embed*>` r:ids resolve
-    // through the fontTable part's OWN relationships.
-    let embedded_fonts = {
-        let stem = font_table_path
-            .rsplit('/')
-            .next()
-            .unwrap_or(&font_table_path);
-        let dir = font_table_path
-            .rsplit_once('/')
-            .map(|(directory, _)| directory)
-            .unwrap_or("word");
-        let font_rels_path = format!("{dir}/_rels/{stem}.rels");
-        let font_rels_xml = read_zip_string(zip, &font_rels_path).unwrap_or_default();
-        let font_rels = parse_rels(&font_rels_xml);
-        parse_embedded_fonts(&font_table_xml, &font_rels, &format!("{dir}/"))
-    };
+    // through the fontTable part's OWN relationships (Part 2 §6.5.2.3).
+    let embedded_fonts = font_table_path
+        .as_deref()
+        .map(|path| {
+            let font_rels_xml =
+                read_zip_string(zip, &relationship_part_path(path)).unwrap_or_default();
+            let mut fonts =
+                parse_embedded_fonts(&font_table_xml, &parse_opc_rels(&font_rels_xml), path);
+            // Like `load_media_map`, publish only parts that exist (under their
+            // stored ZIP item name), so a target naming no package part and a
+            // missing part yield the same model.
+            fonts.retain_mut(|font| match zip.entry_name(&font.part_path) {
+                Some(stored) => {
+                    font.part_path = stored;
+                    true
+                }
+                None => false,
+            });
+            fonts
+        })
+        .unwrap_or_default();
 
     let comments =
         find_internal_rel_target_by_types(&environment.rels_xml, COMMENTS_RELATIONSHIP_TYPES)
-            .map(|target| ooxml_common::rels::resolve_target("word/", &target))
+            .and_then(|target| resolve_part_name(DOCUMENT_PART, &target))
             .and_then(|p| read_zip_string(zip, &p).ok())
             .map(|xml| {
                 // [MS-DOCX] §2.5.3.1 — reply threading and resolved state live in
@@ -1532,20 +1701,16 @@ fn finish_document(
                     &environment.rels_xml,
                     COMMENTS_EXTENDED_RELATIONSHIP_TYPES,
                 )
-                .map(|target| ooxml_common::rels::resolve_target("word/", &target))
+                .and_then(|target| resolve_part_name(DOCUMENT_PART, &target))
                 .and_then(|p| read_zip_string(zip, &p).ok())
                 .map(|extended_xml| parse_comments_extended(&extended_xml))
                 .unwrap_or_default();
                 parse_comments_with_extended(&xml, &extended)
             })
             .unwrap_or_default();
-    let footnotes_path = find_rel_target(&environment.rels_xml, "footnotes").map(|target| {
-        if target.starts_with('/') {
-            target.trim_start_matches('/').to_string()
-        } else {
-            format!("word/{target}")
-        }
-    });
+    let footnotes_path =
+        find_internal_rel_target_by_types(&environment.rels_xml, FOOTNOTES_RELATIONSHIP_TYPES)
+            .and_then(|target| resolve_part_name(DOCUMENT_PART, &target));
     let footnotes = footnotes_path
         .map(|path| {
             parse_notes(
@@ -1558,13 +1723,9 @@ fn finish_document(
             )
         })
         .unwrap_or_default();
-    let endnotes_path = find_rel_target(&environment.rels_xml, "endnotes").map(|target| {
-        if target.starts_with('/') {
-            target.trim_start_matches('/').to_string()
-        } else {
-            format!("word/{target}")
-        }
-    });
+    let endnotes_path =
+        find_internal_rel_target_by_types(&environment.rels_xml, ENDNOTES_RELATIONSHIP_TYPES)
+            .and_then(|target| resolve_part_name(DOCUMENT_PART, &target));
     let endnotes = endnotes_path
         .map(|path| {
             parse_notes(
@@ -1889,22 +2050,13 @@ fn parse_notes(
     };
 
     // Per-part rels for media (e.g. an image inside a footnote). The part lives
-    // at e.g. word/footnotes.xml, so its rels are word/_rels/footnotes.xml.rels.
-    let (dir, file) = path.rsplit_once('/').unwrap_or(("", path));
-    let rels_path = if dir.is_empty() {
-        format!("_rels/{}.rels", file)
-    } else {
-        format!("{}/_rels/{}.rels", dir, file)
-    };
-    let base_dir = if dir.is_empty() {
-        String::new()
-    } else {
-        format!("{}/", dir)
-    };
-    let rels_xml = read_zip_string(zip, &rels_path).unwrap_or_default();
+    // at e.g. word/footnotes.xml, so its rels are word/_rels/footnotes.xml.rels
+    // and their targets resolve against the note part (Part 2 §6.5.2.3).
+    let rels_xml = read_zip_string(zip, &relationship_part_path(path)).unwrap_or_default();
     let local_rel_map = parse_rels(&rels_xml);
-    let local_media_map = load_media_map(zip, &local_rel_map, &base_dir);
-    let local_chart_map = load_chart_map(zip, &local_rel_map, theme);
+    let local_relationships = parse_opc_rels(&rels_xml);
+    let local_media_map = load_media_map(zip, &local_relationships, path);
+    let local_chart_map = load_chart_map(zip, &local_relationships, path, theme);
 
     let Ok(doc) = parse_guarded(&xml) else {
         return Vec::new();
@@ -2264,16 +2416,31 @@ fn parse_page_layout_settings(settings_xml: &str) -> Option<crate::types::PageLa
 fn parse_note_layout_settings(settings_xml: &str) -> Option<crate::types::NoteLayoutSettingsWire> {
     let doc = parse_guarded(settings_xml).ok()?;
     let root = doc.root_element();
-    let position = |properties: &str| {
+    let value = |properties: &str, name: &str| {
         child_w(root, properties)
-            .and_then(|node| child_w(node, "pos"))
+            .and_then(|node| child_w(node, name))
             .and_then(|node| attr_w(node, "val"))
     };
-    let result = crate::types::NoteLayoutSettingsWire {
-        footnote_position: position("footnotePr"),
-        endnote_position: position("endnotePr"),
+    // §17.11.20 numStart is an ST_DecimalNumber; an unparsable value is
+    // treated as absent (the default start of 1).
+    let start = |properties: &str| {
+        value(properties, "numStart").and_then(|value| value.trim().parse::<i64>().ok())
     };
-    if result.footnote_position.is_none() && result.endnote_position.is_none() {
+    let result = crate::types::NoteLayoutSettingsWire {
+        footnote_position: value("footnotePr", "pos"),
+        endnote_position: value("endnotePr", "pos"),
+        footnote_number_format: value("footnotePr", "numFmt"),
+        footnote_number_start: start("footnotePr"),
+        endnote_number_format: value("endnotePr", "numFmt"),
+        endnote_number_start: start("endnotePr"),
+    };
+    if result.footnote_position.is_none()
+        && result.endnote_position.is_none()
+        && result.footnote_number_format.is_none()
+        && result.footnote_number_start.is_none()
+        && result.endnote_number_format.is_none()
+        && result.endnote_number_start.is_none()
+    {
         None
     } else {
         Some(result)
@@ -2338,6 +2505,28 @@ mod note_layout_settings_tests {
             assert_eq!(settings.footnote_position.as_deref(), Some("beneathText"));
             assert_eq!(settings.endnote_position.as_deref(), Some("sectEnd"));
         }
+    }
+
+    #[test]
+    fn preserves_document_wide_note_number_formats_and_starts() {
+        let xml = r#"<w:settings
+                       xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+                     <w:footnotePr><w:numFmt w:val="upperLetter"/><w:numStart w:val="4"/></w:footnotePr>
+                     <w:endnotePr><w:numFmt w:val="lowerRoman"/><w:numStart w:val="x"/></w:endnotePr>
+                   </w:settings>"#;
+        let settings = parse_note_layout_settings(xml).expect("authored note numbering");
+        assert_eq!(
+            settings.footnote_number_format.as_deref(),
+            Some("upperLetter")
+        );
+        assert_eq!(settings.footnote_number_start, Some(4));
+        assert_eq!(
+            settings.endnote_number_format.as_deref(),
+            Some("lowerRoman")
+        );
+        // An invalid ST_DecimalNumber keeps the default start.
+        assert_eq!(settings.endnote_number_start, None);
+        assert_eq!(settings.footnote_position, None);
     }
 
     #[test]
@@ -2418,6 +2607,29 @@ fn parse_document_settings(settings_xml: &str) -> Option<crate::types::DocumentS
         .children()
         .find(|n| n.is_element() && n.tag_name().name() == "compat");
     let compat_bool = |name: &str| -> Option<bool> { bool_prop(compat?, name) };
+    let line_wrap_like_word6 = compat_bool("lineWrapLikeWord6");
+    // [MS-DOCX] §2.3.3: Office stores this as a named `compatSetting`, not a
+    // direct `w:compat` boolean. The setting is off when absent.
+    let enable_open_type_features = compat
+        .filter(|node| node.tag_name().namespace() == root.tag_name().namespace())
+        .and_then(|compat| {
+            compat
+                .children()
+                .find(|node| {
+                    node.is_element()
+                        && node.tag_name().name() == "compatSetting"
+                        && node.tag_name().namespace() == root.tag_name().namespace()
+                        && attr_w(*node, "name").as_deref() == Some("enableOpenTypeFeatures")
+                        && attr_w(*node, "uri").as_deref()
+                            == Some("http://schemas.microsoft.com/office/word")
+                })
+                .and_then(|node| attr_w(node, "val"))
+                .and_then(|value| match value.as_str() {
+                    "1" | "true" | "on" => Some(true),
+                    "0" | "false" | "off" => Some(false),
+                    _ => None,
+                })
+        });
     let use_fe_layout = compat_bool("useFELayout");
     let balance_single_byte_double_byte_width = compat_bool("balanceSingleByteDoubleByteWidth");
     let adjust_line_height_in_table = compat_bool("adjustLineHeightInTable");
@@ -2441,6 +2653,8 @@ fn parse_document_settings(settings_xml: &str) -> Option<crate::types::DocumentS
         && math_def_jc.is_none()
         && default_tab_stop.is_none()
         && character_spacing_control.is_none()
+        && line_wrap_like_word6.is_none()
+        && enable_open_type_features.is_none()
         && use_fe_layout.is_none()
         && balance_single_byte_double_byte_width.is_none()
         && adjust_line_height_in_table.is_none()
@@ -2454,29 +2668,54 @@ fn parse_document_settings(settings_xml: &str) -> Option<crate::types::DocumentS
         math_def_jc,
         default_tab_stop,
         character_spacing_control,
+        line_wrap_like_word6,
+        enable_open_type_features,
         use_fe_layout,
         balance_single_byte_double_byte_width,
         adjust_line_height_in_table,
     })
 }
 
-fn find_rel_target(rels_xml: &str, type_suffix: &str) -> Option<String> {
+/// Find the first main-document relationship whose Type ends in
+/// `/<type_suffix>` and resolve it to the part it names.
+///
+/// - `None`: there is no such relationship (callers may apply their
+///   conventional-part fallback).
+/// - `Some(None)`: the relationship exists but names no package part — it is
+///   External (Part 2 §6.5.3.4) or its target does not resolve to a part name
+///   (see [`resolve_part_name`]). Callers treat this exactly like a
+///   relationship whose target part is missing.
+/// - `Some(Some(path))`: the resolved ZIP part name.
+fn find_rel_part(rels_xml: &str, type_suffix: &str) -> Option<Option<String>> {
     if rels_xml.is_empty() {
         return None;
     }
     let doc = parse_guarded(rels_xml).ok()?;
-    for rel in doc
-        .root_element()
+    let suffix = format!("/{type_suffix}");
+    doc.root_element()
         .children()
         .filter(|n| n.tag_name().name() == "Relationship")
-    {
-        if let (Some(ty), Some(target)) = (rel.attribute("Type"), rel.attribute("Target")) {
-            if ty.ends_with(&format!("/{}", type_suffix)) {
-                return Some(target.to_string());
-            }
-        }
+        .find_map(|rel| {
+            let target = rel.attribute("Target")?;
+            rel.attribute("Type")?.ends_with(&suffix).then_some(())?;
+            let external = rel
+                .attribute("TargetMode")
+                .is_some_and(|mode| mode.eq_ignore_ascii_case("External"));
+            Some(
+                (!external)
+                    .then(|| resolve_part_name(DOCUMENT_PART, target))
+                    .flatten(),
+            )
+        })
+}
+
+/// Read a part located by [`find_rel_part`]; an unresolvable relationship
+/// reads exactly like an absent part.
+fn read_part_string(zip: &mut Zip, path: Option<&str>) -> Result<String, String> {
+    match path {
+        Some(path) => read_zip_string(zip, path),
+        None => Err("relationship names no package part".to_string()),
     }
-    None
 }
 
 const COMMENTS_RELATIONSHIP_TYPES: &[&str] = &[
@@ -2788,6 +3027,7 @@ mod document_typography_settings_tests {
         let mut bytes = Vec::new();
         {
             let mut archive = zip::ZipWriter::new(std::io::Cursor::new(&mut bytes));
+            crate::parser::write_test_content_types(&mut archive);
             let options = SimpleFileOptions::default();
             archive.start_file("word/document.xml", options).unwrap();
             archive.write_all(document_xml.as_bytes()).unwrap();
@@ -2839,8 +3079,8 @@ mod document_typography_settings_tests {
 /// cannot be registered without both the part and its key.
 fn parse_embedded_fonts(
     font_table_xml: &str,
-    rels: &HashMap<String, String>,
-    base_dir: &str,
+    rels: &BTreeMap<String, RelTarget>,
+    font_table_part: &str,
 ) -> Vec<crate::types::EmbeddedFont> {
     let mut out = Vec::new();
     let Ok(doc) = parse_guarded(font_table_xml) else {
@@ -2881,10 +3121,12 @@ fn parse_embedded_fonts(
             ) else {
                 continue;
             };
-            let Some(target) = rels.get(rid) else {
+            let Some(part_path) = rels
+                .get(rid)
+                .and_then(|relationship| relationship.resolve_part(font_table_part))
+            else {
                 continue;
             };
-            let part_path = ooxml_common::rels::resolve_target(base_dir, target);
             out.push(crate::types::EmbeddedFont {
                 font_name: name.to_string(),
                 style: style.to_string(),
@@ -3163,6 +3405,7 @@ fn logical_table_sequence_contexts(
 struct BodyParseCursor {
     field: FieldState,
     section_ordinal: usize,
+    ref_leading_breaks: HashMap<String, String>,
 }
 
 impl BodyParseCursor {
@@ -3187,7 +3430,7 @@ impl BodyParseCursor {
         let mut child_diagnostics = Vec::new();
         match child.tag_name().name() {
             "p" => {
-                let result = parse_paragraph_with_diagnostics(
+                let mut result = parse_paragraph_with_diagnostics(
                     child,
                     style_map,
                     num_map,
@@ -3199,6 +3442,7 @@ impl BodyParseCursor {
                     &mut self.field,
                     &mut child_diagnostics,
                 );
+                apply_matching_leading_break(&mut result, &self.ref_leading_breaks);
                 let lone_break = if result.runs.len() == 1 {
                     match &result.runs[0] {
                         DocRun::Break {
@@ -3243,6 +3487,7 @@ impl BodyParseCursor {
                             });
                         if !section_subsumes_page_break {
                             output.push(BodyElement::PageBreak {
+                                origin: Some(PageBreakOrigin::Authored),
                                 parity: None,
                                 same_paragraph_as_previous: None,
                             });
@@ -3262,6 +3507,7 @@ impl BodyParseCursor {
                                 ParaPiece::PageBreak {
                                     same_paragraph_as_previous,
                                 } => output.push(BodyElement::PageBreak {
+                                    origin: Some(PageBreakOrigin::Authored),
                                     parity: None,
                                     same_paragraph_as_previous: same_paragraph_as_previous
                                         .then_some(true),
@@ -3345,6 +3591,20 @@ fn parse_body_elements_in_story(
     // below) when the cover is already followed by a page-advancing construct.
     let mut cover_break_positions: Vec<usize> = Vec::new();
 
+    // The monolithic API and pull cursor apply the same bounded REF rule.
+    // Only requested target text survives this scan, never bookmarked run trees.
+    let mut ref_instructions = RefInstructionCollector::default();
+    for (child, _) in &body_children {
+        ref_instructions.observe(*child);
+    }
+    if !ref_instructions.targets.is_empty() {
+        let mut collector = LeadingBreakCollector::new(&ref_instructions.targets);
+        for (child, _) in &body_children {
+            collector.observe(*child);
+        }
+        cursor.ref_leading_breaks = collector.finish();
+    }
+
     let logical_table_sequences =
         logical_table_sequence_contexts(&body_children, style_map, table_positioning_context);
 
@@ -3371,6 +3631,7 @@ fn parse_body_elements_in_story(
         if cover_break_after {
             cover_break_positions.push(body.len());
             body.push(BodyElement::PageBreak {
+                origin: Some(PageBreakOrigin::CoverPageSynthetic),
                 parity: None,
                 same_paragraph_as_previous: None,
             });
@@ -3569,7 +3830,8 @@ fn apply_cover_page_breaks(
 // boxing the Para variant would add a heap allocation per paragraph on the hot
 // parse path with no real memory benefit for a transient `Vec<ParaPiece>`.
 #[allow(clippy::large_enum_variant)]
-enum ParaPiece {
+#[cfg(test)]
+enum OldParaPiece {
     Para(DocParagraph),
     PageBreak { same_paragraph_as_previous: bool },
     ColumnBreak,
@@ -3598,7 +3860,9 @@ enum ParaPiece {
 ///
 /// Pure-page-break paragraphs are handled upstream as
 /// BodyElement::PageBreak before this function ever sees them.
-fn split_para_on_page_breaks(para: DocParagraph) -> Vec<ParaPiece> {
+#[cfg(test)]
+fn old_split_para_on_page_breaks(para: DocParagraph) -> Vec<OldParaPiece> {
+    use OldParaPiece as ParaPiece;
     // `<w:lastRenderedPageBreak/>` (BreakType::RenderedPage) is Word's layout
     // cache, not an authoritative break (ECMA-376 §17.3.1.20). We paginate the
     // body ourselves (computePages, TS side), so these hints are ignored
@@ -4150,6 +4414,13 @@ fn section_break_element(
     }
 }
 
+/// Media map for a part's OWN relationships (`<dir>/_rels/<name>.rels`,
+/// ECMA-376 Part 2 §6.5.2.3), resolved against that part.
+fn load_part_media_map(zip: &mut Zip, source_part: &str) -> HashMap<String, String> {
+    let rels_xml = read_zip_string(zip, &relationship_part_path(source_part)).unwrap_or_default();
+    load_media_map(zip, &parse_opc_rels(&rels_xml), source_part)
+}
+
 /// Build a map of rId → embedded **zip path** (e.g. `word/media/image1.png`) for
 /// every relationship targeting a media/image part. The bytes are NOT read here:
 /// images are fetched lazily by path at render time (via the `extract_image`
@@ -4158,27 +4429,32 @@ fn section_break_element(
 /// previous "drop unresolvable blips" behavior.
 fn load_media_map(
     zip: &mut Zip,
-    rel_map: &HashMap<String, String>,
-    base_dir: &str,
+    relationships: &BTreeMap<String, RelTarget>,
+    source_part: &str,
 ) -> HashMap<String, String> {
     let mut media_map: HashMap<String, String> = HashMap::new();
-    for (rid, target) in rel_map {
+    for (rid, relationship) in relationships {
+        // The media filter compares the Target's part-name equivalence key, so
+        // `Media/Image1.png` and `%6Dedia/...` spell the same kind of target.
+        let target = ooxml_common::rels::part_name_equivalence_key(&relationship.target);
         if target.contains("media/") || target.contains("image") {
-            // Resolve the Target against the source part's directory via the
-            // shared OPC resolver (ECMA-376 Part 2 §9.3): this handles
-            // root-absolute Targets (`/word/media/...`) AND normalizes `..`
-            // segments, so a chart/footnote media ref like
-            // `../media/image.png` (base_dir `word/charts/`) resolves to
-            // `word/media/image.png` instead of the unresolved
-            // `word/charts/../media/image.png` the old `format!` left behind.
-            let path = ooxml_common::rels::resolve_target(base_dir, target);
+            // Resolve the Target against the source part via the shared OPC
+            // resolver (ECMA-376 Part 2 §6.4/§6.5.2.3, RFC 3986 §5): this
+            // handles root-absolute (`/word/media/...`), `./` and `../`
+            // Targets, so a chart/footnote media ref like `../media/image.png`
+            // (source `word/charts/chart1.xml`) resolves to
+            // `word/media/image.png`. External targets and references that
+            // name no package part are dropped like a missing part.
+            let Some(path) = relationship.resolve_part(source_part) else {
+                continue;
+            };
             // Confirm the part exists before mapping the rId (keeps the lazy
-            // pipeline honest: a path in the map is always extractable).
-            // `index_for_name` consults only the central directory — no inflate,
-            // unlike the former `read_zip_bytes` which decompressed the whole
-            // entry just to throw the bytes away.
-            if zip.index_for_name(&path).is_some() {
-                media_map.insert(rid.clone(), path);
+            // pipeline honest: a path in the map is always extractable), and
+            // publish its stored ZIP item name so equivalent spellings of one
+            // part share one model path. `entry_name` consults only the
+            // central directory — no inflate.
+            if let Some(stored) = zip.entry_name(&path) {
+                media_map.insert(rid.clone(), stored);
             }
         }
     }
@@ -4196,7 +4472,8 @@ fn load_media_map(
 /// renders nothing, matching the "drop unresolvable blip" behaviour).
 fn load_chart_map(
     zip: &mut Zip,
-    rel_map: &HashMap<String, String>,
+    relationships: &BTreeMap<String, RelTarget>,
+    source_part: &str,
     theme: &ThemeColors,
 ) -> HashMap<String, ooxml_common::chart::ChartModel> {
     // Resolve the rId's Type via the raw rels: `rel_map` only carries Targets,
@@ -4206,9 +4483,17 @@ fn load_chart_map(
     // `None` for a colors/style sidecar, so a stray non-chart `.xml` there is
     // harmless.
     let mut chart_map: HashMap<String, ooxml_common::chart::ChartModel> = HashMap::new();
-    for (rid, target) in rel_map {
-        let path = ooxml_common::rels::resolve_target("word/", target);
-        if !(path.contains("charts/") && path.ends_with(".xml")) {
+    for (rid, relationship) in relationships {
+        // Use the stored ZIP item name (§6.2.2.3 equivalence); an absent part
+        // is dropped exactly like an unreadable one.
+        let Some(path) = relationship
+            .resolve_part(source_part)
+            .and_then(|path| zip.entry_name(&path))
+        else {
+            continue;
+        };
+        let key = ooxml_common::rels::part_name_equivalence_key(&path);
+        if !(key.contains("charts/") && key.ends_with(".xml")) {
             continue;
         }
         let Ok(xml) = read_zip_string(zip, &path) else {
@@ -4271,7 +4556,7 @@ fn load_chart_related_parts(zip: &mut Zip, chart_path: &str) -> ChartRelatedPart
         color_style_xml: None,
         image_relationships: Default::default(),
     };
-    let rels_path = ooxml_common::rels::relationship_part_path(chart_path);
+    let rels_path = relationship_part_path(chart_path);
     let Ok(rels_xml) = read_zip_string(zip, &rels_path) else {
         return result;
     };
@@ -4281,7 +4566,6 @@ fn load_chart_related_parts(zip: &mut Zip, chart_path: &str) -> ChartRelatedPart
         chart_path,
         &relationships,
     );
-    let base_dir = chart_path.rsplit_once('/').map_or("", |(dir, _)| dir);
     let internal_target = |suffix: &str| {
         relationships.values().find(|relationship| {
             relationship.mode == ooxml_common::rels::TargetMode::Internal
@@ -4299,25 +4583,27 @@ fn load_chart_related_parts(zip: &mut Zip, chart_path: &str) -> ChartRelatedPart
                 .is_some_and(ooxml_common::chart::is_chart_style_relationship_type)
     });
     if let Some(style_relationship) = style_relationship {
-        let style_path = ooxml_common::rels::resolve_target(base_dir, &style_relationship.target);
+        // A target naming no part reads like a missing chartStyle part.
+        let style_path = style_relationship.resolve_part(chart_path);
         result.style_xml =
-            Some(read_zip_string(zip, &style_path).unwrap_or_else(|_| "\0".to_owned()));
-        let style_rels_path = ooxml_common::rels::relationship_part_path(&style_path);
-        if let Ok(style_rels_xml) = read_zip_string(zip, &style_rels_path) {
-            let style_relationships = ooxml_common::rels::parse_rels(&style_rels_xml);
-            result.image_relationships.insert_parsed_relationships(
-                ooxml_common::chart::ChartImageSource::Style,
-                &style_path,
-                &style_relationships,
-            );
+            Some(read_part_string(zip, style_path.as_deref()).unwrap_or_else(|_| "\0".to_owned()));
+        if let Some(style_path) = style_path.as_deref() {
+            if let Ok(style_rels_xml) = read_zip_string(zip, &relationship_part_path(style_path)) {
+                let style_relationships = ooxml_common::rels::parse_rels(&style_rels_xml);
+                result.image_relationships.insert_parsed_relationships(
+                    ooxml_common::chart::ChartImageSource::Style,
+                    style_path,
+                    &style_relationships,
+                );
+            }
         }
     }
     if let Some(color_relationship) =
         internal_target(ooxml_common::chart::CHART_COLOR_STYLE_REL_TYPE_SUFFIX)
     {
-        let color_path = ooxml_common::rels::resolve_target(base_dir, &color_relationship.target);
+        let color_path = color_relationship.resolve_part(chart_path);
         result.color_style_xml =
-            Some(read_zip_string(zip, &color_path).unwrap_or_else(|_| "\0".to_owned()));
+            Some(read_part_string(zip, color_path.as_deref()).unwrap_or_else(|_| "\0".to_owned()));
     }
     result
 }
@@ -4336,40 +4622,45 @@ fn load_chart_user_shapes_xml(zip: &mut Zip, chart_path: &str, chart_xml: &str) 
                     .is_some_and(|namespace| namespace.ends_with("/relationships"))
         })?
         .value();
-    let (dir, file) = chart_path.rsplit_once('/').unwrap_or(("", chart_path));
-    let rels_path = format!("{}/_rels/{}.rels", dir, file);
-    let rels_xml = read_zip_string(zip, &rels_path).ok()?;
-    let target = ooxml_common::rels::parse_rels(&rels_xml)
+    let rels_xml = read_zip_string(zip, &relationship_part_path(chart_path)).ok()?;
+    let user_shapes_path = parse_opc_rels(&rels_xml)
         .get(rid)?
-        .target
-        .clone();
-    let user_shapes_path = ooxml_common::rels::resolve_target(&format!("{}/", dir), &target);
+        .resolve_part(chart_path)?;
     read_zip_string(zip, &user_shapes_path).ok()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn load_header_footer_set(
     zip: &mut Zip,
-    type_to_target: &HashMap<String, String>,
+    relationships: &BTreeMap<String, RelTarget>,
+    type_to_rid: &HashMap<String, String>,
     root_tag: &str,
     style_map: &StyleMap,
     num_map: &mut NumberingMap,
     theme: &ThemeColors,
 ) -> HeadersFooters {
     let mut out = HeadersFooters::default();
-    for (kind, target) in type_to_target {
-        let path = format!("word/{}", target);
+    for (kind, rid) in type_to_rid {
+        // ECMA-376 Part 2 §6.5.2.3: the header/footer part is the document
+        // relationship's target resolved against `word/document.xml`. A
+        // relationship naming no package part is skipped like a missing part.
+        let Some(path) = relationships
+            .get(rid)
+            .and_then(|relationship| relationship.resolve_part(DOCUMENT_PART))
+        else {
+            continue;
+        };
         let xml = match read_zip_string(zip, &path) {
             Ok(s) => s,
             Err(_) => continue,
         };
 
-        // Per-file rels for image resolution
-        let stem = target.trim_end_matches(".xml");
-        let rels_path = format!("word/_rels/{}.xml.rels", stem);
-        let rels_xml = read_zip_string(zip, &rels_path).unwrap_or_default();
+        // Per-part rels for image/chart resolution, resolved against this part.
+        let rels_xml = read_zip_string(zip, &relationship_part_path(&path)).unwrap_or_default();
         let local_rel_map = parse_rels(&rels_xml);
-        let local_media_map = load_media_map(zip, &local_rel_map, "word/");
-        let local_chart_map = load_chart_map(zip, &local_rel_map, theme);
+        let local_relationships = parse_opc_rels(&rels_xml);
+        let local_media_map = load_media_map(zip, &local_relationships, &path);
+        let local_chart_map = load_chart_map(zip, &local_relationships, &path, theme);
 
         let xml_doc = match parse_guarded(&xml) {
             Ok(d) => d,
@@ -4532,7 +4823,9 @@ fn parse_section(
     props.margin_left = geom.margin_left;
     props.header_distance = geom.header_distance;
     props.footer_distance = geom.footer_distance;
-    props.title_page = child_w(sp, "titlePg").is_some();
+    // ECMA-376 17.10.6: an explicit false uses the ordinary page header;
+    // only a present element with an omitted val defaults to true.
+    props.title_page = bool_prop(sp, "titlePg").unwrap_or(false);
     // ECMA-376 §17.6.22 — the body (final) section's start type. Non-final
     // sections carry their start type on their own SectionBreak marker; the
     // paginator needs the final section's here to resolve the boundary INTO it.
@@ -4633,14 +4926,13 @@ fn merge_section_refs(
         )
         .map(|s| s.to_string());
         let Some(rid) = rid else { continue };
-        let Some(target) = rel_map.get(&rid) else {
+        if !rel_map.contains_key(&rid) {
             continue;
-        };
-        let target = target.trim_start_matches('/').to_string();
+        }
         if local == "headerReference" {
-            refs.headers.insert(kind, target);
+            refs.headers.insert(kind, rid);
         } else {
-            refs.footers.insert(kind, target);
+            refs.footers.insert(kind, rid);
         }
     }
 }
@@ -4812,7 +5104,16 @@ fn resolve_numbering_marker(
     num_level: u32,
     paragraph_mark_run: &RunFmt,
     theme: &ThemeColors,
-) -> NumberingInfo {
+) -> Option<NumberingInfo> {
+    let ilvl_byte = u8::try_from(num_level).unwrap_or((num_level % 256) as u8);
+    let action = word_level_use(ilvl_byte);
+    // Counter mutation is independent of marker availability. A two-level
+    // definition still advances its level-0 counter for ilvl=16 while showing
+    // no marker, because no level-8 definition supplies the fallback paint.
+    let running_counter = action
+        .counter_level
+        .map(|level| num_map.advance(num_id, level));
+    let marker_level = action.marker_level?;
     let (
         format,
         indent_left,
@@ -4825,42 +5126,29 @@ fn resolve_numbering_marker(
         color,
         color_auto,
         picture_bullet,
-    ) = num_map
-        .get_level(num_id, num_level)
-        .map(|level| {
-            let mut marker_run = paragraph_mark_run.clone();
-            apply_direct_run(&mut marker_run, &level.rpr);
-            (
-                level.format.clone(),
-                level.indent_left,
-                level.tab,
-                level.suff.clone(),
-                level.lvl_jc.clone(),
-                theme.resolve_font_ref(marker_run.font_family_ascii.clone()),
-                theme.resolve_font_ref(marker_run.font_family_east_asia.clone()),
-                Some(resolved_run_font_facts(&marker_run, theme)),
-                level.rpr.color.clone(),
-                level.rpr.color_auto,
-                level.pic_bullet.clone(),
-            )
-        })
-        .unwrap_or_else(|| {
-            (
-                "decimal".to_string(),
-                36.0,
-                18.0,
-                "tab".to_string(),
-                "left".to_string(),
-                theme.resolve_font_ref(paragraph_mark_run.font_family_ascii.clone()),
-                theme.resolve_font_ref(paragraph_mark_run.font_family_east_asia.clone()),
-                Some(resolved_run_font_facts(paragraph_mark_run, theme)),
-                None,
-                false,
-                None,
-            )
-        });
-    let counter = num_map.advance(num_id, num_level);
-    let text = num_map.resolve_text(num_id, num_level, counter);
+    ) = num_map.get_level(num_id, marker_level).map(|level| {
+        let mut marker_run = paragraph_mark_run.clone();
+        apply_direct_run(&mut marker_run, &level.rpr);
+        (
+            level.format.clone(),
+            level.indent_left,
+            level.tab,
+            level.suff.clone(),
+            level.lvl_jc.clone(),
+            theme.resolve_font_ref(marker_run.font_family_ascii.clone()),
+            theme.resolve_font_ref(marker_run.font_family_east_asia.clone()),
+            Some(resolved_run_font_facts(&marker_run, theme)),
+            level.rpr.color.clone(),
+            level.rpr.color_auto,
+            level.pic_bullet.clone(),
+        )
+    })?;
+    let counter = action.fixed_counter.or(running_counter).unwrap_or(0);
+    let text = if action.fixed_counter == Some(0) {
+        num_map.resolve_text_word_zero(num_id, marker_level)
+    } else {
+        num_map.resolve_text(num_id, marker_level, counter)
+    };
     let (pic_bullet_image_path, pic_bullet_mime_type, pic_bullet_width_pt, pic_bullet_height_pt) =
         match picture_bullet {
             // §17.9.20 defines no default size; absence stays absent so layout can
@@ -4874,9 +5162,9 @@ fn resolve_numbering_marker(
             None => (None, None, None, None),
         };
 
-    NumberingInfo {
+    Some(NumberingInfo {
         num_id,
-        level: num_level,
+        level: marker_level,
         format,
         text,
         indent_left,
@@ -4892,7 +5180,7 @@ fn resolve_numbering_marker(
         pic_bullet_mime_type,
         pic_bullet_width_pt,
         pic_bullet_height_pt,
-    }
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4989,9 +5277,7 @@ fn parse_paragraph_cond_at_depth_with_diagnostics(
     let numbering = if let (Some(num_id), Some(num_level)) = (base_para.num_id, base_para.num_level)
     {
         if num_id != 0 {
-            Some(Box::new(resolve_numbering_marker(
-                num_map, num_id, num_level, &mark_run, theme,
-            )))
+            resolve_numbering_marker(num_map, num_id, num_level, &mark_run, theme).map(Box::new)
         } else {
             None
         }
@@ -7268,7 +7554,12 @@ fn parse_run_inner(
                     attach_anchor_host_metrics(&mut drawing_runs);
                     runs.extend(drawing_runs);
                 } else if let Some(img) = parse_object_ole_image(child, media_map) {
-                    runs.push(DocRun::Image(Box::new(img)));
+                    let anchored = img.anchor;
+                    let mut object_runs = vec![DocRun::Image(Box::new(img))];
+                    if anchored {
+                        attach_anchor_host_metrics(&mut object_runs);
+                    }
+                    runs.extend(object_runs);
                 }
             }
             _ => {}
@@ -9455,8 +9746,9 @@ fn parse_wsp_shape(
     let cust_geom = sp_pr
         .children()
         .find(|n| n.is_element() && n.tag_name().name() == "custGeom");
-    let (subpaths, preset_geometry, adj_values) = if let Some(cg) = cust_geom {
-        (parse_custom_geometry(cg, cx, cy), None, Vec::new())
+    let (subpaths, subpath_paint, preset_geometry, adj_values) = if let Some(cg) = cust_geom {
+        let (subpaths, paint) = parse_custom_geometry_with_paint(cg, cx, cy);
+        (subpaths, paint, None, Vec::new())
     } else {
         // Defer prstGeom rendering to core's buildShapePath. Carry the preset
         // name + adjustment values so the renderer can call into the shared
@@ -9472,7 +9764,7 @@ fn parse_wsp_shape(
             .unwrap_or("rect")
             .to_string();
         let adj_values = prst_node.map(parse_preset_adj).unwrap_or_default();
-        (Vec::new(), Some(prst), adj_values)
+        (Vec::new(), Vec::new(), Some(prst), adj_values)
     };
     if subpaths.is_empty() && preset_geometry.is_none() {
         return None;
@@ -9573,6 +9865,7 @@ fn parse_wsp_shape(
         behind_doc: false,
         z_order,
         subpaths,
+        subpath_paint,
         preset_geometry,
         adj_values,
         fill,
@@ -10318,9 +10611,7 @@ fn extract_simple_paragraph_text(
             return None;
         }
         let num_level = direct_ind.num_level.or(style_para.num_level).unwrap_or(0);
-        Some(Box::new(resolve_numbering_marker(
-            num_map, num_id, num_level, &mark_run, theme,
-        )))
+        resolve_numbering_marker(num_map, num_id, num_level, &mark_run, theme).map(Box::new)
     });
     let level = numbering
         .as_ref()
@@ -10769,6 +11060,7 @@ fn parse_vml_pict(
         behind_doc,
         z_order: 0,
         subpaths: Vec::new(),
+        subpath_paint: Vec::new(),
         preset_geometry,
         adj_values,
         fill: resolved_fill.fill,
@@ -10840,7 +11132,11 @@ struct ResolvedVmlFill {
 
 /// Resolve the Part 4 §19.1.2.5/§19.1.2.19 fill cascade. Instance properties
 /// override the referenced shapetype; within either layer `<v:fill>` overrides
-/// the element attributes. An enabled fill defaults to white.
+/// the element attributes. An enabled fill defaults to white. Word's PDF of a
+/// rotated VML textpath watermark with `v:fill type="pattern"` and a valid image
+/// relationship paints the textpath in `color` alone, without an image tile.
+/// That observation supports the solid projection for textpath watermarks; it
+/// does not establish image-pattern behaviour for other VML shape hosts.
 fn resolve_vml_fill(
     shape: roxmltree::Node,
     shape_type: Option<roxmltree::Node>,
@@ -11465,13 +11761,19 @@ fn vml_word_z_order(style: &str) -> (bool, Option<u32>, AnchorValueStatusWire) {
         // does not. Do not invent an ordering for a value outside Word's model.
         return (false, None, AnchorValueStatusWire::Invalid);
     };
-    // ECMA-376 Part 4 §19.1.2.19 orders higher signed z-index values above
-    // lower ones. MS-OE376 §2.1.1692(cc) says Word preserves sign and relative
-    // order, not the absolute number. Biasing the signed domain into u32 is an
-    // exact order-preserving projection into the retained anchor layer key.
+    // ECMA-376 Part 4 §19.1.2.19 defines signed VML z-index ordering;
+    // DrawingML §20.4.2.3 defines unsigned relativeHeight separately. Word
+    // writes comparable positive values for shapes in the same foreground
+    // layer, so retain those values for the shared page sorter. Negative VML
+    // shapes belong to its separate behind-document layer; bias only that
+    // range into u32 to preserve order within that layer.
     (
         signed < 0,
-        Some((i64::from(signed) - i64::from(i32::MIN)) as u32),
+        Some(if signed < 0 {
+            (i64::from(signed) - i64::from(i32::MIN)) as u32
+        } else {
+            signed as u32
+        }),
         AnchorValueStatusWire::Valid,
     )
 }
@@ -11671,48 +11973,15 @@ fn resolved_vml_textpath_bool(
 ///     a separate VML-group feature; until then a grouped imagedata is skipped
 ///     rather than mis-rendered, matching the prior behaviour, or
 ///   - the rId does not resolve, or the shape has no positive pt dimensions.
-fn parse_vml_pict_image(
-    pict: roxmltree::Node,
-    media_map: &HashMap<String, String>,
-) -> Option<ImageRun> {
-    let is_shape = |n: &roxmltree::Node| {
-        n.is_element() && matches!(n.tag_name().name(), "shape" | "rect" | "roundrect" | "oval")
-    };
-    // The first shape carrying an <v:imagedata r:id>, that is NOT nested in a
-    // <v:group> (grouped geometry is in group units, handled elsewhere).
-    let shape = pict.descendants().find(|n| {
-        is_shape(n)
-            && n.children()
-                .any(|c| c.is_element() && c.tag_name().name() == "imagedata")
-            && !n
-                .ancestors()
-                .any(|a| a.is_element() && a.tag_name().name() == "group")
-    })?;
-
-    let imagedata = shape
-        .children()
-        .find(|c| c.is_element() && c.tag_name().name() == "imagedata")?;
-    let rid = attr_ns(
-        &imagedata,
-        relationships::TRANSITIONAL,
-        relationships::STRICT,
-        "id",
-    )?;
-    let image_path = media_map.get(rid)?.clone();
-    let mime_type = mime_from_ext(&image_path).to_string();
-
+fn vml_image_run(
+    shape: roxmltree::Node,
+    image_path: String,
+    width_pt: f64,
+    height_pt: f64,
+) -> ImageRun {
     let style = shape.attribute("style").unwrap_or("");
-    let width_pt = vml_css_length_pt(style, "width").unwrap_or(0.0);
-    let height_pt = vml_css_length_pt(style, "height").unwrap_or(0.0);
-    if width_pt <= 0.0 || height_pt <= 0.0 {
-        return None;
-    }
-
-    // VML §19.1.2.19 uses CSS-like positioning for both text shapes and
-    // imagedata pictures. `position:absolute` is a floating anchor; treating it
-    // as an inline glyph applies line-height/baseline positioning and clips a
-    // page-sized scan. The mso-position-*-relative values select the same page,
-    // margin, column, and paragraph frames used by DrawingML anchors.
+    // ECMA-376 Part 4 §19.1.2.19: an absolute VML image has its own
+    // positioning and z-index even when it previews an embedded OLE object.
     let anchor =
         vml_css_str(style, "position").is_some_and(|value| value.eq_ignore_ascii_case("absolute"));
     let anchor_x_pt = if anchor {
@@ -11746,9 +12015,9 @@ fn parse_vml_pict_image(
     let anchor_acquisition =
         anchor.then(|| vml_word_anchor_acquisition(shape, style, width_pt, height_pt));
 
-    Some(ImageRun {
+    ImageRun {
+        mime_type: mime_from_ext(&image_path).to_string(),
         image_path,
-        mime_type,
         svg_image_path: None,
         src_rect: None,
         width_pt,
@@ -11776,15 +12045,54 @@ fn parse_vml_pict_image(
         anchor_x_relative_from,
         anchor_y_relative_from,
         anchor_acquisition,
-    })
+    }
+}
+
+fn parse_vml_pict_image(
+    pict: roxmltree::Node,
+    media_map: &HashMap<String, String>,
+) -> Option<ImageRun> {
+    let is_shape = |n: &roxmltree::Node| {
+        n.is_element() && matches!(n.tag_name().name(), "shape" | "rect" | "roundrect" | "oval")
+    };
+    // The first shape carrying an <v:imagedata r:id>, that is NOT nested in a
+    // <v:group> (grouped geometry is in group units, handled elsewhere).
+    let shape = pict.descendants().find(|n| {
+        is_shape(n)
+            && n.children()
+                .any(|c| c.is_element() && c.tag_name().name() == "imagedata")
+            && !n
+                .ancestors()
+                .any(|a| a.is_element() && a.tag_name().name() == "group")
+    })?;
+
+    let imagedata = shape
+        .children()
+        .find(|c| c.is_element() && c.tag_name().name() == "imagedata")?;
+    let rid = attr_ns(
+        &imagedata,
+        relationships::TRANSITIONAL,
+        relationships::STRICT,
+        "id",
+    )?;
+    let image_path = media_map.get(rid)?.clone();
+
+    let style = shape.attribute("style").unwrap_or("");
+    let width_pt = vml_css_length_pt(style, "width").unwrap_or(0.0);
+    let height_pt = vml_css_length_pt(style, "height").unwrap_or(0.0);
+    if width_pt <= 0.0 || height_pt <= 0.0 {
+        return None;
+    }
+
+    Some(vml_image_run(shape, image_path, width_pt, height_pt))
 }
 
 /// Extract the preview image from an embedded OLE object (`<w:object>`,
 /// §17.3.3.19 CT_Object). Word represents the object's on-page appearance as a
 /// legacy VML `<v:shape>` (or `<v:rect>`/`<v:roundrect>`/`<v:oval>`) carrying a
 /// `<v:imagedata r:id>` — the rId of a rasterized preview part (usually
-/// EMF/WMF). Resolve that part through the media map and return it as an inline
-/// `ImageRun` sized from the VML shape's CSS `style` (pt), falling back to the
+/// EMF/WMF). Resolve that part through the media map and return an `ImageRun`
+/// with the VML shape's positioning and size, falling back to the
 /// object's `w:dxaOrig`/`w:dyaOrig` (twentieths of a point) when the shape
 /// omits explicit dimensions. Returns `None` when there is no drawable
 /// `<v:imagedata>` (an icon-only or link-only object), preserving the prior
@@ -11810,14 +12118,13 @@ fn parse_object_ole_image(
         "id",
     )?;
     let image_path = media_map.get(rid)?.clone();
-    let mime_type = mime_from_ext(&image_path).to_string();
 
     // Size: prefer the VML shape's CSS `style` width/height (pt); else the
     // object's `w:dxaOrig`/`w:dyaOrig` (1/20 pt). VML CSS lengths default to pt.
     let shape = object.descendants().find(|n| {
         n.is_element() && matches!(n.tag_name().name(), "shape" | "rect" | "roundrect" | "oval")
-    });
-    let style = shape.and_then(|s| s.attribute("style")).unwrap_or("");
+    })?;
+    let style = shape.attribute("style").unwrap_or("");
     let dxa_pt = |name: &str| -> Option<f64> {
         attr_ns(
             &object,
@@ -11838,37 +12145,7 @@ fn parse_object_ole_image(
         return None;
     }
 
-    Some(ImageRun {
-        image_path,
-        mime_type,
-        svg_image_path: None,
-        src_rect: None,
-        width_pt,
-        height_pt,
-        rotation: 0.0,
-        flip_h: false,
-        flip_v: false,
-        anchor: false,
-        anchor_x_pt: 0.0,
-        anchor_y_pt: 0.0,
-        anchor_x_from_margin: false,
-        anchor_y_from_para: false,
-        color_replace_from: None,
-        duotone: None,
-        alpha: None,
-        wrap_mode: None,
-        dist_top: 0.0,
-        dist_bottom: 0.0,
-        dist_left: 0.0,
-        dist_right: 0.0,
-        wrap_side: None,
-        allow_overlap: true,
-        anchor_x_align: None,
-        anchor_y_align: None,
-        anchor_x_relative_from: None,
-        anchor_y_relative_from: None,
-        anchor_acquisition: None,
-    })
+    Some(vml_image_run(shape, image_path, width_pt, height_pt))
 }
 
 /// Result of inspecting a shape's spPr for a direct fill.
@@ -12240,17 +12517,33 @@ fn parse_docx_drawingml_fill(
 
 /// Parse <a:custGeom><a:pathLst><a:path w="W" h="H">...</a:path></a:pathLst>.
 /// Path coords inside each <a:path> are absolute within W×H; normalize to [0,1].
+#[cfg(test)]
 fn parse_custom_geometry(
     cust_geom: roxmltree::Node,
     shape_width: f64,
     shape_height: f64,
 ) -> Vec<Vec<PathCmd>> {
+    parse_custom_geometry_with_paint(cust_geom, shape_width, shape_height).0
+}
+
+/// [`parse_custom_geometry`] plus each kept path's ECMA-376 §20.1.9.15
+/// `fill`/`stroke` flags, parallel to the subpaths. The paint list is empty
+/// when every path uses the defaults.
+fn parse_custom_geometry_with_paint(
+    cust_geom: roxmltree::Node,
+    shape_width: f64,
+    shape_height: f64,
+) -> (Vec<Vec<PathCmd>>, Vec<PathPaint>) {
     use ooxml_common::custom_geometry::{parse_custom_geometry as parse_shared, PathCommand};
 
-    parse_shared(cust_geom, shape_width, shape_height)
+    let (subpaths, paint): (Vec<_>, Vec<_>) = parse_shared(cust_geom, shape_width, shape_height)
         .paths
         .into_iter()
         .filter_map(|path| {
+            let paint = PathPaint {
+                fill: path.fill.clone(),
+                stroke: path.stroke,
+            };
             let commands: Vec<PathCmd> = path
                 .commands
                 .into_iter()
@@ -12298,9 +12591,15 @@ fn parse_custom_geometry(
                     PathCommand::Close => PathCmd::Close,
                 })
                 .collect();
-            (!commands.is_empty()).then_some(commands)
+            (!commands.is_empty()).then_some((commands, paint))
         })
-        .collect()
+        .unzip();
+    let paint = if paint.iter().all(|p| p.fill.is_none() && p.stroke) {
+        Vec::new()
+    } else {
+        paint
+    };
+    (subpaths, paint)
 }
 
 /// Resolve a color container (e.g. <a:solidFill>, <a:gs>) into a hex string by
@@ -12496,20 +12795,26 @@ fn parse_docx_chart_with_style_parts_and_images(
     if is_chartex {
         // chartEx (waterfall/boxWhisker/…) reads its title font size from the
         // associated chartStyle part when the `<cx:title>` itself carries none.
-        ooxml_common::chart::parse_chartex_part_with_style_parts_and_images(
+        ooxml_common::chart::parse_chartex_part(
             root,
-            &resolver,
-            style_xml,
-            color_style_xml,
-            image_resolver,
+            &ooxml_common::chart::ChartParseContext::new(
+                &resolver,
+                style_xml,
+                color_style_xml,
+                Some(image_resolver),
+                None,
+            ),
         )
     } else {
-        let mut chart = ooxml_common::chart::parse_chart_part_with_style_parts_and_images(
+        let mut chart = ooxml_common::chart::parse_chart_part(
             root,
-            &resolver,
-            style_xml,
-            color_style_xml,
-            image_resolver,
+            &ooxml_common::chart::ChartParseContext::new(
+                &resolver,
+                style_xml,
+                color_style_xml,
+                Some(image_resolver),
+                None,
+            ),
         )?;
         apply_word_classic_chart_space_frame(&mut chart);
         Some(chart)
@@ -13469,9 +13774,21 @@ fn parse_table_cell(
 
     let background = tc_pr
         .and_then(|p| child_w(p, "shd"))
-        .and_then(|s| attr_w(s, "fill"))
-        .filter(|f| f != "auto" && f.len() == 6)
-        .map(|f| f.to_lowercase());
+        .and_then(crate::styles::shading_fill);
+
+    // ECMA-376 §17.4.72 cell text direction. Strict §17.18.93 names are
+    // normalized to their transitional equivalents; the default lrTb and
+    // unknown values are None (horizontal).
+    let text_direction = tc_pr
+        .and_then(|p| child_w(p, "textDirection"))
+        .and_then(|v| attr_w(v, "val"))
+        .and_then(|value| cell_text_direction(&value));
+
+    // ECMA-376 §17.4.21 hideMark (CT_OnOff): ignore the end-of-cell mark when
+    // calculating the row height.
+    let hide_mark = tc_pr
+        .and_then(|p| bool_prop(p, "hideMark"))
+        .unwrap_or(false);
 
     // Empty = not set inline; parse_table fills it from the table style (else "top").
     let v_align = tc_pr
@@ -13599,7 +13916,24 @@ fn parse_table_cell(
         margin_left,
         margin_right,
         table_cell_layout,
+        text_direction,
+        hide_mark,
     }
+}
+
+/// ECMA-376 §17.18.93 ST_TextDirection for a table cell: transitional values
+/// are kept, strict values map to their transitional equivalents, and the
+/// default (`lrTb`/`tb`) or an unknown token is `None`.
+fn cell_text_direction(value: &str) -> Option<String> {
+    let transitional = match value {
+        "tbRl" | "rl" => "tbRl",
+        "btLr" | "lr" => "btLr",
+        "lrTbV" | "tbV" => "lrTbV",
+        "tbRlV" | "rlV" => "tbRlV",
+        "tbLrV" | "lrV" => "tbLrV",
+        _ => return None,
+    };
+    Some(transitional.to_string())
 }
 
 fn parse_table_borders(node: roxmltree::Node) -> TableBorders {
@@ -13640,6 +13974,9 @@ fn parse_cell_borders(node: roxmltree::Node) -> CellBorders {
             .map(parse_border_spec),
         inside_h: child_w(node, "insideH").map(parse_border_spec),
         inside_v: child_w(node, "insideV").map(parse_border_spec),
+        // §17.4.73 / §17.4.79: the cell diagonals (CT_TcBorders only).
+        tl2br: child_w(node, "tl2br").map(parse_border_spec),
+        tr2bl: child_w(node, "tr2bl").map(parse_border_spec),
     }
 }
 
@@ -13681,6 +14018,12 @@ fn apply_cond_cell_borders(dst: &mut CellBorders, src: &RawTblBorders) {
     }
     if dst.inside_v.is_none() {
         dst.inside_v = src.inside_v.as_ref().map(edge_to_border_spec);
+    }
+    if dst.tl2br.is_none() {
+        dst.tl2br = src.tl2br.as_ref().map(edge_to_border_spec);
+    }
+    if dst.tr2bl.is_none() {
+        dst.tr2bl = src.tr2bl.as_ref().map(edge_to_border_spec);
     }
 }
 
@@ -13905,6 +14248,90 @@ fn parse_rels(xml: &str) -> HashMap<String, String> {
 mod tests {
     use super::*;
     use crate::xml_util::W_NS;
+
+    fn piece_shape(piece: ParaPiece) -> String {
+        match piece {
+            ParaPiece::Para(para) => format!("p:{}", serde_json::to_string(&para).unwrap()),
+            ParaPiece::PageBreak {
+                same_paragraph_as_previous,
+            } => {
+                format!("page:{same_paragraph_as_previous}")
+            }
+            ParaPiece::ColumnBreak => "column".into(),
+        }
+    }
+
+    fn old_piece_shape(piece: OldParaPiece) -> String {
+        match piece {
+            OldParaPiece::Para(para) => format!("p:{}", serde_json::to_string(&para).unwrap()),
+            OldParaPiece::PageBreak {
+                same_paragraph_as_previous,
+            } => {
+                format!("page:{same_paragraph_as_previous}")
+            }
+            OldParaPiece::ColumnBreak => "column".into(),
+        }
+    }
+
+    #[test]
+    fn shared_paragraph_break_normalizer_matches_previous_short_sequence_matrix() {
+        let run = |kind| match kind {
+            0 => DocRun::Text(Box::new(TextRun {
+                text: "x".into(),
+                ..Default::default()
+            })),
+            1 => DocRun::Text(Box::new(TextRun {
+                text: " \t".into(),
+                ..Default::default()
+            })),
+            2 => DocRun::Break {
+                break_type: BreakType::Line,
+            },
+            3 => DocRun::Break {
+                break_type: BreakType::Page,
+            },
+            4 => DocRun::Break {
+                break_type: BreakType::Column,
+            },
+            5 => DocRun::Break {
+                break_type: BreakType::RenderedPage,
+            },
+            _ => unreachable!(),
+        };
+        for length in 0..=4 {
+            for encoded in 0..6usize.pow(length) {
+                let mut value = encoded;
+                let mut para = DocParagraph::default();
+                for _ in 0..length {
+                    para.runs.push(run(value % 6));
+                    value /= 6;
+                }
+                for (occurrence_id, run_index) in [para.runs.len(), 0, para.runs.len() + 3, 1]
+                    .into_iter()
+                    .enumerate()
+                {
+                    para.complex_field_boundaries
+                        .push(ComplexFieldBoundaryWire {
+                            occurrence_id: occurrence_id as u32,
+                            boundary: "start".into(),
+                            run_index,
+                            field_type: "other".into(),
+                            instruction: String::new(),
+                            hyperlink_anchor: None,
+                        });
+                }
+                let expected: Vec<_> = old_split_para_on_page_breaks(para.clone())
+                    .into_iter()
+                    .map(old_piece_shape)
+                    .collect();
+                let actual: Vec<_> = split_para_on_page_breaks(para)
+                    .into_iter()
+                    .map(piece_shape)
+                    .collect();
+                assert_eq!(actual, expected, "length={length} encoded={encoded}");
+            }
+        }
+    }
 
     fn parse_tbl(body: &str) -> DocTable {
         parse_tbl_in_story(body, TablePositioningContext::Normal)
@@ -14410,6 +14837,56 @@ mod tests {
                <w:tr><w:tc><w:p/></w:tc></w:tr>"#,
         );
         assert_eq!(t.tbl_ind, None);
+    }
+
+    // ECMA-376 §17.4.72 cell text direction: transitional values are kept,
+    // strict values normalize, and the default/unknown values stay unset.
+    #[test]
+    fn cell_text_direction_surfaces_transitional_values() {
+        for (authored, expected) in [
+            ("tbRl", Some("tbRl")),
+            ("btLr", Some("btLr")),
+            ("tbRlV", Some("tbRlV")),
+            ("lrTbV", Some("lrTbV")),
+            ("tbLrV", Some("tbLrV")),
+            ("rl", Some("tbRl")),
+            ("lr", Some("btLr")),
+            ("rlV", Some("tbRlV")),
+            ("lrTb", None),
+            ("tb", None),
+            ("sideways", None),
+        ] {
+            let t = parse_tbl(&format!(
+                r#"<w:tblPr/>
+                   <w:tblGrid><w:gridCol w:w="5000"/></w:tblGrid>
+                   <w:tr><w:tc><w:tcPr><w:textDirection w:val="{authored}"/></w:tcPr><w:p/></w:tc></w:tr>"#
+            ));
+            assert_eq!(
+                t.rows[0].cells[0].text_direction.as_deref(),
+                expected,
+                "{authored}"
+            );
+        }
+    }
+
+    // ECMA-376 §17.4.21 hideMark is CT_OnOff: present means on unless its
+    // w:val turns it off.
+    #[test]
+    fn cell_hide_mark_reads_on_off() {
+        for (tc_pr, expected) in [
+            ("", false),
+            ("<w:hideMark/>", true),
+            (r#"<w:hideMark w:val="true"/>"#, true),
+            (r#"<w:hideMark w:val="0"/>"#, false),
+            (r#"<w:hideMark w:val="false"/>"#, false),
+        ] {
+            let t = parse_tbl(&format!(
+                r#"<w:tblPr/>
+                   <w:tblGrid><w:gridCol w:w="5000"/></w:tblGrid>
+                   <w:tr><w:tc><w:tcPr>{tc_pr}</w:tcPr><w:p/></w:tc></w:tr>"#
+            ));
+            assert_eq!(t.rows[0].cells[0].hide_mark, expected, "{tc_pr}");
+        }
     }
 
     // Regression guard for the direct-rPr merge path. `apply_direct_run` now
@@ -16875,6 +17352,74 @@ mod math_jc_tests {
     }
 
     #[test]
+    fn settings_line_wrap_like_word6_preserves_explicit_on_off_and_absence() {
+        for (xml, expected) in [
+            (
+                format!(
+                    r#"<w:settings xmlns:w="{W_NS}"><w:compat><w:lineWrapLikeWord6/></w:compat></w:settings>"#
+                ),
+                Some(true),
+            ),
+            (
+                format!(
+                    r#"<w:settings xmlns:w="{W_NS}"><w:compat><w:lineWrapLikeWord6 w:val="0"/></w:compat></w:settings>"#
+                ),
+                Some(false),
+            ),
+            (
+                format!(
+                    r#"<w:settings xmlns:w="{W_NS}"><w:compat><w:useFELayout/></w:compat></w:settings>"#
+                ),
+                None,
+            ),
+        ] {
+            assert_eq!(
+                parse_document_settings(&xml)
+                    .expect("compat setting")
+                    .line_wrap_like_word6,
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn settings_enable_open_type_features_preserves_explicit_on_off_and_absence() {
+        for (xml, expected) in [
+            (
+                format!(
+                    r#"<w:settings xmlns:w="{W_NS}"><w:compat><w:compatSetting w:name="enableOpenTypeFeatures" w:uri="http://schemas.microsoft.com/office/word" w:val="1"/></w:compat></w:settings>"#
+                ),
+                Some(true),
+            ),
+            (
+                format!(
+                    r#"<w:settings xmlns:w="{W_NS}"><w:compat><w:compatSetting w:name="enableOpenTypeFeatures" w:uri="http://schemas.microsoft.com/office/word" w:val="0"/></w:compat></w:settings>"#
+                ),
+                Some(false),
+            ),
+            (
+                format!(
+                    r#"<w:settings xmlns:w="{W_NS}"><w:compat><w:useFELayout/></w:compat></w:settings>"#
+                ),
+                None,
+            ),
+            (
+                format!(
+                    r#"<w:settings xmlns:w="{W_NS}"><w:compat><w:useFELayout/><w:compatSetting w:name="enableOpenTypeFeatures" w:uri="urn:other" w:val="1"/></w:compat></w:settings>"#
+                ),
+                None,
+            ),
+        ] {
+            assert_eq!(
+                parse_document_settings(&xml)
+                    .expect("compat setting")
+                    .enable_open_type_features,
+                expected,
+            );
+        }
+    }
+
+    #[test]
     fn settings_adjust_line_height_in_table_surfaces() {
         let xml = format!(
             r#"<w:settings xmlns:w="{w}"><w:compat><w:adjustLineHeightInTable/></w:compat></w:settings>"#,
@@ -17510,6 +18055,7 @@ mod theme_package_presence_tests {
         let mut bytes = Vec::new();
         {
             let mut writer = zip::ZipWriter::new(Cursor::new(&mut bytes));
+            crate::parser::write_test_content_types(&mut writer);
             let options = zip::write::SimpleFileOptions::default();
             writer
                 .start_file("word/_rels/document.xml.rels", options)
@@ -19150,6 +19696,7 @@ mod svg_blip_tests {
         let mut buf = Vec::new();
         {
             let mut zw = zip::ZipWriter::new(Cursor::new(&mut buf));
+            crate::parser::write_test_content_types(&mut zw);
             let opts = SimpleFileOptions::default();
             let mut put = |name: &str, bytes: &[u8]| {
                 use std::io::Write;
@@ -19163,6 +19710,160 @@ mod svg_blip_tests {
             zw.finish().unwrap();
         }
         buf
+    }
+
+    /// ECMA-376 Part 1 §17.16.5.51: a REF result represents its bookmark's
+    /// content. Word controls with and without `\\h` show that an authored page
+    /// break at the start of a bookmarked range precedes the cached result,
+    /// while a text-only range does not add a break. The cached text must still
+    /// match the range; an unrelated/stale result cannot safely borrow its flow.
+    #[test]
+    fn ref_cached_result_preserves_a_matching_bookmark_leading_page_break() {
+        fn body(target: &str, cached: &str) -> String {
+            format!(
+                r#"<w:p><w:r><w:t xml:space="preserve">Before </w:t></w:r>
+  <w:r><w:fldChar w:fldCharType="begin"/></w:r>
+  <w:r><w:instrText xml:space="preserve"> REF Anchor \h </w:instrText></w:r>
+  <w:r><w:fldChar w:fldCharType="separate"/></w:r>
+  <w:r><w:t>{cached}</w:t></w:r>
+  <w:r><w:fldChar w:fldCharType="end"/></w:r>
+  <w:r><w:t xml:space="preserve"> after</w:t></w:r></w:p>
+<w:p><w:r><w:br w:type="page"/></w:r></w:p>
+{target}"#,
+            )
+        }
+        let text_target = r#"<w:p><w:bookmarkStart w:id="1" w:name="Anchor"/>
+  <w:r><w:t>Result</w:t></w:r><w:bookmarkEnd w:id="1"/></w:p>"#;
+        let break_target = r#"<w:p><w:bookmarkStart w:id="1" w:name="Anchor"/>
+  <w:r><w:br w:type="page"/></w:r></w:p>
+<w:p><w:bookmarkStart w:id="2" w:name="Other"/><w:r><w:lastRenderedPageBreak/><w:t>Result</w:t></w:r>
+  <w:bookmarkEnd w:id="1"/><w:bookmarkEnd w:id="2"/></w:p>"#;
+        let table_target = r#"<w:p><w:bookmarkStart w:id="1" w:name="Anchor"/>
+  <w:r><w:br w:type="page"/></w:r></w:p>
+<w:tbl><w:tr><w:tc><w:p><w:r><w:t>Intervening table</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
+<w:p><w:r><w:t>Result</w:t></w:r><w:bookmarkEnd w:id="1"/></w:p>"#;
+        let kinds = |target: &str, cached: &str, streamed: bool| {
+            let data = build_docx_with_media(&body(target, cached));
+            let doc = if streamed {
+                parse_from_bytes_streamed_with_limits(&data, None, None, "ref-test")
+            } else {
+                parse_from_bytes(&data)
+            }
+            .expect("valid synthetic document");
+            doc.body
+                .iter()
+                .filter_map(|part| match part {
+                    BodyElement::PageBreak { .. } => Some("break"),
+                    BodyElement::Paragraph(p) => {
+                        let text = p
+                            .runs
+                            .iter()
+                            .filter_map(|run| match run {
+                                DocRun::Text(text) => Some(text.text.as_str()),
+                                _ => None,
+                            })
+                            .collect::<String>();
+                        if text.contains("Before") && text.contains(cached) {
+                            Some("unsplit-ref")
+                        } else if text.contains("Before") {
+                            Some("prefix")
+                        } else if text.contains(" after") {
+                            Some("result-tail")
+                        } else if text == "Result" {
+                            Some("target")
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        for streamed in [false, true] {
+            assert_eq!(
+                kinds(text_target, "Result", streamed),
+                ["unsplit-ref", "break", "target"]
+            );
+            assert_eq!(
+                kinds(break_target, "Result", streamed),
+                ["prefix", "break", "result-tail", "break", "break", "target"]
+            );
+            assert_eq!(
+                kinds(break_target, "Stale", streamed),
+                ["unsplit-ref", "break", "break", "target"]
+            );
+            assert_eq!(
+                kinds(table_target, "Result", streamed),
+                ["unsplit-ref", "break", "break", "target"]
+            );
+
+            for (instruction, expected_breaks) in [
+                ("REF Anchor", 3),
+                ("REF Anchor \\p", 2),
+                ("REF Anchor \\n", 2),
+                ("REF Anchor \\* MERGEFORMAT", 2),
+                ("REF \"Anchor Other\" \\h", 2),
+            ] {
+                let xml = body(break_target, "Result").replace("REF Anchor \\h", instruction);
+                let data = build_docx_with_media(&xml);
+                let doc = if streamed {
+                    parse_from_bytes_streamed_with_limits(&data, None, None, "ref-switch-test")
+                } else {
+                    parse_from_bytes(&data)
+                }
+                .expect("valid synthetic document");
+                assert_eq!(
+                    doc.body
+                        .iter()
+                        .filter(|part| matches!(part, BodyElement::PageBreak { .. }))
+                        .count(),
+                    expected_breaks,
+                    "instruction {instruction}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ref_leading_break_applies_to_separate_fields_but_not_nested_results() {
+        let field = r#"<w:r><w:fldChar w:fldCharType="begin"/></w:r>
+  <w:r><w:instrText> REF Anchor </w:instrText></w:r>
+  <w:r><w:fldChar w:fldCharType="separate"/></w:r>
+  <w:r><w:t>Result</w:t></w:r>
+  <w:r><w:fldChar w:fldCharType="end"/></w:r>"#;
+        let target = r#"<w:p><w:bookmarkStart w:id="1" w:name="Anchor"/>
+  <w:r><w:br w:type="page"/></w:r></w:p>
+<w:p><w:r><w:t>Result</w:t></w:r><w:bookmarkEnd w:id="1"/></w:p>"#;
+        let separate = format!(
+            r#"<w:p><w:r><w:t>A </w:t></w:r>{field}<w:r><w:t> B </w:t></w:r>{field}</w:p>{target}"#
+        );
+        let nested = format!(
+            r#"<w:p><w:r><w:t>A </w:t></w:r>
+  <w:r><w:fldChar w:fldCharType="begin"/></w:r>
+  <w:r><w:instrText> REF Anchor </w:instrText></w:r>
+  <w:r><w:fldChar w:fldCharType="separate"/></w:r>
+  <w:r><w:fldChar w:fldCharType="begin"/></w:r>
+  <w:r><w:instrText> HYPERLINK x </w:instrText></w:r>
+  <w:r><w:fldChar w:fldCharType="separate"/></w:r>
+  <w:r><w:t>Result</w:t></w:r>
+  <w:r><w:fldChar w:fldCharType="end"/></w:r>
+  <w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>{target}"#
+        );
+        let break_count = |body: &str| {
+            let doc = parse_from_bytes_streamed_with_limits(
+                &build_docx_with_media(body),
+                None,
+                None,
+                "ref-test",
+            )
+            .expect("valid synthetic document");
+            doc.body
+                .iter()
+                .filter(|part| matches!(part, BodyElement::PageBreak { .. }))
+                .count()
+        };
+        assert_eq!(break_count(&separate), 3);
+        assert_eq!(break_count(&nested), 1);
     }
 
     /// End-to-end through `parse()`: an inline `<w:drawing>` whose `<a:blip>`
@@ -19249,6 +19950,7 @@ mod svg_blip_tests {
         let mut buf = Vec::new();
         {
             let mut zw = zip::ZipWriter::new(Cursor::new(&mut buf));
+            crate::parser::write_test_content_types(&mut zw);
             let opts = SimpleFileOptions::default();
             let mut put = |name: &str, bytes: &[u8]| {
                 use std::io::Write;
@@ -19314,6 +20016,7 @@ mod svg_blip_tests {
         let mut buf = Vec::new();
         {
             let mut zw = zip::ZipWriter::new(Cursor::new(&mut buf));
+            crate::parser::write_test_content_types(&mut zw);
             let opts = SimpleFileOptions::default();
             let mut put = |name: &str, bytes: &[u8]| {
                 use std::io::Write;
@@ -19327,9 +20030,12 @@ mod svg_blip_tests {
         let mut zip = Zip::new(Cursor::new(buf)).unwrap();
 
         // A part at word/charts/chart1.xml references the media one directory up.
-        let mut rel_map: HashMap<String, String> = HashMap::new();
-        rel_map.insert("rIdImg".to_string(), "../media/footnote.png".to_string());
-        let media_map = load_media_map(&mut zip, &rel_map, "word/charts/");
+        let relationships = parse_opc_rels(
+            r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+                 <Relationship Id="rIdImg" Target="../media/footnote.png"/>
+               </Relationships>"#,
+        );
+        let media_map = load_media_map(&mut zip, &relationships, "word/charts/chart1.xml");
 
         assert_eq!(
             media_map.get("rIdImg").map(String::as_str),
@@ -19636,6 +20342,39 @@ mod svg_blip_tests {
         );
     }
 
+    /// ECMA-376 §20.1.9.15: per-path `fill`/`stroke` flags stay aligned with the
+    /// kept subpaths (an empty path is dropped with its flags) and are omitted
+    /// when every path uses the defaults.
+    #[test]
+    fn custom_geometry_keeps_per_path_fill_and_stroke_flags() {
+        let parse = |paths: &str| {
+            let xml = format!(
+                r#"<a:custGeom xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:pathLst>{paths}</a:pathLst></a:custGeom>"#
+            );
+            let doc = roxmltree::Document::parse(&xml).unwrap();
+            parse_custom_geometry_with_paint(doc.root_element(), 10.0, 10.0)
+        };
+        let path = |attrs: &str| {
+            format!(
+                r#"<a:path w="10" h="10" {attrs}><a:moveTo><a:pt x="0" y="0"/></a:moveTo><a:lnTo><a:pt x="10" y="10"/></a:lnTo></a:path>"#
+            )
+        };
+        let (subpaths, paint) = parse(&format!(
+            r#"{}<a:path w="10" h="10" fill="none"/>{}{}"#,
+            path(r#"fill="none""#),
+            path(r#"stroke="0""#),
+            path(r#"fill="darken""#)
+        ));
+        assert_eq!(subpaths.len(), 3);
+        assert_eq!(
+            serde_json::to_value(&paint).unwrap(),
+            serde_json::json!([{"fill": "none"}, {"stroke": false}, {"fill": "darken"}])
+        );
+        let (subpaths, paint) = parse(&format!("{}{}", path(""), path(r#"stroke="1""#)));
+        assert_eq!(subpaths.len(), 2);
+        assert!(paint.is_empty());
+    }
+
     /// Value-level check that the parsed `ArcTo` carries the expected numbers:
     /// `wR`/`hR` normalised by the path's w/h and the angles converted from
     /// 60000ths of a degree. `PathCmd` derives `Serialize` only, so this asserts
@@ -19755,6 +20494,7 @@ mod anchor_image_relative_from_tests {
         let mut buf = Vec::new();
         {
             let mut zw = zip::ZipWriter::new(Cursor::new(&mut buf));
+            crate::parser::write_test_content_types(&mut zw);
             let opts = SimpleFileOptions::default();
             let mut put = |name: &str, bytes: &[u8]| {
                 use std::io::Write;
@@ -19781,6 +20521,7 @@ mod anchor_image_relative_from_tests {
         let mut buf = Vec::new();
         {
             let mut zw = zip::ZipWriter::new(Cursor::new(&mut buf));
+            crate::parser::write_test_content_types(&mut zw);
             let opts = SimpleFileOptions::default();
             let mut put = |name: &str, bytes: &[u8]| {
                 use std::io::Write;
@@ -20713,6 +21454,7 @@ mod anchor_image_relative_from_tests {
         let mut bytes = Vec::new();
         {
             let mut writer = zip::ZipWriter::new(Cursor::new(&mut bytes));
+            crate::parser::write_test_content_types(&mut writer);
             let options = SimpleFileOptions::default();
             for (path, xml) in [
                 ("word/document.xml", document_xml),
@@ -20793,6 +21535,7 @@ mod anchor_image_relative_from_tests {
         let mut bytes = Vec::new();
         {
             let mut writer = zip::ZipWriter::new(Cursor::new(&mut bytes));
+            crate::parser::write_test_content_types(&mut writer);
             writer
                 .start_file(
                     "word/charts/_rels/chart9.xml.rels",
@@ -20823,6 +21566,7 @@ mod anchor_image_relative_from_tests {
         let mut bytes = Vec::new();
         {
             let mut writer = zip::ZipWriter::new(Cursor::new(&mut bytes));
+            crate::parser::write_test_content_types(&mut writer);
             let options = SimpleFileOptions::default();
             for (path, xml) in [
                 ("word/document.xml", document_xml),
@@ -20878,6 +21622,7 @@ mod anchor_image_relative_from_tests {
         let mut bytes = Vec::new();
         {
             let mut writer = zip::ZipWriter::new(Cursor::new(&mut bytes));
+            crate::parser::write_test_content_types(&mut writer);
             let options = SimpleFileOptions::default();
             for (path, content) in [
                 ("word/document.xml", document_xml.as_bytes()),
@@ -21948,14 +22693,8 @@ mod column_tests {
         }
         // The first section's default header/footer survive the body sectPr that
         // declares none.
-        assert_eq!(
-            refs.headers.get("default").map(String::as_str),
-            Some("header1.xml")
-        );
-        assert_eq!(
-            refs.footers.get("default").map(String::as_str),
-            Some("footer1.xml")
-        );
+        assert_eq!(refs.headers.get("default").map(String::as_str), Some("rH"));
+        assert_eq!(refs.footers.get("default").map(String::as_str), Some("rF"));
     }
 
     /// ECMA-376 §17.6.5 `<w:docGrid w:charSpace>` surfaces on SectionProps as a
@@ -22166,6 +22905,10 @@ mod column_tests {
         assert!(matches!(body[0], BodyElement::Paragraph(_)));
         assert!(matches!(body[1], BodyElement::Paragraph(_)));
         assert!(matches!(body[2], BodyElement::PageBreak { .. }));
+        assert_eq!(
+            serde_json::to_value(&body[2]).unwrap()["origin"],
+            "coverPageSynthetic"
+        );
         assert!(matches!(body[3], BodyElement::Paragraph(_)));
     }
 
@@ -22212,6 +22955,10 @@ mod column_tests {
         assert_eq!(body.len(), 3);
         assert!(matches!(body[0], BodyElement::Paragraph(_)));
         assert!(matches!(body[1], BodyElement::PageBreak { .. }));
+        assert_eq!(
+            serde_json::to_value(&body[1]).unwrap()["origin"],
+            "authored"
+        );
         assert!(matches!(body[2], BodyElement::Paragraph(_)));
     }
 
@@ -22706,13 +23453,10 @@ mod column_tests {
         // Section 0 snapshot: first=footerA, default=footerD, titlePg=true.
         let (_id0, refs0, tp0) = &snaps[0];
         assert!(tp0, "section 0 declares <w:titlePg>");
-        assert_eq!(
-            refs0.footers.get("first").map(String::as_str),
-            Some("footerA.xml")
-        );
+        assert_eq!(refs0.footers.get("first").map(String::as_str), Some("ridA"));
         assert_eq!(
             refs0.footers.get("default").map(String::as_str),
-            Some("footerD.xml")
+            Some("ridD")
         );
 
         // Section 1 (body-level) snapshot: first OVERWRITTEN to footerB; default
@@ -22721,19 +23465,19 @@ mod column_tests {
         assert!(!tp1, "section 1 has no <w:titlePg> — not inherited");
         assert_eq!(
             refs1.footers.get("first").map(String::as_str),
-            Some("footerB.xml"),
+            Some("ridB"),
             "section 1's own first reference wins"
         );
         assert_eq!(
             refs1.footers.get("default").map(String::as_str),
-            Some("footerD.xml"),
+            Some("ridD"),
             "section 1 inherits section 0's default footer (§17.10.1)"
         );
 
         // Inheritance must not retroactively mutate section 0's snapshot.
         assert_eq!(
             refs0.footers.get("first").map(String::as_str),
-            Some("footerA.xml"),
+            Some("ridA"),
             "section 0 keeps its own first footer (snapshot is independent)"
         );
     }
@@ -26216,6 +26960,23 @@ mod numbering_marker_font_tests {
         );
     }
 
+    #[test]
+    fn direct_cell_percentage_shading_blends_like_run_shading() {
+        let tables = parse_body_tables(
+            r#"<w:tbl><w:tblPr/><w:tr>
+                <w:tc><w:tcPr><w:shd w:val="pct15" w:color="auto" w:fill="FFFFFF"/></w:tcPr><w:p/></w:tc>
+                <w:tc><w:tcPr><w:shd w:val="clear" w:color="auto" w:fill="DDDDDD"/></w:tcPr><w:p/></w:tc>
+                <w:tc><w:tcPr><w:shd w:val="horzStripe" w:color="FF0000" w:fill="00FF00"/></w:tcPr><w:p/></w:tc>
+            </w:tr></w:tbl>"#,
+            &phase_styles(),
+        );
+        let cells = &tables[0].rows[0].cells;
+        assert_eq!(cells[0].background.as_deref(), Some("d9d9d9"));
+        assert_eq!(cells[1].background.as_deref(), Some("dddddd"));
+        // Non-percentage patterns keep the fill-only projection.
+        assert_eq!(cells[2].background.as_deref(), Some("00ff00"));
+    }
+
     fn phase_styles() -> StyleMap {
         StyleMap::parse(&format!(
             r#"<w:styles xmlns:w="{ns}">
@@ -26856,6 +27617,57 @@ mod numbering_marker_font_tests {
         ))
     }
 
+    // ECMA-376 §17.4.73 / §17.4.79: cell diagonals are read from direct
+    // tcBorders and from a conditional table style's tcBorders; a direct value
+    // wins per diagonal, exactly like the four edges.
+    #[test]
+    fn cell_diagonal_borders_fold_direct_over_conditional_style() {
+        let t = parse_tbl_styled(
+            r#"<w:tblPr/>
+               <w:tblGrid><w:gridCol w:w="5000"/></w:tblGrid>
+               <w:tr><w:tc><w:tcPr><w:tcBorders>
+                 <w:tl2br w:val="single" w:sz="4" w:space="0" w:color="auto"/>
+               </w:tcBorders></w:tcPr><w:p/></w:tc></w:tr>"#,
+            &StyleMap::default(),
+        );
+        let borders = &t.rows[0].cells[0].borders;
+        let tl2br = borders.tl2br.as_ref().expect("tl2br");
+        assert_eq!(tl2br.style, "single");
+        assert!((tl2br.width - 0.5).abs() < 1e-9);
+        assert!(borders.tr2bl.is_none());
+
+        let styles = StyleMap::parse(&format!(
+            r#"<w:styles xmlns:w="{ns}">
+                <w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:rPr/></w:style>
+                <w:style w:type="table" w:styleId="Diag">
+                    <w:tblStylePr w:type="firstRow">
+                        <w:tcPr><w:tcBorders>
+                            <w:tl2br w:val="double" w:sz="8" w:color="FF0000"/>
+                            <w:tr2bl w:val="dotted" w:sz="4" w:color="00FF00"/>
+                        </w:tcBorders></w:tcPr>
+                    </w:tblStylePr>
+                </w:style>
+            </w:styles>"#,
+            ns = W_NS
+        ));
+        let t = parse_tbl_styled(
+            r#"<w:tblPr><w:tblStyle w:val="Diag"/><w:tblLook w:val="0020"/></w:tblPr>
+               <w:tblGrid><w:gridCol w:w="2000"/></w:tblGrid>
+               <w:tr><w:tc><w:tcPr><w:tcBorders>
+                 <w:tr2bl w:val="nil"/>
+               </w:tcBorders></w:tcPr><w:p/></w:tc></w:tr>"#,
+            &styles,
+        );
+        let borders = &t.rows[0].cells[0].borders;
+        let tl2br = borders.tl2br.as_ref().expect("conditional tl2br");
+        assert_eq!(tl2br.style, "double");
+        assert_eq!(tl2br.color.as_deref(), Some("ff0000"));
+        assert_eq!(
+            borders.tr2bl.as_ref().map(|b| b.style.as_str()),
+            Some("nil")
+        );
+    }
+
     #[test]
     fn cond_firstrow_underline_folds_into_cell_bottom() {
         // tblLook 0020 = firstRow on (0x0020). Row 0 = header.
@@ -27239,6 +28051,33 @@ mod ole_object_tests {
             "height from style height:75pt, got {}",
             imgs[0].height_pt
         );
+    }
+
+    #[test]
+    fn absolute_ole_preview_retains_vml_position_and_stacking() {
+        // ECMA-376 Part 4 §19.1.2.19: the VML preview of an OLE object is a
+        // floating shape when position:absolute, including its z-index.
+        let body = format!(
+            r##"<w:document{ns}><w:body><w:p><w:r><w:object>
+                <v:shape id="preview" style="position:absolute;margin-left:25.25pt;margin-top:15.55pt;width:161.25pt;height:17.25pt;z-index:251670528;mso-position-horizontal-relative:text;mso-position-vertical-relative:text">
+                  <v:imagedata r:id="rIdPrev"/>
+                </v:shape>
+                <o:OLEObject Type="Embed" ProgID="Package" ShapeID="preview" r:id="rIdData"/>
+              </w:object></w:r></w:p></w:body></w:document>"##,
+            ns = OLE_NS,
+        );
+        let mut media = HashMap::new();
+        media.insert("rIdPrev".to_string(), "word/media/preview.wmf".to_string());
+        let imgs = image_runs(&body, &media);
+        assert_eq!(imgs.len(), 1);
+        assert!(imgs[0].anchor);
+        assert_eq!(imgs[0].anchor_x_pt, 25.25);
+        assert_eq!(imgs[0].anchor_y_pt, 15.55);
+        assert_eq!(imgs[0].anchor_x_relative_from.as_deref(), Some("column"));
+        assert_eq!(imgs[0].anchor_y_relative_from.as_deref(), Some("paragraph"));
+        let acquisition = imgs[0].anchor_acquisition.as_ref().expect("VML anchor");
+        assert_eq!(acquisition.behavior.relative_height, Some(251670528));
+        assert!(vml_word_z_order("z-index:251668000").1 < Some(251669000));
     }
 
     /// When the `<v:shape>` carries no CSS `style` dimensions, the size falls
@@ -28037,6 +28876,34 @@ mod vml_pict_tests {
         assert!(s.behind_doc, "negative z-index ⇒ behindDoc");
     }
 
+    #[test]
+    fn image_pattern_on_vml_textpath_uses_word_pdf_solid_ink() {
+        let body = format!(
+            r##"<w:document{ns}><w:body><w:p><w:r><w:pict>
+              <v:shape id="PowerPlusWaterMarkObject1"
+                style="position:absolute;width:420pt;height:250pt;rotation:315;z-index:-251657216"
+                fillcolor="#D21D54" stroked="f">
+                <v:fill type="pattern" color="#D21D54" color2="#12CED4" r:id="rIdPattern"/>
+                <v:path textpathok="t"/>
+                <v:textpath on="t" fitshape="t" string="PATTERN WATERMARK"/>
+              </v:shape>
+            </w:pict></w:r></w:p></w:body></w:document>"##,
+            ns = VML_NS,
+        );
+        let mut media = HashMap::new();
+        media.insert(
+            "rIdPattern".to_string(),
+            "word/media/pattern.png".to_string(),
+        );
+        let shapes = shape_runs(&body, &media);
+        assert_eq!(shapes.len(), 1);
+        assert!(shapes[0].text_path.is_some());
+        match &shapes[0].fill {
+            Some(ShapeFill::Solid { color }) => assert_eq!(color, "d21d54"),
+            other => panic!("expected solid textpath ink, got {other:?}"),
+        }
+    }
+
     /// ECMA-376 Part 4's transitional VML schema places `textpathok` on
     /// `<v:path>` (CT_Path) and the remaining WordArt switches on
     /// `<v:textpath>` (CT_TextPath). Word's built-in text-path shape types put
@@ -28494,6 +29361,14 @@ mod embedded_font_tests {
         )
     }
 
+    fn internal_rel(target: &str) -> RelTarget {
+        RelTarget {
+            target: target.to_string(),
+            relationship_type: None,
+            mode: TargetMode::Internal,
+        }
+    }
+
     /// A font declaring both `<w:embedRegular>` and `<w:embedBold>` yields two
     /// `EmbeddedFont` entries, each carrying the family name, the style slot, the
     /// resolved part path (Target resolved against `word/`), and the fontKey.
@@ -28505,11 +29380,11 @@ mod embedded_font_tests {
                  <w:embedBold r:id="rId2" w:fontKey="{KEY-BOLD}"/>
                </w:font>"#,
         );
-        let mut rels = HashMap::new();
-        rels.insert("rId1".to_string(), "fonts/font1.odttf".to_string());
-        rels.insert("rId2".to_string(), "fonts/font2.odttf".to_string());
+        let mut rels = BTreeMap::new();
+        rels.insert("rId1".to_string(), internal_rel("fonts/font1.odttf"));
+        rels.insert("rId2".to_string(), internal_rel("fonts/font2.odttf"));
 
-        let fonts = parse_embedded_fonts(&xml, &rels, "word/");
+        let fonts = parse_embedded_fonts(&xml, &rels, "word/fontTable.xml");
         assert_eq!(fonts.len(), 2, "two embed slots ⇒ two entries");
 
         let reg = fonts.iter().find(|f| f.style == "regular").unwrap();
@@ -28534,11 +29409,14 @@ mod embedded_font_tests {
                  <w:embedBoldItalic r:id="rId4" w:fontKey="{K4}"/>
                </w:font>"#,
         );
-        let mut rels = HashMap::new();
+        let mut rels = BTreeMap::new();
         for n in 1..=4 {
-            rels.insert(format!("rId{n}"), format!("fonts/font{n}.odttf"));
+            rels.insert(
+                format!("rId{n}"),
+                internal_rel(&format!("fonts/font{n}.odttf")),
+            );
         }
-        let fonts = parse_embedded_fonts(&xml, &rels, "word/");
+        let fonts = parse_embedded_fonts(&xml, &rels, "word/fontTable.xml");
         let mut styles: Vec<&str> = fonts.iter().map(|f| f.style.as_str()).collect();
         styles.sort_unstable();
         assert_eq!(styles, ["bold", "boldItalic", "italic", "regular"]);
@@ -28554,11 +29432,11 @@ mod embedded_font_tests {
                  <w:embedBold r:id="rIdMissing" w:fontKey="{K2}"/>
                </w:font>"#,
         );
-        let mut rels = HashMap::new();
-        rels.insert("rId1".to_string(), "fonts/font1.odttf".to_string());
+        let mut rels = BTreeMap::new();
+        rels.insert("rId1".to_string(), internal_rel("fonts/font1.odttf"));
         // rIdMissing deliberately absent.
 
-        let fonts = parse_embedded_fonts(&xml, &rels, "word/");
+        let fonts = parse_embedded_fonts(&xml, &rels, "word/fontTable.xml");
         assert_eq!(fonts.len(), 1, "only the resolvable slot survives");
         assert_eq!(fonts[0].style, "regular");
     }
@@ -28572,10 +29450,10 @@ mod embedded_font_tests {
                  <w:embedRegular r:id="rId1"/>
                </w:font>"#,
         );
-        let mut rels = HashMap::new();
-        rels.insert("rId1".to_string(), "fonts/font1.odttf".to_string());
+        let mut rels = BTreeMap::new();
+        rels.insert("rId1".to_string(), internal_rel("fonts/font1.odttf"));
 
-        let fonts = parse_embedded_fonts(&xml, &rels, "word/");
+        let fonts = parse_embedded_fonts(&xml, &rels, "word/fontTable.xml");
         assert!(fonts.is_empty(), "no fontKey ⇒ slot dropped");
     }
 
@@ -28584,7 +29462,7 @@ mod embedded_font_tests {
     #[test]
     fn font_without_embeds_yields_nothing() {
         let xml = font_table(r#"<w:font w:name="Calibri"><w:family w:val="swiss"/></w:font>"#);
-        let fonts = parse_embedded_fonts(&xml, &HashMap::new(), "word/");
+        let fonts = parse_embedded_fonts(&xml, &BTreeMap::new(), "word/fontTable.xml");
         assert!(fonts.is_empty(), "no <w:embed*> ⇒ no embedded fonts");
     }
 
@@ -28597,10 +29475,10 @@ mod embedded_font_tests {
                  <w:embedRegular r:id="rId1" w:fontKey="{K1}"/>
                </w:font>"#,
         );
-        let mut rels = HashMap::new();
-        rels.insert("rId1".to_string(), "/word/fonts/font1.odttf".to_string());
+        let mut rels = BTreeMap::new();
+        rels.insert("rId1".to_string(), internal_rel("/word/fonts/font1.odttf"));
 
-        let fonts = parse_embedded_fonts(&xml, &rels, "word/");
+        let fonts = parse_embedded_fonts(&xml, &rels, "word/fontTable.xml");
         assert_eq!(fonts.len(), 1);
         assert_eq!(fonts[0].part_path, "word/fonts/font1.odttf");
     }
@@ -28616,6 +29494,7 @@ mod embedded_font_tests {
         let mut buf = Vec::new();
         {
             let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            crate::parser::write_test_content_types(&mut zw);
             let opts = SimpleFileOptions::default();
             use std::io::Write;
             zw.start_file("word/document.xml", opts).unwrap();
@@ -28677,76 +29556,6 @@ mod embedded_font_tests {
         );
         assert!(doc.body.is_empty());
     }
-
-    /// An entirely missing `word/document.xml` part degrades rather than aborting.
-    #[test]
-    fn rb7_missing_document_part_degrades() {
-        use zip::write::SimpleFileOptions;
-        // A zip with NO word/document.xml at all.
-        let mut buf = Vec::new();
-        {
-            let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
-            let opts = SimpleFileOptions::default();
-            use std::io::Write;
-            zw.start_file("word/_rels/document.xml.rels", opts).unwrap();
-            zw.write_all(b"<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"></Relationships>").unwrap();
-            zw.finish().unwrap();
-        }
-        let doc = parse_from_bytes(&buf).expect("missing document.xml must open as a placeholder");
-        let err = doc.parse_error.as_deref().expect("carries a parse_error");
-        assert!(
-            err.starts_with("word/document.xml:"),
-            "error names the missing part; got {err:?}"
-        );
-    }
-
-    /// RB7 MAJOR: a truncated / corrupt ZIP CONTAINER — the most common way a docx
-    /// is broken — degrades to a placeholder tagged with the container, rather than
-    /// throwing an opaque `ZipArchive::new` error before any part is read.
-    #[test]
-    fn rb7_corrupt_zip_container_degrades_to_placeholder() {
-        // Truncated container: a valid docx cut off partway is not a readable zip.
-        let full = build_docx_with_raw_document(
-            br#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>hi</w:t></w:r></w:p></w:body></w:document>"#,
-        );
-        let truncated = &full[..full.len() / 2];
-        let doc = parse_from_bytes(truncated)
-            .expect("a corrupt container must open as a placeholder, not error out");
-        let err = doc
-            .parse_error
-            .as_deref()
-            .expect("degraded container doc carries a parse_error");
-        assert!(
-            err.starts_with("(zip container): "),
-            "error is tagged with the container exactly once; got {err:?}"
-        );
-        assert_eq!(
-            err.matches("zip container").count(),
-            1,
-            "the container tag must not be doubled; got {err:?}"
-        );
-        assert!(
-            doc.body.is_empty(),
-            "placeholder document has an empty body"
-        );
-
-        // Not-a-zip-at-all also degrades (no local file header).
-        let garbage = parse_from_bytes(b"this is definitely not a zip file")
-            .expect("non-zip bytes must open as a placeholder");
-        let garbage_err = garbage
-            .parse_error
-            .as_deref()
-            .expect("non-zip degrades with a container-tagged error");
-        assert!(
-            garbage_err.starts_with("(zip container): "),
-            "error is tagged with the container exactly once; got {garbage_err:?}"
-        );
-        assert_eq!(
-            garbage_err.matches("zip container").count(),
-            1,
-            "the container tag must not be doubled; got {garbage_err:?}"
-        );
-    }
 }
 
 #[cfg(test)]
@@ -28766,6 +29575,7 @@ mod streamed_body_equivalence_tests {
         let mut bytes = Vec::new();
         {
             let mut archive = zip::ZipWriter::new(Cursor::new(&mut bytes));
+            crate::parser::write_test_content_types(&mut archive);
             let options = SimpleFileOptions::default();
             for (path, content) in [
                 ("word/document.xml", document_xml),
@@ -28814,6 +29624,45 @@ mod streamed_body_equivalence_tests {
     }
 
     #[test]
+    fn title_page_honors_boolean_values_in_final_and_streamed_sections() {
+        // ECMA-376 17.10.6 / 17.17.4: absence is false; an empty
+        // titlePg is true, but explicit false is NOT element presence.
+        for w in [wordprocessingml::TRANSITIONAL, wordprocessingml::STRICT] {
+            for (toggle, expected) in [
+                ("", false),
+                ("<w:titlePg/>", true),
+                ("<w:titlePg w:val=\"1\"/>", true),
+                ("<w:titlePg w:val=\"true\"/>", true),
+                ("<w:titlePg w:val=\"on\"/>", true),
+                ("<w:titlePg w:val=\"0\"/>", false),
+                ("<w:titlePg w:val=\"false\"/>", false),
+                ("<w:titlePg w:val=\"off\"/>", false),
+            ] {
+                let xml = format!(
+                    r#"<w:document xmlns:w="{w}"><w:body>
+                  <w:p><w:pPr><w:sectPr>{toggle}</w:sectPr></w:pPr><w:r><w:t>A</w:t></w:r></w:p>
+                  <w:p><w:r><w:t>B</w:t></w:r></w:p><w:sectPr>{toggle}</w:sectPr>
+                </w:body></w:document>"#
+                );
+                let data = build_docx(&xml);
+                for parser in [parse, parse_streamed] {
+                    let document = parse_with(&data, parser);
+                    assert_eq!(document.section.title_page, expected, "{toggle}");
+                    let flags: Vec<_> = document
+                        .body
+                        .iter()
+                        .filter_map(|element| match element {
+                            BodyElement::SectionBreak { title_page, .. } => Some(*title_page),
+                            _ => None,
+                        })
+                        .collect();
+                    assert_eq!(flags, [expected], "{toggle}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn streamed_required_document_part_fails_deterministically() {
         let data = build_docx(
             r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p>"#,
@@ -28842,6 +29691,7 @@ mod tracked_change_move_tests {
         let mut bytes = Vec::new();
         {
             let mut archive = zip::ZipWriter::new(Cursor::new(&mut bytes));
+            crate::parser::write_test_content_types(&mut archive);
             let options = SimpleFileOptions::default();
             archive.start_file("word/document.xml", options).unwrap();
             archive.write_all(document_xml.as_bytes()).unwrap();
@@ -29172,6 +30022,7 @@ mod comment_anchor_tests {
         let mut bytes = Vec::new();
         {
             let mut archive = zip::ZipWriter::new(Cursor::new(&mut bytes));
+            crate::parser::write_test_content_types(&mut archive);
             let options = SimpleFileOptions::default();
             for (path, content) in parts {
                 archive.start_file(*path, options).unwrap();
@@ -29684,6 +30535,7 @@ mod lvl_pstyle_backlink_tests {
         let mut buf = Vec::new();
         {
             let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            crate::parser::write_test_content_types(&mut zw);
             let opts = SimpleFileOptions::default();
             zw.start_file("word/document.xml", opts).unwrap();
             zw.write_all(document.as_bytes()).unwrap();
@@ -29846,6 +30698,7 @@ mod lvl_override_full_lvl_tests {
         let mut buf = Vec::new();
         {
             let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            crate::parser::write_test_content_types(&mut zw);
             let opts = SimpleFileOptions::default();
             zw.start_file("word/document.xml", opts).unwrap();
             zw.write_all(document.as_bytes()).unwrap();

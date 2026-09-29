@@ -14,18 +14,17 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
  * Vite **library mode** force-inlines every `?url` asset as a
  * `data:<mime>;base64,…` string regardless of `assetsInlineLimit` (a number or a
  * `() => false` function does NOT override it — `build.lib` unconditionally
- * returns `true` from Vite's internal `shouldInline`). Two heavy asset kinds ride
- * on this path:
+ * returns `true` from Vite's internal `shouldInline`). Heavy asset kinds on
+ * this path include:
  *   - the three parser WASM modules (`*_parser_bg.wasm?url`, ~0.6–0.7 MB each) —
  *     base64 inflates them +33 % and blocks `WebAssembly.compileStreaming`
  *     (a data URL cannot be fetch-streamed; the worker must `atob` by hand);
  *   - the MathJax + STIX Two Math engine (`assets/mathjax-stix2.js?url`, ~3 MB) —
  *     inlined it turned the opt-in `math.mjs` chunk into a 4.1 MB base64 blob,
  *     even though consumers only import it when a document actually has equations.
- *
- * All of these are `?url` imports in a single owner module each (the format
- * main-thread handles — `document.ts` / `presentation.ts` / `workbook.ts` — and
- * `math/engine.ts`). We intercept the `?url` variant here, `emitFile` the bytes
+ * The parser and math assets use plain `?url` imports in their owner modules
+ * (the format main-thread handles and `math/engine.ts`). We intercept those
+ * imports here, `emitFile` the bytes
  * as an asset next to the chunk, and hand back the standard ESM asset reference
  * `new URL('<name>', import.meta.url)` — the form Vite / webpack 5 / Rollup /
  * Turbopack rewrite when they re-bundle our `.mjs`, and which resolves
@@ -71,10 +70,59 @@ export function wasmAssetUrl(): Plugin {
       // Turbopack / Vite statically rewrite when re-bundling our `.mjs`.
       return `export default import.meta.ROLLUP_FILE_URL_${referenceId};`;
     },
+    renderChunk(code, _chunk, output) {
+      if (output.format !== 'cjs') return null;
+      // Oxc lowers `import.meta` to `{}` before Rolldown resolves emitted
+      // asset URLs for CJS. Restore the Node entry's own file URL for static
+      // sidecars; otherwise importing the CJS package throws immediately.
+      const restored = code.replace(
+        /new URL\((["'`])([^"'`]+\.(?:wasm|ttf|mjs))\1,\s*\{\}\.url\)\.href/g,
+        (_match, _quote, file) =>
+          `new URL(${JSON.stringify(file)}, require('node:url').pathToFileURL(__filename)).href`,
+      );
+      return restored === code ? null : { code: restored, map: null };
+    },
+  };
+}
+
+/** Resolve the emitted chunk graph, including aliases, before publishing. */
+export function legacyBundleBoundary(): Plugin {
+  return {
+    name: 'legacy-bundle-boundary',
+    generateBundle(_options, bundle) {
+      // Optional legacy-* entries are allowed to contain the reader. Follow
+      // static and dynamic edges from ordinary entries and workers; a relay
+      // outside the guarded source roots cannot hide the reader in a chunk.
+      const entries = Object.values(bundle).filter((output) =>
+        output.type === 'chunk' && output.isEntry
+        && !output.fileName.startsWith('.types-work/')
+        && !/(?:^|[\\/])legacy-(?:doc|xls|ppt)\./.test(output.fileName));
+      const visited = new Set<string>();
+      const pending = [...entries];
+      while (pending.length > 0) {
+        const output = pending.pop()!;
+        if (output.type !== 'chunk') continue;
+        if (visited.has(output.fileName)) continue;
+        visited.add(output.fileName);
+        for (const moduleId of Object.keys(output.modules)) {
+          if (/(?:^|[\\/])packages[\\/]legacy-converter(?:[\\/]|$)/.test(moduleId)
+            || moduleId.includes('@silurus/ooxml-legacy-converter')) {
+            this.error(`${output.fileName} contains forbidden legacy module ${moduleId}`);
+          }
+        }
+        for (const imported of [...output.imports, ...(output.dynamicImports ?? [])]) {
+          const child = bundle[imported];
+          if (child?.type === 'chunk') pending.push(child);
+        }
+      }
+    },
   };
 }
 
 export default defineConfig(({ command, mode }) => ({
+  // The private comparison build removes selected-source dispatch and code
+  // reachable only through it. Published and dev builds always use true.
+  define: { __OOXML_MODEL_SOURCES__: mode === 'model-sources-off' ? 'false' : 'true' },
   // Published library assets must resolve from the imported module URL, not
   // from the hosting page's origin root. This is especially important for the
   // standalone module workers and sibling assets when consumers serve the
@@ -83,10 +131,11 @@ export default defineConfig(({ command, mode }) => ({
   plugins: [
     wasmAssetUrl(),
     wasm(),
+    legacyBundleBoundary(),
     // Storybook loads the root Vite config in serve mode. The declaration
     // plugins are build-only: their Rolldown buildStart hooks expect library
     // inputs and fail against Storybook's dev-server graph.
-    ...(command === 'build' && mode !== 'runtime'
+    ...(command === 'build' && mode !== 'runtime' && mode !== 'model-sources-off'
       ? dts({
           // TypeScript 7 is the repository's sole compiler. Its native tsgo
           // declaration generator avoids the removed JavaScript Compiler API.
@@ -102,6 +151,8 @@ export default defineConfig(({ command, mode }) => ({
   },
   build: {
     lib: {
+      // Keep both comparison builds on the same entry set: changing the set
+      // would also change shared-chunk factoring and distort the byte delta.
       entry: {
         index: resolve(__dirname, 'src/index.ts'),
         pptx:  resolve(__dirname, 'src/pptx.ts'),
@@ -152,7 +203,7 @@ export default defineConfig(({ command, mode }) => ({
     // Built-in worker renderers lazy-import the same optional math engine. Keep
     // its ~3 MB `?url` asset external in nested worker builds too; otherwise
     // library mode base64-inlines one copy into every format worker chunk.
-    plugins: () => [wasmAssetUrl(), wasm()],
+    plugins: () => [wasmAssetUrl(), wasm(), legacyBundleBoundary()],
     rollupOptions: {
       output: {
         assetFileNames: '[name][extname]',

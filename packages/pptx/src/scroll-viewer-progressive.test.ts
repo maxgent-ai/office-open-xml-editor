@@ -144,8 +144,6 @@ describe('PptxScrollViewer progressive layout', () => {
       { comments: { side: 'left' }, overscan: 0 },
     ) as PptxScrollViewer;
     const state = viewer as unknown as {
-      _hasComments: boolean;
-      _reviewOriginPx: number;
       _slots: Map<number, { wrapper: FakeEl }>;
     };
     const scrollHost = container.children[0]!.children[0]!;
@@ -161,21 +159,21 @@ describe('PptxScrollViewer progressive layout', () => {
     });
     const openingLeft = state._slots.get(0)!.wrapper.style.left;
     const authoredLeft = Number(openingLeft.match(/calc\(([-\d.]+)px/)?.[1]);
-    const openingScreenX = authoredLeft + state._reviewOriginPx - scrollHost.scrollLeft;
+    const reviewOrigin = () => parseFloat(scrollHost.style['--ooxml-review-origin-x'] ?? '0') || 0;
+    const openingScreenX = authoredLeft + reviewOrigin() - scrollHost.scrollLeft;
 
     engine.setLayoutProgress(3, true);
-    await vi.waitFor(() => expect(state._hasComments).toBe(true));
+    await vi.waitFor(() => expect(reviewOrigin()).toBeGreaterThan(0));
     expect(state._slots.get(0)!.wrapper.style.left).toBe(openingLeft);
-    expect(state._reviewOriginPx).toBeGreaterThan(0);
-    expect(scrollHost.scrollLeft).toBe(state._reviewOriginPx);
-    expect(authoredLeft + state._reviewOriginPx - scrollHost.scrollLeft).toBe(openingScreenX);
+    expect(scrollHost.scrollLeft).toBe(reviewOrigin());
+    expect(authoredLeft + reviewOrigin() - scrollHost.scrollLeft).toBe(openingScreenX);
 
     scrollHost.scrollTop = 10_000;
     scrollHost.dispatch('scroll');
     expect(state._slots.get(2)!.wrapper.style.left).toBe(openingLeft);
     viewer.relayout();
     expect(state._slots.get(2)!.wrapper.style.left).toBe(openingLeft);
-    expect(authoredLeft + state._reviewOriginPx - scrollHost.scrollLeft).toBe(openingScreenX);
+    expect(authoredLeft + reviewOrigin() - scrollHost.scrollLeft).toBe(openingScreenX);
     viewer.destroy();
   });
 

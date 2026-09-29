@@ -86,6 +86,10 @@ async function openPptxPresentationImpl(
   buffer: ArrayBuffer | Uint8Array,
   options: OpenPptxPresentationOptions = {},
 ): Promise<PptxPresentationSessionImpl> {
+  if (__OOXML_MODEL_SOURCES__ && options.modelSources !== undefined) {
+    const { openPptxSource } = await import('./pptx-model-source.ts');
+    return openPptxSource(buffer, options, getPptxWasmModule);
+  }
   const cjkFallback = resolveCjkFallback(options.cjkFallback);
   const acquired = await acquirePptxNodeSession(toUint8(buffer), getPptxWasmModule(), options);
   return new PptxPresentationSessionImpl(
@@ -98,7 +102,7 @@ async function openPptxPresentationImpl(
   );
 }
 
-class PptxPresentationSessionImpl implements PptxPresentationSession {
+export class PptxPresentationSessionImpl implements PptxPresentationSession {
   readonly slideCount: number;
   readonly slideWidth: number;
   readonly slideHeight: number;
@@ -351,3 +355,4 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
   error.name = 'AbortError';
   throw error;
 }
+declare const __OOXML_MODEL_SOURCES__: boolean;

@@ -61,8 +61,10 @@ interface Priv {
     dispatch(type: string, event?: unknown): void;
   };
   buildHyperlinkMap(ws: Worksheet): void;
-  dispatchHyperlink(cell: CellAddress): boolean;
-  navigateInternalHyperlink(location: string): Promise<void>;
+  hyperlinks: {
+    dispatch(cell: CellAddress): boolean;
+    navigateInternal(location: string): Promise<void>;
+  };
 }
 
 /** Mount a viewer, inject the fixture worksheet, and build its hyperlink map so
@@ -181,7 +183,7 @@ describe('XlsxViewer IX1 default hyperlink handler (no callback)', () => {
     (v as unknown as { goToSheet: unknown }).goToSheet = goSpy;
     (v as unknown as { scrollToCell: unknown }).scrollToCell = scrollSpy;
 
-    await priv.navigateInternalHyperlink('Sheet2!A1');
+    await priv.hyperlinks.navigateInternal('Sheet2!A1');
     expect(goSpy).toHaveBeenCalledWith(1);
     expect(scrollSpy).toHaveBeenCalledWith('A1');
   });
@@ -195,7 +197,7 @@ describe('XlsxViewer IX1 default hyperlink handler (no callback)', () => {
     });
     (v as unknown as { goToSheet: unknown }).goToSheet = goSpy;
 
-    await priv.navigateInternalHyperlink('Ghost!A1');
+    await priv.hyperlinks.navigateInternal('Ghost!A1');
     expect(goSpy).not.toHaveBeenCalled();
   });
 
@@ -213,7 +215,7 @@ describe('XlsxViewer IX1 default hyperlink handler (no callback)', () => {
     (v as unknown as { goToSheet: unknown }).goToSheet = goSpy;
     (v as unknown as { scrollToCell: unknown }).scrollToCell = scrollSpy;
 
-    await priv.navigateInternalHyperlink('MyName');
+    await priv.hyperlinks.navigateInternal('MyName');
     expect(goSpy).toHaveBeenCalledWith(1);
     expect(scrollSpy).toHaveBeenCalledWith('$B$7');
   });

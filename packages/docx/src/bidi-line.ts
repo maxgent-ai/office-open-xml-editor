@@ -1,199 +1,25 @@
-// Per-line bidi ordering for the docx renderer.
-//
-// `buildSegments` splits each run's text into space-delimited word pieces, so
-// WITHIN a run Arabic joining never crosses a segment boundary (a mid-word
-// run split — e.g. one letter bolded — still seams at the run boundary; that
-// pre-existing limitation is tracked for Phase 4). That lets us reorder at SEGMENT
-// granularity (1:1 with the laid-out segments — every per-segment property is
-// preserved) using the shared UAX#9 engine, and let Canvas shape/mirror each
-// segment internally when it is drawn with `ctx.direction` set to the segment's
-// resolved direction. Inline objects (image / math / tab) participate as a
-// single neutral object-replacement character.
-
+// WordprocessingML segment ordering uses the shared UAX#9 kernel with
+// Word's HL1 run overrides and content-level Canvas direction.
 import {
-  getDefaultBidiEngine,
-  hasStrongRtl,
-  OBJECT_PLACEHOLDER,
-  buildVisualOrder,
-  type BidiClass,
-} from '@silurus/ooxml-core';
+  computeSegmentLineVisualOrder, segmentLineHasRtl,
+  type SegmentLineVisualOrder,
+} from '@silurus/ooxml-core/internal/bidi-line';
 import { wordRtlAmbiguousCharacter } from './layout/script-compatibility.js';
 
-/** A laid-out segment as seen here: only its optional text matters for bidi.
- *  Typed as `unknown` element so the renderer's LayoutSeg union (whose image /
- *  math / tab members carry no `text`) assigns cleanly. */
-const segText = (s: unknown): string | undefined => {
-  const t = (s as { text?: unknown }).text;
-  return typeof t === 'string' ? t : undefined;
+const options = {
+  isTab: (segment: unknown) => 'isTab' in (segment as object),
+  isRtlMarked: (segment: unknown) => (segment as { rtl?: unknown }).rtl === true,
+  digitsAsAN: (segment: unknown) => (segment as { digitsAsAN?: unknown }).digitsAsAN === true,
+  isRtlAmbiguous: wordRtlAmbiguousCharacter,
+  directionFromAnyOdd: true,
 };
+export type LineVisualOrder = SegmentLineVisualOrder;
+export const segmentsHaveRtl = (segments: readonly unknown[]): boolean =>
+  segmentLineHasRtl(segments, options);
+export const computeLineVisualOrder = (
+  segments: readonly unknown[], baseRtl: boolean,
+): LineVisualOrder => computeSegmentLineVisualOrder(segments, baseRtl, options);
 
-/** Does this segment carry a run-level `<w:rtl>` (ECMA-376 §17.3.2.30)? */
-const segRtl = (s: unknown): boolean => (s as { rtl?: unknown }).rtl === true;
-
-/** Should this segment's European digits be classified AN (Word's Arabic
- *  complex-script digit ordering)? Set by the renderer from `w:lang w:bidi`
- *  (§17.3.2.20). See {@link computeLineVisualOrder}. */
-const segDigitsAsAN = (s: unknown): boolean =>
-  (s as { digitsAsAN?: unknown }).digitsAsAN === true;
-
-/** Is this a laid-out TAB segment (ECMA-376 §17.3.1.37)? A tab character is
- *  Unicode Bidi_Class S (Segment Separator), NOT a neutral object — see
- *  {@link computeLineVisualOrder}. */
-const segIsTab = (s: unknown): boolean => 'isTab' in (s as object);
-
-/**
- * Cheap gate: does this run of segments need the bidi pass? True when any
- * segment contains a strong-RTL character OR carries a run-level `<w:rtl>`
- * mark (§17.3.2.30 — e.g. a digits-only run that must resolve RTL).
- */
-export function segmentsHaveRtl(segments: readonly unknown[]): boolean {
-  for (const s of segments) {
-    if (segRtl(s)) return true;
-    const t = segText(s);
-    if (t !== undefined && hasStrongRtl(t)) return true;
-  }
-  return false;
-}
-
-export interface LineVisualOrder {
-  /** Logical segment indices in visual (left-to-right) order. */
-  order: number[];
-  /** Per-LOGICAL-index resolved direction (true = RTL) for `ctx.direction`. */
-  rtl: boolean[];
-}
-
-/**
- * Compute the visual draw order of a line's segments under `baseRtl`. Text
- * segments contribute their text; non-text segments contribute one neutral
- * placeholder so they take the surrounding direction. Each segment is assigned
- * the embedding level of its first code unit (segments are single-script in
- * practice because they are space-split); Canvas resolves any residual
- * intra-segment bidi when the slice is drawn with the matching `ctx.direction`.
- *
- * A run-level `<w:rtl>` (§17.3.2.30) gives punctuation and symbols
- * right-to-left characteristics. Under
- * `word-rtl-run-ambiguous-class-override`, this is modelled as a UAX #9 §4.3
- * HL1 Bidi_Class override (punctuation/symbols → R), not as an RLE…PDF
- * embedding; whitespace and strong letters retain their ordinary classes, and
- * digits use the separate language-gated `digitsAsAN` override:
- * an embedding raises the run's level above the paragraph base, which strands
- * sibling base-level content on the wrong side (e.g. a trailing "." run after
- * "2022" in an RTL paragraph was over-embedded to level 3 and reordered to
- * "2022." instead of the recorded ".2022"). With the class override the run's
- * neutrals resolve RTL at the base level: a literal "1. " prefix mirrors to
- * ".1", while strong-Latin content keeps its even (LTR)
- * level so English words in an rtl-marked run keep their LTR word order.
- */
-export function computeLineVisualOrder(
-  segments: readonly unknown[],
-  baseRtl: boolean,
-): LineVisualOrder {
-  const n = segments.length;
-  if (n === 0) return { order: [], rtl: [] };
-
-  // Concatenate every segment into one logical string for the bidi algorithm.
-  let full = '';
-  const segStart: number[] = new Array(n);
-  const segEnd: number[] = new Array(n);
-  // UAX#9 §4.3 HL1 per-code-unit Bidi_Class override (see engine.computeLevels).
-  //  - `digitsAsAN` segments: European digits → AN, so a logical "28-02-2026"
-  //    reorders to Word's "2026-02-28" under an RTL base (§17.3.2.20).
-  //  - rtl-marked segments (§17.3.2.30): punctuation/symbols → R, so the run's
-  //    ambiguous characters resolve RTL at the base level (see doc above).
-  //  - TAB segments (§17.3.1.37): the placeholder is forced to S (Segment
-  //    Separator) — a tab character's real Bidi_Class. Rules L1/L2 then reset it
-  //    to the paragraph level and reorder each tab-delimited CELL independently,
-  //    so an RTL paragraph's tab-aligned cells appear in mirrored (leading-cell-
-  //    at-the-right) order. `word-rtl-run-ambiguous-class-override` records this
-  //    compatibility mapping. Modelled as a class override rather
-  //    than by emitting a literal "\t" so the segment↔code-unit mapping stays
-  //    1:1 (every non-text inline object is one code unit).
-  // `undefined` until any segment opts in, so the pure algorithm runs for
-  // ordinary lines.
-  let classOverride: (BidiClass | null)[] | undefined;
-  const ensureOverride = (): (BidiClass | null)[] => {
-    if (!classOverride) classOverride = [];
-    while (classOverride.length < full.length) classOverride.push(null);
-    return classOverride;
-  };
-  for (let i = 0; i < n; i++) {
-    const t = segText(segments[i]) ?? '';
-    segStart[i] = full.length;
-    full += t.length > 0 ? t : OBJECT_PLACEHOLDER;
-    segEnd[i] = full.length;
-
-    if (segIsTab(segments[i])) {
-      // Single placeholder code unit at segStart[i]; classify it S.
-      ensureOverride()[segStart[i]] = 'S';
-    } else if (t.length > 0 && (segDigitsAsAN(segments[i]) || segRtl(segments[i]))) {
-      const ov = ensureOverride();
-      const digitsAN = segDigitsAsAN(segments[i]);
-      const rtlMarked = segRtl(segments[i]);
-      for (let k = segStart[i]; k < segEnd[i]; k++) {
-        const c = full.charCodeAt(k);
-        if (digitsAN && c >= 0x30 && c <= 0x39) {
-          ov[k] = 'AN';
-        } else if (rtlMarked && wordRtlAmbiguousCharacter(full[k])) {
-          ov[k] = 'R';
-        }
-      }
-    }
-  }
-  if (classOverride) while (classOverride.length < full.length) classOverride.push(null);
-
-  const engine = getDefaultBidiEngine();
-  const { levels, paragraphLevel } = engine.computeLevels(
-    full,
-    baseRtl ? 'rtl' : 'ltr',
-    classOverride,
-  );
-
-  // Direction hint = "does the segment contain ANY odd-level unit". A
-  // digits-with-punctuation slice like "1. " has its "." resolve to the odd
-  // level, so the slice draws with ctx.direction rtl and Canvas mirrors it to
-  // ".1" under the registered override — whereas a pure-Latin slice is all-even and
-  // keeps its LTR rendering. This is docx-specific (pptx/xlsx use plain
-  // first-unit level parity), so it stays here rather than in buildVisualOrder.
-  const rtl: boolean[] = new Array(n);
-  const visualAnchor: number[] = new Array(n);
-  for (let i = 0; i < n; i++) {
-    // Scan excludes the segment's TRAILING whitespace: an inter-word space's
-    // level is seam context (N2 gives it the embedding level between
-    // opposite-direction neighbours), not segment content — only the content
-    // decides whether the slice must mirror.
-    let scanEnd = segEnd[i];
-    while (scanEnd > segStart[i] && full[scanEnd - 1] === ' ') scanEnd--;
-    let anyOdd = false;
-    for (let k = segStart[i]; k < scanEnd; k++) {
-      const l = levels[k];
-      if (l !== 255 && (l & 1) === 1) {
-        anyOdd = true;
-        break;
-      }
-    }
-    rtl[i] = anyOdd;
-    // L2 must order the slice with the same parity Canvas will use to paint it.
-    // A leading neutral can resolve to the paragraph level even when the rest
-    // of its whitespace-delimited slice is strong RTL (`:word` under an LTR
-    // paragraph base). Using segStart would strand that whole RTL slice on the
-    // LTR edge. Pick the first retained unit with the paint parity instead.
-    visualAnchor[i] = segStart[i];
-    for (let k = segStart[i]; k < scanEnd; k++) {
-      const level = levels[k];
-      if (level !== 255 && ((level & 1) === 1) === anyOdd) {
-        visualAnchor[i] = k;
-        break;
-      }
-    }
-  }
-
-  // UAX#9 L2 permutes the segment representatives. This does not force a new
-  // embedding level: Latin content still selects an even anchor, while RTL
-  // content and registered rtl-run punctuation select an odd anchor.
-  const { order } = buildVisualOrder(levels, paragraphLevel, visualAnchor);
-
-  return { order, rtl };
-}
 /** Physical edge a line aligns to, resolving logical start/end against base direction. */
 export type AlignEdge = 'left' | 'right' | 'center' | 'justify';
 

@@ -1,7 +1,8 @@
-import { DocxDocument } from './document';
-import type { LoadOptions } from './document';
+import { DocxDocument, docxViewerLoadSignal } from './document';
+import type { DocxViewerLoadControl, LoadOptions } from './document';
 import {
   activeDocxLayoutViewOf,
+  reconcilePendingDocxLayoutView,
   selectDocxLayoutView,
   subscribeDocxLayoutView,
   type DocxLayoutViewPublication,
@@ -113,6 +114,9 @@ export interface DocxViewerOptions extends Omit<RenderPageOptions, 'onTextRun'>,
 }
 
 export class DocxViewer implements ZoomableViewer {
+  private _pendingLoadAbort: AbortController | null = null;
+  private _pendingRequestedView: boolean | undefined;
+  private _pendingViewChanged: (() => void) | null = null;
   private readonly _documentOwner: TerminalResourceOwner<DocxDocument>;
   private get _doc(): DocxDocument | null { return this._documentOwner.current; }
   private readonly _borrowed: boolean;
@@ -147,6 +151,8 @@ export class DocxViewer implements ZoomableViewer {
    *  1×1 offscreen canvas, so measuring never touches the visible canvas). */
   private _measureCtx: CanvasRenderingContext2D | null = null;
   private _opts: DocxViewerOptions;
+  /** A pre-load setter call is a choice even when it repeats the final-view default. */
+  private _showTrackedChangesExplicit = false;
   private readonly _mode: 'main' | 'worker';
   private readonly _renderDispatcher: StaticCanvasRenderDispatcher;
   private readonly _errorRouter: CanvasViewerErrorRouter;
@@ -192,6 +198,7 @@ export class DocxViewer implements ZoomableViewer {
   constructor(canvas: HTMLCanvasElement, opts: DocxViewerOptions = {}) {
     this._canvas = canvas;
     this._opts = opts;
+    this._showTrackedChangesExplicit = opts.showTrackedChanges !== undefined;
     const borrowedDocument = (opts as InternalDocxViewerOptions)[borrowedDocumentOption];
     this._borrowed = borrowedDocument !== undefined;
     this._mode = resolveCanvasViewerMode('DocxViewer', opts.mode, borrowedDocument);
@@ -282,35 +289,70 @@ export class DocxViewer implements ZoomableViewer {
     // than dropping to an empty viewer. The 2× memory window is bounded to the
     // load itself (the old engine is freed the moment the new model arrives).
     let elementInvalidated = false;
+    const inheritedRequestedView = this._pendingRequestedView;
+    this._pendingLoadAbort?.abort();
+    const loadAbort = new AbortController();
+    this._pendingLoadAbort = loadAbort;
+    this._pendingRequestedView = inheritedRequestedView;
     try {
-      const doc = await this._documentOwner.replace(() => DocxDocument.load(source, {
-        password: this._opts.password,
-        useGoogleFonts: this._opts.useGoogleFonts,
-        cjkFallback: this._opts.cjkFallback,
-        maxZipEntryBytes: this._opts.maxZipEntryBytes,
-        resourceLimits: this._opts.resourceLimits,
-        debug: this._opts.debug,
-        onResourceMetrics: this._opts.onResourceMetrics,
-        workerTimeoutMs: this._opts.workerTimeoutMs,
-        wasmUrl: this._opts.wasmUrl,
-        math: this._opts.math,
-        threeD: this._opts.threeD,
-        regionMap: this._opts.regionMap,
-        chartEx: this._opts.chartEx,
-        tiff: this._opts.tiff,
-        mode: this._mode,
-        ...(this._opts.progressiveLayout ? { progressiveLayout: true } : {}),
-        ...(this._opts.sliceLayout ? { sliceLayout: true } : {}),
-        onLayoutProgress: this._opts.onLayoutProgress,
-        onLayoutPartial: this._opts.onLayoutPartial,
-        onLayoutComplete: this._opts.onLayoutComplete,
-        // The variant this viewer renders, so load builds that one rather than
-        // paying for a second full pagination on the first render.
-        ...(this._opts.showTrackedChanges === true ? { showTrackedChanges: true } : {}),
-        ...(this._opts.currentDate === undefined
-          ? {}
-          : { currentDate: this._opts.currentDate }),
-      }), () => {
+      const doc = await this._documentOwner.replace(async () => {
+        const loaded = await DocxDocument.load(source, {
+          password: this._opts.password,
+          useGoogleFonts: this._opts.useGoogleFonts,
+          cjkFallback: this._opts.cjkFallback,
+          maxZipEntryBytes: this._opts.maxZipEntryBytes,
+          resourceLimits: this._opts.resourceLimits,
+          debug: this._opts.debug,
+          onResourceMetrics: this._opts.onResourceMetrics,
+          workerTimeoutMs: this._opts.workerTimeoutMs,
+          wasmUrl: this._opts.wasmUrl,
+          math: this._opts.math,
+          threeD: this._opts.threeD,
+          regionMap: this._opts.regionMap,
+          chartEx: this._opts.chartEx,
+          tiff: this._opts.tiff,
+          mode: this._mode,
+          ...(this._opts.progressiveLayout ? { progressiveLayout: true } : {}),
+          ...(this._opts.sliceLayout === undefined ? {} : { sliceLayout: this._opts.sliceLayout }),
+          [docxViewerLoadSignal]: {
+            signal: loadAbort.signal,
+            requestedView: () => this._pendingRequestedView,
+            subscribeViewChange: (listener: () => void) => {
+              this._pendingViewChanged = listener;
+              return () => {
+                if (this._pendingViewChanged === listener) this._pendingViewChanged = null;
+              };
+            },
+          } satisfies DocxViewerLoadControl,
+          onLayoutProgress: this._opts.onLayoutProgress,
+          onLayoutPartial: this._opts.onLayoutPartial,
+          onLayoutComplete: this._opts.onLayoutComplete,
+          // The variant this viewer renders, so load builds that one rather than
+          // paying for a second full pagination on the first render.
+          // An explicit choice (including `false`) is forwarded; otherwise the
+          // document's own view default applies.
+          ...(inheritedRequestedView !== undefined
+            ? { showTrackedChanges: inheritedRequestedView }
+            : this._opts.modelSources === undefined
+              ? (this._opts.showTrackedChanges === true ? { showTrackedChanges: true } : {})
+              : (!this._showTrackedChangesExplicit
+                ? undefined
+                : { showTrackedChanges: this._opts.showTrackedChanges })),
+          ...(this._opts.modelSources === undefined ? undefined : { modelSources: this._opts.modelSources }),
+          ...(this._opts.currentDate === undefined
+            ? {}
+            : { currentDate: this._opts.currentDate }),
+        } as LoadOptions);
+        // A toggle can arrive after pagination has selected its view, including
+        // during the final resource probe. Compare with the document's actual
+        // view, and keep this awaited reconciliation inside replace() so a
+        // superseded selection cannot surface its worker-termination error.
+        await reconcilePendingDocxLayoutView(
+          loaded, loadAbort.signal, () => this._pendingRequestedView,
+          () => this._opts.currentDate, this,
+        );
+        return loaded;
+      }, () => {
         // Invalidate operations owned by the old document before its worker is
         // terminated, so their expected rejection cannot surface as a reload
         // failure for the winning document.
@@ -323,14 +365,27 @@ export class DocxViewer implements ZoomableViewer {
       });
       if (!doc) return;
       if (this._destroyed) throw new Error('DocxViewer is destroyed');
+      if (this._pendingLoadAbort !== loadAbort) return;
+      if (this._pendingRequestedView !== undefined) {
+        this._showTrackedChangesExplicit = true;
+        this._opts = { ...this._opts, showTrackedChanges: this._pendingRequestedView };
+      }
       this._currentPage = 0;
       this._bindLayoutDocument(doc);
       // A new document invalidates any prior find state (cached runs / matches).
       this._find.invalidate();
       await this._render();
+      if (this._pendingLoadAbort !== loadAbort) return;
     } catch (err) {
       if (this._destroyed) throw new Error('DocxViewer is destroyed');
+      if (this._pendingLoadAbort !== loadAbort) return;
       throw err instanceof Error ? err : new Error(String(err));
+    } finally {
+      if (this._pendingLoadAbort === loadAbort) {
+        this._pendingLoadAbort = null;
+        this._pendingRequestedView = undefined;
+        this._pendingViewChanged = null;
+      }
     }
     if (elementInvalidated && !this._destroyed) this._emitSelectionContextChange();
   }
@@ -708,6 +763,9 @@ export class DocxViewer implements ZoomableViewer {
   destroy(): void {
     if (this._destroyed) return;
     this._destroyed = true;
+    this._pendingLoadAbort?.abort();
+    this._pendingLoadAbort = null;
+    this._pendingViewChanged = null;
     this._findRequestGeneration++;
     this._layoutViewGeneration++;
     this._unbindLayoutDocument();
@@ -954,8 +1012,26 @@ export class DocxViewer implements ZoomableViewer {
    */
   async setShowTrackedChanges(value: boolean): Promise<void> {
     const generation = ++this._layoutViewGeneration;
+    if (this._pendingLoadAbort) {
+      const changed = this._pendingRequestedView !== value;
+      this._pendingRequestedView = value;
+      // Keep an explicit false even when it matches the default, but avoid
+      // notifying the in-flight paginator again for the same request.
+      if (changed) this._pendingViewChanged?.();
+    }
     const doc = this._doc;
-    if ((this._opts.showTrackedChanges === true) === value) {
+    // Compare with the document's active view: it may come from the loaded
+    // document's own view default rather than from this viewer's options.
+    const current = this._opts.modelSources === undefined
+      ? this._opts.showTrackedChanges === true
+      : doc
+        ? activeDocxLayoutViewOf(doc).showTrackedChanges
+        : this._opts.showTrackedChanges === true;
+    if (!doc || current === value) {
+      this._showTrackedChangesExplicit = true;
+      this._opts = { ...this._opts, showTrackedChanges: value };
+    }
+    if (current === value) {
       // Still forward the installed value: it cancels an older in-flight
       // worker switch that has not become this viewer's state yet.
       if (doc) await selectDocxLayoutView(doc, {
@@ -976,6 +1052,7 @@ export class DocxViewer implements ZoomableViewer {
       : true;
     if (!selected) return;
     if (this._destroyed || generation !== this._layoutViewGeneration || doc !== this._doc) return;
+    this._showTrackedChangesExplicit = true;
     this._opts = nextOptions;
     this._find.invalidate();
     this._currentPage = Math.max(0, Math.min(this._currentPage, this.pageCount - 1));

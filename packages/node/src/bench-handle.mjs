@@ -48,9 +48,9 @@ const decoder = new TextDecoder();
 /** Load a wasm-pack `--target web` module and synchronously init it from disk. */
 function loadModule(jsPath, wasmPath) {
   const bytes = readFileSync(wasmPath);
-  const module = new WebAssembly.Module(bytes);
+  const wasmModule = new WebAssembly.Module(bytes);
   return import(jsPath).then((mod) => {
-    mod.initSync({ module });
+    mod.initSync({ module: wasmModule });
     return mod;
   });
 }

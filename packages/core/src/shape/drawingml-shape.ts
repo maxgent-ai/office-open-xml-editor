@@ -8,8 +8,13 @@ import {
   buildPresetGeometryFillPath,
   getConnectorAnchors,
   hasPreset,
+  pathFillModeOverlay,
   renderPresetShape,
 } from './preset-geometry';
+
+// Retained DOCX DrawingML plans use points. The shared pattern bitmap's one
+// point cells therefore need no CSS-pixel conversion in this painter.
+const PATTERN_PT_TO_SHAPE_UNITS = 1;
 
 type DeepReadonly<T> =
   T extends (...args: never[]) => unknown ? T
@@ -28,7 +33,27 @@ export type DrawingMLShapeGeometry =
   | Readonly<{
       kind: 'custom';
       subpaths: readonly (readonly PathCmd[])[];
+      /** ECMA-376 §20.1.9.15 per-path `fill` mode and `stroke` flag,
+       *  parallel to `subpaths`; absent when every path uses the defaults. */
+      paint?: readonly DrawingMLPathPaint[];
     }>;
+
+export type DrawingMLPathPaint = Readonly<{
+  /** ST_PathFillMode (§20.1.10.37) other than `norm`. */
+  fill?: 'none' | 'lighten' | 'lightenLess' | 'darken' | 'darkenLess';
+  /** Present only when the path is not stroked. */
+  stroke?: false;
+}>;
+
+/** The per-path paint of a custom geometry, or null when it has none or
+ *  it does not line up with the subpaths. */
+function customPathPaint(
+  geometry: Extract<DrawingMLShapeGeometry, { kind: 'custom' }>,
+): readonly DrawingMLPathPaint[] | null {
+  return geometry.paint && geometry.paint.length === geometry.subpaths.length
+    ? geometry.paint
+    : null;
+}
 
 export interface DrawingMLShapePaintPlan {
   readonly rect: Readonly<{ x: number; y: number; w: number; h: number }>;
@@ -84,7 +109,13 @@ export function clipDrawingMLShape(
       );
     }
   } else {
-    buildCustomPath(ctx, plan.geometry.subpaths as PathCmd[][], x, y, w, h);
+    // The silhouette is the fill-bearing paths (an unfilled path is only a
+    // line), as for PPTX custom geometry.
+    const paint = customPathPaint(plan.geometry);
+    const subpaths = paint
+      ? plan.geometry.subpaths.filter((_, index) => paint[index].fill !== 'none')
+      : plan.geometry.subpaths;
+    buildCustomPath(ctx, subpaths as PathCmd[][], x, y, w, h);
   }
   // Use Canvas's nonzero rule, matching normal DrawingML shape fill and PPTX
   // picture clipping. `evenodd` would turn overlapping silhouette subpaths into
@@ -129,6 +160,7 @@ function applyDrawingMLStroke(
       rect.w,
       rect.h,
       rotationDeg,
+      PATTERN_PT_TO_SHAPE_UNITS,
     );
     if (paint) ctx.strokeStyle = paint;
   }
@@ -154,6 +186,7 @@ function paintConnectorEnds(
         w,
         h,
         plan.transform.rotationDeg,
+        PATTERN_PT_TO_SHAPE_UNITS,
       ) ?? undefined
     : undefined;
   const adjustments = plan.geometry.kind === 'preset' ? plan.geometry.adjustments : [];
@@ -220,6 +253,7 @@ function paintCustomEnds(
         w,
         h,
         plan.transform.rotationDeg,
+        PATTERN_PT_TO_SHAPE_UNITS,
       ) ?? undefined
     : undefined;
   if (endpoints.start && stroke.headEnd) {
@@ -265,6 +299,7 @@ export function paintDrawingMLShape(
       w,
       h,
       plan.transform.rotationDeg,
+      PATTERN_PT_TO_SHAPE_UNITS,
     );
     const stroke = plan.stroke as Stroke | null;
     const applyAndStroke = stroke
@@ -315,13 +350,35 @@ export function paintDrawingMLShape(
       }
       paintConnectorEnds(ctx, plan, geometry, unitToDevice);
     } else {
-      ctx.beginPath();
-      buildCustomPath(ctx, plan.geometry.subpaths as PathCmd[][], x, y, w, h);
-      if (fillStyle) {
-        ctx.fillStyle = fillStyle;
-        ctx.fill();
+      const paint = customPathPaint(plan.geometry);
+      if (paint) {
+        // ECMA-376 §20.1.9.15: each path is filled and stroked on its own.
+        plan.geometry.subpaths.forEach((subpath, index) => {
+          ctx.beginPath();
+          buildCustomPath(ctx, [subpath as PathCmd[]], x, y, w, h);
+          const mode = paint[index].fill;
+          if (fillStyle && mode !== 'none') {
+            ctx.fillStyle = fillStyle;
+            ctx.fill();
+            const overlay = pathFillModeOverlay(mode);
+            if (overlay) {
+              ctx.save();
+              ctx.fillStyle = overlay;
+              ctx.fill();
+              ctx.restore();
+            }
+          }
+          if (applyAndStroke && paint[index].stroke !== false) applyAndStroke();
+        });
+      } else {
+        ctx.beginPath();
+        buildCustomPath(ctx, plan.geometry.subpaths as PathCmd[][], x, y, w, h);
+        if (fillStyle) {
+          ctx.fillStyle = fillStyle;
+          ctx.fill();
+        }
+        if (applyAndStroke) applyAndStroke();
       }
-      if (applyAndStroke) applyAndStroke();
       paintCustomEnds(ctx, plan, unitToDevice);
     }
   });

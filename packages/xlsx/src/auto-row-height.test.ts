@@ -225,6 +225,25 @@ describe('XLSX automatic row height (ECMA-376 §18.3.1.73 / Office auto-fit)', (
     expect(measured.count()).toBe(0);
   });
 
+  it('gates automatic rows on the Normal font, not the larger default font', () => {
+    // <fonts>[0] (column MDW) is 20pt while the Normal style is 11pt: a 20pt
+    // cell still exceeds the Normal line box and must be measured.
+    const ws = worksheet();
+    ws.defaultFontFamily = 'Calibri';
+    ws.defaultFontSize = 20;
+    ws.normalFontSize = 11;
+    ws.rows = [{
+      index: 1,
+      height: null,
+      cells: [{ row: 1, col: 1, styleIndex: 2, value: { type: 'text', text: 'large' } }],
+    }];
+    ws.rowHeights = {};
+    ws.mergeCells = [];
+
+    expect(applyAutoRowHeights(measurementContext(), ws, styles)).toBe(true);
+    expect(ws.rowHeights[1]).toBeGreaterThan(ws.defaultRowHeight);
+  });
+
   it('uses the tallest rich run for an unwrapped automatic row', () => {
     const ws = worksheet();
     ws.rows = [{
@@ -320,6 +339,28 @@ describe('XLSX automatic row height (ECMA-376 §18.3.1.73 / Office auto-fit)', (
     applyAutoRowHeights(measurementContext(), base, styles);
     applyAutoRowHeights(measurementContext(), withIcon, styles);
     expect(withIcon.rowHeights[1]).toBeGreaterThan(base.rowHeights[1] ?? base.defaultRowHeight);
+  });
+
+  it('measures a wrapped General boolean with the inset paint uses', () => {
+    // General centres booleans (§18.18.40); like paint, measurement keeps the
+    // General indent inset, so an indented TRUE in a narrow wrapping column
+    // fits exactly as the same General text does.
+    const general = (value: Worksheet['rows'][number]['cells'][number]['value']): Worksheet => ({
+      ...worksheet(),
+      rows: [{ index: 1, height: null, cells: [{ row: 1, col: 1, styleIndex: 0, value }] }],
+      colWidths: { 1: 1.5 },
+      rowHeights: {},
+      mergeCells: [],
+    });
+    const generalStyles: Styles = {
+      ...styles,
+      cellXfs: [{ ...xf(0, { wrapText: true, indent: 1 }), alignH: null }],
+    };
+    const bool = general({ type: 'bool', bool: true });
+    const text = general({ type: 'text', text: 'TRUE' });
+    applyAutoRowHeights(measurementContext(), bool, generalStyles);
+    applyAutoRowHeights(measurementContext(), text, generalStyles);
+    expect(bool.rowHeights[1]).toBe(text.rowHeights[1]);
   });
 
   it('preserves the caller-authoritative MDW on a render-local auto-height projection', () => {

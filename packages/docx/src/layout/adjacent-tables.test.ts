@@ -43,12 +43,14 @@ function input(
   };
 }
 
+const collect = (body: readonly AdjacentTableSequenceInput[]) => [...normalizeAdjacentTables(body)];
+
 describe('adjacent table normalization (ECMA-376 Part 1 §17.4.37)', () => {
   it('groups adjacent tables the parser assigned to one logical sequence', () => {
     const first = table(1);
     const second = table(2);
 
-    expect(normalizeAdjacentTables([
+    expect(collect([
       input(first, 'seq:0', 0, 3),
       input(second, 'seq:0', 1, 3),
     ])).toEqual([{
@@ -62,7 +64,7 @@ describe('adjacent table normalization (ECMA-376 Part 1 §17.4.37)', () => {
     const first = table(1);
     const second = table(1);
 
-    expect(normalizeAdjacentTables([
+    expect(collect([
       input(first, 'seq:0'),
       input(second, 'seq:7'),
     ])).toEqual([
@@ -76,7 +78,7 @@ describe('adjacent table normalization (ECMA-376 Part 1 §17.4.37)', () => {
     const between = paragraph();
     const second = table(1);
 
-    expect(normalizeAdjacentTables([
+    expect(collect([
       input(first, 'seq:0'),
       input(between, null),
       input(second, 'seq:9'),
@@ -91,7 +93,7 @@ describe('adjacent table normalization (ECMA-376 Part 1 §17.4.37)', () => {
     const first = table(1);
     const second = table(1);
 
-    expect(normalizeAdjacentTables([
+    expect(collect([
       input(first, null),
       input(second, null),
     ])).toEqual([
@@ -103,7 +105,7 @@ describe('adjacent table normalization (ECMA-376 Part 1 §17.4.37)', () => {
   it('emits a single-member logical sequence as a plain body element', () => {
     const only = table(2);
 
-    expect(normalizeAdjacentTables([input(only, 'seq:0', 0, 2)])).toEqual([
+    expect(collect([input(only, 'seq:0', 0, 2)])).toEqual([
       { kind: 'body-element', element: only },
     ]);
   });
@@ -112,7 +114,7 @@ describe('adjacent table normalization (ECMA-376 Part 1 §17.4.37)', () => {
     const first = table(1);
     const second = table(2);
 
-    expect(() => normalizeAdjacentTables([
+    expect(() => collect([
       input(first, 'seq:0', 0, 3),
       input(second, 'seq:0', 2, 3),
     ])).toThrow(/inconsistent/);
@@ -122,7 +124,7 @@ describe('adjacent table normalization (ECMA-376 Part 1 §17.4.37)', () => {
     const first = table(1);
     const second = table(1);
 
-    expect(() => normalizeAdjacentTables([
+    expect(() => collect([
       input(first, 'seq:0', 0, 3),
       input(second, 'seq:0', 1, 3),
     ])).toThrow(/incomplete/);

@@ -1,7 +1,39 @@
 import { expect, test } from '@playwright/test';
 
 async function expectWorkerBitmaps(page: import('@playwright/test').Page, url: string) {
-  await page.goto(url);
+  const sourceRequests: string[] = [];
+  const sourceBodies: string[] = [];
+  const inspectedResponses: Promise<void>[] = [];
+  page.context().on('request', (request) => {
+    const pathname = new URL(request.url()).pathname;
+    if ((pathname.startsWith('/dist/') || pathname.startsWith('/consumer/'))
+      && /model-source|source-worker|worker-source|render-worker-source/.test(pathname)) {
+      sourceRequests.push(pathname);
+    }
+  });
+  page.context().on('response', (response) => {
+    const pathname = new URL(response.url()).pathname;
+    // The consumer fixture embeds a protocol marker in its test source, so
+    // inspect the published dist bodies, where a marker means runtime code.
+    if (!pathname.startsWith('/dist/') || !/\.m?js$/.test(pathname)) return;
+    inspectedResponses.push(response.text().then((body) => {
+      if (body.includes('ooxml-model-source-module/v1')
+        || body.includes('model source view default')) sourceBodies.push(pathname);
+    }));
+  });
+  await page.goto(`${url}${url.includes('?') ? '&' : '?'}pause-sources`);
+  await expect.poll(async () => {
+    const body = page.locator('body');
+    return (await body.getAttribute('data-ordinary-ready')) === 'true'
+      || (await body.getAttribute('data-status')) === 'error';
+  }, { timeout: 60_000 }).toBe(true);
+  await Promise.all(inspectedResponses);
+  expect(sourceRequests, 'ordinary OOXML main/worker loads must not fetch source chunks').toEqual([]);
+  expect(sourceBodies, 'ordinary OOXML main/worker loads must not fetch source module bodies').toEqual([]);
+  await expect(page.locator('body')).toHaveAttribute('data-ordinary-ready', 'true');
+  await expect(page.locator('body')).toHaveAttribute('data-ordinary-loads',
+    'docx-worker,xlsx-worker,pptx-worker,docx-main,xlsx-main,pptx-main');
+  await page.evaluate(() => (window as typeof window & { resumeSourceStages?: () => void }).resumeSourceStages?.());
   await expect.poll(
     () => page.locator('body').getAttribute('data-status'),
     { timeout: 60_000 },
@@ -40,6 +72,8 @@ async function expectWorkerBitmaps(page: import('@playwright/test').Page, url: s
     });
     expect(ink, `${id} worker bitmap should contain ink`).toBeGreaterThan(100);
   }
+
+  await expect(page.locator('body')).toHaveAttribute('data-model-sources', 'ready');
 
   const pptxTextRuns = await page.evaluate(() => (
     window as typeof window & { pptxTextRuns?: Array<Record<string, unknown>> }

@@ -12,6 +12,7 @@
     import { math } from '@ooxml-test-math-renderer';
     import { threeD } from '@ooxml-test-three-d-renderer';
     import { regionMap } from '@ooxml-test-region-map-renderer';
+    import { chartEx } from '@ooxml-test-chart-ex-renderer';
 
     const params = new URLSearchParams(location.search);
     const name = params.get('docx') ?? 'demo/sample-1';
@@ -32,7 +33,7 @@
         bmp.close();
       };
 
-      const renderers = { math, threeD, regionMap };
+      const renderers = { math, threeD, regionMap, chartEx };
       const main = await DocxDocument.load(buf.slice(0), { useGoogleFonts: true, ...renderers });
       paint('main-canvas', await main.renderPageToBitmap(page, { width, dpr }));
       main.destroy();

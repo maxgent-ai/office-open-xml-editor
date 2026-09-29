@@ -15,9 +15,9 @@ afterEach(() => {
  * IX1 `enableHyperlinks` — a viewer-level policy switch (default `true`). When
  * `false`, XLSX hyperlink interactivity is disabled entirely: the cell hit-test
  * reports no hyperlink under any cell, so there is no pointer cursor over a link
- * (the pointermove cursor branch is literally `hyperlinkAtCell(hovered) ?
+ * (the pointermove cursor branch is literally `hyperlinks.at(hovered) ?
  * 'pointer' : ''`), no default open/navigate, and `onHyperlinkClick` is never
- * called. The single gate lives in `hyperlinkAtCell`, which every consumer
+ * called. The single gate lives in `HyperlinkDispatcher.at`, which every consumer
  * (cursor affordance + click dispatch) already funnels through.
  */
 
@@ -47,7 +47,7 @@ interface Priv {
     dispatch(type: string, event?: unknown): void;
   };
   buildHyperlinkMap(ws: Worksheet): void;
-  hyperlinkAtCell(cell: CellAddress): Hyperlink | null;
+  hyperlinks: { at(cell: CellAddress): Hyperlink | null };
 }
 
 function mountViewer(ws: Worksheet, opts: XlsxViewerOptions = {}): { v: XlsxViewer; priv: Priv } {
@@ -75,8 +75,8 @@ describe('XlsxViewer — enableHyperlinks option', () => {
     const ws = makeSheet([{ col: 1, row: 1, url: 'https://example.com/', location: null }]);
     const { v, priv } = mountViewer(ws, { enableHyperlinks: false });
     // The hit-test reports nothing, so the pointermove cursor branch
-    // (`hyperlinkAtCell(hovered) ? 'pointer' : ''`) can never show a pointer.
-    expect(priv.hyperlinkAtCell({ row: 1, col: 1 })).toBeNull();
+    // (`hyperlinks.at(hovered) ? 'pointer' : ''`) can never show a pointer.
+    expect(priv.hyperlinks.at({ row: 1, col: 1 })).toBeNull();
     v.destroy();
   });
 
@@ -105,7 +105,7 @@ describe('XlsxViewer — enableHyperlinks option', () => {
     const seen: HyperlinkTarget[] = [];
     const ws = makeSheet([{ col: 1, row: 1, url: 'https://example.com/', location: null }]);
     const { v, priv } = mountViewer(ws, { onHyperlinkClick: (t) => seen.push(t) });
-    expect(priv.hyperlinkAtCell({ row: 1, col: 1 })).not.toBeNull();
+    expect(priv.hyperlinks.at({ row: 1, col: 1 })).not.toBeNull();
     clickAt(priv, CELL_A1_X, CELL_A1_Y);
     expect(seen).toEqual([{ kind: 'external', url: 'https://example.com/' }]);
     v.destroy();
@@ -114,7 +114,7 @@ describe('XlsxViewer — enableHyperlinks option', () => {
   it('hit-tests normally when enableHyperlinks is explicitly true', () => {
     const ws = makeSheet([{ col: 1, row: 1, url: 'https://example.com/', location: null }]);
     const { v, priv } = mountViewer(ws, { enableHyperlinks: true });
-    expect(priv.hyperlinkAtCell({ row: 1, col: 1 })).not.toBeNull();
+    expect(priv.hyperlinks.at({ row: 1, col: 1 })).not.toBeNull();
     v.destroy();
   });
 });

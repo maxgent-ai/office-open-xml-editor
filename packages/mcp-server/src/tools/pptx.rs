@@ -1,8 +1,11 @@
+use crate::parsed_cache;
+use pptx_model::{
+    ArrowEnd, Paragraph, Presentation, ShapeElement, Slide, SlideElement, TextBody, TextRun,
+};
 use rmcp::{handler::server::wrapper::Parameters, tool};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
-use std::fs;
 
 // ─── Parameter types ─────────────────────────────────────────────────────────
 
@@ -83,164 +86,134 @@ pub struct PptxRelationsParam {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-fn read_file(path: &str) -> Result<Vec<u8>, String> {
-    fs::read(path).map_err(|e| format!("Cannot read '{}': {}", path, e))
+fn presentation(path: &str) -> Result<std::sync::Arc<Presentation>, String> {
+    parsed_cache::pptx(path)
 }
 
-fn extract_text_runs(node: &Value, out: &mut String) {
-    // pptx-parser serializes TextRun as a tagged enum with `rename_all =
-    // "camelCase"` — variants become "text" (TextRun::Text) and "break"
-    // (TextRun::Break). Earlier revisions matched "textRun" / "run", which
-    // never fire and silently produced empty extractions.
-    match node["type"].as_str().unwrap_or("") {
-        "text" => {
-            if let Some(t) = node["text"].as_str() {
-                out.push_str(t);
-            }
-        }
-        "break" => {
-            // ECMA-376 §21.1.2.2.1 — intra-paragraph <a:br/>. Map to a newline
-            // so multi-line shape text isn't collapsed into a single line.
-            out.push('\n');
-        }
-        _ => {}
-    }
-    // Recurse into common container fields (paragraph.runs, etc.).
-    for key in &["runs", "paragraphs", "elements", "children"] {
-        if let Some(arr) = node[key].as_array() {
-            for child in arr {
-                extract_text_runs(child, out);
-            }
-        }
+fn element_type(element: &SlideElement) -> &'static str {
+    match element {
+        SlideElement::Shape(_) => "shape",
+        SlideElement::Picture(_) => "picture",
+        SlideElement::Table(_) => "table",
+        SlideElement::Chart(_) => "chart",
+        SlideElement::Media(_) => "media",
     }
 }
 
-/// Title extraction backed by the parser-emitted `placeholderType`. Looks for
-/// shapes whose `placeholderType` is "title" or "ctrTitle"
-/// (ECMA-376 §19.7.10), falling back to the first shape with non-empty text
-/// for slides that don't carry an explicit title placeholder (e.g. blank
-/// layout, decorative slides).
-fn slide_title(slide: &Value) -> Option<String> {
-    let elements = slide["elements"].as_array()?;
-
-    let read_text = |el: &Value| -> String {
-        let mut text = String::new();
-        if let Some(tb) = el.get("textBody") {
-            if let Some(paras) = tb["paragraphs"].as_array() {
-                for para in paras {
-                    extract_text_runs(para, &mut text);
-                    text.push(' ');
-                }
-            }
-        }
-        text.trim().to_string()
+fn element_box(element: &SlideElement) -> Bbox {
+    let (x, y, w, h) = match element {
+        SlideElement::Shape(el) => (el.x, el.y, el.width, el.height),
+        SlideElement::Picture(el) => (el.x, el.y, el.width, el.height),
+        SlideElement::Table(el) => (el.x, el.y, el.width, el.height),
+        SlideElement::Chart(el) => (el.x, el.y, el.width, el.height),
+        SlideElement::Media(el) => (el.x, el.y, el.width, el.height),
     };
-
-    // First pass: prefer the explicit title placeholder.
-    for el in elements {
-        if el["type"].as_str() != Some("shape") {
-            continue;
-        }
-        let Some(ph) = el["placeholderType"].as_str() else {
-            continue;
-        };
-        if ph == "title" || ph == "ctrTitle" {
-            let trimmed = read_text(el);
-            if !trimmed.is_empty() {
-                return Some(trimmed);
-            }
-        }
-    }
-
-    // Fallback: first non-empty shape text. Same heuristic the previous
-    // implementation used; kept for slides without a title placeholder.
-    for el in elements {
-        if el["type"].as_str() != Some("shape") {
-            continue;
-        }
-        let trimmed = read_text(el);
-        if !trimmed.is_empty() {
-            return Some(trimmed);
-        }
-    }
-    None
+    Bbox { x, y, w, h }
 }
 
-fn extract_slide_text(slide: &Value) -> String {
-    let mut out = String::new();
-    if let Some(elements) = slide["elements"].as_array() {
-        for el in elements {
-            if let Some(tb) = el.get("textBody") {
-                if let Some(paras) = tb["paragraphs"].as_array() {
-                    for para in paras {
-                        extract_text_runs(para, &mut out);
-                        out.push('\n');
-                    }
-                }
+fn shape(element: &SlideElement) -> Option<&ShapeElement> {
+    match element {
+        SlideElement::Shape(shape) => Some(shape),
+        _ => None,
+    }
+}
+fn text_body(element: &SlideElement) -> Option<&TextBody> {
+    shape(element).and_then(|shape| shape.text_body.as_ref())
+}
+fn placeholder_type(element: &SlideElement) -> Option<&str> {
+    shape(element).and_then(|shape| shape.placeholder_type.as_deref())
+}
+fn append_runs(paragraph: &Paragraph, out: &mut String) {
+    for run in &paragraph.runs {
+        match run {
+            TextRun::Text(data) => out.push_str(&data.text),
+            TextRun::Break { .. } => out.push('\n'),
+            TextRun::Math { .. } => {}
+        }
+    }
+}
+fn append_body(body: &TextBody, out: &mut String, separator: char) {
+    for para in &body.paragraphs {
+        append_runs(para, out);
+        out.push(separator);
+    }
+}
+fn element_text(element: &SlideElement, separator: char) -> String {
+    let mut text = String::new();
+    if let Some(body) = text_body(element) {
+        append_body(body, &mut text, separator);
+    }
+    text
+}
+
+/// ECMA-376 §19.7.10 title placeholders take precedence over the first
+/// nonempty shape text, matching the previous MCP projection.
+fn slide_title(slide: &Slide) -> Option<String> {
+    for element in &slide.elements {
+        if matches!(placeholder_type(element), Some("title" | "ctrTitle")) {
+            let title = element_text(element, ' ').trim().to_string();
+            if !title.is_empty() {
+                return Some(title);
             }
-            // Table elements. TableCell holds its paragraphs under
-            // `textBody.paragraphs`, not at the top level — the previous code
-            // looked at `c["paragraphs"]` which always came back empty.
-            if el["type"].as_str() == Some("table") {
-                if let Some(rows) = el["rows"].as_array() {
-                    for row in rows {
-                        if let Some(cells) = row["cells"].as_array() {
-                            let cell_texts: Vec<String> = cells
-                                .iter()
-                                .map(|c| {
-                                    let mut t = String::new();
-                                    if let Some(tb) = c.get("textBody") {
-                                        if let Some(paras) = tb["paragraphs"].as_array() {
-                                            for para in paras {
-                                                extract_text_runs(para, &mut t);
-                                            }
-                                        }
-                                    }
-                                    t
-                                })
-                                .collect();
-                            out.push_str(&cell_texts.join("\t"));
-                            out.push('\n');
+        }
+    }
+    slide
+        .elements
+        .iter()
+        .filter(|element| shape(element).is_some())
+        .map(|element| element_text(element, ' ').trim().to_string())
+        .find(|title| !title.is_empty())
+}
+
+fn extract_slide_text(slide: &Slide) -> String {
+    let mut out = String::new();
+    for element in &slide.elements {
+        if let Some(body) = text_body(element) {
+            append_body(body, &mut out, '\n');
+        }
+        if let SlideElement::Table(table) = element {
+            for row in &table.rows {
+                let cells: Vec<String> = row
+                    .cells
+                    .iter()
+                    .map(|cell| {
+                        let mut text = String::new();
+                        if let Some(body) = &cell.text_body {
+                            for para in &body.paragraphs {
+                                append_runs(para, &mut text);
+                            }
                         }
-                    }
-                }
+                        text
+                    })
+                    .collect();
+                out.push_str(&cells.join("\t"));
+                out.push('\n');
             }
         }
     }
     out
 }
 
-fn slide_structure(slide: &Value) -> Value {
-    let elements: Vec<Value> = slide["elements"]
-        .as_array()
-        .map(|els| {
-            els.iter()
-                .map(|el| {
-                    let mut text = String::new();
-                    if let Some(tb) = el.get("textBody") {
-                        if let Some(paras) = tb["paragraphs"].as_array() {
-                            for para in paras {
-                                extract_text_runs(para, &mut text);
-                            }
-                        }
-                    }
-                    serde_json::json!({
-                        "type": el["type"],
-                        "placeholderType": el["placeholderType"],
-                        "x": el["x"], "y": el["y"],
-                        "width": el["width"], "height": el["height"],
-                        "text": text.trim().to_string(),
-                    })
-                })
-                .collect()
+fn slide_structure(slide: &Slide) -> Value {
+    let elements: Vec<Value> = slide
+        .elements
+        .iter()
+        .map(|element| {
+            let bb = element_box(element);
+            let mut text = String::new();
+            if let Some(body) = text_body(element) {
+                for para in &body.paragraphs {
+                    append_runs(para, &mut text);
+                }
+            }
+            serde_json::json!({
+                "type": element_type(element), "placeholderType": placeholder_type(element),
+                "x": bb.x, "y": bb.y, "width": bb.w, "height": bb.h,
+                "text": text.trim(),
+            })
         })
-        .unwrap_or_default();
-
-    serde_json::json!({
-        "index": slide["index"],
-        "slideNumber": slide["slideNumber"],
-        "elements": elements,
-    })
+        .collect();
+    serde_json::json!({ "index": slide.index, "slideNumber": slide.slide_number, "elements": elements })
 }
 
 // ─── Spatial geometry helpers (used by `pptx_get_shape_relations`) ───────────
@@ -259,14 +232,6 @@ struct Bbox {
 }
 
 impl Bbox {
-    fn from_element(elem: &Value) -> Option<Self> {
-        let x = elem["x"].as_i64()?;
-        let y = elem["y"].as_i64()?;
-        let w = elem["width"].as_i64()?;
-        let h = elem["height"].as_i64()?;
-        Some(Bbox { x, y, w, h })
-    }
-
     fn right(&self) -> i64 {
         self.x + self.w
     }
@@ -339,10 +304,10 @@ fn is_connector(geometry: &str) -> bool {
 /// Returns true when the arrow descriptor (`headEnd` / `tailEnd`) terminates
 /// the line in something visible (i.e. not "none"). Matches ECMA-376 §20.1.10.46
 /// `ST_LineEndType` values that draw a glyph.
-fn arrow_is_directional(arrow: &Value) -> bool {
+fn arrow_is_directional(arrow: &ArrowEnd) -> bool {
     matches!(
-        arrow["type"].as_str(),
-        Some("triangle") | Some("stealth") | Some("arrow") | Some("diamond") | Some("oval")
+        arrow.kind.as_str(),
+        "triangle" | "stealth" | "arrow" | "diamond" | "oval"
     )
 }
 
@@ -506,76 +471,36 @@ pub struct PptxTools;
 impl PptxTools {
     #[tool(description = "Return the number of slides and each slide's title from a PPTX file")]
     pub fn pptx_get_slides(Parameters(p): Parameters<PptxPathParam>) -> String {
-        let data = match read_file(&p.path) {
-            Ok(d) => d,
-            Err(e) => return format!("Error: {}", e),
+        let pres = match presentation(&p.path) {
+            Ok(x) => x,
+            Err(e) => return format!("Error: {e}"),
         };
-        let pres_json = match pptx_parser::parse_pptx_native(&data) {
-            Ok(j) => j,
-            Err(e) => return format!("Error: {}", e),
-        };
-        let pres: Value = match serde_json::from_str(&pres_json) {
-            Ok(v) => v,
-            Err(e) => return format!("Error: {}", e),
-        };
-        let slides = pres["slides"]
-            .as_array()
-            .map(|s| s.as_slice())
-            .unwrap_or(&[]);
-        let summary: Vec<Value> = slides
-            .iter()
-            .map(|s| {
-                serde_json::json!({
-                    "index": s["index"],
-                    "slideNumber": s["slideNumber"],
-                    "title": slide_title(s),
-                })
-            })
-            .collect();
-        serde_json::json!({
-            "slideCount": slides.len(),
-            "slides": summary,
-        })
-        .to_string()
+        let slides: Vec<Value> = pres.slides.iter().map(|slide| serde_json::json!({
+            "index": slide.index, "slideNumber": slide.slide_number, "title": slide_title(slide),
+        })).collect();
+        serde_json::json!({ "slideCount": pres.slides.len(), "slides": slides }).to_string()
     }
 
     #[tool(
         description = "Extract plain text from a PPTX file; optionally filter to a single slide by 0-based index"
     )]
     pub fn pptx_extract_text(Parameters(p): Parameters<PptxTextParam>) -> String {
-        let data = match read_file(&p.path) {
-            Ok(d) => d,
-            Err(e) => return format!("Error: {}", e),
+        let pres = match presentation(&p.path) {
+            Ok(x) => x,
+            Err(e) => return format!("Error: {e}"),
         };
-        let pres_json = match pptx_parser::parse_pptx_native(&data) {
-            Ok(j) => j,
-            Err(e) => return format!("Error: {}", e),
-        };
-        let pres: Value = match serde_json::from_str(&pres_json) {
-            Ok(v) => v,
-            Err(e) => return format!("Error: {}", e),
-        };
-        let slides = pres["slides"]
-            .as_array()
-            .map(|s| s.as_slice())
-            .unwrap_or(&[]);
-
         if let Some(idx) = p.slide_index {
-            let slide = match slides.get(idx) {
-                Some(s) => s,
-                None => {
-                    return format!(
-                        "Error: slide index {} out of range (total: {})",
-                        idx,
-                        slides.len()
-                    )
-                }
+            let Some(slide) = pres.slides.get(idx) else {
+                return format!(
+                    "Error: slide index {} out of range (total: {})",
+                    idx,
+                    pres.slides.len()
+                );
             };
             return extract_slide_text(slide);
         }
-
         let mut out = String::new();
-        for (i, slide) in slides.iter().enumerate() {
+        for (i, slide) in pres.slides.iter().enumerate() {
             out.push_str(&format!("=== Slide {} ===\n", i + 1));
             out.push_str(&extract_slide_text(slide));
             out.push('\n');
@@ -587,162 +512,85 @@ impl PptxTools {
         description = "Return the structure (elements with position, size, text) of a single slide"
     )]
     pub fn pptx_get_slide_structure(Parameters(p): Parameters<PptxSlideParam>) -> String {
-        let data = match read_file(&p.path) {
-            Ok(d) => d,
-            Err(e) => return format!("Error: {}", e),
+        let pres = match presentation(&p.path) {
+            Ok(x) => x,
+            Err(e) => return format!("Error: {e}"),
         };
-        let pres_json = match pptx_parser::parse_pptx_native(&data) {
-            Ok(j) => j,
-            Err(e) => return format!("Error: {}", e),
+        let Some(slide) = pres.slides.get(p.slide_index) else {
+            return format!(
+                "Error: slide index {} out of range (total: {})",
+                p.slide_index,
+                pres.slides.len()
+            );
         };
-        let pres: Value = match serde_json::from_str(&pres_json) {
-            Ok(v) => v,
-            Err(e) => return format!("Error: {}", e),
-        };
-        let slides = pres["slides"]
-            .as_array()
-            .map(|s| s.as_slice())
-            .unwrap_or(&[]);
-        let slide = match slides.get(p.slide_index) {
-            Some(s) => s,
-            None => {
-                return format!(
-                    "Error: slide index {} out of range (total: {})",
-                    p.slide_index,
-                    slides.len()
-                )
-            }
-        };
-        serde_json::to_string(&slide_structure(slide)).unwrap_or_else(|e| format!("Error: {}", e))
+        slide_structure(slide).to_string()
     }
 
     #[tool(
         description = "Search for a substring across all text in a PPTX file; returns matching slide numbers and the text snippets that matched"
     )]
     pub fn pptx_search_text(Parameters(p): Parameters<PptxSearchParam>) -> String {
-        let data = match read_file(&p.path) {
-            Ok(d) => d,
-            Err(e) => return format!("Error: {}", e),
+        let pres = match presentation(&p.path) {
+            Ok(x) => x,
+            Err(e) => return format!("Error: {e}"),
         };
-        let pres_json = match pptx_parser::parse_pptx_native(&data) {
-            Ok(j) => j,
-            Err(e) => return format!("Error: {}", e),
-        };
-        let pres: Value = match serde_json::from_str(&pres_json) {
-            Ok(v) => v,
-            Err(e) => return format!("Error: {}", e),
-        };
-        let slides = pres["slides"]
-            .as_array()
-            .map(|s| s.as_slice())
-            .unwrap_or(&[]);
         let query_lower = p.query.to_lowercase();
-        let mut matches: Vec<Value> = Vec::new();
-
-        for slide in slides {
-            let slide_index = slide["index"].as_u64().unwrap_or(0) as usize;
-            let slide_number = slide["slideNumber"].as_u64().unwrap_or(0) as usize;
-
-            if let Some(elements) = slide["elements"].as_array() {
-                for el in elements {
-                    // Collect all text from this element
-                    let mut element_text = String::new();
-                    if let Some(tb) = el.get("textBody") {
-                        if let Some(paras) = tb["paragraphs"].as_array() {
-                            for para in paras {
-                                extract_text_runs(para, &mut element_text);
-                                element_text.push('\n');
-                            }
-                        }
-                    }
-                    // Table cells. Same fix as `extract_slide_text`: paragraphs
-                    // live under `cell.textBody.paragraphs`, not the top level.
-                    if el["type"].as_str() == Some("table") {
-                        if let Some(rows) = el["rows"].as_array() {
-                            for row in rows {
-                                if let Some(cells) = row["cells"].as_array() {
-                                    for cell in cells {
-                                        if let Some(tb) = cell.get("textBody") {
-                                            if let Some(paras) = tb["paragraphs"].as_array() {
-                                                for para in paras {
-                                                    extract_text_runs(para, &mut element_text);
-                                                }
-                                            }
-                                        }
-                                        element_text.push('\t');
-                                    }
+        let mut matches = Vec::new();
+        for slide in &pres.slides {
+            for element in &slide.elements {
+                let mut element_text = String::new();
+                if let Some(body) = text_body(element) {
+                    append_body(body, &mut element_text, '\n');
+                }
+                if let SlideElement::Table(table) = element {
+                    for row in &table.rows {
+                        for cell in &row.cells {
+                            if let Some(body) = &cell.text_body {
+                                for para in &body.paragraphs {
+                                    append_runs(para, &mut element_text);
                                 }
-                                element_text.push('\n');
                             }
+                            element_text.push('\t');
                         }
+                        element_text.push('\n');
                     }
-
-                    if element_text.to_lowercase().contains(&query_lower) {
-                        matches.push(serde_json::json!({
-                            "slideIndex": slide_index,
-                            "slideNumber": slide_number,
-                            "elementType": el["type"],
-                            "placeholderType": el["placeholderType"],
-                            "text": element_text.trim(),
-                        }));
-                    }
+                }
+                if element_text.to_lowercase().contains(&query_lower) {
+                    matches.push(serde_json::json!({
+                    "slideIndex": slide.index, "slideNumber": slide.slide_number,
+                    "elementType": element_type(element), "placeholderType": placeholder_type(element),
+                    "text": element_text.trim(),
+                }));
                 }
             }
         }
-
-        serde_json::json!({
-            "query": p.query,
-            "matchCount": matches.len(),
-            "matches": matches,
-        })
-        .to_string()
+        serde_json::json!({ "query": p.query, "matchCount": matches.len(), "matches": matches })
+            .to_string()
     }
 
     #[tool(
         description = "Return one slide element's full detail by slide and element index. `elementIndex` matches the element index in `pptx_get_slide_structure`. Includes shapes, pictures, charts, tables, geometry, position/size, rotation/flip, fill, stroke, effects, and the text body when present"
     )]
     pub fn pptx_get_element(Parameters(p): Parameters<PptxElementParam>) -> String {
-        let data = match read_file(&p.path) {
-            Ok(d) => d,
-            Err(e) => return format!("Error: {}", e),
+        let pres = match presentation(&p.path) {
+            Ok(x) => x,
+            Err(e) => return format!("Error: {e}"),
         };
-        let pres_json = match pptx_parser::parse_pptx_native(&data) {
-            Ok(j) => j,
-            Err(e) => return format!("Error: {}", e),
+        let Some(slide) = pres.slides.get(p.slide_index) else {
+            return format!(
+                "Error: slide index {} out of range (total: {})",
+                p.slide_index,
+                pres.slides.len()
+            );
         };
-        let pres: Value = match serde_json::from_str(&pres_json) {
-            Ok(v) => v,
-            Err(e) => return format!("Error: {}", e),
+        let Some(element) = slide.elements.get(p.element_index) else {
+            return format!(
+                "Error: element index {} out of range (slide elements: {})",
+                p.element_index,
+                slide.elements.len()
+            );
         };
-        let slides = pres["slides"]
-            .as_array()
-            .map(|s| s.as_slice())
-            .unwrap_or(&[]);
-        let slide = match slides.get(p.slide_index) {
-            Some(s) => s,
-            None => {
-                return format!(
-                    "Error: slide index {} out of range (total: {})",
-                    p.slide_index,
-                    slides.len()
-                )
-            }
-        };
-        let elements = slide["elements"]
-            .as_array()
-            .map(|s| s.as_slice())
-            .unwrap_or(&[]);
-        let element = match elements.get(p.element_index) {
-            Some(e) => e,
-            None => {
-                return format!(
-                    "Error: element index {} out of range (slide elements: {})",
-                    p.element_index,
-                    elements.len()
-                )
-            }
-        };
-        let mut out = element.clone();
+        let mut out = serde_json::to_value(element).unwrap_or(Value::Null);
         if let Some(obj) = out.as_object_mut() {
             obj.insert("slideIndex".into(), Value::from(p.slide_index));
             obj.insert("elementIndex".into(), Value::from(p.element_index));
@@ -754,51 +602,29 @@ impl PptxTools {
         description = "List all charts on a slide (or every slide when `slide_index` is omitted). Each entry exposes type, position, title, categories, and series (with values)"
     )]
     pub fn pptx_get_charts(Parameters(p): Parameters<PptxOptSlideParam>) -> String {
-        let data = match read_file(&p.path) {
-            Ok(d) => d,
-            Err(e) => return format!("Error: {}", e),
+        let pres = match presentation(&p.path) {
+            Ok(x) => x,
+            Err(e) => return format!("Error: {e}"),
         };
-        let pres_json = match pptx_parser::parse_pptx_native(&data) {
-            Ok(j) => j,
-            Err(e) => return format!("Error: {}", e),
-        };
-        let pres: Value = match serde_json::from_str(&pres_json) {
-            Ok(v) => v,
-            Err(e) => return format!("Error: {}", e),
-        };
-        let slides = pres["slides"]
-            .as_array()
-            .map(|s| s.as_slice())
-            .unwrap_or(&[]);
-        let mut charts: Vec<Value> = Vec::new();
-        for (slide_idx, slide) in slides.iter().enumerate() {
-            if let Some(filter) = p.slide_index {
-                if slide_idx != filter {
-                    continue;
-                }
-            }
-            let Some(elements) = slide["elements"].as_array() else {
+        let mut charts = Vec::new();
+        for (slide_idx, slide) in pres.slides.iter().enumerate() {
+            if p.slide_index.is_some_and(|filter| slide_idx != filter) {
                 continue;
-            };
-            for (shape_idx, el) in elements.iter().enumerate() {
-                if el["type"].as_str() != Some("chart") {
-                    continue;
+            }
+            for (shape_idx, element) in slide.elements.iter().enumerate() {
+                if let SlideElement::Chart(chart) = element {
+                    // The established MCP projection indexes legacy flattened
+                    // chart fields; the typed parser model nests these in
+                    // `chart`. Preserve the published nulls until changed
+                    // through an explicit tool-output revision.
+                    charts.push(serde_json::json!({
+                        "slideIndex": slide_idx, "shapeIndex": shape_idx,
+                        "type": null, "title": null,
+                        "position": { "x": chart.x, "y": chart.y, "width": chart.width, "height": chart.height },
+                        "categories": null, "series": null, "showLegend": null,
+                        "legendPos": null, "showDataLabels": null,
+                    }));
                 }
-                charts.push(serde_json::json!({
-                    "slideIndex": slide_idx,
-                    "shapeIndex": shape_idx,
-                    "type": el["chartType"],
-                    "title": el["title"],
-                    "position": {
-                        "x": el["x"], "y": el["y"],
-                        "width": el["width"], "height": el["height"],
-                    },
-                    "categories": el["categories"],
-                    "series": el["series"],
-                    "showLegend": el["showLegend"],
-                    "legendPos": el["legendPos"],
-                    "showDataLabels": el["showDataLabels"],
-                }));
             }
         }
         serde_json::json!({ "charts": charts }).to_string()
@@ -808,46 +634,23 @@ impl PptxTools {
         description = "List all tables on a slide (or every slide when `slide_index` is omitted). Each entry includes column widths, row heights, and per-cell content (textBody) plus colSpan/rowSpan/merge information"
     )]
     pub fn pptx_get_tables(Parameters(p): Parameters<PptxOptSlideParam>) -> String {
-        let data = match read_file(&p.path) {
-            Ok(d) => d,
-            Err(e) => return format!("Error: {}", e),
+        let pres = match presentation(&p.path) {
+            Ok(x) => x,
+            Err(e) => return format!("Error: {e}"),
         };
-        let pres_json = match pptx_parser::parse_pptx_native(&data) {
-            Ok(j) => j,
-            Err(e) => return format!("Error: {}", e),
-        };
-        let pres: Value = match serde_json::from_str(&pres_json) {
-            Ok(v) => v,
-            Err(e) => return format!("Error: {}", e),
-        };
-        let slides = pres["slides"]
-            .as_array()
-            .map(|s| s.as_slice())
-            .unwrap_or(&[]);
-        let mut tables: Vec<Value> = Vec::new();
-        for (slide_idx, slide) in slides.iter().enumerate() {
-            if let Some(filter) = p.slide_index {
-                if slide_idx != filter {
-                    continue;
-                }
-            }
-            let Some(elements) = slide["elements"].as_array() else {
+        let mut tables = Vec::new();
+        for (slide_idx, slide) in pres.slides.iter().enumerate() {
+            if p.slide_index.is_some_and(|filter| slide_idx != filter) {
                 continue;
-            };
-            for (shape_idx, el) in elements.iter().enumerate() {
-                if el["type"].as_str() != Some("table") {
-                    continue;
+            }
+            for (shape_idx, element) in slide.elements.iter().enumerate() {
+                if let SlideElement::Table(table) = element {
+                    tables.push(serde_json::json!({
+                        "slideIndex": slide_idx, "shapeIndex": shape_idx,
+                        "position": { "x": table.x, "y": table.y, "width": table.width, "height": table.height },
+                        "cols": table.cols, "rows": table.rows,
+                    }));
                 }
-                tables.push(serde_json::json!({
-                    "slideIndex": slide_idx,
-                    "shapeIndex": shape_idx,
-                    "position": {
-                        "x": el["x"], "y": el["y"],
-                        "width": el["width"], "height": el["height"],
-                    },
-                    "cols": el["cols"],
-                    "rows": el["rows"],
-                }));
             }
         }
         serde_json::json!({ "tables": tables }).to_string()
@@ -857,53 +660,28 @@ impl PptxTools {
         description = "List all picture elements on a slide (or every slide when `slide_index` is omitted). Returns metadata only by default; pass `include_data_url=true` to include the inline base64 bytes"
     )]
     pub fn pptx_get_pictures(Parameters(p): Parameters<PptxPicturesParam>) -> String {
-        let data = match read_file(&p.path) {
-            Ok(d) => d,
-            Err(e) => return format!("Error: {}", e),
+        let pres = match presentation(&p.path) {
+            Ok(x) => x,
+            Err(e) => return format!("Error: {e}"),
         };
-        let pres_json = match pptx_parser::parse_pptx_native(&data) {
-            Ok(j) => j,
-            Err(e) => return format!("Error: {}", e),
-        };
-        let pres: Value = match serde_json::from_str(&pres_json) {
-            Ok(v) => v,
-            Err(e) => return format!("Error: {}", e),
-        };
-        let slides = pres["slides"]
-            .as_array()
-            .map(|s| s.as_slice())
-            .unwrap_or(&[]);
-        let mut pictures: Vec<Value> = Vec::new();
-        for (slide_idx, slide) in slides.iter().enumerate() {
-            if let Some(filter) = p.slide_index {
-                if slide_idx != filter {
-                    continue;
-                }
-            }
-            let Some(elements) = slide["elements"].as_array() else {
+        let mut pictures = Vec::new();
+        for (slide_idx, slide) in pres.slides.iter().enumerate() {
+            if p.slide_index.is_some_and(|filter| slide_idx != filter) {
                 continue;
-            };
-            for (shape_idx, el) in elements.iter().enumerate() {
-                if el["type"].as_str() != Some("picture") {
-                    continue;
-                }
-                let mut entry = serde_json::json!({
-                    "slideIndex": slide_idx,
-                    "shapeIndex": shape_idx,
-                    "x": el["x"], "y": el["y"],
-                    "width": el["width"], "height": el["height"],
-                    "rotation": el["rotation"],
-                    "flipH": el["flipH"], "flipV": el["flipV"],
-                    "srcRect": el["srcRect"],
-                    "alpha": el["alpha"],
-                    "clipAdjust": el["clipAdjust"],
-                });
-                if p.include_data_url {
-                    if let Some(obj) = entry.as_object_mut() {
-                        obj.insert("dataUrl".into(), el["dataUrl"].clone());
+            }
+            for (shape_idx, element) in slide.elements.iter().enumerate() {
+                if let SlideElement::Picture(pic) = element {
+                    let mut entry = serde_json::json!({
+                        "slideIndex": slide_idx, "shapeIndex": shape_idx,
+                        "x": pic.x, "y": pic.y, "width": pic.width, "height": pic.height,
+                        "rotation": pic.rotation, "flipH": pic.flip_h, "flipV": pic.flip_v,
+                        "srcRect": pic.src_rect, "alpha": pic.alpha, "clipAdjust": null,
+                    });
+                    if p.include_data_url {
+                        entry["dataUrl"] = Value::Null;
                     }
+                    pictures.push(entry);
                 }
-                pictures.push(entry);
             }
         }
         serde_json::json!({ "pictures": pictures }).to_string()
@@ -913,43 +691,28 @@ impl PptxTools {
         description = "Return presentation-level metadata: slide width/height (EMU), default text color, theme major/minor fonts, and hyperlink colors"
     )]
     pub fn pptx_get_presentation_meta(Parameters(p): Parameters<PptxPathParam>) -> String {
-        let data = match read_file(&p.path) {
-            Ok(d) => d,
-            Err(e) => return format!("Error: {}", e),
+        let pres = match presentation(&p.path) {
+            Ok(x) => x,
+            Err(e) => return format!("Error: {e}"),
         };
-        let pres_json = match pptx_parser::parse_pptx_native(&data) {
-            Ok(j) => j,
-            Err(e) => return format!("Error: {}", e),
-        };
-        let pres: Value = match serde_json::from_str(&pres_json) {
-            Ok(v) => v,
-            Err(e) => return format!("Error: {}", e),
-        };
-        let slide_count = pres["slides"].as_array().map(|s| s.len()).unwrap_or(0);
         serde_json::json!({
-            "slideWidth": pres["slideWidth"],
-            "slideHeight": pres["slideHeight"],
-            "slideCount": slide_count,
-            "defaultTextColor": pres["defaultTextColor"],
-            "majorFont": pres["majorFont"],
-            "minorFont": pres["minorFont"],
-            "hlinkColor": pres["hlinkColor"],
-            "folHlinkColor": pres["folHlinkColor"],
-        })
-        .to_string()
+            "slideWidth": pres.slide_width, "slideHeight": pres.slide_height, "slideCount": pres.slides.len(),
+            "defaultTextColor": pres.default_text_color, "majorFont": pres.major_font,
+            "minorFont": pres.minor_font, "hlinkColor": pres.hlink_color, "folHlinkColor": pres.fol_hlink_color,
+        }).to_string()
     }
 
     #[tool(
         description = "Convert a PPTX file to GitHub-flavoured markdown. Preserves textual structure (titles, bullets at correct nesting, tables, chart summaries, speaker notes, comments) and discards presentation details (geometry, fills, strokes, theme inheritance, positions). Designed for agents that need to *read* a deck efficiently — typical 10-30× token reduction vs. `pptx_get_slides` / `pptx_extract_text`. Lossy by design: when you need precise layout or styling, fall back to the structured tools (`pptx_get_element`, `pptx_get_slide_structure`, etc.)"
     )]
     pub fn pptx_to_markdown(Parameters(p): Parameters<PptxPathParam>) -> String {
-        let data = match read_file(&p.path) {
-            Ok(d) => d,
-            Err(e) => return format!("Error: {}", e),
-        };
-        match pptx_parser::to_markdown_native(&data) {
+        match parsed_cache::markdown(
+            &p.path,
+            parsed_cache::MarkdownKind::Pptx,
+            pptx_parser::to_markdown_native,
+        ) {
             Ok(md) => md,
-            Err(e) => format!("Error: {}", e),
+            Err(e) => format!("Error: {e}"),
         }
     }
 
@@ -957,38 +720,23 @@ impl PptxTools {
         description = "Return speaker-notes text for one or all slides. Each entry: { slideIndex, slideNumber, notes }. Slides without a notesSlide part are omitted"
     )]
     pub fn pptx_get_notes(Parameters(p): Parameters<PptxOptSlideParam>) -> String {
-        let data = match read_file(&p.path) {
-            Ok(d) => d,
-            Err(e) => return format!("Error: {}", e),
+        let pres = match presentation(&p.path) {
+            Ok(x) => x,
+            Err(e) => return format!("Error: {e}"),
         };
-        let pres_json = match pptx_parser::parse_pptx_native(&data) {
-            Ok(j) => j,
-            Err(e) => return format!("Error: {}", e),
-        };
-        let pres: Value = match serde_json::from_str(&pres_json) {
-            Ok(v) => v,
-            Err(e) => return format!("Error: {}", e),
-        };
-        let slides = pres["slides"]
-            .as_array()
-            .map(|s| s.as_slice())
-            .unwrap_or(&[]);
-        let mut notes: Vec<Value> = Vec::new();
-        for (slide_idx, slide) in slides.iter().enumerate() {
-            if let Some(filter) = p.slide_index {
-                if slide_idx != filter {
-                    continue;
-                }
-            }
-            let Some(text) = slide["notes"].as_str() else {
-                continue;
-            };
-            notes.push(serde_json::json!({
-                "slideIndex": slide_idx,
-                "slideNumber": slide["slideNumber"],
-                "notes": text,
-            }));
-        }
+        let notes: Vec<Value> = pres
+            .slides
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| p.slide_index.is_none_or(|filter| *idx == filter))
+            .filter_map(|(idx, slide)| {
+                slide.notes.as_ref().map(|text| {
+                    serde_json::json!({
+                        "slideIndex": idx, "slideNumber": slide.slide_number, "notes": text,
+                    })
+                })
+            })
+            .collect();
         serde_json::json!({ "notes": notes }).to_string()
     }
 
@@ -996,42 +744,24 @@ impl PptxTools {
         description = "Return legacy (non-threaded) slide comments. Each entry: { slideIndex, slideNumber, author?, date?, text }. Office365 modern threaded comments are not yet supported"
     )]
     pub fn pptx_get_comments(Parameters(p): Parameters<PptxOptSlideParam>) -> String {
-        let data = match read_file(&p.path) {
-            Ok(d) => d,
-            Err(e) => return format!("Error: {}", e),
+        let pres = match presentation(&p.path) {
+            Ok(x) => x,
+            Err(e) => return format!("Error: {e}"),
         };
-        let pres_json = match pptx_parser::parse_pptx_native(&data) {
-            Ok(j) => j,
-            Err(e) => return format!("Error: {}", e),
-        };
-        let pres: Value = match serde_json::from_str(&pres_json) {
-            Ok(v) => v,
-            Err(e) => return format!("Error: {}", e),
-        };
-        let slides = pres["slides"]
-            .as_array()
-            .map(|s| s.as_slice())
-            .unwrap_or(&[]);
-        let mut comments: Vec<Value> = Vec::new();
-        for (slide_idx, slide) in slides.iter().enumerate() {
-            if let Some(filter) = p.slide_index {
-                if slide_idx != filter {
-                    continue;
-                }
-            }
-            let Some(arr) = slide["comments"].as_array() else {
-                continue;
-            };
-            for c in arr {
-                comments.push(serde_json::json!({
-                    "slideIndex": slide_idx,
-                    "slideNumber": slide["slideNumber"],
-                    "author": c["author"],
-                    "date": c["date"],
-                    "text": c["text"],
-                }));
-            }
-        }
+        let comments: Vec<Value> = pres
+            .slides
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| p.slide_index.is_none_or(|filter| *idx == filter))
+            .flat_map(|(idx, slide)| {
+                slide.comments.iter().map(move |comment| {
+                    serde_json::json!({
+                        "slideIndex": idx, "slideNumber": slide.slide_number,
+                        "author": comment.author, "date": comment.date, "text": comment.text,
+                    })
+                })
+            })
+            .collect();
         serde_json::json!({ "comments": comments }).to_string()
     }
 
@@ -1039,131 +769,80 @@ impl PptxTools {
         description = "Infer geometric relations between shapes on a slide: connector hookups (with arrow direction when stroke ends are arrows), containment, overlap, axis-aligned alignment groups, and equal distribution. Detection is purely spatial — `confidence: \"inferred\"` flags this — until the parser exposes ECMA-376 §20.5.2.2 stCxn/endCxn references"
     )]
     pub fn pptx_get_shape_relations(Parameters(p): Parameters<PptxRelationsParam>) -> String {
-        let data = match read_file(&p.path) {
-            Ok(d) => d,
-            Err(e) => return format!("Error: {}", e),
+        let pres = match presentation(&p.path) {
+            Ok(x) => x,
+            Err(e) => return format!("Error: {e}"),
         };
-        let pres_json = match pptx_parser::parse_pptx_native(&data) {
-            Ok(j) => j,
-            Err(e) => return format!("Error: {}", e),
+        let Some(slide) = pres.slides.get(p.slide_index) else {
+            return format!(
+                "Error: slide index {} out of range (total: {})",
+                p.slide_index,
+                pres.slides.len()
+            );
         };
-        let pres: Value = match serde_json::from_str(&pres_json) {
-            Ok(v) => v,
-            Err(e) => return format!("Error: {}", e),
-        };
-        let slides = pres["slides"]
-            .as_array()
-            .map(|s| s.as_slice())
-            .unwrap_or(&[]);
-        let slide = match slides.get(p.slide_index) {
-            Some(s) => s,
-            None => {
-                return format!(
-                    "Error: slide index {} out of range (total: {})",
-                    p.slide_index,
-                    slides.len()
-                )
-            }
-        };
-        let elements = slide["elements"]
-            .as_array()
-            .map(|s| s.as_slice())
-            .unwrap_or(&[]);
-
+        let elements = &slide.elements;
         let tol: i64 = p.tolerance_emu.unwrap_or(50_000).max(0);
-
-        // Collect bbox + connector flag for each element. Skip elements with no
-        // geometry (parser shouldn't emit any, but be defensive).
-        let mut shape_summaries: Vec<Value> = Vec::with_capacity(elements.len());
-        let mut bboxes: Vec<(usize, Bbox, bool)> = Vec::with_capacity(elements.len());
-        for (idx, el) in elements.iter().enumerate() {
-            let Some(bbox) = Bbox::from_element(el) else {
-                continue;
-            };
-            let geometry = el["geometry"].as_str().unwrap_or("");
-            let is_conn = el["type"].as_str() == Some("shape") && is_connector(geometry);
-            // Pull a one-line text snippet for reader convenience.
+        let mut shape_summaries = Vec::with_capacity(elements.len());
+        let mut bboxes = Vec::with_capacity(elements.len());
+        for (idx, element) in elements.iter().enumerate() {
+            let bbox = element_box(element);
+            let geometry = shape(element).map(|shape| shape.geometry.as_str());
+            let is_conn = geometry.is_some_and(is_connector);
             let mut text_snippet = String::new();
-            if let Some(tb) = el.get("textBody") {
-                if let Some(paras) = tb["paragraphs"].as_array() {
-                    for para in paras.iter().take(3) {
-                        extract_text_runs(para, &mut text_snippet);
-                        text_snippet.push(' ');
-                    }
+            if let Some(body) = text_body(element) {
+                for para in body.paragraphs.iter().take(3) {
+                    append_runs(para, &mut text_snippet);
+                    text_snippet.push(' ');
                 }
             }
             let trimmed = text_snippet.trim();
             shape_summaries.push(serde_json::json!({
-                "shapeIndex": idx,
-                "type": el["type"],
-                "geometry": el["geometry"],
+                "shapeIndex": idx, "type": element_type(element), "geometry": geometry,
                 "isConnector": is_conn,
-                "bbox": {
-                    "x": bbox.x, "y": bbox.y, "w": bbox.w, "h": bbox.h,
-                },
-                "text": if trimmed.is_empty() { Value::Null } else { Value::String(trimmed.to_string()) },
+                "bbox": { "x": bbox.x, "y": bbox.y, "w": bbox.w, "h": bbox.h },
+                "text": if trimmed.is_empty() { Value::Null } else { Value::String(trimmed.into()) },
             }));
             bboxes.push((idx, bbox, is_conn));
         }
-
-        let mut relations: Vec<Value> = Vec::new();
-
-        // ── Connections (connector → resolved endpoints) ──────────────────
+        let mut relations = Vec::new();
         for (idx, bbox, is_conn) in &bboxes {
             if !*is_conn {
                 continue;
             }
-            let element = &elements[*idx];
-            let stroke = &element["stroke"];
-            let head_arrow = stroke
-                .get("headEnd")
-                .map(arrow_is_directional)
-                .unwrap_or(false);
-            let tail_arrow = stroke
-                .get("tailEnd")
-                .map(arrow_is_directional)
-                .unwrap_or(false);
-
+            let Some(shape) = shape(&elements[*idx]) else {
+                continue;
+            };
+            let head_end = shape
+                .stroke
+                .as_ref()
+                .and_then(|stroke| stroke.head_end.as_ref());
+            let tail_end = shape
+                .stroke
+                .as_ref()
+                .and_then(|stroke| stroke.tail_end.as_ref());
+            let head_arrow = head_end.is_some_and(arrow_is_directional);
+            let tail_arrow = tail_end.is_some_and(arrow_is_directional);
             let endpoints = line_endpoints(bbox);
             let head_target = nearest_shape_to_point(endpoints[0].1, &bboxes, *idx, tol);
             let tail_target = nearest_shape_to_point(endpoints[1].1, &bboxes, *idx, tol);
-
-            // Direction:
-            //   tailEnd arrow only      → "headShape -> tailShape"
-            //   headEnd arrow only      → "tailShape -> headShape"
-            //   both                    → "bidirectional"
-            //   neither                 → undirected
             let direction = match (head_arrow, tail_arrow) {
                 (false, true) => Some("forward"),
                 (true, false) => Some("reverse"),
                 (true, true) => Some("bidirectional"),
                 (false, false) => None,
             };
-
-            // Skip when neither endpoint resolved — pure floating connector.
             if head_target.is_none() && tail_target.is_none() {
                 continue;
             }
-
             relations.push(serde_json::json!({
                 "kind": "connection",
-                "connector": {
-                    "shapeIndex": *idx,
-                    "geometry": element["geometry"],
-                    "headEnd": stroke.get("headEnd").cloned().unwrap_or(Value::Null),
-                    "tailEnd": stroke.get("tailEnd").cloned().unwrap_or(Value::Null),
-                },
-                "head": head_target.map(|(i, side)| serde_json::json!({
-                    "shapeIndex": i, "side": side,
-                })).unwrap_or(Value::Null),
-                "tail": tail_target.map(|(i, side)| serde_json::json!({
-                    "shapeIndex": i, "side": side,
-                })).unwrap_or(Value::Null),
-                "direction": direction,
-                "confidence": "inferred",
+                "connector": { "shapeIndex": *idx, "geometry": shape.geometry,
+                    "headEnd": head_end, "tailEnd": tail_end },
+                "head": head_target.map(|(i, side)| serde_json::json!({ "shapeIndex": i, "side": side })).unwrap_or(Value::Null),
+                "tail": tail_target.map(|(i, side)| serde_json::json!({ "shapeIndex": i, "side": side })).unwrap_or(Value::Null),
+                "direction": direction, "confidence": "inferred",
             }));
         }
-
         // ── Contains (real shapes only — connectors don't "contain") ──────
         for i in 0..bboxes.len() {
             let (idx_outer, outer_bb, outer_conn) = bboxes[i];

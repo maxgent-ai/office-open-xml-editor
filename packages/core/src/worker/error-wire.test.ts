@@ -22,6 +22,22 @@ const USAGE = {
 };
 
 describe('worker error wire', () => {
+  it('preserves DOCX numbering rejection as a typed error across the worker', () => {
+    for (const reason of ['cannot-open:whitespace', 'cannot-open:non-decimal',
+      'repair-required:level-definition']) {
+      const input = new Error(`OOXML_DOCX_ILVL:${reason}`);
+      const result = deserializeWorkerError(structuredClone(serializeWorkerError(input)));
+      expect(result).toBeInstanceOf(OoxmlError);
+      expect((result as OoxmlError).code).toBe('invalid-numbering');
+    }
+    for (const reason of ['unexpected', 'cannot-open:empty']) {
+      const unrelated = deserializeWorkerError(serializeWorkerError(
+        new Error(`OOXML_DOCX_ILVL:${reason}`),
+      ));
+      expect(unrelated).not.toBeInstanceOf(OoxmlError);
+    }
+  });
+
   const rustError =
     'OOXML_RESOURCE_LIMIT:{"code":"ooxml-resource-limit","details":{"stage":"decompression","violation":{"format":"xlsx","operation":"parse","resource":"archive-entry","part":"xl/worksheets/sheet1.xml","metric":"actual-inflated-bytes","limit":5,"observed":6,"configurable":true,"usage":{"archiveEntryCount":1,"declaredInflatedBytes":6,"largestInflatedEntryBytes":6,"distinctInflatedBytes":6,"operationInflatedBytes":6}}}}';
 
@@ -459,6 +475,8 @@ describe('worker error wire', () => {
     'preserves %s across the worker wire',
     (original) => {
       const error = deserializeWorkerError(serializeWorkerError(original));
+      // The input is a test-owned built-in error, so its constructor is the
+      // independent expected class for this round-trip assertion.
       expect(error).toBeInstanceOf(original.constructor);
       expect(error.message).toBe(original.message);
     },

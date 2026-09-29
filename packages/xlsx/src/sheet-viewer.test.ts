@@ -268,7 +268,7 @@ describe('XlsxSheetViewer canvas mount', () => {
       currentWorksheet: Worksheet;
       canvasArea: FakeEl;
       scrollHost: FakeEl;
-      selectionOverlay: FakeEl;
+      overlayHost: { selection: FakeEl };
     } }).engine;
     engine.currentWorksheet = worksheetWithChart('Objects');
     engine.canvasArea.clientWidth = 800;
@@ -283,7 +283,7 @@ describe('XlsxSheetViewer canvas mount', () => {
     await expect(contexts[0]).resolves.toMatchObject({
       format: 'xlsx', kind: 'element', elementType: 'chart',
     });
-    expect(engine.selectionOverlay.querySelector('[data-xlsx-element-context-outline]')).not.toBeNull();
+    expect(engine.overlayHost.selection.querySelector('[data-xlsx-element-context-outline]')).not.toBeNull();
     viewer.destroy();
   });
 
@@ -469,7 +469,7 @@ describe('XlsxSheetViewer canvas mount', () => {
       currentWorksheet: Worksheet;
       canvasArea: FakeEl;
       scrollHost: FakeEl;
-      selectionOverlay: FakeEl;
+      overlayHost: { selection: FakeEl };
     } }).engine;
     engine.currentWorksheet = worksheetWithChart('Objects');
     engine.canvasArea.clientWidth = 800;
@@ -497,7 +497,7 @@ describe('XlsxSheetViewer canvas mount', () => {
       currentWorksheet: Worksheet;
       canvasArea: FakeEl;
       scrollHost: FakeEl;
-      selectionOverlay: FakeEl;
+      overlayHost: { selection: FakeEl };
     } }).engine;
     engine.currentWorksheet = worksheetWithChart('Objects');
     engine.canvasArea.clientWidth = 800;
@@ -512,12 +512,12 @@ describe('XlsxSheetViewer canvas mount', () => {
       format: 'xlsx', kind: 'element', sheetName: 'Objects', elementType: 'chart',
       text: expect.stringContaining('Revenue'),
     });
-    expect(engine.selectionOverlay.querySelector('[data-xlsx-element-context-outline]')).not.toBeNull();
+    expect(engine.overlayHost.selection.querySelector('[data-xlsx-element-context-outline]')).not.toBeNull();
 
     engine.scrollHost.dispatch('pointerdown', pointerEvent({ clientX: 700, clientY: 500 }));
     engine.scrollHost.dispatch('pointerup', pointerEvent({ clientX: 700, clientY: 500 }));
     expect(viewer.getSelectionContext()?.kind).toBe('range');
-    expect(engine.selectionOverlay.querySelector('[data-xlsx-element-context-outline]')).toBeNull();
+    expect(engine.overlayHost.selection.querySelector('[data-xlsx-element-context-outline]')).toBeNull();
     viewer.destroy();
   });
 
@@ -1540,6 +1540,9 @@ describe('XlsxSheetViewer canvas mount', () => {
       sheetNames: ['Sheet1', 'Sheet2'],
       tabColors: {} as Record<number, string>,
       getWorksheet,
+      acquireWorksheetLease: async (index: number) => ({
+        worksheet: await getWorksheet(index), release: () => undefined,
+      }),
       isHidden: () => false,
       destroy,
     } as unknown as XlsxWorkbook;
@@ -1594,6 +1597,7 @@ describe('XlsxSheetViewer canvas mount', () => {
       sheetNames: ['Shared'],
       tabColors: {} as Record<number, string>,
       getWorksheet: vi.fn().mockResolvedValue(source),
+      acquireWorksheetLease: async () => ({ worksheet: source, release: () => undefined }),
       isHidden: () => false,
       destroy: vi.fn(),
     } as unknown as XlsxWorkbook;

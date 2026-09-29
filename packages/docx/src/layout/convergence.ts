@@ -71,13 +71,21 @@ export function convergeExactState<T>(
  * event-loop turns without the convergence policy — adjacent equality is a
  * fixed point, a non-adjacent repeat is a cycle, exhaustion fails closed —
  * being restated anywhere.
+ *
+ * `carry`, when supplied, projects each non-final value to the data the next
+ * pass actually reads, and `step` receives that projection instead of the
+ * value. Only the returned (fixed-point) value is ever needed whole, so a
+ * caller whose passes build large graphs (a whole document layout) can let
+ * the previous pass's graph die while the next one is built: this frame keeps
+ * the carried projection, never the prior value itself.
  */
-export function* convergeExactStateSteps<T, Y>(
+export function* convergeExactStateSteps<T, Y, C = T>(
   options: Omit<ExactConvergenceOptions<T>, 'step'> & {
-    readonly step: (previous: T | null, pass: number) => Generator<Y, T, void>;
+    readonly step: (previous: C | null, pass: number) => Generator<Y, T, void>;
+    readonly carry?: (value: T) => C;
   },
 ): Generator<Y, Readonly<{ value: T; passes: number }>, void> {
-  const { seedState, step, stateOf, limit } = options;
+  const { seedState, step, stateOf, limit, carry } = options;
   const minimumLimit = seedState === undefined ? 2 : 1;
   if (!Number.isInteger(limit) || limit < minimumLimit) {
     throw new RangeError(
@@ -86,11 +94,12 @@ export function* convergeExactStateSteps<T, Y>(
   }
   const states: string[] = seedState === undefined ? [] : [seedState];
   const seen = new Set(states);
-  let previous: T | null = null;
+  let previous: C | null = null;
+  // One function-scoped slot, cleared before the next pass starts, so a
+  // suspended frame never holds the prior value beyond its carried projection.
+  let value: T | null = null;
   for (let pass = 1; pass <= limit; pass += 1) {
-    // Annotated because `yield*` in a generator whose own return type mentions
-    // T cannot be inferred without circularity (TS7022).
-    const value: T = yield* step(previous, pass);
+    value = yield* step(previous, pass);
     const state = stateOf(value);
     const priorState = states.at(-1);
     states.push(state);
@@ -104,7 +113,8 @@ export function* convergeExactStateSteps<T, Y>(
     if (pass === limit) {
       throw new ExactConvergenceError('limit', states, pass);
     }
-    previous = value;
+    previous = carry ? carry(value) : value as unknown as C;
+    value = null;
   }
   throw new ExactConvergenceError('limit', states, limit);
 }
@@ -124,20 +134,33 @@ export function convergeLayout<T extends LayoutIteration>(
   return next.value;
 }
 
-/** {@link convergeLayout} whose step is suspendable; yields are forwarded. */
-export function* convergeLayoutSteps<T extends LayoutIteration, Y>(
+/**
+ * {@link convergeLayout} whose step is suspendable; yields are forwarded.
+ *
+ * With `carry`, `step` receives `carry(iteration)` rather than the iteration,
+ * and neither the seed nor any superseded iteration stays referenced by this
+ * frame while a later pass builds (see {@link convergeExactStateSteps}).
+ */
+export function* convergeLayoutSteps<T extends LayoutIteration, Y, C = T>(
   seed: T,
-  step: (iteration: T) => Generator<Y, T, void>,
+  step: (carried: C) => Generator<Y, T, void>,
   limit: number,
+  carry?: (iteration: T) => C,
 ): Generator<Y, T, void> {
   if (!Number.isInteger(limit) || limit < 1) {
     throw new LayoutInvariantError('NON_CONVERGENCE', 'limit must be a positive integer');
   }
+  const seedState = seed.fingerprint;
+  const seedCarried = carry ? carry(seed) : seed as unknown as C;
+  // Parameters are frame slots too: drop the caller's seed so a carried
+  // projection is all this suspended generator retains of it.
+  seed = undefined as unknown as T;
   try {
-    return (yield* convergeExactStateSteps<T, Y>({
-      seedState: seed.fingerprint,
-      step: function* layoutStep(previous) { return yield* step(previous ?? seed); },
+    return (yield* convergeExactStateSteps<T, Y, C>({
+      seedState,
+      step: function* layoutStep(previous) { return yield* step(previous ?? seedCarried); },
       stateOf: (iteration) => iteration.fingerprint,
+      ...(carry ? { carry } : {}),
       limit,
     })).value;
   } catch (error) {

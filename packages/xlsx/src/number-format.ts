@@ -1,10 +1,12 @@
 import {
-  excelSerialToUtcDate,
+  formatExcelDateTime,
   formatLocalizedExcelShortDate,
+  isDateFormatSection,
   roundDecimalHalfUp,
+  splitFormatSections,
+  textSectionIndex,
 } from '@silurus/ooxml-core';
 import type { Cell, CellValue, Styles } from './types.js';
-import { todaySerial, nowSerial } from './formula.js';
 
 function cellValueText(value: CellValue): string {
   switch (value.type) {
@@ -72,20 +74,15 @@ export function formatCellValueWithColor(
     return { text: effectiveFmt ? applyTextSection(text, effectiveFmt) : text };
   }
 
-  // Volatile builtins: TODAY()/NOW() cells have a cached `<v>` from the last
-  // save, which the viewer would otherwise show as a stale date. Recompute
-  // them against the current system clock at render time.
-  const recomputed = recomputeVolatile(cell.formula);
-  const num = recomputed ?? cell.value.number;
-  // `todaySerial`/`nowSerial` always emit a 1900-system serial (they encode
-  // "today" as a calendar concept, independent of the workbook's date system),
-  // so a recomputed volatile must be formatted against the 1900 epoch even in a
-  // 1904 workbook. Formatting a 1900-system serial against the (later) 1904
-  // base date would push it 1462 days into the future — i.e. render it 1462
-  // days late. Stored cell values, by contrast, use the workbook's own date
-  // system.
-  const effectiveDate1904 = recomputed !== null ? false : date1904;
-  return applyFormat(num, effectiveFmtId, effectiveFmt, effectiveDate1904);
+  // Library policy: cell values are rendered from the cached `<v>` only
+  // (ECMA-376 §18.3.1.96). Cell formulas (`<f>`, §18.3.1.40) are never
+  // calculated, including volatile functions such as TODAY()/NOW(). Replacing
+  // one volatile cell with the current time would leave every cell derived from
+  // it at its cached value, so the render would be internally inconsistent; the
+  // cached values the producing application saved together are authoritative.
+  // A formula cell without a cached value is rendered like any other empty
+  // cell, regardless of which function it calls.
+  return applyFormat(cell.value.number, effectiveFmtId, effectiveFmt, date1904);
 }
 
 /**
@@ -101,17 +98,11 @@ export function formatCellValueWithColor(
  *     `[...]` metadata and `_`/`*` pad pairs follow the numeric conventions.
  */
 function applyTextSection(text: string, formatCode: string): string {
-  const sections = splitSections(formatCode);
-  let section: string;
-  if (sections.length >= 4) {
-    section = sections[3];
-  } else {
-    const last = sections[sections.length - 1];
-    // A text section is one that contains an `@` placeholder. Without one, the
-    // format has no text section and text is unaffected.
-    if (!last.includes('@')) return text;
-    section = last;
-  }
+  const sections = splitFormatSections(formatCode);
+  const textIndex = textSectionIndex(sections);
+  // Without a text section, text is unaffected by the format.
+  if (textIndex < 0) return text;
+  const section = sections[textIndex];
   if (section === '') return '';
   let out = '';
   let i = 0;
@@ -138,16 +129,6 @@ function applyTextSection(text: string, formatCode: string): string {
     }
   }
   return out;
-}
-
-/** If `formula` is a volatile builtin (TODAY/NOW), return the current Excel
- *  serial. Tolerates surrounding whitespace and an optional leading `=`. */
-function recomputeVolatile(formula: string | undefined): number | null {
-  if (!formula) return null;
-  const f = formula.trim().replace(/^=/, '').toUpperCase().replace(/\s+/g, '');
-  if (f === 'TODAY()') return todaySerial();
-  if (f === 'NOW()') return nowSerial();
-  return null;
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -185,241 +166,6 @@ const BUILTIN_DATE_FMT: Record<number, string> = {
   57: '[$-411]ge.m.d',
   58: '[$-411]ggge"年"m"月"d"日"',
 };
-
-const MONTH_NAMES = [
-  'January', 'February', 'March', 'April', 'May', 'June',
-  'July', 'August', 'September', 'October', 'November', 'December',
-];
-const WEEKDAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
-/** Japanese short weekday names (aaa format code, e.g. "水"). */
-const JP_WEEKDAY_SHORT = ['日', '月', '火', '水', '木', '金', '土'];
-/** Japanese long weekday names (aaaa format code, e.g. "水曜日"). */
-const JP_WEEKDAY_LONG = ['日曜日', '月曜日', '火曜日', '水曜日', '木曜日', '金曜日', '土曜日'];
-
-/** Japanese imperial eras, newest-first. First entry whose `start` is
- *  ≤ the target date wins (ECMA-376 §18.8.30 — g/gg/ggg and e/ee codes). */
-const JP_ERAS: Array<{ start: Date; abbr: string; short: string; long: string }> = [
-  { start: new Date(Date.UTC(2019, 4,  1)), abbr: 'R', short: '令', long: '令和' },
-  { start: new Date(Date.UTC(1989, 0,  8)), abbr: 'H', short: '平', long: '平成' },
-  { start: new Date(Date.UTC(1926, 11, 25)), abbr: 'S', short: '昭', long: '昭和' },
-  { start: new Date(Date.UTC(1912, 6,  30)), abbr: 'T', short: '大', long: '大正' },
-  { start: new Date(Date.UTC(1868, 0,  25)), abbr: 'M', short: '明', long: '明治' },
-];
-
-function resolveJpEra(date: Date): { abbr: string; short: string; long: string; year: number } {
-  for (const era of JP_ERAS) {
-    if (date.getTime() >= era.start.getTime()) {
-      return {
-        abbr: era.abbr,
-        short: era.short,
-        long: era.long,
-        year: date.getUTCFullYear() - era.start.getUTCFullYear() + 1,
-      };
-    }
-  }
-  // Pre-Meiji: fall back to Gregorian year, keep Meiji names as a best effort.
-  const last = JP_ERAS[JP_ERAS.length - 1];
-  return { abbr: last.abbr, short: last.short, long: last.long, year: date.getUTCFullYear() };
-}
-
-/**
- * Format an Excel date serial using an ECMA-376 format code.
- * Supports: y/yy/yyy/yyyy, m/mm/mmm/mmmm/mmmmm, d/dd/ddd/dddd,
- *           h/hh, m/mm (minutes when after h), s/ss, AM/PM, A/P,
- *           quoted literals, bracket escapes, _ padding, * fill.
- *
- * `date1904` selects the date system (`<workbookPr date1904>`, §18.2.28). The
- * serial → calendar-date conversion is delegated to the shared core
- * `excelSerialToUtcDate` (§18.17.4.1), which carries the 1900 Lotus
- * leap-year-bug compat and the 1904 epoch. It defaults to false so 1900-system
- * workbooks are unchanged (apart from the serial ≤ 59 leap-bug compat, which is
- * now correct in both systems).
- */
-function formatExcelDateCode(serial: number, fmtCode: string, date1904 = false): string {
-  const date = excelSerialToUtcDate(serial, date1904);
-  const yr = date.getUTCFullYear();
-  const mo = date.getUTCMonth() + 1;   // 1-12
-  const dy = date.getUTCDate();
-  const wd = date.getUTCDay();          // 0=Sun
-  const hr = date.getUTCHours();
-  const mi = date.getUTCMinutes();
-  const sc = date.getUTCSeconds();
-
-  // Take the first section (positive / no-sign section)
-  const section = fmtCode.split(';')[0];
-  const hasAmPm = /am\/pm|a\/p/i.test(section);
-  let era: ReturnType<typeof resolveJpEra> | null = null;
-  const getEra = (): ReturnType<typeof resolveJpEra> => era ?? (era = resolveJpEra(date));
-
-  let result = '';
-  let i = 0;
-  let prevWasHour = false;
-
-  while (i < section.length) {
-    const ch = section[i];
-
-    if (ch === '"') {
-      // Quoted string literal
-      i++;
-      while (i < section.length && section[i] !== '"') result += section[i++];
-      if (i < section.length) i++;
-      prevWasHour = false;
-
-    } else if (ch === '[') {
-      // ECMA-376 §18.8.30: `[h]` / `[m]` / `[s]` are elapsed-time tokens that
-      // suppress the h < 24 / m < 60 / s < 60 wrap-around and instead render
-      // the full duration. Any other bracket content (locale IDs, colours,
-      // conditions) is metadata and skipped.
-      const end = section.indexOf(']', i);
-      const inner = end > i ? section.slice(i + 1, end) : '';
-      const elapsed = inner.match(/^([hms])\1*$/i);
-      if (elapsed) {
-        const kind = elapsed[1].toLowerCase();
-        const sign = serial < 0 ? '-' : '';
-        const absSec = Math.floor(Math.abs(serial) * 86400);
-        let v: number;
-        if      (kind === 'h') v = Math.floor(absSec / 3600);
-        else if (kind === 'm') v = Math.floor(absSec / 60);
-        else                   v = absSec;
-        const padded = inner.length >= 2 ? String(v).padStart(inner.length, '0') : String(v);
-        result += sign + padded;
-        i = end + 1;
-        prevWasHour = kind === 'h';
-      } else {
-        while (i < section.length && section[i] !== ']') i++;
-        if (i < section.length) i++;
-      }
-
-    } else if (ch === '_') {
-      i += 2; // _ followed by a padding character — skip both
-
-    } else if (ch === '*') {
-      i += 2; // * followed by fill character — skip both
-
-    } else if (ch === '\\') {
-      if (i + 1 < section.length) result += section[i + 1];
-      i += 2;
-      prevWasHour = false;
-
-    } else if (ch === 'y' || ch === 'Y') {
-      let n = 0;
-      while (i < section.length && section[i].toLowerCase() === 'y') { n++; i++; }
-      result += n <= 2 ? String(yr).slice(-2) : String(yr).padStart(4, '0');
-      prevWasHour = false;
-
-    } else if (ch === 'm' || ch === 'M') {
-      let n = 0;
-      while (i < section.length && section[i].toLowerCase() === 'm') { n++; i++; }
-      // Determine month vs minutes:
-      //   minutes when immediately after h/hh, OR immediately before :s/:ss
-      const rest = section.slice(i).replace(/\[[^\]]*\]/g, '');
-      const isMinutes = prevWasHour || /^:s/i.test(rest);
-      if (isMinutes) {
-        result += n >= 2 ? String(mi).padStart(2, '0') : String(mi);
-      } else {
-        if      (n === 1) result += String(mo);
-        else if (n === 2) result += String(mo).padStart(2, '0');
-        else if (n === 3) result += MONTH_NAMES[mo - 1].slice(0, 3);
-        else if (n === 4) result += MONTH_NAMES[mo - 1];
-        else              result += MONTH_NAMES[mo - 1][0]; // mmmmm = first letter
-      }
-      prevWasHour = false;
-
-    } else if (ch === 'd' || ch === 'D') {
-      let n = 0;
-      while (i < section.length && section[i].toLowerCase() === 'd') { n++; i++; }
-      if      (n === 1) result += String(dy);
-      else if (n === 2) result += String(dy).padStart(2, '0');
-      else if (n === 3) result += WEEKDAY_NAMES[wd].slice(0, 3);
-      else              result += WEEKDAY_NAMES[wd];
-      prevWasHour = false;
-
-    } else if (ch === 'h' || ch === 'H') {
-      let n = 0;
-      while (i < section.length && section[i].toLowerCase() === 'h') { n++; i++; }
-      const h = hasAmPm ? (hr % 12 || 12) : hr;
-      result += n >= 2 ? String(h).padStart(2, '0') : String(h);
-      prevWasHour = true;
-
-    } else if (ch === 's' || ch === 'S') {
-      let n = 0;
-      while (i < section.length && section[i].toLowerCase() === 's') { n++; i++; }
-      result += n >= 2 ? String(sc).padStart(2, '0') : String(sc);
-      prevWasHour = false;
-
-    } else if (ch === 'g' || ch === 'G') {
-      // Japanese era name (ECMA-376 §18.8.30 ja locale):
-      //   g   → 'R' / 'H' / 'S' / 'T' / 'M'
-      //   gg  → '令' / '平' / '昭' / '大' / '明'
-      //   ggg → '令和' / '平成' / '昭和' / '大正' / '明治'
-      let n = 0;
-      while (i < section.length && section[i].toLowerCase() === 'g') { n++; i++; }
-      const e = getEra();
-      if      (n === 1) result += e.abbr;
-      else if (n === 2) result += e.short;
-      else              result += e.long;
-      prevWasHour = false;
-
-    } else if (ch === 'e' || ch === 'E') {
-      // Japanese era year: `e` → unpadded, `ee` → 2-digit zero-padded.
-      let n = 0;
-      while (i < section.length && section[i].toLowerCase() === 'e') { n++; i++; }
-      const y = getEra().year;
-      result += n >= 2 ? String(y).padStart(2, '0') : String(y);
-      prevWasHour = false;
-
-    } else if (ch === 'r' || ch === 'R') {
-      // Some Japanese Excel variants expose `r` / `rr` as era-year aliases.
-      let n = 0;
-      while (i < section.length && section[i].toLowerCase() === 'r') { n++; i++; }
-      const y = getEra().year;
-      result += n >= 2 ? String(y).padStart(2, '0') : String(y);
-      prevWasHour = false;
-
-    } else if (ch === 'A' || ch === 'a') {
-      const upper = section.slice(i).toUpperCase();
-      // Japanese weekday format codes (Excel ja locale). `aaaa` = "水曜日",
-      // `aaa` = "水". Checked before AM/PM because those are shorter matches
-      // and would otherwise swallow the leading 'a'.
-      if (upper.startsWith('AAAA')) {
-        result += JP_WEEKDAY_LONG[wd]; i += 4;
-      } else if (upper.startsWith('AAA')) {
-        result += JP_WEEKDAY_SHORT[wd]; i += 3;
-      } else if (upper.startsWith('AM/PM')) {
-        result += hr < 12 ? 'AM' : 'PM'; i += 5;
-      } else if (upper.startsWith('A/P')) {
-        result += hr < 12 ? 'A' : 'P'; i += 3;
-      } else {
-        result += ch; i++;
-      }
-      prevWasHour = false;
-
-    } else {
-      result += ch;
-      i++;
-      // Separators (:/-. space) don't reset the hour context for m/mm lookahead
-      if (ch !== ':' && ch !== '/' && ch !== '-' && ch !== '.' && ch !== ' ') {
-        prevWasHour = false;
-      }
-    }
-  }
-
-  return result;
-}
-
-/** Returns true if a custom formatCode is a date/time format. */
-function isDateFormatCode(code: string): boolean {
-  // Elapsed-time brackets `[h]`, `[m]`, `[s]` (ECMA-376 §18.8.30) are themselves
-  // time formats, so detect those *before* stripping bracket content below.
-  if (/\[[hms]+\]/i.test(code)) return true;
-  // Strip quoted literals and bracket content, then look for unambiguous date specifiers.
-  // 'y' = year, 'd' = day — both are unambiguous. 'm' alone is ambiguous (month or minutes).
-  const stripped = code.replace(/"[^"]*"/g, '').replace(/\[[^\]]*\]/g, '');
-  // y / d are unambiguous date specifiers. `aaa+` is the Japanese-locale
-  // weekday code and implies a date format even without y/d (e.g. the
-  // bare `aaa` custom format).
-  return /[yd]/i.test(stripped) || /a{3,}/i.test(stripped);
-}
 
 // Excel's General format does not round-trip the raw IEEE-754 double: the
 // display engine rounds to 11 significant digits (of the 15-17 significant
@@ -514,16 +260,13 @@ function applyFormat(num: number, numFmtId: number, formatCode: string | null, d
   }
   // Built-in date/time numFmtIds (ECMA-376 §18.8.30 table)
   const builtinFmt = BUILTIN_DATE_FMT[numFmtId];
-  if (builtinFmt) return { text: formatExcelDateCode(num, builtinFmt, date1904) };
+  if (builtinFmt) return { text: formatExcelDateTime(num, builtinFmt, date1904) };
   // ECMA-376 §18.8.30: "General" is the reserved General number format regardless
   // of numFmtId. LibreOffice writes a custom numFmt (id ≥ 164) with
   // formatCode="General"; tokenizing it as a literal pattern would render the
   // word "General" instead of the value (issue #358).
   if (formatCode && formatCode.trim().toLowerCase() === 'general') return { text: formatGeneralNumber(num) };
-  if (formatCode) {
-    if (isDateFormatCode(formatCode)) return { text: formatExcelDateCode(num, formatCode, date1904) };
-    return applyFormatCode(num, formatCode);
-  }
+  if (formatCode) return applyFormatCode(num, formatCode, date1904);
   switch (numFmtId) {
     // Built-in numeric numFmtIds without an explicit formatCode. Route the ones
     // that have a well-defined pattern (§18.8.30 p.1776 "All Languages" table)
@@ -594,40 +337,6 @@ interface ParsedSection {
   condition?: SectionCondition;
 }
 
-/**
- * Split a whole format code into its `;`-separated sections. `;` never appears
- * inside quotes, escapes or `[...]` in a valid code, but we scan structurally
- * so a stray one inside those never splits the section (defensive; matches how
- * Excel lexes).
- */
-function splitSections(code: string): string[] {
-  const out: string[] = [];
-  let cur = '';
-  let i = 0;
-  while (i < code.length) {
-    const ch = code[i];
-    if (ch === '"') {
-      cur += ch; i++;
-      while (i < code.length && code[i] !== '"') cur += code[i++];
-      if (i < code.length) cur += code[i++];
-    } else if (ch === '\\') {
-      cur += ch;
-      if (i + 1 < code.length) cur += code[i + 1];
-      i += 2;
-    } else if (ch === '[') {
-      cur += ch; i++;
-      while (i < code.length && code[i] !== ']') cur += code[i++];
-      if (i < code.length) cur += code[i++];
-    } else if (ch === ';') {
-      out.push(cur); cur = ''; i++;
-    } else {
-      cur += ch; i++;
-    }
-  }
-  out.push(cur);
-  return out;
-}
-
 /** Parse a section's leading `[...]` modifiers (colour, condition, currency).
  *  Currency `[$sym-LCID]` is left *in* the body (its `$sym` is emitted as a
  *  literal by the tokenizer); only colour and condition brackets are consumed
@@ -643,7 +352,8 @@ function parseSection(section: string): ParsedSection {
       body += ch; i++;
       while (i < section.length && section[i] !== '"') body += section[i++];
       if (i < section.length) body += section[i++];
-    } else if (ch === '\\') {
+    } else if (ch === '\\' || ch === '_' || ch === '*') {
+      // An escape or a pad / fill pair: its operand is never a delimiter.
       body += ch;
       if (i + 1 < section.length) body += section[i + 1];
       i += 2;
@@ -1096,9 +806,13 @@ function assembleFixed(lex: LexedSection, intText: string, fracText: string, exp
  * per-section colour, and the numeric grammar. Returns the display string and
  * any section colour.
  */
-function applyFormatCode(num: number, formatCode: string): FormattedCell {
-  const rawSections = splitSections(formatCode);
-  const parsed = rawSections.map(parseSection);
+function applyFormatCode(num: number, formatCode: string, date1904 = false): FormattedCell {
+  const rawSections = splitFormatSections(formatCode);
+  // The text section never formats a number (§18.8.30): leave it out of the
+  // positional and conditional selection below.
+  const textIndex = textSectionIndex(rawSections);
+  const parsed = rawSections.filter((_, i) => i !== textIndex).map(parseSection);
+  if (parsed.length === 0) return { text: formatGeneralNumber(num) };
 
   // Conditional sections (§18.8.30 "Specify conditions"): if any section
   // carries a `[cond]`, section selection is condition-driven — the first
@@ -1146,6 +860,10 @@ function applyFormatCode(num: number, formatCode: string): FormattedCell {
     }
   }
 
-  const text = renderNumericSection(num, chosen.body, useMagnitude);
+  // Date/time is a property of the selected section (§18.8.30): `0.00;h:mm`
+  // formats a positive value as a number and only a negative one as a time.
+  const text = isDateFormatSection(chosen.body)
+    ? formatExcelDateTime(useMagnitude ? Math.abs(num) : num, chosen.body, date1904)
+    : renderNumericSection(num, chosen.body, useMagnitude);
   return chosen.color ? { text, color: chosen.color } : { text };
 }

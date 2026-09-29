@@ -28,11 +28,13 @@ export function drawUnderline(
   baseline: number,
   width: number,
   sizePx: number,
-  color: string,
+  color: string | CanvasGradient | CanvasPattern,
   style: string | undefined,
   dpr = 1,
+  authoredLineWidthPx?: number,
 ): void {
-  const baseLineW = Math.max(1, sizePx * 0.05);
+  const baseLineW = authoredLineWidthPx != null
+    ? Math.max(0, authoredLineWidthPx) : Math.max(1, sizePx * 0.05);
   // ST_TextUnderlineType (§20.1.10.82) has two distinct "heavy" spellings:
   // the bare `heavy` value itself, and the `*Heavy` suffix on the dotted/dash/
   // wavy families (`dottedHeavy`, `dashHeavy`, …). Both denote the same ~1.8×

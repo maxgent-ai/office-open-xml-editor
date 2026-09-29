@@ -77,7 +77,7 @@ describe('WasmRuntimeGenerationHost', () => {
       maxEntries: bigint | null,
     ) => GeneratedArchive;
 
-    const module = new WebAssembly.Module(readFileSync(new URL(
+    const wasmModule = new WebAssembly.Module(readFileSync(new URL(
       '../../xlsx/src/wasm/xlsx_parser_bg.wasm',
       import.meta.url,
     )));
@@ -86,7 +86,7 @@ describe('WasmRuntimeGenerationHost', () => {
     const detach = vi.spyOn(Archive.prototype, '__destroy_into_raw');
     const host = new WasmRuntimeGenerationHost<GeneratedArchive>(
       xlsxWasm as unknown as WasmModuleRuntime,
-      module,
+      wasmModule,
     );
     let recovered: import('@silurus/ooxml-core/internal/wasm-runtime-generation')
       .WasmArchiveHandle<GeneratedArchive> | undefined;

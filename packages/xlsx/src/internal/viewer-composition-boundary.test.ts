@@ -19,6 +19,20 @@ describe('XLSX viewer composition boundary', () => {
       'SheetRenderDispatcher',
       'CanvasSurface',
       'SheetOverlayHost',
+      'SheetViewEdits',
+      'OutlineGutter',
+      'SheetTabBar',
+      'ZoomControl',
+      'ValidationPanel',
+      'CommentPopup',
+      'HyperlinkDispatcher',
+      'FindAdapter',
+      'CopyController',
+      'SelectionInput',
+      'SelectionOverlay',
+      'SelectionNotifier',
+      'SelectionContextReader',
+      'ChromeTheme',
     ]) {
       expect(viewer.match(new RegExp(`new ${role}\\(`, 'g')), role).toHaveLength(1);
     }

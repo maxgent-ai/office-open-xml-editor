@@ -12,6 +12,7 @@
     import { math } from '@ooxml-test-math-renderer';
     import { threeD } from '@ooxml-test-three-d-renderer';
     import { regionMap } from '@ooxml-test-region-map-renderer';
+    import { chartEx } from '@ooxml-test-chart-ex-renderer';
 
     const params = new URLSearchParams(location.search);
     const name = params.get('pptx') ?? 'demo/sample-1';
@@ -32,7 +33,7 @@
         bmp.close();
       };
 
-      const renderers = { math, threeD, regionMap };
+      const renderers = { math, threeD, regionMap, chartEx };
       const main = await PptxPresentation.load(buf.slice(0), { useGoogleFonts: true, ...renderers });
       const wk = await PptxPresentation.load(buf.slice(0), { mode: 'worker', useGoogleFonts: true, ...renderers });
       const renderBoth = async (slideIndex) => {

@@ -1,6 +1,7 @@
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { join, parse, resolve, sep } from 'node:path';
 import { PNG } from 'pngjs';
 
 const SCHEMA_VERSION = 1;
@@ -8,23 +9,44 @@ const SCHEMA_VERSION = 1;
 // Bootstrap-only exception for running the current VRT harness against an old
 // renderer commit that predates the harness. No renderer/parser source is
 // allowed in this set. Future baselines should be clean and need no exception.
+// The package Vite configs are listed only because they hold the
+// `@ooxml-test-*` aliases through which the fixtures load optional renderers
+// (for example ChartEx); `harnessBootstrapDiffViolations` enforces that a
+// bootstrap diff there adds or removes nothing but such alias lines.
 const VRT_HARNESS_PATHS = new Set([
   'package.json',
   'packages/docx/package.json',
   'packages/docx/playwright.config.ts',
   'packages/docx/tests/visual/fixture.html',
+  'packages/docx/vite.config.ts',
   'packages/docx/tests/visual/stable-canvas-render.mjs',
   'packages/docx/tests/visual/visual.spec.ts',
   'packages/xlsx/package.json',
   'packages/xlsx/playwright.config.ts',
   'packages/xlsx/tests/visual/fixture.html',
+  'packages/xlsx/vite.config.ts',
   'packages/xlsx/tests/visual/visual.spec.ts',
   'packages/pptx/package.json',
   'packages/pptx/playwright.config.ts',
   'packages/pptx/tests/visual/fixture.html',
+  'packages/pptx/vite.config.ts',
   'packages/pptx/tests/visual/visual.spec.ts',
   'tests/visual/private-corpus.mjs',
 ]);
+
+const TEST_RENDERER_ALIAS_LINE =
+  /^[+-]\s*'@ooxml-test-[a-z0-9-]+': resolve\((?:__)?dirname, '\.\.\/\.\.\/src\/[a-z0-9-]+\.ts'\),$/;
+
+/** Lines of a `git diff -U0` for an allowlisted Vite config that are not a
+ * test-renderer alias addition/removal. Any such line makes the harness
+ * bootstrap unsafe, because the config also drives the package build. */
+export function harnessBootstrapDiffViolations(diff) {
+  return diff.split('\n').filter((line) =>
+    (line.startsWith('+') || line.startsWith('-'))
+    && !line.startsWith('+++')
+    && !line.startsWith('---')
+    && !TEST_RENDERER_ALIAS_LINE.test(line));
+}
 
 function gitRevision(revision) {
   return execFileSync('git', ['rev-parse', `${revision}^{commit}`], {
@@ -67,6 +89,24 @@ function baselineRevision(snapshot = false) {
           'private self-VRT snapshot requires a clean renderer checkout; changed paths: '
           + changed.join(', '),
         );
+      }
+      for (const path of changed.filter((changedPath) => changedPath.endsWith('vite.config.ts'))) {
+        // An untracked config has no HEAD version to diff against, so its
+        // whole content would escape the alias-only bound.
+        if (untracked.includes(path)) {
+          throw new Error(
+            `private self-VRT harness bootstrap cannot add an untracked ${path}`,
+          );
+        }
+        const violations = harnessBootstrapDiffViolations(execFileSync(
+          'git', ['diff', '-U0', 'HEAD', '--', path], { cwd: root, encoding: 'utf8' },
+        ));
+        if (violations.length > 0) {
+          throw new Error(
+            `private self-VRT harness bootstrap may only change test renderer aliases in ${path}: `
+            + violations.join(' | '),
+          );
+        }
       }
     }
   }
@@ -114,6 +154,37 @@ export function preparePrivateCorpus({ format, files, snapshot }) {
     writeFileSync(path, `${JSON.stringify(manifest, null, 2)}\n`);
   } else {
     assertExactManifest(readJson(path), manifest, path);
+  }
+}
+
+/** A prior candidate run may have rendered more pages than this one. Remove
+ * only this input's generated screenshots before capture, so downstream
+ * reviews cannot mistake stale page-N files for the current renderer output.
+ * Baselines and non-image evidence are never touched. */
+export function clearPrivateCandidateItemOutput({
+  stem,
+  itemKind,
+  outputRoot = 'tests/visual/screenshots/private-corpus',
+}) {
+  if (!/^(docx|xlsx|pptx)\/[^/\\]+$/.test(stem)
+    || ['.', '..'].includes(stem.split('/')[1])
+    || !/^(page|sheet|slide)$/.test(itemKind)) {
+    throw new Error('invalid private corpus output identity');
+  }
+  const directory = resolve(outputRoot, stem);
+  // Generated-output directories can be local symlinks. Never follow one when
+  // removing stale files: it may point into another worktree or dependencies.
+  let ancestor = parse(directory).root;
+  for (const component of directory.slice(ancestor.length).split(sep).filter(Boolean)) {
+    ancestor = join(ancestor, component);
+    if (existsSync(ancestor) && lstatSync(ancestor).isSymbolicLink()) {
+      throw new Error(`refusing to clear symlinked private corpus output: ${ancestor}`);
+    }
+  }
+  if (!existsSync(directory)) return;
+  const item = new RegExp(`^${itemKind}-\\d+\\.png$`);
+  for (const file of readdirSync(directory)) {
+    if (item.test(file)) unlinkSync(`${directory}/${file}`);
   }
 }
 

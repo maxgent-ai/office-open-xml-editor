@@ -266,11 +266,13 @@ describe('XlsxViewer comment UI contract', () => {
     const viewer = new XlsxViewer(makeContainer() as unknown as HTMLElement);
     const internals = viewer as unknown as {
       currentSheet: number;
-      renderCommentPopup(cell: { row: number; col: number }, comment: XlsxComment): Promise<void>;
+      comments: {
+        show(cell: { row: number; col: number }, comment: XlsxComment): Promise<void>;
+        popup: FakeEl;
+      };
       _cellRect(row: number, col: number): { x: number; y: number; w: number; h: number };
       canvasArea: FakeEl;
       scrollHost: FakeEl;
-      commentPopup: FakeEl;
       overlayHost: { commentStatus: FakeEl };
     };
     internals.currentSheet = 0;
@@ -291,43 +293,43 @@ describe('XlsxViewer comment UI contract', () => {
       }],
     };
 
-    await internals.renderCommentPopup({ row: 2, col: 2 }, comment);
+    await internals.comments.show({ row: 2, col: 2 }, comment);
 
     const styles = dom.head.querySelector('style[data-ooxml-comment-styles]');
     expect(styles?.textContent).toContain(':where(.ooxml-comment-card)');
     expect(styles?.textContent).toContain(':where(.ooxml-comment-marker)');
     expect(styles?.textContent).toContain('.ooxml-comment-card[data-active="true"]');
 
-    expect(internals.commentPopup.dataset.ooxmlCommentUi).toBe('popup');
-    expect(internals.commentPopup.getAttribute('role')).toBe('note');
-    expect(internals.commentPopup.getAttribute('aria-live')).toBeNull();
-    expect(internals.commentPopup.getAttribute('aria-hidden')).toBe('false');
+    expect(internals.comments.popup.dataset.ooxmlCommentUi).toBe('popup');
+    expect(internals.comments.popup.getAttribute('role')).toBe('note');
+    expect(internals.comments.popup.getAttribute('aria-live')).toBeNull();
+    expect(internals.comments.popup.getAttribute('aria-hidden')).toBe('false');
     expect(internals.overlayHost.commentStatus.getAttribute('role')).toBe('status');
     expect(internals.overlayHost.commentStatus.getAttribute('aria-live')).toBe('polite');
     expect(internals.overlayHost.commentStatus.getAttribute('aria-atomic')).toBe('true');
     expect(internals.overlayHost.commentStatus.textContent)
       .toBe('Comment on B2 by Ada: Review; 1 reply');
-    expect(internals.commentPopup.dataset.ooxmlCommentCard).toBe('');
-    expect(internals.commentPopup.getAttribute('class')).toBe('ooxml-comment-card');
-    expect(internals.commentPopup.style.cssText).toContain('--ooxml-comment-author-accent:');
-    expect(internals.commentPopup.style.cssText).not.toContain('background:');
-    expect(internals.commentPopup.style.cssText).not.toContain('border-radius:');
-    expect(internals.commentPopup.children[0]?.dataset.ooxmlCommentPart).toBe('comment');
-    expect(internals.commentPopup.children[1]?.dataset.ooxmlCommentPart).toBe('reply');
-    expect(internals.commentPopup.children[1]?.getAttribute('class')).toBe(
+    expect(internals.comments.popup.dataset.ooxmlCommentCard).toBe('');
+    expect(internals.comments.popup.getAttribute('class')).toBe('ooxml-comment-card');
+    expect(internals.comments.popup.style.cssText).toContain('--ooxml-comment-author-accent:');
+    expect(internals.comments.popup.style.cssText).not.toContain('background:');
+    expect(internals.comments.popup.style.cssText).not.toContain('border-radius:');
+    expect(internals.comments.popup.children[0]?.dataset.ooxmlCommentPart).toBe('comment');
+    expect(internals.comments.popup.children[1]?.dataset.ooxmlCommentPart).toBe('reply');
+    expect(internals.comments.popup.children[1]?.getAttribute('class')).toBe(
       'ooxml-comment-card__reply',
     );
-    expect(internals.commentPopup.children[2]?.dataset.ooxmlCommentPart).toBe('frame');
-    expect(internals.commentPopup.children[2]?.style.cssText).toBe('');
-    expect(internals.commentPopup.children[0]?.children[0]?.children[0]?.children[0]?.textContent).toBe('Ada');
-    expect(internals.commentPopup.children[0]?.children[0]?.children[0]?.children[1]?.dataset.ooxmlCommentPart).toBe('date');
-    expect(internals.commentPopup.children[0]?.children[0]?.children[0]?.children[1]?.getAttribute('class')).toBe('ooxml-comment-card__date');
-    expect(internals.commentPopup.children[1]?.children[0]?.children[0]?.children[0]?.textContent).toBe('Grace');
-    expect(internals.commentPopup.children[1]?.children[0]?.children[1]?.textContent).toBe('Done');
-    expect(internals.commentPopup.dataset.standalone).toBe('true');
-    expect(internals.commentPopup.style.pointerEvents).toBe('');
-    expect(internals.commentPopup.style.display).toBe('block');
-    await internals.renderCommentPopup({ row: 2, col: 2 }, comment);
+    expect(internals.comments.popup.children[2]?.dataset.ooxmlCommentPart).toBe('frame');
+    expect(internals.comments.popup.children[2]?.style.cssText).toBe('');
+    expect(internals.comments.popup.children[0]?.children[0]?.children[0]?.children[0]?.textContent).toBe('Ada');
+    expect(internals.comments.popup.children[0]?.children[0]?.children[0]?.children[1]?.dataset.ooxmlCommentPart).toBe('date');
+    expect(internals.comments.popup.children[0]?.children[0]?.children[0]?.children[1]?.getAttribute('class')).toBe('ooxml-comment-card__date');
+    expect(internals.comments.popup.children[1]?.children[0]?.children[0]?.children[0]?.textContent).toBe('Grace');
+    expect(internals.comments.popup.children[1]?.children[0]?.children[1]?.textContent).toBe('Done');
+    expect(internals.comments.popup.dataset.standalone).toBe('true');
+    expect(internals.comments.popup.style.pointerEvents).toBe('');
+    expect(internals.comments.popup.style.display).toBe('block');
+    await internals.comments.show({ row: 2, col: 2 }, comment);
     expect(dom.head.children.filter((child) =>
       child.dataset.ooxmlCommentStyles !== undefined)).toHaveLength(1);
     viewer.destroy();
@@ -339,17 +341,16 @@ describe('XlsxViewer comment UI contract', () => {
     const comment: XlsxComment = { cellRef: 'B2', author: 'Ada', text: 'Keyboard review' };
     const internals = viewer as unknown as {
       currentWorksheet: Worksheet;
-      commentMap: Map<string, XlsxComment>;
+      comments: { commentMap: Map<string, XlsxComment>; popup: FakeEl };
       canvasArea: FakeEl;
       scrollHost: FakeEl;
-      commentPopup: FakeEl;
       overlayHost: { commentStatus: FakeEl };
     };
     internals.currentWorksheet = {
       name: 'Sheet 1', rows: [], colWidths: {}, rowHeights: {},
       defaultColWidth: 64, defaultRowHeight: 20, mergeCells: [],
     } as unknown as Worksheet;
-    internals.commentMap = new Map([['2:2', comment]]);
+    internals.comments.commentMap = new Map([['2:2', comment]]);
     internals.canvasArea.clientWidth = 800;
     internals.canvasArea.clientHeight = 600;
     expect(internals.scrollHost.getAttribute('role')).toBe('region');
@@ -375,10 +376,10 @@ describe('XlsxViewer comment UI contract', () => {
 
     expect(enter.preventDefault).toHaveBeenCalledOnce();
     await vi.waitFor(() => {
-      expect(internals.commentPopup.children[0]?.children[0]?.children[1]?.textContent)
+      expect(internals.comments.popup.children[0]?.children[0]?.children[1]?.textContent)
         .toBe('Keyboard review');
     });
-    expect(internals.commentPopup.getAttribute('aria-hidden')).toBe('false');
+    expect(internals.comments.popup.getAttribute('aria-hidden')).toBe('false');
     expect(internals.overlayHost.commentStatus.textContent)
       .toBe('Comment on B2 by Ada: Keyboard review');
     viewer.destroy();

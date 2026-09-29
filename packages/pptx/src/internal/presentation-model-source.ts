@@ -1,0 +1,185 @@
+import {
+  resolveCjkFallback,
+  preloadGoogleFonts,
+  workerRendererDescriptors,
+  type AdmittedModelSourceLoad,
+  type CjkLang,
+} from '@silurus/ooxml-core';
+import {
+  disposeRejectedLoad,
+  normalizeLoadResourceOptions,
+  OoxmlResourceMetricsSession,
+  type NormalizedOoxmlResourcePolicy,
+  type WorkerRendererDescriptors,
+} from '@silurus/ooxml-core/worker';
+import { selectModelSource, beginModelSourceLoad } from '@silurus/ooxml-core/internal/model-source';
+import { excludeEmbeddedFontFamilies } from '../embedded-fonts.js';
+import { PPTX_GOOGLE_FONTS } from '../google-fonts.js';
+import { PptxPresentation, type LoadOptions } from '../presentation.js';
+
+type MutablePresentation = {
+  _metrics: OoxmlResourceMetricsSession;
+  _cjkFallback: CjkLang;
+  _math: LoadOptions['math'];
+  _threeD: LoadOptions['threeD'];
+  _regionMap: LoadOptions['regionMap'];
+  _chartEx: LoadOptions['chartEx'];
+  _tiff: LoadOptions['tiff'];
+  _googleSubstitutes: boolean;
+  _preflight: { fontPreloadNames: string[] } | null;
+  _embeddedFontAliases: ReadonlyMap<string, string>;
+  _googleFontFaces: FontFace[];
+  _parse: (
+    buffer: ArrayBuffer,
+    resourcePolicy: NormalizedOoxmlResourcePolicy,
+    useGoogleFonts: boolean,
+    timeoutMs: number | undefined,
+    onUsage: (usage: import('@silurus/ooxml-core').OoxmlResourceUsageSnapshot) => void,
+    renderers: WorkerRendererDescriptors | undefined,
+    progressive?: unknown,
+  ) => Promise<void>;
+};
+
+/** All source admission, wire decoration and cleanup live behind opt-in import. */
+export async function loadPptxModelSource(
+  input: string | ArrayBuffer,
+  opts: LoadOptions,
+): Promise<PptxPresentation> {
+  const mode = opts.mode ?? 'main';
+  const resourceOptions = normalizeLoadResourceOptions(opts);
+  const metrics = new OoxmlResourceMetricsSession({
+    enabled: true, format: 'pptx', mode, policy: resourceOptions.policy,
+    onMetrics: resourceOptions.onResourceMetrics, emitToConsole: resourceOptions.debug,
+  });
+  try {
+    if (mode === 'worker' && (typeof Worker === 'undefined' || typeof OffscreenCanvas === 'undefined')) {
+      throw new Error("mode: 'worker' requires Worker and OffscreenCanvas support");
+    }
+    let buffer: ArrayBuffer;
+    if (typeof input === 'string') {
+      const response = await fetch(input);
+      if (!response.ok) throw new Error(`Failed to fetch: ${response.status} ${response.statusText}`);
+      buffer = await response.arrayBuffer();
+    } else {
+      buffer = input;
+    }
+    const selected = selectModelSource(opts.modelSources, 'pptx', new Uint8Array(buffer));
+    if (!selected) return PptxPresentation.load(buffer, { ...opts, modelSources: undefined });
+    const load = beginModelSourceLoad(selected, 'pptx');
+    try {
+      metrics.setSourceBytes(buffer.byteLength);
+      metrics.checkpoint('container ready');
+      const worker = mode === 'worker'
+        ? (await import('../render-worker-source-host.js')).createRenderWorker()
+        : new (await import('../worker-source.ts?worker&inline')).default();
+      const wiredWorker = sourceWorker(worker, load);
+      const renderers = mode === 'worker' ? workerRendererDescriptors(opts) : undefined;
+      let presentation: PptxPresentation | undefined;
+      try {
+        // TypeScript's private constructor is compile-time only. This friend
+        // module owns source setup; the returned object remains the public class.
+        const Constructor = PptxPresentation as unknown as new (
+          worker: Worker, mode: 'main' | 'worker', wasmUrl?: string | URL,
+        ) => PptxPresentation;
+        presentation = new Constructor(wiredWorker, mode, opts.wasmUrl);
+        const state = presentation as unknown as MutablePresentation;
+        state._metrics = metrics;
+        state._cjkFallback = resolveCjkFallback(opts.cjkFallback);
+        state._math = mode === 'worker' ? undefined : opts.math;
+        state._threeD = mode === 'worker' ? undefined : opts.threeD;
+        state._regionMap = mode === 'worker' ? undefined : opts.regionMap;
+        state._chartEx = mode === 'worker' ? undefined : opts.chartEx;
+        state._tiff = mode === 'worker' ? undefined : opts.tiff;
+        state._googleSubstitutes = !!opts.useGoogleFonts;
+        warnUnserializableRenderers(opts, mode, renderers);
+        const progressive = opts.progressiveLayout ? {
+          onProgress: opts.onLayoutProgress,
+          onPartial: opts.onLayoutPartial,
+          onComplete: opts.onLayoutComplete,
+          firstPublication: deferred<void>(),
+          published: false, deferred: false, settled: false,
+        } : undefined;
+        await state._parse(
+          buffer, resourceOptions.policy, !!opts.useGoogleFonts,
+          opts.workerTimeoutMs, (usage) => metrics.observeUsage(usage),
+          renderers, progressive,
+        );
+        metrics.checkpoint('presentation preflight ready');
+        if (mode === 'main' && opts.useGoogleFonts && state._preflight && !progressive) {
+          state._googleFontFaces = await preloadGoogleFonts(
+            excludeEmbeddedFontFamilies(state._preflight.fontPreloadNames, state._embeddedFontAliases),
+            PPTX_GOOGLE_FONTS,
+          );
+        }
+        metrics.succeed({ slides: presentation.slideCount });
+        load.release();
+        return presentation;
+      } catch (error) {
+        const rejected = presentation;
+        disposeRejectedLoad(worker, rejected ? () => rejected.destroy() : undefined);
+        throw error;
+      }
+    } finally {
+      load.release();
+    }
+  } catch (error) {
+    metrics.fail(error);
+    throw error;
+  }
+}
+
+function sourceWorker(worker: Worker, load: AdmittedModelSourceLoad): Worker {
+  const sourceOwnerUrl = new URL(
+    import.meta.env.DEV ? './worker-presentation-source.ts' : './pptx-source-worker.mjs',
+    import.meta.url,
+  ).href;
+  return new Proxy(worker, {
+    get(target, key) {
+      if (key === 'postMessage') return (message: unknown, transfer?: Transferable[]) => {
+        if (typeof message === 'object' && message !== null) {
+          const wire = message as { kind?: string };
+          if (wire.kind === 'init') return;
+          if (wire.kind === 'parse') {
+            target.postMessage({ ...wire, source: load.module, sourceOwnerUrl,
+              ...(load.transfer.length ? { sourceTransfer: load.transfer } : {}) },
+            [...(transfer ?? []), ...load.transfer]);
+            return;
+          }
+        }
+        target.postMessage(message, transfer ?? []);
+      };
+      const value = Reflect.get(target, key, target);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+}
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej; });
+  return { promise, resolve, reject };
+}
+
+function warnUnserializableRenderers(
+  opts: LoadOptions,
+  mode: 'main' | 'worker',
+  renderers: WorkerRendererDescriptors | undefined,
+): void {
+  if (mode !== 'worker') return;
+  if (opts.math && !renderers?.math) console.warn(
+    "[ooxml] a custom math renderer cannot cross the worker boundary; equations will be skipped in mode: 'worker'. Use the math renderer from @silurus/ooxml/math.",
+  );
+  if (opts.threeD && !renderers?.threeD) console.warn(
+    "[ooxml] a custom 3-D chart renderer cannot cross the worker boundary; charts use their 2-D family fallback in mode: 'worker'. Use the renderer from @silurus/ooxml/three-d.",
+  );
+  if (opts.regionMap && !renderers?.regionMap) console.warn(
+    "[ooxml] a custom Region Map renderer cannot cross the worker boundary; geospatial charts use the unsupported-chart placeholder in mode: 'worker'. Use the renderer from @silurus/ooxml/region-map.",
+  );
+  if (opts.chartEx && !renderers?.chartEx) console.warn(
+    "[ooxml] a custom ChartEx renderer cannot cross the worker boundary; ChartEx charts use the unsupported-chart placeholder in mode: 'worker'. Use the renderer from @silurus/ooxml/chart-ex.",
+  );
+  if (opts.tiff && !renderers?.tiff) console.warn(
+    "[ooxml] a custom TIFF codec cannot cross the worker boundary; recognized TIFF images will use an unavailable-image placeholder in mode: 'worker'. Use the codec from @silurus/ooxml/tiff to display them.",
+  );
+}

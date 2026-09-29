@@ -1,99 +1,107 @@
-// Preset pattern bitmaps for OOXML pattFill (ECMA-376 §20.1.10.59).
-// Each entry is an 8-row, 8-column binary bitmap. A '1' bit selects the
-// foreground colour, a '0' bit the background. Rows are ordered top→bottom;
-// within a row the most-significant bit is the leftmost pixel.
-//
-// Coverage prioritises the well-known geometric variants whose bitmap is
-// uniquely determined by the spec or by long-standing Office implementations
-// (POI, LibreOffice). Less-common decorative patterns (weave, plaid, sphere,
-// shingle, divot, …) are intentionally omitted — their per-pixel layout is
-// implementation-specific in practice, and falling back to the foreground
-// colour is a safer default than guessing.
+// ECMA-376 Part 1 §20.1.10.51 / ST_PresetPatternVal specifies the 54 names,
+// not their cell artwork. The cells below were measured from PowerPoint's
+// direct PDF export of every name in two opposite foreground/background colours.
+// Each slash-separated row has eight cells: # = foreground, . = background,
+// + = the sRGB midpoint. The diagonal families use midpoint edge cells.
+// PowerPoint embeds a 64×64 image made of uniform 8×8 pixel blocks in an
+// 8 pt PDF tiling pattern: one logical cell = 1 pt. PowerPoint, Word and Excel
+// PDF controls with independent foreground/background alpha (50/50 and
+// 25/75%; Excel also 0/50 and 100/0%) add a matching soft mask whose diagonal
+// cells have midpoint alpha. PDF colour conversion can change RGB by 1–2
+// levels. Both opaque colour variants and a 6× PowerPoint PDF raster agree at
+// all 64 cells for all 54 names. The PPTX painter
+// keeps that grid at the slide origin through rotation, reflection and groups.
 
 import { createAuxCanvas } from '../canvas/aux-canvas.js';
 
-const PATTERN_BITMAPS: Record<string, number[]> = {
-  // ── Percentage shading ────────────────────────────────────────────────
-  // Sparse-to-dense dot patterns. Bit positions follow the canonical
-  // 8x8 templates used by Office/POI for the same preset names.
-  pct5:  [0b00000000, 0b00010000, 0b00000000, 0b00000000, 0b00000000, 0b00000001, 0b00000000, 0b00000000],
-  pct10: [0b10001000, 0b00000000, 0b00100010, 0b00000000, 0b10001000, 0b00000000, 0b00100010, 0b00000000],
-  pct20: [0b10001000, 0b00100010, 0b10001000, 0b00100010, 0b10001000, 0b00100010, 0b10001000, 0b00100010],
-  pct25: [0b10001000, 0b01010101, 0b00100010, 0b01010101, 0b10001000, 0b01010101, 0b00100010, 0b01010101],
-  pct30: [0b10101010, 0b01010101, 0b10101010, 0b01010101, 0b10101010, 0b01010101, 0b10101010, 0b01010101],
-  pct40: [0b10101010, 0b01110111, 0b10101010, 0b11011101, 0b10101010, 0b01110111, 0b10101010, 0b11011101],
-  pct50: [0b10101010, 0b01010101, 0b10101010, 0b01010101, 0b10101010, 0b01010101, 0b10101010, 0b01010101],
-  pct60: [0b11011101, 0b01010101, 0b01110111, 0b01010101, 0b11011101, 0b01010101, 0b01110111, 0b01010101],
-  pct70: [0b11101110, 0b01010101, 0b10111011, 0b01010101, 0b11101110, 0b01010101, 0b10111011, 0b01010101],
-  pct75: [0b11101110, 0b10101010, 0b10111011, 0b10101010, 0b11101110, 0b10101010, 0b10111011, 0b10101010],
-  pct80: [0b11111110, 0b11101111, 0b11111011, 0b10111111, 0b11111110, 0b11101111, 0b11111011, 0b10111111],
-  pct90: [0b11111111, 0b11101111, 0b11111111, 0b11111011, 0b11111111, 0b11101111, 0b11111111, 0b11111011],
-
-  // ── Horizontal / vertical lines ───────────────────────────────────────
-  horz:    [0b11111111, 0b00000000, 0b00000000, 0b00000000, 0b11111111, 0b00000000, 0b00000000, 0b00000000],
-  vert:    [0b10001000, 0b10001000, 0b10001000, 0b10001000, 0b10001000, 0b10001000, 0b10001000, 0b10001000],
-  ltHorz:  [0b00000000, 0b11111111, 0b00000000, 0b00000000, 0b00000000, 0b00000000, 0b00000000, 0b00000000],
-  ltVert:  [0b00100000, 0b00100000, 0b00100000, 0b00100000, 0b00100000, 0b00100000, 0b00100000, 0b00100000],
-  dkHorz:  [0b11111111, 0b11111111, 0b00000000, 0b00000000, 0b11111111, 0b11111111, 0b00000000, 0b00000000],
-  dkVert:  [0b11001100, 0b11001100, 0b11001100, 0b11001100, 0b11001100, 0b11001100, 0b11001100, 0b11001100],
-  narHorz: [0b11111111, 0b00000000, 0b11111111, 0b00000000, 0b11111111, 0b00000000, 0b11111111, 0b00000000],
-  narVert: [0b10101010, 0b10101010, 0b10101010, 0b10101010, 0b10101010, 0b10101010, 0b10101010, 0b10101010],
-
-  // ── Cross / grid ──────────────────────────────────────────────────────
-  cross:   [0b11111111, 0b10001000, 0b10001000, 0b10001000, 0b11111111, 0b10001000, 0b10001000, 0b10001000],
-  lgGrid:  [0b11111111, 0b10000000, 0b10000000, 0b10000000, 0b10000000, 0b10000000, 0b10000000, 0b10000000],
-  smGrid:  [0b11111111, 0b10001000, 0b10001000, 0b10001000, 0b11111111, 0b10001000, 0b10001000, 0b10001000],
-  dotGrid: [0b10001000, 0b00000000, 0b00000000, 0b00000000, 0b10001000, 0b00000000, 0b00000000, 0b00000000],
-
-  // ── Diagonals ─────────────────────────────────────────────────────────
-  // dnDiag: top-left → bottom-right stripe. upDiag: bottom-left → top-right.
-  dnDiag:    [0b10000000, 0b01000000, 0b00100000, 0b00010000, 0b00001000, 0b00000100, 0b00000010, 0b00000001],
-  upDiag:    [0b00000001, 0b00000010, 0b00000100, 0b00001000, 0b00010000, 0b00100000, 0b01000000, 0b10000000],
-  ltDnDiag:  [0b10001000, 0b01000100, 0b00100010, 0b00010001, 0b10001000, 0b01000100, 0b00100010, 0b00010001],
-  ltUpDiag:  [0b00010001, 0b00100010, 0b01000100, 0b10001000, 0b00010001, 0b00100010, 0b01000100, 0b10001000],
-  dkDnDiag:  [0b11000011, 0b10000001, 0b00000000, 0b10000001, 0b11000011, 0b10000001, 0b00000000, 0b10000001],
-  dkUpDiag:  [0b11000011, 0b10000001, 0b00000000, 0b10000001, 0b11000011, 0b10000001, 0b00000000, 0b10000001],
-  wdDnDiag:  [0b10000000, 0b01000000, 0b00100000, 0b00010000, 0b00001000, 0b00000100, 0b00000010, 0b10000001],
-  wdUpDiag:  [0b00000001, 0b00000010, 0b00000100, 0b00001000, 0b00010000, 0b00100000, 0b01000000, 0b10000001],
-  diagCross: [0b10000001, 0b01000010, 0b00100100, 0b00011000, 0b00011000, 0b00100100, 0b01000010, 0b10000001],
-
-  // ── Brick / checker ───────────────────────────────────────────────────
-  horzBrick: [0b11111111, 0b00010000, 0b00010000, 0b00010000, 0b11111111, 0b00000001, 0b00000001, 0b00000001],
-  diagBrick: [0b10000001, 0b01000010, 0b00100100, 0b00011000, 0b00100100, 0b01000010, 0b10000001, 0b00000000],
-  lgCheck:   [0b11110000, 0b11110000, 0b11110000, 0b11110000, 0b00001111, 0b00001111, 0b00001111, 0b00001111],
-  smCheck:   [0b11001100, 0b11001100, 0b00110011, 0b00110011, 0b11001100, 0b11001100, 0b00110011, 0b00110011],
-  trellis:   [0b10100101, 0b01011010, 0b10100101, 0b01011010, 0b10100101, 0b01011010, 0b10100101, 0b01011010],
+const PATTERN_BITMAPS: Record<string, string> = {
+  pct5: '#......./......../......../......../....#.../......../......../........',
+  pct10: '#......./......../....#.../......../#......./......../....#.../........',
+  pct20: '#...#.../......../..#...#./......../#...#.../......../..#...#./........',
+  pct25: '#...#.../..#...#./#...#.../..#...#./#...#.../..#...#./#...#.../..#...#.',
+  pct30: '#.#.#.#./.#...#../#.#.#.#./...#...#/#.#.#.#./.#...#../#.#.#.#./...#...#',
+  pct40: '#.#.#.#./.#.#.#.#/#.#.#.#./.#.#...#/#.#.#.#./.#.#.#.#/#.#.#.#./...#.#.#',
+  pct50: '#.#.#.#./.#.#.#.#/#.#.#.#./.#.#.#.#/#.#.#.#./.#.#.#.#/#.#.#.#./.#.#.#.#',
+  pct60: '###.###./.#.#.#.#/#.###.##/.#.#.#.#/###.###./.#.#.#.#/#.###.##/.#.#.#.#',
+  pct70: '.###.###/##.###.#/.###.###/##.###.#/.###.###/##.###.#/.###.###/##.###.#',
+  pct75: '.###.###/########/##.###.#/########/.###.###/########/##.###.#/########',
+  pct80: '###.####/########/#######./########/###.####/########/#######./########',
+  pct90: '########/########/########/####.###/########/########/########/.#######',
+  horz: '########/......../......../......../......../......../......../........',
+  vert: '#......./#......./#......./#......./#......./#......./#......./#.......',
+  ltHorz: '########/......../......../......../########/......../......../........',
+  ltVert: '#...#.../#...#.../#...#.../#...#.../#...#.../#...#.../#...#.../#...#...',
+  dkHorz: '########/########/......../......../########/########/......../........',
+  dkVert: '##..##../##..##../##..##../##..##../##..##../##..##../##..##../##..##..',
+  narHorz: '########/......../########/......../########/......../########/........',
+  narVert: '.#.#.#.#/.#.#.#.#/.#.#.#.#/.#.#.#.#/.#.#.#.#/.#.#.#.#/.#.#.#.#/.#.#.#.#',
+  dashHorz: '####..../......../......../......../....####/......../......../........',
+  dashVert: '#......./#......./#......./#......./....#.../....#.../....#.../....#...',
+  cross: '########/#......./#......./#......./#......./#......./#......./#.......',
+  dnDiag: '#+.....+/+#+...../.+#+..../..+#+.../...+#+../....+#+./.....+#+/+.....+#',
+  upDiag: '+.....+#/.....+#+/....+#+./...+#+../..+#+.../.+#+..../+#+...../#+.....+',
+  ltDnDiag: '#...#.../.#...#../..#...#./...#...#/#...#.../.#...#../..#...#./...#...#',
+  ltUpDiag: '...#...#/..#...#./.#...#../#...#.../...#...#/..#...#./.#...#../#...#...',
+  dkDnDiag: '##..##../.##..##./..##..##/#..##..#/##..##../.##..##./..##..##/#..##..#',
+  dkUpDiag: '..##..##/.##..##./##..##../#..##..#/..##..##/.##..##./##..##../#..##..#',
+  wdDnDiag: '##.....#/###...../.###..../..###.../...###../....###./.....###/#.....##',
+  wdUpDiag: '#.....##/.....###/....###./...###../..###.../.###..../###...../##.....#',
+  dashDnDiag: '......../......../#...#.../.#...#../..#...#./...#...#/......../........',
+  dashUpDiag: '......../......../...#...#/..#...#./.#...#../#...#.../......../........',
+  diagCross: '#+....+#/+#+..+#+/.+#++#+./..+##+../..+##+../.+#++#+./+#+..+#+/#+....+#',
+  smCheck: '#..##..#/.##..##./.##..##./#..##..#/#..##..#/.##..##./.##..##./#..##..#',
+  lgCheck: '####..../####..../####..../####..../....####/....####/....####/....####',
+  smGrid: '########/#...#.../#...#.../#...#.../########/#...#.../#...#.../#...#...',
+  lgGrid: '########/#......./#......./#......./#......./#......./#......./#.......',
+  dotGrid: '#.#.#.#./......../#......./......../#......./......../#......./........',
+  smConfetti: '#......./....#.../.#....../......#./...#..../.......#/..#...../.....#..',
+  lgConfetti: '#.##...#/..##..../......##/...##.##/##.##.../##....../....##../#...##.#',
+  horzBrick: '########/#......./#......./#......./########/....#.../....#.../....#...',
+  diagBrick: '.......#/......#./.....#../....#.../...##.../..#..#../.#....#./#......#',
+  solidDmnd: '...#..../..###.../.#####../#######./.#####../..###.../...#..../........',
+  openDmnd: '#.....#./.#...#../..#.#.../...#..../..#.#.../.#...#../#.....#./.......#',
+  dotDmnd: '#......./......../..#...#./......../....#.../......../..#...#./........',
+  plaid: '#.#.#.#./.#.#.#.#/#.#.#.#./.#.#.#.#/####..../####..../####..../####....',
+  sphere: '.###.###/#...#..#/#...####/#...####/.###.###/#..##.../#####.../#####...',
+  weave: '#...#.../.#.#.#../..#...#./.#...#.#/#...#.../...#.#../..#...#./.#.#...#',
+  divot: '......../...#..../....#.../...#..../......../#......./.......#/#.......',
+  shingle: '......##/#....#../.#..#.../..##..../....##../......#./.......#/.......#',
+  wave: '......../...##.../..#..#.#/##....../......../...##.../..#..#.#/##......',
+  trellis: '########/.##..##./########/#..##..#/########/.##..##./########/#..##..#',
+  zigZag: '#......#/.#....#./..#..#../...##.../#......#/.#....#./..#..#../...##...',
 };
 
-/**
- * Render an 8x8 pattern bitmap to a tile that `ctx.createPattern(_, 'repeat')`
- * will tile across the shape. Uses OffscreenCanvas where available and falls
- * back to a regular HTMLCanvasElement (test envs / older browsers).
- *
- * Returns null when the preset name is unknown — callers should fall back
- * to the foreground colour, never to an arbitrary substitute pattern.
- */
+/** Render each measured cell at PowerPoint PDF's native 8×8 sample resolution.
+ * A one-pixel source cell would be interpolated across its whole interior
+ * when a slide is enlarged. At small output sizes PDF and Canvas rasterizers
+ * blend cell boundaries differently; the source tile stays unfiltered so its
+ * interior colours and high-resolution phase remain exact. */
 export function buildPatternBitmap(
   preset: string,
   fg: string,
   bg: string,
 ): HTMLCanvasElement | OffscreenCanvas | null {
-  const rows = PATTERN_BITMAPS[preset];
-  if (!rows) return null;
-
-  // 8×8 positive-integer tile, so createAuxCanvas's ceil/≥1 clamp is a no-op.
-  const tile = createAuxCanvas(8, 8);
+  const encoded = PATTERN_BITMAPS[preset];
+  if (typeof encoded !== 'string') return null;
+  const tile = createAuxCanvas(64, 64);
   if (!tile) return null;
-  const tctx = tile.getContext('2d') as CanvasRenderingContext2D | null;
-  if (!tctx) return null;
+  const ctx = tile.getContext('2d') as CanvasRenderingContext2D | null;
+  if (!ctx) return null;
 
-  tctx.fillStyle = hexToCss(bg);
-  tctx.fillRect(0, 0, 8, 8);
-  tctx.fillStyle = hexToCss(fg);
+  const bgCss = hexToCss(bg);
+  const fgCss = hexToCss(fg);
+  const midpointCss = blendHalfCss(fg, bg);
+  const rows = encoded.split('/');
   for (let y = 0; y < 8; y++) {
-    const row = rows[y];
     for (let x = 0; x < 8; x++) {
-      if (row & (1 << (7 - x))) tctx.fillRect(x, y, 1, 1);
+      const cell = rows[y][x];
+      // The Office PDF tile stores one RGBA value per cell. In controls with
+      // independent foreground/background a:alpha (0/50, 25/75 and 50/50%),
+      // the half-covered diagonal cells store each RGB and alpha channel at
+      // the pair's midpoint. Painting a translucent cell over a prefilled
+      // background would increase its alpha, so paint every cell exactly once.
+      ctx.fillStyle = cell === '#' ? fgCss : cell === '+' ? midpointCss : bgCss;
+      ctx.fillRect(x * 8, y * 8, 8, 8);
     }
   }
   return tile;
@@ -105,4 +113,13 @@ function hexToCss(hex: string): string {
   const b = parseInt(hex.slice(4, 6), 16);
   const a = hex.length >= 8 ? parseInt(hex.slice(6, 8), 16) / 255 : 1;
   return `rgba(${r},${g},${b},${a})`;
+}
+
+function blendHalfCss(fg: string, bg: string): string {
+  const channel = (hex: string, offset: number): number => parseInt(hex.slice(offset, offset + 2), 16);
+  const r = Math.round((channel(fg, 0) + channel(bg, 0)) / 2);
+  const g = Math.round((channel(fg, 2) + channel(bg, 2)) / 2);
+  const b = Math.round((channel(fg, 4) + channel(bg, 4)) / 2);
+  const alpha = (hex: string): number => hex.length >= 8 ? channel(hex, 6) / 255 : 1;
+  return `rgba(${r},${g},${b},${(alpha(fg) + alpha(bg)) / 2})`;
 }

@@ -44,7 +44,7 @@
 //! `packages/pptx/src/smartart-fallback-contrast.ts`.
 
 use crate::parse_preflighted_pptx_xml;
-use crate::text::{empty_level_bullets, parse_text_body, ShapeKind};
+use crate::text::{empty_level_bullets, parse_text_body};
 use crate::types::*;
 use crate::{attr, child, read_zip_str, resolve_path, PptxZip};
 use std::collections::HashMap;
@@ -274,6 +274,7 @@ pub(crate) fn emit_smartart_fallback(
             num_col: 1,
             spc_col: 0,
             rtl_col: false,
+            spc_first_last_para: false,
             text_warp: None,
         },
     )));
@@ -310,6 +311,7 @@ fn append_point_paragraphs(
         Default::default(),
         std::array::from_fn(|_| None),
         Default::default(),
+        Default::default(),
         &empty_level_bullets(),
         None,
         None,
@@ -322,8 +324,6 @@ fn append_point_paragraphs(
         None,
         None,
         None,
-        None,
-        ShapeKind::Sp,
         zip,
     );
     if default_font_size.is_none() {
@@ -376,6 +376,7 @@ fn emit_placeholder(gf_xfrm: &Transform, out: &mut Vec<SlideElement>) -> bool {
         num_col: 1,
         spc_col: 0,
         rtl_col: false,
+        spc_first_last_para: false,
         text_warp: None,
     };
     let mut shape = text_list_shape(gf_xfrm, body);
@@ -416,6 +417,7 @@ fn text_list_shape(gf_xfrm: &Transform, body: TextBody) -> ShapeElement {
         text_body: Some(body),
         default_text_color: None,
         cust_geom: None,
+        cust_geom_paint: None,
         adj: None,
         adj2: None,
         adj3: None,
@@ -449,6 +451,8 @@ fn default_paragraph() -> Paragraph {
         indent: 0,
         space_before: None,
         space_after: None,
+        space_before_pct: None,
+        space_after_pct: None,
         space_line: None,
         lvl: 0,
         bullet: Bullet::None,
@@ -462,6 +466,7 @@ fn default_paragraph() -> Paragraph {
         rtl: false,
         ea_ln_brk: true,
         runs: Vec::new(),
+        end_run_properties: None,
     }
 }
 
@@ -473,23 +478,35 @@ fn default_run() -> TextRunData {
         underline: false,
         underline_style: None,
         underline_color: None,
+        underline_fill: None,
+        underline_line: None,
+        underline_line_no_fill: false,
         strikethrough: false,
         strike_double: false,
         font_size: None,
         color: None,
+        pattern_fill: None,
+        glyph_fill: None,
+        no_fill: false,
         font_family: None,
         font_family_ea: None,
+        font_family_cs: None,
         font_family_sym: None,
         baseline: None,
         caps: None,
         letter_spacing: None,
         field_type: None,
         hyperlink: None,
+        hyperlink_uses_text_fill: false,
         hyperlink_action: None,
+        hyperlink_mouse_over: None,
+        hyperlink_mouse_over_action: None,
         shadow: None,
         reflection: None,
         outline: None,
         highlight: None,
+        character_attributes: Default::default(),
+        character_child_attributes: Default::default(),
     }
 }
 

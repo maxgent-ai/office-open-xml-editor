@@ -1,0 +1,27 @@
+<!doctype html><html><body><script type="module">
+import { PptxPresentation } from '/src/index.ts';
+import initParser, { parse_pptx } from '/src/wasm/pptx_parser.js';
+import parserWasmUrl from '/src/wasm/pptx_parser_bg.wasm?url';
+window.parseRunInheritanceFixture = async bytes => {
+  await initParser({ module_or_path: parserWasmUrl });
+  return JSON.parse(new TextDecoder().decode(parse_pptx(new Uint8Array(bytes))));
+};
+window.collectRunInheritanceText = async (bytes, mode) => {
+  const presentation = await PptxPresentation.load(new Uint8Array(bytes).buffer, { mode });
+  try { return await presentation.collectSlideRuns(0, 1280); }
+  finally { presentation.destroy(); }
+};
+window.renderRunInheritanceFixture = async (bytes, index, mode) => {
+  const presentation = await PptxPresentation.load(new Uint8Array(bytes).buffer, { mode });
+  try {
+    const bmp = await presentation.renderSlideToBitmap(index, { width: 1280, dpr: 1 });
+    const canvas = document.createElement('canvas');
+    canvas.width = bmp.width; canvas.height = bmp.height;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(bmp, 0, 0); bmp.close();
+    return { width: canvas.width, height: canvas.height,
+      bytes: Array.from(ctx.getImageData(0, 0, canvas.width, canvas.height).data) };
+  } finally { presentation.destroy(); }
+};
+document.body.dataset.ready = 'true';
+</script></body></html>

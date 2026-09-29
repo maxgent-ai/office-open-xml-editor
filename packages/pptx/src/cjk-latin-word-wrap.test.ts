@@ -69,8 +69,15 @@ describe('pptx CJK/Latin word wrapping (#1474)', () => {
       .toEqual(['日本語', 'Power']);
   });
 
-  it('does not invent a break across a formatting seam inside a Latin word', () => {
-    expect(lines([run('YoY+'), run('11.9%', 'Courier New')]))
+  it('does not invent a break across a formatting seam inside a fitting Latin word', () => {
+    expect(lines([run('YoY+'), run('11.9%', 'Courier New')], 90))
       .toEqual(['YoY+11.9%']);
+  });
+
+  it('emergency-breaks an overwide Latin word across a font seam (control E06)', () => {
+    // PowerPoint splits `ab` + `cdefghij` (another font) per grapheme when the
+    // word is wider than the box; no style seam keeps it whole.
+    expect(lines([run('ab'), run('cdefghij', 'Courier New')], 40))
+      .toEqual(['abcd', 'efgh', 'ij']);
   });
 });
