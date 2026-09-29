@@ -931,6 +931,8 @@ pub(crate) fn parse_tx_body(
                 let mut def_tab_sz: Option<i64> = None;
                 let mut tab_stops: Vec<ShapeTabStop> = Vec::new();
                 let mut space_line: Option<SpaceLine> = None;
+                let mut space_before: Option<SpaceLine> = None;
+                let mut space_after: Option<SpaceLine> = None;
                 let mut runs: Vec<ShapeTextRun> = Vec::new();
                 for pc in c.children().filter(|n| n.is_element()) {
                     match pc.tag_name().name() {
@@ -978,6 +980,19 @@ pub(crate) fn parse_tx_body(
                                 .find(|n| n.is_element() && n.tag_name().name() == "lnSpc")
                             {
                                 space_line = ooxml_common::text::parse_lnspc(ln_spc);
+                            }
+                            // §21.1.2.2.10 `<a:spcBef>` / §21.1.2.2.9 `<a:spcAft>`
+                            // share lnSpc's CT_TextSpacing grammar (spcPct |
+                            // spcPts), so the same parser applies.
+                            for (tag, slot) in
+                                [("spcBef", &mut space_before), ("spcAft", &mut space_after)]
+                            {
+                                if let Some(node) = pc
+                                    .children()
+                                    .find(|n| n.is_element() && n.tag_name().name() == tag)
+                                {
+                                    *slot = ooxml_common::text::parse_lnspc(node);
+                                }
                             }
                         }
                         "r" => {
@@ -1070,6 +1085,8 @@ pub(crate) fn parse_tx_body(
                         def_tab_sz,
                         tab_stops,
                         space_line,
+                        space_before,
+                        space_after,
                         runs,
                     });
                 }
@@ -2589,7 +2606,9 @@ mod math_tests {
                 <a:r><a:t>pct</a:t></a:r>
               </a:p>
               <a:p>
-                <a:pPr><a:lnSpc><a:spcPts val="1800"/></a:lnSpc></a:pPr>
+                <a:pPr><a:lnSpc><a:spcPts val="1800"/></a:lnSpc>
+                  <a:spcBef><a:spcPts val="1200"/></a:spcBef>
+                  <a:spcAft><a:spcPct val="50000"/></a:spcAft></a:pPr>
                 <a:r><a:t>pts</a:t></a:r>
               </a:p>
             </xdr:txBody>"#
@@ -2606,6 +2625,12 @@ mod math_tests {
         assert_eq!(vp1["spaceLine"]["type"], "pts");
         // 1800 hundredths of a point → 18 pt.
         assert_eq!(vp1["spaceLine"]["val"], 18.0);
+        // spcBef / spcAft (§21.1.2.2.10 / .9) use the same CT_TextSpacing JSON.
+        assert_eq!(vp1["spaceBefore"]["type"], "pts");
+        assert_eq!(vp1["spaceBefore"]["val"], 12.0);
+        assert_eq!(vp1["spaceAfter"]["type"], "pct");
+        assert_eq!(vp1["spaceAfter"]["val"], 50000.0);
+        assert!(vp0.get("spaceBefore").is_none() && vp0.get("spaceAfter").is_none());
     }
 
     /// `<a:bodyPr>/<a:normAutofit>` (ECMA-376 §21.1.2.1.3): autoFit="norm" plus

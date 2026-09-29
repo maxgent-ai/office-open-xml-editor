@@ -175,6 +175,9 @@ const SHARED_PAINT_IMPORTS = new Map([
     ['recolorSvg', 'value'],
     ['renderChart', 'value'],
     ['withDrawingMLShapeTransform', 'value'],
+    // This scope only adjusts a CanvasPattern's phase while painting a
+    // retained DrawingML shape; it cannot acquire or alter page layout.
+    ['withPatternCoordinateSpace', 'value'],
     // Serial admission and bitmap pinning are document-owned paint-resource
     // lifecycle concerns, not layout acquisition.
     ['withBitmapCacheLease', 'value'],

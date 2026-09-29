@@ -12,6 +12,10 @@ import {
   renderPresetShape,
 } from './preset-geometry';
 
+// Retained DOCX DrawingML plans use points. The shared pattern bitmap's one
+// point cells therefore need no CSS-pixel conversion in this painter.
+const PATTERN_PT_TO_SHAPE_UNITS = 1;
+
 type DeepReadonly<T> =
   T extends (...args: never[]) => unknown ? T
   : T extends readonly (infer U)[] ? readonly DeepReadonly<U>[]
@@ -156,6 +160,7 @@ function applyDrawingMLStroke(
       rect.w,
       rect.h,
       rotationDeg,
+      PATTERN_PT_TO_SHAPE_UNITS,
     );
     if (paint) ctx.strokeStyle = paint;
   }
@@ -181,6 +186,7 @@ function paintConnectorEnds(
         w,
         h,
         plan.transform.rotationDeg,
+        PATTERN_PT_TO_SHAPE_UNITS,
       ) ?? undefined
     : undefined;
   const adjustments = plan.geometry.kind === 'preset' ? plan.geometry.adjustments : [];
@@ -247,6 +253,7 @@ function paintCustomEnds(
         w,
         h,
         plan.transform.rotationDeg,
+        PATTERN_PT_TO_SHAPE_UNITS,
       ) ?? undefined
     : undefined;
   if (endpoints.start && stroke.headEnd) {
@@ -292,6 +299,7 @@ export function paintDrawingMLShape(
       w,
       h,
       plan.transform.rotationDeg,
+      PATTERN_PT_TO_SHAPE_UNITS,
     );
     const stroke = plan.stroke as Stroke | null;
     const applyAndStroke = stroke

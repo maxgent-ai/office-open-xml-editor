@@ -12,6 +12,7 @@
     import { math } from '@ooxml-test-math-renderer';
     import { threeD } from '@ooxml-test-three-d-renderer';
     import { regionMap } from '@ooxml-test-region-map-renderer';
+    import { chartEx } from '@ooxml-test-chart-ex-renderer';
 
     const params = new URLSearchParams(location.search);
     const name = params.get('xlsx') ?? 'demo/sample-1';
@@ -38,7 +39,7 @@
         bmp.close();
       };
 
-      const renderers = { math, threeD, regionMap };
+      const renderers = { math, threeD, regionMap, chartEx };
       const main = await XlsxWorkbook.load(buf.slice(0), { useGoogleFonts: true, ...renderers });
       paint('main-canvas', await main.renderViewportToBitmap(sheet, viewport, { width, height, dpr }));
       main.destroy();

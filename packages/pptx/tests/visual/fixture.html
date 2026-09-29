@@ -16,6 +16,7 @@
     import { threeD } from '@ooxml-test-three-d-renderer';
     import { regionMap } from '@ooxml-test-region-map-renderer';
     import { tiff } from '@ooxml-test-tiff-renderer';
+    import { chartEx } from '@ooxml-test-chart-ex-renderer';
 
     const fixtureFontStylesheets = [
       '/node_modules/@fontsource/nunito-sans/400.css',
@@ -39,6 +40,7 @@
       threeD,
       regionMap,
       tiff,
+      chartEx,
       onError: (err) => {
         document.body.dataset.status = 'error';
         document.body.dataset.errorMessage = err.message;

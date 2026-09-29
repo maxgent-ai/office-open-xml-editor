@@ -11132,7 +11132,11 @@ struct ResolvedVmlFill {
 
 /// Resolve the Part 4 §19.1.2.5/§19.1.2.19 fill cascade. Instance properties
 /// override the referenced shapetype; within either layer `<v:fill>` overrides
-/// the element attributes. An enabled fill defaults to white.
+/// the element attributes. An enabled fill defaults to white. Word's PDF of a
+/// rotated VML textpath watermark with `v:fill type="pattern"` and a valid image
+/// relationship paints the textpath in `color` alone, without an image tile.
+/// That observation supports the solid projection for textpath watermarks; it
+/// does not establish image-pattern behaviour for other VML shape hosts.
 fn resolve_vml_fill(
     shape: roxmltree::Node,
     shape_type: Option<roxmltree::Node>,
@@ -28870,6 +28874,34 @@ mod vml_pict_tests {
         assert_eq!(s.anchor_y_relative_from.as_deref(), Some("margin"));
         // Negative z-index ⇒ behind the body text.
         assert!(s.behind_doc, "negative z-index ⇒ behindDoc");
+    }
+
+    #[test]
+    fn image_pattern_on_vml_textpath_uses_word_pdf_solid_ink() {
+        let body = format!(
+            r##"<w:document{ns}><w:body><w:p><w:r><w:pict>
+              <v:shape id="PowerPlusWaterMarkObject1"
+                style="position:absolute;width:420pt;height:250pt;rotation:315;z-index:-251657216"
+                fillcolor="#D21D54" stroked="f">
+                <v:fill type="pattern" color="#D21D54" color2="#12CED4" r:id="rIdPattern"/>
+                <v:path textpathok="t"/>
+                <v:textpath on="t" fitshape="t" string="PATTERN WATERMARK"/>
+              </v:shape>
+            </w:pict></w:r></w:p></w:body></w:document>"##,
+            ns = VML_NS,
+        );
+        let mut media = HashMap::new();
+        media.insert(
+            "rIdPattern".to_string(),
+            "word/media/pattern.png".to_string(),
+        );
+        let shapes = shape_runs(&body, &media);
+        assert_eq!(shapes.len(), 1);
+        assert!(shapes[0].text_path.is_some());
+        match &shapes[0].fill {
+            Some(ShapeFill::Solid { color }) => assert_eq!(color, "d21d54"),
+            other => panic!("expected solid textpath ink, got {other:?}"),
+        }
     }
 
     /// ECMA-376 Part 4's transitional VML schema places `textpathok` on

@@ -165,11 +165,19 @@ export function resolveFill(
   ctx: CanvasRenderingContext2D,
   x: number, y: number, w: number, h: number,
   shapeRotationDeg = 0,
+  patternPtToUserUnits?: number,
+  patternCoordinateTransform?: DOMMatrix2DInit,
 ): string | CanvasGradient | CanvasPattern | null {
   if (!fill || fill.fillType === 'none') return null;
   if (fill.fillType === 'solid') return hexToRgba(fill.color);
   if (fill.fillType === 'pattern') {
-    return resolvePatternFill(fill, ctx);
+    const slideRoot = activePatternCoordinateRoot.get(ctx);
+    return resolvePatternFill(
+      fill, ctx, patternPtToUserUnits ?? activePatternPointScale.get(ctx) ?? 4 / 3,
+      patternCoordinateTransform ?? (slideRoot
+        ? patternTransformToRoot(ctx.getTransform(), slideRoot)
+        : undefined),
+    );
   }
   if (fill.fillType === 'gradient') {
     const stops = fill.stops;
@@ -237,21 +245,131 @@ export function resolveFill(
   return null;
 }
 
+// Chart families resolve fills through many shared painters. A chart installs
+// its host's point scale for the duration of the render, so chart-space,
+// series, legend, labels, markers and optional 3-D paths use the same units.
+// The scope changes no canvas geometry, so a chart without patterns paints
+// exactly as before. The scale is restored for nested charts and later shapes.
+const activePatternPointScale = new WeakMap<CanvasRenderingContext2D, number>();
+type PatternMatrix = { a: number; b: number; c: number; d: number; e: number; f: number };
+const activePatternCoordinateRoot = new WeakMap<CanvasRenderingContext2D, PatternMatrix>();
+
+function patternTransformToRoot(current: DOMMatrix2DInit, root: PatternMatrix): PatternMatrix | undefined {
+  const a = current.a ?? 1; const b = current.b ?? 0;
+  const c = current.c ?? 0; const d = current.d ?? 1;
+  const e = current.e ?? 0; const f = current.f ?? 0;
+  const determinant = a * d - b * c;
+  if (Math.abs(determinant) < 1e-12) return undefined;
+  const ia = d / determinant; const ib = -b / determinant;
+  const ic = -c / determinant; const id = a / determinant;
+  const ie = -(ia * e + ic * f); const iff = -(ib * e + id * f);
+  return {
+    a: ia * root.a + ic * root.b,
+    b: ib * root.a + id * root.b,
+    c: ia * root.c + ic * root.d,
+    d: ib * root.c + id * root.d,
+    e: ia * root.e + ic * root.f + ie,
+    f: ib * root.e + id * root.f + iff,
+  };
+}
+
+/** PowerPoint PDF paints pattern cells on slide axes even when a shape is
+ * rotated, reflected or inside a scaled/rotated group. The 64px tile stays
+ * 8pt wide for shapes, table cells, chart fills and text on 4:3, 16:9 and
+ * custom slides. Preserve the slide-to-device frame while a host changes its
+ * CTM; the pattern resolver cancels only the host-local transform. */
+export function withPatternCoordinateSpace<T>(
+  ctx: CanvasRenderingContext2D,
+  slideToDevice: DOMMatrix2DInit,
+  paint: () => T,
+): T {
+  const previous = activePatternCoordinateRoot.get(ctx);
+  activePatternCoordinateRoot.set(ctx, {
+    a: slideToDevice.a ?? 1, b: slideToDevice.b ?? 0,
+    c: slideToDevice.c ?? 0, d: slideToDevice.d ?? 1,
+    e: slideToDevice.e ?? 0, f: slideToDevice.f ?? 0,
+  });
+  try {
+    return paint();
+  } finally {
+    if (previous) activePatternCoordinateRoot.set(ctx, previous);
+    else activePatternCoordinateRoot.delete(ctx);
+  }
+}
+
+export function withPatternPointScale<T>(
+  ctx: CanvasRenderingContext2D,
+  ptToUserUnits: number,
+  paint: () => T,
+): T {
+  const previous = activePatternPointScale.get(ctx);
+  activePatternPointScale.set(ctx, ptToUserUnits);
+  try {
+    return paint();
+  } finally {
+    if (previous === undefined) activePatternPointScale.delete(ctx);
+    else activePatternPointScale.set(ctx, previous);
+  }
+}
+
+/** Preserve a chart's pattern units when effect compositing repaints its body
+ * into a temporary canvas. The auxiliary context receives the original chart
+ * CTM separately, so its pattern uses the same user-space point grid. */
+export function withInheritedPatternScope<T>(
+  source: CanvasRenderingContext2D,
+  target: CanvasRenderingContext2D,
+  paint: () => T,
+  deviceOffset?: { x: number; y: number },
+  sourceDeviceToTargetDevice?: PatternMatrix,
+): T {
+  const scale = activePatternPointScale.get(source);
+  const root = activePatternCoordinateRoot.get(source);
+  // An effect canvas may crop the source, while a bevel canvas additionally
+  // changes its axes to the shape's local frame. Transfer the complete affine
+  // slide frame in that case; a translation alone would rotate the tile with
+  // the bevel when the shape has an authored transform.
+  const inherited = root && sourceDeviceToTargetDevice
+    ? {
+        a: sourceDeviceToTargetDevice.a * root.a + sourceDeviceToTargetDevice.c * root.b,
+        b: sourceDeviceToTargetDevice.b * root.a + sourceDeviceToTargetDevice.d * root.b,
+        c: sourceDeviceToTargetDevice.a * root.c + sourceDeviceToTargetDevice.c * root.d,
+        d: sourceDeviceToTargetDevice.b * root.c + sourceDeviceToTargetDevice.d * root.d,
+        e: sourceDeviceToTargetDevice.a * root.e + sourceDeviceToTargetDevice.c * root.f + sourceDeviceToTargetDevice.e,
+        f: sourceDeviceToTargetDevice.b * root.e + sourceDeviceToTargetDevice.d * root.f + sourceDeviceToTargetDevice.f,
+      }
+    : root && deviceOffset
+      ? { ...root, e: root.e - deviceOffset.x, f: root.f - deviceOffset.y }
+      : root;
+  const run = () => inherited
+    ? withPatternCoordinateSpace(target, inherited, paint)
+    : paint();
+  return scale === undefined
+    ? run()
+    : withPatternPointScale(target, scale, run);
+}
+
 /**
  * Build a tiling CanvasPattern for an OOXML preset pattern fill.
  * Falls back to the foreground colour string when the preset name is unknown
  * or the OffscreenCanvas / Canvas environment cannot create a pattern.
  *
- * Cached per (preset, fg, bg) tuple — patterns are immutable bitmaps so the
- * same backing canvas can be reused across many shapes.
+ * Cached per (preset, fg, bg, coordinate-unit scale) tuple. The per-context
+ * bound limits retained tile resources when a document uses many distinct
+ * colours.
  */
 const patternCache = new WeakMap<CanvasRenderingContext2D, Map<string, CanvasPattern>>();
+// 256 64×64 RGBA tiles retain at most 4 MiB of pixel data per context,
+// aside from CanvasPattern/Map bookkeeping; evict oldest colours beyond that.
+const MAX_PATTERN_CACHE_ENTRIES = 256;
 
 function resolvePatternFill(
   fill: PatternFill,
   ctx: CanvasRenderingContext2D,
+  ptToUserUnits: number,
+  coordinateTransform?: DOMMatrix2DInit,
 ): CanvasPattern | string {
-  const key = `${fill.preset}|${fill.fg}|${fill.bg}`;
+  const tx = coordinateTransform;
+  const key = `${fill.preset}|${fill.fg}|${fill.bg}|${ptToUserUnits}|${tx?.a ?? 1},${tx?.b ?? 0},${tx?.c ?? 0},${tx?.d ?? 1},${tx?.e ?? 0},${tx?.f ?? 0}`;
   let perCtx = patternCache.get(ctx);
   if (!perCtx) {
     perCtx = new Map();
@@ -264,6 +382,26 @@ function resolvePatternFill(
   if (!bitmap) return hexToRgba(fill.fg);
   const pat = ctx.createPattern(bitmap, 'repeat');
   if (!pat) return hexToRgba(fill.fg);
+  // PowerPoint PDF uses one point per 8×8-pixel bitmap cell. In CSS-pixel renderers,
+  // 1 pt = 4/3 px; DOCX supplies 1 because its paint coordinates are points.
+  // Zero translation anchors the tile to the caller's coordinate origin.
+  // PPTX and DOCX paint in slide/page coordinates. XLSX translates into a
+  // shape-local frame; its print PDF uses a different phase (see its painter).
+  if (typeof pat.setTransform === 'function') {
+    const sampleToUser = ptToUserUnits / 8;
+    pat.setTransform({
+      a: (tx?.a ?? 1) * sampleToUser,
+      b: (tx?.b ?? 0) * sampleToUser,
+      c: (tx?.c ?? 0) * sampleToUser,
+      d: (tx?.d ?? 1) * sampleToUser,
+      e: tx?.e ?? 0,
+      f: tx?.f ?? 0,
+    });
+  }
+  if (perCtx.size >= MAX_PATTERN_CACHE_ENTRIES) {
+    const oldest = perCtx.keys().next().value;
+    if (oldest !== undefined) perCtx.delete(oldest);
+  }
   perCtx.set(key, pat);
   return pat;
 }

@@ -7,6 +7,9 @@ import {
   chartStyleDashChoice,
 } from './effective-style.js';
 import {
+  chartExPointFillDecision,
+  chartExPointLinePaintDecision,
+  chartModelIsChartEx,
   chartStyleDirectFillDecision,
   chartStyleDirectLineDecision,
   chartStyleDirectNoFillDecision,
@@ -49,9 +52,14 @@ export function classicDataPointLineStyle(
   // paint and no `allowNoLineOverride` modifier. By contrast, a no-line value
   // coming from a structured style layer is a replacement while resolving
   // CT_StyleEntry and remains modifier-gated below.
-  let paint = point?.lineHidden === true
-    ? null
-    : chartStyleDirectLineDecision(pointStyle, rawLinked, point?.idx ?? styleIndex);
+  // ChartEx columns (histogram/Pareto) share the classic column family but
+  // follow the ChartEx direct-format cascade (see chartExPointFillDecision).
+  const chartEx = chartModelIsChartEx(chart);
+  let paint = chartEx
+    ? chartExPointLinePaintDecision(chart, series, point, styleIndex)
+    : point?.lineHidden === true
+      ? null
+      : chartStyleDirectLineDecision(pointStyle, rawLinked, point?.idx ?? styleIndex);
   if (paint === undefined) {
     if (point?.lineColor) paint = { fillType: 'solid', color: point.lineColor };
   }
@@ -97,6 +105,9 @@ export function classicDataPointFillDecision(
   styleIndex: number,
   pointIndex?: number,
 ): Fill | null | undefined {
+  if (chartModelIsChartEx(chart)) {
+    return chartExPointFillDecision(chart, series, point, styleIndex);
+  }
   const sourceSeriesIndex = chartSeriesSourceIndex(chart, series);
   const linkedRole = chartDataPointStyleRole(
     chart, 'dataPoint', sourceSeriesIndex >= 0 ? sourceSeriesIndex : styleIndex,

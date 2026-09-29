@@ -242,7 +242,7 @@ pub(crate) fn render_paragraph_md(
 
 fn runs_have_visible_text(runs: &[TextRun]) -> bool {
     runs.iter().any(|run| match run {
-        TextRun::Break => false,
+        TextRun::Break { .. } => false,
         TextRun::Math { nodes, .. } => !nodes_to_text(nodes).trim().is_empty(),
         TextRun::Text(text) => !text.text.trim().is_empty(),
     })
@@ -253,7 +253,7 @@ pub(crate) fn render_runs_md(runs: &[TextRun], out: &mut MarkdownWriter) {
         match run {
             // Intra-paragraph soft break (<a:br/>) → markdown hard line break
             // (two trailing spaces + newline).
-            TextRun::Break => out.push_str("  \n"),
+            TextRun::Break { .. } => out.push_str("  \n"),
             // Equations have no faithful markdown form; emit their flattened text.
             TextRun::Math { nodes, .. } => out.push_str(&nodes_to_text(nodes)),
             TextRun::Text(t) => {

@@ -855,7 +855,16 @@ describe('canonical paragraph-owned anchor registry (§20.4.2.3/.20 + §20.4.3.5
     expect(carriesOccurrenceExclusion(anchored[0]!)).toBe(false);
     expect(ownsOccurrence(anchored[1]!)).toBe(true);
     expect(carriesOccurrenceExclusion(anchored[1]!)).toBe(true);
-    expect(following).toHaveLength(2);
+    // The remeasured continuation keeps its own wrap geometry: the image sits
+    // at the fragment top and its lines, and the fragment advance, stay below
+    // it instead of being rebased over it (or lifting the image off the page).
+    const drawing = anchored[1]!.drawings[0]!;
+    expect(drawing.flowBounds.yPt).toBe(anchored[1]!.flowBounds.yPt);
+    expect(anchored[1]!.lines[0]!.bounds.yPt)
+      .toBe(drawing.flowBounds.yPt + drawing.flowBounds.heightPt);
+    expect(anchored[1]!.flowBounds.heightPt)
+      .toBeGreaterThanOrEqual(drawing.flowBounds.heightPt);
+    expect(following).toHaveLength(1);
     expect(layout.pages).toHaveLength(3);
   });
 

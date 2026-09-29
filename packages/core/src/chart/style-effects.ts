@@ -1,7 +1,7 @@
 import type { Glow, Reflection, Shadow, SoftEdge } from '../types/common.js';
 import type { ChartExElementStyle } from '../types/chart.js';
 import { MAX_CANVAS_AREA } from '../canvas/clamp.js';
-import { hexToRgba } from '../shape/paint.js';
+import { hexToRgba, withInheritedPatternScope } from '../shape/paint.js';
 import {
   applyInnerShadow,
   applyOuterShadow,
@@ -289,8 +289,10 @@ export function paintChartStyleEffects(
   const [deviceW, deviceH] = canvasExtent(ctx);
   const haveDeviceCanvas = deviceW > 0 && deviceH > 0;
   const devicePaint: PaintShape = target => {
-    target.setTransform(transform as DOMMatrix2DInit);
-    paintBody(target as CanvasRenderingContext2D);
+    withInheritedPatternScope(ctx, target as CanvasRenderingContext2D, () => {
+      target.setTransform(transform as DOMMatrix2DInit);
+      paintBody(target as CanvasRenderingContext2D);
+    });
   };
   const resetToDevice = () => ctx.setTransform(1, 0, 0, 1, 0, 0);
 

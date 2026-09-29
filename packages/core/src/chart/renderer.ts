@@ -31,7 +31,7 @@ import { withSparseStyleIndexCache } from './sparse-style-index.js';
 
 import { applyPlotVisibleOnly } from './source-visibility.js';
 
-import { resolveFill } from '../shape/paint.js';
+import { resolveFill, withPatternPointScale } from '../shape/paint.js';
 
 import { EMU_PER_PT, PT_TO_PX } from '../units.js';
 
@@ -364,6 +364,9 @@ function renderChartImpl(
   }
 }
 
+/** Paint a chart in the host's user units. Excel's chart PDF controls keep a
+ * fixed page-grid phase when its chart anchor moves; the host supplies only
+ * the point-to-user-unit scale. */
 export function renderChart(
   ctx: CanvasRenderingContext2D,
   chart: ChartModel,
@@ -375,7 +378,7 @@ export function renderChart(
   imageLookup?: ChartImageLookup,
   chartEx?: ChartExRenderer,
 ): void {
-  withChartStyleIndexCache(() => {
+  withPatternPointScale(ctx, ptToPx, () => withChartStyleIndexCache(() => {
     withSparseStyleIndexCache(() => {
       withChartImageLookup(imageLookup, () => {
         const sourceStructureCount = sourceChartStructureCount(chart);
@@ -396,5 +399,5 @@ export function renderChart(
         }, undefined, effectConsumers);
       });
     });
-  });
+  }));
 }

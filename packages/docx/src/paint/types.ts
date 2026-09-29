@@ -67,6 +67,9 @@ export interface CanvasPaintContext {
   readonly ctx: PaintCanvas2D;
   readonly scale: number;
   readonly dpr: number;
+  /** Page-to-device frame for DrawingML pattern fills. Chart and VML hosts
+   * keep their own fill-coordinate policy. */
+  readonly patternPageToDevice?: DOMMatrix2DInit;
   /** Document-level fallback retained independently from any enclosing
    * DrawingML text-box `fontRef` color override. */
   readonly documentDefaultTextColor?: string;

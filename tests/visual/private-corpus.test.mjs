@@ -4,7 +4,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { PNG } from 'pngjs';
-import { clearPrivateCandidateItemOutput, pngPixelsEqual } from './private-corpus.mjs';
+import {
+  clearPrivateCandidateItemOutput,
+  harnessBootstrapDiffViolations,
+  pngPixelsEqual,
+} from './private-corpus.mjs';
 
 test('private corpus self-VRT compares decoded pixels, not encoder bytes', () => {
   const image = new PNG({ width: 2, height: 1 });
@@ -44,4 +48,23 @@ test('candidate capture discards stale pages without following local evidence sy
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test('harness bootstrap allows only test-renderer alias lines in Vite configs', () => {
+  const header = [
+    'diff --git a/packages/pptx/vite.config.ts b/packages/pptx/vite.config.ts',
+    '--- a/packages/pptx/vite.config.ts',
+    '+++ b/packages/pptx/vite.config.ts',
+    '@@ -20,0 +21 @@',
+  ];
+  const alias = "+      '@ooxml-test-chart-ex-renderer': resolve(dirname, '../../src/chart-ex.ts'),";
+  assert.deepEqual(harnessBootstrapDiffViolations([...header, alias].join('\n')), []);
+  assert.deepEqual(
+    harnessBootstrapDiffViolations([
+      ...header,
+      alias,
+      "+  define: { __OOXML_MODEL_SOURCES__: 'false' },",
+    ].join('\n')),
+    ["+  define: { __OOXML_MODEL_SOURCES__: 'false' },"],
+  );
 });

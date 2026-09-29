@@ -6,7 +6,7 @@ import { resolveDrawingMlTabWidths, type DrawingMlTabStop } from './tab.js';
 
 export type DrawingMlInputRun<T> =
   | { type: 'text'; text: string; style: T }
-  | { type: 'break' }
+  | { type: 'break'; style?: T }
   | { type: 'object'; width: number; style: T; payload?: unknown; display?: boolean };
 
 export type DrawingMlLineSegment<T> =
@@ -30,6 +30,8 @@ export interface DrawingMlBrokenLine<T> {
    * input index. PowerPoint sizes such a line by the run (controls L07, L08).
    */
   lineFeedRun?: number;
+  /** Index of the authored a:br that closes this line, for its rPr metrics. */
+  endBreakRun?: number;
 }
 
 export interface DrawingMlBreakOptions<T> {
@@ -101,10 +103,12 @@ export function breakDrawingMlText<T>(
   const runRegion: number[] = [];
   /** Input run whose line feed opened each region, else -1. */
   const regionLineFeedRun: number[] = [-1];
+  const regionEndBreakRun: number[] = [];
   let runIndex = 0;
   for (const run of runs) {
     runRegion.push(regions.length - 1);
     if (run.type === 'break') {
+      regionEndBreakRun[regions.length - 1] = runIndex;
       regions.push([]);
       regionLineFeedRun.push(-1);
       runIndex++;
@@ -652,6 +656,7 @@ export function breakDrawingMlText<T>(
         segments: [], width: 0,
         ...(regionIndex + 1 < regions.length ? { endsWithBreak: true } : {}),
         ...(regionLineFeedRun[regionIndex] >= 0 ? { lineFeedRun: regionLineFeedRun[regionIndex] } : {}),
+        ...(regionEndBreakRun[regionIndex] !== undefined ? { endBreakRun: regionEndBreakRun[regionIndex] } : {}),
       });
       continue;
     }
@@ -759,6 +764,14 @@ export function breakDrawingMlText<T>(
       start = split;
       while (start < end && isSpace(atoms[start])) start++;
     }
+  }
+
+  for (let region = 0; region < regionEndBreakRun.length; region++) {
+    const run = regionEndBreakRun[region];
+    if (run === undefined) continue;
+    const first = regionFirstLine[region];
+    const after = region + 1 < regionFirstLine.length ? regionFirstLine[region + 1] : lines.length;
+    if (after > first) lines[after - 1].endBreakRun = run;
   }
 
   // A text run that paints nothing sits on the line holding the preceding

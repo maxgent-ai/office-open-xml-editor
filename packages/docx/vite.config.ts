@@ -17,6 +17,7 @@ export default defineConfig({
       '@ooxml-test-region-map-renderer': resolve(__dirname, '../../src/region-map.ts'),
       '@ooxml-test-math-renderer': resolve(__dirname, '../../src/math.ts'),
       '@ooxml-test-tiff-renderer': resolve(__dirname, '../../src/tiff.ts'),
+      '@ooxml-test-chart-ex-renderer': resolve(__dirname, '../../src/chart-ex.ts'),
     },
   },
   build: {

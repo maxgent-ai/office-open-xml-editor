@@ -1942,6 +1942,8 @@ export interface ShapeParagraph {
         algn: string;
     }[];
     spaceLine?: SpaceLine | null;
+    spaceBefore?: SpaceLine | null;
+    spaceAfter?: SpaceLine | null;
     runs: ShapeTextRun[];
 }
 export interface ShapeText {

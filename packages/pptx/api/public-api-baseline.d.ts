@@ -1118,6 +1118,12 @@ export interface LightRig {
 }
 export interface LineBreak {
     type: 'break';
+    fontSize?: number;
+    fontFamily?: string;
+    bold?: boolean;
+    italic?: boolean;
+    characterAttributes?: Record<string, string>;
+    characterChildAttributes?: Record<string, Record<string, string>>;
 }
 export type LoadOptions = LoadOptions__emitterCollision1 & {
     mode?: 'main' | 'worker';
@@ -1413,6 +1419,7 @@ interface Paragraph__emitterCollision1 {
     tabStops: TabStop[];
     rtl?: boolean;
     runs: TextRun[];
+    endRunProperties?: TextRunData;
 }
 export type PathCmd = {
     cmd: 'moveTo';
@@ -2111,6 +2118,7 @@ interface TextBody__emitterCollision1 {
 export interface TextOutline {
     width: number;
     color?: string;
+    fill?: Fill;
 }
 export interface TextRect {
     x: number;
@@ -2122,18 +2130,26 @@ export type TextRun = TextRunData | LineBreak | EquationRun;
 export type TextRunCallback = (run: PptxTextRunInfo) => void;
 export interface TextRunData {
     type: 'text';
+    hyperlinkUsesTextFill?: boolean;
     text: string;
     bold: boolean | null;
     italic: boolean | null;
     underline: boolean;
     underlineStyle?: string;
     underlineColor?: string;
+    underlineFill?: Fill;
+    underlineLine?: TextOutline;
+    underlineLineNoFill?: boolean;
     strikethrough: boolean;
     strikeDouble?: boolean;
     fontSize: number | null;
     color: string | null;
+    patternFill?: PatternFill;
+    glyphFill?: Fill;
+    noFill?: boolean;
     fontFamily: string | null;
     fontFamilyEa?: string;
+    fontFamilyCs?: string;
     fontFamilySym?: string;
     baseline?: number;
     caps?: 'none' | 'small' | 'all';
@@ -2141,10 +2157,14 @@ export interface TextRunData {
     fieldType?: string;
     hyperlink?: string;
     hyperlinkAction?: string;
+    hyperlinkMouseOver?: string;
+    hyperlinkMouseOverAction?: string;
     shadow?: Shadow;
     reflection?: Reflection;
     outline?: TextOutline;
     highlight?: string;
+    characterAttributes?: Record<string, string>;
+    characterChildAttributes?: Record<string, Record<string, string>>;
 }
 export interface TextSelectionContextOptions {
     readonly maxTextCharacters?: number;

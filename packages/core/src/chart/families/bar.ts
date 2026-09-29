@@ -78,7 +78,7 @@ import { drawScatterSeriesLayer } from '../shared/scatter-paint.js';
 import { drawChartMarker, seriesHasResolvedMarkerDetail } from '../shared/markers.js';
 import { clamp, appendCurve, dashPatternForPreset } from '../shared/geometry.js';
 
-import { chartExDataPointFill, chartExDataPointPaint, paintClassicDataPointPath, paintClassicDataPointRect, applyChartExSeriesLineStyle, chartExLegendSeries } from '../shared/chartex-style.js';
+import { chartExDataPointFill, chartExDataPointPaint, paintClassicDataPointPath, paintClassicDataPointRect, applyChartExSeriesLineStyle, applyResolvedChartExLineStyle, chartExLegendSeries, resolveChartExLineChain, resolveChartExPointFill, resolveChartExPointLine } from '../shared/chartex-style.js';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Bar chart — vertical columns + horizontal bars, clustered + stacked +
@@ -1352,12 +1352,33 @@ export function renderBarChart(
       const pointOwnsFill = pointStructuredFill !== undefined
         || pointNoFill !== undefined
         || pointOverride?.color != null;
-      const pointPaint = pointOwnsFill
-        ? styleFill
-        : invertedPaint !== undefined
-          ? invertedPaint
-          : styleFill;
+      // ChartEx columns (histogram/pareto) use the ChartEx direct-format
+      // cascade, in which a direct point or series no-fill/no-line owns its
+      // atom without the classic allowNo*Override gate.
+      const chartExPointFill = isChartExColumn
+        ? resolveChartExPointFill(
+          chart, s, pointOverride, pointStyleIndex, barSeries.length,
+        )
+        : undefined;
+      const pointPaint = chartExPointFill !== undefined
+        ? chartExPointFill
+        : pointOwnsFill
+          ? styleFill
+          : invertedPaint !== undefined
+            ? invertedPaint
+            : styleFill;
       const applyPointOutline = (target: CanvasRenderingContext2D): boolean => {
+        if (isChartExColumn) {
+          return applyResolvedChartExLineStyle(
+            target,
+            resolveChartExPointLine(
+              chart, s, pointOverride, pointStyleIndex, barSeries.length, color,
+            ),
+            ptToPx,
+            { x: px0, y: py0, w: pw, h: ph },
+            shapeRotationDeg,
+          );
+        }
         const hasPointLine = pointOverride?.lineHidden != null
           || pointOverride?.lineColor != null
           || pointOverride?.lineWidthEmu != null
@@ -2035,7 +2056,33 @@ export function renderBarChart(
           options.semanticLineNoStyleFallback !== false,
         );
       } else {
+        const strokeOverlayRuns = (target: CanvasRenderingContext2D): void => {
+          target.beginPath();
+          for (const points of runs) {
+            target.moveTo(points[0].x, points[0].y);
+            appendCurve(target, points, smooth);
+          }
+          target.stroke();
+        };
         const paintOverlayLine = (target: CanvasRenderingContext2D): void => {
+          if (isChartExColumn) {
+            // PowerPoint-observed ChartEx Pareto line: direct `a:ln`, then the
+            // dataPoint role line, then dataPointLine, else the dataPoint fill
+            // colour at the 0.75 pt default. Geometry follows the same roles.
+            const roles = [chart.chartexDataPointStyle, chart.chartexDataPointLineStyle];
+            const paretoLine = resolveChartExLineChain(
+              chart, s, roles, roles, styleIndex, lineSeries.length,
+              `#${chartExDataPointFill(chart, styleIndex, lineSeries.length, s.chartexStyle)}`,
+              { linkedNoStyleFallback: true },
+            );
+            if (!applyResolvedChartExLineStyle(
+              // No bounds: structured Pareto line paint stays solid, as on
+              // main, because the paint-work budget does not count it.
+              target, { ...paretoLine, semanticFallback: false }, ptToPx,
+            )) return;
+            strokeOverlayRuns(target);
+            return;
+          }
           const visible = hasAuthoredLine
             ? applyChartExSeriesLineStyle(
               target,
@@ -2055,12 +2102,7 @@ export function renderBarChart(
             target.lineWidth = 2;
             target.setLineDash([]);
           }
-          target.beginPath();
-          for (const points of runs) {
-            target.moveTo(points[0].x, points[0].y);
-            appendCurve(target, points, smooth);
-          }
-          target.stroke();
+          strokeOverlayRuns(target);
         };
         paintChartStyleEffects(
           ctx,

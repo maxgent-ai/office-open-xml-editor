@@ -107,7 +107,10 @@ boundary precedes that paint cascade: `<c:ser>` / `<c:dPt>`
 `spPr/a:ln/a:noFill` removes the series connector or point outline itself, so
 an unmodified linked `dataPointLine` / `dataPoint` role cannot recreate it.
 The modifier rule still applies when no-line is contributed by a style layer
-rather than by that classic mark-visibility property.
+rather than by that classic mark-visibility property. ChartEx data points are
+a second boundary: a direct `<cx:series>` / `<cx:dataPt>` `spPr` `a:noFill`
+or `a:ln/a:noFill` removes the point fill or outline without the modifiers,
+as observed in PowerPoint across every ChartEx family.
 Numeric style definitions, source-layer composition, and Canvas role adapters
 are separate implementation layers. Numeric style semantics are always on:
 `c:style` is document content, not an optional enhancement. Resource ceilings

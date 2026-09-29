@@ -20,6 +20,7 @@ export default defineConfig({
       '@ooxml-test-region-map-renderer': resolve(dirname, '../../src/region-map.ts'),
       '@ooxml-test-math-renderer': resolve(dirname, '../../src/math.ts'),
       '@ooxml-test-tiff-renderer': resolve(dirname, '../../src/tiff.ts'),
+      '@ooxml-test-chart-ex-renderer': resolve(dirname, '../../src/chart-ex.ts'),
     },
   },
   server: { port: 5175, strictPort: true },

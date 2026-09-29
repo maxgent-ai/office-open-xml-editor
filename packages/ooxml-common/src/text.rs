@@ -55,7 +55,8 @@ pub fn parse_lnspc(ln_spc: Node<'_, '_>) -> Option<SpaceLine> {
 
 /// Parse a located `<a:bodyPr>` node's autofit child (ECMA-376 §21.1.2.1.1-.4).
 /// Returns `None` when the `<a:bodyPr>` has *no* autofit child, so the caller
-/// applies its own default (pptx defers to the theme txDef; xlsx uses `none`).
+/// applies its own default (pptx: the inherited placeholder value; both formats
+/// then fall back to `none`).
 /// Otherwise returns `Some((auto_fit, font_scale, ln_spc_reduction))`:
 ///
 /// - `<a:spAutoFit>` → `("sp", None, None)`
@@ -104,7 +105,7 @@ pub const DEFAULT_INS_TB_EMU: i64 = 45_720;
 ///
 /// Every field is already defaulted — [`parse_body_pr`] layers the bodyPr's own
 /// attributes over a caller-supplied [`BodyPrDefaults`] (which carries each
-/// host's inheritance + theme-objectDefaults resolution). No serde: each parser
+/// host's inheritance resolution). No serde: each parser
 /// maps these onto its own model type (pptx `TextBody`, xlsx `ShapeText`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct BodyPr {
@@ -134,8 +135,8 @@ pub struct BodyPr {
 
 /// Defaults for each `<a:bodyPr>` field, applied by [`parse_body_pr`] when the
 /// attribute (or autofit child) is absent. The caller pre-resolves these from
-/// its own inheritance chain (e.g. pptx: inherited placeholder anchor → theme
-/// `objectDefaults` → spec default; xlsx: just the spec default). Use
+/// its own inheritance chain (e.g. pptx: inherited placeholder anchor → spec
+/// default; xlsx: just the spec default). Use
 /// [`BodyPrDefaults::spec`] for the bare ECMA-376 defaults.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BodyPrDefaults {
@@ -308,7 +309,7 @@ mod tests {
     }
 
     /// A `<a:bodyPr>` with NO autofit child → None, so the caller applies its own
-    /// default (pptx: theme txDef; xlsx: "none").
+    /// default (pptx: inherited placeholder value; xlsx: "none").
     #[test]
     fn parse_autofit_none_when_no_child() {
         let xml = format!(r#"<a:bodyPr xmlns:a="{A_NS}" anchor="ctr" wrap="square"/>"#);

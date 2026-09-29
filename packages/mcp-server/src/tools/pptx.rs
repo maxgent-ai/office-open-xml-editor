@@ -127,7 +127,7 @@ fn append_runs(paragraph: &Paragraph, out: &mut String) {
     for run in &paragraph.runs {
         match run {
             TextRun::Text(data) => out.push_str(&data.text),
-            TextRun::Break => out.push('\n'),
+            TextRun::Break { .. } => out.push('\n'),
             TextRun::Math { .. } => {}
         }
     }

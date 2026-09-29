@@ -51,11 +51,46 @@ function recordingContext() {
     createRadialGradient(...args: unknown[]) {
       operations.push({ name: 'createRadialGradient', args }); return gradient;
     },
+    createPattern() {
+      return {
+        setTransform(matrix: DOMMatrix2DInit) {
+          operations.push({ name: 'patternTransform', args: [matrix] });
+        },
+      };
+    },
   } as unknown as CanvasRenderingContext2D;
   return { ctx, operations, gradient };
 }
 
 describe('shared DrawingML shape painter', () => {
+  it('keeps a DOCX point-space pattern on the page-origin 8 pt grid', () => {
+    const previous = globalThis.OffscreenCanvas;
+    class TileCanvas {
+      constructor(public width: number, public height: number) {}
+      getContext() { return { fillStyle: '', fillRect() {} }; }
+    }
+    Object.defineProperty(globalThis, 'OffscreenCanvas', {
+      configurable: true, value: TileCanvas,
+    });
+    try {
+      const { ctx, operations } = recordingContext();
+      paintDrawingMLShape(ctx, {
+        rect: { x: 90, y: 62.18, w: 432, h: 72 },
+        geometry: { kind: 'preset', name: 'rect', adjustments: [] },
+        fill: { fillType: 'pattern', preset: 'pct30', fg: 'D21D54', bg: '12CED4' },
+        stroke: null,
+        transform: { rotationDeg: 0, flipH: false, flipV: false },
+      }, 1);
+      expect(operations).toContainEqual({
+        name: 'patternTransform', args: [{ a: 1 / 8, b: 0, c: 0, d: 1 / 8, e: 0, f: 0 }],
+      });
+    } finally {
+      Object.defineProperty(globalThis, 'OffscreenCanvas', {
+        configurable: true, value: previous,
+      });
+    }
+  });
+
   it('renders preset geometry, gradients, transforms, and point-width strokes once', () => {
     const plan: DrawingMLShapePaintPlan = {
       rect: { x: 10, y: 20, w: 100, h: 50 },

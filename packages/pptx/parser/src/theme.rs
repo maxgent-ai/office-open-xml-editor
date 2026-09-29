@@ -175,10 +175,9 @@ mod relationship_tests {
 ///
 /// The clrScheme and fontScheme are parsed by the shared
 /// [`ooxml_common::theme`] grammar; this function keeps pptx's flat merged-map
-/// storage (colors, `+mj-lt`/`+mn-*` font keys and
-/// `+txDef`/`+spDef` object defaults all in one `HashMap<String, String>`)
-/// because ~30 call sites look these up by string key. Existing fill/effect
-/// fragment adapters and objectDefaults stay local. Structured line recipes
+/// storage (colors and `+mj-lt`/`+mn-*` font keys all in one
+/// `HashMap<String, String>`) because ~30 call sites look these up by string
+/// key. Existing fill/effect fragment adapters stay local. Structured line recipes
 /// are retained by [`PptxTheme`] instead of being flattened into width
 /// sentinels.
 pub(crate) fn parse_theme_colors(xml: &str) -> HashMap<String, String> {
@@ -249,74 +248,9 @@ pub(crate) fn parse_theme_colors(xml: &str) -> HashMap<String, String> {
         }
     }
 
-    // Parse <a:objectDefaults> per ECMA-376 §20.1.6.7. PowerPoint stores
-    // `<a:txDef>` (text-box default), `<a:spDef>` (shape default) and
-    // `<a:lnDef>` (line default) here; their `<a:bodyPr>` settings are the
-    // last-resort fallback below master/layout/slide for any text body that
-    // doesn't override the attribute. Sample-2 hides a `<a:spAutoFit/>`
-    // inside its txDef — without inheriting it, every text box in the
-    // template defaults to "noAutofit + wrap=square" (the spec literal),
-    // which makes mixed-size runs like "20代" wrap unnecessarily and
-    // reproduces the slide-13 regression on every similar deck. We parse
-    // the bodyPr attributes (and the autoFit child element) into namespaced
-    // theme keys so `parse_text_body` can fall back through them without
-    // changing function signatures.
-    if let Some(obj_defaults) = root
-        .descendants()
-        .find(|n| n.is_element() && n.tag_name().name() == "objectDefaults")
-    {
-        let read_def = |def_name: &str, key_prefix: &str, map: &mut HashMap<String, String>| {
-            let Some(def) = child(obj_defaults, def_name) else {
-                return;
-            };
-            let Some(body_pr) = child(def, "bodyPr") else {
-                return;
-            };
-            // Plain attributes — copy verbatim; consumers parse the strings.
-            for attr_name in [
-                "wrap",
-                "anchor",
-                "anchorCtr",
-                "vert",
-                "rtlCol",
-                "lIns",
-                "rIns",
-                "tIns",
-                "bIns",
-                "numCol",
-                "spcCol",
-                "vertOverflow",
-                "horzOverflow",
-                "spcFirstLastPara",
-                "rot",
-                "upright",
-                "fromWordArt",
-                "forceAA",
-                "compatLnSpc",
-            ] {
-                if let Some(v) = attr(&body_pr, attr_name) {
-                    map.insert(format!("{key_prefix}-bodyPr-{attr_name}"), v);
-                }
-            }
-            // Auto-fit is a child element, not an attribute. Encode as
-            // `{prefix}-autoFit` → "sp" | "norm" | "none".
-            let auto_fit = if child(body_pr, "spAutoFit").is_some() {
-                "sp"
-            } else if child(body_pr, "normAutofit").is_some() {
-                "norm"
-            } else {
-                "none"
-            };
-            // Only record when explicit; "none" is the spec default and
-            // recording it would make every consumer see `Some("none")` even
-            // for themes that didn't say anything.
-            if auto_fit != "none" {
-                map.insert(format!("{key_prefix}-autoFit"), auto_fit.to_owned());
-            }
-        };
-        read_def("txDef", "+txDef", &mut map);
-        read_def("spDef", "+spDef", &mut map);
-    }
+    // `<a:objectDefaults>` (ECMA-376 §20.1.6.7) is intentionally not read:
+    // PowerPoint applies txDef/spDef/lnDef only to objects newly inserted in
+    // its UI, never to shapes already in the file (see parse_text_body).
 
     map
 }

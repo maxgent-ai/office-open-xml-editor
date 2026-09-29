@@ -31,6 +31,8 @@ import {
   buildCustomPath as buildCustomPathCore,
   hexToRgba as hexToRgbaCore,
   resolveFill as resolveFillCore,
+  withPatternCoordinateSpace,
+  withInheritedPatternScope,
   applyStroke as applyStrokeCore,
   buildShapePath,
   EMU_PER_PT as PT_TO_EMU,
@@ -78,6 +80,7 @@ import {
   NON_CJK_SERIF_FALLBACKS,
   DEFAULT_KINSOKU_RULES,
   isCjkBreakChar,
+  isComplexScriptCodePoint,
   isUax14NoBreakPair,
   lineBreakClass,
   containsSeaScript,
@@ -155,11 +158,15 @@ import { justifiedPiecePositions } from '@silurus/ooxml-core';
 import { resolveTableBorderConflict } from './table-border-conflict.js';
 import { isSmartArtFallbackShape, smartArtFallbackTextColor } from './smartart-fallback-contrast';
 import { resolveTabWidths, type TabItem, type TabStopPx } from './tab-layout.js';
+import {
+  powerPointAscentShare, powerPointExactLinePoints, powerPointNaturalLine,
+} from './powerpoint-line-metrics.js';
 import { drawEaVertRun } from './vertical-text.js';
 import {
   breakDrawingMlText,
   measureDrawingMlAdvance,
   drawingMlLineHeight,
+  drawingMlSpacedLineBox,
   drawingMlLineX,
   drawingMlLineShouldJustify,
   drawingMlBlockTop,
@@ -569,8 +576,8 @@ const hexToRgba = hexToRgbaCore;
  * shadow is set on the context so the box itself isn't shadowed. `width` is the
  * glyph advance computed by the caller (it differs between the normal and
  * tab-stop paths only by the justification stretch added to it). The vertical
- * band comes from the shared `highlightBox` helper. `glyphColor` restores
- * `ctx.fillStyle` so the subsequent fillText draws in the run colour.
+ * band comes from the shared `highlightBox` helper. Restore the resolved glyph
+ * paint, which may be a CanvasPattern, before the subsequent fillText.
  */
 export function paintHighlight(
   ctx: CanvasRenderingContext2D,
@@ -579,12 +586,12 @@ export function paintHighlight(
   width: number,
   fontPx: number,
   highlight: string,
-  glyphColor: string,
+  glyphPaint: string | CanvasGradient | CanvasPattern,
 ): void {
   const { top, height } = highlightBox(baseline, fontPx);
   ctx.fillStyle = highlight;
   ctx.fillRect(x, top, width, height);
-  ctx.fillStyle = glyphColor;
+  ctx.fillStyle = glyphPaint;
 }
 
 /** Simple fill resolver that returns a CSS color string.
@@ -609,8 +616,9 @@ export function resolveShapeFill(
   ctx: CanvasRenderingContext2D,
   x: number, y: number, w: number, h: number,
   shapeRotationDeg = 0,
+  patternPtToUserUnits = 4 / 3,
 ): string | CanvasGradient | CanvasPattern | null {
-  return resolveFillCore(fill, ctx, x, y, w, h, shapeRotationDeg);
+  return resolveFillCore(fill, ctx, x, y, w, h, shapeRotationDeg, patternPtToUserUnits);
 }
 
 // ===== Text layout helpers =====
@@ -703,6 +711,13 @@ type LayoutSegment = {
   font: string;
   /** Inline DrawingML TAB, classified UAX#9 S during visual ordering (#916). */
   isTab?: true;
+  /** PowerPoint's ascent share for this segment's face (see
+   * powerPointAscentShare); undefined when the face is not resolvable. */
+  lineMetricShare?: number;
+  /** Share of the run's latin face. PowerPoint sizes a line by the run's
+   * latin face even when an East Asian segment draws none of its glyphs
+   * (#1610 powerpoint-line-supplement-3); null when unresolved. */
+  lineMetricLatinShare?: number | null;
   /** Reading-frame gap resolved against a:tabLst immediately before paint. */
   tabWidthPx?: number;
   sizePx: number;
@@ -713,11 +728,17 @@ type LayoutSegment = {
    */
   drawSizePx?: number;
   color: string;
+  patternFill?: Extract<Fill, { fillType: 'pattern' }>;
+  noFill?: boolean;
   underline: boolean;
   /** OOXML rPr @u value when not the default "sng": "dbl"/"dotted"/"wavy"/etc. */
   underlineStyle?: string;
   /** rgba() colour for the underline when uFill overrides the text colour. */
   underlineColor?: string;
+  /** Explicit rPr > uFill; otherwise the underline follows the glyph paint. */
+  underlineFill?: Fill;
+  underlineLine?: import('@silurus/ooxml-core').TextOutline;
+  underlineLineNoFill?: boolean;
   strikethrough: boolean;
   /** Two parallel strike lines (rPr strike="dblStrike"). */
   strikeDouble?: boolean;
@@ -757,6 +778,23 @@ type LayoutSegment = {
     descent: number;
   };
 };
+
+type TextPaint = string | CanvasGradient | CanvasPattern;
+
+/** Resolve a run once per destination canvas. Effects and decorations consume
+ * this same paint; a reflection's auxiliary canvas resolves the same source
+ * again inside its inherited slide coordinate scope. */
+function resolveSegmentTextPaint(
+  ctx: CanvasRenderingContext2D,
+  seg: LayoutSegment,
+  x: number,
+  baseline: number,
+  scale: number,
+): TextPaint {
+  return seg.patternFill
+    ? resolveFillCore(seg.patternFill, ctx, x, baseline, 0, 0, 0, scale * PT_TO_EMU) ?? seg.color
+    : seg.color;
+}
 
 interface LayoutLine {
   segments: LayoutSegment[];
@@ -981,7 +1019,9 @@ function applyTextRunReflection(
     liveTransform.e - cropX,
     liveTransform.f - cropY,
   );
-  paintText(sourceCtx);
+  // The reflection source is cropped in device space. Carry the slide pattern
+  // frame into that crop so a patterned glyph keeps its original tile phase.
+  withInheritedPatternScope(liveCtx, sourceCtx, () => paintText(sourceCtx), { x: cropX, y: cropY });
   sourceCtx.restore();
 
   const localTop = bbox.y - cropY;
@@ -1100,6 +1140,23 @@ export function buildFont(
 }
 
 /**
+ * The PowerPoint line-metric share of a resolved family (see
+ * powerPointAscentShare). A document-embedded face has its own bytes, which
+ * the reference catalog does not describe, so it has no share, and neither
+ * does a CSS generic family.
+ */
+function lineMetricShareFor(
+  family: string,
+  bold: boolean,
+  italic: boolean,
+  rc: RenderContext,
+): number | undefined {
+  if (CSS_GENERIC_FAMILIES.has(family)) return undefined;
+  if (rc.embeddedFontAuthoredFamilies?.has(family)) return undefined;
+  return powerPointAscentShare(family, bold, italic);
+}
+
+/**
  * Lay out a paragraph into display lines.
  * Handles:
  *  - Explicit line breaks (TextRun type='break')
@@ -1168,6 +1225,9 @@ function firstLineIndentPxFor(hasBullet: boolean, indentPx: number): number {
  * hyphen; it does not erase a break opportunity supplied by an authored hyphen.
  */
 const LATIN_SCALAR_RE = /^\p{Script_Extensions=Latin}$/u;
+// The core predicate covers the RTL cs axis. DrawingML also routes Indic and
+// Southeast Asian shaping scripts through a:cs when that font slot is present.
+const INDIC_CS_GLYPH_RE = /[\p{Script=Devanagari}\p{Script=Thai}\p{Script=Bengali}\p{Script=Tamil}\p{Script=Telugu}\p{Script=Kannada}\p{Script=Malayalam}\p{Script=Gujarati}\p{Script=Gurmukhi}\p{Script=Oriya}\p{Script=Sinhala}\p{Script=Khmer}\p{Script=Lao}\p{Script=Myanmar}\p{Script=Tibetan}]/u;
 const LETTER_SCALAR_RE = /^\p{L}$/u;
 const ASCII_SCALARS_RE = /^[\u0000-\u007f]*$/u;
 
@@ -1395,7 +1455,21 @@ export function layoutParagraph(
   const input: DrawingMlInputRun<LayoutSegment>[] = [];
   for (const [sourceRunId, run] of para.runs.entries()) {
     if (run.type === 'break') {
-      input.push({ type: 'break' });
+      const sizePx = run.fontSize != null
+        ? run.fontSize * PT_TO_EMU * scale * fontScale : defaultFontSizePx;
+      const family = normalizeFontFamily(run.fontFamily ?? para.defFontFamily ?? null, rc);
+      const bold = run.bold ?? para.defBold ?? defaultBold;
+      const italic = run.italic ?? para.defItalic ?? defaultItalic;
+      const style: LayoutSegment | undefined = run.fontSize != null || run.fontFamily != null
+        || run.bold != null || run.italic != null
+        ? {
+            text: '', sizePx, color: defaultColor,
+            font: buildFont(bold, italic, sizePx, family, rc, ''),
+            underline: false, strikethrough: false,
+            lineMetricShare: lineMetricShareFor(family, bold, italic, rc),
+          }
+        : undefined;
+      input.push({ type: 'break', style });
       continue;
     }
     if (run.type === 'math') {
@@ -1422,6 +1496,7 @@ export function layoutParagraph(
     const drawSizePx = baselineDrawSizePx(sizePx, run.baseline ?? undefined);
     const family = normalizeFontFamily(run.fontFamily ?? para.defFontFamily ?? null, rc);
     const familyEa = run.fontFamilyEa ? normalizeFontFamily(run.fontFamilyEa, rc) : null;
+    const familyCs = run.fontFamilyCs ? normalizeFontFamily(run.fontFamilyCs, rc) : null;
     const familySym = run.fontFamilySym ? normalizeFontFamily(run.fontFamilySym, rc) : null;
     const bold = run.bold ?? para.defBold ?? defaultBold;
     const italic = run.italic ?? para.defItalic ?? defaultItalic;
@@ -1432,14 +1507,23 @@ export function layoutParagraph(
       hasNamedFontFamily(run.fontFamily ?? para.defFontFamily));
     const eaFont = familyEa
       ? buildFont(bold, italic, drawSizePx, familyEa, rc, rawText) : baseFont;
+    const csFont = familyCs
+      ? buildFont(bold, italic, drawSizePx, familyCs, rc, rawText) : baseFont;
     const letterSpacingPx = (run.letterSpacing ?? 0) * PT_TO_EMU * scale;
     const color = run.color ? hexToRgba(run.color)
       : run.hyperlink && rc.themeHlinkColor ? hexToRgba(rc.themeHlinkColor) : defaultColor;
     const baseStyle: LayoutSegment = {
       text: '', font: baseFont, sizePx, drawSizePx, color,
+      // PowerPoint's default hyperlink theme colour masks pattFill. Reapplying
+      // the text fill writes hlinkClr="tx" and restores the authored pattern.
+      patternFill: run.hyperlink && !run.hyperlinkUsesTextFill ? undefined : run.patternFill,
+      noFill: run.noFill,
       underline: run.underline || run.hyperlink !== undefined,
       underlineStyle: run.underlineStyle,
       underlineColor: run.underlineColor ? hexToRgba(run.underlineColor) : undefined,
+      underlineFill: run.underlineFill,
+      underlineLine: run.underlineLine,
+      underlineLineNoFill: run.underlineLineNoFill,
       strikethrough: run.strikethrough,
       strikeDouble: run.strikeDouble === true,
       letterSpacingPx: letterSpacingPx || undefined,
@@ -1455,37 +1539,59 @@ export function layoutParagraph(
     // the selected font changes, leaving run seams and break policy to core.
     let group = '';
     let groupFont = '';
+    let groupShare: number | undefined;
+    const latinShare = lineMetricShareFor(family, bold, italic, rc) ?? null;
     const emitGroup = () => {
-      if (group) input.push({ type: 'text', text: group, style: { ...baseStyle, font: groupFont } });
+      if (group) {
+        input.push({ type: 'text', text: group,
+          style: { ...baseStyle, font: groupFont, lineMetricShare: groupShare,
+            lineMetricLatinShare: latinShare } });
+      }
       group = '';
     };
     for (const ch of rawText) {
       let glyph = ch;
-      let font = familyEa && isCjkBreakChar(ch.codePointAt(0) ?? 0) ? eaFont : baseFont;
-      if (/[-]/u.test(ch) && (familySym != null || isSymbolFontFamily(family))) {
+      const eaGlyph = familyEa != null && isCjkBreakChar(ch.codePointAt(0) ?? 0);
+      const csGlyph = familyCs != null && (isComplexScriptCodePoint(ch.codePointAt(0) ?? 0)
+        || INDIC_CS_GLYPH_RE.test(ch));
+      let font = eaGlyph ? eaFont : csGlyph ? csFont : baseFont;
+      let share = lineMetricShareFor(eaGlyph ? familyEa : csGlyph ? familyCs : family, bold, italic, rc);
+      if (/[\uf020-\uf0ff]/u.test(ch) && (familySym != null || isSymbolFontFamily(family))) {
         const symbolFamily = familySym ?? family;
         glyph = symbolFontToUnicode(ch, symbolFamily);
         font = buildFont(bold, italic, drawSizePx,
           glyph === ch ? symbolFamily : 'sans-serif', rc, glyph);
+        share = undefined;
       }
-      if (group && font !== groupFont) emitGroup();
+      if (group && (font !== groupFont || share !== groupShare)) emitGroup();
       group += glyph;
       groupFont = font;
+      groupShare = share;
     }
     emitGroup();
   }
 
   const sameStyle = (a: LayoutSegment, b: LayoutSegment): boolean =>
-    a.font === b.font && a.color === b.color && a.sizePx === b.sizePx
+    a.font === b.font && a.color === b.color && a.patternFill === b.patternFill
+    && a.noFill === b.noFill && a.sizePx === b.sizePx
     && a.drawSizePx === b.drawSizePx && a.underline === b.underline
     && a.underlineStyle === b.underlineStyle
     && a.underlineColor === b.underlineColor
+    && a.underlineFill === b.underlineFill
+    && a.underlineLine === b.underlineLine
+    && a.underlineLineNoFill === b.underlineLineNoFill
     && a.strikethrough === b.strikethrough && a.strikeDouble === b.strikeDouble
     && a.letterSpacingPx === b.letterSpacingPx && a.baseline === b.baseline
     && a.shadow === b.shadow && a.reflection === b.reflection
     && a.outline === b.outline && a.highlight === b.highlight
     && hyperlinkKey(a.hyperlink) === hyperlinkKey(b.hyperlink)
-    && (!a.letterSpacingPx || a.sourceRunId === b.sourceRunId);
+    && (!a.letterSpacingPx || a.sourceRunId === b.sourceRunId)
+    // Every face that sizes the PowerPoint line box is part of the key: two
+    // runs drawn in the same face but carrying different latin slots must
+    // stay apart, or the merged segment would drop one slot's share and a
+    // purely visual difference (colour) would decide the line height.
+    && a.lineMetricShare === b.lineMetricShare
+    && a.lineMetricLatinShare === b.lineMetricLatinShare;
   const marRPx = emuToPx(para.marR, scale);
   const broken = breakDrawingMlText(input, {
     maxWidth: maxWidthPx,
@@ -1506,10 +1612,31 @@ export function layoutParagraph(
     nonMonotoneMeasure: input.some((item) => item.type === 'text' && (item.style.letterSpacingPx ?? 0) < 0),
     eastAsianLineBreak: para.eaLnBrk !== false,
   });
-  return broken.map((line) => ({
+  const end = para.endRunProperties;
+  const endSizePx = end?.fontSize != null
+    ? end.fontSize * PT_TO_EMU * scale * fontScale : defaultFontSizePx;
+  const endFamily = normalizeFontFamily(end?.fontFamily ?? para.defFontFamily ?? null, rc);
+  const endBold = end?.bold ?? para.defBold ?? defaultBold;
+  const endItalic = end?.italic ?? para.defItalic ?? defaultItalic;
+  const endStyle: LayoutSegment | undefined = end && (
+    end.fontSize != null || end.fontFamily != null || end.bold != null || end.italic != null)
+    ? {
+        text: '', sizePx: endSizePx, color: defaultColor,
+        font: buildFont(endBold, endItalic, endSizePx, endFamily, rc, ''),
+        underline: false, strikethrough: false,
+        lineMetricShare: lineMetricShareFor(endFamily, endBold, endItalic, rc),
+      }
+    : undefined;
+  return broken.map((line, lineIndex) => ({
     // Office L07/L08: an empty line opened by a line feed inside a run keeps
     // that run's size; a zero-width segment carries it to the line metrics.
-    segments: line.segments.length === 0 && line.lineFeedRun !== undefined
+    segments: [
+      // endParaRPr formats only the empty insertion line after the final
+      // character/break (§21.1.2.2.2); it never replaces existing run paint.
+      ...(lineIndex === broken.length - 1 && line.segments.length === 0 && endStyle
+        ? [endStyle] : []),
+      ...(line.segments.length === 0 && line.lineFeedRun !== undefined
+      && !(lineIndex === broken.length - 1 && endStyle)
       && input[line.lineFeedRun]?.type === 'text'
       ? [{ ...(input[line.lineFeedRun] as { style: LayoutSegment }).style, text: '' }]
       : line.segments.map((part, index): LayoutSegment => {
@@ -1522,7 +1649,12 @@ export function layoutParagraph(
       }
       if (part.type === 'tab') return { ...part.style, text: '', isTab: true, tabWidthPx: part.width };
       return { ...part.style, text: '' };
-    }),
+    })),
+      ...(line.endBreakRun !== undefined && input[line.endBreakRun]?.type === 'break'
+        && (input[line.endBreakRun] as { style?: LayoutSegment }).style
+        ? [{ ...(input[line.endBreakRun] as { style: LayoutSegment }).style, text: '' }]
+        : []),
+    ],
     ...(line.endsWithBreak ? { endsWithBreak: true } : {}),
   }));
 }
@@ -1688,7 +1820,7 @@ async function prepareBackground(
   }
   return {
     paint: (ctx) => {
-      const bg = resolveShapeFill(fill, ctx, 0, 0, canvasW, canvasH);
+      const bg = resolveShapeFill(fill, ctx, 0, 0, canvasW, canvasH, 0, scale * PT_TO_EMU);
       ctx.fillStyle = bg ?? '#FFFFFF';
       ctx.fillRect(0, 0, canvasW, canvasH);
     },
@@ -2083,7 +2215,9 @@ function drawWarpedGlyphStrips(
   bandFrac: number,
   boxX: number,
   boxY: number,
-  color: string,
+  paint: TextPaint,
+  resolveAuxPaint?: (target: CanvasRenderingContext2D) => TextPaint,
+  strokeWidth = 0,
 ): void {
   if (chW <= 0) return;
   // Ink extremes about the baseline (css px), from real metrics — this is where
@@ -2163,8 +2297,14 @@ function drawWarpedGlyphStrips(
   // Paint the whole strip stack onto `target` in `fillStyle`. The transform
   // chain per strip is the single-affine per-glyph draw anchored at the STRIP
   // centre so vScale/shear/angle track this slice's u.
-  const paintStrips = (target: CanvasRenderingContext2D, fillStyle: string): void => {
-    target.fillStyle = fillStyle;
+  const paintStrips = (target: CanvasRenderingContext2D, fillStyle: TextPaint): void => {
+    if (strokeWidth > 0) {
+      target.strokeStyle = fillStyle;
+      target.lineWidth = strokeWidth;
+      target.lineJoin = 'round';
+    } else {
+      target.fillStyle = fillStyle;
+    }
     for (let i = 0; i <= last; i++) {
       const { s0, s1, g } = strips[i];
       const centre = (s0 + s1) / 2;
@@ -2180,7 +2320,8 @@ function drawWarpedGlyphStrips(
       target.clip();
       // Pen origin sits at local −centre; the ls/2 shift centres the ink inside
       // its letter-spaced advance, matching the flat draw's origin convention.
-      target.fillText(ch, -centre + ls / 2, 0);
+      if (strokeWidth > 0) target.strokeText(ch, -centre + ls / 2, 0);
+      else target.fillText(ch, -centre + ls / 2, 0);
       target.restore();
     }
   };
@@ -2192,10 +2333,10 @@ function drawWarpedGlyphStrips(
   // to the pre-#879 path — the overwhelmingly common WordArt case, zero
   // allocation. Otherwise the 1-device-px overlap band would double-compose and
   // darken, so route through the layer below.
-  const fillAlpha = rgbaAlpha(color);
+  const fillAlpha = typeof paint === 'string' ? rgbaAlpha(paint) : 1;
   const destAlpha = typeof ctx.globalAlpha === 'number' ? ctx.globalAlpha : 1;
-  if (fillAlpha >= 1 && destAlpha >= 1) {
-    paintStrips(ctx, color);
+  if (typeof paint === 'string' && fillAlpha >= 1 && destAlpha >= 1) {
+    paintStrips(ctx, paint);
     return;
   }
   if (fillAlpha <= 0 || destAlpha <= 0) return; // fully transparent — nothing to draw
@@ -2209,7 +2350,7 @@ function drawWarpedGlyphStrips(
   // mock ctx), which is never pixel-verified anyway.
   const base = typeof ctx.getTransform === 'function' ? ctx.getTransform() : null;
   if (!base) {
-    paintStrips(ctx, color);
+    paintStrips(ctx, paint);
     return;
   }
 
@@ -2247,7 +2388,7 @@ function drawWarpedGlyphStrips(
   }
   if (!(maxX > minX && maxY > minY)) return; // no ink mapped — nothing to composite
 
-  const pad = 2; // device px, for AA/rounding slack around the ink AABB
+  const pad = 2 + strokeWidth * devScale; // AA and outline around the ink AABB
   const originX = Math.floor(minX - pad);
   const originY = Math.floor(minY - pad);
   const layerW = Math.ceil(maxX + pad) - originX;
@@ -2255,7 +2396,7 @@ function drawWarpedGlyphStrips(
   const aux = createAuxCanvas(layerW, layerH);
   const auxCtx = aux ? (aux.getContext('2d') as CanvasRenderingContext2D | null) : null;
   if (!aux || !auxCtx) {
-    paintStrips(ctx, color);
+    paintStrips(ctx, paint);
     return;
   }
   // The layer's own transform is the live transform translated by −origin (a
@@ -2266,7 +2407,22 @@ function drawWarpedGlyphStrips(
   auxCtx.textAlign = 'left';
   auxCtx.textBaseline = 'alphabetic';
   auxCtx.setTransform(base.a, base.b, base.c, base.d, base.e - originX, base.f - originY);
-  paintStrips(auxCtx, opaqueRgba(color));
+  if (typeof paint === 'string') {
+    paintStrips(auxCtx, opaqueRgba(paint));
+  } else {
+    // A patterned warp can have translucent cells. Build the overlapping strip
+    // stack as one opaque glyph mask, then colour that mask once on the slide
+    // grid. This avoids double-compositing where adjacent strip clips overlap.
+    paintStrips(auxCtx, '#fff');
+    auxCtx.save();
+    auxCtx.setTransform(1, 0, 0, 1, 0, 0);
+    auxCtx.globalCompositeOperation = 'source-in';
+    withInheritedPatternScope(ctx, auxCtx, () => {
+      auxCtx.fillStyle = resolveAuxPaint?.(auxCtx) ?? paint;
+      auxCtx.fillRect(0, 0, layerW, layerH);
+    }, { x: originX, y: originY });
+    auxCtx.restore();
+  }
 
   // Composite the opaque layer once at the effective alpha, at identity so the
   // (already device-oriented) layer blits 1:1. save/restore preserves the live
@@ -2594,17 +2750,29 @@ function renderWarpedText(
     // CENTRE maps to its u fraction; the glyph is drawn at a per-glyph transform.
     let penW = 0;
     for (const seg of line.segments) {
+      const segmentStartW = penW;
+      const segmentBandFrac = env.singleEdge ? baselineFrac : v0 + baselineFrac * (v1 - v0);
       if (seg.math) {
         // Equations inside WordArt are exotic; advance without warping them.
         penW += seg.math.width;
         continue;
       }
       ctx.font = seg.font;
-      ctx.fillStyle = seg.color;
+      const glyphPaint = resolveSegmentTextPaint(ctx, seg, boxX, boxY, scale);
+      ctx.fillStyle = glyphPaint;
+      const outline = seg.outline && seg.outline.width > 0 ? seg.outline : undefined;
+      const outlineFill = outline?.fill;
+      const outlinePaint = outline
+        ? outlineFill
+          ? resolveFillCore(outlineFill, ctx, boxX, boxY, boxW, boxH, 0, scale * PT_TO_EMU)
+          : outline.color ? `#${outline.color}` : seg.noFill ? undefined : glyphPaint
+        : undefined;
+      const outlineWidth = outline ? Math.max(0.5, emuToPx(outline.width, scale)) : 0;
       const ls = seg.letterSpacingPx ?? 0;
       const chars = [...seg.text];
       for (const ch of chars) {
         const chW = ctx.measureText(ch).width + ls;
+        if (seg.noFill && !outlinePaint) { penW += chW; continue; }
         // Blend the per-line vertical band into the baseline fraction so line 2
         // sits below line 1 within the envelope.
         const bandFrac = env.singleEdge ? baselineFrac : v0 + baselineFrac * (v1 - v0);
@@ -2620,23 +2788,26 @@ function renderWarpedText(
         // single-edge (Follow Path) branch below keeps rigid per-glyph rotation;
         // its separate placement rules preserve natural size and alignment.
         if (!env.singleEdge && chW > 0) {
-          drawWarpedGlyphStrips(
-            ctx,
-            ch,
-            ls,
-            chW,
-            getDevScale(),
-            env,
-            penW,
-            totalW,
-            followScale,
-            hScale,
-            warpBoxH,
-            bandFrac,
-            boxX,
-            boxY,
-            seg.color,
-          );
+          if (!seg.noFill) {
+            drawWarpedGlyphStrips(
+              ctx, ch, ls, chW, getDevScale(), env, penW, totalW, followScale,
+              hScale, warpBoxH, bandFrac, boxX, boxY, glyphPaint,
+              seg.patternFill
+                ? target => resolveSegmentTextPaint(target, seg, boxX, boxY, scale)
+                : undefined,
+            );
+          }
+          if (outlinePaint && outline) {
+            drawWarpedGlyphStrips(
+              ctx, ch, ls, chW, getDevScale(), env, penW, totalW, followScale,
+              hScale, warpBoxH, bandFrac, boxX, boxY, outlinePaint,
+              outlineFill
+                ? target => resolveFillCore(outlineFill, target, boxX, boxY, boxW, boxH,
+                  0, scale * PT_TO_EMU) ?? 'rgba(0,0,0,0)'
+                : undefined,
+              outlineWidth,
+            );
+          }
           penW += chW;
           continue;
         }
@@ -2662,9 +2833,49 @@ function renderWarpedText(
         if (hScale !== 1 || g.vScale !== 1) ctx.scale(hScale, g.vScale);
         // Draw the glyph centred on the mapped point: shift left by half its
         // advance so its own centre lands on `u`.
-        ctx.fillText(ch, -chW / 2 + ls / 2, 0);
+        if (!seg.noFill) ctx.fillText(ch, -chW / 2 + ls / 2, 0);
+        if (outlinePaint) {
+          ctx.strokeStyle = outlinePaint;
+          ctx.lineWidth = outlineWidth;
+          ctx.lineJoin = 'round';
+          ctx.strokeText(ch, -chW / 2 + ls / 2, 0);
+        }
         ctx.restore();
         penW += chW;
+      }
+      // A separately authored underline remains visible for noFill WordArt.
+      // Trace it on the same warped baseline as the glyphs; uFill and uLn are
+      // independent CT_TextCharacterProperties children (§21.1.2.3.9).
+      if (seg.underline && !seg.underlineLineNoFill && penW > segmentStartW
+        && (!seg.noFill || seg.underlineFill || seg.underlineColor || seg.underlineLine?.fill)) {
+        const underlinePaint = seg.underlineFill
+          ? resolveFillCore(seg.underlineFill, ctx, boxX, boxY, boxW, boxH,
+              0, scale * PT_TO_EMU)
+          : seg.underlineLine?.fill
+            ? resolveFillCore(seg.underlineLine.fill, ctx, boxX, boxY, boxW, boxH,
+                0, scale * PT_TO_EMU)
+            : seg.underlineColor ?? glyphPaint;
+        if (underlinePaint) {
+          ctx.save();
+          ctx.strokeStyle = underlinePaint;
+          ctx.lineWidth = seg.underlineLine?.width
+            ? emuToPx(seg.underlineLine.width, scale)
+            : Math.max(1, seg.sizePx * 0.05);
+          ctx.beginPath();
+          const samples = Math.max(2, Math.ceil((penW - segmentStartW) / 8));
+          for (let sample = 0; sample <= samples; sample++) {
+            const flat = segmentStartW + (penW - segmentStartW) * sample / samples;
+            const u = followOffset + flat / totalW * followScale;
+            const g = warpGlyphTransform(lineEnv, u, warpBoxH, segmentBandFrac);
+            const offset = Math.max(2, ctx.lineWidth) * g.vScale;
+            const x = boxX + g.x - outset - Math.sin(g.angle) * offset;
+            const y = boxY + g.y + Math.cos(g.angle) * offset;
+            if (sample === 0) ctx.moveTo(x, y);
+            else ctx.lineTo(x, y);
+          }
+          ctx.stroke();
+          ctx.restore();
+        }
       }
     }
   }
@@ -2859,6 +3070,7 @@ export function cacheDevicePaint(
   liveTransform: EffectTransform,
   bbox: { x: number; y: number; w: number; h: number },
   viewport?: { w: number; h: number },
+  source?: CanvasRenderingContext2D,
 ): EffectPaint {
   const x = Math.floor(bbox.x) - 1;
   const y = Math.floor(bbox.y) - 1;
@@ -2886,7 +3098,8 @@ export function cacheDevicePaint(
     liveTransform.e - x,
     liveTransform.f - y,
   );
-  paint(cache);
+  if (source) withInheritedPatternScope(source, cache, () => paint(cache), { x, y });
+  else paint(cache);
   const identity = { a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 } as DOMMatrix;
   return (target) => {
     target.save();
@@ -2916,15 +3129,15 @@ function paintWithRasterEffects(
   const applyLiveTransform = (target: CanvasRenderingContext2D) => target.setTransform(liveTransform);
   const body = (target: CanvasRenderingContext2D) => {
     applyLiveTransform(target);
-    paintBody(target);
+    withInheritedPatternScope(ctx, target, () => paintBody(target));
   };
   const mask = (target: CanvasRenderingContext2D) => {
     applyLiveTransform(target);
-    paintMask(target);
+    withInheritedPatternScope(ctx, target, () => paintMask(target));
   };
   const innerMask = (target: CanvasRenderingContext2D) => {
     applyLiveTransform(target);
-    paintInnerMask(target);
+    withInheritedPatternScope(ctx, target, () => paintInnerMask(target));
   };
   let nativeShadowFallback = false;
   if (effects.shadow && haveAux) {
@@ -3117,10 +3330,18 @@ function renderShape(ctx: CanvasRenderingContext2D, el: ShapeElement, scale: num
       (el.sp3d?.contourW ? el.sp3d.contourW * scale : 0) +
       (extrusion ? Math.hypot(extrusion.offsetX, extrusion.offsetY) / ctxDevScale : 0) +
       2;
+    const projectedTextHasPattern = el.textBody?.paragraphs.some(p =>
+      p.runs.some(run => run.type === 'text' && (
+        run.patternFill?.fillType === 'pattern' ||
+        run.outline?.fill?.fillType === 'pattern' ||
+        run.underlineFill?.fillType === 'pattern'
+      )),
+    ) ?? false;
     const paintProjectedElement = (
       target: CanvasRenderingContext2D,
       projectedElement: ShapeElement,
       padded: boolean,
+      preservePatternFrame = false,
     ): boolean =>
       projectScene3dPaint(
         target,
@@ -3136,13 +3357,13 @@ function renderShape(ctx: CanvasRenderingContext2D, el: ShapeElement, scale: num
           renderShape(octx, projectedElement, scale, themeDefaultColor, slideNumber, rc, undefined);
         },
         padded
-          ? { bevels, extrusion: extrusion ?? undefined, edgePadCss }
-          : {},
+          ? { bevels, extrusion: extrusion ?? undefined, edgePadCss, preservePatternFrame }
+          : { preservePatternFrame },
       );
     const paintProjectedBody = (target: CanvasRenderingContext2D): boolean =>
       paintProjectedElement(target, localBodyEl, true);
     const paintProjectedText = (target: CanvasRenderingContext2D): boolean =>
-      !el.textBody || paintProjectedElement(target, localTextEl, false);
+      !el.textBody || paintProjectedElement(target, localTextEl, false, projectedTextHasPattern);
     const hasRasterEffects = Boolean(
       el.shadow || el.innerShadow || el.glow || el.softEdge || el.reflection,
     );
@@ -3172,6 +3393,7 @@ function renderShape(ctx: CanvasRenderingContext2D, el: ShapeElement, scale: num
           w: (ctx.canvas as { width: number }).width || 0,
           h: (ctx.canvas as { height: number }).height || 0,
         },
+        ctx,
       );
       // A declined cache is still a valid projection path: the compositor will
       // replay rawPaint. Check success only AFTER that first paint so an
@@ -3194,7 +3416,10 @@ function renderShape(ctx: CanvasRenderingContext2D, el: ShapeElement, scale: num
         ctx.restore();
         return;
       }
-    } else if (paintProjectedElement(ctx, localEl, true)) {
+    } else if (paintProjectedElement(
+      ctx, localEl, true,
+      projectedTextHasPattern && el.fill?.fillType !== 'pattern',
+    )) {
       ctx.restore();
       return;
     }
@@ -3213,7 +3438,9 @@ function renderShape(ctx: CanvasRenderingContext2D, el: ShapeElement, scale: num
   }
 
   const geom = el.geometry.toLowerCase();
-  const fillStyle = resolveShapeFill(el.fill, ctx, x, y, w, h, el.rotation);
+  // The slide may render at any requested width. Convert the PDF-measured
+  // one-point pattern cell through this render's EMU-to-canvas scale.
+  const fillStyle = resolveShapeFill(el.fill, ctx, x, y, w, h, el.rotation, scale * PT_TO_EMU);
   const imageFill = el.fill?.fillType === 'image' && shapeImageFillModeIsPaintable(el.fill)
     ? el.fill
     : null;
@@ -3287,7 +3514,7 @@ function renderShape(ctx: CanvasRenderingContext2D, el: ShapeElement, scale: num
     const tFill = silhouette ??
       (target === ctx && bx === x && by === y && bw === w && bh === h
         ? fillStyle
-        : resolveShapeFill(el.fill, target, bx, by, bw, bh, el.rotation));
+        : resolveShapeFill(el.fill, target, bx, by, bw, bh, el.rotation, scale * PT_TO_EMU));
     const tStroke = silhouette
       ? null
       : el.stroke
@@ -3471,7 +3698,7 @@ function renderShape(ctx: CanvasRenderingContext2D, el: ShapeElement, scale: num
   const flatBevelEdgePadCss = (el.stroke ? (el.stroke.width * scale) / 2 : 0) + 2;
   const paintLineDecorations = (target: CanvasRenderingContext2D): void => {
     const effectivePaint = el.stroke?.fill
-      ? resolveShapeFill(el.stroke.fill, target, x, y, w, h, el.rotation) ?? undefined
+      ? resolveShapeFill(el.stroke.fill, target, x, y, w, h, el.rotation, scale * PT_TO_EMU) ?? undefined
       : undefined;
     if (el.stroke && (CONNECTOR_GEOMS.has(geom) || CALLOUT_GEOMS.has(geom))) {
       // The preset body deliberately suppresses retractable leader strokes. Paint
@@ -3978,6 +4205,7 @@ export function renderTextBody(
     bulletLabel: string;  // text to render as bullet ('' = none)
     bulletFont: string;
     bulletColor: string;
+    bulletFollowsText: boolean;
     bulletX: number;      // canvas X for bullet
     // Picture bullet (`<a:buBlip>`, §21.1.2.4.2): the resolved image + its
     // authored height in px (scaled by buSzPct); painting preserves the source
@@ -3992,13 +4220,19 @@ export function renderTextBody(
     /** This spAutoFit line replaces an authored-font design floor with metrics
      * from the font Canvas actually resolved. */
     useResolvedFontMetrics: boolean;
+    /** PowerPoint's metric ascent of the spaced line (px), when every run of
+     * the body has a known face; undefined for the ordinary 0.8 × line model. */
+    metricAscent?: number;
+    /** The line's natural (unspaced) descent in the metric model. */
+    metricNaturalDescent?: number;
   }
 
   // buildLayout runs Pass 1 at a given font scale (1.0 = normal; <1 = normAutoFit shrink)
-  const buildLayout = (fontScale: number): {
+  const buildLayout = (fontScale: number, metric: boolean): {
     allLines: LineEntry[];
     totalHeight: number;
     requiredHeight: number;
+    metricOk: boolean;
   } => {
   const bodyDefaultFontSizePx = (body.defaultFontSize ?? 18) * PT_TO_EMU * scale * fontScale;
   const allLines: LineEntry[] = [];
@@ -4008,6 +4242,10 @@ export function renderTextBody(
   // enough to contain the last line, but must not silently become the pitch of
   // every preceding line when a:lnSpc is omitted (#1473).
   let requiredHeight = 0;
+  // Every line must resolve PowerPoint's metric split (see
+  // powerpoint-line-metrics.ts) for the body to use it; one body never mixes
+  // the two line models.
+  let metricOk = metric;
 
   // AutoNum counters per list level
   const autoNumCounters = new Map<number, number>();
@@ -4070,6 +4308,7 @@ export function renderTextBody(
     let bulletLabel  = '';
     let bulletFont   = buildFont(false, false, bulletBaseSizePx, 'sans-serif', rc);
     let bulletColor  = bulletInheritedColor;
+    let bulletFollowsText = false;
     // Picture bullet (`<a:buBlip>`, §21.1.2.4.2). Resolved to its image + drawn
     // size below; stays null for char/number/none bullets.
     let bulletImage: { imagePath: string; mimeType: string; sizePx: number } | null = null;
@@ -4101,6 +4340,7 @@ export function renderTextBody(
       bulletFont  = buildFont(false, false, bSizePx, convertedFamily, rc, bulletLabel,
         hasNamedFontFamily(b.fontFamily));
       bulletColor = b.color ? hexToRgba(b.color) : bulletInheritedColor;
+      bulletFollowsText = !b.color;
     } else if (bullet.type === 'autoNum') {
       const b = bullet;
       const bSizePx = b.sizePts != null
@@ -4122,6 +4362,7 @@ export function renderTextBody(
       // is absent does the marker fall back to the buClrTx default
       // (§21.1.2.4.5 — the inherited first-run colour).
       bulletColor = bullet.color ? hexToRgba(bullet.color) : bulletInheritedColor;
+      bulletFollowsText = !bullet.color;
     } else if (bullet.type === 'blip') {
       // ECMA-376 §21.1.2.4.2 picture bullet. Its height follows the text's em
       // box, scaled by `<a:buSzPct>`, while paint preserves the source aspect
@@ -4178,6 +4419,7 @@ export function renderTextBody(
       // defaults like `defRPr sz="30000"` (300pt prompt-text marker) would
       // inflate lineHeight and push real 24pt runs far below the anchor.
       let maxSizePx = 0;
+      const metricRuns: { sizePx: number; share: number }[] = [];
       // Measure the fonts Canvas actually resolved (including browser
       // substitutions). A tall live font box is retained for containment under
       // spAutoFit, but PowerPoint does not repeat that box as the implicit
@@ -4193,6 +4435,19 @@ export function renderTextBody(
           ? Math.max(seg.sizePx, (seg.math.ascent + seg.math.descent) / 1.2)
           : seg.sizePx;
         if (effSize > maxSizePx) maxSizePx = effSize;
+        if (seg.math) metricOk = false;
+        else if (!seg.isTab) {
+          if (seg.lineMetricShare === undefined) metricOk = false;
+          else metricRuns.push({ sizePx: seg.sizePx, share: seg.lineMetricShare });
+          // A run's latin face sizes its line even where an East Asian or
+          // symbol segment draws no latin glyph; an unused ea or cs face does
+          // not (#1610 supplements 2 and 3).
+          if (seg.lineMetricLatinShare === null) metricOk = false;
+          else if (seg.lineMetricLatinShare !== undefined
+            && seg.lineMetricLatinShare !== seg.lineMetricShare) {
+            metricRuns.push({ sizePx: seg.sizePx, share: seg.lineMetricLatinShare });
+          }
+        }
         if (!seg.math) {
           if (isSpAutoFit) {
             ctx.font = seg.font;
@@ -4205,6 +4460,7 @@ export function renderTextBody(
         }
       }
       if (maxSizePx === 0) maxSizePx = paraDefaultFontSizePx;
+      const textMaxSizePx = maxSizePx;
       // Bullet font size also counts
       if (isFirst && bulletLabel) {
         ctx.font = bulletFont;
@@ -4217,6 +4473,8 @@ export function renderTextBody(
       if (isFirst && bulletImage && bulletImage.sizePx > maxSizePx) {
         maxSizePx = bulletImage.sizePx;
       }
+      // A marker taller than the text is outside the #1610 controls.
+      if (maxSizePx > textMaxSizePx) metricOk = false;
 
       // PowerPoint's natural single-line pitch is 120% of the authored text size.
       // An Office-produced boundary deck confirms that this is independent of
@@ -4269,6 +4527,27 @@ export function renderTextBody(
       if (body.autoFit === 'norm' && body.lnSpcReduction != null && para.spaceLine?.type !== 'pts') {
         lineHeight *= 1 - body.lnSpcReduction;
       }
+      // PowerPoint's metric line (#1610, powerpoint-line-metrics.ts): the
+      // same 1.2 × size box, split at the baseline by the runs' faces and
+      // re-divided for lnSpc by the shared DrawingML rule. An empty line (no
+      // glyphs) takes a 0.8 split; its split moves no visible glyph and the
+      // next line's top depends only on the line height. spcPts is rounded to
+      // whole points first.
+      let metricAscent: number | undefined;
+      let metricNaturalDescent: number | undefined;
+      if (metric && metricOk && !(measureOnly && !isSpAutoFit && !measureNaturalLineSpacing && !para.spaceLine)) {
+        const natural = metricRuns.length > 0
+          ? powerPointNaturalLine(metricRuns)
+          : { ascent: naturalSingle * 0.8, descent: naturalSingle * 0.2 };
+        const spacing = para.spaceLine?.type === 'pts'
+          ? { type: 'pts' as const, val: powerPointExactLinePoints(para.spaceLine.val) }
+          : para.spaceLine;
+        const box = drawingMlSpacedLineBox(natural, spacing, PT_TO_EMU * scale,
+          body.autoFit === 'norm' && body.lnSpcReduction != null ? body.lnSpcReduction : 0);
+        lineHeight = box.ascent + box.descent;
+        metricAscent = box.ascent;
+        metricNaturalDescent = natural.descent;
+      }
       // ECMA-376 §21.1.2.2.9-.10 with §21.1.2.3.11: a percentage spcBef /
       // spcAft is a fraction of the text size, 100000 being one line. It is
       // taken from the first line for space before and from the last line for
@@ -4315,17 +4594,19 @@ export function renderTextBody(
         line, linePx, lineHeight, baselineLineHeight, topGapPx: topGap,
         textXOffset,
         bulletLabel: isFirst ? bulletLabel : '',
-        bulletFont, bulletColor, bulletX,
+        bulletFont, bulletColor, bulletFollowsText, bulletX,
         bulletImage: entryBulletImage,
         textX, textMaxW,
         alignment: para.alignment,
         isLastLine: isLast,
         para,
-        useResolvedFontMetrics,
+        useResolvedFontMetrics: metricAscent === undefined && useResolvedFontMetrics,
+        metricAscent,
+        metricNaturalDescent,
       });
       const lineTop = totalHeight + topGap;
       totalHeight += linePx + topGap;
-      const requiredLineHeight = useResolvedFontMetrics
+      const requiredLineHeight = useResolvedFontMetrics && metricAscent === undefined
         ? Math.max(lineHeight, resolvedFontLine)
         : lineHeight;
       requiredHeight = Math.max(
@@ -4338,10 +4619,21 @@ export function renderTextBody(
     }
   }
 
-  return { allLines, totalHeight, requiredHeight };
+  return { allLines, totalHeight, requiredHeight, metricOk };
   }; // end buildLayout
 
-  let { allLines, totalHeight, requiredHeight } = buildLayout(1.0);
+  // Try PowerPoint's metric line model first; a body with any face outside
+  // it is laid out again with the ordinary model.
+  let useMetricLines = true;
+  const layoutAt = (fontScale: number) => {
+    let layout = buildLayout(fontScale, useMetricLines);
+    if (useMetricLines && !layout.metricOk) {
+      useMetricLines = false;
+      layout = buildLayout(fontScale, false);
+    }
+    return layout;
+  };
+  let { allLines, totalHeight, requiredHeight } = layoutAt(1.0);
 
   // ── normAutoFit ──────────────────────────────────────────────────────────
   // ECMA-376 §21.1.2.1.3 gives an omitted fontScale the value 100% and an
@@ -4355,7 +4647,7 @@ export function renderTextBody(
   // Therefore our own text metrics must not manufacture a new scale here.
   if (body.autoFit === 'norm') {
     if (body.fontScale != null && body.fontScale > 0) {
-      if (body.fontScale < 1.0) ({ allLines, totalHeight, requiredHeight } = buildLayout(body.fontScale));
+      if (body.fontScale < 1.0) ({ allLines, totalHeight, requiredHeight } = layoutAt(body.fontScale));
     }
   }
 
@@ -4375,22 +4667,36 @@ export function renderTextBody(
     effectiveBh = tPad + requiredHeight + bPad;
     effectiveBy = by - effectiveBh;
   } else {
-    // ── Effective height (spAutoFit: shape expands to fit text) ─────────────
-    const isSpAutoFit = body.autoFit === 'sp';
-    effectiveBh = isSpAutoFit
-      ? Math.max(bh, tPad + requiredHeight + bPad)
+    // spAutoFit (§21.1.2.1.4) asks the editor to resize the shape to its text,
+    // and PowerPoint writes the resized extents when it saves. Rendering and
+    // PDF export keep the authored extents (#1610 controls: 60 pt and 300 pt
+    // boxes holding 100 pt text, anchor t and ctr, are laid out exactly as
+    // with noAutofit; a centred block overflows both edges). Only a zero
+    // height, which has no box to anchor in, still takes the content height.
+    effectiveBh = body.autoFit === 'sp' && bh === 0
+      ? tPad + requiredHeight + bPad
       : bh;
   }
 
   // ── Vertical anchor ─────────────────────────────────────────────────────
+  // PowerPoint anchors the metric block by its last line's natural descent,
+  // not by the spaced one: an lnSpc/spcPts change below the last baseline
+  // does not move a bottom-anchored block (#1610 controls: two 100 pt lines
+  // at 80/90/150 % and 100/140 pt, ctr and b, Arial and Meiryo; normAutofit
+  // lnSpcReduction likewise).
+  const lastMetric = allLines[allLines.length - 1];
+  const anchorHeight = lastMetric?.metricAscent !== undefined
+    && lastMetric.metricNaturalDescent !== undefined
+    ? requiredHeight - (lastMetric.lineHeight - lastMetric.metricAscent) + lastMetric.metricNaturalDescent
+    : requiredHeight;
   let cursorY: number;
   const contentH = Math.max(0, effectiveBh - tPad - bPad);
   if (anchor === 'ctr') {
     cursorY = effectiveBy + drawingMlBlockTop('ctr', {
       left: lPad, top: tPad, width: bw - lPad - rPad, height: contentH,
-    }, requiredHeight);
+    }, anchorHeight);
   } else if (anchor === 'b') {
-    cursorY = effectiveBy + effectiveBh - bPad - requiredHeight;
+    cursorY = effectiveBy + effectiveBh - bPad - anchorHeight;
   } else {
     cursorY = effectiveBy + tPad;
   }
@@ -4455,7 +4761,7 @@ export function renderTextBody(
   let entriesInCol = 0;
 
   for (const entry of allLines) {
-    const { line, linePx, lineHeight, topGapPx, textXOffset, bulletLabel, bulletFont, bulletColor, bulletImage, alignment, isLastLine, useResolvedFontMetrics } = entry;
+    const { line, linePx, lineHeight, topGapPx, textXOffset, bulletLabel, bulletFont, bulletColor, bulletFollowsText, bulletImage, alignment, isLastLine, useResolvedFontMetrics, metricAscent } = entry;
     // Balanced column advance: when the current column has reached its share
     // of paragraphs, jump to the next one. PowerPoint never breaks a single
     // line across columns and never spills past the last column — anything
@@ -4580,7 +4886,9 @@ export function renderTextBody(
             resolvedFontAscent + Math.max(0, lineHeight - resolvedFontHeight) / 2,
           )
       : Math.max(lineHeight * 0.8, maxAscent);
-    const baseline = cursorY + baselineOffset;
+    const baseline = metricAscent !== undefined
+      ? cursorY + metricAscent
+      : cursorY + baselineOffset;
 
     // Reading-frame marker placement under an RTL base (issue #930, same class as
     // the docx #830 / pptx #913 leading-edge mirroring). PowerPoint seats a list
@@ -4620,7 +4928,14 @@ export function renderTextBody(
     // Draw bullet.
     if (bulletLabel) {
       ctx.font = bulletFont;
-      ctx.fillStyle = bulletColor;
+      // §21.1.2.4.5 buClrTx follows the first run's patterned fill in the
+      // PowerPoint control. Keep the existing solid-colour inheritance path
+      // for runs without pattFill; their bullet colour can come from a level
+      // style rather than that first run. An explicit buClr stays solid.
+      const firstTextSegment = line.segments.find(seg => !seg.isTab && !seg.math && !!seg.text);
+      ctx.fillStyle = bulletFollowsText && firstTextSegment?.patternFill
+        ? resolveSegmentTextPaint(ctx, firstTextSegment, bulletX, baseline, scale)
+        : bulletColor;
       if (paraNeedsBidi && baseRtl) {
         const prevDir = ctx.direction;
         ctx.direction = 'rtl';
@@ -4765,11 +5080,12 @@ export function renderTextBody(
         continue;
       }
       ctx.font = seg.font;
-      ctx.fillStyle = seg.color;
       const drawSizePx = seg.drawSizePx ?? seg.sizePx;
       // baseline shift: OOXML baseline in thousandths of a point; positive = superscript (up)
       const baselineShift = seg.baseline ? -(seg.baseline / 100000) * seg.sizePx : 0;
       const segBaseline = baseline + baselineShift;
+      const glyphPaint = resolveSegmentTextPaint(ctx, seg, penX, segBaseline, scale);
+      ctx.fillStyle = glyphPaint;
       const ls = seg.letterSpacingPx ?? 0;
 
       // Run-level text highlight (rPr > a:highlight, ECMA-376 §21.1.2.3.4).
@@ -4779,8 +5095,12 @@ export function renderTextBody(
         const hlW = measureTextAdvance(ctx, seg.text, ls)
           + internalStretch
           + jext;
-        paintHighlight(ctx, penX, segBaseline, hlW, drawSizePx, seg.highlight, seg.color);
+        paintHighlight(ctx, penX, segBaseline, hlW, drawSizePx, seg.highlight, glyphPaint);
       }
+
+      // noFill is the GLYPH fill choice (§21.1.2.3.9).  It does not erase an
+      // independently authored a:ln outline, uFill underline, highlight, or
+      // the text-selection geometry.  Keep those consumers in the common path.
 
       const segShadow = seg.shadow;
 
@@ -4912,7 +5232,7 @@ export function renderTextBody(
       // vertical glyph orientation, and outlines without rasterizing the whole
       // text body as one effect image.
       const segReflection = seg.reflection;
-      if (segReflection && seg.text) {
+      if (segReflection && seg.text && !seg.noFill) {
         const deviceW = (ctx.canvas as { width: number }).width || 0;
         const deviceH = (ctx.canvas as { height: number }).height || 0;
         if (deviceW > 0 && deviceH > 0) {
@@ -4949,7 +5269,7 @@ export function renderTextBody(
             ctx,
             (target) => {
               target.font = seg.font;
-              target.fillStyle = seg.color;
+              target.fillStyle = resolveSegmentTextPaint(target, seg, penX, segBaseline, scale);
               drawRun(target, 'fill');
             },
             bbox,
@@ -4960,14 +5280,14 @@ export function renderTextBody(
             deviceH,
           );
           ctx.font = seg.font;
-          ctx.fillStyle = seg.color;
+          ctx.fillStyle = glyphPaint;
         }
       }
 
       // Run-level text shadow (rPr > effectLst > outerShdw). Apply it only to
       // the primary glyph paint; the reflection above must not cast a second
       // shadow of its already-mirrored pixels.
-      if (segShadow) {
+      if (segShadow && !seg.noFill) {
         const dirRad = (segShadow.dir * Math.PI) / 180;
         const dist = emuToPx(segShadow.dist, scale);
         ctx.save();
@@ -4977,9 +5297,12 @@ export function renderTextBody(
         ctx.shadowOffsetY = Math.sin(dirRad) * dist;
       }
 
-      drawRun(ctx, 'fill');
+      if (!seg.noFill) drawRun(ctx, 'fill');
 
-      if (segShadow) ctx.restore();
+      if (segShadow && !seg.noFill) ctx.restore();
+
+      ctx.font = seg.font;
+      const segW = measureTextAdvance(ctx, seg.text, ls) + internalStretch;
 
       // Run-level text outline (rPr > a:ln). Strokes each glyph in addition
       // to the fill so the text reads as a thin lined character. ECMA-376
@@ -4991,14 +5314,18 @@ export function renderTextBody(
       if (segOutline && segOutline.width > 0) {
         ctx.save();
         ctx.lineWidth = Math.max(0.5, emuToPx(segOutline.width, scale));
-        ctx.strokeStyle = segOutline.color ? `#${segOutline.color}` : seg.color;
-        ctx.lineJoin = 'round';
-        drawRun(ctx, 'stroke');
+        ctx.strokeStyle = segOutline.fill
+          ? resolveFillCore(
+              segOutline.fill, ctx, penX, segBaseline - drawSizePx,
+              Math.max(1, segW), drawSizePx, 0, scale * PT_TO_EMU,
+            ) ?? 'rgba(0,0,0,0)'
+          : segOutline.color ? `#${segOutline.color}` : seg.noFill ? 'rgba(0,0,0,0)' : glyphPaint;
+        if (!seg.noFill || segOutline.fill || segOutline.color) {
+          ctx.lineJoin = 'round';
+          drawRun(ctx, 'stroke');
+        }
         ctx.restore();
       }
-
-      ctx.font = seg.font;
-      const segW = measureTextAdvance(ctx, seg.text, ls) + internalStretch;
 
       if (onTextRun && seg.text) {
         onTextRun({
@@ -5018,13 +5345,29 @@ export function renderTextBody(
         });
       }
 
-      if (seg.underline) {
-        drawUnderline(ctx, penX, segBaseline, segW + jext, drawSizePx, seg.underlineColor ?? seg.color, seg.underlineStyle, rc.dpr);
+      if (seg.underline && !seg.underlineLineNoFill
+        && (!seg.noFill || seg.underlineFill || seg.underlineColor || seg.underlineLine?.fill)) {
+        // §21.1.2.3.13 uFillTx follows the actual glyph fill (including
+        // pattFill), while §21.1.2.3.12 uFill supplies its own fill choice.
+        // Office PDF shows a separately chosen underline pattern on the
+        // same slide-aligned grid.
+        const underlinePaint = seg.underlineFill
+          ? resolveFillCore(
+              seg.underlineFill, ctx, penX, segBaseline, segW + jext, drawSizePx * 0.05,
+              0, scale * PT_TO_EMU,
+            ) ?? 'rgba(0,0,0,0)'
+          : seg.underlineLine?.fill
+            ? resolveFillCore(seg.underlineLine.fill, ctx, penX, segBaseline,
+                segW + jext, drawSizePx * 0.05, 0, scale * PT_TO_EMU) ?? 'rgba(0,0,0,0)'
+            : seg.underlineColor ?? glyphPaint;
+        drawUnderline(ctx, penX, segBaseline, segW + jext, drawSizePx,
+          underlinePaint, seg.underlineStyle, rc.dpr,
+          seg.underlineLine?.width ? emuToPx(seg.underlineLine.width, scale) : undefined);
       }
 
-      if (seg.strikethrough) {
+      if (seg.strikethrough && !seg.noFill) {
         const lineW = Math.max(1, drawSizePx * 0.05);
-        ctx.strokeStyle = seg.color;
+        ctx.strokeStyle = glyphPaint;
         ctx.lineWidth = lineW;
         ctx.setLineDash([]);
         // Crispness nudge (see crispOffset): the strike is a horizontal stroke;
@@ -5210,6 +5553,8 @@ function buildExtrusion(
  * then fall back to painting directly.
  */
 interface Project3dOpts {
+  /** Text front faces retain the slide pattern frame before camera projection. */
+  preservePatternFrame?: boolean;
   /** Bevel lips to bake into the body before the warp (§20.1.5.12 bevelT/B). */
   bevels?: BevelInput[];
   /** Extrusion side-wall to bake in before the bevel (§20.1.5.12 extrusionH). */
@@ -5235,6 +5580,31 @@ interface Project3dOpts {
    * measures the true silhouette distance instead of the canvas edge.
    */
   edgePadCss?: number;
+}
+
+/** Map the source slide/device frame into a padded, shape-local effect raster.
+ * Bevels blit that raster; scene3d warps it through the camera after painting. */
+function patternFrameToLocalRaster(
+  tf: DOMMatrix,
+  devScale: number,
+  padDev: number,
+  x: number,
+  y: number,
+) {
+  const det = tf.a * tf.d - tf.b * tf.c;
+  if (Math.abs(det) <= 1e-12) return undefined;
+  const ia = tf.d / det;
+  const ib = -tf.b / det;
+  const ic = -tf.c / det;
+  const id = tf.a / det;
+  const ie = -(ia * tf.e + ic * tf.f);
+  const iff = -(ib * tf.e + id * tf.f);
+  return {
+    a: devScale * ia, b: devScale * ib,
+    c: devScale * ic, d: devScale * id,
+    e: padDev + devScale * (ie - x),
+    f: padDev + devScale * (iff - y),
+  };
 }
 
 function projectScene3dPaint(
@@ -5281,7 +5651,17 @@ function projectScene3dPaint(
   octx.save();
   octx.scale(devScale, devScale);
   octx.translate(padCss, padCss);
-  paintBody(octx, 0, 0, w, h);
+  // PowerPoint PDF rasterises projected pattern text as a front-face image
+  // before the camera warp. Its 8 pt tile stays in the slide frame: moving an
+  // otherwise identical dnDiag text shape by 4 pt changes the embedded image's
+  // colour phase, while camera rotation and extrusion retain that phase. Map
+  // the live slide root into this padded local raster before painting.
+  if (opts.preservePatternFrame) {
+    const sourceToAux = patternFrameToLocalRaster(tf, devScale, padDev, x, y);
+    withInheritedPatternScope(target, octx, () => paintBody(octx, 0, 0, w, h), undefined, sourceToAux);
+  } else {
+    paintBody(octx, 0, 0, w, h);
+  }
   octx.restore();
 
   // The body silhouette occupies the offscreen's inner box (device px):
@@ -5383,7 +5763,12 @@ function paintBeveledFlat(
   octx.save();
   octx.scale(devScale, devScale);
   octx.translate(padCss, padCss);
-  paintBody(octx, 0, 0, w, h);
+  // PowerPoint keeps the pattern's slide axes inside an orthographic bevel.
+  // The body is repainted in this shape-local device canvas, then blitted
+  // through the shape CTM. Transfer the complete slide frame, including the
+  // shape's rotation/flip, before resolving its pattern fill.
+  const sourceToAux = patternFrameToLocalRaster(tf, devScale, padDev, x, y);
+  withInheritedPatternScope(target, octx, () => paintBody(octx, 0, 0, w, h), undefined, sourceToAux);
   octx.restore();
   // Restrict the bevel distance-transform to the body's inner box grown by the
   // band width (perf: A3 — skips the transparent pad border). Equivalent because
@@ -5810,7 +6195,7 @@ function paintResolvedPicture(
       // visible through transparent pixels. Image fills need their own decode
       // and are not painted here.
       const backing = el.fill && el.fill.fillType !== 'none' && el.fill.fillType !== 'image'
-        ? resolveShapeFill(el.fill, target, ox, oy, ow, oh, el.rotation)
+        ? resolveShapeFill(el.fill, target, ox, oy, ow, oh, el.rotation, scale * PT_TO_EMU)
         : null;
       if (backing) {
         target.save();
@@ -6018,6 +6403,8 @@ function paintResolvedPicture(
           h: (ctx.canvas as { height: number }).height || 0,
         })
       : rawMask;
+    // The caller paints this prepared picture in the slide pattern scope,
+    // including transparent blip areas and any authored rotation or flip.
     paintWithRasterEffects(
       ctx,
       el,
@@ -6191,6 +6578,7 @@ function drawCompoundLine(
         Math.max(1, Math.abs(end.x - start.x)),
         Math.max(1, Math.abs(end.y - start.y)),
         shapeRotationDeg,
+        scale * PT_TO_EMU,
       )
     : null;
   ctx.strokeStyle = strokePaint ?? hexToRgba(stroke.color);
@@ -6224,6 +6612,7 @@ export function applyStroke(
       bounds.w,
       bounds.h,
       shapeRotationDeg,
+      scale * PT_TO_EMU,
     );
     if (paint) ctx.strokeStyle = paint;
   }
@@ -6480,6 +6869,7 @@ export function renderTable(
       cellW,
       cellH,
       el.rotation,
+      scale * PT_TO_EMU,
     );
     if (fillPaint) {
       ctx.fillStyle = fillPaint;
@@ -7449,7 +7839,9 @@ async function renderSlideLeased(
     step.paint(ctx);
     if (step.failure) throw step.failure.error;
   }
-
+  // renderSlide installed only this device scale on the root context. Keep it
+  // as the slide frame while each element adds local rotations or reflections.
+  const slidePatternFrame = { a: effectiveDpr, d: effectiveDpr };
   for (const [elementIndex, el] of slide.elements.entries()) {
     // A text-run callback may start a newer render of this canvas; stop so we
     // don't paint this (now stale) slide over the newer one.
@@ -7462,11 +7854,12 @@ async function renderSlideLeased(
             origin: slide.elementSources?.[elementIndex]?.origin ?? 'slide',
           })
         : undefined;
-      renderShape(ctx, el, scale, themeDefaultColor, slideNumber, rc, elementTextRun, opts.fetchImage);
+      withPatternCoordinateSpace(ctx, slidePatternFrame, () =>
+        renderShape(ctx, el, scale, themeDefaultColor, slideNumber, rc, elementTextRun, opts.fetchImage));
     } else if (el.type === 'picture' || el.type === 'media') {
       const step = elementSteps[elementIndex];
       if (step) {
-        step.paint(ctx);
+        withPatternCoordinateSpace(ctx, slidePatternFrame, () => step.paint(ctx));
         if (step.failure) throw step.failure.error;
       }
     } else if (el.type === 'table') {
@@ -7477,34 +7870,37 @@ async function renderSlideLeased(
             origin: slide.elementSources?.[elementIndex]?.origin ?? 'slide',
           })
         : undefined;
-      renderTable(ctx, el, scale, slideNumber, rc, elementTextRun);
+      withPatternCoordinateSpace(ctx, slidePatternFrame, () =>
+        renderTable(ctx, el, scale, slideNumber, rc, elementTextRun));
     } else if (el.type === 'chart') {
       // OOXML: 1pt = 12700 EMU. The slide renderer's `scale` is px-per-EMU,
       // so PT_TO_EMU * scale gives pixels-per-point at the current display size.
       const chartPtToPx = PT_TO_EMU * scale;
       // `el.chart` is already the canonical ChartModel emitted by the Rust
       // parser (`ooxml_common::chart::ChartModel`) — no per-field adapter.
-      ctx.save();
-      applyFrameTransform(ctx, el, scale);
-      renderChart(
-        ctx,
-        el.chart,
-        {
-          x: emuToPx(el.x, scale),
-          y: emuToPx(el.y, scale),
-          w: emuToPx(el.width, scale),
-          h: emuToPx(el.height, scale),
-        },
-        chartPtToPx,
-        el.rotation,
-        opts.threeD,
-        opts.regionMap,
-        fill => chartMarkerImages.get(
-          chartImageFillKey(fill),
-        ),
-        opts.chartEx,
-      );
-      ctx.restore();
+      withPatternCoordinateSpace(ctx, slidePatternFrame, () => {
+        ctx.save();
+        applyFrameTransform(ctx, el, scale);
+        renderChart(
+          ctx,
+          el.chart,
+          {
+            x: emuToPx(el.x, scale),
+            y: emuToPx(el.y, scale),
+            w: emuToPx(el.width, scale),
+            h: emuToPx(el.height, scale),
+          },
+          chartPtToPx,
+          el.rotation,
+          opts.threeD,
+          opts.regionMap,
+          fill => chartMarkerImages.get(
+            chartImageFillKey(fill),
+          ),
+          opts.chartEx,
+        );
+        ctx.restore();
+      });
     }
   }
 

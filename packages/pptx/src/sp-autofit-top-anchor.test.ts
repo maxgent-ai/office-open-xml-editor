@@ -108,6 +108,11 @@ function twoLineBody(fontFamily: string, fontFamilyEa: string, fontSize: number)
   return textBody;
 }
 
+
+// PowerPoint's metric split (#1610, powerpoint-line-metrics.ts): usWin ascent
+// shares of a 1.2 × size line.
+const MEIRYO_SHARE = 2171 / (2171 + 901);
+const ARIAL_SHARE = 1854 / (1854 + 434);
 describe('pptx spAutoFit top anchoring', () => {
   it.each([
     ['Meiryo', 12], ['Meiryo', 18], ['Meiryo', 24], ['Meiryo', 32],
@@ -117,19 +122,10 @@ describe('pptx spAutoFit top anchoring', () => {
     (fontFamily, fontSize) => {
       for (const autoFit of ['none', 'sp'] as const) {
         const { ctx, draws } = recordingContext(
-          fontSize * 0.78,
-          fontSize * 0.18,
-          true,
-          fontSize * 0.98,
-          fontSize * 0.37,
+          fontSize * 0.78, fontSize * 0.18, true, fontSize * 0.98, fontSize * 0.37,
         );
-        const textBody = {
-          ...twoLineBody(fontFamily, fontFamily, fontSize),
-          autoFit,
-        };
-
+        const textBody = { ...twoLineBody(fontFamily, fontFamily, fontSize), autoFit };
         renderTextBody(ctx, textBody, 0, 0, 400, 46, SCALE);
-
         expect(draws[1]!.y - draws[0]!.y).toBeCloseTo(fontSize * 1.2, 5);
       }
     },
@@ -137,53 +133,70 @@ describe('pptx spAutoFit top anchoring', () => {
 
   it('keeps implicit multi-line pitch separate from the taller resolved font box (#1473)', () => {
     const fontSize = 32;
-    const actualAscent = fontSize * 0.78;
-    const actualDescent = fontSize * 0.18;
-    const fontAscent = fontSize * 0.98;
-    const fontDescent = fontSize * 0.37;
     const { ctx, draws } = recordingContext(
-      actualAscent,
-      actualDescent,
-      true,
-      fontAscent,
-      fontDescent,
+      fontSize * 0.78, fontSize * 0.18, true, fontSize * 0.98, fontSize * 0.37,
     );
     const textBody = twoLineBody('Meiryo', 'Meiryo', fontSize);
-
     renderTextBody(ctx, textBody, 0, 0, 400, 46, SCALE);
 
     expect(draws.map(({ text }) => text)).toEqual(['一行目', '二行目']);
-    expect(draws[0]!.y).toBeCloseTo(actualAscent, 5);
-    // A resolved Canvas design box may be useful for required bounds, but it is
-    // not PowerPoint's implicit baseline pitch when a:lnSpc is omitted.
-    expect(draws[1]!.y - draws[0]!.y).toBeCloseTo(fontSize * 1.2, 5);
-
+    // #1610 controls (spAutoFit and fixed boxes alike): the usWin split of the
+    // 1.2 × size line, independent of the Canvas font box and glyph ink.
+    expect(draws[0]!.y).toBeCloseTo((fontSize * 1.2 * MEIRYO_SHARE), 5);
+    expect(draws[1]!.y).toBeCloseTo((fontSize * 1.2 * (1 + MEIRYO_SHARE)), 5);
     const neededHeight = renderTextBody(
       ctx, textBody, 0, 0, 400, 46, SCALE,
       null, 0, false, false, '#000000', undefined, undefined, undefined, true,
     );
-    // The final line still reserves the live font box below the last baseline:
-    // one baseline pitch plus one full resolved line box.
-    expect(neededHeight).toBeCloseTo(fontSize * 1.2 + fontAscent + fontDescent, 5);
+    // #1610 table controls: a row grows to the sum of the 1.2 × size lines.
+    expect(neededHeight).toBeCloseTo(2 * fontSize * 1.2, 5);
   });
 
-  it('preserves explicit percentage line spacing under spAutoFit (#1473)', () => {
-    const fontSize = 32;
+  it.each([
+    ['theme-resolved heading face', 32, 46],
+    ['explicit Meiryo face', 36, 50.9],
+  ])('seats the %s first line by its metric split, not by glyph ink', (_label, fontSize, storedHeight) => {
+    // #1610 H-Meiryo-*-t: the spAutoFit first baseline is 118 of 1/100 in for
+    // 100 pt Meiryo, the usWin split, whatever Canvas reports for ink.
     const { ctx, draws } = recordingContext(
-      fontSize * 0.78,
-      fontSize * 0.18,
-      true,
-      fontSize * 0.98,
-      fontSize * 0.37,
+      fontSize * 0.78, fontSize * 0.18, true, fontSize * 0.98, fontSize * 0.37,
     );
-    const textBody = twoLineBody('Meiryo', 'Meiryo', fontSize);
-    textBody.paragraphs[0]!.spaceLine = { type: 'pct', val: 150000 };
+    renderTextBody(ctx, body('Meiryo', 'Meiryo', fontSize), 0, 0, 400, storedHeight, SCALE);
+    expect(draws).toHaveLength(1);
+    expect(draws[0]!.y).toBeCloseTo((fontSize * 1.2 * MEIRYO_SHARE), 5);
+  });
 
-    renderTextBody(ctx, textBody, 0, 0, 400, 46, SCALE);
+  it.each(['ctr', 'b'] as const)(
+    'anchors %s spAutoFit text in the authored box without regrowing it',
+    (verticalAnchor) => {
+      // #1610 H-*-h60-ctr: a centred block overflows a too-small authored
+      // box on both edges; PowerPoint does not regrow the shape.
+      const fontSize = 32;
+      const { ctx, draws } = recordingContext(fontSize * 0.78, fontSize * 0.18);
+      const textBody = { ...twoLineBody('Meiryo', 'Meiryo', fontSize), verticalAnchor };
+      const boxHeight = 30;
+      renderTextBody(ctx, textBody, 0, 0, 400, boxHeight, SCALE);
+      const block = 2 * fontSize * 1.2;
+      const top = verticalAnchor === 'ctr' ? (boxHeight - block) / 2 : boxHeight - block;
+      expect(draws[0]!.y).toBeCloseTo(top + (fontSize * 1.2 * MEIRYO_SHARE), 5);
+    },
+  );
 
-    // Preserve PowerPoint's established percentage-line advance. The
-    // fallback-font correction below affects the glyph origin, not the pitch.
-    expect(draws[1]!.y - draws[0]!.y).toBeCloseTo(fontSize * 1.2 * 1.5, 5);
+  it('keeps the zero-height bottom-anchored shape growing upward', () => {
+    const fontSize = 32;
+    const { ctx, draws } = recordingContext(fontSize * 0.78, fontSize * 0.18);
+    const textBody = { ...body('Meiryo', 'Meiryo', fontSize), verticalAnchor: 'b' as const };
+    renderTextBody(ctx, textBody, 0, 100, 400, 0, SCALE);
+    expect(draws[0]!.y).toBeCloseTo(100 - fontSize * 1.2 + (fontSize * 1.2 * MEIRYO_SHARE), 5);
+  });
+
+  it('places Arial by its own split in fixed and spAutoFit shapes alike', () => {
+    const fontSize = 32;
+    for (const autoFit of ['none', 'sp'] as const) {
+      const { ctx, draws } = recordingContext(fontSize * 0.98, fontSize * 0.37, false);
+      renderTextBody(ctx, { ...body('Arial', 'Arial', fontSize), autoFit }, 0, 0, 400, 46, SCALE);
+      expect(draws[0]!.y).toBeCloseTo((fontSize * 1.2 * ARIAL_SHARE), 5);
+    }
   });
 
   it('retains the resolved font-box baseline for percentage spacing in a top-anchored spAutoFit shape', () => {
@@ -260,130 +273,5 @@ describe('pptx spAutoFit top anchoring', () => {
 
     expect(draws).toHaveLength(1);
     expect(draws[0]!.y).toBeCloseTo(actualAscent, 5);
-  });
-
-  it.each([
-    ['theme-resolved heading face', 'Meiryo', 'Meiryo', 32, 46],
-    ['explicit Meiryo face', 'Meiryo', 'Meiryo', 36, 50.9],
-  ])('uses the measured glyph ascent for %s instead of pushing the first line down', (
-    _label,
-    latin,
-    eastAsian,
-    fontSize,
-    storedHeight,
-  ) => {
-    // The resolved browser font can have a shorter font box than Meiryo's
-    // 1.596em saved-design line. spAutoFit must recalculate from those live
-    // metrics instead of reusing the document font's stale design-height floor.
-    const actualAscent = fontSize * 0.78;
-    const actualDescent = fontSize * 0.18;
-    const fontAscent = fontSize * 0.98;
-    const fontDescent = fontSize * 0.37;
-    const { ctx, draws } = recordingContext(
-      actualAscent,
-      actualDescent,
-      true,
-      fontAscent,
-      fontDescent,
-    );
-    renderTextBody(
-      ctx,
-      body(latin as string, eastAsian as string, fontSize as number),
-      0,
-      0,
-      400,
-      storedHeight as number,
-      SCALE,
-    );
-
-    expect(draws).toHaveLength(1);
-    // PowerPoint PDF output places the visible glyph top at the top inset.
-    // Canvas therefore needs the actual glyph ascent for the first baseline,
-    // not the larger font-box ascent that includes leading above the ink.
-    expect(draws[0]!.y).toBeCloseTo(actualAscent, 5);
-
-    const neededHeight = renderTextBody(
-      ctx,
-      body(latin as string, eastAsian as string, fontSize as number),
-      0,
-      0,
-      400,
-      storedHeight as number,
-      SCALE,
-      null,
-      0,
-      false,
-      false,
-      '#000000',
-      undefined,
-      undefined,
-      undefined,
-      true,
-    );
-    expect(neededHeight).toBeCloseTo(fontAscent + fontDescent, 5);
-  });
-
-  it.each(['ctr', 'b'] as const)(
-    'keeps the font-box baseline for explicitly %s-anchored spAutoFit text',
-    (verticalAnchor) => {
-      const fontSize = 32;
-      const actualAscent = fontSize * 0.78;
-      const fontAscent = fontSize * 0.98;
-      const fontDescent = fontSize * 0.37;
-      const { ctx, draws } = recordingContext(
-        actualAscent,
-        fontSize * 0.18,
-        true,
-        fontAscent,
-        fontDescent,
-      );
-      const textBody = { ...body('Meiryo', 'Meiryo', fontSize), verticalAnchor };
-      renderTextBody(ctx, textBody, 0, 0, 400, fontAscent + fontDescent, SCALE);
-
-      expect(draws[0]!.y).toBeCloseTo(fontAscent, 5);
-    },
-  );
-
-  it('falls back to the font-box baseline when Canvas exposes no glyph ascent', () => {
-    const fontSize = 32;
-    const fontAscent = fontSize * 0.98;
-    const fontDescent = fontSize * 0.37;
-    const { ctx, draws } = recordingContext(0, 0, true, fontAscent, fontDescent);
-
-    renderTextBody(ctx, body('Meiryo', 'Meiryo', fontSize), 0, 0, 400, 46, SCALE);
-
-    expect(draws[0]!.y).toBeCloseTo(fontAscent, 5);
-  });
-
-  it('falls back to the natural line box when Canvas has no font metrics', () => {
-    const fontSize = 32;
-    const { ctx, draws } = recordingContext(fontSize * 0.82, fontSize * 0.18, false);
-    const textBody = body('Meiryo', 'Meiryo', fontSize);
-    renderTextBody(ctx, textBody, 0, 0, 400, 46, SCALE);
-    const naturalLineHeight = fontSize * 1.2;
-
-    expect(draws[0]!.y).toBeCloseTo(naturalLineHeight * 0.8, 5);
-    expect(renderTextBody(
-      ctx, textBody, 0, 0, 400, 46, SCALE,
-      null, 0, false, false, '#000000', undefined, undefined, undefined, true,
-    )).toBeCloseTo(naturalLineHeight, 5);
-  });
-
-  it('keeps fixed text independent of the authored font design box', () => {
-    const fontSize = 32;
-    const { ctx, draws } = recordingContext(fontSize * 0.98, fontSize * 0.37);
-    const textBody = { ...body('Meiryo', 'Meiryo', fontSize), autoFit: 'none' as const };
-    renderTextBody(ctx, textBody, 0, 0, 400, 46, SCALE);
-
-    expect(draws[0]!.y).toBeCloseTo(fontSize * 0.98, 5);
-  });
-
-  it('uses live containment metrics for any tall resolved spAutoFit face', () => {
-    const fontSize = 32;
-    const { ctx, draws } = recordingContext(fontSize * 0.98, fontSize * 0.37);
-    const textBody = body('Arial', 'Arial', fontSize);
-    renderTextBody(ctx, textBody, 0, 0, 400, 46, SCALE);
-
-    expect(draws[0]!.y).toBeCloseTo(fontSize * 0.98, 5);
   });
 });

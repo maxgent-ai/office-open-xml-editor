@@ -1,6 +1,38 @@
 import { defineCompatibilityRule } from './compatibility.js';
 import type { ParagraphLayout, StoryLayout } from './types.js';
 
+/** Evidence: Word for Mac PDF exports of synthetic controls (issue #1615):
+ * margin-, page- and paragraph-relative pictures; square, full-width square
+ * and topAndBottom wrap; allowOverlap on and off; single anchors, anchors in
+ * adjacent paragraphs and a later anchor sharing a page with an accepted one;
+ * multi-line anchor paragraphs with the anchor run on the first or last line;
+ * widow control; keepNext on the preceding paragraph; a picture taller than
+ * any page remainder; two newspaper columns; a full-width picture mid-body;
+ * and a 400-paragraph document with six clustered anchors. */
+export const WORD_PAGE_ANCHOR_LINE_DEFERRAL = defineCompatibilityRule({
+  id: 'word-page-anchor-line-deferral',
+  evidence: {
+    kind: 'office-observation',
+    syntheticFixtureId: 'page-anchor-line-deferral',
+    application: 'Microsoft Word',
+    version: '16.113.2',
+    platform: 'macOS 27.0',
+  },
+  description: 'ECMA-376 does not say where a page-owned drawing goes when its own wrap exclusion pushes its anchor line off the page. Word tests anchor lines in flow order on each page: with the page-owned anchors already accepted on page N whose lines precede line L, plus the anchors on L, Word lays out N again; if L stays on N (any column of the region) those anchors are accepted and the earlier lines wrap around them. Otherwise page N keeps its layout without them, L starts a later page as if the page ended just above L (keepNext and widow control act as for an overflow; a mid-paragraph anchor line splits its paragraph), and the anchors go to the page where L lands. Counterexamples in the same controls: a line that still fits keeps its picture on N, and the first line of a page stays even when its picture pushes it past the body bottom. Unmeasured: a deferral whose line would otherwise fall in an earlier column of a multi-column page moves to the next page, not the next column.',
+});
+
+export const WORD_PAGE_ANCHOR_REGION_REGISTRATION = defineCompatibilityRule({
+  id: 'word-page-anchor-region-registration',
+  evidence: {
+    kind: 'office-observation',
+    syntheticFixtureId: 'page-anchor-line-deferral',
+    application: 'Microsoft Word',
+    version: '16.113.2',
+    platform: 'macOS 27.0',
+  },
+  description: 'A page-owned drawing belongs to its page, not to the newspaper column its anchor line reaches: in a two-column control Word keeps column 1 wrapped below a margin-relative topAndBottom picture over column 1 while the anchor paragraph moves into column 2. Register such drawings where their section region opens on the page.',
+});
+
 export const WORD_ZERO_RELATIVE_SIZE_EXTENT_FALLBACK = defineCompatibilityRule({
   id: 'word-zero-relative-size',
   evidence: {

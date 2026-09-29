@@ -58,13 +58,18 @@ import {
   chartStyleLineDecision,
 } from './style-paint.js';
 import { planWaterfallPaintSites } from './waterfall-plan.js';
+import {
+  CHARTEX_DEFAULT_LINE_WIDTH_EMU,
+  resolveChartExLineChain,
+  resolveChartExPointFill,
+  resolveChartExPointLine,
+} from './shared/chartex-style.js';
 import { paintPlotAreaFrame } from './plot-area-frame.js';
 import { chartStyleEffectOwner, paintChartStyleEffects } from './style-effects.js';
 import {
   applyChartExSeriesLineStyle,
   applyResolvedChartExLineStyle,
   axisLabelPx,
-  chartColor,
   chartExDataPointFill,
   chartExDataPointPaint,
   chartExFillStyle,
@@ -102,61 +107,6 @@ import {
   type ChartExStyle,
 } from './renderer.js';
 import { resolveChartExLabel } from './chart-ex-label.js';
-
-function chartExStyleAuthorsFill(style: ChartExStyle | null | undefined): boolean {
-  if (!style || style.fillNoStyle === true) return false;
-  return style.fillPaintAuthored === true
-    || style.fillHidden === true
-    || style.fillColors?.some(color => color != null) === true
-    || style.fillPaints?.some(paint => paint != null) === true;
-}
-
-function waterfallPointPaint(
-  chart: ChartModel,
-  point: ChartDataPointOverride | undefined,
-  series: ChartSeries | undefined,
-  semanticIndex: number,
-): Fill | null {
-  const pointAuthorsFill = point?.fillHidden === true
-    || point?.color != null
-    || chartExStyleAuthorsFill(point?.chartexStyle);
-  if (pointAuthorsFill) {
-    const pointStyle = point?.fillHidden === true
-      ? { ...point.chartexStyle, fillHidden: true, fillPaintAuthored: true }
-      : point?.chartexStyle;
-    return chartExDataPointPaint(
-      chart, semanticIndex, 3, pointStyle, point?.color,
-    );
-  }
-  if (series?.chartexStyle?.fillPaintAuthored === true) {
-    return chartExDataPointPaint(
-      chart, semanticIndex, 3, series.chartexStyle, series.color,
-    );
-  }
-  // CT_Series.spPr formats the series carrier. ChartEx semantic data points
-  // keep their dataPoint role when that carrier has noFill, while a positive
-  // series paint still wins; chartExDataPointPaint owns that distinction.
-  return chartExDataPointPaint(
-    chart, semanticIndex, 3, series?.chartexStyle, series?.color,
-  );
-}
-
-function waterfallPointAuthorsLine(point: ChartDataPointOverride | undefined): boolean {
-  const style = point?.chartexStyle;
-  return point?.lineHidden != null
-    || point?.lineColor != null
-    || point?.lineWidthEmu != null
-    || point?.lineDash != null
-    || style?.linePaintAuthored === true
-    || style?.lineHidden != null
-    || style?.lineColors?.some(color => color != null) === true
-    || style?.linePaints?.some(paint => paint != null) === true
-    || style?.lineWidthEmu != null
-    || style?.lineDash != null
-    || style?.lineCustomDash != null
-    || style?.lineCap != null
-    || style?.lineJoin != null;
-}
 
 /** Bound structured label-shape work owned by ChartEx hierarchy painters. */
 /** @internal Exported for resource-boundary regression tests. */
@@ -268,24 +218,28 @@ export function chartExDataMarkPaintWorkCount(
       if (!bar.paintSlot) continue;
       const accentIndex = bar.semanticIndex;
       const point = overrides.get(index);
-      charge(waterfallPointPaint(chart, point, series, accentIndex));
-      chargeLine(
-        chart.chartexDataPointStyle,
-        waterfallPointAuthorsLine(point) ? point : series,
-        accentIndex,
-        3,
+      charge(resolveChartExPointFill(chart, series, point, accentIndex, 3));
+      const line = resolveChartExPointLine(
+        chart, series, point, accentIndex, 3, '#000000',
+        chart.chartexDataPointStyle, { linkedNoStyleFallback: true },
       );
+      if (line.visible) charge(line.paint ?? { fillType: 'solid', color: '000000' });
     }
   } else if (chart.chartType === 'funnel') {
     const series = chart.series[0];
     const values = series?.values ?? [];
     const count = Math.max(values.length, chart.categories.length);
     if (values.some(value => value != null && value > 0)) {
-      const fill = chartExDataPointPaint(chart, 0, 1, series?.chartexStyle, series?.color);
+      const overrides = indexPointOverrides(series?.dataPointOverrides);
       for (let index = 0; index < count; index++) {
         if (!((values[index] ?? 0) > 0)) continue;
-        charge(fill);
-        chargeLine(chart.chartexDataPointStyle, series, 0, 1);
+        const point = overrides.get(index);
+        charge(resolveChartExPointFill(chart, series, point, 0, 1));
+        const line = resolveChartExPointLine(
+          chart, series, point, 0, 1, '#000000',
+          chart.chartexDataPointStyle, { linkedNoStyleFallback: true },
+        );
+        if (line.visible) charge(line.paint ?? { fillType: 'solid', color: '000000' });
       }
     }
   } else if (chart.chartType === 'boxWhisker') {
@@ -309,12 +263,16 @@ export function chartExDataMarkPaintWorkCount(
     visitChartExHierarchyBodySites(chart, ({ node }) => {
       branchCount = Math.max(branchCount, node.branchIndex + 1);
     });
+    const overrides = indexPointOverrides(series?.dataPointOverrides);
     const status = visitChartExHierarchyBodySites(chart, ({ node, paintsBody }) => {
       if (!paintsBody) return;
-      charge(chartExDataPointPaint(
-        chart, node.branchIndex, branchCount, series?.chartexStyle, series?.color,
-      ));
-      chargeLine(chart.chartexDataPointStyle, series, node.branchIndex, branchCount);
+      const point = overrides.get(node.labelIndex);
+      charge(resolveChartExPointFill(chart, series, point, node.branchIndex, branchCount));
+      const line = resolveChartExPointLine(
+        chart, series, point, node.branchIndex, branchCount, '#000000',
+        chart.chartexDataPointStyle, { linkedNoStyleFallback: true },
+      );
+      if (line.visible) charge(line.paint ?? { fillType: 'solid', color: '000000' });
     });
     if (status === 'too-large') return MAX_CHART_PAINT_COMPONENTS + 1;
   }
@@ -606,12 +564,14 @@ function renderWaterfallChart(
 
     const accentIndex = bar.semanticIndex;
     const point = pointOverrides.get(i);
-    const paint = waterfallPointPaint(chart, point, series, accentIndex);
+    const paint = resolveChartExPointFill(chart, series, point, accentIndex, 3);
     const fallback = point?.color
       ? `#${point.color}`
       : bar.isSub ? colorSub : bar.isPos ? colorPos : colorNeg;
     const lineColor = chartExStyleColor(chart, chart.chartexDataPointStyle, 'line', accentIndex, 3);
-    const lineCarrier = waterfallPointAuthorsLine(point) ? point : series;
+    const outline = resolveChartExPointLine(
+      chart, series, point, accentIndex, 3, lineColor ? `#${lineColor}` : fallback,
+    );
     if (bar.paintSlot) {
       paintChartStyleEffects(
         ctx,
@@ -625,16 +585,11 @@ function renderWaterfallChart(
             target, paint, { x: bx, y: yTop, w: barW, h: bh }, fallback,
             ptToPx, shapeRotationDeg,
           );
-          if (applyChartExSeriesLineStyle(
-            target,
-            chart,
-            chart.chartexDataPointStyle,
-            lineCarrier,
-            accentIndex,
-            3,
-            lineColor ? `#${lineColor}` : fallback,
-            ptToPx,
-          )) target.strokeRect(bx, yTop, barW, bh);
+          if (applyResolvedChartExLineStyle(
+            target, outline, ptToPx, { x: bx, y: yTop, w: barW, h: bh }, shapeRotationDeg,
+          )) {
+            target.strokeRect(bx, yTop, barW, bh);
+          }
         },
       );
     }
@@ -644,15 +599,22 @@ function renderWaterfallChart(
       const nextBx = px0 + gapW * (i + 1) + (gapW - barW) / 2;
       const connY = bar.isPos ? yTop : yBot;
       ctx.save();
-      const connectorLine = resolveChartExSeriesLineStyle(
+      // PowerPoint-observed connector chain: direct series `a:ln`, then the
+      // seriesLine role, then dataPointLine (paint and geometry), else the
+      // black 0.75 pt semantic rule. The dataPoint role does not apply.
+      const connectorRoles = [chart.chartexSeriesLineStyle, chart.chartexDataPointLineStyle];
+      const connectorLine = resolveChartExLineChain(
         chart,
-        chart.chartexSeriesLineStyle,
         series,
+        connectorRoles,
+        connectorRoles,
         accentIndex,
         3,
         '#000000',
         { linkedNoStyleFallback: true },
       );
+      // Connector strokes stay solid (no bounds): structured connector paint
+      // is not part of the paint-work budget, as on main.
       if (applyResolvedChartExLineStyle(ctx, connectorLine, ptToPx)) {
         // A linked `seriesLine` NoStyle delegates to Waterfall's semantic
         // connector rather than suppressing it. Office vector output from
@@ -788,7 +750,7 @@ function renderFunnelChart(
   const series = chart.series[0];
   const labelOverrides = indexPointOverrides(series?.dataLabelOverrides);
   const color = `#${series?.color ?? chartExDataPointFill(chart, 0, 1, series?.chartexStyle)}`;
-  const paint = chartExDataPointPaint(chart, 0, 1, series?.chartexStyle, series?.color);
+  const legendPaint = chartExDataPointPaint(chart, 0, 1, series?.chartexStyle, series?.color);
   const legendChart: ChartModel = {
     ...chart,
     series: [chartExLegendSeries(
@@ -839,11 +801,15 @@ function renderFunnelChart(
   const rowH = ph / n;
   const gapWidthPct = resolveCategoryGapWidthPercent(chart.barGapWidth, 'chartex');
   const barH = rowH / (1 + gapWidthPct / 100);
+  const pointOverrides = indexPointOverrides(series?.dataPointOverrides);
   for (let index = 0; index < n; index++) {
     const value = Math.max(0, values[index] ?? 0);
     const barW = pw * value / max;
     const bx = px0 + (pw - barW) / 2;
     const by = py0 + rowH * index + (rowH - barH) / 2;
+    const point = pointOverrides.get(index);
+    const paint = resolveChartExPointFill(chart, series, point, 0, 1);
+    const outline = resolveChartExPointLine(chart, series, point, 0, 1, color);
     const paintBody = (target: CanvasRenderingContext2D): void => {
       if (paint && barW > 0) paintClassicDataPointRect(
         target, paint, { x: bx, y: by, w: barW, h: barH }, color,
@@ -857,12 +823,18 @@ function renderFunnelChart(
         );
         target.fillRect(bx, by, barW, barH);
       }
-      if (applyChartExSeriesLineStyle(
-        target, chart, chart.chartexDataPointStyle, series, 0, 1, color, ptToPx,
-      )) target.strokeRect(bx, by, barW, barH);
+      // A zero-width ordinal slot keeps main's solid stroke: resolving a
+      // structured paint there would be work the paint budget skips.
+      if (applyResolvedChartExLineStyle(
+        target, outline, ptToPx,
+        barW > 0 ? { x: bx, y: by, w: barW, h: barH } : undefined, shapeRotationDeg,
+      )) {
+        target.strokeRect(bx, by, barW, barH);
+      }
     };
     if (barW > 0) paintChartStyleEffects(
-      ctx, series?.chartexStyle, chart.chartexDataPointStyle, 0,
+      ctx, chartStyleEffectOwner(point?.chartexStyle, series?.chartexStyle),
+      chart.chartexDataPointStyle, 0,
       { x: bx, y: by, w: barW, h: barH }, ptToPx, paintBody,
     );
     else paintBody(ctx);
@@ -917,7 +889,7 @@ function renderFunnelChart(
     ctx.lineWidth = line.width;
     ctx.beginPath(); ctx.moveTo(px0, py0); ctx.lineTo(px0, py0 + ph); ctx.stroke();
   }
-  drawLegendForLayout(ctx, legendChart, leg, x, y, w, h, px0, py0, pw, ph, titleBand.bandH + 2, ptToPx, [paint], shapeRotationDeg);
+  drawLegendForLayout(ctx, legendChart, leg, x, y, w, h, px0, py0, pw, ph, titleBand.bandH + 2, ptToPx, [legendPaint], shapeRotationDeg);
   ctx.restore();
 }
 
@@ -943,13 +915,16 @@ function renderParetoLineChart(
   const layout = planParetoLayout(source, chart.categories, { sortDescending: false });
   if (layout.points.length === 0) return;
   const styleIndex = chartExSeriesFormatIndex(source, 0);
-  const paretoLine = resolveChartExSeriesLineStyle(
+  // Same role chain as the owner-backed Pareto line (see bar.ts).
+  const paretoRoles = [chart.chartexDataPointStyle, chart.chartexDataPointLineStyle];
+  const paretoLine = resolveChartExLineChain(
     chart,
-    chart.chartexDataPointLineStyle,
     source,
+    paretoRoles,
+    paretoRoles,
     styleIndex,
     1,
-    chartColor(0, source),
+    `#${chartExDataPointFill(chart, styleIndex, 1, source.chartexStyle)}`,
     { linkedNoStyleFallback: true },
   );
   renderLineChart(ctx, {
@@ -961,7 +936,9 @@ function renderParetoLineChart(
       showMarker: false,
       lineHidden: !paretoLine.visible,
       lineColor: paretoLine.color.replace(/^#/, ''),
-      lineWidthEmu: paretoLine.widthEmu,
+      // Excel draws a standalone paretoLine without any line width at the
+      // ChartEx 0.75 pt default, not the classic line family's 2.25 pt.
+      lineWidthEmu: paretoLine.widthEmu ?? CHARTEX_DEFAULT_LINE_WIDTH_EMU,
       chartexStyle: {
         lineDash: paretoLine.dash,
         lineCap: paretoLine.cap,
@@ -1491,11 +1468,6 @@ function renderBoxWhiskerChart(
       const styleIndex = boxStyleIndices[si];
       const styleLine = chartExStyleColor(chart, pointStyle, 'line', styleIndex, nSer);
       const edge = s.lineColor ? `#${s.lineColor}` : styleLine ? `#${styleLine}` : fill;
-      const edgeWidth = s.lineWidthEmu
-        ? axisLineWidthPx(s.lineWidthEmu, ptToPx)
-        : pointStyle?.lineWidthEmu != null
-          ? axisLineWidthPx(pointStyle.lineWidthEmu, ptToPx)
-          : 1;
       const lineEdge = chartExStyleColor(chart, lineStyle, 'line', styleIndex, nSer);
       const markerFill = chartExStyleColor(chart, markerStyle, 'fill', styleIndex, nSer);
       const markerFillPaint = chartExMarkerPaint(
@@ -1550,15 +1522,24 @@ function renderBoxWhiskerChart(
             target, fillPaint, { x: bx, y: boxTop, w: boxW, h: boxH }, fill,
             ptToPx, shapeRotationDeg,
           );
-          if (applyChartExSeriesLineStyle(
-            target, chart, pointStyle, s, styleIndex, nSer, edge, ptToPx,
-            { linkedNoStyleFallback: true },
-          )) target.strokeRect(
-            bx + edgeWidth / 2,
-            boxTop + edgeWidth / 2,
-            boxW - edgeWidth,
-            boxH - edgeWidth,
-          );
+          if (applyResolvedChartExLineStyle(
+            target,
+            resolveChartExPointLine(
+              chart, s, undefined, styleIndex, nSer, edge, pointStyle,
+              { linkedNoStyleFallback: true },
+            ),
+            ptToPx,
+            { x: bx, y: boxTop, w: boxW, h: boxH },
+            shapeRotationDeg,
+          )) {
+            const edgeWidth = target.lineWidth;
+            target.strokeRect(
+              bx + edgeWidth / 2,
+              boxTop + edgeWidth / 2,
+              boxW - edgeWidth,
+              boxH - edgeWidth,
+            );
+          }
         },
       );
 
@@ -1802,13 +1783,10 @@ function renderSunburstChart(
     const hex = chartExDataPointFill(chart, bi, root.children.length, series?.chartexStyle);
     return `#${hex}`;
   };
-  const branchPaint = (bi: number): Fill | null => chartExDataPointPaint(
-    chart,
-    bi,
-    root.children.length,
-    series?.chartexStyle,
-    series?.color,
-  );
+  // Hierarchy `dataPt idx` addresses the node's pre-order index, the same
+  // index CT_DataLabel uses (PowerPoint-observed: idx 1 formats the first
+  // leaf under the first top-level branch).
+  const pointOverrides = indexPointOverrides(series?.dataPointOverrides);
 
   const labelDef = series?.seriesDataLabels;
   const labelFont = chartFontFamily(
@@ -1837,12 +1815,19 @@ function renderSunburstChart(
     for (const node of byDepth[d]) {
       const sweep = node.a1 - node.a0;
       if (sweep <= 1e-4) continue;
-      const nodePaint = branchPaint(node.branchIndex);
+      const point = pointOverrides.get(node.labelIndex);
+      const nodePaint = resolveChartExPointFill(
+        chart, series, point, node.branchIndex, root.children.length,
+      );
+      const nodeOutline = resolveChartExPointLine(
+        chart, series, point, node.branchIndex, root.children.length, '#ffffff',
+      );
       const nodeBounds = {
         x: cx - rOuter, y: cy - rOuter, w: rOuter * 2, h: rOuter * 2,
       };
       paintChartStyleEffects(
-        ctx, series?.chartexStyle, chart.chartexDataPointStyle,
+        ctx, chartStyleEffectOwner(point?.chartexStyle, series?.chartexStyle),
+        chart.chartexDataPointStyle,
         series?.chartexFormatIdx ?? 0, nodeBounds, ptToPx,
         target => {
           target.beginPath();
@@ -1853,9 +1838,8 @@ function renderSunburstChart(
             target, nodePaint, nodeBounds, branchColor(node.branchIndex),
             ptToPx, shapeRotationDeg,
           );
-          if (applyChartExSeriesLineStyle(
-            target, chart, chart.chartexDataPointStyle, chart.series[0],
-            node.branchIndex, root.children.length, '#ffffff', ptToPx,
+          if (applyResolvedChartExLineStyle(
+            target, nodeOutline, ptToPx, nodeBounds, shapeRotationDeg,
           )) target.stroke();
         },
         node.branchIndex,
@@ -2121,12 +2105,13 @@ function renderTreemapChart(
     (chart.series[0]?.dataLabelOverrides ?? []).map(override => [override.idx, override]),
   );
   // With no direct or linked line recipe, use a one-CSS-pixel separator derived
-  // from the chart background. `applyChartExSeriesLineStyle` still resolves
-  // direct series formatting and the linked data-point role before this fallback.
+  // from the chart background. `resolveChartExPointLine` still resolves direct
+  // point/series formatting and the linked data-point role before this fallback.
   const automaticSeparator = chart.chartBg
     ? (chart.chartBg.startsWith('#') ? chart.chartBg : `#${chart.chartBg}`)
     : '#ffffff';
 
+  const pointOverrides = indexPointOverrides(series?.dataPointOverrides);
   const paint = (node: SunburstNode, tile: TreemapRect): void => {
     if (tile.w < 0.5 || tile.h < 0.5) return;
     const base = chartExDataPointFill(
@@ -2135,9 +2120,12 @@ function renderTreemapChart(
     // Every descendant of a top-level branch uses that branch's exact accent.
     // Hierarchy depth does not tint or whiten ChartEx treemap data points.
     const color = `#${base}`;
-    const fillPaint = chartExDataPointPaint(
-      chart, node.branchIndex, root.children.length, series?.chartexStyle, series?.color,
+    // `dataPt idx` addresses the node's pre-order index, as in sunburst.
+    const point = pointOverrides.get(node.labelIndex);
+    const fillPaint = resolveChartExPointFill(
+      chart, series, point, node.branchIndex, root.children.length,
     );
+    const effectOwner = chartStyleEffectOwner(point?.chartexStyle, series?.chartexStyle);
     const labelOverride = labelOverrides.get(node.labelIndex);
     const nodeLabelColor = labelOverride?.fontColor ? `#${labelOverride.fontColor}` : labelColor;
     const nodeLabelFontPx = chartTextFontSizePx(labelOverride?.fontSizeHpt, ptToPx)
@@ -2171,7 +2159,7 @@ function renderTreemapChart(
       // a hairline frame around each branch. Banner mode alone reserves and
       // paints a caption band.
       if (bannerH > 0) paintChartStyleEffects(
-        ctx, series?.chartexStyle, chart.chartexDataPointStyle,
+        ctx, effectOwner, chart.chartexDataPointStyle,
         series?.chartexFormatIdx ?? 0,
         { x: tile.x, y: tile.y, w: tile.w, h: bannerH }, ptToPx,
         target => {
@@ -2226,16 +2214,22 @@ function renderTreemapChart(
     }
 
     paintChartStyleEffects(
-      ctx, series?.chartexStyle, chart.chartexDataPointStyle,
+      ctx, effectOwner, chart.chartexDataPointStyle,
       series?.chartexFormatIdx ?? 0, tile, ptToPx,
       target => {
         if (fillPaint) paintClassicDataPointRect(
           target, fillPaint, tile, color, ptToPx, shapeRotationDeg,
         );
-        const hasAuthoredOutline = applyChartExSeriesLineStyle(
-          target, chart, chart.chartexDataPointStyle, chart.series[0],
-          node.branchIndex, root.children.length, automaticSeparator, ptToPx,
-          { linkedNoStyleFallback: true },
+        const hasAuthoredOutline = applyResolvedChartExLineStyle(
+          target,
+          resolveChartExPointLine(
+            chart, series, point, node.branchIndex, root.children.length,
+            automaticSeparator, chart.chartexDataPointStyle,
+            { linkedNoStyleFallback: true },
+          ),
+          ptToPx,
+          tile,
+          shapeRotationDeg,
         );
         if (hasAuthoredOutline) {
           // ChartEx outlines are centered on the tile boundary. An inset

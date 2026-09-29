@@ -63,6 +63,19 @@ import {
   writingModeFromTextDirection,
 } from './coordinate-space.js';
 import { selectParagraphFragment, type ParagraphFragmentCursor } from './paragraph-pagination.js';
+import {
+  anchorKeysId,
+  anchorLineDeferralApplies,
+  anchorLineDeferralKey,
+  anchorLineDeferralsIdentity,
+  createAnchorLineDeferralProof,
+  pageOwnedAnchorKeysByLine,
+  serializeAnchorInput,
+  type AnchorLineDeferralContext,
+  type AnchorLineDeferrals,
+  type AnchorLineDeferralProof,
+  type PageAnchorInputEvent,
+} from './anchor-line-deferral.js';
 import { paragraphGapAdjustment } from './paragraph-spacing.js';
 import {
   endnoteIdsInRetainedSlice,
@@ -103,6 +116,7 @@ import type {
   DeepReadonly,
   DocumentLayout,
   LayoutDiagnostic,
+  LayoutPage,
   LayoutServices,
   NoteLayout,
   PaintNode,
@@ -754,6 +768,10 @@ export type BodyPaginationPassResult = Readonly<{
   footnoteReserveByPage: ReadonlyMap<number, number>;
   footnoteLayoutsByPage: ReadonlyMap<number, readonly NoteLayout[]>;
   terminalDiagnostic: LayoutDiagnostic | null;
+  /** Every read of the anchor-convergence carry, in pass order. */
+  anchorInputs: readonly PageAnchorInputEvent[];
+  /** `anchorInputs` serialized for exact comparison between passes. */
+  serializedAnchorInputs: readonly string[];
 }>;
 
 interface BodyPaginationPassObserver {
@@ -765,22 +783,6 @@ interface BodyPaginationPassObserver {
 }
 
 type PageStartAnchors = PageAnchorPrescanInput['anchors'];
-
-/** One read of anchor-convergence state by a body pagination pass: the anchors
- * prescanned when a flow domain opens, or the minimum-page floor looked up for
- * a page-owned floating table when the flow reaches it. Everything else a pass
- * reads is identical in every pass of one convergence run. */
-type PageAnchorInputEvent = Readonly<{
-  kind: 'prescan';
-  pageIndex: number;
-  flowDomainId: string;
-  anchors: PageStartAnchors;
-}> | Readonly<{
-  kind: 'page-owned-table';
-  pageIndex: number;
-  key: string;
-  floor: number | undefined;
-}>;
 
 /** Receives provisional snapshots of one or more passes of the canonical
  * session; `pageIndexLimit` bounds the leading pages the caller may show. */
@@ -841,6 +843,8 @@ function paginationPassResult(
   footnoteReserveByPage: ReadonlyMap<number, number>,
   footnoteLayoutsByPage: ReadonlyMap<number, readonly NoteLayout[]>,
   terminalDiagnostic: LayoutDiagnostic | null,
+  anchorInputs: readonly PageAnchorInputEvent[] = [],
+  serializedAnchorInputs: readonly string[] = [],
 ): BodyPaginationPassResult {
   const layout = finalize(state, owners);
   const retainedPageIndexes = new Set(layout.pages.map((page) => page.pageIndex));
@@ -858,6 +862,8 @@ function paginationPassResult(
     footnoteLayoutsByPage: new Map([...footnoteLayoutsByPage]
       .filter(([pageIndex]) => retainedPageIndexes.has(pageIndex))),
     terminalDiagnostic,
+    anchorInputs: Object.freeze([...anchorInputs]),
+    serializedAnchorInputs: Object.freeze([...serializedAnchorInputs]),
   });
 }
 
@@ -910,6 +916,7 @@ function* paginateBodyPassSteps(
   minimumTablePageBySource: ReadonlyMap<string, number> | null,
   balancePlan: BodyBalancePlan,
   observer?: BodyPaginationPassObserver,
+  anchorLineDeferrals: AnchorLineDeferrals | null = null,
 ): PaginationSteps<BodyPaginationPassResult> {
   const kernel = bodyLayoutKernelOf(services);
   if (!kernel) throw new Error('Body layout kernel is not attached to the supplied services');
@@ -979,19 +986,38 @@ function* paginateBodyPassSteps(
     }
     return Object.freeze(anchors);
   };
+  // Every read of the anchor-convergence carry, in pass order. A later pass
+  // proves an anchor-line deferral against these reads, and the progressive
+  // observer bounds stable pages with them.
+  const anchorInputs: PageAnchorInputEvent[] = [];
+  const serializedAnchorInputs: string[] = [];
+  const recordAnchorInput = (event: PageAnchorInputEvent) => {
+    anchorInputs.push(event);
+    serializedAnchorInputs.push(serializeAnchorInput(event, pageStartAnchorsIdentity));
+    observer?.onPageAnchorInput?.(event);
+  };
+  // Page-owned anchors registered on the current physical page.
+  let registeredAnchorPage = -1;
+  const registeredAnchorKeys = new Set<string>();
+  // Anchor-line deferrals applied on the current physical page.
+  let deferralPage = -1;
+  const appliedDeferralKeys = new Set<string>();
   const prescanPageAnchors = (target: BodyPaginationState, startIndex: number) => {
     const anchors = pageStartAnchors(target, startIndex);
-    if (observer?.onPageAnchorInput) {
-      // Recorded even when empty: a later pass that prescans anchors here
-      // would change this flow domain.
-      const at = acquisitionLocation(target);
-      observer.onPageAnchorInput(Object.freeze({
-        kind: 'prescan',
-        pageIndex: at.pageIndex,
-        flowDomainId: at.flowDomainId,
-        anchors,
-      }));
+    const at = acquisitionLocation(target);
+    // Recorded even when empty: a later pass that prescans anchors here
+    // would change this flow domain.
+    recordAnchorInput(Object.freeze({
+      kind: 'prescan',
+      pageIndex: at.pageIndex,
+      flowDomainId: at.flowDomainId,
+      anchors,
+    }));
+    if (registeredAnchorPage !== at.pageIndex) {
+      registeredAnchorPage = at.pageIndex;
+      registeredAnchorKeys.clear();
     }
+    anchors.forEach((anchor) => registeredAnchorKeys.add(anchor.occurrenceId));
     if (anchors.length === 0) return;
     if (!session.prescanPageAnchors) {
       throw new Error('Page-owned anchors require canonical prescan acquisition');
@@ -1003,6 +1029,46 @@ function* paginateBodyPassSteps(
       availableInlineExtentPt: location.availableBounds.widthPt,
     });
     if (delta) session.commitFlowRegistryDelta(delta);
+  };
+  const deferralContext: AnchorLineDeferralContext = Object.freeze({
+    reads: serializedAnchorInputs,
+  });
+  /** Whether a proven anchor-line deferral (see anchor-line-deferral.ts)
+   * sends the line anchoring `keys` past the current physical page. */
+  const anchorLineDeferred = (keys: readonly string[]): boolean => {
+    if (anchorLineDeferrals === null || keys.length === 0) return false;
+    const pageIndex = state.flow.pageIndex;
+    if (registeredAnchorPage === pageIndex && keys.some((key) => registeredAnchorKeys.has(key))) {
+      return false;
+    }
+    const keysId = anchorKeysId(keys);
+    if (deferralPage === pageIndex && appliedDeferralKeys.has(keysId)) return true;
+    let proof: AnchorLineDeferralProof | undefined;
+    for (const key of keys) {
+      proof = anchorLineDeferrals.get(anchorLineDeferralKey(key, pageIndex));
+      if (proof) break;
+    }
+    if (!proof || !anchorLineDeferralApplies(proof, keys, pageIndex, deferralContext)) return false;
+    if (deferralPage !== pageIndex) {
+      deferralPage = pageIndex;
+      appliedDeferralKeys.clear();
+    }
+    appliedDeferralKeys.add(keysId);
+    recordAnchorInput(Object.freeze({
+      kind: 'anchor-line-deferral',
+      pageIndex,
+      keys: Object.freeze([...keys].sort()),
+    }));
+    return true;
+  };
+  /** First line of `layout` that a proven deferral keeps off this page. */
+  const deferredAnchorLineIndex = (layout: ParagraphLayout): number | undefined => {
+    if (anchorLineDeferrals === null) return undefined;
+    const keysByLine = pageOwnedAnchorKeysByLine(layout);
+    for (let index = 0; index < keysByLine.length; index += 1) {
+      if (anchorLineDeferred(keysByLine[index]!)) return index;
+    }
+    return undefined;
   };
   prescanPageAnchors(state, 0);
   const commitTransition = (
@@ -1381,6 +1447,7 @@ function* paginateBodyPassSteps(
           let keepSetExtentPt = acquired.blockExtentPt;
           const keepSetReferenceIds = new Set(footnoteIdsInRetainedSlice(acquired.layout));
           let hasTerminalBlock = false;
+          let keepSetBlockedByDeferral = false;
           let bridgeSuccessor = wordEmptyKeepNextBridgesSuccessor({
             keepNext: block.keepNext,
             inkless: block.inkless === true,
@@ -1402,6 +1469,15 @@ function* paginateBodyPassSteps(
             const continues = nextBlock.kind === 'paragraph'
               && (nextBlock.keepNext || bridgeSuccessor);
             bridgeSuccessor = false;
+            // A proven anchor-line deferral on a line this keep set must hold
+            // ends the page above it, like an overflow
+            // (word-page-anchor-line-deferral).
+            const keptLines = continues
+              ? following.pageOwnedAnchorKeysByLine
+              : following.pageOwnedAnchorKeysByLine?.slice(0, 1);
+            if (keptLines?.some((keys) => anchorLineDeferred(keys))) {
+              keepSetBlockedByDeferral = true;
+            }
             keepSetExtentPt += continues
               ? following.fullExtentPt
               : following.leadContentExtentPt;
@@ -1409,7 +1485,7 @@ function* paginateBodyPassSteps(
               ? following.fullFootnoteReferenceIds
               : following.leadFootnoteReferenceIds;
             referenceIds?.forEach((id) => keepSetReferenceIds.add(id));
-            if (!continues) {
+            if (!continues || keepSetBlockedByDeferral) {
               hasTerminalBlock = true;
               break;
             }
@@ -1429,7 +1505,7 @@ function* paginateBodyPassSteps(
           const keepSetAdmissionPt = keepSetExtentPt + keepSetReservePt;
           if (
             hasTerminalBlock
-            && keepSetAdmissionPt > location.availableBounds.heightPt
+            && (keepSetAdmissionPt > location.availableBounds.heightPt || keepSetBlockedByDeferral)
             && keepSetAdmissionPt <= freshPageExtent(state)
           ) {
             commitTransition(
@@ -1535,6 +1611,8 @@ function* paginateBodyPassSteps(
             markBelowBaselinePt: acquired.markBelowBaselinePt ?? 0,
             markOnLineGrid: acquired.markOnLineGrid === true,
           });
+        // A proven anchor-line deferral ends this page just above that line.
+        const anchorLineBreak = deferredAnchorLineIndex(acquired.layout);
         const selected = selectParagraphFragment(
           acquired.layout,
           cursor,
@@ -1547,6 +1625,7 @@ function* paginateBodyPassSteps(
             widowControl: block.widowControl,
             authoredSpaceAfterPt: block.spaceAfterPt,
             writingMode: activeRegion(state).writingMode,
+            ...(anchorLineBreak === undefined ? {} : { lineEndLimit: anchorLineBreak }),
           },
           (fragment) => footnoteAdmission(
             fragment,
@@ -1607,9 +1686,8 @@ function* paginateBodyPassSteps(
       if (block.kind === 'table') {
         const tableKey = `table:${sourceKey(block.source)}`;
         const minimumPage = minimumTablePageBySource?.get(tableKey);
-        if ((block.pageOwnedFloatingTable === true || minimumPage !== undefined)
-          && observer?.onPageAnchorInput) {
-          observer.onPageAnchorInput(Object.freeze({
+        if (block.pageOwnedFloatingTable === true || minimumPage !== undefined) {
+          recordAnchorInput(Object.freeze({
             kind: 'page-owned-table',
             pageIndex: state.flow.pageIndex,
             key: tableKey,
@@ -1861,6 +1939,8 @@ function* paginateBodyPassSteps(
     footnoteReserveByPage,
     footnoteLayoutsByPage,
     terminalDiagnostic,
+    anchorInputs,
+    serializedAnchorInputs,
   );
 }
 
@@ -2303,6 +2383,31 @@ function appendUnsupportedNotePositionDiagnostic(
   });
 }
 
+/** The flow domain in which the section region holding `flowDomainId` opens
+ * on `page`; its page-start prescan is where page-owned anchors register. */
+function regionFlowDomainOpening(page: LayoutPage, flowDomainId: string): string {
+  return page.sectionRegions.find((region) => region.flowDomainIds.includes(flowDomainId))
+    ?.flowDomainIds[0] ?? flowDomainId;
+}
+
+/** Flow order and anchor line of each page-owned drawing in a pass. */
+function pageOwnedDrawingFlowPositions(layout: DocumentLayout) {
+  const positions = new Map<string, Readonly<{ order: number; lineKey: string }>>();
+  let order = 0;
+  for (const page of layout.pages) {
+    for (const node of page.layers.body) {
+      if (node.kind !== 'paragraph' || node.drawings.length === 0) continue;
+      pageOwnedAnchorKeysByLine(node).forEach((keys, lineIndex) => {
+        for (const key of keys) {
+          positions.set(key, Object.freeze({ order, lineKey: `${node.id}#${lineIndex}` }));
+          order += 1;
+        }
+      });
+    }
+  }
+  return positions;
+}
+
 function pageAnchorDestinationPlan(layout: DocumentLayout) {
   const destinations = new Map<string, PageWrapDestination>();
   for (const page of layout.pages) {
@@ -2342,7 +2447,10 @@ function pageAnchorDestinationPlan(layout: DocumentLayout) {
           occurrenceId,
           paragraphSource: node.source,
           pageIndex: page.pageIndex,
-          flowDomainId: node.flowDomainId,
+          // word-page-anchor-region-registration: register the drawing where
+          // its section region opens on the page, so earlier columns of the
+          // region wrap around it too.
+          flowDomainId: regionFlowDomainOpening(page, node.flowDomainId),
         }));
       }
     }
@@ -2386,14 +2494,21 @@ function pageStartAnchorsIdentity(anchors: PageStartAnchors): string {
  * pass is final: no later pass of this convergence run can change those pages.
  *
  * A pass is a deterministic function of the body input, the reserves and the
- * balance plan — fixed for the whole run — and of the two values carried
- * between passes: the anchor plan and the proven minimum table pages. The pass
- * reads the carry only at the events it reports through `onPageAnchorInput`.
- * Two passes whose event reads agree up to some moment are therefore in the
- * same state at that moment, including every page closed by then.
+ * balance plan — fixed for the whole run — and of the values carried between
+ * passes: the anchor plan, the proven minimum table pages and the proven
+ * anchor-line deferrals. The pass reads the carry only at the events it
+ * reports through `onPageAnchorInput`; a deferral check that does not apply
+ * changes nothing and is not a read. Two passes whose event reads agree up to
+ * some moment are therefore in the same state at that moment, including every
+ * page closed by then.
  *
- * Pass k+1 applies the plan pass k observed (`pageAnchorDestinationPlan`), so
- * each read can be predicted from closed pages of pass k:
+ * Pass k+1 applies the plan pass k observed (`pageAnchorDestinationPlan`),
+ * except that `resolveAnchorLineTests` may retest drawings on a page N, and
+ * may prove new deferrals for page N, only where a drawing registered on N
+ * did not land on N. Pass k's prescan of N then already disagrees with the
+ * observed plan (the drawing is observed later, or not yet placed), so both
+ * only affect pages at or after a disagreement. Each read can be predicted
+ * from closed pages of pass k:
  *
  * - A prescan of page p reads the plan's destinations on (p, flow domain). Once
  *   p is closed, pass k's observed destinations there are final, and the read
@@ -2405,6 +2520,11 @@ function pageStartAnchorsIdentity(anchors: PageStartAnchors): string {
  *   and that destination lies on a page that itself stays final. A table
  *   reached before the bound but placed at or after it could still move, and
  *   its next floor could then act at r, so it lowers the bound to r.
+ * - An applied anchor-line deferral at page r ends r above the anchor line;
+ *   the bound stops at r. A carried proof for page p is verified only against
+ *   this pass's own reads up to its anchor line on p, which agree in the next
+ *   pass by induction; a new proof for the same anchor and page needs a
+ *   disagreeing prescan of p.
  *
  * By induction every later pass, including the converged one, reproduces
  * pages below the returned bound exactly. The bound never exceeds the live
@@ -2438,6 +2558,12 @@ function anchorStablePageLimit(
       }
       continue;
     }
+    if (event.kind === 'anchor-line-deferral') {
+      // A deferral ends its page above the anchor line. The pages before it
+      // are covered by the reads above; this page and later ones are not.
+      limit = event.pageIndex;
+      break;
+    }
     const placed = observed.get(event.key);
     const prior = appliedPlan?.get(event.key);
     if ((event.floor !== undefined && event.floor > event.pageIndex)
@@ -2461,6 +2587,102 @@ function anchorStablePageLimit(
     }
   }
   return Object.freeze({ limit, prescanDisagreementPage });
+}
+
+function anchorCarryIdentity(
+  plan: ReadonlyMap<string, unknown>,
+  deferrals: AnchorLineDeferrals,
+): string {
+  return `${anchorPlanIdentity(plan)}\u0004${anchorLineDeferralsIdentity(deferrals)}`;
+}
+
+/**
+ * The next pass's drawing plan and anchor-line deferrals after a planned pass
+ * (see anchor-line-deferral.ts for the Word rule).
+ *
+ * On each page N, the first anchor line in flow order whose page-owned
+ * anchors were registered on N but landed after N is Word's next test on N.
+ * When N registered exactly those anchors plus the anchors confirmed on N, the
+ * pass is Word's counterfactual and proves the deferral. Otherwise the next
+ * pass retests them on N with exactly that registration. A line reached later
+ * on N than a failed test is never tested on N, because the failed test ends
+ * the page above it.
+ */
+function resolveAnchorLineTests(
+  pass: BodyPaginationPassResult,
+  observed: Map<string, PageWrapDestination>,
+  previous: AnchorLineDeferrals,
+): Readonly<{ plan: ReadonlyMap<string, PageWrapDestination>; deferrals: AnchorLineDeferrals }> {
+  const events = pass.anchorInputs;
+  const prescansByPage = new Map<number, number[]>();
+  events.forEach((event, index) => {
+    if (event.kind !== 'prescan') return;
+    const indexes = prescansByPage.get(event.pageIndex);
+    if (indexes) indexes.push(index);
+    else prescansByPage.set(event.pageIndex, [index]);
+  });
+  let positions: ReturnType<typeof pageOwnedDrawingFlowPositions> | null = null;
+  let plan: Map<string, PageWrapDestination> | null = null;
+  let deferrals: Map<string, AnchorLineDeferralProof> | null = null;
+  for (const [pageIndex, indexes] of prescansByPage) {
+    const registeredAt = new Map<string, number>();
+    for (const index of indexes) {
+      const event = events[index] as Extract<PageAnchorInputEvent, { kind: 'prescan' }>;
+      for (const anchor of event.anchors) {
+        if (anchor.kind === 'drawing' && !registeredAt.has(anchor.occurrenceId)) {
+          registeredAt.set(anchor.occurrenceId, index);
+        }
+      }
+    }
+    const pushed = [...registeredAt.keys()].filter((key) => (
+      (observed.get(key)?.pageIndex ?? -1) > pageIndex
+    ));
+    if (pushed.length === 0) continue;
+    positions ??= pageOwnedDrawingFlowPositions(pass.layout);
+    let first: string | null = null;
+    for (const key of pushed) {
+      const order = positions.get(key)?.order;
+      if (order === undefined) continue;
+      if (first === null || order < positions.get(first)!.order) first = key;
+    }
+    if (first === null) continue;
+    const lineKey = positions.get(first)!.lineKey;
+    const line = [...positions].filter(([, position]) => position.lineKey === lineKey)
+      .map(([key]) => key);
+    const registrationIndex = registeredAt.get(first)!;
+    // Anchors on one line are tested together, in one registration.
+    if (line.some((key) => registeredAt.get(key) !== registrationIndex)) continue;
+    const tested = new Set(line);
+    const exact = indexes.every((index) => {
+      const event = events[index] as Extract<PageAnchorInputEvent, { kind: 'prescan' }>;
+      return pageStartAnchorsIdentity(event.anchors.filter((anchor) => !tested.has(anchor.occurrenceId)))
+        === pageStartAnchorsIdentity(plannedPageStartAnchors(observed, pageIndex, event.flowDomainId));
+    });
+    if (exact) {
+      const proof = createAnchorLineDeferralProof(
+        line,
+        pageIndex,
+        events,
+        pass.serializedAnchorInputs,
+        registrationIndex,
+        pageStartAnchorsIdentity,
+      );
+      deferrals ??= new Map(previous);
+      line.forEach((key) => deferrals!.set(anchorLineDeferralKey(key, pageIndex), proof));
+      continue;
+    }
+    plan ??= new Map(observed);
+    const registration = events[registrationIndex] as Extract<PageAnchorInputEvent, { kind: 'prescan' }>;
+    for (const key of line) {
+      const destination = observed.get(key)!;
+      plan.set(key, Object.freeze({
+        ...destination,
+        pageIndex,
+        flowDomainId: registration.flowDomainId,
+      }));
+    }
+  }
+  return Object.freeze({ plan: plan ?? observed, deferrals: deferrals ?? previous });
 }
 
 function anchorPlanIdentity(plan: ReadonlyMap<string, unknown>): string {
@@ -2487,6 +2709,8 @@ type ReserveRepaginationCarry = Readonly<{
   anchorPlan: ReturnType<typeof pageAnchorDestinationPlan>;
 }>;
 
+const ANCHOR_PASS_BASE_LIMIT = 16;
+
 function* paginateBodyWithAnchorConvergenceSteps(
   input: BodyLayoutInput,
   services: LayoutServices,
@@ -2496,13 +2720,21 @@ function* paginateBodyWithAnchorConvergenceSteps(
   publisher?: BodyPagePublisher,
   seedPlan?: ReturnType<typeof pageAnchorDestinationPlan>,
 ): PaginationSteps<BodyPaginationPassResult> {
-  const hasPageOwnedAnchors = input.sequence.some((entry) => (
-    entry.kind === 'body-block'
-    && (entry.block.kind === 'paragraph'
-      ? (entry.block.pageOwnedAnchorOccurrenceIds?.length ?? 0) > 0
-      : entry.block.pageOwnedFloatingTable === true)
-  ));
-  if (!hasPageOwnedAnchors) {
+  let pageOwnedAnchorCount = 0;
+  for (const entry of input.sequence) {
+    if (entry.kind !== 'body-block') continue;
+    pageOwnedAnchorCount += entry.block.kind === 'paragraph'
+      ? entry.block.pageOwnedAnchorOccurrenceIds?.length ?? 0
+      : entry.block.pageOwnedFloatingTable === true ? 1 : 0;
+  }
+  // Operational resource guard, not a claim about the state space. Pages
+  // before the first disagreeing read are final (`anchorStablePageLimit`), and
+  // once they are, one anchor line's Word test needs at most four passes:
+  // observe the line, retest it with exactly the anchors confirmed before it,
+  // prove the deferral, apply it. Anchor tests on later pages wait for the
+  // pages before them, so the budget grows with the anchors, not a constant.
+  const anchorPassLimit = ANCHOR_PASS_BASE_LIMIT + 4 * pageOwnedAnchorCount;
+  if (pageOwnedAnchorCount === 0) {
     return yield* paginateBodyPassSteps(
       input, services, options, reserves, null, null, balancePlan,
       publisher ? passPublicationObserver(publisher, livePageIndex) : undefined,
@@ -2513,7 +2745,7 @@ function* paginateBodyWithAnchorConvergenceSteps(
   // seeded run never publishes: it can be abandoned for an unseeded retry,
   // whose passes form a different chain.
   const anchorPassObserver = (
-    appliedPlan: ReturnType<typeof pageAnchorDestinationPlan> | null,
+    appliedPlan: ReadonlyMap<string, PageWrapDestination> | null,
   ): BodyPaginationPassObserver | undefined => {
     if (!publisher || seedPlan) return undefined;
     const events: PageAnchorInputEvent[] = [];
@@ -2530,15 +2762,18 @@ function* paginateBodyWithAnchorConvergenceSteps(
   };
   const converge = function* (initialPlan?: ReturnType<typeof pageAnchorDestinationPlan>) {
     type AnchorPassCarry = Readonly<{
-      plan: ReturnType<typeof pageAnchorDestinationPlan>;
+      plan: ReadonlyMap<string, PageWrapDestination>;
       minimumTablePageBySource: ReadonlyMap<string, number>;
+      deferrals: AnchorLineDeferrals;
     }>;
+    const noDeferrals: AnchorLineDeferrals = new Map();
     return (yield* convergeExactStateSteps<AnchorPassCarry & Readonly<{
       pass: BodyPaginationPassResult;
     }>, number, AnchorPassCarry>({
-      ...(initialPlan ? { seedState: anchorPlanIdentity(initialPlan) } : {}),
+      ...(initialPlan ? { seedState: anchorCarryIdentity(initialPlan, noDeferrals) } : {}),
       step: function* anchorPass(previous) {
         const appliedPlan = previous?.plan ?? initialPlan ?? null;
+        const appliedDeferrals = previous?.deferrals ?? noDeferrals;
         const pass = yield* paginateBodyPassSteps(
           input,
           services,
@@ -2548,15 +2783,24 @@ function* paginateBodyWithAnchorConvergenceSteps(
           previous?.minimumTablePageBySource ?? null,
           balancePlan,
           anchorPassObserver(appliedPlan),
+          appliedDeferrals.size > 0 ? appliedDeferrals : null,
         );
-        const plan = pageAnchorDestinationPlan(pass.layout);
+        const observed = pageAnchorDestinationPlan(pass.layout);
+        // The unseeded pass registers source-order estimates, not anchor
+        // lines that reached their page, so it proves nothing about them.
+        const lineTests = appliedPlan === null
+          ? Object.freeze({ plan: observed, deferrals: appliedDeferrals })
+          : resolveAnchorLineTests(pass, observed, appliedDeferrals);
         const minimumTablePageBySource = new Map<string, number>();
         // Compare all destinations once. Testing every table against a fresh
         // copy of the full plan would make table-heavy documents quadratic.
+        // A table floor needs the next pass to differ from this one only in
+        // that table's registration, so no drawing retest or new deferral.
         const changedKeys = previous && appliedPlan
-          ? changedAnchorKeys(appliedPlan, plan)
+          && lineTests.plan === observed && lineTests.deferrals === appliedDeferrals
+          ? changedAnchorKeys(appliedPlan, observed)
           : null;
-        for (const [key, destination] of plan) {
+        for (const [key, destination] of observed) {
           if (destination.kind !== 'floating-table') continue;
           const prior = appliedPlan?.get(key);
           if (prior?.kind !== 'floating-table' || !changedKeys
@@ -2573,18 +2817,21 @@ function* paginateBodyWithAnchorConvergenceSteps(
         }
         return Object.freeze({
           pass,
-          plan,
+          plan: lineTests.plan,
           minimumTablePageBySource,
+          deferrals: lineTests.deferrals,
         });
       },
-      stateOf: (value) => anchorPlanIdentity(value.plan),
-      // The next anchor pass reads only the plan and the proven table pages;
-      // the superseded pass (its whole layout) is not carried into it.
+      stateOf: (value) => anchorCarryIdentity(value.plan, value.deferrals),
+      // The next anchor pass reads only the plan, the proven table pages and
+      // the proven anchor-line deferrals; the superseded pass (its whole
+      // layout) is not carried into it.
       carry: (value) => Object.freeze({
         plan: value.plan,
         minimumTablePageBySource: value.minimumTablePageBySource,
+        deferrals: value.deferrals,
       }),
-      limit: 16,
+      limit: anchorPassLimit,
     })).value.pass;
   };
   try {
@@ -2603,7 +2850,7 @@ function* paginateBodyWithAnchorConvergenceSteps(
         'NON_CONVERGENCE',
         error.reason === 'cycle'
           ? 'Page-anchor destination acquisition repeated an exact-state cycle'
-          : 'Page-anchor destination acquisition reached the operational pass limit 16',
+          : `Page-anchor destination acquisition reached the operational pass limit ${anchorPassLimit}`,
       );
     }
     throw error;

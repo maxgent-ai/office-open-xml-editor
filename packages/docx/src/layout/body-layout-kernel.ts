@@ -149,6 +149,9 @@ export interface FollowingBodyBlockMeasurement {
   readonly fullFootnoteReferenceIds?: readonly string[];
   /** References painted by the first indivisible content admitted with keepNext. */
   readonly leadFootnoteReferenceIds?: readonly string[];
+  /** Paragraph only: page-owned drawing occurrence keys anchored on each
+   * measured line, so keepNext can honour an anchor-line deferral. */
+  readonly pageOwnedAnchorKeysByLine?: readonly (readonly string[])[];
 }
 
 export interface PageAnchorPrescanInput {

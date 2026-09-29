@@ -1,3 +1,4 @@
+import { pageOwnedAnchorKeysByLine } from './anchor-line-deferral.js';
 import type { CjkLang } from '@silurus/ooxml-core';
 import type {
   BodyElement,
@@ -1291,6 +1292,7 @@ function measureFollowingBodyBlock(
         : layout.advancePt,
       fullFootnoteReferenceIds: footnoteIdsInRetainedSlice(layout),
       leadFootnoteReferenceIds: firstLine ? footnoteIdsInRetainedLines([firstLine]) : [],
+      pageOwnedAnchorKeysByLine: pageOwnedAnchorKeysByLine(layout),
     });
   }
   if (element.type !== 'table') throw new Error('Following table source kind mismatch');

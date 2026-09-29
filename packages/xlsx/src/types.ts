@@ -642,6 +642,12 @@ export interface ShapeParagraph {
   /** `<a:pPr>/<a:lnSpc>` line spacing (ECMA-376 §21.1.2.2.5). Direct-only;
    *  omitted when unset. */
   spaceLine?: SpaceLine | null;
+  /** `<a:pPr>/<a:spcBef>` space before the paragraph (ECMA-376 §21.1.2.2.10).
+   *  Direct-only; omitted when unset. */
+  spaceBefore?: SpaceLine | null;
+  /** `<a:pPr>/<a:spcAft>` space after the paragraph (ECMA-376 §21.1.2.2.9).
+   *  Direct-only; omitted when unset. */
+  spaceAfter?: SpaceLine | null;
   runs: ShapeTextRun[];
 }
 

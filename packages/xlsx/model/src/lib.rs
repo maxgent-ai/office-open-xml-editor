@@ -1041,6 +1041,15 @@ pub struct ShapeParagraph {
     /// byte-identical (additive).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub space_line: Option<SpaceLine>,
+    /// `<a:pPr>/<a:spcBef>` space before the paragraph (ECMA-376 §21.1.2.2.10,
+    /// the same `CT_TextSpacing` grammar as `lnSpc`). Direct-only; `None` =
+    /// unset and omitted from JSON.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub space_before: Option<SpaceLine>,
+    /// `<a:pPr>/<a:spcAft>` space after the paragraph (ECMA-376 §21.1.2.2.9).
+    /// Direct-only; `None` = unset and omitted from JSON.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub space_after: Option<SpaceLine>,
     pub runs: Vec<ShapeTextRun>,
 }
 

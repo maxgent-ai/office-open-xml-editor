@@ -59,6 +59,10 @@ export function resolveSlidePartTarget(
   partIndex: Map<string, number>,
 ): number | undefined {
   if (target === '') return undefined;
+  // Master/layout-inherited hyperlink relationships are resolved relative to
+  // their owning OPC part by the parser. Their canonical part name is already
+  // rooted at ppt/, whereas a slide-local target is still relative to slides.
+  if (target.startsWith('ppt/')) return partIndex.get(target);
   // Slide-rel targets are authored relative to the slide part's directory.
   const partName = resolveOpcPartName('ppt/slides', target);
   return partIndex.get(partName);

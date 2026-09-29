@@ -1,6 +1,14 @@
 // Classic chart chartex style helpers.
 import type { ChartModel, ChartRect, ChartSeries, ChartStyleRole } from '../../types/chart';
-import { chartStyleColor, chartStyleDirectFillDecision, chartStyleDirectLineDecision, chartStyleDirectNoFillDecision, chartStyleDirectNoLineDecision, chartStyleFillDecision, chartStyleLineDecision } from '../style-paint.js';
+import {
+  chartExPointAuthorsLine,
+  chartExPointFillDecision,
+  chartStyleColor,
+  chartStyleDirectFillDecision,
+  chartStyleFillDecision,
+  chartStyleLineDecision,
+  type ChartExPointCarrier,
+} from '../style-paint.js';
 import type { Fill } from '../../types/common';
 import { rawLinkedChartStyleRole } from '../effective-style.js';
 import { resolveFill } from '../../shape/paint.js';
@@ -142,18 +150,12 @@ export function chartExDataPointPaint(
   legacyColor?: string | null,
   linkedStyle: ChartExStyle | null | undefined = chart.chartexDataPointStyle,
 ): Fill | null {
-  // CT_Series.spPr formats the series shape; ChartEx semantic data points
-  // (waterfall roles, box bodies, hierarchy nodes) still obtain their own
-  // paint from the dataPoint Chart Style. A conventional series-level
-  // `<a:noFill>` therefore does not erase every point. Positive local series
-  // fills remain direct formatting and do override the linked recipe.
-  const rawLinkedStyle = linkedStyle === chart.chartexDataPointStyle
-    ? rawLinkedChartStyleRole(chart, 'dataPoint')
-      ?? (chart.classicChartStyleRoles == null ? linkedStyle : undefined)
-    : linkedStyle;
-  const local = localStyle?.fillHidden
-    ? chartStyleDirectNoFillDecision(rawLinkedStyle)
-    : chartStyleDirectFillDecision(localStyle, rawLinkedStyle, index);
+  // ChartEx direct CT_Series / CT_DataPoint `spPr` owns each fill atom: a
+  // positive paint and an explicit `a:noFill` both replace the linked
+  // dataPoint Chart Style fill, which supplies only an omitted fill. Unlike
+  // the classic cascade, `allowNoFillOverride` does not gate this (see
+  // resolveChartExPointFill for the PowerPoint evidence).
+  const local = chartStyleFillDecision(localStyle, index);
   if (local !== undefined) return local;
   if (localStyle && legacyColor) return { fillType: 'solid', color: legacyColor };
   if (legacyColor) return { fillType: 'solid', color: legacyColor };
@@ -252,6 +254,9 @@ export interface ResolvedChartExLineStyle {
   customDash: ChartModel['plotAreaLineCustomDash'];
   cap: string | null;
   join: string | null;
+  /** True when no direct or linked layer supplied the paint and the family's
+   * semantic fallback outline is used. */
+  semanticFallback?: boolean;
 }
 
 
@@ -274,21 +279,14 @@ export function resolveChartExSeriesLineStyle(
   fallbackColor: string,
   options: { linkedNoStyleFallback?: boolean } = {},
 ): ResolvedChartExLineStyle {
+  void chart;
   void count;
   const local = series?.chartexStyle;
-  const role = linkedStyle === chart.chartexSeriesLineStyle
-    ? 'seriesLine'
-    : linkedStyle === chart.chartexDataPointLineStyle
-      ? 'dataPointLine'
-      : linkedStyle === chart.chartexDataPointMarkerStyle
-        ? 'dataPointMarker'
-        : (Object.entries(chart.chartStyleRoles ?? {}).find(
-            ([, style]) => style === linkedStyle,
-          )?.[0] as ChartStyleRole | undefined);
-  const rawLinkedStyle = role ? rawLinkedChartStyleRole(chart, role) : linkedStyle;
-  const localPaint = chartStyleDirectLineDecision(local, rawLinkedStyle, index);
-  const legacyNoLine = series?.lineHidden === true
-    ? chartStyleDirectNoLineDecision(rawLinkedStyle) : undefined;
+  // Direct ChartEx `spPr/a:ln` owns the outline paint, including an explicit
+  // no-line, without the linked entry's `allowNoLineOverride` (see
+  // resolveChartExPointFill for the PowerPoint evidence).
+  const localPaint = chartStyleLineDecision(local, index);
+  const legacyNoLine = series?.lineHidden === true ? null : undefined;
   const legacyPaintAuthored = series?.lineColor != null
     || legacyNoLine !== undefined;
   const linkedPaint = chartStyleLineDecision(linkedStyle, index);
@@ -308,6 +306,7 @@ export function resolveChartExSeriesLineStyle(
     && linkedStyle?.lineNoStyle === true
     && options.linkedNoStyleFallback !== true;
   return {
+    semanticFallback: selectedPaint === undefined,
     visible: selectedPaint !== null && !linkedNoStyleSuppressesSemanticPaint,
     color: selectedPaint?.fillType === 'solid'
       ? selectedPaint.color
@@ -324,16 +323,203 @@ export function resolveChartExSeriesLineStyle(
 }
 
 
+/** Width PowerPoint uses for a ChartEx outline when neither the direct
+ * `a:ln` nor the linked style entry supplies `w`: 0.75 pt in every measured
+ * family (see resolveChartExPointFill). */
+export const CHARTEX_DEFAULT_LINE_WIDTH_EMU = 9525;
+
+
+/** Resolve one ChartEx data point's body fill.
+ *
+ * Precedence is per fill atom: the CT_DataPoint `spPr` fill, else the
+ * CT_Series `spPr` fill, else the linked dataPoint Chart Style role, else the
+ * family's semantic palette. An explicit direct `a:noFill` at either level
+ * removes the fill.
+ *
+ * PowerPoint-observed (PowerPoint for Mac 16.113; waterfall, funnel,
+ * histogram, pareto, box-and-whisker, treemap and sunburst; linked entries
+ * `fillRef idx=1` with `lnRef` idx 0, 1 and 2, each with and without
+ * `mods="allowNoFillOverride allowNoLineOverride"`):
+ * - series or point `a:noFill` removes the fill, and series or point
+ *   `a:ln/a:noFill` removes the outline, whether or not the modifiers are
+ *   present;
+ * - a point's positive fill or outline wins over the series, and an omitted
+ *   fill or outline atom at either level inherits the next layer;
+ * - an outline whose direct and linked `a:ln` both omit `w` is 0.75 pt.
+ *   An `lnRef idx` >= 1 supplies the theme line's width and cap when `w` is
+ *   omitted.
+ * Box-and-whisker `dataPt` formatting had no visible effect on the box body,
+ * so that family does not route bodies through point overrides. */
+export function resolveChartExPointFill(
+  chart: ChartModel,
+  series: Pick<ChartSeries, 'chartexStyle' | 'color'> | null | undefined,
+  point: ChartExPointCarrier | null | undefined,
+  index: number,
+  count: number,
+  linkedStyle: ChartExStyle | null | undefined = chart.chartexDataPointStyle,
+): Fill | null {
+  const decision = chartExPointFillDecision(chart, series, point, index, linkedStyle);
+  if (decision !== undefined) return decision;
+  return { fillType: 'solid', color: chartExSemanticFill(chart, index, count) };
+}
+
+
+/** Resolve a ChartEx outline through ordered Chart Style role chains.
+ * `paintRoles` are tried in order after the direct carrier until one supplies
+ * line paint; `geometryRoles` supply `w`, dash, cap and join atoms the direct
+ * `a:ln` omits (see the geometry-role selection below). A semantic-fallback
+ * result takes role geometry only from its paint roles. */
+export function resolveChartExLineChain(
+  chart: ChartModel,
+  carrier: Partial<ChartExSeriesStyleCarrier> | null | undefined,
+  paintRoles: ReadonlyArray<ChartExStyle | null | undefined>,
+  geometryRoles: ReadonlyArray<ChartExStyle | null | undefined>,
+  index: number,
+  count: number,
+  fallbackColor: string,
+  options: { linkedNoStyleFallback?: boolean } = {},
+): ResolvedChartExLineStyle {
+  let line = resolveChartExSeriesLineStyle(
+    chart, paintRoles[0], carrier, index, count, fallbackColor, options,
+  );
+  for (const role of paintRoles.slice(1)) {
+    if (!line.semanticFallback) break;
+    const next = resolveChartExSeriesLineStyle(
+      chart, role, null, index, count, fallbackColor, options,
+    );
+    if (!next.semanticFallback) line = next;
+  }
+  const direct = carrier?.chartexStyle;
+  const directDash = direct?.lineDash != null || direct?.lineCustomDash != null;
+  // The first role that carries a line supplies every omitted geometry atom
+  // as a unit; atoms are not merged across roles. Excel output shows a
+  // dataPoint `a:ln w` without `cap` keeping a flat cap even when the
+  // dataPointLine role authors `cap="rnd"`. NoStyle (`lnRef idx=0`) affects
+  // paint only, so geometry authored beside it still counts. A semantic
+  // fallback outline takes geometry only from its paint roles: PowerPoint
+  // draws no data-point outline from dataPointLine alone (round 2 R02).
+  const geometryCandidates = line.semanticFallback ? paintRoles : geometryRoles;
+  const geometryRole = geometryCandidates.find(role => role != null && (
+    role.lineWidthEmu != null || role.lineCap != null || role.lineJoin != null
+    || role.lineDash != null || role.lineCustomDash != null
+    || (role.linePaintAuthored === true && role.lineNoStyle !== true)));
+  const fromRoles = <T>(pick: (role: ChartExStyle) => T | null | undefined): T | null =>
+    geometryRole ? pick(geometryRole) ?? null : null;
+  const roleDash = geometryRole;
+  return {
+    ...line,
+    widthEmu: direct?.lineWidthEmu ?? carrier?.lineWidthEmu
+      ?? fromRoles(role => role.lineWidthEmu),
+    dash: directDash
+      ? direct?.lineCustomDash != null ? null : direct?.lineDash ?? null
+      : roleDash?.lineCustomDash != null ? null : roleDash?.lineDash ?? null,
+    customDash: directDash
+      ? direct?.lineCustomDash ?? null
+      : roleDash?.lineCustomDash ?? null,
+    cap: direct?.lineCap ?? fromRoles(role => role.lineCap),
+    join: direct?.lineJoin ?? fromRoles(role => role.lineJoin),
+  };
+}
+
+
+/** Resolve one ChartEx data point's outline with the same point → series →
+ * linked role precedence as resolveChartExPointFill. Paint belongs to the
+ * layer that authors `a:ln`, else the linked dataPoint role. Geometry atoms a
+ * point's `a:ln` omits fall back to the series outline, then the dataPoint
+ * role (its `spPr` line or `lnRef` theme line), then the dataPointLine role's
+ * geometry. PowerPoint-observed in every ChartEx family: dataPointLine never
+ * paints a data-point outline, but supplies `w`/cap to a direct one whose
+ * dataPoint role has no line (for example 2.25 pt round from the waterfall
+ * default style); a dataPoint `lnRef idx` >= 1 or `spPr` line wins over it. */
+export function resolveChartExPointLine(
+  chart: ChartModel,
+  series: Partial<ChartExSeriesStyleCarrier> | null | undefined,
+  point: ChartExPointCarrier | null | undefined,
+  index: number,
+  count: number,
+  fallbackColor: string,
+  linkedStyle: ChartExStyle | null | undefined = chart.chartexDataPointStyle,
+  options: { linkedNoStyleFallback?: boolean } = {},
+): ResolvedChartExLineStyle {
+  const geometryRoles = linkedStyle === chart.chartexDataPointStyle
+    ? [linkedStyle, chart.chartexDataPointLineStyle]
+    : [linkedStyle];
+  if (!chartExPointAuthorsLine(point)) {
+    return resolveChartExLineChain(
+      chart, series, [linkedStyle], geometryRoles, index, count, fallbackColor, options,
+    );
+  }
+  const pointStyle = point?.chartexStyle;
+  const seriesStyle = series?.chartexStyle;
+  const pointDashAuthored = pointStyle?.lineDash != null || pointStyle?.lineCustomDash != null;
+  // Paint and geometry are separate atoms: a point `a:ln` that authors only
+  // geometry keeps the series outline paint (the same per-atom inheritance the
+  // controls show for fill versus line).
+  // The parser records `lineHidden: false` for any authored `a:ln`, so only an
+  // explicit no-line or actual paint atoms mean the point authors paint.
+  const pointPaintAuthored = point?.lineColor != null || point?.lineHidden === true
+    || pointStyle?.linePaintAuthored === true || pointStyle?.lineHidden === true
+    || pointStyle?.linePaints?.some(paint => paint != null) === true
+    || pointStyle?.lineColors?.some(color => color != null) === true;
+  const paintSource = pointPaintAuthored
+    ? { lineColor: point?.lineColor, lineHidden: point?.lineHidden, style: pointStyle }
+    : { lineColor: series?.lineColor, lineHidden: series?.lineHidden, style: seriesStyle };
+  const carrier: Partial<ChartExSeriesStyleCarrier> = {
+    lineColor: paintSource.lineColor,
+    lineHidden: paintSource.lineHidden,
+    lineWidthEmu: point?.lineWidthEmu ?? series?.lineWidthEmu,
+    chartexStyle: {
+      ...pointStyle,
+      linePaints: paintSource.style?.linePaints,
+      lineColors: paintSource.style?.lineColors,
+      lineColorIndex: paintSource.style?.lineColorIndex,
+      linePaintAuthored: paintSource.style?.linePaintAuthored,
+      lineHidden: paintSource.style?.lineHidden,
+      lineNoStyle: paintSource.style?.lineNoStyle,
+      lineWidthEmu: pointStyle?.lineWidthEmu ?? point?.lineWidthEmu
+        ?? seriesStyle?.lineWidthEmu ?? series?.lineWidthEmu,
+      lineDash: pointDashAuthored ? pointStyle?.lineDash : seriesStyle?.lineDash,
+      lineCustomDash: pointDashAuthored
+        ? pointStyle?.lineCustomDash : seriesStyle?.lineCustomDash,
+      lineCap: pointStyle?.lineCap ?? seriesStyle?.lineCap,
+      lineJoin: pointStyle?.lineJoin ?? seriesStyle?.lineJoin,
+    },
+  };
+  return resolveChartExLineChain(
+    chart, carrier, [linkedStyle], geometryRoles, index, count, fallbackColor, options,
+  );
+}
+
+
 export function applyResolvedChartExLineStyle(
   ctx: CanvasRenderingContext2D,
   line: ResolvedChartExLineStyle,
   ptToPx: number,
+  bounds?: ChartRect,
+  shapeRotationDeg = 0,
 ): boolean {
   if (!line.visible) return false;
-  ctx.strokeStyle = line.color.startsWith('#') ? line.color : `#${line.color}`;
+  // Structured (gradient/pattern) outline paint resolves against the stroked
+  // shape's bounds; a paint Canvas cannot express leaves the outline unpainted
+  // rather than reviving the solid fallback. Callers without bounds keep the
+  // resolved solid colour.
+  if (line.paint && line.paint.fillType !== 'solid' && bounds) {
+    const stroke = resolveFill(
+      line.paint, ctx, bounds.x, bounds.y, bounds.w, bounds.h, shapeRotationDeg,
+    );
+    if (!stroke) return false;
+    ctx.strokeStyle = stroke;
+  } else {
+    ctx.strokeStyle = line.color.startsWith('#') ? line.color : `#${line.color}`;
+  }
+  // An authored outline without `w` is 0.75 pt. A family's semantic fallback
+  // outline (e.g. the treemap tile separator standing in for Office's tile
+  // gap) keeps its one-device-pixel rule.
   ctx.lineWidth = line.widthEmu != null
     ? axisLineWidthPx(line.widthEmu, ptToPx)
-    : 1;
+    : line.semanticFallback
+      ? 1
+      : axisLineWidthPx(CHARTEX_DEFAULT_LINE_WIDTH_EMU, ptToPx);
   ctx.setLineDash(dashPatternForLine(line.customDash, line.dash, ctx.lineWidth));
   ctx.lineCap = line.cap === 'rnd' ? 'round' : line.cap === 'sq' ? 'square' : 'butt';
   ctx.lineJoin = line.join === 'round' || line.join === 'bevel' ? line.join : 'miter';
@@ -380,10 +566,15 @@ export function chartExLegendSeries(
   semanticNoStyleFallback = false,
   inheritPlotOutline = true,
 ): ChartSeries {
-  const line = resolveChartExSeriesLineStyle(
+  // Legend keys follow the same role chain as the plotted body so their
+  // outline geometry (e.g. a dataPointLine 2.25 pt round rule) matches.
+  const line = resolveChartExLineChain(
     chart,
-    linkedStyle,
     series,
+    [linkedStyle],
+    linkedStyle === chart.chartexDataPointStyle
+      ? [linkedStyle, chart.chartexDataPointLineStyle]
+      : [linkedStyle],
     index,
     count,
     fillColor,
@@ -395,7 +586,12 @@ export function chartExLegendSeries(
     color: fillColor.replace(/^#/, ''),
     lineHidden: !inheritPlotOutline || !line.visible,
     lineColor: inheritPlotOutline && line.visible ? line.color.replace(/^#/, '') : null,
-    lineWidthEmu: inheritPlotOutline ? line.widthEmu : null,
+    // A visible authored outline without `w` is 0.75 pt on the body; give
+    // the legend key the same default rather than the legend's 1 px rule.
+    lineWidthEmu: inheritPlotOutline
+      ? line.widthEmu ?? (line.visible && !line.semanticFallback
+        ? CHARTEX_DEFAULT_LINE_WIDTH_EMU : null)
+      : null,
     chartexStyle: {
       linePaints: inheritPlotOutline && line.paint !== undefined ? [line.paint] : null,
       linePaintAuthored: inheritPlotOutline && line.paint !== undefined ? true : null,
