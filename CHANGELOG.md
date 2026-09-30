@@ -7,6 +7,10 @@ the corresponding minor release.
 
 ## Unreleased
 
+- **zero-height PowerPoint shapes:** a rectangle or other shape without text
+  whose height is zero now renders as a horizontal rule, as it does in
+  PowerPoint and Keynote, instead of a two-inch outlined box. Shapes that carry
+  text keep the existing auto-height behavior.
 - **cached Excel values only:** cells with `TODAY()` or `NOW()` formulas now
   show the value saved with the workbook instead of the current date and time.
   Cell formulas are never recalculated, so these cells stay consistent with

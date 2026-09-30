@@ -12797,13 +12797,16 @@ fn parse_docx_chart_with_style_parts_and_images(
         // associated chartStyle part when the `<cx:title>` itself carries none.
         ooxml_common::chart::parse_chartex_part(
             root,
-            &ooxml_common::chart::ChartParseContext::new(
-                &resolver,
-                style_xml,
-                color_style_xml,
-                Some(image_resolver),
-                None,
-            ),
+            &ooxml_common::chart::ChartParseContext {
+                host: ooxml_common::chart::ChartHost::Word,
+                ..ooxml_common::chart::ChartParseContext::new(
+                    &resolver,
+                    style_xml,
+                    color_style_xml,
+                    Some(image_resolver),
+                    None,
+                )
+            },
         )
     } else {
         let mut chart = ooxml_common::chart::parse_chart_part(
@@ -21436,6 +21439,37 @@ mod anchor_image_relative_from_tests {
                 .is_none_or(|roles| !roles.contains_key("chartArea")),
             "classic-chart frame fallback must not leak into ChartEx"
         );
+    }
+
+    /// The Word adapter must pass `ChartHost::Word`, which follows PowerPoint's
+    /// documented policy: every clustered column is retained and the unowned
+    /// Pareto line keeps its percentage axis (the host-neutral default does
+    /// not, and Excel keeps a single column).
+    #[test]
+    fn parse_docx_chart_passes_the_word_chartex_host() {
+        let xml = r#"<cx:chartSpace xmlns:cx="http://schemas.microsoft.com/office/drawing/2014/chartex">
+          <cx:chartData>
+            <cx:data id="0"><cx:strDim type="cat"><cx:lvl ptCount="2"><cx:pt idx="0">A</cx:pt><cx:pt idx="1">B</cx:pt></cx:lvl></cx:strDim><cx:numDim type="val"><cx:lvl ptCount="2"><cx:pt idx="0">3</cx:pt><cx:pt idx="1">5</cx:pt></cx:lvl></cx:numDim></cx:data>
+            <cx:data id="1"><cx:strDim type="cat"><cx:lvl ptCount="2"><cx:pt idx="0">X</cx:pt><cx:pt idx="1">Y</cx:pt></cx:lvl></cx:strDim><cx:numDim type="val"><cx:lvl ptCount="2"><cx:pt idx="0">8</cx:pt><cx:pt idx="1">12</cx:pt></cx:lvl></cx:numDim></cx:data>
+          </cx:chartData>
+          <cx:chart><cx:plotArea><cx:plotAreaRegion>
+            <cx:series layoutId="clusteredColumn"><cx:dataId val="0"/></cx:series>
+            <cx:series layoutId="clusteredColumn"><cx:dataId val="1"/></cx:series>
+            <cx:series layoutId="paretoLine"><cx:dataId val="0"/><cx:axisId val="2"/></cx:series>
+          </cx:plotAreaRegion>
+            <cx:axis id="0"><cx:catScaling/></cx:axis>
+            <cx:axis id="1"><cx:valScaling/></cx:axis>
+            <cx:axis id="2"><cx:valScaling min="0" max="1"/><cx:units unit="percentage"/><cx:tickLabels/></cx:axis>
+          </cx:plotArea></cx:chart>
+        </cx:chartSpace>"#;
+        let chart = parse_docx_chart(xml, None, &ThemeColors::default()).expect("parses");
+        let columns = chart
+            .series
+            .iter()
+            .filter(|series| series.series_type.as_deref() != Some("line"))
+            .count();
+        assert_eq!(columns, 2);
+        assert_eq!(chart.chartex_show_unpaired_percentage_axis, Some(true));
     }
 
     #[test]

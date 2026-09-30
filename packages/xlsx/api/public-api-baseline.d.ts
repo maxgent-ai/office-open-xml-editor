@@ -427,6 +427,7 @@ export interface ChartexHistogramBinning {
     intervalClosed?: 'l' | 'r' | null;
     underflow?: number | null;
     overflow?: number | null;
+    edgeFormatCode?: string | null;
 }
 export interface ChartexRegionMap {
     rows: ChartexRegionMapRow[];
@@ -772,6 +773,13 @@ export interface ChartModel {
     chartexTreemap?: ChartexTreemap | null;
     chartexRegionMap?: ChartexRegionMap | null;
     chartexHistogramBinning?: ChartexHistogramBinning | null;
+    chartexParetoOwnerIndex?: number | null;
+    chartexParetoSortDescending?: boolean | null;
+    chartexParetoFlatEndpoint?: boolean | null;
+    chartexSuppressGeometry?: boolean | null;
+    chartexParetoOutlineOwner?: boolean | null;
+    chartexPrimaryAxisRight?: boolean | null;
+    chartexShowUnpairedPercentageAxis?: boolean | null;
     chartexAccents?: string[] | null;
     chartexColorPalette?: Array<string | null> | null;
     chartexColorStyleMethod?: string | null;

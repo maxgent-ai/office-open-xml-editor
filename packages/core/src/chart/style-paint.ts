@@ -136,13 +136,9 @@ export function chartExPointAuthorsLine(point: ChartExPointCarrier | null | unde
 }
 
 
-/** A ChartEx model: no classic numeric role table, but a ChartEx dataPoint
- * role or colour palette. Classic models that merely expose effective roles
- * through the historical `chartex*Style` aliases are excluded. */
-export function chartModelIsChartEx(chart: ChartModel): boolean {
-  return chart.classicChartStyleRoles == null
-    && (chart.chartexDataPointStyle != null || chart.chartexColorPalette != null);
-}
+/** One file-format predicate shared with the style-role adapter, so paint
+ * and role stripping cannot disagree about a model. */
+export { chartModelIsChartEx } from './effective-style.js';
 
 /** Pure ChartEx data-point fill decision shared by paint, picture preflight
  * and paint-work accounting: the point `spPr` fill if it authors one, else

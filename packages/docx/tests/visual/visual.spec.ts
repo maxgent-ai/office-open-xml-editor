@@ -1,73 +1,50 @@
 import { test, expect } from '@playwright/test';
-import { mkdirSync, existsSync, readFileSync, readdirSync, writeFileSync } from 'fs';
+import { mkdirSync, existsSync, readFileSync, writeFileSync } from 'fs';
 import { PNG } from 'pngjs';
 import pixelmatch from 'pixelmatch';
 import {
-  captureOrComparePrivateItem,
-  clearPrivateCandidateItemOutput,
-  preparePrivateCorpus,
-  verifyPrivateItemManifest,
+  captureOrCompareSelfVrtItem,
+  clearSelfVrtCandidateOutput,
+  prepareSelfVrtCorpus,
+  selfVrtCorpusFiles,
+  selfVrtInputPath,
+  verifySelfVrtItemManifest,
 } from '../../../../tests/visual/private-corpus.mjs';
 
+// ── Fidelity targets ──────────────────────────────────────────────────────────
+// Tracked demo documents with committed reference images (references/{name}/)
+// and fidelity scores (references/{name}/scores.json). Each entry needs:
+//   name      : public path stem (loads /{name}.docx, reads references/{name}/)
+//   pageCount : exact page count; it must equal the renderer's page count
+//   width     : render width in CSS px (the reference image width)
+// Regression (self-VRT) coverage is not listed here: `pnpm vrt` renders every
+// document in public/demo/ and `pnpm vrt:private` every document in
+// public/private/docx/ against previous-renderer baselines.
 const DOCX_FILES: { name: string; pageCount: number; width: number }[] = [
-  { name: 'private/sample-1', pageCount: 1, width: 612 },
-  { name: 'private/sample-2', pageCount: 1, width: 595 },
-  { name: 'private/sample-3', pageCount: 3, width: 595 },
-  { name: 'private/sample-4', pageCount: 1, width: 595 },
-  { name: 'private/sample-5', pageCount: 7, width: 595 },
-  // Multi-column (§17.6.4) section carrying both wrapTopAndBottom (§20.4.2.20,
-  // anchored in the single-column title area) and column-anchored wrapSquare
-  // floats — pixel coverage for the float column-scope semantics (#907).
-  // Reference is private (gitignored) and generated locally with UPDATE_REFS=1.
-  { name: 'private/sample-10', pageCount: 2, width: 595 },
-  // CH13 chart coverage: sample-24 p.3 carries a stockChart (hi-lo-close);
-  // sample-25 is a pie3DChart. References are private (gitignored) and generated
-  // locally with UPDATE_REFS=1 — they are never committed.
-  { name: 'private/sample-24', pageCount: 3, width: 595 },
-  { name: 'private/sample-25', pageCount: 1, width: 595 },
-  // XF9 vertical writing (§17.6.20 tbRl): a landscape vertical-Japanese
-  // newspaper. width = physical page width (842pt, A4 landscape). Reference is
-  // private (gitignored) and generated locally with UPDATE_REFS=1.
-  // 2 pages per the Word PDF (page 2 carries only the spill of the final
-  // column): the deterministic untabled EA docGrid cell height (1.3 em — the
-  // sample-9 regression fix) restores the Word page count from the crammed
-  // 1-page state the 2026-07-13a baseline captured.
-  { name: 'private/sample-26', pageCount: 2, width: 842 },
-  // Multilingual / section coverage (references private + gitignored, generated
-  // locally with UPDATE_REFS=1):
-  // sample-27 = continuous section-break page-number restart fixture (US Letter, 612pt).
-  { name: 'private/sample-27', pageCount: 2, width: 612 },
-  // sample-28 = Arabic RTL long-form (A4).
-  { name: 'private/sample-28', pageCount: 23, width: 595 },
-  // sample-29 = Thai script (A4). 11 pages since the #989 baseline-grazing
-  // page fit (adjudicated best-fidelity state in the #981 follow-up); a stale
-  // higher count silently clamps out-of-range page requests back to page 0,
-  // snapshotting duplicate first pages.
-  { name: 'private/sample-29', pageCount: 11, width: 595 },
-  // sample-30 = Korean script (A4).
-  { name: 'private/sample-30', pageCount: 4, width: 595 },
-  // sample-31 = Russian / Cyrillic (A4).
-  { name: 'private/sample-31', pageCount: 12, width: 595 },
   { name: 'demo/sample-1', pageCount: 6, width: 595 },
 ];
 
 const PIXEL_THRESHOLD = 0.20;
 const FAIL_ABOVE_PCT = 20;
-const REGRESSION_PCT = 0.5;
 // Fidelity-score ratchet: fail if a page's match-% vs its reference PNG drops
 // more than this below the committed score. Catches a renderer change that
 // quietly worsens fidelity against the Word ground truth even while staying
 // under the coarse FAIL_ABOVE_PCT ceiling.
 const RATCHET_DROP_PCT = 0.5;
 
-// UPDATE_REFS=1 pnpm vrt → adopt the current canvas output as the new reference.
+// UPDATE_REFS=1 pnpm vrt:fidelity → adopt the current canvas output as the new
+// reference. Only with explicit user approval (see AGENTS.md).
 const UPDATE_REFS = process.env.UPDATE_REFS === '1';
-// UPDATE_SCORES=1 pnpm vrt → record the current fidelity match-% into
+// UPDATE_SCORES=1 pnpm vrt:fidelity → record the current fidelity match-% into
 // references/<name>/scores.json WITHOUT touching the reference PNGs. This is how
-// the committed demo scores are (re)generated; it never rewrites ground truth.
+// the committed demo scores are (re)generated from a clean latest-main checkout
+// (AGENTS.md); it never rewrites ground truth.
 const UPDATE_SCORES = process.env.UPDATE_SCORES === '1';
 const SNAPSHOT = process.env.VRT_SNAPSHOT === '1';
 const RUN_MODE = process.env.VRT_MODE === 'regression' ? 'regression' : 'fidelity';
+// `vrt` / `vrt:snapshot` run the self-VRT corpora; `vrt:fidelity` compares the
+// listed files with their references. The two never share an oracle.
+const SELF_VRT = RUN_MODE === 'regression' || SNAPSHOT;
 
 // Per-sample fidelity scores live next to the reference PNGs
 // (references/<name>/scores.json), so they inherit the exact same commit policy:
@@ -94,8 +71,8 @@ function writeScore(name: string, key: string, matchPct: number): void {
   writeFileSync(scoresPathFor(name), JSON.stringify(ordered, null, 2) + '\n');
 }
 
-test.describe('docx visual regression', () => {
-  for (const { name, pageCount, width } of DOCX_FILES) {
+test.describe('docx visual fidelity', () => {
+  for (const { name, pageCount, width } of SELF_VRT ? [] : DOCX_FILES) {
     for (let i = 0; i < pageCount; i++) {
       const pageNum = i + 1;
 
@@ -115,29 +92,19 @@ test.describe('docx visual regression', () => {
           throw new Error(`Fixture error on ${name} page ${pageNum}: ${msg}`);
         }
 
-        // Loud out-of-range page guard. `i` is the requested page index and
-        // `pageCount` above is this VRT's DECLARED count; the fixture reports the
-        // renderer's REAL page count via dataset.pageCount. renderPage() silently
-        // clamps an out-of-range index back to page 0 (renderer.ts:
-        // `pages[pageIndex] ?? pages[0]`), so a stale declared count that exceeds
-        // the real pagination keeps snapshotting duplicate first pages under a
-        // green status — the #993 regression, where a private sample dropped
-        // 14→11 pages yet ~15 PRs of VRT stayed green on triplicated page-0 refs.
-        // Fail the moment a requested index is out of range. This runs BEFORE the
-        // UPDATE_REFS branch below on purpose: the silent duplication happened
-        // during reference refreshes, so the guard must fire there too.
+        // Exact page-count guard. The fixture reports the renderer's REAL page
+        // count via dataset.pageCount. renderPage() silently clamps an
+        // out-of-range index back to page 0 (`pages[pageIndex] ?? pages[0]`), so
+        // a stale declared count that exceeds the real pagination would keep
+        // snapshotting duplicate first pages under a green status (#993), and
+        // one below it would leave pages unchecked. It runs BEFORE the
+        // UPDATE_REFS branch on purpose: the silent duplication happened during
+        // reference refreshes.
         const actualPageCount = Number(await page.evaluate(() => document.body.dataset.pageCount));
-        if (!Number.isInteger(actualPageCount) || actualPageCount <= 0) {
+        if (actualPageCount !== pageCount) {
           throw new Error(
-            `${name}: fixture did not report a valid page count (got "${actualPageCount}")`
-          );
-        }
-        if (i >= actualPageCount) {
-          throw new Error(
-            `${name}: requested page index ${i} (page ${pageNum}) is out of range — the renderer ` +
-            `produced only ${actualPageCount} page(s). renderPage() would clamp it back to page 0 ` +
-            `and snapshot a duplicate first page. Lower the DOCX_FILES pageCount for ${name} to ` +
-            `${actualPageCount}.`
+            `${name}: the renderer reports ${actualPageCount} page(s) but DOCX_FILES declares ` +
+            `${pageCount}; keep the declared count exact so no page is duplicated or unchecked.`
           );
         }
 
@@ -157,20 +124,9 @@ test.describe('docx visual regression', () => {
           console.log(`  ${name} page ${pageNum}: reference updated`);
           return;
         }
-        if (SNAPSHOT) {
-          mkdirSync(`tests/visual/baseline/${name}`, { recursive: true });
-          writeFileSync(`tests/visual/baseline/${name}/page-${pageNum}.png`, actualBuf);
-          console.log(`  ${name} page ${pageNum}: baseline captured`);
-          return;
-        }
-
-        const targetRoot = RUN_MODE === 'regression' ? 'baseline' : 'references';
-        const refPath = `tests/visual/${targetRoot}/${name}/page-${pageNum}.png`;
+        const refPath = `tests/visual/references/${name}/page-${pageNum}.png`;
         if (!existsSync(refPath)) {
-          if (RUN_MODE === 'regression') {
-            throw new Error(`missing regression baseline: ${refPath}`);
-          }
-          test.skip(true, `no ${targetRoot} image for ${name} page ${pageNum}`);
+          throw new Error(`missing fidelity reference: ${refPath}`);
         }
         const refBuf = readFileSync(refPath);
         const refPng    = PNG.sync.read(refBuf);
@@ -179,12 +135,6 @@ test.describe('docx visual regression', () => {
         const { width: refW, height: refH } = refPng;
 
         if (actualPng.width !== refW || actualPng.height !== refH) {
-          if (RUN_MODE === 'regression') {
-            throw new Error(
-              `${name} page ${pageNum}: regression dimensions changed from ` +
-              `${refW}×${refH} to ${actualPng.width}×${actualPng.height}`,
-            );
-          }
           console.warn(
             `  ${name} page ${pageNum}: size mismatch ` +
             `actual=${actualPng.width}×${actualPng.height} ` +
@@ -233,28 +183,27 @@ test.describe('docx visual regression', () => {
           `(${diffPixels.toLocaleString()} / ${totalPx.toLocaleString()} px)`
         );
 
-        const limit = RUN_MODE === 'regression' ? REGRESSION_PCT : FAIL_ABOVE_PCT;
-        if (diffPct > limit) {
+        if (diffPct > FAIL_ABOVE_PCT) {
           throw new Error(
-            `${name} page ${pageNum} pixel diff ${diffPct.toFixed(1)}% exceeds ${limit}% in ${RUN_MODE} mode`
+            `${name} page ${pageNum} pixel diff ${diffPct.toFixed(1)}% exceeds ${FAIL_ABOVE_PCT}%`
           );
         }
 
-        // Fidelity-score ratchet (fidelity mode only; the regression mode above
-        // already gates against the captured baseline). UPDATE_SCORES rewrites
-        // the stored score; otherwise a committed score is a floor.
-        if (RUN_MODE === 'fidelity') {
-          const key = `page-${pageNum}`;
-          if (UPDATE_SCORES) {
-            writeScore(name, key, matchPct);
-          } else {
-            const prior = readScores(name)[key];
-            if (prior !== undefined && matchPct < prior - RATCHET_DROP_PCT) {
-              throw new Error(
-                `${name} ${key} fidelity regressed: match ${matchPct.toFixed(2)}% ` +
-                `is >${RATCHET_DROP_PCT}pt below the recorded ${prior.toFixed(2)}%`
-              );
-            }
+        // Fidelity-score ratchet. UPDATE_SCORES rewrites the stored score;
+        // otherwise a committed score is a floor.
+        const key = `page-${pageNum}`;
+        if (UPDATE_SCORES) {
+          writeScore(name, key, matchPct);
+        } else {
+          const prior = readScores(name)[key];
+          if (prior === undefined) {
+            throw new Error(`${name} ${key} has no recorded fidelity score in ${scoresPathFor(name)}`);
+          }
+          if (matchPct < prior - RATCHET_DROP_PCT) {
+            throw new Error(
+              `${name} ${key} fidelity regressed: match ${matchPct.toFixed(2)}% ` +
+              `is >${RATCHET_DROP_PCT}pt below the recorded ${prior.toFixed(2)}%`
+            );
           }
         }
       });
@@ -262,65 +211,80 @@ test.describe('docx visual regression', () => {
   }
 });
 
+// ── Self-VRT (previous-renderer regression) ───────────────────────────────────
+// Every file of a corpus is rendered completely and compared pixel-for-pixel
+// with the previous renderer's images, bound by manifest to
+// VRT_BASELINE_REVISION. `demo` runs under `pnpm vrt`; `private` under
+// `pnpm vrt:private` (VRT_PRIVATE_CORPUS=1).
+type SelfVrtCorpus = 'demo' | 'private';
+
+function describeSelfRegression(title: string, corpus: SelfVrtCorpus, files: string[]): void {
+  test.describe(title, () => {
+    if (corpus === 'demo' && files.length > 0) {
+      test.beforeAll(() => {
+        prepareSelfVrtCorpus({ corpus, format: 'docx', files, snapshot: SNAPSHOT });
+      });
+    }
+    for (const file of files) {
+      test(file, async ({ page }) => {
+        test.setTimeout(600_000);
+        const stem = file.slice(0, -'.docx'.length);
+        if (!SNAPSHOT) clearSelfVrtCandidateOutput({ corpus, stem, itemKind: 'page' });
+        const openPage = async (pageIndex: number) => {
+          await page.goto(
+            `/tests/visual/fixture.html?file=${encodeURIComponent(selfVrtInputPath({ corpus, file }))}`
+            + `&page=${pageIndex}&width=612`,
+          );
+          await page.waitForFunction(
+            () => document.body.dataset.status === 'ready' || document.body.dataset.status === 'error',
+            { timeout: 120_000 },
+          );
+          const status = await page.evaluate(() => document.body.dataset.status);
+          if (status === 'error') {
+            const message = await page.evaluate(() => document.body.dataset.errorMessage ?? '');
+            throw new Error(`${stem} page ${pageIndex + 1}: ${message}`);
+          }
+        };
+
+        await openPage(0);
+        const pageCount = Number(await page.evaluate(() => document.body.dataset.pageCount));
+        expect(pageCount, `${stem} must report its complete page count`).toBeGreaterThan(0);
+        const differences: string[] = [];
+        for (let pageIndex = 0; pageIndex < pageCount; pageIndex++) {
+          if (pageIndex > 0) {
+            await page.evaluate(async (index) => {
+              const render = (globalThis as unknown as {
+                renderDocxVrtPage(pageIndex: number): Promise<void>;
+              }).renderDocxVrtPage;
+              await render(index);
+            }, pageIndex);
+          }
+          const dataUrl = await page.evaluate(() =>
+            (document.querySelector('canvas') as HTMLCanvasElement | null)?.toDataURL('image/png'));
+          if (!dataUrl) throw new Error(`${stem} page ${pageIndex + 1}: no canvas`);
+          const actual = Buffer.from(dataUrl.split(',')[1], 'base64');
+          const difference = captureOrCompareSelfVrtItem({
+            corpus, stem, itemKind: 'page', itemIndex: pageIndex, actual, snapshot: SNAPSHOT,
+          });
+          if (difference) differences.push(difference);
+        }
+        verifySelfVrtItemManifest({
+          corpus, format: 'docx', stem, itemKind: 'page', itemCount: pageCount, snapshot: SNAPSHOT,
+        });
+        expect(differences, differences.join('\n')).toEqual([]);
+      });
+    }
+  });
+}
+
+const DOCX_DEMO_CORPUS = SELF_VRT ? selfVrtCorpusFiles({ corpus: 'demo', format: 'docx' }) : [];
 const DOCX_PRIVATE_CORPUS = process.env.VRT_PRIVATE_CORPUS === '1'
-  ? readdirSync('public/private/docx')
-      .filter((file) => file.endsWith('.docx') && !file.startsWith('~$'))
-      .map((file) => `docx/${file}`)
-      .sort((left, right) => left.localeCompare(right, undefined, { numeric: true }))
+  ? selfVrtCorpusFiles({ corpus: 'private', format: 'docx' })
   : [];
 
 if (process.env.VRT_PRIVATE_CORPUS === '1') {
-  preparePrivateCorpus({ format: 'docx', files: DOCX_PRIVATE_CORPUS, snapshot: SNAPSHOT });
+  prepareSelfVrtCorpus({ corpus: 'private', format: 'docx', files: DOCX_PRIVATE_CORPUS, snapshot: SNAPSHOT });
 }
 
-test.describe('private corpus self regression', () => {
-  for (const file of DOCX_PRIVATE_CORPUS) {
-    test(file, async ({ page }) => {
-      test.setTimeout(600_000);
-      const stem = file.slice(0, -'.docx'.length);
-      if (!SNAPSHOT) clearPrivateCandidateItemOutput({ stem, itemKind: 'page' });
-      const openPage = async (pageIndex: number) => {
-        await page.goto(
-          `/tests/visual/fixture.html?file=${encodeURIComponent(`private/${file}`)}`
-          + `&page=${pageIndex}&width=612`,
-        );
-        await page.waitForFunction(
-          () => document.body.dataset.status === 'ready' || document.body.dataset.status === 'error',
-          { timeout: 120_000 },
-        );
-        const status = await page.evaluate(() => document.body.dataset.status);
-        if (status === 'error') {
-          const message = await page.evaluate(() => document.body.dataset.errorMessage ?? '');
-          throw new Error(`${stem} page ${pageIndex + 1}: ${message}`);
-        }
-      };
-
-      await openPage(0);
-      const pageCount = Number(await page.evaluate(() => document.body.dataset.pageCount));
-      expect(pageCount, `${stem} must report its complete page count`).toBeGreaterThan(0);
-      const differences: string[] = [];
-      for (let pageIndex = 0; pageIndex < pageCount; pageIndex++) {
-        if (pageIndex > 0) {
-          await page.evaluate(async (index) => {
-            const render = (globalThis as unknown as {
-              renderDocxVrtPage(pageIndex: number): Promise<void>;
-            }).renderDocxVrtPage;
-            await render(index);
-          }, pageIndex);
-        }
-        const dataUrl = await page.evaluate(() =>
-          (document.querySelector('canvas') as HTMLCanvasElement | null)?.toDataURL('image/png'));
-        if (!dataUrl) throw new Error(`${stem} page ${pageIndex + 1}: no canvas`);
-        const actual = Buffer.from(dataUrl.split(',')[1], 'base64');
-        const difference = captureOrComparePrivateItem({
-          stem, itemKind: 'page', itemIndex: pageIndex, actual, snapshot: SNAPSHOT,
-        });
-        if (difference) differences.push(difference);
-      }
-      verifyPrivateItemManifest({
-        format: 'docx', stem, itemKind: 'page', itemCount: pageCount, snapshot: SNAPSHOT,
-      });
-      expect(differences, differences.join('\n')).toEqual([]);
-    });
-  }
-});
+describeSelfRegression('demo corpus self regression', 'demo', DOCX_DEMO_CORPUS);
+describeSelfRegression('private corpus self regression', 'private', DOCX_PRIVATE_CORPUS);

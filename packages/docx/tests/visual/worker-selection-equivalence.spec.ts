@@ -56,6 +56,8 @@ test('worker selection + findText + zoom match main mode › demo/sample-1', asy
   expect(main.before.overlay.length).toBeGreaterThan(0);
   expect(worker.before.overlay).toEqual(main.before.overlay);
   expect(main.before.highlights.length).toBeGreaterThan(0);
+  // Every captured box is a real match highlight, not an empty placeholder.
+  for (const h of main.before.highlights) expect(h.width).toBeGreaterThan(0);
   expect(worker.before.highlights).toEqual(main.before.highlights);
   expect(worker.before.page).toBe(main.before.page);
 

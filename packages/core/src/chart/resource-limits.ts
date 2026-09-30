@@ -21,7 +21,7 @@ import { indexChartPlotGroups, markerChartTypeForPlotGroup } from './plot-groups
 import { chartSeriesVariesByPoint } from './effective-style.js';
 import { chartDataPointStyleRole } from './effective-style.js';
 import { chartStyleEffectOwner, chartStyleEffectRecipe } from './style-effects.js';
-import { computeBoxWhiskerStats } from './box-whisker.js';
+import { boxWhiskerDotCandidateCount, computeBoxWhiskerStats } from './box-whisker.js';
 import { planOfPieSecondaryIndices } from './of-pie.js';
 import {
   visitChartExHierarchyBodySites,
@@ -581,8 +581,9 @@ export function chartEffectConsumerUpperBound(chart: ChartModel): number {
     for (const values of series.valuesByCategory) {
       const stats = computeBoxWhiskerStats(values, series.quartileMethod);
       if (!stats) continue;
-      const observations = (series.showNonoutliers ? stats.inner.length : 0)
-        + (series.showOutliers ? stats.outliers.length : 0);
+      const observations = boxWhiskerDotCandidateCount(
+        stats, series.showNonoutliers, series.showOutliers,
+      );
       for (let index = 0; index < observations; index++) {
         add(
           chartStyleEffectOwner(series.chartexStyle),

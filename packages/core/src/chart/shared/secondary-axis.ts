@@ -193,7 +193,7 @@ export function drawSecondaryValueGridlines(
 }
 
 
-/** Draw a secondary value axis on the RIGHT edge of the plot: its rule, mirrored
+/** Draw a secondary value axis on the requested edge of the plot: its rule,
  *  tick marks + labels, and rotated title. Its scale is INDEPENDENT of the
  *  primary axis (its own "nice" major unit; NOT aligned to the primary
  *  gridlines) — PowerPoint places these marks independently. Shared by the
@@ -205,7 +205,8 @@ export function drawSecondaryValueGridlines(
  *  - `secFontPx` / `secLabelBandW` the tick-label font size + reserved gutter
  *    width (measured up front so the title clears the labels),
  *  - `primaryLabelColor` the fallback tick-label color when the axis specifies
- *    none (the primary value-axis label color). */
+ *    none (the primary value-axis label color). ChartEx may put this axis on
+ *    the left when its series comes first. */
 export function drawSecondaryValueAxis(
   ctx: CanvasRenderingContext2D,
   chart: ChartModel,
@@ -220,8 +221,9 @@ export function drawSecondaryValueAxis(
   primaryLabelColor: string,
   date1904: boolean | undefined,
   percentStacked = false,
+  side: 'left' | 'right' = 'right',
 ): void {
-  const axX = px0 + pw;
+  const axX = side === 'left' ? px0 : px0 + pw;
   const { color: secLineColor, width: secLineW } = resolveAxisLine(sec.lineColor, sec.lineWidthEmu, ptToPx);
   if (!sec.lineHidden) {
     strokeAxisSegment(ctx, axX, py0, axX, py0 + ph, secLineColor, secLineW, sec.lineDash);
@@ -229,12 +231,12 @@ export function drawSecondaryValueAxis(
   if (!sec.hidden) {
     ctx.font = `${sec.fontItalic ? 'italic ' : ''}${sec.fontBold ? 'bold ' : ''}${secFontPx}px ${chartFontFamily(chart, sec.fontFace, 'minor')}`;
     ctx.fillStyle = sec.fontColor ? `#${sec.fontColor}` : primaryLabelColor;
-    ctx.textAlign = 'left';
+    ctx.textAlign = side === 'left' ? 'right' : 'left';
     ctx.textBaseline = 'middle';
     for (const sval of secScale.majorLines) {
       const gy = toYSecondary(sval);
       // Same tick geometry as the left axis, mirrored to the right edge.
-      drawAxisTick(ctx, sec.majorTickMark, 'val', axX, gy, secLineColor, secLineW, true, sec.lineHidden, 'major', ptToPx, sec.lineDash);
+      drawAxisTick(ctx, sec.majorTickMark, 'val', axX, gy, secLineColor, secLineW, side === 'right', sec.lineHidden, 'major', ptToPx, sec.lineDash);
       if (sec.tickLabelPos !== 'none') {
         ctx.fillText(
           formatAxisTickWithUnits(
@@ -243,27 +245,28 @@ export function drawSecondaryValueAxis(
             date1904,
             sec.displayUnits,
           ),
-          axX + 14,
+          side === 'left' ? axX - 14 : axX + 14,
           gy,
         );
       }
     }
     if (sec.minorTickMark && sec.minorTickMark !== 'none') {
       for (const value of secScale.minorTicks) {
-        drawAxisTick(ctx, sec.minorTickMark, 'val', axX, toYSecondary(value), secLineColor, secLineW, true, sec.lineHidden, 'minor', ptToPx, sec.lineDash);
+        drawAxisTick(ctx, sec.minorTickMark, 'val', axX, toYSecondary(value), secLineColor, secLineW, side === 'right', sec.lineHidden, 'minor', ptToPx, sec.lineDash);
       }
     }
   }
   if (sec.title) {
     drawSecondaryAxisTitle(
       ctx, chart, sec, chartRect, px0, py0, pw, ph, secLabelBandW, ptToPx,
+      side,
     );
   }
 }
 
 
-/** Draw a right-side secondary value-axis title. Both the duplicated combo-bar
- *  path and the shared line/area path use this helper, so the fixed 10pt
+/** Draw a secondary value-axis title. Both the duplicated combo-bar path and
+ *  the shared line/area path use this helper, so the fixed 10pt
  *  fallback and +90° reading direction cannot drift. */
 export function drawSecondaryAxisTitle(
   ctx: CanvasRenderingContext2D,
@@ -273,6 +276,7 @@ export function drawSecondaryAxisTitle(
   px0: number, py0: number, pw: number, ph: number,
   secLabelBandW: number,
   ptToPx: number,
+  side: 'left' | 'right' = 'right',
 ): void {
   if (!sec.title) return;
   const fontSizePx = axisTitleFontPx(sec.titleFontSizeHpt, ptToPx);
@@ -282,9 +286,10 @@ export function drawSecondaryAxisTitle(
   drawAxisTitle(
     ctx,
     sec.title,
-    px0 + pw + secLabelBandW + fontSizePx * 0.6,
+    side === 'left' ? px0 - secLabelBandW - fontSizePx * 0.6
+      : px0 + pw + secLabelBandW + fontSizePx * 0.6,
     py0 + ph / 2,
-    'right',
+    side,
     fontSizePx,
     sec.titleFontBold ?? true,
     sec.titleFontItalic ?? false,

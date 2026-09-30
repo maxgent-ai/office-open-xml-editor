@@ -314,45 +314,90 @@ VRT is local-only because private samples are not redistributable.
 Regression detection must compare the changed renderer with images produced by
 the previous renderer. It must not use Word/Excel/PowerPoint or PDF reference
 images as the regression oracle. Keep Office-reference fidelity evaluation as a
-separate run:
+separate run.
+
+### Self-VRT (previous-renderer regression)
+
+There are two self-VRT corpora per package. Both render every file completely
+and compare exact decoded pixels with the previous renderer's images:
+
+- **demo**: every file under `packages/<fmt>/public/demo/` (tracked). Captured
+  by `pnpm vrt:snapshot` and checked by `pnpm vrt`.
+- **private**: every file under `packages/<fmt>/public/private/<fmt>/`
+  (gitignored). Captured by `pnpm vrt:private:snapshot` and checked by
+  `pnpm vrt:private`.
+
+`pnpm vrt` also runs the package's other visual specs (worker parity, overlays,
+acceptance checks). Specs that need a private sample load it from
+`public/private/<fmt>/` and skip when it is absent.
+
+Baselines are produced from a clean, detached worktree at the previous-renderer
+revision, normally the full SHA of the latest `origin/main`. Snapshot mode
+rejects a dirty tracked checkout and writes a manifest binding the baseline to
+`VRT_BASELINE_REVISION`, the SHA-256 of each input and the exact
+page/sheet/slide set. The candidate run verifies that manifest and reads the
+images from the baseline worktree named by `VRT_BASELINE_CHECKOUT`. Use distinct
+ports so a candidate server can never satisfy the baseline run:
 
 ```bash
-pnpm build:wasm
-pnpm vrt:snapshot # run from main / the merge-base before the renderer change
-pnpm vrt
-pnpm --filter @silurus/ooxml-docx vrt
-pnpm --filter @silurus/ooxml-xlsx vrt
-pnpm --filter @silurus/ooxml-pptx vrt
-pnpm vrt:fidelity # separate Office/PDF reference fidelity evaluation
-```
-
-If the change is already in progress and no trustworthy self-baseline exists,
-capture `vrt:snapshot` in a temporary worktree at the merge-base, then run `vrt`
-from the changed worktree against those images. A missing baseline is not a
-successful regression check; report or correct stale sample/page manifests
-instead of treating their skips as coverage.
-
-For the complete private corpus, bind both runs to the same full merge-base SHA.
-Use a clean detached worktree for the previous renderer, rebuild its WASM, and
-use distinct ports so a candidate server can never satisfy the baseline run:
-
-```bash
-git worktree add --detach /tmp/ooxml-vrt-baseline <merge-base-sha>
+base=$(git rev-parse origin/main)
+git worktree add --detach /tmp/ooxml-vrt-baseline "$base"
 cd /tmp/ooxml-vrt-baseline
-pnpm build:wasm
-VRT_BASELINE_REVISION=<full-merge-base-sha> VRT_PORT=5190 pnpm vrt:private:snapshot
+pnpm install --frozen-lockfile && pnpm build:wasm
+VRT_BASELINE_REVISION=$base VRT_PORT=5190 pnpm vrt:snapshot
+VRT_BASELINE_REVISION=$base VRT_PORT=5190 pnpm vrt:private:snapshot
 
 cd <candidate-worktree>
 pnpm build:wasm
-VRT_BASELINE_REVISION=<full-merge-base-sha> VRT_PORT=5191 pnpm vrt:private
+VRT_BASELINE_REVISION=$base VRT_BASELINE_CHECKOUT=/tmp/ooxml-vrt-baseline VRT_PORT=5191 pnpm vrt
+VRT_BASELINE_REVISION=$base VRT_BASELINE_CHECKOUT=/tmp/ooxml-vrt-baseline VRT_PORT=5191 pnpm vrt:private
 ```
 
-Snapshot mode rejects a dirty tracked checkout. For the one-time bootstrap of
-this harness against a merge-base that predates it, copy only the allowlisted VRT
-harness files listed in `tests/visual/private-corpus.mjs` and set
-`VRT_ALLOW_HARNESS_CHANGES=1`; renderer/parser changes remain forbidden. The
-baseline manifests record the resolved SHA, each private input's SHA-256, and
-the exact page/sheet/slide sets.
+The root scripts run every package without stopping at the first failing one,
+and still exit non-zero if any package failed. Filter a single package with
+`pnpm --filter @silurus/ooxml-<fmt> vrt` (and the matching snapshot script).
+
+A comparison run requires `VRT_BASELINE_CHECKOUT` and fails closed unless it
+names the root of a Git checkout whose HEAD is exactly `VRT_BASELINE_REVISION`
+and whose renderer is unmodified: no tracked change, and no untracked file
+outside dependencies and the private corpus. The checkout is re-verified
+before every item is read, so a baseline that changes mid-run fails. Snapshot
+manifests record the checkout's real path and each image's SHA-256; the
+comparison requires both to match, and rejects any symlink below the baseline
+checkout, so copied, replaced or redirected images are never accepted. The
+harness runs Git with every `GIT_*` variable removed. A missing or mismatched
+baseline fails the run; it is not a successful regression check. Remove the
+baseline worktree when done.
+
+For the one-time bootstrap of a harness change against a baseline revision that
+predates it, copy only the allowlisted VRT harness files listed in
+`tests/visual/private-corpus.mjs` into the baseline worktree and set
+`VRT_ALLOW_HARNESS_CHANGES=1` for both the snapshot and the comparison run;
+renderer/parser changes remain forbidden.
+
+### Fidelity scores
+
+`pnpm vrt:fidelity` compares each tracked demo file with its committed images
+under `packages/<fmt>/tests/visual/references/demo/` and applies the fidelity
+ratchet: a page, sheet or slide fails when its match-% drops more than
+`RATCHET_DROP_PCT` below the score recorded in `scores.json` beside the images.
+The demo references are adopted renderer outputs, not Office exports, so the
+ratchet detects drift from the adopted generation. Office PDFs remain the
+fidelity ground truth.
+
+Run `pnpm vrt:fidelity` alongside the self-VRT for every renderer change, so
+`main` always passes its own ratchet. Record scores only from a clean checkout
+of committed renderer code: the latest `origin/main` to resynchronize, or the
+head of a renderer PR whose score drop has been adjudicated against the Office
+PDF (recorded in that same PR). Never record from uncommitted work:
+
+```bash
+UPDATE_SCORES=1 pnpm vrt:fidelity
+```
+
+This rewrites only `scores.json`, never the reference images. Commit the
+re-recorded scores as their own change that names the source revision. Never
+loosen `RATCHET_DROP_PCT` or `FAIL_ABOVE_PCT` to make a run pass.
 
 Only update references when the user explicitly asks:
 

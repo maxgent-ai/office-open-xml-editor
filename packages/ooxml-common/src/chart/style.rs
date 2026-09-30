@@ -866,13 +866,21 @@ pub(super) fn chart_style_placeholder(
     accent: Option<&str>,
     palette: Option<&[Option<String>]>,
     color_style_method: Option<&str>,
+    chart_ex_role: bool,
 ) -> Option<String> {
     match reference.map(|reference| {
         chart_style_reference_color(reference, resolver, accent, palette, color_style_method)
     }) {
         Some(Ok(Some(color))) => Some(color),
         Some(Err(())) => None,
-        Some(Ok(None)) | None => accent.map(str::to_owned),
+        // ChartEx only: a present CT_StyleReference without a color choice
+        // supplies black for phClr. Office-produced ChartEx controls establish
+        // this for both fillRef and lnRef, including idx=0. Classic phClr is
+        // unmeasured, so classic roles keep the caller's semantic accent, as
+        // does an absent reference.
+        Some(Ok(None)) if chart_ex_role => Some("000000".to_owned()),
+        Some(Ok(None)) => accent.map(str::to_owned),
+        None => accent.map(str::to_owned),
     }
 }
 
@@ -1363,6 +1371,10 @@ pub(super) fn parse_chart_style_effects(
                 *accent,
                 accents,
                 color_style_method,
+                // The ChartEx black placeholder was measured for fillRef and
+                // lnRef only. A colourless effectRef keeps the previous
+                // semantic-accent placeholder until an effect control exists.
+                false,
             )
         });
         let adapter = ColorResolverThemeAdapter(resolver);
@@ -1538,6 +1550,26 @@ pub(super) fn parse_chartex_element_style(
     image_resolver: &dyn ChartImageResolver,
     image_source: ChartImageSource,
 ) -> ChartExElementStyle {
+    parse_chart_style_element(
+        style_node,
+        resolver,
+        accents,
+        color_style_method,
+        image_resolver,
+        image_source,
+        false,
+    )
+}
+
+fn parse_chart_style_element(
+    style_node: Node,
+    resolver: &dyn ColorResolver,
+    accents: Option<&[Option<String>]>,
+    color_style_method: Option<&str>,
+    image_resolver: &dyn ChartImageResolver,
+    image_source: ChartImageSource,
+    chart_ex_role: bool,
+) -> ChartExElementStyle {
     use crate::line::{LineDash, LineJoin, LinePaint, LineProperties};
 
     let placeholders: Vec<Option<&str>> = accents
@@ -1551,18 +1583,22 @@ pub(super) fn parse_chartex_element_style(
                 .collect()
         })
         .unwrap_or_else(|| vec![None]);
+    let local_sp_pr = child(style_node, "spPr");
     let fill_ref = child(style_node, "fillRef");
     let line_ref = child(style_node, "lnRef");
     // Serialize and parse each referenced theme recipe once per style role.
     // Placeholder substitution and color transforms are then the only work in
     // the palette loop (rather than reparsing a DOM for every palette entry).
+    // DrawingML style-reference rule: a role spPr fill wins; otherwise the
+    // fillRef supplies the fill (idx 0 = none, idx >= 1 = theme fill with the
+    // reference colour as phClr). The ChartEx controls only exercised idx 0,
+    // where a line-only spPr leaves the point unfilled.
     let fill_recipe = fill_ref.map(|reference| chart_style_fill_ref_xml(reference, resolver));
     let fill_recipe_xml = fill_recipe.as_ref().and_then(|recipe| match recipe {
         ChartStyleMatrixRecipe::Xml(xml) => Some(xml.as_str()),
         _ => None,
     });
     let fill_recipe_doc = fill_recipe_xml.and_then(|xml| roxmltree::Document::parse(xml).ok());
-    let local_sp_pr = child(style_node, "spPr");
     let style_modifiers = style_node.attribute("mods").unwrap_or_default();
     let has_modifier = |name: &str| {
         style_modifiers
@@ -1577,8 +1613,12 @@ pub(super) fn parse_chartex_element_style(
             Some(ChartStyleMatrixRecipe::Xml(_) | ChartStyleMatrixRecipe::Missing)
         ))
     .then_some(true);
+    // ChartEx controls: fillRef idx 0 beside a present (line-only) spPr means
+    // no fill rather than the NoStyle fall-through sentinel.
+    let chart_ex_idx0_no_fill = chart_ex_role && local_sp_pr.is_some();
     let fill_no_style = (matches!(fill_recipe.as_ref(), Some(ChartStyleMatrixRecipe::NoStyle))
-        && !local_fill_authored)
+        && !local_fill_authored
+        && !chart_ex_idx0_no_fill)
         .then_some(true);
     let line_recipe = line_ref.map(|reference| chart_style_line_ref_xml(reference, resolver));
     let line_recipe_xml = line_recipe.as_ref().and_then(|recipe| match recipe {
@@ -1615,8 +1655,14 @@ pub(super) fn parse_chartex_element_style(
             fills.push(None);
             continue;
         }
-        let placeholder =
-            chart_style_placeholder(fill_ref, resolver, *accent, accents, color_style_method);
+        let placeholder = chart_style_placeholder(
+            fill_ref,
+            resolver,
+            *accent,
+            accents,
+            color_style_method,
+            chart_ex_role,
+        );
         let local_paint = local_sp_pr.and_then(|sp_pr| {
             parse_chart_style_paint(
                 sp_pr,
@@ -1720,7 +1766,14 @@ pub(super) fn parse_chartex_element_style(
     // substitution for every color. This prevents an authored unbounded-style
     // custom dash from becoming palette-size × dash-size work.
     let first_placeholder = placeholders.first().and_then(|accent| {
-        chart_style_placeholder(line_ref, resolver, *accent, accents, color_style_method)
+        chart_style_placeholder(
+            line_ref,
+            resolver,
+            *accent,
+            accents,
+            color_style_method,
+            chart_ex_role,
+        )
     });
     let inherited_geometry = match line_recipe.as_ref() {
         Some(ChartStyleMatrixRecipe::NoStyle) => Some(LineProperties {
@@ -1748,8 +1801,14 @@ pub(super) fn parse_chartex_element_style(
             if index >= parsed_line_entries {
                 return None;
             }
-            let placeholder =
-                chart_style_placeholder(line_ref, resolver, *accent, accents, color_style_method);
+            let placeholder = chart_style_placeholder(
+                line_ref,
+                resolver,
+                *accent,
+                accents,
+                color_style_method,
+                chart_ex_role,
+            );
             let inherited = match line_recipe.as_ref() {
                 Some(ChartStyleMatrixRecipe::NoStyle) => Some(LinePaint::NoFill),
                 Some(ChartStyleMatrixRecipe::Missing) => None,
@@ -2130,10 +2189,34 @@ pub(super) fn parse_chart_style_role_table(
     color_style_method: Option<&str>,
     image_resolver: &dyn ChartImageResolver,
 ) -> Option<BTreeMap<String, ChartExElementStyle>> {
+    parse_chart_style_role_table_for_chart(
+        style_root,
+        resolver,
+        palette,
+        color_style_method,
+        image_resolver,
+        false,
+    )
+}
+
+pub(super) fn parse_chart_style_role_table_for_chart(
+    style_root: Node,
+    resolver: &dyn ColorResolver,
+    palette: Option<&[Option<String>]>,
+    color_style_method: Option<&str>,
+    image_resolver: &dyn ChartImageResolver,
+    chart_ex_role: bool,
+) -> Option<BTreeMap<String, ChartExElementStyle>> {
     let role_nodes = style_root
         .children()
         .filter(|node| {
-            node.is_element() && CHART_STYLE_ROLE_NAMES.contains(&node.tag_name().name())
+            node.is_element()
+                && CHART_STYLE_ROLE_NAMES.contains(&node.tag_name().name())
+                // Inert classic data roles are dropped before any budget or
+                // palette expansion so a huge inert recipe cannot fail-close
+                // the roles that do paint.
+                && (chart_ex_role
+                    || !CLASSIC_INERT_LINKED_PAINT_ROLES.contains(&node.tag_name().name()))
         })
         .collect::<Vec<_>>();
     if role_nodes.is_empty() {
@@ -2172,13 +2255,14 @@ pub(super) fn parse_chart_style_role_table(
             .into_iter()
             .map(|role| {
                 let name = role.tag_name().name().to_owned();
-                let style = parse_chartex_element_style(
+                let style = parse_chart_style_element(
                     role,
                     resolver,
                     palette,
                     color_style_method,
                     image_resolver,
                     ChartImageSource::Style,
+                    chart_ex_role,
                 );
                 (name, style)
             })
@@ -2196,10 +2280,25 @@ pub(super) fn unresolved_chart_style_role_table(
     resolver: &dyn ColorResolver,
     image_resolver: &dyn ChartImageResolver,
 ) -> Option<BTreeMap<String, ChartExElementStyle>> {
+    unresolved_chart_style_role_table_for_chart(style_root, resolver, image_resolver, false)
+}
+
+pub(super) fn unresolved_chart_style_role_table_for_chart(
+    style_root: Node,
+    resolver: &dyn ColorResolver,
+    image_resolver: &dyn ChartImageResolver,
+    chart_ex_role: bool,
+) -> Option<BTreeMap<String, ChartExElementStyle>> {
     let roles = style_root
         .children()
         .filter(|node| {
-            node.is_element() && CHART_STYLE_ROLE_NAMES.contains(&node.tag_name().name())
+            node.is_element()
+                && CHART_STYLE_ROLE_NAMES.contains(&node.tag_name().name())
+                // Inert classic data roles are dropped before any budget or
+                // palette expansion so a huge inert recipe cannot fail-close
+                // the roles that do paint.
+                && (chart_ex_role
+                    || !CLASSIC_INERT_LINKED_PAINT_ROLES.contains(&node.tag_name().name()))
         })
         .map(|role| {
             let sp_pr = child(role, "spPr");
@@ -2224,15 +2323,20 @@ pub(super) fn unresolved_chart_style_role_table(
             // line geometry and explicit indices survive a palette/aggregate
             // rejection. Paint ownership below is then restored even when the
             // representative recipe itself exceeded its per-recipe budget.
-            let mut style = parse_chartex_element_style(
+            let mut style = parse_chart_style_element(
                 role,
                 resolver,
                 None,
                 None,
                 image_resolver,
                 ChartImageSource::Style,
+                chart_ex_role,
             );
             if local_fill || fill_ref.is_some_and(|_| fill_index != Some(0)) {
+                style.fill_paint_authored = Some(true);
+            } else if fill_index == Some(0) && chart_ex_role && sp_pr.is_some() {
+                style.fill_hidden = Some(true);
+                style.fill_no_style = None;
                 style.fill_paint_authored = Some(true);
             } else if fill_index == Some(0) {
                 style.fill_no_style = Some(true);
@@ -2288,4 +2392,35 @@ pub(super) fn unreadable_chart_style_role_table() -> BTreeMap<String, ChartExEle
             )
         })
         .collect()
+}
+
+/// Linked Chart Style data roles that classic (`c:chartSpace`) series never
+/// consume. Observed in Office: PowerPoint showed identical paint with and
+/// without linked fill/line/width/`phClr` recipes for horizontal bar, stacked
+/// column, area, pie, doughnut, scatter, bubble, radar, stock (high-low-close,
+/// so `hiLoLine`), filled surface, 3-D column and column+line combination;
+/// Excel, Word and PowerPoint agree for clustered column and standard line.
+/// `upBar`, `downBar` and `dataPointWireframe` were NOT measured (no open-close
+/// stock, up/down-bar or wireframe-surface control): the rule is extended to
+/// them without direct evidence, as are effects and any Chart Colors influence
+/// on classic series paint through these roles. The whole role is dropped so no
+/// residue survives. The renderer applies the same rule to hand-built models
+/// (`withEffectiveChartStyleRoles`); every other role is untouched.
+pub(super) const CLASSIC_INERT_LINKED_PAINT_ROLES: [&str; 8] = [
+    "dataPoint",
+    "dataPoint3D",
+    "dataPointLine",
+    "dataPointMarker",
+    "dataPointWireframe",
+    "downBar",
+    "hiLoLine",
+    "upBar",
+];
+
+/// Remove the inert classic data roles entirely (effects included), so no
+/// residue such as an `effectRef idx=0` sentinel can gate direct formatting.
+pub(super) fn drop_classic_inert_linked_roles(roles: &mut BTreeMap<String, ChartExElementStyle>) {
+    for name in CLASSIC_INERT_LINKED_PAINT_ROLES {
+        roles.remove(name);
+    }
 }

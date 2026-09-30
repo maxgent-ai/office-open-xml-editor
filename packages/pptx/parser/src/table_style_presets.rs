@@ -942,7 +942,7 @@ pub fn lookup_builtin_table_style(
     } else {
         Some(*accent_u8)
     };
-    Some(match family {
+    let mut style = match family {
         Family::ThemedStyle1 => themed_style_1(theme, accent_idx),
         Family::ThemedStyle2 => themed_style_2(theme, accent_idx),
         Family::LightStyle1 => light_style_1(theme, accent_idx),
@@ -954,7 +954,14 @@ pub fn lookup_builtin_table_style(
         Family::MediumStyle4 => medium_style_4(theme, accent_idx),
         Family::DarkStyle1 => dark_style_1(theme, accent_idx),
         Family::DarkStyle2 => dark_style_2(theme, accent_idx),
-    })
+    };
+    // Every built-in PowerPoint table style's wholeTbl text references the
+    // theme minor font (`<a:tcTxStyle><a:fontRef idx="minor">`): each copy of a
+    // built-in style that PowerPoint wrote into a deck's tableStyles.xml does,
+    // and an un-copied Medium Style 2 cell rendered in the master's minor font
+    // (issue #1620).
+    style.whole_tbl.text.font = Some("+mn-lt".to_owned());
+    Some(style)
 }
 
 #[cfg(test)]

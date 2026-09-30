@@ -753,7 +753,7 @@ pub(crate) fn load_sheet_charts_with_theme_images(
                             session: context.session,
                             visibility_cache: HashMap::new(),
                         });
-                let chart_context = ooxml_common::chart::ChartParseContext::new(
+                let mut chart_context = ooxml_common::chart::ChartParseContext::new(
                     &resolver,
                     related_parts.style_xml.as_deref(),
                     related_parts.color_style_xml.as_deref(),
@@ -762,6 +762,7 @@ pub(crate) fn load_sheet_charts_with_theme_images(
                         resolver as &mut dyn ooxml_common::chart::ChartReferenceResolver
                     }),
                 );
+                chart_context.host = ooxml_common::chart::ChartHost::Excel;
                 let chart_opt = if is_chartex {
                     ooxml_common::chart::parse_chartex_part(
                         chart_doc.root_element(),
@@ -2090,6 +2091,10 @@ mod chartex_tests {
     /// → `charts/chartEx1.xml` chain Excel uses, including the Microsoft
     /// `.../2014/relationships/chartEx` relationship type.
     fn archive_with_chartex_chart() -> crate::XlsxZip {
+        archive_with_chartex_part(&waterfall_chartex_xml())
+    }
+
+    fn archive_with_chartex_part(chartex_xml: &str) -> crate::XlsxZip {
         let mut buf = Vec::new();
         {
             let mut zw = zip::ZipWriter::new(Cursor::new(&mut buf));
@@ -2107,7 +2112,7 @@ mod chartex_tests {
             zw.write_all(br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdChart" Type="http://schemas.microsoft.com/office/2014/relationships/chartEx" Target="../charts/chartEx1.xml"/></Relationships>"#).unwrap();
 
             zw.start_file("xl/charts/chartEx1.xml", o).unwrap();
-            zw.write_all(waterfall_chartex_xml().as_bytes()).unwrap();
+            zw.write_all(chartex_xml.as_bytes()).unwrap();
 
             zw.start_file("xl/charts/_rels/chartEx1.xml.rels", o)
                 .unwrap();
@@ -2227,6 +2232,47 @@ mod chartex_tests {
             Some(ooxml_common::chart::ChartStyleFill::Image { image_path, .. })
                 if image_path == "xl/media/theme-marker.png"
         ));
+    }
+
+    /// The Excel adapter must pass `ChartHost::Excel`: Excel keeps only the
+    /// first clustered column and drops the unowned Pareto line's percentage
+    /// axis, unlike the PowerPoint/Word and host-neutral policies.
+    #[test]
+    fn excel_adapter_passes_its_chartex_host() {
+        let xml = r#"<cx:chartSpace xmlns:cx="http://schemas.microsoft.com/office/drawing/2014/chartex">
+          <cx:chartData>
+            <cx:data id="0"><cx:strDim type="cat"><cx:lvl ptCount="2"><cx:pt idx="0">A</cx:pt><cx:pt idx="1">B</cx:pt></cx:lvl></cx:strDim><cx:numDim type="val"><cx:lvl ptCount="2"><cx:pt idx="0">3</cx:pt><cx:pt idx="1">5</cx:pt></cx:lvl></cx:numDim></cx:data>
+            <cx:data id="1"><cx:strDim type="cat"><cx:lvl ptCount="2"><cx:pt idx="0">X</cx:pt><cx:pt idx="1">Y</cx:pt></cx:lvl></cx:strDim><cx:numDim type="val"><cx:lvl ptCount="2"><cx:pt idx="0">8</cx:pt><cx:pt idx="1">12</cx:pt></cx:lvl></cx:numDim></cx:data>
+          </cx:chartData>
+          <cx:chart><cx:plotArea><cx:plotAreaRegion>
+            <cx:series layoutId="clusteredColumn"><cx:dataId val="0"/></cx:series>
+            <cx:series layoutId="clusteredColumn"><cx:dataId val="1"/></cx:series>
+            <cx:series layoutId="paretoLine"><cx:dataId val="0"/><cx:axisId val="2"/></cx:series>
+          </cx:plotAreaRegion>
+            <cx:axis id="0"><cx:catScaling/></cx:axis>
+            <cx:axis id="1"><cx:valScaling/></cx:axis>
+            <cx:axis id="2"><cx:valScaling min="0" max="1"/><cx:units unit="percentage"/><cx:tickLabels/></cx:axis>
+          </cx:plotArea></cx:chart>
+        </cx:chartSpace>"#;
+        let mut archive = archive_with_chartex_part(xml);
+        let charts = load_sheet_charts_with_theme_images(
+            &mut archive,
+            "worksheets/sheet1.xml",
+            None,
+            &theme(),
+            (None, None),
+            None,
+            &ooxml_common::chart::ChartImageRelationships::default(),
+        );
+        assert_eq!(charts.len(), 1);
+        let chart = &charts[0].chart;
+        let columns = chart
+            .series
+            .iter()
+            .filter(|series| series.series_type.as_deref() != Some("line"))
+            .count();
+        assert_eq!(columns, 1);
+        assert_eq!(chart.chartex_show_unpaired_percentage_axis, None);
     }
 
     #[test]

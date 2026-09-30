@@ -7,6 +7,26 @@ function series(values: Array<number | null>): ChartSeries {
 }
 
 describe('planParetoLayout', () => {
+  it('uses aggregated display values for the cumulative owner line', () => {
+    const layout = planParetoLayout(series([15, 23, 7, 9, 4]), ['A', 'B', 'C', 'D', 'E']);
+    expect(layout.orderedSeries.values).toEqual([23, 15, 9, 7, 4]);
+    expect(layout.categories).toEqual(['B', 'A', 'D', 'C', 'E']);
+    expect(layout.series.values.map(value => Math.round((value ?? 0) * 10000) / 100))
+      .toEqual([39.66, 65.52, 81.03, 93.1, 100]);
+  });
+
+  it('keeps an unvalued trailing category as a separate tick and flat line endpoint', () => {
+    const layout = planParetoLayout(
+      series([15, 23, 7, 9, 4, null]),
+      ['A', 'B', 'C', 'D', '', 'E'],
+      { keepUnvaluedCategories: true },
+    );
+    expect(layout.categories).toEqual(['B', 'A', 'D', 'C', '', 'E']);
+    expect(layout.orderedSeries.values).toEqual([23, 15, 9, 7, 4, null]);
+    expect(layout.series.values.map(value => Math.round((value ?? 0) * 10000) / 100))
+      .toEqual([39.66, 65.52, 81.03, 93.1, 100, 100]);
+  });
+
   it('can retain authored order for a standalone paretoLine', () => {
     const layout = planParetoLayout(
       series([4, 8, 6, 4]),
@@ -16,6 +36,22 @@ describe('planParetoLayout', () => {
 
     expect(layout.points.map(point => point.sourceIndex)).toEqual([0, 1, 2, 3]);
     expect(layout.series.values).toEqual([4 / 22, 12 / 22, 18 / 22, 1]);
+  });
+
+  it('normalises by the maximum when authored order does not start at the maximum', () => {
+    const layout = planParetoLayout(series([0, 10, 20]), ['A', 'B', 'C'], { sortDescending: false });
+    expect(layout.series.values).toEqual([0, 1 / 3, 1]);
+  });
+
+  it('keeps fractions finite for huge magnitudes in authored order', () => {
+    const big = Number.MAX_VALUE;
+    const layout = planParetoLayout(series([big / 4, big, big / 2]), ['A', 'B', 'C'], {
+      sortDescending: false,
+    });
+    expect(layout.series.values.every(value => Number.isFinite(value ?? NaN))).toBe(true);
+    expect(layout.series.values[0]).toBeCloseTo(1 / 7, 12);
+    expect(layout.series.values[1]).toBeCloseTo(5 / 7, 12);
+    expect(layout.series.values[2]).toBe(1);
   });
 
   it('sorts descending, preserves tie source order, and omits invalid values', () => {

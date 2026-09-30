@@ -315,6 +315,7 @@ export interface ChartexHistogramBinning {
     intervalClosed?: 'l' | 'r' | null;
     underflow?: number | null;
     overflow?: number | null;
+    edgeFormatCode?: string | null;
 }
 export interface ChartexRegionMap {
     rows: ChartexRegionMapRow[];
@@ -660,6 +661,13 @@ export interface ChartModel {
     chartexTreemap?: ChartexTreemap | null;
     chartexRegionMap?: ChartexRegionMap | null;
     chartexHistogramBinning?: ChartexHistogramBinning | null;
+    chartexParetoOwnerIndex?: number | null;
+    chartexParetoSortDescending?: boolean | null;
+    chartexParetoFlatEndpoint?: boolean | null;
+    chartexSuppressGeometry?: boolean | null;
+    chartexParetoOutlineOwner?: boolean | null;
+    chartexPrimaryAxisRight?: boolean | null;
+    chartexShowUnpairedPercentageAxis?: boolean | null;
     chartexAccents?: string[] | null;
     chartexColorPalette?: Array<string | null> | null;
     chartexColorStyleMethod?: string | null;
@@ -1397,6 +1405,8 @@ export interface OpenedModelSource<TArchive> {
 export function openExternalHyperlink(url: string, allowed?: readonly string[], win?: Pick<Window, 'open'> | undefined): boolean;
 export interface Paragraph extends Paragraph__emitterCollision1 {
     eaLnBrk: boolean;
+    fontAlgn?: 't' | 'ctr' | 'b';
+    endFaceAuthored?: boolean;
     defTabSz?: number;
 }
 interface Paragraph__emitterCollision1 {
@@ -2091,6 +2101,7 @@ export interface TabStop {
 export interface TextBody extends TextBody__emitterCollision1 {
     rtlCol?: boolean;
     spcFirstLastPara?: boolean;
+    compatLnSpc?: boolean;
     textWarp?: {
         preset: string;
         adj?: number[];

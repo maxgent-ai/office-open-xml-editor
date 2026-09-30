@@ -11,10 +11,11 @@ use crate::fill::{
     parse_style_matrix_effects, parse_style_matrix_fill_from_source, parse_table_style_fill,
     parse_xfrm, EffectLst,
 };
-use crate::master::{InheritedShapeGeometry, LayoutPlaceholders};
+use crate::master::{DefaultTextLevels, InheritedShapeGeometry, LayoutPlaceholders};
 use crate::text::{
-    empty_level_bullets, parse_text_body, InheritedBodyPr, LevelBullets, LevelFontSizes,
-    LevelIndents,
+    complete_level_faces, complete_level_sizes, empty_level_bullets, parse_text_body,
+    resolve_latin_face, InheritedBodyPr, LevelBullets, LevelFaces, LevelFontSizes, LevelIndents,
+    LevelRunProperties, HARD_DEFAULT_LATIN_FACE,
 };
 use crate::theme::{PptxRawSchemeResolver, PptxSchemeResolver, PptxThemeSource};
 use crate::types::*;
@@ -1008,6 +1009,19 @@ pub(crate) fn parse_shape(
     // cy=0 means "auto-height" for body-text shapes, but connector-type
     // geometries (line, *Connector*) legitimately use cy=0 to represent
     // a perfectly horizontal segment — don't inflate their height.
+    // A shape without text has nothing to grow for either: PowerPoint draws
+    // a zero-height rectangle as a horizontal rule (its top and bottom edges
+    // coincide), so inflating it would paint a tall outlined box instead.
+    let has_text = child(sp_node, "txBody").is_some_and(|text_body| {
+        text_body.descendants().any(|node| {
+            node.is_element()
+                && match node.tag_name().name() {
+                    "t" => node.text().is_some_and(|text| !text.is_empty()),
+                    "fld" => true,
+                    _ => false,
+                }
+        })
+    });
     let is_connector_geom = matches!(
         geometry.as_str(),
         "line"
@@ -1021,7 +1035,7 @@ pub(crate) fn parse_shape(
             | "curvedConnector4"
             | "curvedConnector5"
     );
-    let cy = if t.cy == 0 && !is_connector_geom {
+    let cy = if t.cy == 0 && has_text && !is_connector_geom {
         if is_bottom_anchor {
             0_i64
         } else {
@@ -1057,7 +1071,7 @@ pub(crate) fn parse_shape(
         .and_then(|s| child(s, "fontRef"))
         .and_then(|fr| parse_color_node(fr, theme))
         .or_else(|| {
-            if ph_node.is_some() {
+            if ph_node.is_some() && !lph.is_list_style_cut(&ph_type, ph_idx) {
                 lph.lookup_color(&ph_type, ph_idx)
             } else {
                 None
@@ -1109,50 +1123,88 @@ pub(crate) fn parse_shape(
     };
     let stroke = merge_local_stroke(sp_pr.and_then(|p| child(p, "ln")), inherited_stroke, theme);
 
+    // A placeholder bound to a layout slot without a txBody is cut off from
+    // the master list styles (`LayoutPlaceholders::is_list_style_cut`): its
+    // text takes only its own formatting and the hard defaults.
+    let placeholder_inherits = ph_node.is_some() && !lph.is_list_style_cut(&ph_type, ph_idx);
+
     // Inherited defaults from layout/master for this placeholder type/idx
     let (
-        inherited_font_size,
-        inherited_font_family,
         inherited_bold,
         inherited_italic,
         inherited_caps,
         inherited_reflection,
-        inherited_anchor,
-        inherited_body_pr,
         inherited_alignment,
         inherited_ea_ln_brk,
-        inherited_space_before,
-        inherited_space_after,
-        inherited_line_spacing,
-    ) = if ph_node.is_some() {
+        inherited_font_algn,
+        inherited_spacing,
+    ) = if placeholder_inherits {
         (
-            lph.lookup_font_size(&ph_type, ph_idx),
-            lph.lookup_font_family(&ph_type, ph_idx),
-            lph.lookup_bold(&ph_type),
-            lph.lookup_italic(&ph_type),
-            lph.lookup_caps(&ph_type),
-            lph.lookup_reflection(&ph_type),
+            lph.lookup_bold(&ph_type, ph_idx),
+            lph.lookup_italic(&ph_type, ph_idx),
+            lph.lookup_caps(&ph_type, ph_idx),
+            lph.lookup_reflection(&ph_type, ph_idx),
+            lph.lookup_alignment(&ph_type, ph_idx),
+            lph.lookup_ea_ln_brk(&ph_type, ph_idx),
+            lph.lookup_font_algn(&ph_type, ph_idx),
+            lph.lookup_spacing(&ph_type, ph_idx),
+        )
+    } else {
+        (None, None, None, None, None, None, None, Default::default())
+    };
+    // Shape-level bodyPr values are not list-style properties; a placeholder
+    // keeps them even when its layout slot has no txBody.
+    let (inherited_anchor, inherited_body_pr) = if ph_node.is_some() {
+        (
             lph.lookup_anchor(&ph_type, ph_idx),
             lph.lookup_body_pr(&ph_type, ph_idx),
-            lph.lookup_alignment(&ph_type, ph_idx),
-            lph.lookup_ea_ln_brk(&ph_type),
-            lph.lookup_space_before(&ph_type, ph_idx),
-            lph.lookup_space_after(&ph_type, ph_idx),
-            lph.lookup_line_spacing(&ph_type, ph_idx),
         )
     } else {
-        (
-            None, None, None, None, None, None, None, None, None, None, None, None, None,
-        )
+        (None, None)
     };
-    let inherited_level_font_sizes: LevelFontSizes = if ph_node.is_some() {
-        lph.lookup_level_font_sizes(&ph_type, ph_idx)
+    // Latin face and size per list level, each ending at the hard default
+    // (Arial 18 pt) so no level falls back to the level-1 value or to a
+    // renderer-side theme font (issue #1620):
+    //   placeholder: layout slot → master placeholder → class style
+    //                (titleStyle / bodyStyle / defaultTextStyle);
+    //   ordinary shape: p:style fontRef (face only) → defaultTextStyle.
+    // The shape's own lstStyle, the paragraph defRPr and the run are applied
+    // over these in parse_text_body.
+    let (chain_faces, chain_sizes): (LevelFaces, LevelFontSizes) = if ph_node.is_some() {
+        if placeholder_inherits {
+            (
+                lph.lookup_level_faces(&ph_type, ph_idx),
+                lph.lookup_level_font_sizes(&ph_type, ph_idx),
+            )
+        } else {
+            (LevelFaces::default(), [None; 9])
+        }
     } else {
-        [None; 9]
+        // DrawingML §20.1.4.2.10: a shape style's fontRef names the theme
+        // major/minor collection (idx none names none). Observed (#1620): a
+        // text box's defaultTextStyle face yields to fontRef minor/major, and
+        // fontRef none leaves the defaultTextStyle face; sizes still come from
+        // defaultTextStyle.
+        let style_face = style_node
+            .and_then(|s| child(s, "fontRef"))
+            .and_then(|fr| attr(&fr, "idx"))
+            .and_then(|idx| match idx.as_str() {
+                "major" => resolve_latin_face("+mj-lt", theme),
+                "minor" => resolve_latin_face("+mn-lt", theme),
+                _ => None,
+            });
+        let faces = match style_face {
+            Some(face) => std::array::from_fn(|_| Some(face.clone())),
+            None => lph.default_text.faces.clone(),
+        };
+        (faces, lph.default_text.sizes)
     };
+    let inherited_level_faces = complete_level_faces(&chain_faces);
+    let inherited_level_font_sizes = complete_level_sizes(&chain_sizes);
+    let inherited_font_size = inherited_level_font_sizes[0];
     // Per-level paragraph indents (marL/marR/indent) a paragraph inherits when it
     // omits them (ECMA-376 §21.1.2.4.13): the layout/master placeholder cascade.
-    let inherited_level_indents: LevelIndents = if ph_node.is_some() {
+    let inherited_level_indents: LevelIndents = if placeholder_inherits {
         lph.lookup_level_indents(&ph_type, ph_idx)
     } else {
         Default::default()
@@ -1160,12 +1212,12 @@ pub(crate) fn parse_shape(
 
     // Per-level bullets a paragraph inherits when it declares no explicit one
     // (ECMA-376 §19.7.10): the layout/master placeholder cascade for this slot.
-    let inherited_level_bullets: LevelBullets = if ph_node.is_some() {
+    let inherited_level_bullets: LevelBullets = if placeholder_inherits {
         lph.lookup_level_bullets(&ph_type, ph_idx)
     } else {
         empty_level_bullets()
     };
-    let inherited_level_colors = if ph_node.is_some()
+    let inherited_level_colors = if placeholder_inherits
         && style_node
             .and_then(|style| child(style, "fontRef"))
             .is_none()
@@ -1174,7 +1226,7 @@ pub(crate) fn parse_shape(
     } else {
         std::array::from_fn(|_| None)
     };
-    let inherited_level_run_properties = if ph_node.is_some() {
+    let chain_run_properties: LevelRunProperties = if placeholder_inherits {
         let levels = lph.lookup_level_run_properties(&ph_type, ph_idx);
         if style_node
             .and_then(|style| child(style, "fontRef"))
@@ -1187,6 +1239,19 @@ pub(crate) fn parse_shape(
     } else {
         std::array::from_fn(|_| Default::default())
     };
+    // The resolved chain is authoritative for the Latin face and size of every
+    // level; the other character properties keep their own cascade.
+    let inherited_level_run_properties: LevelRunProperties = {
+        let mut level = 0;
+        chain_run_properties.map(|props| {
+            let resolved = props.with_chain_face_and_size(
+                inherited_level_faces[level].clone(),
+                inherited_level_font_sizes[level],
+            );
+            level += 1;
+            resolved
+        })
+    };
     let text_body = child(sp_node, "txBody").map(|n| {
         parse_text_body(
             n,
@@ -1194,7 +1259,6 @@ pub(crate) fn parse_shape(
             rels,
             source_dir,
             inherited_font_size,
-            inherited_font_family,
             inherited_level_font_sizes,
             inherited_level_colors,
             inherited_level_run_properties,
@@ -1208,9 +1272,16 @@ pub(crate) fn parse_shape(
             inherited_body_pr,
             inherited_alignment,
             inherited_ea_ln_brk,
-            inherited_space_before,
-            inherited_space_after,
-            inherited_line_spacing,
+            inherited_font_algn,
+            inherited_spacing,
+            // A placeholder paragraph that no list style indents starts at the
+            // inset (#1630: title levels 2-5); ordinary text takes its
+            // defaultTextStyle level.
+            if ph_node.is_some() {
+                [0; 9]
+            } else {
+                lph.default_text.mar_l
+            },
             zip,
         )
     });
@@ -1749,10 +1820,25 @@ pub(crate) fn parse_table_styles_xml(
             let Some(text) = child(role, "tcTxStyle") else {
                 return TableTextStyle::default();
             };
+            // EG_ThemeableFontStyles: `fontRef` names the theme major/minor
+            // collection (idx none: no font); `font` carries its own faces.
+            let font = child(text, "fontRef")
+                .and_then(|font_ref| attr(&font_ref, "idx"))
+                .and_then(|idx| match idx.as_str() {
+                    "major" => Some("+mj-lt".to_owned()),
+                    "minor" => Some("+mn-lt".to_owned()),
+                    _ => None,
+                })
+                .or_else(|| {
+                    child(text, "font")
+                        .and_then(|font| child(font, "latin"))
+                        .and_then(|latin| attr(&latin, "typeface"))
+                });
             TableTextStyle {
                 color: parse_color_node(text, theme),
                 bold: parse_on_off_default(attr(&text, "b")),
                 italic: parse_on_off_default(attr(&text, "i")),
+                font,
             }
         };
 
@@ -2032,6 +2118,31 @@ pub(crate) fn resolve_table_cell_style(
     resolved
 }
 
+/// Give every paragraph of a table cell a Latin face: the cell's own formatting
+/// (run, paragraph defRPr, lstStyle — already on the paragraph), else the table
+/// style's tcTxStyle face, else the presentation defaultTextStyle level, else
+/// the hard default. Observed (issue #1620): a cell of a built-in table style
+/// rendered in the master theme's minor font even when defaultTextStyle named
+/// another face.
+pub(crate) fn complete_table_cell_faces(
+    cell: &mut TableCell,
+    style_face: Option<&str>,
+    default_text: &DefaultTextLevels,
+) {
+    let Some(body) = cell.text_body.as_mut() else {
+        return;
+    };
+    for paragraph in &mut body.paragraphs {
+        if paragraph.def_font_family.is_none() {
+            let level = (paragraph.lvl as usize).min(8);
+            paragraph.def_font_family = style_face
+                .map(str::to_owned)
+                .or_else(|| default_text.faces[level].clone())
+                .or_else(|| Some(HARD_DEFAULT_LATIN_FACE.to_owned()));
+        }
+    }
+}
+
 /// Apply the resolved style below direct `tcPr` formatting. This separate step
 /// makes the precedence rule testable without constructing a complete package.
 pub(crate) fn apply_resolved_table_cell_style(
@@ -2080,6 +2191,7 @@ pub(crate) fn parse_table(
     theme_source: &(impl PptxThemeSource + ?Sized),
     rels: &HashMap<String, String>,
     source_dir: &str,
+    default_text: &DefaultTextLevels,
     zip: &mut PptxZip,
 ) -> Option<TableElement> {
     let theme = theme_source.colors();
@@ -2159,12 +2271,19 @@ pub(crate) fn parse_table(
             if let Some(s) = style {
                 let effective =
                     resolve_table_cell_style(s, style_flags, ri, ci, row_count, col_count);
+                let style_face = effective
+                    .text
+                    .font
+                    .as_deref()
+                    .and_then(|face| resolve_latin_face(face, theme));
+                complete_table_cell_faces(cell, style_face.as_deref(), default_text);
 
                 // Direct `tcPr` formatting is the final tier. The presence flags
                 // preserve an authored noFill/no-line, which is not equivalent to
                 // an omitted property inheriting the table style.
                 apply_resolved_table_cell_style(cell, effective);
             } else {
+                complete_table_cell_faces(cell, None, default_text);
                 // ── Fallback for built-in styles not defined in tableStyles.xml ──
                 // Approximate "Medium Style 2": accent1 header fill + thin outer box + row separators.
                 let thin = Stroke {
@@ -2274,7 +2393,9 @@ pub(crate) fn parse_table_cell(
             rels,
             source_dir,
             None,
-            None,
+            // Faces are completed after the table style is resolved
+            // (`complete_table_cell_faces`): the style tier sits between the
+            // cell's own formatting and defaultTextStyle.
             [None; 9],
             std::array::from_fn(|_| None),
             std::array::from_fn(|_| Default::default()),
@@ -2286,11 +2407,11 @@ pub(crate) fn parse_table_cell(
             None, // inherited_reflection
             anchor,
             text_insets,
-            None, // inherited_alignment
-            None, // inherited_ea_ln_brk
-            None, // inherited_space_before
-            None, // inherited_space_after
-            None, // inherited_line_spacing
+            None,                                  // inherited_alignment
+            None,                                  // inherited_ea_ln_brk
+            None,                                  // inherited_font_algn
+            Default::default(),                    // inherited_spacing
+            crate::text::DEFAULT_TEXT_STYLE_MAR_L, // implicit_mar_l
             zip,
         );
         // Table-cell text direction is authored on tcPr rather than txBody's
@@ -2390,17 +2511,27 @@ pub(crate) fn parse_table_cell(
 /// master decorations can be pre-computed once per cached master; `theme`,
 /// `rels`, `smartart_drawings`, and `part_dir` are the resolution context of the
 /// tree being walked. Appends to `out` (callers control ordering/gating).
+// The part's rels/drawings, its theme and the presentation defaultTextStyle
+// levels are independent inheritance inputs of the decorative shape tree.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn extract_decorative_shapes(
     root: roxmltree::Node<'_, '_>,
     part_dir: &str,
     rels: &HashMap<String, String>,
     smartart_drawings: &HashMap<String, String>,
     theme: &(impl PptxThemeSource + ?Sized),
+    default_text: &DefaultTextLevels,
     zip: &mut PptxZip,
     out: &mut Vec<SlideElement>,
 ) {
     if let Some(sp_tree) = child(root, "cSld").and_then(|n| child(n, "spTree")) {
-        let empty_lph = LayoutPlaceholders::default();
+        // Decorations are ordinary shapes: no placeholder inheritance, only the
+        // presentation defaultTextStyle levels (observed for master and layout
+        // text boxes, issue #1620).
+        let empty_lph = LayoutPlaceholders {
+            default_text: default_text.clone(),
+            ..LayoutPlaceholders::default()
+        };
         for node in sp_tree.children().filter(|n| n.is_element()) {
             parse_sp_tree_node(
                 node,
@@ -2536,6 +2667,7 @@ pub(crate) fn parse_sp_tree_node(
             slide_dir,
             rels,
             smartart_drawings,
+            &lph.default_text,
             zip,
             theme_source,
             out,
@@ -2948,11 +3080,15 @@ fn parse_pic_node(
 // CT_GroupShape (ECMA-376 Part 4, pml.xsd) can contain graphicFrame at every
 // level, but these large locals are needed only when visiting that leaf.
 #[inline(never)]
+// Same shape-tree context as parse_sp_tree_node, plus the defaultTextStyle
+// levels that table-cell text falls back to.
+#[allow(clippy::too_many_arguments)]
 fn parse_graphic_frame(
     node: roxmltree::Node<'_, '_>,
     slide_dir: &str,
     rels: &HashMap<String, String>,
     smartart_drawings: &HashMap<String, String>,
+    default_text: &DefaultTextLevels,
     zip: &mut PptxZip,
     theme_source: &(impl PptxThemeSource + ?Sized),
     out: &mut Vec<SlideElement>,
@@ -2966,7 +3102,15 @@ fn parse_graphic_frame(
         .descendants()
         .find(|n| n.is_element() && n.tag_name().name() == "tbl");
     if let Some(tbl_node) = tbl_node {
-        if let Some(mut table) = parse_table(tbl_node, &t, theme_source, rels, slide_dir, zip) {
+        if let Some(mut table) = parse_table(
+            tbl_node,
+            &t,
+            theme_source,
+            rels,
+            slide_dir,
+            default_text,
+            zip,
+        ) {
             table.id = own_cnv_pr(node).and_then(|cnv| attr(&cnv, "id"));
             out.push(SlideElement::Table(table));
         }
@@ -3444,6 +3588,54 @@ mod style_ref_tests {
             writer.finish().unwrap();
         }
         PptxZip::new(Cursor::new(bytes)).unwrap()
+    }
+
+    fn zero_height_rect_height(text_body: &str) -> i64 {
+        let xml = format!(
+            r#"<p:sp xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+                     xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+              <p:nvSpPr><p:cNvPr id="1" name="Rule"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr>
+              <p:spPr>
+                <a:xfrm><a:off x="731520" y="1737360"/><a:ext cx="1280160" cy="0"/></a:xfrm>
+                <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
+                <a:noFill/>
+                <a:ln w="25400"><a:solidFill><a:srgbClr val="C9A227"/></a:solidFill></a:ln>
+              </p:spPr>
+              {text_body}
+            </p:sp>"#
+        );
+        let doc = roxmltree::Document::parse(&xml).unwrap();
+        let mut zip = empty_zip();
+        parse_shape(
+            doc.root_element(),
+            &LayoutPlaceholders::default(),
+            &PptxTheme::default(),
+            &HashMap::new(),
+            "ppt/slides",
+            None,
+            &mut zip,
+        )
+        .expect("zero-height rect is drawn")
+        .height
+    }
+
+    #[test]
+    fn zero_height_rect_without_text_stays_a_rule() {
+        assert_eq!(zero_height_rect_height(""), 0);
+        assert_eq!(
+            zero_height_rect_height(
+                r#"<p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:endParaRPr/></a:p></p:txBody>"#
+            ),
+            0,
+            "an empty paragraph has nothing to grow for"
+        );
+        assert_eq!(
+            zero_height_rect_height(
+                r#"<p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:t>Caption</a:t></a:r></a:p></p:txBody>"#
+            ),
+            2_000_000,
+            "text keeps the auto-height fallback"
+        );
     }
 
     #[test]

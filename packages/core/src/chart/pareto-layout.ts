@@ -23,6 +23,8 @@ export interface ParetoLayout {
 export interface ParetoLayoutOptions {
   /** Owner-backed Pareto bars sort frequencies; a standalone paretoLine does not. */
   sortDescending?: boolean;
+  /** ChartEx aggregation preserves named categories lacking a numeric point. */
+  keepUnvaluedCategories?: boolean;
 }
 
 function remapIndexed<T extends { idx: number }>(
@@ -48,9 +50,10 @@ function reorderNullable<T>(
  * Derive a deterministic Pareto order without mutating the authored model.
  *
  * Finite non-negative values participate. Ties retain source order, missing or
- * invalid values are omitted, and a zero-total series produces finite zero
- * cumulative values. Indexed point/label properties follow their source point
- * through the reorder.
+ * invalid values are omitted from frequency points, and a zero-total series
+ * produces finite zero cumulative values. ChartEx can retain named category
+ * ticks with no value after those points. Indexed point/label properties follow
+ * their source point through the reorder.
  */
 export function planParetoLayout(
   series: ChartSeries,
@@ -68,7 +71,10 @@ export function planParetoLayout(
 
   // Normalize before summing so finite values near Number.MAX_VALUE cannot
   // overflow the denominator to Infinity and collapse early fractions to 0.
-  const scale = retained[0]?.value ?? 0;
+  // The scale is the maximum retained value: with authored (unsorted) order the
+  // first point need not be the largest, and a leading zero would zero every
+  // fraction.
+  const scale = retained.reduce((max, entry) => Math.max(max, entry.value), 0);
   const normalizedTotal = scale > 0
     ? retained.reduce((sum, entry) => sum + entry.value / scale, 0)
     : 0;
@@ -87,10 +93,26 @@ export function planParetoLayout(
     };
   });
   const sourceIndices = points.map(point => point.sourceIndex);
+  if (options.keepUnvaluedCategories) {
+    for (let index = 0; index < chartCategories.length; index++) {
+      if (series.values[index] == null && chartCategories[index] !== '') {
+        sourceIndices.push(index);
+      }
+    }
+  }
   const newIndexBySource = new Map(
     sourceIndices.map((sourceIndex, newIndex) => [sourceIndex, newIndex]),
   );
-  const categories = points.map(point => point.category);
+  const categories = sourceIndices.map(index => series.categories?.[index]
+    ?? chartCategories[index] ?? String(index + 1));
+  const values = sourceIndices.map(index => {
+    const value = series.values[index];
+    return value != null && Number.isFinite(value) && value >= 0 ? value : null;
+  });
+  const cumulative = [
+    ...points.map(point => point.cumulativeFraction),
+    ...sourceIndices.slice(points.length).map(() => points.at(-1)?.cumulativeFraction ?? 0),
+  ];
   const reordered = {
     ...series,
     categories,
@@ -112,11 +134,11 @@ export function planParetoLayout(
     categories,
     orderedSeries: {
       ...reordered,
-      values: points.map(point => point.value),
+      values,
     },
     series: {
       ...reordered,
-      values: points.map(point => point.cumulativeFraction),
+      values: cumulative,
     },
   };
 }

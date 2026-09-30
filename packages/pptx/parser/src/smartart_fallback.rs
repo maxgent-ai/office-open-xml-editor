@@ -275,6 +275,7 @@ pub(crate) fn emit_smartart_fallback(
             spc_col: 0,
             rtl_col: false,
             spc_first_last_para: false,
+            compat_ln_spc: None,
             text_warp: None,
         },
     )));
@@ -307,7 +308,6 @@ fn append_point_paragraphs(
         &empty_rels,
         "",
         None,
-        None,
         Default::default(),
         std::array::from_fn(|_| None),
         Default::default(),
@@ -321,9 +321,9 @@ fn append_point_paragraphs(
         None,
         None,
         None,
-        None,
-        None,
-        None,
+        None, // inherited_font_algn
+        Default::default(),
+        crate::text::DEFAULT_TEXT_STYLE_MAR_L, // inherited_spacing
         zip,
     );
     if default_font_size.is_none() {
@@ -377,6 +377,7 @@ fn emit_placeholder(gf_xfrm: &Transform, out: &mut Vec<SlideElement>) -> bool {
         spc_col: 0,
         rtl_col: false,
         spc_first_last_para: false,
+        compat_ln_spc: None,
         text_warp: None,
     };
     let mut shape = text_list_shape(gf_xfrm, body);
@@ -465,8 +466,10 @@ fn default_paragraph() -> Paragraph {
         def_tab_sz: None,
         rtl: false,
         ea_ln_brk: true,
+        font_algn: None,
         runs: Vec::new(),
         end_run_properties: None,
+        end_face_authored: false,
     }
 }
 

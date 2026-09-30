@@ -992,6 +992,14 @@ pub struct TextBody {
     #[serde(skip_serializing_if = "is_false")]
     #[serde(default)]
     pub spc_first_last_para: bool,
+    /// Effective `<a:bodyPr compatLnSpc>` (ECMA-376 §21.1.2.1.1) after the
+    /// slide → layout → master placeholder cascade. None when no level
+    /// authors it. Only `Some(false)` changes layout (see the renderer's
+    /// PowerPoint line model): PowerPoint renders an omitted value and `1`
+    /// identically.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub compat_ln_spc: Option<bool>,
     /// `<a:bodyPr><a:prstTxWarp>` — WordArt text warp (ECMA-376 §20.1.9.19).
     /// None when the body has no warp (the common case), so existing text bodies
     /// serialize byte-identically. When present the renderer maps each glyph
@@ -1156,11 +1164,23 @@ pub struct Paragraph {
     /// through the paragraph → body/list-style → layout/master cascade, mirroring
     /// `alignment`, so the renderer receives the effective value.
     pub ea_ln_brk: bool,
+    /// ECMA-376 §21.1.2.2.7 `<a:pPr fontAlgn>` after the paragraph →
+    /// body lstStyle → layout/master cascade (the same tiers as `ea_ln_brk`).
+    /// Only `"t"`, `"ctr"` and `"b"` are emitted: an omitted value, `"auto"`
+    /// and `"base"` lay out identically in PowerPoint (#1619 controls), so the
+    /// renderer treats `None` as baseline alignment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub font_algn: Option<String>,
     pub runs: Vec<TextRun>,
     /// Formatting at the insertion point after the last character.  It is
     /// never merged into existing a:r/a:fld runs (ECMA-376 §21.1.2.2.2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end_run_properties: Option<Box<TextRunData>>,
+    /// Whether `endParaRPr` authors its own latin face (`a:latin@typeface`).
+    /// Only such a face is known to join the paragraph's last line with text
+    /// (#1636 controls); an inherited one keeps the previous behaviour.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub end_face_authored: bool,
 }
 
 // serde-facing parser output enum; same rationale as SlideElement — the Text

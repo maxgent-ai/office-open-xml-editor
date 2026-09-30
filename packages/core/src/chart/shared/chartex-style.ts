@@ -364,7 +364,55 @@ export function resolveChartExPointFill(
 }
 
 
+/** Whether a resolved ChartEx outline carries a structured (gradient,
+ * pattern or picture) paint. */
+export function chartExLineIsStructured(line: ResolvedChartExLineStyle): boolean {
+  return line.paint != null && line.paint.fillType !== 'solid';
+}
+
+
+/** Drop a structured direct line paint from a ChartEx series or point
+ * carrier, keeping its geometry, so the paint falls through to the next layer
+ * (point → series → Chart Style roles → semantic colour).
+ *
+ * PowerPoint-observed (16.113, synthetic waterfall, histogram, Pareto,
+ * box-and-whisker, funnel, treemap and sunburst controls; `a:ln` gradFill
+ * linear 0°/90°, path rect, and pattFill): ChartEx never paints a structured
+ * line. Bodies whose style roles carry no line (waterfall bars, histogram and
+ * Pareto columns, funnel bars) end up unoutlined; line elements — waterfall
+ * connectors, box lines, the Pareto line — take their default solid colour at
+ * the authored width; a structured point line takes the series outline. */
+export function chartExSolidLineCarrier<T extends Partial<ChartExSeriesStyleCarrier>>(
+  carrier: T | null | undefined,
+  index: number,
+): T | null | undefined {
+  const style = carrier?.chartexStyle;
+  const decision = chartStyleLineDecision(style, index);
+  if (!carrier || !decision || decision.fillType === 'solid') return carrier;
+  return {
+    ...carrier,
+    lineColor: null,
+    lineHidden: null,
+    chartexStyle: {
+      ...style,
+      linePaints: null,
+      lineColors: null,
+      lineColorIndex: null,
+      linePaintAuthored: null,
+      lineHidden: null,
+    },
+  };
+}
+
+
 /** Resolve a ChartEx outline through ordered Chart Style role chains.
+ *
+ * Role-level structured line paint (a Chart Style role whose own `a:ln` is a
+ * gradient or pattern) is unmeasured in PowerPoint. This resolver reports it
+ * as-is; each family keeps its pre-existing behaviour (waterfall bars and
+ * ChartEx columns omit it, funnel/treemap/sunburst paint it, box lines and the
+ * Pareto line draw solid).
+ *
  * `paintRoles` are tried in order after the direct carrier until one supplies
  * line paint; `geometryRoles` supply `w`, dash, cap and join atoms the direct
  * `a:ln` omits (see the geometry-role selection below). A semantic-fallback
@@ -379,6 +427,9 @@ export function resolveChartExLineChain(
   fallbackColor: string,
   options: { linkedNoStyleFallback?: boolean } = {},
 ): ResolvedChartExLineStyle {
+  // A structured direct line paint is not an authored paint for ChartEx; its
+  // geometry stays and the paint falls through to the roles below.
+  carrier = chartExSolidLineCarrier(carrier, index);
   let line = resolveChartExSeriesLineStyle(
     chart, paintRoles[0], carrier, index, count, fallbackColor, options,
   );
@@ -397,7 +448,8 @@ export function resolveChartExLineChain(
   // dataPointLine role authors `cap="rnd"`. NoStyle (`lnRef idx=0`) affects
   // paint only, so geometry authored beside it still counts. A semantic
   // fallback outline takes geometry only from its paint roles: PowerPoint
-  // draws no data-point outline from dataPointLine alone (round 2 R02).
+  // draws no data-point outline from dataPointLine alone (a dataPointLine-only
+  // control paints no outline on a data point).
   const geometryCandidates = line.semanticFallback ? paintRoles : geometryRoles;
   const geometryRole = geometryCandidates.find(role => role != null && (
     role.lineWidthEmu != null || role.lineCap != null || role.lineJoin != null
@@ -444,6 +496,10 @@ export function resolveChartExPointLine(
   const geometryRoles = linkedStyle === chart.chartexDataPointStyle
     ? [linkedStyle, chart.chartexDataPointLineStyle]
     : [linkedStyle];
+  // A point's structured line paint falls through to the series outline
+  // (PowerPoint-observed: a gradient dataPt `a:ln` over a solid red series
+  // outline paints that bar red).
+  point = chartExSolidLineCarrier(point, index);
   if (!chartExPointAuthorsLine(point)) {
     return resolveChartExLineChain(
       chart, series, [linkedStyle], geometryRoles, index, count, fallbackColor, options,
@@ -565,6 +621,7 @@ export function chartExLegendSeries(
   fillColor: string,
   semanticNoStyleFallback = false,
   inheritPlotOutline = true,
+  bodyOmitsStructuredLine = false,
 ): ChartSeries {
   // Legend keys follow the same role chain as the plotted body so their
   // outline geometry (e.g. a dataPointLine 2.25 pt round rule) matches.
@@ -580,25 +637,91 @@ export function chartExLegendSeries(
     fillColor,
     { linkedNoStyleFallback: semanticNoStyleFallback },
   );
+  // The key follows its own body. Direct structured paint was already demoted
+  // by the role chain above. Role-level structured line paint (a Chart Style
+  // role whose own `a:ln` is a gradient or pattern) is unmeasured: each family
+  // keeps its pre-existing body behaviour, and only families whose body omits
+  // it (waterfall bars, ChartEx columns) ask the key to omit it too.
+  const outlined = inheritPlotOutline
+    && !(bodyOmitsStructuredLine && chartExLineIsStructured(line));
   return {
     name,
     values: [],
     color: fillColor.replace(/^#/, ''),
-    lineHidden: !inheritPlotOutline || !line.visible,
-    lineColor: inheritPlotOutline && line.visible ? line.color.replace(/^#/, '') : null,
+    lineHidden: !outlined || !line.visible,
+    lineColor: outlined && line.visible ? line.color.replace(/^#/, '') : null,
     // A visible authored outline without `w` is 0.75 pt on the body; give
     // the legend key the same default rather than the legend's 1 px rule.
-    lineWidthEmu: inheritPlotOutline
+    lineWidthEmu: outlined
       ? line.widthEmu ?? (line.visible && !line.semanticFallback
         ? CHARTEX_DEFAULT_LINE_WIDTH_EMU : null)
       : null,
     chartexStyle: {
-      linePaints: inheritPlotOutline && line.paint !== undefined ? [line.paint] : null,
-      linePaintAuthored: inheritPlotOutline && line.paint !== undefined ? true : null,
-      lineDash: inheritPlotOutline ? line.dash : null,
-      lineCustomDash: inheritPlotOutline ? line.customDash : null,
-      lineCap: inheritPlotOutline ? line.cap : null,
-      lineJoin: inheritPlotOutline ? line.join : null,
+      linePaints: outlined && line.paint !== undefined ? [line.paint] : null,
+      linePaintAuthored: outlined && line.paint !== undefined ? true : null,
+      lineDash: outlined ? line.dash : null,
+      lineCustomDash: outlined ? line.customDash : null,
+      lineCap: outlined ? line.cap : null,
+      lineJoin: outlined ? line.join : null,
     },
+  };
+}
+
+
+/** Channel multiplier PowerPoint applies to a box-and-whisker line whose
+ * paint comes from the linked dataPoint role and equals that role's own fill. */
+const CHARTEX_BOX_SELF_LINE_DARKEN = 0.8;
+
+
+/** Resolve the outline shared by every box-and-whisker line: the IQR box
+ * outline, whiskers and caps, median, mean line and mean marker.
+ *
+ * PowerPoint-observed (16.113, synthetic box-and-whisker controls):
+ * - paint and geometry come from the direct series `a:ln`, then the linked
+ *   `dataPoint` role's line; `dataPointLine` supplies no width (the default
+ *   is 0.75 pt, not its 2.25 pt), and structured direct paint falls through
+ *   (chartExSolidLineCarrier);
+ * - when the paint comes from the linked dataPoint role and that role's line
+ *   colour equals its own fill colour for the series index, every sRGB
+ *   channel is multiplied by 0.8 and rounded (156082 -> 114D68). Roles whose
+ *   line and fill colours differ are not darkened, and the comparison uses
+ *   the role colours, never a direct series fill. */
+export function resolveChartExBoxLine(
+  chart: ChartModel,
+  series: Partial<ChartExSeriesStyleCarrier> | null | undefined,
+  index: number,
+  count: number,
+  fallbackColor: string,
+): { line: ResolvedChartExLineStyle; darkened: boolean } {
+  const role = chart.chartexDataPointStyle;
+  const carrier = chartExSolidLineCarrier(series, index);
+  const line = resolveChartExPointLine(
+    chart, carrier, undefined, index, count, fallbackColor, role,
+    { linkedNoStyleFallback: true },
+  );
+  const directPaint = carrier != null && (
+    carrier.lineColor != null
+    || carrier.lineHidden === true
+    || chartStyleLineDecision(carrier.chartexStyle, index) !== undefined
+  );
+  const roleLine = chartStyleLineDecision(role, index);
+  const roleFill = chartStyleFillDecision(role, index);
+  if (
+    directPaint || !line.visible || line.paint != null
+    || roleLine?.fillType !== 'solid' || roleFill?.fillType !== 'solid'
+  ) {
+    return { line, darkened: false };
+  }
+  const normalize = (color: string): string => color.replace(/^#/, '').toUpperCase();
+  const lineHex = normalize(roleLine.color);
+  if (!/^[0-9A-F]{6}$/.test(lineHex) || lineHex !== normalize(roleFill.color)) {
+    return { line, darkened: false };
+  }
+  const channel = (offset: number): string => Math.round(
+    parseInt(lineHex.slice(offset, offset + 2), 16) * CHARTEX_BOX_SELF_LINE_DARKEN,
+  ).toString(16).padStart(2, '0');
+  return {
+    line: { ...line, color: `#${channel(0)}${channel(2)}${channel(4)}`.toUpperCase() },
+    darkened: true,
   };
 }

@@ -159,7 +159,9 @@ import { resolveTableBorderConflict } from './table-border-conflict.js';
 import { isSmartArtFallbackShape, smartArtFallbackTextColor } from './smartart-fallback-contrast';
 import { resolveTabWidths, type TabItem, type TabStopPx } from './tab-layout.js';
 import {
-  powerPointAscentShare, powerPointExactLinePoints, powerPointNaturalLine,
+  powerPointCompatOffNaturalLine, powerPointExactLinePoints, powerPointFaceMetrics,
+  powerPointNaturalLine, type PowerPointFaceMetrics,
+  POWERPOINT_FONT_ALGN_UNIT_PT, powerPointFontAlgnOffset, powerPointFontAlgnReference,
 } from './powerpoint-line-metrics.js';
 import { drawEaVertRun } from './vertical-text.js';
 import {
@@ -711,13 +713,19 @@ type LayoutSegment = {
   font: string;
   /** Inline DrawingML TAB, classified UAX#9 S during visual ordering (#916). */
   isTab?: true;
-  /** PowerPoint's ascent share for this segment's face (see
-   * powerPointAscentShare); undefined when the face is not resolvable. */
-  lineMetricShare?: number;
-  /** Share of the run's latin face. PowerPoint sizes a line by the run's
+  /** PowerPoint's line metrics for this segment's face (see
+   * powerPointFaceMetrics); undefined when the face is not resolvable. */
+  lineMetric?: PowerPointFaceMetrics;
+  /** Metrics of the run's latin face. PowerPoint sizes a line by the run's
    * latin face even when an East Asian segment draws none of its glyphs
    * (#1610 powerpoint-line-supplement-3); null when unresolved. */
-  lineMetricLatinShare?: number | null;
+  lineMetricLatin?: PowerPointFaceMetrics | null;
+  /** The face of an a:br or endParaRPr mark (text ''), kept so the mark can be
+   * re-sized to the run it follows (see `layoutParagraph`). */
+  markFace?: { family: string; bold: boolean; italic: boolean };
+  /** Baseline displacement of this segment under pPr@fontAlgn t / ctr / b,
+   * relative to the line's `metricAscent` (powerPointFontAlgnOffset). */
+  fontAlgnOffsetPx?: number;
   /** Reading-frame gap resolved against a:tabLst immediately before paint. */
   tabWidthPx?: number;
   sizePx: number;
@@ -1140,20 +1148,20 @@ export function buildFont(
 }
 
 /**
- * The PowerPoint line-metric share of a resolved family (see
- * powerPointAscentShare). A document-embedded face has its own bytes, which
- * the reference catalog does not describe, so it has no share, and neither
- * does a CSS generic family.
+ * The PowerPoint line metrics of a resolved family (see
+ * powerPointFaceMetrics). A document-embedded face has its own bytes, which
+ * the reference catalog does not describe, so it has none, and neither does
+ * a CSS generic family.
  */
-function lineMetricShareFor(
+function lineMetricFor(
   family: string,
   bold: boolean,
   italic: boolean,
   rc: RenderContext,
-): number | undefined {
+): PowerPointFaceMetrics | undefined {
   if (CSS_GENERIC_FAMILIES.has(family)) return undefined;
   if (rc.embeddedFontAuthoredFamilies?.has(family)) return undefined;
-  return powerPointAscentShare(family, bold, italic);
+  return powerPointFaceMetrics(family, bold, italic);
 }
 
 /**
@@ -1466,7 +1474,11 @@ export function layoutParagraph(
             text: '', sizePx, color: defaultColor,
             font: buildFont(bold, italic, sizePx, family, rc, ''),
             underline: false, strikethrough: false,
-            lineMetricShare: lineMetricShareFor(family, bold, italic, rc),
+            lineMetric: lineMetricFor(family, bold, italic, rc),
+            // Only a face the break authors itself is measured to size its line
+            // at the preceding run's size (#1636); an inherited face keeps the
+            // break's own size.
+            ...(run.fontFamily != null ? { markFace: { family, bold, italic } } : {}),
           }
         : undefined;
       input.push({ type: 'break', style });
@@ -1539,13 +1551,13 @@ export function layoutParagraph(
     // the selected font changes, leaving run seams and break policy to core.
     let group = '';
     let groupFont = '';
-    let groupShare: number | undefined;
-    const latinShare = lineMetricShareFor(family, bold, italic, rc) ?? null;
+    let groupShare: PowerPointFaceMetrics | undefined;
+    const latinShare = lineMetricFor(family, bold, italic, rc) ?? null;
     const emitGroup = () => {
       if (group) {
         input.push({ type: 'text', text: group,
-          style: { ...baseStyle, font: groupFont, lineMetricShare: groupShare,
-            lineMetricLatinShare: latinShare } });
+          style: { ...baseStyle, font: groupFont, lineMetric: groupShare,
+            lineMetricLatin: latinShare } });
       }
       group = '';
     };
@@ -1555,7 +1567,7 @@ export function layoutParagraph(
       const csGlyph = familyCs != null && (isComplexScriptCodePoint(ch.codePointAt(0) ?? 0)
         || INDIC_CS_GLYPH_RE.test(ch));
       let font = eaGlyph ? eaFont : csGlyph ? csFont : baseFont;
-      let share = lineMetricShareFor(eaGlyph ? familyEa : csGlyph ? familyCs : family, bold, italic, rc);
+      let share = lineMetricFor(eaGlyph ? familyEa : csGlyph ? familyCs : family, bold, italic, rc);
       if (/[\uf020-\uf0ff]/u.test(ch) && (familySym != null || isSymbolFontFamily(family))) {
         const symbolFamily = familySym ?? family;
         glyph = symbolFontToUnicode(ch, symbolFamily);
@@ -1590,8 +1602,8 @@ export function layoutParagraph(
     // runs drawn in the same face but carrying different latin slots must
     // stay apart, or the merged segment would drop one slot's share and a
     // purely visual difference (colour) would decide the line height.
-    && a.lineMetricShare === b.lineMetricShare
-    && a.lineMetricLatinShare === b.lineMetricLatinShare;
+    && a.lineMetric === b.lineMetric
+    && a.lineMetricLatin === b.lineMetricLatin;
   const marRPx = emuToPx(para.marR, scale);
   const broken = breakDrawingMlText(input, {
     maxWidth: maxWidthPx,
@@ -1624,19 +1636,36 @@ export function layoutParagraph(
         text: '', sizePx: endSizePx, color: defaultColor,
         font: buildFont(endBold, endItalic, endSizePx, endFamily, rc, ''),
         underline: false, strikethrough: false,
-        lineMetricShare: lineMetricShareFor(endFamily, endBold, endItalic, rc),
+        lineMetric: lineMetricFor(endFamily, endBold, endItalic, rc),
+        ...(para.endFaceAuthored ? { markFace: { family: endFamily, bold: endBold, italic: endItalic } } : {}),
       }
     : undefined;
-  return broken.map((line, lineIndex) => ({
-    // Office L07/L08: an empty line opened by a line feed inside a run keeps
-    // that run's size; a zero-width segment carries it to the line metrics.
-    segments: [
+  // A line-break or end-of-paragraph mark after text that authors its own face
+  // sizes its line with that face at the size of the run it follows, not at
+  // its own size (#1636 PowerPoint controls: a:br and endParaRPr at 16 / 40 /
+  // 80 pt after 24 pt and 60 pt runs, in the same or another face, both line
+  // models). A mark alone on its line keeps its own size (the empty-line rules
+  // above); a mark with an inherited face keeps the earlier behaviour.
+  const followingMark = (mark: LayoutSegment, lineSegments: readonly LayoutSegment[]): LayoutSegment => {
+    const previous = lineSegments[lineSegments.length - 1];
+    if (!previous || !mark.markFace || previous.sizePx === mark.sizePx) return { ...mark, text: '' };
+    const { family, bold, italic } = mark.markFace;
+    return {
+      ...mark, text: '', sizePx: previous.sizePx,
+      font: buildFont(bold, italic, previous.sizePx, family, rc, ''),
+    };
+  };
+  return broken.map((line, lineIndex): LayoutLine => {
+    const isLastLine = lineIndex === broken.length - 1;
+    const content: LayoutSegment[] = [
       // endParaRPr formats only the empty insertion line after the final
       // character/break (§21.1.2.2.2); it never replaces existing run paint.
-      ...(lineIndex === broken.length - 1 && line.segments.length === 0 && endStyle
+      ...(isLastLine && line.segments.length === 0 && endStyle
         ? [endStyle] : []),
+      // Office L07/L08: an empty line opened by a line feed inside a run keeps
+      // that run's size; a zero-width segment carries it to the line metrics.
       ...(line.segments.length === 0 && line.lineFeedRun !== undefined
-      && !(lineIndex === broken.length - 1 && endStyle)
+      && !(isLastLine && endStyle)
       && input[line.lineFeedRun]?.type === 'text'
       ? [{ ...(input[line.lineFeedRun] as { style: LayoutSegment }).style, text: '' }]
       : line.segments.map((part, index): LayoutSegment => {
@@ -1650,13 +1679,20 @@ export function layoutParagraph(
       if (part.type === 'tab') return { ...part.style, text: '', isTab: true, tabWidthPx: part.width };
       return { ...part.style, text: '' };
     })),
-      ...(line.endBreakRun !== undefined && input[line.endBreakRun]?.type === 'break'
-        && (input[line.endBreakRun] as { style?: LayoutSegment }).style
-        ? [{ ...(input[line.endBreakRun] as { style: LayoutSegment }).style, text: '' }]
-        : []),
-    ],
-    ...(line.endsWithBreak ? { endsWithBreak: true } : {}),
-  }));
+    ];
+    const breakStyle = line.endBreakRun !== undefined && input[line.endBreakRun]?.type === 'break'
+      ? (input[line.endBreakRun] as { style?: LayoutSegment }).style
+      : undefined;
+    const hasText = line.segments.length > 0;
+    return {
+      segments: [
+        ...content,
+        ...(breakStyle ? [hasText ? followingMark(breakStyle, content) : { ...breakStyle, text: '' }] : []),
+        ...(isLastLine && hasText && endStyle?.markFace ? [followingMark(endStyle, content)] : []),
+      ],
+      ...(line.endsWithBreak ? { endsWithBreak: true } : {}),
+    };
+  });
 }
 
 // ===== Element renderers =====
@@ -4419,7 +4455,7 @@ export function renderTextBody(
       // defaults like `defRPr sz="30000"` (300pt prompt-text marker) would
       // inflate lineHeight and push real 24pt runs far below the anchor.
       let maxSizePx = 0;
-      const metricRuns: { sizePx: number; share: number }[] = [];
+      const metricRuns: { sizePx: number; face: PowerPointFaceMetrics }[] = [];
       // Measure the fonts Canvas actually resolved (including browser
       // substitutions). A tall live font box is retained for containment under
       // spAutoFit, but PowerPoint does not repeat that box as the implicit
@@ -4437,15 +4473,15 @@ export function renderTextBody(
         if (effSize > maxSizePx) maxSizePx = effSize;
         if (seg.math) metricOk = false;
         else if (!seg.isTab) {
-          if (seg.lineMetricShare === undefined) metricOk = false;
-          else metricRuns.push({ sizePx: seg.sizePx, share: seg.lineMetricShare });
+          if (seg.lineMetric === undefined) metricOk = false;
+          else metricRuns.push({ sizePx: seg.sizePx, face: seg.lineMetric });
           // A run's latin face sizes its line even where an East Asian or
           // symbol segment draws no latin glyph; an unused ea or cs face does
           // not (#1610 supplements 2 and 3).
-          if (seg.lineMetricLatinShare === null) metricOk = false;
-          else if (seg.lineMetricLatinShare !== undefined
-            && seg.lineMetricLatinShare !== seg.lineMetricShare) {
-            metricRuns.push({ sizePx: seg.sizePx, share: seg.lineMetricLatinShare });
+          if (seg.lineMetricLatin === null) metricOk = false;
+          else if (seg.lineMetricLatin !== undefined
+            && seg.lineMetricLatin !== seg.lineMetric) {
+            metricRuns.push({ sizePx: seg.sizePx, face: seg.lineMetricLatin });
           }
         }
         if (!seg.math) {
@@ -4535,10 +4571,48 @@ export function renderTextBody(
       // whole points first.
       let metricAscent: number | undefined;
       let metricNaturalDescent: number | undefined;
+      // A percentage spcBef/spcAft is a fraction of one natural line: 1.2 ×
+      // size in the #1610 model, the natural box under compatLnSpc="0".
+      let pctSpacingUnit = naturalSingle;
+      // An explicit compatLnSpc="0" selects the #1604 natural box
+      // (powerPointCompatOffNaturalLine). Its face participation is the
+      // #1610 one (the run's own face and its latin face). A line with no
+      // glyph run has no measured box in that model, and neither has a face
+      // without Excel tables; either keeps the ordinary model for the body.
+      const compatOff = body.compatLnSpc === false;
+      if (metric && metricOk && compatOff
+        && (metricRuns.length === 0 || metricRuns.some((r) => r.face.excel === undefined))) {
+        metricOk = false;
+      }
+      // pPr@fontAlgn t / ctr / b (powerPointFontAlgnReference): the line box
+      // is split at its alignment reference and each glyph run is offset from
+      // it. A line without runs has nothing to align and keeps the baseline
+      // rule.
+      const fontAlgn = para.fontAlgn;
+      let alignedLine: { ascent: number; descent: number } | undefined;
+      if (metric && metricOk && fontAlgn && metricRuns.length > 0) {
+        const unitPx = POWERPOINT_FONT_ALGN_UNIT_PT * PT_TO_EMU * scale;
+        alignedLine = powerPointFontAlgnReference(fontAlgn, metricRuns, compatOff, unitPx);
+        if (!alignedLine) metricOk = false;
+        for (const seg of line.segments) {
+          if (!alignedLine) break;
+          if (seg.isTab || !seg.text) continue;
+          const offset = seg.lineMetric
+            && powerPointFontAlgnOffset(fontAlgn, { sizePx: seg.sizePx, face: seg.lineMetric }, compatOff, unitPx);
+          if (offset === undefined) {
+            metricOk = false;
+            break;
+          }
+          seg.fontAlgnOffsetPx = offset;
+        }
+      }
       if (metric && metricOk && !(measureOnly && !isSpAutoFit && !measureNaturalLineSpacing && !para.spaceLine)) {
-        const natural = metricRuns.length > 0
-          ? powerPointNaturalLine(metricRuns)
-          : { ascent: naturalSingle * 0.8, descent: naturalSingle * 0.2 };
+        const natural = alignedLine ?? (compatOff
+          ? powerPointCompatOffNaturalLine(metricRuns.map((r) => ({ sizePx: r.sizePx, box: r.face.excel! })))
+          : metricRuns.length > 0
+            ? powerPointNaturalLine(metricRuns.map((r) => ({ sizePx: r.sizePx, share: r.face.share })))
+            : { ascent: naturalSingle * 0.8, descent: naturalSingle * 0.2 });
+        if (compatOff) pctSpacingUnit = natural.ascent + natural.descent;
         const spacing = para.spaceLine?.type === 'pts'
           ? { type: 'pts' as const, val: powerPointExactLinePoints(para.spaceLine.val) }
           : para.spaceLine;
@@ -4560,10 +4634,10 @@ export function renderTextBody(
       // paragraph uses its first line for before and its last line for after.
       // Paint and table measurement use the same base.
       const lineSpaceAfterPx = isLast && para.spaceAfterPct != null
-        ? naturalSingle * (para.spaceAfterPct / 100000)
+        ? pctSpacingUnit * (para.spaceAfterPct / 100000)
         : spaceAfterPx;
       const lineSpaceBeforePx = isFirst && para.spaceBeforePct != null
-        ? naturalSingle * (para.spaceBeforePct / 100000)
+        ? pctSpacingUnit * (para.spaceBeforePct / 100000)
         : spaceBeforePx;
       // ECMA-376 §21.1.2.1.1 bodyPr@spcFirstLastPara (default false): the
       // first paragraph's space before and the last paragraph's space after
@@ -4886,9 +4960,14 @@ export function renderTextBody(
             resolvedFontAscent + Math.max(0, lineHeight - resolvedFontHeight) / 2,
           )
       : Math.max(lineHeight * 0.8, maxAscent);
-    const baseline = metricAscent !== undefined
+    // Under pPr@fontAlgn t / ctr / b, metricAscent is the line's alignment
+    // reference and each run sits at its own offset from it. A list marker
+    // follows the line's first run.
+    const referenceY = metricAscent !== undefined
       ? cursorY + metricAscent
       : cursorY + baselineOffset;
+    const baseline = referenceY
+      + (line.segments.find((seg) => !seg.isTab && !seg.math && !!seg.text)?.fontAlgnOffsetPx ?? 0);
 
     // Reading-frame marker placement under an RTL base (issue #930, same class as
     // the docx #830 / pptx #913 leading-edge mirroring). PowerPoint seats a list
@@ -5083,7 +5162,7 @@ export function renderTextBody(
       const drawSizePx = seg.drawSizePx ?? seg.sizePx;
       // baseline shift: OOXML baseline in thousandths of a point; positive = superscript (up)
       const baselineShift = seg.baseline ? -(seg.baseline / 100000) * seg.sizePx : 0;
-      const segBaseline = baseline + baselineShift;
+      const segBaseline = referenceY + (seg.fontAlgnOffsetPx ?? 0) + baselineShift;
       const glyphPaint = resolveSegmentTextPaint(ctx, seg, penX, segBaseline, scale);
       ctx.fillStyle = glyphPaint;
       const ls = seg.letterSpacingPx ?? 0;
