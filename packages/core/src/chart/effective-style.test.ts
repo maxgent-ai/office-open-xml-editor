@@ -166,26 +166,50 @@ describe('effective classic chart style cascade', () => {
     })).toEqual({ effectAuthored: true, effectUnsupported: true });
   });
 
-  it('adapts classic mark roles without replacing the source layers', () => {
+  it('drops linked data roles entirely from classic charts but keeps numeric paint and other roles', () => {
+    const shadow = { blurEmu: 1, distEmu: 1, dirDeg: 0, color: '000000' } as never;
     const chart = {
-      chartStyleRoles: { dataPoint: { fillColors: ['AAAAAA'] } },
+      chartType: 'clusteredBar',
+      series: [{ values: [1] }],
+      plotGroups: [{ kind: 'bar', seriesStart: 0, seriesCount: 1 }],
+      chartStyleRoles: {
+        dataPoint: { fillColors: ['AAAAAA'], lineColors: ['AAAAAA'], shadows: [shadow] },
+        dataPointLine: { lineColors: ['AAAAAA'], lineWidthEmu: 9525 },
+        legend: { fontColor: 'AAAAAA' },
+      },
       classicChartStyleRoles: {
         dataPoint: { fillColors: ['111111'], lineColors: ['222222'] },
         dataPointLine: { lineColors: ['333333'] },
       },
-    } as ChartModel;
+    } as unknown as ChartModel;
     const effective = withEffectiveChartStyleRoles(chart);
     expect(effective.chartStyleRoles?.dataPoint).toEqual({
-      fillColors: ['AAAAAA'], lineColors: ['222222'],
+      fillColors: ['111111'], lineColors: ['222222'],
     });
+    expect(effective.chartStyleRoles?.dataPointLine).toEqual({ lineColors: ['333333'] });
+    expect(effective.chartStyleRoles?.legend).toEqual({ fontColor: 'AAAAAA' });
     expect(effective.chartexDataPointStyle).toEqual(effective.chartStyleRoles?.dataPoint);
-    expect(effective.chartexDataPointLineStyle).toEqual(
-      effective.chartStyleRoles?.dataPointLine,
-    );
+    expect(effective.linkedChartStyleRoles?.dataPointLine).toBeUndefined();
+    expect(effective.linkedChartStyleRoles?.dataPoint).toBeUndefined();
     expect(effective.classicChartStyleRoles).toBe(chart.classicChartStyleRoles);
-    expect(effective.linkedChartStyleRoles).toBe(chart.chartStyleRoles);
     expect(withEffectiveChartStyleRoles(effective).chartStyleRoles)
       .toEqual(effective.chartStyleRoles);
+  });
+
+  it('never applies linked data-role paint to a classic chart without a numeric style', () => {
+    const effective = withEffectiveChartStyleRoles({
+      chartType: 'line',
+      series: [{ values: [1] }],
+      plotGroups: [{ kind: 'line', seriesStart: 0, seriesCount: 1 }],
+      chartStyleRoles: {
+        dataPointMarker: { fillColors: ['AAAAAA'] },
+        upBar: { fillColors: ['AAAAAA'] },
+        title: { fontColor: 'AAAAAA' },
+      },
+    } as unknown as ChartModel);
+    expect(effective.chartStyleRoles?.dataPointMarker).toBeUndefined();
+    expect(effective.chartStyleRoles?.upBar).toBeUndefined();
+    expect(effective.chartStyleRoles?.title).toEqual({ fontColor: 'AAAAAA' });
   });
 
   it('replaces raw classic linked aliases with linked-over-numeric adapters', () => {

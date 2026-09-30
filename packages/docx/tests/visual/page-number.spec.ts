@@ -1,43 +1,29 @@
 import { test, expect } from '@playwright/test';
 import { existsSync } from 'node:fs';
 
-// ECMA-376 §17.6.12 on REAL private samples, against Word PDF ground truth (measured
-// with pdftotext). Two shapes are covered:
+// ECMA-376 §17.6.12 on REAL private samples, against Word PDF ground truth
+// (measured with pdftotext on each sample's Word PDF). Both documents carry
+// `<w:pgNumType>` plus a footer PAGE field, and Word prints SEQUENTIAL footers:
 //
-// (1) NON-REGRESSION — sample-12/13 both carry `<w:pgNumType>` (sample-12: continuous
-//     start=1; sample-13: nextPage start=1 + a continuous start=2) plus a footer
-//     PAGE field, and Word prints SEQUENTIAL footers. No restart is VISIBLE:
-//     start=1 on the first section is the identity, and sample-13's continuous
-//     start=2 section begins exactly AT a page boundary (probed: its content first
-//     appears on physical page 2, the SAME page whose top it owns — see the module
-//     header of page-numbering.ts), so its restart fires with anchor offset 0 and
-//     shows start=2, which equals the natural continuation (1+1). The DISPLAYED
-//     footer number therefore equals the physical page number. (sample-14 also
-//     carries pgNumType but its footer shares the bottom band with other numeric
-//     content, so the position heuristic can't isolate it; its structure — nextPage
-//     start=1 on the first section — is covered deterministically by
-//     page-numbering.test.ts.)
+// - sample-12: one section with `w:fmt="numberInDash"`; Word prints -1- … -8-
+//   over 8 pages (the dashes are separate runs, so the page token is the digit).
+// - sample-1: nextPage section `w:start="1"`, then a continuous section with
+//   `w:start="2"`. The continuous section begins exactly AT a page boundary, so
+//   its restart shows 2, which equals the natural continuation; Word prints
+//   1 … 5 over 5 pages.
 //
-// (2) RESTART — sample-27 (synthesized for issue #804): section 1 → continuous break
-//     + `w:pgNumType w:start="50"` → section 2 sharing p.1 and spilling to p.2/p.3,
-//     footer PAGE. Word prints [Page 1, Page 51, Page 52]: the continuous section's
-//     series counts the SHARED page (its first appearance) as page 50, so its owned
-//     pages show 51 and 52. This is the case the pre-#804 code got wrong ([1, 50, 51]).
+// The displayed footer number therefore equals the physical page number. A
+// VISIBLE continuous restart (the #804 `w:start="50"` case, where the shared
+// page counts as the section's first page) is pinned deterministically in
+// page-number-field-render.test.ts.
 //
 // Skips gracefully when the (gitignored) sample is absent.
 const CASES: { file: string; pageCount: number; width: number; expected: string[] }[] = [
-  { file: 'private/sample-12', pageCount: 4, width: 595, expected: ['1', '2', '3', '4'] },
-  { file: 'private/sample-13', pageCount: 6, width: 595, expected: ['1', '2', '3', '4', '5'] },
-  // §17.6.12 continuous restart (#804): continuous start=50 shares p.1 and spills.
-  // The DISTINGUISHING signal is that the section's FIRST OWNED page shows 51 (not
-  // 50) — the shared page it does not own counts as the section's page 50. Word's
-  // PDF (public/private/docx/sample-27.pdf) is 3 pages [Page 1, Page 51, Page 52]; this
-  // renderer packs ~50 body paragraphs per page vs Word's ~46, so it fits section 2
-  // in ONE fewer page and shows [1, 51] over 2 pages. That page-DENSITY gap is a
-  // separate pagination-fidelity concern, out of scope for #804 — the RESTART
-  // semantics (51, not 50) are what this asserts. The full [1, 51, 52] series is
-  // pinned deterministically in page-number-field-render.test.ts.
-  { file: 'private/sample-27', pageCount: 2, width: 595, expected: ['1', '51'] },
+  {
+    file: 'private/docx/sample-12', pageCount: 8, width: 595,
+    expected: ['1', '2', '3', '4', '5', '6', '7', '8'],
+  },
+  { file: 'private/docx/sample-1', pageCount: 5, width: 595, expected: ['1', '2', '3', '4', '5'] },
 ];
 
 test.describe('page-number restart non-regression (§17.6.12)', () => {

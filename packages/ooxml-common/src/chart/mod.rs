@@ -118,6 +118,25 @@ use style::*;
 #[cfg(test)]
 mod tests;
 
+/// Host application whose ChartEx layout policy a chart part follows. Office
+/// applications lay out the same ChartEx part differently (for example Pareto
+/// series retention and ordering), so the parsing host must be named.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChartHost {
+    /// The caller did not name a host. Host-neutral: it applies the non-Excel
+    /// behaviour (all columns retained, PowerPoint-style ordering), but none of
+    /// the extras gated on a positive PowerPoint identity (currently the
+    /// unpaired percentage axis). Every shipped package sets its own host, so
+    /// this is only for hosts-agnostic callers and tests.
+    #[default]
+    Unspecified,
+    PowerPoint,
+    Excel,
+    /// Word follows the PowerPoint policy until Office-produced Word controls
+    /// are measured; `parse_chartex_impl` maps it in one place.
+    Word,
+}
+
 /// Package-owned sidecars and lookup hooks for one chart part. All fields are
 /// optional so callers only supply resources present in the host package.
 /// A color resolver is required to parse; omission returns `None`.
@@ -125,6 +144,7 @@ mod tests;
 /// while the parse entry point accepts a shared context reference.
 #[derive(Default)]
 pub struct ChartParseContext<'a> {
+    pub host: ChartHost,
     pub color_resolver: Option<&'a dyn ColorResolver>,
     pub style_xml: Option<&'a str>,
     pub color_style_xml: Option<&'a str>,
@@ -143,6 +163,7 @@ impl<'a> ChartParseContext<'a> {
         references: Option<&'a mut dyn ChartReferenceResolver>,
     ) -> Self {
         Self {
+            host: ChartHost::Unspecified,
             color_resolver: Some(color_resolver),
             style_xml,
             color_style_xml,
@@ -159,22 +180,26 @@ pub fn parse_chart_part(root: Node, context: &ChartParseContext<'_>) -> Option<C
 
 /// Parse a Microsoft chartEx part into the shared wire model.
 pub fn parse_chartex_part(root: Node, context: &ChartParseContext<'_>) -> Option<ChartModel> {
-    parse_part(root, context, parse_chartex_impl)
+    parse_part(
+        root,
+        context,
+        |root, resolver, style, colors, refs, images| {
+            parse_chartex_impl(root, resolver, style, colors, refs, images, context.host)
+        },
+    )
 }
-
-type ChartPartParser = fn(
-    Node<'_, '_>,
-    &dyn ColorResolver,
-    Option<&str>,
-    Option<&str>,
-    &mut dyn ChartReferenceResolver,
-    &dyn ChartImageResolver,
-) -> Option<ChartModel>;
 
 fn parse_part(
     root: Node,
     context: &ChartParseContext<'_>,
-    parser: ChartPartParser,
+    parser: impl FnOnce(
+        Node<'_, '_>,
+        &dyn ColorResolver,
+        Option<&str>,
+        Option<&str>,
+        &mut dyn ChartReferenceResolver,
+        &dyn ChartImageResolver,
+    ) -> Option<ChartModel>,
 ) -> Option<ChartModel> {
     let color_resolver = context.color_resolver?;
     let images = context.images.unwrap_or(&EmptyChartImageResolver);

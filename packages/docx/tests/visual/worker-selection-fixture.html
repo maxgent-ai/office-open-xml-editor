@@ -30,7 +30,13 @@
     // rounded boxes must match exactly.
     const layersOf = (host) => {
       const wrapper = host.querySelector('div'); // the viewer's positioned wrapper
-      return wrapper ? [...wrapper.children].filter((c) => c.tagName === 'DIV') : [];
+      // Exclude the viewer's page-loading status layer (role="status"): it is
+      // not an overlay and sits after the highlight layer in the wrapper.
+      return wrapper
+        ? [...wrapper.children].filter(
+            (c) => c.tagName === 'DIV' && c.getAttribute('role') !== 'status',
+          )
+        : [];
     };
     // Read RESOLVED pixel geometry (getBoundingClientRect), relative to the
     // wrapper's top-left, rather than parsing the inline `style.left` string.
@@ -40,7 +46,7 @@
     // zoom (page geometry px = pt × scale), which is what this spec asserts, and
     // is identical whether the CSS is px or %.
     const wrapperRect = (host) => host.querySelector('div').getBoundingClientRect();
-    // Wrapper stacking order: [canvas, textLayer, highlightLayer].
+    // Overlay order: [textLayer, highlightLayer].
     const serializeOverlay = (host) => {
       const layer = layersOf(host)[0];
       const spans = layer ? [...layer.querySelectorAll('span')] : [];

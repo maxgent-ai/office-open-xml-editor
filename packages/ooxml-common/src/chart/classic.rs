@@ -47,7 +47,7 @@ pub(super) fn parse_classic_impl(
     let style_palette = chart_style_color_palette
         .as_deref()
         .or(theme_style_palette.as_deref());
-    let chart_style_roles = if style_xml.is_some() && style_doc.is_none() {
+    let mut chart_style_roles = if style_xml.is_some() && style_doc.is_none() {
         Some(unreadable_chart_style_role_table())
     } else {
         style_doc.as_ref().and_then(|document| {
@@ -67,6 +67,9 @@ pub(super) fn parse_classic_impl(
             })
         })
     };
+    if let Some(roles) = chart_style_roles.as_mut() {
+        drop_classic_inert_linked_roles(roles);
+    }
     let marker_layout = style_doc
         .as_ref()
         .and_then(|document| child(document.root_element(), "dataPointMarkerLayout"));
@@ -3317,6 +3320,13 @@ pub(super) fn parse_classic_impl(
         chartex_treemap: None,
         chartex_region_map: None,
         chartex_histogram_binning: None,
+        chartex_pareto_owner_index: None,
+        chartex_pareto_sort_descending: None,
+        chartex_pareto_flat_endpoint: None,
+        chartex_suppress_geometry: None,
+        chartex_pareto_outline_owner: None,
+        chartex_primary_axis_right: None,
+        chartex_show_unpaired_percentage_axis: None,
         chartex_accents: None,
         chart_style_roles,
         classic_chart_style_roles,

@@ -320,6 +320,9 @@ pub fn apply_color_transforms(hex: &str, node: Node, tint_mode: TintMode) -> Str
         }
     }
 
+    // One nearest-byte rounding for every colour. Office's exact-.5 ties go
+    // either way (its internal fixed-point HSL arithmetic decides), so no
+    // tie rule is justified; a 1/255 residual is accepted.
     let r = (rf.clamp(0.0, 1.0) * 255.0).round() as u8;
     let g = (gf.clamp(0.0, 1.0) * 255.0).round() as u8;
     let b = (bf.clamp(0.0, 1.0) * 255.0).round() as u8;

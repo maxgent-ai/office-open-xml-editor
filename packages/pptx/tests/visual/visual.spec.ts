@@ -1,12 +1,14 @@
 import { test, expect } from '@playwright/test';
-import { mkdirSync, existsSync, readFileSync, readdirSync, writeFileSync } from 'fs';
+import { mkdirSync, existsSync, readFileSync, writeFileSync } from 'fs';
 import { PNG } from 'pngjs';
 import pixelmatch from 'pixelmatch';
 import {
-  captureOrComparePrivateItem,
-  clearPrivateCandidateItemOutput,
-  preparePrivateCorpus,
-  verifyPrivateItemManifest,
+  captureOrCompareSelfVrtItem,
+  clearSelfVrtCandidateOutput,
+  prepareSelfVrtCorpus,
+  selfVrtCorpusFiles,
+  selfVrtInputPath,
+  verifySelfVrtItemManifest,
 } from '../../../../tests/visual/private-corpus.mjs';
 
 test.afterEach(async ({ page }) => {
@@ -20,23 +22,15 @@ test.afterEach(async ({ page }) => {
   });
 });
 
-// ── Test targets ──────────────────────────────────────────────────────────────
-// Add entries here to include additional PPTX files.
-// Each entry needs:
-//   name       : filename stem (loads /{name}.pptx, reads references/{name}/)
-//   slideCount : number of slides to test (must have matching reference images)
+// ── Fidelity targets ──────────────────────────────────────────────────────────
+// Tracked demo decks with committed reference images (references/{name}/) and
+// fidelity scores (references/{name}/scores.json). Each entry needs:
+//   name       : public path stem (loads /{name}.pptx, reads references/{name}/)
+//   slideCount : exact slide count; it must equal the renderer's slide count
+// Regression (self-VRT) coverage is not listed here: `pnpm vrt` renders every
+// deck in public/demo/ and `pnpm vrt:private` every deck in
+// public/private/pptx/ against previous-renderer baselines.
 const PPTX_FILES: { name: string; slideCount: number }[] = [
-  { name: 'private/sample-1', slideCount: 5 },
-  { name: 'private/sample-2', slideCount: 17 },
-  { name: 'private/sample-3', slideCount: 21 },
-  { name: 'private/sample-4', slideCount: 6 },
-  { name: 'private/sample-5', slideCount: 16 },
-  { name: 'private/sample-6', slideCount: 13 },
-  { name: 'private/sample-7', slideCount: 2 },
-  { name: 'private/sample-8', slideCount: 1 },
-  { name: 'private/sample-9', slideCount: 2 },
-  { name: 'private/sample-10', slideCount: 5 },
-  { name: 'private/sample-11', slideCount: 3 },
   { name: 'demo/sample-1', slideCount: 9 },
 ];
 
@@ -44,25 +38,27 @@ const PPTX_FILES: { name: string; slideCount: number }[] = [
 // 0.20 absorbs font hinting / sub-pixel differences between PowerPoint and Canvas
 const PIXEL_THRESHOLD = 0.20;
 
-// Set to a number (e.g. 20) to fail the test when diff exceeds that percentage.
-// Set to null to always pass (report-only mode).
+// Fail the fidelity test when the diff against the reference exceeds this percentage.
 const FAIL_ABOVE_PCT = 20;
-const REGRESSION_PCT = 0.5;
 // Fidelity-score ratchet: fail if a slide's match-% vs its reference PNG drops
 // more than this below the committed score. Catches a renderer change that
 // quietly worsens fidelity against the PowerPoint ground truth even while
 // staying under the coarse FAIL_ABOVE_PCT ceiling.
 const RATCHET_DROP_PCT = 0.5;
 
-// UPDATE_REFS=1 pnpm vrt → adopt the current canvas output as the new reference.
-// Skips diff comparison and writes the screenshot straight into references/.
+// UPDATE_REFS=1 pnpm vrt:fidelity → adopt the current canvas output as the new
+// reference. Only with explicit user approval (see AGENTS.md).
 const UPDATE_REFS = process.env.UPDATE_REFS === '1';
-// UPDATE_SCORES=1 pnpm vrt → record the current fidelity match-% into
+// UPDATE_SCORES=1 pnpm vrt:fidelity → record the current fidelity match-% into
 // references/<name>/scores.json WITHOUT touching the reference PNGs. This is how
-// the committed demo scores are (re)generated; it never rewrites ground truth.
+// the committed demo scores are (re)generated from a clean latest-main checkout
+// (AGENTS.md); it never rewrites ground truth.
 const UPDATE_SCORES = process.env.UPDATE_SCORES === '1';
 const SNAPSHOT = process.env.VRT_SNAPSHOT === '1';
 const RUN_MODE = process.env.VRT_MODE === 'regression' ? 'regression' : 'fidelity';
+// `vrt` / `vrt:snapshot` run the self-VRT corpora; `vrt:fidelity` compares the
+// listed decks with their references. The two never share an oracle.
+const SELF_VRT = RUN_MODE === 'regression' || SNAPSHOT;
 
 // Per-sample fidelity scores live next to the reference PNGs
 // (references/<name>/scores.json), so they inherit the exact same commit policy:
@@ -89,9 +85,9 @@ function writeScore(name: string, key: string, matchPct: number): void {
   writeFileSync(scoresPathFor(name), JSON.stringify(ordered, null, 2) + '\n');
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
-test.describe('visual regression', () => {
-  for (const { name, slideCount } of PPTX_FILES) {
+// ── Fidelity tests ────────────────────────────────────────────────────────────
+test.describe('visual fidelity', () => {
+  for (const { name, slideCount } of SELF_VRT ? [] : PPTX_FILES) {
     for (let i = 0; i < slideCount; i++) {
       const slideNum = i + 1;
 
@@ -112,6 +108,14 @@ test.describe('visual regression', () => {
           throw new Error(`Fixture error on ${name} slide ${slideNum}: ${msg}`);
         }
 
+        const actualSlideCount = Number(await page.evaluate(() => document.body.dataset.slideCount));
+        if (actualSlideCount !== slideCount) {
+          throw new Error(
+            `${name}: the renderer reports ${actualSlideCount} slide(s) but PPTX_FILES declares ` +
+            `${slideCount}; keep the declared count exact so no slide goes unchecked.`
+          );
+        }
+
         // ── Capture the canvas via toDataURL ──────────────────────────────
         const dataUrl = await page.evaluate(() => {
           const canvas = document.querySelector('canvas') as HTMLCanvasElement;
@@ -130,20 +134,10 @@ test.describe('visual regression', () => {
           console.log(`  ${name} slide ${slideNum}: reference updated`);
           return;
         }
-        if (SNAPSHOT) {
-          mkdirSync(`tests/visual/baseline/${name}`, { recursive: true });
-          writeFileSync(`tests/visual/baseline/${name}/slide-${slideNum}.png`, actualBuf);
-          console.log(`  ${name} slide ${slideNum}: baseline captured`);
-          return;
-        }
 
-        const targetRoot = RUN_MODE === 'regression' ? 'baseline' : 'references';
-        const refPath = `tests/visual/${targetRoot}/${name}/slide-${slideNum}.png`;
+        const refPath = `tests/visual/references/${name}/slide-${slideNum}.png`;
         if (!existsSync(refPath)) {
-          if (RUN_MODE === 'regression') {
-            throw new Error(`missing regression baseline: ${refPath}`);
-          }
-          test.skip(true, `no ${targetRoot} image for ${name} slide ${slideNum}`);
+          throw new Error(`missing fidelity reference: ${refPath}`);
         }
         const refBuf = readFileSync(refPath);
         const refPng    = PNG.sync.read(refBuf);
@@ -152,12 +146,6 @@ test.describe('visual regression', () => {
         const { width: refW, height: refH } = refPng;
 
         if (actualPng.width !== refW || actualPng.height !== refH) {
-          if (RUN_MODE === 'regression') {
-            throw new Error(
-              `${name} slide ${slideNum}: regression dimensions changed from ` +
-              `${refW}×${refH} to ${actualPng.width}×${actualPng.height}`,
-            );
-          }
           console.error(
             `  ${name} slide ${slideNum}: size mismatch ` +
             `actual=${actualPng.width}×${actualPng.height} ` +
@@ -202,30 +190,27 @@ test.describe('visual regression', () => {
           `(${diffPixels.toLocaleString()} / ${totalPx.toLocaleString()} px)`
         );
 
-        // ── Optional hard failure ──────────────────────────────────────────
-        const limit = RUN_MODE === 'regression' ? REGRESSION_PCT : FAIL_ABOVE_PCT;
-        if (diffPct > limit) {
+        if (diffPct > FAIL_ABOVE_PCT) {
           throw new Error(
-            `${name} slide ${slideNum} pixel diff ${diffPct.toFixed(1)}% exceeds ` +
-            `${limit}% in ${RUN_MODE} mode`
+            `${name} slide ${slideNum} pixel diff ${diffPct.toFixed(1)}% exceeds ${FAIL_ABOVE_PCT}%`
           );
         }
 
-        // Fidelity-score ratchet (fidelity mode only; the regression mode above
-        // already gates against the captured baseline). UPDATE_SCORES rewrites
-        // the stored score; otherwise a committed score is a floor.
-        if (RUN_MODE === 'fidelity') {
-          const key = `slide-${slideNum}`;
-          if (UPDATE_SCORES) {
-            writeScore(name, key, matchPct);
-          } else {
-            const prior = readScores(name)[key];
-            if (prior !== undefined && matchPct < prior - RATCHET_DROP_PCT) {
-              throw new Error(
-                `${name} ${key} fidelity regressed: match ${matchPct.toFixed(2)}% ` +
-                `is >${RATCHET_DROP_PCT}pt below the recorded ${prior.toFixed(2)}%`
-              );
-            }
+        // Fidelity-score ratchet. UPDATE_SCORES rewrites the stored score;
+        // otherwise a committed score is a floor.
+        const key = `slide-${slideNum}`;
+        if (UPDATE_SCORES) {
+          writeScore(name, key, matchPct);
+        } else {
+          const prior = readScores(name)[key];
+          if (prior === undefined) {
+            throw new Error(`${name} ${key} has no recorded fidelity score in ${scoresPathFor(name)}`);
+          }
+          if (matchPct < prior - RATCHET_DROP_PCT) {
+            throw new Error(
+              `${name} ${key} fidelity regressed: match ${matchPct.toFixed(2)}% ` +
+              `is >${RATCHET_DROP_PCT}pt below the recorded ${prior.toFixed(2)}%`
+            );
           }
         }
       });
@@ -233,65 +218,80 @@ test.describe('visual regression', () => {
   }
 });
 
+// ── Self-VRT (previous-renderer regression) ───────────────────────────────────
+// Every deck of a corpus is rendered completely and compared pixel-for-pixel
+// with the previous renderer's images, bound by manifest to
+// VRT_BASELINE_REVISION. `demo` runs under `pnpm vrt`; `private` under
+// `pnpm vrt:private` (VRT_PRIVATE_CORPUS=1).
+type SelfVrtCorpus = 'demo' | 'private';
+
+function describeSelfRegression(title: string, corpus: SelfVrtCorpus, files: string[]): void {
+  test.describe(title, () => {
+    if (corpus === 'demo' && files.length > 0) {
+      test.beforeAll(() => {
+        prepareSelfVrtCorpus({ corpus, format: 'pptx', files, snapshot: SNAPSHOT });
+      });
+    }
+    for (const file of files) {
+      test(file, async ({ page }) => {
+        test.setTimeout(600_000);
+        const stem = file.slice(0, -'.pptx'.length);
+        if (!SNAPSHOT) clearSelfVrtCandidateOutput({ corpus, stem, itemKind: 'slide' });
+        const openSlide = async (slideIndex: number) => {
+          await page.goto(
+            `/tests/visual/fixture.html?pptx=${encodeURIComponent(selfVrtInputPath({ corpus, file: stem }))}`
+            + `&slide=${slideIndex}`,
+          );
+          await page.waitForFunction(
+            () => document.body.dataset.status === 'ready' || document.body.dataset.status === 'error',
+            { timeout: 120_000 },
+          );
+          const status = await page.evaluate(() => document.body.dataset.status);
+          if (status === 'error') {
+            const message = await page.evaluate(() => document.body.dataset.errorMessage ?? '');
+            throw new Error(`${stem} slide ${slideIndex + 1}: ${message}`);
+          }
+        };
+
+        await openSlide(0);
+        const slideCount = Number(await page.evaluate(() => document.body.dataset.slideCount));
+        expect(slideCount, `${stem} must report its complete slide count`).toBeGreaterThan(0);
+        const differences: string[] = [];
+        for (let slideIndex = 0; slideIndex < slideCount; slideIndex++) {
+          if (slideIndex > 0) {
+            await page.evaluate(async (index) => {
+              const render = (globalThis as unknown as {
+                renderPptxVrtSlide(slideIndex: number): Promise<void>;
+              }).renderPptxVrtSlide;
+              await render(index);
+            }, slideIndex);
+          }
+          const dataUrl = await page.evaluate(() =>
+            (document.querySelector('canvas') as HTMLCanvasElement | null)?.toDataURL('image/png'));
+          if (!dataUrl) throw new Error(`${stem} slide ${slideIndex + 1}: no canvas`);
+          const actual = Buffer.from(dataUrl.split(',')[1], 'base64');
+          const difference = captureOrCompareSelfVrtItem({
+            corpus, stem, itemKind: 'slide', itemIndex: slideIndex, actual, snapshot: SNAPSHOT,
+          });
+          if (difference) differences.push(difference);
+        }
+        verifySelfVrtItemManifest({
+          corpus, format: 'pptx', stem, itemKind: 'slide', itemCount: slideCount, snapshot: SNAPSHOT,
+        });
+        expect(differences, differences.join('\n')).toEqual([]);
+      });
+    }
+  });
+}
+
+const PPTX_DEMO_CORPUS = SELF_VRT ? selfVrtCorpusFiles({ corpus: 'demo', format: 'pptx' }) : [];
 const PPTX_PRIVATE_CORPUS = process.env.VRT_PRIVATE_CORPUS === '1'
-  ? readdirSync('public/private/pptx')
-      .filter((file) => file.endsWith('.pptx') && !file.startsWith('~$'))
-      .map((file) => `pptx/${file}`)
-      .sort((left, right) => left.localeCompare(right, undefined, { numeric: true }))
+  ? selfVrtCorpusFiles({ corpus: 'private', format: 'pptx' })
   : [];
 
 if (process.env.VRT_PRIVATE_CORPUS === '1') {
-  preparePrivateCorpus({ format: 'pptx', files: PPTX_PRIVATE_CORPUS, snapshot: SNAPSHOT });
+  prepareSelfVrtCorpus({ corpus: 'private', format: 'pptx', files: PPTX_PRIVATE_CORPUS, snapshot: SNAPSHOT });
 }
 
-test.describe('private corpus self regression', () => {
-  for (const file of PPTX_PRIVATE_CORPUS) {
-    test(file, async ({ page }) => {
-      test.setTimeout(600_000);
-      const stem = file.slice(0, -'.pptx'.length);
-      if (!SNAPSHOT) clearPrivateCandidateItemOutput({ stem, itemKind: 'slide' });
-      const openSlide = async (slideIndex: number) => {
-        await page.goto(
-          `/tests/visual/fixture.html?pptx=${encodeURIComponent(`private/${stem}`)}`
-          + `&slide=${slideIndex}`,
-        );
-        await page.waitForFunction(
-          () => document.body.dataset.status === 'ready' || document.body.dataset.status === 'error',
-          { timeout: 120_000 },
-        );
-        const status = await page.evaluate(() => document.body.dataset.status);
-        if (status === 'error') {
-          const message = await page.evaluate(() => document.body.dataset.errorMessage ?? '');
-          throw new Error(`${stem} slide ${slideIndex + 1}: ${message}`);
-        }
-      };
-
-      await openSlide(0);
-      const slideCount = Number(await page.evaluate(() => document.body.dataset.slideCount));
-      expect(slideCount, `${stem} must report its complete slide count`).toBeGreaterThan(0);
-      const differences: string[] = [];
-      for (let slideIndex = 0; slideIndex < slideCount; slideIndex++) {
-        if (slideIndex > 0) {
-          await page.evaluate(async (index) => {
-            const render = (globalThis as unknown as {
-              renderPptxVrtSlide(slideIndex: number): Promise<void>;
-            }).renderPptxVrtSlide;
-            await render(index);
-          }, slideIndex);
-        }
-        const dataUrl = await page.evaluate(() =>
-          (document.querySelector('canvas') as HTMLCanvasElement | null)?.toDataURL('image/png'));
-        if (!dataUrl) throw new Error(`${stem} slide ${slideIndex + 1}: no canvas`);
-        const actual = Buffer.from(dataUrl.split(',')[1], 'base64');
-        const difference = captureOrComparePrivateItem({
-          stem, itemKind: 'slide', itemIndex: slideIndex, actual, snapshot: SNAPSHOT,
-        });
-        if (difference) differences.push(difference);
-      }
-      verifyPrivateItemManifest({
-        format: 'pptx', stem, itemKind: 'slide', itemCount: slideCount, snapshot: SNAPSHOT,
-      });
-      expect(differences, differences.join('\n')).toEqual([]);
-    });
-  }
-});
+describeSelfRegression('demo corpus self regression', 'demo', PPTX_DEMO_CORPUS);
+describeSelfRegression('private corpus self regression', 'private', PPTX_PRIVATE_CORPUS);

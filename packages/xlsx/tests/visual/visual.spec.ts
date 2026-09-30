@@ -1,73 +1,49 @@
 import { test, expect } from '@playwright/test';
-import { mkdirSync, existsSync, readFileSync, readdirSync, writeFileSync } from 'fs';
+import { mkdirSync, existsSync, readFileSync, writeFileSync } from 'fs';
 import { PNG } from 'pngjs';
 import pixelmatch from 'pixelmatch';
 import {
-  captureOrComparePrivateItem,
-  clearPrivateCandidateItemOutput,
-  preparePrivateCorpus,
-  verifyPrivateItemManifest,
+  captureOrCompareSelfVrtItem,
+  clearSelfVrtCandidateOutput,
+  prepareSelfVrtCorpus,
+  selfVrtCorpusFiles,
+  selfVrtInputPath,
+  verifySelfVrtItemManifest,
 } from '../../../../tests/visual/private-corpus.mjs';
 
-// ── Test targets ──────────────────────────────────────────────────────────────
-// Each entry needs:
-//   name       : path stem (loads /{name}.xlsx, reads references/{name}/)
-//   sheetCount : number of sheets to test (sheet-1.png .. sheet-N.png in references/)
+// ── Fidelity targets ──────────────────────────────────────────────────────────
+// Tracked demo workbooks with committed reference images (references/{name}/)
+// and fidelity scores (references/{name}/scores.json). Each entry needs:
+//   name       : public path stem (loads /{name}.xlsx, reads references/{name}/)
+//   sheetCount : exact sheet count; it must equal the renderer's sheet count
+// Regression (self-VRT) coverage is not listed here: `pnpm vrt` renders every
+// workbook in public/demo/ and `pnpm vrt:private` every workbook in
+// public/private/xlsx/ against previous-renderer baselines.
 const XLSX_FILES: { name: string; sheetCount: number }[] = [
   { name: 'demo/sample-1', sheetCount: 5 },
-  { name: 'private/sample-1', sheetCount: 3 },
-  { name: 'private/sample-2', sheetCount: 4 },
-  { name: 'private/sample-3', sheetCount: 2 },
-  { name: 'private/sample-4', sheetCount: 1 },
-  { name: 'private/sample-5', sheetCount: 2 },
-  { name: 'private/sample-6', sheetCount: 1 },
-  { name: 'private/sample-7', sheetCount: 1 },
-  { name: 'private/sample-8', sheetCount: 1 },
-  { name: 'private/sample-9', sheetCount: 3 },
-  { name: 'private/sample-10', sheetCount: 1 },
-  { name: 'private/sample-11', sheetCount: 1 },
-  { name: 'private/sample-12', sheetCount: 8 },
-  { name: 'private/sample-13', sheetCount: 2 },
-  { name: 'private/sample-14', sheetCount: 2 },
-  // Keep Plot Area, Legend, Titles, and Labels in the private self-VRT. The
-  // fifth sheet is source data without chart-renderer coverage.
-  { name: 'private/sample-15', sheetCount: 4 },
-  { name: 'private/sample-16', sheetCount: 2 },
-  { name: 'private/sample-17', sheetCount: 2 },
-  { name: 'private/sample-18', sheetCount: 2 },
-  { name: 'private/sample-19', sheetCount: 2 },
-  { name: 'private/sample-20', sheetCount: 2 },
-  { name: 'private/sample-21', sheetCount: 2 },
-  { name: 'private/sample-22', sheetCount: 2 },
-  { name: 'private/sample-23', sheetCount: 2 },
-  { name: 'private/sample-24', sheetCount: 2 },
-  { name: 'private/sample-25', sheetCount: 4 },
-  { name: 'private/sample-26', sheetCount: 2 },
-  { name: 'private/sample-27', sheetCount: 1 },
-  // sample-28: four sheets, each an OMML equation text box (Fourier series,
-  // cone volume, circle area). Adds regression coverage for shape-equation
-  // rendering, which had none (issue #877). References are self-baseline
-  // (renderer output), regenerated locally with UPDATE_REFS — no Excel export.
-  { name: 'private/sample-28', sheetCount: 4 },
 ];
 
 const PIXEL_THRESHOLD = 0.20;
 const FAIL_ABOVE_PCT = 20;
-const REGRESSION_PCT = 0.5;
 // Fidelity-score ratchet: fail if a page's match-% vs its reference PNG drops
 // more than this below the committed score. Catches a renderer change that
 // quietly worsens fidelity against the Excel ground truth even while staying
 // under the coarse FAIL_ABOVE_PCT ceiling.
 const RATCHET_DROP_PCT = 0.5;
 
-// UPDATE_REFS=1 pnpm vrt → adopt the current canvas output as the new reference.
+// UPDATE_REFS=1 pnpm vrt:fidelity → adopt the current canvas output as the new
+// reference. Only with explicit user approval (see AGENTS.md).
 const UPDATE_REFS = process.env.UPDATE_REFS === '1';
-// UPDATE_SCORES=1 pnpm vrt → record the current fidelity match-% into
+// UPDATE_SCORES=1 pnpm vrt:fidelity → record the current fidelity match-% into
 // references/<name>/scores.json WITHOUT touching the reference PNGs. This is how
-// the committed demo scores are (re)generated; it never rewrites ground truth.
+// the committed demo scores are (re)generated from a clean latest-main checkout
+// (AGENTS.md); it never rewrites ground truth.
 const UPDATE_SCORES = process.env.UPDATE_SCORES === '1';
 const SNAPSHOT = process.env.VRT_SNAPSHOT === '1';
 const RUN_MODE = process.env.VRT_MODE === 'regression' ? 'regression' : 'fidelity';
+// `vrt` / `vrt:snapshot` run the self-VRT corpora; `vrt:fidelity` compares the
+// listed files with their references. The two never share an oracle.
+const SELF_VRT = RUN_MODE === 'regression' || SNAPSHOT;
 
 // Per-sample fidelity scores live next to the reference PNGs
 // (references/<name>/scores.json), so they inherit the exact same commit policy:
@@ -95,8 +71,8 @@ function writeScore(name: string, key: string, matchPct: number): void {
   writeFileSync(scoresPathFor(name), JSON.stringify(ordered, null, 2) + '\n');
 }
 
-test.describe('xlsx visual regression', () => {
-  for (const { name, sheetCount } of XLSX_FILES) {
+test.describe('xlsx visual fidelity', () => {
+  for (const { name, sheetCount } of SELF_VRT ? [] : XLSX_FILES) {
     for (let i = 0; i < sheetCount; i++) {
       const sheetNum = i + 1;
 
@@ -116,6 +92,14 @@ test.describe('xlsx visual regression', () => {
 
         await page.waitForTimeout(200);
 
+        const actualSheetCount = Number(await page.evaluate(() => document.body.dataset.sheetCount));
+        if (actualSheetCount !== sheetCount) {
+          throw new Error(
+            `${name}: the renderer reports ${actualSheetCount} sheet(s) but XLSX_FILES declares ` +
+            `${sheetCount}; keep the declared count exact so no sheet goes unchecked.`
+          );
+        }
+
         const dataUrl = await page.evaluate(() => {
           const canvas = document.querySelector('canvas') as HTMLCanvasElement;
           return canvas ? canvas.toDataURL('image/png') : null;
@@ -132,20 +116,9 @@ test.describe('xlsx visual regression', () => {
           console.log(`  ${name} sheet ${sheetNum}: reference updated`);
           return;
         }
-        if (SNAPSHOT) {
-          mkdirSync(`tests/visual/baseline/${name}`, { recursive: true });
-          writeFileSync(`tests/visual/baseline/${name}/sheet-${sheetNum}.png`, actualBuf);
-          console.log(`  ${name} sheet ${sheetNum}: baseline captured`);
-          return;
-        }
-
-        const targetRoot = RUN_MODE === 'regression' ? 'baseline' : 'references';
-        const refPath = `tests/visual/${targetRoot}/${name}/sheet-${sheetNum}.png`;
+        const refPath = `tests/visual/references/${name}/sheet-${sheetNum}.png`;
         if (!existsSync(refPath)) {
-          if (RUN_MODE === 'regression') {
-            throw new Error(`missing regression baseline: ${refPath}`);
-          }
-          test.skip(true, `no ${targetRoot} image for ${name} sheet ${sheetNum}`);
+          throw new Error(`missing fidelity reference: ${refPath}`);
         }
         const refBuf = readFileSync(refPath);
         const refPng = PNG.sync.read(refBuf);
@@ -154,12 +127,6 @@ test.describe('xlsx visual regression', () => {
         const { width: refW, height: refH } = refPng;
 
         if (actualPng.width !== refW || actualPng.height !== refH) {
-          if (RUN_MODE === 'regression') {
-            throw new Error(
-              `${name} sheet ${sheetNum}: regression dimensions changed from ` +
-              `${refW}×${refH} to ${actualPng.width}×${actualPng.height}`,
-            );
-          }
           console.warn(
             `  ${name} sheet ${sheetNum}: size mismatch ` +
             `actual=${actualPng.width}×${actualPng.height} ref=${refW}×${refH}`
@@ -206,28 +173,27 @@ test.describe('xlsx visual regression', () => {
           `(${diffPixels.toLocaleString()} / ${totalPx.toLocaleString()} px)`
         );
 
-        const limit = RUN_MODE === 'regression' ? REGRESSION_PCT : FAIL_ABOVE_PCT;
-        if (diffPct > limit) {
+        if (diffPct > FAIL_ABOVE_PCT) {
           throw new Error(
-            `${name} sheet ${sheetNum} pixel diff ${diffPct.toFixed(1)}% exceeds ${limit}% in ${RUN_MODE} mode`
+            `${name} sheet ${sheetNum} pixel diff ${diffPct.toFixed(1)}% exceeds ${FAIL_ABOVE_PCT}%`
           );
         }
 
-        // Fidelity-score ratchet (fidelity mode only; the regression mode above
-        // already gates against the captured baseline). UPDATE_SCORES rewrites
-        // the stored score; otherwise a committed score is a floor.
-        if (RUN_MODE === 'fidelity') {
-          const key = `sheet-${sheetNum}`;
-          if (UPDATE_SCORES) {
-            writeScore(name, key, matchPct);
-          } else {
-            const prior = readScores(name)[key];
-            if (prior !== undefined && matchPct < prior - RATCHET_DROP_PCT) {
-              throw new Error(
-                `${name} ${key} fidelity regressed: match ${matchPct.toFixed(2)}% ` +
-                `is >${RATCHET_DROP_PCT}pt below the recorded ${prior.toFixed(2)}%`
-              );
-            }
+        // Fidelity-score ratchet. UPDATE_SCORES rewrites the stored score;
+        // otherwise a committed score is a floor.
+        const key = `sheet-${sheetNum}`;
+        if (UPDATE_SCORES) {
+          writeScore(name, key, matchPct);
+        } else {
+          const prior = readScores(name)[key];
+          if (prior === undefined) {
+            throw new Error(`${name} ${key} has no recorded fidelity score in ${scoresPathFor(name)}`);
+          }
+          if (matchPct < prior - RATCHET_DROP_PCT) {
+            throw new Error(
+              `${name} ${key} fidelity regressed: match ${matchPct.toFixed(2)}% ` +
+              `is >${RATCHET_DROP_PCT}pt below the recorded ${prior.toFixed(2)}%`
+            );
           }
         }
       });
@@ -235,67 +201,82 @@ test.describe('xlsx visual regression', () => {
   }
 });
 
+// ── Self-VRT (previous-renderer regression) ───────────────────────────────────
+// Every file of a corpus is rendered completely and compared pixel-for-pixel
+// with the previous renderer's images, bound by manifest to
+// VRT_BASELINE_REVISION. `demo` runs under `pnpm vrt`; `private` under
+// `pnpm vrt:private` (VRT_PRIVATE_CORPUS=1).
+type SelfVrtCorpus = 'demo' | 'private';
+
+function describeSelfRegression(title: string, corpus: SelfVrtCorpus, files: string[]): void {
+  test.describe(title, () => {
+    if (corpus === 'demo' && files.length > 0) {
+      test.beforeAll(() => {
+        prepareSelfVrtCorpus({ corpus, format: 'xlsx', files, snapshot: SNAPSHOT });
+      });
+    }
+    for (const file of files) {
+      test(file, async ({ page }) => {
+        test.setTimeout(600_000);
+        const stem = file.slice(0, -'.xlsx'.length);
+        if (!SNAPSHOT) clearSelfVrtCandidateOutput({ corpus, stem, itemKind: 'sheet' });
+        const openSheet = async (sheetIndex: number) => {
+          await page.goto(
+            `/tests/visual/fixture.html?file=${encodeURIComponent(selfVrtInputPath({ corpus, file }))}`
+            + `&sheet=${sheetIndex}`,
+          );
+          await page.waitForFunction(
+            () => document.body.dataset.status === 'ready' || document.body.dataset.status === 'error',
+            { timeout: 120_000 },
+          );
+          const status = await page.evaluate(() => document.body.dataset.status);
+          if (status === 'error') {
+            const message = await page.evaluate(() => document.body.dataset.errorMessage ?? '');
+            throw new Error(`${stem} sheet ${sheetIndex + 1}: ${message}`);
+          }
+          await page.waitForTimeout(200);
+        };
+
+        await openSheet(0);
+        const sheetCount = Number(await page.evaluate(() => document.body.dataset.sheetCount));
+        expect(sheetCount, `${stem} must report its complete sheet count`).toBeGreaterThan(0);
+        const differences: string[] = [];
+        for (let sheetIndex = 0; sheetIndex < sheetCount; sheetIndex++) {
+          if (sheetIndex > 0) {
+            await page.evaluate(async (index) => {
+              const render = (globalThis as unknown as {
+                renderXlsxVrtSheet(sheetIndex: number): Promise<void>;
+              }).renderXlsxVrtSheet;
+              await render(index);
+            }, sheetIndex);
+            await page.waitForTimeout(200);
+          }
+          const dataUrl = await page.evaluate(() =>
+            (document.querySelector('canvas') as HTMLCanvasElement | null)?.toDataURL('image/png'));
+          if (!dataUrl) throw new Error(`${stem} sheet ${sheetIndex + 1}: no canvas`);
+          const actual = Buffer.from(dataUrl.split(',')[1], 'base64');
+          const difference = captureOrCompareSelfVrtItem({
+            corpus, stem, itemKind: 'sheet', itemIndex: sheetIndex, actual, snapshot: SNAPSHOT,
+          });
+          if (difference) differences.push(difference);
+        }
+        verifySelfVrtItemManifest({
+          corpus, format: 'xlsx', stem, itemKind: 'sheet', itemCount: sheetCount, snapshot: SNAPSHOT,
+        });
+        expect(differences, differences.join('\n')).toEqual([]);
+      });
+    }
+  });
+}
+
+const XLSX_DEMO_CORPUS = SELF_VRT ? selfVrtCorpusFiles({ corpus: 'demo', format: 'xlsx' }) : [];
 const XLSX_PRIVATE_CORPUS = process.env.VRT_PRIVATE_CORPUS === '1'
-  ? readdirSync('public/private/xlsx')
-      .filter((file) => file.endsWith('.xlsx') && !file.startsWith('~$'))
-      .map((file) => `xlsx/${file}`)
-      .sort((left, right) => left.localeCompare(right, undefined, { numeric: true }))
+  ? selfVrtCorpusFiles({ corpus: 'private', format: 'xlsx' })
   : [];
 
 if (process.env.VRT_PRIVATE_CORPUS === '1') {
-  preparePrivateCorpus({ format: 'xlsx', files: XLSX_PRIVATE_CORPUS, snapshot: SNAPSHOT });
+  prepareSelfVrtCorpus({ corpus: 'private', format: 'xlsx', files: XLSX_PRIVATE_CORPUS, snapshot: SNAPSHOT });
 }
 
-test.describe('private corpus self regression', () => {
-  for (const file of XLSX_PRIVATE_CORPUS) {
-    test(file, async ({ page }) => {
-      test.setTimeout(600_000);
-      const stem = file.slice(0, -'.xlsx'.length);
-      if (!SNAPSHOT) clearPrivateCandidateItemOutput({ stem, itemKind: 'sheet' });
-      const openSheet = async (sheetIndex: number) => {
-        await page.goto(
-          `/tests/visual/fixture.html?file=${encodeURIComponent(`private/${file}`)}`
-          + `&sheet=${sheetIndex}`,
-        );
-        await page.waitForFunction(
-          () => document.body.dataset.status === 'ready' || document.body.dataset.status === 'error',
-          { timeout: 120_000 },
-        );
-        const status = await page.evaluate(() => document.body.dataset.status);
-        if (status === 'error') {
-          const message = await page.evaluate(() => document.body.dataset.errorMessage ?? '');
-          throw new Error(`${stem} sheet ${sheetIndex + 1}: ${message}`);
-        }
-        await page.waitForTimeout(200);
-      };
-
-      await openSheet(0);
-      const sheetCount = Number(await page.evaluate(() => document.body.dataset.sheetCount));
-      expect(sheetCount, `${stem} must report its complete sheet count`).toBeGreaterThan(0);
-      const differences: string[] = [];
-      for (let sheetIndex = 0; sheetIndex < sheetCount; sheetIndex++) {
-        if (sheetIndex > 0) {
-          await page.evaluate(async (index) => {
-            const render = (globalThis as unknown as {
-              renderXlsxVrtSheet(sheetIndex: number): Promise<void>;
-            }).renderXlsxVrtSheet;
-            await render(index);
-          }, sheetIndex);
-          await page.waitForTimeout(200);
-        }
-        const dataUrl = await page.evaluate(() =>
-          (document.querySelector('canvas') as HTMLCanvasElement | null)?.toDataURL('image/png'));
-        if (!dataUrl) throw new Error(`${stem} sheet ${sheetIndex + 1}: no canvas`);
-        const actual = Buffer.from(dataUrl.split(',')[1], 'base64');
-        const difference = captureOrComparePrivateItem({
-          stem, itemKind: 'sheet', itemIndex: sheetIndex, actual, snapshot: SNAPSHOT,
-        });
-        if (difference) differences.push(difference);
-      }
-      verifyPrivateItemManifest({
-        format: 'xlsx', stem, itemKind: 'sheet', itemCount: sheetCount, snapshot: SNAPSHOT,
-      });
-      expect(differences, differences.join('\n')).toEqual([]);
-    });
-  }
-});
+describeSelfRegression('demo corpus self regression', 'demo', XLSX_DEMO_CORPUS);
+describeSelfRegression('private corpus self regression', 'private', XLSX_PRIVATE_CORPUS);

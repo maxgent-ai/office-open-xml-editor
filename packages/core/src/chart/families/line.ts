@@ -271,7 +271,7 @@ export function renderLineChart(
     ? axisTitleFontPx(sec.titleFontSizeHpt, ptToPx) + 8
     : 0;
 
-  const titleLeftBandW = legLeftW + Math.max(
+  let titleLeftBandW = legLeftW + Math.max(
     valAxFontPx * 2.2 + 10 + valTitleW,
     dataTableHeaderW,
   );
@@ -282,8 +282,9 @@ export function renderLineChart(
   if (
     !chart.valAxisHidden
     && chart.valAxisTickLabelPos !== 'none'
-    && chart.plotAreaManualLayout != null
-    && chart.plotAreaManualLayout.layoutTarget !== 'inner'
+    && (chart.chartexParetoSortDescending != null
+      || (chart.plotAreaManualLayout != null
+        && chart.plotAreaManualLayout.layoutTarget !== 'inner'))
   ) {
     const previousFont = ctx.font;
     ctx.font = chartFontCss(
@@ -299,6 +300,12 @@ export function renderLineChart(
       );
     }
     ctx.font = previousFont;
+  }
+  // Standalone ChartEx Pareto has a percentage axis at the chart edge. A
+  // measured 100% tick needs more width than the ordinary line-axis estimate.
+  if (chart.chartexParetoSortDescending != null) {
+    titleLeftBandW = Math.max(titleLeftBandW,
+      legLeftW + primaryLabelWidth + 10 + valTitleW);
   }
   // Pad based on actual label metrics rather than magic percents so an explicit
   // <c:txPr sz="1000"> (10pt) correctly compresses the plot area.

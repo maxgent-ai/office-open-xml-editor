@@ -59,7 +59,12 @@
       await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
 
       const wrapper = canvas.parentElement;
-      const overlayLayers = [...wrapper.children].filter((c) => c.tagName === 'DIV');
+      // The overlay layers are the wrapper's DIV children other than the
+      // viewer's page-loading status layer (role="status", hidden once the page
+      // has rendered): the text-selection layer and the find-highlight layer.
+      const overlayLayers = [...wrapper.children].filter(
+        (c) => c.tagName === 'DIV' && c.getAttribute('role') !== 'status',
+      );
       const overlayRects = overlayLayers.map((l) => {
         const r = l.getBoundingClientRect();
         return { w: Math.round(r.width), h: Math.round(r.height) };

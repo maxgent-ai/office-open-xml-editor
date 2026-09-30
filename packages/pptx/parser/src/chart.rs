@@ -86,6 +86,7 @@ fn parse_chart_with_images(
         theme_format_scheme,
     };
     let context = ooxml_common::chart::ChartParseContext {
+        host: ooxml_common::chart::ChartHost::PowerPoint,
         color_resolver: Some(&resolver),
         style_xml,
         color_style_xml,
@@ -578,5 +579,39 @@ mod tests {
 
         let boxes = element.chart.chart_text_boxes.expect("chart text boxes");
         assert_eq!(boxes[0].paragraphs[0].runs[0].text, "Shared title");
+    }
+
+    /// The PowerPoint adapter must pass `ChartHost::PowerPoint`: PowerPoint
+    /// retains every clustered column and the unowned Pareto line's percentage
+    /// axis, which the host-neutral and Excel policies do not.
+    #[test]
+    fn powerpoint_adapter_passes_its_chartex_host() {
+        let xml = r#"<cx:chartSpace xmlns:cx="http://schemas.microsoft.com/office/drawing/2014/chartex">
+          <cx:chartData>
+            <cx:data id="0"><cx:strDim type="cat"><cx:lvl ptCount="2"><cx:pt idx="0">A</cx:pt><cx:pt idx="1">B</cx:pt></cx:lvl></cx:strDim><cx:numDim type="val"><cx:lvl ptCount="2"><cx:pt idx="0">3</cx:pt><cx:pt idx="1">5</cx:pt></cx:lvl></cx:numDim></cx:data>
+            <cx:data id="1"><cx:strDim type="cat"><cx:lvl ptCount="2"><cx:pt idx="0">X</cx:pt><cx:pt idx="1">Y</cx:pt></cx:lvl></cx:strDim><cx:numDim type="val"><cx:lvl ptCount="2"><cx:pt idx="0">8</cx:pt><cx:pt idx="1">12</cx:pt></cx:lvl></cx:numDim></cx:data>
+          </cx:chartData>
+          <cx:chart><cx:plotArea><cx:plotAreaRegion>
+            <cx:series layoutId="clusteredColumn"><cx:dataId val="0"/></cx:series>
+            <cx:series layoutId="clusteredColumn"><cx:dataId val="1"/></cx:series>
+            <cx:series layoutId="paretoLine"><cx:dataId val="0"/><cx:axisId val="2"/></cx:series>
+          </cx:plotAreaRegion>
+            <cx:axis id="0"><cx:catScaling/></cx:axis>
+            <cx:axis id="1"><cx:valScaling/></cx:axis>
+            <cx:axis id="2"><cx:valScaling min="0" max="1"/><cx:units unit="percentage"/><cx:tickLabels/></cx:axis>
+          </cx:plotArea></cx:chart>
+        </cx:chartSpace>"#;
+        let element = parse_chartex(xml, None, None, &HashMap::new(), None).expect("parses");
+        let columns = element
+            .chart
+            .series
+            .iter()
+            .filter(|series| series.series_type.as_deref() != Some("line"))
+            .count();
+        assert_eq!(columns, 2);
+        assert_eq!(
+            element.chart.chartex_show_unpaired_percentage_axis,
+            Some(true)
+        );
     }
 }

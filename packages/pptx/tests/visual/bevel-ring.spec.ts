@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
 /**
- * Acceptance test for the slide-6 sp3d bevel ring (private/sample-4.pptx, the
+ * Acceptance test for the slide-6 sp3d bevel ring (private/pptx/sample-4.pptx, the
  * tilted-ellipse photo with a 15 pt a:ln beige border, bevelT hardEdge,
  * extrusionH and outerShdw under a perspectiveFront camera).
  *
@@ -32,7 +32,7 @@ import { dirname, join } from 'node:path';
  * 10 px loss inside the shadow falloff, dpr2 makes it a visible cut.
  */
 
-const SAMPLE = 'private/sample-4';
+const SAMPLE = 'private/pptx/sample-4';
 const SLIDE_INDEX = 5; // PDF p6, 0-based
 
 // EMU geometry of the deck (ppt/presentation.xml sldSz) and the ring border

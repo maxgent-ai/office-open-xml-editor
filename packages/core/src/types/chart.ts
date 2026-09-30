@@ -1537,6 +1537,13 @@ export interface ChartModel {
   chartexRegionMap?: ChartexRegionMap | null;
   /** ChartEx histogram controls; raw observations remain in `series[0]`. */
   chartexHistogramBinning?: ChartexHistogramBinning | null;
+  chartexParetoOwnerIndex?: number | null;
+  chartexParetoSortDescending?: boolean | null;
+  chartexParetoFlatEndpoint?: boolean | null;
+  chartexSuppressGeometry?: boolean | null;
+  chartexParetoOutlineOwner?: boolean | null;
+  chartexPrimaryAxisRight?: boolean | null;
+  chartexShowUnpairedPercentageAxis?: boolean | null;
   /**
    * Theme accent palette (`accent1..6`, hex without '#') for chartEx charts
    * that color by branch/series index (boxWhisker series and
@@ -1563,8 +1570,10 @@ export interface ChartModel {
   classicChartStyleRoles?: Partial<Record<ChartStyleRole, ChartExElementStyle>> | null;
   /** Surface-specific numeric style materialized in the value-band domain. */
   classicSurfaceBandStyles?: ChartClassicSurfaceBandStyles | null;
-  /** Raw linked style table retained after renderer-facing effective roles are
-   * composed, so Surface can resolve direct > linked > numeric per band. */
+  /** Linked style table retained after renderer-facing effective roles are
+   * composed. For a classic chart the linked series data roles
+   * (`dataPoint*`, `upBar`, `downBar`, `hiLoLine`) are dropped entirely: Office paints
+   * those atoms from direct formatting over the numeric style alone. */
   linkedChartStyleRoles?: Partial<Record<ChartStyleRole, ChartExElementStyle>> | null;
   /** Numeric dataPoint/dataPoint3D roles for the most common bounded point
    * domain among varyColors groups. Group slots with the same domain inherit
@@ -1951,6 +1960,11 @@ export interface ChartexHistogramBinning {
   intervalClosed?: 'l' | 'r' | null;
   underflow?: number | null;
   overflow?: number | null;
+  /**
+   * Number format for the bin-edge category labels only (value dimension's
+   * resolved or cached format). Never applied to the bin counts.
+   */
+  edgeFormatCode?: string | null;
 }
 
 /** Authored axis format, separate from the effective tick format. */

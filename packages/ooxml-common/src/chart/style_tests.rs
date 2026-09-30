@@ -1220,8 +1220,16 @@ mod tests {
             let roles = model
                 .chart_style_roles
                 .expect("authored unresolved role table");
-            assert_eq!(roles.len(), CHART_STYLE_ROLE_NAMES.len());
+            assert_eq!(
+                roles.len(),
+                CHART_STYLE_ROLE_NAMES.len() - CLASSIC_INERT_LINKED_PAINT_ROLES.len()
+            );
             for role in CHART_STYLE_ROLE_NAMES {
+                if CLASSIC_INERT_LINKED_PAINT_ROLES.contains(&role) {
+                    // Classic series paint ignores these linked roles entirely.
+                    assert!(!roles.contains_key(role));
+                    continue;
+                }
                 let style = &roles[role];
                 assert_eq!(style.fill_paint_authored, Some(true));
                 assert_eq!(style.fill_hidden, Some(true));
@@ -1359,7 +1367,7 @@ mod tests {
     }
 
     #[test]
-    fn linked_marker_style_preserves_unsupported_fill_provenance() {
+    fn linked_role_style_preserves_unsupported_fill_provenance() {
         let chart_xml = format!(
             r#"<c:chartSpace xmlns:c="{C_NS}"><c:chart><c:plotArea>
               <c:lineChart><c:ser><c:idx val="0"/><c:order val="0"/>
@@ -1370,17 +1378,17 @@ mod tests {
         );
         let unsupported_style_xml = format!(
             r#"<cs:chartStyle xmlns:cs="{CS_NS}" xmlns:a="{A_NS}">
-              <cs:dataPointMarker>
+              <cs:legend>
                 <cs:fillRef idx="1"><cs:styleClr val="auto"/></cs:fillRef>
                 <cs:spPr><a:blipFill/></cs:spPr>
-              </cs:dataPointMarker>
+              </cs:legend>
             </cs:chartStyle>"#,
         );
         let inherited_style_xml = format!(
             r#"<cs:chartStyle xmlns:cs="{CS_NS}" xmlns:a="{A_NS}">
-              <cs:dataPointMarker>
+              <cs:legend>
                 <cs:fillRef idx="1"><cs:styleClr val="auto"/></cs:fillRef>
-              </cs:dataPointMarker>
+              </cs:legend>
             </cs:chartStyle>"#,
         );
         let theme_xml = format!(
@@ -1407,7 +1415,7 @@ mod tests {
             },
         )
         .expect("classic chart parses");
-        let role = &model.chart_style_roles.expect("linked roles")["dataPointMarker"];
+        let role = &model.chart_style_roles.expect("linked roles")["legend"];
         assert_eq!(role.fill_paint_authored, Some(true));
         assert_eq!(role.fill_hidden, None);
         assert_eq!(role.fill_colors, None);
@@ -1423,8 +1431,7 @@ mod tests {
             },
         )
         .expect("classic chart with inherited marker fill parses");
-        let inherited_role =
-            &inherited_model.chart_style_roles.expect("linked roles")["dataPointMarker"];
+        let inherited_role = &inherited_model.chart_style_roles.expect("linked roles")["legend"];
         assert_eq!(inherited_role.fill_paint_authored, Some(true));
         assert!(inherited_role
             .fill_colors
@@ -1444,7 +1451,7 @@ mod tests {
         );
         let style_xml = format!(
             r#"<cs:chartStyle xmlns:cs="{CS_NS}" xmlns:a="{A_NS}">
-              <cs:dataPoint><cs:effectRef idx="1"><cs:styleClr val="1"/></cs:effectRef></cs:dataPoint>
+              <cs:plotArea3D><cs:effectRef idx="1"><cs:styleClr val="1"/></cs:effectRef></cs:plotArea3D>
               <cs:legend><cs:effectRef idx="1"><cs:styleClr val="auto"/></cs:effectRef><cs:spPr><a:effectLst/></cs:spPr></cs:legend>
               <cs:title><cs:effectRef idx="1"><cs:styleClr val="auto"/></cs:effectRef><cs:spPr><a:effectDag/></cs:spPr></cs:title>
               <cs:plotArea><cs:effectRef idx="0"/></cs:plotArea>
@@ -1481,7 +1488,7 @@ mod tests {
         .expect("classic chart parses");
         let roles = model.chart_style_roles.expect("linked roles");
 
-        let shadows = roles["dataPoint"].shadows.as_ref().expect("shadows");
+        let shadows = roles["plotArea3D"].shadows.as_ref().expect("shadows");
         assert_eq!(shadows.len(), 2);
         // A numeric ST_StyleColorVal is a fixed zero-based Chart Colors index,
         // not a relative object index. Every expanded effect entry therefore
@@ -1490,9 +1497,9 @@ mod tests {
         assert_eq!(shadows[0].as_ref().unwrap().color, "00AA00");
         assert_eq!(shadows[1].as_ref().unwrap().color, "00AA00");
         assert!((shadows[0].as_ref().unwrap().alpha - 0.5).abs() < 0.01);
-        assert_eq!(roles["dataPoint"].effect_authored, Some(true));
-        assert_eq!(roles["dataPoint"].effect_unsupported, None);
-        assert_eq!(roles["dataPoint"].effect_color_index, Some(1));
+        assert_eq!(roles["plotArea3D"].effect_authored, Some(true));
+        assert_eq!(roles["plotArea3D"].effect_unsupported, None);
+        assert_eq!(roles["plotArea3D"].effect_color_index, Some(1));
 
         let direct_empty = &roles["legend"];
         assert_eq!(direct_empty.effect_authored, Some(true));
@@ -1557,7 +1564,167 @@ mod tests {
     }
 
     #[test]
-    fn linked_marker_style_retains_picture_relationship_from_style_part() {
+    fn classic_inert_data_role_recipes_do_not_fail_close_other_roles() {
+        let stops = (0..4_097)
+            .map(|index| {
+                format!(
+                    "<a:gs pos=\"{}\"><a:srgbClr val=\"112233\"/></a:gs>",
+                    index * 24
+                )
+            })
+            .collect::<String>();
+        let style_xml = format!(
+            r#"<cs:chartStyle xmlns:cs="{CS_NS}" xmlns:a="{A_NS}">
+              <cs:dataPoint><cs:spPr><a:gradFill><a:gsLst>{stops}</a:gsLst></a:gradFill></cs:spPr></cs:dataPoint>
+              <cs:legend><cs:spPr><a:solidFill><a:srgbClr val="445566"/></a:solidFill></cs:spPr></cs:legend>
+            </cs:chartStyle>"#,
+        );
+        let document = root_of(&style_xml);
+        let classic = parse_chart_style_role_table(
+            document.root_element(),
+            &FixtureResolver,
+            None,
+            None,
+            &EmptyChartImageResolver,
+        )
+        .expect("the oversized inert role is dropped before budgeting");
+        assert!(!classic.contains_key("dataPoint"));
+        assert_eq!(
+            classic["legend"].fill_colors.as_deref(),
+            Some(&[Some("445566".to_owned())][..])
+        );
+        assert!(parse_chart_style_role_table_for_chart(
+            document.root_element(),
+            &FixtureResolver,
+            None,
+            None,
+            &EmptyChartImageResolver,
+            true,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn colorless_reference_is_black_only_for_chartex_roles() {
+        let xml = format!(r#"<cs:fillRef xmlns:cs="{CS_NS}" idx="1"/>"#);
+        let document = root_of(&xml);
+        let reference = Some(document.root_element());
+        let classic = chart_style_placeholder(
+            reference,
+            &FixtureResolver,
+            Some("112233"),
+            None,
+            None,
+            false,
+        );
+        let chartex = chart_style_placeholder(
+            reference,
+            &FixtureResolver,
+            Some("112233"),
+            None,
+            None,
+            true,
+        );
+        assert_eq!(classic.as_deref(), Some("112233"));
+        assert_eq!(chartex.as_deref(), Some("000000"));
+    }
+
+    #[test]
+    fn chartex_black_placeholder_is_limited_to_fill_and_line_references() {
+        // Only colourless fillRef/lnRef were measured to resolve phClr to
+        // black. A colourless effectRef keeps the semantic accent.
+        let style_xml = format!(
+            r#"<cs:chartStyle xmlns:cs="{CS_NS}" xmlns:a="{A_NS}">
+              <cs:dataPoint>
+                <cs:lnRef idx="0"/>
+                <cs:fillRef idx="1"/>
+                <cs:effectRef idx="1"/>
+                <cs:fontRef idx="minor"/>
+              </cs:dataPoint>
+            </cs:chartStyle>"#,
+        );
+        let theme_xml = format!(
+            r#"<a:theme xmlns:a="{A_NS}"><a:themeElements><a:fmtScheme name="phClr">
+              <a:fillStyleLst><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:fillStyleLst>
+              <a:lnStyleLst/>
+              <a:effectStyleLst><a:effectStyle><a:effectLst>
+                <a:outerShdw blurRad="12700"><a:schemeClr val="phClr"/></a:outerShdw>
+              </a:effectLst></a:effectStyle></a:effectStyleLst>
+              <a:bgFillStyleLst/>
+            </a:fmtScheme></a:themeElements></a:theme>"#,
+        );
+        let resolver = FormatSchemeFixtureResolver {
+            format_scheme: crate::theme::ThemeFormatScheme::parse(&theme_xml),
+        };
+        let palette = [Some("AA0000".to_owned())];
+        let document = root_of(&style_xml);
+        let roles = parse_chart_style_role_table_for_chart(
+            document.root_element(),
+            &resolver,
+            Some(&palette),
+            None,
+            &EmptyChartImageResolver,
+            true,
+        )
+        .expect("ChartEx roles parse");
+        let data_point = &roles["dataPoint"];
+        assert_eq!(
+            data_point.fill_colors.as_deref(),
+            Some(&[Some("000000".to_owned())][..])
+        );
+        let shadows = data_point.shadows.as_ref().expect("theme shadow");
+        assert_eq!(shadows[0].as_ref().unwrap().color, "AA0000");
+    }
+
+    #[test]
+    fn classic_linked_data_roles_are_dropped_entirely() {
+        let chart_xml = format!(
+            r#"<c:chartSpace xmlns:c="{C_NS}"><c:chart><c:plotArea><c:lineChart>
+              <c:ser><c:idx val="0"/><c:order val="0"/>
+                <c:cat><c:strLit><c:ptCount val="1"/><c:pt idx="0"><c:v>A</c:v></c:pt></c:strLit></c:cat>
+                <c:val><c:numLit><c:ptCount val="1"/><c:pt idx="0"><c:v>1</c:v></c:pt></c:numLit></c:val>
+              </c:ser></c:lineChart></c:plotArea></c:chart></c:chartSpace>"#
+        );
+        let style_xml = format!(
+            r#"<cs:chartStyle xmlns:cs="{CS_NS}" xmlns:a="{A_NS}">
+              <cs:dataPoint><cs:effectRef idx="0"/><cs:spPr><a:solidFill><a:srgbClr val="00B050"/></a:solidFill>
+                <a:ln w="19050"><a:solidFill><a:srgbClr val="00B050"/></a:solidFill></a:ln>
+              </cs:spPr></cs:dataPoint>
+              <cs:dataPointLine><cs:spPr><a:ln w="19050"><a:solidFill><a:srgbClr val="00B050"/></a:solidFill></a:ln></cs:spPr></cs:dataPointLine>
+              <cs:hiLoLine><cs:spPr><a:ln w="19050"><a:solidFill><a:srgbClr val="00B050"/></a:solidFill></a:ln></cs:spPr></cs:hiLoLine>
+              <cs:legend><cs:spPr><a:solidFill><a:srgbClr val="00B050"/></a:solidFill></cs:spPr></cs:legend>
+            </cs:chartStyle>"#
+        );
+        let document = root_of(&chart_xml);
+        let model = parse_chart_part(
+            document.root_element(),
+            &ChartParseContext {
+                color_resolver: Some(&FixtureResolver),
+                style_xml: Some(&style_xml),
+                color_style_xml: None,
+                ..Default::default()
+            },
+        )
+        .expect("classic chart parses");
+        let roles = model.chart_style_roles.expect("linked roles");
+        for role in ["dataPoint", "dataPointLine", "hiLoLine"] {
+            assert!(
+                !roles.contains_key(role),
+                "{role} paint is inert for classic series"
+            );
+        }
+        assert!(
+            roles["legend"]
+                .fill_colors
+                .as_ref()
+                .is_some_and(|colors| !colors.is_empty()
+                    && colors.iter().flatten().all(|color| color == "00B050")),
+            "unmeasured linked roles keep their paint",
+        );
+    }
+
+    #[test]
+    fn linked_role_style_retains_picture_relationship_from_style_part() {
         struct Images;
         impl ChartImageResolver for Images {
             fn resolve_image(
@@ -1582,9 +1749,9 @@ mod tests {
         );
         let style_xml = format!(
             r#"<cs:chartStyle xmlns:cs="{CS_NS}" xmlns:a="{A_NS}" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
-              <cs:dataPointMarker><cs:spPr><a:blipFill><a:blip r:embed="rIdPic"/>
+              <cs:legend><cs:spPr><a:blipFill><a:blip r:embed="rIdPic"/>
                 <a:tile tx="12700" ty="25400" sx="50000" sy="50000" flip="xy" algn="ctr"/>
-              </a:blipFill></cs:spPr></cs:dataPointMarker>
+              </a:blipFill></cs:spPr></cs:legend>
             </cs:chartStyle>"#
         );
         let document = root_of(&chart_xml);
@@ -1599,7 +1766,7 @@ mod tests {
             },
         )
         .expect("classic chart parses");
-        let role = &model.chart_style_roles.expect("linked roles")["dataPointMarker"];
+        let role = &model.chart_style_roles.expect("linked roles")["legend"];
         assert_eq!(role.fill_paint_authored, Some(true));
         assert!(matches!(
             role.fill_paints.as_ref().and_then(|paints| paints[0].as_ref()),
@@ -1660,12 +1827,13 @@ mod tests {
         let style_doc = root_of(&style_xml);
         let (_, palette) = parse_chart_color_style(&colors_xml, &FixtureResolver)
             .expect("bounded color style parses");
-        assert!(parse_chart_style_role_table(
+        assert!(parse_chart_style_role_table_for_chart(
             style_doc.root_element(),
             &FixtureResolver,
             Some(&palette),
             Some("cycle"),
             &EmptyChartImageResolver,
+            true,
         )
         .is_none());
     }
@@ -1707,12 +1875,13 @@ mod tests {
         let (_, palette) =
             parse_chart_color_style(&colors_xml, &resolver).expect("color style parses");
 
-        assert!(parse_chart_style_role_table(
+        assert!(parse_chart_style_role_table_for_chart(
             style_doc.root_element(),
             &resolver,
             Some(&palette),
             Some("cycle"),
             &EmptyChartImageResolver,
+            true,
         )
         .is_none());
 
@@ -1731,12 +1900,13 @@ mod tests {
             r#"<cs:chartStyle xmlns:cs="{CS_NS}" xmlns:a="{A_NS}">{locally_overridden_roles}</cs:chartStyle>"#,
         );
         let locally_overridden_style_doc = root_of(&locally_overridden_style_xml);
-        let table = parse_chart_style_role_table(
+        let table = parse_chart_style_role_table_for_chart(
             locally_overridden_style_doc.root_element(),
             &resolver,
             Some(&palette),
             Some("cycle"),
             &EmptyChartImageResolver,
+            true,
         )
         .expect("unsupported local fills suppress inherited gradient work");
         assert!(table
@@ -1771,23 +1941,25 @@ mod tests {
         for outline in [false, true] {
             let exact_xml = style(MAX_CHART_PAINT_RECIPE_COMPONENTS, outline);
             let exact = root_of(&exact_xml);
-            assert!(parse_chart_style_role_table(
+            assert!(parse_chart_style_role_table_for_chart(
                 exact.root_element(),
                 &FixtureResolver,
                 None,
                 None,
                 &EmptyChartImageResolver,
+                true,
             )
             .is_some());
 
             let oversized_xml = style(MAX_CHART_PAINT_RECIPE_COMPONENTS + 1, outline);
             let oversized = root_of(&oversized_xml);
-            assert!(parse_chart_style_role_table(
+            assert!(parse_chart_style_role_table_for_chart(
                 oversized.root_element(),
                 &FixtureResolver,
                 None,
                 None,
                 &EmptyChartImageResolver,
+                true,
             )
             .is_none());
         }

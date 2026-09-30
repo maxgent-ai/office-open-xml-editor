@@ -10,7 +10,7 @@ import { deletedLegendEntryIndices, legendEntryIsVisible, legendEntryRanges } fr
 import type { Fill } from '../../types/common';
 import { bubblePointIsThreeD, classicMarkerPointIsPainted, dataLabelLegendKeyCount, effectiveMarkerSymbol, hasVisiblePointMarkerOverride, markerFillPaintFor, markerPaintComponents, markerSymbolConsumesFill, markersSuppressedByChartStyle, seriesHasMarkerDetail, seriesLegendMarkerIsVisible, seriesMarkerFillPaint, visibleBubbleSize } from '../marker-style.js';
 import { dataLabelIsDeleted } from '../data-label-style.js';
-import { computeBoxWhiskerStats } from '../box-whisker.js';
+import { boxWhiskerDotCandidateCount, computeBoxWhiskerStats } from '../box-whisker.js';
 import { THREE_D_MAX_SHAPE_FACES_PER_DATUM } from '../three-d-contract.js';
 import type { ChartThreeDRenderer } from '../three-d-contract.js';
 import { LEGEND_ROW_EXTRA_PX, bubblePointLegendMarker, classicPointLegendMarker } from './legend.js';
@@ -290,8 +290,9 @@ export function classicMarkerPaintWorkCount(
         for (const values of series.valuesByCategory) {
           const stats = computeBoxWhiskerStats(values, series.quartileMethod);
           if (!stats) continue;
-          if (series.showNonoutliers) repetitions += stats.inner.length;
-          if (series.showOutliers) repetitions += stats.outliers.length;
+          repetitions += boxWhiskerDotCandidateCount(
+            stats, series.showNonoutliers, series.showOutliers,
+          );
         }
         const styleIndex = chartExSeriesFormatIndex(series, seriesIndex);
         const paint = chartExMarkerPaint(

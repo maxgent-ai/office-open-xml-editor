@@ -220,11 +220,99 @@ export function effectiveChartStyleRole(
   return effective;
 }
 
+/**
+ * Linked Chart Style data roles that classic series never consume.
+ * Observed in Office: PowerPoint showed identical paint with and without
+ * linked fill/line/width/`phClr` recipes for horizontal bar, stacked column,
+ * area, pie, doughnut, scatter, bubble, radar, stock (high-low-close, so
+ * `hiLoLine`), filled surface, 3-D column and column+line combination; Excel,
+ * Word and PowerPoint agree for clustered column and standard line.
+ * `upBar`, `downBar` and `dataPointWireframe` were NOT measured (no open-close
+ * stock, up/down-bar or wireframe-surface control), and neither were the
+ * effects of these roles nor any Chart Colors influence on classic series
+ * paint through them: the rule is extended to all of these without direct
+ * evidence. The whole role is dropped so no residue (for example an
+ * `effectRef idx=0` sentinel) can gate direct formatting; paint then comes
+ * from direct formatting over the numeric `c:style` role only. Every other
+ * role (data labels, axes, gridlines, chart/plot area, legend, title,
+ * trendline, error bars, drop lines, series lines, data table) is unmeasured
+ * and keeps the linked-over-numeric cascade. ChartEx has no numeric layer and
+ * keeps its linked roles.
+ */
+const CLASSIC_INERT_LINKED_ROLES = [
+  'dataPoint', 'dataPoint3D', 'dataPointLine', 'dataPointMarker',
+  'dataPointWireframe', 'upBar', 'downBar', 'hiLoLine',
+] as const satisfies ReadonlyArray<ChartStyleRole>;
+
+/**
+ * `chartType` values produced only by the ChartEx (`cx:`) parser: the
+ * MS-ODRAWXML §2.24.4.19 series layouts plus the semantic families the parser
+ * derives from `clusteredColumn` (histogram, Pareto). The chart type is the
+ * file-format discriminator: optional model layers (the numeric role table,
+ * plot groups, the historical `chartex*Style` adapter aliases) may be absent
+ * from a hand-built classic model or present on an adapted one, so none of
+ * them can decide whether linked data roles are consumed.
+ */
+const CHARTEX_CHART_TYPES: ReadonlySet<string> = new Set([
+  'boxWhisker', 'clusteredColumn', 'funnel', 'histogram', 'pareto',
+  'paretoLine', 'regionMap', 'sunburst', 'treemap', 'waterfall',
+]);
+
+/**
+ * Marks a ChartEx model that a ChartEx family hands to a classic painter under
+ * a classic `chartType` (for example a histogram drawn as `clusteredBar`). A
+ * symbol key survives object spread but is not part of the public model, so a
+ * classic model can never acquire it from parsed or hand-built data.
+ */
+const CHARTEX_DELEGATE: unique symbol = Symbol('chartExDelegate');
+
+/** Re-type a ChartEx model for a shared classic painter without losing its
+ * file format: the painters still apply the ChartEx direct-format cascade. */
+export function chartExDelegateModel(chart: ChartModel, over: Partial<ChartModel>): ChartModel {
+  return { ...chart, ...over, [CHARTEX_DELEGATE]: true } as ChartModel;
+}
+
+/** A ChartEx model, or one delegated from a ChartEx family. Every other chart
+ * type is classic (`c:`), including a future ChartEx layout that the parser
+ * keeps verbatim and fail-closes. */
+export function chartModelIsChartEx(chart: ChartModel): boolean {
+  return CHARTEX_CHART_TYPES.has(chart.chartType)
+    || (chart as { [CHARTEX_DELEGATE]?: true })[CHARTEX_DELEGATE] === true;
+}
+
+function withoutInertLinkedRoles(
+  linked: Partial<Record<ChartStyleRole, ChartExElementStyle>> | null | undefined,
+): Partial<Record<ChartStyleRole, ChartExElementStyle>> | null | undefined {
+  if (!linked) return linked;
+  const result = { ...linked };
+  for (const role of CLASSIC_INERT_LINKED_ROLES) delete result[role];
+  return result;
+}
+
 /** Materialize the renderer-facing role table without losing source layers. */
 export function withEffectiveChartStyleRoles(chart: ChartModel): ChartModel {
   const numeric = chart.classicChartStyleRoles;
-  const linked = chart.linkedChartStyleRoles ?? chart.chartStyleRoles;
-  if (!numeric) return chart;
+  const classic = !chartModelIsChartEx(chart);
+  const rawLinked = chart.linkedChartStyleRoles ?? chart.chartStyleRoles;
+  // Every shared painter reads these tables and the `chartex*Style` adapter
+  // aliases, so removing the inert linked data roles here covers the
+  // renderer, the image preflight and the paint budgets with one decision.
+  const linked = classic ? withoutInertLinkedRoles(rawLinked) : rawLinked;
+  if (!numeric) {
+    if (!classic) return chart;
+    // No numeric layer: the linked table minus its inert data roles is the
+    // effective table. The legacy `chartex*Style` adapter aliases may still
+    // hold the raw linked role, and shared painters fall back to them, so the
+    // inert ones are cleared too.
+    return {
+      ...chart,
+      linkedChartStyleRoles: withoutInertLinkedRoles(chart.linkedChartStyleRoles),
+      chartStyleRoles: withoutInertLinkedRoles(chart.chartStyleRoles),
+      chartexDataPointStyle: undefined,
+      chartexDataPointLineStyle: undefined,
+      chartexDataPointMarkerStyle: undefined,
+    };
+  }
 
   const roleNames = new Set<ChartStyleRole>([
     ...Object.keys(numeric) as ChartStyleRole[],
@@ -270,7 +358,7 @@ export function withEffectiveChartStyleRoles(chart: ChartModel): ChartModel {
     // ChartEx-named adapter fields.  Once a numeric classic style exists the
     // adapters must point at the linked-over-numeric result, otherwise a raw
     // partial/NoStyle role bypasses the numeric fallback in shared painters.
-    // True ChartEx models have no classic role table and returned above.
+    // ChartEx models have no classic role table and returned above.
     chartexDataPointStyle: roles.dataPoint,
     chartexDataPointLineStyle: roles.dataPointLine,
     chartexSeriesLineStyle: roles.seriesLine,

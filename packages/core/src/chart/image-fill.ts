@@ -5,7 +5,7 @@ import type {
 import { drawImageCropped, imageNaturalSize, srcRectHasVisibleArea } from '../image/crop.js';
 import { fillCanProduceVisiblePixels } from '../shape/paint.js';
 import { EMU_PER_PT, PT_TO_PX } from '../units.js';
-import { computeBoxWhiskerStats } from './box-whisker.js';
+import { boxWhiskerDotCandidateCount, computeBoxWhiskerStats } from './box-whisker.js';
 import {
   classicDataLabelPointIsPainted,
   classicMarkerPointIsPainted,
@@ -1025,8 +1025,9 @@ function collectChartMarkerImageFillResult(
     for (const values of series.valuesByCategory) {
       const stats = computeBoxWhiskerStats(values, series.quartileMethod);
       if (!stats) continue;
-      if (series.showNonoutliers) markerCount += stats.inner.length;
-      if (series.showOutliers) markerCount += stats.outliers.length;
+      markerCount += boxWhiskerDotCandidateCount(
+        stats, series.showNonoutliers, series.showOutliers,
+      );
     }
     if (markerCount === 0) continue;
     const styleIndex = series.chartexFormatIdx ?? seriesIndex;
