@@ -543,6 +543,25 @@ fn model_paragraph(
     } else {
         Vec::new()
     };
+    // MS-PPT 2.9.41 adds a terminal CR and 2.9.44/46 styles that position.
+    // `end_character` was read at this paragraph's actual CR, independently
+    // of the last visible run. Carry that fact to the receiving insertion
+    // point (ECMA-376 21.1.2.2.2); do not infer it from visible text or a break.
+    model_charge::<TextRunData>(model_budget, 1)?;
+    // No glyph is painted for the CR. Preserve representable formatting,
+    // but a paint effect the model cannot express must not reject empty text
+    // or mark the visible runs as needing an alternative merely for the CR.
+    let insertion_effect = std::cell::Cell::new(None);
+    let insertion_context = Context {
+        deferred_effect: Some(&insertion_effect),
+        ..context
+    };
+    let end_run_properties = Some(Box::new(model_run(
+        "",
+        end_character,
+        insertion_context,
+        model_budget,
+    )?));
     let empty = !runs.iter().any(|run| matches!(run, TextRun::Text(_)));
     Ok(ModelParagraph {
         alignment: alignment.to_owned(),
@@ -566,10 +585,9 @@ fn model_paragraph(
         def_tab_sz: paragraph.default_tab.map(|v| master_to_emu(i64::from(v))),
         rtl,
         ea_ln_brk: true,
-        // The binary projector has no DrawingML paragraph fontAlgn or
-        // endParaRPr facts; never manufacture them from the last text run.
+        // No binary paragraph fontAlgn fact is available here.
         font_algn: None,
-        end_run_properties: None,
+        end_run_properties,
         runs,
     })
 }
@@ -960,8 +978,8 @@ mod tests {
             Context::default(),
             vec![],
             &base.character,
-            &mut 100,
-            &mut 100,
+            &mut 10_000,
+            &mut 10_000,
         )
         .unwrap();
         assert_eq!(paragraph.def_font_size, None);
@@ -986,6 +1004,7 @@ mod tests {
         let required = std::mem::size_of::<ModelParagraph>()
             + 2 * std::mem::size_of::<TextRun>()
             + text.len()
+            + std::mem::size_of::<TextRunData>()
             + 1;
         let mut available = required;
         let result = paragraphs(&text, &style, context, &mut 10_000, &mut available).unwrap();
@@ -1044,7 +1063,8 @@ mod tests {
             ruler_tabs: Some(tabs),
             ..Context::default()
         };
-        let required = 1 + 2 * std::mem::size_of::<TabStop>() + 1 + 3;
+        let required =
+            1 + 2 * std::mem::size_of::<TabStop>() + 1 + 3 + std::mem::size_of::<TextRunData>();
         let mut budget = required;
         let result = model_paragraph(
             &base.paragraph,
@@ -1092,6 +1112,86 @@ mod tests {
             style.extend(u32s(0));
         }
         style
+    }
+
+    #[test]
+    fn paragraph_end_uses_the_cf_record_at_each_cr_not_the_last_visible_run() {
+        // MS-PPT 2.9.41/44/46: explicit and implicit CRs are styled characters.
+        let base = explicit_origin();
+        let mut style = [u32s(4), u16s(0), u32s(0)].concat();
+        for size in [24, 18, 36, 48] {
+            style.extend([u32s(1), u32s(0x20000), u16s(size)].concat());
+        }
+        let model = paragraphs(
+            "A\rB",
+            &style,
+            Context {
+                levels: Some(std::slice::from_ref(&base)),
+                ..Context::default()
+            },
+            &mut 100,
+            &mut 100_000,
+        )
+        .unwrap();
+        assert_eq!(
+            model[0]
+                .end_run_properties
+                .as_ref()
+                .and_then(|v| v.font_size),
+            Some(18.0)
+        );
+        assert_eq!(
+            model[1]
+                .end_run_properties
+                .as_ref()
+                .and_then(|v| v.font_size),
+            Some(48.0)
+        );
+        assert!(matches!(&model[0].runs[0], TextRun::Text(v) if v.font_size == Some(24.0)));
+        assert!(matches!(&model[1].runs[0], TextRun::Text(v) if v.font_size == Some(36.0)));
+    }
+
+    #[test]
+    fn cr_only_emboss_does_not_poison_visible_text_or_the_callers_effect_gate() {
+        let mut base = explicit_origin();
+        base.character.mask = 0x30000;
+        base.character.size = 32;
+        base.character.font = Some(0);
+        let style = [
+            u32s(2),
+            u16s(0),
+            u32s(0),
+            u32s(1),
+            u32s(0x20000),
+            u16s(24),
+            u32s(1),
+            u32s(0x200),
+            u16s(0x200),
+        ]
+        .concat();
+        let gate = std::cell::Cell::new(None);
+        let fonts = ["Arial".to_owned()];
+        let model = paragraphs(
+            "X",
+            &style,
+            Context {
+                fonts: &fonts,
+                levels: Some(std::slice::from_ref(&base)),
+                deferred_effect: Some(&gate),
+                ..Context::default()
+            },
+            &mut 100,
+            &mut 100_000,
+        )
+        .unwrap();
+        assert_eq!(gate.get(), None);
+        let end = model[0].end_run_properties.as_ref().unwrap();
+        assert_eq!(
+            (end.font_size, end.font_family.as_deref()),
+            (Some(32.0), Some("Arial"))
+        );
+        assert!(matches!(&model[0].runs[0], TextRun::Text(v) if v.font_size == Some(24.0)));
+        // The pre-existing visible emboss case stays rejected (the test above).
     }
 
     #[test]
@@ -1395,8 +1495,8 @@ mod tests {
                 Context::default(),
                 vec![],
                 &base.character,
-                &mut 100,
-                &mut 100,
+                &mut 10_000,
+                &mut 10_000,
             );
             if value > 13200 {
                 assert!(result.unwrap_err().contains("percentage line spacing"));

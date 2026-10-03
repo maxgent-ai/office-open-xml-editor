@@ -1928,8 +1928,9 @@ fn same_run_formatting(
 /// a binary paragraph (MS-PPT 2.9.43), and the masked alternative states each
 /// one as a masked character of the enclosing run, not as `a:br` (every
 /// corpus alternative; both runs of one character and breaks leading a
-/// longer run). Each such character becomes a line break that splits its run
-/// into runs of the same formatting. Other break characters inside a run
+/// longer run). Restore it as the receiving model's in-run LF, keeping the
+/// alternative's run boundaries and formatting. Authored `a:br` stays a
+/// distinct break with its own rPr. Other break characters inside a run
 /// have no observed form and are not compared. An equation has no binary
 /// characters to compare.
 #[cfg(any(test, feature = "direct-ppt"))]
@@ -1968,7 +1969,7 @@ fn substitute_text_bounded(
         *model_budget = model_budget
             .checked_sub(scratch)
             .ok_or(Verdict::Unverifiable("text model budget"))?;
-        let units: Vec<u16> = source.encode_utf16().collect();
+        let mut units: Vec<u16> = source.encode_utf16().collect();
         let mut at = 0usize;
         let mut runs = Vec::new();
         for run in std::mem::take(&mut paragraph.runs) {
@@ -1977,7 +1978,7 @@ fn substitute_text_bounded(
                     let len = data.text.encode_utf16().count();
                     let slice = at
                         .checked_add(len)
-                        .and_then(|end| units.get(at..end))
+                        .and_then(|end| units.get_mut(at..end))
                         .ok_or(DIFFERS)?;
                     at += len;
                     if slice.iter().any(|&u| matches!(u, 0x0a | 0x2028))
@@ -1985,47 +1986,29 @@ fn substitute_text_bounded(
                     {
                         return Err(Verdict::Unverifiable("line break"));
                     }
-                    // Clear masked text before cloning style so each fragment
-                    // does not copy the entire original run. Charge retained
-                    // style/character storage and run capacity before cloning.
-                    data.text.clear();
-                    let style_bytes = usize::try_from(
-                        ooxml_common::json_measurement::measure_json(&data)
-                            .map_err(|_| Verdict::Unverifiable("text model budget"))?
-                            .json_bytes,
-                    )
-                    .map_err(|_| Verdict::Unverifiable("text model budget"))?;
-                    let mut pieces = slice.split(|&u| u == 0x0b).peekable();
-                    while let Some(piece) = pieces.next() {
-                        if !piece.is_empty() {
-                            let owned = piece
-                                .len()
-                                .checked_mul(3)
-                                .and_then(|bytes| bytes.checked_add(style_bytes))
-                                .ok_or(Verdict::Unverifiable("text model budget"))?;
-                            *model_budget = model_budget
-                                .checked_sub(owned)
-                                .ok_or(Verdict::Unverifiable("text model budget"))?;
-                            text_style::direct_model::reserve_run_slot(&mut runs, model_budget)
-                                .map_err(|_| Verdict::Unverifiable("text model budget"))?;
-                            let mut part = data.clone();
-                            part.text = String::from_utf16(piece).map_err(|_| DIFFERS)?;
-                            runs.push(TextRun::Text(part));
-                        }
-                        if pieces.peek().is_some() {
-                            *model_budget = model_budget
-                                .checked_sub(style_bytes)
-                                .ok_or(Verdict::Unverifiable("text model budget"))?;
-                            text_style::direct_model::reserve_run_slot(&mut runs, model_budget)
-                                .map_err(|_| Verdict::Unverifiable("text model budget"))?;
-                            runs.push(text_style::direct_model::line_break(Some(&data)));
+                    // This character came from inside the alternative's a:t,
+                    // not from an authored a:br. Keep its enclosing run and
+                    // normalize binary VT to the model's in-run LF carrier.
+                    // The receiver already sizes empty lines opened by an LF
+                    // from that run; inventing a:br nodes loses this
+                    // ownership and changes final insertion-line formatting.
+                    // No endParaRPr or binary/XML style precedence is inferred.
+                    let owned = slice
+                        .len()
+                        .checked_mul(3)
+                        .ok_or(Verdict::Unverifiable("text model budget"))?;
+                    *model_budget = model_budget
+                        .checked_sub(owned)
+                        .ok_or(Verdict::Unverifiable("text model budget"))?;
+                    for unit in slice.iter_mut() {
+                        if *unit == 0x0b {
+                            *unit = 0x0a;
                         }
                     }
-                    if slice.is_empty() {
-                        text_style::direct_model::reserve_run_slot(&mut runs, model_budget)
-                            .map_err(|_| Verdict::Unverifiable("text model budget"))?;
-                        runs.push(TextRun::Text(data));
-                    }
+                    data.text = String::from_utf16(slice).map_err(|_| DIFFERS)?;
+                    text_style::direct_model::reserve_run_slot(&mut runs, model_budget)
+                        .map_err(|_| Verdict::Unverifiable("text model budget"))?;
+                    runs.push(TextRun::Text(data));
                 }
                 line_break @ TextRun::Break { .. } => {
                     if !matches!(units.get(at), Some(0x0b | 0x0a | 0x2028)) {
@@ -2457,16 +2440,30 @@ mod tests {
     }
 
     #[test]
-    fn masked_break_style_fanout_is_charged_before_projection() {
+    fn masked_text_scratch_and_restored_characters_are_charged_before_projection() {
         let mut alternative = shape("rect");
-        let mut styled = run("__________");
-        styled["fontFamily"] = serde_json::json!("x".repeat(512));
-        alternative.text_body = body(&[&[styled]]);
+        alternative.text_body = body(&[&[run("__________")]]);
+        // 10 UTF-16 units of scratch, bounded UTF-8 output, one initial
+        // two-slot run allocation. Deleting either string charge must fail
+        // the successful exact-boundary assertion, not just an error case.
+        let required = 10 * 2 + 10 * 3 + 2 * std::mem::size_of::<TextRun>();
+        let mut budget = required;
+        let mut admitted = alternative.clone();
+        assert_eq!(
+            substitute_text_bounded(
+                &mut admitted,
+                Some("A\u{b}A\u{b}A\u{b}A\u{b}A\u{b}"),
+                &mut budget,
+            ),
+            Ok(())
+        );
+        assert_eq!(budget, 0);
+        assert_eq!(texts(&admitted), [vec!["A\nA\nA\nA\nA\n"]]);
         assert_eq!(
             substitute_text_bounded(
                 &mut alternative,
                 Some("A\u{b}A\u{b}A\u{b}A\u{b}A\u{b}"),
-                &mut 1024
+                &mut (required - 1),
             ),
             Err(Verdict::Unverifiable("text model budget"))
         );
@@ -2485,16 +2482,27 @@ mod tests {
         substitute_text(&mut alternative, Some("A\u{b}B\u{b}")).unwrap();
         let runs = &alternative.text_body.as_ref().unwrap().paragraphs[0].runs;
         assert!(matches!(
-            &runs[1],
-            TextRun::Break {
-                font_size: Some(24.0),
-                bold: Some(true),
-                ..
-            }
+            &runs[0], TextRun::Text(v)
+                if v.text == "A\nB" && v.font_size == Some(24.0) && v.bold == Some(true)
         ));
         assert!(
-            matches!(&runs[3], TextRun::Break { font_size: Some(36.0), font_family: Some(face), italic: Some(true), .. } if face == "Arial")
+            matches!(&runs[1], TextRun::Break { font_size: Some(36.0), font_family: Some(face), italic: Some(true), .. } if face == "Arial")
         );
+    }
+
+    #[test]
+    fn masked_in_run_breaks_preserve_the_run_and_do_not_invent_insertion_properties() {
+        let mut alternative = shape("rect");
+        let mut styled = run("_____");
+        styled["fontSize"] = serde_json::json!(40.0);
+        styled["fontFamily"] = serde_json::json!("Arial");
+        alternative.text_body = body(&[&[styled]]);
+        substitute_text(&mut alternative, Some("\u{b}A\u{b}B\u{b}")).unwrap();
+        let p = &alternative.text_body.as_ref().unwrap().paragraphs[0];
+        assert!(matches!(p.runs.as_slice(), [TextRun::Text(v)]
+            if v.text == "\nA\nB\n" && v.font_size == Some(40.0)
+                && v.font_family.as_deref() == Some("Arial")));
+        assert!(p.end_run_properties.is_none());
     }
 
     #[test]
@@ -2617,7 +2625,7 @@ mod tests {
             substitute_text(&mut adopted, Some("AB\u{b}\u{b}CDEF")),
             Ok(())
         );
-        assert_eq!(texts(&adopted), [vec!["AB", "<br>", "<br>", "CD", "EF"]]);
+        assert_eq!(texts(&adopted), [vec!["AB", "\n", "\nCD", "EF"]]);
         // Other break characters inside a run have no observed form.
         assert_eq!(
             substitute_text(&mut alternative.clone(), Some("AB\u{2028}\u{b}CDEF")),
