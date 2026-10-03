@@ -112,12 +112,12 @@ pub(super) struct HyperlinkCatalog {
 }
 
 impl HyperlinkCatalog {
-    pub fn get(&self, id: u32) -> Result<String, String> {
+    pub fn get(&self, id: u32) -> Result<&str, String> {
         if let Some(error) = &self.error {
             return Err(error.clone());
         }
         match self.targets.get(&id) {
-            Some(Some(target)) => Ok(target.clone()),
+            Some(Some(target)) => Ok(target.as_str()),
             Some(None) => Err(unsupported("ambiguous PowerPoint hyperlink reference")),
             None => Err(unsupported("unresolved PowerPoint hyperlink reference")),
         }

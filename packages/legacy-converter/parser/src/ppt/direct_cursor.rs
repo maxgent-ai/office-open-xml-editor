@@ -2,8 +2,9 @@
 //! Cancellation discards only an undelivered model buffer; the session retains
 //! its cumulative budgets and admitted media until terminal close.
 use super::direct_session::DirectSession;
-use ooxml_common::json_measurement::measure_json;
+use ooxml_common::json_measurement::serialize_json_with_limit;
 use ooxml_common::pull::insufficient_credit_error;
+use ooxml_common::resource::HardResourceLimitKind;
 use ooxml_common::resource::HARD_MAX_PPTX_SLIDE_JSON_BYTES;
 use ooxml_common::resource::{HARD_MAX_PPTX_BOOTSTRAP_JSON_BYTES, HARD_MAX_PPTX_BOOTSTRAP_SLIDES};
 use pptx_model::{BootstrapSlide, PresentationBootstrap};
@@ -62,20 +63,14 @@ impl DirectCursor {
             embedded_fonts: Vec::new(),
             slides,
         };
-        let measured = measure_json(&bootstrap)?;
-        if measured.json_bytes > HARD_MAX_PPTX_BOOTSTRAP_JSON_BYTES {
-            return Err("PowerPoint bootstrap exceeds the PPTX JSON ceiling".to_string());
-        }
-        let capacity = usize::try_from(measured.json_bytes)
-            .map_err(|_| "PowerPoint bootstrap JSON size exceeds this platform".to_string())?;
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(capacity)
-            .map_err(|_| "PowerPoint bootstrap JSON allocation failed".to_string())?;
-        serde_json::to_writer(&mut bytes, &bootstrap)
-            .map_err(|error| format!("serialize error: {error}"))?;
-        debug_assert_eq!(measured.json_bytes, bytes.len() as u64);
-        Ok(bytes)
+        serialize_json_with_limit(
+            &bootstrap,
+            None,
+            HardResourceLimitKind::PptxBootstrapJsonBytes,
+            None,
+            HARD_MAX_PPTX_BOOTSTRAP_JSON_BYTES,
+            "PowerPoint bootstrap exceeds the PPTX JSON ceiling",
+        )
     }
 
     pub fn pull_slide(
@@ -105,32 +100,21 @@ impl DirectCursor {
                 return Err(error);
             }
         };
-        let measured = match measure_json(&slide) {
-            Ok(measured) => measured,
+        let bytes = match serialize_json_with_limit(
+            &slide,
+            None,
+            HardResourceLimitKind::PptxSlideJsonBytes,
+            None,
+            HARD_MAX_PPTX_SLIDE_JSON_BYTES,
+            "PowerPoint slide exceeds the PPTX slide JSON ceiling",
+        ) {
+            Ok(bytes) => bytes,
             Err(error) => {
                 let _ = self.close_presentation_session();
                 return Err(error);
             }
         };
-        if measured.json_bytes > HARD_MAX_PPTX_SLIDE_JSON_BYTES {
-            let _ = self.close_presentation_session();
-            return Err("PowerPoint slide exceeds the PPTX slide JSON ceiling".to_string());
-        }
-        let capacity = usize::try_from(measured.json_bytes).map_err(|_| {
-            let _ = self.close_presentation_session();
-            "PowerPoint slide JSON size exceeds this platform".to_string()
-        })?;
-        let mut bytes = Vec::new();
-        bytes.try_reserve_exact(capacity).map_err(|_| {
-            let _ = self.close_presentation_session();
-            "PowerPoint slide JSON allocation failed".to_string()
-        })?;
-        serde_json::to_writer(&mut bytes, &slide).map_err(|error| {
-            let _ = self.close_presentation_session();
-            format!("serialize error: {error}")
-        })?;
         let byte_length = bytes.len();
-        debug_assert_eq!(measured.json_bytes, byte_length as u64);
         self.prepared = Some(PreparedSlide {
             index: slide_index,
             operation_id,

@@ -278,7 +278,12 @@ fn push_text_runs(
         if index != 0 {
             charge(budget, "PowerPoint direct text work budget exceeded")?;
             reserve_run_slot(output, model_budget)?;
-            output.push(TextRun::Break);
+            output.push(line_break(Some(&model_run(
+                "",
+                character,
+                context,
+                model_budget,
+            )?)));
         }
         if !part.is_empty() {
             charge(budget, "PowerPoint direct text work budget exceeded")?;
@@ -297,7 +302,10 @@ fn push_text_runs(
 /// Charge backing storage before growing it. Capacity follows actual emitted
 /// runs, not character count; uniform text stays a single run. Geometric
 /// growth avoids quadratic copying for heavily styled input.
-fn reserve_run_slot(output: &mut Vec<TextRun>, budget: &mut usize) -> Result<(), String> {
+pub(in crate::ppt) fn reserve_run_slot(
+    output: &mut Vec<TextRun>,
+    budget: &mut usize,
+) -> Result<(), String> {
     if output.len() < output.capacity() {
         return Ok(());
     }
@@ -310,6 +318,24 @@ fn reserve_run_slot(output: &mut Vec<TextRun>, budget: &mut usize) -> Result<(),
     output
         .try_reserve_exact(capacity - output.len())
         .map_err(|_| unsupported("PowerPoint direct text model allocation failed"))
+}
+
+/// Preserve the known line-box formatting when projecting a break. Binary
+/// TextCFException applies across the break's UTF-16 position (MS-PPT §2.9.14);
+/// adopted DrawingML a:br retains its own rPr (ECMA-376 §21.1.2.2.1).
+pub(in crate::ppt) fn line_break(data: Option<&TextRunData>) -> TextRun {
+    TextRun::Break {
+        font_size: data.and_then(|run| run.font_size),
+        font_family: data.and_then(|run| run.font_family.clone()),
+        bold: data.and_then(|run| run.bold),
+        italic: data.and_then(|run| run.italic),
+        character_attributes: data
+            .map(|run| run.character_attributes.clone())
+            .unwrap_or_default(),
+        character_child_attributes: data
+            .map(|run| run.character_child_attributes.clone())
+            .unwrap_or_default(),
+    }
 }
 
 fn model_run(
@@ -379,12 +405,23 @@ fn model_run(
         underline: character.mask & 4 != 0 && character.style & 4 != 0,
         underline_style: None,
         underline_color: None,
+        // DrawingML-only properties absent from the binary CF record stay
+        // unassigned. An adopted alternative retains its complete model.
+        underline_fill: None,
+        underline_line: None,
+        underline_line_no_fill: false,
         strikethrough: false,
         strike_double: false,
         font_size: (character.mask & 0x20000 != 0).then_some(f64::from(character.size)),
         color,
         font_family: font(character.font)?,
         font_family_ea: font(character.ea)?,
+        font_family_cs: None,
+        lang: None,
+        alt_lang: None,
+        glyph_fill: None,
+        pattern_fill: None,
+        no_fill: false,
         font_family_sym: font(character.symbol)?,
         // MS-PPT baseline is a percentage of line height, whereas this model's
         // baseline is thousandths of a point. Character::read validates it, but
@@ -395,10 +432,15 @@ fn model_run(
         field_type: None,
         hyperlink: None,
         hyperlink_action: None,
+        hyperlink_uses_text_fill: false,
+        hyperlink_mouse_over: None,
+        hyperlink_mouse_over_action: None,
         shadow,
         reflection: None,
         outline: None,
         highlight: None,
+        character_attributes: Default::default(),
+        character_child_attributes: Default::default(),
     })
 }
 
@@ -524,6 +566,10 @@ fn model_paragraph(
         def_tab_sz: paragraph.default_tab.map(|v| master_to_emu(i64::from(v))),
         rtl,
         ea_ln_brk: true,
+        // The binary projector has no DrawingML paragraph fontAlgn or
+        // endParaRPr facts; never manufacture them from the last text run.
+        font_algn: None,
+        end_run_properties: None,
         runs,
     })
 }
@@ -959,7 +1005,7 @@ mod tests {
         let mut budget = 4 * std::mem::size_of::<TextRun>();
         for _ in 0..4 {
             reserve_run_slot(&mut runs, &mut budget).unwrap();
-            runs.push(TextRun::Break);
+            runs.push(line_break(None));
         }
         assert_eq!(budget, 0);
         assert_eq!(runs.capacity(), 4);
@@ -1095,7 +1141,7 @@ mod tests {
         assert_eq!(model.len(), 1);
         assert!(matches!(
             model[0].runs.as_slice(),
-            [TextRun::Text(first), TextRun::Break, TextRun::Text(last)]
+            [TextRun::Text(first), TextRun::Break { .. }, TextRun::Text(last)]
                 if first.text == "AB" && last.text == "CD"
         ));
     }
@@ -1241,7 +1287,7 @@ mod tests {
             .all(|paragraph| paragraph.def_tab_sz == Some(master_to_emu(1152))));
         assert!(matches!(
             model[0].runs.as_slice(),
-            [TextRun::Text(_), TextRun::Break, TextRun::Text(_)]
+            [TextRun::Text(_), TextRun::Break { .. }, TextRun::Text(_)]
         ));
     }
 
@@ -1296,7 +1342,7 @@ mod tests {
         assert_eq!(model[0].def_tab_sz, Some(914_400));
         assert!(matches!(
             model[0].runs.as_slice(),
-            [TextRun::Text(_), TextRun::Break, TextRun::Text(_)]
+            [TextRun::Text(_), TextRun::Break { .. }, TextRun::Text(_)]
         ));
         let TextRun::Text(run) = &model[0].runs[0] else {
             panic!()

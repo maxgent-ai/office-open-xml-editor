@@ -1383,7 +1383,7 @@ mod tests {
             paragraph
                 .runs
                 .iter()
-                .filter(|run| matches!(run, TextRun::Break))
+                .filter(|run| matches!(run, TextRun::Break { .. }))
                 .count()
         };
         for text in ["a\u{b}b", "\u{b}ab", "ab\u{b}", "a\nb", "a\u{2028}b"] {

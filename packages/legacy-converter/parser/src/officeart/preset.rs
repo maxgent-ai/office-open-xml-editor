@@ -570,7 +570,8 @@ mod tests {
         // changed independently by +1000. The negative controls moved the
         // same guides in the opposite direction and their PDFs changed the
         // corresponding outlines. Coordinates are DrawingML EMUs.
-        let cases: &[(u16, &[i32], i64, i64, &[(usize, &[f64])])] = &[
+        type ArrowCase<'a> = (u16, &'a [i32], i64, i64, &'a [(usize, &'a [f64])]);
+        let cases: &[ArrowCase<'_>] = &[
             (
                 102,
                 &[11411, 19053, 16200],

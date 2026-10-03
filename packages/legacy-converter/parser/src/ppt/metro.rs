@@ -127,29 +127,49 @@ impl Theme {
 
 /// Read the round-trip theme of a main master's child records; `None` when
 /// the master has none.
-pub(in crate::ppt) fn master_theme(records: &[Record<'_>]) -> Option<Theme> {
+pub(in crate::ppt) fn master_theme(
+    records: &[Record<'_>],
+    decoded_budget: &mut usize,
+) -> Result<Option<Theme>, String> {
     let mut themes = records.iter().filter(|r| r.kind == 0x040e);
-    let theme = themes.next()?;
+    let Some(theme) = themes.next() else {
+        return Ok(None);
+    };
+    let mut budget_exceeded = false;
     let mut readable = || -> Option<Theme> {
         if themes.next().is_some() {
             return None;
         }
         let mut maps = records.iter().filter(|r| r.kind == 0x040f);
         let clr_map = match (maps.next(), maps.next()) {
-            (Some(map), None) => Some(std::str::from_utf8(map.payload).ok()?.to_owned()),
+            (Some(map), None) => {
+                if super::charge_text(decoded_budget, map.payload.len()).is_err() {
+                    budget_exceeded = true;
+                    return None;
+                }
+                Some(std::str::from_utf8(map.payload).ok()?.to_owned())
+            }
             (None, None) => None,
             _ => return None,
         };
         Some(Theme::Readable {
-            theme_xml: theme_part(theme.payload)?,
+            theme_xml: theme_part(theme.payload, decoded_budget, &mut budget_exceeded)?,
             clr_map,
             format_scheme: std::cell::OnceCell::new(),
         })
     };
-    Some(readable().unwrap_or(Theme::Unreadable))
+    let theme = readable().unwrap_or(Theme::Unreadable);
+    if budget_exceeded {
+        return Err(unsupported("PowerPoint theme decoded byte budget exceeded"));
+    }
+    Ok(Some(theme))
 }
 
-fn theme_part(package: &[u8]) -> Option<String> {
+fn theme_part(
+    package: &[u8],
+    decoded_budget: &mut usize,
+    budget_exceeded: &mut bool,
+) -> Option<String> {
     use std::io::Read;
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(package)).ok()?;
     if archive.len() > MAX_THEME_ENTRIES {
@@ -161,12 +181,22 @@ fn theme_part(package: &[u8]) -> Option<String> {
         if entry.size() > MAX_THEME_BYTES || entry.encrypted() {
             return None;
         }
+        // Charge every inflated theme/relationship part before allocation.
+        // All main masters share this budget; per-entry ZIP limits alone do
+        // not bound retained themes from a highly compressed presentation.
+        let declared_bytes = usize::try_from(entry.size()).ok()?;
+        if super::charge_text(decoded_budget, declared_bytes).is_err() {
+            *budget_exceeded = true;
+            return None;
+        }
         let mut text = String::new();
         entry
-            .take(MAX_THEME_BYTES + 1)
+            .take(declared_bytes as u64 + 1)
             .read_to_string(&mut text)
             .ok()?;
-        (text.len() as u64 <= MAX_THEME_BYTES).then_some(text)
+        // ZIP metadata is untrusted. Never retain actual inflated bytes in
+        // excess of the declared, precharged size (including forged sizes).
+        (text.len() == declared_bytes).then_some(text)
     };
     // Follow the package relationships: root -> theme manager -> theme.
     let target = |rels: &str, source: &str, kind: &str| -> Option<String> {
@@ -194,7 +224,11 @@ fn theme_part(package: &[u8]) -> Option<String> {
         format!("{dir}/_rels/{name}.rels")
     };
     let theme = target(&read(&rels)?, &manager, "/theme")?;
-    read(&theme)
+    let xml = read(&theme)?;
+    let doc = roxmltree::Document::parse(&xml).ok()?;
+    let root = doc.root_element();
+    (root.tag_name().name() == "theme" && ooxml_common::ns::is_a_ns(root.tag_name().namespace()))
+        .then_some(xml)
 }
 
 /// What the binary shape records, for comparison with its alternative.
@@ -882,6 +916,16 @@ pub(in crate::ppt) fn adopt(
     else {
         return Err(unverifiable("theme"));
     };
+    // The modern parser can tolerate an absent/malformed style matrix. An
+    // optional binary alternative has a stronger contract: its theme facts
+    // must be readable before claiming equivalence with the binary shape.
+    let theme_doc = roxmltree::Document::parse(theme_xml).map_err(|_| unverifiable("theme"))?;
+    let theme_root = theme_doc.root_element();
+    if theme_root.tag_name().name() != "theme"
+        || !ooxml_common::ns::is_a_ns(theme_root.tag_name().namespace())
+    {
+        return Err(unverifiable("theme"));
+    }
     let parsed = pptx_parser::parse_standalone_shape_part(
         blob,
         &part,
@@ -940,8 +984,11 @@ pub(in crate::ppt) fn adopt(
     } else {
         (None, None, None)
     };
+    // Validate all selected style references, including ordinary shapes.
+    // Missing matrix entries must not adopt the modern renderer's fallback.
+    let locals = placeholder_locals(blob, &part, theme)?;
     let local = if parsed.placeholder {
-        Some(placeholder_locals(blob, &part, theme)?)
+        Some(locals)
     } else {
         None
     };
@@ -957,7 +1004,7 @@ pub(in crate::ppt) fn adopt(
         binary.element.geometry == "custGeom" && shape.geometry != "custGeom";
     let substituted = {
         let mut candidate = shape.clone();
-        substitute_text(&mut candidate, binary.text).map(|()| candidate)
+        substitute_text_bounded(&mut candidate, binary.text, model_budget).map(|()| candidate)
     };
     // A local placeholder override is ambiguous when it disagrees: XML-only
     // geometry/fill edits render from the alternative, whereas binary-only
@@ -1196,6 +1243,12 @@ fn placeholder_locals(blob: &[u8], part: &str, theme: &Theme) -> Result<Placehol
             .filter(|node| node.is_element() && is_a_ns(node.tag_name().namespace()))
         {
             let selected = match reference.tag_name().name() {
+                "fillRef" => format.lookup_fill_ref(
+                    reference
+                        .attribute("idx")
+                        .and_then(|idx| idx.parse().ok())
+                        .ok_or_else(|| unverifiable("fill style"))?,
+                ),
                 "lnRef" => format.lookup_line_ref(
                     reference
                         .attribute("idx")
@@ -1712,34 +1765,60 @@ fn same_hyperlinks(binary: &ShapeElement, alternative: &ShapeElement) -> Verdict
         return Verdict::Differs("shape hyperlink");
     }
     type Link<'a> = (Option<&'a str>, Option<&'a str>);
-    type LinkParagraphs<'a> = Vec<Vec<Link<'a>>>;
-    fn expand(shape: &ShapeElement) -> Option<Option<LinkParagraphs<'_>>> {
-        shape.text_body.as_ref().map(|body| {
-            body.paragraphs
-                .iter()
-                .map(|paragraph| {
-                    let mut units = Vec::new();
-                    for run in &paragraph.runs {
-                        match run {
-                            TextRun::Text(data) => units.extend(std::iter::repeat_n(
-                                (data.hyperlink.as_deref(), data.hyperlink_action.as_deref()),
-                                data.text.encode_utf16().count(),
-                            )),
-                            TextRun::Break => units.push((None, None)),
-                            TextRun::Math { .. } => return None,
-                        }
-                    }
-                    Some(units)
+    let (Some(b), Some(a)) = (&binary.text_body, &alternative.text_body) else {
+        return if binary.text_body.is_none() && alternative.text_body.is_none() {
+            Verdict::Same
+        } else {
+            Verdict::Unverifiable("text hyperlink")
+        };
+    };
+    if b.paragraphs.len() != a.paragraphs.len() {
+        return Verdict::Differs("text hyperlink");
+    }
+    fn spans(runs: &[TextRun]) -> Option<impl Iterator<Item = (usize, Link<'_>)>> {
+        if runs.iter().any(|run| matches!(run, TextRun::Math { .. })) {
+            return None;
+        }
+        Some(
+            runs.iter()
+                .map(|run| match run {
+                    TextRun::Text(data) => (
+                        data.text.encode_utf16().count(),
+                        (data.hyperlink.as_deref(), data.hyperlink_action.as_deref()),
+                    ),
+                    _ => (1, (None, None)),
                 })
-                .collect::<Option<Vec<_>>>()
-        })
+                .filter(|(len, _)| *len > 0),
+        )
     }
-    match (expand(binary), expand(alternative)) {
-        (Some(Some(a)), Some(Some(b))) if a == b => Verdict::Same,
-        (None, None) => Verdict::Same,
-        (Some(Some(_)), Some(Some(_))) => Verdict::Differs("text hyperlink"),
-        _ => Verdict::Unverifiable("text hyperlink"),
+    for (bp, ap) in b.paragraphs.iter().zip(&a.paragraphs) {
+        let (Some(mut bx), Some(mut ax)) = (spans(&bp.runs), spans(&ap.runs)) else {
+            return Verdict::Unverifiable("text hyperlink");
+        };
+        let (mut bs, mut aspan) = (bx.next(), ax.next());
+        // Compare each run overlap once. Expanding per UTF-16 position would
+        // allocate large scratch arrays and repeatedly compare long URLs.
+        while let (Some((bn, bl)), Some((an, al))) = (bs, aspan) {
+            if bl != al {
+                return Verdict::Differs("text hyperlink");
+            }
+            let common = bn.min(an);
+            bs = if bn == common {
+                bx.next()
+            } else {
+                Some((bn - common, bl))
+            };
+            aspan = if an == common {
+                ax.next()
+            } else {
+                Some((an - common, al))
+            };
+        }
+        if bs.is_some() || aspan.is_some() {
+            return Verdict::Differs("text hyperlink");
+        }
     }
+    Verdict::Same
 }
 
 /// Run formatting both forms state must agree character by character: font
@@ -1768,27 +1847,32 @@ fn same_run_formatting(
     if b.paragraphs.len() != a.paragraphs.len() {
         return Verdict::Differs("paragraph structure");
     }
-    let units = |runs: &[TextRun]| -> Option<Vec<(Unit, Format)>> {
-        let mut units = Vec::new();
-        for run in runs {
-            match run {
-                TextRun::Text(d) => {
-                    let format = (d.font_size, d.bold, d.italic);
-                    if d.field_type.is_some() {
-                        units.push((Unit::Field, format));
-                    } else {
-                        units.extend(std::iter::repeat_n(
-                            (Unit::Character, format),
-                            d.text.encode_utf16().count(),
-                        ));
-                    }
-                }
-                TextRun::Break => units.push((Unit::Break, (None, None, None))),
-                TextRun::Math { .. } => return None,
-            }
+    fn units(runs: &[TextRun]) -> Option<impl Iterator<Item = (Unit, Format)> + Clone + '_> {
+        if runs.iter().any(|run| matches!(run, TextRun::Math { .. })) {
+            return None;
         }
-        Some(units)
-    };
+        // Stream the logical positions rather than allocating a multi-word
+        // tuple for every character. The text budget bounds traversal work.
+        Some(runs.iter().flat_map(|run| {
+            let (unit, format, count) = match run {
+                TextRun::Text(d) => (
+                    (if d.field_type.is_some() {
+                        Unit::Field
+                    } else {
+                        Unit::Character
+                    }),
+                    (d.font_size, d.bold, d.italic),
+                    if d.field_type.is_some() {
+                        1
+                    } else {
+                        d.text.encode_utf16().count()
+                    },
+                ),
+                _ => (Unit::Break, (None, None, None), 1),
+            };
+            std::iter::repeat_n((unit, format), count)
+        }))
+    }
     let agree = |x: Option<f64>, y: Option<f64>| match (x, y) {
         (Some(x), Some(y)) => (x - y).abs() < 1e-6,
         _ => true,
@@ -1800,7 +1884,8 @@ fn same_run_formatting(
         let (Some(bx), Some(ax)) = (units(&bp.runs), units(&ap.runs)) else {
             return Verdict::Unverifiable("equation");
         };
-        if direct_size_authored.is_some_and(|mask| position + bx.len() > mask.len()) {
+        let binary_count = bx.clone().count();
+        if direct_size_authored.is_some_and(|mask| position + binary_count > mask.len()) {
             return Verdict::Unverifiable("run size origin");
         }
         // A masked alternative states a line break as one text character
@@ -1812,12 +1897,17 @@ fn same_run_formatting(
                 unit
             }
         };
-        if bx.len() != ax.len() || bx.iter().zip(&ax).any(|(x, y)| kind(x.0) != kind(y.0)) {
+        if binary_count != ax.clone().count()
+            || bx
+                .clone()
+                .zip(ax.clone())
+                .any(|(x, y)| kind(x.0) != kind(y.0))
+        {
             // `substitute_text` decides the text structure.
-            position += bx.len() + 1;
+            position += binary_count + 1;
             continue;
         }
-        if !bx.iter().zip(&ax).enumerate().all(|(index, (x, y))| {
+        if !bx.zip(ax).enumerate().all(|(index, (x, y))| {
             let size_stated = direct_size_authored.is_none_or(|mask| mask[position + index]);
             (!size_stated || agree(x.1 .0, y.1 .0))
                 && agree_bool(x.1 .1, y.1 .1)
@@ -1825,7 +1915,7 @@ fn same_run_formatting(
         }) {
             verdict = Verdict::Differs("run formatting");
         }
-        position += bx.len() + 1;
+        position += binary_count + 1;
     }
     verdict
 }
@@ -1843,7 +1933,17 @@ fn same_run_formatting(
 /// have no observed form and are not compared. An equation has no binary
 /// characters to compare.
 #[cfg(any(test, feature = "direct-ppt"))]
+#[cfg(test)]
 fn substitute_text(shape: &mut ShapeElement, text: Option<&str>) -> Result<(), Verdict> {
+    let mut budget = usize::MAX;
+    substitute_text_bounded(shape, text, &mut budget)
+}
+
+fn substitute_text_bounded(
+    shape: &mut ShapeElement,
+    text: Option<&str>,
+    model_budget: &mut usize,
+) -> Result<(), Verdict> {
     const DIFFERS: Verdict = Verdict::Differs("text structure");
     let Some(body) = shape.text_body.as_mut() else {
         return if text.is_none_or(str::is_empty) {
@@ -1859,9 +1959,18 @@ fn substitute_text(shape: &mut ShapeElement, text: Option<&str>) -> Result<(), V
         return Err(DIFFERS);
     }
     for (paragraph, source) in body.paragraphs.iter_mut().zip(paragraphs) {
+        // Reserve scratch against the same cumulative model budget before
+        // expanding text into UTF-16, independently of final JSON charging.
+        let unit_count = source.encode_utf16().count();
+        let scratch = unit_count
+            .checked_mul(std::mem::size_of::<u16>())
+            .ok_or(Verdict::Unverifiable("text model budget"))?;
+        *model_budget = model_budget
+            .checked_sub(scratch)
+            .ok_or(Verdict::Unverifiable("text model budget"))?;
         let units: Vec<u16> = source.encode_utf16().collect();
         let mut at = 0usize;
-        let mut runs = Vec::with_capacity(paragraph.runs.len());
+        let mut runs = Vec::new();
         for run in std::mem::take(&mut paragraph.runs) {
             match run {
                 TextRun::Text(mut data) => {
@@ -1876,28 +1985,56 @@ fn substitute_text(shape: &mut ShapeElement, text: Option<&str>) -> Result<(), V
                     {
                         return Err(Verdict::Unverifiable("line break"));
                     }
+                    // Clear masked text before cloning style so each fragment
+                    // does not copy the entire original run. Charge retained
+                    // style/character storage and run capacity before cloning.
+                    data.text.clear();
+                    let style_bytes = usize::try_from(
+                        ooxml_common::json_measurement::measure_json(&data)
+                            .map_err(|_| Verdict::Unverifiable("text model budget"))?
+                            .json_bytes,
+                    )
+                    .map_err(|_| Verdict::Unverifiable("text model budget"))?;
                     let mut pieces = slice.split(|&u| u == 0x0b).peekable();
                     while let Some(piece) = pieces.next() {
                         if !piece.is_empty() {
+                            let owned = piece
+                                .len()
+                                .checked_mul(3)
+                                .and_then(|bytes| bytes.checked_add(style_bytes))
+                                .ok_or(Verdict::Unverifiable("text model budget"))?;
+                            *model_budget = model_budget
+                                .checked_sub(owned)
+                                .ok_or(Verdict::Unverifiable("text model budget"))?;
+                            text_style::direct_model::reserve_run_slot(&mut runs, model_budget)
+                                .map_err(|_| Verdict::Unverifiable("text model budget"))?;
                             let mut part = data.clone();
                             part.text = String::from_utf16(piece).map_err(|_| DIFFERS)?;
                             runs.push(TextRun::Text(part));
                         }
                         if pieces.peek().is_some() {
-                            runs.push(TextRun::Break);
+                            *model_budget = model_budget
+                                .checked_sub(style_bytes)
+                                .ok_or(Verdict::Unverifiable("text model budget"))?;
+                            text_style::direct_model::reserve_run_slot(&mut runs, model_budget)
+                                .map_err(|_| Verdict::Unverifiable("text model budget"))?;
+                            runs.push(text_style::direct_model::line_break(Some(&data)));
                         }
                     }
                     if slice.is_empty() {
-                        data.text.clear();
+                        text_style::direct_model::reserve_run_slot(&mut runs, model_budget)
+                            .map_err(|_| Verdict::Unverifiable("text model budget"))?;
                         runs.push(TextRun::Text(data));
                     }
                 }
-                TextRun::Break => {
+                line_break @ TextRun::Break { .. } => {
                     if !matches!(units.get(at), Some(0x0b | 0x0a | 0x2028)) {
                         return Err(DIFFERS);
                     }
                     at += 1;
-                    runs.push(TextRun::Break);
+                    text_style::direct_model::reserve_run_slot(&mut runs, model_budget)
+                        .map_err(|_| Verdict::Unverifiable("text model budget"))?;
+                    runs.push(line_break);
                 }
                 TextRun::Math { .. } => return Err(Verdict::Unverifiable("equation")),
             }
@@ -2311,12 +2448,53 @@ mod tests {
                     .iter()
                     .map(|run| match run {
                         TextRun::Text(d) => d.text.clone(),
-                        TextRun::Break => "<br>".to_owned(),
+                        TextRun::Break { .. } => "<br>".to_owned(),
                         TextRun::Math { .. } => "<math>".to_owned(),
                     })
                     .collect()
             })
             .collect()
+    }
+
+    #[test]
+    fn masked_break_style_fanout_is_charged_before_projection() {
+        let mut alternative = shape("rect");
+        let mut styled = run("__________");
+        styled["fontFamily"] = serde_json::json!("x".repeat(512));
+        alternative.text_body = body(&[&[styled]]);
+        assert_eq!(
+            substitute_text_bounded(
+                &mut alternative,
+                Some("A\u{b}A\u{b}A\u{b}A\u{b}A\u{b}"),
+                &mut 1024
+            ),
+            Err(Verdict::Unverifiable("text model budget"))
+        );
+    }
+
+    #[test]
+    fn masked_text_retains_line_break_formatting() {
+        let mut alternative = shape("rect");
+        let mut styled = run("___");
+        styled["fontSize"] = serde_json::json!(24.0);
+        styled["bold"] = serde_json::json!(true);
+        alternative.text_body = body(&[&[
+            styled,
+            serde_json::json!({"type":"break", "fontSize":36.0, "fontFamily":"Arial", "italic":true}),
+        ]]);
+        substitute_text(&mut alternative, Some("A\u{b}B\u{b}")).unwrap();
+        let runs = &alternative.text_body.as_ref().unwrap().paragraphs[0].runs;
+        assert!(matches!(
+            &runs[1],
+            TextRun::Break {
+                font_size: Some(24.0),
+                bold: Some(true),
+                ..
+            }
+        ));
+        assert!(
+            matches!(&runs[3], TextRun::Break { font_size: Some(36.0), font_family: Some(face), italic: Some(true), .. } if face == "Arial")
+        );
     }
 
     #[test]
@@ -2683,6 +2861,109 @@ mod tests {
         const AMPLE: (usize, usize, usize) = (usize::MAX, usize::MAX, usize::MAX);
 
         #[test]
+        fn ordinary_alternative_requires_readable_and_resolved_theme_styles() {
+            let styled = SHAPE_XML.replace("</p:sp>", r#"<p:style><a:lnRef idx="999"><a:srgbClr val="FF0000"/></a:lnRef></p:style></p:sp>"#);
+            assert!(
+                run_adopt(&element("FF0000"), &blob(&styled), &theme(), AMPLE)
+                    .0
+                    .is_err()
+            );
+            let unreadable = Theme::Readable {
+                theme_xml: "<broken".to_owned(),
+                clr_map: None,
+                format_scheme: std::cell::OnceCell::new(),
+            };
+            assert!(
+                run_adopt(&element("FF0000"), &blob(SHAPE_XML), &unreadable, AMPLE)
+                    .0
+                    .is_err()
+            );
+        }
+
+        #[test]
+        fn forged_theme_expanded_size_is_not_retained() {
+            let theme_xml = format!("<a:theme xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\"><!--{}--></a:theme>", "x".repeat(65536));
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            for (name, bytes) in [
+                (
+                    "_rels/.rels",
+                    r#"<Relationships><Relationship Id="m" Type="http://schemas.microsoft.com/office/2006/relationships/officeDocument" Target="manager.xml"/></Relationships>"#,
+                ),
+                (
+                    "_rels/manager.xml.rels",
+                    r#"<Relationships><Relationship Id="t" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme" Target="theme.xml"/></Relationships>"#,
+                ),
+                ("theme.xml", theme_xml.as_str()),
+            ] {
+                zip.start_file(name, options).unwrap();
+                zip.write_all(bytes.as_bytes()).unwrap();
+            }
+            let mut blob = zip.finish().unwrap().into_inner();
+            fn record(payload: &[u8]) -> Record<'_> {
+                Record {
+                    version: 0,
+                    instance: 0,
+                    kind: 0x040e,
+                    payload,
+                }
+            }
+            assert!(matches!(
+                master_theme(&[record(&blob)], &mut 100_000).unwrap(),
+                Some(Theme::Readable { .. })
+            ));
+            // Central-directory uncompressed size, with real deflate data and
+            // CRC intact. The reader must bound actual reads by the precharge.
+            let offset = blob
+                .windows(4)
+                .enumerate()
+                .find_map(|(offset, signature)| {
+                    (signature == b"PK\x01\x02"
+                        && blob.get(offset + 46..offset + 55) == Some(b"theme.xml"))
+                    .then_some(offset)
+                })
+                .unwrap();
+            blob[offset + 24..offset + 28].copy_from_slice(&0u32.to_le_bytes());
+            assert!(matches!(
+                master_theme(&[record(&blob)], &mut 100_000).unwrap(),
+                Some(Theme::Unreadable)
+            ));
+        }
+
+        #[test]
+        fn master_themes_share_a_decoded_byte_budget() {
+            let manager_rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="theme" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme" Target="theme.xml"/></Relationships>"#;
+            let blob = package(
+                &[
+                    ("manager.xml", "<x/>"),
+                    ("_rels/manager.xml.rels", manager_rels),
+                    ("theme.xml", &crate::ppt::theme()),
+                ],
+                &[("officeDocument", "manager.xml")],
+            );
+            let record = Record {
+                version: 0,
+                instance: 0,
+                kind: 0x040e,
+                payload: &blob,
+            };
+            let mut budget = 4096;
+            assert!(matches!(
+                master_theme(&[record], &mut budget).unwrap(),
+                Some(Theme::Readable { .. })
+            ));
+            let decoded_bytes = 4096 - budget;
+            assert!(decoded_bytes > 0);
+            let mut budget = decoded_bytes;
+            assert!(matches!(
+                master_theme(&[record], &mut budget).unwrap(),
+                Some(Theme::Readable { .. })
+            ));
+            assert!(master_theme(&[record], &mut budget).is_err());
+        }
+
+        #[test]
         fn a_consistent_alternative_is_adopted_and_charged() {
             let (result, model) = run_adopt(&element("FF0000"), &blob(SHAPE_XML), &theme(), AMPLE);
             let adopted = result.unwrap().expect("consistent alternative");
@@ -2925,7 +3206,7 @@ mod tests {
         serde_json::json!({
             "type": "text", "text": text, "bold": null, "italic": null,
             "underline": false, "strikethrough": false, "strikeDouble": false,
-            "fontSize": null, "color": null, "fontFamily": null, "fieldType": null
+            "fontSize": null, "color": null, "fontFamily": null, "fieldType": null, "hyperlinkUsesTextFill": false
         })
     }
 

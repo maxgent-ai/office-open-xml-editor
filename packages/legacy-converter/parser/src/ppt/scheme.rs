@@ -96,6 +96,7 @@ impl Resolver {
         let defaults = text_style::document_defaults(children, budget)?;
         let mut text_styles = BTreeMap::new();
         let mut metro_themes = BTreeMap::new();
+        let mut decoded_theme_budget = MAX_TEXT_BYTES;
         let mut backgrounds = BTreeMap::new();
         let mut master_records = Vec::new();
         if let Some(list) = lists.first() {
@@ -131,7 +132,7 @@ impl Resolver {
                 master_records.push((id, record_span));
                 if record.kind == 1016 {
                     let records = parse_records(record.payload, budget)?;
-                    if let Some(theme) = metro::master_theme(&records) {
+                    if let Some(theme) = metro::master_theme(&records, &mut decoded_theme_budget)? {
                         metro_themes.insert(id, std::rc::Rc::new(theme));
                     }
                     text_styles.insert(

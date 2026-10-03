@@ -50,7 +50,7 @@ interface LegacySourceOptions {
 
 Creating a source fetches nothing. When a claimed file loads, the parser
 Worker (or Node) imports the source's self-contained ES module, emitted as
-`legacy-<format>-source-module*.js` next to the package files, and initializes
+`legacy-ppt-source-module*.mjs` next to the package files, and initializes
 the reader's dedicated WASM, `legacy_ppt_direct_bg.wasm`. Serve these files
 with the other package assets, and allow the module URL wherever a Content
 Security Policy restricts `script-src` or Worker imports. Applications with a
@@ -139,8 +139,8 @@ try {
 The direct source is an experimental, bounded subset, not a full-fidelity
 PowerPoint implementation. Besides Markdown and ZIP accounting, it currently
 lacks audio/video media and embedded fonts. It rejects constructs it cannot
-represent, including unresolved paragraph margin or indentation and positive
-paragraph before/after percentages. Its explicit unsupported diagnostics are
+represent, including paragraph origins that cannot be resolved from the
+stored text and master records. Its explicit unsupported diagnostics are
 authoritative.
 
 A slide's own `SlideShowSlideInfoAtom.fHidden` marks it hidden; hidden slides
@@ -155,8 +155,7 @@ external object list (MS-PPT 2.7.7 and 2.10.1). The object storage is never
 read or activated. PowerPoint's own PDF exports show that stored picture
 unchanged for embedded objects drawn as content. Icon or thumbnail aspects,
 linked objects and ActiveX controls, pictures without a supported BLIP, and
-pattern, texture or non-stretched picture fills are rejected instead of being
-drawn without them.
+unsupported fill placements are rejected instead of being drawn without them.
 
 PowerPoint displays GIF data that a producer stored in a PNG picture slot,
 so the direct PPT reader identifies such a slot by its GIF87a/GIF89a
@@ -177,9 +176,9 @@ DrawingML position unit of Office's serialized integers.
 Pattern fills on unrotated shapes become tiled picture fills that follow
 PowerPoint's own output: the 8x8 area of the stored 10x10 pattern bitmap,
 one pattern pixel per point, white pixels in the fill colour and black
-pixels in the background colour. Pattern fills on rotated or flipped shapes,
-other pattern bitmap sizes, translucent pattern colours, background
-patterns and texture fills stay rejected.
+pixels in the background colour. Supported placements retain their shape transforms. Unsupported bitmap
+sizes, translucent pattern colours and unprojected texture placements
+remain rejected.
 
 Picture colour settings follow how PowerPoint itself reads the binary
 properties when it saves a binary deck as PPTX: "Black and White" becomes
@@ -198,8 +197,7 @@ Office output confirms their rendering.
 
 A modern Office-saved PPT can retain paragraph properties in the OfficeArt
 `metroBlob` alternative shape XML rather than in its classic text ruler. The
-direct PPT source adopts that XML under the rule described with the release
-gap inventory below.
+direct PPT source adopts that XML under the rule described below.
 
 ## Current implementation boundary
 
@@ -238,104 +236,27 @@ Treat the rendered model as a derived view of the original binary, keep the
 binary as the authoritative source, and gate production use on a corpus
 representative of the documents being ingested.
 
-## Local direct-render survey
+## Alternative shape XML
 
-`packages/legacy-converter/tests/survey/ppt.spec.ts` renders each
-local private legacy sample through the direct source, on the PPTX package's
-own VRT fixture and dev server. Each sample is written beside its
-same-named Office PDF export as paired PNGs and a summary. The survey reports
-only: it never gates, updates references, or generates OOXML. Run it with an
-output directory outside the checkout (`VRT_PORT` serves DOC, `+1` PPT and
-`+2` XLS; `LEGACY_CORPUS_FORMATS` and `LEGACY_CORPUS_FILTER` narrow the run):
+Modern Office can retain DrawingML in an OfficeArt `metroBlob`
+([MS-ODRAW] §2.3.4.41). The source uses three outcomes: a package with no
+alternative or a verified disagreement uses the binary projection; a verified
+consistent alternative is adopted; an unreadable or unverifiable alternative
+rejects the load. A checksum-only package does not require a theme.
 
-```bash
-LEGACY_CORPUS=1 LEGACY_CORPUS_OUT=/tmp/legacy-survey LEGACY_CORPUS_FORMATS=ppt \
-  pnpm --filter @silurus/ooxml-legacy-converter survey
-```
+Adopted alternatives retain their formatting and resource references, while
+characters, identifiers and transforms come from the binary. Theme style
+references must resolve to existing entries. Compatibility comparisons cover
+only the properties documented beside the implementation; edits to other
+properties can leave a stale alternative undetected. This is an experimental
+compatibility boundary, not a claim of complete PowerPoint equivalence.
 
-Pixel percentages are only a triage signal. For example, a slide can score
-above 95% while a chart or autoshape is missing, so review the pairs visually.
+Per-entry and cumulative budgets bound input, records, decoded themes, text,
+model storage and emitted JSON. Repeated hyperlink targets and split text
+styles consume the model budget before they are copied. These ceilings are
+library resource policy, not Office format restrictions.
 
-## Release gap inventory
-
-The direct-render survey was reviewed visually against the Office PDF
-exports, and the findings are grouped here. Counts are local private samples
-affected. They record open work, not supported behavior. Omission is
-acceptable only where the caller did not enable an opt-in module such as
-chartex. Every other gap below is unimplemented behavior or a bug that must
-be closed before an experimental release.
-
-| Area | Gap | Samples |
-| --- | --- | --- |
-| PPT | ~~Only seven MS-ODRAW shape types map to presets~~ 100+ shape types map as PowerPoint converts them, with evidenced adjust formulas (officeart::preset); adjusted callout2/3 families, arrow callouts, curved arrows, ribbons and tall cubes/hexagons/parallelograms still fail closed | several |
-| PPT | ~~Native/OLE charts are missing~~ Resolved: embedded OLE objects show their stored presentation picture (bfc835d3) | 3 |
-| PPT | ~~Rotation by multiples of 90 degrees and combined flips use the wrong bounds or order~~ Resolved from the 120-case PowerPoint control (aa9dc5c1) | 1 |
-| PPT | ~~Slide gradient backgrounds~~ linear/scaled/two-colour/translucent shades resolved (95b74d19); path (5, 6) and title (8) shades now fail closed. Bullets resolved through master levels; letter spacing, shrink-to-fit and per-paragraph indents come from adopted alternative shape XML where it agrees with the binary | several |
-| PPT | ~~Gradients on rotated shapes (or inside rotated/flipped groups) are replaced by the solid fill colour~~ Resolved (ef41f03a) | several |
-| PPT | Custom geometry with per-path fill/stroke flags is rejected; the PPTX model has no per-path `fill`/`stroke` (ECMA-376 §20.1.9.15), a generic PPTX gap | 1 |
-| PPT | ~~Unmapped shape types are dropped silently~~ Now rejected | several |
-| PPT | ~~Picture brightness/contrast (washout)~~ projected as `lum` from the gray-ramp control; pattern fills (including on rotated shapes) are projected; pattern fills on flipped shapes, texture fills, and OLE icons, links and controls are rejected | several |
-| PPT | Implicit paragraph margin/indent and percentage spacing are rejected | 12 of 34 load failures |
-| PPT | Alternative shape XML (metroBlob) that cannot be verified against the binary shape fails closed: placeholders (no slide layout), a preset against freeform geometry, and fills stated in non-comparable forms | first error of 14 of 34 (10 previously loaded) |
-
-PowerPoint 2007+ also stores a `metroBlob` (MS-ODRAW 2.3.4.41, an OPC
-package with the shape's DrawingML, `drs/shapexml.xml`) on most shapes. The
-specification says it SHOULD be ignored; implementation note 32 says Office
-2007 and 2010 use it. PowerPoint 16 controls settle how it is used:
-
-- With only the alternative XML edited (binary byte-identical, the package
-  rebuilt at the same length), PowerPoint's PDF renders the edited XML: a card
-  fill changed in the XML only is drawn in the new color, and character
-  spacing raised in the XML only is drawn raised.
-- With a shape's binary adjust and fill edited but its alternative XML kept,
-  PowerPoint's PDF follows the binary, identically to a copy whose XML was
-  removed.
-- A corpus deck whose alternative states 10.5 pt text over a binary 10 pt run
-  renders without the alternative's other run properties, while decks whose
-  sizes agree render them.
-
-The alternative therefore carries display information the binary lacks, so
-the direct PPT source resolves each shape's alternative to one of three
-outcomes:
-
-- The package names no alternative part (only the `downRev` checksums), or
-  the alternative verifiably disagrees with the binary on a compared
-  attribute: the binary projection is used, as PowerPoint does.
-- The alternative agrees on every compared attribute: it is adopted. Its
-  text characters are masked, so the adopted shape takes its characters,
-  transform and identifier from the binary. The XML is parsed by the ordinary
-  PPTX shape parser, resolving theme references against the master's
-  round-trip theme and color map; no OOXML is generated. Its serialized size
-  is charged to the session's model budget.
-- Otherwise agreement cannot be established and the presentation fails
-  closed as unsupported input: an oversized, over-budget, duplicated or
-  unreadable blob, package or round-trip theme; an alternative part that is
-  not a shape or connector (pictures, groups, SmartArt, ink); a placeholder,
-  whose alternative inherits from a slide layout the binary file does not
-  have; relationship references; and any compared attribute the two forms
-  state in ways the reader cannot equate.
-
-The compared attributes are those the controls cover, each in one unit
-system. Presets compare by name and by adjust values within the range the
-binary inputs' rounding allows (a whole 21600-based value on an anchor that
-rounds PowerPoint's extent to one master unit), an omitted value standing
-for the preset default of ECMA-376 `presetShapeDefinitions.xml`; a preset
-against custom geometry is not comparable, because PowerPoint saves a preset
-without an MS-ODRAW shape type as a freeform. Custom geometry compares path
-by path in normalized path coordinates, including the authored per-path fill
-and stroke flags, after dropping a closing line to the subpath start that the
-binary stores explicitly. Position, size, rotation and flips compare in the
-binary anchor's unit (master units, or a group's unscaled child units) within
-one unit. The recorded fill compares before PowerPoint's open-path display
-rule: solid colors within one unit per channel (independent rounding of a
-theme color transform), gradients and patterns only when identical within
-their fixed-point rounding. Run font size, bold and italic compare where both
-state them, and paragraphs, runs and line breaks must line up at equal UTF-16
-lengths. XML 1.0 cannot carry the vertical tab that breaks a line in a binary
-paragraph; the masked alternative states it as one masked character of the
-enclosing run, which becomes a line break in the adopted shape. The downrev
-checksums beside the XML are not recomputable (they are not checksums of the
-binary records), so structural agreement stands in for them; a binary edit
-that preserves every compared property would still adopt a stale XML.
-Glyph shadow and emboss, which the binary cannot express, reject a shape only
-when its alternative XML is not adopted.
+The private Office corpus and its visual survey remain local development
+material. Current completion requires fresh parser-backed tests, renderer
+self-regression checks and separately adjudicated Office fidelity evidence.
+Historical survey counts do not establish the current release's behavior.

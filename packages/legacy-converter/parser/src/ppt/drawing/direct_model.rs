@@ -61,18 +61,48 @@ fn unprojected_blip_fill(kind: u32) -> String {
 /// style run, so split that run at UTF-16-safe character boundaries.
 fn apply_text_links(
     paragraphs: &mut [pptx_model::Paragraph],
-    links: &[(usize, usize, String)],
+    links: &[(usize, usize, &str)],
     direct_color_authored: &[bool],
+    work_budget: &mut usize,
+    model_budget: &mut usize,
 ) -> Result<(), String> {
-    let mut position = 0usize;
+    // Resource policy: range fan-out and every retained target copy consume
+    // the session budgets before allocation. Catalog targets remain borrowed
+    // until a projected run needs one. Sorting permits one forward sweep;
+    // repeated references never cause a links × runs scan.
+    let charge = |budget: &mut usize, bytes: usize, kind: &str| -> Result<(), String> {
+        *budget = budget
+            .checked_sub(bytes)
+            .ok_or_else(|| unsupported(format!("PowerPoint text link {kind} budget exceeded")))?;
+        Ok(())
+    };
+    let scratch = links
+        .len()
+        .checked_mul(std::mem::size_of::<usize>() + 1)
+        .ok_or_else(|| unsupported("PowerPoint text link size overflow"))?;
+    charge(model_budget, scratch, "model")?;
+    charge(
+        work_budget,
+        links.len().saturating_mul(usize::BITS as usize),
+        "work",
+    )?;
+    let mut order: Vec<_> = (0..links.len()).collect();
+    order.sort_unstable_by_key(|&index| links[index].0);
+    for pair in order.windows(2) {
+        if links[pair[0]].1 > links[pair[1]].0 {
+            return Err(unsupported("overlapping PowerPoint text links"));
+        }
+    }
     let mut seen = vec![false; links.len()];
+    let mut next_link = 0usize;
+    let mut position = 0usize;
     let count = paragraphs.len();
     for (paragraph_index, paragraph) in paragraphs.iter_mut().enumerate() {
         let mut projected = Vec::new();
         for run in std::mem::take(&mut paragraph.runs) {
             let len = match &run {
                 TextRun::Text(data) => data.text.encode_utf16().count(),
-                TextRun::Break => 1,
+                TextRun::Break { .. } => 1,
                 TextRun::Math { .. } => return Err(unsupported("PowerPoint linked equation")),
             };
             let end = position
@@ -81,9 +111,30 @@ fn apply_text_links(
             if end > direct_color_authored.len() {
                 return Err(unsupported("PowerPoint direct text color range"));
             }
+            while next_link < order.len() && links[order[next_link]].1 <= position {
+                next_link += 1;
+            }
             match run {
-                TextRun::Text(data) if len > 0 => {
-                    let mut cuts = vec![0, len];
+                TextRun::Text(mut data) if len > 0 => {
+                    let active_count = order[next_link..]
+                        .iter()
+                        .take_while(|&&index| links[index].0 < end)
+                        .count();
+                    let cut_capacity = len
+                        .checked_add(active_count.saturating_mul(2))
+                        .and_then(|value| value.checked_add(2))
+                        .ok_or_else(|| unsupported("PowerPoint text link size overflow"))?;
+                    let scratch = cut_capacity
+                        .checked_mul(std::mem::size_of::<usize>())
+                        .and_then(|bytes| {
+                            (len + 1)
+                                .checked_mul(std::mem::size_of::<(usize, usize)>())
+                                .and_then(|positions| bytes.checked_add(positions))
+                        })
+                        .ok_or_else(|| unsupported("PowerPoint text link size overflow"))?;
+                    charge(model_budget, scratch, "model")?;
+                    let mut cuts = Vec::with_capacity(cut_capacity);
+                    cuts.extend([0, len]);
                     for offset in 1..len {
                         if direct_color_authored[position + offset - 1]
                             != direct_color_authored[position + offset]
@@ -91,8 +142,8 @@ fn apply_text_links(
                             cuts.push(offset);
                         }
                     }
-                    for (begin, cutoff, _) in links {
-                        for edge in [*begin, *cutoff] {
+                    for &index in &order[next_link..next_link + active_count] {
+                        for edge in [links[index].0, links[index].1] {
                             if position < edge && edge < end {
                                 cuts.push(edge - position);
                             }
@@ -100,18 +151,28 @@ fn apply_text_links(
                     }
                     cuts.sort_unstable();
                     cuts.dedup();
-                    let mut positions = vec![(0, 0)];
+                    let source_text = std::mem::take(&mut data.text);
+                    let mut positions = Vec::with_capacity(len + 1);
+                    positions.push((0, 0));
                     let mut unit = 0;
-                    for (byte, ch) in data.text.char_indices() {
+                    for (byte, ch) in source_text.char_indices() {
                         unit += ch.len_utf16();
                         positions.push((unit, byte + ch.len_utf8()));
                     }
+                    // Clone only the style, never the entire original text for
+                    // every fragment. JSON size bounds all owned style strings.
+                    let style_bytes = usize::try_from(
+                        ooxml_common::json_measurement::measure_json(&data)?.json_bytes,
+                    )
+                    .map_err(|_| unsupported("PowerPoint text link size overflow"))?;
+                    let mut selected = next_link;
                     for pair in cuts.windows(2) {
+                        charge(work_budget, 1, "work")?;
                         let byte_at = |offset| {
                             positions
-                                .iter()
-                                .find(|(unit, _)| *unit == offset)
-                                .map(|(_, byte)| *byte)
+                                .binary_search_by_key(&offset, |&(unit, _)| unit)
+                                .ok()
+                                .map(|index| positions[index].1)
                         };
                         let first = byte_at(pair[0]).ok_or_else(|| {
                             unsupported("PowerPoint text link splits a surrogate")
@@ -119,31 +180,44 @@ fn apply_text_links(
                         let last = byte_at(pair[1]).ok_or_else(|| {
                             unsupported("PowerPoint text link splits a surrogate")
                         })?;
-                        let mut part = data.clone();
-                        part.text = data.text[first..last].to_owned();
                         let begin = position + pair[0];
                         let cutoff = position + pair[1];
-                        for (index, (link_begin, link_end, target)) in links.iter().enumerate() {
-                            if *link_begin <= begin && cutoff <= *link_end {
-                                if part.hyperlink.is_some() {
-                                    return Err(unsupported("overlapping PowerPoint text links"));
-                                }
-                                part.hyperlink = Some(target.clone());
-                                // [MS-PPT] 2.9.15 CFMasks.color makes the run
-                                // color direct only when bit 0x40000 is set.
-                                // PowerPoint-saved hyperlink runs with an
-                                // inherited black fallback omit solidFill and
-                                // take the theme hlink color instead.
-                                if !direct_color_authored[begin] {
-                                    part.color = None;
-                                }
-                                seen[index] = true;
+                        while selected < order.len() && links[order[selected]].1 <= begin {
+                            selected += 1;
+                        }
+                        let link = order
+                            .get(selected)
+                            .copied()
+                            .filter(|&index| links[index].0 <= begin && cutoff <= links[index].1);
+                        let target_bytes = link.map_or(0, |index| links[index].2.len());
+                        let owned_bytes = style_bytes
+                            .checked_add(last - first)
+                            .and_then(|bytes| bytes.checked_add(target_bytes))
+                            .ok_or_else(|| unsupported("PowerPoint text link size overflow"))?;
+                        charge(model_budget, owned_bytes, "model")?;
+                        text_style::direct_model::reserve_run_slot(&mut projected, model_budget)?;
+                        let mut part = data.clone();
+                        part.text = source_text[first..last].to_owned();
+                        if let Some(index) = link {
+                            if part.hyperlink.is_some() {
+                                return Err(unsupported("overlapping PowerPoint text links"));
                             }
+                            part.hyperlink = Some(links[index].2.to_owned());
+                            // [MS-PPT] 2.9.15 CFMasks.color marks direct color.
+                            // Authored colors survive; inherited fallback uses
+                            // the master's hlink slot (existing Office controls).
+                            if !direct_color_authored[begin] {
+                                part.color = None;
+                            }
+                            seen[index] = true;
                         }
                         projected.push(TextRun::Text(part));
                     }
                 }
-                other => projected.push(other),
+                other => {
+                    text_style::direct_model::reserve_run_slot(&mut projected, model_budget)?;
+                    projected.push(other);
+                }
             }
             position = end;
         }
@@ -501,8 +575,8 @@ impl Context<'_> {
         }
         // Alternative shape XML (`ppt::metro`) needs a single blob (two are
         // an ambiguity MS-ODRAW does not resolve) and the master's
-        // round-trip theme to resolve it against; a blob without either
-        // cannot be verified. Text effects the binary cannot express are
+        // round-trip theme to resolve an actual alternative against. A
+        // checksum-only blob needs no theme and retains the binary. Text effects the binary cannot express are
         // deferred: the adopted alternative carries them, and they reject
         // only when it is not adopted.
         let metro_theme = self.presentation.metro_themes[self.index].clone();
@@ -511,8 +585,7 @@ impl Context<'_> {
             (Some(_), _) if shape.props.metro_ambiguous => {
                 return Err(crate::ppt::metro::unverifiable("property"));
             }
-            (Some(_), None) => return Err(crate::ppt::metro::unverifiable("theme")),
-            (Some(span), Some(_)) => Some(span.clone()),
+            (Some(span), _) => Some(span.clone()),
         };
         let deferred_effect = std::cell::Cell::new(None);
         let mut raw_text = None;
@@ -676,7 +749,9 @@ impl Context<'_> {
             sp3d: None,
         };
         let adopted = match (&metro_blob, &metro_theme) {
-            (Some(span), Some(theme)) => {
+            (Some(span), theme) => {
+                let missing_theme = crate::ppt::metro::Theme::Unreadable;
+                let theme = theme.as_deref().unwrap_or(&missing_theme);
                 let recorded_fill = if !fill_area {
                     crate::ppt::metro::RecordedFill::NotDisplayed
                 } else if !paint.fill_stated() {
@@ -1051,7 +1126,14 @@ impl Context<'_> {
                         if begin >= end {
                             return Err(unsupported("invalid PowerPoint text link range"));
                         }
-                        text_links.push((begin, end, self.presentation.hyperlinks.get(id)?));
+                        let target = self.presentation.hyperlinks.get(id)?;
+                        *self.model_budget = self
+                            .model_budget
+                            .checked_sub(2 * std::mem::size_of::<(usize, usize, &str)>())
+                            .ok_or_else(|| {
+                                unsupported("PowerPoint text link model budget exceeded")
+                            })?;
+                        text_links.push((begin, end, target));
                     }
                 }
                 3999 => {
@@ -1196,7 +1278,13 @@ impl Context<'_> {
             let colors = direct_color_authored
                 .as_deref()
                 .ok_or_else(|| unsupported("PowerPoint direct text color mask missing"))?;
-            apply_text_links(&mut paragraphs, &text_links, colors)?;
+            apply_text_links(
+                &mut paragraphs,
+                &text_links,
+                colors,
+                self.work_budget,
+                self.model_budget,
+            )?;
         }
         let p = &shape.props;
         Ok(Some(TextBody {
@@ -1235,6 +1323,10 @@ impl Context<'_> {
             // MS-PPT carries no edge-spacing flag; DrawingML's default
             // (edges suppressed) is the renderer's existing behavior.
             spc_first_last_para: false,
+            // These DrawingML body properties are not supplied by this
+            // binary projector. Alternative shape XML keeps authored values.
+            anchor_ctr: false,
+            compat_ln_spc: None,
             text_warp: None,
         }))
     }
@@ -1296,6 +1388,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn repeated_link_targets_cannot_exceed_the_projection_budget() {
+        let mut paragraphs: Vec<pptx_model::Paragraph> =
+            serde_json::from_value(serde_json::json!([{
+                "alignment":"l", "marL":0, "marR":0, "indent":0,
+                "spaceBefore":null, "spaceAfter":null, "spaceLine":null,
+                "lvl":0, "bullet":{"type":"none"}, "defFontSize":null,
+                "defColor":null, "defBold":null, "defItalic":null,
+                "defFontFamily":null, "tabStops":[], "rtl":false, "eaLnBrk":true,
+                "runs":[{"type":"text", "text":"abcd", "bold":null, "italic":null,
+                    "underline":false, "strikethrough":false, "strikeDouble":false,
+                    "fontSize":18.0, "color":null, "fontFamily":null,
+                    "fieldType":null, "hyperlinkUsesTextFill":false}]
+            }]))
+            .unwrap();
+        let target = "x".repeat(4096);
+        let links = vec![
+            (0, 1, target.as_str()),
+            (1, 2, target.as_str()),
+            (2, 4, target.as_str()),
+        ];
+        let error = apply_text_links(&mut paragraphs, &links, &[false; 4], &mut 10_000, &mut 4096)
+            .unwrap_err();
+        assert!(error.contains("model budget"), "{error}");
+    }
+
+    #[test]
     fn links_clear_inherited_color_but_keep_explicit_color() {
         let run = serde_json::json!({
             "type": "text", "text": "abcd", "bold": null, "italic": null,
@@ -1304,7 +1422,7 @@ mod tests {
             "color": "000000", "fontFamily": "Arial", "fontFamilyEa": null,
             "fontFamilySym": null, "baseline": null, "caps": null,
             "letterSpacing": null, "fieldType": null, "hyperlink": null,
-            "hyperlinkAction": null, "shadow": null, "reflection": null,
+            "hyperlinkUsesTextFill": false, "hyperlinkAction": null, "shadow": null, "reflection": null,
             "outline": null, "highlight": null
         });
         let mut paragraphs: Vec<pptx_model::Paragraph> =
@@ -1319,8 +1437,10 @@ mod tests {
             .unwrap()];
         apply_text_links(
             &mut paragraphs,
-            &[(1, 3, "https://example.invalid".into())],
+            &[(1, 3, "https://example.invalid")],
             &[false, false, true, false, false],
+            &mut 10_000,
+            &mut 100_000,
         )
         .unwrap();
         let text_runs: Vec<_> = paragraphs[0]
@@ -1465,6 +1585,52 @@ mod tests {
             object_masters: vec![std::rc::Rc::from([])],
             size: (720, 540),
         }
+    }
+
+    #[test]
+    fn checksum_only_metro_blob_keeps_binary_shape_without_a_theme() {
+        use std::io::Write;
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        zip.start_file("_rels/.rels", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="downrev" Type="http://schemas.microsoft.com/office/2006/relationships/downRev" Target="downrev.xml"/></Relationships>"#).unwrap();
+        let blob = zip.finish().unwrap().into_inner();
+        let property = record(
+            0x13,
+            0xf00b,
+            &[
+                0x83a9u16.to_le_bytes().as_slice(),
+                &(blob.len() as u32).to_le_bytes(),
+                &blob,
+            ]
+            .concat(),
+        );
+        let drawing = record(
+            15,
+            1036,
+            &record(
+                15,
+                0xf002,
+                &shape(1, 0, 0xf010, [0, 0, 100, 100], vec![property]),
+            ),
+        );
+        let document = record(15, SLIDE_CONTAINER, &drawing);
+        let (span, _) = record_span_with_end(&document, 0, &mut 100, "slide").unwrap();
+        let presentation = presentation(span);
+        let result = slide(
+            0,
+            &presentation,
+            &document,
+            None,
+            &mut media::SpanStore::new(Vec::new()),
+            &mut 10_000,
+            &mut 100_000,
+            &mut (16 * 1024 * 1024),
+        )
+        .unwrap();
+        assert!(
+            matches!(result.elements.as_slice(), [SlideElement::Shape(shape)] if shape.geometry == "rect")
+        );
     }
 
     #[test]
