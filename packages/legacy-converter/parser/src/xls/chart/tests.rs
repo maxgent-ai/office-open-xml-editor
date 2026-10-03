@@ -240,6 +240,12 @@ fn a_chart_without_series_records_is_an_authored_empty_chart() {
     let model = project(&raw, &palette(), &|_| None).unwrap();
     assert!(model.authored_without_series);
     assert!(model.series.is_empty());
+    let budget = std::cell::Cell::new(1usize);
+    assert!(
+        super::project::project_bounded(&raw, &palette(), &|_| Ok(None), &budget)
+            .unwrap_err()
+            .contains("chart model retention budget")
+    );
     // A chart with a Series record is never marked authored-empty.
     let with_series = read(&as_records(&bar_chart(true, None))).unwrap();
     assert!(
@@ -282,4 +288,49 @@ fn an_automatic_chart_area_takes_the_biff_outline_excel_writes_for_it() {
     let styled = chart(xml);
     assert_eq!(styled.chart_border_color, None);
     assert_eq!(styled.chart_border_hidden, Some(true));
+}
+
+#[test]
+fn referenced_shared_text_is_charged_before_every_copy() {
+    let budget = std::cell::Cell::new(std::mem::size_of::<Cached>() + 4);
+    let cells = super::Cells {
+        sheets_by_xti: Vec::new(),
+        sheets: &[],
+        shared: &[],
+        budget: &budget,
+        budget_exceeded: std::cell::Cell::new(false),
+    };
+    assert!(cells.copy_text("same").is_some());
+    assert!(cells.copy_text("same").is_none());
+    assert!(cells.budget_exceeded.get());
+}
+
+#[test]
+fn chart_context_propagates_invalid_theme_instead_of_default_colors() {
+    let styles = super::super::styles::Styles::parse(&[]).unwrap();
+    let records = [Record {
+        kind: 0x0896,
+        offset: 0,
+        data: &[0; 16],
+    }];
+    let budget = std::cell::Cell::new(1024);
+    assert!(super::with_context(&records, &[], &styles, &[], &[], &budget, |_, _| ()).is_err());
+}
+
+#[test]
+fn numeric_chart_expansion_stops_at_aggregate_typed_slot_admission() {
+    let owned = bar_chart(false, None);
+    let raw = read(&as_records(&owned)).unwrap();
+    let calls = std::cell::Cell::new(0);
+    let references = |_: &[u8]| {
+        calls.set(calls.get() + 1);
+        Ok(Some(vec![Some(Cached::Number(0.0)); 100]))
+    };
+    let budget = std::cell::Cell::new(1);
+    assert!(
+        super::project::project_bounded(&raw, &palette(), &references, &budget)
+            .unwrap_err()
+            .contains("budget")
+    );
+    assert_eq!(calls.get(), 1); // no category/bubble expansion after failure
 }

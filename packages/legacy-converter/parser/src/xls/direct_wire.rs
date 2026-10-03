@@ -1,6 +1,8 @@
 //! Bounded JSON wire boundary for the owning native XLS model session.
 //! It mirrors the XLSX worksheet cursor envelope without pretending BIFF decode
-//! is streaming: projection is cached once, then rows are borrowed in chunks.
+//! is streaming: one cursor owns a projection and borrows its rows in chunks.
+//! ACK, cancellation and close release that projection; reopening reprojects
+//! the neutral sheet while the host retains models under the XLSX lease/LRU policy.
 
 use super::direct::DirectSession;
 use ooxml_common::resource::{
@@ -31,6 +33,7 @@ struct ActiveSheet {
     index: usize,
     name: String,
     row_position: usize,
+    preview_sent: bool,
     terminal_awaiting_ack: bool,
     last_pull_terminal: bool,
 }
@@ -122,6 +125,7 @@ impl DirectWire {
             index,
             name: owned_name,
             row_position: 0,
+            preview_sent: false,
             terminal_awaiting_ack: false,
             last_pull_terminal: false,
         });
@@ -152,6 +156,19 @@ impl DirectWire {
             .ok_or_else(|| "worksheet cursor is not open".to_string())?;
         if cursor.terminal_awaiting_ack {
             return Err("worksheet terminal product must be acknowledged before pulling".into());
+        }
+        if !cursor.preview_sent {
+            // BIFF materialization is not incremental. Explicitly stay on the
+            // complete-model viewer path until XLS preview eligibility has
+            // independent evidence; never guess cell/ancillary dependencies.
+            let bytes = self.serialize(
+                &serde_json::json!({"kind":"preview", "worksheet":null,
+                    "reason":"metadata-unavailable", "maxRow":0, "maxCol":0}),
+                json_ceiling,
+                "worksheet preview",
+            )?;
+            self.cursor.as_mut().expect("cursor retained").preview_sent = true;
+            return Ok(bytes);
         }
         let result = (|| {
             let projected = self
@@ -203,15 +220,24 @@ impl DirectWire {
             return Err("worksheet terminal product is not awaiting acknowledgement".into());
         }
         self.cursor.take();
+        if let Some(session) = &mut self.session {
+            session.release_projection();
+        }
         Ok(())
     }
 
     pub(crate) fn cancel_sheet_cursor(&mut self) {
         self.cursor.take();
+        if let Some(session) = &mut self.session {
+            session.release_projection();
+        }
     }
 
     pub(crate) fn close_sheet_cursor(&mut self) {
         self.cursor.take();
+        if let Some(session) = &mut self.session {
+            session.release_projection();
+        }
     }
 
     pub(crate) fn extract_image(&mut self, key: &str) -> Result<Vec<u8>, String> {
@@ -464,6 +490,12 @@ mod tests {
         wire.open_sheet_cursor(0, "S").unwrap();
         assert!(!wire.sheet_cursor_pull_finished());
         assert!(wire.acknowledge_sheet_cursor_terminal().is_err());
+        let preview: serde_json::Value =
+            serde_json::from_slice(&wire.pull_sheet_cursor(1).unwrap()).unwrap();
+        assert_eq!(preview["kind"], "preview");
+        assert_eq!(preview["reason"], "metadata-unavailable");
+        assert!(preview["worksheet"].is_null());
+        assert!(!wire.sheet_cursor_pull_finished());
         let rows: serde_json::Value =
             serde_json::from_slice(&wire.pull_sheet_cursor(1).unwrap()).unwrap();
         assert_eq!(rows["kind"], "rows");
@@ -478,8 +510,9 @@ mod tests {
         assert!(wire.pull_sheet_cursor(1).is_err());
         wire.acknowledge_sheet_cursor_terminal().unwrap();
 
-        // ACK retains the projected slot, so reopening does not rebuild it.
+        // ACK releases the native projection. Reopening starts a new cursor.
         wire.open_sheet_cursor(0, "S").unwrap();
+        wire.pull_sheet_cursor(128).unwrap(); // explicit preview exclusion
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&wire.pull_sheet_cursor(128).unwrap())
                 .unwrap()["kind"],
@@ -597,6 +630,7 @@ mod tests {
         wire.open_sheet_cursor(0, "S").unwrap();
         assert!(wire.open_sheet_cursor(0, "S").is_err());
         assert!(wire.pull_sheet_cursor(0).is_err());
+        wire.pull_sheet_cursor(1).unwrap(); // explicit preview exclusion
         let first: serde_json::Value =
             serde_json::from_slice(&wire.pull_sheet_cursor(1).unwrap()).unwrap();
         assert_eq!(first["rows"][0]["index"], 1);

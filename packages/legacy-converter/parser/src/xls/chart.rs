@@ -21,9 +21,10 @@ pub(crate) fn parse(
     records: &[Record<'_>],
     palette: &Palette<'_>,
     references: &project::References<'_>,
+    budget: &std::cell::Cell<usize>,
 ) -> Result<Option<ooxml_common::chart::ChartModel>, String> {
     let raw = reader::read(records)?;
-    Ok(project::project(&raw, palette, references))
+    project::project_bounded(&raw, palette, references, budget)
 }
 
 const MAX_REFERENCED_CELLS: usize = 32_000;
@@ -36,6 +37,8 @@ struct Cells<'a> {
     sheets_by_xti: Vec<Option<usize>>,
     sheets: &'a [(String, SheetData)],
     shared: &'a [rich::Text],
+    budget: &'a std::cell::Cell<usize>,
+    budget_exceeded: std::cell::Cell<bool>,
 }
 
 impl<'a> Cells<'a> {
@@ -44,6 +47,7 @@ impl<'a> Cells<'a> {
         tab_sheets: &BTreeMap<usize, usize>,
         sheets: &'a [(String, SheetData)],
         shared: &'a [rich::Text],
+        budget: &'a std::cell::Cell<usize>,
     ) -> Self {
         let mut supbooks = Vec::new();
         let mut sheets_by_xti = Vec::new();
@@ -77,24 +81,47 @@ impl<'a> Cells<'a> {
             sheets_by_xti,
             sheets,
             shared,
+            budget,
+            budget_exceeded: std::cell::Cell::new(false),
         }
     }
 
     fn cell(&self, sheet: usize, row: u16, column: u16) -> Option<reader::Cached> {
         match self.sheets[sheet].1.rows.get(&row)?.get(&column)? {
             CellValue::Number(number) => Some(reader::Cached::Number(*number)),
-            CellValue::Text(text) => Some(reader::Cached::Text(text.clone())),
-            CellValue::SharedString(index) => {
-                Some(reader::Cached::Text(self.shared.get(*index)?.text.clone()))
-            }
+            CellValue::Text(text) => self.copy_text(text),
+            CellValue::SharedString(index) => self.copy_text(&self.shared.get(*index)?.text),
             _ => None,
         }
+    }
+
+    fn copy_text(&self, text: &str) -> Option<reader::Cached> {
+        // Count every reference before expanding one SST string into many
+        // categories, including repeats across charts in this workbook.
+        let Some(left) = self
+            .budget
+            .get()
+            .checked_sub(text.len() + std::mem::size_of::<reader::Cached>())
+        else {
+            self.budget_exceeded.set(true);
+            return None;
+        };
+        self.budget.set(left);
+        Some(reader::Cached::Text(text.to_owned()))
     }
 
     /// ChartParsedFormula (2.5.49) limited to 3-D cell references, areas and
     /// their unions (ptgRef3d 2.5.198.85, ptgArea3d 2.5.198.28, ptgUnion,
     /// ptgParen). Any other token leaves the part unresolved.
-    fn resolve(&self, rgce: &[u8]) -> Option<Vec<Option<reader::Cached>>> {
+    fn resolve(&self, rgce: &[u8]) -> Result<Option<Vec<Option<reader::Cached>>>, String> {
+        let result = self.resolve_optional(rgce);
+        if self.budget_exceeded.get() {
+            return Err(unsupported("XLS chart reference retention budget exceeded"));
+        }
+        Ok(result)
+    }
+
+    fn resolve_optional(&self, rgce: &[u8]) -> Option<Vec<Option<reader::Cached>>> {
         let mut output = Vec::new();
         let mut at = 0usize;
         while at < rgce.len() {
@@ -129,7 +156,20 @@ impl<'a> Cells<'a> {
                     if output.len() >= MAX_REFERENCED_CELLS {
                         return None;
                     }
-                    output.push(self.cell(sheet, row, column));
+                    let left = self
+                        .budget
+                        .get()
+                        .checked_sub(std::mem::size_of::<Option<reader::Cached>>());
+                    let Some(left) = left else {
+                        self.budget_exceeded.set(true);
+                        return None;
+                    };
+                    self.budget.set(left);
+                    let cell = self.cell(sheet, row, column);
+                    if self.budget_exceeded.get() {
+                        return None;
+                    }
+                    output.push(cell);
                 }
             }
             at += size;
@@ -153,12 +193,13 @@ fn with_context<R>(
     styles: &styles::Styles<'_>,
     sheets: &[(String, SheetData)],
     shared: &[rich::Text],
+    budget: &std::cell::Cell<usize>,
     body: impl FnOnce(&Palette<'_>, &project::References<'_>) -> R,
-) -> R {
+) -> Result<R, String> {
     let sheet_ids: BTreeMap<_, _> = tabs.iter().enumerate().map(|(i, &tab)| (tab, i)).collect();
-    let cells = Cells::new(records, &sheet_ids, sheets, shared);
+    let cells = Cells::new(records, &sheet_ids, sheets, shared, budget);
     let references = |rgce: &[u8]| cells.resolve(rgce);
-    let theme = theme::Colors::parse(records).unwrap_or_default();
+    let theme = theme::Colors::parse(records)?;
     let color = |icv: u16| styles.chart_color(icv);
     let global_font = |index: u16| styles.global_font(index);
     let decode_font = |data: &[u8]| styles.chart_font(data);
@@ -173,7 +214,11 @@ fn with_context<R>(
                 .map(|[_, r, g, b]| format!("{r:02X}{g:02X}{b:02X}"))
         }),
     };
-    body(&palette, &references)
+    let result = body(&palette, &references);
+    if cells.budget_exceeded.get() {
+        return Err(unsupported("XLS chart reference retention budget exceeded"));
+    }
+    Ok(result)
 }
 
 /// A chart sheet's chart (MS-XLS 2.1.7.20.1 chart sheet substream) and the
@@ -195,6 +240,7 @@ pub(super) fn chart_sheet(
     styles: &styles::Styles<'_>,
     sheets: &[(String, SheetData)],
     shared: &[rich::Text],
+    budget: &std::cell::Cell<usize>,
 ) -> Result<ChartSheet, String> {
     let bof = records
         .get(start)
@@ -240,8 +286,9 @@ pub(super) fn chart_sheet(
         styles,
         sheets,
         shared,
-        |palette, references| parse(&records[start..=end], palette, references),
-    )?
+        budget,
+        |palette, references| parse(&records[start..=end], palette, references, budget),
+    )??
     .ok_or_else(|| unsupported("BIFF chart without drawable series is not projected"))?;
     Ok(ChartSheet {
         model,
@@ -266,19 +313,30 @@ impl Charts {
         styles: &styles::Styles<'_>,
         sheets: &[(String, SheetData)],
         shared: &[rich::Text],
+        budget: &std::cell::Cell<usize>,
     ) -> Result<Self, String> {
         let sheet_ids: BTreeMap<_, _> = tabs.iter().enumerate().map(|(i, &tab)| (tab, i)).collect();
         let anchors = drawing_anchors::projectable(records)?;
+        // Theme bytes are owned by an actual projected chart. Unrelated,
+        // unused theme payloads must not expand or reject a cell-only sheet.
+        // Once chart-owned, malformed theme data propagates without fallback.
+        if !anchors
+            .iter()
+            .any(|anchor| anchor.chart.is_some() && sheet_ids.contains_key(&anchor.sheet))
+        {
+            return Ok(Self::default());
+        }
         with_context(
             records,
             tabs,
             styles,
             sheets,
             shared,
+            budget,
             |palette, references| {
-                Self::prepare_anchors(records, anchors, &sheet_ids, palette, references)
+                Self::prepare_anchors(records, anchors, &sheet_ids, palette, references, budget)
             },
-        )
+        )?
     }
 
     fn prepare_anchors(
@@ -287,6 +345,7 @@ impl Charts {
         sheet_ids: &BTreeMap<usize, usize>,
         palette: &Palette<'_>,
         references: &project::References<'_>,
+        budget: &std::cell::Cell<usize>,
     ) -> Result<Self, String> {
         let mut charts = Self::default();
         for anchor in anchors {
@@ -299,7 +358,7 @@ impl Charts {
                 .ok_or_else(|| unsupported("BIFF chart substream out of range"))?;
             // A chart without Series records projects as an authored empty
             // chart; series that exist but cannot be resolved are rejected.
-            let model = parse(substream, palette, references)?.ok_or_else(|| {
+            let model = parse(substream, palette, references, budget)?.ok_or_else(|| {
                 unsupported("BIFF chart without drawable series is not projected")
             })?;
             charts.sheets.entry(sheet).or_default().push(PreparedChart {

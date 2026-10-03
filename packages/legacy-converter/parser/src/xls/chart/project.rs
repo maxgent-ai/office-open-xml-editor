@@ -317,17 +317,49 @@ fn data_labels(flags: u16) -> Option<ooxml_common::chart::ChartSeriesDataLabels>
 }
 
 /// Resolves a BRAI worksheet reference (rgce) to its cells in order.
-pub(crate) type References<'a> = dyn Fn(&[u8]) -> Option<Vec<Option<Cached>>> + 'a;
+pub(crate) type References<'a> = dyn Fn(&[u8]) -> Result<Option<Vec<Option<Cached>>>, String> + 'a;
 
 /// Project a raw chart. Returns `None` when there is no drawable series.
 /// The chart data cache is authoritative when present (MS-XLS 2.2.3.2);
 /// otherwise series parts are read from the referenced worksheet cells.
+#[cfg(test)]
+type UnboundedReferences = dyn Fn(&[u8]) -> Option<Vec<Option<Cached>>>;
+
+#[cfg(test)]
 pub(crate) fn project(
     raw: &RawChart,
     palette: &Palette<'_>,
-    references: &References<'_>,
+    references: &UnboundedReferences,
 ) -> Option<ChartModel> {
-    let primary = raw.groups.first()?;
+    project_bounded(
+        raw,
+        palette,
+        &|bytes| Ok(references(bytes)),
+        &std::cell::Cell::new(usize::MAX),
+    )
+    .unwrap()
+}
+
+fn charge(budget: &std::cell::Cell<usize>, bytes: usize) -> Result<(), String> {
+    let left = budget
+        .get()
+        .checked_sub(bytes)
+        .ok_or_else(|| super::super::unsupported("XLS chart model retention budget exceeded"))?;
+    budget.set(left);
+    Ok(())
+}
+
+/// Workbook aggregate admission includes typed slots, reference/cache copies,
+/// and generated categories before each potentially amplified allocation.
+pub(crate) fn project_bounded(
+    raw: &RawChart,
+    palette: &Palette<'_>,
+    references: &References<'_>,
+    budget: &std::cell::Cell<usize>,
+) -> Result<Option<ChartModel>, String> {
+    let Some(primary) = raw.groups.first() else {
+        return Ok(None);
+    };
     let values = raw.cache.get(&1);
     let categories = raw.cache.get(&2);
     let bubbles = raw.cache.get(&3);
@@ -358,20 +390,41 @@ pub(crate) fn project(
         }
         let key = index as u16;
         let group = raw.groups.get(usize::from(series.group)).unwrap_or(primary);
-        let part =
-            |numindex: u16, cache: Option<&std::collections::BTreeMap<(u16, u16), Cached>>| {
-                let count = point_count(cache, key);
-                if count > 0 {
-                    return (0..count)
-                        .map(|point| cache.and_then(|c| c.get(&(key, point as u16))).cloned())
-                        .collect::<Vec<_>>();
+        let part = |numindex: u16,
+                    cache: Option<&std::collections::BTreeMap<(u16, u16), Cached>>|
+         -> Result<Vec<Option<Cached>>, String> {
+            let count = point_count(cache, key);
+            if count > 0 {
+                charge(
+                    budget,
+                    count
+                        .checked_mul(std::mem::size_of::<Option<Cached>>())
+                        .ok_or("XLS chart allocation overflow")?,
+                )?;
+                let mut values = Vec::with_capacity(count);
+                for point in 0..count {
+                    let value = cache.and_then(|c| c.get(&(key, point as u16)));
+                    if let Some(Cached::Text(text)) = value {
+                        charge(budget, text.len())?;
+                    }
+                    values.push(value.cloned());
                 }
-                series.references[usize::from(numindex)]
-                    .as_deref()
-                    .and_then(references)
-                    .unwrap_or_default()
-            };
-        let series_values = part(1, values)
+                return Ok(values);
+            }
+            match series.references[usize::from(numindex)].as_deref() {
+                Some(bytes) => Ok(references(bytes)?.unwrap_or_default()),
+                None => Ok(Vec::new()),
+            }
+        };
+        let values = part(1, values)?;
+        charge(
+            budget,
+            values
+                .len()
+                .checked_mul(std::mem::size_of::<Option<f64>>())
+                .ok_or("XLS chart allocation overflow")?,
+        )?;
+        let series_values = values
             .into_iter()
             .map(|value| match value {
                 Some(Cached::Number(number)) => Some(number),
@@ -379,19 +432,39 @@ pub(crate) fn project(
             })
             .collect::<Vec<_>>();
         let count = series_values.len();
-        let series_categories = part(2, categories)
-            .into_iter()
-            .map(|value| match value {
-                Some(Cached::Text(text)) => text,
-                Some(Cached::Number(number)) => number_text(number),
-                None => String::new(),
-            })
-            .collect::<Vec<_>>();
-        let series_categories = if series_categories.is_empty() {
-            (1..=count).map(|n| n.to_string()).collect()
+        let categories = part(2, categories)?;
+        let category_count = if categories.is_empty() {
+            count
         } else {
-            series_categories
+            categories.len()
         };
+        charge(
+            budget,
+            category_count
+                .checked_mul(std::mem::size_of::<String>())
+                .ok_or("XLS chart allocation overflow")?,
+        )?;
+        let mut series_categories = Vec::with_capacity(category_count);
+        if categories.is_empty() {
+            for point in 1..=count {
+                let text = point.to_string();
+                charge(budget, text.len())?;
+                series_categories.push(text);
+            }
+        } else {
+            for value in categories {
+                let text = match value {
+                    Some(Cached::Text(text)) => text,
+                    Some(Cached::Number(number)) => {
+                        let text = number_text(number);
+                        charge(budget, text.len())?;
+                        text
+                    }
+                    None => String::new(),
+                };
+                series_categories.push(text);
+            }
+        }
         let series_paint = series
             .series_format
             .as_ref()
@@ -477,6 +550,12 @@ pub(crate) fn project(
                     .max()
                     .unwrap_or(0),
             );
+            charge(
+                budget,
+                points
+                    .checked_mul(std::mem::size_of::<Option<String>>())
+                    .ok_or("XLS chart allocation overflow")?,
+            )?;
             let colors = (0..points)
                 .map(|point| {
                     series
@@ -490,7 +569,15 @@ pub(crate) fn project(
                 model_series.data_point_colors = Some(colors);
             }
         }
-        let sizes = part(3, bubbles)
+        let sizes = part(3, bubbles)?;
+        charge(
+            budget,
+            sizes
+                .len()
+                .checked_mul(std::mem::size_of::<Option<f64>>())
+                .ok_or("XLS chart allocation overflow")?,
+        )?;
+        let sizes = sizes
             .into_iter()
             .map(|value| match value {
                 Some(Cached::Number(number)) => Some(number),
@@ -500,6 +587,12 @@ pub(crate) fn project(
         if sizes.iter().any(Option::is_some) {
             model_series.bubble_sizes = Some(sizes);
         }
+        use ooxml_common::chart::RetainedBytes;
+        charge(
+            budget,
+            std::mem::size_of::<ChartSeries>()
+                .saturating_add(usize::try_from(model_series.heap_bytes()).unwrap_or(usize::MAX)),
+        )?;
         series_models.push(model_series);
     }
     if series_models.is_empty() {
@@ -507,7 +600,7 @@ pub(crate) fn project(
         // its chart area (see ChartModel::authored_without_series). Series
         // that exist but resolve to nothing are not projected.
         if raw.series.iter().any(|series| !series.trend_or_error) {
-            return None;
+            return Ok(None);
         }
         model.authored_without_series = true;
     }
@@ -617,5 +710,14 @@ pub(crate) fn project(
             model.plot_area_line_hidden = Some(true);
         }
     }
-    Some(model)
+    // Resource policy counts both admitted expansion work and the complete
+    // retained chart, including authored empty charts, titles and axes.
+    // This aggregate quota is independent of Office rendering semantics.
+    use ooxml_common::chart::RetainedBytes;
+    charge(
+        budget,
+        std::mem::size_of::<ChartModel>()
+            .saturating_add(usize::try_from(model.heap_bytes()).unwrap_or(usize::MAX)),
+    )?;
+    Ok(Some(model))
 }

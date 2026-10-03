@@ -137,6 +137,7 @@ impl Shapes {
         tabs: &[usize],
         styles: &styles::Styles<'_>,
     ) -> Result<Self, String> {
+        let mut budget = super::rich::MAX_MODEL_BYTES;
         let sheet_ids: BTreeMap<_, _> = tabs.iter().enumerate().map(|(i, &tab)| (tab, i)).collect();
         let mut prepared = Self::default();
         let mut defaults = None;
@@ -191,7 +192,7 @@ impl Shapes {
                         order: member.order,
                     };
                     if let Some((info, rotation)) =
-                        leaf.project(records, styles, defaults, source)?
+                        leaf.project(records, styles, defaults, source, &mut budget)?
                     {
                         leaves.push((
                             info,
@@ -211,7 +212,9 @@ impl Shapes {
                     child: false,
                     order: anchor.order,
                 };
-                if let Some((info, rotation)) = leaf.project(records, styles, defaults, source)? {
+                if let Some((info, rotation)) =
+                    leaf.project(records, styles, defaults, source, &mut budget)?
+                {
                     leaves.push((
                         info,
                         Placement {
@@ -519,6 +522,7 @@ impl Leaf {
         styles: &styles::Styles<'_>,
         defaults: &Table,
         source: &ShapeSource,
+        budget: &mut usize,
     ) -> Result<Option<(xlsx_model::ShapeInfo, i32)>, String> {
         // MS-ODRAW 2.2.40: groups, patriarchs, deleted, OLE, master-linked,
         // connector and background shapes need facts this projection lacks.
@@ -672,7 +676,18 @@ impl Leaf {
             None
         };
         let text = match source.text {
-            Some(offset) => text(records, styles, offset, anchor_text, margins, wrap, &table)?,
+            Some(offset) => text(
+                records,
+                styles,
+                offset,
+                TextLayout {
+                    anchor_text,
+                    margins,
+                    wrap,
+                    table: &table,
+                },
+                budget,
+            )?,
             None => None,
         };
         if freeform && inscribed && text.is_some() {
@@ -715,44 +730,48 @@ impl Leaf {
             return Err(unsupported("right-to-left XLS shape text is not projected"));
         }
         let (join, miter) = paint.details.join();
-        Ok(Some((
-            xlsx_model::ShapeInfo {
-                z_order: self.order,
-                // Placement is resolved with the anchor size.
-                x: 0.0,
-                y: 0.0,
-                w: 1.0,
-                h: 1.0,
-                rot: 0.0,
-                flip_h: false,
-                flip_v: false,
-                fill_color: fill.clone(),
-                fill: fill.map(|color| xlsx_model::ShapeFill::Solid { color }),
-                stroke_width: line
-                    .as_ref()
-                    .map_or(0, |_| i64::from(paint.width.unwrap_or(9525))),
-                stroke_dash_style: line.as_ref().and_then(|_| {
-                    paint
-                        .dash
-                        .and_then(crate::officeart::stroke::preset_dash)
-                        .filter(|dash| *dash != "solid")
-                        .map(str::to_owned)
-                }),
-                stroke_line_cap: line.as_ref().map(|_| paint.details.canvas_cap().to_owned()),
-                stroke_line_join: line.as_ref().map(|_| join.to_owned()),
-                stroke_miter_limit: line.as_ref().and(miter),
-                stroke_color: line,
-                stroke_fill: None,
-                stroke_custom_dash: Vec::new(),
-                stroke_alignment: None,
-                stroke_cmpd: None,
-                stroke_head_end: None,
-                stroke_tail_end: None,
-                geom,
-                text,
-            },
-            rotation,
-        )))
+        let info = xlsx_model::ShapeInfo {
+            z_order: self.order,
+            // Placement is resolved with the anchor size.
+            x: 0.0,
+            y: 0.0,
+            w: 1.0,
+            h: 1.0,
+            rot: 0.0,
+            flip_h: false,
+            flip_v: false,
+            fill_color: fill.clone(),
+            fill: fill.map(|color| xlsx_model::ShapeFill::Solid { color }),
+            stroke_width: line
+                .as_ref()
+                .map_or(0, |_| i64::from(paint.width.unwrap_or(9525))),
+            stroke_dash_style: line.as_ref().and_then(|_| {
+                paint
+                    .dash
+                    .and_then(crate::officeart::stroke::preset_dash)
+                    .filter(|dash| *dash != "solid")
+                    .map(str::to_owned)
+            }),
+            stroke_line_cap: line.as_ref().map(|_| paint.details.canvas_cap().to_owned()),
+            stroke_line_join: line.as_ref().map(|_| join.to_owned()),
+            stroke_miter_limit: line.as_ref().and(miter),
+            stroke_color: line,
+            stroke_fill: None,
+            stroke_custom_dash: Vec::new(),
+            stroke_alignment: None,
+            stroke_cmpd: None,
+            stroke_head_end: None,
+            stroke_tail_end: None,
+            geom,
+            text,
+        };
+        use ooxml_common::chart::RetainedBytes;
+        charge_shape(
+            budget,
+            std::mem::size_of::<xlsx_model::ShapeInfo>()
+                .saturating_add(usize::try_from(info.heap_bytes()).unwrap_or(usize::MAX)),
+        )?;
+        Ok(Some((info, rotation)))
     }
 }
 
@@ -793,6 +812,14 @@ fn custom_geometry(decoded: &crate::officeart::geometry::Decoded) -> xlsx_model:
                             y3: y3 as f64,
                         }
                     }
+                    // MS-ODRAW quarter ellipse decoded in degree units; XLSX
+                    // arcTo uses 60000ths of a degree (ECMA-376 20.1.9.3).
+                    DecodedCommand::Arc { wr, hr, start, .. } => xlsx_model::PathCmd::ArcTo {
+                        wr: wr as f64,
+                        hr: hr as f64,
+                        st_ang: f64::from(start) * 60_000.0,
+                        sw_ang: -90.0 * 60_000.0,
+                    },
                     DecodedCommand::Close => xlsx_model::PathCmd::Close,
                 })
                 .collect(),
@@ -879,17 +906,47 @@ fn rgb(color: u32, alpha: u32) -> Result<String, String> {
     Ok(hex)
 }
 
+/// Resource policy admits amplified text work and complete retained shapes
+/// against one workbook quota; OfficeArt record sizes alone do not bound it.
+fn charge_shape(budget: &mut usize, bytes: usize) -> Result<(), String> {
+    *budget = budget
+        .checked_sub(bytes)
+        .ok_or_else(|| unsupported("XLS shape model retention budget exceeded"))?;
+    Ok(())
+}
+
+fn charge_run(budget: &mut usize, font: &RunFont, text_bytes: usize) -> Result<(), String> {
+    charge_shape(
+        budget,
+        std::mem::size_of::<xlsx_model::ShapeTextRun>()
+            .saturating_add(font.name.len().saturating_mul(2))
+            .saturating_add(font.color.len())
+            .saturating_add(text_bytes),
+    )
+}
+
+struct TextLayout<'a> {
+    anchor_text: Option<u32>,
+    margins: [u32; 4],
+    wrap: &'a str,
+    table: &'a Table,
+}
+
 /// TxO (MS-XLS 2.4.329): the text string in Continue records of
 /// XLUnicodeStringNoCch fragments, then its TxORuns formatting runs.
 fn text(
     records: &[Record<'_>],
     styles: &styles::Styles<'_>,
     offset: usize,
-    anchor_text: Option<u32>,
-    margins: [u32; 4],
-    wrap: &str,
-    table: &Table,
+    layout: TextLayout<'_>,
+    budget: &mut usize,
 ) -> Result<Option<xlsx_model::ShapeText>, String> {
+    let TextLayout {
+        anchor_text,
+        margins,
+        wrap,
+        table,
+    } = layout;
     let index = records
         .binary_search_by_key(&offset, |record| record.offset)
         .map_err(|_| unsupported("BIFF TxO record is not a record boundary"))?;
@@ -1009,6 +1066,7 @@ fn text(
         font_face: Some(font.name.clone()),
         font_face_ea: Some(font.name.clone()),
         font_face_cs: None,
+        spacing: None,
     };
     let mut paragraphs = Vec::new();
     let mut start = 0usize;
@@ -1017,15 +1075,25 @@ fn text(
             .iter()
             .position(|&unit| unit == 0x000a)
             .map_or(characters, |at| start + at);
+        // TxO cchText bounds encoded text, not the paragraph/run expansion.
+        // Admit each generated slot and repeated font string before allocating.
+        charge_shape(
+            budget,
+            std::mem::size_of::<xlsx_model::ShapeParagraph>() + align.len(),
+        )?;
         let mut paragraph_runs = Vec::new();
         if start == end {
             // An empty line keeps the height of the font at its position.
-            paragraph_runs.push(make_run(String::new(), font_at(start)));
+            let font = font_at(start);
+            charge_run(budget, font, 0)?;
+            paragraph_runs.push(make_run(String::new(), font));
         }
         let mut at = start;
         while at < end {
             let run = runs.partition_point(|run| run.0 <= at) - 1;
             let run_end = runs.get(run + 1).map_or(characters, |next| next.0).min(end);
+            // UTF-8 occupies at most three bytes per UTF-16 code unit.
+            charge_run(budget, &fonts[&runs[run].1], (run_end - at) * 3)?;
             let text = String::from_utf16(&units[at..run_end])
                 .map_err(|_| unsupported("invalid UTF-16 in BIFF TxO text"))?;
             paragraph_runs.push(make_run(text, &fonts[&runs[run].1]));
@@ -1038,6 +1106,10 @@ fn text(
             mar_r: None,
             indent: None,
             space_line: None,
+            space_before: None,
+            space_after: None,
+            def_tab_sz: None,
+            tab_stops: Vec::new(),
             runs: paragraph_runs,
         });
         if end == characters {
@@ -1059,6 +1131,11 @@ fn text(
         t_ins: i64::from(margins[1]),
         r_ins: i64::from(margins[2]),
         b_ins: i64::from(margins[3]),
+        // TxO/OfficeArt facts already admitted above do not carry these
+        // optional DrawingML body properties; use the model defaults.
+        anchor_ctr: false,
+        spc_first_last_para: false,
+        vert: "horz".into(),
         paragraphs,
     }))
 }

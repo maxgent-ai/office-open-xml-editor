@@ -29,7 +29,9 @@ pub(super) fn decode(
 }
 
 /// `gdiplus_end` admits the end-of-file layout GDI+ writes (see
-/// `validate_emf`); only hosts with Office evidence opt in.
+/// `validate_emf`); only hosts with Office evidence opt in. This Excel mode
+/// also preserves exact WMF extent admission: PowerPoint trailer/mtSize
+/// controls do not establish Excel compatibility.
 pub(super) fn decode_with(
     record: Record<'_>,
     budget: &mut usize,
@@ -90,7 +92,7 @@ pub(super) fn decode_with(
             validate_emf(viewed, budget, gdiplus_end)?;
         }
         Format::Wmf => {
-            if !validate_wmf(viewed, budget)? {
+            if !validate_wmf(viewed, budget, gdiplus_end)? {
                 return Ok(None);
             }
         }
@@ -176,7 +178,7 @@ fn starts_with_emf_plus_header(bytes: &[u8]) -> bool {
         && u16::from_le_bytes([comment[16], comment[17]]) == 0x4001
 }
 
-fn validate_wmf(bytes: &[u8], budget: &mut usize) -> Result<bool, String> {
+fn validate_wmf(bytes: &[u8], budget: &mut usize, exact_extent: bool) -> Result<bool, String> {
     // MS-WMF 2.3.2.2-3/2.3: a placeable header is optional; META_HEADER
     // states a file size, followed by bounded records and a META_EOF.
     let start = if bytes.starts_with(&0x9ac6cdd7u32.to_le_bytes()) {
@@ -206,6 +208,9 @@ fn validate_wmf(bytes: &[u8], budget: &mut usize) -> Result<bool, String> {
     // but use physically bounded record envelopes and META_EOF for replay;
     // Office does not use mtSize as an exact byte-length assertion.
     let declared_words = dword(6) as usize;
+    if exact_extent && declared_words.checked_mul(2) != Some(bytes.len() - start) {
+        return Err(unsupported("invalid WMF header"));
+    }
     if !matches!(word(0), 1 | 2)
         || word(2) != 9
         || !matches!(word(4), 0x100 | 0x300)
@@ -243,7 +248,10 @@ fn validate_wmf(bytes: &[u8], budget: &mut usize) -> Result<bool, String> {
             // unchanged by the tested trailers; retain original bytes for
             // the renderer, which also stops at META_EOF, without treating
             // later bytes as another WMF record.
-            return Ok(true);
+            // XLS retains the saved subset until Excel controls justify
+            // admitting bytes after EOF. This is library policy, not a claim
+            // that such padding cannot be a valid WMF.
+            return Ok(!exact_extent || position == bytes.len());
         }
     }
     Err(unsupported("missing WMF end record"))

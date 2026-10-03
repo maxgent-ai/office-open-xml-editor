@@ -307,6 +307,7 @@ fn prepare_workbook(workbook: &[u8]) -> Result<PreparedXls, String> {
     let mut table_styles = None;
     let mut filter_databases = None;
     let mut defined_names = None;
+    let mut name_retention_budget = rich::MAX_MODEL_BYTES;
     let has_names = records
         .iter()
         .take_while(|record| record.kind != EOF)
@@ -383,7 +384,10 @@ fn prepare_workbook(workbook: &[u8]) -> Result<PreparedXls, String> {
                 let (_, externs) = conditional_theme.as_ref().expect("parsed theme");
                 defined_names = Some(names::Names::parse(&records, externs)?);
             }
-            data.defined_names = defined_names.as_ref().expect("parsed names").for_sheet(tab);
+            data.defined_names = defined_names
+                .as_ref()
+                .expect("parsed names")
+                .for_sheet(tab, &mut name_retention_budget)?;
         }
         if !data.validation_records.is_empty() {
             if conditional_theme.is_none() {
@@ -529,7 +533,15 @@ fn prepare_workbook(workbook: &[u8]) -> Result<PreparedXls, String> {
     if pictures.has_unsupported_images() {
         return Err(unsupported("BIFF picture BLIP is not a supported image"));
     }
-    let charts = chart::Charts::prepare(&records, &tabs, &styles, &converted, &shared_strings)?;
+    let chart_reference_budget = std::cell::Cell::new(rich::MAX_MODEL_BYTES);
+    let charts = chart::Charts::prepare(
+        &records,
+        &tabs,
+        &styles,
+        &converted,
+        &shared_strings,
+        &chart_reference_budget,
+    )?;
     shapes.attach_images(&pictures)?;
     let mut chart_sheets = Vec::with_capacity(pending_chart_sheets.len());
     for &(index, offset) in &pending_chart_sheets {
@@ -538,7 +550,15 @@ fn prepare_workbook(workbook: &[u8]) -> Result<PreparedXls, String> {
             .map_err(|_| unsupported("BOUNDSHEET8 points outside the BIFF record stream"))?;
         chart_sheets.push((
             index,
-            chart::chart_sheet(&records, start, &tabs, &styles, &converted, &shared_strings)?,
+            chart::chart_sheet(
+                &records,
+                start,
+                &tabs,
+                &styles,
+                &converted,
+                &shared_strings,
+                &chart_reference_budget,
+            )?,
         ));
     }
     for (index, chart_sheet) in chart_sheets {

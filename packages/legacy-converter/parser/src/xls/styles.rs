@@ -395,6 +395,10 @@ impl ResolvedStyleSheet {
             strike: value.font.strike,
             size: Some(f64::from(value.font.size_twips) / 20.0),
             color,
+            // XLS table/rich-text color precedence has not been established by
+            // Excel binary controls; retain the existing direct-reader policy.
+            normal_color: false,
+            authored_color: None,
             name: Some(value.font.name.clone()),
             underline_style: underline_style.map(str::to_owned),
             vert_align: vert_align.map(str::to_owned),
@@ -977,6 +981,9 @@ fn xf_model(value: ResolvedXf) -> xlsx_model::CellXf {
         text_rotation: (value.text_rotation != 0).then_some(value.text_rotation.into()),
         shrink_to_fit: value.shrink_to_fit,
         reading_order: (value.reading_order != 0).then_some(value.reading_order.into()),
+        // The SpreadsheetML table-color compatibility rule is not evidence
+        // for BIFF XF precedence; preserve this reader's existing behavior.
+        own_font_color: false,
     }
 }
 

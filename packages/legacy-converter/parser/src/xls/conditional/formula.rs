@@ -134,7 +134,7 @@ const ECMA_FUTURE: [&str; 12] = [
 /// when that SupBook is the add-in marker (cch 0x3A01).
 #[derive(Default)]
 pub(in super::super) struct Externs {
-    xti_names: Vec<Option<Vec<String>>>,
+    xti_names: Vec<Option<std::rc::Rc<Vec<String>>>>,
     /// Lbl (2.4.150) names in record order; built-in names are `None`.
     names: Vec<Option<(String, bool)>>,
     /// Formula sheet prefix (quoted when needed) per XTI of this workbook's
@@ -251,6 +251,12 @@ impl Externs {
                 _ => {}
             }
         }
+        // XTI entries share the admitted SupBook name list. Cloning the list
+        // per index creates an XTI × AddinUdf amplification from compact input.
+        let books: Vec<_> = books
+            .into_iter()
+            .map(|names| names.map(std::rc::Rc::new))
+            .collect();
         Ok(Self {
             xti_names: xtis
                 .iter()
@@ -910,7 +916,10 @@ mod tests {
     #[test]
     fn resolves_toolpak_addins_and_rejects_other_names() {
         let externs = Externs {
-            xti_names: vec![Some(vec!["EOMONTH".into(), "MYUDF".into()])],
+            xti_names: vec![Some(std::rc::Rc::new(vec![
+                "EOMONTH".into(),
+                "MYUDF".into(),
+            ]))],
             names: vec![Some(("List".into(), false)), None],
             xti_sheets: vec![Some("Data".into())],
         };

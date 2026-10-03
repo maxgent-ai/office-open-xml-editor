@@ -93,9 +93,36 @@ fn project(
 ) -> Result<Option<xlsx_model::ShapeInfo>, String> {
     let records = records(owned);
     let styles = styles::Styles::parse(&records).unwrap();
+    let mut budget = usize::MAX;
     leaf(flags)
-        .project(&records, &styles, defaults, shape)
+        .project(&records, &styles, defaults, shape, &mut budget)
         .map(|leaf| leaf.map(|(info, _)| info))
+}
+
+#[test]
+fn newline_expansion_is_admitted_against_the_workbook_shape_budget() {
+    let owned = workbook(
+        0x0212,
+        &compressed("\n".repeat(100).as_str()),
+        100,
+        &[(0, 0)],
+    );
+    let shape = source(&owned, 202, &[(0x01bf, 0x0010_0000), (0x01ff, 0x0008_0000)]);
+    let records = records(&owned);
+    let styles = styles::Styles::parse(&records).unwrap();
+    // The encoded text fits; its 101 paragraph/run objects do not.
+    let mut budget = 1024usize;
+    let result = project_limited(&records, &styles, &shape, &mut budget);
+    assert!(result.unwrap_err().contains("shape model retention budget"));
+}
+
+fn project_limited(
+    records: &[Record<'_>],
+    styles: &styles::Styles<'_>,
+    shape: &ShapeSource,
+    budget: &mut usize,
+) -> Result<Option<(xlsx_model::ShapeInfo, i32)>, String> {
+    leaf(0xa00).project(records, styles, &excel_defaults(), shape, budget)
 }
 
 /// Excel's own drawing defaults in every corpus workbook (MS-ODRAW 2.2.12):

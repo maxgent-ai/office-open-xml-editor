@@ -1,5 +1,5 @@
 //! Owned BIFF workbook-to-renderer-model boundary. Indexed models are projected
-//! once on demand, without creating SpreadsheetML or ZIP parts.
+//! on demand, with one cursor-owned projection, without SpreadsheetML or ZIP parts.
 
 use super::*;
 use std::collections::BTreeMap;
@@ -9,6 +9,7 @@ const MAX_MODEL_BYTES: usize = 256 * 1024 * 1024;
 pub(crate) struct DirectSession {
     pending_sheets: Option<Vec<(String, SheetData)>>,
     sheets: Vec<SheetSlot>,
+    active_projection: Option<(usize, Box<ProjectedSheet>, usize)>,
     sheet_meta: Vec<(String, SheetVisibility)>,
     /// Resolved SheetExt tab colors, by sheet.
     tab_colors: Vec<Option<String>>,
@@ -34,8 +35,11 @@ pub(crate) struct DirectSession {
 }
 
 enum SheetSlot {
-    Neutral { name: String, sheet: Box<SheetData> },
-    Projected(Box<ProjectedSheet>),
+    Neutral {
+        name: String,
+        sheet: Box<SheetData>,
+    },
+    #[cfg(test)]
     Consumed,
 }
 
@@ -94,6 +98,7 @@ impl DirectSession {
         let mut session = Self {
             pending_sheets: Some(std::mem::take(&mut prepared.sheets)),
             sheets: Vec::new(),
+            active_projection: None,
             sheet_meta,
             tab_colors,
             styles: Some(prepared.styles),
@@ -156,6 +161,17 @@ impl DirectSession {
                 std::mem::take(&mut self.charts).resolve(pending, mdw, &mut self.warnings);
             self.native_shapes =
                 std::mem::take(&mut self.shapes).resolve(pending, mdw, &mut self.warnings);
+            // Canonical drawing metadata is retained alongside neutral BIFF
+            // facts even when no cursor is active. Account it separately from
+            // the cursor-owned copies, including nested chart/shape storage.
+            let admission = (|| {
+                charge_copy(&mut self.model_budget, &self.native_charts)?;
+                charge_copy(&mut self.model_budget, &self.native_shapes)
+            })();
+            if let Err(error) = admission {
+                self.poisoned = true;
+                return Err(error);
+            }
             // The resolvers report geometry they cannot place (a sheet without
             // stored defaults, a formula-display window or an anchor past the
             // resolved grid) as an omission; drawn content is never dropped,
@@ -274,11 +290,9 @@ impl DirectSession {
         let name = self.sheet_meta[index].0.clone();
         self.projected_sheet(index, &name)?;
         self.sheet_index += 1;
-        let SheetSlot::Projected(projected) =
-            std::mem::replace(&mut self.sheets[index], SheetSlot::Consumed)
-        else {
-            return self.fail("XLS direct sheet was already consumed");
-        };
+        let (_, projected, charged) = self.active_projection.take().expect("projected above");
+        self.model_budget += charged;
+        self.sheets[index] = SheetSlot::Consumed;
         let ProjectedSheet {
             mut worksheet,
             rows,
@@ -287,9 +301,17 @@ impl DirectSession {
         Ok(Some(worksheet))
     }
 
-    /// Lazily project one worksheet into an indexed, reusable model slot.
-    /// The row-free shell and row sidecar are borrowed by the cursor wire layer;
-    /// projection is charged once and never repeated after cancellation.
+    /// Native projection belongs only to the active cursor. Browser/Node retain
+    /// models through the ordinary XLSX admission and lease/LRU paths; keeping
+    /// another inactive decoded cache here would defeat their eviction. Neutral
+    /// BIFF facts remain available for page-local reprojection after cancellation
+    /// or eviction. Refund only the charge saved at successful projection.
+    pub(crate) fn release_projection(&mut self) {
+        if let Some((_, _, charged)) = self.active_projection.take() {
+            self.model_budget += charged;
+        }
+    }
+
     pub(crate) fn projected_sheet(
         &mut self,
         index: usize,
@@ -299,9 +321,6 @@ impl DirectSession {
         if !self.bootstrapped {
             return self.fail("XLS direct bootstrap must be consumed before worksheets");
         }
-        if self.pending_sheets.is_some() {
-            return self.fail("XLS direct pictures require an explicit font measurement decision");
-        }
         let Some((expected, _)) = self.sheet_meta.get(index) else {
             return Err(unsupported("XLS direct sheet index is out of range"));
         };
@@ -310,45 +329,69 @@ impl DirectSession {
                 "XLS direct sheet name does not match its index",
             ));
         }
+        #[cfg(test)]
         if matches!(self.sheets.get(index), Some(SheetSlot::Consumed)) {
             return Err(unsupported("XLS direct sheet was already consumed"));
         }
-        if matches!(self.sheets.get(index), Some(SheetSlot::Neutral { .. })) {
-            let SheetSlot::Neutral { name, sheet } =
-                std::mem::replace(&mut self.sheets[index], SheetSlot::Consumed)
-            else {
-                unreachable!("neutral slot checked above")
+        if self
+            .active_projection
+            .as_ref()
+            .is_none_or(|(active, _, _)| *active != index)
+        {
+            self.release_projection();
+            let (name, sheet) = match &self.sheets[index] {
+                SheetSlot::Neutral { name, sheet } => (name, sheet),
+                #[cfg(test)]
+                SheetSlot::Consumed => unreachable!(),
             };
-            let projected = project_sheet(
-                name,
-                *sheet,
+            let before = self.model_budget;
+            let result = project_sheet(
+                name.clone(),
+                sheet,
                 self.date1904,
                 self.mdw,
                 self.default_font.as_ref(),
                 &mut self.model_budget,
             );
-            let mut worksheet = match projected {
-                Ok(worksheet) => worksheet,
+            let mut worksheet = match result {
+                Ok(value) => value,
                 Err(error) => {
                     self.poisoned = true;
                     return Err(error);
                 }
             };
-            worksheet.images = self
-                .native_pictures
-                .sheets
-                .remove(&index)
-                .unwrap_or_default();
-            worksheet
-                .charts
-                .extend(self.native_charts.remove(&index).unwrap_or_default());
-            worksheet.shape_groups = self.native_shapes.remove(&index).unwrap_or_default();
+            // Canonical drawing metadata remains neutral. Charge each cursor's
+            // owned copies before cloning; no projection is retained after ACK.
+            let pictures = self.native_pictures.sheets.get(&index);
+            let charts = self.native_charts.get(&index);
+            let shapes = self.native_shapes.get(&index);
+            let copies = (|| {
+                if let Some(values) = pictures {
+                    charge_copy(&mut self.model_budget, values)?;
+                    worksheet.images = values.clone();
+                }
+                if let Some(values) = charts {
+                    charge_copy(&mut self.model_budget, values)?;
+                    worksheet.charts.extend(values.clone());
+                }
+                if let Some(values) = shapes {
+                    charge_copy(&mut self.model_budget, values)?;
+                    worksheet.shape_groups = values.clone();
+                }
+                Ok::<_, String>(())
+            })();
+            if let Err(error) = copies {
+                self.poisoned = true;
+                return Err(error);
+            }
             let rows = std::mem::take(&mut worksheet.rows);
-            self.sheets[index] = SheetSlot::Projected(Box::new(ProjectedSheet { worksheet, rows }));
+            self.active_projection = Some((
+                index,
+                Box::new(ProjectedSheet { worksheet, rows }),
+                before - self.model_budget,
+            ));
         }
-        let SheetSlot::Projected(projected) = &self.sheets[index] else {
-            unreachable!("consumed slot rejected above")
-        };
+        let (_, projected, _) = self.active_projection.as_ref().expect("projected above");
         Ok(ProjectedSheetRef {
             worksheet: &projected.worksheet,
             rows: &projected.rows,
@@ -415,9 +458,21 @@ impl DirectSession {
     }
 }
 
+/// Charge structural retained storage before cloning; serialized JSON is not
+/// a heap bound (numeric arrays and omitted fields can be much larger in Rust).
+fn charge_copy<T: ooxml_common::chart::RetainedBytes>(
+    budget: &mut usize,
+    value: &T,
+) -> Result<(), String> {
+    charge(
+        budget,
+        usize::try_from(value.heap_bytes()).map_err(|_| model_error())?,
+    )
+}
+
 fn project_sheet(
     name: String,
-    sheet: SheetData,
+    sheet: &SheetData,
     date1904: bool,
     mdw: Option<f64>,
     default_font: Option<&(String, f64)>,
@@ -431,13 +486,15 @@ fn project_sheet(
         charge(budget, name.len())?;
     }
     let mut worksheet = empty_worksheet(name, date1904, default_font.cloned());
-    if let Some(chart) = sheet.chart_sheet {
+    if let Some(chart) = &sheet.chart_sheet {
         // A chart sheet (ECMA-376 §18.3.1.12 CT_Chartsheet in the XLSX model)
         // has no grid; its chart is placed as the model's absolute anchor
         // (same-cell corners carrying EMU offsets) at the Chart record's
         // chart-area rectangle.
         worksheet.is_chart_sheet = true;
         worksheet.show_gridlines = false;
+        charge_copy(budget, &chart.model)?;
+        reserve_model(&mut worksheet.charts, 1, budget)?;
         worksheet.charts.push(xlsx_model::ChartAnchor {
             z_order: 0,
             from_col: 0,
@@ -448,13 +505,13 @@ fn project_sheet(
             to_col_off: chart.x_emu + chart.width_emu,
             to_row: 0,
             to_row_off: chart.y_emu + chart.height_emu,
-            chart: chart.model,
+            chart: chart.model.clone(),
         });
         sheet.views.project(&mut worksheet);
         return Ok(worksheet);
     }
     reserve_model(&mut worksheet.rows, sheet.rows.len(), budget)?;
-    for (row_index, cells) in sheet.rows {
+    for (&row_index, cells) in &sheet.rows {
         let mut row = xlsx_model::Row {
             index: u32::from(row_index) + 1,
             height: None,
@@ -465,7 +522,7 @@ fn project_sheet(
             hidden: false,
         };
         reserve_model(&mut row.cells, cells.len(), budget)?;
-        for (column, value) in cells {
+        for (&column, value) in cells {
             row.cells.push(xlsx_model::Cell {
                 col: u32::from(column) + 1,
                 row: u32::from(row_index) + 1,
@@ -487,7 +544,7 @@ fn project_sheet(
         worksheet.rows.push(row);
     }
     reserve_model(&mut worksheet.merge_cells, sheet.merged.len(), budget)?;
-    for (first_row, last_row, first_column, last_column) in sheet.merged {
+    for &(first_row, last_row, first_column, last_column) in &sheet.merged {
         worksheet.merge_cells.push(xlsx_model::MergeCell {
             top: u32::from(first_row) + 1,
             left: u32::from(first_column) + 1,
@@ -495,8 +552,8 @@ fn project_sheet(
             right: u32::from(last_column) + 1,
         });
     }
-    charge(budget, conditional_bytes(&sheet.conditional_formats))?;
-    worksheet.conditional_formats = sheet.conditional_formats;
+    charge_copy(budget, &sheet.conditional_formats)?;
+    worksheet.conditional_formats = sheet.conditional_formats.clone();
     charge(
         budget,
         sheet
@@ -509,7 +566,7 @@ fn project_sheet(
             })
             .sum(),
     )?;
-    worksheet.tables = sheet.tables;
+    worksheet.tables = sheet.tables.clone();
     charge(
         budget,
         sheet
@@ -524,8 +581,8 @@ fn project_sheet(
             })
             .sum(),
     )?;
-    worksheet.hyperlinks = sheet.hyperlinks;
-    worksheet.auto_filter = sheet.auto_filter;
+    worksheet.hyperlinks = sheet.hyperlinks.clone();
+    worksheet.auto_filter = sheet.auto_filter.clone();
     charge(
         budget,
         sheet
@@ -550,7 +607,7 @@ fn project_sheet(
             })
             .sum(),
     )?;
-    worksheet.data_validations = sheet.data_validations;
+    worksheet.data_validations = sheet.data_validations.clone();
     charge(
         budget,
         sheet
@@ -563,116 +620,24 @@ fn project_sheet(
             })
             .sum(),
     )?;
-    worksheet.defined_names = sheet.defined_names;
-    charge(budget, pivot_bytes(&sheet.pivot_tables))?;
-    worksheet.pivot_tables = sheet.pivot_tables;
-    if let Some(color) = sheet.tab_color {
+    worksheet.defined_names = sheet.defined_names.clone();
+    charge_copy(budget, &sheet.pivot_tables)?;
+    worksheet.pivot_tables = sheet.pivot_tables.clone();
+    if let Some(color) = &sheet.tab_color {
         charge(budget, color.len())?;
-        worksheet.tab_color = Some(color);
+        worksheet.tab_color = Some(color.clone());
     }
     sheet.geometry.project(&mut worksheet, mdw, budget)?;
     sheet.views.project(&mut worksheet);
     Ok(worksheet)
 }
 
-/// Retained model bytes of projected PivotTables (resource accounting).
-fn pivot_bytes(tables: &[xlsx_model::PivotTableMetadata]) -> usize {
-    let text = |value: &Option<String>| value.as_ref().map_or(0, String::len);
-    tables
-        .iter()
-        .map(|table| {
-            std::mem::size_of::<xlsx_model::PivotTableMetadata>()
-                + table.name.len()
-                + (table.row_fields.len() + table.column_fields.len()) * 4
-                + table
-                    .page_fields
-                    .iter()
-                    .map(|field| {
-                        std::mem::size_of::<xlsx_model::PivotPageField>() + text(&field.name)
-                    })
-                    .sum::<usize>()
-                + table
-                    .data_fields
-                    .iter()
-                    .map(|field| {
-                        std::mem::size_of::<xlsx_model::PivotDataField>()
-                            + text(&field.subtotal)
-                            + text(&field.name)
-                    })
-                    .sum::<usize>()
-                + table
-                    .row_items
-                    .iter()
-                    .chain(&table.column_items)
-                    .map(|item| std::mem::size_of::<xlsx_model::PivotAxisItem>() + item.kind.len())
-                    .sum::<usize>()
-                + table.style.as_ref().map_or(0, |style| {
-                    style.name.len()
-                        + style.elements.len()
-                            * (std::mem::size_of::<xlsx_model::PivotTableStyleElement>() + 64)
-                })
-        })
-        .sum()
-}
-
-/// Retained model bytes of projected conditional formats (resource accounting).
-fn conditional_bytes(formats: &[xlsx_model::ConditionalFormat]) -> usize {
-    let value = |value: &xlsx_model::CfValue| {
-        value.kind.len() + value.value.as_ref().map_or(0, String::len)
-    };
-    formats
-        .iter()
-        .map(|format| {
-            std::mem::size_of::<xlsx_model::ConditionalFormat>()
-                + format.sqref.len() * std::mem::size_of::<xlsx_model::CellRange>()
-                + format
-                    .rules
-                    .iter()
-                    .map(|rule| {
-                        std::mem::size_of::<xlsx_model::CfRule>()
-                            + match rule {
-                                xlsx_model::CfRule::ColorScale { stops, .. } => stops
-                                    .iter()
-                                    .map(|stop| {
-                                        std::mem::size_of::<xlsx_model::CfStop>()
-                                            + stop.kind.len()
-                                            + stop.value.as_ref().map_or(0, String::len)
-                                            + stop.color.len()
-                                    })
-                                    .sum(),
-                                xlsx_model::CfRule::CellIs {
-                                    operator, formulas, ..
-                                } => {
-                                    operator.len() + formulas.iter().map(String::len).sum::<usize>()
-                                }
-                                xlsx_model::CfRule::Expression { formula, .. } => formula.len(),
-                                xlsx_model::CfRule::DataBar {
-                                    color, min, max, ..
-                                } => color.len() + value(min) + value(max),
-                                xlsx_model::CfRule::IconSet {
-                                    icon_set, cfvos, ..
-                                } => {
-                                    icon_set.len()
-                                        + cfvos
-                                            .iter()
-                                            .map(|cfvo| {
-                                                std::mem::size_of::<xlsx_model::CfValue>()
-                                                    + value(cfvo)
-                                            })
-                                            .sum::<usize>()
-                                }
-                                _ => 0,
-                            }
-                    })
-                    .sum::<usize>()
-        })
-        .sum()
-}
-
-fn cell_value(value: CellValue, budget: &mut usize) -> Result<xlsx_model::CellValue, String> {
+fn cell_value(value: &CellValue, budget: &mut usize) -> Result<xlsx_model::CellValue, String> {
     Ok(match value {
         CellValue::Blank => xlsx_model::CellValue::Empty,
-        CellValue::Number(number) if number.is_finite() => xlsx_model::CellValue::Number { number },
+        CellValue::Number(number) if number.is_finite() => {
+            xlsx_model::CellValue::Number { number: *number }
+        }
         CellValue::Number(_) => {
             charge(budget, "#NUM!".len())?;
             xlsx_model::CellValue::Error {
@@ -682,17 +647,19 @@ fn cell_value(value: CellValue, budget: &mut usize) -> Result<xlsx_model::CellVa
         CellValue::Text(text) => {
             charge(budget, text.len())?;
             xlsx_model::CellValue::Text {
-                text,
+                text: text.clone(),
                 runs: None,
                 phonetic_runs: Vec::new(),
                 phonetic_pr: None,
             }
         }
-        CellValue::SharedString(si) => xlsx_model::CellValue::Shared { si },
-        CellValue::Bool(bool) => xlsx_model::CellValue::Bool { bool },
+        CellValue::SharedString(si) => xlsx_model::CellValue::Shared { si: *si },
+        CellValue::Bool(bool) => xlsx_model::CellValue::Bool { bool: *bool },
         CellValue::Error(error) => {
             charge(budget, error.len())?;
-            xlsx_model::CellValue::Error { error }
+            xlsx_model::CellValue::Error {
+                error: error.clone(),
+            }
         }
     })
 }
@@ -747,6 +714,8 @@ fn empty_worksheet(
         default_font_size,
         default_font_bold: None,
         default_font_italic: None,
+        // BIFF Normal XF is the source of default_font (MS-XLS 2.2.6.1.2.2).
+        normal_font_size: default_font_size,
         theme_japanese_major_font: None,
         theme_japanese_minor_font: None,
         date1904,
@@ -866,6 +835,24 @@ pub(super) mod tests {
             .map(|name| (name.into(), SheetData::default()))
             .collect();
         DirectSession::from_prepared(prepared).unwrap()
+    }
+
+    #[test]
+    fn cursor_projection_releases_budget_for_reopen() {
+        let mut session = indexed_session();
+        session.bootstrap().unwrap();
+        // Capacity for one empty model, but not two: cache navigation must
+        // release native projection ownership before another sheet is admitted.
+        session.model_budget = std::mem::size_of::<xlsx_model::Worksheet>() + 100;
+        for index in (0..3).cycle().take(64) {
+            let name = ["First", "Second", "Third"][index];
+            assert_eq!(
+                session.projected_sheet(index, name).unwrap().worksheet.name,
+                name
+            );
+            session.release_projection();
+        }
+        assert!(session.assert_healthy().is_ok());
     }
 
     #[test]
@@ -1011,17 +998,17 @@ pub(super) mod tests {
         ] {
             let mut budget = 1024;
             assert_eq!(
-                serde_json::to_value(cell_value(source, &mut budget).unwrap()).unwrap(),
+                serde_json::to_value(cell_value(&source, &mut budget).unwrap()).unwrap(),
                 serde_json::to_value(expected).unwrap()
             );
         }
         let mut budget = 1024;
         assert!(
-            matches!(cell_value(CellValue::Number(f64::INFINITY), &mut budget).unwrap(), xlsx_model::CellValue::Error { error } if error == "#NUM!")
+            matches!(cell_value(&CellValue::Number(f64::INFINITY), &mut budget).unwrap(), xlsx_model::CellValue::Error { error } if error == "#NUM!")
         );
         let mut budget = 1024;
         assert!(
-            matches!(cell_value(CellValue::Text("cached".into()), &mut budget).unwrap(), xlsx_model::CellValue::Text { text, .. } if text == "cached")
+            matches!(cell_value(&CellValue::Text("cached".into()), &mut budget).unwrap(), xlsx_model::CellValue::Text { text, .. } if text == "cached")
         );
     }
 

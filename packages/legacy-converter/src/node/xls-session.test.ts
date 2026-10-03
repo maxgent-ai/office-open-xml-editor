@@ -61,6 +61,7 @@ describe('Node direct XLS session', () => {
     const workbook = await open(buildXlsFixture());
     try {
       for await (const chunk of workbook.worksheetRows(0)) {
+        // The Node adapter intentionally omits early viewport metadata.
         expect(chunk.kind).toBe('rows');
         break;
       }

@@ -96,21 +96,55 @@ impl Names {
     }
 
     /// Names visible on the zero-based sheet `index`.
-    pub(super) fn for_sheet(&self, index: usize) -> Vec<xlsx_model::DefinedName> {
-        self.0
-            .iter()
-            .filter(|(scope, _, _)| scope.is_none_or(|scope| scope == index))
-            .map(|(_, name, formula)| xlsx_model::DefinedName {
-                name: name.clone(),
-                formula: formula.clone(),
+    pub(super) fn for_sheet(
+        &self,
+        index: usize,
+        budget: &mut usize,
+    ) -> Result<Vec<xlsx_model::DefinedName>, String> {
+        let visible = || {
+            self.0
+                .iter()
+                .filter(|(scope, _, _)| scope.is_none_or(|scope| scope == index))
+        };
+        let bytes = visible()
+            .try_fold(0usize, |total, (_, name, formula)| {
+                total
+                    .checked_add(std::mem::size_of::<xlsx_model::DefinedName>())?
+                    .checked_add(name.len())?
+                    .checked_add(formula.len())
             })
-            .collect()
+            .ok_or_else(|| unsupported("XLS defined name retention overflow"))?;
+        // Global names are visible on every worksheet. Admit the aggregate
+        // workbook expansion before copying, not only the individual Lbl input.
+        *budget = budget
+            .checked_sub(bytes)
+            .ok_or_else(|| unsupported("XLS defined name retention budget exceeded"))?;
+        let mut output = Vec::new();
+        output
+            .try_reserve_exact(visible().count())
+            .map_err(|_| unsupported("XLS defined name allocation failed"))?;
+        output.extend(visible().map(|(_, name, formula)| xlsx_model::DefinedName {
+            name: name.clone(),
+            formula: formula.clone(),
+        }));
+        Ok(output)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_names_consume_one_aggregate_budget_before_each_sheet_copy() {
+        let names = Names(vec![(None, "Rate".into(), "5".into())]);
+        let mut budget = std::mem::size_of::<xlsx_model::DefinedName>() + 5;
+        assert_eq!(names.for_sheet(0, &mut budget).unwrap().len(), 1);
+        assert!(names
+            .for_sheet(1, &mut budget)
+            .unwrap_err()
+            .contains("budget"));
+    }
 
     #[test]
     fn built_in_names_and_scopes_follow_spreadsheetml() {
@@ -143,13 +177,20 @@ mod tests {
             },
         ];
         let names = Names::parse(&records, &Externs::default()).unwrap();
+        let mut unlimited = usize::MAX;
         let first: Vec<_> = names
-            .for_sheet(0)
+            .for_sheet(0, &mut unlimited)
+            .unwrap()
             .into_iter()
             .map(|n| (n.name, n.formula))
             .collect();
         assert_eq!(first, vec![("Rate".to_string(), "5".to_string())]);
-        let second: Vec<_> = names.for_sheet(1).into_iter().map(|n| n.name).collect();
+        let second: Vec<_> = names
+            .for_sheet(1, &mut unlimited)
+            .unwrap()
+            .into_iter()
+            .map(|n| n.name)
+            .collect();
         assert_eq!(second, vec!["_xlnm._FilterDatabase", "Rate"]);
     }
 }

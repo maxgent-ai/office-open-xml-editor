@@ -394,3 +394,14 @@ The private Office corpus and its visual survey remain local development
 material. Current completion requires fresh parser-backed tests, renderer
 self-regression checks and separately adjudicated Office fidelity evidence.
 Historical survey counts do not establish the current release's behavior.
+
+### XLS worksheet ownership
+
+XLS worksheets use the ordinary XLSX cache admission, leases, LRU and render
+worker eviction. Native projections belong to one cursor and are released on
+terminal acknowledgement, cancellation or close. Reopening projects only the
+selected sheet from retained, bounded neutral BIFF facts.
+
+The cursor emits an explicit `metadata-unavailable` preview before row units.
+XLS viewers therefore wait for the complete worksheet. Early viewport rendering
+requires a separately verified BIFF preview eligibility rule.
