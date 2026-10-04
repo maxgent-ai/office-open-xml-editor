@@ -20,6 +20,8 @@ const entries = [
   'region-map',
   'chart-ex',
   'tiff',
+  'legacy-ppt',
+  'legacy-xls',
   'node',
 ];
 const dist = path.resolve(process.cwd(), 'dist');

@@ -233,6 +233,40 @@ mod tests {
     }
 
     #[test]
+    fn standalone_shape_keeps_relationship_backed_image_fill() {
+        use std::io::Write;
+        let xml = format!(
+            "<p:sp xmlns:p=\"{P}\" xmlns:a=\"{A}\" xmlns:r=\"{R}\"><p:spPr><a:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"100\" cy=\"100\"/></a:xfrm><a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom><a:blipFill><a:blip r:embed=\"rId1\"/><a:srcRect l=\"35000\"/><a:stretch><a:fillRect/></a:stretch></a:blipFill></p:spPr></p:sp>"
+        );
+        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for (name, bytes) in [
+            ("shape.xml", xml.as_bytes()),
+            ("_rels/shape.xml.rels", b"<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/image\" Target=\"media/image.png\"/></Relationships>".as_slice()),
+            ("media/image.png", b"image".as_slice()),
+        ] {
+            zip.start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(bytes).unwrap();
+        }
+        let package = zip.finish().unwrap().into_inner();
+        let parsed =
+            parse_standalone_shape_part(&package, "shape.xml", "", None, 100_000, 1_000_000)
+                .unwrap()
+                .unwrap();
+        match parsed.element.fill {
+            Some(Fill::Image {
+                image_path,
+                src_rect,
+                ..
+            }) => {
+                assert_eq!(image_path, "media/image.png");
+                assert_eq!(src_rect.unwrap().l, 0.35);
+            }
+            other => panic!("image fill lost: {other:?}"),
+        }
+    }
+
+    #[test]
     fn color_map_requires_presentationml_or_drawingml_namespace() {
         let xml = shape(Some(P), "sp", "");
         for map in ["<clrMap/>", "<x:clrMap xmlns:x=\"urn:foreign\"/>"] {

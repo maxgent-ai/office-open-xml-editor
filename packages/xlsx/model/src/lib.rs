@@ -1,6 +1,7 @@
 use serde::Serialize;
 use std::collections::BTreeMap;
 
+mod retained;
 pub mod style_presets;
 
 #[derive(Debug, Serialize, Default)]
@@ -350,7 +351,7 @@ impl Worksheet {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct PivotTableMetadata {
     pub name: String,
@@ -390,7 +391,7 @@ pub struct PivotTableMetadata {
 }
 
 /// A PivotTable style as applied to one PivotTable (§18.10.1.97, §18.8.40).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct PivotTableStyle {
     pub name: String,
@@ -404,7 +405,7 @@ pub struct PivotTableStyle {
 }
 
 /// One `tableStyleElement` of a PivotTable style.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct PivotTableStyleElement {
     /// ECMA-376 §18.18.77 ST_TableStyleType, e.g. `firstRowSubheading`.
@@ -415,7 +416,7 @@ pub struct PivotTableStyleElement {
 }
 
 /// One `i` of `rowItems`/`colItems` (§18.10.1.44).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct PivotAxisItem {
     /// ECMA-376 §18.18.43 ST_ItemType (`data`, `default`, `sum`, …, `grand`,
@@ -425,7 +426,7 @@ pub struct PivotAxisItem {
     pub depth: u32,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct PivotLocation {
     #[serde(flatten)]
@@ -435,7 +436,7 @@ pub struct PivotLocation {
     pub first_data_col: u32,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct PivotPageField {
     /// ECMA-376 §18.10.1.66 `CT_PageField@fld` is signed.
@@ -446,7 +447,7 @@ pub struct PivotPageField {
     pub name: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct PivotDataField {
     /// ECMA-376 §18.10.1.16 `CT_DataField@fld` is unsigned.
@@ -459,7 +460,7 @@ pub struct PivotDataField {
     pub name: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum PivotCacheSource {
     Worksheet {
@@ -477,14 +478,14 @@ pub enum PivotCacheSource {
     Scenario,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(tag = "state", rename_all = "camelCase")]
 pub enum PivotMetadataStatus {
     Complete,
     Partial { reasons: Vec<PivotPartialReason> },
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum PivotPartialReason {
     MissingCacheRelationship,
@@ -602,7 +603,7 @@ pub struct Sparkline {
 
 /// Excel Table metadata (ECMA-376 §18.5 `<table>`). The renderer overlays a
 /// built-in style on top of the cell styles inside `range`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct TableInfo {
     /// Inclusive table area including the header row.
@@ -747,7 +748,7 @@ pub struct XlsxCommentReply {
 /// constraint class ("list", "whole", "decimal", "date", "time", "textLength",
 /// "custom"). `operator` qualifies it ("between", "notBetween", "equal",
 /// "notEqual", "lessThan", …). `formula1` / `formula2` are the rule operands.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct DataValidation {
     /// Affected cell ranges, written verbatim from `@sqref` (space-separated).
@@ -787,7 +788,7 @@ pub struct DefinedName {
 
 /// A chart anchored to a rectangular range of cells (ECMA-376 §20.5 twoCellAnchor).
 /// Offsets are EMU (914400 EMU = 1 inch, 9525 EMU = 1 px @ 96 DPI).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ChartAnchor {
     /// Document-order byte position of the `<xdr:graphicFrame>` in its drawing
@@ -811,7 +812,7 @@ pub struct ChartAnchor {
 /// `<xdr:twoCellAnchor>`). Leaf shape elements (`<xdr:sp>`) from any nesting
 /// level are flattened into `shapes` with normalized coordinates so the
 /// renderer only needs to scale to the anchor rect.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ShapeAnchor {
     pub from_col: u32,
@@ -838,7 +839,7 @@ pub struct ShapeAnchor {
 /// A leaf shape extracted from a grpSp/sp tree. Position/size are normalized
 /// to [0,1] relative to the top-level grpSp extent (which itself maps to the
 /// anchor rect).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ShapeInfo {
     /// Document-order byte position of this leaf in the drawing part.
@@ -891,7 +892,7 @@ pub struct ShapeInfo {
     pub text: Option<ShapeText>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(tag = "fillType", rename_all = "camelCase")]
 pub enum ShapeStrokeFill {
     Gradient {
@@ -918,7 +919,7 @@ pub enum ShapeStrokeFill {
     },
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(tag = "fillType", rename_all = "camelCase")]
 pub enum ShapeFill {
     Solid {
@@ -948,14 +949,14 @@ pub enum ShapeFill {
     },
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ShapeLineDashSegment {
     pub dash: f64,
     pub space: f64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ShapeLineEnd {
     pub r#type: String,
@@ -970,7 +971,7 @@ pub use ooxml_common::text::SpaceLine;
 
 /// Text body inside a shape (`<xdr:txBody>`, ECMA-376 §20.1.2.2). Holds
 /// the paragraphs plus body-level formatting (`<a:bodyPr>`).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ShapeText {
     /// DrawingML direction, ECMA-376 §20.1.10.83. Preserve it for host layout.
@@ -1012,7 +1013,7 @@ pub struct ShapeText {
     pub paragraphs: Vec<ShapeParagraph>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ShapeParagraph {
     /// `<a:pPr@algn>` — `l` (default), `ctr`, `r`, `just`, `dist`.
@@ -1058,7 +1059,7 @@ pub struct ShapeParagraph {
     pub runs: Vec<ShapeTextRun>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ShapeTabStop {
     pub pos: i64,
@@ -1069,7 +1070,7 @@ pub struct ShapeTabStop {
 /// shape) so a run is either styled text, a soft line break, or an OMML
 /// equation. Excel stores "Insert > Equation" as OMML inside the shared
 /// DrawingML `<xdr:txBody>` grammar (ECMA-376 §22.1), exactly like PowerPoint.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum ShapeTextRun {
     /// The enum-level `rename_all = "camelCase"` (tag = "type") renames only the
@@ -1129,7 +1130,7 @@ pub enum ShapeTextRun {
     },
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum ShapeGeom {
     /// Preset geometry (rect, ellipse, roundRect, triangle, etc.).
@@ -1177,7 +1178,7 @@ pub enum ShapeGeom {
     },
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct PathInfo {
     /// Path's own coordinate system width.
@@ -1200,7 +1201,7 @@ fn is_true(value: &bool) -> bool {
     *value
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(tag = "op", rename_all = "camelCase")]
 pub enum PathCmd {
     MoveTo {
@@ -1317,7 +1318,7 @@ pub struct SlicerElementStyle {
 /// An image anchored to a rectangular range of cells
 /// (ECMA-376 §20.5, `<xdr:twoCellAnchor>`). Offsets are EMU (English
 /// Metric Unit): 914400 EMU = 1 inch, and 9525 EMU = 1 pixel at 96 DPI.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ImageAnchor {
     /// Document-order byte position of the `<xdr:pic>` in its drawing part.
@@ -1394,7 +1395,7 @@ pub use ooxml_common::blip::SrcRect;
 /// and xlsx parsers (see `ooxml_common::blip`).
 pub use ooxml_common::blip::Duotone;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct CellRange {
     pub top: u32,
@@ -1403,7 +1404,7 @@ pub struct CellRange {
     pub right: u32,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ConditionalFormat {
     pub sqref: Vec<CellRange>,
@@ -1429,7 +1430,7 @@ pub struct ConditionalFormat {
 /// those rule types (observed in a PDF export: a colorScale or dataBar with
 /// formula `0` drew nothing and did not stop a lower rule; formula `1` drew
 /// the scale and stopped it).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase", tag = "type")]
 pub enum CfRule {
     #[serde(rename_all = "camelCase")]
@@ -1537,14 +1538,14 @@ pub enum CfRule {
     },
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct CfIcon {
     pub icon_set: String,
     pub icon_id: u32,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct CfStop {
     pub kind: String,
@@ -1552,14 +1553,14 @@ pub struct CfStop {
     pub color: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct CfValue {
     pub kind: String,
     pub value: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Hyperlink {
     pub col: u32,
