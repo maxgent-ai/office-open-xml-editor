@@ -39,7 +39,9 @@ fn unicode(data: &[u8], offset: usize, count: usize) -> Result<(String, usize), 
                 .get(offset + 1..offset + 1 + count * 2)
                 .ok_or_else(truncated)?;
             let units: Vec<u16> = bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
                 .collect();
             Ok((

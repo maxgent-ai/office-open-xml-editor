@@ -1011,7 +1011,9 @@ fn text(
             0 => units.extend(chars.iter().map(|&byte| u16::from(byte))),
             1 if chars.len() % 2 == 0 => units.extend(
                 chars
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|pair| u16::from_le_bytes([pair[0], pair[1]])),
             ),
             _ => return Err(unsupported("invalid BIFF TxO text fragment")),
@@ -1035,7 +1037,7 @@ fn text(
     }
     // FormatRun (2.5.132) entries, then TxOLastRun (2.5.271) at cchText.
     let mut runs = Vec::new();
-    for entry in runs_data.chunks_exact(8) {
+    for entry in runs_data.as_chunks::<8>().0 {
         runs.push((usize::from(u16_at(entry, 0)?), u16_at(entry, 2)?));
     }
     let (last, _) = runs.pop().expect("at least two runs");

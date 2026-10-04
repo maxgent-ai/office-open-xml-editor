@@ -171,7 +171,9 @@ impl Externs {
                         _ => {
                             let bytes = data.get(8..8 + count * 2).ok_or_else(truncated)?;
                             let units: Vec<u16> = bytes
-                                .chunks_exact(2)
+                                .as_chunks::<2>()
+                                .0
+                                .iter()
                                 .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
                                 .collect();
                             String::from_utf16(&units).map_err(|_| truncated())?
@@ -201,7 +203,9 @@ impl Externs {
                         1 => {
                             let bytes = data.get(8..8 + count * 2).ok_or_else(truncated)?;
                             let units: Vec<u16> = bytes
-                                .chunks_exact(2)
+                                .as_chunks::<2>()
+                                .0
+                                .iter()
                                 .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
                                 .collect();
                             String::from_utf16(&units).map_err(|_| truncated())?
@@ -236,7 +240,9 @@ impl Externs {
                         1 => {
                             let bytes = data.get(15..15 + count * 2).ok_or_else(truncated)?;
                             let units: Vec<u16> = bytes
-                                .chunks_exact(2)
+                                .as_chunks::<2>()
+                                .0
+                                .iter()
                                 .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
                                 .collect();
                             String::from_utf16(&units).map_err(|_| truncated())?
@@ -530,7 +536,9 @@ fn array(extra: &[u8], used: &mut usize) -> Result<String, String> {
                                 .get(at + 4..at + 4 + count * 2)
                                 .ok_or_else(truncated)?;
                             let units: Vec<u16> = bytes
-                                .chunks_exact(2)
+                                .as_chunks::<2>()
+                                .0
+                                .iter()
                                 .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
                                 .collect();
                             (
@@ -626,7 +634,9 @@ fn decompile_inner(
                     1 => {
                         let bytes = rgce.get(at + 3..at + 3 + count * 2).ok_or_else(truncated)?;
                         let units: Vec<u16> = bytes
-                            .chunks_exact(2)
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
                             .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
                             .collect();
                         (

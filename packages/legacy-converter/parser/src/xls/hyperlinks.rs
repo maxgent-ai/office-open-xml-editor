@@ -35,7 +35,9 @@ fn utf16(data: &[u8], offset: usize, units: usize) -> Result<String, String> {
         .get(offset..offset.checked_add(units * 2).ok_or_else(truncated)?)
         .ok_or_else(truncated)?;
     let units: Vec<u16> = bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
         .collect();
     String::from_utf16(&units).map_err(|_| truncated())
@@ -70,8 +72,10 @@ fn moniker(data: &[u8], offset: usize) -> Result<(String, usize), String> {
             .and_then(|end| data.get(at + 4..end))
             .ok_or_else(truncated)?;
         let end = body
-            .chunks_exact(2)
-            .position(|pair| pair == [0, 0])
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .position(|pair| *pair == [0, 0])
             .ok_or_else(|| unsupported("unterminated XLS hyperlink URL"))?;
         let url = utf16(body, 0, end)?;
         let url_bytes = (end + 1) * 2;

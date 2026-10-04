@@ -96,7 +96,7 @@ fn breaks(data: &[u8], horizontal: bool) -> Result<(), String> {
         return Err(unsupported("invalid BIFF page break count or length"));
     }
     let mut previous = None;
-    for entry in data[2..].chunks_exact(6) {
+    for entry in data[2..].as_chunks::<6>().0 {
         let value = (u16_at(entry, 0)?, u16_at(entry, 2)?, u16_at(entry, 4)?);
         if value.1 >= value.2
             || (horizontal && value.2 > 16383)

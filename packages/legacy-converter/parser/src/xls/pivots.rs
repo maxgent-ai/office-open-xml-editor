@@ -45,7 +45,9 @@ fn string_no_cch(data: &[u8], offset: usize, count: usize) -> Result<(String, us
                 .get(offset + 1..offset + 1 + count * 2)
                 .ok_or_else(truncated)?;
             let units: Vec<u16> = bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
                 .collect();
             Ok((
@@ -306,7 +308,9 @@ fn table(
     };
     let page_fields = match &view.pages {
         Some(items) if items.len() == pages * 6 => items
-            .chunks_exact(6)
+            .as_chunks::<6>()
+            .0
+            .iter()
             .map(|item| {
                 let field = i16_at(item, 0)?;
                 let selected = i16_at(item, 2)?;
@@ -434,7 +438,9 @@ fn style(
         .filter(|_| record.len() == 16 + chars * 2 && chars > 0)
         .ok_or_else(|| unsupported("invalid XLS PivotTable style"))?;
     let units: Vec<u16> = bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
         .collect();
     let mut name = String::from_utf16(&units).map_err(|_| truncated())?;
