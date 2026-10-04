@@ -282,6 +282,19 @@ import BrandIcon from '../components/BrandIcon.astro';
     .try-progress-circle { animation: none; }
   }
   .try-stage :global(.lv-scroll-viewer), .try-stage :global(.lv-xlsx) { height: 100%; border-radius: 0; }
+  /* Application chrome only: the viewer observes these inherited tokens and
+     repaints Canvas headers. Authored cell colors stay in the workbook; leaving
+     light tokens unset preserves the viewer's existing light palette. */
+  :global(:root[data-theme='dark']) .try-stage :global(.lv-xlsx) {
+    --ooxml-xlsx-chrome-background: var(--panel);
+    --ooxml-xlsx-chrome-surface: var(--bg-elev);
+    --ooxml-xlsx-chrome-surface-muted: var(--bg-elev-2);
+    --ooxml-xlsx-chrome-text: var(--text);
+    --ooxml-xlsx-chrome-text-muted: var(--text-dim);
+    --ooxml-xlsx-chrome-border: var(--border-bright);
+    --ooxml-xlsx-chrome-selection-background: var(--border-bright);
+    --ooxml-xlsx-chrome-accent: var(--signal-ink);
+  }
   .try-stage :global(.lv-scroll-viewer) {
     width: 100%;
     background: radial-gradient(120% 80% at 50% 0%, var(--preview-top), var(--preview-bottom) 70%);

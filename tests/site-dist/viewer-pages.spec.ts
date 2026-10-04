@@ -4,6 +4,71 @@ import { fileURLToPath } from 'node:url';
 const docxSample = fileURLToPath(
   new URL('../../packages/docx/public/demo/sample-1.docx', import.meta.url),
 );
+const xlsxSample = fileURLToPath(
+  new URL('../../packages/xlsx/public/demo/sample-1.xlsx', import.meta.url),
+);
+
+test('Try Yours XLSX chrome follows the site theme without recoloring cells', async ({ page }) => {
+  // Keep unrelated network font completion from changing the pixel oracle.
+  await page.route('https://fonts.googleapis.com/**', (route) => route.abort());
+  await page.route('https://fonts.gstatic.com/**', (route) => route.abort());
+  await page.addInitScript(() => localStorage.setItem('ooxml-theme', 'dark'));
+  await page.goto('/try/');
+  const canvas = page.locator('#stage canvas').first();
+  const tabs = page.locator('#stage .xlsx-tab-strip button');
+  const readCanvas = () => canvas.evaluate(async (element: HTMLCanvasElement) => {
+    // Read a copy: repeated getImageData on the production canvas can make
+    // Chromium switch its painting backend and change text antialiasing.
+    const copy = document.createElement('canvas');
+    copy.width = element.width;
+    copy.height = element.height;
+    const context = copy.getContext('2d', { willReadFrequently: true }) as CanvasRenderingContext2D;
+    context.drawImage(element, 0, 0);
+    const dpr = devicePixelRatio;
+    // Corner pixels are chrome. The lower-right crop is entirely in the cell
+    // area, away from row/column headers and selection borders.
+    return {
+      corner: Array.from(context.getImageData(4 * dpr, 4 * dpr, 1, 1).data),
+      column: Array.from(context.getImageData(200 * dpr, 4 * dpr, 1, 1).data),
+      cells: Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',
+        context.getImageData(60 * dpr, 40 * dpr, 500 * dpr, 200 * dpr).data))),
+    };
+  });
+  await page.locator('#file').setInputFiles(xlsxSample);
+  await expect(page.locator('#status')).toContainText('rendered in', { timeout: 60_000 });
+  await expect.poll(async () => (await readCanvas()).corner).toEqual([8, 13, 19, 255]);
+  await expect(tabs.first()).toHaveCSS('background-color', 'rgb(8, 13, 19)');
+  await expect(tabs.first()).toHaveCSS('color', 'rgb(237, 243, 250)');
+  await expect(page.locator('#stage button[aria-label="Zoom in"]')).toHaveCSS('color', 'rgb(170, 183, 199)');
+  const dark = await readCanvas();
+
+  await page.locator('[data-theme-toggle]').first().click();
+  await expect.poll(async () => (await readCanvas()).corner).toEqual([248, 249, 250, 255]);
+  await expect(tabs.first()).toHaveCSS('background-color', 'rgb(255, 255, 255)');
+  await expect(tabs.first()).toHaveCSS('color', 'rgb(0, 0, 0)');
+  expect((await readCanvas()).cells).toEqual(dark.cells);
+
+  await page.locator('[data-theme-toggle]').first().click();
+  await expect.poll(async () => (await readCanvas()).corner).toEqual(dark.corner);
+  expect((await readCanvas()).cells).toEqual(dark.cells);
+  await page.locator('#stage [data-xlsx-viewport-input]').click({ position: { x: 200, y: 4 } });
+  await expect.poll(async () => (await readCanvas()).column).toEqual([52, 69, 88, 255]);
+  await page.locator('[data-theme-toggle]').first().click();
+  await expect.poll(async () => (await readCanvas()).column).toEqual([202, 221, 246, 255]);
+  await page.locator('[data-theme-toggle]').first().click();
+  await expect.poll(async () => (await readCanvas()).column).toEqual([52, 69, 88, 255]);
+  await tabs.nth(1).click();
+  await expect(tabs.nth(1)).toHaveCSS('background-color', 'rgb(8, 13, 19)');
+  await expect.poll(async () => (await readCanvas()).corner).toEqual(dark.corner);
+
+  await page.locator('#file').setInputFiles(xlsxSample);
+  await expect(page.locator('#status')).toContainText('rendered in', { timeout: 60_000 });
+  await expect.poll(async () => (await readCanvas()).corner).toEqual(dark.corner);
+  await page.reload();
+  await page.locator('#file').setInputFiles(xlsxSample);
+  await expect(page.locator('#status')).toContainText('rendered in', { timeout: 60_000 });
+  await expect.poll(async () => (await readCanvas()).corner).toEqual(dark.corner);
+});
 
 const dispatchPersistedPagehide = (page: Page) => page.evaluate(() => {
   window.dispatchEvent(new PageTransitionEvent('pagehide', { persisted: true }));
