@@ -83,6 +83,16 @@
       "import": "./dist/tiff.mjs",
       "default": "./dist/tiff.mjs"
     },
+    "./legacy-ppt": {
+      "types": "./dist/types/legacy-ppt.d.ts",
+      "import": "./dist/legacy-ppt.mjs",
+      "default": "./dist/legacy-ppt.mjs"
+    },
+    "./legacy-xls": {
+      "types": "./dist/types/legacy-xls.d.ts",
+      "import": "./dist/legacy-xls.mjs",
+      "default": "./dist/legacy-xls.mjs"
+    },
     "./node": {
       "types": "./dist/types/node.d.ts",
       "import": "./dist/node.mjs",
@@ -95,10 +105,12 @@
     "build:runtime": "vite build --mode runtime && node scripts/build-model-source-sidecars.mjs",
     "build:packages": "pnpm -r build",
     "build:packages:ci": "pnpm --filter @silurus/ooxml-docx --filter @silurus/ooxml-pptx --filter @silurus/ooxml-xlsx --filter @silurus/ooxml-markdown --filter @silurus/ooxml-site -r --workspace-concurrency=1 build:ci",
-    "typecheck": "tsc --build && pnpm --filter @silurus/ooxml-markdown --filter @silurus/ooxml-node --filter ./packages/vscode-extension typecheck",
+    "typecheck": "tsc --build && pnpm --filter @silurus/ooxml-markdown --filter @silurus/ooxml-node --filter @silurus/ooxml-legacy-converter --filter ./packages/vscode-extension typecheck",
     "storybook": "storybook dev -p 6006",
     "build-storybook": "storybook build",
-    "build:wasm": "pnpm --filter @silurus/ooxml-docx wasm && pnpm --filter @silurus/ooxml-xlsx wasm && pnpm --filter @silurus/ooxml-pptx wasm",
+    "build:wasm": "pnpm --filter @silurus/ooxml-docx wasm && pnpm --filter @silurus/ooxml-xlsx wasm && pnpm --filter @silurus/ooxml-pptx wasm && pnpm build:wasm:legacy-ppt && pnpm build:wasm:legacy-xls",
+    "build:wasm:legacy-ppt": "pnpm --filter @silurus/ooxml-legacy-converter wasm:direct-ppt",
+    "build:wasm:legacy-xls": "pnpm --filter @silurus/ooxml-legacy-converter wasm:direct-xls",
     "vrt": "pnpm -r --workspace-concurrency=1 --no-bail vrt",
     "vrt:snapshot": "pnpm -r --workspace-concurrency=1 --no-bail vrt:snapshot",
     "vrt:private": "pnpm -r --workspace-concurrency=1 --no-bail --if-present vrt:private",
@@ -118,6 +130,8 @@
     "check:optional-region-map": "node scripts/check-optional-region-map.mjs dist",
     "check:optional-chart-ex": "node scripts/check-optional-chart-ex.mjs dist",
     "check:optional-tiff": "node scripts/check-optional-tiff.mjs dist",
+    "check:optional-legacy-ppt": "node scripts/check-optional-legacy-source.mjs ppt dist",
+    "check:optional-legacy-xls": "node scripts/check-optional-legacy-source.mjs xls dist",
     "lint": "ast-grep scan",
     "lint:test": "ast-grep test --skip-snapshot-tests",
     "test:docx-boundaries": "node --test scripts/check-docx-layout-boundaries.test.mjs",
@@ -133,6 +147,7 @@
     "check:public-type-exports": "node scripts/check-public-type-exports.mjs",
     "check:docx-compatibility": "node scripts/check-docx-compatibility-evidence.mjs",
     "test:docx-package-build": "node --test scripts/check-docx-package-build.test.mjs",
+    "check:legacy-wasm-exports": "node scripts/check-legacy-wasm-exports.mjs dist",
     "check:core-legacy-boundary": "node scripts/check-core-legacy-boundary.mjs",
     "check:model-source-lazy-graph": "node scripts/check-model-source-lazy-graph.mjs",
     "check:model-source-lazy-runtime": "node scripts/check-model-source-lazy-runtime.mjs",

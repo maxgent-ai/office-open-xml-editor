@@ -1271,3 +1271,11 @@ impl_retained_struct!(ChartLegendEntryOverride {
     font_bold,
     font_italic,
 });
+
+impl RetainedBytes for crate::text::SpaceLine {
+    fn heap_bytes(&self) -> u64 {
+        match self {
+            Self::Pct { val: _ } | Self::Pts { val: _ } => 0,
+        }
+    }
+}
