@@ -18,3 +18,16 @@ test('XLSX construction and parse must share one host.run', () => {
   assert.equal(hasCombinedXlsxHostRun('host.run(() => { const archive = new XlsxArchive(bytes); return archive.parse(); });'), true);
   assert.equal(hasCombinedXlsxHostRun('host.run(() => new XlsxArchive(bytes)); host.run(() => archive.parse());'), false);
 });
+
+test('PPTX retains the same opt-in font barrier when its owner becomes a lease', () => {
+  const file = 'packages/pptx/src/presentation.ts';
+  const previous = 'async function load() { await parse(); if (mode === "main" && opts.useGoogleFonts && ready) await preloadGoogleFonts(names); }';
+  const changed = 'async function load() { await parse(); if (mode === "main" && opts.useGoogleFonts && ready) await pres._ensureGoogleFonts(names); }';
+  assert.equal(auditAwaitCase(file, 'load', previous, changed), 2);
+  const unguarded = 'async function load() { await parse(); await pres._ensureGoogleFonts(names); }';
+  assert.throws(() => auditAwaitCase(file, 'load', previous, unguarded), /OOXML awaits changed/);
+  const extra = 'async function load() { await parse(); if (opts.useGoogleFonts) { await pres._ensureGoogleFonts(names); await helper(); } }';
+  assert.throws(() => auditAwaitCase(file, 'load', previous, extra), /OOXML awaits changed/);
+  const optional = 'async function load() { await parse(); if (mode === "main" || opts.useGoogleFonts) await pres._ensureGoogleFonts(names); }';
+  assert.throws(() => auditAwaitCase(file, 'load', previous, optional), /OOXML awaits changed/);
+});
