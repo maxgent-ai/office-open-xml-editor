@@ -1,3 +1,4 @@
+import { FONT_TRACKING_SENTINEL } from '../internal/font-measurement-sentinels.js';
 /**
  * Canvas run advance including DrawingML `a:rPr@spc` (§21.1.2.3.9).
  * A native Canvas tracking measurement includes one trailing spacing unit;
@@ -24,9 +25,9 @@ function hasNativeSpacing(ctx: CanvasRenderingContext2D): boolean {
   let supported = false;
   try {
     tracking.letterSpacing = '0px';
-    const natural = ctx.measureText('ii').width;
+    const natural = ctx.measureText(FONT_TRACKING_SENTINEL).width;
     tracking.letterSpacing = '1px';
-    const tracked = ctx.measureText('ii').width;
+    const tracked = ctx.measureText(FONT_TRACKING_SENTINEL).width;
     supported = Number.isFinite(natural) && Number.isFinite(tracked) && tracked !== natural;
   } catch {
     supported = false;
