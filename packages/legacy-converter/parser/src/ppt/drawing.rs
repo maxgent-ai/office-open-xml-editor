@@ -19,12 +19,16 @@ impl Rect {
         let b = record.payload;
         let values: Vec<i64> = match (record.kind, record.version, b.len()) {
             (0xf010, 0, 8) => b
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|v| i16::from_le_bytes([v[0], v[1]]) as i64)
                 .collect(),
             (0xf010 | 0xf00f, 0, 16) | (0xf009, 1, 16) => b
-                .chunks_exact(4)
-                .map(|v| i32::from_le_bytes(v.try_into().expect("four bytes")) as i64)
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|v| i32::from_le_bytes(*v) as i64)
                 .collect(),
             _ => return Err(unsupported("invalid PowerPoint shape anchor")),
         };

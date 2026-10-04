@@ -111,7 +111,7 @@ impl Geometry<'_> {
         let dx = bounds[2] - bounds[0];
         let dy = bounds[3] - bounds[1];
         let mut points = Vec::with_capacity(count);
-        for point in bytes.chunks_exact(8) {
+        for point in bytes.as_chunks::<8>().0 {
             let x = u32::from_le_bytes(point[..4].try_into().unwrap());
             let y = u32::from_le_bytes(point[4..].try_into().unwrap());
             if [x, y].iter().any(|v| (0x80000000..=0x8000007f).contains(v)) {
@@ -152,8 +152,8 @@ impl Geometry<'_> {
                 return Ok(None);
             }
             charge(budget, count)?;
-            for bytes in bytes.chunks_exact(2) {
-                let word = u16::from_le_bytes(bytes.try_into().unwrap());
+            for bytes in bytes.as_chunks::<2>().0 {
+                let word = u16::from_le_bytes(*bytes);
                 let count = usize::from(word & 0x1fff);
                 match word >> 13 {
                     0 => reader.lines(count)?,

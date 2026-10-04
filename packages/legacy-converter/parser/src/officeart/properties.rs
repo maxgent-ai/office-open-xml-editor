@@ -126,7 +126,7 @@ fn decode_fopte(
         .get(..length)
         .ok_or_else(|| unsupported("truncated OfficeArt properties"))?;
     let mut end = length;
-    for entry in entries.chunks_exact(6) {
+    for entry in entries.as_chunks::<6>().0 {
         let opid = u16::from_le_bytes(entry[..2].try_into().unwrap());
         let value = u32::from_le_bytes(entry[2..].try_into().unwrap());
         let complex = if opid & 0x8000 != 0 {

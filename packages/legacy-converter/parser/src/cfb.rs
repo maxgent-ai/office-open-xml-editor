@@ -249,10 +249,8 @@ impl<'a> CompoundFile<'a> {
         let mut fat = Vec::with_capacity(fat_capacity.min(physical_sectors + sector_size / 4));
         for id in fat_sector_ids {
             let sector = sector_slice(bytes, sector_size, physical_sectors, id)?;
-            for chunk in sector.chunks_exact(4) {
-                fat.push(u32::from_le_bytes(
-                    chunk.try_into().expect("four-byte chunk"),
-                ));
+            for chunk in sector.as_chunks::<4>().0 {
+                fat.push(u32::from_le_bytes(*chunk));
             }
         }
 
@@ -306,8 +304,10 @@ impl<'a> CompoundFile<'a> {
                 None,
             )?;
             mini_fat_bytes
-                .chunks_exact(4)
-                .map(|chunk| u32::from_le_bytes(chunk.try_into().expect("four-byte chunk")))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|chunk| u32::from_le_bytes(*chunk))
                 .collect()
         };
 
@@ -512,7 +512,7 @@ fn parse_directory(bytes: &[u8], major: u16) -> Result<Vec<DirectorySlot>, Strin
         return Err("invalid CFB directory entry count".into());
     }
     let mut entries = Vec::with_capacity(count);
-    for entry_bytes in bytes.chunks_exact(DIRECTORY_ENTRY_BYTES) {
+    for entry_bytes in bytes.as_chunks::<DIRECTORY_ENTRY_BYTES>().0 {
         let object_type = entry_bytes[66];
         if object_type == 0 {
             entries.push(None);
@@ -529,7 +529,7 @@ fn parse_directory(bytes: &[u8], major: u16) -> Result<Vec<DirectorySlot>, Strin
             return Err("unterminated CFB directory name".into());
         }
         let mut utf16 = Vec::with_capacity(name_bytes / 2 - 1);
-        for chunk in entry_bytes[..name_bytes - 2].chunks_exact(2) {
+        for chunk in entry_bytes[..name_bytes - 2].as_chunks::<2>().0 {
             utf16.push(u16::from_le_bytes([chunk[0], chunk[1]]));
         }
         let name = String::from_utf16(&utf16).map_err(|_| "invalid CFB directory name")?;

@@ -628,7 +628,9 @@ pub(super) fn fonts(children: &[Record<'_>], budget: &mut usize) -> Result<Vec<S
                     return Err(unsupported("invalid PowerPoint font entity"));
                 }
                 let units: Vec<u16> = entity.payload[..64]
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|v| u16::from_le_bytes([v[0], v[1]]))
                     .take_while(|n| *n != 0)
                     .collect();

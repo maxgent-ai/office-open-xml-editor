@@ -53,7 +53,7 @@ fn decode<'a>(data: &'a [u8], budget: &mut usize) -> Result<(u32, Ruler<'a>), St
         *budget = budget
             .checked_sub(count)
             .ok_or_else(|| unsupported("PowerPoint ruler tab work budget exceeded"))?;
-        for entry in entries.chunks_exact(4) {
+        for entry in entries.as_chunks::<4>().0 {
             if u16_at(entry, 2)? > 3 {
                 return Err(unsupported("invalid PowerPoint ruler tab alignment"));
             }
@@ -112,7 +112,7 @@ impl<'a> Tabs<'a> {
     /// fixed when paragraph marL changes. No offset correction, sorting or
     /// duplicate-position policy is invented.
     pub(super) fn positions(self) -> impl ExactSizeIterator<Item = (i64, &'static str)> + 'a {
-        self.entries.chunks_exact(4).map(|entry| {
+        self.entries.as_chunks::<4>().0.iter().map(|entry| {
             let position = master_to_emu(i64::from(i16::from_le_bytes([entry[0], entry[1]])));
             let alignment = ["l", "ctr", "r", "dec"][usize::from(entry[2])];
             (position, alignment)

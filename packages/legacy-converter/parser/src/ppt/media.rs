@@ -178,7 +178,9 @@ fn read_hyperlink_catalog(
                         })?;
                         let units = view
                             .payload
-                            .chunks_exact(2)
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
                             .map(|c| u16::from_le_bytes([c[0], c[1]]))
                             .collect::<Vec<_>>();
                         let value = String::from_utf16(&units)
