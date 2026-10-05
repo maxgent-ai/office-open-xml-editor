@@ -190,3 +190,46 @@ test('local shape-path control slide reaches the published PPTX viewer in both m
   // s≈.353, between red and green (~75,180,0), not at the green middle stop.
   expect(samples[0][0][1] - 180).toBeGreaterThan(60);
 });
+
+// A formatter exception used to abort the public load at the first paint,
+// hiding even an unrelated sheet. Exercise real parser/assets in both realms.
+test('published XLSX viewer isolates an out-of-range date and retains other sheets', async ({ page }) => {
+  const { dateRangeXlsxBytes } = await import('../fixtures/date-range-xlsx.mjs');
+  await page.route('**/date-range-viewer', route => route.fulfill({
+    contentType: 'text/html', body: '<!doctype html><body></body>',
+  }));
+  await page.goto('/date-range-viewer');
+  const results = await page.evaluate(async bytes => {
+    const entry = '/dist/xlsx.mjs';
+    const { XlsxViewer, XlsxWorkbook } = await import(entry);
+    const results = [];
+    for (const mode of ['main', 'worker']) {
+      const host = document.createElement('div');
+      host.style.cssText = 'width:800px;height:400px';
+      document.body.append(host);
+      const errors: string[] = [];
+      const viewer = new XlsxViewer(host, { mode, useGoogleFonts: false, onError: (e: Error) => errors.push(e.message) });
+      try {
+        await viewer.load(new Uint8Array(bytes).buffer);
+        await viewer.goToSheet(1);
+        const matches = await viewer.findText('Healthy sheet');
+        results.push({ mode, errors, matches: matches.length });
+      } finally {
+        viewer.destroy();
+        host.remove();
+      }
+    }
+    const wb = await XlsxWorkbook.load(new Uint8Array(bytes).buffer);
+    try {
+      const dates = await wb.getWorksheet(0);
+      const other = await wb.getWorksheet(1);
+      return { results, invalid: wb.cellText(dates, dates.rows[0].cells[0]), healthy: wb.cellText(other, other.rows[0].cells[0]) };
+    } finally {
+      wb.destroy();
+    }
+  }, [...dateRangeXlsxBytes()]);
+  expect(results).toEqual({
+    results: [{ mode: 'main', errors: [], matches: 1 }, { mode: 'worker', errors: [], matches: 1 }],
+    invalid: '#', healthy: 'Healthy sheet',
+  });
+});
