@@ -1393,6 +1393,31 @@ function drawMultiLineRichText(
   }
 }
 
+/** Invalid date/time display follows Excel's hash fill (issue #1710).
+ * Formatting APIs expose only '#'; painting repeats it in the visible cell
+ * width. Bound the allocation by the target canvas, including huge/offscreen
+ * merges, and keep the marker horizontal even for wrapped/rotated cells.
+ */
+function drawHashFill(
+  ctx: CanvasRenderingContext2D,
+  cx: number, cy: number, cellW: number, cellH: number,
+  alignV: string,
+): void {
+  const padding = 3;
+  const left = Math.max(0, cx) + padding;
+  const available = Math.min(cx + cellW, ctx.canvas.width) - padding - left;
+  if (available <= 0) return;
+  const hashWidth = ctx.measureText('#').width;
+  const count = hashWidth > 0 ? Math.max(1, Math.floor(available / hashWidth)) : 1;
+  ctx.textAlign = 'left';
+  const { baseline, textY } = singleLineVerticalAnchor({
+    alignH: 'left', alignV, cx, cy, cellW, cellH,
+    leftPad: padding, paddingX: padding, paddingY: 2,
+  });
+  ctx.textBaseline = baseline;
+  ctx.fillText('#'.repeat(count), left, textY);
+}
+
 /**
  * Draw rich text (mixed-font runs, ECMA-376 §18.4.4 r) in a NON-wrapped cell.
  * A break-free value is one alignV-anchored line ({@link drawSingleLineRichText});
@@ -2077,6 +2102,12 @@ function renderQuadrant(
     ctx.rect(aCx, aCy, cW, cH);
     ctx.clip();
 
+    if (formatted.fill) {
+      drawHashFill(ctx, aCx, aCy, cW, cH, alignV);
+      ctx.restore();
+      continue;
+    }
+
     let textX: number;
     if (alignH === 'right') { textX = aCx + cW - paddingX; ctx.textAlign = 'right'; }
     else if (alignH === 'center') { textX = aCx + cW / 2; ctx.textAlign = 'center'; }
@@ -2706,6 +2737,12 @@ function renderQuadrant(
       ctx.beginPath();
       ctx.rect(drawX, cy, drawW, cellH);
       ctx.clip();
+
+      if (formatted.fill) {
+        drawHashFill(ctx, cx, cy, cellW, cellH, alignV);
+        ctx.restore();
+        return;
+      }
 
       // Stacked text (textRotation=255): draw each character on its own line
       if (isStacked) {

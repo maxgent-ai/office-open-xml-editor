@@ -2,6 +2,7 @@ import {
   formatExcelDateTime,
   formatLocalizedExcelShortDate,
   isDateFormatSection,
+  isExcelDisplayDateSerial,
   roundDecimalHalfUp,
   splitFormatSections,
   textSectionIndex,
@@ -30,6 +31,8 @@ function cellValueText(value: CellValue): string {
 export interface FormattedCell {
   text: string;
   color?: string;
+  /** Paint '#' across the available cell width, rather than a literal hash. */
+  fill?: boolean;
 }
 
 /**
@@ -254,13 +257,11 @@ function applyFormat(num: number, numFmtId: number, formatCode: string | null, d
   // UTC fields so the Excel serial cannot cross a calendar-day boundary in a
   // non-UTC timezone.
   if (numFmtId === 14 && !formatCode) {
-    return {
-      text: formatLocalizedExcelShortDate(num, date1904),
-    };
+    return dateFormattedCell(formatLocalizedExcelShortDate(num, date1904), num, date1904);
   }
   // Built-in date/time numFmtIds (ECMA-376 §18.8.30 table)
   const builtinFmt = BUILTIN_DATE_FMT[numFmtId];
-  if (builtinFmt) return { text: formatExcelDateTime(num, builtinFmt, date1904) };
+  if (builtinFmt) return dateFormattedCell(formatExcelDateTime(num, builtinFmt, date1904), num, date1904);
   // ECMA-376 §18.8.30: "General" is the reserved General number format regardless
   // of numFmtId. LibreOffice writes a custom numFmt (id ≥ 164) with
   // formatCode="General"; tokenizing it as a literal pattern would render the
@@ -288,6 +289,12 @@ function applyFormat(num: number, numFmtId: number, formatCode: string | null, d
     case 49: return { text: String(num) };
     default: return { text: formatGeneralNumber(num) };
   }
+}
+
+/** Invalid dates use '#'. Keep width-dependent painting out of cellText/find;
+ * a valid section may also return a literal '#', e.g. g"#" without ja-JP. */
+function dateFormattedCell(text: string, serial: number, date1904: boolean): FormattedCell {
+  return text === '#' && !isExcelDisplayDateSerial(serial, date1904) ? { text, fill: true } : { text };
 }
 
 // (formatExcelDate removed; all date formatting now goes through formatExcelDateCode)
@@ -862,8 +869,9 @@ function applyFormatCode(num: number, formatCode: string, date1904 = false): For
 
   // Date/time is a property of the selected section (§18.8.30): `0.00;h:mm`
   // formats a positive value as a number and only a negative one as a time.
-  const text = isDateFormatSection(chosen.body)
-    ? formatExcelDateTime(useMagnitude ? Math.abs(num) : num, chosen.body, date1904)
-    : renderNumericSection(num, chosen.body, useMagnitude);
-  return chosen.color ? { text, color: chosen.color } : { text };
+  const serial = useMagnitude ? Math.abs(num) : num;
+  const formatted = isDateFormatSection(chosen.body)
+    ? dateFormattedCell(formatExcelDateTime(serial, chosen.body, date1904), serial, date1904)
+    : { text: renderNumericSection(num, chosen.body, useMagnitude) };
+  return chosen.color ? { ...formatted, color: chosen.color } : formatted;
 }

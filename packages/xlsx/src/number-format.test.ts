@@ -242,7 +242,7 @@ describe('time-only formats (§18.8.30 h / s / AM/PM without a date part)', () =
   });
 
   it('ignores a quoted elapsed bracket', () => {
-    expect(fmt(-0.25, 'h:mm "[h]"')).toBe('18:00 [h]');
+    expect(fmt(0.75, 'h:mm "[h]"')).toBe('18:00 [h]');
   });
 
   it('keeps a quoted AM/PM literal on the 24-hour clock', () => {
@@ -362,5 +362,32 @@ describe('formula cells render their cached value, never a recalculation', () =>
     const uncachedSum = formatCellValue(formulaCell('SUM(A1:A2)', empty), styles('yyyy-mm-dd'));
     expect(uncachedSum).toBe('');
     expect(formatCellValue(formulaCell('TODAY()', empty), styles('yyyy-mm-dd'))).toBe(uncachedSum);
+  });
+});
+
+
+describe('date serial range (#1710)', () => {
+  it('returns a width-independent marker for invalid built-in and custom dates', () => {
+    for (const id of [14, 15, 16, 17, 22]) {
+      expect(formatCellValue(numCell(12345678901), builtinStyles(id)), `format ${id}`).toBe('#');
+    }
+    expect(fmt(2958466, 'yyyy-mm-dd')).toBe('#');
+    expect(fmt(-1, 'h:mm:ss')).toBe('#');
+    expect(formatCellValueWithColor(numCell(2958466), styles('[Red]yyyy-mm-dd')))
+      .toEqual({ text: '#', color: '#FF0000', fill: true });
+    expect(formatCellValue(numCell(12345678901), builtinStyles(0), { numFmtId: 14, formatCode: null })).toBe('#');
+  });
+
+  it('keeps time fractions, zero, the final day and the selected negative section', () => {
+    expect(fmt(2958465.75, 'yyyy-mm-dd h:mm:ss')).toBe('9999-12-31 18:00:00');
+    expect(fmt(0, 'h:mm:ss')).toBe('0:00:00');
+    expect(fmt(0.5, 'h:mm:ss')).toBe('12:00:00');
+    expect(formatCellValue(numCell(0), styles('yyyy-mm-dd'), null, true)).toBe('1904-01-01');
+    expect(formatCellValue(numCell(2957003.75), styles('yyyy-mm-dd h:mm:ss'), null, true)).toBe('9999-12-31 18:00:00');
+    expect(formatCellValue(numCell(2957004), styles('yyyy-mm-dd'), null, true)).toBe('#');
+    expect(fmt(-1, 'yyyy-mm-dd;0.0')).toBe('1.0');
+    expect(fmt(-0.5, '0;h:mm')).toBe('12:00');
+    expect(fmt(12345678901, '[h]:mm')).toBe('296296293624:00');
+    expect(formatCellValueWithColor(numCell(45200), styles('g"#"'))).toEqual({ text: '#' });
   });
 });

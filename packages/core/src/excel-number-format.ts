@@ -2,7 +2,7 @@
 // by worksheet cells and chart labels alike: section splitting, the text
 // section, date/time section detection and date/time rendering.
 
-import { excelSerialToUtcDate } from './excel-date';
+import { excelSerialToUtcDate, isExcelDisplayDateSerial } from './excel-date';
 
 /** Index of the text section (§18.8.30), or -1: the fourth section when
  *  there are four, otherwise the last section when it holds an `@`
@@ -116,6 +116,17 @@ function resolveJpEra(date: Date): { abbr: string; short: string; long: string; 
  * now correct in both systems).
  */
 export function formatExcelDateTime(serial: number, section: string, date1904 = false): string {
+  const elapsedSection = hasElapsedBracket(section);
+  // Elapsed-only sections describe durations (§18.8.30), not calendar dates.
+  // Validate after section selection/magnitude handling, before Date or Intl
+  // can throw or produce invented/NaN text. '#' is independent of cell width;
+  // the worksheet painter expands it across the available width.
+  const validCalendar = isExcelDisplayDateSerial(serial, date1904);
+  if (!Number.isFinite(serial) || !Number.isFinite(serial * 86_400_000)
+      || (!elapsedSection && !validCalendar)) return '#';
+  // Duration sections may mix clock and calendar tokens. Check actual
+  // calendar fields below in their token context, so quoted calendar letters
+  // and minute tokens cannot accidentally restrict a duration.
   const date = excelSerialToUtcDate(serial, date1904);
   const yr = date.getUTCFullYear();
   const mo = date.getUTCMonth() + 1;   // 1-12
@@ -124,7 +135,6 @@ export function formatExcelDateTime(serial: number, section: string, date1904 = 
   // An elapsed-time section (`[h]:mm`, `[mm]:ss`) reads its clock fields as
   // remainders of the same absolute, millisecond-rounded duration as its
   // elapsed total, so a negative duration keeps consistent minutes.
-  const elapsedSection = hasElapsedBracket(section);
   const absMs = Math.round(Math.abs(serial) * 86_400_000);
   const hr = elapsedSection ? Math.floor(absMs / 3_600_000) % 24 : date.getUTCHours();
   const mi = elapsedSection ? Math.floor(absMs / 60_000) % 60 : date.getUTCMinutes();
@@ -194,6 +204,7 @@ export function formatExcelDateTime(serial: number, section: string, date1904 = 
       }
 
     } else if (ch === 'y' || ch === 'Y') {
+      if (!validCalendar) return '#';
       let n = 0;
       while (i < section.length && section[i].toLowerCase() === 'y') { n++; i++; }
       result += n <= 2 ? String(yr).slice(-2) : String(yr).padStart(4, '0');
@@ -209,6 +220,7 @@ export function formatExcelDateTime(serial: number, section: string, date1904 = 
       if (isMinutes) {
         result += n >= 2 ? String(mi).padStart(2, '0') : String(mi);
       } else {
+        if (!validCalendar) return '#';
         if      (n === 1) result += String(mo);
         else if (n === 2) result += String(mo).padStart(2, '0');
         else if (n === 3) result += MONTH_NAMES[mo - 1].slice(0, 3);
@@ -218,6 +230,7 @@ export function formatExcelDateTime(serial: number, section: string, date1904 = 
       prevWasHour = false;
 
     } else if (ch === 'd' || ch === 'D') {
+      if (!validCalendar) return '#';
       let n = 0;
       while (i < section.length && section[i].toLowerCase() === 'd') { n++; i++; }
       if      (n === 1) result += String(dy);
@@ -246,6 +259,7 @@ export function formatExcelDateTime(serial: number, section: string, date1904 = 
       let n = 0;
       while (i < section.length && section[i].toLowerCase() === 'g') { n++; i++; }
       if (japaneseEra) {
+        if (!validCalendar) return '#';
         const e = getEra();
         if      (n === 1) result += e.abbr;
         else if (n === 2) result += e.short;
@@ -254,6 +268,7 @@ export function formatExcelDateTime(serial: number, section: string, date1904 = 
       prevWasHour = false;
 
     } else if (ch === 'e' || ch === 'E') {
+      if (!validCalendar) return '#';
       // Era year: under `[$-411]` the Japanese era year (`ee` zero-padded);
       // Excel renders `e` and `ee` as the four-digit year in any other section.
       let n = 0;
@@ -267,6 +282,7 @@ export function formatExcelDateTime(serial: number, section: string, date1904 = 
       prevWasHour = false;
 
     } else if (ch === 'r' || ch === 'R') {
+      if (!validCalendar) return '#';
       // Under `[$-411]`, `r` is `ee` and `rr` is `gggee` (§18.8.30); Excel
       // renders both as the four-digit year in any other section.
       let n = 0;
@@ -285,8 +301,10 @@ export function formatExcelDateTime(serial: number, section: string, date1904 = 
       // `aaa` = "水". Checked before AM/PM because those are shorter matches
       // and would otherwise swallow the leading 'a'.
       if (upper.startsWith('AAAA')) {
+        if (!validCalendar) return '#';
         result += JP_WEEKDAY_LONG[wd]; i += 4;
       } else if (upper.startsWith('AAA')) {
+        if (!validCalendar) return '#';
         result += JP_WEEKDAY_SHORT[wd]; i += 3;
       } else if (upper.startsWith('AM/PM')) {
         result += hr < 12 ? 'AM' : 'PM'; i += 5;
