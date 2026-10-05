@@ -148,6 +148,179 @@ fn palette() -> Palette<'static> {
     }
 }
 
+/// Axis records are scoped by their AxisParent and Begin/End blocks. The
+/// expected tick/label names are the shared renderer's DrawingML contract,
+/// independently specified by MS-XLS 2.4.327, not a captured parser model.
+#[test]
+fn primary_axis_ticks_and_label_positions_survive_biff_projection() {
+    let mut owned = bar_chart(true, None);
+    let at = owned.iter().position(|r| r.0 == 0x1014).unwrap();
+    let axis = |kind, major, minor, labels| {
+        let mut tick = vec![0; 30];
+        tick[..3].copy_from_slice(&[major, minor, labels]);
+        vec![
+            record(0x101d, [u16s(&[kind]), vec![0; 16]].concat()),
+            record(0x1033, vec![]),
+            record(0x101e, tick),
+            record(0x1034, vec![]),
+        ]
+    };
+    owned.splice(at..at, [axis(0, 0, 1, 2), axis(1, 3, 2, 0)].concat());
+    let chart_end = owned.iter().position(|r| r.0 == 0x1065).unwrap() - 1;
+    let mut secondary = vec![
+        record(0x1041, [u16s(&[1]), vec![0; 16]].concat()),
+        record(0x1033, vec![]),
+    ];
+    secondary.extend(axis(1, 1, 3, 1));
+    secondary.push(record(0x1034, vec![]));
+    owned.splice(chart_end..chart_end, secondary);
+    let raw = read(&as_records(&owned)).unwrap();
+    let model = project(&raw, &palette(), &|_| None).unwrap();
+    assert_eq!(model.cat_axis_major_tick_mark, "none");
+    assert_eq!(model.cat_axis_minor_tick_mark.as_deref(), Some("in"));
+    assert_eq!(model.cat_axis_tick_label_pos.as_deref(), Some("high"));
+    assert_eq!(model.val_axis_major_tick_mark, "cross");
+    assert_eq!(model.val_axis_minor_tick_mark.as_deref(), Some("out"));
+    assert_eq!(model.val_axis_tick_label_pos.as_deref(), Some("none"));
+}
+
+#[test]
+fn malformed_axis_tick_enumerations_fail_closed() {
+    let mut owned = bar_chart(true, None);
+    let at = owned.iter().position(|r| r.0 == 0x1014).unwrap();
+    let mut tick = vec![0; 30];
+    tick[..3].copy_from_slice(&[4, 0, 3]);
+    owned.splice(
+        at..at,
+        [
+            record(0x101d, vec![0; 18]),
+            record(0x1033, vec![]),
+            record(0x101e, tick),
+            record(0x1034, vec![]),
+        ],
+    );
+    assert!(read(&as_records(&owned)).is_err());
+}
+
+#[test]
+fn value_axis_units_and_direction_respect_biff_automatic_flags() {
+    let project_range = |flags: u16| {
+        let mut owned = bar_chart(true, None);
+        let at = owned.iter().position(|r| r.0 == 0x1014).unwrap();
+        let mut range: Vec<u8> = [0.0f64, 10.0, 2.0, 0.5, 0.0]
+            .into_iter()
+            .flat_map(f64::to_le_bytes)
+            .collect();
+        range.extend(flags.to_le_bytes());
+        owned.splice(
+            at..at,
+            [
+                record(0x101d, [u16s(&[1]), vec![0; 16]].concat()),
+                record(0x1033, vec![]),
+                record(0x101f, range),
+                record(0x1034, vec![]),
+            ],
+        );
+        let raw = read(&as_records(&owned)).unwrap();
+        project(&raw, &palette(), &|_| None).unwrap()
+    };
+    let explicit = project_range(0x40);
+    assert_eq!(explicit.val_axis_major_unit, Some(2.0));
+    assert_eq!(explicit.val_axis_minor_unit, Some(0.5));
+    assert_eq!(explicit.val_axis_orientation.as_deref(), Some("maxMin"));
+    let automatic = project_range(4 | 8);
+    assert_eq!(automatic.val_axis_major_unit, None);
+    assert_eq!(automatic.val_axis_minor_unit, None);
+    assert_eq!(automatic.val_axis_orientation, None);
+    let mixed = project_range(4);
+    assert_eq!(mixed.val_axis_major_unit, None);
+    assert_eq!(mixed.val_axis_minor_unit, Some(0.5));
+}
+
+#[test]
+fn percent_value_axis_uses_canonical_ratio_units_for_all_percent_families() {
+    // BIFF Bar/Line/Area f100 uses percentage-point axis values. The canonical
+    // OOXML model is fractional: a 50-point interval is 0.5 (50%). Exercise
+    // production reading/projection and retain the ordinary-axis boundary.
+    for (kind, data, expected_type, percent) in [
+        (0x1017, u16s(&[0, 150, 6]), "stackedBarPct", true),
+        (0x1017, u16s(&[0, 150, 7]), "stackedBarHPct", true),
+        (0x1018, u16s(&[3]), "stackedLinePct", true),
+        (0x101a, u16s(&[3]), "stackedAreaPct", true),
+        (0x1017, u16s(&[0, 150, 2]), "stackedBar", false),
+    ] {
+        let mut owned = bar_chart(true, None);
+        let group = owned.iter_mut().find(|r| r.0 == 0x1017).unwrap();
+        *group = record(kind, data);
+        let at = owned.iter().position(|r| r.0 == 0x1014).unwrap();
+        let mut range: Vec<u8> = [-100.0f64, 100.0, 50.0, 10.0, 0.0]
+            .into_iter()
+            .flat_map(f64::to_le_bytes)
+            .collect();
+        range.extend(0u16.to_le_bytes());
+        owned.splice(
+            at..at,
+            [
+                record(0x101d, [u16s(&[1]), vec![0; 16]].concat()),
+                record(0x1033, vec![]),
+                record(0x101f, range),
+                record(0x1034, vec![]),
+            ],
+        );
+        let model = project(&read(&as_records(&owned)).unwrap(), &palette(), &|_| None).unwrap();
+        assert_eq!(model.chart_type, expected_type);
+        let factor = if percent { 0.01 } else { 1.0 };
+        assert_eq!(model.val_min, Some(-100.0 * factor), "{expected_type}");
+        assert_eq!(model.val_max, Some(100.0 * factor), "{expected_type}");
+        assert_eq!(
+            model.val_axis_major_unit,
+            Some(50.0 * factor),
+            "{expected_type}"
+        );
+        assert_eq!(
+            model.val_axis_minor_unit,
+            Some(10.0 * factor),
+            "{expected_type}"
+        );
+    }
+}
+
+#[test]
+fn explicit_axis_units_reject_invalid_xnum_and_interval_domains() {
+    let read_units = |major: f64, minor: f64, flags: u16| {
+        let mut owned = bar_chart(true, None);
+        let at = owned.iter().position(|r| r.0 == 0x1014).unwrap();
+        let mut range: Vec<u8> = [0.0f64, 10.0, major, minor, 0.0]
+            .into_iter()
+            .flat_map(f64::to_le_bytes)
+            .collect();
+        range.extend(flags.to_le_bytes());
+        owned.splice(
+            at..at,
+            [
+                record(0x101d, [u16s(&[1]), vec![0; 16]].concat()),
+                record(0x1033, vec![]),
+                record(0x101f, range),
+                record(0x1034, vec![]),
+            ],
+        );
+        read(&as_records(&owned))
+    };
+    for (major, minor) in [
+        (2.0, -0.5),
+        (0.5, 2.0),
+        (f64::NAN, 0.5),
+        (2.0, f64::INFINITY),
+        (2.0, -0.0),
+        (2.0, f64::from_bits(1)),
+    ] {
+        assert!(read_units(major, minor, 0).is_err(), "{major:?}, {minor:?}");
+    }
+    assert!(read_units(0.0, 0.0, 0).is_ok());
+    assert!(read_units(f64::NAN, -0.5, 4 | 8).is_ok());
+    assert!(read_units(f64::NAN, 0.5, 4).is_ok());
+}
+
 #[test]
 fn chart_cache_drives_the_series_and_palette_formats_color_it() {
     let owned = bar_chart(true, None);

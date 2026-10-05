@@ -623,8 +623,57 @@ pub(crate) fn project_bounded(
         );
     }
     if let Some(axis) = raw.axes.iter().find(|a| a.kind == 1 && a.axis_group == 0) {
-        model.val_min = axis.min;
-        model.val_max = axis.max;
+        // MS-XLS Bar/Line/Area f100 (2.4.15 / 2.4.155 / 2.4.2) declares
+        // percentage stacking. Office BIFF percent-stacked bar output stores a
+        // 50%-step ValueRange interval as 50 percentage points, while the
+        // canonical OOXML model stores 0.5; ValueRange (2.4.341) itself does not
+        // spell out this format-unit distinction. All f100 families share that
+        // percentage axis. Convert bounds and both authored intervals together
+        // to ratios; the shared renderer performs the inverse x100 conversion.
+        // Select by the authored group, never by the scalar's magnitude.
+        let percent_axis = matches!(
+            primary.kind,
+            GroupKind::Bar {
+                stacked: true,
+                percent: true,
+                ..
+            } | GroupKind::Line {
+                stacked: true,
+                percent: true
+            } | GroupKind::Area {
+                stacked: true,
+                percent: true
+            }
+        );
+        let canonical_value = |value: f64| if percent_axis { value / 100.0 } else { value };
+        model.val_min = axis.min.map(canonical_value);
+        model.val_max = axis.max.map(canonical_value);
+        // MS-XLS 2.4.341 ValueRange: fAutoMajor/fAutoMinor suppress the
+        // stored intervals, and fReversed changes the value-axis direction.
+        // These are existing shared renderer semantics, not Office tuning.
+        model.val_axis_major_unit = axis.major.map(canonical_value);
+        model.val_axis_minor_unit = axis.minor.map(canonical_value);
+        model.val_axis_orientation = axis.reversed.then(|| "maxMin".into());
+    }
+    // MS-XLS 2.4.327: authored Tick locations belong to their enclosing axis,
+    // not to the chart or the other axis group. Preserve them in the existing
+    // primary-axis renderer slots; a secondary/series axis cannot overwrite
+    // those slots. When Tick is absent, retain the existing model defaults.
+    for axis in raw.axes.iter().filter(|a| a.axis_group == 0) {
+        let Some(ticks) = axis.ticks else { continue };
+        match axis.kind {
+            0 => {
+                model.cat_axis_major_tick_mark = ticks.major.into();
+                model.cat_axis_minor_tick_mark = Some(ticks.minor.into());
+                model.cat_axis_tick_label_pos = Some(ticks.labels.into());
+            }
+            1 => {
+                model.val_axis_major_tick_mark = ticks.major.into();
+                model.val_axis_minor_tick_mark = Some(ticks.minor.into());
+                model.val_axis_tick_label_pos = Some(ticks.labels.into());
+            }
+            _ => {}
+        }
     }
     // Font records carry twips; the shared model uses hundredths of a point.
     let hpt = |twips: u16| i32::from(twips) * 5;

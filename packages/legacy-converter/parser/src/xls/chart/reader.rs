@@ -37,6 +37,7 @@ mod id {
     pub const SCATTER: u16 = 0x101b;
     pub const CRT_LINE: u16 = 0x101c;
     pub const AXIS: u16 = 0x101d;
+    pub const TICK: u16 = 0x101e;
     pub const VALUE_RANGE: u16 = 0x101f;
     pub const AXIS_LINE: u16 = 0x1021;
     pub const TEXT: u16 = 0x1025;
@@ -151,11 +152,45 @@ pub(crate) struct Axis {
     pub min: Option<f64>,
     pub max: Option<f64>,
     pub major: Option<f64>,
+    pub minor: Option<f64>,
     pub log: bool,
     pub reversed: bool,
     pub major_gridlines: bool,
     /// FontX.iFont of the axis labels (AXS rule).
     pub font: Option<u16>,
+    pub ticks: Option<AxisTicks>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AxisTicks {
+    pub major: &'static str,
+    pub minor: &'static str,
+    pub labels: &'static str,
+}
+
+fn axis_ticks(data: &[u8]) -> Result<AxisTicks, String> {
+    // MS-XLS 2.4.327 Tick: the three location enums are independent. They
+    // map directly to DrawingML ST_TickMark / ST_TickLblPos; an absent Tick
+    // is distinct from an authored "none". Other Tick attributes (label
+    // color/rotation/background) remain outside this projection.
+    if data.len() != 30 {
+        return Err(unsupported("invalid BIFF axis Tick size"));
+    }
+    let mark = |value: u8| {
+        ["none", "in", "out", "cross"]
+            .get(usize::from(value))
+            .copied()
+            .ok_or_else(|| unsupported("invalid BIFF axis tick mark location"))
+    };
+    let labels = ["none", "low", "high", "nextTo"]
+        .get(usize::from(data[2]))
+        .copied()
+        .ok_or_else(|| unsupported("invalid BIFF axis tick label location"))?;
+    Ok(AxisTicks {
+        major: mark(data[0])?,
+        minor: mark(data[1])?,
+        labels,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -582,13 +617,33 @@ pub(crate) fn read(records: &[Record<'_>]) -> Result<RawChart, String> {
                         .then(|| f64_at(record.data, offset))
                         .transpose()
                 };
-                let (min, max, major) = (pick(1, 0)?, pick(2, 8)?, pick(4, 16)?);
+                let (min, max, major, minor) =
+                    (pick(1, 0)?, pick(2, 8)?, pick(4, 16)?, pick(8, 24)?);
+                // MS-XLS 2.4.341 ValueRange requires nonnegative intervals and
+                // numMajor >= numMinor. Its Xnum (2.5.342) excludes NaN,
+                // infinity, denormals and negative zero. Automatic fields are
+                // unused and deliberately not validated. Zero remains authored;
+                // the shared renderer's positive-unit policy handles its scale.
+                let valid_unit = |v: f64| !v.is_sign_negative() && (v == 0.0 || v.is_normal());
+                if major.is_some_and(|v| !valid_unit(v))
+                    || minor.is_some_and(|v| !valid_unit(v))
+                    || major.zip(minor).is_some_and(|(a, b)| a < b)
+                {
+                    return Err(unsupported("invalid explicit chart axis interval"));
+                }
                 if let Some(axis) = stack.last_mut().and_then(|b| b.axis.as_mut()) {
                     axis.min = min;
                     axis.max = max;
                     axis.major = major;
+                    axis.minor = minor;
                     axis.log = flags & 0x20 != 0;
                     axis.reversed = flags & 0x40 != 0;
+                }
+            }
+            id::TICK => {
+                let ticks = axis_ticks(record.data)?;
+                if let Some(axis) = stack.last_mut().and_then(|b| b.axis.as_mut()) {
+                    axis.ticks = Some(ticks);
                 }
             }
             id::SI_INDEX => cache_index = Some(u16_at(record.data, 0)?),
