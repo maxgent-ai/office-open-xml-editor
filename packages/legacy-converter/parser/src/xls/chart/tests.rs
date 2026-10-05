@@ -238,6 +238,54 @@ fn value_axis_units_and_direction_respect_biff_automatic_flags() {
 }
 
 #[test]
+fn percent_value_axis_uses_canonical_ratio_units_for_all_percent_families() {
+    // BIFF Bar/Line/Area f100 uses percentage-point axis values. The canonical
+    // OOXML model is fractional: a 50-point interval is 0.5 (50%). Exercise
+    // production reading/projection and retain the ordinary-axis boundary.
+    for (kind, data, expected_type, percent) in [
+        (0x1017, u16s(&[0, 150, 6]), "stackedBarPct", true),
+        (0x1017, u16s(&[0, 150, 7]), "stackedBarHPct", true),
+        (0x1018, u16s(&[3]), "stackedLinePct", true),
+        (0x101a, u16s(&[3]), "stackedAreaPct", true),
+        (0x1017, u16s(&[0, 150, 2]), "stackedBar", false),
+    ] {
+        let mut owned = bar_chart(true, None);
+        let group = owned.iter_mut().find(|r| r.0 == 0x1017).unwrap();
+        *group = record(kind, data);
+        let at = owned.iter().position(|r| r.0 == 0x1014).unwrap();
+        let mut range: Vec<u8> = [-100.0f64, 100.0, 50.0, 10.0, 0.0]
+            .into_iter()
+            .flat_map(f64::to_le_bytes)
+            .collect();
+        range.extend(0u16.to_le_bytes());
+        owned.splice(
+            at..at,
+            [
+                record(0x101d, [u16s(&[1]), vec![0; 16]].concat()),
+                record(0x1033, vec![]),
+                record(0x101f, range),
+                record(0x1034, vec![]),
+            ],
+        );
+        let model = project(&read(&as_records(&owned)).unwrap(), &palette(), &|_| None).unwrap();
+        assert_eq!(model.chart_type, expected_type);
+        let factor = if percent { 0.01 } else { 1.0 };
+        assert_eq!(model.val_min, Some(-100.0 * factor), "{expected_type}");
+        assert_eq!(model.val_max, Some(100.0 * factor), "{expected_type}");
+        assert_eq!(
+            model.val_axis_major_unit,
+            Some(50.0 * factor),
+            "{expected_type}"
+        );
+        assert_eq!(
+            model.val_axis_minor_unit,
+            Some(10.0 * factor),
+            "{expected_type}"
+        );
+    }
+}
+
+#[test]
 fn explicit_axis_units_reject_invalid_xnum_and_interval_domains() {
     let read_units = |major: f64, minor: f64, flags: u16| {
         let mut owned = bar_chart(true, None);
