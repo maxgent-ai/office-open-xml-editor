@@ -274,6 +274,10 @@ impl XlsxChartReferenceResolver<'_, '_, '_, '_> {
             38 => "#,##0 ;[Red](#,##0)",
             39 => "#,##0.00;(#,##0.00)",
             40 => "#,##0.00;[Red](#,##0.00)",
+            45 => "mm:ss",
+            46 => "[h]:mm:ss",
+            // MS-OE376 §2.1.739(a): Office's built-in 47 includes a colon.
+            47 => "mm:ss.0",
             48 => "##0.0E+0",
             49 => "@",
             _ => return None,
@@ -1742,43 +1746,53 @@ mod worksheet_reference_tests {
 
     #[test]
     fn chart_reference_resolves_source_linked_builtin_number_format() {
-        let mut archive = archive_with_chart_and_data(&chart_xml(false));
-        let rels = parse_guarded(workbook_rels_xml()).unwrap();
-        let sheet_metas = sheets();
-        let mut session = WorksheetReferenceSession::default();
-        let theme = vec!["#4472C4".into(); 12];
-        let styles = crate::styles::parse_styles(&mut archive, &theme)
-            .expect("styles parse for chart references");
-        let number_formats = ChartNumberFormatCache::from_styles(&styles.styles);
-        session.seed_current_sheet("Dashboard", None);
-        let mut resolver = XlsxChartReferenceResolver {
-            archive: &mut archive,
-            materialized_rows: None,
-            materialized_col_hidden: None,
-            sheet_name: "Dashboard",
-            sheets: &sheet_metas,
-            workbook_rels: &rels,
-            shared_strings: &[],
-            defined_names: &[],
-            number_formats: &number_formats,
-            session: &mut session,
-            visibility_cache: HashMap::new(),
-        };
-        assert_eq!(
-            ooxml_common::chart::ChartReferenceResolver::resolve_number_format(
-                &mut resolver,
-                "'التقرير'!$C$2:$C$4",
-            )
-            .as_deref(),
-            Some("#,##0"),
-        );
-        assert_eq!(
-            ooxml_common::chart::ChartReferenceResolver::resolve_number_format_id(
-                &mut resolver,
-                "'التقرير'!$C$2:$C$4",
-            ),
-            Some(3),
-        );
+        for (id, expected) in [
+            (3, "#,##0"),
+            (45, "mm:ss"),
+            (46, "[h]:mm:ss"),
+            (47, "mm:ss.0"),
+        ] {
+            let mut archive = archive_with_chart_and_data(&chart_xml(false));
+            let rels = parse_guarded(workbook_rels_xml()).unwrap();
+            let sheet_metas = sheets();
+            let mut session = WorksheetReferenceSession::default();
+            let theme = vec!["#4472C4".into(); 12];
+            let styles = crate::styles::parse_styles(&mut archive, &theme)
+                .expect("styles parse for chart references");
+            let mut number_formats = ChartNumberFormatCache::from_styles(&styles.styles);
+            // The fixture's numeric references use XF 1; retain its source lookup
+            // and substitute each built-in ID without adding a custom numFmt.
+            number_formats.style_num_fmt_ids[1] = Some(id);
+            session.seed_current_sheet("Dashboard", None);
+            let mut resolver = XlsxChartReferenceResolver {
+                archive: &mut archive,
+                materialized_rows: None,
+                materialized_col_hidden: None,
+                sheet_name: "Dashboard",
+                sheets: &sheet_metas,
+                workbook_rels: &rels,
+                shared_strings: &[],
+                defined_names: &[],
+                number_formats: &number_formats,
+                session: &mut session,
+                visibility_cache: HashMap::new(),
+            };
+            assert_eq!(
+                ooxml_common::chart::ChartReferenceResolver::resolve_number_format(
+                    &mut resolver,
+                    "'التقرير'!$C$2:$C$4",
+                )
+                .as_deref(),
+                Some(expected),
+            );
+            assert_eq!(
+                ooxml_common::chart::ChartReferenceResolver::resolve_number_format_id(
+                    &mut resolver,
+                    "'التقرير'!$C$2:$C$4",
+                ),
+                Some(id),
+            );
+        }
     }
 
     #[test]

@@ -209,6 +209,23 @@ describe('date formats (Excel serial; 45292 = 2024-01-01)', () => {
 });
 
 describe('time-only formats (§18.8.30 h / s / AM/PM without a date part)', () => {
+  it('resolves built-in minute, elapsed-hour and fractional-second formats without numFmts', () => {
+    expect(formatCellValue(numCell(0.75), builtinStyles(45))).toBe('00:00');
+    expect(formatCellValue(numCell(45200.75), builtinStyles(46))).toBe('1084818:00:00');
+    expect(formatCellValue(numCell(62.34 / 86400), builtinStyles(47))).toBe('01:02.3');
+    expect(formatCellValue(numCell(59.96 / 86400), builtinStyles(47))).toBe('01:00.0');
+    expect(formatCellValue(numCell(12345678901), builtinStyles(46))).toBe('296296293624:00:00');
+  });
+
+  it('formats fractional seconds from one rounded clock, while keeping literal zeros literal', () => {
+    expect(fmt(62.345 / 86400, 'mm:ss.00')).toBe('01:02.35');
+    expect(fmt(3599.9996 / 86400, '[h]:mm:ss.000')).toBe('1:00:00.000');
+    expect(fmt(3735.8 / 86400, '[ss].00')).toBe('3735.80');
+    expect(fmt(-59.996 / 86400, '[ss].00')).toBe('-60.00');
+    expect(fmt(62.34 / 86400, 'mm:ss".0"')).toBe('01:02.0');
+    expect(fmt(62.34 / 86400, 'mm:ss\\.0')).toBe('01:02.0');
+  });
+
   it('formats the serial as a clock time instead of echoing the code', () => {
     expect(fmt(0.29166666666666669, 'h:mm;@')).toBe('7:00');
     expect(fmt(0.51041666666666663, 'h:mm:ss;@')).toBe('12:15:00');

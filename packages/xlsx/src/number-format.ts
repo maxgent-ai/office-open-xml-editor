@@ -159,6 +159,11 @@ const BUILTIN_DATE_FMT: Record<number, string> = {
   29: '[$-411]ggge"年"m"月"d"日"',
   30: 'm/d/yy',
   31: 'yyyy"年"m"月"d"日"',
+  45: 'mm:ss',
+  46: '[h]:mm:ss',
+  // MS-OE376 §2.1.739(a): Office resolves the ECMA table's `mmss.0`
+  // to `mm:ss.0`. Use that documented Office pattern, as for built-in 14.
+  47: 'mm:ss.0',
   50: '[$-411]ge.m.d',
   51: '[$-411]ggge"年"m"月"d"日"',
   52: 'yyyy"年"m"月"',

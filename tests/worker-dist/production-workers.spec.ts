@@ -233,3 +233,53 @@ test('published XLSX viewer isolates an out-of-range date and retains other shee
     invalid: '#', healthy: 'Healthy sheet',
   });
 });
+
+// Built-in time IDs need no file-authored numFmt. Check actual parser and
+// published main/worker painting plus cellText/find, including subsecond carry.
+test('published XLSX resolves built-in time formats without custom numFmts', async ({ page }) => {
+  const { builtinTimeXlsxBytes } = await import('../fixtures/builtin-time-xlsx.mjs');
+  await page.route('**/builtin-time-viewer', route => route.fulfill({
+    contentType: 'text/html', body: '<!doctype html><body></body>',
+  }));
+  await page.goto('/builtin-time-viewer');
+  const results = await page.evaluate(async bytes => {
+    const entry = '/dist/xlsx.mjs';
+    const { XlsxViewer, XlsxWorkbook } = await import(entry);
+    const results = [];
+    for (const mode of ['main', 'worker']) {
+      const data = new Uint8Array(bytes).buffer;
+      const wb = await XlsxWorkbook.load(data.slice(0), { mode, useGoogleFonts: false });
+      let texts;
+      try {
+        const sheet = await wb.getWorksheet(0);
+        texts = sheet.rows.map((row: { cells: unknown[] }) => row.cells.map(cell => wb.cellText(sheet, cell)));
+      } finally {
+        wb.destroy();
+      }
+      const host = document.createElement('div');
+      host.style.cssText = 'width:800px;height:400px';
+      document.body.append(host);
+      const viewer = new XlsxViewer(host, { mode, useGoogleFonts: false });
+      try {
+        await viewer.load(data);
+        const matches = await viewer.findText('1084818:00:00');
+        results.push({ mode, texts, matches: matches.length });
+      } finally {
+        viewer.destroy();
+        host.remove();
+      }
+    }
+    return results;
+  }, [...builtinTimeXlsxBytes()]);
+  const texts = [
+    ['18:00', '18:00', '0:01', '0:00'],
+    ['18:00:00', '18:00:00', '0:01:02', '0:00:59'],
+    ['00:00', '00:00', '01:02', '00:59'],
+    ['18:00:00', '1084818:00:00', '0:01:02', '0:00:59'],
+    ['00:00.0', '00:00.0', '01:02.3', '01:00.0'],
+  ];
+  expect(results).toEqual([
+    { mode: 'main', texts, matches: 1 },
+    { mode: 'worker', texts, matches: 1 },
+  ]);
+});
