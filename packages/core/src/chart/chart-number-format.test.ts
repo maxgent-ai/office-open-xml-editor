@@ -60,6 +60,11 @@ describe('formatChartValWithCode — percent & null', () => {
 });
 
 describe('chart date1904 (c:date1904 §21.2.2.38 / §18.17.4.1)', () => {
+  it('shares fractional-second carry with worksheet cells in either date system', () => {
+    expect(formatChartValWithCode(59.96 / 86400, 'mm:ss.0')).toBe('01:00.0');
+    expect(formatCategoryLabel(String(59.96 / 86400), 'mm:ss.0', true)).toBe('01:00.0');
+  });
+
   it('localizes worksheet built-in short-date format 14', () => {
     expect(formatLocalizedExcelShortDate(45_658, false, 'ja-JP')).toBe('2025/1/1');
     expect(formatLocalizedExcelShortDate(45_658, false, 'en-US')).toBe('1/1/2025');
