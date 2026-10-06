@@ -354,8 +354,7 @@ export class XlsxWorkbook {
     const worksheetPolicy = normalizeXlsxWorksheetPolicy(opts);
     opts = { ...opts, xlsxWorksheetLimits: worksheetPolicy.worksheet };
     if (__OOXML_MODEL_SOURCES__ && opts.modelSources !== undefined) {
-      const { loadXlsxModelSource } = await import('./internal/workbook-model-source.js');
-      return loadXlsxModelSource(source, opts);
+      return (await import('./internal/workbook-model-source.js')).loadXlsxModelSource(source, opts);
     }
     opts = { ...opts, cjkFallback: resolveCjkFallback(opts.cjkFallback) };
     const resourceOptions = normalizeLoadResourceOptions(opts);
