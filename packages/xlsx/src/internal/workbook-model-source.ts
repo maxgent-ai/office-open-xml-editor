@@ -7,6 +7,7 @@ import {
   disposeRejectedLoad,
   normalizeLoadResourceOptions,
   OoxmlResourceMetricsSession,
+  normalizeXlsxWorksheetPolicy,
   type NormalizedOoxmlResourcePolicy,
 } from '@silurus/ooxml-core/worker';
 import { beginModelSourceLoad, selectModelSource } from '@silurus/ooxml-core/internal/model-source';
@@ -60,11 +61,14 @@ export async function loadXlsxModelSource(
   input: string | ArrayBuffer,
   opts: LoadOptions,
 ): Promise<XlsxWorkbook> {
+  const worksheetPolicy = normalizeXlsxWorksheetPolicy(opts);
+  opts = { ...opts, xlsxWorksheetLimits: worksheetPolicy.worksheet };
   opts = { ...opts, cjkFallback: resolveCjkFallback(opts.cjkFallback) };
   const resourceOptions = normalizeLoadResourceOptions(opts);
   const mode = opts.mode ?? 'main';
   const metrics = new OoxmlResourceMetricsSession({
     enabled: true, format: 'xlsx', mode, policy: resourceOptions.policy,
+    xlsxWorksheetPolicy: worksheetPolicy,
     onMetrics: resourceOptions.onResourceMetrics, emitToConsole: resourceOptions.debug,
   });
   try {

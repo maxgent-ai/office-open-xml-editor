@@ -2,6 +2,7 @@ import type {
   ModelSource,
   OoxmlResourceLimits,
   OoxmlResourceMetrics,
+  XlsxWorksheetLimits,
 } from '@silurus/ooxml-core';
 
 /** Resource policy, diagnostics, and cancellation shared by every Node session. */
@@ -16,6 +17,8 @@ export interface OoxmlNodeSessionOptions {
   modelSources?: readonly ModelSource[];
   /** Package-level inflated ZIP admission limits. */
   resourceLimits?: OoxmlResourceLimits;
+  /** XLSX-only logical worksheet admission limits; ignored by DOCX and PPTX. */
+  xlsxWorksheetLimits?: XlsxWorksheetLimits;
   /** @deprecated Use `resourceLimits.maxArchiveEntryBytes`. Scheduled for
    * removal in a future breaking release. */
   maxZipEntryBytes?: number;

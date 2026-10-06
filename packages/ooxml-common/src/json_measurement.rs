@@ -11,6 +11,13 @@ use std::io::{self, Write};
 use crate::package_session::PackageLimitReporter;
 use crate::resource::HardResourceLimitKind;
 
+/// Independent hard bound on one serialized JSON buffer: a single `Vec<u8>`
+/// can never exceed `isize::MAX` bytes on the compiled target (2147483647 on
+/// wasm32). The effective serialized cap is `min(limit, REPRESENTATION_LIMIT)`.
+/// This applies only to the single emitted buffer, not to aggregate UTF-8 or
+/// public normalization accounting.
+const REPRESENTATION_LIMIT: u64 = isize::MAX as u64;
+
 /// A serialization failure distinct from crossing a parser's JSON byte ceiling.
 #[derive(Debug)]
 enum LimitedJsonError {
@@ -52,6 +59,18 @@ impl Write for LimitedJsonWriter {
                 limit: self.limit,
             }));
         }
+        // The cap (<= isize::MAX) makes the new length representable; check it
+        // anyway, then reserve fallibly so the append cannot abort or overflow
+        // unchecked. `try_reserve` keeps amortized growth (no per-token exact
+        // reservation). A reservation failure is a serialize error, never a
+        // fabricated resource-limit crossing. This is not an OOM guarantee:
+        // later model/JS copies or the allocator may still fail independently.
+        if self.bytes.len().checked_add(bytes.len()).is_none() {
+            return Err(io::Error::other("JSON buffer length overflow"));
+        }
+        self.bytes.try_reserve(bytes.len()).map_err(|error| {
+            io::Error::other(format!("JSON buffer reservation failed: {error}"))
+        })?;
         self.bytes.extend_from_slice(bytes);
         Ok(bytes.len())
     }
@@ -92,18 +111,65 @@ pub fn serialize_json_with_limit<T: Serialize>(
     limit: u64,
     limit_error_prefix: &str,
 ) -> Result<Vec<u8>, String> {
-    let bytes = match serialize_json_limited(value, limit) {
+    serialize_json_with_limit_impl(
+        value,
+        reporter,
+        kind,
+        part,
+        limit,
+        limit_error_prefix,
+        false,
+    )
+}
+
+/// Like `serialize_json_with_limit`, but `limit` is a finite public policy
+/// limit: a crossing reports `configurable: true` when that limit binds
+/// (including a tie with the representation bound), and `configurable: false`
+/// when the lower representation bound binds. Output bytes are exactly the
+/// native `serde_json` bytes.
+pub fn serialize_json_with_policy_limit<T: Serialize>(
+    value: &T,
+    reporter: Option<&PackageLimitReporter>,
+    kind: HardResourceLimitKind,
+    part: Option<&str>,
+    limit: u64,
+    limit_error_prefix: &str,
+) -> Result<Vec<u8>, String> {
+    serialize_json_with_limit_impl(value, reporter, kind, part, limit, limit_error_prefix, true)
+}
+
+/// Shared single-pass implementation; `policy` only selects which reporter
+/// path classifies a crossing of the effective cap.
+fn serialize_json_with_limit_impl<T: Serialize>(
+    value: &T,
+    reporter: Option<&PackageLimitReporter>,
+    kind: HardResourceLimitKind,
+    part: Option<&str>,
+    limit: u64,
+    limit_error_prefix: &str,
+    policy: bool,
+) -> Result<Vec<u8>, String> {
+    let configurable = policy && limit <= REPRESENTATION_LIMIT;
+    let cap = limit.min(REPRESENTATION_LIMIT);
+    let observe = |reporter: &PackageLimitReporter, observed: u64| {
+        if configurable {
+            reporter.observe_policy_limit(kind, part, cap, observed)
+        } else {
+            reporter.observe_hard_limit(kind, part, cap, observed)
+        }
+    };
+    let bytes = match serialize_json_limited(value, cap) {
         Ok(bytes) => bytes,
         Err(LimitedJsonError::LimitExceeded { observed }) => {
             if let Some(reporter) = reporter {
-                reporter.observe_hard_limit(kind, part, limit, observed)?;
+                observe(reporter, observed)?;
             }
-            return Err(format!("{limit_error_prefix}: {observed} > {limit}"));
+            return Err(format!("{limit_error_prefix}: {observed} > {cap}"));
         }
         Err(LimitedJsonError::Serialize(error)) => return Err(format!("serialize error: {error}")),
     };
     if let Some(reporter) = reporter {
-        reporter.observe_hard_limit(kind, part, limit, bytes.len() as u64)?;
+        observe(reporter, bytes.len() as u64)?;
     }
     Ok(bytes)
 }

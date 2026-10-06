@@ -723,10 +723,39 @@ impl PackageSession {
         limit: u64,
         observed: u64,
     ) -> Result<(), String> {
+        self.observe_limit(operation_id, kind, part, limit, observed, false)
+    }
+
+    fn observe_policy_limit(
+        &mut self,
+        operation_id: ResourceOperation,
+        kind: HardResourceLimitKind,
+        part: Option<&str>,
+        limit: u64,
+        observed: u64,
+    ) -> Result<(), String> {
+        self.observe_limit(operation_id, kind, part, limit, observed, true)
+    }
+
+    /// Single lifecycle path (healthy, active, scoped, poison convergence) for
+    /// both hard and public-policy crossings; only the wire flag differs.
+    fn observe_limit(
+        &mut self,
+        operation_id: ResourceOperation,
+        kind: HardResourceLimitKind,
+        part: Option<&str>,
+        limit: u64,
+        observed: u64,
+        configurable: bool,
+    ) -> Result<(), String> {
         self.ensure_healthy()?;
         self.assert_operation_active(operation_id)?;
         let scope = self.governor.scope_operation(operation_id)?;
-        let result = resource::observe_hard_limit(kind, part, limit, observed);
+        let result = if configurable {
+            resource::observe_policy_limit(kind, part, limit, observed)
+        } else {
+            resource::observe_hard_limit(kind, part, limit, observed)
+        };
         drop(scope);
         if result.is_err() {
             self.converge_poison();
@@ -1219,6 +1248,24 @@ impl PackageLimitReporter {
         observed: u64,
     ) -> Result<(), String> {
         self.handle.inner.borrow_mut().observe_hard_limit(
+            self.operation_id,
+            kind,
+            part,
+            limit,
+            observed,
+        )
+    }
+
+    /// Report a crossing of a finite public (configurable) policy limit with
+    /// the same operation lifecycle as `observe_hard_limit`.
+    pub fn observe_policy_limit(
+        &self,
+        kind: HardResourceLimitKind,
+        part: Option<&str>,
+        limit: u64,
+        observed: u64,
+    ) -> Result<(), String> {
+        self.handle.inner.borrow_mut().observe_policy_limit(
             self.operation_id,
             kind,
             part,

@@ -28,6 +28,10 @@ import {
   HARD_MAX_RAW_PART_CACHE_BYTES,
   HARD_MAX_RAW_PART_CACHE_ENTRIES,
   resourcePolicyForWasm,
+  DEFAULT_XLSX_WORKSHEET_POLICY,
+  normalizeXlsxWorksheetPolicy,
+  xlsxWorksheetPolicyForWasm,
+  type NormalizedXlsxWorksheetPolicy,
   serializeWorkerError,
   loadWorkerRenderers,
   isWorkerSvgDecodeResponse,
@@ -49,6 +53,7 @@ import {
   type WorksheetCacheUsage,
 } from './worksheet-resource-limits.js';
 import type { ParsedWorkbook, Worksheet } from './types.js';
+import { bindWorksheetPolicy } from './worksheet-policy-context.js';
 import { WorksheetViewProjectionCache } from './worker-protocol.js';
 import { evictWorkerWorksheets } from './internal/worksheet-cache.js';
 import { readXlsxArchiveBootstrap, type XlsxArchiveBootstrap } from './internal/archive-bootstrap-source.js';
@@ -81,6 +86,9 @@ function sourceUsage(): Uint8Array | undefined {
 let cjkFallback: CjkLang = 'jp';
 let workbook: ParsedWorkbook | null = null;
 let archiveBacked = false;
+/** Normalized worksheet policy of the current document. Replaced only when a
+ *  new document begins, after the previous pull session was reset. */
+let worksheetPolicy: NormalizedXlsxWorksheetPolicy = DEFAULT_XLSX_WORKSHEET_POLICY;
 let renderers: LoadedWorkerRenderers = {};
 /** Settled before any render when `useGoogleFonts` was requested. The resolved
  *  value (the preloaded FontFace[]) is unused here: the worker owns its own
@@ -135,13 +143,17 @@ const worksheetPull = new WorksheetPullWorker(
   (sheetIndex, worksheet, measured, resourceUsage) => {
     const previous = sheetCache.get(sheetIndex);
     const previousUsage = sheetCacheUsage.get(sheetIndex);
-    const nextUsage = addWorksheetCacheUsage(retainedSheetUsage, measured, previousUsage);
+    const nextUsage = addWorksheetCacheUsage(
+      retainedSheetUsage, measured, previousUsage, worksheetPolicy,
+    );
     assertWorksheetCacheUsage(
       nextUsage,
       'get-worksheet-worker',
       undefined,
       resourceUsage,
+      worksheetPolicy,
     );
+    bindWorksheetPolicy(worksheet, worksheetPolicy);
     sheetCache.set(sheetIndex, worksheet);
     return {
       commit: () => {
@@ -163,6 +175,7 @@ const worksheetPull = new WorksheetPullWorker(
   },
   {
     preview: (sheetIndex, worksheet) => {
+      bindWorksheetPolicy(worksheet, worksheetPolicy);
       provisionalSheets.set(sheetIndex, worksheet);
       sheetCache.set(sheetIndex, worksheet);
     },
@@ -172,6 +185,7 @@ const worksheetPull = new WorksheetPullWorker(
       if (preview && sheetCache.get(sheetIndex) === preview) sheetCache.delete(sheetIndex);
     },
   },
+  () => worksheetPolicy,
 );
 
 const rawPost = (msg: unknown, transfer?: Transferable[]) =>
@@ -218,6 +232,7 @@ self.onmessage = async (e: MessageEvent<
     try {
       retainedSheetUsage = evictWorkerWorksheets(
         req.sheetIndices, sheetCache, sheetCacheUsage, retainedSheetUsage, viewProjectionCache,
+        worksheetPolicy,
       );
       post({ type: 'worksheetsEvicted', id: req.id });
     } catch (error) {
@@ -246,6 +261,11 @@ self.onmessage = async (e: MessageEvent<
       );
       return;
     }
+    // Normalize before any host/source/reset effect so invalid options leave
+    // the current document (and any source claim) untouched.
+    const requestPolicy = req.type === 'parse' || req.type === 'parseDelimitedText'
+      ? normalizeXlsxWorksheetPolicy({ xlsxWorksheetLimits: req.worksheetPolicy?.worksheet })
+      : undefined;
     if (req.type === 'parse' || req.type === 'parseDelimitedText') {
       await worksheetPull.reset();
     }
@@ -281,6 +301,7 @@ self.onmessage = async (e: MessageEvent<
       dropDecodedBitmapCache(getImage);
       dropSvgImageCache(getImage);
       rawParts.clear();
+      if (requestPolicy) worksheetPolicy = requestPolicy;
       renderers = await loadWorkerRenderers(req.renderers);
       if (req.type === 'parseDelimitedText') {
         source?.closeModelSource();
@@ -288,10 +309,14 @@ self.onmessage = async (e: MessageEvent<
         host.disposeArchive();
         archiveBacked = false;
         const { parseDelimitedWorksheet } = await delimitedTextModule;
-        const parsed = parseDelimitedWorksheet(req.data, req.options);
+        const parsed = parseDelimitedWorksheet(req.data, req.options, worksheetPolicy);
+        bindWorksheetPolicy(parsed.worksheet, worksheetPolicy);
+        const measured = measureWorksheet(parsed.worksheet, worksheetPolicy);
+        assertWorksheetCacheUsage(
+          measured, 'parse-delimited-text-worker', undefined, undefined, worksheetPolicy,
+        );
         workbook = parsed.workbook;
         cjkFallback = xlsxCjkFallback(workbook, cjkFallback);
-        const measured = measureWorksheet(parsed.worksheet);
         retainedSheetUsage = measured;
         sheetCache.set(0, parsed.worksheet);
         sheetCacheUsage.set(0, measured);
@@ -348,6 +373,7 @@ self.onmessage = async (e: MessageEvent<
               new Uint8Array(req.data), maxEntry, maxTotal, maxEntries,
             );
             host.setArchive(archive);
+            archive.set_worksheet_limits(...xlsxWorksheetPolicyForWasm(worksheetPolicy));
             return JSON.parse(new TextDecoder().decode(archive.parse())) as ParsedWorkbook;
           }),
           () => host.run(() => host.archive!.resource_usage()),

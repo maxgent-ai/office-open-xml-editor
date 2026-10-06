@@ -1,4 +1,8 @@
-import type { WorkerRendererDescriptors, WorkerErrorPayload } from '@silurus/ooxml-core/worker';
+import type {
+  WorkerRendererDescriptors,
+  WorkerErrorPayload,
+  NormalizedXlsxWorksheetPolicy,
+} from '@silurus/ooxml-core/worker';
 import type { ParsedWorkbook } from './types.js';
 import type { ResolvedDelimitedTextOptions } from './delimited-text.js';
 
@@ -7,6 +11,7 @@ export type DelimitedTextParseRequest = {
   readonly id: number;
   readonly data: ArrayBuffer;
   readonly options: ResolvedDelimitedTextOptions;
+  readonly worksheetPolicy?: NormalizedXlsxWorksheetPolicy;
   readonly useGoogleFonts?: boolean;
   readonly cjkFallback?: import('@silurus/ooxml-core').CjkLang;
   readonly renderers?: WorkerRendererDescriptors;

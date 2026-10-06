@@ -2,7 +2,10 @@ import type { ParsedWorkbook, Row, Worksheet } from '@silurus/ooxml-xlsx';
 import type { OoxmlResourceUsageSnapshot } from '@silurus/ooxml-core';
 import {
   decodeOoxmlResourceUsage,
+  DEFAULT_XLSX_WORKSHEET_POLICY,
+  normalizeXlsxWorksheetPolicy,
   parseResourceLimitError,
+  type NormalizedXlsxWorksheetPolicy,
   type OoxmlResourceMetricsSession,
   type PullSessionCommand,
   type PullSessionResponse,
@@ -16,6 +19,7 @@ import {
   assertWorksheetCacheUsage,
   assertWorksheetJsonBytes,
   assertWorksheetModelUsage,
+  bindWorksheetPolicy,
   completeWorksheetUsage,
   measureRows,
   XlsxWorksheetPullClient,
@@ -96,6 +100,12 @@ export async function openXlsxWorkbook(
   buffer: ArrayBuffer | Uint8Array,
   options: OpenXlsxWorkbookOptions = {},
 ): Promise<XlsxWorkbookSession> {
+  const policy = normalizeXlsxWorksheetPolicy(options);
+  // Rebind the local parameter to an immutable policy capture so later caller
+  // mutation cannot affect this session, while keeping the canonical
+  // `options.modelSources !== undefined` branch shape recognized by the
+  // source-boundary gate.
+  options = { ...options, xlsxWorksheetLimits: policy.worksheet };
   if (__OOXML_MODEL_SOURCES__ && options.modelSources !== undefined) {
     const { openXlsxSource } = await import('./xlsx-model-source.ts');
     return openXlsxSource(buffer, options, getXlsxWasmModule);
@@ -109,12 +119,20 @@ export async function openXlsxWorkbook(
     acquired.metrics,
     acquired.usage,
     options.signal,
+    acquired.worksheetPolicy,
   );
 }
 
 type ActiveWorksheetOperation = {
   cleanupPromise?: Promise<void>;
 };
+
+/** Realm-local, non-public per-session normalized worksheet policy binding. */
+const sessionWorksheetPolicies = new WeakMap<object, NormalizedXlsxWorksheetPolicy>();
+
+function sessionWorksheetPolicy(session: object): NormalizedXlsxWorksheetPolicy {
+  return sessionWorksheetPolicies.get(session) ?? DEFAULT_XLSX_WORKSHEET_POLICY;
+}
 
 export class XlsxWorkbookSessionImpl implements XlsxWorkbookSession {
   readonly workbookIndex: ReadonlyParsedWorkbook;
@@ -139,7 +157,9 @@ export class XlsxWorkbookSessionImpl implements XlsxWorkbookSession {
     private readonly metrics: OoxmlResourceMetricsSession,
     usage: OoxmlResourceUsageSnapshot | undefined,
     private readonly signal?: AbortSignal,
+    policy: NormalizedXlsxWorksheetPolicy = DEFAULT_XLSX_WORKSHEET_POLICY,
   ) {
+    sessionWorksheetPolicies.set(this, policy);
     this.workbookIndex = freezeRecursively(workbook);
     this.sheetNames = Object.freeze(this.workbookIndex.workbook.sheets.map((sheet) => sheet.name));
     this.sheetCount = this.sheetNames.length;
@@ -216,6 +236,7 @@ export class XlsxWorkbookSessionImpl implements XlsxWorkbookSession {
           };
           continue;
         }
+        bindWorksheetPolicy(unit.worksheet, sessionWorksheetPolicy(this));
         yield {
           kind: 'finished',
           worksheet: unit.worksheet,
@@ -341,18 +362,20 @@ export async function materializeXlsxWorkbook(
   return usingOwnedSession(
     () => openXlsxWorkbook(buffer, options),
     async (session) => {
+      const policy = sessionWorksheetPolicy(session);
       const worksheets: Worksheet[] = [];
       let retainedUsage: WorksheetCacheUsage = {
         rows: 0, cells: 0, ownedUtf8Bytes: 0, jsonBytes: 0,
       };
       for (let sheetIndex = 0; sheetIndex < session.sheetCount; sheetIndex += 1) {
         const materialized = await materializeWorksheetFromSession(session, sheetIndex);
-        const nextUsage = addWorksheetCacheUsage(retainedUsage, materialized.usage);
+        const nextUsage = addWorksheetCacheUsage(retainedUsage, materialized.usage, {}, policy);
         assertWorksheetCacheUsage(
           nextUsage,
           'materialize-workbook',
           undefined,
           materialized.resourceUsage,
+          policy,
         );
         retainedUsage = nextUsage;
         worksheets.push(materialized.worksheet);
@@ -373,6 +396,7 @@ async function materializeWorksheetFromSession(
   usage: WorksheetModelUsage & { jsonBytes: number };
   resourceUsage?: OoxmlResourceUsageSnapshot;
 }> {
+  const policy = sessionWorksheetPolicy(session);
   const rows: Row[] = [];
   let modelUsage: WorksheetModelUsage = { rows: 0, cells: 0, ownedUtf8Bytes: 0 };
   let retainedUsage: (WorksheetModelUsage & { jsonBytes: number }) | undefined;
@@ -381,35 +405,40 @@ async function materializeWorksheetFromSession(
   for await (const chunk of session.worksheetRows(sheetIndex)) {
     resourceUsage = chunk.usage ?? resourceUsage;
     if (chunk.kind === 'rows') {
-      const nextUsage = addWorksheetUsage(modelUsage, measureRows(chunk.rows));
+      const nextUsage = addWorksheetUsage(modelUsage, measureRows(chunk.rows, policy), policy);
       assertWorksheetModelUsage(
         nextUsage,
         'materialize-worksheet',
         undefined,
         resourceUsage,
+        policy,
       );
       rows.push(...chunk.rows);
       modelUsage = nextUsage;
     } else {
       terminal = chunk.worksheet;
+      bindWorksheetPolicy(terminal, policy);
       terminal.rows = terminal.parseError ? [] : rows;
       const measured = completeWorksheetUsage(
         terminal,
         terminal.parseError
           ? { rows: 0, cells: 0, ownedUtf8Bytes: 0 }
           : modelUsage,
+        policy,
       );
       assertWorksheetModelUsage(
         measured,
         'materialize-worksheet',
         undefined,
         resourceUsage,
+        policy,
       );
       assertWorksheetJsonBytes(
         measured.jsonBytes,
         'materialize-worksheet',
         undefined,
         resourceUsage,
+        policy,
       );
       modelUsage = measured;
       retainedUsage = measured;

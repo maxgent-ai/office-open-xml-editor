@@ -9,6 +9,7 @@ import type { OoxmlResourceUsageSnapshot } from '@silurus/ooxml-core';
 import type { NormalizedOoxmlResourcePolicy } from '@silurus/ooxml-core/worker';
 import type { PullSessionIdentity } from '@silurus/ooxml-core/worker';
 import { GridGeometry } from './internal/grid-geometry.js';
+import { getWorksheetPolicy, inheritWorksheetPolicy } from './worksheet-policy-context.js';
 import type {
   DelimitedTextParseRequest,
   DelimitedTextParseResponse,
@@ -84,6 +85,7 @@ export function createSizeOverriddenWorksheet(
     rowHeights: { ...source.rowHeights },
     colWidths: { ...source.colWidths },
   };
+  inheritWorksheetPolicy(source, view);
   applySizeOverrides(view, overrides);
   return view;
 }
@@ -123,7 +125,8 @@ export class WorksheetViewProjectionCache {
     if (
       cached &&
       cached.revision === projection.revision &&
-      cached.source === source
+      cached.source === source &&
+      getWorksheetPolicy(source) === getWorksheetPolicy(cached.worksheet)
     ) {
       return { worksheet: cached.worksheet, created: false };
     }
@@ -231,7 +234,7 @@ export function extractViewerRenderContext(opts: WireRenderViewportOptions): {
 // `init` arm is copied verbatim from `WorkerRequest`.
 export type RenderWorkerRequest =
   | { type: 'init'; wasmUrl: string }
-  | { type: 'parse'; id: number; data: ArrayBuffer; resourcePolicy: NormalizedOoxmlResourcePolicy; useGoogleFonts?: boolean; cjkFallback?: import('@silurus/ooxml-core').CjkLang; renderers?: import('@silurus/ooxml-core/worker').WorkerRendererDescriptors; source?: import('@silurus/ooxml-core').ModelSourceModuleDescriptor; sourceTransfer?: readonly Transferable[]; sourceOwnerUrl?: string }
+  | { type: 'parse'; id: number; data: ArrayBuffer; resourcePolicy: NormalizedOoxmlResourcePolicy; readonly worksheetPolicy?: import('@silurus/ooxml-core/worker').NormalizedXlsxWorksheetPolicy; useGoogleFonts?: boolean; cjkFallback?: import('@silurus/ooxml-core').CjkLang; renderers?: import('@silurus/ooxml-core/worker').WorkerRendererDescriptors; source?: import('@silurus/ooxml-core').ModelSourceModuleDescriptor; sourceTransfer?: readonly Transferable[]; sourceOwnerUrl?: string }
   | DelimitedTextParseRequest
   | ({ type: 'openSheetSession'; id: number; sheetIndex: number; sheetName: string } & PullSessionIdentity<number>)
   | {

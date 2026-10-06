@@ -1274,6 +1274,8 @@ export type WorkerRequest =
       id: number;
       data: ArrayBuffer;
       resourcePolicy: NormalizedOoxmlResourcePolicy;
+      /** Normalized worksheet admission policy. Optional for older internal requests. */
+      readonly worksheetPolicy?: import('@silurus/ooxml-core/worker').NormalizedXlsxWorksheetPolicy;
       /** Application-selected model source (LoadOptions.modelSources). */
       source?: import('@silurus/ooxml-core').ModelSourceModuleDescriptor;
       sourceTransfer?: readonly Transferable[];

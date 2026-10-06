@@ -1749,6 +1749,7 @@ interface LoadOptions__emitterCollision1 {
     wasmUrl?: string | URL;
     maxZipEntryBytes?: number;
     resourceLimits?: OoxmlResourceLimits;
+    xlsxWorksheetLimits?: XlsxWorksheetLimits;
     debug?: boolean;
     onResourceMetrics?: (metrics: OoxmlResourceMetrics) => void;
     workerTimeoutMs?: number;
@@ -1987,6 +1988,12 @@ export interface OoxmlResourcePolicySnapshot {
     readonly maxArchiveEntryBytes: number | null;
     readonly maxTotalInflatedBytes: number | null;
     readonly maxArchiveEntries: number | null;
+    readonly xlsxWorksheetLimits?: Readonly<{
+        readonly maxRows: number;
+        readonly maxCells: number;
+        readonly maxOwnedUtf8Bytes: number;
+        readonly maxJsonBytes: number;
+    }>;
 }
 export interface OoxmlResourceUsageSnapshot {
     readonly archiveEntryCount: number;
@@ -2512,6 +2519,12 @@ export interface ViewerCommentThreadContext {
 export interface ViewerContextMenuEvent<TContext> {
     readonly originalEvent: MouseEvent;
     getContext(): Promise<TContext | null>;
+}
+export interface XlsxWorksheetLimits {
+    maxRows?: number;
+    maxCells?: number;
+    maxOwnedUtf8Bytes?: number;
+    maxJsonBytes?: number;
 }
 export interface ZoomableViewer {
     getScale(): number;

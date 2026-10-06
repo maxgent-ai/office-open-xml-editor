@@ -23,6 +23,10 @@ export {
   type WorksheetModelUsage,
 } from '../worksheet-resource-limits.js';
 export {
+  bindWorksheetPolicy,
+  getWorksheetPolicy,
+} from '../worksheet-policy-context.js';
+export {
   acquireXlsxNodeSession,
   type XlsxNodeAcquisition,
   type XlsxNodeAcquisitionOptions,

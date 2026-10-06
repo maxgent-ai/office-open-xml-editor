@@ -527,6 +527,31 @@ pub fn observe_hard_limit(
     limit: u64,
     observed: u64,
 ) -> Result<(), String> {
+    observe_limit(kind, part, limit, observed, false)
+}
+
+/// Latch a crossing of a finite public (caller-configurable) policy limit.
+/// Identical lifecycle to `observe_hard_limit`; only the wire `configurable`
+/// flag differs, telling callers that raising the public option can admit the
+/// input. Callers must only use this when the public limit is the binding one
+/// (i.e. not shadowed by a lower hard/representation ceiling).
+pub fn observe_policy_limit(
+    kind: HardResourceLimitKind,
+    part: Option<&str>,
+    limit: u64,
+    observed: u64,
+) -> Result<(), String> {
+    observe_limit(kind, part, limit, observed, true)
+}
+
+/// Shared latch for hard and policy crossings so both share one state path.
+fn observe_limit(
+    kind: HardResourceLimitKind,
+    part: Option<&str>,
+    limit: u64,
+    observed: u64,
+    configurable: bool,
+) -> Result<(), String> {
     if observed <= limit {
         return Ok(());
     }
@@ -543,7 +568,7 @@ pub fn observe_hard_limit(
         part,
         limit,
         observed,
-        configurable: false,
+        configurable,
     }))
 }
 
