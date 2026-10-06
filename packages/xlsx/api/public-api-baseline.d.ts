@@ -2195,6 +2195,7 @@ export interface Worksheet {
     colHidden?: Record<number, boolean>;
     defaultColWidth: number;
     baseColWidth?: number;
+    defaultColWidthIsUi?: boolean;
     defaultRowHeight: number;
     defaultRowHeightCustom?: boolean;
     mergeCells: MergeCell[];

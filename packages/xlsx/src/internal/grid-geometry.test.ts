@@ -7,6 +7,7 @@ import {
   rowHeightToPx,
 } from '../renderer.js';
 import { GridAxisGeometry, GridGeometry } from './grid-geometry.js';
+import { parseDelimitedWorksheet, resolveDelimitedTextOptions } from '../delimited-text.js';
 
 function worksheet(): Worksheet {
   return {
@@ -26,6 +27,89 @@ function worksheet(): Worksheet {
 }
 
 afterEach(() => vi.unstubAllGlobals());
+
+/** Future parser fact (XLSX1709). The intersection lets the RED phase compile. */
+type UiWorksheet = Worksheet & { defaultColWidthIsUi?: boolean };
+
+/** Model shape for a part with no `<sheetFormatPr>`. Column 4 is authored. */
+function absentFormatWorksheet(): UiWorksheet {
+  const ws: UiWorksheet = worksheet();
+  ws.colWidths = { 4: 20 };
+  ws.defaultColWidthIsUi = true;
+  return ws;
+}
+
+const IMPLICIT_COL = 3;
+// ECMA-376 §18.3.1.13: 8.43 UI characters at MDW 6/7/8 are 56/64/72 px. The
+// same 8.43 authored as a stored width decodes to 51/59/67 px.
+const UNIT_CASES = [
+  { mdw: 6, ui: 56, stored: 51 },
+  { mdw: 7, ui: 64, stored: 59 },
+  { mdw: 8, ui: 72, stored: 67 },
+] as const;
+
+describe('XLSX1709 absent sheetFormatPr fallback width', () => {
+  for (const platform of ['MacIntel', 'Win32'] as const) {
+    it(`encodes the flagged 8.43 fallback as UI characters (${platform})`, () => {
+      vi.stubGlobal('navigator', { platform, maxTouchPoints: 0 });
+      for (const { mdw, ui } of UNIT_CASES) {
+        const geometry = GridGeometry.forWorksheet(absentFormatWorksheet(), mdw);
+        expect(geometry.col.sizeOf(IMPLICIT_COL)).toBe(ui);
+      }
+    });
+
+    it(`keeps an unflagged 8.43 default as a stored width (${platform})`, () => {
+      vi.stubGlobal('navigator', { platform, maxTouchPoints: 0 });
+      for (const { mdw, stored } of UNIT_CASES) {
+        const ws = absentFormatWorksheet();
+        delete ws.defaultColWidthIsUi;
+        expect(GridGeometry.forWorksheet(ws, mdw).col.sizeOf(IMPLICIT_COL)).toBe(stored);
+      }
+    });
+
+    it(`keeps explicit column 4 = 20 as a stored width (${platform})`, () => {
+      vi.stubGlobal('navigator', { platform, maxTouchPoints: 0 });
+      expect(GridGeometry.forWorksheet(absentFormatWorksheet(), 7).col.sizeOf(4)).toBe(140);
+    });
+
+    it(`lets the existing baseColWidth branch win over the flag (${platform})`, () => {
+      vi.stubGlobal('navigator', { platform, maxTouchPoints: 0 });
+      const flagged = absentFormatWorksheet();
+      flagged.baseColWidth = 8;
+      const plain = worksheet();
+      plain.colWidths = { 4: 20 };
+      plain.baseColWidth = 8;
+      expect(GridGeometry.forWorksheet(flagged, 7).col.sizeOf(IMPLICIT_COL))
+        .toBe(GridGeometry.forWorksheet(plain, 7).col.sizeOf(IMPLICIT_COL));
+    });
+  }
+
+  it('preserves the flag and its geometry through JSON and structuredClone', () => {
+    const ws = absentFormatWorksheet();
+    const copies: UiWorksheet[] = [JSON.parse(JSON.stringify(ws)), structuredClone(ws)];
+    for (const copy of copies) {
+      expect(copy).toMatchObject({ defaultColWidth: 8.43, defaultColWidthIsUi: true });
+      const geometry = GridGeometry.forWorksheet(copy, 7);
+      expect(geometry.col.sizeOf(IMPLICIT_COL)).toBe(64);
+      expect(geometry.col.sizeOf(4)).toBe(140);
+    }
+  });
+
+  it('builds a distinct cached geometry when MDW changes', () => {
+    const ws = absentFormatWorksheet();
+    const at7 = GridGeometry.forWorksheet(ws, 7);
+    const at8 = GridGeometry.forWorksheet(ws, 8);
+    expect(at8).not.toBe(at7);
+    expect([at7.col.sizeOf(IMPLICIT_COL), at8.col.sizeOf(IMPLICIT_COL)]).toEqual([64, 72]);
+  });
+
+  it('leaves CSV worksheets unflagged with stored-width semantics', () => {
+    const bytes = new TextEncoder().encode('a,b\r\n').buffer as ArrayBuffer;
+    const { worksheet: csv } = parseDelimitedWorksheet(bytes, resolveDelimitedTextOptions({ format: 'csv' }));
+    expect((csv as UiWorksheet).defaultColWidthIsUi).toBeUndefined();
+    expect(GridGeometry.forWorksheet(csv, 7).col.sizeOf(1)).toBe(59);
+  });
+});
 
 describe('GridGeometry', () => {
   it('derives implicit base-width columns without overriding an authored default width', () => {
