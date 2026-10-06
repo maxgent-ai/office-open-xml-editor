@@ -40,6 +40,7 @@ class OoxmlArchive {
   constructor() { state.ooxmlConstruct(); }
   free = vi.fn();
   assert_healthy() {}
+  set_worksheet_limits = vi.fn();
   parse() { return new TextEncoder().encode(JSON.stringify(bootstrap)); }
   resource_usage() { return new TextEncoder().encode(JSON.stringify({
     archiveEntryCount: 0, declaredInflatedBytes: 0,

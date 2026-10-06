@@ -1,5 +1,10 @@
 import type { OoxmlResourceUsageSnapshot } from '@silurus/ooxml-core';
-import { normalizeLoadResourceOptions, OoxmlResourceMetricsSession, parseTypedParserError } from '@silurus/ooxml-core/worker';
+import {
+  normalizeLoadResourceOptions,
+  normalizeXlsxWorksheetPolicy,
+  OoxmlResourceMetricsSession,
+  parseTypedParserError,
+} from '@silurus/ooxml-core/worker';
 import type { ParsedWorkbook } from '../types.js';
 import { readXlsxArchiveBootstrap } from './archive-bootstrap-source.js';
 import type { XlsxNodeAcquisition, XlsxNodeAcquisitionOptions, XlsxNodeSessionArchive } from './node-acquisition.js';
@@ -30,6 +35,7 @@ export function acquireXlsxSessionFromArchive(
 ): XlsxNodeAcquisition {
   let metrics: OoxmlResourceMetricsSession | undefined;
   try {
+    const worksheetPolicy = normalizeXlsxWorksheetPolicy(options);
     if (!Number.isSafeInteger(owned.sourceByteLength) || owned.sourceByteLength < 0) {
       throw new RangeError('XLSX sourceByteLength must be a non-negative safe integer');
     }
@@ -37,6 +43,7 @@ export function acquireXlsxSessionFromArchive(
     metrics = new OoxmlResourceMetricsSession({
       enabled: resourceOptions.debug || resourceOptions.onResourceMetrics !== undefined,
       format: 'xlsx', mode: 'node', scope: 'session', policy: resourceOptions.policy,
+      xlsxWorksheetPolicy: worksheetPolicy,
       onMetrics: resourceOptions.onResourceMetrics, emitToConsole: resourceOptions.debug,
     });
     metrics.setSourceBytes(owned.sourceByteLength);
@@ -51,7 +58,14 @@ export function acquireXlsxSessionFromArchive(
     }
     metrics.observeUsage(usage);
     metrics.checkpoint('workbook index ready');
-    return { archive, workbookIndex, usage, metrics, closeArchive: () => owned.closeArchive() };
+    return {
+      archive,
+      workbookIndex,
+      usage,
+      metrics,
+      worksheetPolicy,
+      closeArchive: () => owned.closeArchive(),
+    };
   } catch (error) {
     try { owned.closeArchive(); } catch {}
     const normalized = parseTypedParserError(error) ?? error;

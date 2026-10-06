@@ -59,4 +59,5 @@ export {
   type OoxmlResourceLimitErrorDetails,
   type OoxmlResourceLimits,
   type OoxmlResourceUsageSnapshot,
+  type XlsxWorksheetLimits,
 } from '@silurus/ooxml-core';

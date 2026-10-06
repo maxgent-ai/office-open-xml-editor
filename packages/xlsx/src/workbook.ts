@@ -39,6 +39,9 @@ import {
   HARD_MAX_RAW_PART_CACHE_BYTES,
   HARD_MAX_RAW_PART_CACHE_ENTRIES,
   respondToWorkerSvgDecodeRequest,
+  DEFAULT_XLSX_WORKSHEET_POLICY,
+  normalizeXlsxWorksheetPolicy,
+  type NormalizedXlsxWorksheetPolicy,
 } from '@silurus/ooxml-core/worker';
 import { BoundedRawPartCache } from '@silurus/ooxml-core/internal/bounded-raw-part-cache';
 import type { ParsedWorkbook, Worksheet, ViewportRange, RenderViewportOptions, XlsxRenderViewportOptions, WorkerRequest, WorkerResponse, Cell, SheetVisibility, XlsxComment } from './types.js';
@@ -87,6 +90,7 @@ import {
 import { readDelimitedTextResponse } from './delimited-text-source.js';
 import { WorksheetPreview } from './internal/worksheet-preview.js';
 import { setWorksheetPreviewBounds } from './internal/worksheet-content-bounds.js';
+import { bindWorksheetPolicy } from './worksheet-policy-context.js';
 import type {
   DelimitedTextParseRequest,
   DelimitedTextParseResponse,
@@ -168,6 +172,8 @@ export class XlsxWorkbook {
   private readonly _fetchImage = (path: string, mime: string): Promise<Blob> =>
     this.getImageWithinArchiveOperation(path, mime);
   private resourcePolicy: NormalizedOoxmlResourcePolicy | null = null;
+  /** Normalized per-session worksheet admission policy. */
+  private worksheetPolicy: NormalizedXlsxWorksheetPolicy = DEFAULT_XLSX_WORKSHEET_POLICY;
   /** Opt-in OMML equation engine, injected once at {@link load}. Every
    *  `renderViewport` call reuses it — equations in shapes render when present,
    *  and are skipped when omitted. */
@@ -273,6 +279,8 @@ export class XlsxWorkbook {
     opts: LoadOptions,
     sourceOptions: Exclude<XlsxSheetLoadOptions, Readonly<{ format?: 'xlsx' }>>,
   ): Promise<XlsxWorkbook> {
+    const worksheetPolicy = normalizeXlsxWorksheetPolicy(opts);
+    opts = { ...opts, xlsxWorksheetLimits: worksheetPolicy.worksheet };
     opts = { ...opts, cjkFallback: resolveCjkFallback(opts.cjkFallback) };
     const delimited = resolveDelimitedTextOptions(sourceOptions);
     const resourceOptions = normalizeLoadResourceOptions(opts);
@@ -282,6 +290,7 @@ export class XlsxWorkbook {
       format: 'xlsx',
       mode,
       policy: resourceOptions.policy,
+      xlsxWorksheetPolicy: worksheetPolicy,
       onMetrics: resourceOptions.onResourceMetrics,
       emitToConsole: resourceOptions.debug,
     });
@@ -342,6 +351,8 @@ export class XlsxWorkbook {
 
   /** Parse an XLSX from a URL or ArrayBuffer. */
   static async load(source: string | ArrayBuffer, opts: LoadOptions = {}): Promise<XlsxWorkbook> {
+    const worksheetPolicy = normalizeXlsxWorksheetPolicy(opts);
+    opts = { ...opts, xlsxWorksheetLimits: worksheetPolicy.worksheet };
     if (__OOXML_MODEL_SOURCES__ && opts.modelSources !== undefined) {
       const { loadXlsxModelSource } = await import('./internal/workbook-model-source.js');
       return loadXlsxModelSource(source, opts);
@@ -354,6 +365,7 @@ export class XlsxWorkbook {
       format: 'xlsx',
       mode,
       policy: resourceOptions.policy,
+      xlsxWorksheetPolicy: worksheetPolicy,
       onMetrics: resourceOptions.onResourceMetrics,
       emitToConsole: resourceOptions.debug,
     });
@@ -423,7 +435,9 @@ export class XlsxWorkbook {
     onUsage?: (usage: import('@silurus/ooxml-core').OoxmlResourceUsageSnapshot) => void,
     preserveCallerBuffer = false,
   ): Promise<void> {
+    const worksheetPolicy = normalizeXlsxWorksheetPolicy(opts);
     const bridge = this.requireBridge();
+    this.worksheetPolicy = worksheetPolicy;
     this.resourceFailure = null;
     this.retainedSheetUsage = { rows: 0, cells: 0, ownedUtf8Bytes: 0, jsonBytes: 0 };
     this.sheetCache.clear();
@@ -485,6 +499,7 @@ export class XlsxWorkbook {
               id,
               data: workerData,
               resourcePolicy,
+              worksheetPolicy,
               useGoogleFonts: !!opts.useGoogleFonts,
               cjkFallback: this.cjkFallback,
               renderers: rendererDescriptors,
@@ -494,6 +509,7 @@ export class XlsxWorkbook {
               id,
               data: workerData,
               resourcePolicy,
+              worksheetPolicy,
             } satisfies WorkerRequest),
       [workerData],
       { timeoutMs: opts.workerTimeoutMs },
@@ -545,7 +561,9 @@ export class XlsxWorkbook {
     resourcePolicy: NormalizedOoxmlResourcePolicy,
     options: ResolvedDelimitedTextOptions,
   ): Promise<void> {
+    const worksheetPolicy = normalizeXlsxWorksheetPolicy(opts);
     const bridge = this.requireBridge();
+    this.worksheetPolicy = worksheetPolicy;
     this.delimitedTextBacked = true;
     this.resourcePolicy = resourcePolicy;
     this.workerTimeoutMs = opts.workerTimeoutMs;
@@ -566,6 +584,7 @@ export class XlsxWorkbook {
         id,
         data,
         options,
+        worksheetPolicy,
         useGoogleFonts: !!opts.useGoogleFonts,
         cjkFallback: this.cjkFallback,
         renderers: rendererDescriptors,
@@ -576,14 +595,15 @@ export class XlsxWorkbook {
     const worksheet = JSON.parse(
       new TextDecoder().decode(response.worksheetJson),
     ) as Worksheet;
+    bindWorksheetPolicy(worksheet, worksheetPolicy);
     const sheets = response.workbook.workbook.sheets;
     if (sheets.length !== 1 || sheets[0]?.name !== worksheet.name) {
       throw new Error('Delimited text worker returned inconsistent worksheet metadata');
     }
-    const measured = measureWorksheet(worksheet);
-    assertWorksheetModelUsage(measured, 'load-delimited-text', undefined);
-    assertWorksheetJsonBytes(measured.jsonBytes, 'load-delimited-text', undefined);
-    assertWorksheetCacheUsage(measured, 'load-delimited-text', undefined);
+    const measured = measureWorksheet(worksheet, worksheetPolicy);
+    assertWorksheetModelUsage(measured, 'load-delimited-text', undefined, undefined, worksheetPolicy);
+    assertWorksheetJsonBytes(measured.jsonBytes, 'load-delimited-text', undefined, undefined, worksheetPolicy);
+    assertWorksheetCacheUsage(measured, 'load-delimited-text', undefined, undefined, worksheetPolicy);
     this.parsedWorkbook = response.workbook;
     this.cjkFallback = xlsxCjkFallback(response.workbook, this.cjkFallback);
     this.sheetCache.set(0, worksheet);
@@ -877,6 +897,7 @@ export class XlsxWorkbook {
   }
 
   private async loadWorksheetStream(sheetIndex: number, sheetName: string, progress: WorksheetPreview): Promise<Worksheet> {
+    const policy = this.worksheetPolicy;
     const client = this.ensureWorksheetPullClient();
     const rows = progress.rows;
     let modelUsage: WorksheetModelUsage = { rows: 0, cells: 0, ownedUtf8Bytes: 0 };
@@ -891,6 +912,7 @@ export class XlsxWorkbook {
     try {
       for await (const unit of client.stream(sheetIndex, sheetName)) {
         if (unit.kind === 'preview') {
+          if (unit.worksheet) bindWorksheetPolicy(unit.worksheet, policy);
           progress.preview(unit.worksheet, unit.reason, unit.maxRow, unit.maxCol);
           if (unit.worksheet) {
             setWorksheetPreviewBounds(unit.worksheet, { maxRow: unit.maxRow, maxCol: unit.maxCol });
@@ -902,18 +924,20 @@ export class XlsxWorkbook {
           continue;
         }
         if (unit.kind === 'rows') {
-          const nextUsage = addWorksheetUsage(modelUsage, measureRows(unit.rows));
+          const nextUsage = addWorksheetUsage(modelUsage, measureRows(unit.rows, policy), policy);
           assertWorksheetModelUsage(
             nextUsage,
             'get-worksheet',
             part,
             unit.usage,
+            policy,
           );
           progress.append(unit.rows);
           modelUsage = nextUsage;
           continue;
         }
         const worksheet = unit.worksheet;
+        bindWorksheetPolicy(worksheet, policy);
         worksheet.rows = worksheet.parseError ? [] : rows;
         // Terminal metadata contains no rows, but measure the final public model
         // to cover exact monolithic JSON before its cache admission.
@@ -922,29 +946,32 @@ export class XlsxWorkbook {
           worksheet.parseError
             ? { rows: 0, cells: 0, ownedUtf8Bytes: 0 }
             : modelUsage,
+          policy,
         );
         assertWorksheetModelUsage(
           measured,
           'get-worksheet',
           part,
           unit.usage,
+          policy,
         );
         assertWorksheetJsonBytes(
           measured.jsonBytes,
           'get-worksheet',
           part,
           unit.usage,
+          policy,
         );
         // Resource governance is a library policy, not an OOXML rule. Plan the
         // complete eviction before changing either realm. The worker receives
         // the same victims before terminal ACK, so it cannot retain a stale
         // model or reject a sheet that fits after eviction.
         let remaining = this.retainedSheetUsage;
-        let nextCache = addWorksheetCacheUsage(remaining, measured);
+        let nextCache = addWorksheetCacheUsage(remaining, measured, {}, policy);
         const victims: number[] = [];
         for (const [candidate] of this.sheetCache) {
           try {
-            assertWorksheetCacheUsage(nextCache, 'get-worksheet', part, unit.usage);
+            assertWorksheetCacheUsage(nextCache, 'get-worksheet', part, unit.usage, policy);
             break;
           } catch (error) {
             if (!(error instanceof OoxmlResourceLimitError)) throw error;
@@ -957,11 +984,11 @@ export class XlsxWorkbook {
           // at limit + 1, so subtracting from that candidate loses exact usage.
           remaining = addWorksheetCacheUsage(remaining, {
             rows: 0, cells: 0, ownedUtf8Bytes: 0, jsonBytes: 0,
-          }, previous);
-          nextCache = addWorksheetCacheUsage(remaining, measured);
+          }, previous, policy);
+          nextCache = addWorksheetCacheUsage(remaining, measured, {}, policy);
           victims.push(candidate);
         }
-        assertWorksheetCacheUsage(nextCache, 'get-worksheet', part, unit.usage);
+        assertWorksheetCacheUsage(nextCache, 'get-worksheet', part, unit.usage, policy);
         let pendingEviction: { done: Promise<void>; complete: () => void } | undefined;
         if (victims.length && this._mode === 'worker') {
           let complete!: () => void;

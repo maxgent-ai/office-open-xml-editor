@@ -1,4 +1,9 @@
-import { acquireXlsxNodeSession, type XlsxNodeAcquisition, type XlsxNodeArchive } from '@silurus/ooxml-xlsx/internal/session';
+import {
+  acquireXlsxNodeSession,
+  type XlsxNodeAcquisition,
+  type XlsxNodeArchive,
+} from '@silurus/ooxml-xlsx/internal/session';
+import { normalizeXlsxWorksheetPolicy } from '@silurus/ooxml-core/worker';
 import { WorksheetPullWorker as SourcePullWorker } from '@silurus/ooxml-xlsx/internal/source-pull-worker';
 import { GridGeometry } from '@silurus/ooxml-xlsx/internal/grid-geometry';
 import type { NodeCanvasFactory } from './render.ts';
@@ -18,8 +23,16 @@ export async function openXlsxSource(
 class SourceXlsxWorkbookSession extends XlsxWorkbookSessionImpl {
   constructor(acquired: XlsxNodeAcquisition, signal: AbortSignal | undefined) {
     super(acquired.closeArchive, acquired.archive as XlsxNodeArchive,
-      acquired.workbookIndex, acquired.metrics, acquired.usage, signal);
-    this.pull = new SourcePullWorker(() => acquired.archive);
+      acquired.workbookIndex, acquired.metrics, acquired.usage, signal, acquired.worksheetPolicy);
+    const policy = acquired.worksheetPolicy;
+    this.pull = new SourcePullWorker(
+      () => acquired.archive,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      () => policy,
+    );
   }
 
   override async *worksheetRows(sheetIndex: number): AsyncGenerator<XlsxWorksheetRowChunk, void, void> {
@@ -41,6 +54,8 @@ export async function acquireXlsxInput(
   options: OoxmlNodeSessionOptions & { readonly factory?: NodeCanvasFactory },
   wasmModule: () => WebAssembly.Module,
 ): Promise<XlsxNodeAcquisition> {
+  const worksheetPolicy = normalizeXlsxWorksheetPolicy(options);
+  const snapshot = { ...options, xlsxWorksheetLimits: worksheetPolicy.worksheet };
   const {
     acquireXlsxSessionFromArchive,
     configureHostLayout,
@@ -48,10 +63,10 @@ export async function acquireXlsxInput(
     validateXlsxModelSourceViewDefaults,
   } = await import('@silurus/ooxml-xlsx/internal/model-source-session');
   const input = await resolveNodeSessionInput(
-    buffer, 'xlsx', options, validateXlsxModelSourceArchive,
+    buffer, 'xlsx', snapshot, validateXlsxModelSourceArchive,
   );
   if (input.kind === 'ooxml') {
-    return acquireXlsxNodeSession(input.bytes, wasmModule(), options);
+    return acquireXlsxNodeSession(input.bytes, wasmModule(), snapshot);
   }
   const { opened } = input;
   let maximumDigitWidth: number | undefined;
@@ -79,5 +94,5 @@ export async function acquireXlsxInput(
     sourceByteLength: input.sourceByteLength,
     ...(maximumDigitWidth === undefined ? {} : { layoutMetrics: { maximumDigitWidth } }),
     closeArchive: opened.close,
-  }, options);
+  }, snapshot);
 }

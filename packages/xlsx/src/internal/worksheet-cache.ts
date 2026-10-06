@@ -1,3 +1,7 @@
+import {
+  DEFAULT_XLSX_WORKSHEET_POLICY,
+  type NormalizedXlsxWorksheetPolicy,
+} from '@silurus/ooxml-core/worker';
 import type { Worksheet } from '../types.js';
 import { addWorksheetCacheUsage, type WorksheetCacheUsage } from '../worksheet-resource-limits.js';
 import type { WorksheetViewProjectionCache } from '../worker-protocol.js';
@@ -14,6 +18,7 @@ export function evictWorkerWorksheets(
   usages: Map<number, WorksheetCacheUsage>,
   retained: WorksheetCacheUsage,
   projections: WorksheetViewProjectionCache,
+  policy: NormalizedXlsxWorksheetPolicy = DEFAULT_XLSX_WORKSHEET_POLICY,
 ): WorksheetCacheUsage {
   for (const sheetIndex of sheetIndices) {
     if (!sheets.has(sheetIndex) || !usages.has(sheetIndex)) {
@@ -24,7 +29,7 @@ export function evictWorkerWorksheets(
     const previous = usages.get(sheetIndex)!;
     sheets.delete(sheetIndex);
     usages.delete(sheetIndex);
-    retained = addWorksheetCacheUsage(retained, ZERO_USAGE, previous);
+    retained = addWorksheetCacheUsage(retained, ZERO_USAGE, previous, policy);
     projections.evictSheet(sheetIndex);
   }
   return retained;
