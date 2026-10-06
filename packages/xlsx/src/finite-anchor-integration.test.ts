@@ -14,6 +14,7 @@ function sourceSheet(): Worksheet {
     images: [{
       imagePath: 'xl/media/image.png', mimeType: 'image/png',
       anchorTag: 'twoCellAnchor', editAs: 'oneCell',
+      nativeExtCx: 952500, nativeExtCy: 476250,
       fromCol: 0, fromColOff: 0, fromRow: 0, fromRowOff: 0,
       toCol: 1, toColOff: 0, toRow: 1, toRowOff: 0,
     }],

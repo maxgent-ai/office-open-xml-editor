@@ -47,8 +47,7 @@ import {
 } from './renderer-coordinate-index.js';
 import { GridGeometry, MAX_WORKSHEET_COL } from './internal/grid-geometry.js';
 import type { GridAxisGeometry } from './internal/grid-axis-geometry.js';
-import { resolveCellAnchorRect } from './internal/cell-anchor-geometry.js';
-import { lookupInitialAnchorSize } from './internal/initial-anchor-sizes.js';
+import { resolveWorksheetAnchorRect } from './internal/initial-anchor-sizes.js';
 import { isOptionalImageUnavailable } from './internal/optional-image-fallback.js';
 import { getWorksheetPolicy, inheritWorksheetPolicy } from './worksheet-policy-context.js';
 import { rotatedImageBounds } from './internal/image-anchor-transform.js';
@@ -4413,9 +4412,7 @@ function renderImages(
     // internal/cell-anchor-geometry.ts.
     const {
       x: imgSheetX1, y: imgSheetY1, width: imgW, height: imgH,
-    } = resolveCellAnchorRect(
-      anchor, colAxis, rowAxis, cs, lookupInitialAnchorSize(ws, anchor),
-    );
+    } = resolveWorksheetAnchorRect(ws, anchor, colAxis, rowAxis, cs);
     if (imgW <= 0 || imgH <= 0) continue;
 
     // Translate to canvas coordinates of the scrollable viewport
@@ -4511,8 +4508,8 @@ function renderShapeGroups(
   for (const anchor of anchors) {
     // Same resolver as renderImages. Normalized child transforms below are
     // raw and only scale into this rectangle.
-    const { x: x1, y: y1, width: w, height: h } = resolveCellAnchorRect(
-      anchor, colAxis, rowAxis, cs, lookupInitialAnchorSize(ws, anchor),
+    const { x: x1, y: y1, width: w, height: h } = resolveWorksheetAnchorRect(
+      ws, anchor, colAxis, rowAxis, cs,
     );
     if (w <= 0 || h <= 0) continue;
 

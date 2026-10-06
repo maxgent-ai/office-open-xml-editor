@@ -52,8 +52,8 @@ import {
   HEADER_H,
 } from './renderer.js';
 import { GridGeometry } from './internal/grid-geometry.js';
-import { resolveCellAnchorRect, type CellAnchorSizeFacts } from './internal/cell-anchor-geometry.js';
-import { lookupInitialAnchorSize } from './internal/initial-anchor-sizes.js';
+import type { CellAnchorSizeFacts } from './internal/cell-anchor-geometry.js';
+import { resolveWorksheetAnchorRect } from './internal/initial-anchor-sizes.js';
 import { rotatedImageBounds } from './internal/image-anchor-transform.js';
 import {
   clearOptionalImageUnavailable,
@@ -180,7 +180,7 @@ function anchorDisplaySize(
   const axes = geometry ?? getGridGeometryForWorksheet(ws);
   const { col, row } = axes.axesAtScale(scale);
   // Decode sizing uses the same display rectangle as paint and hit-testing.
-  const rect = resolveCellAnchorRect(anchor, col, row, scale, lookupInitialAnchorSize(ws, anchor));
+  const rect = resolveWorksheetAnchorRect(ws, anchor, col, row, scale);
   return rect.width > 0 && rect.height > 0 ? { width: rect.width, height: rect.height } : null;
 }
 
@@ -205,7 +205,7 @@ function anchorMayIntersectViewport(
   const scale = frame?.scale ?? 1;
   const { col, row } = axes.axesAtScale(scale);
   // Culling uses the same display rectangle as paint (single resolver).
-  const rect = resolveCellAnchorRect(anchor, col, row, scale, lookupInitialAnchorSize(ws, anchor));
+  const rect = resolveWorksheetAnchorRect(ws, anchor, col, row, scale);
   if (rect.width <= 0 || rect.height <= 0) return false;
   const bounds = rotatedImageBounds(
     { x: rect.x, y: rect.y, width: rect.width, height: rect.height },

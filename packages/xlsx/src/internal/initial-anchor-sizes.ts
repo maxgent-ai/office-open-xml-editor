@@ -48,6 +48,7 @@ import {
   type CellAnchorAxis,
   type CellAnchorSizeFacts,
   type RetainedAnchorExtent,
+  type SheetAnchorRect,
 } from './cell-anchor-geometry.js';
 
 /** Anchor family of a compact entry: `ws.images` or `ws.shapeGroups`. */
@@ -316,6 +317,22 @@ export function lookupInitialAnchorSize(
   // Once this projection is bound, an unknown eligible object has no initial
   // size. Ordinary charts are untagged and exit before this lookup.
   return binding.sizes.get(anchor) ?? NON_RENDERABLE;
+}
+
+/** Display rectangle of `anchor` on `projection`: the single resolver applied
+ * with that projection's bound prepared-initial size (if any). Paint, shape
+ * groups, hit/outline projection and culling/decode sizing all call this so
+ * they always agree on the same rectangle. */
+export function resolveWorksheetAnchorRect(
+  projection: Worksheet,
+  anchor: CellAnchorSizeFacts,
+  colAxis: CellAnchorAxis,
+  rowAxis: CellAnchorAxis,
+  scale: number,
+): SheetAnchorRect {
+  return resolveCellAnchorRect(
+    anchor, colAxis, rowAxis, scale, lookupInitialAnchorSize(projection, anchor),
+  );
 }
 
 /** Mark a reference released (workbook reset / viewer destroy). Projections

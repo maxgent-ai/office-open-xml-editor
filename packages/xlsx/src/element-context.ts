@@ -16,8 +16,8 @@ import {
   getGridGeometryForWorksheet,
   sheetAnchoredRectX,
 } from './renderer.js';
-import { resolveCellAnchorRect, type CellAnchorSizeFacts } from './internal/cell-anchor-geometry.js';
-import { lookupInitialAnchorSize } from './internal/initial-anchor-sizes.js';
+import type { CellAnchorSizeFacts } from './internal/cell-anchor-geometry.js';
+import { resolveWorksheetAnchorRect } from './internal/initial-anchor-sizes.js';
 import { inverseImageTransformPoint, rotatedImageBounds } from './internal/image-anchor-transform.js';
 import type { GridAxisGeometry } from './internal/grid-axis-geometry.js';
 import type { XlsxElementContext } from './selection.js';
@@ -69,9 +69,8 @@ export interface XlsxElementOutlineProjection {
 
 function anchoredCanvasRect(anchor: CellAnchorLike, context: AnchoredRectContext): CanvasRect | null {
   // Same resolver as paint and culling, so hit/outline match the painted rect.
-  const sheet = resolveCellAnchorRect(
-    anchor, context.colAxis, context.rowAxis, context.scale,
-    lookupInitialAnchorSize(context.worksheet, anchor),
+  const sheet = resolveWorksheetAnchorRect(
+    context.worksheet, anchor, context.colAxis, context.rowAxis, context.scale,
   );
   const { width, height } = sheet;
   if (width <= 0 || height <= 0) return null;
