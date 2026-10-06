@@ -13,9 +13,10 @@ use ooxml_common::ns::{attr_ns, is_r_ns, is_x_ns, relationships};
 use ooxml_common::package_session::{
     PackageLimitReporter, PackageOperation, PackageSessionHandle, RetainedPackageOperation,
 };
+#[cfg(test)]
+use ooxml_common::resource::HARD_MAX_XLSX_WORKSHEET_CELL_CONTENT_UTF8_BYTES;
 use ooxml_common::resource::{
-    HardResourceLimitKind, ResourceUsage, HARD_MAX_XLSX_WORKSHEET_CELL_CONTENT_UTF8_BYTES,
-    HARD_MAX_XLSX_WORKSHEET_JSON_BYTES,
+    HardResourceLimitKind, ResourceUsage, HARD_MAX_XLSX_WORKSHEET_JSON_BYTES,
 };
 
 #[cfg(test)]

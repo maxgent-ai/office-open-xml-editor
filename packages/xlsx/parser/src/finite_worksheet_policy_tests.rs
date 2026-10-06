@@ -90,8 +90,14 @@ fn rows_and_cells_limits_are_adjustable_and_policy_values_are_finite() {
     assert_adjustable(&cells_error, &[r#""limit":2"#, r#""observed":3"#]);
     assert!(cells_error.to_lowercase().contains("cell"), "{cells_error}");
 
-    assert_eq!(parse(policy(2, 3, BIG, BIG)).expect("exact boundary"), baseline);
-    assert_eq!(parse(policy(3, 4, BIG, BIG)).expect("increased limits"), baseline);
+    assert_eq!(
+        parse(policy(2, 3, BIG, BIG)).expect("exact boundary"),
+        baseline
+    );
+    assert_eq!(
+        parse(policy(3, 4, BIG, BIG)).expect("increased limits"),
+        baseline
+    );
 
     for invalid in [0, MAX_SAFE] {
         assert!(WorksheetResourcePolicy::new(invalid, 1, 1, 1).is_err());
@@ -100,7 +106,10 @@ fn rows_and_cells_limits_are_adjustable_and_policy_values_are_finite() {
         assert!(WorksheetResourcePolicy::new(1, 1, 1, invalid).is_err());
     }
     // Largest safe policy is accepted and does not pre-allocate to its limits.
-    assert_eq!(parse(policy(BIG, BIG, BIG, BIG)).expect("max safe minus one"), baseline);
+    assert_eq!(
+        parse(policy(BIG, BIG, BIG, BIG)).expect("max safe minus one"),
+        baseline
+    );
 }
 
 #[test]
@@ -117,7 +126,10 @@ fn owned_utf8_limit_counts_materialized_strings_and_formula_at_exact_boundary() 
     let error = parse(policy(BIG, BIG, expected - 1, BIG)).expect_err("one under rejects");
     let limit = format!(r#""limit":{}"#, expected - 1);
     assert_adjustable(&error, &[limit.as_str()]);
-    assert!(error.to_lowercase().contains("utf8") || error.to_lowercase().contains("utf-8"), "{error}");
+    assert!(
+        error.to_lowercase().contains("utf8") || error.to_lowercase().contains("utf-8"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -132,8 +144,14 @@ fn worksheet_json_limit_measures_exact_native_serialization_only() {
     let limit = format!(r#""limit":{}"#, exact - 1);
     assert_adjustable(&error, &[limit.as_str(), "worksheet-json"]);
     let payload: serde_json::Value = serde_json::from_str(
-        error.strip_prefix("OOXML_RESOURCE_LIMIT:").expect("typed resource envelope")
-    ).expect("resource error JSON");
+        error
+            .strip_prefix("OOXML_RESOURCE_LIMIT:")
+            .expect("typed resource envelope"),
+    )
+    .expect("resource error JSON");
     assert_eq!(payload["details"]["stage"], "serialization");
-    assert_eq!(payload["details"]["violation"]["resource"], "worksheet-json");
+    assert_eq!(
+        payload["details"]["violation"]["resource"],
+        "worksheet-json"
+    );
 }

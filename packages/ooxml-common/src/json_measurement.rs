@@ -111,7 +111,15 @@ pub fn serialize_json_with_limit<T: Serialize>(
     limit: u64,
     limit_error_prefix: &str,
 ) -> Result<Vec<u8>, String> {
-    serialize_json_with_limit_impl(value, reporter, kind, part, limit, limit_error_prefix, false)
+    serialize_json_with_limit_impl(
+        value,
+        reporter,
+        kind,
+        part,
+        limit,
+        limit_error_prefix,
+        false,
+    )
 }
 
 /// Like `serialize_json_with_limit`, but `limit` is a finite public policy
