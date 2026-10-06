@@ -26,6 +26,7 @@ import {
 } from './renderer.js';
 import { parseA1 } from './a1.js';
 import { inheritWorksheetPreviewBounds } from './internal/worksheet-content-bounds.js';
+import { inheritWorksheetPolicy } from './worksheet-policy-context.js';
 import {
   anchorBaselinePreviewBlocker,
   viewportPreviewBlocker,
@@ -2080,6 +2081,7 @@ class XlsxViewerEngine implements ZoomableViewer {
     if (this.opts.comments === false) {
       const hidden = { ...worksheet, commentRefs: [], comments: [] };
       inheritWorksheetPreviewBounds(worksheet, hidden);
+      inheritWorksheetPolicy(worksheet, hidden);
       return hidden;
     }
     // Keep the pre-customization behavior: XLSX historically exposed resolved
@@ -2100,6 +2102,7 @@ class XlsxViewerEngine implements ZoomableViewer {
       comments: worksheet.comments?.filter((comment) => !resolved.has(comment.cellRef)),
     };
     inheritWorksheetPreviewBounds(worksheet, unresolved);
+    inheritWorksheetPolicy(worksheet, unresolved);
     return unresolved;
   }
 

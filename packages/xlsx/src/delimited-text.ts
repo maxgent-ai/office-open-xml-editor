@@ -1,10 +1,12 @@
-import { utf8Bytes } from '@silurus/ooxml-core/internal/resource-measurement';
-import type { ParsedWorkbook, Row, Styles, Worksheet } from './types.js';
 import {
-  XLSX_MAX_MATERIALIZED_CELLS,
+  DEFAULT_XLSX_WORKSHEET_POLICY,
+  type NormalizedXlsxWorksheetPolicy,
+} from '@silurus/ooxml-core/worker';
+import { cappedAdd, utf8Bytes } from '@silurus/ooxml-core/internal/resource-measurement';
+import type { ParsedWorkbook, Row, Styles, Worksheet } from './types.js';
+import { bindWorksheetPolicy } from './worksheet-policy-context.js';
+import {
   XLSX_MAX_MATERIALIZED_JSON_BYTES,
-  XLSX_MAX_MATERIALIZED_OWNED_UTF8_BYTES,
-  XLSX_MAX_MATERIALIZED_ROWS,
   assertWorksheetJsonBytes,
   assertWorksheetModelUsage,
   measureWorksheet,
@@ -49,6 +51,10 @@ export interface ResolvedDelimitedTextOptions {
 }
 
 const DELIMITED_TEXT_OPERATION = 'load-delimited-text';
+
+/** UTF-8 bytes of the retained `'text'` value discriminator that every
+ * non-empty delimited field carries in its Cell value. */
+const DELIMITED_TEXT_CELL_DISCRIMINATOR_UTF8_BYTES = 4;
 
 /** Hard input ceiling. Parsing can expand delimiters into a larger worksheet
  * model, so this is only the first of the existing worksheet admission gates. */
@@ -133,8 +139,10 @@ export function resolveDelimitedTextOptions(
 export function parseDelimitedWorksheet(
   source: ArrayBuffer,
   options: ResolvedDelimitedTextOptions,
+  policy: NormalizedXlsxWorksheetPolicy = DEFAULT_XLSX_WORKSHEET_POLICY,
 ): Readonly<{ workbook: ParsedWorkbook; worksheet: Worksheet }> {
   assertDelimitedTextSourceBytes(source.byteLength);
+  const limits = policy.worksheet;
 
   let text: string;
   try {
@@ -152,6 +160,11 @@ export function parseDelimitedWorksheet(
   let fieldChunks: string[] | undefined;
   let rowIndex = 1;
   let columnIndex = 1;
+  /* Independent pre-expansion parsed-field guard. It counts every logical
+   * field, blanks included, against the same public maxCells budget, so a
+   * delimiter-only source cannot expand without bound before the terminal
+   * admission. This is distinct from the terminal Cell record count, which
+   * only sees non-empty fields retained as Cell records. */
   let logicalCellCount = 0;
   let retainedUtf8Bytes = 0;
   let quoted = false;
@@ -168,14 +181,14 @@ export function parseDelimitedWorksheet(
   };
 
   const finishField = (): void => {
-    logicalCellCount++;
-    if (logicalCellCount > XLSX_MAX_MATERIALIZED_CELLS) {
+    logicalCellCount = cappedAdd(logicalCellCount, 1, limits.maxCells);
+    if (logicalCellCount > limits.maxCells) {
       throw worksheetLimitError(
         DELIMITED_TEXT_OPERATION,
         undefined,
         'worksheet-model',
         'cells',
-        XLSX_MAX_MATERIALIZED_CELLS,
+        limits.maxCells,
         logicalCellCount,
       );
     }
@@ -186,17 +199,19 @@ export function parseDelimitedWorksheet(
     }
     const fieldText = fieldChunks ? fieldChunks.join('') + field : field;
     if (fieldText !== '') {
-      retainedUtf8Bytes += utf8Bytes(
-        fieldText,
-        XLSX_MAX_MATERIALIZED_OWNED_UTF8_BYTES + 1,
+      const maxOwned = limits.maxOwnedUtf8Bytes;
+      retainedUtf8Bytes = cappedAdd(
+        cappedAdd(retainedUtf8Bytes, DELIMITED_TEXT_CELL_DISCRIMINATOR_UTF8_BYTES, maxOwned),
+        utf8Bytes(fieldText, maxOwned + 1),
+        maxOwned,
       );
-      if (retainedUtf8Bytes > XLSX_MAX_MATERIALIZED_OWNED_UTF8_BYTES) {
+      if (retainedUtf8Bytes > maxOwned) {
         throw worksheetLimitError(
           DELIMITED_TEXT_OPERATION,
           undefined,
           'worksheet-cell-content',
           'owned-utf8-bytes',
-          XLSX_MAX_MATERIALIZED_OWNED_UTF8_BYTES,
+          maxOwned,
           retainedUtf8Bytes,
         );
       }
@@ -213,13 +228,13 @@ export function parseDelimitedWorksheet(
   };
 
   const finishRow = (): void => {
-    if (rowIndex > XLSX_MAX_MATERIALIZED_ROWS) {
+    if (rowIndex > limits.maxRows) {
       throw worksheetLimitError(
         DELIMITED_TEXT_OPERATION,
         undefined,
         'worksheet-model',
         'rows',
-        XLSX_MAX_MATERIALIZED_ROWS,
+        limits.maxRows,
         rowIndex,
       );
     }
@@ -302,9 +317,16 @@ export function parseDelimitedWorksheet(
     defaultFontFamily: 'Calibri',
     defaultFontSize: 11,
   };
-  const measured = measureWorksheet(worksheet);
-  assertWorksheetModelUsage(measured, DELIMITED_TEXT_OPERATION, undefined);
-  assertWorksheetJsonBytes(measured.jsonBytes, DELIMITED_TEXT_OPERATION, undefined);
+  const measured = measureWorksheet(worksheet, policy);
+  assertWorksheetModelUsage(measured, DELIMITED_TEXT_OPERATION, undefined, undefined, policy);
+  assertWorksheetJsonBytes(
+    measured.jsonBytes,
+    DELIMITED_TEXT_OPERATION,
+    undefined,
+    undefined,
+    policy,
+  );
+  bindWorksheetPolicy(worksheet, policy);
 
   const workbook: ParsedWorkbook = {
     workbook: {

@@ -60,12 +60,14 @@ export function formatCellValueWithColor(
   date1904 = false,
 ): FormattedCell {
   // Resolve the effective format once so both the numeric and text paths
-  // honour the same precedence: CF dxf numFmt > style numFmt (§18.8.17).
+  // honour the same precedence: CF dxf numFmt > style numFmt (§18.8.15).
   const xf = styles.cellXfs[cell.styleIndex ?? 0];
   const styleNumFmtId = xf?.numFmtId ?? 0;
   const styleFmt = styles.numFmts?.find(f => f.numFmtId === styleNumFmtId)?.formatCode ?? null;
   const effectiveFmtId = cfNumFmt?.numFmtId ?? styleNumFmtId;
-  const effectiveFmt = cfNumFmt?.formatCode ?? styleFmt;
+  // A matched differential format replaces the id/code pair. An absent CF
+  // code implies its built-in format, rather than inheriting the base code.
+  const effectiveFmt = cfNumFmt ? cfNumFmt.formatCode : styleFmt;
 
   // Non-numeric cells still need to honour the 4th format section (text).
   // §18.8.30: format sections are positive;negative;zero;text. An empty text
@@ -264,15 +266,17 @@ function applyFormat(num: number, numFmtId: number, formatCode: string | null, d
   if (numFmtId === 14 && !formatCode) {
     return dateFormattedCell(formatLocalizedExcelShortDate(num, date1904), num, date1904);
   }
-  // Built-in date/time numFmtIds (ECMA-376 §18.8.30 table)
-  const builtinFmt = BUILTIN_DATE_FMT[numFmtId];
-  if (builtinFmt) return dateFormattedCell(formatExcelDateTime(num, builtinFmt, date1904), num, date1904);
   // ECMA-376 §18.8.30: "General" is the reserved General number format regardless
   // of numFmtId. LibreOffice writes a custom numFmt (id ≥ 164) with
   // formatCode="General"; tokenizing it as a literal pattern would render the
   // word "General" instead of the value (issue #358).
   if (formatCode && formatCode.trim().toLowerCase() === 'general') return { text: formatGeneralNumber(num) };
+  // §18.8.30 implies a built-in code when no numFmt is authored. An explicit
+  // code (including a differential format layered by §18.8.15) takes precedence
+  // over that fallback, even when its numFmtId also names a built-in format.
   if (formatCode) return applyFormatCode(num, formatCode, date1904);
+  const builtinFmt = BUILTIN_DATE_FMT[numFmtId];
+  if (builtinFmt) return dateFormattedCell(formatExcelDateTime(num, builtinFmt, date1904), num, date1904);
   switch (numFmtId) {
     // Built-in numeric numFmtIds without an explicit formatCode. Route the ones
     // that have a well-defined pattern (§18.8.30 p.1776 "All Languages" table)

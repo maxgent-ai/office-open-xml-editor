@@ -6,18 +6,24 @@ use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 
 use ooxml_common::depth::parse_guarded;
-use ooxml_common::json_measurement::{measure_json, serialize_json_with_limit};
+use ooxml_common::json_measurement::{
+    measure_json, serialize_json_with_limit, serialize_json_with_policy_limit,
+};
 use ooxml_common::ns::{attr_ns, is_r_ns, is_x_ns, relationships};
 use ooxml_common::package_session::{
     PackageLimitReporter, PackageOperation, PackageSessionHandle, RetainedPackageOperation,
 };
+#[cfg(test)]
+use ooxml_common::resource::HARD_MAX_XLSX_WORKSHEET_CELL_CONTENT_UTF8_BYTES;
 use ooxml_common::resource::{
-    HardResourceLimitKind, ResourceUsage, HARD_MAX_XLSX_WORKSHEET_CELLS,
-    HARD_MAX_XLSX_WORKSHEET_CELL_CONTENT_UTF8_BYTES, HARD_MAX_XLSX_WORKSHEET_JSON_BYTES,
-    HARD_MAX_XLSX_WORKSHEET_ROWS,
+    HardResourceLimitKind, ResourceUsage, HARD_MAX_XLSX_WORKSHEET_JSON_BYTES,
 };
 
+#[cfg(test)]
+mod finite_worksheet_policy_tests;
 mod markdown;
+mod worksheet_resource_policy;
+pub use worksheet_resource_policy::WorksheetResourcePolicy;
 mod pivot;
 use pivot::*;
 
@@ -64,6 +70,12 @@ use table::*;
 pub(crate) struct XlsxZip {
     session: PackageSessionHandle,
     operation: RetainedPackageOperation,
+    /// Per-archive worksheet policy. It starts as the default and is never
+    /// module-global.
+    worksheet_policy: WorksheetResourcePolicy,
+    /// Set when the policy is configured or when the first operation is
+    /// attempted. After that, the policy is immutable.
+    worksheet_policy_locked: bool,
 }
 
 impl XlsxZip {
@@ -73,7 +85,32 @@ impl XlsxZip {
     }
 
     fn begin_operation(&mut self, name: &str) -> Result<(), String> {
+        // The first attempted operation freezes the worksheet policy, even if
+        // the operation itself then fails to start.
+        self.worksheet_policy_locked = true;
         self.operation.begin(&self.session, name)
+    }
+
+    /// Configure the worksheet policy once, after admission and before any
+    /// operation. Later calls are refused, including attempts to reconfigure.
+    /// Operations are still allowed after configuration.
+    pub(crate) fn configure_worksheet_policy(
+        &mut self,
+        policy: WorksheetResourcePolicy,
+    ) -> Result<(), String> {
+        if self.worksheet_policy_locked {
+            return Err(
+                "worksheet resource policy is immutable: it was already configured or an archive operation has started"
+                    .to_string(),
+            );
+        }
+        self.worksheet_policy = policy;
+        self.worksheet_policy_locked = true;
+        Ok(())
+    }
+
+    fn worksheet_policy(&self) -> WorksheetResourcePolicy {
+        self.worksheet_policy
     }
 
     fn usage(&self) -> ResourceUsage {
@@ -165,14 +202,19 @@ fn serialize_worksheet_bounded(
     part: &str,
     worksheet: &Worksheet,
 ) -> Result<Vec<u8>, String> {
+    // maxJsonBytes charges the exact UTF-8 bytes that serde_json emits for the
+    // worksheet graph. It does not promise byte parity with JS number
+    // formatting. The limit is per-archive and adjustable, so a breach reports
+    // configurable:true.
+    let max_json_bytes = archive.worksheet_policy().max_json_bytes();
     let reporter = archive.operation()?.limit_reporter()?;
-    serialize_json_with_limit(
+    serialize_json_with_policy_limit(
         worksheet,
         Some(&reporter),
         HardResourceLimitKind::WorksheetJsonBytes,
         Some(part),
-        HARD_MAX_XLSX_WORKSHEET_JSON_BYTES,
-        "worksheet JSON exceeds its hard ceiling",
+        max_json_bytes,
+        "worksheet JSON exceeds its configured limit",
     )
 }
 
@@ -249,6 +291,8 @@ fn open_zip_with_policy(
     .map(|session| XlsxZip {
         session,
         operation: RetainedPackageOperation::new("xlsx"),
+        worksheet_policy: WorksheetResourcePolicy::default(),
+        worksheet_policy_locked: false,
     })
     .map_err(ooxml_common::zip::tag_container_error)
 }
@@ -1406,6 +1450,7 @@ fn stream_sheet_data_from_archive(
     shared_strings: Rc<[SharedString]>,
     theme_colors: Rc<[String]>,
 ) -> Result<StreamedSheetData, String> {
+    let policy = archive.worksheet_policy();
     let reporter = archive.operation()?.limit_reporter()?;
     let mut cursor =
         archive.open_worksheet_cursor(part, Rc::clone(&shared_strings), theme_colors)?;
@@ -1441,22 +1486,25 @@ fn stream_sheet_data_from_archive(
                     .owned_utf8_bytes
                     .checked_add(batch_strings)
                     .ok_or_else(|| "worksheet string measurement overflow".to_string())?;
-                reporter.observe_hard_limit(
+                // Per-archive adjustable limits are charged before `extend`.
+                // They report configurable:true for both the default and an
+                // override.
+                reporter.observe_policy_limit(
                     HardResourceLimitKind::WorksheetModelRows,
                     Some(part),
-                    HARD_MAX_XLSX_WORKSHEET_ROWS,
+                    policy.max_rows(),
                     next_rows,
                 )?;
-                reporter.observe_hard_limit(
+                reporter.observe_policy_limit(
                     HardResourceLimitKind::WorksheetModelCells,
                     Some(part),
-                    HARD_MAX_XLSX_WORKSHEET_CELLS,
+                    policy.max_cells(),
                     next_cells,
                 )?;
-                reporter.observe_hard_limit(
+                reporter.observe_policy_limit(
                     HardResourceLimitKind::WorksheetCellContentOwnedUtf8Bytes,
                     Some(part),
-                    HARD_MAX_XLSX_WORKSHEET_CELL_CONTENT_UTF8_BYTES,
+                    policy.max_owned_utf8_bytes(),
                     next_strings,
                 )?;
                 usage.rows = next_rows;
@@ -1680,8 +1728,15 @@ fn parse_projected_worksheet(
             "sheetFormatPr" if is_x_ns(node.tag_name().namespace()) => {
                 // ECMA-376 §18.3.1.81: baseColWidth describes implicit columns
                 // only when the sheet does not supply defaultColWidth.
+                // CT_SheetFormatPr (Strict and Transitional) declares
+                // baseColWidth default="8": an omitted attribute on an existing
+                // element means 8. A malformed explicit value stays None. When
+                // the element itself is absent, base stays None (width 8.43).
                 if node.attribute("defaultColWidth").is_none() {
-                    base_col_width = node.attribute("baseColWidth").and_then(|s| s.parse().ok());
+                    base_col_width = match node.attribute("baseColWidth") {
+                        None => Some(8),
+                        Some(s) => s.parse().ok(),
+                    };
                 }
                 if let Some(v) = node
                     .attribute("defaultColWidth")
@@ -3696,6 +3751,10 @@ fn serialize_cursor_finished(
         "worksheet JSON exceeds its hard ceiling",
     )
 }
+// The cursor preview and finished envelopes above deliberately keep the
+// independent hard 64 MiB transport/shell cap (configurable:false). They measure
+// envelope bytes, not the worksheet graph, so the adjustable maxJsonBytes policy
+// is never passed to them.
 
 #[wasm_bindgen]
 impl XlsxArchive {
@@ -3733,6 +3792,24 @@ impl XlsxArchive {
             terminal_awaiting_ack: false,
             last_cursor_usage: None,
         })
+    }
+
+    /// Configure the per-archive worksheet limits once. This must happen after
+    /// construction and before any parse or cursor operation. Later calls are
+    /// refused. The constructor and the ZIP scalar limits do not change.
+    pub fn set_worksheet_limits(
+        &mut self,
+        max_rows: u64,
+        max_cells: u64,
+        max_owned_utf8_bytes: u64,
+        max_json_bytes: u64,
+    ) -> Result<(), JsValue> {
+        let policy =
+            WorksheetResourcePolicy::new(max_rows, max_cells, max_owned_utf8_bytes, max_json_bytes)
+                .map_err(|error| JsValue::from_str(&error))?;
+        self.archive
+            .configure_worksheet_policy(policy)
+            .map_err(|error| JsValue::from_str(&error))
     }
 
     /// Parse (once) and return the workbook-level shared parts, caching them for
@@ -4290,6 +4367,27 @@ fn to_markdown_from_archive(archive: &mut XlsxZip) -> Result<String, String> {
 /// native and WASM paths can never drift.
 pub fn parse_sheet_native(data: &[u8], sheet_index: u32, name: &str) -> Result<String, String> {
     let mut archive = open_workbook_package(data.to_vec(), None, None, None)?;
+    parse_sheet_native_in(&mut archive, sheet_index, name)
+}
+
+/// Same as `parse_sheet_native`, but with an explicit per-archive worksheet
+/// policy. The policy is configured after admission and before the operation.
+pub fn parse_sheet_native_with_worksheet_limits(
+    data: &[u8],
+    sheet_index: u32,
+    name: &str,
+    policy: WorksheetResourcePolicy,
+) -> Result<String, String> {
+    let mut archive = open_workbook_package(data.to_vec(), None, None, None)?;
+    archive.configure_worksheet_policy(policy)?;
+    parse_sheet_native_in(&mut archive, sheet_index, name)
+}
+
+fn parse_sheet_native_in(
+    archive: &mut XlsxZip,
+    sheet_index: u32,
+    name: &str,
+) -> Result<String, String> {
     archive.run_operation("parse-sheet", |archive| {
         let shared = WorkbookShared::load(archive)?;
         let json = parse_sheet_with(archive, &shared, sheet_index, name)?;
@@ -4305,6 +4403,27 @@ pub fn parse_sheet_model_native(
     name: &str,
 ) -> Result<xlsx_model::Worksheet, String> {
     let mut archive = open_workbook_package(data.to_vec(), None, None, None)?;
+    parse_sheet_model_native_in(&mut archive, sheet_index, name)
+}
+
+/// Same as `parse_sheet_model_native`, but with an explicit per-archive
+/// worksheet policy.
+pub fn parse_sheet_model_native_with_worksheet_limits(
+    data: &[u8],
+    sheet_index: u32,
+    name: &str,
+    policy: WorksheetResourcePolicy,
+) -> Result<xlsx_model::Worksheet, String> {
+    let mut archive = open_workbook_package(data.to_vec(), None, None, None)?;
+    archive.configure_worksheet_policy(policy)?;
+    parse_sheet_model_native_in(&mut archive, sheet_index, name)
+}
+
+fn parse_sheet_model_native_in(
+    archive: &mut XlsxZip,
+    sheet_index: u32,
+    name: &str,
+) -> Result<xlsx_model::Worksheet, String> {
     archive.run_operation("parse-sheet", |archive| {
         let shared = WorkbookShared::load(archive)?;
         let (worksheet, part) = parse_sheet_model_with(archive, &shared, sheet_index, name)?;
@@ -4744,6 +4863,75 @@ mod sheet_view_tests {
         let (ws, _) = parse_worksheet(&explicit, &[], &[], "Sheet1").expect("worksheet parses");
         assert_eq!(ws.base_col_width, None);
         assert_eq!(ws.default_col_width, 12.5);
+    }
+
+    #[test]
+    fn sheet_format_pr_omitted_base_col_width_uses_schema_default_8() {
+        // CT_SheetFormatPr: baseColWidth is xsd:unsignedInt, use="optional",
+        // default="8" (Strict and Transitional). defaultColWidth is optional
+        // with no schema default. sheetFormatPr itself is minOccurs="0".
+        const STRICT_NS: &str = "http://purl.oclc.org/ooxml/spreadsheetml/main";
+
+        // sheetFormatPr is present, and both baseColWidth and
+        // defaultColWidth are omitted. The effective base must equal an
+        // explicit baseColWidth="8" under both namespaces. Explicit column
+        // widths must survive alongside it.
+        for ns in [NS, STRICT_NS] {
+            let omitted = format!(
+                r#"<worksheet xmlns="{ns}"><sheetFormatPr defaultRowHeight="15"/><cols><col min="1" max="1" width="12" customWidth="1"/></cols><sheetData/></worksheet>"#
+            );
+            let explicit8 = format!(
+                r#"<worksheet xmlns="{ns}"><sheetFormatPr baseColWidth="8" defaultRowHeight="15"/><cols><col min="1" max="1" width="12" customWidth="1"/></cols><sheetData/></worksheet>"#
+            );
+            let (ws_omitted, _) =
+                parse_worksheet(&omitted, &[], &[], "Sheet1").expect("worksheet parses");
+            let (ws_explicit, _) =
+                parse_worksheet(&explicit8, &[], &[], "Sheet1").expect("worksheet parses");
+
+            assert_eq!(
+                ws_omitted.col_widths.get(&1).copied(),
+                Some(12.0),
+                "ns={ns}"
+            );
+            assert_eq!(
+                ws_explicit.col_widths.get(&1).copied(),
+                Some(12.0),
+                "ns={ns}"
+            );
+
+            assert_eq!(ws_explicit.base_col_width, Some(8), "ns={ns}");
+            assert_eq!(
+                ws_omitted.base_col_width, ws_explicit.base_col_width,
+                "omitted baseColWidth must equal explicit 8; ns={ns}"
+            );
+            assert_eq!(
+                ws_omitted.default_col_width, ws_explicit.default_col_width,
+                "ns={ns}"
+            );
+        }
+
+        // Control: sheetFormatPr absent. The attribute default does not apply.
+        let absent = format!(r#"<worksheet xmlns="{NS}"><sheetData/></worksheet>"#);
+        let (ws, _) = parse_worksheet(&absent, &[], &[], "Sheet1").expect("worksheet parses");
+        assert_eq!(ws.base_col_width, None);
+        assert_eq!(ws.default_col_width, 8.43);
+
+        // Control: authored defaultColWidth takes priority, so base stays unset.
+        for default in [0.0, 12.5] {
+            let authored = format!(
+                r#"<worksheet xmlns="{NS}"><sheetFormatPr defaultColWidth="{default}" defaultRowHeight="15"/><sheetData/></worksheet>"#
+            );
+            let (ws, _) = parse_worksheet(&authored, &[], &[], "Sheet1").expect("worksheet parses");
+            assert_eq!(ws.base_col_width, None);
+            assert_eq!(ws.default_col_width, default);
+        }
+
+        // Control: explicit zero is a real value and must not be replaced by 8.
+        let zero = format!(
+            r#"<worksheet xmlns="{NS}"><sheetFormatPr baseColWidth="0" defaultRowHeight="15"/><sheetData/></worksheet>"#
+        );
+        let (ws, _) = parse_worksheet(&zero, &[], &[], "Sheet1").expect("worksheet parses");
+        assert_eq!(ws.base_col_width, Some(0));
     }
 
     /// The serialized worksheet JSON is deterministic: `colWidths` keys come out

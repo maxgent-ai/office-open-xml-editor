@@ -59,6 +59,7 @@ import {
   clearOptionalImageUnavailable,
   markOptionalImageUnavailable,
 } from './internal/optional-image-fallback.js';
+import { getWorksheetPolicy } from './worksheet-policy-context.js';
 
 /** Internal viewer-to-renderer commit latch. It is intentionally not re-exported
  * from the package API: standalone renderer callers do not own viewer lifecycle. */
@@ -748,7 +749,10 @@ export function worksheetWithAutoRowHeights(
 ): Worksheet {
   if (hasPreparedAutoRowHeights(source)) return source;
   const cached = autoHeightProjectionCache.get(source);
-  if (cached) return cached;
+  // Only reuse the projection if the source is still bound to the same policy
+  // it was built under. After an internal rebind, rebuild via
+  // inheritSheetRenderCache so the new limits are validated.
+  if (cached && getWorksheetPolicy(cached) === getWorksheetPolicy(source)) return cached;
   const projection: Worksheet = {
     ...source,
     rowHeights: { ...source.rowHeights },

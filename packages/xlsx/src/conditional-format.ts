@@ -3,6 +3,7 @@ import { dxfFontToggle } from './dxf-font.js';
 import { decodeCfLiteral, decodeCfOperand, type CfOperandValue } from './cf-operand.js';
 import { evalFormulaToBool } from './formula.js';
 import { buildCellCoordinateIndex } from './renderer-coordinate-index.js';
+import { getWorksheetPolicy } from './worksheet-policy-context.js';
 
 // ────────────────────────────────────────────────────────────────
 // Conditional formatting
@@ -189,6 +190,7 @@ function createCellIndex(worksheet: Worksheet): Map<string, Cell> {
   return buildCellCoordinateIndex(worksheet.rows, {
     resource: 'worksheet-cell-index',
     operation: 'index-worksheet-cells',
+    limit: getWorksheetPolicy(worksheet).maxCoordinateIndexEntries,
   });
 }
 

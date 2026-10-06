@@ -7,6 +7,10 @@ import {
   decodeOoxmlResourceUsage,
   resourcePolicyForWasm,
   serializeWorkerError,
+  normalizeXlsxWorksheetPolicy,
+  xlsxWorksheetPolicyForWasm,
+  DEFAULT_XLSX_WORKSHEET_POLICY,
+  type NormalizedXlsxWorksheetPolicy,
   type PullSessionCommand,
 } from '@silurus/ooxml-core/worker';
 import type { WorkerRequest, WorkerResponse } from './types.js';
@@ -37,6 +41,8 @@ const host = new WasmParserHost<XlsxArchive>(init, {
   reinit,
 });
 let source: WorkerWorksheetSourceOwner<XlsxArchive> | undefined;
+// Per-document worksheet policy, captured when a parse claims a new document.
+let worksheetPolicy: NormalizedXlsxWorksheetPolicy = DEFAULT_XLSX_WORKSHEET_POLICY;
 const worksheetPull = new WorksheetPullWorker(
   () => source?.cursor() ?? host.archive,
   undefined,
@@ -47,6 +53,8 @@ const worksheetPull = new WorksheetPullWorker(
     return host.run(() => operation(archive));
   },
   undefined,
+  undefined,
+  () => worksheetPolicy,
 );
 
 self.onmessage = async (e: MessageEvent<WorkerRequest | PullSessionCommand<number>>) => {
@@ -73,6 +81,11 @@ self.onmessage = async (e: MessageEvent<WorkerRequest | PullSessionCommand<numbe
   const id = req.id;
   if (req.type === 'openSheetSession') worksheetPull.reserveOpen(req);
   try {
+    // Validate the request policy before any reset / instance / source work.
+    // Older requests without a policy resolve to the defaults.
+    const parsePolicy = req.type === 'parse'
+      ? normalizeXlsxWorksheetPolicy({ xlsxWorksheetLimits: req.worksheetPolicy?.worksheet })
+      : undefined;
     if (req.type === 'openSheetSession') {
       if (!source) await host.ensureReady();
       if (source?.cursor()) source.execute((archive) => archive.assert_healthy());
@@ -105,6 +118,7 @@ self.onmessage = async (e: MessageEvent<WorkerRequest | PullSessionCommand<numbe
     if (req.type === 'parse') {
       source?.closeModelSource();
       source = undefined;
+      worksheetPolicy = parsePolicy ?? DEFAULT_XLSX_WORKSHEET_POLICY;
       if (req.source) {
         host.disposeArchive();
         if (!req.sourceOwnerUrl) throw new TypeError('XLSX source owner URL is missing');
@@ -123,7 +137,9 @@ self.onmessage = async (e: MessageEvent<WorkerRequest | PullSessionCommand<numbe
         const bytes = new Uint8Array(req.data);
         host.run(() => {
           const opened = new XlsxArchive(bytes, maxEntry, maxTotal, maxEntries);
+          // Adopt first so the host owns cleanup if the setter throws/traps.
           host.setArchive(opened);
+          opened.set_worksheet_limits(...xlsxWorksheetPolicyForWasm(worksheetPolicy));
           return opened;
         });
       }

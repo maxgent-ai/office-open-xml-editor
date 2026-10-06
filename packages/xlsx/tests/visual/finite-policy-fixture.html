@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><style>body { margin: 0 } canvas { width: 800px; height: 360px; }</style></head>
+<body><canvas id="sheet" width="800" height="360"></canvas>
+<script type="module">
+import { XlsxWorkbook, XlsxSheetViewer } from '/src/index.ts';
+
+window.runFinitePolicyCase = async ({ mode, kind, override }) => {
+  const rows = kind === 'rows' ? 100001 : 12550;
+  const columns = kind === 'rows' ? 1 : 20;
+  const tail = kind === 'rows' ? 'A100001' : 'T12550';
+  const timings = {};
+  const heapSamples = [];
+  const sample = (name) => {
+    const bytes = performance.memory?.usedJSHeapSize;
+    if (bytes !== undefined) heapSamples.push({ name, bytes });
+  };
+  const time = async (name, action) => {
+    const start = performance.now();
+    const value = await action();
+    timings[name] = performance.now() - start;
+    sample(name);
+    return value;
+  };
+  const canvas = document.getElementById('sheet');
+  // Keep the viewer's worker bitmaprenderer surface untouched by 2D probes.
+  const paintCanvas = document.createElement('canvas');
+  paintCanvas.width = 800; paintCanvas.height = 360;
+  let workbook;
+  let viewer;
+  let report;
+  try {
+    sample('before');
+    workbook = await time('loadIndex', () => XlsxWorkbook.load(`/finite-${kind}.xlsx`, {
+      mode,
+      ...(override ? { xlsxWorksheetLimits: kind === 'rows' ? { maxRows: 110000 } : { maxCells: 300000 } } : {}),
+      onResourceMetrics: (value) => { report = value; },
+    }));
+    let worksheet;
+    try {
+      worksheet = await time('terminalModel', () => workbook.getWorksheet(0));
+    } catch (error) {
+      return { status: 'refused', code: error.code, details: error.details, timings, heapSamples };
+    }
+    const lastCell = worksheet.rows.at(-1)?.cells.at(-1);
+    const tailText = workbook.cellText(worksheet, lastCell);
+    const paint = async (row, col) => {
+      const bitmap = await workbook.renderViewportToBitmap(0, { row, col, rows: 12, cols: 6 }, {
+        width: 800, height: 360, dpr: 1,
+      });
+      paintCanvas.getContext('2d').drawImage(bitmap, 0, 0);
+      bitmap.close();
+    };
+    await time('firstPaint', () => paint(1, 1));
+    await time('repaint', () => paint(1, 1));
+    await time('tailPaint', () => paint(rows - 5, Math.max(1, columns - 3)));
+    const firstImage = paintCanvas.toDataURL();
+    viewer = XlsxSheetViewer.fromWorkbook(canvas, workbook, { showScrollbars: false });
+    await viewer.goToSheet(0);
+    await time('tailScroll', () => viewer.scrollToCell(tail, { align: 'end' }));
+    viewer.setSelection(tail);
+    const selection = viewer.getSelectionContext();
+    const matches = await time('find', () => viewer.findText(tailText));
+    const copy = await time('copy', () => viewer.copySelection());
+    await time('returnScroll', () => viewer.scrollToCell('A1', { align: 'start' }));
+    await time('secondTailScroll', () => viewer.scrollToCell(tail, { align: 'end' }));
+    return {
+      status: 'ok', rows: worksheet.rows.length,
+      cells: worksheet.rows.reduce((sum, row) => sum + row.cells.length, 0),
+      tail, tailText, selection, matchLocations: matches.map((match) => match.location), copy,
+      offset: viewer.getViewportOffset(), timings, heapSamples,
+      resolvedLimits: report?.policy.xlsxWorksheetLimits,
+      image: firstImage,
+    };
+  } finally {
+    viewer?.destroy();
+    workbook?.destroy();
+  }
+};
+</script></body></html>

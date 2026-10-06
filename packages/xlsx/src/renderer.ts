@@ -50,6 +50,7 @@ import type { GridAxisGeometry } from './internal/grid-axis-geometry.js';
 import { resolveCellAnchorRect } from './internal/cell-anchor-geometry.js';
 import { lookupInitialAnchorSize } from './internal/initial-anchor-sizes.js';
 import { isOptionalImageUnavailable } from './internal/optional-image-fallback.js';
+import { getWorksheetPolicy, inheritWorksheetPolicy } from './worksheet-policy-context.js';
 import { rotatedImageBounds } from './internal/image-anchor-transform.js';
 import {
   MDW_FALLBACK,
@@ -1734,6 +1735,7 @@ export interface TableCellStyle {
 export function buildTableStyleMap(worksheet: Worksheet): Map<string, TableCellStyle> {
   const map = new Map<string, TableCellStyle>();
   const identity = coordinateIndexIdentity(
+    worksheet,
     'worksheet-table-style-index',
     'expand-styled-table-coordinates',
   );
@@ -1857,6 +1859,7 @@ export function tableOverlayBorder(
 function buildSparklineMap(worksheet: Worksheet): Map<string, SparklineModel> {
   const map = new Map<string, SparklineModel>();
   const identity = coordinateIndexIdentity(
+    worksheet,
     'worksheet-sparkline-index',
     'index-sparkline-coordinates',
   );
@@ -3007,6 +3010,8 @@ function renderQuadrant(
  *  cell-Map rebuild and a conditional-formatting recompile per frame. */
 interface SheetRenderCache {
   rowCount: number;
+  /** Bound per-index entry limit these indexes were built under. */
+  coordinateIndexLimit: number;
   cellMap: Map<string, Cell>;
   nonEmptyColsByRow: Map<number, readonly number[]>;
   cfContext: CfContext;
@@ -3028,17 +3033,34 @@ export function invalidateSheetRenderCache(worksheet: Worksheet): void {
 }
 
 function coordinateIndexIdentity(
+  worksheet: Worksheet,
   resource: string,
   operation: string,
 ): CoordinateIndexIdentity {
-  return { resource, operation };
+  return {
+    resource,
+    operation,
+    limit: getWorksheetPolicy(worksheet).maxCoordinateIndexEntries,
+  };
 }
 
 export function getSheetRenderCache(worksheet: Worksheet): SheetRenderCache {
+  const coordinateIndexLimit = getWorksheetPolicy(worksheet).maxCoordinateIndexEntries;
   const cached = sheetRenderCache.get(worksheet);
-  if (cached && cached.rowCount === worksheet.rows.length) return cached;
+  if (
+    cached &&
+    cached.rowCount === worksheet.rows.length &&
+    cached.coordinateIndexLimit === coordinateIndexLimit
+  ) {
+    return cached;
+  }
+  if (cached) sheetRenderCache.delete(worksheet);
 
-  const cellIdentity = coordinateIndexIdentity('worksheet-cell-index', 'index-worksheet-cells');
+  const cellIdentity = coordinateIndexIdentity(
+    worksheet,
+    'worksheet-cell-index',
+    'index-worksheet-cells',
+  );
   const cellMap = buildCellCoordinateIndex(worksheet.rows, cellIdentity);
   const nonEmptyColsByRow = new Map<number, readonly number[]>();
   for (const row of worksheet.rows) {
@@ -3054,10 +3076,12 @@ export function getSheetRenderCache(worksheet: Worksheet): SheetRenderCache {
   const mergeSkipSet = new Set<string>();
   const mergeAnchorSet = new Set<string>();
   const mergeAnchorIdentity = coordinateIndexIdentity(
+    worksheet,
     'worksheet-merge-anchor-index',
     'index-merge-anchor-coordinates',
   );
   const mergeIdentity = coordinateIndexIdentity(
+    worksheet,
     'worksheet-merge-skip-index',
     'expand-merged-cell-coordinates',
   );
@@ -3076,6 +3100,7 @@ export function getSheetRenderCache(worksheet: Worksheet): SheetRenderCache {
   if (worksheet.autoFilter) {
     const af = worksheet.autoFilter;
     const filterIdentity = coordinateIndexIdentity(
+      worksheet,
       'worksheet-auto-filter-index',
       'expand-auto-filter-coordinates',
     );
@@ -3090,6 +3115,7 @@ export function getSheetRenderCache(worksheet: Worksheet): SheetRenderCache {
 
   const hyperlinkMap = new Map<string, string>();
   const hyperlinkIdentity = coordinateIndexIdentity(
+    worksheet,
     'worksheet-hyperlink-index',
     'index-hyperlink-coordinates',
   );
@@ -3099,6 +3125,7 @@ export function getSheetRenderCache(worksheet: Worksheet): SheetRenderCache {
 
   const commentCells = new Set<string>();
   const commentIdentity = coordinateIndexIdentity(
+    worksheet,
     'worksheet-comment-index',
     'index-comment-coordinates',
   );
@@ -3109,6 +3136,7 @@ export function getSheetRenderCache(worksheet: Worksheet): SheetRenderCache {
 
   const entry: SheetRenderCache = {
     rowCount: worksheet.rows.length,
+    coordinateIndexLimit,
     cellMap,
     nonEmptyColsByRow,
     cfContext: compileCf(worksheet, cellMap),
@@ -3736,6 +3764,7 @@ function virtualizedTextOverflowOverscan(
  * The projection may differ only in row/column sizing and outline flags; cells,
  * merges, formatting, tables, links, comments, and sparklines remain source-owned. */
 export function inheritSheetRenderCache(source: Worksheet, projection: Worksheet): void {
+  inheritWorksheetPolicy(source, projection);
   sheetRenderCache.set(projection, getSheetRenderCache(source));
 }
 
@@ -3828,6 +3857,7 @@ export function renderViewport(
   // Merge anchor sizes are cellScale-scaled, so they stay per-frame.
   const mergeAnchorMap = new Map<string, { totalW: number; totalH: number; right: number; bottom: number }>();
   const mergeAnchorIdentity = coordinateIndexIdentity(
+    worksheet,
     'worksheet-merge-anchor-index',
     'index-merge-anchor-coordinates',
   );

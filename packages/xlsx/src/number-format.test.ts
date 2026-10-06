@@ -209,6 +209,50 @@ describe('date formats (Excel serial; 45292 = 2024-01-01)', () => {
 });
 
 describe('time-only formats (§18.8.30 h / s / AM/PM without a date part)', () => {
+  it.each([45, 46, 47])('honors an authored date format over built-in %i', numFmtId => {
+    const authored = builtinStyles(numFmtId);
+    authored.numFmts = [{ numFmtId, formatCode: 'm"月"d"日"' }];
+    expect(formatCellValue(numCell(45306), authored)).toBe('1月15日');
+  });
+
+  it.each([45, 46, 47])('honors a conditional date format over built-in %i', numFmtId => {
+    expect(formatCellValue(numCell(45306), styles('d'), {
+      numFmtId,
+      formatCode: 'm"月"d"日"',
+    })).toBe('1月15日');
+  });
+
+  it.each<[number, string]>([
+    [45, '00:00'],
+    [46, '18:00:00'],
+    [47, '00:00.0'],
+    [0, '0.75'],
+  ])('does not inherit a base date code for conditional built-in %i', (numFmtId, expected) => {
+    expect(formatCellValue(numCell(0.75), styles('d'), {
+      numFmtId,
+      formatCode: null,
+    })).toBe(expected);
+  });
+
+  it('does not inherit a base text section for a matched conditional built-in General', () => {
+    const text: Cell = { row: 1, col: 1, value: { type: 'text', text: 'hello' }, styleIndex: 0 };
+    const base = styles('0;-0;0;"base "@');
+    // Fixture sanity: without CF the base fourth section applies.
+    expect(formatCellValue(text, base)).toBe('base hello');
+    // A matched DXF numFmt id 0 with no code is General, which has no text section.
+    expect(formatCellValue(text, base, { numFmtId: 0, formatCode: null })).toBe('hello');
+  });
+
+  it.each([
+    { numFmtId: 45, formatCode: '0.00', expected: '0.12' },
+    { numFmtId: 46, formatCode: 'General', expected: '0.1234567' },
+    { numFmtId: 27, formatCode: '0.00', expected: '0.12' },
+  ])('honors authored $formatCode over built-in $numFmtId', ({ numFmtId, formatCode, expected }) => {
+    const authored = builtinStyles(numFmtId);
+    authored.numFmts = [{ numFmtId, formatCode }];
+    expect(formatCellValue(numCell(0.1234567), authored)).toBe(expected);
+  });
+
   it('resolves built-in minute, elapsed-hour and fractional-second formats without numFmts', () => {
     expect(formatCellValue(numCell(0.75), builtinStyles(45))).toBe('00:00');
     expect(formatCellValue(numCell(45200.75), builtinStyles(46))).toBe('1084818:00:00');

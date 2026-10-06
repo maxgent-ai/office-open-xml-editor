@@ -14,6 +14,7 @@ import {
   sameInitialAnchorSizeReference,
   type InitialAnchorSizeReference,
 } from './internal/initial-anchor-sizes.js';
+import { getWorksheetPolicy, inheritWorksheetPolicy } from './worksheet-policy-context.js';
 import type {
   DelimitedTextParseRequest,
   DelimitedTextParseResponse,
@@ -89,6 +90,7 @@ export function createSizeOverriddenWorksheet(
     rowHeights: { ...source.rowHeights },
     colWidths: { ...source.colWidths },
   };
+  inheritWorksheetPolicy(source, view);
   applySizeOverrides(view, overrides);
   return view;
 }
@@ -101,7 +103,13 @@ function createInitialSizeProjection(
   source: Worksheet,
   overrides: WireSizeOverrides | undefined,
 ): Worksheet {
-  return overrides ? createSizeOverriddenWorksheet(source, overrides) : { ...source };
+  if (overrides) return createSizeOverriddenWorksheet(source, overrides);
+  // A new identity loses the WeakMap policy binding; the admitted policy (and
+  // the renderer budgets derived from it) stays owned by the source, and the
+  // cache's policy-identity check depends on this projection carrying it.
+  const view = { ...source };
+  inheritWorksheetPolicy(source, view);
+  return view;
 }
 
 export interface WireViewProjection {
@@ -150,7 +158,8 @@ export class WorksheetViewProjectionCache {
     if (
       cached &&
       cached.revision === projection.revision &&
-      cached.source === source
+      cached.source === source &&
+      getWorksheetPolicy(source) === getWorksheetPolicy(cached.worksheet)
     ) {
       if (!sameInitialAnchorSizeReference(cached.initialAnchorSizes, reference)) {
         throw new Error('XLSX initial anchor size reference changed without a new projection revision');
@@ -271,7 +280,7 @@ export function extractViewerRenderContext(opts: WireRenderViewportOptions): {
 // `init` arm is copied verbatim from `WorkerRequest`.
 export type RenderWorkerRequest =
   | { type: 'init'; wasmUrl: string }
-  | { type: 'parse'; id: number; data: ArrayBuffer; resourcePolicy: NormalizedOoxmlResourcePolicy; useGoogleFonts?: boolean; cjkFallback?: import('@silurus/ooxml-core').CjkLang; renderers?: import('@silurus/ooxml-core/worker').WorkerRendererDescriptors; source?: import('@silurus/ooxml-core').ModelSourceModuleDescriptor; sourceTransfer?: readonly Transferable[]; sourceOwnerUrl?: string }
+  | { type: 'parse'; id: number; data: ArrayBuffer; resourcePolicy: NormalizedOoxmlResourcePolicy; readonly worksheetPolicy?: import('@silurus/ooxml-core/worker').NormalizedXlsxWorksheetPolicy; useGoogleFonts?: boolean; cjkFallback?: import('@silurus/ooxml-core').CjkLang; renderers?: import('@silurus/ooxml-core/worker').WorkerRendererDescriptors; source?: import('@silurus/ooxml-core').ModelSourceModuleDescriptor; sourceTransfer?: readonly Transferable[]; sourceOwnerUrl?: string }
   | DelimitedTextParseRequest
   | ({ type: 'openSheetSession'; id: number; sheetIndex: number; sheetName: string } & PullSessionIdentity<number>)
   | {

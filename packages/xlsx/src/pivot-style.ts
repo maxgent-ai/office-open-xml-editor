@@ -30,6 +30,7 @@ import {
   type CoordinateIndexIdentity,
 } from './renderer-coordinate-index.js';
 import type { BorderEdge, CellFill, Dxf, PivotAxisItem, PivotTableMetadata, Worksheet } from './types.js';
+import { getWorksheetPolicy } from './worksheet-policy-context.js';
 
 /** The merged PivotTable style format of one cell. */
 export interface PivotCellFormat {
@@ -190,6 +191,7 @@ export function buildPivotStyleMap(worksheet: Worksheet): Map<string, PivotCellF
   const identity: CoordinateIndexIdentity = {
     resource: 'worksheet-pivot-style-index',
     operation: 'expand-pivot-style-coordinates',
+    limit: getWorksheetPolicy(worksheet).maxCoordinateIndexEntries,
   };
   for (const pivot of worksheet.pivotTables ?? []) {
     const style = pivot.style;
