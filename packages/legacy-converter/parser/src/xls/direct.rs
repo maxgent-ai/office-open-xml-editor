@@ -685,6 +685,7 @@ fn empty_worksheet(
         col_hidden: BTreeMap::new(),
         default_col_width: 0.0,
         base_col_width: None,
+        default_col_width_is_ui: false,
         default_row_height: 0.0,
         default_row_height_custom: false,
         merge_cells: Vec::new(),

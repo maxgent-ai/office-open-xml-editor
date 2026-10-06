@@ -142,6 +142,11 @@ pub struct Worksheet {
     /// `defaultColWidth`; the renderer derives implicit column pixels from it.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub base_col_width: Option<u32>,
+    /// True only when `<sheetFormatPr>` is absent: `default_col_width` is then
+    /// the library's UI-character fallback (padding excluded, §18.3.1.13),
+    /// not a stored width. Omitted when false.
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+    pub default_col_width_is_ui: bool,
     pub default_row_height: f64,
     /// `<sheetFormatPr customHeight>` (§18.3.1.81): the sheet-wide default row
     /// height was manually set. Omitted when false, the schema default.
@@ -287,6 +292,7 @@ impl Worksheet {
             col_hidden: BTreeMap::new(),
             default_col_width: 0.0,
             base_col_width: None,
+            default_col_width_is_ui: false,
             default_row_height: 0.0,
             default_row_height_custom: false,
             merge_cells: Vec::new(),

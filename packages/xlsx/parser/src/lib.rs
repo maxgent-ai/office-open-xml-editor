@@ -430,6 +430,10 @@ struct XlsxThemeData {
 impl XlsxThemeData {
     fn load(archive: &mut XlsxZip, workbook_rels_xml: &str) -> Self {
         let Some(target) = find_internal_rel_target_by_type(workbook_rels_xml, "/theme") else {
+            // Zero Theme parts is valid (§14.2.7). Keep declared font names
+            // when no theme resolves their major/minor scheme (§18.8.35);
+            // do not inject an application/locale theme. Font substitution
+            // for unavailable faces (§18.8.29) remains a rendering decision.
             return Self::default();
         };
         let theme_path = resolve_zip_path("xl/workbook.xml", &target);
@@ -1571,11 +1575,25 @@ fn parse_projected_worksheet(
     let mut merge_cells: Vec<MergeCell> = Vec::new();
     let mut freeze_rows: u32 = 0;
     let mut freeze_cols: u32 = 0;
+    // Fallback for an absent sheetFormatPr. 8.43 is this library's UI-width
+    // choice, not a schema default: §18.3.1.81 supplies no value for an absent
+    // element. A UI width counts content characters (Microsoft Support "Change
+    // the column width and row height"), while a stored defaultColWidth
+    // includes padding (§18.3.1.13). The number alone cannot tell them apart,
+    // because an authored defaultColWidth="8.43" yields the same value. So
+    // default_col_width_is_ui carries that one bit. It starts true and is
+    // cleared by any recognized sheetFormatPr. The renderer encodes a flagged
+    // value with the normative 5 px padding: 56/64/72 px at MDW 6/7/8, versus
+    // 51/59/67 px as a stored width. This is a unit fix only. An application's
+    // StandardWidth (observed 10 with Calibri 11, 65 pt native, on one Mac
+    // Excel 16.113.3 install) remains a separate gap from the 54 pt (72 px at
+    // MDW 8) this fix yields. It is not inferred from this file.
     let mut default_col_width = 8.43;
+    let mut default_col_width_is_ui = true;
     let mut base_col_width: Option<u32> = None;
-    // Intrinsic default row height in *points* — ECMA-376 §18.3.1.81.
-    // 15 pt = 20 CSS px at 96 DPI, Excel's baseline for the Calibri 11
-    // Normal style. The renderer multiplies by 4/3 at display time, so
+    // Policy fallback in points when sheetFormatPr is absent. §18.3.1.81
+    // requires defaultRowHeight on a present element; it supplies no value
+    // for an absent one. 15 pt = 20 CSS px at 96 DPI. Display uses 4/3, so
     // both this default and per-row `<row ht="…">` values share the
     // same units across the parser/renderer boundary.
     let mut default_row_height = 15.0;
@@ -1726,12 +1744,17 @@ fn parse_projected_worksheet(
     for node in doc.descendants() {
         match node.tag_name().name() {
             "sheetFormatPr" if is_x_ns(node.tag_name().namespace()) => {
+                // A present element, even with a malformed defaultColWidth,
+                // means the default is stored-width (or base-derived), never
+                // the UI-character fallback.
+                default_col_width_is_ui = false;
                 // ECMA-376 §18.3.1.81: baseColWidth describes implicit columns
                 // only when the sheet does not supply defaultColWidth.
                 // CT_SheetFormatPr (Strict and Transitional) declares
                 // baseColWidth default="8": an omitted attribute on an existing
                 // element means 8. A malformed explicit value stays None. When
-                // the element itself is absent, base stays None (width 8.43).
+                // the element itself is absent, the historical fallback above
+                // stays in effect; attribute defaults do not create an element.
                 if node.attribute("defaultColWidth").is_none() {
                     base_col_width = match node.attribute("baseColWidth") {
                         None => Some(8),
@@ -2347,6 +2370,7 @@ fn parse_projected_worksheet(
         col_hidden,
         default_col_width,
         base_col_width,
+        default_col_width_is_ui,
         default_row_height,
         default_row_height_custom,
         merge_cells,
@@ -4932,6 +4956,71 @@ mod sheet_view_tests {
         );
         let (ws, _) = parse_worksheet(&zero, &[], &[], "Sheet1").expect("worksheet parses");
         assert_eq!(ws.base_col_width, Some(0));
+    }
+
+    /// XLSX1709: when `<sheetFormatPr>` is absent, the 8.43 fallback is a UI
+    /// character count (ECMA-376 §18.3.1.13), not a stored `<col width>`.
+    /// Numeric `defaultColWidth` stays 8.43. A serde-only marker
+    /// `defaultColWidthIsUi` (omitted when false) is set only when the element
+    /// is absent. The test asserts through JSON so it compiles before the field exists.
+    #[test]
+    fn absent_sheet_format_pr_marks_default_col_width_as_ui_characters() {
+        const STRICT_NS: &str = "http://purl.oclc.org/ooxml/spreadsheetml/main";
+        let ui_flag = |xml: &str| {
+            let (ws, _) = parse_worksheet(xml, &[], &[], "Sheet1").expect("worksheet parses");
+            let flag = serde_json::to_value(&ws)
+                .expect("worksheet serializes")
+                .get("defaultColWidthIsUi")
+                .cloned();
+            (ws, flag)
+        };
+
+        for ns in [NS, STRICT_NS] {
+            // Element absent: flagged; numeric fallback and fixed widths unchanged.
+            let (ws, flag) = ui_flag(&format!(
+                r#"<worksheet xmlns="{ns}"><cols><col min="4" max="4" width="20" customWidth="1"/></cols><sheetData/></worksheet>"#
+            ));
+            assert_eq!(flag, Some(serde_json::Value::Bool(true)), "ns={ns}");
+            assert_eq!(ws.default_col_width, 8.43, "ns={ns}");
+            assert_eq!(ws.base_col_width, None, "ns={ns}");
+            assert_eq!(ws.col_widths.get(&4).copied(), Some(20.0), "ns={ns}");
+
+            // Authored stored defaults, including 8.43 itself, are never flagged.
+            for (attr, value) in [
+                ("8.43", 8.43),
+                ("0", 0.0),
+                ("12.5", 12.5),
+                ("10.7109375", 10.7109375),
+            ] {
+                let (ws, flag) = ui_flag(&format!(
+                    r#"<worksheet xmlns="{ns}"><sheetFormatPr defaultColWidth="{attr}" defaultRowHeight="15"/><sheetData/></worksheet>"#
+                ));
+                assert_eq!(flag, None, "defaultColWidth={attr}; ns={ns}");
+                assert_eq!(ws.default_col_width, value, "ns={ns}");
+                assert_eq!(ws.base_col_width, None, "ns={ns}");
+            }
+
+            // Present element: an omitted base uses schema 8, and explicit 0/10 are kept. Never flagged.
+            for (attrs, base) in [
+                ("", 8),
+                (r#" baseColWidth="0""#, 0),
+                (r#" baseColWidth="10""#, 10),
+            ] {
+                let (ws, flag) = ui_flag(&format!(
+                    r#"<worksheet xmlns="{ns}"><sheetFormatPr{attrs} defaultRowHeight="15"/><cols><col min="4" max="4" width="20" customWidth="1"/></cols><sheetData/></worksheet>"#
+                ));
+                assert_eq!(flag, None, "attrs={attrs:?}; ns={ns}");
+                assert_eq!(ws.base_col_width, Some(base), "ns={ns}");
+                assert_eq!(ws.col_widths.get(&4).copied(), Some(20.0), "ns={ns}");
+            }
+
+            // A malformed present element keeps the old unflagged policy.
+            let (ws, flag) = ui_flag(&format!(
+                r#"<worksheet xmlns="{ns}"><sheetFormatPr defaultColWidth="NaN" defaultRowHeight="15"/><sheetData/></worksheet>"#
+            ));
+            assert_eq!(flag, None, "ns={ns}");
+            assert_eq!(ws.default_col_width, 8.43, "ns={ns}");
+        }
     }
 
     /// The serialized worksheet JSON is deterministic: `colWidths` keys come out

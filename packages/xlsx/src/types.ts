@@ -94,6 +94,10 @@ export interface Worksheet {
   /** `<sheetFormatPr baseColWidth>` (§18.3.1.81), when no explicit
    *  `defaultColWidth` is authored. */
   baseColWidth?: number;
+  /** True only when `<sheetFormatPr>` is absent: `defaultColWidth` then holds
+   *  the library's 8.43 UI-character fallback (padding excluded, ECMA-376
+   *  §18.3.1.13) rather than a stored width. Omitted when false. */
+  defaultColWidthIsUi?: boolean;
   defaultRowHeight: number;
   /** `<sheetFormatPr customHeight>` (ECMA-376 §18.3.1.81). When true, rows
    *  without their own `ht` use the manually authored sheet default instead of
