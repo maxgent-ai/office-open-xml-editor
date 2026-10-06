@@ -1150,6 +1150,7 @@ export interface DefinedName {
     name: string;
     formula: string;
 }
+type DrawingAnchorTag = 'oneCellAnchor' | 'twoCellAnchor';
 export interface DrawingMLCustomDashSegment {
     dash: number;
     space: number;
@@ -1255,6 +1256,7 @@ export interface ImageAnchor {
     toRow: number;
     toRowOff: number;
     editAs?: string;
+    anchorTag?: DrawingAnchorTag;
     nativeExtCx: number;
     nativeExtCy: number;
     rotation?: number;
@@ -1884,6 +1886,9 @@ export interface ShapeAnchor {
     editAs?: string;
     nativeExtCx: number;
     nativeExtCy: number;
+    anchorTag?: DrawingAnchorTag;
+    anchorExtCx?: number;
+    anchorExtCy?: number;
     shapes: ShapeInfo[];
 }
 export type ShapeFill = Exclude<Fill, {

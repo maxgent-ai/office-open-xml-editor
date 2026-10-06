@@ -245,6 +245,7 @@ retained_struct!(ImageAnchor {
     to_row,
     to_row_off,
     edit_as,
+    anchor_tag,
     native_ext_cx,
     native_ext_cy,
     rotation,
@@ -426,8 +427,18 @@ retained_struct!(ShapeAnchor {
     edit_as,
     native_ext_cx,
     native_ext_cy,
+    anchor_tag,
+    anchor_ext_cx,
+    anchor_ext_cy,
     shapes
 });
+
+/// Fieldless `Copy` enum: no heap storage.
+impl RetainedBytes for DrawingAnchorTag {
+    fn heap_bytes(&self) -> u64 {
+        0
+    }
+}
 
 impl RetainedBytes for ShapeFill {
     fn heap_bytes(&self) -> u64 {

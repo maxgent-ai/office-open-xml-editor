@@ -814,6 +814,21 @@ pub struct ChartAnchor {
     pub chart: ooxml_common::chart::ChartModel,
 }
 
+/// Which DrawingML anchor element (ECMA-376 Part 1 §20.5.2) carried a drawing
+/// object. This is a normative acquisition fact recorded from the actual XML
+/// element name and never inferred from marker or extent values. `None` on a
+/// model means the producer did not record it (older models, VML/OLE previews,
+/// legacy binary conversion), and consumers keep their untagged behaviour.
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+pub enum DrawingAnchorTag {
+    /// `<xdr:oneCellAnchor>` (§20.5.2.24): `from` + anchor-level `<xdr:ext>`.
+    #[serde(rename = "oneCellAnchor")]
+    OneCellAnchor,
+    /// `<xdr:twoCellAnchor>` (§20.5.2.33): `from` + `to` (+ `editAs`).
+    #[serde(rename = "twoCellAnchor")]
+    TwoCellAnchor,
+}
+
 /// A grouped-shape anchor (ECMA-376 §20.5.2.17, `<xdr:grpSp>` inside a
 /// `<xdr:twoCellAnchor>`). Leaf shape elements (`<xdr:sp>`) from any nesting
 /// level are flattened into `shapes` with normalized coordinates so the
@@ -829,16 +844,27 @@ pub struct ShapeAnchor {
     pub to_col_off: i64,
     pub to_row: u32,
     pub to_row_off: i64,
-    /// `twoCellAnchor@editAs` (ECMA-376 §20.5.2.33). With `"oneCell"` the
-    /// renderer uses `native_ext_cx/cy` for the on-sheet size instead of the
-    /// from/to-derived rect (Excel's "Move but don't size with cells").
+    /// `twoCellAnchor@editAs` (ECMA-376 §20.5.2.33; normative fact). For a
+    /// `oneCellAnchor` the parser stores the compatibility value `"oneCell"`.
+    /// Library policy: only untagged models size from `native_ext_*`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub edit_as: Option<String>,
     /// Group's `<xdr:grpSpPr><a:xfrm><a:ext cx cy>` (or `<xdr:spPr><a:xfrm>`
-    /// for stand-alone sp/pic) in EMU. The saved on-sheet size, used as the
-    /// authoritative extent when `editAs == "oneCell"`. 0 = unavailable.
+    /// for stand-alone sp/pic) in EMU: the raw child/group transform extent,
+    /// kept unchanged. Used for sizing only by the untagged compatibility
+    /// policy. 0 = unavailable.
     pub native_ext_cx: i64,
     pub native_ext_cy: i64,
+    /// XML anchor element kind (normative fact). `None` = not recorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anchor_tag: Option<DrawingAnchorTag>,
+    /// `<xdr:oneCellAnchor><xdr:ext cx cy>` in EMU (ECMA-376 §20.5.2.24): the
+    /// anchor-level display size, distinct from `native_ext_*`. `None` for
+    /// twoCellAnchor or a missing or unparsable attribute.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anchor_ext_cx: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anchor_ext_cy: Option<i64>,
     pub shapes: Vec<ShapeInfo>,
 }
 
@@ -1338,14 +1364,20 @@ pub struct ImageAnchor {
     pub to_row: u32,
     pub to_row_off: i64,
     /// `twoCellAnchor@editAs` (ECMA-376 §20.5.2.33). Possible values: `"twoCell"`
-    /// (default), `"oneCell"`, `"absolute"`. With `"oneCell"`, Excel preserves
-    /// the picture's native EMU size (below) when cells are resized; with
-    /// `"twoCell"`, the from/to anchor rect IS the rendered size.
+    /// (default), `"oneCell"`, `"absolute"`. This determines behavior under
+    /// later cell edits; the initial `twoCellAnchor` rectangle is `from`/`to`
+    /// regardless of this value (ECMA-376 Part 1 §20.5.3.2).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub edit_as: Option<String>,
-    /// `<xdr:pic><xdr:spPr><a:xfrm><a:ext cx cy>` in EMU. The picture's saved
-    /// size at insert/edit time. Used as the authoritative size when
-    /// `editAs == "oneCell"`. 0 = absent / use from/to rect.
+    /// XML anchor element kind (normative fact; OOXML pictures parsed here are
+    /// always `twoCellAnchor`). `None` = not recorded (old models, OLE/VML
+    /// previews, legacy binary conversion).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anchor_tag: Option<DrawingAnchorTag>,
+    /// `<xdr:pic><xdr:spPr><a:xfrm><a:ext cx cy>` in EMU: the raw child
+    /// transform extent (normative fact). Library policy: only untagged models
+    /// with `editAs == "oneCell"` size from it. A tagged `twoCellAnchor` takes
+    /// its initial display rect from `from`/`to`. 0 = absent.
     pub native_ext_cx: i64,
     pub native_ext_cy: i64,
     /// Non-identity `<a:xfrm>` picture transform (ECMA-376 Part 1,

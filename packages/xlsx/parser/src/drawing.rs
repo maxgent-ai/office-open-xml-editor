@@ -151,10 +151,10 @@ pub(crate) fn parse_drawing_anchors(
         // §20.1.8.23 `<a:duotone>` recolour (None ⇒ no effect).
         let mut alpha: Option<f64> = None;
         let mut duotone: Option<Duotone> = None;
-        // ECMA-376 §20.5.2.33 `twoCellAnchor@editAs`. Possible values:
-        // "twoCell" (default), "oneCell", "absolute". With "oneCell" Excel
-        // preserves the picture's saved size from <xdr:spPr><a:xfrm><a:ext>
-        // regardless of cell resizing.
+        // ECMA-376 §20.5.2.33 `twoCellAnchor@editAs` (normative fact): "twoCell"
+        // (default), "oneCell", "absolute". It governs how later band edits
+        // move/resize the picture (§20.5.3.2). The initial display rect of a
+        // tagged twoCellAnchor is from/to (renderer resolver policy).
         let edit_as = anchor.attribute("editAs").map(|s| s.to_string());
 
         for child in anchor.children() {
@@ -225,8 +225,9 @@ pub(crate) fn parse_drawing_anchors(
                             ooxml_common::color::TintMode::PowerPointLinear,
                         );
                     }
-                    // <xdr:pic><xdr:spPr><a:xfrm><a:ext cx cy>: the picture's
-                    // own saved EMU extent. Authoritative when editAs="oneCell".
+                    // <xdr:pic><xdr:spPr><a:xfrm><a:ext cx cy>: the picture's raw
+                    // child transform extent, recorded unchanged. Sizing from it
+                    // is untagged-model compatibility policy only.
                     if let Some(sp_pr) = child.children().find(|n| {
                         n.tag_name().name() == "spPr" && is_xdr_ns(n.tag_name().namespace())
                     }) {
@@ -293,6 +294,8 @@ pub(crate) fn parse_drawing_anchors(
             to_row,
             to_row_off,
             edit_as,
+            // Normative fact: this loop only accepts `xdr:twoCellAnchor`.
+            anchor_tag: Some(DrawingAnchorTag::TwoCellAnchor),
             native_ext_cx,
             native_ext_cy,
             rotation,
@@ -1630,14 +1633,17 @@ pub(crate) fn parse_shape_anchors(
         let (mut from_col, mut from_col_off, mut from_row, mut from_row_off) =
             (0u32, 0i64, 0u32, 0i64);
         let (mut to_col, mut to_col_off, mut to_row, mut to_row_off) = (0u32, 0i64, 0u32, 0i64);
-        // ECMA-376 §20.5.2.33 `twoCellAnchor@editAs` — see ImageAnchor parsing
-        // path for semantics. `"oneCell"` instructs the renderer to preserve
-        // the group's saved EMU size instead of resizing with the cell rect.
-        // oneCellAnchor has no `<to>`; its size is the saved EMU `<ext>` (which
-        // equals the shape's own xfrm ext), positioned at `<from>` — i.e. the
-        // "oneCell" (move-but-don't-size) semantics the renderer already
-        // implements via nativeExtCx/Cy. Force editAs accordingly so the
-        // renderer sizes from the saved ext rather than a (missing) `to` rect.
+        // ECMA-376 §20.5.2.33 `twoCellAnchor@editAs` (normative fact). A
+        // `oneCellAnchor` (§20.5.2.24) has no `<to>` and no `editAs`. Its size
+        // is the anchor-level `<xdr:ext>`, which need not equal the child xfrm
+        // ext. The parser keeps its established compatibility value
+        // `editAs="oneCell"` for untagged consumers. Tagged consumers size from
+        // `anchor_ext_*` (recorded below) and never from the child ext.
+        let xml_anchor_tag = if anchor_tag == "oneCellAnchor" {
+            DrawingAnchorTag::OneCellAnchor
+        } else {
+            DrawingAnchorTag::TwoCellAnchor
+        };
         let edit_as = if anchor_tag == "oneCellAnchor" {
             Some("oneCell".to_string())
         } else {
@@ -1645,8 +1651,20 @@ pub(crate) fn parse_shape_anchors(
         };
         let native_ext_cx: i64;
         let native_ext_cy: i64;
+        let mut anchor_ext_cx: Option<i64> = None;
+        let mut anchor_ext_cy: Option<i64> = None;
         for c in anchor.children() {
             if !c.is_element() {
+                continue;
+            }
+            // §20.5.2.24 anchor-level `<xdr:ext>` of a oneCellAnchor, recorded
+            // raw with no reconciliation against the child xfrm.
+            if anchor_tag == "oneCellAnchor"
+                && c.tag_name().name() == "ext"
+                && is_xdr_ns(c.tag_name().namespace())
+            {
+                anchor_ext_cx = c.attribute("cx").and_then(|v| v.trim().parse().ok());
+                anchor_ext_cy = c.attribute("cy").and_then(|v| v.trim().parse().ok());
                 continue;
             }
             if c.tag_name().name() == "from" || c.tag_name().name() == "to" {
@@ -1722,8 +1740,9 @@ pub(crate) fn parse_shape_anchors(
                 continue;
             }
 
-            // Top-level grpSp ext is the group's saved on-sheet EMU size —
-            // authoritative when editAs="oneCell".
+            // Preserve the raw top-level grpSp transform extent. Tagged anchor
+            // placement is resolved separately from its markers / anchor ext;
+            // untagged legacy models retain the existing native-size policy.
             native_ext_cx = root.ext_x as i64;
             native_ext_cy = root.ext_y as i64;
 
@@ -1835,6 +1854,9 @@ pub(crate) fn parse_shape_anchors(
             edit_as,
             native_ext_cx,
             native_ext_cy,
+            anchor_tag: Some(xml_anchor_tag),
+            anchor_ext_cx,
+            anchor_ext_cy,
             shapes,
         });
     }
@@ -2322,6 +2344,8 @@ pub(crate) fn parse_ole_object_anchors(
             // sizeWithCells booleans (CT_ObjectAnchor); those live in a different
             // value space and are not mapped here.
             edit_as: Some("twoCell".to_string()),
+            // A CT_ObjectAnchor marker, not an xdr anchor element: untagged.
+            anchor_tag: None,
             native_ext_cx: 0,
             native_ext_cy: 0,
             rotation: None,
@@ -3219,6 +3243,81 @@ mod style_lnref_tests {
             other => panic!("expected an image-geom shape, got {other:?}"),
         }
     }
+
+    /// ECMA-376 §20.5.2.24: a true `oneCellAnchor` records its anchor-level
+    /// `<xdr:ext>` separately from the pic's raw `<a:xfrm><a:ext>`. The shape
+    /// path still owns the crop, because `parse_drawing_anchors` only scans
+    /// twoCellAnchor.
+    #[test]
+    fn onecellanchor_records_anchor_ext_separately_from_child_ext() {
+        let xml = format!(
+            r#"<xdr:wsDr {NS} xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><xdr:oneCellAnchor>
+              <xdr:from><xdr:col>1</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>1</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
+              <xdr:ext cx="1828800" cy="685800"/>
+              <xdr:pic>
+                <xdr:nvPicPr><xdr:cNvPr id="2" name="P"/><xdr:cNvPicPr/></xdr:nvPicPr>
+                <xdr:blipFill><a:blip r:embed="rId1"/><a:srcRect l="10000"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill>
+                <xdr:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="457200"/></a:xfrm>
+                  <a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr>
+              </xdr:pic>
+              <xdr:clientData/>
+            </xdr:oneCellAnchor></xdr:wsDr>"#
+        );
+        let mut rids = HashMap::new();
+        rids.insert("rId1".to_string(), "xl/media/image1.png".to_string());
+        let anchors = parse_shape_anchors(&xml, &theme(), &ThemeFormatScheme::default(), &rids);
+        assert_eq!(anchors.len(), 1);
+        let a = &anchors[0];
+        assert_eq!(a.anchor_tag, Some(DrawingAnchorTag::OneCellAnchor));
+        assert_eq!(
+            (a.anchor_ext_cx, a.anchor_ext_cy),
+            (Some(1828800), Some(685800))
+        );
+        // Raw child extent is unchanged, not rewritten to the anchor ext.
+        assert_eq!((a.native_ext_cx, a.native_ext_cy), (914400, 457200));
+        match &a.shapes[0].geom {
+            ShapeGeom::Image { src_rect, .. } => assert!(src_rect.is_some()),
+            other => panic!("expected an image-geom shape, got {other:?}"),
+        }
+        let json = serde_json::to_string(a).unwrap();
+        assert!(json.contains("\"anchorTag\":\"oneCellAnchor\""), "{json}");
+        assert!(json.contains("\"anchorExtCx\":1828800"), "{json}");
+        assert!(json.contains("\"anchorExtCy\":685800"), "{json}");
+    }
+
+    /// A twoCellAnchor `sp` is tagged from the actual XML element, carries no
+    /// anchor-level ext, and keeps its raw xfrm ext. (The twoCellAnchor `pic`
+    /// dedupe is covered by `standalone_twocellanchor_pic_is_not_a_shape_anchor`.)
+    #[test]
+    fn twocellanchor_sp_is_tagged_without_anchor_ext() {
+        let xml = format!(
+            r#"<xdr:wsDr {NS}><xdr:twoCellAnchor editAs="oneCell">
+              <xdr:from><xdr:col>1</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>1</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
+              <xdr:to><xdr:col>4</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>6</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>
+              <xdr:sp>
+                <xdr:nvSpPr><xdr:cNvPr id="3" name="S"/><xdr:cNvSpPr/></xdr:nvSpPr>
+                <xdr:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="952500" cy="476250"/></a:xfrm>
+                  <a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr>
+              </xdr:sp>
+              <xdr:clientData/>
+            </xdr:twoCellAnchor></xdr:wsDr>"#
+        );
+        let anchors = parse_shape_anchors(
+            &xml,
+            &theme(),
+            &ThemeFormatScheme::default(),
+            &HashMap::new(),
+        );
+        assert_eq!(anchors.len(), 1);
+        let a = &anchors[0];
+        assert_eq!(a.anchor_tag, Some(DrawingAnchorTag::TwoCellAnchor));
+        assert_eq!(a.edit_as.as_deref(), Some("oneCell"));
+        assert_eq!((a.anchor_ext_cx, a.anchor_ext_cy), (None, None));
+        assert_eq!((a.native_ext_cx, a.native_ext_cy), (952500, 476250));
+        let json = serde_json::to_string(a).unwrap();
+        assert!(json.contains("\"anchorTag\":\"twoCellAnchor\""), "{json}");
+        assert!(!json.contains("anchorExtCx"), "{json}");
+    }
 }
 
 /// §20.1.2.2.8 — an `<xdr:cNvPr hidden="1">` drawing object is not rendered.
@@ -3955,6 +4054,7 @@ mod blip_svg_tests {
             to_row: 5,
             to_row_off: 0,
             edit_as: Some("oneCell".to_string()),
+            anchor_tag: Some(DrawingAnchorTag::TwoCellAnchor),
             native_ext_cx: 300000,
             native_ext_cy: 200000,
             rotation: None,
@@ -3973,6 +4073,15 @@ mod blip_svg_tests {
         assert!(json.contains("\"svgImagePath\":\"xl/media/image2.svg\""));
         assert!(json.contains("\"nativeExtCx\":300000"));
         assert!(json.contains("\"nativeExtCy\":200000"));
+        assert!(json.contains("\"anchorTag\":\"twoCellAnchor\""), "{json}");
+        // Untagged models keep the legacy JSON unchanged (field omitted).
+        let untagged = ImageAnchor {
+            anchor_tag: None,
+            ..anchor.clone()
+        };
+        assert!(!serde_json::to_string(&untagged)
+            .unwrap()
+            .contains("anchorTag"));
         assert!(!json.contains("dataUrl"), "must not emit dataUrl: {json}");
         assert!(!json.contains(";base64,"), "must not inline base64: {json}");
     }
