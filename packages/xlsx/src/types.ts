@@ -539,20 +539,34 @@ export interface ChartAnchor {
   chart: ChartModel;
 }
 
+/** Which DrawingML anchor element (ECMA-376 Part 1 §20.5.2) carried the
+ *  object. This is a normative fact recorded from the actual XML element name
+ *  and is never inferred from geometry. Absent means "not recorded" (older
+ *  models, VML/OLE previews, legacy binary conversion). */
+export type DrawingAnchorTag = 'oneCellAnchor' | 'twoCellAnchor';
+
 export interface ShapeAnchor {
   fromCol: number; fromColOff: number;
   fromRow: number; fromRowOff: number;
   toCol: number;   toColOff: number;
   toRow: number;   toRowOff: number;
-  /** `twoCellAnchor@editAs` (ECMA-376 §20.5.2.33). With `"oneCell"` the
-   *  renderer uses `nativeExtCx`/`nativeExtCy` as the on-sheet size, since
-   *  Excel preserves the group's saved EMU extent regardless of cell
-   *  resizing ("Move but don't size with cells"). Absent ⇒ default `"twoCell"`. */
+  /** `twoCellAnchor@editAs` (ECMA-376 §20.5.2.33; normative fact). It governs
+   *  how band edits move/resize the object (§20.5.3.2). Library policy:
+   *  only untagged models with `"oneCell"` size from `nativeExtCx/Cy`.
+   *  Absent ⇒ default `"twoCell"`. */
   editAs?: string;
-  /** Saved EMU extent of the top-level grpSp (or the stand-alone sp/pic).
-   *  Authoritative when `editAs === "oneCell"`. 0 = unavailable. */
+  /** Raw EMU xfrm ext of the top-level grpSp (or the stand-alone sp/pic).
+   *  Used for sizing only by the untagged compatibility policy.
+   *  0 = unavailable. */
   nativeExtCx: number;
   nativeExtCy: number;
+  /** XML anchor element kind (normative fact). Absent = not recorded. */
+  anchorTag?: DrawingAnchorTag;
+  /** `<xdr:oneCellAnchor><xdr:ext cx cy>` in EMU (§20.5.2.24): the
+   *  anchor-level display size. It is distinct from `nativeExtCx/Cy`. Absent
+   *  for twoCellAnchor and for a missing or unparsable attribute. */
+  anchorExtCx?: number;
+  anchorExtCy?: number;
   shapes: ShapeInfo[];
 }
 
@@ -781,13 +795,16 @@ export interface ImageAnchor {
   toColOff: number;
   toRow: number;
   toRowOff: number;
-  /** `twoCellAnchor@editAs` (ECMA-376 §20.5.2.33). `"oneCell"` instructs the
-   *  renderer to use `nativeExtCx`/`nativeExtCy` as the size and ignore the
-   *  `to` anchor (Excel's "Move but don't size with cells"). Absent ⇒ default
-   *  `"twoCell"`. */
+  /** `twoCellAnchor@editAs` (ECMA-376 §20.5.2.33; normative fact). It governs
+   *  how band edits move/resize the picture (§20.5.3.2). For a tagged
+   *  `twoCellAnchor`, the initial display rect is always `from`/`to`.
+   *  Library compatibility policy: only untagged `"oneCell"` models size from
+   *  `nativeExtCx/Cy`. Absent ⇒ default `"twoCell"`. */
   editAs?: string;
-  /** `<xdr:pic><xdr:spPr><a:xfrm><a:ext cx cy>` in EMU — the picture's saved
-   *  size. Authoritative when `editAs === "oneCell"`. 0 = unavailable. */
+  /** XML anchor element kind (normative fact). Absent = not recorded. */
+  anchorTag?: DrawingAnchorTag;
+  /** `<xdr:pic><xdr:spPr><a:xfrm><a:ext cx cy>` in EMU: the raw child
+   *  transform extent. 0 = unavailable. */
   nativeExtCx: number;
   nativeExtCy: number;
   /** Non-identity `<a:xfrm>` transform. Rotation is clockwise degrees. */

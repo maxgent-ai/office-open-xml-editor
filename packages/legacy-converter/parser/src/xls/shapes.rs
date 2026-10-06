@@ -361,6 +361,10 @@ impl Shapes {
                     edit_as: Some(edit_as.into()),
                     native_ext_cx: cx,
                     native_ext_cy: cy,
+                    // Binary OfficeArt anchor, not an XML anchor element.
+                    anchor_tag: None,
+                    anchor_ext_cx: None,
+                    anchor_ext_cy: None,
                     shapes,
                 });
             }

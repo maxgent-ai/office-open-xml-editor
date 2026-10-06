@@ -47,7 +47,8 @@ import {
 } from './renderer-coordinate-index.js';
 import { GridGeometry, MAX_WORKSHEET_COL } from './internal/grid-geometry.js';
 import type { GridAxisGeometry } from './internal/grid-axis-geometry.js';
-import { usesNativeOneCellExtent } from './internal/cell-anchor-geometry.js';
+import { resolveCellAnchorRect } from './internal/cell-anchor-geometry.js';
+import { lookupInitialAnchorSize } from './internal/initial-anchor-sizes.js';
 import { isOptionalImageUnavailable } from './internal/optional-image-fallback.js';
 import { rotatedImageBounds } from './internal/image-anchor-transform.js';
 import {
@@ -4376,36 +4377,15 @@ function renderImages(
     const tiffUnavailable = isOptionalImageUnavailable(loadedImages, lookupKey, 'tiff');
     if (!img && !tiffUnavailable) continue;
 
-    // xdr col/row are 0-indexed; our widths map is 1-indexed.
-    const fromCol1 = anchor.fromCol + 1;
-    const fromRow1 = anchor.fromRow + 1;
-
-    // Image sheet-space top-left (always derived from the `from` anchor)
-    const imgSheetX1 = sheetXForCol(colAxis, fromCol1) + (anchor.fromColOff * cs) / EMU_PER_PX;
-    const imgSheetY1 = sheetYForRow(rowAxis, fromRow1) + (anchor.fromRowOff * cs) / EMU_PER_PX;
-
-    // ECMA-376 §20.5.2.33 + "Move but don't size with cells": when the
-    // anchor was saved with editAs="oneCell" Excel preserves the picture's
-    // saved EMU size (<xdr:spPr><a:xfrm><a:ext>) regardless of cell
-    // resizing, and the to anchor is only updated to track that fixed size.
-    // Use the native ext directly so the rendered image matches Excel even
-    // when our column-width / row-height computation diverges slightly from
-    // Excel's (e.g. row ht is stored as px in this viewer but Excel applies
-    // pt→px for some files). Falls back to the from/to-derived rect for
-    // editAs="twoCell" (default, image resizes with cells) and absolute
-    // anchors, or when the parser couldn't capture the native ext.
-    let imgW: number, imgH: number;
-    if (usesNativeOneCellExtent(anchor)) {
-      imgW = (anchor.nativeExtCx * cs) / EMU_PER_PX;
-      imgH = (anchor.nativeExtCy * cs) / EMU_PER_PX;
-    } else {
-      const toCol1 = anchor.toCol + 1;
-      const toRow1 = anchor.toRow + 1;
-      const imgSheetX2 = sheetXForCol(colAxis, toCol1) + (anchor.toColOff * cs) / EMU_PER_PX;
-      const imgSheetY2 = sheetYForRow(rowAxis, toRow1) + (anchor.toRowOff * cs) / EMU_PER_PX;
-      imgW = imgSheetX2 - imgSheetX1;
-      imgH = imgSheetY2 - imgSheetY1;
-    }
+    // One resolver owns the display rectangle for paint, hit-testing and
+    // culling/decode. The normative anchor facts and the library policies
+    // (tagged initial rect, untagged compatibility) are documented in
+    // internal/cell-anchor-geometry.ts.
+    const {
+      x: imgSheetX1, y: imgSheetY1, width: imgW, height: imgH,
+    } = resolveCellAnchorRect(
+      anchor, colAxis, rowAxis, cs, lookupInitialAnchorSize(ws, anchor),
+    );
     if (imgW <= 0 || imgH <= 0) continue;
 
     // Translate to canvas coordinates of the scrollable viewport
@@ -4499,27 +4479,11 @@ function renderShapeGroups(
   ctx.clip();
 
   for (const anchor of anchors) {
-    const fromCol1 = anchor.fromCol + 1;
-    const fromRow1 = anchor.fromRow + 1;
-
-    const x1 = sheetXForCol(colAxis, fromCol1) + (anchor.fromColOff * cs) / EMU_PER_PX;
-    const y1 = sheetYForRow(rowAxis, fromRow1) + (anchor.fromRowOff * cs) / EMU_PER_PX;
-
-    // editAs="oneCell" preserves the group's saved grpSpPr/xfrm/ext EMU
-    // size regardless of cell resizing (ECMA-376 §20.5.2.33). See
-    // renderImages for the same handling on stand-alone <xdr:pic>.
-    let w: number, h: number;
-    if (usesNativeOneCellExtent(anchor)) {
-      w = (anchor.nativeExtCx * cs) / EMU_PER_PX;
-      h = (anchor.nativeExtCy * cs) / EMU_PER_PX;
-    } else {
-      const toCol1 = anchor.toCol + 1;
-      const toRow1 = anchor.toRow + 1;
-      const x2 = sheetXForCol(colAxis, toCol1) + (anchor.toColOff * cs) / EMU_PER_PX;
-      const y2 = sheetYForRow(rowAxis, toRow1) + (anchor.toRowOff * cs) / EMU_PER_PX;
-      w = x2 - x1;
-      h = y2 - y1;
-    }
+    // Same resolver as renderImages. Normalized child transforms below are
+    // raw and only scale into this rectangle.
+    const { x: x1, y: y1, width: w, height: h } = resolveCellAnchorRect(
+      anchor, colAxis, rowAxis, cs, lookupInitialAnchorSize(ws, anchor),
+    );
     if (w <= 0 || h <= 0) continue;
 
     const logicalCanvasX = scrollAreaX + (x1 - scrollOriginSheetX) - scrollOffsetX;

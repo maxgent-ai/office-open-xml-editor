@@ -9,6 +9,11 @@ import type { OoxmlResourceUsageSnapshot } from '@silurus/ooxml-core';
 import type { NormalizedOoxmlResourcePolicy } from '@silurus/ooxml-core/worker';
 import type { PullSessionIdentity } from '@silurus/ooxml-core/worker';
 import { GridGeometry } from './internal/grid-geometry.js';
+import {
+  bindInitialAnchorSizes,
+  sameInitialAnchorSizeReference,
+  type InitialAnchorSizeReference,
+} from './internal/initial-anchor-sizes.js';
 import type {
   DelimitedTextParseRequest,
   DelimitedTextParseResponse,
@@ -88,12 +93,28 @@ export function createSizeOverriddenWorksheet(
   return view;
 }
 
+/** Render-local projection for a prepared-initial anchor reference. With
+ * overrides it is the ordinary overridden projection; without them a shallow
+ * object sharing the cached maps (never mutated), so the reference is never
+ * bound to the cached worksheet shared by other viewers. */
+function createInitialSizeProjection(
+  source: Worksheet,
+  overrides: WireSizeOverrides | undefined,
+): Worksheet {
+  return overrides ? createSizeOverriddenWorksheet(source, overrides) : { ...source };
+}
+
 export interface WireViewProjection {
   readonly id: number;
   readonly revision: number;
   /** The owning viewer supplied every display-derived automatic row height in
    * `sizeOverrides.rows`; the worker must not rescan cells for this revision. */
   readonly autoRowHeightsPrepared?: boolean;
+  /** Internal compact prepared-initial anchor sizes (#1713), captured by the
+   * owning viewer before any band edit. Present only for sheets with tagged
+   * `twoCellAnchor editAs="oneCell"` anchors; it always travels with its
+   * projection identity, even when no size override exists. */
+  readonly initialAnchorSizes?: InitialAnchorSizeReference;
 }
 
 /** Worker-local cache for one shallow worksheet projection per viewer/sheet.
@@ -101,7 +122,12 @@ export interface WireViewProjection {
 export class WorksheetViewProjectionCache {
   private readonly entries = new Map<
     string,
-    Readonly<{ revision: number; source: Worksheet; worksheet: Worksheet }>
+    Readonly<{
+      revision: number;
+      source: Worksheet;
+      worksheet: Worksheet;
+      initialAnchorSizes: InitialAnchorSizeReference | undefined;
+    }>
   >();
   /** Viewer teardown can overtake a render already awaiting fonts/archive work.
    * A tombstone prevents that late render from resurrecting released entries. */
@@ -120,16 +146,30 @@ export class WorksheetViewProjectionCache {
     const cacheable = !this.releasedProjectionIds.has(projection.id);
     const key = `${projection.id}:${sheetIndex}`;
     const cached = cacheable ? this.entries.get(key) : undefined;
+    const reference = projection.initialAnchorSizes;
     if (
       cached &&
       cached.revision === projection.revision &&
       cached.source === source
     ) {
+      if (!sameInitialAnchorSizeReference(cached.initialAnchorSizes, reference)) {
+        throw new Error('XLSX initial anchor size reference changed without a new projection revision');
+      }
       return { worksheet: cached.worksheet, created: false };
     }
-    const worksheet = createSizeOverriddenWorksheet(source, overrides);
+    // Bind before any paint, once per revision (cached reuse above skips it),
+    // and only to a render-local projection.
+    const worksheet = reference
+      ? createInitialSizeProjection(source, overrides)
+      : createSizeOverriddenWorksheet(source, overrides);
+    if (reference) bindInitialAnchorSizes(worksheet, reference);
     if (worksheet !== source && cacheable) {
-      this.entries.set(key, { revision: projection.revision, source, worksheet });
+      this.entries.set(key, {
+        revision: projection.revision,
+        source,
+        worksheet,
+        initialAnchorSizes: reference,
+      });
       return { worksheet, created: true };
     }
     this.entries.delete(key);
