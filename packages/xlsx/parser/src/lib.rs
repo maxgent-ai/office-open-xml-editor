@@ -1728,8 +1728,15 @@ fn parse_projected_worksheet(
             "sheetFormatPr" if is_x_ns(node.tag_name().namespace()) => {
                 // ECMA-376 §18.3.1.81: baseColWidth describes implicit columns
                 // only when the sheet does not supply defaultColWidth.
+                // CT_SheetFormatPr (Strict and Transitional) declares
+                // baseColWidth default="8": an omitted attribute on an existing
+                // element means 8. A malformed explicit value stays None. When
+                // the element itself is absent, base stays None (width 8.43).
                 if node.attribute("defaultColWidth").is_none() {
-                    base_col_width = node.attribute("baseColWidth").and_then(|s| s.parse().ok());
+                    base_col_width = match node.attribute("baseColWidth") {
+                        None => Some(8),
+                        Some(s) => s.parse().ok(),
+                    };
                 }
                 if let Some(v) = node
                     .attribute("defaultColWidth")
@@ -4856,6 +4863,75 @@ mod sheet_view_tests {
         let (ws, _) = parse_worksheet(&explicit, &[], &[], "Sheet1").expect("worksheet parses");
         assert_eq!(ws.base_col_width, None);
         assert_eq!(ws.default_col_width, 12.5);
+    }
+
+    #[test]
+    fn sheet_format_pr_omitted_base_col_width_uses_schema_default_8() {
+        // CT_SheetFormatPr: baseColWidth is xsd:unsignedInt, use="optional",
+        // default="8" (Strict and Transitional). defaultColWidth is optional
+        // with no schema default. sheetFormatPr itself is minOccurs="0".
+        const STRICT_NS: &str = "http://purl.oclc.org/ooxml/spreadsheetml/main";
+
+        // sheetFormatPr is present, and both baseColWidth and
+        // defaultColWidth are omitted. The effective base must equal an
+        // explicit baseColWidth="8" under both namespaces. Explicit column
+        // widths must survive alongside it.
+        for ns in [NS, STRICT_NS] {
+            let omitted = format!(
+                r#"<worksheet xmlns="{ns}"><sheetFormatPr defaultRowHeight="15"/><cols><col min="1" max="1" width="12" customWidth="1"/></cols><sheetData/></worksheet>"#
+            );
+            let explicit8 = format!(
+                r#"<worksheet xmlns="{ns}"><sheetFormatPr baseColWidth="8" defaultRowHeight="15"/><cols><col min="1" max="1" width="12" customWidth="1"/></cols><sheetData/></worksheet>"#
+            );
+            let (ws_omitted, _) =
+                parse_worksheet(&omitted, &[], &[], "Sheet1").expect("worksheet parses");
+            let (ws_explicit, _) =
+                parse_worksheet(&explicit8, &[], &[], "Sheet1").expect("worksheet parses");
+
+            assert_eq!(
+                ws_omitted.col_widths.get(&1).copied(),
+                Some(12.0),
+                "ns={ns}"
+            );
+            assert_eq!(
+                ws_explicit.col_widths.get(&1).copied(),
+                Some(12.0),
+                "ns={ns}"
+            );
+
+            assert_eq!(ws_explicit.base_col_width, Some(8), "ns={ns}");
+            assert_eq!(
+                ws_omitted.base_col_width, ws_explicit.base_col_width,
+                "omitted baseColWidth must equal explicit 8; ns={ns}"
+            );
+            assert_eq!(
+                ws_omitted.default_col_width, ws_explicit.default_col_width,
+                "ns={ns}"
+            );
+        }
+
+        // Control: sheetFormatPr absent. The attribute default does not apply.
+        let absent = format!(r#"<worksheet xmlns="{NS}"><sheetData/></worksheet>"#);
+        let (ws, _) = parse_worksheet(&absent, &[], &[], "Sheet1").expect("worksheet parses");
+        assert_eq!(ws.base_col_width, None);
+        assert_eq!(ws.default_col_width, 8.43);
+
+        // Control: authored defaultColWidth takes priority, so base stays unset.
+        for default in [0.0, 12.5] {
+            let authored = format!(
+                r#"<worksheet xmlns="{NS}"><sheetFormatPr defaultColWidth="{default}" defaultRowHeight="15"/><sheetData/></worksheet>"#
+            );
+            let (ws, _) = parse_worksheet(&authored, &[], &[], "Sheet1").expect("worksheet parses");
+            assert_eq!(ws.base_col_width, None);
+            assert_eq!(ws.default_col_width, default);
+        }
+
+        // Control: explicit zero is a real value and must not be replaced by 8.
+        let zero = format!(
+            r#"<worksheet xmlns="{NS}"><sheetFormatPr baseColWidth="0" defaultRowHeight="15"/><sheetData/></worksheet>"#
+        );
+        let (ws, _) = parse_worksheet(&zero, &[], &[], "Sheet1").expect("worksheet parses");
+        assert_eq!(ws.base_col_width, Some(0));
     }
 
     /// The serialized worksheet JSON is deterministic: `colWidths` keys come out
