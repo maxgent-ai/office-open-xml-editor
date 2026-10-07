@@ -2,9 +2,9 @@ import type { SectionLayoutContext } from '../layout-context.js';
 import {
   createSectionRegionCoordinateSpace,
   logicalPageExtent,
+  sectionWritingMode,
   transformRect,
   uprightPhysicalExtent,
-  writingModeFromTextDirection,
   type PhysicalPageExtent,
 } from './coordinate-space.js';
 import { columnSeparatorSegments } from './column-separators.js';
@@ -185,6 +185,7 @@ export function sectionLayoutContextsEqual(
     && equalColumns(left.columns, right.columns)
     && left.columnSeparator === right.columnSeparator
     && left.textDirection === right.textDirection
+    && (left.nativeSectionFlow ?? null) === (right.nativeSectionFlow ?? null)
     && (left.sectionBidi === true) === (right.sectionBidi === true)
     && left.grid.kind === right.grid.kind
     && left.grid.linePitchPt === right.grid.linePitchPt
@@ -194,7 +195,7 @@ export function sectionLayoutContextsEqual(
 }
 
 function requireRegionSectionAgreement(input: PageSectionRegionInput): void {
-  const writingMode = writingModeFromTextDirection(input.section.textDirection);
+  const writingMode = sectionWritingMode(input.section);
   if (writingMode !== input.writingMode) {
     throw new RangeError('Section region writing mode must agree with its section text direction');
   }

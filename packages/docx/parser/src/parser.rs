@@ -912,8 +912,18 @@ struct DocumentParseEnvironment {
     document_settings: Option<crate::types::DocumentSettings>,
     page_layout_settings: Option<crate::types::PageLayoutSettingsWire>,
     note_layout_settings: Option<crate::types::NoteLayoutSettingsWire>,
+    special_note_references: SpecialNoteReferences,
     even_and_odd_headers: bool,
     word_ilvl_error: Option<String>,
+}
+
+/// ECMA-376 §17.11.3/.9: document-wide lists select special endnote/footnote
+/// stories. Keep the two ID spaces separate and parser-local; an unlisted story
+/// must not affect retained separator metadata, even when its part is present.
+#[derive(Default)]
+struct SpecialNoteReferences {
+    footnotes: HashSet<String>,
+    endnotes: HashSet<String>,
 }
 
 /// ECMA-376 Part 2 §9.3 relationship types identify actual DOCX stories.
@@ -1060,6 +1070,7 @@ fn load_document_parse_environment(zip: &mut Zip) -> DocumentParseEnvironment {
     let mut document_settings: Option<crate::types::DocumentSettings> = None;
     let mut page_layout_settings: Option<crate::types::PageLayoutSettingsWire> = None;
     let mut note_layout_settings: Option<crate::types::NoteLayoutSettingsWire> = None;
+    let mut special_note_references = SpecialNoteReferences::default();
     // §17.10.1 even/odd headers is a settings.xml flag (not a sectPr property), so
     // capture it here and stamp it onto the section below.
     let mut even_and_odd_headers = false;
@@ -1069,7 +1080,7 @@ fn load_document_parse_environment(zip: &mut Zip) -> DocumentParseEnvironment {
         }
         document_settings = parse_document_settings(&settings_xml);
         page_layout_settings = parse_page_layout_settings(&settings_xml);
-        note_layout_settings = parse_note_layout_settings(&settings_xml);
+        (note_layout_settings, special_note_references) = parse_note_layout_settings(&settings_xml);
         even_and_odd_headers = parse_even_and_odd_headers(&settings_xml);
     }
 
@@ -1106,6 +1117,7 @@ fn load_document_parse_environment(zip: &mut Zip) -> DocumentParseEnvironment {
         document_settings,
         page_layout_settings,
         note_layout_settings,
+        special_note_references,
         even_and_odd_headers,
         word_ilvl_error,
     }
@@ -1819,7 +1831,7 @@ fn finish_document(
     let footnotes_path =
         find_internal_rel_target_by_types(&environment.rels_xml, FOOTNOTES_RELATIONSHIP_TYPES)
             .and_then(|target| resolve_part_name(DOCUMENT_PART, &target));
-    let footnotes = footnotes_path
+    let (footnotes, footnote_stories) = footnotes_path
         .map(|path| {
             parse_notes(
                 zip,
@@ -1828,13 +1840,14 @@ fn finish_document(
                 &environment.style_map,
                 &mut environment.num_map,
                 &environment.theme,
+                &environment.special_note_references.footnotes,
             )
         })
         .unwrap_or_default();
     let endnotes_path =
         find_internal_rel_target_by_types(&environment.rels_xml, ENDNOTES_RELATIONSHIP_TYPES)
             .and_then(|target| resolve_part_name(DOCUMENT_PART, &target));
-    let endnotes = endnotes_path
+    let (endnotes, endnote_stories) = endnotes_path
         .map(|path| {
             parse_notes(
                 zip,
@@ -1843,9 +1856,25 @@ fn finish_document(
                 &environment.style_map,
                 &mut environment.num_map,
                 &environment.theme,
+                &environment.special_note_references.endnotes,
             )
         })
         .unwrap_or_default();
+    // A retained paragraph always has its mark, so marks decide presence.
+    if footnote_stories.separator.is_some()
+        || endnote_stories.separator.is_some()
+        || footnote_stories.continuation_separator.is_some()
+    {
+        let settings = environment
+            .note_layout_settings
+            .get_or_insert_with(Default::default);
+        settings.footnote_separator = footnote_stories.separator;
+        settings.endnote_separator = endnote_stories.separator;
+        settings.footnote_continuation_separator = footnote_stories.continuation_separator;
+        settings.footnote_separator_paragraph = footnote_stories.separator_paragraph;
+        settings.footnote_continuation_separator_paragraph =
+            footnote_stories.continuation_separator_paragraph;
+    }
 
     Ok(Document {
         section,
@@ -2152,9 +2181,10 @@ fn parse_notes(
     style_map: &StyleMap,
     num_map: &mut NumberingMap,
     theme: &ThemeColors,
-) -> Vec<crate::types::DocxNote> {
+    special_references: &HashSet<String>,
+) -> (Vec<crate::types::DocxNote>, SelectedNoteSeparators) {
     let Ok(xml) = read_zip_string(zip, path) else {
-        return Vec::new();
+        return Default::default();
     };
 
     // Per-part rels for media (e.g. an image inside a footnote). The part lives
@@ -2167,13 +2197,13 @@ fn parse_notes(
     let local_chart_map = load_chart_map(zip, &local_relationships, path, theme);
 
     let Ok(doc) = parse_guarded(&xml) else {
-        return Vec::new();
+        return Default::default();
     };
     let mut out = Vec::new();
-    for n in doc
-        .descendants()
-        .filter(|n| n.is_element() && n.tag_name().name() == element_name)
-    {
+    let mut selected_stories = SelectedNoteSeparators::default();
+    for n in doc.descendants().filter(|n| {
+        n.is_element() && is_w_ns(n.tag_name().namespace()) && n.tag_name().name() == element_name
+    }) {
         let id = attr_w(n, "id").unwrap_or_default();
         // ECMA-376 §17.11.18 ST_FtnEdn — skip reserved special notes. They are
         // tagged `w:type` (separator / continuationSeparator / continuationNotice)
@@ -2183,6 +2213,48 @@ fn parse_notes(
             note_type.as_deref(),
             Some("separator") | Some("continuationSeparator") | Some("continuationNotice")
         );
+        // ECMA-376 §17.11.3/.9: only document-listed special stories load.
+        // Absence is not a selected empty paragraph: leave metadata absent so
+        // the existing default-rule policy applies. Normal numbered notes do
+        // not require this list and continue through the ordinary note path.
+        let selected = !special_references.is_empty()
+            && (is_special || (id == "-1" && note_type.is_none()))
+            && note_id_value(&id).is_some_and(|value| special_references.contains(&value));
+        // ECMA-376 §17.11.1/.23: selected stories define their marker kind.
+        // Observed Word behavior: an explicitly empty story prints without the
+        // default rule; a missing reserved story still uses it. Limit the
+        // empty case to a single bare paragraph, as observed in Word controls.
+        // A formatted footnote story also keeps its effective paragraph; the
+        // endnote formatted class stays unsupported (absent).
+        let mut story = || match reserved_note_separator_mark(n) {
+            Some(mark) => (Some(mark), None),
+            None if element_name == "footnote" => formatted_note_separator_paragraph(
+                n,
+                style_map,
+                num_map,
+                &local_media_map,
+                &local_chart_map,
+                &local_rel_map,
+                theme,
+            )
+            .map_or((None, None), |(mark, paragraph)| {
+                (Some(mark), Some(Box::new(paragraph)))
+            }),
+            None => (None, None),
+        };
+        if selected && note_type.as_deref() == Some("continuationSeparator") {
+            (
+                selected_stories.continuation_separator,
+                selected_stories.continuation_separator_paragraph,
+            ) = story();
+        } else if selected
+            && (note_type.as_deref() == Some("separator") || (id == "-1" && note_type.is_none()))
+        {
+            (
+                selected_stories.separator,
+                selected_stories.separator_paragraph,
+            ) = story();
+        }
         if id.is_empty() || id == "-1" || id == "0" || is_special {
             continue;
         }
@@ -2201,7 +2273,487 @@ fn parse_notes(
         );
         out.push(crate::types::DocxNote { id, content });
     }
-    out
+    (out, selected_stories)
+}
+
+/// Selected special story facts of one note part. Paragraphs are retained
+/// only for the formatted footnote class.
+#[derive(Default)]
+struct SelectedNoteSeparators {
+    separator: Option<crate::types::NoteSeparatorMark>,
+    continuation_separator: Option<crate::types::NoteSeparatorMark>,
+    separator_paragraph: Option<Box<DocParagraph>>,
+    continuation_separator_paragraph: Option<Box<DocParagraph>>,
+}
+
+/// The formatted class of a listed story (§17.11.9): one `w:p` holding an
+/// optional `w:pPr` and one run of an optional `w:rPr` plus one
+/// §17.11.23/§17.11.1 mark. Its effective paragraph (style cascade, §17.3.1.33
+/// spacing, line rule) is kept so layout measures the band from these facts
+/// instead of a mark-only scalar.
+/// The shared empty-paragraph line takes its metrics from the paragraph mark
+/// (§17.3.1.29), so the mark run's rPr must equal the mark's rPr child for
+/// child. Paragraph ink, numbering, frames, a hidden mark and authored text are
+/// not represented here either; those stories stay unsupported (absent).
+#[allow(clippy::too_many_arguments)]
+fn formatted_note_separator_paragraph(
+    note: roxmltree::Node<'_, '_>,
+    style_map: &StyleMap,
+    num_map: &mut NumberingMap,
+    media_map: &HashMap<String, String>,
+    chart_map: &ChartMap,
+    rel_map: &HashMap<String, String>,
+    theme: &ThemeColors,
+) -> Option<(crate::types::NoteSeparatorMark, DocParagraph)> {
+    use crate::types::NoteSeparatorMark;
+    let is_w = |node: roxmltree::Node<'_, '_>, name: &str| {
+        is_w_ns(node.tag_name().namespace()) && node.tag_name().name() == name
+    };
+    let mut blocks = note.children().filter(|child| child.is_element());
+    let paragraph = blocks.next()?;
+    if !is_w(paragraph, "p") || blocks.next().is_some() {
+        return None;
+    }
+    let mut children = paragraph
+        .children()
+        .filter(|child| child.is_element())
+        .peekable();
+    let properties = children.next_if(|child| is_w(*child, "pPr"));
+    let run = children.next()?;
+    if !is_w(run, "r") || children.next().is_some() {
+        return None;
+    }
+    let mut run_children = run.children().filter(|child| child.is_element()).peekable();
+    let run_properties = run_children.next_if(|child| is_w(*child, "rPr"));
+    let marker = run_children.next()?;
+    if run_children.next().is_some() || !is_w_ns(marker.tag_name().namespace()) {
+        return None;
+    }
+    let mark = match marker.tag_name().name() {
+        "separator" => NoteSeparatorMark::Short,
+        "continuationSeparator" => NoteSeparatorMark::Full,
+        _ => return None,
+    };
+    let mark_properties = properties.and_then(|node| child_w(node, "rPr"));
+    if !same_xml_element(mark_properties, run_properties) {
+        return None;
+    }
+    let parsed = parse_paragraph_with_diagnostics(
+        paragraph,
+        style_map,
+        num_map,
+        media_map,
+        chart_map,
+        rel_map,
+        theme,
+        None,
+        &mut FieldState::default(),
+        &mut Vec::new(),
+    );
+    if !parsed.runs.is_empty()
+        || parsed.numbering.is_some()
+        || parsed.frame_pr.is_some()
+        || parsed.borders.is_some()
+        || parsed.shading.is_some()
+        || parsed.mark_vanish
+    {
+        return None;
+    }
+    Some((mark, parsed))
+}
+
+/// Element equality by expanded names, attributes and child elements.
+fn same_xml_element(
+    a: Option<roxmltree::Node<'_, '_>>,
+    b: Option<roxmltree::Node<'_, '_>>,
+) -> bool {
+    let (a, b) = match (a, b) {
+        (None, None) => return true,
+        (Some(a), Some(b)) => (a, b),
+        _ => return false,
+    };
+    fn attributes<'a>(node: roxmltree::Node<'a, '_>) -> Vec<(Option<&'a str>, &'a str, &'a str)> {
+        let mut values: Vec<_> = node
+            .attributes()
+            .map(|attribute| (attribute.namespace(), attribute.name(), attribute.value()))
+            .collect();
+        values.sort_unstable();
+        values
+    }
+    let mut left = a.children().filter(|child| child.is_element());
+    let mut right = b.children().filter(|child| child.is_element());
+    a.tag_name() == b.tag_name()
+        && attributes(a) == attributes(b)
+        && loop {
+            match (left.next(), right.next()) {
+                (None, None) => break true,
+                (Some(x), Some(y)) if same_xml_element(Some(x), Some(y)) => {}
+                _ => break false,
+            }
+        }
+}
+
+fn is_empty_note_separator(note: roxmltree::Node<'_, '_>) -> bool {
+    let mut content = note.children().filter(|child| child.is_element());
+    matches!(content.next(), Some(paragraph)
+        if is_w_ns(paragraph.tag_name().namespace())
+            && paragraph.tag_name().name() == "p"
+            && !paragraph.children().any(|child| child.is_element()))
+        && content.next().is_none()
+}
+
+/// ECMA-376 §17.11.1/.23 define full/partial-width reserved marks. Preserve
+/// only a bare paragraph or a single marker run; authored text, borders,
+/// multiple paragraphs and formatting require retained separator-story layout
+/// rather than guessing its geometry. `none` is the same bare-empty Office
+/// observation already used for ordinary separator stories.
+/// These are WordprocessingML expanded names: foreign elements with the same
+/// local name cannot define a special story or suppress the default rule.
+fn reserved_note_separator_mark(
+    note: roxmltree::Node<'_, '_>,
+) -> Option<crate::types::NoteSeparatorMark> {
+    use crate::types::NoteSeparatorMark;
+    if is_empty_note_separator(note) {
+        return Some(NoteSeparatorMark::None);
+    }
+    let mut blocks = note.children().filter(|child| child.is_element());
+    let paragraph = blocks.next()?;
+    if !is_w_ns(paragraph.tag_name().namespace())
+        || paragraph.tag_name().name() != "p"
+        || blocks.next().is_some()
+    {
+        return None;
+    }
+    let mut runs = paragraph.children().filter(|child| child.is_element());
+    let run = runs.next()?;
+    if !is_w_ns(run.tag_name().namespace()) || run.tag_name().name() != "r" || runs.next().is_some()
+    {
+        return None;
+    }
+    let mut marks = run.children().filter(|child| child.is_element());
+    let mark = marks.next()?;
+    if !is_w_ns(mark.tag_name().namespace()) || marks.next().is_some() {
+        return None;
+    }
+    match mark.tag_name().name() {
+        "separator" => Some(NoteSeparatorMark::Short),
+        "continuationSeparator" => Some(NoteSeparatorMark::Full),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod note_separator_tests {
+    use super::*;
+    use std::io::{Cursor, Write};
+    use zip::write::SimpleFileOptions;
+
+    #[test]
+    fn only_explicit_bare_paragraph_suppresses_default_separator() {
+        for (body, expected) in [
+            ("<w:p/>", true),
+            ("<w:p><w:r><w:separator/></w:r></w:p>", false),
+            ("<w:p><w:pPr/></w:p>", false),
+            ("<w:p/><w:p/>", false),
+        ] {
+            let xml = format!("<w:footnote xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">{body}</w:footnote>");
+            let doc = roxmltree::Document::parse(&xml).unwrap();
+            assert_eq!(
+                is_empty_note_separator(doc.root_element()),
+                expected,
+                "{body}"
+            );
+        }
+    }
+
+    fn selected_note_package(
+        properties: Option<&str>,
+        namespace: &str,
+        special_id: &str,
+        special_story: Option<&str>,
+    ) -> Document {
+        let default_story = format!(
+            r#"<w:footnote w:type="separator" w:id="{special_id}"><w:p><w:r><w:separator/></w:r></w:p></w:footnote>"#
+        );
+        let special_story = special_story.unwrap_or(&default_story);
+        let mut bytes = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(Cursor::new(&mut bytes));
+            write_test_content_types(&mut writer);
+            let mut parts = vec![
+                ("word/document.xml", format!(r#"<w:document xmlns:w="{namespace}"><w:body><w:p><w:r><w:footnoteReference w:id="1"/><w:endnoteReference w:id="1"/></w:r></w:p></w:body></w:document>"#)),
+                ("word/_rels/document.xml.rels", r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="f" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes" Target="footnotes.xml"/><Relationship Id="e" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/endnotes" Target="endnotes.xml"/></Relationships>"#.to_string()),
+                ("word/footnotes.xml", format!(r#"<w:footnotes xmlns:w="{namespace}" xmlns:x="urn:foreign">{special_story}<w:footnote w:type="continuationSeparator" w:id="0"><w:p><w:r><w:continuationSeparator/></w:r></w:p></w:footnote><w:footnote w:id="1"><w:p><w:r><w:t>footnote</w:t></w:r></w:p></w:footnote></w:footnotes>"#)),
+                ("word/endnotes.xml", format!(r#"<w:endnotes xmlns:w="{namespace}"><w:endnote w:type="separator" w:id="{special_id}"><w:p><w:r><w:continuationSeparator/></w:r></w:p></w:endnote><w:endnote w:id="1"><w:p><w:r><w:t>endnote</w:t></w:r></w:p></w:endnote></w:endnotes>"#)),
+            ];
+            if let Some(properties) = properties {
+                parts.push(("word/settings.xml", format!(r#"<w:settings xmlns:w="{namespace}" xmlns:x="urn:foreign">{properties}</w:settings>"#)));
+            }
+            for (path, xml) in parts {
+                writer
+                    .start_file(path, SimpleFileOptions::default())
+                    .unwrap();
+                writer.write_all(xml.as_bytes()).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        parse_from_bytes(&bytes).expect("note package parses")
+    }
+
+    #[test]
+    fn projects_only_document_listed_special_stories_without_losing_numbered_notes() {
+        use crate::types::NoteSeparatorMark::{Full, Short};
+        for (properties, foot, continuation, end) in [
+            (None, None, None, None),
+            (
+                Some(
+                    r#"<w:footnotePr><w:footnote w:id="42"/><w:footnote w:id="0"/></w:footnotePr>"#,
+                ),
+                Some(Short),
+                Some(Full),
+                None,
+            ),
+            (
+                Some(r#"<w:endnotePr><w:endnote w:id="42"/></w:endnotePr>"#),
+                None,
+                None,
+                Some(Full),
+            ),
+            (
+                Some(
+                    r#"<w:footnotePr><x:footnote w:id="42"/><w:compat><w:footnote w:id="0"/></w:compat></w:footnotePr><w:compat><w:endnotePr><w:endnote w:id="42"/></w:endnotePr></w:compat>"#,
+                ),
+                None,
+                None,
+                None,
+            ),
+        ] {
+            let document = selected_note_package(properties, crate::xml_util::W_NS, "42", None);
+            assert_eq!(document.footnotes.len(), 1);
+            assert_eq!(document.endnotes.len(), 1);
+            assert_eq!(document.footnotes[0].id, "1");
+            assert_eq!(document.endnotes[0].id, "1");
+            let settings = document.note_layout_settings.unwrap_or_default();
+            assert_eq!(settings.footnote_separator, foot, "{properties:?}");
+            assert_eq!(
+                settings.footnote_continuation_separator, continuation,
+                "{properties:?}"
+            );
+            assert_eq!(settings.endnote_separator, end, "{properties:?}");
+        }
+    }
+
+    #[test]
+    fn selected_formatted_footnote_stories_retain_their_effective_paragraph() {
+        use crate::types::NoteSeparatorMark::{Full, Short};
+        const ARIAL_10: &str = r#"<w:rFonts w:ascii="Arial" w:hAnsi="Arial"/><w:sz w:val="20"/>"#;
+        let story = |kind: &str, id: &str, paragraph: &str| {
+            format!(r#"<w:footnote w:type="{kind}" w:id="{id}">{paragraph}</w:footnote>"#)
+        };
+        let formatted = |marker: &str, line: &str, mark_rpr: &str, run_rpr: &str| {
+            format!(
+                r#"<w:p><w:pPr><w:widowControl w:val="0"/><w:spacing w:before="0" w:after="0" w:line="{line}" w:lineRule="exact"/>{mark_rpr}</w:pPr><w:r>{run_rpr}<w:{marker}/></w:r></w:p>"#
+            )
+        };
+        let arial = format!("<w:rPr>{ARIAL_10}</w:rPr>");
+        // The public A24 control shape: one exact 480-twip paragraph whose mark
+        // run and marker run author the same rPr, for each listed role.
+        let stories = [
+            story(
+                "separator",
+                "42",
+                &formatted("separator", "480", &arial, &arial),
+            ),
+            story(
+                "continuationSeparator",
+                "43",
+                &formatted("separator", "120", "", ""),
+            ),
+        ]
+        .concat();
+        let document = selected_note_package(
+            Some(r#"<w:footnotePr><w:footnote w:id="42"/><w:footnote w:id="43"/></w:footnotePr>"#),
+            crate::xml_util::W_NS,
+            "42",
+            Some(&stories),
+        );
+        assert_eq!(document.footnotes.len(), 1);
+        let settings = document.note_layout_settings.unwrap();
+        assert_eq!(settings.footnote_separator, Some(Short));
+        // Mark kind still wins over role (§17.11.1/.23).
+        assert_eq!(settings.footnote_continuation_separator, Some(Short));
+        let separator = settings
+            .footnote_separator_paragraph
+            .expect("A24 paragraph");
+        let line = separator
+            .line_spacing
+            .as_ref()
+            .expect("authored exact line");
+        assert_eq!((line.value, line.rule.as_str()), (24.0, "exact"));
+        assert_eq!((separator.space_before, separator.space_after), (0.0, 0.0));
+        assert!(separator.runs.is_empty(), "the marker is not text");
+        assert_eq!(separator.default_font_size, Some(10.0));
+        let continuation = settings
+            .footnote_continuation_separator_paragraph
+            .expect("formatted continuation paragraph");
+        assert_eq!(continuation.line_spacing.as_ref().unwrap().value, 6.0);
+
+        // Bare stories keep the scalar contract; formatting this boundary does
+        // not represent (differing marker rPr, paragraph ink, authored text)
+        // stays the existing unsupported class: no mark and no paragraph.
+        let bare = selected_note_package(
+            Some(r#"<w:footnotePr><w:footnote w:id="42"/><w:footnote w:id="0"/></w:footnotePr>"#),
+            crate::xml_util::W_NS,
+            "42",
+            None,
+        )
+        .note_layout_settings
+        .unwrap();
+        assert_eq!(
+            (
+                bare.footnote_separator,
+                bare.footnote_continuation_separator
+            ),
+            (Some(Short), Some(Full))
+        );
+        assert!(bare.footnote_separator_paragraph.is_none());
+        assert!(bare.footnote_continuation_separator_paragraph.is_none());
+        for paragraph in [
+            formatted("separator", "480", "", &arial),
+            formatted(
+                "separator",
+                "480",
+                &arial,
+                "<w:rPr><w:sz w:val=\"40\"/></w:rPr>",
+            ),
+            formatted("separator", "480", "", "").replace(
+                "<w:widowControl w:val=\"0\"/>",
+                "<w:pBdr><w:top w:val=\"single\" w:sz=\"4\"/></w:pBdr>",
+            ),
+            formatted("separator", "480", "", "").replace(
+                "<w:pPr>",
+                "<w:pPr><w:shd w:val=\"clear\" w:fill=\"FF0000\"/>",
+            ),
+            formatted(
+                "separator",
+                "480",
+                "<w:rPr><w:vanish/></w:rPr>",
+                "<w:rPr><w:vanish/></w:rPr>",
+            ),
+            formatted("separator", "480", "", "")
+                .replace("</w:r>", "</w:r><w:r><w:t>x</w:t></w:r>"),
+            formatted("separator", "480", "", "")
+                .replace("<w:separator/>", "<w:separator/><w:t>x</w:t>"),
+        ] {
+            let settings = selected_note_package(
+                Some(r#"<w:footnotePr><w:footnote w:id="42"/></w:footnotePr>"#),
+                crate::xml_util::W_NS,
+                "42",
+                Some(&story("separator", "42", &paragraph)),
+            )
+            .note_layout_settings
+            .unwrap_or_default();
+            assert_eq!(settings.footnote_separator, None, "{paragraph}");
+            assert!(
+                settings.footnote_separator_paragraph.is_none(),
+                "{paragraph}"
+            );
+        }
+    }
+
+    #[test]
+    fn strict_special_lists_match_decimal_id_values_without_machine_integer_limits() {
+        use crate::types::NoteSeparatorMark::{Full, Short};
+        let id = "99999999999999999999999999999999999999999999";
+        let properties = format!(
+            r#"<w:footnotePr><w:footnote w:id=" +000{id} "/><w:footnote w:id="-0"/></w:footnotePr><w:endnotePr><w:endnote w:id="{id}"/></w:endnotePr>"#
+        );
+        let document = selected_note_package(Some(&properties), wordprocessingml::STRICT, id, None);
+        let settings = document.note_layout_settings.unwrap();
+        assert_eq!(settings.footnote_separator, Some(Short));
+        assert_eq!(settings.footnote_continuation_separator, Some(Full));
+        assert_eq!(settings.endnote_separator, Some(Full));
+    }
+
+    #[test]
+    fn foreign_elements_cannot_define_selected_separator_stories() {
+        for story in [
+            r#"<x:footnote w:type="separator" w:id="42"><w:p><w:r><w:separator/></w:r></w:p></x:footnote>"#,
+            r#"<w:footnote w:type="separator" w:id="42"><x:p/></w:footnote>"#,
+            r#"<w:footnote w:type="separator" w:id="42"><x:p><w:r><w:separator/></w:r></x:p></w:footnote>"#,
+            r#"<w:footnote w:type="separator" w:id="42"><w:p><x:r><w:separator/></x:r></w:p></w:footnote>"#,
+            r#"<w:footnote w:type="separator" w:id="42"><w:p><w:r><x:separator/></w:r></w:p></w:footnote>"#,
+            r#"<w:footnote w:type="separator" w:id="42"><w:p><w:r><x:continuationSeparator/></w:r></w:p></w:footnote>"#,
+        ] {
+            let document = selected_note_package(
+                Some(r#"<w:footnotePr><w:footnote w:id="42"/></w:footnotePr>"#),
+                crate::xml_util::W_NS,
+                "42",
+                Some(story),
+            );
+            assert_eq!(document.footnotes.len(), 1);
+            assert_eq!(document.footnotes[0].id, "1");
+            assert_eq!(
+                document
+                    .note_layout_settings
+                    .unwrap_or_default()
+                    .footnote_separator,
+                None,
+                "{story}"
+            );
+        }
+    }
+
+    #[test]
+    fn package_projects_separator_marks_without_dropping_real_notes() {
+        for (ordinary, expected) in [
+            ("<w:p/>", crate::types::NoteSeparatorMark::None),
+            (
+                "<w:p><w:r><w:separator/></w:r></w:p>",
+                crate::types::NoteSeparatorMark::Short,
+            ),
+        ] {
+            let mut bytes = Vec::new();
+            {
+                let mut writer = zip::ZipWriter::new(Cursor::new(&mut bytes));
+                write_test_content_types(&mut writer);
+                for (path, xml) in [
+                    (
+                        "word/document.xml",
+                        r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:footnoteReference w:id="1"/></w:r></w:p></w:body></w:document>"#,
+                    ),
+                    (
+                        "word/_rels/document.xml.rels",
+                        r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes" Target="footnotes.xml"/></Relationships>"#,
+                    ),
+                    (
+                        "word/settings.xml",
+                        r#"<w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:footnotePr><w:footnote w:id="-1"/><w:footnote w:id="0"/></w:footnotePr></w:settings>"#,
+                    ),
+                    (
+                        "word/footnotes.xml",
+                        &format!(
+                            r#"<w:footnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:footnote w:type="separator" w:id="-1">{ordinary}</w:footnote><w:footnote w:type="continuationSeparator" w:id="0"><w:p><w:r><w:separator/></w:r></w:p></w:footnote><w:footnote w:id="1"><w:p><w:r><w:t>note</w:t></w:r></w:p></w:footnote></w:footnotes>"#
+                        ),
+                    ),
+                ] {
+                    writer
+                        .start_file(path, SimpleFileOptions::default())
+                        .unwrap();
+                    writer.write_all(xml.as_bytes()).unwrap();
+                }
+                writer.finish().unwrap();
+            }
+            let document = parse_from_bytes(&bytes).expect("DOCX package parses");
+            assert_eq!(document.footnotes.len(), 1);
+            let settings = document.note_layout_settings.unwrap();
+            assert_eq!(settings.footnote_separator, Some(expected));
+            assert_eq!(
+                settings.footnote_continuation_separator,
+                Some(crate::types::NoteSeparatorMark::Short)
+            );
+        }
+    }
 }
 
 /// Resolve scheme color names (accent1..6, dk1, dk2, lt1, lt2, hlink, folHlink)
@@ -2521,9 +3073,49 @@ fn parse_page_layout_settings(settings_xml: &str) -> Option<crate::types::PageLa
     }
 }
 
-fn parse_note_layout_settings(settings_xml: &str) -> Option<crate::types::NoteLayoutSettingsWire> {
-    let doc = parse_guarded(settings_xml).ok()?;
+/// IDs have ST_DecimalNumber value semantics, including signed/zero-padded
+/// lexical forms. Reuse its lexical validation without imposing a machine
+/// integer limit on XML Schema's unbounded integer identifier space.
+fn note_id_value(value: &str) -> Option<String> {
+    let lexical = valid_decimal_number(value)?;
+    let digits = lexical
+        .trim_start_matches(['-', '+'])
+        .trim_start_matches('0');
+    Some(if digits.is_empty() {
+        "0".to_string()
+    } else if lexical.starts_with('-') {
+        format!("-{digits}")
+    } else {
+        digits.to_string()
+    })
+}
+
+fn parse_note_layout_settings(
+    settings_xml: &str,
+) -> (
+    Option<crate::types::NoteLayoutSettingsWire>,
+    SpecialNoteReferences,
+) {
+    let Ok(doc) = parse_guarded(settings_xml) else {
+        return (None, SpecialNoteReferences::default());
+    };
     let root = doc.root_element();
+    let references = |properties: &str, element: &str| {
+        child_w(root, properties)
+            .into_iter()
+            .flat_map(|node| node.children())
+            .filter(|node| {
+                node.is_element()
+                    && is_w_ns(node.tag_name().namespace())
+                    && node.tag_name().name() == element
+            })
+            .filter_map(|node| attr_w(node, "id").and_then(|value| note_id_value(&value)))
+            .collect()
+    };
+    let special_references = SpecialNoteReferences {
+        footnotes: references("footnotePr", "footnote"),
+        endnotes: references("endnotePr", "endnote"),
+    };
     let value = |properties: &str, name: &str| {
         child_w(root, properties)
             .and_then(|node| child_w(node, name))
@@ -2541,6 +3133,12 @@ fn parse_note_layout_settings(settings_xml: &str) -> Option<crate::types::NoteLa
         footnote_number_start: start("footnotePr"),
         endnote_number_format: value("endnotePr", "numFmt"),
         endnote_number_start: start("endnotePr"),
+        footnote_separator: None,
+        endnote_separator: None,
+        footnote_continuation_separator: None,
+        footnote_separator_paragraph: None,
+        footnote_continuation_separator_paragraph: None,
+        native_separators: None,
     };
     if result.footnote_position.is_none()
         && result.endnote_position.is_none()
@@ -2549,9 +3147,9 @@ fn parse_note_layout_settings(settings_xml: &str) -> Option<crate::types::NoteLa
         && result.endnote_number_format.is_none()
         && result.endnote_number_start.is_none()
     {
-        None
+        (None, special_references)
     } else {
-        Some(result)
+        (Some(result), special_references)
     }
 }
 
@@ -2609,7 +3207,9 @@ mod note_layout_settings_tests {
                    </w:settings>"#,
             );
 
-            let settings = parse_note_layout_settings(&xml).expect("authored note settings");
+            let settings = parse_note_layout_settings(&xml)
+                .0
+                .expect("authored note settings");
             assert_eq!(settings.footnote_position.as_deref(), Some("beneathText"));
             assert_eq!(settings.endnote_position.as_deref(), Some("sectEnd"));
         }
@@ -2622,7 +3222,9 @@ mod note_layout_settings_tests {
                      <w:footnotePr><w:numFmt w:val="upperLetter"/><w:numStart w:val="4"/></w:footnotePr>
                      <w:endnotePr><w:numFmt w:val="lowerRoman"/><w:numStart w:val="x"/></w:endnotePr>
                    </w:settings>"#;
-        let settings = parse_note_layout_settings(xml).expect("authored note numbering");
+        let settings = parse_note_layout_settings(xml)
+            .0
+            .expect("authored note numbering");
         assert_eq!(
             settings.footnote_number_format.as_deref(),
             Some("upperLetter")
@@ -2648,7 +3250,7 @@ mod note_layout_settings_tests {
                      </w:compat>
                    </w:settings>"#;
 
-        assert!(parse_note_layout_settings(xml).is_none());
+        assert!(parse_note_layout_settings(xml).0.is_none());
     }
 }
 
@@ -4453,6 +5055,7 @@ fn section_placement_wire(
             doc_grid_char_space: None,
             gutter_pt: None,
             rtl_gutter: None,
+            native_text_flow: None,
             page_borders_authored: None,
             page_borders: None,
             page_geometry: None,
@@ -4486,6 +5089,8 @@ fn section_placement_wire(
                 .and_then(parse_on_off)
                 .unwrap_or(true)
         }),
+        // MS-DOC-only raw flow fact; WordprocessingML never supplies it.
+        native_text_flow: None,
         page_borders_authored: child_w(sect_pr, "pgBorders").map(|_| true),
         page_borders: parse_page_borders(sect_pr),
         page_geometry: section_page_geometry_wire(sect_pr).map(Box::new),
@@ -7534,10 +8139,15 @@ fn parse_run_inner(
                 runs.extend(drawing_runs);
             }
             "footnoteReference" | "endnoteReference" | "footnoteRef" | "endnoteRef" => {
-                // ECMA-376 §17.11.6 / §17.11.7 / §17.11.16 / §17.11.17.
-                // `*Reference` is the in-body mark; `*Ref` is the auto-number
-                // placeholder that sits at the start of the note's own content.
-                // Both render as a superscript number. The DISPLAYED number is
+                // ECMA-376 §17.11.14 footnoteReference / §17.11.7
+                // endnoteReference are the in-body marks (with `w:id`);
+                // §17.11.13 footnoteRef / §17.11.6 endnoteRef are the empty
+                // auto-number placeholders at the start of the note's own
+                // content. Numbering and formatting are independent: the mark
+                // keeps its run's effective properties, including §17.3.2.42
+                // w:vertAlign from direct §17.3.2.28 rPr or a (typically
+                // reference) character style; the element itself confers no
+                // superscript. The DISPLAYED number is
                 // the note's sequential position (resolved by the renderer from
                 // the footnotes/endnotes ordering), not the raw `@w:id` — we keep
                 // the id in `text` only as a fallback. The `*Ref` placeholder
@@ -7572,12 +8182,11 @@ fn parse_run_inner(
                     background: fmt.background.clone(),
                     color_auto,
                     border: border.clone(),
-                    // Force superscript regardless of the run's original
-                    // vertAlign so reference markers appear above the line.
-                    // NOTE: the model value is "super" (see the styles.rs
-                    // w:vertAlign mapping) — the renderer only raises the
-                    // baseline for that exact token.
-                    vert_align: Some("super".to_string()),
+                    // Effective §17.3.2.42 value only; absence stays absent.
+                    // Consistent Office observation (Word 16.113.3, footnote
+                    // controls only): an unstyled footnoteReference run without
+                    // w:vertAlign prints full-size on the baseline.
+                    vert_align: vert_align.clone(),
                     hyperlink: hyperlink.clone(),
                     hyperlink_anchor: hyperlink_anchor.clone(),
                     all_caps,
@@ -19730,8 +20339,9 @@ mod footnote_tests {
         );
     }
 
-    /// ECMA-376 §17.11.17 — a body `<w:footnoteReference>` becomes a superscript
-    /// TextRun tagged with `note_ref { kind:"footnote", id }`.
+    /// ECMA-376 §17.11.14 — a body `<w:footnoteReference>` becomes a TextRun
+    /// tagged with `note_ref { kind:"footnote", id }`; its authored §17.3.2.42
+    /// superscript is retained.
     #[test]
     fn footnote_reference_is_tagged_as_note_ref() {
         let p = first_para(
@@ -19755,7 +20365,45 @@ mod footnote_tests {
         assert_eq!(run.vert_align.as_deref(), Some("super"));
     }
 
-    /// ECMA-376 §17.11.16 — the in-note `<w:footnoteRef>` placeholder is tagged
+    /// §17.11.14/.7 reference marks and §17.11.13/.6 placeholders take their
+    /// run's effective §17.3.2.42 vertical alignment (direct §17.3.2.28 rPr or
+    /// a character style); the parser synthesizes no superscript. Office
+    /// evidence covers only an unstyled footnoteReference control.
+    #[test]
+    fn note_reference_marks_keep_effective_vertical_alignment() {
+        let styles = format!(
+            r#"<w:styles xmlns:w="{W_NS}"><w:style w:type="character" w:styleId="Ref"><w:rPr><w:vertAlign w:val="superscript"/></w:rPr></w:style></w:styles>"#
+        );
+        // Body marks carry `w:id`; the in-note placeholders are empty elements.
+        for mark in [
+            r#"<w:footnoteReference w:id="1"/>"#,
+            r#"<w:endnoteReference w:id="1"/>"#,
+            "<w:footnoteRef/>",
+            "<w:endnoteRef/>",
+        ] {
+            for (r_pr, expected) in [
+                ("", None),
+                (r#"<w:rPr><w:rStyle w:val="Ref"/></w:rPr>"#, Some("super")),
+            ] {
+                let p = first_para_with(
+                    &format!(r#"<w:p><w:r>{r_pr}{mark}</w:r></w:p>"#),
+                    &styles,
+                    "",
+                );
+                let run = p
+                    .runs
+                    .iter()
+                    .find_map(|r| match r {
+                        DocRun::Text(t) if t.note_ref.is_some() => Some(t),
+                        _ => None,
+                    })
+                    .expect("note reference run");
+                assert_eq!(run.vert_align.as_deref(), expected, "{mark} {r_pr}");
+            }
+        }
+    }
+
+    /// ECMA-376 §17.11.13 — the in-note `<w:footnoteRef>` placeholder is tagged
     /// with an empty id (the renderer substitutes the enclosing note's number).
     #[test]
     fn footnote_ref_placeholder_has_empty_id() {
@@ -19772,7 +20420,7 @@ mod footnote_tests {
         assert_eq!(nr.id, "");
     }
 
-    /// ECMA-376 §17.11.6 — endnote references carry kind "endnote".
+    /// ECMA-376 §17.11.7 — endnote references carry kind "endnote".
     #[test]
     fn endnote_reference_kind_is_endnote() {
         let p = first_para(r#"<w:p><w:r><w:endnoteReference w:id="2"/></w:r></w:p>"#);

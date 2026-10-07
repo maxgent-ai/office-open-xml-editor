@@ -1546,7 +1546,12 @@ function appendRunsToSegments(
   segmentBuildContext: SegmentBuildContext,
   selectedMetric: SegmentBuildContext['selectedMetric'],
 ): void {
-  const sequences = acquireTextSequences(runs, environment, (text, run) => transformedRunText(text, run, environment));
+  // A native reserved-separator paragraph holds only text-free metric
+  // participants; coalescing them would drop a participant's own CHPX.
+  const sequences = runs.some((run) => run.type === 'text'
+    && (run as ParagraphTextBearingRun).noteSeparatorCharacter !== undefined)
+    ? new Map<number, never>()
+    : acquireTextSequences(runs, environment, (text, run) => transformedRunText(text, run, environment));
   let sequenceEnd = -1;
   let joinNextVisibleText = false;
   for (const [runIndex, sourceRun] of runs.entries()) {
@@ -1571,10 +1576,42 @@ function appendRunsToSegments(
     const emittedStart = segs.length;
     if (run.type === 'text') {
       const t = run as unknown as DocxTextRun & { type: 'text' };
+      if ((run as ParagraphTextBearingRun).noteSeparatorCharacter !== undefined) {
+        // MS-DOC 2.3.3 reserved separator character: the U+0003/U+0004 rule
+        // control or its story's content paragraph mark. Neither has a glyph
+        // here; the rule ink is retained separately. As for a suppressed note
+        // mark, a bounded Latin probe resolves the run's own four font slots
+        // and selected face through the ordinary text service, and only its
+        // vertical metrics remain (zero advance, no ink). Control/mark code
+        // points are not East Asian, so an East Asian slot alone is not used.
+        // The run context is the transformed display probe (caps/small caps
+        // or symbol mapping), exactly as for any other text piece.
+        const probe = transformedRunText('x', t, environment);
+        appendTextPiece(segmentBuildContext, 'x', t, t.vertAlign ?? null, runIndex,
+          { text: probe, offset: 0 });
+        for (let index = emittedStart; index < segs.length; index += 1) {
+          const segment = segs[index];
+          if (!('text' in segment)) throw new Error('A separator metric probe lost its text authority');
+          segment.text = '';
+          segment.metricOnly = true;
+          // Keep the probe for vertical metrics only (pass-operations,
+          // paragraph sourceMetrics); display and width stay empty.
+          segment.metricProbeText = probe;
+          segment.sourceRunIndex = runIndex;
+          if (segment.textShapeRequest) {
+            segment.textShapeRequest = Object.freeze(independentTextShapeRequest(segment.textShapeRequest, ''));
+          }
+        }
+        continue;
+      }
       // ECMA-376 §17.11: substitute a footnote/endnote reference marker's glyph
       // with the note's resolved sequential number. The body `*Reference` run
-      // carries the id; the in-note `*Ref` placeholder carries an empty id, so
-      // we fall back to the note number currently being drawn.
+      // (§17.11.14 footnoteReference / §17.11.7 endnoteReference) carries the
+      // id; the in-note `*Ref` placeholder (§17.11.13 footnoteRef / §17.11.6
+      // endnoteRef) carries an empty id, so we fall back to the note number
+      // currently being drawn. Numbering and formatting are independent: the
+      // mark takes its run's effective §17.3.2.42 w:vertAlign (direct §17.3.2.28
+      // rPr or style), and no superscript is synthesized when it is absent.
       const noteText = t.noteRef
         ? t.noteRef.id
           ? environment.noteNumbers?.get(`${t.noteRef.kind}:${t.noteRef.id}`)
@@ -1590,7 +1627,7 @@ function appendRunsToSegments(
           // As for an empty/anchor-only mark, a bounded Latin probe resolves
           // the four font slots and selected-face metrics through the ordinary
           // text service. Discard its ink/text, never its font authority.
-          appendTextPiece(segmentBuildContext, 'x', t, t.vertAlign ?? 'super', runIndex,
+          appendTextPiece(segmentBuildContext, 'x', t, t.vertAlign ?? null, runIndex,
             { text: 'x', offset: 0 });
           for (let index = emittedStart; index < segs.length; index += 1) {
             const segment = segs[index];
@@ -1620,7 +1657,7 @@ function appendRunsToSegments(
             segmentBuildContext,
             label,
             t,
-            t.vertAlign ?? 'super',
+            t.vertAlign ?? null,
             runIndex,
             { text: transformedRunText(label, t, environment), offset: 0 },
             0,

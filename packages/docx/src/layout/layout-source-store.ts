@@ -17,6 +17,14 @@ import { imageResourceKey, sourceKey } from './source-key.js';
 import { indexSealedPaintResourceDescriptors } from './paint-resources.js';
 import { sealPlainData } from './plain-data.js';
 import {
+  isReservedNoteSeparatorInstance,
+  reservedNoteSeparatorRole,
+} from './native-note-separators.js';
+import {
+  isSelectedNoteSeparatorInstance,
+  selectedNoteSeparatorSource,
+} from './selected-note-separators.js';
+import {
   projectTableColumnLayoutInput,
   projectEffectiveTablePreferredWidthPt,
   type TableLayoutSource,
@@ -77,6 +85,8 @@ export interface LayoutBlockRepository {
   readonly body: readonly LayoutStoryBlock[];
   readonly footnotes: readonly LayoutStoryNote[];
   readonly endnotes: readonly LayoutStoryNote[];
+  /** Registered native reserved separator roots; never numbered notes. */
+  readonly reservedNoteRoots: readonly SourceRef[];
   readonly sources: readonly SourceRef[];
   resolve(source: SourceRef): LayoutFlowBlock;
   storyRoot(source: SourceRef): readonly LayoutStoryBlock[];
@@ -164,10 +174,83 @@ function assertExactMembership(
   }
 }
 
+/** Canonical native and ordinary DOCX separator definitions must together
+ * name exactly the registered reserved roots, and their paragraph/control refs
+ * must resolve to the participants acquired for them. Raw parser wire is never
+ * sealed. */
+function validateNativeNoteSeparatorRoles(
+  input: BodyLayoutInput,
+  blocks: LayoutBlockRepository,
+): void {
+  const settings = input.noteLayoutSettings;
+  if (settings?.nativeSeparators !== undefined || settings?.footnoteSeparatorParagraphs !== undefined) {
+    throw new TypeError('Note separator wire must be normalized before sealing');
+  }
+  const defined = new Set<string>();
+  const stories = settings?.footnoteSeparatorStories;
+  if (stories && settings?.nativeSeparatorRoles?.footnote) {
+    throw new TypeError('Native and DOCX footnote separator stories cannot both be sealed');
+  }
+  for (const [role, definition] of Object.entries(stories ?? {})) {
+    if (role !== 'separator' && role !== 'continuationSeparator') {
+      throw new TypeError(`Invalid note separator story definition: ${role}`);
+    }
+    const mode = role === 'separator' ? settings?.footnoteSeparator : settings?.footnoteContinuationSeparator;
+    const root = selectedNoteSeparatorSource(role);
+    if (!definition || definition.role !== role || sourceKey(definition.root) !== sourceKey(root)
+      || sourceKey(definition.paragraph) !== sourceKey({ ...root, path: [0] })
+      || (mode !== 'short' && mode !== 'full')) {
+      throw new TypeError(`Invalid note separator story definition: footnote:${role}`);
+    }
+    defined.add(sourceKey(root));
+    const story = blocks.storyRoot(root);
+    const paragraph = blocks.resolve(definition.paragraph);
+    if (story.length !== 1 || story[0] !== paragraph || paragraph.type !== 'paragraph'
+      || paragraph.runs.length !== 0) {
+      throw new TypeError(`Note separator story paragraph mismatch: ${sourceKey(root)}`);
+    }
+  }
+  for (const kind of ['footnote', 'endnote'] as const) {
+    const definitions = settings?.nativeSeparatorRoles?.[kind];
+    if (!definitions) continue;
+    assertExactOwnKeys(definitions, ['separator', 'continuationSeparator', 'continuationNotice'],
+      'Native note separator definitions');
+    for (const [role, definition] of Object.entries(definitions)) {
+      const { root } = definition;
+      if (definition.role !== role || root.story !== kind || root.path.length !== 0
+        || reservedNoteSeparatorRole(root) !== role) {
+        throw new TypeError(`Invalid native note separator definition: ${kind}:${role}`);
+      }
+      defined.add(sourceKey(root));
+      const story = blocks.storyRoot(root);
+      const paragraph = definition.paragraph
+        ? blocks.resolve(definition.paragraph.source) : undefined;
+      if (definition.paragraph ? story.length !== 1 || story[0] !== paragraph || paragraph?.type !== 'paragraph'
+        || sourceKey(definition.paragraph.source) !== sourceKey({ ...root, path: [0] })
+        : story.length !== 0) {
+        throw new TypeError(`Native note separator paragraph mismatch: ${sourceKey(root)}`);
+      }
+      if (definition.rule) {
+        const control = paragraph?.type === 'paragraph' ? paragraph.runs[0] : undefined;
+        if (sourceKey(definition.rule.control) !== sourceKey({ ...root, path: [0, 0] })
+          || control?.type !== 'text' || control.noteSeparatorCharacter !== 'rule-control') {
+          throw new TypeError(`Native note separator control mismatch: ${sourceKey(root)}`);
+        }
+      }
+    }
+  }
+  assertExactMembership(
+    new Set(blocks.reservedNoteRoots.map(sourceKey)),
+    defined,
+    'Reserved note separator root',
+  );
+}
+
 function validateBodyLayoutSources(
   input: BodyLayoutInput,
   blocks: LayoutBlockRepository,
 ): void {
+  validateNativeNoteSeparatorRoles(input, blocks);
   const requireStory = (source: SourceRef | null): void => {
     if (!source) return;
     blocks.storyRoot(source);
@@ -317,6 +400,7 @@ function sealLayoutSourceStoreWithBody(
     ['body blocks', blocks.body],
     ['footnotes', blocks.footnotes],
     ['endnotes', blocks.endnotes],
+    ['reserved note roots', blocks.reservedNoteRoots],
     ['acquisition facts', input.acquisitionFacts],
     ['paragraph facts', input.acquisitionFacts.paragraphs],
     ['table facts', input.acquisitionFacts.tables],
@@ -517,6 +601,13 @@ export interface LayoutBlockRepositoryInput {
   }>[];
   readonly footnotes: readonly LayoutStoryNote[];
   readonly endnotes: readonly LayoutStoryNote[];
+  /** Closed native reserved separator roots (`footnote`/`endnote` kinds,
+   * `reserved:*` instances) and ordinary DOCX selected footnote story roots
+   * (`selected:*`), registered once per document. */
+  readonly reservedNoteStories?: readonly Readonly<{
+    source: SourceRef;
+    body: readonly LayoutStoryBlock[];
+  }>[];
 }
 
 function storyKey(source: Pick<SourceRef, 'story' | 'storyInstance'>): string {
@@ -545,15 +636,34 @@ export function createLayoutBlockRepository(
     const result = new Map<string, readonly LayoutStoryBlock[]>();
     for (const note of notes) {
       if (result.has(note.id)) throw new TypeError(`Duplicate ${kind} story source: ${note.id}`);
+      // The reserved namespaces are closed: never shadow a numbered note body.
+      if (isReservedNoteSeparatorInstance(note.id) || isSelectedNoteSeparatorInstance(note.id)) {
+        throw new TypeError(`${kind} ${note.id} collides with a reserved note separator story`);
+      }
       result.set(note.id, note.content);
     }
     return result;
   };
   const footnotes = noteMap(input.footnotes, 'footnote');
   const endnotes = noteMap(input.endnotes, 'endnote');
+  const reservedInput = input.reservedNoteStories ?? [];
+  sealPlainData(reservedInput, 'layout source reserved note stories');
+  const reserved = new Map<string, readonly LayoutStoryBlock[]>();
+  for (const { source, body } of reservedInput) {
+    if (source.path.length !== 0 || (source.story !== 'footnote' && source.story !== 'endnote')
+      || !(isReservedNoteSeparatorInstance(source.storyInstance)
+        || (source.story === 'footnote' && isSelectedNoteSeparatorInstance(source.storyInstance)))) {
+      throw new TypeError(`Unsupported reserved note story source: ${storyKey(source)}`);
+    }
+    const key = storyKey(source);
+    if (reserved.has(key)) throw new TypeError(`Duplicate reserved note story source: ${key}`);
+    reserved.set(key, body);
+  }
   const storyRoot = (source: SourceRef): readonly LayoutStoryBlock[] => {
     if (source.path.length !== 0) throw new Error('Story lookup requires a root-only source');
     if (source.story === 'body' && source.storyInstance === 'body') return input.body;
+    const reservedBody = reserved.get(storyKey(source));
+    if (reservedBody) return reservedBody;
     if (source.story === 'footnote') {
       const body = footnotes.get(source.storyInstance);
       if (body) return body;
@@ -586,10 +696,12 @@ export function createLayoutBlockRepository(
   for (const { source, body } of input.stories) indexBody(body, source);
   for (const note of input.footnotes) indexBody(note.content, { story: 'footnote', storyInstance: note.id, path: [] });
   for (const note of input.endnotes) indexBody(note.content, { story: 'endnote', storyInstance: note.id, path: [] });
+  for (const { source, body } of reservedInput) indexBody(body, source);
   return Object.freeze({
     body: input.body,
     footnotes: input.footnotes,
     endnotes: input.endnotes,
+    reservedNoteRoots: Object.freeze(reservedInput.map(({ source }) => source)),
     sources: Object.freeze(indexedSources),
     resolve(source: SourceRef) {
       const block = blocks.get(sourceKey(source));

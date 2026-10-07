@@ -1,3 +1,4 @@
+import { MAX_BODY_LAYOUT_PAGES } from './resource-budgets.js';
 import type { SectionLayoutContext } from '../layout-context.js';
 import type {
   BodyLayoutInput,
@@ -60,11 +61,14 @@ import {
   resolveSectionContextForPage,
 } from './context.js';
 import {
+  sectionWritingMode,
   transformRect,
   uprightPhysicalExtent,
-  writingModeFromTextDirection,
 } from './coordinate-space.js';
-import { selectParagraphFragment, type ParagraphFragmentCursor } from './paragraph-pagination.js';
+import {
+  selectParagraphFragment,
+  type ParagraphFragmentCursor,
+} from './paragraph-pagination.js';
 import {
   anchorKeysId,
   anchorLineDeferralApplies,
@@ -78,9 +82,19 @@ import {
   type AnchorLineDeferralProof,
   type PageAnchorInputEvent,
 } from './anchor-line-deferral.js';
+import { paragraphContinuingPrefixAdvancesPt } from './paragraph.js';
+import {
+  createFootnotePartitioner,
+  moveContinuationNotice,
+  type ContinuationNoticeProvider,
+  type FootnotePartitionExtent,
+  type FootnoteCursor,
+} from './footnote-fragmentation.js';
+import { noteSeparatorOccurrence } from './native-note-separators.js';
 import { paragraphGapAdjustment } from './paragraph-spacing.js';
 import {
   endnoteIdsInRetainedSlice,
+  footnoteIdsInRetainedLines,
   footnoteIdsInRetainedSlice,
 } from './note-reference-ownership.js';
 import { exactRetainedColumnBalanceTarget } from './column-balance-frontier.js';
@@ -93,6 +107,9 @@ import {
 } from './section-page-identity.js';
 import {
   wordActiveColumnBreakIndexes,
+  wordFinalParagraphAdmissionExtentPt,
+  wordParagraphFootnoteMayContinue,
+  wordFootnoteLookaheadBoundary,
   wordEmptyKeepNextBridgesSuccessor,
   wordFlowNeutralPreBreakAnchorParagraph,
   wordPreBreakHostAnchorExtentPt,
@@ -126,6 +143,7 @@ import type {
   ParagraphLayout,
   SourceRef,
   TableLayout,
+  WritingMode,
 } from './types.js';
 import { createPageLayers, pageLayerNodes, type PageLayerNode } from './page-graph.js';
 import {
@@ -141,7 +159,7 @@ import { paginationFieldPageContexts } from './pagination-fields.js';
 
 // Resource governance independent of compatibility thresholds: each physical
 // page retains flow/paint state. Bound adversarial page generation globally.
-const MAX_BODY_LAYOUT_PAGES = 10_000;
+// The full-note acquisition and paginator share one physical-page budget.
 
 class FootnoteAdmissionOverflowError extends Error {
   readonly code = 'FOOTNOTE_RESERVE_EXCEEDS_FRESH_PAGE' as const;
@@ -200,6 +218,39 @@ function nestedStoryDiagnostics(
     ];
   }
   return own;
+}
+
+/** Notes already planned for the fragment being admitted (not committed). */
+type PendingFootnotes = Readonly<{
+  ids: Pick<ReadonlySet<string>, 'has' | 'size'>;
+  carriesNotice: boolean;
+}>;
+
+const NO_PENDING_FOOTNOTES: PendingFootnotes =
+  Object.freeze({ ids: new Set<string>(), carriesNotice: false });
+
+/** Minimum requirements of a later reference in the same body unit: at least
+ * one earlier note always precedes it on the page (so it never owns the
+ * separator band), and the unit's single notice is reserved separately. Its
+ * own ids are unique among the paragraph's events, so no exclusion applies. */
+const LATER_UNIT_REFERENCE: PendingFootnotes = Object.freeze({
+  ids: Object.freeze({ has: () => false, size: 1 }),
+  carriesNotice: true,
+});
+
+/**
+ * Smallest fragment end at or after `lineEnd` that ECMA-376 §17.3.1.44
+ * widow/orphan control accepts for a fragment of `total` remaining lines,
+ * mirroring the selector's `adjustForWidowOrphan`: a lone first line is an
+ * orphan and a selection that leaves exactly one line is a widow.
+ */
+function widowLegalLineEnd(lineEnd: number, total: number): number {
+  for (let end = lineEnd; end < total; end += 1) {
+    const orphan = end === 1;
+    const widow = total - end === 1 && end >= 2;
+    if (!orphan && !widow) return end;
+  }
+  return total;
 }
 
 function assertFreshPageFootnoteAdmission(
@@ -305,6 +356,7 @@ function flowSection(owner: BodySectionLayoutInput, pageIndex: number) {
     geometry: context.geometry,
     columns: context.columns,
     textDirection: context.textDirection,
+    ...(context.nativeSectionFlow ? { nativeSectionFlow: context.nativeSectionFlow } : {}),
     sectionBidi: context.sectionBidi === true,
     grid: context.grid,
   });
@@ -324,7 +376,7 @@ function pageRegion(
     sectionOccurrenceId: owner.sectionOccurrenceId,
     section: context,
     pageBorders: owner.pageBordersAuthored ? owner.pageBorders : null,
-    writingMode: writingModeFromTextDirection(context.textDirection),
+    writingMode: sectionWritingMode(context),
     blockStartPt,
     blockEndPt: interval.blockEndPt,
     columnFlowDirection: context.sectionBidi === true ? 'rtl' : 'ltr',
@@ -344,7 +396,7 @@ function physicalPage(
   section: DeepReadonly<SectionLayoutContext>,
   interval: ReservedBodyInterval,
 ) {
-  const writingMode = writingModeFromTextDirection(section.textDirection);
+  const writingMode = sectionWritingMode(section);
   const extent = uprightPhysicalExtent({
     widthPt: section.geometry.pageWidth,
     heightPt: section.geometry.pageHeight,
@@ -1095,6 +1147,7 @@ function* paginateBodyPassSteps(
     return undefined;
   };
   yield* prescanPageAnchors(state, 0);
+  let placePendingFootnoteContinuations: () => void = () => {};
   const commitTransition = function* (
     transition: ReturnType<typeof applyAuthoredBreak>,
     nextEntryIndex: number,
@@ -1122,6 +1175,7 @@ function* paginateBodyPassSteps(
       const nextLocation = acquisitionLocation(state);
       session.resetPageAcquisition(nextLocation);
       if (!skipPageAnchorPrescan) yield* prescanPageAnchors(state, nextEntryIndex);
+      placePendingFootnoteContinuations();
     } else {
       const nextLocation = acquisitionLocation(state);
       session.moveAcquisitionCursor(nextLocation);
@@ -1136,34 +1190,81 @@ function* paginateBodyPassSteps(
   const footnoteIdsByPage = new Map<number, Set<string>>();
   const footnoteReserveByPage = new Map<number, number>();
   const footnoteLayoutsByPage = new Map<number, NoteLayout[]>();
+  const pendingFootnoteContinuations = new Map<string, FootnoteCursor>();
+  // Pages whose note band opens with a committed incoming tail: real
+  // retained lines of a note continued from an earlier page, placed before
+  // any body (placePendingFootnoteContinuations). Not a newly referenced note,
+  // a notice, a separator-only band or a carried line-free paragraph.
+  const incomingTailPages = new Set<number>();
+  const partitionFootnote = createFootnotePartitioner();
+  // Native continuation notice (MS-DOC 2.3.3; ECMA-376 §17.18.33). The story
+  // is acquired through the ordinary story contract only when a fragment
+  // actually continues; its definition is shared, its occurrence page-owned.
+  const continuationNotice = input.noteLayoutSettings?.nativeSeparatorRoles?.footnote?.continuationNotice;
+  const continuationNoticeFor = (
+    location: BodyAcquisitionLocation,
+    inlineExtentPt: number,
+    pendingCarriesNotice = false,
+  ): ContinuationNoticeProvider | undefined => {
+    if (!continuationNotice?.paragraph || continuationNotice.paragraph.hidden) return undefined;
+    // One notice per page: a page that already reserved it (committed, or
+    // in an earlier reference-line plan of the fragment being admitted)
+    // lends it to the new band-final note at commit instead of charging a
+    // second reserve.
+    if (footnoteLayoutsByPage.get(state.flow.pageIndex)?.some((note) => note.trailing)) return undefined;
+    if (pendingCarriesNotice) return undefined;
+    return () => {
+      if (!session.layoutStory) throw new Error('A footnote continuation notice requires story layout');
+      const bounds = {
+        xPt: location.availableBounds.xPt,
+        yPt: 0,
+        widthPt: inlineExtentPt,
+        heightPt: location.section.geometry.pageHeight,
+      };
+      const story = session.layoutStory({
+        source: continuationNotice.root,
+        pageIndex: state.flow.pageIndex,
+        section: location.section,
+        container: { id: `notes:page:${state.flow.pageIndex}:notice`, kind: 'footnote', bounds },
+      });
+      return noteSeparatorOccurrence(continuationNotice, story, bounds);
+    };
+  };
+  type FootnoteAdmission = Readonly<{
+    ids: readonly string[];
+    layouts: readonly NoteLayout[];
+    reservePt: number;
+    continuations: readonly Readonly<{ id: string; cursor: FootnoteCursor }>[];
+  }>;
   // §17.18.77 observes committed references even when their measured reserve is zero;
   // footnoteReservePt remains only the page-local geometry charge.
   const hasFootnoteReferenceOnPage = (pageIndex: number): boolean => (
     (footnoteIdsByPage.get(pageIndex)?.size ?? 0) > 0
   );
+  /** Whole-note admission for every reference in a slice (no partition). */
   const footnoteAdmission = (
     candidate: ParagraphLayout | TableLayout,
     inlineExtentPt: number,
     retainedReferenceIds?: readonly string[],
-  ): Readonly<{
-    ids: readonly string[];
-    layouts: readonly NoteLayout[];
-    reservePt: number;
-  }> => footnoteAdmissionForIds(
+  ): FootnoteAdmission => footnoteAdmissionForIds(
     retainedReferenceIds ?? footnoteIdsInRetainedSlice(candidate),
     inlineExtentPt,
   );
+  /** `pending` summarises earlier reference-line plans of the fragment being
+   * admitted (maintained incrementally by their owner): their notes are not
+   * re-acquired, and they already own the page's separator band and any
+   * continuation notice. */
   const footnoteAdmissionForIds = (
     retainedReferenceIds: readonly string[],
     inlineExtentPt: number,
-  ): Readonly<{
-    ids: readonly string[];
-    layouts: readonly NoteLayout[];
-    reservePt: number;
-  }> => {
-    const retained = footnoteIdsByPage.get(state.flow.pageIndex) ?? new Set<string>();
+    availableReservePt?: number,
+    pending: PendingFootnotes = NO_PENDING_FOOTNOTES,
+    extent: FootnotePartitionExtent = 'largest',
+  ): FootnoteAdmission => {
+    const committed = footnoteIdsByPage.get(state.flow.pageIndex) ?? new Set<string>();
+    const pendingIds = pending.ids;
     const ids = [...new Set(retainedReferenceIds)]
-      .filter((id) => !retained.has(id));
+      .filter((id) => !committed.has(id) && !pendingIds.has(id));
     const location = acquisitionLocation(state);
     if (ids.length > 0 && !session.layoutNotes) {
       throw new Error('Footnote layout requires a note-capable layout session');
@@ -1183,17 +1284,33 @@ function* paginateBodyPassSteps(
           heightPt: location.section.geometry.pageHeight,
         },
       },
-      firstOnPage: retained.size === 0,
+      firstOnPage: committed.size === 0 && pendingIds.size === 0,
+    });
+    const continuations: Array<Readonly<{ id: string; cursor: FootnoteCursor }>> = [];
+    const admittedLayouts = layouts.map((note, index) => {
+      if (services.allowFootnoteContinuation !== true
+        || availableReservePt === undefined || index !== layouts.length - 1) return note;
+      const precedingPt = layouts.slice(0, index).reduce((sum, preceding) => sum + preceding.advancePt, 0);
+      const partition = partitionFootnote(note, null, Math.max(0, availableReservePt - precedingPt),
+        extent === 'minimum' ? undefined : continuationNoticeFor(location, inlineExtentPt, pending.carriesNotice),
+        extent);
+      if (partition?.nextCursor) {
+        continuations.push(Object.freeze({ id: note.source.storyInstance, cursor: partition.nextCursor }));
+        return partition.fragment;
+      }
+      return note;
     });
     return Object.freeze({
       ids: Object.freeze(ids),
-      layouts,
-      reservePt: layouts.reduce((sum, note) => sum + note.advancePt, 0),
+      layouts: Object.freeze(admittedLayouts),
+      reservePt: admittedLayouts.reduce((sum, note) => sum + note.advancePt, 0),
+      continuations: Object.freeze(continuations),
     });
   };
   const commitFootnotes = (
     ids: readonly string[],
     layouts: readonly NoteLayout[],
+    continuations: FootnoteAdmission['continuations'] = [],
   ) => {
     let retained = footnoteIdsByPage.get(state.flow.pageIndex);
     if (!retained) {
@@ -1202,7 +1319,36 @@ function* paginateBodyPassSteps(
     }
     ids.forEach((id) => retained!.add(id));
     const retainedLayouts = footnoteLayoutsByPage.get(state.flow.pageIndex) ?? [];
-    retainedLayouts.push(...layouts);
+    // Reusable full-note acquisition may have first been requested during a
+    // rejected admission on another page. Intact notes need destination
+    // ownership too; fragmented notes already project only their admitted lines.
+    const ownedLayouts = services.allowFootnoteContinuation !== true ? layouts : layouts.map(note => {
+      const domain = `${note.flowDomainId}:footnote:${note.source.storyInstance}`;
+      if (note.story.blocks.every(block => block.flowDomainId === domain)) return note;
+      return Object.freeze({ ...note, story: Object.freeze({ ...note.story,
+        blocks: Object.freeze(note.story.blocks.map((block, index) => {
+          if (block.kind !== 'paragraph' && block.kind !== 'table') {
+            throw new Error('Unsupported retained footnote block');
+          }
+          return projectBodyOccurrence(block, { occurrenceId: `${note.id}:block:${index}`,
+            destination: { coordinateSpace: 'logical-page-points', flowDomainId: domain,
+              translation: { xPt: 0, yPt: 0 } } });
+        })),
+      }) });
+    });
+    retainedLayouts.push(...ownedLayouts);
+    // §17.18.33: the page's one continuation notice ends its note band. A note
+    // committed after the carrier takes the already-reserved notice; a later
+    // continuing partition on this page reserves none (continuationNoticeFor).
+    const carriers = retainedLayouts.flatMap((note, index) => note.trailing ? [index] : []);
+    if (carriers.length > 1) throw new Error('A page note band owns exactly one continuation notice');
+    const carrierIndex = carriers[0];
+    const lastIndex = retainedLayouts.length - 1;
+    if (carrierIndex !== undefined && carrierIndex !== lastIndex) {
+      const moved = moveContinuationNotice(retainedLayouts[carrierIndex]!, retainedLayouts[lastIndex]!);
+      retainedLayouts[carrierIndex] = moved.carrier;
+      retainedLayouts[lastIndex] = moved.receiver;
+    }
     footnoteLayoutsByPage.set(state.flow.pageIndex, retainedLayouts);
     // The retained note band sums individual advances in document order.
     // Adding independently summed reference groups changes floating-point
@@ -1212,6 +1358,66 @@ function* paginateBodyPassSteps(
       state.flow.pageIndex,
       state.footnoteReservePt,
     );
+    continuations.forEach(({ id, cursor }) => pendingFootnoteContinuations.set(id, cursor));
+  };
+  placePendingFootnoteContinuations = () => {
+    if (pendingFootnoteContinuations.size === 0) return;
+    const pending = [...pendingFootnoteContinuations];
+    pendingFootnoteContinuations.clear();
+    const location = acquisitionLocation(state);
+    for (const [pendingIndex, [id, cursor]] of pending.entries()) {
+      if (!session.layoutNotes) throw new Error('Footnote continuation requires note layout');
+      const [acquired] = session.layoutNotes({
+        kind: 'footnote',
+        referenceIds: Object.freeze([id]),
+        pageIndex: state.flow.pageIndex,
+        section: location.section,
+        container: {
+          id: `notes:page:${state.flow.pageIndex}`,
+          kind: 'footnote',
+          bounds: {
+            xPt: location.availableBounds.xPt,
+            yPt: 0,
+            widthPt: location.availableBounds.widthPt,
+            heightPt: location.section.geometry.pageHeight,
+          },
+        },
+        firstOnPage: !hasFootnoteReferenceOnPage(state.flow.pageIndex),
+        continuing: true,
+      });
+      if (!acquired) continue;
+      const capacityPt = Math.max(0, activeBlockEndPt(state)
+        - state.footnoteReservePt - state.flow.deepestColumnBlockPt);
+      const partition = partitionFootnote(acquired, cursor, capacityPt,
+        continuationNoticeFor(location, location.availableBounds.widthPt));
+      if (!partition) {
+        if (!hasFootnoteReferenceOnPage(state.flow.pageIndex)) {
+          throw new NoteCapacityExceededError('footnote', state.flow.pageIndex, `notes:page:${state.flow.pageIndex}`);
+        }
+        // Library continuation policy: an earlier retained fragment can use
+        // this page's capacity without making a later source cursor invalid.
+        // Keep that cursor and its following peers in reference order for the
+        // next page; emit no empty fragment or extra separator/notice reserve.
+        // A first fragment that cannot fit the fresh band still fails above,
+        // so deferral cannot create an unbounded sequence of empty pages.
+        for (let index = pendingIndex; index < pending.length; index += 1) {
+          const [deferredId, deferredCursor] = pending[index]!;
+          pendingFootnoteContinuations.set(deferredId, deferredCursor);
+        }
+        break;
+      }
+      commitFootnotes([id], [partition.fragment], partition.nextCursor
+        ? [Object.freeze({ id, cursor: partition.nextCursor })]
+        : []);
+      // The partitioner also carries a line-free paragraph on its own (an
+      // empty paragraph keeps its spacing, ownership and cursor), so a
+      // non-null fragment can hold no line. The carried-tail class was
+      // observed only with real retained note lines; an empty-only, notice or
+      // separator-only band does not ground it.
+      if (partition.fragment.story.blocks.some(block => block.kind === 'paragraph' && block.lines.length > 0)) {
+        incomingTailPages.add(state.flow.pageIndex);
+      }
+    }
   };
   // §17.11.21 / §17.18.34 assign each note to the physical page that paints
   // its reference. Growing that page-wide band must not clip a deeper column
@@ -1225,6 +1431,365 @@ function* paginateBodyPassSteps(
   const footnoteReserveInvadesCommittedPageContent = (reservePt: number): boolean => (
     reservePt > additionalFootnoteReserveCapacityPt()
   );
+  // A region is "fresh" only when moving on cannot gain space. A page whose
+  // note band already holds committed lines (carried tails of earlier notes,
+  // placed before any body) is not: those lines belong to their own notes and
+  // shrink page by page, so relocating gains their space and the next page
+  // can still progress. Treating such a page as fresh would force a block in
+  // with a note it cannot hold, pushing the page-bottom band (§17.11.21) off
+  // the page. Continuation-off pages carry no tails, so there this is the
+  // existing body-content rule.
+  const pageCanGainSpaceByRelocating = (): boolean => (
+    state.flow.pageHasContent || state.footnoteReservePt > 0
+  );
+  const noteContinuationEligibilityByEntry = new Map<number, boolean>();
+  const noteContinuationBeforeHardBreak = (entryIndex: number): boolean => {
+    const cached = noteContinuationEligibilityByEntry.get(entryIndex);
+    if (cached !== undefined) return cached;
+    // word-paragraph-footnote-continuation: cache traversed entries so the
+    // bounded compatibility lookahead visits each following block once.
+    const visited = [entryIndex];
+    const finish = (eligible: boolean): boolean => {
+      visited.forEach((index) => noteContinuationEligibilityByEntry.set(index, eligible));
+      return eligible;
+    };
+    for (let index = entryIndex + 1; index < input.sequence.length; index += 1) {
+      const prior = noteContinuationEligibilityByEntry.get(index);
+      if (prior !== undefined) return finish(prior);
+      const next = input.sequence[index]!;
+      if (wordFootnoteLookaheadBoundary(next)) return finish(true);
+      const block = next.kind === 'body-block' ? next.block
+        : next.kind === 'adjacent-table-group' ? next : null;
+
+      if (block) {
+        const location = acquisitionLocation(state);
+        const measurement = session.measureFollowingBlock({
+          input: block,
+          location,
+          availableInlineExtentPt: location.availableBounds.widthPt,
+        });
+        if ((measurement.fullFootnoteReferenceIds?.length ?? 0) > 0) return finish(false);
+      }
+      visited.push(index);
+    }
+    return finish(false);
+  };
+  /**
+   * Reference-line footnote plans for one paragraph placement attempt
+   * (word-reference-line-footnote-allocation; continuation mode only).
+   *
+   * Events and immutability: each line that first references notes not yet
+   * on the page is one admission event. Its plan is acquired once and is
+   * immutable: a later event can only add reserve. The reserve charged for a
+   * candidate ending at line `e` is the sum of the plans of events at or
+   * before `e`, so it never decreases as the candidate grows. If an event's
+   * plan cannot fit (no real line of its last note, or its preceding new
+   * notes cannot stay whole), the plan is charged whole, the candidate
+   * through that line fails, and that line is rejected together with every
+   * later line; earlier plans, their source cursors and their charge are
+   * untouched and are exactly what `admissionThrough` commits.
+   *
+   * Body admission unit: a plan is sized against the smallest body fragment
+   * the paragraph's own line constraints let end at or after its reference
+   * line, not against the reference line alone — the whole paragraph for
+   * keepLines at its start (ECMA-376 §17.3.1.14), else the first end that
+   * leaves neither an orphan nor a widow (§17.3.1.44, the selector's rule).
+   * A note head therefore never consumes body space those constraints
+   * require. Where the page already has content, that strict unit governs
+   * and the selector relocates the paragraph if it does not fit. On a fresh
+   * region relocation cannot help, so a unit that cannot fit (the
+   * constraint is impossible there) yields to the next weaker unit, ending
+   * with the reference line itself; content still progresses.
+   *
+   * Work frontier: prefix charges come from one exact prefix-advance index
+   * (no slice per event), pending ids/notice ownership and cumulative
+   * reserves are maintained incrementally, and text-after facts are
+   * precomputed. Where the reserve is a monotone prefix sum (horizontal,
+   * splittable, no keepLines unit), planning stops at the first event whose
+   * own candidate is proven inadmissible (body through its line plus the
+   * cumulative reserve exceeds the selector's limit, or the band would
+   * invade a committed column) and at an anchor-deferral line limit. Every
+   * longer candidate then fails too: its body and reserve can only be
+   * larger, and a completed fragment's admission extent is at least that
+   * prefix's advance because horizontal admission only discounts authored
+   * trailing space. The truncated sum returned for such candidates is a
+   * sound lower bound; no plan beyond the frontier is acquired or charged
+   * to the footnote work budget.
+   */
+  type ReferenceLineFootnotePlans = Readonly<{
+    reservePt(lineEnd: number): number;
+    admissionThrough(lineEnd: number): FootnoteAdmission;
+  }>;
+  const referenceLineFootnotePlans = (
+    layout: ParagraphLayout,
+    options: Readonly<{
+      indivisible: boolean;
+      continuesFromPrevious: boolean;
+      entryIndex: number;
+      /** Whether moving the paragraph on can gain space (the selector's own
+       * relocation flag); false only for a genuinely fresh region. */
+      canRelocate: boolean;
+      /** keepLines that still governs this fragment (paragraph start). */
+      keepLines: boolean;
+      widowControl: boolean;
+      lineEndLimit: number | undefined;
+      /** The selector's block limit, including any trailing-mark allowance. */
+      admissionLimitPt: number;
+      /** Authored §17.3.1.33 space after, as given to the selector. */
+      authoredSpaceAfterPt: number;
+      writingMode: WritingMode;
+    }>,
+  ): ReferenceLineFootnotePlans => {
+    const location = acquisitionLocation(state);
+    const inlineExtentPt = location.availableBounds.widthPt;
+    const availablePt = location.availableBounds.heightPt;
+    const freshExtentPt = freshPageExtent(state);
+    const canRelocate = options.canRelocate;
+    // Carried-tail class: this page's band already opens with real retained
+    // lines of an earlier note (committed before any body). A page fact,
+    // independent of capacity, so the real plans and the mandatory-unit minima
+    // read the same value. Heads are still sized from `availablePt`, which
+    // already excludes that committed tail reserve exactly once.
+    const pageOpensWithIncomingTail = incomingTailPages.has(state.flow.pageIndex);
+    const total = layout.lines.length;
+    const frontierBounded = !options.indivisible && !options.keepLines
+      && options.writingMode !== 'vertical-rl';
+    const prefixAdvancesPt = options.indivisible
+      ? null
+      : paragraphContinuingPrefixAdvancesPt(layout, options.continuesFromPrevious);
+    // A unit that completes the paragraph is charged with its retained advance,
+    // including authored spacing after: §17.3.1.33 spacing follows the last
+    // line, and here the note band (§17.11) follows the body, so the body ends
+    // at the band rather than at a page edge. The selector's page/column-edge
+    // trailing-space admission (WORD_TRAILING_SPACE_AFTER_FIT_ADMISSION) has no
+    // evidence at that boundary, so plans do not use it. Public Word 16.113.3
+    // controls with exact lines split the note at the same point.
+    const bodyAdvancePt = (lineEnd: number): number => prefixAdvancesPt === null
+      ? layout.advancePt
+      : lineEnd < total ? prefixAdvancesPt[lineEnd]! : prefixAdvancesPt[total]! + layout.spacing.afterPt;
+    // The completing body without only its admissible authored after, through
+    // the selector's own trailing-space projection. It never sizes a head; it
+    // only identifies the after-only class for wordParagraphFootnoteMayContinue.
+    const completingBodyWithoutAfterPt = wordFinalParagraphAdmissionExtentPt({
+      advancePt: bodyAdvancePt(total),
+      retainedSpaceAfterPt: layout.spacing.afterPt,
+      authoredSpaceAfterPt: options.authoredSpaceAfterPt,
+    });
+    // Text after an event's first reference, without suffix copies: a
+    // custom-mark reference is a zero-width anchor host and is still the
+    // event's reference (§17.18.34 ownership), not following text.
+    const isFollowingText = (placement: ParagraphLayout['lines'][number]['placements'][number]) =>
+      placement.kind === 'text' && placement.noteReference?.kind !== 'footnote'
+      && placement.text.trim().length > 0;
+    const textFromLine = new Array<boolean>(total + 1).fill(false);
+    for (let line = total - 1; line >= 0; line -= 1) {
+      textFromLine[line] = textFromLine[line + 1]! || layout.lines[line]!.placements.some(isFollowingText);
+    }
+    const textAfterReference = (line: number, ids: ReadonlySet<string>): boolean => {
+      const placements = layout.lines[line]?.placements ?? [];
+      const first = placements.findIndex((placement) =>
+        (placement.kind === 'text' || placement.kind === 'anchor-host')
+        && placement.noteReference?.kind === 'footnote' && ids.has(placement.noteReference.id));
+      if (first < 0) return false;
+      return placements.slice(first + 1).some(isFollowingText) || textFromLine[line + 1]!;
+    };
+    type FootnoteEvent = Readonly<{ referenceLine: number; lineEnd: number; ids: readonly string[] }>;
+    const events: FootnoteEvent[] = [];
+    const seen = new Set<string>();
+    layout.lines.forEach((line, index) => {
+      const ids = footnoteIdsInRetainedLines([line]).filter((id) => !seen.has(id));
+      ids.forEach((id) => seen.add(id));
+      if (ids.length === 0) return;
+      if (options.indivisible && events.length > 0) {
+        // An indivisible fragment is admitted whole: one event at its end.
+        const merged = events.pop()!;
+        events.push({ ...merged, ids: [...merged.ids, ...ids] });
+      } else {
+        events.push({ referenceLine: index, lineEnd: options.indivisible ? total : index + 1, ids });
+      }
+    });
+    const eventsThrough = new Array<number>(total + 1).fill(0);
+    for (const event of events) eventsThrough[event.lineEnd] = (eventsThrough[event.lineEnd] ?? 0) + 1;
+    for (let lineEnd = 1; lineEnd <= total; lineEnd += 1) eventsThrough[lineEnd]! += eventsThrough[lineEnd - 1]!;
+    const admissionUnitEnds = (lineEnd: number): readonly number[] => {
+      if (options.indivisible) return [total];
+      const ends: number[] = [];
+      if (options.keepLines) ends.push(total);
+      if (options.widowControl) ends.push(widowLegalLineEnd(lineEnd, total));
+      ends.push(lineEnd);
+      return [...new Set(ends)];
+    };
+    const plans: FootnoteAdmission[] = [];
+    const cumulativePt = [0];
+    const pending = { ids: new Set<string>(), carriesNotice: false };
+    let frontierReached = false;
+    // Mandatory-unit lookahead. When an event's body unit also contains later
+    // reference lines, those references must be admitted with it, so its
+    // plan first reserves their legal minimum: every preceding new note of
+    // that event whole and its last new note's first real line (the
+    // partitioner's minimum-head extent) when existing continuation policy
+    // lets it split, else that note whole. These minima are taken from the
+    // measured stories once per event and kept as prefix sums; they are
+    // conservative (continuation eligibility is judged with the smallest
+    // possible charge, so a note that might have to stay whole is reserved
+    // whole). The page's single native notice is added once if any of those
+    // minima continues and neither the page nor an accepted plan owns it;
+    // the current plan then partitions inside the capacity left after that
+    // reserve and, if it continues, carries the same notice, so the notice is
+    // never reserved twice while planning or committing (one band, one
+    // notice). Only the events inside the unit are examined, so ordinary units have
+    // no lookahead. The later event is then planned for real against the
+    // capacity left, greedily, and earlier accepted plans never change.
+    const minimumPt: number[] = [];
+    const minimumPrefixPt = [0];
+    const minimumContinuesPrefix = [0];
+    const requireMinimum = (count: number): void => {
+      while (minimumPt.length < count) {
+        const index = minimumPt.length;
+        const event = events[index]!;
+        const whole = footnoteAdmissionForIds(event.ids, inlineExtentPt, undefined, LATER_UNIT_REFERENCE);
+        const textAfter = textAfterReference(event.referenceLine, new Set(event.ids));
+        const wholeNoteFitsFreshPage = bodyAdvancePt(admissionUnitEnds(event.lineEnd)[0]!)
+          + whole.reservePt <= freshExtentPt;
+        const mayPartition = wordParagraphFootnoteMayContinue({
+          wholeNoteFitsWithReference: false,
+          wholeNoteFitsFreshPage,
+          textAfterReference: textAfter,
+          hardBreakBeforeNextNote: wholeNoteFitsFreshPage && !textAfter && index + 1 === events.length
+            && noteContinuationBeforeHardBreak(options.entryIndex),
+          // The after-only permission depends on the capacity this later
+          // event will actually see, which a minimum taken before its earlier
+          // plans cannot know. Where it would be the only permission, the
+          // legal minimum stays the whole note (conservative for that branch
+          // only); the real plan may still continue the note within whatever
+          // that minimum left.
+          wholeNoteFitsOnlyWithoutTrailingAfter: false,
+          // Unlike the after-only class this permission needs no capacity,
+          // so the legal minimum uses it like the text/break permissions:
+          // the later note's first real line, with any notice in the union.
+          pageOpensWithIncomingTail,
+        });
+        const minimum = mayPartition
+          ? footnoteAdmissionForIds(event.ids, inlineExtentPt, 0, LATER_UNIT_REFERENCE, 'minimum')
+          : whole;
+        minimumPt.push(minimum.reservePt);
+        minimumPrefixPt.push(minimumPrefixPt[index]! + minimum.reservePt);
+        minimumContinuesPrefix.push(minimumContinuesPrefix[index]! + (minimum.continuations.length > 0 ? 1 : 0));
+      }
+    };
+    let noticeAdvancePt: number | undefined;
+    const NO_LATER_RESERVE = Object.freeze({ minimaPt: 0, noticePt: 0 });
+    const laterUnitReserve = (eventIndex: number, unitEnd: number): Readonly<{ minimaPt: number; noticePt: number }> => {
+      const end = eventsThrough[unitEnd]!;
+      if (end <= eventIndex + 1) return NO_LATER_RESERVE;
+      requireMinimum(end);
+      const continues = minimumContinuesPrefix[end]! - minimumContinuesPrefix[eventIndex + 1]! > 0;
+      const notice = continues ? continuationNoticeFor(location, inlineExtentPt, pending.carriesNotice) : undefined;
+      if (notice) noticeAdvancePt ??= notice()?.advancePt ?? 0;
+      return {
+        minimaPt: minimumPrefixPt[end]! - minimumPrefixPt[eventIndex + 1]!,
+        noticePt: notice ? noticeAdvancePt ?? 0 : 0,
+      };
+    };
+    const planNext = (): void => {
+      const event = events[plans.length]!;
+      if (frontierBounded && options.lineEndLimit !== undefined && event.lineEnd > options.lineEndLimit) {
+        frontierReached = true;
+        return;
+      }
+      const plannedPt = cumulativePt[plans.length]!;
+      const whole = footnoteAdmissionForIds(event.ids, inlineExtentPt, undefined, pending);
+      const textAfter = textAfterReference(event.referenceLine, new Set(event.ids));
+      const laterEvent = plans.length + 1 < events.length;
+      let chosen: FootnoteAdmission | undefined;
+      for (const unitEnd of admissionUnitEnds(event.lineEnd)) {
+        const bodyPt = bodyAdvancePt(unitEnd);
+        // Mandatory later references of this unit are charged before this
+        // plan takes any remaining capacity. When their reserve already holds
+        // the page's single notice, this plan partitions inside the capacity
+        // left after it and, if it continues, carries that same notice
+        // instead of reserving another one.
+        const later = laterUnitReserve(plans.length, unitEnd);
+        const laterPt = later.minimaPt + later.noticePt;
+        const wholeChargePt = bodyPt + plannedPt + whole.reservePt + laterPt;
+        const wholeNoteFitsWithReference = wholeChargePt <= availablePt
+          && !footnoteReserveInvadesCommittedPageContent(plannedPt + whole.reservePt + laterPt);
+        const wholeNoteFitsFreshPage = wholeChargePt <= freshExtentPt;
+        // After-only class: a unit that completes the paragraph misses only
+        // because of its admissible authored after. The selector would admit
+        // that whole note with the after overlapping the band; permitting a
+        // split lets a head of at least one real line be sized beside the full
+        // charged body below, keeping that after clear of the band.
+        // Known limitation (owner-pending, not Word's rule): when no real line
+        // fits there (a one-line note, or after filling the capacity), the
+        // partition is null and the existing whole-note fallback still admits
+        // the note over that after. In the public one-line control Word instead
+        // moved the final reference-bearing line and its note to the next page.
+        const wholeNoteFitsOnlyWithoutTrailingAfter = !wholeNoteFitsWithReference
+          && unitEnd === total
+          && unitEnd <= (options.lineEndLimit ?? total)
+          && completingBodyWithoutAfterPt < bodyPt
+          && completingBodyWithoutAfterPt + plannedPt + whole.reservePt + laterPt <= availablePt
+          && !footnoteReserveInvadesCommittedPageContent(plannedPt + whole.reservePt + laterPt);
+        const mayPartition = wordParagraphFootnoteMayContinue({
+          wholeNoteFitsWithReference,
+          wholeNoteFitsFreshPage,
+          textAfterReference: textAfter,
+          hardBreakBeforeNextNote: !wholeNoteFitsWithReference && wholeNoteFitsFreshPage
+            && !textAfter && !laterEvent && noteContinuationBeforeHardBreak(options.entryIndex),
+          wholeNoteFitsOnlyWithoutTrailingAfter,
+          pageOpensWithIncomingTail,
+        });
+        chosen = mayPartition
+          ? footnoteAdmissionForIds(event.ids, inlineExtentPt, Math.max(0, Math.min(
+              availablePt - bodyPt,
+              additionalFootnoteReserveCapacityPt(),
+            ) - plannedPt - laterPt), pending,
+            later.noticePt > 0 ? 'largest-with-reserved-notice' : 'largest')
+          : whole;
+        // The notice is charged once: either in the later reserve or, when
+        // this plan carries it, in this plan's own advance.
+        const sharedNoticePt = later.noticePt > 0 && chosen.layouts.some((note) => note.trailing)
+          ? later.noticePt : 0;
+        const unitReservePt = plannedPt + chosen.reservePt + laterPt - sharedNoticePt;
+        const unitFits = unitEnd <= (options.lineEndLimit ?? total)
+          && bodyPt + unitReservePt <= availablePt
+          && !footnoteReserveInvadesCommittedPageContent(unitReservePt);
+        if (canRelocate || unitFits) break;
+      }
+      plans.push(chosen!);
+      cumulativePt.push(plannedPt + chosen!.reservePt);
+      for (const id of chosen!.ids) pending.ids.add(id);
+      if (chosen!.layouts.some((note) => note.trailing)) pending.carriesNotice = true;
+      const cumulative = cumulativePt[plans.length]!;
+      if (frontierBounded && event.lineEnd < total && (
+        bodyAdvancePt(event.lineEnd) + cumulative > options.admissionLimitPt
+        || footnoteReserveInvadesCommittedPageContent(cumulative)
+      )) frontierReached = true;
+    };
+    const planEvents = (count: number): void => {
+      while (plans.length < count && !frontierReached) planNext();
+    };
+    return Object.freeze({
+      reservePt: (lineEnd: number) => {
+        const count = eventsThrough[Math.min(lineEnd, total)]!;
+        planEvents(count);
+        return cumulativePt[Math.min(count, plans.length)]!;
+      },
+      admissionThrough: (lineEnd: number): FootnoteAdmission => {
+        const count = eventsThrough[Math.min(lineEnd, total)]!;
+        planEvents(count);
+        if (plans.length < count) throw new Error('Footnote plan requested beyond its proven rejection frontier');
+        const admitted = plans.slice(0, count);
+        return Object.freeze({
+          ids: Object.freeze(admitted.flatMap((admission) => admission.ids)),
+          layouts: Object.freeze(admitted.flatMap((admission) => admission.layouts)),
+          reservePt: cumulativePt[count]!,
+          continuations: Object.freeze(admitted.flatMap((admission) => admission.continuations)),
+        });
+      },
+    });
+  };
   let previousParagraph: BodyParagraphSourceInput | null = null;
   const activeColumnBreakIndexes = wordActiveColumnBreakIndexes(input.sequence);
   let terminalDiagnostic: LayoutDiagnostic | null = null;
@@ -1273,9 +1838,9 @@ function* paginateBodyPassSteps(
     }
     if (entry.kind === 'begin-section') {
       previousParagraph = null;
-      const currentWritingMode = writingModeFromTextDirection(activeRegion(state).section.textDirection);
-      const incomingWritingMode = writingModeFromTextDirection(
-        sectionContextForPage(entry.section, state.flow.pageIndex).textDirection,
+      const currentWritingMode = sectionWritingMode(activeRegion(state).section);
+      const incomingWritingMode = sectionWritingMode(
+        sectionContextForPage(entry.section, state.flow.pageIndex),
       );
       const currentPhysical = uprightPhysicalExtent({
         widthPt: activeRegion(state).section.geometry.pageWidth,
@@ -1438,7 +2003,7 @@ function* paginateBodyPassSteps(
               || reserveInvadesCommittedPageContent
             )
             && admissionChargePt <= freshExtentPt
-            && state.flow.pageHasContent
+            && pageCanGainSpaceByRelocating()
           ) {
             yield* commitTransition(
               reserveInvadesCommittedPageContent
@@ -1611,10 +2176,15 @@ function* paginateBodyPassSteps(
             continue;
           }
         }
-        const markReservePt = footnoteAdmission(
-          acquired.layout,
-          location.availableBounds.widthPt,
-        ).reservePt;
+        // The empty-mark allowance can apply only to an undecorated inkless
+        // mark that starts here without keepNext; any other fragment ignores
+        // the reserve, so its whole-note acquisition is not performed (it
+        // would otherwise touch every note of a long paragraph per attempt).
+        const markReserveMatters = cursor.boundary === null && block.inkless === true
+          && !block.keepNext && isUndecoratedInklessMark(acquired.layout);
+        const markReservePt = markReserveMatters
+          ? footnoteAdmission(acquired.layout, location.availableBounds.widthPt).reservePt
+          : 0;
         const pageBottomIsUnreserved = (reserves[state.flow.pageIndex]?.bottom ?? 0) === 0
           && state.footnoteReservePt === 0;
         const physicalRegionBottomIsActive = activeBlockEndPt(state) === activeRegion(state).blockEndPt;
@@ -1638,13 +2208,33 @@ function* paginateBodyPassSteps(
           });
         // A proven anchor-line deferral ends this page just above that line.
         const anchorLineBreak = deferredAnchorLineIndex(acquired.layout);
+        // Same fresh-region rule as framed paragraphs: a page whose band
+        // holds carried note lines is not fresh (pageCanGainSpaceByRelocating).
+        const canRelocateParagraph = pageCanGainSpaceByRelocating();
+        // Continuation mode (the public default) reserves each referenced note
+        // at its reference line; later lines are admitted only beside those
+        // committed plans. With continuation off every note stays whole.
+        const notePlans = services.allowFootnoteContinuation === true
+          ? referenceLineFootnotePlans(acquired.layout, {
+              canRelocate: canRelocateParagraph,
+              indivisible: acquired.fragmentation.kind === 'indivisible',
+              continuesFromPrevious: cursor.boundary !== null,
+              entryIndex,
+              keepLines: cursor.boundary === null && block.keepLines,
+              widowControl: block.widowControl,
+              lineEndLimit: anchorLineBreak,
+              admissionLimitPt: location.availableBounds.heightPt + trailingMarkAdmissionAllowancePt,
+              authoredSpaceAfterPt: block.spaceAfterPt,
+              writingMode: activeRegion(state).writingMode,
+            })
+          : null;
         const selected = selectParagraphFragment(
           acquired.layout,
           cursor,
           acquired.fragmentation,
           location.availableBounds.heightPt + trailingMarkAdmissionAllowancePt,
           freshPageExtent(state),
-          state.flow.pageHasContent,
+          canRelocateParagraph,
           {
             keepLines: block.keepLines,
             widowControl: block.widowControl,
@@ -1652,10 +2242,9 @@ function* paginateBodyPassSteps(
             writingMode: activeRegion(state).writingMode,
             ...(anchorLineBreak === undefined ? {} : { lineEndLimit: anchorLineBreak }),
           },
-          (fragment) => footnoteAdmission(
-            fragment,
-            location.availableBounds.widthPt,
-          ).reservePt,
+          (fragment) => notePlans
+            ? notePlans.reservePt(fragment.lines.length)
+            : footnoteAdmission(fragment, location.availableBounds.widthPt).reservePt,
           acquired.uniformRubyAdvancePt,
           (reservePt) => !footnoteReserveInvadesCommittedPageContent(reservePt),
         );
@@ -1668,6 +2257,10 @@ function* paginateBodyPassSteps(
           continue;
         }
         if (!selected.fragment) throw new Error('Paragraph acquisition made no progress');
+        // Commit exactly the plan objects charged during selection, taken
+        // against the pre-acceptance page state; plans of rejected later
+        // reference lines are never committed.
+        const plannedNotes = notePlans?.admissionThrough(selected.fragment.lines.length);
         state = acceptNode(
           state,
           selected.fragment,
@@ -1678,16 +2271,18 @@ function* paginateBodyPassSteps(
           allocations,
           acquired.placement,
         );
-        const notes = footnoteAdmission(
-          selected.fragment,
-          location.availableBounds.widthPt,
-        );
+        const notes = plannedNotes
+          ?? footnoteAdmission(selected.fragment, location.availableBounds.widthPt);
+        // The fatal guard re-checks the fit the selector admitted, with the
+        // same extent (authored trailing space after a completing fragment is
+        // not charged), so it rejects only notes that cannot fit any fresh
+        // page beside that fragment. Retained advance still drives the cursor.
         assertFreshPageFootnoteAdmission(
           notes.reservePt,
-          selected.fragment.advancePt + notes.reservePt,
+          selected.admissionExtentPt + notes.reservePt,
           freshPageExtent(state),
         );
-        commitFootnotes(notes.ids, notes.layouts);
+        commitFootnotes(notes.ids, notes.layouts, notes.continuations);
         if (acquired.flowRegistryDelta) {
           const acceptedDelta = paragraphFlowRegistryDeltaForAcceptedFragment(
             acquired.flowRegistryDelta,
@@ -1941,6 +2536,19 @@ function* paginateBodyPassSteps(
     }
     session.moveAcquisitionCursor(acquisitionLocation(state));
   }
+  // A note may outlive the final body block; consume the generator so its
+  // physical-page transition commits and the pending line cursor advances.
+  while (pendingFootnoteContinuations.size > 0) {
+    yield* commitTransition(
+      advanceToPage(state.flow, state.flow.section, 'overflow'),
+      input.sequence.length,
+    );
+    // Text-only tail transitions have no anchor prescan to suspend them.
+    // Publish a safe page draft/checkpoint after each admitted note fragment,
+    // so slicing and cancellation do not wait for the entire remaining note.
+    observer?.onPageDrafts?.(state.pages);
+    yield state.pages.length;
+  }
   const reservedPages = new Set([
     ...footnoteReserveByPage.keys(),
     ...footnoteLayoutsByPage.keys(),
@@ -1977,7 +2585,7 @@ function headerFooterReserves(
     if (page.parityBlank) return Object.freeze({ top: 0, bottom: 0 });
     // Vertical header/footer stories paint in physical page space; charging their
     // measured overflow to the logical body interval would create a pagination-only reserve.
-    if (writingModeFromTextDirection(page.section.textDirection) !== 'horizontal-tb') {
+    if (sectionWritingMode(page.section) !== 'horizontal-tb') {
       return Object.freeze({ top: 0, bottom: 0 });
     }
     const owner = owners.get(page.sectionOccurrenceId);
@@ -2051,9 +2659,9 @@ function composePageStories(
       if (!hasPageStories) return page;
       throw new Error('Page-story composition requires a story-capable layout session');
     }
-    const vertical = writingModeFromTextDirection(page.section.textDirection) !== 'horizontal-tb';
+    const vertical = sectionWritingMode(page.section) !== 'horizontal-tb';
     const geometry = vertical
-      ? physicalSectionGeometry(page.section.geometry)
+      ? physicalSectionGeometry(page.section.geometry, page.section.nativeSectionFlow)
       : page.section.geometry;
     const inlineStartPt = Math.abs(geometry.marginLeft);
     const inlineExtentPt = Math.max(
@@ -2061,9 +2669,12 @@ function composePageStories(
       geometry.pageWidth - Math.abs(geometry.marginLeft) - Math.abs(geometry.marginRight),
     );
     const coordinateSpace = vertical ? 'upright-physical' as const : 'section-logical' as const;
+    // Upright physical page stories are horizontal, so a native section frame
+    // does not carry into them.
+    const { nativeSectionFlow: _nativeSectionFlow, ...pageSection } = page.section;
     const pageStorySection: DeepReadonly<SectionLayoutContext> = vertical
       ? Object.freeze({
-          ...page.section,
+          ...pageSection,
           geometry: Object.freeze({ ...geometry }),
           columns: Object.freeze([Object.freeze({
             xPt: inlineStartPt,

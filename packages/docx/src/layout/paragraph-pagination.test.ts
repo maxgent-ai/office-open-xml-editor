@@ -357,4 +357,33 @@ describe('paragraph page-local reserve selection', () => {
       uniformRubyAdvancePt: 30,
     });
   });
+
+  it('keeps an anchor-line limit when completion has a smaller reserve than its prefix', () => {
+    const retained = twoLineParagraph(0);
+    const selected = selectParagraphFragment(
+      retained, { boundary: null }, splittable(twoLineBoundaries),
+      40, 80, true, { keepLines: false, widowControl: false, lineEndLimit: 1 },
+      (fragment) => fragment.continuation?.continuesOnNext ? 46 : 16,
+    );
+    expect(selected.fragment).toBeNull();
+    expect(selected.requiresFreshFlowRegion).toBe(true);
+  });
+
+  it('finalizes a completing continuation through the source slice metadata', () => {
+    const retained = twoLineParagraph(0);
+    const resumed = { ...retained, lines: retained.lines.map((line, index) => ({
+      ...line, range: { start: 4 + index, end: 5 + index },
+    })) };
+    const selected = selectParagraphFragment(
+      resumed, { boundary: { segIndex: 0, charOffset: 4 }, sourceRangeStart: 4 },
+      splittable([{ segIndex: 0, charOffset: 5 }, { segIndex: 0, charOffset: 6 }]), 40, 80, true,
+      { keepLines: false, widowControl: false },
+      (fragment) => fragment.continuation?.continuesOnNext ? 46 : 16,
+    );
+    expect(selected.fragment?.continuation?.continuesFromPrevious).toBe(true);
+    expect(selected.fragment?.continuation?.continuesOnNext).toBe(false);
+    expect(selected.fragment?.lines.map(line => line.range)).toEqual([{ start: 4, end: 5 }, { start: 5, end: 6 }]);
+    expect(selected.nextCursor).toBeNull();
+    expect(selected.additionalReservePt).toBe(16);
+  });
 });

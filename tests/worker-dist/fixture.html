@@ -12,6 +12,8 @@
   <canvas id="docx-chart-ex"></canvas>
   <canvas id="xlsx-chart-ex"></canvas>
   <canvas id="pptx-chart-ex"></canvas>
+  <canvas id="legacy-doc-main"></canvas>
+  <canvas id="legacy-doc-worker"></canvas>
   <script type="module">
     import { DocxDocument, DocxViewer } from '/dist/docx.mjs';
     import { XlsxSheetViewer, XlsxWorkbook } from '/dist/xlsx.mjs';
@@ -151,12 +153,16 @@
       if (new URLSearchParams(location.search).has('pause-sources')) {
         await new Promise((resolve) => { window.resumeSourceStages = resolve; });
       }
+      // The optional legacy entry is part of the selected-source stage.
+      const { legacyDocSource } = await import('/dist/legacy-doc.mjs');
       await runModelSourceStages({
         DocxDocument,
         DocxViewer,
         XlsxWorkbook,
         PptxPresentation,
+        legacyDocSource,
         bytes,
+        paintCanvas: (id) => document.getElementById(id),
       });
 
       document.body.dataset.status = 'ready';

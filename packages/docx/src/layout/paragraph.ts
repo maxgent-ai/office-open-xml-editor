@@ -141,6 +141,7 @@ import {
   transformRect,
   transformRectEdges,
   uprightPhysicalExtent,
+  uprightResourceOrientation,
 } from './coordinate-space.js';
 import { inverseMapAffinePoint } from './affine.js';
 export {
@@ -280,7 +281,7 @@ export interface MeasuredResourcePlanSegment {
   readonly widthPt: number;
   readonly heightPt: number;
   readonly topOffsetPt: number;
-  readonly orientation?: 'upright-physical';
+  readonly orientation?: import('./types.js').UprightResourceOrientation;
 }
 
 export interface MeasuredUnavailableResourcePlanSegment {
@@ -1138,28 +1139,18 @@ function retainPhysicalLines(fragments: readonly LineLayout[], physicalIds: read
   return lines;
 }
 
-function sliceAdvance(input: AcquiredParagraphLayoutInput): number {
+export function paragraphSliceAdvance(input: Pick<AcquiredParagraphLayoutInput,
+  'continuation' | 'lines' | 'spacing' | 'flowBounds' | 'paragraphMark'>): number {
   const continuation = input.continuation;
   const start = continuation?.lineStart ?? 0;
   const end = continuation?.lineEnd ?? input.lines.length;
   if (start < 0 || end < start || end > input.lines.length) {
     throw new RangeError('Paragraph continuation line range is outside the retained lines');
   }
-  let advancePt = continuation?.continuesFromPrevious ? 0 : input.spacing.beforePt;
+  const beforePt = continuation?.continuesFromPrevious ? 0 : input.spacing.beforePt;
+  let advancePt = beforePt;
   for (let index = start; index < end; index += 1) {
-    const line = input.lines[index];
-    if (!line) continue;
-    if (index === 0) {
-      // A remeasured body continuation starts at lineStart 0 without space
-      // before; wrap may still place its first line below the flow cursor.
-      advancePt += Math.max(0, line.bounds.yPt - (input.flowBounds.yPt
-        + (continuation?.continuesFromPrevious ? 0 : input.spacing.beforePt)));
-    } else if (index > start) {
-      const previous = input.lines[index - 1];
-      advancePt += Math.max(0,
-        line.bounds.yPt - ((previous?.bounds.yPt ?? line.bounds.yPt) + (previous?.advancePt ?? 0)));
-    }
-    advancePt += finiteNonNegative(line.advancePt, 'line.advancePt');
+    advancePt += retainedLineAdvanceContributionPt(input, index, start, beforePt);
   }
   if (input.lines.length === 0 && input.paragraphMark) {
     advancePt += finiteNonNegative(input.paragraphMark.bounds.heightPt, 'paragraphMark.heightPt');
@@ -1168,16 +1159,68 @@ function sliceAdvance(input: AcquiredParagraphLayoutInput): number {
   return advancePt;
 }
 
+/** One retained line's share of a slice advance: its own advance plus the
+ * gap above it (from the flow top for line 0, else from the previous line
+ * when that line is inside the slice). Sole formula for slice advances. */
+function retainedLineAdvanceContributionPt(
+  input: Pick<AcquiredParagraphLayoutInput, 'lines' | 'flowBounds'>,
+  index: number,
+  start: number,
+  beforePt: number,
+): number {
+  const line = input.lines[index];
+  if (!line) return 0;
+  let advancePt = 0;
+  if (index === 0) {
+    // A remeasured body continuation starts at lineStart 0 without space
+    // before; wrap may still place its first line below the flow cursor.
+    advancePt += Math.max(0, line.bounds.yPt - (input.flowBounds.yPt + beforePt));
+  } else if (index > start) {
+    const previous = input.lines[index - 1];
+    advancePt += Math.max(0,
+      line.bounds.yPt - ((previous?.bounds.yPt ?? line.bounds.yPt) + (previous?.advancePt ?? 0)));
+  }
+  return advancePt + finiteNonNegative(line.advancePt, 'line.advancePt');
+}
+
+/**
+ * Exact advance index for continuing prefixes of a retained paragraph:
+ * `index[e]` equals `sliceParagraphLayout(layout, { lineStart: 0, lineEnd: e,
+ * continuesFromPrevious, continuesOnNext: true }).advancePt` for 1 <= e <=
+ * lines.length (`index[0]` is the leading space alone). One linear pass over
+ * the same per-line formula lets pagination read prefix charges without
+ * materialising a slice per candidate. A completed fragment still owns its
+ * trailing spacing through its own advance.
+ */
+export function paragraphContinuingPrefixAdvancesPt(
+  layout: Pick<ParagraphLayout, 'lines' | 'flowBounds' | 'spacing'>,
+  continuesFromPrevious: boolean,
+): readonly number[] {
+  const beforePt = continuesFromPrevious ? 0 : layout.spacing.beforePt;
+  const index = [beforePt];
+  for (let line = 0; line < layout.lines.length; line += 1) {
+    index.push(index[line]! + retainedLineAdvanceContributionPt(layout, line, 0, beforePt));
+  }
+  return index;
+}
+
 /**
  * Finalizes the parser-independent paragraph acquisition snapshot. All coordinates
  * are scale-1 points; subsequent Canvas paint is a pure viewport transform.
  */
 export function layoutParagraph(input: AcquiredParagraphLayoutInput, frozenSource?: ParagraphLayout): ParagraphLayout {
+  return finalizeParagraphLayout(input, frozenSource);
+}
+
+/** Slice construction supplies only admitted/rebased lines, while the original
+ * vector remains the authority for absolute source ranges and advance. */
+function finalizeParagraphLayout(input: AcquiredParagraphLayoutInput, frozenSource?: ParagraphLayout,
+  selectedLines?: readonly LineLayout[]): ParagraphLayout {
   const lineStart = input.continuation?.lineStart ?? 0;
   const lineEnd = input.continuation?.lineEnd ?? input.lines.length;
-  const lines = input.lines.slice(lineStart, lineEnd);
+  const lines = selectedLines ?? input.lines.slice(lineStart, lineEnd);
   const advancePt = input.continuation
-    ? sliceAdvance(input)
+    ? paragraphSliceAdvance(input)
     : finiteNonNegative(input.flowBounds.heightPt, 'flowBounds.heightPt');
   const node: ParagraphLayout = {
     kind: 'paragraph',
@@ -1318,10 +1361,22 @@ function selectedFaceSourceMetrics(
   segment: LayoutTextSeg,
 ): Readonly<{ ascentPt: number; descentPt: number }> | undefined {
   if (!segment.textLayoutService || !segment.textShapeRequest) return undefined;
-  const shape = segment.textLayoutService.shape({
-    ...segment.textShapeRequest,
-    measure: true,
-  });
+  // A native reserved-separator participant retains the sides of its bounded
+  // probe, in points, at the same effective metric size as its line box
+  // (pass-operations performTextSegmentBox); generic metric-only hosts keep
+  // their existing request.
+  const shape = segment.metricOnly && segment.metricProbeText
+    ? segment.textLayoutService.shape({
+        ...independentTextShapeRequest(segment.textShapeRequest, segment.metricProbeText),
+        fontSizePt: segment.smallCaps && !segment.vertAlign
+          ? segment.fontSize : calcEffectiveFontPx(segment, 1),
+        measure: true,
+        clusterGeometry: false,
+      })
+    : segment.textLayoutService.shape({
+        ...segment.textShapeRequest,
+        measure: true,
+      });
   return { ascentPt: shape.ascentPt, descentPt: shape.descentPt };
 }
 
@@ -2325,6 +2380,8 @@ function planMeasuredLines(
   verticalPageFrame = false,
   compatibilityMode?: number,
   paragraphMarkShapeInput?: NumberingMarkerShapeInput,
+  /** Owner section's counter-turn for upright inline graphics. */
+  resourceOrientation?: import('./types.js').UprightResourceOrientation,
 ): readonly LineLayout[] {
   let sourceOffset = 0;
   const consumedByRun = new Map<number, number>();
@@ -2495,9 +2552,7 @@ function planMeasuredLines(
           ...(runIndex === undefined ? {} : { sourceRunIndex: runIndex }),
           resourceKey, resourceKind, measuredWidthPt: image.measuredWidth,
           widthPt: image.widthPt, heightPt: image.heightPt, topOffsetPt: -image.heightPt,
-          ...(verticalPageFrame
-            ? { orientation: 'upright-physical' as const }
-            : {}),
+          ...(resourceOrientation ? { orientation: resourceOrientation } : {}),
         });
       } else if ('math' in segment) {
         const math = segment as LayoutMathSeg;
@@ -2870,7 +2925,12 @@ function publicAnchoredResourceDrawing(
         ? imageResourceKey(source, run.imagePath) : chartResourceKey(source),
       rect,
       ...(options.environment.verticalPageFrame
-        ? { orientation: 'upright-physical' as const }
+        ? {
+            orientation: uprightResourceOrientation(
+              options.environment.verticalPageFrame,
+              options.environment.pageWritingMode,
+            )!,
+          }
         : {}),
     }],
     anchorLayer: {
@@ -5096,6 +5156,10 @@ export function paragraphLayoutFromMeasurement(
     options.environment.verticalPageFrame,
     options.environment.compatibilityMode,
     options.environment.paragraphMarkShapeInput,
+    uprightResourceOrientation(
+      options.environment.verticalPageFrame,
+      options.environment.pageWritingMode,
+    ),
   );
   if (options.sourceRangeStart !== undefined) {
     lines = rebaseMeasuredLineRanges(lines, options.sourceRangeStart);
@@ -5554,10 +5618,6 @@ export function sliceParagraphLayout(
     : selected.map((line) => translateLineY(line, deltaYPt));
   const rebasedFirst = rebasedSelected[0];
   const rebasedLast = rebasedSelected.at(-1);
-  const rebasedLines = acquired.lines.map((line, index) =>
-    index >= continuation.lineStart && index < continuation.lineEnd
-      ? rebasedSelected[index - continuation.lineStart]!
-      : line);
   const lineInkBounds = rebasedFirst && rebasedLast ? {
     xPt: Math.min(...rebasedSelected.map((line) => line.bounds.xPt)),
     yPt: rebasedFirst.bounds.yPt,
@@ -5617,13 +5677,13 @@ export function sliceParagraphLayout(
     bookmarkStarts: acquiredBookmarkStarts,
     ...acquiredWithoutBookmarkStarts
   } = acquired;
-  return layoutParagraph({
+  return finalizeParagraphLayout({
     ...acquiredWithoutBookmarkStarts,
     kind: 'paragraph', id,
     ...(!continuation.continuesFromPrevious && acquiredBookmarkStarts?.length
       ? { bookmarkStarts: acquiredBookmarkStarts }
       : {}),
-    lines: rebasedLines,
+    lines: acquired.lines,
     flowBounds: {
       ...acquired.flowBounds,
       yPt: acquired.flowBounds.yPt,
@@ -5688,5 +5748,5 @@ export function sliceParagraphLayout(
           } }
         : {}),
     continuation,
-  }, acquired);
+  }, acquired, rebasedSelected);
 }

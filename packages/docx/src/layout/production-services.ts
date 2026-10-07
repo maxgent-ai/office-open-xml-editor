@@ -42,6 +42,7 @@ export interface LoadedFontFaceRecord {
 }
 
 export interface ProductionLayoutServiceOptions {
+  readonly allowFootnoteContinuation?: boolean;
   readonly localMetrics?: Readonly<Record<string, ResolvedFontMetric>>;
   readonly fontMetrics?: Readonly<Record<string, ResolvedFontMetric>>;
   readonly useGoogleFonts?: boolean;
@@ -338,6 +339,9 @@ export function createProductionLayoutServices(
     text,
     images: createImageMetadataService(imageMetadata),
     math: createMathMetadataService(mathResources),
+    ...(options.allowFootnoteContinuation === true
+      ? { allowFootnoteContinuation: true as const }
+      : {}),
     verticalGlyphFingerprint: options.verticalGlyphMeasurement.fingerprint,
   });
   const occurrenceKeys = source.mathOccurrences.map(({ source: occurrenceSource, display }) =>

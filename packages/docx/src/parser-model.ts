@@ -1,4 +1,12 @@
 import { resolveAutomaticParagraphMarginsPt } from './layout/paragraph-spacing.js';
+import type {
+  NativeNoteSeparatorsInput,
+  NativeNoteSeparatorStoriesInput,
+  NativeNoteSeparatorStoryInput,
+  NoteSeparatorMark,
+  NoteSeparatorInput,
+  SelectedNoteSeparatorParagraphsInput,
+} from './layout/body-layout-input.js';
 import { wordKerningApplies } from './layout/line-compatibility.js';
 import type {
   BodyElement,
@@ -18,6 +26,8 @@ import type {
   TblpPr,
 } from './types.js';
 import type {
+  DeepReadonly,
+  NativeSectionFlow,
   NumberingMarkerShapeInput,
   FloatingTablePositionInput,
   SourceRef,
@@ -44,6 +54,7 @@ import {
   type InternalRunTypographyWire,
 } from './layout/typography-input.js';
 import { deepFreezePlainData, snapshotPlainData } from './layout/plain-data.js';
+import type { NoteSeparatorParticipant } from './layout/native-note-separators.js';
 import {
   normalizeTextBoxInput,
   type TextBoxAcquisitionInput,
@@ -252,6 +263,15 @@ export interface InternalDocxDocumentModel extends DocxDocumentModel {
     footnoteNumberStart?: number;
     endnoteNumberFormat?: string;
     endnoteNumberStart?: number;
+    footnoteSeparator?: NoteSeparatorMark;
+    endnoteSeparator?: NoteSeparatorMark;
+    footnoteContinuationSeparator?: NoteSeparatorMark;
+    /** Ordinary DOCX producer only: effective paragraphs of listed formatted
+     * footnote separator stories; see SelectedNoteSeparatorParagraphsInput. */
+    footnoteSeparatorParagraph?: DocParagraph;
+    footnoteContinuationSeparatorParagraph?: DocParagraph;
+    /** Native (MS-DOC) producer only; see NativeNoteSeparatorsInput. */
+    nativeSeparators?: NativeNoteSeparatorsInput;
   }>;
   readonly __documentTypographySettings?: Readonly<{
     normalStyleFontSizePt?: number;
@@ -297,6 +317,102 @@ export interface DocumentNoteLayoutSettingsInput {
   readonly endnotePosition: string;
   readonly footnoteNumbering: Readonly<{ format: string; start: number }>;
   readonly endnoteNumbering: Readonly<{ format: string; start: number }>;
+  readonly footnoteSeparator: NoteSeparatorInput;
+  readonly endnoteSeparator: NoteSeparatorInput;
+  readonly footnoteContinuationSeparator: NoteSeparatorInput;
+  readonly footnoteSeparatorParagraphs?: SelectedNoteSeparatorParagraphsInput;
+  readonly nativeSeparators?: NativeNoteSeparatorsInput;
+}
+
+function noteSeparatorInput(value: unknown): NoteSeparatorInput {
+  if (value === undefined) return 'default';
+  if (value === 'short' || value === 'full' || value === 'none') return value;
+  // A native producer cannot silently admit an unsupported authored story by
+  // emitting a misspelled/custom mode that is then replaced with a default.
+  throw new Error('Unsupported note separator');
+}
+
+const NATIVE_SEPARATOR_STORY_CLASSES: ReadonlySet<unknown> = new Set([
+  'empty', 'guardOnly', 'paragraphOnly', 'rule',
+]);
+
+/** Check only the closed tags of retained native separator facts. The
+ * paragraph/run payloads keep the producer's shared schema and are copied,
+ * private keys included, by the single snapshot of the settings input; full
+ * validation happens once at normalization (layout/native-note-separators). */
+function nativeNoteSeparatorStoryInput(story: NativeNoteSeparatorStoryInput): void {
+  const mark = story.rule?.mark;
+  if (
+    !NATIVE_SEPARATOR_STORY_CLASSES.has(story.class)
+    || (story.class === 'rule') !== (story.rule !== undefined)
+    || (mark !== undefined && mark !== 'short' && mark !== 'full')
+  ) {
+    throw new Error('Unsupported native note separator story');
+  }
+}
+
+function nativeNoteSeparatorsInput(
+  value: NativeNoteSeparatorsInput | undefined,
+  fixedParagraphAutoSpacing: boolean,
+): Readonly<{ nativeSeparators?: NativeNoteSeparatorsInput }> {
+  if (value === undefined) return {};
+  // Native reserved stories are not ordinary numbered-note bodies and do not
+  // enter normalizeBody. Resolve their effective MS-DOC 2.6.2 automatic flags
+  // here with the same document setting and paragraph-base em as other stories,
+  // before canonical acquisition. At most two kinds × three roles are visited;
+  // clone only changed ancestry, then use the enclosing single frozen snapshot.
+  const normalizeStory = (story: NativeNoteSeparatorStoryInput): NativeNoteSeparatorStoryInput => {
+    nativeNoteSeparatorStoryInput(story);
+    const authored = story.paragraph;
+    if (!authored) return story;
+    const paragraph = authored.paragraph;
+    if (paragraph.beforeAutospacing !== true && paragraph.afterAutospacing !== true) return story;
+    const spacing = resolveAutomaticParagraphMarginsPt(
+      paragraph, paragraph.defaultFontSize ?? 10, fixedParagraphAutoSpacing,
+    );
+    if (spacing.spaceBefore === paragraph.spaceBefore && spacing.spaceAfter === paragraph.spaceAfter) return story;
+    return { ...story, paragraph: { ...authored, paragraph: { ...paragraph, ...spacing } } };
+  };
+  const normalizeKind = (kind: NativeNoteSeparatorStoriesInput | undefined): NativeNoteSeparatorStoriesInput | undefined => {
+    if (!kind) return kind;
+    const separator = normalizeStory(kind.separator);
+    const continuationSeparator = normalizeStory(kind.continuationSeparator);
+    const continuationNotice = normalizeStory(kind.continuationNotice);
+    return separator === kind.separator && continuationSeparator === kind.continuationSeparator && continuationNotice === kind.continuationNotice
+      ? kind : { ...kind, separator, continuationSeparator, continuationNotice };
+  };
+  const footnote = normalizeKind(value.footnote);
+  const endnote = normalizeKind(value.endnote);
+  return { nativeSeparators: footnote === value.footnote && endnote === value.endnote
+    ? value : { ...value, footnote, endnote } };
+}
+
+/** Ordinary DOCX formatted separator paragraphs (footnote kind). Each enters
+ * only beside its own Short/Full mark; the closed shape is validated once at
+ * normalization (layout/selected-note-separators). Automatic paragraph spacing
+ * resolves here with the same document setting as every other story. */
+function selectedNoteSeparatorParagraphsInput(
+  settings: InternalDocxDocumentModel['__noteLayoutSettings'],
+  fixedParagraphAutoSpacing: boolean,
+): Readonly<{ footnoteSeparatorParagraphs?: SelectedNoteSeparatorParagraphsInput }> {
+  const resolve = (paragraph: DocParagraph | undefined, mark: unknown): DocParagraph | undefined => {
+    if (paragraph === undefined) return undefined;
+    if (mark !== 'short' && mark !== 'full') throw new Error('Unsupported note separator story paragraph');
+    if (paragraph.beforeAutospacing !== true && paragraph.afterAutospacing !== true) return paragraph;
+    return {
+      ...paragraph,
+      ...resolveAutomaticParagraphMarginsPt(paragraph, paragraph.defaultFontSize ?? 10, fixedParagraphAutoSpacing),
+    };
+  };
+  const separator = resolve(settings?.footnoteSeparatorParagraph, settings?.footnoteSeparator);
+  const continuationSeparator = resolve(
+    settings?.footnoteContinuationSeparatorParagraph, settings?.footnoteContinuationSeparator,
+  );
+  if (!separator && !continuationSeparator) return {};
+  return { footnoteSeparatorParagraphs: {
+    ...(separator ? { separator } : {}),
+    ...(continuationSeparator ? { continuationSeparator } : {}),
+  } };
 }
 
 /** §17.11.17/.18 numFmt defaults to decimal and §17.11.20 numStart to 1 for
@@ -327,6 +443,13 @@ export function documentNoteLayoutSettingsInput(
       settings?.endnoteNumberFormat,
       settings?.endnoteNumberStart,
     ),
+    footnoteSeparator: noteSeparatorInput(settings?.footnoteSeparator),
+    endnoteSeparator: noteSeparatorInput(settings?.endnoteSeparator),
+    footnoteContinuationSeparator: noteSeparatorInput(settings?.footnoteContinuationSeparator),
+    ...selectedNoteSeparatorParagraphsInput(settings, doc.settings?.doNotUseHtmlParagraphAutoSpacing === true),
+    // Closed tags only here; the source-model adapter validates the complete
+    // shape and normalizes these facts into canonical reserved stories.
+    ...nativeNoteSeparatorsInput(settings?.nativeSeparators, doc.settings?.doNotUseHtmlParagraphAutoSpacing === true),
   }, 'DOCX note layout settings input');
 }
 
@@ -340,6 +463,8 @@ interface InternalSectionPlacementWire {
   readonly docGridCharSpace?: number | null;
   readonly gutterPt?: number | null;
   readonly rtlGutter?: boolean | null;
+  /** Native producer only: raw MS-ODRAW 2.4.5 MSOTXFL of MS-DOC sprmSTextFlow. */
+  readonly nativeTextFlow?: number | null;
   readonly pageBordersAuthored?: boolean;
   readonly pageBorders?: import('./types.js').PageBorders | null;
   readonly pageGeometry?: Readonly<{
@@ -377,6 +502,35 @@ export interface SectionPlacementInput {
   readonly pageBordersAuthored: boolean;
   readonly pageBorders: Readonly<import('./types.js').PageBorders> | null;
   readonly pageGeometry: InternalSectionPlacementWire['pageGeometry'];
+  /** Canonical semantics of a native flow; absent for OOXML sections. */
+  readonly nativeSectionFlow?: NativeSectionFlow;
+}
+
+/** Public display-family token of each raw MS-ODRAW 2.4.5 MSOTXFL emitted by
+ * the native producer (index = raw value). */
+const NATIVE_TEXT_FLOW_DIRECTIONS: readonly (string | null)[] = Object.freeze([
+  null, 'tbRl', 'btLr', 'btLr', null, 'btLr',
+]);
+
+/** Normalize the native producer's private raw flow once, before any layout
+ * input exists. The fact must agree with the section's public token. Only
+ * BtoT (2) needs canonical semantics beyond its nominal `btLr` token: its
+ * counter-clockwise frame. Layout never receives the raw value. */
+function nativeSectionFlowFacts(
+  wire: InternalSectionPlacementWire | undefined,
+  textDirection: string | null | undefined,
+): Readonly<{ nativeSectionFlow?: NativeSectionFlow }> {
+  const raw = wire?.nativeTextFlow;
+  if (raw === undefined || raw === null) return {};
+  if (!Number.isInteger(raw) || raw < 0 || raw >= NATIVE_TEXT_FLOW_DIRECTIONS.length) {
+    throw new TypeError(`Invalid native section text flow ${String(raw)}`);
+  }
+  if ((textDirection ?? null) !== NATIVE_TEXT_FLOW_DIRECTIONS[raw]) {
+    throw new TypeError(
+      `Native section text flow ${raw} contradicts text direction ${JSON.stringify(textDirection ?? null)}`,
+    );
+  }
+  return raw === 2 ? { nativeSectionFlow: 'bottomToTop' } : {};
 }
 
 interface DocumentSectionPlacementInputs {
@@ -1017,6 +1171,7 @@ function projectSectionPlacementInputs(doc: InternalDocxDocumentModel): Document
       pageBordersAuthored: wire?.pageBordersAuthored ?? false,
       pageBorders: wire?.pageBorders ?? null,
       pageGeometry: wire?.pageGeometry ?? element.geom ?? {},
+      ...nativeSectionFlowFacts(wire, element.textDirection),
     }, 'DOCX ending-section placement input'));
     ordinal += 1;
   });
@@ -1040,6 +1195,7 @@ function projectSectionPlacementInputs(doc: InternalDocxDocumentModel): Document
       pageBorders: finalWire?.pageBorders ?? doc.section?.pageBorders ?? null,
       pageGeometry: finalWire?.pageGeometry
         ?? (doc.section ? sectionPageBox(doc.section) : {}),
+      ...nativeSectionFlowFacts(finalWire, doc.section?.textDirection),
     }, 'DOCX final-section placement input'),
   });
 }
@@ -1118,6 +1274,7 @@ export function bodySectionIndexInput(doc: DocxDocumentModel): BodySectionIndexI
       columns: element.columns ?? null,
       authoredGeometry: normalizeSectionGeometryWire(placement.pageGeometry),
       textDirection: element.textDirection ?? null,
+      ...(placement.nativeSectionFlow ? { nativeSectionFlow: placement.nativeSectionFlow } : {}),
       pageNumType: element.pageNumType ?? null,
       headers: element.headers ?? EMPTY_SECTION_HEADERS_FOOTERS,
       footers: element.footers ?? EMPTY_SECTION_HEADERS_FOOTERS,
@@ -1151,6 +1308,7 @@ export function bodySectionIndexInput(doc: DocxDocumentModel): BodySectionIndexI
       ? sectionPageBox(doc.section)
       : normalizeSectionGeometryWire(placement.pageGeometry),
     textDirection: doc.section.textDirection ?? null,
+    ...(placement.nativeSectionFlow ? { nativeSectionFlow: placement.nativeSectionFlow } : {}),
     pageNumType: doc.section.pageNumType ?? null,
     headers: doc.headers ?? EMPTY_SECTION_HEADERS_FOOTERS,
     footers: doc.footers ?? EMPTY_SECTION_HEADERS_FOOTERS,
@@ -1651,6 +1809,49 @@ export function paragraphAcquisitionInput(
     paragraphMarkShapeInput: paragraphMarkShapeInput(paragraph),
     ...(typographyInput === undefined ? {} : { typographyInput }),
   }) as unknown as ParagraphAcquisitionInput;
+}
+
+/** Immutable acquisition input of a native reserved separator paragraph.
+ * Each participant enters as a text-free run with its own effective CHPX,
+ * projected by the same text-run boundary as any other run (private
+ * typography sidecars included), then tagged with its separator role. The
+ * paragraph keeps its own PAPX and paragraph-mark facts unchanged. */
+export function nativeNoteSeparatorParagraphAcquisitionInput(
+  paragraph: DeepReadonly<DocParagraph>,
+  participants: readonly NoteSeparatorParticipant[],
+  source: SourceRef,
+): ParagraphAcquisitionInput {
+  const parserParagraph = {
+    ...(paragraph as unknown as DocParagraph),
+    type: 'paragraph',
+    runs: participants.map(({ run }) => ({ ...(run as unknown as DocxTextRun), type: 'text', text: '' })),
+  } as unknown as ParagraphLayoutSource;
+  const input = paragraphAcquisitionInput(parserParagraph, source);
+  if (input.runs.length !== participants.length) {
+    throw new Error('Native note separator participants were not projected one-to-one');
+  }
+  return deepFreezePlainData({
+    ...input,
+    runs: input.runs.map((run, index) => ({
+      ...run,
+      noteSeparatorCharacter: participants[index]!.role,
+    })),
+  }) as unknown as ParagraphAcquisitionInput;
+}
+
+/** Immutable acquisition input of an ordinary DOCX formatted separator
+ * paragraph. Its single mark run carries the paragraph mark's own rPr (the
+ * parser admits nothing else), so the run-free paragraph reserves exactly the
+ * shared paragraph-mark line box with the paragraph's spacing and line rule. */
+export function selectedNoteSeparatorParagraphAcquisitionInput(
+  paragraph: DeepReadonly<DocParagraph>,
+  source: SourceRef,
+): ParagraphAcquisitionInput {
+  return paragraphAcquisitionInput({
+    ...(paragraph as unknown as DocParagraph),
+    type: 'paragraph',
+    runs: [],
+  } as unknown as ParagraphLayoutSource, source);
 }
 
 /** Pure structural normalization for stable math addressing and parser-only

@@ -71,6 +71,11 @@ export interface LayoutTextSeg extends LayoutSegSource {
   /** Zero-advance anchor-character placeholder: contributes run metrics to the
    * line box but paints no glyph. */
   metricOnly?: true;
+  /** Native reserved-separator participant only (MS-DOC 2.3.3 rule control or
+   * content mark): the bounded selected-face probe whose vertical metrics the
+   * metric-only segment keeps. Never display text, glyph ownership, source
+   * range length or inline width; other metric-only segments omit it. */
+  metricProbeText?: string;
   /** The run participates in Far East line-grid metrics despite containing no
    * East Asian code point. This covers an East-Asian anchor host and the
    * w:useFELayout + rFonts@hint=eastAsia compatibility path. */

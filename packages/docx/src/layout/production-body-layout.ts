@@ -1,3 +1,5 @@
+import { MAX_BODY_LAYOUT_PAGES } from './resource-budgets.js';
+import { deepFreezePlainData, deepFreezePlainDataWithFrozenAliases } from './plain-data.js';
 import { quarterTurnMathMetadataService } from './resources.js';
 import { pageOwnedAnchorKeysByLine } from './anchor-line-deferral.js';
 import type { CjkLang } from '@silurus/ooxml-core';
@@ -24,7 +26,9 @@ import type {
   FloatRegistryEntryPt,
   FloatRegistrySnapshotPt,
   DrawingMLCollisionEntryPt,
+  NativeSectionFlow,
   NoteLayout,
+  NoteSeparatorLayout,
   ParagraphLayout,
   SourceRef,
   StoryBlockInput,
@@ -39,7 +43,7 @@ import {
   validateFloatingTableRegistryDelta,
 } from './floating-table-transaction.js';
 import type { LayoutOptions } from './options.js';
-import { createLayoutServicesRuntimeView, fieldAcquisitionContextOf, verticalGlyphMeasurementServiceOf } from './runtime-state.js';
+import { createLayoutServicesRuntimeView, fieldAcquisitionContextOf, footnoteAcquisitionWorkBudgetOf, verticalGlyphMeasurementServiceOf } from './runtime-state.js';
 import { attachStoryBlockLayoutAlgorithms, layoutStory as layoutSharedStory } from './stories.js';
 import { buildNoteNumberMap, footnoteIdsInRetainedLines, footnoteIdsInRetainedSlice, indexNotes, noteReferenceIdsInDocumentOrder } from './note-reference-ownership.js';
 import type {
@@ -52,10 +56,21 @@ import { NoteCapacityExceededError } from './body-layout-kernel.js';
 import { FlowCapacityExceededError } from './flow.js';
 import { projectBodyOccurrence } from './occurrence-projection.js';
 import {
+  noteSeparatorOccurrence,
+  placeNoteSeparatorOccurrence,
+  reservedNoteSeparatorRole,
+} from './native-note-separators.js';
+import { selectedNoteSeparatorRole } from './selected-note-separators.js';
+import { sourceKey } from './source-key.js';
+import type {
+  NativeNoteSeparatorDefinitionInput,
+  SelectedNoteSeparatorDefinitionInput,
+} from './body-layout-input.js';
+import {
   sectionBodyInsetPt as bodyMarginInsetPt,
   physicalSectionGeometry,
 } from './context.js';
-import { isAllRotatedVerticalTextDirection, isVerticalSection, isVerticalTextDirection, physicalLayoutSection, verticalLayoutSection } from './section-orientation.js';
+import { isAllRotatedVerticalTextDirection, isVerticalTextDirection, physicalLayoutSection, verticalLayoutSection } from './section-orientation.js';
 import { gridForParagraphContext, paragraphMeasurementEnvironment } from './measurement-environment.js';
 import { createRevisionAuthorColorResolver } from './track-changes.js';
 import { BODY_STORY_CONTEXT, bodyAnchorReferenceFrames, retainedTableRecord, resolveBodyParagraphLayoutContext, resolveStateParagraphLayoutContext, withTableCellStory } from './acquisition-state.js';
@@ -63,7 +78,7 @@ import { applyNumberingBodyOffset, resolveNumberingMarkerGeometry } from './numb
 import { projectTableColumnLayoutInput, type TableSourceAcquisitionInput } from './table-source-acquisition.js';
 import { measureTableIntrinsicWidths, resolveTableColumnWidths } from './table-columns.js';
 import { decideLogicalTable, type LogicalTableDecision, type TableMemberDecision } from './table-layout-decision.js';
-import { measureBodyTableEntry } from './body-table-measurement.js';
+import { bodyTableAcquisitionState, measureBodyTableEntry } from './body-table-measurement.js';
 import { measureParagraphIntrinsicWidths, measureTableCellIntrinsicWidths } from './intrinsic-width.js';
 // ── Line-layout engine (segmentation + line-breaking + measurement) ──────────
 // Body acquisition drives the pure root line-layout kernel through this
@@ -84,7 +99,7 @@ import { bottomBorderExtentPt, resolveParagraphBorderEdges, topBorderExtentPt, t
 import { acquireParagraphResult, acquireRetainedFrameGroup, bodyFrameGroupFor, bodyParagraphBorderEdgesFor, projectPhysicalAnchorResult, retainedFrameMaximumBaselineLoweringPt, type BodyFrameGroup } from './paragraph.js';
 import { wordLoweredDropCapAnchorLeadingPt } from './body-pagination-compatibility.js';
 import type { CompleteTextBoxStoryAcquirer } from './paragraph.js';
-import type { AnchorFloatRegistrationState, BodyAcquisitionState, BodyMeasurementContext, RetainedTableRecord } from './acquisition-context.js';
+import type { AnchorFloatRegistrationState, BodyAcquisitionState, BodyMeasurementContext, CompleteTextBoxStoryOwner, PhysicalAnchorFrame, RetainedTableRecord } from './acquisition-context.js';
 import { ownedParagraphAnchorCollisions, inheritedParagraphAuthorityForReacquisition, TRANSIENT_TABLE_FINAL_FRAME_EXCLUSION_PREFIX } from './paragraph-wrap-registry.js';
 import { acquireRegisteredParagraph } from './registered-paragraph-acquisition.js';
 import { paragraphAnchorCollisions, paragraphWrapExclusions } from './paragraph-float-authority.js';
@@ -105,8 +120,8 @@ import type { TableLayoutSource } from './table-source-acquisition.js';
 import { collectBodyFrameGroups, prepareBodyFrameMetadata } from './frame.js';
 import {
   physicalToLogicalMatrix,
+  sectionWritingMode,
   uprightPhysicalExtent,
-  writingModeFromTextDirection,
 } from './coordinate-space.js';
 
 export function createProductionBodyLayoutRuntime(
@@ -135,7 +150,8 @@ export function createProductionBodyLayoutRuntime(
     duotone?: { readonly clr1: string; readonly clr2: string },
   ): string => `${imagePath}${colorReplaceFrom ? `|clr:${colorReplaceFrom}` : ''}`
     + `${duotone ? `|duo:${duotone.clr1}:${duotone.clr2}` : ''}`;
-/** Retained default separator leading used by the shared note story layout. */
+/** Retained default separator band of the shared note story layout. It applies
+ * only where no native reserved separator definition owns the note kind. */
 const FOOTNOTE_SEPARATOR_GAP_PT = 6;
 
 /** A visible §17.3.1.42 top border owns space above the first line in every
@@ -167,8 +183,9 @@ function buildMeasureState(
   resolvedLocalFonts: Readonly<Record<string, ResolvedFontMetric>> = {},
   layoutServices: LayoutServices,
   layoutOptions?: LayoutOptions,
+  nativeSectionFlow?: NativeSectionFlow,
 ): BodyAcquisitionState {
-  const sectionLayout = resolveSectionLayoutContext(layoutSettings, section);
+  const sectionLayout = resolveSectionLayoutContext(layoutSettings, section, nativeSectionFlow);
   // Acquisition always uses the document-scoped service owner supplied by the
   // private body kernel, so its text and vertical measurement capabilities have
   // one auditable lineage and fingerprint.
@@ -216,7 +233,7 @@ function buildMeasureState(
       tableDecision: singleTableDecision,
       resolveColumns: resolveColumnWidths,
       createCellState: (state, contentWidthPt, cell) => ({
-        ...withTableCellStory(state),
+        ...withTableCellStory(tableCellOwnerState(state)),
         contentX: 0,
         contentW: contentWidthPt,
         y: 0,
@@ -295,7 +312,7 @@ function buildMeasureState(
             ),
             continuesFromPrevious: false,
             anchorFrames: bodyAnchorReferenceFrames(cellState),
-            acquireCompleteStory: cellState.acquireCompleteTextBoxStory,
+            acquireCompleteStory: completeTextBoxStoryAcquirerFor(cellState),
           },
           inheritedAuthority,
         ).layout;
@@ -388,14 +405,15 @@ function buildMeasureState(
     // physical branch on `verticalPhys`), otherwise a wrapped shape's exclusion
     // band is reserved at the raw logical rectangle during pagination while the
     // retained paint uses the physical projection — diverging page assignment.
-    // Un-swap via
-    // physicalLayoutSection; `physicalPageWidthPt` is the physical page width
-    // in canonical points. `verticalCJK` stays unset: acquisition
-    // keeps its horizontal glyph metrics (only anchor geometry re-frames).
-    // Seeded from the section this measure state is BUILT from (the body-level
-    // body-level one); a direction-mixed document then re-seeds it per
-    // section via its retained acquisition location (issue #1000), so a
-    // mid-body section's anchors resolve against ITS OWN physical frame.
+    // `physicalPageWidthPt` is the physical page width in canonical points.
+    // The direction flags are getters on the current `sectionLayout`, so they
+    // follow each owner section. An all-rotated `btLr` section (including a
+    // native BtoT section) keeps horizontal glyph metrics through
+    // `verticalAllRotated`; only upright-vertical sections plan vertical
+    // glyphs. The physical anchor frame is seeded here from the section this
+    // state is built from and rebuilt from each acquisition location's own
+    // section (`applyBodyAcquisitionLocationTo`, issue #1000), so a mid-body
+    // section's anchors resolve against ITS OWN physical frame.
     get verticalCJK() {
       return isVerticalTextDirection(this.sectionLayout.textDirection);
     },
@@ -403,20 +421,28 @@ function buildMeasureState(
       return isVerticalTextDirection(this.sectionLayout.textDirection)
         && isAllRotatedVerticalTextDirection(this.sectionLayout.textDirection);
     },
-    verticalPhys: isVerticalSection(section)
-      ? (() => {
-          const phys = physicalLayoutSection(section);
-          return {
-            pageWidth: phys.pageWidth,
-            pageHeight: phys.pageHeight,
-            marginLeft: phys.marginLeft,
-            marginRight: phys.marginRight,
-            marginTop: bodyMarginInsetPt(phys.marginTop),
-            marginBottom: bodyMarginInsetPt(phys.marginBottom),
-            physicalPageWidthPt: phys.pageWidth,
-          };
-        })()
-      : undefined,
+    verticalPhys: physicalAnchorFrameOf(sectionLayout),
+  };
+}
+
+/** Physical page frame of one section context for DrawingML anchors and
+ * upright tables, derived only from that context: its logical page box is
+ * un-swapped with its own frame (the established clockwise mapping, or a
+ * native flow's canonical matrix). Horizontal contexts have no frame. */
+function physicalAnchorFrameOf(
+  section: DeepReadonly<SectionLayoutContext>,
+): PhysicalAnchorFrame | undefined {
+  if (!isVerticalTextDirection(section.textDirection)) return undefined;
+  const phys = physicalSectionGeometry(section.geometry, section.nativeSectionFlow);
+  return {
+    pageWidth: phys.pageWidth,
+    pageHeight: phys.pageHeight,
+    marginLeft: phys.marginLeft,
+    marginRight: phys.marginRight,
+    marginTop: bodyMarginInsetPt(phys.marginTop),
+    marginBottom: bodyMarginInsetPt(phys.marginBottom),
+    physicalPageWidthPt: phys.pageWidth,
+    ...(section.nativeSectionFlow ? { nativeSectionFlow: section.nativeSectionFlow } : {}),
   };
 }
 
@@ -527,7 +553,7 @@ function acquireBodyParagraphAtLocation(
             sourceRangeStart: continuation.sourceRangeStart,
           }),
       anchorFrames: bodyAnchorReferenceFrames(state),
-      acquireCompleteStory: state.acquireCompleteTextBoxStory,
+      acquireCompleteStory: completeTextBoxStoryAcquirerFor(state),
       ...(state.frozenAnchorFrames && state.frozenAnchorFrames.size > 0
         ? { frozenAnchorFrames: state.frozenAnchorFrames }
         : {}),
@@ -563,6 +589,10 @@ interface BodyStoryAcquisitionContext {
   readonly state: BodyAcquisitionState;
   readonly services: LayoutServices;
   readonly storyLayoutCache: Map<string, StoryLayout>;
+  /** One active acquisition context per native reserved separator root (at
+   * most six). Page occurrences are projections; no per-page copies. */
+  readonly reservedNoteStoryCache: Map<string, Readonly<{ key: string; story: StoryLayout }>>;
+  readonly noteSourceReuse: WeakMap<object, boolean>;
   readonly source: LayoutSourceStore;
   readonly publicAnchorBridge: typeof publicAnchorBridge;
 }
@@ -573,17 +603,52 @@ function acquireBodyStoryLayout(
   request: import('./body-layout-kernel.js').StoryLayoutAcquisitionInput,
 ): StoryLayout {
   const { source, state, services, storyLayoutCache, publicAnchorBridge } = dependencies;
+  const root = bodyStoryRoot(source, request.source);
+  // A native reserved or DOCX selected separator root is a shared source
+  // definition, not a numbered (continued) note: it has no number and no note
+  // cursor. Its closed run-free shape has no page-dependent content, so one
+  // acquisition per width/section/font context serves every page occurrence.
+  const reservedRole = reservedNoteSeparatorRole(request.source)
+    ?? selectedNoteSeparatorRole(request.source);
+  // Ordinary text-only paragraph notes have no destination-page fields or
+  // anchors. Their immutable acquisition is shared across equal-width pages;
+  // partitionFootnote projects only the admitted slice into its page domain.
+  // Other continued stories are page-local and must not retain a full copy
+  // for every destination page in this session cache.
+  const continuedNote = reservedRole === undefined
+    && services.allowFootnoteContinuation === true
+    && request.source.story === 'footnote';
+  const workBudget = continuedNote || (reservedRole !== undefined && services.allowFootnoteContinuation === true)
+    ? footnoteAcquisitionWorkBudgetOf(services) : undefined;
+  if (continuedNote && !workBudget) throw new Error('Footnote acquisition requires a pagination work budget');
+  let reusableNote = continuedNote && dependencies.noteSourceReuse.get(root);
+  if (continuedNote && reusableNote === undefined) {
+    workBudget?.sourceUnits(root);
+    reusableNote = root.every(element => element.type === 'paragraph'
+      && !element.framePr && element.runs.every(run => run.type === 'text'));
+    dependencies.noteSourceReuse.set(root, reusableNote);
+  }
+  const pageIndependent = reusableNote || reservedRole !== undefined;
   const cacheKey = JSON.stringify({
     source: request.source,
-    pageIndex: request.pageIndex,
+    pageIndex: pageIndependent ? null : request.pageIndex,
     section: request.section,
-    container: request.container,
+    container: pageIndependent ? { ...request.container, id: null } : request.container,
   });
-  const cached = storyLayoutCache.get(cacheKey);
+  const reservedKey = reservedRole === undefined ? undefined : sourceKey(request.source);
+  const cached = reservedKey === undefined
+    ? storyLayoutCache.get(cacheKey)
+    : dependencies.reservedNoteStoryCache.get(reservedKey)?.key === cacheKey
+      ? dependencies.reservedNoteStoryCache.get(reservedKey)!.story
+      : undefined;
   if (cached) return cached;
-  const root = bodyStoryRoot(source, request.source);
+  // This ledger is shared by all passes/service views of this pagination,
+  // rather than this shorter-lived concrete acquisition session. Debit before
+  // destination-field resolution, shaping, geometry or resource acquisition.
+  workBudget?.charge(root);
   const noteReferenceNumber =
-    request.source.story === 'footnote' || request.source.story === 'endnote'
+    reservedRole === undefined
+      && (request.source.story === 'footnote' || request.source.story === 'endnote')
       ? state.noteNumbers?.get(`${request.source.story}:${request.source.storyInstance}`)
       : undefined;
   const fieldContext = fieldAcquisitionContextOf(services);
@@ -616,7 +681,8 @@ function acquireBodyStoryLayout(
     verticalCJK: storyVertical,
     verticalAllRotated:
       storyVertical && isAllRotatedVerticalTextDirection(request.section.textDirection),
-    ...(storyVertical ? {} : { verticalPhys: undefined }),
+    // The story's own section supplies its frame (none when horizontal).
+    verticalPhys: physicalAnchorFrameOf(request.section),
     storyContext: {
       story: request.source.story,
       containers: [],
@@ -804,7 +870,9 @@ function acquireBodyStoryLayout(
         ),
         continuesFromPrevious: false,
         anchorFrames: bodyAnchorReferenceFrames(candidate),
-        acquireCompleteStory: candidate.acquireCompleteTextBoxStory,
+        // Nested text boxes in this story take the story's own section,
+        // page and frame, not the body's current location.
+        acquireCompleteStory: completeTextBoxStoryAcquirerFor(candidate),
       });
       previousParagraph = paragraph;
       const nextCursor = {
@@ -818,7 +886,7 @@ function acquireBodyStoryLayout(
       // FLOW_OVERLAP. The origin stays at the allocation start so story
       // positioning and anchor extents keep their leading-spacing arithmetic.
       const contentOwned = result.layout.ordinaryFlow
-        ? Object.freeze({
+        ? deepFreezePlainDataWithFrozenAliases({
             ...result.layout,
             flowBounds: Object.freeze({
               ...result.layout.flowBounds,
@@ -827,7 +895,7 @@ function acquireBodyStoryLayout(
                 result.layout.flowBounds.heightPt - result.layout.spacing.afterPt,
               ),
             }),
-          })
+          }, result.layout)
         : result.layout;
       return { layout: contentOwned, nextCursor };
     },
@@ -851,7 +919,7 @@ function acquireBodyStoryLayout(
     },
     storyServices,
   );
-  const retained = Object.freeze({
+  const retained = deepFreezePlainData({
     ...acquired,
     blocks: Object.freeze(
       acquired.blocks.map((block, index) => {
@@ -869,7 +937,10 @@ function acquireBodyStoryLayout(
       }),
     ),
   });
-  storyLayoutCache.set(cacheKey, retained);
+  if (reservedKey !== undefined) {
+    // Replace, never accumulate: a changed context evicts the role's plan.
+    dependencies.reservedNoteStoryCache.set(reservedKey, Object.freeze({ key: cacheKey, story: retained }));
+  } else if (!continuedNote || reusableNote) storyLayoutCache.set(cacheKey, retained);
   return retained;
 }
 
@@ -880,6 +951,10 @@ function applyBodyAcquisitionLocationTo(
 ): void {
   const geometry = next.section.geometry;
   target.sectionLayout = next.section as SectionLayoutContext;
+  // Each retained occurrence owns its physical anchor frame; a horizontal
+  // section clears it. Two native sections can share the nominal `btLr`
+  // token and still differ in frame.
+  target.verticalPhys = physicalAnchorFrameOf(next.section);
   target.pageIndex = next.pageIndex;
   const page = fieldAcquisitionContextOf(services).resolveDestinationPage?.(next.pageIndex);
   target.displayPageNumber = page?.displayPageNumber ?? next.pageIndex + 1;
@@ -1152,9 +1227,41 @@ function layoutBodyNotes(
       storyInstance: id,
       path: [],
     };
-    const separatorHeightPt = first ? FOOTNOTE_SEPARATOR_GAP_PT : 0;
+    const noteSettings = context.source.bodyLayoutInput.noteLayoutSettings;
+    // A native producer's reserved stories replace the scalar library band
+    // for their note kind. First-on-page ownership is singular; the role
+    // (ordinary versus continuing) selects the definition, whose own mark
+    // selects Short/Full.
+    const nativeDefinitions = noteSettings?.nativeSeparatorRoles?.[request.kind];
+    const leading = first && nativeDefinitions
+      ? acquireNativeNoteSeparator(context, request, nativeDefinitions[
+        request.continuing === true ? 'continuationSeparator' : 'separator'
+      ], cursorYPt, `${request.kind}:${id}:page:${request.pageIndex}:separator`)
+      : undefined;
+    // An ordinary DOCX formatted listed story (§17.11.9) replaces only the
+    // scalar band height of its role with its own acquired paragraph advance
+    // (authored spacing and line rule). Its mark kind and rule width keep the
+    // scalar policy below; the rule sits at the midpoint of the story's mark
+    // line box, not in its spacing. Bare and missing stories keep the scalar
+    // band, whose rule stays at the band midpoint.
+    const selectedDefinition = first && !nativeDefinitions && request.kind === 'footnote'
+      ? noteSettings?.footnoteSeparatorStories?.[
+        request.continuing === true ? 'continuationSeparator' : 'separator'
+      ]
+      : undefined;
+    const selectedBand = selectedDefinition
+      ? acquireSelectedNoteSeparatorBand(context, request, selectedDefinition, cursorYPt)
+      : undefined;
+    const separatorHeightPt = nativeDefinitions
+      ? leading?.advancePt ?? 0
+      : selectedBand?.advancePt ?? (first ? FOOTNOTE_SEPARATOR_GAP_PT : 0);
+    const ruleYPt = cursorYPt + (selectedBand?.ruleOffsetPt ?? separatorHeightPt / 2);
     const storyContainer = {
       ...request.container,
+      // Acquire the source once before page partitioning; this is a resource
+      // acquisition container, not permission for retained note ink to overflow.
+      ...(services.allowFootnoteContinuation === true && request.kind === 'footnote'
+        ? { capacity: 'unbounded' as const } : {}),
       id: `${request.container.id}:${request.kind}:${id}`,
       bounds: {
         ...request.container.bounds,
@@ -1182,17 +1289,44 @@ function layoutBodyNotes(
       }
       throw error;
     }
-    const separator = first
+    if (services.allowFootnoteContinuation === true && request.kind === 'footnote'
+      && story.advancePt > request.section.geometry.pageHeight * MAX_BODY_LAYOUT_PAGES) {
+      // Match the paginator's physical-page budget before retaining a source
+      // that cannot finish within it. This is resource policy, not Office fit.
+      throw new Error('Footnote source exceeds the document page budget');
+    }
+    // ECMA-376 §17.11 reserved stories: the observed bare empty story
+    // suppresses rule ink while retaining the existing note band gap.
+    const separatorMode = request.kind === 'footnote'
+      ? request.continuing ? noteSettings?.footnoteContinuationSeparator : noteSettings?.footnoteSeparator
+      : noteSettings?.endnoteSeparator;
+    const separator = first && !nativeDefinitions && separatorMode !== 'none'
       ? Object.freeze([
           Object.freeze({
             edge: 'top' as const,
             from: Object.freeze({
               xPt: request.container.bounds.xPt,
-              yPt: cursorYPt + separatorHeightPt / 2,
+              yPt: ruleYPt,
             }),
             to: Object.freeze({
-              xPt: request.container.bounds.xPt + request.container.bounds.widthPt / 3,
-              yPt: cursorYPt + separatorHeightPt / 2,
+              // ECMA-376 §17.11.1/.23: marker kind wins over story role.
+              // Word 16.113.3 compatibility controls (300pt main width,
+              // 80 plain single-spaced paragraphs, printed Times New Roman
+              // 12pt) retain a selected Short mark in a continuation story.
+              // A missing continuation story prints a full-width rule and
+              // gains a listed Full story on save. Preserve source absence;
+              // this fallback does not synthesize a parser fact or change
+              // the public continuation option's default. These controls
+              // establish neither universal Short dimensions nor gap/leading.
+              // §17.11.1 defines the continuation mark as full main-story width.
+              // §17.11.23 defines a partial ordinary mark; one third is the
+              // existing library policy, not a normative numeric fraction.
+              // It differs from the 144pt Short rule in those Office controls.
+              xPt: request.container.bounds.xPt + request.container.bounds.widthPt
+                * (separatorMode === 'full'
+                  || ((separatorMode === undefined || separatorMode === 'default') && request.continuing)
+                  ? 1 : 1 / 3),
+              yPt: ruleYPt,
             }),
             color: '#000000',
             widthPt: 0.5,
@@ -1232,6 +1366,7 @@ function layoutBodyNotes(
       clipBounds: request.container.bounds,
       advancePt,
       separator,
+      ...(leading ? { leading } : {}),
       story,
     });
     notes.push(note);
@@ -1239,6 +1374,103 @@ function layoutBodyNotes(
     first = false;
   }
   return Object.freeze(notes);
+}
+
+/** Acquire one native reserved separator story at the band cursor through
+ * the shared story/paragraph pipeline and project its page occurrence. An
+ * empty, guard-only or fully hidden story owns no flow, so none is retained. */
+function acquireNativeNoteSeparator(
+  context: BodySessionDependencies,
+  request: Parameters<NonNullable<BodyLayoutSession['layoutNotes']>>[0],
+  definition: NativeNoteSeparatorDefinitionInput,
+  yPt: number,
+  occurrenceId: string,
+): NoteSeparatorLayout | undefined {
+  if (!definition.paragraph || definition.paragraph.hidden) return undefined;
+  const container = {
+    ...request.container,
+    id: `${request.container.id}:${sourceKey(definition.root)}`,
+    bounds: {
+      ...request.container.bounds,
+      yPt,
+      heightPt: Math.max(0, request.container.bounds.yPt + request.container.bounds.heightPt - yPt),
+    },
+  };
+  let story: StoryLayout;
+  try {
+    story = acquireBodyStoryLayout(context.storyAcquisitionContext, {
+      source: definition.root,
+      pageIndex: request.pageIndex,
+      section: request.section,
+      container,
+    });
+  } catch (error) {
+    if (error instanceof FlowCapacityExceededError && error.containerId === container.id) {
+      throw new NoteCapacityExceededError(request.kind, request.pageIndex, request.container.id);
+    }
+    throw error;
+  }
+  return placeNoteSeparatorOccurrence(
+    noteSeparatorOccurrence(definition, story, container.bounds),
+    { occurrenceId, flowDomainId: request.container.id, yPt },
+  );
+}
+
+/** Acquire one ordinary DOCX selected separator story at the band cursor
+ * through the shared story/paragraph pipeline. Returns two retained facts:
+ * - `advancePt`, the band height: the paragraph's acquired advance, i.e. its
+ *   mark line box under the authored line rule plus authored spacing before
+ *   and after (§17.3.1.33 places that spacing outside the paragraph's lines).
+ * - `ruleOffsetPt`: the midpoint of the acquired mark line box, measured from
+ *   the story's own top in its acquisition frame, so it applies at whatever
+ *   band y it is placed. §17.11.23 places the separator mark in its run; the
+ *   parser admits only a mark run formatted exactly like the paragraph mark,
+ *   so that run's line is this mark-only line box. The midpoint is the
+ *   library's existing rule placement, not an Office glyph-baseline
+ *   observation.
+ * No paragraph layout is retained: the closed run-free shape has neither text
+ * nor paragraph ink. */
+function acquireSelectedNoteSeparatorBand(
+  context: BodySessionDependencies,
+  request: Parameters<NonNullable<BodyLayoutSession['layoutNotes']>>[0],
+  definition: SelectedNoteSeparatorDefinitionInput,
+  yPt: number,
+): Readonly<{ advancePt: number; ruleOffsetPt: number }> {
+  const container = {
+    ...request.container,
+    id: `${request.container.id}:${sourceKey(definition.root)}`,
+    bounds: {
+      ...request.container.bounds,
+      yPt,
+      heightPt: Math.max(0, request.container.bounds.yPt + request.container.bounds.heightPt - yPt),
+    },
+  };
+  let story: StoryLayout;
+  try {
+    story = acquireBodyStoryLayout(context.storyAcquisitionContext, {
+      source: definition.root,
+      pageIndex: request.pageIndex,
+      section: request.section,
+      container,
+    });
+  } catch (error) {
+    if (error instanceof FlowCapacityExceededError && error.containerId === container.id) {
+      throw new NoteCapacityExceededError(request.kind, request.pageIndex, request.container.id);
+    }
+    throw error;
+  }
+  const [paragraph, ...rest] = story.blocks;
+  // The run-free paragraph acquires no text line; its mark-only line box is
+  // the paragraph mark bounds (spacing before excluded, line rule applied).
+  const mark = paragraph?.kind === 'paragraph' && rest.length === 0 && paragraph.lines.length === 0
+    ? paragraph.paragraphMark : undefined;
+  if (!mark || mark.hidden) {
+    throw new Error('A note separator story must acquire exactly one visible mark-only paragraph');
+  }
+  return Object.freeze({
+    advancePt: story.advancePt,
+    ruleOffsetPt: mark.bounds.yPt + mark.bounds.heightPt / 2 - story.flowBounds.yPt,
+  });
 }
 
 function measureFollowingBodyBlock(
@@ -1328,7 +1560,12 @@ function measureFollowingBodyBlock(
   }
   if (element.type !== 'table') throw new Error('Following table source kind mismatch');
   const sourceIndex = request.input.source.path[0]!;
-  computeTablePtLayout(candidate, element, request.availableInlineExtentPt, sourceIndex);
+  computeTablePtLayout(
+    bodyTableAcquisitionState(candidate, element, effectiveTablePositioning),
+    element,
+    request.availableInlineExtentPt,
+    sourceIndex,
+  );
   const layout = retainedTableRecord(candidate, sourceIndex).acquisition.layout;
   return Object.freeze({
     fullExtentPt: layout.advancePt,
@@ -1556,9 +1793,7 @@ function prescanBodyPageAnchors(
     // inverse before the exclusion can affect earlier body content.
     const retainedResult = isVerticalTextDirection(request.location.section.textDirection)
       ? (() => {
-          const writingMode = writingModeFromTextDirection(
-            request.location.section.textDirection as string,
-          );
+          const writingMode = sectionWritingMode(request.location.section);
           const physicalPage = uprightPhysicalExtent(
             {
               widthPt: frames.page.widthPt,
@@ -1966,7 +2201,7 @@ function reacquireBodyTableBlock(
     throw new Error('Table paragraph re-acquisition source kind mismatch');
   }
   const candidate: BodyAcquisitionState = {
-    ...withTableCellStory(state),
+    ...withTableCellStory(tableCellOwnerState(state)),
     contentX: 0,
     contentW: request.acquired.flowBounds.widthPt,
     y: request.acquired.flowBounds.yPt,
@@ -2008,22 +2243,64 @@ function reacquireBodyTableBlock(
   );
 }
 
+/** Bound acquirers per session callback, owner section context and page. The
+ * paragraph acquisition cache keys on the acquirer's identity, so equal
+ * authority must yield the identical function. */
+const boundCompleteStoryAcquirers = new WeakMap<
+  NonNullable<BodyAcquisitionState['acquireCompleteTextBoxStory']>,
+  WeakMap<SectionLayoutContext, Map<number, CompleteTextBoxStoryAcquirer>>
+>();
+
+/** Bind nested complete-story acquisition to the section and page of the exact
+ * state that contains the text box (body location, table cell or story
+ * candidate), never to the session's current body location. */
+function completeTextBoxStoryAcquirerFor(
+  owner: BodyAcquisitionState,
+): CompleteTextBoxStoryAcquirer | undefined {
+  const acquire = owner.acquireCompleteTextBoxStory;
+  if (!acquire) return undefined;
+  const { sectionLayout, pageIndex } = owner;
+  let bySection = boundCompleteStoryAcquirers.get(acquire);
+  if (!bySection) {
+    bySection = new WeakMap();
+    boundCompleteStoryAcquirers.set(acquire, bySection);
+  }
+  let byPage = bySection.get(sectionLayout);
+  if (!byPage) {
+    byPage = new Map();
+    bySection.set(sectionLayout, byPage);
+  }
+  let bound = byPage.get(pageIndex);
+  if (!bound) {
+    const authority = Object.freeze({ sectionLayout, pageIndex });
+    bound = (request) => acquire(authority, request);
+    byPage.set(pageIndex, bound);
+  }
+  return bound;
+}
+
+/** Acquire a text box's complete story with its owner's section, page and
+ * frame as authority. The section-keyed story cache stays shared because its
+ * key includes the full section context. */
 function acquireCompleteBodyTextBoxStory(
-  state: BodyAcquisitionState,
+  owner: CompleteTextBoxStoryOwner,
   storyAcquisitionContext: BodyStoryAcquisitionContext,
   request: Parameters<CompleteTextBoxStoryAcquirer>[0],
 ): ReturnType<CompleteTextBoxStoryAcquirer> {
+  // An upright physical text box is horizontal: it keeps the owner section's
+  // physical page box but not that section's native frame.
+  const { nativeSectionFlow, ...sectionLayout } = owner.sectionLayout;
   const section =
     request.coordinateSpace === 'upright-physical'
       ? {
-          ...state.sectionLayout,
-          geometry: physicalSectionGeometry(state.sectionLayout.geometry),
+          ...sectionLayout,
+          geometry: physicalSectionGeometry(owner.sectionLayout.geometry, nativeSectionFlow),
           textDirection: 'lrTb',
         }
-      : state.sectionLayout;
+      : owner.sectionLayout;
   return acquireBodyStoryLayout(storyAcquisitionContext, {
     source: request.source,
-    pageIndex: state.pageIndex,
+    pageIndex: owner.pageIndex,
     section,
     container: request.container,
   });
@@ -2051,7 +2328,7 @@ function openConcreteBodyLayoutSession(
     vAlign: input.section.verticalAlignment,
   };
   const section = isVerticalTextDirection(physicalSection.textDirection)
-    ? verticalLayoutSection(physicalSection)
+    ? verticalLayoutSection(physicalSection, input.section.nativeSectionFlow)
     : physicalSection;
   const state = buildMeasureState(
     measureContext,
@@ -2061,6 +2338,7 @@ function openConcreteBodyLayoutSession(
     resolvedLocalFonts,
     services,
     options,
+    input.section.nativeSectionFlow,
   );
   // Markup view only: resolve tracked-change author colours once per
   // session from the main story's document run order (first-appearance
@@ -2115,10 +2393,12 @@ function openConcreteBodyLayoutSession(
     state,
     services,
     storyLayoutCache,
+    reservedNoteStoryCache: new Map(),
+    noteSourceReuse: new WeakMap(),
     publicAnchorBridge,
   };
-  state.acquireCompleteTextBoxStory = (request) =>
-    acquireCompleteBodyTextBoxStory(state, storyAcquisitionContext, request);
+  state.acquireCompleteTextBoxStory = (owner, request) =>
+    acquireCompleteBodyTextBoxStory(owner, storyAcquisitionContext, request);
   const sessionDependencies = {
     source,
     dependencies,
@@ -2675,11 +2955,9 @@ function resolveShapeBox(
     const phys = resolveShapeBox(
       shape,
       verticalPhysicalContentState(state),
-      state.contentX,
+      physicalColumnTopPt(state, state.verticalPhys),
     );
-    return physicalToLogicalAnchorBox(
-      phys.x, phys.y, phys.w, phys.h, state.verticalPhys.physicalPageWidthPt,
-    );
+    return physicalAnchorBoxToLogical(state.verticalPhys, phys.x, phys.y, phys.w, phys.h);
   }
   // ECMA-376 §20.4.2.18: when wp14:sizeRelH/sizeRelV is present it overrides
   // the static wp:extent for that axis. The size is `relativeFrom` container
@@ -2797,6 +3075,52 @@ const __test_preRegisterPageFloats = (
  *  read are overridden (page size, margins, and `pageH`); everything else is
  *  the live logical state. Callers map the resolved physical box back into the
  *  logical layout frame with {@link physicalToLogicalAnchorBox}. */
+/** Physical y of the anchor paragraph's column top: the logical inline start
+ * in the clockwise frame (physical y = logical x), and the logical inline end
+ * in a native counter-clockwise frame (physical y = page height - logical x).
+ * The native case is the same generic library policy transformed through its
+ * own frame. No comparison with a Word-produced reference has established
+ * this placement. */
+function physicalColumnTopPt(
+  state: AnchorFloatRegistrationState,
+  frame: PhysicalAnchorFrame,
+): number {
+  return frame.nativeSectionFlow == null
+    ? state.contentX
+    : frame.pageHeight - (state.contentX + state.contentW);
+}
+
+/** Project a box resolved on the upright physical page into the section's
+ * logical frame. The Transitional vertical frame keeps its established
+ * clockwise projection; a native BtoT frame applies the inverse of its
+ * counter-clockwise matrix (logical x = page height - physical y, logical
+ * y = physical x). */
+function physicalAnchorBoxToLogical(
+  frame: PhysicalAnchorFrame,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+): { x: number; y: number; w: number; h: number } {
+  if (frame.nativeSectionFlow == null) {
+    return physicalToLogicalAnchorBox(x, y, w, h, frame.physicalPageWidthPt);
+  }
+  return { x: frame.pageHeight - (y + h), y: x, w: h, h: w };
+}
+
+/** Relabel physical dist* padding with the logical edges of the box. Clockwise:
+ * physical top/bottom are logical left/right and physical right/left are
+ * logical top/bottom. Native BtoT: physical bottom/top are logical left/right
+ * and physical left/right are logical top/bottom. */
+function physicalDistToLogical(
+  frame: PhysicalAnchorFrame,
+  dist: Readonly<{ dl: number; dr: number; dt: number; db: number }>,
+): { dl: number; dr: number; dt: number; db: number } {
+  return frame.nativeSectionFlow == null
+    ? { dl: dist.dt, dr: dist.db, dt: dist.dr, db: dist.dl }
+    : { dl: dist.db, dr: dist.dt, dt: dist.dl, db: dist.dr };
+}
+
 function physicalAnchorState(
   state: AnchorFloatRegistrationState,
 ): AnchorFloatRegistrationState {
@@ -2823,7 +3147,30 @@ function physicalAnchorState(
  *  the vertical flags (no per-glyph counter-rotation, no +90° text-layer
  *  transform, `resolveShapeBox`/`resolveAnchorBox` take their horizontal path).
  *  `floats` is fresh: the live float set is in LOGICAL flow coordinates and must
- *  not leak into a physical-frame layout (and vice-versa). */
+ *  not leak into a physical-frame layout (and vice-versa). Clearing
+ *  `verticalPhys` also drops any native section frame; the anchor geometry
+ *  consumers of this view read only its physical page facts. */
+/** Owner state for table cell content. A body table placed upright in the
+ * physical page (identity paint root) owns its cells' physical frame: like an
+ * upright text box, the cell content is acquired horizontally in the physical
+ * page box, with no section counter-turn on its graphics, no vertical glyph
+ * flags and no native section frame ({@link verticalPhysicalContentState}).
+ * Every other table keeps its section-logical owner, and authored cell text
+ * directions are applied by the table itself either way. */
+function tableCellOwnerState(state: BodyAcquisitionState): BodyAcquisitionState {
+  if (!state.uprightPhysicalTable) return state;
+  const { nativeSectionFlow, ...section } = state.sectionLayout;
+  return {
+    ...(verticalPhysicalContentState(state) as BodyAcquisitionState),
+    uprightPhysicalTable: false,
+    sectionLayout: {
+      ...section,
+      geometry: physicalSectionGeometry(state.sectionLayout.geometry, nativeSectionFlow),
+      textDirection: 'lrTb',
+    },
+  };
+}
+
 function verticalPhysicalContentState(
   state: AnchorFloatRegistrationState,
 ): AnchorFloatRegistrationState {
@@ -2889,21 +3236,16 @@ function resolveAnchorBox(
       img.anchorXRelativeFrom ?? null, null, null,
     );
     const py = resolveAnchorY(
-      img.anchorYAlign, img.anchorYFromPara ?? false, img.anchorYPt ?? 0, h, state.contentX, phys,
+      img.anchorYAlign, img.anchorYFromPara ?? false, img.anchorYPt ?? 0, h,
+      physicalColumnTopPt(state, state.verticalPhys), phys,
       img.anchorYRelativeFrom ?? null, null, null,
     );
-    const box = physicalToLogicalAnchorBox(
-      px,
-      py,
-      w,
-      h,
-      state.verticalPhys.physicalPageWidthPt,
-    );
-    // Rotate the dist* padding one quarter-turn with the box: physical top/bottom
-    // become logical left/right; physical right/left become logical top/bottom
-    // (logical y runs opposite physical x). Symmetric wrapSquare dist is common,
-    // but rotate the labels so asymmetric dist stays correct.
-    return { x: box.x, y: box.y, w: box.w, h: box.h, dl: dt, dr: db, dt: dr, db: dl };
+    const box = physicalAnchorBoxToLogical(state.verticalPhys, px, py, w, h);
+    // Rotate the dist* padding one quarter-turn with the box. Symmetric
+    // wrapSquare dist is common, but rotate the labels so asymmetric dist
+    // stays correct.
+    const logicalDist = physicalDistToLogical(state.verticalPhys, { dl, dr, dt, db });
+    return { x: box.x, y: box.y, w: box.w, h: box.h, ...logicalDist };
   }
   const x = resolveAnchorX(
     img.anchorXAlign, img.anchorXFromMargin ?? false, img.anchorXPt ?? 0, w, state,
@@ -3118,20 +3460,18 @@ function registerShapeFloat(
   const mode: 'square' | 'topAndBottom' =
     shape.wrapMode === 'topAndBottom' ? 'topAndBottom' : 'square';
 
-  const pdl = shape.distLeft ?? 0;
-  const pdr = shape.distRight ?? 0;
-  const pdt = shape.distTop ?? 0;
-  const pdb = shape.distBottom ?? 0;
+  const physicalDist = {
+    dl: shape.distLeft ?? 0,
+    dr: shape.distRight ?? 0,
+    dt: shape.distTop ?? 0,
+    db: shape.distBottom ?? 0,
+  };
   // §17.6.20 — on a vertical page the box above is the LOGICAL projection of the
   // physically-resolved shape (resolveShapeBox), so rotate the dist* labels one
-  // quarter-turn with it, exactly like the image path (resolveAnchorBox):
-  // physical top/bottom ↦ logical left/right, physical right/left ↦ logical
-  // top/bottom (logical y runs opposite physical x).
-  const vertical = !!state.verticalPhys;
-  const dl = vertical ? pdt : pdl;
-  const dr = vertical ? pdb : pdr;
-  const dt = vertical ? pdr : pdt;
-  const db = vertical ? pdl : pdb;
+  // quarter-turn with it, exactly like the image path (resolveAnchorBox).
+  const { dl, dr, dt, db } = state.verticalPhys
+    ? physicalDistToLogical(state.verticalPhys, physicalDist)
+    : physicalDist;
 
   // Overlap avoidance, kept consistent with the image path. Shapes carry no
   // parsed allowOverlap field; the spec default is true (§20.4.2.3), so

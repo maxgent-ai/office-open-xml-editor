@@ -19,6 +19,13 @@ const processedPlainData = new WeakSet<object>();
  * because freezing alone does not prove a graph is plain data. */
 const frozenPlainData = new WeakSet<object>();
 
+/** Internal immutable-acquisition identity, stronger than shallow Object.freeze.
+ * This permits scalar memoization only for roots sealed by our complete walks;
+ * it does not waive the separate structured-clone/plain-data validation. */
+export function isDeepFrozenPlainDataRoot(value: object): boolean {
+  return frozenPlainData.has(value) || processedPlainData.has(value);
+}
+
 function assertPlainData(
   value: unknown,
   path: string,

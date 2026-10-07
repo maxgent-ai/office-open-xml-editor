@@ -2,9 +2,9 @@ import { LayoutInvariantError } from './diagnostics.js';
 import {
   createSectionRegionCoordinateSpace,
   logicalPageExtent,
+  sectionWritingMode,
   transformRect,
   uprightPhysicalExtent,
-  writingModeFromTextDirection,
 } from './coordinate-space.js';
 import { columnSeparatorSegments } from './column-separators.js';
 import { orderedPagePaintNodes, pageLayerNodes, PageGraphError } from './page-graph.js';
@@ -29,6 +29,7 @@ import type {
   WritingMode,
 } from './types.js';
 import { unionLayoutRects } from './rect-union.js';
+import { noteOwnedBlocks } from './native-note-separators.js';
 
 import { documentLayoutValidationEnabled } from './validation-policy.js';
 // Pagination's generator yields page counts for public progress telemetry.
@@ -203,7 +204,8 @@ function requireMatrix(matrix: unknown, path: string): asserts matrix is Section
 }
 
 function requireWritingMode(value: unknown, path: string): asserts value is WritingMode {
-  if (value !== 'horizontal-tb' && value !== 'vertical-rl' && value !== 'vertical-lr') {
+  if (value !== 'horizontal-tb' && value !== 'vertical-rl' && value !== 'vertical-lr'
+    && value !== 'sideways-lr') {
     throw new LayoutInvariantError('INVALID_GEOMETRY', `${path} is unsupported`);
   }
 }
@@ -345,7 +347,7 @@ function requirePageBorder(page: LayoutPage, path: string): void {
   }
   requireMatrix(pageBorder.logicalToPhysical, `${path}.logicalToPhysical`);
   const expectedTransform = createSectionRegionCoordinateSpace(
-    writingModeFromTextDirection(page.section.textDirection),
+    sectionWritingMode(page.section),
     page.geometry,
   ).logicalToPhysical;
   if (!equalMatrix(pageBorder.logicalToPhysical, expectedTransform)) {
@@ -416,13 +418,47 @@ function collectRetainedNodeIds(
     return;
   }
   if (node.kind === 'note') {
-    node.story.blocks.forEach((block) =>
+    noteOwnedBlocks(node).forEach((block) =>
       collectRetainedNodeIds(block, pageIds, documentIds));
     return;
   }
   if (node.kind === 'textbox') {
     node.story.blocks.forEach((block) =>
       collectRetainedNodeIds(block, pageIds, documentIds));
+  }
+}
+
+/** Native separator/notice occurrences belong to their note: they lie on its
+ * block interval in its flow domain and replace, never add to, its scalar rule. */
+function requireNoteSeparatorOwnership(node: PaintNode, path: string): void {
+  if (node.kind !== 'note') return;
+  if (node.leading && node.separator.length !== 0) {
+    throw new LayoutInvariantError('INVALID_GEOMETRY', `${path} paints both a scalar and a native separator`);
+  }
+  if (node.trailing && node.trailing.role !== 'continuationNotice') {
+    throw new LayoutInvariantError('INVALID_REFERENCE', `${path}.trailing is not a continuation notice`);
+  }
+  for (const [label, occurrence] of [['leading', node.leading], ['trailing', node.trailing]] as const) {
+    if (!occurrence) continue;
+    const occurrencePath = `${path}.${label}`;
+    requireRect(occurrence.flowBounds, `${occurrencePath}.flowBounds`);
+    requireFinite(occurrence.advancePt, `${occurrencePath}.advancePt`);
+    if (!atMostWithinFloatingPrecision(node.flowBounds.yPt, occurrence.flowBounds.yPt)
+      || !atMostWithinFloatingPrecision(
+        occurrence.flowBounds.yPt + occurrence.advancePt,
+        node.flowBounds.yPt + node.flowBounds.heightPt,
+      )) {
+      throw new LayoutInvariantError('FLOW_DOMAIN_INVASION', `${occurrencePath} lies outside its note`);
+    }
+    if (occurrence.paragraph && occurrence.paragraph.flowDomainId !== node.flowDomainId) {
+      throw new LayoutInvariantError('INVALID_REFERENCE', `${occurrencePath} leaves its note flow domain`);
+    }
+    if (occurrence.rule) {
+      for (const point of [occurrence.rule.segment.from, occurrence.rule.segment.to]) {
+        requireFinite(point.xPt, `${occurrencePath}.rule.xPt`);
+        requireFinite(point.yPt, `${occurrencePath}.rule.yPt`);
+      }
+    }
   }
 }
 
@@ -691,16 +727,16 @@ function* assertDocumentLayoutUncheckedSteps(layout: DocumentLayout): Generator<
           );
         }
         pageWritingMode = writingMode;
-        let sectionWritingMode: WritingMode;
+        let sectionMode: WritingMode;
         try {
-          sectionWritingMode = writingModeFromTextDirection(region.section.textDirection);
+          sectionMode = sectionWritingMode(region.section);
         } catch (error) {
           throw new LayoutInvariantError(
             'INVALID_GEOMETRY',
             `${path}.section.textDirection is unsupported: ${(error as Error).message}`,
           );
         }
-        if (writingMode !== sectionWritingMode) {
+        if (writingMode !== sectionMode) {
           throw new LayoutInvariantError(
             'INVALID_GEOMETRY',
             `${path} writing mode contradicts its section text direction`,
@@ -933,6 +969,7 @@ function* assertDocumentLayoutUncheckedSteps(layout: DocumentLayout): Generator<
       nodes.set(node.id, node);
       collectRetainedNodeIds(node, retainedNodeIds, documentRetainedNodeIds);
       requireRetainedCollisionGeometry(node, path);
+      requireNoteSeparatorOwnership(node, path);
       requireRect(node.flowBounds, `${path}.flowBounds`);
       requireRect(node.inkBounds, `${path}.inkBounds`);
       if (node.clipBounds) requireRect(node.clipBounds, `${path}.clipBounds`);

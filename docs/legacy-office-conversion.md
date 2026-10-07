@@ -3,6 +3,7 @@
 Legacy binary Office files can be opened with the ordinary viewers and
 loaders through optional model sources:
 
+- `.doc` with the DOCX loaders and `DocxViewer`
 - `.xls` with the XLSX loaders and `XlsxViewer`
 - `.ppt` with the PPTX loaders and `PptxViewer`
 
@@ -27,16 +28,17 @@ session options (`openDocxDocument`, `materializeDocxDocument`,
 `openXlsxWorkbook`, `openPptxPresentation` and their siblings).
 
 ```typescript
-import { PptxViewer } from '@silurus/ooxml/pptx';
-import { legacyPptSource } from '@silurus/ooxml/legacy-ppt';
+import { DocxViewer } from '@silurus/ooxml/docx';
+import { legacyDocSource } from '@silurus/ooxml/legacy-doc';
 
 const canvas = document.querySelector('canvas') as HTMLCanvasElement;
-const viewer = new PptxViewer(canvas, { modelSources: [legacyPptSource()] });
-await viewer.load(pptOrPptxBytes);
+const viewer = new DocxViewer(canvas, { modelSources: [legacyDocSource()] });
+await viewer.load(docOrDocxBytes);
 ```
 
 | Input | Entry | Factory | Loaders and viewers |
 | --- | --- | --- | --- |
+| DOC | `@silurus/ooxml/legacy-doc` | `legacyDocSource()` | `DocxViewer`, `DocxDocument.load`, `openDocxDocument`, `materializeDocxDocument` |
 | XLS | `@silurus/ooxml/legacy-xls` | `legacyXlsSource()` | `XlsxViewer`, `XlsxWorkbook.load`, `openXlsxWorkbook` |
 | PPT | `@silurus/ooxml/legacy-ppt` | `legacyPptSource()` | `PptxViewer`, `PptxPresentation.load`, `openPptxPresentation` |
 
@@ -53,7 +55,7 @@ interface LegacySourceOptions {
 Creating a source fetches nothing. When a claimed file loads, the parser
 Worker (or Node) imports the source's self-contained ES module, emitted as
 `legacy-<format>-source-module*.mjs` next to the package files, and initializes
-the reader's dedicated WASM: `legacy_xls_direct_bg.wasm` or
+the reader's dedicated WASM: `legacy_doc_direct_bg.wasm`, `legacy_xls_direct_bg.wasm` or
 `legacy_ppt_direct_bg.wasm`. Serve these files
 with the other package assets, and allow the module URL wherever a Content
 Security Policy restricts `script-src` or Worker imports. Applications with a
@@ -74,7 +76,7 @@ explicit caller option, then the source's view default, then the renderer
 default. Capabilities that a source lacks degrade the same way for every
 format: resource metrics are reported without a ZIP usage snapshot, and
 `toMarkdown()` rejects with an "... is unsupported for this source" error.
-Both legacy readers lack Markdown export and ZIP accounting.
+All three legacy readers lack Markdown export and ZIP accounting.
 
 To cancel a load, destroy the document or viewer, or start another load in
 its place. Node sessions keep their `signal` option.
@@ -82,16 +84,15 @@ its place. Node sessions keep their `signal` option.
 ## Admission and failure behavior
 
 A source's synchronous `claim(bytes)` accepts only its own [MS-CFB] family:
-a compound file whose directory names `Workbook` or `Book` (XLS), or
-`PowerPoint Document` (PPT). A container that names more than one binary
-family (`WordDocument` for DOC counts too), or that carries `EncryptionInfo`,
-is not claimed. Every input a
+a compound file whose directory names `WordDocument` (DOC), `Workbook` or
+`Book` (XLS), or `PowerPoint Document` (PPT). A container that names more than
+one family, or that carries `EncryptionInfo`, is not claimed. Every input a
 source does not claim takes the unchanged OOXML path, so:
 
 - a legacy file without a matching source rejects with the typed
   `legacy-binary-format` error;
 - encrypted OOXML packages keep their existing encryption errors;
-- configuring `legacyXlsSource()` does not enable PPT or DOC input.
+- configuring `legacyDocSource()` does not enable XLS or PPT input.
 
 Claimed input larger than `maxInputBytes` throws a `RangeError`. The limit is
 resource policy, not an Office format limit. After a source claims a file, a
@@ -99,6 +100,107 @@ reader failure rejects the load: there is no fallback to another source or to
 the OOXML path. Password-protected legacy binaries, pre-CFB Office formats and
 unsupported binary structures are rejected by the readers. These checks are
 structural, never filename-based.
+
+## Experimental direct DOC source
+
+```typescript
+import { DocxDocument } from '@silurus/ooxml/docx';
+import { legacyDocSource } from '@silurus/ooxml/legacy-doc';
+
+const document = await DocxDocument.load(legacyDocArrayBuffer, {
+  modelSources: [legacyDocSource()],
+});
+const canvas = window.document.querySelector('canvas') as HTMLCanvasElement;
+
+try {
+  await document.renderPage(canvas, 0, { width: 960 });
+} finally {
+  document.destroy();
+}
+```
+
+Node supports DOC through the same reader:
+
+```typescript
+import { openDocxDocument } from '@silurus/ooxml/node';
+import { legacyDocSource } from '@silurus/ooxml/legacy-doc';
+
+const session = await openDocxDocument(legacyDocBytes, {
+  factory,
+  modelSources: [legacyDocSource()],
+});
+```
+
+Both browser rendering modes and progressive layout use the same retained
+layout pipeline. The native source remains alive for image reads until the
+document is destroyed; finishing a model cursor does not dispose it.
+
+This is a narrow experimental reader, not full DOC support. Unsupported
+formatting, fields, numbering, notes and other unimplemented structures may
+reject the entire document.
+
+When a DOC prints its revision markup (MS-DOC `DopBase.fRMPrint`) and carries
+revision marks, the reader reports `showTrackedChanges: true` as its view
+default. An explicit `showTrackedChanges` option, including `false`, always
+wins.
+
+Missing header and footer distances use the MS-DOC 2.6.4 defaults for the
+stored producer installation LCID when the specification lists that LCID.
+Explicit values, including zero, win. Unlisted languages keep the
+unresolved-margin recovery. The host locale and the document's text language
+are not used to guess the producer's settings.
+
+Fields in the direct DOC source are checked against each story's own field
+table: the main document, headers and footers, footnotes, endnotes and
+textboxes (MS-DOC 2.8.25). They map onto the fields the DOCX reader already
+supports:
+
+- PAGE, NUMPAGES, DATE and TIME are computed when the document is laid out,
+  as for DOCX. Word does the same: a DOC header DATE field prints the export
+  date in Word's PDF, not the date stored in the file. Only switches the
+  renderer interprets exactly are accepted: numeric page formats,
+  MERGEFORMAT or CHARFORMAT, and date pictures that need no language data.
+- Form check boxes show their stored state and size.
+- Every other field shows its stored result. Fields are never executed.
+  HYPERLINK fields and REF or PAGEREF fields with `\h` become links. Inside a
+  table of contents, link text keeps the paragraph's color and underline,
+  which matches Word's PDF. Stored results are not recomputed, so a
+  PAGEREF number can differ from a PDF that Word produced after updating it.
+- Some fields reject the document. These include equations (EQ, often used
+  for phonetic guides), macro buttons, drop-down form fields and SYMBOL
+  fields without a stored result. Others are fields shown as codes, locked
+  or edited page and date fields, and nested hyperlinks. A private result
+  with content is rejected unless it is an INCLUDEPICTURE picture, which
+  Word's PDF shows.
+
+Footnotes and endnotes become DOCX notes. Automatic reference marks and the
+numbers inside each note use the document-wide note format and starting
+value. Arabic, Roman and letter formats are supported, with Word's
+lowercase-Roman default for endnotes in later Word versions. Footnotes must be
+at the page bottom and endnotes at the end of the document. Documents are
+rejected if they use custom reference marks, number restarts per section or
+per page, sections with different note numbering, or custom separator
+stories.
+
+Section text flow (MS-DOC sprmSTextFlow, an MS-ODRAW MSOTXFL value) is shown
+per section, following the basic rules of the specification:
+
+- Values 0 and 4 are horizontal. No different glyph treatment is inferred
+  for value 4 from its name.
+- Value 1 is vertical with upright East Asian characters, as before.
+- Values 3 and 5 run downward with later lines to the left and every
+  character rotated a quarter turn clockwise.
+- Value 2 runs upward with later lines to the right and every character
+  rotated a quarter turn counter-clockwise.
+
+MS-ODRAW notes that Word 2007 and 2010 place later lines of value 5 to the
+right. The file does not record which application displays it, so the
+documented basic rule is used. Word's placement of headers, footers, notes,
+anchored drawings and upright tables in value-2 sections has not been
+established. They follow the library's general placement for vertical
+sections, turned with the section's own direction, without a claim of
+matching Word. Horizontal-in-vertical runs remain supported only in value-1
+sections.
 
 ## Experimental direct PPT source
 
@@ -337,9 +439,10 @@ helpers remain separate from the direct XLS reader.
 
 The repository contains only the direct readers; legacy input is never
 converted to OOXML. The Rust crate `legacy-office-converter` builds one reader
-per feature: `direct-xls` and `direct-ppt`. Building it for `wasm32` with
-neither enabled is a compile error. The `inspection` feature adds the
-native-only examples above, and `fuzzing` exposes the fuzz entry points.
+per feature: `direct-doc`, `direct-xls` and `direct-ppt`. Building it for
+`wasm32` with none of them enabled is a compile error. The `inspection`
+feature adds the native-only examples above, and `fuzzing` exposes the fuzz
+entry points.
 
 The local direct-render survey described below renders every installed
 legacy sample through its source and pairs it with the Office-exported PDF.
@@ -361,8 +464,31 @@ conversion can change layout and is not an absolute visual oracle. In
 particular, rebuilt or down-saved corpus members must not silently be treated
 as lossless copies of their original OOXML.
 
-Compare the direct reader's Canvas output with Office-exported PDFs through
-the local direct-render survey. Keep renderer self-regression tests against the
+The local macOS exporter opens a disposable copy with installed Microsoft
+Office, with macros disabled and Word/Excel external-link updates disabled,
+and writes a PDF to a fresh output path:
+
+```bash
+osascript packages/legacy-converter/tools/legacy-office-export.applescript \
+  doc disposable-copy.doc fresh-output.pdf
+```
+
+The first argument is `doc`, `xls` or `ppt`. The exporter requires Office for
+macOS and macOS automation permission for each Office application. Runs are
+sequential; an Office failure stops rather than accumulating open documents
+or dialogs. Original corpus files and existing visual references are never
+changed, and PDFs and page images stay in a local temporary directory; no
+private artifact is committed or uploaded.
+
+The exporter refuses to open a document unless Office reports its automation
+security setting and confirms that macros are disabled. PowerPoint builds that
+return no value for this property are currently blocked, even after macOS
+automation permission is granted. Word and Excel PDF export have been exercised;
+the PowerPoint export path is not yet validated end to end. Do not weaken this
+guard to obtain a passing report.
+
+Compare the direct reader's Canvas output with those Office PDFs through the
+local direct-render survey. Keep renderer self-regression tests against the
 previous renderer separate from this fidelity comparison. Neither whole-corpus
 Office equality nor Canvas display equality has been reached.
 

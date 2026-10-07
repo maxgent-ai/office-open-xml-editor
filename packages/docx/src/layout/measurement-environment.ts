@@ -13,7 +13,7 @@ import {
 } from '../paragraph-measure.js';
 import type { ParagraphLayoutContext, StoryContext } from '../layout-context.js';
 import type { BodyMeasurementContext } from './acquisition-context.js';
-import { writingModeFromTextDirection } from './coordinate-space.js';
+import { sectionWritingMode } from './coordinate-space.js';
 
 function kashidaLevelOf(alignment: string | null | undefined): KashidaLevel | null {
   if (alignment === 'lowKashida') return 'low';
@@ -80,7 +80,7 @@ export function paragraphMeasurementEnvironment(
     noteNumbers: state.noteNumbers,
     noteNumbering: state.noteNumbering,
     noteReferenceNumber: state.noteReferenceNumber,
-    pageWritingMode: writingModeFromTextDirection(state.sectionLayout.textDirection),
+    pageWritingMode: sectionWritingMode(state.sectionLayout),
     // §17.6.20 btLr uses the horizontal line model rotated wholesale.
     verticalCJK: state.verticalCJK && !state.verticalAllRotated,
     verticalPageFrame: state.verticalCJK === true,

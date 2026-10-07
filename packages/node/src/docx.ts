@@ -45,6 +45,14 @@ export interface OpenDocxDocumentOptions extends OoxmlNodeSessionOptions {
   factory: NodeCanvasFactory;
   /** Stable DATE/TIME field instant captured before pagination. */
   currentDate?: Date | number;
+  /** Continue paragraph footnotes across physical pages. Omitted means true,
+   * the same library display default as the browser `LoadOptions`: a policy
+   * chosen to follow Word's page allocation in finite controls, not a
+   * normative ECMA-376 rule. Pass `false` to keep the previous whole-note
+   * pagination. With continuation, table splitting, width changes and changed
+   * source cuts can reject layout, and full-note acquisition is subject to the
+   * library source/page budgets. */
+  allowFootnoteContinuation?: boolean;
 }
 
 export interface DocxPageRenderOptions {
@@ -105,6 +113,8 @@ export async function openDocxDocument(
     const services = createLayoutServices(acquired.result, {
       cjkFallback,
       measureContext: measurementCanvas.getContext('2d') as CanvasRenderingContext2D,
+      // Library default: continuation unless the caller passes exactly false.
+      allowFootnoteContinuation: options.allowFootnoteContinuation !== false,
     });
     const defaultCurrentDateMs = normalizeCurrentDate(options.currentDate);
     const retained = retainRenderWorkerDocumentLayout(

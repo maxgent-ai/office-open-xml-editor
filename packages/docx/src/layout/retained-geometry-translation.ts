@@ -114,6 +114,9 @@ export function translatePlacement(
   if (placement.kind === 'text') return {
     ...placement,
     origin: translatePoint(placement.origin, delta), bounds: translateRect(placement.bounds, delta),
+    // Selection/comment geometry shares the occurrence's destination, including
+    // note fragments projected from a reusable full-story acquisition.
+    ...(placement.highlightBounds ? { highlightBounds: translateRect(placement.highlightBounds, delta) } : {}),
     decorations: placement.decorations.map((decoration) => ({
       ...decoration, from: translatePoint(decoration.from, delta), to: translatePoint(decoration.to, delta),
       ...(decoration.path ? { path: decoration.path.map((point) => translatePoint(point, delta)) } : {}),

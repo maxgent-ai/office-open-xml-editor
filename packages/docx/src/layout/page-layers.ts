@@ -15,6 +15,7 @@ import type {
   TableLayout,
   TextBoxLayout,
 } from './types.js';
+import { noteOwnedBlocks } from './native-note-separators.js';
 
 export const PAGE_LAYER_IDS = [
   'background',
@@ -104,15 +105,17 @@ function visitAnchoredDrawings(
     const noteFrames = node.story.clipBounds
       ? Object.freeze([...frames, clipFrame(node.story.clipBounds)])
       : frames;
-    for (const block of node.story.blocks) {
-      visitAnchoredDrawings(
-        block,
-        root,
-        noteFrames,
-        layoutTranslationPt,
-        candidates,
-      );
-    }
+    // Separator/notice occurrences paint outside the story clip.
+    const visit = (block: PaintNode, blockFrames: typeof frames) => visitAnchoredDrawings(
+      block,
+      root,
+      blockFrames,
+      layoutTranslationPt,
+      candidates,
+    );
+    if (node.leading?.paragraph) visit(node.leading.paragraph, frames);
+    for (const block of node.story.blocks) visit(block, noteFrames);
+    if (node.trailing?.paragraph) visit(node.trailing.paragraph, frames);
     return;
   }
   if (node.kind === 'paragraph') {
@@ -330,7 +333,7 @@ function retainedNodeRequiresElementBackedVerticalGlyphPaint(
     ));
   }
   if (node.kind === 'textbox' || node.kind === 'note') {
-    return node.story.blocks.some((block) => (
+    return (node.kind === 'note' ? noteOwnedBlocks(node) : node.story.blocks).some((block) => (
       retainedNodeRequiresElementBackedVerticalGlyphPaint(block, seen)
     ));
   }
@@ -363,7 +366,8 @@ function collectRetainedNodeResourceKeys(
     return;
   }
   if (node.kind === 'textbox' || node.kind === 'note') {
-    for (const block of node.story.blocks) collectRetainedNodeResourceKeys(block, keys, seen);
+    const blocks = node.kind === 'note' ? noteOwnedBlocks(node) : node.story.blocks;
+    for (const block of blocks) collectRetainedNodeResourceKeys(block, keys, seen);
     return;
   }
   for (const row of node.rows) {

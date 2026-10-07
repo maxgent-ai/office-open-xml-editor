@@ -175,8 +175,17 @@ export type DrawingPaintCommand =
       rect: LayoutRect;
       /** Keep a non-text graphic upright after the enclosing section-logical
        * frame is rotated into a vertical physical page. */
-      orientation?: 'upright-physical';
+      orientation?: UprightResourceOrientation;
     }>;
+
+/** Closed local counter-turn that keeps a non-text graphic upright in its
+ * owner section's physical page. `upright-physical` cancels the clockwise
+ * vertical frame (local quarter turn counter-clockwise);
+ * `upright-physical-counter-clockwise` cancels a native counter-clockwise
+ * (`sideways-lr`) frame (local quarter turn clockwise). */
+export type UprightResourceOrientation =
+  | 'upright-physical'
+  | 'upright-physical-counter-clockwise';
 
 export interface DrawingLayout extends LayoutNodeBase {
   readonly kind: 'drawing';
@@ -227,7 +236,15 @@ export interface TextRange {
 }
 
 export type TextDirection = 'ltr' | 'rtl';
-export type WritingMode = 'horizontal-tb' | 'vertical-rl' | 'vertical-lr';
+/** `sideways-lr` is the counter-clockwise frame (lines advance upward, later
+ * lines to the right, every glyph rotated with the page). Only a native
+ * {@link NativeSectionFlow} selects it; no OOXML token does. */
+export type WritingMode = 'horizontal-tb' | 'vertical-rl' | 'vertical-lr' | 'sideways-lr';
+
+/** Canonical per-section semantics normalized once from a native MS-DOC flow
+ * that no Transitional ST_TextDirection token expresses in this library:
+ * MS-ODRAW 2.4.5 BtoT (upward, later lines rightward, glyph tops left). */
+export type NativeSectionFlow = 'bottomToTop';
 
 export type TextDecorationLayout = Readonly<{
   kind: 'underline' | 'strikethrough' | 'overline';
@@ -513,7 +530,7 @@ export interface ResourcePlacement {
   readonly resourceKind: InlineResourceKind;
   /** Keep a non-text graphic upright after the enclosing section-logical frame
    * is rotated into a vertical physical page. Absent means flow-relative. */
-  readonly orientation?: 'upright-physical';
+  readonly orientation?: UprightResourceOrientation;
   readonly bounds: LayoutRect;
   readonly advancePt: number;
 }
@@ -940,10 +957,36 @@ export interface StoryLayout {
   readonly diagnostics: readonly LayoutDiagnostic[];
 }
 
+/** Page-owned occurrence of one native reserved separator story (MS-DOC
+ * 2.3.3): the separator or continuation separator leading a page's note band
+ * (ECMA-376 §17.11.23 / §17.11.1), or the continuation notice ending a page on
+ * which a note continues (§17.18.33). The canonical reserved source is shared
+ * by every occurrence; geometry belongs to this destination page. */
+export interface NoteSeparatorLayout {
+  readonly role: 'separator' | 'continuationSeparator' | 'continuationNotice';
+  readonly source: SourceRef;
+  readonly flowBounds: LayoutRect;
+  readonly advancePt: number;
+  /** The story's acquired paragraph; it paints its own decorations only. */
+  readonly paragraph?: ParagraphLayout;
+  /** Ink of the U+0003/U+0004 control, emitted only here. */
+  readonly rule?: Readonly<{
+    mark: 'short' | 'full';
+    source: SourceRef;
+    segment: BorderSegment;
+  }>;
+}
+
 export interface NoteLayout extends LayoutNodeBase {
   readonly kind: 'note';
+  /** Scalar library rule of the modern/absent-native path. Empty when a
+   * native {@link leading} occurrence owns the separator. */
   readonly separator: readonly BorderSegment[];
+  readonly leading?: NoteSeparatorLayout;
   readonly story: StoryLayout;
+  /** The page's continuation notice (§17.18.33), owned by the last note of a
+   * band in which some note continues on a later page. */
+  readonly trailing?: NoteSeparatorLayout;
 }
 
 export type PaintNode = ParagraphLayout | TableLayout | DrawingLayout | TextBoxLayout | NoteLayout;
@@ -1148,6 +1191,9 @@ export interface LayoutServices {
   readonly text: TextLayoutService;
   readonly images: ImageMetadataService;
   readonly math: MathMetadataService;
+  /** Immutable document-level capability for paragraph footnote continuation.
+   * Unsupported cuts fail explicitly; this does not select another renderer. */
+  readonly allowFootnoteContinuation?: boolean;
   /** Geometry-affecting vertical glyph acquisition capability. Kept separate
    * from horizontal text shaping so each service fingerprint stays truthful. */
   readonly verticalGlyphFingerprint?: string;

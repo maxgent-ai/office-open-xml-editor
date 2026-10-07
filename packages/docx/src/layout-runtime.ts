@@ -58,6 +58,7 @@ export function createLayoutServices(
     readonly officeRoutes?: readonly OfficeFontFallbackRoute[];
     readonly googleFaces?: readonly FontFace[];
     readonly installedSubstituteFamilies?: readonly string[];
+    readonly allowFootnoteContinuation?: boolean;
   } = {},
 ): LayoutServices {
   const source = isLayoutSourceStore(input) ? input : layoutSourceStore(input);

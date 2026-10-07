@@ -131,7 +131,7 @@ type SourceDocxFriend = Pick<DocxDocument, keyof DocxDocument> & Record<
   '_chartEx' | '_tiff' | '_document' | '_embeddedFontFaces' | '_officeFontFaces' |
   '_googleFontFaces' | '_source' | '_layoutObservers' | '_layoutAbort' |
   '_replaceMainLayoutPublication' | '_isLayoutViewActive' | '_layoutLifecycle' |
-  '_layoutCompletion' | '_resourceUsage' | '_progressive',
+  '_layoutCompletion' | '_resourceUsage' | '_progressive' | '_allowFootnoteContinuation',
   any
 >;
 
@@ -217,6 +217,9 @@ export async function loadDocxModelSource(
       checkAbort();
       doc._metrics = metrics;
       doc._cjkFallback = cjkFallback;
+      // Same library default as DocxDocument.load: continuation unless the
+      // caller passes exactly false.
+      doc._allowFootnoteContinuation = opts.allowFootnoteContinuation !== false;
       // The variant the caller will actually render, recorded for BOTH render
       // modes and recorded BEFORE the parse: geometry accessors and the
       // per-call option fill-in (`_withActiveView`) read it, the wire options
@@ -347,6 +350,7 @@ export async function loadDocxModelSource(
         const layoutDocument = doc;
         const runtime = documentLayoutRuntimeOf(doc);
         runtime.services = createLayoutServices(doc._source, {
+          allowFootnoteContinuation: doc._allowFootnoteContinuation,
           fontMetrics: embeddedMetrics,
           useGoogleFonts: !!opts.useGoogleFonts,
           cjkFallback,
