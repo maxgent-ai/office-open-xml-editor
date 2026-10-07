@@ -135,6 +135,9 @@ export interface BodyAcquisitionState extends AnchorFloatRegistrationState {
     request: Parameters<CompleteTextBoxStoryAcquirer>[0],
   ) => ReturnType<CompleteTextBoxStoryAcquirer>;
   retainedTablesBySourceIndex: Map<number, RetainedTableRecord>;
+  /** Set only while acquiring a body table that is placed upright in the
+   * physical page (identity paint root); its cells take that frame. */
+  uprightPhysicalTable?: boolean;
   kinsoku: KinsokuRules;
   defaultTabPt: number;
   currentDateMs?: number;

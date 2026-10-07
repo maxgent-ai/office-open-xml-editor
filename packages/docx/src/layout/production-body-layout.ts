@@ -78,7 +78,7 @@ import { applyNumberingBodyOffset, resolveNumberingMarkerGeometry } from './numb
 import { projectTableColumnLayoutInput, type TableSourceAcquisitionInput } from './table-source-acquisition.js';
 import { measureTableIntrinsicWidths, resolveTableColumnWidths } from './table-columns.js';
 import { decideLogicalTable, type LogicalTableDecision, type TableMemberDecision } from './table-layout-decision.js';
-import { measureBodyTableEntry } from './body-table-measurement.js';
+import { bodyTableAcquisitionState, measureBodyTableEntry } from './body-table-measurement.js';
 import { measureParagraphIntrinsicWidths, measureTableCellIntrinsicWidths } from './intrinsic-width.js';
 // ── Line-layout engine (segmentation + line-breaking + measurement) ──────────
 // Body acquisition drives the pure root line-layout kernel through this
@@ -233,7 +233,7 @@ function buildMeasureState(
       tableDecision: singleTableDecision,
       resolveColumns: resolveColumnWidths,
       createCellState: (state, contentWidthPt, cell) => ({
-        ...withTableCellStory(state),
+        ...withTableCellStory(tableCellOwnerState(state)),
         contentX: 0,
         contentW: contentWidthPt,
         y: 0,
@@ -406,13 +406,14 @@ function buildMeasureState(
     // band is reserved at the raw logical rectangle during pagination while the
     // retained paint uses the physical projection — diverging page assignment.
     // `physicalPageWidthPt` is the physical page width in canonical points.
-    // `verticalCJK` stays unset: acquisition keeps its horizontal glyph
-    // metrics (only anchor geometry re-frames).
-    // The direction flags follow the current `sectionLayout`; the physical
-    // anchor frame is seeded here from the section this state is built from
-    // and rebuilt from each acquisition location's own section
-    // (`applyBodyAcquisitionLocationTo`, issue #1000), so a mid-body section's
-    // anchors resolve against ITS OWN physical frame.
+    // The direction flags are getters on the current `sectionLayout`, so they
+    // follow each owner section. An all-rotated `btLr` section (including a
+    // native BtoT section) keeps horizontal glyph metrics through
+    // `verticalAllRotated`; only upright-vertical sections plan vertical
+    // glyphs. The physical anchor frame is seeded here from the section this
+    // state is built from and rebuilt from each acquisition location's own
+    // section (`applyBodyAcquisitionLocationTo`, issue #1000), so a mid-body
+    // section's anchors resolve against ITS OWN physical frame.
     get verticalCJK() {
       return isVerticalTextDirection(this.sectionLayout.textDirection);
     },
@@ -1559,7 +1560,12 @@ function measureFollowingBodyBlock(
   }
   if (element.type !== 'table') throw new Error('Following table source kind mismatch');
   const sourceIndex = request.input.source.path[0]!;
-  computeTablePtLayout(candidate, element, request.availableInlineExtentPt, sourceIndex);
+  computeTablePtLayout(
+    bodyTableAcquisitionState(candidate, element, effectiveTablePositioning),
+    element,
+    request.availableInlineExtentPt,
+    sourceIndex,
+  );
   const layout = retainedTableRecord(candidate, sourceIndex).acquisition.layout;
   return Object.freeze({
     fullExtentPt: layout.advancePt,
@@ -2195,7 +2201,7 @@ function reacquireBodyTableBlock(
     throw new Error('Table paragraph re-acquisition source kind mismatch');
   }
   const candidate: BodyAcquisitionState = {
-    ...withTableCellStory(state),
+    ...withTableCellStory(tableCellOwnerState(state)),
     contentX: 0,
     contentW: request.acquired.flowBounds.widthPt,
     y: request.acquired.flowBounds.yPt,
@@ -3143,6 +3149,27 @@ function physicalAnchorState(
  *  not leak into a physical-frame layout (and vice-versa). Clearing
  *  `verticalPhys` also drops any native section frame; the anchor geometry
  *  consumers of this view read only its physical page facts. */
+/** Owner state for table cell content. A body table placed upright in the
+ * physical page (identity paint root) owns its cells' physical frame: like an
+ * upright text box, the cell content is acquired horizontally in the physical
+ * page box, with no section counter-turn on its graphics, no vertical glyph
+ * flags and no native section frame ({@link verticalPhysicalContentState}).
+ * Every other table keeps its section-logical owner, and authored cell text
+ * directions are applied by the table itself either way. */
+function tableCellOwnerState(state: BodyAcquisitionState): BodyAcquisitionState {
+  if (!state.uprightPhysicalTable) return state;
+  const { nativeSectionFlow, ...section } = state.sectionLayout;
+  return {
+    ...(verticalPhysicalContentState(state) as BodyAcquisitionState),
+    uprightPhysicalTable: false,
+    sectionLayout: {
+      ...section,
+      geometry: physicalSectionGeometry(state.sectionLayout.geometry, nativeSectionFlow),
+      textDirection: 'lrTb',
+    },
+  };
+}
+
 function verticalPhysicalContentState(
   state: AnchorFloatRegistrationState,
 ): AnchorFloatRegistrationState {

@@ -79,6 +79,24 @@ export interface BodyTableMeasurementOperations {
   ) => ParagraphLayout | TableLayout;
 }
 
+/** The state that acquires one top-level body table. A table without
+ * authored or effective positioning on a vertical page is placed upright in
+ * the physical page (identity paint root), so it owns its cells' physical
+ * frame: the table's own decision keeps the section state, while its cell
+ * content is acquired in that upright frame (`createCellState`). Every other
+ * table returns the section state unchanged. Measurement and look-ahead use
+ * this one decision, so their retained cell layouts agree. */
+export function bodyTableAcquisitionState(
+  state: BodyAcquisitionState,
+  table: TableLayoutSource,
+  effectiveTablePositioning: BodyTableMeasurementContext['effectiveTablePositioning'],
+): BodyAcquisitionState {
+  const upright = state.verticalPhys !== undefined
+    && !state.acquisitionInputs.tableFormatInput(table).positioning
+    && !effectiveTablePositioning(table);
+  return upright ? { ...state, uprightPhysicalTable: true } : state;
+}
+
 export function measureBodyTableEntry(
   context: BodyTableMeasurementContext,
   request: Parameters<NonNullable<BodyLayoutSession['measureTable']>>[0],
@@ -92,14 +110,16 @@ export function measureBodyTableEntry(
   const table = operations.sourceElement(dependencies.source, request.input.source);
   if (table.type !== 'table') throw new Error('Table source kind mismatch');
   const sourceIndex = request.input.source.path[0]!;
-  operations.computeTablePtLayout(state, table, request.availableInlineExtentPt, sourceIndex);
+  const authoredPositioning = state.acquisitionInputs.tableFormatInput(table).positioning;
+  const acquisitionState = bodyTableAcquisitionState(state, table, effectiveTablePositioning);
+  const uprightPhysical = acquisitionState.uprightPhysicalTable === true;
+  operations.computeTablePtLayout(acquisitionState, table, request.availableInlineExtentPt, sourceIndex);
   const retained = retainedTableRecord(state, sourceIndex).acquisition;
   if (request.cursor && request.cursor.kind !== 'table') {
     throw new Error('Ordinary table acquisition received an adjacent-group cursor');
   }
   const cursor = request.cursor?.cursor ?? startTableFragmentCursor();
   const pageHeightPt = state.pageH;
-  const authoredPositioning = state.acquisitionInputs.tableFormatInput(table).positioning;
   if (authoredPositioning) {
     return measurePositionedTable(context, request as OrdinaryBodyTableRequest, operations, {
       table,
@@ -110,7 +130,7 @@ export function measureBodyTableEntry(
       authoredPositioning,
     });
   }
-  if (state.verticalPhys && !effectiveTablePositioning(table)) {
+  if (uprightPhysical && state.verticalPhys) {
     if (request.cursor) {
       throw new Error('An upright physical table must remain atomic');
     }
@@ -192,8 +212,9 @@ export function measureBodyTableEntry(
         nextParagraphId: 0,
       }),
       finalPlacementTranslationPt: { xPt: physicalLeftPt, yPt: physicalTopPt },
+      // Page-dependent cell content is reacquired in the same upright owner.
       reacquirePageDependentBlock: (request) =>
-        operations.reacquireBodyTableBlock(state, dependencies.source, request),
+        operations.reacquireBodyTableBlock(acquisitionState, dependencies.source, request),
     });
     if (!upright.fragment || upright.nextCursor || upright.requiresFreshPage) {
       throw new Error('Upright table final-frame layout must remain atomic');

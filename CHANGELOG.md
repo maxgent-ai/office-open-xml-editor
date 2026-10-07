@@ -11,7 +11,16 @@ the corresponding minor release.
   sections whose text flow runs downward with every character rotated, or
   upward with later lines to the right, are now displayed in that direction
   instead of horizontally. Horizontal and the existing upright-vertical
-  sections are unchanged, as are DOCX documents.
+  sections are unchanged, and the section direction authored in DOCX documents
+  is interpreted as before.
+- **Word text boxes in headers, footers and notes:** a text box inside a
+  header, footer or note now takes its page and section from that story. A
+  PAGE field in a header text box shows the number of the page it is printed
+  on; previously every page could show the same number. This also applies to
+  DOCX documents.
+- **pictures in tables on vertical Word pages:** an inline picture or chart in
+  a table that is laid out upright on a vertical page is now drawn upright
+  instead of turned a quarter turn. This also applies to DOCX documents.
 - **zero-height PowerPoint shapes:** a rectangle or other shape without text
   whose height is zero now renders as a horizontal rule, as it does in
   PowerPoint and Keynote, instead of a two-inch outlined box. Shapes that carry

@@ -583,7 +583,10 @@ it.skipIf(!skia)('wraps native MSOTXFL 2 text around its own page-relative pictu
 // turn (clockwise for 1 and 3, counter-clockwise for native 2). The picture
 // is asymmetric (red left half, blue right half), so an upside-down or
 // quarter-turned paint is visible in its actual canvas pixels.
-it.skipIf(!skia).each([0, 1, 3, 2])('keeps an inline picture upright in MSOTXFL %i', async (flow) => {
+/** MS-DOC PICFAndOfficeArtData with an OfficeArtBlipPNG (pib 1) of a 40 x 20
+ * picture, red left half and blue right half, displayed at one inch by half
+ * an inch (as in the doc-images and doc-notes tests). */
+async function asymmetricInlinePicture(): Promise<Uint8Array> {
   const record = (kind: number, options: number, payload: Uint8Array): Uint8Array =>
     concat(little16(options), little16(kind), little32(payload.length), payload);
   const { Canvas } = skia as NonNullable<typeof skia>;
@@ -591,8 +594,6 @@ it.skipIf(!skia).each([0, 1, 3, 2])('keeps an inline picture upright in MSOTXFL 
   const sourceContext = source.getContext('2d');
   sourceContext.fillStyle = '#ff0000'; sourceContext.fillRect(0, 0, 20, 20);
   sourceContext.fillStyle = '#0000ff'; sourceContext.fillRect(20, 0, 20, 20);
-  // MS-DOC PICFAndOfficeArtData with an OfficeArtBlipPNG (pib 1), displayed at
-  // one inch by half an inch (as in doc-images and doc-notes tests).
   const shape = record(0xf004, 15, concat(
     record(0xf00a, (75 << 4) | 2, concat(little32(1), little32(0x800))),
     record(0xf00b, 0x13, concat(little16(0x0104), little32(1))),
@@ -602,29 +603,70 @@ it.skipIf(!skia).each([0, 1, 3, 2])('keeps an inline picture upright in MSOTXFL 
   const view = new DataView(header.buffer);
   view.setUint32(0, header.length + shape.length + blip.length, true);
   for (const [offset, value] of [[4, 68], [6, 100], [28, 1440], [30, 720], [32, 1000], [34, 1000]]) view.setUint16(offset, value, true);
+  return concat(header, shape, blip);
+}
+
+/** sprmCFSpec plus sprmCPicLocation 0: the picture character's properties. */
+const PICTURE_CHARACTER = concat(little16(0x0855), new Uint8Array([1]), little16(0x6a03), little32(0));
+
+/** Physical centroid offset of the painted blue half from the red half. */
+function redToBlueOffset(canvas: Pixels): { dx: number; dy: number } {
+  const pixels = canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height).data;
+  const red = { count: 0, x: 0, y: 0 }, blue = { count: 0, x: 0, y: 0 };
+  for (let y = 0; y < canvas.height; y++) for (let x = 0; x < canvas.width; x++) {
+    const i = (y * canvas.width + x) * 4;
+    const target = pixels[i] > 240 && pixels[i + 1] < 15 && pixels[i + 2] < 15 ? red
+      : pixels[i] < 15 && pixels[i + 1] < 15 && pixels[i + 2] > 240 ? blue : null;
+    if (target) { target.count++; target.x += x; target.y += y; }
+  }
+  expect(red.count).toBeGreaterThan(100);
+  expect(blue.count).toBeGreaterThan(100);
+  return { dx: blue.x / blue.count - red.x / red.count, dy: blue.y / blue.count - red.y / red.count };
+}
+
+it.skipIf(!skia).each([0, 1, 3, 2])('keeps an inline picture upright in MSOTXFL %i', async (flow) => {
   const bytes = buildDocFixture({
-    text: '\u0001', data: concat(header, shape, blip),
+    text: '\u0001', data: await asymmetricInlinePicture(),
     sectionProperties: concat(DISTINCT_MARGINS, textFlow(flow)),
-    characterProperties: concat(little16(0x0855), new Uint8Array([1]), little16(0x6a03), little32(0)),
+    characterProperties: PICTURE_CHARACTER,
   });
   const session = await openDocxDocument(bytes, { factory: skiaFactory(), currentDate: 0, modelSources: [testDocSource()] });
   try {
     expect(session.pageCount).toBe(1);
     const canvas = await session.renderPage(0, { dpr: 1 }) as unknown as Pixels;
-    const pixels = canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height).data;
-    const red = { count: 0, x: 0, y: 0 }, blue = { count: 0, x: 0, y: 0 };
-    for (let y = 0; y < canvas.height; y++) for (let x = 0; x < canvas.width; x++) {
-      const i = (y * canvas.width + x) * 4;
-      const target = pixels[i] > 240 && pixels[i + 1] < 15 && pixels[i + 2] < 15 ? red
-        : pixels[i] < 15 && pixels[i + 1] < 15 && pixels[i + 2] > 240 ? blue : null;
-      if (target) { target.count++; target.x += x; target.y += y; }
-    }
-    expect(red.count).toBeGreaterThan(100);
-    expect(blue.count).toBeGreaterThan(100);
     // Upright: the red half lies to the physical left of the blue half, along
     // the physical horizontal axis.
-    const dx = blue.x / blue.count - red.x / red.count;
-    const dy = blue.y / blue.count - red.y / red.count;
+    const { dx, dy } = redToBlueOffset(canvas);
+    expect(dx, `MSOTXFL ${flow}`).toBeGreaterThan(0);
+    expect(Math.abs(dx), `MSOTXFL ${flow}`).toBeGreaterThan(Math.abs(dy));
+  } finally { await session.close(); }
+});
+
+// The same asymmetric picture inline in a body table cell. On a vertical page
+// the body table is laid out upright in the physical page (no rotation of its
+// own), so the picture inside its cell is already in an upright frame and must
+// not receive the section's counter-turn. The physical owner of the picture is
+// the upright table, not the section's rotated text frame.
+it.skipIf(!skia).each([0, 3, 2])('keeps an inline picture upright inside a body table cell in MSOTXFL %i', async (flow) => {
+  // One cell holding the picture character, its row mark (sprmTInsert one
+  // 2000-twip cell, as in the table shading tests) and a closing paragraph.
+  const cell = new Uint8Array([0, 0, 0x16, 0x24, 1]);
+  const row = concat(cell, new Uint8Array([0x17, 0x24, 1, 0x21, 0x76, 0, 1, 0xd0, 0x07]));
+  const text = '\u0001\x07\x07\r';
+  const bytes = buildDocFixture({
+    text, data: await asymmetricInlinePicture(),
+    sectionProperties: concat(DISTINCT_MARGINS, textFlow(flow)),
+    paragraphMarks: [{ end: 2, properties: cell }, { end: 3, properties: row }],
+    formattingRuns: [
+      { end: 1, properties: PICTURE_CHARACTER },
+      { end: text.length, properties: new Uint8Array() },
+    ],
+  });
+  const session = await openDocxDocument(bytes, { factory: skiaFactory(), currentDate: 0, modelSources: [testDocSource()] });
+  try {
+    expect(session.pageCount).toBe(1);
+    const canvas = await session.renderPage(0, { dpr: 1 }) as unknown as Pixels;
+    const { dx, dy } = redToBlueOffset(canvas);
     expect(dx, `MSOTXFL ${flow}`).toBeGreaterThan(0);
     expect(Math.abs(dx), `MSOTXFL ${flow}`).toBeGreaterThan(Math.abs(dy));
   } finally { await session.close(); }
