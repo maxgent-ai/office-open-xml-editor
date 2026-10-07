@@ -153,7 +153,8 @@ export function measureBodyTableEntry(
     // frame maps logical y to physical x unchanged and its column starts at
     // the bottom (physical y = page height - logical x), so the table ends
     // there. That native placement is generic library policy transformed
-    // through the section's own frame, not an observed Word placement.
+    // through the section's own frame. No comparison with a Word-produced
+    // reference has established this placement.
     const physicalLeftPt = physical.nativeSectionFlow == null
       ? physical.physicalPageWidthPt - request.location.cursorPt.yPt - tableWidthPt
       : request.location.cursorPt.yPt;

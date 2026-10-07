@@ -3079,7 +3079,8 @@ const __test_preRegisterPageFloats = (
  * in the clockwise frame (physical y = logical x), and the logical inline end
  * in a native counter-clockwise frame (physical y = page height - logical x).
  * The native case is the same generic library policy transformed through its
- * own frame, not an observed Word placement. */
+ * own frame. No comparison with a Word-produced reference has established
+ * this placement. */
 function physicalColumnTopPt(
   state: AnchorFloatRegistrationState,
   frame: PhysicalAnchorFrame,
