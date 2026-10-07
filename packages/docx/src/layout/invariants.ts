@@ -29,6 +29,7 @@ import type {
   WritingMode,
 } from './types.js';
 import { unionLayoutRects } from './rect-union.js';
+import { noteOwnedBlocks } from './native-note-separators.js';
 
 import { documentLayoutValidationEnabled } from './validation-policy.js';
 // Pagination's generator yields page counts for public progress telemetry.
@@ -416,13 +417,47 @@ function collectRetainedNodeIds(
     return;
   }
   if (node.kind === 'note') {
-    node.story.blocks.forEach((block) =>
+    noteOwnedBlocks(node).forEach((block) =>
       collectRetainedNodeIds(block, pageIds, documentIds));
     return;
   }
   if (node.kind === 'textbox') {
     node.story.blocks.forEach((block) =>
       collectRetainedNodeIds(block, pageIds, documentIds));
+  }
+}
+
+/** Native separator/notice occurrences belong to their note: they lie on its
+ * block interval in its flow domain and replace, never add to, its scalar rule. */
+function requireNoteSeparatorOwnership(node: PaintNode, path: string): void {
+  if (node.kind !== 'note') return;
+  if (node.leading && node.separator.length !== 0) {
+    throw new LayoutInvariantError('INVALID_GEOMETRY', `${path} paints both a scalar and a native separator`);
+  }
+  if (node.trailing && node.trailing.role !== 'continuationNotice') {
+    throw new LayoutInvariantError('INVALID_REFERENCE', `${path}.trailing is not a continuation notice`);
+  }
+  for (const [label, occurrence] of [['leading', node.leading], ['trailing', node.trailing]] as const) {
+    if (!occurrence) continue;
+    const occurrencePath = `${path}.${label}`;
+    requireRect(occurrence.flowBounds, `${occurrencePath}.flowBounds`);
+    requireFinite(occurrence.advancePt, `${occurrencePath}.advancePt`);
+    if (!atMostWithinFloatingPrecision(node.flowBounds.yPt, occurrence.flowBounds.yPt)
+      || !atMostWithinFloatingPrecision(
+        occurrence.flowBounds.yPt + occurrence.advancePt,
+        node.flowBounds.yPt + node.flowBounds.heightPt,
+      )) {
+      throw new LayoutInvariantError('FLOW_DOMAIN_INVASION', `${occurrencePath} lies outside its note`);
+    }
+    if (occurrence.paragraph && occurrence.paragraph.flowDomainId !== node.flowDomainId) {
+      throw new LayoutInvariantError('INVALID_REFERENCE', `${occurrencePath} leaves its note flow domain`);
+    }
+    if (occurrence.rule) {
+      for (const point of [occurrence.rule.segment.from, occurrence.rule.segment.to]) {
+        requireFinite(point.xPt, `${occurrencePath}.rule.xPt`);
+        requireFinite(point.yPt, `${occurrencePath}.rule.yPt`);
+      }
+    }
   }
 }
 
@@ -933,6 +968,7 @@ function* assertDocumentLayoutUncheckedSteps(layout: DocumentLayout): Generator<
       nodes.set(node.id, node);
       collectRetainedNodeIds(node, retainedNodeIds, documentRetainedNodeIds);
       requireRetainedCollisionGeometry(node, path);
+      requireNoteSeparatorOwnership(node, path);
       requireRect(node.flowBounds, `${path}.flowBounds`);
       requireRect(node.inkBounds, `${path}.inkBounds`);
       if (node.clipBounds) requireRect(node.clipBounds, `${path}.clipBounds`);

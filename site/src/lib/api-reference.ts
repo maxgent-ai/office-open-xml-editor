@@ -138,6 +138,11 @@ const DOCX_CURRENT_DATE: ApiOption = {
   def: 'load time',
   desc: 'Date used to resolve DATE and TIME fields. It participates in the retained layout variant, so pass it at load time when deterministic field values or pagination are required.',
 };
+const DOCX_FOOTNOTE_CONTINUATION: ApiOption = {
+  name: 'allowFootnoteContinuation', type: 'boolean', def: 'true',
+  desc: 'Paragraph footnotes continue across physical pages by default, including for ordinary DOCX input. This can change page placement. Pass false to retain the previous whole-note pagination. With continuation, fitting tables remain whole. Notes requiring table splitting, changed text widths or field reflow that changes the source cut can reject layout. Full-note acquisition has library source and page budgets.',
+  emphasis: 'Pass false to retain the previous whole-note pagination.',
+};
 const DOCX_LAYOUT_VIEW_OPTIONS: readonly ApiOption[] = [
   DOCX_SHOW_TRACKED_CHANGES,
   DOCX_CURRENT_DATE,
@@ -401,7 +406,7 @@ export const apiReference: Record<'docx' | 'xlsx' | 'pptx', ApiClass[]> = {
         CJK_FALLBACK,
         PASSWORD,
         { name: 'enableTextSelection', type: 'boolean', def: 'false', desc: 'Overlay a transparent text layer for native selection & copy.' },
-        ...DOCX_LAYOUT_VIEW_OPTIONS,
+        ...DOCX_LAYOUT_VIEW_OPTIONS, DOCX_FOOTNOTE_CONTINUATION,
         { name: 'enableElementSelection', type: 'boolean', def: 'false', desc: 'Enable read-only picture, chart, and shape selection with a non-editable outline and element context. No editor model is added.' },
         { name: 'onSelectionContextChange', type: '(context: DocxSelectionContext | null) => void', desc: 'Receive bounded detached text or element context. This callback does not enable element hit-testing by itself.' },
         CONTEXT_MENU('DocxSelectionContext'),
@@ -452,7 +457,7 @@ export const apiReference: Record<'docx' | 'xlsx' | 'pptx', ApiClass[]> = {
       name: 'DocxDocument',
       ctor: 'await DocxDocument.load(source, options?)',
       note: 'Headless engine — render any page into any canvas you supply.',
-      options: [GFONTS, CJK_FALLBACK, PASSWORD, WASM_URL, ZIP, RESOURCE_LIMITS, RESOURCE_METRICS, DEBUG, WORKER_TIMEOUT, MATH, THREE_D, REGION_MAP, CHART_EX, TIFF, MODE, ...DOCX_LAYOUT_VIEW_OPTIONS, DOCX_PROGRESSIVE_LAYOUT, DOCX_SLICE_LAYOUT, DOCX_LAYOUT_PROGRESS, DOCX_LAYOUT_PARTIAL, DOCX_LAYOUT_COMPLETE],
+      options: [GFONTS, CJK_FALLBACK, PASSWORD, WASM_URL, ZIP, RESOURCE_LIMITS, RESOURCE_METRICS, DEBUG, WORKER_TIMEOUT, MATH, THREE_D, REGION_MAP, CHART_EX, TIFF, MODE, ...DOCX_LAYOUT_VIEW_OPTIONS, DOCX_FOOTNOTE_CONTINUATION, DOCX_PROGRESSIVE_LAYOUT, DOCX_SLICE_LAYOUT, DOCX_LAYOUT_PROGRESS, DOCX_LAYOUT_PARTIAL, DOCX_LAYOUT_COMPLETE],
       methods: [
         { sig: 'static load(source, options?): Promise<DocxDocument>', desc: 'Parse a document from a URL or ArrayBuffer. With progressiveLayout, resolve when the opening pages are paintable while pagination continues in the background.' },
         { sig: 'get comments(): readonly Readonly<DocComment>[]', desc: 'Immutable detached comments and replies stored in the document.' },
@@ -491,7 +496,7 @@ export const apiReference: Record<'docx' | 'xlsx' | 'pptx', ApiClass[]> = {
         { name: 'zoomMin / zoomMax', type: 'number', def: '0.1 / 4', desc: 'Absolute zoom scale bounds (10%–400%). When width fit needs a smaller scale, that fitted scale remains reachable as the effective minimum.' },
         { name: 'refitOnResize', type: 'boolean', def: 'true', desc: 'Re-fit to the container width when it resizes. Set false to preserve an absolute scale independently of viewport width; explicit fitWidth() / fitPage() still work.' },
         { name: 'enableTextSelection', type: 'boolean', def: 'false', desc: 'Overlay a transparent, selectable text layer per page for native copy in both render modes.' },
-        ...DOCX_LAYOUT_VIEW_OPTIONS,
+        ...DOCX_LAYOUT_VIEW_OPTIONS, DOCX_FOOTNOTE_CONTINUATION,
         { name: 'comments', type: 'boolean | DocxCommentsOptions', def: 'false', desc: 'Show read-only document comment highlights, message icons, and built-in margin cards. Pass `cards: false` for an application-owned list that retains Viewer-owned range highlighting, or `markers: false` to hide only the icons. The options object also controls resolved-thread visibility, side, and optional connectors. Theme cards, highlights, and markers with CSS custom properties or documented classes on the Viewer container.', detailsHref: '/review-ui', detailsLabel: 'Comment UI guide' },
         { name: 'enableElementSelection', type: 'boolean', def: 'false', desc: 'Enable read-only drawing selection on mounted pages with a non-editable outline and element context.' },
         { name: 'onSelectionContextChange', type: '(context: DocxSelectionContext | null) => void', desc: 'Receive bounded detached text, selected-comment, or element context for external AI/MCP integrations. This callback does not enable element hit-testing.' },

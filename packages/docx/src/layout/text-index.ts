@@ -545,11 +545,16 @@ function visitNode(
     case 'table':
       visitTable(node, projection, context);
       return;
-    case 'note':
+    case 'note': {
+      // Separator/notice paragraphs carry only zero-advance participants, so
+      // they add source ownership but no selectable text.
+      if (node.leading?.paragraph) visitNode(node.leading.paragraph, projection, context);
       for (const block of node.story.blocks) {
         visitNode(block, withClip(projection, node.story.clipBounds), context);
       }
+      if (node.trailing?.paragraph) visitNode(node.trailing.paragraph, projection, context);
       return;
+    }
     case 'textbox':
       visitTextBox(node, projection, context);
       return;

@@ -82,22 +82,29 @@ function paintNode(node: PaintNode, context: CanvasPaintContext): void {
       paintTableLayout(node, context, node.resolvedFloatingTables ?? []);
       return;
     case 'note': {
+      // A note paints either its scalar library rule or its native leading
+      // occurrence (paragraph decorations, then the control's rule ink); the
+      // occurrences are outside the story clip like the scalar rule.
       node.separator.forEach((segment) => paintStrokeSegment(segment, context));
+      if (node.leading?.paragraph) paintNode(node.leading.paragraph, context);
+      if (node.leading?.rule) paintStrokeSegment(node.leading.rule.segment, context);
       const paintStory = () => node.story.blocks.forEach((block) => paintNode(block, context));
       if (!node.story.clipBounds) {
         paintStory();
-        return;
+      } else {
+        const clip = node.story.clipBounds;
+        context.ctx.save();
+        try {
+          context.ctx.beginPath();
+          context.ctx.rect(clip.xPt, clip.yPt, clip.widthPt, clip.heightPt);
+          context.ctx.clip();
+          paintStory();
+        } finally {
+          context.ctx.restore();
+        }
       }
-      const clip = node.story.clipBounds;
-      context.ctx.save();
-      try {
-        context.ctx.beginPath();
-        context.ctx.rect(clip.xPt, clip.yPt, clip.widthPt, clip.heightPt);
-        context.ctx.clip();
-        paintStory();
-      } finally {
-        context.ctx.restore();
-      }
+      if (node.trailing?.paragraph) paintNode(node.trailing.paragraph, context);
+      if (node.trailing?.rule) paintStrokeSegment(node.trailing.rule.segment, context);
       return;
     }
     case 'textbox':

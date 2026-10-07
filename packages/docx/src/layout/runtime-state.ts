@@ -7,6 +7,7 @@ import type { VerticalGlyphMeasurementService } from './measurement-capabilities
 import type { LayoutSourceStore } from './layout-source-store.js';
 import type { LayoutOptions } from './options.js';
 import { LayoutInvariantError } from './diagnostics.js';
+import { createFootnoteAcquisitionWorkBudget, type FootnoteAcquisitionWorkBudget } from './resource-budgets.js';
 
 export interface DocumentLayoutRuntimeState {
   services: LayoutServices | null;
@@ -113,6 +114,11 @@ const paragraphAcquisitionCaches = new WeakMap<
   LayoutServices,
   ParagraphAcquisitionRuntimeCache
 >();
+const footnoteAcquisitionWorkBudgets = new WeakMap<LayoutServices, FootnoteAcquisitionWorkBudget>();
+
+export function footnoteAcquisitionWorkBudgetOf(services: LayoutServices): FootnoteAcquisitionWorkBudget | undefined {
+  return footnoteAcquisitionWorkBudgets.get(services);
+}
 
 function createParagraphAcquisitionRuntimeCache(): ParagraphAcquisitionRuntimeCache {
   const identities = new WeakMap<object, number>();
@@ -380,17 +386,22 @@ export function createLayoutServicesRuntimeView(
   if (registry) paintResourceRegistries.set(view, registry);
   const paragraphCache = paragraphAcquisitionCaches.get(services);
   if (paragraphCache) paragraphAcquisitionCaches.set(view, paragraphCache);
+  const footnoteBudget = footnoteAcquisitionWorkBudgets.get(services);
+  if (footnoteBudget) footnoteAcquisitionWorkBudgets.set(view, footnoteBudget);
   return view;
 }
 
-/** Start one paragraph-acquisition memo scope. The returned service view owns a
- * fresh cache even when its document services were used by an earlier layout
- * variant or another document layout request. */
+/** Start one pagination acquisition scope. Paragraph memo and full-footnote
+ * work ledger are fresh for a later layout/variant, but inherited by every
+ * convergence service view inside this execution. */
 export function createParagraphAcquisitionCacheServicesView(
   services: LayoutServices,
 ): LayoutServices {
   const view = createLayoutServicesRuntimeView(services);
   paragraphAcquisitionCaches.set(view, createParagraphAcquisitionRuntimeCache());
+  if (services.allowFootnoteContinuation === true) {
+    footnoteAcquisitionWorkBudgets.set(view, createFootnoteAcquisitionWorkBudget());
+  }
   return view;
 }
 

@@ -286,6 +286,7 @@ self.onmessage = async (e: MessageEvent<RenderWorkerWireRequest | WorkerSvgDecod
         ? await prepareMathRuns(model, renderers.math)
         : undefined;
       const layoutServices = createLayoutServices(source, {
+        allowFootnoteContinuation: req.allowFootnoteContinuation === true,
         fontMetrics: embeddedFonts.metrics,
         useGoogleFonts: !!req.useGoogleFonts,
         cjkFallback: req.cjkFallback,

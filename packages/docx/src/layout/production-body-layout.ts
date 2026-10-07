@@ -1,3 +1,5 @@
+import { MAX_BODY_LAYOUT_PAGES } from './resource-budgets.js';
+import { deepFreezePlainData, deepFreezePlainDataWithFrozenAliases } from './plain-data.js';
 import { quarterTurnMathMetadataService } from './resources.js';
 import { pageOwnedAnchorKeysByLine } from './anchor-line-deferral.js';
 import type { CjkLang } from '@silurus/ooxml-core';
@@ -25,6 +27,7 @@ import type {
   FloatRegistrySnapshotPt,
   DrawingMLCollisionEntryPt,
   NoteLayout,
+  NoteSeparatorLayout,
   ParagraphLayout,
   SourceRef,
   StoryBlockInput,
@@ -39,7 +42,7 @@ import {
   validateFloatingTableRegistryDelta,
 } from './floating-table-transaction.js';
 import type { LayoutOptions } from './options.js';
-import { createLayoutServicesRuntimeView, fieldAcquisitionContextOf, verticalGlyphMeasurementServiceOf } from './runtime-state.js';
+import { createLayoutServicesRuntimeView, fieldAcquisitionContextOf, footnoteAcquisitionWorkBudgetOf, verticalGlyphMeasurementServiceOf } from './runtime-state.js';
 import { attachStoryBlockLayoutAlgorithms, layoutStory as layoutSharedStory } from './stories.js';
 import { buildNoteNumberMap, footnoteIdsInRetainedLines, footnoteIdsInRetainedSlice, indexNotes, noteReferenceIdsInDocumentOrder } from './note-reference-ownership.js';
 import type {
@@ -51,6 +54,17 @@ import type {
 import { NoteCapacityExceededError } from './body-layout-kernel.js';
 import { FlowCapacityExceededError } from './flow.js';
 import { projectBodyOccurrence } from './occurrence-projection.js';
+import {
+  noteSeparatorOccurrence,
+  placeNoteSeparatorOccurrence,
+  reservedNoteSeparatorRole,
+} from './native-note-separators.js';
+import { selectedNoteSeparatorRole } from './selected-note-separators.js';
+import { sourceKey } from './source-key.js';
+import type {
+  NativeNoteSeparatorDefinitionInput,
+  SelectedNoteSeparatorDefinitionInput,
+} from './body-layout-input.js';
 import {
   sectionBodyInsetPt as bodyMarginInsetPt,
   physicalSectionGeometry,
@@ -135,7 +149,8 @@ export function createProductionBodyLayoutRuntime(
     duotone?: { readonly clr1: string; readonly clr2: string },
   ): string => `${imagePath}${colorReplaceFrom ? `|clr:${colorReplaceFrom}` : ''}`
     + `${duotone ? `|duo:${duotone.clr1}:${duotone.clr2}` : ''}`;
-/** Retained default separator leading used by the shared note story layout. */
+/** Retained default separator band of the shared note story layout. It applies
+ * only where no native reserved separator definition owns the note kind. */
 const FOOTNOTE_SEPARATOR_GAP_PT = 6;
 
 /** A visible §17.3.1.42 top border owns space above the first line in every
@@ -563,6 +578,10 @@ interface BodyStoryAcquisitionContext {
   readonly state: BodyAcquisitionState;
   readonly services: LayoutServices;
   readonly storyLayoutCache: Map<string, StoryLayout>;
+  /** One active acquisition context per native reserved separator root (at
+   * most six). Page occurrences are projections; no per-page copies. */
+  readonly reservedNoteStoryCache: Map<string, Readonly<{ key: string; story: StoryLayout }>>;
+  readonly noteSourceReuse: WeakMap<object, boolean>;
   readonly source: LayoutSourceStore;
   readonly publicAnchorBridge: typeof publicAnchorBridge;
 }
@@ -573,17 +592,52 @@ function acquireBodyStoryLayout(
   request: import('./body-layout-kernel.js').StoryLayoutAcquisitionInput,
 ): StoryLayout {
   const { source, state, services, storyLayoutCache, publicAnchorBridge } = dependencies;
+  const root = bodyStoryRoot(source, request.source);
+  // A native reserved or DOCX selected separator root is a shared source
+  // definition, not a numbered (continued) note: it has no number and no note
+  // cursor. Its closed run-free shape has no page-dependent content, so one
+  // acquisition per width/section/font context serves every page occurrence.
+  const reservedRole = reservedNoteSeparatorRole(request.source)
+    ?? selectedNoteSeparatorRole(request.source);
+  // Ordinary text-only paragraph notes have no destination-page fields or
+  // anchors. Their immutable acquisition is shared across equal-width pages;
+  // partitionFootnote projects only the admitted slice into its page domain.
+  // Other continued stories are page-local and must not retain a full copy
+  // for every destination page in this session cache.
+  const continuedNote = reservedRole === undefined
+    && services.allowFootnoteContinuation === true
+    && request.source.story === 'footnote';
+  const workBudget = continuedNote || (reservedRole !== undefined && services.allowFootnoteContinuation === true)
+    ? footnoteAcquisitionWorkBudgetOf(services) : undefined;
+  if (continuedNote && !workBudget) throw new Error('Footnote acquisition requires a pagination work budget');
+  let reusableNote = continuedNote && dependencies.noteSourceReuse.get(root);
+  if (continuedNote && reusableNote === undefined) {
+    workBudget?.sourceUnits(root);
+    reusableNote = root.every(element => element.type === 'paragraph'
+      && !element.framePr && element.runs.every(run => run.type === 'text'));
+    dependencies.noteSourceReuse.set(root, reusableNote);
+  }
+  const pageIndependent = reusableNote || reservedRole !== undefined;
   const cacheKey = JSON.stringify({
     source: request.source,
-    pageIndex: request.pageIndex,
+    pageIndex: pageIndependent ? null : request.pageIndex,
     section: request.section,
-    container: request.container,
+    container: pageIndependent ? { ...request.container, id: null } : request.container,
   });
-  const cached = storyLayoutCache.get(cacheKey);
+  const reservedKey = reservedRole === undefined ? undefined : sourceKey(request.source);
+  const cached = reservedKey === undefined
+    ? storyLayoutCache.get(cacheKey)
+    : dependencies.reservedNoteStoryCache.get(reservedKey)?.key === cacheKey
+      ? dependencies.reservedNoteStoryCache.get(reservedKey)!.story
+      : undefined;
   if (cached) return cached;
-  const root = bodyStoryRoot(source, request.source);
+  // This ledger is shared by all passes/service views of this pagination,
+  // rather than this shorter-lived concrete acquisition session. Debit before
+  // destination-field resolution, shaping, geometry or resource acquisition.
+  workBudget?.charge(root);
   const noteReferenceNumber =
-    request.source.story === 'footnote' || request.source.story === 'endnote'
+    reservedRole === undefined
+      && (request.source.story === 'footnote' || request.source.story === 'endnote')
       ? state.noteNumbers?.get(`${request.source.story}:${request.source.storyInstance}`)
       : undefined;
   const fieldContext = fieldAcquisitionContextOf(services);
@@ -818,7 +872,7 @@ function acquireBodyStoryLayout(
       // FLOW_OVERLAP. The origin stays at the allocation start so story
       // positioning and anchor extents keep their leading-spacing arithmetic.
       const contentOwned = result.layout.ordinaryFlow
-        ? Object.freeze({
+        ? deepFreezePlainDataWithFrozenAliases({
             ...result.layout,
             flowBounds: Object.freeze({
               ...result.layout.flowBounds,
@@ -827,7 +881,7 @@ function acquireBodyStoryLayout(
                 result.layout.flowBounds.heightPt - result.layout.spacing.afterPt,
               ),
             }),
-          })
+          }, result.layout)
         : result.layout;
       return { layout: contentOwned, nextCursor };
     },
@@ -851,7 +905,7 @@ function acquireBodyStoryLayout(
     },
     storyServices,
   );
-  const retained = Object.freeze({
+  const retained = deepFreezePlainData({
     ...acquired,
     blocks: Object.freeze(
       acquired.blocks.map((block, index) => {
@@ -869,7 +923,10 @@ function acquireBodyStoryLayout(
       }),
     ),
   });
-  storyLayoutCache.set(cacheKey, retained);
+  if (reservedKey !== undefined) {
+    // Replace, never accumulate: a changed context evicts the role's plan.
+    dependencies.reservedNoteStoryCache.set(reservedKey, Object.freeze({ key: cacheKey, story: retained }));
+  } else if (!continuedNote || reusableNote) storyLayoutCache.set(cacheKey, retained);
   return retained;
 }
 
@@ -1152,9 +1209,41 @@ function layoutBodyNotes(
       storyInstance: id,
       path: [],
     };
-    const separatorHeightPt = first ? FOOTNOTE_SEPARATOR_GAP_PT : 0;
+    const noteSettings = context.source.bodyLayoutInput.noteLayoutSettings;
+    // A native producer's reserved stories replace the scalar library band
+    // for their note kind. First-on-page ownership is singular; the role
+    // (ordinary versus continuing) selects the definition, whose own mark
+    // selects Short/Full.
+    const nativeDefinitions = noteSettings?.nativeSeparatorRoles?.[request.kind];
+    const leading = first && nativeDefinitions
+      ? acquireNativeNoteSeparator(context, request, nativeDefinitions[
+        request.continuing === true ? 'continuationSeparator' : 'separator'
+      ], cursorYPt, `${request.kind}:${id}:page:${request.pageIndex}:separator`)
+      : undefined;
+    // An ordinary DOCX formatted listed story (§17.11.9) replaces only the
+    // scalar band height of its role with its own acquired paragraph advance
+    // (authored spacing and line rule). Its mark kind and rule width keep the
+    // scalar policy below; the rule sits at the midpoint of the story's mark
+    // line box, not in its spacing. Bare and missing stories keep the scalar
+    // band, whose rule stays at the band midpoint.
+    const selectedDefinition = first && !nativeDefinitions && request.kind === 'footnote'
+      ? noteSettings?.footnoteSeparatorStories?.[
+        request.continuing === true ? 'continuationSeparator' : 'separator'
+      ]
+      : undefined;
+    const selectedBand = selectedDefinition
+      ? acquireSelectedNoteSeparatorBand(context, request, selectedDefinition, cursorYPt)
+      : undefined;
+    const separatorHeightPt = nativeDefinitions
+      ? leading?.advancePt ?? 0
+      : selectedBand?.advancePt ?? (first ? FOOTNOTE_SEPARATOR_GAP_PT : 0);
+    const ruleYPt = cursorYPt + (selectedBand?.ruleOffsetPt ?? separatorHeightPt / 2);
     const storyContainer = {
       ...request.container,
+      // Acquire the source once before page partitioning; this is a resource
+      // acquisition container, not permission for retained note ink to overflow.
+      ...(services.allowFootnoteContinuation === true && request.kind === 'footnote'
+        ? { capacity: 'unbounded' as const } : {}),
       id: `${request.container.id}:${request.kind}:${id}`,
       bounds: {
         ...request.container.bounds,
@@ -1182,17 +1271,44 @@ function layoutBodyNotes(
       }
       throw error;
     }
-    const separator = first
+    if (services.allowFootnoteContinuation === true && request.kind === 'footnote'
+      && story.advancePt > request.section.geometry.pageHeight * MAX_BODY_LAYOUT_PAGES) {
+      // Match the paginator's physical-page budget before retaining a source
+      // that cannot finish within it. This is resource policy, not Office fit.
+      throw new Error('Footnote source exceeds the document page budget');
+    }
+    // ECMA-376 §17.11 reserved stories: the observed bare empty story
+    // suppresses rule ink while retaining the existing note band gap.
+    const separatorMode = request.kind === 'footnote'
+      ? request.continuing ? noteSettings?.footnoteContinuationSeparator : noteSettings?.footnoteSeparator
+      : noteSettings?.endnoteSeparator;
+    const separator = first && !nativeDefinitions && separatorMode !== 'none'
       ? Object.freeze([
           Object.freeze({
             edge: 'top' as const,
             from: Object.freeze({
               xPt: request.container.bounds.xPt,
-              yPt: cursorYPt + separatorHeightPt / 2,
+              yPt: ruleYPt,
             }),
             to: Object.freeze({
-              xPt: request.container.bounds.xPt + request.container.bounds.widthPt / 3,
-              yPt: cursorYPt + separatorHeightPt / 2,
+              // ECMA-376 §17.11.1/.23: marker kind wins over story role.
+              // Word 16.113.3 compatibility controls (300pt main width,
+              // 80 plain single-spaced paragraphs, printed Times New Roman
+              // 12pt) retain a selected Short mark in a continuation story.
+              // A missing continuation story prints a full-width rule and
+              // gains a listed Full story on save. Preserve source absence;
+              // this fallback does not synthesize a parser fact or change
+              // the public continuation option's default. These controls
+              // establish neither universal Short dimensions nor gap/leading.
+              // §17.11.1 defines the continuation mark as full main-story width.
+              // §17.11.23 defines a partial ordinary mark; one third is the
+              // existing library policy, not a normative numeric fraction.
+              // It differs from the 144pt Short rule in those Office controls.
+              xPt: request.container.bounds.xPt + request.container.bounds.widthPt
+                * (separatorMode === 'full'
+                  || ((separatorMode === undefined || separatorMode === 'default') && request.continuing)
+                  ? 1 : 1 / 3),
+              yPt: ruleYPt,
             }),
             color: '#000000',
             widthPt: 0.5,
@@ -1232,6 +1348,7 @@ function layoutBodyNotes(
       clipBounds: request.container.bounds,
       advancePt,
       separator,
+      ...(leading ? { leading } : {}),
       story,
     });
     notes.push(note);
@@ -1239,6 +1356,103 @@ function layoutBodyNotes(
     first = false;
   }
   return Object.freeze(notes);
+}
+
+/** Acquire one native reserved separator story at the band cursor through
+ * the shared story/paragraph pipeline and project its page occurrence. An
+ * empty, guard-only or fully hidden story owns no flow, so none is retained. */
+function acquireNativeNoteSeparator(
+  context: BodySessionDependencies,
+  request: Parameters<NonNullable<BodyLayoutSession['layoutNotes']>>[0],
+  definition: NativeNoteSeparatorDefinitionInput,
+  yPt: number,
+  occurrenceId: string,
+): NoteSeparatorLayout | undefined {
+  if (!definition.paragraph || definition.paragraph.hidden) return undefined;
+  const container = {
+    ...request.container,
+    id: `${request.container.id}:${sourceKey(definition.root)}`,
+    bounds: {
+      ...request.container.bounds,
+      yPt,
+      heightPt: Math.max(0, request.container.bounds.yPt + request.container.bounds.heightPt - yPt),
+    },
+  };
+  let story: StoryLayout;
+  try {
+    story = acquireBodyStoryLayout(context.storyAcquisitionContext, {
+      source: definition.root,
+      pageIndex: request.pageIndex,
+      section: request.section,
+      container,
+    });
+  } catch (error) {
+    if (error instanceof FlowCapacityExceededError && error.containerId === container.id) {
+      throw new NoteCapacityExceededError(request.kind, request.pageIndex, request.container.id);
+    }
+    throw error;
+  }
+  return placeNoteSeparatorOccurrence(
+    noteSeparatorOccurrence(definition, story, container.bounds),
+    { occurrenceId, flowDomainId: request.container.id, yPt },
+  );
+}
+
+/** Acquire one ordinary DOCX selected separator story at the band cursor
+ * through the shared story/paragraph pipeline. Returns two retained facts:
+ * - `advancePt`, the band height: the paragraph's acquired advance, i.e. its
+ *   mark line box under the authored line rule plus authored spacing before
+ *   and after (§17.3.1.33 places that spacing outside the paragraph's lines).
+ * - `ruleOffsetPt`: the midpoint of the acquired mark line box, measured from
+ *   the story's own top in its acquisition frame, so it applies at whatever
+ *   band y it is placed. §17.11.23 places the separator mark in its run; the
+ *   parser admits only a mark run formatted exactly like the paragraph mark,
+ *   so that run's line is this mark-only line box. The midpoint is the
+ *   library's existing rule placement, not an Office glyph-baseline
+ *   observation.
+ * No paragraph layout is retained: the closed run-free shape has neither text
+ * nor paragraph ink. */
+function acquireSelectedNoteSeparatorBand(
+  context: BodySessionDependencies,
+  request: Parameters<NonNullable<BodyLayoutSession['layoutNotes']>>[0],
+  definition: SelectedNoteSeparatorDefinitionInput,
+  yPt: number,
+): Readonly<{ advancePt: number; ruleOffsetPt: number }> {
+  const container = {
+    ...request.container,
+    id: `${request.container.id}:${sourceKey(definition.root)}`,
+    bounds: {
+      ...request.container.bounds,
+      yPt,
+      heightPt: Math.max(0, request.container.bounds.yPt + request.container.bounds.heightPt - yPt),
+    },
+  };
+  let story: StoryLayout;
+  try {
+    story = acquireBodyStoryLayout(context.storyAcquisitionContext, {
+      source: definition.root,
+      pageIndex: request.pageIndex,
+      section: request.section,
+      container,
+    });
+  } catch (error) {
+    if (error instanceof FlowCapacityExceededError && error.containerId === container.id) {
+      throw new NoteCapacityExceededError(request.kind, request.pageIndex, request.container.id);
+    }
+    throw error;
+  }
+  const [paragraph, ...rest] = story.blocks;
+  // The run-free paragraph acquires no text line; its mark-only line box is
+  // the paragraph mark bounds (spacing before excluded, line rule applied).
+  const mark = paragraph?.kind === 'paragraph' && rest.length === 0 && paragraph.lines.length === 0
+    ? paragraph.paragraphMark : undefined;
+  if (!mark || mark.hidden) {
+    throw new Error('A note separator story must acquire exactly one visible mark-only paragraph');
+  }
+  return Object.freeze({
+    advancePt: story.advancePt,
+    ruleOffsetPt: mark.bounds.yPt + mark.bounds.heightPt / 2 - story.flowBounds.yPt,
+  });
 }
 
 function measureFollowingBodyBlock(
@@ -2115,6 +2329,8 @@ function openConcreteBodyLayoutSession(
     state,
     services,
     storyLayoutCache,
+    reservedNoteStoryCache: new Map(),
+    noteSourceReuse: new WeakMap(),
     publicAnchorBridge,
   };
   state.acquireCompleteTextBoxStory = (request) =>

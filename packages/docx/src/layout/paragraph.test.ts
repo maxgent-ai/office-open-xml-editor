@@ -14,6 +14,7 @@ import type { ParagraphLayoutContext } from '../layout-context.js';
 import type { LayoutImageSeg, LayoutMathSeg, LayoutTabSeg, LayoutTextSeg } from '../line-layout.js';
 import type { MeasuredParagraph } from '../paragraph-measure.js';
 import { measureParagraph } from '../paragraph-measure.js';
+import { buildSegments, layoutLines } from '../line-layout.js';
 import { createLayoutServices } from '../layout-runtime.js';
 import type { DocParagraph } from '../types.js';
 import type { AnchorAcquisitionInput } from './anchor-input.js';
@@ -833,18 +834,38 @@ describe('paragraphLayoutFromMeasurement retained authorities', () => {
       spaceBefore: 0, spaceAfter: 0, lineSpacing: null, numbering: null,
       tabStops: [], runs: [],
     } as unknown as DocParagraph;
-    const segment = {
+    // A genuine service: empty text has no extent, a glyph probe does.
+    const textLayoutService = {
+      shape: (request: { text: string; fontSizePt: number }) => ({
+        advancePt: request.text ? request.fontSizePt / 2 : 0,
+        ascentPt: request.text ? request.fontSizePt * 0.7 : 0,
+        descentPt: request.text ? request.fontSizePt * 0.3 : 0,
+        spans: [], diagnostics: [], graphemeBoundaries: [0],
+      }),
+    };
+    const host = (overrides: Record<string, unknown> = {}) => ({
       text: '', metricOnly: true, measuredWidth: 0, fontSize: 10,
       textShapeRequest: {
         text: '', fontSizePt: 10, fonts: { ascii: 'Test Sans' },
         weight: 400, style: 'normal', measure: true,
       },
-      textLayoutService: {
-        shape: () => ({ advancePt: 0, ascentPt: 7, descentPt: 3, spans: [], diagnostics: [], graphemeBoundaries: [0] }),
-      },
-    } as unknown as LayoutTextSeg;
-    expect(projectMeasuredSegment(paragraph, segment).lines[0]?.placements[0]).toMatchObject({
-      kind: 'anchor-host', sourceMetrics: { ascentPt: 7, descentPt: 3 },
+      textLayoutService,
+      ...overrides,
+    } as unknown as LayoutTextSeg);
+    const placement = (segment: LayoutTextSeg) => projectMeasuredSegment(paragraph, segment).lines[0]?.placements[0];
+    // A generic metric-only host keeps its existing empty-text authority.
+    expect(placement(host())).toMatchObject({ kind: 'anchor-host', sourceMetrics: { ascentPt: 0, descentPt: 0 } });
+    // A native separator participant retains its probe's selected-face sides
+    // at the existing effective size (super/sub scaling; small caps measured
+    // at full size), with no width and an empty source range.
+    expect(placement(host({ metricProbeText: 'x' }))).toMatchObject({
+      kind: 'anchor-host', range: { start: 0, end: 0 }, bounds: { widthPt: 0 },
+      sourceMetrics: { ascentPt: 7, descentPt: 3 },
+    });
+    const superscript = placement(host({ metricProbeText: 'x', vertAlign: 'super' }));
+    expect(superscript?.kind === 'anchor-host' && superscript.sourceMetrics?.ascentPt).toBeCloseTo(4.55);
+    expect(placement(host({ metricProbeText: 'x', smallCaps: true }))).toMatchObject({
+      sourceMetrics: { ascentPt: 7, descentPt: 3 },
     });
   });
 
@@ -2908,5 +2929,101 @@ describe('planLine visual geometry', () => {
         ],
       },
     });
+  });
+});
+
+describe('native separator metric participants in the line pipeline', () => {
+  /** Vertical metrics follow the requested size; empty text measures nothing. */
+  const sizedContext = () => {
+    const context = {
+      font: '10px serif', letterSpacing: '0px', fontKerning: 'auto',
+      measureText(text: string) {
+        const px = Number(/([0-9.]+)px/.exec(context.font)?.[1] ?? 10);
+        const extent = text ? 1 : 0;
+        return {
+          width: [...text].length * px / 2,
+          actualBoundingBoxAscent: px * 0.8 * extent, actualBoundingBoxDescent: px * 0.2 * extent,
+          fontBoundingBoxAscent: px * 0.8 * extent, fontBoundingBoxDescent: px * 0.2 * extent,
+        } as TextMetrics;
+      },
+    };
+    return context as unknown as CanvasRenderingContext2D;
+  };
+  const participant = (overrides: Record<string, unknown> = {}) => ({
+    type: 'text', text: '', bold: false, italic: false, underline: false, strikethrough: false,
+    fontSize: 10, color: null, fontFamily: 'serif', isLink: false, background: null,
+    vertAlign: null, hyperlink: null, noteSeparatorCharacter: 'paragraph-mark', ...overrides,
+  });
+  const measure = (run: Record<string, unknown>) => {
+    const context = sizedContext();
+    const services = createLayoutServices({
+      section: {
+        pageWidth: 200, pageHeight: 300, marginTop: 30, marginRight: 20, marginBottom: 30,
+        marginLeft: 20, headerDistance: 15, footerDistance: 15, titlePage: false, evenAndOddHeaders: false,
+      },
+      body: [], headers: { default: null, first: null, even: null },
+      footers: { default: null, first: null, even: null },
+    }, { measureContext: context });
+    const paragraph = {
+      type: 'paragraph', alignment: 'left', indentLeft: 0, indentRight: 0, indentFirst: 0,
+      spaceBefore: 0, spaceAfter: 0, lineSpacing: null, numbering: null, tabStops: [],
+      runs: [run], defaultFontSize: 10,
+    } as unknown as DocParagraph;
+    const environment = {
+      pageIndex: 0, totalPages: 1, documentHasEastAsianText: false,
+      pageWritingMode: 'horizontal-tb', layoutServices: services,
+    } as const;
+    const placement = {
+      startYPt: 0, paragraphXPt: 0, availableWidthPt: 100, maximumYPt: 500, suppressSpaceBefore: false,
+    };
+    const measurer = { context, fontFamilyClasses: {} };
+    const measured = measureParagraph(paragraph, acquisitionContext, placement, measurer, environment);
+    const node = paragraphLayoutFromMeasurement(paragraph as never, {
+      id: 'separator-participant', source, flowDomainId: 'body', ordinaryFlow: true,
+      context: acquisitionContext, placement: measured.placement, measurer, environment, exclusions: [],
+    }, measured);
+    return { line: node.lines[0]!, advancePt: node.advancePt };
+  };
+
+  it('keeps probe vertical metrics and composes an authored raise without advance or ink', () => {
+    const plain = measure(participant());
+    expect(plain.line.placements).toEqual([expect.objectContaining({
+      kind: 'anchor-host', range: { start: 0, end: 0 },
+      bounds: expect.objectContaining({ widthPt: 0 }),
+      sourceMetrics: { ascentPt: 8, descentPt: 2 },
+    })]);
+    expect(plain.line.bounds.widthPt).toBe(0);
+    expect(plain.advancePt).toBeCloseTo(10);
+    // Existing library line-box composition for this controlled fixture (not
+    // an ECMA-376 or Office formula): a 6pt raise adds to the probe's ascent.
+    expect(measure(participant({ position: 6 })).advancePt).toBeCloseTo(16);
+    // Superscript uses the existing effective-size policy for the probe.
+    const superscript = measure(participant({ vertAlign: 'super' }));
+    expect(superscript.line.placements[0]).toMatchObject({ sourceMetrics: { ascentPt: 5.2, descentPt: 1.3 } });
+    expect(superscript.advancePt).not.toBeCloseTo(plain.advancePt);
+    // Small caps keep the existing full-size metric policy.
+    expect(measure(participant({ smallCaps: true })).advancePt).toBeCloseTo(plain.advancePt);
+  });
+
+  it('measures the probe at the caller scale without inline advance', () => {
+    const lineAt = (scale: number) => {
+      const context = sizedContext();
+      const services = createLayoutServices({
+        section: {
+          pageWidth: 200, pageHeight: 300, marginTop: 30, marginRight: 20, marginBottom: 30,
+          marginLeft: 20, headerDistance: 15, footerDistance: 15, titlePage: false, evenAndOddHeaders: false,
+        },
+        body: [], headers: { default: null, first: null, even: null },
+        footers: { default: null, first: null, even: null },
+      }, { measureContext: context });
+      const segments = buildSegments([participant({ vertAlign: 'super' })] as never, { layoutServices: services } as never);
+      return layoutLines(context as never, segments, 200 * scale, 0, scale)[0]!;
+    };
+    const unit = lineAt(1);
+    const double = lineAt(2);
+    expect(unit.ascent).toBeGreaterThan(0);
+    expect(double.ascent).toBeCloseTo(unit.ascent * 2);
+    expect(double.descent).toBeCloseTo(unit.descent * 2);
+    expect(double.segments.reduce((sum, segment) => sum + segment.measuredWidth, 0)).toBe(0);
   });
 });

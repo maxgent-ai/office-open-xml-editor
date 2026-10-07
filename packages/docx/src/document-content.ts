@@ -13,6 +13,7 @@ import type {
 import {
   numberingMarkerShapeInput,
   paragraphMarkShapeInput,
+  type InternalDocxDocumentModel,
   type InternalRunSlotMetadata,
   type InternalShapeRun,
 } from './parser-model.js';
@@ -272,6 +273,41 @@ function* bodyUsages(body: readonly BodyElement[], collection: FontCollection): 
   }
 }
 
+/** Native (MS-DOC 2.3.3) reserved separator paragraphs. Their rule control
+ * and content mark are text-free runs with their own CHPX; registering them
+ * through the ordinary paragraph usages lets a family used only by the
+ * control join the same preload/resolution ownership as body text. */
+function* nativeSeparatorUsages(
+  doc: DocxDocumentModel,
+  collection: FontCollection,
+): Generator<DocxRenderedTextUsage> {
+  const native = (doc as InternalDocxDocumentModel).__noteLayoutSettings?.nativeSeparators;
+  for (const stories of [native?.footnote, native?.endnote]) {
+    if (!stories) continue;
+    for (const story of [stories.separator, stories.continuationSeparator, stories.continuationNotice]) {
+      const authored = story.paragraph;
+      if (!authored) continue;
+      const runs = [story.rule?.control.run, authored.contentMark?.run]
+        .filter((run): run is NonNullable<typeof run> => run !== undefined)
+        .map((run) => ({ ...run, type: 'text', text: '' }));
+      yield* paragraphUsages({ ...authored.paragraph, runs } as unknown as DocParagraph, collection);
+    }
+  }
+}
+
+/** Ordinary DOCX formatted listed separator paragraphs (§17.11.9). Layout
+ * acquires their paragraph-mark line box, so its families join the same
+ * preload/resolution ownership as body text. */
+function* selectedSeparatorUsages(
+  doc: DocxDocumentModel,
+  collection: FontCollection,
+): Generator<DocxRenderedTextUsage> {
+  const settings = (doc as InternalDocxDocumentModel).__noteLayoutSettings;
+  for (const paragraph of [settings?.footnoteSeparatorParagraph, settings?.footnoteContinuationSeparatorParagraph]) {
+    if (paragraph) yield* paragraphUsages({ ...paragraph, runs: [] }, collection);
+  }
+}
+
 /** Traverse every rendered DOCX story once. Script-aware web preloading and
  * resolved native-resource probing share this traversal so those paths cannot
  * drift on nested tables, section headers/footers, notes, or drawing text.
@@ -286,6 +322,8 @@ export function* docxRenderedTextUsages(
   for (const note of [...(doc.footnotes ?? []), ...(doc.endnotes ?? [])]) {
     yield* bodyUsages(note.content, collection);
   }
+  yield* nativeSeparatorUsages(doc, collection);
+  yield* selectedSeparatorUsages(doc, collection);
 }
 
 /** Unique authored families in first-rendered-use order. */

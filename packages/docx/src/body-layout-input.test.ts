@@ -105,6 +105,9 @@ describe('canonical body layout input', () => {
       // §17.11.17/.18/.20 defaults for both note kinds.
       footnoteNumbering: { format: 'decimal', start: 1 },
       endnoteNumbering: { format: 'decimal', start: 1 },
+      footnoteSeparator: 'default',
+      endnoteSeparator: 'default',
+      footnoteContinuationSeparator: 'default',
     });
   });
 
@@ -121,6 +124,8 @@ describe('canonical body layout input', () => {
         footnoteNumberFormat: 'upperLetter',
         footnoteNumberStart: 4,
         endnoteNumberFormat: 'lowerRoman',
+        footnoteSeparator: 'none',
+        footnoteContinuationSeparator: 'short',
       },
     } as unknown as DocxDocumentModel;
 
@@ -129,7 +134,81 @@ describe('canonical body layout input', () => {
       endnotePosition: 'sectEnd',
       footnoteNumbering: { format: 'upperLetter', start: 4 },
       endnoteNumbering: { format: 'lowerRoman', start: 1 },
+      footnoteSeparator: 'none',
+      endnoteSeparator: 'default',
+      footnoteContinuationSeparator: 'short',
     });
+  });
+
+  it('preserves an authored short rule in both note roles across serialization', () => {
+    const document = {
+      body: [paragraph('body')], section: finalSection(),
+      headers: { default: null, first: null, even: null },
+      footers: { default: null, first: null, even: null }, fontFamilyClasses: {},
+      __noteLayoutSettings: { footnoteSeparator: 'short', footnoteContinuationSeparator: 'short' },
+    } as unknown as DocxDocumentModel;
+    const input = createBodyLayoutInput(structuredClone(document));
+    expect(input.noteLayoutSettings).toMatchObject({
+      footnoteSeparator: 'short', footnoteContinuationSeparator: 'short',
+    });
+    expect(structuredClone(input)).toEqual(input);
+    const invalid = { ...document, __noteLayoutSettings: { footnoteContinuationSeparator: 'custom' } };
+    expect(() => createBodyLayoutInput(invalid as DocxDocumentModel)).toThrow('Unsupported note separator');
+  });
+
+  it('retains native separator formatting once as an independent frozen snapshot', () => {
+    const source = (headerCp: number) => ({ headerCp, fc: 2048 + headerCp * 2, prm: 0, paragraphStyle: 0 });
+    const rule = (mark: string, headerCp: number) => ({
+      class: 'rule', contentStartCp: headerCp, contentEndCp: headerCp + 2, guardCp: headerCp + 2,
+      rule: {
+        mark,
+        control: { run: { text: '', fontSize: 14, __typographyAcquisition: { probe: headerCp } } },
+        source: source(headerCp),
+      },
+      paragraph: {
+        paragraph: { runs: [], defaultFontSize: 14 },
+        contentMark: { run: { text: '', fontSize: 9 } },
+        source: source(headerCp + 1),
+      },
+    });
+    const nativeSeparators = {
+      footnote: {
+        separator: rule('short', 0),
+        continuationSeparator: rule('full', 3),
+        continuationNotice: { class: 'empty', contentStartCp: 6, contentEndCp: 6 },
+      },
+    };
+    const document = {
+      body: [paragraph('body')], section: finalSection(),
+      headers: { default: null, first: null, even: null },
+      footers: { default: null, first: null, even: null }, fontFamilyClasses: {},
+      __noteLayoutSettings: {
+        footnoteSeparator: 'short', footnoteContinuationSeparator: 'full', nativeSeparators,
+      },
+    } as unknown as DocxDocumentModel;
+    const acquired = bodyLayoutAcquisitionInput(document);
+    const settings = projectBodyLayoutInput(acquired).noteLayoutSettings;
+    // Normalized once: projection reuses the frozen acquisition snapshot.
+    expect(settings).toBe(acquired.noteLayoutSettings);
+    expect(settings).toMatchObject({ footnoteSeparator: 'short', footnoteContinuationSeparator: 'full' });
+    const retained = settings?.nativeSeparators?.footnote;
+    const authoredControl = nativeSeparators.footnote.separator.rule.control.run;
+    expect(retained?.separator.rule?.control.run).toEqual(authoredControl);
+    // The content paragraph mark keeps its own CHPX and address.
+    expect(retained?.separator.paragraph?.contentMark?.run?.fontSize).toBe(9);
+    expect(retained?.separator.paragraph?.source.headerCp).toBe(1);
+    expect(retained?.continuationNotice).toEqual({ class: 'empty', contentStartCp: 6, contentEndCp: 6 });
+    authoredControl.fontSize = 99;
+    expect(retained?.separator.rule?.control.run?.fontSize).toBe(14);
+    expect(Object.isFrozen(retained?.separator.rule?.control.run)).toBe(true);
+
+    const withSettings = (value: unknown) =>
+      ({ ...document, __noteLayoutSettings: value }) as DocxDocumentModel;
+    expect(createBodyLayoutInput(withSettings({ footnoteSeparator: 'short' })).noteLayoutSettings)
+      .not.toHaveProperty('nativeSeparators');
+    const footnote = { ...nativeSeparators.footnote, continuationNotice: { class: 'rule' } };
+    expect(() => createBodyLayoutInput(withSettings({ nativeSeparators: { footnote } })))
+      .toThrow('Unsupported native note separator story');
   });
 
   it('projects section ownership and authored transitions without parser handles', () => {

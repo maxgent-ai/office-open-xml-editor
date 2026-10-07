@@ -156,6 +156,12 @@ type ParagraphTextFacts = Readonly<{
     theme: TextFontSlots;
     themePresent: TextFontSlotPresence;
   }>;
+  /** Private native reserved-separator character (MS-DOC 2.3.3): the
+   * U+0003/U+0004 control or the story paragraph's content mark. It carries
+   * that character's own effective CHPX and has no text; line acquisition
+   * resolves its selected face as a zero-advance, inkless metric participant.
+   * Its rule ink is retained separately, never as a glyph. */
+  noteSeparatorCharacter?: 'rule-control' | 'paragraph-mark';
 }>;
 
 export type ParagraphTextBearingRun =

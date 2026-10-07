@@ -133,6 +133,8 @@ export interface NoteLayoutAcquisitionInput {
   readonly section: DeepReadonly<SectionLayoutContext>;
   readonly container: FlowContainer;
   readonly firstOnPage: boolean;
+  /** The first note on this page resumes a note begun on an earlier page. */
+  readonly continuing?: boolean;
 }
 
 export interface FollowingBodyBlockMeasurementInput {

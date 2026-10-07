@@ -57,6 +57,36 @@ function documentWithUnavailableDrawing(): DocxDocumentModel {
   } as unknown as DocxDocumentModel;
 }
 
+/** Native (MS-DOC 2.3.3) separator wire as the legacy producer emits it.
+ * `cpBase` moves every native CP/FC address without changing the story. */
+function nativeSeparatorDocument(cpBase: number, noteId = '1'): DocxDocumentModel {
+  const address = (cp: number) => ({ headerCp: cpBase + cp, fc: 0x800 + (cpBase + cp) * 2, prm: 0, paragraphStyle: 0 });
+  const run = (fontSize: number) => ({
+    text: '', bold: false, italic: false, underline: false, strikethrough: false, fontSize,
+    color: null, fontFamily: 'Control Face', isLink: false, background: null, vertAlign: null, hyperlink: null,
+  });
+  const paragraph = {
+    alignment: 'left', indentLeft: 0, indentRight: 0, indentFirst: 0, spaceBefore: 0, spaceAfter: 0,
+    lineSpacing: null, numbering: null, tabStops: [], runs: [], defaultFontSize: 9,
+    paragraphMarkFontFacts: { fontSize: 9 },
+  };
+  const rule = (mark: 'short' | 'full', cp: number) => ({
+    class: 'rule', contentStartCp: cpBase + cp, contentEndCp: cpBase + cp + 2, guardCp: cpBase + cp + 2,
+    rule: { mark, control: { run: run(14) }, source: address(cp) },
+    paragraph: { paragraph, contentMark: { run: run(9) }, source: address(cp + 1) },
+  });
+  const document = documentWithUnavailableDrawing();
+  document.footnotes = [{ id: noteId, content: [] }];
+  return { ...document, __noteLayoutSettings: {
+    footnoteSeparator: 'short', footnoteContinuationSeparator: 'full',
+    nativeSeparators: { footnote: {
+      separator: rule('short', 0),
+      continuationSeparator: rule('full', 3),
+      continuationNotice: { class: 'empty', contentStartCp: cpBase + 6, contentEndCp: cpBase + 6 },
+    } },
+  } } as unknown as DocxDocumentModel;
+}
+
 describe('LayoutSourceStore', () => {
   it('caches one sealed normalized source for raw and normalized model identities', () => {
     const raw = documentWithUnavailableDrawing();
@@ -517,5 +547,132 @@ describe('LayoutSourceStore', () => {
         ).fontSizePt).toBe(fallback);
       }
     }
+  });
+  it('registers native separator stories under closed canonical roots independent of native addresses', () => {
+    const settings = (store: LayoutSourceStore) => store.bodyLayoutInput.noteLayoutSettings;
+    const first = layoutSourceStore(nativeSeparatorDocument(0));
+    const moved = layoutSourceStore(nativeSeparatorDocument(40));
+    // Native CP/FC are provenance only: the sealed layout input holds the
+    // same canonical role refs and no raw parser-shaped separator wire.
+    expect(settings(first)?.nativeSeparatorRoles).toEqual(settings(moved)?.nativeSeparatorRoles);
+    expect(settings(first)).not.toHaveProperty('nativeSeparators');
+    const roles = settings(first)?.nativeSeparatorRoles?.footnote;
+    expect(roles?.separator.root).toEqual({ story: 'footnote', storyInstance: 'reserved:separator', path: [] });
+    expect(roles?.separator.rule).toMatchObject({
+      mark: 'short', control: { storyInstance: 'reserved:separator', path: [0, 0] },
+    });
+    expect(roles?.continuationSeparator.rule?.mark).toBe('full');
+    const paragraph = first.blocks.resolve(roles!.separator.paragraph!.source);
+    if (paragraph.type !== 'paragraph') throw new Error('Expected a reserved separator paragraph');
+    // Control and content mark stay distinct participants with their own CHPX.
+    expect(paragraph.runs.map((run) => run.type === 'text'
+      ? [run.noteSeparatorCharacter, run.fontSize] : null))
+      .toEqual([['rule-control', 14], ['paragraph-mark', 9]]);
+    // An empty notice stays addressable without a fabricated paragraph, and
+    // reserved roots are not numbered note bodies.
+    expect(first.blocks.storyRoot(roles!.continuationNotice.root)).toEqual([]);
+    expect(roles?.continuationNotice.paragraph).toBeUndefined();
+    expect(first.blocks.footnotes.map((note) => note.id)).toEqual(['1']);
+    // A face used only by the control joins the document font ownership.
+    expect(first.fonts.renderedFamilies).toContain('Control Face');
+
+    const streamed = layoutSourceModelAdapterFromOwnedModel(
+      nativeSeparatorDocument(0), nativeSeparatorDocument(0),
+    ).source;
+    expect(streamed.bodyLayoutInput).toEqual(first.bodyLayoutInput);
+    expect(streamed.blocks.resolve(roles!.separator.paragraph!.source)).toEqual(paragraph);
+  });
+
+  it.each([false, true])('resolves native reserved-story automatic margins with document fixed=%s before immutable acquisition', (fixed) => {
+    const document = nativeSeparatorDocument(0) as DocxDocumentModel & {
+      __noteLayoutSettings: { nativeSeparators: { footnote: Record<string, Record<string, unknown>> } };
+    };
+    document.settings = { doNotUseHtmlParagraphAutoSpacing: fixed };
+    const stories = document.__noteLayoutSettings.nativeSeparators.footnote;
+    const wrapper = stories.separator!.paragraph as {
+      paragraph: DocParagraph;
+      contentMark: unknown;
+      source: unknown;
+    };
+    Object.assign(wrapper.paragraph, { spaceBefore: 5, spaceAfter: 7, beforeAutospacing: true, afterAutospacing: false });
+    stories.continuationNotice = {
+      class: 'paragraphOnly', contentStartCp: 6, contentEndCp: 7, guardCp: 7,
+      paragraph: {
+        ...wrapper, paragraph: { ...wrapper.paragraph, afterAutospacing: true },
+        source: { headerCp: 6, fc: 0x80c, prm: 0, paragraphStyle: 0 },
+      },
+    };
+    const original = structuredClone(document);
+    const source = layoutSourceStore(document);
+    const roles = source.bodyLayoutInput.noteLayoutSettings?.nativeSeparatorRoles?.footnote;
+    if (!roles?.separator.paragraph || !roles.continuationNotice.paragraph) throw new Error('Expected reserved paragraphs');
+    const rule = source.blocks.resolve(roles.separator.paragraph.source);
+    const notice = source.blocks.resolve(roles.continuationNotice.paragraph.source);
+    if (rule.type !== 'paragraph' || notice.type !== 'paragraph') throw new Error('Expected reserved paragraphs');
+    // Paragraph base is 9pt; the 14pt rule control does not define the em.
+    expect([rule.spaceBefore, rule.spaceAfter]).toEqual(fixed ? [5, 7] : [9, 7]);
+    expect([notice.spaceBefore, notice.spaceAfter]).toEqual(fixed ? [5, 7] : [9, 9]);
+    expect(document).toEqual(original);
+    expect(Object.isFrozen(rule)).toBe(true);
+    const streamed = layoutSourceModelAdapterFromOwnedModel(structuredClone(document), structuredClone(document)).source;
+    expect(streamed.blocks.resolve(roles.separator.paragraph.source)).toEqual(rule);
+    // Settings and source mutations cannot change an acquired story or its owner.
+    document.settings.doNotUseHtmlParagraphAutoSpacing = !fixed;
+    wrapper.paragraph.spaceBefore = 90;
+    expect(source.blocks.resolve(roles.separator.paragraph.source)).toBe(rule);
+    expect([rule.spaceBefore, rule.spaceAfter]).toEqual(fixed ? [5, 7] : [9, 7]);
+  });
+
+  it.each(['rule-control', 'rule-mark', 'notice-mark'] as const)(
+    'rejects a native %s glyph before metric-only normalization can discard it',
+    (participant) => {
+      const document = nativeSeparatorDocument(0) as DocxDocumentModel & {
+        __noteLayoutSettings: { nativeSeparators: { footnote: Record<string, Record<string, unknown>> } };
+      };
+      const stories = document.__noteLayoutSettings.nativeSeparators.footnote;
+      const paragraph = stories.separator!.paragraph as Record<string, unknown>;
+      let character: { run: { text: string } };
+      if (participant === 'rule-control') {
+        character = (stories.separator!.rule as { control: typeof character }).control;
+      } else if (participant === 'rule-mark') {
+        character = paragraph.contentMark as typeof character;
+      } else {
+        // A paragraph-only notice follows the ordinary empty-paragraph path,
+        // so its content mark must be checked even without a rule participant.
+        const mark = structuredClone(paragraph.contentMark) as typeof character;
+        stories.continuationNotice = {
+          class: 'paragraphOnly', contentStartCp: 6, contentEndCp: 7, guardCp: 7,
+          paragraph: {
+            ...paragraph, contentMark: mark,
+            source: { headerCp: 6, fc: 0x80c, prm: 0, paragraphStyle: 0 },
+          },
+        };
+        character = mark;
+      }
+      // sprmCSymbol can produce text despite direct_text_run's empty input.
+      character.run.text = '\u03a9';
+      expect(() => layoutSourceStore(document)).toThrow('carries unsupported authored text');
+    },
+  );
+
+  it('rejects reserved root collisions and inconsistent native separator shapes before layout', () => {
+    expect(() => layoutSourceStore(nativeSeparatorDocument(0, 'reserved:separator')))
+      .toThrow('collides with a reserved note separator story');
+    const mutate = (edit: (stories: Record<string, Record<string, unknown>>) => void) => {
+      const document = nativeSeparatorDocument(0) as DocxDocumentModel & {
+        __noteLayoutSettings: { nativeSeparators: { footnote: Record<string, Record<string, unknown>> } };
+      };
+      edit(document.__noteLayoutSettings.nativeSeparators.footnote);
+      return () => layoutSourceStore(document);
+    };
+    // A rule spans exactly its control and content mark before the guard.
+    expect(mutate((stories) => { stories.separator!.contentEndCp = 3; }))
+      .toThrow('Unsupported native note separator story');
+    // Presence-only frame/numbering flags mean the owned cascade was not kept.
+    expect(mutate((stories) => {
+      (stories.separator!.paragraph as Record<string, unknown>).framed = true;
+    })).toThrow('Unsupported native note separator story');
+    expect(mutate((stories) => { stories.continuationNotice!.guardCp = 7; }))
+      .toThrow('Unsupported native note separator story');
   });
 });

@@ -333,6 +333,7 @@ self.onmessage = async (e: MessageEvent<RenderWorkerWireRequest | WorkerSvgDecod
         : undefined;
       if (requestedGeneration !== parseGeneration) throw new Error('render-worker parse was superseded');
       const layoutServices = createLayoutServices(source, {
+        allowFootnoteContinuation: req.allowFootnoteContinuation === true,
         fontMetrics: embeddedFonts.metrics,
         useGoogleFonts: !!req.useGoogleFonts,
         cjkFallback: req.cjkFallback,

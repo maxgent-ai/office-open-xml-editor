@@ -56,15 +56,17 @@ it('retains stored margins under Word fixed automatic-spacing compatibility', ()
   expect(paragraphs.map(p => [p.spaceBefore, p.spaceAfter])).toEqual([[5, 5], [5, 5], [40, 5]]);
 });
 
-it('resolves the same inherited margin in parsed cell and story paragraphs', () => {
-  const normalized = normalizeDocxDocumentModel(document(false, true));
+it.each([false, true])('propagates document fixed=%s into inherited cell and story margins', (fixed) => {
+  const raw = document(fixed, true);
+  const normalized = normalizeDocxDocumentModel(raw);
   const table = normalized.body.find(e => e.type === 'table');
   const cell = table?.type === 'table' ? table.rows[0]?.cells[0]?.content[0] : null;
   const paragraphs = [cell, normalized.headers.default?.body[0], normalized.footers.default?.body[0], normalized.footnotes?.[0]?.content?.[0]];
   for (const paragraph of paragraphs) {
     expect(paragraph?.type).toBe('paragraph');
-    if (paragraph?.type === 'paragraph') expect([paragraph.spaceBefore, paragraph.spaceAfter]).toEqual([11, 11]);
+    if (paragraph?.type === 'paragraph') expect([paragraph.spaceBefore, paragraph.spaceAfter]).toEqual(fixed ? [5, 5] : [11, 11]);
   }
+  expect((raw.headers.default?.body[0] as DocParagraph).spaceBefore).toBe(5);
 });
 
 it('keeps parsed compatibility text-box margins independent of the first inline font', () => {

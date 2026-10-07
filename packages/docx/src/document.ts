@@ -109,6 +109,13 @@ import {
  *  must not require an application font catalog or device-font permission.
  *  Embedded fonts and the existing optional web-font preload remain supported. */
 export interface LoadOptions extends CoreLoadOptions {
+  /** Continue paragraph footnotes across physical pages. Omitted means true:
+   * the library's default display policy, chosen to follow Word's page
+   * allocation in finite controls rather than as a normative ECMA-376 rule.
+   * Pass `false` to keep the previous whole-note pagination. With continuation,
+   * table splitting, width changes and changed source cuts can reject layout,
+   * and full-note acquisition is subject to the library source/page budgets. */
+  allowFootnoteContinuation?: boolean;
   /**
    * Opt-in OMML equation engine. Import it from the separate `@silurus/ooxml/math`
    * entry and pass it in: `import { math } from '@silurus/ooxml/math'`. When
@@ -332,6 +339,7 @@ function snapshotReviewData(
 export class DocxDocument {
   private _metrics: OoxmlResourceMetricsSession | null = null;
   private _cjkFallback: CjkLang = 'jp';
+  private _allowFootnoteContinuation = false;
   private _document: DocxDocumentModel | null = null;
   private _source: LayoutSourceStore | null = null;
   private _meta: DocumentMeta | null = null;
@@ -521,6 +529,10 @@ export class DocxDocument {
       checkAbort();
       doc._metrics = metrics;
       doc._cjkFallback = cjkFallback;
+      // Library default: continuation unless the caller passes exactly false
+      // (LoadOptions.allowFootnoteContinuation). The normalized boolean then
+      // reaches main, sliced and worker layout explicitly.
+      doc._allowFootnoteContinuation = opts.allowFootnoteContinuation !== false;
       // The variant the caller will actually render, recorded for BOTH render
       // modes and recorded BEFORE the parse: geometry accessors and the
       // per-call option fill-in (`_withActiveView`) read it, the wire options
@@ -652,6 +664,7 @@ export class DocxDocument {
         const layoutDocument = doc;
         const runtime = documentLayoutRuntimeOf(doc);
         runtime.services = createLayoutServices(doc._source, {
+          allowFootnoteContinuation: doc._allowFootnoteContinuation,
           fontMetrics: embeddedMetrics,
           useGoogleFonts: !!opts.useGoogleFonts,
           cjkFallback,
@@ -927,7 +940,7 @@ export class DocxDocument {
     const res = await this._bridge.request(
       (id) =>
         this._mode === 'worker'
-          ? ({ type: 'parse', id, data: buffer, resourcePolicy, useGoogleFonts, cjkFallback: this._cjkFallback, defaultCurrentDateMs: documentLayoutRuntimeOf(this).defaultCurrentDateMs, ...this._parseViewFields(), renderers } satisfies RenderWorkerRequest)
+          ? ({ type: 'parse', id, data: buffer, resourcePolicy, useGoogleFonts, allowFootnoteContinuation: this._allowFootnoteContinuation, cjkFallback: this._cjkFallback, defaultCurrentDateMs: documentLayoutRuntimeOf(this).defaultCurrentDateMs, ...this._parseViewFields(), renderers } satisfies RenderWorkerRequest)
           : ({ type: 'parse', id, data: buffer, resourcePolicy } satisfies WorkerRequest),
       [buffer],
       { timeoutMs },
@@ -1235,6 +1248,7 @@ export class DocxDocument {
           data: buffer,
           resourcePolicy,
           useGoogleFonts,
+          allowFootnoteContinuation: this._allowFootnoteContinuation,
           cjkFallback: this._cjkFallback,
           defaultCurrentDateMs: documentLayoutRuntimeOf(this).defaultCurrentDateMs,
           ...this._parseViewFields(),

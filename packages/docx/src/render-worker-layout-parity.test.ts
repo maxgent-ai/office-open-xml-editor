@@ -34,6 +34,10 @@ import {
   MaterializedDocumentCursorArchive,
 } from './document-pull-worker.js';
 import { syntheticDocxModel } from './testing/synthetic-document.js';
+import { noteContinuationModel } from './testing/note-continuation-model.js';
+import { layoutDocumentInputAsync } from './layout/document.js';
+import { paginateRenderWorkerDocumentProgressively } from './render-worker-progressive.js';
+import { PaginationAbortError } from './layout/pagination-scheduler.js';
 
 function services(): LayoutServices {
   return Object.freeze({
@@ -184,6 +188,160 @@ function metadataForDefaultLayout(
 }
 
 describe('render worker canonical layout parity', () => {
+  it('retains identical short-rule continuations in sync, sliced and worker layout', async () => {
+    const build = () => {
+      const model = noteContinuationModel();
+      const source = layoutSourceStore(model);
+      const services = createLayoutServices(source, {
+        measureContext: measureContext(), allowFootnoteContinuation: true,
+      });
+      return { source, services };
+    };
+    const main = build();
+    const expected = layoutDocument(main.source, main.services, { currentDateMs: 0 });
+    const sliced = build();
+    let yields = 0;
+    const actual = await layoutDocumentInputAsync(sliced.source.bodyLayoutInput, sliced.services,
+      { currentDateMs: 0 }, { sliceMs: 0, yieldToHost: async () => { yields++; } });
+    expect(yields).toBeGreaterThan(0);
+    const worker = build();
+    const retained = retainRenderWorkerDocumentLayout(worker.source, worker.services, 0);
+    await paginateRenderWorkerDocumentProgressively(retained, worker.source, {
+      publish: () => undefined, progress: () => undefined,
+    }, { currentDateMs: 0 });
+    expect(actual).toEqual(expected);
+    expect(retained.layoutVariants.layoutFor({ currentDateMs: 0 })).toEqual(expected);
+    expect(expected.pages.length).toBeGreaterThan(1);
+    const notes = expected.pages.flatMap(page => page.layers.notes);
+    expect(notes.flatMap(note => note.kind === 'note' ? note.story.blocks.flatMap(block =>
+      block.kind === 'paragraph' ? block.lines.flatMap(line => line.placements.flatMap(placement =>
+        placement.kind === 'text' ? [placement.text] : [])) : []) : []).join(''))
+      .toBe(Array.from({ length: 30 }, (_, index) => `note-${index};`).join(''));
+    expected.pages.forEach(page => page.layers.notes.forEach(note => {
+      if (note.kind !== 'note') throw new Error('Expected note');
+      expect(note.flowDomainId).toBe(`notes:page:${page.pageIndex}`);
+      const rule = note.separator[0];
+      expect(rule).toBeDefined();
+      expect(rule!.to.xPt - rule!.from.xPt).toBeCloseTo(60);
+      expect(note.advancePt - note.story.advancePt).toBe(6);
+      // Selection/comment boxes must move with note text into the destination
+      // band, including later fragments acquired in source coordinates.
+      note.story.blocks.forEach(block => {
+        if (block.kind !== 'paragraph') return;
+        block.lines.forEach(line => line.placements.forEach(placement => {
+          if (placement.kind !== 'text') return;
+          expect(placement.highlightBounds?.yPt).toBeGreaterThanOrEqual(note.story.flowBounds.yPt);
+          expect(placement.highlightBounds!.yPt + placement.highlightBounds!.heightPt)
+            .toBeLessThanOrEqual(note.story.flowBounds.yPt + note.story.advancePt);
+        }));
+      });
+    }));
+  });
+
+  it('can cancel while a pending note continues and retry from an intact source', async () => {
+    const source = layoutSourceStore(noteContinuationModel());
+    const services = createLayoutServices(source, {
+      measureContext: measureContext(), allowFootnoteContinuation: true,
+    });
+    const abort = new AbortController();
+    await expect(layoutDocumentInputAsync(source.bodyLayoutInput, services, { currentDateMs: 0 }, {
+      signal: abort.signal, sliceMs: 0, yieldToHost: async () => undefined,
+      // The opening draft reports one page before note acquisition. Wait for
+      // two actual tail transitions, then cancel before the note exhausts.
+      onProgress: pages => { if (pages >= 3) abort.abort(); },
+    })).rejects.toBeInstanceOf(PaginationAbortError);
+    const retry = await layoutDocumentInputAsync(source.bodyLayoutInput, services, { currentDateMs: 0 });
+    expect(retry).toEqual(layoutDocument(source, services, { currentDateMs: 0 }));
+    expect(retry.pages.length).toBeGreaterThan(1);
+  });
+
+  it('retains native separator and notice ownership identically in sync, sliced, worker and retried layout', async () => {
+    const address = (headerCp: number) => ({ headerCp, fc: 0x800 + headerCp * 2, prm: 0, paragraphStyle: 0 });
+    const run = { text: '', bold: false, italic: false, underline: false, strikethrough: false,
+      fontSize: 10, color: null, fontFamily: 'serif', isLink: false, background: null,
+      vertAlign: null, hyperlink: null };
+    const paragraph = { alignment: 'left', indentLeft: 0, indentRight: 0, indentFirst: 0,
+      spaceBefore: 0, spaceAfter: 2, lineSpacing: null, numbering: null, tabStops: [], runs: [],
+      defaultFontSize: 10, paragraphMarkFontFacts: { fontSize: 10 } };
+    const rule = (mark: 'short' | 'full', cp: number) => ({
+      class: 'rule', contentStartCp: cp, contentEndCp: cp + 2, guardCp: cp + 2,
+      rule: { mark, control: { run }, source: address(cp) },
+      paragraph: { paragraph, contentMark: { run }, source: address(cp + 1) },
+    });
+    const build = () => {
+      const model = noteContinuationModel() as DocxDocumentModel & { __noteLayoutSettings: object };
+      model.__noteLayoutSettings = { ...model.__noteLayoutSettings, nativeSeparators: { footnote: {
+        separator: rule('short', 0), continuationSeparator: rule('full', 3),
+        continuationNotice: { class: 'paragraphOnly', contentStartCp: 6, contentEndCp: 7, guardCp: 7,
+          paragraph: { paragraph, contentMark: { run }, source: address(6) } },
+      } } };
+      const source = layoutSourceStore(model);
+      return { source, services: createLayoutServices(source, {
+        measureContext: measureContext(), allowFootnoteContinuation: true,
+      }) };
+    };
+    const main = build();
+    const expected = layoutDocument(main.source, main.services, { currentDateMs: 0 });
+    const sliced = build();
+    const actual = await layoutDocumentInputAsync(sliced.source.bodyLayoutInput, sliced.services,
+      { currentDateMs: 0 }, { sliceMs: 0, yieldToHost: async () => undefined });
+    const worker = build();
+    const retained = retainRenderWorkerDocumentLayout(worker.source, worker.services, 0);
+    await paginateRenderWorkerDocumentProgressively(retained, worker.source, {
+      publish: () => undefined, progress: () => undefined,
+    }, { currentDateMs: 0 });
+    expect(actual).toEqual(expected);
+    expect(retained.layoutVariants.layoutFor({ currentDateMs: 0 })).toEqual(expected);
+    expect(stableFingerprint('document-layout', structuredClone(expected)))
+      .toBe(stableFingerprint('document-layout', expected));
+    const notes = expected.pages.flatMap((page) => page.layers.notes)
+      .filter((note) => note.kind === 'note');
+    expect(notes.length).toBeGreaterThan(1);
+    notes.forEach((note, index) => {
+      expect(note.separator).toEqual([]);
+      expect(note.leading?.rule?.mark).toBe(index === 0 ? 'short' : 'full');
+      expect(note.trailing !== undefined).toBe(index < notes.length - 1);
+      expect(note.leading?.paragraph?.flowDomainId).toBe(note.flowDomainId);
+    });
+
+    const cancelled = build();
+    const abort = new AbortController();
+    await expect(layoutDocumentInputAsync(cancelled.source.bodyLayoutInput, cancelled.services,
+      { currentDateMs: 0 }, {
+        signal: abort.signal, sliceMs: 0, yieldToHost: async () => undefined,
+        onProgress: (pages) => { if (pages >= 3) abort.abort(); },
+      })).rejects.toBeInstanceOf(PaginationAbortError);
+    expect(await layoutDocumentInputAsync(cancelled.source.bodyLayoutInput, cancelled.services,
+      { currentDateMs: 0 })).toEqual(expected);
+  });
+
+  it.each([true, false])('preserves acquired adjacent paragraph gaps (contextual=%s)', contextualSpacing => {
+    const model = noteContinuationModel();
+    for (const element of model.footnotes![0]!.content) {
+      if (element.type !== 'paragraph') continue;
+      element.spaceBefore = 10; element.spaceAfter = 10;
+      element.contextualSpacing = contextualSpacing; element.styleId = 'same-note-style';
+    }
+    const render = (pageHeight: number, enabled: boolean) => {
+      const input = structuredClone(model);
+      input.section.pageHeight = pageHeight;
+      return layoutDocument(input, createLayoutServices(input, {
+        measureContext: measureContext(), allowFootnoteContinuation: enabled,
+      }), { currentDateMs: 0 });
+    };
+    const starts = (layout: DeepReadonly<DocumentLayout>) => layout.pages.flatMap(page =>
+      page.layers.notes.flatMap(note => note.kind === 'note' ? [note.story.blocks.flatMap(block =>
+        block.kind === 'paragraph' ? block.lines.map(line => line.bounds.yPt) : [])] : []));
+    const control = starts(render(1_000, false))[0]!;
+    const expectedGap = control[1]! - control[0]!;
+    const fragments = starts(render(100, true));
+    expect(fragments.length).toBeGreaterThan(1);
+    expect(fragments.flat()).toHaveLength(30);
+    for (const lines of fragments) for (let index = 1; index < lines.length; index++) {
+      expect(lines[index]! - lines[index - 1]!).toBeCloseTo(expectedGap);
+    }
+  });
+
   it('does not traverse page geometry when a publication has no review data', () => {
     const layout = {
       pages: [{

@@ -1415,7 +1415,35 @@ export function performTextSegmentBox(
   const fullPx = s.fontSize * scale;
   let metricMeasurement = measured;
   let metricEmPx = effectiveFontPx(s);
-  if (s.smallCaps && !s.vertAlign && metricEmPx !== fullPx) {
+  if (s.metricOnly && s.metricProbeText) {
+    // Native reserved-separator participant (MS-DOC 2.3.3): its own text is
+    // empty, so its vertical metrics come from its bounded probe through the
+    // same selected face, at the existing effective metric size in this
+    // caller's scale (super/sub scaling; small caps keep the full-size policy
+    // of the branch below). Width stays the empty measurement above; probe
+    // clusters, ink and advance are never retained. Position applies once below.
+    const probeEmPx = s.smallCaps && !s.vertAlign ? fullPx : metricEmPx;
+    const probe = s.textLayoutService && s.textShapeRequest
+      ? s.textLayoutService.shape({
+          ...independentTextShapeRequest(s.textShapeRequest, s.metricProbeText),
+          fontSizePt: probeEmPx,
+          measure: true,
+          clusterGeometry: false,
+        })
+      : undefined;
+    const fallback = probe ? undefined : measurement.measureWithFont(
+      buildFont(s.bold, s.italic, probeEmPx, s.fontFamily, fontFamilyClasses, s.fontRoute),
+      s.metricProbeText,
+    );
+    metricMeasurement = {
+      width: measured.width,
+      actualBoundingBoxAscent: probe ? probe.ascentPt : fallback!.actualBoundingBoxAscent,
+      actualBoundingBoxDescent: probe ? probe.descentPt : fallback!.actualBoundingBoxDescent,
+      fontBoundingBoxAscent: probe ? probe.ascentPt : fallback!.fontBoundingBoxAscent,
+      fontBoundingBoxDescent: probe ? probe.descentPt : fallback!.fontBoundingBoxDescent,
+    } as TextMetrics;
+    metricEmPx = probeEmPx;
+  } else if (s.smallCaps && !s.vertAlign && metricEmPx !== fullPx) {
     if (s.textLayoutService && s.textShapeRequest) {
       const shaped = s.textLayoutService.shape({
         ...(s.text ? s.textShapeRequest : independentTextShapeRequest(s.textShapeRequest, 'X')),

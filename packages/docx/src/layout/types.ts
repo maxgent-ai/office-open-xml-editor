@@ -940,10 +940,36 @@ export interface StoryLayout {
   readonly diagnostics: readonly LayoutDiagnostic[];
 }
 
+/** Page-owned occurrence of one native reserved separator story (MS-DOC
+ * 2.3.3): the separator or continuation separator leading a page's note band
+ * (ECMA-376 §17.11.23 / §17.11.1), or the continuation notice ending a page on
+ * which a note continues (§17.18.33). The canonical reserved source is shared
+ * by every occurrence; geometry belongs to this destination page. */
+export interface NoteSeparatorLayout {
+  readonly role: 'separator' | 'continuationSeparator' | 'continuationNotice';
+  readonly source: SourceRef;
+  readonly flowBounds: LayoutRect;
+  readonly advancePt: number;
+  /** The story's acquired paragraph; it paints its own decorations only. */
+  readonly paragraph?: ParagraphLayout;
+  /** Ink of the U+0003/U+0004 control, emitted only here. */
+  readonly rule?: Readonly<{
+    mark: 'short' | 'full';
+    source: SourceRef;
+    segment: BorderSegment;
+  }>;
+}
+
 export interface NoteLayout extends LayoutNodeBase {
   readonly kind: 'note';
+  /** Scalar library rule of the modern/absent-native path. Empty when a
+   * native {@link leading} occurrence owns the separator. */
   readonly separator: readonly BorderSegment[];
+  readonly leading?: NoteSeparatorLayout;
   readonly story: StoryLayout;
+  /** The page's continuation notice (§17.18.33), owned by the last note of a
+   * band in which some note continues on a later page. */
+  readonly trailing?: NoteSeparatorLayout;
 }
 
 export type PaintNode = ParagraphLayout | TableLayout | DrawingLayout | TextBoxLayout | NoteLayout;
@@ -1148,6 +1174,9 @@ export interface LayoutServices {
   readonly text: TextLayoutService;
   readonly images: ImageMetadataService;
   readonly math: MathMetadataService;
+  /** Immutable document-level capability for paragraph footnote continuation.
+   * Unsupported cuts fail explicitly; this does not select another renderer. */
+  readonly allowFootnoteContinuation?: boolean;
   /** Geometry-affecting vertical glyph acquisition capability. Kept separate
    * from horizontal text shaping so each service fingerprint stays truthful. */
   readonly verticalGlyphFingerprint?: string;
