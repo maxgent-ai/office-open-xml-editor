@@ -8,6 +8,8 @@ use docx_model::{
     HeadersFooters,
 };
 
+#[cfg(test)]
+mod automatic_spacing_tests;
 pub(in crate::doc) mod fields;
 mod headers;
 mod notes;
@@ -15,8 +17,6 @@ mod payload;
 mod story;
 #[cfg(test)]
 mod table_tests;
-#[cfg(test)]
-mod automatic_spacing_tests;
 mod tables;
 
 #[derive(Debug)]
