@@ -175,8 +175,17 @@ export type DrawingPaintCommand =
       rect: LayoutRect;
       /** Keep a non-text graphic upright after the enclosing section-logical
        * frame is rotated into a vertical physical page. */
-      orientation?: 'upright-physical';
+      orientation?: UprightResourceOrientation;
     }>;
+
+/** Closed local counter-turn that keeps a non-text graphic upright in its
+ * owner section's physical page. `upright-physical` cancels the clockwise
+ * vertical frame (local quarter turn counter-clockwise);
+ * `upright-physical-counter-clockwise` cancels a native counter-clockwise
+ * (`sideways-lr`) frame (local quarter turn clockwise). */
+export type UprightResourceOrientation =
+  | 'upright-physical'
+  | 'upright-physical-counter-clockwise';
 
 export interface DrawingLayout extends LayoutNodeBase {
   readonly kind: 'drawing';
@@ -227,7 +236,15 @@ export interface TextRange {
 }
 
 export type TextDirection = 'ltr' | 'rtl';
-export type WritingMode = 'horizontal-tb' | 'vertical-rl' | 'vertical-lr';
+/** `sideways-lr` is the counter-clockwise frame (lines advance upward, later
+ * lines to the right, every glyph rotated with the page). Only a native
+ * {@link NativeSectionFlow} selects it; no OOXML token does. */
+export type WritingMode = 'horizontal-tb' | 'vertical-rl' | 'vertical-lr' | 'sideways-lr';
+
+/** Canonical per-section semantics normalized once from a native MS-DOC flow
+ * that no Transitional ST_TextDirection token expresses in this library:
+ * MS-ODRAW 2.4.5 BtoT (upward, later lines rightward, glyph tops left). */
+export type NativeSectionFlow = 'bottomToTop';
 
 export type TextDecorationLayout = Readonly<{
   kind: 'underline' | 'strikethrough' | 'overline';
@@ -513,7 +530,7 @@ export interface ResourcePlacement {
   readonly resourceKind: InlineResourceKind;
   /** Keep a non-text graphic upright after the enclosing section-logical frame
    * is rotated into a vertical physical page. Absent means flow-relative. */
-  readonly orientation?: 'upright-physical';
+  readonly orientation?: UprightResourceOrientation;
   readonly bounds: LayoutRect;
   readonly advancePt: number;
 }

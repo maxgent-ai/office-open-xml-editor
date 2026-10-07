@@ -61,9 +61,9 @@ import {
   resolveSectionContextForPage,
 } from './context.js';
 import {
+  sectionWritingMode,
   transformRect,
   uprightPhysicalExtent,
-  writingModeFromTextDirection,
 } from './coordinate-space.js';
 import {
   selectParagraphFragment,
@@ -356,6 +356,7 @@ function flowSection(owner: BodySectionLayoutInput, pageIndex: number) {
     geometry: context.geometry,
     columns: context.columns,
     textDirection: context.textDirection,
+    ...(context.nativeSectionFlow ? { nativeSectionFlow: context.nativeSectionFlow } : {}),
     sectionBidi: context.sectionBidi === true,
     grid: context.grid,
   });
@@ -375,7 +376,7 @@ function pageRegion(
     sectionOccurrenceId: owner.sectionOccurrenceId,
     section: context,
     pageBorders: owner.pageBordersAuthored ? owner.pageBorders : null,
-    writingMode: writingModeFromTextDirection(context.textDirection),
+    writingMode: sectionWritingMode(context),
     blockStartPt,
     blockEndPt: interval.blockEndPt,
     columnFlowDirection: context.sectionBidi === true ? 'rtl' : 'ltr',
@@ -395,7 +396,7 @@ function physicalPage(
   section: DeepReadonly<SectionLayoutContext>,
   interval: ReservedBodyInterval,
 ) {
-  const writingMode = writingModeFromTextDirection(section.textDirection);
+  const writingMode = sectionWritingMode(section);
   const extent = uprightPhysicalExtent({
     widthPt: section.geometry.pageWidth,
     heightPt: section.geometry.pageHeight,
@@ -1837,9 +1838,9 @@ function* paginateBodyPassSteps(
     }
     if (entry.kind === 'begin-section') {
       previousParagraph = null;
-      const currentWritingMode = writingModeFromTextDirection(activeRegion(state).section.textDirection);
-      const incomingWritingMode = writingModeFromTextDirection(
-        sectionContextForPage(entry.section, state.flow.pageIndex).textDirection,
+      const currentWritingMode = sectionWritingMode(activeRegion(state).section);
+      const incomingWritingMode = sectionWritingMode(
+        sectionContextForPage(entry.section, state.flow.pageIndex),
       );
       const currentPhysical = uprightPhysicalExtent({
         widthPt: activeRegion(state).section.geometry.pageWidth,
@@ -2584,7 +2585,7 @@ function headerFooterReserves(
     if (page.parityBlank) return Object.freeze({ top: 0, bottom: 0 });
     // Vertical header/footer stories paint in physical page space; charging their
     // measured overflow to the logical body interval would create a pagination-only reserve.
-    if (writingModeFromTextDirection(page.section.textDirection) !== 'horizontal-tb') {
+    if (sectionWritingMode(page.section) !== 'horizontal-tb') {
       return Object.freeze({ top: 0, bottom: 0 });
     }
     const owner = owners.get(page.sectionOccurrenceId);
@@ -2658,9 +2659,9 @@ function composePageStories(
       if (!hasPageStories) return page;
       throw new Error('Page-story composition requires a story-capable layout session');
     }
-    const vertical = writingModeFromTextDirection(page.section.textDirection) !== 'horizontal-tb';
+    const vertical = sectionWritingMode(page.section) !== 'horizontal-tb';
     const geometry = vertical
-      ? physicalSectionGeometry(page.section.geometry)
+      ? physicalSectionGeometry(page.section.geometry, page.section.nativeSectionFlow)
       : page.section.geometry;
     const inlineStartPt = Math.abs(geometry.marginLeft);
     const inlineExtentPt = Math.max(
@@ -2668,9 +2669,12 @@ function composePageStories(
       geometry.pageWidth - Math.abs(geometry.marginLeft) - Math.abs(geometry.marginRight),
     );
     const coordinateSpace = vertical ? 'upright-physical' as const : 'section-logical' as const;
+    // Upright physical page stories are horizontal, so a native section frame
+    // does not carry into them.
+    const { nativeSectionFlow: _nativeSectionFlow, ...pageSection } = page.section;
     const pageStorySection: DeepReadonly<SectionLayoutContext> = vertical
       ? Object.freeze({
-          ...page.section,
+          ...pageSection,
           geometry: Object.freeze({ ...geometry }),
           columns: Object.freeze([Object.freeze({
             xPt: inlineStartPt,

@@ -217,7 +217,10 @@ struct Properties {
     grid: u16,
     line_pitch: Option<u16>,
     char_space: i32,
-    text_flow: Option<&'static str>,
+    /// MS-DOC 2.6.4 sprmSTextFlow, retained raw. `None` when the SPRM is
+    /// absent, kept distinct from an explicit HorzN; the reader's inherited
+    /// policy displays an absent flow horizontally.
+    text_flow: Option<TextFlow>,
     page_format: &'static str,
     page_restart: bool,
     page_start: u32,
@@ -239,6 +242,37 @@ pub(super) struct NoteProperties {
     pub endnote_offset: Option<u16>,
     pub endnote_format: Option<u16>,
     pub endnote_at_section_end: Option<u8>,
+}
+
+/// MS-ODRAW 2.4.5 MSOTXFL, the sprmSTextFlow operand, in normative order.
+/// The basic rules of the specification describe the flows only:
+/// - HorzN and HorzA: rightward, later lines below, glyph tops up;
+/// - TtoBA, TtoBN and VertN: nominally downward, later lines to the left,
+///   glyph tops toward the right;
+/// - BtoT: upward, later lines to the right, glyph tops toward the left.
+///
+/// No East Asian glyph distinction is inferred from the A/N names.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TextFlow {
+    HorzN,
+    TtoBA,
+    BtoT,
+    TtoBN,
+    HorzA,
+    VertN,
+}
+
+impl TextFlow {
+    fn raw(self) -> u16 {
+        match self {
+            Self::HorzN => 0,
+            Self::TtoBA => 1,
+            Self::BtoT => 2,
+            Self::TtoBN => 3,
+            Self::HorzA => 4,
+            Self::VertN => 5,
+        }
+    }
 }
 
 impl Properties {
@@ -442,27 +476,17 @@ impl Properties {
                 }
                 0x5033 => {
                     // MS-DOC 2.6.4 sprmSTextFlow -> MS-ODRAW 2.4.5 MSOTXFL.
-                    // TtoBA: glyph sequence top-to-bottom, columns right-to-left.
-                    // ECMA-376 17.6.20 / 17.18.93 and Part 4 14.11.7:
-                    // Transitional tbRl is the matching section-flow token.
-                    p.text_flow = match u16_at(value, 0)? {
-                        0 => None,
-                        1 => Some("tbRl"),
-                        // Rotation variants and the Word-version-dependent
-                        // VertN column direction are not inferred from this
-                        // base-flow mapping.
-                        // TODO(native section text flow): the native direct
-                        // model path drops raw 2 (BtoT), 3 (TtoBN) and 5
-                        // (VertN) here without any diagnostic. This omission
-                        // is unresolved information loss, not a claim that
-                        // they are equivalent to horizontal flow. Retain the
-                        // effective MSOTXFL until an accurate projection or an
-                        // explicit native unsupported diagnostic is approved.
-                        // HorzA (4) is a separate glyph-shaping class, not a
-                        // rotated or vertical flow, and needs its own decision.
-                        2..=5 => None,
+                    // Every valid value is retained (last modifier wins);
+                    // projection lives in `direct.rs`.
+                    p.text_flow = Some(match u16_at(value, 0)? {
+                        0 => TextFlow::HorzN,
+                        1 => TextFlow::TtoBA,
+                        2 => TextFlow::BtoT,
+                        3 => TextFlow::TtoBN,
+                        4 => TextFlow::HorzA,
+                        5 => TextFlow::VertN,
                         _ => return Err(unsupported("invalid Word section text flow")),
-                    };
+                    });
                 }
                 _ => {} // Remaining properties are covered by the lossy-conversion warning.
             }
@@ -633,23 +657,35 @@ mod tests {
 
     #[test]
     fn preserves_section_vertical_flow_and_explicit_horizontal_reset() {
+        assert_eq!(Properties::parse(&[], &mut 100).unwrap().text_flow, None);
         let vertical = prl(0x5033, 1);
         let flow = Properties::parse(&vertical, &mut 100).unwrap().text_flow;
-        assert_eq!(flow, Some("tbRl"));
+        assert_eq!(flow, Some(TextFlow::TtoBA));
         let horizontal = [vertical, prl(0x5033, 0)].concat();
         let flow = Properties::parse(&horizontal, &mut 100).unwrap().text_flow;
-        assert_eq!(flow, None);
-        assert!(Properties::parse(&prl(0x5033, 6), &mut 100).is_err());
-        assert!(Properties::parse(&prl(0x5033, -1), &mut 100).is_err());
+        assert_eq!(flow, Some(TextFlow::HorzN));
+        for invalid in [6, -1] {
+            assert_eq!(
+                Properties::parse(&prl(0x5033, invalid), &mut 100).err(),
+                Some("UNSUPPORTED:invalid Word section text flow".to_string())
+            );
+        }
     }
 
     #[test]
-    fn unsupported_rotation_variants_do_not_retain_a_previous_flow() {
-        for flow in 2..=5 {
-            let bytes = [prl(0x5033, 1), prl(0x5033, flow)].concat();
+    fn retains_every_valid_raw_flow_with_the_last_modifier_winning() {
+        for raw in 0..=5 {
+            let flow = Properties::parse(&prl(0x5033, raw), &mut 100)
+                .unwrap()
+                .text_flow;
+            assert_eq!(flow.map(TextFlow::raw), Some(raw as u16));
+            let bytes = [prl(0x5033, 1), prl(0x5033, raw)].concat();
             let flow = Properties::parse(&bytes, &mut 100).unwrap().text_flow;
-            assert_eq!(flow, None);
+            assert_eq!(flow.map(TextFlow::raw), Some(raw as u16), "1 then {raw}");
         }
+        let bytes = [prl(0x5033, 1), prl(0x5033, 3), prl(0x5033, 0)].concat();
+        let flow = Properties::parse(&bytes, &mut 100).unwrap().text_flow;
+        assert_eq!(flow, Some(TextFlow::HorzN));
     }
 
     #[test]
@@ -669,7 +705,10 @@ mod tests {
             }
             let sections = read(&word, &table, 4).unwrap();
             for (section, flow) in sections.iter().zip(flows) {
-                assert_eq!(section.properties.text_flow == Some("tbRl"), flow == 1);
+                assert_eq!(
+                    section.properties.text_flow.map(TextFlow::raw),
+                    Some(flow as u16)
+                );
             }
         }
     }

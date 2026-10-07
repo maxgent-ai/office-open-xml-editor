@@ -7,6 +7,11 @@ the corresponding minor release.
 
 ## Unreleased
 
+- **legacy Word section text flow:** with the experimental direct DOC source,
+  sections whose text flow runs downward with every character rotated, or
+  upward with later lines to the right, are now displayed in that direction
+  instead of horizontally. Horizontal and the existing upright-vertical
+  sections are unchanged, as are DOCX documents.
 - **zero-height PowerPoint shapes:** a rectangle or other shape without text
   whose height is zero now renders as a horizontal rule, as it does in
   PowerPoint and Keynote, instead of a two-inch outlined box. Shapes that carry

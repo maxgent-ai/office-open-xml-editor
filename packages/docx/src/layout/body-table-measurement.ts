@@ -127,9 +127,19 @@ export function measureBodyTableEntry(
         requiresFreshFlowRegion: true,
       });
     }
-    const physicalLeftPt =
-      physical.physicalPageWidthPt - request.location.cursorPt.yPt - tableWidthPt;
-    const physicalTopPt = request.location.cursorPt.xPt;
+    // The upright table occupies the logical block band [y, y + width]. The
+    // clockwise frame maps it to physical x = page width - logical y and
+    // starts it at the column top (physical y = logical x). A native BtoT
+    // frame maps logical y to physical x unchanged and its column starts at
+    // the bottom (physical y = page height - logical x), so the table ends
+    // there. That native placement is generic library policy transformed
+    // through the section's own frame, not an observed Word placement.
+    const physicalLeftPt = physical.nativeSectionFlow == null
+      ? physical.physicalPageWidthPt - request.location.cursorPt.yPt - tableWidthPt
+      : request.location.cursorPt.yPt;
+    const physicalTopPt = physical.nativeSectionFlow == null
+      ? request.location.cursorPt.xPt
+      : physical.pageHeight - request.location.cursorPt.xPt - retained.layout.advancePt;
     const physicalBandHeightPt = Math.max(
       retained.layout.advancePt,
       physical.pageHeight - physical.marginTop - physical.marginBottom,

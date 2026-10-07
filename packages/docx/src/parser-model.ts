@@ -27,6 +27,7 @@ import type {
 } from './types.js';
 import type {
   DeepReadonly,
+  NativeSectionFlow,
   NumberingMarkerShapeInput,
   FloatingTablePositionInput,
   SourceRef,
@@ -462,6 +463,8 @@ interface InternalSectionPlacementWire {
   readonly docGridCharSpace?: number | null;
   readonly gutterPt?: number | null;
   readonly rtlGutter?: boolean | null;
+  /** Native producer only: raw MS-ODRAW 2.4.5 MSOTXFL of MS-DOC sprmSTextFlow. */
+  readonly nativeTextFlow?: number | null;
   readonly pageBordersAuthored?: boolean;
   readonly pageBorders?: import('./types.js').PageBorders | null;
   readonly pageGeometry?: Readonly<{
@@ -499,6 +502,35 @@ export interface SectionPlacementInput {
   readonly pageBordersAuthored: boolean;
   readonly pageBorders: Readonly<import('./types.js').PageBorders> | null;
   readonly pageGeometry: InternalSectionPlacementWire['pageGeometry'];
+  /** Canonical semantics of a native flow; absent for OOXML sections. */
+  readonly nativeSectionFlow?: NativeSectionFlow;
+}
+
+/** Public display-family token of each raw MS-ODRAW 2.4.5 MSOTXFL emitted by
+ * the native producer (index = raw value). */
+const NATIVE_TEXT_FLOW_DIRECTIONS: readonly (string | null)[] = Object.freeze([
+  null, 'tbRl', 'btLr', 'btLr', null, 'btLr',
+]);
+
+/** Normalize the native producer's private raw flow once, before any layout
+ * input exists. The fact must agree with the section's public token. Only
+ * BtoT (2) needs canonical semantics beyond its nominal `btLr` token: its
+ * counter-clockwise frame. Layout never receives the raw value. */
+function nativeSectionFlowFacts(
+  wire: InternalSectionPlacementWire | undefined,
+  textDirection: string | null | undefined,
+): Readonly<{ nativeSectionFlow?: NativeSectionFlow }> {
+  const raw = wire?.nativeTextFlow;
+  if (raw === undefined || raw === null) return {};
+  if (!Number.isInteger(raw) || raw < 0 || raw >= NATIVE_TEXT_FLOW_DIRECTIONS.length) {
+    throw new TypeError(`Invalid native section text flow ${String(raw)}`);
+  }
+  if ((textDirection ?? null) !== NATIVE_TEXT_FLOW_DIRECTIONS[raw]) {
+    throw new TypeError(
+      `Native section text flow ${raw} contradicts text direction ${JSON.stringify(textDirection ?? null)}`,
+    );
+  }
+  return raw === 2 ? { nativeSectionFlow: 'bottomToTop' } : {};
 }
 
 interface DocumentSectionPlacementInputs {
@@ -1139,6 +1171,7 @@ function projectSectionPlacementInputs(doc: InternalDocxDocumentModel): Document
       pageBordersAuthored: wire?.pageBordersAuthored ?? false,
       pageBorders: wire?.pageBorders ?? null,
       pageGeometry: wire?.pageGeometry ?? element.geom ?? {},
+      ...nativeSectionFlowFacts(wire, element.textDirection),
     }, 'DOCX ending-section placement input'));
     ordinal += 1;
   });
@@ -1162,6 +1195,7 @@ function projectSectionPlacementInputs(doc: InternalDocxDocumentModel): Document
       pageBorders: finalWire?.pageBorders ?? doc.section?.pageBorders ?? null,
       pageGeometry: finalWire?.pageGeometry
         ?? (doc.section ? sectionPageBox(doc.section) : {}),
+      ...nativeSectionFlowFacts(finalWire, doc.section?.textDirection),
     }, 'DOCX final-section placement input'),
   });
 }
@@ -1240,6 +1274,7 @@ export function bodySectionIndexInput(doc: DocxDocumentModel): BodySectionIndexI
       columns: element.columns ?? null,
       authoredGeometry: normalizeSectionGeometryWire(placement.pageGeometry),
       textDirection: element.textDirection ?? null,
+      ...(placement.nativeSectionFlow ? { nativeSectionFlow: placement.nativeSectionFlow } : {}),
       pageNumType: element.pageNumType ?? null,
       headers: element.headers ?? EMPTY_SECTION_HEADERS_FOOTERS,
       footers: element.footers ?? EMPTY_SECTION_HEADERS_FOOTERS,
@@ -1273,6 +1308,7 @@ export function bodySectionIndexInput(doc: DocxDocumentModel): BodySectionIndexI
       ? sectionPageBox(doc.section)
       : normalizeSectionGeometryWire(placement.pageGeometry),
     textDirection: doc.section.textDirection ?? null,
+    ...(placement.nativeSectionFlow ? { nativeSectionFlow: placement.nativeSectionFlow } : {}),
     pageNumType: doc.section.pageNumType ?? null,
     headers: doc.headers ?? EMPTY_SECTION_HEADERS_FOOTERS,
     footers: doc.footers ?? EMPTY_SECTION_HEADERS_FOOTERS,

@@ -348,6 +348,7 @@ function sectionInput(
     context: Object.freeze(resolveAcquiredSectionLayoutContext(
       sectionProps(occurrence),
       occurrence.sectionBidi,
+      occurrence.nativeSectionFlow,
     )),
     pageNumbering: Object.freeze({
       start: occurrence.pageNumType?.start ?? null,

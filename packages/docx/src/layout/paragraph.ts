@@ -141,6 +141,7 @@ import {
   transformRect,
   transformRectEdges,
   uprightPhysicalExtent,
+  uprightResourceOrientation,
 } from './coordinate-space.js';
 import { inverseMapAffinePoint } from './affine.js';
 export {
@@ -280,7 +281,7 @@ export interface MeasuredResourcePlanSegment {
   readonly widthPt: number;
   readonly heightPt: number;
   readonly topOffsetPt: number;
-  readonly orientation?: 'upright-physical';
+  readonly orientation?: import('./types.js').UprightResourceOrientation;
 }
 
 export interface MeasuredUnavailableResourcePlanSegment {
@@ -2379,6 +2380,8 @@ function planMeasuredLines(
   verticalPageFrame = false,
   compatibilityMode?: number,
   paragraphMarkShapeInput?: NumberingMarkerShapeInput,
+  /** Owner section's counter-turn for upright inline graphics. */
+  resourceOrientation?: import('./types.js').UprightResourceOrientation,
 ): readonly LineLayout[] {
   let sourceOffset = 0;
   const consumedByRun = new Map<number, number>();
@@ -2549,9 +2552,7 @@ function planMeasuredLines(
           ...(runIndex === undefined ? {} : { sourceRunIndex: runIndex }),
           resourceKey, resourceKind, measuredWidthPt: image.measuredWidth,
           widthPt: image.widthPt, heightPt: image.heightPt, topOffsetPt: -image.heightPt,
-          ...(verticalPageFrame
-            ? { orientation: 'upright-physical' as const }
-            : {}),
+          ...(resourceOrientation ? { orientation: resourceOrientation } : {}),
         });
       } else if ('math' in segment) {
         const math = segment as LayoutMathSeg;
@@ -2924,7 +2925,12 @@ function publicAnchoredResourceDrawing(
         ? imageResourceKey(source, run.imagePath) : chartResourceKey(source),
       rect,
       ...(options.environment.verticalPageFrame
-        ? { orientation: 'upright-physical' as const }
+        ? {
+            orientation: uprightResourceOrientation(
+              options.environment.verticalPageFrame,
+              options.environment.pageWritingMode,
+            )!,
+          }
         : {}),
     }],
     anchorLayer: {
@@ -5150,6 +5156,10 @@ export function paragraphLayoutFromMeasurement(
     options.environment.verticalPageFrame,
     options.environment.compatibilityMode,
     options.environment.paragraphMarkShapeInput,
+    uprightResourceOrientation(
+      options.environment.verticalPageFrame,
+      options.environment.pageWritingMode,
+    ),
   );
   if (options.sourceRangeStart !== undefined) {
     lines = rebaseMeasuredLineRanges(lines, options.sourceRangeStart);

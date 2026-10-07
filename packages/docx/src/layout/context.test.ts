@@ -116,6 +116,61 @@ function ids(occurrences: readonly BodySectionOccurrence[]): string[] {
   return occurrences.map((occurrence) => occurrence.sectionOccurrenceId);
 }
 
+describe('native section flow normalization', () => {
+  const nativeMarker = (textDirection: string | null, nativeTextFlow?: number): BodyElement => ({
+    type: 'sectionBreak',
+    kind: 'nextPage',
+    columns: null,
+    textDirection,
+    pageNumType: null,
+    __sectionPlacement: {
+      sectionId: 'section:native',
+      vAlign: null,
+      lineNumbering: null,
+      ...(nativeTextFlow === undefined ? {} : { nativeTextFlow }),
+    },
+  }) as unknown as BodyElement;
+  const withFinalWire = (doc: DocxDocumentModel, nativeTextFlow: number): DocxDocumentModel => {
+    (doc.section as unknown as Record<string, unknown>).__sectionPlacement = {
+      sectionId: 'section:final', vAlign: null, lineNumbering: null, nativeTextFlow,
+    };
+    return doc;
+  };
+
+  it('normalizes only the native BtoT fact, per section, without retaining the raw wire', () => {
+    const doc = withFinalWire(document(
+      [paragraph('a'), nativeMarker('btLr', 2), paragraph('b')],
+      { textDirection: 'btLr' },
+    ), 3);
+    const { occurrences } = bodySectionIndexInput(doc);
+    expect(occurrences.map((occurrence) => occurrence.nativeSectionFlow ?? null))
+      .toEqual(['bottomToTop', null]);
+    expect(occurrences.map((occurrence) => occurrence.textDirection)).toEqual(['btLr', 'btLr']);
+    expect(JSON.stringify(occurrences)).not.toContain('nativeTextFlow');
+  });
+
+  it.each(['btLr', 'bottomToTop', 'sideways-lr'])
+    ('never derives the native frame from an authored %s token', (textDirection) => {
+      const doc = document(
+        [paragraph('a'), nativeMarker(textDirection), paragraph('b')],
+        { textDirection },
+      );
+      for (const occurrence of bodySectionIndexInput(doc).occurrences) {
+        expect(occurrence.nativeSectionFlow).toBeUndefined();
+      }
+    });
+
+  it.each([
+    ['tbRl', 2],
+    [null, 3],
+    ['btLr', 4],
+    ['btLr', 6],
+  ] as const)('rejects a native wire whose direction is %s for raw flow %i', (textDirection, raw) => {
+    const doc = document([paragraph('a'), nativeMarker(textDirection, raw), paragraph('b')]);
+    expect(() => bodySectionIndexInput(doc)).toThrow(TypeError);
+  });
+});
+
 describe('pre-indexed body section ownership', () => {
   it('assigns each paragraph-owned marker to the section it terminates', () => {
     const doc = document([
@@ -355,6 +410,24 @@ describe('section geometry coordinate boundary', () => {
     });
 
     expect(physicalSectionGeometry(logicalSectionGeometry(physical))).toEqual(physical);
+  });
+
+  it('keeps the clockwise margin mapping and gives a native BtoT frame its own edges', () => {
+    const physical = geometry({ marginTop: 36, marginRight: 54, marginBottom: 72, marginLeft: 90 });
+    // Established Transitional vertical frame: logical left/top/right/bottom
+    // are the physical top/right/bottom/left margins.
+    expect(logicalSectionGeometry(physical)).toEqual(geometry({
+      pageWidth: 792, pageHeight: 612,
+      marginLeft: 36, marginTop: 54, marginRight: 72, marginBottom: 90,
+    }));
+    // Native BtoT: lines start at the physical bottom and later lines move
+    // right, so logical left/right/top/bottom are physical bottom/top/left/right.
+    const native = logicalSectionGeometry(physical, 'bottomToTop');
+    expect(native).toEqual(geometry({
+      pageWidth: 792, pageHeight: 612,
+      marginLeft: 72, marginRight: 36, marginTop: 90, marginBottom: 54,
+    }));
+    expect(physicalSectionGeometry(native, 'bottomToTop')).toEqual(physical);
   });
 
   it('projects only page-box facts and preserves signed-margin body distance', () => {

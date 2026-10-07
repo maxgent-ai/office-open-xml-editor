@@ -2,9 +2,9 @@ import { LayoutInvariantError } from './diagnostics.js';
 import {
   createSectionRegionCoordinateSpace,
   logicalPageExtent,
+  sectionWritingMode,
   transformRect,
   uprightPhysicalExtent,
-  writingModeFromTextDirection,
 } from './coordinate-space.js';
 import { columnSeparatorSegments } from './column-separators.js';
 import { orderedPagePaintNodes, pageLayerNodes, PageGraphError } from './page-graph.js';
@@ -204,7 +204,8 @@ function requireMatrix(matrix: unknown, path: string): asserts matrix is Section
 }
 
 function requireWritingMode(value: unknown, path: string): asserts value is WritingMode {
-  if (value !== 'horizontal-tb' && value !== 'vertical-rl' && value !== 'vertical-lr') {
+  if (value !== 'horizontal-tb' && value !== 'vertical-rl' && value !== 'vertical-lr'
+    && value !== 'sideways-lr') {
     throw new LayoutInvariantError('INVALID_GEOMETRY', `${path} is unsupported`);
   }
 }
@@ -346,7 +347,7 @@ function requirePageBorder(page: LayoutPage, path: string): void {
   }
   requireMatrix(pageBorder.logicalToPhysical, `${path}.logicalToPhysical`);
   const expectedTransform = createSectionRegionCoordinateSpace(
-    writingModeFromTextDirection(page.section.textDirection),
+    sectionWritingMode(page.section),
     page.geometry,
   ).logicalToPhysical;
   if (!equalMatrix(pageBorder.logicalToPhysical, expectedTransform)) {
@@ -726,16 +727,16 @@ function* assertDocumentLayoutUncheckedSteps(layout: DocumentLayout): Generator<
           );
         }
         pageWritingMode = writingMode;
-        let sectionWritingMode: WritingMode;
+        let sectionMode: WritingMode;
         try {
-          sectionWritingMode = writingModeFromTextDirection(region.section.textDirection);
+          sectionMode = sectionWritingMode(region.section);
         } catch (error) {
           throw new LayoutInvariantError(
             'INVALID_GEOMETRY',
             `${path}.section.textDirection is unsupported: ${(error as Error).message}`,
           );
         }
-        if (writingMode !== sectionWritingMode) {
+        if (writingMode !== sectionMode) {
           throw new LayoutInvariantError(
             'INVALID_GEOMETRY',
             `${path} writing mode contradicts its section text direction`,

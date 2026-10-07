@@ -937,6 +937,12 @@ pub struct SectionPlacementWire {
     pub gutter_pt: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rtl_gutter: Option<bool>,
+    /// Native (MS-DOC) producer only: the effective raw MS-DOC 2.6.4
+    /// sprmSTextFlow operand (MS-ODRAW 2.4.5 MSOTXFL, 0..=5), omitted when the
+    /// section has no such SPRM. Normalized once at the TS model boundary;
+    /// OOXML producers never emit it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_text_flow: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub page_borders_authored: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]

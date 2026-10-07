@@ -26,6 +26,7 @@ import type {
   FloatRegistryEntryPt,
   FloatRegistrySnapshotPt,
   DrawingMLCollisionEntryPt,
+  NativeSectionFlow,
   NoteLayout,
   NoteSeparatorLayout,
   ParagraphLayout,
@@ -69,7 +70,7 @@ import {
   sectionBodyInsetPt as bodyMarginInsetPt,
   physicalSectionGeometry,
 } from './context.js';
-import { isAllRotatedVerticalTextDirection, isVerticalSection, isVerticalTextDirection, physicalLayoutSection, verticalLayoutSection } from './section-orientation.js';
+import { isAllRotatedVerticalTextDirection, isVerticalTextDirection, physicalLayoutSection, verticalLayoutSection } from './section-orientation.js';
 import { gridForParagraphContext, paragraphMeasurementEnvironment } from './measurement-environment.js';
 import { createRevisionAuthorColorResolver } from './track-changes.js';
 import { BODY_STORY_CONTEXT, bodyAnchorReferenceFrames, retainedTableRecord, resolveBodyParagraphLayoutContext, resolveStateParagraphLayoutContext, withTableCellStory } from './acquisition-state.js';
@@ -98,7 +99,7 @@ import { bottomBorderExtentPt, resolveParagraphBorderEdges, topBorderExtentPt, t
 import { acquireParagraphResult, acquireRetainedFrameGroup, bodyFrameGroupFor, bodyParagraphBorderEdgesFor, projectPhysicalAnchorResult, retainedFrameMaximumBaselineLoweringPt, type BodyFrameGroup } from './paragraph.js';
 import { wordLoweredDropCapAnchorLeadingPt } from './body-pagination-compatibility.js';
 import type { CompleteTextBoxStoryAcquirer } from './paragraph.js';
-import type { AnchorFloatRegistrationState, BodyAcquisitionState, BodyMeasurementContext, RetainedTableRecord } from './acquisition-context.js';
+import type { AnchorFloatRegistrationState, BodyAcquisitionState, BodyMeasurementContext, CompleteTextBoxStoryOwner, PhysicalAnchorFrame, RetainedTableRecord } from './acquisition-context.js';
 import { ownedParagraphAnchorCollisions, inheritedParagraphAuthorityForReacquisition, TRANSIENT_TABLE_FINAL_FRAME_EXCLUSION_PREFIX } from './paragraph-wrap-registry.js';
 import { acquireRegisteredParagraph } from './registered-paragraph-acquisition.js';
 import { paragraphAnchorCollisions, paragraphWrapExclusions } from './paragraph-float-authority.js';
@@ -119,8 +120,8 @@ import type { TableLayoutSource } from './table-source-acquisition.js';
 import { collectBodyFrameGroups, prepareBodyFrameMetadata } from './frame.js';
 import {
   physicalToLogicalMatrix,
+  sectionWritingMode,
   uprightPhysicalExtent,
-  writingModeFromTextDirection,
 } from './coordinate-space.js';
 
 export function createProductionBodyLayoutRuntime(
@@ -182,8 +183,9 @@ function buildMeasureState(
   resolvedLocalFonts: Readonly<Record<string, ResolvedFontMetric>> = {},
   layoutServices: LayoutServices,
   layoutOptions?: LayoutOptions,
+  nativeSectionFlow?: NativeSectionFlow,
 ): BodyAcquisitionState {
-  const sectionLayout = resolveSectionLayoutContext(layoutSettings, section);
+  const sectionLayout = resolveSectionLayoutContext(layoutSettings, section, nativeSectionFlow);
   // Acquisition always uses the document-scoped service owner supplied by the
   // private body kernel, so its text and vertical measurement capabilities have
   // one auditable lineage and fingerprint.
@@ -310,7 +312,7 @@ function buildMeasureState(
             ),
             continuesFromPrevious: false,
             anchorFrames: bodyAnchorReferenceFrames(cellState),
-            acquireCompleteStory: cellState.acquireCompleteTextBoxStory,
+            acquireCompleteStory: completeTextBoxStoryAcquirerFor(cellState),
           },
           inheritedAuthority,
         ).layout;
@@ -403,14 +405,14 @@ function buildMeasureState(
     // physical branch on `verticalPhys`), otherwise a wrapped shape's exclusion
     // band is reserved at the raw logical rectangle during pagination while the
     // retained paint uses the physical projection — diverging page assignment.
-    // Un-swap via
-    // physicalLayoutSection; `physicalPageWidthPt` is the physical page width
-    // in canonical points. `verticalCJK` stays unset: acquisition
-    // keeps its horizontal glyph metrics (only anchor geometry re-frames).
-    // Seeded from the section this measure state is BUILT from (the body-level
-    // body-level one); a direction-mixed document then re-seeds it per
-    // section via its retained acquisition location (issue #1000), so a
-    // mid-body section's anchors resolve against ITS OWN physical frame.
+    // `physicalPageWidthPt` is the physical page width in canonical points.
+    // `verticalCJK` stays unset: acquisition keeps its horizontal glyph
+    // metrics (only anchor geometry re-frames).
+    // The direction flags follow the current `sectionLayout`; the physical
+    // anchor frame is seeded here from the section this state is built from
+    // and rebuilt from each acquisition location's own section
+    // (`applyBodyAcquisitionLocationTo`, issue #1000), so a mid-body section's
+    // anchors resolve against ITS OWN physical frame.
     get verticalCJK() {
       return isVerticalTextDirection(this.sectionLayout.textDirection);
     },
@@ -418,20 +420,28 @@ function buildMeasureState(
       return isVerticalTextDirection(this.sectionLayout.textDirection)
         && isAllRotatedVerticalTextDirection(this.sectionLayout.textDirection);
     },
-    verticalPhys: isVerticalSection(section)
-      ? (() => {
-          const phys = physicalLayoutSection(section);
-          return {
-            pageWidth: phys.pageWidth,
-            pageHeight: phys.pageHeight,
-            marginLeft: phys.marginLeft,
-            marginRight: phys.marginRight,
-            marginTop: bodyMarginInsetPt(phys.marginTop),
-            marginBottom: bodyMarginInsetPt(phys.marginBottom),
-            physicalPageWidthPt: phys.pageWidth,
-          };
-        })()
-      : undefined,
+    verticalPhys: physicalAnchorFrameOf(sectionLayout),
+  };
+}
+
+/** Physical page frame of one section context for DrawingML anchors and
+ * upright tables, derived only from that context: its logical page box is
+ * un-swapped with its own frame (the established clockwise mapping, or a
+ * native flow's canonical matrix). Horizontal contexts have no frame. */
+function physicalAnchorFrameOf(
+  section: DeepReadonly<SectionLayoutContext>,
+): PhysicalAnchorFrame | undefined {
+  if (!isVerticalTextDirection(section.textDirection)) return undefined;
+  const phys = physicalSectionGeometry(section.geometry, section.nativeSectionFlow);
+  return {
+    pageWidth: phys.pageWidth,
+    pageHeight: phys.pageHeight,
+    marginLeft: phys.marginLeft,
+    marginRight: phys.marginRight,
+    marginTop: bodyMarginInsetPt(phys.marginTop),
+    marginBottom: bodyMarginInsetPt(phys.marginBottom),
+    physicalPageWidthPt: phys.pageWidth,
+    ...(section.nativeSectionFlow ? { nativeSectionFlow: section.nativeSectionFlow } : {}),
   };
 }
 
@@ -542,7 +552,7 @@ function acquireBodyParagraphAtLocation(
             sourceRangeStart: continuation.sourceRangeStart,
           }),
       anchorFrames: bodyAnchorReferenceFrames(state),
-      acquireCompleteStory: state.acquireCompleteTextBoxStory,
+      acquireCompleteStory: completeTextBoxStoryAcquirerFor(state),
       ...(state.frozenAnchorFrames && state.frozenAnchorFrames.size > 0
         ? { frozenAnchorFrames: state.frozenAnchorFrames }
         : {}),
@@ -670,7 +680,8 @@ function acquireBodyStoryLayout(
     verticalCJK: storyVertical,
     verticalAllRotated:
       storyVertical && isAllRotatedVerticalTextDirection(request.section.textDirection),
-    ...(storyVertical ? {} : { verticalPhys: undefined }),
+    // The story's own section supplies its frame (none when horizontal).
+    verticalPhys: physicalAnchorFrameOf(request.section),
     storyContext: {
       story: request.source.story,
       containers: [],
@@ -858,7 +869,9 @@ function acquireBodyStoryLayout(
         ),
         continuesFromPrevious: false,
         anchorFrames: bodyAnchorReferenceFrames(candidate),
-        acquireCompleteStory: candidate.acquireCompleteTextBoxStory,
+        // Nested text boxes in this story take the story's own section,
+        // page and frame, not the body's current location.
+        acquireCompleteStory: completeTextBoxStoryAcquirerFor(candidate),
       });
       previousParagraph = paragraph;
       const nextCursor = {
@@ -937,6 +950,10 @@ function applyBodyAcquisitionLocationTo(
 ): void {
   const geometry = next.section.geometry;
   target.sectionLayout = next.section as SectionLayoutContext;
+  // Each retained occurrence owns its physical anchor frame; a horizontal
+  // section clears it. Two native sections can share the nominal `btLr`
+  // token and still differ in frame.
+  target.verticalPhys = physicalAnchorFrameOf(next.section);
   target.pageIndex = next.pageIndex;
   const page = fieldAcquisitionContextOf(services).resolveDestinationPage?.(next.pageIndex);
   target.displayPageNumber = page?.displayPageNumber ?? next.pageIndex + 1;
@@ -1770,9 +1787,7 @@ function prescanBodyPageAnchors(
     // inverse before the exclusion can affect earlier body content.
     const retainedResult = isVerticalTextDirection(request.location.section.textDirection)
       ? (() => {
-          const writingMode = writingModeFromTextDirection(
-            request.location.section.textDirection as string,
-          );
+          const writingMode = sectionWritingMode(request.location.section);
           const physicalPage = uprightPhysicalExtent(
             {
               widthPt: frames.page.widthPt,
@@ -2222,22 +2237,64 @@ function reacquireBodyTableBlock(
   );
 }
 
+/** Bound acquirers per session callback, owner section context and page. The
+ * paragraph acquisition cache keys on the acquirer's identity, so equal
+ * authority must yield the identical function. */
+const boundCompleteStoryAcquirers = new WeakMap<
+  NonNullable<BodyAcquisitionState['acquireCompleteTextBoxStory']>,
+  WeakMap<SectionLayoutContext, Map<number, CompleteTextBoxStoryAcquirer>>
+>();
+
+/** Bind nested complete-story acquisition to the section and page of the exact
+ * state that contains the text box (body location, table cell or story
+ * candidate), never to the session's current body location. */
+function completeTextBoxStoryAcquirerFor(
+  owner: BodyAcquisitionState,
+): CompleteTextBoxStoryAcquirer | undefined {
+  const acquire = owner.acquireCompleteTextBoxStory;
+  if (!acquire) return undefined;
+  const { sectionLayout, pageIndex } = owner;
+  let bySection = boundCompleteStoryAcquirers.get(acquire);
+  if (!bySection) {
+    bySection = new WeakMap();
+    boundCompleteStoryAcquirers.set(acquire, bySection);
+  }
+  let byPage = bySection.get(sectionLayout);
+  if (!byPage) {
+    byPage = new Map();
+    bySection.set(sectionLayout, byPage);
+  }
+  let bound = byPage.get(pageIndex);
+  if (!bound) {
+    const authority = Object.freeze({ sectionLayout, pageIndex });
+    bound = (request) => acquire(authority, request);
+    byPage.set(pageIndex, bound);
+  }
+  return bound;
+}
+
+/** Acquire a text box's complete story with its owner's section, page and
+ * frame as authority. The section-keyed story cache stays shared because its
+ * key includes the full section context. */
 function acquireCompleteBodyTextBoxStory(
-  state: BodyAcquisitionState,
+  owner: CompleteTextBoxStoryOwner,
   storyAcquisitionContext: BodyStoryAcquisitionContext,
   request: Parameters<CompleteTextBoxStoryAcquirer>[0],
 ): ReturnType<CompleteTextBoxStoryAcquirer> {
+  // An upright physical text box is horizontal: it keeps the owner section's
+  // physical page box but not that section's native frame.
+  const { nativeSectionFlow, ...sectionLayout } = owner.sectionLayout;
   const section =
     request.coordinateSpace === 'upright-physical'
       ? {
-          ...state.sectionLayout,
-          geometry: physicalSectionGeometry(state.sectionLayout.geometry),
+          ...sectionLayout,
+          geometry: physicalSectionGeometry(owner.sectionLayout.geometry, nativeSectionFlow),
           textDirection: 'lrTb',
         }
-      : state.sectionLayout;
+      : owner.sectionLayout;
   return acquireBodyStoryLayout(storyAcquisitionContext, {
     source: request.source,
-    pageIndex: state.pageIndex,
+    pageIndex: owner.pageIndex,
     section,
     container: request.container,
   });
@@ -2265,7 +2322,7 @@ function openConcreteBodyLayoutSession(
     vAlign: input.section.verticalAlignment,
   };
   const section = isVerticalTextDirection(physicalSection.textDirection)
-    ? verticalLayoutSection(physicalSection)
+    ? verticalLayoutSection(physicalSection, input.section.nativeSectionFlow)
     : physicalSection;
   const state = buildMeasureState(
     measureContext,
@@ -2275,6 +2332,7 @@ function openConcreteBodyLayoutSession(
     resolvedLocalFonts,
     services,
     options,
+    input.section.nativeSectionFlow,
   );
   // Markup view only: resolve tracked-change author colours once per
   // session from the main story's document run order (first-appearance
@@ -2333,8 +2391,8 @@ function openConcreteBodyLayoutSession(
     noteSourceReuse: new WeakMap(),
     publicAnchorBridge,
   };
-  state.acquireCompleteTextBoxStory = (request) =>
-    acquireCompleteBodyTextBoxStory(state, storyAcquisitionContext, request);
+  state.acquireCompleteTextBoxStory = (owner, request) =>
+    acquireCompleteBodyTextBoxStory(owner, storyAcquisitionContext, request);
   const sessionDependencies = {
     source,
     dependencies,
@@ -2891,11 +2949,9 @@ function resolveShapeBox(
     const phys = resolveShapeBox(
       shape,
       verticalPhysicalContentState(state),
-      state.contentX,
+      physicalColumnTopPt(state, state.verticalPhys),
     );
-    return physicalToLogicalAnchorBox(
-      phys.x, phys.y, phys.w, phys.h, state.verticalPhys.physicalPageWidthPt,
-    );
+    return physicalAnchorBoxToLogical(state.verticalPhys, phys.x, phys.y, phys.w, phys.h);
   }
   // ECMA-376 §20.4.2.18: when wp14:sizeRelH/sizeRelV is present it overrides
   // the static wp:extent for that axis. The size is `relativeFrom` container
@@ -3013,6 +3069,51 @@ const __test_preRegisterPageFloats = (
  *  read are overridden (page size, margins, and `pageH`); everything else is
  *  the live logical state. Callers map the resolved physical box back into the
  *  logical layout frame with {@link physicalToLogicalAnchorBox}. */
+/** Physical y of the anchor paragraph's column top: the logical inline start
+ * in the clockwise frame (physical y = logical x), and the logical inline end
+ * in a native counter-clockwise frame (physical y = page height - logical x).
+ * The native case is the same generic library policy transformed through its
+ * own frame, not an observed Word placement. */
+function physicalColumnTopPt(
+  state: AnchorFloatRegistrationState,
+  frame: PhysicalAnchorFrame,
+): number {
+  return frame.nativeSectionFlow == null
+    ? state.contentX
+    : frame.pageHeight - (state.contentX + state.contentW);
+}
+
+/** Project a box resolved on the upright physical page into the section's
+ * logical frame. The Transitional vertical frame keeps its established
+ * clockwise projection; a native BtoT frame applies the inverse of its
+ * counter-clockwise matrix (logical x = page height - physical y, logical
+ * y = physical x). */
+function physicalAnchorBoxToLogical(
+  frame: PhysicalAnchorFrame,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+): { x: number; y: number; w: number; h: number } {
+  if (frame.nativeSectionFlow == null) {
+    return physicalToLogicalAnchorBox(x, y, w, h, frame.physicalPageWidthPt);
+  }
+  return { x: frame.pageHeight - (y + h), y: x, w: h, h: w };
+}
+
+/** Relabel physical dist* padding with the logical edges of the box. Clockwise:
+ * physical top/bottom are logical left/right and physical right/left are
+ * logical top/bottom. Native BtoT: physical bottom/top are logical left/right
+ * and physical left/right are logical top/bottom. */
+function physicalDistToLogical(
+  frame: PhysicalAnchorFrame,
+  dist: Readonly<{ dl: number; dr: number; dt: number; db: number }>,
+): { dl: number; dr: number; dt: number; db: number } {
+  return frame.nativeSectionFlow == null
+    ? { dl: dist.dt, dr: dist.db, dt: dist.dr, db: dist.dl }
+    : { dl: dist.db, dr: dist.dt, dt: dist.dl, db: dist.dr };
+}
+
 function physicalAnchorState(
   state: AnchorFloatRegistrationState,
 ): AnchorFloatRegistrationState {
@@ -3039,7 +3140,9 @@ function physicalAnchorState(
  *  the vertical flags (no per-glyph counter-rotation, no +90° text-layer
  *  transform, `resolveShapeBox`/`resolveAnchorBox` take their horizontal path).
  *  `floats` is fresh: the live float set is in LOGICAL flow coordinates and must
- *  not leak into a physical-frame layout (and vice-versa). */
+ *  not leak into a physical-frame layout (and vice-versa). Clearing
+ *  `verticalPhys` also drops any native section frame; the anchor geometry
+ *  consumers of this view read only its physical page facts. */
 function verticalPhysicalContentState(
   state: AnchorFloatRegistrationState,
 ): AnchorFloatRegistrationState {
@@ -3105,21 +3208,16 @@ function resolveAnchorBox(
       img.anchorXRelativeFrom ?? null, null, null,
     );
     const py = resolveAnchorY(
-      img.anchorYAlign, img.anchorYFromPara ?? false, img.anchorYPt ?? 0, h, state.contentX, phys,
+      img.anchorYAlign, img.anchorYFromPara ?? false, img.anchorYPt ?? 0, h,
+      physicalColumnTopPt(state, state.verticalPhys), phys,
       img.anchorYRelativeFrom ?? null, null, null,
     );
-    const box = physicalToLogicalAnchorBox(
-      px,
-      py,
-      w,
-      h,
-      state.verticalPhys.physicalPageWidthPt,
-    );
-    // Rotate the dist* padding one quarter-turn with the box: physical top/bottom
-    // become logical left/right; physical right/left become logical top/bottom
-    // (logical y runs opposite physical x). Symmetric wrapSquare dist is common,
-    // but rotate the labels so asymmetric dist stays correct.
-    return { x: box.x, y: box.y, w: box.w, h: box.h, dl: dt, dr: db, dt: dr, db: dl };
+    const box = physicalAnchorBoxToLogical(state.verticalPhys, px, py, w, h);
+    // Rotate the dist* padding one quarter-turn with the box. Symmetric
+    // wrapSquare dist is common, but rotate the labels so asymmetric dist
+    // stays correct.
+    const logicalDist = physicalDistToLogical(state.verticalPhys, { dl, dr, dt, db });
+    return { x: box.x, y: box.y, w: box.w, h: box.h, ...logicalDist };
   }
   const x = resolveAnchorX(
     img.anchorXAlign, img.anchorXFromMargin ?? false, img.anchorXPt ?? 0, w, state,
@@ -3334,20 +3432,18 @@ function registerShapeFloat(
   const mode: 'square' | 'topAndBottom' =
     shape.wrapMode === 'topAndBottom' ? 'topAndBottom' : 'square';
 
-  const pdl = shape.distLeft ?? 0;
-  const pdr = shape.distRight ?? 0;
-  const pdt = shape.distTop ?? 0;
-  const pdb = shape.distBottom ?? 0;
+  const physicalDist = {
+    dl: shape.distLeft ?? 0,
+    dr: shape.distRight ?? 0,
+    dt: shape.distTop ?? 0,
+    db: shape.distBottom ?? 0,
+  };
   // §17.6.20 — on a vertical page the box above is the LOGICAL projection of the
   // physically-resolved shape (resolveShapeBox), so rotate the dist* labels one
-  // quarter-turn with it, exactly like the image path (resolveAnchorBox):
-  // physical top/bottom ↦ logical left/right, physical right/left ↦ logical
-  // top/bottom (logical y runs opposite physical x).
-  const vertical = !!state.verticalPhys;
-  const dl = vertical ? pdt : pdl;
-  const dr = vertical ? pdb : pdr;
-  const dt = vertical ? pdr : pdt;
-  const db = vertical ? pdl : pdb;
+  // quarter-turn with it, exactly like the image path (resolveAnchorBox).
+  const { dl, dr, dt, db } = state.verticalPhys
+    ? physicalDistToLogical(state.verticalPhys, physicalDist)
+    : physicalDist;
 
   // Overlap avoidance, kept consistent with the image path. Shapes carry no
   // parsed allowOverlap field; the spec default is true (§20.4.2.3), so

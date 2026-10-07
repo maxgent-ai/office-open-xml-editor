@@ -182,6 +182,26 @@ rejected if they use custom reference marks, number restarts per section or
 per page, sections with different note numbering, or custom separator
 stories.
 
+Section text flow (MS-DOC sprmSTextFlow, an MS-ODRAW MSOTXFL value) is shown
+per section, following the basic rules of the specification:
+
+- Values 0 and 4 are horizontal. No different glyph treatment is inferred
+  for value 4 from its name.
+- Value 1 is vertical with upright East Asian characters, as before.
+- Values 3 and 5 run downward with later lines to the left and every
+  character rotated a quarter turn clockwise.
+- Value 2 runs upward with later lines to the right and every character
+  rotated a quarter turn counter-clockwise.
+
+MS-ODRAW notes that Word 2007 and 2010 place later lines of value 5 to the
+right. The file does not record which application displays it, so the
+documented basic rule is used. Word's placement of headers, footers, notes,
+anchored drawings and upright tables in value-2 sections has not been
+established. They follow the library's general placement for vertical
+sections, turned with the section's own direction, without a claim of
+matching Word. Horizontal-in-vertical runs remain supported only in value-1
+sections.
+
 ## Experimental direct PPT source
 
 Browser:

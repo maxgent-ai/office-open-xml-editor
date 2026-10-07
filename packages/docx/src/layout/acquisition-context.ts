@@ -21,7 +21,7 @@ import type {
   RetainedTableAcquisition,
   RetainedTableAcquisitionDependencies,
 } from './table-acquisition.js';
-import type { LayoutRect, LayoutServices } from './types.js';
+import type { LayoutRect, LayoutServices, NativeSectionFlow } from './types.js';
 
 /** One acquired body-table occurrence and the point-space placement facts that
  * bind it to the current retained-layout session. */
@@ -45,6 +45,15 @@ export interface PhysicalAnchorFrame {
   readonly marginTop: number;
   readonly marginBottom: number;
   readonly physicalPageWidthPt: number;
+  /** Native counter-clockwise frame; absent for the Transitional vertical
+   * frame, whose established clockwise projection is unchanged. */
+  readonly nativeSectionFlow?: NativeSectionFlow;
+}
+
+/** The authority a nested text-box story inherits from the state that owns it. */
+export interface CompleteTextBoxStoryOwner {
+  readonly sectionLayout: SectionLayoutContext;
+  readonly pageIndex: number;
 }
 
 /** Read-only page/container geometry consumed by DrawingML anchor placement. */
@@ -117,7 +126,14 @@ export interface BodyAcquisitionState extends AnchorFloatRegistrationState {
   layoutServices?: LayoutServices;
   retainedTableAcquisition:
     RetainedTableAcquisitionDependencies<BodyAcquisitionState>;
-  acquireCompleteTextBoxStory?: CompleteTextBoxStoryAcquirer;
+  /** Session-level nested story acquisition. The section and page of the
+   * state that contains the text box (body location, table cell or story
+   * candidate) are passed explicitly, so they, and the frame derived from
+   * them, govern the nested story; callers bind it per owner. */
+  acquireCompleteTextBoxStory?: (
+    owner: CompleteTextBoxStoryOwner,
+    request: Parameters<CompleteTextBoxStoryAcquirer>[0],
+  ) => ReturnType<CompleteTextBoxStoryAcquirer>;
   retainedTablesBySourceIndex: Map<number, RetainedTableRecord>;
   kinsoku: KinsokuRules;
   defaultTabPt: number;

@@ -5,7 +5,7 @@
 //! contract. Unknown installation-dependent facts fail instead of borrowing
 //! OOXML defaults or renderer heuristics.
 
-use super::{Properties, Section};
+use super::{Properties, Section, TextFlow};
 use crate::doc::unsupported;
 use docx_model::{
     ColSpec, ColumnsSpec, PageNumType, SectionGeom, SectionPageGeometryWire, SectionPlacementWire,
@@ -46,7 +46,7 @@ impl Section {
             title_page: self.properties.title,
             even_and_odd_headers,
             section_start: Some(self.properties.break_kind().to_string()),
-            text_direction: self.properties.text_flow.map(str::to_string),
+            text_direction: self.properties.text_direction().map(str::to_string),
             doc_grid_type: self.properties.grid_type().map(str::to_string),
             doc_grid_line_pitch: self.properties.grid_line_pitch(),
             doc_grid_char_space: (self.properties.grid != 0)
@@ -70,7 +70,7 @@ impl Section {
             title_page: self.properties.title,
             geom: Box::new(self.direct_geometry()?),
             page_num_type: self.properties.page_num_type(),
-            text_direction: self.properties.text_flow.map(str::to_string),
+            text_direction: self.properties.text_direction().map(str::to_string),
             placement: Box::new(self.direct_placement(ordinal)?),
         })
     }
@@ -143,6 +143,7 @@ impl Section {
                 .then_some(f64::from(self.properties.char_space)),
             gutter_pt: Some(twips_to_pt(self.properties.gutter)),
             rtl_gutter: Some(self.properties.rtl_gutter),
+            native_text_flow: self.properties.text_flow.map(TextFlow::raw),
             page_borders_authored: None,
             page_borders: None,
             page_geometry: Some(Box::new(SectionPageGeometryWire {
@@ -187,6 +188,32 @@ impl Properties {
             2 => Some("lines"),
             3 => Some("snapToChars"),
             _ => unreachable!("validated document grid"),
+        }
+    }
+
+    /// ECMA-376 17.6.20 display family of the retained MS-ODRAW 2.4.5 MSOTXFL
+    /// (MS-DOC 2.6.4 sprmSTextFlow). A Transitional token is chosen for its
+    /// display semantics in this library, not as a proven Word DOCX export:
+    /// - An absent sprmSTextFlow keeps the reader's inherited horizontal
+    ///   policy: no element, and no raw value in the placement wire.
+    /// - HorzN/HorzA share the horizontal basic rules: no element. No East
+    ///   Asian glyph rotation is inferred from the HorzA name.
+    /// - TtoBA keeps the established `tbRl` display (upright East Asian).
+    /// - TtoBN/VertN (downward, lines leftward, tops right) use the
+    ///   all-rotated clockwise `btLr` display family. MS-ODRAW records that
+    ///   Word 2007/2010 place later VertN lines to the right; that is a
+    ///   behavior of the displaying application, not a fact in the file, so
+    ///   the normative base flow is used without guessing a version.
+    /// - BtoT (upward, lines rightward, tops left) is nominally `btLr` too;
+    ///   the raw value in the private placement wire selects its canonical
+    ///   counter-clockwise frame. Word's header/footer, note, anchor and
+    ///   upright-table placement for BtoT is not established; the shared
+    ///   generic library policy applies, without a Word fidelity claim.
+    fn text_direction(&self) -> Option<&'static str> {
+        match self.text_flow? {
+            TextFlow::HorzN | TextFlow::HorzA => None,
+            TextFlow::TtoBA => Some("tbRl"),
+            TextFlow::BtoT | TextFlow::TtoBN | TextFlow::VertN => Some("btLr"),
         }
     }
 
@@ -311,7 +338,7 @@ mod tests {
         ] {
             let mut properties = complete_properties();
             properties.vertical = vertical;
-            properties.text_flow = Some("tbRl");
+            properties.text_flow = Some(TextFlow::TtoBA);
             let projected = section(properties, Some(720)).project_ending(0).unwrap();
             assert_eq!(projected.placement.v_align.as_deref(), expected);
             assert_eq!(projected.text_direction.as_deref(), Some("tbRl"));
@@ -436,6 +463,31 @@ mod tests {
     }
 
     #[test]
+    fn final_and_ending_sections_project_the_same_retained_flow() {
+        for (flow, direction) in [
+            (None, None),
+            (Some(TextFlow::HorzN), None),
+            (Some(TextFlow::TtoBA), Some("tbRl")),
+            (Some(TextFlow::BtoT), Some("btLr")),
+            (Some(TextFlow::TtoBN), Some("btLr")),
+            (Some(TextFlow::HorzA), None),
+            (Some(TextFlow::VertN), Some("btLr")),
+        ] {
+            let mut properties = complete_properties();
+            properties.text_flow = flow;
+            let source = section(properties, Some(720));
+            let raw = flow.map(TextFlow::raw);
+            let projected = source.project_final(0, false).unwrap();
+            assert_eq!(projected.text_direction.as_deref(), direction, "{flow:?}");
+            let placement = projected.section_placement.unwrap();
+            assert_eq!(placement.native_text_flow, raw, "{flow:?}");
+            let ending = source.project_ending(0).unwrap();
+            assert_eq!(ending.text_direction.as_deref(), direction, "{flow:?}");
+            assert_eq!(ending.placement.native_text_flow, raw, "{flow:?}");
+        }
+    }
+
+    #[test]
     fn dormant_line_pitch_does_not_leak_when_grid_is_disabled() {
         let mut properties = complete_properties();
         properties.line_pitch = Some(360);
@@ -466,7 +518,7 @@ mod tests {
         properties.grid = 2;
         properties.line_pitch = Some(360);
         properties.char_space = -4096;
-        properties.text_flow = Some("tbRl");
+        properties.text_flow = Some(TextFlow::TtoBA);
         properties.page_restart = true;
         properties.page_start = 7;
         properties.page_format = "lowerRoman";
@@ -485,8 +537,8 @@ mod tests {
         let mut expected = serde_json::json!({
             "__sectionPlacement": {
                 "docGridCharSpace": -4096.0, "docGridLinePitch": 18.0, "docGridType": "lines",
-                "gutterPt": 12.0, "pageGeometry": geometry, "rtlGutter": false,
-                "sectionBidi": true, "sectionId": "section:0", "vAlign": "both"
+                "gutterPt": 12.0, "nativeTextFlow": 1, "pageGeometry": geometry,
+                "rtlGutter": false, "sectionBidi": true, "sectionId": "section:0", "vAlign": "both"
             },
             "columns": {"cols": [], "count": 2, "equalWidth": true, "sep": true, "spacePt": 0.0},
             "docGridCharSpace": -4096.0, "docGridLinePitch": 18.0, "docGridType": "lines",
