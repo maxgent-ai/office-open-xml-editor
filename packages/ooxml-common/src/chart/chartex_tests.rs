@@ -105,6 +105,7 @@ mod tests {
             allocation_chart(&[4; 4], true).replace("clusteredColumn", "boxWhisker"),
             formula_allocation_chart(4096),
             shared_rich_run_chart(4, 8),
+            dense_aggregation_projection_chart(),
         ] {
             let (lower, canonical) = canonical_retention(&xml);
             assert!(lower <= canonical.retained_bytes());
@@ -120,6 +121,7 @@ mod tests {
             formula_allocation_chart(4096),
             later_owner_pareto_chart(),
             shared_rich_run_chart(4, 8),
+            dense_aggregation_projection_chart(),
         ];
         for xml in matrices {
             for host in [
@@ -1998,6 +2000,264 @@ mod tests {
             },
         )
         .expect("control parses")
+    }
+
+    fn aggregation_cache_data(
+        category_count: usize,
+        categories: &[(usize, &str)],
+        numeric_count: usize,
+        values: &[(usize, &str)],
+    ) -> String {
+        let points = |values: &[(usize, &str)]| {
+            values
+                .iter()
+                .map(|(index, value)| format!(r#"<cx:pt idx="{index}">{value}</cx:pt>"#))
+                .collect::<String>()
+        };
+        format!(
+            r#"<cx:data id="0"><cx:strDim type="cat"><cx:lvl ptCount="{category_count}">{}</cx:lvl></cx:strDim><cx:numDim type="val"><cx:lvl ptCount="{numeric_count}">{}</cx:lvl></cx:numDim></cx:data>"#,
+            points(categories),
+            points(values)
+        )
+    }
+
+    const AGGREGATED_COLUMN: &str = r#"<cx:series layoutId="clusteredColumn"><cx:dataId val="0"/><cx:layoutPr><cx:aggregation/></cx:layoutPr></cx:series>"#;
+
+    fn dense_aggregation_projection_chart() -> String {
+        let data = aggregation_cache_data(
+            4,
+            &[(0, "A"), (1, "B"), (2, "A"), (3, "C")],
+            5,
+            &[(0, "10"), (1, "20"), (2, "5"), (3, "7"), (4, "9")],
+        );
+        format!(
+            r#"<cx:chartSpace xmlns:cx="{CX_NS}"><cx:chartData>{data}</cx:chartData><cx:chart><cx:plotArea><cx:plotAreaRegion>{AGGREGATED_COLUMN}</cx:plotAreaRegion></cx:plotArea></cx:chart></cx:chartSpace>"#
+        )
+    }
+
+    #[test]
+    fn chartex_dense_aggregation_projects_mismatched_cached_widths_to_frequencies() {
+        let categories = [(0, "A"), (1, "B"), (2, "A"), (3, "C")];
+        let values = [(0, "10"), (1, "20"), (2, "5"), (3, "7"), (4, "9")];
+        for numeric_count in [3, 4, 5] {
+            let data =
+                aggregation_cache_data(4, &categories, numeric_count, &values[..numeric_count]);
+            for host in [
+                ChartHost::Word,
+                ChartHost::PowerPoint,
+                ChartHost::Excel,
+                ChartHost::Unspecified,
+            ] {
+                let model = parse_chartex_xml(&data, AGGREGATED_COLUMN, host)
+                    .expect("bounded aggregation parses");
+                if numeric_count != 4 && matches!(host, ChartHost::Word | ChartHost::PowerPoint) {
+                    assert_eq!(model.categories, ["A", "B", "C"]);
+                    assert_eq!(
+                        model.series[0].values,
+                        [Some(2.0), Some(1.0), Some(1.0)],
+                        "{host:?} width{numeric_count}"
+                    );
+                } else {
+                    let mut expected =
+                        vec![Some(15.0), Some(20.0), (numeric_count >= 4).then_some(7.0)];
+                    let mut categories = vec!["A", "B", "C"];
+                    if numeric_count == 5 {
+                        expected.push(Some(9.0));
+                        categories.push("");
+                    }
+                    assert_eq!(model.categories, categories);
+                    assert_eq!(model.series[0].values, expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn chartex_frequency_projection_keeps_incomplete_and_pareto_inputs_on_indexed_sums() {
+        let categories = [(0, "A"), (1, "B"), (2, "A"), (3, "C")];
+        let values = [(0, "10"), (1, "20"), (2, "5"), (3, "7"), (4, "9")];
+        // A sparse numeric cache, even with a wider declared extent, is outside
+        // the measured dense projection contract. Equal-width holes also sum.
+        let data = aggregation_cache_data(4, &categories, 5, &values[..4]);
+        let model = parse_chartex_xml(&data, AGGREGATED_COLUMN, ChartHost::Word).unwrap();
+        assert_eq!(model.series[0].values, [Some(15.0), Some(20.0), Some(7.0)]);
+        let data = aggregation_cache_data(4, &categories, 4, &[(0, "10"), (2, "5"), (3, "7")]);
+        let model = parse_chartex_xml(&data, AGGREGATED_COLUMN, ChartHost::Word).unwrap();
+        assert_eq!(model.series[0].values, [Some(15.0), None, Some(7.0)]);
+        for cats in [
+            vec![(0, "A"), (1, ""), (2, "A"), (3, "C")],
+            vec![(0, "A"), (2, "A"), (3, "C")],
+        ] {
+            let data = aggregation_cache_data(4, &cats, 5, &values);
+            let model = parse_chartex_xml(&data, AGGREGATED_COLUMN, ChartHost::Word).unwrap();
+            assert_eq!(model.categories, ["A", "", "C"]);
+            assert_eq!(model.series[0].values, [Some(15.0), Some(29.0), Some(7.0)]);
+        }
+        // Duplicate indices cannot pass as a complete cache merely because
+        // the number of XML points equals its declared extent.
+        let data = aggregation_cache_data(
+            4,
+            &categories,
+            5,
+            &[(0, "10"), (1, "20"), (2, "5"), (3, "7"), (3, "9")],
+        );
+        let model = parse_chartex_xml(&data, AGGREGATED_COLUMN, ChartHost::Word).unwrap();
+        assert_eq!(model.series[0].values, [Some(15.0), Some(20.0), Some(9.0)]);
+        let data = aggregation_cache_data(4, &categories, 5, &values);
+        let paired =
+            format!("{AGGREGATED_COLUMN}<cx:series layoutId=\"paretoLine\" ownerIdx=\"0\"/>");
+        let model = parse_chartex_xml(&data, &paired, ChartHost::Word).unwrap();
+        assert_eq!(
+            model.series[0].values,
+            [Some(15.0), Some(20.0), Some(7.0), Some(9.0)]
+        );
+    }
+
+    #[test]
+    fn chartex_frequency_projection_does_not_enter_mixed_binning_plots() {
+        let data = aggregation_cache_data(
+            4,
+            &[(0, "A"), (1, "B"), (2, "A"), (3, "C")],
+            5,
+            &[(0, "10"), (1, "20"), (2, "5"), (3, "7"), (4, "9")],
+        );
+        let mixed = format!("{AGGREGATED_COLUMN}<cx:series layoutId=\"clusteredColumn\"><cx:dataId val=\"0\"/><cx:layoutPr><cx:binning/></cx:layoutPr></cx:series>");
+        let model = parse_chartex_xml(&data, &mixed, ChartHost::Word).unwrap();
+        assert_eq!(
+            model.series[0].values,
+            [Some(15.0), Some(20.0), Some(7.0), Some(9.0)]
+        );
+    }
+
+    #[test]
+    fn chartex_frequency_projection_tracks_extra_series_before_visibility_filtering() {
+        let ordinary = aggregation_cache_data(2, &[(0, "X"), (1, "Y")], 2, &[(0, "8"), (1, "12")]);
+        let hidden = aggregation_cache_data(
+            4,
+            &[(0, "K"), (1, "K"), (2, "K"), (3, "L")],
+            3,
+            &[(0, "1"), (1, "2"), (2, "3")],
+        )
+        .replace("id=\"0\"", "id=\"1\"");
+        let projected = aggregation_cache_data(
+            4,
+            &[(0, "A"), (1, "B"), (2, "A"), (3, "C")],
+            5,
+            &[(0, "10"), (1, "20"), (2, "5"), (3, "7"), (4, "9")],
+        )
+        .replace("id=\"0\"", "id=\"2\"");
+        let series = format!(
+            r#"<cx:series layoutId="clusteredColumn" hidden="1"><cx:dataId val="1"/><cx:layoutPr><cx:aggregation/></cx:layoutPr></cx:series>{AGGREGATED_COLUMN}<cx:series layoutId="clusteredColumn"><cx:dataId val="2"/><cx:layoutPr><cx:aggregation/></cx:layoutPr><cx:dataPt idx="2"><cx:spPr><a:solidFill xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:srgbClr val="FF0000"/></a:solidFill></cx:spPr></cx:dataPt></cx:series>"#
+        );
+        let data = format!("{ordinary}{hidden}{projected}");
+        let model = parse_chartex_xml(&data, &series, ChartHost::Word).unwrap();
+        assert_eq!(model.categories, ["X", "Y"]);
+        assert_eq!(model.series.len(), 2);
+        assert_eq!(model.series[0].values, [Some(8.0), Some(12.0)]);
+        assert_eq!(
+            model.series[1].categories.as_deref(),
+            Some(&["A".into(), "B".into(), "C".into()][..])
+        );
+        assert_eq!(model.series[1].values, [Some(2.0), Some(1.0), Some(1.0)]);
+        assert_eq!(
+            model.series[1].data_point_overrides.as_ref().unwrap()[0].idx,
+            2
+        );
+        let excel = parse_chartex_xml(&data, &series, ChartHost::Excel).unwrap();
+        assert_eq!(excel.series.len(), 1);
+        assert_eq!(excel.series[0].values, [Some(8.0), Some(12.0)]);
+    }
+
+    #[test]
+    fn chartex_frequency_projection_requires_valid_declared_caches_and_successful_sums() {
+        let categories = [(0, "A"), (1, "B"), (2, "A"), (3, "C")];
+        let values = [(0, "10"), (1, "20"), (2, "5"), (3, "7"), (4, "9")];
+        let data = aggregation_cache_data(4, &categories, 5, &values);
+        let undeclared = data.replacen("ptCount=\"4\"", "", 1);
+        let duplicate_cat = data.replacen("</cx:lvl>", "<cx:pt idx=\"0\">A</cx:pt></cx:lvl>", 1);
+        let extra_numeric = aggregation_cache_data(
+            4,
+            &categories,
+            5,
+            &[(0, "10"), (1, "20"), (2, "5"), (3, "7"), (4, "9"), (4, "9")],
+        );
+        let outside_numeric = aggregation_cache_data(
+            4,
+            &categories,
+            5,
+            &[(0, "10"), (1, "20"), (2, "5"), (3, "7"), (4, "9"), (7, "9")],
+        );
+        for invalid in [undeclared, duplicate_cat, extra_numeric, outside_numeric] {
+            let model = parse_chartex_xml(&invalid, AGGREGATED_COLUMN, ChartHost::Word).unwrap();
+            assert_eq!(model.categories, ["A", "B", "C", ""]);
+            assert_eq!(
+                model.series[0].values,
+                [Some(15.0), Some(20.0), Some(7.0), Some(9.0)]
+            );
+        }
+        let nonfinite = aggregation_cache_data(
+            4,
+            &categories,
+            5,
+            &[(0, "10"), (1, "20"), (2, "5"), (3, "7"), (4, "NaN")],
+        );
+        let model = parse_chartex_xml(&nonfinite, AGGREGATED_COLUMN, ChartHost::Word).unwrap();
+        assert_eq!(model.series[0].values, [Some(15.0), Some(20.0), Some(7.0)]);
+        let empty = aggregation_cache_data(4, &categories, 0, &[]);
+        let model = parse_chartex_xml(&empty, AGGREGATED_COLUMN, ChartHost::Word).unwrap();
+        assert_eq!(model.categories, ["A", "B", "C"]);
+        assert_eq!(model.series[0].values, [None, None, None]);
+        let overflow = aggregation_cache_data(
+            4,
+            &categories,
+            5,
+            &[(0, "1e308"), (1, "20"), (2, "1e308"), (3, "7"), (4, "9")],
+        );
+        for host in [ChartHost::Word, ChartHost::Unspecified] {
+            let model = parse_chartex_xml(&overflow, AGGREGATED_COLUMN, host).unwrap();
+            assert_eq!(model.categories, ["A", "B", "A", "C"]);
+            assert_eq!(
+                model.series[0].values,
+                [Some(1e308), Some(20.0), Some(1e308), Some(7.0), Some(9.0)]
+            );
+        }
+        // Caches are authoritative even when the dimensions also have formulas;
+        // formula-only dimensions continue using the existing indexed resolver.
+        let cached_formula = data.replace("<cx:lvl", "<cx:f>Sheet1!$A$1:$A$5</cx:f><cx:lvl");
+        let model = parse_chartex_xml(&cached_formula, AGGREGATED_COLUMN, ChartHost::Word).unwrap();
+        assert_eq!(model.series[0].values, [Some(2.0), Some(1.0), Some(1.0)]);
+    }
+
+    #[test]
+    fn chartex_frequency_projection_cannot_bypass_canonical_admission() {
+        use crate::resource::{OoxmlFormat, ResourceGovernor};
+        // Each visible series would collapse to a single frequency point, but
+        // the authored/cache allocation is charged before any host projection.
+        let categories = (0..1000).map(|index| (index, "A")).collect::<Vec<_>>();
+        let values = (0..1001).map(|index| (index, "1")).collect::<Vec<_>>();
+        let data = aggregation_cache_data(1000, &categories, 1001, &values);
+        let series = AGGREGATED_COLUMN.repeat(512);
+        let mut violation = None;
+        for host in [
+            ChartHost::Word,
+            ChartHost::PowerPoint,
+            ChartHost::Excel,
+            ChartHost::Unspecified,
+        ] {
+            let governor =
+                ResourceGovernor::from_wasm(OoxmlFormat::Pptx, Some(0), Some(0), Some(0));
+            let _scope = governor.scope("parse-chart");
+            assert!(parse_chartex_xml(&data, &series, host).is_none());
+            let error = governor
+                .first_error()
+                .expect("canonical allocation violation");
+            assert!(error.contains("chartex-allocation"));
+            if let Some(expected) = &violation {
+                assert_eq!(&error, expected);
+            } else {
+                violation = Some(error);
+            }
+        }
     }
 
     #[test]
