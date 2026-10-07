@@ -360,8 +360,10 @@ fn read_story_range<'a>(
                 .get(file_offset..end)
                 .ok_or_else(|| unsupported("Word Unicode piece lies outside WordDocument"))?;
             let units = bytes
-                .chunks_exact(2)
-                .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]));
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|chunk| u16::from_le_bytes(*chunk));
             output.extend(char::decode_utf16(units).map(|value| value.unwrap_or('\u{fffd}')));
         }
     }

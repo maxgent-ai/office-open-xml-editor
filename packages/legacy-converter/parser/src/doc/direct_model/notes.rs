@@ -41,6 +41,10 @@ const DOP_NOTE_PROPERTIES_MAX_NFIB: u16 = 0x00d9;
 /// retain numbering/separator facts. ECMA-376 17.11.17/.18/.20 governs automatic
 /// numbering; rule geometry and continuation scope follow the library policies
 /// documented beside their gates and layout consumer.
+// The parameters are independent note, header, section and acquisition facts
+// plus the two mutable ownership budgets (formatting and model), passed
+// individually like `story::project`'s projections.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn validate(
     stories: &[Option<notes::Notes<'_>>],
     references: &notes::References,

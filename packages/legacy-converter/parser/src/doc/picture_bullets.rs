@@ -100,8 +100,10 @@ fn find(word: &[u8], table: &[u8]) -> Result<Option<std::ops::Range<usize>>, Str
         }
         offset = end;
         let matches = units
-            .chunks_exact(2)
-            .map(|unit| u16::from_le_bytes([unit[0], unit[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|unit| u16::from_le_bytes(*unit))
             .eq(NAME.encode_utf16());
         if !matches {
             continue;

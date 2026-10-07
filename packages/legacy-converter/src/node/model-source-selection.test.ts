@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { OoxmlError } from '@silurus/ooxml-core';
 import { buildCfbFixture } from '@silurus/ooxml-core/testing';
-import { buildDocFixture, buildPptFixture, buildXlsFixture } from '../test-fixtures.js';
+import { buildDocFixture, buildPptFixture, buildXlsFixture, concat, little16 } from '../test-fixtures.js';
 import { testDocSource, testPptSource, testXlsSource } from '../test-sources.js';
 import {
   materializeDocxDocument,
@@ -56,6 +56,38 @@ describe('Node openers and legacy model sources', () => {
     // drawing; reaching its fail-closed rejection proves the routing.
     await expect(materializePptxPresentation(buildPptFixture(), { modelSources: [testPptSource()] }))
       .rejects.toThrow(/UNSUPPORTED:.*no drawing/);
+  });
+
+  // MS-DOC 2.6.1 sprmCFRMarkDel (0x0800, operand 1) is deleted-revision
+  // character formatting that the direct reader does not support: its atomic
+  // gate rejects the whole model. A break control is a character with its own
+  // piece formatting, so formatting confined to that one control must reach the
+  // same gate as text, a tab or a line break, not be emitted as a plain break.
+  const deletedRevision = concat(little16(0x0800), new Uint8Array([1]));
+  const confinedToControl = (text: string) => buildDocFixture({ text, formattingRuns: [
+    { end: 1, properties: new Uint8Array() },
+    { end: 2, properties: deletedRevision },
+    { end: 4, properties: new Uint8Array() },
+  ] });
+  const unsupportedFormatting = new Error('UNSUPPORTED:direct DOC model encountered unsupported formatting');
+  const bodyTypes = (document: { body: unknown[] }) => (document.body as { type: string }[]).map(element => element.type);
+
+  it('reject unsupported character formatting confined to a line-break control', async () => {
+    await expect(materializeDocxDocument(confinedToControl('A\u000bB\r'), { modelSources: [testDocSource()] }))
+      .rejects.toThrow(unsupportedFormatting);
+  });
+
+  it.each([
+    { kind: 'page', control: '\f' },
+    { kind: 'column', control: '\u000e' },
+  ])('reject unsupported character formatting confined to a $kind break', async ({ kind, control }) => {
+    const source = testDocSource();
+    await expect(materializeDocxDocument(confinedToControl(`A${control}B\r`), { modelSources: [source] }))
+      .rejects.toThrow(unsupportedFormatting);
+    // The gate rejects this input only: the same source still opens a valid
+    // document whose plain break of the same kind is kept in the model.
+    const plain = await materializeDocxDocument(buildDocFixture({ text: `A${control}B\r` }), { modelSources: [source] });
+    expect(bodyTypes(plain)).toContain(`${kind}Break`);
   });
 
   it('reject an oversize claimed input before opening it', async () => {

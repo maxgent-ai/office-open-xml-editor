@@ -404,7 +404,7 @@ impl Options {
         if complex_end > record.payload.len() {
             return Err(unsupported("truncated Word picture options"));
         }
-        for entry in record.payload[..complex_end].chunks_exact(6) {
+        for entry in record.payload[..complex_end].as_chunks::<6>().0 {
             let key = u16_at(entry, 0)?;
             let id = key & 0x3fff;
             let value = u32_at(entry, 2)?;

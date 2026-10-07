@@ -364,7 +364,8 @@ pub struct NoteLayoutSettingsWire {
     /// DOCX and for documents without native notes. The shared consumer uses
     /// the retained rule/control and paragraph-mark metrics with reserved-story
     /// ownership. Numeric short-rule geometry remains library layout policy;
-    /// footnote continuation requires the caller's existing explicit opt-in.
+    /// continuation roles apply only while footnote continuation is enabled
+    /// (the default; an explicit `false` keeps whole-note pagination).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub native_separators: Option<Box<NativeNoteSeparatorsWire>>,
 }

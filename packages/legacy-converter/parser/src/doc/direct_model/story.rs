@@ -250,16 +250,32 @@ pub(super) fn project(
                         },
                     )?
                 }
-                Token::PageBreak | Token::ColumnBreak => budget.push(
-                    &mut paragraph.runs,
-                    DocRun::Break {
-                        break_type: if matches!(token, Token::PageBreak) {
-                            BreakType::Page
-                        } else {
-                            BreakType::Column
+                Token::PageBreak | Token::ColumnBreak => {
+                    // MS-DOC 1.3.1/2.6.1: the break control carries character
+                    // formatting. Acquire it so the atomic unsupported gate
+                    // sees break-only formatting; the break itself is emitted
+                    // unchanged.
+                    let (_, fc, piece) = story
+                        .position(cp)
+                        .ok_or_else(|| unsupported("Word break outside piece table"))?;
+                    formatting.direct_break_control(
+                        style,
+                        table_style,
+                        fc,
+                        piece.prm,
+                        &story.prcs,
+                    )?;
+                    budget.push(
+                        &mut paragraph.runs,
+                        DocRun::Break {
+                            break_type: if matches!(token, Token::PageBreak) {
+                                BreakType::Page
+                            } else {
+                                BreakType::Column
+                            },
                         },
-                    },
-                )?,
+                    )?
+                }
                 Token::Picture => {
                     let (_, fc, piece) = story
                         .position(cp)

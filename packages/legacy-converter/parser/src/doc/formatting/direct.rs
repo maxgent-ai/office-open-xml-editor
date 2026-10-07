@@ -233,6 +233,25 @@ impl Formatting<'_> {
             .direct_line_break_clears())
     }
 
+    /// Resolve the CHPX cascade of a page or column break control. MS-DOC
+    /// 1.3.1 treats these controls as characters, so they carry character
+    /// formatting resolved through the 2.6.1 cascade like any other character.
+    /// Only acquisition is performed: the existing atomic gate (unsupported
+    /// character properties, such as the library's unsupported deletion-mark
+    /// policy) applies even when that formatting is confined to the break. No
+    /// visibility or revision display behavior is inferred for the break.
+    pub(in crate::doc) fn direct_break_control(
+        &mut self,
+        paragraph_style: usize,
+        table_style: Option<TableFormattingKey>,
+        fc: usize,
+        prm: u16,
+        prcs: &[&[u8]],
+    ) -> Result<(), String> {
+        self.run_properties_with_table(paragraph_style, table_style, fc, prm, prcs)?;
+        Ok(())
+    }
+
     /// Resolve the CHPX cascade once for an inline-picture character. Visibility
     /// is a run property just as it is for text; picture acquisition must not
     /// create a resource for a vanished run.
@@ -329,8 +348,10 @@ fn revision_authors(bytes: &[u8]) -> Result<Vec<String>, String> {
         let units = bytes
             .get(offset..offset + length * 2)
             .ok_or_else(|| unsupported("truncated Word revision author name"))?
-            .chunks_exact(2)
-            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair))
             .collect::<Vec<_>>();
         authors.push(
             String::from_utf16(&units)

@@ -946,8 +946,10 @@ fn read_fonts(bytes: &[u8]) -> Result<Vec<String>, String> {
             .get(39..)
             .ok_or_else(|| unsupported("short Word font data"))?;
         let units: Vec<_> = name
-            .chunks_exact(2)
-            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| u16::from_le_bytes(*b))
             .take_while(|u| *u != 0)
             .collect();
         if units.is_empty() || units.len() * 2 + 2 > name.len() {

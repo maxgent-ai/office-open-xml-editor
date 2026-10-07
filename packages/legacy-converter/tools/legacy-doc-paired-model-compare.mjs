@@ -174,7 +174,7 @@ function context(model, resources) {
       if (interpretReferences && (key === 'styleId' || key === 'effectiveStyleId' || key === 'logicalSequenceId')) result[key] = {
         encodingClass: idClass(key, v)
       };
-      else if (interpretReferences && key === 'imagePath') {
+      else if (interpretReferences && (key === 'imagePath' || key === 'picBulletImagePath')) {
         const resource = byPath.get(v);
 
         if (!resource?.sha256)
@@ -372,6 +372,20 @@ export function projectModelMeaning(
         });
 
         counts.anchors++;
+      }
+
+      // A picture bullet is a paragraph-format-owned resource (numbering), not
+      // an image run: one marker fact per numbered paragraph, by extracted bytes.
+      if (block.numbering?.picBulletImagePath !== undefined && block.numbering?.picBulletImagePath !== null) {
+        groups.images.push({
+          owner: address,
+          kind: 'pictureBullet',
+          facts: ctx.canonical({
+            picBulletImagePath: block.numbering.picBulletImagePath
+          })
+        });
+
+        counts.images++;
       }
 
       for (const run of block.runs ?? []) {
@@ -626,7 +640,8 @@ export function compareModelMeaning(
 
   // Matching failures never establish image equivalence, even when both sides
   // report the same extraction error. Retained facts can still be inspected.
-  if (left.unavailableResources.length || right.unavailableResources.length) for (const name of ['content', 'runFormats', 'images', 'anchors']) if (categories[name].status !== 'NOT_EXERCISED') {
+  // Paragraph formats depend on resources through picture-bullet numbering.
+  if (left.unavailableResources.length || right.unavailableResources.length) for (const name of ['content', 'paragraphFormats', 'runFormats', 'images', 'anchors']) if (categories[name].status !== 'NOT_EXERCISED') {
     categories[name].equal = null;
     categories[name].status = 'INCOMPLETE_RESOURCE_EVIDENCE';
   }

@@ -921,7 +921,7 @@ mod tests {
         let list_start = table.len();
         let mut list = vec![0; 28];
         list[..4].copy_from_slice(&42i32.to_le_bytes());
-        for style in list[8..26].chunks_exact_mut(2) {
+        for style in list[8..26].as_chunks_mut::<2>().0 {
             style.copy_from_slice(&0x0fffu16.to_le_bytes());
         }
         list[26] = 1;

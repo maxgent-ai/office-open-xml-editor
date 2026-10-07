@@ -103,6 +103,73 @@ test(
   }
 );
 
+// A picture bullet is an image reference held by paragraph numbering, not by
+// an image run. Two numbered paragraphs (one marker each) and one plain one.
+const pictureBullets = path => document([
+  paragraph([text('one')], {
+    numbering: {
+      format: 'bullet',
+      text: '',
+      picBulletImagePath: path
+    }
+  }),
+  paragraph([text('two')], {
+    numbering: {
+      format: 'bullet',
+      text: '',
+      picBulletImagePath: path
+    }
+  }),
+  paragraph([text('plain')])
+]);
+
+const bulletResource = (path, sha256) => [{
+  path,
+  sha256,
+  bytes: 11
+}];
+
+test('compares picture-bullet markers by extracted bytes, not resource paths', () => {
+  const a = pictureBullets('word/media/bullet.png'), b = pictureBullets('native:3');
+
+  const compared = compareModelMeaning(a, b, {
+    resourcesA: bulletResource('word/media/bullet.png', 'a'.repeat(64)),
+    resourcesB: bulletResource('native:3', 'a'.repeat(64))
+  });
+
+  // Image-only numbering exercises images: one marker fact per numbered paragraph.
+  assert.deepEqual([compared.leftCounts.images, compared.rightCounts.images], [2, 2]);
+  assert.equal(compared.categories.images.status, 'AGREEMENT_FOR_COMPARED_FACTS');
+  assert.equal(compared.categories.images.equal, true);
+  assert.equal(compared.categories.paragraphFormats.equal, true);
+
+  // The renamed encoding path remains in the raw ledger.
+  assert.ok(compared.rawDifferences.some(d => d.path.endsWith('/numbering/picBulletImagePath')));
+});
+
+test('reports a picture-bullet byte difference in images and paragraph formats', () => {
+  const compared = compareModelMeaning(pictureBullets('word/media/bullet.png'), pictureBullets('native:3'), {
+    resourcesA: bulletResource('word/media/bullet.png', 'a'.repeat(64)),
+    resourcesB: bulletResource('native:3', 'b'.repeat(64))
+  });
+
+  assert.equal(compared.categories.images.equal, false);
+  assert.equal(compared.categories.paragraphFormats.equal, false);
+});
+
+test('does not claim picture-bullet equivalence from an unextracted resource', () => {
+  // Matching opaque paths are not evidence of equal bytes.
+  const marker = pictureBullets('native:3');
+  const compared = compareModelMeaning(marker, marker);
+
+  assert.deepEqual(compared.unavailableResources.left, ['native:3']);
+
+  for (const name of ['images', 'paragraphFormats']) {
+    assert.equal(compared.categories[name].equal, null, name);
+    assert.equal(compared.categories[name].status, 'INCOMPLETE_RESOURCE_EVIDENCE', name);
+  }
+});
+
 test(
   'renames note IDs by referenced targets while preserving duplicate and distinct ownership',
   () => {

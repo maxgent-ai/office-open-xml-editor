@@ -450,8 +450,16 @@ impl Properties {
                         1 => Some("tbRl"),
                         // Rotation variants and the Word-version-dependent
                         // VertN column direction are not inferred from this
-                        // base-flow mapping. Covered by the existing advanced
-                        // section-property omission warning.
+                        // base-flow mapping.
+                        // TODO(native section text flow): the native direct
+                        // model path drops raw 2 (BtoT), 3 (TtoBN) and 5
+                        // (VertN) here without any diagnostic. This omission
+                        // is unresolved information loss, not a claim that
+                        // they are equivalent to horizontal flow. Retain the
+                        // effective MSOTXFL until an accurate projection or an
+                        // explicit native unsupported diagnostic is approved.
+                        // HorzA (4) is a separate glyph-shaping class, not a
+                        // rotated or vertical flow, and needs its own decision.
                         2..=5 => None,
                         _ => return Err(unsupported("invalid Word section text flow")),
                     };

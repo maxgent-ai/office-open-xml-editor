@@ -26,7 +26,7 @@ fn typed_level(text: &[u8]) -> Level<'_> {
 fn list(id: i32, simple: bool) -> Vec<u8> {
     let mut bytes = vec![0; 28];
     bytes[..4].copy_from_slice(&id.to_le_bytes());
-    for style in bytes[8..26].chunks_exact_mut(2) {
+    for style in bytes[8..26].as_chunks_mut::<2>().0 {
         style.copy_from_slice(&0x0fff_u16.to_le_bytes());
     }
     bytes[26] = u8::from(simple);

@@ -624,7 +624,7 @@ impl Row {
                 if cb > 0 {
                     for (cell, bytes) in self.cells[start..start + cb / 10]
                         .iter_mut()
-                        .zip(b[1..].chunks_exact(10))
+                        .zip(b[1..].as_chunks::<10>().0)
                     {
                         cell.compatibility_shading = match Shading::read(bytes, false)? {
                             Some(value) if value.direct_facts().pattern == "nil" => {
@@ -684,7 +684,7 @@ impl Row {
 
                 let mut values = Vec::with_capacity(cb / 10);
                 let mut supported = true;
-                for (index, bytes) in b[1..].chunks_exact(10).enumerate() {
+                for (index, bytes) in b[1..].as_chunks::<10>().0.iter().enumerate() {
                     let shd_nil = Shading::is_shd_nil(bytes);
                     let value = match Shading::read(bytes, false)? {
                         Some(_) if shd_nil => self.cells[start + index]

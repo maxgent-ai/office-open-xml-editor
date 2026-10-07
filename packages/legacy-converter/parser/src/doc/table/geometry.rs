@@ -208,10 +208,15 @@ impl NativeGeometry {
         let definition_eligible = !row.autofit
             && !row.bidi
             && descriptors.len() % 20 == 0
-            && descriptors.chunks_exact(20).take(count).all(|tc| {
-                let flags = u16_at(tc, 0).unwrap_or(u16::MAX);
-                flags & !(3 << 7) == 0 && (flags >> 7) & 3 <= 2
-            });
+            && descriptors
+                .as_chunks::<20>()
+                .0
+                .iter()
+                .take(count)
+                .all(|tc| {
+                    let flags = u16_at(tc, 0).unwrap_or(u16::MAX);
+                    flags & !(3 << 7) == 0 && (flags >> 7) & 3 <= 2
+                });
         let had_overrides = self.has_overrides();
         // Count changes stay gated: native 3-to-2-to-3 TDef controls retained
         // widths even on the temporarily absent slot, whereas explicit

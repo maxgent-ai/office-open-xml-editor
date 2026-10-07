@@ -4,7 +4,7 @@ export const MAX_BODY_LAYOUT_PAGES = 10_000;
 
 /** Full-note acquisition needs a bound independent of point advance: zero-
  * height paragraphs can contain arbitrarily many source nodes. One million
- * source units is a library resource ceiling for this opt-in acquisition path,
+ * source units is a library resource ceiling for continuation-enabled acquisition,
  * independent of authored layout semantics. Count strings by UTF-16 length and every
  * container/primitive once per source occurrence before any shaping occurs. */
 export const MAX_FOOTNOTE_ACQUISITION_UNITS = 1_000_000;

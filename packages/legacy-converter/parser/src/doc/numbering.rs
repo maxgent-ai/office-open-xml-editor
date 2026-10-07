@@ -106,8 +106,8 @@ impl Level<'_> {
         let mut parts = Vec::with_capacity(placeholders.len() * 2 + 1);
         let mut literal = Vec::new();
         let mut next = 0;
-        for (index, pair) in self.text.chunks_exact(2).enumerate() {
-            let unit = u16::from_le_bytes([pair[0], pair[1]]);
+        for (index, pair) in self.text.as_chunks::<2>().0.iter().enumerate() {
+            let unit = u16::from_le_bytes(*pair);
             if let Some(&(offset, target)) = placeholders.get(next) {
                 if usize::from(offset) == index + 1 {
                     if target > current_level || unit != u16::from(target) {
@@ -207,7 +207,7 @@ impl<'a> Tables<'a> {
             // table_part already checked start + size against table.len().
             let levels_start = u32_at(word, FC_PLF_LST)? as usize + headers.len();
             let mut levels = Reader::new(&table[levels_start..]);
-            for header in headers[2..].chunks_exact(28) {
+            for header in headers[2..].as_chunks::<28>().0 {
                 let id = u32_at(header, 0)? as i32;
                 if id == -1 || by_id.insert(id, lists.len()).is_some() {
                     return Err(unsupported("invalid or duplicate Word list identifier"));
@@ -246,7 +246,7 @@ impl<'a> Tables<'a> {
             }
             budget.bytes(4 + count * 20)?;
             let headers = data.take(count * 16)?;
-            for header in headers.chunks_exact(16) {
+            for header in headers.as_chunks::<16>().0 {
                 let id = u32_at(header, 0)? as i32;
                 let list_index = *by_id.get(&id).ok_or_else(|| {
                     unsupported("Word list override references a missing definition")

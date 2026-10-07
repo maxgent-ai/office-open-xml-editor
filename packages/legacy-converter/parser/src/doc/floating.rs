@@ -626,7 +626,7 @@ impl Placement {
             .payload
             .get(..count * 6)
             .ok_or_else(|| unsupported("truncated Word placement properties"))?;
-        for p in entries.chunks_exact(6) {
+        for p in entries.as_chunks::<6>().0 {
             let key = u16_at(p, 0)?;
             let value = u32_at(p, 2)?;
             match key {

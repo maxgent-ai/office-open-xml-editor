@@ -98,8 +98,14 @@ default rule. This is not permission for a native
 producer to discard separator formatting: it must admit its formatting class
 and special-character semantics before emitting the closed shared rule fact.
 Native CP-empty, guard-only and paragraph-only stories are not implicitly
-equivalent to DOCX default or bare-empty facts. Continuation notices and
-endnote continuation are outside this footnote continuation contract.
+equivalent to DOCX default or bare-empty facts. Ordinary DOCX continuation
+notices keep no story geometry, and they and endnote continuation are outside
+this footnote continuation contract. The native (MS-DOC) footnote continuation
+notice has its own closed contract: only an empty or paragraph-only notice story
+is admitted (notice text is rejected), with its acquired paragraph and mark
+formatting. When a footnote continues, that paragraph is laid out as a story
+and reserved once at the bottom of the page's note band (§17.18.33). This is
+not general support for authored continuation notices.
 
 Word-produced controls confirm marker selection separately from geometry: at
 300pt main width, an 80-paragraph plain single-spaced note printed in Times New
