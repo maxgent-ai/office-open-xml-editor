@@ -38,6 +38,9 @@ export type FloatPlacementParticipant =
     }>
   | Readonly<FloatPlacementParticipantCore & {
       readonly kind: 'frame';
+      /** §17.18.104 framePr wrap projected by `frameWrapExclusionMode`, as on
+       * FloatRegistryEntryPt; absent projects square. */
+      readonly exclusionMode?: 'square' | 'topAndBottom';
     }>;
 
 export type FloatAvoidance =
@@ -85,10 +88,14 @@ export function floatRegistryParticipant(
       tableOverlap: entry.overlap,
     };
   }
-  return {
-    ...core,
-    kind: entry.kind === 'shape' ? 'drawingml' : 'frame',
-  };
+  if (entry.kind === 'frame') {
+    return {
+      ...core,
+      kind: 'frame',
+      ...(entry.exclusionMode ? { exclusionMode: entry.exclusionMode } : {}),
+    };
+  }
+  return { ...core, kind: 'drawingml' };
 }
 
 export function floatRectParticipant(
@@ -128,10 +135,10 @@ export function floatRectParticipant(
       tableOverlap: float.tableOverlap,
     };
   }
-  return {
-    ...core,
-    kind: float.kind === 'shape' ? 'drawingml' : 'frame',
-  };
+  // A frame's FloatRect `mode` is its frameWrapExclusionMode projection.
+  return float.kind === 'frame'
+    ? { ...core, kind: 'frame', exclusionMode: float.mode }
+    : { ...core, kind: 'drawingml' };
 }
 
 export interface FloatPlacement {
@@ -298,33 +305,69 @@ export function resolveFloatPlacement(
 }
 
 export interface ResolveBlockFlowAdmissionInput {
+  /** The block's own inline extent. */
   readonly inlineStartPt: number;
   readonly inlineEndPt: number;
+  /** The inline band of the flow lines the block occupies (its column or
+   * story band), in the same coordinate space. */
+  readonly flowBandStartPt: number;
+  readonly flowBandEndPt: number;
   readonly blockStartPt: number;
   readonly blockExtentPt: number;
   readonly blockers: readonly FloatPlacementParticipant[];
   readonly overlapEpsilonPt: number;
 }
 
+/** The inline interval over which `blocker` excludes an ordinary-flow block,
+ * or null when it never does. */
+function blockFlowExclusionInterval(
+  blocker: FloatPlacementParticipant,
+  input: ResolveBlockFlowAdmissionInput,
+): Readonly<{ startPt: number; endPt: number }> | null {
+  const own = { startPt: input.inlineStartPt, endPt: input.inlineEndPt };
+  switch (blocker.kind) {
+    // §17.4.57 floating-table text exclusion (existing library policy).
+    case 'table': return own;
+    // ECMA-376 §17.18.104: none/notBeside (topAndBottom) allow no flow
+    // content beside the frame, so every line of the band that crosses it
+    // resumes below it; around (square) leaves the remaining line space,
+    // which a block cannot share (ordinary-block policy, as for tables), so
+    // only a block that itself overlaps the frame is moved.
+    case 'frame': return (blocker.exclusionMode ?? 'square') === 'topAndBottom'
+      ? {
+          startPt: Math.min(input.flowBandStartPt, own.startPt),
+          endPt: Math.max(input.flowBandEndPt, own.endPt),
+        }
+      : own;
+    // DrawingML objects keep their established paragraph-line wrap only.
+    case 'drawingml': return null;
+  }
+}
+
 /**
- * Admit one ordinary-flow block below floating-table text exclusions.
+ * Admit one ordinary-flow block below the text exclusions it may not sit
+ * beside: floating tables and `w:framePr` frames ({@link
+ * blockFlowExclusionInterval}).
  *
  * This is not §17.4.56 float-to-float placement: the moving object is flow
- * content, so §17.4.57 exclusion bounds apply. Each move adopts the bottom of
- * an intersecting blocker. The start is monotone and every cleared blocker can
+ * content, so exclusion bounds apply. Each move adopts the bottom of an
+ * intersecting blocker. The start is monotone and every cleared blocker can
  * never intersect again, giving a hard bound of `eligible.length` moves.
  */
 export function resolveBlockFlowAdmission(
   input: ResolveBlockFlowAdmissionInput,
 ): Readonly<{ blockStartPt: number }> {
-  if (input.inlineEndPt < input.inlineStartPt || input.blockExtentPt < 0) {
+  if (input.inlineEndPt < input.inlineStartPt
+    || input.flowBandEndPt < input.flowBandStartPt
+    || input.blockExtentPt < 0) {
     throw new RangeError('Block-flow admission received a negative extent');
   }
   const eligible = input.blockers.filter((blocker) => {
+    const interval = blockFlowExclusionInterval(blocker, input);
+    if (!interval) return false;
     const bounds = blocker.exclusionBounds;
-    return blocker.kind === 'table'
-      && input.inlineEndPt - bounds.xPt > input.overlapEpsilonPt
-      && bounds.xPt + bounds.widthPt - input.inlineStartPt > input.overlapEpsilonPt;
+    return interval.endPt - bounds.xPt > input.overlapEpsilonPt
+      && bounds.xPt + bounds.widthPt - interval.startPt > input.overlapEpsilonPt;
   });
   let blockStartPt = input.blockStartPt;
   for (let moveCount = 0; moveCount <= eligible.length; moveCount += 1) {

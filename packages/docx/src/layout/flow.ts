@@ -93,14 +93,18 @@ export function layoutFlowBlocks(
     cursor = result.nextCursor;
   }
 
+  // A block with page-owned axes (a header/footer story-root cell-owner host
+  // placed by a page/margin frame) is not in this flow's coordinates, so it
+  // neither extends nor positions the flow's extent.
+  const flowOwned = blocks.filter((block) => block.kind !== 'table' || !block.ownerHostPageAxes);
   return {
     source: input.source,
     container: input.container,
     blocks,
     nextCursor: cursor,
     flowDomainId: input.container.id,
-    flowBounds: unionBounds(blocks.map((block) => block.flowBounds), input.container.bounds),
-    inkBounds: unionBounds(blocks.map((block) => block.inkBounds), input.container.bounds),
+    flowBounds: unionBounds(flowOwned.map((block) => block.flowBounds), input.container.bounds),
+    inkBounds: unionBounds(flowOwned.map((block) => block.inkBounds), input.container.bounds),
     ...(input.container.capacity === 'unbounded'
       ? {}
       : { clipBounds: input.container.bounds }),

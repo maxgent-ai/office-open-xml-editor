@@ -46,6 +46,34 @@ export function inverseMapAffinePoint(matrix: Matrix2DData, point: PointPt): Poi
   return Number.isFinite(result.xPt) && Number.isFinite(result.yPt) ? result : null;
 }
 
+/**
+ * The rectangle whose image under `matrix` is `rect`, when `matrix` maps
+ * rectangles to rectangles: a translation or scale, optionally with an exact
+ * quarter turn or reflection. Any other rotation or skew maps no rectangle
+ * to `rect`, and the result is null.
+ */
+export function inverseMapAxisAlignedRect(
+  matrix: Matrix2DData,
+  rect: Readonly<{ xPt: number; yPt: number; widthPt: number; heightPt: number }>,
+): Readonly<{ xPt: number; yPt: number; widthPt: number; heightPt: number }> | null {
+  const axisAligned = (matrix.b === 0 && matrix.c === 0) || (matrix.a === 0 && matrix.d === 0);
+  if (!axisAligned) return null;
+  const corners = [
+    { xPt: rect.xPt, yPt: rect.yPt },
+    { xPt: rect.xPt + rect.widthPt, yPt: rect.yPt + rect.heightPt },
+  ].map((corner) => inverseMapAffinePoint(matrix, corner));
+  if (corners.some((corner) => corner === null)) return null;
+  const [first, second] = corners as PointPt[];
+  const xPt = Math.min(first!.xPt, second!.xPt);
+  const yPt = Math.min(first!.yPt, second!.yPt);
+  return Object.freeze({
+    xPt,
+    yPt,
+    widthPt: Math.max(first!.xPt, second!.xPt) - xPt,
+    heightPt: Math.max(first!.yPt, second!.yPt) - yPt,
+  });
+}
+
 export function inverseMapAffineVector(
   matrix: Matrix2DData,
   vector: PointPt,

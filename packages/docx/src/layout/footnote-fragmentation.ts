@@ -82,9 +82,26 @@ export function partitionFootnote(
   capacityPt: number,
   continuationNotice?: ContinuationNoticeProvider,
   extent: FootnotePartitionExtent = 'largest',
-): Readonly<{ fragment: NoteLayout; nextCursor: FootnoteCursor | null }> | null {
+): FootnotePartition | null {
   return createFootnotePartitioner()(acquired, cursor, capacityPt, continuationNotice, extent);
 }
+
+/**
+ * A retained fragment, the cursor its note resumes at, and `hostShiftPt`:
+ * the y translation the source-cut projection gives the host flow (lines and
+ * host-following drawings) of the fragment's first retained paragraph whose
+ * text box story is band dependent, from the acquisition's story coordinates
+ * to the fragment's; 0 without one. The projection keeps the acquisition's
+ * cursor deltas, so every retained block receives that translation. A head
+ * starts at its story's origin (0); a continued tail moves up by its cut.
+ * Such a story places page-owned content against the band its acquisition is
+ * given (body-paginator.ts footnoteBandPlan), so that band must include it.
+ */
+export type FootnotePartition = Readonly<{
+  fragment: NoteLayout;
+  nextCursor: FootnoteCursor | null;
+  hostShiftPt: number;
+}>;
 
 /** `largest` keeps every complete line that fits the capacity (admission);
  * a continuing fragment reserves the page's notice inside that capacity.
@@ -160,6 +177,7 @@ export function createFootnotePartitioner(): typeof partitionFootnote {
     return Object.freeze({
       fragment: Object.freeze({ ...fragment, flowBounds: bounds, inkBounds: bounds, advancePt, trailing }),
       nextCursor: reserved.nextCursor,
+      hostShiftPt: reserved.hostShiftPt,
     });
   };
 }
@@ -169,7 +187,7 @@ function partitionIndexedFootnote(acquired: NoteLayout, cursor: FootnoteCursor |
   supports: (story: StoryLayout) => boolean,
   /** Most real lines to keep; the minimum-head extent keeps exactly one. */
   lineBudget = Number.POSITIVE_INFINITY,
-): Readonly<{ fragment: NoteLayout; nextCursor: FootnoteCursor | null }> | null {
+): FootnotePartition | null {
   if (!Number.isFinite(capacityPt) || capacityPt < 0) throw new RangeError('Invalid footnote capacity');
   // A cursor counts shaped lines, so continuing it in a different text width
   // could silently skip or repeat source text. Reflow-aware source offsets are
@@ -185,7 +203,7 @@ function partitionIndexedFootnote(acquired: NoteLayout, cursor: FootnoteCursor |
     }
   }
   if (cursor === null && acquired.advancePt <= capacityPt && lineBudget === Number.POSITIVE_INFINITY) {
-    return Object.freeze({ fragment: acquired, nextCursor: null });
+    return Object.freeze({ fragment: acquired, nextCursor: null, hostShiftPt: 0 });
   }
   let remainingLines = lineBudget;
   // The line cursor owns ordinary paragraph flow only. Table rows and framed
@@ -201,6 +219,18 @@ function partitionIndexedFootnote(acquired: NoteLayout, cursor: FootnoteCursor |
   const blocks: PaintNode[] = [];
   const startBlock = cursor?.blockIndex ?? 0;
   let nextCursor: FootnoteCursor | null = null;
+  let hostShiftPt: number | null = null;
+  // `projected` is `source` placed in the fragment; its first line is source
+  // line `lineStart` (a line-free paragraph moves by its flow origin).
+  const retain = (projected: ParagraphLayout, source: ParagraphLayout, lineStart: number) => {
+    blocks.push(projected);
+    if (hostShiftPt !== null
+      || !projected.textBoxes.some((textBox) => textBox.story.bandDependent === true)) return;
+    const first = projected.lines[0];
+    hostShiftPt = first
+      ? first.bounds.yPt - source.lines[lineStart]!.bounds.yPt
+      : projected.flowBounds.yPt - source.flowBounds.yPt;
+  };
   const cut = (block: ParagraphLayout, blockIndex: number, lineIndex: number): FootnoteCursor =>
     Object.freeze({ blockIndex, lineIndex, inlineExtentPt: acquired.flowBounds.widthPt,
       sourcePosition: lineSourcePosition(block, lineIndex, indexOf(block)) });
@@ -237,7 +267,7 @@ function partitionIndexedFootnote(acquired: NoteLayout, cursor: FootnoteCursor |
         nextCursor = cut(block, blockIndex, 0);
         break;
       }
-      blocks.push(place(block));
+      retain(place(block), block, 0);
       usedPt += block.advancePt;
       continue;
     }
@@ -269,7 +299,7 @@ function partitionIndexedFootnote(acquired: NoteLayout, cursor: FootnoteCursor |
       lineStart, lineEnd: admitted,
       continuesFromPrevious: lineStart > 0, continuesOnNext: admitted < block.lines.length,
     });
-    blocks.push(place(admittedBlock));
+    retain(place(admittedBlock), block, lineStart);
     usedPt += admittedBlock.advancePt;
     remainingLines -= admitted - lineStart;
     if (admitted < block.lines.length) {
@@ -296,6 +326,7 @@ function partitionIndexedFootnote(acquired: NoteLayout, cursor: FootnoteCursor |
       advancePt: usedPt,
     }),
     nextCursor,
+    hostShiftPt: hostShiftPt ?? 0,
   });
 }
 

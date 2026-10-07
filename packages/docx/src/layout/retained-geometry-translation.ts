@@ -1,7 +1,7 @@
 import type { AnchorFrameResult } from './anchor-frame.js';
 import type {
   BorderSegment, ClipPathData, DrawingLayout, DrawingPaintCommand, LayoutNodeId,
-  FloatingTablePositionInput, LayoutRect, LineLayout, ParagraphLayout, ParagraphPlacement, PointPt, TableLayout,
+  FloatingTablePlacementLayout, FloatingTablePositionInput, LayoutRect, LineLayout, ParagraphLayout, ParagraphPlacement, PointPt, TableLayout,
   TextBoxLayout,
 } from './types.js';
 
@@ -345,10 +345,55 @@ function translateTextBoxWithContext(
         if (block.kind === 'paragraph') {
           return translateParagraphWithContext(block, delta, context);
         }
-        if (block.kind === 'table') return translateTableLayout(block, delta);
+        if (block.kind === 'table') return translateTextBoxStoryTable(block, delta);
         throw new Error(`Text-box story contains unsupported retained node: ${block.kind}`);
       }),
     } : textBox.story,
+  };
+}
+
+/**
+ * A text box story's table moved with its story frame. The generic occurrence
+ * translator deliberately preserves page-owned resolved floats; a text box
+ * story is a rigid frame (its page frames are stated in story coordinates),
+ * so every floating-table frame moves with it.
+ */
+export function translateTextBoxStoryTable(table: TableLayout, delta: LayoutTranslation): TableLayout {
+  const translated = translateTableLayout(table, delta);
+  const sourceMemo = new Map<FloatingTablePlacementLayout, FloatingTablePlacementLayout>();
+  const translateSource = (source: FloatingTablePlacementLayout): FloatingTablePlacementLayout => {
+    const prior = sourceMemo.get(source);
+    if (prior) return prior;
+    const result = {
+      ...source,
+      anchorBounds: translateRect(source.anchorBounds, delta),
+      ...(source.columnBounds
+        ? { columnBounds: translateRect(source.columnBounds, delta) }
+        : {}),
+      child: translateTextBoxStoryTable(source.child, delta),
+    };
+    sourceMemo.set(source, result);
+    return result;
+  };
+  const floatingTables = table.floatingTables?.map(translateSource);
+  const resolvedFloatingTables = table.resolvedFloatingTables?.map(
+    (placement) => {
+      const source = translateSource(placement.source);
+      return {
+        ...placement,
+        xPt: placement.xPt + delta.xPt,
+        yPt: placement.yPt + delta.yPt,
+        bounds: translateRect(placement.bounds, delta),
+        exclusionBounds: translateRect(placement.exclusionBounds, delta),
+        source,
+        child: source.child,
+      };
+    },
+  );
+  return {
+    ...translated,
+    ...(floatingTables ? { floatingTables } : {}),
+    ...(resolvedFloatingTables ? { resolvedFloatingTables } : {}),
   };
 }
 
@@ -359,7 +404,14 @@ export function translateCompleteParagraphLayout(
   return translateParagraphLayout(paragraph, delta);
 }
 
-export function translateTableLayout(table: TableLayout, delta: LayoutTranslation): TableLayout {
+export function translateTableLayout(table: TableLayout, translation: LayoutTranslation): TableLayout {
+  // A story-root cell-owner host's page/margin axes are page coordinates,
+  // as a page-owned anchor layer's are (drawings above).
+  const pageAxes = table.ownerHostPageAxes;
+  const delta = pageAxes ? {
+    xPt: pageAxes.horizontal ? 0 : translation.xPt,
+    yPt: pageAxes.vertical ? 0 : translation.yPt,
+  } : translation;
   return {
     ...table,
     flowBounds: translateRect(table.flowBounds, delta), inkBounds: translateRect(table.inkBounds, delta),

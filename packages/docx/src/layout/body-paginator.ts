@@ -119,7 +119,12 @@ import {
   wordContinuousSectionRestartDisplayNumber,
   wordTrailingEmptyMarkAdmissionAllowancePt,
 } from './section-compatibility.js';
-import { bodyOccurrenceKey, bodyRootFloatingTablePlacementKey, sourceKey } from './source-key.js';
+import {
+  bodyOccurrenceKey,
+  bodyRootFloatingTablePlacementKey,
+  sourceKey,
+  tableFragmentStartKey,
+} from './source-key.js';
 import {
   convergeHeaderFooterReserveSteps,
   headerStoryBodyReserveExtentPt,
@@ -142,6 +147,7 @@ import type {
   PaintNode,
   ParagraphLayout,
   SourceRef,
+  StoryLayout,
   TableLayout,
   WritingMode,
 } from './types.js';
@@ -156,6 +162,7 @@ import {
   convergeExactStateSteps,
 } from './convergence.js';
 import { paginationFieldPageContexts } from './pagination-fields.js';
+import { solveExactTranslation } from './story-page-frames.js';
 
 // Resource governance independent of compatibility thresholds: each physical
 // page retains flow/paint state. Bound adversarial page generation globally.
@@ -711,28 +718,6 @@ function isUndecoratedInklessMark(layout: ParagraphLayout): boolean {
     && layout.textBoxes.length === 0;
 }
 
-function tableCursorKey(cursor: import('./table-pagination.js').TableFragmentCursor): readonly unknown[] {
-  return [
-    cursor.rowIndex,
-    cursor.rowFragmentIndex,
-    cursor.cells.map((cell) => [
-      cell.blockIndex,
-      cell.paragraphLineStart,
-      cell.nestedFragmentIndex,
-      cell.nestedCursor === null ? null : tableCursorKey(cell.nestedCursor),
-    ]),
-  ];
-}
-
-function tableFragmentStartKey(cursor: BodyTableContinuationCursor | undefined): string {
-  if (cursor === undefined) return 'root';
-  if (cursor.kind === 'table') return `table:${JSON.stringify(tableCursorKey(cursor.cursor))}`;
-  const tableCursor = cursor.cursor.tableCursor;
-  return `adjacent-table:${cursor.cursor.tableIndex}:${cursor.cursor.sourceRowIndex}:${JSON.stringify(
-    tableCursor === undefined ? null : tableCursorKey(tableCursor),
-  )}`;
-}
-
 function locationAfter(
   location: BodyAcquisitionLocation,
   blockExtentPt: number,
@@ -822,6 +807,8 @@ export type BodyPaginationPassResult = Readonly<{
   allocations: readonly BodyFlowAllocation[];
   footnoteReserveByPage: ReadonlyMap<number, number>;
   footnoteLayoutsByPage: ReadonlyMap<number, readonly NoteLayout[]>;
+  /** Non-zero source-cut shifts of continued tails (FootnotePartition.hostShiftPt). */
+  footnoteHostShiftsByPage: ReadonlyMap<number, ReadonlyMap<string, number>>;
   terminalDiagnostic: LayoutDiagnostic | null;
   /** Every read of the anchor-convergence carry, in pass order. */
   anchorInputs: readonly PageAnchorInputEvent[];
@@ -904,6 +891,7 @@ function paginationPassResult(
   allocations: readonly BodyFlowAllocation[],
   footnoteReserveByPage: ReadonlyMap<number, number>,
   footnoteLayoutsByPage: ReadonlyMap<number, readonly NoteLayout[]>,
+  footnoteHostShiftsByPage: ReadonlyMap<number, ReadonlyMap<string, number>>,
   terminalDiagnostic: LayoutDiagnostic | null,
   anchorInputs: readonly PageAnchorInputEvent[] = [],
   serializedAnchorInputs: readonly string[] = [],
@@ -923,6 +911,9 @@ function paginationPassResult(
       .filter(([pageIndex]) => retainedPageIndexes.has(pageIndex))),
     footnoteLayoutsByPage: new Map([...footnoteLayoutsByPage]
       .filter(([pageIndex]) => retainedPageIndexes.has(pageIndex))),
+    footnoteHostShiftsByPage: new Map([...footnoteHostShiftsByPage]
+      .filter(([pageIndex]) => retainedPageIndexes.has(pageIndex))
+      .map(([pageIndex, shifts]) => [pageIndex, new Map(shifts)])),
     terminalDiagnostic,
     anchorInputs: Object.freeze([...anchorInputs]),
     serializedAnchorInputs: Object.freeze([...serializedAnchorInputs]),
@@ -1190,6 +1181,9 @@ function* paginateBodyPassSteps(
   const footnoteIdsByPage = new Map<number, Set<string>>();
   const footnoteReserveByPage = new Map<number, number>();
   const footnoteLayoutsByPage = new Map<number, NoteLayout[]>();
+  // Non-zero source-cut shifts of committed continued tails, by page and note
+  // (FootnotePartition.hostShiftPt; footnoteBandPlan).
+  const footnoteHostShiftsByPage = new Map<number, Map<string, number>>();
   const pendingFootnoteContinuations = new Map<string, FootnoteCursor>();
   // Pages whose note band opens with a committed incoming tail: real
   // retained lines of a note continued from an earlier page, placed before
@@ -1269,11 +1263,13 @@ function* paginateBodyPassSteps(
     if (ids.length > 0 && !session.layoutNotes) {
       throw new Error('Footnote layout requires a note-capable layout session');
     }
+    const plannedTopsPt = reserves[state.flow.pageIndex]?.footnoteTopsPt;
     const layouts = ids.length === 0 ? Object.freeze([]) : session.layoutNotes!({
       kind: 'footnote',
       referenceIds: Object.freeze(ids),
       pageIndex: state.flow.pageIndex,
       section: location.section,
+      ...(plannedTopsPt ? { plannedTopsPt } : {}),
       container: {
         id: `notes:page:${state.flow.pageIndex}`,
         kind: 'footnote',
@@ -1365,6 +1361,9 @@ function* paginateBodyPassSteps(
     const pending = [...pendingFootnoteContinuations];
     pendingFootnoteContinuations.clear();
     const location = acquisitionLocation(state);
+    // A band-dependent tail is acquired with this page's planned band, as a
+    // head is (footnoteAdmissionForIds); the plan already includes its cut.
+    const plannedTopsPt = reserves[state.flow.pageIndex]?.footnoteTopsPt;
     for (const [pendingIndex, [id, cursor]] of pending.entries()) {
       if (!session.layoutNotes) throw new Error('Footnote continuation requires note layout');
       const [acquired] = session.layoutNotes({
@@ -1372,6 +1371,7 @@ function* paginateBodyPassSteps(
         referenceIds: Object.freeze([id]),
         pageIndex: state.flow.pageIndex,
         section: location.section,
+        ...(plannedTopsPt ? { plannedTopsPt } : {}),
         container: {
           id: `notes:page:${state.flow.pageIndex}`,
           kind: 'footnote',
@@ -1409,6 +1409,11 @@ function* paginateBodyPassSteps(
       commitFootnotes([id], [partition.fragment], partition.nextCursor
         ? [Object.freeze({ id, cursor: partition.nextCursor })]
         : []);
+      if (partition.hostShiftPt !== 0) {
+        let shifts = footnoteHostShiftsByPage.get(state.flow.pageIndex);
+        if (!shifts) footnoteHostShiftsByPage.set(state.flow.pageIndex, shifts = new Map());
+        shifts.set(id, partition.hostShiftPt);
+      }
       // The partitioner also carries a line-free paragraph on its own (an
       // empty paragraph keeps its spacing, ownership and cursor), so a
       // non-null fragment can hold no line. The carried-tail class was
@@ -1810,6 +1815,7 @@ function* paginateBodyPassSteps(
         allocations,
         footnoteReserveByPage,
         footnoteLayoutsByPage,
+        footnoteHostShiftsByPage,
         terminalDiagnostic,
       ), entryIndex);
     }
@@ -2329,7 +2335,15 @@ function* paginateBodyPassSteps(
           }
         }
       }
-      let cursor: import('./body-layout-kernel.js').BodyTableContinuationCursor | undefined;
+      let cursor: BodyTableContinuationCursor | undefined;
+      // An owner segment pending at the end of a region starts the next one
+      // as a fresh region (table-owner-runs.ts): every transition that leaves
+      // the region with a same-region entry pending passes through here.
+      const enteringFreshRegion = (
+        next: BodyTableContinuationCursor | undefined,
+      ): BodyTableContinuationCursor | undefined => next?.ownerSegmentEntry === 'same-region'
+        ? Object.freeze({ ...next, ownerSegmentEntry: 'fresh-region' as const })
+        : next;
       let complete = false;
       while (!complete) {
         const fragmentStartKey = tableFragmentStartKey(cursor);
@@ -2369,9 +2383,14 @@ function* paginateBodyPassSteps(
               acquired.layout,
               location.availableBounds.widthPt,
             );
+        // A zero-advance cell-owner host still occupies the host flow below the
+        // cursor; its footnotes are admitted against that extent, as for a
+        // placed paragraph frame. Other tables charge their block advance.
+        const flowChargePt = (block: typeof acquired): number =>
+          block.relocationBlockExtentPt ?? block.blockExtentPt;
         let lastFootnoteAdmission = Object.freeze({
           reservePt: notes.reservePt,
-          chargePt: acquired.blockExtentPt + notes.reservePt,
+          chargePt: flowChargePt(acquired) + notes.reservePt,
         });
         const seenCandidates = new Set<string>();
         // The region extent and the fragment charge reconstruct the same
@@ -2392,12 +2411,13 @@ function* paginateBodyPassSteps(
         while (
           !acquired.requiresFreshFlowRegion
           && !fitsWithinFloatingPrecision(
-            acquired.blockExtentPt + notes.reservePt,
+            flowChargePt(acquired) + notes.reservePt,
             location.availableBounds.heightPt,
           )
         ) {
           const fingerprint = JSON.stringify({
             advancePt: acquired.blockExtentPt,
+            chargePt: flowChargePt(acquired),
             nextCursor: acquired.nextCursor ?? null,
             noteIds: notes.ids,
             reservePt: notes.reservePt,
@@ -2429,7 +2449,7 @@ function* paginateBodyPassSteps(
           if (!acquired.requiresFreshFlowRegion) {
             lastFootnoteAdmission = Object.freeze({
               reservePt: notes.reservePt,
-              chargePt: acquired.blockExtentPt + notes.reservePt,
+              chargePt: flowChargePt(acquired) + notes.reservePt,
             });
           }
         }
@@ -2440,14 +2460,16 @@ function* paginateBodyPassSteps(
             freshPageExtent(state),
           );
           const rebasesFloatingTableOnFreshFrame = !state.flow.pageHasContent
-            && acquired.nextCursor?.kind === 'table'
-            && acquired.nextCursor.floatingContinuationFrame === 'fresh-text'
-            && !(cursor?.kind === 'table' && cursor.floatingContinuationFrame !== undefined);
-          if (acquired.nextCursor?.kind === 'table'
-            && acquired.nextCursor.floatingContinuationFrame !== undefined) {
+            && acquired.nextCursor?.floatingContinuationFrame === 'fresh-text'
+            && cursor?.floatingContinuationFrame === undefined;
+          // A floating continuation frame or an owner-segment entry is state
+          // the next region's request must carry; plain tables keep theirs.
+          if (acquired.nextCursor?.floatingContinuationFrame !== undefined
+            || acquired.nextCursor?.ownerSegmentEntry !== undefined) {
             cursor = acquired.nextCursor;
           }
           if (rebasesFloatingTableOnFreshFrame) continue;
+          cursor = enteringFreshRegion(cursor);
           yield* commitTransition(
             advanceColumnOrPage(state.flow, 'overflow'),
             entryIndex,
@@ -2461,6 +2483,7 @@ function* paginateBodyPassSteps(
           // The acquired table is already a coherent row fragment. A fresh
           // physical page preserves it; another same-page column cannot create
           // more room for the page-wide note band.
+          cursor = enteringFreshRegion(cursor);
           yield* commitTransition(
             advanceToPage(state.flow, state.flow.section, 'overflow'),
             entryIndex,
@@ -2526,7 +2549,8 @@ function* paginateBodyPassSteps(
             );
             hiddenOverflowPt -= pageExtentPt;
           }
-        } else if (cursor) {
+          cursor = enteringFreshRegion(cursor);
+        } else if (cursor && cursor.ownerSegmentEntry !== 'same-region') {
           yield* commitTransition(
             advanceColumnOrPage(state.flow, 'overflow'),
             entryIndex,
@@ -2571,22 +2595,157 @@ function* paginateBodyPassSteps(
     allocations,
     footnoteReserveByPage,
     footnoteLayoutsByPage,
+    footnoteHostShiftsByPage,
     terminalDiagnostic,
     anchorInputs,
     serializedAnchorInputs,
   );
 }
 
+type BandTranslation = Readonly<{ xPt: number; yPt: number }>;
+
+/**
+ * A header or footer story and the band translation that places it: the
+ * header's flow top at headerDistance, the footer's flow end at footerDistance
+ * above the page bottom. A band-dependent story (StoryLayout.bandDependent: a
+ * page- or margin-anchored root cell-owner host, or positioned tables of its
+ * tables) places that content on the page through the translation it is
+ * given, and a footer's translation depends on its extent, so such a story is
+ * laid out again until it is laid out with exactly the translation it
+ * receives (bounded; a cycle or exhaustion fails closed). Any other story is
+ * laid out once, unchanged.
+ *
+ * The translation moves along y only, so its fixed point is a root of one
+ * scalar residual, which {@link solveExactTranslation} brackets and narrows,
+ * still accepting only an exact pass. A residual that changes sign by a jump
+ * alone (e.g. a host whose notBeside/none exclusion starts to displace a
+ * following story paragraph exactly where the band would place it clear)
+ * has no fixed point and fails closed.
+ */
+function layoutBandStory(
+  layoutStory: (band?: BandTranslation) => StoryLayout,
+  kind: 'header' | 'footer',
+  geometry: Readonly<{ pageHeight: number; headerDistance: number; footerDistance: number }>,
+): Readonly<{ story: StoryLayout; translation: BandTranslation }> {
+  const translationOf = (story: StoryLayout): BandTranslation => Object.freeze({
+    xPt: 0,
+    yPt: (kind === 'header'
+      ? geometry.headerDistance
+      : geometry.pageHeight - geometry.footerDistance - story.advancePt) - story.flowBounds.yPt,
+  });
+  const unbanded = layoutStory();
+  if (!unbanded.bandDependent) {
+    return { story: unbanded, translation: translationOf(unbanded) };
+  }
+  try {
+    // The limit is a resource guard only (evaluations); exact equality of the
+    // translation a pass was laid out with and the one it implies accepts.
+    return solveExactTranslation(translationOf(unbanded).yPt, (yPt) => {
+      const story = layoutStory(Object.freeze({ xPt: 0, yPt }));
+      const translation = translationOf(story);
+      return { value: { story, translation }, implied: translation.yPt };
+    }, 16);
+  } catch (error) {
+    if (error instanceof ExactConvergenceError) {
+      throw new LayoutInvariantError(
+        'NON_CONVERGENCE',
+        `${kind} band translation did not converge (${error.reason}; ${error.states.length} states)`,
+      );
+    }
+    throw error;
+  }
+}
+
+/**
+ * The composed position of a page's footnotes. ECMA-376 17.11.21 / 17.18.34:
+ * pageBottom notes use the physical page's reserved body edge (earlier
+ * continuous regions end inside the body and must not pull the page-wide
+ * note band into preceding text); notes stack upward from it in document
+ * order. `topsPt` is each note's page-final flow top.
+ */
+function footnoteStack(
+  page: LayoutPage,
+  notes: readonly NoteLayout[],
+): Readonly<{ advancePt: number; targetTopPt: number; topsPt: readonly number[] }> {
+  const advancePt = notes.reduce((sum, note) => sum + note.advancePt, 0);
+  const blockEndPt = page.sectionRegions.at(-1)?.blockEndPt
+    ?? Math.max(
+      0,
+      page.section.geometry.pageHeight - Math.abs(page.section.geometry.marginBottom),
+    );
+  const targetTopPt = blockEndPt - advancePt;
+  let cursorPt = targetTopPt;
+  const topsPt = notes.map((note) => {
+    const topPt = cursorPt;
+    cursorPt += note.advancePt;
+    return topPt;
+  });
+  return { advancePt, targetTopPt, topsPt };
+}
+
+/**
+ * Footnote band plan (library policy): the page-final flow top of each
+ * footnote whose story is band dependent (StoryLayout.bandDependent: its
+ * tables hold §17.4.57 positioned tables, or text boxes whose stories hold
+ * them; note roots elect no cell-owner carrier, table-owner-runs.ts
+ * tableRowsElectCarriers). A footnote is
+ * laid out when its reference is admitted, before later references on the
+ * page fix the stack, so its page position is known only once the page is
+ * composed. The reserve convergence carries this observation to the next
+ * pass, which lays the note out with exactly that band, and accepts only an
+ * exact fixed point (a pass composing every such note where it was laid out
+ * for); a cycle or exhaustion fails closed there. Vertical pages keep the
+ * plan too (composed tops are logical-frame positions), although they keep
+ * no header/footer reserve.
+ *
+ * A continued tail is projected from its whole-note acquisition by its
+ * source cut (FootnotePartition.hostShiftPt), so its content reaches the
+ * page through the composed top and that shift together. The plan is that
+ * sum: the page position of the acquisition's flow top, the band its next
+ * acquisition is given. A box story in the tail then resolves its page
+ * frames through the translation its anchor paragraph finally receives, so a
+ * §17.4.57 page-anchored table in it lands on the authored page frame while
+ * its text-anchored content follows the paragraph.
+ */
+function footnoteBandPlan(
+  page: LayoutPage,
+  notes: readonly NoteLayout[],
+  hostShifts: ReadonlyMap<string, number> | undefined,
+): Readonly<Record<string, number>> | undefined {
+  if (!notes.some((note) => note.story.bandDependent)) return undefined;
+  const { topsPt } = footnoteStack(page, notes);
+  const plan: Record<string, number> = {};
+  notes.forEach((note, index) => {
+    const id = note.source.storyInstance;
+    if (note.story.bandDependent) plan[id] = topsPt[index]! + (hostShifts?.get(id) ?? 0);
+  });
+  return Object.freeze(plan);
+}
+
 function headerFooterReserves(
-  pass: Readonly<{ layout: DocumentLayout; session: BodyLayoutSession }>,
+  pass: Readonly<{
+    layout: DocumentLayout;
+    session: BodyLayoutSession;
+    footnoteLayoutsByPage: ReadonlyMap<number, readonly NoteLayout[]>;
+    footnoteHostShiftsByPage: ReadonlyMap<number, ReadonlyMap<string, number>>;
+  }>,
   owners: ReadonlyMap<string, BodySectionLayoutInput>,
 ): readonly HeaderFooterReserve[] {
   return Object.freeze(pass.layout.pages.map((page, pageIndex) => {
     if (page.parityBlank) return Object.freeze({ top: 0, bottom: 0 });
+    // A footnote's composed top is its page position in the section's logical
+    // frame in every writing mode (composePageStories stacks it there).
+    const footnoteTopsPt = footnoteBandPlan(
+      page,
+      pass.footnoteLayoutsByPage.get(page.pageIndex) ?? [],
+      pass.footnoteHostShiftsByPage.get(page.pageIndex),
+    );
     // Vertical header/footer stories paint in physical page space; charging their
     // measured overflow to the logical body interval would create a pagination-only reserve.
+    // The section's own frame decides (a native flow fact included), never
+    // the text-direction token alone; the footnote plan is kept either way.
     if (sectionWritingMode(page.section) !== 'horizontal-tb') {
-      return Object.freeze({ top: 0, bottom: 0 });
+      return Object.freeze({ top: 0, bottom: 0, ...(footnoteTopsPt ? { footnoteTopsPt } : {}) });
     }
     const owner = owners.get(page.sectionOccurrenceId);
     if (!owner) throw new Error(`Unknown body section ${page.sectionOccurrenceId}`);
@@ -2607,10 +2766,12 @@ function headerFooterReserves(
         },
       );
       if (source === null) return 0;
-      if (!pass.session.layoutStory) {
+      const layoutStory = pass.session.layoutStory;
+      if (!layoutStory) {
         throw new Error('Header/footer story layout requires a story-capable layout session');
       }
-      const story = pass.session.layoutStory({
+      // The reserve measures the story exactly as composition lays it out.
+      const { story } = layoutBandStory((band) => layoutStory({
         source,
         pageIndex: page.pageIndex,
         section: page.section,
@@ -2624,10 +2785,12 @@ function headerFooterReserves(
             heightPt: page.section.geometry.pageHeight,
           },
         },
-      });
+        ...(band ? { bandTranslationPt: band } : {}),
+      }), kind, page.section.geometry);
       return kind === 'header' ? headerStoryBodyReserveExtentPt(story) : story.advancePt;
     };
     return Object.freeze({
+      ...(footnoteTopsPt ? { footnoteTopsPt } : {}),
       top: headerFooterOverflowReservePt(
         measure('header'),
         page.section.geometry.marginTop,
@@ -2648,6 +2811,8 @@ function composePageStories(
   owners: ReadonlyMap<string, BodySectionLayoutInput>,
   footnotesByPage: ReadonlyMap<number, readonly NoteLayout[]>,
 ): DocumentLayout {
+  const storyDiagnostics: LayoutDiagnostic[] = [];
+  const visited = new WeakSet<object>();
   const pages = layout.pages.map((page, pageIndex) => {
     if (page.parityBlank) return page;
     const owner = owners.get(page.sectionOccurrenceId);
@@ -2695,7 +2860,7 @@ function composePageStories(
     const acquire = (kind: 'header' | 'footer') => {
       const source = sourceFor(kind);
       if (source === null) return null;
-      const story = session.layoutStory!({
+      const { story, translation } = layoutBandStory((band) => session.layoutStory!({
         source,
         pageIndex: page.pageIndex,
         section: pageStorySection,
@@ -2709,38 +2874,21 @@ function composePageStories(
             heightPt: geometry.pageHeight,
           },
         },
-      });
-      const targetYPt = kind === 'header'
-        ? geometry.headerDistance
-        : geometry.pageHeight - geometry.footerDistance - story.advancePt;
-      return translateStoryLayout(story, {
-        xPt: 0,
-        yPt: targetYPt - story.flowBounds.yPt,
-      });
+        ...(band ? { bandTranslationPt: band } : {}),
+      }), kind, geometry);
+      return translateStoryLayout(story, translation);
     };
     const header = acquire('header');
     const footer = acquire('footer');
     const retainedNotes = footnotesByPage.get(page.pageIndex) ?? [];
-    const noteAdvancePt = retainedNotes.reduce((sum, note) => sum + note.advancePt, 0);
-    // ECMA-376 17.11.21 / 17.18.34: pageBottom notes use the physical
-    // page's reserved body edge. Earlier continuous regions end inside the
-    // body and must not pull the page-wide note band into preceding text.
     const noteRegion = page.sectionRegions.at(-1);
-    const noteBlockEndPt = noteRegion?.blockEndPt
-      ?? Math.max(
-        0,
-        page.section.geometry.pageHeight - Math.abs(page.section.geometry.marginBottom),
-      );
-    const noteTargetTopPt = noteBlockEndPt - noteAdvancePt;
-    let noteCursorPt = noteTargetTopPt;
-    const notes = retainedNotes.map((note) => {
-      const translated = translateNoteLayout(note, {
-        xPt: 0,
-        yPt: noteCursorPt - note.flowBounds.yPt,
-      });
-      noteCursorPt += note.advancePt;
-      return translated;
-    });
+    const noteStack = footnoteStack(page, retainedNotes);
+    const noteAdvancePt = noteStack.advancePt;
+    const noteTargetTopPt = noteStack.targetTopPt;
+    const notes = retainedNotes.map((note, index) => translateNoteLayout(note, {
+      xPt: 0,
+      yPt: noteStack.topsPt[index]! - note.flowBounds.yPt,
+    }));
     const noteInlineStartPt = notes.length === 0
       ? 0
       : Math.min(...notes.map((note) => note.flowBounds.xPt));
@@ -2826,6 +2974,10 @@ function composePageStories(
         layer: 'footer', node, coordinateSpace,
       })) ?? []),
     ];
+    // The body pass collected only body diagnostics; these stories are
+    // composed here, so their own diagnostics are collected here.
+    storyDiagnostics.push(...[...(header?.blocks ?? []), ...notes, ...(footer?.blocks ?? [])]
+      .flatMap((node) => nestedStoryDiagnostics(node, visited)));
     return Object.freeze({
       ...page,
       flowDomains: Object.freeze([...page.flowDomains, ...storyDomains]),
@@ -2838,7 +2990,13 @@ function composePageStories(
       ]),
     });
   });
-  return Object.freeze({ ...layout, pages: Object.freeze(pages) });
+  return Object.freeze({
+    ...layout,
+    pages: Object.freeze(pages),
+    ...(storyDiagnostics.length > 0
+      ? { diagnostics: Object.freeze([...layout.diagnostics, ...storyDiagnostics]) }
+      : {}),
+  });
 }
 
 function composeDocumentEndnotes(
@@ -2912,8 +3070,13 @@ function composeDocumentEndnotes(
     pageFootnoteTopPt,
   );
   const id = `endnotes:page:${page.pageIndex}`;
+  // The container is the notes' painted position in the region's logical
+  // frame, so note story coordinates are that frame's page coordinates; the
+  // region's own transform (applied to the whole note layer) relates them to
+  // the physical page, as it relates the story's page frames.
   try {
     const notes = session.layoutNotes({
+      bandTranslationPt: Object.freeze({ xPt: 0, yPt: 0 }),
       kind: 'endnote',
       referenceIds: Object.freeze([...referenceIds]),
       pageIndex: page.pageIndex,
@@ -2976,7 +3139,15 @@ function composeDocumentEndnotes(
       layers: createPageLayers(entries),
       readingOrder: Object.freeze(readingOrder),
     });
-    return Object.freeze({ ...layout, pages: Object.freeze(pages) });
+    const visited = new WeakSet<object>();
+    const noteDiagnostics = notes.flatMap((note) => nestedStoryDiagnostics(note, visited));
+    return Object.freeze({
+      ...layout,
+      pages: Object.freeze(pages),
+      ...(noteDiagnostics.length > 0
+        ? { diagnostics: Object.freeze([...layout.diagnostics, ...noteDiagnostics]) }
+        : {}),
+    });
   } catch (error) {
     if (!(error instanceof NoteCapacityExceededError)
       || error.kind !== 'endnote'
@@ -3049,7 +3220,7 @@ function pageAnchorDestinationPlan(layout: DocumentLayout) {
   for (const page of layout.pages) {
     for (const node of page.layers.body) {
       if (node.kind === 'table' && !node.ordinaryFlow
-        && node.sectionFlowOwnership === 'page') {
+        && node.sectionFlowOwnership === 'page' && node.cellOwnerHost !== true) {
         // §17.4.57 permits a page-positioned table to exclude text that
         // precedes it in source order. The first pass owns its actual page and
         // fragment extent; the next pass reserves exactly that page-local box.

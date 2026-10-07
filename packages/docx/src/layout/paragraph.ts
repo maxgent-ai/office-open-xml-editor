@@ -96,8 +96,8 @@ import {
   translatePlacement,
   translatePoint,
   translateRect,
-  translateTableLayout,
   translateTextBox,
+  translateTextBoxStoryTable,
 } from './retained-geometry-translation.js';
 export { translateParagraphLayout } from './retained-geometry-translation.js';
 import { paginationFieldDependency } from './pagination-fields.js';
@@ -143,7 +143,12 @@ import {
   uprightPhysicalExtent,
   uprightResourceOrientation,
 } from './coordinate-space.js';
-import { inverseMapAffinePoint } from './affine.js';
+import { composeAffine, inverseMapAffinePoint, translationAffine } from './affine.js';
+import {
+  solveStoryPageFrames,
+  storyPageFramesThrough,
+  type StoryPageFrames,
+} from './story-page-frames.js';
 export {
   bodyFrameGroupFor,
   bodyParagraphBorderEdgesFor,
@@ -1295,6 +1300,25 @@ export interface ParagraphAcquisitionOptions {
     'page' | 'margin' | 'column' | 'pageParity'
   >>;
   readonly acquireCompleteStory?: CompleteTextBoxStoryAcquirer;
+  /**
+   * The translation from this paragraph's coordinates to the coordinates of
+   * its `anchorFrames` page that its host-following content still receives,
+   * when its acquisition knows it: none for a body paragraph, its band for a
+   * header, footer or note story given one. Absent (a table cell, whose page
+   * position only pagination knows) the page frames of its drawings' text box
+   * stories are unknown. Page-owned drawing axes never receive it.
+   */
+  readonly hostFlowPageTranslationPt?: Readonly<{ xPt: number; yPt: number }>;
+  /**
+   * The page frames that translation reaches, when they are not the
+   * `anchorFrames` page: in a text box story, the destination page carried
+   * into the coordinates its page-owned anchor axes keep
+   * (story-page-frames.ts storyAnchorPageFrames). Null where that story has
+   * no page frames (its box's placement carries no page band into it, or it
+   * is laid out before its box is placed): its drawings' text box stories
+   * then get none either.
+   */
+  readonly hostPageFrames?: StoryPageFrames | null;
   /** WORD_MODE14_TIGHT_ANCHOR_LINE_REWRAP decisions, keyed by anchor
    * occurrence: the host line top whose layout ignores that object. */
   readonly anchorLineExemptions?: ReadonlyMap<string, number>;
@@ -3347,72 +3371,6 @@ function acquireAnchorOccurrence(
   const diagnostics: LayoutDiagnostic[] = [];
   const textBoxes: TextBoxLayout[] = [];
   const textBoxIds: string[] = [];
-  const acquiredShapeTextBoxes = new Map<number, TextBoxLayout>();
-  let rect = authoredRect;
-  if (outer.run.type === 'shape' && outer.run.anchorAcquisitionInput.group === null) {
-    const source = runSource(options.source, outer.runIndex);
-    const textBoxRect = uprightTransform
-      ? logicalRectToUprightDrawingLocal(authoredRect, uprightTransform)
-      : authoredRect;
-    const acquired = acquireShapeTextBoxLayout(outer.run, textBoxRect, {
-      id: `${options.id}:anchor-textbox:${occurrenceId}:${outer.runIndex}`,
-      source,
-      flowDomainId: options.flowDomainId,
-      context: options.context,
-      measurer: options.measurer,
-      environment: uprightEnvironment,
-      input: outer.run.textBoxInput,
-      acquireCompleteStory: options.acquireCompleteStory,
-      ...(uprightTransform ? { coordinateSpace: 'upright-physical' as const } : {}),
-    });
-    // The fitted text box keeps its anchor alignment. The acquired layout is
-    // immutable retained geometry in textBoxRect's space (logical page, or the
-    // upright drawing frame whose axes are the physical anchor axes), so the
-    // alignment is a translation of that layout, not a second acquisition.
-    const fitShift = acquired
-      ? alignedAutofitTranslation(
-          outer.run.anchorAcquisitionInput,
-          baseFrames?.pageParity ?? null,
-          textBoxRect,
-          acquired.flowBounds,
-        )
-      : { xPt: 0, yPt: 0 };
-    const textBox = acquired && (fitShift.xPt !== 0 || fitShift.yPt !== 0)
-      ? translateTextBox(acquired, fitShift)
-      : acquired;
-    if (textBox) {
-      acquiredShapeTextBoxes.set(outer.runIndex, textBox);
-      rect = uprightTransform
-        ? uprightDrawingLocalRectToLogical(textBox.flowBounds, uprightTransform)
-        : textBox.flowBounds;
-    }
-  }
-  let effectiveResult = resizeResolvedAnchorGeometry(result, rect);
-  const translateAnchor = (delta: Readonly<{ xPt: number; yPt: number }>): void => {
-    rect = translateRect(rect, delta);
-    if (uprightTransform) uprightTransform = {
-      ...uprightTransform,
-      e: uprightTransform.e + delta.xPt,
-      f: uprightTransform.f + delta.yPt,
-    };
-    else {
-      const outerTextBox = acquiredShapeTextBoxes.get(outer.runIndex);
-      if (outerTextBox) {
-        acquiredShapeTextBoxes.set(
-          outer.runIndex,
-          translateTextBox(outerTextBox, delta),
-        );
-      }
-    }
-    effectiveResult = resizeResolvedAnchorGeometry(result, rect);
-  };
-  // WORD_LATER_ANCHOR_EARLIER_LINE_WRAP: a drawing carried to this page keeps
-  // the frame resolved when its anchor paragraph was first laid out.
-  const frozenFrame = options.frozenAnchorFrames?.get(occurrenceId);
-  if (frozenFrame) {
-    const delta = { xPt: frozenFrame.xPt - rect.xPt, yPt: frozenFrame.yPt - rect.yPt };
-    if (delta.xPt !== 0 || delta.yPt !== 0) translateAnchor(delta);
-  }
   if (
     behavior.allowOverlapStatus !== 'valid'
     || behavior.allowOverlap === null
@@ -3421,60 +3379,206 @@ function acquireAnchorOccurrence(
   ) {
     throw new Error('resolved anchor frame must retain overlap and cell behavior');
   }
-  const effectiveWrapBounds = effectiveResult.geometry.wrapBounds;
-  const normativeCollision = !behavior.allowOverlap;
-  if (normativeCollision) {
-    // §20.4.2.3 object collision is independent of text wrapping. An
-    // allowOverlap=true object keeps its resolved position: Word controls
-    // (issue #1623) never move such a picture away from pictures anchored in
-    // other paragraphs, in either compatibility mode, wrap kind, or reference.
-    // ECMA-376 §20.4.2.3 requires displacement for every existing object
-    // whose allowOverlap behavior makes it a collision participant.
-    // Word has one narrower composition exception: a source-later page-owned
-    // member below the already-authored layers in this SAME anchor paragraph
-    // retains its authored position. Cross-paragraph entries remain blockers.
-    const movingVerticalOwnership = anchorAxisOwnership(
-      effectiveResult,
-      'vertical',
-      behavior.layoutInCell && options.anchorCellBounds !== undefined,
-    );
-    const sameParagraphBlockers = sameParagraphCollisions.filter((entry) =>
-      !wordPreservesLowerLayerSameParagraphComposition(
-        movingVerticalOwnership,
-        behavior.relativeHeight,
-        entry.relativeHeight,
-      ));
-    const blockers: FloatPlacementParticipant[] = [...externalCollisions, ...sameParagraphBlockers]
-      .filter((entry) => entry.occurrenceId !== occurrenceId)
-      .map((entry) => ({
-        occurrenceId: entry.occurrenceId,
-        kind: 'drawingml',
-        paragraphId: 0,
-        bounds: entry.bounds,
-        exclusionBounds: entry.bounds,
-      }));
-    const page = options.anchorFrames?.page;
-    const rightBoundary = behavior.layoutInCell
-      && options.anchorCellBounds
-      ? options.anchorCellBounds.xPt + options.anchorCellBounds.widthPt
-      : page
-        ? page.xPt + page.widthPt
-        : Number.POSITIVE_INFINITY;
-    const displaced = resolveFloatPlacement({
-      moving: {
-        occurrenceId,
-        kind: 'drawingml',
-        paragraphId: 1,
-        bounds: rect,
-        exclusionBounds: effectiveWrapBounds ?? rect,
-      },
-      blockers,
-      avoidance: { kind: 'drawingml-normative' },
-      rightBoundaryPt: rightBoundary,
+  const allowOverlap = behavior.allowOverlap;
+  const layoutInCell = behavior.layoutInCell;
+  // The outer drawing's final placement. With `storyPageFrames` its text box
+  // story's page-placed content (positioned tables of its tables) resolves
+  // against those page frames (stated in the box's frame), so the placement
+  // is repeated below until they are the ones it implies.
+  const placeOuter = (storyPageFrames?: StoryPageFrames) => {
+    const acquiredShapeTextBoxes = new Map<number, TextBoxLayout>();
+    let placedRect = authoredRect;
+    let placedUpright = uprightTransform;
+    // Translation of the outer text box from the frame it was acquired in.
+    let textBoxShift = { xPt: 0, yPt: 0 };
+    if (outer.run.type === 'shape' && outer.run.anchorAcquisitionInput!.group === null) {
+      const source = runSource(options.source, outer.runIndex);
+      const textBoxRect = placedUpright
+        ? logicalRectToUprightDrawingLocal(authoredRect, placedUpright)
+        : authoredRect;
+      const acquired = acquireShapeTextBoxLayout(outer.run, textBoxRect, {
+        id: `${options.id}:anchor-textbox:${occurrenceId}:${outer.runIndex}`,
+        source,
+        flowDomainId: options.flowDomainId,
+        context: options.context,
+        measurer: options.measurer,
+        environment: uprightEnvironment,
+        input: outer.run.textBoxInput,
+        acquireCompleteStory: options.acquireCompleteStory,
+        ...(placedUpright ? { coordinateSpace: 'upright-physical' as const } : {}),
+        ...(storyPageFrames ? { pageFrames: storyPageFrames } : {}),
+      });
+      // The fitted text box keeps its anchor alignment. The acquired layout is
+      // immutable retained geometry in textBoxRect's space (logical page, or the
+      // upright drawing frame whose axes are the physical anchor axes), so the
+      // alignment is a translation of that layout, not a second acquisition.
+      const fitShift = acquired
+        ? alignedAutofitTranslation(
+            outer.run.anchorAcquisitionInput!,
+            baseFrames?.pageParity ?? null,
+            textBoxRect,
+            acquired.flowBounds,
+          )
+        : { xPt: 0, yPt: 0 };
+      const textBox = acquired && (fitShift.xPt !== 0 || fitShift.yPt !== 0)
+        ? translateTextBox(acquired, fitShift)
+        : acquired;
+      textBoxShift = fitShift;
+      if (textBox) {
+        acquiredShapeTextBoxes.set(outer.runIndex, textBox);
+        placedRect = placedUpright
+          ? uprightDrawingLocalRectToLogical(textBox.flowBounds, placedUpright)
+          : textBox.flowBounds;
+      }
+    }
+    let placedResult = resizeResolvedAnchorGeometry(result, placedRect);
+    const translateAnchor = (delta: Readonly<{ xPt: number; yPt: number }>): void => {
+      placedRect = translateRect(placedRect, delta);
+      if (placedUpright) placedUpright = {
+        ...placedUpright,
+        e: placedUpright.e + delta.xPt,
+        f: placedUpright.f + delta.yPt,
+      };
+      else {
+        const outerTextBox = acquiredShapeTextBoxes.get(outer.runIndex);
+        if (outerTextBox) {
+          acquiredShapeTextBoxes.set(
+            outer.runIndex,
+            translateTextBox(outerTextBox, delta),
+          );
+        }
+        textBoxShift = {
+          xPt: textBoxShift.xPt + delta.xPt,
+          yPt: textBoxShift.yPt + delta.yPt,
+        };
+      }
+      placedResult = resizeResolvedAnchorGeometry(result, placedRect);
+    };
+    // WORD_LATER_ANCHOR_EARLIER_LINE_WRAP: a drawing carried to this page keeps
+    // the frame resolved when its anchor paragraph was first laid out.
+    const frozenFrame = options.frozenAnchorFrames?.get(occurrenceId);
+    if (frozenFrame) {
+      const delta = { xPt: frozenFrame.xPt - placedRect.xPt, yPt: frozenFrame.yPt - placedRect.yPt };
+      if (delta.xPt !== 0 || delta.yPt !== 0) translateAnchor(delta);
+    }
+    const effectiveWrapBounds = placedResult.geometry.wrapBounds;
+    const normativeCollision = !allowOverlap;
+    if (normativeCollision) {
+      // §20.4.2.3 object collision is independent of text wrapping. An
+      // allowOverlap=true object keeps its resolved position: Word controls
+      // (issue #1623) never move such a picture away from pictures anchored in
+      // other paragraphs, in either compatibility mode, wrap kind, or reference.
+      // ECMA-376 §20.4.2.3 requires displacement for every existing object
+      // whose allowOverlap behavior makes it a collision participant.
+      // Word has one narrower composition exception: a source-later page-owned
+      // member below the already-authored layers in this SAME anchor paragraph
+      // retains its authored position. Cross-paragraph entries remain blockers.
+      const movingVerticalOwnership = anchorAxisOwnership(
+        placedResult,
+        'vertical',
+        layoutInCell && options.anchorCellBounds !== undefined,
+      );
+      const sameParagraphBlockers = sameParagraphCollisions.filter((entry) =>
+        !wordPreservesLowerLayerSameParagraphComposition(
+          movingVerticalOwnership,
+          behavior.relativeHeight!,
+          entry.relativeHeight,
+        ));
+      const blockers: FloatPlacementParticipant[] = [...externalCollisions, ...sameParagraphBlockers]
+        .filter((entry) => entry.occurrenceId !== occurrenceId)
+        .map((entry) => ({
+          occurrenceId: entry.occurrenceId,
+          kind: 'drawingml',
+          paragraphId: 0,
+          bounds: entry.bounds,
+          exclusionBounds: entry.bounds,
+        }));
+      const page = options.anchorFrames?.page;
+      const rightBoundary = layoutInCell
+        && options.anchorCellBounds
+        ? options.anchorCellBounds.xPt + options.anchorCellBounds.widthPt
+        : page
+          ? page.xPt + page.widthPt
+          : Number.POSITIVE_INFINITY;
+      const displaced = resolveFloatPlacement({
+        moving: {
+          occurrenceId,
+          kind: 'drawingml',
+          paragraphId: 1,
+          bounds: placedRect,
+          exclusionBounds: effectiveWrapBounds ?? placedRect,
+        },
+        blockers,
+        avoidance: { kind: 'drawingml-normative' },
+        rightBoundaryPt: rightBoundary,
+      });
+      const delta = displaced.displacement;
+      if (delta.xPt !== 0 || delta.yPt !== 0) translateAnchor(delta);
+    }
+    return Object.freeze({
+      acquiredShapeTextBoxes,
+      rect: placedRect,
+      uprightTransform: placedUpright,
+      effectiveResult: placedResult,
+      textBoxShift,
     });
-    const delta = displaced.displacement;
-    if (delta.xPt !== 0 || delta.yPt !== 0) translateAnchor(delta);
+  };
+  type PlacedOuter = ReturnType<typeof placeOuter>;
+  // Page frames of the outer text box's story (story-page-frames.ts): the
+  // destination page frames carried back through the drawing's final
+  // placement into the box's frame — its upright drawing transform, autofit
+  // alignment and anchor translations, then the translation host-following
+  // axes still receive (hostFlowPageTranslationPt; page-owned axes receive
+  // none, paint undoes it). Without that translation (a table cell before its
+  // pagination places it) a host-following drawing's page is unknown here.
+  const hostFlow = options.hostFlowPageTranslationPt;
+  const hostBase = options.hostPageFrames !== undefined
+    ? options.hostPageFrames
+    : baseFrames?.page && baseFrames.margin ? { page: baseFrames.page, margin: baseFrames.margin } : null;
+  const storyFramesFor = (placed: PlacedOuter): StoryPageFrames | null => {
+    if (!hostBase) return null;
+    const inCell = layoutInCell && options.anchorCellBounds !== undefined;
+    const follows = {
+      horizontal: anchorAxisOwnership(placed.effectiveResult, 'horizontal', inCell) === 'host',
+      vertical: anchorAxisOwnership(placed.effectiveResult, 'vertical', inCell) === 'host',
+    };
+    if ((follows.horizontal || follows.vertical) && !hostFlow) return null;
+    const toPage = composeAffine(
+      translationAffine(
+        follows.horizontal ? hostFlow!.xPt : 0,
+        follows.vertical ? hostFlow!.yPt : 0,
+      ),
+      composeAffine(
+        placed.uprightTransform ?? { a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 },
+        translationAffine(placed.textBoxShift.xPt, placed.textBoxShift.yPt),
+      ),
+    );
+    return storyPageFramesThrough(hostBase, toPage);
+  };
+  let placedOuter = placeOuter();
+  const ownsBandDependentStory = placedOuter.acquiredShapeTextBoxes.get(outer.runIndex)
+    ?.story.bandDependent === true;
+  const startFrames = ownsBandDependentStory ? storyFramesFor(placedOuter) : null;
+  if (startFrames) {
+    try {
+      // Exact fixed point (solveStoryPageFrames); the limit is a resource
+      // guard only.
+      placedOuter = solveStoryPageFrames(startFrames, (frames) => {
+        const placed = placeOuter(frames ?? undefined);
+        return { value: placed, next: storyFramesFor(placed) };
+      }, 16);
+    } catch (error) {
+      if (error instanceof ExactConvergenceError) {
+        throw new LayoutInvariantError(
+          'NON_CONVERGENCE',
+          `anchored text-box page frames did not converge (${error.reason}; ${error.states.length} states)`,
+        );
+      }
+      throw error;
+    }
   }
+  const { acquiredShapeTextBoxes, rect, effectiveResult } = placedOuter;
+  uprightTransform = placedOuter.uprightTransform;
   for (const { run, runIndex } of ordered) {
     const source = runSource(options.source, runIndex);
     const acquisition = run.anchorAcquisitionInput as NonNullable<typeof run.anchorAcquisitionInput>;
@@ -3638,6 +3742,9 @@ export type CompleteTextBoxStoryAcquirer = (
     /** Parser-owned vertical-page drawings acquire their shape content in the
      * same upright local frame as the surrounding DrawingML geometry. */
     coordinateSpace?: 'section-logical' | 'upright-physical';
+    /** The destination page and margin rectangles in the story's own
+     * coordinates (StoryLayoutAcquisitionInput.pageFrames). */
+    pageFrames?: StoryPageFrames;
   }>,
 ) => StoryLayout;
 
@@ -3651,6 +3758,14 @@ export interface ShapeTextBoxAcquisitionOptions {
   readonly input?: TextBoxAcquisitionInput;
   readonly acquireCompleteStory?: CompleteTextBoxStoryAcquirer;
   readonly coordinateSpace?: 'section-logical' | 'upright-physical';
+  /**
+   * The destination page and margin rectangles in the coordinates of `rect`
+   * (the returned layout's, before the caller's own transforms), when the
+   * caller knows how it places the box on the page. The story's page-placed
+   * content then resolves through the box's own story placement as well
+   * (acquireShapeTextBoxLayout).
+   */
+  readonly pageFrames?: StoryPageFrames;
 }
 
 function textBoxParagraphContext(
@@ -3849,61 +3964,12 @@ function translateTextBoxStory(
     } : {}),
     blocks: story.blocks.map((block) => {
       if (block.kind === 'paragraph') return translateParagraphLayout(block, delta);
-      if (block.kind === 'table') return translateVerticalTextBoxTable(block, delta);
+      if (block.kind === 'table') return translateTextBoxStoryTable(block, delta);
       throw new Error(`Text-box story contains unsupported retained node: ${block.kind}`);
     }),
   };
 }
 
-function translateVerticalTextBoxTable(
-  table: import('./types.js').TableLayout,
-  delta: Readonly<{ xPt: number; yPt: number }>,
-): import('./types.js').TableLayout {
-  // The generic occurrence translator deliberately preserves page-owned
-  // resolved floats. This delta instead belongs to the vertical text-box's
-  // local story frame, so every floating-table frame moves with that story.
-  const translated = translateTableLayout(table, delta);
-  const sourceMemo = new Map<
-    import('./types.js').FloatingTablePlacementLayout,
-    import('./types.js').FloatingTablePlacementLayout
-  >();
-  const translateSource = (
-    source: import('./types.js').FloatingTablePlacementLayout,
-  ): import('./types.js').FloatingTablePlacementLayout => {
-    const prior = sourceMemo.get(source);
-    if (prior) return prior;
-    const result = {
-      ...source,
-      anchorBounds: translateRect(source.anchorBounds, delta),
-      ...(source.columnBounds
-        ? { columnBounds: translateRect(source.columnBounds, delta) }
-        : {}),
-      child: translateVerticalTextBoxTable(source.child, delta),
-    };
-    sourceMemo.set(source, result);
-    return result;
-  };
-  const floatingTables = table.floatingTables?.map(translateSource);
-  const resolvedFloatingTables = table.resolvedFloatingTables?.map(
-    (placement) => {
-      const source = translateSource(placement.source);
-      return {
-        ...placement,
-        xPt: placement.xPt + delta.xPt,
-        yPt: placement.yPt + delta.yPt,
-        bounds: translateRect(placement.bounds, delta),
-        exclusionBounds: translateRect(placement.exclusionBounds, delta),
-        source,
-        child: source.child,
-      };
-    },
-  );
-  return {
-    ...translated,
-    ...(floatingTables ? { floatingTables } : {}),
-    ...(resolvedFloatingTables ? { resolvedFloatingTables } : {}),
-  };
-}
 
 /**
  * Translation that keeps an aligned anchor's `wp:align` values when spAutoFit
@@ -3999,27 +4065,26 @@ export function acquireShapeTextBoxLayout(
     widthPt: Math.max(0, contentBounds.widthPt - insets.leftPt - insets.rightPt),
     heightPt: Math.max(0, contentBounds.heightPt - insets.topPt - insets.bottomPt),
   };
-  let completeStory: StoryLayout | undefined;
-  if (acquisition.kind === 'complete') {
-    if (!options.acquireCompleteStory) {
-      throw new Error('Complete text-box content requires the shared story acquisition adapter');
-    }
-    completeStory = options.acquireCompleteStory({
-      source: storySource,
-      container: {
-        id: `${options.id}:story`,
-        kind: 'textbox',
-        bounds: innerBounds,
-        ...(stackedWordArt ? { quarterTurnMath: true } : {}),
-        capacity: 'unbounded',
-        ...(stackedWordArt && shape.textWrap === 'none' ? { noWrap: true } : {}),
-      },
-      coordinateSpace: options.coordinateSpace ?? 'section-logical',
-    });
+  const acquireCompleteStory = options.acquireCompleteStory;
+  if (acquisition.kind === 'complete' && !acquireCompleteStory) {
+    throw new Error('Complete text-box content requires the shared story acquisition adapter');
   }
+  const acquireStory = (pageFrames?: StoryPageFrames): StoryLayout => acquireCompleteStory!({
+    source: storySource,
+    container: {
+      id: `${options.id}:story`,
+      kind: 'textbox',
+      bounds: innerBounds,
+      ...(stackedWordArt ? { quarterTurnMath: true } : {}),
+      capacity: 'unbounded',
+      ...(stackedWordArt && shape.textWrap === 'none' ? { noWrap: true } : {}),
+    },
+    coordinateSpace: options.coordinateSpace ?? 'section-logical',
+    ...(pageFrames ? { pageFrames } : {}),
+  });
   let yPt = contentBounds.yPt + insets.topPt;
   let previousInput: NormalizedTextBoxParagraphInput | null = null;
-  let paragraphs = normalized.map((input, blockIndex) => {
+  const paragraphs = normalized.map((input, blockIndex) => {
     const textRuns: DocRun[] = input.runs.map((run) => shapeRunToDocRun({
       text: run.text,
       fontSizePt: run.fontSizePt,
@@ -4098,109 +4163,163 @@ export function acquireShapeTextBoxLayout(
     previousInput = input;
     return verticalMode ? orientVerticalTextBoxParagraph(child, verticalMode, innerBounds, insets, stackedWordArt) : child;
   });
-  const fittedExtentPt = completeStory
-    ? Math.max(0, completeStory.advancePt + insets.topPt + insets.bottomPt)
-    : Math.max(0, yPt - contentBounds.yPt + insets.bottomPt);
-  const mayAutofit = shape.textAutofit === 'sp' && blockCount > 0
-    && (!verticalMode || normalized.every((input) => input.image === undefined));
-  const effectiveRect = mayAutofit && Number.isFinite(fittedExtentPt) && fittedExtentPt > 0
-    ? verticalMode
-      ? { ...rect, widthPt: fittedExtentPt }
-      : { ...rect, heightPt: fittedExtentPt }
-    : rect;
-  const effectiveContentBounds: LayoutRect = verticalMode ? {
-    xPt: -effectiveRect.heightPt / 2,
-    yPt: -effectiveRect.widthPt / 2,
-    widthPt: effectiveRect.heightPt,
-    heightPt: effectiveRect.widthPt,
-  } : effectiveRect;
-  if (verticalMode && effectiveRect.widthPt !== rect.widthPt && verticalMode !== 'mongolianVert') {
-    const deltaYPt = effectiveContentBounds.yPt - contentBounds.yPt;
-    paragraphs = paragraphs.map((paragraph) => translateParagraphY(paragraph, deltaYPt));
-  }
-  const effectiveInnerBounds = {
-    xPt: effectiveContentBounds.xPt + insets.leftPt,
-    yPt: effectiveContentBounds.yPt + insets.topPt,
-    widthPt: Math.max(
-      0,
-      effectiveContentBounds.widthPt - insets.leftPt - insets.rightPt,
-    ),
-    heightPt: Math.max(
-      0,
-      effectiveContentBounds.heightPt - insets.topPt - insets.bottomPt,
-    ),
-  };
-  const paragraphFlowBounds = unionLayoutRects(paragraphs.map((paragraph) => paragraph.flowBounds))
-    ?? { xPt: effectiveInnerBounds.xPt, yPt: effectiveInnerBounds.yPt, widthPt: 0, heightPt: 0 };
-  const paragraphInkBounds = unionLayoutRects(paragraphs.map((paragraph) => paragraph.inkBounds))
-    ?? { xPt: effectiveInnerBounds.xPt, yPt: effectiveInnerBounds.yPt, widthPt: 0, heightPt: 0 };
-  let story: StoryLayout = completeStory ?? {
-    story: 'textbox',
-    flowBounds: paragraphFlowBounds,
-    inkBounds: paragraphInkBounds,
-    clipBounds: effectiveInnerBounds,
-    blocks: paragraphs,
-    advancePt: Math.max(0, fittedExtentPt - insets.topPt - insets.bottomPt),
-    diagnostics: [],
-  };
-  // `story` is still in its logical block-axis frame here. Vertical text-box
-  // orientation may mirror glyph/line geometry, but `anchor` is defined against
-  // this pre-orientation text-body extent. Retain the scalar now so the later
-  // physical projection cannot change vertical anchoring semantics.
-  const anchorStoryExtentPt = wordTextBoxVisibleAnchorExtentPt(story);
-  if (completeStory && verticalMode) {
-    story = orientVerticalTextBoxStory(
-      translateTextBoxStory(
-        story,
-        effectiveContentBounds.yPt - contentBounds.yPt,
+  // The box composed around its story: autofit extent, anchor offset and
+  // orientation. `storyToBox` carries story coordinates to the coordinates of
+  // `rect`, the frame the caller places the box in.
+  const compose = (completeStory: StoryLayout | undefined): Readonly<{
+    layout: TextBoxLayout;
+    storyToBox: Matrix2DData;
+    storyFlowPt: Readonly<{ xPt: number; yPt: number }>;
+  }> => {
+    const fittedExtentPt = completeStory
+      ? Math.max(0, completeStory.advancePt + insets.topPt + insets.bottomPt)
+      : Math.max(0, yPt - contentBounds.yPt + insets.bottomPt);
+    const mayAutofit = shape.textAutofit === 'sp' && blockCount > 0
+      && (!verticalMode || normalized.every((input) => input.image === undefined));
+    const effectiveRect = mayAutofit && Number.isFinite(fittedExtentPt) && fittedExtentPt > 0
+      ? verticalMode
+        ? { ...rect, widthPt: fittedExtentPt }
+        : { ...rect, heightPt: fittedExtentPt }
+      : rect;
+    const effectiveContentBounds: LayoutRect = verticalMode ? {
+      xPt: -effectiveRect.heightPt / 2,
+      yPt: -effectiveRect.widthPt / 2,
+      widthPt: effectiveRect.heightPt,
+      heightPt: effectiveRect.widthPt,
+    } : effectiveRect;
+    const fittedParagraphs = verticalMode && effectiveRect.widthPt !== rect.widthPt
+      && verticalMode !== 'mongolianVert'
+      ? paragraphs.map((paragraph) => translateParagraphY(
+          paragraph,
+          effectiveContentBounds.yPt - contentBounds.yPt,
+        ))
+      : paragraphs;
+    const effectiveInnerBounds = {
+      xPt: effectiveContentBounds.xPt + insets.leftPt,
+      yPt: effectiveContentBounds.yPt + insets.topPt,
+      widthPt: Math.max(
+        0,
+        effectiveContentBounds.widthPt - insets.leftPt - insets.rightPt,
       ),
-      verticalMode,
-      effectiveInnerBounds,
-      insets,
-      stackedWordArt,
-    );
-  }
-  story = translateTextBoxStory(
-    story,
+      heightPt: Math.max(
+        0,
+        effectiveContentBounds.heightPt - insets.topPt - insets.bottomPt,
+      ),
+    };
+    const paragraphFlowBounds = unionLayoutRects(fittedParagraphs.map((paragraph) => paragraph.flowBounds))
+      ?? { xPt: effectiveInnerBounds.xPt, yPt: effectiveInnerBounds.yPt, widthPt: 0, heightPt: 0 };
+    const paragraphInkBounds = unionLayoutRects(fittedParagraphs.map((paragraph) => paragraph.inkBounds))
+      ?? { xPt: effectiveInnerBounds.xPt, yPt: effectiveInnerBounds.yPt, widthPt: 0, heightPt: 0 };
+    let story: StoryLayout = completeStory ?? {
+      story: 'textbox',
+      flowBounds: paragraphFlowBounds,
+      inkBounds: paragraphInkBounds,
+      clipBounds: effectiveInnerBounds,
+      blocks: fittedParagraphs,
+      advancePt: Math.max(0, fittedExtentPt - insets.topPt - insets.bottomPt),
+      diagnostics: [],
+    };
+    // `story` is still in its logical block-axis frame here. Vertical text-box
+    // orientation may mirror glyph/line geometry, but `anchor` is defined against
+    // this pre-orientation text-body extent. Retain the scalar now so the later
+    // physical projection cannot change vertical anchoring semantics.
+    const anchorStoryExtentPt = wordTextBoxVisibleAnchorExtentPt(story);
+    const fittedShiftPt = completeStory && verticalMode
+      ? effectiveContentBounds.yPt - contentBounds.yPt
+      : 0;
+    if (completeStory && verticalMode) {
+      story = orientVerticalTextBoxStory(
+        translateTextBoxStory(story, fittedShiftPt),
+        verticalMode,
+        effectiveInnerBounds,
+        insets,
+        stackedWordArt,
+      );
+    }
     // WordArt columns advance rightwards: anchoring shifts the mirrored local
     // block axis negatively so ctr/b move toward the physical trailing edge.
-    (stackedWordArt ? -1 : 1) * textBoxAnchorOffsetPt(
+    const anchorShiftPt = (stackedWordArt ? -1 : 1) * textBoxAnchorOffsetPt(
       shape.textAnchor,
       effectiveInnerBounds.heightPt,
       anchorStoryExtentPt,
-    ),
-    false,
-  );
-  // Issue #1668 Word controls: 0/30/90 degree shape rotations carry the
-  // WordArt text frame; flipH keeps it readable, flipV turns it 180 degrees.
-  // Retain the composed transform here so paint/indexing use the same frame.
-  const textRotation = stackedWordArt
-    ? ((shape.rotation ?? 0) + (shape.flipV ? 180 : 0)) * Math.PI / 180 : 0;
-  const sin = Math.sin(textRotation);
-  const cos = Math.cos(textRotation);
-  return deepFreezePlainData({
-    kind: 'textbox', id: options.id, source: normalized[0]?.source ?? storySource,
-    flowDomainId: `${options.flowDomainId}:textbox`, flowBounds: effectiveRect, inkBounds: effectiveRect,
-    ...(shape.defaultTextColor ? {
-      defaultTextColor: `#${shape.defaultTextColor.replace(/^#/u, '')}`,
-    } : {}),
-    // Word issue #1668 controls retain overflow in fixed stacked WordArt
-    // boxes (wrap square/none and multi-paragraph cases); do not add a body clip.
-    ...(shape.textAutofit === 'none' && !stackedWordArt ? { clipBounds: effectiveInnerBounds } : {}),
-    advancePt: 0, ordinaryFlow: false, story,
-    transform: verticalMode ? {
+    );
+    story = translateTextBoxStory(story, anchorShiftPt, false);
+    // Issue #1668 Word controls: 0/30/90 degree shape rotations carry the
+    // WordArt text frame; flipH keeps it readable, flipV turns it 180 degrees.
+    // Retain the composed transform here so paint/indexing use the same frame.
+    const textRotationDeg = stackedWordArt
+      ? (shape.rotation ?? 0) + (shape.flipV ? 180 : 0) : 0;
+    // Exact data for quarter turns: Math.cos(π/2) is not 0, and a quarter
+    // turn must stay one (axis-aligned) for its story's page frames.
+    const quarterTurns = Number.isInteger(textRotationDeg / 90)
+      ? (((textRotationDeg / 90) % 4) + 4) % 4
+      : null;
+    const sin = quarterTurns === null
+      ? Math.sin(textRotationDeg * Math.PI / 180) : [0, 1, 0, -1][quarterTurns]!;
+    const cos = quarterTurns === null
+      ? Math.cos(textRotationDeg * Math.PI / 180) : [1, 0, -1, 0][quarterTurns]!;
+    const transform: Matrix2DData = verticalMode ? {
       a: stackedWordArt ? -sin : 0,
       b: verticalMode === 'vert270' ? -1 : cos,
       c: verticalMode === 'vert270' ? 1 : -cos,
       d: stackedWordArt ? -sin : 0,
       e: effectiveRect.xPt + effectiveRect.widthPt / 2,
       f: effectiveRect.yPt + effectiveRect.heightPt / 2,
-    } : { a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 },
-    writingMode: shape.textVert === 'vert270' ? 'vertical-lr' : shape.textVert ? 'vertical-rl' : 'horizontal-tb',
-    insets,
-    contentBounds: effectiveContentBounds,
-    ...(verticalMode ? { verticalMode } : {}),
-  });
+    } : { a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 };
+    const layout: TextBoxLayout = deepFreezePlainData({
+      kind: 'textbox', id: options.id, source: normalized[0]?.source ?? storySource,
+      flowDomainId: `${options.flowDomainId}:textbox`, flowBounds: effectiveRect, inkBounds: effectiveRect,
+      ...(shape.defaultTextColor ? {
+        defaultTextColor: `#${shape.defaultTextColor.replace(/^#/u, '')}`,
+      } : {}),
+      // Word issue #1668 controls retain overflow in fixed stacked WordArt
+      // boxes (wrap square/none and multi-paragraph cases); do not add a body clip.
+      ...(shape.textAutofit === 'none' && !stackedWordArt ? { clipBounds: effectiveInnerBounds } : {}),
+      advancePt: 0, ordinaryFlow: false, story,
+      transform,
+      writingMode: shape.textVert === 'vert270' ? 'vertical-lr' : shape.textVert ? 'vertical-rl' : 'horizontal-tb',
+      insets,
+      contentBounds: effectiveContentBounds,
+      ...(verticalMode ? { verticalMode } : {}),
+    });
+    return {
+      layout,
+      storyToBox: composeAffine(transform, translationAffine(0, fittedShiftPt + anchorShiftPt)),
+      storyFlowPt: { xPt: 0, yPt: fittedShiftPt + anchorShiftPt },
+    };
+  };
+  if (acquisition.kind !== 'complete') return compose(undefined).layout;
+  const boxPageFrames = options.pageFrames;
+  if (!boxPageFrames) return compose(acquireStory()).layout;
+  // Page frames of the story's page-placed content (story-page-frames.ts):
+  // carried into story coordinates through the box's own story placement,
+  // which depends on the story's extent (autofit, anchor offset), which can
+  // depend on that content as placed. Solved for frames the story was laid
+  // out with that are exactly the ones its placement implies
+  // (solveStoryPageFrames); the limit only guards resources. A story without
+  // such content depends on no frames.
+  const framesFor = (composed: ReturnType<typeof compose>): StoryPageFrames | null => {
+    const frames = storyPageFramesThrough(boxPageFrames, composed.storyToBox);
+    return frames && Object.freeze({ ...frames, storyFlowPt: composed.storyFlowPt });
+  };
+  const seed = compose(acquireStory());
+  if (!seed.layout.story.bandDependent) return seed.layout;
+  const start = framesFor(seed);
+  if (!start) return seed.layout;
+  try {
+    return solveStoryPageFrames(start, (frames) => {
+      const composed = compose(frames ? acquireStory(frames) : acquireStory());
+      return { value: composed.layout, next: framesFor(composed) };
+    }, 16);
+  } catch (error) {
+    if (error instanceof ExactConvergenceError) {
+      throw new LayoutInvariantError(
+        'NON_CONVERGENCE',
+        `text-box story page frames did not converge (${error.reason}; ${error.states.length} states)`,
+      );
+    }
+    throw error;
+  }
 }
 
 /** Single acquisition seam from public/parser paragraph input to retained geometry.
@@ -4612,6 +4731,12 @@ function paragraphAcquisitionKey(
     lineOnly || !hasAnchoredPayload ? null : JSON.stringify(options.anchorCellBounds ?? null),
     lineOnly || !hasCompleteTextBox || !options.acquireCompleteStory
       ? null : cache.objectIdentity(options.acquireCompleteStory),
+    lineOnly || !hasCompleteTextBox || !options.hostFlowPageTranslationPt
+      ? null
+      : [options.hostFlowPageTranslationPt.xPt, options.hostFlowPageTranslationPt.yPt],
+    lineOnly || !hasCompleteTextBox || options.hostPageFrames === undefined
+      ? null
+      : JSON.stringify(options.hostPageFrames),
   ])}`;
 }
 
@@ -5326,6 +5451,18 @@ export function paragraphLayoutFromMeasurement(
       }
       const authoredShapeRect = inlinePlacement?.bounds ?? resolvedShapeLayoutRect(run, options);
       const textBoxId = `${options.id}:textbox:${runIndex}`;
+      // The box rides this paragraph's flow, so its story's page frames
+      // (story-page-frames.ts) are the anchor frames' page through the
+      // translation that flow still receives, when known.
+      const hostFlow = options.hostFlowPageTranslationPt;
+      const hostBase = options.hostPageFrames !== undefined
+        ? options.hostPageFrames
+        : options.anchorFrames?.page && options.anchorFrames.margin
+          ? { page: options.anchorFrames.page, margin: options.anchorFrames.margin }
+          : null;
+      const pageFrames = hostFlow && hostBase
+        ? storyPageFramesThrough(hostBase, translationAffine(hostFlow.xPt, hostFlow.yPt))
+        : null;
       const textBox = acquireShapeTextBoxLayout(run, authoredShapeRect, {
         id: textBoxId,
         source,
@@ -5335,6 +5472,7 @@ export function paragraphLayoutFromMeasurement(
         environment: options.environment,
         input: run.textBoxInput,
         acquireCompleteStory: options.acquireCompleteStory,
+        ...(pageFrames ? { pageFrames } : {}),
       });
       // The wp:inline extent is the line-flow contract. A WPS text body may
       // acquire richer internal geometry, but it must not move or resize the

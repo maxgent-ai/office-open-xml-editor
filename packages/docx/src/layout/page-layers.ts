@@ -199,8 +199,7 @@ function visitTableAnchoredDrawings(
     : frames;
   for (const row of table.rows) {
     for (const cell of row.cells) {
-      const ownsContinuationPaint = 'visualMergeOwnership' in cell
-        && cell.visualMergeOwnership === 'continuation';
+      const ownsContinuationPaint = cell.visualMergeOwnership === 'continuation';
       if (cell.verticalMerge === 'continue' && !ownsContinuationPaint) continue;
       const cellFrames = cell.clipBounds
         ? Object.freeze([...tableFrames, clipFrame(cell.clipBounds)])

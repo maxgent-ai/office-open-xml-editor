@@ -107,6 +107,24 @@ export interface ParagraphAcquisitionRuntimeCache {
  * NON_CONVERGENCE. Each paragraph retains only its two most recent placements.
  * The budget belongs to the pagination cache scope so field-convergence service
  * views cannot reset it while sharing the same retained acquisition values.
+ * Speculative re-layouts that page-placed content (header/footer root
+ * cell-owner hosts, positioned tables of story and nested tables) nests
+ * inside one another are charged to the same budget, so nested solves are
+ * bounded in aggregate, not only per loop: a story laid out for a trial band
+ * or page frames (production-body-layout.ts createStoryLayoutCache) and a
+ * nested table laid out whole through a page origin (table-pagination.ts
+ * layoutNestedWhole). Documents without such content incur none of them.
+ *
+ * Scope and cleanup: the count is owned by one pagination scope
+ * (createParagraphAcquisitionCacheServicesView, opened per document layout),
+ * never by the document services or source, so a later layout starts fresh.
+ * The miss that crosses the budget throws before its acquisition runs; the
+ * caches retain only completed acquisitions (story-layout-cache.ts) and the
+ * immutable source is never written, so a failed session leaves nothing.
+ * Converging nested solves reach their retained trial placements again and
+ * are not charged twice for them; what the budget still bounds is speculative
+ * work that keeps producing new placements, each per-solve limit permitting
+ * it (story-layout-cache.test.ts: charging, release and fail-closed order).
  */
 export const PARAGRAPH_ACQUISITION_MISS_BUDGET = 25_000;
 
@@ -226,7 +244,7 @@ function createParagraphAcquisitionRuntimeCache(): ParagraphAcquisitionRuntimeCa
       if (missCount > PARAGRAPH_ACQUISITION_MISS_BUDGET) {
         throw new LayoutInvariantError(
           'NON_CONVERGENCE',
-          `paragraph acquisition exceeded the operational miss budget ${PARAGRAPH_ACQUISITION_MISS_BUDGET}`,
+          `layout acquisition exceeded the operational miss budget ${PARAGRAPH_ACQUISITION_MISS_BUDGET}`,
         );
       }
     },
