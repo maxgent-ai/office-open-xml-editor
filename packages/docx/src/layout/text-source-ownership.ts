@@ -35,6 +35,13 @@ export function sourceOwnedTextPlacements(placement: TextPlacement): readonly So
       dependency: owner.dependency,
       range: owner.range,
       text: placement.text.slice(offset, offset + owner.range.end - owner.range.start),
+      ...(placement.semanticSlotSpans ? { semanticSlotSpans: Object.freeze(
+        placement.semanticSlotSpans.flatMap(slot => {
+          const start = Math.max(slot.start, offset);
+          const end = Math.min(slot.end, offset + owner.range.end - owner.range.start);
+          return start < end ? [Object.freeze({ ...slot, start: start - offset, end: end - offset })] : [];
+        }),
+      ) } : {}),
       origin: whole ? placement.origin : { ...placement.origin, xPt: placement.origin.xPt + from },
       bounds: whole ? placement.bounds : { ...placement.bounds, xPt: placement.bounds.xPt + from, widthPt: to - from },
       ...(placement.highlightBounds ? { highlightBounds: whole ? placement.highlightBounds : {

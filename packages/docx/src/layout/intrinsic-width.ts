@@ -196,6 +196,9 @@ function mergeCompatibleTextSegments(segments: readonly LayoutSeg[]): LayoutSeg[
       previous
       && 'text' in previous
       && 'text' in segment
+      // A compound grapheme owns one shape/paint unit; extending it here
+      // would lose that proof when the shaper rejects a multi-grapheme probe.
+      && !previous.semanticSlotSpans && !segment.semanticSlotSpans
       && compatibleText(previous, segment)
       // Included and excluded spans depend on the full run. Losing a Latin
       // base can turn its attached Arabic mark into standalone proof; losing
@@ -559,6 +562,8 @@ export function measureParagraphIntrinsicWidths(
     ...environment,
     lineSpacing: context.lineSpacing,
     lineGridActive: context.lineGrid.active,
+    characterGridActive: context.characterGrid.active,
+    paragraphRtl: context.baseRtl,
     autoSpaceDE: paragraph.autoSpaceDE,
     autoSpaceDN: paragraph.autoSpaceDN,
   }));
