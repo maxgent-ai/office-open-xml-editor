@@ -134,6 +134,18 @@ export interface BodyAcquisitionState extends AnchorFloatRegistrationState {
     owner: CompleteTextBoxStoryOwner,
     request: Parameters<CompleteTextBoxStoryAcquirer>[0],
   ) => ReturnType<CompleteTextBoxStoryAcquirer>;
+  /** A table cell paragraph re-acquired by its table's page placement (its
+   * text boxes hold page-placed content): the page translation its host flow
+   * receives there (ParagraphAcquisitionOptions.hostFlowPageTranslationPt). */
+  cellHostFlowPageTranslationPt?: Readonly<{ xPt: number; yPt: number }>;
+  /** A text box story and its tables: the page frames its page-owned anchor
+   * axes keep and the translation its flow receives to reach them
+   * (story-page-frames.ts storyAnchorPageFrames); null when its box carries
+   * no page band into it. Absent outside text box stories. */
+  textBoxStoryHostFrames?: Readonly<{
+    frames: Readonly<{ page: LayoutRect; margin: LayoutRect }>;
+    flowPt: Readonly<{ xPt: number; yPt: number }>;
+  }> | null;
   retainedTablesBySourceIndex: Map<number, RetainedTableRecord>;
   /** Set only while acquiring a body table that is placed upright in the
    * physical page (identity paint root); its cells take that frame. */

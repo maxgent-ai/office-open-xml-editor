@@ -470,9 +470,12 @@ export function paintTextBoxLayout(node: TextBoxLayout, context: CanvasPaintCont
   const documentDefaultTextColor = context.documentDefaultTextColor
     ?? context.defaultTextColor
     ?? '#000000';
+  // The story is its own coordinate root (layout/text-index.ts visitTextBox):
+  // translations that placed the box's paragraph are not undone inside it.
   const storyContext: CanvasPaintContext = {
     ...context,
     pointToCss,
+    layoutTranslationPt: { xPt: 0, yPt: 0 },
     documentDefaultTextColor,
     defaultTextColor: node.defaultTextColor ?? documentDefaultTextColor,
     ...(node.verticalMode ? { textBoxVerticalMode: node.verticalMode } : {}),

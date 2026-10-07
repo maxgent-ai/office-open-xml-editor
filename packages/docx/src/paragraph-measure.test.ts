@@ -969,6 +969,37 @@ describe('measureParagraph', () => {
     expect(first.lines.length).toBeGreaterThan(second.lines.length);
   });
 
+  it('places an unwrapped (DrawingML wrap=none) line through the same exclusion fixed point', () => {
+    // A full-band story float occupies y < 50 (e.g. a notBeside frame host).
+    // wrap=none removes the box-edge break only, so the 30-glyph text (150pt)
+    // stays one line wider than the 100pt band, and that line still starts
+    // below the float with its own allocation.
+    const wrap: WrapOracle = {
+      lineWindow: ({ topYPt, maximumWidthPt }) => ({
+        topYPt: Math.max(topYPt, 50), xOffsetPt: 0, maximumWidthPt,
+      }),
+      skipTopAndBottomBands: ({ yPt }) => yPt,
+    };
+    const doc = paragraph({
+      spaceBefore: 0,
+      runs: [{ type: 'text', ...textRun('abcdefghijklmnopqrstuvwxyzabcd') }],
+    });
+    const measured = measureParagraph(
+      doc,
+      layoutContext({ spaceBeforePt: 0 }),
+      placement({ startYPt: 10, availableWidthPt: 100, noWrap: true, wrap }),
+      measurer,
+      environment(),
+    );
+    expect(measuredTextSequence(measured)).toEqual(['abcdefghijklmnopqrstuvwxyzabcd']);
+    expect(measured.lines[0].topYPt).toBe(50);
+    expect(measured.lines[0].layout.wrapAllocation).toEqual({
+      physicalLineIndex: measured.lines[0].layout.physicalLineIndex,
+      topYPt: 50,
+      advancePt: measured.lines[0].advancePt,
+    });
+  });
+
   it('reproduces the same-width suffix from a consumed line boundary', () => {
     const doc = paragraph({
       spaceBefore: 0,

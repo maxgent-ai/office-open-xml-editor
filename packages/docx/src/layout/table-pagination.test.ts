@@ -372,6 +372,21 @@ describe('retained table pagination', () => {
       // at row 1 reaches row 3, so the window must extend to row 3.
       expect(completedPartialRowWindowEnd(rows[0]!, rows, 0)).toBe(3);
     });
+
+    it('covers the interval a projected segment-opening continuation opens', () => {
+      // A cell-owner segment whose first own row (logical row 1) opens with a
+      // continuation: in the window's grid it is a projected empty owner
+      // (table.ts projectedMergeRole) reaching the continuations below it.
+      const rows = [
+        mergedRow(1, [mergedCell(1, 0, 'none'), mergedCell(1, 1, 'continue')]),
+        mergedRow(2, [mergedCell(2, 0, 'none'), mergedCell(2, 1, 'continue')]),
+        mergedRow(3, [mergedCell(3, 0, 'none'), mergedCell(3, 1, 'continue')]),
+        mergedRow(4, [mergedCell(4, 0, 'none'), mergedCell(4, 1, 'none')]),
+      ];
+      expect(completedPartialRowWindowEnd(rows[0]!, rows, 0, 1)).toBe(2);
+      // Without the projection fact the same continuations open nothing.
+      expect(completedPartialRowWindowEnd(rows[0]!, rows, 0)).toBe(0);
+    });
   });
 
   it('keeps placed table geometry self-contained and clone-safe', () => {

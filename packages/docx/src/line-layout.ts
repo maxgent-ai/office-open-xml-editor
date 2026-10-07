@@ -131,7 +131,12 @@ export function layoutLines(
       justifiedCompression,
       { probeHeights, probeFloors, preparedFloatWrap },
     );
-    if (!wrapCtx || widthPolicy !== 'bounded') return runPass(null);
+    // DrawingML wrap=none (§21.1.2.1.1) removes only the automatic break at the
+    // text-body edge; floats of the same story (e.g. a §17.3.1.11 frame host)
+    // still exclude its lines. An unwrapped line with a wrap context therefore
+    // takes the same exclusion fixed point and publishes the same allocation
+    // provenance as a bounded one. Intrinsic measurement has no placement.
+    if (!wrapCtx || widthPolicy === 'intrinsic') return runPass(null);
     const preparedFloatWrap = wrapCtx.lineWindow
       ? undefined
       : prepareFloatWrap(wrapCtx.floats);

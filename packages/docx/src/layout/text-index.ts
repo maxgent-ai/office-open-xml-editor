@@ -299,9 +299,15 @@ function visitTextBox(
 ): void {
   if (context.emittedTextBoxes.has(textBox.id)) return;
   context.emittedTextBoxes.add(textBox.id);
+  // A text box story is its own coordinate root: its resolved floating-table
+  // placements and the page-owned axes of drawings anchored in it are stated
+  // in story coordinates (story-page-frames.ts), which `pointToPage` already
+  // maps. Only translations taken inside the story are undone for them, never
+  // those that placed the box's own paragraph (a table cell's).
   const transformedProjection: NodeProjection = {
     ...projection,
     pointToPage: composeAffine(projection.pointToPage, textBox.transform),
+    layoutTranslationPt: { xPt: 0, yPt: 0 },
     textBoxVerticalMode: textBox.verticalMode ?? projection.textBoxVerticalMode,
   };
   const textBoxProjection = withClip(transformedProjection, textBox.clipBounds);
@@ -502,8 +508,7 @@ function visitTable(
   const tableProjection = withClip(projection, table.clipBounds);
   for (const row of table.rows) {
     for (const cell of row.cells) {
-      const ownsContinuationPaint = 'visualMergeOwnership' in cell
-        && cell.visualMergeOwnership === 'continuation';
+      const ownsContinuationPaint = cell.visualMergeOwnership === 'continuation';
       if (cell.verticalMerge === 'continue' && !ownsContinuationPaint) continue;
       const cellProjection = withClip(tableProjection, cell.clipBounds);
       if (cell.verticalText) {

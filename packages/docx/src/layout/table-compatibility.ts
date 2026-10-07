@@ -1,6 +1,9 @@
+import type { FramePr } from '../types.js';
 import { defineCompatibilityRule } from './compatibility.js';
+import { stableFingerprint } from './fingerprint.js';
 import type { ParagraphLayoutSource } from './text.js';
-import type { TableColumnLayoutInput, LayoutRect } from './types.js';
+import type { TableLayoutSource } from './table-source-acquisition.js';
+import type { TableColumnLayoutInput, LayoutRect, SourceRef } from './types.js';
 
 export const WORD_ROTATED_CELL_AUTO_ROW_WRAP = defineCompatibilityRule({
   id: 'word-rotated-cell-auto-row-wrap',
@@ -593,3 +596,162 @@ export function wordFixedOccupiedGridInput(
     rows: input.rows.map((row) => ({ ...row, before: null })),
   };
 }
+
+/*
+ * Cell-owner row hosts. table-owner-runs.ts owns the structure (owner
+ * contexts, SourceRef creation, partitioning, segment inputs, host geometry,
+ * caching); the bounded compatibility policies it delegates to live here.
+ *
+ * Evidence boundary. ECMA-376 §17.3.1.11 defines framePr paragraph frames and
+ * §17.4.57 makes a table without effective tblpPr nonfloating; neither
+ * assigns a table row to a cell paragraph's frame, and MS-OI29500 2.1.43
+ * defines no row promotion. MS-DOC 2.4.3 lets the leading first-cell PAP frame
+ * context take part in adjacent-row identity only while both rows lack
+ * nondefault TAP position/wrap: a binary row-identity precondition, not a WML
+ * row-import rule and not proof that any tuple below is Word's native
+ * identity. The rules below are therefore office observations, bounded to
+ * their control class; whatever they do not name is library inference.
+ *
+ * Common control class (Word 16.113.3, macOS 27.0, public synthetic sources):
+ * page/page notBeside carriers unless noted, a fixed 2×189pt grid with frame
+ * w 378pt, horizontal text, no explicit row heights, no rotated, RTL or
+ * tblpPr content. Original-open and saved/reopened full pages were exactly
+ * equal, and the probes left the source and saved packages unchanged.
+ * Numeric compatibility mode, exact fonts, explicit row heights, page splits,
+ * tblpPr together with a carrier, other anchors and wrap modes, RTL and
+ * rotated content were not observed; no universal Word behavior is claimed.
+ */
+
+/**
+ * Context promotion. The 52-case context matrix varied the owning context of
+ * one- and two-cell tables carrying a page/page notBeside framePr (and, where
+ * tested, a width-omitted margin/text-around one). Word kept the framePr and
+ * moved the row for direct roots of the body, header and footer stories. It
+ * removed the framePr on save and rendered exactly the frame-free control for
+ * tables nested in a body or footer cell (frame inside and beyond the flow
+ * region), text box roots (unrotated, 90°, ±30°) and footnote/endnote roots.
+ * The two-cell counterexamples rule out a cell-count rule and the
+ * margin/text-around ones a page/page or notBeside rule: the owning context
+ * decides. Contexts outside these classes are unobserved.
+ */
+export const WORD_CELL_OWNER_ROW_CONTEXT = defineCompatibilityRule({
+  id: 'word-cell-owner-row-context',
+  evidence: {
+    kind: 'office-observation',
+    syntheticFixtureId: 'cell-owner-row-context-matrix',
+    application: 'Microsoft Word',
+    version: '16.113.3',
+    platform: 'macOS 27.0',
+  },
+  description: 'A leading cell paragraph frame promotes its table row only for direct body, header and footer story roots; nested-cell, text box and note-root tables keep the frame-free result.',
+});
+
+/** {@link WORD_CELL_OWNER_ROW_CONTEXT}: `rootStory` is the story a table is a
+ * direct root of, or null for a table owned by a cell at any depth. */
+export function wordCellOwnerContextPromotesRows(rootStory: SourceRef['story'] | null): boolean {
+  return rootStory === 'body' || rootStory === 'header' || rootStory === 'footer';
+}
+
+/**
+ * Selector. Observed: a framePr on the first paragraph of the first cell moves
+ * the whole row (borders and the ordinary sibling paragraphs of both cells)
+ * to the frame position; the same framePr on the second paragraph renders
+ * identically to the frame-free table. First-column vMerge controls (restart
+ * carrier 144/90; continuation cell holding one empty paragraph): a
+ * continuation whose pPr states an equal frame kept one two-row table, a
+ * differing one (90/210) saved two one-row tables each at its own frame, and
+ * no continuation frame saved two one-row tables with the later row in
+ * ordinary flow. The continuation paragraph paints nothing, yet its own frame
+ * takes part in row identity, and the restart frame is not inherited.
+ *
+ * Library choices: the logical first cell `cells[0]` is used, not the
+ * visual-left cell of a bidiVisual table (RTL unobserved); explicit and
+ * parser-defaulted dropCap `none` are one value, and `drop`, `margin` or
+ * unknown tokens do not elect.
+ */
+export const WORD_CELL_OWNER_ROW_SELECTOR = defineCompatibilityRule({
+  id: 'word-cell-owner-row-selector',
+  evidence: {
+    kind: 'office-observation',
+    syntheticFixtureId: 'cell-owner-row-selector-matrix',
+    application: 'Microsoft Word',
+    version: '16.113.3',
+    platform: 'macOS 27.0',
+  },
+  description: 'A row elects the frame of its first cell\'s first paragraph, including a vertical-merge continuation\'s own stated frame; a frame on a later paragraph is inert, and an absent continuation frame is not inherited.',
+});
+
+/** {@link WORD_CELL_OWNER_ROW_SELECTOR}: the frame a row elects, or null. */
+export function wordCellOwnerLeadingFrame(row: TableLayoutSource['rows'][number]): FramePr | null {
+  const block = row.cells[0]?.content[0];
+  if (block?.type !== 'paragraph' || !block.framePr || block.framePr.dropCap !== 'none') return null;
+  return block.framePr as FramePr;
+}
+
+/**
+ * Run identity. Observed: two rows with equal parsed carriers stay one
+ * two-row table, the second row at its natural grid offset; rows whose
+ * carriers differ in position, or only in hSpace with the same authored x/y,
+ * render as independently placed hosts and save as two one-row tables, and
+ * same-coordinate hosts overlap (no collision avoidance). With distinct top,
+ * insideH and bottom border styles, differing carriers saved two one-row
+ * tables each with the original top and bottom and no insideH, while equal
+ * carriers kept top, insideH between the rows, and bottom; exact border
+ * geometry was not compared. A second-column restart/continue across two rows
+ * with the carrier on the first row only, on both rows at different
+ * positions, or on the later row only saved two one-row tables keeping the
+ * restart and an empty continue: merge markup does not decide ownership. An
+ * equal-carrier merge was observed only in the first column (one two-row
+ * table, merge kept; see {@link WORD_CELL_OWNER_ROW_SELECTOR}); a
+ * second-column merge inside one run follows the library's grid model and
+ * ECMA-376 §17.4.84, not an observation.
+ */
+export const WORD_CELL_OWNER_ROW_RUN_IDENTITY = defineCompatibilityRule({
+  id: 'word-cell-owner-row-run-identity',
+  evidence: {
+    kind: 'office-observation',
+    syntheticFixtureId: 'cell-owner-row-identity-merge-matrix',
+    application: 'Microsoft Word',
+    version: '16.113.3',
+    platform: 'macOS 27.0',
+  },
+  description: 'Adjacent electing rows with equal parsed frames stay one table; rows whose frames differ, even only in hSpace, become separate one-row hosts capped by the table top and bottom borders, regardless of vertical merges.',
+});
+
+/**
+ * {@link WORD_CELL_OWNER_ROW_RUN_IDENTITY}: adjacent electing rows share one
+ * run when these parsed framePr fields are equal. Only equality and the
+ * hSpace difference were observed; the other fields are keyed by inference,
+ * unprobed one by one. Absent w/h/x/y/xAlign/yAlign differ from any explicit
+ * value, including 0 (library choice). dropCap is fixed by the selector and
+ * `lines` only sizes drop caps. This is not §17.3.1.11 paragraph grouping and
+ * not a claim about Word's native row-identity tuple.
+ */
+export function wordCellOwnerRunKey(framePr: FramePr): string {
+  return stableFingerprint('w:framePr:owner-run', [
+    framePr.hAnchor, framePr.vAnchor,
+    framePr.x ?? null, framePr.xAlign ?? null,
+    framePr.y ?? null, framePr.yAlign ?? null,
+    framePr.w ?? null, framePr.h ?? null, framePr.hRule,
+    framePr.wrap, framePr.hSpace, framePr.vSpace,
+  ]);
+}
+
+/**
+ * Host width clip. Observed: a 100pt frame over a 378pt grid clipped the
+ * second cell's paint; a 378pt frame painted it. Which edge clips, the
+ * absence of a vertical host clip and the retained text, search and
+ * selection ownership of clipped cells are library choices made in
+ * table-owner-runs.ts (finishOwnerHostLayout); RTL frames were not observed.
+ */
+export const WORD_CELL_OWNER_HOST_WIDTH_CLIP = defineCompatibilityRule({
+  id: 'word-cell-owner-host-width-clip',
+  evidence: {
+    kind: 'office-observation',
+    syntheticFixtureId: 'cell-owner-host-frame-width-clip',
+    application: 'Microsoft Word',
+    version: '16.113.3',
+    platform: 'macOS 27.0',
+  },
+  description: 'A row host whose explicit frame width is narrower than its natural grid keeps the grid and clips its paint at the frame width.',
+});

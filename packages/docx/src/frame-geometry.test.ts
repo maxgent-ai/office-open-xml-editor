@@ -259,12 +259,15 @@ describe('frame geometry (§17.3.1.11) — wrap modes', () => {
     }
   });
 
-  it('wrap="none" → no float registered (absolute draw only, no exclusion)', () => {
+  it('wrap="none" → topAndBottom float, as notBeside (§17.18.104: next line clear of the frame)', () => {
+    // ST_Wrap of w:framePr, not DrawingML wrapNone: text neither wraps
+    // beside nor overlaps the frame.
     const st = st0();
     const fp = dc('none');
     const b = box(fp, st, 200, 42, 50, 14);
     registerFloat(b, fp, st);
-    expect(st.floats).toHaveLength(0);
+    expect(st.floats).toHaveLength(1);
+    expect(st.floats[0].mode).toBe('topAndBottom');
   });
 });
 

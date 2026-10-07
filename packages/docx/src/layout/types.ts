@@ -1,5 +1,5 @@
 import type { SectionLayoutContext } from '../layout-context.js';
-import type { DocxStorySource } from '../types.js';
+import type { DocxStorySource, FramePr } from '../types.js';
 import type {
   GlyphInkBounds,
   TextFontSlotPresence,
@@ -745,6 +745,11 @@ export interface TableCellLayout extends LayoutNodeBase {
   readonly kind: 'table-cell';
   readonly contentBounds: LayoutRect;
   readonly verticalMerge: 'none' | 'restart' | 'continue';
+  /** A paint role of a `continue` cell that owns its painted region: a
+   * page-local merge continuation (table-pagination.ts) or a projected empty
+   * owner (table.ts gridMergeRole). The source w:vMerge value is unchanged
+   * and the cell's content stays suppressed. */
+  readonly visualMergeOwnership?: 'continuation';
   readonly vAlign: 'top' | 'center' | 'bottom';
   readonly background?: FillPaint;
   readonly blocks: readonly TableCellBlockLayout[];
@@ -773,6 +778,14 @@ export interface TableLayout extends LayoutNodeBase {
   /** Point space already owned by `resolvedFloatingTables`; occurrence projection
    * must not translate those final frames a second time. */
   readonly resolvedFloatingTableCoordinateSpace?: FloatRegistryCoordinateSpace;
+  /** @internal Cell-owner host (table-owner-runs.ts): a frame-placed
+   * owner of source rows of a body, header or footer root table, never a
+   * §17.4.57 positioned table. */
+  readonly cellOwnerHost?: true;
+  /** @internal Axes of a header/footer story-root cell-owner host already in
+   * page coordinates (a page/margin frame result). Like a page-owned anchor
+   * layer, story band and occurrence translation leave those axes in place. */
+  readonly ownerHostPageAxes?: Readonly<{ horizontal: boolean; vertical: boolean }>;
 }
 
 /**
@@ -846,6 +859,10 @@ export type FloatRegistryEntryPt =
     }>
   | Readonly<FloatRegistryEntryCorePt & {
       readonly kind: 'frame';
+      /** §17.18.104 framePr wrap projected by `frameWrapExclusionMode`.
+       * Body paragraph frames and cell-owner row hosts always state it;
+       * absent projects square. */
+      readonly exclusionMode?: 'square' | 'topAndBottom';
     }>;
 
 export type FloatRegistryCoordinateSpace = Exclude<
@@ -955,6 +972,13 @@ export interface StoryLayout {
   readonly blocks: readonly PaintNode[];
   readonly advancePt: number;
   readonly diagnostics: readonly LayoutDiagnostic[];
+  /** @internal The story holds content only a page position places — a
+   * page- or margin-anchored header/footer root cell-owner host
+   * (table-owner-runs.ts), §17.4.57 positioned tables of its tables, or a
+   * text box whose story holds such content — so its geometry depends on the
+   * placement its composer gives it
+   * (`StoryLayoutAcquisitionInput.bandTranslationPt` / `pageFrames`). */
+  readonly bandDependent?: true;
 }
 
 /** Page-owned occurrence of one native reserved separator story (MS-DOC
@@ -1456,6 +1480,19 @@ export interface TableRowLayoutInput {
   readonly indentPt: number;
   readonly cells: readonly TableCellLayoutInput[];
   readonly repeatedHeader: boolean;
+  /** Cell-owner row carrier (table-owner-runs.ts): a plain snapshot
+   * of the leading logical-cell paragraph's parsed framePr and its source,
+   * present only on rows of a body, header or footer root table
+   * (tableRowsElectCarriers). A source fact only; owner runs and placement
+   * are resolved downstream. */
+  readonly ownerCarrier?: TableRowOwnerCarrier;
+}
+
+/** The framePr of a row's leading logical-cell paragraph and that paragraph's
+ * complete source. The paragraph itself remains ordinary cell content. */
+export interface TableRowOwnerCarrier {
+  readonly framePr: FramePr;
+  readonly source: SourceRef;
 }
 
 export interface TableLayoutInput {
@@ -1472,6 +1509,20 @@ export interface TableLayoutInput {
   readonly columnWidthKeys?: readonly (string | null)[];
   readonly borders: TableEdgeInputs;
   readonly rows: readonly TableRowLayoutInput[];
+  /** Cell-owner host segment (table-owner-runs.ts): the carrier shared by
+   * the owner run these rows form. Present only on a projected
+   * host segment, which its owning domain places out of ordinary flow. */
+  readonly ownerHost?: TableRowOwnerCarrier;
+  /** Cell-owner segment projection (table-owner-runs.ts ownerSegmentInput):
+   * the `logicalRowIndex` of a segment's first own row when that row, after
+   * the source table's first row, holds a vMerge continuation. In this input's
+   * grid such a continuation with no merged cell above it opens its merge
+   * region as an empty owner (table.ts gridMergeRole). The logical row index,
+   * not the row id, names it: every occurrence input pagination derives from
+   * the row (a cut fragment with its own fragment id, a page-dependent
+   * reacquisition, a bounded track window) keeps the source logical index,
+   * which is unique within one input. Absent on every other input. */
+  readonly segmentOpeningLogicalRowIndex?: number;
 }
 
 export type FlowBlockInput = ParagraphLayoutInput | TableLayoutInput;

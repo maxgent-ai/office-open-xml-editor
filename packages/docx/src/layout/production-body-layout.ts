@@ -7,6 +7,7 @@ import type {
   BodyElement,
   DocParagraph,
   DocTableCell,
+  FramePr,
   ImageRun,
   ChartRun,
   ShapeRun,
@@ -14,13 +15,22 @@ import type {
 } from '../types';
 import type { ResolvedFontMetric } from '@silurus/ooxml-core';
 import { type FloatRect, isWrapFloat } from '../float-layout.js';
-import { type FrameBox, computeFrameBox, frameXContainer, pushFloatRect, registerFrameFloat } from '../frame-geometry.js';
+import {
+  type FrameBox,
+  computeFrameBox,
+  frameWrapExclusionMode,
+  frameXContainer,
+  pushFloatRect,
+  registerFrameFloat,
+} from '../frame-geometry.js';
 import { resolveFloatingTableBoxPt } from '../float-table-geometry.js';
 import { xContainer, yContainer, resolveAnchorX, resolveAnchorY } from '../anchor-geometry.js';
 import { resolveParagraphLayoutContext, resolveSectionLayoutContext, type DocumentLayoutSettings, type SectionLayoutContext } from '../layout-context.js';
 import type {
   BlockLayoutAlgorithms,
+  BlockLayoutResult,
   DeepReadonly,
+  FlowBlockPlacement,
   DrawingMLCollisionRegistrySnapshotPt,
   LayoutServices,
   FloatRegistryEntryPt,
@@ -42,8 +52,16 @@ import {
   floatingTableRegistryDelta,
   validateFloatingTableRegistryDelta,
 } from './floating-table-transaction.js';
+import { FLOAT_OVERLAP_EPS, floatRectParticipant, resolveBlockFlowAdmission } from './floats.js';
 import type { LayoutOptions } from './options.js';
-import { createLayoutServicesRuntimeView, fieldAcquisitionContextOf, footnoteAcquisitionWorkBudgetOf, verticalGlyphMeasurementServiceOf } from './runtime-state.js';
+import { createStoryLayoutCache, type StoryLayoutCache } from './story-layout-cache.js';
+import {
+  createLayoutServicesRuntimeView,
+  fieldAcquisitionContextOf,
+  footnoteAcquisitionWorkBudgetOf,
+  paragraphAcquisitionCacheOf,
+  verticalGlyphMeasurementServiceOf,
+} from './runtime-state.js';
 import { attachStoryBlockLayoutAlgorithms, layoutStory as layoutSharedStory } from './stories.js';
 import { buildNoteNumberMap, footnoteIdsInRetainedLines, footnoteIdsInRetainedSlice, indexNotes, noteReferenceIdsInDocumentOrder } from './note-reference-ownership.js';
 import type {
@@ -78,7 +96,24 @@ import { applyNumberingBodyOffset, resolveNumberingMarkerGeometry } from './numb
 import { projectTableColumnLayoutInput, type TableSourceAcquisitionInput } from './table-source-acquisition.js';
 import { measureTableIntrinsicWidths, resolveTableColumnWidths } from './table-columns.js';
 import { decideLogicalTable, type LogicalTableDecision, type TableMemberDecision } from './table-layout-decision.js';
-import { bodyTableAcquisitionState, measureBodyTableEntry } from './body-table-measurement.js';
+import {
+  bodyTableAcquisitionState,
+  measureBodyTableEntry,
+  ownerSegmentedFlowExtents,
+} from './body-table-measurement.js';
+import {
+  finishOwnerHostLayout,
+  frameBoxAt,
+  ownerCarrierAnchorsToPage,
+  ownerHostOccupiedBox,
+  ownerHostPageAxes,
+  ownerHostPageFrameBox,
+  ownerSegmentInput,
+  tableOwnerSegments,
+} from './table-owner-runs.js';
+import { solveExactTranslation, storyAnchorPageFrames, type StoryPageFrames } from './story-page-frames.js';
+import { ExactConvergenceError } from './convergence.js';
+import { LayoutInvariantError } from './diagnostics.js';
 import { measureParagraphIntrinsicWidths, measureTableCellIntrinsicWidths } from './intrinsic-width.js';
 // ── Line-layout engine (segmentation + line-breaking + measurement) ──────────
 // Body acquisition drives the pure root line-layout kernel through this
@@ -93,7 +128,11 @@ import {
 } from './table-acquisition.js';
 import { combineAdjacentTableLayoutInputs } from './adjacent-table-layout-input.js';
 import { layoutTable as layoutRetainedTableInput } from './table.js';
-import { type PageDependentTableBlockRequest } from './table-pagination.js';
+import {
+  hasPagePlacedTableContent,
+  layoutWholeTableOnPage,
+  type PageDependentTableBlockRequest,
+} from './table-pagination.js';
 import { paragraphGapAdjustment } from './paragraph-spacing.js';
 import { bottomBorderExtentPt, resolveParagraphBorderEdges, topBorderExtentPt, type ParagraphBorderEdges } from './paragraph-border-adjacency.js';
 import { acquireParagraphResult, acquireRetainedFrameGroup, bodyFrameGroupFor, bodyParagraphBorderEdgesFor, projectPhysicalAnchorResult, retainedFrameMaximumBaselineLoweringPt, type BodyFrameGroup } from './paragraph.js';
@@ -121,6 +160,7 @@ import { collectBodyFrameGroups, prepareBodyFrameMetadata } from './frame.js';
 import {
   physicalToLogicalMatrix,
   sectionWritingMode,
+  transformRect,
   uprightPhysicalExtent,
 } from './coordinate-space.js';
 
@@ -153,6 +193,7 @@ export function createProductionBodyLayoutRuntime(
 /** Retained default separator band of the shared note story layout. It applies
  * only where no native reserved separator definition owns the note kind. */
 const FOOTNOTE_SEPARATOR_GAP_PT = 6;
+const BODY_HOST_FLOW_PAGE_TRANSLATION = Object.freeze({ xPt: 0, yPt: 0 });
 
 /** A visible §17.3.1.42 top border owns space above the first line in every
  * paragraph container. Page/cell-start suppression removes authored w:before,
@@ -312,7 +353,13 @@ function buildMeasureState(
             ),
             continuesFromPrevious: false,
             anchorFrames: bodyAnchorReferenceFrames(cellState),
+            // Bound to the cell's own owner (its section, page and, for an
+            // upright physical table, that table's physical frame).
             acquireCompleteStory: completeTextBoxStoryAcquirerFor(cellState),
+            ...(cellState.cellHostFlowPageTranslationPt
+              ? { hostFlowPageTranslationPt: cellState.cellHostFlowPageTranslationPt }
+              : {}),
+            ...textBoxStoryHostOptions(cellState, cellState.cellHostFlowPageTranslationPt),
           },
           inheritedAuthority,
         ).layout;
@@ -554,6 +601,8 @@ function acquireBodyParagraphAtLocation(
           }),
       anchorFrames: bodyAnchorReferenceFrames(state),
       acquireCompleteStory: completeTextBoxStoryAcquirerFor(state),
+      // Body paragraphs are acquired at their page position.
+      hostFlowPageTranslationPt: BODY_HOST_FLOW_PAGE_TRANSLATION,
       ...(state.frozenAnchorFrames && state.frozenAnchorFrames.size > 0
         ? { frozenAnchorFrames: state.frozenAnchorFrames }
         : {}),
@@ -588,13 +637,44 @@ function bodyStoryElement(source: LayoutSourceStore, sourceRef: SourceRef): Layo
 interface BodyStoryAcquisitionContext {
   readonly state: BodyAcquisitionState;
   readonly services: LayoutServices;
-  readonly storyLayoutCache: Map<string, StoryLayout>;
-  /** One active acquisition context per native reserved separator root (at
-   * most six). Page occurrences are projections; no per-page copies. */
-  readonly reservedNoteStoryCache: Map<string, Readonly<{ key: string; story: StoryLayout }>>;
+  /** The session's story layouts under explicit admission
+   * (acquireBodyStoryLayout). A reserved separator root keeps one active
+   * acquisition context (at most six roots); its page occurrences are
+   * projections, never per-page copies. */
+  readonly storyLayoutCache: StoryLayoutCache;
+  /** Whether an immutable continued-footnote root is a proved
+   * page-independent (text-only) class; computed once per root. */
   readonly noteSourceReuse: WeakMap<object, boolean>;
   readonly source: LayoutSourceStore;
   readonly publicAnchorBridge: typeof publicAnchorBridge;
+}
+
+/**
+ * Host-chain options of a paragraph in a text box story or in a cell of one
+ * of its tables (story-page-frames.ts): the page frames the story's
+ * page-owned anchor axes keep, reached by the paragraph's translation into
+ * the story (none at its root; a cell's position, once its table's
+ * pagination states it) plus the story's own flow shift. Without either, its
+ * drawings' text box stories have no page frames, so their page-placed
+ * content keeps its acquisition.
+ */
+function textBoxStoryHostOptions(
+  state: Pick<BodyAcquisitionState, 'textBoxStoryHostFrames'>,
+  inStoryPt: Readonly<{ xPt: number; yPt: number }> | undefined,
+): Readonly<{
+  hostPageFrames?: StoryPageFrames | null;
+  hostFlowPageTranslationPt?: Readonly<{ xPt: number; yPt: number }>;
+}> {
+  const chain = state.textBoxStoryHostFrames;
+  if (chain === undefined) return {};
+  if (chain === null || !inStoryPt) return { hostPageFrames: null };
+  return {
+    hostPageFrames: chain.frames,
+    hostFlowPageTranslationPt: Object.freeze({
+      xPt: inStoryPt.xPt + chain.flowPt.xPt,
+      yPt: inStoryPt.yPt + chain.flowPt.yPt,
+    }),
+  };
 }
 
 /** Acquire one retained story from immutable source and session-owned context. */
@@ -602,7 +682,7 @@ function acquireBodyStoryLayout(
   dependencies: BodyStoryAcquisitionContext,
   request: import('./body-layout-kernel.js').StoryLayoutAcquisitionInput,
 ): StoryLayout {
-  const { source, state, services, storyLayoutCache, publicAnchorBridge } = dependencies;
+  const { source, services } = dependencies;
   const root = bodyStoryRoot(source, request.source);
   // A native reserved or DOCX selected separator root is a shared source
   // definition, not a numbered (continued) note: it has no number and no note
@@ -628,26 +708,50 @@ function acquireBodyStoryLayout(
       && !element.framePr && element.runs.every(run => run.type === 'text'));
     dependencies.noteSourceReuse.set(root, reusableNote);
   }
+  // Both proved page-independent classes hold no table, frame, text box or
+  // anchor, i.e. no page-placed content, so neither a band translation nor
+  // page frames can change their layout: their key keeps only the facts the
+  // layout depends on (section and container extent), and they are never a
+  // convergence trial. Every other story keeps its page and placement facts.
   const pageIndependent = reusableNote || reservedRole !== undefined;
-  const cacheKey = JSON.stringify({
-    source: request.source,
-    pageIndex: pageIndependent ? null : request.pageIndex,
+  const occurrence = JSON.stringify([request.source, pageIndependent ? null : request.pageIndex]);
+  const placement = JSON.stringify({
     section: request.section,
     container: pageIndependent ? { ...request.container, id: null } : request.container,
+    band: pageIndependent ? null : request.bandTranslationPt ?? null,
+    pageFrames: pageIndependent ? null : request.pageFrames ?? null,
   });
-  const reservedKey = reservedRole === undefined ? undefined : sourceKey(request.source);
-  const cached = reservedKey === undefined
-    ? storyLayoutCache.get(cacheKey)
-    : dependencies.reservedNoteStoryCache.get(reservedKey)?.key === cacheKey
-      ? dependencies.reservedNoteStoryCache.get(reservedKey)!.story
-      : undefined;
-  if (cached) return cached;
-  // This ledger is shared by all passes/service views of this pagination,
-  // rather than this shorter-lived concrete acquisition session. Debit before
-  // destination-field resolution, shaping, geometry or resource acquisition.
-  workBudget?.charge(root);
+  return dependencies.storyLayoutCache.layout({
+    occurrence,
+    placement,
+    trial: !pageIndependent
+      && (request.bandTranslationPt !== undefined || request.pageFrames !== undefined),
+    // Replace, never accumulate, a separator root's context; never retain a
+    // destination-dependent full continued note once per page.
+    retention: reservedRole !== undefined
+      ? 'latest'
+      : continuedNote && !reusableNote ? 'none' : 'session',
+  }, () => {
+    // This ledger is shared by all passes/service views of this pagination,
+    // rather than this shorter-lived concrete acquisition session. Debit
+    // every miss before destination-field resolution, shaping, geometry or
+    // resource acquisition; cache hits are free.
+    workBudget?.charge(root);
+    return layoutBodyStory(dependencies, request, root, reservedRole !== undefined);
+  });
+}
+
+/** The one story layout algorithm behind {@link acquireBodyStoryLayout}'s
+ * cache admission; it never reads or writes a cache itself. */
+function layoutBodyStory(
+  dependencies: BodyStoryAcquisitionContext,
+  request: import('./body-layout-kernel.js').StoryLayoutAcquisitionInput,
+  root: readonly LayoutStoryBlock[],
+  separatorRoot: boolean,
+): StoryLayout {
+  const { source, state, services, publicAnchorBridge } = dependencies;
   const noteReferenceNumber =
-    reservedRole === undefined
+    !separatorRoot
       && (request.source.story === 'footnote' || request.source.story === 'endnote')
       ? state.noteNumbers?.get(`${request.source.story}:${request.source.storyInstance}`)
       : undefined;
@@ -693,6 +797,56 @@ function acquireBodyStoryLayout(
   const storyServices = createLayoutServicesRuntimeView(services, request.container.quarterTurnMath
     ? { math: quarterTurnMathMetadataService(services.math) } : {});
   candidate.layoutServices = storyServices;
+  // Content only a page position places (header/footer root hosts, the
+  // positioned tables of story tables) resolves against the destination
+  // page's bands. With the composer's band translation known before layout,
+  // it is placed through that translation below. A story given its page
+  // frames in its own coordinates (a text box) places it there: it is story
+  // content for every later transform, so the band is the identity.
+  const storyFramed = request.pageFrames !== undefined;
+  const band = request.bandTranslationPt ?? (storyFramed ? Object.freeze({ xPt: 0, yPt: 0 }) : undefined);
+  const textBoxHostFrames = request.container.kind !== 'textbox'
+    ? undefined
+    : request.pageFrames ? storyAnchorPageFrames(request.pageFrames) : null;
+  // Its table cells' paragraphs reach those frames through their cell's
+  // position in the story (textBoxStoryHostOptions).
+  if (textBoxHostFrames !== undefined) candidate.textBoxStoryHostFrames = textBoxHostFrames;
+  // Those bands in this story's page frame: the section's physical page and
+  // margin box carried into it by the section's own physical-to-logical
+  // transform — the inverse of the transform that paints the story's layer
+  // (a vertical section's note), the identity for a horizontal or upright
+  // physical story. Margin facts are the ones this story's state holds. A
+  // native section flow selects its own (counter-clockwise) frame through
+  // sectionWritingMode and the same native physical geometry its anchors use
+  // (physicalAnchorFrameOf); the text-direction token alone never decides it.
+  const storyPageFrames = request.pageFrames ?? ((): StoryPageFrames => {
+    const writingMode = sectionWritingMode(request.section);
+    const held = {
+      ...request.section.geometry,
+      marginLeft: candidate.marginLeft,
+      marginRight: candidate.marginRight,
+      marginTop: candidate.marginTop,
+      marginBottom: candidate.marginBottom,
+    };
+    const physical = writingMode === 'horizontal-tb'
+      ? held
+      : physicalSectionGeometry(held, request.section.nativeSectionFlow);
+    const toStory = physicalToLogicalMatrix(
+      writingMode,
+      { widthPt: physical.pageWidth, heightPt: physical.pageHeight },
+    );
+    return Object.freeze({
+      page: transformRect(toStory, { xPt: 0, yPt: 0, widthPt: physical.pageWidth, heightPt: physical.pageHeight }),
+      margin: transformRect(toStory, {
+        xPt: physical.marginLeft,
+        yPt: physical.marginTop,
+        widthPt: Math.max(0, physical.pageWidth - physical.marginLeft - physical.marginRight),
+        heightPt: Math.max(0, physical.pageHeight - physical.marginTop - physical.marginBottom),
+      }),
+    });
+  })();
+  const storyTableAcquisitions = new Map<string, RetainedTableAcquisition>();
+  let bandDependent = false;
   const blockInputs: StoryBlockInput[] = root.flatMap((element, index): StoryBlockInput[] => {
     const source: SourceRef = {
       story: request.source.story,
@@ -716,17 +870,35 @@ function acquireBodyStoryLayout(
     const table: LayoutTableBlock = element;
     const decision = singleTableDecision(table, request.container.bounds.widthPt, candidate);
     const columns = resolveColumnWidths(table, request.container.bounds.widthPt, candidate, decision);
-    return [
-      acquireRetainedTable(
-        table,
-        columns,
-        request.container.bounds.widthPt,
-        candidate,
-        source,
-        dependencies,
-        decision.logical,
-      ).input,
-    ];
+    const acquisition = acquireRetainedTable(
+      table,
+      columns,
+      request.container.bounds.widthPt,
+      candidate,
+      source,
+      dependencies,
+      decision.logical,
+      // Rows elect carriers only where the owner context promotes them
+      // (header/footer roots; tableRowsElectCarriers).
+      { kind: 'story-root', story: request.source.story },
+    );
+    const input = acquisition.input;
+    if (ownerCarrierAnchorsToPage(input) || hasPagePlacedTableContent(acquisition)) {
+      bandDependent = true;
+    }
+    // Owner runs (table-owner-runs.ts) of a header/footer root table become
+    // one story block per segment, in source row order; host segments are
+    // placed by layoutTable below.
+    const segments = tableOwnerSegments(input);
+    if (!segments) {
+      storyTableAcquisitions.set(input.id, acquisition);
+      return [input];
+    }
+    return segments.map((segment) => {
+      const projected = ownerSegmentInput(input, segment);
+      storyTableAcquisitions.set(projected.id, Object.freeze({ ...acquisition, input: projected }));
+      return projected;
+    });
   });
   let previousParagraph: LayoutParagraphBlock | null = null;
   // ECMA-376 §17.3.1.11 frames are story-local: adjacent paragraphs with
@@ -873,6 +1045,13 @@ function acquireBodyStoryLayout(
         // Nested text boxes in this story take the story's own section,
         // page and frame, not the body's current location.
         acquireCompleteStory: completeTextBoxStoryAcquirerFor(candidate),
+        // A page story's host flow receives its band. A text box story's
+        // anchor frames are not its page: its drawings' text box stories
+        // reach the page frames its box carried into it, which page-owned
+        // axes keep and its flow reaches by the box's shift; without them
+        // (no page band reaches the story) they get no page frames.
+        ...(request.bandTranslationPt ? { hostFlowPageTranslationPt: request.bandTranslationPt } : {}),
+        ...textBoxStoryHostOptions(candidate, { xPt: 0, yPt: 0 }),
       });
       previousParagraph = paragraph;
       const nextCursor = {
@@ -900,16 +1079,211 @@ function acquireBodyStoryLayout(
       return { layout: contentOwned, nextCursor };
     },
     layoutTable(block, placement) {
-      previousParagraph = null;
       const normalizedInput: TableLayoutInput = {
         ...block,
         flowDomainId: placement.container.id,
       };
-      const result = layoutRetainedTableInput(normalizedInput, placement, storyServices);
+      if (block.ownerHost) {
+        return layoutStoryOwnerHost(normalizedInput, block.ownerHost.framePr, placement);
+      }
+      previousParagraph = null;
+      const result = normalizedInput.ordinaryFlow
+        ? layoutStoryFlowTable(normalizedInput, placement)
+        : layoutStoryTable(normalizedInput, placement, band);
       candidate.y = result.nextCursor.yPt;
       return result;
     },
   };
+  /**
+   * An ordinary-flow story table, admitted below the story's preceding text
+   * exclusions it may not sit beside by the body's resolver
+   * (resolveBlockFlowAdmission). The exclusions are the story's registered
+   * floats, in story coordinates as its paragraphs consume them (a story-root
+   * host's page-owned axes are registered through the inverse of the band), so
+   * the table is admitted in its own coordinate space. The cleared start moves
+   * the cursor and the available bounds' top, keeping their x, width and
+   * bottom, and the next cursor follows the table laid out there. A table is
+   * laid out again at each move, since its extent may depend on where its
+   * page-placed content lands; the start is monotone and each move clears at
+   * least one exclusion for good, so there are at most `blockers.length`
+   * moves. Host segments never come here (layoutStoryOwnerHost): a host
+   * avoids neither earlier hosts nor its own exclusion.
+   */
+  function layoutStoryFlowTable(
+    input: TableLayoutInput,
+    placement: FlowBlockPlacement,
+  ): BlockLayoutResult<TableLayout> {
+    const blockers = candidate.floats.map(floatRectParticipant);
+    const bottomPt = placement.availableBounds.yPt + placement.availableBounds.heightPt;
+    let at = placement;
+    for (let moveCount = 0; ; moveCount += 1) {
+      const result = layoutStoryTable(input, at, band);
+      if (blockers.length === 0) return result;
+      const { flowBounds } = result.layout;
+      const admittedYPt = resolveBlockFlowAdmission({
+        inlineStartPt: flowBounds.xPt,
+        inlineEndPt: flowBounds.xPt + flowBounds.widthPt,
+        flowBandStartPt: at.availableBounds.xPt,
+        flowBandEndPt: at.availableBounds.xPt + at.availableBounds.widthPt,
+        blockStartPt: at.cursor.yPt,
+        blockExtentPt: result.layout.advancePt,
+        blockers,
+        overlapEpsilonPt: FLOAT_OVERLAP_EPS,
+      }).blockStartPt;
+      if (admittedYPt <= at.cursor.yPt) return result;
+      if (moveCount === blockers.length) {
+        throw new LayoutInvariantError('NON_CONVERGENCE', `story table ${input.id} admission did not converge`);
+      }
+      at = {
+        container: at.container,
+        cursor: { xPt: at.cursor.xPt, yPt: admittedYPt },
+        availableBounds: {
+          ...at.availableBounds,
+          yPt: admittedYPt,
+          heightPt: Math.max(0, bottomPt - admittedYPt),
+        },
+      };
+    }
+  }
+  /**
+   * A story table at `placement`. With `toPage` (story → page translation of
+   * the placement's coordinates) the page-placed content below its cells is
+   * placed through it, as a paginated table places it through its page
+   * translation.
+   */
+  function layoutStoryTable(
+    input: TableLayoutInput,
+    placement: FlowBlockPlacement,
+    toPage: Readonly<{ xPt: number; yPt: number }> | undefined,
+  ): BlockLayoutResult<TableLayout> {
+    const acquisition = storyTableAcquisitions.get(input.id);
+    if (!toPage || !acquisition || !hasPagePlacedTableContent(acquisition)) {
+      return layoutRetainedTableInput(input, placement, storyServices);
+    }
+    // Laid out whole at its page position, as a nested table placed by its
+    // parent's pagination is: §17.4.57 positioned tables at any depth given
+    // final frames on the page (a story table resolves no other way; before
+    // this they were never placed). Their resolutions avoid only each other:
+    // a story keeps no page float registry.
+    const layout = layoutWholeTableOnPage({ ...acquisition, input }, {
+      availableHeightPt: placement.availableBounds.heightPt,
+      freshPageHeightPt: placement.availableBounds.heightPt,
+      placement,
+      services: storyServices,
+      compatibility: 'word',
+      page: {
+        physicalPageIndex: request.pageIndex,
+        displayPageNumber: candidate.displayPageNumber ?? request.pageIndex + 1,
+        occurrenceId: `${request.container.id}:${input.id}`,
+      },
+      pagePlacement: {
+        frames: storyPageFrames,
+        translationPt: toPage,
+        reacquireParagraph: (blockRequest) => reacquireBodyTableBlock(candidate, source, blockRequest),
+      },
+      floatingTableFrames: {
+        page: storyPageFrames.page,
+        margin: storyPageFrames.margin,
+        column: storyPageFrames.margin,
+      },
+      floatingTableRegistry: Object.freeze({
+        coordinateSpace: 'logical-page-points' as const,
+        flowDomainId: request.container.id,
+        entries: Object.freeze([]),
+        nextParagraphId: 0,
+      }),
+      reacquirePageDependentBlock: (blockRequest) => reacquireBodyTableBlock(candidate, source, blockRequest),
+    });
+    return {
+      layout,
+      nextCursor: { xPt: placement.cursor.xPt, yPt: placement.cursor.yPt + layout.advancePt },
+    };
+  }
+  /**
+   * A header/footer story-root cell-owner host (library policy,
+   * table-owner-runs.ts; only those roots elect, tableRowsElectCarriers).
+   * Story-domain owner frame: page and margin bands are the destination
+   * page's on both axes; text bands are the story column and the story
+   * cursor. A header/footer is laid out before its band translation, so a
+   * page/margin result is stated in page coordinates and the layout owns
+   * those axes (`ownerHostPageAxes`): like a page-owned anchor layer, the
+   * translation leaves them in place and they do not form the story's flow
+   * extent. The host advances no story flow and is never split (stories are
+   * not paginated). Its exclusion wraps the following story paragraphs, which
+   * are laid out in story coordinates: page-owned axes of the exclusion are
+   * stated through the inverse of the band, so the wrap lands where the host
+   * is painted. A page/margin carrier makes the story band dependent
+   * (body-paginator.ts layoutBandStory), so its accepted layout always has
+   * its band; an unbanded trial keeps those axes in page coordinates, as
+   * page-owned story anchors' exclusions do.
+   */
+  function layoutStoryOwnerHost(
+    input: TableLayoutInput,
+    framePr: FramePr,
+    placement: FlowBlockPlacement,
+  ): BlockLayoutResult<TableLayout> {
+    const container = placement.container.bounds;
+    const gridWidthPt = input.columnWidthsPt.reduce((sum, width) => sum + width, 0);
+    const viewportWidthPt = Math.max(framePr.w ?? gridWidthPt, gridWidthPt);
+    const pageAxes = ownerHostPageAxes(framePr);
+    // Page translation of the host layout's coordinates: its page-owned axes
+    // already are page coordinates.
+    const hostToPage = band ? {
+      xPt: pageAxes.horizontal ? 0 : band.xPt,
+      yPt: pageAxes.vertical ? 0 : band.yPt,
+    } : undefined;
+    const layoutAt = (xPt: number, yPt: number) => layoutStoryTable(input, {
+      container: placement.container,
+      cursor: { xPt, yPt },
+      availableBounds: { xPt, yPt, widthPt: viewportWidthPt, heightPt: placement.availableBounds.heightPt },
+    }, hostToPage).layout;
+    // The page, not the (possibly unbounded) story capacity.
+    const frameAt = (extentPt: number) => ownerHostPageFrameBox(
+      framePr, storyPageFrames, container.xPt, container.widthPt, placement.cursor.yPt, gridWidthPt, extentPt,
+    );
+    // The frame box depends on the host extent (yAlign, the page clamp) and,
+    // through page-placed content below its cells (a positioned child its
+    // anchor paragraph wraps around), the extent on where the host is placed.
+    // The host is painted, framed and excluded by ONE placement: the exact
+    // fixed point of box.y = frameAt(extent of the host laid out at box.y)
+    // (library consistency policy, not a Word guarantee). The frame x does not
+    // depend on the extent. A host whose extent does not move with it is
+    // accepted by its first evaluation, so it is laid out twice, as before.
+    // The limit is a resource guard only; no fixed point (a residual that
+    // changes sign by a jump) fails closed. The error is restated as a plain
+    // invariant so no exact-state recovery around the story can absorb it.
+    const startBox = frameAt(layoutAt(container.xPt, placement.cursor.yPt).advancePt);
+    let solved: Readonly<{ box: FrameBox; placed: TableLayout }>;
+    try {
+      solved = solveExactTranslation(startBox.y, (yPt) => {
+        const laidOut = layoutAt(startBox.x, yPt);
+        const next = frameAt(laidOut.advancePt);
+        return { value: { box: next, placed: laidOut }, implied: next.y };
+      }, 16);
+    } catch (error) {
+      if (error instanceof ExactConvergenceError) {
+        throw new LayoutInvariantError(
+          'NON_CONVERGENCE',
+          `story cell-owner host placement did not converge (${error.reason}; ${error.states.length} states)`,
+        );
+      }
+      throw error;
+    }
+    const { box, placed } = solved;
+    // Laid out before its own exclusion is registered with the story.
+    const occupied = ownerHostOccupiedBox(box, framePr, placed.advancePt);
+    registerFrameFloat(band ? frameBoxAt(
+      occupied,
+      occupied.x - (pageAxes.horizontal ? band.xPt : 0),
+      occupied.y - (pageAxes.vertical ? band.yPt : 0),
+    ) : occupied, framePr, candidate);
+    const finished = finishOwnerHostLayout(placed, framePr, gridWidthPt, box.x);
+    const pageOwned = pageAxes.horizontal || pageAxes.vertical;
+    return {
+      layout: pageOwned ? Object.freeze({ ...finished, ownerHostPageAxes: pageAxes }) : finished,
+      nextCursor: placement.cursor,
+    };
+  }
   attachStoryBlockLayoutAlgorithms(storyServices, algorithms);
   const acquired = layoutSharedStory(
     {
@@ -919,8 +1293,14 @@ function acquireBodyStoryLayout(
     },
     storyServices,
   );
+  // A text box of a story paragraph places its own story's page-placed
+  // content through the band that paragraph receives
+  // (hostFlowPageTranslationPt above).
+  const textBoxBandDependent = acquired.blocks.some((block) => block.kind === 'paragraph'
+    && block.textBoxes.some((textBox) => textBox.story.bandDependent === true));
   const retained = deepFreezePlainData({
     ...acquired,
+    ...(bandDependent || textBoxBandDependent ? { bandDependent: true as const } : {}),
     blocks: Object.freeze(
       acquired.blocks.map((block, index) => {
         if (block.kind !== 'paragraph' && block.kind !== 'table') {
@@ -937,10 +1317,6 @@ function acquireBodyStoryLayout(
       }),
     ),
   });
-  if (reservedKey !== undefined) {
-    // Replace, never accumulate: a changed context evicts the role's plan.
-    dependencies.reservedNoteStoryCache.set(reservedKey, Object.freeze({ key: cacheKey, story: retained }));
-  } else if (!continuedNote || reusableNote) storyLayoutCache.set(cacheKey, retained);
   return retained;
 }
 
@@ -1055,6 +1431,7 @@ function measureBodyParagraphEntry(
       occurrenceId: frameOccurrenceId,
       exclusionId: frameOccurrenceId,
       paragraphId: sessionState.floatRegistry.nextParagraphId,
+      exclusionMode: frameWrapExclusionMode(frameGroup.framePr),
       bounds: Object.freeze({
         xPt: box.x,
         yPt: box.y,
@@ -1275,6 +1652,10 @@ function layoutBodyNotes(
         ),
       },
     };
+    // A planned page-final top moves this note's flow top (cursorYPt) there.
+    const plannedTopPt = request.plannedTopsPt?.[id];
+    const bandTranslationPt = request.bandTranslationPt
+      ?? (plannedTopPt === undefined ? undefined : { xPt: 0, yPt: plannedTopPt - cursorYPt });
     let story: StoryLayout;
     try {
       story = acquireBodyStoryLayout(storyAcquisitionContext, {
@@ -1282,6 +1663,7 @@ function layoutBodyNotes(
         pageIndex: request.pageIndex,
         section: request.section,
         container: storyContainer,
+        ...(bandTranslationPt ? { bandTranslationPt } : {}),
       });
     } catch (error) {
       if (error instanceof FlowCapacityExceededError && error.containerId === storyContainer.id) {
@@ -1522,9 +1904,21 @@ function measureFollowingBodyBlock(
       },
       services,
     ).layout;
+    const combined: RetainedTableAcquisition = {
+      input: combinedInput,
+      layout,
+      nestedById: Object.assign({}, ...records.map((record) => record.nestedById)),
+      floatingTables: [],
+    };
+    const ownerExtents = ownerSegmentedFlowExtents(
+      combined,
+      request.availableInlineExtentPt,
+      services,
+    );
     return Object.freeze({
-      fullExtentPt: layout.advancePt,
-      leadContentExtentPt: layout.rows[0]?.advancePt ?? layout.advancePt,
+      fullExtentPt: ownerExtents?.fullExtentPt ?? layout.advancePt,
+      leadContentExtentPt: ownerExtents?.leadContentExtentPt
+        ?? layout.rows[0]?.advancePt ?? layout.advancePt,
       fullFootnoteReferenceIds: footnoteIdsInRetainedSlice(layout),
       leadFootnoteReferenceIds: footnoteIdsInRetainedSlice({
         ...layout,
@@ -1560,16 +1954,22 @@ function measureFollowingBodyBlock(
   }
   if (element.type !== 'table') throw new Error('Following table source kind mismatch');
   const sourceIndex = request.input.source.path[0]!;
-  computeTablePtLayout(
-    bodyTableAcquisitionState(candidate, element, effectiveTablePositioning),
-    element,
+  // The same upright physical acquisition owner as actual measurement
+  // (bodyTableAcquisitionState), so lookahead sizes the table, and its owner
+  // segments, exactly as it will be measured on the page.
+  const tableState = bodyTableAcquisitionState(candidate, element, effectiveTablePositioning);
+  computeTablePtLayout(tableState, element, request.availableInlineExtentPt, sourceIndex);
+  const acquisition = retainedTableRecord(tableState, sourceIndex).acquisition;
+  const layout = acquisition.layout;
+  const ownerExtents = ownerSegmentedFlowExtents(
+    acquisition,
     request.availableInlineExtentPt,
-    sourceIndex,
+    services,
   );
-  const layout = retainedTableRecord(candidate, sourceIndex).acquisition.layout;
   return Object.freeze({
-    fullExtentPt: layout.advancePt,
-    leadContentExtentPt: layout.rows[0]?.advancePt ?? layout.advancePt,
+    fullExtentPt: ownerExtents?.fullExtentPt ?? layout.advancePt,
+    leadContentExtentPt: ownerExtents?.leadContentExtentPt
+      ?? layout.rows[0]?.advancePt ?? layout.advancePt,
     fullFootnoteReferenceIds: footnoteIdsInRetainedSlice(layout),
     leadFootnoteReferenceIds: footnoteIdsInRetainedSlice({
       ...layout,
@@ -2005,7 +2405,9 @@ function commitBodyFlowRegistryDelta(
         entry.bounds.yPt -
         entry.bounds.heightPt;
     const core = {
-      mode: (entry.wrap === 'topAndBottom' ? 'topAndBottom' : 'square') as FloatRect['mode'],
+      mode: (entry.kind === 'frame' && entry.exclusionMode
+        ? entry.exclusionMode
+        : entry.wrap === 'topAndBottom' ? 'topAndBottom' : 'square') as FloatRect['mode'],
       ...(entry.kind === 'shape'
         ? {
             anchorOccurrenceId: entry.occurrenceId,
@@ -2229,6 +2631,7 @@ function reacquireBodyTableBlock(
     ),
     floatParaSeq: request.floatingTableExclusions?.length ?? 0,
     pageAnchorPrescanned: new Set<ParagraphLayoutSource>(),
+    cellHostFlowPageTranslationPt: request.hostFlowPageTranslationPt,
   };
   const inheritedAuthority = inheritedParagraphAuthorityForReacquisition(request.acquired);
   const tableAcquisition = state.retainedTableAcquisition;
@@ -2240,6 +2643,8 @@ function reacquireBodyTableBlock(
     request.acquired.flowDomainId,
     undefined,
     inheritedAuthority,
+    // A story table's paragraph keeps its own story (headers, notes).
+    request.acquired.source,
   );
 }
 
@@ -2303,6 +2708,7 @@ function acquireCompleteBodyTextBoxStory(
     pageIndex: owner.pageIndex,
     section,
     container: request.container,
+    ...(request.pageFrames ? { pageFrames: request.pageFrames } : {}),
   });
 }
 
@@ -2387,13 +2793,16 @@ function openConcreteBodyLayoutSession(
   const sessionState = { location, floatRegistry, drawingCollisionRegistry };
   setBodyAcquisitionLocation(services, state, sessionState, sessionState.location);
   const endnotesById = indexNotes(source.blocks.endnotes);
-  const storyLayoutCache = new Map<string, StoryLayout>();
+  // Trial misses debit the pagination-scoped miss budget and full
+  // continued-note misses the pagination-scoped footnote work budget; both are
+  // owned by the execution's service view, so neither resets with this
+  // session or between convergence passes.
+  const storyLayoutCache = createStoryLayoutCache(() => paragraphAcquisitionCacheOf(services)?.noteMiss());
   const storyAcquisitionContext: BodyStoryAcquisitionContext = {
     source,
     state,
     services,
     storyLayoutCache,
-    reservedNoteStoryCache: new Map(),
     noteSourceReuse: new WeakMap(),
     publicAnchorBridge,
   };
@@ -2488,30 +2897,24 @@ function paraGrid(para: ParagraphLayoutSource, state: BodyMeasurementContext): D
   );
 }
 
-/** Resolve column widths once, acquire the retained table, and return its
- * authoritative row advances for one top-level body occurrence. A table that
+/** Resolve column widths once and retain the acquired table for one top-level
+ * body occurrence (read back through retainedTableRecord). A table that
  * continues onto another flow region is measured once per region; while the
  * inline extent is unchanged the retained acquisition is identical for every
  * destination page (page-varying geometry is excluded by
- * retainedTableAcquisitionIsReusableAcrossPages), so reuse the record instead
- * of re-walking and re-laying out every row — that made pagination cost
- * O(flow-regions × rows). */
+ * retainedTableAcquisitionIsReusableAcrossPages), so reuse the record in
+ * constant time instead of re-walking, re-laying out or re-projecting every
+ * row — that made pagination cost O(flow-regions × rows), and a table paged
+ * one owner segment per request would pay it per segment. */
 function computeTablePtLayout(
   state: BodyAcquisitionState,
   table: TableLayoutSource,
   contentWPt: number,
   sourceIndex: number,
   prepared?: Readonly<{ columns: readonly number[]; decision: LogicalTableDecision; member: TableMemberDecision }>,
-): { colWidthsPt: number[]; rowContentHeightsPt: number[]; rowHeightsPt: number[] } {
+): void {
   const prior = state.retainedTablesBySourceIndex.get(sourceIndex);
-  if (prior?.contentWidthPt === contentWPt && prior.reusableAcrossPages) {
-    const priorRowHeightsPt = prior.acquisition.layout.rows.map((row) => row.advancePt);
-    return {
-      colWidthsPt: [...prior.acquisition.layout.columnWidthsPt],
-      rowContentHeightsPt: priorRowHeightsPt,
-      rowHeightsPt: priorRowHeightsPt,
-    };
-  }
+  if (prior?.contentWidthPt === contentWPt && prior.reusableAcrossPages) return;
   const decision = prepared?.decision ?? singleTableDecision(table, contentWPt, state);
   const member = prepared?.member ?? decision.logical;
   const colWidthsPt = prepared ? [...prepared.columns] : resolveColumnWidths(table, contentWPt, state, decision, member);
@@ -2524,6 +2927,7 @@ function computeTablePtLayout(
     [sourceIndex],
     dependencies,
     member,
+    { kind: 'story-root', story: 'body' },
   );
   // Split rows are page-local acquisitions, but an unchanged inline extent
   // retains one authoritative track vector for the table's full occurrence.
@@ -2543,8 +2947,6 @@ function computeTablePtLayout(
     reusableAcrossPages: retainedTableAcquisitionIsReusableAcrossPages(retained),
     anchorYPt: state.y,
   }));
-  const rowHeightsPt = retained.layout.rows.map((row) => row.advancePt);
-  return { colWidthsPt, rowContentHeightsPt: rowHeightsPt, rowHeightsPt };
 }
 
 /** Acquire columns after parser-owned §17.4.37 grouping. Both pagination and
