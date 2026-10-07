@@ -438,6 +438,27 @@ describe('stopIfTrue — a matching rule stops lower-priority rules (ECMA-376 §
     return evaluateCf(numCell(1, 0, 5), 1, 0, compileCf(ws), [FILL_RED, FONT_BLUE]);
   };
 
+  it('an unsupported or incomplete expression neither formats nor stops valid lower rules', () => {
+    // Unsupported values must not become 0: comparisons, NOT and arithmetic
+    // can turn that placeholder into TRUE and suppress real formatting.
+    for (const formula of [
+      'UNSUPPORTED(1)=0', 'NOT(UNSUPPORTED(1))', 'UNSUPPORTED(1)+1=1',
+      'MissingName=0', 'NOT(MissingName)', 'MissingName+1=1',
+      '1^0=0', '1!=1', '1 0', '1+=1', '"unfinished',
+    ]) {
+      const res = evalWith({ type: 'expression', formula, dxfId: 1, priority: 1, stopIfTrue: true });
+      expect(res.fontColor, formula).toBeUndefined();
+      expect(res.fill?.fgColor, formula).toBe('#FF0000');
+      expect(res.iconSet, formula).toBeDefined();
+    }
+    // Valid constant functions and leading '=' are common CF spellings.
+    for (const formula of ['TRUE', 'TRUE()', '=AND(1>0,NOT(FALSE()))', '1+2=3']) {
+      const res = evalWith({ type: 'expression', formula, dxfId: 1, priority: 1, stopIfTrue: true });
+      expect(res.fontColor, formula).toBe('#0000FF');
+      expect(res.fill, formula).toBeUndefined();
+    }
+  });
+
   it.each(stoppers)('%s: applies its own dxf and skips every lower-priority rule', (_, stopper) => {
     const res = evalWith(stopper);
     expect(res.fontColor).toBe('#0000FF');
