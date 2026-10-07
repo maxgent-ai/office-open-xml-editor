@@ -1151,10 +1151,12 @@ fn parse_chartex_impl(
         .is_some_and(|node| attr(node, "layoutId").as_deref() == Some("paretoLine"))
         && first_column.is_some()
         && pareto_pair.is_none();
-    // [MS-ODRAWXML] CT_Series/axisId identifies the value axis and CT_Axis
-    // supplies its percentage units. Office 16.113 uses the first series'
-    // axis on the left: a line-first plot therefore moves its column axis to
-    // the right, even when that line has no valid owner.
+    // [MS-ODRAWXML] CT_Series/ownerIdx identifies the owning series and axisId
+    // identifies the value axis. Axis side is observed Office behavior:
+    // Word/PowerPoint 16.113 put a retained, owned line-first percentage axis
+    // on the left and its column axis on the right. An unowned line is
+    // discarded and leaves the column axis on the left; its authored axisId
+    // cannot establish axis placement for the retained plot.
     let percentage_axis = root.descendants().find(|axis| {
         axis.is_element()
             && axis.tag_name().name() == "axis"
@@ -1174,9 +1176,8 @@ fn parse_chartex_impl(
             .any(|node| attr(&node, "val").as_deref() == Some(axis_id.as_str()))
     };
     let primary_axis_right = first_column.is_some()
-        && series_nodes.first().is_some_and(|node| {
-            attr(node, "layoutId").as_deref() == Some("paretoLine")
-                && references_percentage_axis(*node)
+        && pareto_pair.is_some_and(|(_, line)| {
+            series_nodes.first() == Some(&line) && references_percentage_axis(line)
         });
     // A data-bearing, unowned paretoLine keeps axis 2's ticks in PowerPoint,
     // but Excel suppresses that axis with the line. The axis itself must opt

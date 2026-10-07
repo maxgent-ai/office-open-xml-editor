@@ -2105,6 +2105,32 @@ mod tests {
         assert_eq!(line_first.chartex_pareto_owner_index, Some(0));
         assert_eq!(line_first.chartex_pareto_outline_owner, Some(true));
         assert_eq!(line_first.chartex_primary_axis_right, Some(true));
+        // A discarded line cannot establish axis placement for the retained
+        // columns, whether its owner is missing, self-referential or out of range.
+        for owner_index in ["", " ownerIdx=\"0\"", " ownerIdx=\"7\""] {
+            let series = format!(
+                "<cx:series layoutId=\"paretoLine\"{owner_index}><cx:axisId val=\"2\"/></cx:series>{owner}"
+            );
+            for host in [ChartHost::Word, ChartHost::PowerPoint] {
+                let model = parse_pareto_control(&series, host);
+                assert_eq!(
+                    model.chart_type, "clusteredColumn",
+                    "{host:?} {owner_index}"
+                );
+                assert_eq!(
+                    model.chartex_primary_axis_right, None,
+                    "{host:?} {owner_index}"
+                );
+            }
+        }
+        // A later valid pair does not make a discarded leading line an owner.
+        let later_pair = format!(
+            "<cx:series layoutId=\"paretoLine\"><cx:axisId val=\"2\"/></cx:series>{owner}<cx:series layoutId=\"paretoLine\" ownerIdx=\"1\"><cx:axisId val=\"2\"/></cx:series>"
+        );
+        let later_pair = parse_pareto_control(&later_pair, ChartHost::PowerPoint);
+        assert_eq!(later_pair.chart_type, "pareto");
+        assert_eq!(later_pair.chartex_pareto_owner_index, Some(0));
+        assert_eq!(later_pair.chartex_primary_axis_right, None);
         for index in ["", " ownerIdx=\"7\"", " ownerIdx=\"1\""] {
             let unpaired = parse_pareto_control(
                 &format!("{owner}<cx:series layoutId=\"paretoLine\"{index}/>"),
@@ -2208,7 +2234,7 @@ mod tests {
             powerpoint_first_line.chartex_pareto_outline_owner,
             Some(true)
         );
-        assert_eq!(powerpoint_first_line.chartex_primary_axis_right, Some(true));
+        assert_eq!(powerpoint_first_line.chartex_primary_axis_right, None);
         let unpaired_with_data = format!(
             "{owner}<cx:series layoutId=\"paretoLine\"><cx:dataId val=\"0\"/><cx:axisId val=\"2\"/></cx:series>"
         );
