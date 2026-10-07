@@ -51,9 +51,10 @@ use crate::officeart::{
 /// This record is handled separately from the generic record walker because
 /// PowerPoint for Mac writes an empty-user-name atom with `recLen = 0x1c` but
 /// can omit the final four zero bytes when the CFB stream is stored in the mini
-/// stream. All normative fields through `relVersion` are still present. Keep
-/// that compatibility allowance exact and bounded; other truncated records
-/// remain errors. See [MS-PPT] 2.3.2.
+/// stream. All normative fields through `relVersion` are still present. It
+/// also accepts the Apache POI layout described below. Keep both compatibility
+/// allowances exact and bounded; other truncated records remain errors. See
+/// [MS-PPT] 2.3.2.
 fn parse_current_user_atom(bytes: &[u8], budget: &mut usize) -> Result<usize, String> {
     if *budget == 0 {
         return Err(unsupported("too many PowerPoint records"));
@@ -117,7 +118,18 @@ fn parse_current_user_atom(bytes: &[u8], budget: &mut usize) -> Result<usize, St
     if !standard_length && !mac_empty_name_length {
         return Err(unsupported("invalid PowerPoint CurrentUserAtom length"));
     }
-    let consumed = declared_len.min(payload.len());
+    // MS-PPT 2.3.2 puts the optional unicodeUserName (2 * lenUserName bytes)
+    // inside recLen. Apache POI's HSLF CurrentUserAtom.writeOut declares
+    // recLen = 24 + lenUserName yet still writes that complete Unicode field
+    // after relVersion. Accept only that exact field after an ANSI-only recLen:
+    // a shorter tail must remain all-zero padding, and nonzero bytes after
+    // the complete field remain errors. The name itself is never used, so
+    // its contents are not validated or compared with the ANSI name.
+    let consumed = if declared_len == required_len && payload.len() >= with_unicode_len {
+        with_unicode_len
+    } else {
+        declared_len.min(payload.len())
+    };
     if payload[consumed..].iter().any(|byte| *byte != 0) {
         return Err(unsupported(
             "unexpected data after PowerPoint CurrentUserAtom",
@@ -497,6 +509,121 @@ mod tests {
         let bytes = current_user_atom(28, &empty_user_payload(1234));
         let mut budget = MAX_RECORDS;
         assert_eq!(parse_current_user_atom(&bytes, &mut budget).unwrap(), 1234);
+    }
+
+    fn named_user_payload(ansi: &[u8], unicode: &[u8]) -> Vec<u8> {
+        let mut payload = empty_user_payload(1234);
+        payload.truncate(20);
+        payload[12..14].copy_from_slice(&u16::try_from(ansi.len()).unwrap().to_le_bytes());
+        payload.extend_from_slice(ansi);
+        payload.extend_from_slice(&8u32.to_le_bytes());
+        payload.extend_from_slice(unicode);
+        payload
+    }
+
+    fn utf16le(text: &str) -> Vec<u8> {
+        text.encode_utf16().flat_map(u16::to_le_bytes).collect()
+    }
+
+    #[test]
+    fn current_user_name_layouts_accept_standard_and_poi_forms_only() {
+        let ann = utf16le("Ann");
+        let (ansi_only, full) = (24 + 3, 24 + 3 * 3);
+        let named = named_user_payload(b"Ann", &ann);
+        let empty = empty_user_payload(1234);
+        let with = |payload: &[u8], tail: &[u8]| [payload, tail].concat();
+        let longest = vec![b'a'; 255];
+        let cases = [
+            ("standard ANSI and Unicode", full, named.clone(), true),
+            (
+                "standard with zero padding",
+                full,
+                with(&named, &[0; 4]),
+                true,
+            ),
+            (
+                "ANSI only",
+                ansi_only,
+                named_user_payload(b"Ann", &[]),
+                true,
+            ),
+            (
+                "ANSI only, short zero padding",
+                ansi_only,
+                named_user_payload(b"Ann", &[0; 2]),
+                true,
+            ),
+            ("POI Unicode outside recLen", ansi_only, named.clone(), true),
+            (
+                "POI Unicode, zero padding",
+                ansi_only,
+                with(&named, &[0; 4]),
+                true,
+            ),
+            (
+                "POI non-ASCII Unicode differing from ANSI",
+                24 + 2,
+                named_user_payload(b"??", &utf16le("山田")),
+                true,
+            ),
+            (
+                "POI longest name",
+                24 + 255,
+                named_user_payload(&longest, &utf16le(&"a".repeat(255))),
+                true,
+            ),
+            ("empty name", 24, empty.clone(), true),
+            ("Mac empty name, zero tail", 28, with(&empty, &[0; 4]), true),
+            (
+                "truncated POI Unicode",
+                ansi_only,
+                named_user_payload(b"Ann", &ann[..5]),
+                false,
+            ),
+            (
+                "nonzero after POI Unicode",
+                ansi_only,
+                with(&named, &[0, 1]),
+                false,
+            ),
+            (
+                "nonzero after standard Unicode",
+                full,
+                with(&named, &[1]),
+                false,
+            ),
+            ("nonzero after empty name", 24, with(&empty, &[1, 0]), false),
+            (
+                "Mac empty name, nonzero tail",
+                28,
+                with(&empty, &[0, 0, 0, 1]),
+                false,
+            ),
+            (
+                "recLen between layouts",
+                ansi_only + 2,
+                named.clone(),
+                false,
+            ),
+            (
+                "recLen past truncated Unicode",
+                full,
+                named_user_payload(b"Ann", &ann[..4]),
+                false,
+            ),
+            (
+                "name longer than 255",
+                24 + 256,
+                named_user_payload(&[b'a'; 256], &[]),
+                false,
+            ),
+        ];
+        for (label, declared_len, payload, accepted) in cases {
+            let mut budget = MAX_RECORDS;
+            let result =
+                parse_current_user_atom(&current_user_atom(declared_len, &payload), &mut budget);
+            assert_eq!(result.ok(), accepted.then_some(1234), "{label}");
+        }
     }
 
     #[test]
