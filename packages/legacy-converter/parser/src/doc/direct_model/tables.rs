@@ -162,6 +162,11 @@ fn project_table(
     } else {
         alignment
     };
+    // Only the main-story writer enables positioned_tables. Nested and
+    // other-story RTL P/O disagreements have no established placement owner
+    // in this bounded direct projection and retain the equality fallback.
+    let leading_ordinary_table =
+        positioned_tables && plan.depth == 1 && ordinary_flow && alignment == 0;
     let row_count = plan.rows.len();
     let mut col_widths = Vec::new();
     reserve(&mut col_widths, plan.grid.len() - 1, &mut |n| {
@@ -182,7 +187,7 @@ fn project_table(
                 "direct DOC model cannot retain row table-property shading",
             ));
         }
-        check_row_preferences(&planned, ordinary_flow && alignment == 0)?;
+        check_row_preferences(&planned, leading_ordinary_table)?;
         let mut cells = Vec::new();
         reserve(&mut cells, planned.cells.len(), &mut |n| {
             charge_cell(remaining, n)
@@ -473,12 +478,12 @@ fn check_row_preferences(
             Some(PreferredIndent::Dxa(value)) if i32::from(value) == source.origin()
         )
     {
-        // [MS-DOC] 2.6.3 TDxaLeft/GapHalf and 2.9.321 TDefTableOperand
-        // acquire the signed logical origin, independently of the validated
-        // preferred indent (2.9.102). Ordinary leading RTL tables project that
-        // edge through tblInd+bidiVisual, mirroring once. Nonleading/floating
-        // placement has a separate owner and remains bounded to equal values
-        // until its interaction with the preference is established.
+        // MS-DOC 2.6.3/2.9.321 specify acquired logical row geometry;
+        // 2.9.102 defines a separate preference. Retaining O rather than P is
+        // the bounded direct-projection policy documented on PreferredIndent,
+        // not a normative P/O precedence claim. Only ordinary leading main-
+        // story, depth-one RTL tables use that policy through bidiVisual.
+        // Other placement classes retain the exact-equality fallback.
         return Err(unsupported(
             "direct DOC model cannot place a right-to-left table with a preferred indent",
         ));
@@ -597,6 +602,108 @@ mod tests {
             })));
         Blocks(vec![Block::Paragraph(Box::new(p))])
     }
+    #[test]
+    fn preferred_indent_checks_final_cell_sum_not_union_grid_extent() {
+        let project = |preferred: i16, shifted: bool| -> Result<Blocks, String> {
+            let mut sequence = 0;
+            let mut writer = Writer::with_positioned_tables(&mut sequence, true);
+            let mut budget = ModelBudget::new(1_000_000);
+            for origin in if shifted { vec![0, 360] } else { vec![0] } {
+                let mut end = row(1, &[400, 600]);
+                end.row.bidi = true;
+                end.row.left = origin;
+                end.row.preferred_indent = Some(PreferredIndent::Dxa(if shifted && origin == 0 {
+                    30_680
+                } else {
+                    preferred
+                }));
+                for text in ["a", "b"] {
+                    writer.push(
+                        cell(1),
+                        '\u{7}',
+                        paragraph(text),
+                        &mut unframed,
+                        &mut budget,
+                    )?;
+                }
+                writer.push(end, '\u{7}', Blocks::default(), &mut unframed, &mut budget)?;
+            }
+            writer.finish(&mut budget)
+        };
+        // MS-DOC 2.9.102: P + the final cell-width sum may equal 31680.
+        // The shifted second row widens the union grid without widening its
+        // own cells. It must not falsely invalidate the legal preference.
+        for shifted in [false, true] {
+            let blocks = project(30_680, shifted).unwrap();
+            let Block::Table(table) = &blocks.0[0] else {
+                panic!()
+            };
+            assert_eq!(table.rows.len(), if shifted { 2 } else { 1 });
+            assert_eq!(
+                table.col_widths.iter().sum::<f64>(),
+                if shifted { 68.0 } else { 50.0 }
+            );
+            let error = project(30_681, shifted).err().unwrap();
+            assert!(error.contains("preferred indent plus row width"), "{error}");
+        }
+    }
+
+    #[test]
+    fn differing_rtl_preference_requires_main_story_top_level_owner() {
+        let project = |main_story: bool, nested: bool, preferred: i16| -> Result<Blocks, String> {
+            let mut sequence = 0;
+            let mut writer = Writer::with_positioned_tables(&mut sequence, main_story);
+            let mut budget = ModelBudget::new(1_000_000);
+            let depth = if nested { 2 } else { 1 };
+            if nested {
+                writer.push(
+                    cell(1),
+                    '\r',
+                    paragraph("parent"),
+                    &mut unframed,
+                    &mut budget,
+                )?;
+            }
+            let mut content = cell(depth);
+            content.inner_cell = nested;
+            let mut end = row(depth, &[1000]);
+            end.row.bidi = true;
+            end.row.preferred_indent = Some(PreferredIndent::Dxa(preferred));
+            let mark = if nested { '\r' } else { '\u{7}' };
+            writer.push(
+                content,
+                mark,
+                paragraph("child"),
+                &mut unframed,
+                &mut budget,
+            )?;
+            writer.push(end, mark, Blocks::default(), &mut unframed, &mut budget)?;
+            if nested {
+                writer.push(
+                    cell(1),
+                    '\u{7}',
+                    Blocks::default(),
+                    &mut unframed,
+                    &mut budget,
+                )?;
+                writer.push(
+                    row(1, &[1000]),
+                    '\u{7}',
+                    Blocks::default(),
+                    &mut unframed,
+                    &mut budget,
+                )?;
+            }
+            writer.finish(&mut budget)
+        };
+        assert!(project(true, false, 109).is_ok());
+        for (main_story, nested) in [(false, false), (true, true)] {
+            assert!(project(main_story, nested, 0).is_ok());
+            let error = project(main_story, nested, 109).err().unwrap();
+            assert!(error.contains("right-to-left"), "{error}");
+        }
+    }
+
     #[test]
     fn plain_table_preserves_zero_grid_slots_merges_and_cell_break_runs() {
         let mut sequence = 0;

@@ -3758,6 +3758,26 @@ mod tests {
     }
 
     #[test]
+    fn native_story_bounds_preferred_indent_after_final_width_override() {
+        let project = |preferred: i16, width: u16| {
+            let after = [
+                sprm(0x560b, &1u16.to_le_bytes()),
+                sprm(0xf661, &[&[3][..], &preferred.to_le_bytes()].concat()),
+                sprm(0x7623, &[&[0, 1][..], &width.to_le_bytes()].concat()),
+            ]
+            .concat();
+            try_default_styled_table(&[], &after)
+        };
+        let legal = project(30_679, 1001).unwrap();
+        assert_eq!(legal.table_grids, [vec![50.05]]);
+        assert_eq!(legal.table_indents, [Some(0.0)]);
+        // The preference precedes the width mutation in the property stream.
+        // Its scalar bound is legal, but the final table edge is one twip too far.
+        let error = project(30_680, 1001).err().unwrap();
+        assert!(error.contains("preferred indent plus row width"), "{error}");
+    }
+
+    #[test]
     fn native_story_preserves_logical_rtl_origin_independent_of_preferred_indent() {
         // Direct preferences after TIstd supersede inherited P=0, while the
         // signed acquired edge stays the layout coordinate. No small-offset

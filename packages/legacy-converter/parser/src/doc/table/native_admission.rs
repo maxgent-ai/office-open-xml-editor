@@ -246,14 +246,18 @@ pub(in crate::doc) fn cell_text_flow(flags: u16) -> u16 {
 /// [MS-DOC] 2.9.102 FtsWWidth_Indent, the preferred leading indent written by
 /// sprmTWidthIndent.
 ///
-/// [MS-DOC] 2.6.3 TDxaLeft/GapHalf and 2.9.321 TDefTableOperand acquire
-/// the signed logical horizontal origin independently of this preference.
-/// The direct model projects that acquired edge; replacing it with the
-/// preference would lose native geometry. This includes ordinary leading RTL
-/// tables, whose logical edge is mirrored once through bidiVisual. Nonleading
-/// or floating RTL preferences stay bounded at projection until their separate
-/// placement owner's interaction is established. All preferred units, operand
-/// lengths and ranges remain validated here.
+/// MS-DOC 2.6.3 TDxaLeft/GapHalf and 2.9.321 TDefTableOperand encode
+/// acquired logical row geometry; 2.9.102 describes a separate preference.
+/// Earlier Word PDF controls of two LTR documents with differing P/O placed
+/// borders from acquired O: one differed by the left default cell margin,
+/// one had nil margins. Their paired OOXML documents carried P as tblInd.
+/// The direct producer retains acquired O rather than replacing it with P.
+/// Ordinary leading, top-level main-story RTL tables use this same bounded
+/// converter policy through tblInd+bidiVisual. The logical transformation is
+/// specified; P/O precedence is not claimed as a normative or independently
+/// observed RTL rule. Other RTL placement classes retain equality gating.
+/// Scalar units, lengths and ranges are checked here; the final row-width
+/// bound is checked during grid planning after the complete property cascade.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::doc) enum PreferredIndent {
     Nil,
@@ -262,6 +266,23 @@ pub(in crate::doc) enum PreferredIndent {
 }
 
 impl PreferredIndent {
+    /// MS-DOC 2.9.102: Dxa indentation plus the final table/cell-sum width
+    /// must not exceed 31680 twips, even when the preference is not used for
+    /// placement. The caller supplies validated nonnegative final cell widths.
+    pub(in crate::doc) fn check_row_width(self, width: i32) -> Result<(), String> {
+        if let Self::Dxa(value) = self {
+            let edge = i32::from(value)
+                .checked_add(width)
+                .ok_or("OUTPUT_TOO_LARGE")?;
+            if edge > 31_680 {
+                return Err(unsupported(
+                    "Word preferred indent plus row width outside range",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub(in crate::doc) fn read(bytes: &[u8]) -> Result<Self, String> {
         let [fts, low, high] = bytes else {
             return Err(unsupported("invalid Word preferred indent length"));
