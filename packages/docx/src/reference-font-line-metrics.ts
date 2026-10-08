@@ -6,6 +6,7 @@ import { wordOpenTypeAutoLineRatios } from './layout/line-compatibility.js';
 
 export interface ReferenceFontLineMetrics {
   readonly lineHeightRatio: number;
+  readonly farEastCodePage: boolean;
   readonly designAscentRatio: number;
   readonly designDescentRatio: number;
   readonly eastAsianLineHeightRatio?: undefined;
@@ -62,6 +63,7 @@ function project(profile: ReferenceFontMetricProfile): ReferenceFontLineMetrics 
     && projected.designDescentRatio != null
     ? Object.freeze({
         lineHeightRatio: projected.lineHeightRatio,
+        farEastCodePage: profile.farEastCodePage === true,
         designAscentRatio: projected.designAscentRatio,
         designDescentRatio: projected.designDescentRatio,
       })
@@ -76,6 +78,7 @@ function identicalProjection(
   const projected = profiles.map(project);
   const first = projected[0];
   if (!first || projected.some((candidate) => !candidate
+    || candidate.farEastCodePage !== first.farEastCodePage
     || candidate.lineHeightRatio !== first.lineHeightRatio
     || candidate.designAscentRatio !== first.designAscentRatio
     || candidate.designDescentRatio !== first.designDescentRatio)) return undefined;

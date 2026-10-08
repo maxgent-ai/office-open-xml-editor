@@ -39,6 +39,7 @@
  * would be discarded AND a second full layout built.
  */
 import { layoutDocumentProgressively } from './layout/progressive.js';
+import { unchangedLeadingPageCount } from './layout/unchanged-pages.js';
 import type { DeepReadonly, DocumentLayout } from './layout/types.js';
 import type { LayoutOptions } from './layout/options.js';
 import type { LayoutSourceStore } from './layout/layout-source-store.js';
@@ -75,10 +76,12 @@ function publicationOf(
   exact: boolean,
   source: LayoutSourceStore,
   review: RenderWorkerReviewIndexInput,
+  unchangedPages: number,
 ): RenderWorkerLayoutPublication {
   return {
     ...projectRenderWorkerLayoutMeta(layout, source, review, { provisional: true }),
     exact,
+    unchangedPages,
   };
 }
 
@@ -106,7 +109,7 @@ export async function paginateRenderWorkerDocumentProgressively(
   layoutOptions: LayoutOptions,
   signal?: AbortSignal,
   review: RenderWorkerReviewIndexInput = { comments: [], revisions: [] },
-): Promise<void> {
+): Promise<number> {
   const store = doc.layoutVariants;
   let publishedLayout: DeepReadonly<DocumentLayout> | null = null;
   let ownsPublication = true;
@@ -118,6 +121,7 @@ export async function paginateRenderWorkerDocumentProgressively(
       scheduler: { signal, onProgress: (committedPages) => publisher.progress(committedPages) },
       onPreview: (preview) => {
         if (!ownsPublication) return;
+        const unchangedPages = unchangedLeadingPageCount(publishedLayout?.pages, preview.layout.pages);
         const retainedPreview = store.replaceIfCurrent(
           layoutOptions,
           publishedLayout,
@@ -130,13 +134,16 @@ export async function paginateRenderWorkerDocumentProgressively(
           return;
         }
         publishedLayout = retainedPreview;
-        publisher.publish(publicationOf(preview.layout, preview.exact, source, review));
+        publisher.publish(publicationOf(preview.layout, preview.exact, source, review, unchangedPages));
       },
     },
   );
   // Replace only the exact prefix this drain still owns. If a newer layout now
   // occupies the key, the parse response reads that authority back instead.
-  if (ownsPublication) {
-    store.replaceIfCurrent(layoutOptions, publishedLayout, layout);
-  }
+  // Returns how many leading pages it shares with the last publication.
+  if (!ownsPublication) return 0;
+  // Reassigned by the preview callback, which flow analysis cannot see.
+  const lastPublished = publishedLayout as DeepReadonly<DocumentLayout> | null;
+  const authoritative = store.replaceIfCurrent(layoutOptions, lastPublished, layout);
+  return authoritative === null ? 0 : unchangedLeadingPageCount(lastPublished?.pages, layout.pages);
 }

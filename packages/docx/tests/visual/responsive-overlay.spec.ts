@@ -31,7 +31,7 @@ test('find/selection overlays do not overflow a scaled-canvas scroll area › de
     stageClientHeight: number;
     canvasCssWidth: number;
     canvasCssHeight: number;
-    overlayRects: { w: number; h: number }[];
+    overlayRects: { tag: string; w: number; h: number }[];
   };
 
   // Precondition: the canvas really was scaled DOWN below its intended 794px box.
@@ -50,9 +50,8 @@ test('find/selection overlays do not overflow a scaled-canvas scroll area › de
   // The overlay layers track the SCALED canvas on BOTH axes, not the intended
   // 794px box — this is the direct fix assertion: an overlay pinned to the
   // intended box (the bug) would be wider AND taller than the scaled canvas.
-  // Exactly the text-selection layer and the find-highlight layer: a count
-  // check keeps an unrelated wrapper child from standing in for an overlay.
-  expect(r.overlayRects.length).toBe(2);
+  // Identify all three layers explicitly, including the optional element outline.
+  expect(r.overlayRects.map((rect) => rect.tag).sort()).toEqual(['element', 'highlight', 'text']);
   for (const rect of r.overlayRects) {
     expect(Math.abs(rect.w - r.canvasCssWidth)).toBeLessThanOrEqual(1);
     expect(Math.abs(rect.h - r.canvasCssHeight)).toBeLessThanOrEqual(1);

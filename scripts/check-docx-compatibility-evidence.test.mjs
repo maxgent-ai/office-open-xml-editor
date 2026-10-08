@@ -18,7 +18,6 @@ function fixture() {
   const references = [
     ['packages/docx/src/layout/coordinate-space.test.ts', ['maps Transitional text direction %s to %s']],
     ['packages/docx/src/float-line-start-one-inch.test.ts', [
-      '(e) the boundary is identical across scales (absolute pt width)',
       'keeps an anchor-host metric-only line on the paragraph-mark threshold',
     ]],
     ['packages/docx/src/layout/floats.test.ts', ['keeps observed different-paragraph displacement on exclusion bounds']],
@@ -92,7 +91,7 @@ test('rejects duplicate rule ids across compatibility modules', () => {
   write(root, 'packages/docx/src/layout/table-compatibility.ts', `
     import { defineCompatibilityRule } from './compatibility.js';
     export const WORD_DUPLICATE = defineCompatibilityRule({
-      id: 'word-square-line-start-one-inch',
+      id: 'word-float-gap-flow',
       evidence: { kind: 'microsoft-note', reference: '[MS-OI29500] §2.1.120' },
       description: 'Duplicate rule',
     });

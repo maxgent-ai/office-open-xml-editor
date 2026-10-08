@@ -68,6 +68,7 @@ describe('PptxViewer progressive layout', () => {
 
     const navigation = viewer.goToSlide(2);
     expect(loading.style.display).toBe('flex');
+    expect(wrapper.children.some((child) => child.textContent === 'Loading slide')).toBe(true);
     expect(viewer.slideCount).toBe(3);
     expect(viewer.availableSlideCount).toBe(1);
     expect(viewer.layoutComplete).toBe(false);
@@ -75,6 +76,7 @@ describe('PptxViewer progressive layout', () => {
     engine.setLayoutProgress(3, true);
     await navigation;
     expect(loading.style.display).toBe('none');
+    expect(wrapper.children.some((child) => child.textContent === 'Loading slide')).toBe(false);
     expect(onSlideChange).toHaveBeenLastCalledWith(2, 3, true);
     viewer.destroy();
   });

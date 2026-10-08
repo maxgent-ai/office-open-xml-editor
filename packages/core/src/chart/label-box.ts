@@ -1,6 +1,6 @@
 import type { ChartExElementStyle, ChartLabelBox, ChartRect } from '../types/chart.js';
 import { drawingmlLineDashArray } from '../draw/dash.js';
-import { fillCanProduceVisiblePixels, resolveFill } from '../shape/paint.js';
+import { fillCanProduceVisiblePixels, resolveNativeFill as resolveFill } from '../shape/paint.js';
 import { EMU_PER_PT } from '../units.js';
 import { chartStyleEffectOwner, paintChartStyleEffects } from './style-effects.js';
 import {

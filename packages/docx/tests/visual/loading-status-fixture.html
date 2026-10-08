@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="en">
+<body>
+  <div id="host" style="position:relative;width:200px;height:100px"></div>
+  <button id="start">Start loading</button>
+  <button id="finish">Finish loading</button>
+  <script type="module">
+    import { CanvasLoadingIndicator } from '@silurus/ooxml-core/internal/canvas-viewer-mechanics';
+    const indicator = new CanvasLoadingIndicator(document.getElementById('host'), 'Loading page');
+    document.getElementById('start').onclick = () => indicator.setLoading(true);
+    document.getElementById('finish').onclick = () => indicator.setLoading(false);
+  </script>
+</body>
+</html>

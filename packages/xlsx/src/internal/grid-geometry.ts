@@ -1,5 +1,5 @@
 import type { ViewportRange, Worksheet } from '../types.js';
-import { baseColWidthToPx, colWidthToPx, rowHeightToPx } from './grid-metrics.js';
+import { baseColWidthToPx, colWidthToPx, rowHeightToPx, uiColWidthToPx } from './grid-metrics.js';
 import { isMacDesktop } from './platform.js';
 import { GridAxisGeometry } from './grid-axis-geometry.js';
 
@@ -85,9 +85,13 @@ export class GridGeometry {
     this.maximumDigitWidth = mdw;
     this.freezeRows = Math.min(MAX_WORKSHEET_ROW, Math.max(0, worksheet.freezeRows ?? 0));
     this.freezeCols = Math.min(MAX_WORKSHEET_COL, Math.max(0, worksheet.freezeCols ?? 0));
-    const defaultColPx = worksheet.baseColWidth === undefined
-      ? colWidthToPx(worksheet.defaultColWidth, mdw)
-      : baseColWidthToPx(worksheet.baseColWidth, mdw, isMacDesktop());
+    // baseColWidth always wins. Otherwise the absent-sheetFormatPr flag selects
+    // UI-character encoding, and an unflagged default is a stored width.
+    const defaultColPx = worksheet.baseColWidth !== undefined
+      ? baseColWidthToPx(worksheet.baseColWidth, mdw, isMacDesktop())
+      : worksheet.defaultColWidthIsUi === true
+        ? uiColWidthToPx(worksheet.defaultColWidth, mdw)
+        : colWidthToPx(worksheet.defaultColWidth, mdw);
     const resolvedColWidths = new Float64Array(MAX_WORKSHEET_COL + 1);
     resolvedColWidths.fill(Number.NaN);
     // Resolve declarations from last to first. The disjoint-set successor

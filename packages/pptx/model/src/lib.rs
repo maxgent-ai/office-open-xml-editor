@@ -238,6 +238,10 @@ pub struct ChartElement {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct TableElement {
+    /// ECMA-376 §20.1.4.2.25 `tblBg`: painted once below cell fills so
+    /// transparent bands reveal the theme background rather than the slide.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<Fill>,
     /// `<p:nvGraphicFramePr><p:cNvPr @id>` for the table frame.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
@@ -992,6 +996,11 @@ pub struct TextBody {
     #[serde(skip_serializing_if = "is_false")]
     #[serde(default)]
     pub spc_first_last_para: bool,
+    /// `<a:bodyPr anchorCtr>` (ECMA-376 §21.1.2.1.1) — centre the text block
+    /// perpendicular to the anchor. Default false.
+    #[serde(skip_serializing_if = "is_false")]
+    #[serde(default)]
+    pub anchor_ctr: bool,
     /// Effective `<a:bodyPr compatLnSpc>` (ECMA-376 §21.1.2.1.1) after the
     /// slide → layout → master placeholder cascade. None when no level
     /// authors it. Only `Some(false)` changes layout (see the renderer's
@@ -1176,11 +1185,6 @@ pub struct Paragraph {
     /// never merged into existing a:r/a:fld runs (ECMA-376 §21.1.2.2.2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end_run_properties: Option<Box<TextRunData>>,
-    /// Whether `endParaRPr` authors its own latin face (`a:latin@typeface`).
-    /// Only such a face is known to join the paragraph's last line with text
-    /// (#1636 controls); an inherited one keeps the previous behaviour.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub end_face_authored: bool,
 }
 
 // serde-facing parser output enum; same rationale as SlideElement — the Text
@@ -1273,8 +1277,9 @@ pub struct TextRunData {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub no_fill: bool,
     pub font_family: Option<String>,
-    /// East Asian font family from rPr > ea (resolved through the theme).
-    /// Renderer uses this for CJK runs. None = inherit from latin font.
+    /// East Asian face after the ea cascade and the theme script font of the
+    /// run language (issue #1627). None = the slot has no face: the renderer
+    /// applies PowerPoint's application default, not the Latin face.
     /// ECMA-376 §21.1.2.3.3 (CT_TextFont, ea variant).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub font_family_ea: Option<String>,
@@ -1286,6 +1291,14 @@ pub struct TextRunData {
     /// ECMA-376 §21.1.2.3.10 (CT_TextFont, sym variant).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub font_family_sym: Option<String>,
+    /// Cascaded run language (`rPr@lang`, ECMA-376 §21.1.2.3.9) after list
+    /// styles, paragraph defaults and the run. It selected the theme script
+    /// fonts already resolved into the three face slots (issue #1627).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lang: Option<String>,
+    /// Cascaded alternate language (`rPr@altLang`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alt_lang: Option<String>,
     /// Baseline shift in thousandths of a point. Positive = superscript, negative = subscript.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub baseline: Option<i32>,

@@ -103,10 +103,10 @@ pub(crate) fn apply_transforms(hex: &str, transforms: &[(&str, i64)]) -> String 
                 bf *= v;
             }
             "tint" => {
-                // Built-in PowerPoint table styles use the same literal tint
-                // semantics as XML-backed table styles: val is the retained
-                // input fraction in encoded sRGB, not a white amount.
-                (rf, gf, bf) = apply_tint_channels((rf, gf, bf), v, TintMode::WordLiteral);
+                // ECMA-376 §20.1.2.3.34; PowerPoint applies tint in linear
+                // sRGB, including generated table presets. Tagged PDF controls
+                // for Medium Style 2 distinguish this from encoded-sRGB tint.
+                (rf, gf, bf) = apply_tint_channels((rf, gf, bf), v, TintMode::PowerPointLinear);
             }
             "alpha" => {
                 alpha = v;
@@ -148,7 +148,7 @@ fn solid(color: &str) -> Fill {
     }
 }
 
-fn stroke(color: &str) -> Stroke {
+pub(crate) fn stroke(color: &str) -> Stroke {
     Stroke {
         color: color.to_owned(),
         width: 12700,
@@ -245,27 +245,52 @@ macro_rules! table_style {
     }};
 }
 
-// ── Family generators ────────────────────────────────────────────────────────
+// [MS-OE376] §2.1.1343(b): built-in base definitions and scheme-colour
+// replacement rules. Keep the declarative roles lossless and resolve them with
+// the same parser as package-defined styles: fillRef/lnRef depend on the active
+// theme matrix, not just its palette. Tagged PowerPoint PDF controls confirmed
+// all six accent variants, both band directions, isolated/combined edge flags,
+// explicit false flags, four matrices and direct bold overrides.
+const NO_GRID: &str = r#"<a:tblStyle styleId="{2D5ABB26-0587-4C30-8999-92F81FD0307C}" styleName=""><a:wholeTbl><a:tcTxStyle><a:fontRef idx="minor"><a:scrgbClr r="0" g="0" b="0"/></a:fontRef><a:schemeClr val="tx1"/></a:tcTxStyle><a:tcStyle><a:tcBdr><a:left><a:ln><a:noFill/></a:ln></a:left><a:right><a:ln><a:noFill/></a:ln></a:right><a:top><a:ln><a:noFill/></a:ln></a:top><a:bottom><a:ln><a:noFill/></a:ln></a:bottom><a:insideH><a:ln><a:noFill/></a:ln></a:insideH><a:insideV><a:ln><a:noFill/></a:ln></a:insideV></a:tcBdr><a:fill><a:noFill/></a:fill></a:tcStyle></a:wholeTbl>
+</a:tblStyle>"#;
 
-fn themed_style_1(theme: &HashMap<String, String>, accent_idx: Option<u8>) -> TableStyleDef {
-    let Some(a) = accent(theme, accent_idx) else {
-        return TableStyleDef::default();
-    };
-    let lt = lt1(theme).unwrap_or_else(|| "FFFFFF".into());
-    let border = Some(stroke(&a));
-    let first_row_fill = Some(solid(&a));
-    let band1h_color = apply_transforms(&a, &[("alpha", 40000)]);
-    let band1h_fill = Some(solid(&band1h_color));
-    table_style! {
-        first_row_fill: first_row_fill,
-        band1h_fill: band1h_fill,
-        whole_outer_h: border.clone(),
-        whole_outer_v: border.clone(),
-        whole_inside_h: border.clone(),
-        whole_inside_v: border,
-        first_row_border_b: Some(stroke(&lt)),
-    }
-}
+const THEMED_1: &str = r#"<a:tblStyle styleId="{3C2FFA5D-87B4-456A-9821-1D502468CF0F}" styleName=""><a:tblBg><a:fillRef idx="2"><a:schemeClr val="accent1"/></a:fillRef><a:effectRef idx="1"><a:schemeClr val="accent1"/></a:effectRef></a:tblBg>
+<a:wholeTbl><a:tcTxStyle><a:fontRef idx="minor"><a:scrgbClr r="0" g="0" b="0"/></a:fontRef><a:schemeClr val="dk1"/></a:tcTxStyle><a:tcStyle><a:tcBdr><a:left><a:lnRef idx="1"><a:schemeClr val="accent1"/></a:lnRef></a:left><a:right><a:lnRef idx="1"><a:schemeClr val="accent1"/></a:lnRef></a:right><a:top><a:lnRef idx="1"><a:schemeClr val="accent1"/></a:lnRef></a:top><a:bottom><a:lnRef idx="1"><a:schemeClr val="accent1"/></a:lnRef></a:bottom><a:insideH><a:lnRef idx="1"><a:schemeClr val="accent1"/></a:lnRef></a:insideH><a:insideV><a:lnRef idx="1"><a:schemeClr val="accent1"/></a:lnRef></a:insideV></a:tcBdr><a:fill><a:noFill/></a:fill></a:tcStyle></a:wholeTbl>
+<a:band1H><a:tcStyle><a:tcBdr/><a:fill><a:solidFill><a:schemeClr val="accent1"><a:alpha val="40000"/></a:schemeClr></a:solidFill></a:fill></a:tcStyle></a:band1H>
+<a:band2H><a:tcStyle><a:tcBdr/></a:tcStyle></a:band2H>
+<a:band1V><a:tcStyle><a:tcBdr><a:top><a:lnRef idx="1"><a:schemeClr val="accent1"/></a:lnRef></a:top><a:bottom><a:lnRef idx="1"><a:schemeClr val="accent1"/></a:lnRef></a:bottom></a:tcBdr><a:fill><a:solidFill><a:schemeClr val="accent1"><a:alpha val="40000"/></a:schemeClr></a:solidFill></a:fill></a:tcStyle></a:band1V>
+<a:band2V><a:tcStyle><a:tcBdr/></a:tcStyle></a:band2V>
+<a:lastCol><a:tcTxStyle b="on"/><a:tcStyle><a:tcBdr><a:left><a:lnRef idx="2"><a:schemeClr val="accent1"/></a:lnRef></a:left><a:right><a:lnRef idx="1"><a:schemeClr val="accent1"/></a:lnRef></a:right><a:top><a:lnRef idx="1"><a:schemeClr val="accent1"/></a:lnRef></a:top><a:bottom><a:lnRef idx="1"><a:schemeClr val="accent1"/></a:lnRef></a:bottom><a:insideH><a:lnRef idx="1"><a:schemeClr val="accent1"/></a:lnRef></a:insideH><a:insideV><a:ln><a:noFill/></a:ln></a:insideV></a:tcBdr></a:tcStyle></a:lastCol>
+<a:firstCol><a:tcTxStyle b="on"/><a:tcStyle><a:tcBdr><a:left><a:lnRef idx="1"><a:schemeClr val="accent1"/></a:lnRef></a:left><a:right><a:lnRef idx="2"><a:schemeClr val="accent1"/></a:lnRef></a:right><a:top><a:lnRef idx="1"><a:schemeClr val="accent1"/></a:lnRef></a:top><a:bottom><a:lnRef idx="1"><a:schemeClr val="accent1"/></a:lnRef></a:bottom><a:insideH><a:lnRef idx="1"><a:schemeClr val="accent1"/></a:lnRef></a:insideH><a:insideV><a:ln><a:noFill/></a:ln></a:insideV></a:tcBdr></a:tcStyle></a:firstCol>
+<a:lastRow><a:tcTxStyle b="on"/><a:tcStyle><a:tcBdr><a:left><a:lnRef idx="1"><a:schemeClr val="accent1"/></a:lnRef></a:left><a:right><a:lnRef idx="1"><a:schemeClr val="accent1"/></a:lnRef></a:right><a:top><a:lnRef idx="2"><a:schemeClr val="accent1"/></a:lnRef></a:top><a:bottom><a:lnRef idx="2"><a:schemeClr val="accent1"/></a:lnRef></a:bottom><a:insideH><a:ln><a:noFill/></a:ln></a:insideH><a:insideV><a:ln><a:noFill/></a:ln></a:insideV></a:tcBdr><a:fill><a:noFill/></a:fill></a:tcStyle></a:lastRow>
+<a:firstRow><a:tcTxStyle b="on"><a:fontRef idx="minor"><a:scrgbClr r="0" g="0" b="0"/></a:fontRef><a:schemeClr val="lt1"/></a:tcTxStyle><a:tcStyle><a:tcBdr><a:left><a:lnRef idx="1"><a:schemeClr val="accent1"/></a:lnRef></a:left><a:right><a:lnRef idx="1"><a:schemeClr val="accent1"/></a:lnRef></a:right><a:top><a:lnRef idx="1"><a:schemeClr val="accent1"/></a:lnRef></a:top><a:bottom><a:lnRef idx="2"><a:schemeClr val="lt1"/></a:lnRef></a:bottom><a:insideH><a:ln><a:noFill/></a:ln></a:insideH><a:insideV><a:ln><a:noFill/></a:ln></a:insideV></a:tcBdr><a:fill><a:solidFill><a:schemeClr val="accent1"/></a:solidFill></a:fill></a:tcStyle></a:firstRow>
+</a:tblStyle>"#;
+
+const GRID: &str = r#"<a:tblStyle styleId="{5940675A-B579-460E-94D1-54222C63F5DA}" styleName=""><a:wholeTbl><a:tcTxStyle><a:fontRef idx="minor"><a:scrgbClr r="0" g="0" b="0"/></a:fontRef><a:schemeClr val="tx1"/></a:tcTxStyle><a:tcStyle><a:tcBdr><a:left><a:ln w="12700" cmpd="sng"><a:solidFill><a:schemeClr val="tx1"/></a:solidFill></a:ln></a:left><a:right><a:ln w="12700" cmpd="sng"><a:solidFill><a:schemeClr val="tx1"/></a:solidFill></a:ln></a:right><a:top><a:ln w="12700" cmpd="sng"><a:solidFill><a:schemeClr val="tx1"/></a:solidFill></a:ln></a:top><a:bottom><a:ln w="12700" cmpd="sng"><a:solidFill><a:schemeClr val="tx1"/></a:solidFill></a:ln></a:bottom><a:insideH><a:ln w="12700" cmpd="sng"><a:solidFill><a:schemeClr val="tx1"/></a:solidFill></a:ln></a:insideH><a:insideV><a:ln w="12700" cmpd="sng"><a:solidFill><a:schemeClr val="tx1"/></a:solidFill></a:ln></a:insideV></a:tcBdr><a:fill><a:noFill/></a:fill></a:tcStyle></a:wholeTbl>
+</a:tblStyle>"#;
+
+const LIGHT_1: &str = r#"<a:tblStyle styleId="{9D7B26C5-4107-4FEC-AEDC-1716B250A1EF}" styleName=""><a:wholeTbl><a:tcTxStyle><a:fontRef idx="minor"><a:scrgbClr r="0" g="0" b="0"/></a:fontRef><a:schemeClr val="tx1"/></a:tcTxStyle><a:tcStyle><a:tcBdr><a:left><a:ln><a:noFill/></a:ln></a:left><a:right><a:ln><a:noFill/></a:ln></a:right><a:top><a:ln w="12700" cmpd="sng"><a:solidFill><a:schemeClr val="tx1"/></a:solidFill></a:ln></a:top><a:bottom><a:ln w="12700" cmpd="sng"><a:solidFill><a:schemeClr val="tx1"/></a:solidFill></a:ln></a:bottom><a:insideH><a:ln><a:noFill/></a:ln></a:insideH><a:insideV><a:ln><a:noFill/></a:ln></a:insideV></a:tcBdr><a:fill><a:noFill/></a:fill></a:tcStyle></a:wholeTbl>
+<a:band1H><a:tcStyle><a:tcBdr/><a:fill><a:solidFill><a:schemeClr val="tx1"><a:alpha val="20000"/></a:schemeClr></a:solidFill></a:fill></a:tcStyle></a:band1H>
+<a:band2H><a:tcStyle><a:tcBdr/></a:tcStyle></a:band2H>
+<a:band1V><a:tcStyle><a:tcBdr/><a:fill><a:solidFill><a:schemeClr val="tx1"><a:alpha val="20000"/></a:schemeClr></a:solidFill></a:fill></a:tcStyle></a:band1V>
+<a:lastCol><a:tcTxStyle b="on"/><a:tcStyle><a:tcBdr/></a:tcStyle></a:lastCol>
+<a:firstCol><a:tcTxStyle b="on"/><a:tcStyle><a:tcBdr/></a:tcStyle></a:firstCol>
+<a:lastRow><a:tcTxStyle b="on"/><a:tcStyle><a:tcBdr><a:top><a:ln w="12700" cmpd="sng"><a:solidFill><a:schemeClr val="tx1"/></a:solidFill></a:ln></a:top></a:tcBdr><a:fill><a:noFill/></a:fill></a:tcStyle></a:lastRow>
+<a:firstRow><a:tcTxStyle b="on"/><a:tcStyle><a:tcBdr><a:bottom><a:ln w="12700" cmpd="sng"><a:solidFill><a:schemeClr val="tx1"/></a:solidFill></a:ln></a:bottom></a:tcBdr><a:fill><a:noFill/></a:fill></a:tcStyle></a:firstRow>
+</a:tblStyle>"#;
+
+const MEDIUM_2: &str = r#"<a:tblStyle styleId="{073A0DAA-6AF3-43AB-8588-CEC1D06C72B9}" styleName=""><a:wholeTbl><a:tcTxStyle><a:fontRef idx="minor"><a:prstClr val="black"/></a:fontRef><a:schemeClr val="dk1"/></a:tcTxStyle><a:tcStyle><a:tcBdr><a:left><a:ln w="12700" cmpd="sng"><a:solidFill><a:schemeClr val="lt1"/></a:solidFill></a:ln></a:left><a:right><a:ln w="12700" cmpd="sng"><a:solidFill><a:schemeClr val="lt1"/></a:solidFill></a:ln></a:right><a:top><a:ln w="12700" cmpd="sng"><a:solidFill><a:schemeClr val="lt1"/></a:solidFill></a:ln></a:top><a:bottom><a:ln w="12700" cmpd="sng"><a:solidFill><a:schemeClr val="lt1"/></a:solidFill></a:ln></a:bottom><a:insideH><a:ln w="12700" cmpd="sng"><a:solidFill><a:schemeClr val="lt1"/></a:solidFill></a:ln></a:insideH><a:insideV><a:ln w="12700" cmpd="sng"><a:solidFill><a:schemeClr val="lt1"/></a:solidFill></a:ln></a:insideV></a:tcBdr><a:fill><a:solidFill><a:schemeClr val="dk1"><a:tint val="20000"/></a:schemeClr></a:solidFill></a:fill></a:tcStyle></a:wholeTbl>
+<a:band1H><a:tcStyle><a:tcBdr/><a:fill><a:solidFill><a:schemeClr val="dk1"><a:tint val="40000"/></a:schemeClr></a:solidFill></a:fill></a:tcStyle></a:band1H>
+<a:band2H><a:tcStyle><a:tcBdr/></a:tcStyle></a:band2H>
+<a:band1V><a:tcStyle><a:tcBdr/><a:fill><a:solidFill><a:schemeClr val="dk1"><a:tint val="40000"/></a:schemeClr></a:solidFill></a:fill></a:tcStyle></a:band1V>
+<a:band2V><a:tcStyle><a:tcBdr/></a:tcStyle></a:band2V>
+<a:lastCol><a:tcTxStyle b="on"><a:fontRef idx="minor"><a:prstClr val="black"/></a:fontRef><a:schemeClr val="lt1"/></a:tcTxStyle><a:tcStyle><a:tcBdr/><a:fill><a:solidFill><a:schemeClr val="dk1"/></a:solidFill></a:fill></a:tcStyle></a:lastCol>
+<a:firstCol><a:tcTxStyle b="on"><a:fontRef idx="minor"><a:prstClr val="black"/></a:fontRef><a:schemeClr val="lt1"/></a:tcTxStyle><a:tcStyle><a:tcBdr/><a:fill><a:solidFill><a:schemeClr val="dk1"/></a:solidFill></a:fill></a:tcStyle></a:firstCol>
+<a:lastRow><a:tcTxStyle b="on"><a:fontRef idx="minor"><a:prstClr val="black"/></a:fontRef><a:schemeClr val="lt1"/></a:tcTxStyle><a:tcStyle><a:tcBdr><a:top><a:ln w="38100" cmpd="sng"><a:solidFill><a:schemeClr val="lt1"/></a:solidFill></a:ln></a:top></a:tcBdr><a:fill><a:solidFill><a:schemeClr val="dk1"/></a:solidFill></a:fill></a:tcStyle></a:lastRow>
+<a:firstRow><a:tcTxStyle b="on"><a:fontRef idx="minor"><a:prstClr val="black"/></a:fontRef><a:schemeClr val="lt1"/></a:tcTxStyle><a:tcStyle><a:tcBdr><a:bottom><a:ln w="38100" cmpd="sng"><a:solidFill><a:schemeClr val="lt1"/></a:solidFill></a:ln></a:bottom></a:tcBdr><a:fill><a:solidFill><a:schemeClr val="dk1"/></a:solidFill></a:fill></a:tcStyle></a:firstRow>
+</a:tblStyle>"#;
+
+// ── Family generators ────────────────────────────────────────────────────────
 
 fn themed_style_2(theme: &HashMap<String, String>, accent_idx: Option<u8>) -> TableStyleDef {
     // The zero-accent catalogue entry is the neutral "Themed Style 2": it has
@@ -293,18 +318,6 @@ fn themed_style_2(theme: &HashMap<String, String>, accent_idx: Option<u8>) -> Ta
             whole_inside_h: inside.clone(),
             whole_inside_v: inside,
         }
-    }
-}
-
-fn light_style_1(theme: &HashMap<String, String>, accent_idx: Option<u8>) -> TableStyleDef {
-    let a = accent(theme, accent_idx)
-        .or_else(|| dk1(theme))
-        .unwrap_or_else(|| "000000".into());
-    let band1h_color = apply_transforms(&a, &[("alpha", 20000)]);
-    table_style! {
-        band1h_fill: Some(solid(&band1h_color)),
-        whole_outer_h: Some(stroke(&a)),
-        first_row_border_b: Some(stroke(&a)),
     }
 }
 
@@ -372,54 +385,6 @@ fn medium_style_1(theme: &HashMap<String, String>, accent_idx: Option<u8>) -> Ta
             ..Default::default()
         },
         last_col_text: TableTextStyle {
-            bold: Some(true),
-            ..Default::default()
-        },
-    }
-}
-
-fn medium_style_2(theme: &HashMap<String, String>, accent_idx: Option<u8>) -> TableStyleDef {
-    let a = accent(theme, accent_idx)
-        .or_else(|| dk1(theme))
-        .unwrap_or_else(|| "000000".into());
-    let lt = lt1(theme).unwrap_or_else(|| "FFFFFF".into());
-    let dk = dk1(theme).unwrap_or_else(|| "000000".into());
-    let border = Some(stroke(&lt));
-    let whole_color = apply_transforms(&a, &[("tint", 20000)]);
-    let band1h_color = apply_transforms(&a, &[("tint", 40000)]);
-    table_style! {
-        whole_fill: Some(solid(&whole_color)),
-        first_row_fill: Some(solid(&a)),
-        last_row_fill: Some(solid(&a)),
-        first_col_fill: Some(solid(&a)),
-        last_col_fill: Some(solid(&a)),
-        band1h_fill: Some(solid(&band1h_color)),
-        whole_outer_h: border.clone(),
-        whole_outer_v: border.clone(),
-        whole_inside_h: border.clone(),
-        whole_inside_v: border,
-        first_row_border_b: Some(stroke(&lt)),
-        whole_text: TableTextStyle {
-            color: Some(dk),
-            ..Default::default()
-        },
-        first_row_text: TableTextStyle {
-            color: Some(lt.clone()),
-            bold: Some(true),
-            ..Default::default()
-        },
-        last_row_text: TableTextStyle {
-            color: Some(lt.clone()),
-            bold: Some(true),
-            ..Default::default()
-        },
-        first_col_text: TableTextStyle {
-            color: Some(lt.clone()),
-            bold: Some(true),
-            ..Default::default()
-        },
-        last_col_text: TableTextStyle {
-            color: Some(lt),
             bold: Some(true),
             ..Default::default()
         },
@@ -532,6 +497,7 @@ fn dark_style_2(theme: &HashMap<String, String>, accent_idx: Option<u8>) -> Tabl
 
 #[derive(Clone, Copy)]
 enum Family {
+    NoGrid,
     ThemedStyle1,
     ThemedStyle2,
     LightStyle1,
@@ -548,11 +514,7 @@ enum Family {
 // (GUID, family, accent_index: 0=no accent/dk1, 1-6=accent1-6)
 const CATALOG: &[(&str, Family, u8)] = &[
     // Themed Style 1
-    (
-        "{2D5ABB26-0587-4C30-8999-92F81FD0307C}",
-        Family::ThemedStyle1,
-        0,
-    ),
+    ("{2D5ABB26-0587-4C30-8999-92F81FD0307C}", Family::NoGrid, 0),
     (
         "{3C2FFA5D-87B4-456A-9821-1D502468CF0F}",
         Family::ThemedStyle1,
@@ -930,12 +892,52 @@ const CATALOG: &[(&str, Family, u8)] = &[
     ),
 ];
 
+fn documented_style(
+    definition: &str,
+    base_id: &str,
+    replacement: Option<(&str, u8)>,
+    theme_source: &(impl crate::theme::PptxThemeSource + ?Sized),
+) -> TableStyleDef {
+    let definition = if let Some((slot, accent)) = replacement {
+        // [MS-OE376] §2.1.1343 supplies the accent paint replacements.
+        // Tagged PDF controls keep the whole-table text neutral: all six
+        // Light Style 1 accents, remapped colours/non-white lt1 and alternate
+        // matrices, plus Medium Style 2 Accent 1. Replacing its text slot as
+        // well would incorrectly colour ordinary cell text with the accent.
+        let start = definition
+            .find("<a:tcTxStyle")
+            .expect("built-in definitions have whole-table text formatting");
+        let end = start
+            + definition[start..]
+                .find("</a:tcTxStyle>")
+                .expect("built-in whole-table text formatting is closed")
+            + "</a:tcTxStyle>".len();
+        let from = format!("val=\"{slot}\"");
+        let to = format!("val=\"accent{accent}\"");
+        format!(
+            "{}{}{}",
+            definition[..start].replace(&from, &to),
+            &definition[start..end],
+            definition[end..].replace(&from, &to)
+        )
+    } else {
+        definition.to_owned()
+    };
+    let xml = format!(
+        r#"<a:tblStyleLst xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">{definition}</a:tblStyleLst>"#
+    );
+    crate::shape::parse_table_styles_xml(&xml, theme_source)
+        .remove(base_id)
+        .unwrap_or_default()
+}
+
 // ── Public entry point ───────────────────────────────────────────────────────
 
 pub fn lookup_builtin_table_style(
     guid: &str,
-    theme: &HashMap<String, String>,
+    theme_source: &(impl crate::theme::PptxThemeSource + ?Sized),
 ) -> Option<TableStyleDef> {
+    let theme = theme_source.colors();
     let (_, family, accent_u8) = CATALOG.iter().find(|(g, _, _)| *g == guid)?;
     let accent_idx = if *accent_u8 == 0 {
         None
@@ -943,13 +945,40 @@ pub fn lookup_builtin_table_style(
         Some(*accent_u8)
     };
     let mut style = match family {
-        Family::ThemedStyle1 => themed_style_1(theme, accent_idx),
+        Family::NoGrid => documented_style(
+            NO_GRID,
+            "{2D5ABB26-0587-4C30-8999-92F81FD0307C}",
+            None,
+            theme_source,
+        ),
+        Family::ThemedStyle1 => documented_style(
+            THEMED_1,
+            "{3C2FFA5D-87B4-456A-9821-1D502468CF0F}",
+            accent_idx.map(|n| ("accent1", n)),
+            theme_source,
+        ),
+        Family::ThemedStyle2 if accent_idx.is_none() => documented_style(
+            GRID,
+            "{5940675A-B579-460E-94D1-54222C63F5DA}",
+            None,
+            theme_source,
+        ),
         Family::ThemedStyle2 => themed_style_2(theme, accent_idx),
-        Family::LightStyle1 => light_style_1(theme, accent_idx),
+        Family::LightStyle1 => documented_style(
+            LIGHT_1,
+            "{9D7B26C5-4107-4FEC-AEDC-1716B250A1EF}",
+            accent_idx.map(|n| ("tx1", n)),
+            theme_source,
+        ),
         Family::LightStyle2 => light_style_2(theme, accent_idx),
         Family::LightStyle3 => light_style_3(theme, accent_idx),
         Family::MediumStyle1 => medium_style_1(theme, accent_idx),
-        Family::MediumStyle2 => medium_style_2(theme, accent_idx),
+        Family::MediumStyle2 => documented_style(
+            MEDIUM_2,
+            "{073A0DAA-6AF3-43AB-8588-CEC1D06C72B9}",
+            accent_idx.map(|n| ("dk1", n)),
+            theme_source,
+        ),
         Family::MediumStyle3 => medium_style_3(theme, accent_idx),
         Family::MediumStyle4 => medium_style_4(theme, accent_idx),
         Family::DarkStyle1 => dark_style_1(theme, accent_idx),
@@ -960,7 +989,7 @@ pub fn lookup_builtin_table_style(
     // built-in style that PowerPoint wrote into a deck's tableStyles.xml does,
     // and an un-copied Medium Style 2 cell rendered in the master's minor font
     // (issue #1620).
-    style.whole_tbl.text.font = Some("+mn-lt".to_owned());
+    style.whole_tbl.text.font = Some(crate::TableStyleFont::Collection("+mn"));
     Some(style)
 }
 
@@ -972,6 +1001,32 @@ mod tests {
         match fill {
             Some(Fill::Solid { color }) => Some(color),
             _ => None,
+        }
+    }
+
+    #[test]
+    fn no_grid_and_edge_text_roles_follow_documented_catalogue() {
+        let theme = HashMap::from([
+            ("dk1".into(), "000000".into()),
+            ("tx1".into(), "000000".into()),
+            ("lt1".into(), "FFFFFF".into()),
+            ("accent1".into(), "4472C4".into()),
+        ]);
+        let plain =
+            lookup_builtin_table_style("{2D5ABB26-0587-4C30-8999-92F81FD0307C}", &theme).unwrap();
+        assert!(matches!(
+            plain.whole_tbl.borders.inside_h,
+            TableLineStyle::NoLine
+        ));
+        for id in [
+            "{3C2FFA5D-87B4-456A-9821-1D502468CF0F}",
+            "{3B4B98B0-60AC-42C2-AFA5-B58CD77FA1E5}",
+        ] {
+            let style = lookup_builtin_table_style(id, &theme).unwrap();
+            assert_eq!(style.first_row.text.bold, Some(true));
+            assert_eq!(style.last_row.text.bold, Some(true));
+            assert_eq!(style.first_col.text.bold, Some(true));
+            assert_eq!(style.last_col.text.bold, Some(true));
         }
     }
 
@@ -998,21 +1053,21 @@ mod tests {
 
     /// The built-in Medium Style 2 / Accent 1 table is the default produced by
     /// python-pptx and many Office generators. ECMA-376 §20.1.2.3.34 tint values
-    /// retain the stated fraction of the source colour; table styles apply the
-    /// literal encoded-sRGB blend used by PowerPoint's preset definitions.
+    /// retain the stated fraction in linear sRGB. Tagged PDF measurements
+    /// distinguish both body and band colours from an encoded-sRGB blend.
     #[test]
-    fn medium_style_2_accent_1_uses_literal_table_tints() {
+    fn medium_style_2_accent_1_uses_powerpoint_linear_tints() {
         let theme = HashMap::from([
-            ("accent1".to_owned(), "4F81BD".to_owned()),
+            ("accent1".to_owned(), "4472C4".to_owned()),
             ("lt1".to_owned(), "FFFFFF".to_owned()),
             ("dk1".to_owned(), "000000".to_owned()),
         ]);
         let style = lookup_builtin_table_style("{5C22544A-7EE6-4342-B048-85BDC9FD1C3A}", &theme)
             .expect("known PowerPoint table style");
 
-        assert_eq!(solid_color(&style.first_row.fill), Some("4F81BD"));
-        assert_eq!(solid_color(&style.whole_tbl.fill), Some("DCE6F2"));
-        assert_eq!(solid_color(&style.band1_h.fill), Some("B9CDE5"));
+        assert_eq!(solid_color(&style.first_row.fill), Some("4472C4"));
+        assert_eq!(solid_color(&style.whole_tbl.fill), Some("E9EBF5"));
+        assert_eq!(solid_color(&style.band1_h.fill), Some("CFD5EA"));
         assert_eq!(style.first_row.text.color.as_deref(), Some("FFFFFF"));
         assert_eq!(style.first_row.text.bold, Some(true));
         assert_eq!(style.whole_tbl.text.color.as_deref(), Some("000000"));

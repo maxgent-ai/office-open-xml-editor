@@ -10,6 +10,7 @@ interface LineWrapStateSegment {
 }
 
 export interface LineWrapStateLine {
+  readonly physicalLineIndex?: number;
   readonly consumedEnd?: unknown;
   readonly topY?: number;
   readonly xOffset?: number;
@@ -38,21 +39,32 @@ export function cloneSegmentsForLinePass<T extends object>(segments: readonly T[
   return segments.map((segment) => ({ ...segment }));
 }
 
+function samePhysicalLine(left: LineWrapStateLine | undefined, right: LineWrapStateLine | undefined): boolean {
+  if (!left || !right) return false;
+  if (left.physicalLineIndex !== undefined || right.physicalLineIndex !== undefined) {
+    return left.physicalLineIndex === right.physicalLineIndex;
+  }
+  return left.topY !== undefined && left.topY === right.topY;
+}
+
 function lineWrapState(
   lines: readonly LineWrapStateLine[],
   probeHeights: readonly number[],
+  probeFloors: readonly number[],
 ): string {
-  return JSON.stringify(lines.map((line, index) => ({
-    end: line.consumedEnd,
-    topY: line.topY,
-    xOffset: line.xOffset,
-    availableWidth: line.availWidth,
-    probeHeight: probeHeights[index],
-    segments: line.segments.map((segment) => ({
-      source: segment.src,
-      ...(segment.text === undefined ? {} : { text: segment.text }),
-    })),
-  })));
+  let physicalIndex = -1;
+  return JSON.stringify(lines.map((line, index) => {
+    if (!samePhysicalLine(lines[index - 1], line)) physicalIndex += 1;
+    return {
+      physicalLineIndex: line.physicalLineIndex,
+      end: line.consumedEnd, topY: line.topY, xOffset: line.xOffset,
+      availableWidth: line.availWidth, probeHeight: probeHeights[physicalIndex],
+      probeFloor: probeFloors[physicalIndex],
+      segments: line.segments.map(segment => ({ source: segment.src,
+        ...(segment.text === undefined ? {} : { text: segment.text }),
+      })),
+    };
+  }));
 }
 
 const MAX_LINE_WRAP_PASSES = 16;
@@ -61,30 +73,87 @@ const MAX_LINE_WRAP_PASSES = 16;
  * An adjacent exact-state repeat is the fixed point; a non-adjacent repeat is
  * a real cycle. The pass budget is a fail-closed resource guard for a
  * deterministic orbit whose geometric state cardinality has no useful small
- * bound; exhaustion never accepts stale line geometry.
+ * bound; exhaustion never accepts stale line geometry. Probes are indexed by
+ * physical lines, never gaps. For fixed metrics and one physical line, all G
+ * gaps are discovered in one resolving pass and confirmed in the next (three
+ * passes including initial measurement), irrespective of G. Variable-height
+ * reflow retains the same 16-state fail-closed budget.
+ *
+ * Two monotone rules make the height feedback a finite lattice walk:
+ * - Exclusion probes are monotone per physical line: a line is probed with the
+ *   largest allocation it has had (`probeFloors`), while its advance stays the
+ *   latest resolved allocation. A taller band only removes gap content, so a
+ *   short probe admitting a tall unit and a tall probe excluding it cannot
+ *   alternate.
+ * - If the plain iteration still revisits a state (an advance feedback, e.g. a
+ *   paragraph-wide ruby/grid allocation that depends on the partition), it
+ *   restarts from the largest advances seen and keeps every physical line's
+ *   advance and probe at the running maximum. Lines may then be spaced wider
+ *   than their final allocation, never narrower, so no band overlaps.
+ * Both maxima range over the finite set of allocations the content can
+ * produce, so they rise finitely often; once stable, the next pass repeats.
+ * Fixed metrics converge in three passes; otherwise the bound is the number
+ * of rises plus two, and the unchanged 16-state budget fails closed past it.
  */
 export function convergeLineWrap<TLine extends LineWrapStateLine>(
-  measure: (probeHeights: readonly number[] | null) => TLine[],
+  measure: (probeHeights: readonly number[] | null, probeFloors: readonly number[] | null) => TLine[],
   lineBoxHeight: (line: TLine) => number,
+  resolveLineAdvances?: (lines: readonly TLine[]) => readonly number[],
 ): TLine[] {
   type Pass = Readonly<{
     lines: TLine[];
     probeHeights: readonly number[];
+    probeFloors: readonly number[];
     state: string;
   }>;
+  const resolved = (lines: readonly TLine[]): readonly number[] => {
+    const advances = resolveLineAdvances?.(lines);
+    return Object.freeze(lines.flatMap((line, index) =>
+      samePhysicalLine(line, lines[index + 1])
+        ? [] : [advances?.[index] ?? lineBoxHeight(line)]));
+  };
+  const maximum = (left: readonly number[], right: readonly number[]): readonly number[] =>
+    Object.freeze(Array.from({ length: Math.max(left.length, right.length) }, (_, index) =>
+      Math.max(left[index] ?? Number.NEGATIVE_INFINITY, right[index] ?? Number.NEGATIVE_INFINITY)));
+  // Running maxima of every resolved allocation, used if a cycle appears.
+  let seen: readonly number[] = [];
+  let passes = 0;
   try {
+    try {
+      return convergeExactState<Pass>({
+        step: (previous) => {
+          passes += 1;
+          const lines = measure(previous?.probeHeights ?? null, previous?.probeFloors ?? null);
+          const probeHeights = resolved(lines);
+          seen = maximum(seen, probeHeights);
+          const probeFloors = previous ? maximum(probeHeights, previous.probeFloors)
+            .slice(0, probeHeights.length) : probeHeights;
+          return Object.freeze({
+            lines, probeHeights, probeFloors: Object.freeze(probeFloors),
+            state: lineWrapState(lines, probeHeights, probeFloors),
+          });
+        },
+        stateOf: (pass) => pass.state,
+        limit: MAX_LINE_WRAP_PASSES,
+      }).value.lines;
+    } catch (error) {
+      if (!(error instanceof ExactConvergenceError) || error.reason !== 'cycle'
+        || MAX_LINE_WRAP_PASSES - passes < 2) throw error;
+    }
+    // Monotone advances: inputs only rise, so the walk is finite.
+    let held = seen;
     return convergeExactState<Pass>({
       step: (previous) => {
-        const lines = measure(previous?.probeHeights ?? null);
-        const probeHeights = Object.freeze(lines.map(lineBoxHeight));
+        const input = previous ? maximum(held, previous.probeHeights) : held;
+        held = input;
+        const lines = measure(input, input);
         return Object.freeze({
-          lines,
-          probeHeights,
-          state: lineWrapState(lines, probeHeights),
+          lines, probeHeights: resolved(lines), probeFloors: input,
+          state: lineWrapState(lines, input, input),
         });
       },
       stateOf: (pass) => pass.state,
-      limit: MAX_LINE_WRAP_PASSES,
+      limit: MAX_LINE_WRAP_PASSES - passes,
     }).value.lines;
   } catch (error) {
     if (error instanceof ExactConvergenceError) {

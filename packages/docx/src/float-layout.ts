@@ -20,11 +20,6 @@ export {
   FLOAT_PAGE_RIGHT_SLACK,
 } from './layout/floats.js';
 
-export {
-  LINE_START_GAP_EPS_PT,
-  WORD_MIN_LINE_START_PT,
-  wordMinLineStartPx,
-} from './layout/compatibility.js';
 
 export type {
   FloatRect,

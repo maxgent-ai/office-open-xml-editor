@@ -89,6 +89,8 @@ export interface EmbeddedFontRef {
 }
 
 export interface DocSettings {
+  /** ECMA-376 Part 4 §14.8.3.15 fixed HTML automatic paragraph margins. */
+  doNotUseHtmlParagraphAutoSpacing?: boolean;
   /** §17.15.1.58 `w:kinsoku` — East-Asian line-breaking toggle. `undefined`
    *  means the element is absent; the spec default is ON (treated as `true`). */
   kinsoku?: boolean;
@@ -113,7 +115,7 @@ export interface DocSettings {
   /** §17.15.3.31 `w:compat/w:lineWrapLikeWord6` — fit at uncompressed width
    * even when character-level whitespace is compressed for display. */
   lineWrapLikeWord6?: boolean;
-  /** See WORD_OPENTYPE_FEATURES_COMPAT_KERNING for this compatibility flag. */
+  /** See WORD_KERN_THRESHOLD_AUTHORITY for this compatibility flag. */
   enableOpenTypeFeatures?: boolean;
   /** ECMA-376 Part 4 §14.8.3.50 `w:compat/w:useFELayout` — Far East layout
    * compatibility. */
@@ -124,6 +126,9 @@ export interface DocSettings {
   /** §17.15.3.1 `w:compat/w:adjustLineHeightInTable` — apply the section
    *  document-grid line pitch to text in table cells. */
   adjustLineHeightInTable?: boolean;
+  /** `w:compat/w:compatSetting[@w:name="compatibilityMode"]` (Word URI) — the
+   *  Word version whose layout rules the document uses (for example 14, 15). */
+  compatibilityMode?: number;
 }
 
 export interface DocRevision {
@@ -493,6 +498,9 @@ export interface DocParagraph {
   indentFirst: number;  // pt
   spaceBefore: number;  // pt
   spaceAfter: number;   // pt
+  /** §17.3.1.33 automatic margin flags resolved through paragraph styles. */
+  beforeAutospacing?: boolean;
+  afterAutospacing?: boolean;
   lineSpacing: LineSpacing | null;
   numbering: NumberingInfo | null;
   tabStops: TabStop[];
@@ -534,6 +542,11 @@ export interface DocParagraph {
   /** ECMA-376 §17.3.1.21 `<w:overflowPunct>` — permit one trailing
    *  punctuation character beyond paragraph indents/margins. Omission is true. */
   overflowPunct?: boolean;
+  /** ECMA-376 §17.3.1.2 `<w:autoSpaceDE>` after the style cascade; present
+   *  only when disabled (`false`). Omission means the spec default, on. */
+  autoSpaceDE?: boolean;
+  /** ECMA-376 §17.3.1.3 `<w:autoSpaceDN>`, with the same encoding. */
+  autoSpaceDN?: boolean;
   /** ECMA-376 §17.3.1.1 `<w:adjustRightInd>` — permit automatic right-indent
    *  adjustment when a document grid is active. Absent means true after the
    *  paragraph style hierarchy and specification default are resolved. */
@@ -947,10 +960,12 @@ export interface ShapeRun {
   textAnchor?: string | null;
   /** ECMA-376 §21.1.2.1.1 auto-fit mode from `<wps:bodyPr>`, normalized to the
    *  shared core `autoFit` vocabulary (core `src/types/common.ts`): "none"
-   *  (`<a:noAutofit/>`, fixed box — overflowing text is CLIPPED to the box),
+   *  (`<a:noAutofit/>`, fixed box; stacked WordArt retains Word's visible overflow),
    *  "sp" (`<a:spAutoFit/>`, box grows to text), or "norm" (`<a:normAutofit/>`,
    *  text shrinks). Absent ⇒ overflow visible. */
   textAutofit?: string | null;
+  /** ECMA-376 §21.1.2.1.1 bodyPr@wrap (square default, none permits overflow). */
+  textWrap?: string | null;
   textInsetL?: number;  // pt
   textInsetT?: number;  // pt
   textInsetR?: number;  // pt
@@ -960,8 +975,9 @@ export interface ShapeRun {
    *  "vert" (all glyphs 90° CW, chars T→B, lines R→L), "vert270" (all glyphs 270°
    *  CW = 90° CCW, chars B→T, lines L→R), and "eaVert" (East-Asian upright: CJK
    *  stands upright, non-EA rotated 90°, chars T→B, lines R→L). "horz"/absent ⇒
-   *  horizontal (unchanged). Unrecognised values ("mongolianVert", "wordArtVert",
-   *  …) fall back to horizontal until implemented. */
+   *  horizontal (unchanged). WordArt modes use Word's mixed-orientation,
+   *  left-to-right column layout (both wordArtVert and wordArtVertRtl).
+   *  Other unrecognised values fall back to horizontal. */
   textVert?: string | null;
   /** ECMA-376 Part 4 §19.1.2.23 `<v:textpath>` — WordArt text laid on the
    *  shape path (a text watermark). When set the renderer draws this string,
@@ -1024,6 +1040,8 @@ export interface ShapeTextRun {
 export interface ShapeText {
   text: string;
   fontSizePt: number;
+  /** Paragraph base/mark size; fontSizePt remains the first-run compatibility field. */
+  defaultFontSize?: number;
   color?: string | null;
   /** Resolved paragraph-mark run color used by compatibility rule
    *  `word-numbering-marker-paragraph-mark-fallback` when the numbering level
@@ -1050,6 +1068,9 @@ export interface ShapeText {
   /** ECMA-376 §17.3.1.33 `<w:spacing w:after>` of this text-box paragraph, in
    *  pt — reserved BELOW the paragraph. Absent/0 ⇒ no offset. */
   spaceAfter?: number;
+  /** §17.3.1.33 automatic margins; the compatibility text-box adapter resolves them. */
+  beforeAutospacing?: boolean;
+  afterAutospacing?: boolean;
   /** ECMA-376 §17.3.1.33 line spacing value (style-chain resolved). Encoded per
    *  {@link lineSpacingRule}: "auto" ⇒ a MULTIPLIER on the natural line box
    *  (1.15 = 276/240), "exact"/"atLeast" ⇒ pt. Absent ⇒ single (natural). */
@@ -1283,9 +1304,11 @@ export interface DocxTextRun {
    *  Absent ⇒ no shift. */
   position?: number;
   /** ECMA-376 §17.3.2.19 `<w:kern w:val>` — font-kerning threshold in POINTS
-   *  (the smallest font size that is kerned). Presence enables kerning subject
-   *  to the threshold; absent ⇒ kerning off (the hierarchy default). `0` = kern
-   *  at all sizes. */
+   *  (the smallest font size that is kerned). A positive resolved threshold
+   *  enables kerning at or above that size; absence disables it. Zero disables
+   *  content-run kerning only in mode 15 (WORD_KERN_THRESHOLD_AUTHORITY);
+   *  unmeasured modes, numbering glyphs and paragraph marks retain the previous
+   *  zero size comparison. */
   kerning?: number;
   /** ECMA-376 §17.3.2.10 `<w:eastAsianLayout w:vert>` — horizontal-in-vertical
    *  (縦中横 / tate-chū-yoko). `true` means that in a VERTICAL (tbRl) page this
@@ -1319,6 +1342,10 @@ export interface NoteRef {
   /** `@w:id` linking the marker to its note. Empty for the in-note
    *  `<w:footnoteRef/>` placeholder (the renderer uses the enclosing note). */
   id: string;
+  /** CT_FtnEdnRef/@customMarkFollows: suppress the automatic reference mark
+   * and leave this note out of sequential numbering. Following run text owns
+   * the authored mark; the reference still owns its note's placement. */
+  customMarkFollows?: boolean;
 }
 
 export interface RunRevision {
@@ -1595,6 +1622,9 @@ export interface DocTableCell {
   widthPt: number | null;
   /** `<w:tcW>` type="pct": 50ths of a percent of the final table width. */
   widthPct?: number;
+  /** ECMA-376 §17.4.29 `<w:noWrap>`: in AutoFit, auto/pct cell content
+   *  contributes its unbroken width as the minimum content constraint. */
+  noWrap?: boolean;
   /** Per-cell margins (pt) from `<w:tcPr><w:tcMar>` (ECMA-376 §17.4.42). Each
    *  edge overrides the table-level `cellMargin*` default when set; null/absent
    *  = inherit the table default. */

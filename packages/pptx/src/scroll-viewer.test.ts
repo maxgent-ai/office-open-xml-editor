@@ -178,7 +178,7 @@ describe('PptxScrollViewer — opt-in comment cards', () => {
     const scrollHost = container.children[0]!.children[0]!;
     const slide = scrollHost.children.find((child) => child !== scrollHost.children[0])!;
     expect(slide.children.some((child) => child.style.cssText.includes('overflow-y:auto'))).toBe(false);
-    const markerLayer = slide.children.find((child) => child.style.cssText.includes('inset:0'))!;
+    const markerLayer = slide.children.find((child) => child.dataset.overlay === 'comment-marker')!;
     expect(markerLayer.children.some((child) =>
       child.dataset.ooxmlCommentTarget !== undefined)).toBe(false);
 
@@ -403,7 +403,7 @@ describe('PptxScrollViewer — opt-in comment cards', () => {
         replies: [{ author: 'Linus', text: 'Done' }],
       },
     });
-    const marker = slide.children.find((child) => child.style.cssText.includes('inset:0'))!.children[0]!;
+    const marker = slide.children.find((child) => child.dataset.overlay === 'comment-marker')!.children[0]!;
     expect(marker.dataset.ooxmlCommentMarker).toBe('');
     expect(marker.className).toBe('ooxml-comment-marker');
     expect(marker.style.cssText).toContain('--ooxml-comment-author-accent:');
@@ -434,7 +434,7 @@ describe('PptxScrollViewer — opt-in comment cards', () => {
     expect(slide.children.some((child) =>
       child.dataset.ooxmlCommentConnectors !== undefined)).toBe(true);
     const margin = slide.children.find((child) => child.style.cssText.includes('overflow-y:auto'))!;
-    const markerLayer = slide.children.find((child) => child.style.cssText.includes('inset:0'))!;
+    const markerLayer = slide.children.find((child) => child.dataset.overlay === 'comment-marker')!;
     // Let the initial presentation-handle commit settle before counting the
     // margin-scroll path below.
     await Promise.resolve();
@@ -470,7 +470,7 @@ describe('PptxScrollViewer — opt-in comment cards', () => {
     await waitForBuiltInCommentUi(viewer);
     const scrollHost = container.children[0]!.children[0]!;
     const slide = scrollHost.children.find((child) => child !== scrollHost.children[0])!;
-    const markerLayer = slide.children.find((child) => child.style.cssText.includes('inset:0'))!;
+    const markerLayer = slide.children.find((child) => child.dataset.overlay === 'comment-marker')!;
     const margin = slide.children.find((child) => child.style.cssText.includes('overflow-y:auto'))!;
     expect(markerLayer.children.some((child) =>
       child.dataset.ooxmlCommentMarker !== undefined)).toBe(false);
@@ -520,7 +520,7 @@ describe('PptxScrollViewer — opt-in comment cards', () => {
     const scrollHost = container.children[0]!.children[0]!;
     const slide = scrollHost.children.find((child) => child !== scrollHost.children[0])!;
     const margin = slide.children.find((child) => child.style.cssText.includes('overflow-y:auto'))!;
-    const markerLayer = slide.children.find((child) => child.style.cssText.includes('inset:0'))!;
+    const markerLayer = slide.children.find((child) => child.dataset.overlay === 'comment-marker')!;
     const decoration = slide.children.find((child) =>
       child.dataset.ooxmlCommentConnectors !== undefined)!;
     const item = margin.children[0]!;

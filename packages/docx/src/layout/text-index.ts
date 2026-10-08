@@ -1,3 +1,4 @@
+import { sourceOwnedTextPlacements, type SourceOwnedTextGeometry } from './text-source-ownership.js';
 import {
   composeAffine,
   quarterTurnAffine,
@@ -20,11 +21,11 @@ import type {
   SourceRef,
   TableLayout,
   TextBoxLayout,
-  TextPlacement,
+  UprightResourceOrientation,
 } from './types.js';
 
 export interface TextRunGeometry {
-  readonly placement: TextPlacement;
+  readonly placement: SourceOwnedTextGeometry;
   readonly pointToPage: Matrix2DData;
   /** Canonical structural source of the owning paragraph. */
   readonly source: ParagraphLayout['source'];
@@ -113,7 +114,7 @@ function appendRasterPaintOccurrence(
   bounds: LayoutRect,
   pointToPage: Matrix2DData,
   options: Readonly<{
-    orientation?: 'upright-physical';
+    orientation?: UprightResourceOrientation;
     textBoxVerticalMode?: NonNullable<TextBoxLayout['verticalMode']>;
   }> = {},
 ): void {
@@ -130,8 +131,14 @@ function appendRasterPaintOccurrence(
     );
     [localWidthPt, localHeightPt] = [localHeightPt, localWidthPt];
   }
-  if (options.orientation === 'upright-physical') {
-    matrix = composeAffine(matrix, COUNTER_CLOCKWISE_QUARTER_TURN);
+  if (options.orientation !== undefined) {
+    // The retained local turn inverts the owner section's quarter turn.
+    matrix = composeAffine(
+      matrix,
+      options.orientation === 'upright-physical'
+        ? COUNTER_CLOCKWISE_QUARTER_TURN
+        : CLOCKWISE_QUARTER_TURN,
+    );
     [localWidthPt, localHeightPt] = [localHeightPt, localWidthPt];
   }
   const widthPt = localWidthPt * Math.hypot(matrix.a, matrix.b);
@@ -292,9 +299,15 @@ function visitTextBox(
 ): void {
   if (context.emittedTextBoxes.has(textBox.id)) return;
   context.emittedTextBoxes.add(textBox.id);
+  // A text box story is its own coordinate root: its resolved floating-table
+  // placements and the page-owned axes of drawings anchored in it are stated
+  // in story coordinates (story-page-frames.ts), which `pointToPage` already
+  // maps. Only translations taken inside the story are undone for them, never
+  // those that placed the box's own paragraph (a table cell's).
   const transformedProjection: NodeProjection = {
     ...projection,
     pointToPage: composeAffine(projection.pointToPage, textBox.transform),
+    layoutTranslationPt: { xPt: 0, yPt: 0 },
     textBoxVerticalMode: textBox.verticalMode ?? projection.textBoxVerticalMode,
   };
   const textBoxProjection = withClip(transformedProjection, textBox.clipBounds);
@@ -381,8 +394,8 @@ function visitParagraph(
   }
   if (context.collectTextRuns || context.collectTextRunSources) {
     for (const line of paragraph.lines) {
-      for (const placement of line.placements) {
-        if (placement.kind === 'text') {
+      for (const retained of line.placements) {
+        if (retained.kind === 'text') for (const placement of sourceOwnedTextPlacements(retained)) {
           if (context.collectTextRuns) {
             context.runs.push(Object.freeze({
               placement,
@@ -495,8 +508,7 @@ function visitTable(
   const tableProjection = withClip(projection, table.clipBounds);
   for (const row of table.rows) {
     for (const cell of row.cells) {
-      const ownsContinuationPaint = 'visualMergeOwnership' in cell
-        && cell.visualMergeOwnership === 'continuation';
+      const ownsContinuationPaint = cell.visualMergeOwnership === 'continuation';
       if (cell.verticalMerge === 'continue' && !ownsContinuationPaint) continue;
       const cellProjection = withClip(tableProjection, cell.clipBounds);
       if (cell.verticalText) {
@@ -545,11 +557,16 @@ function visitNode(
     case 'table':
       visitTable(node, projection, context);
       return;
-    case 'note':
+    case 'note': {
+      // Separator/notice paragraphs carry only zero-advance participants, so
+      // they add source ownership but no selectable text.
+      if (node.leading?.paragraph) visitNode(node.leading.paragraph, projection, context);
       for (const block of node.story.blocks) {
         visitNode(block, withClip(projection, node.story.clipBounds), context);
       }
+      if (node.trailing?.paragraph) visitNode(node.trailing.paragraph, projection, context);
       return;
+    }
     case 'textbox':
       visitTextBox(node, projection, context);
       return;

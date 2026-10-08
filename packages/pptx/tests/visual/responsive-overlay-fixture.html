@@ -55,6 +55,7 @@
       const viewer = new PptxViewer(canvas, {
         width: 960,
         enableTextSelection: true,
+        enableElementSelection: true,
         useGoogleFonts: true,
       });
       await viewer.load(buf);
@@ -68,10 +69,10 @@
       // canvas's parent). Read their laid-out size to prove they track the SCALED
       // canvas, not the intended 960×540.
       const wrapper = canvas.parentElement;
-      const overlayLayers = [...wrapper.children].filter((c) => c.tagName === 'DIV');
+      const overlayLayers = [...wrapper.querySelectorAll(':scope > [data-overlay]')];
       const overlayRects = overlayLayers.map((l) => {
         const r = l.getBoundingClientRect();
-        return { w: Math.round(r.width), h: Math.round(r.height) };
+        return { tag: l.dataset.overlay, w: Math.round(r.width), h: Math.round(r.height) };
       });
       const canvasRect = canvas.getBoundingClientRect();
 

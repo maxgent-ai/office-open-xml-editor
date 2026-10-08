@@ -81,6 +81,8 @@ export const ALLOWED_COMPUTED_IMPORTS = new Map([
   ['packages/node/src/xlsx-border-crisp.probe.test.ts', ['ORCH_PATH']],
   ['packages/node/src/xlsx-find.test.ts', ['FIND_PATH', 'NUMFMT_PATH']],
   ['packages/node/src/xlsx-merge-border-zorder.probe.test.ts', ['ORCH_PATH']],
+  // Opt-in latest-main parity run (VRT_BASELINE_CHECKOUT); skipped otherwise.
+  ['packages/docx/src/paragraph-measure.test.ts', ['BASELINE_PARAGRAPH_MEASURE']],
 ]);
 
 // No checked source currently needs the CommonJS loader. An exception would

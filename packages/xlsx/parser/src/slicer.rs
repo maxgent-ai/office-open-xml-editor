@@ -205,7 +205,7 @@ pub(crate) fn load_sheet_slicers(
     //    graphicFrame name.
     let mut slicer_defs: HashMap<String, SlicerDef> = HashMap::new();
     for target in &slicer_targets {
-        let slicer_path = resolve_zip_path(&format!("xl/{}", sheet_dir), target);
+        let slicer_path = resolve_zip_path(&format!("xl/{sheet_path}"), target);
         let Ok(xml) = read_zip_string(archive, &slicer_path) else {
             continue;
         };
@@ -225,7 +225,7 @@ pub(crate) fn load_sheet_slicers(
     // 4. Walk each drawing and pick up slicer graphicFrames.
     let mut out: Vec<SlicerAnchor> = Vec::new();
     for target in drawing_targets {
-        let drawing_path = resolve_zip_path(&format!("xl/{}", sheet_dir), &target);
+        let drawing_path = resolve_zip_path(&format!("xl/{sheet_path}"), &target);
         let Ok(drawing_xml) = read_zip_string(archive, &drawing_path) else {
             continue;
         };

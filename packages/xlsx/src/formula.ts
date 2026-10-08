@@ -30,6 +30,22 @@ interface EvalCtx {
 type EvalScalar = number | boolean | string | null;
 type EvalValue = EvalScalar | EvalScalar[];
 
+/** Internal CF boundary, not a claim of complete formula support (#1547).
+ * ECMA-376 §18.17.2 requires the whole expression to be consumed. Unsupported
+ * syntax/functions/names and invalid expressions are never numeric placeholders:
+ * NOT, comparison or arithmetic could turn 0 into TRUE and make stopIfTrue
+ * suppress valid lower-priority rules (§18.3.1.10).
+ */
+export type FormulaEvaluation =
+  | { kind: 'value'; value: EvalValue }
+  | { kind: 'unsupported' | 'invalid' | 'error' };
+
+class FormulaFailure extends Error {
+  constructor(readonly kind: 'unsupported' | 'invalid' | 'error') {
+    super(`CF formula ${kind}`);
+  }
+}
+
 /** Flatten nested scalars and arrays to a flat list of scalars. */
 function flatten(v: EvalValue): EvalScalar[] {
   return Array.isArray(v) ? v : [v];
@@ -43,13 +59,23 @@ function toScalar(v: EvalValue): EvalScalar {
 }
 
 const MAX_DEFINED_NAME_DEPTH = 8;
+// Library admission policy, not an Excel grammar limit. Bound recursive
+// descent before an untrusted CF expression can exhaust the JS call stack.
+// The budget covers grouping, unary operators and defined-name expansion.
+const MAX_FORMULA_PARSE_DEPTH = 128;
 
 export function evalFormulaToBool(formula: string, ctx: EvalCtx): boolean {
+  const result = evaluateFormula(formula, ctx);
+  return result.kind === 'value' && toBool(result.value);
+}
+
+export function evaluateFormula(formula: string, ctx: EvalCtx): FormulaEvaluation {
   try {
-    const v = evalFormula(formula, ctx);
-    return toBool(v);
-  } catch {
-    return false;
+    return { kind: 'value', value: evalFormula(formula, ctx) };
+  } catch (error) {
+    if (error instanceof FormulaFailure) return { kind: error.kind };
+    // Do not silently misclassify a programming/resource failure as no match.
+    throw error;
   }
 }
 
@@ -104,6 +130,7 @@ function tokenize(formula: string): Tok[] {
         if (s[j] === '"') break;
         buf += s[j]; j++;
       }
+      if (j === s.length) throw new FormulaFailure('invalid');
       toks.push({ kind: 'str', text: buf });
       i = j + 1;
       continue;
@@ -113,16 +140,18 @@ function tokenize(formula: string): Tok[] {
       // reference). Skipping the `#` would read `REF` as an unknown name
       // worth 0 and let the rule match.
       const m = /^#(?:NULL!|DIV\/0!|VALUE!|REF!|NAME\?|NUM!|N\/A|GETTING_DATA)/u.exec(s.slice(i));
-      if (!m) throw new Error('unknown error literal');
+      if (!m) throw new FormulaFailure('unsupported');
       toks.push({ kind: 'error', text: m[0] });
       i += m[0].length;
       continue;
     }
-    if (c >= '0' && c <= '9') {
-      let j = i;
-      while (j < s.length && ((s[j] >= '0' && s[j] <= '9') || s[j] === '.')) j++;
-      toks.push({ kind: 'num', text: s.slice(i, j) });
-      i = j;
+    if ((c >= '0' && c <= '9') || (c === '.' && /[0-9]/u.test(s[i + 1] ?? ''))) {
+      // §18.17.2.1 numerical-constant: retain decimal/exponent spellings
+      // while rejecting adjacent numbers rather than accepting a prefix.
+      const m = /^(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?/u.exec(s.slice(i));
+      if (!m || !Number.isFinite(Number(m[0]))) throw new FormulaFailure('invalid');
+      toks.push({ kind: 'num', text: m[0] });
+      i += m[0].length;
       continue;
     }
     if (OP_CHARS.has(c)) {
@@ -149,13 +178,14 @@ function tokenize(formula: string): Tok[] {
         toks.push({ kind: 'ref', text, ref });
       } else {
         const up = text.toUpperCase();
-        if (up === 'TRUE' || up === 'FALSE') toks.push({ kind: 'bool', text: up });
+        if ((up === 'TRUE' || up === 'FALSE') && s[i] !== '(') toks.push({ kind: 'bool', text: up });
         else toks.push({ kind: 'name', text });
       }
       continue;
     }
-    // Unknown character — skip.
-    i++;
+    // Sheet-qualified references, arrays and future syntax are outside this
+    // evaluator. Skipping a token would evaluate a different expression.
+    throw new FormulaFailure('unsupported');
   }
   return toks;
 }
@@ -196,12 +226,17 @@ function tryParseCellRef(s: string): { colAbs: boolean; col: number; rowAbs: boo
 interface Parser {
   toks: Tok[];
   pos: number;
+  budget: { depth: number };
 }
 
-function evalFormula(formula: string, ctx: EvalCtx): EvalValue {
-  const toks = tokenize(formula);
-  const p: Parser = { toks, pos: 0 };
+function evalFormula(formula: string, ctx: EvalCtx, budget = { depth: 0 }): EvalValue {
+  // The stored grammar is an expression; accept the conventional display '='
+  // prefix too, without interpreting a second '=' as an empty operand.
+  const source = formula.trim();
+  const toks = tokenize(source.startsWith('=') ? source.slice(1) : source);
+  const p: Parser = { toks, pos: 0, budget };
   const v = parseExpr(p, ctx);
+  if (p.pos !== toks.length) throw new FormulaFailure('unsupported');
   return v;
 }
 
@@ -209,7 +244,13 @@ function peek(p: Parser): Tok | undefined { return p.toks[p.pos]; }
 function consume(p: Parser): Tok | undefined { return p.toks[p.pos++]; }
 
 function parseExpr(p: Parser, ctx: EvalCtx): EvalValue {
-  return parseCmp(p, ctx);
+  if (p.budget.depth >= MAX_FORMULA_PARSE_DEPTH) throw new FormulaFailure('unsupported');
+  p.budget.depth++;
+  try {
+    return parseCmp(p, ctx);
+  } finally {
+    p.budget.depth--;
+  }
 }
 
 function parseCmp(p: Parser, ctx: EvalCtx): EvalValue {
@@ -292,26 +333,32 @@ function parseMul(p: Parser, ctx: EvalCtx): EvalValue {
 }
 
 function parseUnary(p: Parser, ctx: EvalCtx): EvalValue {
-  const t = peek(p);
-  if (t && t.kind === 'op' && t.text === '-') { consume(p); return -toNum(parseUnary(p, ctx)); }
-  if (t && t.kind === 'op' && t.text === '+') { consume(p); return toNum(parseUnary(p, ctx)); }
-  return parsePrimary(p, ctx);
+  if (p.budget.depth >= MAX_FORMULA_PARSE_DEPTH) throw new FormulaFailure('unsupported');
+  p.budget.depth++;
+  try {
+    const t = peek(p);
+    if (t && t.kind === 'op' && t.text === '-') { consume(p); return -toNum(parseUnary(p, ctx)); }
+    if (t && t.kind === 'op' && t.text === '+') { consume(p); return toNum(parseUnary(p, ctx)); }
+    return parsePrimary(p, ctx);
+  } finally {
+    p.budget.depth--;
+  }
 }
 
 function parsePrimary(p: Parser, ctx: EvalCtx): EvalValue {
   const t = consume(p);
-  if (!t) return 0;
+  if (!t) throw new FormulaFailure('invalid');
   if (t.kind === 'num') return parseFloat(t.text);
   if (t.kind === 'str') return t.text;
   if (t.kind === 'bool') return t.text === 'TRUE';
   // An error value propagates through the operators and functions this
   // evaluator models, so the rule's result is an error: Excel applies a
   // conditional format only when its formula evaluates to TRUE.
-  if (t.kind === 'error') throw new Error(t.text);
+  if (t.kind === 'error') throw new FormulaFailure('error');
   if (t.kind === 'lparen') {
     const v = parseExpr(p, ctx);
     const next = consume(p);
-    if (!next || next.kind !== 'rparen') throw new Error('missing )');
+    if (!next || next.kind !== 'rparen') throw new FormulaFailure('invalid');
     return v;
   }
   if (t.kind === 'ref') {
@@ -319,7 +366,7 @@ function parsePrimary(p: Parser, ctx: EvalCtx): EvalValue {
     if (peek(p)?.kind === 'colon') {
       consume(p);
       const right = consume(p);
-      if (right?.kind !== 'ref' || !right.ref) throw new Error('range: expected ref after :');
+      if (right?.kind !== 'ref' || !right.ref) throw new FormulaFailure('invalid');
       return resolveRange(t.ref!, right.ref, ctx);
     }
     return resolveRef(t.ref!, ctx);
@@ -337,7 +384,7 @@ function parsePrimary(p: Parser, ctx: EvalCtx): EvalValue {
         }
       }
       const next = consume(p);
-      if (!next || next.kind !== 'rparen') throw new Error('missing )');
+      if (!next || next.kind !== 'rparen') throw new FormulaFailure('invalid');
       return callFunc(t.text, args, ctx);
     }
     // Defined-name reference: substitute and evaluate.
@@ -352,11 +399,11 @@ function parsePrimary(p: Parser, ctx: EvalCtx): EvalValue {
         anchorCol: 1,
         depth: ctx.depth + 1,
       };
-      return evalFormula(body, inner);
+      return evalFormula(body, inner, p.budget);
     }
-    return 0;
+    throw new FormulaFailure('unsupported');
   }
-  return 0;
+  throw new FormulaFailure('invalid');
 }
 
 function stripSheetPrefix(formula: string): string {
@@ -524,7 +571,7 @@ function callFunc(nameRaw: string, args: EvalValue[], ctx: EvalCtx): EvalValue {
       return jsDow + 1;
     }
     default:
-      return 0;
+      throw new FormulaFailure('unsupported');
   }
 }
 

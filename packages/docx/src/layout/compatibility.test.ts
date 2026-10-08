@@ -1,15 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import {
   defineCompatibilityRule,
-  LINE_START_GAP_EPS_PT,
   WORD_FLOAT_DIFFERENT_PARAGRAPH_DISPLACEMENT,
   WORD_EMPTY_MARK_FLOAT_SIDE_GAP,
   WORD_PAGE_ANCHORED_TABLE_COLLISION_DEFERRAL,
-  WORD_MIN_LINE_START_PT,
-  WORD_SQUARE_LINE_START_ONE_INCH,
   WORD_SECTION_BTLR_TBRL_PAGE_FRAME,
   wordEmptyMarkMinimumStartWidthPx,
-  wordMinLineStartPx,
 } from './compatibility.js';
 import {
   WORD_PRE_BREAK_ANCHOR_PARAGRAPH,
@@ -51,7 +47,7 @@ import {
   WORD_HANGING_TAB_SAME_POSITION_PRECEDENCE,
   WORD_JAPANESE_PUNCTUATION_COMPRESSION_CELL,
   WORD_JUSTIFICATION_LEADING_INDENT_EXCLUSION,
-  WORD_JUSTIFIED_CANDIDATE_SEPARATOR_FIT,
+  WORD_COLLAPSIBLE_LINE_EDGE_VISIBLE_FIT,
   WORD_MIXED_ANCHOR_VISIBLE_LINE_METRICS,
   WORD_NUMBERING_MARKER_OVERFLOW_TAB_ADVANCE,
   WORD_NUMBERING_MARKER_PARAGRAPH_MARK_FALLBACK,
@@ -80,7 +76,6 @@ import {
   wordGridRightIndentAdjustmentPt,
   wordUseFeLayoutParagraphMarkGridAdvancePx,
   wordUseFeLayoutInheritedGridHeightPx,
-  wordCandidateFitWidthPx,
   wordDocumentCharacterCompressionApplies,
   wordJapanesePunctuationRetainedExtentPt,
   wordNumberingSuffixAcceptsCoincidentListTab,
@@ -143,7 +138,7 @@ import {
   WORD_TABLE_BORDER_WEIGHT_PRECEDENCE,
   WORD_TABLE_BORDER_STYLE_PRECEDENCE,
   WORD_TABLE_CELL_SPACING_SCOPE_SHADOW,
-  WORD_TABLE_INDENT_ALL_ALIGNMENTS,
+  WORD_TABLE_ORIGIN_COMPATIBILITY,
   WORD_TABLE_MARGIN_SCOPE_SHADOW,
   WORD_TRAILING_STRUCTURAL_CELL_MARKER,
   WORD_VERTICAL_MERGE_TERMINAL_BORDER,
@@ -315,15 +310,6 @@ describe('Word table row-cut observations', () => {
 });
 
 describe('float compatibility evidence', () => {
-  it('keeps the measured square line-start threshold behind one named rule', () => {
-    expect(WORD_SQUARE_LINE_START_ONE_INCH.evidence).toMatchObject({
-      kind: 'regression-test',
-    });
-    expect(WORD_MIN_LINE_START_PT).toBe(72);
-    expect(LINE_START_GAP_EPS_PT).toBe(0.05);
-    expect(wordMinLineStartPx(1)).toBeCloseTo(71.95, 10);
-  });
-
   it('names the established different-paragraph displacement policy', () => {
     expect(WORD_FLOAT_DIFFERENT_PARAGRAPH_DISPLACEMENT).toMatchObject({
       id: 'word-float-different-paragraph-displacement',
@@ -359,7 +345,7 @@ describe('layout compatibility inventory', () => {
       WORD_EXACT_ROW_HEIGHT_BOTTOM_PADDING,
       WORD_TABLE_BORDER_LAYER_CASCADE,
       WORD_SPACED_CELL_INSIDE_BORDER_CONFLICT,
-      WORD_TABLE_INDENT_ALL_ALIGNMENTS,
+      WORD_TABLE_ORIGIN_COMPATIBILITY,
       WORD_EXACT_ROW_VERTICAL_CLIP_ONLY,
       WORD_OVER_PAGE_CANT_SPLIT_CLIP,
       WORD_POSITIONED_TABLE_ADJACENCY_EXCLUSION,
@@ -374,7 +360,7 @@ describe('layout compatibility inventory', () => {
       WORD_AUTO_MULTIPLE_BASELINE_PIN,
       WORD_MIXED_ANCHOR_VISIBLE_LINE_METRICS,
       WORD_JUSTIFICATION_LEADING_INDENT_EXCLUSION,
-      WORD_JUSTIFIED_CANDIDATE_SEPARATOR_FIT,
+      WORD_COLLAPSIBLE_LINE_EDGE_VISIBLE_FIT,
       WORD_OVERFLOW_PUNCTUATION_LANGUAGE_SETS,
       WORD_FULL_WIDTH_CHARACTER_SPACING_SCOPE,
       WORD_AUTHORED_CHARACTER_SPACING_PITCH_PRIORITY,
@@ -684,22 +670,6 @@ describe('layout compatibility inventory', () => {
       20,
       { pos: 20, alignment: 'left' },
     )).toBe(false);
-    expect(wordCandidateFitWidthPx({
-      widthPx: 60,
-      trailingSpacePx: 12,
-      lineWillJustify: true,
-    })).toBe(60);
-    expect(wordCandidateFitWidthPx({
-      widthPx: 60,
-      trailingSpacePx: 12,
-      lineWillJustify: true,
-      wrapNarrowed: true,
-    })).toBe(48);
-    expect(wordCandidateFitWidthPx({
-      widthPx: 60,
-      trailingSpacePx: 12,
-      lineWillJustify: false,
-    })).toBe(48);
   });
 
   it('pins East Asian grid allocation and the untabled Far East metric factor', () => {

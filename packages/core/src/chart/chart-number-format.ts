@@ -5,7 +5,7 @@
 // literal escapes, thousands separators, decimals, percent, and Excel serial
 // dates.
 
-import { excelSerialToUtcDate } from '../excel-date';
+import { excelSerialToUtcDate, isExcelDisplayDateSerial } from '../excel-date';
 import {
   formatExcelDateTime,
   isDateFormatSection,
@@ -23,6 +23,7 @@ export function formatLocalizedExcelShortDate(
   date1904 = false,
   locale = typeof navigator === 'undefined' ? undefined : navigator.language,
 ): string {
+  if (!isExcelDisplayDateSerial(serial, date1904)) return '#';
   const cacheKey = locale ?? '';
   let formatter = localizedShortDateFormatters.get(cacheKey);
   if (!formatter) {

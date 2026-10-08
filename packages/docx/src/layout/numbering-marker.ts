@@ -3,10 +3,18 @@ import type { NumberingInfo, TabStop } from '../types.js';
 import { wordNumberingSuffixAcceptsCoincidentListTab } from './line-compatibility.js';
 import { nextTabStop, type TextLayoutService, type TextShapeResult } from './text.js';
 import type { DeepReadonly, NumberingMarkerShapeInput } from './types.js';
+import { indexedFontMetrics, selectResourceMetric, selectedFontLineMetric } from '../line-breaker/font-metrics.js';
 
 export interface NumberingMarkerTextLayout {
   readonly shape: TextShapeResult;
   readonly fontSizePx: number;
+  readonly lineBox: NumberingMarkerLineBox;
+}
+
+export interface NumberingMarkerLineBox {
+  readonly ascentPt: number;
+  readonly descentPt: number;
+  readonly intendedSinglePt: number;
 }
 
 export interface NumberingMarkerGeometry {
@@ -15,6 +23,7 @@ export interface NumberingMarkerGeometry {
   readonly markerWidthPt: number;
   readonly markerShiftPt: number;
   readonly shape: TextShapeResult | null;
+  readonly lineBox?: NumberingMarkerLineBox;
 }
 
 /** Marker interval in the paragraph's logical-leading coordinate system. */
@@ -113,7 +122,31 @@ export function shapeNumberingMarkerText(
     measure: true,
     clusterGeometry,
   });
-  return { shape, fontSizePx: input.fontSizePt * scale };
+  const metrics = indexedFontMetrics(service.fontMetrics ?? service.localMetrics ?? {});
+  let ascentPt = 0;
+  let descentPt = 0;
+  let intendedSinglePt = 0;
+  for (const span of shape.spans) {
+    const { resourceMetric, referenceMetric, lineMetric } = selectedFontLineMetric(
+      span.font, selectResourceMetric(metrics, span.font, span.text), true,
+    );
+    const design = resourceMetric?.lineHeightRatio != null ? resourceMetric : referenceMetric;
+    // Body text admits these same selected-face sides. Using raw Canvas boxes
+    // only for markers adds device-pixel rounding to otherwise precise lines,
+    // including same-face/same-size numbered headings near a keepNext boundary.
+    const ownsSides = design?.designAscentRatio != null && design.designDescentRatio != null;
+    ascentPt = Math.max(ascentPt, ownsSides
+      ? design.designAscentRatio! * input.fontSizePt * scale : span.ascentPt);
+    descentPt = Math.max(descentPt, ownsSides
+      ? design.designDescentRatio! * input.fontSizePt * scale : span.descentPt);
+    const ratio = span.script === 'eastAsia'
+      ? lineMetric?.eastAsianLineHeightRatio ?? lineMetric?.lineHeightRatio
+      : lineMetric?.lineHeightRatio;
+    intendedSinglePt = Math.max(intendedSinglePt, (ratio ?? 0) * input.fontSizePt * scale);
+  }
+  const lineBox = Object.freeze(shape.spans.length > 0 ? { ascentPt, descentPt, intendedSinglePt }
+    : { ascentPt: shape.ascentPt, descentPt: shape.descentPt, intendedSinglePt: 0 });
+  return { shape, fontSizePx: input.fontSizePt * scale, lineBox };
 }
 
 /** Resolve the tab synthesized by w:suff="tab". ST_TabJc `num` identifies the
@@ -150,15 +183,16 @@ export function resolveNumberingMarkerGeometry(
   const markerText = numbering.picBulletImagePath
     ? ''
     : symbolFontToUnicode(numbering.text, numbering.fontFamily ?? null);
-  const markerShape = markerText
+  const markerLayout = markerText
     ? shapeNumberingMarkerText(
         markerInput,
         markerText,
         1,
         service,
         clusterGeometry,
-      )?.shape ?? null
+      ) ?? null
     : null;
+  const markerShape = markerLayout?.shape ?? null;
   const markerWidthPt = numbering.picBulletImagePath
     ? numbering.picBulletWidthPt ?? markerInput.fontSizePt
     : markerShape?.advancePt ?? 0;
@@ -198,5 +232,6 @@ export function resolveNumberingMarkerGeometry(
     markerWidthPt,
     markerShiftPt,
     shape: markerShape,
+    ...(markerLayout ? { lineBox: markerLayout.lineBox } : {}),
   };
 }

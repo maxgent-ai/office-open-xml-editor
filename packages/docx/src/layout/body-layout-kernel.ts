@@ -65,13 +65,28 @@ export interface AdjacentTableGroupCursor {
   readonly tableCursor?: TableFragmentCursor;
 }
 
+/**
+ * Entry into the next owner segment of a table projected into cell-owner runs
+ * (table-owner-runs.ts). `same-region`: the previous segment completed and
+ * this one starts in the same flow region, so the paginator must not open a
+ * new region. `fresh-region`: this segment's start moved to a new region, so
+ * it continues the source table there and repeats its header rows.
+ */
+export type OwnerSegmentEntry = 'same-region' | 'fresh-region';
+
 export type BodyTableContinuationCursor =
   | Readonly<{
       kind: 'table';
       cursor: TableFragmentCursor;
       floatingContinuationFrame?: 'fresh-text' | 'authored';
+      ownerSegmentEntry?: OwnerSegmentEntry;
     }>
-  | Readonly<{ kind: 'adjacent-table-group'; cursor: AdjacentTableGroupCursor }>;
+  | Readonly<{
+      kind: 'adjacent-table-group';
+      cursor: AdjacentTableGroupCursor;
+      floatingContinuationFrame?: 'fresh-text';
+      ownerSegmentEntry?: OwnerSegmentEntry;
+    }>;
 
 export interface BodyTableAcquisitionInput {
   readonly input: Readonly<{ kind: 'table'; source: SourceRef }> | BodyAdjacentTableGroupInput;
@@ -109,6 +124,9 @@ export interface AcquiredTableBlock {
   readonly unpaintedOverflowPt?: number;
   readonly nextCursor?: BodyTableContinuationCursor | null;
   readonly flowRegistryDelta?: BodyFlowRegistryDeltaPt;
+  /** Host-flow extent below the cursor occupied by a zero-advance owner,
+   * charged with its footnote reserve exactly like a placed paragraph frame. */
+  readonly relocationBlockExtentPt?: number;
   readonly requiresFreshFlowRegion?: boolean;
   readonly retryAtBlockStartPt?: number;
   readonly placement?: Readonly<{
@@ -124,6 +142,24 @@ export interface StoryLayoutAcquisitionInput {
   readonly pageIndex: number;
   readonly section: DeepReadonly<SectionLayoutContext>;
   readonly container: FlowContainer;
+  /**
+   * The translation its composer applies to the laid-out story (a header,
+   * footer or note band), when known before layout. Content only a page
+   * position places then resolves on the page through it: a header/footer
+   * root cell-owner host anchored to the page or margin states its wrap
+   * exclusion in story coordinates through its inverse, and the §17.4.57
+   * positioned tables of story tables are given final frames through it.
+   */
+  readonly bandTranslationPt?: Readonly<{ xPt: number; yPt: number }>;
+  /**
+   * The destination page's page and margin rectangles stated in this story's
+   * own coordinates, when its composer knows the transform that places the
+   * laid-out story (a text box: its anchor offset, autofit shift, orientation
+   * and final drawing placement; story-page-frames.ts). Positioned tables of
+   * its tables then resolve against them in story coordinates and move with
+   * every later transform of the story, like its other content.
+   */
+  readonly pageFrames?: Readonly<{ page: LayoutRect; margin: LayoutRect }>;
 }
 
 export interface NoteLayoutAcquisitionInput {
@@ -133,6 +169,26 @@ export interface NoteLayoutAcquisitionInput {
   readonly section: DeepReadonly<SectionLayoutContext>;
   readonly container: FlowContainer;
   readonly firstOnPage: boolean;
+  /** The first note on this page resumes a note begun on an earlier page. */
+  readonly continuing?: boolean;
+  /**
+   * Present when the container already states the notes' final page
+   * position (document-end endnotes are laid out where they are painted):
+   * each note story's band translation, the identity there, so the
+   * positioned tables of its tables resolve on the page
+   * (`StoryLayoutAcquisitionInput.bandTranslationPt`). Footnotes are stacked
+   * after layout and omit it. Note-root tables elect no cell-owner carrier
+   * (table-owner-runs.ts tableRowsElectCarriers).
+   */
+  readonly bandTranslationPt?: Readonly<{ xPt: number; yPt: number }>;
+  /**
+   * Footnotes: the page-final flow top a previous pass composed for a note
+   * whose story is band dependent (header-footer-reserve.ts
+   * `footnoteTopsPt`; for a continued tail, moved by its source cut). That
+   * note's story is laid out with the band that moves its flow top there,
+   * the translation composition then applies to its retained content.
+   */
+  readonly plannedTopsPt?: Readonly<Record<string, number>>;
 }
 
 export interface FollowingBodyBlockMeasurementInput {
@@ -154,6 +210,20 @@ export interface FollowingBodyBlockMeasurement {
   readonly pageOwnedAnchorKeysByLine?: readonly (readonly string[])[];
 }
 
+/** First-placement geometry of a carried paragraph-relative drawing. */
+export type CarriedHostAnchor = Readonly<{
+  bounds: Readonly<{ xPt: number; yPt: number; widthPt: number; heightPt: number }>;
+  exclusionBounds: Readonly<{ xPt: number; yPt: number; widthPt: number; heightPt: number }>;
+  horizontalOwnership?: 'page' | 'host';
+  verticalOwnership?: 'page' | 'host';
+  wrap: 'square' | 'tight' | 'through' | 'topAndBottom';
+  wrapSide?: string | null;
+  wrapDistances?: Readonly<{ topPt: number; rightPt: number; bottomPt: number; leftPt: number }>;
+  wrapPolygon?: readonly Readonly<{ xPt: number; yPt: number }>[];
+  topEdgeInclusiveFromYPt?: number;
+  anchorLineExemptTopPt?: number;
+}>;
+
 export interface PageAnchorPrescanInput {
   readonly anchors: readonly (
     | Readonly<{
@@ -166,6 +236,14 @@ export interface PageAnchorPrescanInput {
         occurrenceId: string;
         tableSource: SourceRef;
         bounds: Readonly<{ xPt: number; yPt: number; widthPt: number; heightPt: number }>;
+      }>
+    | Readonly<{
+        /** WORD_LATER_ANCHOR_EARLIER_LINE_WRAP: a paragraph-relative drawing
+         * carried from a previous pass with its first-placement geometry. */
+        kind: 'host-drawing';
+        occurrenceId: string;
+        paragraphSource: SourceRef;
+        carry: CarriedHostAnchor;
       }>
   )[];
   readonly location: BodyAcquisitionLocation;

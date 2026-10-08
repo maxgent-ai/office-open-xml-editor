@@ -58,9 +58,14 @@ const EXPECTED_ADDED = new Set([
 ]);
 
 describe('XLSX_GOOGLE_FONTS — shared registry consolidation (oracle)', () => {
-  it('preserves every pre-consolidation entry byte-for-byte', () => {
+  it('preserves complete loading entries with explicit Arabic scope metadata', () => {
     for (const [key, entry] of Object.entries(XLSX_GOOGLE_FONTS_OLD)) {
-      expect(XLSX_GOOGLE_FONTS[key], `entry "${key}"`).toEqual(entry);
+      // Loading entries remain the frozen oracle; only these five authored
+      // visual alternatives carry the explicitly expected Arabic scope tag.
+      const scoped = new Set(['sakkal majalla', 'traditional arabic', 'simplified arabic',
+        'arabic typesetting', 'univers next arabic']);
+      expect(XLSX_GOOGLE_FONTS[key], `entry "${key}"`)
+        .toEqual(scoped.has(key) ? { ...entry, script: 'arabic' } : entry);
     }
   });
 

@@ -18,6 +18,7 @@ const fontMocks = vi.hoisted(() => ({
 }));
 let bootstrapEmbeddedFonts: unknown[] = [];
 let extractedFontCount = 0;
+let subsetSlides: string[] | undefined;
 function deferred<T>() {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>((resolvePromise) => { resolve = resolvePromise; });
@@ -32,25 +33,25 @@ class FakePptxArchive {
   constructor(_bytes: Uint8Array, _max?: bigint) {}
   presentation_bootstrap(): Uint8Array {
     return new TextEncoder().encode(JSON.stringify({
-      slideCount: 1,
+      slideCount: subsetSlides?.length ?? 1,
       slideWidth: 914400,
       slideHeight: 914400,
       defaultTextColor: null,
-      majorFont: null,
+      majorFont: subsetSlides ? 'Calibri' : null,
       minorFont: null,
       hlinkColor: null,
       folHlinkColor: null,
       embeddedFonts: bootstrapEmbeddedFonts,
-      slides: [{ index: 0, partName: 'ppt/slides/slide1.xml' }],
+      slides: Array.from({ length: subsetSlides?.length ?? 1 }, (_, index) => ({ index, partName: `ppt/slides/slide${index + 1}.xml` })),
     }));
   }
-  pull_slide(): Uint8Array {
+  pull_slide(index = 0, _operation?: number, _generation?: number, _credit?: number): Uint8Array {
     return new TextEncoder().encode(JSON.stringify({
-      index: 0,
-      slideNumber: 1,
-      partName: 'ppt/slides/slide1.xml',
+      index,
+      slideNumber: index + 1,
+      partName: `ppt/slides/slide${index + 1}.xml`,
       background: null,
-      elements: [],
+      elements: subsetSlides ? [{ type: 'shape', textBody: { vert: 'horz', paragraphs: [{ bullet: { type: 'none' }, runs: [{ type: 'text', text: subsetSlides[index], fontFamily: 'Calibri' }] }] } }] : [],
       notes: 'worker note',
       hidden: true,
     }));
@@ -128,10 +129,11 @@ function installSelf(): FakeSelf {
   return fake;
 }
 
-async function loadRenderWorker(): Promise<FakeSelf> {
+async function loadRenderWorker(variant: 'source' | 'default' = 'source'): Promise<FakeSelf> {
   const fake = installSelf();
   vi.resetModules();
-  await import('./render-worker-source.js');
+  if (variant === 'source') await import('./render-worker-source.js');
+  else await import('./render-worker.js');
   return fake;
 }
 
@@ -144,6 +146,7 @@ beforeEach(() => {
   fontMocks.render.mockReset();
   bootstrapEmbeddedFonts = [];
   extractedFontCount = 0;
+  subsetSlides = undefined;
 });
 
 afterEach(() => {
@@ -332,5 +335,44 @@ describe('pptx render-worker.ts — init failure never hangs a request (AR4)', (
       expect.objectContaining({ officeFontRoutes: { 'calibri:400:normal': route } }),
       expect.any(Function),
     );
+  });
+});
+
+
+describe('Google subset readiness in progressive render owners', () => {
+  it.each(['default', 'source'] as const)('loads a later subset of an already requested family before publication (%s)', async (variant) => {
+    subsetSlides = ['A', 'B'];
+    initMock.mockResolvedValue(undefined);
+    if (variant === 'source') openSourceMock.mockResolvedValue({ archive: new FakePptxArchive(new Uint8Array()), viewDefaults: {}, close: vi.fn() });
+    const a = deferred<void>(), b = deferred<void>();
+    const faces: Array<{ source: string; loadCalls: number }> = [];
+    class SubsetFace {
+      loadCalls = 0;
+      constructor(public family: string, public source: string) {}
+      load() { this.loadCalls++; return (this.source.includes('a.woff2') ? a.promise : b.promise).then(() => this); }
+    }
+    vi.stubGlobal('FontFace', SubsetFace);
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, text: async () => `
+      @font-face { font-family: Carlito; src: url(b.woff2); unicode-range: U+0042; }
+      @font-face { font-family: Carlito; src: url(a.woff2); unicode-range: U+0041; }
+    ` })));
+    const fake = await loadRenderWorker(variant);
+    fake.fonts = { add: (f: FontFace) => faces.push(f as unknown as typeof faces[number]), delete: () => true } as unknown as FontFaceSet;
+    fake.onmessage?.({ data: { kind: 'init', wasmUrl: 'x' } } as MessageEvent);
+    fake.onmessage?.({ data: { kind: 'parse', id: 71, buffer: new ArrayBuffer(4), resourcePolicy, useGoogleFonts: true, progressiveLayout: true,
+      ...(variant === 'source' ? { source: modelSource, sourceOwnerUrl: './internal/worker-presentation-source.js' } : {}),
+    } } as MessageEvent);
+    await vi.waitFor(() => expect(faces.map(f => f.loadCalls)).toEqual([0, 1]));
+    expect(fake.posted.some((m) => (m as { kind: string }).kind === 'presentationLayoutPartial')).toBe(false);
+    a.resolve();
+    await vi.waitFor(() => expect(fake.posted).toContainEqual(expect.objectContaining({ kind: 'presentationLayoutPartial', availableSlides: 1 })));
+    fake.onmessage?.({ data: { kind: 'continuePresentationPreflight', forId: 71, availableSlides: 1 } } as MessageEvent);
+    await vi.waitFor(() => expect(faces.map(f => f.loadCalls)).toEqual([1, 1]));
+    expect(fake.posted).not.toContainEqual(expect.objectContaining({ kind: 'presentationLayoutPartial', availableSlides: 2 }));
+    b.resolve();
+    await vi.waitFor(() => expect(fake.posted).toContainEqual(expect.objectContaining({ kind: 'presentationLayoutPartial', availableSlides: 2 })));
+    expect(faces).toHaveLength(2);
+    fake.onmessage?.({ data: { kind: 'continuePresentationPreflight', forId: 71, availableSlides: 2 } } as MessageEvent);
+    await vi.waitFor(() => expect(fake.posted).toContainEqual(expect.objectContaining({ kind: 'presentationReady', id: 71 })));
   });
 });

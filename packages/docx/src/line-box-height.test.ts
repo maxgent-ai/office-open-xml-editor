@@ -248,6 +248,16 @@ describe('lineBoxHeight — docGrid line-cell rounding (East Asian vs Latin)', (
     // cell count; Yu Mincho's 28.65px design height takes two 20px cells.
     expect(lineBoxHeight(null, 24, 6, 1, grid20, false, 20 * YU, true)).toBe(40);
   });
+  it('allocates admitted Latin single-line design heights to whole grid cells while exact and atLeast retain their paths', () => {
+    const single = { rule: 'auto' as const, value: 1, explicit: true };
+    const height = (rule: typeof single | { rule: 'exact' | 'atLeast'; value: number; explicit: true }, design: number) =>
+      lineBoxHeight(rule, 18, 5, 1, grid20, false, design, false, 23,
+        undefined, undefined, 0, design);
+    expect(height(single, 23)).toBe(40);
+    expect(height(single, 34.5)).toBe(40);
+    expect(height({ rule: 'exact', value: 30, explicit: true }, 23)).toBe(30);
+    expect(height({ rule: 'atLeast', value: 24, explicit: true }, 23)).toBe(24);
+  });
   it('keeps a Latin line at natural height (one-cell floor), NOT cell-rounded', () => {
     // 22px natural, Latin → max(22, 20) = 22px (Word does not cell-round it).
     expect(lineBoxHeight(null, 17.6, 4.4, 1, grid20, false, 0, false)).toBe(22);

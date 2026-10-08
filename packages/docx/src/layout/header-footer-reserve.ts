@@ -5,6 +5,17 @@ import type { StoryLayout } from './types.js';
 export interface HeaderFooterReserve {
   readonly top: number;
   readonly bottom: number;
+  /**
+   * Page-final flow top of each footnote, by note id, whose story is band
+   * dependent (StoryLayout.bandDependent: it holds §17.4.57 positioned
+   * tables that only a page position places).
+   * Footnotes are stacked only once their page closes, so the composed
+   * position one pass observes is the band the next pass lays the note out
+   * with; like the reserves, it is converged exactly (body-paginator.ts
+   * footnoteBandPlan). A continued tail's entry is its composed top moved by
+   * its source cut: the page position of its acquisition's flow top.
+   */
+  readonly footnoteTopsPt?: Readonly<Record<string, number>>;
 }
 
 export interface ReservedBodyInterval {
@@ -191,7 +202,7 @@ export function* convergeHeaderFooterReserveSteps<T, Y, C>(
   let initial: HeaderFooterReserveIteration<T> | null = iteration(seed);
   seed = undefined as unknown as T;
   if (!input.requiresConvergence && initial.reserves.every(
-    (reserve) => reserve.top === 0 && reserve.bottom === 0,
+    (reserve) => reserve.top === 0 && reserve.bottom === 0 && reserve.footnoteTopsPt === undefined,
   )) return initial;
   const steps = convergeLayoutSteps<HeaderFooterReserveIteration<T>, Y, Carried>(
     initial,

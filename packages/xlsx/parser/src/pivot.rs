@@ -66,7 +66,6 @@ pub(crate) fn load_sheet_pivots(
             }],
         );
     }
-    let base = format!("xl/{sheet_dir}");
     let mut tables = Vec::new();
     let mut diagnostics = Vec::new();
     let mut targets = Vec::new();
@@ -141,7 +140,7 @@ pub(crate) fn load_sheet_pivots(
             });
             continue;
         };
-        targets.push(resolve_zip_path(&base, target));
+        targets.push(resolve_zip_path(&format!("xl/{sheet_path}"), target));
     }
     let mut workbook_styles: Option<WorkbookTableStyles> = None;
     for part in targets {
@@ -590,7 +589,7 @@ fn pivot_cache_target(archive: &mut XlsxZip, pivot_part: &str) -> CacheLink {
             }
             match relationship.attribute("Target") {
                 Some(target) if !target.is_empty() => {
-                    CacheLink::Target(resolve_zip_path(dir, target))
+                    CacheLink::Target(resolve_zip_path(pivot_part, target))
                 }
                 None => CacheLink::Malformed,
                 Some(_) => CacheLink::Malformed,

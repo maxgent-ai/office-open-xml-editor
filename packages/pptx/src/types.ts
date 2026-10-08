@@ -89,11 +89,6 @@ export interface Paragraph extends CoreParagraph {
    */
   fontAlgn?: 't' | 'ctr' | 'b';
   /**
-   * True when `<a:endParaRPr>` authors its own latin face. Only that face
-   * sizes the paragraph's last line with text (at the last run's size).
-   */
-  endFaceAuthored?: boolean;
-  /**
    * `<a:pPr defTabSz>` (ECMA-376 §21.1.2.2.7) — the default tab-stop interval in
    * EMU. When a `\t` has no reachable explicit `a:tabLst` stop, it advances to
    * the next multiple of this grid (issue #1006). Absent ⇒ the renderer uses the
@@ -132,6 +127,13 @@ export interface TextBody extends CoreTextBody {
    * Defaults to false (both suppressed); omitted from JSON when false.
    */
   spcFirstLastPara?: boolean;
+  /**
+   * `<a:bodyPr anchorCtr>` (ECMA-376 §21.1.2.1.1) — centre the text block
+   * within the bounding box perpendicular to the anchor. Defaults to false;
+   * omitted from JSON when false. Only stacked vertical text
+   * (`wordArtVert` / `wordArtVertRtl`) applies it so far.
+   */
+  anchorCtr?: boolean;
   /**
    * Effective `<a:bodyPr compatLnSpc>` (ECMA-376 §21.1.2.1.1) after the
    * slide → layout → master placeholder cascade; omitted when no level
@@ -515,6 +517,10 @@ export interface Sp3d {
 }
 
 export interface TableElement {
+  /** Optional `a:tblBg` fill across the entire table beneath cell fills.
+   * Resolved from the active theme matrix; omitted means no background paint.
+   * Existing model producers may omit it. */
+  background?: Fill;
   type: 'table';
   /** `<p:nvGraphicFramePr><p:cNvPr @id>` for the table frame. */
   id?: string;

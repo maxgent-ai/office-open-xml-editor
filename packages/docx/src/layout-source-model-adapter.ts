@@ -8,11 +8,20 @@ import {
   normalizeInternalDocumentModel,
   normalizeOwnedInternalDocumentModel,
   documentTypographySettingsInput,
+  nativeNoteSeparatorParagraphAcquisitionInput,
+  selectedNoteSeparatorParagraphAcquisitionInput,
   tableSourceAcquisitionInput,
   type InternalShapeRun,
   type NormalizedDocumentInput,
 } from './parser-model.js';
 import type { BodyAcquisitionInputProjections } from './layout/acquisition-input-projections.js';
+import type {
+  BodyLayoutInput,
+  NativeNoteSeparatorRolesInput,
+  SelectedNoteSeparatorDefinitionsInput,
+} from './layout/body-layout-input.js';
+import { normalizeNativeNoteSeparators } from './layout/native-note-separators.js';
+import { normalizeSelectedNoteSeparators } from './layout/selected-note-separators.js';
 import {
   sealLayoutSourceStore,
   type LayoutSourceStore,
@@ -370,6 +379,27 @@ function canonicalOwnedFinalParts(
   return parts;
 }
 
+/** The sealed layout input keeps canonical separator definitions only; the
+ * raw parser-boundary wire (native CP/FC/PAPX, DOCX story paragraphs) never
+ * reaches layout. */
+function withCanonicalNoteSeparators(
+  input: BodyLayoutInput,
+  roles: NativeNoteSeparatorRolesInput | undefined,
+  stories: SelectedNoteSeparatorDefinitionsInput | undefined,
+): BodyLayoutInput {
+  const settings = input.noteLayoutSettings;
+  if (settings?.nativeSeparators === undefined && settings?.footnoteSeparatorParagraphs === undefined) return input;
+  const { nativeSeparators: _nativeWire, footnoteSeparatorParagraphs: _storyWire, ...retained } = settings;
+  return {
+    ...input,
+    noteLayoutSettings: {
+      ...retained,
+      ...(roles ? { nativeSeparatorRoles: roles } : {}),
+      ...(stories ? { footnoteSeparatorStories: stories } : {}),
+    },
+  };
+}
+
 /**
  * Adapt a caller-owned compatibility model. It snapshots parser facts once,
  * captures identity-only sidecars by SourceRef, and seals a model-free store.
@@ -509,6 +539,44 @@ function buildLayoutSourceModelAdapter(
       input: tableSourceAcquisitionInput(table),
     }));
   }, (body, source) => { textBoxStories.push({ body, source }); });
+  // MS-DOC 2.3.3 reserved separator stories: validate and normalize the raw
+  // wire once, then register their paragraphs in the same canonical registry
+  // and fact list as every other paragraph. They join no note list.
+  const nativeSeparators = normalizeNativeNoteSeparators(
+    bodyLayoutInput.noteLayoutSettings?.nativeSeparators,
+    nativeNoteSeparatorParagraphAcquisitionInput,
+  );
+  // Ordinary DOCX formatted footnote separator stories: their own selected
+  // roots, registered the same way. A native producer never emits them.
+  const settings = bodyLayoutInput.noteLayoutSettings;
+  if (nativeSeparators?.roles.footnote && settings?.footnoteSeparatorParagraphs !== undefined) {
+    throw new Error('Native and DOCX footnote separator stories cannot both be retained');
+  }
+  const selectedSeparators = normalizeSelectedNoteSeparators(
+    settings?.footnoteSeparatorParagraphs,
+    {
+      separator: settings?.footnoteSeparator,
+      continuationSeparator: settings?.footnoteContinuationSeparator,
+    },
+    selectedNoteSeparatorParagraphAcquisitionInput,
+  );
+  const reservedNoteStories = [
+    ...(nativeSeparators?.stories ?? []),
+    ...(selectedSeparators?.stories ?? []),
+  ].map(({ source, body }) => {
+    body.forEach((retained, index) => {
+      const paragraphSource: SourceRef = { ...source, path: [index] };
+      const key = sourceKey(paragraphSource);
+      if (paragraphInputs.has(key)) throw new Error(`Duplicate paragraph source: ${key}`);
+      paragraphInputs.set(key, retained);
+      paragraphFacts.push(Object.freeze({
+        source: deepFreezePlainData(paragraphSource),
+        publicAnchorBridges: Object.freeze(retained.runs.map(() => null)),
+        numberingMarkerFallbackFontSizePt: null,
+      }));
+    });
+    return { source, body: body as unknown as readonly LayoutStoryBlock[] };
+  });
   const projections: BodyAcquisitionInputProjections = Object.freeze({
     ...privateProjections,
     paragraphAcquisitionInput(_paragraph: ParagraphLayoutSource, source: SourceRef) {
@@ -552,7 +620,9 @@ function buildLayoutSourceModelAdapter(
   // only the resulting plain snapshot; retaining a lazy closure here would keep
   // the complete private parser model reachable for the store lifetime.
   const source = sealLayoutSourceStore({
-    bodyLayoutInput,
+    bodyLayoutInput: withCanonicalNoteSeparators(
+      bodyLayoutInput, nativeSeparators?.roles, selectedSeparators?.definitions,
+    ),
     blockRepository: {
       body: canonicalDocument.body as unknown as readonly LayoutStoryBlock[],
       stories: [
@@ -564,6 +634,7 @@ function buildLayoutSourceModelAdapter(
       ],
       footnotes: (canonicalDocument.footnotes ?? []) as unknown as readonly LayoutStoryNote[],
       endnotes: (canonicalDocument.endnotes ?? []) as unknown as readonly LayoutStoryNote[],
+      reservedNoteStories,
     },
     section: ownsPrivateGraph
       ? canonicalOwnedSection(privateDocument.section)

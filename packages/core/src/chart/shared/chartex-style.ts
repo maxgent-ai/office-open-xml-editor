@@ -11,11 +11,12 @@ import {
 } from '../style-paint.js';
 import type { Fill } from '../../types/common';
 import { rawLinkedChartStyleRole } from '../effective-style.js';
-import { resolveFill } from '../../shape/paint.js';
+import { resolveNativeFill as resolveFill } from '../../shape/paint.js';
 import { paintChartImageFill } from '../image-fill.js';
 import { axisLineWidthPx } from '../axis-style.js';
 import { CHARTEX_DEFAULT_PALETTE } from './palette.js';
 import { dashPatternForLine } from './geometry.js';
+import { emptyChartExLegendSeries } from '../chart-ex-legend-series.js';
 
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -262,7 +263,7 @@ export interface ResolvedChartExLineStyle {
 
 export type ChartExSeriesStyleCarrier = Pick<
   ChartSeries,
-  'chartexStyle' | 'lineHidden' | 'lineColor' | 'lineWidthEmu'
+  'chartexStyle' | 'lineHidden' | 'lineColor' | 'lineWidthEmu' | 'trendLines'
 >;
 
 
@@ -645,8 +646,7 @@ export function chartExLegendSeries(
   const outlined = inheritPlotOutline
     && !(bodyOmitsStructuredLine && chartExLineIsStructured(line));
   return {
-    name,
-    values: [],
+    ...emptyChartExLegendSeries(name, series ?? undefined),
     color: fillColor.replace(/^#/, ''),
     lineHidden: !outlined || !line.visible,
     lineColor: outlined && line.visible ? line.color.replace(/^#/, '') : null,

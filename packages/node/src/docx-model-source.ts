@@ -57,6 +57,8 @@ export async function openDocxSource(
     const services = createLayoutServices(acquired.result, {
       cjkFallback,
       measureContext: measurementCanvas.getContext('2d') as CanvasRenderingContext2D,
+      // Same library default as openDocxDocument's OOXML branch.
+      allowFootnoteContinuation: options.allowFootnoteContinuation !== false,
     });
     const defaultCurrentDateMs = normalizeCurrentDate(options.currentDate);
     const retained = retainRenderWorkerDocumentLayout(acquired.result, services, defaultCurrentDateMs);

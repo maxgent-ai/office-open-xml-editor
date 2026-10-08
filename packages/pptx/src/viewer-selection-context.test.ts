@@ -182,7 +182,7 @@ describe('PptxViewer selection context', () => {
 
     expect(engine.elementContextCalls).toHaveLength(1);
     expect(viewer.getSelectionContext()).toMatchObject({ kind: 'element', shapeId: '7' });
-    const outlineLayer = (canvas.parentElement as FakeEl).children.at(-1)!;
+    const outlineLayer = (canvas.parentElement as FakeEl).children.find((child) => child.dataset.overlay === 'element')!;
     expect(outlineLayer.children).toHaveLength(1);
     expect(outlineLayer.children[0].style).toMatchObject({
       left: '0%',

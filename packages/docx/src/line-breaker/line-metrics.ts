@@ -5,7 +5,7 @@ import type { NumberingMarkerShapeInput } from '../layout/types.js';
 import type { MeasurementTextContext } from '../layout/measurement-capabilities.js';
 import type { ParagraphLayoutSource, TextLayoutService } from '../layout/text.js';
 import { referenceFontLineMetrics } from '../reference-font-line-metrics.js';
-import { wordDegenerateLineSpacingIsSingle, wordEastAsianGridLineCells, wordFarEastSingleLinePx, wordGridAtLeastLineHeightPx, wordUseFeLayoutInheritedGridHeightPx, wordUseFeLayoutParagraphMarkGridAdvancePx, wordInlinePictureAutoLineHeightPx } from '../layout/line-compatibility.js';
+import { wordDegenerateLineSpacingIsSingle, wordEastAsianGridLineCells, wordFarEastSingleLinePx, wordGridAtLeastLineHeightPx, wordUseFeLayoutInheritedGridHeightPx, wordUseFeLayoutParagraphMarkGridAdvancePx, wordInlinePictureAutoLineHeightPx, wordLatinDesignGridSingleHeight } from '../layout/line-compatibility.js';
 import { type DocGridCtx, type LayoutLine } from './model.js';
 import { isGridLineRule } from './advance.js';
 import { buildFont, getDefaultFontFamily, getDefaultFontSize } from './font-routes.js';
@@ -95,6 +95,7 @@ export function lineBoxHeight(
   untabledEastAsianEmPx?: number,
   uniformPositionAuto?: LayoutLine['uniformPositionAuto'],
   inlinePictureTextSinglePx = 0,
+  latinGridCountSinglePx = 0,
 ): number {
   const glyphNatural = ascentPx + descentPx;
   // For `auto`/single spacing the multiplier applies to the intended font's
@@ -118,12 +119,16 @@ export function lineBoxHeight(
   // height (`gridCountSinglePx`), per
   // `word-east-asian-grid-line-allocation`; the substituted Canvas glyph box is
   // not used because it can overstate the source resource's design height.
-  // A Latin-only line is not cell-rounded: it keeps its natural height above a
-  // one-cell floor. ECMA-376 Part 1 defines only the natural ≤ pitch case
+  // Known non-FE Latin design profiles use WORD_LATIN_DESIGN_GRID_CELLS;
+  // unclassified/FE profiles retain their natural height above a one-cell floor. ECMA-376 Part 1 defines only the natural ≤ pitch case
   // (§17.6.5 / §17.3.1.32), so `word-east-asian-grid-line-allocation` gates
   // whole-cell allocation on the line's script.
   const gridSingleCell = (): number => {
-    if (!eastAsian) return Math.max(natural, pitchPx);
+    if (!eastAsian) {
+      // WORD_LATIN_DESIGN_GRID_CELLS admits design metrics only; unknown
+      // Canvas boxes and Far-East reference faces keep the existing floor.
+      return wordLatinDesignGridSingleHeight(natural, pitchPx, latinGridCountSinglePx);
+    }
     // Ruby lines reserve real furigana height (base + rt); honor the measured
     // glyph box so the annotation is not clipped. Plain EA lines snap their
     // design single-line height to whole cells.
@@ -169,7 +174,7 @@ export function lineBoxHeight(
           ? wordUseFeLayoutInheritedGridHeightPx(allocated, pitchPx, ls.value)
           : allocated;
       }
-      return Math.max(natural, pitchPx * ls.value);
+      return ls.value === 1 ? gridSingleCell() : Math.max(natural, pitchPx * ls.value);
     }
     if (inlinePictureTextSinglePx > 0 && ls.value >= 1) {
       // The object owns its baseline-union extent; the authored auto leading
@@ -334,6 +339,9 @@ export function paragraphMarkLineMetrics(
   const authoredFamily = getDefaultFontFamily(para, markUsesEastAsianFace);
   const markWeight = effectiveMarkShapeInput?.weight ?? 400;
   const markStyle = effectiveMarkShapeInput?.style ?? 'normal';
+  // §17.3.1.29 stores the paragraph mark's own run properties in pPr/rPr.
+  // Shape this probe in its own context: the library's scoped Arabic substitute
+  // policy must not borrow script proof from surrounding body runs.
   const markProbe = markUsesEastAsianFace ? 'あ' : 'x';
   // A supplied metric map without the selecting text service cannot prove
   // which face Canvas paints. The compatibility argument above is ignored;

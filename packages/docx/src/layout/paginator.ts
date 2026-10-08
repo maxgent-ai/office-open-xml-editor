@@ -5,9 +5,9 @@ import {
 } from './context.js';
 import {
   createSectionRegionCoordinateSpace,
+  sectionWritingMode,
   transformRect,
   uprightPhysicalExtent,
-  writingModeFromTextDirection,
 } from './coordinate-space.js';
 import type { PaintNode } from './types.js';
 
@@ -319,8 +319,8 @@ function resolveNextColumnDestination(
       reason,
     );
   };
-  const outgoingWritingMode = writingModeFromTextDirection(state.section.textDirection);
-  const incomingWritingMode = writingModeFromTextDirection(section.textDirection);
+  const outgoingWritingMode = sectionWritingMode(state.section);
+  const incomingWritingMode = sectionWritingMode(section);
   if (outgoingWritingMode !== incomingWritingMode) reject('writing-mode');
   const outgoingPage = uprightPhysicalExtent({
     widthPt: state.section.geometry.pageWidth,

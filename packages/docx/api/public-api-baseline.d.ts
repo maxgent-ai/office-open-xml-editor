@@ -1083,6 +1083,8 @@ export interface DocParagraph {
     indentFirst: number;
     spaceBefore: number;
     spaceAfter: number;
+    beforeAutospacing?: boolean;
+    afterAutospacing?: boolean;
     lineSpacing: LineSpacing | null;
     numbering: NumberingInfo | null;
     tabStops: TabStop[];
@@ -1097,6 +1099,8 @@ export interface DocParagraph {
     markVanish?: boolean;
     widowControl?: boolean;
     overflowPunct?: boolean;
+    autoSpaceDE?: boolean;
+    autoSpaceDN?: boolean;
     adjustRightInd?: boolean;
     borders?: ParagraphBorders | null;
     styleId?: string | null;
@@ -1143,6 +1147,7 @@ type DocRunContent = ({
     type: 'ptab';
 } & PTabRun);
 export interface DocSettings {
+    doNotUseHtmlParagraphAutoSpacing?: boolean;
     kinsoku?: boolean;
     noLineBreaksBefore?: string;
     noLineBreaksAfter?: string;
@@ -1154,6 +1159,7 @@ export interface DocSettings {
     useFeLayout?: boolean;
     balanceSingleByteDoubleByteWidth?: boolean;
     adjustLineHeightInTable?: boolean;
+    compatibilityMode?: number;
 }
 export interface DocTable {
     colWidths: number[];
@@ -1181,6 +1187,7 @@ export interface DocTableCell {
     vAlign: 'top' | 'center' | 'bottom';
     widthPt: number | null;
     widthPct?: number;
+    noWrap?: boolean;
     marginTop?: number | null;
     marginBottom?: number | null;
     marginLeft?: number | null;
@@ -1724,6 +1731,7 @@ export interface LineSpacing {
     explicit?: boolean;
 }
 export interface LoadOptions extends LoadOptions__emitterCollision1 {
+    allowFootnoteContinuation?: boolean;
     math?: MathRenderer;
     mode?: 'main' | 'worker';
     sliceLayout?: boolean;
@@ -1742,6 +1750,7 @@ interface LoadOptions__emitterCollision1 {
     wasmUrl?: string | URL;
     maxZipEntryBytes?: number;
     resourceLimits?: OoxmlResourceLimits;
+    xlsxWorksheetLimits?: XlsxWorksheetLimits;
     debug?: boolean;
     onResourceMetrics?: (metrics: OoxmlResourceMetrics) => void;
     workerTimeoutMs?: number;
@@ -1899,6 +1908,7 @@ export interface NoFill {
 export interface NoteRef {
     kind: 'footnote' | 'endnote' | string;
     id: string;
+    customMarkFollows?: boolean;
 }
 export function noteText(note: DocNote): string;
 export interface NumberingInfo {
@@ -1979,6 +1989,12 @@ export interface OoxmlResourcePolicySnapshot {
     readonly maxArchiveEntryBytes: number | null;
     readonly maxTotalInflatedBytes: number | null;
     readonly maxArchiveEntries: number | null;
+    readonly xlsxWorksheetLimits?: Readonly<{
+        readonly maxRows: number;
+        readonly maxCells: number;
+        readonly maxOwnedUtf8Bytes: number;
+        readonly maxJsonBytes: number;
+    }>;
 }
 export interface OoxmlResourceUsageSnapshot {
     readonly archiveEntryCount: number;
@@ -2343,6 +2359,7 @@ export interface ShapeRun {
     defaultTextColor?: string | null;
     textAnchor?: string | null;
     textAutofit?: string | null;
+    textWrap?: string | null;
     textInsetL?: number;
     textInsetT?: number;
     textInsetR?: number;
@@ -2371,6 +2388,7 @@ export type ShapeStrokeFill = {
 export interface ShapeText {
     text: string;
     fontSizePt: number;
+    defaultFontSize?: number;
     color?: string | null;
     paragraphMarkColor?: string | null;
     fontFamily?: string | null;
@@ -2381,6 +2399,8 @@ export interface ShapeText {
     alignment: string;
     spaceBefore?: number;
     spaceAfter?: number;
+    beforeAutospacing?: boolean;
+    afterAutospacing?: boolean;
     lineSpacingVal?: number;
     lineSpacingRule?: string;
     indentLeft?: number;
@@ -2500,6 +2520,12 @@ export interface ViewerCommentThreadContext {
 export interface ViewerContextMenuEvent<TContext> {
     readonly originalEvent: MouseEvent;
     getContext(): Promise<TContext | null>;
+}
+export interface XlsxWorksheetLimits {
+    maxRows?: number;
+    maxCells?: number;
+    maxOwnedUtf8Bytes?: number;
+    maxJsonBytes?: number;
 }
 export interface ZoomableViewer {
     getScale(): number;

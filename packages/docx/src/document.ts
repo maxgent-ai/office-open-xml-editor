@@ -45,7 +45,7 @@ import type { DocxDocumentModel, RenderPageOptions, WorkerRequest, WorkerRespons
 import { renderLayoutSourceToCanvas, documentHasMath, prepareMathRuns, type DocxTextRunInfo } from './renderer';
 import { createLayoutServices } from './layout-runtime.js';
 import { buildBookmarkPageMap } from './bookmark-nav';
-import { DOCX_GOOGLE_FONTS, docxFontPreloadNames, docxOfficeFontFallbackRequests } from './google-fonts';
+import { DOCX_GOOGLE_FONTS, docxGoogleFontPlan, docxOfficeFontFallbackRequests } from './google-fonts';
 import { loadEmbeddedFonts } from './embedded-fonts';
 import {
   attachDocumentLayoutRuntime,
@@ -96,6 +96,7 @@ import { PaginationAbortError } from './layout/pagination-scheduler.js';
 import { normalizeLayoutOptions, type LayoutOptions } from './layout/options.js';
 import type { LayoutVariantStore } from './layout/variant-store.js';
 import { publishDocxLayout } from './document-layout-events.js';
+import { unchangedLeadingPageCount } from './layout/unchanged-pages.js';
 import {
   docxLayoutViewRequester,
   publishDocxLayoutView,
@@ -108,6 +109,13 @@ import {
  *  must not require an application font catalog or device-font permission.
  *  Embedded fonts and the existing optional web-font preload remain supported. */
 export interface LoadOptions extends CoreLoadOptions {
+  /** Continue paragraph footnotes across physical pages. Omitted means true:
+   * the library's default display policy, chosen to follow Word's page
+   * allocation in finite controls rather than as a normative ECMA-376 rule.
+   * Pass `false` to keep the previous whole-note pagination. With continuation,
+   * table splitting, width changes and changed source cuts can reject layout,
+   * and full-note acquisition is subject to the library source/page budgets. */
+  allowFootnoteContinuation?: boolean;
   /**
    * Opt-in OMML equation engine. Import it from the separate `@silurus/ooxml/math`
    * entry and pass it in: `import { math } from '@silurus/ooxml/math'`. When
@@ -331,6 +339,7 @@ function snapshotReviewData(
 export class DocxDocument {
   private _metrics: OoxmlResourceMetricsSession | null = null;
   private _cjkFallback: CjkLang = 'jp';
+  private _allowFootnoteContinuation = false;
   private _document: DocxDocumentModel | null = null;
   private _source: LayoutSourceStore | null = null;
   private _meta: DocumentMeta | null = null;
@@ -520,6 +529,10 @@ export class DocxDocument {
       checkAbort();
       doc._metrics = metrics;
       doc._cjkFallback = cjkFallback;
+      // Library default: continuation unless the caller passes exactly false
+      // (LoadOptions.allowFootnoteContinuation). The normalized boolean then
+      // reaches main, sliced and worker layout explicitly.
+      doc._allowFootnoteContinuation = opts.allowFootnoteContinuation !== false;
       // The variant the caller will actually render, recorded for BOTH render
       // modes and recorded BEFORE the parse: geometry accessors and the
       // per-call option fill-in (`_withActiveView`) read it, the wire options
@@ -616,7 +629,7 @@ export class DocxDocument {
         embeddedRoutes = loadedEmbedded.routes;
       }
       const officeFonts = doc._mode === 'main' && doc._document
-        ? await loadOfficeFontFallbacks(docxOfficeFontFallbackRequests(doc._document).filter((request) =>
+        ? await loadOfficeFontFallbacks(docxOfficeFontFallbackRequests(doc._document, { useGoogleFonts: opts.useGoogleFonts, cjkFallback: cjkFallback }).filter((request) =>
             !embeddedRoutes?.some((route) => route.requestedFamily.toLowerCase() === request.family.toLowerCase()
               && route.weight === (request.weight ?? 400) && route.style === (request.style ?? 'normal'))))
         : { faces: [], routes: {} };
@@ -625,12 +638,13 @@ export class DocxDocument {
         throw new PaginationAbortError();
       }
       doc._officeFontFaces = officeFonts.faces;
+      let installedSubstituteFamilies: readonly string[] = [];
       if (doc._mode === 'main' && opts.useGoogleFonts && doc._document) {
-        // A proven local Calibri face already resolves this authored family;
-        // avoid the optional Google Fonts substitution for the same request.
-        const names = docxFontPreloadNames(doc._document, cjkFallback).filter((name) =>
-          name?.toLowerCase() !== 'calibri' || !('calibri' in officeFonts.routes));
-        const googleFaces = await preloadGoogleFonts(names, DOCX_GOOGLE_FONTS);
+        // An installed authored face is never displaced by a different-family
+        // substitute (docxGoogleFontPlan).
+        const plan = docxGoogleFontPlan(doc._document, cjkFallback, officeFonts);
+        installedSubstituteFamilies = plan.installedSubstituteFamilies;
+        const googleFaces = await preloadGoogleFonts(plan.names, DOCX_GOOGLE_FONTS);
         if (signal?.aborted) {
           unloadGoogleFonts(googleFaces);
           throw new PaginationAbortError();
@@ -650,12 +664,14 @@ export class DocxDocument {
         const layoutDocument = doc;
         const runtime = documentLayoutRuntimeOf(doc);
         runtime.services = createLayoutServices(doc._source, {
+          allowFootnoteContinuation: doc._allowFootnoteContinuation,
           fontMetrics: embeddedMetrics,
           useGoogleFonts: !!opts.useGoogleFonts,
           cjkFallback,
           embeddedRoutes,
           officeRoutes: Object.values(officeFonts.routes),
           googleFaces: doc._googleFontFaces,
+          installedSubstituteFamilies,
           mathResources: preparedMath?.records,
           mathDrawables: preparedMath?.drawables,
         });
@@ -710,6 +726,7 @@ export class DocxDocument {
               onPreview: (preview) => {
                 if (!ownsPublication) return;
                 const first = publishedLayout === null;
+                const unchangedPages = unchangedLeadingPageCount(publishedLayout?.pages, preview.layout.pages);
                 const retainedPreview = progressiveDocument._replaceMainLayoutPublication(
                   store,
                   layoutOptions,
@@ -735,6 +752,7 @@ export class DocxDocument {
                     pageCount: preview.layout.pages.length,
                     exact: preview.exact,
                     complete: false,
+                    unchangedPages,
                   });
                   progressiveDocument._layoutObservers.notify('onLayoutPartial', opts.onLayoutPartial, {
                     availableUnits: preview.layout.pages.length,
@@ -754,7 +772,9 @@ export class DocxDocument {
           ).then((layout) => {
             // Replace only the exact prefix this drain last published. A newer
             // synchronous rebuild of the same variant owns the key otherwise.
+            let unchangedPages: number | undefined;
             if (ownsPublication) {
+              unchangedPages = unchangedLeadingPageCount(publishedLayout?.pages, layout.pages);
               const authoritative = progressiveDocument._replaceMainLayoutPublication(
                 store,
                 layoutOptions,
@@ -771,6 +791,9 @@ export class DocxDocument {
               pageCount: progressiveDocument.pageCount,
               exact: true,
               complete: true,
+              // Only this session's own publications were on screen.
+              ...(ownsPublication && progressiveDocument._isLayoutViewActive(layoutOptions)
+                && unchangedPages !== undefined ? { unchangedPages } : {}),
             });
             // The terminal success callback fires exactly once per load,
             // whether or not any partial was published — consumers must not
@@ -917,7 +940,7 @@ export class DocxDocument {
     const res = await this._bridge.request(
       (id) =>
         this._mode === 'worker'
-          ? ({ type: 'parse', id, data: buffer, resourcePolicy, useGoogleFonts, cjkFallback: this._cjkFallback, defaultCurrentDateMs: documentLayoutRuntimeOf(this).defaultCurrentDateMs, ...this._parseViewFields(), renderers } satisfies RenderWorkerRequest)
+          ? ({ type: 'parse', id, data: buffer, resourcePolicy, useGoogleFonts, allowFootnoteContinuation: this._allowFootnoteContinuation, cjkFallback: this._cjkFallback, defaultCurrentDateMs: documentLayoutRuntimeOf(this).defaultCurrentDateMs, ...this._parseViewFields(), renderers } satisfies RenderWorkerRequest)
           : ({ type: 'parse', id, data: buffer, resourcePolicy } satisfies WorkerRequest),
       [buffer],
       { timeoutMs },
@@ -995,6 +1018,7 @@ export class DocxDocument {
         pageCount: res.partial.pageCount,
         exact: res.partial.exact,
         complete: false,
+        ...(res.partial.unchangedPages === undefined ? {} : { unchangedPages: res.partial.unchangedPages }),
       });
       this._layoutObservers.notify('onLayoutPartial', progressive.onPartial, {
         availableUnits: res.partial.pageCount,
@@ -1045,10 +1069,14 @@ export class DocxDocument {
   }
 
   /** Install the authoritative metadata and close the progressive window. */
-  private _onAuthoritativeMeta(meta: DocumentMeta): void {
+  private _onAuthoritativeMeta(meta: DocumentMeta, unchangedPages?: number): void {
     this._clearParseWatchdog();
     const progressive = this._progressive;
     if (progressive?.settled) return;
+    // The worker compares against its own last publication, which is what
+    // the host shows only while the load's view is still the active one.
+    const viewedPublication = progressive !== null && this._meta !== null
+      && this._isLayoutViewActive(progressive.layoutOptions);
     if (!progressive || this._isLayoutViewActive(progressive.layoutOptions) || !this._meta) {
       this._meta = meta;
     } else {
@@ -1074,6 +1102,7 @@ export class DocxDocument {
       pageCount: this.pageCount,
       exact: true,
       complete: true,
+      ...(viewedPublication && unchangedPages !== undefined ? { unchangedPages } : {}),
     });
     // A load whose worker published nothing resolves here instead — there was
     // never anything to show early, so `load()` waited for the real document.
@@ -1219,6 +1248,7 @@ export class DocxDocument {
           data: buffer,
           resourcePolicy,
           useGoogleFonts,
+          allowFootnoteContinuation: this._allowFootnoteContinuation,
           cjkFallback: this._cjkFallback,
           defaultCurrentDateMs: documentLayoutRuntimeOf(this).defaultCurrentDateMs,
           ...this._parseViewFields(),
@@ -1264,9 +1294,8 @@ export class DocxDocument {
           progressive.firstPublication.resolve();
           return;
         }
-        this._onAuthoritativeMeta(
-          (res as Extract<RenderWorkerResponse, { type: 'parsedMeta' }>).meta,
-        );
+        const parsed = res as Extract<RenderWorkerResponse, { type: 'parsedMeta' }>;
+        this._onAuthoritativeMeta(parsed.meta, parsed.unchangedPages);
       },
       (error: unknown) => {
         this._parseRequestId = null;

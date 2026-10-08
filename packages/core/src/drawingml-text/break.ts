@@ -1,3 +1,4 @@
+import { FONT_SPACE_SENTINEL } from '../internal/font-measurement-sentinels.js';
 import { isCjkBreakChar } from '../text/cjk-ranges.js';
 import { DEFAULT_KINSOKU_RULES, kinsokuAdjustedSplit } from '../text/kinsoku/index.js';
 import { isUax14NoBreakPair, lineBreakClass } from '../text/line-break.js';
@@ -232,14 +233,51 @@ export function breakDrawingMlText<T>(
       }
     }
 
+    let explicitTabTail: Uint8Array | null = null;
+    let explicitTabTailStart = 0;
     const isSingleExplicitTabCell = (index: number): boolean => {
       const tab = atoms[index];
       const first = atoms[index + 1];
-      return tab?.type === 'tab' && !!options.tabStops?.length
-        && first?.type === 'text'
-        && /^[\p{Script_Extensions=Latin}\p{Number}]$/u.test(first.text)
-        && atoms.slice(index + 1).every((atom) => atom.type === 'text'
-          && !isSpace(atom) && !isCjk(atom));
+      if (tab?.type !== 'tab' || !options.tabStops?.length || first?.type !== 'text'
+          || !/^[\p{Script_Extensions=Latin}\p{Number}]$/u.test(first.text)) return false;
+      // Cache the unchanged suffix predicate; repeated tab-cell probes must
+      // neither copy nor rescan the remaining paragraph on each wrapped line.
+      // Line starts only advance, so no later query can reach an already
+      // consumed line. Start storage and construction at the current line.
+      if (explicitTabTail === null) {
+        explicitTabTailStart = start;
+        explicitTabTail = new Uint8Array(end - explicitTabTailStart + 1);
+        explicitTabTail[end - explicitTabTailStart] = 1;
+        for (let i = end - 1; i >= explicitTabTailStart; i--) {
+          const atom = atoms[i];
+          const offset = i - explicitTabTailStart;
+          explicitTabTail[offset] = explicitTabTail[offset + 1] && atom.type === 'text'
+            && !isSpace(atom) && !isCjk(atom) ? 1 : 0;
+        }
+      }
+      return explicitTabTail[index + 1 - explicitTabTailStart] === 1;
+    };
+
+    let kinsokuText: { chars: string[]; offsets: Int32Array } | null = null;
+    let kinsokuTextStart = 0;
+    const kinsokuCodePoints = (): { chars: string[]; offsets: Int32Array } => {
+      if (kinsokuText === null) {
+        // Flatten the unconsumed suffix once, starting at the current line.
+        // Line starts only advance: consumed atoms cannot affect kinsoku's
+        // line-local retraction floor and must not be scanned or retained.
+        // Suffix-relative offsets preserve the code-point split/retraction
+        // semantics for multi-code-point graphemes and omitted non-text atoms.
+        kinsokuTextStart = start;
+        const chars: string[] = [];
+        const offsets = new Int32Array(end - kinsokuTextStart + 1);
+        for (let i = kinsokuTextStart; i < end; i++) {
+          const atom = atoms[i];
+          if (atom.type === 'text') for (const ch of atom.text) chars.push(ch);
+          offsets[i + 1 - kinsokuTextStart] = chars.length;
+        }
+        kinsokuText = { chars, offsets };
+      }
+      return kinsokuText;
     };
 
     const appendAtom = (segments: DrawingMlLineSegment<T>[], atom: Atom<T>): void => {
@@ -272,7 +310,7 @@ export function breakDrawingMlText<T>(
           // previous length. A tab's earlier resolved gap is not an input to
           // the next candidate's tab-stop resolution.
           seg.width = 0;
-          noStopGap = options.measureText(' ', seg.style);
+          noStopGap = options.measureText(FONT_SPACE_SENTINEL, seg.style);
         }
         return { isTab: seg.type === 'tab', width: seg.width };
       });
@@ -331,11 +369,14 @@ export function breakDrawingMlText<T>(
       /** min(tailSum[i..segment end]) for a stop i inside a text segment. */
       tailSuffixMin: Float64Array;
       tabsBefore: Int32Array;
-      /** Index into gapValues of each tab atom's no-stop gap (`measureText(' ')`). */
+      /** Index into gapValues of each tab atom's no-stop gap (`measureText(FONT_SPACE_SENTINEL)`). */
       tabGap: Int32Array;
       gapValues: number[];
     }
     let model: NonMonotoneModel | null = null;
+    // nonMonotoneMeasure is fixed for this call: this model is built on the
+    // first finite-budget line, before any atoms can be consumed. Its segment,
+    // tab and block indexes are then reused; only bounded line heads are lazy.
     const atomText = (from: number, to: number): string => {
       let text = '';
       for (let i = from; i < to; i++) {
@@ -417,7 +458,7 @@ export function breakDrawingMlText<T>(
       for (let t = 0; t < end; t++) {
         const atom = atoms[t];
         if (atom.type !== 'tab' || (options.defaultTabSize ?? 0) > 0) continue;
-        const gap = options.measureText(' ', atom.style);
+        const gap = options.measureText(FONT_SPACE_SENTINEL, atom.style);
         let index = gapValues.indexOf(gap);
         if (index < 0) index = gapValues.push(gap) - 1;
         tabGap[t] = index;
@@ -747,11 +788,12 @@ export function breakDrawingMlText<T>(
       // eaLnBrk="0" lifts the East Asian line-start/line-end rules (E01).
       if (eastAsianRules && split < end && atoms[split - 1].run === atoms[split].run
           && (isCjk(atoms[split - 1]) || isCjk(atoms[split]))) {
-        const left = atoms.slice(start, split).flatMap((atom) => atom.type === 'text' ? [...atom.text] : []);
-        const right = atoms.slice(split).flatMap((atom) => atom.type === 'text' ? [...atom.text] : []);
-        if (left.length > 1 && right.length > 0) {
-          const adjusted = kinsokuAdjustedSplit([...left, ...right], left.length, DEFAULT_KINSOKU_RULES, 1);
-          const retract = left.length - adjusted;
+        const { chars, offsets } = kinsokuCodePoints();
+        const codeStart = offsets[start - kinsokuTextStart];
+        const codeSplit = offsets[split - kinsokuTextStart];
+        if (codeSplit - codeStart > 1 && codeSplit < chars.length) {
+          const adjusted = kinsokuAdjustedSplit(chars, codeSplit, DEFAULT_KINSOKU_RULES, codeStart + 1);
+          const retract = codeSplit - adjusted;
           if (retract > 0 && split - retract > start) split -= retract;
         }
       }

@@ -27,6 +27,7 @@ import {
 } from '@silurus/ooxml-core';
 import {
   CallerCanvasMount,
+  CanvasLoadingIndicator,
   CanvasOverlayHost,
   CanvasViewerErrorRouter,
   renderCanvasElementOutline,
@@ -51,7 +52,7 @@ import {
   subscribePptxLayout,
   type PptxLayoutPublication,
 } from './presentation-layout-events';
-import { createPptxLoadingLayer } from './loading-indicator';
+import { createPptxLoadingIndicator } from './loading-indicator';
 
 const borrowedPresentationOption = Symbol('PptxViewer.borrowedPresentation');
 type InternalPptxViewerOptions = PptxViewerOptions & {
@@ -211,7 +212,7 @@ export class PptxViewer implements ZoomableViewer {
   private elementContext: PptxElementContext | null = null;
   private elementHitGeneration = 0;
   private readonly elementHitTolerance: number;
-  private readonly _loadingLayer: HTMLSpanElement;
+  private readonly _loadingIndicator: CanvasLoadingIndicator;
   private _layoutUnsubscribe: (() => void) | null = null;
   private readonly _layoutWaiters = new Set<() => void>();
   private _layoutFailed = false;
@@ -279,8 +280,8 @@ export class PptxViewer implements ZoomableViewer {
     this.textLayer = overlays.textLayer;
     this.highlightLayer = overlays.highlightLayer;
     this.elementLayer = overlays.elementLayer;
-    this._loadingLayer = createPptxLoadingLayer(this.wrapper.ownerDocument);
-    this.wrapper.insertBefore(this._loadingLayer, this.elementLayer);
+    this._loadingIndicator = createPptxLoadingIndicator(this.wrapper);
+    this.wrapper.insertBefore(this._loadingIndicator.layer, this.elementLayer);
     if (this.textLayer && (opts.onSelectionContextChange || opts.enableElementSelection)) {
       this.selectionChangeListener = () => this._emitSelectionContextChange();
       this.wrapper.ownerDocument.addEventListener('selectionchange', this.selectionChangeListener);
@@ -815,7 +816,7 @@ export class PptxViewer implements ZoomableViewer {
   }
 
   private _setLoading(loading: boolean): void {
-    this._loadingLayer.style.display = loading ? 'flex' : 'none';
+    this._loadingIndicator.setLoading(loading);
   }
 
   /** Draw the find-highlight boxes for the current slide from its runs. */

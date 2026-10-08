@@ -5,8 +5,8 @@ import {
   fontFaceWeightCovers,
 } from '@silurus/ooxml-core';
 import type { ResolvedFontMetric } from '@silurus/ooxml-core';
-import type { OfficeFontFallbackRoute } from '@silurus/ooxml-core';
-import { DOCX_GOOGLE_FONTS } from '../google-fonts.js';
+import type { FontSubstituteScript, OfficeFontFallbackRoute } from '@silurus/ooxml-core';
+import { DOCX_GOOGLE_FONTS } from '../google-font-registry.js';
 import type { LoadedEmbeddedFontRoute } from '../embedded-fonts.js';
 import { normalizeFontFamilyUncached } from '../line-layout.js';
 import type { LayoutSourceStore } from './layout-source-store.js';
@@ -42,6 +42,7 @@ export interface LoadedFontFaceRecord {
 }
 
 export interface ProductionLayoutServiceOptions {
+  readonly allowFootnoteContinuation?: boolean;
   readonly localMetrics?: Readonly<Record<string, ResolvedFontMetric>>;
   readonly fontMetrics?: Readonly<Record<string, ResolvedFontMetric>>;
   readonly useGoogleFonts?: boolean;
@@ -57,6 +58,29 @@ export interface ProductionLayoutServiceOptions {
   /** Exact local registrations, scoped to this FontFaceSet. */
   readonly officeRoutes?: readonly OfficeFontFallbackRoute[];
   readonly googleFaces?: readonly LoadedFontFaceRecord[];
+  /** Normalized families whose authored face is installed; they are never
+   * routed to a different-family Google substitute (`docxGoogleFontPlan`). */
+  readonly installedSubstituteFamilies?: readonly string[];
+}
+
+/** Registry families with a script-scoped visual substitute (core
+ * substitute-script.ts), mapped to every substitute family of that script. An
+ * installed authored face is never substituted, so it is not scoped either.
+ * This registry delimits proof, not slot overrides: the resolver permits an
+ * override only when a loaded scoped substitute wins the exact resource tuple,
+ * after embedded, local and authored CSS inventory precedence. */
+function docxScriptScopedFamilies(
+  installed: readonly string[],
+): Record<string, { script: FontSubstituteScript; substituteFamilies: string[] }> {
+  const scoped = Object.entries(DOCX_GOOGLE_FONTS).filter(([, entry]) => entry.script !== undefined);
+  return Object.fromEntries(scoped
+    .filter(([key]) => !installed.includes(key))
+    .map(([key, entry]) => [key, {
+      script: entry.script!,
+      substituteFamilies: [...new Set(scoped
+        .filter(([, other]) => other.script === entry.script && other.loadFamily)
+        .map(([, other]) => other.loadFamily!))],
+    }]));
 }
 
 export function createProductionLayoutServices(
@@ -167,6 +191,8 @@ export function createProductionLayoutServices(
       const entry = DOCX_GOOGLE_FONTS[key];
       const resolvedFamily = entry?.loadFamily ?? name;
       if (!entry) continue;
+      if (normalizedFaceFamily(resolvedFamily) !== normalizedFaceFamily(name)
+        && options.installedSubstituteFamilies?.includes(key)) continue;
       for (const loaded of successfulGoogle.filter(
         (face) => face.family === normalizedFaceFamily(resolvedFamily),
       )) {
@@ -175,6 +201,7 @@ export function createProductionLayoutServices(
           resolvedFamily: loaded.displayFamily,
           source: normalizedFaceFamily(resolvedFamily) === normalizedFaceFamily(name)
             ? 'google' : 'substitute',
+          ...(entry.script === undefined ? {} : { script: entry.script }),
           weight: loaded.weight,
           style: loaded.style,
         });
@@ -219,6 +246,9 @@ export function createProductionLayoutServices(
             family, source.fonts.familyClasses, source.fonts.familyPitches, region,
           )])),
       ])),
+      scriptScopedFamilies: options.useGoogleFonts
+        ? docxScriptScopedFamilies(options.installedSubstituteFamilies ?? [])
+        : undefined,
       nativeFamilyLists: Object.fromEntries(routedFontFamilies.map((family) => [
         family,
         normalizeFontFamilyUncached(
@@ -309,6 +339,9 @@ export function createProductionLayoutServices(
     text,
     images: createImageMetadataService(imageMetadata),
     math: createMathMetadataService(mathResources),
+    ...(options.allowFootnoteContinuation === true
+      ? { allowFootnoteContinuation: true as const }
+      : {}),
     verticalGlyphFingerprint: options.verticalGlyphMeasurement.fingerprint,
   });
   const occurrenceKeys = source.mathOccurrences.map(({ source: occurrenceSource, display }) =>

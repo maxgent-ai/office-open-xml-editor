@@ -16,3 +16,11 @@ export { resolveDrawingMlTabWidths } from './tab.js';
 export type { DrawingMlTabItem, DrawingMlTabStop } from './tab.js';
 export { wrapSpreadsheetCellParagraph, layoutSpreadsheetCellRichLines } from './spreadsheet-cell.js';
 export type { SpreadsheetCellRichSeg, SpreadsheetCellRichLine } from './spreadsheet-cell.js';
+export { layoutStackedText } from './stacked.js';
+export type {
+  StackedDirection, StackedGlyph, StackedGlyphKind, StackedParagraph, StackedLayoutOptions, StackedPlacedGlyph,
+  StackedColumn, StackedLayout,
+} from './stacked.js';
+export {
+  STACKED_CELL_FACTOR, stackedCellBoxOverride, stackedFaceBox, stackedSidewaysCharacter, stackedVerticalGlyph,
+} from './stacked-faces.js';

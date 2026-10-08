@@ -23,10 +23,6 @@
     const width = 900;
     const ZOOM = 1.5;
 
-    const layersOf = (host) => {
-      const wrapper = host.querySelector('div'); // the viewer's positioned wrapper
-      return wrapper ? [...wrapper.children].filter((c) => c.tagName === 'DIV') : [];
-    };
     // Serialize the text-selection overlay: pptx nests run <span>s inside a
     // per-shape <div>, so walk shape → span and record the span text plus its
     // shape-frame origin and in-shape offset (rounded — sub-pixel raster jitter
@@ -41,12 +37,11 @@
     // follow the zoom (slide geometry px = EMU × scale), which is what this spec
     // asserts, and is identical whether the CSS is px or %.
     const wrapperRect = (host) => {
-      const wrapper = host.querySelector('div');
+      const wrapper = host.querySelector('canvas').parentElement;
       return wrapper.getBoundingClientRect();
     };
-    // Wrapper stacking order: [canvas, textLayer, highlightLayer].
     const serializeOverlay = (host) => {
-      const textLayer = layersOf(host)[0];
+      const textLayer = host.querySelector('[data-overlay="text"]');
       const out = [];
       if (textLayer) {
         const wr = wrapperRect(host);
@@ -69,12 +64,11 @@
       }
       return out;
     };
-    // IX2 highlight boxes (absolutely positioned divs in the LAST layer; pptx
+    // IX2 highlight boxes (absolutely positioned divs in the highlight layer; pptx
     // groups them per shape like the text layer, so walk to the leaf divs that
     // carry a background). Read resolved px relative to the wrapper.
     const serializeHighlights = (host) => {
-      const layers = layersOf(host);
-      const layer = layers[layers.length - 1];
+      const layer = host.querySelector('[data-overlay="highlight"]');
       if (!layer) return [];
       const wr = wrapperRect(host);
       return [...layer.querySelectorAll('div')]
@@ -108,6 +102,7 @@
         mode,
         width,
         enableTextSelection: true,
+        enableElementSelection: true,
         useGoogleFonts: true,
       });
       await viewer.load(buf);

@@ -209,6 +209,67 @@ describe('date formats (Excel serial; 45292 = 2024-01-01)', () => {
 });
 
 describe('time-only formats (§18.8.30 h / s / AM/PM without a date part)', () => {
+  it.each([45, 46, 47])('honors an authored date format over built-in %i', numFmtId => {
+    const authored = builtinStyles(numFmtId);
+    authored.numFmts = [{ numFmtId, formatCode: 'm"月"d"日"' }];
+    expect(formatCellValue(numCell(45306), authored)).toBe('1月15日');
+  });
+
+  it.each([45, 46, 47])('honors a conditional date format over built-in %i', numFmtId => {
+    expect(formatCellValue(numCell(45306), styles('d'), {
+      numFmtId,
+      formatCode: 'm"月"d"日"',
+    })).toBe('1月15日');
+  });
+
+  it.each<[number, string]>([
+    [45, '00:00'],
+    [46, '18:00:00'],
+    [47, '00:00.0'],
+    [0, '0.75'],
+  ])('does not inherit a base date code for conditional built-in %i', (numFmtId, expected) => {
+    expect(formatCellValue(numCell(0.75), styles('d'), {
+      numFmtId,
+      formatCode: null,
+    })).toBe(expected);
+  });
+
+  it('does not inherit a base text section for a matched conditional built-in General', () => {
+    const text: Cell = { row: 1, col: 1, value: { type: 'text', text: 'hello' }, styleIndex: 0 };
+    const base = styles('0;-0;0;"base "@');
+    // Fixture sanity: without CF the base fourth section applies.
+    expect(formatCellValue(text, base)).toBe('base hello');
+    // A matched DXF numFmt id 0 with no code is General, which has no text section.
+    expect(formatCellValue(text, base, { numFmtId: 0, formatCode: null })).toBe('hello');
+  });
+
+  it.each([
+    { numFmtId: 45, formatCode: '0.00', expected: '0.12' },
+    { numFmtId: 46, formatCode: 'General', expected: '0.1234567' },
+    { numFmtId: 27, formatCode: '0.00', expected: '0.12' },
+  ])('honors authored $formatCode over built-in $numFmtId', ({ numFmtId, formatCode, expected }) => {
+    const authored = builtinStyles(numFmtId);
+    authored.numFmts = [{ numFmtId, formatCode }];
+    expect(formatCellValue(numCell(0.1234567), authored)).toBe(expected);
+  });
+
+  it('resolves built-in minute, elapsed-hour and fractional-second formats without numFmts', () => {
+    expect(formatCellValue(numCell(0.75), builtinStyles(45))).toBe('00:00');
+    expect(formatCellValue(numCell(45200.75), builtinStyles(46))).toBe('1084818:00:00');
+    expect(formatCellValue(numCell(62.34 / 86400), builtinStyles(47))).toBe('01:02.3');
+    expect(formatCellValue(numCell(59.96 / 86400), builtinStyles(47))).toBe('01:00.0');
+    expect(formatCellValue(numCell(12345678901), builtinStyles(46))).toBe('296296293624:00:00');
+  });
+
+  it('formats fractional seconds from one rounded clock, while keeping literal zeros literal', () => {
+    expect(fmt(62.345 / 86400, 'mm:ss.00')).toBe('01:02.35');
+    expect(fmt(3599.9996 / 86400, '[h]:mm:ss.000')).toBe('1:00:00.000');
+    expect(fmt(3735.8 / 86400, '[ss].00')).toBe('3735.80');
+    expect(fmt(-59.996 / 86400, '[ss].00')).toBe('-60.00');
+    expect(fmt(62.34 / 86400, 'mm:ss".0"')).toBe('01:02.0');
+    expect(fmt(62.34 / 86400, 'mm:ss\\.0')).toBe('01:02.0');
+  });
+
   it('formats the serial as a clock time instead of echoing the code', () => {
     expect(fmt(0.29166666666666669, 'h:mm;@')).toBe('7:00');
     expect(fmt(0.51041666666666663, 'h:mm:ss;@')).toBe('12:15:00');
@@ -242,7 +303,7 @@ describe('time-only formats (§18.8.30 h / s / AM/PM without a date part)', () =
   });
 
   it('ignores a quoted elapsed bracket', () => {
-    expect(fmt(-0.25, 'h:mm "[h]"')).toBe('18:00 [h]');
+    expect(fmt(0.75, 'h:mm "[h]"')).toBe('18:00 [h]');
   });
 
   it('keeps a quoted AM/PM literal on the 24-hour clock', () => {
@@ -362,5 +423,32 @@ describe('formula cells render their cached value, never a recalculation', () =>
     const uncachedSum = formatCellValue(formulaCell('SUM(A1:A2)', empty), styles('yyyy-mm-dd'));
     expect(uncachedSum).toBe('');
     expect(formatCellValue(formulaCell('TODAY()', empty), styles('yyyy-mm-dd'))).toBe(uncachedSum);
+  });
+});
+
+
+describe('date serial range (#1710)', () => {
+  it('returns a width-independent marker for invalid built-in and custom dates', () => {
+    for (const id of [14, 15, 16, 17, 22]) {
+      expect(formatCellValue(numCell(12345678901), builtinStyles(id)), `format ${id}`).toBe('#');
+    }
+    expect(fmt(2958466, 'yyyy-mm-dd')).toBe('#');
+    expect(fmt(-1, 'h:mm:ss')).toBe('#');
+    expect(formatCellValueWithColor(numCell(2958466), styles('[Red]yyyy-mm-dd')))
+      .toEqual({ text: '#', color: '#FF0000', fill: true });
+    expect(formatCellValue(numCell(12345678901), builtinStyles(0), { numFmtId: 14, formatCode: null })).toBe('#');
+  });
+
+  it('keeps time fractions, zero, the final day and the selected negative section', () => {
+    expect(fmt(2958465.75, 'yyyy-mm-dd h:mm:ss')).toBe('9999-12-31 18:00:00');
+    expect(fmt(0, 'h:mm:ss')).toBe('0:00:00');
+    expect(fmt(0.5, 'h:mm:ss')).toBe('12:00:00');
+    expect(formatCellValue(numCell(0), styles('yyyy-mm-dd'), null, true)).toBe('1904-01-01');
+    expect(formatCellValue(numCell(2957003.75), styles('yyyy-mm-dd h:mm:ss'), null, true)).toBe('9999-12-31 18:00:00');
+    expect(formatCellValue(numCell(2957004), styles('yyyy-mm-dd'), null, true)).toBe('#');
+    expect(fmt(-1, 'yyyy-mm-dd;0.0')).toBe('1.0');
+    expect(fmt(-0.5, '0;h:mm')).toBe('12:00');
+    expect(fmt(12345678901, '[h]:mm')).toBe('296296293624:00');
+    expect(formatCellValueWithColor(numCell(45200), styles('g"#"'))).toEqual({ text: '#' });
   });
 });

@@ -1,6 +1,6 @@
 import type { ChartModel, ChartRect } from '../types/chart.js';
 import { drawingmlLineDashArray } from '../draw/dash.js';
-import { resolveFill } from '../shape/paint.js';
+import { resolveNativeFill as resolveFill } from '../shape/paint.js';
 import { axisLineWidthPx } from './axis-style.js';
 import { strokeChartFrameRect } from './compound-frame.js';
 import { paintChartStyleEffects } from './style-effects.js';

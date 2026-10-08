@@ -55,6 +55,7 @@
 // glyph rides the page rotation — see BodyAcquisitionState.verticalAllRotated).
 
 import { wordPreservesVerticalTuCorner } from './layout/script-compatibility.js';
+import type { WritingMode } from './layout/types.js';
 import {
   verticalOrientation,
   verticalFormSubstitute,
@@ -337,7 +338,7 @@ function plannedVerticalBlockAxisInkBounds(
   orientation: PlannedVerticalGlyphCell['orientation'],
   drawOffsetPt: Readonly<{ xPt: number; yPt: number }>,
   charScale: number,
-  writingMode: 'horizontal-tb' | 'vertical-rl' | 'vertical-lr',
+  writingMode: WritingMode,
   verticalFeature: boolean,
 ): PlannedVerticalGlyphCell['blockAxisInkBounds'] {
   const previousAlign = ctx.textAlign;
@@ -421,7 +422,7 @@ export function planVerticalRunWithCapability(
   charScale = 1,
   growTrRotateInk = false,
   vertCapability: VertCapability = NO_VERT_CAPABILITY,
-  writingMode: 'horizontal-tb' | 'vertical-rl' | 'vertical-lr' = 'vertical-rl',
+  writingMode: WritingMode = 'vertical-rl',
 ): readonly PlannedVerticalGlyphCell[] {
   const cells: PlannedVerticalGlyphCell[] = [];
   const emBoxCenterPt = emBoxCenterAboveBaselinePx(ctx, text, fontPt);

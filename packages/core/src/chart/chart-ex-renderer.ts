@@ -34,6 +34,11 @@ import {
   computeBoxWhiskerStats,
 } from './box-whisker.js';
 import { planParetoLayout } from './pareto-layout.js';
+import {
+  planChartExColumnPaint,
+  visitChartExColumnLegendSites,
+  visitChartExColumnPaintSites,
+} from './chart-ex-column-plan.js';
 import { markerPaintComponents } from './marker-style.js';
 import {
   MAX_CANVAS_CHART_POINTS,
@@ -229,27 +234,18 @@ export function chartExDataMarkPaintWorkCount(
   // ChartEx columns (plain, histogram bins, owner-backed Pareto bars) paint a
   // fill and an outline per non-empty bar through the ChartEx point cascade,
   // exactly as the bar family's ChartEx column path does.
-  const chargeColumns = (
+  const chargeColumn = (
     series: ChartSeries,
-    values: readonly (number | null | undefined)[],
+    point: ChartDataPointOverride | undefined,
     styleIndex: number,
     count: number,
-    limit = values.length,
-  ): void => {
-    const overrides = indexPointOverrides(series.dataPointOverrides);
-    for (let index = 0; index < Math.min(values.length, limit); index++) {
-      const value = values[index];
-      if (value == null || !Number.isFinite(value) || value === 0) continue;
-      const point = overrides.get(index);
-      charge(resolveChartExPointFill(chart, series, point, styleIndex, count));
-      const line = resolveChartExPointLine(
-        chart, series, point, styleIndex, count, '#000000',
-      );
-      if (line.visible && !chartExLineIsStructured(line)) {
-        charge(line.paint ?? { fillType: 'solid', color: '000000' });
-      }
-      if (total > MAX_CHART_PAINT_COMPONENTS) return;
+  ): void | false => {
+    charge(resolveChartExPointFill(chart, series, point, styleIndex, count));
+    const line = resolveChartExPointLine(chart, series, point, styleIndex, count, '#000000');
+    if (line.visible && !chartExLineIsStructured(line)) {
+      charge(line.paint ?? { fillType: 'solid', color: '000000' });
     }
+    if (total > MAX_CHART_PAINT_COMPONENTS) return false;
   };
   // The Pareto line is always painted solid (no bounds), so a structured role
   // paint costs the same as a solid one.
@@ -262,64 +258,22 @@ export function chartExDataMarkPaintWorkCount(
     if (line.visible) charge({ fillType: 'solid', color: '000000' });
   };
 
-  if (chart.chartType === 'clusteredColumn' || chart.chartType === 'pareto') {
-    const rawColumns = chart.series.filter(series => series.seriesType !== 'line');
-    let sourcePoints = 0;
-    for (const series of rawColumns) {
-      sourcePoints += series.values.length;
-      if (sourcePoints > MAX_CANVAS_CHART_POINTS) return MAX_CHART_PAINT_COMPONENTS + 1;
-    }
-    const columns = rawColumns.map((series, index) => index === 0
-      ? chartExOutlinedOwner(chart, series, index, rawColumns.length) : series);
-    const sorted = chart.chartType === 'pareto' || chart.chartexParetoSortDescending;
-    const layouts = sorted
-      ? columns.map(series => planParetoLayout(series, chart.categories, {
-        sortDescending: chart.chartexParetoSortDescending ?? true,
-        keepUnvaluedCategories: true,
-      }))
-      : null;
-    const displayed = layouts ? layouts.map(layout => layout.orderedSeries) : columns;
-    if (chart.chartType === 'pareto') {
-      // Mirror renderParetoChart's early returns: nothing is painted for a
-      // missing owner or an empty owner/first layout, so nothing is charged.
-      const ownerLayout = layouts?.[chart.chartexParetoOwnerIndex ?? 0];
-      const firstLayout = layouts?.[0];
-      if (!ownerLayout || !firstLayout
-        || ownerLayout.points.length === 0 || firstLayout.points.length === 0) return 0;
-    }
-    // The renderer draws the first (reordered) series' categories, in the same
-    // order for the Pareto and the sorted clustered-column paths.
-    const categoryCount = layouts
-      ? displayed[0]?.values.length ?? 0
-      : chart.categories.length || displayed[0]?.categories?.length
-        || Math.max(0, ...displayed.map(series => series.values.length));
-    for (let seriesIndex = 0; seriesIndex < displayed.length; seriesIndex++) {
-      const series = displayed[seriesIndex]!;
-      chargeColumns(
-        series, series.values, chartExSeriesFormatIndex(series, seriesIndex),
-        displayed.length, categoryCount,
-      );
-      if (total > MAX_CHART_PAINT_COMPONENTS) return total;
-    }
-    if (chart.chartType === 'pareto') {
-      // Past the empty-layout return above the renderer paints the cumulative
-      // line (see renderParetoChart), always as one solid stroke.
+  const columnPlan = planChartExColumnPaint(chart, (series, index, count) => index === 0
+    ? chartExOutlinedOwner(chart, series, index, count) : series);
+  if (columnPlan) {
+    if (columnPlan.kind === 'tooManyInputPoints') return MAX_CHART_PAINT_COMPONENTS + 1;
+    visitChartExColumnPaintSites(columnPlan, chargeColumn);
+    if (total > MAX_CHART_PAINT_COMPONENTS) return total;
+    visitChartExColumnLegendSites(columnPlan, chargeColumn);
+    if (total > MAX_CHART_PAINT_COMPONENTS) return total;
+    if (chart.chartType === 'pareto' && columnPlan.series.length > 0) {
       const ownerIndex = chart.chartexParetoOwnerIndex ?? 0;
+      const owner = columnPlan.series[ownerIndex];
       const authoredLine = chart.series.find(series => series.seriesType === 'line');
       chargeParetoLine(
-        authoredLine ?? displayed[ownerIndex],
-        authoredLine?.chartexFormatIdx ?? columns[ownerIndex]?.chartexFormatIdx ?? 0,
+        authoredLine ?? owner,
+        authoredLine?.chartexFormatIdx ?? owner?.chartexFormatIdx ?? 0,
       );
-    }
-  } else if (chart.chartType === 'histogram') {
-    const source = chart.series[0];
-    if (source) {
-      const plan = planHistogramBins(
-        source.values, chart.chartexHistogramBinning ?? {}, source.valFormatCode,
-        chart.date1904 === true,
-      );
-      if (plan.kind === 'tooManyInputPoints') return MAX_CHART_PAINT_COMPONENTS + 1;
-      chargeColumns(source, plan.counts, chartExSeriesFormatIndex(source, 0), 1);
     }
   } else if (chart.chartType === 'paretoLine') {
     const source = chart.series[0];

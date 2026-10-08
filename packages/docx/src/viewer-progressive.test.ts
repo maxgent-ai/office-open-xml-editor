@@ -25,7 +25,8 @@ describe('DocxViewer progressive layout', () => {
     });
     const load = vi.spyOn(DocxDocument, 'load').mockResolvedValue(doc);
     const pageChanges: Array<[number, number, boolean]> = [];
-    const viewer = new DocxViewer(makeEl('canvas') as unknown as HTMLCanvasElement, {
+    const canvas = makeEl('canvas');
+    const viewer = new DocxViewer(canvas as unknown as HTMLCanvasElement, {
       progressiveLayout: true,
       onPageChange: (page, total, layoutComplete) => {
         pageChanges.push([page, total, layoutComplete]);
@@ -36,20 +37,24 @@ describe('DocxViewer progressive layout', () => {
     expect(load.mock.calls[0]?.[1]).toMatchObject({ progressiveLayout: true });
     expect(pageChanges.at(-1)).toEqual([0, 1, false]);
 
+    const wrapper = canvas.parentElement!;
+    const loading = wrapper.children.find((child) => child.children.some((item) => item.tag === 'progress'))!;
+    expect(wrapper.children.some((child) => child.textContent === 'Loading page')).toBe(false);
     const navigation = viewer.nextPage();
     await Promise.resolve();
-    expect((viewer as unknown as { _loadingLayer: { style: Record<string, string> } })
-      ._loadingLayer.style.display).toBe('flex');
+    expect(loading.style.display).toBe('flex');
+
+    expect(wrapper.children.some((child) => child.textContent === 'Loading page')).toBe(true);
 
     engine.setPageCount(2);
     publishDocxLayout(doc, { pageCount: 2, exact: false, complete: false });
     await navigation;
 
+    expect(wrapper.children.some((child) => child.textContent === 'Loading page')).toBe(false);
     expect(viewer.currentPage).toBe(1);
     expect(engine.renderCalls.at(-1)?.page).toBe(1);
     expect(pageChanges.at(-1)).toEqual([1, 2, false]);
-    expect((viewer as unknown as { _loadingLayer: { style: Record<string, string> } })
-      ._loadingLayer.style.display).toBe('none');
+    expect(loading.style.display).toBe('none');
 
     complete = true;
     engine.setPageCount(5);
@@ -114,21 +119,22 @@ describe('DocxViewer progressive layout', () => {
       waitUntilLayoutComplete: { configurable: true, value: () => new Promise<void>(() => {}) },
     });
     vi.spyOn(DocxDocument, 'load').mockResolvedValue(doc);
-    const viewer = new DocxViewer(makeEl('canvas') as unknown as HTMLCanvasElement, {
+    const canvas = makeEl('canvas');
+    const viewer = new DocxViewer(canvas as unknown as HTMLCanvasElement, {
       progressiveLayout: true,
     });
     await viewer.load('large.docx');
 
+    const loading = canvas.parentElement!.children.find((child) =>
+      child.children.some((item) => item.tag === 'progress'))!;
     const superseded = viewer.goToPage(10);
     await Promise.resolve();
-    expect((viewer as unknown as { _loadingLayer: { style: Record<string, string> } })
-      ._loadingLayer.style.display).toBe('flex');
+    expect(loading.style.display).toBe('flex');
 
     await viewer.goToPage(0);
     await superseded;
     expect(viewer.currentPage).toBe(0);
-    expect((viewer as unknown as { _loadingLayer: { style: Record<string, string> } })
-      ._loadingLayer.style.display).toBe('none');
+    expect(loading.style.display).toBe('none');
     viewer.destroy();
   });
 

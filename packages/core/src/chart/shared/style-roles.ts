@@ -1,6 +1,6 @@
 // Classic chart style roles helpers.
 import type { ChartDataLabelOverride, ChartDecorationLineStyle, ChartExElementStyle, ChartLabelBox, ChartModel, ChartRect, ChartSeries, ChartSeriesDataLabels, ChartStockUpDownBarStyle, ChartStyleRole, ChartTrendline, SecondaryValueAxis } from '../../types/chart';
-import { resolveFill } from '../../shape/paint.js';
+import { resolveNativeFill as resolveFill } from '../../shape/paint.js';
 import { axisLineWidthPx } from '../axis-style.js';
 import { chartSeriesVariesByPoint, chartStyleDashChoice, effectiveChartStyleRole, rawLinkedChartStyleRole } from '../effective-style.js';
 import { chartStyleDirectFillDecision, chartStyleDirectLineDecision, chartStyleDirectNoFillDecision, chartStyleDirectNoLineDecision, chartStyleFillCascade, chartStyleFontColor, chartStyleLineCascade, chartStyleLineDecision } from '../style-paint.js';

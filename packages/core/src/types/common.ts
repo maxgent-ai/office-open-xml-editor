@@ -443,8 +443,9 @@ export interface TextRunData {
   fontFamily: string | null;
   /**
    * East Asian font family from rPr > a:ea (ECMA-376 §21.1.2.3.3),
-   * resolved through the theme. Renderer uses this for CJK glyphs when
-   * present; absent means CJK falls back to fontFamily.
+   * resolved through the theme. PPTX resolves theme tokens with the run
+   * language's theme script font and leaves this absent when the slot has
+   * no face (the renderer then applies PowerPoint's application default).
    */
   fontFamilyEa?: string;
   /** Complex-script font from rPr > cs, after the DrawingML style cascade. */
@@ -456,6 +457,10 @@ export interface TextRunData {
    * Absent means no symbol font was declared.
    */
   fontFamilySym?: string;
+  /** Cascaded run language (DrawingML `rPr@lang`, ECMA-376 §21.1.2.3.9). */
+  lang?: string;
+  /** Cascaded alternate language (DrawingML `rPr@altLang`). */
+  altLang?: string;
   /** Baseline shift in thousandths of a point. Positive = superscript, negative = subscript. */
   baseline?: number;
   /**

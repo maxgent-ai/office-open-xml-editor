@@ -12,8 +12,13 @@ import {
   type SectionLayoutContext,
   type SectionGridContext,
 } from '../layout-context.js';
-import type { DeepReadonly } from './types.js';
+import type { DeepReadonly, NativeSectionFlow } from './types.js';
 import { wordBookFoldGutterEdge } from './section-compatibility.js';
+import {
+  logicalToPhysicalMatrix,
+  physicalToLogicalMatrix,
+  transformRectEdges,
+} from './coordinate-space.js';
 
 /**
  * Section facts that must change atomically at a page-flow boundary. Keeping the
@@ -25,6 +30,8 @@ export interface PageFlowSectionContext {
   readonly geometry: Readonly<SectionGeom>;
   readonly columns: readonly Readonly<ColumnGeom>[];
   readonly textDirection: string;
+  /** Canonical native flow; absent for every OOXML section. */
+  readonly nativeSectionFlow?: NativeSectionFlow;
   /** §17.6.1 section direction controls newspaper-column population order. */
   readonly sectionBidi: boolean;
   readonly grid: Readonly<SectionGridContext>;
@@ -35,6 +42,7 @@ export function createPageFlowSectionContext(input: Readonly<{
   geometry: SectionGeom;
   columns: readonly Readonly<ColumnGeom>[];
   textDirection: string;
+  nativeSectionFlow?: NativeSectionFlow;
   sectionBidi?: boolean;
   grid?: Readonly<SectionGridContext>;
 }>): PageFlowSectionContext {
@@ -49,6 +57,7 @@ export function createPageFlowSectionContext(input: Readonly<{
     geometry: Object.freeze({ ...input.geometry }),
     columns: Object.freeze(input.columns.map((column) => Object.freeze({ ...column }))),
     textDirection: input.textDirection,
+    ...(input.nativeSectionFlow ? { nativeSectionFlow: input.nativeSectionFlow } : {}),
     sectionBidi: input.sectionBidi ?? false,
     grid: Object.freeze(input.grid ?? {
       kind: 'none',
@@ -73,8 +82,38 @@ export function sectionBodyInsetPt(marginPt: number): number {
   return Math.abs(marginPt);
 }
 
-/** Physical-to-logical quarter turn for vertical section body layout. */
-export function logicalSectionGeometry(physical: SectionGeom): SectionGeom {
+/** Physical-to-logical quarter turn for vertical section body layout. The
+ * established Transitional-token mapping is unchanged; a native flow derives
+ * its edges from its own canonical matrix (BtoT: logical left/right/top/bottom
+ * are the physical bottom/top/left/right margins). */
+export function logicalSectionGeometry(
+  physical: SectionGeom,
+  nativeSectionFlow?: NativeSectionFlow | null,
+): SectionGeom {
+  if (nativeSectionFlow != null) {
+    const edges = transformRectEdges(
+      physicalToLogicalMatrix('sideways-lr', {
+        widthPt: physical.pageWidth,
+        heightPt: physical.pageHeight,
+      }),
+      {
+        top: physical.marginTop,
+        right: physical.marginRight,
+        bottom: physical.marginBottom,
+        left: physical.marginLeft,
+      },
+    );
+    return {
+      pageWidth: physical.pageHeight,
+      pageHeight: physical.pageWidth,
+      marginLeft: edges.left,
+      marginTop: edges.top,
+      marginRight: edges.right,
+      marginBottom: edges.bottom,
+      headerDistance: physical.headerDistance,
+      footerDistance: physical.footerDistance,
+    };
+  }
   return {
     pageWidth: physical.pageHeight,
     pageHeight: physical.pageWidth,
@@ -88,7 +127,34 @@ export function logicalSectionGeometry(physical: SectionGeom): SectionGeom {
 }
 
 /** Inverse logical-to-physical quarter turn for a vertical section page box. */
-export function physicalSectionGeometry(logical: SectionGeom): SectionGeom {
+export function physicalSectionGeometry(
+  logical: SectionGeom,
+  nativeSectionFlow?: NativeSectionFlow | null,
+): SectionGeom {
+  if (nativeSectionFlow != null) {
+    const edges = transformRectEdges(
+      logicalToPhysicalMatrix('sideways-lr', {
+        widthPt: logical.pageHeight,
+        heightPt: logical.pageWidth,
+      }),
+      {
+        top: logical.marginTop,
+        right: logical.marginRight,
+        bottom: logical.marginBottom,
+        left: logical.marginLeft,
+      },
+    );
+    return {
+      pageWidth: logical.pageHeight,
+      pageHeight: logical.pageWidth,
+      marginTop: edges.top,
+      marginRight: edges.right,
+      marginBottom: edges.bottom,
+      marginLeft: edges.left,
+      headerDistance: logical.headerDistance,
+      footerDistance: logical.footerDistance,
+    };
+  }
   return {
     pageWidth: logical.pageHeight,
     pageHeight: logical.pageWidth,
@@ -167,7 +233,7 @@ export function resolveSectionContextForPage(
 ): SectionLayoutContext {
   const physical = effectivePhysicalSectionGeometry(policy, pageIndex);
   const geometry = isVerticalSectionDirection(policy.textDirection)
-    ? logicalSectionGeometry(physical)
+    ? logicalSectionGeometry(physical, base.nativeSectionFlow)
     : physical;
   return Object.freeze({
     ...base,
@@ -217,6 +283,9 @@ export interface BodySectionOccurrence {
   /** Physical §17.6.13/§17.6.11 page box; writing-mode transforms happen later. */
   readonly geometry: SectionGeom;
   readonly textDirection: string | null;
+  /** Canonical native flow normalized at the parser-model boundary; absent for
+   * OOXML sections. Layout never sees the raw parser wire. */
+  readonly nativeSectionFlow?: NativeSectionFlow;
   readonly pageNumType: PageNumType | null;
   readonly headers: HeadersFooters;
   readonly footers: HeadersFooters;
@@ -272,6 +341,7 @@ export function defaultSectionGeometry(): SectionGeom {
 export function resolveAcquiredSectionLayoutContext(
   section: SectionProps,
   sectionBidi = false,
+  nativeSectionFlow?: NativeSectionFlow,
 ): SectionLayoutContext {
   const gridKind = section.docGridType === 'lines'
     || section.docGridType === 'linesAndChars'
@@ -288,6 +358,7 @@ export function resolveAcquiredSectionLayoutContext(
       charSpacePt: section.docGridCharSpace == null ? null : section.docGridCharSpace / 4096,
     }),
     textDirection: section.textDirection ?? 'lrTb',
+    ...(nativeSectionFlow ? { nativeSectionFlow } : {}),
     sectionBidi,
     verticalAlignment: section.vAlign ?? 'top',
     ...(section.lineNumbering === null || section.lineNumbering === undefined

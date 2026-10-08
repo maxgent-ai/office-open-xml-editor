@@ -46,6 +46,14 @@ import {
 
 import { resolveChartExLabel } from '../chart-ex-label.js';
 import {
+  chartExBarBodyIsVisible,
+  chartExColumnDateCategoryIsVisible,
+  chartExColumnPointStyleIndex,
+  chartExColumnSharedPlanApplies,
+  planChartExColumnDateCategoryVisibility,
+  planChartExColumnValueAxis,
+} from '../chart-ex-column-paint.js';
+import {
   chartDataPointStyleRole,
   chartModelIsChartEx,
   chartSeriesVariesByPoint,
@@ -290,8 +298,9 @@ export function renderBarChart(
   // format discriminator: the ChartEx chart type (or a ChartEx delegate) is.
   // Otherwise a classic bar+line combo would drop every non-bar legend entry
   // by entering the ChartEx synthetic-series path.
-  const isChartExColumn = chartModelIsChartEx(chart)
-    && (chart.chartexDataPointStyle != null || chart.chartexColorPalette != null);
+  const isChartExColumn = chartModelIsChartEx(chart);
+  const usesChartExColumnSharedPlan = isChartExColumn
+    && chartExColumnSharedPlanApplies(chart, barSeries);
   const styledBarLegendSeries = new Map<ChartSeries, ChartSeries>();
   if (isChartExColumn) {
     barSeries.forEach((series, index) => {
@@ -595,14 +604,16 @@ export function renderBarChart(
   if (dataMax === 0 && dataMin === 0) dataMax = 1;
   // `planValueAxis` folds in the CH6 major unit / logBase / orientation; with
   // none set it is byte-identical to `valueAxisScale` + a linear map.
-  const plan = planValueAxis(
-    chart,
-    dataMin,
-    dataMax,
-    valAxisLenPt,
-    primaryPercentAxis,
-    isH ? 'horizontal' : 'vertical',
-  );
+  const plan = usesChartExColumnSharedPlan
+    ? planChartExColumnValueAxis(chart, primaryBarSeries, n, valAxisLenPt)
+    : planValueAxis(
+      chart,
+      dataMin,
+      dataMax,
+      valAxisLenPt,
+      primaryPercentAxis,
+      isH ? 'horizontal' : 'vertical',
+    );
   const { step } = plan;
 
   // Secondary value-axis scale (combo charts). INDEPENDENT of the primary: its
@@ -829,6 +840,9 @@ export function renderBarChart(
     cats,
     isH ? !catAxisReversed(chart) : catAxisReversed(chart),
   );
+  const chartExDateCategoryVisible = usesChartExColumnSharedPlan
+    ? planChartExColumnDateCategoryVisibility(chart, barSeries, dateAxisPlan)
+    : null;
 
   // Horizontal DrawingML category text (`wrap="square"`) wraps within its
   // category slot. Measure the complete strings with the actual tick font and
@@ -1339,7 +1353,9 @@ export function renderBarChart(
       const pointOverride = pointOverrides[si].get(ci);
       const pointColor = pointOverride?.color ?? s.dataPointColors?.[ci];
       const seriesVariesByPoint = barVariesByPoint(s);
-      const pointStyleIndex = seriesVariesByPoint ? ci : barStyleIndices[si];
+      const pointStyleIndex = isChartExColumn
+        ? chartExColumnPointStyleIndex(chart, s, si, ci)
+        : seriesVariesByPoint ? ci : barStyleIndices[si];
       const styleFill = classicDataPointFillDecision(
         chart, s, pointOverride, pointStyleIndex, ci,
       );
@@ -1506,7 +1522,8 @@ export function renderBarChart(
         // A date axis can explicitly crop categories through min/max. Marks
         // wholly outside that authored plot interval do not bleed into the
         // value-axis/title gutter.
-        if (bx + barW <= px0 || bx >= px0 + pw) continue;
+        if (!chartExColumnDateCategoryIsVisible(chartExDateCategoryVisible, si, ci)
+          || bx + barW <= px0 || bx >= px0 + pw) continue;
         // Column: the bar spans between the zero line and the value. Stacked
         // bars start at the running offset for their sign; clustered bars start
         // at the zero line.
@@ -1524,15 +1541,27 @@ export function renderBarChart(
             valueEnd: clamp(y1, py0, py0 + ph),
           };
         }
-        paintChartStyleEffects(
-          ctx,
-          pointEffect,
-          chartDataPointStyleRole(chart, 'dataPoint', sourceSeriesIndices.get(s) ?? si),
-          pointStyleIndex,
-          { x: bx, y: by, w: barW, h: barH },
-          ptToPx,
-          target => paintBarAt(target, bx, by, barW, barH),
-        );
+        if (!isChartExColumn || chartExBarBodyIsVisible({
+          categoryStart: bx,
+          categoryEnd: bx + barW,
+          valueStart: y0,
+          valueEnd: y1,
+          clipCategory: true,
+          categoryClipStart: px0,
+          categoryClipEnd: px0 + pw,
+          valueClipStart: py0,
+          valueClipEnd: py0 + ph,
+        })) {
+          paintChartStyleEffects(
+            ctx,
+            pointEffect,
+            chartDataPointStyleRole(chart, 'dataPoint', sourceSeriesIndices.get(s) ?? si),
+            pointStyleIndex,
+            { x: bx, y: by, w: barW, h: barH },
+            ptToPx,
+            target => paintBarAt(target, bx, by, barW, barH),
+          );
+        }
         const seriesLabels = s.seriesDataLabels;
         const label = resolveChartExLabel(
           chart, s, ci, s.categories?.[ci] ?? cats[ci] ?? '', raw,
@@ -1617,15 +1646,25 @@ export function renderBarChart(
             valueEnd: clamp(x1, px0, px0 + pw),
           };
         }
-        paintChartStyleEffects(
-          ctx,
-          pointEffect,
-          chartDataPointStyleRole(chart, 'dataPoint', sourceSeriesIndices.get(s) ?? si),
-          pointStyleIndex,
-          { x: bx, y: by, w: barL, h: barW },
-          ptToPx,
-          target => paintBarAt(target, bx, by, barL, barW),
-        );
+        if (!isChartExColumn || chartExBarBodyIsVisible({
+          categoryStart: by,
+          categoryEnd: by + barW,
+          valueStart: x0,
+          valueEnd: x1,
+          clipCategory: false,
+          valueClipStart: px0,
+          valueClipEnd: px0 + pw,
+        })) {
+          paintChartStyleEffects(
+            ctx,
+            pointEffect,
+            chartDataPointStyleRole(chart, 'dataPoint', sourceSeriesIndices.get(s) ?? si),
+            pointStyleIndex,
+            { x: bx, y: by, w: barL, h: barW },
+            ptToPx,
+            target => paintBarAt(target, bx, by, barL, barW),
+          );
+        }
         const seriesLabels = s.seriesDataLabels;
         const label = resolveChartExLabel(
           chart, s, ci, s.categories?.[ci] ?? cats[ci] ?? '', raw,

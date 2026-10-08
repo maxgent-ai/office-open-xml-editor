@@ -86,6 +86,7 @@ export type {
   OoxmlResourceLimits,
   ProgressiveLayoutProgress,
   ProgressiveLayoutPartial,
+  XlsxWorksheetLimits,
 } from './types/load-options';
 export type {
   OoxmlResourceMetrics,
@@ -156,7 +157,7 @@ export {
 } from './crypto';
 export { readCfbStream } from './errors/cfb-read';
 export {
-  preloadGoogleFonts,
+  preloadGoogleFonts, GoogleFontPreloadLease, type FontPreloadDemand,
   unloadGoogleFonts,
   activeFontSet,
   type FontPreloadEntry,
@@ -175,6 +176,14 @@ export {
 // spreads this into its own map; script-fallback Noto faces live in
 // SCRIPT_GOOGLE_FONTS below.
 export { GOOGLE_FONT_SUBSTITUTES, loadedGoogleRegularAliases } from './fonts/google-fonts';
+export {
+  fontSubstituteScriptClusterClass,
+  fontSubstituteScriptCoversText,
+  fontSubstituteScriptScope,
+  type FontSubstituteScopeCluster,
+  substituteEntryCoversText,
+  type FontSubstituteScript,
+} from './fonts/substitute-script';
 export {
   fontFaceWeightCovers,
   loadOfficeFontFallbacks,
@@ -233,7 +242,9 @@ export {
   type CustGeomEndpoint,
   type CustGeomEndpoints,
 } from './shape/custgeom-endpoints';
-export { hexToRgba, relativeLuma, autoContrastColor, resolveFill, applyStroke, withPatternCoordinateSpace, withInheritedPatternScope } from './shape/paint';
+export { hexToRgba, relativeLuma, autoContrastColor, resolveFill, usesPathShade, applyStroke, withPatternCoordinateSpace, withInheritedPatternScope } from './shape/paint';
+export { trackPaintPath, currentStrokeBounds } from './shape/paint-bounds';
+export type { FillOutline } from './shape/path-gradient';
 export { buildShapePath, drawStar, drawPolygon, ooxmlArcTo } from './shape/preset';
 export {
   paintDrawingMLShape,
@@ -246,6 +257,7 @@ export {
 } from './shape/drawingml-shape';
 export {
   drawArrowHead,
+  resolveArrowPaint,
   lineEndPaintExtent,
   lineEndRetract,
   retractLineEndpoint,
@@ -673,7 +685,7 @@ export type { VerticalGlyphCellMetrics } from './text/vertical-vert-feature';
 // Shared Excel serial-date → UTC `Date` conversion (ECMA-376 §18.17.4.1),
 // with the 1900 Lotus leap-year-bug compat and 1900/1904 date-system select.
 // Used by the xlsx cell formatter and the core chart date formatter.
-export { excelSerialToUtcDate, utcDateToExcelSerial } from './excel-date';
+export { excelSerialToUtcDate, utcDateToExcelSerial, isExcelDisplayDateSerial } from './excel-date';
 export {
   formatExcelDateTime,
   isDateFormatSection,
@@ -683,6 +695,9 @@ export {
 export { highlightBox } from './text/highlight-box';
 export {
   distributeLineSlack,
+  enumerateGaps,
+  type GapScanState,
+  type LineGap,
   type DistributeSeg,
   type DistributeResult,
   type DistributeOptions,

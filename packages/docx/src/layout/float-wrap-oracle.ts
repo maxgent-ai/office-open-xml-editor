@@ -7,6 +7,7 @@ import {
 } from './float-wrap.js';
 
 export interface WrapOracle {
+  readonly hasExclusions?: boolean;
   lineWindow(input: {
     readonly topYPt: number;
     readonly minimumStartWidthPt: number;
@@ -43,6 +44,7 @@ export function createFloatWrapOracle(
   const activeFloats = floats.map((float) => Object.freeze({ ...float }));
   const prepared = prepareFloatWrap(activeFloats);
   return {
+    hasExclusions: activeFloats.length > 0,
     lineWindow: ({
       topYPt,
       minimumStartWidthPt,

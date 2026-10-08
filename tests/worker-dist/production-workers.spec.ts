@@ -52,6 +52,8 @@ async function expectWorkerBitmaps(page: import('@playwright/test').Page, url: s
     'xlsx-bordered',
     'xlsx-csv-main',
     'xlsx-csv-worker',
+    'legacy-doc-main',
+    'legacy-doc-worker',
   ]) {
     const ink = await page.locator(`#${id}`).evaluate((canvas: HTMLCanvasElement) => {
       // Worker-backed viewers own a `bitmaprenderer` context, so acquiring a
@@ -111,4 +113,175 @@ test('published dist starts all three render workers with optional renderers', a
 
 test('Vite consumer bundle preserves all three render workers', async ({ page }) => {
   await expectWorkerBitmaps(page, '/consumer/index.html');
+});
+
+// Pixel contracts through the public viewer, not a helper-only Canvas test.
+// No corpus snapshots or Office fidelity thresholds are used here.
+async function viewerPathShadeSamples(
+  page: import('@playwright/test').Page,
+  source: string,
+  width: number,
+  slide: number,
+  points: number[][],
+) {
+  await page.route('**/path-shade-viewer', route => route.fulfill({
+    contentType: 'text/html', body: '<!doctype html><body></body>',
+  }));
+  await page.goto('/path-shade-viewer');
+  return page.evaluate(async ({ source, width, slide, points }) => {
+    const entry = '/dist/pptx.mjs';
+    const { PptxViewer } = await import(entry);
+    const response = await fetch(source);
+    if (!response.ok) throw new Error(`Control load failed: ${response.status}`);
+    const bytes = await response.arrayBuffer();
+    const samples = [];
+    for (const mode of ['main', 'worker']) {
+      const canvas = document.createElement('canvas');
+      document.body.append(canvas);
+      const viewer = new PptxViewer(canvas, { mode, width, dpr: 1, useGoogleFonts: false });
+      try {
+        await viewer.load(bytes.slice(0));
+        if (slide !== 0) await viewer.goToSlide(slide);
+        const copy = document.createElement('canvas');
+        copy.width = canvas.width;
+        copy.height = canvas.height;
+        const ctx = copy.getContext('2d') as CanvasRenderingContext2D;
+        ctx.drawImage(canvas, 0, 0);
+        samples.push(points.map(([x, y]) => [...ctx.getImageData(x, y, 1, 1).data]));
+      } finally {
+        viewer.destroy();
+        canvas.remove();
+      }
+    }
+    return samples;
+  }, { source, width, slide, points });
+}
+
+test('published PPTX viewer retains rect point paint and shades shape tiles in main and worker modes', async ({ page }) => {
+  const samples = await viewerPathShadeSamples(page, '/consumer/path-gradient.pptx', 480, 0,
+    [[60, 120], [60, 70], [300, 120], [300, 70]]);
+  // Rect point foci retain main's radial field: its diagonal half-box sample
+  // is ~180. Shape point foci still use box isolines (~128 at both samples).
+  const expected = [128, 180, 128, 128];
+  for (const modeSamples of samples) for (const [index, pixel] of modeSamples.entries()) {
+    expect(pixel[0]).toBeGreaterThanOrEqual(expected[index] - 4);
+    expect(pixel[0]).toBeLessThanOrEqual(expected[index] + 4);
+    expect(pixel.slice(1)).toEqual([pixel[0], pixel[0], 255]);
+  }
+  expect(samples[1]).toEqual(samples[0]);
+  expect(Math.abs(samples[0][1][0] - 128)).toBeGreaterThan(30);
+  expect(Math.abs(samples[0][2][0] - 90)).toBeGreaterThan(30);
+});
+
+test('local shape-path control slide reaches the published PPTX viewer in both modes', async ({ page }) => {
+  const { existsSync } = await import('node:fs');
+  const file = 'packages/pptx/public/private/pptx/controls-1599/shape-paths.pptx';
+  test.skip(!existsSync(file), 'Local-only Office control deck is absent');
+  // Slide 4, three-stop RGB rect, centered point focus. Coordinates belong to
+  // the control manifest; they sample its axial and diagonal half-box isoline.
+  const samples = await viewerPathShadeSamples(page, `/${file}`, 1920, 3,
+    [[337, 764], [337, 721]]);
+  for (const modeSamples of samples) for (const pixel of modeSamples) {
+    expect(pixel[0]).toBeLessThan(12);
+    expect(pixel[1]).toBeGreaterThan(243);
+    expect(pixel[2]).toBeLessThan(12);
+    expect(pixel[3]).toBe(255);
+  }
+  expect(samples[1]).toEqual(samples[0]);
+  // The previous shape brush's half-diagonal radius puts the axial point at
+  // s≈.353, between red and green (~75,180,0), not at the green middle stop.
+  expect(samples[0][0][1] - 180).toBeGreaterThan(60);
+});
+
+// A formatter exception used to abort the public load at the first paint,
+// hiding even an unrelated sheet. Exercise real parser/assets in both realms.
+test('published XLSX viewer isolates an out-of-range date and retains other sheets', async ({ page }) => {
+  const { dateRangeXlsxBytes } = await import('../fixtures/date-range-xlsx.mjs');
+  await page.route('**/date-range-viewer', route => route.fulfill({
+    contentType: 'text/html', body: '<!doctype html><body></body>',
+  }));
+  await page.goto('/date-range-viewer');
+  const results = await page.evaluate(async bytes => {
+    const entry = '/dist/xlsx.mjs';
+    const { XlsxViewer, XlsxWorkbook } = await import(entry);
+    const results = [];
+    for (const mode of ['main', 'worker']) {
+      const host = document.createElement('div');
+      host.style.cssText = 'width:800px;height:400px';
+      document.body.append(host);
+      const errors: string[] = [];
+      const viewer = new XlsxViewer(host, { mode, useGoogleFonts: false, onError: (e: Error) => errors.push(e.message) });
+      try {
+        await viewer.load(new Uint8Array(bytes).buffer);
+        await viewer.goToSheet(1);
+        const matches = await viewer.findText('Healthy sheet');
+        results.push({ mode, errors, matches: matches.length });
+      } finally {
+        viewer.destroy();
+        host.remove();
+      }
+    }
+    const wb = await XlsxWorkbook.load(new Uint8Array(bytes).buffer);
+    try {
+      const dates = await wb.getWorksheet(0);
+      const other = await wb.getWorksheet(1);
+      return { results, invalid: wb.cellText(dates, dates.rows[0].cells[0]), healthy: wb.cellText(other, other.rows[0].cells[0]) };
+    } finally {
+      wb.destroy();
+    }
+  }, [...dateRangeXlsxBytes()]);
+  expect(results).toEqual({
+    results: [{ mode: 'main', errors: [], matches: 1 }, { mode: 'worker', errors: [], matches: 1 }],
+    invalid: '#', healthy: 'Healthy sheet',
+  });
+});
+
+// Built-in time IDs need no file-authored numFmt. Check actual parser and
+// published main/worker painting plus cellText/find, including subsecond carry.
+test('published XLSX resolves built-in time formats without custom numFmts', async ({ page }) => {
+  const { builtinTimeXlsxBytes } = await import('../fixtures/builtin-time-xlsx.mjs');
+  await page.route('**/builtin-time-viewer', route => route.fulfill({
+    contentType: 'text/html', body: '<!doctype html><body></body>',
+  }));
+  await page.goto('/builtin-time-viewer');
+  const results = await page.evaluate(async bytes => {
+    const entry = '/dist/xlsx.mjs';
+    const { XlsxViewer, XlsxWorkbook } = await import(entry);
+    const results = [];
+    for (const mode of ['main', 'worker']) {
+      const data = new Uint8Array(bytes).buffer;
+      const wb = await XlsxWorkbook.load(data.slice(0), { mode, useGoogleFonts: false });
+      let texts;
+      try {
+        const sheet = await wb.getWorksheet(0);
+        texts = sheet.rows.map((row: { cells: unknown[] }) => row.cells.map(cell => wb.cellText(sheet, cell)));
+      } finally {
+        wb.destroy();
+      }
+      const host = document.createElement('div');
+      host.style.cssText = 'width:800px;height:400px';
+      document.body.append(host);
+      const viewer = new XlsxViewer(host, { mode, useGoogleFonts: false });
+      try {
+        await viewer.load(data);
+        const matches = await viewer.findText('1084818:00:00');
+        results.push({ mode, texts, matches: matches.length });
+      } finally {
+        viewer.destroy();
+        host.remove();
+      }
+    }
+    return results;
+  }, [...builtinTimeXlsxBytes()]);
+  const texts = [
+    ['18:00', '18:00', '0:01', '0:00'],
+    ['18:00:00', '18:00:00', '0:01:02', '0:00:59'],
+    ['00:00', '00:00', '01:02', '00:59'],
+    ['18:00:00', '1084818:00:00', '0:01:02', '0:00:59'],
+    ['00:00.0', '00:00.0', '01:02.3', '01:00.0'],
+  ];
+  expect(results).toEqual([
+    { mode: 'main', texts, matches: 1 },
+    { mode: 'worker', texts, matches: 1 },
+  ]);
 });

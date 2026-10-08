@@ -16,10 +16,12 @@ use ooxml_common::resource::ResourceUsage;
 // Production parses go through `ooxml_common::depth::parse_guarded` (depth-guarded
 // before roxmltree's recursive tree builder). The `XmlDoc` alias survives only for
 // the in-module unit tests, which parse trusted, hand-written fixtures directly.
+use crate::chartex_choice::{self, Verdict, CHARTEX_NS, CHARTEX_REL};
 #[cfg(test)]
 use roxmltree::Document as XmlDoc;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::BufReader;
+use std::rc::Rc;
 
 use crate::chart_compatibility::apply_word_classic_chart_space_frame;
 use crate::document_projector::{DocumentBodyPlan, DocumentBodyProjector};
@@ -118,6 +120,7 @@ fn read_zip_string(zip: &mut Zip, path: &str) -> Result<String, String> {
 
 fn open_document_body_projector(
     zip: &mut Zip,
+    rids: Rc<HashSet<String>>,
 ) -> Result<DocumentBodyProjector<BufReader<PackageEntryStream>>, String> {
     let operation = zip.operation()?;
     let reporter = operation.limit_reporter()?;
@@ -125,6 +128,7 @@ fn open_document_body_projector(
     Ok(DocumentBodyProjector::new(
         BufReader::new(stream),
         Some(reporter),
+        rids,
     ))
 }
 
@@ -160,7 +164,7 @@ mod private_typography_wire_tests {
             styles,
             &mut num_map,
             &media,
-            &HashMap::new(),
+            &ChartMap::default(),
             &relationships,
             &theme,
             None,
@@ -180,6 +184,59 @@ mod private_typography_wire_tests {
             })
             .expect("requested run");
         serde_json::to_value(run).expect("run serializes")
+    }
+
+    #[test]
+    fn kern_threshold_resolves_cascade_and_preserves_explicit_zero() {
+        // ECMA-376 §§17.3.2.19, 17.7: resolved values, never a renderer guess.
+        let styles = StyleMap::parse(&format!(
+            r#"<w:styles xmlns:w="{W_NS}">
+          <w:docDefaults><w:rPrDefault><w:rPr><w:kern w:val="16"/></w:rPr></w:rPrDefault></w:docDefaults>
+          <w:style w:type="paragraph" w:styleId="Base"><w:rPr><w:kern w:val="24"/></w:rPr></w:style>
+          <w:style w:type="paragraph" w:styleId="Child"><w:basedOn w:val="Base"/></w:style>
+          <w:style w:type="character" w:styleId="Char"><w:rPr><w:kern w:val="36"/></w:rPr></w:style>
+        </w:styles>"#
+        ));
+        for (ppr, rpr, expected) in [
+            ("", "", 8.0),
+            (r#"<w:pStyle w:val="Child"/>"#, "", 12.0),
+            (
+                r#"<w:pStyle w:val="Child"/>"#,
+                r#"<w:rStyle w:val="Char"/>"#,
+                18.0,
+            ),
+            (
+                r#"<w:pStyle w:val="Child"/>"#,
+                r#"<w:kern w:val="40"/>"#,
+                20.0,
+            ),
+            (
+                r#"<w:pStyle w:val="Child"/>"#,
+                r#"<w:kern w:val="0"/>"#,
+                0.0,
+            ),
+        ] {
+            let p = parse_p(
+                &format!(
+                    r#"<w:pPr>{ppr}<w:rPr><w:kern w:val="28"/></w:rPr></w:pPr>
+              <w:r><w:rPr>{rpr}<w:sz w:val="36"/></w:rPr><w:t>AV</w:t></w:r>"#
+                ),
+                &styles,
+            );
+            let wire = first_run_json(&p, "text");
+            assert_eq!(wire["kerning"], expected);
+            assert_eq!(
+                wire["__typographyAcquisition"]["kerningThresholdPt"],
+                expected
+            );
+            // Direct paragraph-mark rPr does not become a content default.
+            assert_eq!(
+                p.paragraph_mark_font_facts.as_ref().unwrap().kerning,
+                Some(14.0)
+            );
+        }
+        let p = parse_p(r#"<w:r><w:t>AV</w:t></w:r>"#, &StyleMap::default());
+        assert!(first_run_json(&p, "text")["kerning"].is_null());
     }
 
     #[test]
@@ -794,6 +851,52 @@ pub(crate) fn parse_from_bytes_streamed_with_limits(
     zip.run_operation(operation, parse_streamed_compatible)
 }
 
+/// Story-local chart models and resource capability facts. Keeping these
+/// together prevents header/footer rIds from borrowing body relationships.
+#[derive(Default)]
+struct ChartMap {
+    models: HashMap<String, ooxml_common::chart::ChartModel>,
+    renderable_chartex_rids: Rc<HashSet<String>>,
+    source_part: String,
+    limit_reporter: Option<ooxml_common::package_session::PackageLimitReporter>,
+    drawing_ordinal: std::cell::Cell<usize>,
+}
+impl std::ops::Deref for ChartMap {
+    type Target = HashMap<String, ooxml_common::chart::ChartModel>;
+    fn deref(&self) -> &Self::Target {
+        &self.models
+    }
+}
+impl std::ops::DerefMut for ChartMap {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.models
+    }
+}
+
+impl ChartMap {
+    fn clone_for_drawing(&self, rid: &str) -> Option<ooxml_common::chart::ChartModel> {
+        let chart = self.models.get(rid)?;
+        let retained = chart.clone();
+        if self.renderable_chartex_rids.contains(rid) {
+            let ordinal = self.drawing_ordinal.get();
+            self.drawing_ordinal.set(ordinal.saturating_add(1));
+            if let Some(reporter) = self.limit_reporter.as_ref() {
+                let site = format!("drawing:{ordinal}");
+                reporter
+                    .retain_instance(
+                        ooxml_common::resource::HardResourceLimitKind::ChartexAllocationBytes,
+                        &self.source_part,
+                        &site,
+                        ooxml_common::resource::HARD_MAX_CHARTEX_ALLOCATION_BYTES,
+                        ooxml_common::chart::RetainedBytes::heap_bytes(&retained),
+                    )
+                    .ok()?;
+            }
+        }
+        Some(retained)
+    }
+}
+
 struct DocumentParseEnvironment {
     rels_xml: String,
     rel_map: HashMap<String, String>,
@@ -804,12 +907,23 @@ struct DocumentParseEnvironment {
     num_map: NumberingMap,
     theme: ThemeColors,
     media_map: HashMap<String, String>,
-    chart_map: HashMap<String, ooxml_common::chart::ChartModel>,
+    chart_map: ChartMap,
+    renderable_chartex_rids: Rc<HashSet<String>>,
     document_settings: Option<crate::types::DocumentSettings>,
     page_layout_settings: Option<crate::types::PageLayoutSettingsWire>,
     note_layout_settings: Option<crate::types::NoteLayoutSettingsWire>,
+    special_note_references: SpecialNoteReferences,
     even_and_odd_headers: bool,
     word_ilvl_error: Option<String>,
+}
+
+/// ECMA-376 §17.11.3/.9: document-wide lists select special endnote/footnote
+/// stories. Keep the two ID spaces separate and parser-local; an unlisted story
+/// must not affect retained separator metadata, even when its part is present.
+#[derive(Default)]
+struct SpecialNoteReferences {
+    footnotes: HashSet<String>,
+    endnotes: HashSet<String>,
 }
 
 /// ECMA-376 Part 2 §9.3 relationship types identify actual DOCX stories.
@@ -956,6 +1070,7 @@ fn load_document_parse_environment(zip: &mut Zip) -> DocumentParseEnvironment {
     let mut document_settings: Option<crate::types::DocumentSettings> = None;
     let mut page_layout_settings: Option<crate::types::PageLayoutSettingsWire> = None;
     let mut note_layout_settings: Option<crate::types::NoteLayoutSettingsWire> = None;
+    let mut special_note_references = SpecialNoteReferences::default();
     // §17.10.1 even/odd headers is a settings.xml flag (not a sectPr property), so
     // capture it here and stamp it onto the section below.
     let mut even_and_odd_headers = false;
@@ -965,7 +1080,7 @@ fn load_document_parse_environment(zip: &mut Zip) -> DocumentParseEnvironment {
         }
         document_settings = parse_document_settings(&settings_xml);
         page_layout_settings = parse_page_layout_settings(&settings_xml);
-        note_layout_settings = parse_note_layout_settings(&settings_xml);
+        (note_layout_settings, special_note_references) = parse_note_layout_settings(&settings_xml);
         even_and_odd_headers = parse_even_and_odd_headers(&settings_xml);
     }
 
@@ -997,10 +1112,12 @@ fn load_document_parse_environment(zip: &mut Zip) -> DocumentParseEnvironment {
         num_map,
         theme,
         media_map,
+        renderable_chartex_rids: Rc::clone(&chart_map.renderable_chartex_rids),
         chart_map,
         document_settings,
         page_layout_settings,
         note_layout_settings,
+        special_note_references,
         even_and_odd_headers,
         word_ilvl_error,
     }
@@ -1029,7 +1146,8 @@ fn preflight_document_body(
     zip: &mut Zip,
     environment: &DocumentParseEnvironment,
 ) -> Result<DocumentBodyPreflight, String> {
-    let mut projector = open_document_body_projector(zip)?;
+    let mut projector =
+        open_document_body_projector(zip, Rc::clone(&environment.renderable_chartex_rids))?;
     let mut sequence_facts = Vec::new();
     let mut sections = Vec::new();
     let mut running_refs = SectionRefs::default();
@@ -1121,7 +1239,8 @@ fn preflight_document_body(
     let mut ref_leading_breaks = HashMap::new();
     if !ref_instructions.targets.is_empty() {
         drop(projector);
-        let mut projector = open_document_body_projector(zip)?;
+        let mut projector =
+            open_document_body_projector(zip, Rc::clone(&environment.renderable_chartex_rids))?;
         let mut collector = LeadingBreakCollector::new(&ref_instructions.targets);
         while let Some(block) = projector.next_block()? {
             if block.local_name != "p" {
@@ -1409,10 +1528,11 @@ impl DocxBodyCursor {
         }
 
         let projector =
-            open_document_body_projector(zip).map_err(|error| DocumentCursorFailure {
-                error,
-                theme: Box::new(degraded_theme.clone()),
-            })?;
+            open_document_body_projector(zip, Rc::clone(&environment.renderable_chartex_rids))
+                .map_err(|error| DocumentCursorFailure {
+                    error,
+                    theme: Box::new(degraded_theme.clone()),
+                })?;
         Ok(Self {
             environment: Some(environment),
             plan: preflight.plan,
@@ -1711,7 +1831,7 @@ fn finish_document(
     let footnotes_path =
         find_internal_rel_target_by_types(&environment.rels_xml, FOOTNOTES_RELATIONSHIP_TYPES)
             .and_then(|target| resolve_part_name(DOCUMENT_PART, &target));
-    let footnotes = footnotes_path
+    let (footnotes, footnote_stories) = footnotes_path
         .map(|path| {
             parse_notes(
                 zip,
@@ -1720,13 +1840,14 @@ fn finish_document(
                 &environment.style_map,
                 &mut environment.num_map,
                 &environment.theme,
+                &environment.special_note_references.footnotes,
             )
         })
         .unwrap_or_default();
     let endnotes_path =
         find_internal_rel_target_by_types(&environment.rels_xml, ENDNOTES_RELATIONSHIP_TYPES)
             .and_then(|target| resolve_part_name(DOCUMENT_PART, &target));
-    let endnotes = endnotes_path
+    let (endnotes, endnote_stories) = endnotes_path
         .map(|path| {
             parse_notes(
                 zip,
@@ -1735,9 +1856,25 @@ fn finish_document(
                 &environment.style_map,
                 &mut environment.num_map,
                 &environment.theme,
+                &environment.special_note_references.endnotes,
             )
         })
         .unwrap_or_default();
+    // A retained paragraph always has its mark, so marks decide presence.
+    if footnote_stories.separator.is_some()
+        || endnote_stories.separator.is_some()
+        || footnote_stories.continuation_separator.is_some()
+    {
+        let settings = environment
+            .note_layout_settings
+            .get_or_insert_with(Default::default);
+        settings.footnote_separator = footnote_stories.separator;
+        settings.endnote_separator = endnote_stories.separator;
+        settings.footnote_continuation_separator = footnote_stories.continuation_separator;
+        settings.footnote_separator_paragraph = footnote_stories.separator_paragraph;
+        settings.footnote_continuation_separator_paragraph =
+            footnote_stories.continuation_separator_paragraph;
+    }
 
     Ok(Document {
         section,
@@ -2044,9 +2181,10 @@ fn parse_notes(
     style_map: &StyleMap,
     num_map: &mut NumberingMap,
     theme: &ThemeColors,
-) -> Vec<crate::types::DocxNote> {
+    special_references: &HashSet<String>,
+) -> (Vec<crate::types::DocxNote>, SelectedNoteSeparators) {
     let Ok(xml) = read_zip_string(zip, path) else {
-        return Vec::new();
+        return Default::default();
     };
 
     // Per-part rels for media (e.g. an image inside a footnote). The part lives
@@ -2059,13 +2197,13 @@ fn parse_notes(
     let local_chart_map = load_chart_map(zip, &local_relationships, path, theme);
 
     let Ok(doc) = parse_guarded(&xml) else {
-        return Vec::new();
+        return Default::default();
     };
     let mut out = Vec::new();
-    for n in doc
-        .descendants()
-        .filter(|n| n.is_element() && n.tag_name().name() == element_name)
-    {
+    let mut selected_stories = SelectedNoteSeparators::default();
+    for n in doc.descendants().filter(|n| {
+        n.is_element() && is_w_ns(n.tag_name().namespace()) && n.tag_name().name() == element_name
+    }) {
         let id = attr_w(n, "id").unwrap_or_default();
         // ECMA-376 §17.11.18 ST_FtnEdn — skip reserved special notes. They are
         // tagged `w:type` (separator / continuationSeparator / continuationNotice)
@@ -2075,6 +2213,48 @@ fn parse_notes(
             note_type.as_deref(),
             Some("separator") | Some("continuationSeparator") | Some("continuationNotice")
         );
+        // ECMA-376 §17.11.3/.9: only document-listed special stories load.
+        // Absence is not a selected empty paragraph: leave metadata absent so
+        // the existing default-rule policy applies. Normal numbered notes do
+        // not require this list and continue through the ordinary note path.
+        let selected = !special_references.is_empty()
+            && (is_special || (id == "-1" && note_type.is_none()))
+            && note_id_value(&id).is_some_and(|value| special_references.contains(&value));
+        // ECMA-376 §17.11.1/.23: selected stories define their marker kind.
+        // Observed Word behavior: an explicitly empty story prints without the
+        // default rule; a missing reserved story still uses it. Limit the
+        // empty case to a single bare paragraph, as observed in Word controls.
+        // A formatted footnote story also keeps its effective paragraph; the
+        // endnote formatted class stays unsupported (absent).
+        let mut story = || match reserved_note_separator_mark(n) {
+            Some(mark) => (Some(mark), None),
+            None if element_name == "footnote" => formatted_note_separator_paragraph(
+                n,
+                style_map,
+                num_map,
+                &local_media_map,
+                &local_chart_map,
+                &local_rel_map,
+                theme,
+            )
+            .map_or((None, None), |(mark, paragraph)| {
+                (Some(mark), Some(Box::new(paragraph)))
+            }),
+            None => (None, None),
+        };
+        if selected && note_type.as_deref() == Some("continuationSeparator") {
+            (
+                selected_stories.continuation_separator,
+                selected_stories.continuation_separator_paragraph,
+            ) = story();
+        } else if selected
+            && (note_type.as_deref() == Some("separator") || (id == "-1" && note_type.is_none()))
+        {
+            (
+                selected_stories.separator,
+                selected_stories.separator_paragraph,
+            ) = story();
+        }
         if id.is_empty() || id == "-1" || id == "0" || is_special {
             continue;
         }
@@ -2093,7 +2273,487 @@ fn parse_notes(
         );
         out.push(crate::types::DocxNote { id, content });
     }
-    out
+    (out, selected_stories)
+}
+
+/// Selected special story facts of one note part. Paragraphs are retained
+/// only for the formatted footnote class.
+#[derive(Default)]
+struct SelectedNoteSeparators {
+    separator: Option<crate::types::NoteSeparatorMark>,
+    continuation_separator: Option<crate::types::NoteSeparatorMark>,
+    separator_paragraph: Option<Box<DocParagraph>>,
+    continuation_separator_paragraph: Option<Box<DocParagraph>>,
+}
+
+/// The formatted class of a listed story (§17.11.9): one `w:p` holding an
+/// optional `w:pPr` and one run of an optional `w:rPr` plus one
+/// §17.11.23/§17.11.1 mark. Its effective paragraph (style cascade, §17.3.1.33
+/// spacing, line rule) is kept so layout measures the band from these facts
+/// instead of a mark-only scalar.
+/// The shared empty-paragraph line takes its metrics from the paragraph mark
+/// (§17.3.1.29), so the mark run's rPr must equal the mark's rPr child for
+/// child. Paragraph ink, numbering, frames, a hidden mark and authored text are
+/// not represented here either; those stories stay unsupported (absent).
+#[allow(clippy::too_many_arguments)]
+fn formatted_note_separator_paragraph(
+    note: roxmltree::Node<'_, '_>,
+    style_map: &StyleMap,
+    num_map: &mut NumberingMap,
+    media_map: &HashMap<String, String>,
+    chart_map: &ChartMap,
+    rel_map: &HashMap<String, String>,
+    theme: &ThemeColors,
+) -> Option<(crate::types::NoteSeparatorMark, DocParagraph)> {
+    use crate::types::NoteSeparatorMark;
+    let is_w = |node: roxmltree::Node<'_, '_>, name: &str| {
+        is_w_ns(node.tag_name().namespace()) && node.tag_name().name() == name
+    };
+    let mut blocks = note.children().filter(|child| child.is_element());
+    let paragraph = blocks.next()?;
+    if !is_w(paragraph, "p") || blocks.next().is_some() {
+        return None;
+    }
+    let mut children = paragraph
+        .children()
+        .filter(|child| child.is_element())
+        .peekable();
+    let properties = children.next_if(|child| is_w(*child, "pPr"));
+    let run = children.next()?;
+    if !is_w(run, "r") || children.next().is_some() {
+        return None;
+    }
+    let mut run_children = run.children().filter(|child| child.is_element()).peekable();
+    let run_properties = run_children.next_if(|child| is_w(*child, "rPr"));
+    let marker = run_children.next()?;
+    if run_children.next().is_some() || !is_w_ns(marker.tag_name().namespace()) {
+        return None;
+    }
+    let mark = match marker.tag_name().name() {
+        "separator" => NoteSeparatorMark::Short,
+        "continuationSeparator" => NoteSeparatorMark::Full,
+        _ => return None,
+    };
+    let mark_properties = properties.and_then(|node| child_w(node, "rPr"));
+    if !same_xml_element(mark_properties, run_properties) {
+        return None;
+    }
+    let parsed = parse_paragraph_with_diagnostics(
+        paragraph,
+        style_map,
+        num_map,
+        media_map,
+        chart_map,
+        rel_map,
+        theme,
+        None,
+        &mut FieldState::default(),
+        &mut Vec::new(),
+    );
+    if !parsed.runs.is_empty()
+        || parsed.numbering.is_some()
+        || parsed.frame_pr.is_some()
+        || parsed.borders.is_some()
+        || parsed.shading.is_some()
+        || parsed.mark_vanish
+    {
+        return None;
+    }
+    Some((mark, parsed))
+}
+
+/// Element equality by expanded names, attributes and child elements.
+fn same_xml_element(
+    a: Option<roxmltree::Node<'_, '_>>,
+    b: Option<roxmltree::Node<'_, '_>>,
+) -> bool {
+    let (a, b) = match (a, b) {
+        (None, None) => return true,
+        (Some(a), Some(b)) => (a, b),
+        _ => return false,
+    };
+    fn attributes<'a>(node: roxmltree::Node<'a, '_>) -> Vec<(Option<&'a str>, &'a str, &'a str)> {
+        let mut values: Vec<_> = node
+            .attributes()
+            .map(|attribute| (attribute.namespace(), attribute.name(), attribute.value()))
+            .collect();
+        values.sort_unstable();
+        values
+    }
+    let mut left = a.children().filter(|child| child.is_element());
+    let mut right = b.children().filter(|child| child.is_element());
+    a.tag_name() == b.tag_name()
+        && attributes(a) == attributes(b)
+        && loop {
+            match (left.next(), right.next()) {
+                (None, None) => break true,
+                (Some(x), Some(y)) if same_xml_element(Some(x), Some(y)) => {}
+                _ => break false,
+            }
+        }
+}
+
+fn is_empty_note_separator(note: roxmltree::Node<'_, '_>) -> bool {
+    let mut content = note.children().filter(|child| child.is_element());
+    matches!(content.next(), Some(paragraph)
+        if is_w_ns(paragraph.tag_name().namespace())
+            && paragraph.tag_name().name() == "p"
+            && !paragraph.children().any(|child| child.is_element()))
+        && content.next().is_none()
+}
+
+/// ECMA-376 §17.11.1/.23 define full/partial-width reserved marks. Preserve
+/// only a bare paragraph or a single marker run; authored text, borders,
+/// multiple paragraphs and formatting require retained separator-story layout
+/// rather than guessing its geometry. `none` is the same bare-empty Office
+/// observation already used for ordinary separator stories.
+/// These are WordprocessingML expanded names: foreign elements with the same
+/// local name cannot define a special story or suppress the default rule.
+fn reserved_note_separator_mark(
+    note: roxmltree::Node<'_, '_>,
+) -> Option<crate::types::NoteSeparatorMark> {
+    use crate::types::NoteSeparatorMark;
+    if is_empty_note_separator(note) {
+        return Some(NoteSeparatorMark::None);
+    }
+    let mut blocks = note.children().filter(|child| child.is_element());
+    let paragraph = blocks.next()?;
+    if !is_w_ns(paragraph.tag_name().namespace())
+        || paragraph.tag_name().name() != "p"
+        || blocks.next().is_some()
+    {
+        return None;
+    }
+    let mut runs = paragraph.children().filter(|child| child.is_element());
+    let run = runs.next()?;
+    if !is_w_ns(run.tag_name().namespace()) || run.tag_name().name() != "r" || runs.next().is_some()
+    {
+        return None;
+    }
+    let mut marks = run.children().filter(|child| child.is_element());
+    let mark = marks.next()?;
+    if !is_w_ns(mark.tag_name().namespace()) || marks.next().is_some() {
+        return None;
+    }
+    match mark.tag_name().name() {
+        "separator" => Some(NoteSeparatorMark::Short),
+        "continuationSeparator" => Some(NoteSeparatorMark::Full),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod note_separator_tests {
+    use super::*;
+    use std::io::{Cursor, Write};
+    use zip::write::SimpleFileOptions;
+
+    #[test]
+    fn only_explicit_bare_paragraph_suppresses_default_separator() {
+        for (body, expected) in [
+            ("<w:p/>", true),
+            ("<w:p><w:r><w:separator/></w:r></w:p>", false),
+            ("<w:p><w:pPr/></w:p>", false),
+            ("<w:p/><w:p/>", false),
+        ] {
+            let xml = format!("<w:footnote xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">{body}</w:footnote>");
+            let doc = roxmltree::Document::parse(&xml).unwrap();
+            assert_eq!(
+                is_empty_note_separator(doc.root_element()),
+                expected,
+                "{body}"
+            );
+        }
+    }
+
+    fn selected_note_package(
+        properties: Option<&str>,
+        namespace: &str,
+        special_id: &str,
+        special_story: Option<&str>,
+    ) -> Document {
+        let default_story = format!(
+            r#"<w:footnote w:type="separator" w:id="{special_id}"><w:p><w:r><w:separator/></w:r></w:p></w:footnote>"#
+        );
+        let special_story = special_story.unwrap_or(&default_story);
+        let mut bytes = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(Cursor::new(&mut bytes));
+            write_test_content_types(&mut writer);
+            let mut parts = vec![
+                ("word/document.xml", format!(r#"<w:document xmlns:w="{namespace}"><w:body><w:p><w:r><w:footnoteReference w:id="1"/><w:endnoteReference w:id="1"/></w:r></w:p></w:body></w:document>"#)),
+                ("word/_rels/document.xml.rels", r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="f" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes" Target="footnotes.xml"/><Relationship Id="e" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/endnotes" Target="endnotes.xml"/></Relationships>"#.to_string()),
+                ("word/footnotes.xml", format!(r#"<w:footnotes xmlns:w="{namespace}" xmlns:x="urn:foreign">{special_story}<w:footnote w:type="continuationSeparator" w:id="0"><w:p><w:r><w:continuationSeparator/></w:r></w:p></w:footnote><w:footnote w:id="1"><w:p><w:r><w:t>footnote</w:t></w:r></w:p></w:footnote></w:footnotes>"#)),
+                ("word/endnotes.xml", format!(r#"<w:endnotes xmlns:w="{namespace}"><w:endnote w:type="separator" w:id="{special_id}"><w:p><w:r><w:continuationSeparator/></w:r></w:p></w:endnote><w:endnote w:id="1"><w:p><w:r><w:t>endnote</w:t></w:r></w:p></w:endnote></w:endnotes>"#)),
+            ];
+            if let Some(properties) = properties {
+                parts.push(("word/settings.xml", format!(r#"<w:settings xmlns:w="{namespace}" xmlns:x="urn:foreign">{properties}</w:settings>"#)));
+            }
+            for (path, xml) in parts {
+                writer
+                    .start_file(path, SimpleFileOptions::default())
+                    .unwrap();
+                writer.write_all(xml.as_bytes()).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        parse_from_bytes(&bytes).expect("note package parses")
+    }
+
+    #[test]
+    fn projects_only_document_listed_special_stories_without_losing_numbered_notes() {
+        use crate::types::NoteSeparatorMark::{Full, Short};
+        for (properties, foot, continuation, end) in [
+            (None, None, None, None),
+            (
+                Some(
+                    r#"<w:footnotePr><w:footnote w:id="42"/><w:footnote w:id="0"/></w:footnotePr>"#,
+                ),
+                Some(Short),
+                Some(Full),
+                None,
+            ),
+            (
+                Some(r#"<w:endnotePr><w:endnote w:id="42"/></w:endnotePr>"#),
+                None,
+                None,
+                Some(Full),
+            ),
+            (
+                Some(
+                    r#"<w:footnotePr><x:footnote w:id="42"/><w:compat><w:footnote w:id="0"/></w:compat></w:footnotePr><w:compat><w:endnotePr><w:endnote w:id="42"/></w:endnotePr></w:compat>"#,
+                ),
+                None,
+                None,
+                None,
+            ),
+        ] {
+            let document = selected_note_package(properties, crate::xml_util::W_NS, "42", None);
+            assert_eq!(document.footnotes.len(), 1);
+            assert_eq!(document.endnotes.len(), 1);
+            assert_eq!(document.footnotes[0].id, "1");
+            assert_eq!(document.endnotes[0].id, "1");
+            let settings = document.note_layout_settings.unwrap_or_default();
+            assert_eq!(settings.footnote_separator, foot, "{properties:?}");
+            assert_eq!(
+                settings.footnote_continuation_separator, continuation,
+                "{properties:?}"
+            );
+            assert_eq!(settings.endnote_separator, end, "{properties:?}");
+        }
+    }
+
+    #[test]
+    fn selected_formatted_footnote_stories_retain_their_effective_paragraph() {
+        use crate::types::NoteSeparatorMark::{Full, Short};
+        const ARIAL_10: &str = r#"<w:rFonts w:ascii="Arial" w:hAnsi="Arial"/><w:sz w:val="20"/>"#;
+        let story = |kind: &str, id: &str, paragraph: &str| {
+            format!(r#"<w:footnote w:type="{kind}" w:id="{id}">{paragraph}</w:footnote>"#)
+        };
+        let formatted = |marker: &str, line: &str, mark_rpr: &str, run_rpr: &str| {
+            format!(
+                r#"<w:p><w:pPr><w:widowControl w:val="0"/><w:spacing w:before="0" w:after="0" w:line="{line}" w:lineRule="exact"/>{mark_rpr}</w:pPr><w:r>{run_rpr}<w:{marker}/></w:r></w:p>"#
+            )
+        };
+        let arial = format!("<w:rPr>{ARIAL_10}</w:rPr>");
+        // The public A24 control shape: one exact 480-twip paragraph whose mark
+        // run and marker run author the same rPr, for each listed role.
+        let stories = [
+            story(
+                "separator",
+                "42",
+                &formatted("separator", "480", &arial, &arial),
+            ),
+            story(
+                "continuationSeparator",
+                "43",
+                &formatted("separator", "120", "", ""),
+            ),
+        ]
+        .concat();
+        let document = selected_note_package(
+            Some(r#"<w:footnotePr><w:footnote w:id="42"/><w:footnote w:id="43"/></w:footnotePr>"#),
+            crate::xml_util::W_NS,
+            "42",
+            Some(&stories),
+        );
+        assert_eq!(document.footnotes.len(), 1);
+        let settings = document.note_layout_settings.unwrap();
+        assert_eq!(settings.footnote_separator, Some(Short));
+        // Mark kind still wins over role (§17.11.1/.23).
+        assert_eq!(settings.footnote_continuation_separator, Some(Short));
+        let separator = settings
+            .footnote_separator_paragraph
+            .expect("A24 paragraph");
+        let line = separator
+            .line_spacing
+            .as_ref()
+            .expect("authored exact line");
+        assert_eq!((line.value, line.rule.as_str()), (24.0, "exact"));
+        assert_eq!((separator.space_before, separator.space_after), (0.0, 0.0));
+        assert!(separator.runs.is_empty(), "the marker is not text");
+        assert_eq!(separator.default_font_size, Some(10.0));
+        let continuation = settings
+            .footnote_continuation_separator_paragraph
+            .expect("formatted continuation paragraph");
+        assert_eq!(continuation.line_spacing.as_ref().unwrap().value, 6.0);
+
+        // Bare stories keep the scalar contract; formatting this boundary does
+        // not represent (differing marker rPr, paragraph ink, authored text)
+        // stays the existing unsupported class: no mark and no paragraph.
+        let bare = selected_note_package(
+            Some(r#"<w:footnotePr><w:footnote w:id="42"/><w:footnote w:id="0"/></w:footnotePr>"#),
+            crate::xml_util::W_NS,
+            "42",
+            None,
+        )
+        .note_layout_settings
+        .unwrap();
+        assert_eq!(
+            (
+                bare.footnote_separator,
+                bare.footnote_continuation_separator
+            ),
+            (Some(Short), Some(Full))
+        );
+        assert!(bare.footnote_separator_paragraph.is_none());
+        assert!(bare.footnote_continuation_separator_paragraph.is_none());
+        for paragraph in [
+            formatted("separator", "480", "", &arial),
+            formatted(
+                "separator",
+                "480",
+                &arial,
+                "<w:rPr><w:sz w:val=\"40\"/></w:rPr>",
+            ),
+            formatted("separator", "480", "", "").replace(
+                "<w:widowControl w:val=\"0\"/>",
+                "<w:pBdr><w:top w:val=\"single\" w:sz=\"4\"/></w:pBdr>",
+            ),
+            formatted("separator", "480", "", "").replace(
+                "<w:pPr>",
+                "<w:pPr><w:shd w:val=\"clear\" w:fill=\"FF0000\"/>",
+            ),
+            formatted(
+                "separator",
+                "480",
+                "<w:rPr><w:vanish/></w:rPr>",
+                "<w:rPr><w:vanish/></w:rPr>",
+            ),
+            formatted("separator", "480", "", "")
+                .replace("</w:r>", "</w:r><w:r><w:t>x</w:t></w:r>"),
+            formatted("separator", "480", "", "")
+                .replace("<w:separator/>", "<w:separator/><w:t>x</w:t>"),
+        ] {
+            let settings = selected_note_package(
+                Some(r#"<w:footnotePr><w:footnote w:id="42"/></w:footnotePr>"#),
+                crate::xml_util::W_NS,
+                "42",
+                Some(&story("separator", "42", &paragraph)),
+            )
+            .note_layout_settings
+            .unwrap_or_default();
+            assert_eq!(settings.footnote_separator, None, "{paragraph}");
+            assert!(
+                settings.footnote_separator_paragraph.is_none(),
+                "{paragraph}"
+            );
+        }
+    }
+
+    #[test]
+    fn strict_special_lists_match_decimal_id_values_without_machine_integer_limits() {
+        use crate::types::NoteSeparatorMark::{Full, Short};
+        let id = "99999999999999999999999999999999999999999999";
+        let properties = format!(
+            r#"<w:footnotePr><w:footnote w:id=" +000{id} "/><w:footnote w:id="-0"/></w:footnotePr><w:endnotePr><w:endnote w:id="{id}"/></w:endnotePr>"#
+        );
+        let document = selected_note_package(Some(&properties), wordprocessingml::STRICT, id, None);
+        let settings = document.note_layout_settings.unwrap();
+        assert_eq!(settings.footnote_separator, Some(Short));
+        assert_eq!(settings.footnote_continuation_separator, Some(Full));
+        assert_eq!(settings.endnote_separator, Some(Full));
+    }
+
+    #[test]
+    fn foreign_elements_cannot_define_selected_separator_stories() {
+        for story in [
+            r#"<x:footnote w:type="separator" w:id="42"><w:p><w:r><w:separator/></w:r></w:p></x:footnote>"#,
+            r#"<w:footnote w:type="separator" w:id="42"><x:p/></w:footnote>"#,
+            r#"<w:footnote w:type="separator" w:id="42"><x:p><w:r><w:separator/></w:r></x:p></w:footnote>"#,
+            r#"<w:footnote w:type="separator" w:id="42"><w:p><x:r><w:separator/></x:r></w:p></w:footnote>"#,
+            r#"<w:footnote w:type="separator" w:id="42"><w:p><w:r><x:separator/></w:r></w:p></w:footnote>"#,
+            r#"<w:footnote w:type="separator" w:id="42"><w:p><w:r><x:continuationSeparator/></w:r></w:p></w:footnote>"#,
+        ] {
+            let document = selected_note_package(
+                Some(r#"<w:footnotePr><w:footnote w:id="42"/></w:footnotePr>"#),
+                crate::xml_util::W_NS,
+                "42",
+                Some(story),
+            );
+            assert_eq!(document.footnotes.len(), 1);
+            assert_eq!(document.footnotes[0].id, "1");
+            assert_eq!(
+                document
+                    .note_layout_settings
+                    .unwrap_or_default()
+                    .footnote_separator,
+                None,
+                "{story}"
+            );
+        }
+    }
+
+    #[test]
+    fn package_projects_separator_marks_without_dropping_real_notes() {
+        for (ordinary, expected) in [
+            ("<w:p/>", crate::types::NoteSeparatorMark::None),
+            (
+                "<w:p><w:r><w:separator/></w:r></w:p>",
+                crate::types::NoteSeparatorMark::Short,
+            ),
+        ] {
+            let mut bytes = Vec::new();
+            {
+                let mut writer = zip::ZipWriter::new(Cursor::new(&mut bytes));
+                write_test_content_types(&mut writer);
+                for (path, xml) in [
+                    (
+                        "word/document.xml",
+                        r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:footnoteReference w:id="1"/></w:r></w:p></w:body></w:document>"#,
+                    ),
+                    (
+                        "word/_rels/document.xml.rels",
+                        r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes" Target="footnotes.xml"/></Relationships>"#,
+                    ),
+                    (
+                        "word/settings.xml",
+                        r#"<w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:footnotePr><w:footnote w:id="-1"/><w:footnote w:id="0"/></w:footnotePr></w:settings>"#,
+                    ),
+                    (
+                        "word/footnotes.xml",
+                        &format!(
+                            r#"<w:footnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:footnote w:type="separator" w:id="-1">{ordinary}</w:footnote><w:footnote w:type="continuationSeparator" w:id="0"><w:p><w:r><w:separator/></w:r></w:p></w:footnote><w:footnote w:id="1"><w:p><w:r><w:t>note</w:t></w:r></w:p></w:footnote></w:footnotes>"#
+                        ),
+                    ),
+                ] {
+                    writer
+                        .start_file(path, SimpleFileOptions::default())
+                        .unwrap();
+                    writer.write_all(xml.as_bytes()).unwrap();
+                }
+                writer.finish().unwrap();
+            }
+            let document = parse_from_bytes(&bytes).expect("DOCX package parses");
+            assert_eq!(document.footnotes.len(), 1);
+            let settings = document.note_layout_settings.unwrap();
+            assert_eq!(settings.footnote_separator, Some(expected));
+            assert_eq!(
+                settings.footnote_continuation_separator,
+                Some(crate::types::NoteSeparatorMark::Short)
+            );
+        }
+    }
 }
 
 /// Resolve scheme color names (accent1..6, dk1, dk2, lt1, lt2, hlink, folHlink)
@@ -2413,9 +3073,49 @@ fn parse_page_layout_settings(settings_xml: &str) -> Option<crate::types::PageLa
     }
 }
 
-fn parse_note_layout_settings(settings_xml: &str) -> Option<crate::types::NoteLayoutSettingsWire> {
-    let doc = parse_guarded(settings_xml).ok()?;
+/// IDs have ST_DecimalNumber value semantics, including signed/zero-padded
+/// lexical forms. Reuse its lexical validation without imposing a machine
+/// integer limit on XML Schema's unbounded integer identifier space.
+fn note_id_value(value: &str) -> Option<String> {
+    let lexical = valid_decimal_number(value)?;
+    let digits = lexical
+        .trim_start_matches(['-', '+'])
+        .trim_start_matches('0');
+    Some(if digits.is_empty() {
+        "0".to_string()
+    } else if lexical.starts_with('-') {
+        format!("-{digits}")
+    } else {
+        digits.to_string()
+    })
+}
+
+fn parse_note_layout_settings(
+    settings_xml: &str,
+) -> (
+    Option<crate::types::NoteLayoutSettingsWire>,
+    SpecialNoteReferences,
+) {
+    let Ok(doc) = parse_guarded(settings_xml) else {
+        return (None, SpecialNoteReferences::default());
+    };
     let root = doc.root_element();
+    let references = |properties: &str, element: &str| {
+        child_w(root, properties)
+            .into_iter()
+            .flat_map(|node| node.children())
+            .filter(|node| {
+                node.is_element()
+                    && is_w_ns(node.tag_name().namespace())
+                    && node.tag_name().name() == element
+            })
+            .filter_map(|node| attr_w(node, "id").and_then(|value| note_id_value(&value)))
+            .collect()
+    };
+    let special_references = SpecialNoteReferences {
+        footnotes: references("footnotePr", "footnote"),
+        endnotes: references("endnotePr", "endnote"),
+    };
     let value = |properties: &str, name: &str| {
         child_w(root, properties)
             .and_then(|node| child_w(node, name))
@@ -2433,6 +3133,12 @@ fn parse_note_layout_settings(settings_xml: &str) -> Option<crate::types::NoteLa
         footnote_number_start: start("footnotePr"),
         endnote_number_format: value("endnotePr", "numFmt"),
         endnote_number_start: start("endnotePr"),
+        footnote_separator: None,
+        endnote_separator: None,
+        footnote_continuation_separator: None,
+        footnote_separator_paragraph: None,
+        footnote_continuation_separator_paragraph: None,
+        native_separators: None,
     };
     if result.footnote_position.is_none()
         && result.endnote_position.is_none()
@@ -2441,9 +3147,9 @@ fn parse_note_layout_settings(settings_xml: &str) -> Option<crate::types::NoteLa
         && result.endnote_number_format.is_none()
         && result.endnote_number_start.is_none()
     {
-        None
+        (None, special_references)
     } else {
-        Some(result)
+        (Some(result), special_references)
     }
 }
 
@@ -2501,7 +3207,9 @@ mod note_layout_settings_tests {
                    </w:settings>"#,
             );
 
-            let settings = parse_note_layout_settings(&xml).expect("authored note settings");
+            let settings = parse_note_layout_settings(&xml)
+                .0
+                .expect("authored note settings");
             assert_eq!(settings.footnote_position.as_deref(), Some("beneathText"));
             assert_eq!(settings.endnote_position.as_deref(), Some("sectEnd"));
         }
@@ -2514,7 +3222,9 @@ mod note_layout_settings_tests {
                      <w:footnotePr><w:numFmt w:val="upperLetter"/><w:numStart w:val="4"/></w:footnotePr>
                      <w:endnotePr><w:numFmt w:val="lowerRoman"/><w:numStart w:val="x"/></w:endnotePr>
                    </w:settings>"#;
-        let settings = parse_note_layout_settings(xml).expect("authored note numbering");
+        let settings = parse_note_layout_settings(xml)
+            .0
+            .expect("authored note numbering");
         assert_eq!(
             settings.footnote_number_format.as_deref(),
             Some("upperLetter")
@@ -2540,7 +3250,7 @@ mod note_layout_settings_tests {
                      </w:compat>
                    </w:settings>"#;
 
-        assert!(parse_note_layout_settings(xml).is_none());
+        assert!(parse_note_layout_settings(xml).0.is_none());
     }
 }
 
@@ -2608,28 +3318,34 @@ fn parse_document_settings(settings_xml: &str) -> Option<crate::types::DocumentS
         .find(|n| n.is_element() && n.tag_name().name() == "compat");
     let compat_bool = |name: &str| -> Option<bool> { bool_prop(compat?, name) };
     let line_wrap_like_word6 = compat_bool("lineWrapLikeWord6");
+    let do_not_use_html_paragraph_auto_spacing = compat_bool("doNotUseHTMLParagraphAutoSpacing");
     // [MS-DOCX] §2.3.3: Office stores this as a named `compatSetting`, not a
     // direct `w:compat` boolean. The setting is off when absent.
-    let enable_open_type_features = compat
-        .filter(|node| node.tag_name().namespace() == root.tag_name().namespace())
-        .and_then(|compat| {
-            compat
-                .children()
-                .find(|node| {
+    let word_compat_setting = |name: &str| -> Option<String> {
+        compat
+            .filter(|node| node.tag_name().namespace() == root.tag_name().namespace())
+            .and_then(|compat| {
+                compat.children().find(|node| {
                     node.is_element()
                         && node.tag_name().name() == "compatSetting"
                         && node.tag_name().namespace() == root.tag_name().namespace()
-                        && attr_w(*node, "name").as_deref() == Some("enableOpenTypeFeatures")
+                        && attr_w(*node, "name").as_deref() == Some(name)
                         && attr_w(*node, "uri").as_deref()
                             == Some("http://schemas.microsoft.com/office/word")
                 })
-                .and_then(|node| attr_w(node, "val"))
-                .and_then(|value| match value.as_str() {
-                    "1" | "true" | "on" => Some(true),
-                    "0" | "false" | "off" => Some(false),
-                    _ => None,
-                })
+            })
+            .and_then(|node| attr_w(node, "val"))
+    };
+    let enable_open_type_features =
+        word_compat_setting("enableOpenTypeFeatures").and_then(|value| match value.as_str() {
+            "1" | "true" | "on" => Some(true),
+            "0" | "false" | "off" => Some(false),
+            _ => None,
         });
+    // [MS-DOCX] `compatibilityMode` names the Word version whose layout rules
+    // apply. Absence is surfaced as None; the renderer owns that default.
+    let compatibility_mode =
+        word_compat_setting("compatibilityMode").and_then(|value| value.trim().parse::<u32>().ok());
     let use_fe_layout = compat_bool("useFELayout");
     let balance_single_byte_double_byte_width = compat_bool("balanceSingleByteDoubleByteWidth");
     let adjust_line_height_in_table = compat_bool("adjustLineHeightInTable");
@@ -2654,10 +3370,12 @@ fn parse_document_settings(settings_xml: &str) -> Option<crate::types::DocumentS
         && default_tab_stop.is_none()
         && character_spacing_control.is_none()
         && line_wrap_like_word6.is_none()
+        && do_not_use_html_paragraph_auto_spacing.is_none()
         && enable_open_type_features.is_none()
         && use_fe_layout.is_none()
         && balance_single_byte_double_byte_width.is_none()
         && adjust_line_height_in_table.is_none()
+        && compatibility_mode.is_none()
     {
         return None;
     }
@@ -2669,10 +3387,12 @@ fn parse_document_settings(settings_xml: &str) -> Option<crate::types::DocumentS
         default_tab_stop,
         character_spacing_control,
         line_wrap_like_word6,
+        do_not_use_html_paragraph_auto_spacing,
         enable_open_type_features,
         use_fe_layout,
         balance_single_byte_double_byte_width,
         adjust_line_height_in_table,
+        compatibility_mode,
     })
 }
 
@@ -3185,7 +3905,7 @@ fn parse_body_elements(
     style_map: &StyleMap,
     num_map: &mut NumberingMap,
     media_map: &HashMap<String, String>,
-    chart_map: &HashMap<String, ooxml_common::chart::ChartModel>,
+    chart_map: &ChartMap,
     rel_map: &HashMap<String, String>,
     theme: &ThemeColors,
     section_hf: &HashMap<roxmltree::NodeId, ResolvedSectionHf>,
@@ -3210,7 +3930,7 @@ fn parse_body_elements_with_diagnostics(
     style_map: &StyleMap,
     num_map: &mut NumberingMap,
     media_map: &HashMap<String, String>,
-    chart_map: &HashMap<String, ooxml_common::chart::ChartModel>,
+    chart_map: &ChartMap,
     rel_map: &HashMap<String, String>,
     theme: &ThemeColors,
     section_hf: &HashMap<roxmltree::NodeId, ResolvedSectionHf>,
@@ -3417,7 +4137,7 @@ impl BodyParseCursor {
         style_map: &StyleMap,
         num_map: &mut NumberingMap,
         media_map: &HashMap<String, String>,
-        chart_map: &HashMap<String, ooxml_common::chart::ChartModel>,
+        chart_map: &ChartMap,
         rel_map: &HashMap<String, String>,
         theme: &ThemeColors,
         section_hf: &HashMap<roxmltree::NodeId, ResolvedSectionHf>,
@@ -3565,7 +4285,7 @@ fn parse_body_elements_in_story(
     style_map: &StyleMap,
     num_map: &mut NumberingMap,
     media_map: &HashMap<String, String>,
-    chart_map: &HashMap<String, ooxml_common::chart::ChartModel>,
+    chart_map: &ChartMap,
     rel_map: &HashMap<String, String>,
     theme: &ThemeColors,
     section_hf: &HashMap<roxmltree::NodeId, ResolvedSectionHf>,
@@ -4335,6 +5055,7 @@ fn section_placement_wire(
             doc_grid_char_space: None,
             gutter_pt: None,
             rtl_gutter: None,
+            native_text_flow: None,
             page_borders_authored: None,
             page_borders: None,
             page_geometry: None,
@@ -4368,6 +5089,8 @@ fn section_placement_wire(
                 .and_then(parse_on_off)
                 .unwrap_or(true)
         }),
+        // MS-DOC-only raw flow fact; WordprocessingML never supplies it.
+        native_text_flow: None,
         page_borders_authored: child_w(sect_pr, "pgBorders").map(|_| true),
         page_borders: parse_page_borders(sect_pr),
         page_geometry: section_page_geometry_wire(sect_pr).map(Box::new),
@@ -4475,14 +5198,22 @@ fn load_chart_map(
     relationships: &BTreeMap<String, RelTarget>,
     source_part: &str,
     theme: &ThemeColors,
-) -> HashMap<String, ooxml_common::chart::ChartModel> {
+) -> ChartMap {
     // Resolve the rId's Type via the raw rels: `rel_map` only carries Targets,
     // but a chart Target is distinguishable by the part it lands on. Match on the
     // resolved zip path living under `word/charts/` and ending in `.xml` — the
     // canonical location for a DrawingML chart part. `parse_chart_part` returns
     // `None` for a colors/style sidecar, so a stray non-chart `.xml` there is
     // harmless.
-    let mut chart_map: HashMap<String, ooxml_common::chart::ChartModel> = HashMap::new();
+    let limit_reporter = zip
+        .operation()
+        .and_then(|operation| operation.limit_reporter())
+        .ok();
+    let mut chart_map = ChartMap {
+        source_part: source_part.to_owned(),
+        limit_reporter: limit_reporter.clone(),
+        ..ChartMap::default()
+    };
     for (rid, relationship) in relationships {
         // Use the stored ZIP item name (§6.2.2.3 equivalence); an absent part
         // is dropped exactly like an unreadable one.
@@ -4510,12 +5241,21 @@ fn load_chart_map(
             &theme.chart_images,
         );
         let user_shapes_xml = load_chart_user_shapes_xml(zip, &path, &xml);
-        if let Some(mut chart) = parse_docx_chart_with_style_parts_and_images(
+        let Some(reporter) = limit_reporter.as_ref() else {
+            continue;
+        };
+        let mut exact_chartex_root = false;
+        if let Some(mut chart) = parse_docx_chart_with_provenance(
             &xml,
             related_parts.style_xml.as_deref(),
             related_parts.color_style_xml.as_deref(),
             theme,
             &image_resolver,
+            &mut exact_chartex_root,
+            Some(reporter),
+            // ChartMap is a parse-time lookup, not a model retained by the
+            // returned document. Each emitted DocRun clone is charged below.
+            None,
         ) {
             if let (Some(user_shapes_xml), Ok(chart_doc)) =
                 (user_shapes_xml.as_deref(), parse_guarded(&xml))
@@ -4531,6 +5271,15 @@ fn load_chart_map(
                         chart.chart_text_boxes = Some(text_boxes);
                     }
                 }
+            }
+            // [MS-ODRAWXML] §2.1.5: ChartEx is a separate part/relationship family.
+            // Reuse the already inflated XML and successful ChartEx parse; no
+            // prescan, extra ZIP read, or part-name guess enters the verdict.
+            if relationship.relationship_type.as_deref() == Some(CHARTEX_REL)
+                && relationship.mode == TargetMode::Internal
+                && exact_chartex_root
+            {
+                Rc::make_mut(&mut chart_map.renderable_chartex_rids).insert(rid.clone());
             }
             chart_map.insert(rid.clone(), chart);
         }
@@ -4944,7 +5693,7 @@ fn parse_paragraph(
     style_map: &StyleMap,
     num_map: &mut NumberingMap,
     media_map: &HashMap<String, String>,
-    chart_map: &HashMap<String, ooxml_common::chart::ChartModel>,
+    chart_map: &ChartMap,
     rel_map: &HashMap<String, String>,
     theme: &ThemeColors,
     table_style_id: Option<&str>,
@@ -4971,7 +5720,7 @@ fn parse_paragraph_with_diagnostics(
     style_map: &StyleMap,
     num_map: &mut NumberingMap,
     media_map: &HashMap<String, String>,
-    chart_map: &HashMap<String, ooxml_common::chart::ChartModel>,
+    chart_map: &ChartMap,
     rel_map: &HashMap<String, String>,
     theme: &ThemeColors,
     table_style_id: Option<&str>,
@@ -5003,7 +5752,7 @@ fn parse_paragraph_cond_at_depth(
     style_map: &StyleMap,
     num_map: &mut NumberingMap,
     media_map: &HashMap<String, String>,
-    chart_map: &HashMap<String, ooxml_common::chart::ChartModel>,
+    chart_map: &ChartMap,
     rel_map: &HashMap<String, String>,
     theme: &ThemeColors,
     table_style_id: Option<&str>,
@@ -5189,7 +5938,7 @@ fn parse_paragraph_cond_at_depth_with_diagnostics(
     style_map: &StyleMap,
     num_map: &mut NumberingMap,
     media_map: &HashMap<String, String>,
-    chart_map: &HashMap<String, ooxml_common::chart::ChartModel>,
+    chart_map: &ChartMap,
     rel_map: &HashMap<String, String>,
     theme: &ThemeColors,
     table_style_id: Option<&str>,
@@ -5419,6 +6168,8 @@ fn parse_paragraph_cond_at_depth_with_diagnostics(
         indent_first,
         space_before,
         space_after,
+        before_autospacing: base_para.before_autospacing,
+        after_autospacing: base_para.after_autospacing,
         line_spacing,
         numbering,
         tab_stops,
@@ -5449,6 +6200,10 @@ fn parse_paragraph_cond_at_depth_with_diagnostics(
         widow_control: base_para.widow_control.unwrap_or(true),
         // ECMA-376 §17.3.1.21: omission is explicitly equivalent to true.
         overflow_punct: base_para.overflow_punct.unwrap_or(true),
+        // ECMA-376 §17.3.1.2-3: omission means automatic spacing is on; only a
+        // resolved `false` is carried so default paragraphs serialize unchanged.
+        auto_space_de: base_para.auto_space_de.filter(|enabled| !enabled),
+        auto_space_dn: base_para.auto_space_dn.filter(|enabled| !enabled),
         // ECMA-376 §17.3.1.1: omission resolves through the paragraph style
         // hierarchy and ultimately defaults to true.
         adjust_right_ind: base_para.adjust_right_ind.unwrap_or(true),
@@ -5578,7 +6333,7 @@ fn parse_para_content(
     style_map: &StyleMap,
     num_map: &mut NumberingMap,
     media_map: &HashMap<String, String>,
-    chart_map: &HashMap<String, ooxml_common::chart::ChartModel>,
+    chart_map: &ChartMap,
     rel_map: &HashMap<String, String>,
     theme: &ThemeColors,
     runs: &mut Vec<DocRun>,
@@ -5983,7 +6738,7 @@ fn handle_run_in_para(
     style_map: &StyleMap,
     num_map: &mut NumberingMap,
     media_map: &HashMap<String, String>,
-    chart_map: &HashMap<String, ooxml_common::chart::ChartModel>,
+    chart_map: &ChartMap,
     rel_map: &HashMap<String, String>,
     theme: &ThemeColors,
     runs: &mut Vec<DocRun>,
@@ -6687,7 +7442,7 @@ fn parse_run_inner(
     style_map: &StyleMap,
     num_map: &mut NumberingMap,
     media_map: &HashMap<String, String>,
-    chart_map: &HashMap<String, ooxml_common::chart::ChartModel>,
+    chart_map: &ChartMap,
     rel_map: &HashMap<String, String>,
     theme: &ThemeColors,
     runs: &mut Vec<DocRun>,
@@ -7384,10 +8139,15 @@ fn parse_run_inner(
                 runs.extend(drawing_runs);
             }
             "footnoteReference" | "endnoteReference" | "footnoteRef" | "endnoteRef" => {
-                // ECMA-376 §17.11.6 / §17.11.7 / §17.11.16 / §17.11.17.
-                // `*Reference` is the in-body mark; `*Ref` is the auto-number
-                // placeholder that sits at the start of the note's own content.
-                // Both render as a superscript number. The DISPLAYED number is
+                // ECMA-376 §17.11.14 footnoteReference / §17.11.7
+                // endnoteReference are the in-body marks (with `w:id`);
+                // §17.11.13 footnoteRef / §17.11.6 endnoteRef are the empty
+                // auto-number placeholders at the start of the note's own
+                // content. Numbering and formatting are independent: the mark
+                // keeps its run's effective properties, including §17.3.2.42
+                // w:vertAlign from direct §17.3.2.28 rPr or a (typically
+                // reference) character style; the element itself confers no
+                // superscript. The DISPLAYED number is
                 // the note's sequential position (resolved by the renderer from
                 // the footnotes/endnotes ordering), not the raw `@w:id` — we keep
                 // the id in `text` only as a fallback. The `*Ref` placeholder
@@ -7422,12 +8182,11 @@ fn parse_run_inner(
                     background: fmt.background.clone(),
                     color_auto,
                     border: border.clone(),
-                    // Force superscript regardless of the run's original
-                    // vertAlign so reference markers appear above the line.
-                    // NOTE: the model value is "super" (see the styles.rs
-                    // w:vertAlign mapping) — the renderer only raises the
-                    // baseline for that exact token.
-                    vert_align: Some("super".to_string()),
+                    // Effective §17.3.2.42 value only; absence stays absent.
+                    // Consistent Office observation (Word 16.113.3, footnote
+                    // controls only): an unstyled footnoteReference run without
+                    // w:vertAlign prints full-size on the baseline.
+                    vert_align: vert_align.clone(),
                     hyperlink: hyperlink.clone(),
                     hyperlink_anchor: hyperlink_anchor.clone(),
                     all_caps,
@@ -7459,24 +8218,56 @@ fn parse_run_inner(
                     note_ref: Some(crate::types::NoteRef {
                         kind: kind.to_string(),
                         id: id_str,
+                        custom_mark_follows: matches!(
+                            tag,
+                            "footnoteReference" | "endnoteReference"
+                        ) && attr_w(child, "customMarkFollows")
+                            .as_deref()
+                            .and_then(parse_on_off)
+                            == Some(true),
                     }),
                     typography_acquisition: typography_acquisition.clone(),
                 })));
             }
             "AlternateContent" => {
-                // ECMA-376 Part 3 §9.3 (MCE Step 2) — select the active branch:
-                // the first `<mc:Choice>` whose `Requires` namespaces are all
-                // understood, else the `<mc:Fallback>`. The old code always took
-                // the first Choice and never the Fallback, so a picture living
-                // only behind an un-understood Choice was silently dropped
-                // (issue #747). For sample-24 the Choice `Requires="cx"` IS
-                // understood, so the live chartex chart wins and its rendered-PNG
-                // Fallback is correctly NOT re-emitted (no double draw).
-                if let Some(selected) =
-                    ooxml_common::mce::select_alternate_content(child, &docx_understands_drawing_ns)
-                {
-                    for inner in selected.children().filter(|n| n.is_element()) {
-                        if inner.tag_name().name() == "drawing" {
+                if let Some(selected) = chartex_choice::select_native_alternate_content(
+                    child,
+                    &chart_map.renderable_chartex_rids,
+                    &docx_understands_drawing_ns,
+                    &crate::document_projector::docx_understands_namespace,
+                ) {
+                    let fallback = child.children().find(|node| {
+                        node.is_element()
+                            && node.tag_name().namespace()
+                                == Some(ooxml_common::bounded_xml::MCE_NS)
+                            && node.tag_name().name() == "Fallback"
+                    });
+                    let use_fallback = selected.tag_name().namespace()
+                        == Some(ooxml_common::bounded_xml::MCE_NS)
+                        && selected.tag_name().name() == "Choice"
+                        && fallback.is_some_and(|fallback| {
+                            chartex_choice::native_branch_must_understand(
+                                fallback,
+                                &crate::document_projector::docx_understands_namespace,
+                            )
+                        })
+                        && chartex_choice::native_verdict(
+                            selected,
+                            &chart_map.renderable_chartex_rids,
+                        ) == Verdict::Unrenderable;
+                    // Resource compatibility is intentionally confined to the
+                    // single-drawing ChartEx seam (see chartex_choice.rs). Later
+                    // Choices never replace the selected Choice; only the authored
+                    // drawing/pict fallback is eligible. General MCE stays intact.
+                    let branch = if use_fallback {
+                        fallback.unwrap_or(selected)
+                    } else {
+                        selected
+                    };
+                    for inner in branch.children().filter(|n| n.is_element()) {
+                        if inner.tag_name().name() == "drawing"
+                            && (!use_fallback || is_w_ns(inner.tag_name().namespace()))
+                        {
                             let mut drawing_runs = parse_inline_drawing(
                                 style_map,
                                 num_map,
@@ -7490,6 +8281,26 @@ fn parse_run_inner(
                             );
                             attach_anchor_host_metrics(&mut drawing_runs);
                             runs.extend(drawing_runs);
+                        } else if use_fallback
+                            && is_w_ns(inner.tag_name().namespace())
+                            && inner.tag_name().name() == "pict"
+                        {
+                            // Same VML dispatch and host metrics as the pict arm.
+                            if let Some(img) = parse_vml_pict_image(inner, media_map) {
+                                let mut pict_runs = vec![DocRun::Image(Box::new(img))];
+                                attach_anchor_host_metrics(&mut pict_runs);
+                                runs.extend(pict_runs);
+                            } else if let Some(shp) = parse_vml_pict(
+                                style_map, num_map, inner, theme, media_map, chart_map, rel_map,
+                                depth,
+                            ) {
+                                let anchored = shp.anchor_acquisition.is_some();
+                                let mut pict_runs = vec![DocRun::Shape(Box::new(shp))];
+                                if anchored {
+                                    attach_anchor_host_metrics(&mut pict_runs);
+                                }
+                                runs.extend(pict_runs);
+                            }
                         }
                     }
                 }
@@ -7710,8 +8521,9 @@ fn group_member_hidden(node: roxmltree::Node) -> bool {
 ///
 /// These are the DrawingML / WordprocessingML drawing-extension namespaces whose
 /// `<w:drawing>` payload `parse_inline_drawing` can turn into renderable runs:
-/// the 2014 chartex chart extension, and the 2010 wordprocessing drawing / shape
-/// / group extensions (shapes + groups are parsed by local name in the
+/// the 2014 ChartEx payload namespace and the 2010 wordprocessing drawing /
+/// shape / group extensions
+/// (shapes + groups are parsed by local name in the
 /// anchor/inline paths; the positioning extension is honored by
 /// `find_position_node`). A `Requires` naming anything outside this set (a future
 /// or app-specific extension we cannot draw) is NOT understood, so its Choice is
@@ -7729,8 +8541,7 @@ fn group_member_hidden(node: roxmltree::Node) -> bool {
 pub(crate) fn docx_understands_drawing_ns(ns: &str) -> bool {
     matches!(
         ns,
-        // Microsoft 2014 chartEx (waterfall / boxWhisker / treemap / sunburst …).
-        "http://schemas.microsoft.com/office/drawing/2014/chartex"
+        CHARTEX_NS
         // Microsoft 2010 WordprocessingML drawing extensions.
         | "http://schemas.microsoft.com/office/word/2010/wordprocessingDrawing"
         | "http://schemas.microsoft.com/office/word/2010/wordprocessingShape"
@@ -7744,7 +8555,7 @@ fn parse_inline_drawing(
     num_map: &mut NumberingMap,
     node: roxmltree::Node,
     media_map: &HashMap<String, String>,
-    chart_map: &HashMap<String, ooxml_common::chart::ChartModel>,
+    chart_map: &ChartMap,
     rel_map: &HashMap<String, String>,
     theme: &ThemeColors,
     depth: DepthGuard,
@@ -7812,7 +8623,7 @@ fn parse_inline_drawing_impl(
     num_map: &mut NumberingMap,
     node: roxmltree::Node,
     media_map: &HashMap<String, String>,
-    chart_map: &HashMap<String, ooxml_common::chart::ChartModel>,
+    chart_map: &ChartMap,
     rel_map: &HashMap<String, String>,
     theme: &ThemeColors,
     depth: DepthGuard,
@@ -7867,14 +8678,13 @@ fn parse_inline_drawing_impl(
                         relationships::STRICT,
                         "id",
                     );
-                    if let Some(chart) = rid.and_then(|rid| chart_map.get(rid)) {
-                        // Require a parseable `<wp:extent>` (cx/cy EMU → pt), matching
-                        // the inline-image contract; a chart without one is dropped
-                        // rather than emitted at zero size. If absent, fall through to
-                        // the ordinary image path (which will also drop it).
-                        if let Some((width_pt, height_pt)) = drawing_extent_points(container) {
+                    // Require a parseable `<wp:extent>` (cx/cy EMU → pt), matching
+                    // the inline-image contract. Charge and clone only when the
+                    // drawing will retain the ChartEx model.
+                    if let Some((width_pt, height_pt)) = drawing_extent_points(container) {
+                        if let Some(chart) = rid.and_then(|rid| chart_map.clone_for_drawing(rid)) {
                             return vec![DocRun::Chart(Box::new(ChartRun {
-                                chart: chart.clone(),
+                                chart,
                                 width_pt,
                                 height_pt,
                                 anchor: false,
@@ -8098,13 +8908,12 @@ fn parse_inline_drawing_impl(
                     relationships::STRICT,
                     "id",
                 );
-                if let Some(chart) = rid.and_then(|rid| chart_map.get(rid)) {
-                    // Same `<wp:extent>` (cx/cy EMU → pt) contract as the inline
-                    // chart path: a chart without a parseable extent falls
-                    // through to the blip path (which also drops it).
-                    if let Some((width_pt, height_pt)) = drawing_extent_points(container) {
+                // Same `<wp:extent>` (cx/cy EMU → pt) contract as the inline
+                // chart path. Charge and clone only when the drawing retains it.
+                if let Some((width_pt, height_pt)) = drawing_extent_points(container) {
+                    if let Some(chart) = rid.and_then(|rid| chart_map.clone_for_drawing(rid)) {
                         return vec![DocRun::Chart(Box::new(ChartRun {
-                            chart: chart.clone(),
+                            chart,
                             width_pt,
                             height_pt,
                             anchor: true,
@@ -8291,7 +9100,7 @@ fn parse_inline_drawing_impl(
 fn collect_drawing_extent_diagnostic(
     drawing: roxmltree::Node,
     media_map: &HashMap<String, String>,
-    chart_map: &HashMap<String, ooxml_common::chart::ChartModel>,
+    chart_map: &ChartMap,
     runs: &[DocRun],
     diagnostics: &mut Vec<PendingParseDiagnostic>,
 ) {
@@ -9435,7 +10244,7 @@ fn parse_wgp_shapes(
     anchor_z_order: u32,
 ) -> Vec<ShapeRun> {
     let group_metadata = anchor_group_metadata_index(wgp);
-    let chart_map = HashMap::new();
+    let chart_map = ChartMap::default();
     let rel_map = HashMap::new();
     parse_wgp_shapes_with_metadata(
         style_map,
@@ -9463,7 +10272,7 @@ fn parse_wgp_shapes_with_metadata(
     wgp: roxmltree::Node,
     theme: &ThemeColors,
     media_map: &HashMap<String, String>,
-    chart_map: &HashMap<String, ooxml_common::chart::ChartModel>,
+    chart_map: &ChartMap,
     rel_map: &HashMap<String, String>,
     depth: DepthGuard,
     anchor_pos_x: f64,
@@ -9544,7 +10353,7 @@ fn walk_group_children(
     xform: GroupTransform,
     theme: &ThemeColors,
     media_map: &HashMap<String, String>,
-    chart_map: &HashMap<String, ooxml_common::chart::ChartModel>,
+    chart_map: &ChartMap,
     rel_map: &HashMap<String, String>,
     depth: DepthGuard,
     anchor_pos_x: f64,
@@ -9640,7 +10449,7 @@ fn parse_wsp_shape(
     wsp: roxmltree::Node,
     theme: &ThemeColors,
     media_map: &HashMap<String, String>,
-    chart_map: &HashMap<String, ooxml_common::chart::ChartModel>,
+    chart_map: &ChartMap,
     rel_map: &HashMap<String, String>,
     depth: DepthGuard,
     anchor_pos_x: f64,
@@ -9846,6 +10655,7 @@ fn parse_wsp_shape(
         anchor: text_anchor,
         autofit: text_autofit,
         vert: text_vert,
+        wrap: text_wrap,
         inset_l: text_inset_l,
         inset_t: text_inset_t,
         inset_r: text_inset_r,
@@ -9890,6 +10700,7 @@ fn parse_wsp_shape(
         default_text_color,
         text_anchor,
         text_autofit,
+        text_wrap,
         text_vert,
         text_inset_l,
         text_inset_t,
@@ -9982,6 +10793,7 @@ struct ShapeTextBody {
     anchor: Option<String>,
     autofit: Option<String>,
     vert: Option<String>,
+    wrap: Option<String>,
     inset_l: f64,
     inset_t: f64,
     inset_r: f64,
@@ -10035,7 +10847,7 @@ fn parse_text_box_content(
     style_map: &StyleMap,
     num_map: &mut NumberingMap,
     media_map: &HashMap<String, String>,
-    chart_map: &HashMap<String, ooxml_common::chart::ChartModel>,
+    chart_map: &ChartMap,
     rel_map: &HashMap<String, String>,
     theme: &ThemeColors,
     depth: DepthGuard,
@@ -10128,7 +10940,7 @@ fn parse_text_box_content_at_depth(
     style_map: &StyleMap,
     num_map: &mut NumberingMap,
     media_map: &HashMap<String, String>,
-    chart_map: &HashMap<String, ooxml_common::chart::ChartModel>,
+    chart_map: &ChartMap,
     rel_map: &HashMap<String, String>,
     theme: &ThemeColors,
     depth: DepthGuard,
@@ -10176,7 +10988,7 @@ fn parse_shape_text_body(
     wsp: roxmltree::Node,
     theme: &ThemeColors,
     media_map: &HashMap<String, String>,
-    chart_map: &HashMap<String, ooxml_common::chart::ChartModel>,
+    chart_map: &ChartMap,
     rel_map: &HashMap<String, String>,
     depth: DepthGuard,
 ) -> ShapeTextBody {
@@ -10190,16 +11002,20 @@ fn parse_shape_text_body(
     let anchor = body_pr
         .and_then(|b| b.attribute("anchor"))
         .map(|s| s.to_string());
-    // ECMA-376 §20.1.10.83 `<wps:bodyPr vert>` (ST_TextVerticalType) — the text
-    // body's flow direction. Carried verbatim; the renderer maps the recognised
-    // values (vert / vert270 / eaVert) and falls unknown ones back to horizontal.
+    // ECMA-376 §21.1.2.1.1: wrap="none" permits inline overflow rather than
+    // starting another line/column. An absent attribute uses square wrapping.
+    let wrap = body_pr
+        .and_then(|b| b.attribute("wrap"))
+        .map(str::to_string);
+    // ECMA-376 §20.1.10.83 `<wps:bodyPr vert>` (ST_TextVerticalType): carry
+    // the direction verbatim into the host-specific retained text-box layout.
     let vert = body_pr
         .and_then(|b| b.attribute("vert"))
         .map(|s| s.to_string());
     // ECMA-376 §21.1.2.1.1 auto-fit: the bodyPr's autofit is a CHILD element,
     // one of <a:noAutofit/> / <a:spAutoFit/> / <a:normAutofit/>. Normalize it to
     // the shared core vocabulary (packages/core src/types/common.ts `autoFit`):
-    // `noAutofit → "none"` (fixed box → the renderer clips overflow),
+    // `noAutofit → "none"` (fixed box; retained layout owns the overflow policy),
     // `spAutoFit → "sp"` (box grows to fit), `normAutofit → "norm"` (text
     // shrinks to fit). This matches the pptx path so all three formats emit the
     // same enum; an absent auto-fit ⇒ None (overflow visible).
@@ -10248,6 +11064,7 @@ fn parse_shape_text_body(
         anchor,
         autofit,
         vert,
+        wrap,
         inset_l: l,
         inset_t: t,
         inset_r: r,
@@ -10749,6 +11566,7 @@ fn extract_simple_paragraph_text(
     Some(ShapeText {
         text,
         font_size_pt,
+        default_font_size: Some(mark_run.font_size.unwrap_or(DEFAULT_FONT_SIZE)),
         color,
         paragraph_mark_color: mark_run.color.clone(),
         font_family,
@@ -10759,6 +11577,12 @@ fn extract_simple_paragraph_text(
         alignment: normalize_align(&alignment).to_string(),
         space_before,
         space_after,
+        before_autospacing: direct_ind
+            .before_autospacing
+            .or(style_para.before_autospacing),
+        after_autospacing: direct_ind
+            .after_autospacing
+            .or(style_para.after_autospacing),
         line_spacing_val,
         line_spacing_rule,
         indent_left,
@@ -10836,7 +11660,7 @@ fn parse_vml_pict(
     pict: roxmltree::Node,
     theme: &ThemeColors,
     media_map: &HashMap<String, String>,
-    chart_map: &HashMap<String, ooxml_common::chart::ChartModel>,
+    chart_map: &ChartMap,
     rel_map: &HashMap<String, String>,
     depth: DepthGuard,
 ) -> Option<ShapeRun> {
@@ -12778,6 +13602,7 @@ fn parse_docx_chart_with_style_parts(
     )
 }
 
+#[cfg(test)]
 fn parse_docx_chart_with_style_parts_and_images(
     chart_xml: &str,
     style_xml: Option<&str>,
@@ -12785,8 +13610,32 @@ fn parse_docx_chart_with_style_parts_and_images(
     theme: &ThemeColors,
     image_resolver: &dyn ooxml_common::chart::ChartImageResolver,
 ) -> Option<ooxml_common::chart::ChartModel> {
+    parse_docx_chart_with_provenance(
+        chart_xml,
+        style_xml,
+        color_style_xml,
+        theme,
+        image_resolver,
+        &mut false,
+        None,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn parse_docx_chart_with_provenance(
+    chart_xml: &str,
+    style_xml: Option<&str>,
+    color_style_xml: Option<&str>,
+    theme: &ThemeColors,
+    image_resolver: &dyn ooxml_common::chart::ChartImageResolver,
+    exact_chartex_root: &mut bool,
+    limit_reporter: Option<&ooxml_common::package_session::PackageLimitReporter>,
+    retention_key: Option<ooxml_common::chart::ChartRetentionKey<'_>>,
+) -> Option<ooxml_common::chart::ChartModel> {
     let doc = parse_guarded(chart_xml).ok()?;
     let root = doc.root_element();
+    *exact_chartex_root = root.tag_name().namespace() == Some(CHARTEX_NS);
     let resolver = DocxColorResolver { theme };
     let is_chartex = root
         .tag_name()
@@ -12799,6 +13648,8 @@ fn parse_docx_chart_with_style_parts_and_images(
             root,
             &ooxml_common::chart::ChartParseContext {
                 host: ooxml_common::chart::ChartHost::Word,
+                limit_reporter,
+                retention_key,
                 ..ooxml_common::chart::ChartParseContext::new(
                     &resolver,
                     style_xml,
@@ -12969,7 +13820,7 @@ fn parse_table(
     style_map: &StyleMap,
     num_map: &mut NumberingMap,
     media_map: &HashMap<String, String>,
-    chart_map: &HashMap<String, ooxml_common::chart::ChartModel>,
+    chart_map: &ChartMap,
     rel_map: &HashMap<String, String>,
     theme: &ThemeColors,
     depth: DepthGuard,
@@ -12998,7 +13849,7 @@ fn parse_table_with_diagnostics(
     style_map: &StyleMap,
     num_map: &mut NumberingMap,
     media_map: &HashMap<String, String>,
-    chart_map: &HashMap<String, ooxml_common::chart::ChartModel>,
+    chart_map: &ChartMap,
     rel_map: &HashMap<String, String>,
     theme: &ThemeColors,
     depth: DepthGuard,
@@ -13472,6 +14323,9 @@ fn parse_table_with_diagnostics(
                     .clone()
                     .unwrap_or_else(|| "top".to_string());
             }
+            if cell.no_wrap.is_none() {
+                cell.no_wrap = eff.no_wrap.or(tstyle.cell_no_wrap);
+            }
         }
     }
 
@@ -13628,7 +14482,7 @@ fn parse_table_row(
     style_map: &StyleMap,
     num_map: &mut NumberingMap,
     media_map: &HashMap<String, String>,
-    chart_map: &HashMap<String, ooxml_common::chart::ChartModel>,
+    chart_map: &ChartMap,
     rel_map: &HashMap<String, String>,
     theme: &ThemeColors,
     table_style_id: Option<&str>,
@@ -13735,7 +14589,7 @@ fn parse_table_cell(
     style_map: &StyleMap,
     num_map: &mut NumberingMap,
     media_map: &HashMap<String, String>,
-    chart_map: &HashMap<String, ooxml_common::chart::ChartModel>,
+    chart_map: &ChartMap,
     rel_map: &HashMap<String, String>,
     theme: &ThemeColors,
     table_style_id: Option<&str>,
@@ -13816,6 +14670,9 @@ fn parse_table_cell(
             }
         })
         .unwrap_or((None, None));
+    // ECMA-376 17.4.29: retain explicit false so it can cancel a style's
+    // noWrap; AutoFit uses only a resolved true in its width constraints.
+    let no_wrap = tc_pr.and_then(|p| bool_prop(p, "noWrap"));
 
     // Per-cell margins (ECMA-376 §17.4.42 `<w:tcPr><w:tcMar>`). Each edge,
     // when present, overrides the table-level `<w:tblCellMar>` default; absent
@@ -13914,6 +14771,7 @@ fn parse_table_cell(
         v_align,
         width_pt,
         width_pct,
+        no_wrap,
         margin_top,
         margin_bottom,
         margin_left,
@@ -14356,7 +15214,7 @@ mod tests {
             &style_map,
             &mut num_map,
             &media,
-            &HashMap::new(),
+            &ChartMap::default(),
             &rels,
             &theme,
             DepthGuard::root(),
@@ -14377,7 +15235,7 @@ mod tests {
             style_map,
             &mut num_map,
             &media,
-            &HashMap::new(),
+            &ChartMap::default(),
             &rels,
             &theme,
             DepthGuard::root(),
@@ -14762,6 +15620,41 @@ mod tests {
         let cell = &t.rows[0].cells[0];
         assert_eq!(cell.width_pt, None);
         assert_eq!(cell.width_pct, Some(2500.0));
+    }
+
+    #[test]
+    fn cell_no_wrap_preserves_explicit_on_and_off_values() {
+        let table = parse_tbl(
+            r#"<w:tblGrid><w:gridCol w:w="2500"/></w:tblGrid>
+               <w:tr><w:tc><w:tcPr><w:tcW w:w="0" w:type="auto"/><w:noWrap/></w:tcPr><w:p/></w:tc></w:tr>
+               <w:tr><w:tc><w:tcPr><w:tcW w:w="0" w:type="auto"/><w:noWrap w:val="0"/></w:tcPr><w:p/></w:tc></w:tr>"#,
+        );
+        assert_eq!(table.rows[0].cells[0].no_wrap, Some(true));
+        assert_eq!(table.rows[1].cells[0].no_wrap, Some(false));
+    }
+
+    #[test]
+    fn cell_no_wrap_layers_table_style_condition_and_inline_clearing() {
+        let styles = format!(
+            r#"<w:styles xmlns:w="{ns}">
+              <w:style w:type="table" w:styleId="Base"><w:tcPr><w:noWrap/></w:tcPr></w:style>
+              <w:style w:type="table" w:styleId="Derived"><w:basedOn w:val="Base"/>
+                <w:tblStylePr w:type="firstRow"><w:tcPr><w:noWrap w:val="0"/></w:tcPr></w:tblStylePr>
+              </w:style>
+            </w:styles>"#,
+            ns = W_NS
+        );
+        let table = parse_tbl_with_styles(
+            r#"<w:tblPr><w:tblStyle w:val="Derived"/><w:tblLook w:firstRow="1"/></w:tblPr>
+               <w:tblGrid><w:gridCol w:w="2500"/></w:tblGrid>
+               <w:tr><w:tc><w:p/></w:tc></w:tr>
+               <w:tr><w:tc><w:p/></w:tc></w:tr>
+               <w:tr><w:tc><w:tcPr><w:noWrap w:val="0"/></w:tcPr><w:p/></w:tc></w:tr>"#,
+            &styles,
+        );
+        assert_eq!(table.rows[0].cells[0].no_wrap, Some(false));
+        assert_eq!(table.rows[1].cells[0].no_wrap, Some(true));
+        assert_eq!(table.rows[2].cells[0].no_wrap, Some(false));
     }
 
     // ECMA-376 §17.4.52 — absent `<w:tblLayout>` ⇒ None (renderer default autofit).
@@ -15430,7 +16323,7 @@ mod tests {
             styles,
             &mut num_map,
             &media,
-            &HashMap::new(),
+            &ChartMap::default(),
             &rels,
             &theme,
             &mut runs,
@@ -15688,7 +16581,7 @@ mod tests {
             &styles,
             &mut num_map,
             &media,
-            &HashMap::new(),
+            &ChartMap::default(),
             &rels,
             &theme,
             &HashMap::new(),
@@ -15733,7 +16626,7 @@ mod tests {
             &style_map,
             &mut num_map,
             &media,
-            &HashMap::new(),
+            &ChartMap::default(),
             &rels,
             &theme,
             DepthGuard::root(),
@@ -17139,7 +18032,7 @@ mod paragraph_identity_tests {
             &style_map,
             &mut num_map,
             &HashMap::new(),
-            &HashMap::new(),
+            &ChartMap::default(),
             &HashMap::new(),
             &ThemeColors::default(),
             None,
@@ -17184,7 +18077,7 @@ mod math_jc_tests {
             &style_map,
             &mut num_map,
             &media,
-            &HashMap::new(),
+            &ChartMap::default(),
             &rels,
             &theme,
             None,
@@ -17321,6 +18214,41 @@ mod math_jc_tests {
 
         let empty = r#"<w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>"#;
         assert!(parse_document_settings(empty).is_none());
+    }
+
+    // [MS-DOCX] compatibilityMode is a Word-namespace compatSetting; only a
+    // well-formed integer value with the Word URI is surfaced.
+    #[test]
+    fn settings_compatibility_mode_surfaces() {
+        let settings = |body: &str| {
+            format!(
+                r#"<w:settings xmlns:w="{w}"><w:compat>{body}</w:compat></w:settings>"#,
+                w = W_NS
+            )
+        };
+        let word = r#"w:uri="http://schemas.microsoft.com/office/word""#;
+        let mode = |body: String| {
+            parse_document_settings(&settings(&body)).and_then(|s| s.compatibility_mode)
+        };
+        assert_eq!(
+            mode(format!(
+                r#"<w:compatSetting w:name="compatibilityMode" {word} w:val="15"/>"#
+            )),
+            Some(15)
+        );
+        assert_eq!(
+            mode(format!(
+                r#"<w:compatSetting w:name="compatibilityMode" {word} w:val="x"/>"#
+            )),
+            None
+        );
+        assert_eq!(
+            mode(
+                r#"<w:compatSetting w:name="compatibilityMode" w:uri="urn:other" w:val="15"/>"#
+                    .to_string()
+            ),
+            None,
+        );
     }
 
     // ECMA-376 Part 1 §17.15.1.18 / §17.15.3.3 and Part 4 §14.8.3.50 — East
@@ -17481,7 +18409,7 @@ mod sym_run_tests {
             &style_map,
             &mut num_map,
             &media,
-            &HashMap::new(),
+            &ChartMap::default(),
             &rels,
             &theme,
             None,
@@ -17595,7 +18523,7 @@ mod para_mark_rpr_tests {
             sm,
             &mut num_map,
             &media,
-            &HashMap::new(),
+            &ChartMap::default(),
             &rels,
             &theme,
             None,
@@ -17727,7 +18655,7 @@ mod cs_toggle_tests {
             &style_map,
             &mut num_map,
             &HashMap::new(),
-            &HashMap::new(),
+            &ChartMap::default(),
             &HashMap::new(),
             &ThemeColors::default(),
             &HashMap::new(),
@@ -17998,7 +18926,7 @@ mod cs_toggle_tests {
             &style_map,
             &mut num_map,
             &HashMap::new(),
-            &HashMap::new(),
+            &ChartMap::default(),
             &HashMap::new(),
             &ThemeColors::default(),
             &HashMap::new(),
@@ -18294,7 +19222,7 @@ mod rtl_tests {
             &style_map,
             &mut num_map,
             &media_map,
-            &HashMap::new(),
+            &ChartMap::default(),
             &rel_map,
             &theme,
             &HashMap::new(),
@@ -18855,7 +19783,7 @@ mod footnote_tests {
             &style_map,
             &mut num_map,
             &HashMap::new(),
-            &HashMap::new(),
+            &ChartMap::default(),
             &HashMap::new(),
             &ThemeColors::default(),
             &HashMap::new(),
@@ -18893,7 +19821,7 @@ mod footnote_tests {
             &style_map,
             &mut num_map,
             &HashMap::new(),
-            &HashMap::new(),
+            &ChartMap::default(),
             &HashMap::new(),
             &ThemeColors::default(),
             Some(table_style_id),
@@ -18934,7 +19862,7 @@ mod footnote_tests {
             &style_map,
             &mut num_map,
             &HashMap::new(),
-            &HashMap::new(),
+            &ChartMap::default(),
             &HashMap::new(),
             &ThemeColors::default(),
             &HashMap::new(),
@@ -19411,8 +20339,9 @@ mod footnote_tests {
         );
     }
 
-    /// ECMA-376 §17.11.17 — a body `<w:footnoteReference>` becomes a superscript
-    /// TextRun tagged with `note_ref { kind:"footnote", id }`.
+    /// ECMA-376 §17.11.14 — a body `<w:footnoteReference>` becomes a TextRun
+    /// tagged with `note_ref { kind:"footnote", id }`; its authored §17.3.2.42
+    /// superscript is retained.
     #[test]
     fn footnote_reference_is_tagged_as_note_ref() {
         let p = first_para(
@@ -19436,7 +20365,45 @@ mod footnote_tests {
         assert_eq!(run.vert_align.as_deref(), Some("super"));
     }
 
-    /// ECMA-376 §17.11.16 — the in-note `<w:footnoteRef>` placeholder is tagged
+    /// §17.11.14/.7 reference marks and §17.11.13/.6 placeholders take their
+    /// run's effective §17.3.2.42 vertical alignment (direct §17.3.2.28 rPr or
+    /// a character style); the parser synthesizes no superscript. Office
+    /// evidence covers only an unstyled footnoteReference control.
+    #[test]
+    fn note_reference_marks_keep_effective_vertical_alignment() {
+        let styles = format!(
+            r#"<w:styles xmlns:w="{W_NS}"><w:style w:type="character" w:styleId="Ref"><w:rPr><w:vertAlign w:val="superscript"/></w:rPr></w:style></w:styles>"#
+        );
+        // Body marks carry `w:id`; the in-note placeholders are empty elements.
+        for mark in [
+            r#"<w:footnoteReference w:id="1"/>"#,
+            r#"<w:endnoteReference w:id="1"/>"#,
+            "<w:footnoteRef/>",
+            "<w:endnoteRef/>",
+        ] {
+            for (r_pr, expected) in [
+                ("", None),
+                (r#"<w:rPr><w:rStyle w:val="Ref"/></w:rPr>"#, Some("super")),
+            ] {
+                let p = first_para_with(
+                    &format!(r#"<w:p><w:r>{r_pr}{mark}</w:r></w:p>"#),
+                    &styles,
+                    "",
+                );
+                let run = p
+                    .runs
+                    .iter()
+                    .find_map(|r| match r {
+                        DocRun::Text(t) if t.note_ref.is_some() => Some(t),
+                        _ => None,
+                    })
+                    .expect("note reference run");
+                assert_eq!(run.vert_align.as_deref(), expected, "{mark} {r_pr}");
+            }
+        }
+    }
+
+    /// ECMA-376 §17.11.13 — the in-note `<w:footnoteRef>` placeholder is tagged
     /// with an empty id (the renderer substitutes the enclosing note's number).
     #[test]
     fn footnote_ref_placeholder_has_empty_id() {
@@ -19453,7 +20420,7 @@ mod footnote_tests {
         assert_eq!(nr.id, "");
     }
 
-    /// ECMA-376 §17.11.6 — endnote references carry kind "endnote".
+    /// ECMA-376 §17.11.7 — endnote references carry kind "endnote".
     #[test]
     fn endnote_reference_kind_is_endnote() {
         let p = first_para(r#"<w:p><w:r><w:endnoteReference w:id="2"/></w:r></w:p>"#);
@@ -19467,6 +20434,31 @@ mod footnote_tests {
             .expect("note_ref set");
         assert_eq!(nr.kind, "endnote");
         assert_eq!(nr.id, "2");
+    }
+
+    #[test]
+    fn custom_note_reference_preserves_suppression_without_consuming_its_authored_mark() {
+        for tag in ["footnoteReference", "endnoteReference"] {
+            for (value, expected) in [("1", true), ("true", true), ("0", false)] {
+                let p = first_para(&format!(
+                    r#"<w:p><w:r><w:{tag} w:id="7" w:customMarkFollows="{value}"/><w:t>*</w:t></w:r></w:p>"#
+                ));
+                let texts: Vec<_> = p
+                    .runs
+                    .iter()
+                    .filter_map(|r| match r {
+                        DocRun::Text(t) => Some(t),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    texts[0].note_ref.as_ref().unwrap().custom_mark_follows,
+                    expected
+                );
+                assert_eq!(texts[1].text, "*");
+                assert!(texts[1].note_ref.is_none());
+            }
+        }
     }
 
     /// ECMA-376 §17.3.1.32 — w:snapToGrid val=0 surfaces as Some(false) so the
@@ -20458,7 +21450,7 @@ mod anchor_image_relative_from_tests {
         style_map: &StyleMap,
         node: roxmltree::Node,
         media_map: &HashMap<String, String>,
-        chart_map: &HashMap<String, ooxml_common::chart::ChartModel>,
+        chart_map: &ChartMap,
         theme: &ThemeColors,
     ) -> Vec<DocRun> {
         let mut num_map = NumberingMap::default();
@@ -21343,7 +22335,7 @@ mod anchor_image_relative_from_tests {
             &theme,
         )
         .expect("model");
-        let mut chart_map: HashMap<String, ooxml_common::chart::ChartModel> = HashMap::new();
+        let mut chart_map: ChartMap = ChartMap::default();
         chart_map.insert("rIdChart".to_string(), model);
 
         let runs = parse_inline_drawing(&style_map, drawing, &media, &chart_map, &theme);
@@ -21365,7 +22357,7 @@ mod anchor_image_relative_from_tests {
 
         // Unresolvable rId (empty map) retains layout without inventing a chart
         // model or image fallback.
-        let empty: HashMap<String, ooxml_common::chart::ChartModel> = HashMap::new();
+        let empty: ChartMap = ChartMap::default();
         let unavailable = parse_inline_drawing(&style_map, drawing, &media, &empty, &theme);
         assert_eq!(unavailable.len(), 1);
         match &unavailable[0] {
@@ -21740,7 +22732,7 @@ mod anchor_image_relative_from_tests {
             &theme,
         )
         .expect("chartex model");
-        let mut chart_map: HashMap<String, ooxml_common::chart::ChartModel> = HashMap::new();
+        let mut chart_map: ChartMap = ChartMap::default();
         chart_map.insert("rIdChartEx".to_string(), model);
 
         let runs = parse_inline_drawing(&style_map, drawing, &media, &chart_map, &theme);
@@ -21817,7 +22809,7 @@ mod anchor_image_relative_from_tests {
             &theme,
         )
         .expect("model");
-        let mut chart_map: HashMap<String, ooxml_common::chart::ChartModel> = HashMap::new();
+        let mut chart_map: ChartMap = ChartMap::default();
         chart_map.insert("rIdChart".to_string(), model);
 
         let mut runs = parse_inline_drawing(&style_map, drawing, &media, &chart_map, &theme);
@@ -21860,7 +22852,7 @@ mod anchor_image_relative_from_tests {
 
         // Unresolvable rId keeps one host and the authored anchor geometry
         // without inventing a chart model or image fallback.
-        let empty: HashMap<String, ooxml_common::chart::ChartModel> = HashMap::new();
+        let empty: ChartMap = ChartMap::default();
         let mut unavailable = parse_inline_drawing(&style_map, drawing, &media, &empty, &theme);
         prepend_anchor_host_metrics(
             &mut unavailable,
@@ -21935,7 +22927,7 @@ mod anchor_image_relative_from_tests {
             &theme,
         )
         .expect("model");
-        let mut chart_map: HashMap<String, ooxml_common::chart::ChartModel> = HashMap::new();
+        let mut chart_map: ChartMap = ChartMap::default();
         chart_map.insert("rIdChart".to_string(), model);
 
         let runs = parse_inline_drawing(&style_map, drawing, &media, &chart_map, &theme);
@@ -21978,10 +22970,7 @@ mod anchor_image_relative_from_tests {
     /// so an MCE `<mc:AlternateContent>` test can bind arbitrary `Requires`
     /// prefixes and register a chart model for a chartex Choice. Returns the
     /// paragraph's runs.
-    fn parse_p_with_charts(
-        inner: &str,
-        chart_map: &HashMap<String, ooxml_common::chart::ChartModel>,
-    ) -> Vec<DocRun> {
+    fn parse_p_with_charts(inner: &str, chart_map: &ChartMap) -> Vec<DocRun> {
         let xml = format!(
             r#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
                     xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
@@ -22017,7 +23006,7 @@ mod anchor_image_relative_from_tests {
         p.runs
     }
 
-    fn chartex_model_map() -> HashMap<String, ooxml_common::chart::ChartModel> {
+    fn chartex_model_map() -> ChartMap {
         let theme = ThemeColors::default();
         let model = parse_docx_chart(
             r#"<cx:chartSpace xmlns:cx="http://schemas.microsoft.com/office/drawing/2014/chartex">
@@ -22032,8 +23021,9 @@ mod anchor_image_relative_from_tests {
             &theme,
         )
         .expect("chartex model");
-        let mut m: HashMap<String, ooxml_common::chart::ChartModel> = HashMap::new();
+        let mut m: ChartMap = ChartMap::default();
         m.insert("rId8".to_string(), model);
+        Rc::make_mut(&mut m.renderable_chartex_rids).insert("rId8".to_string());
         m
     }
 
@@ -22088,7 +23078,7 @@ mod anchor_image_relative_from_tests {
     /// must now surface as an image run.
     #[test]
     fn mce_unknown_choice_falls_back_to_picture() {
-        let chart_map: HashMap<String, ooxml_common::chart::ChartModel> = HashMap::new();
+        let chart_map: ChartMap = ChartMap::default();
         let runs = parse_p_with_charts(
             r#"<w:r><mc:AlternateContent>
                  <mc:Choice Requires="unknownns"><w:drawing>
@@ -22126,7 +23116,7 @@ mod anchor_image_relative_from_tests {
     /// Fallback picture.
     #[test]
     fn mce_wpc_canvas_choice_falls_back_to_picture() {
-        let chart_map: HashMap<String, ooxml_common::chart::ChartModel> = HashMap::new();
+        let chart_map: ChartMap = ChartMap::default();
         let runs = parse_p_with_charts(
             r#"<w:r><mc:AlternateContent>
                  <mc:Choice Requires="wpc"><w:drawing>
@@ -22211,7 +23201,7 @@ mod anchor_image_relative_from_tests {
     /// malformed Choice would be the old always-first-Choice behavior.)
     #[test]
     fn mce_missing_or_blank_requires_falls_back() {
-        let chart_map: HashMap<String, ooxml_common::chart::ChartModel> = HashMap::new();
+        let chart_map: ChartMap = ChartMap::default();
         // Case 1: Requires attribute entirely absent.
         let runs_missing = parse_p_with_charts(
             r#"<w:r><mc:AlternateContent>
@@ -22356,7 +23346,7 @@ mod column_tests {
             &style_map,
             &mut num_map,
             &media_map,
-            &HashMap::new(),
+            &ChartMap::default(),
             &rel_map,
             &theme,
             &HashMap::new(),
@@ -23540,7 +24530,7 @@ mod txbx_inline_image_tests {
             wsp,
             theme,
             media_map,
-            &HashMap::new(),
+            &ChartMap::default(),
             &HashMap::new(),
             DepthGuard::root(),
         )
@@ -23712,6 +24702,25 @@ mod txbx_inline_image_tests {
         // Absent vert ⇒ None (horizontal); absent bodyPr ⇒ None.
         assert_eq!(vert_of(wsp(r#"<wps:bodyPr/>"#)), None);
         assert_eq!(vert_of(wsp("")), None);
+    }
+
+    #[test]
+    fn parse_shape_text_body_preserves_nonwrapping_wordart() {
+        let xml = r#"<wps:wsp
+          xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"
+          xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+          <wps:txbx><w:txbxContent><w:p><w:r><w:t>ABCDE</w:t></w:r></w:p></w:txbxContent></wps:txbx>
+          <wps:bodyPr vert="wordArtVert" wrap="none"/>
+        </wps:wsp>"#;
+        let doc = roxmltree::Document::parse(xml).unwrap();
+        let body = parse_shape_text_body(
+            &StyleMap::default(),
+            doc.root_element(),
+            &ThemeColors::default(),
+            &HashMap::new(),
+        );
+        assert_eq!(body.wrap.as_deref(), Some("none"));
+        assert_eq!(body.vert.as_deref(), Some("wordArtVert"));
     }
 
     /// An image-only paragraph (empty text) must NOT be dropped — the prior
@@ -24924,7 +25933,7 @@ mod txbx_block_wire_tests {
             document.root_element(),
             &ThemeColors::default(),
             media_map,
-            &HashMap::new(),
+            &ChartMap::default(),
             rel_map,
             depth,
         )
@@ -25008,7 +26017,7 @@ mod txbx_block_wire_tests {
             doc.root_element(),
             &ThemeColors::default(),
             &HashMap::new(),
-            &HashMap::new(),
+            &ChartMap::default(),
             &HashMap::new(),
             DepthGuard::root(),
             0.0,
@@ -25046,7 +26055,7 @@ mod txbx_block_wire_tests {
             doc.root_element(),
             &ThemeColors::default(),
             &HashMap::new(),
-            &HashMap::new(),
+            &ChartMap::default(),
             &HashMap::new(),
             DepthGuard::root(),
         )
@@ -25074,7 +26083,7 @@ mod txbx_block_wire_tests {
             document.root_element(),
             &ThemeColors::default(),
             &HashMap::new(),
-            &HashMap::new(),
+            &ChartMap::default(),
             &HashMap::new(),
             DepthGuard::root(),
         )
@@ -25103,7 +26112,7 @@ mod txbx_block_wire_tests {
             document.root_element(),
             &ThemeColors::default(),
             &HashMap::new(),
-            &HashMap::new(),
+            &ChartMap::default(),
             &HashMap::new(),
             DepthGuard::root(),
         )
@@ -25199,7 +26208,7 @@ mod txbx_block_wire_tests {
             document.root_element(),
             &ThemeColors::default(),
             &HashMap::new(),
-            &HashMap::new(),
+            &ChartMap::default(),
             &HashMap::new(),
             DepthGuard::with_limit(0),
         )
@@ -25311,7 +26320,7 @@ mod txbx_block_wire_tests {
             wsp_document.root_element(),
             &ThemeColors::default(),
             &HashMap::new(),
-            &HashMap::new(),
+            &ChartMap::default(),
             &HashMap::new(),
             DepthGuard::root(),
         );
@@ -25321,7 +26330,7 @@ mod txbx_block_wire_tests {
             &StyleMap::default(),
             &mut num_map,
             &HashMap::new(),
-            &HashMap::new(),
+            &ChartMap::default(),
             &HashMap::new(),
             &ThemeColors::default(),
             None,
@@ -25405,7 +26414,7 @@ mod txbx_block_wire_tests {
             pict_document.root_element(),
             &ThemeColors::default(),
             &HashMap::new(),
-            &HashMap::new(),
+            &ChartMap::default(),
             &HashMap::new(),
             DepthGuard::root(),
         )
@@ -25416,7 +26425,7 @@ mod txbx_block_wire_tests {
             &StyleMap::default(),
             &mut num_map,
             &HashMap::new(),
-            &HashMap::new(),
+            &ChartMap::default(),
             &HashMap::new(),
             &ThemeColors::default(),
             None,
@@ -25590,7 +26599,7 @@ mod shape_preset_geometry_tests {
             doc.root_element(),
             theme,
             &HashMap::new(),
-            &HashMap::new(),
+            &ChartMap::default(),
             &HashMap::new(),
             DepthGuard::root(),
             0.0,
@@ -25925,7 +26934,7 @@ mod inline_wps_shape_tests {
             &mut NumberingMap::default(),
             doc.root_element(),
             media_map,
-            &HashMap::new(),
+            &ChartMap::default(),
             &HashMap::new(),
             &ThemeColors::default(),
             DepthGuard::root(),
@@ -26040,7 +27049,7 @@ mod inline_wps_shape_tests {
             &mut NumberingMap::default(),
             doc.root_element(),
             &HashMap::new(),
-            &HashMap::new(),
+            &ChartMap::default(),
             &HashMap::new(),
             &ThemeColors::default(),
             DepthGuard::root(),
@@ -26099,7 +27108,7 @@ mod shape_fontref_color_tests {
             doc.root_element(),
             &theme(),
             &HashMap::new(),
-            &HashMap::new(),
+            &ChartMap::default(),
             &HashMap::new(),
             DepthGuard::root(),
             0.0,
@@ -26236,7 +27245,7 @@ mod numbering_marker_font_tests {
             &style_map,
             &mut num_map,
             &HashMap::new(),
-            &HashMap::new(),
+            &ChartMap::default(),
             &HashMap::new(),
             &ThemeColors::default(),
             &HashMap::new(),
@@ -26289,7 +27298,7 @@ mod numbering_marker_font_tests {
             &style_map,
             &mut num_map,
             &HashMap::new(),
-            &HashMap::new(),
+            &ChartMap::default(),
             &HashMap::new(),
             &ThemeColors::default(),
             &HashMap::new(),
@@ -26490,7 +27499,7 @@ mod numbering_marker_font_tests {
             &styles,
             &mut num_map,
             &HashMap::new(),
-            &HashMap::new(),
+            &ChartMap::default(),
             &HashMap::new(),
             &ThemeColors::default(),
             &HashMap::new(),
@@ -26551,7 +27560,7 @@ mod numbering_marker_font_tests {
             &style_map,
             &mut num_map,
             &HashMap::new(),
-            &HashMap::new(),
+            &ChartMap::default(),
             &HashMap::new(),
             &ThemeColors::default(),
             &HashMap::new(),
@@ -26669,13 +27678,45 @@ mod numbering_marker_font_tests {
             styles,
             &mut num_map,
             &media,
-            &HashMap::new(),
+            &ChartMap::default(),
             &rels,
             &theme,
             DepthGuard::root(),
             TablePositioningContext::Normal,
             LogicalTableSequenceContext::standalone(doc.root_element()),
         )
+    }
+
+    #[test]
+    fn table_kern_threshold_reaches_content_and_mark_with_direct_override() {
+        // ECMA-376 §17.7.6 table formatting feeds the same resolved rPr facts.
+        let styles = StyleMap::parse(&format!(
+            r#"<w:styles xmlns:w="{W_NS}">
+          <w:style w:type="table" w:styleId="Kern"><w:rPr><w:kern w:val="24"/></w:rPr></w:style>
+        </w:styles>"#
+        ));
+        let table = parse_tbl_styled(
+            r#"<w:tblPr><w:tblStyle w:val="Kern"/></w:tblPr>
+          <w:tblGrid><w:gridCol w:w="2000"/></w:tblGrid><w:tr><w:tc>
+          <w:p><w:r><w:t>AV</w:t></w:r><w:r><w:rPr><w:kern w:val="0"/></w:rPr><w:t>To</w:t></w:r></w:p>
+          </w:tc></w:tr>"#,
+            &styles,
+        );
+        let CellElement::Paragraph(p) = &table.rows[0].cells[0].content[0] else {
+            panic!("paragraph")
+        };
+        let DocRun::Text(first) = &p.runs[0] else {
+            panic!("text")
+        };
+        let DocRun::Text(second) = &p.runs[1] else {
+            panic!("text")
+        };
+        assert_eq!(first.kerning, Some(12.0));
+        assert_eq!(second.kerning, Some(0.0));
+        assert_eq!(
+            p.paragraph_mark_font_facts.as_ref().unwrap().kerning,
+            Some(12.0)
+        );
     }
 
     fn cell_text_color(cell: &DocTableCell) -> Option<String> {
@@ -26730,7 +27771,7 @@ mod numbering_marker_font_tests {
             styles,
             &mut num_map,
             &HashMap::new(),
-            &HashMap::new(),
+            &ChartMap::default(),
             &HashMap::new(),
             &ThemeColors::default(),
             &HashMap::new(),
@@ -27854,7 +28895,7 @@ mod numbering_marker_color_tests {
             &style_map,
             &mut num_map,
             &HashMap::new(),
-            &HashMap::new(),
+            &ChartMap::default(),
             &HashMap::new(),
             &ThemeColors::default(),
             &HashMap::new(),
@@ -27934,7 +28975,7 @@ mod numbering_marker_color_tests {
             &style_map,
             &mut num_map,
             &HashMap::new(),
-            &HashMap::new(),
+            &ChartMap::default(),
             &HashMap::new(),
             &ThemeColors::default(),
             &HashMap::new(),
@@ -28031,7 +29072,7 @@ mod ole_object_tests {
             &StyleMap::default(),
             &mut num_map,
             media,
-            &HashMap::new(),
+            &ChartMap::default(),
             &HashMap::new(),
             &ThemeColors::default(),
             &HashMap::new(),
@@ -28323,7 +29364,7 @@ mod vml_pict_tests {
             &StyleMap::default(),
             &mut num_map,
             media,
-            &HashMap::new(),
+            &ChartMap::default(),
             &HashMap::new(),
             &ThemeColors::default(),
             &HashMap::new(),
@@ -29262,7 +30303,7 @@ mod strict_namespace_tests {
             &style_map,
             &mut num_map,
             &media,
-            &HashMap::new(),
+            &ChartMap::default(),
             rels,
             &theme,
             None,
@@ -29994,7 +31035,7 @@ mod tracked_change_move_tests {
             document.root_element(),
             &ThemeColors::default(),
             &HashMap::new(),
-            &HashMap::new(),
+            &ChartMap::default(),
             &HashMap::new(),
             DepthGuard::root(),
         );

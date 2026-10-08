@@ -1,3 +1,5 @@
+import { DEFAULT_XLSX_WORKSHEET_POLICY, normalizeXlsxWorksheetPolicy } from '@silurus/ooxml-core/worker';
+import { bindWorksheetPolicy, getWorksheetPolicy } from './worksheet-policy-context.js';
 import { describe, expect, it } from 'vitest';
 import {
   applyAutoRowHeights,
@@ -422,4 +424,18 @@ describe('XLSX automatic row height (ECMA-376 §18.3.1.73 / Office auto-fit)', (
     expect(rendered.rowHeights[1]).toBe(30);
     expect(measured.count()).toBe(0);
   });
+});
+
+it('does not reuse a render-local autoheight projection under an older worksheet policy', () => {
+  const source = worksheet();
+  source.mergeCells = [];
+  const raised = normalizeXlsxWorksheetPolicy({ xlsxWorksheetLimits: { maxCells: 300_000 } });
+  bindWorksheetPolicy(source, raised);
+  const ctx = measurementContext();
+  const first = worksheetWithAutoRowHeights(ctx, source, styles);
+  expect(getWorksheetPolicy(first)).toBe(raised);
+  expect(worksheetWithAutoRowHeights(ctx, source, styles)).toBe(first);
+  bindWorksheetPolicy(source, DEFAULT_XLSX_WORKSHEET_POLICY);
+  const lowered = worksheetWithAutoRowHeights(ctx, source, styles);
+  expect(getWorksheetPolicy(lowered)).toBe(DEFAULT_XLSX_WORKSHEET_POLICY);
 });

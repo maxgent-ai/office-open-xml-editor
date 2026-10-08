@@ -334,7 +334,9 @@ describe('resolveColumnWidths — a tblW=auto table sizes to tcW/content, ignori
       runs: [textRun('(', 'Carlito'), textRun('A', 'Caladea')],
     } as DocParagraph;
     const textCell = {
-      ...cell(1, null, 0), content: [{ type: 'paragraph', ...paragraph }],
+      // A positive preference below the content minimum exercises atom
+      // measurement; a zero tcW means auto and retains the saved grid.
+      ...cell(1, null, 1), content: [{ type: 'paragraph', ...paragraph }],
     } as unknown as DocTableCell;
     const t = autofit([row([textCell])], [200]);
     const state = normalizedColumnState({
@@ -384,7 +386,9 @@ describe('resolveColumnWidths — a tblW=auto table sizes to tcW/content, ignori
       }],
     } as DocParagraph;
     const textCell = {
-      ...cell(1, null, 0), content: [{ type: 'paragraph', ...paragraph }],
+      // A positive preference below the content minimum exercises atom
+      // measurement; a zero tcW means auto and retains the saved grid.
+      ...cell(1, null, 1), content: [{ type: 'paragraph', ...paragraph }],
     } as unknown as DocTableCell;
     const t = autofit([row([textCell])], [200]);
     const state = normalizedColumnState({
@@ -422,7 +426,9 @@ describe('resolveColumnWidths — a tblW=auto table sizes to tcW/content, ignori
       }],
     } as DocParagraph;
     const textCell = {
-      ...cell(1, null, 0), content: [{ type: 'paragraph', ...paragraph }],
+      // A positive preference below the content minimum exercises atom
+      // measurement; a zero tcW means auto and retains the saved grid.
+      ...cell(1, null, 1), content: [{ type: 'paragraph', ...paragraph }],
     } as unknown as DocTableCell;
     const t = autofit([row([textCell])], [200]);
     const state = normalizedColumnState({

@@ -123,6 +123,27 @@ describe('note numbering format and start (ECMA-376 §17.11.17/.18/.20)', () => 
     expect(texts.filter((text) => text === '2')).toHaveLength(2);
   });
 
+  it.each(['footnote', 'endnote'] as const)('retains a custom %s without consuming an automatic number', async (kind) => {
+    const notes = ['custom', 'auto'].map(id => ({ id, content: [para([
+      textRun('', { noteRef: { kind, id: '' }, vertAlign: 'super' }),
+      textRun(id === 'custom' ? '* CUSTOMNOTE' : ' AUTONOTE'),
+    ]) as unknown as BodyElement] }));
+    const body = [para([
+      textRun('BODY'),
+      textRun('custom', { noteRef: { kind, id: 'custom', customMarkFollows: true }, vertAlign: 'super' }),
+      textRun('* MORE'),
+      textRun('auto', { noteRef: { kind, id: 'auto' }, vertAlign: 'super' }),
+    ]) as unknown as BodyElement];
+    const doc = docWith(body, kind === 'footnote' ? notes : []);
+    if (kind === 'endnote') doc.endnotes = notes;
+    const texts = (await renderPage0(doc)).map(call => call.text);
+    expect(texts.filter(text => text === '1')).toHaveLength(2);
+    expect(texts).not.toContain('2');
+    expect(texts).not.toContain('custom');
+    expect(texts.join('')).toContain('CUSTOMNOTE');
+    expect(texts.join('')).toContain('AUTONOTE');
+  });
+
   it('applies the document-wide footnote format and start to references and notes', async () => {
     const texts = (await renderPage0(notesDoc({
       footnoteNumberFormat: 'lowerRoman',

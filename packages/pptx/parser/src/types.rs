@@ -86,6 +86,7 @@ mod group_transform_tests {
             .expect("minimal chart");
         let mut elements = vec![
             SlideElement::Table(TableElement {
+                background: None,
                 id: None,
                 x: 10,
                 y: 20,

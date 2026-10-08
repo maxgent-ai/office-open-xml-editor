@@ -40,10 +40,11 @@ import {
   chartStockBarFillDecision,
   chartStyleFillDecision,
   chartThreeDSurfacePaint,
-  chartExPointAuthorsFill,
+  chartExPointFillDecision,
 } from './style-paint.js';
 import {
   chartDataPointStyleRole,
+  chartModelIsChartEx,
   chartSeriesVariesByPoint,
   rawLinkedChartStyleRole,
   withChartStyleIndexCache,
@@ -66,6 +67,11 @@ import {
   visitChartExHierarchyLabelSites,
 } from './chart-ex-hierarchy-labels.js';
 import { planWaterfallPaintSites } from './waterfall-plan.js';
+import {
+  planChartExColumnPaint,
+  visitChartExColumnLegendSites,
+  visitChartExColumnPaintSites,
+} from './chart-ex-column-plan.js';
 
 const SURFACE_PICTURE_FAMILIES = new Set([
   'line', 'stackedLine', 'stackedLinePct',
@@ -519,17 +525,8 @@ function collectChartMarkerImageFillResult(
     series: Pick<ChartSeries, 'chartexStyle' | 'color'> | undefined,
     index: number,
   ): ImageFill | null | undefined => {
-    if (chartExPointAuthorsFill(point)) {
-      const pointStyle = point?.fillHidden === true
-        ? { ...point.chartexStyle, fillHidden: true, fillPaintAuthored: true }
-        : point?.chartexStyle;
-      return dataPointImageDecision(
-        pointStyle, point?.color, chart.chartexDataPointStyle, index,
-      );
-    }
-    return dataPointImageDecision(
-      series?.chartexStyle, series?.color, chart.chartexDataPointStyle, index,
-    );
+    const fill = chartExPointFillDecision(chart, series, point, index);
+    return fill?.fillType === 'image' ? fill : fill == null ? fill : null;
   };
   const frameImageDecision = (
     directFill: ChartModel['chartFill'] | ChartModel['plotAreaFill'],
@@ -834,6 +831,13 @@ function collectChartMarkerImageFillResult(
     const classicThreeDGroup = group?.kind === 'bar3D' || group?.kind === 'pie3D'
       || group?.kind === 'area3D' || group?.kind === 'line3D'
       || group?.kind === 'surface3D';
+    const chartExColumnSeries = chartModelIsChartEx(chart)
+      && (chart.chartType === 'clusteredColumn'
+        || chart.chartType === 'histogram' || chart.chartType === 'pareto')
+      && (group?.kind === 'bar' || family === 'bar'
+        || family === 'clusteredBar' || family === 'clusteredBarH'
+        || family === 'stackedBar' || family === 'stackedBarH'
+        || family === 'stackedBarPct' || family === 'stackedBarHPct');
     // Parsed classic bar series retain the canonical `seriesType: "bar"`;
     // group.kind owns the 2-D/3-D distinction. Preflight only the flat body
     // painters that can actually consume these pictures.
@@ -858,7 +862,9 @@ function collectChartMarkerImageFillResult(
           : family === 'pie' || family === 'pie3D' || family === 'doughnut' || family === 'ofPie'
             ? series.values.some(value => value != null && Number.isFinite(value) && value !== 0)
             : series.values.some(value => value != null && Number.isFinite(value) && value !== 0);
-      const keyCanPaint = (chart.showLegend && seriesLegendVisible)
+      // ChartEx column legend keys are enumerated from the delegate series below;
+      // table and label keys still use this generic series representation.
+      const keyCanPaint = (!chartExColumnSeries && chart.showLegend && seriesLegendVisible)
         || (chart.dataTable?.showKeys === true && chartDataTableFamilyIsPainted(chart.chartType)
           && chartHasCategories)
         || labelKeyVisible;
@@ -885,10 +891,10 @@ function collectChartMarkerImageFillResult(
           }
           for (let pointIndex = 0; pointIndex < pointCount; pointIndex++) {
             const value = series.values[pointIndex];
-            const bodyPointCanPaint = value != null
+            const bodyPointCanPaint = !chartExColumnSeries && value != null
               && Number.isFinite(value) && value !== 0;
             const pointKeyCanPaint = pointDrivenKeys && (
-              (chart.showLegend && legendEntryIsVisible(
+              (!chartExColumnSeries && chart.showLegend && legendEntryIsVisible(
                 legendRanges, deletedLegendEntries, seriesIndex, pointIndex,
               ))
               || (chart.dataTable?.showKeys === true
@@ -1044,6 +1050,23 @@ function collectChartMarkerImageFillResult(
     if (local !== undefined || series.color != null) continue;
     const linked = styleImageDecision(linkedStyle, styleIndex);
     if (linked) add(linked);
+  }
+  const columnPlan = planChartExColumnPaint(chart, (series, index) => {
+    // Same fill atom as chartExOutlinedOwner: the first outline-only owner
+    // suppresses its series body fill, while explicit dataPt paint can win.
+    if (index !== 0 || !chart.chartexParetoOutlineOwner) return series;
+    return {
+      ...series,
+      chartexStyle: { ...series.chartexStyle, fillHidden: true, fillPaintAuthored: true },
+    };
+  });
+  if (columnPlan?.kind === 'columns') {
+    visitChartExColumnPaintSites(columnPlan, (series, point, styleIndex) => {
+      add(chartExPointImageDecision(point, series, styleIndex));
+    });
+    visitChartExColumnLegendSites(columnPlan, (series, point, styleIndex) => {
+      add(chartExPointImageDecision(point, series, styleIndex));
+    });
   }
   if (chart.chartType === 'waterfall') {
     const series = chart.series[0];

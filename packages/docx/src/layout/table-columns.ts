@@ -183,6 +183,17 @@ function fixedWidths(input: TableColumnLayoutInput, columnCount: number): number
     return widths.map(() => targetPt / widths.length);
   }
   if (targetPt !== null && targetPt >= 0 && totalPt > EPSILON_PT) {
+    if (input.layout === 'autofit' && targetPt < totalPt) {
+      const cells = input.rows.flatMap((row) => row.cells);
+      if (cells.some((cell) => cell.noWrap === true && cell.preferredWidth?.kind === 'dxa')) {
+        // §17.4.29's dxa priority also applies to the initial tblW fit. Use
+        // authored track geometry before proportional shrink loses it, and
+        // reduce unprotected neighbours to their content minima first. Fixed
+        // layout and AutoFit without dxa noWrap retain the proportional pass.
+        const { minimums } = singleColumnBounds(input.rows, columnCount, totalPt);
+        return fitToAvailableWidth(widths, minimums, cells, targetPt, 0);
+      }
+    }
     const scale = targetPt / totalPt;
     return widths.map((width) => width * scale);
   }
@@ -387,6 +398,7 @@ export function measureTableIntrinsicWidths(
 function enforceContentConstraint(
   widths: number[],
   minimums: readonly number[],
+  transferFloors: readonly number[],
   maximums: readonly number[],
   cell: TableColumnCellConstraint,
 ): void {
@@ -405,17 +417,129 @@ function enforceContentConstraint(
   // Reclaim toward maximum, then expand the table only as far as its minimum.
   const transferredPt = shrinkOutsideSpan(
     widths,
-    minimums,
+    transferFloors,
     start,
     span,
     Math.max(0, maximumPt - currentPt),
   );
   growSpan(widths, start, span, transferredPt);
 
-  const afterTransferPt = spanSum(widths, start, span);
-  if (afterTransferPt < requiredPt - EPSILON_PT) {
-    growSpan(widths, start, span, requiredPt - afterTransferPt);
+  const afterPreferredTransferPt = spanSum(widths, start, span);
+  if (afterPreferredTransferPt < requiredPt - EPSILON_PT) {
+    // Once other tracks have reached their absolute minima, §17.4.29 allows
+    // reclaiming protected dxa width to satisfy this cell's own minimum, but
+    // not to enlarge it toward its optional maximum.
+    const minimumTransferPt = shrinkOutsideSpan(
+      widths, minimums, start, span, requiredPt - afterPreferredTransferPt,
+    );
+    growSpan(widths, start, span, minimumTransferPt);
+    const afterMinimumTransferPt = spanSum(widths, start, span);
+    if (afterMinimumTransferPt < requiredPt - EPSILON_PT) {
+      growSpan(widths, start, span, requiredPt - afterMinimumTransferPt);
+    }
   }
+}
+
+function noWrapPreferredFloors(
+  widths: readonly number[],
+  minimums: readonly number[],
+  cells: readonly TableColumnCellConstraint[],
+): number[] {
+  const floors = [...minimums];
+  for (const cell of cells) {
+    if (cell.noWrap !== true || cell.preferredWidth?.kind !== 'dxa') continue;
+    const start = Math.max(0, cell.columnStart);
+    const span = Math.max(1, Math.min(cell.columnSpan, widths.length - start));
+    const currentPt = spanSum(widths, start, span);
+    if (currentPt <= EPSILON_PT) continue;
+    // The authored preference survives earlier fitting; a shrunken track
+    // cannot redefine the protected width (§17.4.29).
+    const protectedPt = finiteNonNegative(cell.preferredWidth.value);
+    for (let column = start; column < start + span; column += 1) {
+      // §17.4.29 protects the span's aggregate preferred width. Retain its
+      // existing grid proportions because the rule does not assign that
+      // preference to individual tracks within a merged cell.
+      floors[column] = Math.max(
+        floors[column] ?? 0,
+        widths[column]! * protectedPt / currentPt,
+      );
+    }
+  }
+  return floors;
+}
+
+/** WORD_AUTOFIT_CONTENT_COLUMN_GROWTH (table-compatibility.ts): tblGrid is
+ * initial geometry (§17.4.48), not a content maximum. The measured two-track
+ * controls release an unpreferred short track's excess saved width. When both
+ * tracks grow, Word interpolates their content minima toward their maxima,
+ * rather than sharing deficits over the saved grid. Simultaneous growth with
+ * more tracks or spans is unmeasured and keeps the existing solver result. */
+function growUnpreferredColumns(
+  widths: number[],
+  minimums: readonly number[],
+  maximums: readonly number[],
+  cells: readonly TableColumnCellConstraint[],
+  rows: readonly TableColumnRowConstraint[],
+  availableWidthPt: number,
+): void {
+  // A saved track without a cell has no content maximum. In particular,
+  // §17.4.85/.86 wAfter/wBefore constrain omitted row intervals; treating
+  // their absent content as a zero maximum would discard the specified width.
+  // Only actual unpreferred cells establish eligibility. An omitted interval
+  // stays excluded even when another row has an auto cell in that track.
+  const eligible = widths.map(() => false);
+  for (const cell of cells) {
+    if (cell.preferredWidth === null && cell.columnSpan === 1
+      && cell.columnStart >= 0 && cell.columnStart < widths.length) {
+      eligible[cell.columnStart] = true;
+    }
+  }
+  for (const cell of cells) {
+    if (cell.preferredWidth === null && cell.columnSpan === 1) continue;
+    const start = Math.max(0, cell.columnStart);
+    const end = Math.min(widths.length, start + Math.max(1, cell.columnSpan));
+    for (let column = start; column < end; column += 1) eligible[column] = false;
+  }
+  // All omissions are prefixes/suffixes. Union them before walking tracks,
+  // avoiding a repeated full-grid scan for each row.
+  let beforeSpan = 0;
+  let afterSpan = 0;
+  for (const row of rows) {
+    beforeSpan = Math.max(beforeSpan, row.before?.columnSpan ?? 0);
+    afterSpan = Math.max(afterSpan, row.after?.columnSpan ?? 0);
+  }
+  for (let column = 0; column < Math.min(widths.length, beforeSpan); column += 1) eligible[column] = false;
+  for (let column = Math.max(0, widths.length - afterSpan); column < widths.length; column += 1) eligible[column] = false;
+  const twoUnpreferredTracks = widths.length === 2 && eligible.every(Boolean);
+  if (twoUnpreferredTracks) {
+    widths.forEach((width, column) => {
+      widths[column] = Math.min(width, maximums[column] ?? width);
+    });
+  }
+  const deficits = widths.map((width, column) => (eligible[column]
+    ? Math.max(0, (maximums[column] ?? 0) - width)
+    : 0));
+  const totalDeficitPt = deficits.reduce((sum, deficit) => sum + deficit, 0);
+  if (totalDeficitPt <= EPSILON_PT) return;
+  if (deficits.filter((deficit) => deficit > EPSILON_PT).length > 1) {
+    if (!twoUnpreferredTracks) return;
+    const minimumPt = minimums.reduce((sum, width) => sum + width, 0);
+    if (minimumPt > availableWidthPt) return;
+    const intervals = maximums.map((maximum, column) => Math.max(0, maximum - (minimums[column] ?? 0)));
+    const totalIntervalPt = intervals.reduce((sum, width) => sum + width, 0);
+    if (totalIntervalPt <= EPSILON_PT) return;
+    const fraction = Math.min(1, (availableWidthPt - minimumPt) / totalIntervalPt);
+    widths.forEach((_width, column) => {
+      widths[column] = (minimums[column] ?? 0) + fraction * intervals[column]!;
+    });
+    return;
+  }
+  const roomPt = availableWidthPt - widths.reduce((sum, width) => sum + width, 0);
+  if (roomPt <= EPSILON_PT) return;
+  const growPt = Math.min(roomPt, totalDeficitPt);
+  deficits.forEach((deficit, column) => {
+    widths[column] = (widths[column] ?? 0) + growPt * deficit / totalDeficitPt;
+  });
 }
 
 function fitToAvailableWidth(
@@ -423,19 +547,29 @@ function fitToAvailableWidth(
   minimums: readonly number[],
   cells: readonly TableColumnCellConstraint[],
   availableWidthPt: number,
+  outerMarginAllowancePt: number,
 ): number[] {
   const totalPt = widths.reduce((sum, width) => sum + width, 0);
   if (totalPt <= availableWidthPt + EPSILON_PT || totalPt <= EPSILON_PT) return widths;
 
   const result = [...widths];
-  const slack = result.map((width, column) => Math.max(0, width - (minimums[column] ?? 0)));
-  const totalSlackPt = slack.reduce((sum, value) => sum + value, 0);
-  const shrinkPt = Math.min(totalPt - availableWidthPt, totalSlackPt);
-  if (shrinkPt > EPSILON_PT && totalSlackPt > EPSILON_PT) {
+  // ECMA-376 §17.4.29: a noWrap dxa cell retains its preferred width while
+  // other cells can still shrink to their absolute content minima. A later
+  // pass may shrink that preference if those other minima exhaust the band.
+  const protectedFloors = noWrapPreferredFloors(result, minimums, cells);
+  const shrinkToFloors = (floors: readonly number[], requestedPt: number): number => {
+    const slack = result.map((width, column) => Math.max(0, width - (floors[column] ?? 0)));
+    const totalSlackPt = slack.reduce((sum, value) => sum + value, 0);
+    const shrinkPt = Math.min(requestedPt, totalSlackPt);
+    if (shrinkPt <= EPSILON_PT || totalSlackPt <= EPSILON_PT) return 0;
     result.forEach((_width, column) => {
       result[column] -= shrinkPt * ((slack[column] ?? 0) / totalSlackPt);
     });
-  }
+    return shrinkPt;
+  };
+  const requestedShrinkPt = totalPt - availableWidthPt;
+  const protectedShrinkPt = shrinkToFloors(protectedFloors, requestedShrinkPt);
+  shrinkToFloors(minimums, requestedShrinkPt - protectedShrinkPt);
 
   // A proportional column shrink can violate an otherwise satisfiable minimum
   // on a spanning cell even though another track still has slack. Restore each
@@ -447,7 +581,10 @@ function fitToAvailableWidth(
     const span = Math.max(1, Math.min(cell.columnSpan, result.length - start));
     const deficitPt = finiteNonNegative(cell.minContentWidthPt) - spanSum(result, start, span);
     if (deficitPt <= EPSILON_PT) continue;
-    const transferredPt = shrinkOutsideSpan(result, minimums, start, span, deficitPt);
+    const preferredTransferPt = shrinkOutsideSpan(result, protectedFloors, start, span, deficitPt);
+    const transferredPt = preferredTransferPt + shrinkOutsideSpan(
+      result, minimums, start, span, deficitPt - preferredTransferPt,
+    );
     growSpan(result, start, span, transferredPt);
     if (transferredPt < deficitPt - EPSILON_PT) {
       growSpan(result, start, span, deficitPt - transferredPt);
@@ -457,6 +594,41 @@ function fitToAvailableWidth(
   const afterSlackPt = result.reduce((sum, width) => sum + width, 0);
   if (afterSlackPt <= availableWidthPt + EPSILON_PT || afterSlackPt <= EPSILON_PT) {
     return cleanWidths(result);
+  }
+  const autoNoWrapCell = cells.find((cell) => cell.noWrap === true
+    && cell.preferredWidth === null && cell.columnSpan === 1);
+  if (
+    outerMarginAllowancePt > EPSILON_PT
+    && (autoNoWrapCell?.minContentWidthPt ?? 0)
+      > availableWidthPt - outerMarginAllowancePt + EPSILON_PT
+    && result.length === 2
+    && cells.length === 2
+    && cells.every((cell) => cell.columnSpan === 1)
+    && cells.some((cell) => cell.columnStart === 0)
+    && cells.some((cell) => cell.columnStart === 1)
+    && autoNoWrapCell
+    && cells.filter((cell) => cell.noWrap === true).length === 1
+  ) {
+    // WORD_AUTOFIT_NOWRAP_AUTO_FORCED_FIT (table-compatibility.ts): scale
+    // content-only widths against the text band, then distribute the outer
+    // margin allowance according to the OTHER cell's content width. §17.18.87
+    // does not define the forced-break distribution; the recorded evidence in
+    // that rule is limited to this two-cell case.
+    const margins = [0, 0];
+    for (const cell of cells) margins[cell.columnStart] = finiteNonNegative(cell.horizontalMarginsPt);
+    const contentWidths = result.map((width, column) => Math.max(0, width - (margins[column] ?? 0)));
+    const contentTotalPt = contentWidths.reduce((sum, width) => sum + width, 0);
+    if (contentTotalPt > EPSILON_PT) {
+      const contentBandPt = Math.max(0, availableWidthPt - outerMarginAllowancePt);
+      const scaled = contentWidths.map((width) => width * contentBandPt / contentTotalPt);
+      const noWrapColumn = autoNoWrapCell.columnStart;
+      const ordinaryColumn = 1 - noWrapColumn;
+      scaled[noWrapColumn] += outerMarginAllowancePt
+        * (contentWidths[ordinaryColumn] ?? 0) / contentTotalPt;
+      scaled[ordinaryColumn] += outerMarginAllowancePt
+        * (contentWidths[noWrapColumn] ?? 0) / contentTotalPt;
+      return cleanWidths(scaled);
+    }
   }
   // The jointly retained minima do not fit, so §17.18.87 now permits forced
   // line breaks. It does not prescribe the final track distribution; reuse the
@@ -500,14 +672,19 @@ function solveTableColumnWidths(input: TableColumnLayoutInput): readonly number[
   const cells = input.rows.flatMap((row) => row.cells);
   // Single-column min/max bounds are established before spanning constraints.
   cells.sort((left, right) => left.columnSpan - right.columnSpan);
+  const transferFloors = noWrapPreferredFloors(widths, minimums, cells);
   for (const cell of cells) {
-    enforceContentConstraint(widths, minimums, maximums, cell);
+    enforceContentConstraint(widths, minimums, transferFloors, maximums, cell);
+  }
+  if (input.growUnpreferredColumns === true && input.tablePreferredWidthPt === null) {
+    growUnpreferredColumns(widths, minimums, maximums, cells, input.rows, finiteNonNegative(input.availableWidthPt));
   }
   return Object.freeze(fitToAvailableWidth(
     widths,
     minimums,
     cells,
     finiteNonNegative(input.availableWidthPt),
+    finiteNonNegative(input.outerMarginAllowancePt),
   ));
 }
 

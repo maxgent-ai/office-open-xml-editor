@@ -117,9 +117,9 @@ fn walk(
 }
 
 /// Entry point from the graphicFrame walker. `dm_rid` is the `<dgm:relIds r:dm>`
-/// value; `rels` are the *referencing part's* relationships and `part_dir` that
+/// value; `rels` are the *referencing part's* relationships and `source_part` that
 /// part's directory (e.g. `ppt/slides`), so `rels[dm_rid]` resolved against
-/// `part_dir` is the data part (ECMA-376 §21.4.2.22). Reads the data part,
+/// `source_part` is the data part (ECMA-376 §21.4.2.22). Reads the data part,
 /// emits the M-stage content list, or the S-stage placeholder when the data
 /// model is readable but has no displayable text. Emits nothing (returns
 /// `false`) when the relationship is missing or the data part cannot be
@@ -130,7 +130,7 @@ fn walk(
 pub(crate) fn emit_smartart_fallback(
     dm_rid: &str,
     gf_xfrm: &Transform,
-    part_dir: &str,
+    source_part: &str,
     rels: &HashMap<String, String>,
     theme: &HashMap<String, String>,
     zip: &mut PptxZip,
@@ -139,7 +139,7 @@ pub(crate) fn emit_smartart_fallback(
     let Some(data_target) = rels.get(dm_rid) else {
         return false;
     };
-    let data_path = resolve_path(part_dir, data_target);
+    let data_path = resolve_path(source_part, data_target);
     let Ok(data_xml) = read_zip_str(zip, &data_path) else {
         return false;
     };
@@ -275,6 +275,7 @@ pub(crate) fn emit_smartart_fallback(
             spc_col: 0,
             rtl_col: false,
             spc_first_last_para: false,
+            anchor_ctr: false,
             compat_ln_spc: None,
             text_warp: None,
         },
@@ -320,6 +321,7 @@ fn append_point_paragraphs(
         None,
         None,
         None,
+        &Default::default(),
         None,
         None, // inherited_font_algn
         Default::default(),
@@ -377,6 +379,7 @@ fn emit_placeholder(gf_xfrm: &Transform, out: &mut Vec<SlideElement>) -> bool {
         spc_col: 0,
         rtl_col: false,
         spc_first_last_para: false,
+        anchor_ctr: false,
         compat_ln_spc: None,
         text_warp: None,
     };
@@ -469,7 +472,6 @@ fn default_paragraph() -> Paragraph {
         font_algn: None,
         runs: Vec::new(),
         end_run_properties: None,
-        end_face_authored: false,
     }
 }
 
@@ -495,6 +497,8 @@ fn default_run() -> TextRunData {
         font_family_ea: None,
         font_family_cs: None,
         font_family_sym: None,
+        lang: None,
+        alt_lang: None,
         baseline: None,
         caps: None,
         letter_spacing: None,
@@ -662,7 +666,7 @@ mod tests {
         let produced = emit_smartart_fallback(
             "rId3",
             &frame(),
-            "ppt/slides",
+            "ppt/slides/slide1.xml",
             &rels,
             &theme,
             &mut zip,
@@ -726,7 +730,7 @@ mod tests {
         emit_smartart_fallback(
             "rId3",
             &frame(),
-            "ppt/slides",
+            "ppt/slides/slide1.xml",
             &rels,
             &theme,
             &mut zip,
@@ -778,7 +782,7 @@ mod tests {
         emit_smartart_fallback(
             "rId3",
             &frame(),
-            "ppt/slides",
+            "ppt/slides/slide1.xml",
             &rels,
             &theme,
             &mut zip,
@@ -816,7 +820,7 @@ mod tests {
         emit_smartart_fallback(
             "rId3",
             &frame(),
-            "ppt/slides",
+            "ppt/slides/slide1.xml",
             &rels,
             &theme,
             &mut zip,
@@ -857,7 +861,7 @@ mod tests {
         let produced = emit_smartart_fallback(
             "rId3",
             &frame(),
-            "ppt/slides",
+            "ppt/slides/slide1.xml",
             &rels,
             &theme,
             &mut zip,
@@ -887,7 +891,7 @@ mod tests {
         let produced = emit_smartart_fallback(
             "rId3",
             &frame(),
-            "ppt/slides",
+            "ppt/slides/slide1.xml",
             &rels,
             &theme,
             &mut zip,

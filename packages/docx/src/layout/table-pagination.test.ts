@@ -17,6 +17,7 @@ import type {
   TableLayoutInput,
   TableRowLayoutInput,
 } from './types.js';
+import { gapParagraph } from '../test-support/gap-paragraph.test-support.js';
 import { layoutParagraph } from './paragraph.js';
 import { validateFloatingTableRegistryDelta } from './floating-table-transaction.js';
 
@@ -235,6 +236,26 @@ describe('retained table pagination', () => {
     vi.restoreAllMocks();
   });
 
+  it('splits a cell only after every gap of its admitted physical line', () => {
+    const p = gapParagraph().paragraph;
+    const result = take(acquisition([row(0, 30, { paragraph: p })]), 10);
+    const cell = result.fragment?.rows[0]?.cells[0];
+    expect(cell?.contentRanges).toEqual([{ kind: 'paragraph', blockIndex: 0, lineStart: 0, lineEnd: 1 }]);
+    const retained = cell?.blocks[0]?.layout;
+    if (retained?.kind !== 'paragraph') throw new Error('missing cell paragraph');
+    expect(retained.lines[0]?.placements).toHaveLength(2);
+    expect(retained.advancePt).toBe(10);
+  });
+
+  it('applies cell widow control to physical lines rather than gap count', () => {
+    const p = gapParagraph().paragraph;
+    const original = row(0, 30, { paragraph: p });
+    const source = acquisition([{ ...original, cells: [{ ...original.cells[0]!,
+      blocks: [{ layout: p, sourceBlockIndex: 0, widowControl: true }],
+    }] }]);
+    expect(take(source, 20, startTableFragmentCursor(), { freshPageHeightPt: 30 }).requiresFreshPage).toBe(true);
+  });
+
   it('charges a completed partial row from a bounded row window, not the whole suffix', () => {
     const original = tableModule.layoutTable;
     const completedPartialRowCounts: number[] = [];
@@ -350,6 +371,21 @@ describe('retained table pagination', () => {
       // The column-0 interval ends at row 1, but the column-1 interval opening
       // at row 1 reaches row 3, so the window must extend to row 3.
       expect(completedPartialRowWindowEnd(rows[0]!, rows, 0)).toBe(3);
+    });
+
+    it('covers the interval a projected segment-opening continuation opens', () => {
+      // A cell-owner segment whose first own row (logical row 1) opens with a
+      // continuation: in the window's grid it is a projected empty owner
+      // (table.ts projectedMergeRole) reaching the continuations below it.
+      const rows = [
+        mergedRow(1, [mergedCell(1, 0, 'none'), mergedCell(1, 1, 'continue')]),
+        mergedRow(2, [mergedCell(2, 0, 'none'), mergedCell(2, 1, 'continue')]),
+        mergedRow(3, [mergedCell(3, 0, 'none'), mergedCell(3, 1, 'continue')]),
+        mergedRow(4, [mergedCell(4, 0, 'none'), mergedCell(4, 1, 'none')]),
+      ];
+      expect(completedPartialRowWindowEnd(rows[0]!, rows, 0, 1)).toBe(2);
+      // Without the projection fact the same continuations open nothing.
+      expect(completedPartialRowWindowEnd(rows[0]!, rows, 0)).toBe(0);
     });
   });
 

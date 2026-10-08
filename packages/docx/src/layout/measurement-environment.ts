@@ -13,7 +13,7 @@ import {
 } from '../paragraph-measure.js';
 import type { ParagraphLayoutContext, StoryContext } from '../layout-context.js';
 import type { BodyMeasurementContext } from './acquisition-context.js';
-import { writingModeFromTextDirection } from './coordinate-space.js';
+import { sectionWritingMode } from './coordinate-space.js';
 
 function kashidaLevelOf(alignment: string | null | undefined): KashidaLevel | null {
   if (alignment === 'lowKashida') return 'low';
@@ -80,7 +80,7 @@ export function paragraphMeasurementEnvironment(
     noteNumbers: state.noteNumbers,
     noteNumbering: state.noteNumbering,
     noteReferenceNumber: state.noteReferenceNumber,
-    pageWritingMode: writingModeFromTextDirection(state.sectionLayout.textDirection),
+    pageWritingMode: sectionWritingMode(state.sectionLayout),
     // §17.6.20 btLr uses the horizontal line model rotated wholesale.
     verticalCJK: state.verticalCJK && !state.verticalAllRotated,
     verticalPageFrame: state.verticalCJK === true,
@@ -91,6 +91,9 @@ export function paragraphMeasurementEnvironment(
     characterSpacingControl: state.layoutSettings.characterSpacingControl,
     lineWrapLikeWord6: state.layoutSettings.compat.lineWrapLikeWord6,
     enableOpenTypeFeatures: state.layoutSettings.compat.enableOpenTypeFeatures,
+    ...(state.layoutSettings.compat.compatibilityMode === undefined
+      ? {}
+      : { compatibilityMode: state.layoutSettings.compat.compatibilityMode }),
     resolvedLocalFonts: state.resolvedLocalFonts,
     layoutServices: state.layoutServices,
     verticalGlyphMeasurement: state.verticalGlyphMeasurement,
@@ -104,6 +107,7 @@ export function segmentEnvironmentOf(
 ): LineLayoutEnvironment {
   if (!state.verticalAllRotated
     && state.layoutSettings.characterSpacingControl === undefined
+    && state.layoutSettings.compat.compatibilityMode === undefined
     && !state.layoutSettings.compat.lineWrapLikeWord6
     && !state.layoutSettings.compat.enableOpenTypeFeatures
     && !state.layoutSettings.compat.balanceSingleByteDoubleByteWidth) return state;
@@ -115,6 +119,9 @@ export function segmentEnvironmentOf(
     enableOpenTypeFeatures: state.layoutSettings.compat.enableOpenTypeFeatures,
     balanceSingleByteDoubleByteWidth:
       state.layoutSettings.compat.balanceSingleByteDoubleByteWidth,
+    ...(state.layoutSettings.compat.compatibilityMode === undefined
+      ? {}
+      : { compatibilityMode: state.layoutSettings.compat.compatibilityMode }),
   };
 }
 

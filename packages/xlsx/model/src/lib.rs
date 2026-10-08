@@ -1,6 +1,7 @@
 use serde::Serialize;
 use std::collections::BTreeMap;
 
+mod retained;
 pub mod style_presets;
 
 #[derive(Debug, Serialize, Default)]
@@ -141,6 +142,11 @@ pub struct Worksheet {
     /// `defaultColWidth`; the renderer derives implicit column pixels from it.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub base_col_width: Option<u32>,
+    /// True only when `<sheetFormatPr>` is absent: `default_col_width` is then
+    /// the library's UI-character fallback (padding excluded, §18.3.1.13),
+    /// not a stored width. Omitted when false.
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+    pub default_col_width_is_ui: bool,
     pub default_row_height: f64,
     /// `<sheetFormatPr customHeight>` (§18.3.1.81): the sheet-wide default row
     /// height was manually set. Omitted when false, the schema default.
@@ -286,6 +292,7 @@ impl Worksheet {
             col_hidden: BTreeMap::new(),
             default_col_width: 0.0,
             base_col_width: None,
+            default_col_width_is_ui: false,
             default_row_height: 0.0,
             default_row_height_custom: false,
             merge_cells: Vec::new(),
@@ -350,7 +357,7 @@ impl Worksheet {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct PivotTableMetadata {
     pub name: String,
@@ -390,7 +397,7 @@ pub struct PivotTableMetadata {
 }
 
 /// A PivotTable style as applied to one PivotTable (§18.10.1.97, §18.8.40).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct PivotTableStyle {
     pub name: String,
@@ -404,7 +411,7 @@ pub struct PivotTableStyle {
 }
 
 /// One `tableStyleElement` of a PivotTable style.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct PivotTableStyleElement {
     /// ECMA-376 §18.18.77 ST_TableStyleType, e.g. `firstRowSubheading`.
@@ -415,7 +422,7 @@ pub struct PivotTableStyleElement {
 }
 
 /// One `i` of `rowItems`/`colItems` (§18.10.1.44).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct PivotAxisItem {
     /// ECMA-376 §18.18.43 ST_ItemType (`data`, `default`, `sum`, …, `grand`,
@@ -425,7 +432,7 @@ pub struct PivotAxisItem {
     pub depth: u32,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct PivotLocation {
     #[serde(flatten)]
@@ -435,7 +442,7 @@ pub struct PivotLocation {
     pub first_data_col: u32,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct PivotPageField {
     /// ECMA-376 §18.10.1.66 `CT_PageField@fld` is signed.
@@ -446,7 +453,7 @@ pub struct PivotPageField {
     pub name: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct PivotDataField {
     /// ECMA-376 §18.10.1.16 `CT_DataField@fld` is unsigned.
@@ -459,7 +466,7 @@ pub struct PivotDataField {
     pub name: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum PivotCacheSource {
     Worksheet {
@@ -477,14 +484,14 @@ pub enum PivotCacheSource {
     Scenario,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(tag = "state", rename_all = "camelCase")]
 pub enum PivotMetadataStatus {
     Complete,
     Partial { reasons: Vec<PivotPartialReason> },
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum PivotPartialReason {
     MissingCacheRelationship,
@@ -602,7 +609,7 @@ pub struct Sparkline {
 
 /// Excel Table metadata (ECMA-376 §18.5 `<table>`). The renderer overlays a
 /// built-in style on top of the cell styles inside `range`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct TableInfo {
     /// Inclusive table area including the header row.
@@ -747,7 +754,7 @@ pub struct XlsxCommentReply {
 /// constraint class ("list", "whole", "decimal", "date", "time", "textLength",
 /// "custom"). `operator` qualifies it ("between", "notBetween", "equal",
 /// "notEqual", "lessThan", …). `formula1` / `formula2` are the rule operands.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct DataValidation {
     /// Affected cell ranges, written verbatim from `@sqref` (space-separated).
@@ -787,7 +794,7 @@ pub struct DefinedName {
 
 /// A chart anchored to a rectangular range of cells (ECMA-376 §20.5 twoCellAnchor).
 /// Offsets are EMU (914400 EMU = 1 inch, 9525 EMU = 1 px @ 96 DPI).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ChartAnchor {
     /// Document-order byte position of the `<xdr:graphicFrame>` in its drawing
@@ -807,11 +814,26 @@ pub struct ChartAnchor {
     pub chart: ooxml_common::chart::ChartModel,
 }
 
+/// Which DrawingML anchor element (ECMA-376 Part 1 §20.5.2) carried a drawing
+/// object. This is a normative acquisition fact recorded from the actual XML
+/// element name and never inferred from marker or extent values. `None` on a
+/// model means the producer did not record it (older models, VML/OLE previews,
+/// legacy binary conversion), and consumers keep their untagged behaviour.
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+pub enum DrawingAnchorTag {
+    /// `<xdr:oneCellAnchor>` (§20.5.2.24): `from` + anchor-level `<xdr:ext>`.
+    #[serde(rename = "oneCellAnchor")]
+    OneCellAnchor,
+    /// `<xdr:twoCellAnchor>` (§20.5.2.33): `from` + `to` (+ `editAs`).
+    #[serde(rename = "twoCellAnchor")]
+    TwoCellAnchor,
+}
+
 /// A grouped-shape anchor (ECMA-376 §20.5.2.17, `<xdr:grpSp>` inside a
 /// `<xdr:twoCellAnchor>`). Leaf shape elements (`<xdr:sp>`) from any nesting
 /// level are flattened into `shapes` with normalized coordinates so the
 /// renderer only needs to scale to the anchor rect.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ShapeAnchor {
     pub from_col: u32,
@@ -822,23 +844,34 @@ pub struct ShapeAnchor {
     pub to_col_off: i64,
     pub to_row: u32,
     pub to_row_off: i64,
-    /// `twoCellAnchor@editAs` (ECMA-376 §20.5.2.33). With `"oneCell"` the
-    /// renderer uses `native_ext_cx/cy` for the on-sheet size instead of the
-    /// from/to-derived rect (Excel's "Move but don't size with cells").
+    /// `twoCellAnchor@editAs` (ECMA-376 §20.5.2.33; normative fact). For a
+    /// `oneCellAnchor` the parser stores the compatibility value `"oneCell"`.
+    /// Library policy: only untagged models size from `native_ext_*`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub edit_as: Option<String>,
     /// Group's `<xdr:grpSpPr><a:xfrm><a:ext cx cy>` (or `<xdr:spPr><a:xfrm>`
-    /// for stand-alone sp/pic) in EMU. The saved on-sheet size, used as the
-    /// authoritative extent when `editAs == "oneCell"`. 0 = unavailable.
+    /// for stand-alone sp/pic) in EMU: the raw child/group transform extent,
+    /// kept unchanged. Used for sizing only by the untagged compatibility
+    /// policy. 0 = unavailable.
     pub native_ext_cx: i64,
     pub native_ext_cy: i64,
+    /// XML anchor element kind (normative fact). `None` = not recorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anchor_tag: Option<DrawingAnchorTag>,
+    /// `<xdr:oneCellAnchor><xdr:ext cx cy>` in EMU (ECMA-376 §20.5.2.24): the
+    /// anchor-level display size, distinct from `native_ext_*`. `None` for
+    /// twoCellAnchor or a missing or unparsable attribute.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anchor_ext_cx: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anchor_ext_cy: Option<i64>,
     pub shapes: Vec<ShapeInfo>,
 }
 
 /// A leaf shape extracted from a grpSp/sp tree. Position/size are normalized
 /// to [0,1] relative to the top-level grpSp extent (which itself maps to the
 /// anchor rect).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ShapeInfo {
     /// Document-order byte position of this leaf in the drawing part.
@@ -891,7 +924,7 @@ pub struct ShapeInfo {
     pub text: Option<ShapeText>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(tag = "fillType", rename_all = "camelCase")]
 pub enum ShapeStrokeFill {
     Gradient {
@@ -918,7 +951,7 @@ pub enum ShapeStrokeFill {
     },
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(tag = "fillType", rename_all = "camelCase")]
 pub enum ShapeFill {
     Solid {
@@ -948,14 +981,14 @@ pub enum ShapeFill {
     },
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ShapeLineDashSegment {
     pub dash: f64,
     pub space: f64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ShapeLineEnd {
     pub r#type: String,
@@ -970,9 +1003,14 @@ pub use ooxml_common::text::SpaceLine;
 
 /// Text body inside a shape (`<xdr:txBody>`, ECMA-376 §20.1.2.2). Holds
 /// the paragraphs plus body-level formatting (`<a:bodyPr>`).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ShapeText {
+    /// DrawingML direction, ECMA-376 §20.1.10.83. Preserve it for host layout.
+    pub vert: String,
+    /// ECMA-376 §21.1.2.1.1 body-axis alignment and paragraph-edge spacing.
+    pub anchor_ctr: bool,
+    pub spc_first_last_para: bool,
     /// `<a:bodyPr@anchor>` — vertical alignment of the text block within the
     /// shape rect. `t` (top, default), `ctr` (middle), `b` (bottom),
     /// `just`/`dist` (treated as top).
@@ -1007,7 +1045,7 @@ pub struct ShapeText {
     pub paragraphs: Vec<ShapeParagraph>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ShapeParagraph {
     /// `<a:pPr@algn>` — `l` (default), `ctr`, `r`, `just`, `dist`.
@@ -1053,7 +1091,7 @@ pub struct ShapeParagraph {
     pub runs: Vec<ShapeTextRun>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ShapeTabStop {
     pub pos: i64,
@@ -1064,7 +1102,7 @@ pub struct ShapeTabStop {
 /// shape) so a run is either styled text, a soft line break, or an OMML
 /// equation. Excel stores "Insert > Equation" as OMML inside the shared
 /// DrawingML `<xdr:txBody>` grammar (ECMA-376 §22.1), exactly like PowerPoint.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum ShapeTextRun {
     /// The enum-level `rename_all = "camelCase"` (tag = "type") renames only the
@@ -1083,6 +1121,9 @@ pub enum ShapeTextRun {
         /// field is already converted). 0 means "inherit from default" →
         /// renderer falls back to its own default.
         size: f64,
+        /// `<a:rPr@spc>` in points, ECMA-376 §20.1.10.74.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        spacing: Option<f64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         color: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -1121,7 +1162,7 @@ pub enum ShapeTextRun {
     },
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum ShapeGeom {
     /// Preset geometry (rect, ellipse, roundRect, triangle, etc.).
@@ -1169,7 +1210,7 @@ pub enum ShapeGeom {
     },
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct PathInfo {
     /// Path's own coordinate system width.
@@ -1192,7 +1233,7 @@ fn is_true(value: &bool) -> bool {
     *value
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(tag = "op", rename_all = "camelCase")]
 pub enum PathCmd {
     MoveTo {
@@ -1309,7 +1350,7 @@ pub struct SlicerElementStyle {
 /// An image anchored to a rectangular range of cells
 /// (ECMA-376 §20.5, `<xdr:twoCellAnchor>`). Offsets are EMU (English
 /// Metric Unit): 914400 EMU = 1 inch, and 9525 EMU = 1 pixel at 96 DPI.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ImageAnchor {
     /// Document-order byte position of the `<xdr:pic>` in its drawing part.
@@ -1323,14 +1364,20 @@ pub struct ImageAnchor {
     pub to_row: u32,
     pub to_row_off: i64,
     /// `twoCellAnchor@editAs` (ECMA-376 §20.5.2.33). Possible values: `"twoCell"`
-    /// (default), `"oneCell"`, `"absolute"`. With `"oneCell"`, Excel preserves
-    /// the picture's native EMU size (below) when cells are resized; with
-    /// `"twoCell"`, the from/to anchor rect IS the rendered size.
+    /// (default), `"oneCell"`, `"absolute"`. This determines behavior under
+    /// later cell edits; the initial `twoCellAnchor` rectangle is `from`/`to`
+    /// regardless of this value (ECMA-376 Part 1 §20.5.3.2).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub edit_as: Option<String>,
-    /// `<xdr:pic><xdr:spPr><a:xfrm><a:ext cx cy>` in EMU. The picture's saved
-    /// size at insert/edit time. Used as the authoritative size when
-    /// `editAs == "oneCell"`. 0 = absent / use from/to rect.
+    /// XML anchor element kind (normative fact; OOXML pictures parsed here are
+    /// always `twoCellAnchor`). `None` = not recorded (old models, OLE/VML
+    /// previews, legacy binary conversion).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anchor_tag: Option<DrawingAnchorTag>,
+    /// `<xdr:pic><xdr:spPr><a:xfrm><a:ext cx cy>` in EMU: the raw child
+    /// transform extent (normative fact). Library policy: only untagged models
+    /// with `editAs == "oneCell"` size from it. A tagged `twoCellAnchor` takes
+    /// its initial display rect from `from`/`to`. 0 = absent.
     pub native_ext_cx: i64,
     pub native_ext_cy: i64,
     /// Non-identity `<a:xfrm>` picture transform (ECMA-376 Part 1,
@@ -1386,7 +1433,7 @@ pub use ooxml_common::blip::SrcRect;
 /// and xlsx parsers (see `ooxml_common::blip`).
 pub use ooxml_common::blip::Duotone;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct CellRange {
     pub top: u32,
@@ -1395,7 +1442,7 @@ pub struct CellRange {
     pub right: u32,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ConditionalFormat {
     pub sqref: Vec<CellRange>,
@@ -1421,7 +1468,7 @@ pub struct ConditionalFormat {
 /// those rule types (observed in a PDF export: a colorScale or dataBar with
 /// formula `0` drew nothing and did not stop a lower rule; formula `1` drew
 /// the scale and stopped it).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase", tag = "type")]
 pub enum CfRule {
     #[serde(rename_all = "camelCase")]
@@ -1529,14 +1576,14 @@ pub enum CfRule {
     },
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct CfIcon {
     pub icon_set: String,
     pub icon_id: u32,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct CfStop {
     pub kind: String,
@@ -1544,14 +1591,14 @@ pub struct CfStop {
     pub color: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct CfValue {
     pub kind: String,
     pub value: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Hyperlink {
     pub col: u32,

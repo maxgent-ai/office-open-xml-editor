@@ -6,12 +6,15 @@ import {
   PullSessionHost,
   PullSessionHostCoordinator,
   serializeWorkerError,
+  DEFAULT_XLSX_WORKSHEET_POLICY,
+  type NormalizedXlsxWorksheetPolicy,
   type PullSessionCommand,
   type PullSessionIdentity,
   type PullSessionResponse,
 } from '@silurus/ooxml-core/worker';
 import type { Row, Worksheet } from './types.js';
 import { decodeWorksheetPullChunk } from './worksheet-pull-codec.js';
+import { bindWorksheetPolicy } from './worksheet-policy-context.js';
 import {
   addWorksheetUsage,
   assertWorksheetJsonBytes,
@@ -66,6 +69,8 @@ export class WorksheetPullWorker {
       preview: (sheetIndex: number, worksheet: Worksheet) => void;
       stop: (sheetIndex: number) => void;
     },
+    private readonly worksheetPolicy: () => NormalizedXlsxWorksheetPolicy =
+      () => DEFAULT_XLSX_WORKSHEET_POLICY,
   ) {}
 
   /** Register synchronously before a worker handler's first await. */
@@ -111,6 +116,9 @@ export class WorksheetPullWorker {
     ) {
       throw new Error('worksheet pull session open reservation is stale or missing');
     }
+    // Capture the policy synchronously, before any queued work, so a later
+    // document change cannot alter the limits this session was opened under.
+    const policy = this.worksheetPolicy();
     let completeOperation!: () => void;
     const completion = new Promise<void>((resolve) => {
       completeOperation = resolve;
@@ -137,15 +145,21 @@ export class WorksheetPullWorker {
                 if (decoded.kind === 'preview') {
                   if (decoded.worksheet) {
                     decoded.worksheet.rows = rows;
+                    bindWorksheetPolicy(decoded.worksheet, policy);
                     this.provisional?.preview(sheetIndex, decoded.worksheet);
                   }
                 } else if (decoded.kind === 'rows') {
-                  const next = addWorksheetUsage(modelUsage, measureRows(decoded.rows));
+                  const next = addWorksheetUsage(
+                    modelUsage,
+                    measureRows(decoded.rows, policy),
+                    policy,
+                  );
                   assertWorksheetModelUsage(
                     next,
                     'get-worksheet-worker',
                     undefined,
                     this.readResourceUsage(),
+                    policy,
                   );
                   rows.push(...decoded.rows);
                   modelUsage = next;
@@ -174,20 +188,23 @@ export class WorksheetPullWorker {
                 const retainedModelUsage = terminal.parseError
                   ? { rows: 0, cells: 0, ownedUtf8Bytes: 0 }
                   : modelUsage;
-                const measured = completeWorksheetUsage(terminal, retainedModelUsage);
+                const measured = completeWorksheetUsage(terminal, retainedModelUsage, policy);
                 const resourceUsage = this.readResourceUsage();
                 assertWorksheetModelUsage(
                   measured,
                   'get-worksheet-worker',
                   undefined,
                   resourceUsage,
+                  policy,
                 );
                 assertWorksheetJsonBytes(
                   measured.jsonBytes,
                   'get-worksheet-worker',
                   undefined,
                   resourceUsage,
+                  policy,
                 );
+                bindWorksheetPolicy(terminal, policy);
                 const accepted = this.acceptWorksheet(
                   sheetIndex,
                   terminal,

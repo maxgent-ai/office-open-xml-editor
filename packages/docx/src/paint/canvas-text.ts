@@ -219,12 +219,13 @@ function paintParagraphContents(node: ParagraphLayout, context: CanvasPaintConte
   }
   if (node.shading) {
     ctx.fillStyle = node.shading.color;
-    ctx.fillRect(
-      node.inkBounds.xPt,
-      node.inkBounds.yPt,
-      node.inkBounds.widthPt,
-      node.inkBounds.heightPt,
-    );
+    const boxes = node.lines.some(line => line.wrapBounds || line.wrapFragments)
+      ? node.lines.flatMap(line => line.wrapFragments ?? [line.wrapBounds ?? {
+          xPt: node.inkBounds.xPt, yPt: line.bounds.yPt,
+          widthPt: node.inkBounds.widthPt, heightPt: line.bounds.heightPt,
+        }])
+      : [node.paragraphMark?.wrapBounds ?? node.inkBounds];
+    for (const box of boxes) ctx.fillRect(box.xPt, box.yPt, box.widthPt, box.heightPt);
   }
   for (const line of node.lines) {
     for (const rule of line.barTabRules ?? []) {
@@ -446,19 +447,14 @@ export function paintTextBoxLayout(node: TextBoxLayout, context: CanvasPaintCont
     || node.transform.f !== 0;
   const transformFrame = canvasPaintFrame(context.ctx, () => {
     if (hasTransform) {
-      if (node.verticalMode) {
-        context.ctx.translate(node.transform.e, node.transform.f);
-        context.ctx.rotate(node.verticalMode === 'vert270' ? -Math.PI / 2 : Math.PI / 2);
-      } else {
-        context.ctx.transform(
-          node.transform.a,
-          node.transform.b,
-          node.transform.c,
-          node.transform.d,
-          node.transform.e,
-          node.transform.f,
-        );
-      }
+      context.ctx.transform(
+        node.transform.a,
+        node.transform.b,
+        node.transform.c,
+        node.transform.d,
+        node.transform.e,
+        node.transform.f,
+      );
     }
   });
   const clipFrame = node.clipBounds ? canvasPaintFrame(context.ctx, () => {
@@ -474,9 +470,12 @@ export function paintTextBoxLayout(node: TextBoxLayout, context: CanvasPaintCont
   const documentDefaultTextColor = context.documentDefaultTextColor
     ?? context.defaultTextColor
     ?? '#000000';
+  // The story is its own coordinate root (layout/text-index.ts visitTextBox):
+  // translations that placed the box's paragraph are not undone inside it.
   const storyContext: CanvasPaintContext = {
     ...context,
     pointToCss,
+    layoutTranslationPt: { xPt: 0, yPt: 0 },
     documentDefaultTextColor,
     defaultTextColor: node.defaultTextColor ?? documentDefaultTextColor,
     ...(node.verticalMode ? { textBoxVerticalMode: node.verticalMode } : {}),

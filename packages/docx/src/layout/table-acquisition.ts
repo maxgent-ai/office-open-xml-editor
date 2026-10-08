@@ -12,7 +12,14 @@ import {
 import type { ParagraphBorderEdges } from './paragraph-border-adjacency.js';
 import { layoutTable, measureTableCellBlockFlowHeightPt } from './table.js';
 import { tableCellHorizontalSpacingInsets } from './table-columns.js';
+import { unmeasuredTableMemberDecision, type LogicalTableDecision, type TableMemberDecision } from './table-layout-decision.js';
 import { snapshotPlainData } from './plain-data.js';
+import {
+  leadingCellOwnerCarrier,
+  tableRowsElectCarriers,
+  CELL_OWNED_TABLE,
+  type TableOwnerContext,
+} from './table-owner-runs.js';
 import { eastAsianUprightPaintOps } from './vertical-glyph-orientation.js';
 import type {
   FloatingTablePositionInput,
@@ -22,19 +29,22 @@ import type {
   PaintNode,
   ParagraphLayout,
   TableBorderInput,
+  TableCellBlockInput,
   TableCellVerticalMode,
   TableEdgeInputs,
   TableFormatInput,
   TableLayout,
   TableLayoutInput,
+  TableRowLayoutInput,
   SourceRef,
   WrapExclusion,
 } from './types.js';
 
 export interface RetainedTableAcquisitionDependencies<State> {
+  tableDecision?(table: TableLayoutSource, contentWidthPt: number, state: State): LogicalTableDecision;
   layoutServices(state: State): LayoutServices | undefined;
   tableFormat(table: TableLayoutSource): TableFormatInput;
-  resolveColumns(table: TableLayoutSource, contentWidthPt: number, state: State): readonly number[];
+  resolveColumns(table: TableLayoutSource, contentWidthPt: number, state: State, decision?: LogicalTableDecision): readonly number[];
   createCellState(state: State, contentWidthPt: number, cell: TableLayoutSource['rows'][number]['cells'][number]): State;
   acquireParagraph(
     state: State,
@@ -87,6 +97,63 @@ export interface NestedFloatingTableOccurrence {
   readonly acquiredTextOffsetPt?: Readonly<{ xPt: number; yPt: number }>;
 }
 
+const pagePlacedContentTables = new WeakMap<RetainedTableAcquisition, boolean>();
+
+/**
+ * Whether this table, laid out whole at a known page origin, has anything to
+ * place on the page: a §17.4.57 positioned table of its own or below an
+ * in-flow nested table at any depth, a positioned table's own positioned
+ * children, or a cell paragraph's text box whose story holds such content.
+ * Only a paginated table's direct positioned children are resolved by its
+ * own fragment (table-pagination.ts finalFrameRow); every deeper one is
+ * placed through the page origin of the table that holds it
+ * (table-pagination.ts layoutNestedWhole).
+ */
+export function hasPagePlacedContent(source: RetainedTableAcquisition): boolean {
+  const known = pagePlacedContentTables.get(source);
+  if (known !== undefined) return known;
+  const result = source.floatingTables.length > 0 || needsNestedPageOrigins(source);
+  pagePlacedContentTables.set(source, result);
+  return result;
+}
+
+/** Whether placing this table needs the page origin of a block inside it:
+ * an in-flow nested table, a positioned child or a text box with page-placed
+ * content. */
+export function needsNestedPageOrigins(source: RetainedTableAcquisition): boolean {
+  return source.input.rows.some((row) => rowNeedsPageOrigins(source, row))
+    || source.floatingTables.some((occurrence) => {
+      const positioned = source.nestedById[occurrence.tableId];
+      return positioned !== undefined && hasPagePlacedContent(positioned);
+    });
+}
+
+/** A cell paragraph whose text boxes hold page-placed content: their stories'
+ * page frames need the paragraph's page position (paragraph.ts
+ * hostFlowPageTranslationPt), which only the table's pagination knows in a
+ * cell. */
+export function paragraphHasBandDependentTextBoxes(layout: ParagraphLayout): boolean {
+  return layout.textBoxes.some((textBox) => textBox.story.bandDependent === true);
+}
+
+/** A cell block whose placement needs its page origin. */
+export function blockNeedsPageOrigin(
+  source: RetainedTableAcquisition,
+  block: TableCellBlockInput,
+): boolean {
+  if (block.layout.kind === 'paragraph') return paragraphHasBandDependentTextBoxes(block.layout);
+  if (block.layout.kind !== 'table') return false;
+  const nested = source.nestedById[block.layout.id];
+  return nested !== undefined && hasPagePlacedContent(nested);
+}
+
+export function rowNeedsPageOrigins(
+  source: RetainedTableAcquisition,
+  row: TableRowLayoutInput,
+): boolean {
+  return row.cells.some((cell) => cell.blocks.some((block) => blockNeedsPageOrigin(source, block)));
+}
+
 function retainedNodeIsReusableAcrossPages(
   node: PaintNode,
   visited: Set<PaintNode>,
@@ -95,9 +162,7 @@ function retainedNodeIsReusableAcrossPages(
   visited.add(node);
   if (node.kind === 'drawing') return node.anchorLayer === undefined;
   if (node.kind === 'paragraph') {
-    return node.lines.every((line) => line.placements.every((placement) => (
-      placement.kind !== 'text' || placement.dependency !== 'page'
-    )))
+    return node.lines.every((line) => !line.placements.some(placementDependsOnPage))
       && node.drawings.every((drawing) => (
         retainedNodeIsReusableAcrossPages(drawing, visited)
       ))
@@ -211,9 +276,16 @@ function physicalAlignment(
 }
 
 function paragraphHasPageDependency(layout: ParagraphLayout): boolean {
-  return layout.lines.some((line) => line.placements.some((placement) => (
-    placement.kind === 'text' && placement.dependency === 'page'
-  )));
+  return layout.lines.some((line) => line.placements.some(placementDependsOnPage));
+}
+
+/** A PAGE field result is its own placement, or (same formatting as the
+ * text before it) one owner range of a shared glyph sequence. */
+function placementDependsOnPage(placement: ParagraphLayout['lines'][number]['placements'][number]): boolean {
+  return placement.kind === 'text' && (
+    placement.dependency === 'page'
+    || placement.sourceRuns?.some((owner) => owner.dependency === 'page') === true
+  );
 }
 
 /** The largest page dimension Word can author (MS-DOC 2.6.4 sprmSXaPage /
@@ -342,6 +414,7 @@ function orientRotatedCellBlocks(
   });
 }
 
+
 /**
  * Acquire an ordinary or nested table from final-width retained children.
  * Parser-private authored-presence and lexical facts arrive only through the
@@ -355,6 +428,8 @@ export function acquireRetainedTable<State>(
   outerState: State,
   source: SourceRef | readonly number[],
   dependencies: RetainedTableAcquisitionDependencies<State>,
+  decision?: TableMemberDecision,
+  owner: TableOwnerContext = CELL_OWNED_TABLE,
 ): RetainedTableAcquisition {
   const sourceRoot: SourceRef = Array.isArray(source)
     ? { story: 'body', storyInstance: 'body', path: source }
@@ -370,12 +445,21 @@ export function acquireRetainedTable<State>(
   const flowDomainId = sourceRoot.story === 'body' && sourceRoot.storyInstance === 'body'
     ? `table:${sourcePath.join('.')}`
     : `${sourceRoot.story}:${sourceRoot.storyInstance}:table:${sourcePath.join('.')}`;
-  const format = dependencies.tableFormat(table);
+  const member = decision ?? dependencies.tableDecision?.(table, contentWidthPt, outerState).logical
+    ?? unmeasuredTableMemberDecision(table, dependencies.tableFormat(table));
+  const format = member.source.format;
+  // Cell-owner rows (table-owner-runs.ts) elect only in a promoting owner
+  // context (tableRowsElectCarriers, WORD_CELL_OWNER_ROW_CONTEXT: body,
+  // header and footer roots) and only when the table's effective §17.4.57
+  // positioning is null — lexical tblpPr presence does not decide
+  // (`word-effective-floating-table-positioning`). The paginated body, its
+  // vertical upright placement (body-table-measurement.ts) and header/footer
+  // story roots (production-body-layout.ts) consume the run projection.
+  // Nested tables (the default owner) and text box and note roots elect
+  // nothing: their framePr stays an ordinary cell-paragraph fact.
+  const electsOwnerRuns = format.positioning === null && tableRowsElectCarriers(owner);
   const bidiVisual = table.bidiVisual === true;
-  const firstRowException = format.firstRowException;
-  const tableIndentPt = firstRowException?.indentAuthored
-    ? (firstRowException.indentPt ?? 0)
-    : (table.tblInd ?? 0);
+  const tableIndentPt = member.tableIndentPt;
   const nestedById: Record<string, RetainedTableAcquisition> = {};
   const floatingTables: NestedFloatingTableOccurrence[] = [];
   const rotatedCells: RotatedCellAcquisition[] = [];
@@ -454,10 +538,12 @@ export function acquireRetainedTable<State>(
               sourceAt(paragraphPath),
             ),
             acquireNestedTable: (cellState, nestedTable, nestedContentWidthPt, nestedPath) => {
+              const nestedDecision = dependencies.tableDecision?.(nestedTable, nestedContentWidthPt, cellState);
               const nestedColumns = dependencies.resolveColumns(
                 nestedTable,
                 nestedContentWidthPt,
                 cellState,
+                nestedDecision,
               );
               const nested = acquireRetainedTable(
                 nestedTable,
@@ -466,6 +552,7 @@ export function acquireRetainedTable<State>(
                 cellState,
                 sourceAt(nestedPath),
                 dependencies,
+                nestedDecision?.logical,
               );
               nestedById[nested.layout.id] = nested;
               const nestedFormat = dependencies.tableFormat(nestedTable);
@@ -596,7 +683,11 @@ export function acquireRetainedTable<State>(
       }
     });
     const heightRule = rowFormat?.height?.rule ?? 'auto';
+    const ownerCarrier = electsOwnerRuns
+      ? leadingCellOwnerCarrier(row, sourceAt([...sourcePath, rowIndex]))
+      : null;
     return {
+      ...(ownerCarrier ? { ownerCarrier } : {}),
       id: `${flowDomainId}:row:${rowIndex}`,
       source: sourceAt([...sourcePath, rowIndex]),
       logicalRowIndex: rowIndex,
@@ -608,7 +699,10 @@ export function acquireRetainedTable<State>(
         ? retainedEdges(rowFormat.exception.borders)
         : null,
       alignment: physicalAlignment(rowFormat?.justification ?? table.jc, bidiVisual),
-      indentPt: tableIndentPt,
+      // Carry one signed leading-axis translation into the sole table layout
+      // algorithm. End alignment uses each row's first margin; leading alignment
+      // keeps the first-row anchor even when subsequent margins differ.
+      indentPt: member.rowTranslationsPt[rowIndex] ?? tableIndentPt,
       cells,
       repeatedHeader: rowFormat?.repeatedHeader ?? row.isHeader === true,
     };

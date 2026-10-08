@@ -11,6 +11,10 @@ export interface DocxLayoutPublication {
   readonly pageCount: number;
   readonly exact: boolean;
   readonly complete: boolean;
+  /** Leading pages identical to the previous publication's, whose painted
+   *  canvases therefore stay valid (see `unchangedLeadingPageCount`). Absent
+   *  when unknown, which a viewer must treat as every page having changed. */
+  readonly unchangedPages?: number;
   readonly error?: unknown;
 }
 

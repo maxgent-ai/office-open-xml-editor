@@ -376,3 +376,84 @@ export function wordActiveColumnBreakIndexes(
   }
   return active;
 }
+
+
+export const WORD_PARAGRAPH_FOOTNOTE_CONTINUATION = defineCompatibilityRule({
+  id: 'word-paragraph-footnote-continuation',
+  evidence: { kind: 'regression-test',
+    reference: 'packages/docx/src/layout/body-paginator-production.test.ts#keeps a reference on its page and paints a long footnote on both pages' },
+  description: 'Existing Word-produced controls cover a completed body paragraph with a long note, following body text and a following hard page/section break without an intervening note. Registered earlier controls kept a short-note/font-size case and a long body paragraph with references on opposite pages whole; their inputs are not retained, so later classes do not claim to reproduce them. Public Word 16.113.3 controls (exact lines, one note of two or four 10pt or two 8pt lines, 6pt authored after on the paragraph whose last line closes with the reference, widowControl off/on and keepLines) split the note when the whole note missed only because of that authored after and kept it whole at the exact charged fit or without after; a one-line note there has no head and stays on the unchanged fallback. This continuation-mode policy decides only whether a note may split; where its head is reserved is governed by word-reference-line-footnote-allocation. It does not claim general Word pagination equivalence or support width-changing continuation. Notes that cannot fit with their first reference line on a fresh page use the separate content-retention policy.',
+});
+
+/** Decide continuation admission within the documented input classes.
+ * Evaluated once for each reference-line note plan. `wholeNoteFitsOnly-
+ * WithoutTrailingAfter` is the after-only class: the whole note misses beside
+ * a unit that completes its paragraph but fits when only that paragraph's
+ * admissible authored after (WORD_TRAILING_SPACE_AFTER_FIT_ADMISSION) is
+ * excluded. It permits a split even when the whole note fits a fresh page and
+ * nothing follows the reference; it does not decide where the head goes.
+ * `pageOpensWithIncomingTail` is the carried-tail class: the page's band
+ * already opens with real retained lines of a note continued from an earlier
+ * page. Public Word 16.113.3 controls (single column, exact 10pt lines, two
+ * notes; a two- or four-line second note whose reference closes its
+ * paragraph, with or without authored after; and the automatic-line K03
+ * document) split such a whole-missing note beside the tail instead of moving
+ * the reference line, and kept it whole where the charged total fits. Pages
+ * without such a tail keep the exclusion above; this is not a universal Word
+ * rule. */
+export function wordParagraphFootnoteMayContinue(input: Readonly<{
+  wholeNoteFitsWithReference: boolean;
+  wholeNoteFitsFreshPage: boolean;
+  textAfterReference: boolean;
+  hardBreakBeforeNextNote: boolean;
+  wholeNoteFitsOnlyWithoutTrailingAfter: boolean;
+  pageOpensWithIncomingTail: boolean;
+}>): boolean {
+  return !input.wholeNoteFitsWithReference
+    && (!input.wholeNoteFitsFreshPage || input.textAfterReference || input.hardBreakBeforeNextNote
+      || input.wholeNoteFitsOnlyWithoutTrailingAfter || input.pageOpensWithIncomingTail);
+}
+
+/**
+ * Footnote reservation order inside one paragraph fragment (continuation
+ * mode only). ECMA-376 §17.11.21 / §17.18.34 fix only ownership: a
+ * note starts on the page that paints its reference. They do not prescribe
+ * how a page's height is divided between a note and later body lines.
+ *
+ * Library policy: at each line that first references notes on the page, the
+ * paginator takes one immutable note plan from that line's remaining capacity
+ * (earlier plans already charged; preceding new notes whole, only the last
+ * new note partitionable to at least one real line plus any native notice).
+ * Later lines of the paragraph are admitted only beside the committed plans.
+ * A later reference line can add reserve but never repartition, shrink or
+ * drop an earlier plan; if its own plan does not fit, that line and every
+ * later line are rejected together and no part of its plan is committed.
+ *
+ * Observed basis (finite, not a universal Word algorithm): Word 16.113.3
+ * source-open controls with one column, exact 10pt lines, widowControl off,
+ * single-paragraph notes and the reference on the first of several lines.
+ * Authored exact-6pt separator stories at 36pt and 35.95pt remaining kept
+ * two and one note lines beside the reference line and moved the next body
+ * line; bare and missing separator stories and a fourteen-line continuing
+ * paragraph also moved the body line after the note head. Extending the same
+ * commitment to later reference lines is owner-approved library policy.
+ */
+export const WORD_REFERENCE_LINE_FOOTNOTE_ALLOCATION = defineCompatibilityRule({
+  id: 'word-reference-line-footnote-allocation',
+  evidence: {
+    kind: 'office-observation',
+    syntheticFixtureId: 'footnote-reference-line-head-boundary',
+    application: 'Microsoft Word',
+    version: '16.113.3',
+    platform: 'macOS',
+  },
+  description: 'With footnote continuation enabled, a referenced note is planned once at its reference line and later body lines of the paragraph are admitted only against that committed plan. Observed in exact-line single-column controls with first-line references (36pt and 35.95pt boundaries kept two and one head lines and moved the following line; a long continuing paragraph moved after the head). Later reference lines follow the same library policy and are rejected atomically when their own plan cannot fit. Separator band charges and other classes (columns, keep/widow, non-exact lines) are not established by these controls.',
+});
+
+/** Saved print controls: only a hard page/section boundary before the next
+ * reference qualifies; a column break or intervening note does not. */
+export function wordFootnoteLookaheadBoundary(entry: BodyLayoutInput['sequence'][number]): boolean {
+  return (entry.kind === 'authored-break' && entry.break !== 'column')
+    || (entry.kind === 'begin-section' && entry.section.startType !== 'continuous')
+    || (entry.kind === 'body-block' && entry.block.kind === 'paragraph' && entry.block.pageBreakBefore);
+}

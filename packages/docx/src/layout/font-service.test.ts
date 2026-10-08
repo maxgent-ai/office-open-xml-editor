@@ -53,6 +53,23 @@ describe('font layout services', () => {
       .not.toBe(first.advancePt);
   }, 30_000);
 
+  it('activates scoped substitution only for the selected family/weight/style tuple', () => {
+    const resolver = createFontResolver([
+      { requestedFamily: 'Sakkal Majalla', resolvedFamily: 'Embedded Sakkal', source: 'embedded' },
+      { requestedFamily: 'Sakkal Majalla', resolvedFamily: 'Noto Naskh Arabic',
+        source: 'substitute', script: 'arabic' },
+      { requestedFamily: 'Sakkal Majalla', resolvedFamily: 'Noto Naskh Arabic',
+        source: 'substitute', script: 'arabic', weight: 700 },
+    ], { scriptScopedFamilies: { 'sakkal majalla': {
+      script: 'arabic', substituteFamilies: ['Noto Naskh Arabic'],
+    } } });
+    expect(resolver.scopedSubstituteScript?.('Sakkal Majalla', 400, 'normal')).toBeUndefined();
+    expect(resolver.scopedSubstituteScript?.('Sakkal Majalla', 700, 'normal')).toBe('arabic');
+    expect(resolver.scopedSubstituteScript?.('Sakkal Majalla', 700, 'italic')).toBeUndefined();
+    expect(resolver.resolve({ requestedFamily: 'Sakkal Majalla', weight: 700, script: 'arabic' }).source)
+      .toBe('substitute');
+  });
+
   it('snapshots regional routes and includes their contents in the font fingerprint', () => {
     const routes = { sc: { Calibri: 'Carlito, "Noto Sans SC", sans-serif' } };
     const resolver = createFontResolver(faces, { regionalFamilyLists: routes });
@@ -415,6 +432,29 @@ describe('font layout services', () => {
     charsets['ea face'] = '00';
     expect(shape()).toBe('eastAsia');
     expect(service.fingerprint).toBe(fingerprint);
+  });
+
+  it.each([
+    { hint: undefined, language: undefined, slot: 'highAnsi' },
+    { hint: 'default' as const, language: undefined, slot: 'highAnsi' },
+    { hint: 'eastAsia' as const, language: undefined, slot: 'eastAsia' },
+    { hint: 'eastAsia' as const, language: 'ja-JP', slot: 'eastAsia' },
+    { hint: 'eastAsia' as const, language: 'zh-CN', slot: 'eastAsia' },
+    { hint: 'default' as const, language: 'ja-JP', slot: 'highAnsi' },
+  ])('routes the measured em dash with hint=$hint language=$language', ({ hint, language, slot }) => {
+    const service = createTextLayoutService({
+      fonts: createFontResolver(faces),
+      measurer: {
+        fingerprint: 'dash-slots-v1',
+        measure: (request) => ({ advancePt: request.text.length, ascentPt: 1, descentPt: 0 }),
+      },
+    });
+    const result = service.shape({ text: '—', fontSizePt: 12,
+      fonts: { highAnsi: 'Calibri', eastAsia: 'Meiryo' },
+      fontHint: hint, eastAsiaLanguage: language,
+    });
+    expect(result.spans[0]?.script).toBe(slot);
+    expect(result.spans[0]?.font.requestedFamily).toBe(slot === 'eastAsia' ? 'Meiryo' : 'Calibri');
   });
 
   it('canonicalizes exact face tuples independently of inventory order', () => {

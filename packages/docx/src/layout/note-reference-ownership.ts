@@ -5,7 +5,7 @@ type NoteReferenceSourceBlock =
       type: 'paragraph';
       runs: readonly Readonly<{
         type: string;
-        noteRef?: Readonly<{ kind: 'footnote' | 'endnote'; id: string }>;
+        noteRef?: Readonly<{ kind: 'footnote' | 'endnote'; id: string; customMarkFollows?: boolean }>;
       }>[];
     }>
   | Readonly<{
@@ -21,12 +21,16 @@ type NoteReferenceSourceBlock =
 export function buildNoteNumberMap(
   notes: readonly Readonly<{ id: string }>[] | undefined,
   referenceIds: readonly string[],
+  customReferenceIds: ReadonlySet<string> = new Set(),
 ): Map<string, number> {
   const numbers = new Map<string, number>();
   if (!notes) return numbers;
   const available = new Set(notes.map((note) => note.id));
+  let ordinal = 0;
   referenceIds.forEach((id) => {
-    if (available.has(id) && !numbers.has(id)) numbers.set(id, numbers.size + 1);
+    // CT_FtnEdnRef/@customMarkFollows: custom notes remain owned/indexed but
+    // never consume an automatic ordinal. Zero suppresses in-note *Ref ink.
+    if (available.has(id) && !numbers.has(id)) numbers.set(id, customReferenceIds.has(id) ? 0 : ++ordinal);
   });
   return numbers;
 }
@@ -45,6 +49,7 @@ export function indexNotes<T extends Readonly<{ id: string }>>(
 export function noteReferenceIdsInDocumentOrder(
   elements: readonly NoteReferenceSourceBlock[],
   kind: 'footnote' | 'endnote',
+  customOnly = false,
 ): readonly string[] {
   const ids: string[] = [];
   const seen = new Set<string>();
@@ -54,13 +59,14 @@ export function noteReferenceIdsInDocumentOrder(
         if (run.type !== 'text'
           || run.noteRef?.kind !== kind
           || run.noteRef.id.length === 0
+          || (customOnly && run.noteRef.customMarkFollows !== true)
           || seen.has(run.noteRef.id)) continue;
         seen.add(run.noteRef.id);
         ids.push(run.noteRef.id);
       }
     } else if (element.type === 'table' && 'rows' in element) {
       for (const row of element.rows) for (const cell of row.cells) {
-        for (const id of noteReferenceIdsInDocumentOrder(cell.content, kind)) {
+        for (const id of noteReferenceIdsInDocumentOrder(cell.content, kind, customOnly)) {
           if (seen.has(id)) continue;
           seen.add(id);
           ids.push(id);
@@ -76,7 +82,7 @@ function noteIdsInRetainedLines(
   kind: 'footnote' | 'endnote',
 ): readonly string[] {
   return Object.freeze([...new Set(lines.flatMap((line) => line.placements.flatMap((placement) => (
-    placement.kind === 'text' && placement.noteReference?.kind === kind
+    (placement.kind === 'text' || placement.kind === 'anchor-host') && placement.noteReference?.kind === kind
       ? [placement.noteReference.id]
       : []
   ))))]);

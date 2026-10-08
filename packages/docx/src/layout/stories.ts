@@ -11,6 +11,7 @@ import type {
   BlockLayoutAlgorithms,
   LayoutServices,
   NoteLayout,
+  NoteSeparatorLayout,
   StoryLayout,
   StoryBlockInput,
   StoryLayoutInput,
@@ -55,6 +56,23 @@ export function translateStoryLayout(
   });
 }
 
+function translateNoteSeparatorLayout(
+  occurrence: NoteSeparatorLayout,
+  delta: LayoutTranslation,
+): NoteSeparatorLayout {
+  return Object.freeze({
+    ...occurrence,
+    flowBounds: translateRect(occurrence.flowBounds, delta),
+    ...(occurrence.paragraph
+      ? { paragraph: translateCompleteParagraphLayout(occurrence.paragraph, delta) } : {}),
+    ...(occurrence.rule ? {
+      rule: Object.freeze({ ...occurrence.rule, segment: translateBorder(occurrence.rule.segment, delta) }),
+    } : {}),
+  });
+}
+
+/** Translate a note and every geometry it owns, including its native
+ * leading separator and trailing continuation notice occurrences. */
 export function translateNoteLayout(
   note: NoteLayout,
   delta: LayoutTranslation,
@@ -65,7 +83,9 @@ export function translateNoteLayout(
     inkBounds: translateRect(note.inkBounds, delta),
     ...(note.clipBounds ? { clipBounds: translateRect(note.clipBounds, delta) } : {}),
     separator: Object.freeze(note.separator.map((segment) => translateBorder(segment, delta))),
+    ...(note.leading ? { leading: translateNoteSeparatorLayout(note.leading, delta) } : {}),
     story: translateStoryLayout(note.story, delta),
+    ...(note.trailing ? { trailing: translateNoteSeparatorLayout(note.trailing, delta) } : {}),
   });
 }
 

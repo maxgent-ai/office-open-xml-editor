@@ -1,4 +1,4 @@
-import { serializeWorkerError } from '@silurus/ooxml-core/worker';
+import { normalizeXlsxWorksheetPolicy, serializeWorkerError } from '@silurus/ooxml-core/worker';
 import { parseDelimitedWorksheet } from './delimited-text.js';
 import type {
   DelimitedTextParseRequest,
@@ -8,7 +8,10 @@ import type {
 self.onmessage = (event: MessageEvent<DelimitedTextParseRequest>): void => {
   const request = event.data;
   try {
-    const { workbook, worksheet } = parseDelimitedWorksheet(request.data, request.options);
+    const policy = normalizeXlsxWorksheetPolicy({
+      xlsxWorksheetLimits: request.worksheetPolicy?.worksheet,
+    });
+    const { workbook, worksheet } = parseDelimitedWorksheet(request.data, request.options, policy);
     const worksheetJson = new TextEncoder().encode(JSON.stringify(worksheet)).buffer as ArrayBuffer;
     const response: DelimitedTextParseResponse = {
       type: 'delimitedTextParsed',

@@ -1,4 +1,10 @@
-import type { RetainedTableAcquisition } from './table-acquisition.js';
+import {
+  blockNeedsPageOrigin,
+  hasPagePlacedContent,
+  needsNestedPageOrigins,
+  rowNeedsPageOrigins,
+  type RetainedTableAcquisition,
+} from './table-acquisition.js';
 import {
   beginFloatingTablePlacementTransaction,
   floatingTableRegistryDelta,
@@ -9,13 +15,19 @@ import {
   convergeExactState,
 } from './convergence.js';
 import { LayoutInvariantError } from './diagnostics.js';
+import { paragraphAcquisitionCacheOf } from './runtime-state.js';
 import { adjustForWidowOrphan } from '../line-fit-policy.js';
+import type { StoryPageFrames } from './story-page-frames.js';
 import { sliceParagraphLayout } from './paragraph.js';
 import {
+  laidOutTableTracks,
   layoutTable,
   measureTableCellBlockFlowHeightPt,
   mergeEndRow,
+  projectedMergeRole,
+  tablePrefixTracks,
   tableRowBoundaryFootprintsPt,
+  type TablePrefixTracks,
 } from './table.js';
 import {
   wordClipsOverPageCantSplitRow,
@@ -63,8 +75,6 @@ export type BlockContinuationRange =
 
 export interface TableCellFragmentLayout extends TableCellLayout {
   readonly contentRanges: readonly BlockContinuationRange[];
-  /** A page-local paint role; the source w:vMerge value remains unchanged. */
-  readonly visualMergeOwnership?: 'continuation';
 }
 
 export interface TableRowFragmentLayout extends TableRowLayout {
@@ -121,6 +131,11 @@ export interface PageDependentTableBlockRequest {
     widthPt: number;
     heightPt: number;
   }>[];
+  /** The page translation the paragraph's host flow receives on this page
+   * (ParagraphAcquisitionOptions.hostFlowPageTranslationPt), stated by the
+   * table's page placement for a cell paragraph whose text boxes hold
+   * page-placed content. */
+  readonly hostFlowPageTranslationPt?: Readonly<{ xPt: number; yPt: number }>;
 }
 
 export interface TableFragmentContext {
@@ -143,6 +158,20 @@ export interface TableFragmentContext {
   readonly reacquirePageDependentBlock?: (
     request: PageDependentTableBlockRequest,
   ) => ParagraphLayout | TableLayout;
+  /**
+   * Page placement of the page-placed content below THIS table's own cells
+   * (§17.4.57 positioned tables under in-flow nested tables, text boxes whose
+   * stories hold such content): the destination page frames, the table-local
+   * to page translation, and re-acquisition of a cell paragraph with its page
+   * translation. A nested table's context inherits it only with its own
+   * translation (the nested block's page origin stated by the parent's
+   * placement), never the parent's.
+   */
+  readonly pagePlacement?: Readonly<{
+    frames: StoryPageFrames;
+    translationPt: Readonly<{ xPt: number; yPt: number }>;
+    reacquireParagraph: (request: PageDependentTableBlockRequest) => ParagraphLayout | TableLayout;
+  }>;
 }
 
 export interface TableFragmentResult {
@@ -185,6 +214,24 @@ export function startTableFragmentCursor(): TableFragmentCursor {
   return Object.freeze({ rowIndex: 0, rowFragmentIndex: 0, cells: Object.freeze([]) });
 }
 
+/**
+ * Input position of the acquired row a selected occurrence stands for. Rows
+ * keep their source logical index; a projected input (a body or story-root
+ * cell-owner segment, possibly led by repeated source headers) does not store logical row i at
+ * position i, so pagination never treats one as the other.
+ */
+function inputRowIndexOf(source: RetainedTableAcquisition, logicalRowIndex: number): number {
+  if (source.input.rows[logicalRowIndex]?.logicalRowIndex === logicalRowIndex) return logicalRowIndex;
+  return source.input.rows.findIndex((row) => row.logicalRowIndex === logicalRowIndex);
+}
+
+function sourceRowFor(
+  source: RetainedTableAcquisition,
+  logicalRowIndex: number,
+): TableRowLayoutInput | undefined {
+  return source.input.rows[inputRowIndexOf(source, logicalRowIndex)];
+}
+
 function leadingHeaderCount(input: TableLayoutInput): number {
   let count = 0;
   while (input.rows[count]?.repeatedHeader === true) count += 1;
@@ -210,6 +257,7 @@ function nestedTableFragmentContext(
   parentCell: TableCellLayoutInput,
   context: TableFragmentContext,
   availableHeightPt: number,
+  nestedBlock?: TableCellBlockInput,
 ): TableFragmentContext {
   const retainedCell = source.layout.rows
     .flatMap((row) => row.cells)
@@ -226,8 +274,12 @@ function nestedTableFragmentContext(
     widthPt: retainedCell.contentBounds.widthPt,
     heightPt: Math.max(0, availableHeightPt),
   });
+  // The parent's page translation is not this table's: the nested block's own
+  // page origin, stated by the parent's page placement, replaces it.
+  const { pagePlacement: parentPagePlacement, ...inherited } = context;
+  const origin = nestedBlock ? nestedPageOrigins.get(nestedBlock) : undefined;
   return Object.freeze({
-    ...context,
+    ...inherited,
     availableHeightPt: bounds.heightPt,
     placement: Object.freeze({
       ...context.placement,
@@ -235,6 +287,12 @@ function nestedTableFragmentContext(
       cursor: Object.freeze({ xPt: 0, yPt: 0 }),
       availableBounds: bounds,
     }),
+    // With its page origin known, the fragment's own positioned children are
+    // resolved through it, not through the parent's translation.
+    ...(origin && parentPagePlacement ? {
+      pagePlacement: Object.freeze({ ...parentPagePlacement, translationPt: origin }),
+      finalPlacementTranslationPt: origin,
+    } : {}),
   });
 }
 
@@ -273,17 +331,28 @@ function paginationRowTrackHeightForOccurrence(
  * owner's interval, so intervals disjoint from the completed row cannot reach
  * its track. The window is closed transitively because an interval opening
  * inside it may itself reach further down.
+ *
+ * An interval opens where a cell's role in the window's own grid (`row`
+ * first, then the source rows below it) is a restart: the authored one, or
+ * the projected empty owner of a cell-owner segment's opening row
+ * (`segmentOpeningLogicalRowIndex`, table.ts projectedMergeRole), which every
+ * fragment of that row opens. Reading the authored role alone would close the
+ * projected owner's interval at the window's end, and its margin deficit
+ * would then land on the completed row instead of the interval's last
+ * growable track.
  */
 export function completedPartialRowWindowEnd(
   row: TableRowLayoutInput,
   sourceRows: readonly TableRowLayoutInput[],
   rowIndex: number,
+  segmentOpeningLogicalRowIndex?: TableLayoutInput['segmentOpeningLogicalRowIndex'],
 ): number {
   let windowEnd = rowIndex;
   for (let scan = rowIndex; scan <= windowEnd && scan < sourceRows.length; scan += 1) {
-    const cells = scan === rowIndex ? row.cells : sourceRows[scan]!.cells;
-    for (const cell of cells) {
-      if (cell.verticalMerge !== 'restart') continue;
+    const scanned = scan === rowIndex ? row : sourceRows[scan]!;
+    const above = scan === rowIndex ? undefined : scan === rowIndex + 1 ? row : sourceRows[scan - 1];
+    for (const cell of scanned.cells) {
+      if (projectedMergeRole(segmentOpeningLogicalRowIndex, above, scanned, cell) !== 'restart') continue;
       windowEnd = Math.max(
         windowEnd,
         mergeEndRow(sourceRows, scan, cell.columnStart, cell.columnSpan),
@@ -308,7 +377,9 @@ function completedPartialRowTrackHeight(
   // table: with no merge it is two rows, so pagination no longer costs
   // O(remaining rows) per completed partial row.
   const sourceRows = source.input.rows;
-  const windowEnd = completedPartialRowWindowEnd(row, sourceRows, rowIndex);
+  const windowEnd = completedPartialRowWindowEnd(
+    row, sourceRows, rowIndex, source.input.segmentOpeningLogicalRowIndex,
+  );
   const sliceEnd = Math.min(sourceRows.length, windowEnd + 2);
   const occurrence = layoutTable({
     ...source.input,
@@ -356,13 +427,653 @@ function rowForOccurrence(
   };
 }
 
-function ownsFinalFrameAxis(placement: FloatingTablePlacementLayout): boolean {
-  const horizontal = placement.positioning.horzSpecified
-    && (placement.positioning.horzAnchor === 'page'
-      || placement.positioning.horzAnchor === 'margin');
-  const vertical = placement.positioning.vertAnchor === 'page'
-    || placement.positioning.vertAnchor === 'margin';
-  return horizontal || vertical;
+type PagePoint = Readonly<{ xPt: number; yPt: number }>;
+
+/**
+ * Page position of a nested table block's local origin in the occurrence that
+ * holds it, stated by that occurrence's page placement. A fragment of the
+ * nested table taken there places its own page-placed content through it, at
+ * every nesting depth. Keyed by the immutable placed block input.
+ */
+const nestedPageOrigins = new WeakMap<TableCellBlockInput, PagePoint>();
+
+/**
+ * A retained table's §17.4.57 positioned children by host cell (indices into
+ * `floatingTables`, in source order), and its acquired cells by id. Both are
+ * fixed by the immutable acquisition, so each table is indexed once, and a
+ * row finds its own children in time proportional to its cells and children
+ * rather than to every child of the table. Keyed by the acquisition, released
+ * with it.
+ */
+type FloatingTableIndex = Readonly<{
+  byHostCell: ReadonlyMap<string, readonly number[]>;
+  cellById: ReadonlyMap<string, TableLayout['rows'][number]['cells'][number]>;
+}>;
+
+const floatingTableIndexes = new WeakMap<RetainedTableAcquisition, FloatingTableIndex>();
+
+function floatingTableIndexOf(source: RetainedTableAcquisition): FloatingTableIndex {
+  const known = floatingTableIndexes.get(source);
+  if (known) return known;
+  const byHostCell = new Map<string, number[]>();
+  source.floatingTables.forEach((occurrence, index) => {
+    const hosted = byHostCell.get(occurrence.hostCellId);
+    if (hosted) hosted.push(index);
+    else byHostCell.set(occurrence.hostCellId, [index]);
+  });
+  const cellById = new Map<string, TableLayout['rows'][number]['cells'][number]>();
+  for (const row of source.layout.rows) {
+    for (const cell of row.cells) if (!cellById.has(cell.id)) cellById.set(cell.id, cell);
+  }
+  const index: FloatingTableIndex = Object.freeze({ byHostCell, cellById });
+  floatingTableIndexes.set(source, index);
+  return index;
+}
+
+/**
+ * Placement probes of one fragment's growing list of selected rows. A probe
+ * of a candidate is the row the fragment lays out after those rows — the
+ * last row of the table laid out from them and the candidate — taken from the
+ * table's exact prefix tracks (table.ts tablePrefixTracks). Those resolve the
+ * rows before the list's last one once each and resolve a probe in time
+ * bounded by the row's own cells and the merges crossing it, so one list's
+ * probes cost work proportional to its rows whatever the merges: under merges
+ * continuing through every row, for `exact` rows (whose merge deficit lands
+ * above them) and for full-row probes (cell heights, vAlign offsets, merge
+ * growth on the candidate) alike. Released with the list. A table laid out
+ * whole is not probed: it is placed against its own final layout
+ * ({@link layoutNestedWholeAt}).
+ */
+type FragmentRowTracks = TablePrefixTracks;
+
+function startFragmentRowTracks(source: RetainedTableAcquisition): FragmentRowTracks {
+  return tablePrefixTracks(source.input);
+}
+
+/** The candidate as the last row of the whole prefix: the probe of a grid the
+ * prefix tracks do not resolve (two owners claiming one column of a row).
+ *
+ * Reachability: canonical DOCX acquisition does not produce such a grid. It
+ * assigns each row's cells sequential grid columns from the row's gridBefore,
+ * each span at least one column and clamped to the grid
+ * (table-acquisition.ts, table-source-acquisition.ts), so the cells of one
+ * row claim disjoint columns; and a merge stays open into a row only through
+ * a continuation cell of that row with the owner's own start and span
+ * (table.ts resolveRowTrack, continuesMerge; ECMA-376 §17.4.84 merges cells
+ * of the same grid columns), so every open owner's columns are those of one
+ * of the row's own cells. The public document model carries no column start
+ * to break this. Only a TableLayoutInput built by hand outside acquisition
+ * reaches here.
+ *
+ * Cost: laying out the prefix is proportional to it, so a fragment probing
+ * such a grid row by row costs the square of its rows. Each probe is charged
+ * to the session's acquisition budget (runtime-state.ts), as a speculative
+ * whole layout nested in another is: the fallback is bounded in count, not
+ * made linear in the input, and needs no budget of its own since canonical
+ * input never takes it. */
+function wholePrefixProbe(
+  source: RetainedTableAcquisition,
+  preceding: readonly TableRowLayoutInput[],
+  candidate: TableRowLayoutInput,
+  context: TableFragmentContext,
+): TableRowLayout {
+  paragraphAcquisitionCacheOf(context.services)?.noteMiss();
+  const laidOut = layoutTable({
+    ...source.input,
+    id: `${source.input.id}:page-origin-probe:${context.page.occurrenceId}:${candidate.logicalRowIndex}`,
+    rows: [...preceding, candidate],
+  }, context.placement, context.services).layout;
+  const row = laidOut.rows[laidOut.rows.length - 1];
+  if (!row) throw new Error('Page origin probe lost its row');
+  return row;
+}
+
+/** The candidate laid out after `preceding` as the fragment will lay it out,
+ * in fragment coordinates. */
+function probeFragmentRow(
+  source: RetainedTableAcquisition,
+  preceding: readonly TableRowLayoutInput[],
+  candidate: TableRowLayoutInput,
+  context: TableFragmentContext,
+  tracks: FragmentRowTracks,
+): TableRowLayout {
+  return tracks.row(preceding, candidate, context.placement)
+    ?? wholePrefixProbe(source, preceding, candidate, context);
+}
+
+/**
+ * The placement a nested table is acquired with (table-acquisition.ts) in a
+ * cell content box `widthPt` wide, and the page placement of the content
+ * below its own cells through `origin`, the page position of its local
+ * origin.
+ */
+function nestedWholeContext(
+  context: TableFragmentContext,
+  nested: RetainedTableAcquisition,
+  widthPt: number,
+  origin: PagePoint,
+): TableFragmentContext {
+  const bounds = Object.freeze({ xPt: 0, yPt: 0, widthPt, heightPt: 1 });
+  return Object.freeze({
+    ...context,
+    placement: Object.freeze({
+      container: Object.freeze({ id: nested.input.flowDomainId, kind: 'tableCell' as const, bounds }),
+      cursor: Object.freeze({ xPt: 0, yPt: 0 }),
+      availableBounds: bounds,
+    }),
+    pagePlacement: Object.freeze({ ...context.pagePlacement!, translationPt: origin }),
+  });
+}
+
+/** Whether a table laid out whole has anything only a page position places:
+ * §17.4.57 positioned tables at any depth, or text boxes holding them. */
+export function hasPagePlacedTableContent(source: RetainedTableAcquisition): boolean {
+  return hasPagePlacedContent(source);
+}
+
+/** A story table laid out whole at a known page translation (the context's
+ * `pagePlacement.translationPt`), as {@link layoutNestedWhole} lays out a
+ * nested one: positioned children given final frames, page-placed content
+ * below its cells placed through it. */
+export function layoutWholeTableOnPage(
+  source: RetainedTableAcquisition,
+  context: TableFragmentContext,
+): TableLayout {
+  return layoutNestedWhole(source, context);
+}
+
+/**
+ * A nested table laid out whole at the page origin its context's placement
+ * states (an in-flow nested table in a whole row, a positioned table at its
+ * final frame): the content below its cells is placed through it
+ * ({@link rowPagePlacement}) and its own §17.4.57 positioned children are
+ * given their final frames there, row by row in source order, by the same
+ * {@link finalFrameRow} step a fragment holding the whole table takes, so
+ * their anchor paragraphs wrap and their own content is placed through them
+ * in turn. Both read each row where the whole table's own layout puts it
+ * ({@link layoutNestedWholeAt}). The resolutions are this layout's own page
+ * placements; like any final frame they avoid the floats of the context's
+ * registry snapshot, and they are not committed to the page registry, which
+ * only a paginated table's direct children enter.
+ */
+function layoutNestedWhole(
+  nested: RetainedTableAcquisition,
+  context: TableFragmentContext,
+): TableLayout {
+  // Each pass of a solve in such a layout that moves an origin repeats every
+  // layout nested in it, so nesting multiplies the per-loop guards (a pass
+  // revisiting an origin reuses its layout: rowPagePlacement,
+  // resolveFinalFrameChild). A layout inside another one is therefore
+  // charged to the session's acquisition budget (runtime-state.ts), which
+  // bounds the total; the outermost one is bounded by its caller's own
+  // loops, per row and pass.
+  if (nestedWholeDepth > 0) {
+    paragraphAcquisitionCacheOf(context.services)?.noteMiss();
+  }
+  nestedWholeDepth += 1;
+  try {
+    return layoutNestedWholeAt(nested, context);
+  } finally {
+    nestedWholeDepth -= 1;
+  }
+}
+
+/** Depth of {@link layoutNestedWhole} calls in progress (layout is synchronous). */
+let nestedWholeDepth = 0;
+
+/**
+ * The whole table's rows placed where its own final layout puts them (library
+ * policy). A row of a table laid out whole is not the last row of the rows
+ * above it: a merge continuing below it gives its deficit to a later row (or,
+ * through `exact` rows, to an earlier one; table.ts resolveRowTrack), so its
+ * track — and with it every centered or bottom vAlign offset and every later
+ * row's top — is the whole table's, not its prefix's. Each row's page-placed
+ * content (nested tables through their page origin, text-box paragraphs
+ * through their page translation; {@link rowPagePlacement}) and the track a
+ * row hosting positioned children resolves them in (its top, height and
+ * owned merges' extent, so its anchors and vAlign offsets; finalFrameRow,
+ * table.ts laidOutTableTracks) are therefore read from the table laid out
+ * from every row. That content can change the rows it is placed in (an
+ * anchor paragraph wrapping below a child, a nested table growing), and so
+ * the layout it is read from, so the pair is solved to an exact fixed point:
+ * a pass reads the placements and tracks from the previous pass's layout
+ * (the first from the acquired rows), prepares every row from them in source
+ * order — each positioned child resolved once per pass, against the registry
+ * of the children before it, starting from its previous pass's resolution —
+ * and lays the prepared rows out; the layout whose placements and tracks are
+ * the ones its rows were prepared with is accepted. No threshold is applied;
+ * a cycle or exhaustion fails closed, like the per-row loops.
+ *
+ * Cost: a pass lays the table out once, builds its tracks once when a row
+ * hosts a child, and reads each row once, so a pass is proportional to the
+ * table, and the passes are bounded by the resource guard. A pass that keeps
+ * a row's placement reuses its placed row, and one that also keeps its track
+ * and the registry before it reuses its prepared row, so only rows whose
+ * geometry moved are prepared again; nested layouts placed through an origin
+ * a pass revisits are reused across passes. The confirming pass prepares and
+ * lays out nothing.
+ */
+function layoutNestedWholeAt(
+  nested: RetainedTableAcquisition,
+  context: TableFragmentContext,
+): TableLayout {
+  const sourceRows = nested.input.rows;
+  const layoutRows = (rows: readonly TableRowLayoutInput[]) => layoutTable(
+    { ...nested.input, rows }, context.placement, context.services,
+  ).layout;
+  const placedWhole: PlacedWholeLayouts = new Map();
+  const placements: readonly (RowPagePlacement | null)[] = needsNestedPageOrigins(nested)
+    ? sourceRows.map((row) => rowPagePlacement(nested, row, 'source', context, placedWhole))
+    : [];
+  const origin = context.pagePlacement?.translationPt;
+  const resolvesChildren = nested.floatingTables.length > 0 && origin !== undefined
+    && context.floatingTableFrames !== undefined && context.reacquirePageDependentBlock !== undefined;
+  if (!resolvesChildren && !placements.some((placement) => placement !== null)) {
+    return layoutRows(sourceRows);
+  }
+  const wholeContext: TableFragmentContext = resolvesChildren && origin
+    ? Object.freeze({ ...context, finalPlacementTranslationPt: origin })
+    : context;
+  const initialRegistry: readonly FloatRegistryEntryPt[] = context.floatingTableRegistry?.entries ?? [];
+  const initialParagraphId = context.floatingTableRegistry?.nextParagraphId ?? 0;
+  // Only a row hosting a positioned child reads its track (finalFrameRow).
+  const { byHostCell } = floatingTableIndexOf(nested);
+  const hostsChild = sourceRows.map((row) => (
+    resolvesChildren && row.cells.some((cell) => byHostCell.has(cell.id))
+  ));
+  type PreparedRow = Readonly<{
+    placementKey: string;
+    placed: TableRowLayoutInput;
+    trackKey: string | null;
+    registry: readonly FloatRegistryEntryPt[];
+    nextParagraphId: number;
+    prepared: ReturnType<typeof finalFrameRow>;
+  }>;
+  type Pass = Readonly<{
+    state: string;
+    rows: readonly TableRowLayoutInput[];
+    prepared: readonly PreparedRow[];
+    resolved: readonly ResolvedFloatingTablePlacementLayout[];
+    layout: TableLayout;
+  }>;
+  const step = (previous: Pass | null): Pass => {
+    const laidOut = previous?.layout ?? layoutRows(sourceRows);
+    const laidOutRows = previous?.rows ?? sourceRows;
+    const laidOutRow = (rowIndex: number): TableRowLayout => {
+      const row = laidOut.rows[rowIndex];
+      if (!row) throw new LayoutInvariantError('INVALID_REFERENCE', `whole table lost row ${rowIndex}`);
+      return row;
+    };
+    const placementStates = sourceRows.map((_row, rowIndex) => (
+      placements[rowIndex]?.stateAt(laidOutRows[rowIndex]!, laidOutRow(rowIndex)) ?? null
+    ));
+    // A hosting row's track in this layout: its top, its height and, for a
+    // merge it owns, the merge's last row are the whole table's, so its
+    // children's anchors and its cells' vAlign offsets are the ones this
+    // layout paints (table.ts laidOutTableTracks), not those of the row laid
+    // out by itself, where a merge it starts would end in it.
+    const trackKeys = sourceRows.map((_row, rowIndex) => (
+      hostsChild[rowIndex] ? rowTrackKey(laidOutRow(rowIndex)) : null
+    ));
+    const state = JSON.stringify([placementStates, trackKeys]);
+    // The rows were prepared with this layout's own placements and tracks.
+    if (previous?.state === state) return previous;
+    let tracks: ReturnType<typeof laidOutTableTracks> | null = null;
+    const trackOf = (rowIndex: number): RowTrack => (candidate) => {
+      const built = tracks ?? laidOutTableTracks({ ...nested.input, rows: laidOutRows }, laidOut, context.placement);
+      tracks = built;
+      return { input: candidate, row: built.row(rowIndex, candidate) };
+    };
+    let registry = initialRegistry;
+    let nextParagraphId = initialParagraphId;
+    const rows: TableRowLayoutInput[] = [];
+    const preparedRows: PreparedRow[] = [];
+    const resolved: ResolvedFloatingTablePlacementLayout[] = [];
+    sourceRows.forEach((sourceRow, rowIndex) => {
+      const placementState = placementStates[rowIndex] ?? null;
+      const placementKey = JSON.stringify(placementState);
+      const trackKey = trackKeys[rowIndex] ?? null;
+      const known = previous?.prepared[rowIndex];
+      const placed = placementState === null
+        ? sourceRow
+        : known?.placementKey === placementKey
+          ? known.placed
+          : placements[rowIndex]!.rowFor(placementState);
+      // A row whose track moved starts from its previous pass's children
+      // (finalFrameRow seed).
+      const prepared = trackKey === null
+        ? { row: placed, resolved: [], registry, nextParagraphId }
+        : known && known.placed === placed && known.trackKey === trackKey
+          && known.registry === registry && known.nextParagraphId === nextParagraphId
+          ? known.prepared
+          : finalFrameRow(
+            nested, placed, 'source', trackOf(rowIndex), wholeContext, registry, nextParagraphId,
+            startTableFragmentCursor(), () => true, known?.prepared.resolved,
+          );
+      preparedRows.push({ placementKey, placed, trackKey, registry, nextParagraphId, prepared });
+      rows.push(prepared.row);
+      resolved.push(...prepared.resolved);
+      registry = prepared.registry;
+      nextParagraphId = prepared.nextParagraphId;
+    });
+    return Object.freeze({
+      state,
+      rows: Object.freeze(rows),
+      prepared: Object.freeze(preparedRows),
+      resolved: Object.freeze(resolved),
+      layout: layoutRows(rows),
+    });
+  };
+  let solved: Pass;
+  try {
+    solved = convergeExactState<Pass>({
+      step,
+      stateOf: (pass) => pass.state,
+      // Resource guard only; exact equality determines acceptance.
+      limit: 16,
+    }).value;
+  } catch (error) {
+    if (error instanceof ExactConvergenceError) {
+      throw new LayoutInvariantError(
+        'NON_CONVERGENCE',
+        `whole table page placement did not converge (${error.reason}; ${error.states.length} states)`,
+      );
+    }
+    throw error;
+  }
+  const { layout, resolved } = solved;
+  return resolved.length === 0 ? layout : Object.freeze({
+    ...layout,
+    resolvedFloatingTables: resolved,
+    ...(context.floatingTableRegistry ? {
+      resolvedFloatingTableCoordinateSpace: context.floatingTableRegistry.coordinateSpace,
+    } : {}),
+  });
+}
+
+/** The page position of the content below one cell of a row. */
+type CellPagePlacement = Readonly<{
+  nested: readonly Readonly<{ blockIndex: number; origin: PagePoint; widthPt: number }>[];
+  /** Paragraphs whose text boxes hold page-placed content: their page
+   * translation. */
+  hostFlows: readonly Readonly<{ blockIndex: number; translation: PagePoint }>[];
+}>;
+
+const UNPLACED_CELL: CellPagePlacement = Object.freeze({ nested: [], hostFlows: [] });
+
+/** Nested tables laid out whole through a page origin, by table, origin and
+ * width: one placement's (every pass of its solve reuses an origin it
+ * revisits), released with it. */
+type PlacedWholeLayouts = Map<string, TableLayout>;
+
+/**
+ * Page placement of the content below a row's cells (library policy): a
+ * nested table block holding page-placed content (§17.4.57 positioned tables
+ * at any depth below it) and a cell paragraph whose text boxes hold such
+ * content are given their page position. `stateAt` reads that position from
+ * a laid-out occurrence of the row; `rowFor` places the content there. A
+ * nested table laid out whole here is laid out whole through its origin
+ * ({@link layoutNestedWhole}); a fragment of it is taken through the origin.
+ * A paragraph is re-acquired with its page translation, so its text boxes'
+ * stories are given their page frames. Without a page placement (a step that
+ * owns no page) the content keeps its acquisition (null), as a table's direct
+ * positioned children do without frames.
+ */
+type RowPagePlacement = Readonly<{
+  /** The placement where `laidOutRow`, the occurrence `laidOutInput` laid
+   * out (for a continued row, its remainder), puts the row's content. */
+  stateAt: (laidOutInput: TableRowLayoutInput, laidOutRow: TableRowLayout) => readonly CellPagePlacement[];
+  rowFor: (state: readonly CellPagePlacement[]) => TableRowLayoutInput;
+}>;
+
+function rowPagePlacement(
+  source: RetainedTableAcquisition,
+  row: TableRowLayoutInput,
+  ownership: TableFragmentOwnership,
+  context: TableFragmentContext,
+  placedWholeLayouts: PlacedWholeLayouts,
+  cursor?: TableFragmentCursor,
+): RowPagePlacement | null {
+  if (!rowNeedsPageOrigins(source, row)) return null;
+  const owner = context.pagePlacement;
+  if (!owner) return null;
+  const translation = owner.translationPt;
+  // Blocks before a continued row's cell cursor were placed by earlier
+  // fragments.
+  const continuing = cursor !== undefined && cursor.rowFragmentIndex > 0;
+  const firstBlock = (cellIndex: number) => (
+    continuing ? cursor.cells[cellIndex]?.blockIndex ?? 0 : 0
+  );
+  const stateAt = (
+    candidate: TableRowLayoutInput,
+    laidOutRow: TableRowLayout,
+  ): readonly CellPagePlacement[] => (
+    candidate.cells.map((cell, cellIndex): CellPagePlacement => {
+      const laidOutCell = laidOutRow.cells[cellIndex];
+      const start = firstBlock(cellIndex);
+      if (!laidOutCell || !cell.blocks.slice(start).some((block) => (
+        blockNeedsPageOrigin(source, block)
+      ))) return UNPLACED_CELL;
+      const placedAt = (blockIndex: number) => laidOutCell.blocks[blockIndex - start];
+      const cellTopPt = translation.yPt + laidOutCell.flowBounds.yPt;
+      const contentXPt = translation.xPt + laidOutCell.contentBounds.xPt;
+      const nested: { blockIndex: number; origin: PagePoint; widthPt: number }[] = [];
+      const hostFlows: { blockIndex: number; translation: PagePoint }[] = [];
+      for (let blockIndex = start; blockIndex < cell.blocks.length; blockIndex += 1) {
+        const block = cell.blocks[blockIndex]!;
+        const placed = placedAt(blockIndex);
+        if (!placed || !blockNeedsPageOrigin(source, block)) continue;
+        const placedTopPt = cellTopPt + placed.offsetPt;
+        if (block.layout.kind === 'table') {
+          // A nested table's local origin is placed at its cell content x and
+          // block offset (table.ts placedChildInkBounds).
+          nested.push({
+            blockIndex,
+            origin: { xPt: contentXPt, yPt: placedTopPt },
+            widthPt: laidOutCell.contentBounds.widthPt,
+          });
+        } else if (block.layout.kind === 'paragraph') {
+          // Page point → this paragraph's acquired coordinates (the inverse
+          // of table.ts child placement): the translation its host flow, and
+          // so its text boxes' stories, receive on the page.
+          hostFlows.push({
+            blockIndex,
+            translation: {
+              xPt: contentXPt - block.layout.flowBounds.xPt,
+              yPt: placedTopPt - block.layout.flowBounds.yPt,
+            },
+          });
+        }
+      }
+      return { nested, hostFlows };
+    })
+  );
+  const placedWhole = (
+    block: TableCellBlockInput,
+    at: Readonly<{ origin: PagePoint; widthPt: number }>,
+  ): TableLayout => {
+    const key = JSON.stringify([block.layout.id, at.origin, at.widthPt]);
+    const known = placedWholeLayouts.get(key);
+    if (known) return known;
+    const nested = source.nestedById[block.layout.id]!;
+    const layout = layoutNestedWhole(
+      nested,
+      nestedWholeContext(context, nested, at.widthPt, at.origin),
+    );
+    placedWholeLayouts.set(key, layout);
+    return layout;
+  };
+  const rowFor = (state: readonly CellPagePlacement[]): TableRowLayoutInput => ({
+    ...row,
+    cells: row.cells.map((cell, logicalCellIndex) => {
+      const cellState = state[logicalCellIndex];
+      if (!cellState || cellState === UNPLACED_CELL) return cell;
+      return {
+        ...cell,
+        blocks: cell.blocks.map((block, blockIndex): TableCellBlockInput => {
+          const nestedAt = cellState.nested.find((candidate) => candidate.blockIndex === blockIndex);
+          if (nestedAt) {
+            // A nested table this fragment continues keeps its acquisition;
+            // its remainder is taken through the origin.
+            const continues = continuing
+              && blockIndex === firstBlock(logicalCellIndex)
+              && cursor.cells[logicalCellIndex]?.nestedCursor != null;
+            const placed: TableCellBlockInput = continues
+              ? { ...block }
+              : { ...block, layout: placedWhole(block, nestedAt) };
+            nestedPageOrigins.set(placed, nestedAt.origin);
+            return placed;
+          }
+          const hostFlow = cellState.hostFlows
+            .find((candidate) => candidate.blockIndex === blockIndex)?.translation;
+          if (!hostFlow) return block;
+          return {
+            ...block,
+            layout: owner.reacquireParagraph({
+              logicalRowIndex: row.logicalRowIndex,
+              logicalCellIndex,
+              sourceBlockIndex: block.sourceBlockIndex,
+              ownership,
+              page: context.page,
+              acquired: block.layout,
+              hostFlowPageTranslationPt: hostFlow,
+            }),
+          };
+        }),
+      };
+    }),
+  });
+  return Object.freeze({ stateAt, rowFor });
+}
+
+/**
+ * {@link rowPagePlacement} of a row of a paginated fragment. The row (or, for
+ * a continued row, the remainder this fragment lays out; for a row this
+ * fragment cuts, the cut occurrence) is probed after the rows already
+ * selected in this fragment, as the fragment lays them out
+ * ({@link probeFragmentRow}), or, once the fragment has been materialized,
+ * in that materialization's own track of the row (`frame.final`; see
+ * {@link takeTableFragment}). Everything is repeated until exact (re-acquired
+ * content can move the blocks after it). `frame.seed`, the row this placed in
+ * a previous pass, only starts the iteration; `frame.used` is told the track
+ * the accepted placement was read from.
+ */
+function placeRowNestedContent(
+  source: RetainedTableAcquisition,
+  row: TableRowLayoutInput,
+  precedingRows: () => readonly TableRowLayoutInput[],
+  ownership: TableFragmentOwnership,
+  context: TableFragmentContext,
+  tracks: FragmentRowTracks,
+  cursor?: TableFragmentCursor,
+  cutOf?: (candidate: TableRowLayoutInput) => TableRowLayoutInput | null,
+  frame?: FragmentRowFrame,
+): TableRowLayoutInput {
+  const placement = rowPagePlacement(source, row, ownership, context, new Map(), cursor);
+  if (!placement) return row;
+  const preceding = precedingRows();
+  // A continued row is probed as the remainder this fragment lays out.
+  const continuing = cursor !== undefined && cursor.rowFragmentIndex > 0;
+  const stateOf = (candidate: TableRowLayoutInput): readonly CellPagePlacement[] => {
+    // A row this fragment cuts is probed as the cut occurrence: its track and
+    // so every non-top vAlign offset are the cut's, not the uncut row's.
+    const probed = cutOf?.(candidate) ?? (continuing
+      ? remainingRowAtCursor(source, candidate, cursor, context, new Map())
+      : candidate);
+    const laidOut = frame?.final
+      ? frame.final(probed)
+      : probeFragmentRow(source, preceding, probed, context, tracks);
+    frame?.used(laidOut);
+    return placement.stateAt(candidate, laidOut);
+  };
+  try {
+    return convergeExactState<Readonly<{ row: TableRowLayoutInput; state: string }>>({
+      seedState: JSON.stringify(null),
+      step: (previous) => {
+        const state = stateOf(previous?.row ?? frame?.seed ?? row);
+        return Object.freeze({ row: placement.rowFor(state), state: JSON.stringify(state) });
+      },
+      stateOf: (pass) => pass.state,
+      // Resource guard only; exact equality determines acceptance.
+      limit: 16,
+    }).value.row;
+  } catch (error) {
+    if (error instanceof ExactConvergenceError) {
+      throw new LayoutInvariantError(
+        'NON_CONVERGENCE',
+        `page placement below a table row did not converge (${error.reason}; ${error.states.length} states)`,
+      );
+    }
+    throw error;
+  }
+}
+
+/**
+ * A §17.4.57 positioned child with page-placed content of its own (library
+ * policy). The positioned nested table is placed by the final frame resolved
+ * here, so the page position of its local origin is that frame's: the
+ * content below its cells (its own positioned children, at any in-flow depth
+ * below it) is placed through it, exactly as a paginated table places it
+ * through its page translation. The frame depends on the placed child's
+ * extent (the vertical page clamp, the registry avoidance) and the placement
+ * on the frame, so the pair is iterated to an exact fixed point: the frame
+ * the placed child resolves to is the frame it was placed through. No
+ * threshold is applied; a cycle or exhaustion fails closed like the
+ * final-frame reflow around it. Without a page placement the child keeps its
+ * acquisition.
+ */
+function resolveFinalFrameChild<R extends Readonly<{ placement: ResolvedFloatingTablePlacementLayout }>>(
+  source: RetainedTableAcquisition,
+  occurrence: RetainedTableAcquisition['floatingTables'][number],
+  context: TableFragmentContext,
+  resolveWith: (child: TableLayout) => R,
+): R {
+  // The placement being resolved already found this child.
+  const nested = source.nestedById[occurrence.tableId]!;
+  if (!hasPagePlacedContent(nested) || !context.pagePlacement) return resolveWith(nested.layout);
+  const hostCell = floatingTableIndexOf(source).cellById.get(occurrence.hostCellId);
+  if (!hostCell) throw new LayoutInvariantError('INVALID_REFERENCE', `${occurrence.hostCellId} is not a cell`);
+  // The child is acquired in its host cell's content box (table-acquisition.ts).
+  const widthPt = hostCell.contentBounds.widthPt;
+  // The child placed through each origin this solve visits, laid out once: a
+  // pass that confirms the previous origin (the fixed point) is the previous
+  // pass's child, so it is not laid out — with every level nested in it —
+  // again. Released with the solve.
+  const children = new Map<string, TableLayout>();
+  const childAt = (origin: PagePoint): TableLayout => {
+    const key = JSON.stringify(origin);
+    const known = children.get(key);
+    if (known) return known;
+    const child = layoutNestedWhole(nested, nestedWholeContext(context, nested, widthPt, origin));
+    children.set(key, child);
+    return child;
+  };
+  const originOf = (resolved: R, child: TableLayout): PagePoint => Object.freeze({
+    xPt: resolved.placement.xPt - child.flowBounds.xPt,
+    yPt: resolved.placement.yPt - child.flowBounds.yPt,
+  });
+  type Pass = Readonly<{ resolution: R; origin: PagePoint }>;
+  try {
+    return convergeExactState<Pass>({
+      step: (previous) => {
+        const origin = previous?.origin ?? originOf(resolveWith(nested.layout), nested.layout);
+        const child = childAt(origin);
+        const resolution = resolveWith(child);
+        return Object.freeze({ resolution, origin: originOf(resolution, child) });
+      },
+      stateOf: (pass) => JSON.stringify(pass.origin),
+      // Resource guard only; exact equality determines acceptance.
+      limit: 16,
+    }).value.resolution;
+  } catch (error) {
+    if (error instanceof ExactConvergenceError) {
+      throw new LayoutInvariantError(
+        'NON_CONVERGENCE',
+        `positioned child page placement did not converge (${error.reason}; ${error.states.length} states)`,
+      );
+    }
+    throw error;
+  }
 }
 
 function remainingRowAtCursor(
@@ -392,6 +1103,7 @@ function remainingRowAtCursor(
                   cell,
                   context,
                   context.freshPageHeightPt,
+                  block,
                 ),
               );
               const requiredAnchor = requiredAnchorByCell.get(cell.id);
@@ -421,11 +1133,67 @@ function remainingRowAtCursor(
   };
 }
 
+/**
+ * Where a row being prepared is laid out: `candidate` (the row as prepared so
+ * far; `remaining`, its remainder at the preparing fragment's cursor) as the
+ * layout holding it lays it out, and the input that layout is given for it.
+ */
+type RowTrack = (
+  candidate: TableRowLayoutInput,
+  remaining: TableRowLayoutInput,
+) => Readonly<{ input: TableRowLayoutInput; row: TableRowLayout }>;
+
+/** The remainder laid out by itself `offsetPt` below the table's top: a
+ * first estimate of a fragment row's track, before any materialization of
+ * the fragment is known ({@link takeTableFragment}). */
+function aloneRowTrack(
+  source: RetainedTableAcquisition,
+  context: TableFragmentContext,
+  offsetPt: number,
+): RowTrack {
+  const rowPlacement: FlowBlockPlacement = {
+    ...context.placement,
+    cursor: { ...context.placement.cursor, yPt: context.placement.cursor.yPt + offsetPt },
+  };
+  return (_candidate, remaining) => {
+    const laidOut = layoutTable({
+      ...source.input,
+      id: `${source.input.id}:float-probe:${context.page.occurrenceId}:${remaining.logicalRowIndex}`,
+      rows: [remaining],
+    }, rowPlacement, context.services).layout;
+    const row = laidOut.rows[0];
+    if (!row) throw new LayoutInvariantError('INVALID_REFERENCE', 'row track lost its row');
+    return { input: remaining, row };
+  };
+}
+
+/** The geometry a row is materialized in, independent of its cells'
+ * content: its box and each cell's box (a merge owner's reaching the merge's
+ * last row). Equal keys place one candidate's content identically, every
+ * vAlign offset and block position included (table.ts materializeTableRow
+ * reads nothing else of the tracks for them). */
+function rowTrackKey(row: TableRowLayout): string {
+  return JSON.stringify([row.flowBounds, row.cells.map((cell) => cell.flowBounds)]);
+}
+
+/**
+ * The row's own §17.4.57 positioned children given final frames, their
+ * anchor paragraphs re-acquired around them, to an exact fixed point. Every
+ * anchor and column frame is read from the candidate as `track` lays it out
+ * (the caller's final tracks of the row, or an estimate the caller checks
+ * against them). `seed`, a previous resolution of these children in that
+ * caller's solve, only starts the iteration: the accepted row is still the
+ * one whose resolution, read from its own track, is the one it was
+ * re-acquired with. Starting from the unwrapped row instead, a centered or
+ * bottom-aligned cell whose wrapped content fills its track would approach
+ * that fixed point without reaching it (each wrap moves the anchor a part of
+ * the way).
+ */
 function finalFrameRow(
   source: RetainedTableAcquisition,
   row: TableRowLayoutInput,
   ownership: TableFragmentOwnership,
-  rowOffsetPt: number,
+  track: RowTrack,
   context: TableFragmentContext,
   registry: readonly FloatRegistryEntryPt[],
   nextParagraphId: number,
@@ -433,6 +1201,7 @@ function finalFrameRow(
   ownsAnchorStart: (
     occurrence: RetainedTableAcquisition['floatingTables'][number],
   ) => boolean,
+  seed: readonly ResolvedFloatingTablePlacementLayout[] = [],
 ): Readonly<{
   row: TableRowLayoutInput;
   resolved: readonly ResolvedFloatingTablePlacementLayout[];
@@ -441,14 +1210,17 @@ function finalFrameRow(
 }> {
   const frames = context.floatingTableFrames;
   const reacquire = context.reacquirePageDependentBlock;
-  const sourceRow = source.input.rows[row.logicalRowIndex];
+  const sourceRow = sourceRowFor(source, row.logicalRowIndex);
   if (!frames || !reacquire || !sourceRow) {
     return { row, resolved: [], registry, nextParagraphId };
   }
-  const occurrences = source.floatingTables.filter((occurrence) => (
-    sourceRow.cells.some((cell) => cell.id === occurrence.hostCellId)
-    && ownsAnchorStart(occurrence)
-  ));
+  // The row's own children, in source order (cell ids are unique).
+  const { byHostCell } = floatingTableIndexOf(source);
+  const occurrences = sourceRow.cells
+    .flatMap((cell) => byHostCell.get(cell.id) ?? [])
+    .sort((left, right) => left - right)
+    .map((index) => source.floatingTables[index]!)
+    .filter((occurrence) => ownsAnchorStart(occurrence));
   if (occurrences.length === 0) return { row, resolved: [], registry, nextParagraphId };
   const requiredAnchorByCell = new Map<string, number>();
   for (const occurrence of occurrences) {
@@ -461,29 +1233,16 @@ function finalFrameRow(
     );
   }
 
-  const rowPlacement: FlowBlockPlacement = {
-    ...context.placement,
-    cursor: {
-      ...context.placement.cursor,
-      yPt: context.placement.cursor.yPt + rowOffsetPt,
-    },
-  };
-  const remainingRow = remainingRowAtCursor(
-    source, row, cursor, context, requiredAnchorByCell,
-  );
-  const provisional = layoutTable({
-    ...source.input,
-    id: `${source.input.id}:float-probe:${context.page.occurrenceId}:${row.logicalRowIndex}`,
-    rows: [remainingRow],
-  }, rowPlacement, context.services).layout;
   const translation = context.finalPlacementTranslationPt ?? { xPt: 0, yPt: 0 };
   const placementFor = (
     occurrence: RetainedTableAcquisition['floatingTables'][number],
-    laidOut: TableLayout,
+    laidOut: TableRowLayout,
     rowInput: TableRowLayoutInput,
   ): FloatingTablePlacementLayout | null => {
-    const cellIndex = rowInput.cells.findIndex((cell) => cell.id === occurrence.hostCellId);
-    const laidOutCell = laidOut.rows[0]?.cells[cellIndex];
+    // A track may lay out a fragment's cut of the row, whose cells carry
+    // fragment ids: cells correspond by position, as the source row's do.
+    const cellIndex = sourceRow.cells.findIndex((cell) => cell.id === occurrence.hostCellId);
+    const laidOutCell = laidOut.cells[cellIndex];
     const selectedCell = rowInput.cells[cellIndex];
     const blockIndex = selectedCell?.blocks.findIndex((block) => (
       block.sourceBlockIndex === occurrence.anchorBlockIndex
@@ -520,14 +1279,10 @@ function finalFrameRow(
   };
 
   const resolveCandidate = (candidate: TableRowLayoutInput) => {
-    const remainingCandidate = remainingRowAtCursor(
-      source, candidate, cursor, context, requiredAnchorByCell,
+    const laidOut = track(
+      candidate,
+      remainingRowAtCursor(source, candidate, cursor, context, requiredAnchorByCell),
     );
-    const laidOut = candidate === row ? provisional : layoutTable({
-      ...source.input,
-      id: `${source.input.id}:float-converge:${context.page.occurrenceId}:${row.logicalRowIndex}`,
-      rows: [remainingCandidate],
-    }, rowPlacement, context.services).layout;
     let transaction = beginFloatingTablePlacementTransaction(
       registry,
       nextParagraphId,
@@ -536,21 +1291,28 @@ function finalFrameRow(
     );
     const resolved: ResolvedFloatingTablePlacementLayout[] = [];
     for (const occurrence of occurrences) {
-      const placement = placementFor(occurrence, laidOut, remainingCandidate);
-      if (!placement || (
-        context.floatingTableRegistry?.coordinateSpace !== 'upright-physical-page-points'
-        && !ownsFinalFrameAxis(placement)
-      )) continue;
-      const resolution = resolveFloatingTablePlacementInTransaction(placement, {
-        page: frames.page,
-        margin: frames.margin,
-        text: {
-          xPt: placement.columnBounds?.xPt ?? placement.anchorBounds.xPt,
-          yPt: placement.anchorBounds.yPt,
-          widthPt: placement.columnBounds?.widthPt ?? placement.anchorBounds.widthPt,
-          heightPt: placement.anchorBounds.heightPt,
+      // Every owned occurrence gets its final frame, a text/text one too: no
+      // later step places an unresolved nested occurrence on the page (only
+      // resolved placements are painted). A text axis keeps the offset its
+      // acquisition registered against the cell flow (acquiredTextOffsetPt),
+      // so the anchor paragraphs' acquired wrap is unchanged.
+      const placement = placementFor(occurrence, laidOut.row, laidOut.input);
+      if (!placement) continue;
+      const resolveWith = (child: TableLayout) => resolveFloatingTablePlacementInTransaction(
+        child === placement.child ? placement : Object.freeze({ ...placement, child }),
+        {
+          page: frames.page,
+          margin: frames.margin,
+          text: {
+            xPt: placement.columnBounds?.xPt ?? placement.anchorBounds.xPt,
+            yPt: placement.anchorBounds.yPt,
+            widthPt: placement.columnBounds?.widthPt ?? placement.anchorBounds.widthPt,
+            heightPt: placement.anchorBounds.heightPt,
+          },
         },
-      }, transaction);
+        transaction,
+      );
+      const resolution = resolveFinalFrameChild(source, occurrence, context, resolveWith);
       resolved.push(resolution.placement);
       transaction = resolution.transaction;
     }
@@ -599,9 +1361,13 @@ function finalFrameRow(
     placements: resolved,
   });
 
-  const initialResolution = resolveCandidate(row);
-  if (initialResolution.resolved.length === 0) {
-    return { row, resolved: [], registry, nextParagraphId };
+  // A seed resolution of children this row no longer owns is not used.
+  const owned = new Set(occurrences.map(occurrenceSelectionKey));
+  const seeded = seed.filter((placement) => owned.has(occurrenceSelectionKey(placement.source)));
+  let initialResolved: readonly ResolvedFloatingTablePlacementLayout[] = seeded;
+  if (seeded.length === 0) {
+    initialResolved = resolveCandidate(row).resolved;
+    if (initialResolved.length === 0) return { row, resolved: [], registry, nextParagraphId };
   }
   type Pass = Readonly<{
     candidate: TableRowLayoutInput;
@@ -610,10 +1376,10 @@ function finalFrameRow(
   }>;
   try {
     const result = convergeExactState<Pass>({
-      seedState: convergenceKey(row, initialResolution.resolved),
+      seedState: convergenceKey(row, initialResolved),
       step: (previous) => {
         const candidate = reacquireCandidate(
-          previous?.resolution.resolved ?? initialResolution.resolved,
+          previous?.resolution.resolved ?? initialResolved,
         );
         const resolution = resolveCandidate(candidate);
         return Object.freeze({
@@ -652,7 +1418,7 @@ function selectedOwnsOccurrence(
   selection: SelectedRow,
   occurrence: Pick<FloatingTablePlacementLayout, 'hostCellId' | 'anchorBlockIndex'>,
 ): boolean {
-  const sourceRow = source.input.rows[selection.logicalRowIndex];
+  const sourceRow = sourceRowFor(source, selection.logicalRowIndex);
   const cellIndex = sourceRow?.cells.findIndex(
     (cell) => cell.id === occurrence.hostCellId,
   ) ?? -1;
@@ -865,7 +1631,7 @@ function selectCell(
       const nestedResult = takeTableFragment(
         nested,
         nestedCursor ?? startTableFragmentCursor(),
-        nestedTableFragmentContext(source, cell, context, remainingPt),
+        nestedTableFragmentContext(source, cell, context, remainingPt, sourceBlock),
       );
       if (!nestedResult.fragment) break;
       blocks.push({ layout: nestedResult.fragment, sourceBlockIndex: sourceBlock.sourceBlockIndex });
@@ -915,6 +1681,10 @@ function partialRow(
   complete: boolean;
 }> {
   const cellCursors = row.cells.map((_, index) => cursor.cells[index] ?? emptyCellCursor());
+  // Library cut model: each fragment is materialized as its own grid in which
+  // every cell keeps both §17.4.68 margins, a projected segment-opening owner
+  // (table.ts projectedMergeRole) included, so each fragment reserves them.
+  // Splitting one cell's margins across fragments is not modeled.
   const verticalInsetsPt = Math.max(0, ...row.cells.map((cell) => (
     cell.margins.topPt + cell.margins.bottomPt
   )));
@@ -1057,7 +1827,7 @@ function materializeFragment(
     });
   });
   const floatingTables = selected.flatMap((selection, rowIndex) => {
-    const sourceRow = source.input.rows[selection.logicalRowIndex];
+    const sourceRow = sourceRowFor(source, selection.logicalRowIndex);
     if (!sourceRow) return [];
     return source.floatingTables.flatMap((occurrence): FloatingTablePlacementLayout[] => {
       const logicalCellIndex = sourceRow.cells.findIndex((cell) => cell.id === occurrence.hostCellId);
@@ -1165,16 +1935,160 @@ function firstCellAnchorPastPageBand(
   return -1;
 }
 
+/** How a selection pass prepares the row at one fragment position
+ * ({@link takeTableFragment}): `final`, the track a previous pass's
+ * materialization gave that position (absent before one did), and `seed`,
+ * the row placed there in that pass. `used` is told every track the row's
+ * preparation reads, the last being the accepted one's. */
+type FragmentRowFrame = Readonly<{
+  final?: (candidate: TableRowLayoutInput) => TableRowLayout;
+  seed?: TableRowLayoutInput;
+  used: (row: TableRowLayout) => void;
+}>;
+
+/** What the latest materialization holding a fragment position left for the
+ * next selection pass: its track there, and what that pass placed and
+ * resolved there (seeds only). */
+type FragmentPositionHint = Readonly<{
+  final: (candidate: TableRowLayoutInput) => TableRowLayout;
+  placed?: TableRowLayoutInput;
+  cut?: TableRowLayoutInput;
+  resolved: readonly ResolvedFloatingTablePlacementLayout[];
+}>;
+
+type FragmentPass = Readonly<{
+  result: TableFragmentResult;
+  /** The rows the result's fragment materializes, in position order. */
+  selected: readonly SelectedRow[];
+  /** Per position, the key of the track its preparation was accepted in. */
+  used: ReadonlyMap<number, string>;
+  placed: ReadonlyMap<number, TableRowLayoutInput>;
+  cut: ReadonlyMap<number, TableRowLayoutInput>;
+}>;
+
+/** Selection passes of one fragment; a resource guard only. */
+const FRAGMENT_TRACK_PASS_LIMIT = 16;
+
+/**
+ * The next fragment of a paginated table (library policy for the rows'
+ * page-placed content, below).
+ *
+ * A row whose content is placed by its geometry — page-placed content below
+ * its cells (rowPagePlacement) and its own §17.4.57 positioned children
+ * (finalFrameRow) — is prepared before the fragment holding it is laid out,
+ * so a selection pass reads its track from an estimate: the rows selected
+ * above it (probeFragmentRow), or the row by itself below them. Neither is the
+ * materialized fragment's track when a merge continues below the row (the
+ * merge's deficit then lands lower, not on the row) or when the rows below
+ * change its rule footprint, and a centered or bottom-aligned cell's content,
+ * every anchor in it and so every wrap, sits where its track puts it.
+ *
+ * So the fragment is solved to an exact fixed point: a pass selects and
+ * materializes the fragment as before; if every row prepared against a track
+ * was accepted in the very track the materialization gives it (equal
+ * {@link rowTrackKey}), the pass is the result. Otherwise the next pass is
+ * run from scratch — page admission, repeated headers, cut reselection and
+ * the ownership of continuations included — with each position prepared in
+ * the latest materialization's track of it (table.ts laidOutTableTracks) and
+ * seeded by what was placed there. Admission therefore uses the heights of
+ * rows prepared in their final tracks, and the result's registry delta and
+ * placements are its own pass's (an earlier pass leaves nothing). No
+ * threshold is applied; exhaustion fails closed.
+ *
+ * Cost: a table without such rows takes one pass, unchanged. Otherwise a
+ * pass is the selection (proportional to the selected rows, with the prefix
+ * probes) plus one frame build proportional to the fragment; passes are
+ * bounded by the guard, and every pass after the first is charged to the
+ * session's acquisition budget (runtime-state.ts), as a speculative whole
+ * layout nested in another is, since a nested table's fragments are solved
+ * inside its parent's passes.
+ */
 export function takeTableFragment(
   source: RetainedTableAcquisition,
   cursor: TableFragmentCursor,
   context: TableFragmentContext,
 ): TableFragmentResult {
+  let hints: ReadonlyMap<number, FragmentPositionHint> = new Map();
+  for (let pass = 1; ; pass += 1) {
+    const taken = takeTableFragmentPass(source, cursor, context, hints);
+    const fragment = taken.result.fragment;
+    if (!fragment || taken.used.size === 0) return taken.result;
+    const keys = fragment.rows.map(rowTrackKey);
+    // A position past the fragment (trimmed after selection) placed nothing.
+    if ([...taken.used].every(([position, key]) => position >= keys.length || keys[position] === key)) {
+      return taken.result;
+    }
+    if (pass >= FRAGMENT_TRACK_PASS_LIMIT) {
+      throw new LayoutInvariantError(
+        'NON_CONVERGENCE',
+        `table fragment row tracks did not converge (${pass} passes)`,
+      );
+    }
+    paragraphAcquisitionCacheOf(context.services)?.noteMiss();
+    const tracks = laidOutTableTracks(
+      { ...source.input, rows: taken.selected.map((selection) => selection.input) },
+      fragment,
+      context.placement,
+    );
+    // A position the latest fragment lacks keeps the hint of the last one
+    // that held it.
+    const next = new Map(hints);
+    taken.selected.forEach((selection, position) => {
+      next.set(position, Object.freeze({
+        final: (candidate: TableRowLayoutInput) => tracks.row(position, candidate),
+        placed: taken.placed.get(position),
+        cut: taken.cut.get(position),
+        resolved: selection.resolvedFloatingTables ?? [],
+      }));
+    });
+    hints = next;
+  }
+}
+
+function takeTableFragmentPass(
+  source: RetainedTableAcquisition,
+  cursor: TableFragmentCursor,
+  context: TableFragmentContext,
+  hints: ReadonlyMap<number, FragmentPositionHint>,
+): FragmentPass {
+  const selected: SelectedRow[] = [];
+  const used = new Map<number, string>();
+  const placedAt = new Map<number, TableRowLayoutInput>();
+  const cutAt = new Map<number, TableRowLayoutInput>();
+  const passOf = (result: TableFragmentResult): FragmentPass => Object.freeze({
+    result, selected, used, placed: placedAt, cut: cutAt,
+  });
+  // The row at `position` is prepared in the latest materialization's track
+  // of it, else in the estimate.
+  const frameAt = (position: number, seed?: TableRowLayoutInput): FragmentRowFrame => ({
+    final: hints.get(position)?.final,
+    seed,
+    used: (row) => { used.set(position, rowTrackKey(row)); },
+  });
+  const trackAt = (
+    position: number,
+    offsetPt: number,
+    inputOf: (candidate: TableRowLayoutInput, remaining: TableRowLayoutInput) => TableRowLayoutInput,
+  ): RowTrack => {
+    const final = hints.get(position)?.final;
+    const estimate = aloneRowTrack(source, context, offsetPt);
+    return (candidate, remaining) => {
+      let laidOut: ReturnType<RowTrack>;
+      if (final) {
+        const input = inputOf(candidate, remaining);
+        laidOut = { input, row: final(input) };
+      } else {
+        laidOut = estimate(candidate, remaining);
+      }
+      used.set(position, rowTrackKey(laidOut.row));
+      return laidOut;
+    };
+  };
+  const wholeInput = (candidate: TableRowLayoutInput) => candidate;
   if (cursor.rowIndex >= source.input.rows.length) {
-    return { fragment: null, nextCursor: null, requiresFreshPage: false };
+    return passOf({ fragment: null, nextCursor: null, requiresFreshPage: false });
   }
 
-  const selected: SelectedRow[] = [];
   const registrySnapshot = context.floatingTableRegistry;
   if (registrySnapshot
     && registrySnapshot.flowDomainId.length === 0) {
@@ -1185,30 +2099,36 @@ export function takeTableFragment(
   ]) as readonly FloatRegistryEntryPt[];
   let floatParagraphId = registrySnapshot?.nextParagraphId ?? 0;
   let availablePt = Math.max(0, context.availableHeightPt);
+  const pageOriginTracks = startFragmentRowTracks(source);
   const headerCount = leadingHeaderCount(source.input);
   if (cursor.rowIndex >= headerCount && cursor.rowIndex > 0 && headerCount > 0) {
     for (let rowIndex = 0; rowIndex < headerCount; rowIndex += 1) {
-      const acquiredHeader = rowForOccurrence(
+      const position = selected.length;
+      const hint = hints.get(position);
+      const acquiredHeader = placeRowNestedContent(source, rowForOccurrence(
         source,
         source.input.rows[rowIndex]!,
         'repeated-header',
         context,
-      );
+      ), () => selected.map((item) => item.input), 'repeated-header', context, pageOriginTracks,
+      undefined, undefined, frameAt(position, hint?.placed));
+      placedAt.set(position, acquiredHeader);
       const preparedHeader = finalFrameRow(
         source,
         acquiredHeader,
         'repeated-header',
-        context.availableHeightPt - availablePt,
+        trackAt(position, context.availableHeightPt - availablePt, wholeInput),
         context,
         floatRegistry,
         floatParagraphId,
         startTableFragmentCursor(),
         () => true,
+        hint?.resolved,
       );
       const header = preparedHeader.row;
       const heightPt = paginationRowHeightForOccurrence(source, header, rowIndex, context);
       if (heightPt > availablePt + EPSILON_PT) {
-        return { fragment: null, nextCursor: cursor, requiresFreshPage: true };
+        return passOf({ fragment: null, nextCursor: cursor, requiresFreshPage: true });
       }
       selected.push(selectedWholeRow(
         header,
@@ -1230,8 +2150,12 @@ export function takeTableFragment(
   );
   let nextCursor: TableFragmentCursor | null = cursor;
   let rowIndex = cursor.rowIndex;
+  // Acquisition-time tracks of rows whose nested content is placed per page
+  // (re-acquired anchor or text box paragraphs) are not their occurrence
+  // tracks, so they never admit the remainder.
   const retainedRemainderFits = cursor.rowFragmentIndex === 0
     && cursor.cells.length === 0
+    && !needsNestedPageOrigins(source)
     && source.layout.rows
       .slice(cursor.rowIndex)
       .reduce((heightPt, row) => heightPt + Math.max(0, row.heightPt), 0)
@@ -1239,21 +2163,28 @@ export function takeTableFragment(
   let followsCompletedPartialRow = false;
   while (rowIndex < source.input.rows.length) {
     const ownership: TableFragmentOwnership = 'source';
-    const acquiredRow = rowForOccurrence(
+    const rowCursor = rowIndex === cursor.rowIndex
+      ? cursor
+      : Object.freeze({ rowIndex, rowFragmentIndex: 0, cells: Object.freeze([]) });
+    const occurrenceRow = rowForOccurrence(
       source,
       source.input.rows[rowIndex]!,
       ownership,
       context,
     );
-    const rowCursor = rowIndex === cursor.rowIndex
-      ? cursor
-      : Object.freeze({ rowIndex, rowFragmentIndex: 0, cells: Object.freeze([]) });
+    const position = selected.length;
+    const hint = hints.get(position);
+    const acquiredRow = placeRowNestedContent(
+      source, occurrenceRow, () => selected.map((item) => item.input), ownership, context,
+      pageOriginTracks, rowCursor, undefined, frameAt(position, hint?.placed),
+    );
+    placedAt.set(position, acquiredRow);
     const canTakeWhole = rowIndex !== cursor.rowIndex || cursor.rowFragmentIndex === 0;
     const preparedRow = canTakeWhole ? finalFrameRow(
       source,
       acquiredRow,
       ownership,
-      context.availableHeightPt - availablePt,
+      trackAt(position, context.availableHeightPt - availablePt, wholeInput),
       context,
       floatRegistry,
       floatParagraphId,
@@ -1271,6 +2202,7 @@ export function takeTableFragment(
           || (cellCursor.blockIndex === anchorBlockOffset
             && cellCursor.paragraphLineStart === 0);
       },
+      hint?.resolved,
     ) : {
       row: acquiredRow,
       resolved: Object.freeze([]),
@@ -1307,10 +2239,10 @@ export function takeTableFragment(
       const fitsFreshBand = wholeHeightPt + freshHeaderHeightPt
         <= context.freshPageHeightPt + EPSILON_PT;
       if (fitsFreshBand) {
-        return { fragment: null, nextCursor: cursor, requiresFreshPage: true };
+        return passOf({ fragment: null, nextCursor: cursor, requiresFreshPage: true });
       }
       if (context.availableHeightPt + EPSILON_PT < context.freshPageHeightPt) {
-        return { fragment: null, nextCursor: cursor, requiresFreshPage: true };
+        return passOf({ fragment: null, nextCursor: cursor, requiresFreshPage: true });
       }
       // Compatibility-owned over-page cantSplit admission.
       if (wordClipsOverPageCantSplitRow({
@@ -1342,7 +2274,7 @@ export function takeTableFragment(
       epsilonPt: EPSILON_PT,
     })) {
       if (selected.some((item) => item.ownership === 'source')) break;
-      return { fragment: null, nextCursor: cursor, requiresFreshPage: true };
+      return passOf({ fragment: null, nextCursor: cursor, requiresFreshPage: true });
     }
 
     // Floating overflow is not defined by §17.4.57. The retained floating
@@ -1365,8 +2297,32 @@ export function takeTableFragment(
 
     const canGainPageSpace = context.availableHeightPt + EPSILON_PT < context.freshPageHeightPt
       || selected.some((item) => item.ownership === 'source');
+    // The row is cut (or continued) here: its nested page-placed content is
+    // placed against the occurrence this fragment selects, not the uncut row,
+    // and so are its own positioned children's anchors.
+    const cutOf = (candidate: TableRowLayoutInput): TableRowLayoutInput | null => {
+      const probe = partialRow(
+        source, candidate, rowCursor, availablePt, freshSourceHeightPt, canGainPageSpace, context,
+      );
+      return probe.selected && !(probe.complete && rowCursor.rowFragmentIndex === 0)
+        ? probe.selected.input
+        : null;
+    };
+    const continuing = rowCursor.rowFragmentIndex > 0;
+    const cutRow = rowNeedsPageOrigins(source, occurrenceRow)
+      ? placeRowNestedContent(
+        source, occurrenceRow, () => selected.map((item) => item.input), ownership, context,
+        pageOriginTracks, rowCursor, cutOf, frameAt(position, hint?.cut),
+      )
+      : acquiredRow;
+    if (cutRow !== acquiredRow) cutAt.set(position, cutRow);
+    const cutTrack = trackAt(
+      position,
+      context.availableHeightPt - availablePt,
+      (candidate, remaining) => cutOf(candidate) ?? (continuing ? remaining : candidate),
+    );
     let partial = partialRow(
-      source, acquiredRow, rowCursor, availablePt,
+      source, cutRow, rowCursor, availablePt,
       freshSourceHeightPt, canGainPageSpace, context,
     );
     let selectedPrepared: ReturnType<typeof finalFrameRow> | null = null;
@@ -1380,14 +2336,15 @@ export function takeTableFragment(
       visitedOwnershipStates.add(ownershipState);
       selectedPrepared = finalFrameRow(
         source,
-        acquiredRow,
+        cutRow,
         ownership,
-        context.availableHeightPt - availablePt,
+        cutTrack,
         context,
         floatRegistry,
         floatParagraphId,
         rowCursor,
         (occurrence) => transactionInputs.has(occurrenceSelectionKey(occurrence)),
+        hint?.resolved,
       );
       const reselection = partialRow(
         source, selectedPrepared.row, rowCursor, availablePt,
@@ -1453,11 +2410,11 @@ export function takeTableFragment(
         'Table pagination cannot advance from a fresh page',
       );
     }
-    return {
+    return passOf({
       fragment: null,
       nextCursor: cursor,
       requiresFreshPage: true,
-    };
+    });
   }
   let fragment = materializeFragment(source, selected, context);
   // §20.4.2.3 identifies the drawing as cell-owned; it does not specify this
@@ -1474,15 +2431,15 @@ export function takeTableFragment(
     const conflictIndex = firstCellAnchorPastPageBand(fragment, pageBottomPt);
     if (conflictIndex < 0) break;
     const conflict = selected[conflictIndex];
-    const authoredRow = conflict && source.input.rows[conflict.logicalRowIndex];
+    const authoredRow = conflict && sourceRowFor(source, conflict.logicalRowIndex);
     if (conflict?.ownership !== 'source' || conflict.fragmentIndex !== 0
       || authoredRow?.heightRule !== 'atLeast' || authoredRow.cantSplit) break;
     if (selected.slice(0, conflictIndex).every((item) => item.ownership !== 'source')) {
-      return { fragment: null, nextCursor: cursor, requiresFreshPage: true };
+      return passOf({ fragment: null, nextCursor: cursor, requiresFreshPage: true });
     }
     selected.splice(conflictIndex);
     nextCursor = Object.freeze({
-      rowIndex: conflict.logicalRowIndex,
+      rowIndex: inputRowIndexOf(source, conflict.logicalRowIndex),
       rowFragmentIndex: 0,
       cells: Object.freeze([]),
     });
@@ -1502,7 +2459,7 @@ export function takeTableFragment(
     if (!trimmableSourceRow || sourceCount <= 1) break;
     selected.pop();
     nextCursor = Object.freeze({
-      rowIndex: last.logicalRowIndex,
+      rowIndex: inputRowIndexOf(source, last.logicalRowIndex),
       rowFragmentIndex: 0,
       cells: Object.freeze([]),
     });
@@ -1511,9 +2468,9 @@ export function takeTableFragment(
   if (fragment.advancePt > context.availableHeightPt + EPSILON_PT
     && context.availableHeightPt + EPSILON_PT < context.freshPageHeightPt
     && fragment.advancePt <= context.freshPageHeightPt + EPSILON_PT) {
-    return { fragment: null, nextCursor: cursor, requiresFreshPage: true };
+    return passOf({ fragment: null, nextCursor: cursor, requiresFreshPage: true });
   }
-  return {
+  return passOf({
     fragment,
     nextCursor,
     requiresFreshPage: false,
@@ -1532,5 +2489,5 @@ export function takeTableFragment(
         );
       })(),
     } : {}),
-  };
+  });
 }

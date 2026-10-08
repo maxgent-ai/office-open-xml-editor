@@ -1,0 +1,16 @@
+id: no-retained-bytes-rest-pattern
+language: Rust
+severity: error
+rule:
+  kind: remaining_field_pattern
+  inside:
+    kind: impl_item
+    has:
+      field: trait
+      regex: ^RetainedBytes$
+    stopBy: end
+message: >-
+  RetainedBytes implementations must destructure every field so model field
+  additions fail to compile until their retained storage is measured.
+files:
+  - "packages/ooxml-common/src/chart/**/*.rs"

@@ -529,8 +529,7 @@ describe('retained text-frame grouping', () => {
       acquired.members[0]!.fragment.exclusions[0]!.anchorOccurrenceId,
     ]);
     expect(followingLines).toEqual([
-      'B'.repeat(16),
-      'B'.repeat(16),
+      'B'.repeat(32),
       'B'.repeat(8),
     ]);
   });

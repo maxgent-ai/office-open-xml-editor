@@ -40,6 +40,8 @@ struct GovernorState {
     max_actual_by_part: HashMap<usize, u64>,
     next_operation_id: u64,
     operations: HashMap<u64, LogicalOperationState>,
+    hard_limit_totals: HashMap<HardResourceLimitKind, u64>,
+    retained_instance_bytes: HashMap<(HardResourceLimitKind, String, String), u64>,
     first_error: Option<String>,
 }
 
@@ -66,7 +68,7 @@ pub struct ResourceUsage {
 /// Closed vocabulary for non-configurable parser/model safety ceilings.
 /// Format parsers choose a semantic kind; this shared layer owns its stable
 /// wire discriminants so stage/resource/metric strings cannot drift.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum HardResourceLimitKind {
     XmlEventBytes,
     XmlContextBytes,
@@ -80,6 +82,8 @@ pub enum HardResourceLimitKind {
     PptxSlideJsonBytes,
     PptxSharedDependencyXmlBytes,
     XmlDomComplexity,
+    ChartexAllocationElements,
+    ChartexAllocationBytes,
     PptxSharedDependencyProjectionBytes,
     PptxSharedCacheEntries,
     PptxSharedCacheProjectionBytes,
@@ -116,6 +120,8 @@ impl HardResourceLimitKind {
             Self::PptxSharedDependencyXmlBytes => {
                 ("parsing", "pptx-shared-dependency-xml", "bytes")
             }
+            Self::ChartexAllocationElements => ("parsing", "chartex-allocation", "elements"),
+            Self::ChartexAllocationBytes => ("parsing", "chartex-allocation", "bytes"),
             Self::XmlDomComplexity => ("parsing", "xml-dom", "complexity-units"),
             Self::PptxSharedDependencyProjectionBytes => {
                 ("parsing", "pptx-shared-dependency", "projected-bytes")
@@ -277,6 +283,8 @@ impl ResourceGovernor {
             max_actual_by_part: HashMap::new(),
             next_operation_id: 1,
             operations: HashMap::new(),
+            hard_limit_totals: HashMap::new(),
+            retained_instance_bytes: HashMap::new(),
             first_error: None,
         })))
     }
@@ -519,6 +527,31 @@ pub fn observe_hard_limit(
     limit: u64,
     observed: u64,
 ) -> Result<(), String> {
+    observe_limit(kind, part, limit, observed, false)
+}
+
+/// Latch a crossing of a finite public (caller-configurable) policy limit.
+/// Identical lifecycle to `observe_hard_limit`; only the wire `configurable`
+/// flag differs, telling callers that raising the public option can admit the
+/// input. Callers must only use this when the public limit is the binding one
+/// (i.e. not shadowed by a lower hard/representation ceiling).
+pub fn observe_policy_limit(
+    kind: HardResourceLimitKind,
+    part: Option<&str>,
+    limit: u64,
+    observed: u64,
+) -> Result<(), String> {
+    observe_limit(kind, part, limit, observed, true)
+}
+
+/// Shared latch for hard and policy crossings so both share one state path.
+fn observe_limit(
+    kind: HardResourceLimitKind,
+    part: Option<&str>,
+    limit: u64,
+    observed: u64,
+    configurable: bool,
+) -> Result<(), String> {
     if observed <= limit {
         return Ok(());
     }
@@ -535,6 +568,56 @@ pub fn observe_hard_limit(
         part,
         limit,
         observed,
+        configurable,
+    }))
+}
+
+/// Retain one independently owned model instance for the package lifetime.
+///
+/// The key names both the source part and the concrete retention site. Repeated
+/// parsing of the same site (for example XLSX cursor preview and final
+/// materialization) observes only growth, while a second drawing that owns an
+/// equal model has a distinct site and is charged independently.
+pub fn retain_instance(
+    kind: HardResourceLimitKind,
+    source_part: &str,
+    site: &str,
+    limit: u64,
+    bytes: u64,
+) -> Result<(), String> {
+    let Some(governor) = active_governor() else {
+        return Ok(());
+    };
+    let mut state = governor.0.borrow_mut();
+    state.assert_healthy()?;
+    // Raw package identifiers stay internal. Public ChartEx violations omit
+    // them so filenames and relationship ids never cross the wire boundary.
+    let key = (kind, source_part.to_owned(), site.to_owned());
+    let old = state
+        .retained_instance_bytes
+        .get(&key)
+        .copied()
+        .unwrap_or(0);
+    let retained = old.max(bytes);
+    let total = state
+        .hard_limit_totals
+        .get(&kind)
+        .copied()
+        .unwrap_or(0)
+        .saturating_add(retained.saturating_sub(old));
+    state.retained_instance_bytes.insert(key, retained);
+    state.hard_limit_totals.insert(kind, total);
+    if total <= limit {
+        return Ok(());
+    }
+    let (stage, resource, metric) = kind.wire_fields();
+    Err(state.fail(LimitCrossing {
+        stage,
+        resource,
+        metric,
+        part: None,
+        limit,
+        observed: total,
         configurable: false,
     }))
 }

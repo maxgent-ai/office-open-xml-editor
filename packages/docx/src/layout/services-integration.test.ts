@@ -9,7 +9,8 @@ import { createLayoutServices } from '../layout-runtime.js';
 import { layoutDocument } from '../document-layout.js';
 import type { DocParagraph, DocRun, DocxDocumentModel } from '../types.js';
 import type { InternalDocxDocumentModel, InternalFieldRun } from '../parser-model.js';
-import type { TextLayoutService } from './text.js';
+import { createTextLayoutService, type TextLayoutService } from './text.js';
+import { createFontResolver } from './font-service.js';
 import { mathResourceKey } from './resources.js';
 import { layoutSourceStore } from '../layout-source-model-adapter.js';
 import { privateResourceLookupOf } from './runtime-state.js';
@@ -70,25 +71,22 @@ describe('production layout service integration', () => {
     expect(layout.pages[0]?.geometry).toMatchObject({ widthPt: 612, heightPt: 792 });
   });
 
-  it('routes every normal run segmentation and measurement through the injected text service', () => {
+  it('uses injected text metrics instead of the fallback Canvas width', () => {
     const base = createLayoutServices(model(), { measureContext: measureContext() });
-    let calls = 0;
-    const countingText: TextLayoutService = Object.freeze({
-      ...base.text,
-      shape(request: Parameters<TextLayoutService['shape']>[0]) {
-        calls += 1;
-        return base.text.shape(request);
-      },
+    const text = createTextLayoutService({
+      fonts: createFontResolver([]),
+      measurer: { fingerprint: 'injected-seven-point-advances', measure: request => ({
+        advancePt: [...request.text].length * 7, ascentPt: 8, descentPt: 2,
+      }) },
     });
-    const services = Object.freeze({ ...base, text: countingText });
+    const services = Object.freeze({ ...base, text });
     const environment: LineLayoutEnvironment = { pageIndex: 0, totalPages: 1, layoutServices: services };
     const segments = buildSegments([textRun('first'), textRun('second')], environment);
-    const afterSegmentation = calls;
     const lines = layoutLines(measureContext(), segments, 300, 0, 1);
 
-    expect(afterSegmentation).toBeGreaterThanOrEqual(2);
-    expect(calls).toBeGreaterThan(afterSegmentation);
     expect(lines).toHaveLength(1);
+    expect(lines[0]?.segments.reduce((sum, segment) => sum + segment.measuredWidth, 0)).toBe(77);
+    expect(lines[0]?.segments.map(segment => 'text' in segment ? segment.text : '').join('')).toBe('firstsecond');
   });
 
   it('keeps cross-slot scalar spans in one unbreakable grapheme', () => {

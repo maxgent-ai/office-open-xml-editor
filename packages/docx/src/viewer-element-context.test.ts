@@ -125,7 +125,7 @@ describe('DocxViewer element context', () => {
       format: 'docx', kind: 'element', elementType: 'chart',
       point: { xPt: 0, yPt: 0 },
     });
-    const outlineLayer = mounted.wrapper.children.at(-1)!;
+    const outlineLayer = mounted.wrapper.children.find((child) => child.dataset.overlay === 'element')!;
     expect(outlineLayer.children).toHaveLength(1);
     expect(outlineLayer.children[0].style).toMatchObject({
       left: `${10 / PAGE.widthPt * 100}%`,

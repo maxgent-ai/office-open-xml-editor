@@ -347,6 +347,9 @@ const retainedFloatFragment = (node: PaintNode): TableFragmentLayout => {
   return node as TableFragmentLayout;
 };
 
+// These row-fit probes use a one-character following marker so it fits the
+// clear side gap. Long-word gap admission is covered by float-gap-continuation;
+// it must not introduce an unrelated extra text page into the table assertions.
 describe('canonical layout — floating-table page-fit / row-split (§17.4.57, Word ground truth)', () => {
   // Content band 160×100, bodyTop 20. A vertAnchor="text" table's first slice sits
   // at its in-flow anchor (y=20N after N leading 20pt lines); it overflows once
@@ -621,7 +624,7 @@ describe('canonical layout — floating-table page-fit / row-split (§17.4.57, W
     const body = [
       para({ text: 'a' }),
       floatTableRows(tblp({ vertAnchor: 'text', tblpY: 1 }), 3, 20),
-      para({ text: 'anchor' }),
+      para({ text: 'x' }),
     ];
     const pages = layoutPages(body, section(), makeCtx());
     expect(pages.length).toBe(1);
@@ -629,7 +632,7 @@ describe('canonical layout — floating-table page-fit / row-split (§17.4.57, W
     // Exactly ONE floating-table element (not sliced).
     const floatCount = pages.reduce((s, p) => s + p.layers.body.filter(isFloatTable).length, 0);
     expect(floatCount).toBe(1);
-    expect(hasAnchorText(pages[0], 'anchor')).toBe(true);
+    expect(hasAnchorText(pages[0], 'x')).toBe(true);
   });
 
   it('moves the whole table to the next page when not even the first row fits the remaining band', () => {
@@ -643,7 +646,7 @@ describe('canonical layout — floating-table page-fit / row-split (§17.4.57, W
       para({ text: 'c' }),
       para({ text: 'd' }),
       floatTableRows(tblp({ vertAnchor: 'text', tblpY: 0 }), 3, 30),
-      para({ text: 'anchor' }),
+      para({ text: 'x' }),
     ];
     const pages = layoutPages(body, section(), makeCtx());
     expect(pages.length).toBe(2);
@@ -652,7 +655,7 @@ describe('canonical layout — floating-table page-fit / row-split (§17.4.57, W
     expect(pages[0].layers.body.map(textOf)).toEqual(['a', 'b', 'c', 'd']);
     // All rows land on page 2 (a fresh full band fits them).
     expect(floatRowsOn(pages[1])).toEqual(['r1', 'r2', 'r3']);
-    expect(hasAnchorText(pages[1], 'anchor')).toBe(true);
+    expect(hasAnchorText(pages[1], 'x')).toBe(true);
   });
 
   it('terminates (no loop) and places a single over-tall row on the page it best fits', () => {
@@ -667,7 +670,7 @@ describe('canonical layout — floating-table page-fit / row-split (§17.4.57, W
       para({ text: 'b' }),
       para({ text: 'c' }),
       floatTableRows(tblp({ vertAnchor: 'text', tblpY: 0 }), 1, 150),
-      para({ text: 'anchor' }),
+      para({ text: 'x' }),
     ];
     const pages = layoutPages(body, section(), makeCtx());
     // Terminates with a bounded page count; the over-tall single row is placed once.
@@ -688,7 +691,7 @@ describe('canonical layout — floating-table page-fit / row-split (§17.4.57, W
       para({ text: 'b' }),
       para({ text: 'c' }),
       floatTableRows(tblp({ vertAnchor: 'page', tblpY: 90 }), 2, 30),
-      para({ text: 'anchor' }),
+      para({ text: 'x' }),
     ];
     const pages = layoutPages(body, section(), makeCtx());
     expect(pages.length).toBe(1);
@@ -697,7 +700,7 @@ describe('canonical layout — floating-table page-fit / row-split (§17.4.57, W
     expect(floatRowsOn(pages[0])).toEqual(['r1', 'r2']);
     const floatCount = pages.reduce((s, p) => s + p.layers.body.filter(isFloatTable).length, 0);
     expect(floatCount).toBe(1);
-    expect(hasAnchorText(pages[0], 'anchor')).toBe(true);
+    expect(hasAnchorText(pages[0], 'x')).toBe(true);
   });
 
   it('(e) does NOT split a margin-anchored floating table (absolute y; clamped in place by geometry)', () => {
@@ -709,7 +712,7 @@ describe('canonical layout — floating-table page-fit / row-split (§17.4.57, W
       para({ text: 'b' }),
       para({ text: 'c' }),
       floatTableRows(tblp({ vertAnchor: 'margin', tblpY: 70 }), 2, 30),
-      para({ text: 'anchor' }),
+      para({ text: 'x' }),
     ];
     const pages = layoutPages(body, section(), makeCtx());
     expect(pages.length).toBe(1);

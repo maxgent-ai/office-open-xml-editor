@@ -97,13 +97,26 @@ pub(crate) fn xdr_node_hidden(node: &roxmltree::Node) -> bool {
     false
 }
 
+fn resolve_drawing_media_path(
+    drawing_rels: &HashMap<String, String>,
+    drawing_path: &str,
+    archive: &mut crate::XlsxZip,
+    rid: &str,
+) -> Option<String> {
+    let target = drawing_rels.get(rid)?;
+    let media_path = resolve_zip_path(drawing_path, target);
+    // Confirm the entry resolves before emitting its path. `index_for_name`
+    // reads only the central directory and does not inflate the media payload.
+    archive.index_for_name(&media_path)?;
+    Some(media_path)
+}
+
 /// Parse `<xdr:twoCellAnchor>` elements from a drawing XML and resolve
-/// embedded pictures into data URLs. `drawing_dir` is the folder that
-/// contains `drawing_path` so relative `Target`s resolve correctly.
+/// embedded pictures into data URLs. `drawing_path` is the OPC source part.
 pub(crate) fn parse_drawing_anchors(
     drawing_xml: &str,
     drawing_rels: &HashMap<String, String>,
-    drawing_dir: &str,
+    drawing_path: &str,
     archive: &mut crate::XlsxZip,
     // Positional clrScheme palette, for resolving a picture's `<a:duotone>`
     // effect colours (§20.1.8.23).
@@ -138,10 +151,10 @@ pub(crate) fn parse_drawing_anchors(
         // §20.1.8.23 `<a:duotone>` recolour (None ⇒ no effect).
         let mut alpha: Option<f64> = None;
         let mut duotone: Option<Duotone> = None;
-        // ECMA-376 §20.5.2.33 `twoCellAnchor@editAs`. Possible values:
-        // "twoCell" (default), "oneCell", "absolute". With "oneCell" Excel
-        // preserves the picture's saved size from <xdr:spPr><a:xfrm><a:ext>
-        // regardless of cell resizing.
+        // ECMA-376 §20.5.2.33 `twoCellAnchor@editAs` (normative fact): "twoCell"
+        // (default), "oneCell", "absolute". It governs how later band edits
+        // move/resize the picture (§20.5.3.2). The initial display rect of a
+        // tagged twoCellAnchor is from/to (renderer resolver policy).
         let edit_as = anchor.attribute("editAs").map(|s| s.to_string());
 
         for child in anchor.children() {
@@ -212,8 +225,9 @@ pub(crate) fn parse_drawing_anchors(
                             ooxml_common::color::TintMode::PowerPointLinear,
                         );
                     }
-                    // <xdr:pic><xdr:spPr><a:xfrm><a:ext cx cy>: the picture's
-                    // own saved EMU extent. Authoritative when editAs="oneCell".
+                    // <xdr:pic><xdr:spPr><a:xfrm><a:ext cx cy>: the picture's raw
+                    // child transform extent, recorded unchanged. Sizing from it
+                    // is untagged-model compatibility policy only.
                     if let Some(sp_pr) = child.children().find(|n| {
                         n.tag_name().name() == "spPr" && is_xdr_ns(n.tag_name().namespace())
                     }) {
@@ -243,24 +257,15 @@ pub(crate) fn parse_drawing_anchors(
             }
         }
 
-        // Resolve a blip rId → the media part's zip path (verifying the entry
-        // exists, so a dangling rId is dropped exactly as before). The renderer
-        // fetches the bytes lazily via `extract_image`; no base64 is inlined.
-        let mut resolve = |rid: &str| -> Option<String> {
-            let target = drawing_rels.get(rid)?;
-            let media_path = resolve_zip_path(drawing_dir, target);
-            // Confirm the entry resolves before emitting its path (preserves the
-            // previous "drop when bytes are missing" semantics). `index_for_name`
-            // reads only the central directory — no inflate, unlike the former
-            // `read_zip_bytes` which decompressed the entry only to discard it.
-            archive.index_for_name(&media_path)?;
-            Some(media_path)
-        };
-
         // Vector original first (so an svg-only picture is never dropped); raster
-        // fallback second.
-        let svg_image_path = svg_rid.as_deref().and_then(&mut resolve);
-        let raster_path = pic_rid.as_deref().and_then(&mut resolve);
+        // fallback second. Verify each selected target exists without inflating
+        // it; the renderer fetches the bytes lazily via `extract_image`.
+        let svg_image_path = svg_rid
+            .as_deref()
+            .and_then(|rid| resolve_drawing_media_path(drawing_rels, drawing_path, archive, rid));
+        let raster_path = pic_rid
+            .as_deref()
+            .and_then(|rid| resolve_drawing_media_path(drawing_rels, drawing_path, archive, rid));
 
         // A picture needs at least one drawable source. Prefer the raster as
         // `image_path` (Excel's compatibility fallback); when no raster is
@@ -289,6 +294,8 @@ pub(crate) fn parse_drawing_anchors(
             to_row,
             to_row_off,
             edit_as,
+            // Normative fact: this loop only accepts `xdr:twoCellAnchor`.
+            anchor_tag: Some(DrawingAnchorTag::TwoCellAnchor),
             native_ext_cx,
             native_ext_cy,
             rotation,
@@ -882,8 +889,7 @@ pub(crate) fn parse_tx_body(
     // ooxml_common::text::parse_body_pr over the bare ECMA-376 §21.1.2.1.1
     // defaults — xlsx has no theme objectDefaults / inheritance layer, so
     // BodyPrDefaults::spec() is the whole fallback (anchor `t`, wrap `square`,
-    // autofit `none`, insets 91440/45720 EMU). `vert` is parsed but xlsx does
-    // not model it. When there is no `<a:bodyPr>` the spec defaults apply.
+    // autofit `none`, insets 91440/45720 EMU). When there is no `<a:bodyPr>` the spec defaults apply.
     let body = tx_body
         .children()
         .find(|n| n.is_element() && n.tag_name().name() == "bodyPr")
@@ -905,6 +911,17 @@ pub(crate) fn parse_tx_body(
                 ln_spc_reduction: None,
             }
         });
+    let body_pr = tx_body
+        .children()
+        .find(|n| n.is_element() && n.tag_name().name() == "bodyPr");
+    let body_bool = |name| {
+        body_pr
+            .and_then(|bp| bp.attribute(name))
+            .is_some_and(|v| v == "1" || v == "true")
+    };
+    let anchor_ctr = body_bool("anchorCtr");
+    let spc_first_last_para = body_bool("spcFirstLastPara");
+    let vert = body.vert;
     let anchor = body.anchor;
     let wrap = body.wrap;
     // Text insets (EMU), §21.1.2.1.1. Emitted always (spec default when the
@@ -1001,6 +1018,7 @@ pub(crate) fn parse_tx_body(
                             let mut bold = false;
                             let mut italic = false;
                             let mut size: f64 = 0.0;
+                            let mut spacing = None;
                             let mut color: Option<String> = None;
                             let mut font_face: Option<String> = None;
                             // ECMA-376 §21.1.2.3.1 `<a:ea>` / `<a:cs>` typefaces.
@@ -1015,6 +1033,10 @@ pub(crate) fn parse_tx_body(
                                         bold = rc.attribute("b").map(|v| v == "1").unwrap_or(false);
                                         italic =
                                             rc.attribute("i").map(|v| v == "1").unwrap_or(false);
+                                        spacing = rc
+                                            .attribute("spc")
+                                            .and_then(|s| s.parse::<f64>().ok())
+                                            .map(|v| v / 100.0);
                                         size = rc
                                             .attribute("sz")
                                             .and_then(|s| s.parse::<f64>().ok())
@@ -1055,6 +1077,7 @@ pub(crate) fn parse_tx_body(
                                     bold,
                                     italic,
                                     size,
+                                    spacing,
                                     color,
                                     font_face,
                                     font_face_ea,
@@ -1098,6 +1121,9 @@ pub(crate) fn parse_tx_body(
         None
     } else {
         Some(ShapeText {
+            vert,
+            anchor_ctr,
+            spc_first_last_para,
             anchor,
             wrap,
             auto_fit,
@@ -1607,14 +1633,17 @@ pub(crate) fn parse_shape_anchors(
         let (mut from_col, mut from_col_off, mut from_row, mut from_row_off) =
             (0u32, 0i64, 0u32, 0i64);
         let (mut to_col, mut to_col_off, mut to_row, mut to_row_off) = (0u32, 0i64, 0u32, 0i64);
-        // ECMA-376 §20.5.2.33 `twoCellAnchor@editAs` — see ImageAnchor parsing
-        // path for semantics. `"oneCell"` instructs the renderer to preserve
-        // the group's saved EMU size instead of resizing with the cell rect.
-        // oneCellAnchor has no `<to>`; its size is the saved EMU `<ext>` (which
-        // equals the shape's own xfrm ext), positioned at `<from>` — i.e. the
-        // "oneCell" (move-but-don't-size) semantics the renderer already
-        // implements via nativeExtCx/Cy. Force editAs accordingly so the
-        // renderer sizes from the saved ext rather than a (missing) `to` rect.
+        // ECMA-376 §20.5.2.33 `twoCellAnchor@editAs` (normative fact). A
+        // `oneCellAnchor` (§20.5.2.24) has no `<to>` and no `editAs`. Its size
+        // is the anchor-level `<xdr:ext>`, which need not equal the child xfrm
+        // ext. The parser keeps its established compatibility value
+        // `editAs="oneCell"` for untagged consumers. Tagged consumers size from
+        // `anchor_ext_*` (recorded below) and never from the child ext.
+        let xml_anchor_tag = if anchor_tag == "oneCellAnchor" {
+            DrawingAnchorTag::OneCellAnchor
+        } else {
+            DrawingAnchorTag::TwoCellAnchor
+        };
         let edit_as = if anchor_tag == "oneCellAnchor" {
             Some("oneCell".to_string())
         } else {
@@ -1622,8 +1651,20 @@ pub(crate) fn parse_shape_anchors(
         };
         let native_ext_cx: i64;
         let native_ext_cy: i64;
+        let mut anchor_ext_cx: Option<i64> = None;
+        let mut anchor_ext_cy: Option<i64> = None;
         for c in anchor.children() {
             if !c.is_element() {
+                continue;
+            }
+            // §20.5.2.24 anchor-level `<xdr:ext>` of a oneCellAnchor, recorded
+            // raw with no reconciliation against the child xfrm.
+            if anchor_tag == "oneCellAnchor"
+                && c.tag_name().name() == "ext"
+                && is_xdr_ns(c.tag_name().namespace())
+            {
+                anchor_ext_cx = c.attribute("cx").and_then(|v| v.trim().parse().ok());
+                anchor_ext_cy = c.attribute("cy").and_then(|v| v.trim().parse().ok());
                 continue;
             }
             if c.tag_name().name() == "from" || c.tag_name().name() == "to" {
@@ -1699,8 +1740,9 @@ pub(crate) fn parse_shape_anchors(
                 continue;
             }
 
-            // Top-level grpSp ext is the group's saved on-sheet EMU size —
-            // authoritative when editAs="oneCell".
+            // Preserve the raw top-level grpSp transform extent. Tagged anchor
+            // placement is resolved separately from its markers / anchor ext;
+            // untagged legacy models retain the existing native-size policy.
             native_ext_cx = root.ext_x as i64;
             native_ext_cy = root.ext_y as i64;
 
@@ -1812,6 +1854,9 @@ pub(crate) fn parse_shape_anchors(
             edit_as,
             native_ext_cx,
             native_ext_cy,
+            anchor_tag: Some(xml_anchor_tag),
+            anchor_ext_cx,
+            anchor_ext_cy,
             shapes,
         });
     }
@@ -1848,7 +1893,7 @@ pub(crate) fn load_sheet_shape_groups(
     }
     let mut all: Vec<ShapeAnchor> = Vec::new();
     for target in drawing_targets {
-        let drawing_path = resolve_zip_path(&format!("xl/{}", sheet_dir), &target);
+        let drawing_path = resolve_zip_path(&format!("xl/{sheet_path}"), &target);
         let Ok(drawing_xml) = read_zip_string(archive, &drawing_path) else {
             continue;
         };
@@ -1896,7 +1941,7 @@ pub(crate) fn build_drawing_rid_urls(
         {
             continue;
         }
-        let media_path = resolve_zip_path(drawing_dir, &target);
+        let media_path = resolve_zip_path(drawing_path, &target);
         // Only emit the path when the entry actually resolves (preserves the
         // previous behavior of dropping rIds whose bytes are missing).
         // `index_for_name` checks the central directory only — no inflate, unlike
@@ -1950,8 +1995,8 @@ pub(crate) fn load_sheet_images(
     let mut all_anchors: Vec<ImageAnchor> = Vec::new();
     for target in drawing_targets {
         // sheet_dir is "worksheets", target typically "../drawings/drawing1.xml"
-        // base dir for the drawing = "xl/worksheets" + "../drawings" → "xl/drawings"
-        let drawing_path = resolve_zip_path(&format!("xl/{}", sheet_dir), &target);
+        // base dir for the drawing = "xl/worksheets/sheet1.xml" + "../drawings" → "xl/drawings/drawing1.xml"
+        let drawing_path = resolve_zip_path(&format!("xl/{sheet_path}"), &target);
         let Ok(drawing_xml) = read_zip_string(archive, &drawing_path) else {
             continue;
         };
@@ -1968,7 +2013,7 @@ pub(crate) fn load_sheet_images(
         let mut anchors = parse_drawing_anchors(
             &drawing_xml,
             &drawing_rels,
-            drawing_dir,
+            &drawing_path,
             archive,
             theme_colors,
         );
@@ -2078,7 +2123,7 @@ fn parse_vml_client_anchor(client_data: &roxmltree::Node) -> Option<AnchorRect> 
 fn vml_ole_preview<'a>(
     vml_doc: &'a roxmltree::Document<'a>,
     vml_rels: &HashMap<String, String>,
-    vml_dir: &str,
+    vml_path: &str,
     shape_id: &str,
     archive: &mut crate::XlsxZip,
 ) -> Option<(String, roxmltree::Node<'a, 'a>)> {
@@ -2105,7 +2150,7 @@ fn vml_ole_preview<'a>(
             )
         })?;
     let target = vml_rels.get(rid)?;
-    let media_path = resolve_zip_path(vml_dir, target);
+    let media_path = resolve_zip_path(vml_path, target);
     archive.index_for_name(&media_path)?;
     // Preview parts are metafiles/bitmaps (EMF/WMF/PNG…); require an image MIME
     // so a mis-typed rels target can never feed non-image bytes to the renderer.
@@ -2130,7 +2175,7 @@ fn vml_ole_preview<'a>(
 fn load_legacy_vml_drawing(
     doc: &roxmltree::Document,
     sheet_rels: &HashMap<String, String>,
-    sheet_dir: &str,
+    sheet_path: &str,
     archive: &mut crate::XlsxZip,
 ) -> Option<(String, HashMap<String, String>, String)> {
     let legacy = doc
@@ -2143,16 +2188,16 @@ fn load_legacy_vml_drawing(
         "id",
     )?;
     let target = sheet_rels.get(rid)?;
-    let vml_path = resolve_zip_path(sheet_dir, target); // e.g. xl/drawings/vmlDrawing1.vml
+    let vml_path = resolve_zip_path(sheet_path, target); // e.g. xl/drawings/vmlDrawing1.vml
     let vml_xml = read_zip_string(archive, &vml_path).ok()?;
     // Directory + file split for the VML part's own rels.
-    let (vml_dir, vml_file) = vml_path.rsplit_once('/')?;
-    let vml_rels_path = format!("{vml_dir}/_rels/{vml_file}.rels");
+    let (vml_part, vml_file) = vml_path.rsplit_once('/')?;
+    let vml_rels_path = format!("{vml_part}/_rels/{vml_file}.rels");
     let vml_rels = read_zip_string(archive, &vml_rels_path)
         .ok()
         .map(|xml| parse_rels_map(&xml))
         .unwrap_or_default();
-    Some((vml_xml, vml_rels, vml_dir.to_string()))
+    Some((vml_xml, vml_rels, vml_path))
 }
 
 /// Parse worksheet `<oleObjects>` (the collection element, ECMA-376
@@ -2197,7 +2242,7 @@ fn load_legacy_vml_drawing(
 pub(crate) fn parse_ole_object_anchors(
     sheet_xml: &str,
     sheet_rels: &HashMap<String, String>,
-    sheet_dir: &str,
+    sheet_path: &str,
     archive: &mut crate::XlsxZip,
 ) -> Vec<ImageAnchor> {
     let Ok(doc) = parse_guarded(sheet_xml) else {
@@ -2218,7 +2263,7 @@ pub(crate) fn parse_ole_object_anchors(
     // Lazily load the sheet's legacy VML drawing (once) — only reached because
     // there is at least one oleObject to place. `vml` owns the XML string; the
     // parsed document borrows from it, so both live to the end of the function.
-    let vml = load_legacy_vml_drawing(&doc, sheet_rels, sheet_dir, archive);
+    let vml = load_legacy_vml_drawing(&doc, sheet_rels, sheet_path, archive);
     let vml_parsed = vml
         .as_ref()
         .and_then(|(xml, rels, dir)| parse_guarded(xml).ok().map(|d| (d, rels, dir)));
@@ -2237,7 +2282,7 @@ pub(crate) fn parse_ole_object_anchors(
                 "id",
             )?;
             let target = sheet_rels.get(rid)?;
-            let media_path = resolve_zip_path(sheet_dir, target);
+            let media_path = resolve_zip_path(sheet_path, target);
             archive.index_for_name(&media_path)?;
             // §18.3.1.56: this relationship nominally targets the object *data*
             // part. Only genuine image parts enter the picture pipeline; a
@@ -2253,8 +2298,8 @@ pub(crate) fn parse_ole_object_anchors(
         let vml_preview = match (&object_pr_preview, shape_id, &vml_parsed) {
             // objectPr already resolved an image — no need to touch the VML.
             (Some(_), _, _) => None,
-            (None, Some(sid), Some((vml_doc, vml_rels, vml_dir))) => {
-                vml_ole_preview(vml_doc, vml_rels, vml_dir, sid, archive)
+            (None, Some(sid), Some((vml_doc, vml_rels, vml_part))) => {
+                vml_ole_preview(vml_doc, vml_rels, vml_part, sid, archive)
             }
             _ => None,
         };
@@ -2299,6 +2344,8 @@ pub(crate) fn parse_ole_object_anchors(
             // sizeWithCells booleans (CT_ObjectAnchor); those live in a different
             // value space and are not mapped here.
             edit_as: Some("twoCell".to_string()),
+            // A CT_ObjectAnchor marker, not an xdr anchor element: untagged.
+            anchor_tag: None,
             native_ext_cx: 0,
             native_ext_cy: 0,
             rotation: None,
@@ -2360,8 +2407,8 @@ pub(crate) fn load_sheet_ole_images(
     if sheet_rels.is_empty() {
         return Vec::new();
     }
-    let base_dir = format!("xl/{}", sheet_dir);
-    parse_ole_object_anchors(sheet_xml, &sheet_rels, &base_dir, archive)
+    let source_part = format!("xl/{sheet_path}");
+    parse_ole_object_anchors(sheet_xml, &sheet_rels, &source_part, archive)
 }
 
 #[cfg(test)]
@@ -2592,6 +2639,25 @@ mod math_tests {
             vt.get("lnSpcReduction").is_none(),
             "lnSpcReduction omitted when unset"
         );
+    }
+
+    #[test]
+    fn stacked_body_preserves_direction_and_spacing() {
+        for vert in ["wordArtVert", "wordArtVertRtl"] {
+            let xml = format!(
+                r#"<xdr:txBody {NS}>
+              <a:bodyPr vert="{vert}" anchorCtr="1" spcFirstLastPara="1"/>
+              <a:p><a:r><a:rPr spc="125"/><a:t>AB</a:t></a:r></a:p>
+            </xdr:txBody>"#
+            );
+            let doc = roxmltree::Document::parse(&xml).unwrap();
+            let text = parse_tx_body(&doc.root_element(), &[]).unwrap();
+            let value = serde_json::to_value(text).unwrap();
+            assert_eq!(value["vert"], vert);
+            assert_eq!(value["anchorCtr"], true);
+            assert_eq!(value["spcFirstLastPara"], true);
+            assert_eq!(value["paragraphs"][0]["runs"][0]["spacing"], 1.25);
+        }
     }
 
     /// `<a:pPr>/<a:lnSpc>` line spacing (ECMA-376 §21.1.2.2.5): spcPct → a
@@ -3177,6 +3243,81 @@ mod style_lnref_tests {
             other => panic!("expected an image-geom shape, got {other:?}"),
         }
     }
+
+    /// ECMA-376 §20.5.2.24: a true `oneCellAnchor` records its anchor-level
+    /// `<xdr:ext>` separately from the pic's raw `<a:xfrm><a:ext>`. The shape
+    /// path still owns the crop, because `parse_drawing_anchors` only scans
+    /// twoCellAnchor.
+    #[test]
+    fn onecellanchor_records_anchor_ext_separately_from_child_ext() {
+        let xml = format!(
+            r#"<xdr:wsDr {NS} xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><xdr:oneCellAnchor>
+              <xdr:from><xdr:col>1</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>1</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
+              <xdr:ext cx="1828800" cy="685800"/>
+              <xdr:pic>
+                <xdr:nvPicPr><xdr:cNvPr id="2" name="P"/><xdr:cNvPicPr/></xdr:nvPicPr>
+                <xdr:blipFill><a:blip r:embed="rId1"/><a:srcRect l="10000"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill>
+                <xdr:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="457200"/></a:xfrm>
+                  <a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr>
+              </xdr:pic>
+              <xdr:clientData/>
+            </xdr:oneCellAnchor></xdr:wsDr>"#
+        );
+        let mut rids = HashMap::new();
+        rids.insert("rId1".to_string(), "xl/media/image1.png".to_string());
+        let anchors = parse_shape_anchors(&xml, &theme(), &ThemeFormatScheme::default(), &rids);
+        assert_eq!(anchors.len(), 1);
+        let a = &anchors[0];
+        assert_eq!(a.anchor_tag, Some(DrawingAnchorTag::OneCellAnchor));
+        assert_eq!(
+            (a.anchor_ext_cx, a.anchor_ext_cy),
+            (Some(1828800), Some(685800))
+        );
+        // Raw child extent is unchanged, not rewritten to the anchor ext.
+        assert_eq!((a.native_ext_cx, a.native_ext_cy), (914400, 457200));
+        match &a.shapes[0].geom {
+            ShapeGeom::Image { src_rect, .. } => assert!(src_rect.is_some()),
+            other => panic!("expected an image-geom shape, got {other:?}"),
+        }
+        let json = serde_json::to_string(a).unwrap();
+        assert!(json.contains("\"anchorTag\":\"oneCellAnchor\""), "{json}");
+        assert!(json.contains("\"anchorExtCx\":1828800"), "{json}");
+        assert!(json.contains("\"anchorExtCy\":685800"), "{json}");
+    }
+
+    /// A twoCellAnchor `sp` is tagged from the actual XML element, carries no
+    /// anchor-level ext, and keeps its raw xfrm ext. (The twoCellAnchor `pic`
+    /// dedupe is covered by `standalone_twocellanchor_pic_is_not_a_shape_anchor`.)
+    #[test]
+    fn twocellanchor_sp_is_tagged_without_anchor_ext() {
+        let xml = format!(
+            r#"<xdr:wsDr {NS}><xdr:twoCellAnchor editAs="oneCell">
+              <xdr:from><xdr:col>1</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>1</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
+              <xdr:to><xdr:col>4</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>6</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>
+              <xdr:sp>
+                <xdr:nvSpPr><xdr:cNvPr id="3" name="S"/><xdr:cNvSpPr/></xdr:nvSpPr>
+                <xdr:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="952500" cy="476250"/></a:xfrm>
+                  <a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr>
+              </xdr:sp>
+              <xdr:clientData/>
+            </xdr:twoCellAnchor></xdr:wsDr>"#
+        );
+        let anchors = parse_shape_anchors(
+            &xml,
+            &theme(),
+            &ThemeFormatScheme::default(),
+            &HashMap::new(),
+        );
+        assert_eq!(anchors.len(), 1);
+        let a = &anchors[0];
+        assert_eq!(a.anchor_tag, Some(DrawingAnchorTag::TwoCellAnchor));
+        assert_eq!(a.edit_as.as_deref(), Some("oneCell"));
+        assert_eq!((a.anchor_ext_cx, a.anchor_ext_cy), (None, None));
+        assert_eq!((a.native_ext_cx, a.native_ext_cy), (952500, 476250));
+        let json = serde_json::to_string(a).unwrap();
+        assert!(json.contains("\"anchorTag\":\"twoCellAnchor\""), "{json}");
+        assert!(!json.contains("anchorExtCx"), "{json}");
+    }
 }
 
 /// §20.1.2.2.8 — an `<xdr:cNvPr hidden="1">` drawing object is not rendered.
@@ -3667,7 +3808,8 @@ mod blip_svg_tests {
         let data = build_media_zip(PNG_1X1, SVG);
         let cursor = Cursor::new(data.clone());
         let mut archive = crate::XlsxZip::new(cursor).unwrap();
-        let anchors = parse_drawing_anchors(&xml, rels, "xl/drawings", &mut archive, &[]);
+        let anchors =
+            parse_drawing_anchors(&xml, rels, "xl/drawings/drawing1.xml", &mut archive, &[]);
         assert_eq!(anchors.len(), 1, "exactly one picture anchor expected");
         anchors.into_iter().next().unwrap()
     }
@@ -3700,7 +3842,8 @@ mod blip_svg_tests {
                 hidden = hidden_attr,
             );
             let mut archive = crate::XlsxZip::new(Cursor::new(data.clone())).unwrap();
-            let anchors = parse_drawing_anchors(&xml, &rels, "xl/drawings", &mut archive, &[]);
+            let anchors =
+                parse_drawing_anchors(&xml, &rels, "xl/drawings/drawing1.xml", &mut archive, &[]);
             assert_eq!(anchors.len(), expect_len, "hidden={hidden_attr}");
         }
     }
@@ -3782,10 +3925,11 @@ mod blip_svg_tests {
         );
         let data = build_media_zip(PNG_1X1, SVG);
         let mut archive = crate::XlsxZip::new(Cursor::new(data)).unwrap();
-        let anchor = parse_drawing_anchors(&xml, &rels, "xl/drawings", &mut archive, &[])
-            .into_iter()
-            .next()
-            .unwrap();
+        let anchor =
+            parse_drawing_anchors(&xml, &rels, "xl/drawings/drawing1.xml", &mut archive, &[])
+                .into_iter()
+                .next()
+                .unwrap();
 
         assert_eq!(anchor.native_ext_cx, 0);
         assert_eq!(anchor.native_ext_cy, 0);
@@ -3805,10 +3949,11 @@ mod blip_svg_tests {
             );
             let data = build_media_zip(PNG_1X1, SVG);
             let mut archive = crate::XlsxZip::new(Cursor::new(data)).unwrap();
-            let anchor = parse_drawing_anchors(&xml, &rels, "xl/drawings", &mut archive, &[])
-                .into_iter()
-                .next()
-                .unwrap();
+            let anchor =
+                parse_drawing_anchors(&xml, &rels, "xl/drawings/drawing1.xml", &mut archive, &[])
+                    .into_iter()
+                    .next()
+                    .unwrap();
             assert_eq!(anchor.rotation, None, "rot={rot}");
             assert_eq!(anchor.flip_h, None);
             assert_eq!(anchor.flip_v, None);
@@ -3909,6 +4054,7 @@ mod blip_svg_tests {
             to_row: 5,
             to_row_off: 0,
             edit_as: Some("oneCell".to_string()),
+            anchor_tag: Some(DrawingAnchorTag::TwoCellAnchor),
             native_ext_cx: 300000,
             native_ext_cy: 200000,
             rotation: None,
@@ -3927,6 +4073,15 @@ mod blip_svg_tests {
         assert!(json.contains("\"svgImagePath\":\"xl/media/image2.svg\""));
         assert!(json.contains("\"nativeExtCx\":300000"));
         assert!(json.contains("\"nativeExtCy\":200000"));
+        assert!(json.contains("\"anchorTag\":\"twoCellAnchor\""), "{json}");
+        // Untagged models keep the legacy JSON unchanged (field omitted).
+        let untagged = ImageAnchor {
+            anchor_tag: None,
+            ..anchor.clone()
+        };
+        assert!(!serde_json::to_string(&untagged)
+            .unwrap()
+            .contains("anchorTag"));
         assert!(!json.contains("dataUrl"), "must not emit dataUrl: {json}");
         assert!(!json.contains(";base64,"), "must not inline base64: {json}");
     }
@@ -4198,7 +4353,7 @@ mod ole_object_tests {
             ("xl/media/choice.emf", b"emf-c"),
             ("xl/media/fallback.emf", b"emf-f"),
         ]);
-        parse_ole_object_anchors(&sheet_xml, &rels, "xl/worksheets", &mut archive)
+        parse_ole_object_anchors(&sheet_xml, &rels, "xl/worksheets/sheet1.xml", &mut archive)
     }
 
     /// ECMA-376 Part 3 §9.3(1) — an `<oleObject>` Choice whose `Requires` names a
@@ -4262,7 +4417,8 @@ mod ole_object_tests {
         rels.insert("rIdPrev".to_string(), "../media/image1.emf".to_string());
         let mut archive = archive_with(&[("xl/media/image1.emf", b"emfbytes")]);
 
-        let anchors = parse_ole_object_anchors(&sheet_xml, &rels, "xl/worksheets", &mut archive);
+        let anchors =
+            parse_ole_object_anchors(&sheet_xml, &rels, "xl/worksheets/sheet1.xml", &mut archive);
         assert_eq!(
             anchors.len(),
             1,
@@ -4301,7 +4457,8 @@ mod ole_object_tests {
         rels.insert("rIdPrev".to_string(), "../media/image2.wmf".to_string());
         let mut archive = archive_with(&[("xl/media/image2.wmf", b"wmf")]);
 
-        let anchors = parse_ole_object_anchors(&sheet_xml, &rels, "xl/worksheets", &mut archive);
+        let anchors =
+            parse_ole_object_anchors(&sheet_xml, &rels, "xl/worksheets/sheet1.xml", &mut archive);
         assert_eq!(anchors.len(), 1);
         assert_eq!(anchors[0].image_path, "xl/media/image2.wmf");
         assert_eq!(anchors[0].mime_type, "image/wmf");
@@ -4327,7 +4484,8 @@ mod ole_object_tests {
         );
         let rels = HashMap::new(); // rIdMissing not present
         let mut archive = archive_with(&[]);
-        let anchors = parse_ole_object_anchors(&sheet_xml, &rels, "xl/worksheets", &mut archive);
+        let anchors =
+            parse_ole_object_anchors(&sheet_xml, &rels, "xl/worksheets/sheet1.xml", &mut archive);
         assert!(anchors.is_empty(), "no resolvable preview ⇒ no anchor");
     }
 
@@ -4360,7 +4518,8 @@ mod ole_object_tests {
         );
         let mut archive = archive_with(&[("xl/embeddings/oleObject1.bin", b"\x00\x01datablob")]);
 
-        let anchors = parse_ole_object_anchors(&sheet_xml, &rels, "xl/worksheets", &mut archive);
+        let anchors =
+            parse_ole_object_anchors(&sheet_xml, &rels, "xl/worksheets/sheet1.xml", &mut archive);
         assert!(
             anchors.is_empty(),
             "a .bin (non-image) objectPr target must be skipped, got {} anchor(s)",
@@ -4445,8 +4604,12 @@ mod ole_object_tests {
             ("xl/media/image1.emf", b"emfbytes"),
         ]);
 
-        let anchors =
-            parse_ole_object_anchors(&sheet_xml, &sheet_rels, "xl/worksheets", &mut archive);
+        let anchors = parse_ole_object_anchors(
+            &sheet_xml,
+            &sheet_rels,
+            "xl/worksheets/sheet1.xml",
+            &mut archive,
+        );
         assert_eq!(anchors.len(), 1, "one vmlDrawing preview anchor expected");
         let a = &anchors[0];
         assert_eq!(a.image_path, "xl/media/image1.emf");
@@ -4551,8 +4714,12 @@ mod ole_object_tests {
             ),
             ("xl/media/image1.wmf", b"wmf"),
         ]);
-        let anchors =
-            parse_ole_object_anchors(&sheet_xml, &sheet_rels, "xl/worksheets", &mut archive);
+        let anchors = parse_ole_object_anchors(
+            &sheet_xml,
+            &sheet_rels,
+            "xl/worksheets/sheet1.xml",
+            &mut archive,
+        );
         assert_eq!(anchors.len(), 1);
         let a = &anchors[0];
         assert_eq!(a.image_path, "xl/media/image1.wmf");
@@ -4603,8 +4770,12 @@ mod ole_object_tests {
             ("xl/embeddings/oleObject1.bin", b"data"),
             ("xl/drawings/vmlDrawing1.vml", vml.as_bytes()),
         ]);
-        let anchors =
-            parse_ole_object_anchors(&sheet_xml, &sheet_rels, "xl/worksheets", &mut archive);
+        let anchors = parse_ole_object_anchors(
+            &sheet_xml,
+            &sheet_rels,
+            "xl/worksheets/sheet1.xml",
+            &mut archive,
+        );
         assert!(
             anchors.is_empty(),
             "note VML must not be picked up as an OLE preview, got {}",
@@ -4653,8 +4824,13 @@ mod ole_object_tests {
             ("xl/media/image1.emf", b"emf"),
         ]);
         assert!(
-            parse_ole_object_anchors(&sheet("999"), &sheet_rels, "xl/worksheets", &mut arch_a)
-                .is_empty(),
+            parse_ole_object_anchors(
+                &sheet("999"),
+                &sheet_rels,
+                "xl/worksheets/sheet1.xml",
+                &mut arch_a
+            )
+            .is_empty(),
             "shapeId mismatch ⇒ no anchor"
         );
 
@@ -4672,8 +4848,13 @@ mod ole_object_tests {
             ("xl/media/image1.emf", b"emf"),
         ]);
         assert!(
-            parse_ole_object_anchors(&sheet("1025"), &sheet_rels, "xl/worksheets", &mut arch_b)
-                .is_empty(),
+            parse_ole_object_anchors(
+                &sheet("1025"),
+                &sheet_rels,
+                "xl/worksheets/sheet1.xml",
+                &mut arch_b
+            )
+            .is_empty(),
             "no imagedata ⇒ no anchor"
         );
 
@@ -4684,8 +4865,13 @@ mod ole_object_tests {
             ("xl/media/image1.emf", b"emf"),
         ]);
         assert!(
-            parse_ole_object_anchors(&sheet("1025"), &sheet_rels, "xl/worksheets", &mut arch_c)
-                .is_empty(),
+            parse_ole_object_anchors(
+                &sheet("1025"),
+                &sheet_rels,
+                "xl/worksheets/sheet1.xml",
+                &mut arch_c
+            )
+            .is_empty(),
             "missing vmlDrawing rels ⇒ relid unresolved ⇒ no anchor"
         );
     }
@@ -4774,7 +4960,8 @@ mod strict_namespace_tests {
 
         let data = build_media_zip(PNG_1X1);
         let mut archive = crate::XlsxZip::new(Cursor::new(data)).unwrap();
-        let anchors = parse_drawing_anchors(&xml, &rels, "xl/drawings", &mut archive, &[]);
+        let anchors =
+            parse_drawing_anchors(&xml, &rels, "xl/drawings/drawing1.xml", &mut archive, &[]);
 
         assert_eq!(
             anchors.len(),

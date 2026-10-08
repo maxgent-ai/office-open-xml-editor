@@ -9,6 +9,7 @@ import {
   createParagraphAcquisitionCacheServicesView,
   documentLayoutRuntimeOf,
   fieldAcquisitionContextOf,
+  footnoteAcquisitionWorkBudgetOf,
   paragraphAcquisitionCacheOf,
   PARAGRAPH_ACQUISITION_MISS_BUDGET,
   paintResourceRegistryOf,
@@ -136,6 +137,25 @@ describe('document layout runtime state', () => {
 
     expect(() => fieldCache.noteMiss())
       .toThrow(/NON_CONVERGENCE.*operational miss budget 25000/i);
+  });
+
+  it('shares full-note work across field views and starts fresh for a new pagination execution', () => {
+    const services = { text: {}, images: {}, math: {},
+      allowFootnoteContinuation: true } as unknown as LayoutServices;
+    attachUnusedKernel(services);
+    // Exactly one million source units: container + property + UTF16 string.
+    const root = Object.freeze({ text: 'x'.repeat(999_998) });
+    const otherNote = Object.freeze({ text: 'y'.repeat(999_998) });
+    const scope = createParagraphAcquisitionCacheServicesView(services);
+    const field = createFieldAcquisitionServicesView(scope, { totalPages: 100 });
+    for (let index = 0; index < 32; index++) {
+      footnoteAcquisitionWorkBudgetOf(index % 2 ? field : scope)!.charge(index % 3 ? root : otherNote);
+    }
+    expect(() => footnoteAcquisitionWorkBudgetOf(field)!.charge(root))
+      .toThrow('Footnote acquisition cumulative work budget exceeded');
+    const retry = createParagraphAcquisitionCacheServicesView(services);
+    expect(() => footnoteAcquisitionWorkBudgetOf(retry)!.charge(root)).not.toThrow();
+    expect(footnoteAcquisitionWorkBudgetOf(services)).toBeUndefined();
   });
 
   it('keeps destination-page resolution private to its immutable pagination iteration view', () => {

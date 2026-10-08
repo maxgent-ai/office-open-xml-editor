@@ -343,9 +343,7 @@ describe('docGrid character grid — measure==draw invariant (§17.6.5)', () => 
     expect(emailRun).toBeDefined();
     expect(closingRun).toBeDefined();
     expect(closingRun!.x).toBeCloseTo(emailRun!.x + emailRun!.w, 6);
-    expect(rendered.fillTextCalls.find((call) => call.text === email)?.letterSpacing)
-      .toBe(`${-1161 / 4096}px`);
-    expect(rendered.fillTextCalls.find((call) => call.text === ')')?.letterSpacing)
+    expect(rendered.fillTextCalls.find((call) => call.text === email + ')')?.letterSpacing)
       .toBe(`${-1161 / 4096}px`);
   });
 

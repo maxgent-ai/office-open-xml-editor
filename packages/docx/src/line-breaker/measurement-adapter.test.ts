@@ -25,7 +25,7 @@ describe('LineMeasurementAdapter', () => {
       text: 'AB', fontFamily: 'narrow', fontSize: 10, kerning: 12,
     } as LayoutTextSeg;
     const wide = {
-      text: 'AB', fontFamily: 'wide', fontSize: 10, kerning: 0,
+      text: 'AB', fontFamily: 'wide', fontSize: 10, kerning: 8,
     } as LayoutTextSeg;
 
     expect(adapter.measureSegment(narrow).width).toBe(20);

@@ -1,3 +1,4 @@
+import { lineGapModel } from '../line-breaker/line-gaps.js';
 import { describe, expect, it } from 'vitest';
 import { DEFAULT_KINSOKU_RULES } from '@silurus/ooxml-core';
 import {
@@ -13,6 +14,7 @@ import type { ParagraphLayoutContext } from '../layout-context.js';
 import type { LayoutImageSeg, LayoutMathSeg, LayoutTabSeg, LayoutTextSeg } from '../line-layout.js';
 import type { MeasuredParagraph } from '../paragraph-measure.js';
 import { measureParagraph } from '../paragraph-measure.js';
+import { buildSegments, layoutLines } from '../line-layout.js';
 import { createLayoutServices } from '../layout-runtime.js';
 import type { DocParagraph } from '../types.js';
 import type { AnchorAcquisitionInput } from './anchor-input.js';
@@ -46,9 +48,10 @@ function projectMeasuredSegment(
   paragraphBorderEdges?: Parameters<typeof paragraphLayoutFromMeasurement>[1]['paragraphBorderEdges'],
   verticalGlyphMeasurement?: VerticalGlyphMeasurementService,
   verticalPageFrame = false,
+  precedingLines: MeasuredParagraph['lines'] = [],
 ) {
   const measured = {
-    lines: [{
+    lines: [...precedingLines, {
       layout: {
         segments: Array.isArray(segment) ? segment : [segment], height: 10, ascent: 8, descent: 2,
         visibleAscent: 8, visibleDescent: 2, intendedSingle: 10,
@@ -56,11 +59,11 @@ function projectMeasuredSegment(
       },
       topYPt: 10, advancePt: 12,
     }],
-    markOnly: false, requestedSpaceBeforePt: 0, requestedSpaceAfterPt: 0,
+    markOnly: false, requestedSpaceBeforePt: context.spaceBeforePt, requestedSpaceAfterPt: 0,
     uniformRubyAdvancePt: 0, contentStartYPt: 10, contentEndYPt: 22,
     lastLineBelowBaselinePt: 2,
     placement: {
-      startYPt: 10, paragraphXPt: 10, availableWidthPt: 100,
+      startYPt: 10 - context.spaceBeforePt, paragraphXPt: 10, availableWidthPt: 100,
       maximumYPt: 500, suppressSpaceBefore: false,
     },
   } as unknown as MeasuredParagraph;
@@ -831,18 +834,38 @@ describe('paragraphLayoutFromMeasurement retained authorities', () => {
       spaceBefore: 0, spaceAfter: 0, lineSpacing: null, numbering: null,
       tabStops: [], runs: [],
     } as unknown as DocParagraph;
-    const segment = {
+    // A genuine service: empty text has no extent, a glyph probe does.
+    const textLayoutService = {
+      shape: (request: { text: string; fontSizePt: number }) => ({
+        advancePt: request.text ? request.fontSizePt / 2 : 0,
+        ascentPt: request.text ? request.fontSizePt * 0.7 : 0,
+        descentPt: request.text ? request.fontSizePt * 0.3 : 0,
+        spans: [], diagnostics: [], graphemeBoundaries: [0],
+      }),
+    };
+    const host = (overrides: Record<string, unknown> = {}) => ({
       text: '', metricOnly: true, measuredWidth: 0, fontSize: 10,
       textShapeRequest: {
         text: '', fontSizePt: 10, fonts: { ascii: 'Test Sans' },
         weight: 400, style: 'normal', measure: true,
       },
-      textLayoutService: {
-        shape: () => ({ advancePt: 0, ascentPt: 7, descentPt: 3, spans: [], diagnostics: [], graphemeBoundaries: [0] }),
-      },
-    } as unknown as LayoutTextSeg;
-    expect(projectMeasuredSegment(paragraph, segment).lines[0]?.placements[0]).toMatchObject({
-      kind: 'anchor-host', sourceMetrics: { ascentPt: 7, descentPt: 3 },
+      textLayoutService,
+      ...overrides,
+    } as unknown as LayoutTextSeg);
+    const placement = (segment: LayoutTextSeg) => projectMeasuredSegment(paragraph, segment).lines[0]?.placements[0];
+    // A generic metric-only host keeps its existing empty-text authority.
+    expect(placement(host())).toMatchObject({ kind: 'anchor-host', sourceMetrics: { ascentPt: 0, descentPt: 0 } });
+    // A native separator participant retains its probe's selected-face sides
+    // at the existing effective size (super/sub scaling; small caps measured
+    // at full size), with no width and an empty source range.
+    expect(placement(host({ metricProbeText: 'x' }))).toMatchObject({
+      kind: 'anchor-host', range: { start: 0, end: 0 }, bounds: { widthPt: 0 },
+      sourceMetrics: { ascentPt: 7, descentPt: 3 },
+    });
+    const superscript = placement(host({ metricProbeText: 'x', vertAlign: 'super' }));
+    expect(superscript?.kind === 'anchor-host' && superscript.sourceMetrics?.ascentPt).toBeCloseTo(4.55);
+    expect(placement(host({ metricProbeText: 'x', smallCaps: true }))).toMatchObject({
+      sourceMetrics: { ascentPt: 7, descentPt: 3 },
     });
   });
 
@@ -869,6 +892,61 @@ describe('paragraphLayoutFromMeasurement retained authorities', () => {
         inkBounds: { xMinPt: 0, xMaxPt: 7, ascentPt: 7, descentPt: 3 },
       }],
     });
+  });
+
+  it.each(['paragraph', 'line'] as const)('keeps the first %s picture origin before paragraph spacing on a grid', (relativeFrom) => {
+    const occurrenceId = 'anchor:spacing-grid';
+    const seed = retainedAnchor(occurrenceId);
+    const anchored = { ...seed, vertical: { ...seed.vertical, relativeFrom } };
+    const anchorParagraph = { ...paragraph, runs: [
+      { type: 'anchorHost', fontSize: 10, anchorOccurrenceId: occurrenceId },
+      { type: 'image', imagePath: 'word/media/anchor.png', mimeType: 'image/png',
+        widthPt: 20, heightPt: 10, anchor: true, anchorAcquisitionInput: anchored },
+    ] } as unknown as DocParagraph;
+    const host = { text: '', metricOnly: true, sourceRunIndex: 0, measuredWidth: 0,
+      fontSize: 10, fontFamily: 'Test Sans', fontRoute } as unknown as LayoutTextSeg;
+    const node = projectMeasuredSegment(anchorParagraph, host, {
+      ...acquisitionContext, spaceBeforePt: 6, lineGrid: { active: true, pitchPt: 20 },
+    }, undefined, {
+      page: { xPt: 0, yPt: 0, widthPt: 200, heightPt: 300 },
+      margin: { xPt: 10, yPt: 20, widthPt: 180, heightPt: 260 },
+      column: { xPt: 10, yPt: 20, widthPt: 90, heightPt: 260 }, pageParity: 'odd',
+    });
+    // The retained text top is 10; paragraph/first-line origin is 4, and the
+    // authored picture offset is 3. Baseline leading does not move the picture.
+    expect(node.drawings[0]?.flowBounds.yPt).toBe(7);
+  });
+
+  it('uses physical host identity when later picture lines have the same numeric top', () => {
+    const occurrenceId = 'anchor:later-grid-line';
+    const seed = retainedAnchor(occurrenceId);
+    const anchored = { ...seed, vertical: { ...seed.vertical, relativeFrom: 'line' } };
+    const anchorParagraph = { ...paragraph, runs: [
+      { ...(paragraph.runs[0] as object), text: 'A' },
+      { type: 'anchorHost', fontSize: 10, anchorOccurrenceId: occurrenceId },
+      { type: 'image', imagePath: 'word/media/anchor.png', mimeType: 'image/png',
+        widthPt: 20, heightPt: 10, anchor: true, anchorAcquisitionInput: anchored },
+    ] } as unknown as DocParagraph;
+    const host = { text: '', metricOnly: true, sourceRunIndex: 1, measuredWidth: 0,
+      fontSize: 10, fontFamily: 'Test Sans', fontRoute } as unknown as LayoutTextSeg;
+    const precedingLine = {
+      layout: { segments: [{ ...host, text: 'A', metricOnly: undefined, sourceRunIndex: 0,
+        measuredWidth: 5, shapedClusters: [{ range: { start: 0, end: 1 }, offsetPt: 0, advancePt: 5 }] }],
+        height: 10, ascent: 8, descent: 2, intendedSingle: 10, gridCountSingle: 10,
+        xOffset: 0, availWidth: 100 },
+      topYPt: 10, advancePt: 0,
+    };
+    const node = projectMeasuredSegment(anchorParagraph, host, {
+      ...acquisitionContext, spaceBeforePt: 6, lineGrid: { active: true, pitchPt: 20 },
+    }, undefined, {
+      page: { xPt: 0, yPt: 0, widthPt: 200, heightPt: 300 },
+      margin: { xPt: 10, yPt: 20, widthPt: 180, heightPt: 260 },
+      column: { xPt: 10, yPt: 20, widthPt: 90, heightPt: 260 }, pageParity: 'odd',
+    }, undefined, undefined, false, [precedingLine]);
+    // Only the first physical line owns the before-spacing origin. A later
+    // line retains its own top even when numeric geometry happens to coincide.
+    expect(node.lines).toHaveLength(2);
+    expect(node.drawings[0]?.flowBounds.yPt).toBe(13);
   });
 
   it('matches one scoped host to one anchored payload and retains one drawing and exclusion', () => {
@@ -2046,6 +2124,71 @@ describe('planLine visual geometry', () => {
     }],
   });
 
+  it.each(['a😀 b  c', `a${' '.repeat(50_000)}b`])(
+    'projects retained proportional gaps through clusters and contextual paint ops in one sweep', (value) => {
+      let utf16 = 0;
+      let xPt = 0;
+      let spaceIndex = 0;
+      const spaceWidths = new Map<number, number>();
+      const clusters = [...value].map((character, cpIndex) => {
+        const advancePt = character === ' ' ? 2 + (spaceIndex++ % 3) : 3;
+        if (character === ' ') spaceWidths.set(cpIndex, advancePt);
+        const cluster = {
+          range: { start: utf16, end: utf16 + character.length },
+          offset: { xPt, yPt: 0 }, advancePt,
+        };
+        utf16 += character.length;
+        xPt += advancePt;
+        return cluster;
+      });
+      const segment = { ...measuredText(value, 0, xPt), clusters };
+      // The small case crosses op, surrogate and unequal-gap boundaries. The
+      // large case exposes a rescan per gap without a flaky timing threshold.
+      if (value.length < 20) {
+        segment.basePaintOps = [
+          { ...segment.basePaintOps[0]!, text: value.slice(0, 4), range: { start: 0, end: 4 } },
+          { ...segment.basePaintOps[0]!, text: value.slice(4), range: { start: 4, end: value.length },
+            offset: { xPt: clusters[3]!.offset.xPt, yPt: 0 } },
+        ];
+      }
+      const model = lineGapModel([{ text: value, widthPx: xPt, spacePx: 0, spaceWidths }]);
+      const slack = model.S / 8;
+      const line = planLine({
+        paragraphXPt: 0, availableWidthPt: xPt + slack,
+        alignment: 'both', baseRtl: false,
+        isFirstLine: true, isLastLine: false, stretchLastLine: false,
+        line: {
+          range: segment.range, topPt: 0, baselinePt: 10, advancePt: 12,
+          xOffsetPt: 0, availableWidthPt: xPt + slack, endsWithBreak: false,
+          justifiedCompressionPt: 0, gapPlan: { ...model, expansionGaps: [] },
+          segments: [segment],
+        },
+      });
+      const placement = line.placements[0];
+      if (placement?.kind !== 'text') throw new Error('Expected retained text');
+      const characters = [...value];
+      let deltaPt = 0;
+      for (let i = 0; i < clusters.length; i++) {
+        const previous = characters[i - 1];
+        if (previous === ' ') deltaPt += clusters[i - 1]!.advancePt / 8;
+        expect(placement.clusters[i]!.offset.xPt).toBe(clusters[i]!.offset.xPt + deltaPt);
+      }
+      expect(placement.advancePt).toBe(xPt + slack);
+      expect(placement.paintOps.map(op => op.text).join('')).toBe(value);
+      // Independent small reference can afford repeated scans; the stress
+      // expectation above is incremental to keep the test itself linear.
+      if (value.length < 20) {
+        for (const op of placement.paintOps) {
+          const before = clusters.filter(c => c.range.end <= op.range.start
+            && value.slice(c.range.start, c.range.end) === ' ')
+            .reduce((sum, c) => sum + c.advancePt / 8, 0);
+          const natural = clusters.find(c => c.range.start === op.range.start)!;
+          expect(op.offset.xPt).toBe(natural.offset.xPt + before);
+        }
+      }
+    },
+  );
+
   it.each([
     ['left', false, [10, 30]],
     ['center', false, [40, 60]],
@@ -2786,5 +2929,101 @@ describe('planLine visual geometry', () => {
         ],
       },
     });
+  });
+});
+
+describe('native separator metric participants in the line pipeline', () => {
+  /** Vertical metrics follow the requested size; empty text measures nothing. */
+  const sizedContext = () => {
+    const context = {
+      font: '10px serif', letterSpacing: '0px', fontKerning: 'auto',
+      measureText(text: string) {
+        const px = Number(/([0-9.]+)px/.exec(context.font)?.[1] ?? 10);
+        const extent = text ? 1 : 0;
+        return {
+          width: [...text].length * px / 2,
+          actualBoundingBoxAscent: px * 0.8 * extent, actualBoundingBoxDescent: px * 0.2 * extent,
+          fontBoundingBoxAscent: px * 0.8 * extent, fontBoundingBoxDescent: px * 0.2 * extent,
+        } as TextMetrics;
+      },
+    };
+    return context as unknown as CanvasRenderingContext2D;
+  };
+  const participant = (overrides: Record<string, unknown> = {}) => ({
+    type: 'text', text: '', bold: false, italic: false, underline: false, strikethrough: false,
+    fontSize: 10, color: null, fontFamily: 'serif', isLink: false, background: null,
+    vertAlign: null, hyperlink: null, noteSeparatorCharacter: 'paragraph-mark', ...overrides,
+  });
+  const measure = (run: Record<string, unknown>) => {
+    const context = sizedContext();
+    const services = createLayoutServices({
+      section: {
+        pageWidth: 200, pageHeight: 300, marginTop: 30, marginRight: 20, marginBottom: 30,
+        marginLeft: 20, headerDistance: 15, footerDistance: 15, titlePage: false, evenAndOddHeaders: false,
+      },
+      body: [], headers: { default: null, first: null, even: null },
+      footers: { default: null, first: null, even: null },
+    }, { measureContext: context });
+    const paragraph = {
+      type: 'paragraph', alignment: 'left', indentLeft: 0, indentRight: 0, indentFirst: 0,
+      spaceBefore: 0, spaceAfter: 0, lineSpacing: null, numbering: null, tabStops: [],
+      runs: [run], defaultFontSize: 10,
+    } as unknown as DocParagraph;
+    const environment = {
+      pageIndex: 0, totalPages: 1, documentHasEastAsianText: false,
+      pageWritingMode: 'horizontal-tb', layoutServices: services,
+    } as const;
+    const placement = {
+      startYPt: 0, paragraphXPt: 0, availableWidthPt: 100, maximumYPt: 500, suppressSpaceBefore: false,
+    };
+    const measurer = { context, fontFamilyClasses: {} };
+    const measured = measureParagraph(paragraph, acquisitionContext, placement, measurer, environment);
+    const node = paragraphLayoutFromMeasurement(paragraph as never, {
+      id: 'separator-participant', source, flowDomainId: 'body', ordinaryFlow: true,
+      context: acquisitionContext, placement: measured.placement, measurer, environment, exclusions: [],
+    }, measured);
+    return { line: node.lines[0]!, advancePt: node.advancePt };
+  };
+
+  it('keeps probe vertical metrics and composes an authored raise without advance or ink', () => {
+    const plain = measure(participant());
+    expect(plain.line.placements).toEqual([expect.objectContaining({
+      kind: 'anchor-host', range: { start: 0, end: 0 },
+      bounds: expect.objectContaining({ widthPt: 0 }),
+      sourceMetrics: { ascentPt: 8, descentPt: 2 },
+    })]);
+    expect(plain.line.bounds.widthPt).toBe(0);
+    expect(plain.advancePt).toBeCloseTo(10);
+    // Existing library line-box composition for this controlled fixture (not
+    // an ECMA-376 or Office formula): a 6pt raise adds to the probe's ascent.
+    expect(measure(participant({ position: 6 })).advancePt).toBeCloseTo(16);
+    // Superscript uses the existing effective-size policy for the probe.
+    const superscript = measure(participant({ vertAlign: 'super' }));
+    expect(superscript.line.placements[0]).toMatchObject({ sourceMetrics: { ascentPt: 5.2, descentPt: 1.3 } });
+    expect(superscript.advancePt).not.toBeCloseTo(plain.advancePt);
+    // Small caps keep the existing full-size metric policy.
+    expect(measure(participant({ smallCaps: true })).advancePt).toBeCloseTo(plain.advancePt);
+  });
+
+  it('measures the probe at the caller scale without inline advance', () => {
+    const lineAt = (scale: number) => {
+      const context = sizedContext();
+      const services = createLayoutServices({
+        section: {
+          pageWidth: 200, pageHeight: 300, marginTop: 30, marginRight: 20, marginBottom: 30,
+          marginLeft: 20, headerDistance: 15, footerDistance: 15, titlePage: false, evenAndOddHeaders: false,
+        },
+        body: [], headers: { default: null, first: null, even: null },
+        footers: { default: null, first: null, even: null },
+      }, { measureContext: context });
+      const segments = buildSegments([participant({ vertAlign: 'super' })] as never, { layoutServices: services } as never);
+      return layoutLines(context as never, segments, 200 * scale, 0, scale)[0]!;
+    };
+    const unit = lineAt(1);
+    const double = lineAt(2);
+    expect(unit.ascent).toBeGreaterThan(0);
+    expect(double.ascent).toBeCloseTo(unit.ascent * 2);
+    expect(double.descent).toBeCloseTo(unit.descent * 2);
+    expect(double.segments.reduce((sum, segment) => sum + segment.measuredWidth, 0)).toBe(0);
   });
 });

@@ -300,14 +300,14 @@ describe('pPr fontAlgn and line-break marks (#1636)', () => {
     renderTextBody(ctx, body, 0, 0, 2000, 800, SCALE);
     return draws.filter((d) => d.text).map((d) => d.y / U);
   };
-  const expectWithin = (ys: number[], exported: number[]) => {
+  const expectWithin = (ys: number[], exported: number[], tolerance = 0.5) => {
     expect(ys).toHaveLength(exported.length);
     ys.forEach((y, i) => expect(Math.abs(y - exported[i]), `run ${i}: ${y} vs ${exported[i]}`)
-      .toBeLessThanOrEqual(0.5 + 1e-9));
+      .toBeLessThanOrEqual(tolerance + 1e-9));
   };
-  const expectModels = (paragraphs: () => Paragraph[], [compat0, compat1]: Model) => {
-    expectWithin(runBaselines(paragraphs(), false), compat0);
-    expectWithin(runBaselines(paragraphs(), true), compat1);
+  const expectModels = (paragraphs: () => Paragraph[], [compat0, compat1]: Model, tolerance = 0.5) => {
+    expectWithin(runBaselines(paragraphs(), false), compat0, tolerance);
+    expectWithin(runBaselines(paragraphs(), true), compat1, tolerance);
   };
   const spacing = (tag: string): Spacing => tag.startsWith('pct')
     ? { type: 'pct', val: Number(tag.slice(3)) * 1000 }
@@ -399,7 +399,6 @@ describe('pPr fontAlgn and line-break marks (#1636)', () => {
         text: (ea(font) ? '日' : 'H') + (k === 0 ? String(i) : ''), font, size,
       })), { spaceLine: null }),
       endRunProperties: end,
-      endFaceAuthored: true,
     } as unknown as Paragraph));
 
   it('sizes an a:br face at the preceding run size', () => {
@@ -422,17 +421,41 @@ describe('pPr fontAlgn and line-break marks (#1636)', () => {
       [[78, 78, 174, 174], [81, 81, 181, 181]]);
   });
 
-  it('leaves an inherited end-of-paragraph face out of a line with text', () => {
-    // Size-only endParaRPr over a Meiryo paragraph default: not yet measured,
-    // so the line keeps the run's own Arial box (46 pt pitch under compatLnSpc="0").
-    const plain = () => [1, 2].map((i) => paragraph([{ text: `H${i}`, font: 'Arial', size: 40 }], { spaceLine: null }));
-    const inherited = () => plain().map((p) => ({
-      ...p, defFontFamily: 'Meiryo', endRunProperties: mark('Meiryo', 40),
-    } as unknown as Paragraph));
-    for (const compat of [false, true]) {
-      expect(runBaselines(inherited(), compat)).toEqual(runBaselines(plain(), compat));
+  // #1663: marks without a face of their own contribute the face they inherit
+  // (here the Meiryo paragraph default) the same way; an omitted endParaRPr
+  // contributes nothing. [compatLnSpc="0", compatLnSpc="1"] of the
+  // endmark-inherited controls, Arial 60 + Arial 24 lines. With the Meiryo
+  // 24 pt face the compatLnSpc="0" second baseline lands 0.004 unit past a
+  // rounding tie (178.504 vs 179), exactly as the authored control and the
+  // #1636 Arial 60 + Meiryo 24 lines do, hence the 0.51 tolerance.
+  const TIE = 0.51;
+  const inheriting = (paragraphs: Paragraph[]) => paragraphs.map((p) => ({ ...p, defFontFamily: 'Meiryo' } as Paragraph));
+  const ari = (i: number) => [{ text: `H${i}`, font: 'Arial', size: 60 }, { text: 'H', font: 'Arial', size: 24 }];
+  it('adds an inherited endParaRPr face at the last run size', () => {
+    const withMark = (end: object | undefined) => () => inheriting([1, 2].map((i) => ({
+      ...paragraph(ari(i), { spaceLine: null }), ...(end ? { endRunProperties: end } : {}),
+    } as unknown as Paragraph)));
+    // lang only or size only: the parser resolves the inherited face.
+    for (const size of [16, 40, 80]) {
+      expectModels(withMark({ fontSize: size, fontFamily: 'Meiryo' }), [[78, 78, 179, 179], [81, 81, 181, 181]], TIE);
     }
-    expectWithin(runBaselines(inherited(), false), [52, 116]);
+    expectModels(withMark(undefined), [[78, 78, 174, 174], [81, 81, 181, 181]]);
+    expectModels(() => withMark({ fontSize: 16, fontFamily: 'Meiryo' })().map((p) => ({ ...p, fontAlgn: 'b' } as Paragraph)),
+      [[78, 83, 176, 181], [81, 86, 181, 186]]);
+  });
+
+  it('adds an inherited a:br face at the preceding run size', () => {
+    const withBreakMark = (br: object) => () => {
+      const [first, second] = [1, 2].map((i) => paragraph(ari(i), { spaceLine: null }));
+      return inheriting([{
+        ...first, runs: [...first.runs, { type: 'break', ...br }, ...second.runs],
+        endRunProperties: mark('Arial', 24),
+      } as unknown as Paragraph]);
+    };
+    // a:br without rPr, and a size-only rPr at 16 / 80 pt.
+    for (const br of [{}, { fontSize: 16 }, { fontSize: 80 }]) {
+      expectModels(withBreakMark(br), [[78, 78, 179, 179], [81, 81, 181, 181]], TIE);
+    }
   });
 
   it('handles lines with 10^5 metric runs without spreading them into Math.max', () => {

@@ -10,6 +10,16 @@ type CellAnchoredObject = {
 
 const previewBounds = new WeakMap<Worksheet, { maxRow: number; maxCol: number }>();
 
+export interface WorksheetContentMinimums {
+  readonly minRows?: number;
+  readonly minCols?: number;
+}
+
+export const DEFAULT_WORKSHEET_CONTENT_MINIMUMS = Object.freeze({
+  minRows: 50,
+  minCols: 26,
+});
+
 /** The metadata pass derives these from every MCE-visible row and cell, so the
  * scrollbars have their final extent while values are still arriving. */
 export function setWorksheetPreviewBounds(
@@ -28,10 +38,21 @@ export function inheritWorksheetPreviewBounds(source: Worksheet, target: Workshe
  * an object ending at marker row 113 requires row 114 in the scroll extent.
  * Excel permits drawings well beyond the `<dimension>` / populated cell range;
  * ignoring them makes those authored objects unreachable in a viewer. */
-export function worksheetContentBounds(ws: Worksheet): { maxRow: number; maxCol: number } {
+export function worksheetContentBounds(
+  ws: Worksheet,
+  minimums: WorksheetContentMinimums = {},
+): { maxRow: number; maxCol: number } {
   const preview = previewBounds.get(ws);
-  let maxRow = Math.max(50, ws.freezeRows ?? 0, preview?.maxRow ?? 0);
-  let maxCol = Math.max(26, ws.freezeCols ?? 0, preview?.maxCol ?? 0);
+  let maxRow = Math.max(
+    minimums.minRows ?? DEFAULT_WORKSHEET_CONTENT_MINIMUMS.minRows,
+    ws.freezeRows ?? 0,
+    preview?.maxRow ?? 0,
+  );
+  let maxCol = Math.max(
+    minimums.minCols ?? DEFAULT_WORKSHEET_CONTENT_MINIMUMS.minCols,
+    ws.freezeCols ?? 0,
+    preview?.maxCol ?? 0,
+  );
   for (const row of ws.rows) {
     if (row.index > maxRow) maxRow = row.index;
     for (const cell of row.cells) {

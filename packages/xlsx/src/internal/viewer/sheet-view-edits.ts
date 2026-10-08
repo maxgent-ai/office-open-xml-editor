@@ -160,6 +160,23 @@ export class SheetViewEdits {
     return this.sizeOverrideStore.get(sheetIndex)?.rows.keys() ?? [];
   }
 
+  /** Whether `sheetIndex` carries a manual view edit: a row/column resize or
+   * an outline collapse/expand (outline writes also call recordSizeOverride).
+   * Display-derived `automaticRows` are not edits. #1713 uses this to refuse
+   * capturing a prepared-initial anchor reference from an edited projection. */
+  hasViewEdits(sheetIndex: number): boolean {
+    const sizes = this.sizeOverrideStore.get(sheetIndex);
+    if (sizes && (sizes.rows.size > 0 || sizes.cols.size > 0)) return true;
+    const outline = this.outlineStateStore.get(sheetIndex);
+    return outline !== undefined && (outline.rowCollapsed.size > 0 || outline.colCollapsed.size > 0);
+  }
+
+  /** Current projection revision of `sheetIndex` (0 before any size record),
+   * also used when only a prepared-initial anchor reference is transported. */
+  sizeRevision(sheetIndex: number): number {
+    return this.sizeOverrideStore.get(sheetIndex)?.revision ?? 0;
+  }
+
   /** Mirror only display-derived heights into the worker projection channel.
    * Manual/authored sizes remain in `rows`, so a later column refit can replace
    * automatic values without reclassifying a user's row resize. */

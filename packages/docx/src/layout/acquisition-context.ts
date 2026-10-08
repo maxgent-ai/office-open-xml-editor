@@ -21,7 +21,7 @@ import type {
   RetainedTableAcquisition,
   RetainedTableAcquisitionDependencies,
 } from './table-acquisition.js';
-import type { LayoutServices } from './types.js';
+import type { LayoutRect, LayoutServices, NativeSectionFlow } from './types.js';
 
 /** One acquired body-table occurrence and the point-space placement facts that
  * bind it to the current retained-layout session. */
@@ -45,6 +45,15 @@ export interface PhysicalAnchorFrame {
   readonly marginTop: number;
   readonly marginBottom: number;
   readonly physicalPageWidthPt: number;
+  /** Native counter-clockwise frame; absent for the Transitional vertical
+   * frame, whose established clockwise projection is unchanged. */
+  readonly nativeSectionFlow?: NativeSectionFlow;
+}
+
+/** The authority a nested text-box story inherits from the state that owns it. */
+export interface CompleteTextBoxStoryOwner {
+  readonly sectionLayout: SectionLayoutContext;
+  readonly pageIndex: number;
 }
 
 /** Read-only page/container geometry consumed by DrawingML anchor placement. */
@@ -70,6 +79,10 @@ export interface FloatRegistrationState extends AnchorGeometryContext {
  * projection and page-start pre-scan ownership. */
 export interface AnchorFloatRegistrationState extends FloatRegistrationState {
   pageAnchorPrescanned?: Set<ParagraphLayoutSource>;
+  /** WORD_LATER_ANCHOR_EARLIER_LINE_WRAP: object frames of paragraph-relative
+   * drawings carried to this page, keyed by anchor occurrence. The anchor
+   * paragraph keeps the carried frame instead of re-resolving it. */
+  frozenAnchorFrames?: Map<string, LayoutRect>;
   verticalCJK?: boolean;
   verticalAllRotated?: boolean;
   verticalPhys?: PhysicalAnchorFrame;
@@ -113,8 +126,30 @@ export interface BodyAcquisitionState extends AnchorFloatRegistrationState {
   layoutServices?: LayoutServices;
   retainedTableAcquisition:
     RetainedTableAcquisitionDependencies<BodyAcquisitionState>;
-  acquireCompleteTextBoxStory?: CompleteTextBoxStoryAcquirer;
+  /** Session-level nested story acquisition. The section and page of the
+   * state that contains the text box (body location, table cell or story
+   * candidate) are passed explicitly, so they, and the frame derived from
+   * them, govern the nested story; callers bind it per owner. */
+  acquireCompleteTextBoxStory?: (
+    owner: CompleteTextBoxStoryOwner,
+    request: Parameters<CompleteTextBoxStoryAcquirer>[0],
+  ) => ReturnType<CompleteTextBoxStoryAcquirer>;
+  /** A table cell paragraph re-acquired by its table's page placement (its
+   * text boxes hold page-placed content): the page translation its host flow
+   * receives there (ParagraphAcquisitionOptions.hostFlowPageTranslationPt). */
+  cellHostFlowPageTranslationPt?: Readonly<{ xPt: number; yPt: number }>;
+  /** A text box story and its tables: the page frames its page-owned anchor
+   * axes keep and the translation its flow receives to reach them
+   * (story-page-frames.ts storyAnchorPageFrames); null when its box carries
+   * no page band into it. Absent outside text box stories. */
+  textBoxStoryHostFrames?: Readonly<{
+    frames: Readonly<{ page: LayoutRect; margin: LayoutRect }>;
+    flowPt: Readonly<{ xPt: number; yPt: number }>;
+  }> | null;
   retainedTablesBySourceIndex: Map<number, RetainedTableRecord>;
+  /** Set only while acquiring a body table that is placed upright in the
+   * physical page (identity paint root); its cells take that frame. */
+  uprightPhysicalTable?: boolean;
   kinsoku: KinsokuRules;
   defaultTabPt: number;
   currentDateMs?: number;

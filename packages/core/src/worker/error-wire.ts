@@ -133,6 +133,8 @@ const KNOWN_PAIR_RULES = new Map<string, KnownPairRule>([
   ['archive:distinct-inflated-bytes', { stage: 'decompression', part: 'required' }],
   ['xml-event:bytes', { stage: 'parsing', part: 'optional', configurable: false }],
   ['xml-context:bytes', { stage: 'parsing', part: 'optional', configurable: false }],
+  ['chartex-allocation:elements', { stage: 'parsing', part: 'forbidden', configurable: false }],
+  ['chartex-allocation:bytes', { stage: 'parsing', part: 'forbidden', configurable: false }],
   ['xml-tree:depth', { stage: 'parsing', part: 'optional', configurable: false }],
   ['worksheet-row:projected-bytes', { stage: 'parsing', part: 'optional', configurable: false }],
   ['worksheet-shell:projected-bytes', { stage: 'parsing', part: 'optional', configurable: false }],

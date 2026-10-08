@@ -1,4 +1,4 @@
-import type { StaticCanvasRenderDispatcher } from '@silurus/ooxml-core/internal/canvas-viewer-mechanics';
+import type { CanvasLoadingIndicator, StaticCanvasRenderDispatcher } from '@silurus/ooxml-core/internal/canvas-viewer-mechanics';
 import type { ReadOnlyCommentMarginGeometry } from '@silurus/ooxml-core/internal/read-only-comment-decoration';
 import type { PptxElementBounds } from './element-selection';
 import type { PresentationHandle } from './presentation-handle';
@@ -13,7 +13,7 @@ export interface PptxScrollSlot {
   textLayer: HTMLDivElement | null;
   highlightLayer: HTMLDivElement;
   elementLayer: HTMLDivElement | null;
-  loadingLayer: HTMLSpanElement;
+  loadingIndicator: CanvasLoadingIndicator;
   commentMarkerLayer: HTMLDivElement | null;
   commentMargin: HTMLDivElement | null;
   commentDecorationLayer: HTMLDivElement | null;

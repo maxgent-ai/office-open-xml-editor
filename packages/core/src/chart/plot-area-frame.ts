@@ -1,6 +1,6 @@
 import type { ChartModel } from '../types/chart.js';
 import { drawingmlLineDashArray } from '../draw/dash.js';
-import { resolveFill } from '../shape/paint.js';
+import { resolveNativeFill as resolveFill } from '../shape/paint.js';
 import { EMU_PER_PT } from '../units.js';
 import { strokeChartFrameRect } from './compound-frame.js';
 import { paintChartImageFill } from './image-fill.js';

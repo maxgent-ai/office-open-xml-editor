@@ -866,8 +866,9 @@ pub(crate) fn parse_background<F: FnMut(&str) -> Option<String>>(
 
 /// Resolve a table-style `<a:fill>` wrapper's colour. PowerPoint applies the
 /// ECMA-376 §20.1.2.3.34 retained-input tint in linear sRGB for these DrawingML
-/// fills, just as it does for other presentation fills. Gradient/pattern/blip
-/// fills (rare in table styles) defer to the generic `parse_fill`.
+/// fills, just as it does for other presentation fills. Gradient/pattern fills
+/// defer to `parse_fill`; the host resolves explicit blips with the style
+/// part's relationships before calling this colour-only parser.
 pub(crate) fn parse_table_style_fill(
     fill_wrapper: roxmltree::Node<'_, '_>,
     theme: &HashMap<String, String>,

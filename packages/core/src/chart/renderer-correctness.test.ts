@@ -42,6 +42,7 @@ import {
   collectChartImageFillUsagesForCharts,
   collectChartMarkerImageFills,
   collectChartMarkerImageFillsForCharts,
+  withChartImageLookup,
 } from './image-fill.js';
 import {
   chartEffectConsumerUpperBound,
@@ -10600,15 +10601,465 @@ describe('ChartEx flat layouts dispatch to semantic renderers', () => {
     });
 
     it('does not preflight a linked picture removed by series noFill', () => {
-      expect(collectChartImageFillUsages(model({ fillHidden: true, fillPaintAuthored: true })))
-        .toHaveLength(0);
+      expectPaintedPictures(model(null), [picture.imagePath]);
+      expectPaintedPictures(model({ fillHidden: true, fillPaintAuthored: true }), []);
     });
 
-    // Pre-existing gap: the image preflight has no ChartEx clusteredColumn
-    // family, so a reachable linked picture is not collected. Tracked
-    // separately; this flips to a normal test once the preflight covers it.
-    it.fails('preflights a reachable linked picture', () => {
-      expect(collectChartImageFillUsages(model(null))).toHaveLength(1);
+    it('preflights a reachable linked picture', () => {
+      expectPaintedPictures(model(null), [picture.imagePath]);
+      // The same linked data role stays inert on the classic parser's model.
+      expectPaintedPictures({ ...model(null), chartType: 'clusteredBar',
+        series: [series({ seriesType: 'bar', values: [2, 1] })] }, []);
+    });
+
+    const pointPicture = (name: string) => ({ ...picture, imagePath: `ppt/media/${name}.png` });
+    const pointStyle = (name: string) => ({
+      fillPaints: [pointPicture(name)], fillPaintAuthored: true,
+    });
+    const paths = (chart: ChartModel) => collectChartImageFillUsages(chart)
+      .map(usage => usage.fill.imagePath).sort();
+    const expectPaintedPictures = (chart: ChartModel, expected: string[]) => {
+      expect(paths(chart)).toEqual([...expected].sort());
+      const rec = recordingCtx();
+      renderChart(rec.ctx, chart, RECT, 1, 0, testThreeD, undefined, fill => ({
+        width: 8, height: 8, path: fill.imagePath,
+      }) as unknown as CanvasImageSource);
+      const painted = rec.drawImages.map(args => (args[0] as { path: string }).path);
+      expect([...new Set(painted)].sort()).toEqual([...expected].sort());
+    };
+
+    it('uses the point formatting index for varying ChartEx columns and their paint budget', () => {
+      const pictures = ['vary-a', 'vary-b', 'series-c'].map(pointPicture);
+      const chart = baseModel({
+        chartType: 'clusteredColumn',
+        categories: ['A', 'B'],
+        varyColors: true,
+        chartexDataPointStyle: { fillPaints: pictures, fillPaintAuthored: true },
+        series: [series({ values: [2, 1], chartexFormatIdx: 2 })],
+      });
+      expectPaintedPictures(chart, pictures.slice(0, 2).map(fill => fill.imagePath));
+
+      const stops = Array.from({ length: 4_096 }, (_, index) => ({
+        position: index / 4_095, color: '112233',
+      }));
+      const budgetChart = baseModel({
+        chartType: 'clusteredColumn',
+        categories: Array.from({ length: 600 }, (_, index) => String(index)),
+        varyColors: true,
+        chartexDataPointStyle: {
+          fillPaints: [
+            { fillType: 'solid', color: '112233' },
+            { fillType: 'gradient', gradType: 'linear', angle: 0, stops },
+          ],
+          fillPaintAuthored: true,
+          lineHidden: true,
+          linePaintAuthored: true,
+        },
+        series: [series({ values: Array<number | null>(600).fill(1), chartexFormatIdx: 0 })],
+      });
+      expect(chartExDataMarkPaintWorkCount(budgetChart, RECT, 1)).toBe(1_048_577);
+    });
+
+    it.each(['clusteredColumn', 'histogram', 'pareto'] as const)(
+      'preflights the %s series picture used by its legend key despite point noFill',
+      chartType => {
+        const legendPicture = pointPicture(`${chartType}-legend`);
+        const chart = baseModel({
+          chartType,
+          categories: chartType === 'histogram' ? [] : ['A', 'B'],
+          showLegend: true,
+          legendPos: 'r',
+          chartexHistogramBinning: chartType === 'histogram' ? { binCount: 2 } : undefined,
+          series: [series({
+            name: 'Series',
+            values: [2, 1],
+            chartexStyle: {
+              fillPaints: [legendPicture], fillPaintAuthored: true,
+              lineHidden: true, linePaintAuthored: true,
+            },
+            dataPointOverrides: [
+              { idx: 0, fillHidden: true },
+              { idx: 1, fillHidden: true },
+            ],
+          })],
+        });
+        expectPaintedPictures(chart, [legendPicture.imagePath]);
+        expect(withChartImageLookup(() => ({ width: 8, height: 8 }) as CanvasImageSource,
+          () => chartExDataMarkPaintWorkCount(chart, RECT, 1))).toBe(1);
+      },
+    );
+
+    it('excludes fully clipped ChartEx column pictures from preflight and paint work', () => {
+      const clippedPictures = Array.from({ length: 257 }, (_, index) =>
+        pointPicture(`clipped-${index}`));
+      const clipped = baseModel({
+        chartType: 'clusteredColumn',
+        categories: clippedPictures.map((_, index) => String(index)),
+        valMin: 10,
+        valMax: 20,
+        series: [series({
+          values: clippedPictures.map((_, index) => index % 2 === 0 ? 2 : 1),
+          dataPointOverrides: clippedPictures.map((fill, idx) => ({
+            idx, chartexStyle: { fillPaints: [fill], fillPaintAuthored: true },
+          })),
+        })],
+      });
+      expectPaintedPictures(clipped, []);
+      expect(chartExDataMarkPaintWorkCount(clipped, RECT, 1)).toBe(0);
+
+      const visiblePicture = pointPicture('visible-second-chart');
+      const visible = baseModel({
+        chartType: 'clusteredColumn', categories: ['A'],
+        series: [series({ values: [12], chartexStyle: {
+          fillPaints: [visiblePicture], fillPaintAuthored: true,
+        } })],
+      });
+      expect(collectChartImageFillUsagesForCharts([clipped, visible])
+        .map(usage => usage.fill.imagePath)).toEqual([visiblePicture.imagePath]);
+    });
+
+    it('does not invent point-driven legend pictures from the empty ChartEx legend series', () => {
+      const small = baseModel({
+        chartType: 'clusteredColumn',
+        categories: ['A', 'B'],
+        varyColors: true,
+        showLegend: true,
+        legendPos: 'r',
+        valMin: 10,
+        valMax: 20,
+        chartexDataPointStyle: {
+          fillPaints: [pointPicture('varying-a'), pointPicture('varying-b')],
+          fillPaintAuthored: true,
+          lineHidden: true,
+          linePaintAuthored: true,
+        },
+        series: [series({ values: [2, 1] })],
+      });
+      expectPaintedPictures(small, []);
+      expect(withChartImageLookup(() => ({ width: 8, height: 8 }) as CanvasImageSource,
+        () => chartExDataMarkPaintWorkCount(small, RECT, 1))).toBe(0);
+
+      const clippedPictures = Array.from({ length: 257 }, (_, index) =>
+        pointPicture(`varying-clipped-${index}`));
+      const clipped = baseModel({
+        chartType: 'clusteredColumn',
+        categories: clippedPictures.map((_, index) => String(index)),
+        varyColors: true,
+        showLegend: true,
+        legendPos: 'r',
+        valMin: 10,
+        valMax: 20,
+        chartexDataPointStyle: {
+          fillPaints: clippedPictures,
+          fillPaintAuthored: true,
+          lineHidden: true,
+          linePaintAuthored: true,
+        },
+        series: [series({ values: Array<number | null>(257).fill(1) })],
+      });
+      expectPaintedPictures(clipped, []);
+      expect(chartExDataMarkPaintWorkCount(clipped, RECT, 1)).toBe(0);
+
+      const visiblePicture = pointPicture('visible-after-varying-legend');
+      const visible = baseModel({
+        chartType: 'clusteredColumn', categories: ['A'],
+        series: [series({ values: [1], chartexStyle: {
+          fillPaints: [visiblePicture], fillPaintAuthored: true,
+        } })],
+      });
+      expect(collectChartImageFillUsagesForCharts([clipped, visible])
+        .map(usage => usage.fill.imagePath)).toEqual([visiblePicture.imagePath]);
+    });
+
+    it('uses the ChartEx legend model without requiring a linked style or palette', () => {
+      const chart = baseModel({
+        chartType: 'clusteredColumn',
+        categories: ['A', 'B'],
+        varyColors: true,
+        showLegend: true,
+        legendPos: 'r',
+        valMin: 10,
+        valMax: 20,
+        series: [series({
+          name: 'Series',
+          values: [2, 1],
+          chartexStyle: {
+            fillPaints: [pointPicture('direct-a'), pointPicture('direct-b')],
+            fillPaintAuthored: true,
+            lineHidden: true,
+            linePaintAuthored: true,
+          },
+        })],
+      });
+      expectPaintedPictures(chart, []);
+      expect(chartExDataMarkPaintWorkCount(chart, RECT, 1)).toBe(0);
+    });
+
+    it('excludes ChartEx column pictures outside the authored date-axis range', () => {
+      const before = pointPicture('date-before-range');
+      const first = pointPicture('date-first-visible');
+      const last = pointPicture('date-last-visible');
+      const chart = baseModel({
+        chartType: 'clusteredColumn',
+        categories: ['45600', '45630', '45660'],
+        catAxisIsDate: true,
+        catAxisBaseTimeUnit: 'days',
+        catAxisMajorTimeUnit: 'days',
+        catAxisMajorUnit: 30,
+        catAxisMin: 45630,
+        catAxisMax: 45660,
+        chartexDataPointStyle: { lineHidden: true, linePaintAuthored: true },
+        series: [series({
+          values: [10, 20, 30],
+          dataPointOverrides: [before, first, last].map((fill, idx) => ({
+            idx, chartexStyle: { fillPaints: [fill], fillPaintAuthored: true },
+          })),
+        })],
+      });
+      expectPaintedPictures(chart, [first.imagePath, last.imagePath]);
+      expect(withChartImageLookup(() => ({ width: 8, height: 8 }) as CanvasImageSource,
+        () => chartExDataMarkPaintWorkCount(chart, RECT, 1))).toBe(2);
+    });
+
+    it('keeps stacked ChartEx date-axis columns on the classic bar geometry path', () => {
+      const first = pointPicture('stacked-date-first');
+      const second = pointPicture('stacked-date-second');
+      const stackedStyle = (fill: typeof first) => ({
+        fillPaints: [fill],
+        fillPaintAuthored: true,
+        lineHidden: true,
+        linePaintAuthored: true,
+      });
+      const chart = baseModel({
+        chartType: 'clusteredColumn',
+        categories: ['45630', '45660'],
+        catAxisIsDate: true,
+        catAxisBaseTimeUnit: 'days',
+        catAxisMin: 45630,
+        catAxisMax: 45660,
+        catAxisCrossBetween: 'midCat',
+        plotGroups: [plotGroup('bar', 0, 2, {
+          grouping: 'stacked', barDirection: 'col', overlap: -100,
+        })],
+        series: [
+          series({
+            name: 'First', values: [1, null],
+            barGroupIndex: 0, barGroupDirection: 'col',
+            barGroupGrouping: 'stacked', barGroupOverlap: -100,
+            chartexStyle: stackedStyle(first),
+          }),
+          series({
+            name: 'Second', values: [1, null],
+            barGroupIndex: 0, barGroupDirection: 'col',
+            barGroupGrouping: 'stacked', barGroupOverlap: -100,
+            chartexStyle: stackedStyle(second),
+          }),
+        ],
+      });
+      expectPaintedPictures(chart, [first.imagePath, second.imagePath]);
+      expect(withChartImageLookup(() => ({ width: 8, height: 8 }) as CanvasImageSource,
+        () => chartExDataMarkPaintWorkCount(chart, RECT, 1))).toBe(2);
+    });
+
+    it('clips non-shared stacked columns before applying the image-source limit', () => {
+      const pictures = Array.from({ length: 257 }, (_, index) =>
+        pointPicture(`stacked-clipped-${index}`));
+      const categories = pictures.map((_, index) => String(45_000 + index));
+      const chart = baseModel({
+        chartType: 'clusteredColumn',
+        categories,
+        catAxisIsDate: true,
+        catAxisBaseTimeUnit: 'days',
+        catAxisMin: 45_256,
+        catAxisMax: 45_257,
+        plotGroups: [plotGroup('bar', 0, 1, {
+          grouping: 'stacked', barDirection: 'col',
+        })],
+        series: [series({
+          values: Array<number | null>(pictures.length).fill(1),
+          barGroupIndex: 0,
+          barGroupDirection: 'col',
+          barGroupGrouping: 'stacked',
+          dataPointOverrides: pictures.map((fill, idx) => ({
+            idx,
+            chartexStyle: {
+              fillPaints: [fill], fillPaintAuthored: true,
+              lineHidden: true, linePaintAuthored: true,
+            },
+          })),
+        })],
+      });
+      expectPaintedPictures(chart, [pictures.at(-1)!.imagePath]);
+      expect(withChartImageLookup(() => ({ width: 8, height: 8 }) as CanvasImageSource,
+        () => chartExDataMarkPaintWorkCount(chart, RECT, 1))).toBe(1);
+    });
+
+    it('uses the primary value axis for a horizontal secondary-axis column delegate', () => {
+      const picture = pointPicture('horizontal-secondary-column');
+      const chart = baseModel({
+        chartType: 'clusteredColumn',
+        categories: ['A'],
+        valMin: 0,
+        valMax: 2,
+        secondaryValAxis: {
+          min: 10,
+          max: 20,
+          title: null,
+          hidden: true,
+          lineHidden: true,
+          majorTickMark: 'none',
+        },
+        series: [series({
+          values: [1],
+          useSecondaryAxis: true,
+          barGroupDirection: 'bar',
+          chartexStyle: {
+            fillPaints: [picture], fillPaintAuthored: true,
+            lineHidden: true, linePaintAuthored: true,
+          },
+        })],
+      });
+      expectPaintedPictures(chart, [picture.imagePath]);
+      expect(withChartImageLookup(() => ({ width: 8, height: 8 }) as CanvasImageSource,
+        () => chartExDataMarkPaintWorkCount(chart, RECT, 1))).toBe(1);
+    });
+
+    it('keeps a primary line series in the generic ChartEx column value-axis plan', () => {
+      const columnPicture = pointPicture('column-with-primary-line');
+      const seriesWithLine = [
+        series({
+          name: 'Column', values: [1],
+          chartexStyle: {
+            fillPaints: [columnPicture], fillPaintAuthored: true,
+            lineHidden: true, linePaintAuthored: true,
+          },
+        }),
+        series({ name: 'Line', values: [100], seriesType: 'line', showMarker: false }),
+      ];
+      const common = {
+        categories: ['A'],
+        catAxisHidden: true,
+        valAxisHidden: true,
+        series: seriesWithLine,
+      };
+      const paintRect = (chart: ChartModel) => {
+        const rec = recordingCtx();
+        renderChart(rec.ctx, chart, RECT, 1, 0, testThreeD, undefined, fill => ({
+          width: 8, height: 8, path: fill.imagePath,
+        }) as unknown as CanvasImageSource);
+        const call = rec.drawImages.find(args =>
+          (args[0] as { path?: string }).path === columnPicture.imagePath
+        );
+        expect(call).toBeDefined();
+        return call!.at(-1);
+      };
+      const classic = paintRect(baseModel({ ...common, chartType: 'clusteredBar' }));
+      const chartEx = paintRect(baseModel({ ...common, chartType: 'clusteredColumn' }));
+      expect(chartEx).toEqual(classic);
+    });
+
+    it('preflights a point picture over series noFill and excludes a point noFill', () => {
+      const chart = model({ fillHidden: true, fillPaintAuthored: true });
+      chart.series[0]!.dataPointOverrides = [
+        { idx: 0, chartexStyle: pointStyle('point') },
+        { idx: 1, fillHidden: true },
+      ];
+      expectPaintedPictures(chart, ['ppt/media/point.png']);
+      chart.series[0]!.chartexStyle = null;
+      expectPaintedPictures(chart, ['ppt/media/point.png']);
+    });
+
+    it('preflights painted histogram bins rather than observations or empty bins', () => {
+      const chart = baseModel({
+        chartType: 'histogram', categories: [],
+        chartexHistogramBinning: { binCount: 5 },
+        chartexDataPointStyle: linked,
+        series: [series({
+          values: [0, 1, 10],
+          chartexStyle: { fillHidden: true, fillPaintAuthored: true },
+          dataPointOverrides: [
+            { idx: 0, chartexStyle: pointStyle('first-bin') },
+            { idx: 1, chartexStyle: pointStyle('empty-bin') },
+            { idx: 4, chartexStyle: pointStyle('last-bin') },
+          ],
+        })],
+      });
+      expectPaintedPictures(chart, ['ppt/media/first-bin.png', 'ppt/media/last-bin.png']);
+    });
+
+    const pareto = () => baseModel({
+      chartType: 'pareto', categories: ['A', 'B', 'C', 'D', '', 'E'],
+      chartexParetoOwnerIndex: 0,
+      chartexParetoSortDescending: true,
+      chartexDataPointStyle: { ...linked, fillPaints: [picture, pointPicture('second-owner')] },
+      series: [
+        // Aggregation is already materialized by the parser. The valued blank
+        // category and trailing unvalued category retain their display slots.
+        series({ values: [0, 23, 7, 9, 4, null], chartexFormatIdx: 2,
+          dataPointOverrides: [
+            { idx: 0, chartexStyle: pointStyle('zero-before-sort') },
+            { idx: 1, chartexStyle: pointStyle('sorted-point') },
+            { idx: 5, chartexStyle: pointStyle('unvalued-category') },
+          ],
+        }),
+        series({ values: [8, 12, 0, -1, null, null], chartexFormatIdx: 3,
+          dataPointOverrides: [
+            { idx: 2, chartexStyle: pointStyle('zero') },
+            { idx: 3, chartexStyle: pointStyle('negative') },
+          ],
+        }),
+        series({ seriesType: 'line', values: [], chartexStyle: pointStyle('line-fill') }),
+      ],
+    });
+
+    it('preflights sorted aggregated Pareto bars across multiple owners with original format indices', () => {
+      expectPaintedPictures(pareto(), [
+        picture.imagePath, 'ppt/media/sorted-point.png', 'ppt/media/second-owner.png',
+      ]);
+    });
+
+    it('excludes Pareto bars for a hidden owner, missing owner or empty first/owner layout', () => {
+      const chart = pareto();
+      expect(paths(chart)).toHaveLength(3);
+      // A hidden PowerPoint owner is emitted with chartexSuppressGeometry.
+      expectPaintedPictures({ ...chart, chartexSuppressGeometry: true }, []);
+      expectPaintedPictures({ ...chart, chartexParetoOwnerIndex: 4 }, []);
+      expectPaintedPictures({ ...chart, series: [series({ values: [null] }), chart.series[1]!] }, []);
+      expectPaintedPictures({ ...chart, chartexParetoOwnerIndex: 1,
+        series: [chart.series[0]!, series({ values: [null] })] }, []);
+    });
+
+    it('excludes outlined owner fill while allowing an authored point picture', () => {
+      const chart = model(null);
+      chart.chartexParetoOutlineOwner = true;
+      expectPaintedPictures(chart, []);
+      chart.series[0]!.dataPointOverrides = [{ idx: 1, chartexStyle: pointStyle('outlined-point') }];
+      expectPaintedPictures(chart, ['ppt/media/outlined-point.png']);
+    });
+
+    it('charges and preflights the first series category domain used by the painter', () => {
+      const chart = model(null);
+      chart.categories = ['A'];
+      chart.series[0]!.categories = ['A', 'B'];
+      chart.series[0]!.dataPointOverrides = [{ idx: 1, chartexStyle: pointStyle('series-category') }];
+      chart.chartexDataPointStyle = { ...linked, lineHidden: true, linePaintAuthored: true };
+      chart.chartStyleRoles = { dataPoint: chart.chartexDataPointStyle };
+      expect(withChartImageLookup(() => ({ width: 8, height: 8 }) as CanvasImageSource,
+        () => chartExDataMarkPaintWorkCount(chart, RECT, 1))).toBe(2);
+      expectPaintedPictures(chart, [picture.imagePath, 'ppt/media/series-category.png']);
+    });
+
+    it('charges and preflights a later owner bar in the Pareto flat endpoint slot', () => {
+      const chart = baseModel({
+        chartType: 'pareto', categories: ['A'], chartexParetoFlatEndpoint: true,
+        chartexDataPointStyle: { ...linked, lineHidden: true, linePaintAuthored: true },
+        series: [series({ values: [10] }), series({ values: [3, 2],
+          dataPointOverrides: [{ idx: 1, chartexStyle: pointStyle('endpoint-slot') }],
+        })],
+      });
+      expect(withChartImageLookup(() => ({ width: 8, height: 8 }) as CanvasImageSource,
+        () => chartExDataMarkPaintWorkCount(chart, RECT, 1))).toBe(3);
+      expectPaintedPictures(chart, [picture.imagePath, 'ppt/media/endpoint-slot.png']);
     });
   });
 

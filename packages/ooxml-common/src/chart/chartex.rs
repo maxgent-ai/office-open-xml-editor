@@ -191,65 +191,73 @@ pub(super) fn parse_chartex_data_point_overrides(
     image_resolver: &dyn ChartImageResolver,
     paint_budget: &mut usize,
     paint_budget_exceeded: &mut bool,
-) -> Vec<ChartDataPointOverride> {
-    series
+) -> Option<Vec<ChartDataPointOverride>> {
+    let override_count = series
         .children()
         .filter(|node| node.is_element() && node.tag_name().name() == "dataPt")
-        .filter_map(|point| {
-            let idx = attr(&point, "idx")?.parse::<u32>().ok()?;
-            let (color, fill_hidden, line_color, line_width_emu, line_dash, line_hidden) =
-                parse_data_point_shape(point, resolver);
-            let shape = child(point, "spPr");
-            let fill_components = shape
-                .and_then(chart_style_paint_component_count)
-                .unwrap_or(0);
-            let line_components = shape
-                .and_then(|sp_pr| child(sp_pr, "ln"))
-                .and_then(chart_style_paint_component_count)
-                .unwrap_or(0);
-            let components = fill_components.saturating_add(line_components);
-            let within_limit = fill_components <= MAX_CHART_MARKER_GRADIENT_STOPS
-                && line_components <= MAX_CHART_MARKER_GRADIENT_STOPS
-                && components <= *paint_budget;
-            let chartex_style = if within_limit {
-                *paint_budget -= components;
-                shape.map(|_| {
-                    parse_chartex_element_style(
-                        point,
-                        resolver,
-                        None,
-                        None,
-                        image_resolver,
-                        ChartImageSource::Chart,
-                    )
+        .filter(|point| attr(point, "idx").is_some_and(|idx| idx.parse::<u32>().is_ok()))
+        .count();
+    Some(
+        series
+            .children()
+            .filter(|node| node.is_element() && node.tag_name().name() == "dataPt")
+            .filter_map(|point| {
+                let idx = attr(&point, "idx")?.parse::<u32>().ok()?;
+                let (color, fill_hidden, line_color, line_width_emu, line_dash, line_hidden) =
+                    parse_data_point_shape(point, resolver);
+                let shape = child(point, "spPr");
+                let fill_components = shape
+                    .and_then(chart_style_paint_component_count)
+                    .unwrap_or(0);
+                let line_components = shape
+                    .and_then(|sp_pr| child(sp_pr, "ln"))
+                    .and_then(chart_style_paint_component_count)
+                    .unwrap_or(0);
+                let components = fill_components.saturating_add(line_components);
+                let within_limit = fill_components <= MAX_CHART_MARKER_GRADIENT_STOPS
+                    && line_components <= MAX_CHART_MARKER_GRADIENT_STOPS
+                    && components <= *paint_budget;
+                let chartex_style = if within_limit {
+                    *paint_budget -= components;
+                    shape.map(|_| {
+                        parse_chartex_element_style(
+                            point,
+                            resolver,
+                            None,
+                            None,
+                            image_resolver,
+                            ChartImageSource::Chart,
+                        )
+                    })
+                } else {
+                    *paint_budget_exceeded = true;
+                    None
+                };
+                Some(ChartDataPointOverride {
+                    idx,
+                    color,
+                    fill_hidden,
+                    chartex_style,
+                    line_color,
+                    line_width_emu,
+                    line_dash,
+                    line_hidden,
+                    marker_symbol: None,
+                    marker_size: None,
+                    marker_fill: None,
+                    marker_fill_paint: None,
+                    marker_fill_paint_authored: None,
+                    marker_style: None,
+                    marker_line: None,
+                    marker_line_width_emu: None,
+                    marker_line_paint_authored: None,
+                    bubble_3d: None,
+                    explosion: None,
                 })
-            } else {
-                *paint_budget_exceeded = true;
-                None
-            };
-            Some(ChartDataPointOverride {
-                idx,
-                color,
-                fill_hidden,
-                chartex_style,
-                line_color,
-                line_width_emu,
-                line_dash,
-                line_hidden,
-                marker_symbol: None,
-                marker_size: None,
-                marker_fill: None,
-                marker_fill_paint: None,
-                marker_fill_paint_authored: None,
-                marker_style: None,
-                marker_line: None,
-                marker_line_width_emu: None,
-                marker_line_paint_authored: None,
-                bubble_3d: None,
-                explosion: None,
             })
-        })
-        .collect()
+            .take(override_count)
+            .collect(),
+    )
 }
 
 pub(super) fn parse_chartex_histogram_binning(series: Node) -> Option<ChartexHistogramBinning> {
@@ -350,9 +358,9 @@ pub(super) fn parse_chartex_series_labels(
     value_count: usize,
     resolver: &dyn ColorResolver,
     allow_label_paints: bool,
-) -> ChartexSeriesLabels {
+) -> Option<ChartexSeriesLabels> {
     let Some(labels) = child(series, "dataLabels") else {
-        return (None, None, None);
+        return Some((None, None, None));
     };
     let visibility = child(labels, "visibility");
     let bool_value = |name: &str| {
@@ -416,7 +424,13 @@ pub(super) fn parse_chartex_series_labels(
     };
     let mut colors = vec![None; value_count];
     let mut has_color = false;
-    let mut overrides = Vec::new();
+    let override_count = labels
+        .children()
+        .filter(|node| {
+            node.is_element() && matches!(node.tag_name().name(), "dataLabel" | "dataLabelHidden")
+        })
+        .count();
+    let mut overrides = Vec::with_capacity(override_count);
     for label in labels
         .children()
         .filter(|node| node.is_element() && node.tag_name().name() == "dataLabel")
@@ -439,7 +453,11 @@ pub(super) fn parse_chartex_series_labels(
         // The rich-text parser already applies each paragraph's defRPr to its
         // own runs. Passing the first run as a body default would incorrectly
         // leak direct formatting into later sibling runs.
-        let rich_runs = tx_pr.and_then(|tx| parse_data_label_rich_body(tx, None, resolver, None));
+        let rich_runs = if let Some(tx) = tx_pr {
+            parse_data_label_rich_body(tx, None, resolver, None)
+        } else {
+            None
+        };
         // Paragraph defRPr is already applied to the runs in that paragraph.
         // It is a point-wide fallback only for a style-only txPr with no rich
         // text; otherwise it would leak the first paragraph into later ones.
@@ -452,13 +470,16 @@ pub(super) fn parse_chartex_series_labels(
         }
         let body_style = chart_label_body_style(tx_pr.and_then(|tx| child(tx, "bodyPr")));
         let label_visibility = child(label, "visibility");
+
         overrides.push(ChartDataLabelOverride {
             idx: index as u32,
-            text: rich_runs
-                .as_ref()
-                .map(|runs| runs.iter().map(|run| run.text.as_str()).collect())
-                .or_else(|| tx_pr.map(|node| flatten_rich_text(node, None)))
-                .unwrap_or_default(),
+            text: if let Some(runs) = rich_runs.as_ref() {
+                (runs.iter().map(|run| run.text.as_str())).collect::<String>()
+            } else if let Some(node) = tx_pr {
+                flatten_rich_text(node, None)
+            } else {
+                ("").to_owned()
+            },
             position: attr(&label, "pos"),
             font_color,
             font_paint_authored: text_paint.authored.then_some(true),
@@ -511,11 +532,6 @@ pub(super) fn parse_chartex_series_labels(
             deleted: None,
         });
     }
-    let mut override_positions: std::collections::HashMap<u32, usize> = overrides
-        .iter()
-        .enumerate()
-        .map(|(position, override_)| (override_.idx, position))
-        .collect();
     for hidden in labels
         .children()
         .filter(|node| node.is_element() && node.tag_name().name() == "dataLabelHidden")
@@ -529,12 +545,12 @@ pub(super) fn parse_chartex_series_labels(
         {
             continue;
         }
-        if let Some(position) = override_positions.get(&idx).copied() {
+        if let Some(position) = overrides.iter().position(|override_| override_.idx == idx) {
             overrides[position].deleted = Some(true);
         } else {
             overrides.push(ChartDataLabelOverride {
                 idx,
-                text: String::new(),
+                text: ("").to_owned(),
                 rich_runs: None,
                 position: None,
                 font_color: None,
@@ -568,42 +584,364 @@ pub(super) fn parse_chartex_series_labels(
                 show_legend_key: None,
                 deleted: Some(true),
             });
-            override_positions.insert(idx, overrides.len() - 1);
         }
     }
-    (
+    Some((
         has_color.then_some(colors),
         (!overrides.is_empty()).then_some(overrides),
         Some(defaults),
-    )
+    ))
 }
 
-pub(super) fn parse_chartex_impl(
+// Model construction is deliberately free of resource-accounting decisions.
+// The caller first applies the cheap authored-width lower bound below, then
+// measures the completed host-neutral canonical value with `RetainedBytes`.
+pub(super) struct ChartexCanonical {
+    model: Option<Box<ChartModel>>,
+    projection: ChartexProjection,
+}
+
+impl RetainedBytes for ChartexCanonical {
+    fn heap_bytes(&self) -> u64 {
+        let Self { model, projection } = self;
+        // Projection metadata is transient parser state. The charged value is
+        // exactly the host-neutral ChartModel that can be retained by a host.
+        let _ = projection;
+        model.heap_bytes()
+    }
+}
+
+#[derive(Default)]
+struct ChartexProjection {
+    common_series_keep: Vec<bool>,
+    excel_series_keep: Vec<bool>,
+    excel_drop_pareto: bool,
+    excel_pareto_sort_descending: bool,
+    excel_suppress_geometry: bool,
+    presentation_suppress_geometry: bool,
+    presentation_show_unpaired_percentage_axis: bool,
+}
+
+impl ChartexCanonical {
+    fn project(self, host: ChartHost) -> Option<ChartModel> {
+        let Self { model, projection } = self;
+        let mut model = *model?;
+        let keep = if host == ChartHost::Excel {
+            &projection.excel_series_keep
+        } else {
+            &projection.common_series_keep
+        };
+        let mut index = 0usize;
+        model.series.retain(|_| {
+            let retained = keep.get(index).copied().unwrap_or(false);
+            index = index.saturating_add(1);
+            retained
+        });
+
+        match host {
+            ChartHost::Excel => {
+                if projection.excel_drop_pareto {
+                    // Canonical chart-type strings reserve enough capacity for
+                    // this longest in-place projection; no allocation occurs.
+                    model.chart_type.clear();
+                    model.chart_type.push_str("clusteredColumn");
+                    model.chartex_pareto_owner_index = None;
+                }
+                model.chartex_pareto_sort_descending = matches!(
+                    model.chart_type.as_str(),
+                    "pareto" | "paretoLine" | "clusteredColumn"
+                )
+                .then_some(projection.excel_pareto_sort_descending);
+                model.chartex_pareto_flat_endpoint =
+                    matches!(model.chart_type.as_str(), "pareto" | "paretoLine").then_some(false);
+                model.chartex_suppress_geometry =
+                    projection.excel_suppress_geometry.then_some(true);
+                model.chartex_show_unpaired_percentage_axis = None;
+            }
+            ChartHost::PowerPoint | ChartHost::Word => {
+                model.chartex_suppress_geometry =
+                    projection.presentation_suppress_geometry.then_some(true);
+                model.chartex_show_unpaired_percentage_axis = projection
+                    .presentation_show_unpaired_percentage_axis
+                    .then_some(true);
+            }
+            ChartHost::Unspecified => {}
+        }
+        Some(model)
+    }
+}
+
+pub(super) struct ChartexBuild {
+    canonical: ChartexCanonical,
+    checkpoint_violation: Option<u64>,
+}
+
+impl ChartexBuild {
+    pub(super) fn retained_bytes(&self) -> u64 {
+        let Self {
+            canonical,
+            checkpoint_violation: _,
+        } = self;
+        canonical.heap_bytes()
+    }
+
+    pub(super) fn project(self, host: ChartHost) -> Option<ChartModel> {
+        let Self {
+            canonical,
+            checkpoint_violation: _,
+        } = self;
+        canonical.project(host)
+    }
+
+    pub(super) fn checkpoint_violation(&self) -> Option<u64> {
+        self.checkpoint_violation
+    }
+}
+
+#[derive(Default)]
+struct ChartexRetainedCheckpoint {
+    violation: Option<u64>,
+}
+
+impl ChartexRetainedCheckpoint {
+    fn observe_series(&mut self, series: &impl RetainedBytes) -> bool {
+        use crate::resource::HARD_MAX_CHARTEX_ALLOCATION_BYTES;
+
+        let retained = series.heap_bytes();
+        if retained > HARD_MAX_CHARTEX_ALLOCATION_BYTES {
+            self.violation = Some(retained);
+            false
+        } else {
+            true
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(super) enum ChartexPreparseViolation {
+    Elements(u64),
+    Bytes(u64),
+}
+
+/// Computes a host-independent lower bound before any width-controlled cache
+/// vector is materialized. Invalid declarations saturate so increasing or
+/// corrupting a width can never make a document more likely to pass.
+pub(super) fn chartex_preparse_lower_bound(root: Node) -> Result<u64, ChartexPreparseViolation> {
+    use crate::resource::{
+        HARD_MAX_CHARTEX_ALLOCATION_BYTES, HARD_MAX_CHARTEX_ALLOCATION_ELEMENTS,
+    };
+
+    fn declared_width(level: Node) -> u64 {
+        let declared = level
+            .attribute("ptCount")
+            .map_or(0, |value| value.parse::<u64>().unwrap_or(u64::MAX));
+        let sparse = level
+            .children()
+            .filter(|node| node.is_element() && node.tag_name().name() == "pt")
+            .map(|point| {
+                point
+                    .attribute("idx")
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .map_or(u64::MAX, |index| index.saturating_add(1))
+            })
+            .max()
+            .unwrap_or(0);
+        declared.max(sparse)
+    }
+
+    fn dimension_width(dimension: Node) -> u64 {
+        if let Some(level) = dimension
+            .children()
+            .find(|node| node.is_element() && node.tag_name().name() == "lvl")
+        {
+            return declared_width(level);
+        }
+        dimension
+            .children()
+            .find(|node| node.is_element() && node.tag_name().name() == "f")
+            .and_then(|node| node.text())
+            .map(str::trim)
+            .filter(|formula| !formula.is_empty())
+            .map(|formula| {
+                if formula.contains(['!', ':', '$']) {
+                    chartex_a1_range_point_count_u64(formula).unwrap_or(u64::MAX)
+                } else {
+                    0
+                }
+            })
+            .unwrap_or(0)
+    }
+
+    let mut lower = 0u64;
+    let series_count = root
+        .descendants()
+        .filter(|node| node.is_element() && node.tag_name().name() == "series")
+        .count() as u64;
+    lower = lower
+        .saturating_add(series_count.saturating_mul(std::mem::size_of::<ChartSeries>() as u64));
+    if lower > HARD_MAX_CHARTEX_ALLOCATION_BYTES {
+        return Err(ChartexPreparseViolation::Bytes(lower));
+    }
+    let box_series_count = root
+        .descendants()
+        .filter(|node| {
+            node.is_element()
+                && node.tag_name().name() == "series"
+                && node.attribute("layoutId") == Some("boxWhisker")
+        })
+        .count() as u64;
+    lower = lower.saturating_add(
+        box_series_count
+            .saturating_mul(box_series_count)
+            .saturating_mul(std::mem::size_of::<String>() as u64),
+    );
+    if lower > HARD_MAX_CHARTEX_ALLOCATION_BYTES {
+        return Err(ChartexPreparseViolation::Bytes(lower));
+    }
+    let data_nodes = root
+        .descendants()
+        .filter(|node| node.is_element() && node.tag_name().name() == "data")
+        .collect::<Vec<_>>();
+    for series in root
+        .descendants()
+        .filter(|node| node.is_element() && node.tag_name().name() == "series")
+    {
+        let data_id = child(series, "dataId").and_then(|node| node.attribute("val"));
+        let data = data_id
+            .and_then(|id| {
+                data_nodes
+                    .iter()
+                    .rev()
+                    .copied()
+                    .find(|node| node.attribute("id") == Some(id))
+            })
+            .unwrap_or(root);
+        for dimension in data.descendants().filter(|node| {
+            node.is_element() && matches!(node.tag_name().name(), "numDim" | "strDim")
+        }) {
+            let width = dimension_width(dimension);
+            if width > HARD_MAX_CHARTEX_ALLOCATION_ELEMENTS {
+                return Err(ChartexPreparseViolation::Elements(width));
+            }
+            let element = if dimension.tag_name().name() == "numDim" {
+                std::mem::size_of::<Option<f64>>() as u64
+            } else {
+                std::mem::size_of::<String>() as u64
+            };
+            lower = lower.saturating_add(width.saturating_mul(element));
+        }
+    }
+
+    // Each retained rich run owns inherited paragraph strings. Extra series
+    // clone the primary label model, so multiply this known amplifier by the
+    // authored series count before model construction.
+    let mut inherited_run_strings = 0u64;
+    for paragraph in root
+        .descendants()
+        .filter(|node| node.is_element() && node.tag_name().name() == "p")
+    {
+        let run_count = paragraph
+            .children()
+            .filter(|node| {
+                node.is_element() && matches!(node.tag_name().name(), "r" | "fld" | "br")
+            })
+            .take(MAX_DATA_LABEL_RICH_SCALARS)
+            .count() as u64;
+        let defaults = paragraph
+            .descendants()
+            .find(|node| node.is_element() && node.tag_name().name() == "defRPr");
+        let inherited = defaults.map_or(0u64, |props| {
+            let face = props
+                .descendants()
+                .find(|node| node.is_element() && node.tag_name().name() == "latin")
+                .and_then(|node| node.attribute("typeface"))
+                .map_or(0, str::len) as u64;
+            let language = props.attribute("lang").map_or(0, str::len) as u64;
+            face.saturating_add(language)
+        });
+        let text_bytes = paragraph
+            .descendants()
+            .filter(|node| node.is_element() && node.tag_name().name() == "t")
+            .filter_map(|node| node.text())
+            .fold(0u64, |total, text| total.saturating_add(text.len() as u64));
+        inherited_run_strings = inherited_run_strings.saturating_add(
+            run_count
+                .saturating_mul(
+                    (std::mem::size_of::<ChartTextRun>() as u64).saturating_add(inherited),
+                )
+                .saturating_add(text_bytes),
+        );
+    }
+    lower = lower.saturating_add(inherited_run_strings.saturating_mul(series_count.max(1)));
+    if lower > HARD_MAX_CHARTEX_ALLOCATION_BYTES {
+        Err(ChartexPreparseViolation::Bytes(lower))
+    } else {
+        Ok(lower)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn build_chartex_canonical(
     chartspace_root: Node,
     resolver: &dyn ColorResolver,
     style_xml: Option<&str>,
     color_style_xml: Option<&str>,
     references: &mut dyn ChartReferenceResolver,
     image_resolver: &dyn ChartImageResolver,
-    host: ChartHost,
-) -> Option<ChartModel> {
-    // Word follows PowerPoint's compatibility policy until Word controls are
-    // measured. This is the single host-level switch for that choice.
-    // `Unspecified` deliberately stays distinct: it takes the non-Excel
-    // behaviour but none of the quirks gated on a positive PowerPoint identity.
-    let host = if host == ChartHost::Word {
-        ChartHost::PowerPoint
-    } else {
-        host
+) -> ChartexBuild {
+    let mut checkpoint = ChartexRetainedCheckpoint::default();
+    let mut projection = ChartexProjection::default();
+    let canonical = ChartexCanonical {
+        model: parse_chartex_impl(
+            chartspace_root,
+            resolver,
+            style_xml,
+            color_style_xml,
+            references,
+            image_resolver,
+            &mut checkpoint,
+            &mut projection,
+        )
+        .map(Box::new),
+        projection,
     };
+    if checkpoint.violation.is_some() {
+        return ChartexBuild {
+            canonical,
+            checkpoint_violation: checkpoint.violation,
+        };
+    }
+    ChartexBuild {
+        canonical,
+        checkpoint_violation: checkpoint.violation,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn parse_chartex_impl(
+    chartspace_root: Node,
+    resolver: &dyn ColorResolver,
+    style_xml: Option<&str>,
+    color_style_xml: Option<&str>,
+    references: &mut dyn ChartReferenceResolver,
+    image_resolver: &dyn ChartImageResolver,
+    retained_checkpoint: &mut ChartexRetainedCheckpoint,
+    projection: &mut ChartexProjection,
+) -> Option<ChartModel> {
+    // Canonical construction uses the host-neutral compatibility branch. The
+    // final projection below only removes series or changes scalar flags.
+    let host = ChartHost::Unspecified;
     let root = chartspace_root;
     let chart_node = root
         .descendants()
         .find(|n| n.is_element() && n.tag_name().name() == "chart")?;
     let style_doc = style_xml.and_then(|xml| crate::depth::parse_guarded(xml).ok());
     let color_style = color_style_xml.and_then(|xml| parse_chart_color_style(xml, resolver));
-    let unresolved_color_style_palette =
-        (color_style_xml.is_some() && color_style.is_none()).then(|| vec![None]);
+    let unresolved_color_style_palette = if color_style_xml.is_some() && color_style.is_none() {
+        Some(vec![None; 1])
+    } else {
+        None
+    };
     let style_element = |name: &str| {
         style_doc.as_ref().and_then(|doc| {
             doc.root_element()
@@ -615,10 +953,76 @@ pub(super) fn parse_chartex_impl(
     // CT_PlotAreaRegion may contain several series. `hidden` is an authored
     // series visibility flag; a hidden leading series must not select the
     // chart layout or data used by the visible plot.
-    let all_series_nodes: Vec<Node> = root
+    let all_series_count = root
         .descendants()
         .filter(|n| n.is_element() && n.tag_name().name() == "series")
-        .collect();
+        .count();
+    let all_series_nodes = (root
+        .descendants()
+        .filter(|n| n.is_element() && n.tag_name().name() == "series"))
+    .take(all_series_count)
+    .collect::<Vec<_>>();
+    let data_count = root
+        .descendants()
+        .filter(|node| node.is_element() && node.tag_name().name() == "data")
+        .count();
+    let mut data_by_id = Vec::with_capacity(data_count);
+    for data in root
+        .descendants()
+        .filter(|node| node.is_element() && node.tag_name().name() == "data")
+    {
+        let Some(id) = data.attribute("id") else {
+            continue;
+        };
+        if let Some((_, existing)) = data_by_id
+            .iter_mut()
+            .find(|(known, _): &&mut (String, Node)| known == id)
+        {
+            *existing = data;
+        } else {
+            let id = (id).to_owned();
+            data_by_id.push((id, data));
+        }
+    }
+    // Width validation is host-neutral and monotonic. Even a series that a
+    // host later hides or discards owns an authored cache, so an oversized
+    // declaration or sparse maximum index must produce the same verdict in
+    // Word, Excel, PowerPoint, and the standalone shared parser.
+    let mut referenced_data_ids = Vec::with_capacity(all_series_nodes.len());
+    let mut uses_implicit_data = false;
+    for series in &all_series_nodes {
+        if let Some(id) = child(*series, "dataId").and_then(|node| node.attribute("val")) {
+            if !referenced_data_ids.iter().any(|known| known == id) {
+                let id = (id).to_owned();
+                referenced_data_ids.push(id);
+            }
+        } else {
+            uses_implicit_data = true;
+        }
+    }
+    for data in referenced_data_ids
+        .iter()
+        .filter_map(|id| {
+            data_by_id
+                .iter()
+                .find(|(known, _)| known == id)
+                .map(|(_, data)| *data)
+        })
+        .chain(uses_implicit_data.then_some(root))
+    {
+        for level in data.descendants().filter(|node| {
+            node.is_element()
+                && node.tag_name().name() == "lvl"
+                && node.parent().is_some_and(|parent| {
+                    matches!(
+                        parent.tag_name().name(),
+                        "numDim" | "strDim" | "numLit" | "strLit"
+                    )
+                })
+        }) {
+            bounded_chartex_point_count(level)?;
+        }
+    }
     // Office 16.113 (owner-hidden control): Excel still paints a hidden
     // clustered-column series when it is the owner of a valid, visible
     // `paretoLine`; PowerPoint suppresses its geometry. Other hidden series,
@@ -639,22 +1043,25 @@ pub(super) fn parse_chartex_impl(
         (owner != *pareto && attr(&owner, "layoutId").as_deref() == Some("clusteredColumn"))
             .then_some(owner)
     };
-    let visible_line_owners: Vec<Node> = all_series_nodes
+    let visible_pareto_owners = all_series_nodes
         .iter()
         .filter(|node| !is_hidden(node))
         .filter_map(pareto_line_owner)
-        .collect();
-    let series_nodes: Vec<Node> = all_series_nodes
+        .collect::<Vec<_>>();
+    let retained_series_count = all_series_nodes
+        .iter()
+        .filter(|node| !is_hidden(node))
+        .count();
+    let series_nodes = (all_series_nodes
         .iter()
         .copied()
-        .filter(|node| {
-            (host == ChartHost::Excel && visible_line_owners.contains(node)) || !is_hidden(node)
-        })
-        .collect();
-    // MS-ODRAWXML §2.24.4.19 defines this closed set.  Preserve a future
-    // identifier verbatim, but let it own the chart-wide fail-closed result:
-    // otherwise a preceding known series or a trailing `paretoLine` could
-    // silently normalize the chart to a visually similar implemented layout.
+        .filter(|node| !is_hidden(node)))
+    .take(retained_series_count)
+    .collect::<Vec<_>>();
+    // MS-ODRAWXML §2.24.4.19 defines this closed set. Reject a future or
+    // unsupported identifier for the whole chart: otherwise a preceding known
+    // series or trailing `paretoLine` could silently normalize the plot, or a
+    // classic renderer could paint a misleading chart with the same name.
     const KNOWN_SERIES_LAYOUTS: [&str; 8] = [
         "boxWhisker",
         "clusteredColumn",
@@ -665,37 +1072,47 @@ pub(super) fn parse_chartex_impl(
         "treemap",
         "waterfall",
     ];
-    let unknown_series = series_nodes.iter().copied().find(|node| {
+    let unknown_series = all_series_nodes.iter().copied().find(|node| {
         !attr(node, "layoutId")
             .is_some_and(|layout| KNOWN_SERIES_LAYOUTS.contains(&layout.as_str()))
     });
+    if unknown_series.is_some() {
+        // A ChartEx layout identifier is not interchangeable with the classic
+        // chart families that happen to use the same spelling. Returning a
+        // model here would let the TypeScript renderer dispatch an unsupported
+        // ChartEx layout (for example `pie`) as an ordinary classic chart.
+        // Fail the complete plot closed in every host; package adapters may
+        // then omit it, while DOCX can select an authored MCE picture fallback.
+        return None;
+    }
     // [MS-ODRAWXML] CT_Series@ownerIdx names a document-order series, not
     // formatIdx. The owner can follow its auxiliary line. A line without a
     // valid clustered-column owner never borrows the first column's data. An
     // unknown future layout owns the chart-wide fail-closed result, so no
     // Pareto pairing (and none of its derived flags) may apply then.
-    let pareto_pair = if unknown_series.is_none() {
-        series_nodes
-            .iter()
-            .copied()
-            .find_map(|pareto| pareto_line_owner(&pareto).map(|owner| (owner, pareto)))
-    } else {
-        None
-    };
+    let pareto_pair = series_nodes
+        .iter()
+        .copied()
+        .find_map(|pareto| pareto_line_owner(&pareto).map(|owner| (owner, pareto)));
     let first_column = series_nodes
         .iter()
         .copied()
         .find(|node| attr(node, "layoutId").as_deref() == Some("clusteredColumn"));
+    let excel_first_column = all_series_nodes.iter().copied().find(|node| {
+        attr(node, "layoutId").as_deref() == Some("clusteredColumn")
+            && (!is_hidden(node) || visible_pareto_owners.contains(node))
+    });
     // Excel 16.113 retains only the first clustered column series. A line
     // owned by a discarded later series is therefore discarded with it.
-    let pareto_pair =
-        pareto_pair.filter(|(owner, _)| host != ChartHost::Excel || first_column == Some(*owner));
+    let excel_pareto_pair = pareto_pair.filter(|(owner, _)| excel_first_column == Some(*owner));
     // Office 16.113 implicit format slots. Only the measured shape is
     // implemented: with exactly three series `[owner, column, line]` (line
     // ownerIdx=0) the line takes slot 1 and the later column slot 2, while
     // ownerIdx=1 keeps source order. Other arrangements keep source order
     // because no control establishes a general "line follows its owner" rule.
-    let mut format_order = all_series_nodes.clone();
+    let mut format_order = (all_series_nodes.iter().copied())
+        .take(all_series_nodes.len())
+        .collect::<Vec<_>>();
     if let Some((owner, pareto)) = pareto_pair {
         if let (Some(owner_position), Some(line_position)) = (
             format_order.iter().position(|node| *node == owner),
@@ -721,9 +1138,7 @@ pub(super) fn parse_chartex_impl(
             })
             .unwrap_or(0)
     };
-    let (series_node, pareto_series_node) = if let Some(unknown) = unknown_series {
-        (unknown, None)
-    } else if let Some((_, pareto)) = pareto_pair {
+    let (series_node, pareto_series_node) = if let Some((_, pareto)) = pareto_pair {
         (
             first_column.or_else(|| pareto_pair.map(|pair| pair.0))?,
             Some(pareto),
@@ -766,8 +1181,7 @@ pub(super) fn parse_chartex_impl(
     // A data-bearing, unowned paretoLine keeps axis 2's ticks in PowerPoint,
     // but Excel suppresses that axis with the line. The axis itself must opt
     // into tick labels; its mere declaration is insufficient.
-    let show_unpaired_percentage_axis = host == ChartHost::PowerPoint
-        && first_column.is_some()
+    let presentation_show_unpaired_percentage_axis = first_column.is_some()
         && pareto_pair.is_none()
         && percentage_axis.is_some_and(|axis| {
             child(axis, "tickLabels").is_some()
@@ -779,6 +1193,7 @@ pub(super) fn parse_chartex_impl(
                 && child(node, "dataId").is_some()
                 && references_percentage_axis(node)
         });
+    let show_unpaired_percentage_axis = false;
     let hidden_pareto_owner = pareto_pair.is_some_and(|(owner, _)| is_hidden(&owner));
     // A standalone line without dataId has no data owner. Office 16.113
     // paints only the chart frame/title even when chartData exists elsewhere.
@@ -799,22 +1214,24 @@ pub(super) fn parse_chartex_impl(
         && layout_id == "clusteredColumn")
         .then(|| parse_chartex_histogram_binning(series_node))
         .flatten();
-    let chart_type = if pareto_series_node.is_some() {
-        "pareto".to_string()
+    let chart_type_value = if pareto_series_node.is_some() {
+        "pareto"
     } else if chartex_histogram_binning.is_some() {
-        "histogram".to_string()
+        "histogram"
     } else {
-        layout_id.clone()
+        layout_id.as_str()
     };
-    let data_by_id: std::collections::HashMap<String, Node> = root
-        .descendants()
-        .filter(|node| node.is_element() && node.tag_name().name() == "data")
-        .filter_map(|data| attr(&data, "id").map(|id| (id, data)))
-        .collect();
+    // Excel can project a host-neutral Pareto model back to its first column.
+    // Reserve the longest replacement now so projection remains allocation-free.
+    let mut chart_type = String::with_capacity(chart_type_value.len().max("clusteredColumn".len()));
+    chart_type.push_str(chart_type_value);
     let data_for_series = |series: Node| -> Option<Node> {
-        let data_id = child(series, "dataId").and_then(|node| attr(&node, "val"));
+        let data_id = child(series, "dataId").and_then(|node| node.attribute("val"));
         match data_id {
-            Some(id) => data_by_id.get(&id).copied(),
+            Some(id) => data_by_id
+                .iter()
+                .find(|(known, _)| known == id)
+                .map(|(_, data)| *data),
             // Retain compatibility with early ChartEx producers that placed a
             // single data block in chartSpace but omitted CT_Series.dataId.
             None => Some(root),
@@ -833,11 +1250,6 @@ pub(super) fn parse_chartex_impl(
                 .filter(|node| {
                     *node != series_node
                         && attr(node, "layoutId").as_deref() == Some("clusteredColumn")
-                })
-                .take(if host == ChartHost::Excel {
-                    0
-                } else {
-                    usize::MAX
                 })
                 .filter(|node| data_for_series(*node).is_some())
         })
@@ -882,9 +1294,10 @@ pub(super) fn parse_chartex_impl(
         chart_type.as_str(),
         "waterfall" | "boxWhisker" | "sunburst" | "treemap" | "regionMap"
     ) {
-        let accents: Vec<String> = (0..6)
-            .filter_map(|i| resolver.resolve_series_accent(i))
-            .collect();
+        let mut accents = Vec::with_capacity(6);
+        for accent in (0..6).filter_map(|index| resolver.resolve_series_accent(index)) {
+            accents.push(accent);
+        }
         if accents.len() == 6 {
             Some(accents)
         } else {
@@ -903,9 +1316,10 @@ pub(super) fn parse_chartex_impl(
     // ordinary six-color theme palette independently whenever a style part is
     // present so `phClr` recipes are not discarded for other layouts.
     let theme_style_palette = style_doc.as_ref().and_then(|_| {
-        let colors = (0..6)
-            .map(|index| resolver.resolve_series_accent(index))
-            .collect::<Vec<_>>();
+        let mut colors = Vec::with_capacity(6);
+        for color in (0..6).map(|index| resolver.resolve_series_accent(index)) {
+            colors.push(color);
+        }
         colors.iter().any(Option::is_some).then_some(colors)
     });
     let style_palette = chartex_color_palette
@@ -1005,38 +1419,47 @@ pub(super) fn parse_chartex_impl(
         .as_ref()
         .map(|data| data.rows.as_slice())
         .or_else(|| chartex_sunburst.as_ref().map(|data| data.rows.as_slice()));
-    let mut categories: Vec<String> = hierarchy_rows
-        .map(|rows| {
-            rows.iter()
-                .map(|row| row.path.last().cloned().unwrap_or_default())
-                .collect()
-        })
-        .or_else(|| chartex_box.as_ref().map(|data| data.categories.clone()))
-        .or_else(|| {
-            chartex_region_map
-                .as_ref()
-                .map(|data| data.rows.iter().map(|row| row.label.clone()).collect())
-        })
-        .or_else(|| {
-            chartex_string_levels(primary_data, references)
-                .and_then(|levels| levels.into_iter().next())
-        })
-        .unwrap_or_default();
+    let mut categories: Vec<String> = if let Some(rows) = hierarchy_rows {
+        let mut values = Vec::with_capacity(rows.len());
+        for row in rows {
+            values.push((row.path.last().map_or("", String::as_str)).to_owned());
+        }
+        values
+    } else if let Some(data) = chartex_box.as_ref() {
+        let mut values = Vec::with_capacity(data.categories.len());
+        for value in &data.categories {
+            values.push((value).to_owned());
+        }
+        values
+    } else if let Some(data) = chartex_region_map.as_ref() {
+        let mut values = Vec::with_capacity(data.rows.len());
+        for row in &data.rows {
+            values.push(row.label.to_owned());
+        }
+        values
+    } else {
+        chartex_string_levels(primary_data, references)
+            .and_then(|levels| levels.into_iter().next())
+            .unwrap_or_default()
+    };
 
     let pt_count = categories.len().max(1);
 
-    let mut raw_values: Vec<Option<f64>> = hierarchy_rows
-        .map(|rows| rows.iter().map(|row| Some(row.size)).collect())
-        .or_else(|| {
-            if chartex_box.is_some() {
-                None
-            } else if let Some(region_map) = chartex_region_map.as_ref() {
-                Some(region_map.rows.iter().map(|row| row.value).collect())
-            } else {
-                chartex_number_values(primary_data, &["val"], references)
-            }
-        })
-        .unwrap_or_else(|| vec![None; pt_count]);
+    let mut raw_values: Vec<Option<f64>> = if let Some(rows) = hierarchy_rows {
+        (rows.iter().map(|row| Some(row.size)))
+            .take(rows.len())
+            .collect::<Vec<_>>()
+    } else if chartex_box.is_some() {
+        vec![None; pt_count]
+    } else if let Some(region_map) = chartex_region_map.as_ref() {
+        (region_map.rows.iter().map(|row| row.value))
+            .take(region_map.rows.len())
+            .collect::<Vec<_>>()
+    } else if let Some(values) = chartex_number_values(primary_data, &["val"], references) {
+        values
+    } else {
+        vec![None; pt_count]
+    };
 
     // [MS-ODRAWXML] CT_Aggregation is an empty layout marker; CT_StringValue
     // and CT_NumericValue carry source `idx`. Office 16.113 groups values by
@@ -1064,23 +1487,19 @@ pub(super) fn parse_chartex_impl(
     // series: `series_node` first, then every other retained clustered column
     // that resolves a data block (the extra-series loop below skips the rest;
     // Excel keeps only the first column).
-    let model_columns: Vec<Node> = std::iter::once(series_node)
-        .chain(
-            series_nodes
-                .iter()
-                .copied()
-                .filter(|node| {
-                    *node != series_node
-                        && attr(node, "layoutId").as_deref() == Some("clusteredColumn")
-                })
-                .take(if host == ChartHost::Excel {
-                    0
-                } else {
-                    usize::MAX
-                })
-                .filter(|node| data_for_series(*node).is_some()),
-        )
-        .collect();
+    let model_column_iter = std::iter::once(series_node).chain(
+        series_nodes
+            .iter()
+            .copied()
+            .filter(|node| {
+                *node != series_node && attr(node, "layoutId").as_deref() == Some("clusteredColumn")
+            })
+            .filter(|node| data_for_series(*node).is_some()),
+    );
+    let model_column_count = model_column_iter.clone().count();
+    let model_columns = (model_column_iter)
+        .take(model_column_count)
+        .collect::<Vec<_>>();
     let owner_column_index =
         pareto_pair.and_then(|(owner, _)| model_columns.iter().position(|node| *node == owner));
     let pareto_sort_descending = if let Some((owner, _)) = pareto_pair {
@@ -1136,7 +1555,15 @@ pub(super) fn parse_chartex_impl(
     // `<cx:subtotals><cx:idx val>` identifies only points explicitly marked as
     // totals. The first waterfall point starts at zero geometrically, but it is
     // still an ordinary increase/decrease point unless index 0 is present.
-    let mut subtotal_indices: Vec<u32> = Vec::new();
+    let subtotal_capacity = series_node
+        .descendants()
+        .find(|n| n.is_element() && n.tag_name().name() == "subtotals")
+        .map_or(0, |node| {
+            node.children()
+                .filter(|n| n.is_element() && n.tag_name().name() == "idx")
+                .count()
+        });
+    let mut subtotal_indices = Vec::with_capacity(subtotal_capacity);
     if let Some(subtotals_node) = series_node
         .descendants()
         .find(|n| n.is_element() && n.tag_name().name() == "subtotals")
@@ -1183,14 +1610,17 @@ pub(super) fn parse_chartex_impl(
         None
     };
 
-    let (data_label_colors, data_label_overrides, series_data_labels) = parse_chartex_series_labels(
-        series_node,
-        raw_values.len(),
-        resolver,
-        allow_chartex_label_paints,
-    );
+    let (data_label_colors, data_label_overrides, series_data_labels) =
+        parse_chartex_series_labels(
+            series_node,
+            raw_values.len(),
+            resolver,
+            allow_chartex_label_paints,
+        )?;
 
-    let mut series = vec![ChartSeries {
+    let mut series = Vec::with_capacity(all_series_nodes.len().max(1));
+    let mut series_sources = Vec::with_capacity(all_series_nodes.len().max(1));
+    series.push(ChartSeries {
         name: series_name,
         chartex_format_idx: Some(series_format_index(series_node)),
         values: raw_values,
@@ -1253,7 +1683,7 @@ pub(super) fn parse_chartex_impl(
                 image_resolver,
                 &mut chartex_point_paint_budget,
                 &mut chartex_point_paint_budget_exceeded,
-            );
+            )?;
             (!overrides.is_empty()).then_some(overrides)
         },
         data_label_overrides,
@@ -1265,7 +1695,11 @@ pub(super) fn parse_chartex_impl(
         trend_lines: None,
         // chartEx has no scatter connecting line to suppress.
         line_hidden,
-    }];
+    });
+    series_sources.push(series_node);
+    if !retained_checkpoint.observe_series(&series) {
+        return None;
+    }
 
     // PowerPoint additionally paints a short line fragment for a paretoLine
     // that has its own dataId but no ownerIdx. That fragment is unexplained by
@@ -1320,7 +1754,7 @@ pub(super) fn parse_chartex_impl(
                 image_resolver,
                 &mut chartex_point_paint_budget,
                 &mut chartex_point_paint_budget_exceeded,
-            );
+            )?;
             (!overrides.is_empty()).then_some(overrides)
         };
         let (label_colors, label_overrides, label_defaults) = parse_chartex_series_labels(
@@ -1328,29 +1762,29 @@ pub(super) fn parse_chartex_impl(
             pareto_series.values.len(),
             resolver,
             allow_chartex_label_paints,
-        );
+        )?;
         pareto_series.data_label_colors = label_colors;
         pareto_series.data_label_overrides = label_overrides;
         pareto_series.series_data_labels = label_defaults;
         series.push(pareto_series);
+        series_sources.push(pareto_node);
+        if !retained_checkpoint.observe_series(&series) {
+            return None;
+        }
     }
 
     // A flat clustered-column ChartEx plot may contain several CT_Series, each
     // selecting its own CT_Data through dataId. Preserve every visible series
     // rather than silently collapsing the plot to the first one.
+    // Excel exposes only the primary column (plus any retained Pareto line),
+    // but parse the remaining authored columns into the same bounded
+    // intermediate representation before discarding them. This makes the
+    // parser-owned allocation work, and therefore the resource verdict,
+    // host-independent without estimating widths ahead of allocation.
     if chart_type == "clusteredColumn" || chart_type == "pareto" {
-        for extra_node in series_nodes
-            .iter()
-            .copied()
-            .filter(|node| {
-                *node != series_node && attr(node, "layoutId").as_deref() == Some("clusteredColumn")
-            })
-            .take(if host == ChartHost::Excel {
-                0
-            } else {
-                usize::MAX
-            })
-        {
+        for extra_node in all_series_nodes.iter().copied().filter(|node| {
+            *node != series_node && attr(node, "layoutId").as_deref() == Some("clusteredColumn")
+        }) {
             let Some(extra_data) = data_for_series(extra_node) else {
                 continue;
             };
@@ -1405,7 +1839,7 @@ pub(super) fn parse_chartex_impl(
                     image_resolver,
                     &mut chartex_point_paint_budget,
                     &mut chartex_point_paint_budget_exceeded,
-                );
+                )?;
                 (!overrides.is_empty()).then_some(overrides)
             };
             let (label_colors, label_overrides, label_defaults) = parse_chartex_series_labels(
@@ -1413,11 +1847,15 @@ pub(super) fn parse_chartex_impl(
                 extra.values.len(),
                 resolver,
                 allow_chartex_label_paints,
-            );
+            )?;
             extra.data_label_colors = label_colors;
             extra.data_label_overrides = label_overrides;
             extra.series_data_labels = label_defaults;
             series.push(extra);
+            series_sources.push(extra_node);
+            if !retained_checkpoint.observe_series(&series) {
+                return None;
+            }
         }
     }
 
@@ -1647,7 +2085,34 @@ pub(super) fn parse_chartex_impl(
         return None;
     }
 
-    Some(ChartModel {
+    let excel_primary_source = excel_first_column.or_else(|| {
+        all_series_nodes
+            .iter()
+            .copied()
+            .find(|node| !is_hidden(node) || visible_pareto_owners.contains(node))
+    });
+    let excel_line_source = excel_pareto_pair.map(|(_, line)| line);
+    let common_pareto_owner = pareto_pair.map(|(owner, _)| owner);
+    projection.common_series_keep = series_sources
+        .iter()
+        .map(|node| !is_hidden(node) || common_pareto_owner == Some(*node))
+        .collect();
+    projection.excel_series_keep = series_sources
+        .iter()
+        .map(|node| excel_primary_source == Some(*node) || excel_line_source == Some(*node))
+        .collect();
+    projection.excel_drop_pareto = pareto_pair.is_some() && excel_pareto_pair.is_none();
+    projection.excel_pareto_sort_descending = if excel_pareto_pair.is_some() {
+        pareto_sort_descending
+    } else {
+        false
+    };
+    projection.excel_suppress_geometry = line_first_without_owner || standalone_line_without_data;
+    projection.presentation_suppress_geometry = hidden_pareto_owner || standalone_line_without_data;
+    projection.presentation_show_unpaired_percentage_axis =
+        presentation_show_unpaired_percentage_axis;
+
+    let mut model = ChartModel {
         chart_type: chart_type.clone(),
         title: chartex_title,
         title_rich_runs: None,
@@ -1975,7 +2440,13 @@ pub(super) fn parse_chartex_impl(
         chartex_marker_size_pt,
         chartex_marker_symbol,
         chartex_connector_lines,
-    })
+    };
+    model.chart_type.reserve(
+        "clusteredColumn"
+            .len()
+            .saturating_sub(model.chart_type.len()),
+    );
+    Some(model)
 }
 
 /// Parse the structured box-and-whisker data of a chartEx `boxWhisker`.
@@ -1994,81 +2465,93 @@ pub(super) fn parse_chartex_boxwhisker(
     references: &mut dyn ChartReferenceResolver,
     image_resolver: &dyn ChartImageResolver,
 ) -> Option<ChartexBoxWhisker> {
-    // Build id -> <cx:data> lookup.
-    let data_by_id: std::collections::HashMap<String, Node> = root
-        .descendants()
-        .filter(|n| n.is_element() && n.tag_name().name() == "data")
-        .filter_map(|d| attr(&d, "id").map(|id| (id, d)))
-        .collect();
-
     // Series nodes, in document order (one column each).
-    let all_series_nodes: Vec<Node> = root
+    let all_series_count = root
         .descendants()
         .filter(|n| n.is_element() && n.tag_name().name() == "series")
-        .collect();
-    let series_nodes: Vec<Node> = all_series_nodes
+        .count();
+    let all_series_nodes = (root
+        .descendants()
+        .filter(|n| n.is_element() && n.tag_name().name() == "series"))
+    .take(all_series_count)
+    .collect::<Vec<_>>();
+    let series_count = all_series_nodes
         .iter()
-        .copied()
         .filter(|node| {
             !attr(node, "hidden")
                 .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
         })
-        .collect();
+        .count();
+    let series_nodes = (all_series_nodes.iter().copied().filter(|node| {
+        !attr(node, "hidden")
+            .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    }))
+    .take(series_count)
+    .collect::<Vec<_>>();
     if series_nodes.is_empty() {
         return None;
     }
 
     // Per-series raw (category-label, value) points, resolving each series' own
     // <cx:dataId> -> <cx:data>.
-    let per_series_points: Vec<Vec<(Option<String>, f64)>> = series_nodes
-        .iter()
-        .map(|s| {
-            let data_id = s
-                .children()
-                .find(|n| n.is_element() && n.tag_name().name() == "dataId")
-                .and_then(|n| attr(&n, "val"));
-            let data = data_id.as_ref().and_then(|id| data_by_id.get(id).copied());
-            match data {
-                Some(d) => chartex_data_cat_val_points(d, references),
-                None => Vec::new(),
-            }
-        })
-        .collect();
+    let mut per_series_points = Vec::with_capacity(series_nodes.len());
+    for s in &series_nodes {
+        let data_id = s
+            .children()
+            .find(|n| n.is_element() && n.tag_name().name() == "dataId")
+            .and_then(|n| attr(&n, "val"));
+        let data = data_id.as_ref().and_then(|id| {
+            root.descendants().rfind(|node| {
+                node.is_element()
+                    && node.tag_name().name() == "data"
+                    && attr(node, "id").as_deref() == Some(id.as_str())
+            })
+        });
+        let points = match data {
+            Some(d) => chartex_data_cat_val_points(d, references),
+            None => Some(Vec::with_capacity(0)),
+        }?;
+        per_series_points.push(points);
+    }
 
-    let series_names: Vec<String> = series_nodes
-        .iter()
-        .enumerate()
-        .map(|(index, series)| {
-            series
-                .descendants()
-                .find(|node| node.is_element() && node.tag_name().name() == "txData")
-                .and_then(|tx_data| {
-                    child(tx_data, "v")
-                        .and_then(|value| value.text())
-                        .map(str::trim)
-                        .filter(|name| !name.is_empty())
-                        .map(ToOwned::to_owned)
-                        .or_else(|| {
-                            child(tx_data, "f")
-                                .and_then(|formula| formula.text())
-                                .and_then(|formula| references.resolve_strings(formula))
-                                .and_then(|values| {
-                                    values.into_iter().find(|value| !value.trim().is_empty())
-                                })
-                        })
-                })
-                .unwrap_or_else(|| format!("Series {}", index + 1))
-        })
-        .collect();
+    let mut series_names = Vec::with_capacity(series_nodes.len());
+    for (index, series) in series_nodes.iter().enumerate() {
+        let tx_data = series
+            .descendants()
+            .find(|node| node.is_element() && node.tag_name().name() == "txData");
+        let inline_name = tx_data
+            .and_then(|node| child(node, "v"))
+            .and_then(|value| value.text())
+            .map(str::trim)
+            .filter(|name| !name.is_empty());
+        let name = if let Some(name) = inline_name {
+            (name).to_owned()
+        } else if let Some(name) = tx_data
+            .and_then(|node| child(node, "f"))
+            .and_then(|formula| formula.text())
+            .and_then(|formula| references.resolve_strings(formula))
+            .and_then(|values| values.into_iter().find(|value| !value.trim().is_empty()))
+        {
+            name
+        } else {
+            let ordinal = index + 1;
+            format!("Series {ordinal}")
+        };
+        series_names.push(name);
+    }
 
     // Unique categories in first-seen order across all series (first series'
     // order dominates; later series only contribute unseen labels).
-    let mut categories: Vec<String> = Vec::new();
+    let category_capacity = per_series_points
+        .iter()
+        .map(Vec::len)
+        .fold(0usize, usize::saturating_add);
+    let mut categories = Vec::with_capacity(category_capacity);
     for pts in &per_series_points {
         for (cat, _) in pts {
             if let Some(cat) = cat {
                 if !categories.iter().any(|existing| existing == cat) {
-                    categories.push(cat.clone());
+                    categories.push((cat).to_owned());
                 }
             }
         }
@@ -2081,80 +2564,78 @@ pub(super) fn parse_chartex_boxwhisker(
     // the series names as category labels and place its values on the diagonal.
     let one_box_per_series = categories.is_empty();
     if one_box_per_series {
-        categories.clone_from(&series_names);
+        for name in &series_names {
+            categories.push((name).to_owned());
+        }
     }
-    let cat_index: std::collections::HashMap<&str, usize> = categories
-        .iter()
-        .enumerate()
-        .map(|(i, c)| (c.as_str(), i))
-        .collect();
 
-    let series: Vec<ChartexBoxSeries> = series_nodes
-        .iter()
-        .enumerate()
-        .map(|(si, s)| {
-            let name = series_names[si].clone();
+    let mut series = Vec::with_capacity(series_nodes.len());
+    for (si, s) in series_nodes.iter().enumerate() {
+        let name = series_names[si].to_owned();
 
-            // Bin this series' raw points into the shared category order.
-            let mut values_by_category: Vec<Vec<f64>> = vec![Vec::new(); categories.len()];
-            for (cat, v) in &per_series_points[si] {
-                if one_box_per_series {
-                    values_by_category[si].push(*v);
-                } else if let Some(cat) = cat {
-                    if let Some(&ci) = cat_index.get(cat.as_str()) {
-                        values_by_category[ci].push(*v);
-                    }
+        // Bin this series' raw points into the shared category order.
+        let empty_values = Vec::with_capacity(0);
+        let mut values_by_category = vec![empty_values; categories.len()];
+        for (cat, v) in &per_series_points[si] {
+            if one_box_per_series {
+                values_by_category[si].push(*v);
+            } else if let Some(cat) = cat {
+                if let Some(ci) = categories.iter().position(|value| value == cat) {
+                    values_by_category[ci].push(*v);
                 }
             }
+        }
 
-            // `<cx:layoutPr><cx:visibility …>` flags; Office defaults when omitted:
-            // meanMarker on, meanLine off, outliers and nonoutliers on.
-            let vis = s
-                .descendants()
-                .find(|n| n.is_element() && n.tag_name().name() == "visibility");
-            let bool_attr = |name: &str, dflt: bool| {
-                vis.and_then(|v| attr(&v, name))
-                    .map(|s| s == "1" || s == "true")
-                    .unwrap_or(dflt)
-            };
-            let quartile_method = s
-                .descendants()
-                .find(|n| n.is_element() && n.tag_name().name() == "statistics")
-                .and_then(|st| attr(&st, "quartileMethod"))
-                .unwrap_or_else(|| "exclusive".to_string());
+        // `<cx:layoutPr><cx:visibility …>` flags; Office defaults when omitted:
+        // meanMarker on, meanLine off, outliers and nonoutliers on.
+        let vis = s
+            .descendants()
+            .find(|n| n.is_element() && n.tag_name().name() == "visibility");
+        let bool_attr = |name: &str, dflt: bool| {
+            vis.and_then(|v| attr(&v, name))
+                .map(|s| s == "1" || s == "true")
+                .unwrap_or(dflt)
+        };
+        let quartile_method = s
+            .descendants()
+            .find(|n| n.is_element() && n.tag_name().name() == "statistics")
+            .and_then(|st| attr(&st, "quartileMethod"));
+        let quartile_method = match quartile_method {
+            Some(value) => value.to_owned(),
+            None => ("exclusive").to_owned(),
+        };
 
-            ChartexBoxSeries {
-                name,
-                chartex_format_idx: attr(s, "formatIdx")
-                    .and_then(|value| value.parse::<u32>().ok())
-                    .or_else(|| {
-                        all_series_nodes
-                            .iter()
-                            .position(|candidate| candidate == s)
-                            .and_then(|index| u32::try_from(index).ok())
-                    }),
-                color: child(*s, "spPr").and_then(|shape| resolver.resolve_shape_fill(shape)),
-                line_color: extract_sp_pr_ln_style(*s, resolver).0,
-                line_width_emu: extract_sp_pr_ln_style(*s, resolver).1,
-                chartex_style: child(*s, "spPr").map(|_| {
-                    parse_chartex_element_style(
-                        *s,
-                        resolver,
-                        None,
-                        None,
-                        image_resolver,
-                        ChartImageSource::Chart,
-                    )
+        series.push(ChartexBoxSeries {
+            name,
+            chartex_format_idx: attr(s, "formatIdx")
+                .and_then(|value| value.parse::<u32>().ok())
+                .or_else(|| {
+                    all_series_nodes
+                        .iter()
+                        .position(|candidate| candidate == s)
+                        .and_then(|index| u32::try_from(index).ok())
                 }),
-                values_by_category,
-                mean_marker: bool_attr("meanMarker", true),
-                mean_line: bool_attr("meanLine", false),
-                show_outliers: bool_attr("outliers", true),
-                show_nonoutliers: bool_attr("nonoutliers", true),
-                quartile_method,
-            }
-        })
-        .collect();
+            color: child(*s, "spPr").and_then(|shape| resolver.resolve_shape_fill(shape)),
+            line_color: extract_sp_pr_ln_style(*s, resolver).0,
+            line_width_emu: extract_sp_pr_ln_style(*s, resolver).1,
+            chartex_style: child(*s, "spPr").map(|_| {
+                parse_chartex_element_style(
+                    *s,
+                    resolver,
+                    None,
+                    None,
+                    image_resolver,
+                    ChartImageSource::Chart,
+                )
+            }),
+            values_by_category,
+            mean_marker: bool_attr("meanMarker", true),
+            mean_line: bool_attr("meanLine", false),
+            show_outliers: bool_attr("outliers", true),
+            show_nonoutliers: bool_attr("nonoutliers", true),
+            quartile_method,
+        });
+    }
 
     Some(ChartexBoxWhisker {
         one_box_per_series,
@@ -2170,27 +2651,24 @@ pub(super) fn parse_chartex_boxwhisker(
 pub(super) fn chartex_data_cat_val_points(
     data: Node,
     references: &mut dyn ChartReferenceResolver,
-) -> Vec<(Option<String>, f64)> {
+) -> Option<Vec<(Option<String>, f64)>> {
     let categories =
         chartex_string_levels(data, references).and_then(|levels| levels.into_iter().next());
     let values = chartex_number_values(data, &["val", "size"], references).unwrap_or_default();
-    values
-        .into_iter()
-        .enumerate()
-        .filter_map(|(index, value)| {
-            let value = value?;
-            if !value.is_finite() {
-                return None;
-            }
-            let category = categories
-                .as_ref()
-                .and_then(|items| items.get(index))
-                .map(|item| item.trim())
-                .filter(|item| !item.is_empty())
-                .map(ToOwned::to_owned);
-            Some((category, value))
-        })
-        .collect()
+    let mut points = Vec::with_capacity(values.len());
+    for (index, value) in values.into_iter().enumerate() {
+        let Some(value) = value.filter(|value| value.is_finite()) else {
+            continue;
+        };
+        let category = categories
+            .as_ref()
+            .and_then(|items| items.get(index))
+            .map(|item| item.trim())
+            .filter(|item| !item.is_empty());
+        let category = category.map(ToOwned::to_owned);
+        points.push((category, value));
+    }
+    Some(points)
 }
 
 /// Parse the structured hierarchy of a chartEx `sunburst`.
@@ -2203,23 +2681,27 @@ pub(super) fn chartex_data_cat_val_points(
 /// deepest level — and the `size` value at that `idx`. Returns `None` when
 /// there is no size dimension or no rows.
 pub(super) fn bounded_chartex_point_count(level: Node) -> Option<usize> {
+    let width_limit = crate::resource::HARD_MAX_CHARTEX_ALLOCATION_ELEMENTS;
     if let Some(declared) = attr(&level, "ptCount") {
-        let count = declared.parse::<usize>().ok()?;
-        return (count <= MAX_CHART_CACHE_POINTS).then_some(count);
+        let count = declared.parse::<u64>().ok()?;
+        if count > width_limit {
+            return None;
+        }
+        return usize::try_from(count).ok();
     }
-    let mut count = 0usize;
+    let mut count = 0u64;
     for point in level
         .children()
         .filter(|node| node.is_element() && node.tag_name().name() == "pt")
     {
-        let index = attr(&point, "idx")?.parse::<usize>().ok()?;
+        let index = attr(&point, "idx")?.parse::<u64>().ok()?;
         let required = index.checked_add(1)?;
-        if required > MAX_CHART_CACHE_POINTS {
+        if required > width_limit {
             return None;
         }
         count = count.max(required);
     }
-    Some(count)
+    usize::try_from(count).ok()
 }
 
 fn has_chartex_aggregation(series: Node) -> bool {
@@ -2252,23 +2734,22 @@ fn aggregate_chartex_data(
         {
             if let Some(index) = attr(&point, "idx").and_then(|value| value.parse::<usize>().ok()) {
                 if index < count {
-                    slots[index] = Some(point.text().unwrap_or("").replace('\n', " "));
+                    let text = point.text().unwrap_or("");
+                    slots[index] = Some(text.replace('\n', " "));
                 }
             }
         }
         slots
     } else {
-        chartex_string_levels(data, references)?
+        let level = chartex_string_levels(data, references)?
             .into_iter()
-            .next()?
-            .into_iter()
-            .map(Some)
-            .collect()
+            .next()?;
+        level.into_iter().map(Some).collect::<Vec<_>>()
     };
     let values = chartex_number_values(data, &["val"], references)?;
-    let mut categories = Vec::<String>::new();
-    let mut sums = Vec::<Option<f64>>::new();
-    let mut by_category = std::collections::HashMap::<String, usize>::new();
+    let capacity = category_slots.len().max(values.len());
+    let mut categories = Vec::with_capacity(capacity);
+    let mut sums: Vec<Option<f64>> = Vec::with_capacity(capacity);
     for index in 0..category_slots.len().max(values.len()) {
         let value = values
             .get(index)
@@ -2279,8 +2760,8 @@ fn aggregate_chartex_data(
         if !aggregation_category_present(category, value) {
             continue;
         }
-        let category = category.unwrap_or_default().to_string();
-        if let Some(&index) = by_category.get(&category) {
+        let category = category.unwrap_or_default();
+        if let Some(index) = categories.iter().position(|value| value == category) {
             if let Some(value) = value {
                 let sum = sums[index].unwrap_or(0.0) + value;
                 if !sum.is_finite() {
@@ -2289,8 +2770,7 @@ fn aggregate_chartex_data(
                 sums[index] = Some(sum);
             }
         } else {
-            by_category.insert(category.clone(), categories.len());
-            categories.push(category);
+            categories.push((category).to_owned());
             sums.push(value);
         }
     }
@@ -2308,50 +2788,48 @@ pub(super) fn chartex_string_levels_for_types(
             && attr(n, "type").is_some_and(|kind| dimension_types.contains(&kind.as_str()))
     })?;
     // Levels in document order: lvl[0] = Leaf (deepest), last = Branch (root).
-    let levels: Vec<Node> = cat_dim
+    let level_count = cat_dim
+        .children()
+        .filter(|n| n.is_element() && n.tag_name().name() == "lvl")
+        .take(crate::depth::MAX_XML_DEPTH as usize)
+        .count();
+    let levels = (cat_dim
         .children()
         .filter(|n| n.is_element() && n.tag_name().name() == "lvl")
         // Hierarchy levels are siblings in XML but become recursive nodes in
         // Sunburst/Treemap layout. Reuse the shared OOXML depth ceiling so a
         // wide sequence of `<cx:lvl>` cannot bypass the parser's stack bound.
-        .take(crate::depth::MAX_XML_DEPTH as usize)
-        .collect();
+        .take(crate::depth::MAX_XML_DEPTH as usize))
+    .take(level_count)
+    .collect::<Vec<_>>();
     if !levels.is_empty() {
-        // Preflight the aggregate slot budget before allocating any level.
-        // A per-level cap alone still permits MAX_XML_DEPTH full-width levels.
-        let level_counts = levels
-            .iter()
-            .map(|level| bounded_chartex_point_count(*level))
-            .collect::<Option<Vec<_>>>()?;
-        let total_slots = level_counts.iter().try_fold(0usize, |total, count| {
-            total
-                .checked_add(*count)
-                .filter(|sum| *sum <= MAX_CHART_CACHE_POINTS)
-        })?;
-        debug_assert!(total_slots <= MAX_CHART_CACHE_POINTS);
-        return Some(
-            levels
-                .into_iter()
-                .zip(level_counts)
-                .map(|(level, point_count)| {
-                    let mut values = vec![String::new(); point_count];
-                    for point in level
-                        .children()
-                        .filter(|node| node.is_element() && node.tag_name().name() == "pt")
-                    {
-                        let Some(index) =
-                            attr(&point, "idx").and_then(|value| value.parse::<usize>().ok())
-                        else {
-                            continue;
-                        };
-                        if index < values.len() {
-                            values[index] = point.text().unwrap_or("").replace('\n', " ");
-                        }
-                    }
-                    values
-                })
-                .collect(),
-        );
+        // Validate every level before materializing any width-controlled
+        // vector. RetainedBytes measures the completed model structurally.
+        let mut level_counts = Vec::with_capacity(levels.len());
+        for level in &levels {
+            let count = bounded_chartex_point_count(*level)?;
+            level_counts.push(count);
+        }
+        let mut output = Vec::with_capacity(levels.len());
+        for (level, point_count) in levels.into_iter().zip(level_counts) {
+            let empty = ("").to_owned();
+            let mut values = vec![empty; point_count];
+            for point in level
+                .children()
+                .filter(|node| node.is_element() && node.tag_name().name() == "pt")
+            {
+                let Some(index) = attr(&point, "idx").and_then(|value| value.parse::<usize>().ok())
+                else {
+                    continue;
+                };
+                if index < values.len() {
+                    let text = point.text().unwrap_or("");
+                    values[index] = text.replace('\n', " ");
+                }
+            }
+            output.push(values);
+        }
+        return Some(output);
     }
     let formula = cat_dim
         .children()
@@ -2359,10 +2837,24 @@ pub(super) fn chartex_string_levels_for_types(
         .and_then(|node| node.text())
         .map(str::trim)
         .filter(|formula| !formula.is_empty())?;
-    references.resolve_string_levels(formula).map(|mut levels| {
-        levels.truncate(crate::depth::MAX_XML_DEPTH as usize);
-        levels
-    })
+    let formula_count = chartex_a1_range_point_count(formula);
+    if let Some(count) = formula_count {
+        if u64::try_from(count).ok()? > crate::resource::HARD_MAX_CHARTEX_ALLOCATION_ELEMENTS {
+            return None;
+        }
+    }
+    let mut levels = references
+        .resolve_string_levels(formula)
+        .or_else(|| formula_count.map(|count| vec![vec![String::new(); count]]))?;
+    levels.truncate(crate::depth::MAX_XML_DEPTH as usize);
+    if let Some(count) = formula_count {
+        for level in &mut levels {
+            if level.len() < count {
+                level.resize(count, String::new());
+            }
+        }
+    }
+    Some(levels)
 }
 
 pub(super) fn chartex_string_levels(
@@ -2408,7 +2900,57 @@ pub(super) fn chartex_number_values(
         .and_then(|node| node.text())
         .map(str::trim)
         .filter(|formula| !formula.is_empty())?;
-    references.resolve_numbers(formula)
+    let formula_count = chartex_a1_range_point_count(formula);
+    if let Some(count) = formula_count {
+        if u64::try_from(count).ok()? > crate::resource::HARD_MAX_CHARTEX_ALLOCATION_ELEMENTS {
+            return None;
+        }
+    }
+    let mut values = references
+        .resolve_numbers(formula)
+        .or_else(|| formula_count.map(|count| vec![None; count]))?;
+    if let Some(count) = formula_count {
+        if values.len() < count {
+            values.resize(count, None);
+        }
+    }
+    Some(values)
+}
+
+fn chartex_a1_range_point_count(formula: &str) -> Option<usize> {
+    usize::try_from(chartex_a1_range_point_count_u64(formula)?).ok()
+}
+
+fn chartex_a1_range_point_count_u64(formula: &str) -> Option<u64> {
+    fn cell(reference: &str) -> Option<(u64, u64)> {
+        let reference = reference.trim().trim_matches('$');
+        let mut column = 0u64;
+        let mut row_start = 0usize;
+        for (index, byte) in reference.bytes().enumerate() {
+            if byte.is_ascii_alphabetic() {
+                column = column
+                    .checked_mul(26)?
+                    .checked_add(u64::from(byte.to_ascii_uppercase() - b'A' + 1))?;
+                row_start = index + 1;
+            } else {
+                break;
+            }
+        }
+        let row = reference
+            .get(row_start..)?
+            .trim_start_matches('$')
+            .parse()
+            .ok()?;
+        (column > 0 && row > 0).then_some((column, row))
+    }
+
+    let address = formula.rsplit_once('!').map_or(formula, |(_, range)| range);
+    let (start, end) = address.split_once(':').unwrap_or((address, address));
+    let (start_column, start_row) = cell(start)?;
+    let (end_column, end_row) = cell(end)?;
+    let columns = start_column.abs_diff(end_column).checked_add(1)?;
+    let rows = start_row.abs_diff(end_row).checked_add(1)?;
+    columns.checked_mul(rows)
 }
 
 /// `<cx:numDim><cx:lvl formatCode>` cached format of the first matching dimension.
@@ -2453,19 +2995,19 @@ pub(super) fn parse_chartex_hierarchy_rows(
         .len()
         .max(levels.iter().map(Vec::len).max().unwrap_or(0));
 
-    let mut rows: Vec<ChartexSunburstRow> = Vec::new();
+    let mut rows = Vec::with_capacity(n);
     for idx in 0..n {
         let size = sizes.get(idx).copied().flatten().unwrap_or(0.0);
         // Build path root→leaf: iterate levels from LAST (Branch/root) to FIRST
         // (Leaf/deepest). Trailing empty leaf cells are trimmed so a node that is
         // itself a leaf terminates early.
-        let mut path: Vec<String> = Vec::new();
+        let mut path = Vec::with_capacity(levels.len());
         for level in levels.iter().rev() {
-            let label = level.get(idx).cloned().unwrap_or_default();
+            let label = level.get(idx).map_or("", String::as_str);
             if label.is_empty() {
                 break;
             }
-            path.push(label);
+            path.push((label).to_owned());
         }
         if path.is_empty() {
             continue;
@@ -2515,20 +3057,24 @@ pub(super) fn parse_chartex_region_map(
     if row_count == 0 || row_count > MAX_CHART_CACHE_POINTS {
         return None;
     }
-    let rows = (0..row_count)
-        .map(|index| ChartexRegionMapRow {
-            label: labels.get(index).cloned().unwrap_or_default(),
-            entity_id: entity_ids
-                .get(index)
-                .filter(|value| !value.trim().is_empty())
-                .cloned(),
+    let mut rows = Vec::with_capacity(row_count);
+    for index in 0..row_count {
+        let label = (labels.get(index).map_or("", String::as_str)).to_owned();
+        let entity_id = entity_ids
+            .get(index)
+            .filter(|value| !value.trim().is_empty());
+        let entity_id = entity_id.map(ToOwned::to_owned);
+
+        rows.push(ChartexRegionMapRow {
+            label,
+            entity_id,
             value: values
                 .get(index)
                 .copied()
                 .flatten()
                 .filter(|value| value.is_finite()),
-        })
-        .collect();
+        });
+    }
 
     let layout = child(series, "layoutPr");
     let region_label_layout = layout

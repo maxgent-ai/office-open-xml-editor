@@ -25,29 +25,41 @@ import type { ReferenceFontMetricProfile } from './reference-font-metrics.js';
  * The same vertical and code-page metrics were confirmed in the installed
  * macOS BIZ_UDGothic.ttc regular/bold faces. These static metadata references
  * do not bundle font bytes or establish which face Canvas selected.
+ *
+ * Name identity (font metadata, not an Office layout rule): the pinned regular
+ * and bold TTFs of both families record the Japanese (language 0x0411) name
+ * ID 1 "BIZ UDゴシック" / "BIZ UD明朝" beside the English "BIZ UDGothic" /
+ * "BIZ UDMincho", in the same files and therefore with the same hhea values.
+ * Office documents can record either spelling as the requested family (for
+ * example w:rFonts and the ECMA-376 §17.8.3.10 w:font@w:name), so both are
+ * aliases of one profile. The localized name is a family
+ * name shared by regular and bold; it never identifies a styled face by itself.
+ * The installed macOS asset faces carry only the English names, so a local()
+ * probe still needs the English/PostScript aliases listed first. The
+ * proportional BIZ UDP* families are distinct fonts and are not aliased here.
  */
 export const OPEN_FONT_REFERENCE_PROFILES: readonly ReferenceFontMetricProfile[] = [
   {
     source: 'published-open-font', family: 'BIZ UDGothic',
-    aliases: ['BIZ UDGothic', 'BIZUDGothic-Regular'],
+    aliases: ['BIZ UDGothic', 'BIZUDGothic-Regular', 'BIZ UDゴシック'],
     weight: 400, style: 'normal', unitsPerEm: 2048,
     hhea: [1802, -246, 0], farEastCodePage: true, xAvgCharWidth: 1718,
   },
   {
     source: 'published-open-font', family: 'BIZ UDGothic',
-    aliases: ['BIZ UDGothic', 'BIZUDGothic-Bold'],
+    aliases: ['BIZ UDGothic', 'BIZUDGothic-Bold', 'BIZ UDゴシック'],
     weight: 700, style: 'normal', unitsPerEm: 2048,
     hhea: [1802, -246, 0], farEastCodePage: true, xAvgCharWidth: 1718,
   },
   {
     source: 'published-open-font', family: 'BIZ UDMincho',
-    aliases: ['BIZ UDMincho', 'BIZUDMincho-Regular'],
+    aliases: ['BIZ UDMincho', 'BIZUDMincho-Regular', 'BIZ UD明朝'],
     weight: 400, style: 'normal', unitsPerEm: 2048,
     hhea: [1802, -246, 0], farEastCodePage: true, xAvgCharWidth: 1959,
   },
   {
     source: 'published-open-font', family: 'BIZ UDMincho',
-    aliases: ['BIZ UDMincho', 'BIZUDMincho-Bold'],
+    aliases: ['BIZ UDMincho', 'BIZUDMincho-Bold', 'BIZ UD明朝'],
     weight: 700, style: 'normal', unitsPerEm: 2048,
     hhea: [1802, -246, 0], farEastCodePage: true, xAvgCharWidth: 1963,
   },

@@ -170,6 +170,7 @@ export {
   type OoxmlResourceLimit,
   type OoxmlResourceLimitErrorDetails,
   type OoxmlResourceLimits,
+  type XlsxWorksheetLimits,
   type CjkFallback,
   type OoxmlResourceMetric,
   type OoxmlResourceMetrics,

@@ -390,8 +390,10 @@ describe('PAGE field renders the per-section displayed number (footer)', () => {
 
     await renderDocumentToCanvas(doc, canvas, 0, { dpr: 1 });
 
-    const footerDraws = draws.filter(({ text }) => ['Page ', '1', '12'].includes(text));
-    expect(footerDraws.map(({ text }) => text)).toEqual(['Page ', '1', '12']);
+    // Acquisition may paint adjacent equally positioned text/field results as
+    // one sequence. Verify the displayed result and baseline, not fillText seams.
+    const footerDraws = draws.filter(({ text }) => !/^L\d+$/u.test(text));
+    expect(footerDraws.map(({ text }) => text).join('')).toBe('Page 1 of 12');
     expect(new Set(footerDraws.map(({ y }) => y)).size).toBe(1);
   });
 });

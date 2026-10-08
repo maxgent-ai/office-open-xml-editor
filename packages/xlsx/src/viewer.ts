@@ -26,7 +26,19 @@ import {
 } from './renderer.js';
 import { parseA1 } from './a1.js';
 import { inheritWorksheetPreviewBounds } from './internal/worksheet-content-bounds.js';
-import { viewportPreviewBlocker, type ViewportPreviewBlocker } from './internal/worksheet-preview-eligibility.js';
+import { inheritWorksheetPolicy } from './worksheet-policy-context.js';
+import {
+  anchorBaselinePreviewBlocker,
+  viewportPreviewBlocker,
+  type ViewportPreviewBlocker,
+} from './internal/worksheet-preview-eligibility.js';
+import {
+  bindInitialAnchorSizes,
+  captureInitialAnchorSizes,
+  initialAnchorRowCoverage,
+  releaseInitialAnchorSizeReference,
+  type InitialAnchorSizeReference,
+} from './internal/initial-anchor-sizes.js';
 import type {
   CellAddress,
   XlsxSelectionContext,
@@ -80,7 +92,10 @@ import {
 } from './internal/sheet-viewer-runtime.js';
 import { CanvasSurface, SheetOverlayHost } from './internal/sheet-surface.js';
 import { withXlsxRenderCommitGuard } from './render-orchestrator.js';
-import { worksheetContentBounds } from './internal/worksheet-content-bounds.js';
+import {
+  DEFAULT_WORKSHEET_CONTENT_MINIMUMS,
+  worksheetContentBounds,
+} from './internal/worksheet-content-bounds.js';
 import type { XlsxSheetLoadOptions } from './delimited-text.js';
 
 export type { XlsxSheetLoadOptions } from './delimited-text.js';
@@ -163,6 +178,21 @@ export interface XlsxSheetViewerOptions extends LoadOptions {
    * disabled.
    */
   showScrollbars?: boolean;
+  /**
+   * Minimum number of worksheet rows included in the grid and fit calculations.
+   * Content, drawings, and frozen panes can extend it further. Default: 50.
+   */
+  minRows?: number;
+  /**
+   * Minimum number of worksheet columns included in the grid and fit
+   * calculations. Content, drawings, and frozen panes can extend it further.
+   * Default: 26.
+   */
+  minCols?: number;
+  /** Additional blank rows after the resolved grid extent. Default: 30. */
+  marginRows?: number;
+  /** Additional blank columns after the resolved grid extent. Default: 10. */
+  marginCols?: number;
   /** Lower/upper bounds for the zoom slider as scale factors. Default 0.1–4
    *  (10%–400%, matching Excel's zoom range). Also the clamp range for the IX9
    *  {@link ZoomableViewer} zoom contract ({@link XlsxViewer.setScale} etc.). */
@@ -293,6 +323,38 @@ type InternalXlsxViewerOptions = (XlsxViewerOptions | XlsxSheetViewerOptions) & 
   [borrowedWorkbookOption]?: XlsxWorkbook;
 };
 
+interface GridExtentOptions {
+  readonly minRows: number;
+  readonly minCols: number;
+  readonly marginRows: number;
+  readonly marginCols: number;
+}
+
+function gridExtentOption(value: number | undefined, fallback: number, name: string): number {
+  const resolved = value ?? fallback;
+  if (!Number.isSafeInteger(resolved) || resolved < 0) {
+    throw new TypeError(`${name} must be a non-negative safe integer`);
+  }
+  return resolved;
+}
+
+function resolveGridExtentOptions(options: XlsxSheetViewerOptions): GridExtentOptions {
+  return {
+    minRows: gridExtentOption(
+      options.minRows,
+      DEFAULT_WORKSHEET_CONTENT_MINIMUMS.minRows,
+      'minRows',
+    ),
+    minCols: gridExtentOption(
+      options.minCols,
+      DEFAULT_WORKSHEET_CONTENT_MINIMUMS.minCols,
+      'minCols',
+    ),
+    marginRows: gridExtentOption(options.marginRows, 30, 'marginRows'),
+    marginCols: gridExtentOption(options.marginCols, 10, 'marginCols'),
+  };
+}
+
 export interface XlsxViewportOffset {
   /** Horizontal CSS-pixel offset from the logical start edge (column A side). */
   readonly x: number;
@@ -398,6 +460,27 @@ class XlsxViewerEngine implements ZoomableViewer {
   /** Viewer-owned projections of workbook-cached worksheets. Only view-mutable
    * size/outline state is copied; immutable cell/content graphs stay shared. */
   private sheetViews = new Map<number, Worksheet>();
+  /**
+   * #1713 prepared-initial sizes of tagged `twoCellAnchor editAs="oneCell"`
+   * pictures/groups by sheet index, valid only for {@link initialAnchorWorkbook}.
+   * "Initial" is library policy: the rect resolved at 96 dpi and the viewer's
+   * scale on its first prepared projection of the sheet (host fonts/MDW
+   * bound, automatic row heights measured, no view edit replayed). Grids round
+   * each band's scaled pixels, so that first prepared scale influences the
+   * reference; capture divides by it and stores EMU, and later zoom only
+   * rescales the stored EMU, never recapturing. Band edits then
+   * move the anchor without resizing it (ECMA-376 Part 1 §20.5.2.33/§20.5.3.2).
+   * Entries are compact primitive references, never a Worksheet, geometry,
+   * cells or anchor objects, so an inactive sheet cannot pin its evicted
+   * model. Captured once per workbook/sheet, never replaced nor recaptured
+   * from an edited projection; `null` records "nothing eligible". Absolute
+   * position freezing for editAs is outside #1713 and not implemented.
+   */
+  private initialAnchorWorkbook: XlsxWorkbook | null = null;
+  private readonly initialAnchorReferences = new Map<number, InitialAnchorSizeReference | null>();
+  /** Whether the displayed projection's automatic row heights were measured
+   * on this thread, so the worker must not derive them again. */
+  private currentAutoRowHeightsPrepared = false;
   private opts: XlsxViewerOptions;
   private readonly _mountKind: XlsxViewerMount['kind'];
   /** Whether this mount delegates viewport movement to a native scroll host. */
@@ -448,6 +531,7 @@ class XlsxViewerEngine implements ZoomableViewer {
   private readonly notifier: SelectionNotifier;
   /** Bounded range-context extraction for getSelectionContext(). */
   private readonly contextReader = new SelectionContextReader();
+  private readonly gridExtent: GridExtentOptions;
   private elementContext: XlsxElementContext | null = null;
   /** Selection / object-context overlay painter. */
   private readonly selectionPaint: SelectionOverlay;
@@ -484,6 +568,7 @@ class XlsxViewerEngine implements ZoomableViewer {
     if (!hostWindow) throw new Error('XlsxViewer requires a document with an active Window');
     this.hostWindow = hostWindow;
     this.opts = opts;
+    this.gridExtent = resolveGridExtentOptions(opts);
     this._mountKind = mount.kind;
     this._nativeScrollbars = opts.showScrollbars ?? true;
     const borrowedWorkbook = (opts as InternalXlsxViewerOptions)[borrowedWorkbookOption];
@@ -901,6 +986,7 @@ class XlsxViewerEngine implements ZoomableViewer {
     if (this.preparedWorkbook === workbook) return true;
     this.finder.invalidate();
     this.viewEdits.clear();
+    this.releaseInitialAnchorReferences();
     this.sheetViews.clear();
     this.buildTabs();
     this.preparedWorkbook = workbook;
@@ -935,6 +1021,10 @@ class XlsxViewerEngine implements ZoomableViewer {
     let releaseNewWorksheet: (() => void) | undefined;
     let previewCompletion: Promise<Worksheet> | null = null;
     let previewPreparedViewport: { width: number; height: number; scale: number } | null = null;
+    // #1713: reference captured by THIS request; installed only after the
+    // generation check below, released if the request fails or is stale.
+    let pendingReference: InitialAnchorSizeReference | null | undefined;
+    let heightsPrepared = false;
     try {
       if (!await this.ensureHostFonts(workbook)) return;
       if (!this.isCurrentSheetRequest(generation, workbook)) return;
@@ -947,12 +1037,49 @@ class XlsxViewerEngine implements ZoomableViewer {
       const lease = await acquireXlsxWorksheetPreview(workbook, index);
       sourceWorksheet = lease.worksheet;
       releaseNewWorksheet = lease.release;
+      // A superseded request returns right after each await below, before it
+      // reads or mutates a shared projection (sheetViews may already hold a
+      // newer workbook's displayed view), releasing its lease exactly once.
+      const abandoned = (): boolean => {
+        if (this.isCurrentSheetRequest(generation, workbook)) return false;
+        releaseNewWorksheet?.();
+        releaseNewWorksheet = undefined;
+        return true;
+      };
+      if (abandoned()) return;
       let eligiblePreview = lease.partial;
       const cachedView = this.sheetViews.get(index);
+      // #1713: the first prepared projection of a sheet with tagged
+      // twoCellAnchor editAs="oneCell" anchors defines their initial size.
+      // A known reference (this viewer + workbook) is bound to every fresh
+      // projection before manual state is replayed or a frame is painted;
+      // otherwise this request captures it once from an unedited projection.
+      // Ordinary sheets only pay one pass over their anchor arrays.
+      const knownReference = this.initialAnchorReferenceFor(workbook, index);
+      const anchorCoverage = knownReference === undefined
+        ? initialAnchorRowCoverage(sourceWorksheet) : undefined;
+      const capturing = anchorCoverage !== undefined;
+      if (capturing && ((cachedView !== undefined && !cachedView.parseError) || this.viewEdits.hasViewEdits(index))) {
+        // An edited projection's current geometry is not the prepared initial
+        // geometry and authored sizes cannot reconstruct it: refuse instead.
+        throw new Error(
+          'XLSX viewer cannot establish the initial size of editAs="oneCell" anchors ' +
+            `on sheet ${index} after view edits.`,
+        );
+      }
       const prepareView = (model: Worksheet): Worksheet => {
-        const view = cachedView ?? this.createVisibleSheetView(model);
-        if (cachedView || lease.partial) view.rows = model.rows;
-        if (!cachedView) this.viewEdits.restoreSheetViewState(index, view);
+        // A parser placeholder replaces the content graph, and a later valid
+        // reacquisition replaces that placeholder. Neither reuses the other.
+        const reusableView = model.parseError || cachedView?.parseError ? undefined : cachedView;
+        const view = reusableView ?? this.createVisibleSheetView(model);
+        if (reusableView || lease.partial) view.rows = model.rows;
+        if (!reusableView) {
+          // A degraded parser placeholder is a different graph: never bind.
+          if (knownReference && !model.parseError) bindInitialAnchorSizes(view, knownReference);
+          // While capturing, hasViewEdits() is false, so this replay is empty
+          // and the capture below still observes the unedited projection.
+          this.viewEdits.restoreSheetViewState(index, view);
+        }
         return view;
       };
       const prepareHeights = (view: Worksheet, refresh: boolean): void => {
@@ -961,9 +1088,27 @@ class XlsxViewerEngine implements ZoomableViewer {
         if (typeof prepareRowHeights === 'function') {
           const measureCanvas = this.hostDocument.createElement('canvas');
           const measureCtx = measureCanvas.getContext('2d');
-          if (measureCtx) prepareRowHeights.call(workbook, view, measureCtx);
+          if (measureCtx) {
+            prepareRowHeights.call(workbook, view, measureCtx);
+            heightsPrepared = true;
+          }
         }
-        this.viewEdits.syncAutomaticRowOverrides(index, view);
+        // A superseded request must not write the current workbook's store.
+        if (this.isCurrentSheetRequest(generation, workbook)) {
+          this.viewEdits.syncAutomaticRowOverrides(index, view);
+        }
+      };
+      // Capture from the fully prepared (host fonts/MDW, automatic heights)
+      // unedited projection at the scale its first frame is painted with; a
+      // superseded request or a degraded parser placeholder captures nothing.
+      const captureInitial = (view: Worksheet): InitialAnchorSizeReference | null | undefined => {
+        if (!capturing || view.parseError || !this.isCurrentSheetRequest(generation, workbook)) {
+          return undefined;
+        }
+        const reference = captureInitialAnchorSizes(
+          view, getGridGeometryForWorksheet(view), this.viewport.scale) ?? null;
+        if (reference) bindInitialAnchorSizes(view, reference);
+        return reference;
       };
       worksheet = prepareView(sourceWorksheet);
       if (lease.partial) {
@@ -982,17 +1127,24 @@ class XlsxViewerEngine implements ZoomableViewer {
         });
         let visible = visibleRange();
         let coveringRow = 0;
+        // #1713: while capturing, rows through every eligible anchor's marker
+        // rows must be prepared as well (bounded; usually inside the viewport).
+        const anchorRow = anchorCoverage ?? 0;
         for (;;) {
-          const needed = Math.max(visible.range.row + visible.range.rows - 1, worksheet.freezeRows ?? 0);
+          const needed = Math.max(
+            visible.range.row + visible.range.rows - 1, worksheet.freezeRows ?? 0, anchorRow);
           if (needed > coveringRow) {
             await (lease.waitForRows?.(needed) ?? Promise.resolve());
+            if (abandoned()) return;
             coveringRow = needed;
           }
           // Rows that arrived while waiting can change display-derived height
           // and therefore bring additional rows into the first viewport.
           prepareHeights(worksheet, true);
           visible = visibleRange();
-          if (Math.max(visible.range.row + visible.range.rows - 1, worksheet.freezeRows ?? 0) <= coveringRow) break;
+          if (Math.max(
+            visible.range.row + visible.range.rows - 1, worksheet.freezeRows ?? 0, anchorRow,
+          ) <= coveringRow) break;
         }
         // Paint includes the frozen corner, frozen row/column strips, and the
         // scrollable quadrant. Use their union for both row coverage and every
@@ -1004,26 +1156,46 @@ class XlsxViewerEngine implements ZoomableViewer {
           rows: visible.range.row + visible.range.rows - ((worksheet.freezeRows ?? 0) > 0 ? 1 : visible.range.row),
           cols: visible.range.col + visible.range.cols - ((worksheet.freezeCols ?? 0) > 0 ? 1 : visible.range.col),
         };
-        this.previewFallbackReason = viewportPreviewBlocker(worksheet, painted, coveringRow);
+        // The anchor baseline also needs final automatic heights for rows
+        // outside the painted viewport. anchorBaselinePreviewBlocker reports
+        // `drawing-dependency` when a statistical/formula conditional format
+        // reaches rows not loaded yet (they can change those heights), so the
+        // full model is awaited before capture (library policy).
+        this.previewFallbackReason = viewportPreviewBlocker(worksheet, painted, coveringRow) ??
+          (capturing ? anchorBaselinePreviewBlocker(worksheet, anchorRow, coveringRow) : null);
         if (this.previewFallbackReason) {
           sourceWorksheet = await lease.completion;
+          if (abandoned()) return;
           eligiblePreview = false;
           previewPreparedViewport = null;
           worksheet = prepareView(sourceWorksheet);
           prepareHeights(worksheet, true);
         }
-      } else prepareHeights(worksheet, false);
+        // Also after the completion await: captureInitial re-checks generation.
+        pendingReference = captureInitial(worksheet);
+      } else {
+        prepareHeights(worksheet, false);
+        pendingReference = captureInitial(worksheet);
+      }
       previewCompletion = eligiblePreview ? lease.completion : null;
     } catch (error) {
       releaseNewWorksheet?.();
+      if (pendingReference) releaseInitialAnchorSizeReference(pendingReference);
       if (!this.isCurrentSheetRequest(generation, workbook)) return;
       await this.restoreDisplayedWorksheetLease(workbook, generation);
       throw error;
     }
     if (!this.isCurrentSheetRequest(generation, workbook)) {
       releaseNewWorksheet?.();
+      if (pendingReference) releaseInitialAnchorSizeReference(pendingReference);
       return;
     }
+    // #1713: install synchronously after the generation check, before the
+    // projection is stored, painted or reachable by manual edit input.
+    if (pendingReference !== undefined) {
+      this.installInitialAnchorReference(workbook, index, pendingReference);
+    }
+    this.currentAutoRowHeightsPrepared = heightsPrepared;
 
     this.releaseCurrentWorksheet?.();
     this.releaseCurrentWorksheet = releaseNewWorksheet ?? null;
@@ -1045,11 +1217,18 @@ class XlsxViewerEngine implements ZoomableViewer {
         // Chart and sparkline references can resolve more completely once all
         // rows exist. Rebind the viewer to the committed model, preserving only
         // viewer-owned size and outline edits made during the pull.
+        // A degraded parser placeholder is decided before any binding: it is
+        // a different graph, so the known reference is never forced onto it.
+        const degraded = Boolean(completed.parseError);
         const finalized = this.createVisibleSheetView(completed);
+        // #1713: a non-degraded terminal projection reuses this request's
+        // reference, bound before manual state is replayed; never recaptured.
+        const initialReference = degraded ? undefined : this.initialAnchorReferenceFor(workbook, index);
+        if (initialReference) bindInitialAnchorSizes(finalized, initialReference);
         this.viewEdits.restoreSheetViewState(index, finalized);
         this.currentWorksheet = finalized;
         this.sheetViews.set(index, finalized);
-        if (completed.parseError) {
+        if (degraded) {
           // A later row may make the cursor produce the normal degraded-sheet
           // placeholder. Replace the provisional graph before the next frame.
           this.currentSourceComments = [];
@@ -1068,7 +1247,10 @@ class XlsxViewerEngine implements ZoomableViewer {
         invalidateSheetRenderCache(worksheet);
         invalidateAutoRowHeights(worksheet);
         const measureCtx = this.hostDocument.createElement('canvas').getContext('2d');
-        if (measureCtx) workbook[prepareXlsxViewerRowHeights](finalized, measureCtx);
+        if (measureCtx) {
+          workbook[prepareXlsxViewerRowHeights](finalized, measureCtx);
+          this.currentAutoRowHeightsPrepared = true;
+        }
         this.viewEdits.syncAutomaticRowOverrides(index, finalized);
         this.currentSourceComments = completed.comments ?? [];
         this.sourceCommentMap = createCommentMap(this.currentSourceComments);
@@ -1149,6 +1331,39 @@ class XlsxViewerEngine implements ZoomableViewer {
 
   private isCurrentSheetRequest(generation: number, workbook: XlsxWorkbook): boolean {
     return !this._destroyed && generation === this.sheetRequestGeneration && this.wb === workbook;
+  }
+
+  /** #1713 entry of `index` for the workbook it was captured from: a
+   * reference, `null` (captured; nothing eligible) or `undefined` (none). */
+  private initialAnchorReferenceFor(
+    workbook: XlsxWorkbook,
+    index: number,
+  ): InitialAnchorSizeReference | null | undefined {
+    return this.initialAnchorWorkbook === workbook ? this.initialAnchorReferences.get(index) : undefined;
+  }
+
+  private installInitialAnchorReference(
+    workbook: XlsxWorkbook,
+    index: number,
+    reference: InitialAnchorSizeReference | null,
+  ): void {
+    // References belong to one workbook; adopting another releases the old set.
+    if (this.initialAnchorWorkbook !== workbook) {
+      this.releaseInitialAnchorReferences();
+      this.initialAnchorWorkbook = workbook;
+    }
+    // At most one capture per sheet: a request captures only when no entry
+    // exists and installs only while it is the current generation.
+    if (!this.initialAnchorReferences.has(index)) this.initialAnchorReferences.set(index, reference);
+  }
+
+  /** Release every reference (bound lookups stop applying), then forget them. */
+  private releaseInitialAnchorReferences(): void {
+    for (const reference of this.initialAnchorReferences.values()) {
+      if (reference) releaseInitialAnchorSizeReference(reference);
+    }
+    this.initialAnchorReferences.clear();
+    this.initialAnchorWorkbook = null;
   }
 
   private async restoreDisplayedWorksheetLease(workbook: XlsxWorkbook, generation: number): Promise<void> {
@@ -1866,6 +2081,7 @@ class XlsxViewerEngine implements ZoomableViewer {
     if (this.opts.comments === false) {
       const hidden = { ...worksheet, commentRefs: [], comments: [] };
       inheritWorksheetPreviewBounds(worksheet, hidden);
+      inheritWorksheetPolicy(worksheet, hidden);
       return hidden;
     }
     // Keep the pre-customization behavior: XLSX historically exposed resolved
@@ -1886,6 +2102,7 @@ class XlsxViewerEngine implements ZoomableViewer {
       comments: worksheet.comments?.filter((comment) => !resolved.has(comment.cellRef)),
     };
     inheritWorksheetPreviewBounds(worksheet, unresolved);
+    inheritWorksheetPolicy(worksheet, unresolved);
     return unresolved;
   }
 
@@ -2053,11 +2270,11 @@ class XlsxViewerEngine implements ZoomableViewer {
   }
 
   /** Natural (unscaled, cs=1) CSS-px extent of a worksheet's used data range:
-   *  the row/column header plus every used column width / row height. Mirrors
-   *  {@link updateSpacerSize} at cs=1 (same used-range detection) so the fit
-   *  targets exactly the region the spacer/scroll extent covers. */
+   *  the row/column header plus every used column width / row height. Uses the
+   *  same content bounds and configured minimums as {@link updateSpacerSize},
+   *  but deliberately excludes its trailing scroll headroom. */
   private _naturalContentExtent(ws: Worksheet): { width: number; height: number } {
-    const { maxRow, maxCol } = worksheetContentBounds(ws);
+    const { maxRow, maxCol } = worksheetContentBounds(ws, this.gridExtent);
     return getGridGeometryForWorksheet(ws).logicalContentExtent(
       maxRow,
       maxCol,
@@ -2072,9 +2289,9 @@ class XlsxViewerEngine implements ZoomableViewer {
     const freezeCols = ws.freezeCols ?? 0;
 
     // Find actual scrollable data extent
-    let { maxRow, maxCol } = worksheetContentBounds(ws);
-    maxRow += 30;
-    maxCol += 10;
+    let { maxRow, maxCol } = worksheetContentBounds(ws, this.gridExtent);
+    maxRow += this.gridExtent.marginRows;
+    maxCol += this.gridExtent.marginCols;
 
     // Spacer = rounded header + cumulative per-band-rounded geometry.
     const extent = getGridGeometryForWorksheet(ws).roundedContentExtent(
@@ -2192,15 +2409,26 @@ class XlsxViewerEngine implements ZoomableViewer {
     };
 
     const sizeProjection = this.wireSizeOverrides();
+    // #1713: the worker needs the bound reference even before any size edit.
+    // It is fixed for this workbook/sheet, so the existing revision remains
+    // the cache key (a changed reference without a revision bump is an error).
+    // A degraded parser placeholder has its own graph. Keep the reference for
+    // later valid reacquisition, but never transport it onto that placeholder.
+    const initialAnchorSizes = ws.parseError
+      ? undefined
+      : this.initialAnchorReferenceFor(this.workbook, this.currentSheet) ?? undefined;
+    const projection = sizeProjection || initialAnchorSizes
+      ? {
+          id: this.projectionId,
+          revision: this.viewEdits.sizeRevision(this.currentSheet),
+          autoRowHeightsPrepared: this.currentAutoRowHeightsPrepared,
+          ...(initialAnchorSizes ? { initialAnchorSizes } : {}),
+        }
+      : undefined;
     const viewerRenderOpts = withViewerRenderContext(
       sizeProjection ? { ...renderOpts, sizeOverrides: sizeProjection.overrides } : renderOpts,
       getGridGeometryForWorksheet(ws).maximumDigitWidth,
-      {
-        worksheet: ws,
-        projection: sizeProjection
-          ? { id: this.projectionId, revision: sizeProjection.revision, autoRowHeightsPrepared: true }
-          : undefined,
-      },
+      { worksheet: ws, projection },
     );
 
     if (this._mode === 'worker') {
@@ -2301,6 +2529,7 @@ class XlsxViewerEngine implements ZoomableViewer {
     this.releaseCurrentWorksheet?.();
     this.releaseCurrentWorksheet = null;
     this.sheetViews.clear();
+    this.releaseInitialAnchorReferences();
     this.viewEdits.destroy();
     this.currentSourceComments = [];
     this.sourceCommentMap.clear();

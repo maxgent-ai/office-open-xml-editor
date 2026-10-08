@@ -78,6 +78,8 @@ fn parse_chart_with_images(
     theme_format_scheme: Option<&ooxml_common::theme::ThemeFormatScheme>,
     image_resolver: &dyn ooxml_common::chart::ChartImageResolver,
     is_chartex: bool,
+    limit_reporter: Option<&ooxml_common::package_session::PackageLimitReporter>,
+    retention_key: Option<ooxml_common::chart::ChartRetentionKey<'_>>,
 ) -> Option<ChartElement> {
     let doc = parse_preflighted_pptx_xml(xml).ok()?;
     let root = doc.root_element();
@@ -87,6 +89,8 @@ fn parse_chart_with_images(
     };
     let context = ooxml_common::chart::ChartParseContext {
         host: ooxml_common::chart::ChartHost::PowerPoint,
+        limit_reporter,
+        retention_key,
         color_resolver: Some(&resolver),
         style_xml,
         color_style_xml,
@@ -192,6 +196,8 @@ pub(crate) fn parse_legacy_chart_with_style_parts_and_images(
         theme_format_scheme,
         image_resolver,
         false,
+        None,
+        None,
     )
 }
 
@@ -219,9 +225,12 @@ pub(crate) fn parse_chartex(
         theme,
         theme_format_scheme,
         &images,
+        None,
+        None,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn parse_chartex_with_images(
     xml: &str,
     style_xml: Option<&str>,
@@ -229,6 +238,8 @@ pub(crate) fn parse_chartex_with_images(
     theme: &HashMap<String, String>,
     theme_format_scheme: Option<&ooxml_common::theme::ThemeFormatScheme>,
     image_resolver: &dyn ooxml_common::chart::ChartImageResolver,
+    limit_reporter: Option<&ooxml_common::package_session::PackageLimitReporter>,
+    retention_key: Option<ooxml_common::chart::ChartRetentionKey<'_>>,
 ) -> Option<ChartElement> {
     // The shared chart grammar reparses optional style XML after this entry.
     parse_chart_with_images(
@@ -240,6 +251,8 @@ pub(crate) fn parse_chartex_with_images(
         theme_format_scheme,
         image_resolver,
         true,
+        limit_reporter,
+        retention_key,
     )
 }
 
@@ -249,6 +262,69 @@ mod tests {
 
     const C_NS: &str = "http://schemas.openxmlformats.org/drawingml/2006/chart";
     const A_NS: &str = "http://schemas.openxmlformats.org/drawingml/2006/main";
+
+    #[test]
+    fn chartex_allocation_limit_survives_full_presentation_parse() {
+        use std::io::{Cursor, Write};
+        let series =
+            r#"<cx:series layoutId="clusteredColumn"><cx:dataId val="0"/></cx:series>"#.repeat(16);
+        let xml = format!(
+            r#"<cx:chartSpace xmlns:cx="http://schemas.microsoft.com/office/drawing/2014/chartex"><cx:chartData><cx:data id="0"><cx:numDim type="val"><cx:lvl ptCount="65536"><cx:pt idx="0">7</cx:pt></cx:lvl></cx:numDim></cx:data></cx:chartData><cx:chart><cx:plotArea><cx:plotAreaRegion>{series}</cx:plotAreaRegion></cx:plotArea></cx:chart></cx:chartSpace>"#
+        );
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for (path, part) in [
+            (
+                "[Content_Types].xml",
+                r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/></Types>"#,
+            ),
+            (
+                "_rels/.rels",
+                r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="p" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="ppt/presentation.xml"/></Relationships>"#,
+            ),
+            (
+                "ppt/presentation.xml",
+                r#"<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:sldIdLst><p:sldId id="256" r:id="s"/></p:sldIdLst><p:sldSz cx="9144000" cy="6858000"/></p:presentation>"#,
+            ),
+            (
+                "ppt/_rels/presentation.xml.rels",
+                r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="s" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/></Relationships>"#,
+            ),
+            (
+                "ppt/slides/slide1.xml",
+                r#"<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:cx="http://schemas.microsoft.com/office/drawing/2014/chartex" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:cSld><p:spTree><p:graphicFrame><p:nvGraphicFramePr><p:cNvPr id="2" name="Chart"/></p:nvGraphicFramePr><p:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="914400"/></p:xfrm><a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/drawing/2014/chartex"><cx:chart r:id="c"/></a:graphicData></a:graphic></p:graphicFrame></p:spTree></p:cSld></p:sld>"#,
+            ),
+            (
+                "ppt/slides/_rels/slide1.xml.rels",
+                r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="c" Type="http://schemas.microsoft.com/office/2014/relationships/chartEx" Target="../charts/chartEx1.xml"/></Relationships>"#,
+            ),
+            ("ppt/charts/chartEx1.xml", xml.as_str()),
+        ] {
+            writer
+                .start_file(path, zip::write::SimpleFileOptions::default())
+                .expect("ZIP part");
+            writer.write_all(part.as_bytes()).expect("part XML");
+        }
+        let data = writer.finish().expect("ZIP").into_inner();
+        let error =
+            crate::parse_pptx_native(&data).expect_err("presentation rejects chart resource limit");
+        let json: serde_json::Value = serde_json::from_str(
+            error
+                .strip_prefix("OOXML_RESOURCE_LIMIT:")
+                .expect("typed prefix"),
+        )
+        .expect("typed JSON");
+        assert_eq!(
+            json["details"]["violation"]["resource"],
+            "chartex-allocation"
+        );
+        assert_eq!(json["details"]["violation"]["format"], "pptx");
+        assert_eq!(json["details"]["violation"]["metric"], "bytes");
+        assert_eq!(
+            json["details"]["violation"]["limit"],
+            ooxml_common::resource::HARD_MAX_CHARTEX_ALLOCATION_BYTES
+        );
+        assert_eq!(json["details"]["violation"]["observed"], 12_582_913);
+    }
 
     #[test]
     fn powerpoint_chart_host_style_scope_retains_seventh_point_fallback() {
@@ -613,5 +689,16 @@ mod tests {
             element.chart.chartex_show_unpaired_percentage_axis,
             Some(true)
         );
+    }
+
+    #[test]
+    fn powerpoint_adapter_rejects_unsupported_chartex_layouts() {
+        let xml = r#"<cx:chartSpace xmlns:cx="http://schemas.microsoft.com/office/drawing/2014/chartex">
+          <cx:chartData><cx:data id="0"><cx:numDim type="val"><cx:lvl ptCount="1"><cx:pt idx="0">7</cx:pt></cx:lvl></cx:numDim></cx:data></cx:chartData>
+          <cx:chart><cx:plotArea><cx:plotAreaRegion>
+            <cx:series layoutId="pie"><cx:dataId val="0"/></cx:series>
+          </cx:plotAreaRegion></cx:plotArea></cx:chart>
+        </cx:chartSpace>"#;
+        assert!(parse_chartex(xml, None, None, &HashMap::new(), None).is_none());
     }
 }

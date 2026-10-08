@@ -25,7 +25,12 @@ const config: StorybookConfig = {
       // workflow sets STORYBOOK_BASE=/storybook/ to nest it under the site.
       base: process.env.STORYBOOK_BASE ?? '/',
       plugins: [...(config.plugins ?? []), wasm()],
-      worker: { format: 'es' as const, plugins: () => [wasm()] },
+      worker: {
+        format: 'es' as const,
+        plugins: () => [wasm()],
+        // Inline parser workers cannot resolve relative chunks from Blob URLs.
+        rolldownOptions: { output: { codeSplitting: false } },
+      },
     };
   },
 };

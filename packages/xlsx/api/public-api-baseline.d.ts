@@ -1150,6 +1150,7 @@ export interface DefinedName {
     name: string;
     formula: string;
 }
+type DrawingAnchorTag = 'oneCellAnchor' | 'twoCellAnchor';
 export interface DrawingMLCustomDashSegment {
     dash: number;
     space: number;
@@ -1255,6 +1256,7 @@ export interface ImageAnchor {
     toRow: number;
     toRowOff: number;
     editAs?: string;
+    anchorTag?: DrawingAnchorTag;
     nativeExtCx: number;
     nativeExtCy: number;
     rotation?: number;
@@ -1315,6 +1317,7 @@ interface LoadOptions__emitterCollision1 {
     wasmUrl?: string | URL;
     maxZipEntryBytes?: number;
     resourceLimits?: OoxmlResourceLimits;
+    xlsxWorksheetLimits?: XlsxWorksheetLimits;
     debug?: boolean;
     onResourceMetrics?: (metrics: OoxmlResourceMetrics) => void;
     workerTimeoutMs?: number;
@@ -1538,6 +1541,12 @@ export interface OoxmlResourcePolicySnapshot {
     readonly maxArchiveEntryBytes: number | null;
     readonly maxTotalInflatedBytes: number | null;
     readonly maxArchiveEntries: number | null;
+    readonly xlsxWorksheetLimits?: Readonly<{
+        readonly maxRows: number;
+        readonly maxCells: number;
+        readonly maxOwnedUtf8Bytes: number;
+        readonly maxJsonBytes: number;
+    }>;
 }
 export interface OoxmlResourceUsageSnapshot {
     readonly archiveEntryCount: number;
@@ -1877,6 +1886,9 @@ export interface ShapeAnchor {
     editAs?: string;
     nativeExtCx: number;
     nativeExtCy: number;
+    anchorTag?: DrawingAnchorTag;
+    anchorExtCx?: number;
+    anchorExtCy?: number;
     shapes: ShapeInfo[];
 }
 export type ShapeFill = Exclude<Fill, {
@@ -1955,6 +1967,9 @@ export interface ShapeParagraph {
     runs: ShapeTextRun[];
 }
 export interface ShapeText {
+    vert?: string;
+    anchorCtr?: boolean;
+    spcFirstLastPara?: boolean;
     anchor: string;
     wrap: string;
     autoFit?: string;
@@ -1972,6 +1987,7 @@ export type ShapeTextRun = {
     bold: boolean;
     italic: boolean;
     size: number;
+    spacing?: number;
     color?: string;
     fontFace?: string;
     fontFaceEa?: string;
@@ -2184,6 +2200,7 @@ export interface Worksheet {
     colHidden?: Record<number, boolean>;
     defaultColWidth: number;
     baseColWidth?: number;
+    defaultColWidthIsUi?: boolean;
     defaultRowHeight: number;
     defaultRowHeightCustom?: boolean;
     mergeCells: MergeCell[];
@@ -2441,6 +2458,10 @@ export interface XlsxSheetViewerOptions extends LoadOptions {
     cellScale?: number;
     resizable?: boolean;
     showScrollbars?: boolean;
+    minRows?: number;
+    minCols?: number;
+    marginRows?: number;
+    marginCols?: number;
     zoomMin?: number;
     zoomMax?: number;
     onScaleChange?: (scale: number) => void;
@@ -2550,6 +2571,12 @@ export class XlsxWorkbook {
     private __privatePresence;
     private static __staticPrivatePresence;
     private constructor();
+}
+export interface XlsxWorksheetLimits {
+    maxRows?: number;
+    maxCells?: number;
+    maxOwnedUtf8Bytes?: number;
+    maxJsonBytes?: number;
 }
 export interface ZoomableViewer {
     getScale(): number;

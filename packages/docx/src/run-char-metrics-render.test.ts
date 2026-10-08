@@ -26,7 +26,7 @@ interface FillCall {
   translateX: number;
 }
 
-function makeRecordingCanvas(): { canvas: HTMLCanvasElement; fills: FillCall[] } {
+function makeRecordingCanvas(advance?: (text: string, size: number) => number): { canvas: HTMLCanvasElement; fills: FillCall[] } {
   let font = `${FONT_PX}px serif`;
   let letterSpacing = '0px';
   let fontKerning = 'auto';
@@ -45,7 +45,8 @@ function makeRecordingCanvas(): { canvas: HTMLCanvasElement; fills: FillCall[] }
     set fontKerning(v: string) { fontKerning = v; },
     measureText: (s: string) => {
       const p = px();
-      const w = [...s].length * p;
+      const w = advance?.(s, p) ?? [...s].length * p - (fontKerning === 'normal' ?
+        (s.includes('AV') ? 2 : 0) + (s.includes('T ') ? 1 : 0) + (s.includes(' A') ? 1.5 : 0) : 0);
       return {
         width: w,
         fontBoundingBoxAscent: p * 0.8,
@@ -84,9 +85,9 @@ function textRun(text: string, extra: Partial<DocxTextRun> = {}): DocxTextRun {
 
 type DocRun = DocParagraph['runs'][number];
 
-function para(runs: DocxTextRun[]): BodyElement {
+function para(runs: DocxTextRun[], alignment: DocParagraph['alignment'] = 'left'): BodyElement {
   const p: DocParagraph = {
-    alignment: 'left', indentLeft: 0, indentRight: 0, indentFirst: 0,
+    alignment, indentLeft: 0, indentRight: 0, indentFirst: 0,
     spaceBefore: 0, spaceAfter: 0, lineSpacing: null, numbering: null, tabStops: [],
     runs: runs.map((r) => ({ type: 'text', ...r }) as DocRun),
     defaultFontSize: FONT_PX, defaultFontFamily: 'NotInMetrics', widowControl: false,
@@ -110,10 +111,10 @@ function doc(body: BodyElement[], settings?: DocSettings): DocxDocumentModel {
   } as unknown as DocxDocumentModel;
 }
 
-async function render(runs: DocxTextRun[], settings?: DocSettings): Promise<{ runs: DocxTextRunInfo[]; fills: FillCall[] }> {
+async function render(runs: DocxTextRun[], settings?: DocSettings, alignment?: DocParagraph['alignment']): Promise<{ runs: DocxTextRunInfo[]; fills: FillCall[] }> {
   const { canvas, fills } = makeRecordingCanvas();
   const info: DocxTextRunInfo[] = [];
-  await renderDocumentToCanvas(doc([para(runs)], settings), canvas, 0, {
+  await renderDocumentToCanvas(doc([para(runs, alignment)], settings), canvas, 0, {
     dpr: 1, width: 600, onTextRun: (r) => info.push(r),
   });
   return { runs: info, fills };
@@ -191,9 +192,9 @@ describe('WD4 run character metrics reach the glyph draw (measure==paint)', () =
     ]);
 
     expect(uniformlyRaised.runs[0].h).toBeCloseTo(FONT_PX + 6, 5);
-    expect(drawOf(uniformlyRaised.fills, 'A').y - drawOf(plain.fills, 'N').y)
+    expect(drawOf(uniformlyRaised.fills, 'AB').y - drawOf(plain.fills, 'N').y)
       .toBeCloseTo(3, 5);
-    expect(drawOf(uniformlyRaised.fills, 'B').y - drawOf(plain.fills, 'N').y)
+    expect(drawOf(uniformlyRaised.fills, 'AB').y - drawOf(plain.fills, 'N').y)
       .toBeCloseTo(3, 5);
   });
 
@@ -225,18 +226,6 @@ describe('WD4 run character metrics reach the glyph draw (measure==paint)', () =
     ).toBeCloseTo(4, 5);
   });
 
-  it('w:kern (§17.3.2.19) enables ctx.fontKerning when the run size ≥ the threshold', async () => {
-    // fontSize FONT_PX=20pt, threshold 14pt ⇒ 20 ≥ 14 ⇒ kerning normal.
-    const { fills } = await render([textRun('WORD', { kerning: 14 })]);
-    expect(drawOf(fills, 'WORD').fontKerning).toBe('normal');
-  });
-
-  it('w:kern disables kerning when the run size is below the threshold', async () => {
-    // threshold 28pt > 20pt run ⇒ kerning none.
-    const { fills } = await render([textRun('WORD', { kerning: 28 })]);
-    expect(drawOf(fills, 'WORD').fontKerning).toBe('none');
-  });
-
   it('keeps authored w:kern thresholds authoritative for complex-script runs', async () => {
     const { fills } = await render([
       textRun('نص', { rtl: true, cs: true, fontSizeCs: FONT_PX, kerning: 14 }),
@@ -247,22 +236,108 @@ describe('WD4 run character metrics reach the glyph draw (measure==paint)', () =
     expect(drawOf(fills, 'عنوان').fontKerning).toBe('none');
   });
 
-  it('disables kerning when w:kern is absent from the resolved style hierarchy', async () => {
-    const { fills } = await render([textRun('WORD')]);
-    expect(drawOf(fills, 'WORD').fontKerning).toBe('none');
+  // CAL-K measured sizes/thresholds plus K1/K4 boundaries. Both flag values
+  // accept positive qualifying thresholds and reject absent/zero/too-large.
+  it.each([
+    { size: 8, threshold: undefined, expected: 'none' },
+    { size: 8, threshold: 0, expected: 'none' },
+    { size: 8, threshold: 8, expected: 'normal' },
+    { size: 12, threshold: 8, expected: 'normal' },
+    { size: 18, threshold: 18, expected: 'normal' },
+    { size: 18, threshold: 20, expected: 'none' },
+    { size: 20, threshold: 20, expected: 'normal' },
+    { size: 18, threshold: 8, expected: 'normal' },
+    { size: 18, threshold: undefined, expected: 'none' },
+  ])('keeps size $size threshold $threshold authoritative for measurement and paint', async ({ size, threshold, expected }) => {
+    for (const enableOpenTypeFeatures of [false, true]) {
+      const { fills, runs } = await render([textRun('AV', { fontSize: size, kerning: threshold })], {
+        compatibilityMode: 15, enableOpenTypeFeatures,
+      });
+      expect(drawOf(fills, 'AV').fontKerning).toBe(expected);
+      expect(runs[0].w).toBe(expected === 'normal' ? 2 * size - 2 : 2 * size);
+    }
   });
 
-  it('enables absent-threshold kerning only under enableOpenTypeFeatures', async () => {
-    const enabled = await render([textRun('WORD')], { enableOpenTypeFeatures: true });
-    const disabled = await render([textRun('WORD')], { enableOpenTypeFeatures: false });
-    expect(drawOf(enabled.fills, 'WORD').fontKerning).toBe('normal');
-    expect(drawOf(disabled.fills, 'WORD').fontKerning).toBe('none');
+  it('paints same-format letter and space seams as their concatenated sequence', async () => {
+    const settings = { compatibilityMode: 15 };
+    for (const parts of [['T', ' beyond'], ['A', 'V']]) {
+      const split = await render(parts.map(text => textRun(text, { kerning: 8 })), settings);
+      const whole = await render([textRun(parts.join(''), { kerning: 8 })], settings);
+      expect(split.fills).toEqual(whole.fills);
+    }
+    const changed = await render([textRun('T', { kerning: 8 }), textRun(' beyond', { kerning: 8, charSpacing: 1 })], settings);
+    expect(drawOf(changed.fills, ' ').x - drawOf(changed.fills, 'T').x).toBe(FONT_PX);
+    for (const kerning of [undefined, 0, 28]) {
+      const split = await render([textRun('T', { kerning }), textRun(' beyond', { kerning })], settings);
+      expect(split.fills).toEqual((await render([textRun('T beyond', { kerning })], settings)).fills);
+    }
   });
 
-  it('keeps an authored w:kern threshold authoritative over enableOpenTypeFeatures', async () => {
-    const { fills } = await render([textRun('WORD', { kerning: 28 })], {
-      enableOpenTypeFeatures: true,
+  it.each(['right', 'center'] as const)('compares source formatting by value for %s alignment', async (alignment) => {
+    const first = textRun('T', { kerning: 8 });
+    const second = textRun(' X', { kerning: 8 });
+    const reversed = Object.fromEntries(Object.entries(second).reverse()) as unknown as DocxTextRun;
+    const settings = { compatibilityMode: 15 };
+    const ordinary = await render([first, second], settings, alignment);
+    const reordered = await render([first, reversed], settings, alignment);
+    expect(ordinary.fills).toEqual((await render([textRun('T X', { kerning: 8 })], settings, alignment)).fills);
+    expect(reordered.runs).toEqual(ordinary.runs);
+    expect(reordered.fills).toEqual(ordinary.fills);
+    const changed = await render([first, { ...reversed, italic: true }], settings, alignment);
+    expect(drawOf(changed.fills, ' ').x - drawOf(changed.fills, 'T').x).toBe(FONT_PX);
+  });
+
+  it.each([14, undefined, 16, 15])('bounds zero to mode 15 while source splits stay transparent (mode %s)', async (compatibilityMode) => {
+    const settings = { compatibilityMode, enableOpenTypeFeatures: true };
+    const zero = await render([textRun('AV', { kerning: 0 })], settings);
+    expect(drawOf(zero.fills, 'AV').fontKerning).toBe(compatibilityMode === 15 ? 'none' : 'normal');
+    expect(zero.runs[0].w).toBe(compatibilityMode === 15 ? 2 * FONT_PX : 2 * FONT_PX - 2);
+    const seam = await render([textRun('T', { kerning: 8 }), textRun(' X', { kerning: 8 })], settings);
+    expect(seam.fills).toEqual((await render([textRun('T X', { kerning: 8 })], settings)).fills);
+    // Absence and positive size boundaries are normative in every mode.
+    for (const kerning of [undefined, FONT_PX, FONT_PX + 1]) {
+      const result = await render([textRun('AV', { kerning })], settings);
+      expect(drawOf(result.fills, 'AV').fontKerning).toBe(kerning === FONT_PX ? 'normal' : 'none');
+      expect(result.runs[0].w).toBe(kerning === FONT_PX ? 2 * FONT_PX - 2 : 2 * FONT_PX);
+    }
+  });
+});
+
+describe('kerning authority and justified fitting share measured advances', () => {
+  // Word 16.113.3 mode-15 K3/K4 controls, with the independently pinned
+  // Times New Roman cmap/hmtx advances (2048 upm). These scalar metrics isolate
+  // zero/absent kerning from the fitting decision; they are not fitted widths.
+  const advances: Record<string, number> = {
+    ' ': 512, A: 1479, E: 1251, L: 1251, R: 1366, T: 1251, U: 1479,
+    V: 1479, W: 1933, b: 1024, d: 1024, e: 909, n: 1024, o: 1024, y: 1024,
+  };
+  async function lines(prefix: string, kerning: number | undefined, width: number): Promise<string[]> {
+    const { canvas } = makeRecordingCanvas((text, size) =>
+      [...text].reduce((sum, ch) => sum + advances[ch]!, 0) * size / 2048);
+    const model = doc([para([
+      textRun(prefix, { fontSize: 18, kerning }),
+      textRun(' beyond', { fontSize: 18, kerning }),
+    ], 'both')], {
+      compatibilityMode: 15, enableOpenTypeFeatures: true,
+      characterSpacingControl: 'compressPunctuation',
     });
-    expect(drawOf(fills, 'WORD').fontKerning).toBe('none');
+    model.section.pageWidth = width;
+    const result = new Map<number, string>();
+    await renderDocumentToCanvas(model, canvas, 0, { dpr: 1, width, onTextRun(run) {
+      result.set(run.y, (result.get(run.y) ?? '') + run.text);
+    } });
+    return [...result.values()].map(text => text.trim());
+  }
+  const controls = [
+    { prefix: 'AVATAR To WAVE VAULT', kerning: 0, rejectWidth: 217.10, acceptWidth: 220.35,
+      rejected: ['AVATAR To WAVE', 'VAULT beyond'] },
+    { prefix: 'AVATAR To WAVE VAULT AVATAR To WAVE VAULT To', kerning: undefined, rejectWidth: 464.10, acceptWidth: 467.35,
+      rejected: ['AVATAR To WAVE VAULT AVATAR To WAVE VAULT', 'To beyond'] },
+  ];
+  it.each(controls)('preserves the Word rejection below the fitting boundary (threshold $kerning)', async ({ prefix, kerning, rejectWidth, rejected }) => {
+    expect(await lines(prefix, kerning, rejectWidth)).toEqual(rejected);
+  });
+  it.each(controls)('accepts the Word prefix above the compression boundary (threshold $kerning)', async ({ prefix, kerning, acceptWidth }) => {
+    expect(await lines(prefix, kerning, acceptWidth)).toEqual([prefix, 'beyond']);
   });
 });

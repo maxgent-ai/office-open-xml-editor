@@ -161,3 +161,18 @@ export function documentImageMetadataRecords(
     resolvePictureBulletSize,
   ).imageMetadata];
 }
+
+/** Atomic upright OMML in a quarter-turn text frame. Library layout policy:
+ * §22.1.2.77 keeps the math zone intact; the rendered height advances along
+ * the column, and rendered width reserves its cross extent. Paint already
+ * counter-rotates resources and swaps these retained logical axes back. */
+export function quarterTurnMathMetadataService(math: MathMetadataService): MathMetadataService {
+  return Object.freeze({
+    fingerprint: stableFingerprint('quarter-turn-math', math.fingerprint),
+    resolve(resourceKey: string): DeepReadonly<MathLayoutResource> {
+      const resource = math.resolve(resourceKey);
+      return Object.freeze({ ...resource, widthEm: resource.ascentEm + resource.descentEm,
+        ascentEm: resource.widthEm / 2, descentEm: resource.widthEm / 2 });
+    },
+  });
+}

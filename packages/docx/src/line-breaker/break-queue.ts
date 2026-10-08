@@ -1,3 +1,4 @@
+import { createMixedSpaceState } from './mixed-space-fit.js';
 import { LineMeasurementAdapter } from './measurement-adapter.js';
 import type { KinsokuRules } from '@silurus/ooxml-core';
 import { containsSeaScript, seaMixedBreakOffsets } from '@silurus/ooxml-core';
@@ -5,6 +6,8 @@ import { type LayoutImageSeg, type LayoutLine, type LayoutMathSeg, type LayoutSe
 import { protectedNoBreakOffsets, slicedTextMetadata } from './advance.js';
 import { rebaseSeaBreaks } from './text-runs.js';
 import { resolveFitTextSegments } from './segment-builder.js';
+import type { LineGapModel } from './line-gaps.js';
+import { SegmentQueue, type SegmentQueueCursor } from './segment-queue.js';
 
 /** Prepare source-anchored break opportunities and the resumable queue.
  * SEA dictionary boundaries, protected ranges, paragraph-final hanging spaces,
@@ -161,18 +164,71 @@ export type SnapBlockState = {
   };
 
 
+/** A window accepted for one line fragment. `solverWidth` is the width the
+ * float solver compared with the requirement (before hanging-indent restore). */
+export interface GapWindow {
+  readonly topY: number;
+  readonly xOffset: number;
+  readonly maxWidth: number;
+  readonly solverWidth: number;
+}
+
+/** WORD_FLOAT_GAP_FLOW admission as a placement transaction (#1670).
+ * A fragment narrowed by an exclusion is filled by ordinary placement; if
+ * placement would need a forced break or overflow at the fragment head, the
+ * fragment rolls back and the next gap is searched with a strictly larger
+ * requirement. Admission and placement therefore share one implementation. */
+export interface GapTransaction {
+  /** Continuation origin while this physical line may still take a later gap. */
+  cursor: { topY: number; left: number; right: number } | null;
+  /** Top requested for a new physical line (solver searches downward from it). */
+  requestTopY: number;
+  /** Width the next gap must offer, in solver units (incl. positive first-line indent). */
+  requirement: number;
+  window: GapWindow | null;
+  narrowed: boolean;
+  /** The fragment's line-end edge (reading order) is an exclusion, not the
+   * paragraph edge: §17.3.1.21 hanging punctuation may not cross it. */
+  endsAtExclusion: boolean;
+  snapshot: Readonly<{
+    scalars: Readonly<Record<string, unknown>>;
+    snapBlock: unknown;
+    linesLength: number;
+    queue: SegmentQueueCursor;
+  }> | null;
+  /** Complete units precede a forced unit: end the fragment before this source. */
+  stopBefore: LineBoundary | null;
+}
+
 export function createLineBreakerState(maxWidth: number, wrapCtx?: WrapLayoutCtx) {
   return {
     lines: [] as LayoutLine[],
     currentLine: [] as (LayoutTextSeg | LayoutImageSeg | LayoutMathSeg | LayoutTabSeg)[],
     currentWidth: 0,
+    justifiedGapModel: undefined as LineGapModel | undefined,
+    justifiedCompressionPx: 0,
+    justifiedUnitEnd: undefined as LayoutSeg | undefined,
     latinLineFace: undefined as LayoutTextSeg | undefined,
     latinLineHomogeneous: true,
     latinLineGaps: [] as LayoutTextSeg[],
+    /** WORD_COMPRESSED_SPACE_LINE_FIT state of the current line. */
+    mixedSpace: createMixedSpaceState(),
+    /** Some segment of the paragraph carries the rule's eligibility; when
+     * false the projection does no work at all. */
+    mixedSpaceEnabled: false,
     latinUniformGapCapacity: undefined as number | undefined,
     latinAppliedGapCount: 0,
     latinAppliedPerGap: 0,
     snapBlock: null as SnapBlockState | null,
+    physicalLineIndex: 0,
+    positionReferencePt: undefined as number | null | undefined,
+    firstPositioned: undefined as LayoutTextSeg | undefined,
+    uniformPositionEligible: true,
+    fragmentCursor: null as { topY: number; left: number; right: number } | null,
+    /** Pass-local admission transaction of the line fragment being filled. */
+    gapTransaction: null as GapTransaction | null,
+    /** Queue item taken by the iterator and not yet committed or re-queued. */
+    inHand: undefined as LayoutSeg | undefined,
     lineHeight: 0,
     lineAscent: 0,
     lineDescent: 0,
@@ -180,6 +236,7 @@ export function createLineBreakerState(maxWidth: number, wrapCtx?: WrapLayoutCtx
     lineHasInlinePicture: false,
     linePictureMarkSingle: 0,
     lineGridCountSingle: 0,
+    lineLatinGridCountSingle: 0,
     lineVisibleAscent: 0,
     lineVisibleDescent: 0,
     lineVisibleIntendedSingle: 0,
@@ -187,10 +244,13 @@ export function createLineBreakerState(maxWidth: number, wrapCtx?: WrapLayoutCtx
     isFirst: true,
     lineMaxWidth: maxWidth,
     lineXOffset: 0,
+    /** Exclusion-free width past the paragraph's trailing indent, up to the
+     *  text margin, that an aligned tab cell on this line may allocate. */
+    lineMarginExtension: 0,
     currentLineTopY: wrapCtx?.startPageY ?? 0,
     lineHasRuby: false,
     lineEastAsian: false,
-    queue: [] as LayoutSeg[],
+    queue: new SegmentQueue(),
     trailingBreakFontSize: null as number | null,
   };
 }

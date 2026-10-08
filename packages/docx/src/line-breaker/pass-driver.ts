@@ -1,11 +1,13 @@
+import { createPrefixWorkBudget } from './prefix-work-budget.js';
 import { LineMeasurementAdapter } from './measurement-adapter.js';
 import type { TabStop } from '../types';
 import type { KinsokuRules } from '@silurus/ooxml-core';
-import { wordMinLineStartPx, type PreparedFloatWrap } from '../float-layout.js';
+import { type PreparedFloatWrap } from '../float-layout.js';
 import type {
   MeasurementTextContext,
   VerticalGlyphMeasurementService,
 } from '../layout/measurement-capabilities.js';
+import { wordUniformRunPositionPaintPt } from '../layout/line-compatibility.js';
 import { calcEffectiveFontPx } from '../layout/text.js';
 import {
   type DocGridCtx,
@@ -19,11 +21,22 @@ import {
   type WrapLayoutCtx,
 } from './model.js';
 import { createLineBreakerState, prepareBreakQueue } from './break-queue.js';
+import { SegmentQueue } from './segment-queue.js';
 import { buildFont } from './font-routes.js';
 import { type CrossRunKinsokuRetraction } from './kinsoku.js';
 import { iterateBreakOpportunities } from './break-opportunities.js';
 import { finalizeRetainedLineShapes } from './line-finalize.js';
 import {
+  performMarkMixedSpacesCompressed,
+  performMixedSpaceRequirement,
+  type MixedSpaceCandidate,
+} from './mixed-space-fit.js';
+import {
+  performLineHeadRequirement,
+  performForcedPlacement,
+  performMinimalLegalTextWidth,
+  performRejectGap,
+  performCaptureGapSnapshot,
   performSameLatinSpaceFace,
   performMaterializeLatinSpaceCompression,
   performStartLine,
@@ -46,7 +59,7 @@ import {
   performDecimalAlignmentPrefixWidth,
   performTabFollowingMetrics,
   performEmergencyTextSplit,
-  performExternalLinkSyntaxSplit,
+  performExplicitTextSplit,
   performQueueEmergencyTail,
   performRetractCurrentLineForLeadingKinsoku,
   performKeepLeadingKinsokuWithCurrentLine,
@@ -71,11 +84,14 @@ export interface LineBreakerPassInput {
   readonly isJustified: boolean;
   readonly stretchLastLine: boolean;
   readonly startBoundary?: LineBoundary;
-  readonly widthPolicy: 'bounded' | 'intrinsic';
+  readonly widthPolicy: 'bounded' | 'intrinsic' | 'unwrapped';
   readonly verticalGlyphMeasurement?: VerticalGlyphMeasurementService;
   readonly overflowPunct: boolean;
+  readonly justifiedCompression?: boolean;
   readonly passContext: Readonly<{
     probeHeights: readonly number[] | null;
+    /** Monotone per-physical-line exclusion probe heights (≥ probeHeights). */
+    probeFloors?: readonly number[] | null;
     preparedFloatWrap?: PreparedFloatWrap;
   }>;
 }
@@ -112,7 +128,16 @@ export function runLineBreakerPass(input: LineBreakerPassInput): LayoutLine[] {
   } = input;
 
   const { probeHeights, preparedFloatWrap } = passContext;
+  const probeFloors = passContext.probeFloors ?? probeHeights;
   const breakerState = createLineBreakerState(maxWidth, wrapCtx);
+  // WORD_COMPRESSED_SPACE_LINE_FIT scope, fixed for the paragraph: only
+  // segments acquired under its document gate carry the eligibility. No
+  // Word control measured U+3000, whose hanging and paragraph-final rules
+  // (WORD_IDEOGRAPHIC_SPACE_LINE_END_ALLOWANCE) the observed rule does not
+  // define; a paragraph holding U+3000 keeps this compression rule disabled.
+  breakerState.mixedSpaceEnabled = segs.some(
+    (segment) => 'text' in segment && segment.mixedSpaceAverageWidthRatio !== undefined,
+  ) && !segs.some((segment) => 'text' in segment && segment.text.includes('\u3000'));
 
   let operationState: PassOperationState;
   const sameLatinSpaceFace = performSameLatinSpaceFace;
@@ -126,47 +151,22 @@ export function runLineBreakerPass(input: LineBreakerPassInput): LayoutLine[] {
       ? characterGrid.characterPitchPt * scale
       : null;
 
-  // Square-only compatibility side-space (px) a CONTENT line needs before it may
-  // START beside a square object rather than flow below its band.
-  // `word-square-line-start-one-inch` supplies the requirement through
-  // wordMinLineStartPx(scale), independent of a content line's text. The same
-  // threshold applies to a short token and a long word; a word that overruns
-  // the side gap is force-broken there by the overlong-word path. This replaced
-  // a per-line first-atomic-token
-  // width probe that wedged short-token lines into sub-inch gaps and refused
-  // ≥1-inch gaps to long-word lines (issue #676). Shared by the paint pass and the
-  // paginator's two mirror layouts (they call layoutLines with scale 1), so the
-  // flow/beside decision agrees across passes.
-  //
-  // NOTE — this 1-inch rule is the CONTENT-line threshold. A literally-empty
-  // paragraph's pilcrow is placed by resolveEmptyMarkTop / flowMarkLine
-  // (renderer.ts) against the NARROWER pilcrow-em threshold. An anchorHost-only
-  // paragraph still enters layoutLines so its anchor-character metrics size the
-  // mark line, but `isParagraphMarkOnlyFlow` selects the same narrow threshold
-  // for its first line. `word-empty-mark-float-side-gap` supplies that narrower
-  // threshold. #676 over-generalized one inch onto marks; inline
-  // content (including a content paragraph's trailing-break final line) keeps
-  // the square-only 1-inch rule. Tight/through are governed by their polygon
-  // openings (§20.4.2.18/.19), for which there is no corresponding evidence.
-  const minLineStartWidth = (): number => wordMinLineStartPx(scale);
-  const isParagraphMarkOnlyFlow =
-    segs.length > 0 &&
-    segs.every(
-      (segment) =>
-        ('text' in segment && segment.metricOnly === true) ||
-        ('imagePath' in segment && Boolean(segment.anchor)),
-    );
+  const lineHeadRequirement = (boundary?: LineBoundary): number =>
+    performLineHeadRequirement(operationState, boundary);
+  const forcedPlacement = (requiredWidth: number, unitStart?: number): void =>
+    performForcedPlacement(operationState, requiredWidth, unitStart);
+  const minimalLegalTextWidth = (segment: LayoutTextSeg): number =>
+    performMinimalLegalTextWidth(operationState, segment);
 
-  // Compute wrap constraints for a new line about to start. Mutates
-  // lineXOffset/lineMaxWidth/currentLineTopY. `minWidth` is the smallest clear
-  // square side-space the upcoming line must have to START here. Polygon wraps
-  // receive MIN_LINE_GAP separately so the compatibility policy cannot erase a
-  // through opening explicitly permitted by §20.4.2.18.
-  const startLine = (minWidth: number = 0): void => performStartLine(operationState, minWidth);
+  // Compute wrap constraints for a new line fragment about to start. Mutates
+  // lineXOffset/lineMaxWidth/currentLineTopY. `requirement` seeds the gap
+  // search; placement itself admits or rejects a narrowed gap (#1670).
+  const startLine = (requirement: number = 0): void => performStartLine(operationState, requirement);
 
-  // Intrinsic acquisition deliberately disables automatic line wrapping while
-  // retaining the real paragraph/anchor width for tab and alignment reference
-  // frames. This is a semantic mode, not a synthetic oversized page.
+  // Intrinsic acquisition and DrawingML wrap=none disable automatic wrapping
+  // while retaining the real paragraph/anchor width for tabs and alignment.
+  // Unwrapped paint still finalizes retained shapes; intrinsic measurement does
+  // not. Neither mode invents an oversized page.
   const availW = () => performAvailW(operationState);
 
   // AutoFit can set a table column to the measured text advance plus its
@@ -227,7 +227,7 @@ export function runLineBreakerPass(input: LineBreakerPassInput): LayoutLine[] {
   const setMeasureFont = (font: string): void => measurement.setFont(font);
 
   const endBoundary: LineBoundary = { segIndex: segs.length, charOffset: 0 };
-  breakerState.queue = prepareBreakQueue(segs, startBoundary, kinsoku, scale, measurement);
+  breakerState.queue = new SegmentQueue(prepareBreakQueue(segs, startBoundary, kinsoku, scale, measurement));
 
   // The segment's laid-out ADVANCE (= its measuredWidth): natural width plus the
   // character-grid delta, the §17.3.2.43 horizontal glyph scale (w:w) and the
@@ -273,6 +273,9 @@ export function runLineBreakerPass(input: LineBreakerPassInput): LayoutLine[] {
    * setting excludes the fit projection at segment acquisition. */
   const fitHomogeneousLatinSpaces = (next: LayoutTextSeg, nextFitWidth: number): boolean =>
     performFitHomogeneousLatinSpaces(operationState, next, nextFitWidth);
+  const mixedSpaceRequirement = (candidate: MixedSpaceCandidate): number | undefined =>
+    performMixedSpaceRequirement(operationState, candidate);
+  const markMixedSpacesCompressed = (): void => performMarkMixedSpacesCompressed(operationState);
 
   /** Measure one text segment's canonical advance and vertical contribution.
    * Every path that commits a complete text segment to a line must use this
@@ -334,8 +337,8 @@ export function runLineBreakerPass(input: LineBreakerPassInput): LayoutLine[] {
    * Every candidate is evaluated independently: signed character spacing can
    * make prefix advances non-monotone, and snapToChars must include the current
    * line's active script block rather than treating the prefix in isolation. */
-  const externalLinkSyntaxSplit = (segment: LayoutTextSeg, available: number): number =>
-    performExternalLinkSyntaxSplit(operationState, segment, available);
+  const explicitTextSplit = (segment: LayoutTextSeg, available: number): number =>
+    performExplicitTextSplit(operationState, segment, available);
 
   const queueEmergencyTail = (segment: LayoutTextSeg, split: number): void =>
     performQueueEmergencyTail(operationState, segment, split);
@@ -367,15 +370,18 @@ export function runLineBreakerPass(input: LineBreakerPassInput): LayoutLine[] {
 
   operationState = {
     ...input,
+    reservePrefixWork: createPrefixWorkBudget(),
     probeHeights,
+    probeFloors,
     preparedFloatWrap,
     breakerState,
     sameLatinSpaceFace,
     materializeLatinSpaceCompression,
     snapPitchPx,
-    minLineStartWidth,
-    isParagraphMarkOnlyFlow,
+    lineHeadRequirement,
     startLine,
+    forcedPlacement,
+    minimalLegalTextWidth,
     availW,
     fitsMeasuredWidth,
     bidiCustomStopsPx,
@@ -396,6 +402,8 @@ export function runLineBreakerPass(input: LineBreakerPassInput): LayoutLine[] {
     eastAsianSnapCellCount,
     strAdvance,
     fitHomogeneousLatinSpaces,
+    mixedSpaceRequirement,
+    markMixedSpacesCompressed,
     textSegmentBox,
     appendQueuedIdeographicSpaceSegment,
     tabFollowWidth,
@@ -403,23 +411,57 @@ export function runLineBreakerPass(input: LineBreakerPassInput): LayoutLine[] {
     decimalAlignmentPrefixWidth,
     tabFollowingMetrics,
     emergencyTextSplit,
-    externalLinkSyntaxSplit,
+    explicitTextSplit,
     queueEmergencyTail,
     retractCurrentLineForLeadingKinsoku,
     keepLeadingKinsokuWithCurrentLine,
   };
-  startLine(
-    isParagraphMarkOnlyFlow
-      ? (wrapCtx?.paragraphMarkLineStartWidth ?? minLineStartWidth())
-      : minLineStartWidth(),
-  );
+  startLine(lineHeadRequirement());
 
-  iterateBreakOpportunities(operationState);
+  iterateBreakOpportunities(operationState, {
+    captureGapSnapshot: () => performCaptureGapSnapshot(operationState, false),
+    rejectGap: (rejection) => performRejectGap(operationState, rejection),
+  });
 
   if (breakerState.currentLine.length > 0) flush();
   // Trailing <w:br/>: emit the empty line it opened (§17.3.3.1).
   else if (breakerState.trailingBreakFontSize !== null) flush(breakerState.trailingBreakFontSize);
 
+  // Gap fragments on a physical baseline share the tallest line metrics. The
+  // next convergence pass probes every fragment with that same band, so a
+  // taller later gap cannot silently collide with a polygon above/below it.
+  for (let start = 0; start < breakerState.lines.length;) {
+    let end = start + 1;
+    const first = breakerState.lines[start];
+    while (end < breakerState.lines.length
+      && breakerState.lines[end].physicalLineIndex === first.physicalLineIndex) end += 1;
+    const last = breakerState.lines[end - 1];
+    // Metrics accumulate until horizontal continuation ends. Publish the final
+    // physical union, including object leading and position ownership, to all
+    // fragments; each segment is visited once, independent of gap count.
+    const { segments: _segments, xOffset: _x, availWidth: _width,
+      marginExtension: _extension, consumedEnd: _end, endsWithBreak: _break, ...metrics } = last;
+    let positionReference: number | undefined;
+    for (let index = start; index < end; index += 1) {
+      for (const segment of breakerState.lines[index].segments) {
+        if ('isTab' in segment) continue;
+        const position = 'text' in segment && segment.positionExtendsLineBox !== false
+          ? segment.position ?? 0 : 0;
+        positionReference = positionReference === undefined ? position
+          : positionReference === position ? positionReference : 0;
+      }
+    }
+    for (let index = start; index < end; index += 1) {
+      const line = breakerState.lines[index];
+      Object.assign(line, metrics);
+      line.endsWithBreak = last.endsWithBreak;
+      for (const segment of line.segments) {
+        if ('text' in segment) segment.lineRelativePosition =
+          wordUniformRunPositionPaintPt(segment.position ?? 0, positionReference ?? 0);
+      }
+    }
+    start = end;
+  }
   finalizeRetainedLineShapes(breakerState.lines, widthPolicy, measureText);
 
   return breakerState.lines;

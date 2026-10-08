@@ -7,7 +7,7 @@ import { bubblePointIsThreeD, effectiveMarkerSymbol, markerFillColorFor, markerF
 import { chartStyleEffectOwner, paintChartStyleEffects } from '../style-effects.js';
 import { chartStyleDirectFillDecision, chartStyleDirectLineDecision, chartStyleFillDecision, chartStyleLineDecision } from '../style-paint.js';
 import { axisLineWidthPx } from '../axis-style.js';
-import { resolveFill } from '../../shape/paint.js';
+import { resolveNativeFill as resolveFill } from '../../shape/paint.js';
 import { drawingmlLineDashArray } from '../../draw/dash.js';
 import { chartVariesColorsByPoint, legendEntryGlobalIndex, legendEntryRanges, legendIsCategoryDriven } from '../legend-entry-plan.js';
 import { classicDataPointFillDecision, classicDataPointLineStyle } from '../classic-data-point-style.js';

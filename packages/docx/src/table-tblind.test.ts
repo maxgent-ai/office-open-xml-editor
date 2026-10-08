@@ -220,6 +220,117 @@ describe('§17.4.50 tblInd — table indent from the leading margin', () => {
     },
   );
 
+  const autoWidthTable = (options: {
+    sideMarginPt: number;
+    indentPt: number;
+    gridPt: number;
+    compatibilityMode?: number;
+    text?: string;
+    preferredCell?: boolean;
+    justification?: 'left' | 'center' | 'right';
+  }) => {
+    const source = tableDoc(options.gridPt, options.indentPt, false);
+    const { widthPt: _preferred, ...sourceTable } = source.body[0] as DocTable;
+    const sourceRow = sourceTable.rows[0]!;
+    const { widthPt: _cellPreferred, ...sourceCell } = sourceRow.cells[0]!;
+    const cell = options.text === undefined
+      ? (options.preferredCell ? sourceRow.cells[0]! : sourceCell as DocTableCell)
+      : { ...sourceCell, content: [{ type: 'paragraph', ...bodyParagraph(options.text) }] } as DocTableCell;
+    const doc = {
+      ...source,
+      ...(options.compatibilityMode === undefined
+        ? {}
+        : { settings: { compatibilityMode: options.compatibilityMode } }),
+      section: { ...source.section, marginLeft: options.sideMarginPt, marginRight: options.sideMarginPt },
+      body: [{
+        ...sourceTable,
+        jc: options.justification ?? 'left',
+        cellMarginLeft: 5.4,
+        cellMarginRight: 5.4,
+        rows: [{ ...sourceRow, cells: [cell] }],
+      }],
+    } as DocxDocumentModel;
+    const recording = makeRecordingCanvas();
+    const services = createLayoutServices(doc, {
+      measureContext: recording.canvas.getContext('2d') as CanvasRenderingContext2D,
+    });
+    const retained = layoutDocument(doc, services, { currentDateMs: 0 }).pages[0]?.layers.body[0];
+    if (retained?.kind !== 'table') throw new Error('expected retained table geometry');
+    return retained.flowBounds;
+  };
+
+  it.each([
+    // Word controls (auto tblW, 5.4pt outer cell margins, 468pt page, saved
+    // grid past the band) scaled here to a 200pt page with a 210.8pt grid.
+    // Mode 14 (and an omitted mode) hangs both outer margins outside the
+    // band - tblInd text area; mode 15 keeps the table inside it.
+    ['zero side margins, mode 14, overflow the page', undefined, 0, 0, { xPt: 0, widthPt: 210.8 }],
+    ['a positive indent, mode 14', 14, 10, 20, { xPt: 30, widthPt: 170.8 }],
+    ['a negative indent, mode 14, crosses the page edge', 14, 10, -20, { xPt: -10, widthPt: 210.8 }],
+    ['zero side margins, mode 15', 15, 0, 0, { xPt: 0, widthPt: 200 }],
+    ['a positive indent, mode 15', 15, 10, 20, { xPt: 30, widthPt: 160 }],
+    ['a negative indent, mode 15, crosses the page edge', 15, 10, -20, { xPt: -10, widthPt: 200 }],
+  ] as const)(
+    'auto-width AutoFit: %s',
+    (_case, compatibilityMode, sideMarginPt, indentPt, expected) => {
+      const bounds = autoWidthTable({
+        sideMarginPt, indentPt, gridPt: 210.8,
+        ...(compatibilityMode === undefined ? {} : { compatibilityMode }),
+      });
+      // WORD_AUTOFIT_LEADING_INDENT_BAND: no physical page clamp.
+      expect(bounds.xPt).toBeCloseTo(expected.xPt, 6);
+      expect(bounds.widthPt).toBeCloseTo(expected.widthPt, 6);
+    },
+  );
+
+  it('applies the mode ceiling independently of cell preferences', () => {
+    // Cell preferences affect allocation, not the auto tblW occurrence limit.
+    // Word PDF clipping bounds and matching-font line partitions also confirm
+    // this for an all-dxa multirow table.
+    const bounds = autoWidthTable({
+      sideMarginPt: 10, indentPt: 5, gridPt: 190, compatibilityMode: 15,
+      preferredCell: true,
+    });
+    expect(bounds.widthPt).toBeCloseTo(175, 6);
+  });
+
+  it('preserves the established ceiling for an unmeasured compatibility mode', () => {
+    expect(autoWidthTable({
+      sideMarginPt: 10, indentPt: 5, gridPt: 190, compatibilityMode: 12,
+    }).widthPt).toBeCloseTo(190, 6);
+  });
+
+  it.each(['center', 'right'] as const)(
+    '%s auto-width limit retains the indent in mode 14 and uses the full band in mode 15',
+    (justification) => {
+      const common = { sideMarginPt: 10, indentPt: 5, gridPt: 175, justification, text: 'x'.repeat(100) };
+      expect(autoWidthTable({ ...common, compatibilityMode: 14 }).widthPt).toBeCloseTo(185.8, 6);
+      expect(autoWidthTable({ ...common, compatibilityMode: 15 }).widthPt).toBeCloseTo(180, 6);
+      // A wider grid separates the two mode-14 hypotheses, but no such Word
+      // control exists. Preserve the established result outside their common
+      // geometry instead of inferring a ceiling from these four controls.
+      expect(autoWidthTable({ ...common, gridPt: 190, compatibilityMode: 14 }).widthPt).toBeCloseTo(190, 6);
+      expect(autoWidthTable({ ...common, gridPt: 190, compatibilityMode: 15 }).widthPt).toBeCloseTo(190, 6);
+    },
+  );
+
+  it.each([
+    [14, 185.8],
+    [15, 175],
+  ] as const)(
+    'mode %s: an unpreferred content column grows past a saved grid at band - tblInd',
+    (compatibilityMode, expectedWidthPt) => {
+      // The Word gridmatch controls save a grid of exactly band - tblInd. A
+      // long first cell without tcW still fits to the mode's AutoFit ceiling.
+      const bounds = autoWidthTable({
+        sideMarginPt: 10, indentPt: 5, gridPt: 175, compatibilityMode,
+        text: Array.from({ length: 40 }, () => 'ab').join(' '),
+      });
+      expect(bounds.xPt).toBeCloseTo(15, 6);
+      expect(bounds.widthPt).toBeCloseTo(expectedWidthPt, 6);
+    },
+  );
+
   it('RTL (bidiVisual): negative tblInd pushes the RIGHT leading edge into the right margin', async () => {
     // No indent, bidiVisual, colW=160=content: table fills [20,180]; right edge 180.
     const noInd = makeRecordingCanvas();

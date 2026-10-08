@@ -133,11 +133,56 @@ describe('legacy float transport facts', () => {
     })).toThrow('Floating-table transport omitted tblOverlap');
   });
 
-  it('keeps a displaced anchor wrap band within the page-right boundary', () => {
+  it('keeps a displaced frame wrap band within the page-right boundary', () => {
     const st = makeState({
       pageWidth: 100,
       floats: [{
         kind: 'frame',
+        mode: 'square',
+        imageKey: 'blocker',
+        imageX: 0,
+        imageY: 0,
+        imageW: 50,
+        imageH: 50,
+        xLeft: 0,
+        xRight: 50,
+        yTop: 0,
+        yBottom: 50,
+        side: 'bothSides',
+        distLeft: 0,
+        distRight: 0,
+        distTop: 0,
+        distBottom: 0,
+        paraId: 1,
+      }],
+    });
+
+    const placed = pushFloatRect(st as never, {
+      x: 20,
+      y: 10,
+      w: 45,
+      h: 10,
+      dl: 0,
+      dr: 8,
+      dt: 0,
+      db: 0,
+      kind: 'frame',
+      mode: 'square',
+      side: 'bothSides',
+      imageKey: 'moving',
+      paraId: 2,
+      avoidOverlap: true,
+    });
+
+    expect(placed).toMatchObject({ imageX: 20, imageY: 50 });
+    expect(placed.xRight).toBeLessThanOrEqual(100.5);
+  });
+
+  it('keeps an overlap-permitted DrawingML anchor at its resolved position (issue #1623)', () => {
+    const st = makeState({
+      pageWidth: 100,
+      floats: [{
+        kind: 'shape',
         mode: 'square',
         imageKey: 'blocker',
         imageX: 0,
@@ -175,8 +220,7 @@ describe('legacy float transport facts', () => {
       avoidOverlap: true,
     });
 
-    expect(placed).toMatchObject({ imageX: 20, imageY: 50 });
-    expect(placed.xRight).toBeLessThanOrEqual(100.5);
+    expect(placed).toMatchObject({ imageX: 20, imageY: 10 });
   });
 });
 
@@ -215,12 +259,15 @@ describe('frame geometry (§17.3.1.11) — wrap modes', () => {
     }
   });
 
-  it('wrap="none" → no float registered (absolute draw only, no exclusion)', () => {
+  it('wrap="none" → topAndBottom float, as notBeside (§17.18.104: next line clear of the frame)', () => {
+    // ST_Wrap of w:framePr, not DrawingML wrapNone: text neither wraps
+    // beside nor overlaps the frame.
     const st = st0();
     const fp = dc('none');
     const b = box(fp, st, 200, 42, 50, 14);
     registerFloat(b, fp, st);
-    expect(st.floats).toHaveLength(0);
+    expect(st.floats).toHaveLength(1);
+    expect(st.floats[0].mode).toBe('topAndBottom');
   });
 });
 

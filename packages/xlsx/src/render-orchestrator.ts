@@ -51,13 +51,15 @@ import {
   HEADER_W,
   HEADER_H,
 } from './renderer.js';
-import { GridGeometry, type GridAxisGeometry } from './internal/grid-geometry.js';
-import { usesNativeOneCellExtent } from './internal/cell-anchor-geometry.js';
+import { GridGeometry } from './internal/grid-geometry.js';
+import type { CellAnchorSizeFacts } from './internal/cell-anchor-geometry.js';
+import { resolveWorksheetAnchorRect } from './internal/initial-anchor-sizes.js';
 import { rotatedImageBounds } from './internal/image-anchor-transform.js';
 import {
   clearOptionalImageUnavailable,
   markOptionalImageUnavailable,
 } from './internal/optional-image-fallback.js';
+import { getWorksheetPolicy } from './worksheet-policy-context.js';
 
 /** Internal viewer-to-renderer commit latch. It is intentionally not re-exported
  * from the package API: standalone renderer callers do not own viewer lifecycle. */
@@ -165,18 +167,7 @@ function setImageRef(refs: Map<string, ImageRef>, key: string, ref: ImageRef): v
   refs.set(key, prior ? mergeImageRef(prior, ref) : ref);
 }
 
-interface CellAnchorRange {
-  fromCol: number;
-  fromColOff: number;
-  fromRow: number;
-  fromRowOff: number;
-  toCol: number;
-  toColOff: number;
-  toRow: number;
-  toRowOff: number;
-  editAs?: string;
-  nativeExtCx?: number;
-  nativeExtCy?: number;
+interface CellAnchorRange extends CellAnchorSizeFacts {
   rotation?: number;
 }
 
@@ -188,17 +179,9 @@ function anchorDisplaySize(
 ): { width: number; height: number } | null {
   const axes = geometry ?? getGridGeometryForWorksheet(ws);
   const { col, row } = axes.axesAtScale(scale);
-  const marker = (axis: GridAxisGeometry, index: number, offset: number) =>
-    axis.offsetOf(index + 1) + (offset * scale) / EMU_PER_PX;
-  const fromX = marker(col, anchor.fromCol, anchor.fromColOff);
-  const fromY = marker(row, anchor.fromRow, anchor.fromRowOff);
-  const toX = usesNativeOneCellExtent(anchor)
-    ? fromX + ((anchor.nativeExtCx as number) * scale) / EMU_PER_PX
-    : marker(col, anchor.toCol, anchor.toColOff);
-  const toY = usesNativeOneCellExtent(anchor)
-    ? fromY + ((anchor.nativeExtCy as number) * scale) / EMU_PER_PX
-    : marker(row, anchor.toRow, anchor.toRowOff);
-  return toX > fromX && toY > fromY ? { width: toX - fromX, height: toY - fromY } : null;
+  // Decode sizing uses the same display rectangle as paint and hit-testing.
+  const rect = resolveWorksheetAnchorRect(ws, anchor, col, row, scale);
+  return rect.width > 0 && rect.height > 0 ? { width: rect.width, height: rect.height } : null;
 }
 
 function anchorMayIntersectViewport(
@@ -214,24 +197,18 @@ function anchorMayIntersectViewport(
     readonly freezeCols: number;
   },
 ): boolean {
-  if (!viewport) return true;
+  // Tagged acquisition facts share paint's validity policy even for a whole
+  // sheet preload. Preserve the historical eager preload for untagged models.
+  if (!viewport) return anchor.anchorTag === undefined
+    || anchorDisplaySize(anchor, ws, geometry, frame?.scale ?? 1) !== null;
   const axes = geometry ?? getGridGeometryForWorksheet(ws);
   const scale = frame?.scale ?? 1;
   const { col, row } = axes.axesAtScale(scale);
-  const marker = (axis: GridAxisGeometry, index: number, offset: number) =>
-    axis.offsetOf(index + 1) + (offset * scale) / EMU_PER_PX;
-  const fromX = marker(col, anchor.fromCol, anchor.fromColOff);
-  const fromY = marker(row, anchor.fromRow, anchor.fromRowOff);
-  const useNativeExtent = usesNativeOneCellExtent(anchor);
-  const toX = useNativeExtent
-    ? fromX + ((anchor.nativeExtCx as number) * scale) / EMU_PER_PX
-    : marker(col, anchor.toCol, anchor.toColOff);
-  const toY = useNativeExtent
-    ? fromY + ((anchor.nativeExtCy as number) * scale) / EMU_PER_PX
-    : marker(row, anchor.toRow, anchor.toRowOff);
-  if (toX <= fromX || toY <= fromY) return false;
+  // Culling uses the same display rectangle as paint (single resolver).
+  const rect = resolveWorksheetAnchorRect(ws, anchor, col, row, scale);
+  if (rect.width <= 0 || rect.height <= 0) return false;
   const bounds = rotatedImageBounds(
-    { x: fromX, y: fromY, width: toX - fromX, height: toY - fromY },
+    { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
     anchor.rotation,
   );
   const effectiveFreeze = frame
@@ -449,21 +426,27 @@ export async function prefetchImages(
         geometry,
         frame,
       )) continue;
+      const display = anchorDisplaySize(img, ws, geometry, opts?.cellScale ?? 1);
       // Key by (path + duotone colours) so a recoloured picture is looked up
       // separately from the raw blip (§20.1.8.23).
       setImageRef(refs, imageCacheKey(img.imagePath, img.duotone), {
         imagePath: img.imagePath,
         mimeType: img.mimeType,
         svgImagePath: img.svgImagePath,
-        // Saved EMU extent → pt sizes a metafile raster (0 ⇒ decoder fallback).
-        widthPt: img.nativeExtCx > 0 ? img.nativeExtCx / EMU_PER_PT : 0,
-        heightPt: img.nativeExtCy > 0 ? img.nativeExtCy / EMU_PER_PT : 0,
+        // Tagged placement and WMF/EMF raster preparation share the resolved
+        // display size, including a retained viewer reference. Untagged models
+        // preserve native sizing; decodeImageSource expands crop once.
+        widthPt: img.anchorTag !== undefined
+          ? (display?.width ?? 0) * (EMU_PER_PX / EMU_PER_PT)
+          : img.nativeExtCx > 0 ? img.nativeExtCx / EMU_PER_PT : 0,
+        heightPt: img.anchorTag !== undefined
+          ? (display?.height ?? 0) * (EMU_PER_PX / EMU_PER_PT)
+          : img.nativeExtCy > 0 ? img.nativeExtCy / EMU_PER_PT : 0,
         // An `<a:srcRect>` crop forces the raster decode (native pixel grid)
         // and, for a metafile, the full-frame raster size.
         srcRect: img.srcRect ?? null,
         duotone: img.duotone ?? null,
         ...(() => {
-          const display = anchorDisplaySize(img, ws, geometry, opts?.cellScale ?? 1);
           const target = display && opts?.effectiveDpr
             ? sourceRasterTargetSize(
                 display.width * opts.effectiveDpr,
@@ -487,19 +470,24 @@ export async function prefetchImages(
       )) continue;
       for (const shape of grp.shapes) {
         if (shape.geom.type === 'image') {
+          const display = anchorDisplaySize(grp, ws, geometry, opts?.cellScale ?? 1);
           setImageRef(refs, imageCacheKey(shape.geom.imagePath, shape.geom.duotone), {
             imagePath: shape.geom.imagePath,
             mimeType: shape.geom.mimeType,
             svgImagePath: shape.geom.svgImagePath,
-            // Group's saved EMU extent scaled by the leaf's normalized w/h → pt.
-            widthPt: grp.nativeExtCx > 0 ? (grp.nativeExtCx * shape.w) / EMU_PER_PT : 0,
-            heightPt: grp.nativeExtCy > 0 ? (grp.nativeExtCy * shape.h) / EMU_PER_PT : 0,
+            // Resolve the group's display extent, then apply the existing
+            // normalized leaf transform. Crop expansion remains in the decoder.
+            widthPt: grp.anchorTag !== undefined
+              ? (display?.width ?? 0) * shape.w * (EMU_PER_PX / EMU_PER_PT)
+              : grp.nativeExtCx > 0 ? (grp.nativeExtCx * shape.w) / EMU_PER_PT : 0,
+            heightPt: grp.anchorTag !== undefined
+              ? (display?.height ?? 0) * shape.h * (EMU_PER_PX / EMU_PER_PT)
+              : grp.nativeExtCy > 0 ? (grp.nativeExtCy * shape.h) / EMU_PER_PT : 0,
             // A crop forces the raster decode (native pixel grid for the crop)
             // and, for a metafile, the full-frame raster size.
             srcRect: shape.geom.srcRect ?? null,
             duotone: shape.geom.duotone ?? null,
             ...(() => {
-              const display = anchorDisplaySize(grp, ws, geometry, opts?.cellScale ?? 1);
               const target = display && opts?.effectiveDpr
                 ? sourceRasterTargetSize(
                     display.width * shape.w * opts.effectiveDpr,
@@ -761,7 +749,10 @@ export function worksheetWithAutoRowHeights(
 ): Worksheet {
   if (hasPreparedAutoRowHeights(source)) return source;
   const cached = autoHeightProjectionCache.get(source);
-  if (cached) return cached;
+  // Only reuse the projection if the source is still bound to the same policy
+  // it was built under. After an internal rebind, rebuild via
+  // inheritSheetRenderCache so the new limits are validated.
+  if (cached && getWorksheetPolicy(cached) === getWorksheetPolicy(source)) return cached;
   const projection: Worksheet = {
     ...source,
     rowHeights: { ...source.rowHeights },
