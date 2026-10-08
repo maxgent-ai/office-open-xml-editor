@@ -63,6 +63,8 @@ export type PptxWorkerRequest =
        *  region, and dropping it silently preloads the `jp` default while the
        *  renderer paints the resolved one. */
       cjkFallback: import('@silurus/ooxml-core').CjkLang;
+      /** Internal opt-in only; omission preserves ordinary parse payloads. */
+      collectFontDemand?: boolean;
       progressiveLayout?: boolean;
     }
   | ({

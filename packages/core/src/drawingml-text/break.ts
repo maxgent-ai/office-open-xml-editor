@@ -1,3 +1,4 @@
+import { FONT_SPACE_SENTINEL } from '../internal/font-measurement-sentinels.js';
 import { isCjkBreakChar } from '../text/cjk-ranges.js';
 import { DEFAULT_KINSOKU_RULES, kinsokuAdjustedSplit } from '../text/kinsoku/index.js';
 import { isUax14NoBreakPair, lineBreakClass } from '../text/line-break.js';
@@ -309,7 +310,7 @@ export function breakDrawingMlText<T>(
           // previous length. A tab's earlier resolved gap is not an input to
           // the next candidate's tab-stop resolution.
           seg.width = 0;
-          noStopGap = options.measureText(' ', seg.style);
+          noStopGap = options.measureText(FONT_SPACE_SENTINEL, seg.style);
         }
         return { isTab: seg.type === 'tab', width: seg.width };
       });
@@ -368,7 +369,7 @@ export function breakDrawingMlText<T>(
       /** min(tailSum[i..segment end]) for a stop i inside a text segment. */
       tailSuffixMin: Float64Array;
       tabsBefore: Int32Array;
-      /** Index into gapValues of each tab atom's no-stop gap (`measureText(' ')`). */
+      /** Index into gapValues of each tab atom's no-stop gap (`measureText(FONT_SPACE_SENTINEL)`). */
       tabGap: Int32Array;
       gapValues: number[];
     }
@@ -457,7 +458,7 @@ export function breakDrawingMlText<T>(
       for (let t = 0; t < end; t++) {
         const atom = atoms[t];
         if (atom.type !== 'tab' || (options.defaultTabSize ?? 0) > 0) continue;
-        const gap = options.measureText(' ', atom.style);
+        const gap = options.measureText(FONT_SPACE_SENTINEL, atom.style);
         let index = gapValues.indexOf(gap);
         if (index < 0) index = gapValues.push(gap) - 1;
         tabGap[t] = index;

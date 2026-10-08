@@ -1,3 +1,4 @@
+import { loadFontDemandCollector } from './font-demand-collector.js';
 import { resolveCjkFallback, type CjkLang } from '@silurus/ooxml-core';
 import type { DimOptions, PptxComment } from './types';
 import {
@@ -13,11 +14,11 @@ import {
   type SlidePartNames,
 } from './slide-nav';
 import {
-  preloadGoogleFonts,
+  GoogleFontPreloadLease,
+  type FontPreloadDemand,
   loadOfficeFontFallbacks,
   unloadOfficeFontFallbacks,
   releaseOwnedBitmap,
-  unloadGoogleFonts,
   unregisterEmbeddedFonts,
   WorkerBridge,
   defaultDpr,
@@ -267,7 +268,7 @@ export class PptxPresentation {
    *  its own FontFaceSet). Released in {@link destroy} so they do not leak into
    *  the shared FontFaceSet for the lifetime of the SPA (deduped + refcounted in
    *  core, so a web font shared with another open deck survives until both go). */
-  private _googleFontFaces: FontFace[] = [];
+  private _googleFonts: GoogleFontPreloadLease | null = null;
   private readonly _officeFontLoads = new Map<FontFaceSet, Map<string, Promise<LoadedOfficeFontFallbacks>>>();
   /** Embedded Font parts registered into the main-thread FontFaceSet. */
   private _embeddedFontFaces: FontFace[] = [];
@@ -440,12 +441,12 @@ export class PptxPresentation {
       );
       metrics.checkpoint('presentation preflight ready');
       if (mode === 'main' && opts.useGoogleFonts && pres._preflight && !progressive) {
-        pres._googleFontFaces = await preloadGoogleFonts(
+        await pres._ensureGoogleFonts(
           excludeEmbeddedFontFamilies(
             pres._preflight.fontPreloadNames,
             pres._embeddedFontAliases,
           ),
-          PPTX_GOOGLE_FONTS,
+          pres._preflight.fontPreloadDemand,
         );
       }
       metrics.succeed({ slides: pres.slideCount });
@@ -459,6 +460,13 @@ export class PptxPresentation {
       metrics.fail(error);
       throw error;
     }
+  }
+
+  /** One owner covers ordinary, progressive and selected-source Window load. */
+  private async _ensureGoogleFonts(names: Iterable<string | null | undefined>, demand?: FontPreloadDemand): Promise<void> {
+    if (this._destroyed) return;
+    this._googleFonts ??= new GoogleFontPreloadLease(PPTX_GOOGLE_FONTS);
+    await this._googleFonts.ensure(names, demand);
   }
 
   private async _parse(
@@ -478,7 +486,7 @@ export class PptxPresentation {
         );
       } else {
         await this._parseMainProgressively(
-          buffer, resourcePolicy, useGoogleFonts, timeoutMs, onUsage, progressive,
+          buffer, resourcePolicy, useGoogleFonts, timeoutMs, onUsage, progressive, useGoogleFonts && !renderers,
         );
       }
       return;
@@ -487,7 +495,7 @@ export class PptxPresentation {
       (id) =>
         this._mode === 'worker'
           ? ({ kind: 'parse', id, buffer, resourcePolicy, useGoogleFonts, cjkFallback: this._cjkFallback, renderers } satisfies RenderWorkerRequest)
-          : ({ kind: 'parse', id, buffer, resourcePolicy, cjkFallback: this._cjkFallback } satisfies PptxWorkerRequest),
+          : ({ kind: 'parse', id, buffer, resourcePolicy, cjkFallback: this._cjkFallback, ...(useGoogleFonts && !renderers ? { collectFontDemand: true } : {}) } satisfies PptxWorkerRequest),
       [buffer],
       { timeoutMs },
     );
@@ -580,6 +588,7 @@ export class PptxPresentation {
     timeoutMs: number | undefined,
     onUsage: ((usage: import('@silurus/ooxml-core').OoxmlResourceUsageSnapshot) => void) | undefined,
     progressive: ProgressiveLoad,
+    collectFontDemand = useGoogleFonts,
   ): Promise<void> {
     const response = await this._bridge.request(
       // The region is inert on this path — a progressive main-mode load builds
@@ -619,18 +628,14 @@ export class PptxPresentation {
         return slide;
       },
     });
-    const builder = new PresentationPreflightBuilder(bootstrap, { cjkFallback: this._cjkFallback });
-    const loadedGoogleFonts = new Set<string>();
+    const builder = new PresentationPreflightBuilder(bootstrap, { cjkFallback: this._cjkFallback, collectFontDemand: collectFontDemand ? await loadFontDemandCollector(true) : undefined });
     const ensureFonts = async (): Promise<void> => {
       await embeddedFontLoad;
       if (!useGoogleFonts) return;
-      const requested = excludeEmbeddedFontFamilies(
-        builder.currentFontPreloadNames,
-        this._embeddedFontAliases,
-      ).filter((name): name is string => !!name && !loadedGoogleFonts.has(name));
-      if (requested.length === 0) return;
-      for (const name of requested) loadedGoogleFonts.add(name);
-      this._googleFontFaces.push(...await preloadGoogleFonts(requested, PPTX_GOOGLE_FONTS));
+      await this._ensureGoogleFonts(
+        excludeEmbeddedFontFamilies(builder.currentFontPreloadNames, this._embeddedFontAliases),
+        builder.currentFontPreloadDemandDelta,
+      );
     };
     const full = (async () => {
       for (let slideIndex = 0; slideIndex < bootstrap.slideCount; slideIndex += 1) {
@@ -1493,10 +1498,8 @@ export class PptxPresentation {
     // FontFaceSet (main mode). Refcounted in core: a web font also used by another
     // open deck stays until that one is destroyed too. Without this, every opened
     // deck left its Google FontFace objects in `document.fonts` forever (SPA leak).
-    if (this._googleFontFaces.length > 0) {
-      unloadGoogleFonts(this._googleFontFaces);
-      this._googleFontFaces = [];
-    }
+    this._googleFonts?.release();
+    this._googleFonts = null;
     for (const loads of this._officeFontLoads.values()) {
       for (const pending of loads.values()) {
         void pending.then((loaded) => unloadOfficeFontFallbacks(loaded.faces));

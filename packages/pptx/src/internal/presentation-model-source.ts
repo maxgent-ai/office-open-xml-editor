@@ -1,6 +1,6 @@
 import {
   resolveCjkFallback,
-  preloadGoogleFonts,
+  type FontPreloadDemand,
   workerRendererDescriptors,
   type AdmittedModelSourceLoad,
   type CjkLang,
@@ -14,7 +14,6 @@ import {
 } from '@silurus/ooxml-core/worker';
 import { selectModelSource, beginModelSourceLoad } from '@silurus/ooxml-core/internal/model-source';
 import { excludeEmbeddedFontFamilies } from '../embedded-fonts.js';
-import { PPTX_GOOGLE_FONTS } from '../google-fonts.js';
 import { PptxPresentation, type LoadOptions } from '../presentation.js';
 
 type MutablePresentation = {
@@ -26,9 +25,9 @@ type MutablePresentation = {
   _chartEx: LoadOptions['chartEx'];
   _tiff: LoadOptions['tiff'];
   _googleSubstitutes: boolean;
-  _preflight: { fontPreloadNames: string[] } | null;
+  _preflight: { fontPreloadNames: readonly (string | null)[]; fontPreloadDemand?: FontPreloadDemand } | null;
   _embeddedFontAliases: ReadonlyMap<string, string>;
-  _googleFontFaces: FontFace[];
+  _ensureGoogleFonts: (names: Iterable<string | null | undefined>, demand?: FontPreloadDemand) => Promise<void>;
   _parse: (
     buffer: ArrayBuffer,
     resourcePolicy: NormalizedOoxmlResourcePolicy,
@@ -106,9 +105,9 @@ export async function loadPptxModelSource(
         );
         metrics.checkpoint('presentation preflight ready');
         if (mode === 'main' && opts.useGoogleFonts && state._preflight && !progressive) {
-          state._googleFontFaces = await preloadGoogleFonts(
+          await state._ensureGoogleFonts(
             excludeEmbeddedFontFamilies(state._preflight.fontPreloadNames, state._embeddedFontAliases),
-            PPTX_GOOGLE_FONTS,
+            state._preflight.fontPreloadDemand,
           );
         }
         metrics.succeed({ slides: presentation.slideCount });

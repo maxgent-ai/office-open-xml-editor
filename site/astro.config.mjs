@@ -23,6 +23,9 @@ export default defineConfig({
     worker: {
       format: 'es',
       plugins: () => [wasm()],
+      // Inline parser workers run from Blob URLs and cannot resolve relative
+      // sibling chunks. Keep dynamic analysis within the emitted worker module.
+      rollupOptions: { output: { inlineDynamicImports: true } },
     },
     resolve: {
       // Pull the workspace packages from source so Vite processes their

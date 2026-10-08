@@ -1,7 +1,7 @@
+import { _resetCssCacheForTests } from '../../core/src/fonts/preload.js';
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import {
   WorkerBridge,
-  preloadGoogleFonts,
   registerEmbeddedFonts,
   type ModelSource,
   type WorkerLike,
@@ -54,6 +54,7 @@ const ORIG_FONTS = {
   location: G.location,
 };
 afterEach(() => {
+  _resetCssCacheForTests();
   G.document = ORIG_FONTS.document;
   G.self = ORIG_FONTS.self;
   G.fetch = ORIG_FONTS.fetch;
@@ -337,15 +338,12 @@ describe('PptxPresentation.destroy() — rejects in-flight worker requests', () 
   // core, hand it to the deck, then assert destroy() removes it and clears the array.
   it('destroy() releases the deck’s Google fonts from the FontFaceSet', async () => {
     const { added } = installFontFaceSet();
-    const held = await preloadGoogleFonts(['Calibri'], MAP);
-    expect(added).toHaveLength(1); // the web font is in the shared set
-
     const { pres } = makePresentation();
-    (pres as unknown as { _googleFontFaces: FontFace[] })._googleFontFaces = held;
+    await (pres as unknown as { _ensureGoogleFonts(names: string[]): Promise<void> })._ensureGoogleFonts(['Calibri']);
+    expect(added).toHaveLength(1);
     pres.destroy();
+    expect(added).toHaveLength(0);
 
-    expect(added).toHaveLength(0); // face left the set
-    expect((pres as unknown as { _googleFontFaces: FontFace[] })._googleFontFaces).toHaveLength(0);
   });
 
   it('destroy() releases the deck’s embedded fonts from the FontFaceSet', async () => {
@@ -366,4 +364,41 @@ describe('PptxPresentation.destroy() — rejects in-flight worker requests', () 
     expect(added).toHaveLength(0);
     expect((pres as unknown as { _embeddedFontFaces: FontFace[] })._embeddedFontFaces).toHaveLength(0);
   });
+});
+
+
+it.each(['ordinary', 'selected-source'] as const)('filters ordinary Window preload and releases its retained rules (%s)', async (variant) => {
+  G.Worker = SilentWorker;
+  G.location = { href: 'http://localhost/' };
+  const { added } = installFontFaceSet();
+  G.fetch = vi.fn(async () => ({ ok: true, text: async () => `
+    @font-face { font-family: Carlito; src: url(b.woff2); unicode-range: U+0042; }
+    @font-face { font-family: Carlito; src: url(a.woff2); unicode-range: U+0041; }
+  ` }));
+  const loads: string[] = [];
+  G.FontFace = class {
+    constructor(public family: string, public source: string) {}
+    load() { loads.push(this.source); return Promise.resolve(this); }
+  };
+  vi.spyOn(PptxPresentation.prototype as unknown as {
+    _parse(buffer: ArrayBuffer, resourcePolicy: object): Promise<void>;
+  }, '_parse').mockImplementationOnce(async function (this: PptxPresentation) {
+    (this as unknown as { _preflight: object })._preflight = {
+      slideCount: 0, slideWidth: 914400, slideHeight: 914400,
+      defaultTextColor: null, majorFont: 'Calibri', minorFont: null,
+      hlinkColor: null, folHlinkColor: null, embeddedFonts: [], slides: [],
+      fontPreloadNames: ['Calibri'], fontPreloadDemand: [65],
+    };
+  });
+  const source: ModelSource<'pptx'> = { target: 'pptx', claim: () => true, beginLoad: () => ({
+    module: { protocol: 'ooxml-model-source-module/v1', target: 'pptx', moduleUrl: 'https://example.test/source.mjs', config: {} },
+    release: () => undefined,
+  }) };
+  const presentation = await PptxPresentation.load(new ArrayBuffer(0), { useGoogleFonts: true,
+    ...(variant === 'selected-source' ? { modelSources: [source] } : {}),
+  });
+  expect(added).toHaveLength(2);
+  expect(loads).toEqual([expect.stringContaining('a.woff2')]);
+  presentation.destroy();
+  expect(added).toHaveLength(0);
 });

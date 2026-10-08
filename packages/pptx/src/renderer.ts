@@ -1,3 +1,5 @@
+import { FONT_TRACKING_SENTINEL, FONT_BASELINE_SENTINEL, FONT_SPACE_SENTINEL } from '@silurus/ooxml-core/internal/font-measurement-sentinels';
+import { preparedPowerPointText } from './font-display-text.js';
 import { pptxSlideCjkFallback } from './google-fonts.js';
 import type { CjkLang } from '@silurus/ooxml-core';
 import { containsHanScript } from '@silurus/ooxml-core/internal/script-preload-accumulator';
@@ -1481,9 +1483,9 @@ function hasNativeLetterSpacing(ctx: CanvasRenderingContext2D): boolean {
   let supported = false;
   try {
     spacingCtx.letterSpacing = '0px';
-    const natural = ctx.measureText('ii').width;
+    const natural = ctx.measureText(FONT_TRACKING_SENTINEL).width;
     spacingCtx.letterSpacing = '1px';
-    const tracked = ctx.measureText('ii').width;
+    const tracked = ctx.measureText(FONT_TRACKING_SENTINEL).width;
     supported = Number.isFinite(natural) && Number.isFinite(tracked) && tracked !== natural;
   } catch {
     supported = false;
@@ -1556,8 +1558,7 @@ export function paragraphInputRuns(
   // phase stays linear in the paragraph length however the runs are cut.
   const runTexts = para.runs.map((run) => {
     if (run.type !== 'text') return null;
-    const text = run.fieldType === 'slidenum' && slideNumber !== undefined ? String(slideNumber) : run.text;
-    return run.caps === 'all' || run.caps === 'small' ? text.toUpperCase() : text;
+    return preparedPowerPointText(run, slideNumber);
   });
   const runStarts: number[] = [];
   let joinedText = '';
@@ -4840,7 +4841,7 @@ export function renderTextBody(
         if (!seg.math) {
           if (isSpAutoFit) {
             ctx.font = seg.font;
-            const metrics = ctx.measureText(seg.text || 'M');
+            const metrics = ctx.measureText(seg.text || FONT_BASELINE_SENTINEL);
             const fontAscent = metrics.fontBoundingBoxAscent ?? 0;
             const fontDescent = metrics.fontBoundingBoxDescent ?? 0;
             const resolved = fontAscent + fontDescent;
@@ -4861,7 +4862,7 @@ export function renderTextBody(
       // Bullet font size also counts
       if (isFirst && bulletLabel) {
         ctx.font = bulletFont;
-        const bm = ctx.measureText('M');
+        const bm = ctx.measureText(FONT_BASELINE_SENTINEL);
         const bSizeApprox = bm.actualBoundingBoxAscent + bm.actualBoundingBoxDescent;
         if (bSizeApprox > maxSizePx) maxSizePx = bSizeApprox;
       }
@@ -5239,7 +5240,7 @@ export function renderTextBody(
       const limitPx = textMaxW + marLPxE + marRPxE;
       const tabFontSeg = line.segments.find((seg) => seg.isTab) as LayoutSegment;
       ctx.font = tabFontSeg.font;
-      const spaceW = ctx.measureText(' ').width;
+      const spaceW = ctx.measureText(FONT_SPACE_SENTINEL).width;
       const items = line.segments.map((seg) => {
         if (seg.isTab) return { isTab: true, width: 0 };
         if (seg.math) return { isTab: false, width: seg.math.width };
@@ -5285,7 +5286,7 @@ export function renderTextBody(
         continue;
       }
       ctx.font = seg.font;
-      const m = ctx.measureText(seg.text || 'M');
+      const m = ctx.measureText(seg.text || FONT_BASELINE_SENTINEL);
       const ls = seg.letterSpacingPx ?? 0;
       lineWidth += seg.leadingLetterSpacingPx ?? 0;
       lineWidth += seg.text ? measureTextAdvance(ctx, seg.text, ls) : 0;
