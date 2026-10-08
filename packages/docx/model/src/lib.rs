@@ -28,6 +28,18 @@ pub const PARSE_DIAGNOSTIC_SEVERITY_INVALID_DRAWING_EXTENT: DiagnosticSeverity =
     DiagnosticSeverity::Error;
 pub const PARSE_DIAGNOSTIC_SEVERITY_DEGENERATE_DRAWING_EXTENT: DiagnosticSeverity =
     DiagnosticSeverity::Warning;
+/// Native DOC nested-cell paragraph frames kept as `framePr` facts while the
+/// shared consumer lays their tables out in ordinary cell flow. Word's native
+/// DOC positioning of such frames is not established; this is a library
+/// fallback, reported rather than silent.
+pub const PARSE_DIAGNOSTIC_CODE_NATIVE_DOC_NESTED_CELL_FRAME_FLOW: &str =
+    "NATIVE_DOC_NESTED_CELL_FRAME_FLOW";
+pub const PARSE_DIAGNOSTIC_SEVERITY_NATIVE_DOC_NESTED_CELL_FRAME_FLOW: DiagnosticSeverity =
+    DiagnosticSeverity::Warning;
+/// Source part of a code-specific fact: the [MS-DOC] main stream of a native
+/// Word binary. A code without its own part constant is a WordprocessingML
+/// `word/document.xml` fact; layout accepts each code only from its own part.
+pub const PARSE_DIAGNOSTIC_PART_NATIVE_DOC_NESTED_CELL_FRAME_FLOW: &str = "WordDocument";
 
 /// Private parser-to-layout diagnostic severity. This wire is intentionally
 /// smaller than the public document model: diagnostics carry stable facts and

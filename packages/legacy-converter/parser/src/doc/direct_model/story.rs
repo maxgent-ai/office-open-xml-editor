@@ -169,13 +169,23 @@ pub(super) fn project(
                     })
                 {
                     // MS-DOC 2.4.3 frame identity still segments native rows.
-                    // Preserve that identity and the representable framePr:
-                    // the shared consumer's WORD_CELL_OWNER_ROW_CONTEXT keeps
-                    // cell-owned tables as ordinary cell content. This bounded
-                    // library projection does not synthesize tblpPr or claim a
-                    // native Word positioning rule; its compatibility evidence
-                    // is recorded in docx/layout/table-compatibility.ts.
+                    // Preserve that identity and the representable framePr;
+                    // the shared consumer keeps cell-owned tables as ordinary
+                    // cell content. That consumer rule
+                    // (WORD_CELL_OWNER_ROW_CONTEXT, docx/layout/
+                    // table-compatibility.ts) was observed only for WML/DOCX
+                    // sources, where Word dropped such frames. Word's
+                    // placement of a native DOC nested-cell frame is not
+                    // established, so ordinary cell flow here is a bounded
+                    // library projection: it synthesizes no tblpPr and claims
+                    // no native Word positioning rule. The final retained
+                    // body reports this limitation once per owning root
+                    // table, after discarded continuation content is gone.
                 } else {
+                    // Any other framed table paragraph has no consumer that
+                    // places it as Word does: a root cell frame that does not
+                    // mirror its row position, a frame outside the main story,
+                    // or one outside the bounded nested-cell class above.
                     formatting.unsupported_paragraph_properties = true;
                 }
             }

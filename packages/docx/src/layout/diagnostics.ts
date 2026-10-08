@@ -13,38 +13,61 @@ export interface ParseDiagnosticWire {
 
 interface ParseDiagnosticContractEntry {
   readonly severity: ParseDiagnosticWire['severity'];
+  /** The one source part that may carry this code, compared exactly. */
+  readonly part: string;
   readonly layoutCode: LayoutDiagnosticCode;
   readonly message: string;
 }
 
-/** Private cross-language contract. The Rust constants in parser/src/types.rs
- * are compared with these keys by diagnostics.test.ts so a new emitter code
- * cannot silently disappear in a newer parser/older renderer mismatch. */
+const WORDPROCESSINGML_DOCUMENT_PART = 'word/document.xml';
+/** [MS-DOC] main stream of a native Word binary (legacy-converter producer). */
+const NATIVE_DOC_MAIN_STREAM = 'WordDocument';
+
+/** Private cross-language contract. The Rust constants in model/src/lib.rs
+ * are compared with these keys, severities and parts by diagnostics.test.ts so
+ * a new emitter code cannot silently disappear in a newer parser/older
+ * renderer mismatch. Each code is accepted only from its own part, so a
+ * WordprocessingML fact and a native DOC fact cannot claim each other. */
 export const PARSER_DIAGNOSTIC_CONTRACT = Object.freeze({
   UNSUPPORTED_TEXT_EFFECT: Object.freeze({
     severity: 'warning',
+    part: WORDPROCESSINGML_DOCUMENT_PART,
     layoutCode: 'UNSUPPORTED_FEATURE',
     message: 'WordprocessingML text effects are not rendered',
   }),
   INVALID_TEXT_EFFECT_VALUE: Object.freeze({
     severity: 'warning',
+    part: WORDPROCESSINGML_DOCUMENT_PART,
     layoutCode: 'INVALID_VALUE',
     message: 'An invalid WordprocessingML text-effect value was ignored',
   }),
   MISSING_DRAWING_EXTENT: Object.freeze({
     severity: 'error',
+    part: WORDPROCESSINGML_DOCUMENT_PART,
     layoutCode: 'INVALID_GEOMETRY',
     message: 'A drawing with a missing required extent was omitted',
   }),
   INVALID_DRAWING_EXTENT: Object.freeze({
     severity: 'error',
+    part: WORDPROCESSINGML_DOCUMENT_PART,
     layoutCode: 'INVALID_GEOMETRY',
     message: 'A drawing with an invalid extent was omitted',
   }),
   DEGENERATE_DRAWING_EXTENT: Object.freeze({
     severity: 'warning',
+    part: WORDPROCESSINGML_DOCUMENT_PART,
     layoutCode: 'INVALID_GEOMETRY',
     message: 'A drawing has a schema-valid zero-area extent',
+  }),
+  // Retained framePr facts of native DOC nested-cell paragraphs; the shared
+  // consumer keeps cell-owned tables in ordinary cell flow (table-owner-runs.ts
+  // tableRowsElectCarriers), whose Word evidence covers WML/DOCX sources only.
+  // No native DOC positioning rule is implemented or claimed.
+  NATIVE_DOC_NESTED_CELL_FRAME_FLOW: Object.freeze({
+    severity: 'warning',
+    part: NATIVE_DOC_MAIN_STREAM,
+    layoutCode: 'UNSUPPORTED_FEATURE',
+    message: 'Native DOC nested-cell paragraph frames are retained but laid out in ordinary cell flow; Word frame positioning is not implemented',
   }),
 } satisfies Readonly<Record<string, ParseDiagnosticContractEntry>>);
 
@@ -95,14 +118,13 @@ export function mapParseDiagnostics(
     if (!isRecord(candidate)
       || typeof candidate.code !== 'string'
       || !Object.hasOwn(PARSER_DIAGNOSTIC_CONTRACT, candidate.code)
-      || candidate.part !== 'word/document.xml'
       || !validPath(candidate.path, bodyLength)) {
       mismatch = true;
       continue;
     }
     const code = candidate.code as KnownParseDiagnosticCode;
-    const contract = PARSER_DIAGNOSTIC_CONTRACT[code];
-    if (candidate.severity !== contract.severity) {
+    const contract: ParseDiagnosticContractEntry = PARSER_DIAGNOSTIC_CONTRACT[code];
+    if (candidate.part !== contract.part || candidate.severity !== contract.severity) {
       mismatch = true;
       continue;
     }

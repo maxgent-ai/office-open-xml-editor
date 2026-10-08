@@ -17,12 +17,26 @@ const wire = (
   code: string,
   severity: ParseDiagnosticWire['severity'],
   path: readonly number[],
+  part = 'word/document.xml',
 ): ParseDiagnosticWire => ({
   code,
   severity,
-  part: 'word/document.xml',
+  part,
   path,
 });
+
+const CONTRACT_MISMATCH = {
+  code: 'INVALID_VALUE',
+  severity: 'warning',
+  message: 'The parser diagnostic contract did not match this renderer build',
+} as const;
+
+const NATIVE_DOC_FRAME_FLOW = {
+  code: 'UNSUPPORTED_FEATURE',
+  severity: 'warning',
+  source: { story: 'body', storyInstance: 'body', path: [0] },
+  message: 'Native DOC nested-cell paragraph frames are retained but laid out in ordinary cell flow; Word frame positioning is not implemented',
+} as const;
 
 const section: SectionProps = {
   pageWidth: 200,
@@ -139,6 +153,23 @@ describe('private parser diagnostic mapping', () => {
     }]);
   });
 
+  it('accepts the native DOC frame-flow fact only from the exact WordDocument part', () => {
+    expect(mapParseDiagnostics([
+      wire('NATIVE_DOC_NESTED_CELL_FRAME_FLOW', 'warning', [0], 'WordDocument'),
+    ], 1)).toEqual([NATIVE_DOC_FRAME_FLOW]);
+
+    // Each code is bound to one exact part: neither source format can claim
+    // the other's fact, and no near-miss part or severity is normalized.
+    for (const candidate of [
+      wire('NATIVE_DOC_NESTED_CELL_FRAME_FLOW', 'warning', [0]),
+      wire('NATIVE_DOC_NESTED_CELL_FRAME_FLOW', 'warning', [0], 'worddocument'),
+      wire('NATIVE_DOC_NESTED_CELL_FRAME_FLOW', 'error', [0], 'WordDocument'),
+      wire('UNSUPPORTED_TEXT_EFFECT', 'warning', [0], 'WordDocument'),
+    ]) {
+      expect(mapParseDiagnostics([candidate], 1)).toEqual([CONTRACT_MISMATCH]);
+    }
+  });
+
   it('preserves validated nested numeric source coordinates', () => {
     expect(mapParseDiagnostics([
       wire('UNSUPPORTED_TEXT_EFFECT', 'warning', [0, 3, 2]),
@@ -168,6 +199,33 @@ describe('private parser diagnostic mapping', () => {
       Object.entries(PARSER_DIAGNOSTIC_CONTRACT)
         .map(([code, contract]) => [code, contract.severity]),
     ));
+
+    // A code without its own Rust part constant is a WordprocessingML
+    // document-part fact (parser/src/parser.rs DOCUMENT_PART).
+    const rustParts: Record<string, string> = Object.fromEntries(
+      [...rustDiagnosticTypes.matchAll(
+        /pub const PARSE_DIAGNOSTIC_PART_([A-Z_]+):\s*&str\s*=\s*"([^"]+)";/g,
+      )].map((match) => [match[1]!, match[2]!]),
+    );
+    expect(Object.keys(rustParts).every((code) =>
+      Object.hasOwn(PARSER_DIAGNOSTIC_CONTRACT, code))).toBe(true);
+    expect(Object.fromEntries(
+      Object.entries(PARSER_DIAGNOSTIC_CONTRACT)
+        .map(([code, contract]) => [code, (contract as { part?: unknown }).part]),
+    )).toEqual(Object.fromEntries(
+      Object.keys(PARSER_DIAGNOSTIC_CONTRACT)
+        .map((code) => [code, rustParts[code] ?? 'word/document.xml']),
+    ));
+  });
+
+  it('attaches the native DOC frame-flow warning to the final production layout', () => {
+    const model = document([
+      wire('NATIVE_DOC_NESTED_CELL_FRAME_FLOW', 'warning', [0], 'WordDocument'),
+    ]);
+    const services = createLayoutServices(model, { measureContext: measureContext() });
+
+    expect(layoutDocument(model, services, { currentDateMs: 0 }).diagnostics)
+      .toEqual([NATIVE_DOC_FRAME_FLOW]);
   });
 
   it('crosses acquisition once and freezes the final layout diagnostic graph', () => {

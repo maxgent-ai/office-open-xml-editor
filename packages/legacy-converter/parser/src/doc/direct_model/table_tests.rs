@@ -1485,14 +1485,17 @@ fn whole_model_keeps_refusing_framed_unpositioned_cell_paragraphs() {
     }
 }
 
+/// A depth-2 cell paragraph PAPX with the given frame SPRMs. An explicit
+/// unlocked anchor keeps the fixture's PAPX grpprl length odd.
+fn nested_frame_cell(frame: Vec<u8>) -> Vec<u8> {
+    let mut properties = [nested_cell(), frame].concat();
+    if properties.len() % 2 == 0 {
+        properties.extend(sprm(0x2430, &[0], false));
+    }
+    properties
+}
+
 fn nested_frame_source(first: Vec<u8>, second: Vec<u8>) -> Vec<u8> {
-    let properties = |frame: Vec<u8>| {
-        let mut properties = [nested_cell(), frame].concat();
-        if properties.len() % 2 == 0 {
-            properties.extend(sprm(0x2430, &[0], false));
-        }
-        properties
-    };
     let text = "n\r\rm\r\rx\u{7}\u{7}\r";
     let units = text.encode_utf16().count();
     let source = source_with_typography(
@@ -1506,9 +1509,9 @@ fn nested_frame_source(first: Vec<u8>, second: Vec<u8>) -> Vec<u8> {
     with_papx(
         &source,
         &[
-            (0, 2, properties(first)),
+            (0, 2, nested_frame_cell(first)),
             (2, 3, nested_row(500)),
-            (3, 5, properties(second)),
+            (3, 5, nested_frame_cell(second)),
             (5, 6, nested_row(500)),
             (6, 8, cell()),
             (8, 9, row(1000)),
@@ -1595,4 +1598,172 @@ fn nested_cell_frames_keep_source_facts_and_native_row_identity() {
     let root_frame = [nested_owner_frame(-4), sprm(0x2430, &[0], false)].concat();
     let root = two_row_source(root_frame.clone(), root_frame);
     assert!(super::super::direct_model(&CompoundFile::open(&root).unwrap(), 1_000_000).is_err());
+}
+
+/// Two root tables separated by a body paragraph. Each root's outer cell opens
+/// with a one-row nested table whose cell paragraph carries `first` or
+/// `second` frame SPRMs (empty: unframed).
+/// CPs: root 1 inner cell 0..2, inner TTP 2..3, outer cell 3..5, outer TTP
+/// 5..6; body paragraph 6..8; root 2 inner cell 8..10, inner TTP 10..11,
+/// outer cell 11..13, outer TTP 13..14; final paragraph 14..15.
+fn two_root_nested_frame_source(first: Vec<u8>, second: Vec<u8>) -> Vec<u8> {
+    let text = "n\r\rx\u{7}\u{7}s\rm\r\ry\u{7}\u{7}\r";
+    let units = text.encode_utf16().count();
+    let source = source_with_typography(
+        text,
+        &[(units, 2, 12240, 15840, 1, 720)],
+        None,
+        None,
+        None,
+        None,
+    );
+    with_papx(
+        &source,
+        &[
+            (0, 2, nested_frame_cell(first)),
+            (2, 3, nested_row(500)),
+            (3, 5, cell()),
+            (5, 6, row(1000)),
+            (6, 8, Vec::new()),
+            (8, 10, nested_frame_cell(second)),
+            (10, 11, nested_row(500)),
+            (11, 13, cell()),
+            (13, 14, row(1000)),
+            (14, units, Vec::new()),
+        ],
+    )
+}
+
+#[test]
+fn nested_cell_frame_flow_warning_names_each_root_body_element_once() {
+    // The private parser/layout wire is the contract: a fixed code, the
+    // native WordDocument stream as part and the final root body index only.
+    let warning = |index: usize| {
+        serde_json::json!({
+            "code": "NATIVE_DOC_NESTED_CELL_FRAME_FLOW",
+            "severity": "warning",
+            "part": "WordDocument",
+            "path": [index],
+        })
+    };
+    let model = |bytes: &[u8]| {
+        let result = super::super::direct_model(&CompoundFile::open(bytes).unwrap(), 1_000_000)
+            .expect("admitted native model");
+        let json = serde_json::to_value(&result.document).unwrap();
+        (result.document, json)
+    };
+    let diagnostics =
+        |json: &serde_json::Value| json.get("diagnostics").cloned().unwrap_or_default();
+
+    // Two framed paragraphs under one root, as one nested table of equal row
+    // identity or as two one-row nested tables: one fact for that root.
+    for second in [-4, 1441] {
+        let (_, json) = model(&nested_frame_source(
+            nested_owner_frame(-4),
+            nested_owner_frame(second),
+        ));
+        assert_eq!(diagnostics(&json), serde_json::json!([warning(0)]));
+    }
+
+    // Each root table is named by its own final body index.
+    let (document, json) = model(&two_root_nested_frame_source(
+        nested_owner_frame(-4),
+        nested_owner_frame(-4),
+    ));
+    assert!(matches!(
+        document.body[..],
+        [
+            BodyElement::Table(_),
+            BodyElement::Paragraph(_),
+            BodyElement::Table(_),
+            ..
+        ]
+    ));
+    assert_eq!(
+        diagnostics(&json),
+        serde_json::json!([warning(0), warning(2)])
+    );
+    let (_, json) = model(&two_root_nested_frame_source(
+        Vec::new(),
+        nested_owner_frame(-4),
+    ));
+    assert_eq!(diagnostics(&json), serde_json::json!([warning(2)]));
+
+    // Unframed nested tables emit nothing and keep the serialized model free
+    // of the private diagnostics member.
+    let (_, json) = model(&nested_frame_source(Vec::new(), Vec::new()));
+    assert!(json.get("diagnostics").is_none());
+
+    // A root cell frame mirroring its own table position is carried by the
+    // positioned table (story.rs), not retained as a cell fact: no warning.
+    // CPs: cell 0..2, TTP 2..3, final paragraph 3..4.
+    let text = "a\u{7}\u{7}\r";
+    let units = text.encode_utf16().count();
+    let source = source_with_typography(
+        text,
+        &[(units, 2, 12240, 15840, 1, 720)],
+        None,
+        None,
+        None,
+        None,
+    );
+    let mirrored = with_papx(
+        &source,
+        &[
+            (
+                0,
+                2,
+                [
+                    cell(),
+                    sprm(0x261b, &[0x60], false),
+                    sprm(0x8419, &159i16.to_le_bytes(), false),
+                    sprm(0x2423, &[2], false),
+                ]
+                .concat(),
+            ),
+            (
+                2,
+                3,
+                [
+                    row(1000),
+                    sprm(0x360d, &[0x60], false),
+                    sprm(0x940f, &159i16.to_le_bytes(), false),
+                    cell(),
+                ]
+                .concat(),
+            ),
+            (3, units, Vec::new()),
+        ],
+    );
+    let (document, json) = model(&mirrored);
+    let BodyElement::Table(table) = &document.body[0] else {
+        panic!("positioned root table")
+    };
+    assert!(table.tblp_pr.is_some());
+    let CellElement::Paragraph(paragraph) = &table.rows[0].cells[0].content[0] else {
+        panic!("root cell paragraph")
+    };
+    assert!(paragraph.frame_pr.is_none());
+    assert!(json.get("diagnostics").is_none());
+}
+
+#[test]
+fn nested_cell_frame_flow_warning_does_not_silently_skip_exhausted_allocations() {
+    let bytes = nested_frame_source(nested_owner_frame(-4), nested_owner_frame(-4));
+    let result = super::super::direct_model(&CompoundFile::open(&bytes).unwrap(), 1_000_000)
+        .expect("public framed-container fixture");
+    // Exercise the new allocation boundary with an already retained public
+    // fixture. Zero quota refuses the traversal stack; one borrowed-table
+    // slot gets past it but cannot retain diagnostic metadata. Neither may
+    // return a successful, unreported cell-flow projection.
+    for quota in [0, std::mem::size_of::<(&docx_model::DocTable, bool)>()] {
+        let mut document = result.document.clone();
+        document.diagnostics = Vec::new();
+        let mut budget = super::ModelBudget::new(quota);
+        assert_eq!(
+            super::report_nested_cell_frame_flow(&mut document, &mut budget).unwrap_err(),
+            "OUTPUT_TOO_LARGE"
+        );
+        assert!(document.diagnostics.is_empty());
+    }
 }
