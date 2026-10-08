@@ -500,10 +500,10 @@ impl Context<'_> {
         if shape.kind == 75 && shape.props.picture != 0 {
             let blip_effects = self.picture_display_effects(&shape, true)?;
             // MS-ODRAW 2.3.23.5: pib names the BLIP displayed by the picture
-            // shape. A BLIP this projector cannot carry (PICT, DIB, TIFF, an
-            // unused store slot or a mislabeled payload) is rejected rather
-            // than leaving an empty frame.
-            if self.media.reference(
+            // shape. Opaque PICT is retained for an explicit unavailable-image
+            // placeholder; this is recovery policy, not QuickDraw decoding.
+            // Other unsupported, absent or mislabeled slots still reject.
+            if self.media.reference_picture(
                 shape.props.picture,
                 self.backing,
                 self.pictures,
@@ -539,7 +539,13 @@ impl Context<'_> {
                         flip_h: transform.flip_h,
                         flip_v: transform.flip_v,
                         image_path: format!("legacy-ppt/image/{}", shape.props.picture),
-                        mime_type: ooxml_common::blip::mime_from_ext(extension).to_owned(),
+                        // The marker is internal to legacy PPT picture frames;
+                        // do not broaden image-fill or other format admission.
+                        mime_type: if extension == "pict" {
+                            "image/x-pict".to_owned()
+                        } else {
+                            ooxml_common::blip::mime_from_ext(extension).to_owned()
+                        },
                         svg_image_path: None,
                         intrinsic_width_px: None,
                         intrinsic_height_px: None,
@@ -2159,6 +2165,40 @@ mod tests {
             .unwrap()
             .elements
             .is_empty());
+    }
+
+    #[test]
+    fn pict_picture_is_retained_as_an_explicit_unsupported_image() {
+        // A minimal v2 picture in an uncompressed MS-ODRAW 2.2.26 BLIP.
+        let pict = [0, 0, 0, 0, 0, 0, 0, 20, 0, 30, 0, 17, 2, 255, 0, 255];
+        let mut payload = vec![0; 16 + 34];
+        payload[16..20].copy_from_slice(&(pict.len() as u32).to_le_bytes());
+        payload[44..48].copy_from_slice(&(pict.len() as u32).to_le_bytes());
+        payload[48..50].fill(0xfe);
+        payload.extend(pict);
+        let blip = record(0x5420, 0xf01c, &payload);
+        let model = project(
+            75,
+            0x200,
+            vec![properties(&[(0x4104, 1)])],
+            blip.clone(),
+            None,
+        )
+        .unwrap();
+        let SlideElement::Picture(picture) = &model.elements[0] else {
+            panic!("picture")
+        };
+        assert_eq!(picture.mime_type, "image/x-pict");
+        assert_eq!(picture.image_path, "legacy-ppt/image/1");
+        assert!(picture.width > 0 && picture.height > 0);
+        // Recovery is picture-frame policy, not implicit acceptance of fills.
+        let fill = properties(&[(0x180, 3), (0x4186, 1), (0x1bf, 0x0010_0010)]);
+        assert!(project(1, 0x200, vec![fill], blip.clone(), None)
+            .unwrap_err()
+            .contains("fill BLIP"));
+        let mut broken = blip;
+        broken[8 + 44..8 + 48].copy_from_slice(&999u32.to_le_bytes());
+        assert!(project(75, 0x200, vec![properties(&[(0x4104, 1)])], broken, None).is_err());
     }
 
     #[test]

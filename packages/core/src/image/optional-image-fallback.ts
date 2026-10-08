@@ -40,17 +40,20 @@ export interface OptionalImagePlaceholderBounds {
   readonly height: number;
 }
 
-const OPTIONAL_IMAGE_LABELS: Readonly<Record<OptionalImageCodec, string>> = {
+const OPTIONAL_IMAGE_LABELS: Readonly<Record<OptionalImageCodec | 'pict', string>> = {
   tiff: 'TIFF image unavailable',
+  pict: 'PICT image unsupported',
 };
 
 /**
  * Paint the same bounded, non-throwing capability placeholder in every format.
+ * PICT is an opaque legacy PPT resource, not an optional codec: callers may
+ * label that unsupported format without claiming that its pixels were decoded.
  * The fixed label avoids shaping package-controlled or attacker-controlled text.
  */
 export function paintOptionalImagePlaceholder(
   ctx: CanvasRenderingContext2D,
-  codec: OptionalImageCodec,
+  codec: OptionalImageCodec | 'pict',
   bounds: OptionalImagePlaceholderBounds,
 ): void {
   if (![bounds.x, bounds.y, bounds.width, bounds.height].every(Number.isFinite)

@@ -6289,6 +6289,7 @@ function paintUnavailablePicture(
   ctx: CanvasRenderingContext2D,
   el: PictureElement,
   scale: number,
+  format: 'tiff' | 'pict' = 'tiff',
 ): void {
   const x = emuToPx(el.x, scale);
   const y = emuToPx(el.y, scale);
@@ -6303,7 +6304,7 @@ function paintUnavailablePicture(
       ctx.scale(el.flipH ? -1 : 1, el.flipV ? -1 : 1);
       ctx.translate(-(x + w / 2), -(y + h / 2));
     }
-    paintOptionalImagePlaceholder(ctx, 'tiff', { x, y, width: w, height: h });
+    paintOptionalImagePlaceholder(ctx, format, { x, y, width: w, height: h });
   } finally {
     ctx.restore();
   }
@@ -6320,6 +6321,15 @@ async function preparePicture(
   svgDecoder?: SvgBlobDecoder,
   imagePlan?: DecodedImageTargetPlan,
 ): Promise<PreparedPaint> {
+  // A PICT picture is an opaque unavailable-image resource, including OOXML
+  // parts labeled with this MIME. QuickDraw is unsupported: keep the authored
+  // bounds with a visible diagnostic instead of invoking a platform decoder.
+  // The legacy PPT source validates its OfficeArt envelope before labeling the
+  // resource; this renderer gate does not validate arbitrary OOXML PICT bytes
+  // or catch errors from supported image codecs.
+  if (el.mimeType === 'image/x-pict') {
+    return { paint: (ctx) => paintUnavailablePicture(ctx, el, scale, 'pict') };
+  }
   // No byte source → nothing to draw (the lazy pipeline always supplies one in
   // both render modes; this guards the rare misconfiguration).
   if (!fetchImage) return NO_PAINT;
