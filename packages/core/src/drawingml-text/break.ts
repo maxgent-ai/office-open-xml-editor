@@ -61,6 +61,12 @@ export interface DrawingMlBreakOptions<T> {
    */
   eastAsianLineBreak?: boolean;
   /**
+   * Whether kinsoku continues across the seam between two adjacent input
+   * runs (authored runs, or one run's font-slot segments). Without it a seam
+   * keeps its greedy break (Office control C08). Hosts supply the evidence.
+   */
+  kinsokuAcrossRuns?(left: T, right: T, leftText: string, rightText: string): boolean;
+  /**
    * Negative tracking can make a longer prefix narrower. Every prefix is then
    * a fit candidate; widths are accumulated from segment heads and
    * per-grapheme advances measured with a bounded left shaping context.
@@ -88,7 +94,8 @@ const isCjk = <T>(atom: Atom<T>): boolean =>
  * and an overwide unbreakable word falls back to grapheme boundaries. Both
  * hosts put a tab on its next visual line when its following word will not fit.
  * C08 also shows that a CJK punctuation run seam can remain a break boundary;
- * the kinsoku adjustment therefore stays within an authored run here.
+ * the kinsoku adjustment therefore stays within an input run unless the host's
+ * `kinsokuAcrossRuns` evidence continues it across the seam.
  *
  * The input adapter owns fonts and measurement; this phase never changes a
  * run's style or fabricates a font. The output is logical order. Alignment,
@@ -278,6 +285,32 @@ export function breakDrawingMlText<T>(
         kinsokuText = { chars, offsets };
       }
       return kinsokuText;
+    };
+
+    const admittedKinsokuSeam = (left: Atom<T>, right: Atom<T>): boolean =>
+      left.type === 'text' && right.type === 'text'
+      && options.kinsokuAcrossRuns?.(left.style, right.style, left.text, right.text) === true;
+    let kinsokuSeamFloors: Int32Array | null = null;
+    let kinsokuSeamFloorsStart = 0;
+    const kinsokuSeamFloor = (boundary: number): number => {
+      if (kinsokuSeamFloors === null) {
+        // Only new cross-run adjustments use this prefix map. Preserve the
+        // established in-run policy, but never extend a host's seam evidence
+        // across an earlier unauthorized seam, object or tab. Build once per
+        // unconsumed suffix rather than rescanning each line's prefix or
+        // retaining already consumed atoms.
+        kinsokuSeamFloorsStart = start;
+        kinsokuSeamFloors = new Int32Array(end - start + 1);
+        let floor = start + 1;
+        for (let i = start + 1; i < end; i++) {
+          const left = atoms[i - 1];
+          const right = atoms[i];
+          if (left.type !== 'text' || right.type !== 'text'
+              || (left.run !== right.run && !admittedKinsokuSeam(left, right))) floor = i;
+          kinsokuSeamFloors[i - kinsokuSeamFloorsStart] = floor;
+        }
+      }
+      return Math.max(start + 1, kinsokuSeamFloors[boundary - kinsokuSeamFloorsStart]);
     };
 
     const appendAtom = (segments: DrawingMlLineSegment<T>[], atom: Atom<T>): void => {
@@ -783,18 +816,35 @@ export function breakDrawingMlText<T>(
       }
 
       // Kinsoku (§17.15.1.58–.60) adjusts an in-run CJK boundary. The Office
-      // C08 control is a counterexample at an authored run seam, so leave that
-      // boundary intact instead of inferring a cross-run retraction rule.
-      // eaLnBrk="0" lifts the East Asian line-start/line-end rules (E01).
-      if (eastAsianRules && split < end && atoms[split - 1].run === atoms[split].run
-          && (isCjk(atoms[split - 1]) || isCjk(atoms[split]))) {
+      // C08 control is a counterexample at an authored run seam, so a seam
+      // keeps its boundary unless the host's kinsokuAcrossRuns evidence says
+      // otherwise. eaLnBrk="0" lifts the East Asian line-start/line-end rules (E01).
+      const prev = atoms[split - 1];
+      const next = split < end ? atoms[split] : undefined;
+      if (eastAsianRules && next && (isCjk(prev) || isCjk(next))
+          && (prev.run === next.run || admittedKinsokuSeam(prev, next))) {
         const { chars, offsets } = kinsokuCodePoints();
         const codeStart = offsets[start - kinsokuTextStart];
         const codeSplit = offsets[split - kinsokuTextStart];
         if (codeSplit - codeStart > 1 && codeSplit < chars.length) {
-          const adjusted = kinsokuAdjustedSplit(chars, codeSplit, DEFAULT_KINSOKU_RULES, codeStart + 1);
+          const crossRun = prev.run !== next.run;
+          const floor = crossRun ? kinsokuSeamFloor(split) : start + 1;
+          const adjusted = kinsokuAdjustedSplit(chars, codeSplit, DEFAULT_KINSOKU_RULES,
+            crossRun ? offsets[floor - kinsokuTextStart] : codeStart + 1);
           const retract = codeSplit - adjusted;
-          if (retract > 0 && split - retract > start) split -= retract;
+          if (retract > 0) {
+            if (crossRun) {
+              // Code-point retraction must land on an atom/grapheme boundary.
+              let low = floor;
+              let high = split;
+              while (low < high) {
+                const mid = Math.floor((low + high) / 2);
+                if (offsets[mid - kinsokuTextStart] < adjusted) low = mid + 1;
+                else high = mid;
+              }
+              split = low;
+            } else if (split - retract > start) split -= retract;
+          }
         }
       }
 
