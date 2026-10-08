@@ -167,6 +167,7 @@ fn project_table(
     // in this bounded direct projection and retain the equality fallback.
     let leading_ordinary_table =
         positioned_tables && plan.depth == 1 && ordinary_flow && alignment == 0;
+    let centered_acquired_table = positioned_tables && centered_acquired_geometry(&plan);
     let row_count = plan.rows.len();
     let mut col_widths = Vec::new();
     reserve(&mut col_widths, plan.grid.len() - 1, &mut |n| {
@@ -187,7 +188,7 @@ fn project_table(
                 "direct DOC model cannot retain row table-property shading",
             ));
         }
-        check_row_preferences(&planned, leading_ordinary_table)?;
+        check_row_preferences(&planned, leading_ordinary_table || centered_acquired_table)?;
         let mut cells = Vec::new();
         reserve(&mut cells, planned.cells.len(), &mut |n| {
             charge_cell(remaining, n)
@@ -456,11 +457,60 @@ fn project_table(
     Ok(table)
 }
 
+/// A bounded acquired-geometry projection for whole-frame centered RTL tables.
+/// [MS-DOC] 2.6.3 sprmTDxaAbs (-4) and TPc supply physical frame placement;
+/// ECMA-376 17.4.57 centers the complete laid-out table. Uniform logical O is
+/// retained in tblInd/bidiVisual, then removed by the existing child-flow to
+/// positioned-frame translation. It is not added to the external center.
+/// This is a projection policy, not a normative P/O precedence rule. Admit
+/// only homogeneous main-story, depth-one leading rows with complete positive
+/// geometry and absent or agreeing absolute width preferences. AutoFit retains its
+/// existing shared solver: cancellation of uniform O holds for its final width
+/// as well. Mixed translations, row parts, competing preferences and discarded
+/// horizontal continuations need a separate ownership proof and stay refused.
+fn centered_acquired_geometry(plan: &LogicalTable<Blocks>) -> bool {
+    let first = &plan.rows[0].source;
+    let Some(position) = first.position.direct().0 else {
+        return false;
+    };
+    let width = plan.grid.last().copied().unwrap_or(plan.origin) - plan.origin;
+    plan.depth == 1
+        && position.tblp_x_spec.as_deref() == Some("center")
+        && matches!(position.horz_anchor.as_str(), "margin" | "page")
+        && position.vert_anchor == "page"
+        && position.tblp_y_spec.is_none()
+        && position.tblp_y >= 0.0
+        && matches!(first.preferred_indent, Some(PreferredIndent::Dxa(_)))
+        && matches!(first.preferred_width, None | Some(PreferredWidth::Dxa(_)))
+        && plan.grid.windows(2).all(|edges| edges[1] > edges[0])
+        && plan.rows.iter().all(|row| {
+            let source = &row.source;
+            source.bidi
+                && source.alignment == first.alignment
+                && matches!(source.alignment, (0, false) | (2, true))
+                && source.origin() == plan.origin
+                && source.preferred_indent == first.preferred_indent
+                && source.position == first.position
+                && source.autofit == first.autofit
+                && source.preferred_width == first.preferred_width
+                && source.preferred_width.is_none_or(|preference| matches!(preference, PreferredWidth::Dxa(value) if i32::from(value) == width))
+                && row.grid_before == 0
+                && row.grid_after == 0
+                && row.cells.len() == row.source_cell_count
+                && row.cells.iter().all(|cell| {
+                    cell.source_end == cell.source_index + 1
+                        && cell.source.flags & 3 == 0
+                        && cell.source.width > 0
+                        && cell.source.preferred.is_none_or(|preference| matches!(preference, PreferredWidth::Dxa(value) if i32::from(value) == cell.source.width))
+                })
+        })
+}
+
 /// Validate the row preferences that the projection represents through the
 /// acquired logical row geometry instead of a separate model field.
 fn check_row_preferences(
     planned: &PlannedRow<Blocks>,
-    leading_ordinary_table: bool,
+    acquired_geometry_table: bool,
 ) -> Result<(), String> {
     let source = &planned.source;
     let (alignment, physical) = source.alignment;
@@ -469,7 +519,7 @@ fn check_row_preferences(
     } else {
         alignment
     };
-    let acquired_leading_origin = leading_ordinary_table && logical_alignment == 0;
+    let acquired_leading_origin = acquired_geometry_table && logical_alignment == 0;
     if source.bidi
         && !acquired_leading_origin
         && source.preferred_indent.is_some()
@@ -482,8 +532,9 @@ fn check_row_preferences(
         // 2.9.102 defines a separate preference. Retaining O rather than P is
         // the bounded direct-projection policy documented on PreferredIndent,
         // not a normative P/O precedence claim. Only ordinary leading main-
-        // story, depth-one RTL tables use that policy through bidiVisual.
-        // Other placement classes retain the exact-equality fallback.
+        // story, depth-one RTL tables and the bounded whole-frame centered
+        // profile above use that policy through bidiVisual. Other placement
+        // classes retain the exact-equality fallback.
         return Err(unsupported(
             "direct DOC model cannot place a right-to-left table with a preferred indent",
         ));
@@ -701,6 +752,110 @@ mod tests {
             assert!(project(main_story, nested, 0).is_ok());
             let error = project(main_story, nested, 109).err().unwrap();
             assert!(error.contains("right-to-left"), "{error}");
+        }
+    }
+
+    #[test]
+    fn centered_rtl_table_retains_acquired_geometry_with_a_distinct_preference() {
+        let project = |origin: i32, preferred: i16, autofit: bool, variant: u8| {
+            let mut sequence = 0;
+            let mut writer = Writer::with_positioned_tables(&mut sequence, variant != 1);
+            let mut budget = ModelBudget::new(1_000_000);
+            for index in 0..2 {
+                let widths: &[u16] = if index == 1 && variant == 0 {
+                    &[1200]
+                } else {
+                    &[400, 800]
+                };
+                let mut end = row(1, widths);
+                end.row.bidi = true;
+                end.row.left = origin;
+                end.row.autofit = autofit;
+                end.row.preferred_indent = Some(PreferredIndent::Dxa(preferred));
+                end.row.preferred_width = Some(PreferredWidth::Dxa(1200));
+                for source in &mut end.row.cells {
+                    source.preferred = Some(PreferredWidth::Dxa(source.width as u16));
+                }
+                for (code, value) in [
+                    (0x360d, vec![0x50]),
+                    (0x940e, (-4i16).to_le_bytes().to_vec()),
+                    (0x940f, 401i16.to_le_bytes().to_vec()),
+                    (0x9410, 100u16.to_le_bytes().to_vec()),
+                    (0x941e, 200u16.to_le_bytes().to_vec()),
+                ] {
+                    end.row.position.apply(code, &value).unwrap();
+                }
+                if variant == 7 {
+                    end.row.preferred_width = None;
+                    for source in &mut end.row.cells {
+                        source.preferred = None;
+                    }
+                }
+                if index == 1 {
+                    match variant {
+                        2 => end.row.left += 20,
+                        3 => end.row.alignment = (1, false),
+                        4 => end.row.preferred_indent = Some(PreferredIndent::Dxa(preferred + 20)),
+                        5 => end.row.cells[0].preferred = Some(PreferredWidth::Percent(1000)),
+                        6 => {
+                            end.row.cells[0].flags = 2;
+                            end.row.cells[1].flags = 1;
+                        }
+                        _ => {}
+                    }
+                }
+                for text in ["A", "B"].into_iter().take(end.row.cells.len()) {
+                    writer.push(
+                        cell(1),
+                        '\u{7}',
+                        paragraph(text),
+                        &mut unframed,
+                        &mut budget,
+                    )?;
+                }
+                writer.push(end, '\u{7}', Blocks::default(), &mut unframed, &mut budget)?;
+            }
+            writer.finish(&mut budget)
+        };
+        // Uniform acquired O is retained. Whole-frame centering supplies the
+        // external placement even when O/P differ or either one is negative.
+        for (origin, preferred) in [(200, 120), (-200, 120), (200, -120)] {
+            for autofit in [false, true] {
+                let blocks = project(origin, preferred, autofit, 0).unwrap();
+                let Block::Table(table) = &blocks.0[0] else {
+                    panic!()
+                };
+                assert_eq!(table.tbl_ind, Some(f64::from(origin) / 20.0));
+                assert_eq!(table.col_widths, vec![20.0, 40.0]);
+                assert_eq!(table.rows[1].cells.len(), 1);
+                assert_eq!(table.rows[1].cells[0].col_span, 2);
+                assert_eq!(table.bidi_visual, Some(true));
+                assert_eq!(table.jc, "left");
+                assert_eq!(
+                    table.layout.as_deref(),
+                    Some(if autofit { "autofit" } else { "fixed" })
+                );
+                assert!(!table.table_layout.ordinary_flow);
+                let position = table.tblp_pr.as_ref().unwrap();
+                assert_eq!(position.tblp_x_spec.as_deref(), Some("center"));
+                assert_eq!(
+                    (position.horz_anchor.as_str(), position.vert_anchor.as_str()),
+                    ("margin", "page")
+                );
+                assert_eq!(
+                    (position.left_from_text, position.right_from_text),
+                    (5.0, 10.0)
+                );
+            }
+        }
+        // Different owners, translations, alignment or competing width
+        // preferences have no centered homogeneous admission proof.
+        assert!(project(200, 120, true, 7).is_ok());
+        for variant in 1..=6 {
+            assert!(
+                project(200, 120, true, variant).is_err(),
+                "variant {variant}"
+            );
         }
     }
 
