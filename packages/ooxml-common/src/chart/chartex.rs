@@ -620,12 +620,37 @@ struct ChartexProjection {
     excel_suppress_geometry: bool,
     presentation_suppress_geometry: bool,
     presentation_show_unpaired_percentage_axis: bool,
+    // Sparse, bounded parser-only metadata keyed by canonical series index.
+    // Never retained in the public model or charged as a host-specific model.
+    presentation_aggregation_frequencies: Vec<(usize, Vec<u32>)>,
 }
 
 impl ChartexCanonical {
     fn project(self, host: ChartHost) -> Option<ChartModel> {
         let Self { model, projection } = self;
         let mut model = *model?;
+        if matches!(host, ChartHost::Word | ChartHost::PowerPoint) {
+            // Apply before series retention, while metadata indices still refer
+            // to canonical series. Dense named categories precede the sole
+            // possible numeric-only blank group, whose frequency is zero.
+            // Truncate only that trailing group: all retained point identities
+            // and authored point/label properties keep their original indices.
+            for (index, frequencies) in &projection.presentation_aggregation_frequencies {
+                let Some(series) = model.series.get_mut(*index) else {
+                    continue;
+                };
+                let count = frequencies.iter().take_while(|count| **count != 0).count();
+                for (value, frequency) in series.values.iter_mut().zip(frequencies).take(count) {
+                    *value = Some(f64::from(*frequency));
+                }
+                series.values.truncate(count);
+                if let Some(categories) = &mut series.categories {
+                    categories.truncate(count);
+                } else {
+                    model.categories.truncate(count);
+                }
+            }
+        }
         let keep = if host == ChartHost::Excel {
             &projection.excel_series_keep
         } else {
@@ -1151,10 +1176,12 @@ fn parse_chartex_impl(
         .is_some_and(|node| attr(node, "layoutId").as_deref() == Some("paretoLine"))
         && first_column.is_some()
         && pareto_pair.is_none();
-    // [MS-ODRAWXML] CT_Series/axisId identifies the value axis and CT_Axis
-    // supplies its percentage units. Office 16.113 uses the first series'
-    // axis on the left: a line-first plot therefore moves its column axis to
-    // the right, even when that line has no valid owner.
+    // [MS-ODRAWXML] CT_Series/ownerIdx identifies the owning series and axisId
+    // identifies the value axis. Axis side is observed Office behavior:
+    // Word/PowerPoint 16.113 put a retained, owned line-first percentage axis
+    // on the left and its column axis on the right. An unowned line is
+    // discarded and leaves the column axis on the left; its authored axisId
+    // cannot establish axis placement for the retained plot.
     let percentage_axis = root.descendants().find(|axis| {
         axis.is_element()
             && axis.tag_name().name() == "axis"
@@ -1174,9 +1201,8 @@ fn parse_chartex_impl(
             .any(|node| attr(&node, "val").as_deref() == Some(axis_id.as_str()))
     };
     let primary_axis_right = first_column.is_some()
-        && series_nodes.first().is_some_and(|node| {
-            attr(node, "layoutId").as_deref() == Some("paretoLine")
-                && references_percentage_axis(*node)
+        && pareto_pair.is_some_and(|(_, line)| {
+            series_nodes.first() == Some(&line) && references_percentage_axis(line)
         });
     // A data-bearing, unowned paretoLine keeps axis 2's ticks in PowerPoint,
     // but Excel suppresses that axis with the line. The axis itself must opt
@@ -1473,13 +1499,29 @@ fn parse_chartex_impl(
     // undefined formula name, no values, an over-limit or overflowing sum)
     // falls back to the unaggregated data for that series rather than
     // discarding the whole chart.
+    // Frequency fallback is measured only for flat, aggregated columns.
+    // Paired/standalone Pareto, histogram and mixed-layout plots retain their
+    // existing source-index sums until their frequency/order semantics are
+    // measured independently.
+    let allow_presentation_frequencies = chart_type == "clusteredColumn"
+        && all_series_nodes.iter().all(|node| {
+            attr(node, "layoutId").as_deref() == Some("clusteredColumn")
+                && child(*node, "layoutPr")
+                    .and_then(|layout| child(layout, "binning"))
+                    .is_none()
+        });
     let mut primary_aggregated = false;
     if layout_id == "clusteredColumn" && has_chartex_aggregation(series_node) {
-        if let Some((aggregated_categories, aggregated_values)) =
-            aggregate_chartex_data(primary_data, references)
+        if let Some(aggregation) =
+            aggregate_chartex_data(primary_data, references, allow_presentation_frequencies)
         {
-            categories = aggregated_categories;
-            raw_values = aggregated_values;
+            categories = aggregation.categories;
+            raw_values = aggregation.values;
+            if let Some(frequencies) = aggregation.presentation_frequencies {
+                projection
+                    .presentation_aggregation_frequencies
+                    .push((0, frequencies));
+            }
             primary_aggregated = true;
         }
     }
@@ -1789,17 +1831,26 @@ fn parse_chartex_impl(
                 continue;
             };
             // An unresolvable aggregation falls back to the raw series data.
-            let (extra_categories, extra_values) = has_chartex_aggregation(extra_node)
-                .then(|| aggregate_chartex_data(extra_data, references))
-                .flatten()
-                .unwrap_or_else(|| {
-                    (
-                        chartex_string_levels(extra_data, references)
-                            .and_then(|levels| levels.into_iter().next())
-                            .unwrap_or_default(),
-                        chartex_number_values(extra_data, &["val"], references).unwrap_or_default(),
-                    )
-                });
+            let aggregation = has_chartex_aggregation(extra_node)
+                .then(|| {
+                    aggregate_chartex_data(extra_data, references, allow_presentation_frequencies)
+                })
+                .flatten();
+            let (extra_categories, extra_values) = if let Some(aggregation) = aggregation {
+                if let Some(frequencies) = aggregation.presentation_frequencies {
+                    projection
+                        .presentation_aggregation_frequencies
+                        .push((series.len(), frequencies));
+                }
+                (aggregation.categories, aggregation.values)
+            } else {
+                (
+                    chartex_string_levels(extra_data, references)
+                        .and_then(|levels| levels.into_iter().next())
+                        .unwrap_or_default(),
+                    chartex_number_values(extra_data, &["val"], references).unwrap_or_default(),
+                )
+            };
             let extra_name = series_name_for(extra_node, references);
             let extra_color =
                 child(extra_node, "spPr").and_then(|shape| resolver.resolve_shape_fill(shape));
@@ -2716,10 +2767,17 @@ fn aggregation_category_present(value: Option<&str>, numeric: Option<f64>) -> bo
     value.is_some_and(|text| !text.is_empty()) || numeric.is_some()
 }
 
+struct ChartexAggregation {
+    categories: Vec<String>,
+    values: Vec<Option<f64>>,
+    presentation_frequencies: Option<Vec<u32>>,
+}
+
 fn aggregate_chartex_data(
     data: Node,
     references: &mut dyn ChartReferenceResolver,
-) -> Option<(Vec<String>, Vec<Option<f64>>)> {
+    allow_presentation_frequencies: bool,
+) -> Option<ChartexAggregation> {
     let cat = data.descendants().find(|node| {
         node.is_element()
             && node.tag_name().name() == "strDim"
@@ -2748,6 +2806,48 @@ fn aggregate_chartex_data(
     };
     let values = chartex_number_values(data, &["val"], references)?;
     let capacity = category_slots.len().max(values.len());
+    // [MS-ODRAWXML] 2.24.3.2 CT_Aggregation is an empty marker; it does not
+    // specify this fallback. Word/PowerPoint 16.113 cached-only controls and
+    // reference-bearing cached controls use category frequencies when declared
+    // category/numeric widths differ, and source-index sums when they match.
+    // Implement only complete, nonempty named-category and finite-value caches
+    // in flat column plots. Sparse/blank/duplicate/out-of-range caches, zero
+    // widths and formula-only dimensions keep indexed sums. These are explicit
+    // evidence limits, not claims that Office uses sums for excluded classes.
+    // In particular, blank padding has unresolved frequency/label alignment.
+    // Exactly `count` authored points plus every bounded slot being filled
+    // excludes duplicate, absent, malformed and out-of-range indices without
+    // another width-sized allocation.
+    let complete_cache = |dimension: Node, count: usize| {
+        child(dimension, "lvl").is_some_and(|level| {
+            level.attribute("ptCount").is_some()
+                && level
+                    .children()
+                    .filter(|point| point.is_element() && point.tag_name().name() == "pt")
+                    .count()
+                    == count
+        })
+    };
+    let numeric_dimension = data.descendants().find(|node| {
+        node.is_element()
+            && node.tag_name().name() == "numDim"
+            && attr(node, "type").as_deref() == Some("val")
+    });
+    let use_frequencies = allow_presentation_frequencies
+        && !category_slots.is_empty()
+        && !values.is_empty()
+        && category_slots.len() != values.len()
+        && complete_cache(cat, category_slots.len())
+        && category_slots
+            .iter()
+            .all(|value| value.as_ref().is_some_and(|text| !text.is_empty()))
+        && numeric_dimension.is_some_and(|dimension| complete_cache(dimension, values.len()))
+        && values
+            .iter()
+            .all(|value| value.is_some_and(|value| value.is_finite()));
+    // The already bounded canonical group domain bounds this transient vector.
+    // Compute it in the same grouping pass; never clone categories/raw caches.
+    let mut frequencies = use_frequencies.then(|| Vec::<u32>::with_capacity(capacity));
     let mut categories = Vec::with_capacity(capacity);
     let mut sums: Vec<Option<f64>> = Vec::with_capacity(capacity);
     for index in 0..category_slots.len().max(values.len()) {
@@ -2761,7 +2861,12 @@ fn aggregate_chartex_data(
             continue;
         }
         let category = category.unwrap_or_default();
+        let category_frequency = u32::from(index < category_slots.len());
         if let Some(index) = categories.iter().position(|value| value == category) {
+            if let Some(frequencies) = &mut frequencies {
+                // Source widths are below the shared ChartEx element ceiling.
+                frequencies[index] = frequencies[index].checked_add(category_frequency)?;
+            }
             if let Some(value) = value {
                 let sum = sums[index].unwrap_or(0.0) + value;
                 if !sum.is_finite() {
@@ -2772,9 +2877,18 @@ fn aggregate_chartex_data(
         } else {
             categories.push((category).to_owned());
             sums.push(value);
+            if let Some(frequencies) = &mut frequencies {
+                frequencies.push(category_frequency);
+            }
         }
     }
-    Some((categories, sums))
+    // Failed/nonfinite SUM aggregation returns above before frequency metadata
+    // is admitted, keeping fallback and resource verdicts host independent.
+    Some(ChartexAggregation {
+        categories,
+        values: sums,
+        presentation_frequencies: frequencies,
+    })
 }
 
 pub(super) fn chartex_string_levels_for_types(
