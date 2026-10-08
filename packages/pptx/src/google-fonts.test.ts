@@ -9,6 +9,31 @@ import {
 } from './google-fonts';
 import type { Presentation, Slide } from './types';
 
+// DrawingML a:cs is an independently authored font slot (ECMA-376
+// §21.1.2.3.1), already consumed by run segmentation. Loading must preserve
+// its resolved face just as it preserves a:latin, a:ea and a:sym.
+describe('PPTX complex-script slot loading', () => {
+  const textBody = {
+    defaultBold: true, defaultItalic: true,
+    paragraphs: [{ bullet: { type: 'none' },
+      runs: [{ type: 'text', text: 'שלום', lang: 'he-IL',
+        fontFamily: 'Arial', fontFamilyCs: 'Calibri' }],
+    }],
+  };
+
+  it.each(['shape', 'table'] as const)('retains authored CS faces in %s preload names', (kind) => {
+    const slide = { elements: [kind === 'shape'
+      ? { type: 'shape', textBody }
+      : { type: 'table', rows: [{ cells: [{ textBody }] }] },
+    ] } as unknown as Slide;
+    const accumulator = new PptxFontPreloadAccumulator(null, null);
+    accumulator.addSlide(slide);
+    expect(accumulator.names()).toContain('Calibri');
+    expect(pptxSlideOfficeFontRequests(slide, null, null))
+      .toContainEqual({ family: 'Calibri', weight: 700, style: 'italic' });
+  });
+});
+
 describe('PPTX exact Office face requests', () => {
   it('does not pin a theme font when no run or inherited style names a face', () => {
     const slide = {
