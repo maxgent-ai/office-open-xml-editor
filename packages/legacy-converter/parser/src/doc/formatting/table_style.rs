@@ -573,6 +573,13 @@ impl Formatting<'_> {
                         let baseline = profile.unconditional.clone();
                         profile.unconditional.apply(code, operand, &baseline)?;
                     }
+                    // The existing sprmCLidBi decoder treats 0x0400 as
+                    // absence of an authored complex-script language (see
+                    // character::Properties::apply and its Word evidence).
+                    // This unconditional table-style value changes no axis.
+                    // Other languages and conditional writes still need a
+                    // table-language cascade consumer and remain gated.
+                    0x485f if operand == [0, 4] => {}
                     0xca85 => {
                         parse_conditional(&mut profile, operand, &mut self.budget)?;
                     }

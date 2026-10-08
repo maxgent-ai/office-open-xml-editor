@@ -397,6 +397,21 @@ impl Properties {
             return Ok(true);
         }
         let (key, value) = match code {
+            0x484e => {
+                // MS-DOC 2.9.118 HresiOperand: hresNormal (1) with ChHres
+                // zero is the default word-breaking method. It adds no
+                // character substitution to the renderer's default policy.
+                // Other valid methods require a word-break consumer; refuse
+                // them rather than silently dropping the changed characters.
+                if operand.len() != 2
+                    || !(1..=6).contains(&operand[0])
+                    || (operand[0] == 1 && operand[1] != 0)
+                    || (operand[0] != 1 && !(1..=0x7f).contains(&operand[1]))
+                {
+                    return Err(unsupported("invalid Word word-breaking method"));
+                }
+                return Ok(operand[0] == 1);
+            }
             0x485f => {
                 // MS-DOC 2.6.1 sprmCLidBi / 2.9.134 LID: this axis is used for
                 // RTL or complex-script presentation. The language itself is
@@ -1128,6 +1143,41 @@ mod tests {
 
         let truncated = [0x16, 0x68, 0x12, 0x34, 0x56];
         assert!(Sprms::new(&truncated).next(&mut Budget::default()).is_err());
+    }
+
+    #[test]
+    fn normal_word_breaking_is_default_but_custom_and_malformed_methods_are_not() {
+        let base = Properties::default();
+        let mut normal = base.clone();
+        assert!(normal.apply(0x484e, &[1, 0], &base).unwrap());
+        assert_eq!(normal, base);
+        // A valid custom method changes characters at a break and needs a
+        // consumer. It must not be treated as the default method.
+        for method in 2..=6 {
+            assert!(!base.clone().apply(0x484e, &[method, b'x'], &base).unwrap());
+        }
+        for operand in [
+            vec![],
+            vec![1],
+            vec![1, 0, 0],
+            vec![0, 1],
+            vec![7, 0],
+            vec![1, 1],
+            vec![2, 0],
+            vec![2, 0x80],
+        ] {
+            assert!(
+                base.clone().apply(0x484e, &operand, &base).is_err(),
+                "{operand:?}"
+            );
+        }
+        let bytes = [0x4e, 0x48, 1, 0, 0x35, 0x08, 1];
+        let mut sprms = Sprms::new(&bytes);
+        let mut budget = Budget::default();
+        while let Some((code, operand)) = sprms.next(&mut budget).unwrap() {
+            normal.apply(code, operand, &base).unwrap();
+        }
+        assert!(run(&normal, &[]).bold);
     }
 
     #[test]

@@ -1543,6 +1543,55 @@ mod tests {
     }
 
     #[test]
+    fn table_default_complex_script_language_is_inert_and_other_languages_stay_gated() {
+        let mut default = observed_table_style_formatting();
+        default.styles[0]
+            .as_mut()
+            .unwrap()
+            .table
+            .as_mut()
+            .unwrap()
+            .chpx = &[0x5f, 0x48, 0, 4, 0x43, 0x4a, 28, 0];
+        let run = default
+            .direct_text_run(7, table_key(0), 0, 0, &[], "x".into())
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.font_size, 14.0);
+        assert!(!default.unsupported_character_properties);
+        for lid in [0x0401u16, 0x0411, 0x1000, 0xffff] {
+            let mut language = observed_table_style_formatting();
+            language.styles[0]
+                .as_mut()
+                .unwrap()
+                .table
+                .as_mut()
+                .unwrap()
+                .chpx = leaked([&[0x5f, 0x48][..], &lid.to_le_bytes()].concat());
+            language.table_style_selector_profile(Some(0)).unwrap();
+            assert!(language.unsupported_character_properties, "{lid:04x}");
+        }
+        let mut truncated = observed_table_style_formatting();
+        truncated.styles[0]
+            .as_mut()
+            .unwrap()
+            .table
+            .as_mut()
+            .unwrap()
+            .chpx = &[0x5f, 0x48, 0];
+        assert!(truncated.table_style_selector_profile(Some(0)).is_err());
+        let mut conditional = observed_table_style_formatting();
+        conditional.styles[0]
+            .as_mut()
+            .unwrap()
+            .table
+            .as_mut()
+            .unwrap()
+            .chpx = leaked(ccnf(table_style_condition::FIRST_ROW, &[0x5f, 0x48, 0, 4]));
+        conditional.table_style_selector_profile(Some(0)).unwrap();
+        assert!(conditional.unsupported_character_properties);
+    }
+
+    #[test]
     fn table_chpx_fonts_validate_indices_and_keep_other_axes_and_conditions_gated() {
         let mut negative = observed_table_style_formatting();
         negative.styles[0]
