@@ -880,6 +880,13 @@ export function buildSegments(
 const AUTO_SPACE_EAST_ASIAN = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/u;
 const AUTO_SPACE_LATIN = /\p{Script=Latin}/u;
 const AUTO_SPACE_DIGIT = /[0-9]/u;
+// UAX #29 GB9 extenders and ZWJ can hide a base character's adjacency. Keep
+// the existing scalar checks as well: some extending characters themselves
+// carry Han script membership, and their previous exclusions must remain.
+// Issue #1660's compression observation excludes autospace-on adjacency and
+// does not establish these extender-bearing inputs. Preserve that exclusion;
+// this narrows admission without asserting an Office automatic-spacing amount.
+const AUTO_SPACE_GRAPHEME_EXTEND = /[\p{Grapheme_Extend}\u200D]/u;
 
 /**
  * Scope of WORD_COMPRESSED_SPACE_LINE_FIT (see its registered description):
@@ -890,9 +897,45 @@ const AUTO_SPACE_DIGIT = /[0-9]/u;
  * - a compressible closing mark is directly followed by U+0020, where the
  *   registered rule records a full retained cell that
  *   WORD_JAPANESE_PUNCTUATION_COMPRESSION_CELL does not reproduce.
- * Adjacency is read on the paragraph's joined text, so run seams cannot
- * change the decision.
+ * Preserve the scalar exclusions on the paragraph's joined text and add
+ * extender-transparent base adjacency. This only withdraws additional
+ * unsupported paragraphs; it cannot re-admit a previously excluded one.
+ * `texts` lists the segments in order; `undefined` marks a non-text segment,
+ * which ends both adjacency checks. This is not a full grapheme segmenter.
  */
+export function mixedSpaceFitTextOutsideScope(
+  texts: Iterable<string | undefined>,
+  autoSpaceDE: boolean | undefined,
+  autoSpaceDN: boolean | undefined,
+): boolean {
+  const pair = (left: string, right: string): boolean => {
+    if (COMPRESSIBLE_TRAILING_FULL_WIDTH_PUNCTUATION.has(left) && right === ' ') return true;
+    const eastAsian = AUTO_SPACE_EAST_ASIAN.test(left) ? right : AUTO_SPACE_EAST_ASIAN.test(right) ? left : undefined;
+    if (eastAsian === undefined) return false;
+    return (autoSpaceDE !== false && AUTO_SPACE_LATIN.test(eastAsian))
+      || (autoSpaceDN !== false && AUTO_SPACE_DIGIT.test(eastAsian));
+  };
+  let previous: string | undefined;
+  let previousBase: string | undefined;
+  for (const text of texts) {
+    if (text === undefined) {
+      previous = undefined;
+      previousBase = undefined;
+      continue;
+    }
+    for (const character of text) {
+      if (previous !== undefined && pair(previous, character)) return true;
+      if (!AUTO_SPACE_GRAPHEME_EXTEND.test(character)) {
+        if (previousBase !== undefined && previousBase !== previous
+          && pair(previousBase, character)) return true;
+        previousBase = character;
+      }
+      previous = character;
+    }
+  }
+  return false;
+}
+
 function withdrawMixedSpaceEligibilityOutsideScope(
   environment: LineLayoutEnvironment,
   segs: LayoutSeg[],
@@ -900,30 +943,11 @@ function withdrawMixedSpaceEligibilityOutsideScope(
   if (!segs.some((segment) => 'text' in segment && segment.mixedSpaceAverageWidthRatio !== undefined)) {
     return;
   }
-  let previous: string | undefined;
-  let outside = false;
-  const pair = (left: string, right: string): boolean => {
-    if (COMPRESSIBLE_TRAILING_FULL_WIDTH_PUNCTUATION.has(left) && right === ' ') return true;
-    const eastAsian = AUTO_SPACE_EAST_ASIAN.test(left) ? right : AUTO_SPACE_EAST_ASIAN.test(right) ? left : undefined;
-    if (eastAsian === undefined) return false;
-    return (environment.autoSpaceDE !== false && AUTO_SPACE_LATIN.test(eastAsian))
-      || (environment.autoSpaceDN !== false && AUTO_SPACE_DIGIT.test(eastAsian));
-  };
-  for (const segment of segs) {
-    if (!('text' in segment)) {
-      previous = undefined;
-      continue;
-    }
-    for (const character of segment.text) {
-      if (previous !== undefined && pair(previous, character)) {
-        outside = true;
-        break;
-      }
-      previous = character;
-    }
-    if (outside) break;
-  }
-  if (!outside) return;
+  if (!mixedSpaceFitTextOutsideScope(
+    segs.map((segment) => ('text' in segment ? segment.text : undefined)),
+    environment.autoSpaceDE,
+    environment.autoSpaceDN,
+  )) return;
   for (const segment of segs) {
     if ('text' in segment) segment.mixedSpaceAverageWidthRatio = undefined;
   }
