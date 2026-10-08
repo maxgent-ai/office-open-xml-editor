@@ -27,6 +27,20 @@ describe('planParetoLayout', () => {
       .toEqual([39.66, 65.52, 81.03, 93.1, 100, 100]);
   });
 
+  it('keeps an unvalued named category at its source slot in authored order', () => {
+    const source = series([5, null, 3]);
+    source.dataPointOverrides = [{ idx: 2, color: 'ABCDEF' }];
+    const layout = planParetoLayout(source, ['A', 'B', 'C'], {
+      sortDescending: false,
+      keepUnvaluedCategories: true,
+    });
+    expect(layout.categories).toEqual(['A', 'B', 'C']);
+    expect(layout.orderedSeries.values).toEqual([5, null, 3]);
+    expect(layout.orderedSeries.dataPointOverrides).toEqual([{ idx: 2, color: 'ABCDEF' }]);
+    // The cumulative share is unchanged through a slot that adds no value.
+    expect(layout.series.values).toEqual([5 / 8, 5 / 8, 1]);
+  });
+
   it('can retain authored order for a standalone paretoLine', () => {
     const layout = planParetoLayout(
       series([4, 8, 6, 4]),
