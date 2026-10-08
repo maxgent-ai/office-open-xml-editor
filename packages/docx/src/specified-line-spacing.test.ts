@@ -140,17 +140,21 @@ describe('Word specified spacing for ordinary Latin text', () => {
     expect(Math.abs(paragraph.lines[0].baselinePt - 72 - 40)).toBeLessThan(.24);
   });
 
-  it('preserves tall-host allocation in the unresolved grid-atLeast class', () => {
+  it('keeps grid-atLeast floating hosts out of visible-text allocation', () => {
     const hosted = render('Arial', 10, { rule: 'atLeast', value: 24, explicit: true }, true, 30);
-    expect(hosted.flowBounds.heightPt).toBeCloseTo(103.4912109375, 10);
+    const free = render('Arial', 10, { rule: 'atLeast', value: 24, explicit: true }, true);
+    expect(hosted.lines.map(line => line.baselinePt)).toEqual(free.lines.map(line => line.baselinePt));
+    expect(hosted.flowBounds.heightPt).toBe(72);
   });
 
   it.each([
-    ['Arial', 10, 24, 24, 15.63037109375],
-    ['Yu Mincho', 30, 24, 42.97998046875001, 31.355712890625],
-  ] as const)('preserves the unresolved %s grid-atLeast class', (font, size, minimum, advance, baseline) => {
+    ['Arial', 10, 24, 24, 17.52],
+    ['Arial', 10, 40, 40, 33.60],
+    ['Arial', 30, 24, 40, 30.96],
+    ['Yu Mincho', 30, 24, 60, 40.08],
+  ] as const)('places %s grid-atLeast leading before the normal cell box', (font, size, minimum, advance, baseline) => {
     const paragraph = render(font, size, { rule: 'atLeast', value: minimum, explicit: true }, true);
-    expect(paragraph.lines[0].advancePt).toBe(advance);
-    expect(paragraph.lines[0].baselinePt - 72).toBeCloseTo(baseline, 10);
+    expect(paragraph.lines.map(line => line.advancePt)).toEqual([advance, advance, advance]);
+    expect(Math.abs(paragraph.lines[0].baselinePt - 72 - baseline)).toBeLessThan(.24);
   });
 });
