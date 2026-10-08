@@ -85,10 +85,8 @@ pub(super) fn project(
     // position for every paragraph, including paragraphs without frame facts.
     // Positioned-table admission is deliberately main-story-only (tables::Writer).
     // Headers share a drawing store but do not acquire that layout contract.
-    let mut tables = Writer::with_positioned_tables(
-        table_sequence,
-        matches!(floating, Some((_, floating::Part::Main))),
-    );
+    let main_story = matches!(floating, Some((_, floating::Part::Main)));
+    let mut tables = Writer::with_positioned_tables(table_sequence, main_story);
     for (paragraph_index, prepared) in prepared.into_iter().enumerate() {
         let PreparedParagraph {
             source,
@@ -146,17 +144,38 @@ pub(super) fn project(
                 .as_ref()
                 .and_then(|frame| frame.table_paragraph_facts()),
         ) {
-            (Some(_), Some(frame)) => {
+            (Some(context), Some(frame)) => {
                 if table_context
                     .outer_row_position(paragraph_index)?
                     .is_some_and(|position| position.matches_cell_frame(frame))
                 {
                     // The positioned table itself carries this placement.
                     paragraph.frame_pr = None;
+                } else if main_story
+                    && context.source_cell_index.is_some()
+                    && matches!(
+                        table_context.tables()[context.table_id].location,
+                        Some(table_context::TableLocation::Cell { .. })
+                    )
+                    && direct.frame_gap.is_none()
+                    && paragraph.frame_pr.as_ref().is_some_and(|frame| {
+                        frame.drop_cap == "none"
+                            && frame.h_anchor == "margin"
+                            && frame.v_anchor == "text"
+                            && frame.wrap == "around"
+                            && frame.w.is_none()
+                            && frame.h.is_none()
+                            && frame.h_rule == "auto"
+                    })
+                {
+                    // MS-DOC 2.4.3 frame identity still segments native rows.
+                    // Preserve that identity and the representable framePr:
+                    // the shared consumer's WORD_CELL_OWNER_ROW_CONTEXT keeps
+                    // cell-owned tables as ordinary cell content. This bounded
+                    // library projection does not synthesize tblpPr or claim a
+                    // native Word positioning rule; its compatibility evidence
+                    // is recorded in docx/layout/table-compatibility.ts.
                 } else {
-                    // The DOCX renderer positions frames only in the body
-                    // flow; a framed cell paragraph would silently lay out in
-                    // flow.
                     formatting.unsupported_paragraph_properties = true;
                 }
             }

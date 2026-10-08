@@ -1484,3 +1484,115 @@ fn whole_model_keeps_refusing_framed_unpositioned_cell_paragraphs() {
         assert!(error.contains("unsupported formatting"), "{error}");
     }
 }
+
+fn nested_frame_source(first: Vec<u8>, second: Vec<u8>) -> Vec<u8> {
+    let properties = |frame: Vec<u8>| {
+        let mut properties = [nested_cell(), frame].concat();
+        if properties.len() % 2 == 0 {
+            properties.extend(sprm(0x2430, &[0], false));
+        }
+        properties
+    };
+    let text = "n\r\rm\r\rx\u{7}\u{7}\r";
+    let units = text.encode_utf16().count();
+    let source = source_with_typography(
+        text,
+        &[(units, 2, 12240, 15840, 1, 720)],
+        None,
+        None,
+        None,
+        None,
+    );
+    with_papx(
+        &source,
+        &[
+            (0, 2, properties(first)),
+            (2, 3, nested_row(500)),
+            (3, 5, properties(second)),
+            (5, 6, nested_row(500)),
+            (6, 8, cell()),
+            (8, 9, row(1000)),
+            (9, units, Vec::new()),
+        ],
+    )
+}
+
+fn nested_owner_frame(x: i16) -> Vec<u8> {
+    [padded_frame(0x60, x), sprm(0x2423, &[2], false)].concat()
+}
+
+#[test]
+fn nested_cell_frames_keep_source_facts_and_native_row_identity() {
+    for (second, expected_rows) in [(-4, vec![2]), (1441, vec![1, 1])] {
+        let bytes = nested_frame_source(nested_owner_frame(-4), nested_owner_frame(second));
+        let result = super::super::direct_model(&CompoundFile::open(&bytes).unwrap(), 1_000_000)
+            .expect("ordinary nested-cell frames have a shared model consumer");
+        let BodyElement::Table(outer) = &result.document.body[0] else {
+            panic!("outer")
+        };
+        assert!(outer.tblp_pr.is_none());
+        let nested: Vec<_> = outer.rows[0].cells[0]
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                CellElement::Table(table) => Some(table),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            nested.iter().map(|t| t.rows.len()).collect::<Vec<_>>(),
+            expected_rows
+        );
+        let paragraphs: Vec<_> = nested
+            .iter()
+            .flat_map(|table| table.rows.iter())
+            .flat_map(|row| row.cells.iter())
+            .flat_map(|cell| cell.content.iter())
+            .filter_map(|block| match block {
+                CellElement::Paragraph(p) => Some(p),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(paragraphs.len(), 2);
+        assert_eq!(
+            paragraphs
+                .iter()
+                .flat_map(|p| p.runs.iter())
+                .filter_map(|run| match run {
+                    DocRun::Text(t) => Some(t.text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            ["n", "m"]
+        );
+        for paragraph in paragraphs {
+            let frame = paragraph.frame_pr.as_ref().expect("retained native fact");
+            assert_eq!(
+                (&*frame.h_anchor, &*frame.v_anchor, &*frame.wrap),
+                ("margin", "text", "around")
+            );
+            assert_eq!(frame.y, Some(12.0));
+        }
+    }
+    for extra in [
+        sprm(0x2462, &[1], false),
+        sprm(0x8419, &0i16.to_le_bytes(), false),
+        sprm(0x841a, &400i16.to_le_bytes(), false),
+        sprm(0x442c, &9u16.to_le_bytes(), false),
+        sprm(0x443a, &1u16.to_le_bytes(), false),
+        sprm(0x261b, &[0x50], false),
+        sprm(0x2423, &[4], false),
+        sprm(0x442b, &400u16.to_le_bytes(), false),
+    ] {
+        let bytes = nested_frame_source(
+            [nested_owner_frame(-4), extra].concat(),
+            nested_owner_frame(-4),
+        );
+        assert!(
+            super::super::direct_model(&CompoundFile::open(&bytes).unwrap(), 1_000_000).is_err()
+        );
+    }
+    let root_frame = [nested_owner_frame(-4), sprm(0x2430, &[0], false)].concat();
+    let root = two_row_source(root_frame.clone(), root_frame);
+    assert!(super::super::direct_model(&CompoundFile::open(&root).unwrap(), 1_000_000).is_err());
+}
