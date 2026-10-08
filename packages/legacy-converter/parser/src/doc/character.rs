@@ -397,6 +397,24 @@ impl Properties {
             return Ok(true);
         }
         let (key, value) = match code {
+            0x2a86 => {
+                // [MS-DOC] 2.6.1 sprmCNeedFontFixup / 2.9.81 FFM is an
+                // enum, not a toggle. ffmNone and ffmDefault use the existing
+                // default Unicode font route: Canvas measurement and paint
+                // share the same CSS fallback chain, which substitutes a face
+                // for missing glyphs. This delegates to the library/browser
+                // font policy; it does not reproduce Word's font choice or
+                // guarantee installed coverage/identical metrics. Language-
+                // optimal and UI-font substitution need a distinct consumer.
+                let [value] = operand else {
+                    return Err(unsupported("invalid Word font fixup length"));
+                };
+                return match value {
+                    0 | 1 => Ok(true),
+                    2 | 4 => Ok(false),
+                    _ => Err(unsupported("invalid Word font fixup method")),
+                };
+            }
             0x484e => {
                 // MS-DOC 2.9.118 HresiOperand: hresNormal (1) with ChHres
                 // zero is the default word-breaking method. It adds no
