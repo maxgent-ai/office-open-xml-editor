@@ -5,7 +5,9 @@
 //! Automatic formatting is left unset so the shared renderer applies its
 //! ordinary automatic series colors.
 use super::reader::{Cached, Format, GroupKind, RawChart};
-use ooxml_common::chart::{ChartModel, ChartSeries};
+use ooxml_common::chart::{
+    ChartModel, ChartPlotGroup, ChartSeries, ChartThreeD, ChartThreeDSeriesAxis,
+};
 use ooxml_common::color::{parse_color_node, ThemeResolver, TintMode};
 
 pub(crate) struct Palette<'a> {
@@ -200,7 +202,7 @@ fn series_type(kind: GroupKind) -> &'static str {
         GroupKind::Pie { .. } | GroupKind::OfPie => "pie",
         GroupKind::Scatter { .. } => "scatter",
         GroupKind::Radar { .. } => "radar",
-        GroupKind::Surface => "surface",
+        GroupKind::Surface { .. } => "surface",
     }
 }
 
@@ -228,7 +230,7 @@ fn chart_type(kind: GroupKind) -> String {
         GroupKind::Scatter { bubbles: true } => "bubble".into(),
         GroupKind::Scatter { bubbles: false } => "scatter".into(),
         GroupKind::Radar { .. } => "radar".into(),
-        GroupKind::Surface => "surface".into(),
+        GroupKind::Surface { .. } => "surface".into(),
     }
 }
 
@@ -383,6 +385,61 @@ pub(crate) fn project_bounded(
         plot_visible_only: Some(raw.plot_visible_only),
         ..ChartModel::default()
     };
+    if let Some(view) = primary.three_d {
+        let pie = matches!(primary.kind, GroupKind::Pie { .. });
+        // MS-XLS 2.4.46 -> ECMA-376 CT_View3D/CT_Bar3DChart. f3DScaling
+        // makes pcHeight automatic; copying its resolved number to an authored
+        // hPercent changes the scene aspect ratio. BIFF pie pcHeight instead
+        // specifies thickness, not OOXML's default-thickness multiplier, so
+        // keep the shared painter's automatic pie thickness until that unit
+        // conversion is supported. fWalls2D has no shared scene-model slot;
+        // CrtMlFrt/XmlTk view overrides remain outside the BIFF projection.
+        let authored_height = !pie && view.flags & 4 == 0;
+        let bar_grouping = match primary.kind {
+            GroupKind::Bar {
+                stacked: true,
+                percent: true,
+                ..
+            } => Some("percentStacked"),
+            GroupKind::Bar { stacked: true, .. } => Some("stacked"),
+            GroupKind::Bar { .. } if view.flags & 2 != 0 => Some("clustered"),
+            GroupKind::Bar { .. } => Some("standard"),
+            _ => None,
+        };
+        model.three_d = Some(ChartThreeD {
+            view_3d_present: Some(true),
+            rotation_x: Some(i32::from(view.rotation_x)),
+            rotation_x_authored: Some(true),
+            rotation_y: Some(u32::from(view.rotation_y)),
+            rotation_y_authored: Some(true),
+            height_percent: authored_height.then_some(f64::from(view.height)),
+            height_percent_authored: Some(authored_height),
+            depth_percent: Some(f64::from(view.depth)),
+            depth_percent_authored: Some(true),
+            perspective: (!pie).then_some(u32::from(view.perspective)),
+            perspective_authored: Some(!pie),
+            right_angle_axes: Some(view.flags & 1 == 0),
+            right_angle_axes_authored: Some(true),
+            gap_depth_percent: (!pie).then_some(f64::from(view.gap)),
+            gap_depth_percent_authored: Some(!pie),
+            bar_grouping: bar_grouping.map(str::to_string),
+            shape: matches!(primary.kind, GroupKind::Bar { .. }).then(|| {
+                primary
+                    .default_format
+                    .as_ref()
+                    .and_then(|f| f.three_d_shape)
+                    .unwrap_or("box")
+                    .into()
+            }),
+            ..ChartThreeD::default()
+        });
+    }
+    if let GroupKind::Surface { wireframe } = primary.kind {
+        // Surf.fFillSurface (MS-XLS 2.4.272) is independent of Chart3d.
+        // The shared Surface painter currently remains planar even with a
+        // retained 3-D view; projected Surface geometry is a renderer gap.
+        model.surface_wireframe = Some(wireframe);
+    }
     let mut series_models = Vec::new();
     for (index, series) in raw.series.iter().enumerate() {
         if series.trend_or_error {
@@ -478,6 +535,25 @@ pub(crate) fn project_bounded(
             categories: Some(series_categories),
             ..ChartSeries::default()
         };
+        if group.three_d.is_some() && matches!(group.kind, GroupKind::Bar { .. }) {
+            model_series.three_d_shape = series
+                .series_format
+                .as_ref()
+                .and_then(|format| format.three_d_shape)
+                .map(str::to_string);
+        }
+        if matches!(group.kind, GroupKind::Scatter { bubbles: true }) {
+            // SerFmt belongs to the series/point SS. Bubble's shading is a
+            // marker effect, not Chart3d camera projection (MS-XLS 2.4.251).
+            model_series.bubble_3d = series
+                .series_format
+                .as_ref()
+                .and_then(|format| format.bubble_3d);
+            model_series.bubble_3d_group_default = group
+                .default_format
+                .as_ref()
+                .and_then(|format| format.bubble_3d);
+        }
         // Line-drawn groups take the series color from its line (the fill
         // only paints markers or areas); filled groups use the fill.
         let line_drawn = matches!(
@@ -609,6 +685,74 @@ pub(crate) fn project_bounded(
         .and_then(|series| series.categories.clone())
         .unwrap_or_default();
     model.series = series_models;
+    // A BIFF 3-D chart has one axis/chart group (MS-XLS 2.2.3.5). Preserve
+    // its ownership metadata just as the XLSX parser does, without changing
+    // the existing projection/dispatch of ordinary 2-D combination charts.
+    if raw.groups.len() == 1 && primary.three_d.is_some() {
+        let no_axes = matches!(primary.kind, GroupKind::Pie { .. });
+        let axis = if no_axes { "none" } else { "primary" };
+        let (grouping, direction, gap, overlap) = match primary.kind {
+            GroupKind::Bar {
+                horizontal,
+                gap,
+                overlap,
+                ..
+            } => (
+                model
+                    .three_d
+                    .as_ref()
+                    .and_then(|view| view.bar_grouping.clone()),
+                Some(if horizontal { "bar" } else { "col" }.into()),
+                Some(i32::from(gap)),
+                Some(i32::from(overlap)),
+            ),
+            GroupKind::Line { stacked, percent } | GroupKind::Area { stacked, percent } => (
+                Some(
+                    if stacked {
+                        grouping(stacked, percent)
+                    } else {
+                        "standard"
+                    }
+                    .into(),
+                ),
+                None,
+                None,
+                None,
+            ),
+            _ => (None, None, None, None),
+        };
+        model.plot_groups = Some(vec![ChartPlotGroup {
+            kind: match primary.kind {
+                GroupKind::Bar { .. } => "bar3D",
+                GroupKind::Line { .. } => "line3D",
+                GroupKind::Area { .. } => "area3D",
+                GroupKind::Pie { .. } => "pie3D",
+                _ => "surface",
+            }
+            .into(),
+            series_start: 0,
+            series_count: model.series.len(),
+            category_axis: axis.into(),
+            value_axis: axis.into(),
+            series_axis: if raw.axes.iter().any(|a| a.kind == 2 && a.axis_group == 0) {
+                "primary"
+            } else {
+                "none"
+            }
+            .into(),
+            axis_ids: None,
+            grouping,
+            bar_direction: direction,
+            scatter_style: None,
+            radar_style: None,
+            vary_colors: Some(primary.varied_colors),
+            gap_width: gap,
+            overlap,
+            bubble_scale: None,
+            bubble_size_represents: None,
+            show_negative_bubbles: None,
+        }]);
+    }
     if let Some(legend) = raw.groups.iter().find_map(|g| g.legend) {
         model.show_legend = true;
         model.legend_pos = Some(
@@ -678,6 +822,32 @@ pub(crate) fn project_bounded(
     // Font records carry twips; the shared model uses hundredths of a point.
     let hpt = |twips: u16| i32::from(twips) * 5;
     let color = |font: &super::super::styles::ChartFont| font.color.clone().map(hex);
+    if let Some(view) = model.three_d.as_mut() {
+        if let Some(axis) = raw.axes.iter().find(|a| a.kind == 2 && a.axis_group == 0) {
+            let font = axis.font.and_then(|i| palette.font(raw, i));
+            let axis_paint = paint(&axis.format, palette);
+            let line_authored = axis_paint.line_hidden || axis_paint.line.is_some();
+            view.series_axis = Some(ChartThreeDSeriesAxis {
+                title: raw.axis_titles.get(&7).cloned(),
+                orientation: axis.reversed.then(|| "maxMin".into()),
+                tick_label_pos: axis.ticks.map(|t| t.labels.into()),
+                tick_label_skip: axis.tick_label_skip,
+                tick_mark_skip: axis.tick_mark_skip,
+                major_tick_mark: axis.ticks.map_or("out", |t| t.major).into(),
+                minor_tick_mark: axis.ticks.map(|t| t.minor.into()),
+                font_size_hpt: font.as_ref().map(|f| hpt(f.size_twips)),
+                font_bold: font.as_ref().map(|f| f.bold),
+                font_italic: font.as_ref().map(|f| f.italic),
+                font_color: font.as_ref().and_then(color),
+                font_face: font.map(|f| f.name),
+                line_color: axis_paint.line,
+                line_hidden: axis_paint.line_hidden,
+                line_width_emu: axis_paint.line_width_emu,
+                line_paint_authored: line_authored.then_some(true),
+                ..ChartThreeDSeriesAxis::default()
+            });
+        }
+    }
     if let Some(font) = raw.title_font.and_then(|i| palette.font(raw, i)) {
         model.title_font_size_hpt = Some(hpt(font.size_twips));
         model.title_font_bold = Some(font.bold);
