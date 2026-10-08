@@ -66,15 +66,15 @@ describe('PPTX display-sized picture decode', () => {
       rotation: 0, flipH: false, flipV: false,
     };
     const slide = { index: 0, slideNumber: 1, background: null, elements: [
-      { ...frame, imagePath: 'legacy-ppt/image/1', mimeType: 'image/x-pict' },
-      { ...frame, imagePath: 'legacy-ppt/image/2', mimeType: 'image/png' },
+      { ...frame, imagePath: 'media/image-a', mimeType: 'image/x-pict' },
+      { ...frame, imagePath: 'media/image-b', mimeType: 'image/png' },
     ] } as Slide;
     await renderSlide(canvas(undefined, fillText), slide, 9_144_000, 6_858_000, {
       width: 960, dpr: 1,
       fetchImage: vi.fn(async () => new Blob([pngHeader(2, 1) as BlobPart], { type: 'image/png' })),
     });
     expect(fillText).toHaveBeenCalledWith('PICT image unsupported', 240, 180, 480);
-    expect(coreMocks.decode.mock.calls.map(([path]) => path)).toEqual(['legacy-ppt/image/2']);
+    expect(coreMocks.decode.mock.calls.map(([path]) => path)).toEqual(['media/image-b']);
   });
 
   it('propagates a recognized TIFF codec failure instead of silently omitting the picture', async () => {

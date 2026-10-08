@@ -47,7 +47,7 @@ const OPTIONAL_IMAGE_LABELS: Readonly<Record<OptionalImageCodec | 'pict', string
 
 /**
  * Paint the same bounded, non-throwing capability placeholder in every format.
- * PICT is an opaque legacy PPT resource, not an optional codec: callers may
+ * PICT is an opaque image resource, not an optional codec: callers may
  * label that unsupported format without claiming that its pixels were decoded.
  * The fixed label avoids shaping package-controlled or attacker-controlled text.
  */

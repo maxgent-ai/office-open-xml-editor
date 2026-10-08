@@ -6324,9 +6324,8 @@ async function preparePicture(
   // A PICT picture is an opaque unavailable-image resource, including OOXML
   // parts labeled with this MIME. QuickDraw is unsupported: keep the authored
   // bounds with a visible diagnostic instead of invoking a platform decoder.
-  // The legacy PPT source validates its OfficeArt envelope before labeling the
-  // resource; this renderer gate does not validate arbitrary OOXML PICT bytes
-  // or catch errors from supported image codecs.
+  // Each source validates its own container format; this renderer gate
+  // validates no PICT bytes and catches no errors from supported image codecs.
   if (el.mimeType === 'image/x-pict') {
     return { paint: (ctx) => paintUnavailablePicture(ctx, el, scale, 'pict') };
   }
