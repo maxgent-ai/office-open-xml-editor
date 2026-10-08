@@ -1,4 +1,20 @@
-import { describe, it, expect } from 'vitest';
+import { layoutDocument } from './document-layout.js';
+import { normalizeInternalDocumentModel } from './parser-model.js';
+import { createLayoutServices } from './layout-runtime.js';
+import { paintTextBoxLayout } from './paint/canvas-text.js';
+import { afterEach, describe, it, expect, vi } from 'vitest';
+import { rasterizeMathSvg } from '@silurus/ooxml-core';
+import { createPaintResourceRegistry } from './layout/paint-resources.js';
+import { createPaintResourceSession, unavailablePaintResourceHandle } from './paint/resource-session.js';
+import { createCanvasPaintResourcePainter } from './paint/canvas-page.js';
+import { canonicalCanvasPaintResourceHandlers } from './paint/canonical-resource-handlers.js';
+import { prepareMathResources } from './paint/math-resources.js';
+
+vi.mock('@silurus/ooxml-core', async (load) => ({
+  ...await load<typeof import('@silurus/ooxml-core')>(),
+  rasterizeMathSvg: vi.fn(async () => ({ source: {} })),
+}));
+afterEach(() => vi.restoreAllMocks());
 import {
   acquireAndPaintShapeTextBox,
   acquireShapeTextBoxForTest,
@@ -48,6 +64,7 @@ function makeMatrixCtx(): {
   ctx: CanvasRenderingContext2D;
   glyphs: GlyphCall[];
   images: ImageCall[];
+  clips: boolean[];
 } {
   let m = { a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 };
   const stack: (typeof m)[] = [];
@@ -60,6 +77,7 @@ function makeMatrixCtx(): {
   let fontKerning = 'auto';
   const glyphs: GlyphCall[] = [];
   const images: ImageCall[] = [];
+  const clips: boolean[] = [];
   const px = () => parseFloat(/(\d+(?:\.\d+)?)px/.exec(font)?.[1] ?? '10');
   const ctx = {
     get font() { return font; },
@@ -95,11 +113,16 @@ function makeMatrixCtx(): {
         f: m.f,
       };
     },
+    transform(a: number, b: number, c: number, d: number, e: number, f: number) {
+      m = { a: m.a * a + m.c * b, b: m.b * a + m.d * b,
+        c: m.a * c + m.c * d, d: m.b * c + m.d * d,
+        e: m.a * e + m.c * f + m.e, f: m.b * e + m.d * f + m.f };
+    },
     scale(sx: number, sy: number) {
       m = { ...m, a: m.a * sx, b: m.b * sx, c: m.c * sy, d: m.d * sy };
     },
     beginPath() {}, closePath() {}, moveTo() {}, lineTo() {}, rect() {},
-    fill() {}, stroke() {}, clip() {}, fillRect() {}, strokeRect() {}, clearRect() {},
+    fill() {}, stroke() {}, clip() { clips.push(true); }, fillRect() {}, strokeRect() {}, clearRect() {},
     setTransform() {}, resetTransform() {},
     measureText(s: string) {
       const p = px();
@@ -125,7 +148,7 @@ function makeMatrixCtx(): {
       images.push({ angleDeg, devX, devY, w, h });
     },
   };
-  return { ctx: ctx as unknown as CanvasRenderingContext2D, glyphs, images };
+  return { ctx: ctx as unknown as CanvasRenderingContext2D, glyphs, images, clips };
 }
 
 function richTextbox(
@@ -187,6 +210,71 @@ describe('§20.1.10.83 textbox <wps:bodyPr vert> — vertical text-box rendering
     expect(lat, 'Latin glyph drawn').toBeDefined();
     expect(NEAR(norm(cjk!.angleDeg), 0), `CJK @${cjk!.angleDeg}`).toBe(true);
     expect(NEAR(norm(lat!.angleDeg), 90), `Latin @${lat!.angleDeg}`).toBe(true);
+  });
+
+  it.each(['wordArtVert', 'wordArtVertRtl'])(
+    '%s: Word keeps Latin sideways, CJK upright and columns left-to-right',
+    (mode) => {
+      const { ctx, glyphs } = makeMatrixCtx();
+      const shape = richTextbox([run('AB'), run(CJK)], mode);
+      shape.textBlocks = [...shape.textBlocks!, { text: 'CD', fontSizePt: 10, alignment: 'left', runs: [run('CD')] }];
+      acquireAndPaintShapeTextBox(shape, 0, 0, 200, 100, ctx, 1, {});
+      const a = glyphs.find((g) => g.text === 'A')!;
+      const b = glyphs.find((g) => g.text === 'B')!;
+      const c = glyphs.find((g) => g.text === 'C')!;
+      const cjk = glyphs.find((g) => g.text === CJK)!;
+      expect(norm(a.angleDeg)).toBeCloseTo(90);
+      expect(norm(cjk.angleDeg)).toBeCloseTo(0);
+      expect(b.devY - a.devY).toBeCloseTo(10); // ordinary horizontal advance
+      expect(b.devX).toBeCloseTo(a.devX);
+      expect(c.devX).toBeGreaterThan(a.devX);
+    },
+  );
+
+  it('WordArt wrap=none retains one continuous overflowing column', () => {
+    const { ctx, glyphs, clips } = makeMatrixCtx();
+    const shape = Object.assign(richTextbox([run('ABCDE')], 'wordArtVert'), { textWrap: 'none', textAutofit: 'none' });
+    acquireAndPaintShapeTextBox(shape, 0, 0, 100, 30, ctx, 1, {});
+    expect(glyphs.map((g) => g.text).join('')).toBe('ABCDE');
+    expect(glyphs.every((g) => Math.abs(g.devX - glyphs[0].devX) < 0.001)).toBe(true);
+    expect(glyphs.at(-1)!.devY).toBeGreaterThan(30);
+    expect(clips).toEqual([]);
+  });
+
+  it('WordArt keeps physical inset axes and moves anchors along LTR columns', () => {
+    const draw = (extra: Partial<ShapeRun>) => {
+      const { ctx, glyphs } = makeMatrixCtx();
+      const shape = Object.assign(richTextbox([run('AB')], 'wordArtVert'), extra);
+      acquireAndPaintShapeTextBox(shape, 0, 0, 100, 100, ctx, 1, {});
+      return glyphs[0];
+    };
+    const start = draw({});
+    const inset = draw({ textInsetL: 10, textInsetT: 20 });
+    expect(inset.devX - start.devX).toBeCloseTo(10);
+    expect(inset.devY - start.devY).toBeCloseTo(20);
+    const center = draw({ textAnchor: 'ctr' });
+    const end = draw({ textAnchor: 'b' });
+    expect(center.devX).toBeGreaterThan(start.devX);
+    expect(end.devX).toBeGreaterThan(center.devX);
+  });
+
+  it('WordArt keeps emoji presentation clusters upright alongside sideways Latin', () => {
+    const { ctx, glyphs } = makeMatrixCtx();
+    acquireAndPaintShapeTextBox(richTextbox([run('A👩‍💻🇯🇵')], 'wordArtVert'), 0, 0, 200, 100, ctx, 1, {});
+    expect(norm(glyphs.find((g) => g.text === 'A')!.angleDeg)).toBeCloseTo(90);
+    const emoji = glyphs.filter((g) => /\p{Emoji_Presentation}/u.test(g.text));
+    expect(emoji.length).toBeGreaterThan(0);
+    for (const glyph of emoji) expect(norm(glyph.angleDeg)).toBeCloseTo(0);
+  });
+
+  it.each([
+    [30, false, false, 120], [90, false, false, 180],
+    [0, true, false, 90], [0, false, true, -90],
+  ])('WordArt text frame rotation=%s flipH=%s flipV=%s', (rotation, flipH, flipV, angle) => {
+    const { ctx, glyphs } = makeMatrixCtx();
+    const shape = { ...richTextbox([run('AB')], 'wordArtVert'), rotation, flipH, flipV };
+    acquireAndPaintShapeTextBox(shape, 0, 0, 200, 100, ctx, 1, {});
+    expect(norm(glyphs.find((g) => g.text === 'A')!.angleDeg)).toBeCloseTo(norm(angle));
   });
 
   it('rotated glyphs land INSIDE the physical box (transform pivots on box centre)', () => {
@@ -627,4 +715,91 @@ describe('§20.1.10.83 textbox <wps:bodyPr vert> — vertical text-box rendering
     // bIns must NOT move the physical-left first column.
     expect(firstColX(7, 20), 'bIns does not own the physical-left origin').toBeCloseTo(firstColX(7, 3), 5);
   });
+});
+
+// Compare cached and unavailable OMML geometry with the horizontal host rule.
+it.each(['cached', 'no engine', 'conversion', 'rasterization'] as const)('%s preserves horizontal math geometry and diagnostics in both stacked modes', async (failure) => {
+  const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+  if (failure === 'rasterization') vi.mocked(rasterizeMathSvg).mockRejectedValue(new Error('rasterization failed'));
+  try {
+    for (const display of [false, true]) {
+      const outcomes = [];
+      let horizontalGeometry: { advance: number; image?: ImageCall } | undefined;
+      for (const textVert of ['horz', 'wordArtVert', 'wordArtVertRtl']) {
+        warn.mockClear(); error.mockClear();
+        const { ctx, glyphs, images } = makeMatrixCtx();
+        const text = (value: string) => ({ type: 'text', text: value, fontSize: 10, fontFamily: 'NotInMetrics',
+          bold: false, italic: false, underline: false, strikethrough: false });
+        const paraProps = { alignment: 'left', indentLeft: 0, indentRight: 0, indentFirst: 0,
+          spaceBefore: 0, spaceAfter: 0, lineSpacing: null, numbering: null, tabStops: [] };
+        const shape = { ...richTextbox([], textVert), widthPt: 200, heightPt: 100,
+          textBoxContent: [{ type: 'paragraph', ...paraProps, runs: [text('A'),
+            { type: 'math', nodes: [{ kind: 'run', text: 'x+y', style: 'italic' }], display, fontSize: 10 }, text('B')] }] };
+        const normalized = normalizeInternalDocumentModel({
+          section: { pageWidth: 300, pageHeight: 200, marginTop: 0, marginRight: 0, marginBottom: 0,
+            marginLeft: 0, headerDistance: 0, footerDistance: 0, titlePage: false, evenAndOddHeaders: false },
+          body: [{ type: 'paragraph', ...paraProps, runs: [shape] }],
+          headers: { default: null, first: null, even: null }, footers: { default: null, first: null, even: null },
+          fontFamilyClasses: {},
+        } as unknown as import('./types.js').DocxDocumentModel);
+        const prepared = failure === 'no engine' ? undefined : await prepareMathResources(normalized.mathOccurrences, {
+          loadMathJax: async () => {},
+          mathMLToSvg: async () => {
+            if (failure === 'conversion') throw new Error('conversion failed');
+            return { svg: '<svg/>', widthEm: 3, ascentEm: 1.5, descentEm: .5 };
+          },
+        });
+        const services = createLayoutServices(normalized.document, { measureContext: ctx,
+          mathResources: prepared?.records, mathDrawables: prepared?.drawables });
+        const layout = layoutDocument(normalized.document, services, { currentDateMs: 0 });
+        const paragraph = layout.pages[0].layers.body.find((node) => node.kind === 'paragraph');
+        if (!paragraph || paragraph.kind !== 'paragraph') throw new Error('expected body paragraph');
+        const registry = createPaintResourceRegistry(normalized.mathOccurrences.map(({ resourceKey }) => ({ kind: 'math', resourceKey })));
+        const session = createPaintResourceSession(registry, normalized.mathOccurrences.map(({ resourceKey }) => ({
+          kind: 'math', resourceKey, handle: unavailablePaintResourceHandle('optional or failed math'),
+        })));
+        paintTextBoxLayout(paragraph.textBoxes[0]!, { ctx, scale: 1, dpr: 1, resources:
+          failure === 'cached' ? { paint(_key, _kind, bounds, target) {
+            target.drawImage({} as CanvasImageSource, bounds.xPt, bounds.yPt, bounds.widthPt, bounds.heightPt);
+          } } : createCanvasPaintResourcePainter(session, canonicalCanvasPaintResourceHandlers) });
+        const diagnostics = services.math.resolve(normalized.mathOccurrences[0].resourceKey).diagnostics;
+        const outcome = { text: glyphs.map((g) => g.text).join(''), images: images.length,
+          diagnostics, warnings: [...warn.mock.calls], errors: [...error.mock.calls] };
+        expect(outcome).toEqual({ text: 'AB', images: failure === 'cached' ? 1 : 0, diagnostics: failure === 'cached' ? [] : [{ code: 'UNSUPPORTED_FEATURE', severity: 'warning',
+          message: failure === 'no engine'
+            ? 'The optional math renderer is unavailable; using the deterministic text fallback'
+            : 'Math conversion failed; using the deterministic text fallback' }], warnings: [], errors: [] });
+        const [a, b] = glyphs;
+        if (textVert === 'horz') {
+          horizontalGeometry = { advance: b.devX - a.devX, image: images[0] };
+          if (failure === 'cached') {
+            expect(images[0]).toMatchObject({ w: 30, h: 20 });
+            expect(images[0].devX - a.devX).toBeCloseTo(10);
+          }
+          // A non-square fallback detects confusing horizontal advance with
+          // height: three 10 pt ems still reserve their inline extent.
+          const inlineAdvance = failure === 'cached' ? 30 : 3 * 10;
+          expect(b.devX - a.devX).toBeCloseTo(10 + inlineAdvance);
+          expect(b.devY).toBeCloseTo(a.devY);
+        } else {
+          const inlineAdvance = failure === 'cached' ? 10 + horizontalGeometry!.image!.h
+            : horizontalGeometry!.advance;
+          expect(b.devY - a.devY).toBeCloseTo(inlineAdvance);
+          expect(b.devX).toBeCloseTo(a.devX);
+          if (failure === 'cached') {
+            expect(images[0]).toMatchObject({ w: horizontalGeometry!.image!.w, h: horizontalGeometry!.image!.h });
+            expect(images[0].devY - a.devY).toBeCloseTo(10);
+            expect(norm(images[0].angleDeg)).toBeCloseTo(0);
+          } else {
+            expect(b.devY - a.devY).toBeCloseTo(horizontalGeometry!.advance);
+          }
+        }
+        outcomes.push(outcome);
+      }
+      expect(outcomes.slice(1)).toEqual([outcomes[0], outcomes[0]]);
+    }
+  } finally {
+    vi.mocked(rasterizeMathSvg).mockResolvedValue({ source: {} as CanvasImageSource, widthPx: 3, heightPx: 2 });
+  }
 });

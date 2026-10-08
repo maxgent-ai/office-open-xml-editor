@@ -160,7 +160,9 @@ function production(state, table, para, group) {
       + '  numberingMarkerShapeInput(): unknown;\n'
       + '  paragraphMarkShapeInput(): unknown;\n'
       + '  tableFormatInput(): unknown;\n'
+      + '  tableSourceAcquisitionInput(): unknown;\n'
       + '  tableColumnLayoutInput(): unknown;\n'
+      + '  effectiveTablePreferredWidthPt(): unknown;\n'
       + '  tableParticipatesInOrdinaryFlow(): unknown;\n'
       + '  paragraphAcquisitionInput(): unknown;\n'
       + '}\n');
@@ -351,6 +353,26 @@ function installParagraphAnchorFrameAdapter(root) {
 
 test('accepts the final canonical producer, retained model, selected variant, and worker route', () => {
   const root = initializeCanonicalFixture();
+  const result = runChecker(root, '--final');
+  assert.equal(result.status, 0, result.output);
+});
+
+test('retained shape ranges cannot replace text without projecting run context', () => {
+  for (const [spread, textMember] of [[true, 'text: request.text.slice(1)'], [true, 'text: fragment'], [true, 'text'], [false, 'text: request.text.substring(1)']]) {
+    const root = initializeCanonicalFixture();
+    write(root, 'packages/docx/src/layout/fragment.ts',
+      `export function measure(service, request, fragment, text) {
+        return service.shape({ ${spread ? '...request,' : 'fonts: request.fonts,'} ${textMember}, measure: true });
+      }`);
+    const result = runChecker(root, '--final');
+    assert.notEqual(result.status, 0);
+    assert.match(result.output, /TEXT_SHAPE_RANGE_CONTEXT/u);
+  }
+  const root = initializeCanonicalFixture();
+  write(root, 'packages/docx/src/layout/fragment.ts',
+    `export function measure(service, request) {
+      return service.shape({ ...sliceTextShapeRequest(request, 1, 2), measure: true });
+    }`);
   const result = runChecker(root, '--final');
   assert.equal(result.status, 0, result.output);
 });
@@ -633,6 +655,46 @@ test('production table and frame acquisition cannot regain local fallback measur
     const path = join(root, 'packages/docx/src/layout/production-body-layout.ts');
     write(root, 'packages/docx/src/layout/production-body-layout.ts', mutate(readFileSync(path, 'utf8')));
     expectDiagnostic(root, 'PRODUCTION_ACQUISITION_AUTHORITY', name, '--final');
+  }
+});
+
+test('logical-table preparation retains source ownership and complete column contexts', () => {
+  const root = initializeCanonicalFixture('docx-layout-boundary-logical-table-');
+  const path = 'packages/docx/src/layout/production-body-layout.ts';
+  const canonical = readFileSync(join(root, path), 'utf8')
+    .replace('function resolveColumnWidths(state, paragraph) {',
+      'function resolveColumnWidths(state, paragraph) { return acquireTableColumnInput(state, paragraph); }\n'
+      + 'function acquireTableColumnInput(state, paragraph) {')
+    .replace('sourceIndex: number)',
+      'sourceIndex: number, prepared?: Readonly<{ columns: readonly number[]; decision: LogicalTableDecision; member: TableMemberDecision }>)')
+    .replace('computeTablePtLayout(state, table, 100, 0)',
+      'computeTablePtLayout(state, table, 100, 0, { columns: [], decision: {}, member: {} })');
+  write(root, path, canonical);
+  assert.equal(runChecker(root, '--final').status, 0);
+  for (const [label, source] of [
+    ['reduced extracted context', canonical.replace(
+      'const baseContext = resolveParagraphLayoutContext(',
+      'const baseContext = state.layoutSettings ? resolveParagraphLayoutContext(',
+    ).replace('    paragraph,\n  );\n  return baseContext;', '    paragraph,\n  ) : {};\n  return baseContext;')],
+    ['unowned source', canonical.replace('sourceIndex: number', 'sourceIndex?: number')],
+    ['untyped preparation', canonical.replace(
+      'prepared?: Readonly<{ columns: readonly number[]; decision: LogicalTableDecision; member: TableMemberDecision }>',
+      'prepared?: unknown')],
+    ['unwired column authority', canonical.replace(
+      'return acquireTableColumnInput(state, paragraph);', 'return [];')],
+  ]) {
+    write(root, path, source);
+    expectDiagnostic(root, 'PRODUCTION_ACQUISITION_AUTHORITY', label, '--final');
+  }
+});
+
+test('member table acquisition cannot recompute logical compatibility eligibility', () => {
+  for (const helper of ['wordMeasuredTableOriginMode', 'wordFixedOccupiedGridInput', 'wordTableEffectiveIndentPt', 'wordTableOriginTranslationPt']) {
+    const root = initializeCanonicalFixture('docx-layout-boundary-table-decision-');
+    const path = 'packages/docx/src/layout/production-body-layout.ts';
+    write(root, path, `import { ${helper} as memberGate } from './table-compatibility.js';\n`
+      + readFileSync(join(root, path), 'utf8'));
+    expectDiagnostic(root, 'TABLE_LOGICAL_DECISION_AUTHORITY', helper, '--final');
   }
 });
 

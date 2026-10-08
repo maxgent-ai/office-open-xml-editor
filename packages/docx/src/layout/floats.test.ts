@@ -285,6 +285,8 @@ describe('block flow admission around floating-table exclusions', () => {
     resolveBlockFlowAdmission({
       inlineStartPt: 0,
       inlineEndPt: 20,
+      flowBandStartPt: 0,
+      flowBandEndPt: 20,
       blockStartPt: 0,
       blockExtentPt: 10,
       blockers,
@@ -309,6 +311,37 @@ describe('block flow admission around floating-table exclusions', () => {
 
   it('treats an edge overlap within the supplied epsilon as clear', () => {
     expect(admit([table('touching', -10.005, 10)])).toBe(0);
+  });
+
+  it('clears a frame by its §17.18.104 wrap: none/notBeside over the band, around over the block', () => {
+    // A 20pt block at the start of a 100pt band; the frame sits beside it,
+    // inside the band, vertically across the block.
+    const frame = (exclusionMode?: 'square' | 'topAndBottom'): FloatPlacementParticipant => Object.freeze({
+      occurrenceId: `frame-${exclusionMode ?? 'absent'}`,
+      kind: 'frame',
+      paragraphId: 0,
+      ...(exclusionMode ? { exclusionMode } : {}),
+      bounds: Object.freeze({ xPt: 50, yPt: 5, widthPt: 30, heightPt: 15 }),
+      exclusionBounds: Object.freeze({ xPt: 50, yPt: 5, widthPt: 30, heightPt: 15 }),
+    });
+    const admitInBand = (blocker: FloatPlacementParticipant, flowBandEndPt = 100) =>
+      resolveBlockFlowAdmission({
+        inlineStartPt: 0,
+        inlineEndPt: 20,
+        flowBandStartPt: 0,
+        flowBandEndPt,
+        blockStartPt: 0,
+        blockExtentPt: 10,
+        blockers: [blocker],
+        overlapEpsilonPt: 0.01,
+      }).blockStartPt;
+
+    expect(admitInBand(frame('topAndBottom'))).toBe(20);
+    expect(admitInBand(frame('square'))).toBe(0);
+    // Absent projects square, as on the registry entry.
+    expect(admitInBand(frame())).toBe(0);
+    // A frame outside the block's band (another column) never blocks it.
+    expect(admitInBand(frame('topAndBottom'), 40)).toBe(0);
   });
 });
 

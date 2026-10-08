@@ -76,7 +76,16 @@ export class DocxScrollLayoutController {
 
   apply(publication: DocxLayoutPublication): void {
     const mounted = [...this.hooks.mounted()];
+    const presented = this.prefix;
     this.prefix = publication.pageCount;
+    // A publication that keeps every presented page identical (typically one
+    // that only appends pages) leaves their canvases, painted or still in
+    // flight, valid. Discarding them would delay the first visible paint by a
+    // whole render per progressive checkpoint.
+    if ((publication.unchangedPages ?? 0) >= Math.min(presented, publication.pageCount)) {
+      this.hooks.relayout();
+      return;
+    }
     this.hooks.invalidateRender();
     this.hooks.relayout();
     for (const [page, slot] of mounted) {

@@ -89,7 +89,11 @@ describe('Node bounded DOCX document session', () => {
       count += 1;
     }
     expect(count).toBe(expectedPages);
-  });
+    // This compares two parser/layout paths and paints every public demo page
+    // through native Skia. Keep the same bounded integration timeout as the
+    // multi-page lifetime test below; the assertions check pagination and
+    // ownership, rather than a machine-dependent five-second performance SLO.
+  }, 15_000);
 
   it('does not route the bounded session through the materializing parse export', async () => {
     const parse = vi.spyOn(docxWasm, 'parse_docx');

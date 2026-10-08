@@ -38,7 +38,7 @@ test('find/selection overlays do not overflow a scaled-canvas scroll area › de
     stageClientHeight: number;
     canvasCssWidth: number;
     canvasCssHeight: number;
-    overlayRects: { w: number; h: number }[];
+    overlayRects: { tag: string; w: number; h: number }[];
   };
 
   // Precondition: the canvas really was scaled DOWN below its intended 960×540
@@ -55,7 +55,7 @@ test('find/selection overlays do not overflow a scaled-canvas scroll area › de
 
   // And the overlay layers track the SCALED canvas, not the intended 960×540 box:
   // each overlay layer's laid-out width equals the canvas's rendered width (±1).
-  expect(r.overlayRects.length).toBeGreaterThan(0);
+  expect(r.overlayRects.map((rect) => rect.tag).sort()).toEqual(['element', 'highlight', 'text']);
   for (const rect of r.overlayRects) {
     expect(Math.abs(rect.w - r.canvasCssWidth)).toBeLessThanOrEqual(1);
     expect(Math.abs(rect.h - r.canvasCssHeight)).toBeLessThanOrEqual(1);

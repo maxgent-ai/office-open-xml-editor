@@ -440,6 +440,11 @@ describe('paintParagraphLayout', () => {
           f: matrix.f + matrix.b * x + matrix.d * y,
         };
       },
+      transform(a: number, b: number, c: number, d: number, e: number, f: number) {
+        matrix = { a: matrix.a * a + matrix.c * b, b: matrix.b * a + matrix.d * b,
+          c: matrix.a * c + matrix.c * d, d: matrix.b * c + matrix.d * d,
+          e: matrix.a * e + matrix.c * f + matrix.e, f: matrix.b * e + matrix.d * f + matrix.f };
+      },
       scale(x: number, y: number) {
         matrix = { ...matrix, a: matrix.a * x, b: matrix.b * x, c: matrix.c * y, d: matrix.d * y };
       },

@@ -1,5 +1,6 @@
+import { sliceTextBreakWindow } from './text-break-window.js';
 import { graphemeClusterOffsets } from '@silurus/ooxml-core';
-import { EAST_ASIAN_RE } from '../layout/text.js';
+import { EAST_ASIAN_RE, sliceTextShapeRequest } from '../layout/text.js';
 import { wordBalancedSpaceCellAdjustmentApplies } from '../layout/line-compatibility.js';
 import { type DocGridCtx, type LayoutSeg, type LayoutTextSeg } from './model.js';
 
@@ -7,7 +8,9 @@ import { type DocGridCtx, type LayoutSeg, type LayoutTextSeg } from './model.js'
  * segment split for wrapping must not retain geometry from the parent slice;
  * measurement and addToLine recompute these facts from the new text. */
 export const RESET_SLICED_TEXT_MEASUREMENT = {
+  leadingWordBoundaryPx: undefined,
   shapedClusters: undefined,
+  shapedSpaceClusters: undefined,
   selectedFaceInkBounds: undefined,
   selectedFaceFontBox: undefined,
   snapGridClass: undefined,
@@ -209,38 +212,30 @@ export function slicedTextMetadata(
   start: number,
   end: number,
 ): Pick<LayoutTextSeg,
-  'punctuationCompressions' | 'noBreakRanges' | 'externalLinkBreakOffsets'
+  'punctuationCompressions' | 'noBreakRanges' | 'explicitBreaks' | 'textShapeRequest' | 'sourceTextOffset'
 > {
   return {
+    ...(seg.sourceTextOffset === undefined ? {} : { sourceTextOffset: seg.sourceTextOffset + start }),
+    ...(seg.textShapeRequest
+      ? { textShapeRequest: sliceTextShapeRequest(seg.textShapeRequest, start, end) }
+      : {}),
     punctuationCompressions: slicedPunctuationCompressions(seg, start, end),
     noBreakRanges: slicedNoBreakRanges(seg, start, end),
-    externalLinkBreakOffsets: slicedExternalLinkBreakOffsets(seg, start, end),
+    explicitBreaks: sliceTextBreakWindow(seg.explicitBreaks, start, end),
   };
-}
-
-
-export function slicedExternalLinkBreakOffsets(
-  seg: LayoutTextSeg,
-  start: number,
-  end: number,
-): readonly number[] | undefined {
-  const sliced = seg.externalLinkBreakOffsets
-    ?.filter((offset) => offset > start && offset < end)
-    .map((offset) => offset - start);
-  return sliced && sliced.length > 0 ? Object.freeze(sliced) : undefined;
 }
 
 
 export function tightHorizontalGraphemeInk(
   segment: LayoutTextSeg,
   grapheme: string,
+  start = 0,
 ): Readonly<{ advancePt: number; xMinPt: number; xMaxPt: number }> | undefined {
   if (!segment.textLayoutService || !segment.textShapeRequest || grapheme.length === 0) {
     return undefined;
   }
   const shaped = segment.textLayoutService.shape({
-    ...segment.textShapeRequest,
-    text: grapheme,
+    ...sliceTextShapeRequest(segment.textShapeRequest, start, start + grapheme.length),
     measure: true,
     clusterGeometry: false,
   });
@@ -270,7 +265,6 @@ export function contextualHorizontalGraphemeAdvances(
   }
   const shaped = segment.textLayoutService.shape({
     ...segment.textShapeRequest,
-    text: segment.text,
     measure: true,
     clusterGeometry: true,
   });
@@ -325,7 +319,7 @@ export function retainHorizontalPunctuationInkClearance(segs: LayoutSeg[]): void
       if (end <= start) continue;
       const compressionIndex = compressionIndexByEnd.get(end);
       const currentInk = pending || compressionIndex !== undefined
-        ? tightHorizontalGraphemeInk(segment, segment.text.slice(start, end))
+        ? tightHorizontalGraphemeInk(segment, segment.text.slice(start, end), start)
         : undefined;
       if (pending && currentInk) {
         const adjustments = adjustedBySegment.get(pending.segment)

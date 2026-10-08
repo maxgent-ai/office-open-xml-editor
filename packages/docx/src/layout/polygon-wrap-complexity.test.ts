@@ -35,7 +35,11 @@ function starPoints(vertexCount: number, step: number) {
   });
 }
 
-function denseStar(vertexCount: number, step: number): FloatRect {
+function denseStar(
+  vertexCount: number,
+  step: number,
+  wrap: 'tight' | 'through' = 'tight',
+): FloatRect {
   const points = starPoints(vertexCount, step);
   const xs = points.map(({ xPt }) => xPt);
   const ys = points.map(({ yPt }) => yPt);
@@ -46,7 +50,7 @@ function denseStar(vertexCount: number, step: number): FloatRect {
   return {
     kind: 'shape',
     mode: 'square',
-    authoredWrap: 'tight',
+    authoredWrap: wrap,
     wrapPolygon: points,
     imageKey: 'dense-star',
     imageX: xLeft,
@@ -880,7 +884,9 @@ describe('polygon line-window active sweep complexity', () => {
 
   it('compiles a dense self-intersecting star incrementally and queries adjacent boundaries', () => {
     const vertexCount = 31;
-    const prepared = prepareFloatWrap([denseStar(vertexCount, 15)]);
+    // Through wrap: a tight line advances in line-height steps instead of the
+    // contour sweep (word-tight-wrap-line-step-advance).
+    const prepared = prepareFloatWrap([denseStar(vertexCount, 15, 'through')]);
 
     const { window, diagnostics } = computePreparedLineFloatWindowWithDiagnostics(
       95, 195, 0.5, 0, 200, prepared,

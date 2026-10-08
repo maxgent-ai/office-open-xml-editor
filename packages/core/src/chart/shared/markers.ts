@@ -6,7 +6,7 @@ import { chartDataPointStyleRole, chartSeriesSourceIndex, chartSeriesVariesByPoi
 import { chartStyleDirectFillDecision, chartStyleDirectLineDecision, chartStyleFillCascade, chartStyleLineCascade } from '../style-paint.js';
 import { axisLineWidthPx } from '../axis-style.js';
 import { seriesHasMarkerDetail } from '../marker-style.js';
-import { resolveFill } from '../../shape/paint.js';
+import { resolveNativeFill as resolveFill } from '../../shape/paint.js';
 import { paintChartImageFill } from '../image-fill.js';
 import { dashPatternForLine } from './geometry.js';
 

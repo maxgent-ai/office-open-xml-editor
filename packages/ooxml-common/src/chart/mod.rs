@@ -105,6 +105,7 @@ mod chartex;
 mod classic;
 mod labels;
 mod model;
+mod retained;
 mod style;
 
 pub use axis::*;
@@ -113,6 +114,7 @@ use chartex::*;
 use classic::*;
 pub use labels::*;
 pub use model::*;
+pub use retained::RetainedBytes;
 use style::*;
 
 #[cfg(test)]
@@ -137,6 +139,13 @@ pub enum ChartHost {
     Word,
 }
 
+/// Identity of one independently retained ChartEx model within an OPC package.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChartRetentionKey<'a> {
+    pub source_part: &'a str,
+    pub site: &'a str,
+}
+
 /// Package-owned sidecars and lookup hooks for one chart part. All fields are
 /// optional so callers only supply resources present in the host package.
 /// A color resolver is required to parse; omission returns `None`.
@@ -145,6 +154,10 @@ pub enum ChartHost {
 #[derive(Default)]
 pub struct ChartParseContext<'a> {
     pub host: ChartHost,
+    /// Package-operation capability: hard failures survive Option-based adapters.
+    pub limit_reporter: Option<&'a crate::package_session::PackageLimitReporter>,
+    /// Stable source-part and retention-site identity for package accounting.
+    pub retention_key: Option<ChartRetentionKey<'a>>,
     pub color_resolver: Option<&'a dyn ColorResolver>,
     pub style_xml: Option<&'a str>,
     pub color_style_xml: Option<&'a str>,
@@ -164,6 +177,8 @@ impl<'a> ChartParseContext<'a> {
     ) -> Self {
         Self {
             host: ChartHost::Unspecified,
+            limit_reporter: None,
+            retention_key: None,
             color_resolver: Some(color_resolver),
             style_xml,
             color_style_xml,
@@ -180,13 +195,91 @@ pub fn parse_chart_part(root: Node, context: &ChartParseContext<'_>) -> Option<C
 
 /// Parse a Microsoft chartEx part into the shared wire model.
 pub fn parse_chartex_part(root: Node, context: &ChartParseContext<'_>) -> Option<ChartModel> {
-    parse_part(
+    use crate::resource::{
+        observe_hard_limit, HardResourceLimitKind, HARD_MAX_CHARTEX_ALLOCATION_BYTES,
+        HARD_MAX_CHARTEX_ALLOCATION_ELEMENTS,
+    };
+
+    match chartex_preparse_lower_bound(root) {
+        Ok(_) => {}
+        Err(violation) => {
+            let (kind, limit, observed) = match violation {
+                ChartexPreparseViolation::Elements(observed) => (
+                    HardResourceLimitKind::ChartexAllocationElements,
+                    HARD_MAX_CHARTEX_ALLOCATION_ELEMENTS,
+                    observed,
+                ),
+                ChartexPreparseViolation::Bytes(observed) => (
+                    HardResourceLimitKind::ChartexAllocationBytes,
+                    HARD_MAX_CHARTEX_ALLOCATION_BYTES,
+                    observed,
+                ),
+            };
+            if let Some(reporter) = context.limit_reporter {
+                let _ = reporter.observe_hard_limit(kind, None, limit, observed);
+            } else {
+                let _ = observe_hard_limit(kind, None, limit, observed);
+            }
+            return None;
+        }
+    }
+
+    let canonical = parse_part_value(
         root,
         context,
         |root, resolver, style, colors, refs, images| {
-            parse_chartex_impl(root, resolver, style, colors, refs, images, context.host)
+            Some(build_chartex_canonical(
+                root, resolver, style, colors, refs, images,
+            ))
         },
-    )
+    )?;
+    if let Some(observed) = canonical.checkpoint_violation() {
+        if let Some(reporter) = context.limit_reporter {
+            let _ = reporter.observe_hard_limit(
+                HardResourceLimitKind::ChartexAllocationBytes,
+                None,
+                HARD_MAX_CHARTEX_ALLOCATION_BYTES,
+                observed,
+            );
+        } else {
+            let _ = observe_hard_limit(
+                HardResourceLimitKind::ChartexAllocationBytes,
+                None,
+                HARD_MAX_CHARTEX_ALLOCATION_BYTES,
+                observed,
+            );
+        }
+        return None;
+    }
+    let retained = canonical.retained_bytes();
+    let result =
+        if let (Some(reporter), Some(key)) = (context.limit_reporter, context.retention_key) {
+            reporter.retain_instance(
+                HardResourceLimitKind::ChartexAllocationBytes,
+                key.source_part,
+                key.site,
+                HARD_MAX_CHARTEX_ALLOCATION_BYTES,
+                retained,
+            )
+        } else if let Some(reporter) = context.limit_reporter {
+            reporter.observe_hard_limit(
+                HardResourceLimitKind::ChartexAllocationBytes,
+                None,
+                HARD_MAX_CHARTEX_ALLOCATION_BYTES,
+                retained,
+            )
+        } else {
+            observe_hard_limit(
+                HardResourceLimitKind::ChartexAllocationBytes,
+                None,
+                HARD_MAX_CHARTEX_ALLOCATION_BYTES,
+                retained,
+            )
+        };
+    if result.is_err() || retained > HARD_MAX_CHARTEX_ALLOCATION_BYTES {
+        return None;
+    }
+    canonical.project(context.host)
 }
 
 fn parse_part(
@@ -201,6 +294,21 @@ fn parse_part(
         &dyn ChartImageResolver,
     ) -> Option<ChartModel>,
 ) -> Option<ChartModel> {
+    parse_part_value(root, context, parser)
+}
+
+fn parse_part_value<T>(
+    root: Node,
+    context: &ChartParseContext<'_>,
+    parser: impl FnOnce(
+        Node<'_, '_>,
+        &dyn ColorResolver,
+        Option<&str>,
+        Option<&str>,
+        &mut dyn ChartReferenceResolver,
+        &dyn ChartImageResolver,
+    ) -> Option<T>,
+) -> Option<T> {
     let color_resolver = context.color_resolver?;
     let images = context.images.unwrap_or(&EmptyChartImageResolver);
     let mut references = context.references.take();

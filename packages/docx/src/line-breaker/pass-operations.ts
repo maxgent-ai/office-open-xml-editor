@@ -1,16 +1,17 @@
+import { textBreakOffsetAt, textBreakOffsets } from './text-break-window.js';
+import { candidateUnit, lineGapModel, type GapSegment } from './line-gaps.js';
 import { LineMeasurementAdapter } from './measurement-adapter.js';
-import { graphemeClusterOffsets } from '@silurus/ooxml-core';
+import { enumerateGaps, graphemeClusterOffsets, kinsokuAdjustedSplit } from '@silurus/ooxml-core';
 import {
-  MIN_LINE_GAP,
   prepareFloatWrap,
   computePreparedLineFloatWindow,
   type PreparedFloatWrap,
 } from '../float-layout.js';
-import { calcEffectiveFontPx, EAST_ASIAN_RE } from '../layout/text.js';
+import { calcEffectiveFontPx, EAST_ASIAN_RE, independentTextShapeRequest, sliceTextShapeRequest } from '../layout/text.js';
 import {
   wordSnapToCharsEastAsianCellCount,
   wordIdeographicSpaceLineEndAllowanceCount,
-  wordUniformRunPositionPaintPt,
+  wordJustifiedInterwordCompressionFactor,
 } from '../layout/line-compatibility.js';
 import {
   type LayoutImageSeg,
@@ -20,7 +21,13 @@ import {
   type LayoutTextSeg,
   type LineBoundary,
 } from './model.js';
-import { createLineBreakerState } from './break-queue.js';
+import { createLineBreakerState, type GapTransaction, type GapWindow } from './break-queue.js';
+import {
+  commitMixedLineItem,
+  createMixedSpaceState,
+  performSettleMixedSpaces,
+  type MixedSpaceCandidate,
+} from './mixed-space-fit.js';
 import { applyBidiTabPostPass } from './tabs.js';
 import {
   eastAsianGridCountSinglePx,
@@ -30,8 +37,11 @@ import {
 import {
   RESET_SLICED_TEXT_MEASUREMENT,
   charScaleFactor,
+  segLetterSpacingPx,
   charSpacingDeltaPx,
   protectedNoBreakOffsets,
+  hardJoinPrefixEnd,
+  legalTextSplitAtOrBefore,
   segAdvanceWidth,
   segmentCharacterGridDeltaPx,
   slicedPunctuationCompressions,
@@ -46,7 +56,7 @@ import {
 } from './font-routes.js';
 import { rubyAscentReservePx } from './ruby-metrics.js';
 import { fitCJKPrefix, hasEastAsianVisiblePredecessor } from './fit-search.js';
-import { rebaseSeaBreaks } from './text-runs.js';
+import { rebaseSeaBreaks, hasCJKBreakOpportunity } from './text-runs.js';
 import {
   keepLeadingKinsoku,
   retractLeadingKinsoku,
@@ -56,13 +66,18 @@ import {
 import type { LineBreakerPassInput } from './pass-driver.js';
 
 export interface PassOperationState extends LineBreakerPassInput {
+  readonly reservePrefixWork: (utf16Units: number) => void;
   readonly breakerState: ReturnType<typeof createLineBreakerState>;
   readonly sameLatinSpaceFace: (candidate: LayoutTextSeg, reference: LayoutTextSeg) => boolean;
   readonly materializeLatinSpaceCompression: () => void;
   readonly snapPitchPx: number | null;
-  readonly minLineStartWidth: () => number;
-  readonly isParagraphMarkOnlyFlow: boolean;
-  readonly startLine: (minWidth?: number) => void;
+  readonly lineHeadRequirement: (boundary?: LineBoundary) => number;
+  readonly startLine: (requirement?: number) => void;
+  /** Report a forced placement of the unit starting at `unitStart` in the
+   * current line; throws LineGapRejection inside a narrowed float gap. */
+  readonly forcedPlacement: (requiredWidth: number, unitStart?: number) => void;
+  /** Smallest legal line-head advance of a text segment under placement rules. */
+  readonly minimalLegalTextWidth: (segment: LayoutTextSeg) => number;
   readonly availW: () => number;
   readonly fitsMeasuredWidth: (used: number, available: number) => boolean;
   readonly bidiCustomStopsPx: {
@@ -101,6 +116,9 @@ export interface PassOperationState extends LineBreakerPassInput {
     retainTrailingPunctuationCompression?: boolean,
   ) => number;
   readonly fitHomogeneousLatinSpaces: (next: LayoutTextSeg, nextFitWidth: number) => boolean;
+  /** WORD_COMPRESSED_SPACE_LINE_FIT (mixed-script lines); see mixed-space-fit.ts. */
+  readonly mixedSpaceRequirement: (candidate: MixedSpaceCandidate) => number | undefined;
+  readonly markMixedSpacesCompressed: () => void;
   readonly textSegmentBox: (
     s: LayoutTextSeg,
   ) => Readonly<{ width: number; height: number; ascent: number; descent: number }>;
@@ -116,7 +134,7 @@ export interface PassOperationState extends LineBreakerPassInput {
     available: number,
     forceAtLeastOne?: boolean,
   ) => number;
-  readonly externalLinkSyntaxSplit: (segment: LayoutTextSeg, available: number) => number;
+  readonly explicitTextSplit: (segment: LayoutTextSeg, available: number) => number;
   readonly queueEmergencyTail: (segment: LayoutTextSeg, split: number) => void;
   readonly retractCurrentLineForLeadingKinsoku: (next: LayoutTextSeg) => CrossRunKinsokuRetraction;
   readonly keepLeadingKinsokuWithCurrentLine: (
@@ -126,6 +144,7 @@ export interface PassOperationState extends LineBreakerPassInput {
     desc: number,
   ) => boolean;
   readonly probeHeights: readonly number[] | null;
+  readonly probeFloors: readonly number[] | null;
   readonly preparedFloatWrap?: PreparedFloatWrap;
 }
 
@@ -166,60 +185,408 @@ export function performMaterializeLatinSpaceCompression(operationState: PassOper
   breakerState.latinAppliedPerGap = 0;
 }
 
-export function performStartLine(operationState: PassOperationState, minWidth: number = 0): void {
-  const { breakerState, maxWidth, wrapCtx, baseRtl, probeHeights, preparedFloatWrap } =
-    operationState;
+/**
+ * WORD_FLOAT_GAP_FLOW (#1670): one physical line may be split into fragments,
+ * one per free gap, filled in reading order. ECMA-376 §20.4.2.17–.19 permits
+ * text on both sides of a square/tight/through object but does not say how a
+ * line is partitioned. The registered rule selects the first gap in reading
+ * order whose width admits the content placed there, then continues into
+ * later gaps on the same baseline.
+ *
+ * Admission is a placement transaction, not a separate width predictor. A
+ * fragment narrowed by an exclusion is filled by ordinary placement. If any
+ * placement path would force content into it (an emergency split, an illegal
+ * kinsoku split, or an advance past the fragment edge), the fragment rolls
+ * back to its first placement and the search continues with a requirement
+ * strictly larger than the rejected gap. A full paragraph band (no exclusion
+ * narrows it) keeps the established forced-placement behavior, so progress is
+ * guaranteed once a unit fits no narrowed gap.
+ */
+export class LineGapRejection extends Error {
+  constructor(
+    /** Lower bound of the forced unit's advance, from placement's own measurement. */
+    readonly requiredWidth: number,
+    /** Complete units precede the forced unit: end the fragment before it. */
+    readonly stopBefore?: LineBoundary,
+  ) {
+    super('A narrowed float gap cannot admit the line-head unit');
+    this.name = 'LineGapRejection';
+  }
+}
+
+/** Seed requirement for a line head. Content needs no more than the solver's
+ * numeric floor: placement decides admission. A mark-only head (no inline
+ * content remains) keeps `word-empty-mark-float-side-gap`. */
+export function performLineHeadRequirement(
+  operationState: PassOperationState,
+  boundary?: LineBoundary,
+): number {
+  const { wrapCtx, segs, breakerState, scale } = operationState;
+  if (!wrapCtx) return 0;
+  const start = boundary?.segIndex ?? 0;
+  // Source boundaries must start directly at their index: walking the already
+  // consumed prefix at every fragment would make long paragraphs quadratic.
+  function* sourceCandidates(): IterableIterator<LayoutSeg> {
+    for (let index = start; index < segs.length; index += 1) yield segs[index];
+  }
+  const candidates = boundary ? sourceCandidates() : breakerState.queue;
+  let mark: LayoutTextSeg | undefined;
+  for (const candidate of candidates) {
+    if (('text' in candidate && !candidate.metricOnly && candidate.text.length > 0)
+      || ('imagePath' in candidate && !candidate.anchor) || 'math' in candidate
+      || 'isTab' in candidate || 'lineBreak' in candidate) return 0;
+    if ('text' in candidate && candidate.metricOnly) mark ??= candidate;
+  }
+  if (boundary ? start >= segs.length : breakerState.queue.length === 0) return 0;
+  return wrapCtx.paragraphMarkLineStartWidth ?? (mark ? mark.fontSize * scale : 0);
+}
+
+/** Smallest prefix placement may legally put at a line head: the first SEA
+ * boundary, the first CJK split legal under kinsoku and protected ranges, the
+ * first URL syntax opportunity, a hard seam's protected prefix, else the whole
+ * segment (segments are already delimited at ordinary opportunities). Used
+ * only as the lower bound reported when a narrowed gap rejects its head. */
+export function performMinimalLegalTextWidth(
+  operationState: PassOperationState,
+  segment: LayoutTextSeg,
+): number {
+  const { kinsoku, strAdvance, baseRtl } = operationState;
+  const text = segment.text;
+  let end = text.length;
+  if (segment.fitTextRegionIndex === undefined && !segment.ruby && !segment.tateChuYoko) {
+    const protectedOffsets = protectedNoBreakOffsets(segment);
+    if (segment.hardJoinPrev === true) {
+      end = hardJoinPrefixEnd(segment) ?? text.length;
+    } else if (segment.seaBreaks !== undefined) {
+      end = segment.seaBreaks.find((offset) => offset > 0 && offset < text.length) ?? text.length;
+    } else if (hasCJKBreakOpportunity(text)) {
+      const characters = [...text];
+      for (let count = 1; count < characters.length; count += 1) {
+        if (kinsokuAdjustedSplit(characters, count, kinsoku, 0) !== count) continue;
+        const utf16 = characters.slice(0, count).join('').length;
+        if (legalTextSplitAtOrBefore(segment, utf16, 1) === utf16) {
+          end = utf16;
+          break;
+        }
+      }
+    } else {
+      end = [...textBreakOffsets(segment.explicitBreaks)].find((offset) =>
+        offset > 0 && offset < text.length && !protectedOffsets.has(offset)) ?? text.length;
+    }
+  }
+  const prefix = text.slice(0, end);
+  // The fit tests exclude a collapsible U+0020 suffix except in an RTL line.
+  return strAdvance(segment, baseRtl ? prefix : prefix.replace(/ +$/u, ''));
+}
+
+/** Vertical allocation belongs to the physical line; only a failed gap
+ * continuation opens a new line. Horizontal queue/fit state resets per gap. */
+function resetPhysicalLineMetrics({ breakerState }: PassOperationState): void {
+  breakerState.lineHeight = 0;
+  breakerState.lineAscent = 0;
+  breakerState.lineDescent = 0;
+  breakerState.lineIntendedSingle = 0;
+  breakerState.lineHasInlinePicture = false;
+  breakerState.linePictureMarkSingle = 0;
+  breakerState.lineGridCountSingle = 0;
+  breakerState.lineLatinGridCountSingle = 0;
+  breakerState.lineVisibleAscent = 0;
+  breakerState.lineVisibleDescent = 0;
+  breakerState.lineVisibleIntendedSingle = 0;
+  breakerState.lineHasVisibleMetrics = false;
+  breakerState.lineHasRuby = false;
+  breakerState.lineEastAsian = false;
+  breakerState.positionReferencePt = undefined;
+  breakerState.firstPositioned = undefined;
+  breakerState.uniformPositionEligible = true;
+}
+
+/** Exclusion probe band of a physical line. The initial pass measures without
+ * exclusions. Afterwards every physical line is probed in the pass that
+ * reaches it: a line the previous pass did not produce uses the last resolved
+ * physical allocation, and the next pass replaces it with its own. With fixed
+ * metrics, the result converges in three passes (measure, resolve, confirm)
+ * regardless of how many physical lines or gaps exclusions create; varying
+ * metrics retain the fail-closed pass guard. */
+function physicalProbeHeight(probeHeights: readonly number[] | null, index: number): number | undefined {
+  if (!probeHeights || probeHeights.length === 0) return undefined;
+  return probeHeights[index] ?? probeHeights[probeHeights.length - 1];
+}
+
+function openPhysicalLine(operationState: PassOperationState): void {
+  const { breakerState } = operationState;
+  resetPhysicalLineMetrics(operationState);
+  if (breakerState.lines.length > 0) breakerState.physicalLineIndex += 1;
+}
+
+/** Width between the paragraph's trailing indent and the text margin (zero
+ * when a negative indent already reaches past the margin). */
+function marginExtensionWidth({ marginRightPx, maxWidth }: PassOperationState): number {
+  return Math.max(0, marginRightPx - maxWidth);
+}
+
+export function performStartLine(operationState: PassOperationState, requirement: number = 0): void {
+  const { breakerState, maxWidth, wrapCtx, firstIndent, probeFloors } = operationState;
 
   breakerState.snapBlock = null;
   breakerState.lineXOffset = 0;
   breakerState.lineMaxWidth = maxWidth;
+  breakerState.lineMarginExtension = marginExtensionWidth(operationState);
+  breakerState.gapTransaction = null;
+  const cursor = breakerState.fragmentCursor;
+  breakerState.fragmentCursor = null;
+  // Every gap of this physical line uses the same observed band. New gaps
+  // are horizontal placements, so they need no additional convergence pass.
+  // Without an observed band (first pass), the line is measured unconstrained.
+  if (!wrapCtx || physicalProbeHeight(probeFloors, breakerState.physicalLineIndex) === undefined) {
+    openPhysicalLine(operationState);
+    return;
+  }
+  const transaction: GapTransaction = {
+    cursor,
+    requestTopY: breakerState.currentLineTopY,
+    requirement: requirement + (breakerState.isFirst ? Math.max(0, firstIndent) : 0),
+    window: null,
+    narrowed: false,
+    endsAtExclusion: false,
+    snapshot: null,
+    stopBefore: null,
+  };
+  breakerState.gapTransaction = transaction;
+  if (!cursor) openPhysicalLine(operationState);
+  placeLineWindow(operationState, transaction, null);
+}
+
+/** Search the first admissible window for the transaction's requirement:
+ * a later gap on the continuation baseline, else a new physical line. */
+function placeLineWindow(
+  operationState: PassOperationState,
+  transaction: GapTransaction,
+  rejected: GapWindow | null,
+): void {
+  const { breakerState, maxWidth, wrapCtx, baseRtl, firstIndent, probeFloors, preparedFloatWrap } =
+    operationState;
   if (!wrapCtx) return;
-  const probeH = probeHeights?.[breakerState.lines.length];
-  // The first pass measures this line without a float window. A later pass
-  // resolves it only once that exact line index has an observed line-box
-  // height; newly-created lines are likewise measured before they are probed.
-  if (probeH === undefined) return;
+  // §17.3.1.12 removes a hanging indent from the paragraph's first-line
+  // indentation, not from an object's exclusion (§20.4.2.17–.19). Query the
+  // expanded first-line band before subtracting floats; applying the hanging
+  // offset after that subtraction would move text back inside an object.
+  // Positive first-line indents remain an inset within the selected window.
+  // The measured-line contract still carries the authored firstIndent: restore
+  // it in the returned width so fit/tab arithmetic and planLine consume the
+  // same safe window, including the mirrored logical start of RTL paragraphs.
+  const hangingOffset = breakerState.isFirst ? Math.min(0, firstIndent) : 0;
+  const lineBandX = wrapCtx.paraX + (baseRtl ? 0 : hangingOffset);
+  const lineBandWidth = maxWidth - hangingOffset;
   const reference = {
     xLeftPt: wrapCtx.referenceXPt ?? wrapCtx.paraX,
     xRightPt: (wrapCtx.referenceXPt ?? wrapCtx.paraX) + (wrapCtx.referenceWidthPt ?? maxWidth),
     readingDirection: wrapCtx.readingDirection ?? (baseRtl ? 'rtl' : 'ltr'),
   } as const;
-  if (wrapCtx.lineWindow) {
-    const win = wrapCtx.lineWindow({
-      topYPt: breakerState.currentLineTopY,
-      minimumStartWidthPt: MIN_LINE_GAP,
-      squareMinimumStartWidthPt: minWidth,
-      probeHeightPt: probeH,
-      paragraphXPt: wrapCtx.paraX,
-      maximumWidthPt: maxWidth,
-      columnXPt: wrapCtx.columnXPt,
-      columnWidthPt: wrapCtx.columnWidthPt,
-    });
-    breakerState.currentLineTopY = win.topYPt;
-    breakerState.lineXOffset = win.xOffsetPt;
-    breakerState.lineMaxWidth = win.maximumWidthPt;
-  } else {
-    const win = computePreparedLineFloatWindow(
-      breakerState.currentLineTopY,
-      MIN_LINE_GAP,
-      probeH,
-      wrapCtx.paraX,
-      maxWidth,
+  const query = (topY: number, x: number, width: number, height: number,
+    requiredWidth = transaction.requirement) => {
+    if (wrapCtx.lineWindow) {
+      const win = wrapCtx.lineWindow({
+        topYPt: topY, minimumStartWidthPt: requiredWidth,
+        squareMinimumStartWidthPt: requiredWidth, probeHeightPt: height,
+        paragraphXPt: x, maximumWidthPt: width,
+        columnXPt: wrapCtx.columnXPt, columnWidthPt: wrapCtx.columnWidthPt,
+      });
+      return { topY: win.topYPt, xOffset: win.xOffsetPt, maxWidth: win.maximumWidthPt };
+    }
+    return computePreparedLineFloatWindow(
+      topY, requiredWidth, height, x, width,
       preparedFloatWrap ?? prepareFloatWrap(wrapCtx.floats),
-      wrapCtx.columnXPt,
-      wrapCtx.columnXPt + wrapCtx.columnWidthPt,
-      reference,
-      minWidth,
+      wrapCtx.columnXPt, wrapCtx.columnXPt + wrapCtx.columnWidthPt,
+      reference, requiredWidth,
     );
-    breakerState.currentLineTopY = win.topY;
-    breakerState.lineXOffset = win.xOffset;
-    breakerState.lineMaxWidth = win.maxWidth;
+  };
+  let accepted: GapWindow & { narrowed: boolean } | null = null;
+  const cursor = transaction.cursor;
+  if (cursor) {
+    const probeH = physicalProbeHeight(probeFloors, breakerState.physicalLineIndex);
+    const left = baseRtl ? lineBandX : cursor.right;
+    const right = baseRtl ? cursor.left : lineBandX + lineBandWidth;
+    if (probeH !== undefined && right > left) {
+      const next = query(cursor.topY, left, right - left, probeH);
+      if (next.topY === cursor.topY && next.maxWidth >= transaction.requirement) {
+        // A strictly smaller unvisited band gives monotonic horizontal
+        // progress; the column and largest-side reference never shrink.
+        accepted = {
+          topY: next.topY,
+          xOffset: left - wrapCtx.paraX + next.xOffset,
+          maxWidth: next.maxWidth,
+          solverWidth: next.maxWidth,
+          narrowed: true,
+        };
+      }
+    }
+    if (!accepted) {
+      // No later gap on this baseline admits the head: the physical line ends.
+      transaction.cursor = null;
+      openPhysicalLine(operationState);
+      breakerState.currentLineTopY = transaction.requestTopY;
+    }
   }
+  if (!accepted) {
+    const probeH = physicalProbeHeight(probeFloors, breakerState.physicalLineIndex);
+    if (probeH === undefined) {
+      breakerState.lineXOffset = 0;
+      breakerState.lineMaxWidth = maxWidth;
+      breakerState.lineMarginExtension = marginExtensionWidth(operationState);
+      transaction.window = null;
+      transaction.narrowed = false;
+      transaction.endsAtExclusion = false;
+      transaction.snapshot = null;
+      return;
+    }
+    const win = query(transaction.requestTopY, lineBandX, lineBandWidth, probeH);
+    accepted = {
+      topY: win.topY,
+      xOffset: win.xOffset,
+      maxWidth: win.maxWidth + hangingOffset,
+      solverWidth: win.maxWidth,
+      narrowed: win.xOffset !== 0 || win.maxWidth !== lineBandWidth,
+    };
+  }
+  // After a rejection the requirement exceeds the rejected width. A window
+  // still narrower than it is not admitted by the solver's exact comparison
+  // (it differs only by representable rounding) or comes from a boundary
+  // that does not honor the requirement. Accept it without a transaction:
+  // forced placement is then the established behavior, and the search ends.
+  if (rejected && accepted.narrowed && accepted.solverWidth < transaction.requirement) {
+    accepted = { ...accepted, narrowed: false };
+  }
+  breakerState.currentLineTopY = accepted.topY;
+  breakerState.lineXOffset = accepted.xOffset;
+  breakerState.lineMaxWidth = accepted.maxWidth;
+  // A trailing-indent extension exists only beside an unnarrowed band, and
+  // only where no exclusion intersects it on this line (§20.4.2.17–.19).
+  const extension = marginExtensionWidth(operationState);
+  const extensionProbeH = physicalProbeHeight(probeFloors, breakerState.physicalLineIndex);
+  if (accepted.narrowed || extension <= 0 || baseRtl) {
+    breakerState.lineMarginExtension = 0;
+  } else if (extensionProbeH === undefined) {
+    breakerState.lineMarginExtension = extension;
+  } else {
+    const free = query(accepted.topY, wrapCtx.paraX + maxWidth, extension, extensionProbeH, extension);
+    breakerState.lineMarginExtension = free.topY === accepted.topY && free.xOffset === 0
+      && free.maxWidth >= extension ? extension : 0;
+  }
+  transaction.window = accepted;
+  transaction.narrowed = accepted.narrowed;
+  // Absolute line-end edge versus the paragraph band edge, in reading order.
+  const windowStart = wrapCtx.paraX + accepted.xOffset;
+  const windowEnd = windowStart + accepted.maxWidth;
+  transaction.endsAtExclusion = baseRtl
+    ? windowStart > lineBandX + 1e-9
+    : windowEnd < lineBandX + lineBandWidth - 1e-9;
+  transaction.snapshot = null;
+  if (accepted.narrowed) performCaptureGapSnapshot(operationState, true);
+}
+
+/** Record the rollback image of a narrowed fragment before its first unit.
+ * Called when the window is accepted (the iterator may hold the segment being
+ * processed) and again at each iterator step while the fragment is empty, so
+ * content re-queued by the preceding flush (e.g. kinsoku retraction) is kept. */
+export function performCaptureGapSnapshot(
+  operationState: PassOperationState,
+  includeInHand: boolean,
+): void {
+  const { breakerState } = operationState;
+  const transaction = breakerState.gapTransaction;
+  if (!transaction?.narrowed) return;
+  const {
+    lines, queue, currentLine: _line, latinLineGaps: _gaps, gapTransaction: _transaction,
+    inHand, snapBlock, ...scalars
+  } = breakerState;
+  transaction.snapshot = {
+    scalars: { ...scalars },
+    snapBlock: snapBlock ? { ...snapBlock } : null,
+    linesLength: lines.length,
+    queue: queue.snapshot(includeInHand ? inHand : undefined),
+  };
+}
+
+/** Called by every placement path that would force its unit into the
+ * current fragment. On a full band this is the established behavior; in a
+ * narrowed gap the fragment is rejected (or ended before the unit). */
+export function performForcedPlacement(
+  operationState: PassOperationState,
+  requiredWidth: number,
+  unitStart = 0,
+): void {
+  const { breakerState } = operationState;
+  const transaction = breakerState.gapTransaction;
+  if (!transaction?.narrowed || !transaction.snapshot) return;
+  // Inkless items before the unit (anchor characters, mark metrics) travel
+  // with it; only inked content can end the fragment before the unit.
+  let committed = false;
+  for (let index = 0; index < unitStart && index < breakerState.currentLine.length; index += 1) {
+    if (!isInklessLineItem(breakerState.currentLine[index])) {
+      committed = true;
+      break;
+    }
+  }
+  const lead = committed ? breakerState.currentLine[unitStart] : undefined;
+  throw new LineGapRejection(requiredWidth, lead?.src ? { ...lead.src } : undefined);
+}
+
+function isInklessLineItem(item: LayoutSeg): boolean {
+  return ('text' in item && item.metricOnly === true) || ('imagePath' in item && Boolean(item.anchor));
+}
+
+/** Lower bound of a queued unit's line-head advance, from placement's measures. */
+function headUnitLowerBound(operationState: PassOperationState, segment: LayoutSeg | undefined): number {
+  if (!segment) return 0;
+  if ('text' in segment) return operationState.minimalLegalTextWidth(segment);
+  if ('imagePath' in segment) return segment.anchor ? 0 : segment.widthPt * operationState.scale;
+  if ('math' in segment) return segment.measuredWidth;
+  return 0;
+}
+
+/** Roll a rejected fragment back and continue the search. */
+export function performRejectGap(
+  operationState: PassOperationState,
+  rejection: LineGapRejection,
+): void {
+  const { breakerState, firstIndent, maxWidth } = operationState;
+  const transaction = breakerState.gapTransaction;
+  const snapshot = transaction?.snapshot;
+  if (!transaction || !snapshot || !transaction.window) throw rejection;
+  Object.assign(breakerState, snapshot.scalars);
+  breakerState.snapBlock = snapshot.snapBlock
+    ? { ...(snapshot.snapBlock as NonNullable<typeof breakerState.snapBlock>) }
+    : null;
+  breakerState.lines.length = snapshot.linesLength;
+  breakerState.queue.restore(snapshot.queue);
+  breakerState.currentLine = [];
+  breakerState.latinLineGaps = [];
+  breakerState.mixedSpace = createMixedSpaceState();
+  breakerState.inHand = undefined;
+  // A replay ends the fragment before the forced unit. If the replay cannot
+  // reach that source boundary, the whole fragment is rejected instead.
+  if (rejection.stopBefore && !transaction.stopBefore) {
+    transaction.stopBefore = rejection.stopBefore;
+    return;
+  }
+  transaction.stopBefore = null;
+  const rejected = transaction.window;
+  const required = rejection.requiredWidth
+    + (breakerState.isFirst ? Math.max(0, firstIndent) : 0);
+  const hangingOffset = breakerState.isFirst ? Math.min(0, firstIndent) : 0;
+  // The forced unit did not fit this gap, so its advance exceeds the width
+  // the solver admitted. A lower bound that does not (non-monotone advances)
+  // sends the unit to the full band instead of creeping through gaps.
+  transaction.requirement = required > rejected.solverWidth
+    ? Math.max(transaction.requirement, required)
+    : maxWidth - hangingOffset;
+  placeLineWindow(operationState, transaction, rejected);
 }
 
 export function performAvailW(operationState: PassOperationState) {
   const { breakerState, firstIndent, widthPolicy } = operationState;
-  return widthPolicy === 'intrinsic'
+  return widthPolicy !== 'bounded'
     ? Number.POSITIVE_INFINITY
     : breakerState.lineMaxWidth - (breakerState.isFirst ? firstIndent : 0);
 }
@@ -231,9 +598,13 @@ export function performFitsMeasuredWidth(
 ): boolean {
   const { breakerState, firstIndent, widthPolicy } = operationState;
 
-  if (used <= available) return true;
+  // Intrinsic AutoFit widths can become the exact final line width. The
+  // margin subtraction and point/pixel round trip may differ by an ulp from
+  // the same shaped advance. Use the existing grapheme-fit numerical epsilon
+  // (below), not an Office width allowance, before forcing an emergency split.
+  if (used <= available + 1e-9) return true;
   if (
-    widthPolicy === 'intrinsic' ||
+    widthPolicy !== 'bounded' ||
     !Number.isFinite(used) ||
     !Number.isFinite(breakerState.lineMaxWidth)
   ) {
@@ -251,7 +622,7 @@ export function performFlush(
   const {
     breakerState,
     materializeLatinSpaceCompression,
-    minLineStartWidth,
+    lineHeadRequirement,
     startLine,
     bidiCustomStopsPx,
     bidiIntervalPx,
@@ -266,11 +637,22 @@ export function performFlush(
     baseRtl,
   } = operationState;
 
+  // An anchor character or paragraph-mark metric has no advance; it moves
+  // with the unit that follows it. A narrowed fragment holding only such
+  // items cannot end before that unit: the unit is its head (forced here).
+  // Tabs and breaks are pen/line controls, not such units.
+  const followingUnit = headUnitLowerBound(operationState, breakerState.inHand);
+  if (!brTerminated && nextStart !== undefined && followingUnit > 0
+    && breakerState.currentLine.length > 0 && breakerState.currentLine.every(isInklessLineItem)) {
+    operationState.forcedPlacement(followingUnit);
+  }
   materializeLatinSpaceCompression();
+  performSettleMixedSpaces(operationState);
   breakerState.currentWidth += applyBidiTabPostPass({
     baseRtl,
     currentLine: breakerState.currentLine,
     marginRightPx,
+    maxWidth: operationState.maxWidth,
     lineXOffset: breakerState.lineXOffset,
     lineMaxWidth: breakerState.lineMaxWidth,
     isFirst: breakerState.isFirst,
@@ -291,35 +673,31 @@ export function performFlush(
   // provide a zero-position reference; tabs do not contribute vertical
   // metrics. The fixed drop-cap path intentionally keeps its paint-only
   // lowering and therefore opts out of this normalization.
-  let commonPositionPt: number | undefined;
-  let hasPositionReference = false;
   for (const segment of breakerState.currentLine) {
     if ('isTab' in segment) continue;
-    const positionPt = 'text' in segment ? (segment.position ?? 0) : 0;
-    if ('text' in segment && segment.positionExtendsLineBox === false) {
-      commonPositionPt = 0;
-      hasPositionReference = true;
-      break;
+    const position = 'text' in segment && segment.positionExtendsLineBox !== false
+      ? (segment.position ?? 0) : 0;
+    if (breakerState.positionReferencePt === undefined) breakerState.positionReferencePt = position;
+    else if (breakerState.positionReferencePt !== position) breakerState.positionReferencePt = null;
+    if (!('text' in segment)) {
+      breakerState.uniformPositionEligible = false;
+      continue;
     }
-    if (!hasPositionReference) {
-      commonPositionPt = positionPt;
-      hasPositionReference = true;
-    } else if (commonPositionPt !== positionPt) {
-      commonPositionPt = 0;
-      break;
-    }
+    breakerState.firstPositioned ??= segment;
+    const first = breakerState.firstPositioned;
+    breakerState.uniformPositionEligible &&= segment.text.length > 0
+      && !segment.metricOnly && !segment.ruby && !segment.vertAlign
+      && segment.positionExtendsLineBox !== false
+      && segment.position === first.position
+      && segment.fontFamily === first.fontFamily
+      && segment.fontRoute?.fingerprint === first.fontRoute?.fingerprint
+      && segment.bold === first.bold && segment.italic === first.italic
+      && segment.fontSize === first.fontSize
+      && segment.resolvedDesignDescentRatio === first.resolvedDesignDescentRatio
+      && segment.referenceFontVerticalMetric === first.referenceFontVerticalMetric
+      && segment.resolvedResourceVerticalMetric === first.resolvedResourceVerticalMetric;
   }
-  const linePositionReferencePt = hasPositionReference ? (commonPositionPt ?? 0) : 0;
-  if (linePositionReferencePt !== 0) {
-    for (const segment of breakerState.currentLine) {
-      if ('text' in segment) {
-        segment.lineRelativePosition = wordUniformRunPositionPaintPt(
-          segment.position ?? 0,
-          linePositionReferencePt,
-        );
-      }
-    }
-  }
+  const linePositionReferencePt = breakerState.positionReferencePt ?? 0;
   // §17.3.3.1 — the break is one run among the line's runs: its own size
   // participates in the line height but must not override a taller peer.
   const h =
@@ -351,35 +729,11 @@ export function performFlush(
   // visible text in one admitted face tuple. Canvas fallback geometry does
   // not reveal hhea descent, and mixed styles cannot share one descent
   // reserve. The rule uses face data, never a family-specific correction.
-  const positionedTexts = breakerState.currentLine.filter(
-    (segment): segment is LayoutTextSeg => 'text' in segment,
-  );
-  const firstPositioned = positionedTexts[0];
+  const firstPositioned = breakerState.firstPositioned;
   const uniformPositionAuto =
-    linePositionReferencePt !== 0 &&
-    positionedTexts.length > 0 &&
-    breakerState.currentLine.every((segment) => 'isTab' in segment || 'text' in segment) &&
-    firstPositioned?.resolvedDesignDescentRatio != null &&
-    (firstPositioned.referenceFontVerticalMetric ||
-      firstPositioned.resolvedResourceVerticalMetric) &&
-    positionedTexts.every(
-      (segment) =>
-        segment.text.length > 0 &&
-        !segment.metricOnly &&
-        !segment.ruby &&
-        !segment.vertAlign &&
-        segment.positionExtendsLineBox !== false &&
-        segment.position === linePositionReferencePt &&
-        segment.fontFamily === firstPositioned.fontFamily &&
-        segment.fontRoute?.fingerprint === firstPositioned.fontRoute?.fingerprint &&
-        segment.bold === firstPositioned.bold &&
-        segment.italic === firstPositioned.italic &&
-        segment.fontSize === firstPositioned.fontSize &&
-        segment.resolvedDesignDescentRatio === firstPositioned.resolvedDesignDescentRatio &&
-        segment.referenceFontVerticalMetric === firstPositioned.referenceFontVerticalMetric &&
-        segment.resolvedResourceVerticalMetric === firstPositioned.resolvedResourceVerticalMetric &&
-        (segment.referenceFontVerticalMetric || segment.resolvedResourceVerticalMetric),
-    )
+    linePositionReferencePt !== 0 && breakerState.uniformPositionEligible
+    && firstPositioned?.resolvedDesignDescentRatio != null
+    && (firstPositioned.referenceFontVerticalMetric || firstPositioned.resolvedResourceVerticalMetric)
       ? {
           normalSinglePx: Math.max(
             asc + desc - Math.abs(linePositionReferencePt * scale),
@@ -391,6 +745,20 @@ export function performFlush(
         }
       : undefined;
   breakerState.lines.push({
+    physicalLineIndex: breakerState.physicalLineIndex,
+    ...(justifiedCompressionApplies(operationState)
+      ? {
+          justifiedCompressionPx: breakerState.justifiedCompressionPx,
+          gapPlan: {
+            ...lineGapModel(breakerState.currentLine.map(s => gapSegment(operationState, s))),
+            // CJK/ideographic/SEA expansion has no proportional measurement.
+            // Retain its previous opportunities; family selection lives in core.
+            expansionGaps: enumerateGaps(breakerState.currentLine.map(s => ({
+              text: 'text' in s && !s.metricOnly && s.fitTextRegionIndex === undefined && s.snapGridClass === undefined
+                ? s.text : undefined,
+            })), { lastDrawnSi: Infinity }).gaps,
+          },
+        } : {}),
     segments: breakerState.currentLine,
     height: h,
     ascent: asc,
@@ -399,6 +767,7 @@ export function performFlush(
     visibleDescent,
     visibleIntendedSingle,
     intendedSingle: breakerState.lineIntendedSingle,
+    latinGridCountSingle: breakerState.lineLatinGridCountSingle,
     ...(inlinePictureTextSingle > 0 ? { inlinePictureTextSingle } : {}),
     uniformPositionAuto,
     // Empty/synthetic East Asian lines use the same design-height rule as a
@@ -407,14 +776,28 @@ export function performFlush(
     gridCountSingle,
     xOffset: breakerState.lineXOffset,
     availWidth: breakerState.lineMaxWidth,
+    ...(breakerState.currentLine.some((segment) => 'isTab' in segment && segment.marginAllocation)
+      ? { marginExtension: breakerState.lineMarginExtension } : {}),
     topY: wrapCtx ? breakerState.currentLineTopY : undefined,
     hasRuby: breakerState.lineHasRuby,
     eastAsian: breakerState.lineEastAsian,
     endsWithBreak: brTerminated,
-    consumedEnd: nextStart ?? breakerState.queue[0]?.src ?? endBoundary,
+    consumedEnd: nextStart ?? breakerState.queue.peek()?.src ?? endBoundary,
   });
   if (wrapCtx) {
-    breakerState.currentLineTopY += wrapCtx.lineBoxH(
+    if (!brTerminated && nextStart !== undefined) {
+      breakerState.fragmentCursor = {
+        topY: breakerState.currentLineTopY,
+        left: wrapCtx.paraX + breakerState.lineXOffset
+          + (breakerState.isFirst ? Math.min(0, firstIndent) : 0),
+        right: wrapCtx.paraX + breakerState.lineXOffset + breakerState.lineMaxWidth,
+      };
+    }
+    // Use the physical allocation that supplied the exclusion probe. Local
+    // fragment metrics can be smaller than a later gap or paragraph-wide ruby
+    // reserve (§17.3.3.25); they cannot independently advance the next origin.
+    breakerState.currentLineTopY += operationState.probeHeights?.[breakerState.physicalLineIndex]
+      ?? wrapCtx.lineBoxH(
       asc,
       desc,
       breakerState.lineHasRuby,
@@ -423,29 +806,20 @@ export function performFlush(
       gridCountSingle,
       uniformPositionAuto,
       inlinePictureTextSingle,
+      breakerState.lineLatinGridCountSingle,
     );
   }
   breakerState.currentLine = [];
   breakerState.currentWidth = 0;
+  breakerState.justifiedGapModel = undefined;
+  breakerState.justifiedCompressionPx = 0;
+  breakerState.justifiedUnitEnd = undefined;
   breakerState.latinLineFace = undefined;
   breakerState.latinLineHomogeneous = true;
   breakerState.latinLineGaps = [];
   breakerState.latinUniformGapCapacity = undefined;
-  breakerState.lineHeight = 0;
-  breakerState.lineAscent = 0;
-  breakerState.lineDescent = 0;
-  breakerState.lineIntendedSingle = 0;
-  breakerState.lineHasInlinePicture = false;
-  breakerState.linePictureMarkSingle = 0;
-  breakerState.lineGridCountSingle = 0;
-  breakerState.lineVisibleAscent = 0;
-  breakerState.lineVisibleDescent = 0;
-  breakerState.lineVisibleIntendedSingle = 0;
-  breakerState.lineHasVisibleMetrics = false;
-  breakerState.lineHasRuby = false;
-  breakerState.lineEastAsian = false;
   breakerState.isFirst = false;
-  startLine(minLineStartWidth());
+  startLine(lineHeadRequirement(nextStart));
 }
 
 export function performProspectiveSnapAdvance(
@@ -560,12 +934,17 @@ export function performAddToLine(
   } else {
     breakerState.snapBlock = null;
   }
-  breakerState.currentLine.push(s);
+  commitMixedLineItem(breakerState, s, scale);
   breakerState.currentWidth += committedWidth;
+  if (justifiedCompressionApplies(operationState)) {
+    const previous = breakerState.justifiedGapModel;
+    breakerState.justifiedGapModel = previous?.segmentCount === breakerState.currentLine.length - 1
+      ? lineGapModel([gapSegment(operationState, s)], previous, false)
+      : lineGapModel(breakerState.currentLine.map(item => gapSegment(operationState, item)), undefined, false);
+  }
   if (
     'text' in s &&
-    s.latinSpaceCompressionEligible === true &&
-    s.latinSpaceAverageWidthRatio != null &&
+    s.latinSpaceCompressionEligible === true && s.latinSpaceAverageWidthRatio != null &&
     s.fontRoute
   ) {
     if (breakerState.latinLineFace && !sameLatinSpaceFace(s, breakerState.latinLineFace)) {
@@ -574,10 +953,13 @@ export function performAddToLine(
     }
     breakerState.latinLineFace ??= s;
     if (s.latinNaturalTrailingSpacePx !== undefined) {
-      const floor =
-        ((calcEffectiveFontPx(s, scale) * s.latinSpaceAverageWidthRatio) / 2) * charScaleFactor(s) +
-        segmentCharacterGridDeltaPx(s, characterGrid, scale);
-      const capacity = Math.max(0, s.latinNaturalTrailingSpacePx - floor);
+      const capacity = Math.max(
+        0,
+        s.latinNaturalTrailingSpacePx - (
+          ((calcEffectiveFontPx(s, scale) * s.latinSpaceAverageWidthRatio!) / 2) * charScaleFactor(s) +
+          segmentCharacterGridDeltaPx(s, characterGrid, scale)
+        ),
+      );
       if (
         breakerState.latinUniformGapCapacity !== undefined &&
         Math.abs(capacity - breakerState.latinUniformGapCapacity) > 1e-6
@@ -588,7 +970,9 @@ export function performAddToLine(
       breakerState.latinUniformGapCapacity ??= capacity;
       breakerState.latinLineGaps.push(s);
     }
-  } else {
+  } else if (!(operationState.isJustified && isInklessLineItem(s))) {
+    // In a justified line an anchor character or paragraph-mark metric has no
+    // advance or separator, so it neither forms nor interrupts a gap.
     materializeLatinSpaceCompression();
     breakerState.latinLineHomogeneous = false;
   }
@@ -651,6 +1035,10 @@ export function performAddToLine(
               ? segmentEastAsiaFloorSingleLinePx(ts, intendedEm, segScriptHint)
               : 0,
           );
+    if (paintsInlineInk && !metricEastAsian && !ts.ruby
+      && ts.resolvedLatinGridCellAllocation === true) {
+      breakerState.lineLatinGridCountSingle = Math.max(breakerState.lineLatinGridCountSingle, designIntended);
+    }
     const intended = Math.max(designIntended, (nativeRatio ?? 0) * intendedEm);
     if (intended > breakerState.lineIntendedSingle) breakerState.lineIntendedSingle = intended;
     if (paintsInlineInk && intended > breakerState.lineVisibleIntendedSingle) {
@@ -725,8 +1113,7 @@ export function performStrNaturalAdvance(
   };
   if (s.textLayoutService && s.textShapeRequest) {
     const shaped = s.textLayoutService.shape({
-      ...s.textShapeRequest,
-      text,
+      ...sliceTextShapeRequest(s.textShapeRequest, Math.max(0, start), Math.max(0, start) + text.length),
       fontSizePt: effectiveFontPx(s),
       measure: true,
       clusterGeometry: false,
@@ -782,7 +1169,7 @@ export function performEastAsianSnapCellCount(
     const measuredSegment = {
       ...s,
       text,
-      punctuationCompressions: slicedPunctuationCompressions(s, start, end),
+      ...slicedTextMetadata(s, start, end),
     };
     let naturalAdvancePx: number;
     if (range.advancePx != null) {
@@ -814,9 +1201,13 @@ export function performStrAdvance(
 ): number {
   const { standaloneSnapAdvance, strNaturalAdvance } = operationState;
 
+  const start = retainTrailingPunctuationCompression ? s.text.length - text.length : 0;
   const candidate = {
     ...s,
     text,
+    // Snap-cell acquisition can remeasure this candidate, so it needs the
+    // same retained range as strNaturalAdvance, not the parent word request.
+    ...slicedTextMetadata(s, Math.max(0, start), Math.max(0, start) + text.length),
     shapedClusters: text === s.text ? s.shapedClusters : undefined,
   };
   return standaloneSnapAdvance(
@@ -879,6 +1270,114 @@ export function performFitHomogeneousLatinSpaces(
   return true;
 }
 
+/** Closed paragraph/layout gates only; no source/content/face taxonomy. */
+export function justifiedCompressionApplies(state: Pick<PassOperationState,
+  'justifiedCompression' | 'baseRtl' | 'widthPolicy' | 'characterGrid'>): boolean {
+  return state.justifiedCompression === true && !state.baseRtl
+    && state.widthPolicy === 'bounded'
+    && state.characterGrid?.type !== 'snapToChars'
+    && state.characterGrid?.type !== 'linesAndChars';
+}
+
+function gapSegment(state: Pick<PassOperationState, 'strAdvance' | 'scale' | 'characterGrid'>, segment: LayoutSeg): GapSegment {
+  if ('text' in segment) {
+    // §17.3.2.14 owns fixed-width fitText geometry and atomic wrapping.
+    // Its interaction with proportional justification is unmeasured: keep
+    // the cell and adjacent spaces fixed, as for the existing pitch policy.
+    if (segment.fitTextRegionIndex !== undefined) {
+      return { widthPx: segment.measuredWidth, spacePx: 0 };
+    }
+    const spaceWidths = new Map<number, number>();
+    const spaceClusters = segment.shapedSpaceClusters ?? segment.shapedClusters;
+    if (spaceClusters && !segment.ruby) {
+      const advances = new Map(spaceClusters.map(cluster => [cluster.range.start, cluster.advancePt]));
+      let utf16 = 0;
+      let cpOffset = 0;
+      for (const character of segment.text) {
+        if (character === ' ') {
+          const advance = advances.get(utf16);
+          if (advance === undefined) throw new Error('A text space lacks authoritative cluster geometry');
+          spaceWidths.set(cpOffset, advance * charScaleFactor(segment)
+            + segLetterSpacingPx(segment, state.characterGrid, state.scale));
+        }
+        utf16 += character.length;
+        cpOffset += 1;
+      }
+    }
+    const start = segment.text.indexOf(' ');
+    const spacePx = spaceWidths.values().next().value ?? (start >= 0 && !segment.ruby
+      ? state.strAdvance({ ...segment, text: ' ', ...slicedTextMetadata(segment, start, start + 1) }, ' ')
+      : 0);
+    return {
+      text: segment.metricOnly ? '' : segment.ruby ? undefined : segment.text,
+      widthPx: segment.measuredWidth, spacePx, spaceWidths,
+    };
+  }
+  return { widthPx: segment.measuredWidth, spacePx: 0 };
+}
+
+/** Admit the whole unit against the same natural gap model that layout uses
+ * for paint. Advances are never shortened here; compression is line-owned. */
+export function fitJustifiedCompression(state: Pick<PassOperationState,
+  'justifiedCompression' | 'baseRtl' | 'widthPolicy' | 'characterGrid' | 'breakerState'
+  | 'segAdvance' | 'strAdvance' | 'availW' | 'textSegmentBox' | 'addToLine' | 'scale' | 'measurement' | 'flush'>, first: LayoutTextSeg): boolean {
+  if (!justifiedCompressionApplies(state) || first.fitTextRegionIndex !== undefined) return false;
+  const { breakerState: breaker } = state;
+  if (breaker.justifiedUnitEnd) {
+    if (breaker.justifiedUnitEnd === first) breaker.justifiedUnitEnd = undefined;
+    return false;
+  }
+  const members = candidateUnit(first, breaker.queue);
+  // Opaque successors stay with their own placement path. Ruby is itself an
+  // opaque, measured text unit and participates without opening adjacent gaps.
+  if (members.some(member => !('text' in member))) return false;
+  let previousText = breaker.currentLine.at(-1);
+  const boundaries: number[] = [];
+  const boxes = members.map(member => {
+    if (!('text' in member)) throw new Error('A text candidate lost its placement unit');
+    const box = state.textSegmentBox(member);
+    const boundary = state.measurement.wordBoundaryAdvance(
+      previousText && 'text' in previousText ? previousText : undefined, member);
+    boundaries.push(boundary);
+    member.measuredWidth = box.width + boundary;
+    previousText = member;
+    return box;
+  });
+  if (!breaker.justifiedGapModel || breaker.justifiedGapModel.segmentCount !== breaker.currentLine.length) {
+    breaker.justifiedGapModel = lineGapModel(breaker.currentLine.map(s => gapSegment(state, s)), undefined, false);
+  }
+  const previous = breaker.justifiedGapModel;
+  const model = lineGapModel(members.map(s => gapSegment(state, s)), previous, false);
+  const overflow = model.visibleWidthPx - state.availW();
+  const factor = overflow > 0 ? wordJustifiedInterwordCompressionFactor({
+    overflow, naturalGapSum: model.S,
+    candidateLineEndSeparator: model.lineEndSeparatorPx,
+    previousOpportunitySum: previous.S + previous.lineEndSeparatorPx,
+    expansionWithoutCandidate: state.availW() - previous.visibleWidthPx,
+  }) : 0;
+  if (factor === undefined) {
+    for (const [index, member] of members.entries()) member.measuredWidth = boxes[index].width;
+    // An adjusted candidate that was refused must be reconsidered at a fresh
+    // line origin; the ordinary isolated-width path cannot override this fit.
+    if (boundaries.some(delta => delta !== 0) && breaker.currentLine.length > 0) {
+      state.flush(undefined, false, first.src);
+      breaker.queue.unshift(first);
+      return true;
+    }
+    if (members.length > 1) breaker.justifiedUnitEnd = members.at(-1);
+    return false;
+  }
+  for (const [index, member] of members.entries()) {
+    if (member !== first) breaker.queue.shift();
+    if (!('text' in member)) throw new Error('A text candidate lost its placement unit');
+    const box = boxes[index];
+    member.leadingWordBoundaryPx = boundaries[index];
+    state.addToLine(member, member.measuredWidth, box.height, box.ascent, box.descent);
+  }
+  breaker.justifiedCompressionPx = Math.max(0, overflow);
+  return true;
+}
+
 export function performTextSegmentBox(
   operationState: PassOperationState,
   s: LayoutTextSeg,
@@ -899,7 +1398,12 @@ export function performTextSegmentBox(
     characterGrid,
   } = operationState;
 
-  const measured = measureText(s, snapToCharsClass(s, characterGrid) === 'eastAsia');
+  s.leadingWordBoundaryPx = undefined;
+  // Fitting needs the spaces' contextual advances, not every prefix of a
+  // possibly overlong word. Full cluster acquisition belongs to final slices.
+  const measured = justifiedCompressionApplies(operationState) && s.text.includes(' ') && !s.ruby
+    ? measurement.measureSegment(s, 'spaces')
+    : measureText(s, snapToCharsClass(s, characterGrid) === 'eastAsia');
   const width = segAdvanceWidth(
     s,
     measured.width + verticalInkExtra(s, s.text),
@@ -911,11 +1415,38 @@ export function performTextSegmentBox(
   const fullPx = s.fontSize * scale;
   let metricMeasurement = measured;
   let metricEmPx = effectiveFontPx(s);
-  if (s.smallCaps && !s.vertAlign && metricEmPx !== fullPx) {
+  if (s.metricOnly && s.metricProbeText) {
+    // Native reserved-separator participant (MS-DOC 2.3.3): its own text is
+    // empty, so its vertical metrics come from its bounded probe through the
+    // same selected face, at the existing effective metric size in this
+    // caller's scale (super/sub scaling; small caps keep the full-size policy
+    // of the branch below). Width stays the empty measurement above; probe
+    // clusters, ink and advance are never retained. Position applies once below.
+    const probeEmPx = s.smallCaps && !s.vertAlign ? fullPx : metricEmPx;
+    const probe = s.textLayoutService && s.textShapeRequest
+      ? s.textLayoutService.shape({
+          ...independentTextShapeRequest(s.textShapeRequest, s.metricProbeText),
+          fontSizePt: probeEmPx,
+          measure: true,
+          clusterGeometry: false,
+        })
+      : undefined;
+    const fallback = probe ? undefined : measurement.measureWithFont(
+      buildFont(s.bold, s.italic, probeEmPx, s.fontFamily, fontFamilyClasses, s.fontRoute),
+      s.metricProbeText,
+    );
+    metricMeasurement = {
+      width: measured.width,
+      actualBoundingBoxAscent: probe ? probe.ascentPt : fallback!.actualBoundingBoxAscent,
+      actualBoundingBoxDescent: probe ? probe.descentPt : fallback!.actualBoundingBoxDescent,
+      fontBoundingBoxAscent: probe ? probe.ascentPt : fallback!.fontBoundingBoxAscent,
+      fontBoundingBoxDescent: probe ? probe.descentPt : fallback!.fontBoundingBoxDescent,
+    } as TextMetrics;
+    metricEmPx = probeEmPx;
+  } else if (s.smallCaps && !s.vertAlign && metricEmPx !== fullPx) {
     if (s.textLayoutService && s.textShapeRequest) {
       const shaped = s.textLayoutService.shape({
-        ...s.textShapeRequest,
-        text: s.text || 'X',
+        ...(s.text ? s.textShapeRequest : independentTextShapeRequest(s.textShapeRequest, 'X')),
         fontSizePt: fullPx,
         measure: true,
         clusterGeometry: false,
@@ -980,7 +1511,7 @@ export function performAppendQueuedIdeographicSpaceSegment(
     source.fitTextRegionIndex !== undefined
   )
     return;
-  const follower = breakerState.queue[0];
+  const follower = breakerState.queue.peek();
   if (
     !follower ||
     !('text' in follower) ||
@@ -1111,6 +1642,24 @@ export function performTabFollowingMetrics(operationState: PassOperationState): 
   return decimalPrefixWidth === undefined ? { totalWidth } : { totalWidth, decimalPrefixWidth };
 }
 
+/** Bracket close to the line band; probing a whole suffix midpoint on
+ * every queued line repeats long measurements for dense sparse breaks. */
+function lastFittingMonotoneIndex(count: number, fits: (index: number) => boolean): number {
+  if (!count || !fits(0)) return -1;
+  let lower = 0, upper = 1;
+  while (upper < count && fits(upper)) {
+    lower = upper;
+    upper = upper * 2 + 1;
+  }
+  upper = Math.min(upper, count);
+  while (lower + 1 < upper) {
+    const middle = Math.floor((lower + upper) / 2);
+    if (fits(middle)) lower = middle;
+    else upper = middle;
+  }
+  return lower;
+}
+
 export function performEmergencyTextSplit(
   operationState: PassOperationState,
   segment: LayoutTextSeg,
@@ -1131,10 +1680,9 @@ export function performEmergencyTextSplit(
     verticalGlyphMeasurement,
   } = operationState;
 
+  operationState.reservePrefixWork(segment.text.length);
   const protectedOffsets = protectedNoBreakOffsets(segment);
-  const graphemeOffsets = [0, ...graphemeClusterOffsets(segment.text), segment.text.length].filter(
-    (offset, index, all) => all.indexOf(offset) === index,
-  );
+  const graphemeOffsets = [...new Set([0, ...graphemeClusterOffsets(segment.text), segment.text.length])];
   let split = 0;
   if (available > 0) {
     const monotoneAllocation =
@@ -1161,20 +1709,35 @@ export function performEmergencyTextSplit(
           charSpacingDeltaPx(segment, scale),
           segment.verticalRun === true,
           verticalGlyphMeasurement,
-          (prefix) => strAdvance(segment, prefix),
+          (prefix) => {
+            operationState.reservePrefixWork(prefix.length);
+            return strAdvance(segment, prefix);
+          },
         ).length;
         split =
           graphemeOffsets
             .filter((offset) => offset <= fitted && !protectedOffsets.has(offset))
             .at(-1) ?? 0;
       });
+    } else if (charSpacingDeltaPx(segment, scale) >= 0) {
+      // A Latin block's ceil((activeNatural + prefixNatural) / pitch) * pitch
+      // minus its fixed allocation is monotone in the retained natural width.
+      // Use that exact active-block allocator, rather than standalone rounding.
+      const legal = graphemeOffsets.filter(offset => offset > 0 && !protectedOffsets.has(offset));
+      const index = lastFittingMonotoneIndex(legal.length, i => {
+        operationState.reservePrefixWork(legal[i]!);
+        const natural = strNaturalAdvance(segment, segment.text.slice(0, legal[i]!));
+        return prospectiveSnapAdvance(segment, natural) <= available + 1e-9;
+      });
+      if (index >= 0) split = legal[index]!;
     } else {
-      // Signed spacing and a Latin snap block can make prefix advances
+      // Signed spacing can make prefix advances
       // non-monotone. Evaluate every legal retained candidate against the
       // exact prospective line block rather than binary-searching a
       // standalone approximation.
       for (const offset of graphemeOffsets) {
         if (offset <= 0 || protectedOffsets.has(offset)) continue;
+        operationState.reservePrefixWork(offset);
         const natural = strNaturalAdvance(segment, segment.text.slice(0, offset));
         if (prospectiveSnapAdvance(segment, natural) <= available + 1e-9) split = offset;
       }
@@ -1191,22 +1754,32 @@ export function performEmergencyTextSplit(
   return split;
 }
 
-export function performExternalLinkSyntaxSplit(
+export function performExplicitTextSplit(
   operationState: PassOperationState,
   segment: LayoutTextSeg,
   available: number,
 ): number {
-  const { prospectiveSnapAdvance, strNaturalAdvance } = operationState;
-
-  if (!(available > 0) || !segment.externalLinkBreakOffsets?.length) return 0;
-  let selected = 0;
-  for (const offset of segment.externalLinkBreakOffsets) {
-    if (offset <= 0 || offset >= segment.text.length) continue;
-    const naturalAdvance = strNaturalAdvance(segment, segment.text.slice(0, offset));
-    const prospectiveAdvance = prospectiveSnapAdvance(segment, naturalAdvance);
-    if (prospectiveAdvance <= available + 1e-9) selected = offset;
+  const { prospectiveSnapAdvance, strNaturalAdvance, scale } = operationState;
+  const window = segment.explicitBreaks;
+  if (!(available > 0) || !window) return 0;
+  const count = window.end - window.start;
+  const fits = (index: number): boolean => {
+    const offset = textBreakOffsetAt(window, index);
+    operationState.reservePrefixWork(offset);
+    const natural = strNaturalAdvance(segment, segment.text.slice(0, offset));
+    return prospectiveSnapAdvance(segment, natural) <= available + 1e-9;
+  };
+  // Use the emergency splitter's existing monotone-allocation contract. Signed
+  // spacing retains exact candidate evaluation. Positive Latin snap allocation
+  // is a monotone ceil map of the same natural-prefix authority, even with an
+  // existing block; fits() uses its actual prospective allocation.
+  if (charSpacingDeltaPx(segment, scale) < 0) {
+    let selected = 0;
+    for (let i = 0; i < count; i++) if (fits(i)) selected = textBreakOffsetAt(window, i);
+    return selected;
   }
-  return selected;
+  const index = lastFittingMonotoneIndex(count, fits);
+  return index < 0 ? 0 : textBreakOffsetAt(window, index);
 }
 
 export function performQueueEmergencyTail(
@@ -1246,6 +1819,7 @@ export function performRetractCurrentLineForLeadingKinsoku(
     materializeLatinSpaceCompression,
     strAdvance,
     next,
+    operationState.scale,
   );
 }
 

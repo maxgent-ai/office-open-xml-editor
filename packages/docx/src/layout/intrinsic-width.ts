@@ -1,3 +1,4 @@
+import { textBreakWindow, textBreakOffsets } from '../line-breaker/text-break-window.js';
 import { graphemeClusterOffsets } from '@silurus/ooxml-core';
 import type { DocTableCell } from '../types.js';
 import type { ParagraphLayoutContext } from '../layout-context.js';
@@ -21,12 +22,11 @@ import type {
   TextMeasurer,
 } from '../paragraph-measure.js';
 import { paragraphCharacterGrid } from '../paragraph-measure.js';
-import { calcEffectiveFontPx } from './text.js';
+import { calcEffectiveFontPx, sliceTextShapeRequest } from './text.js';
 import { wordSnapToCharsEastAsianCellCount } from './line-compatibility.js';
 import type { ParagraphLayoutSource, TextFontSlots } from './text.js';
-import type { TableLayoutSource } from './table-source-acquisition.js';
-import type { DeepReadonly } from './types.js';
-import { stableFingerprint } from './fingerprint.js';
+import { projectEffectiveCellPreferredWidth, type TableLayoutSource } from './table-source-acquisition.js';
+import type { DeepReadonly, TablePreferredWidthConstraint } from './types.js';
 import {
   numberingMarkerLogicalInterval,
   type NumberingMarkerGeometry,
@@ -41,6 +41,8 @@ export interface ParagraphIntrinsicWidths {
 export interface TableCellIntrinsicWidths {
   readonly minWidthPt: number;
   readonly maxWidthPt: number;
+  /** Intrinsic text width without first-line positioning, for w:noWrap. */
+  readonly noWrapWidthPt?: number;
 }
 
 export interface TableCellIntrinsicWidthDependencies {
@@ -54,16 +56,19 @@ export interface ParagraphIntrinsicWidthOptions {
   readonly preserveWhitespaceOnlyContent?: boolean;
 }
 
-/** Fold public cell content into one intrinsic interval. OOXML width/style
- * precedence is deliberately absent: parser/model projection and the column
- * solver own those separate responsibilities. */
+/** Fold public cell content into one intrinsic interval using the effective
+ * tcW acquired before measurement. Public-model-only callers use the same
+ * width interpreter; lexical/style precedence remains in source projection. */
 export function measureTableCellIntrinsicWidths(
   cell: DeepReadonly<DocTableCell>,
   margins: Readonly<{ left: number; right: number }>,
   dependencies: TableCellIntrinsicWidthDependencies,
+  tableLayout: 'autofit' | 'fixed' = 'autofit',
+  preferredWidth: TablePreferredWidthConstraint | null = projectEffectiveCellPreferredWidth(cell),
 ): TableCellIntrinsicWidths {
   let minContentWidthPt = 0;
   let maxContentWidthPt = 0;
+  let noWrapContentWidthPt = 0;
   for (const element of cell.content) {
     // ECMA-376 §17.18.87 defines AutoFit minima from cell contents. The
     // registered Word observation refines the otherwise-unspecified empty-mark
@@ -76,14 +81,37 @@ export function measureTableCellIntrinsicWidths(
       : dependencies.nestedTable(element);
     minContentWidthPt = Math.max(minContentWidthPt, intrinsic.minWidthPt);
     maxContentWidthPt = Math.max(maxContentWidthPt, intrinsic.maxWidthPt);
+    noWrapContentWidthPt = Math.max(
+      noWrapContentWidthPt,
+      intrinsic.noWrapWidthPt ?? intrinsic.maxWidthPt,
+    );
   }
   const horizontalMarginsPt = Math.max(0, margins.left) + Math.max(0, margins.right);
+  // ECMA-376 §17.4.29: for AutoFit auto/pct tcW, measure cell contents as
+  // one unbroken string. This changes column constraints, not line breaking.
+  // The noWrap content width excludes first-line paragraph positioning:
+  // controlled Word documents with 0/432-twip first-line indent give the same
+  // noWrap column width, even though the indented text still wraps in the cell.
+  // Hanging indents and numbering markers have not been measured here.
+  const unbrokenMinimum = tableLayout === 'autofit'
+    && cell.noWrap === true
+    && preferredWidth?.kind !== 'dxa';
   return {
-    minWidthPt: minContentWidthPt + horizontalMarginsPt,
+    minWidthPt: (unbrokenMinimum ? noWrapContentWidthPt : minContentWidthPt) + horizontalMarginsPt,
     maxWidthPt: Math.max(minContentWidthPt, maxContentWidthPt) + horizontalMarginsPt,
   };
 }
 
+/**
+ * The shaping inputs of a text segment other than its text service.
+ *
+ * Every component is a primitive or an array of them, so `JSON.stringify` is
+ * already an injective canonical encoding; no key sorting is needed. The text
+ * service is compared separately by its fingerprint (`compatibleText`): that
+ * identity embeds the service's whole font and metric snapshot, and
+ * canonicalizing and percent-encoding it again for every neighbouring segment
+ * pair dominated table intrinsic-width measurement.
+ */
 function compatibleTextKey(segment: LayoutTextSeg): string {
   const request = segment.textShapeRequest;
   const slots = (value: TextFontSlots | undefined) => value
@@ -94,8 +122,7 @@ function compatibleTextKey(segment: LayoutTextSeg): string {
         value.complexScript ?? null,
       ]
     : null;
-  return stableFingerprint('paragraph-intrinsic-text', [
-    segment.textLayoutService?.fingerprint ?? null,
+  return JSON.stringify([
     request ? [
       slots(request.fonts),
       slots(request.themeFonts),
@@ -120,7 +147,7 @@ function compatibleTextKey(segment: LayoutTextSeg): string {
     segment.italic,
     calcEffectiveFontPx(segment, 1),
     segment.fontFamily,
-    segment.fontRoute ?? null,
+    segment.fontRoute ? [segment.fontRoute.familyList, segment.fontRoute.scope] : null,
     segment.charScale ?? 1,
     segment.charSpacing ?? 0,
     segment.fitTextPerGapPx ?? null,
@@ -153,20 +180,44 @@ function compatibleTextKey(segment: LayoutTextSeg): string {
   ]);
 }
 
+function compatibleText(left: LayoutTextSeg, right: LayoutTextSeg): boolean {
+  return (left.textLayoutService?.fingerprint ?? null) === (right.textLayoutService?.fingerprint ?? null)
+    && compatibleTextKey(left) === compatibleTextKey(right);
+}
+
 /** Run boundaries with identical effective metrics are not shaping boundaries.
  * Merge only for the intrinsic probe; retained source/run ownership stays intact. */
 function mergeCompatibleTextSegments(segments: readonly LayoutSeg[]): LayoutSeg[] {
   const merged: LayoutSeg[] = [];
+  let activeBreakOffsets: number[] | undefined;
   for (const segment of segments) {
     const previous = merged.at(-1);
     if (
       previous
       && 'text' in previous
       && 'text' in segment
-      && compatibleTextKey(previous) === compatibleTextKey(segment)
+      && compatibleText(previous, segment)
+      // Included and excluded spans depend on the full run. Losing a Latin
+      // base can turn its attached Arabic mark into standalone proof; losing
+      // Arabic proof can exclude following digits. Keep contiguous ranges in
+      // one context, and do not invent a new context across scoped run seams.
+      // General text retains the ordinary same-metric run merge.
+      && ((previous.substituteScope === undefined && segment.substituteScope === undefined)
+        || (previous.textShapeRequest?.substituteContext?.text === segment.textShapeRequest?.substituteContext?.text
+          && previous.textShapeRequest?.substituteContext !== undefined
+          && segment.textShapeRequest?.substituteContext?.offset
+            === previous.textShapeRequest.substituteContext.offset + previous.text.length))
     ) {
       const previousTextLength = previous.text.length;
       const text = previous.text + segment.text;
+      // One task-local accumulator per compatible sequence. Re-copying all
+      // previous offsets at every word seam makes hyphen-rich text quadratic.
+      if (segment.explicitBreakBefore || segment.explicitBreaks) {
+        activeBreakOffsets ??= [];
+        if (segment.explicitBreakBefore) activeBreakOffsets.push(previousTextLength);
+        for (const offset of textBreakOffsets(segment.explicitBreaks))
+          activeBreakOffsets.push(previousTextLength + offset);
+      }
       const punctuationCompressions = [
         ...(previous.punctuationCompressions ?? []),
         ...(segment.punctuationCompressions ?? []).map((compression) => ({
@@ -177,17 +228,27 @@ function mergeCompatibleTextSegments(segments: readonly LayoutSeg[]): LayoutSeg[
       merged[merged.length - 1] = {
         ...previous,
         text,
+        // Acquisition owns legal boundaries. Preserve them through this
+        // measurement-only join so AutoFit minima use the same text atoms as
+        // actual wrapping, without splitting the maximum-width shaping probe.
+        explicitBreaks: activeBreakOffsets ? textBreakWindow(activeBreakOffsets) : undefined,
         punctuationCompressions: punctuationCompressions.length > 0
           ? punctuationCompressions
           : undefined,
         textShapeRequest: previous.textShapeRequest
-          ? { ...previous.textShapeRequest, text }
+          ? { ...previous.textShapeRequest, text,
+              substituteContext: previous.substituteScope !== undefined || segment.substituteScope !== undefined
+                ? previous.textShapeRequest.substituteContext : { text, offset: 0 } }
           : undefined,
       };
       continue;
     }
+    if (activeBreakOffsets) Object.freeze(activeBreakOffsets);
     merged.push({ ...segment });
+    activeBreakOffsets = 'text' in segment && segment.explicitBreaks
+      ? [...textBreakOffsets(segment.explicitBreaks)] : undefined;
   }
+  if (activeBreakOffsets) Object.freeze(activeBreakOffsets);
   return merged;
 }
 
@@ -218,7 +279,18 @@ function measureTextRange(
     );
     pendingSnapBlock = null;
   };
-  for (const piece of pieces) {
+  // Pieces are acquired in source order. Dense hyphens across real format
+  // seams must not rescan the complete joined unit for every small atom.
+  // Locate the first overlap, then visit only this range's contributing pieces;
+  // snap-block folding remains local to the same complete atom as before.
+  let first = 0, stop = pieces.length;
+  while (first < stop) {
+    const middle = Math.floor((first + stop) / 2);
+    if (pieces[middle]!.end <= start) first = middle + 1;
+    else stop = middle;
+  }
+  for (let index = first; index < pieces.length && pieces[index]!.start < end; index++) {
+    const piece = pieces[index]!;
     const overlapStart = Math.max(start, piece.start);
     const overlapEnd = Math.min(end, piece.end);
     if (overlapStart >= overlapEnd) continue;
@@ -228,6 +300,8 @@ function measureTextRange(
     const candidate = {
       ...piece.segment,
       text,
+      ...(piece.segment.textShapeRequest
+        ? { textShapeRequest: sliceTextShapeRequest(piece.segment.textShapeRequest, localStart, localEnd) } : {}),
       punctuationCompressions: slicedPunctuationCompressions(
         piece.segment,
         localStart,
@@ -238,7 +312,6 @@ function measureTextRange(
       if (measured.textLayoutService && measured.textShapeRequest) {
         const shaped = measured.textLayoutService.shape({
           ...measured.textShapeRequest,
-          text: measured.text,
           fontSizePt: calcEffectiveFontPx(measured, 1),
           measure: true,
           clusterGeometry: false,
@@ -266,7 +339,6 @@ function measureTextRange(
       const shapedClusters = candidate.textLayoutService && candidate.textShapeRequest
         ? candidate.textLayoutService.shape({
             ...candidate.textShapeRequest,
-            text,
             fontSizePt: calcEffectiveFontPx(candidate, 1),
             measure: true,
             clusterGeometry: true,
@@ -301,6 +373,8 @@ function measureTextRange(
         const cluster = {
           ...candidate,
           text: text.slice(clusterStart, clusterEnd),
+          ...(candidate.textShapeRequest
+            ? { textShapeRequest: sliceTextShapeRequest(candidate.textShapeRequest, clusterStart, clusterEnd) } : {}),
           punctuationCompressions: slicedPunctuationCompressions(
             candidate,
             clusterStart,
@@ -378,6 +452,9 @@ function minimumTextAtomWidthPt(
       segmentIndex += 1;
     }
 
+    const explicitBreaks = pieces.flatMap(piece => [...textBreakOffsets(piece.segment.explicitBreaks)]
+      .map(offset => piece.start + offset));
+    let breakIndex = 0;
     let tokenStart = 0;
     for (const token of splitTextForLayout(joinedText)) {
       const trimmed = token.replace(/\s+$/u, '');
@@ -386,17 +463,18 @@ function minimumTextAtomWidthPt(
       tokenStart += token.length;
       if (!trimmed) continue;
       if (!hasCJKBreakOpportunity(trimmed)) {
-        maximumPt = Math.max(
-          maximumPt,
-          measureTextRange(
-            pieces,
-            joinedText,
-            trimmedStart,
-            trimmedEnd,
-            measurer,
-            characterGrid,
-          ),
-        );
+        const ends: number[] = [];
+        while (breakIndex < explicitBreaks.length && explicitBreaks[breakIndex] <= trimmedStart)
+          breakIndex += 1;
+        while (breakIndex < explicitBreaks.length && explicitBreaks[breakIndex] < trimmedEnd)
+          ends.push(explicitBreaks[breakIndex++]);
+        ends.push(trimmedEnd);
+        let atomStart = trimmedStart;
+        for (const atomEnd of ends) {
+          maximumPt = Math.max(maximumPt, measureTextRange(
+            pieces, joinedText, atomStart, atomEnd, measurer, characterGrid));
+          atomStart = atomEnd;
+        }
         continue;
       }
 
@@ -481,6 +559,8 @@ export function measureParagraphIntrinsicWidths(
     ...environment,
     lineSpacing: context.lineSpacing,
     lineGridActive: context.lineGrid.active,
+    autoSpaceDE: paragraph.autoSpaceDE,
+    autoSpaceDN: paragraph.autoSpaceDN,
   }));
   const paragraphWidthPt = Math.max(
     1,

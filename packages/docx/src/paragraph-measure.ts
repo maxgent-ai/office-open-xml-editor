@@ -1,3 +1,4 @@
+import { specifiedTextLineMetrics, specifiedTextParagraphIsHomogeneous } from './layout/specified-line-spacing.js';
 import {
   paragraphGridRightAdjustmentPt,
   type ParagraphLayoutContext,
@@ -23,7 +24,11 @@ import type { DocParagraph } from './types.js';
 import type { WrapOracle } from './layout/float-wrap-oracle.js';
 import type { NumberingMarkerShapeInput, WritingMode } from './layout/types.js';
 import { wordEmptyMarkMinimumStartWidthPx } from './layout/compatibility.js';
-import { WORD_NUMBERING_MARKER_FIRST_LINE_UNION } from './layout/line-compatibility.js';
+import {
+  WORD_NUMBERING_MARKER_FIRST_LINE_UNION,
+  wordJustifiedInterwordCompressionApplies,
+} from './layout/line-compatibility.js';
+import { LayoutInvariantError } from './layout/diagnostics.js';
 import type { MeasurementTextContext } from './layout/measurement-capabilities.js';
 
 export type { LineLayoutEnvironment } from './line-layout.js';
@@ -34,12 +39,14 @@ export interface ParagraphMeasurementEnvironment extends LineLayoutEnvironment {
   readonly documentHasEastAsianText: boolean;
   readonly paragraphMarkShapeInput?: NumberingMarkerShapeInput;
   /** Selected-face text marker box, resolved by retained numbering before line acquisition. */
-  readonly firstLineNumberingMarkerBox?: Readonly<{ ascentPt: number; descentPt: number }>;
+  readonly firstLineNumberingMarkerBox?: Readonly<{ ascentPt: number; descentPt: number; intendedSinglePt?: number }>;
   /** Canonical section writing mode used by retained page geometry. */
   readonly pageWritingMode: WritingMode;
   /** The paragraph is acquired in a section-logical frame that paint rotates
    * into a vertical physical page. This is independent of glyph orientation. */
   readonly verticalPageFrame?: boolean;
+  /** `w:compatSetting` compatibilityMode (§17.15.3.4) of the document; absent when not authored. */
+  readonly compatibilityMode?: number;
 }
 
 export interface TextMeasurer {
@@ -54,6 +61,8 @@ export interface ParagraphPlacement {
   readonly maximumYPt: number;
   readonly suppressSpaceBefore: boolean;
   readonly wrap?: WrapOracle;
+  /** DrawingML wrap=none: keep the real alignment band, allow inline overflow. */
+  readonly noWrap?: boolean;
 }
 
 export interface MeasuredLine {
@@ -65,10 +74,13 @@ export interface MeasuredLine {
 export interface MeasuredParagraph {
   readonly lines: readonly MeasuredLine[];
   readonly markOnly: boolean;
+  /** Selected empty-mark wrap gap, retained for measurement-free shading. */
+  readonly markWrapBounds?: { readonly xPt: number; readonly yPt: number; readonly widthPt: number; readonly heightPt: number };
   readonly requestedSpaceBeforePt: number;
   readonly requestedSpaceAfterPt: number;
-  /** ECMA-376 §17.3.3.25 paragraph-wide uniform line advance in points, snapped
-   *  to the docGrid. Zero when the paragraph has no ruby. */
+  /** Established paragraph-wide ruby allocation in points, snapped to docGrid
+   *  (§17.6.5). §17.3.3.25 defines guide/base placement, not uniform advances.
+   *  Zero when the paragraph has no ruby. */
   readonly uniformRubyAdvancePt: number;
   readonly contentStartYPt: number;
   readonly contentEndYPt: number;
@@ -187,8 +199,9 @@ export function measureParagraph(
       environment.paragraphMarkShapeInput,
       environment.useFeLayout === true,
     );
+    let markWrapBounds: MeasuredParagraph['markWrapBounds'];
     if (placement.wrap) {
-      markTopPt = placement.wrap.lineWindow({
+      const window = placement.wrap.lineWindow({
         topYPt: markTopPt,
         minimumStartWidthPt: getDefaultFontSize(paragraph),
         squareMinimumStartWidthPt: wordEmptyMarkMinimumStartWidthPx(
@@ -202,9 +215,15 @@ export function measureParagraph(
         // COLUMN band, not the indented mark band above.
         columnXPt: placement.paragraphXPt,
         columnWidthPt: placement.availableWidthPt,
-      }).topYPt;
+      });
+      markTopPt = window.topYPt;
+      if (window.xOffsetPt !== 0 || window.maximumWidthPt !== paragraphWidthPt) {
+        markWrapBounds = { xPt: paragraphXPt + window.xOffsetPt, yPt: markTopPt,
+          widthPt: window.maximumWidthPt, heightPt: markAdvancePt };
+      }
     }
     return {
+      ...(markWrapBounds ? { markWrapBounds } : {}),
       lines: [],
       markOnly: true,
       requestedSpaceBeforePt,
@@ -233,6 +252,8 @@ export function measureParagraph(
     ...environment,
     lineSpacing: context.lineSpacing,
     lineGridActive: context.lineGrid.active,
+    autoSpaceDE: paragraph.autoSpaceDE,
+    autoSpaceDN: paragraph.autoSpaceDN,
   });
   if (segments.length === 0) return measureMarkOnly();
 
@@ -255,9 +276,107 @@ export function measureParagraph(
     }
   }
 
+  // Library policy retains the established paragraph-wide ruby reserve
+  // (§17.3.3.25 describes the guide above the base; §17.6.5 supplies grid cells).
+  // Resolve the complete physical unions before querying floats: a per-fragment
+  // reserve cannot determine either a probe band or the next physical origin.
+  const specifiedParagraph = specifiedTextParagraphIsHomogeneous(paragraph);
+  const allocateLines = (lines: readonly LayoutLine[]) => {
+    let uniformRubyAdvancePt = context.hasRuby
+      ? snapParagraphLineToGrid(
+          lines.reduce((heightPt, line) => Math.max(heightPt, lineBoxHeight(
+            context.lineSpacing,
+            line.ascent,
+            line.descent,
+            1,
+            grid,
+            true,
+            line.intendedSingle,
+            context.hasEastAsianText,
+          )), 0),
+          grid,
+        )
+      : 0;
+    if (context.hasRuby && continuation?.uniformRubyAdvancePt !== undefined) {
+      uniformRubyAdvancePt = Math.max(
+        uniformRubyAdvancePt,
+        continuation.uniformRubyAdvancePt,
+      );
+    }
+    const allocations: { layout: LayoutLine; advancePt: number }[] = [];
+    for (const [lineIndex, originalLine] of lines.entries()) {
+      const markerBox = lineIndex === 0 && !continuation && !placement.wrap
+        && !context.lineGrid.active
+        && (context.lineSpacing == null
+          || (context.lineSpacing.rule === 'auto' && context.lineSpacing.value >= 1))
+        && !context.hasRuby
+        && !originalLine.uniformPositionAuto && !originalLine.inlinePictureTextSingle
+        ? environment.firstLineNumberingMarkerBox : undefined;
+      const markerAscent = markerBox?.ascentPt;
+      const markerDescent = markerBox?.descentPt;
+      const line = markerAscent !== undefined && markerDescent !== undefined
+        && Number.isFinite(markerAscent) && Number.isFinite(markerDescent)
+        ? {
+            ...originalLine,
+            ascent: Math.max(originalLine.ascent, markerAscent),
+            descent: Math.max(originalLine.descent, markerDescent),
+            visibleAscent: Math.max(originalLine.visibleAscent ?? originalLine.ascent, markerAscent),
+            visibleDescent: Math.max(originalLine.visibleDescent ?? originalLine.descent, markerDescent),
+            intendedSingle: Math.max(originalLine.intendedSingle, markerBox?.intendedSinglePt ?? 0),
+            visibleIntendedSingle: Math.max(originalLine.visibleIntendedSingle ?? originalLine.intendedSingle,
+              markerBox?.intendedSinglePt ?? 0),
+          }
+        : originalLine;
+      const textSinglePt = Math.max(
+        originalLine.ascent + originalLine.descent,
+        originalLine.intendedSingle,
+      );
+      // ECMA-376 §17.9.6 supplies marker rPr and §17.3.1.33 the auto multiple,
+      // No inherited line value means single spacing (§17.3.1.33 @line), so
+      // omitted spacing and explicit auto1 use the same selected glyph union.
+      // The spec does not specify that union. Controlled Word omitted/auto1
+      // pairs independently agree, including a different marker face. Pagination
+      // uses the same allocation, including at keepNext boundaries.
+      // This selected-face projection is limited to non-grid text markers; other classes
+      // retain their established allocation.
+      void WORD_NUMBERING_MARKER_FIRST_LINE_UNION;
+      const markerNaturalPt = Math.max(line.ascent + line.descent, markerBox?.intendedSinglePt ?? 0);
+      const markerRaisesBox = line !== originalLine
+        && markerNaturalPt > textSinglePt;
+      const specified = specifiedParagraph && !paragraph.numbering
+        ? specifiedTextLineMetrics(line, context, paragraph, environment.compatibilityMode,
+            environment.verticalPageFrame === true, environment.paragraphMarkShapeInput)
+        : null;
+      const advancePt = specified ? specified.advancePt : markerRaisesBox
+        ? markerNaturalPt + textSinglePt * ((context.lineSpacing?.value ?? 1) - 1)
+        : context.hasRuby
+        ? uniformRubyAdvancePt
+        : lineBoxHeight(
+            context.lineSpacing,
+            line.ascent,
+            line.descent,
+            1,
+            grid,
+            false,
+            line.intendedSingle,
+            // §17.6.5 cell rounding is gated by the line's script; a Latin-only
+            // line in a CJK paragraph keeps its natural height.
+            line.eastAsian ?? false,
+            line.gridCountSingle,
+            undefined,
+            line.uniformPositionAuto,
+            line.inlinePictureTextSingle,
+            line.latinGridCountSingle,
+          );
+      allocations.push({ layout: line, advancePt });
+    }
+    return { allocations, uniformRubyAdvancePt };
+  };
+
   const wrapContext: WrapLayoutCtx | undefined = placement.wrap
     ? {
         startPageY: cursorPt,
+        resolveLineAdvances: (lines) => allocateLines(lines).allocations.map(line => line.advancePt),
         paraX: paragraphXPt,
         // Raw COLUMN band (placement) for the topAndBottom gate; paraX above is
         // the indented text band for the square side-gap math (§20.4.2.20 vs
@@ -269,8 +388,9 @@ export function measureParagraph(
           getDefaultFontSize(paragraph),
           1,
         ),
+        hasExclusions: placement.wrap!.hasExclusions,
         lineWindow: (input) => placement.wrap!.lineWindow(input),
-        lineBoxH: (ascent, descent, _hasRuby, intendedSingle, eastAsian, gridCountSingle, uniformPositionAuto, inlinePictureTextSingle) => lineBoxHeight(
+        lineBoxH: (ascent, descent, _hasRuby, intendedSingle, eastAsian, gridCountSingle, uniformPositionAuto, inlinePictureTextSingle, latinGridCountSingle) => lineBoxHeight(
           context.lineSpacing,
           ascent,
           descent,
@@ -285,6 +405,7 @@ export function measureParagraph(
           undefined,
           uniformPositionAuto,
           inlinePictureTextSingle,
+          latinGridCountSingle,
         ),
         pageH: placement.maximumYPt,
       }
@@ -309,87 +430,35 @@ export function measureParagraph(
     context.isJustified,
     context.stretchLastLine,
     continuation?.boundary,
-    undefined,
+    placement.noWrap ? 'unwrapped' : undefined,
     environment.verticalGlyphMeasurement,
     context.overflowPunct !== false,
+    wordJustifiedInterwordCompressionApplies(
+      paragraph.alignment, environment.compatibilityMode, environment.lineWrapLikeWord6,
+    ) && environment.verticalCJK !== true,
   );
   if (lines.length === 0) return measureMarkOnly();
 
-  let uniformRubyAdvancePt = context.hasRuby
-    ? snapParagraphLineToGrid(
-        Math.max(0, ...lines.map((line) => lineBoxHeight(
-          context.lineSpacing,
-          line.ascent,
-          line.descent,
-          1,
-          grid,
-          true,
-          line.intendedSingle,
-          context.hasEastAsianText,
-        ))),
-        grid,
-      )
-    : 0;
-  if (context.hasRuby && continuation?.uniformRubyAdvancePt !== undefined) {
-    uniformRubyAdvancePt = Math.max(
-      uniformRubyAdvancePt,
-      continuation.uniformRubyAdvancePt,
-    );
-  }
+  const { allocations, uniformRubyAdvancePt } = allocateLines(lines);
   const measuredLines: MeasuredLine[] = [];
-  for (const [lineIndex, originalLine] of lines.entries()) {
-    const markerBox = lineIndex === 0 && !continuation && !placement.wrap
-      && !context.lineGrid.active && context.lineSpacing?.rule === 'auto'
-      && context.lineSpacing.value >= 1 && !context.hasRuby
-      && !originalLine.uniformPositionAuto && !originalLine.inlinePictureTextSingle
-      ? environment.firstLineNumberingMarkerBox : undefined;
-    const markerAscent = markerBox?.ascentPt;
-    const markerDescent = markerBox?.descentPt;
-    const line = markerAscent !== undefined && markerDescent !== undefined
-      && Number.isFinite(markerAscent) && Number.isFinite(markerDescent)
-      ? {
-          ...originalLine,
-          ascent: Math.max(originalLine.ascent, markerAscent),
-          descent: Math.max(originalLine.descent, markerDescent),
-          visibleAscent: Math.max(originalLine.visibleAscent ?? originalLine.ascent, markerAscent),
-          visibleDescent: Math.max(originalLine.visibleDescent ?? originalLine.descent, markerDescent),
-        }
-      : originalLine;
-    const topYPt = line.topY !== undefined && line.topY > cursorPt
-      ? line.topY
-      : cursorPt;
-    const textSinglePt = Math.max(
-      originalLine.ascent + originalLine.descent,
-      originalLine.intendedSingle,
-    );
-    // ECMA-376 §17.9.6 supplies marker rPr and §17.3.1.33 the auto multiple,
-    // but neither specifies their line-box union. This selected-face projection
-    // is limited to the observed auto/non-grid text-marker class; other classes
-    // retain their established allocation.
-    void WORD_NUMBERING_MARKER_FIRST_LINE_UNION;
-    const markerNaturalPt = line.ascent + line.descent;
-    const markerRaisesBox = line !== originalLine
-      && markerNaturalPt > textSinglePt;
-    const advancePt = markerRaisesBox
-      ? markerNaturalPt + textSinglePt * ((context.lineSpacing?.value ?? 1) - 1)
-      : context.hasRuby
-      ? uniformRubyAdvancePt
-      : lineBoxHeight(
-          context.lineSpacing,
-          line.ascent,
-          line.descent,
-          1,
-          grid,
-          false,
-          line.intendedSingle,
-          // §17.6.5 cell rounding is gated by the line's script; a Latin-only
-          // line in a CJK paragraph keeps its natural height.
-          line.eastAsian ?? false,
-          line.gridCountSingle,
-          undefined,
-          line.uniformPositionAuto,
-          line.inlinePictureTextSingle,
-        );
+  let physicalLineIndex: number | undefined;
+  let physicalTopPt = cursorPt;
+  for (const { layout: line, advancePt } of allocations) {
+    // A wrap top is valid only after the fixed point used this allocation for
+    // this physical line. Fragment tops share that allocation; equal numeric
+    // tops alone do not establish physical-line identity.
+    const allocation = line.wrapAllocation;
+    if (placement.wrap && (!allocation
+      || allocation.physicalLineIndex !== line.physicalLineIndex
+      || allocation.topYPt !== line.topY
+      || allocation.advancePt !== advancePt)) {
+      throw new LayoutInvariantError('INVALID_GEOMETRY', 'line origin does not own its allocated advance');
+    }
+    const samePhysicalLine = line.physicalLineIndex !== undefined
+      && line.physicalLineIndex === physicalLineIndex;
+    const topYPt = allocation?.topYPt ?? (samePhysicalLine ? physicalTopPt : cursorPt);
+    physicalLineIndex = line.physicalLineIndex;
+    physicalTopPt = topYPt;
     measuredLines.push({ layout: line, topYPt, advancePt });
     cursorPt = topYPt + advancePt;
   }

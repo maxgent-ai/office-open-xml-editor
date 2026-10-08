@@ -16,6 +16,7 @@ import { openExternalHyperlink, PT_TO_PX, nextZoomStep, prevZoomStep, clampScale
 import type { FindHighlightColors, HyperlinkTarget, FindMatch, FindMatchesOptions, OoxmlResourceMetrics, ViewerContextMenuEvent, ZoomableViewer } from '@silurus/ooxml-core';
 import {
   CallerCanvasMount,
+  CanvasLoadingIndicator,
   CanvasOverlayHost,
   CanvasViewerErrorRouter,
   renderCanvasElementOutline,
@@ -170,7 +171,7 @@ export class DocxViewer implements ZoomableViewer {
   private _internalHyperlinkGeneration = 0;
   private readonly _layoutWaiters = new Set<() => void>();
   private _layoutFailed = false;
-  private readonly _loadingLayer: HTMLDivElement;
+  private readonly _loadingIndicator: CanvasLoadingIndicator;
   private _elementClickListener: ((event: MouseEvent) => void) | null = null;
   private _contextMenuListener: ((event: MouseEvent) => void) | null = null;
   /**
@@ -227,24 +228,11 @@ export class DocxViewer implements ZoomableViewer {
     this._textLayer = overlays.textLayer;
     this._highlightLayer = overlays.highlightLayer;
     this._elementLayer = overlays.elementLayer;
-    this._loadingLayer = this._wrapper.ownerDocument.createElement('div');
-    this._loadingLayer.style.cssText = [
-      'position:absolute',
-      'inset:0',
-      'display:none',
-      'align-items:center',
-      'justify-content:center',
-      'background:rgba(255,255,255,0.72)',
-      'pointer-events:none',
-      'z-index:4',
-    ].join(';');
-    this._loadingLayer.setAttribute('role', 'status');
-    this._loadingLayer.setAttribute('aria-live', 'polite');
-    this._loadingLayer.setAttribute('aria-label', 'Loading page');
+    this._loadingIndicator = new CanvasLoadingIndicator(this._wrapper, 'Loading page');
     const progress = this._wrapper.ownerDocument.createElement('progress');
     progress.setAttribute('aria-hidden', 'true');
-    this._loadingLayer.appendChild(progress);
-    this._wrapper.insertBefore(this._loadingLayer, this._elementLayer);
+    this._loadingIndicator.layer.appendChild(progress);
+    this._wrapper.insertBefore(this._loadingIndicator.layer, this._elementLayer);
     if (this._textLayer && (opts.onSelectionContextChange || opts.enableElementSelection)) {
       this._selectionChangeListener = () => this._emitSelectionContextChange();
       this._wrapper.ownerDocument.addEventListener('selectionchange', this._selectionChangeListener);
@@ -299,6 +287,7 @@ export class DocxViewer implements ZoomableViewer {
         const loaded = await DocxDocument.load(source, {
           password: this._opts.password,
           useGoogleFonts: this._opts.useGoogleFonts,
+          allowFootnoteContinuation: this._opts.allowFootnoteContinuation,
           cjkFallback: this._opts.cjkFallback,
           maxZipEntryBytes: this._opts.maxZipEntryBytes,
           resourceLimits: this._opts.resourceLimits,
@@ -1000,7 +989,7 @@ export class DocxViewer implements ZoomableViewer {
   }
 
   private _setLoading(loading: boolean): void {
-    this._loadingLayer.style.display = loading ? 'flex' : 'none';
+    this._loadingIndicator.setLoading(loading);
   }
 
   /**

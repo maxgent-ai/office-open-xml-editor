@@ -46,22 +46,13 @@ export const WORD_SECTION_BTLR_TBRL_PAGE_FRAME = defineCompatibilityRule({
   description: 'Issue #988 comment 4950296007 records that, unlike the normative ECMA-376 Part 4 §14.11.7 equivalence to lr, Word uses the tbRl page frame for section-level btLr; this rule covers only the page frame, while glyph orientation is paint-owned.',
 });
 
-export const WORD_SQUARE_LINE_START_ONE_INCH = defineCompatibilityRule({
-  id: 'word-square-line-start-one-inch',
-  evidence: {
-    kind: 'regression-test',
-    reference: 'packages/docx/src/float-line-start-one-inch.test.ts#(e) the boundary is identical across scales (absolute pt width)',
-  },
-  description: 'Issue #676 records that Word starts a content line beside a square-wrapped object only when the free side gap is at least one inch; tight and through polygon openings and empty paragraph marks are outside this rule.',
-});
-
 export const WORD_FLOAT_DIFFERENT_PARAGRAPH_DISPLACEMENT = defineCompatibilityRule({
   id: 'word-float-different-paragraph-displacement',
   evidence: {
     kind: 'regression-test',
     reference: 'packages/docx/src/layout/floats.test.ts#keeps observed different-paragraph displacement on exclusion bounds',
   },
-  description: 'Preserve the established Word-compatible policy that an overlap-permitted float is displaced by exclusion geometry from floats anchored in other paragraphs, while same-paragraph floats may overlap.',
+  description: 'Preserve the established Word-compatible policy that an overlap-permitted floating table or frame is displaced by exclusion geometry from floats anchored in other paragraphs, while same-paragraph floats may overlap. It does not apply to DrawingML objects: issue #1623 Word controls keep allowOverlap=true pictures from different paragraphs at their resolved positions in compatibility modes 14 and 15.',
 });
 
 export const WORD_PAGE_ANCHORED_TABLE_COLLISION_DEFERRAL = defineCompatibilityRule({
@@ -79,24 +70,36 @@ export const WORD_EMPTY_MARK_FLOAT_SIDE_GAP = defineCompatibilityRule({
     kind: 'regression-test',
     reference: 'packages/docx/src/float-line-start-one-inch.test.ts#keeps an anchor-host metric-only line on the paragraph-mark threshold',
   },
-  description: 'An empty or anchor-only paragraph-mark line may start beside a square-wrapped object when the available side gap can hold the paragraph mark em; the one-inch content-line threshold does not apply.',
+  description: 'An empty or anchor-only paragraph-mark line may start beside a square-wrapped object when the available side gap can hold the paragraph mark em; Word controls also admit visible text by its next atom, rather than a universal width.',
 });
-
-/** Word compatibility width from issue #676, in points. ECMA-376
- * §20.4.2.17 defines square wrapping but no minimum side-gap width. */
-export const WORD_MIN_LINE_START_PT = 72;
-
-/** One-twip tolerance for the inclusive one-inch boundary. It absorbs the
- * authored twip/EMU conversion deficit documented by the regression suite. */
-export const LINE_START_GAP_EPS_PT = 0.05;
-
-export function wordMinLineStartPx(scale: number): number {
-  return (WORD_MIN_LINE_START_PT - LINE_START_GAP_EPS_PT) * scale;
-}
 
 export function wordEmptyMarkMinimumStartWidthPx(
   paragraphMarkEmPt: number,
   scale: number,
 ): number {
   return paragraphMarkEmPt * scale;
+}
+
+export const WORD_FLOAT_GAP_FLOW = defineCompatibilityRule({
+  id: 'word-float-gap-flow',
+  evidence: { kind: 'office-observation', syntheticFixtureId: 'float-gap-continuation',
+    application: 'Microsoft Word', version: '16.113.2', platform: 'macOS 27.0' },
+  description: 'Issue #1670 controlled exports in modes 14 and 15 fill successive gaps on one baseline in paragraph reading order, then restart at the leading gap of the next baseline. Two/three-gap square and rectangular tight/through controls, left/right/largest restrictions, 20–100pt gaps, 10/20pt text, alignment, indents, padding, empty marks and Hebrew RTL establish atom-fit admission, including 40pt gaps. An unbroken Latin word too wide for every gap moves below the object. These controls supersede the one-inch inference from issue #676. Geometry remains fail-closed on non-finite input and unavailable polygon contours; emergency splitting is retained in a full paragraph band.',
+});
+
+/** Word for Mac issue #1668 controls (527 cases including horizontal twins):
+ * both stacked WordArt values use continuous clockwise sideways Latin with
+ * ordinary horizontal advances, upright East Asian/emoji clusters, and left-to-right
+ * columns. Sizes 12–48 pt, face/style and character sweeps, wrapping, spacing,
+ * anchors, transforms and split graphemes showed no direction-mode exception.
+ * This is host compatibility, not ECMA-376 §20.1.10.83's stacked-letter rule.
+ * Reuse the existing mixed-orientation vertical pipeline; native glyph metrics
+ * and vertical glyph designs remain the text service's responsibility.
+ */
+export function wordTextBoxVerticalMode(
+  value: string | null | undefined,
+): 'vert' | 'vert270' | 'eaVert' | 'mongolianVert' | undefined {
+  if (value === 'wordArtVert' || value === 'wordArtVertRtl') return 'mongolianVert';
+  return value === 'vert' || value === 'vert270' || value === 'eaVert' || value === 'mongolianVert'
+    ? value : undefined;
 }

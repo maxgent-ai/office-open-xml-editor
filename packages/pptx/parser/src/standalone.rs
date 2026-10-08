@@ -58,7 +58,6 @@ pub fn parse_standalone_shape_part(
             apply_clr_map(&mut theme, Some(&parse_clr_map_node(node)));
         }
         let rels_xml = read_zip_str(zip, &relationship_part_path(part)).unwrap_or_default();
-        let base = part.rsplit_once('/').map_or("", |(dir, _)| dir);
         let rels = parse_rels(&rels_xml);
         // ECMA-376 §20.1.4.2: style-matrix references select DrawingML
         // fragments in the theme. A blip there owns a relationship in the
@@ -76,10 +75,29 @@ pub fn parse_standalone_shape_part(
                 &LayoutPlaceholders::default(),
                 &theme,
                 &rels,
-                base,
+                part,
                 None,
                 zip,
-            ),
+            )
+            .map(|mut shape| {
+                // The slide-tree path promotes image-filled p:sp nodes to
+                // PictureElement. This standalone API must retain ShapeElement,
+                // so resolve the same blip relationship into its fill instead.
+                // Relationship targets are relative to the source shape part,
+                // not to its containing directory (ECMA-376 Part 2 §6.4.1).
+                if let Some(blip_fill) =
+                    child(root, "spPr").and_then(|node| child(node, "blipFill"))
+                {
+                    let mut resolve_blip = |relationship_id: &str| {
+                        let target = rels.get(relationship_id)?;
+                        let image_path = resolve_path(part, target);
+                        zip.index_for_name(&image_path)?;
+                        Some(image_path)
+                    };
+                    shape.fill = parse_blip_fill(blip_fill, theme.colors(), &mut resolve_blip);
+                }
+                shape
+            }),
             ("cxnSp", true) => parse_connector(root, &theme, &rels),
             _ => None,
         };
@@ -160,6 +178,28 @@ mod tests {
         zip.finish().unwrap().into_inner()
     }
 
+    fn package_with_relationship(
+        part: &str,
+        xml: &str,
+        relationship_target: &str,
+        related_part: &str,
+    ) -> Vec<u8> {
+        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        zip.start_file(part, SimpleFileOptions::default()).unwrap();
+        zip.write_all(xml.as_bytes()).unwrap();
+        zip.start_file(relationship_part_path(part), SimpleFileOptions::default())
+            .unwrap();
+        write!(
+            zip,
+            r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdImage" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="{relationship_target}"/></Relationships>"#
+        )
+        .unwrap();
+        zip.start_file(related_part, SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(b"image").unwrap();
+        zip.finish().unwrap().into_inner()
+    }
+
     fn parse(xml: &str, theme: &str, map: Option<&str>) -> Result<Option<StandaloneShape>, String> {
         parse_standalone_shape_part(&package(xml), "shape.xml", theme, map, 100_000, 1_000_000)
     }
@@ -193,6 +233,40 @@ mod tests {
     }
 
     #[test]
+    fn standalone_shape_keeps_relationship_backed_image_fill() {
+        use std::io::Write;
+        let xml = format!(
+            "<p:sp xmlns:p=\"{P}\" xmlns:a=\"{A}\" xmlns:r=\"{R}\"><p:spPr><a:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"100\" cy=\"100\"/></a:xfrm><a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom><a:blipFill><a:blip r:embed=\"rId1\"/><a:srcRect l=\"35000\"/><a:stretch><a:fillRect/></a:stretch></a:blipFill></p:spPr></p:sp>"
+        );
+        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for (name, bytes) in [
+            ("shape.xml", xml.as_bytes()),
+            ("_rels/shape.xml.rels", b"<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/image\" Target=\"media/image.png\"/></Relationships>".as_slice()),
+            ("media/image.png", b"image".as_slice()),
+        ] {
+            zip.start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(bytes).unwrap();
+        }
+        let package = zip.finish().unwrap().into_inner();
+        let parsed =
+            parse_standalone_shape_part(&package, "shape.xml", "", None, 100_000, 1_000_000)
+                .unwrap()
+                .unwrap();
+        match parsed.element.fill {
+            Some(Fill::Image {
+                image_path,
+                src_rect,
+                ..
+            }) => {
+                assert_eq!(image_path, "media/image.png");
+                assert_eq!(src_rect.unwrap().l, 0.35);
+            }
+            other => panic!("image fill lost: {other:?}"),
+        }
+    }
+
+    #[test]
     fn color_map_requires_presentationml_or_drawingml_namespace() {
         let xml = shape(Some(P), "sp", "");
         for map in ["<clrMap/>", "<x:clrMap xmlns:x=\"urn:foreign\"/>"] {
@@ -220,6 +294,25 @@ mod tests {
             let parsed = parse(&xml, &theme, None).unwrap().unwrap();
             assert_eq!(parsed.relationship_references, expected);
         }
+    }
+
+    #[test]
+    fn nested_standalone_shape_resolves_image_fill_from_source_part() {
+        let part = "ppt/shapes/shape1.xml";
+        let xml = format!(
+            "<p:sp xmlns:p=\"{P}\" xmlns:a=\"{A}\" xmlns:r=\"{R}\"><p:spPr><a:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"100\" cy=\"100\"/></a:xfrm><a:blipFill><a:blip r:embed=\"rIdImage\"/><a:stretch/></a:blipFill></p:spPr></p:sp>"
+        );
+        let package =
+            package_with_relationship(part, &xml, "../media/image.png", "ppt/media/image.png");
+
+        let parsed = parse_standalone_shape_part(&package, part, "", None, 100_000, 1_000_000)
+            .unwrap()
+            .unwrap();
+
+        assert!(matches!(
+            parsed.element.fill,
+            Some(Fill::Image { ref image_path, .. }) if image_path == "ppt/media/image.png"
+        ));
     }
 
     #[test]

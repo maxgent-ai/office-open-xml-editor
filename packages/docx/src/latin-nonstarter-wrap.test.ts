@@ -99,14 +99,14 @@ describe('Latin line-start-forbidden wrap (UAX#14 LB13 / §17.15.1.59)', () => {
       [multiRunPara(['aaaa bbbb system', ', cc']) as unknown as BodyElement],
       90,
     );
-    const system = calls.find((c) => c.text === 'system');
+    const system = calls.find((c) => c.text.includes('system'));
     const comma = calls.find((c) => c.text.includes(','));
     expect(system, 'painted "system"').toBeDefined();
     expect(comma, 'painted comma').toBeDefined();
     // The comma must ride on the SAME line as "system" (never lead a line).
     expect(comma!.y, '"system" and "," share a line').toBeCloseTo(system!.y, 3);
     // …and sit immediately AFTER it (to its right), not before.
-    expect(comma!.x).toBeGreaterThan(system!.x);
+    expect(comma!.text.indexOf(',')).toBeGreaterThan(comma!.text.indexOf('system'));
   });
 
   it('still wraps normally at real (whitespace) break opportunities', async () => {

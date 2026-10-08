@@ -8,6 +8,13 @@ export interface OoxmlResourcePolicySnapshot {
   readonly maxArchiveEntryBytes: number | null;
   readonly maxTotalInflatedBytes: number | null;
   readonly maxArchiveEntries: number | null;
+  /** Resolved per-worksheet XLSX logical limits; present only for XLSX. */
+  readonly xlsxWorksheetLimits?: Readonly<{
+    readonly maxRows: number;
+    readonly maxCells: number;
+    readonly maxOwnedUtf8Bytes: number;
+    readonly maxJsonBytes: number;
+  }>;
 }
 
 export interface OoxmlResourceMetricsCheckpoint {

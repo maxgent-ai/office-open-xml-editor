@@ -1,3 +1,4 @@
+import type { FontPreloadDemand } from '@silurus/ooxml-core';
 import {
   OoxmlResourceLimitError,
   type OoxmlResourceUsageSnapshot,
@@ -61,6 +62,7 @@ export interface PresentationPreflight {
   readonly embeddedFonts: readonly Readonly<PptxEmbeddedFontRef>[];
   readonly slides: readonly PresentationPreflightSlide[];
   readonly fontPreloadNames: readonly (string | null)[];
+  readonly fontPreloadDemand?: FontPreloadDemand;
 }
 
 function assertNullableString(value: unknown, field: string): asserts value is string | null {
@@ -372,6 +374,14 @@ function normalizePresentationPreflightValue(
         : {}),
     });
   });
+  let fontPreloadDemand: FontPreloadDemand | undefined;
+  if (candidate.fontPreloadDemand !== undefined) {
+    const demand = candidate.fontPreloadDemand;
+    if (demand === 'all') fontPreloadDemand = 'all';
+    else if (Array.isArray(demand) && demand.every(cp => Number.isInteger(cp) && cp >= 0 && cp <= 0x10ffff && !(cp >= 0xd800 && cp <= 0xdfff))) {
+      fontPreloadDemand = Object.freeze([...new Set(demand)]);
+    } else throw new Error('invalid PPTX presentation preflight font demand');
+  }
   const fontPreloadNames = candidate.fontPreloadNames.map((name, index) => {
     if (name !== null && typeof name !== 'string') {
       throw new Error(`invalid PPTX presentation preflight font at ${index}`);
@@ -392,6 +402,7 @@ function normalizePresentationPreflightValue(
     ),
     slides: Object.freeze(slides),
     fontPreloadNames: Object.freeze(fontPreloadNames),
+    ...(fontPreloadDemand === undefined ? {} : { fontPreloadDemand }),
   });
 }
 
@@ -487,11 +498,20 @@ interface PendingAcceptance {
   readonly fontNames: readonly (string | null)[];
   readonly fontBytes: number;
   readonly committedBytes: number;
+  readonly demandDelta?: FontPreloadDemand;
+  readonly demandBytes: number;
+  readonly demandMembershipBytes: number;
+  readonly demandDeltaBytes: number;
 }
+
+/** Injected after opt-in lazy import; Google-off builders import no analysis
+ * and allocate no scalar membership cache. ACK transactions stay synchronous. */
+export type FontDemandCollector = (slide: Slide, committed: ReadonlySet<number>, byteAllowance: number) => FontPreloadDemand;
 
 /** @internal Test-only lowering; production cannot raise or replace the hard ceiling. */
 export interface PresentationPreflightBuilderOptions {
   readonly cjkFallback?: import('@silurus/ooxml-core').CjkLang;
+  readonly collectFontDemand?: FontDemandCollector;
   readonly hardLimitForTesting?: number;
 }
 
@@ -519,6 +539,14 @@ export class PresentationPreflightBuilder {
   private readonly limit: number;
   private pending: PendingAcceptance | null = null;
   private finished: PresentationPreflight | null = null;
+  private readonly demandPoints?: Set<number>;
+  private demandAll = false;
+  private demandBytes = 0;
+  private demandMembershipBytes = 0;
+  private demandDeltaBytes = 0;
+  private readonly collectFontDemand?: FontDemandCollector;
+  private demandDelta: FontPreloadDemand | undefined;
+
 
   constructor(
     bootstrap: PresentationBootstrap,
@@ -533,6 +561,14 @@ export class PresentationPreflightBuilder {
       throw new Error('invalid PPTX presentation preflight test limit');
     }
     this.limit = requestedLimit;
+    this.collectFontDemand = options.collectFontDemand;
+    this.demandPoints = this.collectFontDemand ? new Set<number>() : undefined;
+    // Exact cost of appending the known empty-array field to an existing JSON
+    // object (one comma replaces one closing brace). All demand uses omission.
+    this.demandBytes = this.collectFontDemand
+      ? measureStructuralJson({ fontPreloadDemand: [] }, this.limit).jsonBytes - 1 : 0;
+
+    this.demandMembershipBytes = this.demandBytes;
     this.slideCountValue = normalized.slideCount;
     this.slideWidthValue = normalized.slideWidth;
     this.slideHeightValue = normalized.slideHeight;
@@ -567,6 +603,14 @@ export class PresentationPreflightBuilder {
       slides: [],
       fontPreloadNames: this.fontPreloadNames,
     }, this.limit).jsonBytes;
+    // Demand is an evictable precision cache, not required document metadata.
+    // At the hard ceiling omit it: omission has legacy conservative all meaning.
+    if (this.projectionBytesValue + this.demandBytes > this.limit) {
+      this.demandAll = true;
+      this.demandBytes = 0;
+      this.demandMembershipBytes = 0;
+    }
+    this.projectionBytesValue = cappedAdd(this.projectionBytesValue, this.demandBytes, this.limit);
     assertProjectionBytes(this.projectionBytesValue, this.limit, ZERO_RESOURCE_USAGE);
   }
 
@@ -591,6 +635,10 @@ export class PresentationPreflightBuilder {
   get currentFontPreloadNames(): readonly (string | null)[] {
     return this.fontPreloadNames;
   }
+
+  /** Delta from the last committed admission, never an uncommitted candidate.
+   * Progressive owners consume this before publishing that slide. */
+  get currentFontPreloadDemandDelta(): FontPreloadDemand | undefined { return this.demandDelta; }
 
   /**
    * Read-only snapshot of the committed prefix while preflight is still open.
@@ -647,6 +695,7 @@ export class PresentationPreflightBuilder {
     // strings, and adds one fact. This exact delta keeps the building-state
     // projection honest while descriptors and committed facts coexist.
     let committedBytes = this.projectionBytesValue
+      - this.demandBytes
       - this.fontProjectionBytes
       - measureStructuralJson(descriptor, this.limit).jsonBytes
       + 4;
@@ -662,7 +711,59 @@ export class PresentationPreflightBuilder {
       slide: fact,
       fontPreloadNames: nextFontNames,
     }, this.limit).jsonBytes;
-    const preparedBytes = cappedAdd(this.projectionBytesValue, candidateBytes, this.limit);
+    const basePreparedBytes = cappedAdd(this.projectionBytesValue - this.demandBytes, candidateBytes, this.limit);
+    const baseCommittedBytes = committedBytes;
+    assertProjectionBytes(Math.max(basePreparedBytes, baseCommittedBytes), this.limit, usage);
+    let preparedBytes = basePreparedBytes + this.demandBytes;
+    committedBytes += this.demandBytes;
+    // First test admission without optional demand. Genuine metadata rejection
+    // must not change the committed cache. If only cache retention causes the
+    // pressure, evict its precision D→all without retaining a rollback copy.
+    // Rollback still publishes no candidate facts or incoming scalars; it need
+    // not restore evicted optimization precision. Already published text is
+    // unchanged, and the next font barrier consumes conservative all demand.
+    if (Math.max(preparedBytes, committedBytes) > this.limit && this.demandBytes) {
+      this.projectionBytesValue -= this.demandBytes;
+      this.demandBytes = 0;
+      this.demandMembershipBytes = 0;
+      this.demandDeltaBytes = 0;
+      this.demandPoints?.clear();
+      this.demandAll = true;
+      this.demandDelta = 'all';
+      preparedBytes = basePreparedBytes;
+      committedBytes = baseCommittedBytes;
+    }
+    let demandDelta: FontPreloadDemand | undefined;
+    let demandBytes = this.demandBytes;
+    let demandMembershipBytes = this.demandMembershipBytes;
+    let demandDeltaBytes = this.demandDeltaBytes;
+    if (this.collectFontDemand) {
+      const emptyArrayBytes = measureStructuralJson([], this.limit).jsonBytes;
+      // D (cumulative membership) and E (last committed delta array) coexist.
+      // Prepare retains D+E+Δ; commit retains (D∪Δ)+Δ while replacing E.
+      // The factor two below charges those two actual scalar representations;
+      // this is projection accounting, not a measured JavaScript heap size.
+      const preparedAllowance = this.limit - preparedBytes;
+      const committedAllowance = this.limit - baseCommittedBytes - this.demandMembershipBytes;
+      const deltaAllowance = Math.min(preparedAllowance, Math.floor(
+        (committedAllowance + emptyArrayBytes - Number((this.demandPoints?.size ?? 0) > 0)) / 2,
+      ));
+      demandDelta = this.demandAll ? 'all' : this.collectFontDemand(
+        slide, this.demandPoints as Set<number>, Math.max(0, deltaAllowance),
+      );
+      if (demandDelta === 'all') {
+        demandBytes = 0;
+        demandMembershipBytes = 0;
+        demandDeltaBytes = 0;
+      } else {
+        demandDeltaBytes = measureStructuralJson(demandDelta, this.limit).jsonBytes;
+        const growthBytes = demandDelta.length === 0 ? 0 : demandDeltaBytes - emptyArrayBytes + Number((this.demandPoints?.size ?? 0) > 0);
+        demandMembershipBytes += growthBytes;
+        demandBytes = demandMembershipBytes + demandDeltaBytes;
+        preparedBytes += demandDeltaBytes;
+      }
+      committedBytes = baseCommittedBytes + demandBytes;
+    }
     const observed = Math.max(preparedBytes, committedBytes);
     assertProjectionBytes(observed, this.limit, usage);
     const pending: PendingAcceptance = {
@@ -672,6 +773,10 @@ export class PresentationPreflightBuilder {
       fontNames: nextFontNames,
       fontBytes: nextFontBytes,
       committedBytes,
+      demandDelta,
+      demandBytes,
+      demandMembershipBytes,
+      demandDeltaBytes,
     };
     this.pending = pending;
     return {
@@ -690,6 +795,12 @@ export class PresentationPreflightBuilder {
         this.fontPreloadNames = pending.fontNames;
         this.fontProjectionBytes = pending.fontBytes;
         this.projectionBytesValue = pending.committedBytes;
+        this.demandDelta = pending.demandDelta;
+        if (pending.demandDelta === 'all') { this.demandAll = true; this.demandPoints?.clear(); }
+        else for (const cp of pending.demandDelta ?? []) this.demandPoints?.add(cp);
+        this.demandBytes = pending.demandBytes;
+        this.demandMembershipBytes = pending.demandMembershipBytes;
+        this.demandDeltaBytes = pending.demandDeltaBytes;
         pending.state = 'committed';
         this.pending = null;
       },
@@ -727,10 +838,13 @@ export class PresentationPreflightBuilder {
       embeddedFonts: this.embeddedFontsValue,
       slides: Object.freeze([...this.slides]),
       fontPreloadNames: this.fontPreloadNames,
+      ...(this.collectFontDemand && !this.demandAll && this.demandBytes ? { fontPreloadDemand: Object.freeze([...(this.demandPoints ?? [])]) } : {}),
     });
     // The frozen compact model owns its slide-array storage from here. The
     // builder releases both construction-only arrays rather than retaining a
     // second array of fact references or descriptor slots after finish.
+    this.demandPoints?.clear();
+    this.demandDelta = undefined;
     this.descriptors = [];
     this.slides = [];
     this.projectionBytesValue = measureStructuralJson(

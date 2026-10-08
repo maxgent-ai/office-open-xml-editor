@@ -9,6 +9,7 @@ describe('DOCX reference font vertical metrics', () => {
     const metric = referenceFontLineMetrics('Calibri', 400, 'normal', 'other');
     expect(metric).toEqual({
       lineHeightRatio: 2500 / 2048,
+      farEastCodePage: false,
       designAscentRatio: 1950 / 2048,
       designDescentRatio: 550 / 2048,
     });

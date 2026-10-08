@@ -1,3 +1,5 @@
+import { CanvasOverlayHost } from '../internal/canvas-viewer-mechanics';
+
 /** UI gesture debounce; repeated CSS previews settle into one full render. */
 export const DEFAULT_ZOOM_SETTLE_MS = 150;
 
@@ -180,19 +182,7 @@ export function createSlotHost(
   canvas.style.cssText = 'display:block;background:#fff;';
   if (shadow !== false) canvas.style.boxShadow = shadow;
   wrapper.appendChild(canvas);
-  let textLayer: HTMLDivElement | null = null;
-  if (textSelection) {
-    textLayer = doc.createElement('div');
-    textLayer.style.cssText =
-      'position:absolute;top:0;left:0;width:100%;height:100%;' +
-      'overflow:hidden;pointer-events:none;user-select:text;-webkit-user-select:text;';
-    wrapper.appendChild(textLayer);
-  }
-  const highlightLayer = doc.createElement('div');
-  highlightLayer.style.cssText =
-    'position:absolute;top:0;left:0;width:100%;height:100%;' +
-    'overflow:hidden;pointer-events:none;';
-  wrapper.appendChild(highlightLayer);
+  const { textLayer, highlightLayer } = new CanvasOverlayHost(wrapper, textSelection);
   return { wrapper, canvas, textLayer, highlightLayer };
 }
 
@@ -247,6 +237,7 @@ export function createCommentSlotLayers(
   if (!enabled) return { markerLayer: null, margin: null, decorationLayer: null };
   const doc = wrapper.ownerDocument;
   const markerLayer = doc.createElement('div');
+  markerLayer.setAttribute('data-overlay', 'comment-marker');
   markerLayer.style.cssText = 'position:absolute;inset:0;overflow:hidden;pointer-events:none;';
   wrapper.appendChild(markerLayer);
   if (!cards) return { markerLayer, margin: null, decorationLayer: null };

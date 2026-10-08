@@ -110,10 +110,11 @@ function installSelf(): FakeSelf {
 
 /** Import the worker module fresh (its top-level `self.onmessage = …` runs on
  *  import), after `self` and the WASM mock are installed. */
-async function loadWorker(): Promise<FakeSelf> {
+async function loadWorker(variant: 'default' | 'source' = 'source'): Promise<FakeSelf> {
   const fake = installSelf();
   vi.resetModules();
-  await import('./worker-source.js');
+  if (variant === 'source') await import('./worker-source.js');
+  else await import('./worker.js');
   return fake;
 }
 
@@ -307,4 +308,20 @@ describe('pptx worker.ts — init failure never hangs a request (AR4)', () => {
       message: expect.stringContaining('session id'),
     })));
   });
+});
+
+
+it.each(['default', 'source'] as const)('carries completed compact demand from the parser owner (%s)', async (variant) => {
+  initMock.mockResolvedValue(undefined);
+  if (variant === 'source') openSourceMock.mockResolvedValue({ archive: sourceArchive(), viewDefaults: {}, close: vi.fn() });
+  const fake = await loadWorker(variant);
+  fake.onmessage?.({ data: { kind: 'init', wasmUrl: 'x' } } as MessageEvent);
+  fake.onmessage?.({ data: { kind: 'parse', id: 80, buffer: new ArrayBuffer(4), resourcePolicy, cjkFallback: 'jp', collectFontDemand: true,
+    ...(variant === 'source' ? { source: modelSource, sourceOwnerUrl: './internal/worker-presentation-source.js' } : {}),
+  } } as MessageEvent);
+  await vi.waitFor(() => expect(fake.posted).toContainEqual(expect.objectContaining({ kind: 'presentationOpened', id: 80 })));
+  fake.onmessage?.({ data: { kind: 'finishPresentationPreflight', id: 81 } } as MessageEvent);
+  await vi.waitFor(() => expect(fake.posted).toContainEqual(expect.objectContaining({
+    kind: 'presentationPreflightReady', id: 81, preflight: expect.objectContaining({ fontPreloadDemand: [] }),
+  })));
 });

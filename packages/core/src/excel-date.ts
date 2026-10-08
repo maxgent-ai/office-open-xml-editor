@@ -39,6 +39,27 @@ const MS_PER_DAY = 86_400_000;
 const BASE_1900_MS = Date.UTC(1899, 11, 30);
 const BASE_1904_MS = Date.UTC(1904, 0, 1);
 
+/** Calendar/clock display admission for the Excel-compatible date systems.
+ * Annex L.2.16.9.1 defines their last day; §18.17.4.2 allows time fractions
+ * below 1. Library policy preserves serial zero (including existing 1900
+ * rendering), while negative calendar/clock values use a width-independent
+ * '#' marker. This is a display policy, not the wider signed temporal range
+ * in §18.17.4.1, and does not restrict elapsed durations or date arithmetic.
+ */
+export function isExcelDisplayDateSerial(serial: number, date1904 = false): boolean {
+  return Number.isFinite(serial) && serial >= 0 && serial < (date1904 ? 2_957_004 : 2_958_466);
+}
+
+function roundSerialDate(base: number, adjusted: number, serial: number, date1904: boolean): number {
+  const ms = base + Math.round(adjusted * MS_PER_DAY);
+  // A valid final-day fraction can round to midnight of year 10000. Saturate
+  // only that rounding carry at the supported final millisecond; ordinary
+  // dates still carry midnight, and out-of-range arithmetic is untouched.
+  return isExcelDisplayDateSerial(serial, date1904)
+    ? Math.min(ms, Date.UTC(10000, 0, 1) - 1)
+    : ms;
+}
+
 /**
  * Convert an Excel date-time serial to a UTC `Date`.
  *
@@ -52,13 +73,13 @@ export function excelSerialToUtcDate(serial: number, date1904 = false): Date {
   // is rarely exact in binary (8:00 is 0.33333333333333331, a hair under
   // 28 800 000 ms), so round to the nearest millisecond first.
   if (date1904) {
-    return new Date(BASE_1904_MS + Math.round(serial * MS_PER_DAY));
+    return new Date(roundSerialDate(BASE_1904_MS, serial, serial, date1904));
   }
   // 1900 system: apply the Lotus leap-year-bug compensation. Serials < 60 sit
   // before the phantom 1900-02-29 and are one day short under the bug-free
   // 1899-12-30 epoch, so add a day back. Serials ≥ 60 need no adjustment.
   const adjusted = serial < 60 ? serial + 1 : serial;
-  return new Date(BASE_1900_MS + Math.round(adjusted * MS_PER_DAY));
+  return new Date(roundSerialDate(BASE_1900_MS, adjusted, serial, date1904));
 }
 
 /**

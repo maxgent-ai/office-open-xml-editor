@@ -4,6 +4,7 @@ import {
   logicalPageExtent,
   logicalToPhysicalMatrix,
   physicalToLogicalMatrix,
+  sectionWritingMode,
   uprightPhysicalExtent,
   writingModeFromTextDirection,
   transformPoint,
@@ -21,6 +22,8 @@ describe('coordinate-space', () => {
     ['horizontal-tb', { xPt: 80, yPt: 120 }, rect],
     ['vertical-rl', { xPt: 492, yPt: 80 }, { xPt: 432, yPt: 80, widthPt: 60, heightPt: 140 }],
     ['vertical-lr', { xPt: 120, yPt: 80 }, { xPt: 120, yPt: 80, widthPt: 60, heightPt: 140 }],
+    // Counter-clockwise: inline +x runs up from the bottom edge, block +y right.
+    ['sideways-lr', { xPt: 120, yPt: 712 }, { xPt: 120, yPt: 572, widthPt: 60, heightPt: 140 }],
   ])('maps %s logical points and rectangles to upright physical space', (mode, expectedPoint, expectedRect) => {
     const matrix = logicalToPhysicalMatrix(mode, page);
 
@@ -28,7 +31,7 @@ describe('coordinate-space', () => {
     expect(transformRect(matrix, rect)).toEqual(expectedRect);
   });
 
-  it.each<WritingMode>(['horizontal-tb', 'vertical-rl', 'vertical-lr'])
+  it.each<WritingMode>(['horizontal-tb', 'vertical-rl', 'vertical-lr', 'sideways-lr'])
     ('uses an exact closed-form inverse for %s points and rectangles', (mode) => {
       const forward = logicalToPhysicalMatrix(mode, page);
       const inverse = physicalToLogicalMatrix(mode, page);
@@ -46,6 +49,7 @@ describe('coordinate-space', () => {
     ['horizontal-tb', { top: 'top', right: 'right', bottom: 'bottom', left: 'left' }],
     ['vertical-rl', { top: 'right', right: 'bottom', bottom: 'left', left: 'top' }],
     ['vertical-lr', { top: 'left', right: 'bottom', bottom: 'right', left: 'top' }],
+    ['sideways-lr', { top: 'left', right: 'top', bottom: 'right', left: 'bottom' }],
   ] as const)('projects physical edge ownership through %s', (mode, expected) => {
     expect(transformRectEdges(
       physicalToLogicalMatrix(mode, page),
@@ -75,8 +79,34 @@ describe('coordinate-space', () => {
     expect(writingModeFromTextDirection(token)).toBe(expected);
   });
 
-  it.each(['', 'unknown'])('rejects unsupported text direction %j', (token) => {
+  it.each(['', 'unknown', 'sideways-lr', 'bottomToTop'])('rejects unsupported text direction %j', (token) => {
     expect(() => writingModeFromTextDirection(token)).toThrow(RangeError);
+    // An authored token never selects the native counter-clockwise frame.
+    expect(() => sectionWritingMode({ textDirection: token })).toThrow(RangeError);
+  });
+
+  it('selects the counter-clockwise frame only from a native flow fact on its nominal token', () => {
+    expect(sectionWritingMode({ textDirection: 'btLr' })).toBe('vertical-rl');
+    expect(sectionWritingMode({ textDirection: 'tbRl' })).toBe('vertical-rl');
+    expect(sectionWritingMode({ textDirection: 'btLr', nativeSectionFlow: 'bottomToTop' }))
+      .toBe('sideways-lr');
+    for (const textDirection of ['lrTb', 'tbRl', 'tbLrV']) {
+      expect(() => sectionWritingMode({ textDirection, nativeSectionFlow: 'bottomToTop' }))
+        .toThrow(RangeError);
+    }
+  });
+
+  it('places the counter-clockwise inline start at the physical bottom and block start at the left', () => {
+    const forward = logicalToPhysicalMatrix('sideways-lr', page);
+    expect(forward).toEqual({ a: 0, b: -1, c: 1, d: 0, e: 0, f: 792 });
+    expect(physicalToLogicalMatrix('sideways-lr', page)).toEqual({ a: 0, b: 1, c: -1, d: 0, e: 792, f: 0 });
+    // Logical origin: physical bottom-left corner. Inline advance: upward.
+    // Block advance: rightward.
+    expect(transformPoint(forward, { xPt: 0, yPt: 0 })).toEqual({ xPt: 0, yPt: 792 });
+    expect(transformPoint(forward, { xPt: 10, yPt: 0 })).toEqual({ xPt: 0, yPt: 782 });
+    expect(transformPoint(forward, { xPt: 0, yPt: 10 })).toEqual({ xPt: 10, yPt: 792 });
+    expect(logicalPageExtent(page, 'sideways-lr')).toEqual({ widthPt: 792, heightPt: 612 });
+    expect(uprightPhysicalExtent({ widthPt: 792, heightPt: 612 }, 'sideways-lr')).toEqual(page);
   });
 
   it('derives logical and upright extents without conflating vertical axes', () => {

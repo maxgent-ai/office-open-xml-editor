@@ -31,7 +31,7 @@ import { withSparseStyleIndexCache } from './sparse-style-index.js';
 
 import { applyPlotVisibleOnly } from './source-visibility.js';
 
-import { resolveFill, withPatternPointScale } from '../shape/paint.js';
+import { resolveNativeFill as resolveFill, withPatternPointScale } from '../shape/paint.js';
 
 import { EMU_PER_PT, PT_TO_PX } from '../units.js';
 

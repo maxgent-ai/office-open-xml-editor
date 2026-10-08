@@ -47,6 +47,20 @@ describe('findReferenceFontMetrics', () => {
     })).toHaveLength(0);
   });
 
+  it('resolves the Japanese BIZ UD family names to the same pinned profiles', () => {
+    for (const [japanese, english] of [
+      ['BIZ UDゴシック', 'BIZ UDGothic'],
+      ['BIZ UD明朝', 'BIZ UDMincho'],
+    ] as const) {
+      for (const weight of [400, 700] as const) {
+        const localized = findReferenceFontMetrics(japanese, { weight, style: 'normal' });
+        expect(localized).toHaveLength(1);
+        expect(localized).toEqual(findReferenceFontMetrics(english, { weight, style: 'normal' }));
+      }
+      expect(findReferenceFontMetrics(japanese, { style: 'italic' })).toHaveLength(0);
+    }
+  });
+
   it('does not let callers mutate shared generated profiles', () => {
     const matches = findReferenceFontMetrics('Times New Roman');
     const filtered = findReferenceFontMetrics('Times New Roman', { source: 'office-mac' });

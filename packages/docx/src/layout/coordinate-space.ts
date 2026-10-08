@@ -1,10 +1,25 @@
 import type {
   LayoutRect,
   Matrix2DData,
+  NativeSectionFlow,
   PointPt,
   SectionRegionCoordinateSpace,
+  UprightResourceOrientation,
   WritingMode,
 } from './types.js';
+
+/** Local counter-turn that keeps a non-text graphic upright in a vertical
+ * page of this writing mode: the inverse of the section frame's quarter turn.
+ * Horizontal pages need none. */
+export function uprightResourceOrientation(
+  verticalPageFrame: boolean | undefined,
+  pageWritingMode: WritingMode,
+): UprightResourceOrientation | undefined {
+  if (!verticalPageFrame) return undefined;
+  return pageWritingMode === 'sideways-lr'
+    ? 'upright-physical-counter-clockwise'
+    : 'upright-physical';
+}
 
 export type PhysicalPageExtent = Readonly<{
   widthPt: number;
@@ -41,6 +56,22 @@ export function writingModeFromTextDirection(textDirection: string): WritingMode
     default:
       throw new RangeError(`Unsupported Transitional text direction ${JSON.stringify(textDirection)}`);
   }
+}
+
+/** Writing mode of one section context. The authored token decides it unless
+ * a validated native flow fact selects its canonical frame; that fact is only
+ * normalized from the native producer's private wire, never from a token. */
+export function sectionWritingMode(section: Readonly<{
+  textDirection: string;
+  nativeSectionFlow?: NativeSectionFlow | null;
+}>): WritingMode {
+  if (section.nativeSectionFlow == null) return writingModeFromTextDirection(section.textDirection);
+  if (section.nativeSectionFlow !== 'bottomToTop' || section.textDirection !== 'btLr') {
+    throw new RangeError(
+      `Native section flow ${String(section.nativeSectionFlow)} contradicts text direction ${JSON.stringify(section.textDirection)}`,
+    );
+  }
+  return 'sideways-lr';
 }
 
 function requirePage(page: PhysicalPageExtent): void {
@@ -80,6 +111,7 @@ export function logicalPageExtent(
       return { widthPt: physicalPage.widthPt, heightPt: physicalPage.heightPt };
     case 'vertical-rl':
     case 'vertical-lr':
+    case 'sideways-lr':
       return { widthPt: physicalPage.heightPt, heightPt: physicalPage.widthPt };
     default:
       throw new RangeError(`Unsupported writing mode ${String(writingMode)}`);
@@ -99,6 +131,7 @@ export function uprightPhysicalExtent(
       };
     case 'vertical-rl':
     case 'vertical-lr':
+    case 'sideways-lr':
       return {
         widthPt: logicalSectionExtent.heightPt,
         heightPt: logicalSectionExtent.widthPt,
@@ -120,6 +153,10 @@ export function logicalToPhysicalMatrix(
       return { a: 0, b: 1, c: -1, d: 0, e: page.widthPt, f: 0 };
     case 'vertical-lr':
       return { a: 0, b: 1, c: 1, d: 0, e: 0, f: 0 };
+    case 'sideways-lr':
+      // Counter-clockwise quarter turn: logical inline +x runs physically
+      // upward from the bottom edge, logical block +y runs rightward.
+      return { a: 0, b: -1, c: 1, d: 0, e: 0, f: page.heightPt };
     default:
       throw new RangeError(`Unsupported writing mode ${String(writingMode)}`);
   }
@@ -137,6 +174,8 @@ export function physicalToLogicalMatrix(
       return { a: 0, b: -1, c: 1, d: 0, e: 0, f: page.widthPt };
     case 'vertical-lr':
       return { a: 0, b: 1, c: 1, d: 0, e: 0, f: 0 };
+    case 'sideways-lr':
+      return { a: 0, b: 1, c: -1, d: 0, e: page.heightPt, f: 0 };
     default:
       throw new RangeError(`Unsupported writing mode ${String(writingMode)}`);
   }

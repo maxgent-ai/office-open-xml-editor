@@ -159,10 +159,11 @@ pub struct RunFmt {
     /// ECMA-376 §17.3.2.19 `<w:kern w:val>` — the SMALLEST font size (threshold)
     /// that has automatic font kerning applied; a run whose `sz` is below this
     /// value is not kerned. Stored in POINTS (source is ST_HpsMeasure =
-    /// half-points). Presence itself enables kerning (subject to the threshold);
+    /// half-points). Positive presence enables kerning (subject to the threshold);
     /// `None` = inherit, and "never set in the hierarchy" ⇒ no kerning at all
     /// (Word's default is OFF, unlike Canvas's default `fontKerning='auto'`).
-    /// `Some(0.0)` = kern at every size.
+    /// `Some(0.0)` preserves an explicit override: DOCX layout applies the
+    /// WORD_KERN_THRESHOLD_AUTHORITY zero-disables compatibility extension.
     pub kerning: Option<f64>,
     /// ECMA-376 §17.3.2.10 `<w:eastAsianLayout w:vert>` — "Horizontal in Vertical
     /// (Rotate Text)" (縦中横 / tate-chū-yoko). When `Some(true)`, in a VERTICAL
@@ -205,6 +206,10 @@ pub struct ParaFmt {
     pub indent_first: Option<f64>, // pt
     pub space_before: Option<f64>, // pt
     pub space_after: Option<f64>,  // pt
+    /// ECMA-376 §17.3.1.33: per-side automatic margin toggles inherit independently;
+    /// an explicit false clears an inherited true without discarding stored twips.
+    pub before_autospacing: Option<bool>,
+    pub after_autospacing: Option<bool>,
     pub line_spacing_val: Option<f64>,
     pub line_spacing_rule: Option<String>,
     /// True when `w:spacing/@w:line` was declared on the paragraph's own pPr
@@ -237,6 +242,11 @@ pub struct ParaFmt {
     /// applied when the resolved paragraph is built so style/direct `false`
     /// remains distinguishable from omission during the cascade.
     pub overflow_punct: Option<bool>,
+    /// ECMA-376 §17.3.1.2 w:autoSpaceDE / §17.3.1.3 w:autoSpaceDN — automatic
+    /// spacing between East Asian text and Latin text / numbers. Omission
+    /// inherits; the final default (`true`) is applied on the resolved paragraph.
+    pub auto_space_de: Option<bool>,
+    pub auto_space_dn: Option<bool>,
     /// ECMA-376 §17.3.1.1 w:adjustRightInd — allow the consumer to adjust the
     /// effective right indent when a document grid is active. Retained as an
     /// Option through the style cascade because omission inherits and the final
@@ -305,6 +315,8 @@ pub struct RawTblBorders {
 #[derive(Debug, Default, Clone)]
 pub struct CondFmt {
     pub shd: Option<String>,
+    /// ECMA-376 17.4.29, including explicit false to clear a base style.
+    pub no_wrap: Option<bool>,
     pub borders: RawTblBorders,
     /// ECMA-376 §17.7.6: the conditional block's `<w:rPr>` — run defaults that
     /// apply to runs in cells covered by this condition (e.g. Calendar 3's
@@ -343,6 +355,9 @@ pub fn merge_cond_layers(layers: &[&CondFmt]) -> CondFmt {
         if layer.shd.is_some() {
             out.shd = layer.shd.clone();
         }
+        if layer.no_wrap.is_some() {
+            out.no_wrap = layer.no_wrap;
+        }
         merge_raw_borders(&mut out.borders, &layer.borders);
         if let Some(r) = &layer.run {
             apply_run(out.run.get_or_insert_with(RunFmt::default), r);
@@ -370,6 +385,7 @@ pub struct TableStyleDef {
     pub based_on: Option<String>,
     pub borders: RawTblBorders,
     pub cell_shd: Option<String>,
+    pub cell_no_wrap: Option<bool>,
     pub cell_valign: Option<String>,
     /// ECMA-376 §17.7.6: the table style's whole-table `<w:rPr>` — run defaults
     /// applied to every cell (e.g. Calendar 3's `<w:color w:val="7F7F7F"/>`
@@ -628,6 +644,9 @@ impl StyleMap {
             if def.cell_shd.is_some() {
                 out.cell_shd = def.cell_shd.clone();
             }
+            if def.cell_no_wrap.is_some() {
+                out.cell_no_wrap = def.cell_no_wrap;
+            }
             if def.cell_valign.is_some() {
                 out.cell_valign = def.cell_valign.clone();
             }
@@ -680,6 +699,9 @@ impl StyleMap {
                 let slot = out.cond.entry(k.clone()).or_default();
                 if v.shd.is_some() {
                     slot.shd = v.shd.clone();
+                }
+                if v.no_wrap.is_some() {
+                    slot.no_wrap = v.no_wrap;
                 }
                 merge_raw_borders(&mut slot.borders, &v.borders);
                 if let Some(r) = &v.run {
@@ -968,6 +990,12 @@ pub(crate) fn apply_para(dst: &mut ParaFmt, src: &ParaFmt) {
     if src.space_after.is_some() {
         dst.space_after = src.space_after;
     }
+    if src.before_autospacing.is_some() {
+        dst.before_autospacing = src.before_autospacing;
+    }
+    if src.after_autospacing.is_some() {
+        dst.after_autospacing = src.after_autospacing;
+    }
     if src.line_spacing_val.is_some() {
         dst.line_spacing_val = src.line_spacing_val;
     }
@@ -1013,6 +1041,12 @@ pub(crate) fn apply_para(dst: &mut ParaFmt, src: &ParaFmt) {
     }
     if src.overflow_punct.is_some() {
         dst.overflow_punct = src.overflow_punct;
+    }
+    if src.auto_space_de.is_some() {
+        dst.auto_space_de = src.auto_space_de;
+    }
+    if src.auto_space_dn.is_some() {
+        dst.auto_space_dn = src.auto_space_dn;
     }
     if src.adjust_right_ind.is_some() {
         dst.adjust_right_ind = src.adjust_right_ind;
@@ -1317,8 +1351,13 @@ pub fn parse_para_fmt(ppr: roxmltree::Node) -> ParaFmt {
         fmt.alignment = attr_w(jc, "val");
     }
 
-    // Spacing
+    // Spacing. §17.3.1.33 gives an active automatic flag priority over both
+    // absolute and line-unit margins. Inactive beforeLines/afterLines spacing
+    // remains unsupported: retain the existing absolute-value fallback instead
+    // of guessing a line-height conversion here.
     if let Some(sp) = child_w(ppr, "spacing") {
+        fmt.before_autospacing = on_off_attr(sp, "beforeAutospacing");
+        fmt.after_autospacing = on_off_attr(sp, "afterAutospacing");
         if let Some(v) = attr_w(sp, "before") {
             fmt.space_before = Some(twips_to_pt(&v));
         }
@@ -1327,7 +1366,11 @@ pub fn parse_para_fmt(ppr: roxmltree::Node) -> ParaFmt {
         }
         if let Some(v) = attr_w(sp, "line") {
             let rule = attr_w(sp, "lineRule").unwrap_or_else(|| "auto".to_string());
-            let raw: f64 = v.parse().unwrap_or(240.0);
+            // §17.3.1.33: w:line is ST_SignedTwipsMeasure. A value outside
+            // its lexical union (e.g. an exponent or NaN) keeps the historical
+            // single-spacing fallback instead of reaching layout. Converting
+            // from the authored unit keeps every valid lexeme finite.
+            let measure = signed_twips_measure(&v).unwrap_or(SignedTwipsMeasure::Twips(240.0));
             // OOXML encodes line spacing as:
             //   auto      → raw / 240   = multiplier (1.0 = single, 1.5 = 1½, 2.0 = double)
             //   atLeast   → raw / 20    = pt (minimum line height)
@@ -1339,9 +1382,9 @@ pub fn parse_para_fmt(ppr: roxmltree::Node) -> ParaFmt {
             // the section enables a line grid, which is where those oversized
             // values are actually authored.
             let (val, effective_rule) = match rule.as_str() {
-                "exact" => (raw / 20.0, "exact".to_string()),
-                "atLeast" => (raw / 20.0, "atLeast".to_string()),
-                _ => (raw / 240.0, "auto".to_string()),
+                "exact" => (measure.to_pt(), "exact".to_string()),
+                "atLeast" => (measure.to_pt(), "atLeast".to_string()),
+                _ => (measure.to_240ths(), "auto".to_string()),
             };
             fmt.line_spacing_val = Some(val);
             fmt.line_spacing_rule = Some(effective_rule);
@@ -1443,6 +1486,10 @@ pub fn parse_para_fmt(ppr: roxmltree::Node) -> ParaFmt {
     // ECMA-376 §17.3.1.21 defines omission as true; retain Option here so an
     // explicit style/direct false participates correctly in the cascade.
     fmt.overflow_punct = bool_prop(ppr, "overflowPunct");
+
+    // autoSpaceDE / autoSpaceDN — ECMA-376 §17.3.1.2-3; same cascade contract.
+    fmt.auto_space_de = bool_prop(ppr, "autoSpaceDE");
+    fmt.auto_space_dn = bool_prop(ppr, "autoSpaceDN");
 
     // adjustRightInd — ECMA-376 §17.3.1.1. The setting participates in the
     // paragraph-style hierarchy and omission ultimately defaults to true.
@@ -2218,9 +2265,10 @@ pub fn parse_run_fmt(rpr: roxmltree::Node) -> RunFmt {
     }
 
     // Font kerning threshold (ECMA-376 §17.3.2.19 `<w:kern w:val>`). ST_HpsMeasure
-    // (half-points) — the SMALLEST font size that has kerning applied. The mere
-    // presence of the element turns kerning on (subject to the threshold); Word's
-    // hierarchy default is OFF. `w:val="0"` = kern at all sizes. Stored in points.
+    // (half-points) — the SMALLEST font size that has kerning applied. A
+    // positive threshold enables kerning when size qualifies; absence inherits.
+    // Preserve zero, which overrides inheritance; layout owns its compatibility
+    // interpretation (WORD_KERN_THRESHOLD_AUTHORITY). Stored in points.
     if let Some(kern) = child_w(rpr, "kern") {
         if let Some(v) = attr_w(kern, "val") {
             fmt.kerning = half_pt_to_pt(&v);
@@ -2489,6 +2537,7 @@ fn parse_tbl_style_def(style_node: roxmltree::Node, based_on: Option<String>) ->
     }
     if let Some(tc_pr) = child_w(style_node, "tcPr") {
         def.cell_shd = shd_fill(tc_pr);
+        def.cell_no_wrap = bool_prop(tc_pr, "noWrap");
         def.cell_valign = child_w(tc_pr, "vAlign").and_then(|v| attr_w(v, "val"));
     }
     if let Some(tr_pr) = child_w(style_node, "trPr") {
@@ -2515,6 +2564,7 @@ fn parse_tbl_style_def(style_node: roxmltree::Node, based_on: Option<String>) ->
         let mut cf = CondFmt::default();
         if let Some(tc_pr) = child_w(sp, "tcPr") {
             cf.shd = shd_fill(tc_pr);
+            cf.no_wrap = bool_prop(tc_pr, "noWrap");
             if let Some(borders) = child_w(tc_pr, "tcBorders") {
                 cf.borders = parse_raw_tbl_borders(borders);
             }
@@ -2590,6 +2640,28 @@ mod tests {
         let direct = vec![stop(100.0, "clear", "none")];
         let merged = merge_tab_stops(&style, &direct);
         assert_eq!(merged, vec![stop(200.0, "right", "dot")]);
+    }
+
+    #[test]
+    fn auto_space_flags_participate_in_paragraph_style_cascade() {
+        let parse = |inner: &str| {
+            let xml = format!(
+                r#"<w:pPr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">{inner}</w:pPr>"#
+            );
+            let document = XmlDoc::parse(&xml).unwrap();
+            parse_para_fmt(document.root_element())
+        };
+        let mut inherited = parse(r#"<w:autoSpaceDE w:val="0"/><w:autoSpaceDN w:val="0"/>"#);
+        apply_para(&mut inherited, &parse("<w:keepNext/>"));
+        assert_eq!(
+            (inherited.auto_space_de, inherited.auto_space_dn),
+            (Some(false), Some(false))
+        );
+        apply_para(&mut inherited, &parse("<w:autoSpaceDE/>"));
+        assert_eq!(
+            (inherited.auto_space_de, inherited.auto_space_dn),
+            (Some(true), Some(false))
+        );
     }
 
     #[test]
@@ -3540,6 +3612,38 @@ mod tests {
     // ── WD4: run-level character metrics (§17.3.2.35 / .43 / .24 / .19) ──────
 
     #[test]
+    fn spacing_line_accepts_only_signed_twips_measure_lexemes() {
+        // §17.3.1.33: w:line is ST_SignedTwipsMeasure (§17.18.81).
+        let f = para_fmt_from(r#"<w:spacing w:line="20" w:lineRule="exact"/>"#);
+        assert_eq!(f.line_spacing_val, Some(1.0));
+        let f = para_fmt_from(r#"<w:spacing w:line="12pt" w:lineRule="exact"/>"#);
+        assert_eq!(f.line_spacing_val, Some(12.0));
+        // Exponents, decimals and non-finite values are outside the union and
+        // keep the single-spacing fallback rather than a sub-ulp line pitch.
+        for invalid in ["2e-13", "0.5", "NaN", "inf"] {
+            let f = para_fmt_from(&format!(
+                r#"<w:spacing w:line="{invalid}" w:lineRule="exact"/>"#
+            ));
+            assert_eq!(f.line_spacing_val, Some(12.0), "{invalid:?}");
+        }
+        // A valid, representable universal measure stays finite.
+        let f = para_fmt_from(&format!(
+            r#"<w:spacing w:line="1{}pt" w:lineRule="exact"/>"#,
+            "0".repeat(307)
+        ));
+        assert_eq!(f.line_spacing_val, Some(1e307));
+        // A valid unit-bearing lexeme beyond binary64 saturates, as bare
+        // integers do, instead of falling back to single spacing.
+        for unit in ["pt", "in", "mm", "cm", "pc", "pi"] {
+            let f = para_fmt_from(&format!(
+                r#"<w:spacing w:line="1{}{unit}" w:lineRule="exact"/>"#,
+                "0".repeat(400)
+            ));
+            assert_eq!(f.line_spacing_val, Some(f64::MAX), "{unit}");
+        }
+    }
+
+    #[test]
     fn char_spacing_parses_signed_twips_to_pt() {
         // §17.3.2.35: val is ST_SignedTwipsMeasure (twips = 1/20 pt). The spec
         // example `<w:spacing w:val="200"/>` == 10 pt of extra pitch.
@@ -3735,8 +3839,7 @@ mod tests {
         // size that gets kerning. Spec example `<w:kern w:val="28"/>` == 14 pt.
         let f = run_fmt_from(r#"<w:kern w:val="28"/>"#);
         assert_eq!(f.kerning, Some(14.0));
-        // val="0" (common in Word documents) = kern at every size — presence,
-        // not absence, so it must be Some(0.0) to keep kerning enabled.
+        // Explicit zero must survive parsing to override an inherited threshold.
         let f = run_fmt_from(r#"<w:kern w:val="0"/>"#);
         assert_eq!(f.kerning, Some(0.0));
         let f = run_fmt_from(r#"<w:kern w:val="12pt"/>"#);

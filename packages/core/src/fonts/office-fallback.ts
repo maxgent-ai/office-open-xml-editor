@@ -9,6 +9,13 @@ export interface OfficeFontFallbackRequest {
   family: string;
   weight?: number;
   style?: 'normal' | 'italic';
+  /**
+   * Only report whether ANY face of this family is installed, independent of
+   * the styles a document uses (exact local() probe of the family name and
+   * every catalogued alias). No route or metric is created; see
+   * {@link LoadedOfficeFontFallbacks.installed}.
+   */
+  presenceOnly?: boolean;
 }
 
 export interface OfficeFontFallbackRoute {
@@ -33,6 +40,8 @@ export interface LoadedOfficeFontFallbacks {
    * missing route means the attempted sources did not load, not proof that no
    * system installation exists. Budget/deadline omissions are absent. */
   checked: string[];
+  /** Normalized families of `presenceOnly` requests whose face is installed. */
+  installed?: string[];
 }
 
 type Tuple = Readonly<{
@@ -111,6 +120,20 @@ export async function loadOfficeFontFallbacks(
   requests: readonly OfficeFontFallbackRequest[],
   targetFontSet: FontFaceSet | null = activeFontSet(),
 ): Promise<LoadedOfficeFontFallbacks> {
+  const presence = requests.filter((request) => request.presenceOnly).map((request) => request.family);
+  const [loaded, installed] = await Promise.all([
+    loadOfficeFontRoutes(requests.filter((request) => !request.presenceOnly), targetFontSet),
+    presence.length > 0
+      ? probeInstalledFontFamilies(presence, targetFontSet)
+      : Promise.resolve(new Set<string>()),
+  ]);
+  return installed.size > 0 ? { ...loaded, installed: [...installed].sort() } : loaded;
+}
+
+async function loadOfficeFontRoutes(
+  requests: readonly OfficeFontFallbackRequest[],
+  targetFontSet: FontFaceSet | null,
+): Promise<LoadedOfficeFontFallbacks> {
   if (!targetFontSet || typeof FontFace === 'undefined') return { faces: [], routes: {}, checked: [] };
   // A loaded application face wins only its declared style/weight tuple. A
   // regular face must not suppress exact-local Bold or Italic, and a face still
@@ -182,4 +205,64 @@ export async function loadOfficeFontFallbacks(
 
 export function unloadOfficeFontFallbacks(faces: Iterable<FontFace>): void {
   unloadLocalFontMetrics(faces);
+}
+
+/** Exact local() names that identify ANY installed face of a family: the
+ * family name (a regular face's full name in practice) plus every catalogued
+ * full/PostScript alias of every weight and style. Presence of the family is a
+ * question separate from which styles a document uses. */
+function familyPresenceLocalNames(family: string): string[] {
+  return [...new Set([family, ...findReferenceFontMetrics(family).flatMap((profile) => profile.aliases)])];
+}
+
+/**
+ * Which authored families the host has installed: a family counts when any of
+ * its faces loads through an exact local() name (see
+ * {@link familyPresenceLocalNames}). Each family is an independent probe. Probe
+ * faces are released as soon as each probe completes, and no route or metric
+ * is created, so the authored family keeps its ordinary CSS resolution.
+ *
+ * Callers use this only to decline an optional web substitute for a family
+ * that is actually present. Library policy: the authored family names the
+ * face to use, so an installed authored face is never displaced by a
+ * substitute. The probes share the catalogued preflight's bounds: at most four
+ * run at once, no probe starts after the document deadline, and the result is
+ * returned at the deadline with the probes completed so far. A probe that
+ * completes later only releases its face. A timeout or a missing face is not
+ * proof of absence; it only leaves the substitute enabled.
+ */
+async function probeInstalledFontFamilies(
+  families: readonly string[],
+  targetFontSet: FontFaceSet | null,
+): Promise<ReadonlySet<string>> {
+  const unique = [...new Map(families
+    .map((family) => family.trim())
+    .filter(Boolean)
+    .map((family) => [normalizeLocalFontMetricFamily(family), family] as const)).values()]
+    .slice(0, MAX_PREFLIGHT_SOURCES);
+  const installed = new Set<string>();
+  if (!targetFontSet || typeof FontFace === 'undefined' || unique.length === 0) return installed;
+  let next = 0;
+  let accepting = true;
+  const workers = Array.from({ length: Math.min(4, unique.length) }, async () => {
+    while (accepting && next < unique.length) {
+      const family = unique[next++];
+      const result = await loadLocalFontMetrics(
+        [{ family, localNames: familyPresenceLocalNames(family) }],
+        targetFontSet,
+      );
+      unloadLocalFontMetrics(result.faces);
+      if (accepting && Object.keys(result.metrics).length > 0) {
+        installed.add(normalizeLocalFontMetricFamily(family));
+      }
+    }
+  });
+  let deadline: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    Promise.allSettled(workers),
+    new Promise<void>((resolve) => { deadline = setTimeout(resolve, PREFLIGHT_DEADLINE_MS); }),
+  ]);
+  if (deadline !== undefined) clearTimeout(deadline);
+  accepting = false;
+  return new Set(installed);
 }

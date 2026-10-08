@@ -193,14 +193,12 @@ const TEXT5 = 'AAAA AAAA AAAA AAAA AAAA'; // marginal word is followed by more c
 const COLUMN = 225;
 
 describe('§17.18.44 — natural word fit across alignment modes', () => {
-  it('counts a candidate trailing space when the prospective line will justify', async () => {
+  it('fits the visible justified prefix without counting its line-end separator', async () => {
     const lines = await renderLines(textPara('AAAA AAAA BBBB', 'both'), 108);
 
-    // A separator following the last admitted word still participates in the
-    // wrap decision for a line that will justify. The first word plus the
-    // second visible word is exactly 108px; counting the second token's 12px
-    // separator therefore moves it to the next line.
-    expect(tokens(lines[0])).toBe(1);
+    // The visible pair is exactly 108px; its collapsible line-edge separator
+    // cannot turn an otherwise fitting word into an overflow.
+    expect(tokens(lines[0])).toBe(2);
   });
 
   it('wraps the marginal word on a line that will justify', async () => {
@@ -276,8 +274,10 @@ describe('§17.18.44 — natural word fit across alignment modes', () => {
       } as DocRun],
       'both',
     );
-    expect(tokens((await renderLines(el, 89.2))[0])).toBe(2);
-    expect(tokens((await renderLines(generic, 89.2))[0])).toBe(2);
+    // Three scaled words plus their two interior spaces advance 84px. Their
+    // following edge separator cannot turn that visible fit into a wrap.
+    expect(tokens((await renderLines(el, 89.2))[0])).toBe(3);
+    expect(tokens((await renderLines(generic, 89.2))[0])).toBe(3);
   });
 
   it('wraps a marginal glued group at natural width for one or mixed routes', () => {

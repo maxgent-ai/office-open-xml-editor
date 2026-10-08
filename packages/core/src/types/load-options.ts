@@ -27,6 +27,50 @@ export interface OoxmlResourceLimits {
   maxArchiveEntries?: OoxmlResourceLimit;
 }
 
+/**
+ * Per-load XLSX worksheet admission limits, validated before load effects and
+ * snapshotted for that load. DOCX and PPTX ignore them. An omitted value, an
+ * empty object, or an omitted field uses the default (100,000 rows / 250,000
+ * cells / 32 MiB owned UTF-8 / 64 MiB JSON). Each supplied field must be a
+ * positive safe integer no greater than `Number.MAX_SAFE_INTEGER - 1`; `null`
+ * is invalid.
+ *
+ * These are logical budgets, not physical memory measurements. Raising them
+ * accepts additional out-of-memory risk; catching allocation failures is not
+ * guaranteed.
+ * Each dimension of the aggregate derived worksheet cache is the larger of its
+ * default (200,000 rows / 500,000 cells / 64 MiB owned / 128 MiB JSON) and the
+ * corresponding limit. Each renderer coordinate index independently allows
+ * `max(250000, maxCells)` entries, charged per unique key. ZIP, input, wire,
+ * representation and copy limits remain separate. The non-retaining Node
+ * `worksheetRows` path keeps streaming semantics: cumulative budgets apply
+ * only to models it materializes.
+ */
+export interface XlsxWorksheetLimits {
+  /** Maximum retained row records for one worksheet (not grid row coordinates). */
+  maxRows?: number;
+  /**
+   * Maximum retained cell records for one worksheet. This counts records, not
+   * grid coordinates or unique indexes. Delimited-text parsing counts every
+   * parsed field, including blanks; its fixed 64 MiB input limit is separate.
+   */
+  maxCells?: number;
+  /**
+   * Maximum UTF-8 bytes of all strings owned by `Cell.value` across one
+   * worksheet. This includes typed-value discriminators, rich-text and
+   * phonetic strings, plus formula text outside `Cell.value`. Shared strings
+   * are charged per cell after resolution.
+   */
+  maxOwnedUtf8Bytes?: number;
+  /**
+   * Maximum structural JSON UTF-8 bytes for one worksheet model, including
+   * covered ancillary data. Browser and Node measure `JSON.stringify` of the
+   * assembled model. The native Rust path measures complete `serde_json`
+   * output, which is a separate boundary.
+   */
+  maxJsonBytes?: number;
+}
+
 /** Format-neutral progress reported while a progressive layout pass runs. */
 export interface ProgressiveLayoutProgress {
   /**
@@ -151,6 +195,11 @@ export interface LoadOptions {
    * not guarantees of exact browser-process memory use.
    */
   resourceLimits?: OoxmlResourceLimits;
+  /**
+   * XLSX-only logical worksheet admission limits; ignored by DOCX and PPTX.
+   * Omitted fields use the library defaults. See {@link XlsxWorksheetLimits}.
+   */
+  xlsxWorksheetLimits?: XlsxWorksheetLimits;
   /**
    * Emit one content-free resource-usage card after load succeeds or fails.
    * Includes observed archive counters and configured limits, but never source

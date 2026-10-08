@@ -243,6 +243,52 @@ export function mergeEndRow(
   return endRow;
 }
 
+/**
+ * The vertical-merge role `cell` of `row` (input row `rowIndex`) plays in
+ * this input's grid. ECMA-376 §17.4.84 relates a continuation to the merged
+ * cell above it in the same grid, so every cell keeps its authored role,
+ * except in a cell-owner segment projection
+ * (`segmentOpeningLogicalRowIndex`, table-owner-runs.ts): there a
+ * continuation of the segment's first own row with no merged cell above it in
+ * this grid lost its restart to another segment, and opens its region as an
+ * empty owner with its own borders, shading (materializeTableRow) and margins
+ * (resolveRowTrack) (library projected-segment contract). Its content stays
+ * suppressed, since its authored role is unchanged. The row is matched by its
+ * logical index, so every occurrence of it — each fragment of a row cut
+ * across pages included, whose id is its own — is projected alike: a fragment
+ * that opens its own grid has no merged cell above it either.
+ */
+function gridMergeRole(
+  input: TableLayoutInput,
+  row: TableRowLayoutInput,
+  rowIndex: number,
+  cell: TableCellLayoutInput,
+): TableCellLayoutInput['verticalMerge'] {
+  return projectedMergeRole(input.segmentOpeningLogicalRowIndex, input.rows[rowIndex - 1], row, cell);
+}
+
+/** {@link gridMergeRole} given the row above `row` in the grid directly, for
+ * the row-track solver, which reads windows of the input's rows, and for
+ * pagination's bounded track windows (table-pagination.ts
+ * completedPartialRowWindowEnd), which must read the role the window's own
+ * layout gives each cell. */
+export function projectedMergeRole(
+  segmentOpeningLogicalRowIndex: TableLayoutInput['segmentOpeningLogicalRowIndex'],
+  above: TableRowLayoutInput | undefined,
+  row: TableRowLayoutInput,
+  cell: TableCellLayoutInput,
+): TableCellLayoutInput['verticalMerge'] {
+  if (cell.verticalMerge !== 'continue' || row.logicalRowIndex !== segmentOpeningLogicalRowIndex) {
+    return cell.verticalMerge;
+  }
+  const mergedAbove = above?.cells.some((candidate) => (
+    candidate.verticalMerge !== 'none'
+    && candidate.columnStart === cell.columnStart
+    && candidate.columnSpan === cell.columnSpan
+  )) ?? false;
+  return mergedAbove ? 'continue' : 'restart';
+}
+
 function semanticRowFloor(row: TableRowLayoutInput): number {
   if (row.heightRule === 'exact') {
     // Compatibility-owned exact-row floor.
@@ -258,80 +304,136 @@ function semanticRowFloor(row: TableRowLayoutInput): number {
   return 0;
 }
 
-function resolveRowHeights(
-  rows: readonly TableRowLayoutInput[],
-  flows: ReadonlyMap<string, CellFlowGeometry>,
-  boundaryFootprintsPt: readonly number[],
-): Readonly<{ heights: readonly number[]; contentHeights: readonly number[] }> {
-  const heights = rows.map((row) => semanticRowFloor(row));
-  const contentHeights = rows.map((row, rowIndex) => Math.max(
-    0,
-    ...row.cells
-      .filter((cell) => cell.verticalMerge !== 'continue')
-      .map((cell) => {
-        const endRowIndex = cell.verticalMerge === 'restart'
-          ? mergeEndRow(rows, rowIndex, cell.columnStart, cell.columnSpan)
-          : rowIndex;
-        const startInsets = rowSpacingInsets(rows, rowIndex);
-        const endInsets = rowSpacingInsets(rows, endRowIndex);
-        return cellRequiredHeight(
-          cell,
-          flows.get(cell.id) ?? resolveCellFlow([]),
-          { topPt: startInsets.topPt, bottomPt: endInsets.bottomPt },
-        );
-      }),
-  ));
-  rows.forEach((row, rowIndex) => {
-    const spacing = rowSpacingInsets(rows, rowIndex);
-    for (const cell of row.cells) {
-      if (cell.verticalMerge !== 'none') continue;
-      const required = cellRequiredHeight(cell, flows.get(cell.id) ?? resolveCellFlow([]), spacing);
-      if (row.heightRule !== 'exact') heights[rowIndex] = Math.max(heights[rowIndex] ?? 0, required);
-    }
-  });
+/** A vertical merge whose owner is in a resolved row and whose next row
+ * continues it: its constraint is still open. */
+interface OpenMergeTrack {
+  readonly cell: TableCellLayoutInput;
+  readonly start: number;
+  readonly topInsetPt: number;
+}
 
+function continuesMerge(cell: TableCellLayoutInput, owner: TableCellLayoutInput): boolean {
+  // Matched by grid columns, as mergeEndRow matches a continuation.
+  return cell.verticalMerge === 'continue'
+    && cell.columnStart === owner.columnStart
+    && cell.columnSpan === owner.columnSpan;
+}
+
+/** Row tracks resolved so far, before collapsed-rule footprints. */
+interface RowTrackStore {
+  readonly length: number;
+  push(heightPt: number, contentHeightPt: number, exact: boolean): void;
+  /** The current heights of rows `start..end`, summed from `start`. */
+  sum(start: number, end: number): number;
+  grow(rowIndex: number, deficitPt: number): void;
+  /** The last row at or above `rowIndex` that is not `exact`, or -1. */
+  lastNonExact(rowIndex: number): number;
+  raiseContentHeight(rowIndex: number, requiredPt: number): void;
+}
+
+/**
+ * Resolve row `rows[index]` as the next row of `store`, whose following row
+ * is `rows[index + 1]` (none: the row is the table's last). `open` holds the
+ * merges continuing into it from above, in owner order; the result holds the
+ * merges continuing out of it. A merge's constraint is applied when its last
+ * row is resolved, so constraints are applied ordered by end row, then start
+ * row, then owner order — the order the interval policy below defines — and
+ * each reads only rows already resolved. Every row's floor and unmerged cells
+ * are therefore fixed before any constraint reaches it, and a resolved row
+ * changes later only by a deficit of a merge ending below it.
+ *
+ * Cells take their grid role (gridMergeRole, `segmentOpeningLogicalRowIndex`
+ * naming the input's opening row, `rows[index - 1]` the row above it). A projected empty
+ * owner is therefore one more interval constraint: ECMA-376 §17.4.68 tcMar
+ * makes its own margins part of its cell, and §17.4.80 lets an auto row grow
+ * to what its cells require. Its flow stays empty (`flowOf` keeps the
+ * authored continuation's content suppressed), so it requires its margins and
+ * row spacing only, with no assumed paragraph-mark height (library
+ * projected-segment contract, not a Word measurement).
+ */
+function resolveRowTrack(
+  store: RowTrackStore,
+  rows: readonly TableRowLayoutInput[],
+  index: number,
+  open: readonly OpenMergeTrack[],
+  flowOf: (cell: TableCellLayoutInput) => CellFlowGeometry,
+  segmentOpeningLogicalRowIndex: TableLayoutInput['segmentOpeningLogicalRowIndex'],
+): readonly OpenMergeTrack[] {
+  const row = rows[index]!;
+  const next = rows[index + 1];
+  const rowIndex = store.length;
+  const spacing = rowSpacingInsets(rows, index);
+  const roles = row.cells.map((cell) => projectedMergeRole(
+    segmentOpeningLogicalRowIndex, rows[index - 1], row, cell,
+  ));
+  let heightPt = semanticRowFloor(row);
+  let contentHeightPt = 0;
+  for (const [cellIndex, cell] of row.cells.entries()) {
+    if (roles[cellIndex] !== 'none') continue;
+    const required = cellRequiredHeight(cell, flowOf(cell), spacing);
+    contentHeightPt = Math.max(contentHeightPt, required);
+    if (row.heightRule !== 'exact') heightPt = Math.max(heightPt, required);
+  }
+  store.push(heightPt, contentHeightPt, row.heightRule === 'exact');
   // A merged owner is one interval constraint over row tracks. ECMA-376 defines
   // the merged region but not deficit distribution. The terminal-growable greedy
   // policy makes the minimum total change, preserves earlier boundaries, reuses
   // prior interval growth, and never violates an exact track.
-  const constraints: Array<{
-    start: number;
-    end: number;
-    requiredPt: number;
-  }> = [];
-  rows.forEach((row, rowIndex) => {
-    for (const cell of row.cells) {
-      if (cell.verticalMerge !== 'restart') continue;
-      constraints.push({
-        start: rowIndex,
-        end: mergeEndRow(rows, rowIndex, cell.columnStart, cell.columnSpan),
-        requiredPt: cellRequiredHeight(
-          cell,
-          flows.get(cell.id) ?? resolveCellFlow([]),
-          {
-            topPt: rowSpacingInsets(rows, rowIndex).topPt,
-            bottomPt: rowSpacingInsets(
-              rows,
-              mergeEndRow(rows, rowIndex, cell.columnStart, cell.columnSpan),
-            ).bottomPt,
-          },
-        ),
-      });
+  const owners: OpenMergeTrack[] = [...open];
+  for (const [cellIndex, cell] of row.cells.entries()) {
+    if (roles[cellIndex] === 'restart') owners.push({ cell, start: rowIndex, topInsetPt: spacing.topPt });
+  }
+  const stillOpen: OpenMergeTrack[] = [];
+  for (const merge of owners) {
+    if (next?.cells.some((cell) => continuesMerge(cell, merge.cell))) {
+      stillOpen.push(merge);
+      continue;
     }
-  });
-  constraints.sort((left, right) => left.end - right.end || left.start - right.start);
-  for (const constraint of constraints) {
-    let currentPt = 0;
-    for (let rowIndex = constraint.start; rowIndex <= constraint.end; rowIndex += 1) {
-      currentPt += heights[rowIndex] ?? 0;
-    }
-    const deficitPt = constraint.requiredPt - currentPt;
+    const requiredPt = cellRequiredHeight(
+      merge.cell,
+      flowOf(merge.cell),
+      { topPt: merge.topInsetPt, bottomPt: spacing.bottomPt },
+    );
+    store.raiseContentHeight(merge.start, requiredPt);
+    const deficitPt = requiredPt - store.sum(merge.start, rowIndex);
     if (deficitPt <= 0) continue;
-    for (let rowIndex = constraint.end; rowIndex >= constraint.start; rowIndex -= 1) {
-      if (rows[rowIndex]?.heightRule === 'exact') continue;
-      heights[rowIndex] = (heights[rowIndex] ?? 0) + deficitPt;
-      break;
-    }
+    const target = store.lastNonExact(rowIndex);
+    if (target >= merge.start) store.grow(target, deficitPt);
+  }
+  return stillOpen;
+}
+
+function resolveRowHeights(
+  input: TableLayoutInput,
+  flows: ReadonlyMap<string, CellFlowGeometry>,
+  boundaryFootprintsPt: readonly number[],
+): Readonly<{ heights: readonly number[]; contentHeights: readonly number[] }> {
+  const rows = input.rows;
+  const heights: number[] = [];
+  const contentHeights: number[] = [];
+  const lastNonExact: number[] = [];
+  const store: RowTrackStore = {
+    get length() { return heights.length; },
+    push(heightPt, contentHeightPt, exact) {
+      lastNonExact.push(exact ? (lastNonExact.at(-1) ?? -1) : heights.length);
+      heights.push(heightPt);
+      contentHeights.push(contentHeightPt);
+    },
+    sum(start, end) {
+      let currentPt = 0;
+      for (let rowIndex = start; rowIndex <= end; rowIndex += 1) currentPt += heights[rowIndex] ?? 0;
+      return currentPt;
+    },
+    grow(rowIndex, deficitPt) { heights[rowIndex] = (heights[rowIndex] ?? 0) + deficitPt; },
+    lastNonExact: (rowIndex) => lastNonExact[rowIndex] ?? -1,
+    raiseContentHeight(rowIndex, requiredPt) {
+      contentHeights[rowIndex] = Math.max(contentHeights[rowIndex] ?? 0, requiredPt);
+    },
+  };
+  const flowOf = (cell: TableCellLayoutInput) => flows.get(cell.id) ?? resolveCellFlow([]);
+  let open: readonly OpenMergeTrack[] = [];
+  for (let rowIndex = 0; rowIndex < rows.length; rowIndex += 1) {
+    open = resolveRowTrack(store, rows, rowIndex, open, flowOf, input.segmentOpeningLogicalRowIndex);
   }
   rows.forEach((row, rowIndex) => {
     if (row.heightRule === 'exact') return;
@@ -458,8 +560,9 @@ function ownerGrid(
   const occupancy = input.rows.map(() => new Array<number>(columnCount).fill(-1));
   input.rows.forEach((row, rowIndex) => {
     for (const cell of row.cells) {
-      if (cell.verticalMerge === 'continue') continue;
-      const lastRowIndex = cell.verticalMerge === 'restart'
+      const role = gridMergeRole(input, row, rowIndex, cell);
+      if (role === 'continue') continue;
+      const lastRowIndex = role === 'restart'
         ? mergeEndRow(input.rows, rowIndex, cell.columnStart, cell.columnSpan)
         : rowIndex;
       const ownerIndex = owners.length;
@@ -932,8 +1035,9 @@ function materializeBorders(
     }
 
     for (const cell of row.cells) {
-      if (cell.verticalMerge === 'continue') continue;
-      const lastRowIndex = cell.verticalMerge === 'restart'
+      const role = gridMergeRole(input, row, rowIndex, cell);
+      if (role === 'continue') continue;
+      const lastRowIndex = role === 'restart'
         ? mergeEndRow(input.rows, rowIndex, cell.columnStart, cell.columnSpan)
         : rowIndex;
       const startXPt = columnX(rowIndex, cell.columnStart);
@@ -976,8 +1080,10 @@ function materializeBorders(
   // resolution, so they are materialized from the owning cell alone.
   input.rows.forEach((row, rowIndex) => {
     for (const cell of row.cells) {
-      if (!cell.diagonalBorders || cell.verticalMerge === 'continue') continue;
-      const lastRowIndex = cell.verticalMerge === 'restart'
+      if (!cell.diagonalBorders) continue;
+      const role = gridMergeRole(input, row, rowIndex, cell);
+      if (role === 'continue') continue;
+      const lastRowIndex = role === 'restart'
         ? mergeEndRow(input.rows, rowIndex, cell.columnStart, cell.columnSpan)
         : rowIndex;
       const startXPt = columnX(rowIndex, cell.columnStart);
@@ -1160,8 +1266,7 @@ function rotatedCellLayout(
   cellFlowBounds: LayoutRect,
   physicalContentHeightPt: number,
   input: TableLayoutInput,
-  rowIndex: number,
-  lastRowIndex: number,
+  exactOwnedSpan: boolean,
   placement: FlowBlockPlacement,
 ): TableCellLayout {
   const verticalText = cell.verticalText!;
@@ -1180,9 +1285,6 @@ function rotatedCellLayout(
         ? localBlockExtentPt - flow.inkHeightPt - flow.inkTopPt
         : -Math.min(0, flow.inkTopPt);
   const transform = verticalCellTransform(verticalText.mode, physicalContent);
-  const exactOwnedSpan = input.rows
-    .slice(rowIndex, lastRowIndex + 1)
-    .every((ownedRow) => ownedRow.heightRule === 'exact');
   // Rotated lines can exceed the physical cell on either axis; clip them to
   // the cell like an exact row so they never paint over neighbours.
   const clipBounds = exactOwnedSpan
@@ -1227,7 +1329,7 @@ export function layoutTable(
   }));
   const boundaries = resolvedBoundaries(input);
   const resolvedRows = resolveRowHeights(
-    input.rows,
+    input,
     flows,
     rowBoundaryFootprintsPt(input, boundaries),
   );
@@ -1255,139 +1357,22 @@ export function layoutTable(
   const borders = materializeBorders(input, rowXPt, yPt, rowHeightsPt, boundaries);
   const retainedCompoundFrames = compoundBorderFrames(borders);
 
-  const columnOffsets = [0];
-  for (const width of input.columnWidthsPt) columnOffsets.push((columnOffsets.at(-1) ?? 0) + width);
   const rowOffsets = [0];
   for (const height of rowHeightsPt) rowOffsets.push((rowOffsets.at(-1) ?? 0) + height);
-  const columnX = (rowIndex: number, column: number) => (rowXPt[rowIndex] ?? xPt) + (input.bidiVisual
-    ? widthPt - (columnOffsets[column] ?? 0)
-    : (columnOffsets[column] ?? 0));
-
-  const rows: TableRowLayout[] = input.rows.map((row, rowIndex) => {
-    const rowTopPt = yPt + (rowOffsets[rowIndex] ?? 0);
-    const rowHeightPt = rowHeightsPt[rowIndex] ?? 0;
-    const rowOriginXPt = rowXPt[rowIndex] ?? xPt;
-    const rowSpacing = rowSpacingInsets(input.rows, rowIndex);
-    const horizontalSpacingPt = effectiveCellSpacingPt(row);
-    const cells: TableCellLayout[] = row.cells.map((cell) => {
-      const lastRowIndex = cell.verticalMerge === 'restart'
-        ? mergeEndRow(input.rows, rowIndex, cell.columnStart, cell.columnSpan)
-        : rowIndex;
-      const lastRowSpacing = rowSpacingInsets(input.rows, lastRowIndex);
-      const cellBottomPt = yPt
-        + (rowOffsets[lastRowIndex + 1] ?? rowOffsets[rowIndex + 1] ?? 0)
-        - lastRowSpacing.bottomPt;
-      const logicalStartX = columnX(rowIndex, cell.columnStart);
-      const logicalEndX = columnX(
-        rowIndex,
-        Math.min(input.columnWidthsPt.length, cell.columnStart + cell.columnSpan),
-      );
-      const gridLeftPt = Math.min(logicalStartX, logicalEndX);
-      const gridRightPt = Math.max(logicalStartX, logicalEndX);
-      const { startPt: startInsetPt, endPt: endInsetPt } = tableCellHorizontalSpacingInsets(
-        horizontalSpacingPt,
-        cell.columnStart,
-        cell.columnSpan,
-        input.columnWidthsPt.length,
-      );
-      const cellXPt = gridLeftPt + (input.bidiVisual ? endInsetPt : startInsetPt);
-      const cellRightPt = gridRightPt - (input.bidiVisual ? startInsetPt : endInsetPt);
-      const cellWidthPt = Math.max(0, cellRightPt - cellXPt);
-      const cellTopPt = rowTopPt + rowSpacing.topPt;
-      const cellHeightPt = cell.verticalMerge === 'restart'
-        ? Math.max(0, cellBottomPt - cellTopPt)
-        : Math.max(0, rowHeightPt - rowSpacing.topPt - rowSpacing.bottomPt);
-      const flow = flows.get(cell.id) ?? resolveCellFlow([]);
-      const physicalContentHeightPt = Math.max(
-        0,
-        cellHeightPt - cell.margins.topPt - cell.margins.bottomPt,
-      );
-      if (cell.verticalText && cell.verticalMerge !== 'continue') {
-        return rotatedCellLayout(
-          cell,
-          flow,
-          { xPt: cellXPt, yPt: cellTopPt, widthPt: cellWidthPt, heightPt: cellHeightPt },
-          physicalContentHeightPt,
-          input,
-          rowIndex,
-          lastRowIndex,
-          placement,
-        );
-      }
-      const availableContentHeightPt = physicalContentHeightPt;
-      const topInkOffsetPt = cell.margins.topPt - Math.min(0, flow.inkTopPt);
-      const inkOffsetPt = flow.inkHeightPt >= availableContentHeightPt
-        ? topInkOffsetPt
-        : cell.vAlign === 'center'
-          ? cell.margins.topPt + (availableContentHeightPt - flow.inkHeightPt) / 2 - flow.inkTopPt
-          : cell.vAlign === 'bottom'
-            ? cellHeightPt - cell.margins.bottomPt - flow.inkHeightPt - flow.inkTopPt
-            : topInkOffsetPt;
-      const contentBounds = {
-        xPt: cellXPt + cell.margins.leftPt,
-        yPt: cellTopPt + inkOffsetPt,
-        // Use the same grouped horizontal margins as acquisition so retained
-        // geometry and line layout agree at an intrinsic equality.
-        widthPt: Math.max(0, cellWidthPt - (cell.margins.leftPt + cell.margins.rightPt)),
-        heightPt: availableContentHeightPt,
-      };
-      const cellFlowBounds = { xPt: cellXPt, yPt: cellTopPt, widthPt: cellWidthPt, heightPt: cellHeightPt };
-      const exactOwnedSpan = cell.verticalMerge !== 'continue'
-        && input.rows
-          .slice(rowIndex, lastRowIndex + 1)
-          .every((ownedRow) => ownedRow.heightRule === 'exact');
-      const clipBounds = exactOwnedSpan
-        ? wordExactRowVerticalClipBounds(
-            cellFlowBounds,
-            placement.availableBounds,
-          )
-        : undefined;
-      const blocks = cell.verticalMerge === 'continue'
-        ? []
-        : flow.blocks.map((block) => ({
-            ...block,
-            offsetPt: inkOffsetPt + block.offsetPt,
-          }));
-      const childInk = blocks
-        .map((block) => placedChildInkBounds(block, contentBounds.xPt, cellFlowBounds.yPt))
-        .map((bounds) => clipBounds ? intersectRects(bounds, clipBounds) : bounds)
-        .filter((bounds): bounds is LayoutRect => bounds !== null);
-      const cellInkBounds = unionLayoutRects([cellFlowBounds, ...childInk]) ?? cellFlowBounds;
-      return {
-        kind: 'table-cell',
-        id: cell.id,
-        source: cell.source,
-        flowDomainId: input.flowDomainId,
-        ordinaryFlow: input.ordinaryFlow,
-        flowBounds: cellFlowBounds,
-        inkBounds: cellInkBounds,
-        ...(clipBounds ? { clipBounds } : {}),
-        contentBounds,
-        advancePt: cellHeightPt,
-        verticalMerge: cell.verticalMerge,
-        vAlign: cell.vAlign,
-        ...(cell.background ? { background: cell.background } : {}),
-        blocks,
-      };
-    });
-    const rowBounds = { xPt: rowOriginXPt, yPt: rowTopPt, widthPt, heightPt: rowHeightPt };
-    const rowInkBounds = unionLayoutRects([rowBounds, ...cells.map((cell) => cell.inkBounds)])
-      ?? rowBounds;
-    return {
-      kind: 'table-row',
-      id: row.id,
-      source: row.source,
-      flowDomainId: input.flowDomainId,
-      ordinaryFlow: input.ordinaryFlow,
-      flowBounds: rowBounds,
-      inkBounds: rowInkBounds,
-      advancePt: rowHeightPt,
-      heightPt: rowHeightPt,
-      contentHeightPt: resolvedRows.contentHeights[rowIndex] ?? 0,
-      ...(row.repeatedHeader ? { repeatedHeader: true } : {}),
-      cells,
-    };
-  });
+  const frame: TableRowFrame = {
+    yPt,
+    rowOffsetsPt: rowOffsets,
+    rowHeightsPt,
+    contentHeightsPt: resolvedRows.contentHeights,
+    rowXPt,
+    xPt,
+    widthPt,
+    columnOffsetsPt: columnOffsetsOf(input),
+    flows,
+  };
+  const rows: TableRowLayout[] = input.rows.map((_row, rowIndex) => (
+    materializeTableRow(input, rowIndex, frame, placement)
+  ));
   const flowLeftPt = rowXPt.length > 0 ? Math.min(...rowXPt) : xPt;
   const flowRightPt = rowXPt.length > 0
     ? Math.max(...rowXPt.map((rowX) => rowX + widthPt))
@@ -1420,4 +1405,588 @@ export function layoutTable(
     layout,
     nextCursor: { xPt: placement.cursor.xPt, yPt: placement.cursor.yPt + heightPt },
   }, 'TableLayoutResult') as BlockLayoutResult<TableLayout>;
+}
+
+/** The row geometry layoutTable resolves for `input.rows` before it
+ * materializes any row: the table top, each row's offset below it (offset
+ * `r + 1` is offset `r` plus row r's height), heights, content heights and
+ * origin x, the grid width and the cells' block flows by cell id. */
+interface TableRowFrame {
+  readonly yPt: number;
+  readonly rowOffsetsPt: readonly number[];
+  readonly rowHeightsPt: readonly number[];
+  readonly contentHeightsPt: readonly number[];
+  readonly rowXPt: readonly number[];
+  readonly xPt: number;
+  readonly widthPt: number;
+  readonly columnOffsetsPt: readonly number[];
+  readonly flows: ReadonlyMap<string, CellFlowGeometry>;
+}
+
+function columnOffsetsOf(input: TableLayoutInput): readonly number[] {
+  const columnOffsets = [0];
+  for (const width of input.columnWidthsPt) columnOffsets.push((columnOffsets.at(-1) ?? 0) + width);
+  return columnOffsets;
+}
+
+/** Row `rowIndex` of `input` laid out in `frame`. It reads the frame at its
+ * own index and, for a merge it owns, at the merge's last row. `row` is the
+ * row materialized there: input row `rowIndex` itself, or a row of the same
+ * structure (cells, merges, spacing; {@link laidOutTableTracks}). The other
+ * rows of `input` are read only for that structure. */
+function materializeTableRow(
+  input: TableLayoutInput,
+  rowIndex: number,
+  frame: TableRowFrame,
+  placement: FlowBlockPlacement,
+  row: TableRowLayoutInput = input.rows[rowIndex]!,
+): TableRowLayout {
+  const {
+    yPt, rowOffsetsPt: rowOffsets, rowHeightsPt, rowXPt, xPt, widthPt, columnOffsetsPt: columnOffsets, flows,
+  } = frame;
+  const columnX = (column: number) => (rowXPt[rowIndex] ?? xPt) + (input.bidiVisual
+    ? widthPt - (columnOffsets[column] ?? 0)
+    : (columnOffsets[column] ?? 0));
+  const rowTopPt = yPt + (rowOffsets[rowIndex] ?? 0);
+  const rowHeightPt = rowHeightsPt[rowIndex] ?? 0;
+  const rowOriginXPt = rowXPt[rowIndex] ?? xPt;
+  const rowSpacing = rowSpacingInsets(input.rows, rowIndex);
+  const horizontalSpacingPt = effectiveCellSpacingPt(row);
+  const cells: TableCellLayout[] = row.cells.map((cell) => {
+    const opensRegion = gridMergeRole(input, row, rowIndex, cell) === 'restart';
+    const lastRowIndex = opensRegion
+      ? mergeEndRow(input.rows, rowIndex, cell.columnStart, cell.columnSpan)
+      : rowIndex;
+    const lastRowSpacing = rowSpacingInsets(input.rows, lastRowIndex);
+    const cellBottomPt = yPt
+      + (rowOffsets[lastRowIndex + 1] ?? rowOffsets[rowIndex + 1] ?? 0)
+      - lastRowSpacing.bottomPt;
+    const logicalStartX = columnX(cell.columnStart);
+    const logicalEndX = columnX(
+      Math.min(input.columnWidthsPt.length, cell.columnStart + cell.columnSpan),
+    );
+    const gridLeftPt = Math.min(logicalStartX, logicalEndX);
+    const gridRightPt = Math.max(logicalStartX, logicalEndX);
+    const { startPt: startInsetPt, endPt: endInsetPt } = tableCellHorizontalSpacingInsets(
+      horizontalSpacingPt,
+      cell.columnStart,
+      cell.columnSpan,
+      input.columnWidthsPt.length,
+    );
+    const cellXPt = gridLeftPt + (input.bidiVisual ? endInsetPt : startInsetPt);
+    const cellRightPt = gridRightPt - (input.bidiVisual ? startInsetPt : endInsetPt);
+    const cellWidthPt = Math.max(0, cellRightPt - cellXPt);
+    const cellTopPt = rowTopPt + rowSpacing.topPt;
+    const cellHeightPt = opensRegion
+      ? Math.max(0, cellBottomPt - cellTopPt)
+      : Math.max(0, rowHeightPt - rowSpacing.topPt - rowSpacing.bottomPt);
+    const flow = flows.get(cell.id) ?? resolveCellFlow([]);
+    const physicalContentHeightPt = Math.max(
+      0,
+      cellHeightPt - cell.margins.topPt - cell.margins.bottomPt,
+    );
+    const exactOwnedSpan = row.heightRule === 'exact' && input.rows
+      .slice(rowIndex + 1, lastRowIndex + 1)
+      .every((ownedRow) => ownedRow.heightRule === 'exact');
+    if (cell.verticalText && cell.verticalMerge !== 'continue') {
+      return rotatedCellLayout(
+        cell,
+        flow,
+        { xPt: cellXPt, yPt: cellTopPt, widthPt: cellWidthPt, heightPt: cellHeightPt },
+        physicalContentHeightPt,
+        input,
+        exactOwnedSpan,
+        placement,
+      );
+    }
+    const availableContentHeightPt = physicalContentHeightPt;
+    const topInkOffsetPt = cell.margins.topPt - Math.min(0, flow.inkTopPt);
+    const inkOffsetPt = flow.inkHeightPt >= availableContentHeightPt
+      ? topInkOffsetPt
+      : cell.vAlign === 'center'
+        ? cell.margins.topPt + (availableContentHeightPt - flow.inkHeightPt) / 2 - flow.inkTopPt
+        : cell.vAlign === 'bottom'
+          ? cellHeightPt - cell.margins.bottomPt - flow.inkHeightPt - flow.inkTopPt
+          : topInkOffsetPt;
+    const contentBounds = {
+      xPt: cellXPt + cell.margins.leftPt,
+      yPt: cellTopPt + inkOffsetPt,
+      // Use the same grouped horizontal margins as acquisition so retained
+      // geometry and line layout agree at an intrinsic equality.
+      widthPt: Math.max(0, cellWidthPt - (cell.margins.leftPt + cell.margins.rightPt)),
+      heightPt: availableContentHeightPt,
+    };
+    const cellFlowBounds = { xPt: cellXPt, yPt: cellTopPt, widthPt: cellWidthPt, heightPt: cellHeightPt };
+    const clipBounds = cell.verticalMerge !== 'continue' && exactOwnedSpan
+      ? wordExactRowVerticalClipBounds(
+          cellFlowBounds,
+          placement.availableBounds,
+        )
+      : undefined;
+    const blocks = cell.verticalMerge === 'continue'
+      ? []
+      : flow.blocks.map((block) => ({
+          ...block,
+          offsetPt: inkOffsetPt + block.offsetPt,
+        }));
+    const childInk = blocks
+      .map((block) => placedChildInkBounds(block, contentBounds.xPt, cellFlowBounds.yPt))
+      .map((bounds) => clipBounds ? intersectRects(bounds, clipBounds) : bounds)
+      .filter((bounds): bounds is LayoutRect => bounds !== null);
+    const cellInkBounds = unionLayoutRects([cellFlowBounds, ...childInk]) ?? cellFlowBounds;
+    return {
+      kind: 'table-cell',
+      id: cell.id,
+      source: cell.source,
+      flowDomainId: input.flowDomainId,
+      ordinaryFlow: input.ordinaryFlow,
+      flowBounds: cellFlowBounds,
+      inkBounds: cellInkBounds,
+      ...(clipBounds ? { clipBounds } : {}),
+      contentBounds,
+      advancePt: cellHeightPt,
+      verticalMerge: cell.verticalMerge,
+      vAlign: cell.vAlign,
+      ...(cell.background ? { background: cell.background } : {}),
+      // A projected empty owner (gridMergeRole) paints its own region: the
+      // authored §17.4.32 shading fills the cell whether or not it holds
+      // text. Its authored w:vMerge and suppressed (empty) blocks are kept.
+      ...(cell.verticalMerge === 'continue' && opensRegion
+        ? { visualMergeOwnership: 'continuation' as const }
+        : {}),
+      blocks,
+    };
+  });
+  const rowBounds = { xPt: rowOriginXPt, yPt: rowTopPt, widthPt, heightPt: rowHeightPt };
+  const rowInkBounds = unionLayoutRects([rowBounds, ...cells.map((cell) => cell.inkBounds)])
+    ?? rowBounds;
+  return {
+    kind: 'table-row',
+    id: row.id,
+    source: row.source,
+    flowDomainId: input.flowDomainId,
+    ordinaryFlow: input.ordinaryFlow,
+    flowBounds: rowBounds,
+    inkBounds: rowInkBounds,
+    advancePt: rowHeightPt,
+    heightPt: rowHeightPt,
+    contentHeightPt: frame.contentHeightsPt[rowIndex] ?? 0,
+    ...(row.repeatedHeader ? { repeatedHeader: true } : {}),
+    cells,
+  };
+}
+
+/**
+ * The final tracks of a laid-out table, given again to rows prepared for it.
+ *
+ * `row(rowIndex, candidate)` is `candidate` materialized as row `rowIndex` of
+ * `laidOut`, the layout `layoutTable(input, placement)` returned: the row's
+ * top, its height, its content height, its origin x, and, for a merge the
+ * candidate owns, the merge's last row, are all `laidOut`'s; only the cells'
+ * block flows are the candidate's. A candidate is a row whose content was
+ * prepared against that layout (a cell paragraph wrapped around a positioned
+ * child, a nested table placed through its page origin), with the row's
+ * structure (cells, grid columns, merges, height rule, spacing). Laying it
+ * out after the rows above it alone, or by itself, gives a merge continuing
+ * below it the wrong end row, so its deficit, and with it every centered or
+ * bottom vAlign offset, would not be the ones `laidOut` paints. Whether the
+ * candidate's own content keeps those tracks is the caller's fixed point
+ * (table-pagination.ts): the tracks are read from one layout and the rows
+ * prepared in them are laid out again.
+ *
+ * The offsets are summed from `laidOut`'s row heights in row order, as
+ * layoutTable offsets them, so they are its own values. Cost: the frame is
+ * built once, proportional to the rows; each `row` call is proportional to
+ * the candidate's cells and, for a merge it owns, that merge's span (as in
+ * layoutTable).
+ */
+export function laidOutTableTracks(
+  input: TableLayoutInput,
+  laidOut: TableLayout,
+  placement: FlowBlockPlacement,
+): Readonly<{ row(rowIndex: number, candidate: TableRowLayoutInput): TableRowLayout }> {
+  if (laidOut.rows.length !== input.rows.length) {
+    throw new TypeError('laidOutTableTracks: the layout is not the input’s');
+  }
+  const rowHeightsPt = laidOut.rows.map((row) => row.heightPt);
+  const rowOffsetsPt = [0];
+  for (const height of rowHeightsPt) rowOffsetsPt.push((rowOffsetsPt.at(-1) ?? 0) + height);
+  const rowXPt = laidOut.rows.map((row) => row.flowBounds.xPt);
+  const frame: Omit<TableRowFrame, 'flows'> = {
+    yPt: laidOut.flowBounds.yPt,
+    rowOffsetsPt,
+    rowHeightsPt,
+    contentHeightsPt: laidOut.rows.map((row) => row.contentHeightPt),
+    rowXPt,
+    xPt: rowXPt[0] ?? laidOut.flowBounds.xPt,
+    widthPt: input.columnWidthsPt.reduce((sum, width) => sum + width, 0),
+    columnOffsetsPt: columnOffsetsOf(input),
+  };
+  return Object.freeze({
+    row(rowIndex: number, candidate: TableRowLayoutInput): TableRowLayout {
+      const structural = input.rows[rowIndex];
+      if (!structural || structural.cells.length !== candidate.cells.length) {
+        throw new TypeError(`laidOutTableTracks: row ${rowIndex} is not the candidate’s`);
+      }
+      const flows = new Map(candidate.cells.map((cell) => [
+        cell.id,
+        resolveCellFlow(cell.verticalMerge === 'continue' ? [] : cell.blocks),
+      ] as const));
+      return materializeTableRow(input, rowIndex, { ...frame, flows }, placement, candidate);
+    },
+  });
+}
+
+/**
+ * Exact row tracks of every prefix of a growing row list, at bounded cost.
+ *
+ * `row(rows, candidate, placement)` is the last row of
+ * `layoutTable({ ...input, rows: [...rows, candidate] }, placement)`, for a
+ * `rows` list that only grows by appending (a fragment's selected rows).
+ * Pagination places the content of every row through such a probe
+ * (table-pagination.ts), so laying the prefix out again for each row would
+ * cost the square of the rows.
+ *
+ * Invariant: in any prefix, a row's track is settled once the row after it is
+ * known, except for the deficit of a merge that continues below it:
+ * - its floor, unmerged cells and spacing insets read only it and its two
+ *   neighbours;
+ * - a merge reads and grows only rows inside its own interval, and the
+ *   merges are applied by end row (resolveRowTrack, shared with layoutTable);
+ * - its collapsed-rule footprint reads only its two horizontal boundaries,
+ *   and a boundary reads only the owners on its two sides: one ending above
+ *   it (its terminal cell, and whether that is the table's last row) and one
+ *   starting below it.
+ * So the rows of `rows` before its last one are resolved once each, in order,
+ * as the list grows (committed). A probe resolves only the last row (whose
+ * next row is the candidate) and the candidate (the prefix's last row) on top
+ * of them, without changing the committed state. Every merge continuing into
+ * the candidate ends there in the prefix: its deficit lands on the candidate,
+ * or, for an `exact` candidate, on the last non-exact row inside the merge,
+ * which may be committed (see Arithmetic). A boundary is resolved by
+ * layoutTable's own boundary resolution over the rows on its two sides, with
+ * each continuation cell of the upper row that an owner covers made the owner
+ * (a restart of that same cell), so the owner's terminal cell, edges and row
+ * exceptions are the prefix's.
+ *
+ * Arithmetic: committed row tops are running sums from the table top, as
+ * layoutTable offsets its rows, and a committed merge sums its interval from
+ * its start, as layoutTable does, so committed rows carry layoutTable's own
+ * values. A probe never re-sums committed rows. It reads a committed
+ * interval (a merge still open at the candidate) and the candidate's top as
+ * differences of the committed running sums, plus the growth its own
+ * deficits gave committed rows (at most one per merge it closes, kept apart
+ * from the committed heights) and its two own rows. A merge starting at row 0
+ * that no probe deficit reaches, and a top no probe deficit lies above, are
+ * then layoutTable's values; anything else equals layoutTable's up to the
+ * association of the floating-point sum.
+ *
+ * Cost and retention: each committed row is resolved once (its cells, the
+ * merges open across it and a boundary resolution over at most three rows),
+ * and each committed merge sums its span once, as layoutTable does for the
+ * whole table. A committed deficit landing at row t of its merge invalidates
+ * the running sums from t, so they are recomputed at most over that merge's
+ * span again; the recomputation is therefore bounded by the spans the
+ * merges already sum. A probe resolves two rows and reads each interval and
+ * its top in time proportional to the merges closing at the candidate, not to
+ * the rows, whether its deficits land on the candidate, on its neighbour or
+ * far above (an `exact` candidate below an `auto` merge start). One height,
+ * footprint and two running sums per committed row, and the merges open into
+ * the next row, are retained with the tracks, and released with them (one row
+ * list's probes). A grid in which two owners claim one column of a row (a
+ * malformed merge) breaks the boundary locality: a committed row's
+ * collapsed-rule footprint can then depend on the terminal cell of an owner
+ * that continues below the rows it reads. `row` returns null for such a list,
+ * and the caller lays out the whole prefix instead (table-pagination.ts
+ * wholePrefixProbe, charged to the session's acquisition budget).
+ */
+export interface TablePrefixTracks {
+  row(
+    rows: readonly TableRowLayoutInput[],
+    candidate: TableRowLayoutInput,
+    placement: FlowBlockPlacement,
+  ): TableRowLayout | null;
+}
+
+interface CommittedRowTracks {
+  /** The committed rows and the row after the last of them. */
+  readonly rows: TableRowLayoutInput[];
+  readonly heights: number[];
+  readonly footprints: number[];
+  readonly lastNonExact: number[];
+  /** Σ heights[0..i−1], valid for i ≤ heightSumsValid. */
+  readonly heightSums: number[];
+  heightSumsValid: number;
+  /** Σ (heights + footprints)[0..i−1], valid for i ≤ offsetsValid. */
+  readonly offsets: number[];
+  offsetsValid: number;
+  open: readonly OpenMergeTrack[];
+  /** Continuation cells of the last committed row that an owner covers. */
+  covered: ReadonlySet<TableCellLayoutInput>;
+  regular: boolean;
+}
+
+/** The continuation cells of `row` the merges open into it cover, and
+ * whether no column of the row is claimed by two owners. `above` is the row
+ * above it, so a projected empty owner claims its columns (gridMergeRole). */
+function rowCoverage(
+  row: TableRowLayoutInput,
+  above: TableRowLayoutInput | undefined,
+  open: readonly OpenMergeTrack[],
+  columnCount: number,
+  segmentOpeningLogicalRowIndex: TableLayoutInput['segmentOpeningLogicalRowIndex'],
+): Readonly<{ covered: ReadonlySet<TableCellLayoutInput>; regular: boolean }> {
+  const claimed = new Set<number>();
+  let regular = true;
+  const claim = (cell: TableCellLayoutInput) => {
+    const end = Math.min(columnCount, cell.columnStart + cell.columnSpan);
+    for (let column = Math.max(0, cell.columnStart); column < end; column += 1) {
+      if (claimed.has(column)) regular = false;
+      claimed.add(column);
+    }
+  };
+  const covered = new Set<TableCellLayoutInput>();
+  for (const merge of open) {
+    claim(merge.cell);
+    const continuation = row.cells.find((cell) => continuesMerge(cell, merge.cell));
+    if (continuation) covered.add(continuation);
+  }
+  for (const cell of row.cells) {
+    if (projectedMergeRole(segmentOpeningLogicalRowIndex, above, row, cell) !== 'continue') claim(cell);
+  }
+  return { covered, regular };
+}
+
+export function tablePrefixTracks(input: TableLayoutInput): TablePrefixTracks {
+  const columnCount = input.columnWidthsPt.length;
+  const flows = new WeakMap<TableCellLayoutInput, CellFlowGeometry>();
+  const flowOf = (cell: TableCellLayoutInput): CellFlowGeometry => {
+    let flow = flows.get(cell);
+    if (!flow) {
+      flow = resolveCellFlow(cell.verticalMerge === 'continue' ? [] : cell.blocks);
+      flows.set(cell, flow);
+    }
+    return flow;
+  };
+  const emptyTracks = (): CommittedRowTracks => ({
+    rows: [],
+    heights: [],
+    footprints: [],
+    lastNonExact: [],
+    heightSums: [0],
+    heightSumsValid: 0,
+    offsets: [0],
+    offsetsValid: 0,
+    open: [],
+    covered: new Set<TableCellLayoutInput>(),
+    regular: true,
+  });
+  let tracks = emptyTracks();
+  const ensureHeightSums = (upTo: number) => {
+    for (let index = tracks.heightSumsValid; index < upTo; index += 1) {
+      tracks.heightSums[index + 1] = tracks.heightSums[index]! + tracks.heights[index]!;
+    }
+    tracks.heightSumsValid = Math.max(tracks.heightSumsValid, upTo);
+  };
+  const ensureOffsets = (upTo: number) => {
+    for (let index = tracks.offsetsValid; index < upTo; index += 1) {
+      tracks.offsets[index + 1] = tracks.offsets[index]! + (tracks.heights[index]! + tracks.footprints[index]!);
+    }
+    tracks.offsetsValid = Math.max(tracks.offsetsValid, upTo);
+  };
+  const committedStore: RowTrackStore = {
+    get length() { return tracks.heights.length; },
+    push(heightPt, _contentHeightPt, exact) {
+      tracks.lastNonExact.push(exact ? (tracks.lastNonExact.at(-1) ?? -1) : tracks.heights.length);
+      tracks.heights.push(heightPt);
+    },
+    sum(start, end) {
+      // Each merge ends once, so summing its interval as layoutTable does
+      // (from its start) costs its span once.
+      if (start > 0) {
+        let sumPt = 0;
+        for (let rowIndex = start; rowIndex <= end; rowIndex += 1) sumPt += tracks.heights[rowIndex]!;
+        return sumPt;
+      }
+      ensureHeightSums(end + 1);
+      return tracks.heightSums[end + 1]!;
+    },
+    grow(rowIndex, deficitPt) {
+      tracks.heights[rowIndex] = tracks.heights[rowIndex]! + deficitPt;
+      tracks.heightSumsValid = Math.min(tracks.heightSumsValid, rowIndex);
+      tracks.offsetsValid = Math.min(tracks.offsetsValid, rowIndex);
+    },
+    lastNonExact: (rowIndex) => tracks.lastNonExact[rowIndex] ?? -1,
+    raiseContentHeight() {},
+  };
+  // The collapsed-rule footprint of `row`, between `above` and `next`.
+  const footprintOf = (
+    above: Readonly<{ row: TableRowLayoutInput; covered: ReadonlySet<TableCellLayoutInput> }> | null,
+    row: TableRowLayoutInput,
+    next: TableRowLayoutInput | undefined,
+  ): number => {
+    const owners = above && above.covered.size > 0
+      ? {
+          ...above.row,
+          cells: above.row.cells.map((cell) => (
+            above.covered.has(cell) ? { ...cell, verticalMerge: 'restart' as const } : cell
+          )),
+        }
+      : above?.row;
+    const rows = [...(owners ? [owners] : []), row, ...(next ? [next] : [])];
+    return tableRowBoundaryFootprintsPt({ ...input, rows })[owners ? 1 : 0] ?? 0;
+  };
+  const commitNext = (rows: readonly TableRowLayoutInput[]) => {
+    const rowIndex = tracks.heights.length;
+    const row = rows[rowIndex]!;
+    const next = rows[rowIndex + 1]!;
+    const above = rowIndex === 0 ? null : { row: rows[rowIndex - 1]!, covered: tracks.covered };
+    const coverage = rowCoverage(row, above?.row, tracks.open, columnCount, input.segmentOpeningLogicalRowIndex);
+    tracks.open = resolveRowTrack(
+      committedStore, above ? [above.row, row, next] : [row, next], above ? 1 : 0, tracks.open, flowOf,
+      input.segmentOpeningLogicalRowIndex,
+    );
+    tracks.footprints.push(footprintOf(above, row, next));
+    tracks.covered = coverage.covered;
+    tracks.regular &&= coverage.regular;
+    tracks.rows[rowIndex] = row;
+    tracks.rows[rowIndex + 1] = next;
+  };
+  // Commit every row of `rows` but its last; a list that is not the committed
+  // one grown by appending starts over.
+  const sync = (rows: readonly TableRowLayoutInput[]) => {
+    const target = Math.max(0, rows.length - 1);
+    const committed = tracks.heights.length;
+    if (committed > target || (committed > 0 && (
+      rows[committed - 1] !== tracks.rows[committed - 1] || rows[committed] !== tracks.rows[committed]
+    ))) tracks = emptyTracks();
+    while (tracks.heights.length < target) commitNext(rows);
+  };
+  const resolve = (rows: readonly TableRowLayoutInput[], candidate: TableRowLayoutInput) => {
+    sync(rows);
+    const count = rows.length;
+    const base = tracks.heights.length;
+    const heights: number[] = [];
+    const lastNonExact: number[] = [];
+    let contentHeightPt = 0;
+    // Committed rows a deficit of this probe grew, and their growth: at most
+    // one entry per merge the probe closes, never written to the committed
+    // state.
+    const landed = new Map<number, number>();
+    // A row of the probe's own (rowIndex ≥ base).
+    const heightAt = (rowIndex: number) => heights[rowIndex - base]!;
+    // The growth landed on committed rows start..end−1.
+    const landedIn = (start: number, end: number) => {
+      let growthPt = 0;
+      for (const [rowIndex, deficitPt] of landed) {
+        if (rowIndex >= start && rowIndex < end) growthPt += deficitPt;
+      }
+      return growthPt;
+    };
+    const lastNonExactAt = (rowIndex: number) => (
+      rowIndex >= base ? lastNonExact[rowIndex - base]! : tracks.lastNonExact[rowIndex] ?? -1
+    );
+    const store: RowTrackStore = {
+      get length() { return base + heights.length; },
+      push(heightPt, rowContentHeightPt, exact) {
+        const rowIndex = base + heights.length;
+        lastNonExact.push(exact ? (rowIndex === 0 ? -1 : lastNonExactAt(rowIndex - 1)) : rowIndex);
+        heights.push(heightPt);
+        if (rowIndex === count) contentHeightPt = rowContentHeightPt;
+      },
+      sum(start, end) {
+        // Committed rows as a difference of running sums plus the growth
+        // landed on them, then the probe's own rows (at most two): no
+        // committed row is summed again.
+        let sumPt = 0;
+        const committedEnd = Math.min(end + 1, base);
+        if (start < committedEnd) {
+          ensureHeightSums(committedEnd);
+          sumPt = tracks.heightSums[committedEnd]! - tracks.heightSums[start]!;
+          if (landed.size > 0) sumPt += landedIn(start, committedEnd);
+        }
+        for (let rowIndex = Math.max(start, base); rowIndex <= end; rowIndex += 1) sumPt += heightAt(rowIndex);
+        return sumPt;
+      },
+      grow(rowIndex, deficitPt) {
+        if (rowIndex >= base) heights[rowIndex - base] = heights[rowIndex - base]! + deficitPt;
+        else landed.set(rowIndex, (landed.get(rowIndex) ?? 0) + deficitPt);
+      },
+      lastNonExact: lastNonExactAt,
+      raiseContentHeight(rowIndex, requiredPt) {
+        if (rowIndex === count) contentHeightPt = Math.max(contentHeightPt, requiredPt);
+      },
+    };
+    let open = tracks.open;
+    let above = count >= 2 ? { row: rows[count - 2]!, covered: tracks.covered } : null;
+    let regular = tracks.regular;
+    let lastFootprintPt = 0;
+    if (count >= 1) {
+      const last = rows[count - 1]!;
+      const coverage = rowCoverage(last, above?.row, open, columnCount, input.segmentOpeningLogicalRowIndex);
+      regular &&= coverage.regular;
+      open = resolveRowTrack(
+        store, above ? [above.row, last, candidate] : [last, candidate], above ? 1 : 0, open, flowOf,
+        input.segmentOpeningLogicalRowIndex,
+      );
+      lastFootprintPt = footprintOf(above, last, candidate);
+      above = { row: last, covered: coverage.covered };
+    }
+    regular &&= rowCoverage(candidate, above?.row, open, columnCount, input.segmentOpeningLogicalRowIndex).regular;
+    resolveRowTrack(
+      store, above ? [above.row, candidate] : [candidate], above ? 1 : 0, open, flowOf,
+      input.segmentOpeningLogicalRowIndex,
+    );
+    if (!regular) return null;
+    const candidateFootprintPt = footprintOf(above, candidate, undefined);
+    const footprintAt = (rowIndex: number) => (
+      rowIndex >= base ? lastFootprintPt : tracks.footprints[rowIndex]!
+    );
+    // The committed top of the probe's first own row, the growth landed above
+    // it (every landed row is committed), then the probe's own rows above the
+    // candidate (at most one).
+    ensureOffsets(base);
+    let topOffsetPt = tracks.offsets[base]!;
+    if (landed.size > 0) topOffsetPt += landedIn(0, base);
+    for (let rowIndex = base; rowIndex < count; rowIndex += 1) {
+      topOffsetPt += heightAt(rowIndex) + footprintAt(rowIndex);
+    }
+    return {
+      topOffsetPt,
+      heightPt: heightAt(count) + candidateFootprintPt,
+      contentHeightPt,
+    };
+  };
+  const prefixTracks: TablePrefixTracks = {
+    row(rows, candidate, placement) {
+      const resolved = resolve(rows, candidate);
+      if (!resolved) return null;
+      // The candidate after its upper neighbour reads, as the prefix's last
+      // row, only its own track and that neighbour's spacing.
+      const local = rows.length > 0 ? [rows[rows.length - 1]!, candidate] : [candidate];
+      const localInput: TableLayoutInput = { ...input, rows: local };
+      const widthPt = input.columnWidthsPt.reduce((sum, width) => sum + width, 0);
+      const rowXPt = local.map((row) => alignedTableOriginX(
+        row.alignment ?? input.alignment,
+        Number.isFinite(row.indentPt) ? row.indentPt : input.indentPt,
+        input.bidiVisual,
+        placement,
+        widthPt,
+      ));
+      const rowOffsetsPt = local.map(() => resolved.topOffsetPt);
+      rowOffsetsPt.push(resolved.topOffsetPt + resolved.heightPt);
+      return materializeTableRow(localInput, local.length - 1, {
+        yPt: placement.cursor.yPt,
+        rowOffsetsPt,
+        rowHeightsPt: local.map(() => resolved.heightPt),
+        contentHeightsPt: local.map(() => resolved.contentHeightPt),
+        rowXPt,
+        xPt: rowXPt[0]!,
+        widthPt,
+        columnOffsetsPt: columnOffsetsOf(input),
+        flows: new Map(candidate.cells.map((cell) => [cell.id, flowOf(cell)] as const)),
+      }, placement);
+    },
+  };
+  return Object.freeze(prefixTracks);
 }

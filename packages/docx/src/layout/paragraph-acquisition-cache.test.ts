@@ -149,6 +149,32 @@ function options(
 }
 
 describe('paragraph acquisition cache', () => {
+  it('remeasures zero-threshold text when a vertical move also changes compatibility mode', () => {
+    const ctx = measureContext();
+    ctx.measureText = function (text) {
+      return {
+        width: [...text].length * 5 - (this.fontKerning === 'normal' && text.includes('AV') ? 2 : 0),
+        actualBoundingBoxAscent: 8, actualBoundingBoxDescent: 2,
+        fontBoundingBoxAscent: 8, fontBoundingBoxDescent: 2,
+      } as TextMetrics;
+    };
+    const services = createParagraphAcquisitionCacheServicesView(
+      createLayoutServices(model(), { measureContext: ctx }),
+    );
+    const paragraph = textParagraph('AV');
+    (paragraph.runs[0] as Extract<DocRun, { type: 'text' }>).kerning = 0;
+    const input = paragraphAcquisitionInput(paragraph, source);
+    const base = options(services, { measurer: { context: ctx, fontFamilyClasses: {} } });
+    const at = (compatibilityMode: number, startYPt: number) => acquireParagraphResult(input, {
+      ...base,
+      environment: { ...base.environment, compatibilityMode },
+      placement: { ...base.placement, startYPt },
+    }).layout.lines[0]!.placements.find((placement) => placement.kind === 'text')?.kerning;
+    expect(at(14, 72)).toBe(true);
+    expect(at(15, 73)).toBe(false);
+    expect(at(14, 74)).toBe(true);
+  });
+
   it('reuses the immutable result across initial and field service views', () => {
     const services = scopedServices();
     const fieldView = createFieldAcquisitionServicesView(services, { totalPages: 1 });

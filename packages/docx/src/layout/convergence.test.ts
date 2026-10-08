@@ -73,6 +73,18 @@ describe('convergeExactState', () => {
     });
   });
 
+  it('hands the first pass exactly null, and later passes the previous value', () => {
+    // Callers distinguish the unseeded first pass by this sentinel; a check
+    // against `undefined` once silently disabled progressive publication.
+    const seen: unknown[] = [];
+    convergeExactState<string>({
+      step: (previous, pass) => { seen.push(previous); return pass === 1 ? 'A' : 'B'; },
+      stateOf: (value) => value,
+      limit: 3,
+    });
+    expect(seen).toStrictEqual([null, 'A', 'B']);
+  });
+
   it('allows the first pass to confirm an explicitly observed seed state', () => {
     const result = convergeExactState<{ state: string; pass: number }>({
       seedState: 'A',

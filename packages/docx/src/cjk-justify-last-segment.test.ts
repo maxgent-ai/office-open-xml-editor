@@ -117,13 +117,23 @@ function doc(body: BodyElement[], sec: SectionProps): DocxDocumentModel {
   } as unknown as DocxDocumentModel;
 }
 
-async function render(body: BodyElement[], sec: SectionProps) {
+async function render(body: BodyElement[], sec: SectionProps, compatibilityMode?: number) {
   const { canvas, fillTextCalls } = makeRecordingCanvas();
-  await renderDocumentToCanvas(doc(body, sec), canvas, 0, { dpr: 1, width: sec.pageWidth });
+  await renderDocumentToCanvas({ ...doc(body, sec), settings: { compatibilityMode } } as DocxDocumentModel, canvas, 0, { dpr: 1, width: sec.pageWidth });
   return fillTextCalls;
 }
 
 describe('CJK justification — even slack distribution across the last segment (§17.18.44)', () => {
+  it('preserves unweighted CJK expansion across an empty metric host in mode 15', async () => {
+    const paragraph = twoRunPara('観', '察観察観察') as DocParagraph & { type: 'paragraph' };
+    paragraph.runs.splice(1, 0, {
+      type: 'anchorHost', fontSize: FONT_PX, fontFamily: 'NotInMetrics',
+    } as unknown as DocRun);
+    const sec = section({ pageWidth: 70, docGridType: 'default', docGridCharSpace: undefined });
+    const previous = await render([paragraph], sec, 14);
+    expect(await render([paragraph], sec, 15)).toEqual(previous);
+  });
+
   it('gives the visually-last CJK segment the SAME inter-glyph pitch as the first', async () => {
     // Cell = 20 + (-2048/4096) = 19.5 px. availW 210 → 10 cells (195) fit with
     // 15 px slack; the 11th (214.5) overflows. So line 1 = "ああああ" (run A, 4) +
@@ -153,4 +163,12 @@ describe('CJK justification — even slack distribution across the last segment 
     expect(line[0].letterSpacing).toBeCloseTo(line[1].letterSpacing, 9);
     expect(line[1].letterSpacing).toBeGreaterThan(-0.5);
   });
+});
+
+it.each(['ああああああああああああ', 'ああ ab ああああああああ'])('preserves mode-15 expansion for the unmeasured CJK gap family: %s', async text => {
+  const body = [twoRunPara(text, 'いいいいいい')];
+  const sec = section({ docGridType: undefined, docGridCharSpace: undefined });
+  const previous = await render(body, sec, 14);
+  const current = await render(body, sec, 15);
+  expect(current).toEqual(previous);
 });

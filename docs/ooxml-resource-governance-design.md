@@ -443,6 +443,21 @@ constants are checked in CI so browser option normalization, parser-native
 fallbacks, and effective hard caps cannot drift during calibration or later
 releases. Generation rejects a default that exceeds its hard ceiling.
 
+ChartEx has a non-configurable 524,288-element per-document allocation budget
+from the same generated policy. Calibration measured a maximum of 2,454
+parser-owned data-vector slots in any one document across 22,973 local ChartEx
+parts, leaving more than 213 times headroom; this is availability policy, not a
+document-format constraint. Each sparse numeric/string cache, derived category,
+value, hierarchy and box-and-whisker bin vector is charged immediately before
+allocation. Separate ChartEx parts and lazy operations share the owning package
+governor, including DOCX native and streaming paths. A declared `ptCount` or
+implicit point index beyond the allocatable range is rejected monotonically,
+including the `unsignedInt` maximum. The count is neither compressed ZIP size
+nor exact allocator bytes; formula-only source resolution remains under the
+host's existing range policy. A crossing poisons the package with
+`chartex-allocation:elements` at the parsing stage; it cannot silently omit a
+series or select a DOCX picture fallback. No migration is required.
+
 Archive entry count, XML nesting, relationships, model complexity, serialized
 bytes, image dimensions, canvas pixels, and timeouts remain internal quotas or
 separate existing options unless evidence shows that users can tune them

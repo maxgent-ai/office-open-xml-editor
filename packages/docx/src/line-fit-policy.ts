@@ -1,10 +1,11 @@
 /**
  * Greedy line-break selection shared by the body paragraph splitter and the
- * table-cell content splitter: returns the largest `end` in (start, limitEnd]
- * whose caller-model cumulative fit measure for lines [start, end) fits
- * `available`. The walk stops at the FIRST non-fitting end (both callers'
- * measures are monotone; preserving the early stop keeps their historical
- * float-comparison order bit-identical).
+ * table-cell content splitter: returns the largest fitting prefix reached
+ * before the first failed end in (start, limitEnd], using the caller's
+ * cumulative fit measure for lines [start, end). Callers must
+ * handle endpoints with a different reserve contract independently: the body
+ * paragraph selector tests completion before its continuing-prefix walk.
+ * Preserving the early stop keeps the prefix float-comparison order unchanged.
  *
  * ECMA-376 does not prescribe a line-selection algorithm for page/row filling;
  * greedy forward filling is this renderer's established layout convention

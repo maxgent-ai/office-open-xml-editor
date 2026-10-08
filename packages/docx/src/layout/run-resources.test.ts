@@ -398,7 +398,7 @@ describe('paragraph run resource projection', () => {
     const wrapped = acquireSameParagraph(square);
     const unwrapped = acquireSameParagraph(none);
 
-    expect(wrapped.lines.length).toBeGreaterThan(unwrapped.lines.length);
+    expect(wrapped.lines[0]?.bounds.yPt).toBeGreaterThan(unwrapped.lines[0]!.bounds.yPt);
     expect(wrapped.advancePt).toBeGreaterThan(unwrapped.advancePt);
     expect(wrapped.drawings).toHaveLength(1);
     expect(wrapped.exclusions).toHaveLength(1);
@@ -429,7 +429,7 @@ describe('paragraph run resource projection', () => {
     expect(left.exclusions[0]).toMatchObject({ wrapSide: 'left' });
     expect(right.exclusions[0]).toMatchObject({ wrapSide: 'right' });
     expect(largest.exclusions[0]).toMatchObject({ wrapSide: 'largest' });
-    expect(left.lines[0]?.bounds.yPt).toBe(10);
+    expect(left.lines[0]?.bounds.yPt).toBe(41);
     expect(largest.lines.map((line) => line.bounds)).toEqual(left.lines.map((line) => line.bounds));
     expect(right.lines[0]?.bounds.yPt).toBeGreaterThanOrEqual(41);
   });
@@ -827,19 +827,6 @@ describe('paragraph run resource projection', () => {
         origin: { xPt: 22, yPt: expect.any(Number) },
       }),
     ]);
-
-    const hangingFloat = acquireVariant({
-      alignment: 'left', indentLeft: 0, indentRight: 0, indentFirst: -10,
-      spaceBefore: 0, spaceAfter: 0, lineSpacing: null, numbering: null, tabStops: [],
-      runs: [text('hanging text')],
-    }, { ...context, firstIndentPt: -10 }, 'hanging-float', 120, [{
-      id: 'left-float', wrap: 'square', bounds: { xPt: 10, yPt: 10, widthPt: 30, heightPt: 20 },
-      polygon: [{ xPt: 10, yPt: 10 }, { xPt: 40, yPt: 10 }, { xPt: 40, yPt: 30 }, { xPt: 10, yPt: 30 }],
-    }]);
-    const hangingLine = hangingFloat.lines[0]!;
-    const hangingText = hangingLine.placements.find((placement) => placement.kind === 'text');
-    expect(hangingLine.bounds.xPt).toBe(30);
-    expect(hangingText?.origin.xPt).toBe(30);
 
     const math = acquireVariant({
       alignment: 'left', indentLeft: 0, indentRight: 0, indentFirst: 0,

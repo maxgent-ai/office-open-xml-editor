@@ -1,3 +1,5 @@
+import type { WritingMode } from './types.js';
+
 /** Canvas capabilities that retained layout may use synchronously.
  *
  * Vertical OpenType feature probing is deliberately excluded: it needs the
@@ -25,7 +27,7 @@ export interface VerticalGlyphMeasurementService {
     letterSpacingPt: number;
     charScale: number;
     growTrRotateInk: boolean;
-    writingMode: 'horizontal-tb' | 'vertical-rl' | 'vertical-lr';
+    writingMode: WritingMode;
   }>): readonly Readonly<{
     range: Readonly<{ start: number; end: number }>;
     text: string;

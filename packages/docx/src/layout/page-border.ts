@@ -3,7 +3,7 @@ import type { PageBorderEdge, PageBorders } from '../types.js';
 import { retainedBorderTreatment } from './border-treatment.js';
 import {
   createSectionRegionCoordinateSpace,
-  writingModeFromTextDirection,
+  sectionWritingMode,
   type PhysicalPageExtent,
 } from './coordinate-space.js';
 import { sectionBodyInsetPt } from './context.js';
@@ -115,7 +115,7 @@ export function materializePageBorderLayout(
   if (segments.length === 0) return null;
 
   const coordinateSpace = createSectionRegionCoordinateSpace(
-    writingModeFromTextDirection(section.textDirection),
+    sectionWritingMode(section),
     physicalPage,
   );
   return Object.freeze({

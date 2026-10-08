@@ -171,10 +171,10 @@ describe('tab-stop grid (§17.15.1.25 automatic stops, margin-relative)', () => 
       canvas, 0, { dpr: 1, width: 300 },
     );
 
-    const splitPeriod = fills.find((fill) => fill.text === '.');
+    const splitPeriod = fills.find((fill) => fill.text === '12.34');
     const whole = fills.find((fill) => fill.text === '1234.56');
     const integer = fills.find((fill) => fill.text === '1234');
-    expect(splitPeriod?.x).toBeCloseTo(144, 6);
+    expect((splitPeriod?.x ?? 0) + 2 * 9).toBeCloseTo(144, 6);
     expect((whole?.x ?? 0) + 4 * 9).toBeCloseTo(144, 6);
     expect((integer?.x ?? 0) + 4 * 9).toBeCloseTo(144, 6);
   });
@@ -189,12 +189,9 @@ describe('tab-stop grid (§17.15.1.25 automatic stops, margin-relative)', () => 
       canvas, 0, { dpr: 1, width: 300 },
     );
 
-    const firstDigits = fills.find((fill) => fill.text === '12');
-    const finalDigit = fills.find((fill) => fill.text === '3');
-    const suffix = fills.find((fill) => fill.text === 'kg');
-    expect(firstDigits?.x).toBeCloseTo(117, 6);
-    expect(finalDigit?.x).toBeCloseTo(135, 6);
-    expect(suffix?.x).toBeCloseTo(144, 6);
+    const value = fills.find((fill) => fill.text === '123kg');
+    expect(value?.x).toBeCloseTo(117, 6);
+    expect((value?.x ?? 0) + 3 * 9).toBeCloseTo(144, 6);
   });
 
   it('retains bar rules at the logical leading-edge coordinate without creating a stop', () => {

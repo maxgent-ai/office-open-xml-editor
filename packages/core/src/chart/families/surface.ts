@@ -39,7 +39,7 @@ import {
   chartStyleLineDecision,
 } from '../style-paint.js';
 
-import { resolveFill } from '../../shape/paint.js';
+import { resolveNativeFill as resolveFill } from '../../shape/paint.js';
 import { drawingmlLineDashArray, pptxPresetDashArray } from '../../draw/dash.js';
 import {
   isObservedAutomaticSurfaceCamera,

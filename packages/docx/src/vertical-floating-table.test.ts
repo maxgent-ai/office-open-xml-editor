@@ -232,7 +232,7 @@ function freshPageSensitiveSplitDocument(): DocxDocumentModel {
 
 describe('vertical outer floating tables retain the canonical logical paint domain', () => {
   it('emits distinct fitting envelopes when one source table occurs twice', () => {
-    const source = floatingTable([{ text: 'REUSED-FITTING', heightPt: 30 }]);
+    const source = floatingTable([{ text: 'REUSED_FITTING', heightPt: 30 }]);
     const doc = documentWith(source);
     doc.body = [source, source] as unknown as BodyElement[];
     const measure = recordingCanvas();
@@ -254,7 +254,7 @@ describe('vertical outer floating tables retain the canonical logical paint doma
   });
 
   it('keeps an earlier fitting envelope stable across independent widths', () => {
-    const source = floatingTable([{ text: 'SESSION-FITTING', heightPt: 30 }]);
+    const source = floatingTable([{ text: 'SESSION_FITTING', heightPt: 30 }]);
     source.widthPct = 5000;
     source.colWidths = [180];
     source.rows[0]!.cells[0]!.widthPt = 180;
@@ -296,8 +296,8 @@ describe('vertical outer floating tables retain the canonical logical paint doma
   });
 
   it('paints a fitting outer tblpPr table once without physical-domain finalization', async () => {
-    const doc = documentWith(floatingTable([{ text: 'OUTER-FLOAT', heightPt: 30 }]));
-    doc.body.push({ type: 'paragraph', ...paragraph('AFTER-OUTER') } as unknown as BodyElement);
+    const doc = documentWith(floatingTable([{ text: 'OUTER_FLOAT', heightPt: 30 }]));
+    doc.body.push({ type: 'paragraph', ...paragraph('AFTER_OUTER') } as unknown as BodyElement);
     const measure = recordingCanvas();
     const pages = layoutPages(
       doc.body,
@@ -308,7 +308,7 @@ describe('vertical outer floating tables retain the canonical logical paint doma
     const table = pages[0]?.layers.body.find((element) => element.kind === 'table');
     const retained = table ? table : undefined;
     const following = pages[0]?.layers.body.find(
-      (element) => element.kind === 'paragraph' && nodeText(element).includes('AFTER-OUTER'),
+      (element) => element.kind === 'paragraph' && nodeText(element).includes('AFTER_OUTER'),
     );
     const coordinateSpace = retained?.kind === 'table'
       && 'resolvedFloatingTableCoordinateSpace' in retained
@@ -333,7 +333,7 @@ describe('vertical outer floating tables retain the canonical logical paint doma
     })).resolves.toBeUndefined();
     expect(coordinateSpace).not.toBe('upright-physical-page-points');
     expect(paint.measureCalls()).toBe(0);
-    expect(runs.filter((run) => run.text === 'OUTER-FLOAT')).toHaveLength(1);
+    expect(runs.filter((run) => run.text === 'OUTER_FLOAT')).toHaveLength(1);
   });
 
   it('finalizes a fitting nested float before registering and painting its outer tblpPr parent', async () => {
@@ -354,7 +354,7 @@ describe('vertical outer floating tables retain the canonical logical paint doma
       insideH: null,
       insideV: null,
     };
-    const nestedTable = floatingTable([{ text: 'FITTING-NESTED', heightPt: 20 }]);
+    const nestedTable = floatingTable([{ text: 'FITTING_NESTED', heightPt: 20 }]);
     nestedTable.tblpPr = {
       ...nestedTable.tblpPr!,
       horzAnchor: 'page',
@@ -364,12 +364,12 @@ describe('vertical outer floating tables retain the canonical logical paint doma
     };
     outer.rows[0]!.cells[0]!.content = [
       { type: 'table', ...nestedTable },
-      { type: 'paragraph', ...paragraph('FITTING-ANCHOR') },
+      { type: 'paragraph', ...paragraph('FITTING_ANCHOR') },
     ] as unknown as DocTableCell['content'];
     const doc = documentWith(outer);
-    const external = floatingTable([{ text: 'AFTER-EXTERNAL', heightPt: 20 }]);
+    const external = floatingTable([{ text: 'AFTER_EXTERNAL', heightPt: 20 }]);
     doc.body.push({ type: 'table', ...external } as unknown as BodyElement);
-    doc.body.push({ type: 'paragraph', ...paragraph('AFTER-FITTING') } as unknown as BodyElement);
+    doc.body.push({ type: 'paragraph', ...paragraph('AFTER_FITTING') } as unknown as BodyElement);
     const measure = recordingCanvas();
     const pages = layoutPages(
       doc.body,
@@ -396,7 +396,7 @@ describe('vertical outer floating tables retain the canonical logical paint doma
       heightPt: nested.exclusionBounds.heightPt,
     };
     const followingElement = pages[0]?.layers.body.find(
-      (element) => element.kind === 'paragraph' && nodeText(element).includes('AFTER-FITTING'),
+      (element) => element.kind === 'paragraph' && nodeText(element).includes('AFTER_FITTING'),
     );
     const following = followingElement ? followingElement : undefined;
     if (following?.kind !== 'paragraph') {
@@ -461,7 +461,7 @@ describe('vertical outer floating tables retain the canonical logical paint doma
       onTextRun: (run) => runs.push(run),
     })).resolves.toBeUndefined();
     expect(paint.measureCalls()).toBe(0);
-    expect(runs.filter((run) => run.text === 'FITTING-NESTED')).toHaveLength(1);
+    expect(runs.filter((run) => run.text === 'FITTING_NESTED')).toHaveLength(1);
     const parentBorderPaint = paint.paintEvents.findIndex(
       (event) => event.kind === 'stroke' && event.color === '#ff00ff',
     );
@@ -526,7 +526,7 @@ describe('vertical outer floating tables retain the canonical logical paint doma
     };
     const relocated = floatingTable([{ text: 'unused', heightPt: 70 }]);
     relocated.tblpPr = { ...blocker.tblpPr! };
-    const nestedTable = floatingTable([{ text: 'LATER-NESTED', heightPt: 20 }]);
+    const nestedTable = floatingTable([{ text: 'LATER_NESTED', heightPt: 20 }]);
     nestedTable.tblpPr = {
       ...nestedTable.tblpPr!,
       horzAnchor: 'page',
@@ -584,13 +584,13 @@ describe('vertical outer floating tables retain the canonical logical paint doma
     });
     expect(paint.measureCalls()).toBe(0);
     expect(runs.some((run) => run.text === '2')).toBe(true);
-    expect(runs.filter((run) => run.text === 'LATER-NESTED')).toHaveLength(1);
+    expect(runs.filter((run) => run.text === 'LATER_NESTED')).toHaveLength(1);
   });
 
   it('keeps every split outer tblpPr slice in the logical domain and paints each row once', async () => {
     const doc = documentWith(floatingTable([
-      { text: 'OUTER-SLICE-1', heightPt: 90 },
-      { text: 'OUTER-SLICE-2', heightPt: 90 },
+      { text: 'OUTER_SLICE_1', heightPt: 90 },
+      { text: 'OUTER_SLICE_2', heightPt: 90 },
     ]));
     const measure = recordingCanvas();
     const pages = layoutPages(
@@ -624,14 +624,14 @@ describe('vertical outer floating tables retain the canonical logical paint doma
       })).resolves.toBeUndefined();
       expect(paint.measureCalls()).toBe(0);
     }
-    expect(runs.filter((run) => run.text === 'OUTER-SLICE-1')).toHaveLength(1);
-    expect(runs.filter((run) => run.text === 'OUTER-SLICE-2')).toHaveLength(1);
+    expect(runs.filter((run) => run.text === 'OUTER_SLICE_1')).toHaveLength(1);
+    expect(runs.filter((run) => run.text === 'OUTER_SLICE_2')).toHaveLength(1);
   });
 
   it('stamps later-page split slices with their live page ownership without a PAGE map', () => {
     const doc = documentWith(floatingTable([
-      { text: 'LATER-SLICE-1', heightPt: 90 },
-      { text: 'LATER-SLICE-2', heightPt: 90 },
+      { text: 'LATER_SLICE_1', heightPt: 90 },
+      { text: 'LATER_SLICE_2', heightPt: 90 },
     ]));
     doc.body.unshift(
       { type: 'pageBreak' } as BodyElement,
@@ -663,9 +663,9 @@ describe('vertical outer floating tables retain the canonical logical paint doma
   it('commits a selected nested float before registering its split outer slice', async () => {
     const outer = floatingTable([
       { text: 'unused', heightPt: 90 },
-      { text: 'OUTER-TAIL', heightPt: 90 },
+      { text: 'OUTER_TAIL', heightPt: 90 },
     ]);
-    const nestedTable = floatingTable([{ text: 'NESTED-FLOAT', heightPt: 20 }]);
+    const nestedTable = floatingTable([{ text: 'NESTED_FLOAT', heightPt: 20 }]);
     nestedTable.tblpPr = {
       ...nestedTable.tblpPr!,
       horzAnchor: 'page',
@@ -682,10 +682,10 @@ describe('vertical outer floating tables retain the canonical logical paint doma
     };
     outer.rows[1]!.cells[0]!.content = [
       { type: 'table', ...nestedTable },
-      { type: 'paragraph', ...paragraph('NESTED-ANCHOR') },
+      { type: 'paragraph', ...paragraph('NESTED_ANCHOR') },
     ] as unknown as DocTableCell['content'];
     const doc = documentWith(outer);
-    doc.body.push({ type: 'paragraph', ...paragraph('AFTER-SPLIT') } as unknown as BodyElement);
+    doc.body.push({ type: 'paragraph', ...paragraph('AFTER_SPLIT') } as unknown as BodyElement);
     const measure = recordingCanvas();
     const pages = layoutPages(
       doc.body,
@@ -703,7 +703,7 @@ describe('vertical outer floating tables retain the canonical logical paint doma
     const [nested] = fragment.resolvedFloatingTables;
     if (!nested) throw new Error('expected a retained split nested float');
     const followingElement = pages[1]?.layers.body.find(
-      (element) => element.kind === 'paragraph' && nodeText(element).includes('AFTER-SPLIT'),
+      (element) => element.kind === 'paragraph' && nodeText(element).includes('AFTER_SPLIT'),
     );
     const following = followingElement ? followingElement : undefined;
     if (following?.kind !== 'paragraph') {
@@ -742,7 +742,7 @@ describe('vertical outer floating tables retain the canonical logical paint doma
       })).resolves.toBeUndefined();
       expect(paint.measureCalls()).toBe(0);
     }
-    expect(runs.filter((run) => run.text === 'NESTED-FLOAT')).toHaveLength(1);
+    expect(runs.filter((run) => run.text === 'NESTED_FLOAT')).toHaveLength(1);
   });
 
   it('reflows a split child against the accepted slice box after an external blocker', async () => {
@@ -760,7 +760,7 @@ describe('vertical outer floating tables retain the canonical logical paint doma
 
     const outer = floatingTable([
       { text: 'unused', heightPt: 140 },
-      { text: 'OUTER-TAIL', heightPt: 20 },
+      { text: 'OUTER_TAIL', heightPt: 20 },
     ]);
     const nestedTable = floatingTable([{ text: 'C', heightPt: 20 }]);
     nestedTable.layout = 'fixed';
@@ -775,12 +775,12 @@ describe('vertical outer floating tables retain the canonical logical paint doma
     };
     outer.rows[0]!.cells[0]!.content = [
       { type: 'table', ...nestedTable },
-      { type: 'paragraph', ...paragraph('CHILD-ANCHOR') },
+      { type: 'paragraph', ...paragraph('CHILD_ANCHOR') },
     ] as unknown as DocTableCell['content'];
 
     const doc = documentWith(blocker);
     doc.body.push({ type: 'table', ...outer } as unknown as BodyElement);
-    doc.body.push({ type: 'paragraph', ...paragraph('AFTER-BLOCKED-SPLIT') } as unknown as BodyElement);
+    doc.body.push({ type: 'paragraph', ...paragraph('AFTER_BLOCKED_SPLIT') } as unknown as BodyElement);
     const measure = recordingCanvas();
     const pages = layoutPages(
       doc.body,

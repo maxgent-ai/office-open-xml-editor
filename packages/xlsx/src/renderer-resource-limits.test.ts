@@ -45,7 +45,7 @@ function worksheet(overrides: Partial<Worksheet> = {}): Worksheet {
   };
 }
 
-function expectHardRendererLimit(run: () => unknown, resource: string, operation: string): void {
+function expectRendererPolicyLimit(run: () => unknown, resource: string, operation: string, configurable = true): void {
   try {
     run();
     throw new Error('expected renderer resource limit');
@@ -62,7 +62,7 @@ function expectHardRendererLimit(run: () => unknown, resource: string, operation
         metric: 'entry-count',
         limit: LIMIT,
         observed: LIMIT + 1,
-        configurable: false,
+        configurable,
       },
     });
   }
@@ -167,7 +167,7 @@ describe('XLSX renderer coordinate-index hard limits', () => {
       value: EMPTY_VALUE,
     }));
 
-    expectHardRendererLimit(
+    expectRendererPolicyLimit(
       () => getSheetRenderCache(worksheet({ rows: [{ index: 1, height: null, cells }] })),
       'worksheet-cell-index',
       'index-worksheet-cells',
@@ -181,7 +181,7 @@ describe('XLSX renderer coordinate-index hard limits', () => {
   });
 
   it('rejects a merge-skip range one entry above the boundary before expansion', () => {
-    expectHardRendererLimit(
+    expectRendererPolicyLimit(
       () => getSheetRenderCache(worksheet({
         mergeCells: [{ top: 1, bottom: 1, left: 1, right: LIMIT + 2 }],
       })),
@@ -191,7 +191,7 @@ describe('XLSX renderer coordinate-index hard limits', () => {
   });
 
   it('rejects cumulative unique merge-skip entries across individually safe disjoint ranges', () => {
-    expectHardRendererLimit(
+    expectRendererPolicyLimit(
       () => getSheetRenderCache(worksheet({
         mergeCells: [
           { top: 1, bottom: 1, left: 1, right: 125_001 },
@@ -214,7 +214,7 @@ describe('XLSX renderer coordinate-index hard limits', () => {
   });
 
   it('rejects a styled-table range one entry above the boundary before expansion', () => {
-    expectHardRendererLimit(
+    expectRendererPolicyLimit(
       () => buildTableStyleMap(worksheet({
         tables: [table({ top: 1, bottom: 1, left: 1, right: LIMIT + 1 })],
       })),
@@ -224,7 +224,7 @@ describe('XLSX renderer coordinate-index hard limits', () => {
   });
 
   it('rejects cumulative unique table-style entries across individually safe disjoint ranges', () => {
-    expectHardRendererLimit(
+    expectRendererPolicyLimit(
       () => buildTableStyleMap(worksheet({
         tables: [
           table({ top: 1, bottom: 250, left: 1, right: 500 }),
@@ -242,7 +242,7 @@ describe('XLSX renderer coordinate-index hard limits', () => {
       autoFilter: { top: 1, bottom: 1, left: 1, right: LIMIT },
     })).autoFilterCells.size).toBe(LIMIT);
 
-    expectHardRendererLimit(
+    expectRendererPolicyLimit(
       () => getSheetRenderCache(worksheet({
         autoFilter: { top: 1, bottom: 1, left: 1, right: LIMIT + 1 },
       })),
@@ -265,7 +265,7 @@ describe('XLSX renderer coordinate-index hard limits', () => {
       col: 1,
       url: 'https://example.test',
     }));
-    expectHardRendererLimit(
+    expectRendererPolicyLimit(
       () => getSheetRenderCache(worksheet({ hyperlinks: over })),
       'worksheet-hyperlink-index',
       'index-hyperlink-coordinates',
@@ -281,7 +281,7 @@ describe('XLSX renderer coordinate-index hard limits', () => {
       .toBe(LIMIT);
 
     const over = Array.from({ length: LIMIT + 1 }, (_, index) => `A${index + 1}`);
-    expectHardRendererLimit(
+    expectRendererPolicyLimit(
       () => getSheetRenderCache(worksheet({ commentRefs: over })),
       'worksheet-comment-index',
       'index-comment-coordinates',
@@ -293,7 +293,7 @@ describe('XLSX renderer coordinate-index hard limits', () => {
       sparklineGroups: [sparklineGroup(LIMIT + 1, true)],
     })).sparklineMap.size).toBe(LIMIT);
 
-    expectHardRendererLimit(
+    expectRendererPolicyLimit(
       () => getSheetRenderCache(worksheet({
         sparklineGroups: [sparklineGroup(LIMIT + 1)],
       })),
@@ -324,7 +324,7 @@ describe('XLSX renderer coordinate-index hard limits', () => {
       left: 1,
       right: 1,
     }));
-    expectHardRendererLimit(
+    expectRendererPolicyLimit(
       () => renderViewport(
         recordingCtx(),
         worksheet({ mergeCells }),
@@ -354,7 +354,7 @@ describe('XLSX renderer coordinate-index hard limits', () => {
       },
       identity,
     )).toBe(1);
-    expectHardRendererLimit(
+    expectRendererPolicyLimit(
       () => assertCoordinateRangeArea(
         { top: 1, bottom: Number.MAX_SAFE_INTEGER, left: 1, right: 1 },
         identity,
@@ -362,21 +362,23 @@ describe('XLSX renderer coordinate-index hard limits', () => {
       identity.resource,
       identity.operation,
     );
-    expectHardRendererLimit(
+    expectRendererPolicyLimit(
       () => assertCoordinateRangeArea(
         { top: 1, bottom: 1, left: 1, right: Number.POSITIVE_INFINITY },
         identity,
       ),
       identity.resource,
       identity.operation,
+      false,
     );
-    expectHardRendererLimit(
+    expectRendererPolicyLimit(
       () => assertCoordinateRangeArea(
         { top: 1, bottom: 1.5, left: 1, right: 1 },
         identity,
       ),
       identity.resource,
       identity.operation,
+      false,
     );
   });
 
@@ -384,7 +386,7 @@ describe('XLSX renderer coordinate-index hard limits', () => {
     const ws = worksheet({
       autoFilter: { top: 1, bottom: 1, left: 1, right: LIMIT + 1 },
     });
-    expectHardRendererLimit(
+    expectRendererPolicyLimit(
       () => getSheetRenderCache(ws),
       'worksheet-auto-filter-index',
       'expand-auto-filter-coordinates',

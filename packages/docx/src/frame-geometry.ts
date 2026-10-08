@@ -22,6 +22,7 @@ import {
   FLOAT_OVERLAP_EPS,
   FLOAT_PAGE_RIGHT_SLACK,
   drawingMLAvoidance,
+  frameAvoidance,
   floatRectParticipant,
   floatingTableAvoidance,
   resolveFloatPlacement,
@@ -365,7 +366,9 @@ export function pushFloatRect(state: FloatRegistrationState, o: PushFloatOpts): 
       blockers: state.floats.map(floatRectParticipant),
       avoidance: o.kind === 'table'
         ? floatingTableAvoidance(o.tableOverlap!, o.paraId)
-        : drawingMLAvoidance(o.allowOverlap ?? true, o.paraId),
+        : o.kind === 'frame'
+          ? frameAvoidance(o.paraId)
+          : drawingMLAvoidance(o.allowOverlap ?? true),
       rightBoundaryPt: state.pageWidth,
       overlapEpsilonPt: FLOAT_OVERLAP_EPS,
       rightBoundarySlackPt: FLOAT_PAGE_RIGHT_SLACK,
@@ -399,18 +402,29 @@ export function pushFloatRect(state: FloatRegistrationState, o: PushFloatOpts): 
 }
 
 /**
+ * The exclusion a framePr wrap imposes (mapping documented on
+ * {@link registerFrameFloat}). This is §17.18.104 ST_Wrap of w:framePr, not
+ * DrawingML wrapNone (§20.4.2.15), whose text does overlap its object.
+ */
+export function frameWrapExclusionMode(
+  fp: Pick<FramePr, 'wrap'>,
+): 'square' | 'topAndBottom' {
+  return fp.wrap === 'none' || fp.wrap === 'notBeside' ? 'topAndBottom' : 'square';
+}
+
+/**
  * Push the wrap-exclusion FloatRect for a resolved frame box onto
  * `state.floats` so following body text flows around the frame. No-op for
- * wrap="none" or a degenerate (zero-area) box. Shared by the renderer (after
- * drawing) and the paginator (so the anchor paragraph's measured height
- * accounts for the wrap). The exclusion x-range is COLUMN-relative (built in
- * frameXContainer from state.contentX/contentW for hAnchor="text"), so
+ * a degenerate (zero-area) box. Shared by the renderer (after drawing) and
+ * the paginator (so the anchor paragraph's measured height accounts for the
+ * wrap). The exclusion x-range is COLUMN-relative (built in frameXContainer
+ * from state.contentX/contentW for hAnchor="text"), so
  * resolveLineFloatWindow only constrains the matching column (#513).
  *
  * Wrap-mode → FloatRect mapping (ECMA-376 §17.18.104):
- *   none      → no exclusion (text may overlap; the frame is drawn absolutely
- *               and following text starts at its normal Y).
- *   notBeside → topAndBottom (text never sits beside the frame).
+ *   none, notBeside → topAndBottom: neither allows text to wrap around the
+ *               frame; text resumes on the next line that does not intersect
+ *               the frame's extents.
  *   around / auto → square side wrap. `word-frame-auto-wrap-around` records
  *               the application-defined mapping of auto to around.
  *   tight / through → a frame is a rectangle, so contour wrapping collapses to
@@ -420,11 +434,10 @@ export function pushFloatRect(state: FloatRegistrationState, o: PushFloatOpts): 
  */
 export function registerFrameFloat(box: FrameBox, fp: FramePr, state: FloatRegistrationState): void {
   if (box.registerExclusion === false) return;
-  if (fp.wrap === 'none') return;
+  const mode = frameWrapExclusionMode(fp);
   if (box.w <= 0 || box.h <= 0) return;
 
   const paraId = state.floatParaSeq++;
-  const mode: 'square' | 'topAndBottom' = fp.wrap === 'notBeside' ? 'topAndBottom' : 'square';
   // dist padding recovered from the box's pre-computed exclusion edges so the
   // unified builder reproduces xLeft=box.exLeft etc. exactly.
   pushFloatRect(state, {

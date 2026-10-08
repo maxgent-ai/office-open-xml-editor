@@ -94,6 +94,10 @@ export interface Worksheet {
   /** `<sheetFormatPr baseColWidth>` (§18.3.1.81), when no explicit
    *  `defaultColWidth` is authored. */
   baseColWidth?: number;
+  /** True only when `<sheetFormatPr>` is absent: `defaultColWidth` then holds
+   *  the library's 8.43 UI-character fallback (padding excluded, ECMA-376
+   *  §18.3.1.13) rather than a stored width. Omitted when false. */
+  defaultColWidthIsUi?: boolean;
   defaultRowHeight: number;
   /** `<sheetFormatPr customHeight>` (ECMA-376 §18.3.1.81). When true, rows
    *  without their own `ht` use the manually authored sheet default instead of
@@ -539,20 +543,34 @@ export interface ChartAnchor {
   chart: ChartModel;
 }
 
+/** Which DrawingML anchor element (ECMA-376 Part 1 §20.5.2) carried the
+ *  object. This is a normative fact recorded from the actual XML element name
+ *  and is never inferred from geometry. Absent means "not recorded" (older
+ *  models, VML/OLE previews, legacy binary conversion). */
+export type DrawingAnchorTag = 'oneCellAnchor' | 'twoCellAnchor';
+
 export interface ShapeAnchor {
   fromCol: number; fromColOff: number;
   fromRow: number; fromRowOff: number;
   toCol: number;   toColOff: number;
   toRow: number;   toRowOff: number;
-  /** `twoCellAnchor@editAs` (ECMA-376 §20.5.2.33). With `"oneCell"` the
-   *  renderer uses `nativeExtCx`/`nativeExtCy` as the on-sheet size, since
-   *  Excel preserves the group's saved EMU extent regardless of cell
-   *  resizing ("Move but don't size with cells"). Absent ⇒ default `"twoCell"`. */
+  /** `twoCellAnchor@editAs` (ECMA-376 §20.5.2.33; normative fact). It governs
+   *  how band edits move/resize the object (§20.5.3.2). Library policy:
+   *  only untagged models with `"oneCell"` size from `nativeExtCx/Cy`.
+   *  Absent ⇒ default `"twoCell"`. */
   editAs?: string;
-  /** Saved EMU extent of the top-level grpSp (or the stand-alone sp/pic).
-   *  Authoritative when `editAs === "oneCell"`. 0 = unavailable. */
+  /** Raw EMU xfrm ext of the top-level grpSp (or the stand-alone sp/pic).
+   *  Used for sizing only by the untagged compatibility policy.
+   *  0 = unavailable. */
   nativeExtCx: number;
   nativeExtCy: number;
+  /** XML anchor element kind (normative fact). Absent = not recorded. */
+  anchorTag?: DrawingAnchorTag;
+  /** `<xdr:oneCellAnchor><xdr:ext cx cy>` in EMU (§20.5.2.24): the
+   *  anchor-level display size. It is distinct from `nativeExtCx/Cy`. Absent
+   *  for twoCellAnchor and for a missing or unparsable attribute. */
+  anchorExtCx?: number;
+  anchorExtCy?: number;
   shapes: ShapeInfo[];
 }
 
@@ -590,6 +608,12 @@ export interface ShapeInfo {
 }
 
 export interface ShapeText {
+  /** DrawingML vertical text mode (ECMA-376 §20.1.10.83). */
+  vert?: string;
+  /** Center the longest column along its axis (§21.1.2.1.1). */
+  anchorCtr?: boolean;
+  /** Include spacing at the first/last paragraph edges (§21.1.2.1.1). */
+  spcFirstLastPara?: boolean;
   /** `<a:bodyPr@anchor>` — vertical alignment of the text block within the
    *  shape rect. `t` (top, default), `ctr` (middle), `b` (bottom). */
   anchor: string;
@@ -664,6 +688,8 @@ export type ShapeTextRun =
       /** Font size in points (already converted from `<a:rPr@sz>` 100ths-of-a-pt).
        *  0 = inherit (renderer falls back to its default). */
       size: number;
+      /** `<a:rPr@spc>` in points (§20.1.10.74). */
+      spacing?: number;
       color?: string;
       fontFace?: string;
       /** East-Asian typeface (`<a:ea@typeface>`, ECMA-376 §21.1.2.3.1).
@@ -773,13 +799,16 @@ export interface ImageAnchor {
   toColOff: number;
   toRow: number;
   toRowOff: number;
-  /** `twoCellAnchor@editAs` (ECMA-376 §20.5.2.33). `"oneCell"` instructs the
-   *  renderer to use `nativeExtCx`/`nativeExtCy` as the size and ignore the
-   *  `to` anchor (Excel's "Move but don't size with cells"). Absent ⇒ default
-   *  `"twoCell"`. */
+  /** `twoCellAnchor@editAs` (ECMA-376 §20.5.2.33; normative fact). It governs
+   *  how band edits move/resize the picture (§20.5.3.2). For a tagged
+   *  `twoCellAnchor`, the initial display rect is always `from`/`to`.
+   *  Library compatibility policy: only untagged `"oneCell"` models size from
+   *  `nativeExtCx/Cy`. Absent ⇒ default `"twoCell"`. */
   editAs?: string;
-  /** `<xdr:pic><xdr:spPr><a:xfrm><a:ext cx cy>` in EMU — the picture's saved
-   *  size. Authoritative when `editAs === "oneCell"`. 0 = unavailable. */
+  /** XML anchor element kind (normative fact). Absent = not recorded. */
+  anchorTag?: DrawingAnchorTag;
+  /** `<xdr:pic><xdr:spPr><a:xfrm><a:ext cx cy>` in EMU: the raw child
+   *  transform extent. 0 = unavailable. */
   nativeExtCx: number;
   nativeExtCy: number;
   /** Non-identity `<a:xfrm>` transform. Rotation is clockwise degrees. */
@@ -1266,6 +1295,8 @@ export type WorkerRequest =
       id: number;
       data: ArrayBuffer;
       resourcePolicy: NormalizedOoxmlResourcePolicy;
+      /** Normalized worksheet admission policy. Optional for older internal requests. */
+      readonly worksheetPolicy?: import('@silurus/ooxml-core/worker').NormalizedXlsxWorksheetPolicy;
       /** Application-selected model source (LoadOptions.modelSources). */
       source?: import('@silurus/ooxml-core').ModelSourceModuleDescriptor;
       sourceTransfer?: readonly Transferable[];

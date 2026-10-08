@@ -227,8 +227,7 @@ describe('ECMA-376 §17.15.3.3 single-byte/double-byte width balance', () => {
       segment.text,
       segment.widthBalanceSpaceSequence ?? false,
     ])).toEqual([
-      ['Anchor ', true],
-      [' ', true],
+      ['Anchor  ', true],
       ['Target', false],
     ]);
   });

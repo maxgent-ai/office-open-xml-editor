@@ -2,7 +2,7 @@
 // by worksheet cells and chart labels alike: section splitting, the text
 // section, date/time section detection and date/time rendering.
 
-import { excelSerialToUtcDate } from './excel-date';
+import { excelSerialToUtcDate, isExcelDisplayDateSerial } from './excel-date';
 
 /** Index of the text section (§18.8.30), or -1: the fourth section when
  *  there are four, otherwise the last section when it holds an `@`
@@ -116,7 +116,30 @@ function resolveJpEra(date: Date): { abbr: string; short: string; long: string; 
  * now correct in both systems).
  */
 export function formatExcelDateTime(serial: number, section: string, date1904 = false): string {
-  const date = excelSerialToUtcDate(serial, date1904);
+  const elapsedSection = hasElapsedBracket(section);
+  const subSecondDigits = fractionalSecondDigits(section);
+  // Elapsed-only sections describe durations (§18.8.30), not calendar dates.
+  // Validate after section selection/magnitude handling, before Date or Intl
+  // can throw or produce invented/NaN text. '#' is independent of cell width;
+  // the worksheet painter expands it across the available width.
+  const validCalendar = isExcelDisplayDateSerial(serial, date1904);
+  if (!Number.isFinite(serial) || !Number.isFinite(serial * 86_400_000)
+      || (!elapsedSection && !validCalendar)) return '#';
+  // Duration sections may mix clock and calendar tokens. Check actual
+  // calendar fields below in their token context, so quoted calendar letters
+  // and minute tokens cannot accidentally restrict a duration.
+  // MS-OE376 §2.1.739(b), NFPartSubSecond: one to three zero placeholders
+  // after a decimal separator display tenths/hundredths/milliseconds. Round
+  // the entire clock once, so a fraction carry also updates seconds/minutes.
+  // Formats without subsecond tokens retain the existing millisecond clock.
+  const quantumMs = 10 ** (3 - (subSecondDigits || 3));
+  const absMs = Math.round(Math.abs(serial) * 86_400_000 / quantumMs) * quantumMs;
+  const roundedSerial = (serial < 0 ? -absMs : absMs) / 86_400_000;
+  // Preserve the final-day saturation provided by excelSerialToUtcDate: a
+  // fractional-second carry must not invent a calendar date in year 10000.
+  const dateSerial = subSecondDigits && (!validCalendar || isExcelDisplayDateSerial(roundedSerial, date1904))
+    ? roundedSerial : serial;
+  const date = excelSerialToUtcDate(dateSerial, date1904);
   const yr = date.getUTCFullYear();
   const mo = date.getUTCMonth() + 1;   // 1-12
   const dy = date.getUTCDate();
@@ -124,8 +147,6 @@ export function formatExcelDateTime(serial: number, section: string, date1904 = 
   // An elapsed-time section (`[h]:mm`, `[mm]:ss`) reads its clock fields as
   // remainders of the same absolute, millisecond-rounded duration as its
   // elapsed total, so a negative duration keeps consistent minutes.
-  const elapsedSection = hasElapsedBracket(section);
-  const absMs = Math.round(Math.abs(serial) * 86_400_000);
   const hr = elapsedSection ? Math.floor(absMs / 3_600_000) % 24 : date.getUTCHours();
   const mi = elapsedSection ? Math.floor(absMs / 60_000) % 60 : date.getUTCMinutes();
   const sc = elapsedSection ? Math.floor(absMs / 1_000) % 60 : date.getUTCSeconds();
@@ -171,6 +192,12 @@ export function formatExcelDateTime(serial: number, section: string, date1904 = 
         const padded = inner.length >= 2 ? String(v).padStart(inner.length, '0') : String(v);
         result += sign + padded;
         i = end + 1;
+        const fraction = kind === 's' ? /^\.(0{1,3})(?!0)/.exec(section.slice(i)) : null;
+        if (fraction) {
+          const digits = fraction[1].length;
+          result += '.' + String(Math.floor((absMs % 1000) / 10 ** (3 - digits))).padStart(digits, '0');
+          i += fraction[0].length;
+        }
         prevWasHour = kind === 'h';
       } else {
         while (i < section.length && section[i] !== ']') i++;
@@ -194,6 +221,7 @@ export function formatExcelDateTime(serial: number, section: string, date1904 = 
       }
 
     } else if (ch === 'y' || ch === 'Y') {
+      if (!validCalendar) return '#';
       let n = 0;
       while (i < section.length && section[i].toLowerCase() === 'y') { n++; i++; }
       result += n <= 2 ? String(yr).slice(-2) : String(yr).padStart(4, '0');
@@ -209,6 +237,7 @@ export function formatExcelDateTime(serial: number, section: string, date1904 = 
       if (isMinutes) {
         result += n >= 2 ? String(mi).padStart(2, '0') : String(mi);
       } else {
+        if (!validCalendar) return '#';
         if      (n === 1) result += String(mo);
         else if (n === 2) result += String(mo).padStart(2, '0');
         else if (n === 3) result += MONTH_NAMES[mo - 1].slice(0, 3);
@@ -218,6 +247,7 @@ export function formatExcelDateTime(serial: number, section: string, date1904 = 
       prevWasHour = false;
 
     } else if (ch === 'd' || ch === 'D') {
+      if (!validCalendar) return '#';
       let n = 0;
       while (i < section.length && section[i].toLowerCase() === 'd') { n++; i++; }
       if      (n === 1) result += String(dy);
@@ -237,6 +267,13 @@ export function formatExcelDateTime(serial: number, section: string, date1904 = 
       let n = 0;
       while (i < section.length && section[i].toLowerCase() === 's') { n++; i++; }
       result += n >= 2 ? String(sc).padStart(2, '0') : String(sc);
+      const fraction = /^\.(0{1,3})(?!0)/.exec(section.slice(i));
+      if (fraction) {
+        const digits = fraction[1].length;
+        const milliseconds = elapsedSection ? absMs % 1000 : date.getUTCMilliseconds();
+        result += '.' + String(Math.floor(milliseconds / 10 ** (3 - digits))).padStart(digits, '0');
+        i += fraction[0].length;
+      }
       prevWasHour = false;
 
     } else if (ch === 'g' || ch === 'G') {
@@ -246,6 +283,7 @@ export function formatExcelDateTime(serial: number, section: string, date1904 = 
       let n = 0;
       while (i < section.length && section[i].toLowerCase() === 'g') { n++; i++; }
       if (japaneseEra) {
+        if (!validCalendar) return '#';
         const e = getEra();
         if      (n === 1) result += e.abbr;
         else if (n === 2) result += e.short;
@@ -254,6 +292,7 @@ export function formatExcelDateTime(serial: number, section: string, date1904 = 
       prevWasHour = false;
 
     } else if (ch === 'e' || ch === 'E') {
+      if (!validCalendar) return '#';
       // Era year: under `[$-411]` the Japanese era year (`ee` zero-padded);
       // Excel renders `e` and `ee` as the four-digit year in any other section.
       let n = 0;
@@ -267,6 +306,7 @@ export function formatExcelDateTime(serial: number, section: string, date1904 = 
       prevWasHour = false;
 
     } else if (ch === 'r' || ch === 'R') {
+      if (!validCalendar) return '#';
       // Under `[$-411]`, `r` is `ee` and `rr` is `gggee` (§18.8.30); Excel
       // renders both as the four-digit year in any other section.
       let n = 0;
@@ -285,8 +325,10 @@ export function formatExcelDateTime(serial: number, section: string, date1904 = 
       // `aaa` = "水". Checked before AM/PM because those are shorter matches
       // and would otherwise swallow the leading 'a'.
       if (upper.startsWith('AAAA')) {
+        if (!validCalendar) return '#';
         result += JP_WEEKDAY_LONG[wd]; i += 4;
       } else if (upper.startsWith('AAA')) {
+        if (!validCalendar) return '#';
         result += JP_WEEKDAY_SHORT[wd]; i += 3;
       } else if (upper.startsWith('AM/PM')) {
         result += hr < 12 ? 'AM' : 'PM'; i += 5;
@@ -335,6 +377,38 @@ function sectionHasJapaneseLocale(section: string): boolean {
     }
   }
   return false;
+}
+
+/** Fractional seconds following an unescaped seconds token. Quoted text and
+ * metadata never change clock precision. MS-OE376 limits precision to 3. */
+function fractionalSecondDigits(section: string): number {
+  let digits = 0;
+  for (let i = 0; i < section.length;) {
+    const ch = section[i];
+    if (ch === '\\' || ch === '_' || ch === '*') {
+      i += 2;
+    } else if (ch === '[') {
+      // ECMA-376 §18.8.30 includes `[ss].00` (elapsed seconds/hundredths).
+      const token = /^\[s+\]\.(0{1,3})(?!0)/i.exec(section.slice(i));
+      if (token) digits = Math.max(digits, token[1].length);
+      const end = section.indexOf(']', i + 1);
+      i = token ? i + token[0].length : end < 0 ? section.length : end + 1;
+    } else if (ch === '"') {
+      const end = section.indexOf('"', i + 1);
+      i = end < 0 ? section.length : end + 1;
+    } else if (ch === 's' || ch === 'S') {
+      const token = /^s+\.(0{1,3})(?!0)/i.exec(section.slice(i));
+      if (token) {
+        digits = Math.max(digits, token[1].length);
+        i += token[0].length;
+      } else {
+        while (i < section.length && section[i].toLowerCase() === 's') i++;
+      }
+    } else {
+      i++;
+    }
+  }
+  return digits;
 }
 
 /** Whether a section holds an AM/PM or A/P token outside quotes, escapes and

@@ -1,5 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { createSlotHost } from '../viewer/slot-scroller.js';
 import {
+  CanvasLoadingIndicator,
+  CanvasOverlayHost,
   CanvasViewerErrorRouter,
   readBoundedNativeTextSelection,
   resolveCanvasViewerMode,
@@ -418,4 +421,33 @@ describe('TerminalResourceOwner', () => {
     stalePending.resolve({ destroy: () => { throw new Error('dispose failed'); } });
     await expect(stale).resolves.toBeNull();
   });
+});
+
+// Minimal DOM for the container contract; browser coverage verifies accessibility.
+function overlayHostFixture() {
+  const ownerDocument = {
+    createElement: (tagName: string) => ({
+      tagName,
+      ownerDocument,
+      style: { cssText: '', display: '' },
+      textContent: '',
+      attributes: new Map<string, string>(),
+      children: [] as unknown[],
+      setAttribute(name: string, value: string) { this.attributes.set(name, value); },
+      appendChild(child: unknown) { this.children.push(child); },
+    }),
+  };
+  return ownerDocument.createElement('div');
+}
+
+it('identifies all canvas overlays independently of sibling order and loading DOM', () => {
+  const wrapper = overlayHostFixture();
+  new CanvasLoadingIndicator(wrapper as unknown as HTMLElement, 'Loading page');
+  new CanvasOverlayHost(wrapper as unknown as HTMLElement, true, true);
+  expect(wrapper.children.map((child) =>
+    (child as ReturnType<typeof overlayHostFixture>).attributes.get('data-overlay'),
+  ).filter(Boolean).sort()).toEqual(['element', 'highlight', 'text']);
+  const slot = createSlotHost(wrapper as unknown as HTMLDivElement, true, false);
+  expect((slot.textLayer as unknown as ReturnType<typeof overlayHostFixture>).attributes.get('data-overlay')).toBe('text');
+  expect((slot.highlightLayer as unknown as ReturnType<typeof overlayHostFixture>).attributes.get('data-overlay')).toBe('highlight');
 });

@@ -2,7 +2,7 @@
 import type { ChartDataPointOverride, ChartModel, ChartRect, ChartSeries } from '../../types/chart';
 import { chartDataPointStyleRole, chartSeriesSourceIndex, chartSeriesVariesByPoint } from '../effective-style.js';
 import { classicDataPointLineStyle } from '../classic-data-point-style.js';
-import { resolveFill } from '../../shape/paint.js';
+import { resolveNativeFill as resolveFill } from '../../shape/paint.js';
 import { axisLineWidthPx } from '../axis-style.js';
 import { drawingmlLineDashArray } from '../../draw/dash.js';
 import { chartStyleEffectOwner, paintChartStyleEffects } from '../style-effects.js';

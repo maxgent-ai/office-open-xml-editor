@@ -49,7 +49,7 @@ import { pptxCommentOccurrenceKey } from './comment-occurrence';
 import type { PptxComment } from './types';
 import { renderPptxFocusedSlide } from './focused-view-runtime';
 import { PptxScrollLayoutController } from './scroll-layout-controller';
-import { createPptxLoadingLayer } from './loading-indicator';
+import { createPptxLoadingIndicator } from './loading-indicator';
 import { PptxScrollMediaController } from './scroll-media-controller';
 import { PptxScrollCommentNavigation } from './scroll-comment-navigation';
 
@@ -743,8 +743,7 @@ export class PptxScrollViewer implements ZoomableViewer {
     const { wrapper, canvas, textLayer, highlightLayer } = createSlotHost(
       this._scrollHost, this._opts.enableTextSelection === true, this._pageShadow,
     );
-    const loadingLayer = createPptxLoadingLayer(document);
-    wrapper.appendChild(loadingLayer);
+    const loadingIndicator = createPptxLoadingIndicator(wrapper);
     const { markerLayer: commentMarkerLayer, margin: commentMargin, decorationLayer: commentDecorationLayer } =
       createCommentSlotLayers(
         wrapper,
@@ -764,7 +763,7 @@ export class PptxScrollViewer implements ZoomableViewer {
       textLayer,
       highlightLayer,
       elementLayer,
-      loadingLayer,
+      loadingIndicator,
       commentMarkerLayer,
       commentMargin,
       commentDecorationLayer,
@@ -807,7 +806,7 @@ export class PptxScrollViewer implements ZoomableViewer {
       );
     }
     this._layers.reset(slot);
-    slot.loadingLayer.style.display = 'none';
+    slot.loadingIndicator.setLoading(false);
     slot.commentElementBounds = Object.freeze([]);
     slot.commentGeometry = null;
     slot.commentAnchorSlide = -1;
@@ -847,13 +846,12 @@ export class PptxScrollViewer implements ZoomableViewer {
       // dispatches only the placeholders that are still mounted.
       slot.renderedSlide = -1;
       slot.mediaInteractive = false;
-      slot.loadingLayer.style.display = 'flex';
+      slot.loadingIndicator.setLoading(true);
       return null;
     }
     slot.renderedSlide = i;
     const renderGeneration = ++slot.renderGeneration;
-    slot.loadingLayer.style.display =
-      i >= this.availableSlideCount && !this.layoutComplete ? 'flex' : 'none';
+    slot.loadingIndicator.setLoading(i >= this.availableSlideCount && !this.layoutComplete);
 
     const dpr = this._viewport.dpr();
     const widthPx = this._slideWidthPx();
@@ -910,7 +908,7 @@ export class PptxScrollViewer implements ZoomableViewer {
         this._slots.get(slideIndex) === slot &&
         slot.renderedSlide === slideIndex
       ) {
-        slot.loadingLayer.style.display = 'none';
+        slot.loadingIndicator.setLoading(false);
       }
     }
   }

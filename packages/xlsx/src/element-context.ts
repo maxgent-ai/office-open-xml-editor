@@ -1,4 +1,3 @@
-import { EMU_PER_PX } from '@silurus/ooxml-core';
 import {
   boundedChartContextText,
   MAX_CHART_CONTEXT_TEXT_CHARACTERS,
@@ -17,24 +16,13 @@ import {
   getGridGeometryForWorksheet,
   sheetAnchoredRectX,
 } from './renderer.js';
-import { usesNativeOneCellExtent } from './internal/cell-anchor-geometry.js';
+import type { CellAnchorSizeFacts } from './internal/cell-anchor-geometry.js';
+import { resolveWorksheetAnchorRect } from './internal/initial-anchor-sizes.js';
 import { inverseImageTransformPoint, rotatedImageBounds } from './internal/image-anchor-transform.js';
 import type { GridAxisGeometry } from './internal/grid-axis-geometry.js';
 import type { XlsxElementContext } from './selection.js';
 
-interface CellAnchorLike {
-  readonly fromCol: number;
-  readonly fromColOff: number;
-  readonly fromRow: number;
-  readonly fromRowOff: number;
-  readonly toCol: number;
-  readonly toColOff: number;
-  readonly toRow: number;
-  readonly toRowOff: number;
-  readonly editAs?: string;
-  readonly nativeExtCx?: number;
-  readonly nativeExtCy?: number;
-}
+type CellAnchorLike = CellAnchorSizeFacts;
 
 export interface XlsxElementHitViewport {
   readonly width: number;
@@ -49,6 +37,8 @@ export interface XlsxElementHitViewport {
 }
 
 interface AnchoredRectContext {
+  /** Projection whose bound prepared-initial reference (if any) sizes anchors. */
+  readonly worksheet: Worksheet;
   readonly colAxis: GridAxisGeometry;
   readonly rowAxis: GridAxisGeometry;
   readonly scale: number;
@@ -78,30 +68,18 @@ export interface XlsxElementOutlineProjection {
 }
 
 function anchoredCanvasRect(anchor: CellAnchorLike, context: AnchoredRectContext): CanvasRect | null {
-  const x1 = context.colAxis.offsetOf(anchor.fromCol + 1) +
-    (anchor.fromColOff * context.scale) / EMU_PER_PX;
-  const y1 = context.rowAxis.offsetOf(anchor.fromRow + 1) +
-    (anchor.fromRowOff * context.scale) / EMU_PER_PX;
-  let width: number;
-  let height: number;
-  if (usesNativeOneCellExtent(anchor)) {
-    width = (anchor.nativeExtCx! * context.scale) / EMU_PER_PX;
-    height = (anchor.nativeExtCy! * context.scale) / EMU_PER_PX;
-  } else {
-    const x2 = context.colAxis.offsetOf(anchor.toCol + 1) +
-      (anchor.toColOff * context.scale) / EMU_PER_PX;
-    const y2 = context.rowAxis.offsetOf(anchor.toRow + 1) +
-      (anchor.toRowOff * context.scale) / EMU_PER_PX;
-    width = x2 - x1;
-    height = y2 - y1;
-  }
+  // Same resolver as paint and culling, so hit/outline match the painted rect.
+  const sheet = resolveWorksheetAnchorRect(
+    context.worksheet, anchor, context.colAxis, context.rowAxis, context.scale,
+  );
+  const { width, height } = sheet;
   if (width <= 0 || height <= 0) return null;
   const scrollOriginX = context.colAxis.offsetOf(context.startCol);
   const scrollOriginY = context.rowAxis.offsetOf(context.startRow);
-  const logicalX = context.scrollAreaX + (x1 - scrollOriginX) - context.scrollOffsetX;
+  const logicalX = context.scrollAreaX + (sheet.x - scrollOriginX) - context.scrollOffsetX;
   return {
     x: sheetAnchoredRectX(logicalX, width, context.canvasWidth, context.rtl),
-    y: context.scrollAreaY + (y1 - scrollOriginY) - context.scrollOffsetY,
+    y: context.scrollAreaY + (sheet.y - scrollOriginY) - context.scrollOffsetY,
     width,
     height,
   };
@@ -152,6 +130,7 @@ function anchoredContextForViewport(
   const frozenW = frozenColBands.reduce((sum, band) => sum + band.size, 0);
   const frozenH = frozenRowBands.reduce((sum, band) => sum + band.size, 0);
   return {
+    worksheet,
     colAxis,
     rowAxis,
     scale,

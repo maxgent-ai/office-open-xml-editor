@@ -233,6 +233,14 @@ describe('DrawingML <a:tbl> — shared interior gridline drawn once (spec-silent
     expect(boundary(120000, 0)).toBeCloseTo(boundary(100000, 8.5), 2);
   });
 
+  it('composes a table background below translucent cell bands', () => {
+    const t = tableOf([[cell({ fill: { fillType: 'solid', color: '4472C466' } })]], [COL]);
+    t.background = { fillType: 'solid', color: '22BBCC' };
+    const { fills } = renderRecording(t);
+    expect(fills.map((f) => f.color)).toEqual([rgba('22BBCC'), 'rgba(68,114,196,0.4)']);
+    expect(fills[0].height).toBe(20);
+  });
+
   it('does not grow an authored row from substituted-font design metrics', () => {
     // ECMA-376 §21.1.2.2.5/.11: 120% line spacing is based on the largest
     // authored natural line box. The terminal 3pt spcAft is suppressed:

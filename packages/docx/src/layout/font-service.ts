@@ -1,7 +1,11 @@
 import { cjkLangFromLanguage, type CjkLang } from '@silurus/ooxml-core';
 import type { LayoutDiagnostic } from './types.js';
 import { stableFingerprint } from './fingerprint.js';
-import { createCanvasFontRoute, type CanvasFontRoute } from '@silurus/ooxml-core';
+import {
+  createCanvasFontRoute,
+  type CanvasFontRoute,
+  type FontSubstituteScript,
+} from '@silurus/ooxml-core';
 
 export type FontResolutionSource = 'embedded' | 'local' | 'css' | 'google' | 'substitute' | 'native' | 'generic';
 export type FontStyle = 'normal' | 'italic';
@@ -13,6 +17,10 @@ export interface FontRequest {
   readonly genericFamily?: 'serif' | 'sans-serif' | 'monospace';
   readonly weight?: number;
   readonly style?: FontStyle;
+  /** Script that the requested text belongs to, when it belongs to one that a
+   * scoped visual substitute covers. A scoped inventory face answers only such
+   * a request; any other request resolves as if that face did not exist. */
+  readonly script?: FontSubstituteScript;
 }
 
 export interface FontResolution {
@@ -31,6 +39,12 @@ export interface FontResolution {
 export interface FontResolver {
   readonly fingerprint: string;
   resolve(request: Readonly<FontRequest>): FontResolution;
+  /** Registry scope used only to delimit the shared run-context proof rule.
+   * It does not authorize changing a scalar's slot or selected face. */
+  configuredSubstituteScript?(requestedFamily: string | null | undefined): FontSubstituteScript | undefined;
+  /** Script of the scoped substitute that actually wins this resource tuple.
+   * Authored embedded/local/installed faces retain §17.3.2.26 scalar slots. */
+  scopedSubstituteScript?(requestedFamily: string | null | undefined, weight?: number, style?: FontStyle): FontSubstituteScript | undefined;
 }
 
 export interface FontInventoryFace {
@@ -40,6 +54,8 @@ export interface FontInventoryFace {
   readonly resourceIdentity?: string;
   readonly weight?: number;
   readonly style?: FontStyle;
+  /** Visual substitute limited to one script (core `substitute-script.ts`). */
+  readonly script?: FontSubstituteScript;
 }
 
 export interface FontResolverOptions {
@@ -47,6 +63,17 @@ export interface FontResolverOptions {
   readonly regionalFamilyLists?: Partial<Record<CjkLang, Readonly<Record<string, string>>>>;
   /** Stable DOCX fallback routes derived from document metadata and rendered faces. */
   readonly nativeFamilyLists?: Readonly<Record<string, string>>;
+  /**
+   * Authored families (normalized) whose web substitute is script-scoped (core
+   * substitute-script.ts), with the substitute families of that script. For a
+   * request not in that script, those families are removed from EVERY route
+   * of the family (explicit, native and regional CSS lists), so Canvas can
+   * never select them for other characters, even as a CSS fallback.
+   */
+  readonly scriptScopedFamilies?: Readonly<Record<string, Readonly<{
+    script: FontSubstituteScript;
+    substituteFamilies: readonly string[];
+  }>>>;
 }
 
 function normalizeFamily(value: string): string {
@@ -129,7 +156,34 @@ export function createFontResolver(
     return (region ? regionalFamilyLists[region]?.[normalizeFamily(family)] : undefined)
       ?? nativeFamilyLists[normalizeFamily(family)];
   };
-  const fingerprint = stableFingerprint('fonts', { faces, nativeFamilyLists, regionalFamilyLists });
+  const scriptScopedFamilies = Object.freeze(Object.fromEntries(
+    Object.entries(options.scriptScopedFamilies ?? {})
+      .map(([family, scope]) => [normalizeFamily(family), Object.freeze({
+        script: scope.script,
+        substituteFamilies: Object.freeze([...scope.substituteFamilies]
+          .map((name) => normalizeFamily(name)).sort()),
+      })] as const)
+      .sort(([a], [b]) => a.localeCompare(b)),
+  ));
+  // Remove a scoped substitute's families from a CSS family list. Names never
+  // contain commas in these generated lists; each entry is a quoted family or
+  // a CSS generic keyword.
+  const withoutScopedSubstitutes = (
+    familyList: string,
+    requestedFamily: string,
+    script: FontSubstituteScript | undefined,
+  ): string => {
+    const scope = scriptScopedFamilies[normalizeFamily(requestedFamily)];
+    if (!scope || scope.script === script) return familyList;
+    return familyList.split(',').map((entry) => entry.trim())
+      .filter((entry) => !scope.substituteFamilies.includes(
+        normalizeFamily(entry.replace(/^"(.*)"$/u, '$1').replaceAll('\\"', '"').replaceAll('\\\\', '\\')),
+      ))
+      .join(', ');
+  };
+  const fingerprint = stableFingerprint('fonts', {
+    faces, nativeFamilyLists, regionalFamilyLists, scriptScopedFamilies,
+  });
 
   // Every shaped script span, line segment and east-Asian line floor asks for a
   // resolution, and each fresh answer carried its own copy of the complete CSS
@@ -143,12 +197,17 @@ export function createFontResolver(
   // The bound only caps pathological documents; a miss recomputes.
   const resolutionMemoLimit = 4096;
   const resolutions = new Map<string, FontResolution>();
+  // One resource selector serves resolution and the scope gate. Inventory
+  // priority, exact tuple matching and script admission cannot diverge.
+  const selectedFace = (family: string, weight: number, style: FontStyle, script?: FontSubstituteScript) =>
+    (byFamily.get(normalizeFamily(family)) ?? []).find((candidate) =>
+      candidate.weight === weight && candidate.style === style
+      && (candidate.script === undefined || candidate.script === script));
   const resolveUncached = (request: Readonly<FontRequest>): FontResolution => {
     const requestedFamily = request.requestedFamily?.trim() || request.genericFamily || 'sans-serif';
     const weight = normalizedWeight(request.weight);
     const style = request.style ?? 'normal';
-    const candidates = byFamily.get(normalizeFamily(requestedFamily)) ?? [];
-    const face = candidates.find((candidate) => candidate.weight === weight && candidate.style === style);
+    const face = selectedFace(requestedFamily, weight, style, request.script);
     if (face) {
       const diagnostics: LayoutDiagnostic[] = face.source === 'substitute'
         ? [{
@@ -164,7 +223,10 @@ export function createFontResolver(
       return freezeResolution({
         requestedFamily,
         resolvedFamily: face.resolvedFamily,
-        route: createCanvasFontRoute(familyList, 'registered'),
+        route: createCanvasFontRoute(
+          withoutScopedSubstitutes(familyList, requestedFamily, request.script),
+          'registered',
+        ),
         source: face.source,
         ...(face.resourceIdentity === undefined ? {} : { resourceIdentity: face.resourceIdentity }),
         weight,
@@ -182,7 +244,10 @@ export function createFontResolver(
       return freezeResolution({
         requestedFamily,
         resolvedFamily: authored,
-        route: createCanvasFontRoute(familyList, 'native'),
+        route: createCanvasFontRoute(
+          withoutScopedSubstitutes(familyList, authored, request.script),
+          'native',
+        ),
         source: 'native',
         weight,
         style,
@@ -207,6 +272,19 @@ export function createFontResolver(
 
   return Object.freeze({
     fingerprint,
+    configuredSubstituteScript(requestedFamily: string | null | undefined): FontSubstituteScript | undefined {
+      return requestedFamily ? scriptScopedFamilies[normalizeFamily(requestedFamily)]?.script : undefined;
+    },
+    scopedSubstituteScript(requestedFamily: string | null | undefined, weight?: number, style?: FontStyle): FontSubstituteScript | undefined {
+      const family = requestedFamily?.trim();
+      if (!family) return undefined;
+      const script = scriptScopedFamilies[normalizeFamily(family)]?.script;
+      if (!script) return undefined;
+      // Same priority and tuple selection as resolveUncached: a configured
+      // substitute is insufficient when an authored resource outranks it.
+      const face = selectedFace(family, normalizedWeight(weight), style ?? 'normal', script);
+      return face?.source === 'substitute' && face.script === script ? script : undefined;
+    },
     resolve(request: Readonly<FontRequest>): FontResolution {
       const key = JSON.stringify([
         request.requestedFamily ?? null,
@@ -215,6 +293,7 @@ export function createFontResolver(
         request.style ?? null,
         request.language ?? null,
         request.cjkFallback ?? null,
+        request.script ?? null,
       ]);
       const retained = resolutions.get(key);
       if (retained) return retained;

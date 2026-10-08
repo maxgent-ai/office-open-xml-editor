@@ -20,7 +20,7 @@
  *   for WordprocessingML, so pptx font bytes are consumed as-is (no XOR).
  *
  * The registration mechanism (build `FontFace` from bytes, add to the set,
- * force `load()`, await `fonts.ready`) mirrors {@link preloadGoogleFonts}: the
+ * await each face's `load()`) mirrors {@link preloadGoogleFonts}: the
  * two loaders share {@link activeFontSet} and the same first-paint determinism
  * contract (fonts must be ready before the caller measures/paints text).
  */
@@ -215,6 +215,9 @@ export async function registerEmbeddedFonts(
     // FontFace.load() is idempotent. Calling it for reused faces also closes the
     // concurrent-holder race: every caller observes the shared face's real load
     // result instead of assuming that the first holder already succeeded.
+    // CSS Font Loading Level 3 §2.2: a successful load makes that face usable.
+    // Do not await FontFaceSet.ready (§3.4), which synchronizes the whole set
+    // and layout; Chromium workers can leave it pending for loaded binary faces.
     const results = await withFontCeiling(
       Promise.allSettled(held.map((font) => Promise.resolve().then(() => font.load()))),
     );
@@ -235,10 +238,6 @@ export async function registerEmbeddedFonts(
           releaseFaces([font]);
         }
       });
-      // Loading the exact faces above is the readiness proof. This extra wait
-      // lets the FontFaceSet settle without making a wedged `ready` promise turn
-      // already-loaded faces back into failures.
-      await withFontCeiling(set.ready);
     }
   }
 

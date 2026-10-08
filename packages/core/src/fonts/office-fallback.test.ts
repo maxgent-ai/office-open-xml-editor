@@ -10,7 +10,12 @@ const originals = Object.fromEntries(
 
 type Face = { family: string; source: string | ArrayBuffer; status: FontFaceLoadStatus };
 
-function fontSet(installed: readonly string[], delayMs = 0, declared: readonly string[] = []) {
+function fontSet(
+  installed: readonly string[],
+  delayMs = 0,
+  declared: readonly string[] = [],
+  stalled: readonly string[] = [],
+) {
   const added: Face[] = [];
   const deleted: Face[] = [];
   let active = 0;
@@ -29,6 +34,11 @@ function fontSet(installed: readonly string[], delayMs = 0, declared: readonly s
     status: FontFaceLoadStatus = 'unloaded';
     constructor(readonly family: string, readonly source: string | ArrayBuffer) {}
     async load(): Promise<this> {
+      const probeSource = this.source;
+      if (typeof probeSource === 'string'
+        && stalled.some((name) => probeSource.includes(`local("${name}")`))) {
+        return new Promise<this>(() => {});
+      }
       active++;
       peak = Math.max(peak, active);
       if (delayMs) await new Promise((resolve) => setTimeout(resolve, delayMs));
@@ -156,6 +166,68 @@ describe('loadOfficeFontFallbacks', () => {
     });
     expect(result.routes['メイリオ'].resourceIdentity).toContain('local("Meiryo")');
     unloadOfficeFontFallbacks(result.faces);
+  });
+
+  it('resolves the Japanese BIZ UD names through the English-named installed faces', async () => {
+    // The macOS asset faces carry only English name records.
+    const { set } = fontSet(['BIZUDMincho-Regular', 'BIZUDGothic-Bold']);
+    const result = await loadOfficeFontFallbacks([
+      { family: 'BIZ UD明朝' }, { family: 'BIZ UDゴシック', weight: 700 },
+    ], set);
+    expect(result.routes['biz ud明朝']).toMatchObject({
+      requestedFamily: 'BIZ UD明朝', source: 'local', weight: 400,
+    });
+    expect(result.routes['biz ud明朝'].resourceIdentity).toContain('local("BIZUDMincho-Regular")');
+    expect(result.routes['biz udゴシック:700:normal'].resourceIdentity)
+      .toContain('local("BIZUDGothic-Bold")');
+    // A family name shared by regular and bold never proves the bold face.
+    expect(result.routes['biz udゴシック:700:normal'].resourceIdentity)
+      .not.toContain('local("BIZ UDゴシック")');
+    unloadOfficeFontFallbacks(result.faces);
+  });
+
+  it('detects an installed catalogued family whatever styles the document uses', async () => {
+    // Only a bold tuple is requested, but the regular face is installed.
+    const { set } = fontSet(['TimesNewRomanPSMT']);
+    const result = await loadOfficeFontFallbacks([
+      { family: 'Times New Roman', weight: 700 },
+      { family: 'Times New Roman', presenceOnly: true },
+    ], set);
+    expect(result.routes['times new roman:700:normal']).toBeUndefined();
+    expect(result.installed).toEqual(['times new roman']);
+  });
+
+  it('returns presence at the deadline, releases completed probes and starts no new probe', async () => {
+    vi.useFakeTimers();
+    const stalled = ['Stall A', 'Stall B', 'Stall C', 'Stall D'];
+    const { set, added, deleted } = fontSet(['Franklin Gothic Book', 'Late Face'], 0, [], stalled);
+    const pending = loadOfficeFontFallbacks(
+      ['Franklin Gothic Book', ...stalled, 'Late Face'].map((family) => ({ family, presenceOnly: true })),
+      set,
+    );
+    await vi.advanceTimersByTimeAsync(8_000);
+    const result = await pending;
+    expect(result.installed).toEqual(['franklin gothic book']);
+    // Four concurrent probes; the completed one left the set immediately and
+    // the queued "Late Face" never started.
+    expect(added).toHaveLength(5);
+    const completed = added.find((face) => String(face.source).includes('Franklin Gothic Book'));
+    expect(deleted).toContain(completed);
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(added).toHaveLength(5);
+    expect(added.filter((face) => !deleted.includes(face))).toHaveLength(0);
+  });
+
+  it('probes uncatalogued installed families by exact name and releases the probe faces', async () => {
+    const { set, added, deleted } = fontSet(['Franklin Gothic Book']);
+    const result = await loadOfficeFontFallbacks([
+      { family: 'Franklin Gothic Book', presenceOnly: true },
+      { family: 'Missing Face', presenceOnly: true },
+    ], set);
+    expect(result.installed).toEqual(['franklin gothic book']);
+    expect(result.routes).toEqual({});
+    // No route is created: every probe face leaves the FontFaceSet again.
+    expect(added.filter((face) => !deleted.includes(face))).toHaveLength(0);
   });
 
   it('bounds independent local probes and cleans up failed faces', async () => {

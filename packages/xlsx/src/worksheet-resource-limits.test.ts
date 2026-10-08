@@ -51,7 +51,7 @@ describe('worksheet retained resource measurements', () => {
             : metric === 'cells'
               ? XLSX_MAX_MATERIALIZED_CELLS + 1
               : XLSX_MAX_MATERIALIZED_OWNED_UTF8_BYTES + 1,
-          configurable: false,
+          configurable: true,
           part: 'worksheet/0',
         });
       }

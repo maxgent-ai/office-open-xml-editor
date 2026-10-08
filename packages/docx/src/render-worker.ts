@@ -38,7 +38,7 @@ import {
 } from '@silurus/ooxml-core/worker';
 import { prepareMathRuns, renderLayoutSourceToCanvas } from './renderer';
 import { createLayoutServices } from './layout-runtime.js';
-import { DOCX_GOOGLE_FONTS, docxFontPreloadNames, docxOfficeFontFallbackRequests } from './google-fonts';
+import { DOCX_GOOGLE_FONTS, docxGoogleFontPlan, docxOfficeFontFallbackRequests } from './google-fonts';
 import { loadEmbeddedFonts } from './embedded-fonts';
 import type {
   RenderWorkerResponse,
@@ -268,29 +268,32 @@ self.onmessage = async (e: MessageEvent<RenderWorkerWireRequest | WorkerSvgDecod
         });
       }
       embeddedFontFaces = embeddedFonts.faces;
-      const officeFonts = await loadOfficeFontFallbacks(docxOfficeFontFallbackRequests(model).filter((request) =>
+      const officeFonts = await loadOfficeFontFallbacks(docxOfficeFontFallbackRequests(model, { useGoogleFonts: req.useGoogleFonts, cjkFallback: req.cjkFallback }).filter((request) =>
         !embeddedFonts.routes.some((route) => route.requestedFamily.toLowerCase() === request.family.toLowerCase()
           && route.weight === (request.weight ?? 400) && route.style === (request.style ?? 'normal'))));
       officeFontFaces = officeFonts.faces;
       let googleFaces: FontFace[] = [];
+      let installedSubstituteFamilies: readonly string[] = [];
       if (req.useGoogleFonts) {
         // Pagination measures text, so each admitted face must be available
         // before canonical layout in both worker and main mode.
-        const names = docxFontPreloadNames(model, req.cjkFallback).filter((name) =>
-          name?.toLowerCase() !== 'calibri' || !officeFonts.routes.calibri);
-        googleFaces = await preloadGoogleFonts(names, DOCX_GOOGLE_FONTS);
+        const plan = docxGoogleFontPlan(model, req.cjkFallback, officeFonts);
+        installedSubstituteFamilies = plan.installedSubstituteFamilies;
+        googleFaces = await preloadGoogleFonts(plan.names, DOCX_GOOGLE_FONTS);
       }
       googleFontFaces = googleFaces;
       const preparedMath = renderers.math && source.mathOccurrences.length > 0
         ? await prepareMathRuns(model, renderers.math)
         : undefined;
       const layoutServices = createLayoutServices(source, {
+        allowFootnoteContinuation: req.allowFootnoteContinuation === true,
         fontMetrics: embeddedFonts.metrics,
         useGoogleFonts: !!req.useGoogleFonts,
         cjkFallback: req.cjkFallback,
         embeddedRoutes: embeddedFonts.routes,
         officeRoutes: Object.values(officeFonts.routes),
         googleFaces,
+        installedSubstituteFamilies,
         mathResources: preparedMath?.records,
         mathDrawables: preparedMath?.drawables,
       });
@@ -318,6 +321,7 @@ self.onmessage = async (e: MessageEvent<RenderWorkerWireRequest | WorkerSvgDecod
       // The guard mirrors main mode's `deferrable`: a fatally-unparseable
       // document is served a synthetic error page by the variant store's
       // builder, and neither previewing nor slicing may route around that.
+      let unchangedPages: number | undefined;
       if (req.progressiveLayout && source.fatalParse === null) {
         // The parsed model is the source of review data, so the first
         // publication carries it: the host has nothing else to answer
@@ -332,7 +336,7 @@ self.onmessage = async (e: MessageEvent<RenderWorkerWireRequest | WorkerSvgDecod
         let lastProgressMs = 0;
         const abort = new AbortController();
         layoutAbort = abort;
-        await paginateRenderWorkerDocumentProgressively(doc, source, {
+        unchangedPages = await paginateRenderWorkerDocumentProgressively(doc, source, {
           publish: (publication) => {
             post({
               type: 'layoutPartial',
@@ -367,7 +371,10 @@ self.onmessage = async (e: MessageEvent<RenderWorkerWireRequest | WorkerSvgDecod
       resourceUsage = decodeOoxmlResourceUsage(
         host.run(() => loadedArchive.resource_usage()),
       );
-      post({ type: 'parsedMeta', id, meta, usage: resourceUsage });
+      post({
+        type: 'parsedMeta', id, meta, usage: resourceUsage,
+        ...(unchangedPages === undefined ? {} : { unchangedPages }),
+      });
       return;
     }
     if (req.type === 'selectLayoutView') {

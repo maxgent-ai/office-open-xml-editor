@@ -25,11 +25,22 @@ export interface LayoutSegSource {
    * objects. Unlike `src.segIndex` (the flattened segment stream), this remains
    * the original paragraph run index through line splitting. */
   sourceRunIndex?: number;
+  /** Original ownership is independent of the canonical text sequence. */
+  sourceTextSequence?: readonly import('./text-sequence.js').TextSequenceSource[];
+  sourceTextOffset?: number;
 }
 
 
 export interface LayoutTextSeg extends LayoutSegSource {
   text: string;
+  /** Authored family and selected source survive local FontFace aliases.
+   * Compatibility metadata may distinguish an installed authored face from a
+   * substitute without inspecting the CSS alias or changing its paint route. */
+  authoredFontFamily?: string | null;
+  fontSource?: import('../layout/font-service.js').FontResolutionSource;
+  /** Existing selected-face reference policy; application-provided SFNT
+   * resources are local inventory entries but are not installed Office faces. */
+  authoredReferenceMetricAllowed?: boolean;
   /** §17.3.2.26 script slot selected by the authoritative shaping service. */
   script?: FontScriptSlot;
   /** Internal §17.6.5 snapToChars allocation retained from measure to paint. */
@@ -60,6 +71,11 @@ export interface LayoutTextSeg extends LayoutSegSource {
   /** Zero-advance anchor-character placeholder: contributes run metrics to the
    * line box but paints no glyph. */
   metricOnly?: true;
+  /** Native reserved-separator participant only (MS-DOC 2.3.3 rule control or
+   * content mark): the bounded selected-face probe whose vertical metrics the
+   * metric-only segment keeps. Never display text, glyph ownership, source
+   * range length or inline width; other metric-only segments omit it. */
+  metricProbeText?: string;
   /** The run participates in Far East line-grid metrics despite containing no
    * East Asian code point. This covers an East-Asian anchor host and the
    * w:useFELayout + rFonts@hint=eastAsia compatibility path. */
@@ -81,6 +97,9 @@ export interface LayoutTextSeg extends LayoutSegSource {
   fontRoute?: CanvasFontRoute;
   /** Selected-route line ratio. It may come from parsed font bytes or a bounded
    * Canvas measurement; the latter does not reveal OpenType table identity. */
+  /** Admitted reference profile has no Far East code-page bits; its Latin
+   * single-line design height owns whole line-grid cells (#1674). */
+  resolvedLatinGridCellAllocation?: boolean;
   resolvedLineHeightRatio?: number;
   /** A selected route supplied this ratio from measured or parsed geometry. */
   resolvedResourceVerticalMetric?: true;
@@ -98,18 +117,33 @@ export interface LayoutTextSeg extends LayoutSegSource {
   /** Retained paint advance is shorter than the natural space by this amount. */
   latinSpaceCompressionPx?: number;
   latinNaturalTrailingSpacePx?: number;
+  /** Selected-face OS/2 xAvgCharWidth / unitsPerEm, set only where
+   * WORD_COMPRESSED_SPACE_LINE_FIT may shrink this segment's U+0020 on a mixed
+   * East Asian / Latin line. Independent of the Latin-only projection. */
+  mixedSpaceAverageWidthRatio?: number;
+  /** Natural advance and count of this segment's shrinkable trailing U+0020
+   * under WORD_COMPRESSED_SPACE_LINE_FIT. */
+  mixedNaturalTrailingSpacePx?: number;
+  mixedNaturalTrailingSpaceCount?: number;
   vertAlign: 'super' | 'sub' | null;
   measuredWidth: number;  // px (set during layout)
   /** A2 text authority captured during segmentation; production text width and
    * metrics are resolved through this same service during line layout. */
   textLayoutService?: TextLayoutService;
   textShapeRequest?: TextShapeRequest;
+  /** Run-context substitute decision, including false for excluded spans;
+   * intrinsic merging must preserve the context for either decision. */
+  substituteScope?: boolean;
   /** Contextually shaped grapheme geometry from the authoritative text service. */
   shapedClusters?: readonly Readonly<{
     range: Readonly<{ start: number; end: number }>;
     offsetPt: number;
     advancePt: number;
   }>[];
+  /** Same-line native boundary advance; also shifts retained glyph origins. */
+  leadingWordBoundaryPx?: number;
+  /** Sparse, contextual U+0020 cluster geometry used only during gap fitting. */
+  shapedSpaceClusters?: LayoutTextSeg['shapedClusters'];
   /** Tight selected-face ink retained by the authoritative shape call that
    * also produced `shapedClusters`. */
   selectedFaceInkBounds?: GlyphInkBounds;
@@ -189,10 +223,10 @@ export interface LayoutTextSeg extends LayoutSegSource {
   /** Parser-independent UTF-16 ranges occupied by authored
    * `<w:noBreakHyphen/>` glyphs. Neither edge is a legal line boundary. */
   noBreakRanges?: readonly Readonly<{ start: number; end: number }>[];
-  /** Registered external-URL syntax breaks, as segment-local UTF-16 offsets. */
-  externalLinkBreakOffsets?: readonly number[];
-  /** This segment starts after a registered external-URL syntax break. */
-  externalLinkBreakBefore?: true;
+  /** Legal ordinary-hyphen and registered URL breaks, as segment-local UTF-16 offsets. */
+  explicitBreaks?: import('./text-break-window.js').TextBreakWindow;
+  /** This source seam follows a legal ordinary-hyphen or URL break. */
+  explicitBreakBefore?: true;
   /** ECMA-376 §17.3.2.34 `<w:snapToGrid>` — false opts this run out of the
    *  section character grid without changing paragraph line-grid policy. */
   snapToCharacterGrid?: boolean;
@@ -255,8 +289,9 @@ export interface LayoutTextSeg extends LayoutSegSource {
   /** ECMA-376 §17.3.2.19 `<w:kern>` — font-kerning threshold in POINTS (smallest
    *  kerned size). Sets `ctx.fontKerning` on measure and paint when the run's
    *  font size ≥ the threshold. Absent at every style level disables kerning
-   *  unless `enableOpenTypeFeatures` explicitly enables it for the
-   *  document; Canvas `auto` is not the WordprocessingML default. */
+   *  regardless of `enableOpenTypeFeatures`. WORD_KERN_THRESHOLD_AUTHORITY
+   *  additionally disables zero in mode 15; unmeasured modes retain the previous
+   *  zero size comparison. Canvas `auto` is not the WordprocessingML default. */
   kerning?: number;
   /** ECMA-376 §17.3.2.10 `<w:eastAsianLayout w:vert>` — horizontal-in-vertical
    *  (縦中横). Set by {@link buildSegments} ONLY when the run declares `w:vert`
@@ -298,10 +333,17 @@ export interface LayoutTabSeg extends LayoutSegSource {
   isTab: true;
   fontSize: number;  // pt — for line-height purposes
   measuredWidth: number;
+  /** Queue-resolved reading-frame gap. The bidi post-pass must preserve the
+   * same gap that ordinary text fitting consumed, including a collapsed
+   * unreachable stop on an empty line. */
+  readingGap?: number;
   /** tab leader to fill the gap (e.g. TOC dot leaders); set during layout. */
   leader?: TabStop['leader'];
   /** Alignment selected from the effective stop during layout. */
   resolvedAlignment?: TabStop['alignment'];
+  /** Set when this aligned tab's cell was admitted past the paragraph's
+   *  trailing indent into the line's exclusion-free margin extension. */
+  marginAllocation?: boolean;
   /** Bold/italic of the run carrying the tab (ECMA-376 §17.3.1.37 — the leader
    *  characters take the formatting of the tab's run, e.g. a bold TOC1 entry's
    *  dot leader is bold). Threaded so {@link drawTabLeader} can match the font. */
@@ -408,6 +450,13 @@ export type LayoutSeg = LayoutTextSeg | LayoutImageSeg | LayoutMathSeg | LayoutL
 
 
 export interface LayoutLine {
+  /** Present (including zero) for the measured proportional gap policy. The
+   * natural advances stay intact; layout applies this slack once to paint. */
+  justifiedCompressionPx?: number;
+  gapPlan?: import('./line-gaps.js').LineGapPlan;
+  /** Pass-local physical identity: gap fragments share it even if vertical
+   * rounding makes distinct physical lines have equal numeric tops. */
+  physicalLineIndex?: number;
   segments: (LayoutTextSeg | LayoutImageSeg | LayoutMathSeg | LayoutTabSeg)[];
   height: number;  // pt — max fontSize on line (for empty-line sizing fallback)
   ascent: number;  // px — fontBoundingBoxAscent (font-metric, stable per font+size)
@@ -422,6 +471,8 @@ export interface LayoutLine {
   intendedSingle: number;
   /** Text-face single line that supplies automatic leading to an inline picture. */
   inlinePictureTextSingle?: number;
+  /** Admitted Latin design height; native fallback boxes do not establish grid cells. */
+  latinGridCountSingle?: number;
   /** Registered compatibility allocation for a uniform positioned, visible run. */
   uniformPositionAuto?: Readonly<{ normalSinglePx: number; positionPx: number; designDescentPx: number }>;
   /** px — DESIGN grid-count height: the max over segments of each run's
@@ -434,8 +485,14 @@ export interface LayoutLine {
   xOffset: number;
   /** Effective available width (px) for this line after float exclusion. */
   availWidth: number;
+  /** Width (px) past `availWidth` up to the text margin that this line's
+   *  margin-allocated tab cell occupies as part of its band. */
+  marginExtension?: number;
   /** When wrap context is active, the absolute canvas Y where this line begins. */
   topY?: number;
+  /** Confirmed fixed-point allocation that owns topY, in the same units as
+   * the wrap context. Never infer ownership from a numeric top alone. */
+  wrapAllocation?: Readonly<{ physicalLineIndex: number; topYPt: number; advancePt: number }>;
   /** Set when at least one segment on this line carries a ruby annotation —
    *  enables docGrid pitch snapping in lineBoxHeight. */
   hasRuby?: boolean;
@@ -460,6 +517,7 @@ export interface LayoutLine {
 
 /** Additional context passed to layoutLines so it can honor floats on the current page. */
 export interface WrapLayoutCtx {
+  hasExclusions?: boolean;
   startPageY: number;   // absolute canvas Y where the first line should start
   paraX: number;        // absolute canvas X of the paragraph's INDENTED text left edge
   /** Absolute canvas X of the paragraph's raw COLUMN left edge. Distinct from
@@ -473,13 +531,13 @@ export interface WrapLayoutCtx {
   /** Minimum clear side-gap for an anchor-host-only paragraph mark. Such a
    *  zero-advance metric placeholder preserves the anchor character's line box,
    *  but is not inline content and therefore keeps the pilcrow-em threshold
-   *  instead of the 1-inch content-line threshold (issue #676). */
+   *  like visible content admitted by its next atom (#1670). */
   paragraphMarkLineStartWidth?: number;
   /** Placement-aware wrap boundary used by paragraph measurement. */
   lineWindow?: (input: {
     topYPt: number;
     minimumStartWidthPt: number;
-    /** `word-square-line-start-one-inch`, active only for a square object. */
+    /** Required atomic start width for a square-constrained gap. */
     squareMinimumStartWidthPt?: number;
     probeHeightPt: number;
     paragraphXPt: number;
@@ -499,10 +557,13 @@ export interface WrapLayoutCtx {
   referenceWidthPt?: number;
   /** Reading order of the first line intersecting a centered `largest` object. */
   readingDirection?: 'ltr' | 'rtl';
-  /** Per-line box-height resolver (line natural ascent+descent → total px box height).
-   *  `gridCountSinglePx` (the line's design grid-count height) keeps the
-   *  float-wrap advance consistent with the final render's docGrid cell count. */
-  lineBoxH: (ascentPx: number, descentPx: number, hasRuby?: boolean, intendedSinglePx?: number, eastAsian?: boolean, gridCountSinglePx?: number, uniformPositionAuto?: LayoutLine['uniformPositionAuto'], inlinePictureTextSingle?: number) => number;
+  /** Paragraph-wide allocation (ruby, spacing, grid and inline objects).
+   * Supplies both float probes and physical-line cursor advancement. */
+  resolveLineAdvances?: (lines: readonly LayoutLine[]) => readonly number[];
+  /** Per-line box-height resolver for isolated line-layout callers. Paragraph
+   * measurement supplies resolveLineAdvances so origins and probes include its
+   * paragraph-wide allocation rather than only this fragment's metrics. */
+  lineBoxH: (ascentPx: number, descentPx: number, hasRuby?: boolean, intendedSinglePx?: number, eastAsian?: boolean, gridCountSinglePx?: number, uniformPositionAuto?: LayoutLine['uniformPositionAuto'], inlinePictureTextSingle?: number, latinGridCountSingle?: number) => number;
   /** Hard cap on Y to keep layout from running past the page. */
   pageH: number;
 }
@@ -571,7 +632,15 @@ export interface LineLayoutEnvironment {
   readonly characterSpacingControl?: string;
   /** §17.15.3.31: use full character width when deciding line fit. */
   readonly lineWrapLikeWord6?: boolean;
-  /** See WORD_OPENTYPE_FEATURES_COMPAT_KERNING for absent `w:kern`. */
+  /** `w:compatSetting` compatibilityMode; absent when not authored. Gates
+   * WORD_COMPRESSED_SPACE_LINE_FIT. */
+  readonly compatibilityMode?: number;
+  /** Paragraph §17.3.1.2-3 automatic East Asian/Latin and East Asian/number
+   * spacing (absent means on). The renderer does not model that spacing;
+   * WORD_COMPRESSED_SPACE_LINE_FIT stays out of a paragraph it applies to. */
+  readonly autoSpaceDE?: boolean;
+  readonly autoSpaceDN?: boolean;
+  /** See WORD_KERN_THRESHOLD_AUTHORITY for absent `w:kern`. */
   readonly enableOpenTypeFeatures?: boolean;
   /** False only when `w:framePr` specifies a drop cap with a fixed `w:lines`;
    * the authored frame height remains authoritative even when glyph paint is

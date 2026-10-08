@@ -36,9 +36,10 @@ export function layoutLines(
   isJustified?: boolean,
   stretchLastLine?: boolean,
   startBoundary?: LineBoundary,
-  widthPolicy?: 'bounded' | 'intrinsic',
+  widthPolicy?: 'bounded' | 'intrinsic' | 'unwrapped',
   verticalGlyphMeasurement?: VerticalGlyphMeasurementService,
   overflowPunct?: boolean,
+  justifiedCompression?: boolean,
 ): LayoutLine[];
 
 export function layoutLines(
@@ -85,11 +86,13 @@ export function layoutLines(
   // kashida modes leave true-last/manual-break lines non-justified.
   stretchLastLine = false,
   startBoundary?: LineBoundary,
-  widthPolicy: 'bounded' | 'intrinsic' = 'bounded',
+  widthPolicy: 'bounded' | 'intrinsic' | 'unwrapped' = 'bounded',
   verticalGlyphMeasurement?: VerticalGlyphMeasurementService,
   overflowPunct = false,
+  justifiedCompression = false,
   passContext?: Readonly<{
     probeHeights: readonly number[] | null;
+    probeFloors?: readonly number[] | null;
     preparedFloatWrap?: PreparedFloatWrap;
   }>,
 ): LayoutLine[] {
@@ -101,6 +104,7 @@ export function layoutLines(
     const runPass = (
       probeHeights: readonly number[] | null,
       preparedFloatWrap?: PreparedFloatWrap,
+      probeFloors: readonly number[] | null = null,
     ): LayoutLine[] => (layoutLines as unknown as (
       ...args: unknown[]
     ) => LayoutLine[])(
@@ -124,14 +128,20 @@ export function layoutLines(
       widthPolicy,
       verticalGlyphMeasurement,
       overflowPunct,
-      { probeHeights, preparedFloatWrap },
+      justifiedCompression,
+      { probeHeights, probeFloors, preparedFloatWrap },
     );
+    // DrawingML wrap=none (§21.1.2.1.1) removes only the automatic break at the
+    // text-body edge; floats of the same story (e.g. a §17.3.1.11 frame host)
+    // still exclude its lines. An unwrapped line with a wrap context therefore
+    // takes the same exclusion fixed point and publishes the same allocation
+    // provenance as a bounded one. Intrinsic measurement has no placement.
     if (!wrapCtx || widthPolicy === 'intrinsic') return runPass(null);
     const preparedFloatWrap = wrapCtx.lineWindow
       ? undefined
       : prepareFloatWrap(wrapCtx.floats);
-    return convergeLineWrap(
-      (probeHeights) => runPass(probeHeights, preparedFloatWrap),
+    const lines = convergeLineWrap(
+      (probeHeights, probeFloors) => runPass(probeHeights, preparedFloatWrap, probeFloors),
       (line) => wrapCtx.lineBoxH(
         line.ascent,
         line.descent,
@@ -141,13 +151,30 @@ export function layoutLines(
         line.gridCountSingle,
         line.uniformPositionAuto,
         line.inlinePictureTextSingle,
+        line.latinGridCountSingle,
       ),
+      wrapCtx.resolveLineAdvances,
     );
+    const advances = wrapCtx.resolveLineAdvances?.(lines);
+    return lines.map((line, index) => ({
+      ...line,
+      // Publish provenance only after exact-state convergence confirms the
+      // same physical partition, probes and tops, never on an exploratory pass.
+      wrapAllocation: Object.freeze({
+        physicalLineIndex: line.physicalLineIndex!,
+        topYPt: line.topY!,
+        advancePt: advances?.[index] ?? wrapCtx.lineBoxH(
+          line.ascent, line.descent, line.hasRuby, line.intendedSingle,
+          line.eastAsian, line.gridCountSingle, line.uniformPositionAuto,
+          line.inlinePictureTextSingle, line.latinGridCountSingle,
+        ),
+      }),
+    }));
   }
   return runLineBreakerPass({
     ctx, segs, maxWidth, firstIndent, scale, tabStops, wrapCtx,
     fontFamilyClasses, tabOriginPx, kinsoku, characterGrid, defaultTabPt,
     marginRightPx, baseRtl, isJustified, stretchLastLine, startBoundary,
-    widthPolicy, verticalGlyphMeasurement, overflowPunct, passContext,
+    widthPolicy, verticalGlyphMeasurement, overflowPunct, justifiedCompression, passContext,
   });
 }

@@ -1,3 +1,4 @@
+import { drawShapeStackedText } from './shape-stacked-text.js';
 import type { CjkLang } from '@silurus/ooxml-core';
 import {
   breakDrawingMlText, drawingMlTextRect, drawingMlLineHeight,
@@ -15,7 +16,7 @@ import type {
   CfRule, CfStop, CfValue, Dxf, Hyperlink, DefinedName,
   Run, GradientFillSpec, ShapeInfo, ShapeAnchor, ImageAnchor, ChartAnchor,
   SlicerItem, SlicerStyle, SlicerElementStyle,
-  PhoneticRun, PhoneticProperties, PhoneticAlignment, Duotone,
+  PhoneticRun, PhoneticProperties, PhoneticAlignment, Duotone, PathInfo,
 } from './types.js';
 import type {
   Stroke,
@@ -23,7 +24,7 @@ import type {
   ChartRegionMapRenderer,
   ChartExRenderer,
 } from '@silurus/ooxml-core';
-import { chartImageFillKey, paintOptionalImagePlaceholder, pathFillModeOverlay, withDrawingMLShapeTransform } from '@silurus/ooxml-core';
+import { usesPathShade, trackPaintPath, currentStrokeBounds, chartImageFillKey, paintOptionalImagePlaceholder, pathFillModeOverlay, withDrawingMLShapeTransform, buildPresetGeometryFillPath } from '@silurus/ooxml-core';
 import { placePhoneticRuns } from './phonetic.js';
 import { crispOffset, renderChart, renderSparkline, renderPresetShape, createAuxCanvas, PT_TO_PX, EMU_PER_PX, mathToMathML, rasterizeMathSvg, tintMathRaster, classifyCjkFont, classifyFontGeneric, googleCjkFontAlias, cjkFallbackChain, NON_CJK_SANS_FALLBACKS, NON_CJK_SERIF_FALLBACKS, isCjkBreakChar, xlsxBorderDashArray, drawImageCropped, hexToRgba, verticalTrLongMark, verticalVertGlyphReachable, applyStroke, resolveFill, type SparklineModel, type MathNode, type MathRenderer, type RasterizedMathSvg } from '@silurus/ooxml-core';
 import { isMacDesktop } from './internal/platform.js';
@@ -46,8 +47,9 @@ import {
 } from './renderer-coordinate-index.js';
 import { GridGeometry, MAX_WORKSHEET_COL } from './internal/grid-geometry.js';
 import type { GridAxisGeometry } from './internal/grid-axis-geometry.js';
-import { usesNativeOneCellExtent } from './internal/cell-anchor-geometry.js';
+import { resolveWorksheetAnchorRect } from './internal/initial-anchor-sizes.js';
 import { isOptionalImageUnavailable } from './internal/optional-image-fallback.js';
+import { getWorksheetPolicy, inheritWorksheetPolicy } from './worksheet-policy-context.js';
 import { rotatedImageBounds } from './internal/image-anchor-transform.js';
 import {
   MDW_FALLBACK,
@@ -1392,6 +1394,31 @@ function drawMultiLineRichText(
   }
 }
 
+/** Invalid date/time display follows Excel's hash fill (issue #1710).
+ * Formatting APIs expose only '#'; painting repeats it in the visible cell
+ * width. Bound the allocation by the target canvas, including huge/offscreen
+ * merges, and keep the marker horizontal even for wrapped/rotated cells.
+ */
+function drawHashFill(
+  ctx: CanvasRenderingContext2D,
+  cx: number, cy: number, cellW: number, cellH: number,
+  alignV: string,
+): void {
+  const padding = 3;
+  const left = Math.max(0, cx) + padding;
+  const available = Math.min(cx + cellW, ctx.canvas.width) - padding - left;
+  if (available <= 0) return;
+  const hashWidth = ctx.measureText('#').width;
+  const count = hashWidth > 0 ? Math.max(1, Math.floor(available / hashWidth)) : 1;
+  ctx.textAlign = 'left';
+  const { baseline, textY } = singleLineVerticalAnchor({
+    alignH: 'left', alignV, cx, cy, cellW, cellH,
+    leftPad: padding, paddingX: padding, paddingY: 2,
+  });
+  ctx.textBaseline = baseline;
+  ctx.fillText('#'.repeat(count), left, textY);
+}
+
 /**
  * Draw rich text (mixed-font runs, ECMA-376 §18.4.4 r) in a NON-wrapped cell.
  * A break-free value is one alignV-anchored line ({@link drawSingleLineRichText});
@@ -1707,6 +1734,7 @@ export interface TableCellStyle {
 export function buildTableStyleMap(worksheet: Worksheet): Map<string, TableCellStyle> {
   const map = new Map<string, TableCellStyle>();
   const identity = coordinateIndexIdentity(
+    worksheet,
     'worksheet-table-style-index',
     'expand-styled-table-coordinates',
   );
@@ -1830,6 +1858,7 @@ export function tableOverlayBorder(
 function buildSparklineMap(worksheet: Worksheet): Map<string, SparklineModel> {
   const map = new Map<string, SparklineModel>();
   const identity = coordinateIndexIdentity(
+    worksheet,
     'worksheet-sparkline-index',
     'index-sparkline-coordinates',
   );
@@ -2075,6 +2104,12 @@ function renderQuadrant(
     ctx.beginPath();
     ctx.rect(aCx, aCy, cW, cH);
     ctx.clip();
+
+    if (formatted.fill) {
+      drawHashFill(ctx, aCx, aCy, cW, cH, alignV);
+      ctx.restore();
+      continue;
+    }
 
     let textX: number;
     if (alignH === 'right') { textX = aCx + cW - paddingX; ctx.textAlign = 'right'; }
@@ -2706,6 +2741,12 @@ function renderQuadrant(
       ctx.rect(drawX, cy, drawW, cellH);
       ctx.clip();
 
+      if (formatted.fill) {
+        drawHashFill(ctx, cx, cy, cellW, cellH, alignV);
+        ctx.restore();
+        return;
+      }
+
       // Stacked text (textRotation=255): draw each character on its own line
       if (isStacked) {
         const charH = vMetricPx(font.size, cs, 1.1);
@@ -2968,6 +3009,8 @@ function renderQuadrant(
  *  cell-Map rebuild and a conditional-formatting recompile per frame. */
 interface SheetRenderCache {
   rowCount: number;
+  /** Bound per-index entry limit these indexes were built under. */
+  coordinateIndexLimit: number;
   cellMap: Map<string, Cell>;
   nonEmptyColsByRow: Map<number, readonly number[]>;
   cfContext: CfContext;
@@ -2989,17 +3032,34 @@ export function invalidateSheetRenderCache(worksheet: Worksheet): void {
 }
 
 function coordinateIndexIdentity(
+  worksheet: Worksheet,
   resource: string,
   operation: string,
 ): CoordinateIndexIdentity {
-  return { resource, operation };
+  return {
+    resource,
+    operation,
+    limit: getWorksheetPolicy(worksheet).maxCoordinateIndexEntries,
+  };
 }
 
 export function getSheetRenderCache(worksheet: Worksheet): SheetRenderCache {
+  const coordinateIndexLimit = getWorksheetPolicy(worksheet).maxCoordinateIndexEntries;
   const cached = sheetRenderCache.get(worksheet);
-  if (cached && cached.rowCount === worksheet.rows.length) return cached;
+  if (
+    cached &&
+    cached.rowCount === worksheet.rows.length &&
+    cached.coordinateIndexLimit === coordinateIndexLimit
+  ) {
+    return cached;
+  }
+  if (cached) sheetRenderCache.delete(worksheet);
 
-  const cellIdentity = coordinateIndexIdentity('worksheet-cell-index', 'index-worksheet-cells');
+  const cellIdentity = coordinateIndexIdentity(
+    worksheet,
+    'worksheet-cell-index',
+    'index-worksheet-cells',
+  );
   const cellMap = buildCellCoordinateIndex(worksheet.rows, cellIdentity);
   const nonEmptyColsByRow = new Map<number, readonly number[]>();
   for (const row of worksheet.rows) {
@@ -3015,10 +3075,12 @@ export function getSheetRenderCache(worksheet: Worksheet): SheetRenderCache {
   const mergeSkipSet = new Set<string>();
   const mergeAnchorSet = new Set<string>();
   const mergeAnchorIdentity = coordinateIndexIdentity(
+    worksheet,
     'worksheet-merge-anchor-index',
     'index-merge-anchor-coordinates',
   );
   const mergeIdentity = coordinateIndexIdentity(
+    worksheet,
     'worksheet-merge-skip-index',
     'expand-merged-cell-coordinates',
   );
@@ -3037,6 +3099,7 @@ export function getSheetRenderCache(worksheet: Worksheet): SheetRenderCache {
   if (worksheet.autoFilter) {
     const af = worksheet.autoFilter;
     const filterIdentity = coordinateIndexIdentity(
+      worksheet,
       'worksheet-auto-filter-index',
       'expand-auto-filter-coordinates',
     );
@@ -3051,6 +3114,7 @@ export function getSheetRenderCache(worksheet: Worksheet): SheetRenderCache {
 
   const hyperlinkMap = new Map<string, string>();
   const hyperlinkIdentity = coordinateIndexIdentity(
+    worksheet,
     'worksheet-hyperlink-index',
     'index-hyperlink-coordinates',
   );
@@ -3060,6 +3124,7 @@ export function getSheetRenderCache(worksheet: Worksheet): SheetRenderCache {
 
   const commentCells = new Set<string>();
   const commentIdentity = coordinateIndexIdentity(
+    worksheet,
     'worksheet-comment-index',
     'index-comment-coordinates',
   );
@@ -3070,6 +3135,7 @@ export function getSheetRenderCache(worksheet: Worksheet): SheetRenderCache {
 
   const entry: SheetRenderCache = {
     rowCount: worksheet.rows.length,
+    coordinateIndexLimit,
     cellMap,
     nonEmptyColsByRow,
     cfContext: compileCf(worksheet, cellMap),
@@ -3697,6 +3763,7 @@ function virtualizedTextOverflowOverscan(
  * The projection may differ only in row/column sizing and outline flags; cells,
  * merges, formatting, tables, links, comments, and sparklines remain source-owned. */
 export function inheritSheetRenderCache(source: Worksheet, projection: Worksheet): void {
+  inheritWorksheetPolicy(source, projection);
   sheetRenderCache.set(projection, getSheetRenderCache(source));
 }
 
@@ -3789,6 +3856,7 @@ export function renderViewport(
   // Merge anchor sizes are cellScale-scaled, so they stay per-frame.
   const mergeAnchorMap = new Map<string, { totalW: number; totalH: number; right: number; bottom: number }>();
   const mergeAnchorIdentity = coordinateIndexIdentity(
+    worksheet,
     'worksheet-merge-anchor-index',
     'index-merge-anchor-coordinates',
   );
@@ -4338,36 +4406,13 @@ function renderImages(
     const tiffUnavailable = isOptionalImageUnavailable(loadedImages, lookupKey, 'tiff');
     if (!img && !tiffUnavailable) continue;
 
-    // xdr col/row are 0-indexed; our widths map is 1-indexed.
-    const fromCol1 = anchor.fromCol + 1;
-    const fromRow1 = anchor.fromRow + 1;
-
-    // Image sheet-space top-left (always derived from the `from` anchor)
-    const imgSheetX1 = sheetXForCol(colAxis, fromCol1) + (anchor.fromColOff * cs) / EMU_PER_PX;
-    const imgSheetY1 = sheetYForRow(rowAxis, fromRow1) + (anchor.fromRowOff * cs) / EMU_PER_PX;
-
-    // ECMA-376 §20.5.2.33 + "Move but don't size with cells": when the
-    // anchor was saved with editAs="oneCell" Excel preserves the picture's
-    // saved EMU size (<xdr:spPr><a:xfrm><a:ext>) regardless of cell
-    // resizing, and the to anchor is only updated to track that fixed size.
-    // Use the native ext directly so the rendered image matches Excel even
-    // when our column-width / row-height computation diverges slightly from
-    // Excel's (e.g. row ht is stored as px in this viewer but Excel applies
-    // pt→px for some files). Falls back to the from/to-derived rect for
-    // editAs="twoCell" (default, image resizes with cells) and absolute
-    // anchors, or when the parser couldn't capture the native ext.
-    let imgW: number, imgH: number;
-    if (usesNativeOneCellExtent(anchor)) {
-      imgW = (anchor.nativeExtCx * cs) / EMU_PER_PX;
-      imgH = (anchor.nativeExtCy * cs) / EMU_PER_PX;
-    } else {
-      const toCol1 = anchor.toCol + 1;
-      const toRow1 = anchor.toRow + 1;
-      const imgSheetX2 = sheetXForCol(colAxis, toCol1) + (anchor.toColOff * cs) / EMU_PER_PX;
-      const imgSheetY2 = sheetYForRow(rowAxis, toRow1) + (anchor.toRowOff * cs) / EMU_PER_PX;
-      imgW = imgSheetX2 - imgSheetX1;
-      imgH = imgSheetY2 - imgSheetY1;
-    }
+    // One resolver owns the display rectangle for paint, hit-testing and
+    // culling/decode. The normative anchor facts and the library policies
+    // (tagged initial rect, untagged compatibility) are documented in
+    // internal/cell-anchor-geometry.ts.
+    const {
+      x: imgSheetX1, y: imgSheetY1, width: imgW, height: imgH,
+    } = resolveWorksheetAnchorRect(ws, anchor, colAxis, rowAxis, cs);
     if (imgW <= 0 || imgH <= 0) continue;
 
     // Translate to canvas coordinates of the scrollable viewport
@@ -4461,27 +4506,11 @@ function renderShapeGroups(
   ctx.clip();
 
   for (const anchor of anchors) {
-    const fromCol1 = anchor.fromCol + 1;
-    const fromRow1 = anchor.fromRow + 1;
-
-    const x1 = sheetXForCol(colAxis, fromCol1) + (anchor.fromColOff * cs) / EMU_PER_PX;
-    const y1 = sheetYForRow(rowAxis, fromRow1) + (anchor.fromRowOff * cs) / EMU_PER_PX;
-
-    // editAs="oneCell" preserves the group's saved grpSpPr/xfrm/ext EMU
-    // size regardless of cell resizing (ECMA-376 §20.5.2.33). See
-    // renderImages for the same handling on stand-alone <xdr:pic>.
-    let w: number, h: number;
-    if (usesNativeOneCellExtent(anchor)) {
-      w = (anchor.nativeExtCx * cs) / EMU_PER_PX;
-      h = (anchor.nativeExtCy * cs) / EMU_PER_PX;
-    } else {
-      const toCol1 = anchor.toCol + 1;
-      const toRow1 = anchor.toRow + 1;
-      const x2 = sheetXForCol(colAxis, toCol1) + (anchor.toColOff * cs) / EMU_PER_PX;
-      const y2 = sheetYForRow(rowAxis, toRow1) + (anchor.toRowOff * cs) / EMU_PER_PX;
-      w = x2 - x1;
-      h = y2 - y1;
-    }
+    // Same resolver as renderImages. Normalized child transforms below are
+    // raw and only scale into this rectangle.
+    const { x: x1, y: y1, width: w, height: h } = resolveWorksheetAnchorRect(
+      ws, anchor, colAxis, rowAxis, cs,
+    );
     if (w <= 0 || h <= 0) continue;
 
     const logicalCanvasX = scrollAreaX + (x1 - scrollOriginSheetX) - scrollOffsetX;
@@ -4504,6 +4533,86 @@ function renderShapeGroups(
   ctx.restore();
 }
 
+// XLSX custom coordinates remain path-local until this format boundary.
+// Both ordinary painting and gradient outlines use the same arc/Bezier rules.
+function appendSpreadsheetCustomPath(
+  ctx: CanvasRenderingContext2D, path: PathInfo,
+  x: number, y: number, w: number, h: number,
+): void {
+  if (path.w <= 0 || path.h <= 0) return;
+  const kx = w / path.w;
+  const ky = h / path.h;
+  // Track pen position for arcTo center computation.
+  let penX = x, penY = y;
+  // Track subpath start for close lineTo.
+  let subX = x, subY = y;
+  for (const cmd of path.commands) {
+    switch (cmd.op) {
+      case 'moveTo': {
+        const px = x + cmd.x * kx, py = y + cmd.y * ky;
+        ctx.moveTo(px, py);
+        penX = subX = px; penY = subY = py;
+        break;
+      }
+      case 'lineTo': {
+        const px = x + cmd.x * kx, py = y + cmd.y * ky;
+        ctx.lineTo(px, py);
+        penX = px; penY = py;
+        break;
+      }
+      case 'cubicBezTo': {
+        const ex = x + cmd.x3 * kx, ey = y + cmd.y3 * ky;
+        ctx.bezierCurveTo(
+          x + cmd.x1 * kx, y + cmd.y1 * ky,
+          x + cmd.x2 * kx, y + cmd.y2 * ky,
+          ex, ey,
+        );
+        penX = ex; penY = ey;
+        break;
+      }
+      case 'quadBezTo': {
+        const ex = x + cmd.x2 * kx, ey = y + cmd.y2 * ky;
+        ctx.quadraticCurveTo(x + cmd.x1 * kx, y + cmd.y1 * ky, ex, ey);
+        penX = ex; penY = ey;
+        break;
+      }
+      case 'arcTo': {
+        // ECMA-376 §20.1.9.3: pen lies on ellipse at stAng;
+        // derive center from pen + stAng, then sweep swAng.
+        const rx = cmd.wr * kx, ry = cmd.hr * ky;
+        if (rx <= 0 || ry <= 0) break;
+        const stRad = (cmd.stAng / 60000) * (Math.PI / 180);
+        const swRad = (cmd.swAng / 60000) * (Math.PI / 180);
+        const cx = penX - Math.cos(stRad) * rx;
+        const cy = penY - Math.sin(stRad) * ry;
+        const endRad = stRad + swRad;
+        ctx.ellipse(cx, cy, rx, ry, 0, stRad, endRad, swRad < 0);
+        penX = cx + Math.cos(endRad) * rx;
+        penY = cy + Math.sin(endRad) * ry;
+        break;
+      }
+      case 'close':
+        ctx.closePath();
+        penX = subX; penY = subY;
+        break;
+    }
+  }
+}
+
+function appendSpreadsheetShapeOutline(
+  ctx: CanvasRenderingContext2D, shape: ShapeInfo,
+  x: number, y: number, w: number, h: number,
+): void {
+  if (shape.geom.type === 'custom') {
+    for (const path of shape.geom.paths) {
+      if (path.fill !== 'none') appendSpreadsheetCustomPath(ctx, path, x, y, w, h);
+    }
+  } else if (shape.geom.type !== 'preset'
+    || !buildPresetGeometryFillPath(ctx, shape.geom.name, x, y, w, h, shape.geom.adj ?? [])) {
+    ctx.rect(x, y, w, h);
+  }
+}
+
 function drawShape(
   ctx: CanvasRenderingContext2D,
   shape: ShapeInfo,
@@ -4512,6 +4621,7 @@ function drawShape(
   loadedImages?: Map<string, CanvasImageSource | null>,
   cjkFallback?: CjkLang,
 ): void {
+  if (usesPathShade(shape.strokeFill)) ctx = trackPaintPath(ctx);
   ctx.save();
   if (shape.rot !== 0 || shape.flipH || shape.flipV) {
     ctx.translate(sx + sw / 2, sy + sh / 2);
@@ -4523,71 +4633,16 @@ function drawShape(
   }
 
   if (shape.geom.type === 'custom') {
+    const fill = resolveSpreadsheetShapeFill(ctx, shape, sw, sh, cs);
     for (const path of shape.geom.paths) {
       if (path.w <= 0 || path.h <= 0) continue;
-      const kx = sw / path.w;
-      const ky = sh / path.h;
       ctx.beginPath();
-      // Track pen position for arcTo center computation.
-      let penX = 0, penY = 0;
-      // Track subpath start for close lineTo.
-      let subX = 0, subY = 0;
-      for (const cmd of path.commands) {
-        switch (cmd.op) {
-          case 'moveTo': {
-            const px = cmd.x * kx, py = cmd.y * ky;
-            ctx.moveTo(px, py);
-            penX = subX = px; penY = subY = py;
-            break;
-          }
-          case 'lineTo': {
-            const px = cmd.x * kx, py = cmd.y * ky;
-            ctx.lineTo(px, py);
-            penX = px; penY = py;
-            break;
-          }
-          case 'cubicBezTo': {
-            const ex = cmd.x3 * kx, ey = cmd.y3 * ky;
-            ctx.bezierCurveTo(
-              cmd.x1 * kx, cmd.y1 * ky,
-              cmd.x2 * kx, cmd.y2 * ky,
-              ex, ey,
-            );
-            penX = ex; penY = ey;
-            break;
-          }
-          case 'quadBezTo': {
-            const ex = cmd.x2 * kx, ey = cmd.y2 * ky;
-            ctx.quadraticCurveTo(cmd.x1 * kx, cmd.y1 * ky, ex, ey);
-            penX = ex; penY = ey;
-            break;
-          }
-          case 'arcTo': {
-            // ECMA-376 §20.1.9.3: pen lies on ellipse at stAng;
-            // derive center from pen + stAng, then sweep swAng.
-            const rx = cmd.wr * kx, ry = cmd.hr * ky;
-            if (rx <= 0 || ry <= 0) break;
-            const stRad = (cmd.stAng / 60000) * (Math.PI / 180);
-            const swRad = (cmd.swAng / 60000) * (Math.PI / 180);
-            const cx = penX - Math.cos(stRad) * rx;
-            const cy = penY - Math.sin(stRad) * ry;
-            const endRad = stRad + swRad;
-            ctx.ellipse(cx, cy, rx, ry, 0, stRad, endRad, swRad < 0);
-            penX = cx + Math.cos(endRad) * rx;
-            penY = cy + Math.sin(endRad) * ry;
-            break;
-          }
-          case 'close':
-            ctx.closePath();
-            penX = subX; penY = subY;
-            break;
-        }
-      }
+      appendSpreadsheetCustomPath(ctx, path, 0, 0, sw, sh);
       // ECMA-376 §20.1.9.15: each custom path carries its own fill mode and
       // stroke flag. `fill="none"` leaves the path unfilled and `stroke="0"`
       // unstroked. The lighten/darken modes shade the fill by the amounts
       // measured from PowerPoint's output (shared with the preset engine).
-      if (path.fill !== 'none' && fillShape(ctx, shape, sw, sh, cs)) {
+      if (path.fill !== 'none' && fillShape(ctx, shape, sw, sh, cs, fill)) {
         const overlay = pathFillModeOverlay(path.fill);
         if (overlay) {
           ctx.fillStyle = overlay;
@@ -4603,19 +4658,7 @@ function drawShape(
     // renders with its true outline instead of the old rect fallback. The
     // engine returns false for presets it doesn't carry; only then do we fall
     // back to a plain rectangle.
-    const baseFill = resolveFill(
-      shape.fill ?? (shape.fillColor
-        ? { fillType: 'solid' as const, color: shape.fillColor }
-        : null),
-      ctx,
-      0,
-      0,
-      sw,
-      sh,
-      shape.rot,
-      PT_TO_PX * cs,
-      axisAlignedPatternTransform(shape, sw, sh),
-    );
+    const baseFill = resolveSpreadsheetShapeFill(ctx, shape, sw, sh, cs);
     const applyAndStroke = shape.strokeColor && shape.strokeWidth > 0
       ? () => strokeShapePath(ctx, shape, sw, sh, cs)
       : null;
@@ -4675,7 +4718,21 @@ function drawShape(
   // Shape text body (ECMA-376 §20.5.2.34 `<xdr:txBody>`). Drawn after
   // fill/stroke so it sits on top of the shape's background.
   if (shape.text) {
-    drawShapeText(ctx, shape.text, sw, sh, cs, cjkFallback);
+    const stacked = shape.text.vert === 'wordArtVert' || shape.text.vert === 'wordArtVertRtl';
+    if (stacked && (shape.flipH || shape.flipV)) {
+      // Issue #1668 Excel controls: WordArt stays readable under flipH;
+      // flipV turns its unmirrored frame 180 degrees. Cancel the shape mirror
+      // first, keeping the authored rotation and physical text insets.
+      ctx.save();
+      ctx.translate(sw / 2, sh / 2);
+      ctx.scale(shape.flipH ? -1 : 1, shape.flipV ? -1 : 1);
+      if (shape.flipV) ctx.rotate(Math.PI);
+      ctx.translate(-sw / 2, -sh / 2);
+      drawShapeText(ctx, shape.text, sw, sh, cs, cjkFallback);
+      ctx.restore();
+    } else {
+      drawShapeText(ctx, shape.text, sw, sh, cs, cjkFallback);
+    }
   }
   ctx.restore();
 }
@@ -4806,6 +4863,41 @@ export function drawShapeText(
   const innerH = rect.height;
   if (innerW <= 0 || innerH <= 0) return;
 
+  // Font string + px size for a text run (math runs have no run-level font).
+  const textFont = (run: Extract<import('./types.js').ShapeTextRun, { type: 'text' }>, fontScale = 1): { font: string; px: number } => {
+    const size = run.size > 0 ? run.size : DEFAULT_FONT_SIZE;
+    const px = size * PT_TO_PX * cs * fontScale;
+    const family = fontStackFor(run.fontFace, cjkFallback, run.text,
+      officeRoute(ctx, run.fontFace, run.bold, run.italic),
+      googleSubstitutesByContext.get(ctx) === true,
+      undefined, contextRegularAlias(ctx, run.fontFace));
+    return { font: `${run.italic ? 'italic ' : ''}${run.bold ? 'bold ' : ''}${px}px ${family}`, px };
+  };
+
+  if (txt.vert === 'wordArtVert' || txt.vert === 'wordArtVertRtl') {
+    // ECMA-376 §21.1.2.1.3: scale each run's original font size before
+    // measuring its stacked cell. An omitted scale means 100%.
+    const fontScale = txt.autoFit === 'norm' ? txt.fontScale ?? 1 : 1;
+    if (fontScale === 0) return; // A zero font scale has no glyph ink.
+    drawShapeStackedText(ctx, txt, txt.vert, rect, PT_TO_PX * cs, (run, text) => {
+      const face = isCjkBreakChar(text.codePointAt(0) ?? 0)
+        ? run.fontFaceEa ?? run.fontFace : run.fontFace;
+      return { ...textFont({ ...run, text, fontFace: face }, fontScale), face };
+    }, (run, precedingSizePt) => {
+      const render = mathRenders.get(run.nodes);
+      // Match horizontal input: optional/failed equations contribute neither
+      // ink nor a display break; preparation deliberately leaves them uncached.
+      if (!render) return undefined;
+      const pxSize = (run.fontSize ?? precedingSizePt) * PT_TO_PX * cs * fontScale;
+      const width = render.widthEm * pxSize;
+      const height = (render.ascentEm + render.descentEm) * pxSize;
+      return { width, height, draw: (x, y) => {
+        if (width > 0 && height > 0) ctx.drawImage(tintedMathImage(render, run.color ?? '#000000'), x, y, width, height);
+      } };
+    });
+    return;
+  }
+
   // Excel's natural line box follows each run's font metrics (see
   // excelDrawingMlLineRatios): Arial 1.150 em, Calibri 1.221 em, Meiryo
   // 1.95 em, and so on, instead of a flat 1.2 em. A name alone cannot identify
@@ -4844,17 +4936,6 @@ export function drawShapeText(
   type Line = {
     segs: Seg[]; align: string; height: number; ascent: number; hasMath: boolean;
     leftInset: number; availW: number; gapBefore: number;
-  };
-
-  // Font string + px size for a text run (math runs have no run-level font).
-  const textFont = (run: Extract<import('./types.js').ShapeTextRun, { type: 'text' }>): { font: string; px: number } => {
-    const size = run.size > 0 ? run.size : DEFAULT_FONT_SIZE;
-    const px = size * PT_TO_PX * cs;
-    const family = fontStackFor(run.fontFace, cjkFallback, run.text,
-      officeRoute(ctx, run.fontFace, run.bold, run.italic),
-      googleSubstitutesByContext.get(ctx) === true,
-      undefined, contextRegularAlias(ctx, run.fontFace));
-    return { font: `${run.italic ? 'italic ' : ''}${run.bold ? 'bold ' : ''}${px}px ${family}`, px };
   };
 
   // Real font ascent for a line's alphabetic baseline (used on lines that mix
@@ -5239,14 +5320,14 @@ function axisAlignedPatternTransform(
   return { a, b, c, d, e: cx - a * cx - c * cy, f: cy - b * cx - d * cy };
 }
 
-/** Fill the current path with the shape fill; returns whether it painted. */
-function fillShape(
+/** Resolve once per shape, including all fill-bearing custom subpaths. */
+function resolveSpreadsheetShapeFill(
   ctx: CanvasRenderingContext2D,
   shape: ShapeInfo,
   width: number,
   height: number,
   cs: number,
-): boolean {
+): ReturnType<typeof resolveFill> {
   const fill = shape.fill ?? (shape.fillColor
     ? { fillType: 'solid' as const, color: shape.fillColor }
     : null);
@@ -5256,10 +5337,19 @@ function fillShape(
   // print-page origin, so its phase is anchored to this local shape frame.
   // One point is 4/3 CSS pixels at native zoom; cellScale changes the sheet
   // coordinate system without an additional canvas scale for shape painting.
-  const paint = resolveFill(
+  return resolveFill(
     fill, ctx, 0, 0, width, height, shape.rot, PT_TO_PX * cs,
     axisAlignedPatternTransform(shape, width, height),
+    (target, x, y, w, h) => appendSpreadsheetShapeOutline(target, shape, x, y, w, h),
   );
+}
+
+/** Fill the current path; reuse one raster across a custom shape's subpaths. */
+function fillShape(
+  ctx: CanvasRenderingContext2D, shape: ShapeInfo,
+  width: number, height: number, cs: number,
+  paint = resolveSpreadsheetShapeFill(ctx, shape, width, height, cs),
+): boolean {
   if (!paint) return false;
   ctx.fillStyle = paint;
   ctx.fill();
@@ -5294,10 +5384,15 @@ function strokeShapePath(
   const stroke = shapeStroke(shape);
   if (!stroke) return;
   applyStroke(ctx, stroke, 1 / EMU_PER_PX);
+  // Match DOCX/PPTX stroke hosts: use the authored box, not the fill-bearing
+  // silhouette (which excludes decorative paths that may still be stroked).
+  // Shade coordinates use that host box; raster coverage comes from the
+  // recorded stroke path, including its actual transformed caps and joins.
   if (stroke.fill) {
     const paint = resolveFill(
       stroke.fill, ctx, 0, 0, width, height, shape.rot, PT_TO_PX * cs,
       axisAlignedPatternTransform(shape, width, height),
+      undefined, currentStrokeBounds(ctx),
     );
     if (paint) ctx.strokeStyle = paint;
   }

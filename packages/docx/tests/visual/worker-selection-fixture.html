@@ -28,16 +28,6 @@
     // OffscreenCanvas cannot spuriously fail an exact-equality assertion. The
     // run GEOMETRY is computed identically in both modes (same renderer), so the
     // rounded boxes must match exactly.
-    const layersOf = (host) => {
-      const wrapper = host.querySelector('div'); // the viewer's positioned wrapper
-      // Exclude the viewer's page-loading status layer (role="status"): it is
-      // not an overlay and sits after the highlight layer in the wrapper.
-      return wrapper
-        ? [...wrapper.children].filter(
-            (c) => c.tagName === 'DIV' && c.getAttribute('role') !== 'status',
-          )
-        : [];
-    };
     // Read RESOLVED pixel geometry (getBoundingClientRect), relative to the
     // wrapper's top-left, rather than parsing the inline `style.left` string.
     // The overlay coordinates are CSS PERCENTAGES (so the overlay tracks a canvas
@@ -45,10 +35,9 @@
     // follow the zoom if read verbatim. The laid-out px position DOES follow the
     // zoom (page geometry px = pt × scale), which is what this spec asserts, and
     // is identical whether the CSS is px or %.
-    const wrapperRect = (host) => host.querySelector('div').getBoundingClientRect();
-    // Overlay order: [textLayer, highlightLayer].
+    const wrapperRect = (host) => host.querySelector('canvas').parentElement.getBoundingClientRect();
     const serializeOverlay = (host) => {
-      const layer = layersOf(host)[0];
+      const layer = host.querySelector('[data-overlay="text"]');
       const spans = layer ? [...layer.querySelectorAll('span')] : [];
       const wr = wrapperRect(host);
       return spans.map((s) => {
@@ -60,11 +49,10 @@
         };
       });
     };
-    // IX2 highlight boxes (absolutely positioned divs in the LAST layer). Read
+    // IX2 highlight boxes (absolutely positioned divs in the highlight layer). Read
     // resolved px relative to the wrapper.
     const serializeHighlights = (host) => {
-      const layers = layersOf(host);
-      const layer = layers[layers.length - 1];
+      const layer = host.querySelector('[data-overlay="highlight"]');
       const boxes = layer ? [...layer.children] : [];
       const wr = wrapperRect(host);
       return boxes.map((b) => {
@@ -96,6 +84,7 @@
         mode,
         width,
         enableTextSelection: true,
+        enableElementSelection: true,
         useGoogleFonts: true,
       });
       await viewer.load(buf);

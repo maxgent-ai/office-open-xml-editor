@@ -35,3 +35,16 @@ test('the CLI checks the reviewed await baseline without Git history', () => {
   assert.equal(result.status, 0, result.stdout + result.stderr);
   assert.match(result.stdout, /XLSX render worker keeps construction and parse/);
 });
+
+test('PPTX retains the same opt-in font barrier when its owner becomes a lease', () => {
+  const file = 'packages/pptx/src/presentation.ts';
+  const previous = ['parse', 'preloadGoogleFonts'];
+  const changed = 'async function load() { await parse(); if (mode === "main" && opts.useGoogleFonts && ready) await pres._ensureGoogleFonts(names); }';
+  assert.equal(auditAwaitCase(file, 'load', previous, changed), 2);
+  const unguarded = 'async function load() { await parse(); await pres._ensureGoogleFonts(names); }';
+  assert.throws(() => auditAwaitCase(file, 'load', previous, unguarded), /OOXML awaits changed/);
+  const extra = 'async function load() { await parse(); if (opts.useGoogleFonts) { await pres._ensureGoogleFonts(names); await helper(); } }';
+  assert.throws(() => auditAwaitCase(file, 'load', previous, extra), /OOXML awaits changed/);
+  const optional = 'async function load() { await parse(); if (mode === "main" || opts.useGoogleFonts) await pres._ensureGoogleFonts(names); }';
+  assert.throws(() => auditAwaitCase(file, 'load', previous, optional), /OOXML awaits changed/);
+});

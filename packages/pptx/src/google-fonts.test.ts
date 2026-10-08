@@ -84,10 +84,15 @@ const PPTX_GOOGLE_FONTS_OLD: Record<string, FontPreloadEntry> = {
 };
 
 describe('PPTX_GOOGLE_FONTS — shared registry consolidation (oracle)', () => {
-  it('preserves valid pre-consolidation entries byte-for-byte', () => {
+  it('preserves valid loading entries with explicit Arabic scope metadata', () => {
     for (const [key, entry] of Object.entries(PPTX_GOOGLE_FONTS_OLD)) {
       if (key === 'calibri light' || key === 'cambria math') continue;
-      expect(PPTX_GOOGLE_FONTS[key], `entry "${key}"`).toEqual(entry);
+      // Loading entries remain the frozen oracle; only these five authored
+      // visual alternatives carry the explicitly expected Arabic scope tag.
+      const scoped = new Set(['sakkal majalla', 'traditional arabic', 'simplified arabic',
+        'arabic typesetting', 'univers next arabic']);
+      expect(PPTX_GOOGLE_FONTS[key], `entry "${key}"`)
+        .toEqual(scoped.has(key) ? { ...entry, script: 'arabic' } : entry);
     }
     expect(PPTX_GOOGLE_FONTS['calibri light']).toBeUndefined();
     expect(PPTX_GOOGLE_FONTS['cambria math']).toBeUndefined();

@@ -2,7 +2,6 @@ import { describe, it, expect } from 'vitest';
 import {
   resolveLineFloatWindow,
   skipPastTopAndBottom,
-  wordMinLineStartPx,
   type FloatRect,
 } from './float-layout.js';
 
@@ -74,7 +73,7 @@ const PROBE_H = 10;
 function windowTopY(col: { xLeft: number; width: number }, floats: FloatRect[]): number {
   return resolveLineFloatWindow(
     LINE_TOP,
-    wordMinLineStartPx(1),
+    10,
     PROBE_H,
     col.xLeft,
     col.width,
@@ -183,7 +182,7 @@ describe('resolveLineFloatWindow — topAndBottom float in the inter-column gutt
   it('does not push a line in column 0', () => {
     const topY = resolveLineFloatWindow(
       LINE_TOP,
-      wordMinLineStartPx(1),
+      10,
       PROBE_H,
       COL0.xLeft,
       COL0.width,
@@ -197,7 +196,7 @@ describe('resolveLineFloatWindow — topAndBottom float in the inter-column gutt
   it('does not push a line in column 1', () => {
     const topY = resolveLineFloatWindow(
       LINE_TOP,
-      wordMinLineStartPx(1),
+      10,
       PROBE_H,
       COL1.xLeft,
       COL1.width,

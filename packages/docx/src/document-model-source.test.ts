@@ -13,6 +13,8 @@ import {
 import { installStubCanvas, syntheticDocxModel } from './testing/synthetic-document.js';
 import { installDeterministicPaginationHost } from './testing/deterministic-pagination-host.js';
 import type { DocumentMeta } from './worker-protocol.js';
+import type { DocxDocumentModel } from './types.js';
+import { noteContinuationBoundaryModel, noteContinuationModel } from './testing/note-continuation-model.js';
 
 vi.mock('@silurus/ooxml-core', async (load) => ({
   ...await load<typeof import('@silurus/ooxml-core')>(),
@@ -115,13 +117,14 @@ function renderWorkerScript(sourceDefault: boolean | undefined, options: { parti
 }
 
 /** Parse-worker script: open a pull session over a materialized model. */
-function parseWorkerScript(viewDefaults: Record<string, boolean> | undefined, paragraphs = 6): Script {
+function parseWorkerScript(viewDefaults: Record<string, boolean> | undefined, paragraphs = 6,
+  model?: DocxDocumentModel): Script {
   let pull: DocumentPullWorker | undefined;
   return async (worker, message) => {
     if (isDocumentPullCommand(message)) {
       await pull!.dispatch(message, (response) => worker.reply(response));
     } else if (message.type === 'parse') {
-      const archive = new MaterializedDocumentCursorArchive(syntheticDocxModel('tracked', { paragraphs }));
+      const archive = new MaterializedDocumentCursorArchive(model ?? syntheticDocxModel('tracked', { paragraphs }));
       pull = new DocumentPullWorker(() => archive);
       const identity = { sessionId: 1, operationId: 1, generation: 1 };
       pull.open(identity);
@@ -156,6 +159,63 @@ function install(script: Script): void {
 }
 
 describe('DocxDocument.load with model sources', () => {
+  it.each([false, true])('continues a shared-model note through the public main loader (sliced=%s)', async sliceLayout => {
+    install(parseWorkerScript(undefined, 1, noteContinuationModel()));
+    const { source, release } = fakeSource();
+    const document = await DocxDocument.load(cfbBytes(), {
+      modelSources: [source], sliceLayout, allowFootnoteContinuation: true, currentDate: 0,
+    });
+    try {
+      expect(document.pageCount).toBeGreaterThan(1);
+      const text = (await Promise.all(Array.from({ length: document.pageCount }, (_, page) =>
+        document.collectPageRuns(page)))).flat().map(run => run.text).join('');
+      expect(text).toBe('1' + Array.from({ length: 30 }, (_, index) => `note-${index};`).join(''));
+      expect(release).toHaveBeenCalledOnce();
+    } finally { document.destroy(); }
+  });
+
+  // Library default: an omitted option continues notes like explicit true;
+  // explicit false keeps whole notes. noteContinuationBoundaryModel's exact
+  // arithmetic gives the independent page texts.
+  it.each([
+    { option: undefined, sliceLayout: false, continued: true },
+    { option: undefined, sliceLayout: true, continued: true },
+    { option: true, sliceLayout: false, continued: true },
+    { option: false, sliceLayout: false, continued: false },
+    { option: false, sliceLayout: true, continued: false },
+  ])('applies footnote continuation $option to a claimed main load (sliced=$sliceLayout)', async ({
+    option, sliceLayout, continued,
+  }) => {
+    install(parseWorkerScript(undefined, 1, noteContinuationBoundaryModel()));
+    const { source } = fakeSource();
+    const document = await DocxDocument.load(cfbBytes(), {
+      modelSources: [source], sliceLayout, currentDate: 0,
+      ...(option === undefined ? {} : { allowFootnoteContinuation: option }),
+    });
+    try {
+      const pages = await Promise.all(Array.from({ length: document.pageCount }, async (_, page) =>
+        (await document.collectPageRuns(page)).map(run => run.text).join('')));
+      expect(pages).toEqual(continued
+        ? ['F0F1F2F3F41B01note-0;', 'note-1;note-2;note-3;']
+        : ['F0F1F2F3F4', '1B01note-0;note-1;note-2;note-3;']);
+    } finally { document.destroy(); }
+  });
+
+  it.each([
+    { option: undefined, wire: true },
+    { option: false, wire: false },
+  ])('sends footnote continuation $option to a claimed worker parse as $wire', async ({ option, wire }) => {
+    // Wire contract only: a scripted worker does not paginate.
+    install(renderWorkerScript(undefined));
+    const { source } = fakeSource();
+    const document = await DocxDocument.load(cfbBytes(), {
+      mode: 'worker', modelSources: [source],
+      ...(option === undefined ? {} : { allowFootnoteContinuation: option }),
+    });
+    expect(ProtocolWorker.instances[0]!.parseRequests()[0]).toMatchObject({ allowFootnoteContinuation: wire });
+    document.destroy();
+  });
+
   it.each([
     { mode: 'worker' as const, progressiveLayout: false },
     { mode: 'worker' as const, progressiveLayout: true },
@@ -163,11 +223,11 @@ describe('DocxDocument.load with model sources', () => {
     install(renderWorkerScript(undefined));
     const transfer = new ArrayBuffer(4);
     const { source, beginLoad, release } = fakeSource({ transfer: [transfer] });
-    const document = await DocxDocument.load(cfbBytes(), { ...options, modelSources: [source] });
+    const document = await DocxDocument.load(cfbBytes(), { ...options, modelSources: [source], allowFootnoteContinuation: true });
 
     const [parse, ...others] = ProtocolWorker.instances[0]!.parseRequests();
     expect(others).toEqual([]);
-    expect(parse).toMatchObject({ source: descriptor, sourceTransfer: [transfer] });
+    expect(parse).toMatchObject({ source: descriptor, sourceTransfer: [transfer], allowFootnoteContinuation: true });
     const parseIndex = ProtocolWorker.instances[0]!.messages.indexOf(parse!);
     expect(ProtocolWorker.instances[0]!.transfers[parseIndex]).toContain(transfer);
     expect(beginLoad).toHaveBeenCalledOnce();

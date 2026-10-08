@@ -121,6 +121,10 @@ function run(text: string, letterSpacing?: number, color = '000000'): TextRunDat
   return {
     type: 'text', text, bold: null, italic: null, underline: false,
     strikethrough: false, fontSize: 20, color, fontFamily: 'Serif',
+    // One face for every slot keeps each probe a single-font run; an empty
+    // East Asian slot would draw the CJK glyphs in PowerPoint's application
+    // default instead (issue #1627).
+    fontFamilyEa: 'Serif',
     ...(letterSpacing != null ? { letterSpacing } : {}),
   } as TextRunData;
 }

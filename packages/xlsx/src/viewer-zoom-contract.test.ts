@@ -2,6 +2,7 @@ import { describe, it, expect, afterEach, vi } from 'vitest';
 import { XlsxViewer } from './viewer.js';
 import { zoomPosToScale, zoomScaleToPos } from './internal/viewer/zoom-control.js';
 import { worksheetContentBounds } from './internal/worksheet-content-bounds.js';
+import { GridGeometry } from './internal/grid-geometry.js';
 import { installDom, makeContainer } from './viewer-destroy-test-dom.js';
 import { HEADER_W, HEADER_H, colWidthToPx, rowHeightToPx, getMdwForWorksheet } from './renderer.js';
 import type { Worksheet } from './types.js';
@@ -55,6 +56,7 @@ interface Priv {
   currentWorksheet: Worksheet | null;
   canvasArea: { clientWidth: number; clientHeight: number; getBoundingClientRect(): DOMRect };
   scrollHost: FakeScrollHost;
+  spacer: { style: { width: string; height: string } };
   sheetTabs: {
     navPrev: { parentElement: { style: { width: string } } | null };
     tabBar: { style: { flexDirection: string } };
@@ -69,6 +71,7 @@ interface Priv {
     scrollTabs(direction: -1 | 1): void;
   };
   updateFooterDirection(): void;
+  updateSpacerSize(ws: Worksheet): void;
   _pendingZoomAnchor: { x: number; y: number } | null;
 }
 
@@ -123,6 +126,60 @@ describe('XlsxViewer IX9 zoom contract', () => {
       chart: {} as never,
     }];
     expect(worksheetContentBounds(ws)).toEqual({ maxRow: 114, maxCol: 26 });
+    expect(worksheetContentBounds(ws, { minRows: 0, minCols: 0 }))
+      .toEqual({ maxRow: 114, maxCol: 18 });
+  });
+
+  it('allows the configured minimum to expose only the actual content bounds', () => {
+    const ws = makeSheet();
+    expect(worksheetContentBounds(ws, { minRows: 0, minCols: 0 }))
+      .toEqual({ maxRow: 5, maxCol: 8 });
+
+    ws.freezeRows = 12;
+    ws.freezeCols = 10;
+    expect(worksheetContentBounds(ws, { minRows: 0, minCols: 0 }))
+      .toEqual({ maxRow: 12, maxCol: 10 });
+  });
+
+  it('configures grid minimums and trailing margins independently', () => {
+    installDom();
+    const ws = makeSheet();
+    const { priv } = mount(ws, {
+      minRows: 6,
+      minCols: 9,
+      marginRows: 2,
+      marginCols: 3,
+    });
+
+    priv.updateSpacerSize(ws);
+
+    const geometry = GridGeometry.forWorksheet(ws, getMdwForWorksheet(ws));
+    const expected = geometry.roundedContentExtent(8, 12, 1, HEADER_W, HEADER_H);
+    expect(priv.spacer.style.width).toBe(`${expected.width}px`);
+    expect(priv.spacer.style.height).toBe(`${expected.height}px`);
+  });
+
+  it('preserves the historical 80-row by 36-column default grid extent', () => {
+    installDom();
+    const ws = makeSheet();
+    const { priv } = mount(ws);
+
+    priv.updateSpacerSize(ws);
+
+    const geometry = GridGeometry.forWorksheet(ws, getMdwForWorksheet(ws));
+    const expected = geometry.roundedContentExtent(80, 36, 1, HEADER_W, HEADER_H);
+    expect(priv.spacer.style.width).toBe(`${expected.width}px`);
+    expect(priv.spacer.style.height).toBe(`${expected.height}px`);
+  });
+
+  it('rejects fractional or negative grid extent options', () => {
+    installDom();
+    expect(() => mount(makeSheet(), { minRows: -1 })).toThrow(
+      'minRows must be a non-negative safe integer',
+    );
+    expect(() => mount(makeSheet(), { marginCols: 1.5 })).toThrow(
+      'marginCols must be a non-negative safe integer',
+    );
   });
 
   it('getScale() is 1 (100%) by default and reflects the cellScale option', () => {
@@ -246,6 +303,24 @@ describe('XlsxViewer IX9 zoom contract', () => {
     // fitScale = cw / width, then snapped to whole percent by setScale.
     const expected = Math.round((cw / width) * 100) / 100;
     expect(v.getScale()).toBe(expected);
+  });
+
+  it('fitWidth uses configured minimums without including trailing margins', () => {
+    installDom();
+    const ws = makeSheet();
+    const { width } = naturalExtent(ws);
+    const contentWidth = GridGeometry.forWorksheet(ws, getMdwForWorksheet(ws))
+      .logicalContentExtent(5, 8, HEADER_W, HEADER_H).width;
+    expect(contentWidth).toBeLessThan(width);
+
+    const { v } = mount(ws, {
+      minRows: 0,
+      minCols: 0,
+      marginRows: 100,
+      marginCols: 100,
+    }, { cw: 400, ch: 300 });
+    v.fitWidth();
+    expect(v.getScale()).toBe(Math.round((400 / contentWidth) * 100) / 100);
   });
 
   it('fitPage takes the tighter of the width/height fit', () => {

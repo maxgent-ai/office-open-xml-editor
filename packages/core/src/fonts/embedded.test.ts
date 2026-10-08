@@ -17,6 +17,7 @@ afterEach(() => {
   G.FontFace = ORIG.FontFace;
   _resetEmbeddedRegistryForTests(); // dedup registry is module-global
   vi.restoreAllMocks();
+  vi.useRealTimers();
 });
 
 describe('deobfuscateOdttf (ECMA-376 §17.8.1)', () => {
@@ -96,7 +97,10 @@ interface FakeFace {
   load: () => Promise<FakeFace>;
 }
 
-function installFontFaceSet(opts: { failLoad?: (family: string) => boolean } = {}) {
+function installFontFaceSet(opts: {
+  failLoad?: (family: string) => boolean;
+  load?: (face: FakeFace) => Promise<FakeFace>;
+} = {}) {
   const added: FakeFace[] = [];
   class FakeFontFace implements FakeFace {
     family: string;
@@ -110,7 +114,7 @@ function installFontFaceSet(opts: { failLoad?: (family: string) => boolean } = {
       this.loadCalls++;
       return opts.failLoad?.(this.family)
         ? Promise.reject(new Error('load failed'))
-        : Promise.resolve(this);
+        : (opts.load?.(this) ?? Promise.resolve(this));
     }
   }
   const set = {
@@ -142,6 +146,36 @@ const validHeader = () =>
   ]);
 
 describe('registerEmbeddedFonts', () => {
+  it.each(['main', 'worker'])('finishes individual loads without waiting on global ready (%s)', async (mode) => {
+    vi.useFakeTimers();
+    let finishLoads!: () => void;
+    const loadGate = new Promise<void>((resolve) => { finishLoads = resolve; });
+    const { set, added } = installFontFaceSet({
+      failLoad: (family) => family === 'Failed',
+      load: (face) => loadGate.then(() => face),
+    });
+    set.ready = new Promise<void>(() => {});
+    if (mode === 'worker') {
+      delete G.document;
+      G.self = { fonts: set };
+    }
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    let loaded: FontFace[] | undefined;
+    const loading = registerEmbeddedFonts(['Loaded', 'Failed'].map((family) => ({
+      family, bytes: validHeader(), odttf: false, weight: 'normal', style: 'normal',
+    }))).then((faces) => { loaded = faces; });
+
+    // Neither the unresolved set.ready nor the safety ceiling decides readiness.
+    await vi.advanceTimersByTimeAsync(0);
+    expect(loaded).toBeUndefined();
+    finishLoads();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(loaded?.map((face) => face.family)).toEqual(['Loaded']);
+    expect(added.map((face) => face.family)).toEqual(['Loaded']);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('Failed'));
+    await loading;
+  });
+
   it('shares the exact admission boundary with pre-registration inspectors', () => {
     expect(embeddedFontBytesAreWithinLimit(new Uint8Array(10), 10)).toBe(true);
     expect(embeddedFontBytesAreWithinLimit(new Uint8Array(0), 10)).toBe(false);

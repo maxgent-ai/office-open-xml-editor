@@ -93,7 +93,11 @@ function* nodeText(node: DeepReadonly<PaintNode>): Iterable<string> {
     }
     return;
   }
-  if (node.kind === 'note' || node.kind === 'textbox') {
+  if (node.kind === 'note') {
+    if (node.leading?.paragraph) yield* nodeText(node.leading.paragraph);
+    for (const block of node.story.blocks) yield* nodeText(block);
+    if (node.trailing?.paragraph) yield* nodeText(node.trailing.paragraph);
+  } else if (node.kind === 'textbox') {
     for (const block of node.story.blocks) yield* nodeText(block);
   }
 }

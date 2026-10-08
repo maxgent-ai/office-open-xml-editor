@@ -92,6 +92,10 @@
           "title": "Part 1 Section 17.4.66, tcBorders (Table Cell Borders)"
         },
         {
+          "id": "2.1.171",
+          "title": "Part 1 Section 17.4.71, tcW (Preferred Table Cell Width)"
+        },
+        {
           "id": "2.1.177",
           "title": "Part 1 Section 17.4.77, top (Table Cell Top Margin Exception)"
         },

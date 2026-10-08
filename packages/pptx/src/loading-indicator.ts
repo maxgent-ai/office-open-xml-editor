@@ -1,23 +1,11 @@
+import { CanvasLoadingIndicator } from '@silurus/ooxml-core/internal/canvas-viewer-mechanics';
+
 /** Build the shared progressive-slide loading surface used by both PPTX viewers. */
-export function createPptxLoadingLayer(ownerDocument: Document): HTMLSpanElement {
-  const layer = ownerDocument.createElement('span');
-  layer.style.cssText = [
-    'position:absolute',
-    'top:0',
-    'right:0',
-    'bottom:0',
-    'left:0',
-    'display:none',
-    'align-items:center',
-    'justify-content:center',
-    'background:rgba(255,255,255,0.72)',
-    'backdrop-filter:blur(2px)',
-    'pointer-events:none',
-    'z-index:4',
-  ].join(';');
-  layer.setAttribute('role', 'status');
-  layer.setAttribute('aria-live', 'polite');
-  layer.setAttribute('aria-label', 'Loading slide');
+export function createPptxLoadingIndicator(wrapper: HTMLElement): CanvasLoadingIndicator {
+  const ownerDocument = wrapper.ownerDocument ?? document;
+  const indicator = new CanvasLoadingIndicator(wrapper, 'Loading slide');
+  const layer = indicator.layer;
+  layer.style.backdropFilter = 'blur(2px)';
 
   const circle = ownerDocument.createElement('span');
   circle.className = 'ooxml-pptx-progress-circle';
@@ -42,5 +30,5 @@ export function createPptxLoadingLayer(ownerDocument: Document): HTMLSpanElement
     );
   }
 
-  return layer;
+  return indicator;
 }

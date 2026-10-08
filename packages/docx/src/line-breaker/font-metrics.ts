@@ -1,6 +1,25 @@
 import type { ResolvedFontMetric } from '@silurus/ooxml-core';
 import { normalizeFontMetricFamily } from '@silurus/ooxml-core';
 import type { FontResolution } from '../layout/font-service.js';
+import { referenceFontLineMetrics } from '../reference-font-line-metrics.js';
+
+/** Vertical admission shared by ordinary text and numbering markers. Resource
+ * identity, tuple ambiguity and glyph coverage are resolved before this gate.
+ * Canvas sides remain the fallback; exact spacing suppresses design geometry. */
+export function selectedFontLineMetric(
+  selected: FontResolution | undefined,
+  localFont: ResolvedFontMetric | undefined,
+  naturalMetricAllowed: boolean,
+) {
+  const resourceMetric = (naturalMetricAllowed || localFont?.designAscentRatio == null)
+    && (localFont?.lineHeightRatio != null || localFont?.designAscentRatio != null
+      || localFont?.eastAsianLineHeightRatio != null) ? localFont : undefined;
+  const referenceMetric = naturalMetricAllowed && !resourceMetric
+    && mayUseAuthoredReferenceVerticalMetric(selected)
+    ? referenceFontLineMetrics(selected.requestedFamily, selected.weight, selected.style)
+    : undefined;
+  return { resourceMetric, referenceMetric, lineMetric: resourceMetric ?? referenceMetric };
+}
 
 /** A subset face lends design metrics only to spans whose every scalar it owns.
  * A FontFace tuple can win CSS selection while Canvas silently paints missing

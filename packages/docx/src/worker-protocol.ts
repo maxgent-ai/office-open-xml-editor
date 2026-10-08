@@ -80,6 +80,8 @@ export interface DocumentLayoutPartial {
   /** Whether these pages are known to match the final layout. Always false
    *  today because later convergence can still replace a checkpoint. */
   exact: boolean;
+  /** Leading pages identical to the previous publication's. */
+  unchangedPages?: number;
   /** Model-derived review data, sent with the FIRST publication only.
    *
    *  It comes from the parsed model rather than the layout, so it costs nothing
@@ -116,6 +118,7 @@ export type RenderWorkerRequest =
       sourceTransfer?: readonly Transferable[];
       sourceOwnerUrl?: string;
       useGoogleFonts?: boolean;
+      allowFootnoteContinuation?: boolean;
       cjkFallback?: import('@silurus/ooxml-core').CjkLang;
       defaultCurrentDateMs: number;
       currentDateMs?: number;
@@ -152,6 +155,9 @@ export type RenderWorkerResponse =
       id: number;
       meta: DocumentMeta;
       usage?: OoxmlResourceUsageSnapshot;
+      /** Leading pages of this authoritative layout identical to the last
+       *  progressive publication's (`DocumentLayoutPartial.unchangedPages`). */
+      unchangedPages?: number;
       /** The tracked-change view the worker paginated (the effective view). */
       showTrackedChanges?: boolean;
     }

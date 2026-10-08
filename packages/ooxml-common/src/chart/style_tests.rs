@@ -60,6 +60,7 @@ mod tests {
         let chartex_document = root_of(&chartex_xml);
         let defaults =
             parse_chartex_series_labels(chartex_document.root_element(), 1, &StubResolver, true)
+                .expect("labels fit allocation budget")
                 .2
                 .unwrap();
         assert_eq!((defaults.font_bold, defaults.font_italic), (None, None));

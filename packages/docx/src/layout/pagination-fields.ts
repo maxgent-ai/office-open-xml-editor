@@ -1,3 +1,4 @@
+import { sourceOwnedTextPlacements, type SourceOwnedTextGeometry } from './text-source-ownership.js';
 import type { NumberFormat } from '@silurus/ooxml-core';
 import { convergeLayout, type LayoutIteration } from './convergence.js';
 import { stableFingerprint } from './fingerprint.js';
@@ -115,9 +116,13 @@ export function paginationFieldFlowGeometry(fragment: FlowFragment): unknown {
       lines: fragment.lines.map((line) => ({
         range: line.range,
         bounds: line.bounds,
+        wrapBounds: line.wrapBounds,
+        wrapFragments: line.wrapFragments,
         baselinePt: line.baselinePt,
         advancePt: line.advancePt,
-        placements: line.placements.map((placement) => ({
+        placements: line.placements.flatMap<import('./types.js').ParagraphPlacement | SourceOwnedTextGeometry>(
+          placement => placement.kind === 'text' ? sourceOwnedTextPlacements(placement) : [placement],
+        ).map((placement) => ({
           kind: placement.kind,
           range: placement.range,
           bounds: placement.bounds,

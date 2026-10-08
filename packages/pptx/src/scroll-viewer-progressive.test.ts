@@ -56,8 +56,8 @@ describe('PptxScrollViewer progressive layout', () => {
       engine.asPres(),
       { overscan: 3, onVisibleSlideChange },
     ) as PptxScrollViewer;
-    const slots = (viewer as unknown as { _slots: Map<number, { loadingLayer: FakeEl }> })._slots;
-    const loadingLayer = slots.get(1)?.loadingLayer;
+    const slots = (viewer as unknown as { _slots: Map<number, { loadingIndicator: { layer: FakeEl } }> })._slots;
+    const loadingLayer = slots.get(1)?.loadingIndicator.layer;
 
     expect(loadingLayer?.style.display).toBe('flex');
     expect(loadingLayer?.children.some((child) => child.tag === 'progress')).toBe(false);
@@ -66,7 +66,7 @@ describe('PptxScrollViewer progressive layout', () => {
     expect(onVisibleSlideChange).toHaveBeenLastCalledWith(0, 4, false);
 
     engine.setLayoutProgress(4, true);
-    await vi.waitFor(() => expect(slots.get(1)?.loadingLayer.style.display).toBe('none'));
+    await vi.waitFor(() => expect(slots.get(1)?.loadingIndicator.layer.style.display).toBe('none'));
     expect(onVisibleSlideChange).toHaveBeenLastCalledWith(0, 4, true);
     viewer.destroy();
   });

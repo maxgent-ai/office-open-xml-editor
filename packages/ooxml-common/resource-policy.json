@@ -18,6 +18,8 @@
     "maxPptxSlideJsonBytes": 67108864,
     "maxPptxSharedDependencyXmlBytes": 16777216,
     "maxXmlDomComplexity": 200000,
+    "maxChartexAllocationElements": 524288,
+    "maxChartexAllocationBytes": 12582912,
     "maxPptxSlideXmlDomComplexity": 262144,
     "maxPptxSharedDependencyProjectionBytes": 33554432,
     "maxPptxSharedCacheEntries": 256,

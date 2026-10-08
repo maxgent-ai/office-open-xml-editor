@@ -36,7 +36,7 @@ function projectTextRun(
   const inlineScale = Math.hypot(pointToCss.a, pointToCss.b);
   const blockScale = Math.hypot(pointToCss.c, pointToCss.d);
   const transform = cssTransformFor(pointToCss);
-  const letterSpacingPt = placement.paintOps[0]?.letterSpacingPt ?? 0;
+  const letterSpacingPt = placement.letterSpacingPt;
   return {
     source: {
       story: geometry.source.story,

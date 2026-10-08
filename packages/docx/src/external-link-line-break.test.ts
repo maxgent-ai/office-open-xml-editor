@@ -1,3 +1,4 @@
+import { textBreakWindow } from './line-breaker/text-break-window.js';
 import { describe, expect, it } from 'vitest';
 import { graphemeClusterOffsets } from '@silurus/ooxml-core';
 import { wordExternalLinkSyntaxBreakOffsets } from './layout/line-compatibility.js';
@@ -74,7 +75,7 @@ describe('Word-observed external-link syntax breaks', () => {
       measuredWidth: 0,
       charSpacing: -5,
       hyperlink: { kind: 'external', url: text },
-      externalLinkBreakOffsets: offsets,
+      explicitBreaks: textBreakWindow(offsets),
       src: { segIndex: 0, charOffset: 0 },
     };
 

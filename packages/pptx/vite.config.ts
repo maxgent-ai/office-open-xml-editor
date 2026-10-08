@@ -50,7 +50,9 @@ export default defineConfig({
     format: 'es',
     plugins: () => [wasmAssetUrl(), wasm(), legacyBundleBoundary()],
     rollupOptions: {
-      output: { assetFileNames: '[name][extname]' },
+      // Inline parser workers run from Blob URLs: keep their dynamic analysis
+      // in one module rather than emitting unresolvable relative imports.
+      output: { assetFileNames: '[name][extname]', codeSplitting: false },
     },
   },
 });

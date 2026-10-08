@@ -141,19 +141,21 @@ describe('DrawingML gradient geometry', () => {
     });
   });
 
-  it('uses the authored path focus and tile rectangles', () => {
+  it('uses the authored circle focus and tile rectangles', () => {
     const { ctx, calls } = gradientContext();
     resolveFill({
       fillType: 'gradient',
       stops: [{ position: 0, color: '000000' }, { position: 1, color: 'FFFFFF' }],
       angle: 0,
       gradType: 'radial',
-      path: 'rect',
+      path: 'circle',
       tileRect: { l: 0.5 },
       fillToRect: { l: 0.25, r: 0.25, t: 0.5, b: 0.5 },
     }, ctx, 0, 0, 200, 100);
 
-    expect(calls[0]).toEqual({ kind: 'radial', args: [150, 50, 0, 150, 50, 50] });
+    expect(calls[0].kind).toBe('radial');
+    expect(calls[0].args.slice(0, 5)).toEqual([150, 50, 0, 150, 50]);
+    expect(calls[0].args[5]).toBeCloseTo(Math.hypot(50, 50));
   });
 
   it('counter-rotates a non-shape-rotating gradient', () => {

@@ -9,6 +9,7 @@ use ooxml_common::resource::{
 use wasm_bindgen::prelude::*;
 
 mod chart_compatibility;
+mod chartex_choice;
 mod document_projector;
 mod drawing_compatibility;
 mod markdown;
@@ -903,6 +904,18 @@ mod tests {
     }
 
     #[test]
+    fn chartex_free_document_keeps_the_existing_inflated_byte_cost() {
+        let data = cursor_test_package();
+        let mut archive = cursor_archive(&data);
+        archive.parse().unwrap();
+        let usage: serde_json::Value =
+            serde_json::from_slice(&archive.resource_usage().unwrap()).unwrap();
+        // This fixture's established two-pass streamed parse cost. A ChartEx
+        // pre-scan would add another full `word/document.xml` inflation.
+        assert_eq!(usage["operationInflatedBytes"].as_u64(), Some(553));
+    }
+
+    #[test]
     fn retained_document_projection_limit_is_typed_and_poisons_before_transfer() {
         let data = cursor_test_package();
         let mut archive = cursor_archive(&data);
@@ -1139,3 +1152,6 @@ mod tests {
         let _: fn(&[u8]) -> Result<String, String> = to_markdown_native;
     }
 }
+
+#[cfg(test)]
+mod chartex_choice_tests;

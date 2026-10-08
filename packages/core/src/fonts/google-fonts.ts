@@ -85,12 +85,16 @@ export const GOOGLE_FONT_SUBSTITUTES: Record<string, FontPreloadEntry> = {
   // substitutes so RTL documents (which request e.g. Sakkal Majalla / Univers
   // Next Arabic) render with a real web font instead of an oversized OS
   // fallback. "Naskh" covers traditional serif-like Arabic faces; "Sans" covers
-  // the modern geometric ones.
-  'sakkal majalla':      { url: NOTO_NASKH_ARABIC_URL, loadFamily: 'Noto Naskh Arabic' },
-  'traditional arabic':  { url: NOTO_NASKH_ARABIC_URL, loadFamily: 'Noto Naskh Arabic' },
-  'simplified arabic':   { url: NOTO_NASKH_ARABIC_URL, loadFamily: 'Noto Naskh Arabic' },
-  'arabic typesetting':  { url: NOTO_NASKH_ARABIC_URL, loadFamily: 'Noto Naskh Arabic' },
-  'univers next arabic': { url: NOTO_SANS_ARABIC_URL, loadFamily: 'Noto Sans Arabic' },
+  // the modern geometric ones. These are VISUAL substitutes for Arabic script
+  // only: the Noto faces' Latin glyphs and tall line boxes do not resemble the
+  // authored faces' own Latin. So they are scoped to Arabic characters
+  // (substitute-script.ts), and Latin text requested from the same family
+  // falls back as if no substitute existed.
+  'sakkal majalla':      { url: NOTO_NASKH_ARABIC_URL, loadFamily: 'Noto Naskh Arabic', script: 'arabic' },
+  'traditional arabic':  { url: NOTO_NASKH_ARABIC_URL, loadFamily: 'Noto Naskh Arabic', script: 'arabic' },
+  'simplified arabic':   { url: NOTO_NASKH_ARABIC_URL, loadFamily: 'Noto Naskh Arabic', script: 'arabic' },
+  'arabic typesetting':  { url: NOTO_NASKH_ARABIC_URL, loadFamily: 'Noto Naskh Arabic', script: 'arabic' },
+  'univers next arabic': { url: NOTO_SANS_ARABIC_URL, loadFamily: 'Noto Sans Arabic', script: 'arabic' },
   // Self-referencing entries so the generic Arabic fallback fonts (appended to
   // the renderer's font chain) are themselves loaded whenever useGoogleFonts is
   // enabled — the loaders always queue these names.

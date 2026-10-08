@@ -6,6 +6,7 @@
 //! stay in `lib.rs`; the colour + theme helpers live in `fill` / `theme`.
 
 use crate::fill::{parse_color_node, parse_fill, parse_reflection, parse_shadow};
+use crate::script_font::{resolve_slot_face, theme_token_set, FontSlot};
 use crate::theme::resolve_theme_typeface;
 use crate::types::*;
 use crate::{attr, attr_f64, attr_i64, attr_r, child, children_vec, resolve_path, PptxZip};
@@ -22,7 +23,7 @@ struct InheritedRelationship {
     target: String,
     /// Set for master/layout levels. Slide-local targets retain the existing
     /// slide-relative representation used by the viewer.
-    source_dir: Option<String>,
+    source_part: Option<String>,
 }
 
 fn merge_attributes(higher: &PropertyAttributes, lower: &PropertyAttributes) -> PropertyAttributes {
@@ -194,12 +195,15 @@ pub(crate) type LevelFaces = [Option<String>; 9];
 
 /// Resolve one authored `<a:latin typeface>` value.
 ///
-/// * A theme token (`+mj-lt`, `+mn-lt`, …, ECMA-376 §20.1.4.1.16-.17) resolves
-///   through the slide master's own theme. A token naming an absent or empty
-///   theme slot counts as unspecified (`None`), so the next tier of the chain
-///   applies: with an empty theme minor font a text-box run carrying `+mn-lt`
-///   took the presentation `defaultTextStyle` face, and a placeholder took the
-///   hard default.
+/// * A theme token (`+mj-lt`, `+mn-lt`, …, ECMA-376 §20.1.4.1.16-.17) is
+///   checked against the slide master's own theme. A token naming an absent or
+///   empty theme slot counts as unspecified (`None`), so the next tier of the
+///   chain applies: with an empty theme minor font a text-box run carrying
+///   `+mn-lt` took the presentation `defaultTextStyle` face, and a placeholder
+///   took the hard default. A token naming a face is kept as the token: the
+///   face depends on the run language (a theme script font such as `Viet`,
+///   issue #1627) and is chosen by [`finalize_latin_face`] once the run's
+///   cascade is complete.
 /// * A literal empty `typeface=""` is an authored face that no installed font
 ///   matches. PowerPoint rendered it in Arial in a run, in master txStyles and
 ///   in a shape lstStyle, never falling through to the inherited face.
@@ -211,9 +215,27 @@ pub(crate) fn resolve_latin_face(
         return Some(HARD_DEFAULT_LATIN_FACE.to_owned());
     }
     if typeface.starts_with('+') {
-        return theme.get(typeface).filter(|face| !face.is_empty()).cloned();
+        return theme
+            .get(typeface)
+            .filter(|face| !face.is_empty())
+            .map(|_| typeface.to_owned());
     }
     Some(typeface.to_owned())
+}
+
+/// The face a resolved Latin chain value names for a run language: a kept
+/// theme token picks its collection's script font for the language (Viet),
+/// else the collection's Latin face. Literal faces pass through.
+pub(crate) fn finalize_latin_face(
+    face: Option<&str>,
+    theme: &HashMap<String, String>,
+    lang: Option<&str>,
+) -> Option<String> {
+    let face = face?;
+    if theme_token_set(face).is_none() {
+        return Some(face.to_owned());
+    }
+    resolve_slot_face(face, FontSlot::Latin, theme, lang, None)
 }
 
 /// The resolved Latin face of a `defRPr` / `rPr`, or `None` when unspecified.
@@ -253,6 +275,27 @@ pub(crate) fn extract_level_faces(
         .unwrap_or_default()
 }
 
+/// Per-level authored value of `<a:lvlNpPr><a:defRPr>`: the typeface of child
+/// `element` (`ea` / `cs`, kept as authored) or, with `element` None, the
+/// attribute `attribute` (`lang` / `altLang`).
+pub(crate) fn read_level_defrpr_values(
+    list_style: roxmltree::Node<'_, '_>,
+    element: Option<&str>,
+    attribute: &str,
+) -> LevelFaces {
+    std::array::from_fn(|lvl| {
+        let tag = format!("lvl{}pPr", lvl + 1);
+        let def_rpr = list_style
+            .children()
+            .find(|n| n.is_element() && n.tag_name().name() == tag)
+            .and_then(|lp| child(lp, "defRPr"))?;
+        match element {
+            Some(name) => child(def_rpr, name).and_then(|n| attr(&n, attribute)),
+            None => attr(&def_rpr, attribute),
+        }
+    })
+}
+
 pub(crate) fn has_any_level_face(faces: &LevelFaces) -> bool {
     faces.iter().any(Option::is_some)
 }
@@ -276,6 +319,22 @@ pub(crate) fn complete_level_faces(faces: &LevelFaces) -> LevelFaces {
 /// End a size chain at the hard default so every level has a size.
 pub(crate) fn complete_level_sizes(sizes: &LevelFontSizes) -> LevelFontSizes {
     std::array::from_fn(|lvl| Some(sizes[lvl].unwrap_or(HARD_DEFAULT_FONT_SIZE)))
+}
+
+/// Per-list-level paragraph alignment (`<a:lvlNpPr@algn>`). Index 0..=8 →
+/// lvl1pPr..lvl9pPr; `None` where the level does not set it.
+pub(crate) type LevelAlignments = [Option<String>; 9];
+
+/// Read `<a:lvlNpPr@algn>` for levels 1..9 from a node holding `<a:lvlNpPr>`
+/// children (a txBody's `<a:lstStyle>` or a master `<p:txStyles>` style).
+pub(crate) fn read_level_alignments(list_style: roxmltree::Node<'_, '_>) -> LevelAlignments {
+    std::array::from_fn(|lvl| {
+        let tag = format!("lvl{}pPr", lvl + 1);
+        list_style
+            .children()
+            .find(|n| n.is_element() && n.tag_name().name() == tag)
+            .and_then(|lp| attr(&lp, "algn"))
+    })
 }
 
 /// Per-list-level default text colours. Index 0..=8 maps to
@@ -323,7 +382,7 @@ pub(crate) fn merge_level_colors(primary: &LevelColors, fallback: &LevelColors) 
 /// itself, exactly like a paragraph's own `<a:pPr>`). Each axis is `Option` so it
 /// inherits independently: a level that sets only `marL` leaves `marR`/`indent`
 /// `None` and a lower-priority tier supplies them.
-#[derive(Clone, Copy, Default, serde::Serialize)]
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
 pub(crate) struct LevelIndent {
     pub(crate) mar_l: Option<i64>,
     pub(crate) mar_r: Option<i64>,
@@ -734,6 +793,8 @@ pub(crate) struct InheritedBodyPr {
     pub(crate) spc_col: Option<i64>,
     pub(crate) rtl_col: Option<bool>,
     pub(crate) spc_first_last_para: Option<bool>,
+    /// `anchorCtr` (ECMA-376 §21.1.2.1.1).
+    pub(crate) anchor_ctr: Option<bool>,
     /// `compatLnSpc` (see the cascade note on `TextBody::compat_ln_spc`).
     pub(crate) compat_ln_spc: Option<bool>,
     pub(crate) auto_fit: Option<InheritedAutoFit>,
@@ -758,6 +819,7 @@ impl InheritedBodyPr {
             spc_col: attr_i64(&body_pr, "spcCol"),
             rtl_col: flag("rtlCol"),
             spc_first_last_para: flag("spcFirstLastPara"),
+            anchor_ctr: flag("anchorCtr"),
             compat_ln_spc: flag("compatLnSpc"),
             auto_fit: ooxml_common::text::parse_autofit(body_pr).map(
                 |(mode, font_scale, ln_spc_reduction)| InheritedAutoFit {
@@ -780,6 +842,7 @@ impl InheritedBodyPr {
             spc_col: self.spc_col.or(fallback.spc_col),
             rtl_col: self.rtl_col.or(fallback.rtl_col),
             spc_first_last_para: self.spc_first_last_para.or(fallback.spc_first_last_para),
+            anchor_ctr: self.anchor_ctr.or(fallback.anchor_ctr),
             compat_ln_spc: self.compat_ln_spc.or(fallback.compat_ln_spc),
             auto_fit: self.auto_fit.or_else(|| fallback.auto_fit.clone()),
             text_warp: self.text_warp.or_else(|| fallback.text_warp.clone()),
@@ -794,6 +857,7 @@ impl InheritedBodyPr {
             && self.spc_col.is_none()
             && self.rtl_col.is_none()
             && self.spc_first_last_para.is_none()
+            && self.anchor_ctr.is_none()
             && self.compat_ln_spc.is_none()
             && self.auto_fit.is_none()
             && self.text_warp.is_none()
@@ -922,12 +986,10 @@ impl RunProperties {
             font_family: child(node, "latin")
                 .and_then(|n| attr(&n, "typeface"))
                 .and_then(|v| resolve_latin_face(&v, theme)),
-            font_family_ea: child(node, "ea")
-                .and_then(|n| attr(&n, "typeface"))
-                .map(|v| resolve_theme_typeface(&v, theme)),
-            font_family_cs: child(node, "cs")
-                .and_then(|n| attr(&n, "typeface"))
-                .map(|v| resolve_theme_typeface(&v, theme)),
+            // ea/cs keep the authored value (a token, a literal or "") so the
+            // face can follow the run language after the cascade (#1627).
+            font_family_ea: child(node, "ea").and_then(|n| attr(&n, "typeface")),
+            font_family_cs: child(node, "cs").and_then(|n| attr(&n, "typeface")),
             font_family_sym: child(node, "sym")
                 .and_then(|n| attr(&n, "typeface"))
                 .map(|v| resolve_theme_typeface(&v, theme)),
@@ -970,7 +1032,7 @@ impl RunProperties {
             .map(|id| {
                 rels.get(id).map(|target| InheritedRelationship {
                     target: target.clone(),
-                    source_dir: None,
+                    source_part: None,
                 })
             });
         self.hlink_mouse_over_target = self
@@ -980,7 +1042,7 @@ impl RunProperties {
             .map(|id| {
                 rels.get(id).map(|target| InheritedRelationship {
                     target: target.clone(),
-                    source_dir: None,
+                    source_part: None,
                 })
             });
         self
@@ -989,13 +1051,13 @@ impl RunProperties {
     /// Retain the relationship owner until after the attribute-wise cascade.
     /// A nearer level may author @action without a new r:id, so resolving the
     /// target here would miss a later hlinksldjump action.
-    pub(crate) fn with_part_targets(mut self, part_dir: &str) -> Self {
+    pub(crate) fn with_part_targets(mut self, source_part: &str) -> Self {
         for link in [
             &mut self.hlink_click_target,
             &mut self.hlink_mouse_over_target,
         ] {
             if let Some(Some(relationship)) = link {
-                relationship.source_dir = Some(part_dir.to_owned());
+                relationship.source_part = Some(source_part.to_owned());
             }
         }
         self
@@ -1015,6 +1077,45 @@ impl RunProperties {
         self.font_family = face;
         self.font_size = size;
         self
+    }
+
+    /// The ea/cs faces and language ordinary text inherits from the
+    /// presentation defaultTextStyle level or its shape style's fontRef.
+    pub(crate) fn script_base(
+        ea: Option<String>,
+        cs: Option<String>,
+        lang: Option<String>,
+        alt_lang: Option<String>,
+    ) -> Self {
+        let mut attributes = PropertyAttributes::new();
+        if let Some(lang) = lang {
+            attributes.insert("lang".to_owned(), lang);
+        }
+        if let Some(alt_lang) = alt_lang {
+            attributes.insert("altLang".to_owned(), alt_lang);
+        }
+        Self {
+            attributes,
+            font_family_ea: ea,
+            font_family_cs: cs,
+            ..Default::default()
+        }
+    }
+
+    /// The cascaded run language (`lang`, ECMA-376 §21.1.2.3.9).
+    pub(crate) fn language(&self) -> Option<&str> {
+        self.attributes
+            .get("lang")
+            .map(String::as_str)
+            .filter(|v| !v.is_empty())
+    }
+
+    /// The cascaded alternate language (`altLang`).
+    pub(crate) fn alt_language(&self) -> Option<&str> {
+        self.attributes
+            .get("altLang")
+            .map(String::as_str)
+            .filter(|v| !v.is_empty())
     }
 
     pub(crate) fn over(&self, lower: &Self) -> Self {
@@ -1254,7 +1355,7 @@ pub(crate) fn parse_text_body(
     tx_body: roxmltree::Node<'_, '_>,
     theme: &HashMap<String, String>,
     rels: &HashMap<String, String>,
-    source_dir: &str,
+    source_part: &str,
     inherited_font_size: Option<f64>,
     inherited_level_font_sizes: LevelFontSizes,
     inherited_level_colors: LevelColors,
@@ -1268,6 +1369,7 @@ pub(crate) fn parse_text_body(
     inherited_anchor: Option<String>,
     inherited_body_pr: Option<InheritedBodyPr>,
     inherited_alignment: Option<String>,
+    inherited_level_alignments: &LevelAlignments,
     inherited_ea_ln_brk: Option<bool>,
     inherited_font_algn: Option<String>,
     inherited_spacing: LevelSpacing,
@@ -1371,6 +1473,10 @@ pub(crate) fn parse_text_body(
         .spc_first_last_para
         .or(inherited.spc_first_last_para)
         .unwrap_or(false);
+    // ECMA-376 §21.1.2.1.1 anchorCtr ("centered within the bounding box"
+    // perpendicular to the anchor), xsd:boolean default false. Cascaded like
+    // the other bodyPr attributes above.
+    let anchor_ctr = own.anchor_ctr.or(inherited.anchor_ctr).unwrap_or(false);
     // ECMA-376 §21.1.2.1.1 compatLnSpc ("line spacing ... decided in a
     // simplistic manner using the font scene", schema default false). Carried
     // through the placeholder cascade like the other bodyPr attributes; a
@@ -1436,7 +1542,7 @@ pub(crate) fn parse_text_body(
     // §6.5.2.3), the same base as the containing shape's picture fills.
     let mut resolve_slide_blip = |rid: &str| -> Option<String> {
         let target = rels.get(rid)?;
-        let path = resolve_path(source_dir, target);
+        let path = resolve_path(source_part, target);
         // Verify the part exists so a listed-but-missing rId yields None and the
         // bullet falls through to Bullet::Inherit (matches the variant's doc
         // comment), mirroring the slide picture-fill resolvers. `index_for_name`
@@ -1455,6 +1561,16 @@ pub(crate) fn parse_text_body(
         .and_then(|rp| attr(&rp, "i"))
         .map(|v| v == "1" || v == "true")
         .or(inherited_italic);
+    // Per-level alignment: the own lstStyle level, else the inherited level.
+    // A level neither sets falls back to the body default below.
+    let own_level_alignments = child(tx_body, "lstStyle")
+        .map(read_level_alignments)
+        .unwrap_or_default();
+    let effective_level_alignments: LevelAlignments = std::array::from_fn(|lvl| {
+        own_level_alignments[lvl]
+            .clone()
+            .or_else(|| inherited_level_alignments[lvl].clone())
+    });
     // Own lstStyle > lvl1pPr > algn overrides inherited alignment
     let body_default_alignment = own_lvl1_ppr
         .and_then(|lp| attr(&lp, "algn"))
@@ -1488,8 +1604,9 @@ pub(crate) fn parse_text_body(
                 p,
                 theme,
                 rels,
-                source_dir,
+                source_part,
                 body_default_alignment.as_deref(),
+                &effective_level_alignments,
                 body_default_ea_ln_brk,
                 &effective_spacing,
                 default_reflection.as_ref(),
@@ -1559,6 +1676,7 @@ pub(crate) fn parse_text_body(
         spc_col,
         rtl_col,
         spc_first_last_para,
+        anchor_ctr,
         compat_ln_spc,
         text_warp,
     }
@@ -1652,8 +1770,9 @@ pub(crate) fn parse_paragraph(
     p_node: roxmltree::Node<'_, '_>,
     theme: &HashMap<String, String>,
     rels: &HashMap<String, String>,
-    source_dir: &str,
+    source_part: &str,
     body_default_alignment: Option<&str>,
+    level_alignments: &LevelAlignments,
     body_default_ea_ln_brk: Option<bool>,
     level_spacing: &LevelSpacing,
     body_default_reflection: Option<&Reflection>,
@@ -1691,15 +1810,15 @@ pub(crate) fn parse_paragraph(
         .map(|v| v.to_string());
 
     // Paragraph's own algn → body/layout/master default → "r" if rtl, else "l"
-    let alignment = p_pr
-        .and_then(|n| attr(&n, "algn"))
-        .map(|a| a.to_string())
-        .or_else(|| body_default_alignment.map(|a| a.to_string()))
-        .unwrap_or_else(|| if rtl { "r".into() } else { "l".into() });
     let lvl: u32 = p_pr
         .and_then(|n| attr(&n, "lvl"))
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
+    let alignment = p_pr
+        .and_then(|n| attr(&n, "algn"))
+        .or_else(|| level_alignments[(lvl as usize).min(8)].clone())
+        .or_else(|| body_default_alignment.map(|a| a.to_string()))
+        .unwrap_or_else(|| if rtl { "r".into() } else { "l".into() });
 
     // Effective bullet: the paragraph's own bullet groups
     // (`<a:buClr>`/`<a:buSz…>`/`<a:buFont>` + `<a:buChar>`/`<a:buAutoNum>`/
@@ -1712,7 +1831,7 @@ pub(crate) fn parse_paragraph(
     // §6.5.2.3).
     let mut resolve_para_blip = |rid: &str| -> Option<String> {
         let target = rels.get(rid)?;
-        let path = resolve_path(source_dir, target);
+        let path = resolve_path(source_part, target);
         // Verify the part exists so a listed-but-missing rId yields None and the
         // buBlip marker falls through (inherit), mirroring the slide picture-fill
         // resolvers. `index_for_name` reads the central directory only (no
@@ -1822,7 +1941,8 @@ pub(crate) fn parse_paragraph(
     let def_italic = defaults.italic;
     // The list-level face already ends the placeholder / defaultTextStyle
     // chain (shape.rs); levels never borrow the level-1 face (#1620).
-    let def_font_family = defaults.font_family.clone();
+    let def_font_family =
+        finalize_latin_face(defaults.font_family.as_deref(), theme, defaults.language());
 
     let mut runs = Vec::new();
     for node in p_node.children().filter(|n| n.is_element()) {
@@ -1845,7 +1965,11 @@ pub(crate) fn parse_paragraph(
                     // preceding line to the master default size (observed in
                     // PowerPoint-exported Japanese and title controls).
                     font_size: own.font_size,
-                    font_family: own.font_family,
+                    font_family: finalize_latin_face(
+                        own.font_family.as_deref(),
+                        theme,
+                        effective.language(),
+                    ),
                     bold: own.bold,
                     italic: own.italic,
                     character_attributes: br_pr.map(|_| effective.attributes).unwrap_or_default(),
@@ -1880,16 +2004,12 @@ pub(crate) fn parse_paragraph(
     // For paragraphs with no visible text content, use endParaRPr sz to set line height.
     // This ensures empty spacer paragraphs have the correct height (e.g. between sections).
     let end_rpr = child(p_node, "endParaRPr");
-    // The mark authors a face only when its own a:latin resolves (a theme
-    // token against this master's theme); an unresolved token inherits.
-    let end_face_authored = end_rpr
-        .and_then(|n| run_properties_latin_face(n, theme))
-        .is_some_and(|f| !f.is_empty());
     let end_run_properties = end_rpr.map(|node| {
         Box::new(resolve_run_properties(
             String::new(),
             RunProperties::from_xml(node, theme).with_relationships(rels),
             &defaults,
+            theme,
         ))
     });
     let has_text = runs
@@ -1936,7 +2056,6 @@ pub(crate) fn parse_paragraph(
         font_algn,
         runs,
         end_run_properties,
-        end_face_authored,
     }
 }
 
@@ -2158,7 +2277,7 @@ fn parse_run_with_defaults(
     let authored = r_pr
         .map(|n| RunProperties::from_xml(n, theme).with_relationships(rels))
         .unwrap_or_default();
-    Some(resolve_run_properties(text, authored, defaults))
+    Some(resolve_run_properties(text, authored, defaults, theme))
 }
 
 fn inherited_hyperlink_target(
@@ -2178,8 +2297,8 @@ fn inherited_hyperlink_target(
         && rel.target.ends_with(".xml")
         && !rel.target.contains("://")
     {
-        if let Some(source_dir) = &rel.source_dir {
-            return Some(resolve_path(source_dir, &rel.target));
+        if let Some(source_part) = &rel.source_part {
+            return Some(resolve_path(source_part, &rel.target));
         }
     }
     Some(rel.target.clone())
@@ -2192,8 +2311,11 @@ fn resolve_run_properties(
     text: String,
     authored: RunProperties,
     defaults: &RunProperties,
+    theme: &HashMap<String, String>,
 ) -> TextRunData {
     let props = authored.over(defaults);
+    let lang = props.language();
+    let alt_lang = props.alt_language();
     let underline = props.underline.as_deref().is_some_and(|v| v != "none");
     let underline_style = props
         .underline
@@ -2216,9 +2338,20 @@ fn resolve_run_properties(
     };
     let no_fill = matches!(props.fill, Some(Fill::None));
     let color = props.color.clone();
-    let font_family = props.font_family.clone();
-    let font_family_ea = props.font_family_ea.clone().filter(|v| !v.is_empty());
-    let font_family_cs = props.font_family_cs.clone().filter(|v| !v.is_empty());
+    // Theme tokens resolve per run language (issue #1627). An empty ea/cs
+    // slot stays None: the renderer then applies Office's application
+    // default for the script, never the Latin face.
+    let font_family = finalize_latin_face(props.font_family.as_deref(), theme, lang);
+    let font_family_ea = props
+        .font_family_ea
+        .as_deref()
+        .and_then(|face| resolve_slot_face(face, FontSlot::EastAsian, theme, lang, alt_lang));
+    let font_family_cs = props
+        .font_family_cs
+        .as_deref()
+        .and_then(|face| resolve_slot_face(face, FontSlot::ComplexScript, theme, lang, alt_lang));
+    let run_lang = lang.map(str::to_owned);
+    let run_alt_lang = alt_lang.map(str::to_owned);
     let font_family_sym = props.font_family_sym.clone().filter(|v| !v.is_empty());
     let baseline = props.baseline.filter(|v| *v != 0);
 
@@ -2277,6 +2410,8 @@ fn resolve_run_properties(
         font_family_ea,
         font_family_cs,
         font_family_sym,
+        lang: run_lang,
+        alt_lang: run_alt_lang,
         baseline,
         caps,
         letter_spacing,
@@ -2335,7 +2470,7 @@ mod relationship_owner_tests {
             master.root_element(),
             &theme,
             &master_rels,
-            "ppt/slideMasters",
+            "ppt/slideMasters/slideMaster1.xml",
         );
         let master_default = &master_levels.placeholders["body"][0];
         let layout_levels =
@@ -2359,7 +2494,7 @@ mod relationship_owner_tests {
     }
 
     #[test]
-    fn inherited_slide_jump_is_resolved_from_master_and_layout_directories() {
+    fn inherited_slide_jump_is_resolved_from_master_and_layout_parts() {
         let doc = roxmltree::Document::parse(
             r#"<rPr
           xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
@@ -2368,10 +2503,13 @@ mod relationship_owner_tests {
         )
         .unwrap();
         let rels = HashMap::from([("rId7".into(), "../slides/slide3.xml".into())]);
-        for part_dir in ["ppt/slideMasters", "ppt/slideLayouts"] {
+        for source_part in [
+            "ppt/slideMasters/slideMaster1.xml",
+            "ppt/slideLayouts/slideLayout1.xml",
+        ] {
             let props = RunProperties::from_xml(doc.root_element(), &HashMap::new())
                 .with_relationships(&rels)
-                .with_part_targets(part_dir);
+                .with_part_targets(source_part);
             assert_eq!(
                 inherited_hyperlink_target(
                     &props.hlink_click_target,
@@ -2388,7 +2526,7 @@ mod relationship_owner_tests {
         .unwrap();
         let props = RunProperties::from_xml(external.root_element(), &HashMap::new())
             .with_relationships(&rels)
-            .with_part_targets("ppt/slideMasters");
+            .with_part_targets("ppt/slideMasters/slideMaster1.xml");
         assert_eq!(
             inherited_hyperlink_target(
                 &props.hlink_click_target,

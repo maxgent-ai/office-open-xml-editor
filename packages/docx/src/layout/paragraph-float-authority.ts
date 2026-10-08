@@ -43,6 +43,10 @@ export function paragraphWrapExclusions(
             verticalOwnership: 'page' as const,
           }
         : {}),
+      ...(float.topEdgeInclusiveFromYPt === undefined
+        ? {} : { topEdgeInclusiveFromYPt: float.topEdgeInclusiveFromYPt }),
+      ...(float.exemptLineTopPt === undefined
+        ? {} : { anchorLineExemptTopPt: float.exemptLineTopPt }),
     }];
   });
 }

@@ -9,6 +9,7 @@ import type {
   OoxmlResourceMetricsCheckpoint,
 } from '../types/resource-metrics.js';
 import type { NormalizedOoxmlResourcePolicy } from './resource-policy.js';
+import type { NormalizedXlsxWorksheetPolicy } from './xlsx-worksheet-policy.js';
 import { emitOoxmlResourceDebugReport } from './resource-debug-view.js';
 import { WasmTrapError } from './wasm-guard.js';
 import { OoxmlDecodedImageLimitError } from '../image/pixel-budget.js';
@@ -19,6 +20,8 @@ export interface OoxmlResourceMetricsSessionOptions {
   readonly mode: OoxmlResourceMetrics['mode'];
   readonly scope?: OoxmlResourceMetrics['scope'];
   readonly policy: Readonly<NormalizedOoxmlResourcePolicy>;
+  /** Already-resolved XLSX worksheet policy; reported only when format is xlsx. */
+  readonly xlsxWorksheetPolicy?: NormalizedXlsxWorksheetPolicy;
   readonly now?: () => number;
   readonly onMetrics?: (report: OoxmlResourceMetrics) => void;
   /** Emit the human-readable console card in addition to `onMetrics`. */
@@ -63,10 +66,23 @@ export class OoxmlResourceMetricsSession {
   constructor(private readonly options: OoxmlResourceMetricsSessionOptions) {
     this.now = options.now ?? defaultNow;
     this.startedAt = this.now();
+    const worksheetLimits = options.format === 'xlsx'
+      ? options.xlsxWorksheetPolicy?.worksheet
+      : undefined;
     this.policy = Object.freeze({
       maxArchiveEntryBytes: options.policy.maxArchiveEntryBytes,
       maxTotalInflatedBytes: options.policy.maxTotalInflatedBytes,
       maxArchiveEntries: options.policy.maxArchiveEntries,
+      ...(worksheetLimits
+        ? {
+          xlsxWorksheetLimits: Object.freeze({
+            maxRows: worksheetLimits.maxRows,
+            maxCells: worksheetLimits.maxCells,
+            maxOwnedUtf8Bytes: worksheetLimits.maxOwnedUtf8Bytes,
+            maxJsonBytes: worksheetLimits.maxJsonBytes,
+          }),
+        }
+        : {}),
     });
     this.mode = options.mode;
   }

@@ -258,6 +258,7 @@ export function createCanvasElementOutlineLayer(
   if (!enabled) return null;
   const ownerDocument = wrapper.ownerDocument ?? document;
   const layer = ownerDocument.createElement('div');
+  layer.setAttribute('data-overlay', 'element');
   layer.style.cssText = ELEMENT_OUTLINE_LAYER_STYLE;
   wrapper.appendChild(layer);
   return layer;
@@ -285,7 +286,8 @@ export function renderCanvasElementOutline(
   layer.appendChild(frame);
 }
 
-/** DOM containers only; each format remains responsible for overlay contents. */
+/** DOM containers only; each format remains responsible for overlay contents.
+ * data-overlay identifies each role independently of sibling order or loading UI. */
 export class CanvasOverlayHost {
   readonly textLayer: HTMLDivElement | null;
   readonly highlightLayer: HTMLDivElement;
@@ -299,13 +301,50 @@ export class CanvasOverlayHost {
     const ownerDocument = wrapper.ownerDocument ?? document;
     this.textLayer = enableTextSelection ? ownerDocument.createElement('div') : null;
     if (this.textLayer) {
+      this.textLayer.setAttribute('data-overlay', 'text');
       this.textLayer.style.cssText = TEXT_LAYER_STYLE;
       wrapper.appendChild(this.textLayer);
     }
     this.highlightLayer = ownerDocument.createElement('div');
+    this.highlightLayer.setAttribute('data-overlay', 'highlight');
     this.highlightLayer.style.cssText = HIGHLIGHT_LAYER_STYLE;
     wrapper.appendChild(this.highlightLayer);
     this.elementLayer = createCanvasElementOutlineLayer(wrapper, enableElementSelection);
+  }
+}
+
+/** Shared DOM lifecycle; formats supply their existing visual progress contents. */
+export class CanvasLoadingIndicator {
+  readonly layer: HTMLDivElement;
+  readonly status: HTMLDivElement;
+
+  constructor(wrapper: HTMLElement, private readonly message: string) {
+    const ownerDocument = wrapper.ownerDocument ?? document;
+    this.layer = ownerDocument.createElement('div');
+    this.layer.style.cssText =
+      'position:absolute;inset:0;display:none;align-items:center;justify-content:center;' +
+      'background:rgba(255,255,255,0.72);pointer-events:none;z-index:4;';
+    this.layer.setAttribute('aria-hidden', 'true');
+    wrapper.appendChild(this.layer);
+
+    // A live region must already be in the accessibility tree when its text
+    // changes. Keep it separate from the display:none visual surface, empty at
+    // rest, and clipped rather than hidden so later loading episodes announce.
+    this.status = ownerDocument.createElement('div');
+    this.status.setAttribute('role', 'status');
+    this.status.setAttribute('aria-live', 'polite');
+    this.status.setAttribute('aria-atomic', 'true');
+    this.status.style.cssText =
+      'position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;' +
+      'clip:rect(0 0 0 0);white-space:nowrap;border:0;pointer-events:none;' +
+      'user-select:none;-webkit-user-select:none;';
+    wrapper.appendChild(this.status);
+  }
+
+  setLoading(loading: boolean): void {
+    this.layer.style.display = loading ? 'flex' : 'none';
+    const text = loading ? this.message : '';
+    if (this.status.textContent !== text) this.status.textContent = text;
   }
 }
 

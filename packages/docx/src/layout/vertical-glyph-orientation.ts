@@ -15,6 +15,7 @@ import { EAST_ASIAN_RE } from './text.js';
  * clusters upright (centred on their advance) and others sideways. */
 export function eastAsianUprightPaintOps(
   placement: TextPlacement,
+  wordArtEmoji = false,
 ): TextPlacement['paintOps'] {
   return placement.clusters.map((cluster) => {
     const text = placement.text.slice(
@@ -24,7 +25,11 @@ export function eastAsianUprightPaintOps(
     const template = placement.paintOps.find((operation) =>
       operation.range.start <= cluster.range.start && operation.range.end >= cluster.range.end)
       ?? placement.paintOps[0]!;
-    const upright = EAST_ASIAN_RE.test(text);
+    // Word's stacked WordArt also uprights emoji presentation clusters.
+    // Issue #1668 controls: split ZWJ, modifier and regional-indicator runs;
+    // text-presentation symbols (copyright, registered) remain sideways.
+    const upright = EAST_ASIAN_RE.test(text)
+      || (wordArtEmoji && /\p{Emoji_Presentation}/u.test(text));
     return {
       ...template,
       text,

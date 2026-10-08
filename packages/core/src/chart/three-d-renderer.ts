@@ -103,7 +103,7 @@ import {
 import { buildThreeDOutlineTopology } from './three-d-outline.js';
 import { paintLegendFrame } from './legend-frame.js';
 import { paintPlotAreaFrame } from './plot-area-frame.js';
-import { resolveFill } from '../shape/paint.js';
+import { resolveNativeFill as resolveFill } from '../shape/paint.js';
 import {
   chartThreeDSurfacePaint,
   chartStyleDirectFillDecision,

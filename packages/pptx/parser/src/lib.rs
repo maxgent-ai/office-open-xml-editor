@@ -40,6 +40,8 @@ mod chart;
 mod chart_compatibility;
 
 mod theme;
+// Theme font tokens resolved per run language (issue #1627).
+mod script_font;
 use theme::*;
 
 mod fill;
@@ -504,7 +506,7 @@ fn serialize_presentation_bootstrap(
             .relationship_id
             .as_ref()
             .and_then(|id| shared.pres_rels.get(id))
-            .map(|target| resolve_path("ppt", target));
+            .map(|target| resolve_path("ppt/presentation.xml", target));
         let candidate = BootstrapSlideProjection {
             index: descriptor.index,
             part_name: part_name.as_deref(),
@@ -1094,9 +1096,25 @@ struct TableTextStyle {
     color: Option<String>,
     bold: Option<bool>,
     italic: Option<bool>,
-    /// Latin typeface from `tcTxStyle` (§20.1.4.2.10 fontRef → `+mj-lt` /
-    /// `+mn-lt`, or `<a:font><a:latin>`), unresolved; resolved per slide theme.
-    font: Option<String>,
+    /// `tcTxStyle` font choice (EG_ThemeableFontStyles), unresolved; resolved
+    /// per slide theme.
+    font: Option<TableStyleFont>,
+}
+
+/// The font choice of a `tcTxStyle` (EG_ThemeableFontStyles, §20.1.4.2.10).
+/// A fontRef names a theme collection; `<a:font>` authors its own faces, and
+/// an authored theme token there is an ordinary token (issue #1627 review:
+/// the two differ when the named collection's Latin face is empty).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TableStyleFont {
+    /// `fontRef idx="major"` / `"minor"`: `+mj` / `+mn`.
+    Collection(&'static str),
+    /// `<a:font>`: the authored latin / ea / cs typefaces.
+    Faces {
+        latin: Option<String>,
+        ea: Option<String>,
+        cs: Option<String>,
+    },
 }
 
 impl TableTextStyle {
@@ -1173,6 +1191,7 @@ struct TablePartStyle {
 
 #[derive(Debug, Clone, Default)]
 struct TableStyleDef {
+    background: Option<Fill>,
     whole_tbl: TablePartStyle,
     band1_h: TablePartStyle,
     band2_h: TablePartStyle,
@@ -1298,7 +1317,7 @@ pub(crate) fn parse_rels(xml: &str) -> HashMap<String, String> {
 /// only for compatibility; the spec-driven relId path above is primary.
 pub(crate) fn build_smartart_drawings(
     rels_xml: &str,
-    source_dir: &str,
+    source_part: &str,
     zip: &mut PptxZip,
 ) -> HashMap<String, String> {
     let mut result: HashMap<String, String> = HashMap::new();
@@ -1328,7 +1347,7 @@ pub(crate) fn build_smartart_drawings(
     for (dm_rid, data_target) in data_rels {
         // 1) Canonical: read the data part's dataModelExt relId, resolve it in
         //    this same rels map.
-        let drawing_target = smartart_drawing_relid(&data_target, source_dir, zip)
+        let drawing_target = smartart_drawing_relid(&data_target, source_part, zip)
             .and_then(|drawing_rid| rid_target.get(&drawing_rid).cloned())
             // 2) Fallback: file-number-suffix match (heuristic, compat only).
             .or_else(|| {
@@ -1340,7 +1359,7 @@ pub(crate) fn build_smartart_drawings(
                 })
             });
         if let Some(dt) = drawing_target {
-            let drawing_path = resolve_path(source_dir, &dt);
+            let drawing_path = resolve_path(source_part, &dt);
             if let Ok(xml) = read_zip_str(zip, &drawing_path) {
                 result.insert(dm_rid, xml);
             }
@@ -1355,10 +1374,10 @@ pub(crate) fn build_smartart_drawings(
 /// be read or carries no `dataModelExt@relId`.
 fn smartart_drawing_relid(
     data_target: &str,
-    source_dir: &str,
+    source_part: &str,
     zip: &mut PptxZip,
 ) -> Option<String> {
-    let data_path = resolve_path(source_dir, data_target);
+    let data_path = resolve_path(source_part, data_target);
     let xml = read_zip_str(zip, &data_path).ok()?;
     let doc = parse_preflighted_pptx_xml(&xml).ok()?;
     doc.descendants()
@@ -1504,7 +1523,7 @@ fn parse_embedded_font_refs(
             {
                 continue;
             }
-            let part_path = resolve_path("ppt", &relationship.target);
+            let part_path = resolve_path("ppt/presentation.xml", &relationship.target);
             let Some(content_type) = content_types.for_part(&part_path) else {
                 continue;
             };
@@ -1524,20 +1543,13 @@ fn parse_embedded_font_refs(
     refs
 }
 
-/// Resolve a relative path against a base directory inside the ZIP.
+/// Resolve an internal relationship target against its source part.
 ///
-/// Thin alias for the shared [`ooxml_common::rels::resolve_target`], which
-/// handles both root-absolute (`/ppt/charts/chart5.xml`) and relative
-/// (`../charts/chart1.xml`) Targets with `..` normalization (ECMA-376 Part 2
-/// §9.3). Kept as a local name so the many call sites read unchanged.
-pub(crate) fn resolve_path(base_dir: &str, target: &str) -> String {
-    ooxml_common::rels::resolve_target(base_dir, target)
-}
-
-/// Directory containing an OPC source part. Relationship Targets are resolved
-/// relative to this directory (ECMA-376 Part 2 §6.5.2.3).
-fn part_directory(part_path: &str) -> &str {
-    part_path.rsplit_once('/').map_or("", |(dir, _)| dir)
+/// ECMA-376 Part 2 §6.4.1 applies RFC 3986 resolution before validating and
+/// normalizing the result as an OPC part name. An invalid target becomes the
+/// empty lookup key, so callers follow their existing missing-part path.
+pub(crate) fn resolve_path(source_part: &str, target: &str) -> String {
+    ooxml_common::rels::resolve_part_name(source_part, target).unwrap_or_default()
 }
 
 // ===========================
@@ -1560,7 +1572,7 @@ fn slide_is_hidden(root: roxmltree::Node) -> bool {
 #[allow(clippy::too_many_arguments)]
 fn parse_slide(
     xml: &str,
-    slide_dir: &str,
+    slide_part: &str,
     slide_rels_xml: &str,
     // The layout's single-pass extraction (placeholders + layout bg + layout
     // showMasterSp), built/cached by the caller against this slide's effective
@@ -1570,7 +1582,7 @@ fn parse_slide(
     parsed_layout: &ParsedLayout,
     layout_xml: Option<&str>,
     layout_rels: &HashMap<String, String>,
-    layout_dir: &str,
+    layout_part: &str,
     bundle: &ParsedMaster,
     eff: Option<&EffectiveMaster>,
     index: usize,
@@ -1596,7 +1608,7 @@ fn parse_slide(
         theme,
         master_xml,
         master_rels,
-        master_dir,
+        master_part,
         master_smartart_drawings,
         master_bg,
         master_decorative,
@@ -1617,7 +1629,7 @@ fn parse_slide(
     // flow through `parsed_layout`, already override-adjusted by the caller.)
     let theme: &PptxTheme = eff.map(|e| &e.theme).unwrap_or(theme);
     let master_xml: Option<&str> = master_xml.as_deref();
-    let master_dir: &str = master_dir.as_str();
+    let master_part: &str = master_part.as_str();
     let master_bg: Option<Fill> = match eff {
         Some(e) => e.master_bg.clone(),
         None => master_bg.clone(),
@@ -1678,7 +1690,7 @@ fn parse_slide(
     if let Some(n) = c_sld {
         let mut resolve = |rid: &str| -> Option<String> {
             let target = rels.get(rid)?;
-            let path = resolve_path(slide_dir, target);
+            let path = resolve_path(slide_part, target);
             // Resolve to the zip path; verify the part exists so a dangling
             // rId still yields None (the bg chain then falls through to the
             // next level), preserving the prior data-URL behaviour.
@@ -1739,7 +1751,7 @@ fn parse_slide(
                 if let Ok(mdoc) = parse_preflighted_pptx_xml(mxml) {
                     extract_decorative_shapes(
                         mdoc.root_element(),
-                        master_dir,
+                        master_part,
                         master_rels,
                         master_smartart_drawings,
                         theme,
@@ -1779,7 +1791,7 @@ fn parse_slide(
                         parse_sp_tree_node(
                             node,
                             &empty_lph,
-                            layout_dir,
+                            layout_part,
                             layout_rels,
                             smartart_drawings,
                             zip,
@@ -1806,7 +1818,7 @@ fn parse_slide(
         parse_sp_tree_node(
             node,
             &lph,
-            slide_dir,
+            slide_part,
             rels,
             smartart_drawings,
             zip,
@@ -1824,10 +1836,10 @@ fn parse_slide(
     debug_assert_eq!(elements.len(), element_sources.len());
 
     // ── Notes slide & comments (Phase 2 surfacing only — no rendering) ────
-    let notes = load_notes_slide(zip, slide_dir, rels);
+    let notes = load_notes_slide(zip, slide_part, rels);
     let comments = load_pptx_comments(
         zip,
-        slide_dir,
+        slide_part,
         slide_rels_xml,
         comment_authors,
         comment_authors_path,
@@ -1875,7 +1887,7 @@ fn broken_slide(index: usize, part: &str, detail: &str) -> Slide {
 /// the slide has no notes part or the part can't be read.
 fn load_notes_slide(
     zip: &mut PptxZip,
-    slide_dir: &str,
+    slide_part: &str,
     rels: &HashMap<String, String>,
 ) -> Option<String> {
     // rels here is the slide's _rels map (rId → Target) parsed by the caller.
@@ -1886,7 +1898,7 @@ fn load_notes_slide(
     let path = if target.starts_with('/') {
         target.trim_start_matches('/').to_string()
     } else {
-        resolve_path(slide_dir, target)
+        resolve_path(slide_part, target)
     };
     let xml = read_zip_str(zip, &path).ok()?;
     let doc = parse_preflighted_pptx_xml(&xml).ok()?;
@@ -2009,7 +2021,7 @@ fn parse_modern_comment_anchors(comment: roxmltree::Node<'_, '_>) -> Vec<PptxCom
 /// the 2018 PowerPoint namespace and relationship defined by [MS-PPTX] §2.1.5.
 fn load_pptx_comments(
     zip: &mut PptxZip,
-    slide_dir: &str,
+    slide_part: &str,
     rels_xml: &str,
     legacy_authors: &mut Option<HashMap<String, String>>,
     legacy_authors_path: Option<&str>,
@@ -2022,7 +2034,7 @@ fn load_pptx_comments(
     // XML order and HashMap iteration. Each relationship identifies its part;
     // no target-directory or filename convention is inferred.
     for target in [classic_target, modern_target].into_iter().flatten() {
-        let path = resolve_path(slide_dir, &target);
+        let path = resolve_path(slide_part, &target);
         let Ok(xml) = read_zip_str(zip, &path) else {
             continue;
         };
@@ -2605,7 +2617,7 @@ fn bootstrap_presentation(
     // major/minor fonts, hyperlink colors) and as the fallback theme for any
     // master that declares no /theme relationship of its own.
     let theme_path = find_rel_target_by_type(&pres_rels_xml, "/theme")
-        .map(|target| resolve_path("ppt", &target));
+        .map(|target| resolve_path("ppt/presentation.xml", &target));
     let theme = theme_path
         .as_deref()
         .map(|path| parse_theme_part(path, zip))
@@ -2615,16 +2627,16 @@ fn bootstrap_presentation(
     // The first slide master referenced by the presentation. Used for slides
     // whose layout→master→theme chain can't be resolved (simple/old decks), so
     // their behavior is unchanged from before per-slide resolution existed.
-    let pres_master_path: Option<String> =
-        find_rel_target_by_type(&pres_rels_xml, "/slideMaster").map(|t| resolve_path("ppt", &t));
+    let pres_master_path: Option<String> = find_rel_target_by_type(&pres_rels_xml, "/slideMaster")
+        .map(|t| resolve_path("ppt/presentation.xml", &t));
     let comment_authors_path = find_internal_rel_target_by_types(
         &pres_rels_xml,
         CLASSIC_COMMENT_AUTHOR_RELATIONSHIP_TYPES,
     )
-    .map(|target| resolve_path("ppt", &target));
+    .map(|target| resolve_path("ppt/presentation.xml", &target));
     let modern_comment_authors_path =
         find_internal_rel_target_by_types(&pres_rels_xml, MODERN_COMMENT_AUTHOR_RELATIONSHIP_TYPES)
-            .map(|target| resolve_path("ppt", &target));
+            .map(|target| resolve_path("ppt/presentation.xml", &target));
     let default_text_style = default_text_style_fragment(&pres_xml, pres_root);
 
     // This is a serialization-shaped projection of retained bootstrap state,
@@ -2699,7 +2711,7 @@ fn bootstrap_presentation(
 struct SlideRaw {
     index: usize,
     slide_path: String,
-    slide_dir: String,
+    slide_part: String,
     slide_xml: Result<String, String>,
     slide_rels_xml: String,
     slide_rels: HashMap<String, String>,
@@ -2809,8 +2821,8 @@ fn produce_slide_unit_with_journal<T>(
         // instead of producing `ppt//ppt/slides/slide1.xml`. Relative targets
         // (the common `slides/slide1.xml`) are unaffected. Same fix class as
         // the chart-rel resolution above.
-        let slide_path = resolve_path("ppt", &rel_target);
-        let slide_dir = part_directory(&slide_path).to_owned();
+        let slide_path = resolve_path("ppt/presentation.xml", &rel_target);
+        let slide_part = slide_path.clone();
         let rels_path = relationship_part_path(&slide_path);
 
         // RB7: a slide part that can't be read no longer aborts the whole deck.
@@ -2831,26 +2843,23 @@ fn produce_slide_unit_with_journal<T>(
         };
         let slide_rels_xml = read_zip_str(zip, &rels_path).unwrap_or_default();
         let slide_rels = parse_rels(&slide_rels_xml);
-        let smartart_drawings = build_smartart_drawings(&slide_rels_xml, &slide_dir, zip);
+        let smartart_drawings = build_smartart_drawings(&slide_rels_xml, &slide_part, zip);
 
         // Layout XML
         let layout_path = find_rel_target_by_type(&slide_rels_xml, "/slideLayout")
-            .map(|target| resolve_path(&slide_dir, &target));
+            .map(|target| resolve_path(&slide_path, &target));
 
         if let Some(path) = layout_path.as_deref() {
             if !layout_source_cache.contains_key(path) {
                 let xml = read_zip_str(zip, path).ok();
-                let dir = path
-                    .rsplit_once('/')
-                    .map(|(dir, _)| dir.to_owned())
-                    .unwrap_or_else(|| "ppt/slideLayouts".to_owned());
+                let dir = path.to_owned();
                 // Needed both for images inside the layout and for the
                 // layout→slideMaster chain (ECMA-376 §19.3.1.43).
                 let rels_path = relationship_part_path(path);
                 let rels_xml = read_zip_str(zip, &rels_path).unwrap_or_default();
                 let rels = parse_rels(&rels_xml);
                 let master_path = find_rel_target_by_type(&rels_xml, "/slideMaster")
-                    .map(|target| resolve_path(&dir, &target));
+                    .map(|target| resolve_path(path, &target));
                 let source = LayoutSource {
                     xml,
                     rels,
@@ -2878,7 +2887,7 @@ fn produce_slide_unit_with_journal<T>(
         let raw = SlideRaw {
             index: idx,
             slide_path,
-            slide_dir,
+            slide_part,
             slide_xml,
             slide_rels_xml,
             slide_rels,
@@ -2888,7 +2897,7 @@ fn produce_slide_unit_with_journal<T>(
         };
 
         let empty_layout_rels = HashMap::new();
-        let (layout_xml, layout_rels, layout_dir, master_path) = match raw.layout_source.as_deref()
+        let (layout_xml, layout_rels, layout_part, master_path) = match raw.layout_source.as_deref()
         {
             Some(source) => (
                 source.xml.as_deref(),
@@ -2896,7 +2905,12 @@ fn produce_slide_unit_with_journal<T>(
                 source.dir.as_str(),
                 source.master_path.as_deref(),
             ),
-            None => (None, &empty_layout_rels, "ppt/slideLayouts", None),
+            None => (
+                None,
+                &empty_layout_rels,
+                "ppt/slideLayouts/slideLayout.xml",
+                None,
+            ),
         };
 
         // RB7: a slide part that couldn't be READ (recorded above) degrades to a
@@ -3023,7 +3037,7 @@ fn produce_slide_unit_with_journal<T>(
                 let c_sld = child(root, "cSld")?;
                 let mut resolve = |rid: &str| -> Option<String> {
                     let target = bundle.master_rels.get(rid)?;
-                    let path = resolve_path(&bundle.master_dir, target);
+                    let path = resolve_path(&bundle.master_part, target);
                     // Existence check only — central-directory lookup, no inflate
                     // (former `read_zip_bytes` decompressed the entry to discard it).
                     zip.index_for_name(&path)?;
@@ -3043,7 +3057,7 @@ fn produce_slide_unit_with_journal<T>(
                         root,
                         &theme,
                         &bundle.master_rels,
-                        &bundle.master_dir,
+                        &bundle.master_part,
                     )
                 })
                 .unwrap_or_default();
@@ -3053,7 +3067,7 @@ fn produce_slide_unit_with_journal<T>(
                         root,
                         &theme,
                         &bundle.master_rels,
-                        &bundle.master_dir,
+                        &bundle.master_part,
                         zip,
                     )
                 })
@@ -3071,7 +3085,7 @@ fn produce_slide_unit_with_journal<T>(
                         root,
                         &theme,
                         &bundle.master_rels,
-                        &bundle.master_dir,
+                        &bundle.master_part,
                         dts,
                         zip,
                     )
@@ -3134,7 +3148,7 @@ fn produce_slide_unit_with_journal<T>(
                 &bundle.master_ea_ln_brk,
                 &bundle.master_spacing,
                 layout_theme,
-                layout_dir,
+                layout_part,
                 layout_rels,
                 zip,
             )
@@ -3187,12 +3201,12 @@ fn produce_slide_unit_with_journal<T>(
         let had_modern_comment_authors = modern_comment_authors.is_some();
         let slide = match parse_slide(
             slide_xml,
-            &raw.slide_dir,
+            &raw.slide_part,
             &raw.slide_rels_xml,
             parsed_layout,
             layout_xml,
             layout_rels,
-            layout_dir,
+            layout_part,
             bundle,
             effective_master.as_ref(),
             raw.index,
@@ -3595,7 +3609,7 @@ mod tests {
   <Relationship Id="rIdDrawB" Type="http://schemas.microsoft.com/office/2007/relationships/diagramDrawing" Target="../diagrams/drawing2.xml"/>
 </Relationships>"#;
 
-        let map = build_smartart_drawings(rels, "ppt/slides", &mut zip);
+        let map = build_smartart_drawings(rels, "ppt/slides/slide1.xml", &mut zip);
         // Keyed by the diagramData rel Id (= the slide's r:dm value).
         // data1 → dataModelExt relId rIdDrawB → drawing2.xml ("TWO").
         assert!(
@@ -3628,7 +3642,7 @@ mod tests {
   <Relationship Id="rIdData1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramData" Target="../diagrams/data1.xml"/>
   <Relationship Id="rIdDraw1" Type="http://schemas.microsoft.com/office/2007/relationships/diagramDrawing" Target="../diagrams/drawing1.xml"/>
 </Relationships>"#;
-        let map = build_smartart_drawings(rels, "ppt/slides", &mut zip);
+        let map = build_smartart_drawings(rels, "ppt/slides/slide1.xml", &mut zip);
         assert!(
             map.get("rIdData1")
                 .map(|s| s.contains("ONE"))
@@ -3648,16 +3662,19 @@ mod tests {
         // load (read_zip_str on `ppt/slides/ppt/charts/chart5.xml`) and the
         // slide rendered the chart as a blank area.
         assert_eq!(
-            resolve_path("ppt/slides", "/ppt/charts/chart5.xml"),
+            resolve_path("ppt/slides/slide1.xml", "/ppt/charts/chart5.xml"),
             "ppt/charts/chart5.xml"
         );
         // Relative references are unaffected by the absolute-target handling.
         assert_eq!(
-            resolve_path("ppt/slides", "../charts/chart1.xml"),
+            resolve_path("ppt/slides/slide1.xml", "../charts/chart1.xml"),
             "ppt/charts/chart1.xml"
         );
         assert_eq!(
-            resolve_path("ppt/slideLayouts", "../slideMasters/slideMaster1.xml"),
+            resolve_path(
+                "ppt/slideLayouts/slideLayout1.xml",
+                "../slideMasters/slideMaster1.xml",
+            ),
             "ppt/slideMasters/slideMaster1.xml"
         );
     }
@@ -3670,13 +3687,31 @@ mod tests {
         // which must NOT become `ppt//ppt/slides/slide1.xml`. Guards the
         // `resolve_path("ppt", rel_target)` slide-loading path.
         assert_eq!(
-            resolve_path("ppt", "slides/slide1.xml"),
+            resolve_path("ppt/presentation.xml", "slides/slide1.xml"),
             "ppt/slides/slide1.xml"
         );
         assert_eq!(
-            resolve_path("ppt", "/ppt/slides/slide1.xml"),
+            resolve_path("ppt/presentation.xml", "/ppt/slides/slide1.xml"),
             "ppt/slides/slide1.xml"
         );
+        assert_eq!(
+            resolve_path("ppt/slides/slide1.xml", "./media/image.png"),
+            "ppt/slides/media/image.png"
+        );
+        assert_eq!(
+            resolve_path("ppt/slides/slide1.xml", "../media/%69mage.png"),
+            "ppt/media/image.png"
+        );
+        assert_eq!(
+            resolve_path("ppt/slides/slide1.xml", "../media/%ZZ.png"),
+            ""
+        );
+        let external = ooxml_common::rels::RelTarget {
+            target: "https://example.invalid/image.png".to_owned(),
+            relationship_type: None,
+            mode: ooxml_common::rels::TargetMode::External,
+        };
+        assert_eq!(external.resolve_part("ppt/slides/slide1.xml"), None);
     }
 
     #[test]
@@ -4564,7 +4599,7 @@ mod tests {
             doc.root_element(),
             &theme,
             &master_rels,
-            "ppt/slideMasters",
+            "ppt/slideMasters/slideMaster1.xml",
             &mut zip,
         );
         match m.get("body").map(|b| b[0].resolve()) {
@@ -4686,7 +4721,7 @@ mod tests {
         let rels = parse_rels(&rels_xml);
         println!("rels: {:?}", rels);
 
-        let chart_path = resolve_path("ppt/slides", "../charts/chartEx1.xml");
+        let chart_path = resolve_path("ppt/slides/slide8.xml", "../charts/chartEx1.xml");
         println!("chart_path: {}", chart_path);
 
         let result = read_zip_str(&mut zip, &chart_path);
@@ -4997,8 +5032,9 @@ mod tests {
             child(doc.root_element(), "p").unwrap(),
             &HashMap::new(),
             &HashMap::new(),
-            "ppt/slides",
+            "ppt/slides/slide1.xml",
             None,
+            &Default::default(),
             None,
             &Default::default(),
             None,
@@ -5048,8 +5084,9 @@ mod tests {
             doc.root_element(),
             &HashMap::new(),
             &HashMap::new(),
-            "ppt/slides",
+            "ppt/slides/slide1.xml",
             None,
+            &Default::default(),
             None,
             &Default::default(),
             None,
@@ -5120,8 +5157,9 @@ mod tests {
             child(doc.root_element(), "p").unwrap(),
             &HashMap::new(),
             &rels,
-            "ppt/slides",
+            "ppt/slides/slide1.xml",
             None,
+            &Default::default(),
             None,
             &Default::default(),
             None,
@@ -5232,7 +5270,8 @@ mod tests {
             doc.root_element(),
             &HashMap::new(),
             &HashMap::new(),
-            "ppt/slides",
+            "ppt/slides/slide1.xml",
+            &crate::master::TableTextLevels::default(),
             &mut zip,
         );
         let runs = &cell.text_body.unwrap().paragraphs[0].runs;
@@ -5263,8 +5302,9 @@ mod tests {
             child(doc.root_element(), "p").unwrap(),
             &HashMap::new(),
             &HashMap::new(),
-            "ppt/slides",
+            "ppt/slides/slide1.xml",
             None,
+            &Default::default(),
             None,
             &Default::default(),
             None,
@@ -5633,7 +5673,7 @@ mod tests {
             &LayoutPlaceholders::default(),
             &theme,
             &HashMap::new(),
-            "ppt/slides",
+            "ppt/slides/slide1.xml",
             None,
             &mut zip,
         )
@@ -5680,6 +5720,144 @@ mod tests {
         ));
     }
 
+    /// Issue #1627: theme tokens resolve per run language. The theme script
+    /// font of the lang (then altLang) wins inside the token's collection;
+    /// text boxes take the defaultTextStyle ea/cs tokens and a fontRef
+    /// major/minor collection below their own lstStyle; an empty or absent
+    /// slot is left to the renderer's application default.
+    #[test]
+    fn east_asian_and_complex_script_faces_follow_run_language() {
+        let theme = parse_theme_colors(
+            r#"<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:themeElements>
+              <a:clrScheme name="C"><a:dk1><a:srgbClr val="000000"/></a:dk1><a:lt1><a:srgbClr val="FFFFFF"/></a:lt1><a:dk2><a:srgbClr val="111111"/></a:dk2><a:lt2><a:srgbClr val="EEEEEE"/></a:lt2><a:accent1><a:srgbClr val="111111"/></a:accent1><a:accent2><a:srgbClr val="222222"/></a:accent2><a:accent3><a:srgbClr val="333333"/></a:accent3><a:accent4><a:srgbClr val="444444"/></a:accent4><a:accent5><a:srgbClr val="555555"/></a:accent5><a:accent6><a:srgbClr val="666666"/></a:accent6><a:hlink><a:srgbClr val="0000FF"/></a:hlink><a:folHlink><a:srgbClr val="800080"/></a:folHlink></a:clrScheme>
+              <a:fontScheme name="F">
+                <a:majorFont><a:latin typeface="Garamond"/><a:ea typeface="HGMinchoE"/><a:cs typeface=""/>
+                  <a:font script="Jpan" typeface="HGSoeiKakugothicUB"/><a:font script="Hebr" typeface="Tahoma"/><a:font script="Viet" typeface="Book Antiqua"/></a:majorFont>
+                <a:minorFont><a:latin typeface="Corbel"/><a:ea typeface="Meiryo"/><a:cs typeface="Microsoft Sans Serif"/>
+                  <a:font script="Jpan" typeface="Yu Mincho"/><a:font script="Hebr" typeface="David"/><a:font script="Viet" typeface="Palatino Linotype"/></a:minorFont>
+              </a:fontScheme>
+              <a:fmtScheme name="S"><a:fillStyleLst/><a:lnStyleLst/><a:effectStyleLst/><a:bgFillStyleLst/></a:fmtScheme>
+            </a:themeElements></a:theme>"#,
+        );
+        let dts_xml = r#"<p:defaultTextStyle xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+          <a:defPPr><a:defRPr lang="ja-JP"/></a:defPPr>
+          <a:lvl1pPr><a:defRPr sz="1800"><a:latin typeface="+mn-lt"/><a:ea typeface="+mn-ea"/><a:cs typeface="+mn-cs"/></a:defRPr></a:lvl1pPr>
+          <a:lvl2pPr><a:defRPr sz="1800"/></a:lvl2pPr></p:defaultTextStyle>"#;
+        let dts_doc = roxmltree::Document::parse(dts_xml).unwrap();
+        let placeholders = LayoutPlaceholders {
+            default_text: crate::master::parse_default_text_levels(
+                Some(dts_doc.root_element()),
+                &theme,
+            ),
+            ..LayoutPlaceholders::default()
+        };
+        let text_box = |font_ref: &str, lst: &str, paras: &str| {
+            let style = if font_ref.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    r#"<p:style><a:lnRef idx="0"><a:scrgbClr r="0" g="0" b="0"/></a:lnRef><a:fillRef idx="0"><a:scrgbClr r="0" g="0" b="0"/></a:fillRef><a:effectRef idx="0"><a:scrgbClr r="0" g="0" b="0"/></a:effectRef><a:fontRef idx="{font_ref}"><a:schemeClr val="tx1"/></a:fontRef></p:style>"#
+                )
+            };
+            let xml = format!(
+                r#"<p:sp xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+                  <p:nvSpPr><p:cNvPr id="2" name="T"/><p:cNvSpPr txBox="1"/><p:nvPr/></p:nvSpPr>
+                  <p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="1000000" cy="500000"/></a:xfrm></p:spPr>{style}
+                  <p:txBody><a:bodyPr/><a:lstStyle>{lst}</a:lstStyle>{paras}</p:txBody></p:sp>"#
+            );
+            let doc = roxmltree::Document::parse(&xml).unwrap();
+            let mut zip = PptxZip::new(Cursor::new(empty_zip_bytes())).unwrap();
+            let shape = parse_shape(
+                doc.root_element(),
+                &placeholders,
+                &theme,
+                &HashMap::new(),
+                "ppt/slides/slide1.xml",
+                None,
+                &mut zip,
+            )
+            .expect("text box");
+            shape
+                .text_body
+                .expect("body")
+                .paragraphs
+                .into_iter()
+                .map(|p| match p.runs.into_iter().next() {
+                    Some(TextRun::Text(t)) => (t.font_family, t.font_family_ea, t.font_family_cs),
+                    other => panic!("expected a text run, got {other:?}"),
+                })
+                .collect::<Vec<_>>()
+        };
+        let s = |v: &str| Some(v.to_owned());
+        let runs = text_box(
+            "",
+            "",
+            r#"<a:p><a:r><a:rPr lang="ja-JP"/><a:t>a</a:t></a:r></a:p>
+               <a:p><a:r><a:rPr lang="en-US"/><a:t>a</a:t></a:r></a:p>
+               <a:p><a:r><a:rPr lang="en-US" altLang="ja-JP"/><a:t>a</a:t></a:r></a:p>
+               <a:p><a:r><a:rPr lang="he-IL"/><a:t>a</a:t></a:r></a:p>
+               <a:p><a:r><a:rPr lang="vi-VN"/><a:t>a</a:t></a:r></a:p>
+               <a:p><a:r><a:rPr lang="ja-JP"><a:ea typeface="Meiryo"/></a:rPr><a:t>a</a:t></a:r></a:p>
+               <a:p><a:r><a:rPr lang="ja-JP"><a:ea typeface=""/></a:rPr><a:t>a</a:t></a:r></a:p>
+               <a:p><a:pPr lvl="1"/><a:r><a:rPr lang="ja-JP"/><a:t>a</a:t></a:r></a:p>
+               <a:p><a:r><a:rPr/><a:t>a</a:t></a:r></a:p>"#,
+        );
+        assert_eq!(
+            runs[0],
+            (s("Corbel"), s("Yu Mincho"), s("Microsoft Sans Serif"))
+        );
+        assert_eq!(
+            runs[1],
+            (s("Corbel"), s("Meiryo"), s("Microsoft Sans Serif"))
+        );
+        assert_eq!(
+            runs[2].1,
+            s("Yu Mincho"),
+            "altLang selects the East Asian script"
+        );
+        assert_eq!(runs[3].2, s("David"), "lang selects the complex script");
+        assert_eq!(
+            runs[4].0,
+            s("Palatino Linotype"),
+            "the latin token follows vi-VN"
+        );
+        assert_eq!(runs[5].1, s("Meiryo"), "a literal face is used as authored");
+        assert_eq!(
+            runs[6].1, None,
+            "typeface=\"\" leaves the application default"
+        );
+        assert_eq!(
+            runs[7].1, None,
+            "a level without ea leaves the application default"
+        );
+        // defPPr lang has no effect: no lang selects no script.
+        assert_eq!(runs[8].1, s("Meiryo"));
+
+        let major = text_box(
+            "major",
+            "",
+            r#"<a:p><a:r><a:rPr lang="ja-JP"/><a:t>a</a:t></a:r></a:p>
+               <a:p><a:pPr lvl="1"/><a:r><a:rPr lang="he-IL"/><a:t>a</a:t></a:r></a:p>"#,
+        );
+        assert_eq!(major[0], (s("Garamond"), s("HGSoeiKakugothicUB"), None));
+        assert_eq!(
+            major[1].2,
+            s("Tahoma"),
+            "fontRef major supplies +mj-cs at every level"
+        );
+
+        let over = text_box(
+            "major",
+            r#"<a:lvl1pPr><a:defRPr lang="ja-JP"><a:ea typeface="+mn-ea"/></a:defRPr></a:lvl1pPr>"#,
+            r#"<a:p><a:r><a:rPr/><a:t>a</a:t></a:r></a:p>"#,
+        );
+        assert_eq!(
+            over[0].1,
+            s("Yu Mincho"),
+            "the shape lstStyle beats fontRef, and its lang inherits"
+        );
+    }
+
     /// ECMA-376 §19.3.1.52 / §21.1.2.3.7: a title with no local Latin
     /// typeface inherits titleStyle's +mj-lt, resolved through the current
     /// master's major Latin theme font.
@@ -5697,8 +5875,10 @@ mod tests {
         </p:sldMaster>"#;
         let master_doc = roxmltree::Document::parse(master_xml).unwrap();
         let faces = parse_master_level_faces(master_doc.root_element(), &theme, None);
-        assert_eq!(faces["title"][0].as_deref(), Some("Arial Black"));
-        assert_eq!(faces["ctrTitle"][0].as_deref(), Some("Arial Black"));
+        // The chain keeps the theme token; the face follows the run language
+        // once the cascade is complete (issue #1627).
+        assert_eq!(faces["title"][0].as_deref(), Some("+mj-lt"));
+        assert_eq!(faces["ctrTitle"][0].as_deref(), Some("+mj-lt"));
 
         let placeholders = LayoutPlaceholders {
             by_type_level_faces: faces,
@@ -5716,7 +5896,7 @@ mod tests {
             &placeholders,
             &theme,
             &HashMap::new(),
-            "ppt/slides",
+            "ppt/slides/slide1.xml",
             None,
             &mut zip,
         )
@@ -6069,7 +6249,7 @@ mod tests {
             master_root,
             &theme,
             &master_rels,
-            "ppt/slideMasters",
+            "ppt/slideMasters/slideMaster1.xml",
             &mut zip,
         );
         // The listed-but-missing part must not produce a Blip anywhere. With only
@@ -6100,7 +6280,7 @@ mod tests {
             master_root,
             &theme,
             &master_rels,
-            "ppt/slideMasters",
+            "ppt/slideMasters/slideMaster1.xml",
             &mut zip_ok,
         );
         match m_ok.get("body").map(|b| b[0].resolve()) {
@@ -6601,7 +6781,7 @@ mod tests {
             master_doc.root_element(),
             &theme,
             &master_rels,
-            "ppt/slideMasters",
+            "ppt/slideMasters/slideMaster1.xml",
             &mut zip,
         );
         let body = m.get("body").expect("body bullets");
@@ -6730,7 +6910,7 @@ mod tests {
                 doc.root_element(),
                 &theme,
                 &rels,
-                "ppt/slides",
+                "ppt/slides/slide1.xml",
                 None,
                 [None; 9],
                 std::array::from_fn(|_| None),
@@ -6744,6 +6924,7 @@ mod tests {
                 None,
                 None,
                 None,
+                &Default::default(),
                 None,
                 None, // inherited_font_algn
                 Default::default(),
@@ -6905,7 +7086,7 @@ mod tests {
                 &m_bool,
                 &HashMap::new(),
                 &theme,
-                "ppt/slideLayouts",
+                "ppt/slideLayouts/slideLayout1.xml",
                 &empty_rels,
                 &mut zip,
             )
@@ -7324,7 +7505,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &theme,
-            "ppt/slideLayouts",
+            "ppt/slideLayouts/slideLayout1.xml",
             &HashMap::new(),
             &mut zip,
         );
@@ -7340,7 +7521,7 @@ mod tests {
             body_doc.root_element(),
             &theme,
             &HashMap::new(),
-            "ppt/slides",
+            "ppt/slides/slide1.xml",
             None,
             [None; 9],
             inherited,
@@ -7354,6 +7535,7 @@ mod tests {
             None,
             None,
             None,
+            &Default::default(),
             None,
             None, // inherited_font_algn
             Default::default(),
@@ -7531,10 +7713,13 @@ mod tests {
             </a:theme>"#,
         );
         let styles = parse_table_styles_xml(
-            r#"<a:tblStyleLst xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:tblStyle styleId="{REF}"><a:wholeTbl><a:tcStyle><a:tcBdr><a:left><a:lnRef idx="1"><a:srgbClr val="445566"/></a:lnRef></a:left></a:tcBdr><a:fillRef idx="1"><a:srgbClr val="778899"/></a:fillRef></a:tcStyle></a:wholeTbl><a:firstRow><a:tcStyle><a:tcBdr><a:left><a:lnRef idx="2"/></a:left></a:tcBdr></a:tcStyle></a:firstRow></a:tblStyle></a:tblStyleLst>"#,
+            r#"<a:tblStyleLst xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:tblStyle styleId="{REF}"><a:tblBg><a:fillRef idx="1"><a:srgbClr val="223344"/></a:fillRef></a:tblBg><a:wholeTbl><a:tcStyle><a:tcBdr><a:left><a:lnRef idx="1"><a:srgbClr val="445566"/></a:lnRef></a:left></a:tcBdr><a:fillRef idx="1"><a:srgbClr val="778899"/></a:fillRef></a:tcStyle></a:wholeTbl><a:firstRow><a:tcStyle><a:tcBdr><a:left><a:lnRef idx="2"/></a:left></a:tcBdr></a:tcStyle></a:firstRow></a:tblStyle></a:tblStyleLst>"#,
             &theme,
         );
         let style = styles.get("{REF}").expect("table style");
+        assert!(
+            matches!(style.background, Some(Fill::Gradient { ref stops, angle, .. }) if stops[0].color == "223344" && angle == 90.0)
+        );
         assert!(
             matches!(style.whole_tbl.fill, Some(Fill::Gradient { ref stops, angle, .. }) if stops[0].color == "778899" && angle == 90.0)
         );
@@ -7557,6 +7742,60 @@ mod tests {
             2,
         );
         assert!(matches!(resolved.border_l, TableLineStyle::NoLine));
+    }
+
+    #[test]
+    fn unresolved_table_style_keeps_plain_grid_and_direct_formatting() {
+        let theme = HashMap::from([
+            ("tx1".to_owned(), "000000".to_owned()),
+            ("accent1".to_owned(), "4472C4".to_owned()),
+        ]);
+        for id in [
+            None,
+            Some("{FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF}"),
+            Some("{00000000-0000-0000-0000-000000000000}"),
+        ] {
+            let style_id = id
+                .map(|id| format!("<a:tableStyleId>{id}</a:tableStyleId>"))
+                .unwrap_or_default();
+            let xml = format!(
+                r#"<a:tbl xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+                <a:tblPr firstRow="1" bandRow="1" firstCol="1">{style_id}</a:tblPr>
+                <a:tblGrid><a:gridCol w="100"/><a:gridCol w="100"/></a:tblGrid>
+                <a:tr h="100"><a:tc><a:tcPr/></a:tc><a:tc><a:tcPr>
+                <a:lnL><a:noFill/></a:lnL><a:solidFill><a:srgbClr val="FF0000"/></a:solidFill>
+                </a:tcPr></a:tc></a:tr></a:tbl>"#
+            );
+            let doc = roxmltree::Document::parse(&xml).unwrap();
+            let mut zip = PptxZip::new(Cursor::new(empty_zip_bytes())).unwrap();
+            let table = parse_table(
+                doc.root_element(),
+                &Transform::default(),
+                &theme,
+                &HashMap::new(),
+                "ppt/slides/slide1.xml",
+                &crate::master::DefaultTextLevels::default(),
+                &mut zip,
+            )
+            .unwrap();
+            let plain = &table.rows[0].cells[0];
+            assert!(
+                matches!(plain.fill, None | Some(Fill::None)),
+                "{id:?}: no accent fill"
+            );
+            for border in [
+                &plain.border_l,
+                &plain.border_r,
+                &plain.border_t,
+                &plain.border_b,
+            ] {
+                let border = border.as_ref().expect("plain grid");
+                assert_eq!((&*border.color, border.width), ("000000", 12700));
+            }
+            let direct = &table.rows[0].cells[1];
+            assert!(direct.border_l.is_none());
+            assert!(matches!(&direct.fill, Some(Fill::Solid { color }) if color == "FF0000"));
+        }
     }
 
     #[test]
@@ -7663,6 +7902,26 @@ mod tests {
             Some("WHOLE"),
             "an unspecified band2V inherits wholeTbl"
         );
+
+        // Light-style edge roles can supply bold text without a fill. Enabled
+        // edge columns retain horizontal bands instead of inheriting band1V.
+        style.first_col.fill = None;
+        let flags = TableStyleFlags {
+            first_col: true,
+            last_col: true,
+            band_row: true,
+            band_col: true,
+            ..Default::default()
+        };
+        for (row, col, expected) in [
+            (0, 0, "BAND-ROW"),
+            (0, 1, "BAND-COL"),
+            (0, 2, "BAND-ROW"),
+            (1, 0, "WHOLE"),
+        ] {
+            let cell = resolve_table_cell_style(&style, flags, row, col, 3, 3);
+            assert_eq!(solid_color(&cell.fill).as_deref(), Some(expected));
+        }
     }
 
     /// ECMA-376 §21.1.3.17 (`CT_TableCellProperties`) — direct cell fill and
@@ -7682,7 +7941,14 @@ mod tests {
         let theme = HashMap::new();
         let rels = HashMap::new();
         let mut zip = PptxZip::new(Cursor::new(empty_zip_bytes())).expect("empty OOXML zip");
-        let mut cell = parse_table_cell(doc.root_element(), &theme, &rels, "ppt/slides", &mut zip);
+        let mut cell = parse_table_cell(
+            doc.root_element(),
+            &theme,
+            &rels,
+            "ppt/slides/slide1.xml",
+            &crate::master::TableTextLevels::default(),
+            &mut zip,
+        );
 
         assert!(cell.has_direct_fill);
         assert!(cell.has_direct_border_l);
@@ -7769,7 +8035,7 @@ mod tests {
                 doc.root_element(),
                 &theme,
                 &rels,
-                "ppt/slides",
+                "ppt/slides/slide1.xml",
                 None,
                 [None; 9], // inherited_level_font_sizes
                 std::array::from_fn(|_| None),
@@ -7782,11 +8048,12 @@ mod tests {
                 None, // inherited_reflection
                 None, // inherited_anchor
                 None, // inherited_body_pr
-                None, // inherited_alignment
-                None, // inherited_ea_ln_brk
-                None, // inherited_font_algn
-                Default::default(),
-                crate::text::DEFAULT_TEXT_STYLE_MAR_L, // inherited_spacing
+                None,
+                &Default::default(), // inherited_alignment
+                None,                // inherited_ea_ln_brk
+                None,                // inherited_font_algn
+                Default::default(),  // inherited_spacing
+                crate::text::DEFAULT_TEXT_STYLE_MAR_L,
                 &mut zip,
             )
         };
@@ -7825,6 +8092,17 @@ mod tests {
         }
         assert!(!parse(r#"<bodyPr spcFirstLastPara="0"/>"#).spc_first_last_para);
 
+        // anchorCtr (ECMA-376 §21.1.2.1.1): the same boolean shape; stacked
+        // vertical text centres its column block along the columns with it.
+        assert!(!tb_absent.anchor_ctr);
+        assert!(!json.contains("anchorCtr"), "{json}");
+        let tb_ctr = parse(r#"<bodyPr vert="wordArtVert" anchorCtr="1"/>"#);
+        assert!(tb_ctr.anchor_ctr);
+        assert!(serde_json::to_string(&tb_ctr)
+            .unwrap()
+            .contains("\"anchorCtr\":true"));
+        assert!(!parse(r#"<bodyPr anchorCtr="0"/>"#).anchor_ctr);
+
         // rtlCol="1" appears under the camelCase key "rtlCol".
         let json_true = serde_json::to_string(&tb).unwrap();
         assert!(
@@ -7854,7 +8132,7 @@ mod tests {
                 doc.root_element(),
                 &theme,
                 &rels,
-                "ppt/slides",
+                "ppt/slides/slide1.xml",
                 None,
                 [None; 9],
                 std::array::from_fn(|_| None),
@@ -7868,6 +8146,7 @@ mod tests {
                 None,
                 None,
                 None,
+                &Default::default(),
                 None,
                 None, // inherited_font_algn
                 Default::default(),
@@ -7914,11 +8193,10 @@ mod tests {
         );
     }
 
-    /// Review regression (#1636): an end-of-paragraph or break mark authors a
-    /// face only when its own a:latin resolves; an unresolved theme token
-    /// inherits like an omitted face.
+    /// A break carries only its own resolved latin face: an unresolved theme
+    /// token leaves it to inherit the paragraph face (#1636, #1663).
     #[test]
-    fn test_mark_face_authored_only_when_resolved() {
+    fn test_break_face_is_own_resolved_face() {
         let rels = HashMap::new();
         let bytes = empty_zip_bytes();
         let mut zip = PptxZip::new(Cursor::new(bytes)).unwrap();
@@ -7931,7 +8209,7 @@ mod tests {
                 doc.root_element(),
                 theme,
                 &rels,
-                "ppt/slides",
+                "ppt/slides/slide1.xml",
                 None,
                 [None; 9],
                 std::array::from_fn(|_| None),
@@ -7945,6 +8223,7 @@ mod tests {
                 None,
                 None,
                 None,
+                &Default::default(),
                 None,
                 None,
                 Default::default(),
@@ -7960,15 +8239,16 @@ mod tests {
         let empty = HashMap::new();
         let themed = HashMap::from([("+mn-lt".to_owned(), "Meiryo".to_owned())]);
         let token = r#"<latin typeface="+mn-lt"/>"#;
-        let unresolved = parse(&empty, token);
-        assert!(!unresolved.end_face_authored);
-        assert_eq!(break_face(&unresolved), None);
-        let resolved = parse(&themed, token);
-        assert!(resolved.end_face_authored);
-        assert_eq!(break_face(&resolved).as_deref(), Some("Meiryo"));
-        let literal = parse(&empty, r#"<latin typeface="Meiryo"/>"#);
-        assert!(literal.end_face_authored);
-        assert!(!parse(&empty, "").end_face_authored);
+        assert_eq!(break_face(&parse(&empty, token)), None);
+        assert_eq!(
+            break_face(&parse(&themed, token)).as_deref(),
+            Some("Meiryo")
+        );
+        assert_eq!(
+            break_face(&parse(&empty, r#"<latin typeface="Meiryo"/>"#)).as_deref(),
+            Some("Meiryo")
+        );
+        assert_eq!(break_face(&parse(&empty, "")), None);
     }
 
     /// ECMA-376 §21.1.2.2.7 — `<a:pPr eaLnBrk>` (xsd:boolean, default true)
@@ -7996,7 +8276,7 @@ mod tests {
                 doc.root_element(),
                 &theme,
                 &rels,
-                "ppt/slides",
+                "ppt/slides/slide1.xml",
                 None,
                 [None; 9],
                 std::array::from_fn(|_| None),
@@ -8010,6 +8290,7 @@ mod tests {
                 None,
                 None,
                 None,
+                &Default::default(),
                 None,
                 None, // inherited_font_algn
                 Default::default(),
@@ -8085,7 +8366,7 @@ mod tests {
                 doc.root_element(),
                 &theme,
                 &rels,
-                "ppt/slides",
+                "ppt/slides/slide1.xml",
                 None,
                 [None; 9],
                 std::array::from_fn(|_| None),
@@ -8099,6 +8380,7 @@ mod tests {
                 None,
                 None,
                 None,
+                &Default::default(),
                 None,
                 None, // inherited_font_algn
                 Default::default(),
@@ -8160,7 +8442,7 @@ mod tests {
             doc.root_element(),
             &theme,
             &rels,
-            "ppt/slides",
+            "ppt/slides/slide1.xml",
             None,
             [None; 9],
             std::array::from_fn(|_| None),
@@ -8174,6 +8456,7 @@ mod tests {
             None,
             None,
             None,
+            &Default::default(),
             None,
             None,
             inherited,
@@ -8213,7 +8496,7 @@ mod tests {
                 doc.root_element(),
                 &theme,
                 &rels,
-                "ppt/slides",
+                "ppt/slides/slide1.xml",
                 None,
                 [None; 9],
                 std::array::from_fn(|_| None),
@@ -8227,6 +8510,7 @@ mod tests {
                 None,
                 None,
                 None,
+                &Default::default(),
                 None,
                 None, // inherited_font_algn
                 {
@@ -8281,12 +8565,21 @@ mod tests {
 
     /// ECMA-376 §21.1.3.13 (`a:tblPr@rtl`): a right-to-left table sets `rtl=true`
     /// so the renderer can place column 0 at the right edge. Absent/false must be
-    /// Issue #1620: table-cell text takes the table style's tcTxStyle face
-    /// (built-in styles reference the theme minor font of the slide's master),
-    /// then the defaultTextStyle level; the cell's own formatting wins.
+    /// Issue #1620 / #1628: table-cell text takes the table style's tcTxStyle
+    /// face (built-in styles reference the theme minor font of the slide's
+    /// master), else the theme minor font, never the defaultTextStyle face; the
+    /// cell's own formatting wins. Its size, alignment and marL come from its
+    /// own level of the master otherStyle, ending at 18 pt and no indent.
     #[test]
-    fn table_cell_faces_follow_table_style_then_default_text_style() {
-        let parse = |tbl_xml: &str| -> TableElement {
+    fn table_cell_text_follows_table_style_theme_minor_and_other_style() {
+        let master = r#"<p:sldMaster xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+            xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:txStyles><p:otherStyle>
+            <a:defPPr><a:defRPr sz="1500"/></a:defPPr>
+            <a:lvl1pPr algn="ctr"><a:defRPr sz="1300"><a:latin typeface="Trebuchet MS"/></a:defRPr></a:lvl1pPr>
+            <a:lvl2pPr><a:defRPr sz="1100"/></a:lvl2pPr></p:otherStyle></p:txStyles></p:sldMaster>"#;
+        let master_doc = roxmltree::Document::parse(master).unwrap();
+        let other = crate::master::parse_table_text_levels(master_doc.root_element());
+        let parse = |tbl_xml: &str, table: &crate::master::TableTextLevels| -> TableElement {
             let xml = format!(
                 r#"<root xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">{tbl_xml}</root>"#
             );
@@ -8310,8 +8603,10 @@ mod tests {
             faces[0] = Some("Century Gothic".to_owned());
             let dts = crate::master::DefaultTextLevels {
                 faces,
-                sizes: [None; 9],
+                sizes: [Some(21.0); 9],
                 mar_l: [0; 9],
+                table: table.clone(),
+                ..Default::default()
             };
             let mut zip = PptxZip::new(Cursor::new(empty_zip_bytes())).unwrap();
             parse_table(
@@ -8319,31 +8614,222 @@ mod tests {
                 &t,
                 &theme,
                 &HashMap::new(),
-                "ppt/slides",
+                "ppt/slides/slide1.xml",
                 &dts,
                 &mut zip,
             )
             .unwrap()
         };
-        let face = |table: &TableElement, row: usize| {
+        let paragraph = |table: &TableElement, row: usize, index: usize| {
             table.rows[row].cells[0]
                 .text_body
                 .as_ref()
                 .unwrap()
-                .paragraphs[0]
-                .def_font_family
+                .paragraphs[index]
                 .clone()
         };
         let rows = r#"<a:tblGrid><a:gridCol w="100"/></a:tblGrid>
-            <a:tr h="0"><a:tc><a:txBody><a:bodyPr/><a:p><a:r><a:t>a</a:t></a:r></a:p></a:txBody></a:tc></a:tr>
-            <a:tr h="0"><a:tc><a:txBody><a:bodyPr/><a:p><a:pPr><a:defRPr><a:latin typeface="Rockwell"/></a:defRPr></a:pPr><a:r><a:t>b</a:t></a:r></a:p></a:txBody></a:tc></a:tr>"#;
-        let styled = parse(&format!(
-            r#"<a:tbl><a:tblPr firstRow="1"><a:tableStyleId>{{5C22544A-7EE6-4342-B048-85BDC9FD1C3A}}</a:tableStyleId></a:tblPr>{rows}</a:tbl>"#
-        ));
-        assert_eq!(face(&styled, 0).as_deref(), Some("Candara"));
-        assert_eq!(face(&styled, 1).as_deref(), Some("Rockwell"));
-        let unstyled = parse(&format!(r#"<a:tbl><a:tblPr/>{rows}</a:tbl>"#));
-        assert_eq!(face(&unstyled, 0).as_deref(), Some("Century Gothic"));
+            <a:tr h="0"><a:tc><a:txBody><a:bodyPr/><a:p><a:r><a:t>a</a:t></a:r></a:p>
+              <a:p><a:pPr lvl="1"/><a:r><a:t>b</a:t></a:r></a:p><a:p><a:pPr lvl="2"/><a:r><a:t>c</a:t></a:r></a:p></a:txBody></a:tc></a:tr>
+            <a:tr h="0"><a:tc><a:txBody><a:bodyPr/><a:p><a:pPr><a:defRPr><a:latin typeface="Rockwell"/></a:defRPr></a:pPr><a:r><a:t>d</a:t></a:r></a:p></a:txBody></a:tc></a:tr>"#;
+        let styled = parse(
+            &format!(
+                r#"<a:tbl><a:tblPr firstRow="1"><a:tableStyleId>{{5C22544A-7EE6-4342-B048-85BDC9FD1C3A}}</a:tableStyleId></a:tblPr>{rows}</a:tbl>"#
+            ),
+            &other,
+        );
+        assert_eq!(
+            paragraph(&styled, 0, 0).def_font_family.as_deref(),
+            Some("Candara")
+        );
+        assert_eq!(
+            paragraph(&styled, 1, 0).def_font_family.as_deref(),
+            Some("Rockwell")
+        );
+        let unstyled = parse(&format!(r#"<a:tbl><a:tblPr/>{rows}</a:tbl>"#), &other);
+        for index in 0..3 {
+            assert_eq!(
+                paragraph(&unstyled, 0, index).def_font_family.as_deref(),
+                Some("Candara")
+            );
+        }
+        // otherStyle levels: 13 pt centred, 11 pt left; level 3 is not defined
+        // (defPPr has no effect) and ends at 18 pt with no indent.
+        let sizes: Vec<_> = (0..3)
+            .map(|i| paragraph(&unstyled, 0, i).def_font_size)
+            .collect();
+        assert_eq!(sizes, [Some(13.0), Some(11.0), Some(18.0)]);
+        let alignments: Vec<_> = (0..3)
+            .map(|i| paragraph(&unstyled, 0, i).alignment)
+            .collect();
+        assert_eq!(alignments, ["ctr", "l", "l"]);
+        assert!((0..3).all(|i| paragraph(&unstyled, 0, i).mar_l == 0));
+        // Without an otherStyle: PowerPoint's default, 18 pt and 0.5" per level.
+        let built_in = parse(
+            &format!(r#"<a:tbl><a:tblPr/>{rows}</a:tbl>"#),
+            &crate::master::TableTextLevels::default(),
+        );
+        let levels: Vec<_> = (0..3)
+            .map(|i| {
+                let p = paragraph(&built_in, 0, i);
+                (p.def_font_size, p.mar_l)
+            })
+            .collect();
+        assert_eq!(
+            levels,
+            [
+                (Some(18.0), 0),
+                (Some(18.0), 457_200),
+                (Some(18.0), 914_400)
+            ]
+        );
+    }
+
+    /// Issue #1627 table-lang controls (XE*, TE*): a fontRef naming a theme
+    /// collection whose Latin face is empty draws its Latin text in Arial, not
+    /// the defaultTextStyle face, while ea/cs keep that collection.
+    #[test]
+    fn font_ref_to_an_empty_latin_collection_draws_arial() {
+        let theme = HashMap::from(
+            [("+mn-lt", "Corbel"), ("+mj-script-Jpan", "MajorJpan")]
+                .map(|(k, v)| (k.to_owned(), v.to_owned())),
+        );
+        let mut default_text = crate::master::DefaultTextLevels::default();
+        default_text.faces[0] = Some("+mn-lt".to_owned());
+        let placeholders = LayoutPlaceholders {
+            default_text,
+            ..LayoutPlaceholders::default()
+        };
+        let xml = r#"<p:sp xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+          <p:nvSpPr><p:cNvPr id="2" name="A"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr>
+          <p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="1000000" cy="500000"/></a:xfrm></p:spPr>
+          <p:style><a:lnRef idx="0"><a:scrgbClr r="0" g="0" b="0"/></a:lnRef><a:fillRef idx="0"><a:scrgbClr r="0" g="0" b="0"/></a:fillRef><a:effectRef idx="0"><a:scrgbClr r="0" g="0" b="0"/></a:effectRef><a:fontRef idx="major"><a:schemeClr val="tx1"/></a:fontRef></p:style>
+          <p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:rPr lang="ja-JP"/><a:t>a</a:t></a:r></a:p></p:txBody></p:sp>"#;
+        let doc = roxmltree::Document::parse(xml).unwrap();
+        let mut zip = PptxZip::new(Cursor::new(empty_zip_bytes())).unwrap();
+        let shape = parse_shape(
+            doc.root_element(),
+            &placeholders,
+            &theme,
+            &HashMap::new(),
+            "ppt/slides/slide1.xml",
+            None,
+            &mut zip,
+        )
+        .expect("autoshape");
+        let TextRun::Text(run) = &shape.text_body.expect("body").paragraphs[0].runs[0] else {
+            panic!("text run expected")
+        };
+        assert_eq!(run.font_family.as_deref(), Some("Arial"));
+        assert_eq!(run.font_family_ea.as_deref(), Some("MajorJpan"));
+    }
+
+    /// Issue #1627: a table cell's text is parsed over the table-style tier,
+    /// so the cell cascade completes before theme tokens resolve. An authored
+    /// empty ea/cs stays empty, the run's own language picks the script font,
+    /// and the cell's theme collection (tcTxStyle fontRef, else minor)
+    /// supplies ea/cs like a shape style's fontRef. A defaultTextStyle lang
+    /// does not reach cells (#1628: cells take no defaultTextStyle property).
+    #[test]
+    fn table_cell_scripts_resolve_after_the_cell_cascade() {
+        let theme = HashMap::from(
+            [
+                ("+mn-lt", "Corbel"),
+                ("+mn-ea", "Meiryo"),
+                ("+mn-cs", "Microsoft Sans Serif"),
+                ("+mn-script-Jpan", "Yu Mincho"),
+                ("+mn-script-Hebr", "David"),
+                ("+mn-script-Viet", "Palatino Linotype"),
+            ]
+            .map(|(k, v)| (k.to_owned(), v.to_owned())),
+        );
+        let parse = |tbl_xml: &str, dts_lang: Option<&str>| -> TableElement {
+            let xml = format!(
+                r#"<root xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">{tbl_xml}</root>"#
+            );
+            let doc = roxmltree::Document::parse(&xml).unwrap();
+            let tbl = doc
+                .root_element()
+                .children()
+                .find(|n| n.is_element() && n.tag_name().name() == "tbl")
+                .unwrap();
+            let t = Transform {
+                x: 0,
+                y: 0,
+                cx: 100,
+                cy: 100,
+                rot: 0.0,
+                flip_h: false,
+                flip_v: false,
+            };
+            let mut dts = crate::master::DefaultTextLevels::default();
+            dts.faces[0] = Some("+mn-lt".to_owned());
+            dts.east_asian[0] = Some("+mn-ea".to_owned());
+            dts.complex_script[0] = Some("+mn-cs".to_owned());
+            dts.lang[0] = dts_lang.map(str::to_owned);
+            let mut zip = PptxZip::new(Cursor::new(empty_zip_bytes())).unwrap();
+            parse_table(
+                tbl,
+                &t,
+                &theme,
+                &HashMap::new(),
+                "ppt/slides/slide1.xml",
+                &dts,
+                &mut zip,
+            )
+            .unwrap()
+        };
+        let run = |table: &TableElement, row: usize| -> TextRunData {
+            match &table.rows[row].cells[0]
+                .text_body
+                .as_ref()
+                .unwrap()
+                .paragraphs[0]
+                .runs[0]
+            {
+                TextRun::Text(t) => t.clone(),
+                other => panic!("expected text, got {other:?}"),
+            }
+        };
+        let rows = r#"<a:tblGrid><a:gridCol w="100"/></a:tblGrid>
+            <a:tr h="0"><a:tc><a:txBody><a:bodyPr/><a:p><a:r><a:rPr lang="ja-JP"><a:ea typeface=""/><a:cs typeface=""/></a:rPr><a:t>a</a:t></a:r></a:p></a:txBody></a:tc></a:tr>
+            <a:tr h="0"><a:tc><a:txBody><a:bodyPr/><a:p><a:r><a:rPr lang="vi-VN"/><a:t>b</a:t></a:r></a:p></a:txBody></a:tc></a:tr>
+            <a:tr h="0"><a:tc><a:txBody><a:bodyPr/><a:p><a:r><a:rPr/><a:t>c</a:t></a:r></a:p></a:txBody></a:tc></a:tr>
+            <a:tr h="0"><a:tc><a:txBody><a:bodyPr/><a:p><a:r><a:rPr lang="he-IL"/><a:t>d</a:t></a:r></a:p></a:txBody></a:tc></a:tr>"#;
+        for tbl_pr in [
+            r#"<a:tblPr firstRow="1"><a:tableStyleId>{5C22544A-7EE6-4342-B048-85BDC9FD1C3A}</a:tableStyleId></a:tblPr>"#,
+            "<a:tblPr/>",
+        ] {
+            let table = parse(&format!("<a:tbl>{tbl_pr}{rows}</a:tbl>"), Some("ja-JP"));
+            let empty = run(&table, 0);
+            assert_eq!(
+                empty.font_family_ea, None,
+                "{tbl_pr}: authored ea=\"\" stays empty"
+            );
+            assert_eq!(
+                empty.font_family_cs, None,
+                "{tbl_pr}: authored cs=\"\" stays empty"
+            );
+            assert_eq!(
+                run(&table, 1).font_family.as_deref(),
+                Some("Palatino Linotype"),
+                "{tbl_pr}: vi-VN"
+            );
+            // Cells take no defaultTextStyle properties (#1628), language
+            // included: the minor collection's ea face, no script font.
+            let inherited = run(&table, 2);
+            assert_eq!(inherited.lang, None, "{tbl_pr}: no defaultTextStyle lang");
+            assert_eq!(
+                inherited.font_family_ea.as_deref(),
+                Some("Meiryo"),
+                "{tbl_pr}"
+            );
+            assert_eq!(
+                run(&table, 3).font_family_cs.as_deref(),
+                Some("David"),
+                "{tbl_pr}"
+            );
+        }
     }
 
     /// The presentation defaultTextStyle is copied out with the namespace
@@ -8402,7 +8888,7 @@ mod tests {
                 &t,
                 &theme,
                 &rels,
-                "ppt/slides",
+                "ppt/slides/slide1.xml",
                 &crate::master::DefaultTextLevels::default(),
                 &mut zip,
             )
@@ -8671,7 +9157,7 @@ mod tests {
         rels.insert("rId1".to_string(), "../media/clip.m4v".to_string());
         rels.insert("rId2".to_string(), "../media/image1.png".to_string());
 
-        let media = parse_media(pic, "ppt/slides", &rels)
+        let media = parse_media(pic, "ppt/slides/slide1.xml", &rels)
             .expect("p14:media-only .m4v should parse as a MediaElement");
         assert_eq!(media.id.as_deref(), Some("5"));
         assert_eq!(media.media_kind, "video");
@@ -8710,7 +9196,7 @@ mod tests {
         let mut rels: HashMap<String, String> = HashMap::new();
         rels.insert("rId1".to_string(), "../media/sound.wav".to_string());
 
-        let media = parse_media(pic, "ppt/slides", &rels)
+        let media = parse_media(pic, "ppt/slides/slide1.xml", &rels)
             .expect("p14:media-only .wav should parse as a MediaElement");
         assert_eq!(media.media_kind, "audio");
         assert_eq!(media.mime_type, "audio/wav");
@@ -8756,7 +9242,7 @@ mod tests {
         rels.insert("rIdGood".to_string(), "../media/clip.mp4".to_string());
         rels.insert("rIdPoster".to_string(), "../media/image1.png".to_string());
 
-        let media = parse_media(pic, "ppt/slides", &rels)
+        let media = parse_media(pic, "ppt/slides/slide1.xml", &rels)
             .expect("a broken videoFile link must not shadow the good p14:media embed");
         assert_eq!(media.media_kind, "video");
         assert_eq!(media.media_path, "ppt/media/clip.mp4");
@@ -9463,7 +9949,7 @@ mod tests {
         let cursor = Cursor::new(data.clone());
         let mut zip = PptxZip::new(cursor).unwrap();
 
-        let pic = parse_picture(pic_node, "ppt/slides", &rels, &theme, &mut zip)
+        let pic = parse_picture(pic_node, "ppt/slides/slide1.xml", &rels, &theme, &mut zip)
             .expect("parse_picture should succeed for an SVG-blip picture");
 
         // PNG fallback is preserved as the raster image_path (regression-safe);
@@ -9519,7 +10005,7 @@ mod tests {
         let data = build_blip_media_zip(PNG_1X1, b"<svg/>");
         let cursor = Cursor::new(data.clone());
         let mut zip = PptxZip::new(cursor).unwrap();
-        let pic = parse_picture(pic_node, "ppt/slides", &rels, &theme, &mut zip)
+        let pic = parse_picture(pic_node, "ppt/slides/slide1.xml", &rels, &theme, &mut zip)
             .expect("parse_picture should succeed");
         assert_eq!(pic.image_path, "ppt/media/image1.png");
         assert_eq!(pic.mime_type, "image/png");
@@ -9580,8 +10066,14 @@ mod tests {
         let data = build_blip_media_zip(b"png", b"<svg/>");
         let mut zip = PptxZip::new(Cursor::new(data)).unwrap();
 
-        let pic = parse_picture(doc.root_element(), "ppt/slides", &rels, &theme, &mut zip)
-            .expect("styled picture should parse");
+        let pic = parse_picture(
+            doc.root_element(),
+            "ppt/slides/slide1.xml",
+            &rels,
+            &theme,
+            &mut zip,
+        )
+        .expect("styled picture should parse");
 
         let stroke = pic.stroke.expect("lnRef should supply a picture border");
         assert_eq!(stroke.width, 19_050);
@@ -9638,7 +10130,7 @@ mod tests {
         let data = build_blip_media_zip(PNG_1X1, b"<svg/>");
         let cursor = Cursor::new(data.clone());
         let mut zip = PptxZip::new(cursor).unwrap();
-        let pic = parse_picture(pic_node, "ppt/slides", &rels, &theme, &mut zip)
+        let pic = parse_picture(pic_node, "ppt/slides/slide1.xml", &rels, &theme, &mut zip)
             .expect("parse_picture should succeed for a duotone picture");
         let duo = pic.duotone.expect("duotone must be surfaced");
         assert_eq!(duo.clr1, "000000", "clr1 = black prstClr");
@@ -9681,7 +10173,7 @@ mod tests {
         let data = build_blip_media_zip(PNG_1X1, b"<svg/>");
         let cursor = Cursor::new(data.clone());
         let mut zip = PptxZip::new(cursor).unwrap();
-        let pic = parse_picture(pic_node, "ppt/slides", &rels, &theme, &mut zip)
+        let pic = parse_picture(pic_node, "ppt/slides/slide1.xml", &rels, &theme, &mut zip)
             .expect("parse_picture should succeed for a duotone picture");
         assert!(pic.duotone.is_none());
         assert_eq!(
@@ -9734,7 +10226,7 @@ mod tests {
         let data = build_blip_media_zip(PNG_1X1, b"<svg/>");
         let cursor = Cursor::new(data.clone());
         let mut zip = PptxZip::new(cursor).unwrap();
-        let pic = parse_picture(pic_node, "ppt/slides", &rels, &theme, &mut zip)
+        let pic = parse_picture(pic_node, "ppt/slides/slide1.xml", &rels, &theme, &mut zip)
             .expect("parse_picture should succeed for a duotone picture");
         assert!(matches!(
             pic.fill,
@@ -9770,7 +10262,7 @@ mod tests {
         let data = build_blip_media_zip(PNG_1X1, b"<svg/>");
         let cursor = Cursor::new(data.clone());
         let mut zip = PptxZip::new(cursor).unwrap();
-        let pic = parse_picture(pic_node, "ppt/slides", &rels, &theme, &mut zip)
+        let pic = parse_picture(pic_node, "ppt/slides/slide1.xml", &rels, &theme, &mut zip)
             .expect("parse_picture should succeed");
         assert!(pic.duotone.is_none(), "duotone must be None when absent");
     }
@@ -9817,7 +10309,7 @@ mod tests {
         let cursor = Cursor::new(data.clone());
         let mut zip = PptxZip::new(cursor).unwrap();
 
-        let pic = parse_picture(pic_node, "ppt/slides", &rels, &theme, &mut zip)
+        let pic = parse_picture(pic_node, "ppt/slides/slide1.xml", &rels, &theme, &mut zip)
             .expect("parse_picture must succeed for an svgBlip-only picture (sample-12 case)");
 
         // The SVG original is surfaced on svg_image_path so the renderer prefers it.

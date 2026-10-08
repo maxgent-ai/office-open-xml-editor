@@ -1,7 +1,20 @@
+import { existsSync, readFileSync } from 'node:fs';
+import init, { DocxArchive } from '../wasm/docx_parser.js';
+import { normalizeInternalDocumentModel } from '../parser-model.js';
 import { describe, expect, it, vi } from 'vitest';
 
 // Counts body pagination passes: each pass opens exactly one kernel session.
-const passes = vi.hoisted(() => ({ opened: 0 }));
+const passes = vi.hoisted(() => ({ opened: 0, finalizedPages: 0, sessionCalls: 0 }));
+vi.mock('./page-factory.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./page-factory.js')>();
+  return {
+    ...actual,
+    finalizeLayoutPage: (...args: Parameters<typeof actual.finalizeLayoutPage>) => {
+      passes.finalizedPages += 1;
+      return actual.finalizeLayoutPage(...args);
+    },
+  };
+});
 vi.mock('./runtime-state.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./runtime-state.js')>();
   return {
@@ -11,7 +24,15 @@ vi.mock('./runtime-state.js', async (importOriginal) => {
       return kernel && {
         openBodyLayoutSession: (...args: Parameters<typeof kernel.openBodyLayoutSession>) => {
           passes.opened += 1;
-          return kernel.openBodyLayoutSession(...args);
+          // Every session call is layout work; counting them between host
+          // turns measures how long the host waited.
+          const session = kernel.openBodyLayoutSession(...args);
+          return Object.fromEntries(Object.entries(session).map(([key, value]) => [
+            key,
+            typeof value === 'function'
+              ? (...callArgs: unknown[]) => { passes.sessionCalls += 1; return value.apply(session, callArgs); }
+              : value,
+          ])) as typeof session;
         },
       };
     },
@@ -122,6 +143,13 @@ function pageFloatingTable(
       horzAnchor: 'margin', horzSpecified: true, vertAnchor: 'page', tblpX: 0, tblpY,
     },
   } as unknown as BodyElement;
+}
+
+/** An ordinary (in-flow) table of empty exact-height rows across the column. */
+function ordinaryTable(rows: number, rowHeightPt: number): BodyElement {
+  const { tblpPr: _tblpPr, ...table } = pageFloatingTable(468, 0, rows, rowHeightPt, 0) as unknown as
+    Record<string, unknown>;
+  return table as unknown as BodyElement;
 }
 
 /** `lines` single-line paragraphs; each insert lands at its body index, in order. */
@@ -272,6 +300,97 @@ describe('progressive layout with page-owned anchors', () => {
     expect(counts.at(-1)!).toBeGreaterThan(placedPage);
   }, 300_000);
 
+  it('publishes the opening pages of a document that opens with a page table during discovery', async () => {
+    // A page-positioned table on the first page: the source-order first pass
+    // cannot have registered it at the page start, so none of its pages is
+    // final. The second pass, applying the plan of the pages the first has
+    // closed, runs behind it and publishes before discovery finishes. A
+    // three-page ordinary table makes one body entry of the second pass open
+    // pages whose plan the first pass has not closed yet.
+    const lines = 300;
+    const model = documentModel(lines, [
+      [2, pageFloatingTable(468, 300, 2, 100, 0)],
+      [40, ordinaryTable(3 * 27, 24)],
+    ]);
+    const blocking = blockingLayout(model);
+    expect(blocking.passes).toBe(2);
+    expect(tablePages(blocking.layout, 2).placedPage).toBe(0);
+
+    let steps = 0;
+    let stepsAtFirstPreview: number | null = null;
+    const previews: ProgressiveLayoutPreview[] = [];
+    const run = open(model);
+    const before = passes.opened;
+    const final = await layoutDocumentProgressively(run.input, run.services, run.options, {
+      scheduler: { onProgress: () => { steps += 1; } },
+      onPreview: (preview) => {
+        stepsAtFirstPreview ??= steps;
+        previews.push(preview);
+      },
+    });
+    expect(layoutFingerprint(final)).toBe(layoutFingerprint(blocking.layout));
+    // The overlapped second pass is the solver's second pass, not extra work.
+    expect(passes.opened - before).toBe(blocking.passes);
+    expectPublishedPagesFinal(previews, final);
+    // The first pass alone suspends once per body entry; the opening preview
+    // arrives well before it could have finished.
+    expect(stepsAtFirstPreview).not.toBeNull();
+    expect(stepsAtFirstPreview!).toBeLessThan(run.input.sequence.length / 4);
+    expect(previews.at(-1)!.layout.pages.length).toBeGreaterThan(5);
+  }, 300_000);
+
+  it('keeps host turns frequent while the second pass waits on the first', async () => {
+    // The ordinary table makes one second-pass entry wait for pages the first
+    // pass has not closed; the many one-line paragraphs after it are what the
+    // first pass must lay out meanwhile. Each must stay a suspension point.
+    const model = documentModel(300, [
+      [2, pageFloatingTable(468, 72, 3, 200, 0)],
+      [6, pageFloatingTable(468, 72, 3, 200, 0)],
+      [10, pageFloatingTable(468, 72, 3, 200, 0)],
+      [40, ordinaryTable(4 * 27, 24)],
+    ]);
+    const blocking = blockingLayout(model);
+    const run = open(model);
+    let since = 0;
+    let widest = 0;
+    let last = passes.sessionCalls;
+    const final = await layoutDocumentProgressively(run.input, run.services, run.options, {
+      onPreview: () => {},
+      scheduler: {
+        now: () => Number.MAX_SAFE_INTEGER,
+        sliceMs: 0,
+        yieldToHost: () => {
+          since = passes.sessionCalls - last;
+          widest = Math.max(widest, since);
+          last = passes.sessionCalls;
+          return Promise.resolve();
+        },
+      },
+    });
+    expect(layoutFingerprint(final)).toBe(layoutFingerprint(blocking.layout));
+    // One body entry here is at most about fifteen session calls. Waiting
+    // synchronously for the first pass instead ran a whole page of entries
+    // (over 180 calls) inside one host turn.
+    expect(widest).toBeLessThan(40);
+  }, 300_000);
+
+  it('discovers first-pass destinations in work linear in the page count', async () => {
+    const finalizations = async (pages: number) => {
+      const model = documentModel(pages * 27, [[2, pageFloatingTable(468, 300, 2, 100, 0)]]);
+      const run = open(model);
+      const before = passes.finalizedPages;
+      await layoutDocumentProgressively(run.input, run.services, run.options, { onPreview: () => {} });
+      return passes.finalizedPages - before;
+    };
+    const small = await finalizations(11);
+    const medium = await finalizations(21);
+    const large = await finalizations(41);
+    // Doubling the document may at most roughly double the finalized pages;
+    // a full-prefix snapshot per closed page would quadruple them.
+    expect(medium / small).toBeLessThan(2.5);
+    expect(large / medium).toBeLessThan(2.5);
+  }, 300_000);
+
   it('emits no stale page when cancelled during convergence', async () => {
     const model = anchoredImageModel();
     const { layout: final } = blockingLayout(model);
@@ -320,4 +439,79 @@ describe('progressive layout with page-owned anchors', () => {
       expectPublishedPagesFinal(previews, final);
     }
   }, 300_000);
+});
+
+describe('page-table destination cycle settlement', () => {
+  const coupledTables = () => documentModel(33, [
+    [13, pageFloatingTable(468, 72, 1, 360, 0)],
+    [15, pageFloatingTable(468, 72, 1, 600, 0)],
+    [33, pageFloatingTable(300, 72, 1, 600, 0)],
+  ]);
+
+  it('settles a near-page-tall table on the later page of its two-state cycle', () => {
+    const model = documentModel(56, [
+      [26, pageFloatingTable(524, 0, 1, 667, 0)],
+      [55, pageFloatingTable(524, 0, 1, 667, 0)],
+    ]);
+    model.section.pageHeight = 842;
+    const { layout } = blockingLayout(model);
+    // Main alternates (0, 1) and (2, 3). Recovery pins those later floors;
+    // subsequent ordinary collision admission may move a table farther.
+    expect(tablePages(layout, 26).placedPage).toBe(2);
+    expect(tablePages(layout, 55).placedPage).toBeGreaterThanOrEqual(3);
+  });
+
+  it('settles the coupled T1/T2/T3 cycle deterministically without overlapping body text', () => {
+    const model = coupledTables();
+    const { layout } = blockingLayout(model);
+    expect(layoutFingerprint(blockingLayout(model).layout)).toBe(layoutFingerprint(layout));
+    expect(layout.pages.flatMap((page) => page.layers.body)
+      .filter((node) => node.kind === 'table')).toHaveLength(3);
+    for (const page of layout.pages) {
+      const tables = page.layers.body.filter((node) => node.kind === 'table');
+      const lines = page.layers.body.flatMap((node) => node.kind === 'paragraph' ? node.lines : []);
+      const bands = [...tables.map((table) => table.flowBounds), ...lines.map((line) => line.bounds)];
+      for (const table of tables) {
+        for (const b of bands) {
+          const a = table.flowBounds;
+          if (a === b) continue;
+          expect(a.xPt >= b.xPt + b.widthPt || b.xPt >= a.xPt + a.widthPt
+            || a.yPt >= b.yPt + b.heightPt || b.yPt >= a.yPt + a.heightPt).toBe(true);
+        }
+      }
+    }
+  });
+
+  it('keeps cycle-settled progressive pages equal to the blocking result', async () => {
+    const model = coupledTables();
+    const { final, previews } = await progressiveRun(model);
+    expect(layoutFingerprint(final)).toBe(layoutFingerprint(blockingLayout(model).layout));
+    expectPublishedPagesFinal(previews, final);
+  });
+});
+
+// Local Word controls exercise the parser-to-paginator path without publishing
+// the non-redistributable fixtures. Placement fidelity is informational here:
+// this regression guarantees termination, not Word's logical anchor rule.
+describe('local page-table boundary controls', () => {
+  for (const name of ['heights', 'source-boundaries', 'wrap-widths', 'zero-boundaries']) {
+    const path = new URL(`../../public/private/docx/controls-1659/page-anchor-${name}.docx`, import.meta.url);
+    it.skipIf(!existsSync(path))(`lays out the ${name} controls without error`, async () => {
+      await init({ module_or_path: readFileSync(new URL('../wasm/docx_parser_bg.wasm', import.meta.url)) });
+      const archive = new DocxArchive(readFileSync(path));
+      let model: DocxDocumentModel;
+      try {
+        model = normalizeInternalDocumentModel(JSON.parse(new TextDecoder().decode(archive.parse()))).document;
+      } finally {
+        archive.free();
+      }
+      const { layout } = blockingLayout(model);
+      const tables = layout.pages.flatMap((page) => page.layers.body
+        .filter((node) => node.kind === 'table').map((node) => ({
+          source: node.source.path, page: page.pageIndex + 1, bounds: node.flowBounds,
+        })));
+      expect(tables).toHaveLength(model.body.filter((node) => node.type === 'table').length);
+      expect(layout.diagnostics.some((entry) => entry.code === 'NON_CONVERGENCE')).toBe(false);
+    }, 30_000);
+  }
 });

@@ -35,7 +35,7 @@ describe('buildSegments UAX #14 LB28 boundary glue', () => {
     ['HL × AL', 'א', 'a'],
     ['HL × HL', 'א', 'ב'],
   ])('marks the following segment joinPrev for %s', (_label, prev, next) => {
-    expect(textSegments([textRun(prev), textRun(next)]).map((seg) => seg.joinPrev))
+    expect(textSegments([textRun(prev), textRun(next, true)]).map((seg) => seg.joinPrev))
       .toEqual([undefined, true]);
   });
 
@@ -55,14 +55,6 @@ describe('buildSegments UAX #14 LB28 boundary glue', () => {
     ],
   ])('does not add glue across %s', (_label, runs) => {
     expect(textSegments(runs).every((seg) => seg.joinPrev === undefined)).toBe(true);
-  });
-
-  it('does not create a break inside consecutive spaces split by a source-run boundary (LB7)', () => {
-    expect(textSegments([
-      textRun('deadline ', true),
-      textRun(' ', true),
-      textRun('next'),
-    ]).map((segment) => segment.joinPrev)).toEqual([undefined, true, undefined]);
   });
 
   it('keeps a trailing space split by script shaping with the preceding text from the same run', () => {

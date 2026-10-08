@@ -114,7 +114,10 @@ export function distributeLineSlack(
  *  Negative for compression. The drawn line width is `Σ measuredWidth + this`. */
 export function distributedDelta(dist: DistributeResult | null): number {
   if (!dist) return 0;
-  let gaps = 0;
-  for (const s of dist.perSeg.values()) gaps += s.splitBefore.length + (s.trailingGap ? 1 : 0);
-  return dist.perGap * gaps;
+  let delta = 0;
+  for (const stretch of dist.perSeg.values()) {
+    delta += stretch.internalStretch;
+    if (stretch.trailingGap) delta += stretch.trailingDelta ?? dist.perGap;
+  }
+  return delta;
 }

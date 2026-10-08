@@ -241,6 +241,14 @@ function lineStructure(lines: LayoutLine[]) {
 }
 
 describe('resumed text segment geometry', () => {
+  it('does not emergency-split a word at an intrinsic-width round-trip boundary', () => {
+    const fixture = { name: 'exact-width word', width: 25, segs: () => [textSeg('other')] };
+    // Margin subtraction / point conversion can lose one representable step.
+    expect(layoutFixture({ ...fixture, width: 25 - Number.EPSILON * 25 })).toHaveLength(1);
+    // An actual content deficit still requires a split.
+    expect(layoutFixture({ ...fixture, width: 24.99 })).toHaveLength(2);
+  });
+
   it('rebases punctuation compressions after the pagination boundary', () => {
     const resumed = layoutFixture({
       name: 'compressed punctuation resume',

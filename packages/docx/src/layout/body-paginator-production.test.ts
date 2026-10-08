@@ -1690,6 +1690,70 @@ describe('canonical body producer', () => {
       .toBe(0.1 + 0.2 + 0.3);
   });
 
+  it('keeps a reference on its page and paints a long footnote on both pages', () => {
+    const services = Object.freeze({
+      text: { fingerprint: 'text' }, images: { fingerprint: 'images' }, math: { fingerprint: 'math' },
+      allowFootnoteContinuation: true,
+    }) as LayoutServices;
+    attachBodyLayoutKernel(services, {
+      openBodyLayoutSession: () => ({
+        hasPaginationFields: false,
+        measureParagraph: ({ input }) => ({
+          layout: paragraphWithFootnote('body-note', input.source, 60, 'long'),
+          blockExtentPt: 60, fragmentation: { kind: 'indivisible' },
+        }),
+        layoutNotes: (request) => {
+          const noteSource = { story: 'footnote' as const, storyInstance: 'long', path: [0] };
+          const lines = Array.from({ length: 4 }, (_, index) => ({
+            range: { start: index, end: index + 1 },
+            bounds: { xPt: 10, yPt: 6 + index * 10, widthPt: 20, heightPt: 10 },
+            baselinePt: 14 + index * 10, advancePt: 10, placements: [],
+          }));
+          const bounds = { xPt: 10, yPt: 6, widthPt: 180, heightPt: 40 };
+          const noteParagraph = {
+            ...paragraph(`note:${request.pageIndex}`, noteSource, 40),
+            flowBounds: bounds, inkBounds: bounds, lines,
+            flowDomainId: `${request.container.id}:footnote:long`,
+          } as unknown as ParagraphLayout;
+          const noteBounds = { xPt: 10, yPt: 0, widthPt: 180, heightPt: 46 };
+          return [{
+            kind: 'note', id: `footnote:long:page:${request.pageIndex}`,
+            source: { story: 'footnote' as const, storyInstance: 'long', path: [] },
+            flowDomainId: request.container.id, ordinaryFlow: true,
+            flowBounds: noteBounds, inkBounds: noteBounds, advancePt: 46, separator: [],
+            story: {
+              story: 'footnote' as const, blocks: [noteParagraph],
+              flowBounds: bounds, inkBounds: bounds, advancePt: 40, diagnostics: [],
+            },
+          }];
+        },
+        measureTable: () => { throw new Error('unused'); },
+        measureStoryExtent: () => 0,
+        measureFollowingBlock: () => ({ fullExtentPt: 60, leadContentExtentPt: 60 }),
+        measureLineNumberGlyph: () => ({ widthPt: 0, ascentPt: 0, descentPt: 0 }),
+        resetPageAcquisition: () => undefined,
+        moveAcquisitionCursor: () => undefined,
+        flowRegistrySnapshot: emptyFlowRegistrySnapshot,
+        commitFlowRegistryDelta: () => undefined,
+      }),
+    });
+    const layout = paginateBody({
+      source: { story: 'body', storyInstance: 'body', path: [] },
+      initialSection: bodyOwner(),
+      sequence: [{
+        kind: 'body-block', block: {
+          kind: 'paragraph', source: source(0), pageBreakBefore: false,
+          keepLines: false, keepNext: false, widowControl: false,
+          spaceBeforePt: 0, spaceAfterPt: 0, contextualSpacing: false, styleId: null,
+        },
+      }],
+    }, services, { currentDateMs: 0 });
+    expect(layout.pages).toHaveLength(2);
+    expect(layout.pages.map(page => page.layers.notes.map(note => note.advancePt)))
+      .toEqual([[16], [36]]);
+    expect(layout.pages.map(page => page.layers.body.length)).toEqual([1, 0]);
+  });
+
   it.each([0, 16])('places page-bottom notes after all continuous regions with footer extent %s', (footerExtent) => {
     // ECMA-376 17.11.21 / 17.18.34: pageBottom is the physical page's
     // reserved body edge, not the end of an earlier continuous section.
@@ -3292,7 +3356,7 @@ describe('canonical body producer', () => {
         measureFollowingBlock: () => ({ fullExtentPt: 20, leadContentExtentPt: 20 }),
         prescanPageAnchors: ({ anchors, location }) => {
           events.push(`prescan:${anchors.map((anchor) => (
-            anchor.kind === 'drawing' ? anchor.paragraphSource : anchor.tableSource
+            anchor.kind === 'floating-table' ? anchor.tableSource : anchor.paragraphSource
           ).path[0]).join(',')}`);
           return {
             floats: {

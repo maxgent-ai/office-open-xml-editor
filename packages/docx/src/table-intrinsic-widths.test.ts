@@ -1,4 +1,5 @@
 import { beforeAll, describe, expect, it } from 'vitest';
+import { Canvas } from 'skia-canvas';
 import { DEFAULT_KINSOKU_RULES } from '@silurus/ooxml-core';
 import { layoutDocument } from './document-layout.js';
 import { createLayoutServices } from './layout-runtime.js';
@@ -13,7 +14,8 @@ import {
   resolveSectionLayoutContext,
   type ParagraphLayoutContext,
 } from './layout-context.js';
-import type { TextLayoutService } from './layout/text.js';
+import { createTextLayoutService, type TextLayoutService } from './layout/text.js';
+import { createFontResolver } from './layout/font-service.js';
 import type {
   BodyElement,
   CellElement,
@@ -193,6 +195,168 @@ describe('table intrinsic content widths', () => {
         nestedTable: () => ({ minWidthPt: 0, maxWidthPt: 0 }),
       },
     )).toEqual({ minWidthPt: 26.6, maxWidthPt: 26.6 });
+  });
+
+  it('uses full unbroken content as the AutoFit minimum for auto-width noWrap cells', () => {
+    const source = paragraph([textRun('words with spaces')]);
+    const content = { ...cell([source as CellElement]), noWrap: true, widthPt: null };
+    const dependencies = {
+      paragraph: () => ({ minWidthPt: 20, maxWidthPt: 100, noWrapWidthPt: 80 }),
+      nestedTable: () => ({ minWidthPt: 0, maxWidthPt: 0 }),
+    };
+    expect(measureTableCellIntrinsicWidths(
+      content,
+      { left: 5, right: 5 },
+      dependencies,
+      'autofit',
+    )).toEqual({ minWidthPt: 90, maxWidthPt: 110 });
+    expect(measureTableCellIntrinsicWidths(
+      content,
+      { left: 5, right: 5 },
+      dependencies,
+      'fixed',
+    )).toEqual({ minWidthPt: 30, maxWidthPt: 110 });
+  });
+
+  it('measures an omitted-tcW noWrap minimum beyond the available band', () => {
+    const words = 'alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu';
+    const makeTable = (noWrap: boolean) => table([row([
+      { ...cell([paragraph([textRun(words)]) as CellElement]), noWrap },
+      cell([paragraph([textRun('x')]) as CellElement]),
+    ])], [100, 100]);
+    const ctx = measuringContext();
+    const on = resolveColumnWidths(makeTable(true), 200, columnState(ctx));
+    const off = resolveColumnWidths(makeTable(false), 200, columnState(ctx));
+
+    // The deterministic canvas measures 330pt. A 200pt-clamped paragraph
+    // width would allocate about 195pt here, so this checks the production
+    // paragraph probe rather than injecting a precomputed intrinsic width.
+    expect(on[0]).toBeCloseTo(200 * 330 / 335, 6);
+    expect(on[0]).toBeGreaterThan(off[0]!);
+    expect(on[1]).toBeLessThan(off[1]!);
+  });
+
+  it('uses actual canvas glyph advances for the omitted-tcW noWrap minimum', () => {
+    const words = 'alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu';
+    const makeTable = (noWrap: boolean) => table([row([
+      { ...cell([paragraph([textRun(words)]) as CellElement]), noWrap },
+      cell([paragraph([textRun('x')]) as CellElement]),
+    ])], [100, 100]);
+    const ctx = new Canvas(1, 1).getContext('2d') as unknown as CanvasRenderingContext2D;
+    const state = columnState(ctx);
+    const on = resolveColumnWidths(makeTable(true), 200, state);
+    const off = resolveColumnWidths(makeTable(false), 200, state);
+
+    // The full phrase is wider than the available band in a real font. If
+    // paragraph maxWidthPt is clamped first, this relative result fails.
+    ctx.font = '10pt serif';
+    expect(ctx.measureText(words).width).toBeGreaterThan(200);
+    expect(on[0]).toBeGreaterThan(off[0]! + 5);
+    expect(on[0]).toBeGreaterThan(195);
+    expect(on[1]).toBeLessThan(off[1]!);
+  });
+
+  it('passes dxa noWrap through acquisition to the competing AutoFit columns', () => {
+    const makeTable = (noWrap: boolean) => table([row([
+      { ...cell([paragraph([textRun('first')]) as CellElement]), widthPt: 100, noWrap },
+      { ...cell([paragraph([textRun('other')]) as CellElement]), widthPt: 100 },
+    ])], [100, 100]);
+    const ctx = measuringContext();
+    expect(resolveColumnWidths(makeTable(true), 150, columnState(ctx))).toEqual([100, 50]);
+    expect(resolveColumnWidths(makeTable(false), 150, columnState(ctx))).toEqual([75, 75]);
+  });
+
+  it('honors outer-margin overhang already present in a saved AutoFit grid', () => {
+    const makeTable = (marginPt: number, grid = [240, 238.8]) => table([row([
+      { ...cell([paragraph([textRun('first')]) as CellElement]), marginLeft: marginPt, marginRight: marginPt },
+      { ...cell([paragraph([textRun('other')]) as CellElement]), marginLeft: marginPt, marginRight: marginPt },
+    ])], grid);
+    const state = columnState(measuringContext());
+
+    // Word's saved grid is 478.8pt for a 468pt text band and 5.4pt outer
+    // cell margins. With zero cell margins, the same grid fits to 468pt.
+    expect(resolveColumnWidths(makeTable(5.4), 468, state)
+      .reduce((sum, width) => sum + width, 0)).toBeCloseTo(478.8, 6);
+    expect(resolveColumnWidths(makeTable(0), 468, state)
+      .reduce((sum, width) => sum + width, 0)).toBeCloseTo(468, 6);
+    // A Word-saved 468pt grid stays at the text band even when its cells
+    // inherit the same 5.4pt margins.
+    expect(resolveColumnWidths(makeTable(5.4, [236.5, 231.5]), 468, state)
+      .reduce((sum, width) => sum + width, 0)).toBeCloseTo(468, 6);
+    const nestedState = {
+      ...state,
+      storyContext: {
+        story: 'body',
+        containers: [{ kind: 'tableCell' }],
+        lineNumberingEligible: false,
+      },
+    } as ColumnState;
+    expect(resolveColumnWidths(makeTable(5.4), 468, nestedState)
+      .reduce((sum, width) => sum + width, 0)).toBeCloseTo(468, 6);
+  });
+
+  it('keeps forced noWrap content and outer cell margins in separate AutoFit bands', () => {
+    const words = 'alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu';
+    const long = { ...cell([paragraph([textRun(words)]) as CellElement]),
+      noWrap: true, marginLeft: 5.4, marginRight: 5.4 };
+    const ordinary = { ...cell([paragraph([textRun('other')]) as CellElement]),
+      marginLeft: 5.4, marginRight: 5.4 };
+    const state = columnState(measuringContext());
+    const widths = resolveColumnWidths(table([row([long, ordinary])], [105.4, 105.4]), 200, state);
+    const reversed = resolveColumnWidths(table([row([ordinary, long])], [105.4, 105.4]), 200, state);
+
+    // The real paragraph probe measures 330pt and 25pt of text. The Word
+    // two-cell forced-fit control scales them inside 200pt, then distributes
+    // the 10.8pt outer margin allowance according to the opposing text width.
+    const expectedNoWrap = (200 * 330 + 10.8 * 25) / 355;
+    expect(widths[0]).toBeCloseTo(expectedNoWrap, 6);
+    expect(widths[1]).toBeCloseTo(210.8 - expectedNoWrap, 6);
+    expect(reversed[0]).toBeCloseTo(widths[1]!, 6);
+    expect(reversed[1]).toBeCloseTo(widths[0]!, 6);
+  });
+
+  it('shares the outer margins in a mode-15 forced fit without widening the ceiling', () => {
+    const words = 'alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu';
+    const long = { ...cell([paragraph([textRun(words)]) as CellElement]),
+      noWrap: true, marginLeft: 5.4, marginRight: 5.4 };
+    const ordinary = { ...cell([paragraph([textRun('other')]) as CellElement]),
+      marginLeft: 5.4, marginRight: 5.4 };
+    const base = columnState(measuringContext());
+    const pageStory = (compatibilityMode: number) => ({
+      ...base,
+      layoutSettings: {
+        ...base.layoutSettings,
+        compat: { ...base.layoutSettings.compat, compatibilityMode },
+      },
+      storyContext: { story: 'body', containers: [], lineNumberingEligible: false },
+    } as ColumnState);
+    const widths = (mode: number) =>
+      resolveColumnWidths(table([row([long, ordinary])], [105.4, 105.4]), 200, pageStory(mode));
+
+    // WORD_AUTOFIT_LEADING_INDENT_BAND: mode 14 hangs the 10.8pt outer margins
+    // outside the 200pt band; mode 15 keeps the table at 200pt but still
+    // distributes those margins by the opposing content width (330pt, 25pt).
+    const m14 = widths(14);
+    const m15 = widths(15);
+    expect(m14[0]).toBeCloseTo((200 * 330 + 10.8 * 25) / 355, 6);
+    expect(m14[0]! + m14[1]!).toBeCloseTo(210.8, 6);
+    expect(m15[0]).toBeCloseTo((189.2 * 330 + 10.8 * 25) / 355, 6);
+    expect(m15[0]! + m15[1]!).toBeCloseTo(200, 6);
+  });
+
+  it('excludes first-line indent from the noWrap width request', () => {
+    const first = (text: string, indentFirst: number): DocTableCell => ({
+      ...cell([paragraph([textRun(text)], { indentFirst }) as CellElement]),
+      noWrap: true,
+      widthPct: 1750,
+    });
+    const makeTable = (text: string, indentFirst: number) => ({
+      ...table([row([first(text, indentFirst), cell([paragraph([textRun('Other')]) as CellElement])])], [70, 130]),
+      widthPct: 5000,
+    });
+    const state = columnState(measuringContext());
+    expect(resolveColumnWidths(makeTable('City or Town', 20), 200, state)).toEqual([70, 130]);
+    expect(resolveColumnWidths(makeTable('City or Town Name', 20), 200, state)[0]).toBeGreaterThan(70);
   });
 
   it('retains numbering-marker intrinsic width on an otherwise empty cell paragraph', () => {
@@ -491,6 +655,21 @@ describe('table intrinsic content widths', () => {
     expect(retainedNested.flowBounds.widthPt).toBe(120);
   });
 
+  it.each([undefined, 0, 8, 10, 12])('uses threshold %s in AutoFit intrinsic widths', (kerning) => {
+    const ctx = measuringContext((text) => [...text].length * 10
+      - (ctx.fontKerning === 'normal' && text.includes('AV') ? 2 : 0));
+    const run = { ...textRun('AV'), kerning };
+    const source = paragraph([run]);
+    const services = createLayoutServices(model([]), { measureContext: ctx });
+    const widths = measureParagraphIntrinsicWidths(source, intrinsicContext(), 200,
+      { context: ctx, fontFamilyClasses: {} },
+      { pageIndex: 0, totalPages: 1, pageWritingMode: 'horizontal-tb',
+        documentHasEastAsianText: false, layoutServices: services, enableOpenTypeFeatures: true,
+        compatibilityMode: 15 });
+    expect(widths).toEqual(kerning === 8 || kerning === 10
+      ? { minWidthPt: 18, maxWidthPt: 18 } : { minWidthPt: 20, maxWidthPt: 20 });
+  });
+
   it('shapes identical formatting across a run seam as one proportional atom', () => {
     const ctx = measuringContext((text) => text === 'AV' ? 15 : [...text].length * 10);
     const source = table([row([cell([
@@ -498,6 +677,78 @@ describe('table intrinsic content widths', () => {
     ])])], [0]);
 
     expect(resolveColumnWidths(source, 200, columnState(ctx))).toEqual([15]);
+  });
+
+  it.each([
+    { parts: ['T', ' i'], kerning: 8, min: 10, max: 20 },
+    { parts: ['T ', 'i'], kerning: 8, min: 10, max: 20 },
+    { parts: ['T', ' ', 'i'], kerning: 8, min: 10, max: 20 },
+    { parts: ['A', 'T', ' i'], kerning: 8, min: 18, max: 28 },
+    { parts: ['T', ' iT', ' i'], kerning: 8, min: 11, max: 40 },
+    { parts: [' ', 'T', ' i', ' '], kerning: 8, min: 10, max: 40 },
+    { parts: ['T', ' i'], kerning: 10, min: 10, max: 20 },
+    { parts: ['T', ' i'], kerning: 10.5, min: 10, max: 21 },
+    { parts: ['T', ' i'], kerning: 0, min: 10, max: 21 },
+  ])('measures trimmed atoms independently of run splits: $parts / kern=$kerning', ({ parts, kerning, min, max }) => {
+    // Independent pair-sensitive metrics expose both the removed T-space pair
+    // and the AT pair inside an unbreakable atom; no font installation needed.
+    const ctx = measuringContext((text) => [...text].reduce((sum, c) => sum + (c === 'i' ? 1 : 10), 0)
+      - (ctx.fontKerning === 'normal'
+        ? (text.match(/T /gu)?.length ?? 0) + 2 * (text.match(/AT/gu)?.length ?? 0) : 0));
+    const services = createLayoutServices(model([]), { measureContext: ctx });
+    const widths = (texts: string[]) => measureParagraphIntrinsicWidths(
+      paragraph(texts.map((text) => ({ ...textRun(text), kerning }))),
+      intrinsicContext(), 200, { context: ctx, fontFamilyClasses: {} },
+      { pageIndex: 0, totalPages: 1, pageWritingMode: 'horizontal-tb',
+        documentHasEastAsianText: false, compatibilityMode: 15, layoutServices: services },
+    );
+    expect(widths([parts.join('')])).toEqual({ minWidthPt: min, maxWidthPt: max });
+    expect(widths(parts)).toEqual({ minWidthPt: min, maxWidthPt: max });
+  });
+
+  it.each(['font', 'formatting', 'threshold'])('retains a real %s boundary before a source-run space', (boundary) => {
+    const ctx = measuringContext((text) => [...text].reduce((sum, c) => sum + (c === 'i' ? 1 : 10), 0)
+      - (ctx.fontKerning === 'normal' && text.includes('T ') ? 1 : 0));
+    const services = createLayoutServices(model([]), { measureContext: ctx });
+    const runs = [
+      { ...textRun('T'), kerning: 8 },
+      { ...textRun(' i'), kerning: 8,
+        ...(boundary === 'font' ? { fontFamily: 'sans-serif' }
+          : boundary === 'formatting' ? { bold: true } : { kerning: 10.5 }) },
+    ];
+    expect(measureParagraphIntrinsicWidths(paragraph(runs), intrinsicContext(), 200,
+      { context: ctx, fontFamilyClasses: {} },
+      { pageIndex: 0, totalPages: 1, pageWritingMode: 'horizontal-tb',
+        documentHasEastAsianText: false, compatibilityMode: 15, layoutServices: services },
+    )).toEqual({ minWidthPt: 10, maxWidthPt: 21 });
+  });
+
+  it('removes separator context from a minimum atom when scoped-font ownership prevents merging', () => {
+    const ctx = measuringContext();
+    const base = createLayoutServices(model([]), { measureContext: ctx });
+    // Use the real scope classifier: even excluded Latin ranges retain their
+    // separate full-run contexts and cannot be merged across source runs.
+    const services = Object.freeze({ ...base, text: createTextLayoutService({
+      fonts: createFontResolver([
+        { requestedFamily: 'Scoped Face', resolvedFamily: 'Arabic Substitute',
+          source: 'substitute', script: 'arabic' },
+      ], { scriptScopedFamilies: { 'scoped face': {
+        script: 'arabic', substituteFamilies: ['Arabic Substitute'],
+      } } }),
+      measurer: { fingerprint: 'intrinsic-scoped-space', measure: (request) => ({
+        advancePt: [...request.text].reduce((sum, c) => sum + (c === 'i' ? 1 : 10), 0)
+          - (request.kerning && request.text.includes('T ') ? 1 : 0),
+        ascentPt: 8, descentPt: 2,
+      }) },
+    }) });
+    const widths = (texts: string[]) => measureParagraphIntrinsicWidths(
+      paragraph(texts.map((text) => ({ ...textRun(text), kerning: 8, fontFamily: 'Scoped Face' }))),
+      intrinsicContext(), 200, { context: ctx, fontFamilyClasses: {} },
+      { pageIndex: 0, totalPages: 1, pageWritingMode: 'horizontal-tb',
+        documentHasEastAsianText: false, compatibilityMode: 15, layoutServices: services },
+    );
+    expect(widths(['T i'])).toEqual({ minWidthPt: 10, maxWidthPt: 20 });
+    expect(widths(['T', ' i'])).toEqual({ minWidthPt: 10, maxWidthPt: 20 });
   });
 
   it('retains every rebased punctuation compression across compatible run seams', () => {

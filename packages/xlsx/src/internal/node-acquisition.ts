@@ -1,9 +1,12 @@
 import type { OoxmlResourceUsageSnapshot } from '@silurus/ooxml-core';
 import {
   normalizeLoadResourceOptions,
+  normalizeXlsxWorksheetPolicy,
   OoxmlResourceMetricsSession,
   parseTypedParserError,
   resourcePolicyForWasm,
+  xlsxWorksheetPolicyForWasm,
+  type NormalizedXlsxWorksheetPolicy,
 } from '@silurus/ooxml-core/worker';
 import {
   WasmRuntimeGenerationHost,
@@ -21,10 +24,17 @@ export interface XlsxNodeAcquisitionOptions {
   readonly debug?: boolean;
   readonly onResourceMetrics?: (metrics: import('@silurus/ooxml-core').OoxmlResourceMetrics) => void;
   readonly signal?: AbortSignal;
+  readonly xlsxWorksheetLimits?: Readonly<import('@silurus/ooxml-core').XlsxWorksheetLimits>;
 }
 
 export interface XlsxNodeArchive {
   free(): void;
+  set_worksheet_limits(
+    maxRows: bigint,
+    maxCells: bigint,
+    maxOwnedUtf8Bytes: bigint,
+    maxJsonBytes: bigint,
+  ): void;
   parse(): Uint8Array;
   resource_usage(): Uint8Array;
   open_sheet_cursor(sheetIndex: number, name: string): void;
@@ -66,6 +76,8 @@ export interface XlsxNodeAcquisition {
   readonly workbookIndex: ParsedWorkbook;
   readonly usage: OoxmlResourceUsageSnapshot | undefined;
   readonly metrics: OoxmlResourceMetricsSession;
+  /** Normalized, deeply frozen worksheet policy captured at acquisition. */
+  readonly worksheetPolicy: NormalizedXlsxWorksheetPolicy;
   closeArchive(): void;
 }
 
@@ -74,7 +86,10 @@ export interface XlsxNodeAcquisition {
  * archive, or a model-source archive whose ZIP accounting is optional.
  */
 export interface XlsxNodeSessionArchive
-  extends Omit<XlsxNodeArchive, 'free' | 'resource_usage' | 'sheet_cursor_resource_usage'> {
+  extends Omit<
+    XlsxNodeArchive,
+    'free' | 'resource_usage' | 'sheet_cursor_resource_usage' | 'set_worksheet_limits'
+  > {
   /** Absent when the source has no ZIP accounting; absence is not zero usage. */
   resource_usage?(): Uint8Array;
   sheet_cursor_resource_usage?(): Uint8Array;
@@ -86,6 +101,7 @@ export async function acquireXlsxNodeSession(
   wasmModule: WebAssembly.Module,
   options: XlsxNodeAcquisitionOptions = {},
 ): Promise<XlsxNodeAcquisition> {
+  const worksheetPolicy = normalizeXlsxWorksheetPolicy(options);
   const resourceOptions = normalizeLoadResourceOptions(options);
   const metrics = new OoxmlResourceMetricsSession({
     enabled: resourceOptions.debug || resourceOptions.onResourceMetrics !== undefined,
@@ -93,6 +109,7 @@ export async function acquireXlsxNodeSession(
     mode: 'node',
     scope: 'session',
     policy: resourceOptions.policy,
+    xlsxWorksheetPolicy: worksheetPolicy,
     onMetrics: resourceOptions.onResourceMetrics,
     emitToConsole: resourceOptions.debug,
   });
@@ -112,6 +129,9 @@ export async function acquireXlsxNodeSession(
     );
     throwIfAborted(options.signal);
     const archive = handle.proxy;
+    const [maxRows, maxCells, maxOwnedUtf8Bytes, maxJsonBytes] =
+      xlsxWorksheetPolicyForWasm(worksheetPolicy);
+    archive.set_worksheet_limits(maxRows, maxCells, maxOwnedUtf8Bytes, maxJsonBytes);
     const { workbook: workbookIndex, usage } = readXlsxArchiveBootstrap(
       () => JSON.parse(new TextDecoder().decode(archive.parse())) as ParsedWorkbook,
       () => archive.resource_usage(),
@@ -123,6 +143,7 @@ export async function acquireXlsxNodeSession(
       workbookIndex,
       usage,
       metrics,
+      worksheetPolicy,
       closeArchive: () => handle?.close((current: XlsxNodeArchive) => current.free()),
     };
   } catch (error) {

@@ -1,0 +1,17 @@
+id: no-retained-bytes-rest-pattern
+valid:
+  - |
+    impl RetainedBytes for Model {
+        fn heap_bytes(&self) -> u64 {
+            let Self { name, values } = self;
+            name.heap_bytes() + values.heap_bytes()
+        }
+    }
+invalid:
+  - |
+    impl RetainedBytes for Model {
+        fn heap_bytes(&self) -> u64 {
+            let Self { name, .. } = self;
+            name.heap_bytes()
+        }
+    }

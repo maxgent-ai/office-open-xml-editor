@@ -27,6 +27,36 @@ function measureContext(): CanvasRenderingContext2D {
 }
 
 describe('line layout cluster acquisition', () => {
+  it.each(['', ' '])('keeps justified fit acquisition bounded for an overlong word with tail %j', (tail) => {
+    const text = 'a'.repeat(400) + tail;
+    const layout = (compression: boolean) => {
+      let measuredUtf16 = 0;
+      const service = createTextLayoutService({
+        fonts: createFontResolver([]),
+        measurer: { fingerprint: 'overlong-word-acquisition', measure(request) {
+          measuredUtf16 += request.text.length;
+          return { advancePt: request.text.length * 5, ascentPt: 8, descentPt: 2 };
+        } },
+      });
+      const segment: LayoutTextSeg = {
+        text, bold: false, italic: false, underline: false, strikethrough: false,
+        fontSize: 10, color: null, fontFamily: 'serif', vertAlign: null, measuredWidth: 0,
+        textLayoutService: service,
+        textShapeRequest: { text, fontSizePt: 10, fonts: { ascii: 'serif' }, measure: false },
+      };
+      const lines = layoutLines(measureContext(), [segment], 50, 0, 1, [], undefined, {}, 0,
+        undefined, undefined, undefined, undefined, false, true, false,
+        undefined, 'bounded', undefined, false, compression);
+      return { measuredUtf16, lines: lines.map(line => line.segments.map(s => 'text' in s ? s.text : '').join('')) };
+    };
+    const previous = layout(false);
+    const current = layout(true);
+    expect(current.lines).toEqual(previous.lines);
+    // Count shaping input, not wall time: a full grapheme pass over every
+    // emergency suffix grows cubically and exceeds the aggregate path budget.
+    expect(current.measuredUtf16).toBeLessThanOrEqual(previous.measuredUtf16 * 2);
+  });
+
   it('uses aggregate shaping while wrapping and retains clusters only for final pieces', () => {
     const requests: TextShapeRequest[] = [];
     const base = createTextLayoutService({

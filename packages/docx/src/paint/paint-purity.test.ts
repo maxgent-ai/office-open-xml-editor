@@ -385,6 +385,96 @@ describe('paintLayoutPage', () => {
     expect(events).toContain('clip');
   });
 
+  it('paints native separator and notice occurrences once without measuring', () => {
+    const events: string[] = [];
+    let fill = '';
+    const ctx = {
+      save() {}, restore() {}, beginPath() {}, clip() {}, rect() {}, setLineDash() {},
+      moveTo() {}, lineTo() {},
+      stroke() { events.push('stroke'); },
+      set fillStyle(value: string) { fill = value; },
+      get fillStyle() { return fill; },
+      fillRect(x: number, y: number) { events.push(`fill:${fill}:${x},${y}`); },
+      strokeStyle: '', lineWidth: 1,
+    } as unknown as CanvasRenderingContext2D;
+    const section: SectionLayoutContext = {
+      geometry: {
+        pageWidth: 100, pageHeight: 200,
+        marginTop: 10, marginRight: 10, marginBottom: 10, marginLeft: 10,
+        headerDistance: 5, footerDistance: 5,
+      },
+      columns: [{ xPt: 10, wPt: 80 }],
+      columnSeparator: false,
+      grid: { kind: 'none', linePitchPt: null, charSpacePt: null },
+      textDirection: 'lrTb', verticalAlignment: 'top',
+    };
+    const flowDomainId = 'page:0:region:region%3A0:column:0';
+    const reserved = (storyInstance: string) => ({ story: 'footnote' as const, storyInstance, path: [] });
+    const paragraph = (id: string, yPt: number, heightPt: number, color: string): ParagraphLayout => {
+      const bounds = { xPt: 10, yPt, widthPt: 80, heightPt };
+      return {
+        kind: 'paragraph', id, source: { ...reserved(id), path: [0] }, flowDomainId,
+        ordinaryFlow: true, flowBounds: bounds, inkBounds: bounds, advancePt: heightPt,
+        spacing: { beforePt: 0, afterPt: 0 }, contextualSpacing: false, lines: [],
+        shading: { color }, borders: [], resources: [], drawings: [], textBoxes: [],
+        events: [], exclusions: [],
+      } as unknown as ParagraphLayout;
+    };
+    const child = paragraph('note-child', 150, 10, '#ffffff');
+    const note: NoteLayout = {
+      kind: 'note', id: 'note', source: { story: 'footnote', storyInstance: '1', path: [] },
+      flowDomainId, ordinaryFlow: false,
+      flowBounds: { xPt: 10, yPt: 140, widthPt: 80, heightPt: 26 },
+      inkBounds: { xPt: 10, yPt: 140, widthPt: 80, heightPt: 26 },
+      advancePt: 26,
+      separator: [],
+      leading: {
+        role: 'separator', source: reserved('reserved:separator'),
+        flowBounds: { xPt: 10, yPt: 140, widthPt: 80, heightPt: 10 }, advancePt: 10,
+        paragraph: paragraph('reserved:separator', 140, 10, '#00ff00'),
+        rule: {
+          mark: 'short', source: { ...reserved('reserved:separator'), path: [0, 0] },
+          segment: {
+            edge: 'top', from: { xPt: 10, yPt: 145 }, to: { xPt: 36, yPt: 145 },
+            color: '#000000', widthPt: 0.5, authoredStyle: 'single', style: 'solid',
+          },
+        },
+      },
+      trailing: {
+        role: 'continuationNotice', source: reserved('reserved:continuation-notice'),
+        flowBounds: { xPt: 10, yPt: 160, widthPt: 80, heightPt: 6 }, advancePt: 6,
+        paragraph: paragraph('reserved:continuation-notice', 160, 6, '#0000ff'),
+      },
+      story: {
+        story: 'footnote', flowBounds: child.flowBounds, inkBounds: child.inkBounds,
+        blocks: [child], advancePt: 10, diagnostics: [],
+      },
+    };
+    const page = createLayoutPage({
+      pageIndex: 0,
+      physicalPage: { widthPt: 100, heightPt: 200, contentTopPt: 10, contentBottomPt: 190 },
+      sectionOccurrenceId: 'section:0', section,
+      sectionRegions: [{
+        id: 'region:0', sectionOccurrenceId: 'section:0', section,
+        writingMode: 'horizontal-tb', blockStartPt: 10, blockEndPt: 190,
+        columns: [{ inlineStartPt: 10, inlineExtentPt: 80 }],
+      }],
+      paint: [{ layer: 'notes', node: note }],
+      readingOrder: [note],
+      pageNumber: { displayNumber: 1, format: 'decimal', sectionOccurrenceId: 'section:0' },
+    });
+
+    // The stub has no measureText: any paint-time measurement would throw.
+    paintLayoutPageContent(page, {
+      ctx, scale: 1, dpr: 1,
+    } as unknown as Parameters<typeof paintLayoutPageContent>[1]);
+
+    expect(events.filter((event) => event === 'stroke')).toHaveLength(1);
+    expect(events.filter((event) => event.startsWith('fill:'))).toEqual([
+      'fill:#00ff00:10,140', 'fill:#ffffff:10,150', 'fill:#0000ff:10,160',
+    ]);
+  });
+
   it('paints retained geometry without measuring text', async () => {
     const fills: Array<{ fill: string; args: number[] }> = [];
     let currentFill = '';

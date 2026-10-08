@@ -13,6 +13,9 @@ import {
   type TiffRenderOptions,
 } from '@silurus/ooxml-core';
 import { isOptionalImageUnavailable } from './internal/optional-image-fallback.js';
+import { captureInitialAnchorSizes, bindInitialAnchorSizes } from './internal/initial-anchor-sizes.js';
+import { getGridGeometryForWorksheet } from './renderer.js';
+import { GridGeometry } from './internal/grid-geometry.js';
 
 /**
  * The render orchestrator decodes embedded images lazily by zip path:
@@ -179,6 +182,20 @@ function worksheetWithImages(): Worksheet {
 
 describe('render-orchestrator image decode (lazy bytes)', () => {
   afterEach(() => vi.unstubAllGlobals());
+
+  it('does not fetch a tagged oneCell picture whose anchor-level extent is missing', async () => {
+    const ws = worksheetWithImages();
+    ws.images = [];
+    const group = ws.shapeGroups![0]!;
+    group.anchorTag = 'oneCellAnchor';
+    group.editAs = 'oneCell';
+    // A stale child transform cannot make a missing anchor-level size renderable.
+    group.nativeExtCx = 914400;
+    group.nativeExtCy = 914400;
+    const fetchImage = vi.fn();
+    await prefetchImages(ws, new Map(), fetchImage);
+    expect(fetchImage).not.toHaveBeenCalled();
+  });
 
   it('prefetchImages collects BOTH ws.images and group-leaf images, keyed by imagePath, decoded once each', async () => {
     vi.stubGlobal('createImageBitmap', vi.fn(async (blob: Blob) => new FakeBitmap(blob.type)));
@@ -1619,5 +1636,71 @@ describe('render-pass lease: >cap prefetch never draws a closed bitmap', () => {
 
     dropDuotoneBitmapCache(fetchImage);
     dropBitmapCacheByPath(fetchImage);
+  });
+});
+
+// Production metafile raster sizing must agree with tagged placement geometry,
+// including retained viewer sizes and true oneCell anchor ext. Untagged models
+// preserve their existing native extent and crop is still expanded exactly once.
+describe('tagged anchor metafile raster preparation (#1713)', () => {
+  afterEach(() => vi.unstubAllGlobals());
+  it.each([
+    ['picture', [480, 180]], ['group', [240, 90]],
+    ['oneCell-crop', [480, 90]], ['untagged', [2, 2]],
+  ] as const)('sizes the real WMF player for %s', async (kind, expected) => {
+    stubOffscreenCanvas();
+    vi.stubGlobal('createImageBitmap', vi.fn(async (surface: { width: number; height: number }) =>
+      ({ width: surface.width, height: surface.height, close() {} })));
+    const ws = worksheetWithImages();
+    const facts = {
+      fromCol: 0, fromColOff: 0, fromRow: 0, fromRowOff: 0,
+      toCol: 0, toColOff: 320 * 9525, toRow: 0, toRowOff: 120 * 9525,
+      nativeExtCx: 9525, nativeExtCy: 9525, editAs: 'oneCell' as const,
+    };
+    const path = 'xl/media/synthetic-metafile.wmf';
+    ws.images = [];
+    ws.shapeGroups = [];
+    if (kind === 'picture' || kind === 'untagged') {
+      ws.images = [{ ...facts, ...(kind === 'picture' ? { anchorTag: 'twoCellAnchor' as const } : {}), imagePath: path, mimeType: 'image/wmf' }];
+    } else {
+      ws.shapeGroups = [{
+        ...facts, anchorTag: kind === 'group' ? 'twoCellAnchor' : 'oneCellAnchor',
+        anchorExtCx: 320 * 9525, anchorExtCy: 120 * 9525,
+        shapes: [{ x: 0, y: 0, w: .5, h: .5, rot: 0, strokeWidth: 0,
+          geom: { type: 'image', imagePath: path, mimeType: 'image/wmf',
+            ...(kind === 'oneCell-crop' ? { srcRect: { l: .25, r: .25, t: 0, b: 0 } } : {}) } }],
+      }] as Worksheet['shapeGroups'];
+    }
+    const fetch = vi.fn(async () => new Blob([buildMinimalWmf() as BlobPart], { type: 'image/wmf' }));
+    const cache = new Map<string, CanvasImageSource | null>();
+    try {
+      await prefetchImages(ws, cache, fetch, { effectiveDpr: 1 });
+      const bitmap = cache.get(path) as ImageBitmap;
+      expect(bitmap).not.toBeNull();
+      expect([bitmap.width, bitmap.height]).toEqual(expected);
+    } finally { dropBitmapCacheByPath(fetch); }
+  });
+
+  it('uses the bound prepared size for the WMF decoder after band edits and zoom', async () => {
+    stubOffscreenCanvas();
+    vi.stubGlobal('createImageBitmap', vi.fn(async (surface: { width: number; height: number }) =>
+      ({ width: surface.width, height: surface.height, close() {} })));
+    const ws = worksheetWithImages();
+    ws.colWidths = { 1: 20, 2: 20 };
+    ws.rowHeights = { 1: 45, 2: 45 };
+    ws.shapeGroups = [];
+    const image = ws.images[0];
+    Object.assign(image, { anchorTag: 'twoCellAnchor', editAs: 'oneCell', nativeExtCx: 9525, nativeExtCy: 9525,
+      imagePath: 'xl/media/retained-metafile.wmf', mimeType: 'image/wmf' });
+    bindInitialAnchorSizes(ws, captureInitialAnchorSizes(ws, getGridGeometryForWorksheet(ws))!);
+    ws.colWidths[1] = 60;
+    GridGeometry.invalidate(ws);
+    const fetch = vi.fn(async () => new Blob([buildMinimalWmf() as BlobPart], { type: 'image/wmf' }));
+    const cache = new Map<string, CanvasImageSource | null>();
+    try {
+      await prefetchImages(ws, cache, fetch, { cellScale: 2, effectiveDpr: 1 });
+      const bitmap = cache.get(image.imagePath) as ImageBitmap;
+      expect([bitmap.width, bitmap.height]).toEqual([960, 360]);
+    } finally { dropBitmapCacheByPath(fetch); }
   });
 });

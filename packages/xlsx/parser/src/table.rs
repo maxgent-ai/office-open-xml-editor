@@ -150,7 +150,7 @@ pub(crate) fn load_sheet_tables(
 
     let mut tables: Vec<TableInfo> = Vec::new();
     for target in table_targets {
-        let table_path = resolve_zip_path(&format!("xl/{}", sheet_dir), &target);
+        let table_path = resolve_zip_path(&format!("xl/{sheet_path}"), &target);
         let Ok(xml) = read_zip_string(archive, &table_path) else {
             continue;
         };

@@ -334,6 +334,26 @@ function docOf(paras: DocParagraph[], width = 400): DocxDocumentModel {
 }
 
 describe('bidi TOC / footer rows render on one line, mirrored (issue #820)', () => {
+  it('retains a leading tab leader when a second tab fixes its reading-order gap', async () => {
+    const { canvas, fills, leaderXs } = makeRecordingCanvas();
+    const row = bidiPara(
+      [txt('AB', true), txt('\t', true), txt('TITLE', true), txt('\t', true), txt('9', true)],
+      [
+        { pos: 50, alignment: 'left', leader: 'underscore' },
+        { pos: 180, alignment: 'left', leader: 'underscore' },
+      ],
+    );
+    await renderDocumentToCanvas(docOf([row]), canvas, 0, { dpr: 1, width: 400 });
+    const pageNum = fills.find((f) => f.text === '9')!;
+    const title = fills.find((f) => f.text === 'TITLE')!;
+    expect(pageNum.x).toBeCloseTo(210, 0);
+    expect(title.x).toBeCloseTo(300, 0);
+    // Both authored leaders survive fitting: the second leading gap is fixed
+    // before bidi projection and still paints between the adjacent cells.
+    expect(leaderXs.some((x) => x > pageNum.x + 10 && x < title.x)).toBe(true);
+    expect(leaderXs.some((x) => x > title.x + 50 && x < 380)).toBe(true);
+  });
+
   it('draws the TOC page number at the left, chapter at the right, with a leader', async () => {
     const { canvas, fills, leaderXs } = makeRecordingCanvas();
     // pageWidth 400, no margins ⇒ scale 1, content [0,400]. Right/underscore
@@ -346,7 +366,7 @@ describe('bidi TOC / footer rows render on one line, mirrored (issue #820)', () 
     await renderDocumentToCanvas(docOf([row]), canvas, 0, { dpr: 1, width: 400 });
 
     const pageNum = fills.find((f) => f.text === '9');
-    const chapter = fills.find((f) => f.text === 'AB');
+    const chapter = fills.find((f) => f.text.trim() === 'AB');
     expect(pageNum, 'page number drawn').toBeDefined();
     expect(chapter, 'chapter number drawn').toBeDefined();
     // Page number on the visual LEFT (near x=20), chapter number on the visual
@@ -398,7 +418,7 @@ describe('bidi TOC / footer rows render on one line, mirrored (issue #820)', () 
     await renderDocumentToCanvas(docOf([row]), canvas, 0, { dpr: 1, width: 400 });
     const pageNum = fills.find((f) => f.text === '9');
     const title = fills.find((f) => f.text === 'TITLE');
-    const chapter = fills.find((f) => f.text === 'AB');
+    const chapter = fills.find((f) => f.text.trim() === 'AB');
     expect(pageNum).toBeDefined();
     expect(title).toBeDefined();
     expect(chapter).toBeDefined();
@@ -426,7 +446,7 @@ describe('bidi TOC / footer rows render on one line, mirrored (issue #820)', () 
       { indentLeft: 36 },
     );
     await renderDocumentToCanvas(docOf([row]), canvas, 0, { dpr: 1, width: 400 });
-    const chapter = fills.find((f) => f.text === 'AB');
+    const chapter = fills.find((f) => f.text.trim() === 'AB');
     const title = fills.find((f) => f.text === 'TITLE');
     expect(chapter).toBeDefined();
     expect(title).toBeDefined();

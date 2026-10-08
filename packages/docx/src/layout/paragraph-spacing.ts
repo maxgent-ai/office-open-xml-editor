@@ -1,3 +1,4 @@
+import { WORD_FIXED_PARAGRAPH_AUTO_SPACING_STORED_MARGINS } from './line-compatibility.js';
 export interface ParagraphSpacingParticipant {
   readonly contextualSpacing?: boolean;
   readonly styleId?: string | null;
@@ -39,5 +40,42 @@ export function paragraphGapAdjustment(
   return {
     suppressBefore,
     overlap: previousAfterPt + (suppressBefore ? 0 : currentBeforePt) - gapPt,
+  };
+}
+
+/**
+ * ECMA-376 §17.3.1.33 delegates automatic margins to the consumer's HTML
+ * paragraph policy and gives an active automatic flag priority over stored
+ * before/after values (including line-unit values). The library uses the
+ * standard HTML p margin of 1em on each side, with the paragraph's resolved
+ * base/mark font size as the em; changing an inline run must not change its
+ * parent paragraph's margin. This is a consumer policy, not a fitted Office
+ * amount or a font-dependent correction. Explicit false retains stored values.
+ *
+ * Part 4 §14.8.3.15 specifies 5pt/10pt under the fixed compatibility setting.
+ * WORD_FIXED_PARAGRAPH_AUTO_SPACING_STORED_MARGINS records the approved Word
+ * deviation: that setting preserves the stored resolved pair. Missing values
+ * remain zero; line-unit interpretation stays at its existing parser owner.
+ * Resolve at the immutable model boundary, before both pagination and line
+ * acquisition consume the same pair; paint and paragraph-gap folding do not
+ * need to know about automatic flags.
+ */
+export function resolveAutomaticParagraphMarginsPt(
+  paragraph: Readonly<{
+    spaceBefore?: number;
+    spaceAfter?: number;
+    beforeAutospacing?: boolean;
+    afterAutospacing?: boolean;
+  }>,
+  baseFontSizePt: number,
+  fixed: boolean,
+): Readonly<{ spaceBefore: number; spaceAfter: number }> {
+  void WORD_FIXED_PARAGRAPH_AUTO_SPACING_STORED_MARGINS;
+  if (fixed) return { spaceBefore: paragraph.spaceBefore ?? 0, spaceAfter: paragraph.spaceAfter ?? 0 };
+  return {
+    spaceBefore: paragraph.beforeAutospacing === true
+      ? baseFontSizePt : paragraph.spaceBefore ?? 0,
+    spaceAfter: paragraph.afterAutospacing === true
+      ? baseFontSizePt : paragraph.spaceAfter ?? 0,
   };
 }

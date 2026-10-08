@@ -5,8 +5,8 @@
 // policy lives in floats.ts. No canvas/drawing or document-model deps, so the
 // geometry can be unit-reasoned and shared by the renderer and the paginator.
 //
-// Compatibility behavior is named and evidence-backed in compatibility.ts;
-// this module receives its square-line minimum as an explicit input.
+// Word gap order is measured by the issue #1670 controls; callers supply
+// the next atom width, while this module owns geometry and numeric safety.
 
 import {
   assertValidPolygonCompileInput,
@@ -99,6 +99,13 @@ interface FloatRectCore {
   anchorOccurrenceId?: string;
   acquisitionOccurrenceId?: string;
   wrapPolygon?: readonly Readonly<{ xPt: number; yPt: number }>[];
+  /** WORD_MODE14_TIGHT_ANCHOR_TOP_TOUCH: a line starting at or below this Y
+   * whose bottom lies exactly on this tight polygon's top also wraps around
+   * the top edge. */
+  topEdgeInclusiveFromYPt?: number;
+  /** WORD_MODE14_TIGHT_ANCHOR_LINE_REWRAP: the line starting exactly at this
+   * top ignores this float. */
+  exemptLineTopPt?: number;
   /** Hex key of the image bitmap (used to defer drawing until final Y is known). */
   imageKey: string;
   /** Absolute X of the object box in the consuming wrap context's linear unit
@@ -474,11 +481,10 @@ function floatBlockedIntervals(
  *   2. square floats (§20.4.2.17): text wraps around the float's rect + dist
  *      padding; tight/through use their compiled polygons (§20.4.2.18/.19).
  *      Multiple objects are composed only after each `largest` object selects
- *      its own permitted side under §20.4.3.7. The widest remaining gap wins.
+ *      its own permitted side under §20.4.3.7. The first usable gap in reading order wins.
  *
- * `word-square-line-start-one-inch` is a square-object compatibility rule, not
- * polygon geometry and not an ECMA-376 mandate. The prepared API therefore
- * receives square and polygon requirements separately.
+ * The prepared API can receive distinct square/polygon requirements for
+ * direct geometry probes; production supplies the next atom width to both.
  */
 export function resolveLineFloatWindow(
   topY: number,
@@ -533,6 +539,9 @@ function finiteStructuralEvents(
       unreducedExactFromNumber(probeH),
     )));
     appendY(rect.yBottom);
+    // The window changes at an exempt anchor line and at a top-touch threshold.
+    if (rect.exemptLineTopPt !== undefined) appendY(rect.exemptLineTopPt);
+    if (rect.topEdgeInclusiveFromYPt !== undefined) appendY(rect.topEdgeInclusiveFromYPt);
     if (!polygon) continue;
     for (const eventYPt of polygonLineTopEventYPts(polygon, probeH)) appendY(eventYPt);
   }
@@ -578,12 +587,13 @@ function mergeAttributedIntervals(
   return merged;
 }
 
-function widestUsableFreeGap(
+function firstUsableFreeGap(
   blocked: readonly ExactAttributedGap[],
   left: number,
   right: number,
   polygonRequiredWidth: number,
   squareRequiredWidth: number,
+  readingDirection: 'ltr' | 'rtl',
 ): Readonly<{
   l: ExactRational;
   r: ExactRational;
@@ -639,14 +649,11 @@ function widestUsableFreeGap(
   if (compareExactRational(cursor, exactRight) < 0) {
     consider(cursor, exactRight, cursorSquareBoundary);
   }
-  let widestWidth: ExactRational = { numerator: 0n, denominator: 1n };
-  for (const gap of gaps) {
+  // WORD_FLOAT_GAP_FLOW selects physical gaps in reading order;
+  // width admission belongs to the next
+  // indivisible text atom, not a universal one-inch threshold (#1670).
+  for (const gap of readingDirection === 'rtl' ? gaps.reverse() : gaps) {
     const width = subtractUnreducedExact(gap.r, gap.l);
-    if (compareExactRational(width, widestWidth) > 0) widestWidth = width;
-  }
-  for (const gap of gaps) {
-    const width = subtractUnreducedExact(gap.r, gap.l);
-    if (compareExactRational(width, widestWidth) !== 0) continue;
     const requirement = Math.max(
       MIN_LINE_GAP,
       gap.squareConstrained ? squareRequiredWidth : polygonRequiredWidth,
@@ -660,6 +667,122 @@ function widestUsableFreeGap(
     }
   }
   return null;
+}
+
+/** Whether the unpadded polygon `points` meets the rectangle
+ * [leftPt, rightPt] x [topY, topY + heightPt). */
+export function polygonMeetsRect(
+  points: readonly Readonly<{ xPt: number; yPt: number }>[],
+  topY: number,
+  heightPt: number,
+  leftPt: number,
+  rightPt: number,
+): boolean {
+  if (points.length < 3 || !(heightPt > 0) || !(rightPt > leftPt)) return false;
+  const xs = points.map((point) => point.xPt);
+  const ys = points.map((point) => point.yPt);
+  const compiled = compilePolygonWrap({
+    kind: 'tight',
+    imageKey: 'anchor-line-rewrap-probe',
+    points,
+    xLeftPt: Math.min(...xs),
+    xRightPt: Math.max(...xs),
+    yTopPt: Math.min(...ys),
+    yBottomPt: Math.max(...ys),
+  });
+  const exactLeft = unreducedExactFromNumber(leftPt);
+  const exactRight = unreducedExactFromNumber(rightPt);
+  return projectPolygonExactLineIntervals(compiled, topY, heightPt).some((interval) =>
+    compareExactRational(interval.l, exactRight) < 0
+      && compareExactRational(interval.r, exactLeft) > 0);
+}
+
+/** Exact binary height of the probe that reads a tight polygon edge. */
+const TIGHT_EDGE_PROBE_PT = 2 ** -10;
+
+/** Line-top Y of the probe band that reads a tight polygon's touched edge, or
+ * null when the line band does not touch one. WORD_TIGHT_WRAP_BOTTOM_EDGE: a
+ * line whose top is exactly the polygon bottom wraps around the bottom edge.
+ * WORD_MODE14_TIGHT_ANCHOR_TOP_TOUCH: a line whose bottom is exactly the top
+ * of a polygon flagged `topEdgeInclusiveFromYPt`, starting at or below that
+ * Y, wraps around the top edge. */
+function tightEdgeTouch(
+  float: PreparedFloatRect,
+  exactTop: ExactRational,
+  exactBottom: ExactRational,
+): number | null {
+  if (float.polygon?.kind !== 'tight') return null;
+  const { rect } = float;
+  if (compareExactRational(exactTop, unreducedExactFromNumber(rect.yBottom)) === 0) {
+    return rect.yBottom - TIGHT_EDGE_PROBE_PT;
+  }
+  if (rect.topEdgeInclusiveFromYPt !== undefined
+    && compareExactRational(exactTop, unreducedExactFromNumber(rect.topEdgeInclusiveFromYPt)) >= 0
+    && compareExactRational(exactBottom, unreducedExactFromNumber(rect.yTop)) === 0) {
+    return rect.yTop;
+  }
+  return null;
+}
+
+/**
+ * The vertical test `lineWindowAtY` uses to decide whether `float` affects a
+ * line band [topY, topY + heightPt]: a strict overlap, or a touched tight
+ * polygon edge (`tightEdgeTouch`), except on an exempt anchor line.
+ * Pagination uses the same predicate to decide whether a carried drawing
+ * can change an earlier line.
+ */
+export function createFloatLineBandPredicate(
+  float: FloatRect,
+): (topY: number, heightPt: number) => boolean {
+  const prepared = prepareFloatWrap([float]).floats[0]!;
+  const { rect } = prepared;
+  return (topY, heightPt) => {
+    const exactTop = unreducedExactFromNumber(topY);
+    const exactBottom = addUnreducedExact(exactTop, unreducedExactFromNumber(heightPt));
+    const overlaps = compareExactRational(exactBottom, unreducedExactFromNumber(rect.yTop)) > 0
+      && compareExactRational(exactTop, unreducedExactFromNumber(rect.yBottom)) < 0;
+    if (rect.mode === 'topAndBottom') return overlaps;
+    if (rect.exemptLineTopPt === topY) return false;
+    return overlaps || tightEdgeTouch(prepared, exactTop, exactBottom) !== null;
+  };
+}
+
+/** Whether the line band [topY, topY + probeH] lies in a tight polygon's
+ * line-step region: it meets the polygon, including the touched edges of
+ * `tightEdgeTouch`. An exempt anchor line (`exemptLineTopPt`) is still in the
+ * region; the exemption only changes that line's own window. */
+function bandMeetsTightPolygon(
+  prepared: PreparedFloatWrap,
+  topY: number,
+  probeH: number,
+  paraXLeft: number,
+  paraXRight: number,
+): boolean {
+  return lowestMetTightBottom(prepared, topY, probeH, paraXLeft, paraXRight) !== null;
+}
+
+/** The lowest bottom of the tight polygons whose line-step region contains
+ * the band [topY, topY + probeH] (see bandMeetsTightPolygon), or null. */
+function lowestMetTightBottom(
+  prepared: PreparedFloatWrap,
+  topY: number,
+  probeH: number,
+  paraXLeft: number,
+  paraXRight: number,
+): number | null {
+  const exactTop = unreducedExactFromNumber(topY);
+  const exactBottom = addUnreducedExact(exactTop, unreducedExactFromNumber(probeH));
+  let lowest: number | null = null;
+  for (const float of prepared.floats) {
+    const { rect } = float;
+    if (float.polygon?.kind !== 'tight' || rect.mode !== 'square') continue;
+    if (!floatOverlapsColumnX(rect as FloatRect, paraXLeft, paraXRight)) continue;
+    const meets = tightEdgeTouch(float, exactTop, exactBottom) !== null
+      || (compareExactRational(exactBottom, unreducedExactFromNumber(rect.yTop)) > 0
+        && compareExactRational(exactTop, unreducedExactFromNumber(rect.yBottom)) < 0);
+    if (meets) lowest = Math.max(lowest ?? Number.NEGATIVE_INFINITY, rect.yBottom);
+  }
+  return lowest;
 }
 
 function lineWindowAtY(
@@ -689,22 +812,27 @@ function lineWindowAtY(
   for (const float of prepared.floats) {
     const { rect } = float;
     if (rect.mode !== 'square') continue;
-    if (compareExactRational(exactBottom, exactRectY(rect.yTop)) <= 0
-      || compareExactRational(exactTop, exactRectY(rect.yBottom)) >= 0) continue;
+    if (rect.exemptLineTopPt === topY) continue;
+    const edge = tightEdgeTouch(float, exactTop, exactBottom);
+    if (edge === null && (compareExactRational(exactBottom, exactRectY(rect.yTop)) <= 0
+      || compareExactRational(exactTop, exactRectY(rect.yBottom)) >= 0)) continue;
     if (!floatOverlapsColumnX(rect as FloatRect, paraXLeft, paraXRight)) continue;
-    const intervals = floatBlockedIntervals(
-      float, topY, probeH, paraXLeft, paraXRight, reference,
-    );
+    const intervals = edge === null
+      ? floatBlockedIntervals(float, topY, probeH, paraXLeft, paraXRight, reference)
+      : floatBlockedIntervals(
+          float, edge, TIGHT_EDGE_PROBE_PT, paraXLeft, paraXRight, reference,
+        );
     if (intervals.length === 0) continue;
     blocked.push(...intervals);
   }
   if (blocked.length === 0) return { topY, xOffset: 0, maxWidth };
-  const best = widestUsableFreeGap(
+  const best = firstUsableFreeGap(
     blocked,
     paraXLeft,
     paraXRight,
     polygonRequiredWidth,
     squareRequiredWidth,
+    reference.readingDirection,
   );
   if (!best) return null;
   const zero: ExactRational = { numerator: 0n, denominator: 1n };
@@ -756,6 +884,52 @@ function lineWindowAtY(
     xOffset: xOffsetNumber,
     maxWidth: maxWidthNumber,
   };
+}
+
+/**
+ * Left edge of the first free horizontal gap of the band [topY, topY + probeH]
+ * between `leftPt` and `rightPt`, around the square/tight/through exclusions of
+ * `floats`, or null when the band is fully blocked (including by a
+ * topAndBottom object). Gaps narrower than MIN_LINE_GAP are slivers.
+ *
+ * Used by WORD_MODE14_COLUMN_LINE_START_ORIGIN: in compatibility mode 14 a
+ * column-relative horizontal offset is measured from this edge.
+ */
+export function firstFreeGapLeftPt(
+  floats: readonly FloatRect[],
+  topY: number,
+  probeH: number,
+  leftPt: number,
+  rightPt: number,
+): number | null {
+  const prepared = prepareFloatWrap(floats);
+  const exactTop = unreducedExactFromNumber(topY);
+  const exactBottom = addUnreducedExact(exactTop, unreducedExactFromNumber(probeH));
+  const reference: LineFloatReference = { xLeftPt: leftPt, xRightPt: rightPt, readingDirection: 'ltr' };
+  const blocked: ExactAttributedGap[] = [];
+  for (const float of prepared.floats) {
+    const { rect } = float;
+    if (compareExactRational(exactBottom, unreducedExactFromNumber(rect.yTop)) <= 0
+      || compareExactRational(exactTop, unreducedExactFromNumber(rect.yBottom)) >= 0) continue;
+    if (!floatOverlapsColumnX(rect as FloatRect, leftPt, rightPt)) continue;
+    if (rect.mode === 'topAndBottom') return null;
+    blocked.push(...floatBlockedIntervals(float, topY, probeH, leftPt, rightPt, reference));
+  }
+  let cursor = unreducedExactFromNumber(leftPt);
+  const exactRight = unreducedExactFromNumber(rightPt);
+  const minimum = unreducedExactFromNumber(MIN_LINE_GAP);
+  for (const interval of mergeAttributedIntervals(blocked)) {
+    if (compareExactRational(interval.r, cursor) <= 0) continue;
+    const gapRight = compareExactRational(interval.l, exactRight) < 0 ? interval.l : exactRight;
+    if (compareExactRational(subtractUnreducedExact(gapRight, cursor), minimum) >= 0) {
+      return exactRationalToNumberUp(cursor);
+    }
+    cursor = interval.r;
+    if (compareExactRational(cursor, exactRight) >= 0) return null;
+  }
+  return compareExactRational(subtractUnreducedExact(exactRight, cursor), minimum) >= 0
+    ? exactRationalToNumberUp(cursor)
+    : null;
 }
 
 interface AffineBoundary {
@@ -1131,6 +1305,67 @@ function nextLocalSweepEvent(
   return Math.min(...roots);
 }
 
+/** Resource limit on ordinary tight line steps per line query (library
+ * policy, not an OOXML rule). Within it every grid position is tested; past
+ * it, a step jumps to the first grid position below the tight polygons the
+ * failed band meets (see `computePreparedLineFloatWindowCore`). */
+const TIGHT_LINE_STEP_LIMIT = 20_000;
+
+/** Upper bound on the magnitude of line-top Ys the float line search visits.
+ * DrawingML positions and extents are ST_CoordinateUnqualified (ECMA-376
+ * §20.1.10.19), bounded by ±27,273,042,316,900 EMU = ±(2^31 − 1) pt, and a
+ * page-relative line or object Y is a sum of a few such terms, so 2^33 pt is
+ * past every page. Beyond it the search stops (see the domain contract in
+ * `computePreparedLineFloatWindowCore`). */
+export const LINE_SEARCH_Y_LIMIT_PT = 2 ** 33;
+/** Finest retry pitch: one twip, the smallest positive integer
+ * ST_SignedTwipsMeasure (§17.18.81) a w:spacing/@w:line exact or atLeast
+ * value can express. Finer pitches (universal measures, small auto
+ * multiples) retry at this pitch. */
+export const LINE_SEARCH_MIN_PITCH_PT = 0.05;
+/** Coarsest retry pitch: 1,584 pt (22 in), Word's largest page height and
+ * its largest exact/atLeast line spacing. A taller line cannot sit on any
+ * page, so a finer retry cannot move it onto one. */
+export const LINE_SEARCH_MAX_PITCH_PT = 1584;
+
+/** The line-retry pitch for a line of height `probeH`, clamped to the search
+ * domain, or null when the line has no positive finite height (no retries). */
+export function lineSearchPitch(probeH: number): number | null {
+  if (!(probeH > 0) || !Number.isFinite(probeH)) return null;
+  return Math.min(Math.max(probeH, LINE_SEARCH_MIN_PITCH_PT), LINE_SEARCH_MAX_PITCH_PT);
+}
+
+/**
+ * The first line-grid position strictly below `y`: `originY + k * pitchPt`
+ * for the smallest integer k >= 1 whose binary64 value exceeds `y`.
+ *
+ * Domain (asserted): |originY|, |y| <= LINE_SEARCH_Y_LIMIT_PT and pitchPt in
+ * [LINE_SEARCH_MIN_PITCH_PT, LINE_SEARCH_MAX_PITCH_PT]. There every relevant
+ * index is below 2^40, so k and k * pitchPt are exact integers times a pitch
+ * at least 2^14 ulps of any coordinate: grid values strictly increase with k
+ * and are finite. The quotient estimate is then off by at most one, so each
+ * correction loop runs at most twice (asserted).
+ */
+export function lineGridAfter(originY: number, pitchPt: number, y: number): number {
+  if (!(Math.abs(originY) <= LINE_SEARCH_Y_LIMIT_PT && Math.abs(y) <= LINE_SEARCH_Y_LIMIT_PT
+    && pitchPt >= LINE_SEARCH_MIN_PITCH_PT && pitchPt <= LINE_SEARCH_MAX_PITCH_PT)) {
+    throw new RangeError('Line grid query outside the float line-search domain');
+  }
+  const at = (k: number): number => originY + k * pitchPt;
+  let k = Math.max(1, Math.floor((y - originY) / pitchPt) + 1);
+  let corrections = 0;
+  while (at(k) <= y) {
+    k += 1;
+    corrections += 1;
+  }
+  while (k > 1 && at(k - 1) > y) {
+    k -= 1;
+    corrections += 1;
+  }
+  if (corrections > 2) throw new Error('Line grid estimate violated its one-step error bound');
+  return at(k);
+}
+
 /**
  * Hot line query over immutable, acquisition-compiled float geometry.
  *
@@ -1185,30 +1420,106 @@ function computePreparedLineFloatWindowCore(
   };
   const current = evaluate(topY);
   if (current) return current;
-  let cursor = topY;
-  let structuralIndex = structuralEvents.findIndex((eventY) => eventY > cursor);
-  while (structuralIndex >= 0 && structuralIndex < structuralEvents.length) {
-    const upper = structuralEvents[structuralIndex]!;
-    const localEvent = nextLocalSweepEvent(
-      cursor, upper, probeH, paraXLeft, paraXRight, prepared,
-      columnXLeftPt, columnXRightPt, reference,
-      polygonRequiredWidth, squareRequiredWidth, diagnostics,
-    );
-    if (localEvent !== null) {
-      if (diagnostics) diagnostics.localRootEventCount += 1;
-      const candidate = evaluate(localEvent);
-      if (candidate) return candidate;
-      cursor = localEvent;
-      continue;
+  // One candidate walk, WORD_TIGHT_WRAP_LINE_STEP_ADVANCE included. Every
+  // candidate is tested with the same predicate (`evaluate`, i.e.
+  // `lineWindowAtY`); the first one that fits is the answer, so no returned
+  // line collides with a wrap region. Candidates come from two sources:
+  //   - line steps: while a failed candidate reached on the line grid
+  //     (topY + k * probeH, the Word retry) still meets a tight polygon, or
+  //     while the open structural slab ahead is a tight-region slab, the next
+  //     candidate is the next grid position (`lineGridAfter`);
+  //   - the exact event sweep elsewhere: the earliest local root of the slab
+  //     ahead (`nextLocalSweepEvent`), else the slab's upper structural event.
+  // Tight-region membership of a band changes only at structural events
+  // (polygon top - probeH, bottom, exempt and top-touch Ys), so a slab
+  // midpoint decides the whole open slab.
+  //
+  // Termination and bounds: every candidate is strictly greater than the
+  // previous one (checked below). Ordinary line steps are capped by
+  // TIGHT_LINE_STEP_LIMIT. Past the cap a line step jumps to the first grid
+  // position below the lowest bottom of the tight polygons the failed band
+  // meets, which leaves at least one polygon permanently behind (at most B
+  // such jumps), or, when the band meets none (a tight slab entered from its
+  // top edge), advances one grid position: that lands inside the slab, where
+  // the next step is such a jump, or past the slab's upper event (at most E
+  // such steps). Sweep candidates consume the finite
+  // structural and local events. Each candidate costs one `lineWindowAtY`,
+  // one O(B) region test and an O(1) grid search (`lineGridAfter`), so a
+  // query is O((LIMIT + E + B + local events) * B log B) for every input in
+  // the domain below. Grid positions skipped by a past-the-cap jump
+  // are the only positions not tested; below the cap the walk never returns a
+  // Y above the first usable candidate.
+  //
+  // Numeric domain of the line grid: retries use the pitch
+  // `lineSearchPitch(probeH)` (1 twip to 1,584 pt; bands keep the line's own
+  // height), and a line top takes part in tight retries only within
+  // [-LIMIT, LIMIT] (LINE_SEARCH_Y_LIMIT_PT, past every page), where
+  // `lineGridAfter` is exact, finite and O(1). "Earliest" is stated on that
+  // grid. Beyond the domain (off every page) the exact sweep alone places the
+  // line, so extreme binary64 inputs keep origin/main's behaviour.
+  const pitch = Math.abs(topY) <= LINE_SEARCH_Y_LIMIT_PT ? lineSearchPitch(probeH) : null;
+  const tightAt = (y: number): boolean =>
+    pitch !== null && Math.abs(y) <= LINE_SEARCH_Y_LIMIT_PT
+    && bandMeetsTightPolygon(prepared, y, probeH, paraXLeft, paraXRight);
+  const gridAfter = (y: number): number =>
+    lineGridAfter(topY, pitch!, Math.min(y, LINE_SEARCH_Y_LIMIT_PT));
+  let stepBudget = TIGHT_LINE_STEP_LIMIT;
+  const lineStepAfter = (y: number): number => {
+    if (stepBudget > 0) {
+      stepBudget -= 1;
+      return gridAfter(y);
     }
-    const candidate = evaluate(upper);
-    if (candidate) return candidate;
-    cursor = upper;
-    do structuralIndex += 1;
+    const bottom = lowestMetTightBottom(prepared, y, probeH, paraXLeft, paraXRight);
+    return gridAfter(bottom === null ? y : Math.max(bottom, y));
+  };
+  let cursor = topY;
+  // topY is grid position 0.
+  let cursorOnGrid = true;
+  let structuralIndex = 0;
+  for (;;) {
     while (structuralIndex < structuralEvents.length
-      && structuralEvents[structuralIndex]! <= cursor);
+      && structuralEvents[structuralIndex]! <= cursor) structuralIndex += 1;
+    let next: number;
+    let nextOnGrid: boolean;
+    if (cursorOnGrid && tightAt(cursor)) {
+      next = lineStepAfter(cursor);
+      nextOnGrid = true;
+    } else if (structuralIndex < structuralEvents.length) {
+      const upper = structuralEvents[structuralIndex]!;
+      const midpoint = exactBinary64Midpoint(cursor, upper);
+      // An open slab with no binary64 value inside has no line tops.
+      if (midpoint > cursor && midpoint < upper && tightAt(midpoint)) {
+        next = lineStepAfter(cursor);
+        nextOnGrid = true;
+      } else {
+        const localEvent = nextLocalSweepEvent(
+          cursor, upper, probeH, paraXLeft, paraXRight, prepared,
+          columnXLeftPt, columnXRightPt, reference,
+          polygonRequiredWidth, squareRequiredWidth, diagnostics,
+        );
+        if (localEvent !== null && diagnostics) diagnostics.localRootEventCount += 1;
+        next = localEvent ?? upper;
+        nextOnGrid = false;
+      }
+    } else {
+      // Past the last event no object meets a band that starts strictly
+      // below every object. Keep layout total rather than throwing when the
+      // last event itself is blocked (a line resting on a tight bottom edge).
+      const lowest = Math.max(cursor, ...prepared.floats.map(({ rect }) => rect.yBottom));
+      let terminalY = pitch !== null && lowest <= LINE_SEARCH_Y_LIMIT_PT
+        ? gridAfter(lowest)
+        : lowest + Number.EPSILON * Math.max(1, Math.abs(lowest));
+      if (!Number.isFinite(terminalY)) terminalY = lowest;
+      return evaluate(terminalY) ?? { topY: terminalY, xOffset: 0, maxWidth };
+    }
+    if (!(next > cursor)) {
+      throw new Error('Float line-window search violated strictly increasing candidate progress');
+    }
+    const window = evaluate(next);
+    if (window) return window;
+    cursor = next;
+    cursorOnGrid = nextOnGrid;
   }
-  throw new Error('Finite float line-window event sweep found no usable terminal Y');
 }
 
 export function computePreparedLineFloatWindow(

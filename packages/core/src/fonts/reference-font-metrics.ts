@@ -22,6 +22,9 @@ export interface ReferenceFontMetricProfile {
   /** Derived OS/2 code-page class. Null means this source did not provide the
    * code-page field needed to classify Word's auto-line allocation. */
   readonly farEastCodePage: boolean | null;
+  /** OS/2 PANOSE [bFamilyType, bSerifStyle]. Null means the face has no OS/2
+   * table; undefined means this source did not record the field. */
+  readonly panose?: readonly [familyType: number, serifStyle: number] | null;
 }
 
 export interface FindReferenceFontMetricsOptions {
@@ -35,6 +38,7 @@ function freezeProfile(profile: ReferenceFontMetricProfile): ReferenceFontMetric
   Object.freeze(profile.hhea);
   if (profile.win) Object.freeze(profile.win);
   if (profile.typoMetrics) Object.freeze(profile.typoMetrics);
+  if (profile.panose) Object.freeze(profile.panose);
   return Object.freeze(profile);
 }
 

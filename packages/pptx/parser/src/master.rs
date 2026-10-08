@@ -13,16 +13,17 @@ use crate::shape::{
     extract_decorative_shapes, resolve_picture_shape_properties, PictureShapeProperties,
 };
 use crate::text::{
-    empty_level_bullets, extract_level_bullets, extract_level_colors, extract_level_faces,
-    extract_level_font_sizes, extract_level_indents, extract_level_run_properties_with_rels,
-    has_any_level_bullet, has_any_level_color, has_any_level_face, has_any_level_indent,
-    has_any_level_run_properties, has_any_level_size, merge_level_bullets, merge_level_colors,
-    merge_level_faces, merge_level_indents, merge_level_run_properties, merge_level_sizes,
-    read_level_bullets, read_level_colors, read_level_faces, read_level_font_sizes,
+    complete_level_sizes, empty_level_bullets, extract_level_bullets, extract_level_colors,
+    extract_level_faces, extract_level_font_sizes, extract_level_indents,
+    extract_level_run_properties_with_rels, has_any_level_bullet, has_any_level_color,
+    has_any_level_face, has_any_level_indent, has_any_level_run_properties, has_any_level_size,
+    merge_level_bullets, merge_level_colors, merge_level_faces, merge_level_indents,
+    merge_level_run_properties, merge_level_sizes, read_level_alignments, read_level_bullets,
+    read_level_colors, read_level_defrpr_values, read_level_faces, read_level_font_sizes,
     read_level_indents, read_level_run_properties_with_rels, resolve_latin_face,
-    text_property_color, InheritedBodyPr, LevelBullets, LevelColors, LevelFaces, LevelFontSizes,
-    LevelIndents, LevelRunProperties, LevelSpacing, DEFAULT_TEXT_STYLE_MAR_L,
-    HARD_DEFAULT_FONT_SIZE,
+    text_property_color, InheritedBodyPr, LevelAlignments, LevelBullets, LevelColors, LevelFaces,
+    LevelFontSizes, LevelIndent, LevelIndents, LevelRunProperties, LevelSpacing,
+    DEFAULT_TEXT_STYLE_MAR_L, HARD_DEFAULT_FONT_SIZE,
 };
 use crate::theme::{
     bake_clr_map, parse_theme_part, PptxSchemeResolver, PptxTheme, PptxThemeSource,
@@ -1492,16 +1493,16 @@ pub(crate) fn parse_master_level_run_properties(
     root: roxmltree::Node<'_, '_>,
     theme: &HashMap<String, String>,
     master_rels: &HashMap<String, String>,
-    master_dir: &str,
+    master_part: &str,
 ) -> MasterLevelRunProperties {
-    parse_master_level_run_properties_tier(root, theme, master_rels, master_dir, true)
+    parse_master_level_run_properties_tier(root, theme, master_rels, master_part, true)
 }
 
 pub(crate) fn parse_master_level_run_properties_tier(
     root: roxmltree::Node<'_, '_>,
     theme: &HashMap<String, String>,
     master_rels: &HashMap<String, String>,
-    master_dir: &str,
+    master_part: &str,
     with_placeholders: bool,
 ) -> MasterLevelRunProperties {
     let mut specific = HashMap::new();
@@ -1509,7 +1510,7 @@ pub(crate) fn parse_master_level_run_properties_tier(
     for (ph_type, sp) in master_placeholder_shapes(root, with_placeholders) {
         if let Some(body) = child(sp, "txBody") {
             let props = extract_level_run_properties_with_rels(body, theme, master_rels)
-                .map(|p| p.with_part_targets(master_dir));
+                .map(|p| p.with_part_targets(master_part));
             if has_any_level_run_properties(&props) {
                 specific.entry(ph_type).or_insert(props);
             }
@@ -1521,7 +1522,7 @@ pub(crate) fn parse_master_level_run_properties_tier(
     inherit_master_placeholder_classes(&mut specific);
     for (style, ph_types) in tx_style_nodes(root) {
         let props = read_level_run_properties_with_rels(style, theme, master_rels)
-            .map(|p| p.with_part_targets(master_dir));
+            .map(|p| p.with_part_targets(master_part));
         if has_any_level_run_properties(&props) {
             for ph_type in ph_types {
                 styles.insert((*ph_type).to_owned(), props.clone());
@@ -1597,17 +1598,17 @@ pub(crate) fn parse_master_level_bullets(
     root: roxmltree::Node<'_, '_>,
     theme: &HashMap<String, String>,
     master_rels: &HashMap<String, String>,
-    master_dir: &str,
+    master_part: &str,
     zip: &mut PptxZip,
 ) -> HashMap<String, LevelBullets> {
-    parse_master_level_bullets_tier(root, theme, master_rels, master_dir, zip, true)
+    parse_master_level_bullets_tier(root, theme, master_rels, master_part, zip, true)
 }
 
 pub(crate) fn parse_master_level_bullets_tier(
     root: roxmltree::Node<'_, '_>,
     theme: &HashMap<String, String>,
     master_rels: &HashMap<String, String>,
-    master_dir: &str,
+    master_part: &str,
     zip: &mut PptxZip,
     with_placeholders: bool,
 ) -> HashMap<String, LevelBullets> {
@@ -1617,7 +1618,7 @@ pub(crate) fn parse_master_level_bullets_tier(
     // part directory (ECMA-376 §21.1.2.4.2), mirroring the master background.
     let mut resolve_blip = |rid: &str| -> Option<String> {
         let target = master_rels.get(rid)?;
-        let path = resolve_path(master_dir, target);
+        let path = resolve_path(master_part, target);
         // Existence check only (central directory, no inflate): a listed but
         // missing rId falls through to Bullet::Inherit.
         zip.index_for_name(&path)?;
@@ -1846,7 +1847,7 @@ impl MasterStyleTier {
         root: roxmltree::Node<'_, '_>,
         theme: &HashMap<String, String>,
         master_rels: &HashMap<String, String>,
-        master_dir: &str,
+        master_part: &str,
         default_text_style: Option<roxmltree::Node<'_, '_>>,
         zip: &mut PptxZip,
     ) -> Self {
@@ -1861,7 +1862,7 @@ impl MasterStyleTier {
                 root,
                 theme,
                 master_rels,
-                master_dir,
+                master_part,
                 zip,
                 false,
             ),
@@ -1894,11 +1895,80 @@ impl MasterStyleTier {
 pub(crate) struct DefaultTextLevels {
     pub(crate) faces: LevelFaces,
     pub(crate) sizes: LevelFontSizes,
+    /// Authored `<a:ea>` / `<a:cs>` typefaces per level (tokens stay tokens;
+    /// they resolve per run language, issue #1627).
+    pub(crate) east_asian: LevelFaces,
+    pub(crate) complex_script: LevelFaces,
+    /// Per-level `lang` / `altLang` of the level defRPr.
+    pub(crate) lang: LevelFaces,
+    pub(crate) alt_lang: LevelFaces,
     /// The marL a plain paragraph takes when nothing in its own cascade sets
     /// one: the level's marL, else 0 (issue #1628 controls: text boxes whose
     /// defaultTextStyle level set no marL started at the inset at levels 2
     /// and 3).
     pub(crate) mar_l: [i64; 9],
+    /// The list style table-cell text inherits (`parse_table_text_levels`).
+    pub(crate) table: TableTextLevels,
+}
+
+/// The list-level properties table-cell text inherits: the slide master's
+/// `otherStyle`, which ECMA-376 §19.3.1.35 describes as the style of text
+/// that is neither title nor body.
+///
+/// Observed (issue #1628, PowerPoint's reference PDF export), with every
+/// source at a distinct size:
+/// * A cell paragraph took the size, alignment and marL of its own level of
+///   the master's otherStyle, in every table style (built-in, custom, none)
+///   and in placeholder graphic frames. The size did not come from
+///   defaultTextStyle, bodyStyle or the layout slot.
+/// * A level otherStyle does not define ended at 18 pt with no indent. Its
+///   defPPr had no effect.
+/// * otherStyle's Latin face and colour did not apply: the face is the table
+///   style's, else the theme minor font (`complete_table_cell_faces`).
+/// * A master with no otherStyle (no txStyles, or txStyles without one) laid
+///   cells out at 18 pt with marL 0.5" per level, PowerPoint's default
+///   otherStyle.
+///
+/// Only size, alignment and indents were observable; the other paragraph and
+/// character properties of otherStyle are not applied here.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct TableTextLevels {
+    pub(crate) sizes: LevelFontSizes,
+    pub(crate) indents: LevelIndents,
+    pub(crate) alignments: LevelAlignments,
+}
+
+impl Default for TableTextLevels {
+    /// PowerPoint's default otherStyle: 18 pt, marL 0.5" per level.
+    fn default() -> Self {
+        let mut indents: LevelIndents = Default::default();
+        for (lvl, indent) in indents.iter_mut().enumerate() {
+            indent.mar_l = Some(lvl as i64 * 457_200);
+            indent.indent = Some(0);
+        }
+        TableTextLevels {
+            sizes: [Some(HARD_DEFAULT_FONT_SIZE); 9],
+            indents,
+            alignments: Default::default(),
+        }
+    }
+}
+
+/// Build [`TableTextLevels`] from a slide master's `txStyles/otherStyle`.
+pub(crate) fn parse_table_text_levels(root: roxmltree::Node<'_, '_>) -> TableTextLevels {
+    let Some(other) = child(root, "txStyles").and_then(|tx| child(tx, "otherStyle")) else {
+        return TableTextLevels::default();
+    };
+    let indents = read_level_indents(other);
+    TableTextLevels {
+        sizes: complete_level_sizes(&read_level_font_sizes(other)),
+        indents: std::array::from_fn(|lvl| LevelIndent {
+            mar_l: Some(indents[lvl].mar_l.unwrap_or(0)),
+            mar_r: indents[lvl].mar_r,
+            indent: Some(indents[lvl].indent.unwrap_or(0)),
+        }),
+        alignments: read_level_alignments(other),
+    }
 }
 
 /// Build [`DefaultTextLevels`]. When the presentation has no defaultTextStyle
@@ -1916,12 +1986,19 @@ pub(crate) fn parse_default_text_levels(
                 faces: read_level_faces(node, theme),
                 sizes: read_level_font_sizes(node),
                 mar_l: std::array::from_fn(|level| indents[level].mar_l.unwrap_or(0)),
+                east_asian: read_level_defrpr_values(node, Some("ea"), "typeface"),
+                complex_script: read_level_defrpr_values(node, Some("cs"), "typeface"),
+                lang: read_level_defrpr_values(node, None, "lang"),
+                alt_lang: read_level_defrpr_values(node, None, "altLang"),
+                table: TableTextLevels::default(),
             }
         }
         None => DefaultTextLevels {
             faces: std::array::from_fn(|_| resolve_latin_face("+mn-lt", theme)),
             sizes: [Some(HARD_DEFAULT_FONT_SIZE); 9],
             mar_l: DEFAULT_TEXT_STYLE_MAR_L,
+            table: TableTextLevels::default(),
+            ..Default::default()
         },
     }
 }
@@ -1972,7 +2049,7 @@ pub(crate) fn parse_layout_placeholders(
     master_ea_ln_brk: &HashMap<String, bool>,
     master_spacing: &HashMap<String, LevelSpacing>,
     theme_source: &(impl PptxThemeSource + ?Sized),
-    layout_dir: &str,
+    layout_part: &str,
     layout_rels: &HashMap<String, String>,
     zip: &mut PptxZip,
 ) -> LayoutPlaceholders {
@@ -2042,7 +2119,7 @@ pub(crate) fn parse_layout_placeholders(
         let layout_level_run_properties = child(sp, "txBody")
             .map(|tx_body| {
                 extract_level_run_properties_with_rels(tx_body, theme, layout_rels)
-                    .map(|p| p.with_part_targets(layout_dir))
+                    .map(|p| p.with_part_targets(layout_part))
             })
             .unwrap_or_else(|| std::array::from_fn(|_| Default::default()));
         // Per-level indents (marL/marR/indent) from the layout placeholder's own
@@ -2055,7 +2132,7 @@ pub(crate) fn parse_layout_placeholders(
         // rels + part directory, mirroring the layout-spPr blipFill above.
         let mut resolve_layout_blip = |rid: &str| -> Option<String> {
             let target = layout_rels.get(rid)?;
-            let path = resolve_path(layout_dir, target);
+            let path = resolve_path(layout_part, target);
             // Verify the part exists so a listed-but-missing rId yields None and
             // the bullet falls through to Bullet::Inherit (matches the variant's
             // doc comment), mirroring the master/layout background resolvers.
@@ -2133,7 +2210,7 @@ pub(crate) fn parse_layout_placeholders(
         let layout_blip_fill: Option<InheritedBlipFill> = child(sp_pr, "blipFill").and_then(|bf| {
             let rid = child(bf, "blip").and_then(|b| attr_r(&b, "embed"))?;
             let rel_target = layout_rels.get(&rid)?;
-            let image_path = resolve_path(layout_dir, rel_target);
+            let image_path = resolve_path(layout_part, rel_target);
             // Verify the part exists so a dangling rId yields None (no inherited
             // fill), preserving the prior data-URL behaviour. `index_for_name`
             // reads the central directory only (no inflate), unlike the former
@@ -2563,7 +2640,7 @@ pub(crate) fn parse_layout(
     master_ea_ln_brk: &HashMap<String, bool>,
     master_spacing: &HashMap<String, LevelSpacing>,
     theme_source: &(impl PptxThemeSource + ?Sized),
-    layout_dir: &str,
+    layout_part: &str,
     layout_rels: &HashMap<String, String>,
     zip: &mut PptxZip,
 ) -> ParsedLayout {
@@ -2593,18 +2670,18 @@ pub(crate) fn parse_layout(
         master_ea_ln_brk,
         master_spacing,
         theme_source,
-        layout_dir,
+        layout_part,
         layout_rels,
         zip,
     );
 
-    // Layout-level bg (rels = layout rels, part dir = layout_dir). Verbatim from
+    // Layout-level bg (rels = layout rels, part dir = layout_part). Verbatim from
     // the former inline layout-bg block in `parse_slide`; the slide decides
     // whether to use it (only when its own bg chain is empty).
     let background: Option<Fill> = child(root, "cSld").and_then(|n| {
         let mut resolve = |rid: &str| -> Option<String> {
             let target = layout_rels.get(rid)?;
-            let path = resolve_path(layout_dir, target);
+            let path = resolve_path(layout_part, target);
             // Existence check only — central-directory lookup, no inflate.
             zip.index_for_name(&path)?;
             Some(path)
@@ -2635,7 +2712,7 @@ pub(crate) struct ParsedMaster {
     pub(crate) theme: PptxTheme,
     pub(crate) master_xml: Option<String>,
     pub(crate) master_rels: HashMap<String, String>,
-    pub(crate) master_dir: String,
+    pub(crate) master_part: String,
     pub(crate) master_smartart_drawings: HashMap<String, String>,
     pub(crate) master_bg: Option<Fill>,
     /// The master's own decorative (non-placeholder) spTree shapes, resolved ONCE
@@ -2717,12 +2794,13 @@ pub(crate) fn build_master_bundle(
         read_zip_str(zip, master_path).ok()
     };
 
-    let master_dir: String = master_path
-        .rsplit_once('/')
-        .map(|(dir, _)| dir.to_owned())
-        .unwrap_or_else(|| "ppt/slideMasters".to_owned());
+    let master_part = if master_path.is_empty() {
+        "ppt/slideMasters/slideMaster.xml".to_owned()
+    } else {
+        master_path.to_owned()
+    };
 
-    // Master rels: `<master_dir>/_rels/<file>.rels`.
+    // Master rels: `<master_part>/_rels/<file>.rels`.
     let master_rels_xml: String = if master_path.is_empty() {
         // An empty path is the explicit no-master fallback, not an OPC source
         // part. It has no relationship part; deriving `_rels/.rels` would read
@@ -2737,7 +2815,7 @@ pub(crate) fn build_master_bundle(
     // The master's own theme (slide→…→slideMaster→theme). Fall back to the
     // presentation theme when the master declares no /theme relationship.
     let theme_path: Option<String> =
-        find_rel_target_by_type(&master_rels_xml, "/theme").map(|t| resolve_path(&master_dir, &t));
+        find_rel_target_by_type(&master_rels_xml, "/theme").map(|t| resolve_path(&master_part, &t));
     let mut theme = theme_path
         .as_deref()
         .map(|path| parse_theme_part(path, zip))
@@ -2746,7 +2824,7 @@ pub(crate) fn build_master_bundle(
     bake_clr_map(&mut theme, master_xml_opt.as_deref());
 
     let master_smartart_drawings: HashMap<String, String> =
-        build_smartart_drawings(&master_rels_xml, &master_dir, zip);
+        build_smartart_drawings(&master_rels_xml, &master_part, zip);
 
     // Parse the master XML EXACTLY ONCE and share the resulting `Document` across
     // every master-derived extractor below (D4: previously each `parse_master_*`
@@ -2766,7 +2844,7 @@ pub(crate) fn build_master_bundle(
         let c_sld = child(root, "cSld")?;
         let mut resolve = |rid: &str| -> Option<String> {
             let target = master_rels.get(rid)?;
-            let path = resolve_path(&master_dir, target);
+            let path = resolve_path(&master_part, target);
             // Existence check only — central-directory lookup, no inflate
             // (former `read_zip_bytes` decompressed the entry just to discard it).
             zip.index_for_name(&path)?;
@@ -2782,9 +2860,12 @@ pub(crate) fn build_master_bundle(
         doc.descendants()
             .find(|n| n.is_element() && n.tag_name().name() == "defaultTextStyle")
     });
-    let default_text = parse_default_text_levels(dts, &theme);
+    let mut default_text = parse_default_text_levels(dts, &theme);
+    if let Some(root) = master_root {
+        default_text.table = parse_table_text_levels(root);
+    }
     let master_styles = master_root
-        .map(|root| MasterStyleTier::parse(root, &theme, &master_rels, &master_dir, dts, zip))
+        .map(|root| MasterStyleTier::parse(root, &theme, &master_rels, &master_part, dts, zip))
         .unwrap_or_default();
     let master_level_faces = master_root
         .map(|root| parse_master_level_faces(root, &theme, dts))
@@ -2796,13 +2877,13 @@ pub(crate) fn build_master_bundle(
         .map(|root| parse_master_level_colors(root, &theme))
         .unwrap_or_default();
     let master_level_run_properties = master_root
-        .map(|root| parse_master_level_run_properties(root, &theme, &master_rels, &master_dir))
+        .map(|root| parse_master_level_run_properties(root, &theme, &master_rels, &master_part))
         .unwrap_or_default();
     let master_level_indents = master_root
         .map(|root| parse_master_level_indents(root))
         .unwrap_or_default();
     let master_level_bullets = master_root
-        .map(|root| parse_master_level_bullets(root, &theme, &master_rels, &master_dir, zip))
+        .map(|root| parse_master_level_bullets(root, &theme, &master_rels, &master_part, zip))
         .unwrap_or_default();
     let master_anchors = master_root.map(parse_master_anchors).unwrap_or_default();
     let master_body_pr = master_root
@@ -2832,7 +2913,7 @@ pub(crate) fn build_master_bundle(
     if let Some(root) = master_root {
         extract_decorative_shapes(
             root,
-            &master_dir,
+            &master_part,
             &master_rels,
             &master_smartart_drawings,
             &theme,
@@ -2846,7 +2927,7 @@ pub(crate) fn build_master_bundle(
         theme,
         master_xml: master_xml_opt,
         master_rels,
-        master_dir,
+        master_part,
         master_smartart_drawings,
         master_bg,
         master_decorative,
@@ -2915,7 +2996,7 @@ mod placeholder_geometry_tests {
             master_doc.root_element(),
             &theme,
             &HashMap::new(),
-            "ppt/slideMasters",
+            "ppt/slideMasters/slideMaster1.xml",
         );
         let mut zip = empty_zip();
         let placeholders = parse_layout_placeholders(
@@ -2935,7 +3016,7 @@ mod placeholder_geometry_tests {
             &HashMap::new(),
             &HashMap::new(),
             &theme,
-            "ppt/slideLayouts",
+            "ppt/slideLayouts/slideLayout1.xml",
             &HashMap::new(),
             &mut zip,
         );
@@ -2980,7 +3061,7 @@ mod placeholder_geometry_tests {
             &HashMap::<String, bool>::new(),
             &HashMap::<String, LevelSpacing>::new(),
             &HashMap::new(),
-            "ppt/slideLayouts",
+            "ppt/slideLayouts/slideLayout1.xml",
             &HashMap::new(),
             &mut zip,
         )
@@ -3005,7 +3086,7 @@ mod placeholder_geometry_tests {
             placeholders,
             &HashMap::new(),
             &HashMap::new(),
-            "ppt/slides",
+            "ppt/slides/slide1.xml",
             None,
             &mut zip,
         )
@@ -3139,7 +3220,7 @@ mod placeholder_geometry_tests {
             placeholders,
             theme,
             &HashMap::new(),
-            "ppt/slides",
+            "ppt/slides/slide1.xml",
             None,
             &mut zip,
         )
@@ -3197,7 +3278,7 @@ mod placeholder_geometry_tests {
             root,
             &theme,
             &HashMap::new(),
-            "ppt/slideMasters",
+            "ppt/slideMasters/slideMaster1.xml",
             None,
             &mut zip,
         );
@@ -3214,7 +3295,7 @@ mod placeholder_geometry_tests {
                 root,
                 &theme,
                 &HashMap::new(),
-                "ppt/slideMasters",
+                "ppt/slideMasters/slideMaster1.xml",
                 &mut zip,
             ),
             &HashMap::new(),
@@ -3224,7 +3305,7 @@ mod placeholder_geometry_tests {
             &HashMap::new(),
             &HashMap::new(),
             &theme,
-            "ppt/slideLayouts",
+            "ppt/slideLayouts/slideLayout1.xml",
             &HashMap::new(),
             &mut zip,
         );
@@ -3421,18 +3502,19 @@ mod placeholder_geometry_tests {
             doc.root_element(),
             &theme,
             &HashMap::new(),
-            "ppt/slideMasters",
+            "ppt/slideMasters/slideMaster1.xml",
             &mut zip,
         );
 
         for title in TITLE_CLASS {
             assert_eq!(sizes[*title][0], Some(44.0));
-            assert_eq!(faces[*title][0].as_deref(), Some("Calibri Light"));
+            // Chain values keep theme tokens (issue #1627).
+            assert_eq!(faces[*title][0].as_deref(), Some("+mj-lt"));
         }
         // Every body-class type, obj included, gets the built-in body style.
         for body in BODY_CLASS {
             assert_eq!(sizes[*body][0], Some(28.0));
-            assert_eq!(faces[*body][0].as_deref(), Some("Calibri"));
+            assert_eq!(faces[*body][0].as_deref(), Some("+mn-lt"));
             assert_eq!(indents[*body][0].mar_l, Some(228_600));
             assert_eq!(indents[*body][0].indent, Some(-228_600));
             match bullets[*body][0].resolve() {
@@ -3457,7 +3539,8 @@ mod placeholder_geometry_tests {
             (8, 18.0),
         ] {
             assert_eq!(sizes["body"][level], Some(size));
-            assert_eq!(faces["body"][level].as_deref(), Some("Calibri"));
+            // The chain keeps the theme token (issue #1627).
+            assert_eq!(faces["body"][level].as_deref(), Some("+mn-lt"));
             assert_eq!(
                 indents["body"][level].mar_l,
                 Some(228_600 + 457_200 * level as i64)
@@ -3556,7 +3639,7 @@ mod placeholder_geometry_tests {
                 master_doc.root_element(),
                 &theme,
                 &HashMap::new(),
-                "ppt/slideMasters",
+                "ppt/slideMasters/slideMaster1.xml",
             ),
             &HashMap::new(),
             &HashMap::new(),
@@ -3567,7 +3650,7 @@ mod placeholder_geometry_tests {
             &HashMap::new(),
             &HashMap::new(),
             &theme,
-            "ppt/slideLayouts",
+            "ppt/slideLayouts/slideLayout1.xml",
             &HashMap::new(),
             &mut zip,
         );
@@ -3627,7 +3710,7 @@ mod placeholder_geometry_tests {
             root,
             &theme,
             &HashMap::new(),
-            "ppt/slideMasters",
+            "ppt/slideMasters/slideMaster1.xml",
             None,
             &mut zip,
         );
@@ -3648,7 +3731,7 @@ mod placeholder_geometry_tests {
             &parse_master_ea_ln_brk(root),
             &HashMap::new(),
             &theme,
-            "ppt/slideLayouts",
+            "ppt/slideLayouts/slideLayout1.xml",
             &HashMap::new(),
             &mut zip,
         );
@@ -3706,7 +3789,12 @@ mod placeholder_geometry_tests {
             &crate::master::MasterStyleTier::default(),
             &parse_master_level_font_sizes(root, dts),
             &HashMap::new(),
-            &parse_master_level_run_properties(root, &theme, &HashMap::new(), "ppt/slideMasters"),
+            &parse_master_level_run_properties(
+                root,
+                &theme,
+                &HashMap::new(),
+                "ppt/slideMasters/slideMaster1.xml",
+            ),
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
@@ -3716,7 +3804,7 @@ mod placeholder_geometry_tests {
             &HashMap::new(),
             &HashMap::new(),
             &theme,
-            "ppt/slideLayouts",
+            "ppt/slideLayouts/slideLayout1.xml",
             &HashMap::new(),
             &mut zip,
         );
@@ -3780,7 +3868,7 @@ mod placeholder_geometry_tests {
     fn default_text_levels_synthesize_theme_minor_when_absent() {
         let theme = HashMap::from([("+mn-lt".to_owned(), "Verdana".to_owned())]);
         let absent = parse_default_text_levels(None, &theme);
-        assert!(absent.faces.iter().all(|f| f.as_deref() == Some("Verdana")));
+        assert!(absent.faces.iter().all(|f| f.as_deref() == Some("+mn-lt")));
         assert!(absent.sizes.iter().all(|s| *s == Some(18.0)));
 
         let dts = r#"<p:defaultTextStyle
@@ -3985,7 +4073,7 @@ mod placeholder_geometry_tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            "ppt/slideLayouts",
+            "ppt/slideLayouts/slideLayout1.xml",
             &HashMap::new(),
             &mut zip,
         );
@@ -4155,7 +4243,7 @@ mod placeholder_geometry_tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            "ppt/slideLayouts",
+            "ppt/slideLayouts/slideLayout1.xml",
             &HashMap::new(),
             &mut zip,
         );
@@ -4281,7 +4369,7 @@ mod placeholder_geometry_tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            "ppt/slideLayouts",
+            "ppt/slideLayouts/slideLayout1.xml",
             &HashMap::new(),
             &mut zip,
         );
@@ -4349,7 +4437,7 @@ mod placeholder_geometry_tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            "ppt/slideLayouts",
+            "ppt/slideLayouts/slideLayout1.xml",
             &HashMap::new(),
             &mut zip,
         );
@@ -4456,7 +4544,7 @@ mod placeholder_geometry_tests {
                 &HashMap::new(),
                 &HashMap::new(),
                 &HashMap::new(),
-                "ppt/slideLayouts",
+                "ppt/slideLayouts/slideLayout1.xml",
                 &HashMap::new(),
                 &mut zip,
             )

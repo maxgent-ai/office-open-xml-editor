@@ -16,6 +16,24 @@ import type { DistributeSeg, DistributeResult } from './line-distribute.js';
 
 const seg = (text?: string): DistributeSeg => ({ text });
 
+it('allocates proportional slack only to spaces between text cells', () => {
+  const segments = [seg('a  b '), seg(), seg(' c '), seg('d')];
+  for (const slack of [-0.25, 8]) {
+    const result = distributeLineSlack(segments, slack, {
+      lastDrawnSi: segments.length,
+      textCellSpaceGaps: true,
+      isWhitespace: cp => cp === 0x20,
+      isGapChar: () => false,
+      gapWidth: si => si === 0 ? 2 : 4,
+    });
+    expect(result).not.toBeNull();
+    expect(result!.perSeg.get(0)!.splitBefore).toEqual([2, 3]);
+    expect(result!.perSeg.get(0)!.gapDeltas).toEqual([slack / 4, slack / 4]);
+    expect(result!.perSeg.get(0)!.trailingGap).toBe(false);
+    expect(result!.perSeg.get(2)!.trailingDelta).toBe(slack / 2);
+  }
+});
+
 /** Total px the kernel will add across the whole line = Σ over segments of
  *  (internal gaps + trailing gap) × perGap. Must equal `slack` so the final
  *  glyph lands on the right margin. */

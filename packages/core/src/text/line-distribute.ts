@@ -32,8 +32,8 @@
 // the gap geometry both renderers share. See packages/pptx/src/text-justify.ts
 // and packages/docx/src/text-distribute.ts for the format adapters.
 
-import { isCjkBreakChar } from './cjk-ranges.js';
-import { isSeaScriptCodePoint, isSeaGraphemeExtend } from './sea-break.js';
+import { enumerateGaps, type GapScanState, type LineGap } from './line-gaps.js';
+export { enumerateGaps, type GapScanState, type LineGap } from './line-gaps.js';
 
 /** A laid-out segment as the distributor sees it. Only the optional text matters;
  *  an undefined `text` marks a non-text inline atom (image / math / tab) — one
@@ -59,10 +59,16 @@ export interface SegStretch {
    *  Decorations (highlight / underline / strike / ruby centring / onTextRun
    *  width) should span measuredWidth + internalStretch. */
   internalStretch: number;
+  /** Per-cut deltas when the caller supplies natural gap widths. */
+  gapDeltas?: number[];
+  /** Delta at the segment edge under proportional allocation. */
+  trailingDelta?: number;
 }
 
 /** Result of distributing a line's slack across its gap opportunities. */
 export interface DistributeResult {
+  /** A caller-supplied unweighted expansion family retained its old allocation. */
+  usedUnweightedExpansion?: true;
   /** px added at each gap (negative when the line is compressed). */
   perGap: number;
   /** Per-segment stretch, keyed by the segment's index in `segments`. Segments
@@ -73,10 +79,31 @@ export interface DistributeResult {
 /** Tuning for {@link distributeLineSlack}; every field is optional and defaults
  *  to the WordprocessingML expansion behaviour. */
 export interface DistributeOptions {
+  /** Reuse the breaker's measured opportunities without rescanning text. */
+  gapModel?: Readonly<{ gaps: readonly LineGap[]; state: Readonly<GapScanState> }>;
+  /** Allocate proportionally to natural advances in a retained gap model. */
+  proportional?: boolean;
+  /** A separately measured expansion family whose allocation is unweighted.
+   * Select it only for positive slack with a non-ASCII-space opportunity;
+   * callers without this option retain their ordinary family. This bounds the
+   * proportional observation without changing ideographic/SEA expansion. */
+  unweightedExpansion?: Readonly<{ gaps: readonly LineGap[]; slack: number }>;
+
   /** Index of the first segment holding non-whitespace content; earlier
    *  (leading-indent / 字下げ whitespace) segments are fixed and never open a
    *  gap. Default 0 (no skip — e.g. under bidi, or for callers with no indent
    *  concept). */
+  /** Require ASCII-space runs to have text cells on both sides. Tabs and
+   * opaque atoms freeze adjoining spaces. Other gap families keep their policy. */
+  textCellSpaceGaps?: boolean;
+  /** Keep a space and its following grapheme extension atomic, including
+   * across segment seams. Callers that omit this retain their gap policy. */
+  atomicSpaceGaps?: boolean;
+  /** Natural gap advance in the same units as slack. Supplying this selects
+   * proportional allocation; omitted callers retain equal per-gap allocation. */
+  gapWidth?: (segmentIndex: number, cpOffset: number, cp: number) => number;
+  /** Lower bound on proportional compression, e.g. -0.25. */
+  minFactor?: number;
   firstContentSi?: number;
   /** Index of the VISUALLY-final segment; it and the boundary into it open no
    *  gap. Default `segments.length - 1`. The match is EXACT, not `>=`: under
@@ -114,152 +141,48 @@ export interface DistributeOptions {
   seaClusterGaps?: boolean;
 }
 
-/** Default inter-word whitespace (WordprocessingML): ASCII space + ideographic
- *  space. */
-const defaultIsWhitespace = (cp: number): boolean => cp === 0x20 || cp === 0x3000;
-
-/**
- * Distribute `slack` px equally across a justified line's gap opportunities
- * (inter-word spaces AND, by default, inter-CJK boundaries).
- *
- * A gap is opened AFTER a code point whose owning segment is eligible to OPEN a
- * gap (its index is in `[firstContentSi, segments.length)` and is NOT
- * `lastDrawnSi`). The LEFT side of every gap is thus eligible, while the gap's
- * right side may be the first code point of the final segment — so a 2-token
- * line "the quick" widens the space before "quick", and a CJK line split into
- * [観察][結果] widens the 察|結 boundary. The final segment opens no gap of its
- * own and is never split internally, but the boundary INTO it stretches like any
- * other; all slack lands to the final glyph's left, which reaches the margin
- * (Σgaps == slack). Leading whitespace before the first content unit and the gap
- * after the last content unit never stretch.
- *
- * @param segments The line's segments in LOGICAL (reading) order.
- * @param slack    availWidth - naturalWidth, px. >0 stretches; <0 compresses.
- * @param opts     See {@link DistributeOptions}; omitted fields take the
- *                 WordprocessingML-expansion defaults.
- * @returns The distribution, or `null` when nothing stretches (no eligible gap,
- *          or |slack| below the 0.5px noise floor).
- */
+/** Distribute slack over the enumerated opportunities. Existing callers use
+ * equal deltas. Callers with measured gap widths use delta_i = slack*w_i/S,
+ * including tiny negative slack (the legacy 0.5px floor does not apply there). */
 export function distributeLineSlack<T extends DistributeSeg>(
   segments: readonly T[],
   slack: number,
   opts: DistributeOptions = {},
 ): DistributeResult | null {
-  if (Math.abs(slack) <= 0.5) return null;
-
-  const firstContentSi = opts.firstContentSi ?? 0;
-  const lastDrawnSi = opts.lastDrawnSi ?? segments.length - 1;
-  const minPerGap = opts.minPerGap ?? -Infinity;
-  const isGapChar = opts.isGapChar ?? isCjkBreakChar;
-  const isWhitespace = opts.isWhitespace ?? defaultIsWhitespace;
-  const seaClusterGaps = opts.seaClusterGaps ?? false;
-
-  // Flatten the eligible segments to a code-point stream. Segments before
-  // `firstContentSi` (leading indent) are skipped; the rest — INCLUDING the
-  // final segment — are flattened, because a gap may have its RIGHT side in the
-  // final segment even though its left side may not be. Each unit carries its
-  // owning segment, the code-point offset within that segment, the code point,
-  // and an inter-word-whitespace flag. Non-text atoms become one unit with
-  // cp=undefined.
-  type Unit = { si: number; off: number; cp?: number; ws: boolean };
-  const units: Unit[] = [];
-  for (let si = firstContentSi; si < segments.length; si++) {
-    const seg = segments[si];
-    if (seg === undefined) continue;
-    if (seg.text === undefined) {
-      units.push({ si, off: 0, ws: false });
-      continue;
-    }
-    let off = 0;
-    for (const ch of seg.text) {
-      const cp = ch.codePointAt(0)!;
-      units.push({ si, off, cp, ws: isWhitespace(cp) });
-      off++;
-    }
+  let proportional = opts.proportional ?? opts.gapWidth !== undefined;
+  const enumeration = opts.gapModel ?? enumerateGaps(segments, opts);
+  let { gaps, state } = enumeration;
+  const expansion = opts.unweightedExpansion;
+  const useExpansion = slack > 0 && expansion?.gaps.some(gap =>
+    gap.kind === 'boundary' || gap.codePoint !== 0x20);
+  if (useExpansion && expansion) {
+    gaps = expansion.gaps;
+    state = { ...state, naturalGapSum: gaps.length };
+    slack = expansion.slack;
+    proportional = false;
   }
-
-  // Content span: the first and last NON-whitespace units. Leading/trailing
-  // spaces never stretch, and a single content unit has no interior gap.
-  let first = -1;
-  let last = -1;
-  for (let k = 0; k < units.length; k++) {
-    if (!units[k].ws) {
-      if (first === -1) first = k;
-      last = k;
-    }
-  }
-  if (first === -1 || first === last) return null;
-
-  // Mark a gap AFTER unit k, for first <= k < last, when k's owning segment is
-  // eligible to OPEN a gap (its si is not lastDrawnSi — the visually-last
-  // segment opens none and is never split, but the boundary INTO it still
-  // stretches). Whitespace → one inter-word gap (each space stretches).
-  // Non-space → an inter-CJK gap only when the boundary to the next NON-space
-  // unit satisfies `isGapChar` on either side; a boundary INTO whitespace is
-  // already counted by that whitespace, so it is not double-counted. Under
-  // seaClusterGaps a boundary between two SEA code points ALSO opens when it is a
-  // grapheme-cluster start (never before a combining mark).
-  const gapAfter = new Array<boolean>(units.length).fill(false);
-  let total = 0;
-  for (let k = first; k < last; k++) {
-    const u = units[k];
-    if (u.si === lastDrawnSi) continue; // the visually-last segment opens no gap
-    if (u.ws) {
-      gapAfter[k] = true;
-      total++;
-      continue;
-    }
-    const nx = units[k + 1];
-    if (nx.ws) continue; // counted by that space when we reach it
-    const lc = u.cp;
-    const rc = nx.cp;
-    if (
-      (lc !== undefined && isGapChar(lc)) ||
-      (rc !== undefined && isGapChar(rc)) ||
-      // thaiDistribute: a grapheme-cluster boundary interior to a SEA span. For
-      // two adjacent SEA code points the boundary is a cluster start iff the RIGHT
-      // side is NOT an Extend/SpacingMark (the SEA blocks have no Prepend), so a
-      // base + combining vowel/tone mark is never split. This code-point-local
-      // test needs no `Intl.Segmenter`, so it stays correct on every runtime.
-      (seaClusterGaps &&
-        lc !== undefined &&
-        rc !== undefined &&
-        isSeaScriptCodePoint(lc) &&
-        isSeaScriptCodePoint(rc) &&
-        !isSeaGraphemeExtend(rc))
-    ) {
-      gapAfter[k] = true;
-      total++;
-    }
-  }
-  if (total === 0) return null;
-
-  let perGap = slack / total;
-  if (slack < 0 && perGap < minPerGap) perGap = minPerGap;
-
-  // Per-segment code-point length, to tell an internal gap (off < len-1) from the
-  // trailing inter-segment gap (off === len-1).
-  const segLen = new Map<number, number>();
-  for (const u of units) {
-    if (u.cp !== undefined) segLen.set(u.si, (segLen.get(u.si) ?? 0) + 1);
-  }
-
+  if (proportional ? slack === 0 : Math.abs(slack) <= 0.5) return null;
+  if (!(state.naturalGapSum > 0) || gaps.length === 0) return null;
+  let factor = slack / state.naturalGapSum;
+  if (slack < 0) factor = Math.max(factor, proportional ? opts.minFactor ?? -Infinity : opts.minPerGap ?? -Infinity);
   const perSeg = new Map<number, SegStretch>();
-  for (let k = 0; k < units.length; k++) {
-    if (!gapAfter[k]) continue;
-    const u = units[k];
-    let s = perSeg.get(u.si);
-    if (!s) {
-      s = { splitBefore: [], trailingGap: false, internalStretch: 0 };
-      perSeg.set(u.si, s);
+  for (const gap of gaps) {
+    let stretch = perSeg.get(gap.segIndex);
+    if (!stretch) {
+      stretch = { splitBefore: [], trailingGap: false, internalStretch: 0,
+        ...(proportional ? { gapDeltas: [], trailingDelta: 0 } : {}) };
+      perSeg.set(gap.segIndex, stretch);
     }
-    const len = segLen.get(u.si) ?? 0;
-    if (u.cp === undefined || u.off === len - 1) {
-      s.trailingGap = true; // inter-segment boundary
+    const delta = factor * (proportional ? gap.naturalPx : 1);
+    if (gap.trailing) {
+      stretch.trailingGap = true;
+      if (proportional) stretch.trailingDelta = delta;
     } else {
-      s.splitBefore.push(u.off + 1); // split BEFORE code point off+1
-      s.internalStretch += perGap;
+      stretch.splitBefore.push(gap.cpOffset + 1);
+      stretch.internalStretch += delta;
+      stretch.gapDeltas?.push(delta);
     }
   }
-  return { perGap, perSeg };
+  return { perGap: proportional ? 0 : factor, perSeg,
+    ...(useExpansion ? { usedUnweightedExpansion: true } : {}) };
 }

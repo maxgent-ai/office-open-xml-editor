@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import type { TextLayoutService } from './text.js';
 import { resolveNumberingMarkerGeometry } from './numbering-marker.js';
+import { createTextLayoutService } from './text.js';
+import { createFontResolver } from './font-service.js';
 
 const route = {
   familyList: 'serif', scope: 'generic', fingerprint: 'numbering-marker-test-route',
@@ -55,6 +57,37 @@ function textService(advancePt: number): TextLayoutService {
 }
 
 describe('resolveNumberingMarkerGeometry', () => {
+  it('allocates a registered marker from the same precise font box as body text', () => {
+    // Canvas rounds both sides independently. Those device-pixel sides must
+    // not enlarge a numbered line whose selected resource owns precise sides.
+    const serviceWithCoverage = (unicodeRanges?: Array<[number, number]>) => createTextLayoutService({
+      fonts: createFontResolver([{ requestedFamily: 'Fixture Serif', resolvedFamily: 'Fixture Serif',
+        source: 'embedded', resourceIdentity: 'embedded:marker', weight: 400, style: 'normal' }]),
+      fontMetrics: { marker: { family: 'Fixture Serif', sourceIdentity: 'embedded:marker',
+        weight: 400, style: 'normal', lineHeightRatio: 1,
+        designAscentRatio: .8, designDescentRatio: .2, unicodeRanges } },
+      measurer: { fingerprint: 'rounded-marker-box', measure(request) {
+        return { advancePt: request.text.length * 5, ascentPt: 9, descentPt: 3 };
+      } },
+    });
+    const service = serviceWithCoverage();
+    const acquire = (fontSizePt: number, textService = service) => resolveNumberingMarkerGeometry(
+      { numId: 1, level: 0, format: 'decimal', text: '1.', suff: 'nothing', indentLeft: 0, tab: 36 },
+      { fontSizePt, fonts: { ascii: 'Fixture Serif' }, weight: 400, style: 'normal', complexScript: false },
+      { authoredFirstIndentPt: 0, physicalIndentLeftPt: 0, tabStops: [], defaultTabPt: 36 }, textService,
+    );
+    const sameSize = acquire(10);
+    expect(sameSize.lineBox).toEqual({ ascentPt: 8, descentPt: 2, intendedSinglePt: 10 });
+    expect(acquire(20).lineBox).toEqual({ ascentPt: 16, descentPt: 4, intendedSinglePt: 20 });
+    // Geometry for painting and horizontal fitting still belongs to Canvas.
+    expect(sameSize.markerWidthPt).toBe(10);
+    expect(sameSize.shape?.ascentPt).toBe(9);
+    expect(sameSize.shape?.descentPt).toBe(3);
+    // A selected subset lacking marker digits cannot lend its design geometry
+    // to Canvas fallback glyphs, even when it covers the following body text.
+    expect(acquire(10, serviceWithCoverage([[65, 90]])).lineBox)
+      .toEqual({ ascentPt: 9, descentPt: 3, intendedSinglePt: 0 });
+  });
   function geometryWithSuffix(suff: 'nothing' | 'space', authoredFirstIndentPt: number) {
     return resolveNumberingMarkerGeometry(
       {

@@ -193,3 +193,91 @@ export function wordPreservesLowerLayerSameParagraphComposition(
     && blockerRelativeHeight !== undefined
     && movingRelativeHeight < blockerRelativeHeight;
 }
+
+
+/** Evidence: issue #1623 Word controls (compatibility modes 14 and 15; column,
+ * margin and page-sized references; tight and square wrap; empty and text
+ * anchor paragraphs; free gaps left, right and on both sides; paragraph
+ * indents, first-line and hanging indents and centred anchor paragraphs). */
+export const WORD_MODE14_COLUMN_LINE_START_ORIGIN = defineCompatibilityRule({
+  id: 'word-mode14-column-line-start-origin',
+  evidence: {
+    kind: 'office-observation',
+    syntheticFixtureId: 'cross-paragraph-float-overlap',
+    application: 'Microsoft Word',
+    version: '16.113.2',
+    platform: 'macOS 27.0',
+  },
+  description: 'In compatibility mode 14 a positionH posOffset relative to the column is measured from the left edge of the first free gap of the anchor paragraph first-line band (at the paragraph content start, before any float pushes the line down), around the floats of other paragraphs only; paragraph indents and alignment do not move it. The resolved position is kept when the line later moves. Mode 15 measures from the column edge. Alignment and percentage offsets are unmeasured and keep the column edge.',
+});
+
+export const WORD_TIGHT_WRAP_BOTTOM_EDGE = defineCompatibilityRule({
+  id: 'word-tight-wrap-bottom-edge',
+  evidence: {
+    kind: 'office-observation',
+    syntheticFixtureId: 'cross-paragraph-float-overlap',
+    application: 'Microsoft Word',
+    version: '16.113.2',
+    platform: 'macOS 27.0',
+  },
+  description: 'A line whose top lies exactly on the bottom edge of a wrapTight polygon still wraps around that edge (modes 14 and 15); a square object and a line whose bottom touches a polygon top do not.',
+});
+
+export const WORD_TIGHT_WRAP_LINE_STEP_ADVANCE = defineCompatibilityRule({
+  id: 'word-tight-wrap-line-step-advance',
+  evidence: {
+    kind: 'office-observation',
+    syntheticFixtureId: 'cross-paragraph-float-overlap',
+    application: 'Microsoft Word',
+    version: '16.113.2',
+    platform: 'macOS 27.0',
+  },
+  description: 'When no gap beside a wrapTight polygon can hold a line, Word moves the line down by its own height and tries again (modes 14 and 15) instead of jumping to the polygon bottom as it does for square wrap.',
+});
+
+export const WORD_MODE14_TIGHT_ANCHOR_LINE_REWRAP = defineCompatibilityRule({
+  id: 'word-mode14-tight-anchor-line-rewrap',
+  evidence: {
+    kind: 'office-observation',
+    syntheticFixtureId: 'cross-paragraph-float-overlap',
+    application: 'Microsoft Word',
+    version: '16.113.2',
+    platform: 'macOS 27.0',
+  },
+  description: 'In compatibility mode 14 the line holding a wrapTight anchor is first laid out without that object; it is laid out again around the object (with distL/distR) only when the unpadded polygon intersects the line content, an empty paragraph mark counting as one paragraph-mark em. Mode 15 and square wrap always wrap the anchor line.',
+});
+
+export const WORD_LATER_ANCHOR_EARLIER_LINE_WRAP = defineCompatibilityRule({
+  id: 'word-later-anchor-earlier-line-wrap',
+  evidence: {
+    kind: 'office-observation',
+    syntheticFixtureId: 'cross-paragraph-float-overlap',
+    application: 'Microsoft Word',
+    version: '16.113.2',
+    platform: 'macOS 27.0',
+  },
+  description: 'A paragraph-relative wrapping drawing also wraps the lines of earlier paragraphs on its page that it overlaps (modes 14 and 15, tight and square). The drawing keeps the position resolved when its anchor paragraph was first laid out; the earlier lines move, not the drawing.',
+});
+
+export const WORD_MODE14_TIGHT_ANCHOR_TOP_TOUCH = defineCompatibilityRule({
+  id: 'word-mode14-tight-anchor-top-touch',
+  evidence: {
+    kind: 'office-observation',
+    syntheticFixtureId: 'cross-paragraph-float-overlap',
+    application: 'Microsoft Word',
+    version: '16.113.2',
+    platform: 'macOS 27.0',
+  },
+  description: 'In compatibility mode 14, when the first line of the anchor paragraph of a wrapTight drawing cannot be placed at its start position, an earlier line whose bottom lies exactly on the polygon top also wraps around it. Otherwise a line touching the polygon top from above is not wrapped.',
+});
+
+export const WORD_GRID_PICTURE_LINE_ORIGIN = defineCompatibilityRule({
+  id: 'word-grid-picture-line-origin',
+  evidence: { kind: 'office-observation', syntheticFixtureId: 'float-grid-picture-origin',
+    application: 'Microsoft Word', version: '16.113.2', platform: 'macOS 27.0' },
+  description: 'Issue #1674 controlled exports (74 picture-origin cases within the 142-case gap/grid suite) in modes 14/15 keep paragraph-relative pictures at the pre-before-spacing paragraph top. On an active line grid the first line-relative picture uses that same origin before authored before-spacing, and later line references use their actual line tops. Grid pitches 12–36pt, font sizes 10/20/30pt, offsets, phases, snap overrides, exact/atLeast/auto spacing, empty/multiline paragraphs, page/margin references and square/tight/none wrap disprove a universal half-pitch picture offset. Non-grid line references and non-picture payloads retain their previous reference frames.',
+});
+
+export function wordGridPictureLineOriginPt(lineTop: number, paragraphTop: number, contentStart: number): number {
+  return lineTop - (contentStart - paragraphTop);
+}

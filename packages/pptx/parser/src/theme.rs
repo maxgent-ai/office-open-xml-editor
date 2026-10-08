@@ -115,7 +115,6 @@ pub(crate) fn parse_theme_part(theme_path: &str, zip: &mut PptxZip) -> PptxTheme
     let theme_xml = read_zip_str(zip, theme_path).unwrap_or_default();
     let mut theme = PptxTheme::from_xml(&theme_xml);
     let rels_xml = read_zip_str(zip, &relationship_part_path(theme_path)).unwrap_or_default();
-    let theme_dir = theme_path.rsplit_once('/').map_or("", |(dir, _)| dir);
 
     theme.chart_images.insert_part_relationships(
         ooxml_common::chart::ChartImageSource::Theme,
@@ -124,7 +123,7 @@ pub(crate) fn parse_theme_part(theme_path: &str, zip: &mut PptxZip) -> PptxTheme
     );
 
     for (relationship_id, target) in parse_rels(&rels_xml) {
-        let path = resolve_path(theme_dir, &target);
+        let path = resolve_path(theme_path, &target);
         if zip.index_for_name(&path).is_some() {
             theme.insert(format!("{THEME_REL_PREFIX}{relationship_id}"), path);
         }
@@ -138,8 +137,55 @@ mod relationship_tests {
     use std::io::{Cursor, Write};
     use zip::write::SimpleFileOptions;
 
+    /// OPC Part 2 §6.4.1: a deferred fillRef retains the theme part's
+    /// relationship context, even when the consumer has a different base.
     #[test]
-    fn theme_part_relationships_are_resolved_from_the_theme_directory() {
+    fn theme_referenced_image_fill_resolves_relative_to_theme_part() {
+        let mut bytes = Vec::new();
+        {
+            let mut archive = zip::ZipWriter::new(Cursor::new(&mut bytes));
+            let options = SimpleFileOptions::default();
+            archive
+                .start_file("ppt/theme/nested/theme1.xml", options)
+                .unwrap();
+            archive
+                .write_all(
+                    br#"<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+                xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+                <a:themeElements><a:fmtScheme name="S"><a:fillStyleLst>
+                <a:blipFill><a:blip r:embed="rIdImage"/><a:stretch/></a:blipFill>
+                </a:fillStyleLst></a:fmtScheme></a:themeElements></a:theme>"#,
+                )
+                .unwrap();
+            archive
+                .start_file("ppt/theme/nested/_rels/theme1.xml.rels", options)
+                .unwrap();
+            archive.write_all(br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+                <Relationship Id="rIdImage" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image"
+                Target="./media/background.png"/></Relationships>"#).unwrap();
+            archive
+                .start_file("ppt/theme/nested/media/background.png", options)
+                .unwrap();
+            archive.write_all(b"png").unwrap();
+            archive.finish().unwrap();
+        }
+        let mut zip = PptxZip::new(Cursor::new(bytes)).expect("open package");
+        let theme = parse_theme_part("ppt/theme/nested/theme1.xml", &mut zip);
+        let consumer = roxmltree::Document::parse(
+            r#"<a:fillRef xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" idx="1">
+            <a:srgbClr val="FFFFFF"/></a:fillRef>"#,
+        )
+        .unwrap();
+        match crate::fill::parse_style_matrix_fill(consumer.root_element(), &theme, false) {
+            Some(crate::Fill::Image { image_path, .. }) => {
+                assert_eq!(image_path, "ppt/theme/nested/media/background.png");
+            }
+            other => panic!("expected theme-relative image fill, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn theme_part_relationships_are_resolved_from_the_theme_part() {
         let mut bytes = Vec::new();
         {
             let mut archive = zip::ZipWriter::new(Cursor::new(&mut bytes));
@@ -208,6 +254,13 @@ pub(crate) fn parse_theme_colors(xml: &str) -> HashMap<String, String> {
             if let Some(typeface) = face {
                 map.insert(format!("{prefix}-{axis}"), typeface.clone());
             }
+        }
+        // CT_SupplementalFont (§20.1.4.1.16): the per-script faces a theme
+        // token resolves to for a run whose language selects that script
+        // (issue #1627). A script with conflicting duplicates is ambiguous
+        // and names no face.
+        for (script, typeface) in unique_script_faces(&group.supplemental) {
+            map.insert(theme_script_key(prefix, script), typeface.to_owned());
         }
     }
 
@@ -353,6 +406,37 @@ pub(crate) fn parse_clr_map_ovr(xml: &str) -> Option<HashMap<String, String>> {
     Some(parse_clr_map_node(override_node))
 }
 
+/// Aggregate supplemental fonts in one pass: each script maps to its face, or
+/// to nothing when duplicate entries disagree (the same semantics as
+/// `ThemeFontGroup::typeface_for_script`, without its per-script rescan).
+fn unique_script_faces(fonts: &[ooxml_common::theme::ThemeSupplementalFont]) -> Vec<(&str, &str)> {
+    let mut faces: HashMap<&str, Option<&str>> = HashMap::with_capacity(fonts.len());
+    let mut order = Vec::new();
+    for font in fonts {
+        match faces.get_mut(font.script.as_str()) {
+            Some(existing) => {
+                if existing.is_some_and(|face| face != font.typeface) {
+                    *existing = None;
+                }
+            }
+            None => {
+                faces.insert(&font.script, Some(&font.typeface));
+                order.push(font.script.as_str());
+            }
+        }
+    }
+    order
+        .into_iter()
+        .filter_map(|script| faces[script].map(|face| (script, face)))
+        .collect()
+}
+
+/// Theme-map key of a major (`+mj`) or minor (`+mn`) supplemental script
+/// font, e.g. `+mn-script-Jpan`.
+pub(crate) fn theme_script_key(set_prefix: &str, script: &str) -> String {
+    format!("{set_prefix}-script-{script}")
+}
+
 /// Resolve a theme typeface reference (e.g. "+mj-lt") to the actual font family name.
 /// If the typeface starts with '+' and has a matching entry in the theme map (added by
 /// parse_theme_colors from the fontScheme), returns the resolved name; otherwise returns
@@ -422,6 +506,49 @@ impl ooxml_common::color::ThemeResolver for PptxSchemeResolver<'_> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn supplemental_script_fonts_are_aggregated_once_and_conflicts_name_no_face() {
+        use ooxml_common::theme::ThemeSupplementalFont;
+        let font = |script: &str, typeface: &str| ThemeSupplementalFont {
+            script: script.to_owned(),
+            typeface: typeface.to_owned(),
+        };
+        let mut fonts: Vec<_> = (0..48_000)
+            .map(|i| font(&format!("S{i}"), &format!("F{i}")))
+            .collect();
+        fonts.extend([
+            font("Jpan", "Yu Mincho"),
+            font("Jpan", "Yu Mincho"),
+            font("Hebr", "David"),
+            font("Hebr", "Arial"),
+        ]);
+        // One pass: the former per-entry rescan was quadratic in the entry
+        // count (48,000 entries took seconds).
+        let started = std::time::Instant::now();
+        let faces: HashMap<_, _> = unique_script_faces(&fonts).into_iter().collect();
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(faces.get("S47999"), Some(&"F47999"));
+        assert_eq!(faces.get("Jpan"), Some(&"Yu Mincho"));
+        assert_eq!(
+            faces.get("Hebr"),
+            None,
+            "conflicting duplicates name no face"
+        );
+
+        let map = parse_theme_colors(
+            r#"<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:themeElements><a:fontScheme name="F"><a:majorFont><a:latin typeface="A"/></a:majorFont><a:minorFont><a:latin typeface="B"/><a:font script="Jpan" typeface="Yu Mincho"/><a:font script="Hebr" typeface="David"/><a:font script="Hebr" typeface="Arial"/></a:minorFont></a:fontScheme></a:themeElements></a:theme>"#,
+        );
+        assert_eq!(
+            map.get("+mn-script-Jpan").map(String::as_str),
+            Some("Yu Mincho")
+        );
+        assert_eq!(map.get("+mn-script-Hebr"), None);
+    }
+
     use super::*;
     use std::io::{Cursor, Write};
 

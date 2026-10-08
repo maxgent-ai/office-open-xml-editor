@@ -4,10 +4,10 @@ import type { LayoutLine, LayoutTextSeg } from './model.js';
  * Refresh retained geometry through the same measurement authority. */
 export function finalizeRetainedLineShapes(
   lines: readonly LayoutLine[],
-  widthPolicy: 'bounded' | 'intrinsic',
+  widthPolicy: 'bounded' | 'intrinsic' | 'unwrapped',
   measureText: (segment: LayoutTextSeg, clusterGeometry?: boolean) => TextMetrics,
 ): void {
-  if (widthPolicy !== 'bounded') return;
+  if (widthPolicy === 'intrinsic') return;
   for (const line of lines) {
     for (const segment of line.segments) {
       if (!('text' in segment) || segment.metricOnly || segment.text.length === 0) continue;

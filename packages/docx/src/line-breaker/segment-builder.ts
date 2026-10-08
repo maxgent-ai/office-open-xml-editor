@@ -1,8 +1,12 @@
+import { revisionIsOmitted } from '../layout/revision-visibility.js';
+import { type TextBreakWindow } from './text-break-window.js';
 import type { DocxTextRun, FieldRun } from '../types';
+import { acquireTextSequences } from './text-sequence.js';
 import type { HyperlinkTarget, ResolvedFontMetric } from '@silurus/ooxml-core';
 import {
   DEFAULT_KINSOKU_RULES,
   isUax14NoBreakPair,
+  lineBreakClass,
   containsSeaScript,
   graphemeClusterOffsets,
   isSymbolFontFamily,
@@ -18,14 +22,16 @@ import type {
   TextShapeRequest,
   TextShapeSpan,
 } from '../layout/text.js';
-import { calcEffectiveFontPx, EAST_ASIAN_RE } from '../layout/text.js';
+import { calcEffectiveFontPx, EAST_ASIAN_RE, assertTextShapeRunContext, independentTextShapeRequest, sliceTextShapeRequest } from '../layout/text.js';
 import {
   referenceFontAverageWidthRatio,
   referenceFontLineMetrics,
 } from '../reference-font-line-metrics.js';
 import {
+  wordKerningApplies,
   wordDocumentCharacterCompressionApplies,
   wordJapanesePunctuationRetainedExtentPt,
+  wordCompressedSpaceLineFitApplies,
   wordSourceRunSpaceContinuesSequence,
   wordBalancedConsecutiveSpaceCellApplies,
   wordBalancedLinesAndCharsGridDeltaFactor,
@@ -52,6 +58,7 @@ import {
   mayUseExactLocalReferenceWidthMetric,
   selectResourceAverageWidthRatio,
   selectResourceMetric,
+  selectedFontLineMetric,
   type MetricTupleIndex,
 } from './font-metrics.js';
 
@@ -121,12 +128,34 @@ export interface SegmentBuildContext {
   ) => number | undefined;
 }
 
+/** ECMA-376 §17.3.2.5/§17.3.2.33 change displayed case, not run ownership.
+ * §17.3.3.30 symbol normalization may also expand a scalar to a surrogate
+ * pair. Scope and offsets use the complete display string after both changes;
+ * small-caps size pieces and tabs cannot create independent Arabic proof.
+ * Hidden runs are omitted by the parser (§17.3.2.41), not merged into this run.
+ */
+function transformedRunText(
+  text: string,
+  run: Extract<ParagraphLayoutSource['runs'][number], { type: 'text' | 'field' }>,
+  environment: LineLayoutEnvironment,
+): string {
+  const r: ParagraphTextBearingRun = run;
+  const display = run.allCaps || run.smallCaps ? text.toUpperCase() : text;
+  const map = (text: string, family: string | null | undefined) => isSymbolFontFamily(family)
+    ? symbolTextToUnicodeSegments(text, family).map((part) => part.text).join('') : text;
+  if (r.rtl || r.cs) return map(display, r.fontFamilyCs ?? run.fontFamily);
+  if (environment.layoutServices?.text) return map(display, run.fontFamily);
+  return splitByEastAsia(display).map((part) => map(part.text,
+    part.ea ? r.fontFamilyEastAsia ?? run.fontFamily : run.fontFamily)).join('');
+}
+
 export function appendTextPiece(
   state: SegmentBuildContext,
   text: string,
   base: Extract<ParagraphLayoutSource['runs'][number], { type: 'text' | 'field' }>,
   vertAlign: 'super' | 'sub' | null,
   sourceRunIndex: number,
+  fullRunContext: Readonly<{ text: string; offset: number }>,
   sourceFragmentIndex?: number,
   joinPreviousRun = false,
 ): void {
@@ -169,12 +198,9 @@ export function appendTextPiece(
   const documentCharacterCompressionApplies =
     wordDocumentCharacterCompressionApplies(effectiveCharacterSpacing);
   const effectiveCharacterScale = acquiredTypography?.characterScale ?? r.charScale;
-  // WORD_OPENTYPE_FEATURES_COMPAT_KERNING: the exact compatSetting enables
-  // kerning for unqualified runs. Authored/style-resolved w:kern wins.
-  const effectiveKerningThreshold =
-    acquiredTypography?.kerningThresholdPt ??
-    r.kerning ??
-    (environment.enableOpenTypeFeatures ? 0 : undefined);
+  // WORD_KERN_THRESHOLD_AUTHORITY: keep the resolved value, including zero,
+  // so every measurement/paint consumer uses the same threshold decision.
+  const effectiveKerningThreshold = acquiredTypography?.kerningThresholdPt ?? r.kerning;
   const effectiveSnapToGrid = acquiredTypography?.snapToGrid ?? r.snapToGrid;
   // §17.3.2.33 small caps are sized per character: lowercase LETTERS render two
   // points smaller, uppercase letters and non-alphabetic characters at the full
@@ -282,6 +308,10 @@ export function appendTextPiece(
     reduced: false,
     firstSeg: true,
     gluePending: false,
+    scopeContext: {
+      text: fullRunContext.text,
+      cursor: fullRunContext.offset,
+    },
   };
   // True while the next emitted segment should be GLUED to the previous one
   // (a small-caps case-piece that continues the same word). Consumed by the
@@ -398,6 +428,27 @@ export function appendTextPiece(
 
 /** Resolve source-level no-break ownership and adjacent UAX14/fitText seams
  * after every display segment has been emitted. */
+/** Linear projection onto immutable offset windows. A real source/font seam
+ * is breakable only when the complete text proved that boundary legal. */
+function projectTextBreakOffsets(group: readonly LayoutTextSeg[], offsets: readonly number[]): void {
+  let cursor = 0, index = 0;
+  for (const segment of group) {
+    const end = cursor + segment.text.length;
+    if (offsets[index] === cursor) {
+      segment.joinPrev = undefined;
+      segment.explicitBreakBefore = true;
+      index++;
+    }
+    const start = index;
+    while (index < offsets.length && offsets[index]! < end) index++;
+    if (index > start) {
+      const window: TextBreakWindow = { offsets, start, end: index, origin: cursor };
+      segment.explicitBreaks = window;
+    }
+    cursor = end;
+  }
+}
+
 export function finalizeBuiltSegments(
   runs: readonly ParagraphLayoutRun[],
   environment: LineLayoutEnvironment,
@@ -406,6 +457,77 @@ export function finalizeBuiltSegments(
   // Project acquisition-owned no-break ranges through the display case
   // transform and onto the single-font layout segments produced above.
   projectNoBreakRanges(runs, segs);
+
+  // ECMA-376 §17.3.3.18 permits ordinary U+002D breaks, including numeric
+  // identifiers. This DOCX tailoring overrides LB25 only inside a word:
+  // signed numbers after an opening bracket/start and LB21a's Hebrew-to-other
+  // boundary retain their Unicode protection. LB9 combining bases and grapheme
+  // boundaries use the complete displayed text, irrespective of font/run seams.
+  // This acquires opportunities, without splitting or merging shaped segments.
+  // Atomic cells and external-link syntax have their own owners below.
+  const rubyOwnedRuns = new Set(segs.filter(segment => 'text' in segment && segment.ruby)
+    .map(segment => segment.sourceRunIndex));
+  for (let start = 0; start < segs.length;) {
+    const ordinary = (s: LayoutSeg): s is LayoutTextSeg => 'text' in s
+      && s.hyperlink?.kind !== 'external' && s.fitTextRegionIndex === undefined
+      && !s.ruby && !s.tateChuYoko && !rubyOwnedRuns.has(s.sourceRunIndex);
+    if (!ordinary(segs[start]!)) { start++; continue; }
+    let end = start;
+    const group: LayoutTextSeg[] = [];
+    while (end < segs.length && ordinary(segs[end]!)) group.push(segs[end++] as LayoutTextSeg);
+    const text = group.map(segment => segment.text).join('');
+    if (text.includes('-')) {
+      const boundaries = [...graphemeClusterOffsets(text), text.length];
+      let boundaryIndex = 0;
+      // Authored noBreakHyphen owns its whole extended grapheme. Its XML
+      // range can end at HY before a following mark, so test that original
+      // edge as well as the displayed cluster end below.
+      const protectedOffsets = new Set<number>();
+      let origin = 0;
+      for (const segment of group) {
+        for (const range of segment.noBreakRanges ?? []) {
+          protectedOffsets.add(origin + range.start);
+          protectedOffsets.add(origin + range.end);
+        }
+        if (segment.hardJoinPrev) protectedOffsets.add(origin);
+        origin += segment.text.length;
+      }
+      const offsets: number[] = [];
+      const prohibitedHyphenEnds = new Set<number>();
+      let cursor = 0;
+      let baseClass: ReturnType<typeof lineBreakClass> | undefined;
+      const wordClass = (c: typeof baseClass) => c === 'AL' || c === 'HL' || c === 'NU';
+      for (const scalar of text) {
+        const cls = lineBreakClass(scalar.codePointAt(0)!);
+        const offset = cursor + scalar.length;
+        while (boundaries[boundaryIndex]! <= cursor) boundaryIndex++;
+        const clusterEnd = boundaries[boundaryIndex]!;
+        if (scalar === '-' && clusterEnd < text.length) {
+          prohibitedHyphenEnds.add(clusterEnd);
+          const rightClass = lineBreakClass(text.codePointAt(clusterEnd)!);
+          if (wordClass(baseClass) && wordClass(rightClass) && !(baseClass === 'HL' && rightClass !== 'HL')
+            && text.codePointAt(clusterEnd - 1) !== 0x200d
+            && !protectedOffsets.has(offset) && !protectedOffsets.has(clusterEnd)) {
+            offsets.push(clusterEnd);
+            prohibitedHyphenEnds.delete(clusterEnd);
+          }
+        }
+        // LB9: CM/ZWJ inherit a preceding base; the grapheme check above still
+        // places any hyphen opportunity after its complete extended grapheme.
+        if (cls !== 'CM' && cls !== 'ZWJ') baseClass = cls;
+        cursor = offset;
+      }
+      projectTextBreakOffsets(group, Object.freeze(offsets));
+      // A rendering seam after a rejected hyphen is not an alternate route
+      // around the complete-text classifier (including Hebrew and signs).
+      let seam = 0;
+      for (const segment of group) {
+        if (prohibitedHyphenEnds.has(seam)) segment.joinPrev = true;
+        seam += segment.text.length;
+      }
+    }
+    start = end;
+  }
 
   // Project the registered `word-external-link-syntax-breaks` opportunities
   // across the complete semantic link and all formatting seams first, then
@@ -469,24 +591,7 @@ export function finalizeBuiltSegments(
       groupStart = groupEnd;
       continue;
     }
-    cursor = 0;
-    for (let index = 0; index < group.length; index += 1) {
-      const segment = group[index]!;
-      const segmentStart = cursor;
-      const segmentEnd = segmentStart + segment.text.length;
-      const localBreaks = [...legalOffsets]
-        .filter((offset) => offset > segmentStart && offset < segmentEnd)
-        .map((offset) => offset - segmentStart)
-        .sort((a, b) => a - b);
-      if (localBreaks.length > 0) {
-        segment.externalLinkBreakOffsets = Object.freeze(localBreaks);
-      }
-      if (index > 0 && legalOffsets.has(segmentStart)) {
-        segment.joinPrev = undefined;
-        segment.externalLinkBreakBefore = true;
-      }
-      cursor = segmentEnd;
-    }
+    projectTextBreakOffsets(group, Object.freeze([...legalOffsets].sort((a, b) => a - b)));
     groupStart = groupEnd;
   }
 
@@ -514,15 +619,13 @@ export function finalizeBuiltSegments(
       const cached = metricCache.get(key);
       if (cached !== undefined) return cached;
       const naturalSpace = service.shape({
-        ...request,
-        text: ' ',
+        ...independentTextShapeRequest(request, ' '),
         fontSizePt: effectiveFontSizePt,
         measure: true,
         clusterGeometry: false,
       }).advancePt;
       const ideographicCell = service.shape({
-        ...request,
-        text: '\u4e00',
+        ...independentTextShapeRequest(request, '\u4e00'),
         fontSizePt: effectiveFontSizePt,
         fontHint: 'eastAsia',
         measure: true,
@@ -631,7 +734,7 @@ export function finalizeBuiltSegments(
   // false means unsupported/deferred, never "break allowed".
   for (let i = 1; i < segs.length; i++) {
     const cur = segs[i];
-    if (!('text' in cur) || cur.joinPrev || cur.externalLinkBreakBefore || cur.text.length === 0)
+    if (!('text' in cur) || cur.joinPrev || cur.explicitBreakBefore || cur.text.length === 0)
       continue;
     const prev = segs[i - 1];
     if (!('text' in prev) || prev.text.length === 0) continue;
@@ -769,8 +872,61 @@ export function buildSegments(
   appendRunsToSegments(runs, environment, segs, segmentBuildContext, selectedMetric);
 
   finalizeBuiltSegments(runs, environment, segs);
+  withdrawMixedSpaceEligibilityOutsideScope(environment, segs);
 
   return segs;
+}
+
+const AUTO_SPACE_EAST_ASIAN = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/u;
+const AUTO_SPACE_LATIN = /\p{Script=Latin}/u;
+const AUTO_SPACE_DIGIT = /[0-9]/u;
+
+/**
+ * Scope of WORD_COMPRESSED_SPACE_LINE_FIT (see its registered description):
+ * the paragraph keeps the unchanged line breaker when
+ * - §17.3.1.2-3 automatic spacing applies (enabled, with an ideograph or kana
+ *   directly beside a Latin letter or ASCII digit), which the renderer does
+ *   not model, or
+ * - a compressible closing mark is directly followed by U+0020, where the
+ *   registered rule records a full retained cell that
+ *   WORD_JAPANESE_PUNCTUATION_COMPRESSION_CELL does not reproduce.
+ * Adjacency is read on the paragraph's joined text, so run seams cannot
+ * change the decision.
+ */
+function withdrawMixedSpaceEligibilityOutsideScope(
+  environment: LineLayoutEnvironment,
+  segs: LayoutSeg[],
+): void {
+  if (!segs.some((segment) => 'text' in segment && segment.mixedSpaceAverageWidthRatio !== undefined)) {
+    return;
+  }
+  let previous: string | undefined;
+  let outside = false;
+  const pair = (left: string, right: string): boolean => {
+    if (COMPRESSIBLE_TRAILING_FULL_WIDTH_PUNCTUATION.has(left) && right === ' ') return true;
+    const eastAsian = AUTO_SPACE_EAST_ASIAN.test(left) ? right : AUTO_SPACE_EAST_ASIAN.test(right) ? left : undefined;
+    if (eastAsian === undefined) return false;
+    return (environment.autoSpaceDE !== false && AUTO_SPACE_LATIN.test(eastAsian))
+      || (environment.autoSpaceDN !== false && AUTO_SPACE_DIGIT.test(eastAsian));
+  };
+  for (const segment of segs) {
+    if (!('text' in segment)) {
+      previous = undefined;
+      continue;
+    }
+    for (const character of segment.text) {
+      if (previous !== undefined && pair(previous, character)) {
+        outside = true;
+        break;
+      }
+      previous = character;
+    }
+    if (outside) break;
+  }
+  if (!outside) return;
+  for (const segment of segs) {
+    if ('text' in segment) segment.mixedSpaceAverageWidthRatio = undefined;
+  }
 }
 
 interface SegmentEmissionState {
@@ -814,6 +970,10 @@ interface SegmentEmissionState {
   reduced: boolean;
   firstSeg: boolean;
   gluePending: boolean;
+  /** The run's display text around the emitted pieces, with a cursor. The
+   * text service decides a script-scoped substitute's scope over this whole
+   * contiguous context, not over one word (core fontSubstituteScriptScope). */
+  readonly scopeContext: { readonly text: string; cursor: number };
 }
 
 function pushSegmentPiece(
@@ -824,6 +984,7 @@ function pushSegmentPiece(
   authoritativeSpan?: TextShapeSpan,
   compressCharacterWhitespace = false,
   mappedSymbolUnicode = false,
+  substituteContext?: TextShapeRequest['substituteContext'],
 ): void {
   const {
     base,
@@ -858,6 +1019,15 @@ function pushSegmentPiece(
     overflowPunctuationEastAsianRun,
   } = emissionState;
 
+  // Consume an exact range of the immutable full display run. A parent
+  // advances once; child spans inherit its range. Never search ahead or drop
+  // context when a transform fails to project: that could invent Arabic proof.
+  const scopeContext = emissionState.scopeContext;
+  const retainedContext = substituteContext
+    ?? Object.freeze({ text: scopeContext.text, offset: scopeContext.cursor });
+  assertTextShapeRunContext({ text, substituteContext: retainedContext }, scopeContext.text);
+  if (!substituteContext) scopeContext.cursor += text.length;
+
   if (
     environment.balanceSingleByteDoubleByteWidth &&
     !cs &&
@@ -868,6 +1038,7 @@ function pushSegmentPiece(
     // other East-Asian glyphs receive the full delta. Split only at that
     // semantic boundary so Canvas can retain one uniform letterSpacing per
     // segment (measure == paint); the space itself has no contextual shape.
+    let partOffset = 0;
     for (const part of text.split(/(\u3000+)/u).filter(Boolean)) {
       pushSegmentPiece(
         emissionState,
@@ -877,7 +1048,10 @@ function pushSegmentPiece(
         undefined,
         compressCharacterWhitespace,
         mappedSymbolUnicode,
+        retainedContext
+          ? { text: retainedContext.text, offset: retainedContext.offset + partOffset } : undefined,
       );
+      partOffset += part.length;
     }
     return;
   }
@@ -899,7 +1073,9 @@ function pushSegmentPiece(
         characterSpacingControlCompresses(grapheme, environment.characterSpacingControl),
       )
     ) {
-      pushSegmentPiece(emissionState, text, cs, fontFamily, undefined, true, mappedSymbolUnicode);
+      pushSegmentPiece(
+        emissionState, text, cs, fontFamily, undefined, true, mappedSymbolUnicode, retainedContext,
+      );
       return;
     }
   }
@@ -909,6 +1085,7 @@ function pushSegmentPiece(
   const style = italic ? ('italic' as const) : ('normal' as const);
   const textShapeRequest: TextShapeRequest = Object.freeze({
     text,
+    ...(retainedContext ? { substituteContext: retainedContext } : {}),
     fontSizePt: cs ? csFontSize : base.fontSize,
     // A successfully decoded Symbol/Wingdings code point is Unicode text,
     // not a request for the legacy font encoding. Clear every authored
@@ -931,8 +1108,7 @@ function pushSegmentPiece(
     fontHint: r.fontHint,
     eastAsiaLanguage: r.langEastAsia,
     kerning:
-      effectiveKerningThreshold != null &&
-      (cs ? csFontSize : base.fontSize) >= effectiveKerningThreshold,
+      wordKerningApplies(cs ? csFontSize : base.fontSize, effectiveKerningThreshold, environment.compatibilityMode),
     measure: false,
   });
   const shaped = authoritativeSpan
@@ -955,8 +1131,7 @@ function pushSegmentPiece(
             )
               continue;
             const measured = environment.layoutServices?.text.shape({
-              ...textShapeRequest,
-              text: compressedGrapheme,
+              ...sliceTextShapeRequest(textShapeRequest, start, end),
               measure: true,
               clusterGeometry: false,
             });
@@ -978,13 +1153,12 @@ function pushSegmentPiece(
                     }
                     const punctuationRoute = measured.spans[0]?.fontRoute.fingerprint;
                     const ideographicCell = environment.layoutServices?.text.shape({
-                      ...textShapeRequest,
+                      ...independentTextShapeRequest(textShapeRequest, '\u4e00'),
                       // U+3000 is semantically an ideographic space, but several
                       // proportional East Asian faces expose it to Canvas with
                       // the same narrow advance as their punctuation. The grid's
                       // full-width character cell is represented by an
                       // ideograph, not by that platform-specific space metric.
-                      text: '\u4e00',
                       fontHint: 'eastAsia',
                       measure: true,
                       clusterGeometry: false,
@@ -1126,7 +1300,10 @@ function emitResolvedTextSegment(
         [...span.text].some((grapheme) =>
           characterSpacingControlCompresses(grapheme, environment.characterSpacingControl),
         );
-      pushSegmentPiece(emissionState, span.text, spanCs, spanFamily, span, compressedSpan);
+      pushSegmentPiece(
+        emissionState, span.text, spanCs, spanFamily, span, compressedSpan, mappedSymbolUnicode,
+        sliceTextShapeRequest(textShapeRequest, span.start, span.end).substituteContext,
+      );
     }
     return;
   }
@@ -1155,42 +1332,10 @@ function emitResolvedTextSegment(
   // The Word OpenType projection supplies that normal box by inference;
   // exact spacing instead suppresses it.
   const naturalMetricAllowed = environment.lineSpacing?.rule !== 'exact';
-  const resourceFamilyLineMetric =
-    (naturalMetricAllowed || localFont?.designAscentRatio == null) &&
-    (localFont?.lineHeightRatio != null ||
-      localFont?.designAscentRatio != null ||
-      localFont?.eastAsianLineHeightRatio != null)
-      ? localFont
-      : undefined;
-  const referenceLineMetric =
-    naturalMetricAllowed &&
-    !resourceFamilyLineMetric &&
-    mayUseAuthoredReferenceVerticalMetric(resolvedSpan?.font)
-      ? referenceFontLineMetrics(
-          resolvedSpan.font.requestedFamily,
-          resolvedSpan.font.weight,
-          resolvedSpan.font.style,
-        )
-      : undefined;
-  const familyLineMetric = resourceFamilyLineMetric ?? referenceLineMetric;
-  const resourceEaLineMetric =
-    (naturalMetricAllowed || localEaFloor?.designAscentRatio == null) &&
-    (localEaFloor?.lineHeightRatio != null ||
-      localEaFloor?.designAscentRatio != null ||
-      localEaFloor?.eastAsianLineHeightRatio != null)
-      ? localEaFloor
-      : undefined;
-  const referenceEaLineMetric =
-    naturalMetricAllowed &&
-    !resourceEaLineMetric &&
-    mayUseAuthoredReferenceVerticalMetric(eaResolution)
-      ? referenceFontLineMetrics(
-          eaResolution.requestedFamily,
-          eaResolution.weight,
-          eaResolution.style,
-        )
-      : undefined;
-  const eaLineMetric = resourceEaLineMetric ?? referenceEaLineMetric;
+  const { resourceMetric: resourceFamilyLineMetric, referenceMetric: referenceLineMetric,
+    lineMetric: familyLineMetric } = selectedFontLineMetric(resolvedSpan?.font, localFont, naturalMetricAllowed);
+  const { resourceMetric: resourceEaLineMetric, referenceMetric: referenceEaLineMetric,
+    lineMetric: eaLineMetric } = selectedFontLineMetric(eaResolution, localEaFloor, naturalMetricAllowed);
   const resolvedEaFloorFamily =
     eaResolution?.resolvedFamily ?? localEaFloor?.family ?? eaFontFamily;
   // WORD_USE_FE_LAYOUT_INHERITED_GRID_MINIMUM was observed for an active
@@ -1222,9 +1367,37 @@ function emitResolvedTextSegment(
     effectiveVertAlign == null &&
     (effectiveCharacterSpacing == null || effectiveCharacterSpacing === 0) &&
     (effectiveCharacterScale == null || effectiveCharacterScale === 1) &&
+    // WORD_LATIN_INTERWORD_XAVG_FLOOR retains its existing OpenType gate;
+    // threshold authority must not widen this separate fit policy's scope.
+    // Evidence gap: disabling implicit/zero kerning exposes justified fitting
+    // losses in mode-15 zero/absent-threshold controls, and mode-14 space fitting
+    // remains unresolved. Preserve this fit gate pending the separate justified
+    // compression correction; do not infer an allowance from pair advances or
+    // apply a font-specific scale. Positive-threshold fit contradictions likewise
+    // do not establish a different shaping-table or kerning-switch rule.
+    environment.enableOpenTypeFeatures !== true &&
     effectiveKerningThreshold == null;
   const latinSpaceAverageWidthRatio = latinSpaceCompressionEligible
     ? selectedAverageWidth(resolvedSpan?.font, text)
+    : undefined;
+  // WORD_COMPRESSED_SPACE_LINE_FIT: U+0020 on mixed East Asian / Latin lines.
+  // The line breaker applies it only once its line holds East Asian text;
+  // OpenType features and explicit kerning thresholds do not gate it.
+  const mixedSpaceCompressionEligible =
+    wordCompressedSpaceLineFitApplies(
+      environment.compatibilityMode,
+      environment.characterSpacingControl,
+    ) &&
+    environment.lineWrapLikeWord6 !== true &&
+    environment.verticalCJK !== true &&
+    documentCharacterCompressionApplies &&
+    (resolvedScript === 'ascii' || resolvedScript === 'highAnsi') &&
+    !emissionState.reduced &&
+    effectiveVertAlign == null &&
+    (effectiveCharacterSpacing == null || effectiveCharacterSpacing === 0) &&
+    (effectiveCharacterScale == null || effectiveCharacterScale === 1);
+  const mixedSpaceAverageWidthRatio = mixedSpaceCompressionEligible
+    ? latinSpaceAverageWidthRatio ?? selectedAverageWidth(resolvedSpan?.font, text)
     : undefined;
   const widthBalanceGridDeltaFactor = environment.balanceSingleByteDoubleByteWidth
     ? wordBalancedLinesAndCharsGridDeltaFactor(text, resolvedScript)
@@ -1254,8 +1427,12 @@ function emitResolvedTextSegment(
     fontSize: cs ? csFontSize : base.fontSize,
     color: base.color,
     fontFamily: resolvedSpan?.font.resolvedFamily ?? localFont?.family ?? fontFamily,
+    authoredFontFamily: resolvedSpan?.font.requestedFamily ?? fontFamily,
+    fontSource: resolvedSpan?.font.source,
+    authoredReferenceMetricAllowed: mayUseAuthoredReferenceVerticalMetric(resolvedSpan?.font),
     fontRoute: resolvedSpan?.fontRoute,
     resolvedLineHeightRatio: familyLineMetric?.lineHeightRatio,
+    resolvedLatinGridCellAllocation: referenceLineMetric?.farEastCodePage === false,
     ...(resourceFamilyLineMetric?.lineHeightRatio != null
       ? {
           resolvedResourceVerticalMetric: true as const,
@@ -1274,10 +1451,15 @@ function emitResolvedTextSegment(
     ...(latinSpaceAverageWidthRatio != null && latinSpaceAverageWidthRatio > 0
       ? { latinSpaceAverageWidthRatio, latinSpaceCompressionEligible: true as const }
       : {}),
+    ...(mixedSpaceAverageWidthRatio != null && mixedSpaceAverageWidthRatio > 0
+      ? { mixedSpaceAverageWidthRatio }
+      : {}),
     vertAlign: effectiveVertAlign,
     measuredWidth: 0,
     textLayoutService: environment.layoutServices?.text,
     textShapeRequest,
+    ...(resolvedSpan?.substituteScope !== undefined
+      ? { substituteScope: resolvedSpan.substituteScope } : {}),
     breakBefore: resolvedSpan?.breakBefore ?? authoritativeSpan?.breakBefore ?? true,
     smallCaps: emissionState.reduced,
     joinPrev:
@@ -1364,8 +1546,19 @@ function appendRunsToSegments(
   segmentBuildContext: SegmentBuildContext,
   selectedMetric: SegmentBuildContext['selectedMetric'],
 ): void {
+  // A native reserved-separator paragraph holds only text-free metric
+  // participants; coalescing them would drop a participant's own CHPX.
+  const sequences = runs.some((run) => run.type === 'text'
+    && (run as ParagraphTextBearingRun).noteSeparatorCharacter !== undefined)
+    ? new Map<number, never>()
+    : acquireTextSequences(runs, environment, (text, run) => transformedRunText(text, run, environment));
+  let sequenceEnd = -1;
   let joinNextVisibleText = false;
-  for (const [runIndex, run] of runs.entries()) {
+  for (const [runIndex, sourceRun] of runs.entries()) {
+    if (runIndex <= sequenceEnd) continue;
+    const sequence = sequences.get(runIndex);
+    const run = sequence?.run ?? sourceRun;
+    if (sequence) sequenceEnd = sequence.sources.at(-1)!.runIndex;
     // ECMA-376 §17.13.5 final view (the default): deleted (`w:del`,
     // §17.13.5.14) and moved-away (`w:moveFrom`, §17.13.5.22) content is not
     // part of the document's final state, so no segment is produced and line
@@ -1374,10 +1567,7 @@ function appendRunsToSegments(
     // decorated. Insertions/moveTo render in both views, and revision metadata
     // remains available through the parsed model for consumer-owned review UI.
     const runRevisionKind = (run as { revision?: { kind?: string } }).revision?.kind;
-    if (
-      environment.showTrackedChanges !== true &&
-      (runRevisionKind === 'deletion' || runRevisionKind === 'moveFrom')
-    ) {
+    if (revisionIsOmitted(runRevisionKind, environment.showTrackedChanges)) {
       continue;
     }
     const joinFromPreviousNoBreakHyphen = joinNextVisibleText;
@@ -1386,16 +1576,71 @@ function appendRunsToSegments(
     const emittedStart = segs.length;
     if (run.type === 'text') {
       const t = run as unknown as DocxTextRun & { type: 'text' };
+      if ((run as ParagraphTextBearingRun).noteSeparatorCharacter !== undefined) {
+        // MS-DOC 2.3.3 reserved separator character: the U+0003/U+0004 rule
+        // control or its story's content paragraph mark. Neither has a glyph
+        // here; the rule ink is retained separately. As for a suppressed note
+        // mark, a bounded Latin probe resolves the run's own four font slots
+        // and selected face through the ordinary text service, and only its
+        // vertical metrics remain (zero advance, no ink). Control/mark code
+        // points are not East Asian, so an East Asian slot alone is not used.
+        // The run context is the transformed display probe (caps/small caps
+        // or symbol mapping), exactly as for any other text piece.
+        const probe = transformedRunText('x', t, environment);
+        appendTextPiece(segmentBuildContext, 'x', t, t.vertAlign ?? null, runIndex,
+          { text: probe, offset: 0 });
+        for (let index = emittedStart; index < segs.length; index += 1) {
+          const segment = segs[index];
+          if (!('text' in segment)) throw new Error('A separator metric probe lost its text authority');
+          segment.text = '';
+          segment.metricOnly = true;
+          // Keep the probe for vertical metrics only (pass-operations,
+          // paragraph sourceMetrics); display and width stay empty.
+          segment.metricProbeText = probe;
+          segment.sourceRunIndex = runIndex;
+          if (segment.textShapeRequest) {
+            segment.textShapeRequest = Object.freeze(independentTextShapeRequest(segment.textShapeRequest, ''));
+          }
+        }
+        continue;
+      }
       // ECMA-376 §17.11: substitute a footnote/endnote reference marker's glyph
       // with the note's resolved sequential number. The body `*Reference` run
-      // carries the id; the in-note `*Ref` placeholder carries an empty id, so
-      // we fall back to the note number currently being drawn.
+      // (§17.11.14 footnoteReference / §17.11.7 endnoteReference) carries the
+      // id; the in-note `*Ref` placeholder (§17.11.13 footnoteRef / §17.11.6
+      // endnoteRef) carries an empty id, so we fall back to the note number
+      // currently being drawn. Numbering and formatting are independent: the
+      // mark takes its run's effective §17.3.2.42 w:vertAlign (direct §17.3.2.28
+      // rPr or style), and no superscript is synthesized when it is absent.
       const noteText = t.noteRef
         ? t.noteRef.id
           ? environment.noteNumbers?.get(`${t.noteRef.kind}:${t.noteRef.id}`)
           : environment.noteReferenceNumber
         : undefined;
       if (t.noteRef) {
+        // CT_FtnEdnRef/@customMarkFollows suppresses the automatic glyph, not
+        // the note relationship. Keep an immutable zero-width host so a note
+        // remains attached to the physical line/page of this reference.
+        // Number 0 is the acquisition map's custom-note sentinel; the note's
+        // own automatic *Ref placeholder is suppressed by the same contract.
+        if (t.noteRef.customMarkFollows === true || noteText === 0) {
+          // As for an empty/anchor-only mark, a bounded Latin probe resolves
+          // the four font slots and selected-face metrics through the ordinary
+          // text service. Discard its ink/text, never its font authority.
+          appendTextPiece(segmentBuildContext, 'x', t, t.vertAlign ?? null, runIndex,
+            { text: 'x', offset: 0 });
+          for (let index = emittedStart; index < segs.length; index += 1) {
+            const segment = segs[index];
+            if (!('text' in segment)) throw new Error('A note metric probe lost its text authority');
+            segment.text = '';
+            segment.metricOnly = true;
+            segment.sourceRunIndex = runIndex;
+            if (segment.textShapeRequest) {
+              segment.textShapeRequest = Object.freeze(independentTextShapeRequest(segment.textShapeRequest, ''));
+            }
+          }
+          continue;
+        }
         const label =
           noteText != null
             ? formatNoteNumber(
@@ -1412,8 +1657,9 @@ function appendRunsToSegments(
             segmentBuildContext,
             label,
             t,
-            t.vertAlign ?? 'super',
+            t.vertAlign ?? null,
             runIndex,
+            { text: transformedRunText(label, t, environment), offset: 0 },
             0,
             joinFromPreviousNoBreakHyphen,
           );
@@ -1425,6 +1671,8 @@ function appendRunsToSegments(
       }
       // Split on tab chars so tab alignment can be resolved during layout.
       const parts = t.text.split('\t');
+      const fullDisplayText = transformedRunText(t.text, t, environment);
+      let displayOffset = 0;
       for (let i = 0; i < parts.length; i++) {
         if (parts[i].length > 0) {
           appendTextPiece(
@@ -1433,10 +1681,12 @@ function appendRunsToSegments(
             t,
             t.vertAlign,
             runIndex,
+            { text: fullDisplayText, offset: displayOffset },
             i,
             i === 0 && joinFromPreviousNoBreakHyphen,
           );
         }
+        displayOffset += transformedRunText(parts[i], t, environment).length + 1;
         if (i < parts.length - 1) {
           segs.push({
             isTab: true,
@@ -1445,6 +1695,7 @@ function appendRunsToSegments(
             bold: t.bold,
             italic: t.italic,
             sourceRunIndex: runIndex,
+            ...(sequence ? { sourceTextOffset: displayOffset - 1 } : {}),
           });
         }
       }
@@ -1548,6 +1799,7 @@ function appendRunsToSegments(
           f,
           f.vertAlign,
           runIndex,
+          { text: transformedRunText(text, f, environment), offset: 0 },
           undefined,
           joinFromPreviousNoBreakHyphen,
         );
@@ -1632,6 +1884,9 @@ function appendRunsToSegments(
         fontSize: run.fontSize,
         color: null,
         fontFamily: selected?.resolvedFamily ?? authoredFamily,
+        authoredFontFamily: selected?.requestedFamily ?? authoredFamily,
+        fontSource: selected?.source,
+        authoredReferenceMetricAllowed: mayUseAuthoredReferenceVerticalMetric(selected),
         fontRoute: selected?.route,
         resolvedLineHeightRatio: familyLineMetric?.lineHeightRatio,
         ...(resourceMetric?.lineHeightRatio != null
@@ -1660,7 +1915,14 @@ function appendRunsToSegments(
       });
     }
     for (let index = emittedStart; index < segs.length; index += 1) {
-      segs[index].sourceRunIndex = runIndex;
+      const segment = segs[index];
+      segment.sourceRunIndex = runIndex;
+      if (sequence) {
+        segment.sourceTextSequence = sequence.sources;
+        segment.sourceTextOffset = 'text' in segment
+          ? segment.textShapeRequest?.substituteContext?.offset ?? 0
+          : segment.sourceTextOffset ?? 0;
+      }
     }
   }
 }

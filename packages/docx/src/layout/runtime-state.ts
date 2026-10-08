@@ -7,6 +7,7 @@ import type { VerticalGlyphMeasurementService } from './measurement-capabilities
 import type { LayoutSourceStore } from './layout-source-store.js';
 import type { LayoutOptions } from './options.js';
 import { LayoutInvariantError } from './diagnostics.js';
+import { createFootnoteAcquisitionWorkBudget, type FootnoteAcquisitionWorkBudget } from './resource-budgets.js';
 
 export interface DocumentLayoutRuntimeState {
   services: LayoutServices | null;
@@ -106,6 +107,24 @@ export interface ParagraphAcquisitionRuntimeCache {
  * NON_CONVERGENCE. Each paragraph retains only its two most recent placements.
  * The budget belongs to the pagination cache scope so field-convergence service
  * views cannot reset it while sharing the same retained acquisition values.
+ * Speculative re-layouts that page-placed content (header/footer root
+ * cell-owner hosts, positioned tables of story and nested tables) nests
+ * inside one another are charged to the same budget, so nested solves are
+ * bounded in aggregate, not only per loop: a story laid out for a trial band
+ * or page frames (production-body-layout.ts createStoryLayoutCache) and a
+ * nested table laid out whole through a page origin (table-pagination.ts
+ * layoutNestedWhole). Documents without such content incur none of them.
+ *
+ * Scope and cleanup: the count is owned by one pagination scope
+ * (createParagraphAcquisitionCacheServicesView, opened per document layout),
+ * never by the document services or source, so a later layout starts fresh.
+ * The miss that crosses the budget throws before its acquisition runs; the
+ * caches retain only completed acquisitions (story-layout-cache.ts) and the
+ * immutable source is never written, so a failed session leaves nothing.
+ * Converging nested solves reach their retained trial placements again and
+ * are not charged twice for them; what the budget still bounds is speculative
+ * work that keeps producing new placements, each per-solve limit permitting
+ * it (story-layout-cache.test.ts: charging, release and fail-closed order).
  */
 export const PARAGRAPH_ACQUISITION_MISS_BUDGET = 25_000;
 
@@ -113,6 +132,11 @@ const paragraphAcquisitionCaches = new WeakMap<
   LayoutServices,
   ParagraphAcquisitionRuntimeCache
 >();
+const footnoteAcquisitionWorkBudgets = new WeakMap<LayoutServices, FootnoteAcquisitionWorkBudget>();
+
+export function footnoteAcquisitionWorkBudgetOf(services: LayoutServices): FootnoteAcquisitionWorkBudget | undefined {
+  return footnoteAcquisitionWorkBudgets.get(services);
+}
 
 function createParagraphAcquisitionRuntimeCache(): ParagraphAcquisitionRuntimeCache {
   const identities = new WeakMap<object, number>();
@@ -220,7 +244,7 @@ function createParagraphAcquisitionRuntimeCache(): ParagraphAcquisitionRuntimeCa
       if (missCount > PARAGRAPH_ACQUISITION_MISS_BUDGET) {
         throw new LayoutInvariantError(
           'NON_CONVERGENCE',
-          `paragraph acquisition exceeded the operational miss budget ${PARAGRAPH_ACQUISITION_MISS_BUDGET}`,
+          `layout acquisition exceeded the operational miss budget ${PARAGRAPH_ACQUISITION_MISS_BUDGET}`,
         );
       }
     },
@@ -366,7 +390,7 @@ const fieldAcquisitionContexts = new WeakMap<object, FieldAcquisitionContext>();
 
 export function createLayoutServicesRuntimeView(
   services: LayoutServices,
-  overrides: Readonly<{ text?: LayoutServices['text'] }> = {},
+  overrides: Readonly<{ text?: LayoutServices['text']; math?: LayoutServices['math'] }> = {},
 ): LayoutServices {
   const view = Object.freeze({ ...services, ...overrides });
   const kernel = bodyLayoutKernelOf(services);
@@ -380,17 +404,22 @@ export function createLayoutServicesRuntimeView(
   if (registry) paintResourceRegistries.set(view, registry);
   const paragraphCache = paragraphAcquisitionCaches.get(services);
   if (paragraphCache) paragraphAcquisitionCaches.set(view, paragraphCache);
+  const footnoteBudget = footnoteAcquisitionWorkBudgets.get(services);
+  if (footnoteBudget) footnoteAcquisitionWorkBudgets.set(view, footnoteBudget);
   return view;
 }
 
-/** Start one paragraph-acquisition memo scope. The returned service view owns a
- * fresh cache even when its document services were used by an earlier layout
- * variant or another document layout request. */
+/** Start one pagination acquisition scope. Paragraph memo and full-footnote
+ * work ledger are fresh for a later layout/variant, but inherited by every
+ * convergence service view inside this execution. */
 export function createParagraphAcquisitionCacheServicesView(
   services: LayoutServices,
 ): LayoutServices {
   const view = createLayoutServicesRuntimeView(services);
   paragraphAcquisitionCaches.set(view, createParagraphAcquisitionRuntimeCache());
+  if (services.allowFootnoteContinuation === true) {
+    footnoteAcquisitionWorkBudgets.set(view, createFootnoteAcquisitionWorkBudget());
+  }
   return view;
 }
 

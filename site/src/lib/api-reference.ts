@@ -80,6 +80,7 @@ export const optionalRenderers: readonly OptionalRendererReference[] = [
 ];
 
 const RESOURCE_LIMITS = { name: 'resourceLimits', type: 'OoxmlResourceLimits', def: '128 MiB per entry / 256 MiB distinct total / 4,096 entries', desc: 'Shared DOCX/XLSX/PPTX package budgets. maxArchiveEntryBytes caps each package part; maxTotalInflatedBytes counts the largest amount read from every distinct part without charging repeat reads twice; maxArchiveEntries bounds central-directory entries before ZIP index allocation. Supply positive safe integers, or null to disable one configurable budget (internal hard ceilings remain). Violations reject with OoxmlResourceLimitError. These deterministic counters reduce OOM risk but do not measure or guarantee peak memory.', emphasis: 'Violations reject with OoxmlResourceLimitError.', detailsHref: '/errors#ooxml-resource-limit-error', detailsLabel: 'Error fields' };
+const XLSX_WORKSHEET_LIMITS = { name: 'xlsxWorksheetLimits', type: 'XlsxWorksheetLimits', def: '100,000 rows / 250,000 cell records / 32 MiB owned UTF-8 / 64 MiB JSON', desc: 'Logical XLSX worksheet budgets, validated before load effects and snapshotted per load. Omitted fields and an empty object use the defaults. Supplied fields must be positive safe integers no greater than Number.MAX_SAFE_INTEGER - 1; null is invalid. Rows and cells count retained records, not grid coordinates or unique indexes. maxOwnedUtf8Bytes counts every string in Cell.value, including typed discriminators and rich-text and phonetic strings, plus formula text, with shared strings charged per cell after resolution. maxJsonBytes counts structural JSON UTF-8: JSON.stringify of the assembled model in browser and Node, or complete serde_json output on the native Rust path. Each dimension of the derived worksheet cache is the larger of its default (200,000 rows / 500,000 cells / 64 MiB owned / 128 MiB JSON) and the worksheet limit. Each coordinate index independently allows max(250000, maxCells) unique keys. ZIP, input, wire, representation and copy limits stay separate. These are logical budgets, not physical memory; raising them accepts out-of-memory risk.', emphasis: 'These are logical budgets, not physical memory; raising them accepts out-of-memory risk.' };
 const IMAGE_RESOURCES = { name: 'imageResources', type: 'ImageResourceOptions', def: "{ decodedByteBudget: 128 MiB, strategy: 'adaptive', resolution: 'native-if-fit' }", desc: "Decoded-raster policy shared by DOCX, XLSX and PPTX paints. Ordinary browser rasters receive a geometry-weighted share of decodedByteBudget before source extraction, allowing each source to flow directly into decode. A source keeps native resolution when it fits its share and otherwise uses up to a 2x canvas/DPR grid when that share has headroom. If the complete set of display grids exceeds the budget, adaptive mode reduces them by one uniform quality ratio. Set resolution: 'display' to minimize retained pixels. Natural-size consumers, pixel effects that require the authored grid, and non-resizable formats retain their guarded source-specific paths. Set strategy: 'strict' to preserve requested targets and receive OoxmlDecodedImageLimitError on an aggregate crossing. The budget accepts 4 bytes through 512 MiB; encoded-source, per-axis and per-surface hard safety ceilings remain non-disableable.", emphasis: 'A source keeps native resolution when it fits its share and otherwise uses up to a 2x canvas/DPR grid when that share has headroom.', detailsHref: '/errors#decoded-image-limit-error', detailsLabel: 'Safety boundaries' };
 const RESOURCE_METRICS = { name: 'onResourceMetrics', type: '(metrics: OoxmlResourceMetrics) => void', desc: 'Receives the content-free initial-load report used by the debug card, without enabling console output. It reports the configured public policy, timing checkpoints, format/mode, success or typed failure discriminants, source bytes, and observed archive counters when available. It does not wait for a Viewer\'s first paint. On success, call getResourceMetrics() on the engine or Viewer for a fresh snapshot after lazy package work. Callback exceptions never change load results.', emphasis: 'Receives the content-free initial-load report used by the debug card, without enabling console output.' };
 const RESOURCE_METRICS_METHOD = { sig: 'getResourceMetrics(): Promise<OoxmlResourceMetrics>', desc: 'Return a fresh, content-free package-usage snapshot, including lazy archive work observed since load. Collection is always active; debug controls only console output.', emphasis: 'Collection is always active; debug controls only console output.' };
@@ -136,6 +137,11 @@ const DOCX_CURRENT_DATE: ApiOption = {
   type: 'Date | number',
   def: 'load time',
   desc: 'Date used to resolve DATE and TIME fields. It participates in the retained layout variant, so pass it at load time when deterministic field values or pagination are required.',
+};
+const DOCX_FOOTNOTE_CONTINUATION: ApiOption = {
+  name: 'allowFootnoteContinuation', type: 'boolean', def: 'true',
+  desc: 'Paragraph footnotes continue across physical pages by default, including for ordinary DOCX input. This can change page placement. Pass false to retain the previous whole-note pagination. With continuation, fitting tables remain whole. Notes requiring table splitting, changed text widths or field reflow that changes the source cut can reject layout. Full-note acquisition has library source and page budgets.',
+  emphasis: 'Pass false to retain the previous whole-note pagination.',
 };
 const DOCX_LAYOUT_VIEW_OPTIONS: readonly ApiOption[] = [
   DOCX_SHOW_TRACKED_CHANGES,
@@ -400,7 +406,7 @@ export const apiReference: Record<'docx' | 'xlsx' | 'pptx', ApiClass[]> = {
         CJK_FALLBACK,
         PASSWORD,
         { name: 'enableTextSelection', type: 'boolean', def: 'false', desc: 'Overlay a transparent text layer for native selection & copy.' },
-        ...DOCX_LAYOUT_VIEW_OPTIONS,
+        ...DOCX_LAYOUT_VIEW_OPTIONS, DOCX_FOOTNOTE_CONTINUATION,
         { name: 'enableElementSelection', type: 'boolean', def: 'false', desc: 'Enable read-only picture, chart, and shape selection with a non-editable outline and element context. No editor model is added.' },
         { name: 'onSelectionContextChange', type: '(context: DocxSelectionContext | null) => void', desc: 'Receive bounded detached text or element context. This callback does not enable element hit-testing by itself.' },
         CONTEXT_MENU('DocxSelectionContext'),
@@ -451,7 +457,7 @@ export const apiReference: Record<'docx' | 'xlsx' | 'pptx', ApiClass[]> = {
       name: 'DocxDocument',
       ctor: 'await DocxDocument.load(source, options?)',
       note: 'Headless engine — render any page into any canvas you supply.',
-      options: [GFONTS, CJK_FALLBACK, PASSWORD, WASM_URL, ZIP, RESOURCE_LIMITS, RESOURCE_METRICS, DEBUG, WORKER_TIMEOUT, MATH, THREE_D, REGION_MAP, CHART_EX, TIFF, MODE, ...DOCX_LAYOUT_VIEW_OPTIONS, DOCX_PROGRESSIVE_LAYOUT, DOCX_SLICE_LAYOUT, DOCX_LAYOUT_PROGRESS, DOCX_LAYOUT_PARTIAL, DOCX_LAYOUT_COMPLETE],
+      options: [GFONTS, CJK_FALLBACK, PASSWORD, WASM_URL, ZIP, RESOURCE_LIMITS, RESOURCE_METRICS, DEBUG, WORKER_TIMEOUT, MATH, THREE_D, REGION_MAP, CHART_EX, TIFF, MODE, ...DOCX_LAYOUT_VIEW_OPTIONS, DOCX_FOOTNOTE_CONTINUATION, DOCX_PROGRESSIVE_LAYOUT, DOCX_SLICE_LAYOUT, DOCX_LAYOUT_PROGRESS, DOCX_LAYOUT_PARTIAL, DOCX_LAYOUT_COMPLETE],
       methods: [
         { sig: 'static load(source, options?): Promise<DocxDocument>', desc: 'Parse a document from a URL or ArrayBuffer. With progressiveLayout, resolve when the opening pages are paintable while pagination continues in the background.' },
         { sig: 'get comments(): readonly Readonly<DocComment>[]', desc: 'Immutable detached comments and replies stored in the document.' },
@@ -490,7 +496,7 @@ export const apiReference: Record<'docx' | 'xlsx' | 'pptx', ApiClass[]> = {
         { name: 'zoomMin / zoomMax', type: 'number', def: '0.1 / 4', desc: 'Absolute zoom scale bounds (10%–400%). When width fit needs a smaller scale, that fitted scale remains reachable as the effective minimum.' },
         { name: 'refitOnResize', type: 'boolean', def: 'true', desc: 'Re-fit to the container width when it resizes. Set false to preserve an absolute scale independently of viewport width; explicit fitWidth() / fitPage() still work.' },
         { name: 'enableTextSelection', type: 'boolean', def: 'false', desc: 'Overlay a transparent, selectable text layer per page for native copy in both render modes.' },
-        ...DOCX_LAYOUT_VIEW_OPTIONS,
+        ...DOCX_LAYOUT_VIEW_OPTIONS, DOCX_FOOTNOTE_CONTINUATION,
         { name: 'comments', type: 'boolean | DocxCommentsOptions', def: 'false', desc: 'Show read-only document comment highlights, message icons, and built-in margin cards. Pass `cards: false` for an application-owned list that retains Viewer-owned range highlighting, or `markers: false` to hide only the icons. The options object also controls resolved-thread visibility, side, and optional connectors. Theme cards, highlights, and markers with CSS custom properties or documented classes on the Viewer container.', detailsHref: '/review-ui', detailsLabel: 'Comment UI guide' },
         { name: 'enableElementSelection', type: 'boolean', def: 'false', desc: 'Enable read-only drawing selection on mounted pages with a non-editable outline and element context.' },
         { name: 'onSelectionContextChange', type: '(context: DocxSelectionContext | null) => void', desc: 'Receive bounded detached text, selected-comment, or element context for external AI/MCP integrations. This callback does not enable element hit-testing.' },
@@ -552,6 +558,8 @@ export const apiReference: Record<'docx' | 'xlsx' | 'pptx', ApiClass[]> = {
         { name: 'zoomMin / zoomMax', type: 'number', def: '0.1 / 4', desc: 'Zoom slider bounds as scale factors (10%–400%).' },
         { name: 'resizable', type: 'boolean', def: 'true', desc: 'Allow resizing columns/rows by dragging header borders. View-only — it changes the on-screen view only and never modifies the loaded file. Set false to disable.', emphasis: 'View-only — it changes the on-screen view only and never modifies the loaded file.' },
         { name: 'showScrollbars', type: 'boolean', def: 'true', desc: 'Show native worksheet scrollbars. Set false only when the host supplies another viewport navigation UI.' },
+        { name: 'minRows / minCols', type: 'number', def: '50 / 26', desc: 'Minimum worksheet rows and columns included in the scroll grid and fit calculations. Content, drawings and frozen panes can extend these bounds.' },
+        { name: 'marginRows / marginCols', type: 'number', def: '30 / 10', desc: 'Additional blank rows and columns kept as scroll headroom after the resolved grid extent. Fit calculations exclude this headroom.' },
         { name: 'selectionColor', type: 'string', def: "'#1a73e8'", desc: 'Accent color for the cell-selection rectangle (any CSS color). The fill is the same color at 8% opacity.' },
         { name: 'enableElementSelection', type: 'boolean', def: 'false', desc: 'Enable read-only chart, picture, and shape selection with a non-editable outline and element context, without changing the underlying cell selection.' },
         { name: 'comments', type: 'boolean | XlsxCommentsOptions', def: 'true', desc: 'Show authored cell note or threaded-comment markers and their anchored read-only popup. Pass an options object to control resolved-thread visibility. Theme the popup with documented CSS custom properties or classes on the Viewer container.', detailsHref: '/review-ui', detailsLabel: 'Comment UI guide' },
@@ -562,6 +570,7 @@ export const apiReference: Record<'docx' | 'xlsx' | 'pptx', ApiClass[]> = {
         PASSWORD,
         ZIP,
         RESOURCE_LIMITS,
+        XLSX_WORKSHEET_LIMITS,
         IMAGE_RESOURCES,
         RESOURCE_METRICS,
         DEBUG,
@@ -625,6 +634,8 @@ export const apiReference: Record<'docx' | 'xlsx' | 'pptx', ApiClass[]> = {
         { name: 'zoomMin / zoomMax', type: 'number', def: '0.1 / 4', desc: 'Zoom bounds as scale factors (10%–400%).' },
         { name: 'resizable', type: 'boolean', def: 'true', desc: 'Allow resizing columns/rows by dragging header borders. View-only.' },
         { name: 'showScrollbars', type: 'boolean', def: 'true', desc: 'Show native worksheet scrollbars. Set false only when the host supplies another viewport navigation UI.' },
+        { name: 'minRows / minCols', type: 'number', def: '50 / 26', desc: 'Minimum worksheet rows and columns included in the scroll grid and fit calculations. Content, drawings and frozen panes can extend these bounds.' },
+        { name: 'marginRows / marginCols', type: 'number', def: '30 / 10', desc: 'Additional blank rows and columns kept as scroll headroom after the resolved grid extent. Fit calculations exclude this headroom.' },
         { name: 'selectionColor', type: 'string', def: "'#1a73e8'", desc: 'Accent color for the cell-selection rectangle.' },
         { name: 'enableElementSelection', type: 'boolean', def: 'false', desc: 'Enable read-only chart, picture, and shape selection with a non-editable outline and element context.' },
         { name: 'comments', type: 'boolean | XlsxCommentsOptions', def: 'true', desc: 'Show authored cell note or threaded-comment markers and their anchored read-only popup. Pass an options object to control resolved-thread visibility. Theme the popup with documented CSS custom properties or classes on the Viewer container.', detailsHref: '/review-ui', detailsLabel: 'Comment UI guide' },
@@ -637,6 +648,7 @@ export const apiReference: Record<'docx' | 'xlsx' | 'pptx', ApiClass[]> = {
         WASM_URL,
         ZIP,
         RESOURCE_LIMITS,
+        XLSX_WORKSHEET_LIMITS,
         IMAGE_RESOURCES,
         RESOURCE_METRICS,
         DEBUG,
@@ -689,7 +701,7 @@ export const apiReference: Record<'docx' | 'xlsx' | 'pptx', ApiClass[]> = {
       name: 'XlsxWorkbook',
       ctor: 'await XlsxWorkbook.load(source, options?)',
       note: 'Headless engine — parse once, render any sheet viewport into any canvas you supply.',
-      options: [GFONTS, CJK_FALLBACK, PASSWORD, WASM_URL, ZIP, RESOURCE_LIMITS, RESOURCE_METRICS, DEBUG, WORKER_TIMEOUT, MATH, THREE_D, REGION_MAP, CHART_EX, TIFF, MODE],
+      options: [GFONTS, CJK_FALLBACK, PASSWORD, WASM_URL, ZIP, RESOURCE_LIMITS, XLSX_WORKSHEET_LIMITS, RESOURCE_METRICS, DEBUG, WORKER_TIMEOUT, MATH, THREE_D, REGION_MAP, CHART_EX, TIFF, MODE],
       methods: [
         { sig: 'static load(source, options?): Promise<XlsxWorkbook>', desc: 'Parse a workbook from a URL or ArrayBuffer.' },
         { sig: 'get sheetNames(): string[]', desc: 'Names of all sheets.' },

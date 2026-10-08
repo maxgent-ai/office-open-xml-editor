@@ -50,6 +50,7 @@
       const viewer = new DocxViewer(canvas, {
         width: 794,
         enableTextSelection: true,
+        enableElementSelection: true,
         useGoogleFonts: true,
       });
       await viewer.load(buf);
@@ -59,15 +60,10 @@
       await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
 
       const wrapper = canvas.parentElement;
-      // The overlay layers are the wrapper's DIV children other than the
-      // viewer's page-loading status layer (role="status", hidden once the page
-      // has rendered): the text-selection layer and the find-highlight layer.
-      const overlayLayers = [...wrapper.children].filter(
-        (c) => c.tagName === 'DIV' && c.getAttribute('role') !== 'status',
-      );
+      const overlayLayers = [...wrapper.querySelectorAll(':scope > [data-overlay]')];
       const overlayRects = overlayLayers.map((l) => {
         const r = l.getBoundingClientRect();
-        return { w: Math.round(r.width), h: Math.round(r.height) };
+        return { tag: l.dataset.overlay, w: Math.round(r.width), h: Math.round(r.height) };
       });
       const canvasRect = canvas.getBoundingClientRect();
 
