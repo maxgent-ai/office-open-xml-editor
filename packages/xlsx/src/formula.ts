@@ -134,13 +134,39 @@ function toBool(v: EvalValue): boolean {
   return false;
 }
 
+/** Number operand for arithmetic, unary operators and number-typed function
+ * arguments (§18.17.7: an incompatible argument type is #VALUE!). Each failure
+ * is an Excel error value, never a placeholder 0: NOT, a comparison or
+ * stopIfTrue could otherwise turn the error into a match. Comparison operands
+ * do not use this conversion; see applyCmp. */
 function toNum(v: EvalValue): number {
   const s = operand(v);
-  if (typeof s === 'number') return s;
+  if (typeof s === 'number') {
+    // §18.17.2.6 numbers are real numbers. An IEEE Infinity or NaN can only
+    // come from an overflowed or undefined intermediate result, which §18.17.3
+    // classifies as #NUM!. Operator results are not range-checked themselves.
+    if (!Number.isFinite(s)) throw new FormulaFailure('error', '#NUM!');
+    return s;
+  }
   if (typeof s === 'boolean') return s ? 1 : 0;
   if (s == null) return 0;
-  const n = parseFloat(String(s));
-  return isNaN(n) ? 0 : n;
+  // §18.17.3 #VALUE!: text is an incompatible operand unless converted.
+  const n = parseNumericText(s);
+  if (n === null) throw new FormulaFailure('error', '#VALUE!');
+  return n;
+}
+
+/** Library policy, not an Excel rule: §18.17.2.6 leaves text-to-number
+ * conversion implementation-defined. Only the locale-independent §18.17.2.1
+ * numeric-constant spelling converts, with an optional sign and surrounding
+ * U+0020 spaces; underflow reads as 0, as the literal tokenizer does. Other
+ * spellings Excel may convert through locale or number formats (percent,
+ * currency, grouping, dates, times) fail as #VALUE!, as does a numeric
+ * prefix ("1x") or overflow, rather than as a guess. */
+function parseNumericText(s: string): number | null {
+  if (!/^ *[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)? *$/u.test(s)) return null;
+  const n = Number(s);
+  return Number.isFinite(n) ? n : null;
 }
 
 function toStr(v: EvalValue): string {
@@ -379,12 +405,17 @@ function applyBinary(op: string, a: EvalValue, b: EvalValue): EvalValue {
   }
 }
 
+/** Unsettled (#1547): §18.17 does not define how comparison operators convert
+ * or order mixed-type, blank or text operands, and no Excel evidence is
+ * recorded here. Until it is, this keeps the evaluator's earlier rule rather
+ * than adopting either arithmetic's #VALUE! conversion or a guessed Excel
+ * order: when neither operand is text without a numeric prefix, both compare
+ * as numbers; otherwise both compare as case-sensitive strings, a blank as "".
+ * Known unverified consequences include "1"=1, TRUE=1 and "2024 Q1"="2024 Q2"
+ * reading TRUE. */
 function applyCmp(op: string, a: PlainScalar, b: PlainScalar): boolean {
-  // Numeric-first comparison; fall back to string compare if either side is
-  // a non-numeric string. Matches Excel's behavior for dates (stored as
-  // serials) and arithmetic operations.
-  const an = typeof a === 'string' && isNaN(parseFloat(a)) ? null : toNum(a);
-  const bn = typeof b === 'string' && isNaN(parseFloat(b)) ? null : toNum(b);
+  const an = typeof a === 'string' && isNaN(parseFloat(a)) ? null : comparisonNumber(a);
+  const bn = typeof b === 'string' && isNaN(parseFloat(b)) ? null : comparisonNumber(b);
   if (an !== null && bn !== null) {
     switch (op) {
       case '<':  return an <  bn;
@@ -406,6 +437,19 @@ function applyCmp(op: string, a: PlainScalar, b: PlainScalar): boolean {
   }
   return false;
 }
+
+/** The evaluator's earlier lenient number reading, kept only for applyCmp's
+ * unsettled rule: a text prefix ("1x" → 1), 0 for other text, and no error.
+ * Do not use it for arithmetic or function arguments; they use toNum. */
+function comparisonNumber(v: EvalValue): number {
+  const s = operand(v);
+  if (typeof s === 'number') return s;
+  if (typeof s === 'boolean') return s ? 1 : 0;
+  if (s == null) return 0;
+  const n = parseFloat(s);
+  return isNaN(n) ? 0 : n;
+}
+
 
 function parseUnary(p: Parser): FormulaNode {
   if (p.budget.depth >= MAX_FORMULA_PARSE_DEPTH) throw new FormulaFailure('unsupported');
@@ -676,11 +720,7 @@ function callFunc(name: string, argNodes: FormulaNode[], ctx: EvalCtx): EvalValu
       const p = Math.pow(10, d);
       return (n >= 0 ? Math.ceil(n * p) : Math.floor(n * p)) / p;
     }
-    case 'ROUND': {
-      const n = toNum(args[0]); const d = toNum(args[1]);
-      const p = Math.pow(10, d);
-      return Math.round(n * p) / p;
-    }
+    case 'ROUND':      return roundHalfAwayFromZero(toNum(args[0]), toNum(args[1]));
     case 'INT':        return Math.floor(toNum(args[0]));
     case 'TRUNC':      { const n = toNum(args[0]); const d = toNum(args[1] ?? 0); const p = Math.pow(10, d); return (n >= 0 ? Math.floor(n * p) : Math.ceil(n * p)) / p; }
     case 'CEILING':    { const n = toNum(args[0]); const sig = toNum(args[1]); return sig === 0 ? 0 : Math.ceil(n / sig) * sig; }
@@ -747,6 +787,37 @@ function callFunc(name: string, argNodes: FormulaNode[], ctx: EvalCtx): EvalValu
     default:
       throw new FormulaFailure('unsupported');
   }
+}
+
+/** §18.17.7.278 ROUND. Normative: digits 0–4 round down and 5–9 round up by
+ * magnitude, so ties round away from zero (ROUND(-1.475,2) = -1.48).
+ * Library policy: the digits are x's shortest round-trip decimal spelling.
+ * Round that spelling directly, converting back to a double only once:
+ * binary products can lose a written tie, while exponent-shifting through
+ * intermediate doubles can change x even when no decimal digit is discarded.
+ * Unsupported: fractional number-digits has no rule established here.
+ * Callers pass finite operands; a result outside the finite-double range is
+ * the §18.17.3 #NUM! error. */
+function roundHalfAwayFromZero(x: number, digits: number): number {
+  if (!Number.isInteger(digits)) throw new FormulaFailure('unsupported');
+  if (x === 0) return 0;
+  // Finite doubles' shortest spellings fit in decimal exponents -324..308
+  // with at most 17 significant digits. This resource bound covers every
+  // place that can change them and keeps exponents in integer spelling.
+  const d = Math.max(-400, Math.min(400, digits));
+  const [mantissa, exponent = '0'] = String(Math.abs(x)).split('e');
+  const point = mantissa.indexOf('.');
+  const decimalDigits = mantissa.replace('.', '');
+  const integerPlaces = (point === -1 ? mantissa.length : point) + Number(exponent);
+  const retainedPlaces = integerPlaces + d;
+  // No discarded digit: preserve the original double exactly.
+  if (retainedPlaces >= decimalDigits.length) return x;
+  if (retainedPlaces < 0) return 0;
+  const retained = retainedPlaces === 0 ? 0n : BigInt(decimalDigits.slice(0, retainedPlaces));
+  const rounded = retained + (decimalDigits[retainedPlaces]! >= '5' ? 1n : 0n);
+  const value = Number(`${rounded}e${-d}`);
+  if (!Number.isFinite(value)) throw new FormulaFailure('error', '#NUM!');
+  return value === 0 ? 0 : Math.sign(x) * value;
 }
 
 function countIf(source: EvalScalar[], criteria: EvalValue): number {
