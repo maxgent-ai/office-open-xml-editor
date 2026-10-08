@@ -825,6 +825,8 @@ type LayoutSegment = {
   letterSpacingPx?: number;
   /** Internal identity of the authored run; keeps rPr@spc within that run. */
   sourceRunId?: number;
+  /** Cascaded `rPr@lang` of the authored run; selects kinsoku across seams. */
+  lang?: string;
   /** Spacing boundary before this segment when one authored run changed font. */
   leadingLetterSpacingPx?: number;
   baseline?: number;
@@ -1700,6 +1702,7 @@ export function paragraphInputRuns(
       strikeDouble: run.strikeDouble === true,
       letterSpacingPx: letterSpacingPx || undefined,
       sourceRunId,
+      lang: run.lang,
       baseline: run.baseline ?? undefined,
       shadow: run.shadow,
       reflection: run.reflection,
@@ -1792,6 +1795,34 @@ export function paragraphInputRuns(
 }
 
 /**
+ * Whether kinsoku continues across an input-run seam (authored runs, or the
+ * font-slot segments of one run). DrawingML specifies no kinsoku rule beyond
+ * a:pPr@eaLnBrk (§21.1.2.2.7), and rPr@lang (§21.1.2.3.9) only names the run
+ * language. Observed PowerPoint behavior (issue #1653, controls K00–K23):
+ * Arial in every slot, eaLnBrk="1", 20 pt, boxes 24/30/40 pt wide, with a
+ * curly quote next to ideographs in one run and split over two runs. Each
+ * two-run case breaks like its one-run twin. Under ja-JP, an opening quote
+ * never ends a line and a closing quote never starts one, even at the seam.
+ * Under en-US, neither rule applies to the quotes. Our curly quotes paint in
+ * the Latin slot, so they sit behind a slot seam in both languages.
+ * Limits: only the observed curly-quote/ideograph seams where both runs are
+ * Japanese join; other punctuation keeps its old boundary. Retraction never
+ * crosses another seam unless that seam meets this same rule. Other East
+ * Asian languages, mixed-language seams, and
+ * runs without lang keep the seam boundary, as C08 observed. Vertical
+ * (stacked) text and XLSX shapes have no such controls and are not wired.
+ */
+const JAPANESE_LANG_RE = /^ja(?:[-_]|$)/i;
+function powerPointKinsokuAcrossRuns(
+  left: LayoutSegment, right: LayoutSegment, leftText: string, rightText: string,
+): boolean {
+  const quote = (text: string) => text === '“' || text === '”';
+  const ideograph = (text: string) => /^\p{Script=Han}/u.test(text);
+  return JAPANESE_LANG_RE.test(left.lang ?? '') && JAPANESE_LANG_RE.test(right.lang ?? '')
+    && ((quote(leftText) && ideograph(rightText)) || (ideograph(leftText) && quote(rightText)));
+}
+
+/**
  * PowerPoint adapter for the shared DrawingML text phases. It resolves the
  * presentation theme, run formatting, fields, symbols, and equation rasters;
  * the core owns all soft break decisions. The resulting LayoutLine retains
@@ -1834,6 +1865,7 @@ export function layoutParagraph(
       ? marRPx : marLPx + (lineIndex === 0 ? firstLineIndentPx : 0),
     nonMonotoneMeasure: input.some((item) => item.type === 'text' && (item.style.letterSpacingPx ?? 0) < 0),
     eastAsianLineBreak: para.eaLnBrk !== false,
+    kinsokuAcrossRuns: powerPointKinsokuAcrossRuns,
   });
   const end = para.endRunProperties;
   const endSizePx = end?.fontSize != null
