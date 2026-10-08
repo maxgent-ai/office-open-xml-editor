@@ -77,12 +77,15 @@ export function specifiedTextLineMetrics(
   // allocation passes before wrapAllocation is published. Keep that complete
   // class on its existing convergence/placement contract.
   if (line.topY !== undefined) return null;
-  // Grid-atLeast is deliberately unresolved: the printing PDFs keep anchors
-  // on exact point advances while text can follow a different device cadence
-  // (40pt minima produced successive 40.08pt text steps on a 20pt grid). Neither
-  // §17.3.1.33 nor §17.6.5 establishes that projection. Preserve the complete
-  // existing class rather than fit the small baseline residual or its hosts.
-  if (spacing.rule === 'atLeast' && context.lineGrid.active) return null;
+  // Grid-atLeast uses the same normal-box projection as explicit auto=1;
+  // added minimum leading precedes that box, rather than centering the glyph
+  // in the entire minimum. The measured 20pt-grid controls include 24pt/40pt
+  // minima, 10pt/30pt visible text and zero/one/two same-face floating hosts.
+  // A 24pt minimum stays 24pt when the normal box fits, but oversized normal
+  // boxes reserve 40pt/60pt; do not round the authored minimum to grid cells.
+  // Word printing coordinates alternate 40.08/40.08/39.84pt (or a rotation):
+  // a 13-line control totals exactly 480pt, and anchors remain on nominal
+  // point advances. This is device projection, not accumulated layout leading.
   let first: LayoutTextSeg | undefined;
   for (const segment of line.segments) {
     if (!('text' in segment)) return null;
