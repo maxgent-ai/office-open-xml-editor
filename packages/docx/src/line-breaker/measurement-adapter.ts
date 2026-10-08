@@ -116,6 +116,13 @@ export class LineMeasurementAdapter {
    * a line-prefix cache. This does not promise arbitrary multi-token contextual
    * GSUB equivalence; RTL/complex and authored atomic units retain their own
    * shaping/placement contracts. Callers commit the result only on that line.
+   * Library policy: a registered compound grapheme (semanticSlotSpans) is one
+   * physical shape only as a single-grapheme request, so the joined probe
+   * re-splits its §17.3.2.26 slots and would charge the detached mark's
+   * advance to this boundary. Decline the repair there (no estimated pair
+   * value), as the intrinsic-width merge does. A compound never ends with a
+   * space, so only the right token can carry it. Unproven: whether native
+   * one-string shaping kerns across such a boundary.
    */
   wordBoundaryAdvance(left: LayoutTextSeg | undefined, right: LayoutTextSeg): number {
     const l = left?.textShapeRequest;
@@ -123,6 +130,7 @@ export class LineMeasurementAdapter {
     const service = right.textLayoutService;
     if (!left || !l || !r || !service || service !== left.textLayoutService
       || !left.text.endsWith(' ') || right.text.startsWith(' ') || !right.text
+      || right.semanticSlotSpans
       || left.metricOnly || right.metricOnly || left.ruby || right.ruby
       || left.fitTextRegionIndex !== undefined || right.fitTextRegionIndex !== undefined
       || left.verticalRun || right.verticalRun || left.rtl || right.rtl
