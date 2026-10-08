@@ -22,7 +22,7 @@ import type {
   TextShapeRequest,
   TextShapeSpan,
 } from '../layout/text.js';
-import { calcEffectiveFontPx, EAST_ASIAN_RE, assertTextShapeRunContext, independentTextShapeRequest, sliceTextShapeRequest } from '../layout/text.js';
+import { calcEffectiveFontPx, EAST_ASIAN_RE, assertTextShapeRunContext, independentTextShapeRequest, sliceTextShapeRequest, registeredLatinMarkGraphemeCandidate } from '../layout/text.js';
 import {
   referenceFontAverageWidthRatio,
   referenceFontLineMetrics,
@@ -1277,10 +1277,33 @@ function emitResolvedTextSegment(
     italic,
     weight,
     style,
-    textShapeRequest,
-    shaped,
+    textShapeRequest: initialTextShapeRequest,
+    shaped: initialShape,
     punctuationCompressions,
   } = frame;
+  let textShapeRequest = initialTextShapeRequest;
+  let shaped = initialShape;
+  // A single physical grapheme may retain several semantic rFonts slots.
+  // Both ordinary slots use the same allocation policy only in the explicit
+  // absence of character grid, spacing/scaling and atomic/transformed units.
+  // The text service separately proves exact registered face and cmap cover.
+  if (!authoritativeSpan && shaped && shaped.spans.length > 1
+    && registeredLatinMarkGraphemeCandidate(text)
+    && environment.characterGridActive === false && environment.verticalCJK !== true
+    && environment.paragraphRtl === false
+    && !rtl && !ruby && fitTextRegionIndex === undefined
+    && !base.smallCaps && !base.allCaps && !effectiveVertAlign
+    && (effectiveCharacterSpacing == null || effectiveCharacterSpacing === 0)
+    && (effectiveCharacterScale == null || effectiveCharacterScale === 1)
+    && !mappedSymbolUnicode && !compressCharacterWhitespace
+    && (r.fontHint == null || r.fontHint === 'default')) {
+    const compoundRequest = Object.freeze({ ...textShapeRequest, joinRegisteredGrapheme: true });
+    const compound = environment.layoutServices?.text.shape(compoundRequest);
+    if (compound?.spans.length === 1 && compound.spans[0]?.semanticSlotSpans) {
+      shaped = compound;
+      textShapeRequest = compoundRequest;
+    }
+  }
   const resolvedAxisDiffers =
     shaped?.spans.some((span) => (span.script === 'complexScript') !== cs) ?? false;
   if (shaped && (shaped.spans.length > 1 || resolvedAxisDiffers)) {
@@ -1405,6 +1428,7 @@ function emitResolvedTextSegment(
   segs.push({
     text,
     script: resolvedScript,
+    ...(resolvedSpan?.semanticSlotSpans ? { semanticSlotSpans: resolvedSpan.semanticSlotSpans } : {}),
     ...(widthBalanceGridDeltaFactor !== undefined
       ? {
           // §17.15.3.3 defines the SBCS:DBCS width ratio as 1:2; the

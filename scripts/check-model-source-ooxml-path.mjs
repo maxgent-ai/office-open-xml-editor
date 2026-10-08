@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // Compare the ordinary OOXML await path with the merge base using the AST.
 // Source-only branches are excluded; every remaining await must keep its
-// original order and callee. The XLSX render worker also retains one host.run
+// original order and callee, with the bounded opt-in font-owner refactor below.
+// The XLSX render worker also retains one host.run
 // around archive construction and parse, as in the previous renderer.
 // This regression check covers accidental edits, not intentionally hostile code.
 import { execFileSync } from 'node:child_process';
@@ -58,19 +59,28 @@ function callName(node) {
   return node.type;
 }
 
-function ooxmlAwaits(node, code) {
+function requiresGoogleFonts(node) {
+  if (node.type === 'LogicalExpression' && node.operator === '&&') {
+    return requiresGoogleFonts(node.left) || requiresGoogleFonts(node.right);
+  }
+  return node.type === 'MemberExpression' && !node.computed
+    && node.object.type === 'Identifier' && node.object.name === 'opts'
+    && node.property.type === 'Identifier' && node.property.name === 'useGoogleFonts';
+}
+
+function ooxmlAwaits(node, code, pptxFontOwnerRefactor = false) {
   const awaits = [];
-  function walk(current) {
+  function walk(current, googleFontsRequired = false) {
     if (current.type === 'BlockStatement') {
       for (const statement of current.body) {
         if (statement.type === 'IfStatement') {
           const test = code.slice(statement.test.start, statement.test.end).replace(/\s+/g, '');
           if (test === 'options.modelSources===undefined') {
-            walk(statement.consequent);
+            walk(statement.consequent, googleFontsRequired);
             return;
           }
         }
-        walk(statement);
+        walk(statement, googleFontsRequired);
       }
       return;
     }
@@ -79,39 +89,55 @@ function ooxmlAwaits(node, code) {
       // The internal comparison-build flag can only narrow the existing
       // selected-source branch; the ordinary OOXML await path is unchanged.
       if (/^(?:__OOXML_MODEL_SOURCES__&&)?(?:opts|options)\.modelSources!==undefined$/.test(test)) {
-        if (current.alternate) walk(current.alternate);
+        if (current.alternate) walk(current.alternate, googleFontsRequired);
         return;
       }
       if (/^options\.modelSources===undefined$/.test(test)) {
-        walk(current.consequent);
+        walk(current.consequent, googleFontsRequired);
         return;
       }
       if (/^!sourceLoad$/.test(test)) {
-        walk(current.consequent);
+        walk(current.consequent, googleFontsRequired);
         return;
       }
+      walk(current.test, googleFontsRequired);
+      walk(current.consequent, googleFontsRequired || requiresGoogleFonts(current.test));
+      if (current.alternate) walk(current.alternate, googleFontsRequired);
+      return;
     }
     if (current.type === 'ConditionalExpression') {
       const test = code.slice(current.test.start, current.test.end).replace(/\s+/g, '');
       if (test === 'options.modelSources===undefined') {
-        walk(current.consequent);
+        walk(current.consequent, googleFontsRequired);
         return;
       }
       if (test === 'sourceLoad' || test === 'this._sourceLoad' || test.startsWith('sourceLoad&&')) {
-        walk(current.alternate);
+        walk(current.alternate, googleFontsRequired);
         return;
       }
     }
-    if (current.type === 'AwaitExpression') awaits.push(callName(current.argument));
-    children(current).forEach(walk);
+    if (current.type === 'AwaitExpression') {
+      let name = callName(current.argument);
+      // The PPTX font barrier moved from a per-call array owner to the shared
+      // presentation lease. Normalize only this known callee transition under
+      // its positive opt-in AND gate. Every await is still visited, so additions
+      // or reordering inside the gate fail; unguarded/OR/alternate calls and
+      // every other package/helper retain their original identity checks.
+      if (pptxFontOwnerRefactor && googleFontsRequired && name === 'pres._ensureGoogleFonts') {
+        name = 'preloadGoogleFonts';
+      }
+      awaits.push(name);
+    }
+    children(current).forEach(child => walk(child, googleFontsRequired));
   }
   walk(node.body);
   return awaits;
 }
 
 export function auditAwaitCase(file, name, previous, current) {
-  const baseline = ooxmlAwaits(findFunction(parse(previous, { sourceType: 'module', plugins: ['typescript', 'jsx'] }), name), previous);
-  const candidate = ooxmlAwaits(findFunction(parse(current, { sourceType: 'module', plugins: ['typescript', 'jsx'] }), name), current);
+  const pptxFontOwnerRefactor = file === 'packages/pptx/src/presentation.ts' && name === 'load';
+  const baseline = ooxmlAwaits(findFunction(parse(previous, { sourceType: 'module', plugins: ['typescript', 'jsx'] }), name), previous, pptxFontOwnerRefactor);
+  const candidate = ooxmlAwaits(findFunction(parse(current, { sourceType: 'module', plugins: ['typescript', 'jsx'] }), name), current, pptxFontOwnerRefactor);
   if (JSON.stringify(candidate) !== JSON.stringify(baseline)) {
     throw new Error(`${file} ${name}: OOXML awaits changed\nmain ${JSON.stringify(baseline)}\nhead ${JSON.stringify(candidate)}`);
   }

@@ -1,3 +1,4 @@
+import { loadFontDemandCollector } from './font-demand-collector.js';
 import type { CjkLang } from '@silurus/ooxml-core';
 import init, { PptxArchive, reinit } from './wasm/pptx_parser.js';
 import type { PptxTextRunInfo } from './renderer';
@@ -11,7 +12,7 @@ import { PptxSlideRepository } from './slide-repository';
 import { loadPptxSlideFromCursor, readPptxSlideCursorUsage } from './slide-cursor-operation';
 import { SlidePullWorker } from './slide-pull-worker';
 import {
-  preloadGoogleFonts,
+  GoogleFontPreloadLease,
   loadOfficeFontFallbacks,
   unloadOfficeFontFallbacks,
   decodeDataUrl,
@@ -66,6 +67,7 @@ let preflight: PresentationPreflight | null = null;
 let cjkFallback: CjkLang | undefined;
 let googleSubstitutes = false;
 let preflightBuilder: PresentationPreflightBuilder | null = null;
+let googleFonts: GoogleFontPreloadLease | null = null;
 let slides: PptxSlideRepository | null = null;
 let availableSlideCount = 0;
 const slideAvailabilityWaiters = new Set<() => void>();
@@ -180,6 +182,8 @@ function getFontBytes(path: string): Promise<Uint8Array> {
 
 async function openPresentation(request: Extract<RenderWorkerRequest, { kind: 'parse' }>) {
   releaseOfficeFonts();
+  googleFonts?.release();
+  googleFonts = null;
   progressivePreflightGate.reset();
   await slidePull.reset();
   slides?.clear();
@@ -213,27 +217,25 @@ async function openPresentation(request: Extract<RenderWorkerRequest, { kind: 'p
   const embeddedFontsLoaded = loadEmbeddedFonts(bootstrap.embeddedFonts, getFontBytes);
   cjkFallback = request.cjkFallback;
   googleSubstitutes = request.useGoogleFonts === true;
-  preflightBuilder = new PresentationPreflightBuilder(bootstrap, { cjkFallback });
+  preflightBuilder = new PresentationPreflightBuilder(bootstrap, { cjkFallback, collectFontDemand: request.useGoogleFonts === true && !request.renderers ? await loadFontDemandCollector(true) : undefined });
   slides = new PptxSlideRepository({
     slideCount: bootstrap.slideCount,
     maxCachedSlides: HARD_MAX_PPTX_CACHED_SLIDES,
     maxCachedStructuralBytes: HARD_MAX_PPTX_CACHED_SLIDE_PROJECTION_BYTES,
     loadSlide,
   });
+  if (request.useGoogleFonts) googleFonts = new GoogleFontPreloadLease(PPTX_GOOGLE_FONTS);
   if (request.progressiveLayout) {
-    const loadedGoogleFonts = new Set<string>();
     const ensureFonts = async (): Promise<void> => {
       const embedded = await embeddedFontsLoaded;
       embeddedFontAliases = embedded.aliases;
       embeddedFontAuthoredFamilies = embedded.authoredFamilies;
       embeddedFontTuples = embedded.tuples;
       if (!request.useGoogleFonts) return;
-      const requested = excludeEmbeddedFontFamilies(
-        preflightBuilder!.currentFontPreloadNames,
-        embedded.aliases,
-      ).filter((name): name is string => !!name && !loadedGoogleFonts.has(name));
-      for (const name of requested) loadedGoogleFonts.add(name);
-      if (requested.length) await preloadGoogleFonts(requested, PPTX_GOOGLE_FONTS);
+      await googleFonts?.ensure(
+        excludeEmbeddedFontFamilies(preflightBuilder!.currentFontPreloadNames, embedded.aliases),
+        preflightBuilder!.currentFontPreloadDemandDelta,
+      );
     };
     for (let index = 0; index < bootstrap.slideCount; index += 1) {
       await slides.withSlide(index, () => undefined);
@@ -273,11 +275,11 @@ async function openPresentation(request: Extract<RenderWorkerRequest, { kind: 'p
       embeddedFontAuthoredFamilies = embedded.authoredFamilies;
       embeddedFontTuples = embedded.tuples;
       if (!request.useGoogleFonts) return embedded.faces;
-      const substitutes = await preloadGoogleFonts(
+      await googleFonts?.ensure(
         excludeEmbeddedFontFamilies(preflight.fontPreloadNames, embedded.aliases),
-        PPTX_GOOGLE_FONTS,
+        preflight.fontPreloadDemand,
       );
-      return [...embedded.faces, ...substitutes];
+      return embedded.faces;
     })();
   }
   return preflight;
@@ -487,6 +489,8 @@ self.onmessage = async (event: MessageEvent<RenderWorkerRequest | WorkerSvgDecod
       wakeSlideAvailabilityWaiters();
     }
     if (ownsParseReservation) {
+      googleFonts?.release();
+      googleFonts = null;
       progressivePreflightGate.reset();
       slides?.clear();
       slides = null;

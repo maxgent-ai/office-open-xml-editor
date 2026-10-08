@@ -209,7 +209,12 @@ describe('XlsxWorkbook.destroy() — rejects in-flight worker requests', () => {
   it('an in-flight destroy releases once and preserves another workbook holder', async () => {
     const { added } = installFontFaceSet();
     let resolveFetch!: (response: { ok: boolean; text(): Promise<string> }) => void;
-    G.fetch = vi.fn(() => new Promise((resolve) => { resolveFetch = resolve; }));
+    let signalFetchStarted!: () => void;
+    const fetchStarted = new Promise<void>(resolve => { signalFetchStarted = resolve; });
+    G.fetch = vi.fn(() => new Promise((resolve) => {
+      resolveFetch = resolve;
+      signalFetchStarted();
+    }));
     const first = makeWorkbook().wb as unknown as XlsxWorkbook;
     const second = makeWorkbook().wb as unknown as XlsxWorkbook;
     (first as unknown as { googleFontNames: string[] }).googleFontNames = ['Cambria'];
@@ -218,6 +223,9 @@ describe('XlsxWorkbook.destroy() — rejects in-flight worker requests', () => {
 
     const firstRetain = first[retainXlsxViewerFonts](targetDocument);
     const secondRetain = second[retainXlsxViewerFonts](targetDocument);
+    // Destroy during the actual pending request, independently of whether the
+    // shared loader starts that request synchronously or through its queue.
+    await fetchStarted;
     first.destroy();
     resolveFetch({ ok: true, text: async () => CSS });
     const [releaseFirst] = await Promise.all([firstRetain, secondRetain]);

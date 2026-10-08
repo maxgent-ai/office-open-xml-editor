@@ -157,7 +157,7 @@ export {
 } from './crypto';
 export { readCfbStream } from './errors/cfb-read';
 export {
-  preloadGoogleFonts,
+  preloadGoogleFonts, GoogleFontPreloadLease, type FontPreloadDemand,
   unloadGoogleFonts,
   activeFontSet,
   type FontPreloadEntry,

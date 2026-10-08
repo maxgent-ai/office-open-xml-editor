@@ -1,6 +1,7 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import {
   preloadGoogleFonts,
+  GoogleFontPreloadLease,
   unloadGoogleFonts,
   parseFontFaceRules,
   _resetCssCacheForTests,
@@ -548,4 +549,87 @@ describe('preloadGoogleFonts — dedup + unloadGoogleFonts (SPA leak)', () => {
     unloadGoogleFonts(b);
     expect(added).toHaveLength(0);
   });
+});
+
+describe('GoogleFontPreloadLease subset admission', () => {
+  it('registers original overlapping order before loading demand and releases once', async () => {
+    const { set, added } = installFakes();
+    G.fetch = vi.fn(async () => ({ ok: true, text: async () => `
+      @font-face { font-family: Carlito; src: url(b.woff2); unicode-range: U+0042; }
+      @font-face { font-family: Carlito; src: url(ab.woff2); unicode-range: U+0041-0042; }
+    ` }));
+    const lease = new GoogleFontPreloadLease(MAP, set as unknown as FontFaceSet);
+    await lease.ensure(['Calibri'], [0x41]);
+    expect(added.map(f => f.source)).toEqual([expect.stringContaining('b.woff2'), expect.stringContaining('ab.woff2')]);
+    expect(added.map(f => f.loadCalls)).toEqual([0, 1]);
+    await lease.ensure(['Calibri'], [0x42]);
+    await lease.ensure(['Calibri'], [0x42]);
+    expect(added.map(f => f.loadCalls)).toEqual([1, 1]);
+    lease.release(); lease.release();
+    expect(added).toHaveLength(0);
+  });
+
+  it('loads invalid or missing ranges conservatively and preserves distinct weights', async () => {
+    const { set, added } = installFakes();
+    G.fetch = vi.fn(async () => ({ ok: true, text: async () => `
+      @font-face { font-family: Carlito; src: url(a.woff2); unicode-range: U+0041, broken; }
+      @font-face { font-family: Carlito; src: url(b.woff2); }
+      @font-face { font-family: Carlito; src: url(c.woff2); font-weight: 400; unicode-range: U+1F6??; }
+      @font-face { font-family: Carlito; src: url(c.woff2); font-weight: 700; unicode-range: U+1F600-1F6FF; }
+      @font-face { font-family: Carlito; src: url(d.woff2); unicode-range: U+1F700; }
+    ` }));
+    const lease = new GoogleFontPreloadLease(MAP, set as unknown as FontFaceSet);
+    await lease.ensure(['Calibri'], [0x1f6ff]);
+    expect(added.map(f => f.loadCalls)).toEqual([1, 1, 1, 1, 0]);
+    lease.release();
+  });
+
+  it('does not register after release during a delayed stylesheet fetch', async () => {
+    const { set, added } = installFakes();
+    let resolve!: (value: unknown) => void;
+    G.fetch = vi.fn(() => new Promise(r => { resolve = r; }));
+    const lease = new GoogleFontPreloadLease(MAP, set as unknown as FontFaceSet);
+    const pending = lease.ensure(['Calibri'], [0x41]);
+    await Promise.resolve(); await Promise.resolve();
+    lease.release();
+    resolve({ ok: true, text: async () => CSS });
+    await pending;
+    expect(added).toHaveLength(0);
+  });
+});
+
+it('joins eligible shared readiness and releases a pending owner without removing the survivor', async () => {
+  let finish!: () => void;
+  const gate = new Promise<void>(resolve => { finish = resolve; });
+  const { set, added } = installFakes({ load: face => gate.then(() => face) });
+  const first = new GoogleFontPreloadLease(MAP, set as unknown as FontFaceSet);
+  const second = new GoogleFontPreloadLease(MAP, set as unknown as FontFaceSet);
+  const opening = first.ensure(['Calibri'], [65]);
+  await vi.waitFor(() => expect(added).toHaveLength(2));
+  let ready = false;
+  const joining = second.ensure(['Calibri'], [65]).then(() => { ready = true; });
+  await vi.waitFor(() => expect(added.every(face => face.loadCalls === 2)).toBe(true));
+  expect(ready).toBe(false);
+  first.release();
+  expect(added).toHaveLength(2);
+  finish();
+  await Promise.all([opening, joining]);
+  expect(ready).toBe(true);
+  second.release();
+  expect(added).toHaveLength(0);
+});
+
+it('unwinds earlier registrations when a later rule cannot be constructed', async () => {
+  const { set, added } = installFakes();
+  const Original = G.FontFace as new (...args: unknown[]) => FakeFace;
+  G.FontFace = class extends Original {
+    constructor(...args: unknown[]) {
+      if (String(args[1]).includes('y.woff2')) throw new Error('invalid font source');
+      super(...args);
+    }
+  };
+  const lease = new GoogleFontPreloadLease(MAP, set as unknown as FontFaceSet);
+  await expect(lease.ensure(['Calibri'], [65])).rejects.toThrow('invalid font source');
+  expect(added).toHaveLength(0);
+  lease.release();
 });

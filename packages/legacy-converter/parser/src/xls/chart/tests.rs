@@ -507,3 +507,189 @@ fn numeric_chart_expansion_stops_at_aggregate_typed_slot_admission() {
     );
     assert_eq!(calls.get(), 1); // no category/bubble expansion after failure
 }
+
+/// Chart3d is the BIFF view/group contract, not a different canonical family.
+/// Exercise the record -> shared-model boundary used by both native XLS hosts.
+#[test]
+fn chart3d_projects_camera_and_bar_depth_grouping() {
+    for (bar_flags, view_flags, expected_grouping, height) in [
+        (0, 0x17, "clustered", None),
+        (0, 0x10, "standard", Some(125.0)),
+        (2, 0x11, "stacked", Some(125.0)),
+        (6, 0x11, "percentStacked", Some(125.0)),
+    ] {
+        let mut owned = bar_chart(true, None);
+        let at = owned.iter().position(|r| r.0 == 0x1017).unwrap();
+        owned[at].1 = u16s(&[0, 150, bar_flags]);
+        owned.insert(
+            at + 1,
+            record(
+                0x103a,
+                u16s(&[270, (-25i16) as u16, 45, 125, 240, 80, view_flags]),
+            ),
+        );
+        let raw = read(&as_records(&owned)).unwrap();
+        let model = project(&raw, &palette(), &|_| None).unwrap();
+        let view = model.three_d.expect("Chart3d must reach the renderer");
+        assert_eq!(view.rotation_x, Some(-25));
+        assert_eq!(view.rotation_y, Some(270));
+        assert_eq!(view.perspective, Some(45));
+        assert_eq!(view.right_angle_axes, Some(view_flags & 1 == 0));
+        assert_eq!(view.depth_percent, Some(240.0));
+        assert_eq!(view.gap_depth_percent, Some(80.0));
+        assert_eq!(view.height_percent, height);
+        assert_eq!(view.height_percent_authored, Some(height.is_some()));
+        assert_eq!(view.bar_grouping.as_deref(), Some(expected_grouping));
+    }
+}
+
+#[test]
+fn chart3d_bar_shapes_follow_series_format_and_ignore_2d_shapes() {
+    for (riser, taper, expected) in [
+        (0, 0, "box"),
+        (1, 0, "cylinder"),
+        (1, 1, "cone"),
+        (1, 2, "coneToMax"),
+        (0, 1, "pyramid"),
+        (0, 2, "pyramidToMax"),
+    ] {
+        let mut owned = bar_chart(true, None);
+        let format_at = owned.iter().position(|r| r.0 == 0x1006).unwrap() + 2;
+        owned.insert(format_at, record(0x105f, vec![riser, taper]));
+        let raw = read(&as_records(&owned)).unwrap();
+        let flat = project(&raw, &palette(), &|_| None).unwrap();
+        assert!(flat.three_d.is_none());
+        assert!(flat.series[0].three_d_shape.is_none());
+        let at = owned.iter().position(|r| r.0 == 0x1017).unwrap();
+        owned.insert(
+            at + 1,
+            record(0x103a, u16s(&[20, 15, 30, 100, 100, 150, 0x17])),
+        );
+        let raw = read(&as_records(&owned)).unwrap();
+        let model = project(&raw, &palette(), &|_| None).unwrap();
+        assert_eq!(model.series[0].three_d_shape.as_deref(), Some(expected));
+    }
+}
+
+#[test]
+fn malformed_chart3d_is_rejected_instead_of_silently_flattened() {
+    let mut owned = bar_chart(true, None);
+    let at = owned.iter().position(|r| r.0 == 0x1017).unwrap();
+    owned.insert(at + 1, record(0x103a, vec![0; 12]));
+    assert!(read(&as_records(&owned)).is_err());
+}
+
+#[test]
+fn chart3d_line_area_pie_and_surface_keep_their_family_and_view() {
+    for (record_kind, data, flags, expected_type) in [
+        (0x1018, u16s(&[0]), 0x11, "line"),
+        (0x101a, u16s(&[0]), 0x11, "area"),
+        (0x1019, u16s(&[0, 0, 0]), 0, "pie"),
+        (0x103f, u16s(&[0]), 0x11, "surface"),
+    ] {
+        let mut owned = bar_chart(true, None);
+        let at = owned.iter().position(|r| r.0 == 0x1017).unwrap();
+        owned[at] = record(record_kind, data);
+        owned.insert(
+            at + 1,
+            record(0x103a, u16s(&[20, 15, 30, 125, 100, 150, flags])),
+        );
+        let raw = read(&as_records(&owned)).unwrap();
+        let model = project(&raw, &palette(), &|_| None).unwrap();
+        assert_eq!(model.chart_type, expected_type);
+        let view = model.three_d.unwrap();
+        assert_eq!(view.rotation_x, Some(15));
+        if expected_type == "pie" {
+            // BIFF pcHeight is pie thickness, not the OOXML hPercent multiplier.
+            assert!(view.height_percent.is_none());
+        }
+        if expected_type == "surface" {
+            assert_eq!(model.surface_wireframe, Some(true));
+        }
+    }
+}
+
+#[test]
+fn standard_chart3d_keeps_series_axis_ticks_title_direction_and_skips() {
+    let mut owned = bar_chart(true, None);
+    let at = owned.iter().position(|r| r.0 == 0x1014).unwrap();
+    let mut ticks = vec![0; 30];
+    ticks[..3].copy_from_slice(&[1, 0, 2]);
+    owned.splice(
+        at..at,
+        [
+            record(0x101d, [u16s(&[2]), vec![0; 16]].concat()),
+            record(0x1033, vec![]),
+            record(0x1020, u16s(&[0, 2, 3, 4])),
+            record(0x101e, ticks),
+            record(0x1034, vec![]),
+            record(0x1025, vec![0; 32]),
+            record(0x1033, vec![]),
+            record(0x1027, u16s(&[7, 0, 0])),
+            record(0x100d, short_text("Series")),
+            record(0x1034, vec![]),
+        ],
+    );
+    let at = owned.iter().position(|r| r.0 == 0x1017).unwrap();
+    owned[at].1 = u16s(&[0, 150, 0]);
+    owned.insert(
+        at + 1,
+        record(0x103a, u16s(&[20, 15, 30, 125, 100, 150, 0x15])),
+    );
+    let raw = read(&as_records(&owned)).unwrap();
+    let model = project(&raw, &palette(), &|_| None).unwrap();
+    let axis = model.three_d.unwrap().series_axis.unwrap();
+    assert_eq!(axis.major_tick_mark, "in");
+    assert_eq!(axis.tick_label_pos.as_deref(), Some("high"));
+    assert_eq!(axis.title.as_deref(), Some("Series"));
+    assert_eq!(axis.orientation.as_deref(), Some("maxMin"));
+    assert_eq!(axis.tick_label_skip, Some(2));
+    assert_eq!(axis.tick_mark_skip, Some(3));
+}
+
+#[test]
+fn bubble_3d_effect_is_series_scoped_and_ignored_for_other_families() {
+    for bubbles in [false, true] {
+        let mut owned = bar_chart(true, None);
+        let at = owned.iter().position(|r| r.0 == 0x1006).unwrap() + 2;
+        owned.insert(at, record(0x105d, u16s(&[2])));
+        if bubbles {
+            let at = owned.iter().position(|r| r.0 == 0x1017).unwrap();
+            owned[at] = record(0x101b, u16s(&[100, 1, 1]));
+        }
+        let raw = read(&as_records(&owned)).unwrap();
+        let model = project(&raw, &palette(), &|_| None).unwrap();
+        assert_eq!(model.series[0].bubble_3d, bubbles.then_some(true));
+        assert!(model.three_d.is_none());
+    }
+}
+
+#[test]
+fn chart3d_group_shape_supplies_only_missing_series_shapes() {
+    for override_shape in [None, Some(vec![1, 0])] {
+        let mut owned = bar_chart(true, None);
+        if let Some(shape) = override_shape.as_ref() {
+            let at = owned.iter().position(|r| r.0 == 0x1006).unwrap() + 2;
+            owned.insert(at, record(0x105f, shape.clone()));
+        }
+        let at = owned.iter().position(|r| r.0 == 0x1017).unwrap() + 1;
+        owned.splice(
+            at..at,
+            [
+                record(0x103a, u16s(&[20, 15, 30, 100, 100, 150, 0x17])),
+                record(0x1006, u16s(&[0xffff, 0, 0, 0])),
+                record(0x1033, vec![]),
+                record(0x105f, vec![0, 1]),
+                record(0x1034, vec![]),
+            ],
+        );
+        let raw = read(&as_records(&owned)).unwrap();
+        let model = project(&raw, &palette(), &|_| None).unwrap();
+        let view = model.three_d.unwrap();
+        assert_eq!(view.shape.as_deref(), Some("pyramid"));
+        assert_eq!(
+            model.series[0].three_d_shape.as_deref(),
+            override_shape.map(|_| "cylinder")
+        );
+    }
+}
