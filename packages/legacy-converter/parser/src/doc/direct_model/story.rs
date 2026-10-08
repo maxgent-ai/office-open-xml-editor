@@ -1118,6 +1118,10 @@ mod tests {
     struct ProjectedTable {
         markers: Vec<String>,
         row_cell_counts: Vec<usize>,
+        table_indents: Vec<Option<f64>>,
+        table_directions: Vec<Option<bool>>,
+        row_grid_before: Vec<u32>,
+        table_grids: Vec<Vec<f64>>,
         col_spans: Vec<u32>,
         colors: Vec<String>,
         sizes: Vec<f64>,
@@ -1767,6 +1771,10 @@ mod tests {
             let mut colors = Vec::new();
             let mut markers = Vec::new();
             let mut row_cell_counts = Vec::new();
+            let mut table_indents = Vec::new();
+            let mut table_directions = Vec::new();
+            let mut row_grid_before = Vec::new();
+            let mut table_grids = Vec::new();
             let mut col_spans = Vec::new();
             let mut sizes = Vec::new();
             let mut ascii_fonts = Vec::new();
@@ -1784,8 +1792,12 @@ mod tests {
                 let BodyElement::Table(table) = element else {
                     continue;
                 };
+                table_indents.push(table.tbl_ind);
+                table_directions.push(table.bidi_visual);
+                table_grids.push(table.col_widths.clone());
                 for row in &table.rows {
                     row_cell_counts.push(row.cells.len());
+                    row_grid_before.push(row.grid_before);
                     for cell in &row.cells {
                         col_spans.push(cell.col_span);
                         text_directions.push(cell.text_direction.clone());
@@ -1850,6 +1862,10 @@ mod tests {
             Ok(ProjectedTable {
                 markers,
                 row_cell_counts,
+                table_indents,
+                table_directions,
+                row_grid_before,
+                table_grids,
                 col_spans,
                 colors,
                 sizes,
@@ -3736,19 +3752,140 @@ mod tests {
                 .unsupported_table
         );
         let moved = sprm(0x9601, &200i16.to_le_bytes());
-        let error = try_default_styled_table(&moved, &rtl_inherited)
-            .err()
-            .unwrap();
-        assert!(error.contains("right-to-left"), "{error}");
+        let projected = try_default_styled_table(&moved, &rtl_inherited).unwrap();
+        assert_eq!(projected.table_indents, [Some(10.0)]);
+        assert_eq!(projected.table_directions, [Some(true)]);
+    }
 
-        // A differing preferred indent is not covered by the LTR evidence.
-        let rtl_indented = [
+    #[test]
+    fn native_story_bounds_preferred_indent_after_final_width_override() {
+        let project = |preferred: i16, width: u16| {
+            let after = [
+                sprm(0x560b, &1u16.to_le_bytes()),
+                sprm(0xf661, &[&[3][..], &preferred.to_le_bytes()].concat()),
+                sprm(0x7623, &[&[0, 1][..], &width.to_le_bytes()].concat()),
+            ]
+            .concat();
+            try_default_styled_table(&[], &after)
+        };
+        let legal = project(30_679, 1001).unwrap();
+        assert_eq!(legal.table_grids, [vec![50.05]]);
+        assert_eq!(legal.table_indents, [Some(0.0)]);
+        // The preference precedes the width mutation in the property stream.
+        // Its scalar bound is legal, but the final table edge is one twip too far.
+        let error = project(30_680, 1001).err().unwrap();
+        assert!(error.contains("preferred indent plus row width"), "{error}");
+    }
+
+    #[test]
+    fn native_story_preserves_logical_rtl_origin_independent_of_preferred_indent() {
+        // Direct preferences after TIstd supersede inherited P=0, while the
+        // signed acquired edge stays the layout coordinate. No small-offset
+        // tolerance, zero-only rule, or double bidi mirror is appropriate.
+        for (origin, preferred) in [(5i16, -400i16), (200, 109), (-360, 720)] {
+            let before = [
+                sprm(0x9601, &(origin + 108).to_le_bytes()),
+                sprm(0x9602, &108i16.to_le_bytes()),
+            ]
+            .concat();
+            let after = [
+                sprm(0x560b, &1u16.to_le_bytes()),
+                sprm(0xf661, &[&[3][..], &preferred.to_le_bytes()].concat()),
+            ]
+            .concat();
+            let projected = try_default_styled_table(&before, &after).unwrap();
+            assert_eq!(projected.table_indents, [Some(f64::from(origin) / 20.0)]);
+            assert_eq!(projected.table_directions, [Some(true)]);
+            assert_eq!(projected.markers, ["a"]);
+            assert_eq!(projected.row_cell_counts, [1]);
+            assert!(!projected.unsupported_table);
+        }
+        // TDefTable edges include spacing already; they must not subtract
+        // TDxaGapHalf again. Two shifted rows retain the union-grid gap.
+        let defined_row = |origin: i16| {
+            let mut definition = vec![6, 0, 1];
+            definition.extend(origin.to_le_bytes());
+            definition.extend((origin + 1000).to_le_bytes());
+            let after = [
+                sprm(0x9602, &108i16.to_le_bytes()),
+                sprm(0xd608, &definition),
+                sprm(0x560b, &1u16.to_le_bytes()),
+                sprm(0xf661, &[3, 0x70, 0xfe]), // direct P=-400
+                sprm(0xf617, &[3, (origin - 5) as u8, ((origin - 5) >> 8) as u8]),
+            ]
+            .concat();
+            styled_row(11, &[], &after)
+        };
+        let projected = try_project_table(
+            "a\u{7}\u{7}b\u{7}\u{7}\r",
+            &[
+                (0, 2, cell()),
+                (2, 3, defined_row(5)),
+                (3, 5, cell()),
+                (5, 6, defined_row(365)),
+                (6, 7, Vec::new()),
+            ],
+            StyleFixture {
+                default_table_style: true,
+                default_table_style_indent: true,
+                ..StyleFixture::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(projected.table_indents, [Some(0.25)]);
+        assert_eq!(projected.table_directions, [Some(true)]);
+        assert_eq!(projected.markers, ["a", "b"]);
+        assert_eq!(projected.table_grids, [vec![18.0, 32.0, 18.0]]);
+        assert_eq!(projected.row_grid_before, [0, 1]);
+        assert_eq!(projected.col_spans, [2, 2]);
+        // This recovery does not define nonleading or floating placement.
+        for extra in [
+            sprm(0x548a, &1u16.to_le_bytes()),
+            sprm(0x548a, &2u16.to_le_bytes()),
+            [sprm(0x360d, &[0x60]), sprm(0x940f, &159i16.to_le_bytes())].concat(),
+        ] {
+            let after = [
+                sprm(0x560b, &1u16.to_le_bytes()),
+                sprm(0xf661, &[3, 0x6d, 0]),
+                extra,
+            ]
+            .concat();
+            let error = try_default_styled_table(&[], &after).err().unwrap();
+            assert!(error.contains("right-to-left"), "{error}");
+        }
+        // The table takes its alignment from its first row. A later leading
+        // row cannot widen admission for a centered table's differing P.
+        let first = [
+            sprm(0x560b, &1u16.to_le_bytes()),
+            sprm(0x548a, &1u16.to_le_bytes()),
+        ]
+        .concat();
+        let later = [
             sprm(0x560b, &1u16.to_le_bytes()),
             sprm(0xf661, &[3, 0x6d, 0]),
         ]
         .concat();
-        let error = try_default_styled_table(&[], &rtl_indented).err().unwrap();
+        let error = try_project_table(
+            "a\u{7}\u{7}b\u{7}\u{7}\r",
+            &[
+                (0, 2, cell()),
+                (2, 3, styled_row(11, &[], &first)),
+                (3, 5, cell()),
+                (5, 6, styled_row(11, &[], &later)),
+                (6, 7, Vec::new()),
+            ],
+            StyleFixture {
+                default_table_style: true,
+                default_table_style_indent: true,
+                ..StyleFixture::default()
+            },
+        )
+        .err()
+        .unwrap();
         assert!(error.contains("right-to-left"), "{error}");
+        let malformed = [sprm(0x560b, &1u16.to_le_bytes()), sprm(0xf661, &[2, 0, 0])].concat();
+        let error = try_default_styled_table(&[], &malformed).err().unwrap();
+        assert!(error.contains("preferred indent unit"), "{error}");
     }
 
     #[test]

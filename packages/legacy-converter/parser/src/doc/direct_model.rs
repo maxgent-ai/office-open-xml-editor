@@ -1029,6 +1029,14 @@ mod tests {
     }
 
     fn source_with_proofing(text: &str, no_proof: bool) -> Vec<u8> {
+        let mut chpx = vec![0x35, 0x08, 1];
+        if no_proof {
+            chpx.extend([0x75, 0x08, 1]);
+        }
+        source_with_direct_chpx(text, &chpx)
+    }
+
+    fn source_with_direct_chpx(text: &str, chpx: &[u8]) -> Vec<u8> {
         let source = source(text);
         let cfb = CompoundFile::open(&source).unwrap();
         let mut word = cfb.stream("WordDocument").unwrap();
@@ -1036,13 +1044,9 @@ mod tests {
         let bte = u32::from_le_bytes(word[0xfa..0xfe].try_into().unwrap()) as usize;
         let page_number = u32::from_le_bytes(table[bte + 8..bte + 12].try_into().unwrap()) as usize;
         let page = &mut word[page_number * 512..(page_number + 1) * 512];
-        let mut chpx = vec![0x35, 0x08, 1];
-        if no_proof {
-            chpx.extend([0x75, 0x08, 1]);
-        }
         page[8] = 32;
         page[64] = chpx.len() as u8;
-        page[65..65 + chpx.len()].copy_from_slice(&chpx);
+        page[65..65 + chpx.len()].copy_from_slice(chpx);
         build_scoped_cfb(&[("WordDocument", word), ("0Table", table)])
     }
 
@@ -2096,6 +2100,31 @@ mod tests {
                 .unwrap_err()
                 .contains("cyclic")
         );
+    }
+
+    #[test]
+    fn default_font_fixup_chpx_reaches_the_native_document_without_losing_text() {
+        let project = |chpx: &[u8]| {
+            let bytes = source_with_direct_chpx("عربي x\r", chpx);
+            super::super::direct_model(&CompoundFile::open(&bytes).unwrap(), 1024 * 1024)
+                .map(|result| serde_json::to_value(result.document).unwrap())
+        };
+        let baseline = project(&[0x35, 0x08, 1]).unwrap();
+        assert_eq!(body_outline(&baseline["body"]), ["p[t:عربي x]"]);
+        for value in [0, 1] {
+            assert_eq!(
+                project(&[0x35, 0x08, 1, 0x86, 0x2a, value]).unwrap(),
+                baseline
+            );
+        }
+        for value in [2, 4] {
+            assert!(project(&[0x86, 0x2a, value])
+                .unwrap_err()
+                .contains("unsupported formatting"));
+        }
+        assert!(project(&[0x86, 0x2a, 0x80])
+            .unwrap_err()
+            .contains("font fixup method"));
     }
 
     #[test]

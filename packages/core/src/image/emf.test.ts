@@ -827,7 +827,115 @@ describe('playEmf — polygon16 fill + brush/pen select', () => {
 
 // ── playEmf: text-out ────────────────────────────────────────────────────────
 
+function symbolTextFile(face: string, charset: number, text: string, options = 0, advances: number[] = []): Uint8Array {
+  return concat(
+    emfHeader(0, 0, 100, 100),
+    record(EMR.EXTCREATEFONTINDIRECTW, (w) => {
+      w.u32(1).i32(-12).i32(0).i32(0).i32(0).i32(400);
+      w.raw(0, 0, 0, charset).raw(0, 0, 0, 0).utf16(face);
+      for (let i = face.length; i < 32; i++) w.u16(0);
+    }),
+    record(EMR.SELECTOBJECT, (w) => w.u32(1)),
+    record(EMR.EXTTEXTOUTW, (w) => {
+      w.i32(0).i32(0).i32(100).i32(100).u32(1).f32(1).f32(1);
+      const headerSize = options & 0x100 ? 60 : 76;
+      w.i32(20).i32(30).u32(text.length).u32(headerSize).u32(options);
+      if (!(options & 0x100)) w.i32(0).i32(0).i32(0).i32(0);
+      w.u32(advances.length ? headerSize + text.length * 2 : 0).utf16(text);
+      for (const advance of advances) w.u32(advance);
+    }),
+    record(EMR.EOF, () => {}),
+  );
+}
+
 describe('playEmf — EXTTEXTOUTW text', () => {
+  it('preserves valid text with ETO_NO_RECT and its shorter record header', () => {
+    const m = makeRecordingCtx();
+    const report = vi.fn();
+    playEmf(symbolTextFile('Arial', 0, 'A', 0x100), m.ctx, 100, 100, { onUnsupported: report });
+    expect(m.calls.find((c) => c.op === 'fillText')?.args).toEqual(['A', 20, 30]);
+    expect(report).not.toHaveBeenCalled();
+  });
+  it('normalizes private Symbol glyphs only under SYMBOL_CHARSET', () => {
+    const m = makeRecordingCtx();
+    playEmf(symbolTextFile('Symbol', 2, '\uf0ae'), m.ctx, 100, 100);
+    expect(m.calls.find((c) => c.op === 'fillText')?.args).toEqual(['→', 20, 30]);
+    expect(m.ctx.font).toBe('12px serif');
+    const ordinary = makeRecordingCtx();
+    playEmf(symbolTextFile('Symbol', 0, '\uf0ae'), ordinary.ctx, 100, 100);
+    expect(ordinary.calls.find((c) => c.op === 'fillText')?.args[0]).toBe('\uf0ae');
+  });
+
+  it('decodes MT Extra private ellipses in the exact family, leaving other families and ANSI alone', () => {
+    const text = '\uf04b\uf04c\uf04d\uf04e\uf04f';
+    const m = makeRecordingCtx();
+    const report = vi.fn();
+    playEmf(symbolTextFile('MT Extra', 2, text), m.ctx, 100, 100, { onUnsupported: report });
+    expect(m.calls.find((c) => c.op === 'fillText')?.args).toEqual(['…⋯⋮⋰⋱', 20, 30]);
+    expect(m.ctx.font).toBe('12px serif');
+    expect(report).not.toHaveBeenCalled();
+    for (const [face, charset] of [['MT Extra Tiger', 2], ['MT Extra', 0]] as const) {
+      const other = makeRecordingCtx();
+      playEmf(symbolTextFile(face, charset, text), other.ctx, 100, 100);
+      expect(other.calls.find((c) => c.op === 'fillText')?.args[0]).toBe(text);
+    }
+  });
+
+  it('retains unknown symbol-font compatibility text and reports the unsupported encoding', () => {
+    const m = makeRecordingCtx();
+    const report = vi.fn();
+    playEmf(symbolTextFile('MT Extra', 2, '\uf04c\uf041'), m.ctx, 100, 100, { onUnsupported: report });
+    expect(m.calls.find((c) => c.op === 'fillText')?.args[0]).toBe('\uf04c\uf041');
+    expect(report).toHaveBeenCalledWith(['EMR_EXTTEXTOUTW (unsupported symbol encoding)']);
+  });
+
+  it.each([
+    ['Symbol', '\uf0ae\uf041', 0],
+    ['SymbolMT', '\uf0ae', 0],
+    ['Symbol', '\uf0ae', 0x10],
+  ])('does not partially decode unknown glyphs, faces or glyph-index options (%s)', (face, text, options) => {
+    const m = makeRecordingCtx();
+    const report = vi.fn();
+    playEmf(symbolTextFile(face, 2, text, options), m.ctx, 100, 100, { onUnsupported: report });
+    expect(m.calls.find((c) => c.op === 'fillText')?.args[0]).toBe(text);
+    expect(report).toHaveBeenCalledWith(['EMR_EXTTEXTOUTW (unsupported symbol encoding)']);
+  });
+
+  it('keeps real Unicode alongside a private Symbol entry and reports unimplemented advances', () => {
+    const m = makeRecordingCtx();
+    const report = vi.fn();
+    playEmf(symbolTextFile('Symbol', 2, 'α\uf0ae', 0, [30, 10]), m.ctx, 100, 100, { onUnsupported: report });
+    expect(m.calls.find((c) => c.op === 'fillText')?.args[0]).toBe('α→');
+    expect(report).toHaveBeenCalledWith(['EMR_EXTTEXTOUTW (symbol character advances)']);
+  });
+
+  it('does not decode Symbol text from following records when offString crosses the record boundary', () => {
+    const file = symbolTextFile('Symbol', 2, '\uf0ae');
+    const view = new DataView(file.buffer);
+    let pos = view.getUint32(4, true);
+    while (view.getUint32(pos, true) !== EMR.EXTTEXTOUTW) pos += view.getUint32(pos + 4, true);
+    view.setUint32(pos + 48, view.getUint32(pos + 4, true), true);
+    const m = makeRecordingCtx();
+    const report = vi.fn();
+    playEmf(file, m.ctx, 100, 100, { onUnsupported: report });
+    expect(m.calls.filter((c) => c.op === 'fillText')).toEqual([]);
+    expect(report).toHaveBeenCalledWith(['EMF record 84 (malformed)']);
+  });
+
+  it('does not construct a Symbol font by reading the next record', () => {
+    const original = symbolTextFile('Symbol', 2, '\uf0ae');
+    const originalView = new DataView(original.buffer);
+    const fontStart = originalView.getUint32(4, true);
+    const fontEnd = fontStart + originalView.getUint32(fontStart + 4, true);
+    const file = concat(original.slice(0, fontStart + 40), original.slice(fontEnd));
+    new DataView(file.buffer).setUint32(fontStart + 4, 40, true);
+    const m = makeRecordingCtx();
+    const report = vi.fn();
+    playEmf(file, m.ctx, 100, 100, { onUnsupported: report });
+    expect(m.calls.filter((c) => c.op === 'fillText')).toEqual([]);
+    expect(report).toHaveBeenCalledWith(['EMF record 82 (malformed)']);
+  });
+
   it('draws the UTF-16 string with the selected font color at the mapped ref point', () => {
     // offString = byte offset from the RECORD start to the string. The EXTTEXTOUTW
     // data layout up to the string: header(8) + RECTL(16) + iGraphicsMode(4) +
@@ -1207,6 +1315,18 @@ describe('renderEmfToBitmap', () => {
     expect(bmp?.width).toBe(64);
     expect(bmp?.height).toBe(48);
     expect(unsupported).toEqual([]);
+  });
+
+  it('propagates an unmapped symbol-font gap through bitmap decode and strict refusal', async () => {
+    const file = symbolTextFile('MT Extra', 2, '\uf041');
+    const blob = () => new Blob([file as Uint8Array<ArrayBuffer>]);
+    const partial = await decodeRasterOrMetafile(blob());
+    expect(getIncompleteMetafileReport(partial)).toEqual({
+      format: 'emf', unsupported: ['EMR_EXTTEXTOUTW (unsupported symbol encoding)'],
+    });
+    await expect(decodeRasterOrMetafile(blob(), { incompleteMetafile: 'reject' })).rejects.toMatchObject({
+      code: 'ooxml-incomplete-metafile', format: 'emf',
+    });
   });
 
   it('returns a null bitmap for non-EMF bytes', async () => {

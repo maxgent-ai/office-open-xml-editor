@@ -1027,6 +1027,38 @@ mod tests {
     }
 
     #[test]
+    fn default_font_fixup_preserves_text_and_the_existing_font_route() {
+        // FFM is an enum, not ToggleOperand. Default substitution uses the
+        // renderer's existing Unicode fallback, preserving authored routing.
+        for value in [0, 1] {
+            let properties = applied(&[
+                (0x4a43, 24u16.to_le_bytes().to_vec()),
+                (0x085a, vec![1]),
+                (0x2a86, vec![value]),
+            ]);
+            let run = properties
+                .direct_text_run("عربي x".into(), &[])
+                .unwrap()
+                .unwrap();
+            assert_eq!(run.text, "عربي x");
+            assert_eq!(run.font_size, 12.0);
+            assert_eq!(run.rtl, Some(true));
+            assert_eq!(run.font_family, None);
+            assert_eq!(run.font_hint, None);
+        }
+        let base = Properties::default();
+        for value in [2, 4] {
+            assert!(!base.clone().apply(0x2a86, &[value], &base).unwrap());
+        }
+        for invalid in [vec![], vec![1, 0], vec![3], vec![0x80], vec![0xff]] {
+            assert!(
+                base.clone().apply(0x2a86, &invalid, &base).is_err(),
+                "{invalid:?}"
+            );
+        }
+    }
+
+    #[test]
     fn font_hints_cancellation_and_partial_axes() {
         for (hint, expected) in [
             (0, Some("default")),

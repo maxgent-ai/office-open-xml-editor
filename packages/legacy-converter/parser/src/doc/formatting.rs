@@ -587,6 +587,21 @@ impl<'a> Formatting<'a> {
                 {
                     self.unsupported_paragraph_properties = true;
                 }
+                // MS-DOC 2.6.2 sprmPIstd preserves NumRM; 2.9.338 forbids
+                // preserved properties in UpxPapx. Empty history is a safe
+                // display no-op only at legal direct/piece/list-level origins,
+                // never in a paragraph style (including a linked list style).
+                if code == 0xc645
+                    && matches!(
+                        if is_piece { piece_origin } else { origin },
+                        paragraph::FrameOrigin::ParagraphStyle(_)
+                            | paragraph::FrameOrigin::LinkedListStyle(_)
+                    )
+                {
+                    return Err(unsupported(
+                        "Word numbering revision is placed in a paragraph style",
+                    ));
+                }
                 props.record_frame_origin(code, if is_piece { piece_origin } else { origin });
                 if code == 0x2441 {
                     // Properties::apply validated this Bool8 operand above.
@@ -1528,6 +1543,55 @@ mod tests {
     }
 
     #[test]
+    fn table_default_complex_script_language_is_inert_and_other_languages_stay_gated() {
+        let mut default = observed_table_style_formatting();
+        default.styles[0]
+            .as_mut()
+            .unwrap()
+            .table
+            .as_mut()
+            .unwrap()
+            .chpx = &[0x5f, 0x48, 0, 4, 0x43, 0x4a, 28, 0];
+        let run = default
+            .direct_text_run(7, table_key(0), 0, 0, &[], "x".into())
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.font_size, 14.0);
+        assert!(!default.unsupported_character_properties);
+        for lid in [0x0401u16, 0x0411, 0x1000, 0xffff] {
+            let mut language = observed_table_style_formatting();
+            language.styles[0]
+                .as_mut()
+                .unwrap()
+                .table
+                .as_mut()
+                .unwrap()
+                .chpx = leaked([&[0x5f, 0x48][..], &lid.to_le_bytes()].concat());
+            language.table_style_selector_profile(Some(0)).unwrap();
+            assert!(language.unsupported_character_properties, "{lid:04x}");
+        }
+        let mut truncated = observed_table_style_formatting();
+        truncated.styles[0]
+            .as_mut()
+            .unwrap()
+            .table
+            .as_mut()
+            .unwrap()
+            .chpx = &[0x5f, 0x48, 0];
+        assert!(truncated.table_style_selector_profile(Some(0)).is_err());
+        let mut conditional = observed_table_style_formatting();
+        conditional.styles[0]
+            .as_mut()
+            .unwrap()
+            .table
+            .as_mut()
+            .unwrap()
+            .chpx = leaked(ccnf(table_style_condition::FIRST_ROW, &[0x5f, 0x48, 0, 4]));
+        conditional.table_style_selector_profile(Some(0)).unwrap();
+        assert!(conditional.unsupported_character_properties);
+    }
+
+    #[test]
     fn table_chpx_fonts_validate_indices_and_keep_other_axes_and_conditions_gated() {
         let mut negative = observed_table_style_formatting();
         negative.styles[0]
@@ -2430,6 +2494,93 @@ mod tests {
             Ok(_) => panic!("mismatched embedded table style index must fail"),
         };
         assert!(error.contains("mismatched style index"), "{error}");
+    }
+
+    #[test]
+    fn empty_numbering_history_cannot_bypass_paragraph_style_placement_rules() {
+        let mut operand = [0u8; 129];
+        operand[0] = 128;
+        let prl = [vec![0x45, 0xc6], operand.to_vec()].concat();
+        for origin in [
+            paragraph::FrameOrigin::ParagraphStyle(0),
+            paragraph::FrameOrigin::LinkedListStyle(0),
+        ] {
+            let mut formatting = empty();
+            let error = formatting
+                .apply_paragraph_from(&mut paragraph::Properties::default(), &prl, origin)
+                .err()
+                .unwrap();
+            assert!(error.contains("placed in a paragraph style"), "{error}");
+        }
+        let mut formatting = observed_table_style_formatting();
+        formatting.styles[7].as_mut().unwrap().papx = leaked(prl.clone());
+        assert!(formatting
+            .resolve_paragraph_with_table(7, None, 0, 0, &[])
+            .is_err());
+        for origin in [
+            paragraph::FrameOrigin::Papx { fc: 0 },
+            paragraph::FrameOrigin::Piece { fc: 0, prm: 1 },
+        ] {
+            empty()
+                .apply_paragraph_from(&mut paragraph::Properties::default(), &prl, origin)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn redundant_physical_table_alignment_normalizes_only_to_equivalent_later_logical_alignment() {
+        for (sprms, alignment, unsupported) in [
+            (
+                vec![0x03, 0x24, 3, 0x14, 0xa4, 80, 0, 0x61, 0x24, 3],
+                "justify",
+                false,
+            ),
+            (vec![0x03, 0x24, 1, 0x61, 0x24, 1], "center", false),
+            (vec![0x61, 0x24, 3, 0x03, 0x24, 3], "justify", true),
+            (vec![0x03, 0x24, 2, 0x61, 0x24, 3], "justify", true),
+            (vec![0x03, 0x24, 4, 0x61, 0x24, 4], "distribute", true),
+            (vec![0x03, 0x24, 3], "left", true),
+        ] {
+            let mut formatting = observed_table_style_formatting();
+            formatting.styles[0]
+                .as_mut()
+                .unwrap()
+                .table
+                .as_mut()
+                .unwrap()
+                .papx = leaked([vec![0, 0], sprms].concat());
+            let resolved = formatting
+                .resolve_paragraph_with_table(7, table_key(0), 0, 0, &[])
+                .unwrap();
+            assert_eq!(resolved_alignment(&resolved), alignment);
+            assert_eq!(formatting.unsupported_paragraph_properties, unsupported);
+            if !unsupported && alignment == "justify" {
+                assert_eq!(resolved.properties.direct_paragraph().space_after, 4.0);
+            }
+        }
+        let mut invalid = observed_table_style_formatting();
+        invalid.styles[0]
+            .as_mut()
+            .unwrap()
+            .table
+            .as_mut()
+            .unwrap()
+            .papx = &[0, 0, 0x03, 0x24, 6, 0x61, 0x24, 3];
+        assert!(invalid
+            .resolve_paragraph_with_table(7, table_key(0), 0, 0, &[])
+            .is_err());
+        let mut inherited = observed_table_style_formatting();
+        inherited.styles[0]
+            .as_mut()
+            .unwrap()
+            .table
+            .as_mut()
+            .unwrap()
+            .papx = &[0, 0, 0x03, 0x24, 1];
+        inherited
+            .resolve_paragraph_with_table(7, table_key(1), 0, 0, &[])
+            .unwrap();
+        assert!(inherited.unsupported_paragraph_properties);
     }
 
     #[test]
