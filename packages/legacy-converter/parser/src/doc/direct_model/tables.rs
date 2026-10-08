@@ -182,7 +182,7 @@ fn project_table(
                 "direct DOC model cannot retain row table-property shading",
             ));
         }
-        check_row_preferences(&planned)?;
+        check_row_preferences(&planned, ordinary_flow && alignment == 0)?;
         let mut cells = Vec::new();
         reserve(&mut cells, planned.cells.len(), &mut |n| {
             charge_cell(remaining, n)
@@ -452,21 +452,33 @@ fn project_table(
 }
 
 /// Validate the row preferences that the projection represents through the
-/// physical row geometry instead of a separate model field.
-fn check_row_preferences(planned: &PlannedRow<Blocks>) -> Result<(), String> {
+/// acquired logical row geometry instead of a separate model field.
+fn check_row_preferences(
+    planned: &PlannedRow<Blocks>,
+    leading_ordinary_table: bool,
+) -> Result<(), String> {
     let source = &planned.source;
+    let (alignment, physical) = source.alignment;
+    let logical_alignment = if physical && source.bidi {
+        2 - alignment
+    } else {
+        alignment
+    };
+    let acquired_leading_origin = leading_ordinary_table && logical_alignment == 0;
     if source.bidi
+        && !acquired_leading_origin
         && source.preferred_indent.is_some()
         && !matches!(
             source.preferred_indent,
             Some(PreferredIndent::Dxa(value)) if i32::from(value) == source.origin()
         )
     {
-        // The preferred-indent evidence (see table::PreferredIndent) covers
-        // left-to-right tables only. The effective value includes the one
-        // inherited from the selected table style (story::preferences). A
-        // preference equal to the projected origin gives the same placement
-        // under either reading.
+        // [MS-DOC] 2.6.3 TDxaLeft/GapHalf and 2.9.321 TDefTableOperand
+        // acquire the signed logical origin, independently of the validated
+        // preferred indent (2.9.102). Ordinary leading RTL tables project that
+        // edge through tblInd+bidiVisual, mirroring once. Nonleading/floating
+        // placement has a separate owner and remains bounded to equal values
+        // until its interaction with the preference is established.
         return Err(unsupported(
             "direct DOC model cannot place a right-to-left table with a preferred indent",
         ));
