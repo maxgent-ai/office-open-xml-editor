@@ -20,7 +20,7 @@ interface ParseDiagnosticContractEntry {
 }
 
 const WORDPROCESSINGML_DOCUMENT_PART = 'word/document.xml';
-/** [MS-DOC] main stream of a native Word binary (legacy-converter producer). */
+/** Source-part identifier carried by the parser diagnostic wire contract. */
 const NATIVE_DOC_MAIN_STREAM = 'WordDocument';
 
 /** Private cross-language contract. The Rust constants in model/src/lib.rs
