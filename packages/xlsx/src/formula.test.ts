@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { evalFormulaToBool } from './formula.js';
+import { evaluateFormula, evalFormulaToBool } from './formula.js';
 import type { Cell } from './types.js';
 
 function numCell(row: number, col: number, n: number): Cell {
@@ -21,6 +21,41 @@ function ctx(opts: { cells?: Cell[]; row?: number; col?: number } = {}) {
 }
 
 const ev = (f: string, c = ctx()) => evalFormulaToBool(f, c);
+
+describe('CF formula evaluation boundary', () => {
+  it('distinguishes a valid false/zero from unsupported, invalid and error results', () => {
+    expect(evaluateFormula('FALSE', ctx())).toEqual({ kind: 'value', value: false });
+    expect(evaluateFormula('0', ctx())).toEqual({ kind: 'value', value: 0 });
+    expect(evaluateFormula('NOT(UNKNOWN())', ctx())).toEqual({ kind: 'unsupported' });
+    expect(evaluateFormula('1+', ctx())).toEqual({ kind: 'invalid' });
+    expect(evaluateFormula('#REF!', ctx())).toEqual({ kind: 'error' });
+  });
+
+  it('retains decimal/exponent literals, escaped strings and nested defined names', () => {
+    const c = ctx();
+    c.definedNames.set('Limit', { name: 'Limit', formula: 'Base+1' });
+    c.definedNames.set('Base', { name: 'Base', formula: '2' });
+    expect(ev('Limit=3', c)).toBe(true);
+    expect(ev('.5+1e-2=0.51')).toBe(true);
+    expect(ev('1.E2=100')).toBe(true);
+    expect(ev('"a""b"="a""b"')).toBe(true);
+    expect(ev('=TRUE()')).toBe(true);
+    expect(ev('=FALSE()')).toBe(false);
+    c.definedNames.set('Base', { name: 'Base', formula: 'UNKNOWN()' });
+    expect(ev('Limit=1', c)).toBe(false);
+  });
+
+  it('rejects excessive nesting without aborting rendering, including name expansion', () => {
+    const nested = (body: string, count: number) => '('.repeat(count) + body + ')'.repeat(count);
+    const c = ctx();
+    expect(ev(nested('1', 30), c)).toBe(true);
+    expect(evaluateFormula(nested('1', 1000), c)).toEqual({ kind: 'unsupported' });
+    expect(ev('-'.repeat(1000) + '1', c)).toBe(false);
+    c.definedNames.set('Inner', { name: 'Inner', formula: nested('1', 40) });
+    expect(ev(nested('Inner', 40), c)).toBe(false);
+    expect(ev('Inner', c)).toBe(true);
+  });
+});
 
 describe('evalFormulaToBool — comparisons', () => {
   it('numeric comparisons', () => {
