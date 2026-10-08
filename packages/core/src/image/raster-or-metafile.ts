@@ -30,14 +30,16 @@ import { isEmf, isWmf, renderWmfToBitmap, wmfRasterTarget } from './wmf.js';
 /**
  * What the loading path does with a metafile whose playback could not
  * reproduce all of its content (unimplemented records, an EMF+-only stream
- * that fails validation, damaged records; see `EmfRasterResult` in emf.ts):
+ * that fails validation, damaged records; see `EmfRasterResult` in emf.ts).
+ * WMF detection currently covers EXTTEXTOUT exclusions, not every skipped
+ * drawing record; a missing report is not a general fidelity guarantee.
  *
  * - `'draw-supported'` (default): return what playback drew, with the gap
  *   attached to the bitmap ({@link getIncompleteMetafileReport}). This is the
  *   OOXML renderers' deliberate compatibility policy, not an oversight: the
- *   player drew these same partial pictures before it could detect the gaps,
- *   so DOCX/XLSX/PPTX documents keep rendering exactly as they did while the
- *   gap stays observable.
+ *   callers retain the available content while detected gaps stay observable.
+ *   When nothing draws, the result is null and cannot carry a bitmap report;
+ *   strict callers still receive the detected reason in the thrown error.
  * - `'reject'`: throw {@link OoxmlIncompleteMetafileError}. For callers that
  *   must not present a partial picture as complete, such as a conversion
  *   whose output would otherwise silently lose content.
@@ -46,7 +48,7 @@ export type IncompleteMetafilePolicy = 'draw-supported' | 'reject';
 
 /** The content a drawn metafile left out, attached to its bitmap. */
 export interface IncompleteMetafileReport {
-  readonly format: 'emf';
+  readonly format: 'emf' | 'wmf';
   readonly unsupported: readonly string[];
 }
 
@@ -55,7 +57,7 @@ export class OoxmlIncompleteMetafileError extends Error {
   readonly code = 'ooxml-incomplete-metafile' as const;
 
   constructor(
-    readonly format: 'emf',
+    readonly format: 'emf' | 'wmf',
     readonly unsupported: readonly string[],
   ) {
     super(`OOXML ${format} metafile could not be fully played: ${unsupported.join(', ')}`);
@@ -100,13 +102,14 @@ function applyIncompleteMetafilePolicy(
   bitmap: ImageBitmap | null,
   unsupported: readonly string[],
   policy: IncompleteMetafilePolicy,
+  format: 'emf' | 'wmf' = 'emf',
 ): ImageBitmap | null {
   if (unsupported.length === 0) return bitmap;
   if (policy === 'reject') {
     if (bitmap) closeImageBitmapIfSupported(bitmap);
-    throw new OoxmlIncompleteMetafileError('emf', unsupported);
+    throw new OoxmlIncompleteMetafileError(format, unsupported);
   }
-  if (bitmap) incompleteMetafileReports.set(bitmap, { format: 'emf', unsupported });
+  if (bitmap) incompleteMetafileReports.set(bitmap, { format, unsupported });
   return bitmap;
 }
 
@@ -224,8 +227,13 @@ export async function decodeRasterOrMetafileWithInspection(
 
   if (isWmf(head)) {
     const { w, h } = wmfRasterTarget(widthPt, heightPt);
+    let unsupported: readonly string[] = [];
+    const bitmap = await renderWmfToBitmap(
+      new Uint8Array(await data.arrayBuffer()), w, h, suppressBoundaryFrame,
+      (records) => { unsupported = records; },
+    );
     return enforceDecodedBitmapBudget(
-      await renderWmfToBitmap(new Uint8Array(await data.arrayBuffer()), w, h, suppressBoundaryFrame),
+      applyIncompleteMetafilePolicy(bitmap, unsupported, incompleteMetafile, 'wmf'),
       retainedPixelLimit,
     );
   }

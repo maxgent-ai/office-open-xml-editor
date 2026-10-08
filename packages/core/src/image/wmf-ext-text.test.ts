@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { playWmf } from './wmf.js';
+import { decodeRasterOrMetafile, getIncompleteMetafileReport } from './raster-or-metafile.js';
 
 const u16 = (value: number) => [value & 0xff, (value >>> 8) & 0xff];
 const u32 = (value: number) => [
@@ -27,8 +28,8 @@ function join(...parts: Uint8Array[]): Uint8Array {
   return output;
 }
 
-function font(height = -20, charset = 0): Uint8Array {
-  const face = [...Buffer.from('Times New Roman\0', 'latin1')];
+function font(height = -20, charset = 0, family = 'Times New Roman'): Uint8Array {
+  const face = [...Buffer.from(`${family}\0`, 'latin1')];
   return record(0x02fb, [
     ...u16(height), ...u16(0), ...u16(0), ...u16(0), ...u16(400),
     1, 0, 0, charset, 0, 0, 0, 0,
@@ -69,7 +70,55 @@ function context() {
   return { ctx, fillText };
 }
 
-describe('WMF EXTTEXTOUT bounded ANSI subset', () => {
+describe('WMF EXTTEXTOUT bounded font encoding', () => {
+  it('draws Symbol mathematical bytes as Unicode in a fallback font', () => {
+    const mock = context();
+    playWmf(base(extText([0xe5, 0xa5, 0xb4, 0x2b, 0x2d, 0x3d]), font(-20, 2, 'Symbol')), mock.ctx, 200, 100);
+    expect(mock.fillText).toHaveBeenCalledWith('∑∞×+−=', 24, 24);
+    expect(mock.ctx.font).toBe('italic 400 20px serif');
+  });
+
+  it('reports unknown symbol encoding through default and strict decode policies', async () => {
+    // Keep a readable ANSI record, then an unknown symbol-font glyph. The
+    // partial picture must carry its gap; strict mode must close and refuse it.
+    const file = base(join(extText([65]), font(-20, 2, 'MT Extra'), record(0x012d, u16(1)), extText([0x4c])));
+    const mock = context();
+    const close = vi.fn();
+    vi.stubGlobal('OffscreenCanvas', class {
+      constructor(readonly width: number, readonly height: number) {}
+      getContext() { return mock.ctx; }
+    });
+    vi.stubGlobal('createImageBitmap', vi.fn(async () => ({ width: 200, height: 100, close })));
+    try {
+      const blob = () => new Blob([file as Uint8Array<ArrayBuffer>]);
+      const bitmap = await decodeRasterOrMetafile(blob(), { widthPt: 100, heightPt: 50 });
+      expect(mock.fillText).toHaveBeenCalledWith('A', 24, 24);
+      expect(mock.fillText).not.toHaveBeenCalledWith('L', expect.anything(), expect.anything());
+      expect(getIncompleteMetafileReport(bitmap)).toEqual({
+        format: 'wmf', unsupported: ['META_EXTTEXTOUT (unsupported text state or encoding)'],
+      });
+      await expect(decodeRasterOrMetafile(blob(), { incompleteMetafile: 'reject' })).rejects.toMatchObject({
+        code: 'ooxml-incomplete-metafile', format: 'wmf',
+      });
+      expect(close).toHaveBeenCalledOnce();
+    } finally { vi.unstubAllGlobals(); }
+  });
+
+  it('omits an unmapped Symbol byte atomically and reports an empty partial picture', async () => {
+    const file = base(extText([0xae, 0x41]), font(-20, 2, 'Symbol'));
+    const mock = context();
+    const report = vi.fn();
+    expect(playWmf(file, mock.ctx, 100, 100, false, report)).toBe(false);
+    expect(mock.fillText).not.toHaveBeenCalled();
+    expect(report).toHaveBeenCalledWith(['META_EXTTEXTOUT (unsupported text state or encoding)']);
+    vi.stubGlobal('OffscreenCanvas', class { getContext() { return mock.ctx; } });
+    try {
+      await expect(decodeRasterOrMetafile(new Blob([file as Uint8Array<ArrayBuffer>]), {
+        incompleteMetafile: 'reject',
+      })).rejects.toMatchObject({ code: 'ooxml-incomplete-metafile', format: 'wmf' });
+    } finally { vi.unstubAllGlobals(); }
+  });
+
   it('draws Windows-1252 bytes including NUL with mapped coordinates and font fields', () => {
     const raw = [0x41, 0x80, 0, 0x42];
     const mock = context();
