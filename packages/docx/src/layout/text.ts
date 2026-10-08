@@ -289,6 +289,9 @@ export interface TextShapeRequest {
   /** Resolved §17.3.2.19 w:kern state at this run size. Absence preserves the
    * measurement adapter's inherited kerning policy, matching the paint path. */
   readonly kerning?: boolean;
+  /** Builder-owned proof that one registered grapheme has no per-slot
+   * allocation policy. The shaper still revalidates resource and cmap facts. */
+  readonly joinRegisteredGrapheme?: boolean;
   /** Resolve script slots and faces without touching the measurement adapter. */
   readonly measure?: boolean;
   /** False acquires only aggregate metrics; 'spaces' acquires contextual
@@ -300,6 +303,13 @@ export interface TextShapeRequest {
    * context, so a word of Arabic digits after proven Arabic text continues it,
    * while digits alone never enable the substitute. */
   readonly substituteContext?: Readonly<{ text: string; offset: number }>;
+}
+
+/** The measured class has a strong Latin base with attached marks. rFonts
+ * ascii is a semantic slot, not proof of ASCII or bidi direction: it also
+ * contains unmarked Hebrew/Arabic, which must retain their existing path. */
+export function registeredLatinMarkGraphemeCandidate(text: string): boolean {
+  return /^[A-Za-z]\p{M}+$/u.test(text) && graphemeClusterOffsets(text).length === 0;
 }
 
 /** Validate against the owning transformed run, not merely a self-consistent
@@ -328,6 +338,8 @@ export function sliceTextShapeRequest(
   return {
     ...request,
     text: request.text.slice(start, end),
+    joinRegisteredGrapheme: start === 0 && end === request.text.length
+      ? request.joinRegisteredGrapheme : undefined,
     substituteContext: { text: context.text, offset: context.offset + start },
   };
 }
@@ -338,7 +350,7 @@ export function independentTextShapeRequest(
   request: Readonly<TextShapeRequest>,
   text: string,
 ): TextShapeRequest {
-  return { ...request, text, substituteContext: { text, offset: 0 } };
+  return { ...request, text, joinRegisteredGrapheme: undefined, substituteContext: { text, offset: 0 } };
 }
 
 /** Transform this range in its run (e.g. inserting justification kashidas),
@@ -348,7 +360,7 @@ export function replaceTextShapeRequest(
   text: string,
 ): TextShapeRequest {
   const context = request.substituteContext ?? { text: request.text, offset: 0 };
-  return { ...request, text, substituteContext: {
+  return { ...request, text, joinRegisteredGrapheme: undefined, substituteContext: {
     text: context.text.slice(0, context.offset) + text
       + context.text.slice(context.offset + request.text.length),
     offset: context.offset,
@@ -410,6 +422,11 @@ export interface GlyphMeasurer {
 }
 
 export interface TextShapeSpan extends GlyphMeasurement {
+  /** Original ECMA-376 rFonts facts within one physical grapheme. These
+   * carry no competing advance or ink authority. */
+  readonly semanticSlotSpans?: readonly Readonly<{
+    start: number; end: number; script: FontScriptSlot; font: FontResolution;
+  }>[];
   /** Run-context substitute decision: true selects the scoped face, false
    * retains exclusion. Absence means this request has no scoped substitute. */
   readonly substituteScope?: boolean;
@@ -728,6 +745,14 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
     ...input.localMetrics,
     ...input.fontMetrics,
   });
+  const metricTupleKey = (identity: string, family: string, weight: number, style: FontStyle) =>
+    JSON.stringify([identity, family, weight, style]);
+  const registeredMetrics = new Map<string, Readonly<ResolvedFontMetric>>();
+  for (const metric of Object.values(fontMetrics)) {
+    if (metric.sourceIdentity && metric.weight !== undefined && metric.style !== undefined) {
+      registeredMetrics.set(metricTupleKey(metric.sourceIdentity, metric.family, metric.weight, metric.style), metric);
+    }
+  }
   const genericFamilies = Object.freeze(Object.fromEntries(
     Object.entries(input.genericFamilies ?? {})
       .map(([family, generic]) => [family.trim().toLocaleLowerCase('en-US'), generic])
@@ -1031,6 +1056,7 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
         request.genericFamily ?? null,
         request.letterSpacingPt ?? null,
         request.kerning ?? null,
+        request.joinRegisteredGrapheme ?? null,
         request.measure ?? null,
         request.clusterGeometry ?? null,
         ...(scopeDescriptor !== undefined ? [scopeDescriptor] : []),
@@ -1091,7 +1117,7 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
       // family name or slot requested it and whatever CSS fallback list follows.
       // Shaping it apart would break Arabic joining. Only in-scope spans
       // merge; all other spans keep main's per-slot runs.
-      const merged: typeof resolvedGroups = [];
+      const merged: Array<(typeof resolvedGroups)[number] & Pick<TextShapeSpan, 'semanticSlotSpans'>> = [];
       for (const group of resolvedGroups) {
         const previous = merged.at(-1);
         if (previous && previous.substituteScript && group.substituteScript
@@ -1099,6 +1125,43 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
           merged[merged.length - 1] = { ...previous, text: previous.text + group.text, end: group.end };
         } else {
           merged.push(group);
+        }
+      }
+
+      // Semantic slots select faces per scalar (§17.3.2.26); they need not
+      // detach a combining mark when the exact physical face is proven.
+      // Keep the existing scoped Arabic merge above independent of this gate.
+      if (request.joinRegisteredGrapheme === true && registeredLatinMarkGraphemeCandidate(request.text)
+        && graphemeBoundaries.length === 2
+        && merged.length > 1 && scopeDescriptor === undefined) {
+        const first = merged[0]!;
+        const face = first.font;
+        const metric = face.resourceIdentity ? registeredMetrics.get(metricTupleKey(
+          face.resourceIdentity, face.resolvedFamily, face.weight, face.style,
+        )) : undefined;
+        const ranges = metric?.unicodeRanges;
+        const covered = ranges !== undefined && [...request.text].every(scalar => {
+          const cp = scalar.codePointAt(0)!;
+          let low = 0;
+          let high = ranges.length;
+          while (low < high) {
+            const middle = (low + high) >>> 1;
+            if (ranges[middle]![1] < cp) low = middle + 1;
+            else high = middle;
+          }
+          return low < ranges.length && ranges[low]![0] <= cp;
+        });
+        if ((face.source === 'embedded' || face.source === 'local') && face.resourceIdentity
+          && covered && merged.every(group => !group.substituteScript
+            && (group.script === 'ascii' || group.script === 'highAnsi')
+            && group.font.source === face.source && group.font.resourceIdentity === face.resourceIdentity
+            && group.font.weight === face.weight && group.font.style === face.style
+            && group.font.route.fingerprint === face.route.fingerprint)) {
+          const semanticSlotSpans = Object.freeze(merged.map(group => Object.freeze({
+            start: group.start, end: group.end, script: group.script, font: group.font,
+          })));
+          merged.splice(0, merged.length, { ...first, text: request.text, end: request.text.length,
+            semanticSlotSpans });
         }
       }
 
@@ -1123,7 +1186,8 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
           ...(scopeDescriptor !== undefined ? { substituteScope: substituteScript } : {}),
         });
       });
-      const diagnostics = spans.flatMap((span) => span.font.diagnostics);
+      const diagnostics = spans.flatMap(span => span.semanticSlotSpans
+        ? span.semanticSlotSpans.flatMap(slot => slot.font.diagnostics) : span.font.diagnostics);
       const inkBounds = spans.length > 0 && spans.every((span) => span.inkBounds !== undefined)
         ? (() => {
             let originPt = 0;
