@@ -54,6 +54,22 @@ describe('CF formula evaluation boundary', () => {
     c.definedNames.set('Inner', { name: 'Inner', formula: nested('1', 40) });
     expect(ev(nested('Inner', 40), c)).toBe(false);
     expect(ev('Inner', c)).toBe(true);
+    // A long left-associative operator chain is not nesting: evaluating it
+    // must not recurse once per operator.
+    expect(ev('1' + '+1'.repeat(100_000) + '=100001', c)).toBe(true);
+  });
+
+  it('bounds retained expansion of branching defined names', () => {
+    const c = ctx();
+    c.definedNames.set('Layer_0', { name: 'Layer_0', formula: '1' });
+    for (let level = 1; level <= 3; level++) {
+      const name = `Layer_${level}`;
+      c.definedNames.set(name, { name, formula: `SUM(${Array(20).fill(`Layer_${level - 1}`).join(',')})` });
+    }
+    expect(ev('Layer_2=400', c)).toBe(true);
+    // A tiny workbook name graph can otherwise retain exponentially many
+    // copies of its parsed bodies before evaluating a single CF cell.
+    expect(evaluateFormula('Layer_3', c)).toEqual({ kind: 'unsupported' });
   });
 });
 
@@ -209,5 +225,152 @@ describe('evalFormulaToBool — error literals', () => {
     expect(evalFormulaToBool('MONTH(#REF!)<>MONTH(B1)', c)).toBe(false);
     expect(evalFormulaToBool('#N/A=1', c)).toBe(false);
     expect(evalFormulaToBool('MONTH(B1)=6', c)).toBe(true);
+  });
+});
+
+function errCell(row: number, col: number, error: string): Cell {
+  return { row, col, value: { type: 'error', error }, styleIndex: 0 };
+}
+
+describe('CF formula error values and lazy evaluation', () => {
+  it('produces and propagates error values instead of blank or zero placeholders', () => {
+    // A1=5, B1 blank, A2=#N/A (cached), A3=7.
+    const c = ctx({ cells: [numCell(1, 1, 5), errCell(2, 1, '#N/A'), numCell(3, 1, 7)] });
+    expect(evaluateFormula('A1/B1', c)).toEqual({ kind: 'error' });
+    expect(ev('A1/B1<0.5', c)).toBe(false);
+    expect(ev('MOD(A1,B1)=0', c)).toBe(false);
+    expect(ev('A2=0', c)).toBe(false);
+    expect(ev('A3>AVERAGE(A1:A3)', c)).toBe(false);
+    expect(ev('A3>A1', c)).toBe(true);
+  });
+
+  it('evaluates only the selected IF branch and catches errors only in IFERROR/IS*', () => {
+    const c = ctx({ cells: [numCell(1, 1, 5), errCell(2, 1, '#N/A'), errCell(3, 1, '#DIV/0!')] });
+    expect(ev('IF(B1=0,TRUE,A1/B1>1)', c)).toBe(true);
+    expect(ev('IF(A1>0,TRUE,#N/A)', c)).toBe(true);
+    expect(ev('IF(A2,TRUE,TRUE)', c)).toBe(false);
+    expect(evaluateFormula('IFS(A1>0,TRUE,TRUE,#N/A)', c)).toEqual({ kind: 'error' });
+    expect(ev('ISNA(IFS(A1<0,TRUE))', c)).toBe(true);
+    expect(ev('IFERROR(A1/B1,-1)=-1', c)).toBe(true);
+    expect(ev('IFERROR(B1,"x")="x"', c)).toBe(false); // blank is not an error
+    expect(ev('IFERROR(UNKNOWN(),TRUE)', c)).toBe(false); // unsupported is not caught
+    expect(ev('ISERROR(B1)', c)).toBe(false);
+    expect(ev('ISNA(A2)', c)).toBe(true);
+    expect(ev('ISERR(A2)', c)).toBe(false);
+    expect(ev('ISERR(A3)', c)).toBe(true);
+    expect(ev('ISBLANK("")', c)).toBe(false);
+    // Compound errors remain values that type/count functions can inspect.
+    expect(ev('NOT(ISNUMBER(1/0+1))', c)).toBe(true);
+    expect(ev('COUNT(1/0+1)=0', c)).toBe(true);
+    expect(ev('COUNTA(1/0+1)=1', c)).toBe(true);
+    expect(ev('ISBLANK(IFERROR(B1,TRUE))', c)).toBe(false);
+    expect(ev('ISTEXT(IFERROR(B1,TRUE))', c)).toBe(true);
+  });
+
+  it('checks support for the whole formula before selecting an IF branch', () => {
+    const c = ctx();
+    c.definedNames.set('Hidden', { name: 'Hidden', formula: 'UNKNOWN()' });
+    for (const formula of ['IF(TRUE,TRUE,UNKNOWN())', 'IF(TRUE,TRUE,Missing)', 'IF(TRUE,TRUE,Hidden)']) {
+      expect(evaluateFormula(formula, c), formula).toEqual({ kind: 'unsupported' });
+    }
+    // A supported Excel error value can still be ignored by a lazy IF.
+    expect(ev('IF(TRUE,TRUE,#NAME?)', c)).toBe(true);
+  });
+
+  it('enforces supported-function arity and reads ROW/COLUMN of a reference argument', () => {
+    expect(evaluateFormula('NOT()', ctx())).toEqual({ kind: 'invalid' });
+    expect(evaluateFormula('IF(TRUE)', ctx())).toEqual({ kind: 'invalid' });
+    expect(evaluateFormula('ROUND(1.5)', ctx())).toEqual({ kind: 'invalid' });
+    // CONCAT is a later Excel function with a 253-text-argument limit.
+    const concat = (count: number) => `CONCAT(${Array(count).fill('""').join(',')})`;
+    expect(evaluateFormula(concat(253), ctx())).toEqual({ kind: 'value', value: '' });
+    expect(evaluateFormula(concat(254), ctx())).toEqual({ kind: 'invalid' });
+    const c = ctx({ row: 5, col: 3 });
+    expect(ev('ROW($A$1)=1', c)).toBe(true);
+    expect(ev('COLUMN(B1)=4', c)).toBe(true); // relative B1 shifts by +2 columns
+    expect(ev('MOD(ROW()-ROW($A$2),2)=1', c)).toBe(true);
+  });
+
+  it('rejects ranges larger than the evaluation cap instead of truncating them', () => {
+    const c = ctx({ cells: [numCell(4500, 1, 1)] });
+    expect(evaluateFormula('COUNTIF($A$1:$A$5000,1)', c)).toEqual({ kind: 'unsupported' });
+  });
+});
+
+describe('scalar coercion and comparison types', () => {
+  const textCell = (row: number, col: number, text: string): Cell =>
+    ({ row, col, value: { type: 'text', text }, styleIndex: 0 });
+
+  it('converts only a whole numeric text operand; other text is #VALUE!', () => {
+    expect(evaluateFormula('" 1.5e1 "+1', ctx())).toEqual({ kind: 'value', value: 16 });
+    expect(evaluateFormula('"-.5"*2', ctx())).toEqual({ kind: 'value', value: -1 });
+    for (const f of ['"abc"+1', '"1x"+1', '""+1', '-"abc"', 'ROUND("1x",0)']) {
+      expect(evaluateFormula(f, ctx()), f).toEqual({ kind: 'error' });
+    }
+    // A text cell must not read as 0 and make the rule match.
+    const c = ctx({ cells: [textCell(1, 1, 'pending')] });
+    expect(evalFormulaToBool('A1+0=0', c)).toBe(false);
+  });
+
+  it('keeps the arithmetic #VALUE! rule out of comparison operands', () => {
+    // Comparison coercion is unchanged by the strict arithmetic conversion; a
+    // digit-led text cell must still equal the identical text.
+    const c = ctx({ cells: [textCell(1, 1, '2024 Q1')] });
+    expect(evaluateFormula('A1="2024 Q1"', c)).toEqual({ kind: 'value', value: true });
+  });
+});
+
+
+describe('existing ROUND numeric semantics', () => {
+  it('ROUND rounds the decimal digits of x half away from zero (§18.17.7.278)', () => {
+    const round = (f: string) => evaluateFormula(f, ctx());
+    // The standard's own examples.
+    expect(round('ROUND(2.15,1)')).toEqual({ kind: 'value', value: 2.2 });
+    expect(round('ROUND(2.149,1)')).toEqual({ kind: 'value', value: 2.1 });
+    expect(round('ROUND(-1.475,2)')).toEqual({ kind: 'value', value: -1.48 });
+    expect(round('ROUND(21.5,-1)')).toEqual({ kind: 'value', value: 20 });
+    // A negative tie rounds away from zero (Math.round gives -2).
+    expect(round('ROUND(-2.5,0)')).toEqual({ kind: 'value', value: -3 });
+    // A written 5 is a tie even when its binary product falls below it.
+    expect(round('ROUND(1.005,2)')).toEqual({ kind: 'value', value: 1.01 });
+    // Exponent-form magnitudes and out-of-range digit counts stay finite.
+    expect(round('ROUND(1.5E-7,7)')).toEqual({ kind: 'value', value: 2e-7 });
+    expect(round('ROUND(1.5,400)')).toEqual({ kind: 'value', value: 1.5 });
+    expect(round('ROUND(123,-400)')).toEqual({ kind: 'value', value: 0 });
+  });
+
+  it('ROUND reports unrepresentable numbers and fractional digit counts', () => {
+    const round = (f: string) => evaluateFormula(f, ctx());
+    // §18.17.3 #NUM! range error: the rounded maximum double overflows.
+    expect(round('ROUND(1.7976931348623157E308,-308)')).toEqual({ kind: 'error' });
+    // An overflowed or NaN operand is not a number Excel can hold.
+    expect(round('ROUND(1E308*10,0)')).toEqual({ kind: 'error' });
+    expect(round('ROUND(1.5,1E308*10-1E308*10)')).toEqual({ kind: 'error' });
+    // §18.17.7.278 does not say how a fractional number-digits is applied.
+    expect(round('ROUND(1.25,1.5)')).toEqual({ kind: 'unsupported' });
+  });
+});
+
+describe('typed numeric failures in existing error predicates', () => {
+  it('supports error predicates and IFERROR around numeric coercion', () => {
+    expect(evaluateFormula('ISERROR("1x"+1)', ctx())).toEqual({ kind: 'value', value: true });
+    expect(evaluateFormula('ISNA("1x"+1)', ctx())).toEqual({ kind: 'value', value: false });
+    expect(evaluateFormula('IFERROR(ROUND(1E308*10,0),7)', ctx())).toEqual({ kind: 'value', value: 7 });
+  });
+});
+
+describe('decimal ROUND conversion stability', () => {
+  it('preserves an operand when the requested precision discards no written digit', () => {
+    for (const [n, places] of [[9.320345665328205, 18], [4.1432000626809895, 25]]) {
+      expect(evaluateFormula(`ROUND(${n},${places})`, ctx())).toEqual({ kind: 'value', value: n });
+    }
+  });
+  it('carries decimal digits without an intermediate floating-point shift', () => {
+    expect(evaluateFormula('ROUND(9.995,2)', ctx())).toEqual({ kind: 'value', value: 10 });
+    expect(evaluateFormula('ROUND(5.7118551805615425,15)', ctx())).toEqual({ kind: 'value', value: 5.711855180561543 });
+    expect(evaluateFormula('ROUND(23.545329668559134,14)', ctx())).toEqual({ kind: 'value', value: 23.54532966855913 });
+    expect(evaluateFormula('ROUND(-0.0005,3)', ctx())).toEqual({ kind: 'value', value: -0.001 });
+    // The finite double's shortest spelling is 5e-324, a decimal tie.
+    expect(evaluateFormula('ROUND(4.9406564584124654E-324,323)', ctx())).toEqual({ kind: 'value', value: 1e-323 });
   });
 });
