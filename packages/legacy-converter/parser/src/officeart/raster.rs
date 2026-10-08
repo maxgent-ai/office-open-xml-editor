@@ -32,9 +32,10 @@ pub(crate) enum Raster {
     // Chosen only by the direct DOC reader.
     #[cfg_attr(not(any(test, feature = "direct-doc")), allow(dead_code))]
     TiffAndGifAware,
-    // Chosen only by the direct PPT reader.
+    /// PPT's media cache accepts GIF-in-PNG and opaque PICT. The projector
+    /// permits a PICT placeholder only in picture frames; fills still reject.
     #[cfg_attr(not(any(test, feature = "direct-ppt")), allow(dead_code))]
-    GifAware,
+    PptPictures,
     /// Advertised raster encodings, plus EMF files with the end-of-file
     /// layout GDI+ writes, which Excel displays (see the metafile validator).
     ExcelMetafiles,
@@ -170,6 +171,11 @@ pub(crate) fn read_store_entry_span_as(
     let (blip, end) = super::record_span_with_end_in(bytes, &source, offset, budget, "OfficeArt")?;
     if end != source.range().end {
         return Err(unsupported("OfficeArt BLIP record size mismatch"));
+    }
+    // MS-ODRAW 2.2.32: the FBSE's selected type must be present. Recovery
+    // admits a PICT slot, not a PICT record substituted for another slot type.
+    if raster == Raster::PptPictures && blip.kind == 0xf01c && viewed.instance != 4 {
+        return Err(unsupported("OfficeArt PICT store type mismatch"));
     }
     Ok(read_span_as(&blip, bytes, budget, remaining_bytes, raster)?
         .map(|image| StoreImageSpan { image, backing }))
@@ -328,6 +334,12 @@ fn decode(
     remaining_bytes: usize,
     raster: Raster,
 ) -> Result<Option<DecodedImage>, String> {
+    if blip.kind == 0xf01c && raster == Raster::PptPictures {
+        return Ok(Some(DecodedImage {
+            bytes: super::metafile::pict_placeholder(blip, remaining_bytes)?,
+            extension: "pict",
+        }));
+    }
     if matches!(blip.kind, 0xf01a | 0xf01b) {
         let extension = if blip.kind == 0xf01a { "emf" } else { "wmf" };
         let gdiplus_end = raster == Raster::ExcelMetafiles;
@@ -365,7 +377,7 @@ fn decode(
             {
                 "tiff"
             }
-            Raster::GifAware | Raster::TiffAndGifAware
+            Raster::PptPictures | Raster::TiffAndGifAware
                 if extension == "png"
                     && (bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a")) =>
             {
@@ -648,7 +660,7 @@ mod tests {
             let bytes = blip(gif(sig, 40, 30), 0xf01e, 0x6e00);
             let (record, _) = crate::officeart::record_with_end(&bytes, 0, &mut 10, "t").unwrap();
             assert!(read(record, &mut 100, usize::MAX).unwrap().is_none());
-            for raster in [Raster::GifAware, Raster::TiffAndGifAware] {
+            for raster in [Raster::PptPictures, Raster::TiffAndGifAware] {
                 let image = read_as(record, &mut 100, usize::MAX, raster)
                     .unwrap()
                     .unwrap();
@@ -660,7 +672,7 @@ mod tests {
         // are rejected.
         let jpeg = blip(gif(b"GIF89a", 40, 30), 0xf01d, 0x46a0);
         let (record, _) = crate::officeart::record_with_end(&jpeg, 0, &mut 10, "t").unwrap();
-        assert!(read_as(record, &mut 100, usize::MAX, Raster::GifAware)
+        assert!(read_as(record, &mut 100, usize::MAX, Raster::PptPictures)
             .unwrap()
             .is_none());
         for data in [
@@ -670,7 +682,7 @@ mod tests {
         ] {
             let bytes = blip(data, 0xf01e, 0x6e00);
             let (record, _) = crate::officeart::record_with_end(&bytes, 0, &mut 10, "t").unwrap();
-            assert!(read_as(record, &mut 100, usize::MAX, Raster::GifAware).is_err());
+            assert!(read_as(record, &mut 100, usize::MAX, Raster::PptPictures).is_err());
         }
     }
 
@@ -709,10 +721,12 @@ mod tests {
                 "{entries:?}"
             );
         }
-        // TIFF data is not admitted for the GIF-only host.
-        assert!(read_as(blip_record, &mut 100, usize::MAX, Raster::GifAware)
-            .unwrap()
-            .is_none());
+        // TIFF data is not admitted for the PPT host.
+        assert!(
+            read_as(blip_record, &mut 100, usize::MAX, Raster::PptPictures)
+                .unwrap()
+                .is_none()
+        );
         // Other data in a PNG BLIP is still omitted.
         let other = record(0x6e00, 0xf01e, &[vec![0; 17], b"BM\0\0".to_vec()].concat());
         let (blip_record, _) = crate::officeart::record_with_end(&other, 0, &mut 10, "t").unwrap();
