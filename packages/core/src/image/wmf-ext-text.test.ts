@@ -78,10 +78,19 @@ describe('WMF EXTTEXTOUT bounded font encoding', () => {
     expect(mock.ctx.font).toBe('italic 400 20px serif');
   });
 
+  it('decodes the published MT Extra ellipsis repertoire without treating its codes as Latin', () => {
+    const mock = context();
+    const report = vi.fn();
+    playWmf(base(extText([0x4b, 0x4c, 0x4d, 0x4e, 0x4f]), font(-20, 2, 'MT Extra')), mock.ctx, 200, 100, false, report);
+    expect(mock.fillText).toHaveBeenCalledWith('…⋯⋮⋰⋱', 24, 24);
+    expect(mock.ctx.font).toBe('italic 400 20px serif');
+    expect(report).not.toHaveBeenCalled();
+  });
+
   it('reports unknown symbol encoding through default and strict decode policies', async () => {
     // Keep a readable ANSI record, then an unknown symbol-font glyph. The
     // partial picture must carry its gap; strict mode must close and refuse it.
-    const file = base(join(extText([65]), font(-20, 2, 'MT Extra'), record(0x012d, u16(1)), extText([0x4c])));
+    const file = base(join(extText([65]), font(-20, 2, 'MT Extra'), record(0x012d, u16(1)), extText([0x41])));
     const mock = context();
     const close = vi.fn();
     vi.stubGlobal('OffscreenCanvas', class {
@@ -93,7 +102,7 @@ describe('WMF EXTTEXTOUT bounded font encoding', () => {
       const blob = () => new Blob([file as Uint8Array<ArrayBuffer>]);
       const bitmap = await decodeRasterOrMetafile(blob(), { widthPt: 100, heightPt: 50 });
       expect(mock.fillText).toHaveBeenCalledWith('A', 24, 24);
-      expect(mock.fillText).not.toHaveBeenCalledWith('L', expect.anything(), expect.anything());
+      expect(mock.fillText).toHaveBeenCalledTimes(1);
       expect(getIncompleteMetafileReport(bitmap)).toEqual({
         format: 'wmf', unsupported: ['META_EXTTEXTOUT (unsupported text state or encoding)'],
       });

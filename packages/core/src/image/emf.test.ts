@@ -866,11 +866,26 @@ describe('playEmf — EXTTEXTOUTW text', () => {
     expect(ordinary.calls.find((c) => c.op === 'fillText')?.args[0]).toBe('\uf0ae');
   });
 
+  it('decodes MT Extra private ellipses in the exact family, leaving other families and ANSI alone', () => {
+    const text = '\uf04b\uf04c\uf04d\uf04e\uf04f';
+    const m = makeRecordingCtx();
+    const report = vi.fn();
+    playEmf(symbolTextFile('MT Extra', 2, text), m.ctx, 100, 100, { onUnsupported: report });
+    expect(m.calls.find((c) => c.op === 'fillText')?.args).toEqual(['…⋯⋮⋰⋱', 20, 30]);
+    expect(m.ctx.font).toBe('12px serif');
+    expect(report).not.toHaveBeenCalled();
+    for (const [face, charset] of [['MT Extra Tiger', 2], ['MT Extra', 0]] as const) {
+      const other = makeRecordingCtx();
+      playEmf(symbolTextFile(face, charset, text), other.ctx, 100, 100);
+      expect(other.calls.find((c) => c.op === 'fillText')?.args[0]).toBe(text);
+    }
+  });
+
   it('retains unknown symbol-font compatibility text and reports the unsupported encoding', () => {
     const m = makeRecordingCtx();
     const report = vi.fn();
-    playEmf(symbolTextFile('MT Extra', 2, '\uf04c'), m.ctx, 100, 100, { onUnsupported: report });
-    expect(m.calls.find((c) => c.op === 'fillText')?.args[0]).toBe('\uf04c');
+    playEmf(symbolTextFile('MT Extra', 2, '\uf04c\uf041'), m.ctx, 100, 100, { onUnsupported: report });
+    expect(m.calls.find((c) => c.op === 'fillText')?.args[0]).toBe('\uf04c\uf041');
     expect(report).toHaveBeenCalledWith(['EMR_EXTTEXTOUTW (unsupported symbol encoding)']);
   });
 
@@ -1303,7 +1318,7 @@ describe('renderEmfToBitmap', () => {
   });
 
   it('propagates an unmapped symbol-font gap through bitmap decode and strict refusal', async () => {
-    const file = symbolTextFile('MT Extra', 2, '\uf04c');
+    const file = symbolTextFile('MT Extra', 2, '\uf041');
     const blob = () => new Blob([file as Uint8Array<ArrayBuffer>]);
     const partial = await decodeRasterOrMetafile(blob());
     expect(getIncompleteMetafileReport(partial)).toEqual({
