@@ -172,6 +172,36 @@ describe('preset geometry and paint', () => {
 });
 
 describe('pictures and picture fills', () => {
+  it.skipIf(!skia)('retains an opaque PICT resource, paints its diagnostic and keeps neighboring content', async () => {
+    const pict = new Uint8Array([0, 0, 0, 0, 0, 0, 0, 20, 0, 30, 0, 17, 2, 255, 0, 255]);
+    const header = concat(little32(pict.length), new Uint8Array(24), little32(pict.length), new Uint8Array([0xfe, 0xfe]));
+    const blip = record(0x5420, 0xf01c, concat(new Uint8Array(16), header, pict));
+    const entry = record(0x42, 0xf007, concat(
+      new Uint8Array([4, 4]), new Uint8Array(18), little32(blip.length), little32(1), little32(0xffffffff), new Uint8Array(4), blip,
+    ));
+    const input = buildPptFixture(drawing(
+      spContainer(shapeAtom(75, 42, 0xa00), anchor(576, 576, 1728, 1728), properties([[0x4104, 1]])),
+      spContainer(shapeAtom(1, 43, 0xa00), anchor(576, 2304, 3456, 1728), properties([[0x181, 255], [0x1ff, 0x00080000]])),
+    ), undefined, undefined, { entries: [entry] });
+    const session = await openSession(input);
+    const canvas = new skia!.Canvas(960, 720);
+    try {
+      for await (const slide of session) {
+        expect(slide.elements).toHaveLength(2);
+        const picture = slide.elements[0];
+        expect(picture.type).toBe('picture');
+        if (picture.type !== 'picture') throw new Error('expected PICT picture');
+        expect(picture.mimeType).toBe('image/x-pict');
+        expect(new Uint8Array(await (await session.getImage(picture.imagePath, picture.mimeType)).arrayBuffer())).toEqual(pict);
+        await session.renderSlide(canvas as never, slide, { width: 960, dpr: 1, factory: skiaFactory() });
+      }
+    } finally { await session.close(); }
+    const ctx = canvas.getContext('2d');
+    expect(Array.from(ctx.getImageData(400, 180, 1, 1).data)).toEqual(RED);
+    const pixels = ctx.getImageData(96, 96, 192, 192).data;
+    expect(Array.from(pixels).some((v, i) => i % 4 !== 3 && v < 250)).toBe(true);
+  });
+
   it.skipIf(!skia)('renders embedded and delayed raster pictures with cropping and flips', async () => {
     const source = new skia!.Canvas(20, 10);
     const context = source.getContext('2d');

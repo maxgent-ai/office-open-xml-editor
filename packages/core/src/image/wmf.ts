@@ -17,7 +17,7 @@
 // Implemented records: SETWINDOWORG, SETWINDOWEXT, SETPOLYFILLMODE,
 // SETTEXTCOLOR, SETTEXTALIGN, CREATEPENINDIRECT, CREATEBRUSHINDIRECT,
 // CREATEFONTINDIRECT, SELECTOBJECT, DELETEOBJECT, POLYLINE, POLYGON,
-// POLYPOLYGON, RECTANGLE, MOVETO, LINETO, TEXTOUT, a bounded ANSI
+// POLYPOLYGON, RECTANGLE, MOVETO, LINETO, TEXTOUT, a bounded ANSI/Symbol
 // EXTTEXTOUT subset,
 // STRETCHDIBITS (embedded raster DIB via the
 // shared decoder in ./dib.ts), EOF.
@@ -39,6 +39,7 @@
 
 import { decodePackedDib, blitDibToCtx } from './dib.js';
 import { createAuxCanvas } from '../canvas/aux-canvas.js';
+import { decodeMetafileSymbolText } from '../fonts/metafile-symbol-encoding.js';
 
 // WMF record function codes (the subset we act on; others are skipped by size).
 const META = {
@@ -245,6 +246,7 @@ interface PlayState {
   textAlign: number;
   fillRule: CanvasFillRule; // from SETPOLYFILLMODE
   bkMode: number;
+  unsupported: Set<string>;
   extTextSafe: boolean;
   extTextMappingSafe: boolean;
   currentX: number;
@@ -580,18 +582,21 @@ function createFont(c: Cursor): Font {
 }
 
 /** MS-WMF 2.3.3.5, 2.2.1.2 and 2.1.2.3. This implementation intentionally
- * omits valid variants outside the measured ANSI/transparent/baseline subset;
+ * omits valid variants outside the bounded ANSI/Symbol transparent baseline subset;
  * omission is implementation policy, not a claim that those records are invalid. */
 function drawExtTextOut(s: PlayState, c: Cursor): void {
-  if (c.remaining < 8) return;
+  // Report EXTTEXTOUT omissions even when other records draw. This is a bounded
+  // text diagnostic, not a complete audit of the WMF player's skipped records.
+  const omit = () => { s.unsupported.add('META_EXTTEXTOUT (unsupported text state or encoding)'); };
+  if (c.remaining < 8) { omit(); return; }
   const y = c.i16();
   const x = c.i16();
   const length = c.i16();
   const options = c.u16();
-  if (length < 0) return;
-  if (options !== 0) return; // Rectangle-bearing/clipped/opaque variants are outside this subset.
+  if (length < 0) { omit(); return; }
+  if (options !== 0) { omit(); return; } // Rectangle-bearing/clipped/opaque variants are outside this subset.
   const padded = length + (length & 1);
-  if (c.remaining !== padded) return; // Reject truncation and any optional Dx array.
+  if (c.remaining !== padded) { omit(); return; } // Reject truncation and any optional Dx array.
   const raw = c.bytes(length);
   if (length & 1) c.skip(1);
   const font = s.curFont;
@@ -606,7 +611,7 @@ function drawExtTextOut(s: PlayState, c: Cursor): void {
     !(s.extX > 0 && s.extY > 0 && s.W > 0 && s.H > 0) ||
     ![s.extX, s.extY, s.W, s.H].every(Number.isFinite) ||
     !font ||
-    font.charset !== 0 ||
+    (font.charset !== 0 && font.charset !== 2) ||
     font.signedHeight >= 0 ||
     font.width !== 0 ||
     font.escapement !== 0 ||
@@ -618,21 +623,26 @@ function drawExtTextOut(s: PlayState, c: Cursor): void {
     !font.validForExt ||
     font.weight < 1 ||
     font.weight > 1000
-  ) return;
-  const text = decodeWindows1252(raw);
+  ) { omit(); return; }
+  // MS-WMF 2.2.1.2 Font.CharSet selects the byte encoding. SYMBOL_CHARSET
+  // is font-specific, not Windows-1252; only a fully known repertoire is drawn.
+  const text = font.charset === 2
+    ? decodeMetafileSymbolText(Array.from(raw, (byte) => String.fromCharCode(byte)).join(''), font.ansiFace)
+    : decodeWindows1252(raw);
+  if (text === null) { omit(); return; }
   if (!text.length) return;
   const px = font.height * (s.H / s.extY);
-  if (!Number.isFinite(px) || px <= 0) return;
+  if (!Number.isFinite(px) || px <= 0) { omit(); return; }
   try {
     s.ctx.fillStyle = s.textColor;
     const family = `"${font.ansiFace.replaceAll('\\', '\\\\').replaceAll('"', '\\"')}"`;
-    s.ctx.font = `${font.italic ? 'italic ' : ''}${font.weight} ${px}px ${family}`;
+    s.ctx.font = `${font.italic ? 'italic ' : ''}${font.weight} ${px}px ${font.charset === 2 ? 'serif' : family}`;
     const horiz = s.textAlign & 0x6;
     s.ctx.textAlign = horiz === 2 ? 'right' : horiz === 6 ? 'center' : 'left';
     s.ctx.textBaseline = 'alphabetic';
     s.ctx.fillText(text, mapX(s, x), mapY(s, y));
     s.drew = true;
-  } catch { /* Context may not implement text. */ }
+  } catch { omit(); }
 }
 
 function drawTextOut(s: PlayState, text: string, x: number, y: number): void {
@@ -676,6 +686,7 @@ export function playWmf(
   W: number,
   H: number,
   suppressBoundaryFrame = false,
+  onUnsupported?: (records: readonly string[]) => void,
 ): boolean {
   if (!isWmf(bytes)) return false;
 
@@ -706,6 +717,7 @@ export function playWmf(
     textAlign: 0,
     fillRule: 'nonzero',
     bkMode: 2,
+    unsupported: new Set(),
     extTextSafe: true,
     extTextMappingSafe: false,
     currentX: 0,
@@ -989,6 +1001,7 @@ export function playWmf(
     pos = recEnd;
   }
 
+  if (s.unsupported.size > 0) onUnsupported?.([...s.unsupported]);
   return s.drew;
 }
 
@@ -1029,6 +1042,7 @@ export async function renderWmfToBitmap(
   targetW: number,
   targetH: number,
   suppressBoundaryFrame = false,
+  onUnsupported?: (records: readonly string[]) => void,
 ): Promise<ImageBitmap | null> {
   if (!isWmf(bytes)) return null;
   if (targetW <= 0 || targetH <= 0) return null;
@@ -1042,7 +1056,7 @@ export async function renderWmfToBitmap(
   if (!ctx) return null;
   ctx.lineJoin = 'round';
   ctx.lineCap = 'round';
-  const drew = playWmf(bytes, ctx, targetW, targetH, suppressBoundaryFrame);
+  const drew = playWmf(bytes, ctx, targetW, targetH, suppressBoundaryFrame, onUnsupported);
   if (!drew) return null;
   return createImageBitmap(canvas);
 }

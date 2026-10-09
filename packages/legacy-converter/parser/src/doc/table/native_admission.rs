@@ -246,17 +246,18 @@ pub(in crate::doc) fn cell_text_flow(flags: u16) -> u16 {
 /// [MS-DOC] 2.9.102 FtsWWidth_Indent, the preferred leading indent written by
 /// sprmTWidthIndent.
 ///
-/// The displayed horizontal origin of a DOC table is the physical one given by
-/// sprmTDxaLeft/sprmTDxaGapHalf or the first TDefTable boundary (2.6.3: "the
-/// location of the horizontal origin of the table"), which the direct model
-/// already projects as the table indent. Word's own PDF exports of two
-/// left-to-right documents whose preferred indent differs from that origin
-/// (once by exactly the left default cell margin, once with nil margins) place
-/// the table borders at the physical origin, while the paired OOXML documents
-/// carry the preferred value as `w:tblInd` and display at that value.
-/// The preference is therefore validated and retained, but does not replace
-/// the physical origin. Right-to-left tables are not covered by that evidence
-/// and stay gated at projection.
+/// MS-DOC 2.6.3 TDxaLeft/GapHalf and 2.9.321 TDefTableOperand encode
+/// acquired logical row geometry; 2.9.102 describes a separate preference.
+/// Earlier Word PDF controls of two LTR documents with differing P/O placed
+/// borders from acquired O: one differed by the left default cell margin,
+/// one had nil margins. Their paired OOXML documents carried P as tblInd.
+/// The direct producer retains acquired O rather than replacing it with P.
+/// Ordinary leading, top-level main-story RTL tables use this same bounded
+/// converter policy through tblInd+bidiVisual. The logical transformation is
+/// specified; P/O precedence is not claimed as a normative or independently
+/// observed RTL rule. Other RTL placement classes retain equality gating.
+/// Scalar units, lengths and ranges are checked here; the final row-width
+/// bound is checked during grid planning after the complete property cascade.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::doc) enum PreferredIndent {
     Nil,
@@ -265,6 +266,23 @@ pub(in crate::doc) enum PreferredIndent {
 }
 
 impl PreferredIndent {
+    /// MS-DOC 2.9.102: Dxa indentation plus the final table/cell-sum width
+    /// must not exceed 31680 twips, even when the preference is not used for
+    /// placement. The caller supplies validated nonnegative final cell widths.
+    pub(in crate::doc) fn check_row_width(self, width: i32) -> Result<(), String> {
+        if let Self::Dxa(value) = self {
+            let edge = i32::from(value)
+                .checked_add(width)
+                .ok_or("OUTPUT_TOO_LARGE")?;
+            if edge > 31_680 {
+                return Err(unsupported(
+                    "Word preferred indent plus row width outside range",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub(in crate::doc) fn read(bytes: &[u8]) -> Result<Self, String> {
         let [fts, low, high] = bytes else {
             return Err(unsupported("invalid Word preferred indent length"));

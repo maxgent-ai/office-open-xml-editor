@@ -33,6 +33,7 @@ export interface LayoutSegSource {
 
 export interface LayoutTextSeg extends LayoutSegSource {
   text: string;
+  semanticSlotSpans?: import('../layout/text.js').TextShapeSpan['semanticSlotSpans'];
   /** Authored family and selected source survive local FontFace aliases.
    * Compatibility metadata may distinguish an installed authored face from a
    * substitute without inspecting the CSS alias or changing its paint route. */
@@ -623,6 +624,10 @@ export interface LineLayoutEnvironment {
   /** §17.6.5 effective line-grid gate after section type, paragraph opt-out,
    *  and §17.15.3.1 table-cell compatibility have been resolved. */
   readonly lineGridActive?: boolean;
+  /** Explicit paragraph character-allocation fact; omission is unknown. */
+  readonly characterGridActive?: boolean;
+  /** Paragraph base direction after inherited bidi resolution. */
+  readonly paragraphRtl?: boolean;
   /** §17.15.3.3 w:balanceSingleByteDoubleByteWidth document compatibility switch. */
   readonly balanceSingleByteDoubleByteWidth?: boolean;
   readonly resolvedLocalFonts?: Readonly<Record<string, ResolvedFontMetric>>;

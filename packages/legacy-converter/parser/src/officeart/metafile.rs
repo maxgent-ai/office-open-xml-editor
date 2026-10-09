@@ -45,6 +45,55 @@ pub(super) fn decode_with(
         (0xf01b, 0, 0x217) => (32, Format::Wmf),
         _ => return Err(unsupported("invalid OfficeArt metafile BLIP header")),
     };
+    let bytes = decode_payload(record, start, remaining)?;
+    // Preserve only the record's declared metafile encoding; never interpret it.
+    let viewed = bytes.view(record.payload);
+    match format {
+        Format::Emf => {
+            if viewed.len() < 44 || number(viewed, 0) != 1 || number(viewed, 40) != 0x464d4520 {
+                return Ok(None);
+            }
+            validate_emf(viewed, budget, gdiplus_end)?;
+        }
+        Format::Wmf => {
+            if !validate_wmf(viewed, budget, gdiplus_end)? {
+                return Ok(None);
+            }
+        }
+    }
+    Ok(Some(bytes))
+}
+
+/// MS-ODRAW 2.2.26/31: carry a PICT as an opaque unavailable-picture resource,
+/// never as a decoded image. This validates the bounded OfficeArt envelope and
+/// exact DEFLATE stream; QuickDraw commands are neither interpreted nor claimed
+/// valid. Only PPT's media cache opts in; its projector admits picture-frame
+/// placeholders and still rejects PICT fills. DOC/XLS do not opt in.
+/// PowerPoint 16.113 on macOS retains such a resource but displays an unavailable
+/// image in both the PPT and its PDF. The renderer labels this capability gap.
+pub(super) fn pict_placeholder(
+    record: Record<'_>,
+    remaining: usize,
+) -> Result<DecodedBytes, String> {
+    let start = match (record.kind, record.version, record.instance) {
+        (0xf01c, 0, 0x542) => 16,
+        (0xf01c, 0, 0x543) => 32,
+        _ => return Err(unsupported("invalid OfficeArt PICT BLIP header")),
+    };
+    // No platform/browser image decoder receives these opaque bytes. Invalid
+    // sizes, filters, compression or decompression still fail instead of being
+    // converted into successful recovery. Inner QuickDraw validation would
+    // require a decoder; the placeholder makes no assertion about that syntax.
+    decode_payload(record, start, remaining)
+}
+
+/// Common OfficeArtMetafileHeader envelope. Keep one inflation/size policy for
+/// opaque PICT resources and validated EMF/WMF resources.
+fn decode_payload(
+    record: Record<'_>,
+    start: usize,
+    remaining: usize,
+) -> Result<DecodedBytes, String> {
     let header = record
         .payload
         .get(start..start + 34)
@@ -82,22 +131,7 @@ pub(super) fn decode_with(
         }
         _ => return Err(unsupported("unsupported OfficeArt metafile compression")),
     };
-    // Preserve only the record's declared metafile encoding; never interpret it.
-    let viewed = bytes.view(record.payload);
-    match format {
-        Format::Emf => {
-            if viewed.len() < 44 || number(viewed, 0) != 1 || number(viewed, 40) != 0x464d4520 {
-                return Ok(None);
-            }
-            validate_emf(viewed, budget, gdiplus_end)?;
-        }
-        Format::Wmf => {
-            if !validate_wmf(viewed, budget, gdiplus_end)? {
-                return Ok(None);
-            }
-        }
-    }
-    Ok(Some(bytes))
+    Ok(bytes)
 }
 
 #[derive(Clone, Copy)]
@@ -607,6 +641,64 @@ pub(super) mod tests {
         result[start..start + 4].copy_from_slice(&(source.len() as u32).to_le_bytes());
         result[start + 32] = 0;
         result
+    }
+
+    #[test]
+    fn opaque_pict_recovery_still_rejects_corrupt_envelopes_and_expansion_limits() {
+        let source = [0, 0, 0, 0, 0, 0, 0, 20, 0, 30, 0, 17, 2, 255, 0, 255];
+        for two in [false, true] {
+            let start = if two { 32 } else { 16 };
+            let instance = if two { 0x543 } else { 0x542 };
+            let read = |data: &[u8], remaining| {
+                pict_placeholder(
+                    Record {
+                        kind: 0xf01c,
+                        version: 0,
+                        instance,
+                        payload: data,
+                    },
+                    remaining,
+                )
+            };
+            for data in [payload(&source, two), compressed(&source, two)] {
+                assert_eq!(read(&data, source.len()).unwrap().view(&data), source);
+                assert!(read(&data, source.len() - 1).is_err());
+                let mut invalid = data.clone();
+                invalid[start + 33] = 0;
+                assert!(read(&invalid, source.len()).is_err());
+                assert!(read(&data[..data.len() - 1], source.len()).is_err());
+                invalid = data.clone();
+                invalid[start..start + 4]
+                    .copy_from_slice(&((MAX_METAFILE_BYTES + 1) as u32).to_le_bytes());
+                assert!(read(&invalid, usize::MAX)
+                    .err()
+                    .unwrap()
+                    .contains("byte budget exceeded"));
+            }
+            let mut damaged = compressed(&source, two);
+            damaged[start + 34] ^= 0xff; // Damage the zlib header, not its declaration.
+            assert!(read(&damaged, source.len()).is_err());
+            let mut trailing = compressed(&source, two);
+            trailing.push(0);
+            let stored = (trailing.len() - start - 34) as u32;
+            trailing[start + 28..start + 32].copy_from_slice(&stored.to_le_bytes());
+            assert!(read(&trailing, source.len()).is_err());
+            let valid = compressed(&source, two);
+            for (version, instance) in [(1, instance), (0, 0x544)] {
+                assert!(pict_placeholder(
+                    Record {
+                        kind: 0xf01c,
+                        version,
+                        instance,
+                        payload: &valid
+                    },
+                    usize::MAX
+                )
+                .err()
+                .unwrap()
+                .contains("invalid OfficeArt PICT BLIP header"));
+            }
+        }
     }
     pub(crate) fn emf_test_blip() -> (Vec<u8>, Vec<u8>) {
         let source = emf();

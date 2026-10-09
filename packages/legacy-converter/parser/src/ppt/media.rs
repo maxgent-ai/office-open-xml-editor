@@ -361,6 +361,27 @@ impl SpanStore {
         pictures: Option<&[u8]>,
         budget: &mut usize,
     ) -> Result<bool, String> {
+        self.reference_with_policy(index, primary, pictures, budget, false)
+    }
+
+    pub fn reference_picture(
+        &mut self,
+        index: u32,
+        primary: &[u8],
+        pictures: Option<&[u8]>,
+        budget: &mut usize,
+    ) -> Result<bool, String> {
+        self.reference_with_policy(index, primary, pictures, budget, true)
+    }
+
+    fn reference_with_policy(
+        &mut self,
+        index: u32,
+        primary: &[u8],
+        pictures: Option<&[u8]>,
+        budget: &mut usize,
+        pict_placeholder: bool,
+    ) -> Result<bool, String> {
         if index == 0 {
             return Ok(false);
         }
@@ -378,7 +399,10 @@ impl SpanStore {
                 pictures,
                 budget,
                 self.remaining,
-                crate::officeart::raster::Raster::GifAware,
+                // Cache the resource independently of its first use. The gate
+                // below decides whether that caller may display a PICT frame;
+                // a fill must not poison later picture references with None.
+                crate::officeart::raster::Raster::PptPictures,
             )?;
             if let Some(image) = &image {
                 self.remaining = self
@@ -388,7 +412,12 @@ impl SpanStore {
             }
             self.images.insert(index, image);
         }
-        if self.images[&index].is_none() {
+        let Some(image) = &self.images[&index] else {
+            return Ok(false);
+        };
+        // A picture-frame placeholder is not a tiled/stretch fill capability.
+        // Keep this gate even when another picture already cached the resource.
+        if image.image.extension == "pict" && !pict_placeholder {
             return Ok(false);
         }
         self.used.insert(index);
@@ -516,6 +545,56 @@ mod tests {
     }
 
     #[test]
+    fn pict_picture_admission_is_independent_of_fill_order_and_reuses_retained_bytes() {
+        use std::io::Write;
+        let source = [0, 16, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0x11, 2, 0xff, 0, 0xff];
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&source).unwrap();
+        let zipped = encoder.finish().unwrap();
+        let mut payload = vec![0; 16 + 34];
+        payload[16..20].copy_from_slice(&(source.len() as u32).to_le_bytes());
+        payload[44..48].copy_from_slice(&(zipped.len() as u32).to_le_bytes());
+        payload[49] = 0xfe;
+        payload.extend_from_slice(&zipped);
+        let blip = record(0xf01c, 0x5420, &payload);
+        let mut entry = bse(blip.len(), 0, &[]);
+        entry[0] = 0x42;
+        entry[8] = 4;
+        let mislabeled = bse(blip.len(), 0, &[]);
+        let mut wrong_slot = SpanStore::new(vec![spanned(&mislabeled, 0)]);
+        assert!(wrong_slot
+            .reference_picture(1, &mislabeled, Some(&blip), &mut 100)
+            .unwrap_err()
+            .contains("store type mismatch"));
+        for fill_first in [false, true] {
+            let mut store = SpanStore::new(vec![spanned(&entry, 0)]);
+            store.remaining = source.len();
+            if fill_first {
+                assert!(!store.reference(1, &entry, Some(&blip), &mut 100).unwrap());
+                assert_eq!(store.used_images().count(), 0);
+            }
+            assert!(store
+                .reference_picture(1, &entry, Some(&blip), &mut 100)
+                .unwrap());
+            assert_eq!(
+                store.image(1, &entry, None).unwrap(),
+                Some(("pict", source.as_slice()))
+            );
+            assert!(!store.reference(1, &entry, None, &mut 0).unwrap());
+            store.begin_slide();
+            // An exhausted media/work budget still admits a cached picture on
+            // another slide, without inflating or charging the resource twice.
+            assert!(store.reference_picture(1, &entry, None, &mut 0).unwrap());
+            assert_eq!(store.used_images().count(), 1);
+            assert_eq!(
+                store.image(1, &entry, None).unwrap(),
+                Some(("pict", source.as_slice()))
+            );
+        }
+    }
+
+    #[test]
     fn reads_embedded_and_delayed_blips_with_one_or_two_uids() {
         for two in [false, true] {
             let png = png(7, 11);
@@ -545,8 +624,10 @@ mod tests {
         entry[8 + 33] = 0;
         entry[8 + 24..8 + 28].fill(0); // Unused slot never dereferences foDelay.
         assert!(image(&entry, &[], &mut 100).unwrap().is_none());
-        let unsupported = record(0xf01c, 0, &[]); // PICT is still not admitted.
+        let unsupported = record(0xf01f, 0, &[]); // DIB is still not admitted.
         assert!(image(&unsupported, &[], &mut 100).unwrap().is_none());
+        let malformed_pict = record(0xf01c, 0, &[]);
+        assert!(image(&malformed_pict, &[], &mut 100).is_err());
         let mut invalid = blip.clone();
         invalid[0] = 1;
         assert!(image(&invalid, &[], &mut 100).is_err());

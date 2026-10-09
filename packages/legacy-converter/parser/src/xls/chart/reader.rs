@@ -39,6 +39,7 @@ mod id {
     pub const AXIS: u16 = 0x101d;
     pub const TICK: u16 = 0x101e;
     pub const VALUE_RANGE: u16 = 0x101f;
+    pub const CAT_SER_RANGE: u16 = 0x1020;
     pub const AXIS_LINE: u16 = 0x1021;
     pub const TEXT: u16 = 0x1025;
     pub const OBJECT_LINK: u16 = 0x1027;
@@ -47,6 +48,7 @@ mod id {
     pub const END: u16 = 0x1034;
     pub const PLOT_AREA: u16 = 0x1035;
     pub const CHART3D: u16 = 0x103a;
+    pub const CHART3D_BAR_SHAPE: u16 = 0x105f;
     pub const RADAR: u16 = 0x103e;
     pub const SURF: u16 = 0x103f;
     pub const RADAR_AREA: u16 = 0x1040;
@@ -95,7 +97,9 @@ pub(crate) enum GroupKind {
     Radar {
         filled: bool,
     },
-    Surface,
+    Surface {
+        wireframe: bool,
+    },
     OfPie,
 }
 
@@ -105,10 +109,47 @@ pub(crate) struct Group {
     /// Zero-based AxisParent ordinal (0 primary, 1 secondary).
     pub axis_group: usize,
     pub varied_colors: bool,
-    pub three_d: bool,
+    pub three_d: Option<ThreeD>,
     pub legend: Option<Legend>,
     /// Group-level default series format (SS in the CRT rule).
     pub default_format: Option<Format>,
+}
+
+/// MS-XLS 2.4.46 Chart3d. Keep automatic-height provenance rather than
+/// treating the stored resolved height as an authored scene ratio.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ThreeD {
+    pub rotation_y: u16,
+    pub rotation_x: i16,
+    pub perspective: u16,
+    pub height: u16,
+    pub depth: u16,
+    pub gap: u16,
+    pub flags: u16,
+}
+
+fn three_d(data: &[u8]) -> Result<ThreeD, String> {
+    if data.len() != 14 {
+        return Err(unsupported("invalid BIFF Chart3d size"));
+    }
+    let view = ThreeD {
+        rotation_y: u16_at(data, 0)?,
+        rotation_x: u16_at(data, 2)? as i16,
+        perspective: u16_at(data, 4)?,
+        height: u16_at(data, 6)?,
+        depth: u16_at(data, 8)?,
+        gap: u16_at(data, 10)?,
+        flags: u16_at(data, 12)?,
+    };
+    if view.rotation_y > 360
+        || !(-90..=90).contains(&view.rotation_x)
+        || view.perspective >= 200
+        || !(1..=2000).contains(&view.depth)
+        || view.gap > 500
+    {
+        return Err(unsupported("invalid BIFF Chart3d view"));
+    }
+    Ok(view)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -128,6 +169,10 @@ pub(crate) struct Format {
     pub shape_xml: BTreeMap<u16, String>,
     pub explosion: Option<u16>,
     pub smooth: bool,
+    /// MS-XLS 2.4.47; meaningful only in an SS belonging to a 3-D bar group.
+    pub three_d_shape: Option<&'static str>,
+    /// MS-XLS 2.4.251; meaningful only for a bubble group.
+    pub bubble_3d: Option<bool>,
     /// AttachedLabel (2.4.5) flags of a series or point data label.
     pub data_labels: Option<u16>,
 }
@@ -159,6 +204,9 @@ pub(crate) struct Axis {
     /// FontX.iFont of the axis labels (AXS rule).
     pub font: Option<u16>,
     pub ticks: Option<AxisTicks>,
+    pub tick_label_skip: Option<u32>,
+    pub tick_mark_skip: Option<u32>,
+    pub format: Format,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -476,7 +524,7 @@ pub(crate) fn read(records: &[Record<'_>]) -> Result<RawChart, String> {
                         },
                         axis_group: axis_parent,
                         varied_colors: flags & 1 != 0,
-                        three_d: false,
+                        three_d: None,
                         legend: None,
                         default_format: None,
                     });
@@ -502,12 +550,29 @@ pub(crate) fn read(records: &[Record<'_>]) -> Result<RawChart, String> {
                 }
             }
             id::CHART3D => {
+                let view = three_d(record.data)?;
                 if let Some(group) = stack
                     .last_mut()
                     .filter(|b| b.owner == Owner::ChartFormat)
                     .and_then(|b| b.group.as_mut())
                 {
-                    group.three_d = true;
+                    group.three_d = Some(view);
+                }
+            }
+            id::CHART3D_BAR_SHAPE => {
+                // Riser selects rectangular/elliptical base, taper selects
+                // straight/point/to-maximum solids (MS-XLS 2.4.47).
+                let shape = match record.data {
+                    [0, 0] => "box",
+                    [1, 0] => "cylinder",
+                    [1, 1] => "cone",
+                    [1, 2] => "coneToMax",
+                    [0, 1] => "pyramid",
+                    [0, 2] => "pyramidToMax",
+                    _ => return Err(unsupported("invalid BIFF Chart3DBarShape")),
+                };
+                if let Some(block) = stack.last_mut() {
+                    block.format.three_d_shape = Some(shape);
                 }
             }
             id::SHT_PROPS => {
@@ -574,6 +639,7 @@ pub(crate) fn read(records: &[Record<'_>]) -> Result<RawChart, String> {
                 let flags = u16_at(record.data, 0)?;
                 if let Some(block) = stack.last_mut() {
                     block.format.smooth = flags & 1 != 0;
+                    block.format.bubble_3d = Some(flags & 2 != 0);
                 }
             }
             id::GEL_FRAME => {
@@ -608,6 +674,29 @@ pub(crate) fn read(records: &[Record<'_>]) -> Result<RawChart, String> {
                     if let Some(last) = block.records.last_mut() {
                         last.1 = data;
                     }
+                }
+            }
+            id::CAT_SER_RANGE => {
+                // SERIESAXIS uses CatSerRange, not ValueRange (MS-XLS
+                // 2.1.7.20.1 / 2.4.39). Keep this addition scoped to the
+                // newly projected series axis; category/date mapping is
+                // outside this 3-D projection change.
+                if let Some(axis) = stack
+                    .last_mut()
+                    .and_then(|b| b.axis.as_mut())
+                    .filter(|a| a.kind == 2)
+                {
+                    if record.data.len() != 8 {
+                        return Err(unsupported("invalid BIFF series CatSerRange size"));
+                    }
+                    let label = u16_at(record.data, 2)?;
+                    let mark = u16_at(record.data, 4)?;
+                    if !(1..=31999).contains(&label) || !(1..=31999).contains(&mark) {
+                        return Err(unsupported("invalid BIFF series axis skip interval"));
+                    }
+                    axis.reversed = u16_at(record.data, 6)? & 4 != 0;
+                    axis.tick_label_skip = Some(u32::from(label));
+                    axis.tick_mark_skip = Some(u32::from(mark));
                 }
             }
             id::VALUE_RANGE => {
@@ -754,7 +843,9 @@ fn group_kind(record: Record<'_>) -> Result<GroupKind, String> {
         },
         id::RADAR => GroupKind::Radar { filled: false },
         id::RADAR_AREA => GroupKind::Radar { filled: true },
-        id::SURF => GroupKind::Surface,
+        id::SURF => GroupKind::Surface {
+            wireframe: u16_at(data, 0)? & 1 == 0,
+        },
         _ => GroupKind::OfPie,
     })
 }
@@ -837,7 +928,8 @@ fn finish_block(
             }
         }
         Owner::Axis => {
-            if let Some(axis) = block.axis.take() {
+            if let Some(mut axis) = block.axis.take() {
+                axis.format = block.format;
                 chart.axes.push(axis);
             }
         }

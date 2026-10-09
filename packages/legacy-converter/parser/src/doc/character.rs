@@ -397,6 +397,39 @@ impl Properties {
             return Ok(true);
         }
         let (key, value) = match code {
+            0x2a86 => {
+                // [MS-DOC] 2.6.1 sprmCNeedFontFixup / 2.9.81 FFM is an
+                // enum, not a toggle. ffmNone and ffmDefault use the existing
+                // default Unicode font route: Canvas measurement and paint
+                // share the same CSS fallback chain, which substitutes a face
+                // for missing glyphs. This delegates to the library/browser
+                // font policy; it does not reproduce Word's font choice or
+                // guarantee installed coverage/identical metrics. Language-
+                // optimal and UI-font substitution need a distinct consumer.
+                let [value] = operand else {
+                    return Err(unsupported("invalid Word font fixup length"));
+                };
+                return match value {
+                    0 | 1 => Ok(true),
+                    2 | 4 => Ok(false),
+                    _ => Err(unsupported("invalid Word font fixup method")),
+                };
+            }
+            0x484e => {
+                // MS-DOC 2.9.118 HresiOperand: hresNormal (1) with ChHres
+                // zero is the default word-breaking method. It adds no
+                // character substitution to the renderer's default policy.
+                // Other valid methods require a word-break consumer; refuse
+                // them rather than silently dropping the changed characters.
+                if operand.len() != 2
+                    || !(1..=6).contains(&operand[0])
+                    || (operand[0] == 1 && operand[1] != 0)
+                    || (operand[0] != 1 && !(1..=0x7f).contains(&operand[1]))
+                {
+                    return Err(unsupported("invalid Word word-breaking method"));
+                }
+                return Ok(operand[0] == 1);
+            }
             0x485f => {
                 // MS-DOC 2.6.1 sprmCLidBi / 2.9.134 LID: this axis is used for
                 // RTL or complex-script presentation. The language itself is
@@ -692,6 +725,27 @@ impl Properties {
                         .to_string(),
                 )
             }
+            0x4a60 => {
+                // [MS-DOC] 2.6.1 sprmCIcoBi, implementation note 147:
+                // later Word does not use this Word 97 complex-script color.
+                // Our current-Word projection keeps the ordinary CIco/CCv
+                // color route, without emulating the historical color axis.
+                // The SPRM frame is two bytes, while 2.9.119 Ico is a byte
+                // palette index below 0x11. Admit only the zero-extended
+                // subset; a nonzero high byte is an unsupported encoding,
+                // not a normatively reserved byte that may be masked away.
+                // Inert success must not author color or sparse presence.
+                let [index, high] = operand else {
+                    return Err(unsupported("invalid Word compatibility color operand"));
+                };
+                if *high != 0 {
+                    return Ok(false);
+                }
+                if usize::from(*index) >= ICO_COLORS.len() {
+                    return Err(unsupported("invalid Word complex-script palette index"));
+                }
+                return Ok(true);
+            }
             0x286f => {
                 // MS-DOC 2.6.1 sprmCIdctHint. 0xFF is an explicit absence of
                 // guidance and therefore cancels an inherited ST_Hint value.
@@ -933,6 +987,23 @@ mod tests {
     }
 
     #[test]
+    fn obsolete_complex_script_palette_is_inert_for_current_word_color() {
+        let base = Properties::default();
+        let mut value = base.clone();
+        value.apply(0x6870, &[0x12, 0x34, 0x56, 0], &base).unwrap();
+        assert!(value.apply(0x4a60, &[9, 0], &base).unwrap());
+        assert!(value.apply(0x4a60, &[16, 0], &base).unwrap());
+        assert_eq!(run(&value, &[]).color.as_deref(), Some("123456"));
+        value.apply(0x2a42, &[6], &base).unwrap();
+        assert!(value.apply(0x4a60, &[0, 0], &base).unwrap());
+        assert_eq!(run(&value, &[]).color.as_deref(), Some("ff0000"));
+        assert!(!value.apply(0x4a60, &[9, 1], &base).unwrap());
+        assert!(value.apply(0x4a60, &[17, 0], &base).is_err());
+        assert!(value.apply(0x4a60, &[9], &base).is_err());
+        assert!(value.apply(0x4a60, &[9, 0, 0], &base).is_err());
+    }
+
+    #[test]
     fn highlight_uses_symbolic_palette_and_explicit_none() {
         let base = Properties::default();
         for (index, expected) in HIGHLIGHT_COLORS.iter().enumerate() {
@@ -1128,6 +1199,41 @@ mod tests {
 
         let truncated = [0x16, 0x68, 0x12, 0x34, 0x56];
         assert!(Sprms::new(&truncated).next(&mut Budget::default()).is_err());
+    }
+
+    #[test]
+    fn normal_word_breaking_is_default_but_custom_and_malformed_methods_are_not() {
+        let base = Properties::default();
+        let mut normal = base.clone();
+        assert!(normal.apply(0x484e, &[1, 0], &base).unwrap());
+        assert_eq!(normal, base);
+        // A valid custom method changes characters at a break and needs a
+        // consumer. It must not be treated as the default method.
+        for method in 2..=6 {
+            assert!(!base.clone().apply(0x484e, &[method, b'x'], &base).unwrap());
+        }
+        for operand in [
+            vec![],
+            vec![1],
+            vec![1, 0, 0],
+            vec![0, 1],
+            vec![7, 0],
+            vec![1, 1],
+            vec![2, 0],
+            vec![2, 0x80],
+        ] {
+            assert!(
+                base.clone().apply(0x484e, &operand, &base).is_err(),
+                "{operand:?}"
+            );
+        }
+        let bytes = [0x4e, 0x48, 1, 0, 0x35, 0x08, 1];
+        let mut sprms = Sprms::new(&bytes);
+        let mut budget = Budget::default();
+        while let Some((code, operand)) = sprms.next(&mut budget).unwrap() {
+            normal.apply(code, operand, &base).unwrap();
+        }
+        assert!(run(&normal, &[]).bold);
     }
 
     #[test]

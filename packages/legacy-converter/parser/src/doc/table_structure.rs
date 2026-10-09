@@ -7,7 +7,7 @@
 use std::borrow::Borrow;
 
 use super::{
-    table::{Cell, Properties, Row},
+    table::{Cell, PreferredIndent, Properties, Row},
     unsupported,
 };
 
@@ -110,6 +110,8 @@ pub(super) struct Event<P>(pub(super) Vec<LogicalTable<P>>);
 pub(super) struct RawEvent<P, R = Row>(pub(super) Vec<RawTable<P, R>>);
 
 pub(super) struct RawTable<P, R = Row> {
+    /// Exact nesting depth owned by the table grammar, not row formatting.
+    pub(super) depth: usize,
     pub(super) rows: Vec<RawRow<P, R>>,
 }
 
@@ -122,6 +124,7 @@ pub(super) struct RawRow<P, R = Row> {
 }
 
 pub(super) struct LogicalTable<P> {
+    pub(super) depth: usize,
     pub(super) grid: Vec<i32>,
     pub(super) origin: i32,
     pub(super) rows: Vec<PlannedRow<P>>,
@@ -250,6 +253,7 @@ impl<P: Payload, R: Borrow<Row>> Assembler<P, R> {
         E: FnMut(RawEvent<P, R>, &mut A) -> Result<P, String>,
         A: FnMut(usize) -> Result<(), String>,
     {
+        let depth = self.stack.len();
         let pending = self.stack.pop().expect("open table");
         if !pending.cell.is_empty() || !pending.cells.is_empty() || pending.first.is_some() {
             return Err(unsupported("unterminated Word table row"));
@@ -268,7 +272,7 @@ impl<P: Payload, R: Borrow<Row>> Assembler<P, R> {
                 group.push(rows.next().expect("peeked row"));
             }
             reserve_one(&mut tables, admit)?;
-            tables.push(RawTable { rows: group });
+            tables.push(RawTable { depth, rows: group });
         }
         let payload = emit(RawEvent(tables), admit)?;
         if let Some(parent) = self.stack.last_mut() {
@@ -363,6 +367,7 @@ fn plan<P: Default, A: FnMut(usize) -> Result<(), String>>(
     raw: RawTable<P>,
     admit: &mut A,
 ) -> Result<LogicalTable<P>, String> {
+    let depth = raw.depth;
     let rows = raw.rows;
     let (boundaries, _) = grid_boundaries(&rows, admit)?;
     let grid_len = boundaries.iter().try_fold(0usize, |sum, (_, count)| {
@@ -395,6 +400,17 @@ fn plan<P: Default, A: FnMut(usize) -> Result<(), String>>(
         first: _,
     } in rows
     {
+        // MS-DOC 2.9.102 permits the cell-width sum for the Dxa bound.
+        // This direct geometry profile uses the final per-row sum, not the
+        // union grid (which also contains other rows' offsets).
+        // Validate after the complete cascade and width mutations, while all
+        // source cells, including merged continuations, are still retained.
+        if let Some(indent @ PreferredIndent::Dxa(_)) = row.preferred_indent {
+            let width = row.cells.iter().try_fold(0i32, |sum, cell| {
+                sum.checked_add(cell.width).ok_or("OUTPUT_TOO_LARGE")
+            })?;
+            indent.check_row_width(width)?;
+        }
         let edge = row.origin();
         let before = grid.partition_point(|value| *value < edge);
         let mut cell_grid = Vec::new();
@@ -474,6 +490,7 @@ fn plan<P: Default, A: FnMut(usize) -> Result<(), String>>(
         });
     }
     Ok(LogicalTable {
+        depth,
         grid,
         origin,
         rows: planned_rows,
@@ -1299,6 +1316,7 @@ mod tests {
 
             let table = plan(
                 RawTable {
+                    depth: 1,
                     rows: vec![raw(row, vec![(), (), ()])],
                 },
                 &mut |_| Ok(()),
@@ -1323,6 +1341,7 @@ mod tests {
         assert_eq!(
             plan(
                 RawTable {
+                    depth: 1,
                     rows: vec![raw(row, vec![(); 65_536])],
                 },
                 &mut |_| Ok(()),
