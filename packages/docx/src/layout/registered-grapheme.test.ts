@@ -150,6 +150,51 @@ it('retains one paint operation and shared cluster geometry across source owners
   expect(owners[0].bounds).toEqual(owners[1].bounds);
   expect(structuredClone(placement)).toEqual(placement);
 });
+it('paints a justified compound grapheme at its own shape origin, not a split joined probe', () => {
+  // Synthetic shaper: letters 6pt, an attached mark 0pt, a detached (string-
+  // initial) mark 2pt, and kerning removes 1pt only from the " T" pair.
+  const paintedOrigins = (text: string, markCovered: boolean) => {
+    const service = createTextLayoutService({
+      fonts: createFontResolver([{ requestedFamily: 'Test Face', resolvedFamily: 'Test Resource',
+        resourceIdentity: identity, source: 'embedded', weight: 400, style: 'normal' }]),
+      fontMetrics: { resource: { family: 'Test Resource', sourceIdentity: identity, weight: 400,
+        style: 'normal', unicodeRanges: markCovered ? [[0x20, 0x7a], [0x301, 0x301]] : [[0x20, 0x7a]] } },
+      measurer: { fingerprint: 'detached-mark-spacing', measure: ({ text, kerning }) => ({
+        advancePt: [...text].reduce((sum, ch, index) =>
+          sum + (ch === '́' ? (index === 0 ? 2 : 0) : 6), 0)
+          - (kerning && text.includes(' T') ? 1 : 0),
+        ascentPt: 9, descentPt: 0,
+      }) },
+    });
+    // Mode-15 `both` is the only production consumer of the boundary repair.
+    const doc = { ...documentModel, settings: { compatibilityMode: 15 }, body: [{ type: 'paragraph',
+      alignment: 'both', indentLeft: 0, indentRight: 0, indentFirst: 0, spaceBefore: 0,
+      spaceAfter: 0, lineSpacing: null, numbering: null, tabStops: [],
+      runs: [run(text, { kerning: 1 })] }] } as unknown as DocxDocumentModel;
+    const services = Object.freeze({ ...createLayoutServices(doc, { measureContext: context }), text: service });
+    const placements: TextPlacement[] = [];
+    const seen = new WeakSet<object>();
+    (function walk(value: unknown): void {
+      if (!value || typeof value !== 'object' || seen.has(value)) return;
+      seen.add(value);
+      if ('kind' in value && value.kind === 'text' && 'paintOps' in value) {
+        placements.push(value as TextPlacement); return;
+      }
+      for (const child of Object.values(value)) walk(child);
+    })(layoutDocument(doc, services, { currentDateMs: 0 }).pages);
+    const x = (p: TextPlacement) => p.origin.xPt + p.paintOps[0].offset.xPt;
+    return placements.map(p => [p.text, x(p) - x(placements[0]), Boolean(p.semanticSlotSpans)]);
+  };
+  // The compound paints as one shape; the joined probe "a T́" cannot
+  // carry its single-grapheme proof and would charge the detached 2pt mark
+  // (net +1) to the boundary. No estimated pair value replaces it.
+  expect(paintedOrigins('a T́', true)).toEqual([['a ', 0, false], ['T́', 12, true]]);
+  // Ordinary pairs keep the native repair, including when the proof is
+  // withheld and the same text keeps its per-slot spans.
+  expect(paintedOrigins('a T', true)).toEqual([['a ', 0, false], ['T', 11, false]]);
+  expect(paintedOrigins('a T́', false)).toEqual(
+    [['a ', 0, false], ['T', 11, false], ['́', 17, false]]);
+});
 it('rejects native faces even when the resolver memoizes the same object', () => {
   const service = createTextLayoutService({ fonts: createFontResolver([]),
     measurer: { fingerprint: 'native', measure: () => ({ advancePt: 1, ascentPt: 1, descentPt: 0 }) } });
