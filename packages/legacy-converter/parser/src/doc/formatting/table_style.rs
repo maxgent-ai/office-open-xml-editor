@@ -573,6 +573,14 @@ impl Formatting<'_> {
                         let baseline = profile.unconditional.clone();
                         profile.unconditional.apply(code, operand, &baseline)?;
                     }
+                    // CIcoBi is inert for the current-Word target. Share its
+                    // operand validation; unknown encodings remain gated.
+                    0x4a60 => {
+                        profile.unsupported_character |=
+                            !profile
+                                .unconditional
+                                .apply(code, operand, &Properties::sparse())?;
+                    }
                     // The existing sprmCLidBi decoder treats 0x0400 as
                     // absence of an authored complex-script language (see
                     // character::Properties::apply and its Word evidence).
@@ -739,6 +747,11 @@ fn parse_conditional(
             let baseline = patch.clone();
             patch.apply(code, value, &baseline)?;
             has_supported_character = true;
+        } else if code == 0x4a60 {
+            // See character::Properties::apply for the current-Word policy
+            // and bounded CIcoBi encoding. Validation adds no character
+            // patch and therefore cannot establish conditional presence.
+            profile.unsupported_character |= !patch.apply(code, value, &Properties::sparse())?;
         } else if matches!(code, 0x4a4f | 0x4a50 | 0x4a51 | 0x4a5e) {
             // Word 16.112.4 controls with seven reordered FFN records leave
             // conditional font markers fixed while unconditional CRgFtc values
