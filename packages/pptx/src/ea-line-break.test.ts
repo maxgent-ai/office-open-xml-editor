@@ -99,6 +99,34 @@ describe('pptx eaLnBrk (§21.1.2.2.7)', () => {
   });
 });
 
+describe('pptx kinsoku across run seams (issue #1653 controls K00–K23)', () => {
+  // Each Office two-run case breaks exactly like its one-run twin. Curly quotes
+  // paint in the Latin slot here, so their slot seam is a run seam as well.
+  const lang = (text: string, value: string): TextRunData => ({ ...run(text), lang: value });
+
+  it('keeps Japanese line-start and line-end rules continuous across authored and slot seams', () => {
+    for (const parts of [['漢漢', '”漢'], ['漢漢”漢']]) {
+      expect(lines(parts.map((text) => lang(text, 'ja-JP')), 20, true)).toEqual(['漢', '漢”', '漢']);
+    }
+    for (const parts of [['漢', '“漢漢'], ['漢“漢漢']]) {
+      expect(lines(parts.map((text) => lang(text, 'ja-JP')), 20, true)).toEqual(['漢', '“漢', '漢']);
+    }
+  });
+
+  it('leaves the curly quote at the seam under en-US', () => {
+    expect(lines([lang('漢漢', 'en-US'), lang('”漢', 'en-US')], 20, true)).toEqual(['漢漢', '”漢']);
+    expect(lines([lang('漢', 'en-US'), lang('“漢漢', 'en-US')], 20, true)).toEqual(['漢“', '漢漢']);
+  });
+
+  it('keeps unobserved punctuation and mixed-language seams outside the new rule', () => {
+    expect(lines([lang('漢漢', 'ja-JP'), lang('、漢', 'ja-JP')], 20, true)).toEqual(['漢漢', '、漢']);
+    expect(lines([lang('漢“', 'en-US'), lang('）', 'ja-JP'), lang('”漢', 'ja-JP')], 30, true))
+      .toEqual(['漢“）', '”漢']);
+    expect(lines([lang('漢“', 'en-US'), lang('漢', 'ja-JP'), lang('”漢', 'ja-JP')], 30, true))
+      .toEqual(['漢“漢', '”漢']);
+  });
+});
+
 describe('pptx line feed inside a:t (controls L00–L08)', () => {
   it('breaks at the line feed; the next line takes the containing run size (L00)', () => {
     const laid = layoutParagraph(measuringContext(), paragraph([

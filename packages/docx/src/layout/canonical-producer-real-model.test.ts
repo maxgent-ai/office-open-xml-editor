@@ -4,7 +4,7 @@ import { createLayoutServices } from '../layout-runtime.js';
 import { layoutDocument } from '../document-layout.js';
 import { layoutSourceStore } from '../layout-source-model-adapter.js';
 import { layoutDocumentInputAsync } from './document.js';
-import type { BodyElement, DocParagraph, DocxDocumentModel, SectionProps } from '../types.js';
+import type { BodyElement, CellElement, DocParagraph, DocxDocumentModel, SectionProps } from '../types.js';
 import type { NoteLayout } from './types.js';
 
 function measureContext(): CanvasRenderingContext2D {
@@ -789,6 +789,45 @@ describe('canonical producer with a real document model', () => {
     );
     expect(frame.flowBounds).toMatchObject({ xPt: 25, yPt: 15 });
     expect(follower.flowBounds.yPt).toBe(10);
+  });
+
+  it.each([{ kind: 'fixed', grow: false }, { kind: 'autofit', grow: false }, { kind: 'autofit', grow: true }])('centers a complete RTL floating frame independently of acquired origin: $kind/$grow', ({ kind, grow }) => {
+    const results = [-10, 0, 10].map((indentPt) => {
+      const table = floatingTable() as Extract<BodyElement, { type: 'table' }>;
+      table.colWidths = [20, 40];
+      table.tblInd = indentPt;
+      table.bidiVisual = true;
+      table.layout = kind;
+      table.widthPt = grow ? undefined : 60;
+      const cell = table.rows[0]!.cells[0]!;
+      table.rows = [{ ...table.rows[0]!, cells: [
+        { ...cell, widthPt: grow ? null : 20, noWrap: grow, content: [{ ...ordinaryParagraph(grow ? 'ABCDEFGHIJKLMNOPQRSTUVWXYZABCDEFGHIJKLMNOPQRSTUVWXYZ' : 'A'), type: 'paragraph' } as CellElement] },
+        { ...cell, widthPt: grow ? null : 40, content: [{ ...ordinaryParagraph('B'), type: 'paragraph' } as CellElement] },
+      ] }, { ...table.rows[0]!, cells: [{ ...cell, widthPt: grow ? null : 60, colSpan: 2, content: [{ ...ordinaryParagraph('C'), type: 'paragraph' } as CellElement] }] }];
+      table.tblpPr = { leftFromText: 5, rightFromText: 10, topFromText: 2, bottomFromText: 4,
+        horzAnchor: 'margin', horzSpecified: true, vertAnchor: 'page', tblpX: 0, tblpXSpec: 'center', tblpY: 20 };
+      const model = {
+        section: { pageWidth: 200, pageHeight: 100, marginTop: 10, marginRight: 20, marginBottom: 10,
+          marginLeft: 10, headerDistance: 5, footerDistance: 5, titlePage: false, evenAndOddHeaders: false,
+          sectionStart: 'nextPage', columns: null },
+        body: [table, ordinaryBodyParagraph('following')],
+        headers: { default: null, first: null, even: null }, footers: { default: null, first: null, even: null },
+        footnotes: [], endnotes: [], fontFamilyClasses: {},
+      } as unknown as DocxDocumentModel;
+      const layout = layoutDocument(model, createLayoutServices(model, { measureContext: measureContext() }), { currentDateMs: 0 });
+      const frame = layout.pages[0]!.layers.body[0]!;
+      if (frame.kind !== 'table') throw new Error('expected floating frame');
+      expect(frame.ordinaryFlow).toBe(false);
+      if (grow) expect(frame.flowBounds.widthPt).toBeGreaterThan(60);
+      expect(frame.flowBounds.xPt + frame.flowBounds.widthPt / 2).toBeCloseTo(95);
+      expect(frame.rows[0]!.cells[0]!.flowBounds.xPt).toBeGreaterThan(frame.rows[0]!.cells[1]!.flowBounds.xPt);
+      expect(layout.pages[0]!.layers.body[1]!.flowBounds.yPt).toBe(10);
+      return { frame: frame.flowBounds, rows: frame.rows.map((row) => ({ bounds: row.flowBounds,
+        cells: row.cells.map((cell) => ({ bounds: cell.flowBounds, clips: cell.clipBounds,
+          blocks: cell.blocks })) })), borders: frame.borders };
+    });
+    expect(results[0]).toEqual(results[1]);
+    expect(results[2]).toEqual(results[1]);
   });
 
   it('retains an effective positioned table without charging ordinary flow', () => {

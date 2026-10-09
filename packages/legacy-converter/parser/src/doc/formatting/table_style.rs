@@ -573,6 +573,21 @@ impl Formatting<'_> {
                         let baseline = profile.unconditional.clone();
                         profile.unconditional.apply(code, operand, &baseline)?;
                     }
+                    // CIcoBi is inert for the current-Word target. Share its
+                    // operand validation; unknown encodings remain gated.
+                    0x4a60 => {
+                        profile.unsupported_character |=
+                            !profile
+                                .unconditional
+                                .apply(code, operand, &Properties::sparse())?;
+                    }
+                    // The existing sprmCLidBi decoder treats 0x0400 as
+                    // absence of an authored complex-script language (see
+                    // character::Properties::apply and its Word evidence).
+                    // This unconditional table-style value changes no axis.
+                    // Other languages and conditional writes still need a
+                    // table-language cascade consumer and remain gated.
+                    0x485f if operand == [0, 4] => {}
                     0xca85 => {
                         parse_conditional(&mut profile, operand, &mut self.budget)?;
                     }
@@ -589,6 +604,7 @@ impl Formatting<'_> {
                         "Word table style PAPX has mismatched style index",
                     ));
                 }
+                let mut physical_alignment = None;
                 sprm::paragraph_properties(
                     &sets.papx[2..],
                     self.data,
@@ -599,12 +615,24 @@ impl Formatting<'_> {
                             let alignment = paragraph::AlignmentPatch::from_sprm(code, operand)?
                                 .expect("logical alignment code");
                             profile.paragraph_alignment = Some(alignment);
+                            // MS-DOC 2.2.5: a later Prl for the same property
+                            // supersedes the older compatibility encoding.
+                            // Normalize only equal center/low-compression
+                            // justify values in this unconditional PAPX: they
+                            // mean the same thing in PJc80 and PJc regardless
+                            // of direction. Value 4 differs between encodings.
+                            // Other physical alignment remains gated; this
+                            // does not widen table-style inheritance or CNF.
+                            if physical_alignment == Some(operand[0]) && matches!(operand[0], 1 | 3)
+                            {
+                                physical_alignment = None;
+                            }
                         } else if code == 0x2403 {
                             let _ = paragraph::AlignmentPatch::from_sprm(code, operand)?;
                             // Office 16.112.4 table-style controls ignore
                             // physical PJc80. Keep direct paragraph PJc80
                             // behavior independent and retain admission gating.
-                            profile.unsupported_paragraph = true;
+                            physical_alignment = Some(operand[0]);
                         } else if matches!(code, 0xa413 | 0xa414) {
                             // Validate the ordinary twip-spacing operand before
                             // retaining property presence; authored zero clears
@@ -625,6 +653,7 @@ impl Formatting<'_> {
                         Ok(())
                     },
                 )?;
+                profile.unsupported_paragraph |= physical_alignment.is_some();
             }
         }
         if conditional_margin_sides != 0
@@ -718,6 +747,11 @@ fn parse_conditional(
             let baseline = patch.clone();
             patch.apply(code, value, &baseline)?;
             has_supported_character = true;
+        } else if code == 0x4a60 {
+            // See character::Properties::apply for the current-Word policy
+            // and bounded CIcoBi encoding. Validation adds no character
+            // patch and therefore cannot establish conditional presence.
+            profile.unsupported_character |= !patch.apply(code, value, &Properties::sparse())?;
         } else if matches!(code, 0x4a4f | 0x4a50 | 0x4a51 | 0x4a5e) {
             // Word 16.112.4 controls with seven reordered FFN records leave
             // conditional font markers fixed while unconditional CRgFtc values

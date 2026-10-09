@@ -52,8 +52,9 @@ function reorderNullable<T>(
  * Finite non-negative values participate. Ties retain source order, missing or
  * invalid values are omitted from frequency points, and a zero-total series
  * produces finite zero cumulative values. ChartEx can retain named category
- * ticks with no value after those points. Indexed point/label properties follow
- * their source point through the reorder.
+ * ticks with no value: after the sorted points, or at their source slot when
+ * authored order is kept. Indexed point/label properties follow their source
+ * point through the reorder.
  */
 export function planParetoLayout(
   series: ChartSeries,
@@ -99,6 +100,15 @@ export function planParetoLayout(
         sourceIndices.push(index);
       }
     }
+    // [MS-ODRAWXML] CT_NumericValue/CT_StringValue@idx identify the source
+    // point. Without the frequency sort, bars keep authored (source-index)
+    // order, so an unvalued named category keeps its own slot instead of
+    // moving after every valued point (which also mislabelled other series'
+    // bars drawn against the first series' categories). With sorting it
+    // still follows the sorted points. Evidence limit: no Office control
+    // places an interior unvalued slot; the renderers' flat-endpoint rule is
+    // unchanged.
+    if (options.sortDescending === false) sourceIndices.sort((a, b) => a - b);
   }
   const newIndexBySource = new Map(
     sourceIndices.map((sourceIndex, newIndex) => [sourceIndex, newIndex]),
@@ -109,10 +119,16 @@ export function planParetoLayout(
     const value = series.values[index];
     return value != null && Number.isFinite(value) && value >= 0 ? value : null;
   });
-  const cumulative = [
-    ...points.map(point => point.cumulativeFraction),
-    ...sourceIndices.slice(points.length).map(() => points.at(-1)?.cumulativeFraction ?? 0),
-  ];
+  // A slot without a value adds nothing, so it carries the cumulative share
+  // of the slots before it (0 before the first valued point).
+  const fractionBySource = new Map(
+    points.map(point => [point.sourceIndex, point.cumulativeFraction]),
+  );
+  let carried = 0;
+  const cumulative = sourceIndices.map(index => {
+    carried = fractionBySource.get(index) ?? carried;
+    return carried;
+  });
   const reordered = {
     ...series,
     categories,

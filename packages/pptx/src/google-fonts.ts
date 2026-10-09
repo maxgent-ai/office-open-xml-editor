@@ -47,6 +47,10 @@ function* textBodyFontFamilies(body: TextBody | null | undefined): Generator<str
       if (run.type !== 'text') continue;
       if (run.fontFamily) yield run.fontFamily;
       if (run.fontFamilyEa) yield run.fontFamilyEa;
+      // ECMA-376 §21.1.2.3.1: a:cs names an independently resolved run face.
+      // The existing renderer consumes it for complex-script segments;
+      // preload must retain that independently authored face.
+      if (run.fontFamilyCs) yield run.fontFamilyCs;
       if (run.fontFamilySym) yield run.fontFamilySym;
     }
   }
@@ -189,6 +193,7 @@ export function pptxSlideOfficeFontRequests(
         const italic = run.italic ?? paragraph.defItalic ?? textBody?.defaultItalic ?? false;
         add(run.fontFamily ?? paragraph.defFontFamily, bold, italic);
         if (run.fontFamilyEa) add(run.fontFamilyEa, bold, italic);
+        if (run.fontFamilyCs) add(run.fontFamilyCs, bold, italic);
         if (run.fontFamilySym) add(run.fontFamilySym, bold, italic);
       }
       if (paragraph.bullet.type === 'char' || paragraph.bullet.type === 'autoNum') {

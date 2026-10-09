@@ -252,6 +252,8 @@ export function measureParagraph(
     ...environment,
     lineSpacing: context.lineSpacing,
     lineGridActive: context.lineGrid.active,
+    characterGridActive: context.characterGrid.active,
+    paragraphRtl: context.baseRtl,
     autoSpaceDE: paragraph.autoSpaceDE,
     autoSpaceDN: paragraph.autoSpaceDN,
   });

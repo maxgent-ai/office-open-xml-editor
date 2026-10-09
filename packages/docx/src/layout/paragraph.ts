@@ -1513,6 +1513,7 @@ function textPlacement(
   return {
     kind: 'text',
     text: segment.text,
+    ...(segment.semanticSlotSpans ? { semanticSlotSpans: segment.semanticSlotSpans } : {}),
     ...(runIndex === undefined ? {} : { sourceRunIndex: runIndex }),
     ...(run?.type === 'field' ? { role: 'field-result' as const, dependency: fieldDependency(run) } : {}),
     ...(run?.type === 'text'

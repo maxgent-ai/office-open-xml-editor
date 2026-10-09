@@ -5,7 +5,9 @@ use super::{unsupported, AcquiredDoc, Fields};
 use docx_model::paragraph_breaks::ParaPiece;
 use docx_model::{
     BodyElement, CellElement, DocRun, Document, DocumentSettings, DocumentTypographySettingsWire,
-    HeadersFooters,
+    HeadersFooters, ParseDiagnostic, PARSE_DIAGNOSTIC_CODE_NATIVE_DOC_NESTED_CELL_FRAME_FLOW,
+    PARSE_DIAGNOSTIC_PART_NATIVE_DOC_NESTED_CELL_FRAME_FLOW,
+    PARSE_DIAGNOSTIC_SEVERITY_NATIVE_DOC_NESTED_CELL_FRAME_FLOW,
 };
 
 #[cfg(test)]
@@ -242,7 +244,7 @@ pub(super) fn build(
         ));
     }
 
-    let document = Document {
+    let mut document = Document {
         section,
         body,
         headers: final_headers.unwrap_or_default(),
@@ -254,6 +256,7 @@ pub(super) fn build(
         note_layout_settings,
         ..Document::default()
     };
+    report_nested_cell_frame_flow(&mut document, &mut budget)?;
     let mut revision_markup = facts
         .document_settings
         .as_ref()
@@ -283,6 +286,90 @@ pub(super) fn build(
         resources,
         revision_markup,
     })
+}
+
+/// Report the bounded native-cell projection from `story::project`, not a
+/// native Word positioning rule. The shared cell-flow consumer's evidence is
+/// DOCX-only; native nested-cell frames retain their facts without applying
+/// that placement. Mirror frames are already consumed by table positioning,
+/// and all other unsupported owners have failed before this final-body pass.
+///
+/// Scan only retained main-story tables after merge-continuation replacement:
+/// one fixed fact per final root body index avoids stale source coordinates
+/// and per-paragraph fan-out. O(retained table blocks), no text/run traversal
+/// or recursion. The reused borrowed stack and all diagnostic allocations are
+/// charged to the cumulative model budget; failure aborts the entire model,
+/// never an unreported fallback. A proven native placement consumer must
+/// deliberately update this limitation alongside the admission policy.
+fn report_nested_cell_frame_flow(
+    document: &mut Document,
+    budget: &mut ModelBudget,
+) -> Result<(), String> {
+    fn fixed_string(value: &str, budget: &mut ModelBudget) -> Result<String, String> {
+        budget.charge(value.len())?;
+        let mut result = String::new();
+        result
+            .try_reserve_exact(value.len())
+            .map_err(|_| "OUTPUT_TOO_LARGE".to_string())?;
+        budget.charge(result.capacity().saturating_sub(value.len()))?;
+        result.push_str(value);
+        Ok(result)
+    }
+
+    let Document {
+        body, diagnostics, ..
+    } = document;
+    let mut pending = Vec::new();
+    for (index, block) in body.iter().enumerate() {
+        let BodyElement::Table(root) = block else {
+            continue;
+        };
+        pending.clear();
+        budget.push(&mut pending, (root.as_ref(), false))?;
+        let mut has_frame = false;
+        'walk: while let Some((table, nested)) = pending.pop() {
+            for row in &table.rows {
+                for cell in &row.cells {
+                    for block in &cell.content {
+                        match block {
+                            CellElement::Paragraph(paragraph)
+                                if nested && paragraph.frame_pr.is_some() =>
+                            {
+                                has_frame = true;
+                                break 'walk;
+                            }
+                            CellElement::Table(child) => {
+                                budget.push(&mut pending, (child.as_ref(), true))?;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        if has_frame {
+            let code = fixed_string(
+                PARSE_DIAGNOSTIC_CODE_NATIVE_DOC_NESTED_CELL_FRAME_FLOW,
+                budget,
+            )?;
+            let part = fixed_string(
+                PARSE_DIAGNOSTIC_PART_NATIVE_DOC_NESTED_CELL_FRAME_FLOW,
+                budget,
+            )?;
+            let mut path = Vec::new();
+            budget.push(&mut path, index)?;
+            budget.push(
+                diagnostics,
+                ParseDiagnostic {
+                    code,
+                    severity: PARSE_DIAGNOSTIC_SEVERITY_NATIVE_DOC_NESTED_CELL_FRAME_FLOW,
+                    part,
+                    path,
+                },
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// MS-DOC §2.7.2 fRMPrint applies to markup anywhere in the document,
@@ -1029,6 +1116,14 @@ mod tests {
     }
 
     fn source_with_proofing(text: &str, no_proof: bool) -> Vec<u8> {
+        let mut chpx = vec![0x35, 0x08, 1];
+        if no_proof {
+            chpx.extend([0x75, 0x08, 1]);
+        }
+        source_with_direct_chpx(text, &chpx)
+    }
+
+    fn source_with_direct_chpx(text: &str, chpx: &[u8]) -> Vec<u8> {
         let source = source(text);
         let cfb = CompoundFile::open(&source).unwrap();
         let mut word = cfb.stream("WordDocument").unwrap();
@@ -1036,13 +1131,9 @@ mod tests {
         let bte = u32::from_le_bytes(word[0xfa..0xfe].try_into().unwrap()) as usize;
         let page_number = u32::from_le_bytes(table[bte + 8..bte + 12].try_into().unwrap()) as usize;
         let page = &mut word[page_number * 512..(page_number + 1) * 512];
-        let mut chpx = vec![0x35, 0x08, 1];
-        if no_proof {
-            chpx.extend([0x75, 0x08, 1]);
-        }
         page[8] = 32;
         page[64] = chpx.len() as u8;
-        page[65..65 + chpx.len()].copy_from_slice(&chpx);
+        page[65..65 + chpx.len()].copy_from_slice(chpx);
         build_scoped_cfb(&[("WordDocument", word), ("0Table", table)])
     }
 
@@ -2096,6 +2187,31 @@ mod tests {
                 .unwrap_err()
                 .contains("cyclic")
         );
+    }
+
+    #[test]
+    fn default_font_fixup_chpx_reaches_the_native_document_without_losing_text() {
+        let project = |chpx: &[u8]| {
+            let bytes = source_with_direct_chpx("عربي x\r", chpx);
+            super::super::direct_model(&CompoundFile::open(&bytes).unwrap(), 1024 * 1024)
+                .map(|result| serde_json::to_value(result.document).unwrap())
+        };
+        let baseline = project(&[0x35, 0x08, 1]).unwrap();
+        assert_eq!(body_outline(&baseline["body"]), ["p[t:عربي x]"]);
+        for value in [0, 1] {
+            assert_eq!(
+                project(&[0x35, 0x08, 1, 0x86, 0x2a, value]).unwrap(),
+                baseline
+            );
+        }
+        for value in [2, 4] {
+            assert!(project(&[0x86, 0x2a, value])
+                .unwrap_err()
+                .contains("unsupported formatting"));
+        }
+        assert!(project(&[0x86, 0x2a, 0x80])
+            .unwrap_err()
+            .contains("font fixup method"));
     }
 
     #[test]

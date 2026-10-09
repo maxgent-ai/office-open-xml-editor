@@ -70,6 +70,7 @@
 // {@link ./raster-or-metafile.ts}#decodeRasterOrMetafile, which sniffs the bytes and routes
 // true EMF here.
 
+import { decodeMetafileSymbolText } from '../fonts/metafile-symbol-encoding.js';
 import { decodeDib, blitDibToCtx, type DecodedDib } from './dib.js';
 import { colorRefToCss, isEmf } from './wmf.js';
 import { createAuxCanvas } from '../canvas/aux-canvas.js';
@@ -249,6 +250,7 @@ interface Brush {
 }
 interface Font {
   kind: 'font';
+  charset: number; // LOGFONT CharSet; SYMBOL_CHARSET uses a private font encoding
   height: number; // |lfHeight|, logical units
   weight: number; // lfWeight (400 normal, 700 bold)
   italic: boolean;
@@ -1612,6 +1614,9 @@ function readDibPatternBrush(c: EmfCursor, dv: DataView, recStart: number): [num
 /** EMR_EXTCREATEFONTINDIRECTW(82): u32 ihObject + LOGFONT (lfHeight,…,lfFaceName
  *  UTF-16 at LOGFONT offset 28). */
 function readCreateFont(c: EmfCursor, dv: DataView, recStart: number): [number, Font] {
+  // The handle and complete LOGFONTW (92 bytes) belong to this record. A short
+  // record cannot borrow charset/face fields from the next drawing operation.
+  if (c.remaining < 96) throw new RangeError('Truncated EMF LOGFONTW');
   const ih = c.u32();
   const lfBase = recStart + 12; // ihObject (4) after the 8-byte record header
   const lfHeight = dv.getInt32(lfBase, true);
@@ -1620,6 +1625,7 @@ function readCreateFont(c: EmfCursor, dv: DataView, recStart: number): [number, 
   const lfEscapement = dv.getInt32(lfBase + 8, true);
   const lfWeight = dv.getInt32(lfBase + 16, true);
   const lfItalic = dv.getUint8(lfBase + 20);
+  const charset = dv.getUint8(lfBase + 23);
   // lfFaceName: UTF-16, up to 32 code units, at LOGFONT offset 28.
   let face = '';
   for (let i = 0; i < 32; i++) {
@@ -1633,6 +1639,7 @@ function readCreateFont(c: EmfCursor, dv: DataView, recStart: number): [number, 
     ih,
     {
       kind: 'font',
+      charset,
       height: Math.abs(lfHeight),
       weight: lfWeight,
       italic: lfItalic !== 0,
@@ -1642,9 +1649,11 @@ function readCreateFont(c: EmfCursor, dv: DataView, recStart: number): [number, 
   ];
 }
 
-// ── text — EMR_EXTTEXTOUTW(84) ([MS-EMF] 2.3.5.2) ────────────────────────────
+// ── text — EMR_EXTTEXTOUTW(84) ([MS-EMF] 2.3.5.8) ────────────────────────────
 
 function drawText(s: PlayState, c: EmfCursor, dv: DataView, recStart: number): void {
+  const recEnd = c.pos + c.remaining;
+  if (c.remaining < 48) throw new RangeError('Truncated EMF text record');
   c.skip(16); // RECTL rclBounds (record offset 8..24)
   c.u32(); // iGraphicsMode
   c.f32(); // exScale
@@ -1654,8 +1663,17 @@ function drawText(s: PlayState, c: EmfCursor, dv: DataView, recStart: number): v
   const refY = c.i32();
   const nChars = c.u32();
   const offString = c.u32(); // BYTE offset from RECORD START to UTF-16 string
-  c.u32(); // fOptions
+  const options = c.u32(); // fOptions
+  // MS-EMF 2.2.5 / 2.1.11: ETO_NO_RECT omits the optional 16-byte rectangle,
+  // moving offDx and the minimum string offset earlier in the record.
+  const headerSize = options & 0x100 ? 60 : 76;
+  if (recStart + headerSize > recEnd) throw new RangeError('Truncated EMF text header');
   if (nChars <= 0 || nChars > 0x10000) return;
+  // MS-EMF 2.2.5 offsets address data inside the containing record. Do not
+  // normalize a truncated string using unrelated bytes from following records.
+  if (offString < headerSize || recStart + offString + nChars * 2 > recEnd) {
+    throw new RangeError('Truncated EMF text string');
+  }
   // Read nChars UTF-16LE code units at recStart + offString.
   let str = '';
   for (let i = 0; i < nChars; i++) {
@@ -1666,6 +1684,23 @@ function drawText(s: PlayState, c: EmfCursor, dv: DataView, recStart: number): v
   if (str.length === 0) return;
 
   const font = s.curFont;
+  let symbolNormalized = false;
+  if (font?.charset === 2 && /[\uf000-\uf0ff]/.test(str)) {
+    // MS-EMF 2.3.5.8 carries UTF-16. Windows symbol-font cmap entries occupy
+    // F000..F0FF (OpenType cmap, Windows encoding 0): normalize those private
+    // entries only, never ordinary Unicode
+    // text under an ANSI font. Unmapped repertoires retain compatibility drawing
+    // with an explicit incompleteness report, enabling strict callers to refuse.
+    const normalized = options === 0 ? decodeMetafileSymbolText(str, font.face, true) : null;
+    if (normalized === null) unsupportedDrawing(s, 'EMR_EXTTEXTOUTW (unsupported symbol encoding)');
+    else { str = normalized; symbolNormalized = true; }
+    // This player still draws a whole string in one Canvas call. MS-EMF 2.2.5
+    // Dx advances can change multi-character positions even after the encoding
+    // is correct; preserve compatibility drawing but expose that remaining gap.
+    if (symbolNormalized && nChars > 1 && dv.getUint32(recStart + headerSize - 4, true) !== 0) {
+      unsupportedDrawing(s, 'EMR_EXTTEXTOUTW (symbol character advances)');
+    }
+  }
   // Font height is in logical units: world→page (worldScaleY), page→device
   // (|pageScaleY|, 1 under MM_TEXT), then device→target (deviceScaleY).
   const px =
@@ -1680,7 +1715,7 @@ function drawText(s: PlayState, c: EmfCursor, dv: DataView, recStart: number): v
   ctx.fillStyle = s.textColor;
   const weight = font && font.weight >= 700 ? 'bold ' : '';
   const italic = font?.italic ? 'italic ' : '';
-  ctx.font = `${italic}${weight}${px}px ${font?.face || 'sans-serif'}`;
+  ctx.font = `${italic}${weight}${px}px ${symbolNormalized ? 'serif' : font?.face || 'sans-serif'}`;
 
   // SETTEXTALIGN: low 2 bits horizontal. TA_LEFT(0), TA_RIGHT(2), TA_CENTER(6).
   const horiz = s.textAlign & 0x6;
@@ -2553,7 +2588,9 @@ function replayRecords(
  * ({@link renderEmfToBitmap} → `decodeRasterOrMetafile`). `unsupported` names,
  * once each, the content the player could not reproduce: unimplemented drawing
  * records, EMF+ content of an EMF+-only file that failed validation, and
- * damaged or malformed records. An empty list means the picture is complete.
+ * damaged or malformed records. An empty list means no omission was detected;
+ * it does not prove full fidelity (ordinary text advances, for example, are
+ * still drawn with Canvas spacing).
  * The bitmap is what playback drew around those gaps (`null` when nothing
  * drew); a caller decides whether that partial picture is acceptable.
  */

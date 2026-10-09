@@ -201,6 +201,28 @@ impl Properties {
                 let side = usize::from(code - 0xc64e);
                 self.borders[side] = Some(Border::paragraph(&operand[1..], false, side)?);
             }
+            0xc645 => {
+                // MS-DOC 2.9.159-160: NumRM stores the *previous* numbering
+                // when revision tracking began, independently of the current
+                // list properties. An empty prior state has no old marker to
+                // render: fNumRM=0, no placeholders and empty xst. Author/date,
+                // ignored bytes and unused history slots do not create one.
+                // Current-content viewer policy omits this empty prior-display
+                // metadata; it does not assert that no revision exists.
+                // Nonempty history remains unsupported because the shared
+                // model cannot display numbering revisions.
+                if operand.len() != 129 || operand[0] != 128 {
+                    return Err(unsupported("invalid Word numbering revision operand"));
+                }
+                let previously_numbered = bool8(operand[1])?;
+                let length = u16_at(operand, 65)?;
+                if length > 31 {
+                    return Err(unsupported("invalid Word numbering revision string length"));
+                }
+                return Ok(!previously_numbered
+                    && length == 0
+                    && operand[9..18].iter().all(|value| *value == 0));
+            }
             0xc60d | 0xc615 => self.tabs.apply(operand, code == 0xc615)?,
             0x6412 => {
                 let line = signed(operand)?;
@@ -436,6 +458,38 @@ mod tests {
 
     fn raw_border(value: &serde_json::Value, side: &str) -> serde_json::Value {
         value["__paragraphTypographyAcquisition"]["borders"][side]["val"]["raw"].clone()
+    }
+
+    #[test]
+    fn empty_numbering_revision_has_no_prior_marker_but_active_history_stays_unsupported() {
+        let mut operand = [0u8; 129];
+        operand[0] = 128;
+        // Ignored fields, revision author/date and unused history slots do
+        // not create a displayed marker when fNumRM and xst are empty.
+        operand[2] = 0xff;
+        operand[3..9].fill(0xa5);
+        operand[18..65].fill(0xa5);
+        operand[67..].fill(0xa5);
+        let mut properties = Properties::default();
+        let baseline = projected(&properties);
+        assert!(properties.apply(0xc645, &operand).unwrap());
+        assert_eq!(projected(&properties), baseline);
+        operand[1] = 1;
+        assert!(!properties.apply(0xc645, &operand).unwrap());
+        operand[1] = 0;
+        operand[9] = 1;
+        assert!(!properties.apply(0xc645, &operand).unwrap());
+        operand[9] = 0;
+        operand[65] = 1;
+        assert!(!properties.apply(0xc645, &operand).unwrap());
+        operand[65] = 0;
+        operand[1] = 2;
+        assert!(properties.apply(0xc645, &operand).is_err());
+        operand[1] = 0;
+        operand[0] = 127;
+        assert!(properties.apply(0xc645, &operand).is_err());
+        operand[0] = 128;
+        assert!(properties.apply(0xc645, &operand[..128]).is_err());
     }
 
     #[test]
