@@ -1333,6 +1333,83 @@ mod tests {
     }
 
     #[test]
+    fn obsolete_table_style_complex_script_color_does_not_create_presence() {
+        let mut formatting = observed_table_style_formatting();
+        formatting.configure_table_styles(0x0112, true);
+        formatting.styles[0]
+            .as_mut()
+            .unwrap()
+            .table
+            .as_mut()
+            .unwrap()
+            .chpx = leaked(
+            [
+                &[0x42, 0x2a, 6, 0x60, 0x4a, 9, 0][..],
+                ccnf(table_style_condition::FIRST_ROW, &[0x60, 0x4a, 9, 0]).as_slice(),
+            ]
+            .concat(),
+        );
+        assert_eq!(
+            formatting.table_style_selector_profile(Some(0)).unwrap().2,
+            0
+        );
+        let run = formatting
+            .direct_text_run(7, table_key(0), 0, 0, &[], "x".into())
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.color.as_deref(), Some("ff0000"));
+        assert!(!formatting.unsupported_character_properties);
+
+        let mut unknown = observed_table_style_formatting();
+        unknown.configure_table_styles(0x0112, true);
+        unknown.styles[0]
+            .as_mut()
+            .unwrap()
+            .table
+            .as_mut()
+            .unwrap()
+            .chpx = leaked(ccnf(table_style_condition::FIRST_ROW, &[0x60, 0x4a, 9, 1]));
+        unknown.table_style_selector_profile(Some(0)).unwrap();
+        assert!(unknown.unsupported_character_properties);
+    }
+
+    #[test]
+    fn obsolete_table_style_color_preserves_supported_conditional_color() {
+        let mut formatting = observed_table_style_formatting();
+        formatting.configure_table_styles(0x0112, true);
+        formatting.styles[0]
+            .as_mut()
+            .unwrap()
+            .table
+            .as_mut()
+            .unwrap()
+            .chpx = leaked(ccnf(
+            table_style_condition::FIRST_ROW,
+            &[0x70, 0x68, 0x12, 0x34, 0x56, 0, 0x60, 0x4a, 9, 0],
+        ));
+        let key = TableFormattingKey {
+            selected_style: 0,
+            matches: [
+                None,
+                None,
+                None,
+                Some(table_style_condition::FIRST_ROW),
+                None,
+            ],
+        };
+        let run = formatting
+            .direct_text_run(7, Some(key), 0, 0, &[], "x".into())
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.color.as_deref(), Some("123456"));
+        assert_eq!(
+            formatting.table_style_selector_profile(Some(0)).unwrap().2,
+            table_style_condition::FIRST_ROW
+        );
+        assert!(!formatting.unsupported_character_properties);
+    }
+
+    #[test]
     fn table_chpx_absolute_size_inherits_and_direct_size_wins_for_run_and_mark() {
         let mut formatting = observed_table_style_formatting();
         for (id, half_points) in [(0, 28), (1, 36), (3, 44), (4, 44), (5, 28)] {

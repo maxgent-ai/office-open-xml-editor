@@ -725,6 +725,27 @@ impl Properties {
                         .to_string(),
                 )
             }
+            0x4a60 => {
+                // [MS-DOC] 2.6.1 sprmCIcoBi, implementation note 147:
+                // later Word does not use this Word 97 complex-script color.
+                // Our current-Word projection keeps the ordinary CIco/CCv
+                // color route, without emulating the historical color axis.
+                // The SPRM frame is two bytes, while 2.9.119 Ico is a byte
+                // palette index below 0x11. Admit only the zero-extended
+                // subset; a nonzero high byte is an unsupported encoding,
+                // not a normatively reserved byte that may be masked away.
+                // Inert success must not author color or sparse presence.
+                let [index, high] = operand else {
+                    return Err(unsupported("invalid Word compatibility color operand"));
+                };
+                if *high != 0 {
+                    return Ok(false);
+                }
+                if usize::from(*index) >= ICO_COLORS.len() {
+                    return Err(unsupported("invalid Word complex-script palette index"));
+                }
+                return Ok(true);
+            }
             0x286f => {
                 // MS-DOC 2.6.1 sprmCIdctHint. 0xFF is an explicit absence of
                 // guidance and therefore cancels an inherited ST_Hint value.
@@ -963,6 +984,23 @@ mod tests {
         assert_eq!(run(&value, &[]).color.as_deref(), Some("ff0000"));
         value.reset_to(&style, false);
         assert_eq!(run(&value, &[]).color.as_deref(), Some("0000ff"));
+    }
+
+    #[test]
+    fn obsolete_complex_script_palette_is_inert_for_current_word_color() {
+        let base = Properties::default();
+        let mut value = base.clone();
+        value.apply(0x6870, &[0x12, 0x34, 0x56, 0], &base).unwrap();
+        assert!(value.apply(0x4a60, &[9, 0], &base).unwrap());
+        assert!(value.apply(0x4a60, &[16, 0], &base).unwrap());
+        assert_eq!(run(&value, &[]).color.as_deref(), Some("123456"));
+        value.apply(0x2a42, &[6], &base).unwrap();
+        assert!(value.apply(0x4a60, &[0, 0], &base).unwrap());
+        assert_eq!(run(&value, &[]).color.as_deref(), Some("ff0000"));
+        assert!(!value.apply(0x4a60, &[9, 1], &base).unwrap());
+        assert!(value.apply(0x4a60, &[17, 0], &base).is_err());
+        assert!(value.apply(0x4a60, &[9], &base).is_err());
+        assert!(value.apply(0x4a60, &[9, 0, 0], &base).is_err());
     }
 
     #[test]
