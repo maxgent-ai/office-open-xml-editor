@@ -22,7 +22,7 @@ import type {
   TextShapeRequest,
   TextShapeSpan,
 } from '../layout/text.js';
-import { calcEffectiveFontPx, EAST_ASIAN_RE, assertTextShapeRunContext, independentTextShapeRequest, sliceTextShapeRequest, registeredLatinMarkGraphemeCandidate } from '../layout/text.js';
+import { calcEffectiveFontPx, EAST_ASIAN_RE, assertTextShapeRunContext, independentTextShapeRequest, sliceTextShapeRequest, registeredLatinMarkGraphemeCandidate, registeredLatinSlotRunCandidate, registeredLatinSingleSeamCandidate } from '../layout/text.js';
 import {
   referenceFontAverageWidthRatio,
   referenceFontLineMetrics,
@@ -776,6 +776,38 @@ export function finalizeBuiltSegments(
     }
   }
 
+  // A formatting seam on either side of an authored optional marker is not
+  // an ordinary break. Keep the word joined; the discretionary consumer
+  // decides both the opportunity and the conditional glyph's measured cost.
+  for (let index = 0; index < segs.length; index += 1) {
+    const marker = segs[index];
+    if (!('text' in marker)) continue;
+    const inlineEndpoint = marker.optionalHyphenBreaks?.at(-1)?.offset === marker.text.length;
+    if (!marker.optionalHyphen && !inlineEndpoint) continue;
+    const previous = segs[index - 1];
+    const next = segs[index + 1];
+    if (marker.optionalHyphen && previous && 'text' in previous && !/\s$/u.test(previous.text)) marker.joinPrev = true;
+    if (next && 'text' in next && !/^\s/u.test(next.text)) next.joinPrev = true;
+  }
+  // Mark each complete joined word once, avoiding a lookahead scan for every
+  // ordinary word or formatting seam in the paragraph.
+  for (let start = 0; start < segs.length;) {
+    const first = segs[start];
+    if (!('text' in first)) { start++; continue; }
+    let end = start + 1;
+    let optional = first.optionalHyphen !== undefined || Boolean(first.optionalHyphenBreaks?.length);
+    while (end < segs.length) {
+      const next = segs[end];
+      if (!('text' in next) || !next.joinPrev) break;
+      optional ||= next.optionalHyphen !== undefined || Boolean(next.optionalHyphenBreaks?.length);
+      end++;
+    }
+    if (optional) for (let index = start; index < end; index++) {
+      (segs[index] as LayoutTextSeg).optionalHyphenWord = true;
+    }
+    start = end;
+  }
+
   retainHorizontalPunctuationInkClearance(segs);
 }
 
@@ -1307,25 +1339,73 @@ function emitResolvedTextSegment(
   } = frame;
   let textShapeRequest = initialTextShapeRequest;
   let shaped = initialShape;
-  // A single physical grapheme may retain several semantic rFonts slots.
+  // One physical grapheme or single-seam Latin word piece retains semantic slots.
   // Both ordinary slots use the same allocation policy only in the explicit
   // absence of character grid, spacing/scaling and atomic/transformed units.
   // The text service separately proves exact registered face and cmap cover.
-  if (!authoritativeSpan && shaped && shaped.spans.length > 1
-    && registeredLatinMarkGraphemeCandidate(text)
-    && environment.characterGridActive === false && environment.verticalCJK !== true
+  const hasSlotSeam = !authoritativeSpan && shaped !== undefined && shaped.spans.length > 1;
+  const joinGrapheme = hasSlotSeam && registeredLatinMarkGraphemeCandidate(text);
+  const joinLatin = hasSlotSeam && registeredLatinSingleSeamCandidate(shaped!.spans)
+    && textShapeRequest.kerning === true && registeredLatinSlotRunCandidate(text);
+  const uniformAllocation = environment.characterGridActive === false && environment.verticalCJK !== true
     && environment.paragraphRtl === false
     && !rtl && !ruby && fitTextRegionIndex === undefined
     && !base.smallCaps && !base.allCaps && !effectiveVertAlign
     && (effectiveCharacterSpacing == null || effectiveCharacterSpacing === 0)
     && (effectiveCharacterScale == null || effectiveCharacterScale === 1)
     && !mappedSymbolUnicode && !compressCharacterWhitespace
-    && (r.fontHint == null || r.fontHint === 'default')) {
-    const compoundRequest = Object.freeze({ ...textShapeRequest, joinRegisteredGrapheme: true });
+    && (r.fontHint == null || r.fontHint === 'default');
+  if (!authoritativeSpan && shaped && shaped.spans.length > 1 && (joinGrapheme || joinLatin)
+    && uniformAllocation) {
+    // `text` is one splitTextForLayout piece, including its pure trailing
+    // U+0020 sequence. That separator is not a second WORD slot seam; the full
+    // piece still shares the uniform allocation/face/cmap proof. This is never
+    // a new run/line merge. Authored paint/atomic and differing policies split.
+    const compoundRequest = Object.freeze({ ...textShapeRequest,
+      ...(joinGrapheme ? { joinRegisteredGrapheme: true } : { joinRegisteredLatinSlots: true }),
+    });
     const compound = environment.layoutServices?.text.shape(compoundRequest);
     if (compound?.spans.length === 1 && compound.spans[0]?.semanticSlotSpans) {
       shaped = compound;
-      textShapeRequest = compoundRequest;
+      textShapeRequest = compoundRequest.joinRegisteredLatinSlots === true
+        ? Object.freeze({ ...compoundRequest, registeredLatinPieceText: text })
+        : compoundRequest;
+    }
+  }
+  // ASCII Latin base + marks followed only by U+0020, when the whole piece was
+  // not adopted above (kerning off, or a peer covering the body but not the
+  // separator). Prove the body alone through the existing joinRegisteredGrapheme
+  // gate; the separator stays its own span. The initial push already consumed
+  // this piece's scope range, so: the body is emitted directly (pushSegmentPiece
+  // would rebuild its request and drop admission); the tail is pushed exactly
+  // as the multi-span loop below would push it (context given, no cursor move).
+  // Cross-word pair probes still require their own whole face/cmap proof.
+  // Any decline falls through to that unchanged loop with the original shape.
+  const markBody = !authoritativeSpan && uniformAllocation && !cs && shaped && shaped.spans.length > 1
+    ? /^([A-Za-z]\p{M}+)( +)$/u.exec(text) : null;
+  const tailSpan = markBody ? shaped!.spans[shaped!.spans.length - 1] : undefined;
+  if (markBody && tailSpan && registeredLatinMarkGraphemeCandidate(markBody[1]!)
+    && tailSpan.text === markBody[2] && tailSpan.start === markBody[1]!.length
+    && tailSpan.end === text.length
+    && (tailSpan.script === 'ascii' || tailSpan.script === 'highAnsi')) {
+    const body = markBody[1]!;
+    const bodyRequest: TextShapeRequest = Object.freeze({
+      ...sliceTextShapeRequest(textShapeRequest, 0, body.length),
+      joinRegisteredGrapheme: true,
+      joinRegisteredLatinSlots: undefined,
+    });
+    const bodyShape = environment.layoutServices?.text.shape(bodyRequest);
+    if (bodyShape?.spans.length === 1 && bodyShape.spans[0]?.semanticSlotSpans) {
+      emitResolvedTextSegment(emissionState, {
+        ...frame, text: body, textShapeRequest: bodyRequest, shaped: bodyShape,
+      });
+      pushSegmentPiece(
+        emissionState, tailSpan.text, false,
+        tailSpan.script === 'highAnsi' ? highAnsiFontFamily : base.fontFamily,
+        tailSpan, false, mappedSymbolUnicode,
+        sliceTextShapeRequest(textShapeRequest, tailSpan.start, tailSpan.end).substituteContext,
+      );
+      return;
     }
   }
   const resolvedAxisDiffers =
@@ -1624,6 +1704,22 @@ function appendRunsToSegments(
     const emittedStart = segs.length;
     if (run.type === 'text') {
       const t = run as unknown as DocxTextRun & { type: 'text' };
+      if ((run as ParagraphTextBearingRun).optionalHyphen === true) {
+        // §17.3.3.29: acquire the conditional hyphen through the ordinary
+        // font/shape/paint route, retaining its own run rather than borrowing
+        // either neighbor. Its empty source marker contributes no geometry
+        // unless the breaker chooses this authored boundary.
+        appendTextPiece(segmentBuildContext, '-', t, t.vertAlign ?? null, runIndex,
+          { text: '-', offset: 0 });
+        for (let index = emittedStart; index < segs.length; index += 1) {
+          const glyph = segs[index];
+          if (!('text' in glyph)) throw new Error('An optional hyphen lost its text authority');
+          segs[index] = { ...glyph, text: '', metricOnly: true,
+            optionalHyphen: Object.freeze({ ...glyph }), measuredWidth: 0,
+            sourceRunIndex: runIndex };
+        }
+        continue;
+      }
       if ((run as ParagraphTextBearingRun).noteSeparatorCharacter !== undefined) {
         // MS-DOC 2.3.3 reserved separator character: the U+0003/U+0004 rule
         // control or its story's content paragraph mark. Neither has a glyph
@@ -1962,14 +2058,39 @@ function appendRunsToSegments(
         snapToCharacterGrid: false,
       });
     }
+    let sequenceOffset = 0;
+    let markerIndex = 0;
     for (let index = emittedStart; index < segs.length; index += 1) {
       const segment = segs[index];
       segment.sourceRunIndex = runIndex;
       if (sequence) {
         segment.sourceTextSequence = sequence.sources;
-        segment.sourceTextOffset = 'text' in segment
-          ? segment.textShapeRequest?.substituteContext?.offset ?? 0
+        // Authored optional controls need the displayed source sweep even
+        // when no shaping service is installed. Sequences without controls
+        // retain their existing anchor projection unchanged.
+        segment.sourceTextOffset = sequence.optionalHyphens.length > 0 ? sequenceOffset
+          : 'text' in segment ? segment.textShapeRequest?.substituteContext?.offset ?? 0
           : segment.sourceTextOffset ?? 0;
+        const end = sequenceOffset + ('text' in segment ? segment.text.length : 'isTab' in segment ? 1 : 0);
+        if ('text' in segment) {
+          const opportunities: NonNullable<LayoutTextSeg['optionalHyphenBreaks']>[number][] = [];
+          while (markerIndex < sequence.optionalHyphens.length
+            && sequence.optionalHyphens[markerIndex]!.offset <= end) {
+            const marker = sequence.optionalHyphens[markerIndex++]!;
+            const glyphs: LayoutSeg[] = [];
+            appendTextPiece({ ...segmentBuildContext, segs: glyphs }, '-', marker.run,
+              marker.run.vertAlign ?? null, marker.runIndex, { text: '-', offset: 0 });
+            if (glyphs.length !== 1 || !('text' in glyphs[0]!)) {
+              throw new Error('An optional hyphen lost its single conditional glyph');
+            }
+            const glyph = glyphs[0] as LayoutTextSeg;
+            glyph.sourceRunIndex = marker.runIndex;
+            opportunities.push(Object.freeze({ offset: marker.offset - sequenceOffset,
+              glyph: Object.freeze(glyph) }));
+          }
+          if (opportunities.length) segment.optionalHyphenBreaks = Object.freeze(opportunities);
+        }
+        sequenceOffset = end;
       }
     }
   }

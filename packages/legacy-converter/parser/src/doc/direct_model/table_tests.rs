@@ -108,7 +108,7 @@ fn body_table_source(text: &str) -> Vec<u8> {
     )
 }
 
-fn with_piece_prc(source: &[u8], prc: &[u8], data: &[u8]) -> Vec<u8> {
+pub(super) fn with_piece_prc(source: &[u8], prc: &[u8], data: &[u8]) -> Vec<u8> {
     with_piece_prc_and_prm(source, prc, data, 1)
 }
 
@@ -558,6 +558,443 @@ fn retained_tistd_does_not_bypass_the_existing_style_projection_gate() {
     let error =
         super::super::direct_model(&CompoundFile::open(&bytes).unwrap(), 1_000_000).unwrap_err();
     assert!(error.contains("unsupported formatting"), "{error}");
+}
+
+fn cell_border_assignment(sides: u8, border: [u8; 8]) -> Vec<u8> {
+    let mut operand = vec![11, 0, 1, sides];
+    operand.extend(border);
+    sprm(0xd62f, &operand, false)
+}
+
+fn cell_border_tc80_row(border: [u8; 4]) -> Vec<u8> {
+    let mut definition = vec![26, 0, 1, 0, 0, 0xe8, 3, 0, 0, 0, 0];
+    for _ in 0..4 {
+        definition.extend(border);
+    }
+    [
+        cell(),
+        sprm(0x2417, &[1], false),
+        sprm(0xd608, &definition, false),
+    ]
+    .concat()
+}
+
+/// Fill the existing fixture's empty style slot with a red table border.
+fn with_cell_border_style_border(source: &[u8], border: [u8; 8]) -> Vec<u8> {
+    let cfb = CompoundFile::open(source).unwrap();
+    let mut word = cfb.stream("WordDocument").unwrap();
+    let mut table = cfb.stream("0Table").unwrap();
+    let offset = u32::from_le_bytes(word[0xa2..0xa6].try_into().unwrap()) as usize;
+    let length = u32::from_le_bytes(word[0xa6..0xaa].try_into().unwrap()) as usize;
+    let mut stylesheet = table[offset..offset + length].to_vec();
+    let normal = 2 + u16::from_le_bytes(stylesheet[..2].try_into().unwrap()) as usize;
+    let slot = normal
+        + 2
+        + u16::from_le_bytes(stylesheet[normal..normal + 2].try_into().unwrap()) as usize;
+    assert_eq!(&stylesheet[slot..slot + 2], &[0, 0]);
+    let mut borders = vec![48];
+    for _ in 0..6 {
+        borders.extend(border);
+    }
+    let tapx = sprm(0xd613, &borders, false);
+    let mut style = vec![0; 14];
+    style[2..4].copy_from_slice(&0xfff3u16.to_le_bytes());
+    style[4..6].copy_from_slice(&3u16.to_le_bytes());
+    for set in [tapx.as_slice(), &[][..], &[][..]] {
+        style.extend((set.len() as u16).to_le_bytes());
+        style.extend(set);
+        if set.len() % 2 != 0 {
+            style.push(0);
+        }
+    }
+    let size = style.len() as u16;
+    style[6..8].copy_from_slice(&size.to_le_bytes());
+    stylesheet.splice(
+        slot..slot + 2,
+        [size.to_le_bytes().as_slice(), &style].concat(),
+    );
+    word[0xa2..0xa6].copy_from_slice(&(table.len() as u32).to_le_bytes());
+    word[0xa6..0xaa].copy_from_slice(&(stylesheet.len() as u32).to_le_bytes());
+    table.extend(stylesheet);
+    build_scoped_cfb(&[("WordDocument", word), ("0Table", table)])
+}
+
+fn cell_border_source(mut row_properties: Vec<u8>, styled: bool) -> Vec<u8> {
+    let source = body_table_source("x\u{7}\u{7}\r");
+    if row_properties.len().is_multiple_of(2) {
+        row_properties.extend(cell());
+    }
+    let source = with_papx(
+        &source,
+        &[(0, 2, cell()), (2, 3, row_properties), (3, 4, Vec::new())],
+    );
+    if styled {
+        with_cell_border_style_border(&source, [0xff, 0, 0, 0, 8, 1, 0, 0])
+    } else {
+        source
+    }
+}
+
+fn cell_border_document(
+    row_properties: Vec<u8>,
+    styled: bool,
+) -> Result<docx_model::Document, String> {
+    let source = cell_border_source(row_properties, styled);
+    super::super::direct_model(&CompoundFile::open(&source).unwrap(), 1_000_000)
+        .map(|result| result.document)
+}
+
+#[test]
+fn cell_border_superseded_complete_assignment_matches_drawn_and_nil_controls() {
+    // MS-DOC 2.4.6 and 2.9.305: a complete later direct assignment owns
+    // every field on the selected edges. This does not decode a winning FF.
+    for (replacement, expected_style, unresolved) in [
+        (
+            [0, 0, 0xff, 0, 24, 1, 0, 0],
+            "single",
+            [0, 0, 0, 0, 8, 0xff, 0, 0],
+        ),
+        ([0xff; 8], "nil", [0, 0, 0, 0, 8, 0xff, 0, 0]),
+        (
+            [0, 0, 0xff, 0, 24, 1, 0, 0],
+            "single",
+            [0, 0, 0, 0, 31, 0xff, 0, 0],
+        ),
+        // cvAuto ignores its RGB bytes; FF width zero remains in its valid domain.
+        (
+            [0, 0, 0xff, 0, 24, 1, 0, 0],
+            "single",
+            [1, 2, 3, 0xff, 0, 0xff, 0, 0],
+        ),
+        // Exact Nil must precede ordinary COLORREF and width validation.
+        (
+            [0, 0, 0, 1, 0xff, 0xff, 0xff, 0xff],
+            "nil",
+            [0, 0, 0, 0, 8, 0xff, 0, 0],
+        ),
+    ] {
+        // MS-DOC 2.9.16 requires width < 32 for types >= 0x40.
+        let unresolved = cell_border_assignment(0x0f, unresolved);
+        let later = cell_border_assignment(0x0f, replacement);
+        let control = cell_border_document([row(1000), later.clone()].concat(), false).unwrap();
+        let BodyElement::Table(table) = &control.body[0] else {
+            panic!("table")
+        };
+        let top = table.rows[0].cells[0].borders.top.as_ref().unwrap();
+        assert_eq!(top.style, expected_style);
+        if expected_style == "single" {
+            assert_eq!(top.color.as_deref(), Some("0000ff"));
+        }
+        let actual =
+            cell_border_document([row(1000), unresolved.clone(), later].concat(), false).unwrap();
+        assert_eq!(
+            serde_json::to_value(actual).unwrap(),
+            serde_json::to_value(control).unwrap()
+        );
+    }
+}
+
+#[test]
+fn cell_border_superseded_leaves_winning_and_partially_replaced_owners_gated() {
+    let unresolved = cell_border_assignment(0x03, [0, 0, 0, 0, 8, 0xff, 0, 0]);
+    let complete = cell_border_assignment(0x03, [0xff, 0, 0, 0, 8, 1, 0, 0]);
+    let top_only = cell_border_assignment(0x01, [0xff, 0, 0, 0, 8, 1, 0, 0]);
+    for properties in [
+        [row(1000), unresolved.clone()].concat(),
+        [row(1000), complete, unresolved.clone()].concat(),
+        [row(1000), unresolved.clone(), unresolved.clone()].concat(),
+        [row(1000), unresolved, top_only].concat(),
+    ] {
+        assert!(cell_border_document(properties, false).is_err());
+    }
+
+    // Replacing one cell must not discharge the neighbouring cell's owner.
+    let source = body_table_source("x\u{7}y\u{7}\u{7}\r");
+    let project = |properties: Vec<u8>| {
+        let mut properties = properties;
+        if properties.len().is_multiple_of(2) {
+            properties.extend(cell());
+        }
+        let bytes = with_papx(
+            &source,
+            &[
+                (0, 2, cell()),
+                (2, 4, cell()),
+                (4, 5, properties),
+                (5, 6, Vec::new()),
+            ],
+        );
+        super::super::direct_model(&CompoundFile::open(&bytes).unwrap(), 1_000_000)
+            .map(|result| result.document)
+    };
+    let two_cells = [
+        cell(),
+        sprm(0x2417, &[1], false),
+        sprm(0x7621, &[0, 2, 0xe8, 3], false),
+    ]
+    .concat();
+    let assignment = |limit, border: [u8; 8]| {
+        let mut operand = vec![11, 0, limit, 1];
+        operand.extend(border);
+        sprm(0xd62f, &operand, false)
+    };
+    let both_ff = assignment(2, [0, 0, 0, 0, 8, 0xff, 0, 0]);
+    let one_red = assignment(1, [0xff, 0, 0, 0, 8, 1, 0, 0]);
+    assert!(project([two_cells.clone(), both_ff.clone(), one_red].concat()).is_err());
+    let both_red = assignment(2, [0xff, 0, 0, 0, 8, 1, 0, 0]);
+    let control = project([two_cells.clone(), both_red.clone()].concat()).unwrap();
+    let BodyElement::Table(table) = &control.body[0] else {
+        panic!("table")
+    };
+    assert_eq!(table.rows[0].cells.len(), 2);
+    assert!(table.rows[0].cells.iter().all(|cell| cell
+        .borders
+        .top
+        .as_ref()
+        .unwrap()
+        .color
+        .as_deref()
+        == Some("ff0000")));
+    let actual = project([two_cells, both_ff, both_red].concat()).unwrap();
+    assert_eq!(
+        serde_json::to_value(actual).unwrap(),
+        serde_json::to_value(control).unwrap()
+    );
+}
+
+#[test]
+fn cell_border_superseded_tistd_resets_only_the_prepared_direct_layer() {
+    let unresolved = cell_border_assignment(0x0f, [0, 0, 0, 0, 8, 0xff, 0, 0]);
+    let reset = sprm(0x563a, &1u16.to_le_bytes(), false);
+    let control = cell_border_document([row(1000), reset.clone()].concat(), true).unwrap();
+    let BodyElement::Table(table) = &control.body[0] else {
+        panic!("table")
+    };
+    assert_eq!(
+        table.rows[0].cells[0]
+            .borders
+            .top
+            .as_ref()
+            .unwrap()
+            .color
+            .as_deref(),
+        Some("ff0000")
+    );
+    let actual = cell_border_document(
+        [row(1000), unresolved.clone(), reset.clone()].concat(),
+        true,
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(actual).unwrap(),
+        serde_json::to_value(control).unwrap()
+    );
+
+    // TC80 is outside that resettable layer; the existing styled-TC80 gate
+    // and unrelated malformed property refusals cannot be cleared by TIstd.
+    assert!(cell_border_document(
+        [
+            cell_border_tc80_row([8, 1, 6, 0]),
+            unresolved.clone(),
+            reset.clone(),
+        ]
+        .concat(),
+        true
+    )
+    .is_err());
+    let mut undefined_row_border = vec![48];
+    for _ in 0..6 {
+        undefined_row_border.extend([0, 0, 0, 0, 8, 2, 0, 0]);
+    }
+    assert!(cell_border_document(
+        [
+            row(1000),
+            sprm(0xd613, &undefined_row_border, false),
+            unresolved,
+            reset,
+        ]
+        .concat(),
+        true
+    )
+    .is_err());
+}
+
+#[test]
+fn cell_border_superseded_does_not_excuse_invalid_earlier_operands() {
+    let valid = vec![11, 0, 1, 1, 0, 0, 0, 0, 8, 0xff, 0, 0];
+    let mut range = valid.clone();
+    range[2] = 2;
+    let mut reversed = valid.clone();
+    reversed[1] = 1;
+    reversed[2] = 0;
+    let mut sides = valid.clone();
+    sides[3] = 0x40;
+    let mut cb = valid.clone();
+    cb[0] = 10;
+    let mut color = valid.clone();
+    color[7] = 1;
+    let mut kind = valid.clone();
+    kind[9] = 2;
+    let mut width = valid.clone();
+    width[8] = 32;
+    let later = cell_border_assignment(1, [0xff, 0, 0, 0, 8, 1, 0, 0]);
+    cell_border_document([row(1000), later.clone()].concat(), false).unwrap();
+    for (operand, reason) in [
+        (range, "cell range outside row"),
+        (reversed, "cell range outside row"),
+        (sides, "unsupported formatting"),
+        (cb.clone(), "truncated Word integer"),
+        (color, "invalid Word COLORREF"),
+        (kind, "undefined Word border type 0x02"),
+        (width, "invalid Word ignored border width"),
+    ] {
+        let error = cell_border_document(
+            [row(1000), sprm(0xd62f, &operand, false), later.clone()].concat(),
+            false,
+        )
+        .expect_err("invalid earlier assignment must refuse");
+        assert!(error.contains(reason), "{reason}: {error}");
+    }
+    // A truncated operand needs its own acquisition boundary: concatenating
+    // another Prl could supply its missing bytes from that Prl's opcode.
+    let mut direct = crate::doc::table::Row::default();
+    direct.apply(0x7621, &[0, 1, 0xe8, 3]).unwrap();
+    for operand in [&valid[..10], cb.as_slice()] {
+        let error = direct
+            .apply_style_aware_borders(0xd62f, operand)
+            .unwrap_err();
+        assert!(
+            error.contains("invalid Word cell border operand length"),
+            "{error}"
+        );
+    }
+    // Exact Nil is independently valid, not an ordinary FF with invalid
+    // COLORREF. The full-container Nil replacement positive above exercises it.
+}
+
+#[test]
+fn cell_border_superseded_keeps_row_old_tc80_and_style_carriers_gated() {
+    let ff = [0, 0, 0, 0, 8, 0xff, 0, 0];
+    let mut array = vec![48];
+    for _ in 0..6 {
+        array.extend(ff);
+    }
+    let later = cell_border_assignment(0x0f, [0xff, 0, 0, 0, 8, 1, 0, 0]);
+    let mut valid_array = vec![48];
+    for _ in 0..6 {
+        valid_array.extend([0xff, 0, 0, 0, 8, 1, 0, 0]);
+    }
+    for (control, earlier) in [
+        (
+            [row(1000), sprm(0xd613, &valid_array, false)].concat(),
+            [row(1000), sprm(0xd613, &array, false)].concat(),
+        ),
+        (
+            cell_border_tc80_row([8, 1, 6, 0]),
+            cell_border_tc80_row([8, 0xff, 6, 0]),
+        ),
+        (
+            [row(1000), sprm(0xd620, &[7, 0, 1, 1, 8, 1, 6, 0], false)].concat(),
+            [row(1000), sprm(0xd620, &[7, 0, 1, 1, 8, 0xff, 6, 0], false)].concat(),
+        ),
+    ] {
+        cell_border_document([control, later.clone()].concat(), false).unwrap();
+        let error = cell_border_document([earlier, later.clone()].concat(), false)
+            .expect_err("unsupported carrier must refuse");
+        assert!(
+            error.contains("unsupported Word border type 0xFF"),
+            "{error}"
+        );
+    }
+    // A later row border belongs to a different layer from direct cell FF.
+    let mut red_array = vec![48];
+    for _ in 0..6 {
+        red_array.extend([0xff, 0, 0, 0, 8, 1, 0, 0]);
+    }
+    assert!(cell_border_document(
+        [
+            row(1000),
+            cell_border_assignment(1, ff),
+            sprm(0xd613, &red_array, false),
+        ]
+        .concat(),
+        false
+    )
+    .is_err());
+    let source = cell_border_source(
+        [row(1000), sprm(0x563a, &1u16.to_le_bytes(), false), later].concat(),
+        false,
+    );
+    let control = with_cell_border_style_border(&source, [0xff, 0, 0, 0, 8, 1, 0, 0]);
+    super::super::direct_model(&CompoundFile::open(&control).unwrap(), 1_000_000).unwrap();
+    let source = with_cell_border_style_border(&source, ff);
+    let error = super::super::direct_model(&CompoundFile::open(&source).unwrap(), 1_000_000)
+        .expect_err("table-style FF must refuse");
+    assert!(
+        error.contains("unsupported Word border type 0xFF"),
+        "{error}"
+    );
+}
+
+#[test]
+fn cell_border_superseded_textbox_overwrite_matches_control_but_winner_refuses() {
+    let source = super::tests::drawing_shape_source(Some("x\u{7}\u{7}\r"), false);
+    let unresolved = cell_border_assignment(0x0f, [0, 0, 0, 0, 8, 0xff, 0, 0]);
+    let red = cell_border_assignment(0x0f, [0xff, 0, 0, 0, 8, 1, 0, 0]);
+    let project = |mut properties: Vec<u8>| {
+        if properties.len().is_multiple_of(2) {
+            properties.extend(cell());
+        }
+        // The real fixture's main story precedes its anchored textbox story.
+        let bytes = with_papx(
+            &source,
+            &[
+                (0, 3, Vec::new()),
+                (3, 5, cell()),
+                (5, 6, properties),
+                (6, 7, Vec::new()),
+            ],
+        );
+        super::super::direct_model(&CompoundFile::open(&bytes).unwrap(), 1_000_000)
+            .map(|result| result.document)
+    };
+    let control = project([row(1000), red.clone()].concat()).unwrap();
+    let BodyElement::Paragraph(paragraph) = &control.body[0] else {
+        panic!("main paragraph")
+    };
+    let shape = paragraph
+        .runs
+        .iter()
+        .find_map(|run| match run {
+            DocRun::Shape(shape) => Some(shape),
+            _ => None,
+        })
+        .expect("anchored textbox");
+    let table = shape
+        .text_box_content
+        .iter()
+        .find_map(|block| match block {
+            docx_model::TextBoxBlockWire::Body(BodyElement::Table(table)) => Some(table),
+            _ => None,
+        })
+        .expect("textbox table");
+    assert_eq!(
+        table.rows[0].cells[0]
+            .borders
+            .top
+            .as_ref()
+            .unwrap()
+            .color
+            .as_deref(),
+        Some("ff0000")
+    );
+    let actual = project([row(1000), unresolved.clone(), red.clone()].concat()).unwrap();
+    assert_eq!(
+        serde_json::to_value(actual).unwrap(),
+        serde_json::to_value(control).unwrap()
+    );
+    assert!(project([row(1000), unresolved.clone()].concat()).is_err());
+    assert!(project([row(1000), red, unresolved].concat()).is_err());
 }
 
 #[test]
@@ -1496,6 +1933,15 @@ fn nested_frame_cell(frame: Vec<u8>) -> Vec<u8> {
 }
 
 fn nested_frame_source(first: Vec<u8>, second: Vec<u8>) -> Vec<u8> {
+    nested_frame_source_with_rows(first, second, nested_row(500), nested_row(500))
+}
+
+fn nested_frame_source_with_rows(
+    first: Vec<u8>,
+    second: Vec<u8>,
+    first_row: Vec<u8>,
+    second_row: Vec<u8>,
+) -> Vec<u8> {
     let text = "n\r\rm\r\rx\u{7}\u{7}\r";
     let units = text.encode_utf16().count();
     let source = source_with_typography(
@@ -1510,9 +1956,9 @@ fn nested_frame_source(first: Vec<u8>, second: Vec<u8>) -> Vec<u8> {
         &source,
         &[
             (0, 2, nested_frame_cell(first)),
-            (2, 3, nested_row(500)),
+            (2, 3, first_row),
             (3, 5, nested_frame_cell(second)),
-            (5, 6, nested_row(500)),
+            (5, 6, second_row),
             (6, 8, cell()),
             (8, 9, row(1000)),
             (9, units, Vec::new()),
@@ -1522,6 +1968,108 @@ fn nested_frame_source(first: Vec<u8>, second: Vec<u8>) -> Vec<u8> {
 
 fn nested_owner_frame(x: i16) -> Vec<u8> {
     [padded_frame(0x60, x), sprm(0x2423, &[2], false)].concat()
+}
+
+#[test]
+fn nested_cell_frame_leaves_unproved_grid_policies_in_flow_with_warning() {
+    for extra in [
+        sprm(0x3615, &[1], false),
+        sprm(0x560b, &1u16.to_le_bytes(), false),
+        sprm(0x7629, &[0, 1, 1, 0], false),
+    ] {
+        let mut row = [nested_row(500), extra].concat();
+        if row.len() % 2 == 0 {
+            row.extend(sprm(0x2416, &[1], false));
+        }
+        let bytes = nested_frame_source_with_rows(
+            nested_owner_frame(-4),
+            nested_owner_frame(-4),
+            row.clone(),
+            row,
+        );
+        let result = super::super::direct_model(&CompoundFile::open(&bytes).unwrap(), 1_000_000)
+            .expect("previously admitted nested grid policy");
+        let BodyElement::Table(outer) = &result.document.body[0] else {
+            panic!("outer")
+        };
+        let CellElement::Table(nested) = &outer.rows[0].cells[0].content[0] else {
+            panic!("nested")
+        };
+        let wire = serde_json::to_value(nested).unwrap();
+        assert!(wire["__tableLayout"]["cellFrame"].is_null());
+        assert_eq!(wire["__tableLayout"]["ordinaryFlow"], true);
+        assert!(!result.document.diagnostics.is_empty());
+    }
+}
+
+#[test]
+fn nested_cell_frame_does_not_override_nondefault_tap_without_active_anchors() {
+    for tap in [sprm(0x360d, &[0xf0], false), sprm(0x3465, &[1], false)] {
+        let source = nested_frame_source(nested_owner_frame(-4), nested_owner_frame(-4));
+        let text_units = "n\r\rm\r\rx\u{7}\u{7}\r".encode_utf16().count();
+        let positioned_row = |extra: &[u8]| {
+            let mut properties = [nested_row(500), extra.to_vec()].concat();
+            if properties.len() % 2 == 0 {
+                properties.extend(sprm(0x2416, &[1], false));
+            }
+            properties
+        };
+        for row_index in [0, 1] {
+            let bytes = with_papx(
+                &source,
+                &[
+                    (0, 2, nested_frame_cell(nested_owner_frame(-4))),
+                    (
+                        2,
+                        3,
+                        positioned_row(if row_index == 0 { &tap } else { &[] }),
+                    ),
+                    (3, 5, nested_frame_cell(nested_owner_frame(-4))),
+                    (
+                        5,
+                        6,
+                        positioned_row(if row_index == 1 { &tap } else { &[] }),
+                    ),
+                    (6, 8, cell()),
+                    (8, 9, row(1000)),
+                    (9, text_units, Vec::new()),
+                ],
+            );
+            let model = super::super::direct_model(&CompoundFile::open(&bytes).unwrap(), 1_000_000)
+                .expect("existing bounded native admission");
+            let BodyElement::Table(outer) = &model.document.body[0] else {
+                panic!("outer table")
+            };
+            // TAP row identity can split the normal first row from a later
+            // positioned row. Check the group owning the authored TAP, not
+            // the independently valid preceding group.
+            let wanted = if row_index == 0 { "n" } else { "m" };
+            let nested = outer.rows[0].cells[0]
+                .content
+                .iter()
+                .find_map(|block| {
+                    let CellElement::Table(table) = block else {
+                        return None;
+                    };
+                    table
+                        .rows
+                        .iter()
+                        .flat_map(|row| &row.cells)
+                        .flat_map(|cell| &cell.content)
+                        .any(|block| {
+                            matches!(block, CellElement::Paragraph(p) if p.runs.iter()
+                        .any(|run| matches!(run, DocRun::Text(t) if t.text == wanted)))
+                        })
+                        .then_some(table)
+                })
+                .expect("group owning the TAP row");
+            assert!(nested.tblp_pr.is_none());
+            assert!(
+                serde_json::to_value(nested).unwrap()["__tableLayout"]["cellFrame"].is_null(),
+                "nondefault TAP remains authoritative even without an active placement: {tap:?}, row {row_index}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -1546,6 +2094,21 @@ fn nested_cell_frames_keep_source_facts_and_native_row_identity() {
             nested.iter().map(|t| t.rows.len()).collect::<Vec<_>>(),
             expected_rows
         );
+        for (index, table) in nested.iter().enumerate() {
+            let wire = serde_json::to_value(table).unwrap();
+            if index != 0 {
+                assert!(wire["__tableLayout"]["cellFrame"].is_null());
+                assert_eq!(wire["__tableLayout"]["ordinaryFlow"], true);
+                continue;
+            }
+            assert_eq!(wire["__tableLayout"]["cellFrame"]["hAnchor"], "margin");
+            assert_eq!(wire["__tableLayout"]["cellFrame"]["y"], 12.0);
+            assert_eq!(wire["__tableLayout"]["ordinaryFlow"], false);
+            assert!(
+                table.tblp_pr.is_none(),
+                "paragraph frames are not authored TAP positioning"
+            );
+        }
         let paragraphs: Vec<_> = nested
             .iter()
             .flat_map(|table| table.rows.iter())
@@ -1655,14 +2218,21 @@ fn nested_cell_frame_flow_warning_names_each_root_body_element_once() {
     let diagnostics =
         |json: &serde_json::Value| json.get("diagnostics").cloned().unwrap_or_default();
 
-    // Two framed paragraphs under one root, as one nested table of equal row
-    // identity or as two one-row nested tables: one fact for that root.
+    // A homogeneous first grid acquires placement. A later grid with a
+    // different row identity remains a residual frame warning for the root.
     for second in [-4, 1441] {
         let (_, json) = model(&nested_frame_source(
             nested_owner_frame(-4),
             nested_owner_frame(second),
         ));
-        assert_eq!(diagnostics(&json), serde_json::json!([warning(0)]));
+        assert_eq!(
+            diagnostics(&json),
+            if second == -4 {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!([warning(0)])
+            }
+        );
     }
 
     // Each root table is named by its own final body index.
@@ -1679,15 +2249,15 @@ fn nested_cell_frame_flow_warning_names_each_root_body_element_once() {
             ..
         ]
     ));
-    assert_eq!(
-        diagnostics(&json),
-        serde_json::json!([warning(0), warning(2)])
+    assert!(
+        json.get("diagnostics").is_none(),
+        "both homogeneous grids have placement owners"
     );
     let (_, json) = model(&two_root_nested_frame_source(
         Vec::new(),
         nested_owner_frame(-4),
     ));
-    assert_eq!(diagnostics(&json), serde_json::json!([warning(2)]));
+    assert!(json.get("diagnostics").is_none());
 
     // Unframed nested tables emit nothing and keep the serialized model free
     // of the private diagnostics member.
@@ -1749,7 +2319,7 @@ fn nested_cell_frame_flow_warning_names_each_root_body_element_once() {
 
 #[test]
 fn nested_cell_frame_flow_warning_does_not_silently_skip_exhausted_allocations() {
-    let bytes = nested_frame_source(nested_owner_frame(-4), nested_owner_frame(-4));
+    let bytes = nested_frame_source(nested_owner_frame(-4), nested_owner_frame(1441));
     let result = super::super::direct_model(&CompoundFile::open(&bytes).unwrap(), 1_000_000)
         .expect("public framed-container fixture");
     // Exercise the new allocation boundary with an already retained public
@@ -1766,4 +2336,166 @@ fn nested_cell_frame_flow_warning_does_not_silently_skip_exhausted_allocations()
         );
         assert!(document.diagnostics.is_empty());
     }
+}
+
+#[test]
+fn cell_border_superseded_nested_owner_resolves_before_table_projection() {
+    // The inner row uses CR + sprmPFInnerTtp at depth two, rather than the
+    // depth-one cell/row U+0007 marks. Its active TTP must remain in the context
+    // index and reach border resolution before nested-table output planning.
+    let text = "n\r\r\u{7}\u{7}\r";
+    let source = source_with_typography(
+        text,
+        &[(text.encode_utf16().count(), 2, 12240, 15840, 1, 720)],
+        None,
+        None,
+        None,
+        None,
+    );
+    let project = |inner_borders: Vec<u8>| {
+        let bytes = with_papx(
+            &source,
+            &[
+                (0, 2, nested_cell()),
+                (2, 3, [nested_row(500), inner_borders].concat()),
+                (3, 4, cell()),
+                (4, 5, row(1000)),
+                (5, 6, Vec::new()),
+            ],
+        );
+        super::super::direct_model(&CompoundFile::open(&bytes).unwrap(), 1_000_000)
+            .map(|result| result.document)
+    };
+    let blue = cell_border_assignment(0x0f, [0, 0, 0xff, 0, 24, 1, 0, 0]);
+    let unresolved = cell_border_assignment(0x0f, [0, 0, 0, 0, 8, 0xff, 0, 0]);
+    let control = project(blue.clone()).unwrap();
+    let BodyElement::Table(outer) = &control.body[0] else {
+        panic!("outer table")
+    };
+    let inner = outer.rows[0].cells[0]
+        .content
+        .iter()
+        .find_map(|block| match block {
+            CellElement::Table(table) => Some(table),
+            _ => None,
+        })
+        .expect("nested table");
+    let top = inner.rows[0].cells[0]
+        .borders
+        .top
+        .as_ref()
+        .expect("inner top border");
+    assert_eq!(top.style, "single");
+    assert_eq!(top.color.as_deref(), Some("0000ff"));
+    let actual = project([unresolved.clone(), blue.clone()].concat()).unwrap();
+    assert_eq!(
+        serde_json::to_value(actual).unwrap(),
+        serde_json::to_value(control).unwrap()
+    );
+    for borders in [unresolved.clone(), [blue, unresolved].concat()] {
+        let error = project(borders).expect_err("winning nested FF must refuse");
+        assert!(
+            error.contains("unsupported Word border type 0xFF ignore semantics"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn cell_border_superseded_definition_cannot_discharge_unresolved_owner() {
+    let ff = cell_border_assignment(1, [0, 0, 0, 0, 8, 0xff, 0, 0]);
+    let drawn = cell_border_assignment(1, [0, 0, 0xff, 0, 24, 1, 0, 0]);
+    let definition = sprm(0xd608, &[6, 0, 1, 0, 0, 0xe8, 3], false);
+    let control = cell_border_document(
+        [row(1000), drawn.clone(), definition.clone()].concat(),
+        false,
+    )
+    .unwrap();
+    let error = cell_border_document([row(1000), ff.clone(), definition.clone()].concat(), false)
+        .expect_err("a new table definition is not established to reset unresolved FF");
+    assert!(
+        error.contains("unresolved Word cell border before topology change"),
+        "{error}"
+    );
+    let replaced = cell_border_document(
+        [row(1000), ff.clone(), drawn, definition.clone()].concat(),
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(replaced).unwrap(),
+        serde_json::to_value(control).unwrap()
+    );
+    let reset = sprm(0x563a, &1u16.to_le_bytes(), false);
+    let control = cell_border_document(
+        [row(1000), reset.clone(), definition.clone()].concat(),
+        true,
+    )
+    .unwrap();
+    let reset = cell_border_document([row(1000), ff, reset, definition].concat(), true).unwrap();
+    assert_eq!(
+        serde_json::to_value(reset).unwrap(),
+        serde_json::to_value(control).unwrap()
+    );
+}
+
+#[test]
+fn cell_border_superseded_deletion_cannot_discharge_unresolved_owner() {
+    let ff = cell_border_assignment(1, [0, 0, 0, 0, 8, 0xff, 0, 0]);
+    let drawn = cell_border_assignment(1, [0, 0, 0xff, 0, 24, 1, 0, 0]);
+    let insert = sprm(0x7621, &[1, 1, 0xe8, 3], false);
+    let delete = sprm(0x5622, &[0, 1], false);
+    let control = cell_border_document(
+        [row(1000), drawn.clone(), insert.clone(), delete.clone()].concat(),
+        false,
+    )
+    .unwrap();
+    let error = cell_border_document(
+        [row(1000), ff.clone(), insert.clone(), delete.clone()].concat(),
+        false,
+    )
+    .expect_err("deleting an owner does not establish the meaning of its unresolved FF");
+    assert!(
+        error.contains("unresolved Word cell border before topology change"),
+        "{error}"
+    );
+    let replaced = cell_border_document(
+        [row(1000), ff.clone(), drawn.clone(), insert, delete.clone()].concat(),
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(replaced).unwrap(),
+        serde_json::to_value(control).unwrap()
+    );
+
+    // Inserting a fresh cell moves the old owner intact. Deleting only the
+    // fresh cell must not discard the FF debt of the retained original cell.
+    let insert_before = sprm(0x7621, &[0, 1, 0xe8, 3], false);
+    let error = cell_border_document(
+        [row(1000), ff.clone(), insert_before.clone(), delete.clone()].concat(),
+        false,
+    )
+    .expect_err("unrelated deletion leaves the retained FF owner unresolved");
+    assert!(
+        error.contains("unsupported Word border type 0xFF ignore semantics"),
+        "{error}"
+    );
+    let mut shifted = vec![11, 1, 2, 1];
+    shifted.extend([0, 0, 0xff, 0, 24, 1, 0, 0]);
+    let shifted = sprm(0xd62f, &shifted, false);
+    let control = cell_border_document(
+        [row(1000), drawn, insert_before.clone(), delete.clone()].concat(),
+        false,
+    )
+    .unwrap();
+    let replaced = cell_border_document(
+        [row(1000), ff, insert_before, shifted, delete].concat(),
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(replaced).unwrap(),
+        serde_json::to_value(control).unwrap()
+    );
 }

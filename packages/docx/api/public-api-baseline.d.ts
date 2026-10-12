@@ -1461,6 +1461,7 @@ export interface DocxTextRunInfo {
     paragraphId?: string;
     sourceRunIndex?: number;
     direction?: 'ltr' | 'rtl';
+    optionalHyphenGlyph?: true;
     text: string;
     x: number;
     y: number;
@@ -1928,6 +1929,7 @@ export interface NumberingInfo {
     picBulletMimeType?: string;
     picBulletWidthPt?: number;
     picBulletHeightPt?: number;
+    picBulletTransform?: Pick<ImageRun, 'srcRect' | 'rotation' | 'flipH' | 'flipV'>;
 }
 export class OoxmlDecodedImageLimitError extends RangeError {
     readonly metric: OoxmlDecodedImageLimitMetric;
@@ -2365,6 +2367,8 @@ export interface ShapeRun {
     textInsetR?: number;
     textInsetB?: number;
     textVert?: string | null;
+    /** DrawingML bodyPr@upright: keep text independent of the shape rotation. */
+    textUpright?: boolean | null;
     textPath?: TextPath | null;
     fillOpacity?: number | null;
 }

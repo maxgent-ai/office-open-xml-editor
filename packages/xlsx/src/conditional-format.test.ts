@@ -459,6 +459,16 @@ describe('stopIfTrue — a matching rule stops lower-priority rules (ECMA-376 §
     }
   });
 
+  it('a FLOOR domain error preserves lower rules while ISERROR can intentionally match it', () => {
+    const rule = (formula: string): CfRule => ({ type: 'expression', formula, dxfId: 1, priority: 1, stopIfTrue: true });
+    const error = evalWith(rule('FLOOR(2.5,-2)>0'));
+    expect(error.fontColor).toBeUndefined();
+    expect(error.fill?.fgColor).toBe('#FF0000');
+    const caught = evalWith(rule('ISERROR(FLOOR(2.5,-2))'));
+    expect(caught.fontColor).toBe('#0000FF');
+    expect(caught.fill).toBeUndefined();
+  });
+
   it.each(stoppers)('%s: applies its own dxf and skips every lower-priority rule', (_, stopper) => {
     const res = evalWith(stopper);
     expect(res.fontColor).toBe('#0000FF');

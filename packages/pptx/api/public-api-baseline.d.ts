@@ -1744,6 +1744,7 @@ export interface PptxTextRunInfo {
         row: number;
         column: number;
     }>;
+    cellHorzOverflow?: 'clip' | 'overflow';
     textBodyRotation?: number;
     hyperlink?: HyperlinkTarget;
 }
@@ -2069,6 +2070,7 @@ export interface Stroke {
 }
 export interface TableCell {
     textBody: TextBody | null;
+    horzOverflow?: 'clip' | 'overflow';
     fill: Fill | null;
     textColor?: string;
     borderL: Stroke | null;

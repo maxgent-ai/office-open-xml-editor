@@ -1305,6 +1305,20 @@ pub fn parse(zip: &mut Zip) -> Result<Document, String> {
         Err(e) => return Ok(degraded_document(theme, format!("word/document.xml: {e}"))),
     };
     validate_paragraph_ilvls(xml_doc.root_element())?;
+    // ECMA-376 Part 3 §9.1 requires a MustUnderstand mismatch to be signaled
+    // but does not mandate the mechanism. Library policy, not an Office
+    // observation: like the streamed facade, report it as this required part's
+    // degraded document rather than substituting a picture or dropping the run.
+    // `run_operation` still lets a poisoned resource session win.
+    if let Err(error) = chartex_choice::validate_selected_chartex_must_understand(
+        xml_doc.root_element(),
+        &chart_map.renderable_chartex_rids,
+    ) {
+        return Ok(degraded_document(
+            theme,
+            format!("word/document.xml: {error}"),
+        ));
+    }
 
     let body_node = match xml_doc
         .root_element()
@@ -5929,6 +5943,7 @@ fn resolve_numbering_marker(
         pic_bullet_mime_type,
         pic_bullet_width_pt,
         pic_bullet_height_pt,
+        pic_bullet_transform: None,
     })
 }
 
@@ -7348,7 +7363,9 @@ fn has_mergeformat_switch(instr: &str) -> bool {
 /// contents — merging text into (or out of) such a run would be wrong even
 /// if the annotation happened to match.
 fn text_runs_mergeable(a: &TextRun, b: &TextRun) -> bool {
-    a.ruby.is_none()
+    !a.optional_hyphen
+        && !b.optional_hyphen
+        && a.ruby.is_none()
         && b.ruby.is_none()
         && a.revision.is_none()
         && b.revision.is_none()
@@ -7655,6 +7672,7 @@ fn parse_run_inner(
                         no_break_before: false,
                         no_break_after: false,
                         no_break_hyphen_offsets: Vec::new(),
+                        optional_hyphen: false,
                         bold,
                         italic,
                         underline,
@@ -7757,6 +7775,7 @@ fn parse_run_inner(
                         no_break_before: false,
                         no_break_after: false,
                         no_break_hyphen_offsets: Vec::new(),
+                        optional_hyphen: false,
                         bold,
                         italic,
                         underline,
@@ -7820,6 +7839,7 @@ fn parse_run_inner(
                     no_break_before: false,
                     no_break_after: false,
                     no_break_hyphen_offsets: Vec::new(),
+                    optional_hyphen: false,
                     bold,
                     italic,
                     underline,
@@ -7892,7 +7912,7 @@ fn parse_run_inner(
                     break_type: BreakType::Line,
                 });
             }
-            "noBreakHyphen" => {
+            "noBreakHyphen" | "softHyphen" => {
                 // ECMA-376 §17.3.3.18 <w:noBreakHyphen> — a non-breaking hyphen.
                 // The spec: "display using the same glyph as the hyphen-minus
                 // character (U+002D) … without that hyphen being a line breaking
@@ -7918,14 +7938,20 @@ fn parse_run_inner(
                 // `<w:t>` immediately following this element merges the same way
                 // (see the "t" | "delText" arm above), so the whole spec example
                 // collapses to one run and the boundary vanishes entirely.
+                let optional = child.tag_name().name() == "softHyphen";
                 let this = TextRun {
-                    text: "-".to_string(),
+                    text: if optional {
+                        String::new()
+                    } else {
+                        "-".to_string()
+                    },
+                    optional_hyphen: optional,
                     // If the hyphen cannot merge with the previous text run,
                     // this provenance closes the otherwise breakable run
                     // boundary for every formatting/revision/comment reason.
-                    no_break_before: true,
-                    no_break_after: true,
-                    no_break_hyphen_offsets: vec![1],
+                    no_break_before: !optional,
+                    no_break_after: !optional,
+                    no_break_hyphen_offsets: if optional { Vec::new() } else { vec![1] },
                     bold,
                     italic,
                     underline,
@@ -7975,6 +8001,16 @@ fn parse_run_inner(
                     note_ref: None,
                     typography_acquisition: typography_acquisition.clone(),
                 };
+                if optional {
+                    // §17.3.3.29: the authored opportunity survives with its
+                    // own formatting, although its unselected glyph has zero
+                    // width. It can be chosen without automatic dictionary
+                    // hyphenation. Never coalesce away this conditional owner.
+                    runs.push(DocRun::Text(Box::new(this)));
+                    merge_into_prev_text = false;
+                    preserve_next_comment_boundary = false;
+                    continue;
+                }
                 match runs.last_mut() {
                     Some(DocRun::Text(prev))
                         if !preserve_next_comment_boundary && text_runs_mergeable(prev, &this) =>
@@ -7995,23 +8031,6 @@ fn parse_run_inner(
                 // (the exact shape of the spec example's 2nd/3rd runs) should
                 // merge into the run we just pushed/extended above.
                 merge_into_prev_text = true;
-            }
-            "softHyphen" => {
-                // ECMA-376 §17.3.3.29 <w:softHyphen> — an OPTIONAL hyphen. The spec
-                // gives it two states: (a) when it is NOT the character used to
-                // break the line it "shall have zero width" and "shall not change
-                // the normal display of text"; (b) only when it IS the break point
-                // does it display a U+002D hyphen-minus. This renderer performs no
-                // automatic hyphenation, so a soft hyphen is never chosen as a break
-                // point — state (a) always applies. The minimal spec-correct
-                // behaviour is therefore to emit NOTHING: no glyph and no added
-                // break opportunity. (Always drawing a '-' would be wrong — Word
-                // shows it only at an actual line break.)
-                //
-                // TODO: when automatic hyphenation (§17.15.1.x autoHyphenation) is
-                // implemented, a soft hyphen at a chosen break must render a trailing
-                // '-' on the broken line; wire this element into that break-point
-                // logic then. Until then, dropping it is the correct display.
             }
             "ptab" => {
                 // ECMA-376 §17.3.3.23 <w:ptab> — an absolute-position tab. It reads
@@ -8165,6 +8184,7 @@ fn parse_run_inner(
                     no_break_before: false,
                     no_break_after: false,
                     no_break_hyphen_offsets: Vec::new(),
+                    optional_hyphen: false,
                     bold,
                     italic,
                     underline,
@@ -8710,6 +8730,156 @@ fn parse_inline_drawing_impl(
                     }
                 }
             }
+        }
+        // ECMA-376 §20.4.2.8 wp:inline retains one flow object. [MS-ODRAWXML]
+        // §2.16.3.2 CT_WordprocessingGroup allows interleaved WPS shapes,
+        // pictures and nested groups; their positioned children reuse one
+        // retained story rather than each advancing the line pen. graphicFrame
+        // and contentPart group children are not yet supported by these readers.
+        if let Some(wgp) = container
+            .children()
+            .find(|n| n.is_element() && n.tag_name().name() == "graphic")
+            .and_then(|graphic| {
+                graphic
+                    .children()
+                    .find(|n| n.is_element() && n.tag_name().name() == "graphicData")
+            })
+            .filter(|data| {
+                data.attribute("uri")
+                    == Some("http://schemas.microsoft.com/office/word/2010/wordprocessingGroup")
+            })
+            .and_then(|data| {
+                data.children().find(|n| {
+                    n.is_element()
+                        && n.tag_name().name() == "wgp"
+                        && n.tag_name().namespace()
+                            == Some(
+                                "http://schemas.microsoft.com/office/word/2010/wordprocessingGroup",
+                            )
+                })
+            })
+        {
+            if let Some((width_pt, height_pt)) = drawing_extent_points(container) {
+                let metadata = anchor_group_metadata_index(wgp);
+                let anchor = AnchorMeta::default();
+                let mut children: Vec<DocRun> = parse_wgp_images_with_metadata(
+                    wgp, media_map, theme, 0.0, true, 0.0, true, &anchor, &metadata,
+                )
+                .into_iter()
+                .map(|image| DocRun::Image(Box::new(image)))
+                .collect();
+                children.extend(
+                    parse_wgp_shapes_with_metadata(
+                        style_map, num_map, wgp, theme, media_map, chart_map, rel_map, depth, 0.0,
+                        true, 0.0, true, &anchor, 0, &metadata,
+                    )
+                    .into_iter()
+                    .map(|shape| DocRun::Shape(Box::new(shape))),
+                );
+                // The two walkers return different kinds separately. Restore
+                // authored paint order before discarding floating-group facts.
+                children.sort_by_key(|child| {
+                    let acquisition = match child {
+                        DocRun::Shape(shape) => &shape.anchor_acquisition,
+                        DocRun::Image(image) => &image.anchor_acquisition,
+                        _ => unreachable!("WPG walkers emit shapes and images"),
+                    };
+                    acquisition
+                        .as_ref()
+                        .and_then(|a| a.group.as_ref())
+                        .map_or(usize::MAX, |group| group.source_index)
+                });
+                let spec = group_xfrm(wgp).map(read_group_xfrm);
+                let frame = GroupTransform::from_group(DrawingGroupSpec {
+                    off_x: 0.0,
+                    off_y: 0.0,
+                    ext_x: width_pt,
+                    ext_y: height_pt,
+                    child_off_x: spec.map_or(0.0, |s| s.off_x / 12700.0),
+                    child_off_y: spec.map_or(0.0, |s| s.off_y / 12700.0),
+                    child_ext_x: spec
+                        .filter(|s| s.ext_x > 0.0)
+                        .map_or(width_pt, |s| s.ext_x / 12700.0),
+                    child_ext_y: spec
+                        .filter(|s| s.ext_y > 0.0)
+                        .map_or(height_pt, |s| s.ext_y / 12700.0),
+                    rotation_degrees: 0.0,
+                    flip_h: false,
+                    flip_v: false,
+                });
+                for (source_index, child) in children.iter_mut().enumerate() {
+                    let (x, y, w, h, rotation, flip_h, flip_v) = match child {
+                        DocRun::Shape(shape) => {
+                            shape.anchor_acquisition = None;
+                            shape.z_order = source_index as u32;
+                            shape.anchor_x_relative_from = Some("column".into());
+                            shape.anchor_y_relative_from = Some("paragraph".into());
+                            shape.group_width_pt = None;
+                            shape.group_height_pt = None;
+                            (
+                                &mut shape.anchor_x_pt,
+                                &mut shape.anchor_y_pt,
+                                &mut shape.width_pt,
+                                &mut shape.height_pt,
+                                &mut shape.rotation,
+                                &mut shape.flip_h,
+                                &mut shape.flip_v,
+                            )
+                        }
+                        DocRun::Image(image) => {
+                            image.anchor_acquisition = None;
+                            image.anchor_x_relative_from = Some("column".into());
+                            image.anchor_y_relative_from = Some("paragraph".into());
+                            (
+                                &mut image.anchor_x_pt,
+                                &mut image.anchor_y_pt,
+                                &mut image.width_pt,
+                                &mut image.height_pt,
+                                &mut image.rotation,
+                                &mut image.flip_h,
+                                &mut image.flip_v,
+                            )
+                        }
+                        _ => unreachable!("WPG walkers emit shapes and images"),
+                    };
+                    // Walkers already applied the authored group hierarchy and
+                    // its bounded direct-leaf Word compatibility rule. This
+                    // wp:extent frame is only a coordinate-space adapter, not
+                    // another authored group (Annex L §L.4.7.4).
+                    let rect = frame.apply_rect(DrawingRect {
+                        x: *x,
+                        y: *y,
+                        width: *w,
+                        height: *h,
+                        rotation_degrees: *rotation,
+                        flip_h: *flip_h,
+                        flip_v: *flip_v,
+                    });
+                    *x = rect.x;
+                    *y = rect.y;
+                    *w = rect.width;
+                    *h = rect.height;
+                    *rotation = rect.rotation_degrees;
+                    *flip_h = rect.flip_h;
+                    *flip_v = rect.flip_v;
+                }
+                if !children.is_empty() {
+                    return vec![DocRun::Shape(Box::new(ShapeRun {
+                        inline: true,
+                        width_pt,
+                        height_pt,
+                        text_box_content: vec![TextBoxBlockWire::Body(BodyElement::Paragraph(
+                            Box::new(DocParagraph {
+                                alignment: "left".into(),
+                                runs: children,
+                                ..DocParagraph::default()
+                            }),
+                        ))],
+                        ..ShapeRun::default()
+                    }))];
+                }
+            }
+            return vec![];
         }
         // ECMA-376 §20.4.2.8: wp:inline contains an arbitrary DrawingML
         // graphic, not only a picture. Word emits WPS text panels as a direct
@@ -10478,13 +10648,18 @@ fn parse_wsp_shape(
     let cx = ext.attribute("cx").and_then(|v| v.parse::<f64>().ok())?;
     let cy = ext.attribute("cy").and_then(|v| v.parse::<f64>().ok())?;
 
+    let cust_geom = sp_pr
+        .children()
+        .find(|n| n.is_element() && n.tag_name().name() == "custGeom");
     // Line/connector presets (ECMA-376 §20.1.9.18 prstGeom; preset geometries
     // `line`, `straightConnector1`, `bent*Connector*`, `curved*Connector*`)
     // legitimately have a degenerate bounding box: an axis-aligned connector
     // has cx==0 (vertical) or cy==0 (horizontal). Such a shape must NOT be
-    // discarded — it is the line itself. A genuine zero-area box on any other
-    // geometry (rect, ellipse, …) has nothing to draw, and a negative extent
-    // is always invalid, so both are still rejected.
+    // discarded — it is the line itself. ECMA-376 §20.1.7.3 ext uses
+    // ST_PositiveCoordinate (minInclusive=0), and §20.1.9.15 path has a separate
+    // coordinate space. Custom strokes remain visible with one zero axis.
+    // Rejecting both-zero custom boxes and zero-area non-line presets remains
+    // library policy, not a prohibition imposed by the extent schema.
     let prst_lower = sp_pr
         .children()
         .find(|n| n.is_element() && n.tag_name().name() == "prstGeom")
@@ -10497,10 +10672,13 @@ fn parse_wsp_shape(
             || p.starts_with("bentconnector")
             || p.starts_with("curvedconnector")
     );
-    if cx < 0.0 || cy < 0.0 {
+    if !cx.is_finite() || !cy.is_finite() || cx < 0.0 || cy < 0.0 {
         return None;
     }
-    if !is_line_geom && (cx == 0.0 || cy == 0.0) {
+    if !is_line_geom
+        && (cx == 0.0 || cy == 0.0)
+        && (cust_geom.is_none() || (cx == 0.0 && cy == 0.0))
+    {
         return None;
     }
     let rotation = xfrm
@@ -10552,9 +10730,6 @@ fn parse_wsp_shape(
     let anchor_x_pt = anchor_pos_x + local_x_pt;
     let anchor_y_pt = anchor_pos_y + local_y_pt;
 
-    let cust_geom = sp_pr
-        .children()
-        .find(|n| n.is_element() && n.tag_name().name() == "custGeom");
     let (subpaths, subpath_paint, preset_geometry, adj_values) = if let Some(cg) = cust_geom {
         let (subpaths, paint) = parse_custom_geometry_with_paint(cg, cx, cy);
         (subpaths, paint, None, Vec::new())
@@ -10702,6 +10877,11 @@ fn parse_wsp_shape(
         text_autofit,
         text_wrap,
         text_vert,
+        text_upright: wsp
+            .children()
+            .find(|n| n.is_element() && n.tag_name().name() == "bodyPr")
+            .and_then(|n| n.attribute("upright"))
+            .and_then(parse_xsd_bool),
         text_inset_l,
         text_inset_t,
         text_inset_r,
@@ -14438,6 +14618,7 @@ fn parse_table_with_diagnostics(
         .max(grid_columns.len() as u32);
     let table_layout = TableLayoutAcquisitionWire {
         effective_style_id: effective_table_style_id,
+        cell_frame: None,
         ordinary_flow: table_is_ordinary_flow(
             tbl_pr.and_then(|p| child_w(p, "tblpPr")),
             table_positioning_context,
@@ -17017,13 +17198,13 @@ mod tests {
         assert_eq!(text.no_break_hyphen_offsets, vec![4]);
     }
 
-    // §17.3.3.29 <w:softHyphen> — zero width and no glyph when not a break point.
-    // With no automatic hyphenation, a soft hyphen is never a break point.
+    // §17.3.3.29: retain the conditional glyph's own run, even when automatic
+    // hyphenation is absent. Layout decides whether its authored break is used.
     #[test]
-    fn soft_hyphen_is_invisible() {
+    fn soft_hyphen_retains_its_styled_conditional_owner() {
         let base = RunFmt::default();
         let runs = parse_para(
-            r#"<w:r><w:t>br</w:t><w:softHyphen/><w:t>eaking</w:t></w:r>"#,
+            r#"<w:r><w:t>br</w:t></w:r><w:r><w:rPr><w:color w:val="FF0000"/><w:sz w:val="28"/></w:rPr><w:softHyphen/></w:r><w:r><w:t>eaking</w:t></w:r>"#,
             &base,
             &StyleMap::parse(""),
         );
@@ -17039,6 +17220,20 @@ mod tests {
         assert!(!joined.contains('-'));
         // And it does NOT create a break run.
         assert!(!runs.iter().any(|r| matches!(r, DocRun::Break { .. })));
+        let [DocRun::Text(before), DocRun::Text(marker), DocRun::Text(after)] = runs.as_slice()
+        else {
+            panic!("optional marker must retain its own styled run");
+        };
+        assert_eq!(
+            (&before.text[..], &marker.text[..], &after.text[..]),
+            ("br", "", "eaking")
+        );
+        assert_eq!(
+            serde_json::to_value(marker).unwrap()["__optionalHyphen"],
+            true
+        );
+        assert_eq!(marker.color.as_deref(), Some("ff0000"));
+        assert_eq!(marker.font_size, 14.0);
     }
 
     // §17.3.3.23 <w:ptab> — an absolute-position tab surfaces as a PTab run
@@ -27030,16 +27225,110 @@ mod inline_wps_shape_tests {
     }
 
     #[test]
-    fn wp_inline_group_is_not_misread_as_its_first_nested_wps_shape() {
+    fn parse_wsp_shape_retains_zero_axis_custom_paths_only_with_valid_extent() {
+        let parse_shape = |cx: &str, cy: &str, guide: bool| {
+            let path_x = if cx == "0" { 0 } else { 381000 };
+            let path_y = if guide {
+                "ss".to_string()
+            } else {
+                (if cy == "0" { 0 } else { 381000 }).to_string()
+            };
+            let xml = format!(
+                r#"<wps:wsp
+                     xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"
+                     xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+                     <wps:spPr>
+                       <a:xfrm><a:off x="0" y="0"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm>
+                       <a:custGeom><a:pathLst><a:path w="381000" h="381000">
+                         <a:moveTo><a:pt x="0" y="0"/></a:moveTo>
+                         <a:lnTo><a:pt x="{path_x}" y="{path_y}"/></a:lnTo>
+                       </a:path></a:pathLst></a:custGeom>
+                       <a:noFill/><a:ln w="12700"><a:solidFill><a:srgbClr val="000000"/></a:solidFill></a:ln>
+                     </wps:spPr>
+                   </wps:wsp>"#,
+            );
+            let doc = roxmltree::Document::parse(&xml).unwrap();
+            parse_wsp_shape(
+                &StyleMap::default(),
+                &mut NumberingMap::default(),
+                doc.root_element(),
+                &ThemeColors::default(),
+                &HashMap::new(),
+                &ChartMap::default(),
+                &HashMap::new(),
+                DepthGuard::root(),
+                0.0,
+                true,
+                0.0,
+                true,
+                &AnchorMeta::default(),
+                None,
+                None,
+                0,
+            )
+        };
+
+        for (cx, cy, endpoint) in [("381000", "0", (1.0, 0.0)), ("0", "381000", (0.0, 1.0))] {
+            let shape = parse_shape(cx, cy, false).expect("single zero-axis custom path parses");
+            assert_eq!(
+                (shape.width_pt, shape.height_pt),
+                (
+                    cx.parse::<f64>().unwrap() / 12700.0,
+                    cy.parse::<f64>().unwrap() / 12700.0
+                )
+            );
+            assert_eq!(shape.stroke_width, 1.0);
+            let PathCmd::LineTo { x, y } = shape.subpaths[0][1] else {
+                panic!("expected custom line endpoint")
+            };
+            assert!(x.is_finite() && y.is_finite());
+            assert_eq!((x, y), endpoint);
+        }
+        assert!(
+            parse_shape("0", "0", false).is_none(),
+            "both-zero custom extent remains rejected"
+        );
+        assert!(
+            parse_shape("-381000", "381000", false).is_none(),
+            "negative extent remains rejected"
+        );
+        for (cx, cy) in [("NaN", "0"), ("inf", "0"), ("0", "NaN"), ("0", "inf")] {
+            assert!(
+                parse_shape(cx, cy, false).is_none(),
+                "non-finite extent is rejected"
+            );
+        }
+        let guided = parse_shape("0", "381000", true).expect("zero-axis guided path parses");
+        assert!(
+            matches!(guided.subpaths[0][1], PathCmd::LineTo { x: 0.0, y: 0.0 }),
+            "ss is min(shape width, shape height), including a zero shape axis"
+        );
+    }
+
+    #[test]
+    fn wp_inline_group_keeps_rotated_children_in_one_flow_object() {
         let xml = r#"<w:drawing
           xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+          xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+          xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"
           xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
           xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
           xmlns:wpg="http://schemas.microsoft.com/office/word/2010/wordprocessingGroup"
           xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">
           <wp:inline><wp:extent cx="2540000" cy="635000"/>
             <a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingGroup">
-              <wpg:wgp><wps:wsp><wps:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="1270000" cy="317500"/></a:xfrm><a:prstGeom prst="rect"/></wps:spPr></wps:wsp></wpg:wgp>
+              <wpg:wgp>
+                <wpg:grpSpPr><a:xfrm><a:off x="127000" y="254000"/><a:ext cx="1270000" cy="317500"/><a:chOff x="0" y="0"/><a:chExt cx="1270000" cy="317500"/></a:xfrm></wpg:grpSpPr>
+                <wps:wsp><wps:spPr><a:xfrm rot="-5400000"><a:off x="254000" y="127000"/><a:ext cx="254000" cy="127000"/></a:xfrm><a:prstGeom prst="rect"/><a:noFill/><a:ln><a:noFill/></a:ln></wps:spPr>
+                  <wps:txbx><w:txbxContent><w:p><w:r><w:t>ALPHA</w:t></w:r></w:p></w:txbxContent></wps:txbx><wps:bodyPr/>
+                </wps:wsp>
+                <wps:wsp><wps:spPr><a:xfrm rot="-5400000"><a:off x="635000" y="127000"/><a:ext cx="254000" cy="127000"/></a:xfrm><a:prstGeom prst="rect"/><a:noFill/><a:ln><a:noFill/></a:ln></wps:spPr>
+                  <wps:txbx><w:txbxContent><w:p><w:r><w:t>BETA</w:t></w:r></w:p></w:txbxContent></wps:txbx><wps:bodyPr upright="true"/>
+                </wps:wsp>
+                <pic:pic><pic:blipFill><a:blip r:embed="rIdOverlay"/></pic:blipFill>
+                  <pic:spPr><a:xfrm><a:off x="1016000" y="127000"/><a:ext cx="127000" cy="127000"/></a:xfrm></pic:spPr>
+                </pic:pic>
+              </wpg:wgp>
             </a:graphicData></a:graphic>
           </wp:inline>
         </w:drawing>"#;
@@ -27048,16 +27337,122 @@ mod inline_wps_shape_tests {
             &StyleMap::default(),
             &mut NumberingMap::default(),
             doc.root_element(),
+            &HashMap::from([("rIdOverlay".into(), "word/media/overlay.png".into())]),
+            &ChartMap::default(),
+            &HashMap::new(),
+            &ThemeColors::default(),
+            DepthGuard::root(),
+        );
+        let [DocRun::Shape(group)] = runs.as_slice() else {
+            panic!("expected one inline group flow object, got {runs:?}");
+        };
+        assert!(group.inline);
+        assert_eq!((group.width_pt, group.height_pt), (200.0, 50.0));
+        let [TextBoxBlockWire::Body(BodyElement::Paragraph(paragraph))] =
+            group.text_box_content.as_slice()
+        else {
+            panic!("expected a retained child drawing story");
+        };
+        assert_eq!(paragraph.runs.len(), 3);
+        let DocRun::Image(image) = &paragraph.runs[2] else {
+            panic!("expected retained group image");
+        };
+        assert!(image.anchor);
+        assert!(image.anchor_acquisition.is_none());
+        assert_eq!(image.image_path, "word/media/overlay.png");
+        assert_eq!((image.anchor_x_pt, image.anchor_y_pt), (160.0, 20.0));
+        assert_eq!((image.width_pt, image.height_pt), (20.0, 20.0));
+        let children: Vec<_> = paragraph
+            .runs
+            .iter()
+            .take(2)
+            .enumerate()
+            .map(|(source_index, run)| {
+                let DocRun::Shape(shape) = run else {
+                    panic!("expected group shape")
+                };
+                assert!(!shape.inline, "children must not advance the paragraph pen");
+                assert_eq!(
+                    shape.z_order, source_index as u32,
+                    "source order owns inline group painting"
+                );
+                assert!(shape.anchor_acquisition.is_none());
+                assert_eq!(shape.rotation, -90.0);
+                assert_eq!(
+                    shape.text_upright,
+                    (shape.text_blocks[0].text == "BETA").then_some(true)
+                );
+                assert_eq!((shape.width_pt, shape.height_pt), (40.0, 20.0));
+                (
+                    shape.text_blocks[0].text.as_str(),
+                    shape.anchor_x_pt,
+                    shape.anchor_y_pt,
+                )
+            })
+            .collect();
+        assert_eq!(children, vec![("ALPHA", 40.0, 20.0), ("BETA", 100.0, 20.0)]);
+
+        // A nested leaf stays on Annex L's authored-axis scale path. The
+        // wp:extent adapter must not turn it into a directly grouped leaf.
+        let nested_xml = xml
+            .replace("<wp:extent cx=\"2540000\" cy=\"635000\"/>", "<wp:extent cx=\"2540000\" cy=\"317500\"/>")
+            .replace("<wps:wsp>", "<wpg:grpSp><wpg:grpSpPr><a:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"1270000\" cy=\"317500\"/><a:chOff x=\"0\" y=\"0\"/><a:chExt cx=\"1270000\" cy=\"317500\"/></a:xfrm></wpg:grpSpPr><wps:wsp>")
+            .replace("</wps:wsp>", "</wps:wsp></wpg:grpSp>");
+        let nested_doc = roxmltree::Document::parse(&nested_xml).unwrap();
+        let nested_runs = parse_inline_drawing_impl(
+            &StyleMap::default(),
+            &mut NumberingMap::default(),
+            nested_doc.root_element(),
+            &HashMap::from([("rIdOverlay".into(), "word/media/overlay.png".into())]),
+            &ChartMap::default(),
+            &HashMap::new(),
+            &ThemeColors::default(),
+            DepthGuard::root(),
+        );
+        let [DocRun::Shape(nested_group)] = nested_runs.as_slice() else {
+            panic!("group missing")
+        };
+        let TextBoxBlockWire::Body(BodyElement::Paragraph(nested_paragraph)) =
+            &nested_group.text_box_content[0]
+        else {
+            panic!("story missing")
+        };
+        let DocRun::Shape(nested_leaf) = &nested_paragraph.runs[0] else {
+            panic!("leaf missing")
+        };
+        assert_eq!((nested_leaf.width_pt, nested_leaf.height_pt), (40.0, 10.0));
+
+        let outer_xml = format!(
+            r#"<w:drawing
+          xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+          xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+          xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+          xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">
+          <wp:inline><wp:extent cx="3810000" cy="1270000"/><a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">
+          <wps:wsp><wps:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="3810000" cy="1270000"/></a:xfrm><a:prstGeom prst="rect"/></wps:spPr>
+          <wps:txbx><w:txbxContent><w:p><w:r><w:t>OUTER</w:t></w:r><w:r>{xml}</w:r></w:p></w:txbxContent></wps:txbx><wps:bodyPr/>
+          </wps:wsp></a:graphicData></a:graphic></wp:inline></w:drawing>"#
+        );
+        let outer_doc = roxmltree::Document::parse(&outer_xml).unwrap();
+        let outer_runs = parse_inline_drawing_impl(
+            &StyleMap::default(),
+            &mut NumberingMap::default(),
+            outer_doc.root_element(),
             &HashMap::new(),
             &ChartMap::default(),
             &HashMap::new(),
             &ThemeColors::default(),
             DepthGuard::root(),
         );
-        assert!(
-            !runs.iter().any(|run| matches!(run, DocRun::Shape(_))),
-            "an inline WPG group must not collapse to its first nested WPS shape"
+        let [DocRun::Shape(outer)] = outer_runs.as_slice() else {
+            panic!("outer shape missing")
+        };
+        assert_eq!(
+            (outer.width_pt, outer.height_pt),
+            (300.0, 100.0),
+            "a nested drawing cannot replace its containing inline shape"
         );
+        assert!(outer.text_blocks[0].text.starts_with("OUTER"));
     }
 }
 

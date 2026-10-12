@@ -2,18 +2,27 @@ import type { Worksheet } from '../../types.js';
 import type { WireSizeOverrides } from '../../worker-protocol.js';
 import { derivedAutoRowHeights } from '../../renderer.js';
 import type { OutlineAxis } from '../../outline.js';
+import { getColumnCssWidth, setColumnCssWidth } from '../column-css-overrides.js';
+import { GridGeometry } from '../grid-geometry.js';
+import { replaceRowResizeRanges, rowResizeRanges, setRowResizeRanges,
+  type RowResizeRange, type RowBandRange, type RowResizePreview } from '../row-resize-overrides.js';
 
 type OutlineState = {
   rowCollapsed: Map<number, boolean>;
   colCollapsed: Map<number, boolean>;
   stashedRowHeights: Map<number, number | undefined>;
   stashedColWidths: Map<number, number | undefined>;
+  /** Paired CSS pixel intent; `undefined` stashes CSS absence. */
+  stashedColCssWidths: Map<number, number | undefined>;
 };
 
 type SizeOverrides = {
   rows: Map<number, number | null>;
+  rowHeightRanges?: readonly RowResizeRange[];
   automaticRows: Map<number, number>;
   cols: Map<number, number | null>;
+  /** Canonical logical CSS px of user column resizes; `null` = removed. */
+  colCss: Map<number, number | null>;
   revision: number;
   wire?: WireSizeOverrides;
 };
@@ -30,6 +39,7 @@ export class SheetViewEdits {
    * maps belong to {@link outlineStateStore} and survive projection eviction. */
   private stashedRowHeights = new Map<number, number | undefined>();
   private stashedColWidths = new Map<number, number | undefined>();
+  private stashedColCssWidths = new Map<number, number | undefined>();
   /** Only user-mutated outline flags and pre-collapse sizes survive a sheet
    * switch. The parser's filters and frozen panes are read-only here; selection
    * and scroll are viewer viewport state, reset by navigation as before. */
@@ -59,11 +69,13 @@ export class SheetViewEdits {
       state = {
         rowCollapsed: new Map(), colCollapsed: new Map(),
         stashedRowHeights: new Map(), stashedColWidths: new Map(),
+        stashedColCssWidths: new Map(),
       };
       this.outlineStateStore.set(sheetIndex, state);
     }
     this.stashedRowHeights = state.stashedRowHeights;
     this.stashedColWidths = state.stashedColWidths;
+    this.stashedColCssWidths = state.stashedColCssWidths;
   }
 
   /** Set a row/column hidden by mapping to the size-0 encoding the axis/renderer
@@ -97,16 +109,23 @@ export class SheetViewEdits {
       if (hidden) {
         if (!this.stashedColWidths.has(index)) {
           this.stashedColWidths.set(index, ws.colWidths[index]);
+          this.stashedColCssWidths.set(index, getColumnCssWidth(ws, index));
         }
         ws.colWidths[index] = 0;
+        // Hidden is size 0; a stale CSS override must not keep the band visible.
+        setColumnCssWidth(ws, index, null);
       } else {
         if (this.stashedColWidths.has(index)) {
           const orig = this.stashedColWidths.get(index);
           if (orig === undefined) delete ws.colWidths[index];
           else ws.colWidths[index] = orig;
+          // Restore the pixel intent, including its original absence.
+          setColumnCssWidth(ws, index, this.stashedColCssWidths.get(index) ?? null);
           this.stashedColWidths.delete(index);
+          this.stashedColCssWidths.delete(index);
         } else if (ws.colWidths[index] === 0) {
           delete ws.colWidths[index];
+          setColumnCssWidth(ws, index, null);
         }
       }
     }
@@ -118,20 +137,109 @@ export class SheetViewEdits {
 
   /** Record band `index`'s CURRENT model size (or `null` = no entry) in the
    *  per-sheet override store. Called after every view-only size mutation so
-   *  both render modes receive this viewer's independent projection. */
-  recordSizeOverride(ws: Worksheet, sheetIndex: number, axis: OutlineAxis, index: number): void {
+   *  both render modes receive this viewer's independent projection.
+   *  `columnCssPx` is the logical CSS px a user column drag captured: it is
+   *  stored as the column's canonical view-only width so a later MDW change
+   *  keeps the drag's pixel size. Without it, the worksheet's current CSS
+   *  override (possibly none) is mirrored. CSS metadata changes bump the
+   *  revision even when the raw `colWidths` number is unchanged. */
+  recordSizeOverride(
+    ws: Worksheet,
+    sheetIndex: number,
+    axis: OutlineAxis,
+    index: number,
+    columnCssPx?: number,
+  ): void {
     let entry = this.sizeOverrideStore.get(sheetIndex);
     if (!entry) {
-      entry = { rows: new Map(), automaticRows: new Map(), cols: new Map(), revision: 0 };
+      entry = {
+        rows: new Map(), automaticRows: new Map(), cols: new Map(), colCss: new Map(), revision: 0,
+      };
       this.sizeOverrideStore.set(sheetIndex, entry);
     }
     const target = axis === 'row' ? entry.rows : entry.cols;
     if (axis === 'row') entry.automaticRows.delete(index);
     const value = axis === 'row' ? ws.rowHeights[index] ?? null : ws.colWidths[index] ?? null;
-    if (target.get(index) === value && target.has(index)) return;
-    target.set(index, value);
+    let changed = false;
+    if (target.get(index) !== value) {
+      target.set(index, value);
+      changed = true;
+    }
+    if (axis === 'col') {
+      if (columnCssPx !== undefined) setColumnCssWidth(ws, index, columnCssPx);
+      const css = getColumnCssWidth(ws, index) ?? null;
+      if (entry.colCss.has(index) ? entry.colCss.get(index) !== css : css !== null) {
+        entry.colCss.set(index, css);
+        changed = true;
+      }
+    }
+    if (!changed) return;
     entry.revision++;
     entry.wire = undefined;
+  }
+
+  /** Check the cumulative manual resize fan-out before capture/mutation. The
+   * selection-input budget bounds one gesture; this check prevents successive
+   * disjoint gestures from accumulating a million retained per-band overrides.
+   * Re-editing an existing band costs no new slot. Existing outline edits count
+   * in this channel too; derived automatic row heights have their own lifecycle. */
+  assertResizeBudget(sheetIndex: number, axis: OutlineAxis, indices: readonly number[], limit: number): void {
+    const entry = this.sizeOverrideStore.get(sheetIndex);
+    const target = axis === 'row' ? entry?.rows : entry?.cols;
+    let count = target?.size ?? 0;
+    for (const index of indices) if (!target?.has(index)) count++;
+    if (count > limit) {
+      throw new RangeError(`A resize projection may retain at most ${limit} manually edited bands per axis.`);
+    }
+  }
+
+  /** Compact live preview, based on the gesture's immutable starting ranges.
+   * Candidate interval construction can fail without touching the projection.
+   * Cancel/navigation/teardown restores only this gesture's ranges, preserving
+   * independently derived heights and outline edits. No row ordinal expansion. */
+  beginRowResizePreview(ws: Worksheet, sheetIndex: number, targets: readonly RowBandRange[]): RowResizePreview {
+    const prior = rowResizeRanges(ws);
+    let applied = false;
+    const install = (ranges: readonly RowResizeRange[]) => {
+      let entry = this.sizeOverrideStore.get(sheetIndex);
+      if (!entry && ranges.length) {
+        entry = { rows: new Map(), automaticRows: new Map(), cols: new Map(), colCss: new Map(), revision: 0 };
+        this.sizeOverrideStore.set(sheetIndex, entry);
+      }
+      setRowResizeRanges(ws, ranges);
+      if (entry) {
+        entry.rowHeightRanges = ranges;
+        entry.revision++;
+        entry.wire = undefined;
+        // Keep the empty ledger's monotonic revision after cancellation. A new
+        // preview must not reuse an old worker cache revision if rollback paint
+        // was overtaken. wireSizeOverrides still omits empty payloads.
+      }
+      GridGeometry.invalidate(ws);
+    };
+    return {
+      apply: height => {
+        const candidate = replaceRowResizeRanges(prior, targets, height);
+        install(candidate);
+        applied = true;
+      },
+      rollback: () => {
+        if (applied) install(prior);
+        applied = false;
+      },
+    };
+  }
+
+  /** Reconcile compact metadata at installation too: while sheet acquisition
+   * awaited, a gesture on the still-visible sheet may have begun or cancelled.
+   * A prepared projection must not retain an earlier preview snapshot. */
+  restoreRowResizeRanges(sheetIndex: number, worksheet: Worksheet): void {
+    const ranges = this.sizeOverrideStore.get(sheetIndex)?.rowHeightRanges ?? [];
+    const current = rowResizeRanges(worksheet);
+    if ((ranges.length || current.length) && ranges !== current) {
+      setRowResizeRanges(worksheet, ranges);
+      GridGeometry.invalidate(worksheet);
+    }
   }
 
   /** A sheet's override store serialized for the wire, or undefined when
@@ -141,15 +249,18 @@ export class SheetViewEdits {
     revision: number;
   }> | undefined {
     const entry = this.sizeOverrideStore.get(sheetIndex);
-    if (!entry || (entry.rows.size === 0 && entry.automaticRows.size === 0 && entry.cols.size === 0)) {
+    if (!entry || (entry.rows.size === 0 && entry.automaticRows.size === 0 && entry.cols.size === 0
+      && !entry.rowHeightRanges?.length)) {
       return undefined;
     }
     if (!entry.wire) {
       const wire: WireSizeOverrides = {};
+      if (entry.rowHeightRanges?.length) wire.rowHeightRanges = entry.rowHeightRanges;
       if (entry.rows.size > 0 || entry.automaticRows.size > 0) {
         wire.rows = Object.fromEntries([...entry.automaticRows, ...entry.rows]);
       }
       if (entry.cols.size > 0) wire.cols = Object.fromEntries(entry.cols);
+      if (entry.colCss.size > 0) wire.columnCssWidths = Object.fromEntries(entry.colCss);
       entry.wire = wire;
     }
     return { overrides: entry.wire, revision: entry.revision };
@@ -166,7 +277,7 @@ export class SheetViewEdits {
    * capturing a prepared-initial anchor reference from an edited projection. */
   hasViewEdits(sheetIndex: number): boolean {
     const sizes = this.sizeOverrideStore.get(sheetIndex);
-    if (sizes && (sizes.rows.size > 0 || sizes.cols.size > 0)) return true;
+    if (sizes && (sizes.rows.size > 0 || sizes.cols.size > 0 || sizes.rowHeightRanges?.length)) return true;
     const outline = this.outlineStateStore.get(sheetIndex);
     return outline !== undefined && (outline.rowCollapsed.size > 0 || outline.colCollapsed.size > 0);
   }
@@ -185,7 +296,9 @@ export class SheetViewEdits {
     let entry = this.sizeOverrideStore.get(sheetIndex);
     if (!entry && next.size === 0) return;
     if (!entry) {
-      entry = { rows: new Map(), automaticRows: new Map(), cols: new Map(), revision: 0 };
+      entry = {
+        rows: new Map(), automaticRows: new Map(), cols: new Map(), colCss: new Map(), revision: 0,
+      };
       this.sizeOverrideStore.set(sheetIndex, entry);
     }
     entry.automaticRows = next;
@@ -217,6 +330,7 @@ export class SheetViewEdits {
   /** Rebuild only the mutable projection fields. The large row/cell graph is
    * reacquired from the workbook cache and may have been evicted meanwhile. */
   restoreSheetViewState(sheetIndex: number, worksheet: Worksheet): void {
+    this.restoreRowResizeRanges(sheetIndex, worksheet);
     const sizes = this.sizeOverrideStore.get(sheetIndex);
     if (sizes) {
       for (const [index, size] of sizes.rows) {
@@ -227,6 +341,7 @@ export class SheetViewEdits {
         if (size === null) delete worksheet.colWidths[index];
         else worksheet.colWidths[index] = size;
       }
+      for (const [index, css] of sizes.colCss) setColumnCssWidth(worksheet, index, css);
     }
     const outline = this.outlineStateStore.get(sheetIndex);
     if (!outline) return;
@@ -250,6 +365,7 @@ export class SheetViewEdits {
     this.outlineStateStore.clear();
     this.stashedRowHeights.clear();
     this.stashedColWidths.clear();
+    this.stashedColCssWidths.clear();
     this.sizeOverrideStore.clear();
   }
 }

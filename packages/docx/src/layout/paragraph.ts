@@ -37,7 +37,7 @@ import {
 } from '../line-layout.js';
 import {
   calcEffectiveFontPx, EAST_ASIAN_RE, independentTextShapeRequest,
-  replaceTextShapeRequest, sliceTextShapeRequest, shapeRunToDocRun,
+  replaceTextShapeRequest, sliceTextShapeRequest, sliceSemanticSlotSpans, shapeRunToDocRun,
 } from './text.js';
 import { eastAsianUprightPaintOps } from './vertical-glyph-orientation.js';
 import { wordTrackChangeDecoration } from './paint-compatibility.js';
@@ -1325,6 +1325,9 @@ export interface ParagraphAcquisitionOptions {
   /** WORD_LATER_ANCHOR_EARLIER_LINE_WRAP: carried first-placement object
    * frames keyed by anchor occurrence. */
   readonly frozenAnchorFrames?: ReadonlyMap<string, LayoutRect>;
+  /** Cell-grid wrap preserves an empty carrier's insertion reference while
+   * its paragraph flow is admitted below the grid. Paragraph-local points. */
+  readonly paragraphAnchorReferenceDeltaPt?: number;
 }
 
 function runSource(source: SourceRef, runIndex: number): SourceRef {
@@ -1510,22 +1513,27 @@ function textPlacement(
       })
     : [];
   const baselineOffsetPt = retainedBaselineOffsetPt(segment);
+  const sourceEnd = sourceOffset + logicalTextSegmentLength(segment);
   return {
     kind: 'text',
     text: segment.text,
-    ...(segment.semanticSlotSpans ? { semanticSlotSpans: segment.semanticSlotSpans } : {}),
+    ...(segment.optionalHyphenGlyph ? { optionalHyphenGlyph: true as const } : {}),
+    ...(segment.semanticSlotSpans ? { semanticSlotSpans: segment.semanticSlotRange
+      ? sliceSemanticSlotSpans(segment.semanticSlotSpans,
+        segment.semanticSlotRange.start, segment.semanticSlotRange.end)
+      : segment.semanticSlotSpans } : {}),
     ...(runIndex === undefined ? {} : { sourceRunIndex: runIndex }),
     ...(run?.type === 'field' ? { role: 'field-result' as const, dependency: fieldDependency(run) } : {}),
     ...(run?.type === 'text'
       && (run.noteRef?.kind === 'footnote' || run.noteRef?.kind === 'endnote')
       ? { noteReference: { kind: run.noteRef.kind, id: run.noteRef.id } }
       : {}),
-    range: { start: sourceOffset, end: sourceOffset + segment.text.length },
+    range: { start: sourceOffset, end: sourceEnd },
     origin: { xPt, yPt: baselinePt + baselineOffsetPt },
     bounds: { xPt, yPt: topPt, widthPt: segment.measuredWidth, heightPt },
     advancePt: segment.measuredWidth,
     clusters: [{
-      range: { start: sourceOffset, end: sourceOffset + segment.text.length },
+      range: { start: sourceOffset, end: sourceEnd },
       offset: { xPt: 0, yPt: 0 },
       advancePt: segment.measuredWidth,
     }],
@@ -1612,7 +1620,7 @@ function textPlacement(
     decorations: [],
     paintOps: [{
       text: segment.text,
-      range: { start: sourceOffset, end: sourceOffset + segment.text.length },
+      range: { start: sourceOffset, end: sourceEnd },
       offset: { xPt: 0, yPt: baselineOffsetPt },
       letterSpacingPt: effectiveCharacterSpacingPt(segment),
       scaleX: segment.charScale ?? 1,
@@ -2054,14 +2062,28 @@ function textPlanSegment(
     };
   });
   if (segment.latinSpaceCompressionPx && segment.text.endsWith(' ') && clusters.length > 0) {
-    // The fit projection removes only the final invisible U+0020 advance.
-    // Keep retained cluster geometry inside the same shortened segment box;
+    // The fit projections remove only the segment's trailing invisible U+0020
+    // advances, shrinking each by the same share: one space under
+    // WORD_LATIN_INTERWORD_XAVG_FLOOR, possibly several consecutive ones under
+    // WORD_COMPRESSED_SPACE_LINE_FIT. Take each share from the cluster owning
+    // that space and move later clusters with it, so retained clusters and
+    // source-owned fragments stay inside the same shortened segment box;
     // Canvas paint operations still draw the preceding visible glyph naturally.
-    const last = clusters.length - 1;
-    clusters[last] = {
-      ...clusters[last],
-      advancePt: Math.max(0, clusters[last].advancePt - segment.latinSpaceCompressionPx),
-    };
+    const spacesStart = sourceOffset + segment.text.replace(/ +$/u, '').length;
+    const perSpacePt = segment.latinSpaceCompressionPx
+      / (sourceOffset + segment.text.length - spacesStart);
+    let removedPt = 0;
+    clusters = clusters.map((cluster) => {
+      const spaces = Math.max(0, cluster.range.end - Math.max(cluster.range.start, spacesStart));
+      if (spaces === 0 && removedPt === 0) return cluster;
+      const placed = {
+        ...cluster,
+        offset: { ...cluster.offset, xPt: cluster.offset.xPt - removedPt },
+        advancePt: Math.max(0, cluster.advancePt - spaces * perSpacePt),
+      };
+      removedPt += spaces * perSpacePt;
+      return placed;
+    });
   }
   const snapLeadingPadPt = segment.snapGridLeadingPadPx ?? 0;
   let decorationTerminalAdvancePt = segment.measuredWidth
@@ -2278,9 +2300,14 @@ function textPlanSegment(
     ...(segment.latinSpaceCompressionPx ? {
       trailingSpaceCompressionPt: segment.latinSpaceCompressionPx,
     } : {}),
-    clusters,
+    // A discretionary glyph has real ink and advance, but no source UTF-16
+    // units. Keep its shaped geometry at the authored zero-length boundary.
+    clusters: segment.optionalHyphenGlyph ? clusters.map(cluster => ({
+      ...cluster, range: { start: sourceOffset, end: sourceOffset },
+    })) : clusters,
     basePaintOps: basePaintOps.map((operation) => ({
       ...operation,
+      ...(segment.optionalHyphenGlyph ? { range: { start: sourceOffset, end: sourceOffset } } : {}),
       offset: { ...operation.offset,
         xPt: operation.offset.xPt + (segment.leadingWordBoundaryPx ?? 0) },
       // Measurement resolves w:spacing, docGrid character pitch, and w:fitText
@@ -2356,7 +2383,7 @@ function logicalOccurrenceMap(
       const runIndex = sourceRunIndex(segment);
       if (runIndex === undefined) continue;
       const length = 'text' in segment
-        ? (segment.metricOnly ? 0 : segment.text.length)
+        ? logicalTextSegmentLength(segment)
         : 'math' in segment ? segment.fallbackText.length
           : 'isTab' in segment || 'imagePath' in segment ? 1 : 0;
       measuredLengths.set(runIndex, (measuredLengths.get(runIndex) ?? 0) + length);
@@ -2384,8 +2411,12 @@ function logicalOccurrenceMap(
   return { runStarts, runLengths };
 }
 
+function logicalTextSegmentLength(segment: LayoutTextSeg): number {
+  return segment.metricOnly || segment.optionalHyphenGlyph ? 0 : segment.text.length;
+}
+
 function segmentOccurrenceLength(segment: LayoutTextSeg | LayoutTabSeg | LayoutImageSeg | LayoutMathSeg): number {
-  if ('text' in segment) return segment.metricOnly ? 0 : segment.text.length;
+  if ('text' in segment) return logicalTextSegmentLength(segment);
   if ('math' in segment) return segment.fallbackText.length;
   return 1;
 }
@@ -3311,7 +3342,14 @@ function acquireAnchorOccurrence(
         : null,
       paragraph: {
         xPt: options.placement.paragraphXPt,
-        yPt: options.placement.startYPt,
+        yPt: options.placement.startYPt + (
+          outer.run.anchorAcquisitionInput.vertical.relativeFrom === 'paragraph'
+          && outer.run.anchorAcquisitionInput.wrap.kind === 'none'
+          && behavior.allowOverlap === true
+          && behavior.layoutInCell === true && options.anchorCellBounds !== undefined
+          && options.environment.pageWritingMode === 'horizontal-tb'
+            ? options.paragraphAnchorReferenceDeltaPt ?? 0 : 0
+        ),
         widthPt: options.placement.availableWidthPt,
         heightPt: Math.max(0, paragraphHeightPt),
       },
@@ -3319,7 +3357,10 @@ function acquireAnchorOccurrence(
       // reference frame; paragraph ownership already precedes before-spacing.
       // The retained host index owns first-line policy. Distinct physical
       // lines can share a numeric top; equal coordinates do not transfer it.
+      // Only posOffset was measured: translating the frame for wp:align would
+      // also move the line's center/bottom edge, so alignment keeps the line.
       line: hostLineIndex === 0 && options.context.lineGrid.active && outer.run.type === 'image'
+        && outer.run.anchorAcquisitionInput.vertical.choice.kind === 'offset'
         ? { ...line.bounds, yPt: wordGridPictureLineOriginPt(
             line.bounds.yPt, options.placement.startYPt, contentStartYPt,
           ) }
@@ -3975,7 +4016,7 @@ function translateTextBoxStory(
 /**
  * Translation that keeps an aligned anchor's `wp:align` values when spAutoFit
  * gives a text box a fitted extent different from its authored one
- * (ECMA-376 §20.4.3.1 wp:align, §21.1.2.1.3 spAutoFit): the aligned edge
+ * (ECMA-376 §20.4.2.2 wp:align / §20.4.3.2 ST_AlignV, §21.1.2.1.3 spAutoFit): the aligned edge
  * belongs to the drawn extent. A trailing value (`right`/`bottom`, or
  * `inside`/`outside` by page parity) keeps the fitted box's trailing edge on
  * the authored one and `center` keeps the centre. Offsets, percentages and
@@ -4248,8 +4289,10 @@ export function acquireShapeTextBoxLayout(
     // Issue #1668 Word controls: 0/30/90 degree shape rotations carry the
     // WordArt text frame; flipH keeps it readable, flipV turns it 180 degrees.
     // Retain the composed transform here so paint/indexing use the same frame.
-    const textRotationDeg = stackedWordArt
-      ? (shape.rotation ?? 0) + (shape.flipV ? 180 : 0) : 0;
+    // ECMA-376 §20.4.2.22 bodyPr@upright opts out of the accompanying
+    // shape transform, including WordArt's vertical-flip rotation.
+    const textRotationDeg = shape.textUpright ? 0
+      : (shape.rotation ?? 0) + (stackedWordArt && shape.flipV ? 180 : 0);
     // Exact data for quarter turns: Math.cos(π/2) is not 0, and a quarter
     // turn must stay one (axis-aligned) for its story's page frames.
     const quarterTurns = Number.isInteger(textRotationDeg / 90)
@@ -4259,14 +4302,23 @@ export function acquireShapeTextBoxLayout(
       ? Math.sin(textRotationDeg * Math.PI / 180) : [0, 1, 0, -1][quarterTurns]!;
     const cos = quarterTurns === null
       ? Math.cos(textRotationDeg * Math.PI / 180) : [1, 0, -1, 0][quarterTurns]!;
-    const transform: Matrix2DData = verticalMode ? {
-      a: stackedWordArt ? -sin : 0,
-      b: verticalMode === 'vert270' ? -1 : cos,
-      c: verticalMode === 'vert270' ? 1 : -cos,
-      d: stackedWordArt ? -sin : 0,
+    const orientation: Matrix2DData = verticalMode ? {
+      a: 0,
+      b: verticalMode === 'vert270' ? -1 : 1,
+      c: verticalMode === 'vert270' ? 1 : -1,
+      d: 0,
       e: effectiveRect.xPt + effectiveRect.widthPt / 2,
       f: effectiveRect.yPt + effectiveRect.heightPt / 2,
     } : { a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 };
+    // DrawingML text follows its shape rotation unless bodyPr@upright opts out.
+    // Compose once here so canvas paint and the text index share the same frame.
+    const centerX = effectiveRect.xPt + effectiveRect.widthPt / 2;
+    const centerY = effectiveRect.yPt + effectiveRect.heightPt / 2;
+    const transform = textRotationDeg === 0 ? orientation : composeAffine({
+      a: cos, b: sin, c: -sin, d: cos,
+      e: centerX - cos * centerX + sin * centerY,
+      f: centerY - sin * centerX - cos * centerY,
+    }, orientation);
     const layout: TextBoxLayout = deepFreezePlainData({
       kind: 'textbox', id: options.id, source: normalized[0]?.source ?? storySource,
       flowDomainId: `${options.flowDomainId}:textbox`, flowBounds: effectiveRect, inkBounds: effectiveRect,
@@ -4691,6 +4743,7 @@ function paragraphAcquisitionKey(
     ],
     lineOnly ? null : JSON.stringify(options.exclusions),
     lineOnly || !hasAnchoredPayload ? null : JSON.stringify(options.anchorCollisions ?? []),
+    lineOnly || !hasAnchoredPayload ? null : options.paragraphAnchorReferenceDeltaPt ?? null,
     lineOnly || !hasAnchoredPayload || !options.frozenAnchorFrames?.size
       ? null
       : JSON.stringify([...options.frozenAnchorFrames].sort(([left], [right]) => left.localeCompare(right))),

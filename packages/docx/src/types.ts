@@ -737,6 +737,9 @@ export interface NumberingInfo {
   picBulletWidthPt?: number;
   /** Picture-bullet marker height in pt (from the `<v:shape style="height">`). */
   picBulletHeightPt?: number;
+  /** Carrier transforms painted within the resolved marker box. They do not
+   *  determine its size or the font governing native AUTO sizing. */
+  picBulletTransform?: Pick<ImageRun, 'srcRect' | 'rotation' | 'flipH' | 'flipV'>;
 }
 
 type DocRunContent =
@@ -979,6 +982,8 @@ export interface ShapeRun {
    *  left-to-right column layout (both wordArtVert and wordArtVertRtl).
    *  Other unrecognised values fall back to horizontal. */
   textVert?: string | null;
+  /** DrawingML bodyPr@upright: keep text independent of the shape rotation. */
+  textUpright?: boolean | null;
   /** ECMA-376 Part 4 §19.1.2.23 `<v:textpath>` — WordArt text laid on the
    *  shape path (a text watermark). When set the renderer draws this string,
    *  scaled to fill the box (`fitshape`), rotated by {@link ShapeRun.rotation},
@@ -1724,6 +1729,10 @@ export interface DocxTextRunInfo {
   sourceRunIndex?: number;
   /** Resolved direction of this rendered text segment. */
   direction?: 'ltr' | 'rtl';
+  /** Selected authored discretionary ink keeps its original empty logical
+   * text owner. Its painted '-' is retained by the Canvas layout, not copied
+   * into the selection or the find index. Literal hyphens omit this flag. */
+  optionalHyphenGlyph?: true;
   text: string;
   /** Left edge in canvas CSS px. */
   x: number;

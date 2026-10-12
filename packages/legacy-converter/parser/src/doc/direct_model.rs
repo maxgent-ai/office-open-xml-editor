@@ -289,9 +289,9 @@ pub(super) fn build(
 }
 
 /// Report the bounded native-cell projection from `story::project`, not a
-/// native Word positioning rule. The shared cell-flow consumer's evidence is
-/// DOCX-only; native nested-cell frames retain their facts without applying
-/// that placement. Mirror frames are already consumed by table positioning,
+/// native Word positioning rule. Homogeneous first-block grids with an acquired
+/// cell frame now have a placement consumer; other retained nested-cell frames
+/// still lack established ownership. Mirror frames are consumed by TAP positioning,
 /// and all other unsupported owners have failed before this final-body pass.
 ///
 /// Scan only retained main-story tables after merge-continuation replacement:
@@ -333,7 +333,9 @@ fn report_nested_cell_frame_flow(
                     for block in &cell.content {
                         match block {
                             CellElement::Paragraph(paragraph)
-                                if nested && paragraph.frame_pr.is_some() =>
+                                if nested
+                                    && table.table_layout.cell_frame.is_none()
+                                    && paragraph.frame_pr.is_some() =>
                             {
                                 has_frame = true;
                                 break 'walk;
@@ -496,7 +498,10 @@ fn direct_picture_references<'a>(
         if !key.starts_with("legacy-doc/") {
             return Ok(());
         }
-        if !(key.starts_with("legacy-doc/image/") || key.starts_with("legacy-doc/float/")) {
+        if !(key.starts_with("legacy-doc/image/")
+            || key.starts_with("legacy-doc/bullet/")
+            || key.starts_with("legacy-doc/float/"))
+        {
             return Err(unsupported("unknown direct DOC picture resource namespace"));
         }
         budget.push(references, key)
@@ -1137,6 +1142,32 @@ mod tests {
         build_scoped_cfb(&[("WordDocument", word), ("0Table", table)])
     }
 
+    /// Isolate a one-CP control's CHPX from both neighboring Unicode text
+    /// spans. This prevents a text run or paragraph mark from validating the
+    /// control's operand on its behalf.
+    fn source_with_control_chpx(text: &str, cp: usize, chpx: &[u8]) -> Vec<u8> {
+        let source = source(text);
+        let cfb = CompoundFile::open(&source).unwrap();
+        let mut word = cfb.stream("WordDocument").unwrap();
+        let table = cfb.stream("0Table").unwrap();
+        let bte = u32::from_le_bytes(word[0xfa..0xfe].try_into().unwrap()) as usize;
+        let page_number = u32::from_le_bytes(table[bte + 8..bte + 12].try_into().unwrap()) as usize;
+        let page = &mut word[page_number * 512..(page_number + 1) * 512];
+        page.fill(0);
+        for (index, boundary) in [0, cp, cp + 1, text.encode_utf16().count()]
+            .into_iter()
+            .enumerate()
+        {
+            page[index * 4..index * 4 + 4]
+                .copy_from_slice(&((0x400 + boundary * 2) as u32).to_le_bytes());
+        }
+        page[17] = 32;
+        page[64] = chpx.len() as u8;
+        page[65..65 + chpx.len()].copy_from_slice(chpx);
+        page[511] = 3;
+        build_scoped_cfb(&[("WordDocument", word), ("0Table", table)])
+    }
+
     pub(super) fn with_picture_data(source: &[u8], vanish: bool) -> Vec<u8> {
         let cfb = CompoundFile::open(source).unwrap();
         let mut word = cfb.stream("WordDocument").unwrap();
@@ -1289,7 +1320,7 @@ mod tests {
     /// A textbox (msosptTextBox) or rectangle anchored in the main or header
     /// document. The textbox story follows the header story; its FTXBXS and
     /// Tbkd tables name the shape (MS-DOC 2.3.6-2.3.7, 2.9.106, 2.9.312).
-    fn drawing_shape_source(textbox: Option<&str>, header: bool) -> Vec<u8> {
+    pub(super) fn drawing_shape_source(textbox: Option<&str>, header: bool) -> Vec<u8> {
         drawing_source(textbox, header, false, [0, 0])
     }
 
@@ -2190,6 +2221,180 @@ mod tests {
     }
 
     #[test]
+    fn documented_word97_base_aliases_preserve_complete_document_projection() {
+        let bytes = source("quartz\r");
+        let cfb = CompoundFile::open(&bytes).unwrap();
+        let original_word = cfb.stream("WordDocument").unwrap();
+        let table = cfb.stream("0Table").unwrap();
+        assert_eq!(&original_word[2..4], &0x00c1u16.to_le_bytes());
+        let project = |word: Vec<u8>| {
+            // Mutate the named stream, not an assumed physical CFB sector.
+            let bytes = build_scoped_cfb(&[("WordDocument", word), ("0Table", table.clone())]);
+            super::super::direct_model(&CompoundFile::open(&bytes).unwrap(), 1024 * 1024)
+                .map(|result| serde_json::to_value(result.document).unwrap())
+        };
+        let expected = project(original_word.clone()).unwrap();
+        assert_eq!(body_outline(&expected["body"]), ["p[t:quartz]"]);
+        for base in [0x00c0u16, 0x00c2] {
+            let mut word = original_word.clone();
+            word[2..4].copy_from_slice(&base.to_le_bytes());
+            assert_eq!(project(word).unwrap(), expected);
+        }
+        // An aliasable base cannot override the authoritative first extension
+        // word, including when that word names another base-only alias.
+        for extension in [0x00c0u16, 0x00c1, 0x00c2, 0x0120] {
+            let mut word = original_word.clone();
+            word[2..4].copy_from_slice(&0x00c0u16.to_le_bytes());
+            word[0x382..0x384].copy_from_slice(&2u16.to_le_bytes());
+            word[0x384..0x386].copy_from_slice(&extension.to_le_bytes());
+            assert!(project(word)
+                .unwrap_err()
+                .contains("unsupported Word FIB version"));
+        }
+        let mut word = original_word.clone();
+        word[2..4].copy_from_slice(&0x00c0u16.to_le_bytes());
+        word[0x382..0x384].copy_from_slice(&u16::MAX.to_le_bytes());
+        assert!(project(word)
+            .unwrap_err()
+            .contains("truncated Word FIB extension"));
+        let mut word = original_word.clone();
+        word[2..4].copy_from_slice(&0x00c0u16.to_le_bytes());
+        word[32..34].copy_from_slice(&15u16.to_le_bytes());
+        assert!(project(word)
+            .unwrap_err()
+            .contains("noncanonical Word FIB fixed prefix"));
+        let mut word = original_word;
+        word[2..4].copy_from_slice(&0x0120u16.to_le_bytes());
+        assert!(project(word)
+            .unwrap_err()
+            .contains("unsupported Word FIB version"));
+    }
+
+    #[test]
+    fn optional_hyphen_preserves_its_own_style_and_validates_its_hresi() {
+        // The astral character places the isolated marker at UTF-16 CP 3,
+        // rather than scalar index 2. Its formatting is absent from A/emoji/B
+        // and the paragraph mark, so only marker-owner acquisition can refuse
+        // a malformed Hresi operand.
+        let project = |chpx: &[u8]| {
+            let chpx = [&[0x42, 0x2a, 6, 0x43, 0x4a, 28, 0][..], chpx].concat();
+            let bytes = source_with_control_chpx("A\u{1f600}\u{1f}B\r", 3, &chpx);
+            super::super::direct_model(&CompoundFile::open(&bytes).unwrap(), 1024 * 1024)
+        };
+        for chpx in [&[][..], &[0x4e, 0x48, 1, 0][..]] {
+            let document = serde_json::to_value(project(chpx).unwrap().document).unwrap();
+            let runs = document["body"][0]["runs"].as_array().unwrap();
+            assert_eq!(runs.len(), 3);
+            assert_eq!(runs[0]["text"], "A😀");
+            assert_eq!(runs[1]["text"], "");
+            assert_eq!(runs[1]["__optionalHyphen"], true);
+            assert_eq!(runs[1]["color"], "ff0000");
+            assert_eq!(runs[1]["fontSize"], 14.0);
+            assert_eq!(runs[2]["text"], "B");
+        }
+        for chpx in [
+            &[0x4e, 0x48, 0, 0][..],
+            &[0x4e, 0x48, 0, 1, 0x4e, 0x48, 1, 0][..],
+            &[0x3c, 0x08, 1, 0x4e, 0x48, 0, 1][..],
+        ] {
+            assert!(project(chpx)
+                .unwrap_err()
+                .contains("invalid Word word-breaking method"));
+        }
+        assert!(project(&[0x4e, 0x48, 2, b'q'])
+            .unwrap_err()
+            .contains("unsupported formatting"));
+        // A vanished marker contributes neither a conditional glyph nor a
+        // break opportunity, after its properties have been validated.
+        let hidden = project(&[0x3c, 0x08, 1, 0x4e, 0x48, 1, 0]).unwrap();
+        let hidden = serde_json::to_value(hidden.document).unwrap();
+        assert_eq!(body_outline(&hidden["body"]), ["p[t:A😀,t:B]"]);
+    }
+
+    #[test]
+    fn hresi_final_direct_owner_admits_complete_document_and_retains_invalid_refusal() {
+        let project = |chpx: &[u8]| {
+            let bytes = source_with_direct_chpx("quartz\r", chpx);
+            super::super::direct_model(&CompoundFile::open(&bytes).unwrap(), 1024 * 1024)
+                .map(|result| serde_json::to_value(result.document).unwrap())
+        };
+        let expected = project(&[0x4e, 0x48, 1, 0]).unwrap();
+        assert_eq!(body_outline(&expected["body"]), ["p[t:quartz]"]);
+        for chpx in [
+            &[0x4e, 0x48, 2, b'q', 0x4e, 0x48, 1, 0][..],
+            &[0x4e, 0x48, 2, b'q', 0x33, 0x2a, 0][..],
+        ] {
+            assert_eq!(project(chpx).unwrap(), expected);
+        }
+        for chpx in [
+            &[0x4e, 0x48, 2, b'q'][..],
+            &[0x4e, 0x48, 1, 0, 0x4e, 0x48, 2, b'q'][..],
+            &[0x86, 0x2a, 2, 0x4e, 0x48, 2, b'q', 0x4e, 0x48, 1, 0][..],
+        ] {
+            assert!(project(chpx)
+                .unwrap_err()
+                .contains("unsupported formatting"));
+        }
+        for chpx in [
+            &[0x4e, 0x48, 0, 0][..],
+            &[0x4e, 0x48, 0, 1][..],
+            &[0x4e, 0x48, 0, b'Z', 0x4e, 0x48, 1, 0][..],
+            &[0x4e, 0x48, 7, b'Z', 0x4e, 0x48, 1, 0][..],
+            &[0x4e, 0x48, 2][..],
+        ] {
+            assert!(project(chpx).is_err());
+        }
+        for chpx in [
+            &[0x33, 0x2a, 1, 0x4e, 0x48, 1, 0][..],
+            &[0x4e, 0x48, 1, 0, 0x33, 0x2a, 1][..],
+        ] {
+            assert!(project(chpx).is_err());
+        }
+
+        // MS-DOC 2.4.6.2: PRM1 character properties follow physical CHPX.
+        let project_piece = |direct: &[u8], piece: &[u8]| {
+            let bytes = source_with_direct_chpx("quartz\r", direct);
+            let bytes = super::table_tests::with_piece_prc(&bytes, piece, &[]);
+            super::super::direct_model(&CompoundFile::open(&bytes).unwrap(), 1024 * 1024)
+                .map(|result| serde_json::to_value(result.document).unwrap())
+        };
+        assert_eq!(
+            project_piece(&[0x4e, 0x48, 2, b'q'], &[0x4e, 0x48, 1, 0]).unwrap(),
+            expected
+        );
+        assert_eq!(
+            project_piece(&[], &[0x4e, 0x48, 2, b'q', 0x4e, 0x48, 1, 0]).unwrap(),
+            expected
+        );
+        assert!(project_piece(&[0x4e, 0x48, 1, 0], &[0x4e, 0x48, 2, b'q'])
+            .unwrap_err()
+            .contains("unsupported formatting"));
+        assert!(project_piece(&[0x4e, 0x48, 0, b'Z'], &[0x4e, 0x48, 1, 0]).is_err());
+    }
+
+    #[test]
+    fn hresi_final_level_marker_owner_controls_complete_document_admission() {
+        let project = |chpx: &[u8]| {
+            let bytes = with_numbering_level_chpx(&source("quartz\r"), chpx);
+            super::super::direct_model(&CompoundFile::open(&bytes).unwrap(), 1024 * 1024)
+                .map(|result| serde_json::to_value(result.document).unwrap())
+        };
+        let expected = project(&[0x4e, 0x48, 1, 0]).unwrap();
+        assert_eq!(
+            project(&[0x4e, 0x48, 2, b'q', 0x4e, 0x48, 1, 0]).unwrap(),
+            expected
+        );
+        for chpx in [
+            &[0x4e, 0x48, 2, b'q'][..],
+            &[0x4e, 0x48, 1, 0, 0x4e, 0x48, 2, b'q'][..],
+        ] {
+            assert!(project(chpx)
+                .unwrap_err()
+                .contains("unsupported formatting"));
+        }
+    }
+
+    #[test]
     fn default_font_fixup_chpx_reaches_the_native_document_without_losing_text() {
         let project = |chpx: &[u8]| {
             let bytes = source_with_direct_chpx("عربي x\r", chpx);
@@ -2936,6 +3141,175 @@ mod tests {
         assert!(picture_bullet_result(&bytes)
             .unwrap_err()
             .contains("lacks its picture position"));
+    }
+
+    #[test]
+    fn picture_bullet_projection_keeps_occurrence_geometry_and_owned_resources() {
+        let bytes = picture_bullet_source(
+            &picture_bullet_level(0, 1),
+            &[("_PictureBullets", 0, 1)],
+            100,
+        );
+        let cfb = CompoundFile::open(&bytes).unwrap();
+        let (document, resources) = crate::doc::with_acquired_doc(&cfb, |mut facts| {
+            // This positive ownership/geometry fixture retains two complete
+            // paragraph/numbering allocations plus body, reference and media
+            // storage. Quota rejection is exercised by the separate guards.
+            let mut model_budget = ModelBudget::new(16 * 1024);
+            let mut key = String::new();
+            let mut document = Document::default();
+            // Invented display boxes are supplied by the occurrence consumer.
+            // Neither sizing mode may reinterpret PICMID as the display box.
+            for (no_auto_size, display_box) in [(false, [8.0, 5.0]), (true, [12.0, 7.0])] {
+                let bullet = crate::doc::character::EnabledPictureBullet {
+                    relative_cp: 0,
+                    flags: crate::doc::character::PbiGrf {
+                        picture: true,
+                        no_auto_size,
+                    },
+                };
+                let projected = facts.pictures.direct_picture_bullet(
+                    &mut facts.formatting,
+                    bullet,
+                    display_box,
+                    &mut model_budget.remaining_bytes,
+                )?;
+                assert_eq!(projected.no_auto_size, no_auto_size);
+                assert_eq!(
+                    [projected.picture.width_pt, projected.picture.height_pt],
+                    display_box
+                );
+                assert_eq!(projected.picture.rotation, 90.0);
+                assert!(projected.picture.flip_h && projected.picture.flip_v);
+                let crop = projected.picture.crop.unwrap();
+                assert_eq!([crop.t, crop.b, crop.l, crop.r], [0.125, 0.25, 0.375, 0.5]);
+                if key.is_empty() {
+                    key = projected.picture.resource_key.clone();
+                } else {
+                    assert_eq!(key, projected.picture.resource_key);
+                }
+                let mut numbering = docx_model::NumberingInfo {
+                    num_id: 1,
+                    level: 0,
+                    format: "bullet".into(),
+                    text: "•".into(),
+                    indent_left: 18.0,
+                    tab: 18.0,
+                    suff: "tab".into(),
+                    jc: "left".into(),
+                    font_family: Some("Invented marker family".into()),
+                    font_family_east_asia: None,
+                    font_facts: None,
+                    color: None,
+                    color_auto: false,
+                    pic_bullet_image_path: None,
+                    pic_bullet_mime_type: None,
+                    pic_bullet_width_pt: None,
+                    pic_bullet_height_pt: None,
+                    pic_bullet_transform: None,
+                };
+                projected.install(&mut numbering, &mut model_budget.remaining_bytes)?;
+                assert_eq!(
+                    numbering.font_family.as_deref(),
+                    Some("Invented marker family")
+                );
+                assert_eq!(numbering.pic_bullet_width_pt, Some(display_box[0]));
+                assert_eq!(numbering.pic_bullet_height_pt, Some(display_box[1]));
+                let transform = numbering.pic_bullet_transform.as_ref().unwrap();
+                assert_eq!(transform.rotation, 90.0);
+                assert!(transform.flip_h && transform.flip_v);
+                let paragraph = docx_model::DocParagraph {
+                    numbering: Some(Box::new(numbering)),
+                    ..docx_model::DocParagraph::default()
+                };
+                model_budget.paragraph(&paragraph)?;
+                model_budget.push(
+                    &mut document.body,
+                    BodyElement::Paragraph(Box::new(paragraph)),
+                )?;
+            }
+            assert!(facts.pictures.has_selected_direct_resources());
+            let references = direct_picture_references(&document, &mut model_budget)?;
+            let resources = facts.pictures.finish_referenced_direct_resources(
+                &references,
+                &mut model_budget.remaining_bytes,
+            )?;
+            Ok((document, resources))
+        })
+        .unwrap();
+        drop(cfb);
+        drop(bytes);
+        assert_eq!(document.body.len(), 2);
+        for (paragraph, display_box) in document.body.iter().zip([[8.0, 5.0], [12.0, 7.0]]) {
+            let BodyElement::Paragraph(paragraph) = paragraph else {
+                panic!("paragraph occurrence")
+            };
+            let numbering = paragraph.numbering.as_ref().unwrap();
+            assert_eq!(
+                numbering.pic_bullet_image_path.as_deref(),
+                Some("legacy-doc/bullet/0")
+            );
+            assert_eq!(numbering.pic_bullet_width_pt, Some(display_box[0]));
+            assert_eq!(numbering.pic_bullet_height_pt, Some(display_box[1]));
+        }
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0].key, "legacy-doc/bullet/0");
+        assert_eq!(resources[0].mime_type, "image/png");
+        assert!(resources[0].bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+    }
+
+    #[test]
+    fn picture_bullet_projection_rejects_invalid_boxes_without_selection() {
+        let bytes = picture_bullet_source(
+            &picture_bullet_level(0, 1),
+            &[("_PictureBullets", 0, 1)],
+            100,
+        );
+        let cfb = CompoundFile::open(&bytes).unwrap();
+        crate::doc::with_acquired_doc(&cfb, |mut facts| {
+            let bullet = crate::doc::character::EnabledPictureBullet {
+                relative_cp: 0,
+                flags: crate::doc::character::PbiGrf {
+                    picture: true,
+                    no_auto_size: false,
+                },
+            };
+            let mut budget = 8192;
+            for display_box in [
+                [0.0, 5.0],
+                [8.0, -1.0],
+                [f64::NAN, 5.0],
+                [8.0, f64::INFINITY],
+            ] {
+                let error = facts
+                    .pictures
+                    .direct_picture_bullet(&mut facts.formatting, bullet, display_box, &mut budget)
+                    .unwrap_err();
+                assert!(error.contains("display box"), "{error}");
+                assert_eq!(budget, 8192);
+                assert!(!facts.pictures.has_selected_direct_resources());
+            }
+            let error = facts
+                .pictures
+                .direct_picture_bullet(&mut facts.formatting, bullet, [8.0, 5.0], &mut 0)
+                .unwrap_err();
+            assert_eq!(error, "OUTPUT_TOO_LARGE");
+            assert!(!facts.pictures.has_selected_direct_resources());
+            facts.pictures.direct_picture_bullet(
+                &mut facts.formatting,
+                bullet,
+                [8.0, 5.0],
+                &mut budget,
+            )?;
+            // A resource selected by an occurrence that was later trimmed must
+            // not survive final retained-reference selection.
+            assert!(facts
+                .pictures
+                .finish_referenced_direct_resources(&[], &mut budget)?
+                .is_empty());
+            Ok(())
+        })
+        .unwrap();
     }
 
     #[test]
