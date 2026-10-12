@@ -2,6 +2,8 @@ import type { ViewportRange, Worksheet } from '../types.js';
 import { baseColWidthToPx, colWidthToPx, rowHeightToPx, uiColWidthToPx } from './grid-metrics.js';
 import { isMacDesktop } from './platform.js';
 import { GridAxisGeometry } from './grid-axis-geometry.js';
+import { columnCssWidths } from './column-css-overrides.js';
+import { rowResizeRanges, rowResizeContains } from './worksheet-size-context.js';
 
 export { GridAxisGeometry } from './grid-axis-geometry.js';
 
@@ -132,11 +134,16 @@ export class GridGeometry {
         resolvedColWidths[index] = width;
       }
     }
+    // ACTIVE view-only resize policy: a user drag's canonical logical CSS px
+    // wins over decoding its stored width at the current MDW, so a font MDW
+    // change keeps the dragged pixel size. Authored widths decode as before.
+    const cssWidths = columnCssWidths(worksheet);
     const columnPixels: Array<{ index: number; px: number }> = [];
     for (let index = 1; index <= MAX_WORKSHEET_COL; index++) {
+      const cssPx = cssWidths?.get(index);
       const width = resolvedColWidths[index];
-      if (!Number.isFinite(width) || width < 0) continue;
-      const px = colWidthToPx(width, mdw);
+      if (cssPx === undefined && (!Number.isFinite(width) || width < 0)) continue;
+      const px = cssPx ?? colWidthToPx(width, mdw);
       if (px !== defaultColPx) columnPixels.push({ index, px });
     }
     this.col = new GridAxisGeometry(
@@ -146,11 +153,21 @@ export class GridGeometry {
       MAX_WORKSHEET_COL,
       columnPixels,
     );
+    const rowRanges = rowResizeRanges(worksheet);
+    // A resize range overrides authored/derived positive point heights without
+    // expanding missing rows. Hidden points remain authoritative after outline
+    // edits. The source worksheet map remains sparse and unchanged by a range.
+    const rowPoints = rowRanges.length
+      ? Object.fromEntries(Object.entries(worksheet.rowHeights).filter(([index, height]) =>
+        height === 0 || !rowResizeContains(rowRanges, Number(index))))
+      : worksheet.rowHeights;
     this.row = new GridAxisGeometry(
-      worksheet.rowHeights,
+      rowPoints,
       rowHeightToPx(worksheet.defaultRowHeight),
       rowHeightToPx,
       MAX_WORKSHEET_ROW,
+      undefined,
+      rowRanges.map(r => ({ first: r.first, last: r.last, px: rowHeightToPx(r.height) })),
     );
   }
 

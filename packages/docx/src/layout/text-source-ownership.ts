@@ -1,3 +1,4 @@
+import { sliceSemanticSlotSpans } from './text.js';
 import type { TextPlacement } from './types.js';
 
 /** Project original ownership from retained clusters; never reshape or repaint
@@ -8,9 +9,17 @@ import type { TextPlacement } from './types.js';
 export type SourceOwnedTextGeometry = Omit<TextPlacement, 'paintOps'> & Readonly<{ letterSpacingPt: number }>;
 
 export function sourceOwnedTextPlacements(placement: TextPlacement): readonly SourceOwnedTextGeometry[] {
-  const { paintOps, ...geometry } = placement;
-  const projected = { ...geometry, letterSpacingPt: paintOps[0]?.letterSpacingPt ?? 0 };
+  const { paintOps, trailingSpaceCompressionPt, ...geometry } = placement;
+  const unreduced = { ...geometry, letterSpacingPt: paintOps[0]?.letterSpacingPt ?? 0 };
+  const projected = trailingSpaceCompressionPt === undefined
+    ? unreduced : { ...unreduced, trailingSpaceCompressionPt };
   if (!placement.sourceRuns) return [projected];
+  // The retained reduction is an equal share of each trailing U+0020 (see
+  // textPlanSegment); an owner reports only the share inside its own advance.
+  const spacesStart = trailingSpaceCompressionPt === undefined
+    ? placement.range.end
+    : placement.range.start + placement.text.replace(/ +$/u, '').length;
+  const perSpacePt = (trailingSpaceCompressionPt ?? 0) / Math.max(1, placement.range.end - spacesStart);
   let cursor = 0;
   return placement.sourceRuns.map(owner => {
     while (cursor < placement.clusters.length && placement.clusters[cursor]!.range.end <= owner.range.start) cursor++;
@@ -27,20 +36,18 @@ export function sourceOwnedTextPlacements(placement: TextPlacement): readonly So
     // A whole glyph/vertical cell keeps its existing physical rectangle.
     const whole = owner.range.start === placement.range.start && owner.range.end === placement.range.end;
     const offset = owner.range.start - placement.range.start;
+    const ownedSpaces = Math.max(0, owner.range.end - Math.max(owner.range.start, spacesStart));
     return {
-      ...projected,
+      ...unreduced,
+      ...(ownedSpaces > 0 && perSpacePt > 0 ? { trailingSpaceCompressionPt: ownedSpaces * perSpacePt } : {}),
       sourceRuns: undefined,
       sourceRunIndex: owner.sourceRunIndex,
       role: owner.role ?? 'content',
       dependency: owner.dependency,
       range: owner.range,
       text: placement.text.slice(offset, offset + owner.range.end - owner.range.start),
-      ...(placement.semanticSlotSpans ? { semanticSlotSpans: Object.freeze(
-        placement.semanticSlotSpans.flatMap(slot => {
-          const start = Math.max(slot.start, offset);
-          const end = Math.min(slot.end, offset + owner.range.end - owner.range.start);
-          return start < end ? [Object.freeze({ ...slot, start: start - offset, end: end - offset })] : [];
-        }),
+      ...(placement.semanticSlotSpans ? { semanticSlotSpans: sliceSemanticSlotSpans(
+        placement.semanticSlotSpans, offset, offset + owner.range.end - owner.range.start,
       ) } : {}),
       origin: whole ? placement.origin : { ...placement.origin, xPt: placement.origin.xPt + from },
       bounds: whole ? placement.bounds : { ...placement.bounds, xPt: placement.bounds.xPt + from, widthPt: to - from },

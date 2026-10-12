@@ -74,6 +74,8 @@ import { SelectionOverlay } from './internal/viewer/selection-overlay.js';
 import { SelectionNotifier } from './internal/viewer/selection-notifier.js';
 import { SelectionContextReader } from './internal/viewer/selection-context.js';
 import { ChromeTheme } from './internal/viewer/chrome-theme.js';
+import { ConditionalFormattingNotice } from './internal/viewer/cf-notice.js';
+import { withCfReportSink, type XlsxConditionalFormattingReport } from './cf-diagnostics.js';
 import {
   COMMENT_POPUP_MAX_H,
   COMMENT_POPUP_MAX_W,
@@ -555,6 +557,9 @@ class XlsxViewerEngine implements ZoomableViewer {
 
   /** List data-validation dropdown arrow and display-only value panel. */
   private readonly validation: ValidationPanel;
+  /** Default notice for the committed frame's conditional-formatting
+   *  evaluation boundary (#1547). */
+  private readonly cfNotice: ConditionalFormattingNotice;
 
   constructor(
     container: HTMLElement,
@@ -626,6 +631,7 @@ class XlsxViewerEngine implements ZoomableViewer {
       validationMaxWidth: VALIDATION_PANEL_MAX_W,
       validationMaxHeight: VALIDATION_PANEL_MAX_H,
     });
+    this.cfNotice = new ConditionalFormattingNotice(this.hostDocument, this.canvasArea);
     this.notifier = new SelectionNotifier({
       hostWindow: this.hostWindow,
       isDestroyed: () => this._destroyed,
@@ -851,7 +857,15 @@ class XlsxViewerEngine implements ZoomableViewer {
       emitViewportChange: () => this.emitViewportChange(),
       hideCommentPopup: () => this.hideCommentPopup(),
       hideValidationPanel: () => this.hideValidationPanel(),
-      recordSizeOverride: (axis, index) => this.recordSizeOverride(axis, index),
+      recordSizeOverride: (axis, index, columnCssPx) =>
+        this.recordSizeOverride(axis, index, columnCssPx),
+      assertResizeBudget: (axis, indices, limit) =>
+        this.viewEdits.assertResizeBudget(this.currentSheet, axis, indices, limit),
+      beginRowResizePreview: targets => {
+        const ws = this.currentWorksheet;
+        if (!ws) throw new Error('Cannot resize an unavailable worksheet.');
+        return this.viewEdits.beginRowResizePreview(ws, this.currentSheet, targets);
+      },
       updateSpacerSize: (ws) => this.updateSpacerSize(ws),
       refitAutoRowsAfterColumnResize: () => this.refitAutoRowsAfterColumnResize(),
       reportError: (error) => this._reportRenderError(error),
@@ -933,6 +947,8 @@ class XlsxViewerEngine implements ZoomableViewer {
           this.finder.invalidate();
           this.hideValidationPanel();
           this.releaseHostFonts();
+          // The replaced workbook's frame no longer describes the canvas.
+          this.cfNotice.clear();
         });
       if (!wb) return;
       if (this._destroyed) throw this.destroyedError();
@@ -985,6 +1001,7 @@ class XlsxViewerEngine implements ZoomableViewer {
     if (this._destroyed || this.wb !== workbook) return false;
     if (this.preparedWorkbook === workbook) return true;
     this.finder.invalidate();
+    this.selectionInput.clearSheetGestures();
     this.viewEdits.clear();
     this.releaseInitialAnchorReferences();
     this.sheetViews.clear();
@@ -1013,6 +1030,10 @@ class XlsxViewerEngine implements ZoomableViewer {
   }
 
   private async showSheet(index: number): Promise<void> {
+    // End a live compact preview before reading/replaying the per-sheet ledger,
+    // including same-sheet reloads. It must not become the new projection's
+    // committed state merely because an asynchronous navigation interrupted it.
+    this.selectionInput.clearSheetGestures();
     const generation = ++this.sheetRequestGeneration;
     this.previewFallbackReason = null;
     const workbook = this.workbook;
@@ -1190,6 +1211,10 @@ class XlsxViewerEngine implements ZoomableViewer {
       if (pendingReference) releaseInitialAnchorSizeReference(pendingReference);
       return;
     }
+    // Another row preview may have begun while acquisition awaited. Reconcile
+    // after cancelling it, before the prepared snapshot becomes reachable.
+    this.selectionInput.clearSheetGestures();
+    this.viewEdits.restoreRowResizeRanges(index, worksheet);
     // #1713: install synchronously after the generation check, before the
     // projection is stored, painted or reachable by manual edit input.
     if (pendingReference !== undefined) {
@@ -1205,6 +1230,8 @@ class XlsxViewerEngine implements ZoomableViewer {
     this.sheetViews.set(index, worksheet);
     this.currentSheet = index;
     this.currentWorksheet = worksheet;
+    // The previous sheet's report must not describe this sheet's first frame.
+    this.cfNotice.clear();
     this.previewCompletion = previewCompletion;
     this.firstPreviewRender = previewCompletion !== null;
     this.previewPreparedViewport = previewPreparedViewport;
@@ -1220,6 +1247,7 @@ class XlsxViewerEngine implements ZoomableViewer {
         // A degraded parser placeholder is decided before any binding: it is
         // a different graph, so the known reference is never forced onto it.
         const degraded = Boolean(completed.parseError);
+        this.selectionInput.clearSheetGestures();
         const finalized = this.createVisibleSheetView(completed);
         // #1713: a non-degraded terminal projection reuses this request's
         // reference, bound before manual state is replayed; never recaptured.
@@ -1266,10 +1294,12 @@ class XlsxViewerEngine implements ZoomableViewer {
         this.previewCompletion = null;
         this.firstPreviewRender = false;
         this.previewPreparedViewport = null;
+        this.selectionInput.clearSheetGestures();
         this.currentWorksheet = null;
         this.releaseCurrentWorksheet?.();
         this.releaseCurrentWorksheet = null;
         this.renderDispatcher.begin();
+        this.cfNotice.clear();
         if (this._mode === 'worker') {
           // A bitmaprenderer canvas has no 2D context, and resizing it can
           // retain the last transferred frame. Replace it with an empty bitmap.
@@ -1290,7 +1320,7 @@ class XlsxViewerEngine implements ZoomableViewer {
     }
     this.sourceCommentMap = createCommentMap(this.currentSourceComments);
     this.setElementContext(null);
-    this.selectionInput.clearPendingElementClick();
+    this.selectionInput.clearSheetGestures();
     this.updateFooterDirection();
     this.viewportTop = 0;
     this.selectionController.reset();
@@ -1424,9 +1454,9 @@ class XlsxViewerEngine implements ZoomableViewer {
     if (ws) this.viewEdits.setBandHidden(ws, this.currentSheet, axis, index, hidden);
   }
 
-  private recordSizeOverride(axis: OutlineAxis, index: number): void {
+  private recordSizeOverride(axis: OutlineAxis, index: number, columnCssPx?: number): void {
     const ws = this.currentWorksheet;
-    if (ws) this.viewEdits.recordSizeOverride(ws, this.currentSheet, axis, index);
+    if (ws) this.viewEdits.recordSizeOverride(ws, this.currentSheet, axis, index, columnCssPx);
   }
 
   private wireSizeOverrides(): ReturnType<SheetViewEdits['wireSizeOverrides']> {
@@ -2331,10 +2361,12 @@ class XlsxViewerEngine implements ZoomableViewer {
 
   private async renderCurrentSheet(): Promise<void> {
     const generation = this.renderDispatcher.begin();
+    const rowPreview = this.selectionInput.rowResizePreview;
     try {
       await this._renderCurrentSheet(generation);
     } catch (err) {
       if (!this.renderDispatcher.isCurrent(generation)) return;
+      if (rowPreview) this.selectionInput.abortRowResizePreview(rowPreview);
       throw err;
     }
   }
@@ -2431,6 +2463,14 @@ class XlsxViewerEngine implements ZoomableViewer {
       { worksheet: ws, projection },
     );
 
+    // This invocation's report is delivered only to this call. It is applied
+    // after the frame commits; a stale or failed frame returns/throws below
+    // and leaves the current notice untouched.
+    const frame: { report: XlsxConditionalFormattingReport | null } = { report: null };
+    const reportingOpts = withCfReportSink(viewerRenderOpts, (report) => {
+      frame.report = report;
+    });
+
     if (this._mode === 'worker') {
       // Render the viewport off the main thread and paint the returned bitmap.
       // The selection overlay (geometry-based, from getCellRect) is unaffected.
@@ -2440,7 +2480,7 @@ class XlsxViewerEngine implements ZoomableViewer {
       const bmp = await this.workbook.renderViewportToBitmap(
         this.currentSheet,
         viewport,
-        viewerRenderOpts,
+        reportingOpts,
       );
       if (!this.renderDispatcher.commitBitmap(seq, bmp, w, h)) return;
     } else {
@@ -2448,12 +2488,13 @@ class XlsxViewerEngine implements ZoomableViewer {
         this.canvas,
         this.currentSheet,
         viewport,
-        withXlsxRenderCommitGuard(viewerRenderOpts, () =>
+        withXlsxRenderCommitGuard(reportingOpts, () =>
           !this._destroyed && this.renderDispatcher.isCurrent(seq),
         ),
       );
       if (!this.renderDispatcher.isCurrent(seq) || this._destroyed) return;
     }
+    this.cfNotice.update(frame.report);
     // XL4: repaint the outline gutters over the fresh grid frame, aligned to the
     // same scroll offset. No-op when the sheet has no outlining.
     this.renderGutters();
@@ -2516,6 +2557,7 @@ class XlsxViewerEngine implements ZoomableViewer {
     this.zoomControl?.destroy();
     this.comments.destroy();
     this.validation.destroy();
+    this.cfNotice.destroy();
     // IX2 — drop the find state (matches + cursor) so a stale
     // findNext()/findPrev() after teardown returns null instead of a match
     // pointing into a dead viewer (same fix as DocxViewer/PptxViewer.destroy).

@@ -135,6 +135,9 @@ export function shapeRunToDocRun(
 /** Plain parser-boundary snapshot used by retained line acquisition. Private
  * parser extensions are copied into named immutable fields exactly once. */
 type ParagraphTextFacts = Readonly<{
+  /** Authored discretionary opportunity with its own conditional glyph style.
+   * Its source run is otherwise empty, independent of dictionary hyphenation. */
+  optionalHyphen?: boolean;
   /** Parser-projected CT_R boundary constraint around an authored
    * `<w:noBreakHyphen/>`. These names are layout facts, not parser wire keys. */
   noBreakBefore?: boolean;
@@ -292,6 +295,16 @@ export interface TextShapeRequest {
   /** Builder-owned proof that one registered grapheme has no per-slot
    * allocation policy. The shaper still revalidates resource and cmap facts. */
   readonly joinRegisteredGrapheme?: boolean;
+  /** Builder-owned uniform allocation of one Latin word piece with a single
+   * ordinary WORD slot seam (two maximal body spans, plus an optional pure
+   * trailing U+0020 span owned by the builder piece). §17.3.2.26 slots still
+   * select faces per scalar; matching registered faces may share
+   * native GPOS/GSUB context. This is library shaping policy, not an Office
+   * metric rule. The service re-proves exact face/route and snapshot cmap. */
+  readonly joinRegisteredLatinSlots?: boolean;
+  /** Exact text of a builder-adopted Latin physical piece. Only actual slices
+   * preserve this internal provenance; generated/expanded probes clear it. */
+  readonly registeredLatinPieceText?: string;
   /** Resolve script slots and faces without touching the measurement adapter. */
   readonly measure?: boolean;
   /** False acquires only aggregate metrics; 'spaces' acquires contextual
@@ -310,6 +323,55 @@ export interface TextShapeRequest {
  * contains unmarked Hebrew/Arabic, which must retain their existing path. */
 export function registeredLatinMarkGraphemeCandidate(text: string): boolean {
   return /^[A-Za-z]\p{M}+$/u.test(text) && graphemeClusterOffsets(text).length === 0;
+}
+
+/** Exclude non-Latin scripts even when §17.3.2.26 selects their ascii slot.
+ * Soft hyphens and nonordinary separators keep their existing break path. */
+const REGISTERED_LATIN_SLOT_CHARSET =
+  /^(?:[\p{Script=Latin}\u0020-\u0040\u005B-\u0060\u007B-\u007E\u00A0-\u00AC\u00AE-\u00BF\u00D7\u00F7\u0300-\u036F])+$/u;
+export function registeredLatinSlotRunCandidate(text: string): boolean {
+  return /\p{Script=Latin}/u.test(text) && REGISTERED_LATIN_SLOT_CHARSET.test(text);
+}
+
+/** Structural word-seam admission over already resolved maximal slots.
+ * splitTextForLayout owns a word's trailing U+0020 sequence in the same piece;
+ * that pure separator span does not add a WORD slot seam. Face/route/cmap and
+ * allocation admission still cover every scalar, including these spaces.
+ * A third span containing any non-space scalar is not a separator exception. */
+export function registeredLatinSingleSeamCandidate(
+  spans: readonly Readonly<{ text: string }>[],
+): boolean {
+  if (spans.length < 2 || spans.length > 3) return false;
+  const lastIsSeparator = /^ +$/u.test(spans[spans.length - 1]!.text);
+  return spans.length - (lastIsSeparator ? 1 : 0) === 2;
+}
+
+/** Rebase semantic ownership after an actual retained-text slice. Physical
+ * shaping admission is re-proved over that slice by the text service. */
+export function semanticSlotStartIndex(
+  spans: NonNullable<TextShapeSpan['semanticSlotSpans']>, offset: number,
+): number {
+  let low = 0, high = spans.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (spans[middle]!.end <= offset) low = middle + 1;
+    else high = middle;
+  }
+  return low;
+}
+
+export function sliceSemanticSlotSpans(
+  spans: TextShapeSpan['semanticSlotSpans'], start: number, end: number,
+): TextShapeSpan['semanticSlotSpans'] {
+  if (!spans) return undefined;
+  const result: NonNullable<TextShapeSpan['semanticSlotSpans']>[number][] = [];
+  for (let index = semanticSlotStartIndex(spans, start); index < spans.length; index++) {
+    const span = spans[index]!;
+    if (span.start >= end) break;
+    const from = Math.max(start, span.start), to = Math.min(end, span.end);
+    if (from < to) result.push(Object.freeze({ ...span, start: from - start, end: to - start }));
+  }
+  return Object.freeze(result);
 }
 
 /** Validate against the owning transformed run, not merely a self-consistent
@@ -335,9 +397,12 @@ export function sliceTextShapeRequest(
   end: number,
 ): TextShapeRequest {
   const context = request.substituteContext ?? { text: request.text, offset: 0 };
+  const text = request.text.slice(start, end);
   return {
     ...request,
-    text: request.text.slice(start, end),
+    text,
+    registeredLatinPieceText: request.joinRegisteredLatinSlots === true
+      && request.registeredLatinPieceText === request.text ? text : undefined,
     joinRegisteredGrapheme: start === 0 && end === request.text.length
       ? request.joinRegisteredGrapheme : undefined,
     substituteContext: { text: context.text, offset: context.offset + start },
@@ -350,7 +415,8 @@ export function independentTextShapeRequest(
   request: Readonly<TextShapeRequest>,
   text: string,
 ): TextShapeRequest {
-  return { ...request, text, joinRegisteredGrapheme: undefined, substituteContext: { text, offset: 0 } };
+  return { ...request, text, joinRegisteredGrapheme: undefined, joinRegisteredLatinSlots: undefined,
+    registeredLatinPieceText: undefined, substituteContext: { text, offset: 0 } };
 }
 
 /** Transform this range in its run (e.g. inserting justification kashidas),
@@ -360,7 +426,8 @@ export function replaceTextShapeRequest(
   text: string,
 ): TextShapeRequest {
   const context = request.substituteContext ?? { text: request.text, offset: 0 };
-  return { ...request, text, joinRegisteredGrapheme: undefined, substituteContext: {
+  return { ...request, text, joinRegisteredGrapheme: undefined, joinRegisteredLatinSlots: undefined,
+    registeredLatinPieceText: undefined, substituteContext: {
     text: context.text.slice(0, context.offset) + text
       + context.text.slice(context.offset + request.text.length),
     offset: context.offset,
@@ -422,7 +489,7 @@ export interface GlyphMeasurer {
 }
 
 export interface TextShapeSpan extends GlyphMeasurement {
-  /** Original ECMA-376 rFonts facts within one physical grapheme. These
+  /** Original ECMA-376 rFonts facts within one physical shape unit. These
    * carry no competing advance or ink authority. */
   readonly semanticSlotSpans?: readonly Readonly<{
     start: number; end: number; script: FontScriptSlot; font: FontResolution;
@@ -753,6 +820,18 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
       registeredMetrics.set(metricTupleKey(metric.sourceIdentity, metric.family, metric.weight, metric.style), metric);
     }
   }
+  // Metric resources represented in this immutable snapshot, grouped by the
+  // case-insensitive Canvas family/weight/style tuple. This does not enumerate
+  // registrations outside the snapshot in an external FontFaceSet.
+  const canvasFaceKey = (family: string, weight: number, style: FontStyle) =>
+    JSON.stringify([normalizeFontMetricFamily(family), weight, style]);
+  const metricsByCanvasFace = new Map<string, Readonly<ResolvedFontMetric>[]>();
+  for (const metric of Object.values(fontMetrics)) {
+    const key = canvasFaceKey(metric.family, metric.weight ?? 400, metric.style ?? 'normal');
+    const peers = metricsByCanvasFace.get(key);
+    if (peers) peers.push(metric);
+    else metricsByCanvasFace.set(key, [metric]);
+  }
   const genericFamilies = Object.freeze(Object.fromEntries(
     Object.entries(input.genericFamilies ?? {})
       .map(([family, generic]) => [family.trim().toLocaleLowerCase('en-US'), generic])
@@ -1057,6 +1136,8 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
         request.letterSpacingPt ?? null,
         request.kerning ?? null,
         request.joinRegisteredGrapheme ?? null,
+        request.joinRegisteredLatinSlots ?? null,
+        request.registeredLatinPieceText !== undefined && request.registeredLatinPieceText === request.text,
         request.measure ?? null,
         request.clusterGeometry ?? null,
         ...(scopeDescriptor !== undefined ? [scopeDescriptor] : []),
@@ -1116,7 +1197,8 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
       // resource, weight, style and source) is one string for Canvas, whichever
       // family name or slot requested it and whatever CSS fallback list follows.
       // Shaping it apart would break Arabic joining. Only in-scope spans
-      // merge; all other spans keep main's per-slot runs.
+      // merge; ordinary spans start with per-slot runs, independently of the
+      // registered physical-unit admission below.
       const merged: Array<(typeof resolvedGroups)[number] & Pick<TextShapeSpan, 'semanticSlotSpans'>> = [];
       for (const group of resolvedGroups) {
         const previous = merged.at(-1);
@@ -1129,32 +1211,72 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
       }
 
       // Semantic slots select faces per scalar (§17.3.2.26); they need not
-      // detach a combining mark when the exact physical face is proven.
+      // create a native shaping seam when the exact physical face is proven.
       // Keep the existing scoped Arabic merge above independent of this gate.
-      if (request.joinRegisteredGrapheme === true && registeredLatinMarkGraphemeCandidate(request.text)
-        && graphemeBoundaries.length === 2
-        && merged.length > 1 && scopeDescriptor === undefined) {
+      // Uniform ordinary allocation permits one physical shape/paint across a
+      // SINGLE word slot seam: width correction with split paint loses GSUB.
+      // A builder-owned pure trailing U+0020 span is allowed separately; its
+      // full face/cmap/allocation proof is unchanged. Multiple ordinary WORD
+      // seams retain baseline partition/placement. Joining
+      // alternating slots would turn its cached one-scalar acquisitions into
+      // repeated full-tail native shaping during emergency wrapping. This is
+      // a structural admission limit, not a text-length or font heuristic.
+      // The existing one-grapheme contract remains independent; kerning-off
+      // multi-grapheme GSUB is unqualified and retains baseline as well.
+      const joinGrapheme = request.joinRegisteredGrapheme === true
+        && registeredLatinMarkGraphemeCandidate(request.text) && graphemeBoundaries.length === 2;
+      // Emergency slicing can leave only highAnsi body + its ASCII SPACE tail.
+      // Retained paint still draws this adopted physical piece as one string;
+      // splitting its measurement would lose a native body/separator pair.
+      // Only exact slices of a previously adopted piece get this zero-word-seam
+      // exception. Fresh words and expanded/generated probes keep the ordinary
+      // predicate. The parent's Latin character may have been cut away (e.g.
+      // km² SPACE -> ² SPACE); its alphabet bound is still checked on the slice.
+      // Every suffix scalar still passes the same face/route/cmap
+      // proof below; provenance alone never admits a resource or peer.
+      const joinedLatinSlice = request.registeredLatinPieceText === request.text
+        && merged.length === 2 && merged[0]!.script === 'highAnsi'
+        && merged[0]!.text.length > 0 && /^ +$/u.test(merged[1]!.text);
+      const joinLatin = request.joinRegisteredLatinSlots === true && request.kerning === true
+        && ((registeredLatinSingleSeamCandidate(merged) && registeredLatinSlotRunCandidate(request.text))
+          || (joinedLatinSlice && REGISTERED_LATIN_SLOT_CHARSET.test(request.text)));
+      if ((joinGrapheme || joinLatin) && merged.length > 1 && scopeDescriptor === undefined) {
         const first = merged[0]!;
         const face = first.font;
         const metric = face.resourceIdentity ? registeredMetrics.get(metricTupleKey(
           face.resourceIdentity, face.resolvedFamily, face.weight, face.style,
         )) : undefined;
-        const ranges = metric?.unicodeRanges;
-        const covered = ranges !== undefined && [...request.text].every(scalar => {
-          const cp = scalar.codePointAt(0)!;
-          let low = 0;
-          let high = ranges.length;
-          while (low < high) {
-            const middle = (low + high) >>> 1;
-            if (ranges[middle]![1] < cp) low = middle + 1;
-            else high = middle;
+        // Repeated letters/marks do not change cmap admission. Deduplicate
+        // coverage work for long pieces and avoid a per-peer filter allocation.
+        const scalars = [...new Set(Array.from(request.text, scalar => scalar.codePointAt(0)!))];
+        const coveredCount = (ranges: readonly (readonly [number, number])[]) => {
+          let count = 0;
+          for (const cp of scalars) {
+            let low = 0;
+            let high = ranges.length;
+            while (low < high) {
+              const middle = (low + high) >>> 1;
+              if (ranges[middle]![1] < cp) low = middle + 1;
+              else high = middle;
+            }
+            if (low < ranges.length && ranges[low]![0] <= cp) count += 1;
           }
-          return low < ranges.length && ranges[low]![0] <= cp;
-        });
+          return count;
+        };
+        const ranges = metric?.unicodeRanges;
+        // This join guard is stricter than selected line-metric admission:
+        // every snapshot peer must explicitly cover all or none of the
+        // physical unit. Unknown or partial cmap coverage declines joining;
+        // geometry selection remains the separate line-metric policy.
+        const covered = ranges !== undefined && coveredCount(ranges) === scalars.length
+          && (metricsByCanvasFace.get(canvasFaceKey(face.resolvedFamily, face.weight, face.style)) ?? [])
+            .every(peer => peer === metric || (peer.unicodeRanges !== undefined
+              && [0, scalars.length].includes(coveredCount(peer.unicodeRanges))));
         if ((face.source === 'embedded' || face.source === 'local') && face.resourceIdentity
           && covered && merged.every(group => !group.substituteScript
             && (group.script === 'ascii' || group.script === 'highAnsi')
             && group.font.source === face.source && group.font.resourceIdentity === face.resourceIdentity
+            && group.font.resolvedFamily === face.resolvedFamily
             && group.font.weight === face.weight && group.font.style === face.style
             && group.font.route.fingerprint === face.route.fingerprint)) {
           const semanticSlotSpans = Object.freeze(merged.map(group => Object.freeze({

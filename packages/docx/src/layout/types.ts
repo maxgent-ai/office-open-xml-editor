@@ -366,8 +366,11 @@ export interface RetainedRunTypographyFacts {
 
 export interface TextPlacement {
   readonly kind: 'text';
+  /** Authored discretionary '-' ink has an empty logical source owner.
+   * Paint still consumes text/paintOps; copy and find consume the typed owner. */
+  readonly optionalHyphenGlyph?: true;
   readonly text: string;
-  /** Semantic rFonts ranges relative to this physical grapheme's text. */
+  /** Semantic rFonts ranges relative to this physical shape unit's text. */
   readonly semanticSlotSpans?: import('./text.js').TextShapeSpan['semanticSlotSpans'];
   /** Parsed run occurrence retained for destination-page field convergence. */
   readonly sourceRunIndex?: number;
@@ -822,6 +825,9 @@ export interface FloatingTableReferenceFramesPt {
 }
 
 interface FloatRegistryEntryCorePt {
+  /** Cell-start grid frame: its wrap moves flow, not an empty carrier's
+   * paragraph-relative drawing insertion reference. */
+  readonly paragraphAnchorReference?: 'unwrapped-empty-carrier';
   readonly occurrenceId: string;
   readonly paragraphId: number;
   readonly bounds: LayoutRect;
@@ -1415,8 +1421,15 @@ export interface TableFormatInput {
   readonly firstRowException: TableRowExceptionInput | null;
 }
 
-/** Parser-independent positioning facts retained from §17.4.57 `<w:tblpPr>`. */
+/** Parser-independent positioning facts from §17.4.57 `<w:tblpPr>` or an
+ * acquired homogeneous cell-owned grid frame. */
 export interface FloatingTablePositionInput {
+  /** A grid frame at its host cell's insertion cursor. The following paragraph
+   * may select its page, but its before-spacing is not this vertical anchor. */
+  readonly textAnchor?: 'cell-start';
+  /** Bounded acquired grid-frame policy: the host content band determines
+   * alignment independently of fixed grid ink. Not a general AUTO-width rule. */
+  readonly widthBasis?: 'host-cell-content';
   readonly leftFromTextPt: number;
   readonly rightFromTextPt: number;
   readonly topFromTextPt: number;

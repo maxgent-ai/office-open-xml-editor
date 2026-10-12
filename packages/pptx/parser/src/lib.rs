@@ -8191,6 +8191,56 @@ mod tests {
             !json_absent.contains("textWarp"),
             "absent warp must be omitted from JSON; got {json_absent}"
         );
+
+        // ST_TextShapeType derives from xsd:token: XML whitespace around the
+        // prst value is not part of it. Padded textNoShape must serialize
+        // exactly like the absent body (as canonical textNoShape does) …
+        assert_eq!(serde_json::to_string(&tb_none).unwrap(), json_absent);
+        for prst in [
+            " textNoShape",
+            "textNoShape ",
+            "&#9;textNoShape&#10;",
+            "&#13;&#10; textNoShape ",
+        ] {
+            let body = format!(r#"<bodyPr><prstTxWarp prst="{prst}"/></bodyPr>"#);
+            let tb_pad = parse(body.as_str());
+            assert!(tb_pad.text_warp.is_none(), "padded {prst:?} → no warp");
+            assert_eq!(
+                serde_json::to_string(&tb_pad).unwrap(),
+                json_absent,
+                "prst={prst:?}"
+            );
+        }
+        // … and a padded known warp exactly like its canonical spelling,
+        // adjustments included.
+        let tb_arch_pad = parse(
+            r#"<bodyPr wrap="none"><prstTxWarp prst=" textArchUp&#9;"><avLst><gd name="adj1" fmla="val 10800000"/><gd name="adj2" fmla="val 25000"/></avLst></prstTxWarp><spAutoFit/></bodyPr>"#,
+        );
+        let warp_pad = tb_arch_pad
+            .text_warp
+            .as_ref()
+            .expect("padded textArchUp present");
+        assert_eq!(warp_pad.preset, "textArchUp");
+        assert_eq!(warp_pad.adj, vec![10_800_000, 25_000]);
+        assert_eq!(
+            serde_json::to_string(&tb_arch_pad).unwrap(),
+            serde_json::to_string(&tb).unwrap()
+        );
+        // Only the padding goes: internal whitespace, other casings and
+        // non-XML spaces stay verbatim; the parser does not canonicalize their
+        // spelling. The existing renderer's envelope policy is unchanged.
+        for (prst, kept) in [
+            ("text NoShape", "text NoShape"),
+            ("textArch Up", "textArch Up"),
+            ("TEXTNOSHAPE", "TEXTNOSHAPE"),
+            (" textarchup ", "textarchup"),
+            ("&#160;textNoShape", "\u{a0}textNoShape"),
+        ] {
+            let body = format!(r#"<bodyPr><prstTxWarp prst="{prst}"/></bodyPr>"#);
+            let tb_bad = parse(body.as_str());
+            let w = tb_bad.text_warp.as_ref();
+            assert_eq!(w.map(|w| w.preset.as_str()), Some(kept), "prst={prst:?}");
+        }
     }
 
     /// A break carries only its own resolved latin face: an unresolved theme
@@ -11660,6 +11710,14 @@ mod tests {
             }
             other => panic!("expected resolved arcTo, got {other:?}"),
         }
+
+        let xml = r#"<custGeom xmlns="http://schemas.openxmlformats.org/drawingml/2006/main">
+          <pathLst><path w="100" h="100"><moveTo><pt x="ss" y="0"/></moveTo>
+          <lnTo><pt x="w" y="0"/></lnTo></path></pathLst></custGeom>"#;
+        let doc = roxmltree::Document::parse(xml).unwrap();
+        let paths = parse_cust_geom(doc.root_element(), 100.0, 0.0);
+        assert!(matches!(paths[0][0], PathCmd::MoveTo { x: 0.0, y: 0.0 }));
+        assert!(matches!(paths[0][1], PathCmd::LineTo { x: 1.0, y: 0.0 }));
     }
 
     /// ECMA-376 Part 1 §20.1.9.15: an omitted path coordinate-system size

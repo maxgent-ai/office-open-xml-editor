@@ -52,6 +52,7 @@ import {
   HEADER_H,
 } from './renderer.js';
 import { GridGeometry } from './internal/grid-geometry.js';
+import { inheritWorksheetSizeContext } from './internal/worksheet-size-context.js';
 import type { CellAnchorSizeFacts } from './internal/cell-anchor-geometry.js';
 import { resolveWorksheetAnchorRect } from './internal/initial-anchor-sizes.js';
 import { rotatedImageBounds } from './internal/image-anchor-transform.js';
@@ -739,7 +740,10 @@ export interface RenderDeps {
   tiff?: TiffRenderer;
 }
 
-const autoHeightProjectionCache = new WeakMap<Worksheet, Worksheet>();
+const autoHeightProjectionCache = new WeakMap<Worksheet, {
+  projection: Worksheet;
+  sourceGeometry: GridGeometry;
+}>();
 
 export function worksheetWithAutoRowHeights(
   ctx: CanvasRenderingContext2D,
@@ -748,27 +752,36 @@ export function worksheetWithAutoRowHeights(
   cjkFallback?: CjkLang,
 ): Worksheet {
   if (hasPreparedAutoRowHeights(source)) return source;
+  const sourceGeometry = getGridGeometryForWorksheet(source);
   const cached = autoHeightProjectionCache.get(source);
   // Only reuse the projection if the source is still bound to the same policy
   // it was built under. After an internal rebind, rebuild via
   // inheritSheetRenderCache so the new limits are validated.
-  if (cached && getWorksheetPolicy(cached) === getWorksheetPolicy(source)) return cached;
+  // Size edits (including CSS-only intent changes) and Normal-font rebinds
+  // invalidate source geometry. A cached row-height clone must follow that
+  // revision too, or it would wrap/paint with the previous column widths.
+  if (cached && cached.sourceGeometry === sourceGeometry
+    && getWorksheetPolicy(cached.projection) === getWorksheetPolicy(source)) return cached.projection;
   const projection: Worksheet = {
     ...source,
     rowHeights: { ...source.rowHeights },
   };
+  // This is a fresh row-height projection: preserve view-only column pixel
+  // intent before geometry/wrapping. Render-cache inheritance also runs after
+  // worker size overrides, so it must never overwrite their CSS channel.
+  inheritWorksheetSizeContext(source, projection);
   inheritSheetRenderCache(source, projection);
   // The viewer/main realm supplies the authoritative Normal-font MDW used by
   // hit-testing and spacer geometry. Preserve it across the render-local clone
   // so worker/direct auto-fit wraps at the exact same column pixels.
-  const mdw = getGridGeometryForWorksheet(source).maximumDigitWidth;
+  const mdw = sourceGeometry.maximumDigitWidth;
   GridGeometry.forWorksheet(projection, mdw);
   applyAutoRowHeights(ctx, projection, styles, cjkFallback);
   // applyAutoRowHeights invalidates geometry after deriving row sizes; seed the
   // rebuilt row axis with the same authoritative MDW rather than remeasuring in
   // another Canvas realm.
   GridGeometry.forWorksheet(projection, mdw);
-  autoHeightProjectionCache.set(source, projection);
+  autoHeightProjectionCache.set(source, { projection, sourceGeometry });
   return projection;
 }
 
@@ -875,6 +888,11 @@ async function renderWorksheetViewportLeased(
   // frame can supersede this one while it waits; never mutate the caller-owned
   // canvas after that lifecycle generation is stale.
   if ((opts as GuardedRenderViewportOptions)[XLSX_RENDER_COMMIT_GUARD]?.() === false) return;
+
+  // From here the frame paints synchronously. Only a painted frame owns a
+  // conditional-formatting report; a guarded-out frame never claims one, and
+  // a paint that throws rejects before its caller can commit the report.
+  opts.cfDiagnostics?.markPainted();
 
   // ── Step 2: Resize + draw, all synchronous from here.
   // Resize only when the backing store dimensions actually change. Assigning

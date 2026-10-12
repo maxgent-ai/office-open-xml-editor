@@ -9,6 +9,9 @@ import type { OoxmlResourceUsageSnapshot } from '@silurus/ooxml-core';
 import type { NormalizedOoxmlResourcePolicy } from '@silurus/ooxml-core/worker';
 import type { PullSessionIdentity } from '@silurus/ooxml-core/worker';
 import { GridGeometry } from './internal/grid-geometry.js';
+import { setColumnCssWidth } from './internal/column-css-overrides.js';
+import { inheritWorksheetSizeContext, setRowResizeRanges,
+  type RowResizeRange } from './internal/worksheet-size-context.js';
 import {
   bindInitialAnchorSizes,
   sameInitialAnchorSizeReference,
@@ -19,9 +22,10 @@ import type {
   DelimitedTextParseRequest,
   DelimitedTextParseResponse,
 } from './delimited-text-protocol.js';
+import type { CfRuleDiagnostic } from './cf-diagnostics.js';
 
 /**
- * View-only per-band size overrides for one sheet, carried with every worker
+ * View-only point and compact row-interval overrides for one sheet, carried with every worker
  * `renderViewport` request. The render worker draws from its own worker-local
  * parsed-sheet cache, so main-thread Worksheet mutations (outline
  * collapse/expand via the size-0 hidden encoding, drag-to-resize #567) never
@@ -37,7 +41,30 @@ import type {
  */
 export interface WireSizeOverrides {
   rows?: Record<number, number | null>;
+  /** Private view-only point-height intervals. Positive heights override source
+   * positive points; explicit hidden zero points win. Empty resets intervals.
+   * Carries full million-row edits without million-key row records. */
+  rowHeightRanges?: readonly RowResizeRange[];
   cols?: Record<number, number | null>;
+  /** @internal Private view-only channel: canonical logical CSS px of user
+   * column resizes, which win over decoding `cols` at the current MDW. `null`
+   * removes the CSS override (fall back to the stored width); 0 is hidden.
+   * Absent when no column was user-resized. */
+  columnCssWidths?: Record<number, number | null>;
+}
+
+/** Rows retain native points and columns retain stored widths. Their point
+ * maps share null-removal/change detection; CSS widths and compact row runs
+ * stay in the private projection context instead of this authored-map path. */
+function applyBandPointOverrides(target: Record<number, number>, values: Record<number, number | null>): boolean {
+  let changed = false;
+  for (const [key, value] of Object.entries(values)) {
+    const index = Number(key);
+    if (value === null) {
+      if (Object.hasOwn(target, index)) { delete target[index]; changed = true; }
+    } else if (target[index] !== value) { target[index] = value; changed = true; }
+  }
+  return changed;
 }
 
 /**
@@ -47,32 +74,17 @@ export interface WireSizeOverrides {
 export function applySizeOverrides(ws: Worksheet, overrides: WireSizeOverrides | undefined): void {
   if (!overrides) return;
   let changed = false;
-  if (overrides.rows) {
-    for (const [k, v] of Object.entries(overrides.rows)) {
-      const idx = Number(k);
-      if (v === null) {
-        if (Object.hasOwn(ws.rowHeights, idx)) {
-          delete ws.rowHeights[idx];
-          changed = true;
-        }
-      } else if (ws.rowHeights[idx] !== v) {
-        ws.rowHeights[idx] = v;
-        changed = true;
-      }
-    }
+  if (overrides.rowHeightRanges) {
+    // The setter validates the complete range set before installing metadata,
+    // and runs before any point mutation. Avoid scanning every interval twice.
+    setRowResizeRanges(ws, overrides.rowHeightRanges);
+    changed = true;
   }
-  if (overrides.cols) {
-    for (const [k, v] of Object.entries(overrides.cols)) {
-      const idx = Number(k);
-      if (v === null) {
-        if (Object.hasOwn(ws.colWidths, idx)) {
-          delete ws.colWidths[idx];
-          changed = true;
-        }
-      } else if (ws.colWidths[idx] !== v) {
-        ws.colWidths[idx] = v;
-        changed = true;
-      }
+  if (overrides.rows) changed = applyBandPointOverrides(ws.rowHeights, overrides.rows) || changed;
+  if (overrides.cols) changed = applyBandPointOverrides(ws.colWidths, overrides.cols) || changed;
+  if (overrides.columnCssWidths) {
+    for (const [k, v] of Object.entries(overrides.columnCssWidths)) {
+      if (setColumnCssWidth(ws, Number(k), v)) changed = true;
     }
   }
   if (changed) GridGeometry.invalidate(ws);
@@ -84,15 +96,7 @@ export function createSizeOverriddenWorksheet(
   source: Worksheet,
   overrides: WireSizeOverrides | undefined,
 ): Worksheet {
-  if (!overrides) return source;
-  const view = {
-    ...source,
-    rowHeights: { ...source.rowHeights },
-    colWidths: { ...source.colWidths },
-  };
-  inheritWorksheetPolicy(source, view);
-  applySizeOverrides(view, overrides);
-  return view;
+  return overrides ? createInitialSizeProjection(source, overrides) : source;
 }
 
 /** Render-local projection for a prepared-initial anchor reference. With
@@ -103,12 +107,19 @@ function createInitialSizeProjection(
   source: Worksheet,
   overrides: WireSizeOverrides | undefined,
 ): Worksheet {
-  if (overrides) return createSizeOverriddenWorksheet(source, overrides);
   // A new identity loses the WeakMap policy binding; the admitted policy (and
   // the renderer budgets derived from it) stays owned by the source, and the
   // cache's policy-identity check depends on this projection carrying it.
   const view = { ...source };
+  // Only an overridden projection mutates size maps. A prepared-anchor-only
+  // projection shares them read-only; both inherit context before any edits.
+  if (overrides) {
+    view.rowHeights = { ...source.rowHeights };
+    view.colWidths = { ...source.colWidths };
+  }
   inheritWorksheetPolicy(source, view);
+  inheritWorksheetSizeContext(source, view);
+  applySizeOverrides(view, overrides);
   return view;
 }
 
@@ -213,7 +224,7 @@ export class WorksheetViewProjectionCache {
  *  render-local sheet projection; absent when nothing changed. */
 export type WireRenderViewportOptions = Omit<
   RenderViewportOptions,
-  'onTextRun' | 'loadedImages' | 'fetchImage'
+  'onTextRun' | 'loadedImages' | 'fetchImage' | 'cfDiagnostics'
 > & {
   sizeOverrides?: WireSizeOverrides;
 };
@@ -296,6 +307,9 @@ export type RenderWorkerRequest =
       /** Viewer-local projection cache identity. The worker rebuilds its shallow
        * worksheet projection only when the revision changes. */
       viewProjection?: WireViewProjection;
+      /** Contextless caller-realm surface, transferred so worker text uses the
+       *  caller's inherited canvas language. Absent: the worker creates one. */
+      canvas?: OffscreenCanvas;
     }
   | { type: 'releaseViewProjection'; projectionId: number }
   | { type: 'evictWorksheets'; id: number; sheetIndices: number[] }
@@ -322,6 +336,13 @@ export type RenderWorkerResponse =
       usage?: OoxmlResourceUsageSnapshot;
     }
   | DelimitedTextParseResponse
-  | { type: 'viewportRendered'; id: number; bitmap: ImageBitmap }
+  | {
+      type: 'viewportRendered';
+      id: number;
+      bitmap: ImageBitmap;
+      /** Conditional-formatting diagnostics of THIS frame only (#1547); a
+       *  per-response batch, never a lifetime cursor. */
+      conditionalFormatting: readonly CfRuleDiagnostic[];
+    }
   | { type: 'worksheetsEvicted'; id: number }
   | ({ type: 'sheetSessionOpened'; id: number } & PullSessionIdentity<number>);
