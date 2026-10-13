@@ -280,6 +280,8 @@ impl ResolvedPictures {
                     edit_as: Some(value.edit_as.into()),
                     // Binary OfficeArt anchor, not an XML anchor element.
                     anchor_tag: None,
+                    anchor_ext_cx: None,
+                    anchor_ext_cy: None,
                     native_ext_cx: value.cx,
                     native_ext_cy: value.cy,
                     rotation: (value.rotation != 0).then_some(value.rotation as f64 / 60000.0),

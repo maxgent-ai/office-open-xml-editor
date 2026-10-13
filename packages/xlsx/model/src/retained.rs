@@ -250,6 +250,8 @@ retained_struct!(ImageAnchor {
     to_row_off,
     edit_as,
     anchor_tag,
+    anchor_ext_cx,
+    anchor_ext_cy,
     native_ext_cx,
     native_ext_cy,
     rotation,

@@ -111,8 +111,9 @@ fn resolve_drawing_media_path(
     Some(media_path)
 }
 
-/// Parse `<xdr:twoCellAnchor>` elements from a drawing XML and resolve
-/// embedded pictures into data URLs. `drawing_path` is the OPC source part.
+/// Parse `<xdr:twoCellAnchor>` and `<xdr:oneCellAnchor>` pictures from a drawing
+/// XML and resolve embedded pictures into data URLs. `drawing_path` is the OPC
+/// source part.
 pub(crate) fn parse_drawing_anchors(
     drawing_xml: &str,
     drawing_rels: &HashMap<String, String>,
@@ -128,13 +129,20 @@ pub(crate) fn parse_drawing_anchors(
     let mut anchors: Vec<ImageAnchor> = Vec::new();
 
     for anchor in doc.descendants() {
-        if anchor.tag_name().name() != "twoCellAnchor" || !is_xdr_ns(anchor.tag_name().namespace())
+        // ECMA-376 §20.5.2: a picture is anchored with either `twoCellAnchor`
+        // (from+to) or `oneCellAnchor` (from + an anchor-level `<xdr:ext>` size).
+        let anchor_name = anchor.tag_name().name();
+        if (anchor_name != "twoCellAnchor" && anchor_name != "oneCellAnchor")
+            || !is_xdr_ns(anchor.tag_name().namespace())
         {
             continue;
         }
+        let one_cell = anchor_name == "oneCellAnchor";
         let (mut from_col, mut from_col_off, mut from_row, mut from_row_off) =
             (0u32, 0i64, 0u32, 0i64);
         let (mut to_col, mut to_col_off, mut to_row, mut to_row_off) = (0u32, 0i64, 0u32, 0i64);
+        let mut anchor_ext_cx: Option<i64> = None;
+        let mut anchor_ext_cy: Option<i64> = None;
         let mut pic_rid: Option<String> = None;
         // Microsoft 2016 SVG extension (MS-ODRAWXML): the blip's vector original,
         // nested in `<a:blip><a:extLst>`. The raster `r:embed` (pic_rid) is only a
@@ -154,14 +162,27 @@ pub(crate) fn parse_drawing_anchors(
         // ECMA-376 §20.5.2.33 `twoCellAnchor@editAs` (normative fact): "twoCell"
         // (default), "oneCell", "absolute". It governs how later band edits
         // move/resize the picture (§20.5.3.2). The initial display rect of a
-        // tagged twoCellAnchor is from/to (renderer resolver policy).
-        let edit_as = anchor.attribute("editAs").map(|s| s.to_string());
+        // tagged twoCellAnchor is from/to (renderer resolver policy). A
+        // `oneCellAnchor` (§20.5.2.24) has no `to` and no `editAs`; like shapes,
+        // it keeps the compatibility value `editAs="oneCell"` for untagged
+        // consumers, while tagged consumers size from `anchor_ext_*`.
+        let edit_as = if one_cell {
+            Some("oneCell".to_string())
+        } else {
+            anchor.attribute("editAs").map(|s| s.to_string())
+        };
 
         for child in anchor.children() {
             if !child.is_element() {
                 continue;
             }
             match child.tag_name().name() {
+                // §20.5.2.24 anchor-level `<xdr:ext>` of a oneCellAnchor, recorded
+                // raw with no reconciliation against the picture's xfrm.
+                "ext" if one_cell && is_xdr_ns(child.tag_name().namespace()) => {
+                    anchor_ext_cx = child.attribute("cx").and_then(|v| v.trim().parse().ok());
+                    anchor_ext_cy = child.attribute("cy").and_then(|v| v.trim().parse().ok());
+                }
                 "from" | "to" => {
                     let is_from = child.tag_name().name() == "from";
                     let mut col: u32 = 0;
@@ -191,7 +212,7 @@ pub(crate) fn parse_drawing_anchors(
                 }
                 "pic" => {
                     // §20.1.2.2.8 — a `<xdr:cNvPr hidden="1">` picture is not
-                    // rendered. Skip the whole anchor (a twoCellAnchor holds a
+                    // rendered. Skip the whole anchor (a cell anchor holds a
                     // single drawing object).
                     if xdr_node_hidden(&child) {
                         continue;
@@ -294,8 +315,14 @@ pub(crate) fn parse_drawing_anchors(
             to_row,
             to_row_off,
             edit_as,
-            // Normative fact: this loop only accepts `xdr:twoCellAnchor`.
-            anchor_tag: Some(DrawingAnchorTag::TwoCellAnchor),
+            // Normative fact: the XML element this picture was anchored with.
+            anchor_tag: Some(if one_cell {
+                DrawingAnchorTag::OneCellAnchor
+            } else {
+                DrawingAnchorTag::TwoCellAnchor
+            }),
+            anchor_ext_cx,
+            anchor_ext_cy,
             native_ext_cx,
             native_ext_cy,
             rotation,
@@ -1781,15 +1808,15 @@ pub(crate) fn parse_shape_anchors(
             }
             let t = n.tag_name().name();
             // A standalone `<xdr:sp>` always renders through the shape path. A
-            // standalone `<xdr:pic>` under a `twoCellAnchor`, however, is ALSO a
-            // plain image anchor that `parse_drawing_anchors` already emits into
+            // `<xdr:pic>` directly under a cell anchor, however, is ALSO a plain
+            // image anchor that `parse_drawing_anchors` already emits into
             // `ws.images` — WITH its `<a:srcRect>` crop, svgBlip vector original,
-            // and `editAs` size. Capturing it here too would draw the picture a
-            // second time as an uncropped full-image shape, overwriting the
-            // cropped anchor draw (the sample-27 regression). So a `twoCellAnchor`
-            // pic is owned solely by `ws.images`; we only keep a standalone pic
-            // for `oneCellAnchor`, which `parse_drawing_anchors` does not handle.
-            t == "sp" || (t == "pic" && anchor_tag == "oneCellAnchor")
+            // and anchor size. Capturing it here too would draw the picture a
+            // second time (the sample-27 regression), so it is owned solely by
+            // `ws.images`. `parse_drawing_anchors` does not unwrap
+            // `<mc:AlternateContent>`, so a oneCellAnchor pic selected from it
+            // stays here.
+            t == "sp" || (t == "pic" && anchor_tag == "oneCellAnchor" && content != anchor)
         }) {
             // §20.1.2.2.8 — a hidden stand-alone shape/pic is not rendered.
             if xdr_node_hidden(&sp) {
@@ -2346,6 +2373,8 @@ pub(crate) fn parse_ole_object_anchors(
             edit_as: Some("twoCell".to_string()),
             // A CT_ObjectAnchor marker, not an xdr anchor element: untagged.
             anchor_tag: None,
+            anchor_ext_cx: None,
+            anchor_ext_cy: None,
             native_ext_cx: 0,
             native_ext_cy: 0,
             rotation: None,
@@ -3166,17 +3195,27 @@ mod style_lnref_tests {
         ));
     }
 
-    /// A standalone `<xdr:pic>` directly under a `twoCellAnchor` is a plain image
-    /// anchor owned by `ws.images` (parse_drawing_anchors, WITH its `<a:srcRect>`
-    /// crop). `parse_shape_anchors` must NOT also capture it — otherwise the
-    /// renderer draws the picture twice and the uncropped shape draw overwrites
-    /// the cropped anchor draw (the sample-27 double-draw regression).
+    /// A standalone `<xdr:pic>` directly under a `twoCellAnchor` or
+    /// `oneCellAnchor` is a plain image anchor owned by `ws.images`
+    /// (parse_drawing_anchors, WITH its `<a:srcRect>` crop).
+    /// `parse_shape_anchors` must NOT also capture it — otherwise the renderer
+    /// draws the picture twice (the sample-27 double-draw regression).
     #[test]
-    fn standalone_twocellanchor_pic_is_not_a_shape_anchor() {
-        let xml = format!(
-            r#"<xdr:wsDr {NS} xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><xdr:twoCellAnchor editAs="oneCell">
-              <xdr:from><xdr:col>9</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>1</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
-              <xdr:to><xdr:col>11</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>10</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>
+    fn standalone_pic_is_not_a_shape_anchor() {
+        for (open, close) in [
+            (
+                r#"<xdr:twoCellAnchor editAs="oneCell"><xdr:from><xdr:col>9</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>1</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
+              <xdr:to><xdr:col>11</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>10</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>"#,
+                "</xdr:twoCellAnchor>",
+            ),
+            (
+                r#"<xdr:oneCellAnchor><xdr:from><xdr:col>9</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>1</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
+              <xdr:ext cx="2905125" cy="2181225"/>"#,
+                "</xdr:oneCellAnchor>",
+            ),
+        ] {
+            let xml = format!(
+                r#"<xdr:wsDr {NS} xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">{open}
               <xdr:pic>
                 <xdr:nvPicPr><xdr:cNvPr id="2" name="P"/><xdr:cNvPicPr/></xdr:nvPicPr>
                 <xdr:blipFill><a:blip r:embed="rId1"/><a:srcRect l="32560" r="3829"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill>
@@ -3184,18 +3223,16 @@ mod style_lnref_tests {
                   <a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr>
               </xdr:pic>
               <xdr:clientData/>
-            </xdr:twoCellAnchor></xdr:wsDr>"#
-        );
-        let anchors = parse_shape_anchors(
-            &xml,
-            &theme(),
-            &ThemeFormatScheme::default(),
-            &HashMap::new(),
-        );
-        assert!(
-            anchors.is_empty(),
-            "twoCellAnchor pic belongs to ws.images, not ws.shape_groups: {anchors:?}"
-        );
+            {close}</xdr:wsDr>"#
+            );
+            let mut rids = HashMap::new();
+            rids.insert("rId1".to_string(), "xl/media/image1.png".to_string());
+            let anchors = parse_shape_anchors(&xml, &theme(), &ThemeFormatScheme::default(), &rids);
+            assert!(
+                anchors.is_empty(),
+                "a cell-anchor pic belongs to ws.images, not ws.shape_groups: {anchors:?}"
+            );
+        }
     }
 
     /// A standalone `<xdr:sp>` under the same anchor IS a shape anchor — only the
@@ -3209,63 +3246,28 @@ mod style_lnref_tests {
         assert_eq!(color.as_deref(), Some("#FF0000"), "sp still captured");
     }
 
-    /// A `oneCellAnchor` pic is NOT handled by `parse_drawing_anchors` (which only
-    /// scans `twoCellAnchor`), so the shape path must keep capturing it — else the
-    /// image is dropped entirely. Its `<a:srcRect>` crop must also be surfaced on
-    /// the `ShapeGeom::Image` so the renderer can crop it like a top-level anchor.
-    #[test]
-    fn standalone_onecellanchor_pic_is_still_captured_with_crop() {
-        let xml = format!(
-            r#"<xdr:wsDr {NS} xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><xdr:oneCellAnchor>
-              <xdr:from><xdr:col>1</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>1</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
-              <xdr:ext cx="914400" cy="914400"/>
-              <xdr:pic>
-                <xdr:nvPicPr><xdr:cNvPr id="2" name="P"/><xdr:cNvPicPr/></xdr:nvPicPr>
-                <xdr:blipFill><a:blip r:embed="rId1"/><a:srcRect l="10000" t="20000"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill>
-                <xdr:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="914400"/></a:xfrm>
-                  <a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr>
-              </xdr:pic>
-              <xdr:clientData/>
-            </xdr:oneCellAnchor></xdr:wsDr>"#
-        );
-        let mut rids = HashMap::new();
-        rids.insert("rId1".to_string(), "xl/media/image1.png".to_string());
-        let anchors = parse_shape_anchors(&xml, &theme(), &ThemeFormatScheme::default(), &rids);
-        assert_eq!(anchors.len(), 1, "oneCellAnchor pic must still be captured");
-        match &anchors[0].shapes[0].geom {
-            ShapeGeom::Image { src_rect, .. } => {
-                let sr = src_rect
-                    .as_ref()
-                    .expect("leaf pic surfaces its srcRect crop");
-                assert!((sr.l - 0.1).abs() < 1e-9);
-                assert!((sr.t - 0.2).abs() < 1e-9);
-            }
-            other => panic!("expected an image-geom shape, got {other:?}"),
-        }
-    }
-
     /// ECMA-376 §20.5.2.24: a true `oneCellAnchor` records its anchor-level
-    /// `<xdr:ext>` separately from the pic's raw `<a:xfrm><a:ext>`. The shape
-    /// path still owns the crop, because `parse_drawing_anchors` only scans
-    /// twoCellAnchor.
+    /// `<xdr:ext>` separately from the shape's raw `<a:xfrm><a:ext>`.
     #[test]
     fn onecellanchor_records_anchor_ext_separately_from_child_ext() {
         let xml = format!(
             r#"<xdr:wsDr {NS} xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><xdr:oneCellAnchor>
               <xdr:from><xdr:col>1</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>1</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
               <xdr:ext cx="1828800" cy="685800"/>
-              <xdr:pic>
-                <xdr:nvPicPr><xdr:cNvPr id="2" name="P"/><xdr:cNvPicPr/></xdr:nvPicPr>
-                <xdr:blipFill><a:blip r:embed="rId1"/><a:srcRect l="10000"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill>
+              <xdr:sp>
+                <xdr:nvSpPr><xdr:cNvPr id="2" name="S"/><xdr:cNvSpPr/></xdr:nvSpPr>
                 <xdr:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="457200"/></a:xfrm>
                   <a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr>
-              </xdr:pic>
+              </xdr:sp>
               <xdr:clientData/>
             </xdr:oneCellAnchor></xdr:wsDr>"#
         );
-        let mut rids = HashMap::new();
-        rids.insert("rId1".to_string(), "xl/media/image1.png".to_string());
-        let anchors = parse_shape_anchors(&xml, &theme(), &ThemeFormatScheme::default(), &rids);
+        let anchors = parse_shape_anchors(
+            &xml,
+            &theme(),
+            &ThemeFormatScheme::default(),
+            &HashMap::new(),
+        );
         assert_eq!(anchors.len(), 1);
         let a = &anchors[0];
         assert_eq!(a.anchor_tag, Some(DrawingAnchorTag::OneCellAnchor));
@@ -3275,10 +3277,6 @@ mod style_lnref_tests {
         );
         // Raw child extent is unchanged, not rewritten to the anchor ext.
         assert_eq!((a.native_ext_cx, a.native_ext_cy), (914400, 457200));
-        match &a.shapes[0].geom {
-            ShapeGeom::Image { src_rect, .. } => assert!(src_rect.is_some()),
-            other => panic!("expected an image-geom shape, got {other:?}"),
-        }
         let json = serde_json::to_string(a).unwrap();
         assert!(json.contains("\"anchorTag\":\"oneCellAnchor\""), "{json}");
         assert!(json.contains("\"anchorExtCx\":1828800"), "{json}");
@@ -3834,6 +3832,47 @@ mod blip_svg_tests {
         anchors.into_iter().next().unwrap()
     }
 
+    /// §20.5.2.24 — a picture anchored with `<xdr:oneCellAnchor>` is emitted,
+    /// tagged, and sized from the anchor-level `<xdr:ext>`. Its `<xdr:spPr>`
+    /// need not carry an `<a:xfrm>` (CT_ShapeProperties makes it optional).
+    #[test]
+    fn one_cell_anchor_picture_is_emitted_with_anchor_extent() {
+        let mut rels = HashMap::new();
+        rels.insert("rId1".to_string(), "../media/image1.png".to_string());
+        let xml = r#"<xdr:wsDr
+  xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"
+  xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+  xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <xdr:oneCellAnchor>
+    <xdr:from><xdr:col>0</xdr:col><xdr:colOff>19050</xdr:colOff><xdr:row>1</xdr:row><xdr:rowOff>9525</xdr:rowOff></xdr:from>
+    <xdr:ext cx="1066800" cy="752475"/>
+    <xdr:pic>
+      <xdr:nvPicPr><xdr:cNvPr id="2" name="P"/><xdr:cNvPicPr/></xdr:nvPicPr>
+      <xdr:blipFill><a:blip r:embed="rId1"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill>
+      <xdr:spPr><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr>
+    </xdr:pic>
+    <xdr:clientData/>
+  </xdr:oneCellAnchor>
+</xdr:wsDr>"#;
+        let data = build_media_zip(PNG_1X1, SVG);
+        let mut archive = crate::XlsxZip::new(Cursor::new(data)).unwrap();
+        let anchors =
+            parse_drawing_anchors(xml, &rels, "xl/drawings/drawing1.xml", &mut archive, &[]);
+        assert_eq!(anchors.len(), 1);
+        let a = &anchors[0];
+        assert_eq!(a.anchor_tag, Some(DrawingAnchorTag::OneCellAnchor));
+        assert_eq!(
+            (a.anchor_ext_cx, a.anchor_ext_cy),
+            (Some(1066800), Some(752475))
+        );
+        assert_eq!(
+            (a.from_col, a.from_col_off, a.from_row, a.from_row_off),
+            (0, 19050, 1, 9525)
+        );
+        assert_eq!(a.edit_as.as_deref(), Some("oneCell"));
+        assert_eq!(a.image_path, "xl/media/image1.png");
+    }
+
     /// §20.1.2.2.8 — a `<xdr:pic>` whose `<xdr:cNvPr hidden="1">` marks it hidden
     /// is not emitted as an image anchor. A visible pic still resolves.
     #[test]
@@ -4075,6 +4114,8 @@ mod blip_svg_tests {
             to_row_off: 0,
             edit_as: Some("oneCell".to_string()),
             anchor_tag: Some(DrawingAnchorTag::TwoCellAnchor),
+            anchor_ext_cx: None,
+            anchor_ext_cy: None,
             native_ext_cx: 300000,
             native_ext_cy: 200000,
             rotation: None,
@@ -4097,6 +4138,8 @@ mod blip_svg_tests {
         // Untagged models keep the legacy JSON unchanged (field omitted).
         let untagged = ImageAnchor {
             anchor_tag: None,
+            anchor_ext_cx: None,
+            anchor_ext_cy: None,
             ..anchor.clone()
         };
         assert!(!serde_json::to_string(&untagged)

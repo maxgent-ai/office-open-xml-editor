@@ -7,6 +7,11 @@ the corresponding minor release.
 
 ## Unreleased
 
+- **Excel pictures anchored to one cell:** pictures saved with a one-cell
+  anchor (a top-left cell plus a fixed size, as written for example by
+  openpyxl) are now displayed at that size. Previously such a picture was
+  missing when its shape properties had no transform. No migration is
+  required.
 - **legacy Word section text flow:** with the experimental direct DOC source,
   sections whose text flow runs downward with every character rotated, or
   upward with later lines to the right, are now displayed in that direction
