@@ -1269,6 +1269,8 @@ export interface ImageAnchor {
     toRowOff: number;
     editAs?: string;
     anchorTag?: DrawingAnchorTag;
+    anchorExtCx?: number;
+    anchorExtCy?: number;
     nativeExtCx: number;
     nativeExtCy: number;
     rotation?: number;

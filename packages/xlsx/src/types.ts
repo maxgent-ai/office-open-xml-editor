@@ -808,6 +808,10 @@ export interface ImageAnchor {
   editAs?: string;
   /** XML anchor element kind (normative fact). Absent = not recorded. */
   anchorTag?: DrawingAnchorTag;
+  /** `<xdr:oneCellAnchor><xdr:ext cx cy>` in EMU (§20.5.2.24): the
+   *  anchor-level display size. Absent for twoCellAnchor. */
+  anchorExtCx?: number;
+  anchorExtCy?: number;
   /** `<xdr:pic><xdr:spPr><a:xfrm><a:ext cx cy>` in EMU: the raw child
    *  transform extent. 0 = unavailable. */
   nativeExtCx: number;

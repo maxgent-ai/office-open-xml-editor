@@ -1371,10 +1371,17 @@ pub struct ImageAnchor {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub edit_as: Option<String>,
     /// XML anchor element kind (normative fact; OOXML pictures parsed here are
-    /// always `twoCellAnchor`). `None` = not recorded (old models, OLE/VML
-    /// previews, legacy binary conversion).
+    /// `twoCellAnchor` or `oneCellAnchor`). `None` = not recorded (old models,
+    /// OLE/VML previews, legacy binary conversion).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub anchor_tag: Option<DrawingAnchorTag>,
+    /// `<xdr:oneCellAnchor><xdr:ext cx cy>` in EMU (§20.5.2.24): the picture's
+    /// anchor-level display size, distinct from `native_ext_*`. `None` for
+    /// twoCellAnchor or a missing or unparsable attribute.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anchor_ext_cx: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anchor_ext_cy: Option<i64>,
     /// `<xdr:pic><xdr:spPr><a:xfrm><a:ext cx cy>` in EMU: the raw child
     /// transform extent (normative fact). Library policy: only untagged models
     /// with `editAs == "oneCell"` size from it. A tagged `twoCellAnchor` takes
