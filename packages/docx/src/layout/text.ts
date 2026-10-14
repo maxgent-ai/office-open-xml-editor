@@ -1328,7 +1328,15 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
             return Object.freeze({ xMinPt, xMaxPt, ascentPt, descentPt });
           })()
         : undefined;
-      const totalAdvancePt = spans.reduce((sum, span) => sum + span.advancePt, 0);
+      // A valid long run can retain one ordinary font slot per scalar. Keep
+      // metric aggregation independent of the engine's call-argument limit;
+      // spreading those spans into Math.max would throw before layout starts.
+      let totalAdvancePt = 0, ascentPt = 0, descentPt = 0;
+      for (const span of spans) {
+        totalAdvancePt += span.advancePt;
+        ascentPt = Math.max(ascentPt, span.ascentPt);
+        descentPt = Math.max(descentPt, span.descentPt);
+      }
       const clusters = request.clusterGeometry === false
         ? undefined
         : (() => {
@@ -1388,8 +1396,8 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
           })();
       const result: TextShapeResult = Object.freeze({
         advancePt: totalAdvancePt,
-        ascentPt: Math.max(0, ...spans.map((span) => span.ascentPt)),
-        descentPt: Math.max(0, ...spans.map((span) => span.descentPt)),
+        ascentPt,
+        descentPt,
         ...(inkBounds ? { inkBounds } : {}),
         ...(inkBounds && spans.every((span) => span.horizontalInkBoundsAreTight === true)
           ? { horizontalInkBoundsAreTight: true }

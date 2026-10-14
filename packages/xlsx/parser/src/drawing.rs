@@ -111,6 +111,18 @@ fn resolve_drawing_media_path(
     Some(media_path)
 }
 
+// ECMA-376 Part 3 §§9.3–9.4: the selected branch replaces its wrapper.
+// Both picture and shape acquisition must use the same namespace capability policy.
+fn selected_anchor_content<'a, 'input>(
+    anchor: roxmltree::Node<'a, 'input>,
+) -> roxmltree::Node<'a, 'input> {
+    anchor
+        .children()
+        .find(|n| n.is_element() && n.tag_name().name() == "AlternateContent")
+        .and_then(|ac| ooxml_common::mce::select_alternate_content(ac, &xlsx_understands_ns))
+        .unwrap_or(anchor)
+}
+
 /// Parse `<xdr:twoCellAnchor>` and `<xdr:oneCellAnchor>` pictures from a drawing
 /// XML and resolve embedded pictures into data URLs. `drawing_path` is the OPC
 /// source part.
@@ -172,7 +184,18 @@ pub(crate) fn parse_drawing_anchors(
             anchor.attribute("editAs").map(|s| s.to_string())
         };
 
-        for child in anchor.children() {
+        // One-cell pictures have one owner even after MCE branch substitution.
+        // Anchor markers/ext stay on the original anchor; selected pic content
+        // needs no child xfrm. Two-cell MCE handling is unchanged here.
+        let content = if one_cell {
+            selected_anchor_content(anchor)
+        } else {
+            anchor
+        };
+        for child in anchor
+            .children()
+            .chain(content.children().filter(|_| content != anchor))
+        {
             if !child.is_element() {
                 continue;
             }
@@ -1729,11 +1752,7 @@ pub(crate) fn parse_shape_anchors(
         // Choice or fall through to the Fallback so the grpSp/sp/pic lookups below
         // see the selected shape. (Equations inside the shape text body are handled
         // separately by `push_math_runs_shape`; this is the shape-level wrapper.)
-        let content = anchor
-            .children()
-            .find(|n| n.is_element() && n.tag_name().name() == "AlternateContent")
-            .and_then(|ac| ooxml_common::mce::select_alternate_content(ac, &xlsx_understands_ns))
-            .unwrap_or(anchor);
+        let content = selected_anchor_content(anchor);
 
         // Two top-level layouts ECMA-376 allows under <xdr:twoCellAnchor>:
         //   (a) <xdr:grpSp> wrapping a tree of nested groups + leaves; and
@@ -1813,10 +1832,9 @@ pub(crate) fn parse_shape_anchors(
             // `ws.images` — WITH its `<a:srcRect>` crop, svgBlip vector original,
             // and anchor size. Capturing it here too would draw the picture a
             // second time (the sample-27 regression), so it is owned solely by
-            // `ws.images`. `parse_drawing_anchors` does not unwrap
-            // `<mc:AlternateContent>`, so a oneCellAnchor pic selected from it
-            // stays here.
-            t == "sp" || (t == "pic" && anchor_tag == "oneCellAnchor" && content != anchor)
+            // `ws.images`, including a oneCellAnchor picture selected by MCE.
+            // Group image leaves remain owned by collect_shapes below.
+            t == "sp"
         }) {
             // §20.1.2.2.8 — a hidden stand-alone shape/pic is not rendered.
             if xdr_node_hidden(&sp) {
@@ -3871,6 +3889,49 @@ mod blip_svg_tests {
         );
         assert_eq!(a.edit_as.as_deref(), Some("oneCell"));
         assert_eq!(a.image_path, "xl/media/image1.png");
+    }
+
+    /// Part 3 §9.3 substitutes the selected MCE branch before §20.5.2.24.
+    /// A selected picture has the same optional child xfrm as a direct picture.
+    #[test]
+    fn one_cell_anchor_selected_mce_picture_without_child_transform() {
+        let pic = r#"<xdr:pic>
+          <xdr:nvPicPr><xdr:cNvPr id="2" name="P"/><xdr:cNvPicPr/></xdr:nvPicPr>
+          <xdr:blipFill><a:blip r:embed="rId1"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill>
+          <xdr:spPr><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr>
+        </xdr:pic>"#;
+        // An unsupported Choice must select this ordinary picture in Fallback.
+        let xml = format!(
+            r#"<xdr:wsDr
+              xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"
+              xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+              xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+              xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+              xmlns:unknown="urn:public-unsupported-extension">
+              <xdr:oneCellAnchor>
+                <xdr:from><xdr:col>0</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>1</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
+                <xdr:ext cx="1066800" cy="752475"/>
+                <mc:AlternateContent><mc:Choice Requires="unknown"/>
+                  <mc:Fallback>{pic}</mc:Fallback></mc:AlternateContent>
+                <xdr:clientData/>
+              </xdr:oneCellAnchor></xdr:wsDr>"#
+        );
+        let rels = HashMap::from([("rId1".to_string(), "../media/image1.png".to_string())]);
+        let data = build_media_zip(PNG_1X1, SVG);
+        let mut archive = crate::XlsxZip::new(Cursor::new(data)).unwrap();
+        let images =
+            parse_drawing_anchors(&xml, &rels, "xl/drawings/drawing1.xml", &mut archive, &[]);
+        let rid_urls = HashMap::from([("rId1".to_string(), "xl/media/image1.png".to_string())]);
+        let shapes = parse_shape_anchors(&xml, &[], &ThemeFormatScheme::default(), &rid_urls);
+        assert_eq!(
+            images.len(),
+            1,
+            "the selected MCE picture must not disappear"
+        );
+        assert!(shapes.is_empty(), "the picture has one acquisition owner");
+        let value = serde_json::to_value(&images[0]).unwrap();
+        assert_eq!(value["anchorExtCx"].as_i64(), Some(1066800));
+        assert_eq!(value["anchorExtCy"].as_i64(), Some(752475));
     }
 
     /// §20.1.2.2.8 — a `<xdr:pic>` whose `<xdr:cNvPr hidden="1">` marks it hidden
