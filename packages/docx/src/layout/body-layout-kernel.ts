@@ -119,6 +119,13 @@ export interface AcquiredParagraphBlock {
   /** §17.3.1.11 admits identical adjacent framePr members with their owner. */
   readonly retainedFootnoteReferenceIds?: readonly string[];
   readonly relocationBlockExtentPt?: number;
+  /** Private source-owned reading atom. All members are fully acquired before
+   * any page occurrence is accepted; a flow-region retry reacquires the atom. */
+  readonly sourceOwnedAnchorRun?: Readonly<{
+    members: readonly Readonly<{input: import('./body-layout-input.js').BodyParagraphSourceInput; layout: ParagraphLayout; blockExtentPt: number}>[];
+    pageIndex: number; columnIndex: number; flowDomainId: string;
+    startYPt: number; extentPt: number;
+  }>;
 }
 
 export interface AcquiredTableBlock {

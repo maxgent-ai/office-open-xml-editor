@@ -1,3 +1,6 @@
+import { composeNativeReadingAnchorRun, nativeReadingAnchorRuns, type AnchorRunMember } from './native-reading-anchor-run.js';
+import { NativeReadingSceneError } from './native-reading-block-scene.js';
+import { acquireRequestedNativeReadingScenes } from './native-reading-paragraph.js';
 import { MAX_BODY_LAYOUT_PAGES } from './resource-budgets.js';
 import { deepFreezePlainData, deepFreezePlainDataWithFrozenAliases } from './plain-data.js';
 import { quarterTurnMathMetadataService } from './resources.js';
@@ -59,6 +62,7 @@ import {
   createLayoutServicesRuntimeView,
   fieldAcquisitionContextOf,
   footnoteAcquisitionWorkBudgetOf,
+  paintResourceRegistryOf,
   paragraphAcquisitionCacheOf,
   verticalGlyphMeasurementServiceOf,
 } from './runtime-state.js';
@@ -135,7 +139,7 @@ import {
 } from './table-pagination.js';
 import { paragraphGapAdjustment } from './paragraph-spacing.js';
 import { bottomBorderExtentPt, resolveParagraphBorderEdges, topBorderExtentPt, type ParagraphBorderEdges } from './paragraph-border-adjacency.js';
-import { acquireParagraphResult, acquireRetainedFrameGroup, bodyFrameGroupFor, bodyParagraphBorderEdgesFor, projectPhysicalAnchorResult, retainedFrameMaximumBaselineLoweringPt, type BodyFrameGroup } from './paragraph.js';
+import { acquireParagraphAnchorRunStage, type ParagraphAcquisitionOptions, acquireParagraphResult, acquireRetainedFrameGroup, bodyFrameGroupFor, bodyParagraphBorderEdgesFor, projectPhysicalAnchorResult, retainedFrameMaximumBaselineLoweringPt, type BodyFrameGroup } from './paragraph.js';
 import { wordLoweredDropCapAnchorLeadingPt } from './body-pagination-compatibility.js';
 import { wordGridFrameCarrierSourceOwnsNoFlow } from './table-compatibility.js';
 import type { CompleteTextBoxStoryAcquirer } from './paragraph.js';
@@ -548,7 +552,7 @@ function nestedSourceElement(sourceStore: LayoutSourceStore, ref: SourceRef): La
   /** Body acquisition stays at the kernel adapter because it resolves renderer
    * state into retained paragraph inputs; layout-owned projections below it
    * receive only immutable structural values. */
-function acquireBodyParagraphAtLocation(
+function bodyParagraphAcquisitionArguments(
   state: BodyAcquisitionState,
   paragraph: LayoutParagraphBlock,
   source: SourceRef,
@@ -572,7 +576,7 @@ function acquireBodyParagraphAtLocation(
     suppressSpaceBefore,
     continuation.boundary !== null,
   );
-  return acquireParagraphResult(
+  return [
     paragraph,
     {
       id: `${source.story}:${source.storyInstance}:${source.path.join('.')}`,
@@ -610,7 +614,7 @@ function acquireBodyParagraphAtLocation(
       ...(state.frozenAnchorFrames && state.frozenAnchorFrames.size > 0
         ? { frozenAnchorFrames: state.frozenAnchorFrames }
         : {}),
-    },
+    } satisfies ParagraphAcquisitionOptions,
     continuation.boundary === null
       ? undefined
       : {
@@ -621,7 +625,11 @@ function acquireBodyParagraphAtLocation(
                 uniformRubyAdvancePt: continuation.uniformRubyAdvancePt,
               }),
         },
-  );
+  ] as const;
+}
+
+function acquireBodyParagraphAtLocation(...args: Parameters<typeof bodyParagraphAcquisitionArguments>) {
+  return acquireParagraphResult(...bodyParagraphAcquisitionArguments(...args));
 }
 
 function bodyStoryRoot(source: LayoutSourceStore, ref: SourceRef): readonly LayoutStoryBlock[] {
@@ -1377,6 +1385,60 @@ interface BodySessionDependencies {
   readonly measureContext: MeasurementTextContext;
   readonly publicAnchorBridge: typeof publicAnchorBridge;
   readonly effectiveTablePositioning: typeof effectiveTablePositioning;
+  readonly nativeAnchorRuns: ReadonlyMap<number, readonly import('./body-layout-input.js').BodyParagraphSourceInput[]>;
+}
+
+function acquireBodyAnchorRun(
+  context: BodySessionDependencies,
+  request: Parameters<NonNullable<BodyLayoutSession['measureParagraph']>>[0],
+  inputs: readonly import('./body-layout-input.js').BodyParagraphSourceInput[],
+): ReturnType<NonNullable<BodyLayoutSession['measureParagraph']>> {
+  if (request.continuation.boundary !== null) throw new Error('Anchor run cannot be continued');
+  const {state,services,sessionState,source} = context;
+  const candidate: BodyAcquisitionState = {...state,floats:[...state.floats],pageAnchorPrescanned:new Set(state.pageAnchorPrescanned)};
+  const stages: AnchorRunMember[] = [];
+  let y = request.location.cursorPt.yPt;
+  for (const input of inputs) {
+    const paragraph = sourceElement(source,input.source);
+    if (paragraph.type !== 'paragraph') throw new Error('Anchor run source kind changed');
+    const formatting = resolveBodyParagraphLayoutContext(candidate,paragraph);
+    // This run class preserves independently acquired mark advances. Spacing
+    // folding, keep chains and decorated marks retain their ordinary
+    // owner; do not introduce a second implementation of those algorithms.
+    if (formatting.spaceBeforePt !== 0 || formatting.spaceAfterPt !== 0
+      || paragraph.contextualSpacing || paragraph.borders || paragraph.shading || input.keepNext || input.keepLines)
+      throw new NativeReadingSceneError('placement','anchor run paragraph formatting requires ordinary spacing/keep acquisition');
+    const location = {...request.location,cursorPt:{...request.location.cursorPt,yPt:y},
+      availableBounds:{...request.location.availableBounds,yPt:y}};
+    applyBodyAcquisitionLocationTo(services,candidate,location);
+    const [p,options] = bodyParagraphAcquisitionArguments(candidate,paragraph,input.source,location,
+      request.availableInlineExtentPt,stages.length===0 && request.suppressSpaceBefore,
+      undefined,sessionState.drawingCollisionRegistry.entries);
+    const stage = acquireParagraphAnchorRunStage(p,options);
+    stages.push({input,paragraph,stage,frames:{...bodyAnchorReferenceFrames(candidate),paragraph:stage.acquired.layout.flowBounds,line:null,character:null}});
+    y += stage.acquired.layout.advancePt;
+  }
+  const column = bodyAnchorReferenceFrames(candidate).column;
+  if (!column) throw new Error('Anchor run column is unresolved');
+  const composed = composeNativeReadingAnchorRun(stages,column,
+    paragraphWrapExclusions(state.floats,request.location.flowDomainId).map(e=>e.bounds),paintResourceRegistryOf(services));
+  const layouts = composed.members.map(m=>m.layout);
+  const floats = layouts.flatMap(layout=>retainedBodyParagraphFloatEntries(sessionState,layout));
+  const collisions = layouts.flatMap(ownedParagraphAnchorCollisions);
+  const delta = Object.freeze({
+    ...(floats.length ? {floats:floatingTableRegistryDelta(sessionState.floatRegistry,Object.freeze(floats),sessionState.floatRegistry.nextParagraphId+floats.length)} : {}),
+    ...(collisions.length ? {drawingCollisions:drawingMLCollisionRegistryDelta(sessionState.drawingCollisionRegistry,Object.freeze(collisions))} : {}),
+  });
+  if (delta.floats) validateFloatingTableRegistryDelta(delta.floats,sessionState.floatRegistry);
+  if (delta.drawingCollisions) validateDrawingMLCollisionRegistryDelta(sessionState.drawingCollisionRegistry,delta.drawingCollisions);
+  const first = layouts[0];
+  return Object.freeze({layout:first,blockExtentPt:first.advancePt,fragmentation:Object.freeze({kind:'indivisible' as const}),
+    placement:Object.freeze({coordinateSpace:'logical-body' as const,xPt:first.flowBounds.xPt,yPt:first.flowBounds.yPt,sectionFlowOwnership:'host-flow' as const}),
+    relocationBlockExtentPt:composed.extentPt,
+    sourceOwnedAnchorRun:Object.freeze({members:composed.members,pageIndex:request.location.pageIndex,columnIndex:request.location.columnIndex,
+      flowDomainId:request.location.flowDomainId,startYPt:request.location.cursorPt.yPt,extentPt:composed.extentPt}),
+    ...(floats.length || collisions.length ? {flowRegistryDelta:delta} : {}),
+  });
 }
 
 function measureBodyParagraphEntry(
@@ -1400,6 +1462,8 @@ function measureBodyParagraphEntry(
   setBodyAcquisitionLocation(services, state, sessionState, request.location);
   const paragraph = sourceElement(dependencies.source, request.input.source);
   if (paragraph.type !== 'paragraph') throw new Error('Paragraph source kind mismatch');
+  const anchorRun = context.nativeAnchorRuns.get(request.input.source.path[0]);
+  if (anchorRun) return acquireBodyAnchorRun(context, request, anchorRun);
   if (paragraph.framePr) {
     if (request.continuation.boundary !== null) {
       throw new Error('Body frame acquisition cannot continue across flow regions');
@@ -1538,7 +1602,7 @@ function measureBodyParagraphEntry(
   return Object.freeze({
     layout,
     blockExtentPt: layout.advancePt,
-    fragmentation: measured.markOnly
+    fragmentation: measured.markOnly || (layout.nativeReadingRelocations?.length ?? 0) > 0
       ? Object.freeze({ kind: 'indivisible' as const })
       : Object.freeze({
           kind: 'splittable' as const,
@@ -1933,6 +1997,13 @@ function measureFollowingBodyBlock(
   const element = sourceElement(dependencies.source, request.input.source);
   if (request.input.kind === 'paragraph') {
     if (element.type !== 'paragraph') throw new Error('Following paragraph source kind mismatch');
+    const run = context.nativeAnchorRuns.get(request.input.source.path[0]);
+    if (run) {
+      const acquired = acquireBodyAnchorRun(context,{input:request.input,location:request.location,
+        availableInlineExtentPt:request.availableInlineExtentPt,suppressSpaceBefore:false,continuation:{boundary:null}},run);
+      return Object.freeze({fullExtentPt:acquired.relocationBlockExtentPt!,leadContentExtentPt:acquired.relocationBlockExtentPt!,
+        fullFootnoteReferenceIds:Object.freeze([]),leadFootnoteReferenceIds:Object.freeze([])});
+    }
     const { layout } = acquireBodyParagraphAtLocation(
       candidate,
       element,
@@ -2182,6 +2253,14 @@ function prescanBodyPageAnchors(
       throw new Error(
         `Page-anchor prescan occurrence acquisition mismatch: ${anchor.occurrenceId}`,
       );
+    }
+    if (payloads[0]!.run.anchorAcquisitionInput.nativeReadingRelocation === 'completeScene') {
+      // No page-owned exclusion is claimed for changed placement. Defer only
+      // after the same complete scene/resource owner validates all members.
+      const scenes = acquireRequestedNativeReadingScenes(acquired, anchor.paragraphSource,
+        `prescan:${anchor.occurrenceId}`, pageRegistryFlowDomainId(request.location.pageIndex), paintResourceRegistryOf(services));
+      if (!scenes.some(scene => scene.occurrenceId === anchor.occurrenceId)) throw new Error('Reading prescan omitted its complete scene');
+      return [];
     }
     const result = resolveAnchorFrame({
       acquisition: payloads[0]!.run.anchorAcquisitionInput,
@@ -2819,6 +2898,11 @@ function openConcreteBodyLayoutSession(
   state.acquireCompleteTextBoxStory = (owner, request) =>
     acquireCompleteBodyTextBoxStory(owner, storyAcquisitionContext, request);
   const sessionDependencies = {
+    nativeAnchorRuns: nativeReadingAnchorRuns(source.bodyLayoutInput, ref => {
+      const p = sourceElement(source,ref);
+      if (p.type !== 'paragraph') throw new Error('Anchor run index source mismatch');
+      return p;
+    }),
     source,
     dependencies,
     services,

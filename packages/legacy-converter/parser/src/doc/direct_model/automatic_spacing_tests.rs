@@ -53,6 +53,29 @@ fn document(bytes: &[u8]) -> Document {
         .document
 }
 
+fn declare_dop2000_owner(word: &mut [u8], table: &[u8]) {
+    // MS-DOC 2.7.1 requires a present recognized extension to select Dop2000.
+    // These fixtures reserve a zero header prefix before their first text FC.
+    assert_eq!(u16::from_le_bytes(word[2..4].try_into().unwrap()), 0x00c1);
+    assert_eq!(u16::from_le_bytes(word[0x3e..0x40].try_into().unwrap()), 22);
+    assert_eq!(
+        u16::from_le_bytes(word[0x98..0x9a].try_into().unwrap()),
+        0x005d
+    );
+    assert!(word[0x382..0x400].iter().all(|byte| *byte == 0));
+    let clx = u32::from_le_bytes(word[0x1a2..0x1a6].try_into().unwrap()) as usize;
+    assert_eq!(table[clx], 2);
+    assert_eq!(
+        u32::from_le_bytes(table[clx + 15..clx + 19].try_into().unwrap()),
+        0x400
+    );
+    // The D9 FC/LCB array and its two extension words end exactly at 0x400;
+    // all story bytes, existing pairs, and table payloads remain unchanged.
+    word[0x98..0x9a].copy_from_slice(&0x006cu16.to_le_bytes());
+    word[0x3fa..0x3fc].copy_from_slice(&2u16.to_le_bytes());
+    word[0x3fc..0x3fe].copy_from_slice(&0x00d9u16.to_le_bytes());
+}
+
 #[test]
 fn automatic_spacing_preserves_inherited_true_and_independent_direct_false() {
     let parts = ["inherit\r", "before\r", "after\r", "both\r"];
@@ -153,7 +176,14 @@ fn automatic_spacing_native_body_header_footer_and_note_keep_their_own_paragraph
         Some(&[None, Some("Header\r"), None, Some("Footer\r"), None, None]),
         Some(&notes),
     )));
-    let doc = document(&bytes);
+    let cfb = CompoundFile::open(&bytes).unwrap();
+    let mut word = cfb.stream("WordDocument").unwrap();
+    let table = cfb.stream("0Table").unwrap();
+    declare_dop2000_owner(&mut word, &table);
+    let doc = document(&build_scoped_cfb(&[
+        ("WordDocument", word),
+        ("0Table", table),
+    ]));
     assert_eq!(
         doc.settings
             .as_ref()
@@ -216,6 +246,9 @@ fn automatic_spacing_dop_setting_reaches_canonical_document_without_neighbor_bit
         table.extend(dop);
         word[0x192..0x196].copy_from_slice(&(offset as u32).to_le_bytes());
         word[0x196..0x19a].copy_from_slice(&(size as u32).to_le_bytes());
+        if size >= 544 {
+            declare_dop2000_owner(&mut word, &table);
+        }
         let doc = document(&build_scoped_cfb(&[
             ("WordDocument", word.clone()),
             ("0Table", table.clone()),

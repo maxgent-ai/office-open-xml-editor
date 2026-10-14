@@ -581,6 +581,14 @@ fn cell_border_tc80_row(border: [u8; 4]) -> Vec<u8> {
 
 /// Fill the existing fixture's empty style slot with a red table border.
 fn with_cell_border_style_border(source: &[u8], border: [u8; 8]) -> Vec<u8> {
+    let mut borders = vec![48];
+    for _ in 0..6 {
+        borders.extend(border);
+    }
+    with_table_style_sets(source, &sprm(0xd613, &borders, false), &[])
+}
+
+fn with_table_style_sets(source: &[u8], tapx: &[u8], chpx: &[u8]) -> Vec<u8> {
     let cfb = CompoundFile::open(source).unwrap();
     let mut word = cfb.stream("WordDocument").unwrap();
     let mut table = cfb.stream("0Table").unwrap();
@@ -592,15 +600,10 @@ fn with_cell_border_style_border(source: &[u8], border: [u8; 8]) -> Vec<u8> {
         + 2
         + u16::from_le_bytes(stylesheet[normal..normal + 2].try_into().unwrap()) as usize;
     assert_eq!(&stylesheet[slot..slot + 2], &[0, 0]);
-    let mut borders = vec![48];
-    for _ in 0..6 {
-        borders.extend(border);
-    }
-    let tapx = sprm(0xd613, &borders, false);
     let mut style = vec![0; 14];
     style[2..4].copy_from_slice(&0xfff3u16.to_le_bytes());
     style[4..6].copy_from_slice(&3u16.to_le_bytes());
-    for set in [tapx.as_slice(), &[][..], &[][..]] {
+    for set in [tapx, &[][..], chpx] {
         style.extend((set.len() as u16).to_le_bytes());
         style.extend(set);
         if set.len() % 2 != 0 {
@@ -617,6 +620,87 @@ fn with_cell_border_style_border(source: &[u8], border: [u8; 8]) -> Vec<u8> {
     word[0xa6..0xaa].copy_from_slice(&(stylesheet.len() as u32).to_le_bytes());
     table.extend(stylesheet);
     build_scoped_cfb(&[("WordDocument", word), ("0Table", table)])
+}
+
+#[test]
+fn conditional_diagonal_none_preserves_complete_native_document_and_resources() {
+    use crate::doc::table_style_condition::FIRST_ROW;
+    let source = cell_border_source(
+        [
+            row(1000),
+            sprm(0x563a, &1u16.to_le_bytes(), false),
+            sprm(0x740a, &[0, 0, 32, 0], false),
+        ]
+        .concat(),
+        false,
+    );
+    // Supported bold authors FIRST_ROW in CHPX, parsed after TAPX. A valid
+    // diagonal NONE must not suppress it or add model/resource data.
+    let chpx = sprm(0xca85, &[1, 0, 0x35, 0x08, 1], true);
+    let acquire = |tapx: &[u8]| {
+        let bytes = with_table_style_sets(&source, tapx, &chpx);
+        super::super::direct_model(&CompoundFile::open(&bytes).unwrap(), 1_000_000)
+    };
+    let expected = acquire(&[]).unwrap();
+    let BodyElement::Table(table) = &expected.document.body[0] else {
+        panic!("table")
+    };
+    let CellElement::Paragraph(paragraph) = &table.rows[0].cells[0].content[0] else {
+        panic!("paragraph")
+    };
+    let DocRun::Text(run) = &paragraph.runs[0] else {
+        panic!("text")
+    };
+    assert_eq!(run.text, "x");
+    assert!(run.bold, "control must select the supported condition");
+    for code in [0xd685, 0xd686] {
+        for border in [
+            [17, 23, 31, 0, 32, 0, 0, 0],
+            [17, 23, 31, 255, 8, 0, 0, 0],
+            // MS-DOC 2.9.16 ignores reserved bits; space/shadow/frame cannot
+            // draw a border when 2.9.22 specifies NONE.
+            [17, 23, 31, 0, 32, 0, 255, 255],
+        ] {
+            let diagonal = sprm(code, &[&[8][..], &border].concat(), false);
+            let tapx = sprm(
+                0xd66a,
+                &[&FIRST_ROW.to_le_bytes()[..], &diagonal].concat(),
+                true,
+            );
+            let actual = acquire(&tapx).expect("redundant valid NONE must admit");
+            assert_eq!(
+                serde_json::to_value(actual.document).unwrap(),
+                serde_json::to_value(&expected.document).unwrap()
+            );
+            let resource_facts = |resources: Vec<crate::doc::pictures::DirectPictureResource>| {
+                resources
+                    .into_iter()
+                    .map(|r| (r.key, r.mime_type, r.bytes))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                resource_facts(actual.resources),
+                expected
+                    .resources
+                    .iter()
+                    .map(|r| (r.key.clone(), r.mime_type, r.bytes.clone()))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+    let empty = with_table_style_sets(&source, &[], &[]);
+    assert!(super::super::direct_model(&CompoundFile::open(&empty).unwrap(), 1_000_000).is_ok());
+    let diagonal = sprm(0xd685, &[8, 0, 0, 0, 0, 8, 0, 0, 0], false);
+    let tapx = sprm(
+        0xd66a,
+        &[&FIRST_ROW.to_le_bytes()[..], &diagonal].concat(),
+        true,
+    );
+    let no_presence = with_table_style_sets(&source, &tapx, &[]);
+    assert!(
+        super::super::direct_model(&CompoundFile::open(&no_presence).unwrap(), 1_000_000).is_err(),
+        "NONE alone must refuse at native document admission"
+    );
 }
 
 fn cell_border_source(mut row_properties: Vec<u8>, styled: bool) -> Vec<u8> {

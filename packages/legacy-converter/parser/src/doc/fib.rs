@@ -40,7 +40,29 @@ pub(super) fn write_minimal_word97_header(word: &mut [u8]) {
     word[FIXED_PREFIX_END..FIXED_PREFIX_END + 2].copy_from_slice(&0u16.to_le_bytes());
 }
 
-pub(super) fn effective_version(word: &[u8]) -> Result<u16, String> {
+/// Closed FIB selector and DOP ownership acquired from counted bytes.
+/// Numeric nFib alone is insufficient: MS-DOC 2.7.1 selects Dop97 when
+/// cswNew is zero, including a tolerated higher base selector. Physical
+/// extension bounds and unknown-selector refusal are checked before creation.
+#[derive(Clone, Copy)]
+pub(super) struct KnownFibSchema {
+    version: u16,
+    extension_words: usize,
+}
+
+impl KnownFibSchema {
+    pub(super) fn effective_version(self) -> u16 {
+        self.version
+    }
+
+    /// Every accepted nonzero extension selector embeds Dop2000; an absent
+    /// extension owns only Dop97. Length is still checked by the DOP reader.
+    pub(super) fn has_dop2000_fields(self) -> bool {
+        self.extension_words != 0
+    }
+}
+
+pub(super) fn known_schema(word: &[u8]) -> Result<KnownFibSchema, String> {
     word.get(..32)
         .ok_or_else(|| unsupported("truncated Word FIB base"))?;
     let mut offset = 32usize;
@@ -81,7 +103,15 @@ pub(super) fn effective_version(word: &[u8]) -> Result<u16, String> {
     {
         return Err(unsupported("unsupported Word FIB version"));
     }
-    Ok(version)
+    Ok(KnownFibSchema {
+        version,
+        extension_words: count,
+    })
+}
+
+#[cfg(test)]
+fn effective_version(word: &[u8]) -> Result<u16, String> {
+    known_schema(word).map(KnownFibSchema::effective_version)
 }
 
 #[cfg(test)]
@@ -197,5 +227,22 @@ mod tests {
             assert!(effective_version(&fib(0xc1, Some(version), [14, 22, 0x5d])).is_err());
         }
         assert!(effective_version(&fib(0xc1, Some(0xc1), [14, 22, 0x5d])).is_err());
+    }
+
+    #[test]
+    fn fib_dop_owner_known_extension_retains_minimum_extra_and_ignored_tail_acquisition() {
+        for (version, words) in [(0x00d9u16, 1u16), (0x00d9, 5), (0x0112, 1), (0x0112, 5)] {
+            let mut word = fib(0x00c1, None, [14, 22, 0x00b7]);
+            let offset = word.len() - 2;
+            word[offset..].copy_from_slice(&words.to_le_bytes());
+            word.extend_from_slice(&version.to_le_bytes());
+            word.resize(word.len() + usize::from(words - 1) * 2, 0xff);
+            // Keep quick-save in its published domain; only ignored tails vary.
+            if words > 1 {
+                word[offset + 4..offset + 6].fill(0);
+            }
+            assert_eq!(effective_version(&word).unwrap(), version);
+            assert!(effective_version(&word[..word.len() - 1]).is_err());
+        }
     }
 }

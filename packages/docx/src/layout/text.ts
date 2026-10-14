@@ -1,3 +1,5 @@
+import type { NativeReadingWordBreaking } from '../native-reading-word-breaking.js';
+import type { NativeReadingPictureBullet } from '../native-reading-picture-bullet.js';
 import { wordTextBoxVerticalMode } from './compatibility.js';
 import type { LayoutDiagnostic } from './types.js';
 import {
@@ -138,6 +140,9 @@ type ParagraphTextFacts = Readonly<{
   /** Authored discretionary opportunity with its own conditional glyph style.
    * Its source run is otherwise empty, independent of dictionary hyphenation. */
   optionalHyphen?: boolean;
+  /** Explicit native reading owner; common layout never applies unknown
+   * Hresi dictionary/character transformations. Literal text stays unchanged. */
+  nativeReadingWordBreaking?: Readonly<NativeReadingWordBreaking>;
   /** Parser-projected CT_R boundary constraint around an authored
    * `<w:noBreakHyphen/>`. These names are layout facts, not parser wire keys. */
   noBreakBefore?: boolean;
@@ -238,8 +243,10 @@ export interface ComplexFieldBoundaryInput {
 }
 
 export type ParagraphAcquisitionInput = DeepReadonly<Omit<DocParagraph, 'runs'>> & Readonly<{
+  nativeReadingNumberingWordBreaking?: Readonly<NativeReadingWordBreaking>;
   runs: readonly ParagraphAcquisitionRun[];
   complexFieldBoundaries?: readonly ComplexFieldBoundaryInput[];
+  nativeReadingPictureBullet?: NativeReadingPictureBullet;
   numberingMarkerShapeInput?: NumberingMarkerShapeInput;
   paragraphMarkShapeInput?: NumberingMarkerShapeInput;
 }>;
@@ -250,6 +257,7 @@ export type ParagraphAcquisitionInput = DeepReadonly<Omit<DocParagraph, 'runs'>>
 export type ParagraphLayoutSource = DeepReadonly<Omit<DocParagraph, 'runs'>> & Readonly<{
   runs: readonly (DeepReadonly<DocRun> | ParagraphAcquisitionRun)[];
   complexFieldBoundaries?: readonly ComplexFieldBoundaryInput[];
+  nativeReadingPictureBullet?: NativeReadingPictureBullet;
   numberingMarkerShapeInput?: NumberingMarkerShapeInput;
   paragraphMarkShapeInput?: NumberingMarkerShapeInput;
 }>;
@@ -1328,7 +1336,15 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
             return Object.freeze({ xMinPt, xMaxPt, ascentPt, descentPt });
           })()
         : undefined;
-      const totalAdvancePt = spans.reduce((sum, span) => sum + span.advancePt, 0);
+      // A valid long run can retain one ordinary font slot per scalar. Keep
+      // metric aggregation independent of the engine's call-argument limit;
+      // spreading those spans into Math.max would throw before layout starts.
+      let totalAdvancePt = 0, ascentPt = 0, descentPt = 0;
+      for (const span of spans) {
+        totalAdvancePt += span.advancePt;
+        ascentPt = Math.max(ascentPt, span.ascentPt);
+        descentPt = Math.max(descentPt, span.descentPt);
+      }
       const clusters = request.clusterGeometry === false
         ? undefined
         : (() => {
@@ -1388,8 +1404,8 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
           })();
       const result: TextShapeResult = Object.freeze({
         advancePt: totalAdvancePt,
-        ascentPt: Math.max(0, ...spans.map((span) => span.ascentPt)),
-        descentPt: Math.max(0, ...spans.map((span) => span.descentPt)),
+        ascentPt,
+        descentPt,
         ...(inkBounds ? { inkBounds } : {}),
         ...(inkBounds && spans.every((span) => span.horizontalInkBoundsAreTight === true)
           ? { horizontalInkBoundsAreTight: true }

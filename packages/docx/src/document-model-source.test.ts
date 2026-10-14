@@ -451,3 +451,114 @@ describe('DocxDocument.load with model sources', () => {
     explicit.destroy();
   });
 });
+
+
+it('delivers requested progressive completion after native model-source full layout', async () => {
+  const observations: Array<{ native: boolean; progressive: boolean; callbacks: unknown[] }> = [];
+  // Use the existing real load/pull/acquisition/layout fixture, not a stubbed
+  // load, native predicate or completion emitter. Each cursor consumes its
+  // input, so every case owns a fresh model and selected source.
+  for (const [native, progressive] of [[false, true], [true, false], [true, true]] as const) {
+    const input = syntheticDocxModel('plain', { paragraphs: 1, wordsPerParagraph: 1 });
+    const paragraph = input.body[0];
+    if (paragraph.type !== 'paragraph' || paragraph.runs[0]?.type !== 'text') {
+      throw new Error('Public synthetic text paragraph absent');
+    }
+    paragraph.runs[0].text = 'A';
+    // Published valid wire-sidecar from native-reading-word-breaking.test.ts.
+    if (native) Object.assign(paragraph.runs[0], {
+      __nativeReadingWordBreaking: { rawHres: 0, rawChHres: 1 },
+    });
+    install(parseWorkerScript(undefined, 1, input));
+    const { source, claim, beginLoad, release } = fakeSource();
+    const callbacks: unknown[] = [];
+    const document = await DocxDocument.load(cfbBytes(), {
+      mode: 'main', modelSources: [source], currentDate: 0, progressiveLayout: progressive,
+      onLayoutComplete(error) { callbacks.push(error); },
+    });
+    try {
+      await document.waitUntilLayoutComplete();
+      // Admission and native ownership are observed before callback assertions:
+      // losing the sidecar or failing setup cannot manufacture a causal RED.
+      expect(claim).toHaveBeenCalled(); expect(beginLoad).toHaveBeenCalledTimes(1);
+      expect(document.pageCount).toBeGreaterThan(0); expect(document.layoutComplete).toBe(true);
+      expect(document.readingNotices.map(notice => notice.code)).toEqual(native
+        ? ['WORD_BREAKING_SIMPLIFIED_FOR_READING'] : []);
+      expect(release).toHaveBeenCalledTimes(1);
+      observations.push({ native, progressive, callbacks });
+    } finally { document.destroy(); }
+  }
+  expect(observations[0].callbacks).toEqual([undefined]);
+  expect(observations[1].callbacks).toEqual([]);
+  expect(observations[2].callbacks).toEqual([undefined]);
+});
+
+it('does not notify native progressive completion after a viewer abort during telemetry', async () => {
+  const input = syntheticDocxModel('plain', { paragraphs: 1, wordsPerParagraph: 1 });
+  const paragraph = input.body[0];
+  if (paragraph.type !== 'paragraph' || paragraph.runs[0]?.type !== 'text') {
+    throw new Error('Public synthetic text paragraph absent');
+  }
+  paragraph.runs[0].text = 'A';
+  Object.assign(paragraph.runs[0], {
+    __nativeReadingWordBreaking: { rawHres: 0, rawChHres: 1 },
+  });
+  const script = parseWorkerScript(undefined, 1, input);
+  let entered!: () => void;
+  const telemetryStarted = new Promise<void>(resolve => { entered = resolve; });
+  install(async (worker, message) => {
+    // Hold only the real telemetry reply after canonical layout. No loader,
+    // native predicate or completion event is replaced.
+    if (message.type === 'resourceUsage') { entered(); return; }
+    await script(worker, message);
+  });
+  const abort = new AbortController();
+  const { source, release } = fakeSource();
+  const callbacks: unknown[] = [];
+  const loading = DocxDocument.load(cfbBytes(), {
+    mode: 'main', modelSources: [source], currentDate: 0, progressiveLayout: true,
+    onLayoutComplete(error) { callbacks.push(error); },
+    [docxViewerLoadSignal]: {
+      signal: abort.signal,
+      requestedView: () => undefined,
+      subscribeViewChange: () => () => undefined,
+    },
+  } as LoadOptions);
+  await telemetryStarted;
+  abort.abort();
+  await expect(loading).rejects.toBeInstanceOf(PaginationAbortError);
+  expect(callbacks).toEqual([]);
+  expect(release).toHaveBeenCalledOnce();
+  expect(ProtocolWorker.instances.at(-1)!.terminated).toBe(true);
+});
+
+it('does not notify native progressive completion when source release aborts the viewer', async () => {
+  const input = syntheticDocxModel('plain', { paragraphs: 1, wordsPerParagraph: 1 });
+  const paragraph = input.body[0];
+  if (paragraph.type !== 'paragraph' || paragraph.runs[0]?.type !== 'text') {
+    throw new Error('Public synthetic text paragraph absent');
+  }
+  paragraph.runs[0].text = 'A';
+  Object.assign(paragraph.runs[0], {
+    __nativeReadingWordBreaking: { rawHres: 0, rawChHres: 1 },
+  });
+  install(parseWorkerScript(undefined, 1, input));
+  const abort = new AbortController();
+  const { source, release } = fakeSource();
+  // A caller-owned release can synchronously cancel its viewer. Exercise that
+  // public hook, without replacing the loader or completion emitter.
+  release.mockImplementation(() => { abort.abort(); });
+  const callbacks: unknown[] = [];
+  await expect(DocxDocument.load(cfbBytes(), {
+    mode: 'main', modelSources: [source], currentDate: 0, progressiveLayout: true,
+    onLayoutComplete(error) { callbacks.push(error); },
+    [docxViewerLoadSignal]: {
+      signal: abort.signal,
+      requestedView: () => undefined,
+      subscribeViewChange: () => () => undefined,
+    },
+  } as LoadOptions)).rejects.toBeInstanceOf(PaginationAbortError);
+  expect(release).toHaveBeenCalledOnce();
+  expect(ProtocolWorker.instances.at(-1)!.terminated).toBe(true);
+  expect(callbacks).toEqual([]);
+});

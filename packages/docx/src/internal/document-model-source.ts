@@ -1,3 +1,4 @@
+import { hasNativeReadingRequests } from '../native-reading-notice.js';
 import { resolveCjkFallback, type CjkLang } from '@silurus/ooxml-core';
 import {
   preloadGoogleFonts,
@@ -208,6 +209,7 @@ export async function loadDocxModelSource(
     const wiredWorker = sourceWorker(worker, sourceLoad, opts, (view) => { if (doc) adoptSourceView(doc, view); });
     const rendererDescriptors = mode === 'worker' ? workerRendererDescriptors(opts) : undefined;
     const workerProgressive = mode === 'worker' && !!opts.progressiveLayout;
+    let owesNativeCompletion = false;
     try {
       publicDoc = Reflect.construct(DocxDocument, [wiredWorker, mode, defaultCurrentDateMs, opts.wasmUrl]) as DocxDocument;
       // TypeScript's private members have no cross-module friend access;
@@ -391,7 +393,12 @@ export async function loadDocxModelSource(
             )
             : undefined,
         };
-        if (deferrable && opts.progressiveLayout) {
+        // Native reading suppresses early publication, not the library's
+        // requested completion callback. Retain the same short-circuit scan.
+        const nativeReading = deferrable && !!opts.progressiveLayout
+          && hasNativeReadingRequests(doc._source);
+        owesNativeCompletion = nativeReading;
+        if (deferrable && opts.progressiveLayout && !nativeReading) {
           const store = retained.layoutVariants;
           // Narrowed once: the closures below outlive this block's control flow.
           const progressiveDocument = doc;
@@ -574,6 +581,14 @@ export async function loadDocxModelSource(
       checkAbort();
       metrics.succeed({ pages: doc.pageCount });
       sourceLoad.release();
+      // LoadOptions.onLayoutComplete also applies when native reading builds
+      // the full layout before load() resolves. A caller-owned release can
+      // synchronously cancel its viewer: recheck before notifying so this
+      // unpublished native load still rejects without a completion callback.
+      if (owesNativeCompletion) {
+        checkAbort();
+        doc._layoutObservers.notify('onLayoutComplete', opts.onLayoutComplete);
+      }
       return publicDoc;
     } catch (error) {
       disposeRejectedLoad(worker, doc ? abortDocument : undefined);

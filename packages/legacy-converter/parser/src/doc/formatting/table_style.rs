@@ -326,6 +326,7 @@ impl Formatting<'_> {
         let mut vertical_source = None;
         let mut has_inherited_conditional_shading = false;
         let mut conditional_border_rejected = false;
+        let mut pending_diagonal_none_conditions = 0u16;
         let mut default_margin_sides = 0u8;
         let mut style_margin_sides = 0u8;
         let mut conditional_margin_sides = 0u8;
@@ -385,6 +386,34 @@ impl Formatting<'_> {
                             profile.conditional_table_borders.sides[slot][side] = Some(value);
                             profile.conditional_table_borders.present |= 1 << slot;
                             profile.condition_presence |= condition;
+                            Ok(interpret_table_styles)
+                        }
+                        0xd685 | 0xd686 => {
+                            let tapx::Scope::Conditional(condition) = scope else {
+                                return Ok(false);
+                            };
+                            if operand.len() != 9 || operand[0] != 8 {
+                                return Err(unsupported(
+                                    "invalid Word conditional table-style diagonal border",
+                                ));
+                            }
+                            // Validate even with interpretation disabled, as for
+                            // other conditional borders; malformed/FF decoding
+                            // errors remain refusals rather than normalization.
+                            let value = table::PreparedBorder::read(&operand[1..], false)?;
+                            // MS-DOC 2.6.3 defaults both cell diagonals to absent;
+                            // 2.9.21/2.9.22 specify the BrcOperand and type-zero
+                            // NONE. Normalize only that validated redundant value.
+                            // Nil and visible diagonals remain unsupported, and a
+                            // later NONE cannot erase an earlier refusal.
+                            if value.is_nil() || !value.decode()?.is_cleared() {
+                                return Ok(false);
+                            }
+                            // Authored condition presence changes region selection
+                            // (including band exclusions). Do not invent presence
+                            // from NONE: require another supported property after
+                            // the complete TAPX/CHPX/PAPX inheritance chain below.
+                            pending_diagonal_none_conditions |= condition;
                             Ok(interpret_table_styles)
                         }
                         0xd613 => {
@@ -655,6 +684,9 @@ impl Formatting<'_> {
                 )?;
                 profile.unsupported_paragraph |= physical_alignment.is_some();
             }
+        }
+        if pending_diagonal_none_conditions & !profile.condition_presence != 0 {
+            profile.unsupported_table = true;
         }
         if conditional_margin_sides != 0
             && (conditional_margin_sides & default_margin_sides != 0
