@@ -51,7 +51,11 @@ pub(super) struct NoteProperties {
     pub formats: Option<(u16, u16)>,
 }
 
-pub(super) fn read(word: &[u8], table: &[u8]) -> Result<Option<Properties>, String> {
+pub(super) fn read(
+    word: &[u8],
+    table: &[u8],
+    schema: super::fib::KnownFibSchema,
+) -> Result<Option<Properties>, String> {
     let size = u32_at(word, 0x196)? as usize;
     // Recovery policy for incomplete documents and minimal synthetic fixtures:
     // the normative lcbDop is nonzero. The caller warns and retains the OOXML
@@ -95,7 +99,12 @@ pub(super) fn read(word: &[u8], table: &[u8]) -> Result<Option<Properties>, Stri
     // fDontAdjustLineHeightInTable. 2.6.4 sprmSDyaLinePitch excludes table
     // lines only "in case the fDontAdjustLineHeightInTable flag is set in the
     // document Dop2000"; an older DOP has no such flag, so it is not set.
-    let adjust_line_height_in_table = if dop.len() >= 544 {
+    // MS-DOC 2.7.1 chooses Dop97 when cswNew is zero. A bounded excess DOP
+    // tail does not authorize later Copts facts. We retain the existing
+    // prefix-only DOP tolerance, not a claim of conformant producer length;
+    // Section 2.5.15 FIB zero-initialization is not applied to missing DOP fields.
+    let owns_copts = schema.has_dop2000_fields() && dop.len() >= 544;
+    let adjust_line_height_in_table = if owns_copts {
         u32_at(dop, 512)? & (1 << 3) == 0
     } else {
         true
@@ -103,7 +112,7 @@ pub(super) fn read(word: &[u8], table: &[u8]) -> Result<Option<Properties>, Stri
     // Copts bit C (bit2), immediately before the independent table-grid bit.
     // Older/absent DOPs have no acquired fact; the existing shared consumer
     // retains its default rather than inventing an authored compatibility flag.
-    let do_not_use_html_paragraph_auto_spacing = if dop.len() >= 544 {
+    let do_not_use_html_paragraph_auto_spacing = if owns_copts {
         Some(u32_at(dop, 512)? & (1 << 2) != 0)
     } else {
         None
@@ -148,6 +157,16 @@ impl Properties {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Existing settings unit cases exercise a modern DOP owner. Whole-CFB
+    // tests separately establish absent-extension semantics through acquisition.
+    fn read(word: &[u8], table: &[u8]) -> Result<Option<Properties>, String> {
+        let mut header = vec![0; 0x388];
+        super::super::fib::write_minimal_word97_header(&mut header);
+        header[0x382..0x384].copy_from_slice(&2u16.to_le_bytes());
+        header[0x384..0x386].copy_from_slice(&0x00d9u16.to_le_bytes());
+        let schema = super::super::fib::known_schema(&header)?;
+        super::read(word, table, schema)
+    }
     fn default_tab_twips(word: &[u8], table: &[u8]) -> Result<Option<u16>, String> {
         Ok(read(word, table)?.map(|p| p.default_tab_twips))
     }

@@ -592,6 +592,7 @@ function acceptNode(
     yPt: number;
     sectionFlowOwnership?: 'host-flow' | 'page';
   }>,
+  retainedSourceContent = false,
 ): BodyPaginationState {
   const page = state.pages.at(-1);
   if (!page || page.kind !== 'content') throw new Error('Body content requires an active page');
@@ -629,7 +630,7 @@ function acceptNode(
     ? projected
     : Object.freeze({ ...projected, sectionFlowOwnership: placement.sectionFlowOwnership });
   const admittedBlockStartPt = placement?.yPt ?? state.flow.cursorBlockPt;
-  const contentOwned = ownershipRetained.kind === 'paragraph' && ownershipRetained.ordinaryFlow
+  const contentOwned = !retainedSourceContent && ownershipRetained.kind === 'paragraph' && ownershipRetained.ordinaryFlow
     ? (() => {
         const contentStartPt = admittedBlockStartPt + ownershipRetained.spacing.beforePt;
         const contentEndPt = admittedBlockStartPt
@@ -2018,6 +2019,51 @@ function* paginateBodyPassSteps(
               entryIndex,
             );
             continue;
+          }
+          if (acquired.sourceOwnedAnchorRun) {
+            const atom = acquired.sourceOwnedAnchorRun;
+            if (cursor.boundary !== null || atom.pageIndex !== location.pageIndex
+              || atom.columnIndex !== location.columnIndex || atom.flowDomainId !== location.flowDomainId
+              || atom.startYPt !== location.cursorPt.yPt || atom.extentPt !== relocationExtentPt
+              || !atom.members.length || atom.members.length > 16384)
+              throw new Error('Reading anchor atom admission provenance mismatch');
+            let total = 0;
+            for (let i=0;i<atom.members.length;i++) {
+              const expected = input.sequence[entryIndex+i], member = atom.members[i];
+              if (expected?.kind !== 'body-block' || expected.block.kind !== 'paragraph'
+                || expected.block !== member.input || member.layout.source.story !== member.input.source.story
+                || member.layout.source.storyInstance !== member.input.source.storyInstance
+                || member.layout.source.path.length !== member.input.source.path.length
+                || member.layout.source.path.some((p,j)=>p !== member.input.source.path[j])
+                || member.layout.events.length || member.input.pageBreakBefore || member.input.continuousSectionRole
+                || !Number.isFinite(member.blockExtentPt) || member.blockExtentPt < 0)
+                throw new Error('Reading anchor atom source sequence mismatch');
+              total += member.blockExtentPt;
+            }
+            if (Math.abs(total-atom.extentPt) > Number.EPSILON*Math.max(1,Math.abs(total),Math.abs(atom.extentPt)))
+              throw new Error('Reading anchor atom allocation mismatch');
+            // No scheduler yield or live acceptance mutation until every source
+            // projection succeeds. Members keep content/mark geometry and exact
+            // page/column placement; the final member owns the union reserve.
+            const ids = new Set<string>(), pendingAllocations: BodyFlowAllocation[] = [];
+            let pendingState = state;
+            for (const member of atom.members) {
+              pendingState = acceptNode(pendingState,member.layout,member.input.source,
+                member.blockExtentPt,fragmentStartKey,ids,pendingAllocations,
+                {coordinateSpace:'logical-body',xPt:member.layout.flowBounds.xPt,yPt:member.layout.flowBounds.yPt,sectionFlowOwnership:'host-flow'},true);
+            }
+            for (const id of ids) if (acceptedOccurrenceIds.has(id))
+              throw new Error(`Duplicate body occurrence acceptance: ${id}`);
+            // Registry owners validate their original identity lineage before
+            // mutating it. One consolidated delta registers every peer once.
+            if (acquired.flowRegistryDelta) session.commitFlowRegistryDelta(acquired.flowRegistryDelta);
+            state = pendingState;
+            for (const id of ids) acceptedOccurrenceIds.add(id);
+            allocations.push(...pendingAllocations);
+            previousParagraph = atom.members.at(-1)!.input;
+            entryIndex += atom.members.length-1;
+            session.moveAcquisitionCursor(acquisitionLocation(state));
+            continue bodyEntries;
           }
           // A placed frame still paints its retained references despite a zero flow
           // charge, so note ownership is committed with the accepted occurrence.

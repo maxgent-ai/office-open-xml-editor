@@ -185,6 +185,17 @@ export type AnchorFrameResult = Readonly<{
   issues: readonly AnchorFrameIssue[];
 }>;
 
+/** Canonical authored allocation and axes, independent of wrap exclusion
+ * geometry. A completed disclosed reading scene may use this origin without
+ * claiming an authored wrap side, contour, effect or distance. */
+export type AnchorPlacementResult = Readonly<{
+  status: 'resolved';
+  occurrenceId: string;
+  axes: Readonly<{ horizontal: AnchorAxisDiagnostic; vertical: AnchorAxisDiagnostic }>;
+  issues: readonly AnchorFrameIssue[];
+  geometry: Readonly<Pick<AnchorFrameGeometry, 'objectFrame' | 'size'>>;
+}> | Extract<AnchorFrameResult, { status: 'unsupported' }>;
+
 type Axis = 'horizontal' | 'vertical';
 type ReferenceFrameName = ResolvedAxisDiagnostic['referenceFrame'];
 
@@ -852,7 +863,7 @@ function frozenResult(result: AnchorFrameResult): AnchorFrameResult {
  * §§20.4.3.1-.7; implementation-note evidence is owned by the compatibility
  * decision module.
  */
-export function resolveAnchorFrame(input: AnchorFrameInput): AnchorFrameResult {
+export function resolveAnchorPlacement(input: AnchorFrameInput): AnchorPlacementResult {
   const { acquisition, frames } = input;
   // CT_Anchor makes these authoring controls required even when a particular
   // layout stage does not consume their values. Rejecting incomplete facts at
@@ -972,6 +983,24 @@ export function resolveAnchorFrame(input: AnchorFrameInput): AnchorFrameResult {
     widthPt: width.resolved.valuePt,
     heightPt: height.resolved.valuePt,
   };
+  return snapshotPlainData<AnchorPlacementResult>({
+    status: 'resolved', occurrenceId: acquisition.occurrenceId,
+    axes: { horizontal: horizontal.diagnostic, vertical: vertical.diagnostic },
+    issues: [], geometry: { objectFrame, size: {
+      horizontal: width.resolved.diagnostic, vertical: height.resolved.diagnostic,
+    } },
+  }, 'anchor placement result');
+}
+
+/** Complete ordinary anchor acquisition preserves the canonical placement
+ * guards and issue precedence, then validates all wrap/effect geometry. */
+export function resolveAnchorFrame(input: AnchorFrameInput): AnchorFrameResult {
+  const { acquisition } = input;
+  const placement = resolveAnchorPlacement(input);
+  if (placement.status !== 'resolved') return placement;
+  const objectFrame = placement.geometry.objectFrame;
+  const horizontal = { diagnostic: placement.axes.horizontal };
+  const vertical = { diagnostic: placement.axes.vertical };
   const parentEffects = effectEdges(acquisition.parentEffectExtent, 'parentEffectExtent', false);
   if (parentEffects.problem || !parentEffects.values) {
     const problem = parentEffects.problem as AnchorFrameIssue;
@@ -1114,10 +1143,7 @@ export function resolveAnchorFrame(input: AnchorFrameInput): AnchorFrameResult {
       objectFrame,
       inkBounds,
       wrapBounds,
-      size: {
-        horizontal: width.resolved.diagnostic,
-        vertical: height.resolved.diagnostic,
-      },
+      size: placement.geometry.size,
       parentEffectExtent: parentEffects.values,
       wrap: {
         kind: acquisition.wrap.kind,

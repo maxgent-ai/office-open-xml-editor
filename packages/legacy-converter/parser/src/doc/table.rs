@@ -1151,6 +1151,42 @@ impl Row {
 mod tests {
     use super::*;
 
+    #[test]
+    fn public_cell_border_none_nil_and_ignored_type_stay_distinct() {
+        // Public [MS-DOC] 2.9.16/20/22/157 cases, invented independently:
+        // none width is in eighth-points; exact Nil bypasses Brc fields;
+        // ordinary FF is an unresolved authored operation, not a clear.
+        let none =
+            PreparedBorder::read_cell_assignment(&[0x21, 0x43, 0x65, 0, 255, 0, 0, 0], false)
+                .unwrap();
+        assert!(!none.is_nil());
+        assert_eq!(none.decode().unwrap().direct_spec().style, "none");
+        let nil =
+            PreparedBorder::read_cell_assignment(&[0x21, 0x43, 0x65, 0, 255, 255, 255, 255], false)
+                .unwrap();
+        assert!(nil.is_nil());
+        assert_eq!(nil.decode().unwrap().direct_spec().style, "nil");
+        let ignored =
+            PreparedBorder::read_cell_assignment(&[0x21, 0x43, 0x65, 0, 31, 255, 0, 0], false)
+                .unwrap();
+        assert!(!ignored.is_nil());
+        assert!(ignored.decode().is_err());
+    }
+
+    #[test]
+    fn public_cell_border_ignored_width_boundary_remains_validated() {
+        // Current conservative scalar validation: Brc type>=40 width MUST<32.
+        // This does not settle whether FF MUST-ignore discards the full Brc.
+        assert!(
+            PreparedBorder::read_cell_assignment(&[0x21, 0x43, 0x65, 0, 31, 255, 0, 0], false,)
+                .is_ok()
+        );
+        assert!(
+            PreparedBorder::read_cell_assignment(&[0x21, 0x43, 0x65, 0, 32, 255, 0, 0], false,)
+                .is_err()
+        );
+    }
+
     /// The projected table position and overlap of a row.
     fn position(row: &Row) -> serde_json::Value {
         let (position, overlap) = row.position.direct();

@@ -2596,6 +2596,46 @@ fn parse_tbl_style_def(style_node: roxmltree::Node, based_on: Option<String>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_margin_child_inherits_whole_table_border_carrier() {
+        // ECMA-376 CT_Style/CT_TblPrBase: whole-table borders are authored
+        // in tblPr/tblBorders; a child's margin must not reset those sides.
+        let xml = r#"<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+          <w:style w:type="table" w:styleId="PublicBase">
+            <w:name w:val="Public Base"/>
+            <w:tblPr><w:tblBorders>
+              <w:top w:val="single" w:sz="8" w:color="C00000"/>
+              <w:left w:val="single" w:sz="8" w:color="C00000"/>
+              <w:bottom w:val="single" w:sz="8" w:color="C00000"/>
+              <w:right w:val="single" w:sz="8" w:color="C00000"/>
+              <w:insideH w:val="single" w:sz="8" w:color="C00000"/>
+              <w:insideV w:val="single" w:sz="8" w:color="C00000"/>
+            </w:tblBorders></w:tblPr>
+          </w:style>
+          <w:style w:type="table" w:styleId="PublicChild">
+            <w:name w:val="Public Child"/><w:basedOn w:val="PublicBase"/>
+            <w:tblPr><w:tblCellMar><w:left w:w="180" w:type="dxa"/></w:tblCellMar></w:tblPr>
+          </w:style>
+        </w:styles>"#;
+        let styles = StyleMap::parse(xml);
+        let inherited = styles.resolve_table_style("PublicChild");
+        for edge in [
+            &inherited.borders.top,
+            &inherited.borders.left,
+            &inherited.borders.bottom,
+            &inherited.borders.right,
+            &inherited.borders.inside_h,
+            &inherited.borders.inside_v,
+        ] {
+            let edge = edge.as_ref().expect("inherited base border");
+            assert_eq!(edge.style, "single");
+            assert_eq!(edge.color.as_deref(), Some("c00000"));
+            assert_eq!(edge.width, 1.0);
+        }
+        assert_eq!(inherited.cell_margin_left, Some(9.0));
+    }
+
     use roxmltree::Document as XmlDoc;
 
     fn stop(pos: f64, al: &str, ldr: &str) -> (f64, String, String) {
