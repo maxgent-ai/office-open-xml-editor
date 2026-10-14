@@ -2437,6 +2437,148 @@ mod tests {
         }
     }
 
+    fn conditional_diagonal_none_fixture(
+        condition: u16,
+        properties: &[u8],
+        present: bool,
+    ) -> Formatting<'static> {
+        let mut formatting = observed_table_style_formatting();
+        formatting.configure_table_styles(0x0112, true);
+        let sets = formatting.styles[0]
+            .as_mut()
+            .unwrap()
+            .table
+            .as_mut()
+            .unwrap();
+        sets.tapx = leaked(cnf(0xd66a, condition, properties));
+        sets.chpx = if present {
+            leaked(ccnf(condition, &[0x35, 0x08, 1]))
+        } else {
+            &[]
+        };
+        formatting
+    }
+
+    #[test]
+    fn conditional_diagonal_none_requires_existing_condition_and_interpretation() {
+        use table_style_condition::{FIRST_ROW, HORIZONTAL_ODD, LAST_ROW, TOP_LEFT};
+        let none = [0x85, 0xd6, 8, 0, 0, 0, 0, 8, 0, 0, 0];
+        for condition in [FIRST_ROW, HORIZONTAL_ODD, TOP_LEFT] {
+            let mut alone = conditional_diagonal_none_fixture(condition, &none, false);
+            assert_eq!(alone.table_style_selector_profile(Some(0)).unwrap().2, 0);
+            assert!(
+                alone.unsupported_table_properties,
+                "NONE cannot invent condition presence"
+            );
+        }
+        let mut disabled = conditional_diagonal_none_fixture(FIRST_ROW, &none, true);
+        disabled.configure_table_styles(0x0112, false);
+        disabled.table_style_selector_profile(Some(0)).unwrap();
+        assert!(disabled.unsupported_table_properties);
+        let mut control = conditional_diagonal_none_fixture(FIRST_ROW, &none, true);
+        assert_eq!(
+            control.table_style_selector_profile(Some(0)).unwrap().2,
+            FIRST_ROW
+        );
+        assert!(!control.unsupported_table_properties);
+        // Presence for a different condition cannot discharge this NONE.
+        let mut other = conditional_diagonal_none_fixture(FIRST_ROW, &none, false);
+        other.styles[0]
+            .as_mut()
+            .unwrap()
+            .table
+            .as_mut()
+            .unwrap()
+            .chpx = leaked(ccnf(LAST_ROW, &[0x35, 0x08, 1]));
+        assert_eq!(
+            other.table_style_selector_profile(Some(0)).unwrap().2,
+            LAST_ROW
+        );
+        assert!(other.unsupported_table_properties);
+        // An unsupported character property must not supply table presence,
+        // even though it also sets its own character-family refusal.
+        let mut font = conditional_diagonal_none_fixture(FIRST_ROW, &none, false);
+        font.styles[0]
+            .as_mut()
+            .unwrap()
+            .table
+            .as_mut()
+            .unwrap()
+            .chpx = leaked(ccnf(FIRST_ROW, &[0x4f, 0x4a, 0, 0]));
+        assert_eq!(font.table_style_selector_profile(Some(0)).unwrap().2, 0);
+        assert!(font.unsupported_table_properties);
+        // Presence authored in a later child must discharge the parent's
+        // redundant NONE without changing the existing conditional text.
+        let mut inherited = conditional_diagonal_none_fixture(FIRST_ROW, &none, false);
+        inherited.styles[1]
+            .as_mut()
+            .unwrap()
+            .table
+            .as_mut()
+            .unwrap()
+            .chpx = leaked(ccnf(FIRST_ROW, &[0x35, 0x08, 1]));
+        assert_eq!(
+            inherited.table_style_selector_profile(Some(1)).unwrap().2,
+            FIRST_ROW
+        );
+        assert!(!inherited.unsupported_table_properties);
+    }
+
+    #[test]
+    fn conditional_diagonal_none_preserves_malformed_visible_nil_and_inherited_refusals() {
+        let condition = table_style_condition::FIRST_ROW;
+        for (properties, decoding_error) in [
+            (vec![0x85, 0xd6, 7, 0, 0, 0, 0, 8, 0, 0], true), // invalid cb
+            (vec![0x85, 0xd6, 8, 0, 0, 0, 1, 8, 0, 0, 0], true), // invalid COLORREF
+            (vec![0x85, 0xd6, 8, 0, 0, 0, 0, 8, 2, 0, 0], true), // undefined type
+            (vec![0x85, 0xd6, 8, 0, 0, 0, 0, 8, 0xff, 0, 0], true), // unresolved FF
+            (vec![0x86, 0xd6, 8, 0, 0, 0, 0, 8, 1, 0, 0], false), // visible
+            (vec![0x85, 0xd6, 8, 0, 0, 0, 0, 255, 255, 255, 255], false), // Nil
+        ] {
+            for interpretation in [true, false] {
+                let mut formatting =
+                    conditional_diagonal_none_fixture(condition, &properties, true);
+                formatting.configure_table_styles(0x0112, interpretation);
+                let result = formatting.table_style_selector_profile(Some(0));
+                assert_eq!(result.is_err(), decoding_error);
+                if !decoding_error {
+                    assert!(formatting.unsupported_table_properties);
+                }
+            }
+        }
+        let none = [0x85, 0xd6, 8, 0, 0, 0, 0, 8, 0, 0, 0];
+        let visible = [0x85, 0xd6, 8, 0, 0, 0, 0, 8, 1, 0, 0];
+        for properties in [[visible, none].concat(), [none, visible].concat()] {
+            let mut formatting = conditional_diagonal_none_fixture(condition, &properties, true);
+            formatting.table_style_selector_profile(Some(0)).unwrap();
+            assert!(formatting.unsupported_table_properties);
+        }
+        for kind in [1, 255] {
+            let parent = if kind == 255 {
+                [0x85, 0xd6, 8, 0, 0, 0, 0, 255, 255, 255, 255]
+            } else {
+                [0x85, 0xd6, 8, 0, 0, 0, 0, 8, kind, 0, 0]
+            };
+            let mut formatting = conditional_diagonal_none_fixture(condition, &parent, true);
+            formatting.styles[1]
+                .as_mut()
+                .unwrap()
+                .table
+                .as_mut()
+                .unwrap()
+                .tapx = leaked(cnf(
+                0xd66a,
+                condition,
+                &[0x85, 0xd6, 8, 0, 0, 0, 0, 8, 0, 0, 0],
+            ));
+            formatting.table_style_selector_profile(Some(1)).unwrap();
+            assert!(
+                formatting.unsupported_table_properties,
+                "child NONE cannot erase a parent's unsupported diagonal"
+            );
+        }
+    }
+
     #[test]
     fn conditional_table_style_nil_shading_is_noop_and_unmapped_pattern_is_gated() {
         let mut conditional_nil = observed_table_style_formatting();
