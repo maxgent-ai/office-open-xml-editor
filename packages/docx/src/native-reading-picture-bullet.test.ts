@@ -49,7 +49,7 @@ describe('native picture-bullet owned reading acquisition', () => {
     Object.assign(numbering.__nativeReadingPictureBullet!, patch);
     expect(() => acquireNativeReadingPictureBullet(numbering)).toThrow(TypeError);
   });
-  it.each([3, 4, 5, 6, 7, 8, 11, 12, 15, 16, 0x40, 0xffffffff])('rejects undefined or incompatible MSOBLIPFLAGS %j', value => {
+  it.each([3, 4, 5, 6, 7, 8, 11, 12, 15, 16, 0x20, 0x41, 0x80, 0xffffffff])('rejects undefined or incompatible MSOBLIPFLAGS %j', value => {
     const numbering = inventedReadingPictureBulletNumbering();
     Object.assign(numbering.__nativeReadingPictureBullet!, { pibFlags: { key: 0x106, value } });
     expect(() => acquireNativeReadingPictureBullet(numbering)).toThrow('MSOBLIPFLAGS');
@@ -69,9 +69,12 @@ describe('native picture-bullet owned reading acquisition', () => {
     const paragraph = model.body[0];
     if (paragraph.type !== 'paragraph') throw new Error('invented paragraph absent');
     const rawNumbering = inventedReadingPictureBulletNumbering();
+    Object.assign(rawNumbering.__nativeReadingPictureBullet!, { pibFlags: { key: 0x106, value: 0x40 } });
     paragraph.numbering = rawNumbering;
     const input = paragraphAcquisitionInput(paragraph, source);
     expect(input.nativeReadingPictureBullet?.rawPbiFlags).toBe(0xa5fd);
+    expect(input.nativeReadingPictureBullet?.pibFlags).toEqual({ key: 0x106, value: 0x40 });
+    expect(Object.isFrozen(input.nativeReadingPictureBullet?.pibFlags)).toBe(true);
     expect(input.numbering).not.toHaveProperty('__nativeReadingPictureBullet');
     expect(input.numbering).not.toHaveProperty('fontFacts');
     expect(input.numbering?.picBulletTransform).toEqual(paragraph.numbering.picBulletTransform);

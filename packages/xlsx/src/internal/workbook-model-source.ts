@@ -1,3 +1,4 @@
+import { resolveBundledAssetUrl } from '@silurus/ooxml-core/internal/bundled-asset-url';
 import {
   resolveCjkFallback,
   type AdmittedModelSourceLoad,
@@ -129,10 +130,10 @@ function sourceWorker(
   opts: LoadOptions,
   onMdw: (value: number) => void,
 ): Worker {
-  const sourceOwnerUrl = new URL(
+  const sourceOwnerUrl = resolveBundledAssetUrl(new URL(
     import.meta.env.DEV ? './worker-worksheet-source.ts' : './xlsx-source-worker.mjs',
     import.meta.url,
-  ).href;
+  ).href, import.meta.url);
   return new Proxy(worker, {
     get(target, key) {
       if (key === 'postMessage') return (message: unknown, transfer?: Transferable[]) => {

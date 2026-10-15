@@ -1,3 +1,4 @@
+import { resolveBundledAssetUrl } from '@silurus/ooxml-core/internal/bundled-asset-url';
 import {
   resolveCjkFallback,
   type FontPreloadDemand,
@@ -128,10 +129,10 @@ export async function loadPptxModelSource(
 }
 
 function sourceWorker(worker: Worker, load: AdmittedModelSourceLoad): Worker {
-  const sourceOwnerUrl = new URL(
+  const sourceOwnerUrl = resolveBundledAssetUrl(new URL(
     import.meta.env.DEV ? './worker-presentation-source.ts' : './pptx-source-worker.mjs',
     import.meta.url,
-  ).href;
+  ).href, import.meta.url);
   return new Proxy(worker, {
     get(target, key) {
       if (key === 'postMessage') return (message: unknown, transfer?: Transferable[]) => {

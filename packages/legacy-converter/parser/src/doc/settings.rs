@@ -61,6 +61,9 @@ pub(super) fn read(
     // the normative lcbDop is nonzero. The caller warns and retains the OOXML
     // default when the entire DOP is absent; no offset is dereferenced then.
     if size == 0 {
+        if schema.requires_legacy_dop97_prefix() {
+            return Err(unsupported("missing legacy Word Dop97 prefix"));
+        }
         return Ok(None);
     }
     let offset = u32_at(word, 0x192)? as usize;
@@ -69,6 +72,12 @@ pub(super) fn read(
         .and_then(|tail| tail.get(..size))
         .filter(|dop| dop.len() >= 84)
         .ok_or_else(|| unsupported("truncated Word document properties"))?;
+    // The legacy forward reading profile has a published Dop97 prefix,
+    // including typography and note formats. A short blob cannot acquire
+    // this layout by filling missing facts with defaults.
+    if schema.requires_legacy_dop97_prefix() && dop.len() < 500 {
+        return Err(unsupported("truncated legacy Word Dop97 prefix"));
+    }
     // Two four-byte flag words and copts60 (two bytes) precede dxaTab.
     let interval = u16_at(dop, 10)?;
     // ECMA-376 17.15.1.25 requires a positive interval. Do not silently invent
@@ -100,7 +109,9 @@ pub(super) fn read(
     // lines only "in case the fDontAdjustLineHeightInTable flag is set in the
     // document Dop2000"; an older DOP has no such flag, so it is not set.
     // MS-DOC 2.7.1 chooses Dop97 when cswNew is zero. A bounded excess DOP
-    // tail does not authorize later Copts facts. We retain the existing
+    // tail does not authorize later Copts facts. The Microsoft 2007 legacy
+    // pre-2000 FIB reading family also owns Dop97 despite a present extension;
+    // its physical tail remains uninterpreted. We retain the existing
     // prefix-only DOP tolerance, not a claim of conformant producer length;
     // Section 2.5.15 FIB zero-initialization is not applied to missing DOP fields.
     let owns_copts = schema.has_dop2000_fields() && dop.len() >= 544;
@@ -180,6 +191,33 @@ mod tests {
             table[17..19].copy_from_slice(&interval.to_le_bytes());
         }
         (word, table)
+    }
+
+    #[test]
+    fn legacy_actual_selector_requires_dop97_and_never_promotes_opaque_tail() {
+        let mut header = vec![0; 0x500];
+        super::super::fib::write_minimal_word97_header(&mut header);
+        header[0x98..0x9a].copy_from_slice(&0x006cu16.to_le_bytes());
+        let extension = 0x9a + 0x006c * 8;
+        header[extension..extension + 2].copy_from_slice(&4u16.to_le_bytes());
+        header[extension + 2..extension + 4].copy_from_slice(&0x00c3u16.to_le_bytes());
+        header[extension + 4..extension + 8].fill(0xff);
+        let schema = super::super::fib::known_schema(&header).unwrap();
+        for size in [0, 84, 499] {
+            let (word, table) = fixture(size, 720);
+            assert!(super::read(&word, &table, schema).is_err());
+        }
+        for size in [500, 544] {
+            let (word, mut table) = fixture(size, 720);
+            if size >= 544 {
+                table[7 + 500..].fill(0xff);
+            }
+            let properties = super::read(&word, &table, schema).unwrap().unwrap();
+            assert!(properties.adjust_line_height_in_table);
+            assert_eq!(properties.do_not_use_html_paragraph_auto_spacing, None);
+            assert_eq!(properties.character_spacing_control, Some("doNotCompress"));
+            assert_eq!(properties.notes.formats, Some((0, 0)));
+        }
     }
 
     #[test]

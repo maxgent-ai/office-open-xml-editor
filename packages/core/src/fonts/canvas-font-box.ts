@@ -1,3 +1,5 @@
+import { quoteCssFontFamily } from '../internal/css-font-family.js';
+
 export interface CanvasFontBoxProbeContext {
   font: string;
   measureText(text: string): TextMetrics;
@@ -14,19 +16,6 @@ export interface CanvasFontBoxProbeOptions {
 
 const MISSING_CONTROL_FAMILY = '__ooxml_missing_font_control_6f33c9b4__';
 
-function quoteCssFamily(family: string): string {
-  let escaped = '';
-  for (const scalar of family) {
-    const codePoint = scalar.codePointAt(0) ?? 0;
-    if (scalar === '"' || scalar === '\\' || codePoint <= 0x1f || codePoint === 0x7f) {
-      escaped += `\\${codePoint.toString(16)} `;
-    } else {
-      escaped += scalar;
-    }
-  }
-  return `"${escaped}"`;
-}
-
 function fontString(
   family: string,
   emPx: number,
@@ -37,7 +26,7 @@ function fontString(
   // hostile or coincidental global FontFace owns the control name, a missing
   // requested family still resolves through exactly the same chain and cannot
   // be misidentified as present.
-  return `${style} ${weight} ${emPx}px ${quoteCssFamily(family)}, ${quoteCssFamily(MISSING_CONTROL_FAMILY)}, serif`;
+  return `${style} ${weight} ${emPx}px ${quoteCssFontFamily(family)}, ${quoteCssFontFamily(MISSING_CONTROL_FAMILY)}, serif`;
 }
 
 function glyphGeometryTuple(metrics: TextMetrics): readonly number[] {

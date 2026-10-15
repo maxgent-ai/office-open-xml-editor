@@ -3699,7 +3699,7 @@ mod tests {
                         .contains("truncated Word picture complex option")
                 );
             }
-            for flags in [1u32, 0x40] {
+            for flags in [1u32, 0x80] {
                 let mut active = named_data(key);
                 active[138..142].copy_from_slice(&flags.to_le_bytes());
                 let error =
@@ -3723,7 +3723,7 @@ mod tests {
     }
 
     #[test]
-    fn reading_picture_bullet_single_unknown_bit_has_no_passive_display_proof() {
+    fn reading_picture_bullet_safe_to_send_embedded_resource_preserves_raw_flags() {
         // Wholly invented PICF/list source. Only the hidden U+0001 owns the
         // special-character, picture-location and vanish CHPX operands.
         // A visible prefix puts the control strictly inside the helper's
@@ -3748,9 +3748,9 @@ mod tests {
         assert_eq!(&original_data[136..138], &0x0106u16.to_le_bytes());
         assert_eq!(&original_data[138..142], &0u32.to_le_bytes());
 
-        // MS-ODRAW 2.3.23.9/2.4.8: recognized pibFlags has no defined bit 6
-        // or ignore rule. Unknown property-ID rules cannot authorize masking
-        // an unknown operand bit in this recognized display/name property.
+        // Microsoft's RTF 1.9.1 shape-property table names bit 6 of pibFlags
+        // as a send-safety modifier. Exercise only the passive embedded case;
+        // the raw operand must survive in the reading model.
         let mut changed_data = original_data.clone();
         changed_data[138..142].copy_from_slice(&0x40u32.to_le_bytes());
         let differences: Vec<_> = original_data
@@ -3802,11 +3802,32 @@ mod tests {
                 serde_json::json!({ "key": 0x0106, "value": 0 })
             );
         }
-        // Err returns no partial DirectDocResult, model or selected resources.
+        let changed_result = reading_picture_bullet_result(&changed, 1024 * 1024).unwrap();
+        let changed_model = serde_json::to_value(&changed_result.document).unwrap();
         assert_eq!(
-            reading_picture_bullet_result(&changed, 1024 * 1024).unwrap_err(),
-            "UNSUPPORTED:invalid Word picture bullet MSOBLIPFLAGS"
+            body_outline(&changed_model["body"]),
+            body_outline(&model["body"])
         );
+        assert_eq!(changed_result.resources, accepted.resources);
+        for paragraph in changed_model["body"].as_array().unwrap() {
+            assert_eq!(
+                paragraph["numbering"]["__nativeReadingPictureBullet"]["pibFlags"],
+                serde_json::json!({ "key": 0x0106, "value": 0x40 })
+            );
+        }
+        for unsupported_flags in [0x20u32, 0x41] {
+            let mut unsupported_data = original_data.clone();
+            unsupported_data[138..142].copy_from_slice(&unsupported_flags.to_le_bytes());
+            let unsupported_source = build_scoped_cfb(&[
+                ("WordDocument", original.stream("WordDocument").unwrap()),
+                ("0Table", original.stream("0Table").unwrap()),
+                ("Data", unsupported_data),
+            ]);
+            assert_eq!(
+                reading_picture_bullet_result(&unsupported_source, 1024 * 1024).unwrap_err(),
+                "UNSUPPORTED:invalid Word picture bullet MSOBLIPFLAGS"
+            );
+        }
         assert!(picture_bullet_result(&source).is_err());
         assert!(picture_bullet_result(&changed).is_err());
         assert_eq!(
@@ -3834,7 +3855,7 @@ mod tests {
             12,
             15,
             16,
-            0x40,
+            0x20,
             u32::MAX,
             1,
             2,

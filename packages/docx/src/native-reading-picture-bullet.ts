@@ -81,13 +81,16 @@ export function acquireNativeReadingPictureBullet(
     const key = integer(property.key, 0, 65535);
     if (key !== 0x106) throw new TypeError('Invalid native picture-bullet pibFlags');
     const value = integer(property.value, 0, 0xffffffff);
-    // MS-ODRAW 2.4.8: exact enum/dependency domain, then the bounded
-    // embedded Comment subset. Never mask undefined bits into a valid mode.
-    if ((value & ~0x0f) !== 0 || (value & 3) === 3
+    // Match the direct DOC reader's bounded compatibility inference: RTF
+    // 1.9.1 Shapes pp.184/193 names exact0x40 Safe to send. For the already
+    // selected passive embedded carrier this preserves send-safety metadata,
+    // without enabling a named/link selector or masking other unknown bits.
+    // MS-ODRAW2.4.8 does not itself define this modifier for DOC.
+    if ((value !== 0x40 && (value & ~0x0f) !== 0) || (value & 3) === 3
       || ((value & 4) !== 0 && (value & 8) === 0)
       || ((value & 8) !== 0 && (value & 3) === 0))
       throw new TypeError('Invalid native picture-bullet MSOBLIPFLAGS');
-    if (value !== 0) throw new TypeError('Named or linked native picture bullet has no stored-size reading consumer');
+    if (value !== 0 && value !== 0x40) throw new TypeError('Named or linked native picture bullet has no stored-size reading consumer');
     pibFlags = Object.freeze({ key, value });
   }
   let clientAnchor: readonly number[] | null = null;

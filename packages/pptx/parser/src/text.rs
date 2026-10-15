@@ -15,6 +15,7 @@ use ooxml_common::math::parse_omath_nodes;
 use ooxml_common::text::{parse_lnspc, SpaceLine};
 use ooxml_common::units::text_point_to_pt;
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 type PropertyAttributes = BTreeMap<String, String>;
 
@@ -30,6 +31,32 @@ fn merge_attributes(higher: &PropertyAttributes, lower: &PropertyAttributes) -> 
     let mut merged = lower.clone();
     merged.extend(higher.clone());
     merged
+}
+
+/// Cascaded attribute maps are shared between levels: most levels author no
+/// attributes, so a merge usually returns the other side unchanged and cloning
+/// a resolved level (layout placeholders are cloned per slide) stays cheap.
+type SharedAttributes = Arc<PropertyAttributes>;
+type SharedChildAttributes = Arc<BTreeMap<String, PropertyAttributes>>;
+
+fn merge_shared_attributes(
+    higher: &SharedAttributes,
+    lower: &SharedAttributes,
+) -> SharedAttributes {
+    if higher.is_empty() {
+        lower.clone()
+    } else if lower.is_empty() {
+        higher.clone()
+    } else {
+        Arc::new(merge_attributes(higher, lower))
+    }
+}
+
+fn serialize_shared<T: serde::Serialize, S: serde::Serializer>(
+    value: &Arc<T>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    value.as_ref().serialize(serializer)
 }
 
 fn xml_attributes(node: roxmltree::Node<'_, '_>) -> PropertyAttributes {
@@ -944,10 +971,12 @@ pub(crate) struct RunProperties {
     /// schema marks these as editing diagnostics).  Keep the full set so
     /// language, kerning, normalization and annotation state survive the same
     /// cascade as visible paint even when this canvas has no consumer yet.
-    attributes: PropertyAttributes,
+    #[serde(serialize_with = "serialize_shared")]
+    attributes: SharedAttributes,
     /// Direct child attributes, merged within a child after schema choice
     /// groups have selected the nearest authored alternative.
-    child_attributes: BTreeMap<String, PropertyAttributes>,
+    #[serde(serialize_with = "serialize_shared")]
+    child_attributes: SharedChildAttributes,
     bold: Option<bool>,
     italic: Option<bool>,
     underline: Option<String>,
@@ -982,6 +1011,32 @@ pub(crate) struct RunProperties {
 }
 pub(crate) type LevelRunProperties = [RunProperties; 9];
 
+/// Resolved level run properties held by master/layout placeholder tables.
+/// The tables are cloned for every slide, so the nine levels are shared rather
+/// than deep-copied with their attribute maps.
+#[derive(Clone, Default)]
+pub(crate) struct SharedLevelRunProperties(Arc<LevelRunProperties>);
+
+impl From<LevelRunProperties> for SharedLevelRunProperties {
+    fn from(levels: LevelRunProperties) -> Self {
+        Self(Arc::new(levels))
+    }
+}
+
+impl std::ops::Deref for SharedLevelRunProperties {
+    type Target = LevelRunProperties;
+
+    fn deref(&self) -> &LevelRunProperties {
+        &self.0
+    }
+}
+
+impl serde::Serialize for SharedLevelRunProperties {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.as_ref().serialize(serializer)
+    }
+}
+
 impl RunProperties {
     pub(crate) fn from_xml(node: roxmltree::Node<'_, '_>, theme: &HashMap<String, String>) -> Self {
         let fill_choice = text_property_fill(node);
@@ -997,8 +1052,8 @@ impl RunProperties {
             );
         }
         Self {
-            attributes: xml_attributes(node),
-            child_attributes,
+            attributes: Arc::new(xml_attributes(node)),
+            child_attributes: Arc::new(child_attributes),
             bold: attr(&node, "b").map(|v| v == "1" || v == "true"),
             italic: attr(&node, "i").map(|v| v == "1" || v == "true"),
             underline: attr(&node, "u"),
@@ -1139,7 +1194,7 @@ impl RunProperties {
             attributes.insert("altLang".to_owned(), alt_lang);
         }
         Self {
-            attributes,
+            attributes: Arc::new(attributes),
             font_family_ea: ea,
             font_family_cs: cs,
             ..Default::default()
@@ -1169,9 +1224,11 @@ impl RunProperties {
             };
         }
         Self {
-            attributes: merge_attributes(&self.attributes, &lower.attributes),
-            child_attributes: {
-                let mut merged = lower.child_attributes.clone();
+            attributes: merge_shared_attributes(&self.attributes, &lower.attributes),
+            child_attributes: if self.child_attributes.is_empty() {
+                lower.child_attributes.clone()
+            } else {
+                let mut merged = BTreeMap::clone(&lower.child_attributes);
                 // The schema groups are alternatives.  A nearer choice ends
                 // inheritance of the other choices, while attributes inside
                 // the same child remain independently inherited.
@@ -1186,7 +1243,7 @@ impl RunProperties {
                 const EFFECT: &[&str] = &["effectLst", "effectDag"];
                 const ULINE: &[&str] = &["uLn", "uLnTx"];
                 const UFILL: &[&str] = &["uFill", "uFillTx"];
-                for (name, attrs) in &self.child_attributes {
+                for (name, attrs) in self.child_attributes.iter() {
                     for group in [FILL, EFFECT, ULINE, UFILL] {
                         if group.contains(&name.as_str()) {
                             for other in group {
@@ -1199,7 +1256,7 @@ impl RunProperties {
                     let previous = merged.get(name).cloned().unwrap_or_default();
                     merged.insert(name.clone(), merge_attributes(attrs, &previous));
                 }
-                merged
+                Arc::new(merged)
             },
             bold: pick!(bold),
             italic: pick!(italic),
@@ -2016,9 +2073,11 @@ pub(crate) fn parse_paragraph(
                     ),
                     bold: own.bold,
                     italic: own.italic,
-                    character_attributes: br_pr.map(|_| effective.attributes).unwrap_or_default(),
+                    character_attributes: br_pr
+                        .map(|_| Arc::unwrap_or_clone(effective.attributes))
+                        .unwrap_or_default(),
                     character_child_attributes: br_pr
-                        .map(|_| effective.child_attributes)
+                        .map(|_| Arc::unwrap_or_clone(effective.child_attributes))
                         .unwrap_or_default(),
                 });
             }
@@ -2469,8 +2528,8 @@ fn resolve_run_properties(
         reflection: props.reflection,
         outline: props.outline.flatten(),
         highlight: props.highlight,
-        character_attributes: props.attributes,
-        character_child_attributes: props.child_attributes,
+        character_attributes: Arc::unwrap_or_clone(props.attributes),
+        character_child_attributes: Arc::unwrap_or_clone(props.child_attributes),
     }
 }
 

@@ -183,10 +183,14 @@ impl Store<'_> {
             ));
         }
         if let Some(flags) = picture.pib_flags {
-            // MS-ODRAW 2.4.8: Comment/File/URL are exclusive; DoNotSave
-            // requires LinkToFile, which itself requires File or URL.
+            // MS-ODRAW 2.4.8 defines only the display/link selectors below.
+            // Microsoft RTF 1.9.1, Shapes pp. 184/193, refers pibFlags to
+            // lineFillBlipFlags, where 0x40 means Safe to send. Applying that
+            // send-safety modifier to DOC is a bounded compatibility inference:
+            // admit exact 0x40 only with this embedded passive carrier, retain
+            // its raw value, and reject other undefined bits or link mixtures.
             let value = flags.value;
-            if value & !0x0f != 0
+            if (value != 0x40 && value & !0x0f != 0)
                 || value & 3 == 3
                 || (value & 4 != 0 && value & 8 == 0)
                 || (value & 8 != 0 && value & 3 == 0)
@@ -197,7 +201,7 @@ impl Store<'_> {
             // linked display semantics need a separate source/name consumer.
             // Omitted pibFlags uses the normative Comment default; retain
             // the absence rather than synthesizing an encoded zero operand.
-            if value != 0 {
+            if value != 0 && value != 0x40 {
                 return Err(unsupported(
                     "named or linked Word picture bullet has no stored-size reading consumer",
                 ));

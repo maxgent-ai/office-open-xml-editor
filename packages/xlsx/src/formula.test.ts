@@ -22,6 +22,105 @@ function ctx(opts: { cells?: Cell[]; row?: number; col?: number } = {}) {
 
 const ev = (f: string, c = ctx()) => evalFormulaToBool(f, c);
 
+describe('CF1547 supported text functions', () => {
+  it('TRIM normalizes ASCII spaces while preserving nonbreaking spaces and controls', () => {
+    const trim = (text: string) => evaluateFormula(`TRIM("${text.replace(/"/g, '""')}")`, ctx());
+    expect(trim('')).toEqual({ kind: 'value', value: '' });
+    expect(trim('   ')).toEqual({ kind: 'value', value: '' });
+    expect(trim('  alpha   beta  ')).toEqual({ kind: 'value', value: 'alpha beta' });
+    expect(trim(' \u00a0alpha\u00a0 ')).toEqual({ kind: 'value', value: '\u00a0alpha\u00a0' });
+    expect(trim('\talpha\n')).toEqual({ kind: 'value', value: '\talpha\n' });
+    expect(trim(' alpha \n ')).toEqual({ kind: 'value', value: 'alpha \n' });
+  });
+
+  it('LEFT and RIGHT return an error for negative counts, preserving valid boundaries', () => {
+    for (const name of ['LEFT', 'RIGHT']) {
+      expect(evaluateFormula(`${name}("abc",-1)`, ctx())).toEqual({ kind: 'error' });
+      expect(evaluateFormula(`${name}("abc",0)`, ctx())).toEqual({ kind: 'value', value: '' });
+      expect(evaluateFormula(`${name}("abc",5)`, ctx())).toEqual({ kind: 'value', value: 'abc' });
+    }
+    expect(ev('ISERROR(LEFT("abc",-1))')).toBe(true);
+    expect(evaluateFormula('IFERROR(RIGHT("abc",-1),7)', ctx())).toEqual({ kind: 'value', value: 7 });
+  });
+
+  it('FIND and MID reject invalid positions or counts instead of clamping', () => {
+    for (const formula of ['FIND("a","abc",0)', 'FIND("a","abc",-1)', 'FIND("a","abc",0.5)', 'MID("abc",0,1)', 'MID("abc",1,-1)']) {
+      expect(evaluateFormula(formula, ctx()), formula).toEqual({ kind: 'error' });
+    }
+    expect(evaluateFormula('FIND("b","abc",2)', ctx())).toEqual({ kind: 'value', value: 2 });
+    expect(evaluateFormula('MID("abc",2,5)', ctx())).toEqual({ kind: 'value', value: 'bc' });
+    expect(evaluateFormula('MID("abc",4,1)', ctx())).toEqual({ kind: 'value', value: '' });
+  });
+
+  it('matches ASCII text equality criteria without case distinctions in each consumer', () => {
+    const textCell = (row: number, text: string): Cell => ({ row, col: 1, value: { type: 'text', text }, styleIndex: 0 });
+    const c = ctx({ cells: [textCell(1, 'Apples'), textCell(2, 'APPLES'), textCell(3, 'pears'), numCell(1, 2, 2), numCell(2, 2, 4), numCell(3, 2, 9)] });
+    expect(evaluateFormula('COUNTIF(A1:A3,"apples")', c)).toEqual({ kind: 'value', value: 2 });
+    expect(evaluateFormula('COUNTIF(A1:A3,"=APPLES")', c)).toEqual({ kind: 'value', value: 2 });
+    expect(evaluateFormula('COUNTIF(A1:A3,"<>apples")', c)).toEqual({ kind: 'value', value: 1 });
+    expect(evaluateFormula('SUMIF(A1:A3,"apples",B1:B3)', c)).toEqual({ kind: 'value', value: 6 });
+    expect(evaluateFormula('AVERAGEIF(A1:A3,"APPLES",B1:B3)', c)).toEqual({ kind: 'value', value: 3 });
+  });
+});
+
+describe('CF1547 existing scalar error and count results', () => {
+  it('SEARCH rejects established invalid start positions while preserving literal search', () => {
+    for (const start of [0, -1, 0.5]) {
+      expect(evaluateFormula(`SEARCH("A","abc",${start})`, ctx())).toEqual({ kind: 'error' });
+    }
+    expect(evaluateFormula('SEARCH("B","abc",2)', ctx())).toEqual({ kind: 'value', value: 2 });
+    expect(ev('ISERROR(SEARCH("A","abc",0))')).toBe(true);
+    expect(evaluateFormula('SEARCH("","abc",4)', ctx())).toEqual({ kind: 'error' });
+    expect(evaluateFormula('SEARCH("","abc",3)', ctx())).toEqual({ kind: 'value', value: 3 });
+    expect(evaluateFormula('SEARCH("b","abc",4)', ctx())).toEqual({ kind: 'error' });
+    expect(evaluateFormula('SEARCH("","İ",2)', ctx())).toEqual({ kind: 'error' });
+  });
+
+  it('COUNTA counts cached empty text but excludes blank and absent cells', () => {
+    const c = ctx({ cells: [
+      { row: 1, col: 1, value: { type: 'text', text: '' }, styleIndex: 0 },
+      { row: 2, col: 1, value: { type: 'empty' }, styleIndex: 0 },
+      numCell(3, 1, 0),
+      { row: 4, col: 1, value: { type: 'error', error: '#N/A' }, styleIndex: 0 },
+    ] });
+    expect(evaluateFormula('COUNTA(A1:A5)', c)).toEqual({ kind: 'value', value: 3 });
+    expect(evaluateFormula('COUNTA("")', c)).toEqual({ kind: 'value', value: 1 });
+    expect(ev('ISBLANK(A1)', c)).toBe(false);
+    expect(evaluateFormula('COUNTBLANK(A1:A5)', c)).toEqual({ kind: 'value', value: 3 });
+  });
+
+  it('reports primitive overflow and math domain failures before CF error consumers', () => {
+    for (const formula of ['EXP(1000)', 'POWER(-1,0.5)', '1E308*10']) {
+      expect(evaluateFormula(formula, ctx()), formula).toEqual({ kind: 'error' });
+      expect(ev(formula), formula).toBe(false);
+      expect(ev(`ISERROR(${formula})`), formula).toBe(true);
+      expect(evaluateFormula(`IFERROR(${formula},7)`, ctx()), formula).toEqual({ kind: 'value', value: 7 });
+    }
+    expect(ev('EXP(1000)>0')).toBe(false);
+    expect(ev('NOT(POWER(-1,0.5)=1)')).toBe(false);
+    expect(ev('ISNUMBER(EXP(1000))')).toBe(false);
+    expect(ev('ISERR(EXP(1000))')).toBe(true);
+    expect(ev('ISNA(EXP(1000))')).toBe(false);
+    expect(evaluateFormula('POWER(0,0)', ctx())).toEqual({ kind: 'error' });
+    expect(ev('COUNTIF(POWER(0,0),"#DIV/0!")=1')).toBe(true);
+    expect(ev('COUNTIF(POWER(0,-1),"#DIV/0!")=1')).toBe(true);
+    expect(ev('COUNTIF(EXP(1000),"#NUM!")=1')).toBe(true);
+    expect(evaluateFormula('POWER(0,2)', ctx())).toEqual({ kind: 'value', value: 0 });
+    expect(evaluateFormula('IF(FALSE,EXP(1000),2)', ctx())).toEqual({ kind: 'value', value: 2 });
+    expect(ev('ISNA(#N/A)')).toBe(true);
+    expect(ev('ISNA(1/0)')).toBe(false);
+  });
+});
+
+describe('CF valid math results beyond internal intermediate range', () => {
+  it('preserves valid rounding comparisons while limiting new numeric-error checks', () => {
+    // Both mathematical results are finite and >100. A blanket conversion of
+    // legacy Math helper intermediates to errors must not make these rules false.
+    expect(ev('ROUNDDOWN(1E307,2)>100')).toBe(true);
+    expect(ev('CEILING(1E308,0.1)>100')).toBe(true);
+  });
+});
+
 describe('CF formula evaluation boundary', () => {
   it('distinguishes a valid false/zero from unsupported, invalid and error results', () => {
     expect(evaluateFormula('FALSE', ctx())).toEqual({ kind: 'value', value: false });

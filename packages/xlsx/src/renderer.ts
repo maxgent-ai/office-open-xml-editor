@@ -1,5 +1,6 @@
 import { drawShapeStackedText } from './shape-stacked-text.js';
 import type { CjkLang } from '@silurus/ooxml-core';
+import { quoteCssFontFamily } from '@silurus/ooxml-core/internal/css-font-family';
 import {
   breakDrawingMlText, drawingMlTextRect, drawingMlLineHeight,
   drawingMlSpacedLineBox, drawingMlParagraphSpacing, drawingMlBlockTop, drawingMlLineX, paintDrawingMlLine,
@@ -303,12 +304,12 @@ export function fontStackFor(
   const selected = route && (normalized?.toLocaleLowerCase('en-US') || 'calibri')
     === route.requestedFamily.trim().toLocaleLowerCase('en-US') ? route : undefined;
   const aliasPart = fallbackAlias && fallbackAlias.toLocaleLowerCase('en-US') !== normalized?.toLocaleLowerCase('en-US')
-    ? `"${fallbackAlias}", ` : '';
+    ? `${quoteCssFontFamily(fallbackAlias)}, ` : '';
   const regularPart = regularAlias && regularAlias.toLocaleLowerCase('en-US') !== normalized?.toLocaleLowerCase('en-US')
-    ? `"${regularAlias}", ` : '';
+    ? `${quoteCssFontFamily(regularAlias)}, ` : '';
   return selected
-    ? `"${selected.family}", ${aliasPart}${regularPart}${cssTailFor(normalized, fallback, googleSubstitutes, text)}`
-    : normalized ? `"${normalized}", ${aliasPart}${regularPart}${cssTailFor(normalized, fallback, googleSubstitutes, text)}` : cssTailFor(null, fallback, googleSubstitutes, text);
+    ? `${quoteCssFontFamily(selected.family)}, ${aliasPart}${regularPart}${cssTailFor(normalized, fallback, googleSubstitutes, text)}`
+    : normalized ? `${quoteCssFontFamily(normalized)}, ${aliasPart}${regularPart}${cssTailFor(normalized, fallback, googleSubstitutes, text)}` : cssTailFor(null, fallback, googleSubstitutes, text);
 }
 
 const DEFAULT_FONT_SIZE = 11;

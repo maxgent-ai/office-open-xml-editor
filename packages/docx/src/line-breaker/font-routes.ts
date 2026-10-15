@@ -1,4 +1,5 @@
 import type { CjkLang } from '@silurus/ooxml-core';
+import { quoteCssFontFamily } from '@silurus/ooxml-core/internal/css-font-family';
 import type { DocxTextRun, FieldRun } from '../types';
 import type { CanvasFontRoute } from '@silurus/ooxml-core';
 import { classifyCjkFont, cjkFallbackChain, NON_CJK_SANS_FALLBACKS, NON_CJK_SERIF_FALLBACKS, classifyFontGeneric, normalizeFontMetricFamily, canvasFontString } from '@silurus/ooxml-core';
@@ -48,7 +49,7 @@ export function isArabicSubstituteFont(family: string): boolean {
 
 /** Quote each family for a CSS font-family list. */
 export function quoteAll(names: readonly string[]): string {
-  return names.map((n) => `"${n}"`).join(', ');
+  return names.map(quoteCssFontFamily).join(', ');
 }
 
 
@@ -236,8 +237,7 @@ export function normalizeFontFamilyUncached(
     : '"Courier New", monospace';
   if (family === 'monospace') return monoTail;
 
-  const escape = (s: string) => s.replace(/"/g, '\\"');
-  const head = `"${escape(family)}"`;
+  const head = quoteCssFontFamily(family);
   const lower = family.toLowerCase();
 
   // CJK language inferred from the font name (null for plain Latin faces). For a

@@ -40,10 +40,11 @@ pub(super) fn write_minimal_word97_header(word: &mut [u8]) {
     word[FIXED_PREFIX_END..FIXED_PREFIX_END + 2].copy_from_slice(&0u16.to_le_bytes());
 }
 
-/// Closed FIB selector and DOP ownership acquired from counted bytes.
+/// FIB selector and independently acquired DOP ownership from counted bytes.
 /// Numeric nFib alone is insufficient: MS-DOC 2.7.1 selects Dop97 when
 /// cswNew is zero, including a tolerated higher base selector. Physical
-/// extension bounds and unknown-selector refusal are checked before creation.
+/// extension bounds and the documented legacy reading family are checked
+/// before creation.
 #[derive(Clone, Copy)]
 pub(super) struct KnownFibSchema {
     version: u16,
@@ -55,10 +56,16 @@ impl KnownFibSchema {
         self.version
     }
 
-    /// Every accepted nonzero extension selector embeds Dop2000; an absent
-    /// extension owns only Dop97. Length is still checked by the DOP reader.
+    /// The legacy reading family needs the whole documented Dop97 prefix.
+    pub(super) fn requires_legacy_dop97_prefix(self) -> bool {
+        (0x00c3..0x00d9).contains(&self.version)
+    }
+
+    /// Modern enumerated extension selectors embed Dop2000. The legacy
+    /// pre-2000 reading family owns Dop97 even with a counted extension.
+    /// Physical DOP length alone never grants later field ownership.
     pub(super) fn has_dop2000_fields(self) -> bool {
-        self.extension_words != 0
+        self.extension_words != 0 && self.version >= 0x00d9
     }
 }
 
@@ -98,7 +105,21 @@ pub(super) fn known_schema(word: &[u8]) -> Result<KnownFibSchema, String> {
     } else {
         u16_at(&word[start..end], 0)?
     };
-    if !matches!(version, 0x00c1 | 0x00d9 | 0x0101 | 0x010c | 0x0112)
+    // Microsoft Office Word 97-2007 Binary File Format Specification (2007),
+    // "File Information Block": readers skip future counted-array entries;
+    // rgswNew begins with the actual nFib. "Document Properties" defines the
+    // pre-2000 DOP family for 105 < nFib < 217. This is a bounded reading
+    // profile, not a new MS-DOC schema or an alias to C1/D9. Retain the actual
+    // selector and all extra bytes in the original stream; never interpret
+    // this family's extension/FC-LCB tails as modern fields. Only the canonical
+    // Word97 prefix with a compatible base/back-version is supported here.
+    let legacy_forward = (0x00c3..0x00d9).contains(&version)
+        && u16_at(word, 2)? == 0x00c1
+        && u16_at(word, 12)? <= 0x00c1;
+    if legacy_forward {
+        validate_fixed_prefix(word)?;
+    }
+    if (!matches!(version, 0x00c1 | 0x00d9 | 0x0101 | 0x010c | 0x0112) && !legacy_forward)
         || (count != 0 && version == 0x00c1)
     {
         return Err(unsupported("unsupported Word FIB version"));
@@ -227,6 +248,30 @@ mod tests {
             assert!(effective_version(&fib(0xc1, Some(version), [14, 22, 0x5d])).is_err());
         }
         assert!(effective_version(&fib(0xc1, Some(0xc1), [14, 22, 0x5d])).is_err());
+    }
+
+    #[test]
+    fn legacy_forward_selector_retains_prefix_without_modern_dop_ownership() {
+        for selector in [0x00c3, 0x00d8] {
+            let mut word = fib(0x00c1, Some(selector), [14, 22, 0x006c]);
+            let offset = word.len() - 6;
+            word[offset..offset + 2].copy_from_slice(&4u16.to_le_bytes());
+            word.extend_from_slice(&[0xe5, 0x00, 0xff, 0xff]);
+            let schema = known_schema(&word).unwrap();
+            assert_eq!(schema.effective_version(), selector);
+            assert!(!schema.has_dop2000_fields());
+            for end in 0..word.len() {
+                assert!(known_schema(&word[..end]).is_err());
+            }
+            word[12..14].copy_from_slice(&0x00d9u16.to_le_bytes());
+            assert!(known_schema(&word).is_err());
+            word[12..14].fill(0);
+            word[2..4].copy_from_slice(&0x00c3u16.to_le_bytes());
+            assert!(known_schema(&word).is_err());
+        }
+        for selector in [0x00c2, 0x00da, 0x0100] {
+            assert!(known_schema(&fib(0x00c1, Some(selector), [14, 22, 0x006c])).is_err());
+        }
     }
 
     #[test]

@@ -1,4 +1,5 @@
 import { cjkLangFromLanguage, type CjkLang } from '@silurus/ooxml-core';
+import { quoteCssFontFamily } from '@silurus/ooxml-core/internal/css-font-family';
 import type { LayoutDiagnostic } from './types.js';
 import { stableFingerprint } from './fingerprint.js';
 import {
@@ -89,12 +90,8 @@ function freezeResolution(value: FontResolution): FontResolution {
   return Object.freeze({ ...value, diagnostics: Object.freeze([...value.diagnostics]) });
 }
 
-function quoteCssFamily(value: string): string {
-  return `"${value.replaceAll('\\', '\\\\').replaceAll('"', '\\"')}"`;
-}
-
 function cssFamilyList(family: string, generic: FontResolution['genericFamily']): string {
-  return `${quoteCssFamily(family)}, ${generic}`;
+  return `${quoteCssFontFamily(family)}, ${generic}`;
 }
 
 /**
@@ -218,7 +215,7 @@ export function createFontResolver(
         : [];
       const fallbackList = familyListFor(requestedFamily, request.language, request.cjkFallback);
       const familyList = fallbackList
-        ? `${quoteCssFamily(face.resolvedFamily)}, ${fallbackList}`
+        ? `${quoteCssFontFamily(face.resolvedFamily)}, ${fallbackList}`
         : cssFamilyList(face.resolvedFamily, request.genericFamily ?? 'sans-serif');
       return freezeResolution({
         requestedFamily,

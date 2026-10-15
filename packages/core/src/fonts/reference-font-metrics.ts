@@ -56,23 +56,43 @@ function getProfiles(): readonly ReferenceFontMetricProfile[] {
 }
 
 type OptionBuckets = ReadonlyMap<string, readonly ReferenceFontMetricProfile[]>;
-let aliasIndex: ReadonlyMap<string, OptionBuckets> | undefined;
+let aliasProfiles: ReadonlyMap<string, readonly ReferenceFontMetricProfile[]> | undefined;
+// Option buckets are built per alias on its first lookup. Documents name a few
+// families, so first paint no longer pays for the whole catalogue's buckets.
+const aliasBuckets = new Map<string, OptionBuckets>();
 const EMPTY_RESULTS = Object.freeze([]) as readonly ReferenceFontMetricProfile[];
 
 function normalizeFamilyName(value: string): string {
-  return value.normalize('NFKC').trim().replace(/\s+/gu, ' ').toLocaleLowerCase('en-US');
+  // NFKC leaves ASCII unchanged; skip it for the (common) ASCII names.
+  const composed = /^[\u0000-\u007f]*$/u.test(value) ? value : value.normalize('NFKC');
+  return composed.trim().replace(/\s+/gu, ' ').toLocaleLowerCase('en-US');
 }
 
 function optionKey(options: FindReferenceFontMetricsOptions): string {
   return `${options.source ?? '*'}|${options.weight ?? '*'}|${options.style ?? '*'}`;
 }
 
-function getAliasIndex(): ReadonlyMap<string, OptionBuckets> {
-  if (aliasIndex !== undefined) return aliasIndex;
-
-  const mutable = new Map<string, Map<string, ReferenceFontMetricProfile[]>>();
+function getAliasProfiles(): ReadonlyMap<string, readonly ReferenceFontMetricProfile[]> {
+  if (aliasProfiles !== undefined) return aliasProfiles;
+  const mutable = new Map<string, ReferenceFontMetricProfile[]>();
   for (const profile of getProfiles()) {
-    const keys = new Set(profile.aliases.map(normalizeFamilyName));
+    for (const alias of new Set(profile.aliases.map(normalizeFamilyName))) {
+      const matches = mutable.get(alias);
+      if (matches === undefined) mutable.set(alias, [profile]);
+      else matches.push(profile);
+    }
+  }
+  aliasProfiles = mutable;
+  return aliasProfiles;
+}
+
+function getOptionBuckets(alias: string): OptionBuckets | undefined {
+  const cached = aliasBuckets.get(alias);
+  if (cached !== undefined) return cached;
+  const matches = getAliasProfiles().get(alias);
+  if (matches === undefined) return undefined;
+  const buckets = new Map<string, ReferenceFontMetricProfile[]>();
+  for (const profile of matches) {
     const optionKeys = new Set<string>();
     for (const source of [undefined, profile.source] as const) {
       for (const weight of [undefined, profile.weight] as const) {
@@ -81,26 +101,17 @@ function getAliasIndex(): ReadonlyMap<string, OptionBuckets> {
         }
       }
     }
-    for (const alias of keys) {
-      let buckets = mutable.get(alias);
-      if (buckets === undefined) {
-        buckets = new Map();
-        mutable.set(alias, buckets);
-      }
-      for (const key of optionKeys) {
-        const matches = buckets.get(key);
-        if (matches === undefined) buckets.set(key, [profile]);
-        else matches.push(profile);
-      }
+    for (const key of optionKeys) {
+      const bucket = buckets.get(key);
+      if (bucket === undefined) buckets.set(key, [profile]);
+      else bucket.push(profile);
     }
   }
-  for (const buckets of mutable.values()) {
-    for (const matches of buckets.values()) Object.freeze(matches);
-  }
-  // This index is bounded solely by aliases in the immutable generated catalog.
-  // Caller-provided queries are normalized once and are never memoized.
-  aliasIndex = mutable;
-  return aliasIndex;
+  for (const bucket of buckets.values()) Object.freeze(bucket);
+  // Bounded solely by aliases in the immutable generated catalogue: unknown
+  // caller-provided names return above and are never memoized.
+  aliasBuckets.set(alias, buckets);
+  return buckets;
 }
 
 /**
@@ -114,5 +125,5 @@ export function findReferenceFontMetrics(
 ): readonly ReferenceFontMetricProfile[] {
   const query = normalizeFamilyName(familyOrAlias);
   if (!query) return EMPTY_RESULTS;
-  return getAliasIndex().get(query)?.get(optionKey(options)) ?? EMPTY_RESULTS;
+  return getOptionBuckets(query)?.get(optionKey(options)) ?? EMPTY_RESULTS;
 }

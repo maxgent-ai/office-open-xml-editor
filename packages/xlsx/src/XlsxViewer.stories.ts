@@ -7,7 +7,7 @@ import { chartEx } from '../../../src/chart-ex';
 
 type Args = {
   scale: number;
-  selectionColor: string;
+  selectionColor?: string;
   debug?: boolean;
 };
 

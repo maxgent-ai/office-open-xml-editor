@@ -613,6 +613,26 @@ describe('layoutParagraph', () => {
     expect(second.borders.some((border) => border.edge === 'top')).toBe(false);
   });
 
+  it('preserves a literal backslash in a retained fallback font route', () => {
+    const family = 'Family \\31';
+    const segment = {
+      text: 'AB', sourceRunIndex: 0, measuredWidth: 10, fontSize: 10, fontFamily: family,
+      shapedClusters: [
+        { range: { start: 0, end: 1 }, offsetPt: 0, advancePt: 5 },
+        { range: { start: 1, end: 2 }, offsetPt: 5, advancePt: 5 },
+      ],
+    } as unknown as LayoutTextSeg;
+    const paragraph = {
+      type: 'paragraph', alignment: 'left', indentLeft: 0, indentRight: 0, indentFirst: 0,
+      spaceBefore: 0, spaceAfter: 0, lineSpacing: null, tabStops: [],
+      runs: [{ type: 'text', text: 'AB', fontSize: 10, fontFamily: family }],
+    } as unknown as DocParagraph;
+    const placement = projectMeasuredSegment(paragraph, segment).lines[0]?.placements[0];
+    expect(placement?.kind).toBe('text');
+    if (placement?.kind !== 'text') throw new Error('Expected retained text');
+    expect(JSON.parse(placement.fontRoute.familyList)).toBe(family);
+  });
+
   it('retains paint-ready shared dash and double treatments for paragraph borders', () => {
     const segment = {
       text: 'AB', sourceRunIndex: 0, measuredWidth: 10,
