@@ -77,8 +77,11 @@ export interface FontResolverOptions {
   }>>>;
 }
 
+// DOCX family keys use the locale-independent Unicode lowercase mapping. It is
+// identical to toLocaleLowerCase('en-US') for every input (only lt/tr/az tailor
+// lowercasing), but avoids per-call locale resolution on this per-segment path.
 function normalizeFamily(value: string): string {
-  return value.trim().toLocaleLowerCase('en-US');
+  return value.trim().toLowerCase();
 }
 
 function normalizedWeight(value: number | undefined): number {

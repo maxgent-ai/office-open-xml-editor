@@ -26,6 +26,13 @@ const runtimeReferenceFontPlatform: ReferenceFontPlatform =
 
 const projectedProfiles = new WeakMap<object, ReferenceFontLineMetrics | null>();
 
+// Layout asks for the same few (family, weight, style) tuples for every text
+// segment. The answer is a pure function of the immutable generated catalog,
+// so it is memoized; the bound only caps documents that name many families.
+const preferredProfilesMemoLimit = 1024;
+const preferredProfilesMemo = new Map<string, readonly ReferenceFontMetricProfile[]>();
+const NO_PROFILES = Object.freeze([]) as readonly ReferenceFontMetricProfile[];
+
 /** One source-choice authority for both vertical and xAvg projections. A
  * populated but ambiguous preferred group must never fall through to Office. */
 function preferredProfiles(
@@ -34,16 +41,27 @@ function preferredProfiles(
   style: 'normal' | 'italic',
   platform: ReferenceFontPlatform,
 ): readonly ReferenceFontMetricProfile[] {
-  if (!family?.trim()) return [];
+  if (!family?.trim()) return NO_PROFILES;
+  const key = `${platform}|${weight}|${style}|${family}`;
+  const retained = preferredProfilesMemo.get(key);
+  if (retained !== undefined) return retained;
   const sourceGroups = platform === 'macos'
     ? [['macos-system', 'macos-supplemental'], ['office-mac'], ['published-open-font']] as const
     : [['office-mac'], ['macos-system', 'macos-supplemental'], ['published-open-font']] as const;
+  let result = NO_PROFILES;
   for (const sources of sourceGroups) {
     const profiles = sources.flatMap((source) =>
       findReferenceFontMetrics(family, { source, weight, style }));
-    if (profiles.length > 0) return profiles;
+    if (profiles.length > 0) {
+      result = Object.freeze(profiles);
+      break;
+    }
   }
-  return [];
+  preferredProfilesMemo.set(key, result);
+  if (preferredProfilesMemo.size > preferredProfilesMemoLimit) {
+    preferredProfilesMemo.delete(preferredProfilesMemo.keys().next().value as string);
+  }
+  return result;
 }
 
 function project(profile: ReferenceFontMetricProfile): ReferenceFontLineMetrics | null {

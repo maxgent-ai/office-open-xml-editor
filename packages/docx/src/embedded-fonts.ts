@@ -59,7 +59,7 @@ async function embeddedFamily(data: Uint8Array, authoredFamily: string): Promise
   // in separate CSS registrations. A name-hash collision is harmless because
   // the bytes, and thus painted geometry, are then identical.
   let nameHash = 0x811c9dc5;
-  for (const scalar of authoredFamily.trim().toLocaleLowerCase('en-US')) {
+  for (const scalar of authoredFamily.trim().toLowerCase()) {
     nameHash ^= scalar.codePointAt(0)!;
     nameHash = Math.imul(nameHash, 0x01000193);
   }

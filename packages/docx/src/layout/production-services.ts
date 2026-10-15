@@ -95,13 +95,13 @@ export function createProductionLayoutServices(
     .trim()
     .replace(/^(['"])(.*)\1$/, '$2');
   const normalizedFaceFamily = (family: string): string => displayFaceFamily(family)
-    .toLocaleLowerCase('en-US');
+    .toLowerCase();
   const loadedFaceStyle = (face: LoadedFontFaceRecord): 'normal' | 'italic' | null => {
-    const style = face.style.trim().toLocaleLowerCase('en-US');
+    const style = face.style.trim().toLowerCase();
     return style === 'normal' || style === 'italic' ? style : null;
   };
   const loadedFaceWeights = (face: LoadedFontFaceRecord): number[] => {
-    const weight = face.weight.trim().toLocaleLowerCase('en-US');
+    const weight = face.weight.trim().toLowerCase();
     if (weight === 'normal') return [400];
     if (weight === 'bold') return [700];
     if (/^\d+$/.test(weight)) {
@@ -185,7 +185,7 @@ export function createProductionLayoutServices(
     const seen = new Set<string>();
     for (const name of source.fonts.preloadNames) {
       if (!name) continue;
-      const key = name.toLocaleLowerCase('en-US');
+      const key = name.toLowerCase();
       if (seen.has(key)) continue;
       seen.add(key);
       const entry = DOCX_GOOGLE_FONTS[key];
