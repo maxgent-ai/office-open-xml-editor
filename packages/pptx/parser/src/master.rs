@@ -23,7 +23,7 @@ use crate::text::{
     read_level_indents, read_level_run_properties_with_rels, resolve_latin_face,
     text_property_color, InheritedBodyPr, LevelAlignments, LevelBullets, LevelColors, LevelFaces,
     LevelFontSizes, LevelIndent, LevelIndents, LevelRunProperties, LevelSpacing,
-    DEFAULT_TEXT_STYLE_MAR_L, HARD_DEFAULT_FONT_SIZE,
+    SharedLevelRunProperties, DEFAULT_TEXT_STYLE_MAR_L, HARD_DEFAULT_FONT_SIZE,
 };
 use crate::theme::{
     bake_clr_map, parse_theme_part, PptxSchemeResolver, PptxTheme, PptxThemeSource,
@@ -88,11 +88,11 @@ pub(crate) struct LayoutPlaceholders {
     pub(crate) by_idx_level_colors: HashMap<u32, LevelColors>,
     pub(crate) by_type_level_colors: HashMap<String, LevelColors>,
     pub(crate) by_type_master_level_colors: HashMap<String, LevelColors>,
-    pub(crate) by_idx_level_run_properties: HashMap<u32, LevelRunProperties>,
-    pub(crate) by_type_level_run_properties: HashMap<String, LevelRunProperties>,
+    pub(crate) by_idx_level_run_properties: HashMap<u32, SharedLevelRunProperties>,
+    pub(crate) by_type_level_run_properties: HashMap<String, SharedLevelRunProperties>,
     /// txStyles-only character properties for an idx with no layout slot
     /// (see `MasterLevelRunProperties`).
-    pub(crate) by_type_master_level_run_properties: HashMap<String, LevelRunProperties>,
+    pub(crate) by_type_master_level_run_properties: HashMap<String, SharedLevelRunProperties>,
     /// Per-list-level paragraph indents (`marL`/`marR`/`indent`, EMU) per
     /// placeholder idx — what a paragraph with no own `marL`/`marR`/`indent`
     /// inherits from the authored list-style cascade (ECMA-376 §21.1.2.4.13),
@@ -462,26 +462,34 @@ impl LayoutPlaceholders {
                 return self
                     .by_idx_level_run_properties
                     .get(&i)
-                    .cloned()
+                    .map(|levels| LevelRunProperties::clone(levels))
                     .unwrap_or_else(empty);
             }
             return self
                 .by_type_master_level_run_properties
                 .get(ph_type)
-                .cloned()
+                .map(|levels| LevelRunProperties::clone(levels))
                 .or_else(|| {
                     (ph_type == "obj")
-                        .then(|| self.by_type_master_level_run_properties.get("").cloned())
+                        .then(|| {
+                            self.by_type_master_level_run_properties
+                                .get("")
+                                .map(|levels| LevelRunProperties::clone(levels))
+                        })
                         .flatten()
                 })
                 .unwrap_or_else(empty);
         }
         self.by_type_level_run_properties
             .get(ph_type)
-            .cloned()
+            .map(|levels| LevelRunProperties::clone(levels))
             .or_else(|| {
                 (ph_type == "body")
-                    .then(|| self.by_type_level_run_properties.get("").cloned())
+                    .then(|| {
+                        self.by_type_level_run_properties
+                            .get("")
+                            .map(|levels| LevelRunProperties::clone(levels))
+                    })
                     .flatten()
             })
             .unwrap_or_else(empty)
@@ -1533,9 +1541,15 @@ pub(crate) fn parse_master_level_run_properties_tier(
             }
         }
     }
+    let share = |levels: HashMap<String, LevelRunProperties>| {
+        levels
+            .into_iter()
+            .map(|(key, value)| (key, value.into()))
+            .collect()
+    };
     MasterLevelRunProperties {
-        placeholders: specific,
-        styles,
+        placeholders: share(specific),
+        styles: share(styles),
     }
 }
 
@@ -1549,8 +1563,8 @@ pub(crate) fn parse_master_level_run_properties_tier(
 /// the master placeholder's values.
 #[derive(Clone, Default, serde::Serialize)]
 pub(crate) struct MasterLevelRunProperties {
-    pub(crate) placeholders: HashMap<String, LevelRunProperties>,
-    pub(crate) styles: HashMap<String, LevelRunProperties>,
+    pub(crate) placeholders: HashMap<String, SharedLevelRunProperties>,
+    pub(crate) styles: HashMap<String, SharedLevelRunProperties>,
 }
 
 /// Per-list-level paragraph indents (`marL`/`marR`/`indent`, EMU) from the
@@ -2294,12 +2308,13 @@ pub(crate) fn parse_layout_placeholders(
                     master_level_run_properties
                         .placeholders
                         .get(&ph_type)
+                        .map(|levels| &**levels)
                         .unwrap_or(&empty_run),
                 );
                 if has_any_level_run_properties(&level_run) {
                     lph.by_idx_level_run_properties
                         .entry(idx)
-                        .or_insert(level_run);
+                        .or_insert(level_run.into());
                 }
                 // Per-level indents: layout lstStyle wins per axis/level, else master.
                 let level_indents = merge_level_indents(
@@ -2410,12 +2425,13 @@ pub(crate) fn parse_layout_placeholders(
                 master_level_run_properties
                     .placeholders
                     .get(&ph_type)
+                    .map(|levels| &**levels)
                     .unwrap_or(&empty_run),
             );
             if has_any_level_run_properties(&type_level_run) {
                 lph.by_type_level_run_properties
                     .entry(ph_type.clone())
-                    .or_insert(type_level_run);
+                    .or_insert(type_level_run.into());
             }
             let type_level_indents = merge_level_indents(
                 &layout_level_indents,

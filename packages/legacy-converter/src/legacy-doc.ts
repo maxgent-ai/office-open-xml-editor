@@ -1,3 +1,4 @@
+import { resolveBundledAssetUrl } from '@silurus/ooxml-core/internal/bundled-asset-url';
 import type { ModelSource } from '@silurus/ooxml-core';
 import { createLegacySource, type LegacySourceOptions } from './legacy-source.js';
 import { readNativeDocReadingPolicies, type NativeDocReadingPolicies } from './source-module-config.js';
@@ -38,8 +39,8 @@ export function legacyDocSource(options: LegacyDocSourceOptions = {}): ModelSour
     nativePictureBulletPolicy: options.nativePictureBulletPolicy,
   });
   return createLegacySource<'docx'>('doc', options, {
-    wasmUrl: new URL(defaultWasmUrl, import.meta.url).href,
-    moduleUrl: new URL(defaultModuleUrl, import.meta.url).href,
+    wasmUrl: resolveBundledAssetUrl(defaultWasmUrl, import.meta.url),
+    moduleUrl: resolveBundledAssetUrl(defaultModuleUrl, import.meta.url),
   }, {
     ...(policies.nativeContourPolicy === 'strict' ? {} : { nativeContourPolicy: policies.nativeContourPolicy }),
     ...(policies.nativeWordBreakingPolicy === 'strict' ? {} : { nativeWordBreakingPolicy: policies.nativeWordBreakingPolicy }),

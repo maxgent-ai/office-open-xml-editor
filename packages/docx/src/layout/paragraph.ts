@@ -5,6 +5,7 @@ import { distributeLineSlack as distributeProportionalSlack } from '@silurus/oox
 import { specifiedTextLineMetrics, specifiedTextParagraphIsHomogeneous } from './specified-line-spacing.js';
 import { wordTextBoxVerticalMode } from './compatibility.js';
 import { autoContrastColor, canvasFontString, createCanvasFontRoute } from '@silurus/ooxml-core';
+import { quoteCssFontFamily } from '@silurus/ooxml-core/internal/css-font-family';
 import {
   effectiveParagraphTabStops,
   paragraphGridRightAdjustmentPt,
@@ -1472,7 +1473,7 @@ function textPlacement(
       ? { kind: 'auto', ...(segment.background ? { background: `#${segment.background}` } : {}) }
       : { kind: 'default' };
   const fontRoute = segment.fontRoute ?? createCanvasFontRoute(
-    segment.fontFamily ? `"${segment.fontFamily.replaceAll('"', '\\"')}"` : 'sans-serif',
+    segment.fontFamily ? quoteCssFontFamily(segment.fontFamily) : 'sans-serif',
     segment.fontFamily ? 'native' : 'generic',
   );
   const baseShape = segment.ruby && segment.textLayoutService && segment.textShapeRequest

@@ -271,7 +271,31 @@ impl Write for JsonMeasurementWriter {
         })?;
         Self::checked_add(&mut self.json_bytes, byte_count)?;
 
-        for &byte in bytes {
+        let mut index = 0;
+        while index < bytes.len() {
+            // Fast paths: plain string content and structural bytes between
+            // strings carry no per-byte state, so count or skip them in bulk.
+            // Only quotes, escapes and the byte after a string end need the
+            // state machine below.
+            if self.in_string && !self.escaped {
+                let run = bytes[index..]
+                    .iter()
+                    .position(|&byte| byte == b'"' || byte == b'\\')
+                    .unwrap_or(bytes.len() - index);
+                if run > 0 {
+                    self.flush_pending_surrogate()?;
+                    Self::checked_add(&mut self.current_string_bytes, run as u64)?;
+                    index += run;
+                    continue;
+                }
+            } else if !self.in_string && self.pending_string_bytes.is_none() {
+                match bytes[index..].iter().position(|&byte| byte == b'"') {
+                    Some(run) => index += run,
+                    None => break,
+                }
+            }
+            let byte = bytes[index];
+            index += 1;
             if self.in_string {
                 if self.unicode_digits != 0 {
                     let nibble = match byte {
@@ -447,6 +471,25 @@ mod tests {
         let measured = writer.finish().unwrap();
         assert_eq!(measured.json_bytes, json.len() as u64);
         assert_eq!(measured.string_value_utf8_bytes, 8 + 4 + 3 + 3);
+    }
+
+    #[test]
+    fn bulk_and_single_byte_writes_measure_identically() {
+        let json = r#"{"k":"plain text é","n":[1,2.5,null,{"a":"\uD800tail","b":"x\"y\\z\u00e9"}], "s" : "v" ,"e":""}"#.as_bytes();
+        let measure = |chunk: usize| {
+            let mut writer = JsonMeasurementWriter::default();
+            for part in json.chunks(chunk) {
+                writer.write_all(part).unwrap();
+            }
+            writer.finish().unwrap()
+        };
+        let whole = measure(json.len());
+        assert_eq!(whole.json_bytes, json.len() as u64);
+        // "plain text é" 13 + "\uD800tail" 3+4 + "x\"y\\zé" 5+2 + "v" 1 + "" 0.
+        assert_eq!(whole.string_value_utf8_bytes, 13 + 7 + 7 + 1);
+        for chunk in 1..json.len() {
+            assert_eq!(measure(chunk), whole, "chunk size {chunk}");
+        }
     }
 
     #[test]

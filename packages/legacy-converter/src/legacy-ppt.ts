@@ -1,3 +1,4 @@
+import { resolveBundledAssetUrl } from '@silurus/ooxml-core/internal/bundled-asset-url';
 import type { ModelSource } from '@silurus/ooxml-core';
 import { createLegacySource, type LegacySourceOptions } from './legacy-source.js';
 import defaultWasmUrl from './wasm-direct-ppt/legacy_ppt_direct_bg.wasm?url';
@@ -13,7 +14,7 @@ export type LegacyPptSourceOptions = LegacySourceOptions;
  */
 export function legacyPptSource(options: LegacyPptSourceOptions = {}): ModelSource<'pptx'> {
   return createLegacySource<'pptx'>('ppt', options, {
-    wasmUrl: new URL(defaultWasmUrl, import.meta.url).href,
-    moduleUrl: new URL(defaultModuleUrl, import.meta.url).href,
+    wasmUrl: resolveBundledAssetUrl(defaultWasmUrl, import.meta.url),
+    moduleUrl: resolveBundledAssetUrl(defaultModuleUrl, import.meta.url),
   });
 }

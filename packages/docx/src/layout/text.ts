@@ -842,12 +842,12 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
   }
   const genericFamilies = Object.freeze(Object.fromEntries(
     Object.entries(input.genericFamilies ?? {})
-      .map(([family, generic]) => [family.trim().toLocaleLowerCase('en-US'), generic])
+      .map(([family, generic]) => [family.trim().toLowerCase(), generic])
       .sort(([a], [b]) => a.localeCompare(b)),
   ));
   const eastAsiaFontCharsets = Object.freeze(Object.fromEntries(
     Object.entries(input.eastAsiaFontCharsets ?? {})
-      .map(([family, charset]) => [family.trim().toLocaleLowerCase('en-US'), charset.trim()])
+      .map(([family, charset]) => [family.trim().toLowerCase(), charset.trim()])
       .sort(([a], [b]) => a.localeCompare(b)),
   ));
   const fingerprint = stableFingerprint('text', {
@@ -861,7 +861,7 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
   const resolve = (request: Readonly<TextFontResolveRequest>): FontResolution => {
     const authoredFamily = requestedFamily(request, request.slot);
     const genericFamily = authoredFamily
-      ? genericFamilies[authoredFamily.trim().toLocaleLowerCase('en-US')]
+      ? genericFamilies[authoredFamily.trim().toLowerCase()]
         ?? request.genericFamily
         ?? 'sans-serif'
       // ECMA-376 §17.3.2.26 deliberately leaves the consumer's supported
@@ -1020,7 +1020,7 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
       const eastAsiaFamily = requestedFamily(request, 'eastAsia');
       const eastAsiaCharset = request.eastAsiaFontCharset
         ?? (eastAsiaFamily
-          ? eastAsiaFontCharsets[eastAsiaFamily.trim().toLocaleLowerCase('en-US')]
+          ? eastAsiaFontCharsets[eastAsiaFamily.trim().toLowerCase()]
           : undefined);
       // ECMA-376 §17.3.2.26 (and the MS-OI29500 table) selects the rFonts slot
       // per code point, including rFonts@hint. General text keeps that exactly.

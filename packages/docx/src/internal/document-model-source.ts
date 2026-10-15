@@ -1,3 +1,4 @@
+import { resolveBundledAssetUrl } from '@silurus/ooxml-core/internal/bundled-asset-url';
 import { hasNativeReadingRequests } from '../native-reading-notice.js';
 import { resolveCjkFallback, type CjkLang } from '@silurus/ooxml-core';
 import {
@@ -110,10 +111,10 @@ function modelSourceFields(
 ): { source: AdmittedModelSourceLoad['module']; sourceTransfer?: readonly Transferable[]; sourceOwnerUrl: string } {
   // The source owner is an opt-in ESM sidecar. An inline OOXML worker contains
   // only this URL and imports the sidecar after a source is selected.
-  const sourceOwnerUrl = new URL(
+  const sourceOwnerUrl = resolveBundledAssetUrl(new URL(
     import.meta.env.DEV ? './worker-document-source.ts' : './docx-source-worker.mjs',
     import.meta.url,
-  ).href;
+  ).href, import.meta.url);
   return load.transfer.length > 0
     ? { source: load.module, sourceTransfer: load.transfer, sourceOwnerUrl }
     : { source: load.module, sourceOwnerUrl };

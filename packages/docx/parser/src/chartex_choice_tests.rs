@@ -692,8 +692,20 @@ fn synthetic_docx_choice_matrix() {
                         assert_eq!(streamed_runs[0]["text"], "choice");
                     }
                     "first-container" => {
-                        assert_eq!(native_runs, &serde_json::json!([]));
-                        assert_eq!(streamed_runs, &serde_json::json!([]));
+                        // The observer keeps the parent selection; the empty
+                        // first container emits nothing and the later sibling
+                        // container (CT_Drawing is an unbounded choice) is
+                        // still acquired as its own drawing.
+                        assert_eq!(native_runs, streamed_runs);
+                        assert_eq!(
+                            native_runs,
+                            &serde_json::json!([{
+                                "type": "unavailableDrawing",
+                                "resourceKind": "chart",
+                                "widthPt": 72.0,
+                                "heightPt": 72.0
+                            }])
+                        );
                     }
                     "wrong-namespace" => {
                         assert_eq!(native["model"], streaming["model"]);

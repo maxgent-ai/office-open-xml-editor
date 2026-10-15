@@ -185,8 +185,14 @@ pub(super) fn validate(
             && [&ordinary, &continuation, &notice]
                 .iter()
                 .all(|story| story.metric_only());
-        if !ordinary.standard_rule(separators::RuleKind::Short)
-            || !(continuation.standard_rule(separators::RuleKind::Full) || short_continuation)
+        // MS-DOC 2.3.3 explicitly permits zero-length reserved stories. The
+        // shared native-story consumer already represents empty stories with
+        // no ink or flow. Preserve the equal CPs and explicit None mark;
+        // never substitute a default rule or discard custom content.
+        if !(ordinary.standard_rule(separators::RuleKind::Short) || ordinary.empty_story())
+            || !(continuation.standard_rule(separators::RuleKind::Full)
+                || short_continuation
+                || continuation.empty_story())
             || !matches!(headers.separator_text(base + 2), "" | "\r\r")
         {
             return Err(unsupported("custom Word note separators are not supported"));
@@ -687,6 +693,25 @@ mod tests {
     }
 
     #[test]
+    fn empty_reserved_separator_stories_preserve_explicit_absence() {
+        let notes = ["\u{2} one\r"];
+        let references = [(1, true)];
+        let mut properties = fixture(&notes, &references);
+        properties.separators = [""; 6];
+        let document = document("A\u{2}\r", &properties).unwrap();
+        assert_eq!(document.footnotes.len(), 1);
+        let settings = serde_json::to_value(document.note_layout_settings.unwrap()).unwrap();
+        assert_eq!(settings["footnoteSeparator"], "none");
+        assert_eq!(settings["footnoteContinuationSeparator"], "none");
+        for role in ["separator", "continuationSeparator", "continuationNotice"] {
+            assert_eq!(
+                settings["nativeSeparators"]["footnote"][role]["class"],
+                "empty"
+            );
+        }
+    }
+
+    #[test]
     fn unrepresentable_note_properties_are_rejected() {
         let notes = ["\u{2} one\r"];
         let references = [(1, true)];
@@ -716,7 +741,6 @@ mod tests {
         missing.dop = None;
         assert!(reject(missing, "A\u{2}\r").contains("note properties"));
         for separators in [
-            ["", "\u{4}\r\r", "", "", "", ""],
             ["\u{3}\r\r\r", "\u{4}\r\r", "", "", "", ""],
             ["\u{4}\r\r", "\u{3}\r\r", "", "", "", ""],
             ["\u{3}\r\r", "\u{4}\r\r", "x\r\r", "", "", ""],

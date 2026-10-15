@@ -59,11 +59,11 @@ export function docxFontPreloadNames(
   const languageNames = new Set<string>();
   const renderedFamilies = new Map<string, string>();
   const themeKeys = new Set([doc.majorFont, doc.minorFont]
-    .map((family) => family?.trim().toLocaleLowerCase('en-US')));
+    .map((family) => family?.trim().toLowerCase()));
   for (const usage of docxRenderedTextUsages(doc, 'google-preload')) {
     for (const family of usage.fontFamilies) {
       const name = family?.trim();
-      const key = name?.toLocaleLowerCase('en-US');
+      const key = name?.toLowerCase();
       const entry = key ? DOCX_GOOGLE_FONTS[key] : undefined;
       // A script-scoped visual substitute is fetched only when text in its
       // script actually requests the family (core substitute-script.ts).
@@ -99,9 +99,9 @@ function differentFamilySubstitutes(
   const substitutes = new Map<string, string>();
   for (const name of names) {
     const family = name?.trim();
-    const key = family?.toLocaleLowerCase('en-US');
+    const key = family?.toLowerCase();
     const loadFamily = key ? DOCX_GOOGLE_FONTS[key]?.loadFamily : undefined;
-    if (family && key && loadFamily && loadFamily.toLocaleLowerCase('en-US') !== key) {
+    if (family && key && loadFamily && loadFamily.toLowerCase() !== key) {
       substitutes.set(key, family);
     }
   }
@@ -132,7 +132,7 @@ export function docxGoogleFontPlan(
   const installed = new Set([...differentFamilySubstitutes(names).keys()]
     .filter((key) => routedFamilies.has(key) || probed.has(key)));
   return {
-    names: names.filter((name) => !installed.has(name?.trim().toLocaleLowerCase('en-US') ?? '')),
+    names: names.filter((name) => !installed.has(name?.trim().toLowerCase() ?? '')),
     installedSubstituteFamilies: [...installed].sort(),
   };
 }
@@ -150,7 +150,7 @@ export function docxOfficeFontFallbackRequests(
     if (!name) return;
     const weight = bold ? 700 : 400;
     const style = italic ? 'italic' : 'normal';
-    tuples.set(`${name.toLocaleLowerCase('en-US')}:${weight}:${style}`, { family: name, weight, style });
+    tuples.set(`${name.toLowerCase()}:${weight}:${style}`, { family: name, weight, style });
   };
   // Theme faces can govern paragraph marks and inherited runs even when a
   // particular authored run does not repeat its font name.

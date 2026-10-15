@@ -23,6 +23,7 @@
   "exports": {
     ".": "./src/index.ts",
     "./worker": "./src/worker/index.ts",
+    "./internal/bundled-asset-url": "./src/internal/bundled-asset-url.ts",
     "./internal/model-source": "./src/source/model-source.ts",
     "./internal/cfb-directory-names": "./src/source/cfb-directory-names.ts",
     "./types": "./src/types/common.ts",
@@ -68,6 +69,7 @@
     "./internal/visible-unit-events": "./src/internal/visible-unit-events.ts",
     "./internal/scroll-load-controller": "./src/internal/scroll-load-controller.ts",
     "./internal/font-measurement-sentinels": "./src/internal/font-measurement-sentinels.ts",
+    "./internal/css-font-family": "./src/internal/css-font-family.ts",
     "./internal/script-preload-accumulator": "./src/internal/script-preload-accumulator.ts",
     "./internal/wasm-runtime-generation": "./src/internal/wasm-runtime-generation.ts",
     "./mathjax-stix2": "./assets/mathjax-stix2.js"

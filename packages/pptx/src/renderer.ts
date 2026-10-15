@@ -1,4 +1,5 @@
 import { clipCanvasHorizontally } from '@silurus/ooxml-core/internal/canvas-clip';
+import { quoteCssFontFamily } from '@silurus/ooxml-core/internal/css-font-family';
 import { FONT_TRACKING_SENTINEL, FONT_BASELINE_SENTINEL, FONT_SPACE_SENTINEL } from '@silurus/ooxml-core/internal/font-measurement-sentinels';
 import { preparedPowerPointText } from './font-display-text.js';
 import { pptxSlideCjkFallback } from './google-fonts.js';
@@ -984,7 +985,7 @@ function isArabicScriptFace(family: string): boolean {
 
 /** Quote each family for a CSS font-family list (no trailing comma). */
 function quoteAll(names: readonly string[]): string {
-  return names.map((n) => `"${n}"`).join(', ');
+  return names.map(quoteCssFontFamily).join(', ');
 }
 
 /**
@@ -1016,9 +1017,9 @@ export function cssFontStack(
   const sub = alias && substituteEntryCoversText(
     GOOGLE_FONT_SUBSTITUTES[authoredFamily.toLowerCase()], text, 'any',
   ) ? alias : undefined;
-  const subPart = sub ? `"${sub}", ` : '';
+  const subPart = sub ? `${quoteCssFontFamily(sub)}, ` : '';
   const googleAlias = googleCjkFontAlias(authoredFamily);
-  const aliasPart = googleAlias ? `"${googleAlias}", ` : '';
+  const aliasPart = googleAlias ? `${quoteCssFontFamily(googleAlias)}, ` : '';
   // Arabic faces lead with script fallbacks only for Arabic runs.
   const arabicFamilies = generic === 'serif'
     ? ['Noto Naskh Arabic', 'Noto Sans Arabic']
@@ -1026,7 +1027,7 @@ export function cssFontStack(
   const arabicPart = arabicText ? `${quoteAll(arabicFamilies)}, ` : '';
   if (isArabicScriptFace(authoredFamily) && arabicText) {
     const cjk = fallback ? cjkFallbackChain(fallback, 'sans') : [];
-    return `"${normalized}", ${subPart}${arabicPart}${cjk.length ? `${quoteAll(cjk)}, ` : ''}${generic}`;
+    return `${quoteCssFontFamily(normalized)}, ${subPart}${arabicPart}${cjk.length ? `${quoteAll(cjk)}, ` : ''}${generic}`;
   }
   const variant: 'sans' | 'serif' = generic === 'serif' ? 'serif' : 'sans';
   const authoredCjk = classifyCjkFont(authoredFamily);
@@ -1038,8 +1039,8 @@ export function cssFontStack(
   const nonCjk = variant === 'serif' ? NON_CJK_SERIF_FALLBACKS : NON_CJK_SANS_FALLBACKS;
   const nonCjkPart = `${quoteAll(nonCjk)}, `;
   return authoredCjk
-    ? `"${normalized}", ${subPart}${aliasPart}${cjkPart}${nonCjkPart}${arabicPart}${generic}`
-    : `"${normalized}", ${subPart}${aliasPart}${nonCjkPart}${cjkPart}${arabicPart}${generic}`;
+    ? `${quoteCssFontFamily(normalized)}, ${subPart}${aliasPart}${cjkPart}${nonCjkPart}${arabicPart}${generic}`
+    : `${quoteCssFontFamily(normalized)}, ${subPart}${aliasPart}${nonCjkPart}${cjkPart}${arabicPart}${generic}`;
 }
 
 /**
@@ -1240,8 +1241,10 @@ export function buildFont(
   // Application-default faces follow the primary face in their fallback
   // order (issue #1627), ahead of the generic web fallbacks.
   const extras = extraFamilies.filter((name) => name !== normalized);
+  // Match the complete escaped primary string. A callback keeps $&/$' in
+  // authored family names literal instead of treating them as replace tokens.
   return `${style}${weight}${sizePx}px ${extras.length
-    ? stack.replace(/^("[^"]*"), /u, `$1, ${quoteAll(extras)}, `) : stack}`;
+    ? stack.replace(/^("(?:[^"\\]|\\.)*"), /u, (_match, first: string) => `${first}, ${quoteAll(extras)}, `) : stack}`;
 }
 
 /**

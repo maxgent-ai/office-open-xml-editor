@@ -73,6 +73,9 @@ impl RuleKind {
 impl AcquiredSeparator<'_> {
     /// Preserve explicit native rule kind independently of its destination role.
     pub(super) fn mark(&self) -> Option<NoteSeparatorMark> {
+        if self.empty_story() {
+            return Some(NoteSeparatorMark::None);
+        }
         self.rule.as_ref()?.kind.map(RuleKind::mark)
     }
 
@@ -133,6 +136,16 @@ impl AcquiredSeparator<'_> {
                     && !paragraph.framed
                     && paragraph.mark.as_ref().is_some_and(character)
             })
+    }
+
+    /// MS-DOC 2.3.3: equal PlcfHdd CPs mean no contents and no guard.
+    /// This is explicit native absence, not an omitted/default OOXML story.
+    pub(super) fn empty_story(&self) -> bool {
+        self.source.cp.is_empty()
+            && self.source.guard_cp.is_none()
+            && self.source.content.is_empty()
+            && self.rule.is_none()
+            && self.paragraph.is_none()
     }
 
     pub(super) fn standard_rule(&self, kind: RuleKind) -> bool {

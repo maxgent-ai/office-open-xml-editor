@@ -3653,13 +3653,13 @@ fn parse_row_cells(
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
 
-        let v_text = c_node
-            .children()
-            .find(|n| n.tag_name().name() == "v")
-            .and_then(|n| n.text())
-            .unwrap_or("")
-            .to_string();
+        let v_node = c_node.children().find(|n| n.tag_name().name() == "v");
+        let v_text = v_node.and_then(|n| n.text()).unwrap_or("").to_string();
 
+        // ECMA-376 §§18.3.1.4/.96: CT_Cell permits an absent <v>, while
+        // a present string cache can contain empty ST_Xstring text. Preserve
+        // that value for cached-only consumers (COUNTA/ISBLANK); never infer
+        // a missing cache from <f>, including shared-formula followers.
         let value = if cell_type == "inlineStr" {
             match is_node {
                 Some(is) => {
@@ -3673,7 +3673,7 @@ fn parse_row_cells(
                 }
                 None => CellValue::Empty,
             }
-        } else if v_text.is_empty() {
+        } else if v_text.is_empty() && !(cell_type == "str" && v_node.is_some()) {
             CellValue::Empty
         } else {
             match cell_type {
@@ -9649,5 +9649,46 @@ mod implicit_reference_tests {
             CellValue::Text { text, .. } => assert_eq!(text, "Bold tail"),
             other => panic!("expected concatenated inline rich text, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod cached_empty_string_regression_tests {
+    use super::*;
+
+    #[test]
+    fn cached_formula_empty_string_is_text_while_missing_cache_stays_empty() {
+        // ECMA-376 §§18.3.1.4/.96, ST_CellType: an explicit string cache
+        // may be empty; absence of a cache does not establish a result.
+        let xml = r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1">
+          <c r="A1" t="str"><f>""</f><v/></c>
+          <c r="B1" t="str"><f>""</f></c>
+          <c r="C1" s="2"/>
+          <c r="D1"><f>Z1</f><v/></c>
+          <c r="E1" t="str"><f t="shared" si="0"/><v/></c>
+        </row></sheetData></worksheet>"#;
+        let (ws, _) = parse_worksheet(xml, &[], &[], "Sheet1").unwrap();
+        let cells = &ws.rows[0].cells;
+        assert!(
+            matches!(&cells[0].value, CellValue::Text { text, .. } if text.is_empty()),
+            "present empty cached string must preserve text ownership: {:?}",
+            cells[0].value
+        );
+        assert!(
+            matches!(cells[1].value, CellValue::Empty),
+            "missing v must remain absent cache"
+        );
+        assert!(
+            matches!(cells[2].value, CellValue::Empty),
+            "style-only cell stays blank"
+        );
+        assert!(
+            matches!(cells[3].value, CellValue::Empty),
+            "untyped empty cache stays blank"
+        );
+        assert!(
+            matches!(&cells[4].value, CellValue::Text { text, .. } if text.is_empty()),
+            "shared-formula follower preserves its explicit empty string cache"
+        );
     }
 }
