@@ -66,26 +66,6 @@ export function subtractExactRational(
   );
 }
 
-export function multiplyExactRational(
-  left: ExactRational,
-  right: ExactRational,
-): ExactRational {
-  return normalizeExactRational(
-    left.numerator * right.numerator,
-    left.denominator * right.denominator,
-  );
-}
-
-export function divideExactRational(
-  left: ExactRational,
-  right: ExactRational,
-): ExactRational {
-  return normalizeExactRational(
-    left.numerator * right.denominator,
-    left.denominator * right.numerator,
-  );
-}
-
 export function midpointExactRational(
   left: ExactRational,
   right: ExactRational,

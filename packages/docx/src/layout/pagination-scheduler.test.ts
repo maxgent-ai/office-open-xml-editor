@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { vi, afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { layoutDocument } from '../document-layout.js';
 import { layoutSourceStore } from '../layout-source-model-adapter.js';
 import { createLayoutServices } from '../layout-runtime.js';
@@ -11,7 +11,7 @@ import { layoutDocumentInputAsync } from './document.js';
 import { layoutFingerprint } from './invariants.js';
 import { normalizeLayoutOptions } from './options.js';
 import { drainPaginationAsync, PaginationAbortError } from './pagination-scheduler.js';
-import { setDocumentLayoutValidation } from './validation-policy.js';
+import { setDocumentLayoutValidation } from '../testing/validation-policy.js';
 import type { DocumentLayout } from './types.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -149,3 +149,5 @@ describe('pagination scheduler', () => {
     })).rejects.toBeInstanceOf(PaginationAbortError);
   });
 });
+
+vi.mock('./validation-policy.js', () => ({ documentLayoutValidationEnabled: vi.fn(() => true) }));

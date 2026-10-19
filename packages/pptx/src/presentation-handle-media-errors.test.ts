@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createPresentationHandle, type PresentOptions } from './presentation-handle';
+import { OoxmlDecodedImageLimitError, OoxmlResourceLimitError } from '@silurus/ooxml-core';
 import type { MediaElement } from './types';
 
 type Listener = (event: Event) => void;
@@ -188,6 +189,26 @@ describe('presentation media failure reporting', () => {
     } as unknown as PointerEvent);
     expect(media.play).toHaveBeenCalledTimes(1);
     handle.destroy();
+  });
+
+  it.each(['archive', 'decoded'])('preserves the typed %s limit failure when extracting interactive media', async kind => {
+    installDom();
+    const error = kind === 'decoded' ? new OoxmlDecodedImageLimitError('active-decoded-bytes', 1, 2)
+      : new OoxmlResourceLimitError('archive limit', {
+      stage: 'decompression', violation: {
+        format: 'pptx', operation: 'extract-media', resource: 'archive-entry',
+        metric: 'actual-inflated-bytes', part: 'ppt/media/clip.mp3',
+        limit: 1, observed: 2, configurable: true,
+        usage: { archiveEntryCount: 1, declaredInflatedBytes: 2,
+          distinctInflatedBytes: 2, operationInflatedBytes: 2 },
+      },
+    });
+    const onError = vi.fn();
+    await expect(createPresentationHandle(
+      makeCanvas() as unknown as HTMLCanvasElement,
+      [mediaElement()], options({ fetchMedia: async () => { throw error; }, onError }),
+    )).rejects.toBe(error);
+    expect(onError).not.toHaveBeenCalled();
   });
 
   it('rejects initial fetchMedia failures without also calling onError', async () => {

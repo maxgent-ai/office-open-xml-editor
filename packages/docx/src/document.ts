@@ -1,12 +1,12 @@
-import { isDocxCallerInputError } from './layout/caller-input-error.js';
-import { nativeReadingNotices, retainedReadingNotices, noReadingNotices, type DocxReadingNotice } from './native-reading-notice.js';
-import { hasNativeReadingRequests, nativeReadingRequests, noNativeReadingRequests, type NativeReadingRequests } from './native-reading-notice.js';
+import { measureHostFontLines, loadDocxOfficeFontFallbacks as loadOfficeFontFallbacks } from './host-font-line-metrics.js';
+import { recordResourceDiagnostics, resourceDiagnosticsOf } from './resource-diagnostics.js';
+import type { DocxDiagnostic } from './types.js';
 import { resolveCjkFallback, type CjkLang } from '@silurus/ooxml-core';
 import InlineWorker from './worker.ts?worker&inline';
 import wasmAssetUrl from './wasm/docx_parser_bg.wasm?url';
 import {
+  activeFontSet,
   preloadGoogleFonts,
-  loadOfficeFontFallbacks,
   unloadOfficeFontFallbacks,
   releaseOwnedBitmap,
   unloadGoogleFonts,
@@ -18,6 +18,7 @@ import {
   resolveOoxmlContainer,
   toArrayBuffer,
   type LoadOptions as CoreLoadOptions,
+  type ModelSource,
   type ProgressiveLayoutPartial,
   type ProgressiveLayoutProgress,
   type MathRenderer,
@@ -46,7 +47,9 @@ import { ProgressiveLayoutLifecycle } from '@silurus/ooxml-core/internal/progres
 import { ProgressiveLayoutObserverNotifier } from '@silurus/ooxml-core/internal/progressive-layout-observers';
 import type { DocxDocumentModel, RenderPageOptions, WorkerRequest, WorkerResponse, DocComment, DocNote, DocRevision } from './types';
 import { renderLayoutSourceToCanvas, documentHasMath, prepareMathRuns, type DocxTextRunInfo } from './renderer';
-import { createLayoutServices } from './layout-runtime.js';
+import { createLayoutServices, nativeRouteLineRequests } from './layout-runtime.js';
+import { mainThreadFallbackWarning } from './main-thread-fallback.js';
+import { admitDocxNativeRouteLines, measureDocxNativeRouteLines } from './native-route-line-metrics.js';
 import { buildBookmarkPageMap } from './bookmark-nav';
 import { DOCX_GOOGLE_FONTS, docxGoogleFontPlan, docxOfficeFontFallbackRequests } from './google-fonts';
 import { loadEmbeddedFonts } from './embedded-fonts';
@@ -104,6 +107,7 @@ import {
   docxLayoutViewRequester,
   publishDocxLayoutView,
 } from './document-layout-view.js';
+import { deferred, type Deferred } from '@silurus/ooxml-core/internal/deferred';
 
 /** Options for {@link DocxDocument.load}. Extends the shared load-options type
  *  from `@silurus/ooxml-core` (`useGoogleFonts`, `resourceLimits`, and the
@@ -119,6 +123,14 @@ export interface LoadOptions extends CoreLoadOptions {
    * table splitting, width changes and changed source cuts can reject layout,
    * and full-note acquisition is subject to the library source/page budgets. */
   allowFootnoteContinuation?: boolean;
+  /**
+   * Opt-in model source for document input that is not an OOXML package (a
+   * `ModelSource<'docx'>`). When its `claim()` accepts the raw bytes, it
+   * opens them in the parser realm through its own module; otherwise the
+   * ordinary OOXML path runs unchanged. A source for another format is a
+   * `TypeError`. Omitting this option imports and runs nothing extra.
+   */
+  legacyDoc?: ModelSource<'docx'>;
   /**
    * Opt-in OMML equation engine. Import it from the separate `@silurus/ooxml/math`
    * entry and pass it in: `import { math } from '@silurus/ooxml/math'`. When
@@ -293,12 +305,6 @@ interface WorkerProgressiveLoad {
   settled: boolean;
 }
 
-interface Deferred<T> {
-  readonly promise: Promise<T>;
-  readonly resolve: (value: T) => void;
-  readonly reject: (error: unknown) => void;
-}
-
 /** LayoutOptions are already normalized; absent and explicit false select the
  * same retained variant. */
 function sameLayoutView(
@@ -308,13 +314,6 @@ function sameLayoutView(
   return left !== null
     && left.currentDateMs === right.currentDateMs
     && (left.showTrackedChanges === true) === (right.showTrackedChanges === true);
-}
-
-function deferred<T>(): Deferred<T> {
-  let resolve!: (value: T) => void;
-  let reject!: (error: unknown) => void;
-  const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej; });
-  return { promise, resolve, reject };
 }
 
 /** Identity-stable empties for the two anchor projections.
@@ -340,6 +339,16 @@ function snapshotReviewData(
 }
 
 export class DocxDocument {
+  /** Parser/layout limitations and resource acquisition failures. Updated after
+   * load/layout and page rendering; fallback content may still be displayed. */
+  get diagnostics(): readonly DocxDiagnostic[] {
+    return snapshotPlainData([
+      ...(this._mode === 'worker' ? this._meta?.diagnostics ?? [] : this._getLayout()?.diagnostics ?? []),
+      ...(this._meta?.resourceDiagnostics ?? []),
+      ...resourceDiagnosticsOf(this),
+    ], 'DOCX diagnostics') as readonly DocxDiagnostic[];
+  }
+
   private _metrics: OoxmlResourceMetricsSession | null = null;
   private _cjkFallback: CjkLang = 'jp';
   private _allowFootnoteContinuation = false;
@@ -404,6 +413,11 @@ export class DocxDocument {
   private _embeddedFontFaces: FontFace[] = [];
   /** Library-owned exact-local or pinned substitute faces in main mode. */
   private _officeFontFaces: FontFace[] = [];
+  /** Why a worker-mode load continued on the main thread. */
+  private _mainThreadFallbackReason: 'vertical' | 'nativeRouteSentinels' = 'vertical';
+  /** Native route sentinels (native-route-line-metrics.ts), main mode. */
+  private _nativeRouteFaces: FontFace[] = [];
+  private _nativeRouteFacesReleased = false;
   /** Google-Fonts `FontFace` objects this document preloaded into `document.fonts`
    *  (main mode only — in worker mode the worker owns them and terminates with its
    *  own FontFaceSet). Released in {@link destroy} so they do not leak into the
@@ -470,7 +484,7 @@ export class DocxDocument {
       if (signal?.aborted) throw new PaginationAbortError();
     };
     checkAbort();
-    if (__OOXML_MODEL_SOURCES__ && opts.modelSources !== undefined) {
+    if (__OOXML_MODEL_SOURCES__ && opts.legacyDoc !== undefined) {
       const { loadDocxModelSource } = await import('./internal/document-model-source.js');
       const modelDocument = await loadDocxModelSource(source, opts, control);
       if (signal?.aborted) {
@@ -576,9 +590,7 @@ export class DocxDocument {
       checkAbort();
       if (mode === 'worker' && doc._mode === 'main') {
         metrics.setMode('main');
-        console.warn(
-          "[ooxml] mode: 'worker' fell back to main-thread rendering because this document requires DOM OpenType vertical glyph selection.",
-        );
+        console.warn(mainThreadFallbackWarning(doc._mainThreadFallbackReason));
       }
       if (opts.math && doc._mode === 'worker' && !rendererDescriptors?.math) {
         console.warn(
@@ -615,6 +627,24 @@ export class DocxDocument {
       // inside the worker (before it paginates); here it runs on the main thread.
       let embeddedMetrics: Awaited<ReturnType<typeof loadEmbeddedFonts>>['metrics'] | undefined;
       let embeddedRoutes: Awaited<ReturnType<typeof loadEmbeddedFonts>>['routes'] | undefined;
+      // Absent authored faces (native-route-line-metrics.ts): native family
+      // lists do not depend on which resources load, so the document-realm
+      // measurement starts here and overlaps the font loading below; admission
+      // waits for every font. The sentinels stay with this document (they
+      // judge glyph ownership during layout) and are released by destroy().
+      const measuringDocument = doc;
+      const nativeRoutesPending = doc._mode === 'main' && doc._document && doc._source
+        ? measureDocxNativeRouteLines(nativeRouteLineRequests(doc._source, doc._document, {
+            useGoogleFonts: !!opts.useGoogleFonts, cjkFallback,
+          }), true).then((measured) => {
+            if (measuringDocument._nativeRouteFacesReleased) {
+              unloadOfficeFontFallbacks(measured.faces);
+              return null;
+            }
+            measuringDocument._nativeRouteFaces.push(...measured.faces);
+            return measured;
+          }, () => null)
+        : null;
       if (doc._mode === 'main' && doc._document?.embeddedFonts?.length) {
         const loadingDocument = doc;
         const loadedEmbedded = await loadEmbeddedFonts(
@@ -627,13 +657,14 @@ export class DocxDocument {
           unregisterEmbeddedFonts(loadedEmbedded.faces);
           throw new PaginationAbortError();
         }
+        recordResourceDiagnostics(doc, loadedEmbedded.diagnostics);
         doc._embeddedFontFaces = loadedEmbedded.faces;
         embeddedMetrics = loadedEmbedded.metrics;
         embeddedRoutes = loadedEmbedded.routes;
       }
       const officeFonts = doc._mode === 'main' && doc._document
         ? await loadOfficeFontFallbacks(docxOfficeFontFallbackRequests(doc._document, { useGoogleFonts: opts.useGoogleFonts, cjkFallback: cjkFallback }).filter((request) =>
-            !embeddedRoutes?.some((route) => route.requestedFamily.toLowerCase() === request.family.toLowerCase()
+            request.presenceOnly || !embeddedRoutes?.some((route) => route.requestedFamily.toLowerCase() === request.family.toLowerCase()
               && route.weight === (request.weight ?? 400) && route.style === (request.style ?? 'normal'))))
         : { faces: [], routes: {} };
       if (signal?.aborted) {
@@ -666,7 +697,7 @@ export class DocxDocument {
       if (doc._mode === 'main' && doc._document && doc._source) {
         const layoutDocument = doc;
         const runtime = documentLayoutRuntimeOf(doc);
-        runtime.services = createLayoutServices(doc._source, {
+        const serviceOptions = {
           allowFootnoteContinuation: doc._allowFootnoteContinuation,
           fontMetrics: embeddedMetrics,
           useGoogleFonts: !!opts.useGoogleFonts,
@@ -675,8 +706,17 @@ export class DocxDocument {
           officeRoutes: Object.values(officeFonts.routes),
           googleFaces: doc._googleFontFaces,
           installedSubstituteFamilies,
+          installedFamilies: 'installed' in officeFonts ? officeFonts.installed : undefined,
           mathResources: preparedMath?.records,
           mathDrawables: preparedMath?.drawables,
+        };
+        const nativeRoutes = await nativeRoutesPending;
+        checkAbort();
+        runtime.services = createLayoutServices(doc._source, {
+          ...serviceOptions,
+          nativeRouteMetrics: nativeRoutes && nativeRoutes.faces.length > 0
+            ? admitDocxNativeRouteLines(nativeRoutes.lines, activeFontSet())
+            : undefined,
         });
         const services = runtime.services;
         const retained = retainRenderWorkerDocumentLayout(
@@ -708,7 +748,7 @@ export class DocxDocument {
             )
             : undefined,
         };
-        if (deferrable && opts.progressiveLayout && !hasNativeReadingRequests(doc._source)) {
+        if (deferrable && opts.progressiveLayout) {
           const store = retained.layoutVariants;
           // Narrowed once: the closures below outlive this block's control flow.
           const progressiveDocument = doc;
@@ -941,13 +981,16 @@ export class DocxDocument {
       return;
     }
     const res = await this._bridge.request(
-      (id) =>
-        this._mode === 'worker'
+      (id) => {
+        this._parseRequestId = id;
+        return this._mode === 'worker'
           ? ({ type: 'parse', id, data: buffer, resourcePolicy, useGoogleFonts, allowFootnoteContinuation: this._allowFootnoteContinuation, cjkFallback: this._cjkFallback, defaultCurrentDateMs: documentLayoutRuntimeOf(this).defaultCurrentDateMs, ...this._parseViewFields(), renderers } satisfies RenderWorkerRequest)
-          : ({ type: 'parse', id, data: buffer, resourcePolicy } satisfies WorkerRequest),
+          : ({ type: 'parse', id, data: buffer, resourcePolicy } satisfies WorkerRequest);
+      },
       [buffer],
       { timeoutMs },
     );
+    this._parseRequestId = null;
     if ('protocol' in res) {
       throw new Error('DOCX parse open returned a pull-protocol response');
     }
@@ -960,10 +1003,10 @@ export class DocxDocument {
           { timeoutMs, onUsage },
         );
         this._source = adapted.source;
-        this._captureNativeReadingRequests(adapted.source);
         this._document = adapted.document;
         this._meta = null;
         this._mode = 'main';
+        this._mainThreadFallbackReason = res.reason ?? 'vertical';
       } else {
         this._meta = (res as Extract<RenderWorkerResponse, { type: 'parsedMeta' }>).meta;
       }
@@ -975,7 +1018,6 @@ export class DocxDocument {
         { timeoutMs, onUsage },
       );
       this._source = adapted.source;
-      this._captureNativeReadingRequests(adapted.source);
       this._document = adapted.document;
     }
     this._review = snapshotReviewData(
@@ -1002,6 +1044,23 @@ export class DocxDocument {
     // Any push proves the worker is alive and working, which is the only thing
     // the watchdog is asking about.
     this._rearmParseWatchdog();
+    if (res.type === 'measureHostFontLines') {
+      void measureHostFontLines(res.routes).catch(() => []).then(measurements => {
+        if (res.forId !== this._parseRequestId) return;
+        this._worker.postMessage({ type: 'hostFontLinesMeasured', forId: res.forId, measurements } satisfies RenderWorkerRequest);
+      });
+      return;
+    }
+    if (res.type === 'measureNativeRouteLines') {
+      // Measured and released here: this realm does not lay out in worker mode.
+      void measureDocxNativeRouteLines(res.requests, false)
+        .then(measured => measured.lines, () => res.requests.map(() => null))
+        .then(lines => {
+          if (res.forId !== this._parseRequestId) return;
+          this._worker.postMessage({ type: 'nativeRouteLinesMeasured', forId: res.forId, lines } satisfies RenderWorkerRequest);
+        });
+      return;
+    }
     const progressive = this._progressive;
     if (progressive?.settled) return;
     if (res.type === 'layoutProgress') {
@@ -1064,6 +1123,8 @@ export class DocxDocument {
       comments: review?.comments ?? [],
       footnotes: review?.footnotes ?? [],
       endnotes: review?.endnotes ?? [],
+      diagnostics: partial.diagnostics,
+      resourceDiagnostics: partial.review?.resourceDiagnostics ?? this._meta?.resourceDiagnostics,
       commentAnchorRanges: partial.commentAnchorRanges,
       revisionAnchorRanges: partial.revisionAnchorRanges,
     };
@@ -1091,12 +1152,12 @@ export class DocxDocument {
       const selected = this._meta;
       this._meta = {
         ...meta,
+        diagnostics: selected.diagnostics,
         pageCount: selected.pageCount,
         pageSizes: selected.pageSizes,
         bookmarkPages: selected.bookmarkPages,
         commentAnchorRanges: selected.commentAnchorRanges,
         revisionAnchorRanges: selected.revisionAnchorRanges,
-        readingNotices: selected.readingNotices,
       };
     }
     this._invalidateLayoutDerivedCaches();
@@ -1290,10 +1351,10 @@ export class DocxDocument {
             { timeoutMs, onUsage },
           );
           this._source = adapted.source;
-          this._captureNativeReadingRequests(adapted.source);
           this._document = adapted.document;
           this._meta = null;
           this._mode = 'main';
+          this._mainThreadFallbackReason = res.reason ?? 'vertical';
           this._review = snapshotReviewData(
             adapted.document.comments ?? [],
             adapted.document.revisions ?? [],
@@ -1325,9 +1386,6 @@ export class DocxDocument {
   }
 
   destroy(): void {
-    // Cancellation must not acquire a lazy variant that may itself fail.
-    this._invalidateReadingLayout(new Error('Reading layout cancelled'));
-    this._readingPublicationGeneration = (this._readingPublicationGeneration ?? 0) + 1;
     // Stop background layout first: without this, a destroyed document's
     // remaining pagination kept consuming main-thread slices to completion for
     // a viewer that no longer exists.
@@ -1363,6 +1421,11 @@ export class DocxDocument {
     if (this._officeFontFaces.length > 0) {
       unloadOfficeFontFallbacks(this._officeFontFaces);
       this._officeFontFaces = [];
+    }
+    this._nativeRouteFacesReleased = true;
+    if (this._nativeRouteFaces?.length > 0) {
+      unloadOfficeFontFallbacks(this._nativeRouteFaces);
+      this._nativeRouteFaces = [];
     }
     // Release the Google-Fonts substitutes this document preloaded into the
     // shared FontFaceSet (main mode). Same refcount contract as the embedded
@@ -1460,82 +1523,7 @@ export class DocxDocument {
     return (res as Extract<WorkerResponse, { type: 'markdownRendered' }>).markdown;
   }
 
-  private _readingLayoutFailed = false;
-  // Acquired once from sealed main source or projected by its worker owner;
-  // teardown and result guards must never re-resolve lazy source blocks.
-  private _nativeReadingRequested = false;
-  private _nativeReadingRequests: NativeReadingRequests = noNativeReadingRequests;
-  private _captureNativeReadingRequests(source: LayoutSourceStore): void {
-    this._nativeReadingRequests = nativeReadingRequests(source);
-    const requests = this._nativeReadingRequests;
-    this._nativeReadingRequested = requests.contour || requests.wordBreaking || requests.pictureBullets;
-  }
-  private _readingTermination: Promise<void> | null = null;
-  private _resolveReadingTermination: (() => void) | null = null;
-
-  private _ownsReadingPublication(): boolean {
-    return this._nativeReadingRequested || this._meta?.nativeReadingRequested === true || !!this._meta?.readingNotices?.length;
-  }
-  // Distinct from selection request generations: reselecting the active view
-  // cancels pending selections but does not replace its published pages.
-  private _readingPublicationGeneration = 0;
-
-  /** @internal Viewers own the changed-layout lifecycle even for notice-free variants. */
-  get _readingPublicationOwned(): boolean { return this._ownsReadingPublication(); }
-  /** @internal Presentation failures must identify the publication they painted. */
-  get _readingPublicationToken(): number | null { return this._ownsReadingPublication() ? (this._readingPublicationGeneration ?? 0) : null; }
-
-  private _captureReadingPublication(): number | null {
-    if (this._readingLayoutFailed) throw new Error('Reading layout was revoked');
-    return this._ownsReadingPublication() ? (this._readingPublicationGeneration ?? 0) : null;
-  }
-
-  private _assertReadingPublication(generation: number | null): void {
-    if (this._readingLayoutFailed) throw new Error('Reading layout was revoked');
-    if (generation !== null && generation !== (this._readingPublicationGeneration ?? 0))
-      throw new Error('Reading layout was superseded');
-  }
-
-  /** Retained page results, including text/hits, belong to one active reading
-   * publication. A stale bitmap is released before any direct caller sees it. */
-  private async _readingPublicationResult<T>(operation: (assertCurrent: () => void) => Promise<T>, discard?: (result: T) => void, consumerFailed: () => boolean = () => false): Promise<T> {
-    const generation = this._captureReadingPublication();
-    try {
-      const result = await operation(() => this._assertReadingPublication(generation));
-      try { this._assertReadingPublication(generation); }
-      catch (error) { discard?.(result); throw error; }
-      return result;
-    } catch (error) {
-      if (!consumerFailed() && !isDocxCallerInputError(error) && generation !== null && generation === (this._readingPublicationGeneration ?? 0)) this._invalidateReadingLayout(error);
-      throw error;
-    }
-  }
-
-  /** Disclosures for the active retained layout in main and worker modes. */
-  get readingNotices(): readonly DocxReadingNotice[] {
-    if (this._readingLayoutFailed) return noReadingNotices;
-    if (this._meta) return retainedReadingNotices(this._meta.readingNotices);
-    const layout = this._getLayout();
-    return layout ? nativeReadingNotices(layout, this._nativeReadingRequests) : noReadingNotices;
-  }
-
-  /** @internal A late changed-layout failure revokes every page and disclosure. */
-  _invalidateReadingLayout(cause: unknown, publication?: number): void {
-    if (publication !== undefined && publication !== (this._readingPublicationGeneration ?? 0)) return;
-    if (this._readingLayoutFailed || !this._ownsReadingPublication()) return;
-    this._readingLayoutFailed = true;
-    // A pending selection may no longer install geometry after revocation.
-    this._layoutViewGeneration++;
-    this._readingPublicationGeneration = (this._readingPublicationGeneration ?? 0) + 1;
-    this._layoutLifecycle.fail(cause);
-    this._resolveReadingTermination?.();
-    if (this._meta) this._meta = { ...this._meta, pageCount: 0, pageSizes: [], bookmarkPages: [], readingNotices: noReadingNotices, commentAnchorRanges: [], revisionAnchorRanges: [] };
-    this._invalidateLayoutDerivedCaches();
-    publishDocxLayout(this, { pageCount: 0, exact: false, complete: false, error: cause });
-  }
-
   get pageCount(): number {
-    if (this._readingLayoutFailed) return 0;
     if (this._meta) return this._meta.pageCount;
     if (!this._document) return 0;
     return this._getLayout()?.pages.length ?? 0;
@@ -1551,7 +1539,7 @@ export class DocxDocument {
    * {@link waitUntilLayoutComplete} distinguishes pending work from failure.
    */
   get layoutComplete(): boolean {
-    return !this._readingLayoutFailed && this._layoutLifecycle.complete;
+    return this._layoutLifecycle.complete;
   }
 
   /**
@@ -1563,18 +1551,7 @@ export class DocxDocument {
    * `load()` because that already resolved.
    */
   async waitUntilLayoutComplete(): Promise<void> {
-    if (this._readingLayoutFailed) {
-      this._layoutLifecycle.throwIfFailed();
-      throw new Error('Reading layout was revoked');
-    }
-    if (this._layoutCompletion) {
-      if (this._ownsReadingPublication()) {
-        // Termination need not settle a transport's completion Promise. Wake
-        // this waiter on revocation, then rethrow the retained terminal cause.
-        this._readingTermination ??= new Promise(resolve => { this._resolveReadingTermination = resolve; });
-        await Promise.race([this._layoutCompletion, this._readingTermination]);
-      } else await this._layoutCompletion;
-    }
+    if (this._layoutCompletion) await this._layoutCompletion;
     this._layoutLifecycle.throwIfFailed();
   }
 
@@ -1631,7 +1608,6 @@ export class DocxDocument {
    * before treating an empty or partial result as whole-document authority.
    */
   commentAnchorRanges(): readonly CommentAnchorRange[] {
-    if (this._readingLayoutFailed) return NO_COMMENT_ANCHOR_RANGES;
     if (this._meta) return this._meta.commentAnchorRanges ?? NO_COMMENT_ANCHOR_RANGES;
     if (!this._document || !this._source) return [];
     const comments = this._reviewSnapshot().comments;
@@ -1670,7 +1646,6 @@ export class DocxDocument {
    * this projects the available prefix; await {@link waitUntilLayoutComplete}
    * before a whole-document review scan. */
   revisionAnchorRanges(): readonly RevisionAnchorRange[] {
-    if (this._readingLayoutFailed) return NO_REVISION_ANCHOR_RANGES;
     if (this._meta) return this._meta.revisionAnchorRanges ?? NO_REVISION_ANCHOR_RANGES;
     if (!this._document || !this._source) return [];
     const revisions = this._reviewSnapshot().revisions;
@@ -1730,24 +1705,18 @@ export class DocxDocument {
   }
 
   private _getLayout(): DeepReadonly<DocumentLayout> | null {
-    if (this._readingLayoutFailed) return null;
     if (!this._document) return null;
-    try {
-      const runtime = documentLayoutRuntimeOf(this);
-      const services = runtime.services;
-      if (!services) throw new Error('Document layout services are not initialized');
-      const store = layoutVariantStoreOf(services);
-      if (!store) throw new Error('Document layout variant store is not initialized');
-      // The ACTIVE variant, not the default one: a tracked-changes viewer paints
-      // the markup layout, so its page count and page geometry must come from
-      // that same layout. Reading the default here also silently paginated the
-      // whole document a second time for a variant nobody was viewing.
-      const active = runtime.activeLayoutOptions;
-      return active ? store.layoutFor(active) : store.defaultLayout;
-    } catch (error) {
-      this._invalidateReadingLayout(error);
-      throw error;
-    }
+    const runtime = documentLayoutRuntimeOf(this);
+    const services = runtime.services;
+    if (!services) throw new Error('Document layout services are not initialized');
+    const store = layoutVariantStoreOf(services);
+    if (!store) throw new Error('Document layout variant store is not initialized');
+    // The ACTIVE variant, not the default one: a tracked-changes viewer paints
+    // the markup layout, so its page count and page geometry must come from
+    // that same layout. Reading the default here also silently paginated the
+    // whole document a second time for a variant nobody was viewing.
+    const active = runtime.activeLayoutOptions;
+    return active ? store.layoutFor(active) : store.defaultLayout;
   }
 
   /**
@@ -1767,7 +1736,6 @@ export class DocxDocument {
   async setLayoutView(
     view: Readonly<{ showTrackedChanges?: boolean; currentDate?: Date | number }> = {},
   ): Promise<void> {
-    if (this._readingLayoutFailed) throw new Error('Reading layout was revoked');
     // Request ownership is explicit input metadata. It is captured before a
     // worker request yields, stripped by normalization, and never serialized.
     const requester = (view as Readonly<{
@@ -1790,32 +1758,22 @@ export class DocxDocument {
           currentDateMs: next.currentDateMs,
           showTrackedChanges: next.showTrackedChanges === true,
         }) satisfies RenderWorkerRequest,
-      ).catch(error => {
-        if (generation === this._layoutViewGeneration) this._invalidateReadingLayout(error);
-        throw error;
-      });
-      if (generation !== this._layoutViewGeneration || this._readingLayoutFailed) return;
+      );
+      if (generation !== this._layoutViewGeneration) return;
       const variant = res as Extract<RenderWorkerResponse, { type: 'layoutViewSelected' }>;
       // Install selection and geometry in one turn. Until this point every
       // synchronous getter and option fill-in remains on the previous variant.
       runtime.activeLayoutOptions = next;
-      this._readingPublicationGeneration = (this._readingPublicationGeneration ?? 0) + 1;
-      this._meta = { ...this._meta, ...variant.meta, readingNotices: variant.meta.readingNotices ?? noReadingNotices };
+      this._meta = { ...this._meta, ...variant.meta };
       this._invalidateLayoutDerivedCaches();
       publishDocxLayoutView(this, requester);
       return;
     }
 
     runtime.activeLayoutOptions = next;
-    this._readingPublicationGeneration = (this._readingPublicationGeneration ?? 0) + 1;
     // Bookmark pages and the review anchor caches are derived from the
     // layout, so they belong to the variant that produced them.
     this._invalidateLayoutDerivedCaches();
-    // Changed reading layouts have an acquire-before-publication contract.
-    // Ordinary main layouts keep their existing lazy variant construction.
-    // Propagate the exact acquisition cause to this setter's Promise instead
-    // of resolving while a subscription's geometry getter revokes the layout.
-    if (this._ownsReadingPublication()) this._getLayout();
     publishDocxLayoutView(this, requester);
   }
 
@@ -1925,16 +1883,9 @@ export class DocxDocument {
       );
     }
     if (!this._source) throw new Error('Document not loaded');
-    if (this._readingLayoutFailed) return Promise.reject(new Error('Reading layout was revoked'));
-    const generation = this._captureReadingPublication();
-    let consumerFailed = false;
-    const onTextRun = opts.onTextRun && ((run: DocxTextRunInfo) => {
-      try { opts.onTextRun!(run); } catch (error) { consumerFailed = true; throw error; }
-    });
     return renderLayoutSourceToCanvas(this._source, target, pageIndex, {
       ...this._withActiveView(opts),
-      onTextRun,
-      assertPublicationCurrent: () => this._assertReadingPublication(generation),
+      onDiagnostic: diagnostic => recordResourceDiagnostics(this, [diagnostic]),
       callerOwnedCanvasTarget,
       // Lazy image bytes: the renderer fetches each embedded blip on demand by
       // zip path (decoded only when drawn) instead of reading inlined base64.
@@ -1945,10 +1896,6 @@ export class DocxDocument {
       regionMap: this._regionMap,
       chartEx: this._chartEx,
       tiff: this._tiff,
-    }).then(() => this._assertReadingPublication(generation)).catch(error => {
-      // A consumer's callback failure does not invalidate acquired page data.
-      if (!consumerFailed && !isDocxCallerInputError(error) && generation !== null && generation === (this._readingPublicationGeneration ?? 0)) this._invalidateReadingLayout(error);
-      throw error;
     });
   }
 
@@ -1971,45 +1918,36 @@ export class DocxDocument {
     pageIndex: number,
     opts: RenderPageToBitmapOptions = {},
   ): Promise<ImageBitmap> {
-    let consumerFailed = false;
-    const callback = opts.onTextRun;
-    const replay = callback && ((run: DocxTextRunInfo) => {
-      try { callback(run); } catch (error) { consumerFailed = true; throw error; }
-    });
-    return this._readingPublicationResult(async assertCurrent => {
-      const { onTextRun, ...wire } = opts;
-      const wireOpts: WireRenderPageOptions = {
-        ...this._withActiveView(wire),
-        dpr: wire.dpr ?? defaultDpr(),
-      };
-      if (this._mode === 'worker') {
-        // The selected date variant may have a different page count than default
-        // metadata, so the worker validates against the layout it actually paints.
-        // WHATWG HTML: an OffscreenCanvas constructed here snapshots this
-        // document's language and direction, while one constructed in the Worker
-        // has unknown language. Transferring it before any getContext() carries
-        // those inherited values, matching the main-mode surface below.
-        const canvas = new OffscreenCanvas(1, 1);
-        const res = await this._bridge.request(
-          (id) => ({ type: 'renderPage', id, pageIndex, opts: wireOpts, canvas }) satisfies RenderWorkerRequest,
-          [canvas],
-        );
-        const rendered = res as Extract<RenderWorkerResponse, { type: 'pageRendered' }>;
-        try {
-          // A successful response can race another request's revocation. Check
-          // before replaying any text, and again between reentrant callbacks.
-          assertCurrent();
-          if (replay) for (const r of rendered.runs) { assertCurrent(); replay(r); }
-        } catch (error) {
-          releaseOwnedBitmap(rendered.bitmap);
-          throw error;
-        }
-        return rendered.bitmap;
+    const { onTextRun, ...wire } = opts;
+    const wireOpts: WireRenderPageOptions = {
+      ...this._withActiveView(wire),
+      dpr: wire.dpr ?? defaultDpr(),
+    };
+    if (this._mode === 'worker') {
+      // The selected date variant may have a different page count than default
+      // metadata, so the worker validates against the layout it actually paints.
+      // WHATWG HTML: an OffscreenCanvas constructed here snapshots this
+      // document's language and direction, while one constructed in the Worker
+      // has unknown language. Transferring it before any getContext() carries
+      // those inherited values, matching the main-mode surface below.
+      const canvas = new OffscreenCanvas(1, 1);
+      const res = await this._bridge.request(
+        (id) => ({ type: 'renderPage', id, pageIndex, opts: wireOpts, canvas }) satisfies RenderWorkerRequest,
+        [canvas],
+      );
+      const rendered = res as Extract<RenderWorkerResponse, { type: 'pageRendered' }>;
+      try {
+        recordResourceDiagnostics(this, rendered.diagnostics);
+        if (onTextRun) for (const r of rendered.runs) onTextRun(r);
+      } catch (error) {
+        releaseOwnedBitmap(rendered.bitmap);
+        throw error;
       }
-      const off = new OffscreenCanvas(1, 1);
-      await this._renderPageWithTargetOwnership(off, pageIndex, { ...wireOpts, onTextRun: replay }, false);
-      return off.transferToImageBitmap();
-    }, releaseOwnedBitmap, () => consumerFailed);
+      return rendered.bitmap;
+    }
+    const off = new OffscreenCanvas(1, 1);
+    await this._renderPageWithTargetOwnership(off, pageIndex, { ...wireOpts, onTextRun }, false);
+    return off.transferToImageBitmap();
   }
 
   /**
@@ -2023,24 +1961,22 @@ export class DocxDocument {
     pageIndex: number,
     opts: CollectPageRunsOptions = {},
   ): Promise<DocxTextRunInfo[]> {
-    return this._readingPublicationResult(async () => {
-      const wireOpts: WireRenderPageOptions = { ...this._withActiveView(opts) };
-      if (this._mode === 'worker') {
-        // Keep collection validation on the same selected worker layout as paint.
-        const res = await this._bridge.request(
-          (id) => ({ type: 'collectRuns', id, pageIndex, opts: wireOpts }) satisfies RenderWorkerRequest,
-        );
-        return (res as Extract<RenderWorkerResponse, { type: 'runsCollected' }>).runs;
-      }
-      const runtime = documentLayoutRuntimeOf(this);
-      const services = runtime.services;
-      if (!services) throw new Error('Document layout services are not initialized');
-      return textRunsForSelectedPage(services, pageIndex, {
-        currentDate: wireOpts.currentDate,
-        defaultCurrentDateMs: runtime.defaultCurrentDateMs,
-        width: wireOpts.width,
-        showTrackedChanges: wireOpts.showTrackedChanges,
-      });
+    const wireOpts: WireRenderPageOptions = { ...this._withActiveView(opts) };
+    if (this._mode === 'worker') {
+      // Keep collection validation on the same selected worker layout as paint.
+      const res = await this._bridge.request(
+        (id) => ({ type: 'collectRuns', id, pageIndex, opts: wireOpts }) satisfies RenderWorkerRequest,
+      );
+      return (res as Extract<RenderWorkerResponse, { type: 'runsCollected' }>).runs;
+    }
+    const runtime = documentLayoutRuntimeOf(this);
+    const services = runtime.services;
+    if (!services) throw new Error('Document layout services are not initialized');
+    return textRunsForSelectedPage(services, pageIndex, {
+      currentDate: wireOpts.currentDate,
+      defaultCurrentDateMs: runtime.defaultCurrentDateMs,
+      width: wireOpts.width,
+      showTrackedChanges: wireOpts.showTrackedChanges,
     });
   }
 
@@ -2076,21 +2012,19 @@ export class DocxDocument {
     point: DocxPagePoint,
     opts: DocxElementContextOptions = {},
   ): Promise<DocxElementContext | null> {
-    return this._readingPublicationResult(async () => {
-      const viewOpts = this._withActiveView(opts);
-      if (this._mode === 'worker') {
-        const res = await this._bridge.request(
-          (id) => ({ type: 'hitTestElement', id, pageIndex, point, opts: viewOpts }) satisfies RenderWorkerRequest,
-        );
-        return (res as Extract<RenderWorkerResponse, { type: 'elementHit' }>).context;
-      }
-      const runtime = documentLayoutRuntimeOf(this);
-      const services = runtime.services;
-      if (!services) throw new Error('Document layout services are not initialized');
-      return hitTestSelectedDocxElementContext(services, pageIndex, point, {
-        ...viewOpts,
-        defaultCurrentDateMs: runtime.defaultCurrentDateMs,
-      });
+    const viewOpts = this._withActiveView(opts);
+    if (this._mode === 'worker') {
+      const res = await this._bridge.request(
+        (id) => ({ type: 'hitTestElement', id, pageIndex, point, opts: viewOpts }) satisfies RenderWorkerRequest,
+      );
+      return (res as Extract<RenderWorkerResponse, { type: 'elementHit' }>).context;
+    }
+    const runtime = documentLayoutRuntimeOf(this);
+    const services = runtime.services;
+    if (!services) throw new Error('Document layout services are not initialized');
+    return hitTestSelectedDocxElementContext(services, pageIndex, point, {
+      ...viewOpts,
+      defaultCurrentDateMs: runtime.defaultCurrentDateMs,
     });
   }
 }

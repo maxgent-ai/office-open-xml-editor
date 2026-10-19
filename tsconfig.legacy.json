@@ -1,0 +1,11 @@
+{
+  "extends": "./packages/legacy-office/tsconfig.json",
+  "compilerOptions": { "noEmit": false, "emitDeclarationOnly": true },
+  "include": [
+    "packages/legacy-office/src/legacy-doc.ts",
+    "packages/legacy-office/src/legacy-xls.ts",
+    "packages/legacy-office/src/legacy-ppt.ts",
+    "packages/legacy-office/src/vite-env.d.ts",
+    "packages/core/src/vite-env.d.ts"
+  ]
+}

@@ -777,8 +777,14 @@ mod tests {
                 }),
                 stretch: true,
                 tile: None,
-                alpha: Some(0.25),
+                // Both modulations stay ordered effects; none is reapplied
+                // through paint-time alpha.
+                alpha: None,
                 duotone: None,
+                blip_effects: vec![
+                    crate::blip::BlipEffect::AlphaModFix { amt: 0.5 },
+                    crate::blip::BlipEffect::AlphaModFix { amt: 0.5 },
+                ],
             })
         );
     }
@@ -814,7 +820,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_marker_block_fails_closed_for_multiple_duotone_effects() {
+    fn parse_marker_block_keeps_every_duotone_palette_in_order() {
         struct Images;
         impl ChartImageResolver for Images {
             fn resolve_image(
@@ -840,12 +846,27 @@ mod tests {
             &FixtureResolver,
             &Images,
         );
-        assert_eq!(paint, None);
+        let Some(ChartStyleFill::Image { blip_effects, .. }) = paint else {
+            panic!("picture fill must be retained: {paint:?}");
+        };
+        assert_eq!(
+            blip_effects,
+            vec![
+                crate::blip::BlipEffect::Duotone {
+                    clr1: "000000".into(),
+                    clr2: "FFFFFF".into()
+                },
+                crate::blip::BlipEffect::Duotone {
+                    clr1: "112233".into(),
+                    clr2: "DDEEFF".into()
+                },
+            ]
+        );
         assert_eq!(authored, Some(true));
     }
 
     #[test]
-    fn parse_marker_block_fails_closed_for_malformed_supported_effects() {
+    fn parse_marker_block_keeps_malformed_effects_as_explicit_diagnostics() {
         struct Images;
         impl ChartImageResolver for Images {
             fn resolve_image(
@@ -857,9 +878,12 @@ mod tests {
                     .then(|| ("xl/media/marker.png".to_owned(), "image/png".to_owned()))
             }
         }
-        for effect in [
-            "<a:alphaModFix amt=\"not-a-number\"/>",
-            "<a:duotone><a:srgbClr val=\"000000\"/></a:duotone>",
+        for (effect, name) in [
+            ("<a:alphaModFix amt=\"not-a-number\"/>", "alphaModFix"),
+            (
+                "<a:duotone><a:srgbClr val=\"000000\"/></a:duotone>",
+                "duotone",
+            ),
         ] {
             let xml = format!(
                 r#"<c:marker xmlns:c="{C_NS}" xmlns:a="{A_NS}" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
@@ -872,7 +896,17 @@ mod tests {
                 &FixtureResolver,
                 &Images,
             );
-            assert_eq!(paint, None, "effect must fail closed: {effect}");
+            // Retained as an Unsupported entry: paint fails closed with a
+            // typed error rather than omitting the authored fill.
+            let Some(ChartStyleFill::Image { blip_effects, .. }) = paint else {
+                panic!("malformed effect must stay explicit: {effect}");
+            };
+            assert_eq!(
+                blip_effects,
+                vec![crate::blip::BlipEffect::Unsupported {
+                    effect: name.into()
+                }]
+            );
             assert_eq!(authored, Some(true));
         }
     }

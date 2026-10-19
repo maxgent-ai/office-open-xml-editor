@@ -12,7 +12,6 @@ export {
   computePreparedLineFloatWindow,
   computePreparedLineFloatWindowWithDiagnostics,
   skipPastTopAndBottom,
-  widestFreeGap,
 } from './layout/float-wrap.js';
 
 export {

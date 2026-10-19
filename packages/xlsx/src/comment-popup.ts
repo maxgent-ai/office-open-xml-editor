@@ -16,7 +16,7 @@
  */
 
 /** Gap (CSS px) between the cell edge and the popup. */
-export const COMMENT_POPUP_GAP = 8;
+const COMMENT_POPUP_GAP = 8;
 
 export interface CommentPopupGeometry {
   /** The commented cell's on-screen rect (canvasArea space). */

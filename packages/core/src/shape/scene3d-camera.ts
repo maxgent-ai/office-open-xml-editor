@@ -1,3 +1,4 @@
+import { ownValue } from '../internal/own-key';
 /**
  * DrawingML 3D camera — perspective projection of a planar shape (Phase A).
  *
@@ -6,15 +7,12 @@
  *   - §20.1.5.11 `rot`    (CT_SphereCoords): lat / lon / rev rotation.
  *   - §20.1.10.47 ST_PresetCameraType: the 62 preset cameras.
  *
- * SPEC GAP (documented assumption — see CLAUDE.md "spec fidelity"):
- * ECMA-376 specifies the camera *model* (rotation order, fov meaning, the
- * preset enumeration) but gives **no numeric definitions** for the presets —
- * no base orientation, no per-preset field of view, no near/far. There is no
- * MS-OI29500 in this repo's spec/ tree either. The numeric constants below are
- * therefore the de-facto values from the OOXML implementer consensus, i.e. the
- * orientation/FOV PowerPoint emits and that LibreOffice's `oox` import maps in
- * oox/source/drawingml/scene3dcontext.cxx + the preset-camera table. They are
- * flagged here as a derived assumption, not a spec quotation.
+ * Fidelity boundary: ECMA-376 names presets and authored FOV/zoom/rotation,
+ * but does not supply a numerical preset table or a complete projection matrix.
+ * MS-OI29500 §2.1.1270 says non-perspective cameras ignore FOV. This module's
+ * modern preset table and projection are bounded Office observations, not
+ * normative definitions. Legacy presets retain their previous parallel fallback.
+ * See MODERN_SCENE_INCHES for the evidence and scene-scale limitation.
  *
  * Phase A scope: we model the shape as a flat z=0 rectangle (the picture / 2D
  * drawing) and compute the 2D homography that maps the un-projected rectangle
@@ -28,6 +26,19 @@
  * degrees (the parser already converted from 60000ths).
  */
 export interface CameraInput {
+  /**
+   * Projection coordinate units per document inch; renderer context, not an
+   * OOXML camera attribute. Defaults to 96 for CSS pixels. Use 72 for points,
+   * or multiply by the raster scale for device-space extrusion. Shape/group
+   * resizing changes geometry, not this document-to-render conversion.
+   */
+  unitsPerInch?: number;
+  /**
+   * Extent of the rendered solid along object −Z, in projection units. Bind
+   * once for all front/back/effect calls; scale with unitsPerInch for device
+   * coordinates. This is renderer context, not an OOXML camera attribute.
+   */
+  sceneDepth?: number;
   /** Preset camera name (`ST_PresetCameraType`). */
   prst: string;
   /** Field-of-view override in degrees. Omitted = preset default. */
@@ -58,9 +69,8 @@ export interface Scene3dQuad {
    * bounding-box top-left, in order: top-left, top-right, bottom-right,
    * bottom-left (matching the source rectangle (0,0)-(w,0)-(w,h)-(0,h)).
    *
-   * The quad is re-centred and scaled to fit the SAME bounding box (w×h) the
-   * un-projected shape occupied, so the renderer can blit a w×h offscreen
-   * bitmap onto it without changing the element's footprint.
+   * Projection is about the shape center and can extend beyond its original
+   * box; zoom is retained. Callers must allow the projected bitmap to overhang.
    */
   corners: [Vec2, Vec2, Vec2, Vec2];
   /**
@@ -82,13 +92,13 @@ export interface Scene3dQuad {
 type ProjectionKind = 'perspective' | 'orthographic';
 
 /**
- * Per-preset definition: the base camera orientation (applied before the user
- * `rot` override) and the default field of view in degrees for perspective
+ * Per-preset definition: the base camera orientation (replaced by an authored
+ * `rot` override) and the fallback field of view in degrees for perspective
  * presets. Orthographic / isometric presets use parallel projection (fov is
- * ignored). See the SPEC GAP note above for the source of these numbers.
+ * ignored). Modern oblique presets additionally shear the rotated depth.
  *
  * Base orientation is expressed as the same lat/lon/rev sphere coordinates the
- * file uses, in degrees, so it composes with the user rot in one place.
+ * file uses, in degrees; authored rot replaces it.
  */
 interface PresetDef {
   kind: ProjectionKind;
@@ -100,88 +110,126 @@ interface PresetDef {
   baseRev: number;
   /** Default field of view for perspective presets, degrees. */
   fovDeg: number;
+  /** Physical scene framing for modern perspective; absent = old fallback. */
+  sceneInches?: number;
+  /** Parallel depth shear in screen coordinates, after rotation. */
+  shearX: number;
+  shearY: number;
 }
 
-// Default perspective FOV for the relaxed presets, in degrees.
+// Observed Office behavior (Windows PowerPoint 16.0, synthetic flat rectangles):
+// all 44 modern ST_PresetCameraType values (20 isometric, 8 oblique, 15
+// perspective, orthographicFront) were checked with omitted/zero/(25,35,17)
+// rotations. All 15 perspective names also cover FOV 5/15/26/45/75/115 degrees,
+// rotations (0,30,0)/(30,0,0)/(25,35,17), aspects 0.7/1.5/2.5; zoom controls
+// cover 0.5/1/1.5. Max modern corner residuals by preset/lens/parallel-FOV/zoom
+// stratum: 0.688/0.556/0.496/0.503pt (0.75pt PDF extraction uncertainty).
+// The table's orientation hypothesis was independently checked against those
+// Office controls; the numeric angles are observations, not ECMA defaults.
 //
-// SPEC GAP (see the file header): ECMA-376 gives no per-preset FOV. This value
-// is CALIBRATED against the PowerPoint-rendered ground truth (sample-11.pdf
-// page 3, `perspectiveRelaxed` + an explicit <a:rot lat="-30" lon="20"
-// rev="-13">). Procedure: rasterise the PDF page at 200 DPI, detect the card's
-// four corners as the pixels extremal along x±y (robust for a convex quad),
-// normalise (centroid-subtract + mean-radius-divide), and minimise the summed
-// per-corner residual over (fov, rotation-sign, depth-sign). The composition
-// Rz(-rev)·Rx(-lat)·Ry(-lon) with depth = d − rz (see `buildRotation`) wins by
-// 5–9× over every other order/sign/depth variant, and its residual bottoms out
-// near **fov ≈ 26°** (top/bottom edge ratio 0.809 vs the PDF's 0.824, left/right
-// 0.927 vs 0.944). 26° is a *narrow* perspective — the earlier 45° vastly
-// over-foreshortened the card. The "relaxed" presets are gentle by design, so a
-// shallow FOV is expected.
-//
-// We have ground truth for `perspectiveRelaxed` only. The remaining perspective
-// presets share the same family/lens scale in PowerPoint's camera rig, so we
-// apply the same 26° default and flag it as a derived assumption; if a future
-// sample supplies a ground truth for another preset, recalibrate that entry.
-const DEFAULT_PERSP_FOV = 26;
+// Windows PowerPoint 16.0 controls additionally vary width 47.88..383.04pt,
+// aspect 0.7/2.5, shape-image-fill/picture, 2pt top bevel, 6pt extrusion,
+// xfrm rotation 0/30 and flipH, all 23 modern perspective/oblique presets,
+// wrapped lat/lon/rev, and identity/uniform/nonuniform/nested reflected groups.
+// Together with the lens packet above they support a FIXED physical numerator:
+// d = 6.28 * unitsPerInch / tan(FOV/2), independent of shape size/aspect/depth.
+// Microsoft Open Specifications support question 769795 (2022-03-23) gives
+// the 6.28 scene-unit formula; the inch mapping is an Office observation from
+// these varied-size controls, not an ECMA definition or a universal scene rule.
+// https://learn.microsoft.com/answers/questions/769795/
+// Group ext/chExt scale the leaf dimensions before projection (Annex L.4.3);
+// composed flips act before the camera and composed 2-D rotation after it.
+// Do not scale the physical distance with group/shape width or raster bounds.
+// All 1,005 original and 77,648 added modern controls fit a 2pt maximum corner
+// tolerance. Thin compressed PDF fiducials require higher-resolution edge
+// extraction; this tolerance is for measured front-plane correspondences.
+// Interior fiducials measure the z=0 texture plane, not bevel/wall silhouettes.
+// Omitted lenses are 45 degrees (80 for both heroic-extreme presets). Near-plane
+// nudging, larger depths and other group/angle combinations remain unvalidated
+// Office fidelity; cameraDistance below supplies a non-crossing library fallback.
+const MODERN_SCENE_INCHES = 6.28;
+
+// Legacy ST_PresetCameraType names intentionally keep the previous parallel
+// fallback, including their authored rotations/FOV handling; no legacy framing
+// candidate is adopted. In the same 1,572-control investigation, an off-axis
+// perspective candidate still missed by 41.425pt; 73 cases exceeded 2pt, all
+// legacy perspective. The 3.037pt preset and 4.232pt zoom maxima were legacy,
+// not modern failures. A free scale per case hid the error but supplied no rule.
+// Audit C camera-round2-residuals.json (local investigation evidence) retains
+// every control and the per-case/preset/stratum residual table. Legacy oblique
+// shear and legacy perspective framing remain explicit fidelity limitations.
+// Retained legacy production maxima by preset/lens/zoom: 24.023/65.689/35.969pt;
+// these are unresolved errors, not accepted tolerances.
+// Keep the old 26-degree lens only for the unrecognized perspective* fallback;
+// no measured modern preset uses it. These fallbacks are library policy.
+const LEGACY_PERSP_FOV = 26;
+
+function parallel(lat = 0, lon = 0, rev = 0, shearX = 0, shearY = 0): PresetDef {
+  return { kind: 'orthographic', baseLat: lat, baseLon: lon, baseRev: rev, fovDeg: 0, shearX, shearY };
+}
+
+function perspective(lat: number, lon: number, rev: number, fovDeg = 45): PresetDef {
+  return {
+    kind: 'perspective', baseLat: lat, baseLon: lon, baseRev: rev, fovDeg,
+    sceneInches: MODERN_SCENE_INCHES, shearX: 0, shearY: 0,
+  };
+}
 
 /**
- * Preset camera table. Only presets whose default orientation is implemented
- * are enumerated. Other standard `perspective*` presets still use perspective
- * projection when an authored `<a:rot>` supplies their orientation; unrelated
- * unknown/legacy presets fall back to `orthographicFront` without throwing.
- *
- * Orientation sign convention. Object axes: +X right, +Y down, +Z toward the
- * viewer (depth = d − z, so a corner with larger +z projects larger). The
- * DrawingML `rot` latitude/longitude/revolution rotate in the OPPOSITE sense to
- * a textbook right-handed rotation about those axes — `buildRotation` therefore
- * spins by the NEGATED file angle. In the resulting (file-angle) terms:
- *   - `lat` > 0 tips the TOP edge TOWARD the viewer (top edge widens / nears);
- *     `lat` < 0 tips the top AWAY (top edge recedes). sample-11 slide 3 uses
- *     lat = −30° → top recedes, matching the PDF (top/bottom width ≈ 0.82).
- *   - `lon` > 0 turns the RIGHT edge TOWARD the viewer (right edge nears / grows
- *     taller); `lon` < 0 turns the right edge away. sample-11 slide 3 uses
- *     lon = +20° → right edge nearer, matching the PDF (left/right ≈ 0.94).
- *   - `rev` > 0 spins the shape COUNTER-CLOCKWISE on screen; `rev` < 0 clockwise.
- * These directions are calibrated against sample-11.pdf p3 (see DEFAULT_PERSP_FOV)
- * and verified by the per-axis geometric unit tests. Preset base orientations
- * below are written as the same file-angle lat/lon/rev so they compose with the
- * file <a:rot> through one code path.
+ * ECMA-376 §20.1.10.47 names these modern presets; numerical definitions below
+ * are the bounded Office observations above. +X right, +Y down, +Z toward viewer.
+ * Explicit rot replaces these angles, retaining the preset's projection/shear.
  */
 const PRESETS: Record<string, PresetDef> = {
-  // ---- Orthographic / front-facing ----
-  orthographicFront: { kind: 'orthographic', baseLat: 0, baseLon: 0, baseRev: 0, fovDeg: 0 },
-
-  // ---- Perspective family (front + heroic + relaxed) ----
-  // perspectiveFront: looking straight on, but with perspective foreshortening.
-  perspectiveFront: { kind: 'perspective', baseLat: 0, baseLon: 0, baseRev: 0, fovDeg: DEFAULT_PERSP_FOV },
-  // perspectiveRelaxed / perspectiveRelaxedModerately: a gentle downward tilt so
-  // the top edge recedes. PowerPoint's "Perspective Relaxed" tips the shape
-  // back ~10–18°; "Moderately" is roughly half that. These are the de-facto
-  // angles (see SPEC GAP). The file-level <a:rot> overrides them when present.
-  perspectiveRelaxed: { kind: 'perspective', baseLat: 0, baseLon: 0, baseRev: 0, fovDeg: DEFAULT_PERSP_FOV },
-  perspectiveRelaxedModerately: { kind: 'perspective', baseLat: 0, baseLon: 0, baseRev: 0, fovDeg: DEFAULT_PERSP_FOV },
-  // perspectiveAbove / perspectiveBelow: camera looks down at / up at the shape.
-  // "Above" → the top edge recedes, so lat < 0 in the file-angle convention
-  // documented above (lat < 0 tips the top away); "Below" → top nears, lat > 0.
-  perspectiveAbove: { kind: 'perspective', baseLat: -20, baseLon: 0, baseRev: 0, fovDeg: DEFAULT_PERSP_FOV },
-  perspectiveBelow: { kind: 'perspective', baseLat: 20, baseLon: 0, baseRev: 0, fovDeg: DEFAULT_PERSP_FOV },
-  // Left / right facing perspective variants: shape turned about the Y axis.
-  // "Right" shows the right edge nearer (lon > 0); "Left" the left edge nearer
-  // (lon < 0). No ground truth for these — derived from the documented lon sign.
-  perspectiveLeft: { kind: 'perspective', baseLat: 0, baseLon: -20, baseRev: 0, fovDeg: DEFAULT_PERSP_FOV },
-  perspectiveRight: { kind: 'perspective', baseLat: 0, baseLon: 20, baseRev: 0, fovDeg: DEFAULT_PERSP_FOV },
+  isometricBottomDown: parallel(35.4, 314.7, 299.8),
+  isometricBottomUp: parallel(35.4, 45.3, 60.2),
+  isometricLeftDown: parallel(35, 45, 0),
+  isometricLeftUp: parallel(325, 45, 0),
+  isometricOffAxis1Left: parallel(18, 64, 0),
+  isometricOffAxis1Right: parallel(18, 334, 0),
+  isometricOffAxis1Top: parallel(301.3, 306.5, 57.6),
+  isometricOffAxis2Left: parallel(18, 26, 0),
+  isometricOffAxis2Right: parallel(18, 296, 0),
+  isometricOffAxis2Top: parallel(301.3, 53.5, 302.4),
+  isometricOffAxis3Bottom: parallel(58.7, 306.5, 302.4),
+  isometricOffAxis3Left: parallel(342, 64, 0),
+  isometricOffAxis3Right: parallel(342, 334, 0),
+  isometricOffAxis4Bottom: parallel(58.7, 53.5, 57.6),
+  isometricOffAxis4Left: parallel(342, 26, 0),
+  isometricOffAxis4Right: parallel(342, 296, 0),
+  isometricRightDown: parallel(325, 315, 0),
+  isometricRightUp: parallel(35, 315, 0),
+  isometricTopDown: parallel(324.6, 45.3, 299.8),
+  isometricTopUp: parallel(324.6, 314.7, 60.2),
+  obliqueBottom: parallel(0, 0, 0, 0, -0.3),
+  obliqueBottomLeft: parallel(0, 0, 0, 0.3 / Math.sqrt(2), -0.3 / Math.sqrt(2)),
+  obliqueBottomRight: parallel(0, 0, 0, -0.3 / Math.sqrt(2), -0.3 / Math.sqrt(2)),
+  obliqueLeft: parallel(0, 0, 0, 0.3, 0),
+  obliqueRight: parallel(0, 0, 0, -0.3, 0),
+  obliqueTop: parallel(0, 0, 0, 0, 0.3),
+  obliqueTopLeft: parallel(0, 0, 0, 0.3 / Math.sqrt(2), 0.3 / Math.sqrt(2)),
+  obliqueTopRight: parallel(0, 0, 0, -0.3 / Math.sqrt(2), 0.3 / Math.sqrt(2)),
+  orthographicFront: parallel(0, 0, 0),
+  perspectiveAbove: perspective(340, 0, 0),
+  perspectiveAboveLeftFacing: perspective(39.3, 14.3, 341.1),
+  perspectiveAboveRightFacing: perspective(39.3, 345.7, 18.9),
+  perspectiveBelow: perspective(20, 0, 0),
+  perspectiveContrastingLeftFacing: perspective(10.4, 43.9, 356.4),
+  perspectiveContrastingRightFacing: perspective(10.4, 316.1, 3.6),
+  perspectiveFront: perspective(0, 0, 0),
+  perspectiveHeroicExtremeLeftFacing: perspective(8.1, 34.5, 357.1, 80),
+  perspectiveHeroicExtremeRightFacing: perspective(8.1, 325.5, 2.9, 80),
+  perspectiveHeroicLeftFacing: perspective(349, 14.3, 2.6),
+  perspectiveHeroicRightFacing: perspective(349, 345.7, 357.4),
+  perspectiveLeft: perspective(0, 20, 0),
+  perspectiveRelaxed: perspective(309.6, 0, 0),
+  perspectiveRelaxedModerately: perspective(324.8, 0, 0),
+  perspectiveRight: perspective(0, 340, 0),
 };
 
-/**
- * Note on `perspectiveRelaxed` base orientation: the most common authoring path
- * (and the sample-11 case) supplies an explicit `<a:rot>` that fully defines the
- * orientation, so the preset's own base tilt is only a fallback. We keep the
- * base tilt at 0 for the relaxed presets and let the file's rot drive the
- * orientation; this is the spec-faithful choice because the rot override, when
- * present, *replaces* the preset rotation (§20.1.5.5: "rotation … overrides …
- * that further rotate the camera"). When no rot is present we fall back to the
- * front view rather than inventing an angle we cannot cite.
- */
+const UNKNOWN_PERSPECTIVE: PresetDef = {
+  ...perspective(0, 0, 0, LEGACY_PERSP_FOV), sceneInches: undefined,
+};
 
 /** 3×3 matrix in row-major order. */
 type Mat3 = [number, number, number, number, number, number, number, number, number];
@@ -231,19 +279,10 @@ function applyMat3(m: Mat3, x: number, y: number, z: number): [number, number, n
 }
 
 /**
- * Compose the full object rotation from a base orientation and an optional file
- * `rot` override. Per §20.1.5.11 the revolution is applied "about the axis as
- * the latitude and longitude coordinates", i.e. rev is the last (outermost)
- * rotation about the resulting view axis. We therefore compose
- *   R = Rz(−rev) · Rx(−lat) · Ry(−lon).
- * The angles are NEGATED: DrawingML's sphere-coordinate rotations spin in the
- * opposite sense to the textbook right-handed rotX/rotY/rotZ used here (the
- * y-down screen axis flips the apparent handedness). This negated composition
- * is the variant that fits the PowerPoint ground truth (sample-11.pdf p3) by
- * 5–9× over every alternative order/sign — see DEFAULT_PERSP_FOV for the fit.
- * When an explicit `<a:rot>` is present it supplies lat/lon/rev directly
- * (replacing the preset base, per the override semantics in §20.1.5.5); when
- * absent we use the preset's base angles.
+ * Object rotation Rz(-rev) · Rx(-lat) · Ry(-lon), with explicit rot replacing
+ * the modeled preset orientation. ECMA-376 §§20.1.5.5/.11 describe overrides;
+ * the modern-camera controls above support this matrix for their tested angles.
+ * It is not a complete legacy camera model (legacy perspective ignores rev).
  */
 function buildRotation(preset: PresetDef, rot: RotInput | undefined): Mat3 {
   const lat = rot ? rot.lat : preset.baseLat;
@@ -253,13 +292,52 @@ function buildRotation(preset: PresetDef, rot: RotInput | undefined): Mat3 {
 }
 
 /** Look up a preset while retaining the projection family encoded by its
- * standard name. An explicit `<a:rot>` replaces the missing preset orientation,
- * so the perspectiveFront lens is the neutral fallback for that family. */
+ * standard name. Unknown perspective names retain the old neutral lens/framing;
+ * other unknown and legacy names retain the old parallel fallback. */
 function presetDef(prst: string): PresetDef {
-  const known = PRESETS[prst];
+  const known = ownValue(PRESETS, prst);
   if (known) return known;
-  if (prst.startsWith('perspective')) return PRESETS.perspectiveFront;
+  if (prst.startsWith('perspective')) return UNKNOWN_PERSPECTIVE;
   return PRESETS.orthographicFront;
+}
+
+/** Shared by the face and extrusion so their coordinate scales agree. */
+function cameraDistance(
+  camera: CameraInput, def: PresetDef, rotation: Mat3,
+  w: number, h: number, surfaceDepth: number,
+): number {
+  const fovDeg = camera.fov ?? def.fovDeg;
+  // Retain the finite-lens guard; endpoint/near-plane fidelity is unvalidated.
+  const fov = (Math.max(1, Math.min(179, fovDeg)) * Math.PI) / 180;
+  const numerator = def.sceneInches === undefined
+    ? Math.max(w, h) / 2 : def.sceneInches * (camera.unitsPerInch ?? 96);
+  const distance = numerator / Math.tan(fov / 2);
+  // ECMA-376 §20.1.5.5 does not define camera near-plane handling. Microsoft
+  // Open Specifications support question 769795 describes moving the camera
+  // behind the scene with a gap of 2% of its projection-space z-volume.
+  // Windows PowerPoint 16.0 front-plane markers support the unchanged lens
+  // for flat 4in shape/picture and a 12in shape with 8in receding extrusion
+  // (lon60/FOV90, no bevel); raised-bevel probes remain unresolved.
+  // A 20in crossing shape and a shared-camera group FAIL Office PDF export;
+  // they establish no numerical nudge, framing or scene-ownership rule.
+  //
+  // Outside that measured domain this is LIBRARY POLICY, not an Office fit:
+  // use the rendered leaf solid's rotated bounds, move only along view +Z,
+  // and use the moved distance in the numerator too (retain z=0 framing).
+  // Do not infer shared-group scene bounds from flattened leaf geometry.
+  // Bevel shading is baked onto these planes, not independent raised geometry.
+  const depth = Math.max(0, camera.sceneDepth ?? 0, surfaceDepth);
+  const halfRange = Math.abs(rotation[6]) * w / 2 + Math.abs(rotation[7]) * h / 2;
+  const rearZ = -rotation[8] * depth;
+  const nearest = halfRange + Math.max(0, rearZ);
+  const volume = 2 * halfRange + Math.abs(rearZ);
+  // Mathematical guard: the solid contains z=0, hence volume >= nearest >= 0.
+  // If nearest is positive the 2% gap dominates roundoff; if it is zero the
+  // positive lens distance already clears every point. Thus 1-rz/d >= 1/51
+  // throughout the solid (perspective magnification <= 51 before zoom).
+  // One scene distance preserves a convex projective map instead of clamping
+  // corners separately.
+  return Math.max(distance, nearest + .02 * volume);
 }
 
 /**
@@ -271,8 +349,10 @@ function presetDef(prst: string): PresetDef {
  * @param camera  parsed <a:camera> (prst / fov / zoom / rot, angles in degrees).
  * @param w       shape width in CSS pixels.
  * @param h       shape height in CSS pixels.
+ * @param surfaceDepth back surface distance along object −Z, in the same units.
+ *                MS-OI29500 §2.1.1268 places bevelB at the extrusion base.
  */
-export function computeScene3dQuad(camera: CameraInput, w: number, h: number): Scene3dQuad {
+export function computeScene3dQuad(camera: CameraInput, w: number, h: number, surfaceDepth = 0): Scene3dQuad {
   const def = presetDef(camera.prst);
   const R = buildRotation(def, camera.rot);
 
@@ -290,9 +370,7 @@ export function computeScene3dQuad(camera: CameraInput, w: number, h: number): S
     };
   }
 
-  // Source rectangle corners centred at the origin in shape-local space, with
-  // +X right, +Y down. We work in a unit-ish space (half-extents) so the FOV /
-  // camera distance is independent of pixel size, then rescale at the end.
+  // Source corners centred at the origin, in the caller's coordinate units.
   const hw = w / 2;
   const hh = h / 2;
   const srcCorners: Array<[number, number]> = [
@@ -304,33 +382,22 @@ export function computeScene3dQuad(camera: CameraInput, w: number, h: number): S
 
   const zoom = camera.zoom ?? 1;
 
-  // Camera distance for perspective. The shape's larger half-extent subtends
-  // the full field of view at the camera plane: d = halfMax / tan(fov/2). This
-  // is the standard pinhole relation; it keeps the shape filling the frame
-  // before tilting, matching how PowerPoint frames the un-tilted shape.
-  const halfMax = Math.max(hw, hh);
   let projected: Array<[number, number]>;
 
   if (def.kind === 'perspective') {
-    const fovDeg = camera.fov ?? def.fovDeg;
-    const fov = (Math.max(1, Math.min(179, fovDeg)) * Math.PI) / 180;
-    const d = halfMax / Math.tan(fov / 2);
+    const d = cameraDistance(camera, def, R, w, h, surfaceDepth);
     projected = srcCorners.map(([sx, sy]) => {
-      const [rx, ry, rz] = applyMat3(R, sx, sy, 0);
+      const [rx, ry, rz] = applyMat3(R, sx, sy, -surfaceDepth);
       // Camera at +Z = d looking toward -Z (origin). A point at object-z rz is
       // at camera-relative depth (d - rz); perspective divide by that depth.
-      const depth = d - rz;
-      // Guard against a corner crossing the camera plane (shouldn't happen for
-      // sane tilts, but clamp to keep the map finite).
-      const safeDepth = Math.abs(depth) < 1e-6 ? 1e-6 * Math.sign(depth || 1) : depth;
-      const f = d / safeDepth;
+      const f = d / (d - rz);
       return [rx * f, ry * f] as [number, number];
     });
   } else {
-    // Parallel (orthographic / isometric) projection: drop z after rotation.
+    // Parallel projection, including the oblique preset's directional depth shear.
     projected = srcCorners.map(([sx, sy]) => {
-      const [rx, ry] = applyMat3(R, sx, sy, 0);
-      return [rx, ry] as [number, number];
+      const [rx, ry, rz] = applyMat3(R, sx, sy, -surfaceDepth);
+      return [rx + rz * def.shearX, ry + rz * def.shearY] as [number, number];
     });
   }
 
@@ -370,12 +437,50 @@ export function computeScene3dQuad(camera: CameraInput, w: number, h: number): S
 /**
  * True when a scene3d camera will visibly change the shape, i.e. the renderer
  * should take the projection path. A camera whose preset is unknown/front-facing
- * with no rot (or an all-zero rot) is the identity and can be skipped.
+ * with no rot (or an all-zero rot) can be skipped when its depth geometry adds
+ * no visible footprint. `depth` uses the same coordinate units as w and h.
  */
-export function isScene3dNonIdentity(camera: CameraInput): boolean {
-  // A 1×1 probe is enough to detect identity vs. projection; the result scales.
-  const { isIdentity } = computeScene3dQuad(camera, 1000, 1000);
-  return !isIdentity;
+export function isScene3dNonIdentity(camera: CameraInput, w?: number, h?: number, depth = 0): boolean {
+  // Perspective framing depends on aspect, so a square probe can miss a visible
+  // projection on a tall shape. Renderers supply their actual dimensions.
+  if (w !== undefined && h !== undefined) {
+    if (w <= 0 || h <= 0) return false;
+    // The front plane alone is insufficient: default oblique cameras preserve
+    // it but shear the extrusion base (§20.1.5.12). Test both ends of the solid
+    // with the same geometry tolerance. A modern face-on perspective camera
+    // contracts the rear plane inside the front: that hidden surface does not
+    // expose a wall and must not introduce another front-face resampling.
+    // The planar compositor does not draw independent translucent rear faces.
+    camera = { ...camera, sceneDepth: Math.max(camera.sceneDepth ?? 0, depth) };
+    if (!computeScene3dQuad(camera, w, h).isIdentity) return true;
+    if (depth <= 0) return false;
+    const back = computeScene3dQuad(camera, w, h, depth);
+    if (presetDef(camera.prst).sceneInches === undefined) return !back.isIdentity;
+    const eps = 1e-3 * Math.max(w, h);
+    return back.corners.some(p => p.x < -eps || p.y < -eps || p.x > w + eps || p.y > h + eps);
+  }
+  // Geometry-free callers use a conservative mathematical identity test instead
+  // of borrowing a shape's numerical pixel tolerance.
+  const def = presetDef(camera.prst), R = buildRotation(def, camera.rot);
+  const terms = def.kind === 'perspective'
+    ? [R[0] - 1, R[1], R[3], R[4] - 1, R[6], R[7]]
+    : [R[0] + def.shearX * R[6] - 1, R[1] + def.shearX * R[7],
+       R[3] + def.shearY * R[6], R[4] + def.shearY * R[7] - 1];
+  if (depth > 0) {
+    if (def.kind === 'perspective') return true;
+    terms.push(R[2] + def.shearX * R[8], R[5] + def.shearY * R[8]);
+  }
+  return (camera.zoom ?? 1) !== 1 || terms.some(value => Math.abs(value) > 1e-12);
+}
+
+/** Internal surface frame for the bitmap bevel compositor. Back-face selection
+ * uses the camera's viewing direction (including parallel oblique shear), not
+ * a rotation-angle threshold. ECMA §§20.1.5.3–4 assign separate back/front faces.
+ */
+export function scene3dSurfaceFrame(camera: CameraInput) {
+  const def = presetDef(camera.prst), rotation = buildRotation(def, camera.rot);
+  const facing = rotation[8] - def.shearX * rotation[2] - def.shearY * rotation[5];
+  return { rotation, backFacing: facing < 0 };
 }
 
 /**
@@ -399,28 +504,22 @@ export function computeDepthOffset(camera: CameraInput, w: number, h: number, de
   const R = buildRotation(def, camera.rot);
   if (w <= 0 || h <= 0 || depthPx === 0) return { x: 0, y: 0 };
 
-  const hw = w / 2;
-  const hh = h / 2;
-  const halfMax = Math.max(hw, hh);
   const zoom = camera.zoom ?? 1;
+  const distance = def.kind === 'perspective'
+    ? cameraDistance(camera, def, R, w, h, depthPx) : 0;
 
   // Project the centre at object-z 0 and at object-z −depthPx, take the screen
-  // delta. Mirrors the per-corner math in computeScene3dQuad (same rotation,
-  // same perspective divide), but without the box refit — we only need the
-  // direction/scale of the displacement, which the caller applies in the
-  // refitted offscreen space (a close approximation for small depths).
+  // delta. Use the same lens, distance and parallel shear as the front face.
+  // unitsPerInch must use the same render scale as w/h/depth, keeping the
+  // device-space extrusion consistent with the CSS-space face. This remains
+  // a centre approximation to the wall sweep.
   const project = (oz: number): [number, number] => {
     const [rx, ry, rz] = applyMat3(R, 0, 0, oz);
     if (def.kind === 'perspective') {
-      const fovDeg = camera.fov ?? def.fovDeg;
-      const fov = (Math.max(1, Math.min(179, fovDeg)) * Math.PI) / 180;
-      const d = halfMax / Math.tan(fov / 2);
-      const depth = d - rz;
-      const safe = Math.abs(depth) < 1e-6 ? 1e-6 * Math.sign(depth || 1) : depth;
-      const f = d / safe;
+      const f = distance / (distance - rz);
       return [rx * f * zoom, ry * f * zoom];
     }
-    return [rx * zoom, ry * zoom];
+    return [(rx + rz * def.shearX) * zoom, (ry + rz * def.shearY) * zoom];
   };
   const [x0, y0] = project(0);
   const [x1, y1] = project(-depthPx);

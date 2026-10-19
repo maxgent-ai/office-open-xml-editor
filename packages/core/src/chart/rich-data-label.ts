@@ -1,5 +1,6 @@
 import type { ChartTextRun } from '../types/chart.js';
 import { chartTextFontSizePx } from './layout.js';
+import { chartFaceWithFallback } from './shared/fonts.js';
 
 export interface RichDataLabelOptions {
   runs: readonly ChartTextRun[];
@@ -64,7 +65,7 @@ export function resolveRichDataLabelBlock(
     const safeFace = authoredFace && !authoredFace.startsWith('+') ? authoredFace : null;
     const fontFamily = authoredFace && options.fontFamilyForFace
       ? options.fontFamilyForFace(authoredFace)
-      : safeFace ? `"${safeFace}", Calibri, Arial, sans-serif` : options.fontFamily;
+      : safeFace ? chartFaceWithFallback(safeFace) : options.fontFamily;
     const italic = source.italic ?? options.fallbackItalic ?? false;
     const font = `${italic ? 'italic ' : ''}${(source.bold ?? options.fallbackBold) ? 'bold ' : ''}${fontSizePx}px ${fontFamily}`;
     const baselineShiftPx = (source.baseline ?? options.fallbackBaseline ?? 0) * fontSizePx;

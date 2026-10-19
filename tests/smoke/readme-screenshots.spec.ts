@@ -3,7 +3,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 // Generates PNG screenshots referenced from the root README.
-// Run manually: `npx playwright test readme-screenshots --reporter=list`
+// Run manually: `pnpm screenshots:readme` (the smoke config's Storybook server,
+// Chrome only, so the README images never come from WebKit or Firefox).
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);

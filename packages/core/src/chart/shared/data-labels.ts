@@ -379,7 +379,7 @@ export function drawBoundedDataLabelText(
 /** Measure and paint a data-label legend key and its optional text as one
  * bounded block. Existing legend swatch geometry is reused verbatim, while the
  * shared data-label placement resolver owns clipping and manual layout. */
-export function drawBoundedDataLabelWithLegendKey(
+function drawBoundedDataLabelWithLegendKey(
   ctx: CanvasRenderingContext2D,
   text: string,
   anchor: DataLabelAnchor,
@@ -642,7 +642,7 @@ export function drawCategoryDataLabels(
 }
 
 
-export function chartLabelBoxPaintComponents(
+function chartLabelBoxPaintComponents(
   box: ChartLabelBox | null | undefined,
   imageLookup: ChartImageLookup | undefined,
   destinationWidth: number,

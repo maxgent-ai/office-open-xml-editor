@@ -9,7 +9,7 @@ import type { FitTextRun } from './fit-text.js';
 // several CONSECUTIVE runs carry the SAME `w:id`, they are treated as ONE fit
 // region whose combined contents fill `w:val` together (the spec's example: a
 // 1-inch region split across three runs occupies one inch in total, not one inch
-// each). An id-less fitText run never links to a neighbour. A non-fitText run
+// each). An id-less fitText run has id 0 (WORD_FIT_TEXT_OMITTED_ID_LINKING). A non-fitText run
 // breaks adjacency, so two same-id runs separated by a plain run do NOT merge.
 //
 // Word's observed geometry (private fixture, Word-generated PDF): the glyphs keep
@@ -33,7 +33,7 @@ const EM = 12;
 function fitRun(
   n: number,
   fitTextValTwips: number,
-  fitTextId: number | undefined,
+  fitTextId: number | string | undefined,
   extra: Partial<FitTextRun> = {},
 ): FitTextRun {
   return {
@@ -145,16 +145,27 @@ describe('groupFitTextRegions — ECMA-376 §17.3.2.14 fit-region math', () => {
     expect(regions[1].start).toBe(1);
   });
 
-  it('treats an id-less fitText run as a standalone region (never links, even to another id-less run)', () => {
-    const regions = groupFitTextRegions(
-      [fitRun(3, 2400, undefined), fitRun(3, 2400, undefined)],
+  it('links contiguous id-less and id-0 fitText runs as id 0 (WORD_FIT_TEXT_OMITTED_ID_LINKING)', () => {
+    const linked = groupFitTextRegions(
+      [fitRun(3, 2400, undefined), fitRun(3, 2400, undefined), fitRun(3, 2400, '0')],
       1,
     );
-    expect(regions).toHaveLength(2);
-    expect(regions[0].start).toBe(0);
-    expect(regions[0].end).toBe(1);
-    expect(regions[1].start).toBe(1);
-    expect(regions[1].end).toBe(2);
+    expect(linked.map((r) => [r.start, r.end])).toEqual([[0, 3]]);
+    // Another id, or a plain run between them, still separates regions.
+    const separate = groupFitTextRegions(
+      [fitRun(3, 2400, undefined), fitRun(3, 2400, 7), fitRun(3, 2400, undefined)],
+      1,
+    );
+    expect(separate.map((r) => [r.start, r.end])).toEqual([[0, 1], [1, 2], [2, 3]]);
+  });
+
+  it('compares integer ids by value at arbitrary precision', () => {
+    const regions = groupFitTextRegions(
+      [fitRun(3, 2400, '0012345678901234567890'), fitRun(3, 2400, '12345678901234567890'),
+        fitRun(3, 2400, '12345678901234567891')],
+      1,
+    );
+    expect(regions.map((r) => [r.start, r.end])).toEqual([[0, 2], [2, 3]]);
   });
 
   it('converts w:val twips → px through the layout scale', () => {

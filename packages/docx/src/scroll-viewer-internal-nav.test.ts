@@ -1,5 +1,4 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
-import { DocxScrollViewer } from './scroll-viewer.js';
 import { publishDocxLayout } from './document-layout-events.js';
 import { installDom, makeContainer, makeBorrowedDocxScrollViewer, FakeDocxEngine, type FakeEl } from './scroll-viewer-test-dom.js';
 import type { DocxTextRunInfo } from './renderer';

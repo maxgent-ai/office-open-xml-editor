@@ -116,6 +116,7 @@ const STREAMED_XML_CONTEXT_BYTES: usize = 4 * 1024 * 1024;
 pub(super) enum WorksheetProjectorLimitKind {
     XmlEventBytes,
     XmlContextBytes,
+    XmlNamespaceDeclarations,
     XmlDepth,
     RowProjectionBytes,
     WorksheetShellBytes,
@@ -126,6 +127,7 @@ impl WorksheetProjectorLimitKind {
         match self {
             Self::XmlEventBytes => "xml-event-bytes",
             Self::XmlContextBytes => "xml-context-bytes",
+            Self::XmlNamespaceDeclarations => "xml-namespace-declarations",
             Self::XmlDepth => "xml-depth",
             Self::RowProjectionBytes => "row-projection-bytes",
             Self::WorksheetShellBytes => "worksheet-shell-bytes",
@@ -229,6 +231,9 @@ fn report_projector_limit(
     let common_kind = match kind {
         WorksheetProjectorLimitKind::XmlEventBytes => HardResourceLimitKind::XmlEventBytes,
         WorksheetProjectorLimitKind::XmlContextBytes => HardResourceLimitKind::XmlContextBytes,
+        WorksheetProjectorLimitKind::XmlNamespaceDeclarations => {
+            HardResourceLimitKind::XmlNamespaceDeclarations
+        }
         WorksheetProjectorLimitKind::XmlDepth => HardResourceLimitKind::XmlNestingDepth,
         WorksheetProjectorLimitKind::RowProjectionBytes => {
             HardResourceLimitKind::WorksheetRowProjectionBytes
@@ -1159,6 +1164,14 @@ where
                     observed,
                 ));
             }
+            Err(BoundedXmlReadError::NamespaceDeclarationLimit { limit, observed }) => {
+                return Err(worksheet_projector_limit(
+                    WorksheetProjectorLimitKind::XmlNamespaceDeclarations,
+                    self.part.as_deref(),
+                    limit,
+                    observed,
+                ));
+            }
             Err(BoundedXmlReadError::Xml(error)) => {
                 #[cfg(test)]
                 {
@@ -2013,6 +2026,35 @@ mod worksheet_streaming_tests {
             }
         );
         assert_eq!(projector.max_event_bytes(), STREAMED_XML_EVENT_BYTES);
+    }
+
+    #[test]
+    fn namespace_count_limit_is_typed_and_latched() {
+        use ooxml_common::resource::{OoxmlFormat, ResourceGovernor};
+        let declarations = (0..257)
+            .map(|n| format!(r#" xmlns:n{n}="urn:{n}""#))
+            .collect::<String>();
+        let xml = format!(
+            r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"{declarations}><sheetData/></worksheet>"#
+        );
+        let governor = ResourceGovernor::from_wasm(OoxmlFormat::Xlsx, None, None, None);
+        let scope = governor.scope("parse");
+        let mut projector = WorksheetRowProjector::new(Cursor::new(xml.as_bytes()), &[], &[]);
+        let error = projector.next_item().unwrap_err().to_string();
+        let payload: serde_json::Value = serde_json::from_str(
+            error
+                .strip_prefix("OOXML_RESOURCE_LIMIT:")
+                .expect("typed namespace limit"),
+        )
+        .unwrap();
+        assert_eq!(payload["details"]["violation"]["resource"], "xml-context");
+        assert_eq!(payload["details"]["violation"]["metric"], "declarations");
+        assert_eq!(payload["details"]["violation"]["limit"], 256);
+        assert_eq!(payload["details"]["violation"]["observed"], 257);
+        assert_eq!(
+            scope.resource_limit_error().as_deref(),
+            Some(error.as_str())
+        );
     }
 
     #[test]

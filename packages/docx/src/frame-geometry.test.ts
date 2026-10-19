@@ -133,7 +133,9 @@ describe('legacy float transport facts', () => {
     })).toThrow('Floating-table transport omitted tblOverlap');
   });
 
-  it('keeps a displaced frame wrap band within the page-right boundary', () => {
+  // Windows Word 16.0.20430 (#1896 controls): a frame keeps its position over
+  // a frame of another paragraph.
+  it('keeps a frame at its resolved position over a frame of another paragraph', () => {
     const st = makeState({
       pageWidth: 100,
       floats: [{
@@ -174,8 +176,7 @@ describe('legacy float transport facts', () => {
       avoidOverlap: true,
     });
 
-    expect(placed).toMatchObject({ imageX: 20, imageY: 50 });
-    expect(placed.xRight).toBeLessThanOrEqual(100.5);
+    expect(placed).toMatchObject({ imageX: 20, imageY: 10 });
   });
 
   it('keeps an overlap-permitted DrawingML anchor at its resolved position (issue #1623)', () => {

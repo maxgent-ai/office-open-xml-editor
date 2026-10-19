@@ -4,7 +4,7 @@ import Nav from '../../components/Nav.astro';
 import SiteFooter from '../../components/SiteFooter.astro';
 import { Code } from 'astro:components';
 import { codeThemes } from '../../lib/code-theme';
-import { announcements, formatAnnouncementDate, type Announcement } from '../../lib/announcements';
+import { announcements, formatAnnouncementDate, inlineSegments, type Announcement } from '../../lib/announcements';
 
 export function getStaticPaths() {
   return announcements.map((announcement) => ({
@@ -73,8 +73,8 @@ const sectionId = (title: string): string => title
                 {section.rationale && <><dt>Why</dt><dd>{section.rationale}</dd></>}
               </dl>
             )}
-            {section.paragraphs.map((paragraph) => <p>{paragraph}</p>)}
-            {section.bullets && <ul>{section.bullets.map((bullet) => <li>{bullet}</li>)}</ul>}
+            {section.paragraphs.map((paragraph) => <p>{inlineSegments(paragraph).map(({ text, code }) => code ? <code>{text}</code> : text)}</p>)}
+            {section.bullets && <ul>{section.bullets.map((bullet) => <li>{inlineSegments(bullet).map(({ text, code }) => code ? <code>{text}</code> : text)}</li>)}</ul>}
             {section.examples?.map((example) => (
               <div class="article-example">
                 <h3>{example.title}</h3>
@@ -122,6 +122,7 @@ const sectionId = (title: string): string => title
   .article-module-list { display: flex; flex-wrap: wrap; gap: 5px 0; }
   .article-module + .article-module { margin-left: .65ch; }
   .article-module-list code { color: var(--text); font: 12px var(--mono); }
+  .article-body p code, .article-body li code { padding: .08em .34em; border: 1px solid var(--border); border-radius: 4px; background: var(--code-bg); color: var(--code-keyword); font: 500 .9em/1.45 var(--mono); overflow-wrap: anywhere; }
   .article-body p, .article-body li { color: var(--text-dim); font-size: 17px; line-height: 1.75; }
   .article-body ul { padding-left: 20px; }
   .article-body li { padding-left: 8px; margin: 10px 0; }

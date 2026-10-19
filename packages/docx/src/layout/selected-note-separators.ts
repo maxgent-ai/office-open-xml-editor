@@ -14,7 +14,7 @@ import type { DocParagraph } from '../types.js';
  * story whose one paragraph formats its single §17.11.23/§17.11.1 mark run.
  *
  * Identity: one canonical `selected:*` root per role inside the `footnote`
- * story kind. These are library identities, distinct from native MS-DOC
+ * story kind. These are library identities, distinct from producer-supplied
  * `reserved:*` stories and never DOCX note ids. A root is shared by every
  * page occurrence and never joins note numbering.
  *

@@ -1,4 +1,5 @@
 import type { DrawingMLCustomDashSegment } from '../types/common.js';
+import { ownValue } from '../internal/own-key.js';
 
 /**
  * Shared border / line dash-pattern core.
@@ -85,7 +86,7 @@ const DOCX_BORDER_RELATIVE: Record<string, RelativeDashPattern> = {
  * stroke as a continuous line.
  */
 export function docxBorderDashArray(style: string, lw: number): number[] {
-  const relative = DOCX_BORDER_RELATIVE[style];
+  const relative = ownValue(DOCX_BORDER_RELATIVE, style);
   return relative ? dashArray(relative, lw) : [];
 }
 
@@ -122,7 +123,7 @@ const XLSX_BORDER_PX: Record<string, RelativeDashPattern> = {
  * see the table doc above). Returns `[]` for solid styles.
  */
 export function xlsxBorderDashArray(style: string): number[] {
-  const px = XLSX_BORDER_PX[style];
+  const px = ownValue(XLSX_BORDER_PX, style);
   return px ? dashArray(px, 1) : [];
 }
 
@@ -161,7 +162,7 @@ const PPTX_PRESET_DASH_RELATIVE: Record<string, RelativeDashPattern> = {
  * for any unknown value (table miss ⇒ solid line).
  */
 export function pptxPresetDashArray(style: string, lineW: number): number[] {
-  const relative = PPTX_PRESET_DASH_RELATIVE[style];
+  const relative = ownValue(PPTX_PRESET_DASH_RELATIVE, style);
   return relative ? dashArray(relative, lineW) : [];
 }
 
@@ -254,6 +255,6 @@ const PPTX_UNDERLINE_RELATIVE: Record<string, RelativeDashPattern> = {
  * underline types (sng / dbl / wavy* / unknown).
  */
 export function pptxUnderlineDashArray(style: string, lineW: number): number[] {
-  const relative = PPTX_UNDERLINE_RELATIVE[style];
+  const relative = ownValue(PPTX_UNDERLINE_RELATIVE, style);
   return relative ? dashArray(relative, lineW) : [];
 }

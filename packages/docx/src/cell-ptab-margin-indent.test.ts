@@ -3,7 +3,6 @@ import { renderDocumentToCanvas } from './renderer.js';
 import type {
   BodyElement,
   CellElement,
-  DocParagraph,
   DocRun,
   DocTable,
   DocTableCell,

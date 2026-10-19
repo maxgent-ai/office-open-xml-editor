@@ -24,12 +24,18 @@ const wasm = fileURLToPath(new URL('packages/docx/src/wasm/docx_parser_bg.wasm',
 
 const ready = existsSync(sample) && existsSync(wasm);
 
+// Each case spawns real `node` processes that load and initialise the parser
+// WASM (the non-OOXML case spawns three in sequence, ~1.6 s on an idle
+// machine). Process start-up dominates and stretches badly on loaded CI
+// runners, where the default 5 s budget has timed out.
+const CLI_TIMEOUT_MS = 30_000;
+
 describe('ooxml-md CLI', () => {
   it.skipIf(!ready)('prints markdown to stdout for a .docx', () => {
     const out = execFileSync('node', [bin, sample], { encoding: 'utf8' });
     expect(out.length).toBeGreaterThan(0);
     expect(out).toContain('CANOPY');
-  });
+  }, CLI_TIMEOUT_MS);
 
   const parsersReady = ['docx', 'xlsx', 'pptx'].every((format) =>
     existsSync(fileURLToPath(new URL(`packages/${format}/src/wasm/${format}_parser_bg.wasm`, root))));
@@ -55,7 +61,7 @@ describe('ooxml-md CLI', () => {
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
-  });
+  }, CLI_TIMEOUT_MS);
 
   it('prints usage and exits non-zero with no arguments', () => {
     let code = 0;

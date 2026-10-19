@@ -159,6 +159,51 @@ codex "Show me all formulas in Sheet1 of /Users/me/Documents/model.xlsx"
 
 ---
 
+## Restricting file access (allowed roots)
+
+Path-based tools take their `path` argument from the AI agent, and an agent can
+be steered by the content of the documents it reads. By default a manually
+configured server reads any local file it is given. To confine it, list the
+directories it may read:
+
+```json
+{
+  "mcpServers": {
+    "ooxml": {
+      "type": "stdio",
+      "command": "ooxml-mcp-server",
+      "args": ["--allowed-root", "/Users/me/Documents/reports"]
+    }
+  }
+}
+```
+
+- `--allowed-root <DIR>` (or `--allowed-root=<DIR>`) may be repeated.
+- The `OOXML_MCP_ALLOWED_ROOTS` environment variable adds roots separated like
+  `PATH` (`:` on macOS/Linux, `;` on Windows). CLI and environment roots are
+  combined.
+- When any root is configured, each requested path is canonicalized (`..` and
+  every symlink are resolved) and must lie inside a canonicalized root.
+  Anything else fails with `path_outside_allowed_roots` before the file is
+  opened. The same error is returned for paths that do not exist, so the scope
+  does not reveal which files exist outside it.
+- On Windows, UNC paths (`\\server\share\...`, `//server/share/...`,
+  `\\?\UNC\...`) and device namespaces (`\\.\...`, `\\?\` forms other than a
+  drive, `\??\...`) are rejected before any file-system access, so a request
+  cannot make the server open an SMB connection. A UNC path is accepted only
+  when it lies inside a configured root on that same share.
+- Roots must be absolute paths. A relative root, or one that cannot be
+  resolved at startup, is skipped with a warning; the
+  scope stays in force, so if no root is valid every path is rejected.
+- Unrecognized command-line arguments are rejected, so a misspelt flag cannot
+  silently leave the scope off.
+
+The VS Code extension passes the workspace's local folders as allowed roots
+(see `ooxmlViewer.mcpServer.restrictToWorkspaceFolders` in the extension
+README).
+
+---
+
 ## Troubleshooting: command not found in MCP config
 
 Some launchers (VS Code, Codex) do not inherit your shell `PATH`. If the server fails to start with a "command not found" error, use the full path to the binary instead of just the name:

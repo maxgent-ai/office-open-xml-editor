@@ -150,7 +150,7 @@ const headFamily = (font: string) => /"([^"]+)"/.exec(font)?.[1] ?? font;
 
 describe('numbering marker + body eastAsia font routing (§17.3.2.26 / §17.9.6)', () => {
   it('moves a following paragraph by the selected marker and body line-box union', async () => {
-    const renderedSuccessorTop = async (markerSizePt: number | null): Promise<number> => {
+    const renderedSuccessorTop = async (markerSizePt: number | null, compatibilityMode = 15): Promise<number> => {
       const { canvas } = makeRecordingCanvas();
       const first = {
         ...(headingDoc(null).body[0] as DocParagraph),
@@ -168,7 +168,8 @@ describe('numbering marker + body eastAsia font routing (§17.3.2.26 / §17.9.6)
         lineSpacing: null,
         runs: [{ type: 'text', ...run('Next', 'Text Face', 'Text Face'), fontSize: 10 }],
       };
-      const model = { ...headingDoc(null), body: [
+      const base = headingDoc(null);
+      const model = { ...base, settings: { ...base.settings, compatibilityMode }, body: [
         { type: 'paragraph' as const, ...first },
         { type: 'paragraph' as const, ...successor },
       ] } as DocxDocumentModel;
@@ -184,7 +185,11 @@ describe('numbering marker + body eastAsia font routing (§17.3.2.26 / §17.9.6)
     const smallMarker = await renderedSuccessorTop(8);
     const tallMarker = await renderedSuccessorTop(20);
     expect(smallMarker).toBeCloseTo(plain);
-    expect(tallMarker - plain).toBeCloseTo(10);
+    // Windows Word 16.0 (#1884): the 20pt marker raises the line by its 16pt
+    // ascent over the 8pt text ascent; its descent does not join the union.
+    expect(tallMarker - plain).toBeCloseTo(8);
+    // Other compatibility modes keep the established union, descent included.
+    expect(await renderedSuccessorTop(20, 14) - await renderedSuccessorTop(null, 14)).toBeCloseTo(10);
   });
   it('routes the CJK title to the eastAsia (MS Gothic / sans) face', async () => {
     const { runs } = await render(numbering());

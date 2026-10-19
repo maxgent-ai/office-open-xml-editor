@@ -9,7 +9,7 @@ export const DXF_FONT_TOGGLES = ['bold', 'italic', 'underline', 'strike'] as con
  * stays (ECMA-376 §18.8.14-15 dxf, §18.8.2 b CT_BooleanProperty `val` default
  * true). A model without `fontToggles` (older producer) can only say "on".
  */
-export function dxfFontToggle(dxf: Dxf, key: keyof DxfFontToggles): boolean | undefined {
+export function dxfFontToggle(dxf: Dxf, key: (typeof DXF_FONT_TOGGLES)[number]): boolean | undefined {
   if (!dxf.font) return undefined;
   return dxf.fontToggles ? dxf.fontToggles[key] : dxf.font[key] || undefined;
 }

@@ -128,7 +128,7 @@ export function computeFloatTableBox(
   const resolved = resolveFloatPlacement({
     moving,
     blockers: state.floats.map(floatRectParticipant),
-    avoidance: floatingTableAvoidance(tableOverlap, state.floatParaSeq),
+    avoidance: floatingTableAvoidance(),
     rightBoundaryPt: state.pageWidth,
     overlapEpsilonPt: FLOAT_OVERLAP_EPS,
     rightBoundarySlackPt: FLOAT_PAGE_RIGHT_SLACK,

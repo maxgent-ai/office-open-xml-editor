@@ -1,110 +1,41 @@
+import { loadDocxOfficeFontFallbacks as loadOfficeFontFallbacks } from '../host-font-line-metrics.js';
+import { recordResourceDiagnostics } from '../resource-diagnostics.js';
 import { resolveBundledAssetUrl } from '@silurus/ooxml-core/internal/bundled-asset-url';
-import { hasNativeReadingRequests } from '../native-reading-notice.js';
-import { resolveCjkFallback, type CjkLang } from '@silurus/ooxml-core';
+import { resolveCjkFallback } from '@silurus/ooxml-core';
 import {
   preloadGoogleFonts,
-  loadOfficeFontFallbacks,
   unloadOfficeFontFallbacks,
-  releaseOwnedBitmap,
   unloadGoogleFonts,
   unregisterEmbeddedFonts,
-  WorkerBridge,
-  defaultDpr,
-  dropSvgImageCache,
-  dropDecodedBitmapCache,
-  resolveOoxmlContainer,
-  toArrayBuffer,
   type AdmittedModelSourceLoad,
-  type LoadOptions as CoreLoadOptions,
-  type ProgressiveLayoutPartial,
-  type ProgressiveLayoutProgress,
-  type MathRenderer,
-  type ChartThreeDRenderer,
-  type ChartRegionMapRenderer,
-  type ChartExRenderer,
-  type OoxmlResourceMetrics,
   workerRendererDescriptors,
 } from '@silurus/ooxml-core';
 import {
-  deserializeWorkerError,
   disposeRejectedLoad,
-  HARD_MAX_RAW_PART_CACHE_BYTES,
-  HARD_MAX_RAW_PART_CACHE_ENTRIES,
   normalizeLoadResourceOptions,
   OOXML_RESOURCE_METRICS_PROBE_TIMEOUT_MS,
   OoxmlResourceMetricsSession,
-  readLatestOoxmlResourceMetrics,
-  PULL_SESSION_PROTOCOL,
-  respondToWorkerSvgDecodeRequest,
-  type NormalizedOoxmlResourcePolicy,
-  type WorkerRendererDescriptors,
 } from '@silurus/ooxml-core/worker';
-import { BoundedRawPartCache } from '@silurus/ooxml-core/internal/bounded-raw-part-cache';
-import { ProgressiveLayoutLifecycle } from '@silurus/ooxml-core/internal/progressive-layout-lifecycle';
-import { ProgressiveLayoutObserverNotifier } from '@silurus/ooxml-core/internal/progressive-layout-observers';
-import type { DocxDocumentModel, RenderPageOptions, WorkerRequest, WorkerResponse, DocComment, DocNote, DocRevision } from '../types';
-import { renderLayoutSourceToCanvas, documentHasMath, prepareMathRuns, type DocxTextRunInfo } from '../renderer';
-import { createLayoutServices } from '../layout-runtime.js';
-import { buildBookmarkPageMap } from '../bookmark-nav';
+import { documentHasMath, prepareMathRuns } from '../renderer';
+import { createLayoutServices, prepareMainThreadNativeRouteMetrics } from '../layout-runtime.js';
+import { mainThreadFallbackWarning } from '../main-thread-fallback.js';
 import { DOCX_GOOGLE_FONTS, docxGoogleFontPlan, docxOfficeFontFallbackRequests } from '../google-fonts';
 import { loadEmbeddedFonts } from '../embedded-fonts';
 import {
-  attachDocumentLayoutRuntime,
   documentLayoutRuntimeOf,
-  layoutVariantStoreOf,
 } from '../layout/runtime-state.js';
-import {
-  type LayoutSourceStore,
-} from '../layout/layout-source-store.js';
 import type { DeepReadonly, DocumentLayout } from '../layout/types.js';
-import { snapshotPlainData } from '../layout/plain-data.js';
-import type {
-  DocumentLayoutPartial,
-  DocumentMeta,
-  RenderWorkerRequest,
-  RenderWorkerResponse,
-  WireRenderPageOptions,
-} from '../worker-protocol';
 import { retainRenderWorkerDocumentLayout } from '../render-worker-layout.js';
-import { textRunsForSelectedPage } from '../text-run-projection.js';
-import {
-  reviewProjectionIndexForDocument,
-  type ReviewProjectionIndex,
-} from '../layout/text-index.js';
-import {
-  hitTestSelectedDocxElementContext,
-  type DocxElementContextOptions,
-} from '../element-context.js';
-import type { DocxElementContext, DocxPagePoint } from '../selection-context.js';
-import {
-  collectLayoutSourceCommentRangesIfPresent,
-  resolveDocxCommentThreads,
-  type CommentAnchorRange,
-  type ResolvedDocxCommentThread,
-  type ResolveDocxCommentThreadsOptions,
-} from '../comments.js';
-import {
-  collectLayoutSourceRevisionRangesIfPresent,
-  type RevisionAnchorRange,
-} from '../revisions.js';
-import {
-  isDocumentPullResponse,
-  materializeDocumentPullAdapterSession,
-} from '../document-pull-client.js';
 import { layoutDocumentInputAsync } from '../layout/document.js';
 import { layoutDocumentProgressively } from '../layout/progressive.js';
 import { PaginationAbortError } from '../layout/pagination-scheduler.js';
 import { normalizeLayoutOptions, type LayoutOptions } from '../layout/options.js';
-import type { LayoutVariantStore } from '../layout/variant-store.js';
 import { publishDocxLayout } from '../document-layout-events.js';
-import {
-  docxLayoutViewRequester,
-  publishDocxLayoutView,
-} from '../document-layout-view.js';
 
 
 import { DocxDocument, type DocxViewerLoadControl, type LoadOptions } from '../document.js';
-import { selectModelSource, beginModelSourceLoad } from '@silurus/ooxml-core/internal/model-source';
+import { selectModelSource, beginModelSourceLoad, modelSourceWorker } from '@silurus/ooxml-core/internal/model-source';
+import { deferred } from '@silurus/ooxml-core/internal/deferred';
 /** Parse-request fields for an application-selected model source. */
 function modelSourceFields(
   load: AdmittedModelSourceLoad,
@@ -120,20 +51,13 @@ function modelSourceFields(
     : { source: load.module, sourceOwnerUrl };
 }
 
-interface Deferred<T> { promise: Promise<T>; resolve(value: T): void; reject(error: unknown): void; }
-function deferred<T>(): Deferred<T> {
-  let resolve!: (value: T) => void;
-  let reject!: (error: unknown) => void;
-  const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej; });
-  return { promise, resolve, reject };
-}
-
 type SourceDocxFriend = Pick<DocxDocument, keyof DocxDocument> & Record<
   '_metrics' | '_cjkFallback' | '_parse' | '_mode' | '_threeD' | '_regionMap' |
   '_chartEx' | '_tiff' | '_document' | '_embeddedFontFaces' | '_officeFontFaces' |
   '_googleFontFaces' | '_source' | '_layoutObservers' | '_layoutAbort' |
   '_replaceMainLayoutPublication' | '_isLayoutViewActive' | '_layoutLifecycle' |
-  '_layoutCompletion' | '_resourceUsage' | '_progressive' | '_allowFootnoteContinuation',
+  '_layoutCompletion' | '_resourceUsage' | '_progressive' | '_allowFootnoteContinuation' |
+  '_mainThreadFallbackReason',
   any
 >;
 
@@ -183,10 +107,10 @@ export async function loadDocxModelSource(
     }
     checkAbort();
     // An application-supplied model source claims its input from the raw bytes
-    // before OOXML container resolution; without `modelSources` nothing here
+    // before OOXML container resolution; without `legacyDoc` nothing here
     // runs and the OOXML path below is unchanged.
-    const selected = selectModelSource(opts.modelSources, 'docx', new Uint8Array(buffer));
-    if (!selected) return DocxDocument.load(buffer, { ...opts, modelSources: undefined });
+    const selected = selectModelSource(opts.legacyDoc === undefined ? undefined : [opts.legacyDoc], 'docx', new Uint8Array(buffer));
+    if (!selected) return DocxDocument.load(buffer, { ...opts, legacyDoc: undefined });
     const sourceLoad = beginModelSourceLoad(selected, 'docx');
     try {
     // Resolve the container on the main thread before spinning up the worker.
@@ -197,7 +121,7 @@ export async function loadDocxModelSource(
     // The render worker is reachable only through this dynamic import, so
     // main-mode bundles never pull in its (renderer-bearing) chunk.
     const worker = mode === 'worker'
-      ? (await import('../render-worker-source-host')).createRenderWorker()
+      ? (await import('../render-worker-host')).createRenderWorker()
       : new (await import('../worker-source.ts?worker&inline')).default();
     let doc: SourceDocxFriend | undefined;
     let publicDoc: DocxDocument | undefined;
@@ -210,7 +134,6 @@ export async function loadDocxModelSource(
     const wiredWorker = sourceWorker(worker, sourceLoad, opts, (view) => { if (doc) adoptSourceView(doc, view); });
     const rendererDescriptors = mode === 'worker' ? workerRendererDescriptors(opts) : undefined;
     const workerProgressive = mode === 'worker' && !!opts.progressiveLayout;
-    let owesNativeCompletion = false;
     try {
       publicDoc = Reflect.construct(DocxDocument, [wiredWorker, mode, defaultCurrentDateMs, opts.wasmUrl]) as DocxDocument;
       // TypeScript's private members have no cross-module friend access;
@@ -262,9 +185,7 @@ export async function loadDocxModelSource(
       );
       if (mode === 'worker' && doc._mode === 'main') {
         metrics.setMode('main');
-        console.warn(
-          "[ooxml] mode: 'worker' fell back to main-thread rendering because this document requires DOM OpenType vertical glyph selection.",
-        );
+        console.warn(mainThreadFallbackWarning(doc._mainThreadFallbackReason));
       }
       if (opts.math && doc._mode === 'worker' && !rendererDescriptors?.math) {
         console.warn(
@@ -313,13 +234,14 @@ export async function loadDocxModelSource(
           unregisterEmbeddedFonts(loadedEmbedded.faces);
           throw new PaginationAbortError();
         }
+        recordResourceDiagnostics(doc, loadedEmbedded.diagnostics);
         doc._embeddedFontFaces = loadedEmbedded.faces;
         embeddedMetrics = loadedEmbedded.metrics;
         embeddedRoutes = loadedEmbedded.routes;
       }
       const officeFonts = doc._mode === 'main' && doc._document
         ? await loadOfficeFontFallbacks(docxOfficeFontFallbackRequests(doc._document, { useGoogleFonts: opts.useGoogleFonts, cjkFallback: cjkFallback }).filter((request) =>
-            !embeddedRoutes?.some((route) => route.requestedFamily.toLowerCase() === request.family.toLowerCase()
+            request.presenceOnly || !embeddedRoutes?.some((route) => route.requestedFamily.toLowerCase() === request.family.toLowerCase()
               && route.weight === (request.weight ?? 400) && route.style === (request.style ?? 'normal'))))
         : { faces: [], routes: {} };
       if (signal?.aborted) {
@@ -352,7 +274,7 @@ export async function loadDocxModelSource(
       if (doc._mode === 'main' && doc._document && doc._source) {
         const layoutDocument = doc;
         const runtime = documentLayoutRuntimeOf(doc);
-        runtime.services = createLayoutServices(doc._source, {
+        const serviceOptions = {
           allowFootnoteContinuation: doc._allowFootnoteContinuation,
           fontMetrics: embeddedMetrics,
           useGoogleFonts: !!opts.useGoogleFonts,
@@ -361,8 +283,24 @@ export async function loadDocxModelSource(
           officeRoutes: Object.values(officeFonts.routes),
           googleFaces: doc._googleFontFaces,
           installedSubstituteFamilies,
+          installedFamilies: 'installed' in officeFonts ? officeFonts.installed : undefined,
           mathResources: preparedMath?.records,
           mathDrawables: preparedMath?.drawables,
+        };
+        // Absent authored faces: see native-route-line-metrics.ts.
+        const nativeRoutes = await prepareMainThreadNativeRouteMetrics(
+          doc._source, doc._document, { useGoogleFonts: !!opts.useGoogleFonts, cjkFallback },
+        );
+        // destroy() may have drained this document's faces while the
+        // sentinels loaded: release a late acquisition before aborting.
+        if (signal?.aborted) {
+          unloadOfficeFontFallbacks(nativeRoutes.faces);
+          throw new PaginationAbortError();
+        }
+        doc._officeFontFaces = [...doc._officeFontFaces, ...nativeRoutes.faces];
+        runtime.services = createLayoutServices(doc._source, {
+          ...serviceOptions,
+          nativeRouteMetrics: nativeRoutes.nativeRouteMetrics,
         });
         const services = runtime.services;
         const retained = retainRenderWorkerDocumentLayout(
@@ -394,12 +332,7 @@ export async function loadDocxModelSource(
             )
             : undefined,
         };
-        // Native reading suppresses early publication, not the library's
-        // requested completion callback. Retain the same short-circuit scan.
-        const nativeReading = deferrable && !!opts.progressiveLayout
-          && hasNativeReadingRequests(doc._source);
-        owesNativeCompletion = nativeReading;
-        if (deferrable && opts.progressiveLayout && !nativeReading) {
+        if (deferrable && opts.progressiveLayout) {
           const store = retained.layoutVariants;
           // Narrowed once: the closures below outlive this block's control flow.
           const progressiveDocument = doc;
@@ -582,14 +515,6 @@ export async function loadDocxModelSource(
       checkAbort();
       metrics.succeed({ pages: doc.pageCount });
       sourceLoad.release();
-      // LoadOptions.onLayoutComplete also applies when native reading builds
-      // the full layout before load() resolves. A caller-owned release can
-      // synchronously cancel its viewer: recheck before notifying so this
-      // unpublished native load still rejects without a completion callback.
-      if (owesNativeCompletion) {
-        checkAbort();
-        doc._layoutObservers.notify('onLayoutComplete', opts.onLayoutComplete);
-      }
       return publicDoc;
     } catch (error) {
       disposeRejectedLoad(worker, doc ? abortDocument : undefined);
@@ -614,21 +539,12 @@ function sourceWorker(
   adoptView: (value: boolean | undefined) => void,
 ): Worker {
   const listeners = new Map<EventListenerOrEventListenerObject, EventListener>();
-  return new Proxy(worker, {
-    get(target, key) {
-      if (key === 'postMessage') return (message: unknown, transfer?: Transferable[]) => {
-        if (typeof message === 'object' && message !== null) {
-          const wire = message as { type?: string };
-          if (wire.type === 'init') return;
-          if (wire.type === 'parse') {
-            target.postMessage({ ...wire, ...modelSourceFields(load),
-              ...(opts.showTrackedChanges === undefined ? {} : { showTrackedChanges: opts.showTrackedChanges }) },
-            [...(transfer ?? []), ...load.transfer]);
-            return;
-          }
-        }
-        target.postMessage(message, transfer ?? []);
-      };
+  return modelSourceWorker(worker, {
+    discriminator: 'type',
+    load,
+    parseMessage: (wire) => ({ ...wire, ...modelSourceFields(load),
+      ...(opts.showTrackedChanges === undefined ? {} : { showTrackedChanges: opts.showTrackedChanges }) }),
+    member: (target, key) => {
       if (key === 'addEventListener') return (
         type: string, listener: EventListenerOrEventListenerObject, options?: AddEventListenerOptions,
       ) => {
@@ -655,8 +571,7 @@ function sourceWorker(
       if (key === 'removeEventListener') return (
         type: string, listener: EventListenerOrEventListenerObject, options?: EventListenerOptions,
       ) => target.removeEventListener(type, type === 'message' ? (listeners.get(listener) ?? listener) : listener, options);
-      const value = Reflect.get(target, key, target);
-      return typeof value === 'function' ? value.bind(target) : value;
+      return undefined;
     },
   });
 }

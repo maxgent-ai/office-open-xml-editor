@@ -1,3 +1,4 @@
+import { resizeViewer, viewerState } from './scroll-viewer-test-dom.js';
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { DocxScrollViewer } from './scroll-viewer.js';
 import { DocxDocument } from './document.js';
@@ -1010,7 +1011,7 @@ describe('DocxScrollViewer — layout + virtualization (T2)', () => {
     // Window here is ~2-4 slots; allow generous headroom but far below 50.
     expect(seen.size).toBeLessThanOrEqual(8);
     // Coming back to the top mounts page 0 again, drawn from the pool.
-    expect(v.mountedPageIndicesForTest()).toContain(0);
+    expect(viewerState(v).mounted()).toContain(0);
   });
 
   it('mounts the correct window for a mid-document scrollTop', () => {
@@ -1021,7 +1022,7 @@ describe('DocxScrollViewer — layout + virtualization (T2)', () => {
     scrollHost.scrollTop = 2000;
     scrollHost.dispatch('scroll');
     const top = v.topVisiblePage;
-    const mountedPages = v.mountedPageIndicesForTest(); // T2 test hook
+    const mountedPages = viewerState(v).mounted(); // T2 test hook
     expect(mountedPages).toContain(top);
     expect(Math.max(...mountedPages) - Math.min(...mountedPages)).toBeLessThanOrEqual(4);
   });
@@ -1043,7 +1044,7 @@ describe('DocxScrollViewer — rendering (T3)', () => {
     scrollHost.clientWidth = 200;
     v.relayout();
     // Every mounted page got exactly one renderPage call, no more no less.
-    const mounted = v.mountedPageIndicesForTest().sort((a, b) => a - b);
+    const mounted = viewerState(v).mounted().sort((a, b) => a - b);
     const rendered = engine.renderCalls.map((c) => c.page).sort((a, b) => a - b);
     expect(rendered).toEqual(mounted);
     // Each renderPage call carried THIS page's own px width (uniform px-per-pt
@@ -1075,7 +1076,7 @@ describe('DocxScrollViewer — rendering (T3)', () => {
     scrollHost.clientWidth = 200;
     v.relayout();
     // Both pages mount, so both get exactly one render.
-    const mounted = v.mountedPageIndicesForTest().sort((a, b) => a - b);
+    const mounted = viewerState(v).mounted().sort((a, b) => a - b);
     expect(mounted).toEqual([0, 1]);
     // Per-page px widths in call order: page 0 → 100, page 1 → 200.
     const widths = engine.renderCalls
@@ -1130,7 +1131,7 @@ describe('DocxScrollViewer — rendering (T3)', () => {
     await Promise.resolve();
     expect(engine.renderCalls).toHaveLength(0); // renderPage never touched
     // Every mounted page dispatched exactly one bitmap render.
-    const mounted = v.mountedPageIndicesForTest().sort((a, b) => a - b);
+    const mounted = viewerState(v).mounted().sort((a, b) => a - b);
     const bitmapPages = [...new Set(engine.bitmapCalls.map((c) => c.page))].sort((a, b) => a - b);
     expect(bitmapPages).toEqual(mounted);
     v.destroy();
@@ -1214,7 +1215,7 @@ describe('DocxScrollViewer — rendering (T3)', () => {
     // Scroll far away so page 0's slot recycles while its render is in flight.
     scrollHost.scrollTop = 12000;
     scrollHost.dispatch('scroll');
-    expect(v.mountedPageIndicesForTest()).not.toContain(0);
+    expect(viewerState(v).mounted()).not.toContain(0);
     // Now the stale render for page 0 resolves — the viewer must NOT paint it and
     // must close the orphaned bitmap.
     const bmp0 = engine.createdBitmaps[engine.bitmapCalls.indexOf(page0!)];
@@ -1250,10 +1251,10 @@ describe('DocxScrollViewer — rendering (T3)', () => {
     // (page 0 re-mounts on a fresh slot) — all while the initial render is deferred.
     scrollHost.scrollTop = 12000;
     scrollHost.dispatch('scroll');
-    expect(v.mountedPageIndicesForTest()).not.toContain(0);
+    expect(viewerState(v).mounted()).not.toContain(0);
     scrollHost.scrollTop = 0;
     scrollHost.dispatch('scroll');
-    expect(v.mountedPageIndicesForTest()).toContain(0);
+    expect(viewerState(v).mounted()).toContain(0);
     // Coalescing pin: page 0's render is STILL in flight (initial deferred call
     // not yet resolved), so the re-mount must NOT dispatch a second render for
     // page 0 — the in-flight guard swallows it. Exactly one dispatch so far.
@@ -1301,7 +1302,7 @@ describe('DocxScrollViewer — rendering (T3)', () => {
 
     const page0 = engine.bitmapCalls.find((c) => c.page === 0);
     expect(page0).toBeDefined();
-    expect(v.mountedPageIndicesForTest()).toContain(0); // slot still live
+    expect(viewerState(v).mounted()).toContain(0); // slot still live
     const dispatchesForPage0 = () => engine.bitmapCalls.filter((c) => c.page === 0).length;
     expect(dispatchesForPage0()).toBe(1);
 
@@ -1392,8 +1393,8 @@ describe('DocxScrollViewer — zoom (T4)', () => {
   it('base fit scale maps the first page width to the container width', () => {
     const { v } = setup();
     // base = 200 / (100 * 4/3) = 1.5
-    expect(v.scaleForTest()).toBeCloseTo(1.5, 5);
-    expect(v.baseScaleForTest()).toBeCloseTo(1.5, 5);
+    expect(v.getScale()).toBeCloseTo(1.5, 5);
+    expect(viewerState(v).baseScale()).toBeCloseTo(1.5, 5);
     v.destroy();
   });
 
@@ -1403,9 +1404,9 @@ describe('DocxScrollViewer — zoom (T4)', () => {
     scrollHost.scrollTop = 1230;
     scrollHost.dispatch('scroll');
     expect(v.topVisiblePage).toBe(3);
-    const cur = v.scaleForTest(); // 1.5
+    const cur = v.getScale(); // 1.5
     v.setScale(cur * 2); // 3.0 (== zoomMax, no clamp)
-    expect(v.scaleForTest()).toBeCloseTo(3, 5);
+    expect(v.getScale()).toBeCloseTo(3, 5);
     // page 3 stays the top page; new offset = 3 * (800 + 10) = 2430
     expect(v.topVisiblePage).toBe(3);
     expect(Math.abs(scrollHost.scrollTop - 2430)).toBeLessThan(2);
@@ -1419,7 +1420,7 @@ describe('DocxScrollViewer — zoom (T4)', () => {
     scrollHost.scrollTop = 1430;
     scrollHost.dispatch('scroll');
     expect(v.topVisiblePage).toBe(3);
-    v.setScale(v.scaleForTest() * 2); // 1.5 → 3.0; heights' = 800
+    v.setScale(v.getScale() * 2); // 1.5 → 3.0; heights' = 800
     // newScrollTop = offset'[3] + 0.5 * 800 = 2430 + 400 = 2830
     expect(Math.abs(scrollHost.scrollTop - 2830)).toBeLessThan(2);
     // Page 3 is still under the viewport top: offset'[3]=2430 <= 2830 < 3240.
@@ -1430,9 +1431,9 @@ describe('DocxScrollViewer — zoom (T4)', () => {
   it('clamps setScale to the absolute [zoomMin, zoomMax] px-per-pt bounds', () => {
     const { v } = setup();
     v.setScale(100); // above zoomMax 3 (absolute, NOT a multiple of base)
-    expect(v.scaleForTest()).toBeCloseTo(3, 5);
+    expect(v.getScale()).toBeCloseTo(3, 5);
     v.setScale(0.01); // below zoomMin 0.5
-    expect(v.scaleForTest()).toBeCloseTo(0.5, 5);
+    expect(v.getScale()).toBeCloseTo(0.5, 5);
     v.destroy();
   });
 
@@ -1449,64 +1450,64 @@ describe('DocxScrollViewer — zoom (T4)', () => {
     scrollHost.clientWidth = 200;
     v.relayout();
     v.setScale(999);
-    expect(v.scaleForTest()).toBeCloseTo(4, 5); // default zoomMax
+    expect(v.getScale()).toBeCloseTo(4, 5); // default zoomMax
     v.setScale(0.0001);
-    expect(v.scaleForTest()).toBeCloseTo(0.1, 5); // default zoomMin
+    expect(v.getScale()).toBeCloseTo(0.1, 5); // default zoomMin
     v.destroy();
   });
 
   it('Ctrl+wheel zooms in and calls preventDefault; bare wheel does not zoom or preventDefault', () => {
     const { v, scrollHost } = setup();
-    const before = v.scaleForTest();
+    const before = v.getScale();
 
     // Bare wheel: no zoom, native scroll (preventDefault NOT called).
     const barePrevent = vi.fn();
     scrollHost.dispatch('wheel', { deltaY: -100, ctrlKey: false, metaKey: false, preventDefault: barePrevent });
-    expect(v.scaleForTest()).toBe(before);
+    expect(v.getScale()).toBe(before);
     expect(barePrevent).not.toHaveBeenCalled();
 
     // Ctrl+wheel (deltaY<0 = zoom in): scale increases, preventDefault called.
     const ctrlPrevent = vi.fn();
     scrollHost.dispatch('wheel', { deltaY: -100, deltaMode: 0, ctrlKey: true, metaKey: false, preventDefault: ctrlPrevent });
-    expect(v.scaleForTest()).toBeCloseTo(before * 1.1, 10);
+    expect(v.getScale()).toBeCloseTo(before * 1.1, 10);
     expect(ctrlPrevent).toHaveBeenCalledTimes(1);
     v.destroy();
   });
 
   it('Cmd(meta)+wheel also zooms', () => {
     const { v, scrollHost } = setup();
-    const before = v.scaleForTest();
+    const before = v.getScale();
     scrollHost.dispatch('wheel', { deltaY: -100, ctrlKey: false, metaKey: true, preventDefault() {} });
-    expect(v.scaleForTest()).toBeGreaterThan(before);
+    expect(v.getScale()).toBeGreaterThan(before);
     v.destroy();
   });
 
   it('positive deltaY (ctrl+wheel down) zooms out', () => {
     const { v, scrollHost } = setup();
-    const before = v.scaleForTest();
+    const before = v.getScale();
     scrollHost.dispatch('wheel', { deltaY: 100, ctrlKey: true, metaKey: false, preventDefault() {} });
-    expect(v.scaleForTest()).toBeLessThan(before);
+    expect(v.getScale()).toBeLessThan(before);
     v.destroy();
   });
 
   it('enableZoom:false installs no wheel handler — ctrl+wheel is inert', () => {
     const { v, scrollHost } = setup(20, { enableZoom: false });
-    const before = v.scaleForTest();
+    const before = v.getScale();
     // No wheel listener was registered at all.
     expect(scrollHost._listeners.has('wheel')).toBe(false);
     const prevent = vi.fn();
     scrollHost.dispatch('wheel', { deltaY: -100, ctrlKey: true, preventDefault: prevent });
-    expect(v.scaleForTest()).toBe(before);
+    expect(v.getScale()).toBe(before);
     expect(prevent).not.toHaveBeenCalled();
     v.destroy();
   });
 
   it('a wheel with deltaY 0 is a no-op even with ctrl held', () => {
     const { v, scrollHost } = setup();
-    const before = v.scaleForTest();
+    const before = v.getScale();
     const prevent = vi.fn();
     scrollHost.dispatch('wheel', { deltaY: 0, ctrlKey: true, preventDefault: prevent });
-    expect(v.scaleForTest()).toBe(before);
+    expect(v.getScale()).toBe(before);
     v.destroy();
   });
 
@@ -1539,8 +1540,8 @@ describe('DocxScrollViewer — zoom (T4)', () => {
 
     // Zoom mid-flight: bumps the render epoch and re-mounts. Page 0's re-mount is
     // coalesced away by the in-flight guard (same index still in flight).
-    v.setScale(v.scaleForTest() * 2);
-    expect(v.mountedPageIndicesForTest()).toContain(0); // page 0 still visible at top
+    v.setScale(v.getScale() * 2);
+    expect(viewerState(v).mounted()).toContain(0); // page 0 still visible at top
     expect(engine.bitmapCalls.filter((c) => c.page === 0).length).toBe(1); // no double-dispatch yet
 
     // The OLD-scale render resolves. Epoch moved ⇒ STALE: close, do not paint,
@@ -1602,8 +1603,8 @@ describe('DocxScrollViewer — zoom (T4)', () => {
     const oldWidth = page0Old!.width;
 
     // Zoom mid-flight: bumps the epoch. Page 0's re-mount is coalesced away.
-    v.setScale(v.scaleForTest() * 2);
-    expect(v.mountedPageIndicesForTest()).toContain(0);
+    v.setScale(v.getScale() * 2);
+    expect(viewerState(v).mounted()).toContain(0);
     expect(dispatchesForPage0()).toBe(1);
 
     // REJECT the old-scale dispatch. Epoch moved ⇒ stale ⇒ re-dispatch (not a plain
@@ -1633,7 +1634,7 @@ describe('DocxScrollViewer — zoom (T4)', () => {
     scrollHost.scrollTop = 1230;
     scrollHost.dispatch('scroll');
     const topBefore = scrollHost.scrollTop;
-    v.setScale(v.scaleForTest()); // identical scale
+    v.setScale(v.getScale()); // identical scale
     expect(scrollHost.scrollTop).toBe(topBefore); // unchanged
     v.destroy();
   });
@@ -1667,7 +1668,7 @@ describe('DocxScrollViewer — self-load path (T7 story)', () => {
       }),
     );
     // Layout happened: slots mounted and the spacer was sized.
-    expect(v.mountedPageIndicesForTest().length).toBeGreaterThan(0);
+    expect(viewerState(v).mounted().length).toBeGreaterThan(0);
     const spacer = scrollHost.children[0] as FakeEl;
     expect(parseFloat(spacer.style.height)).toBeGreaterThan(0);
     // The mounted pages were actually rendered (main mode → renderPage).
@@ -1751,7 +1752,7 @@ describe('DocxScrollViewer — text selection (T5)', () => {
     await Promise.resolve();
     await Promise.resolve();
     // Every mounted slot got its overlay built from that page's render.
-    const mounted = v.mountedPageIndicesForTest();
+    const mounted = viewerState(v).mounted();
     expect(mounted.length).toBeGreaterThan(0);
     for (const wrapper of scrollHost.children.filter((c) => c.children.some((k) => k.tag === 'canvas'))) {
       const textLayer = findTextLayer(wrapper);
@@ -1843,7 +1844,7 @@ describe('DocxScrollViewer — text selection (T5)', () => {
     expect(engine.renderCalls.length).toBe(0);
     expect(engine.bitmapCalls.length).toBeGreaterThan(0);
     // Every mounted slot got its overlay built from the worker-shipped runs.
-    const mounted = v.mountedPageIndicesForTest();
+    const mounted = viewerState(v).mounted();
     expect(mounted.length).toBeGreaterThan(0);
     for (const wrapper of scrollHost.children.filter((c) => c.children.some((k) => k.tag === 'canvas'))) {
       const textLayer = wrapper.children.find((c) => c.tag === 'div') as FakeEl;
@@ -1878,7 +1879,7 @@ describe('DocxScrollViewer — text selection (T5)', () => {
     const staleCall = engine.renderCalls.find((c) => c.page === 0)!;
     // Zoom mid-flight: bumps the epoch and force-re-mounts every slot (which
     // re-dispatches a fresh page-0 render at the new scale).
-    v.setScale(v.scaleForTest() * 2);
+    v.setScale(v.getScale() * 2);
     // Now resolve the STALE (old-epoch) render. Its .then must bail on the epoch
     // guard and NOT build the overlay.
     staleCall.resolve();
@@ -2364,7 +2365,7 @@ describe('DocxScrollViewer — navigation, resize, empty (T6)', () => {
     const { v, scrollHost, container } = setup();
     container.clientWidth = 199.9;
     scrollHost.clientWidth = 199.9; // fractional fit scale → fractional page px
-    v.resizeForTest();
+    resizeViewer(v);
 
     let requestedTop = -1;
     (scrollHost as FakeEl & {
@@ -2389,13 +2390,13 @@ describe('DocxScrollViewer — navigation, resize, empty (T6)', () => {
     // px-per-pt bounds (design §8.1), so a low zoomMax would legitimately CLAMP
     // the re-fit and break preservation. Give the multiplier room to survive.
     const { v, container } = setup(20, { zoomMax: 10 });
-    v.setScale(v.baseScaleForTest() * 2); // 2× zoom
-    const zoomMultiplier = v.scaleForTest() / v.baseScaleForTest();
+    v.setScale(viewerState(v).baseScale() * 2); // 2× zoom
+    const zoomMultiplier = v.getScale() / viewerState(v).baseScale();
     // Container widens; the observer callback re-fits base and re-applies the mult.
     container.clientWidth = 400;
     (container.children[0] as FakeEl).children[0].clientWidth = 400;
-    v.resizeForTest(); // fires the observed resize path
-    expect(v.scaleForTest() / v.baseScaleForTest()).toBeCloseTo(zoomMultiplier, 5);
+    resizeViewer(v); // fires the observed resize path
+    expect(v.getScale() / viewerState(v).baseScale()).toBeCloseTo(zoomMultiplier, 5);
     v.destroy();
   });
 
@@ -2404,37 +2405,37 @@ describe('DocxScrollViewer — navigation, resize, empty (T6)', () => {
     const { v, container } = setup(20, { refitOnResize: false, onScaleChange });
     v.setScale(1);
     onScaleChange.mockClear();
-    const epochBefore = v.renderEpochForTest();
+    const epochBefore = viewerState(v).epoch();
 
     container.clientWidth = 400;
     (container.children[0] as FakeEl).children[0].clientWidth = 400;
-    v.resizeForTest();
+    resizeViewer(v);
 
-    expect(v.scaleForTest()).toBe(1);
-    expect(v.renderEpochForTest()).toBe(epochBefore);
+    expect(v.getScale()).toBe(1);
+    expect(viewerState(v).epoch()).toBe(epochBefore);
     expect(onScaleChange).not.toHaveBeenCalled();
     v.destroy();
   });
 
   it('ResizeObserver re-fit bumps the render epoch (resize is an epoch event)', () => {
     const { v, container } = setup();
-    const before = v.renderEpochForTest();
+    const before = viewerState(v).epoch();
     container.clientWidth = 400;
     (container.children[0] as FakeEl).children[0].clientWidth = 400;
-    v.resizeForTest();
+    resizeViewer(v);
     // A width change re-fits the base scale (routed through setScale), which bumps
     // the epoch so any bitmap in flight at the old scale is treated as stale.
-    expect(v.renderEpochForTest()).toBeGreaterThan(before);
+    expect(viewerState(v).epoch()).toBeGreaterThan(before);
     v.destroy();
   });
 
   it('ResizeObserver re-fit with an UNCHANGED width does not re-fit or bump the epoch', () => {
     const { v } = setup();
-    const scaleBefore = v.scaleForTest();
-    const epochBefore = v.renderEpochForTest();
-    v.resizeForTest(); // same width — no-op re-fit
-    expect(v.scaleForTest()).toBe(scaleBefore);
-    expect(v.renderEpochForTest()).toBe(epochBefore);
+    const scaleBefore = v.getScale();
+    const epochBefore = viewerState(v).epoch();
+    resizeViewer(v); // same width — no-op re-fit
+    expect(v.getScale()).toBe(scaleBefore);
+    expect(viewerState(v).epoch()).toBe(epochBefore);
     v.destroy();
   });
 
@@ -2447,24 +2448,24 @@ describe('DocxScrollViewer — navigation, resize, empty (T6)', () => {
     // valid), and no onVisiblePageChange fire (topIndex stays 0 at scrollTop 0).
     const changes: number[] = [];
     const { v, scrollHost } = setup(20, { onVisiblePageChange: (i: number) => changes.push(i) });
-    const mountedBefore = v.mountedPageIndicesForTest().slice().sort((a, b) => a - b);
+    const mountedBefore = viewerState(v).mounted().slice().sort((a, b) => a - b);
     expect(mountedBefore).toEqual([0, 1]);
     expect(changes).toEqual([0]); // initial mount fired 0
-    const epochBefore = v.renderEpochForTest();
-    const scaleBefore = v.scaleForTest();
+    const epochBefore = viewerState(v).epoch();
+    const scaleBefore = v.getScale();
 
     // Grow HEIGHT only; width (and thus the fit-width base scale) is unchanged.
     scrollHost.clientHeight = 1600;
-    v.resizeForTest(); // NO scroll event dispatched
+    resizeViewer(v); // NO scroll event dispatched
 
-    const mountedAfter = v.mountedPageIndicesForTest().slice().sort((a, b) => a - b);
+    const mountedAfter = viewerState(v).mounted().slice().sort((a, b) => a - b);
     // The revealed window grew: bottom edge 1600 now intersects pages 0..3 (+1
     // overscan ⇒ end 4). The mounted span strictly grows.
     expect(mountedAfter).toEqual([0, 1, 2, 3, 4]);
     expect(mountedAfter.length).toBeGreaterThan(mountedBefore.length);
     // No epoch bump — nothing was re-scaled, so no in-flight render is stale.
-    expect(v.renderEpochForTest()).toBe(epochBefore);
-    expect(v.scaleForTest()).toBe(scaleBefore);
+    expect(viewerState(v).epoch()).toBe(epochBefore);
+    expect(v.getScale()).toBe(scaleBefore);
     // topIndex is still 0 at scrollTop 0 ⇒ callback did NOT fire again.
     expect(changes).toEqual([0]);
     v.destroy();
@@ -2481,10 +2482,10 @@ describe('DocxScrollViewer — navigation, resize, empty (T6)', () => {
       zoomMax: BASE, // 1.5 — clamps the re-fit back to the current scale
       onVisiblePageChange: (i: number) => changes.push(i),
     });
-    expect(v.scaleForTest()).toBe(BASE);
-    const mountedBefore = v.mountedPageIndicesForTest().slice().sort((a, b) => a - b);
+    expect(v.getScale()).toBe(BASE);
+    const mountedBefore = viewerState(v).mounted().slice().sort((a, b) => a - b);
     expect(mountedBefore).toEqual([0, 1]);
-    const epochBefore = v.renderEpochForTest();
+    const epochBefore = viewerState(v).epoch();
 
     // Grow BOTH width and height. The width grow triggers the re-fit branch, but the
     // clamp pins the scale unchanged ⇒ setScale no-ops. Heights are therefore
@@ -2494,14 +2495,14 @@ describe('DocxScrollViewer — navigation, resize, empty (T6)', () => {
     (container.children[0] as FakeEl).children[0].clientWidth = 400;
     scrollHost.clientWidth = 400;
     scrollHost.clientHeight = 1600;
-    v.resizeForTest();
+    resizeViewer(v);
 
-    const mountedAfter = v.mountedPageIndicesForTest().slice().sort((a, b) => a - b);
+    const mountedAfter = viewerState(v).mounted().slice().sort((a, b) => a - b);
     expect(mountedAfter).toEqual([0, 1, 2, 3, 4]);
     expect(mountedAfter.length).toBeGreaterThan(mountedBefore.length);
     // Scale stayed pinned at the clamp, so setScale no-oped ⇒ no epoch bump.
-    expect(v.scaleForTest()).toBe(BASE);
-    expect(v.renderEpochForTest()).toBe(epochBefore);
+    expect(v.getScale()).toBe(BASE);
+    expect(viewerState(v).epoch()).toBe(epochBefore);
     // topIndex still 0 ⇒ no extra callback.
     expect(changes).toEqual([0]);
     v.destroy();
@@ -2513,12 +2514,12 @@ describe('DocxScrollViewer — navigation, resize, empty (T6)', () => {
     const engine = new FakeDocxEngine(5, Array.from({ length: 5 }, () => ({ widthPt: 100, heightPt: 200 })));
     const v = makeBorrowedDocxScrollViewer(container as unknown as HTMLElement, { document: engine.asDoc() });
     const scrollHost = (container.children[0] as FakeEl).children[0] as FakeEl;
-    expect(v.mountedPageIndicesForTest().length).toBe(0); // deferred
+    expect(viewerState(v).mounted().length).toBe(0); // deferred
     container.clientWidth = 300;
     scrollHost.clientWidth = 300;
     scrollHost.clientHeight = 400;
-    v.resizeForTest();
-    expect(v.mountedPageIndicesForTest().length).toBeGreaterThan(0);
+    resizeViewer(v);
+    expect(viewerState(v).mounted().length).toBeGreaterThan(0);
     v.destroy();
   });
 
@@ -2530,7 +2531,7 @@ describe('DocxScrollViewer — navigation, resize, empty (T6)', () => {
     v.relayout();
     const spacer = (container.children[0] as FakeEl).children[0].children[0] as FakeEl;
     expect(parseFloat(spacer.style.height || '0')).toBe(0);
-    expect(v.mountedPageIndicesForTest().length).toBe(0);
+    expect(viewerState(v).mounted().length).toBe(0);
     v.scrollToPage(0); // no throw
     v.destroy();
   });
@@ -2546,8 +2547,8 @@ describe('DocxScrollViewer — navigation, resize, empty (T6)', () => {
     });
     container.clientWidth = 300;
     (container.children[0] as FakeEl).children[0].clientWidth = 300;
-    v.resizeForTest(); // no pages ⇒ no-op
-    expect(v.mountedPageIndicesForTest().length).toBe(0);
+    resizeViewer(v); // no pages ⇒ no-op
+    expect(viewerState(v).mounted().length).toBe(0);
     expect(changes).toEqual([]);
     v.destroy();
   });
@@ -2615,7 +2616,7 @@ describe('DocxScrollViewer — paddingTop/paddingBottom (desk margin)', () => {
 
   it('explicit paddingTop mounts the first slot at top = paddingTop px', () => {
     const { v, scrollHost } = setup({ paddingTop: 24, paddingBottom: 24 });
-    expect(v.mountedPageIndicesForTest()).toContain(0);
+    expect(viewerState(v).mounted()).toContain(0);
     // Page 0's wrapper sits at top = paddingTop (not flush 0).
     expect(slotTopFor(scrollHost, 0, STRIDE, 24)).toBeDefined();
     v.destroy();
@@ -2632,7 +2633,7 @@ describe('DocxScrollViewer — paddingTop/paddingBottom (desk margin)', () => {
     // No paddingTop/paddingBottom → each defaults to `gap` (10). Page 0 sits at
     // top:10px, NOT flush 0 (this is the sanctioned pre-release default change).
     const { v, scrollHost } = setup();
-    expect(v.mountedPageIndicesForTest()).toContain(0);
+    expect(viewerState(v).mounted()).toContain(0);
     expect(slotTopFor(scrollHost, 0, STRIDE, GAP)).toBeDefined();
     // And the spacer includes both default pads.
     const spacer = scrollHost.children[0] as FakeEl;
@@ -2674,8 +2675,8 @@ describe('DocxScrollViewer — paddingTop/paddingBottom (desk margin)', () => {
     scrollHost.scrollTop = 24 + 3 * STRIDE;
     scrollHost.dispatch('scroll');
     expect(v.topVisiblePage).toBe(3);
-    v.setScale(v.scaleForTest() * 2); // 1.5 → 3.0; PAGE_H' = 800, STRIDE' = 810
-    expect(v.scaleForTest()).toBeCloseTo(3, 5);
+    v.setScale(v.getScale() * 2); // 1.5 → 3.0; PAGE_H' = 800, STRIDE' = 810
+    expect(v.getScale()).toBeCloseTo(3, 5);
     // Page 3 stays the top page; padding is intact so offset'[3] = 24 + 3*810 = 2454.
     expect(v.topVisiblePage).toBe(3);
     expect(Math.abs(scrollHost.scrollTop - (24 + 3 * 810))).toBeLessThan(2);
@@ -2685,7 +2686,7 @@ describe('DocxScrollViewer — paddingTop/paddingBottom (desk margin)', () => {
   it('keeps the leading desk padding visible when setScale runs at the top', () => {
     const { v, scrollHost } = setup({ paddingTop: 24, paddingBottom: 24, zoomMin: 0.5, zoomMax: 3 });
     expect(scrollHost.scrollTop).toBe(0);
-    v.setScale(v.scaleForTest() * 0.75);
+    v.setScale(v.getScale() * 0.75);
     expect(scrollHost.scrollTop).toBe(0);
     expect(slotTopFor(scrollHost, 0, PAGE_H * 0.75 + GAP, 24)).toBeDefined();
     v.destroy();
@@ -2727,8 +2728,8 @@ describe('DocxScrollViewer — paddingLeft/paddingRight (horizontal desk gutters
     // 232 − 16 (padL) − 16 (padR) = 200, the same fit the old 200-container tests
     // used, so the base scale matches their 1.5 (page widthPt 100 → 200/(100×4/3)).
     const { v } = setup(232);
-    expect(v.baseScaleForTest()).toBeCloseTo(1.5, 5);
-    expect(v.scaleForTest()).toBeCloseTo(1.5, 5);
+    expect(viewerState(v).baseScale()).toBeCloseTo(1.5, 5);
+    expect(v.getScale()).toBeCloseTo(1.5, 5);
     v.destroy();
   });
 
@@ -2736,7 +2737,7 @@ describe('DocxScrollViewer — paddingLeft/paddingRight (horizontal desk gutters
     // With the gutters pinned to 0 the fit is the full 200 container width ⇒ base
     // 1.5, exactly the pre-feature behavior.
     const { v } = setup(200, { paddingLeft: 0, paddingRight: 0 });
-    expect(v.baseScaleForTest()).toBeCloseTo(1.5, 5);
+    expect(viewerState(v).baseScale()).toBeCloseTo(1.5, 5);
     v.destroy();
   });
 
@@ -2745,7 +2746,7 @@ describe('DocxScrollViewer — paddingLeft/paddingRight (horizontal desk gutters
     // 1.125. The gutters still apply to PLACEMENT (asserted in the centering test),
     // just not to the width.
     const { v } = setup(400, { width: 150, paddingLeft: 24, paddingRight: 24 });
-    expect(v.baseScaleForTest()).toBeCloseTo(150 / (100 * PT_TO_PX), 5);
+    expect(viewerState(v).baseScale()).toBeCloseTo(150 / (100 * PT_TO_PX), 5);
     v.destroy();
   });
 
@@ -2796,8 +2797,8 @@ describe('DocxScrollViewer — paddingLeft/paddingRight (horizontal desk gutters
       zoomMin: 0.5,
       zoomMax: 4,
     });
-    expect(v.scaleForTest()).toBeCloseTo(1.5, 5);
-    v.setScale(v.scaleForTest() * 2); // page px 200 → 400
+    expect(v.getScale()).toBeCloseTo(1.5, 5);
+    v.setScale(v.getScale() * 2); // page px 200 → 400
     const s0 = scrollHost.children.find(
       (c) => c.tag === 'div' && c.children.some((k) => k.tag === 'canvas') && c.style.top === '0px',
     ) as FakeEl | undefined;
@@ -2841,7 +2842,7 @@ describe('DocxScrollViewer — paddingLeft/paddingRight (horizontal desk gutters
     // outer container remains 232px wide. Re-fit must use 215, yielding page 183
     // + two 16px gutters = exactly 215px, not the stale outer width.
     scrollHost.clientWidth = 215;
-    v.resizeForTest();
+    resizeViewer(v);
     const spacer = scrollHost.children[0] as FakeEl;
     expect(parseFloat(spacer.style.width)).toBeCloseTo(215, 3);
     expect(container.clientWidth).toBe(232);
@@ -2852,7 +2853,7 @@ describe('DocxScrollViewer — paddingLeft/paddingRight (horizontal desk gutters
     // padL + padR = 300 > container 200 ⇒ fit ≤ 0 ⇒ deferred (no slots mounted),
     // mirroring the zero-width container deferral.
     const { v } = setup(200, { paddingLeft: 150, paddingRight: 150 });
-    expect(v.mountedPageIndicesForTest().length).toBe(0);
+    expect(viewerState(v).mounted().length).toBe(0);
     v.destroy();
   });
 
@@ -2922,7 +2923,7 @@ describe('DocxScrollViewer — flicker-free zoom (T8)', () => {
     const beforeCanvas = before!.children.find((k) => k.tag === 'canvas') as FakeEl;
     const resizesBefore = beforeCanvas._deviceResizes.length;
 
-    v.setScale(v.scaleForTest() * 2); // zoom in
+    v.setScale(v.getScale() * 2); // zoom in
 
     // The very SAME wrapper element is still mounted for page 0 (not recycled +
     // re-mounted). Its canvas is the SAME element (identity preserved).
@@ -2941,7 +2942,7 @@ describe('DocxScrollViewer — flicker-free zoom (T8)', () => {
     const slot = slotAtTop(scrollHost, '0px')!;
     const canvas = slot.children.find((k) => k.tag === 'canvas') as FakeEl;
     // base 1.5 ⇒ page px width 200. Zoom ×2 ⇒ CSS width 400.
-    v.setScale(v.scaleForTest() * 2);
+    v.setScale(v.getScale() * 2);
     expect(canvas.style.width).toBe('400px');
     // height: 200pt × PT_TO_PX × 3.0 = 800.
     expect(canvas.style.height).toBe('800px');
@@ -2958,7 +2959,7 @@ describe('DocxScrollViewer — flicker-free zoom (T8)', () => {
     const textLayer = slot.children.find((k) => k.tag === 'div') as FakeEl;
     // Zoom ×2 — the overlay was built at the base scale (1.5); the preview scales
     // it by newScale/renderedScale = 3.0/1.5 = 2.
-    v.setScale(v.scaleForTest() * 2);
+    v.setScale(v.getScale() * 2);
     expect(textLayer.style.transform).toBe('scale(2)');
     expect(textLayer.style.transformOrigin).toBe('0 0');
     // The slot wrapper has already grown to 400×800. Keeping the text layer at
@@ -2979,18 +2980,18 @@ describe('DocxScrollViewer — flicker-free zoom (T8)', () => {
       const { v, engine } = setup();
       const dispatchesBefore = engine.renderCalls.length; // initial mount renders
       // Three rapid setScale calls within the settle window.
-      v.setScale(v.scaleForTest() * 1.1);
+      v.setScale(v.getScale() * 1.1);
       vi.advanceTimersByTime(50);
-      v.setScale(v.scaleForTest() * 1.1);
+      v.setScale(v.getScale() * 1.1);
       vi.advanceTimersByTime(50);
-      v.setScale(v.scaleForTest() * 1.1);
+      v.setScale(v.getScale() * 1.1);
       // Still inside the settle window (150ms): NO settle re-render dispatched.
       vi.advanceTimersByTime(50); // total 150 since first, but timer reset each tick
       expect(engine.renderCalls.length).toBe(dispatchesBefore);
       // Advance past the settle timeout measured from the LAST setScale.
       vi.advanceTimersByTime(150);
       // Now the visible window re-rendered exactly once each (no per-tick storm).
-      const mounted = v.mountedPageIndicesForTest();
+      const mounted = viewerState(v).mounted();
       const settleRenders = engine.renderCalls.length - dispatchesBefore;
       expect(settleRenders).toBe(mounted.length);
     } finally {
@@ -3014,7 +3015,7 @@ describe('DocxScrollViewer — flicker-free zoom (T8)', () => {
       const onScreenUid = onScreenCanvas._uid;
       const resizesOnScreenBefore = onScreenCanvas._deviceResizes.length;
 
-      v.setScale(v.scaleForTest() * 2);
+      v.setScale(v.getScale() * 2);
       vi.advanceTimersByTime(200); // past ZOOM_SETTLE_MS
 
       // A settle render was dispatched for page 0 into a canvas that is NOT the
@@ -3057,7 +3058,7 @@ describe('DocxScrollViewer — flicker-free zoom (T8)', () => {
     const canvasUid = canvas._uid;
     const bitmapsBefore = engine.bitmapCalls.length;
 
-    v.setScale(v.scaleForTest() * 2);
+    v.setScale(v.getScale() * 2);
     vi.advanceTimersByTime(200); // past ZOOM_SETTLE_MS
 
     // Worker settle re-dispatched a bitmap render for the visible window (no spare
@@ -3107,12 +3108,12 @@ describe('DocxScrollViewer — flicker-free zoom (T8)', () => {
       const slot = slotAtTop(scrollHost, '0px')!;
       const onScreenCanvas = slot.children.find((k) => k.tag === 'canvas') as FakeEl;
 
-      v.setScale(v.scaleForTest() * 2);
+      v.setScale(v.getScale() * 2);
       vi.advanceTimersByTime(200); // settle dispatched (deferred, in flight)
       const settleCall = engine.renderCalls.filter((c) => c.page === 0).pop()!;
 
       // Another setScale bumps the epoch WHILE the settle render is in flight.
-      v.setScale(v.scaleForTest() * 1.1);
+      v.setScale(v.getScale() * 1.1);
 
       // The old settle now resolves — epoch moved ⇒ STALE ⇒ no swap.
       settleCall.resolve();
@@ -3137,7 +3138,7 @@ describe('DocxScrollViewer — flicker-free zoom (T8)', () => {
     try {
       const { v, engine } = setup();
       const dispatchesBefore = engine.renderCalls.length;
-      v.setScale(v.scaleForTest() * 2); // schedules a settle timer
+      v.setScale(v.getScale() * 2); // schedules a settle timer
       v.destroy(); // must clear the pending timer
       vi.advanceTimersByTime(500); // fire any surviving timer
       // No settle render dispatched after destroy.
@@ -3155,7 +3156,7 @@ describe('DocxScrollViewer — flicker-free zoom (T8)', () => {
       for (const c of engine.renderCalls.slice()) c.resolve();
       const slot = slotAtTop(scrollHost, '0px')!;
       const onScreenCanvas = slot.children.find((k) => k.tag === 'canvas') as FakeEl;
-      v.setScale(v.scaleForTest() * 2);
+      v.setScale(v.getScale() * 2);
       vi.advanceTimersByTime(200);
       const settleCall = engine.renderCalls.filter((c) => c.page === 0).pop()!;
       v.destroy(); // tear down while the settle render is in flight
@@ -3183,7 +3184,7 @@ describe('DocxScrollViewer — flicker-free zoom (T8)', () => {
     const slot = slotAtTop(scrollHost, '0px')!;
     const textLayer = slot.children.find((k) => k.tag === 'div') as FakeEl;
 
-    v.setScale(v.scaleForTest() * 2);
+    v.setScale(v.getScale() * 2);
     expect(textLayer.style.transform).toBe('scale(2)'); // preview transform applied
     vi.advanceTimersByTime(200);
     const settleCall = engine.renderCalls.filter((c) => c.page === 0).pop()!;
@@ -3284,7 +3285,7 @@ describe('DocxScrollViewer — pageShadow (T9)', () => {
       // Resolve the initial mount renders so the on-screen canvases are painted.
       for (const c of engine.renderCalls.slice()) c.resolve();
 
-      v.setScale(v.scaleForTest() * 2); // zoom → schedules a settle
+      v.setScale(v.getScale() * 2); // zoom → schedules a settle
       vi.advanceTimersByTime(200); // past ZOOM_SETTLE_MS → settle dispatched
 
       // The settle render for page 0 targets a fresh SPARE canvas — it must

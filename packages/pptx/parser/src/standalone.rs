@@ -35,21 +35,50 @@ pub fn parse_standalone_shape_part(
     max_part_bytes: u64,
     max_total_bytes: u64,
 ) -> Result<Option<StandaloneShape>, String> {
-    let mut zip = open_zip_with_limits(
-        package.to_vec(),
-        Some(max_part_bytes),
-        Some(max_total_bytes),
-    )?;
+    // PackageSession owns its source across operations. Retain that ownership
+    // contract, but make this secondary source copy fallible: OPC containers
+    // may have large inert prefixes despite very little inflated content.
+    // Source length is not an admission quota. On allocation failure, report
+    // the unavailable additional retention through the ordinary resource wire
+    // envelope (zero retained capacity, actual requested bytes), before opening
+    // a package session. Callers preserve this marker.
+    let mut source = Vec::new();
+    source.try_reserve_exact(package.len()).map_err(|_| {
+        format!(
+            "OOXML_RESOURCE_LIMIT:{}",
+            serde_json::json!({
+                "code": "ooxml-resource-limit",
+                "details": {
+                    "stage": "parsing",
+                    "violation": {
+                        "format": "pptx",
+                        "operation": "standalone-shape",
+                        "resource": "package-source-allocation",
+                        "metric": "retained-bytes",
+                        "limit": source.capacity(),
+                        "observed": package.len(),
+                        "configurable": false,
+                        "usage": ResourceUsage::default(),
+                    }
+                }
+            })
+        )
+    })?;
+    source.extend_from_slice(package);
+    let mut zip = open_zip_with_limits(source, Some(max_part_bytes), Some(max_total_bytes))?;
     zip.run_operation("standalone-shape", |zip| {
         let xml = read_zip_str(zip, part).map_err(|e| e.to_string())?;
+        standalone_xml_limits(zip, &xml, Some(part))?;
         let doc = parse_preflighted_pptx_xml(&xml).map_err(|e| e.to_string())?;
         let root = doc.root_element();
+        standalone_xml_limits(zip, theme_xml, None)?;
         let mut theme = PptxTheme::from_xml(theme_xml);
         if let Some(map_xml) = clr_map_xml {
+            standalone_xml_limits(zip, map_xml, None)?;
             let map_doc = parse_preflighted_pptx_xml(map_xml).map_err(|e| e.to_string())?;
             let node = map_doc.root_element();
-            // Slide masters carry p:clrMap (ECMA-376 §19.3.1.6), while
-            // [MS-PPT] §2.11.9 round-trip color mappings use a:clrMap.
+            // Slide masters carry p:clrMap (ECMA-376 §19.3.1.6); a DrawingML
+            // a:clrMap (§20.1.6.1, CT_ColorMapping) has the same attributes.
             if node.tag_name().name() != "clrMap"
                 || !(is_p_ns(node.tag_name().namespace()) || is_a_ns(node.tag_name().namespace()))
             {
@@ -109,6 +138,34 @@ pub fn parse_standalone_shape_part(
     })
 }
 
+/// Resource policy shared with ordinary package XML reads. Supplied theme and
+/// color-map XML bypass archive preflight; the DOM parser's depth error and
+/// theme fallback must not erase a quota failure. Report it before parsing,
+/// with the current operation's measured usage and without inventing a part
+/// path for context XML supplied separately from the package.
+fn standalone_xml_limits(zip: &mut PptxZip, xml: &str, part: Option<&str>) -> Result<(), String> {
+    use ooxml_common::depth::{xml_too_deep, MAX_XML_DEPTH};
+    let reporter = zip.operation()?.limit_reporter()?;
+    if xml_too_deep(xml.as_bytes()) {
+        reporter.observe_hard_limit(
+            HardResourceLimitKind::XmlNestingDepth,
+            part,
+            u64::from(MAX_XML_DEPTH),
+            u64::from(MAX_XML_DEPTH) + 1,
+        )?;
+    }
+    let limit = pptx_internal_limits().xml_dom_complexity;
+    if xml_dom_complexity_exceeds(xml, limit) {
+        reporter.observe_hard_limit(
+            HardResourceLimitKind::XmlDomComplexity,
+            part,
+            limit,
+            limit + 1,
+        )?;
+    }
+    Ok(())
+}
+
 fn theme_style_has_relationship(root: roxmltree::Node<'_, '_>, theme: &PptxTheme) -> bool {
     // ECMA-376 §20.1.4.2: only the DrawingML references directly in the
     // shape's p:style select theme matrix entries. Extension descendants do
@@ -143,7 +200,9 @@ fn theme_style_has_relationship(root: roxmltree::Node<'_, '_>, theme: &PptxTheme
             };
             // A failed fragment parse leaves the dependency unverifiable. Never
             // turn that state into a claim that this shape is self-contained.
-            let has_relationship = theme_fragment_needs_relationship_verification(&entry.to_xml());
+            let has_relationship = entry.to_xml().map_or(true, |xml| {
+                theme_fragment_needs_relationship_verification(&xml)
+            });
             inspected.insert((kind, index), has_relationship);
             has_relationship
         })

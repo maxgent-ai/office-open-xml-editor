@@ -1,3 +1,4 @@
+import { normalizeDocxParserError } from './internal/parser-errors.js';
 import init, { DocxArchive, reinit } from './wasm/docx_parser.js';
 import {
   decodeDataUrl,
@@ -63,7 +64,7 @@ self.onmessage = async (e: MessageEvent<WorkerRequest | PullSessionCommand<numbe
         operationId: req.operationId,
         generation: req.generation,
         requestId: req.requestId,
-        error: serializeWorkerError(error),
+        error: serializeWorkerError(normalizeDocxParserError(error)),
       });
     }
     return;
@@ -137,7 +138,7 @@ self.onmessage = async (e: MessageEvent<WorkerRequest | PullSessionCommand<numbe
       return;
     }
   } catch (err) {
-    const res: WorkerResponse = { type: 'error', id, ...serializeWorkerError(err) };
+    const res: WorkerResponse = { type: 'error', id, ...serializeWorkerError(normalizeDocxParserError(err)) };
     post(res);
   }
 };

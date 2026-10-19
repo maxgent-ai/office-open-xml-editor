@@ -1,8 +1,8 @@
 /**
- * Machine-readable code for a typed load-time failure.
+ * Machine-readable code for a typed input failure, at load or during lazy reads.
  *
- * The container-level failures the `load()` factories detect on the main thread
- * before handing bytes to the parser worker (see `sniffCfb` / `decryptOoxml`).
+ * Container failures can be detected before parsing (sniffCfb/decryptOoxml);
+ * parsers and configured model sources can also report typed failures.
  * This is the seed of the broader typed-error surface tracked as PD4 (OoxmlError
  * typed errors). Add codes here rather than throwing bare `Error(string)`, so
  * callers can `switch` on `err.code` instead of matching message text.
@@ -19,6 +19,11 @@
  *     without the OPC `[Content_Types].xml` stream, or an OPC package without
  *     the format's main part. Raised by the parser at package admission and
  *     reconstructed across the worker boundary.
+ *   - `'unsupported-content'`  — a configured model source cannot represent
+ *     the input; details identify its format and stable rejection category.
+ *   - `'unsupported-image-effect'` — a malformed CT_Blip
+ *     chain, an unavailable image-effect/fill surface, or unrepresentable
+ *     image-effect/fill geometry at render time.
  *   - `'invalid-numbering'`     — a DOCX numbering level that Word cannot open
  *     normally (invalid paragraph ilvl or an out-of-range level definition).
  */
@@ -28,7 +33,9 @@ export type OoxmlErrorCode =
   | 'unsupported-encryption'
   | 'legacy-binary-format'
   | 'not-ooxml'
-  | 'invalid-numbering';
+  | 'unsupported-image-effect'
+  | 'invalid-numbering'
+  | 'unsupported-content';
 
 export type OoxmlErrorStage =
   | 'container'
@@ -39,25 +46,35 @@ export type OoxmlErrorStage =
   | 'rendering'
   | 'worker';
 
+/** A source's declared representational boundary, not a parser crash or quota.
+ * Format is a bounded source-owned identifier; core has no input-format registry.
+ * No document text, paths, native diagnostics or URLs belong in this record. */
+export interface OoxmlUnsupportedContentDetails {
+  readonly format: string;
+  readonly reason: 'source-subset';
+}
+
 /**
- * Typed error thrown by the docx / pptx / xlsx `load()` factories for failures
+ * Typed error thrown by load factories and the image paint pipeline for failures
  * that carry a stable, programmatic {@link OoxmlErrorCode} (e.g. a
  * password-protected or legacy-binary file detected from its container magic).
  *
- * Note on workers: `instanceof OoxmlError` does not survive a structured-clone
- * across the worker boundary. Detection that needs a typed error is therefore
- * done on the main thread (before the worker is involved) so a genuine
- * `OoxmlError` instance is thrown to the caller. Errors that must cross the
- * worker boundary should carry the `code` string and be reconstructed on the
- * main side.
+ * Workers send validated code/details payloads; the receiving viewer restores
+ * a real OoxmlError. Source-module open and lazy archive operations use the
+ * same constructor in their owning realm before crossing the worker boundary.
  */
 export class OoxmlError extends Error {
   readonly code: OoxmlErrorCode;
 
-  constructor(code: OoxmlErrorCode, message: string) {
+  readonly details?: OoxmlUnsupportedContentDetails;
+
+  constructor(code: OoxmlErrorCode, message: string, details?: OoxmlUnsupportedContentDetails) {
     super(message);
     this.name = 'OoxmlError';
     this.code = code;
+    if (code === 'unsupported-content' && details) {
+      this.details = Object.freeze({ format: details.format, reason: details.reason });
+    }
     // Restore the prototype chain for environments that down-level `extends
     // Error` (e.g. older TS `target`), so `instanceof OoxmlError` holds.
     Object.setPrototypeOf(this, OoxmlError.prototype);

@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { Row, Worksheet } from '@silurus/ooxml-xlsx';
-import { DEFAULT_XLSX_WORKSHEET_POLICY } from '@silurus/ooxml-core/worker';
+import { DEFAULT_XLSX_WORKSHEET_POLICY } from '@silurus/ooxml-xlsx/internal/session';
 import { OoxmlError } from '@silurus/ooxml-core';
 import { generateSyntheticXlsx } from '../scripts/generate-synthetic-xlsx.mjs';
 // Test-only direct relative import of the realm-local policy context.

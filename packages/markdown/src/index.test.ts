@@ -13,7 +13,7 @@ vi.mock('@silurus/ooxml-docx/wasm', () => ({
   docx_to_markdown: mocks.docxToMarkdown,
 }));
 
-import { OoxmlResourceLimitError } from '@silurus/ooxml-core';
+import { OoxmlError, OoxmlResourceLimitError } from '@silurus/ooxml-core';
 import { docxToMarkdown, initDocxFromBytes } from './index.js';
 
 describe('markdown byte normalization', () => {
@@ -73,6 +73,17 @@ describe('markdown projection errors', () => {
     }
     expect(error).toBeInstanceOf(OoxmlResourceLimitError);
     expect(error).toMatchObject({ code: 'ooxml-resource-limit', details });
+  });
+
+  it('normalizes DOCX numbering failures through the DOCX-owned adapter', () => {
+    mocks.docxToMarkdown.mockImplementation(() => { throw 'OOXML_DOCX_ILVL:cannot-open:whitespace'; });
+    let error: unknown;
+    try { docxToMarkdown(new Uint8Array([1])); } catch (caught) { error = caught; }
+    expect(error).toBeInstanceOf(OoxmlError);
+    expect(error).toMatchObject({
+      code: 'invalid-numbering',
+      message: 'Word cannot open this DOCX numbering level (whitespace).',
+    });
   });
 
   it('rethrows any other failure unchanged', () => {

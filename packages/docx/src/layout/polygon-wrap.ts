@@ -94,10 +94,6 @@ export interface PolygonInterval {
   r: number;
 }
 
-function edgeXAt(edge: CompiledEdge, yPt: number): number {
-  return edge.from.xPt + edge.slopeXPerY * (yPt - edge.from.yPt);
-}
-
 interface ExactPoint {
   readonly x: bigint;
   readonly y: bigint;
@@ -1195,30 +1191,4 @@ export function polygonBandExactIntervalFunctions(
     intervals.push(exactInterval);
   }
   return Object.freeze(intervals);
-}
-
-/** Number adapter for diagnostics; the line-window solver consumes the exact authority above. */
-export function polygonBandIntervalFunctions(
-  polygon: CompiledPolygonWrap,
-  probeHeightPt: number,
-  intervalTopY: number,
-  intervalBottomY: number,
-): readonly PolygonAffineInterval[] {
-  return Object.freeze(
-    polygonBandExactIntervalFunctions(
-      polygon,
-      probeHeightPt,
-      intervalTopY,
-      intervalBottomY,
-    ).map((interval) => Object.freeze({
-      left: Object.freeze({
-        slope: exactRationalToNumber(interval.left.slope),
-        intercept: exactRationalToNumber(interval.left.intercept),
-      }),
-      right: Object.freeze({
-        slope: exactRationalToNumber(interval.right.slope),
-        intercept: exactRationalToNumber(interval.right.intercept),
-      }),
-    })),
-  );
 }

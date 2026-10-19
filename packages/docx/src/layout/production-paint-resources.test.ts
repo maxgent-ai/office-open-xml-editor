@@ -68,11 +68,13 @@ function documentModel(): DocxDocumentModel {
     }, {
       type: 'shape', widthPt: 50, heightPt: 30, anchorXPt: 0, anchorYPt: 0,
       anchorXFromMargin: false, anchorYFromPara: false, zOrder: 0, subpaths: [],
+      rotation: 30, flipH: true,
       fill: {
         fillType: 'image', imagePath: 'word/media/shape-fill.png', mimeType: 'image/png',
         svgImagePath: 'word/media/shape-fill.svg',
         srcRect: { l: .2, t: 0, r: .1, b: .05 },
         alpha: .6, duotone: { clr1: '112233', clr2: 'DDEEFF' },
+        blipEffects: [{ type: 'blur', radius: 12700, grow: true }],
       }, stroke: null, textBlocks: [{
         text: '', fontSizePt: 10, alignment: 'left', imagePath: 'word/media/textbox.png',
         mimeType: 'image/png', imageWidthPt: 9, imageHeightPt: 5,
@@ -142,7 +144,12 @@ describe('production paint resources', () => {
       svgImagePath: 'word/media/shape-fill.svg',
       srcRect: { l: .2, t: 0, r: .1, b: .05 },
       alpha: .6, duotone: { clr1: '112233', clr2: 'DDEEFF' },
+      blipEffects: [{ type: 'blur', radius: 12700, grow: true }],
+      // The fill image is unrotated, but its page-fixed effects are evaluated
+      // against the host shape's orientation (§20.1.8.45/.49).
+      effectHost: { rotation: 30, flipH: true },
     });
+    expect(registry.resolve(shapeFillKey, 'image')).not.toHaveProperty('rotation');
     expect(registry.resolve(bulletKey, 'picture-bullet')).toMatchObject({
       partPath: 'word/media/bullet.gif', intrinsicSize: { widthPt: 6, heightPt: 7 },
     });

@@ -105,6 +105,7 @@ mod chartex;
 mod classic;
 mod labels;
 mod model;
+mod related_parts;
 mod retained;
 mod style;
 
@@ -114,6 +115,7 @@ use chartex::*;
 use classic::*;
 pub use labels::*;
 pub use model::*;
+pub use related_parts::{load_chart_related_parts, load_chart_user_shapes_xml, ChartRelatedParts};
 pub use retained::RetainedBytes;
 use style::*;
 
@@ -190,7 +192,95 @@ impl<'a> ChartParseContext<'a> {
 
 /// Parse an ECMA-376 DrawingML chart part into the shared wire model.
 pub fn parse_chart_part(root: Node, context: &ChartParseContext<'_>) -> Option<ChartModel> {
+    if let Err((limit, observed)) = classic_cache_preparse(root) {
+        // Fail closed with a typed hard-limit violation (the host turns the
+        // latched violation into its OOXML_RESOURCE_LIMIT error) instead of
+        // letting `vec![_; ptCount]` request an unbounded allocation.
+        use crate::resource::{observe_hard_limit, HardResourceLimitKind};
+        let kind = HardResourceLimitKind::ChartCachePoints;
+        if let Some(reporter) = context.limit_reporter {
+            let _ = reporter.observe_hard_limit(kind, None, limit, observed);
+        } else {
+            let _ = observe_hard_limit(kind, None, limit, observed);
+        }
+        return None;
+    }
     parse_part(root, context, parse_classic_impl)
+}
+
+/// Total cache slots one classic chart part may declare: four full-height
+/// worksheet columns of [`MAX_CHART_CACHE_POINTS`] each. Library resource
+/// policy, not an ECMA-376 rule.
+const MAX_CLASSIC_CHART_CACHE_SLOTS: usize = 4 * MAX_CHART_CACHE_POINTS;
+
+/// Bound the dense vectors the classic parser sizes from `<c:ptCount>` and
+/// `<c:pt idx>` before any of them is allocated.
+///
+/// The cache collectors size one vector per cache from whichever `ptCount`
+/// they meet (some take the first child, others the last descendant of a
+/// series container) or from the largest `pt idx`, so admission does not
+/// mirror one collector. Every element's width is the largest `ptCount` value,
+/// `pt idx + 1` or number of `pt` among its children; each width is bounded by
+/// [`MAX_CHART_CACHE_POINTS`] (the worksheet row limit chart data comes from)
+/// and their sum over the part by [`MAX_CLASSIC_CHART_CACHE_SLOTS`]. Every
+/// `ptCount` and `pt` is some element's child, so this covers every vector the
+/// collectors can size (a `multiLvlStrCache` counts each `lvl`; its own
+/// collector separately bounds width × levels), and error bars beyond the
+/// schema's two per series are charged at their plus/minus vector cost.
+/// `Err` carries the crossed limit and the observed (saturated) count.
+fn classic_cache_preparse(root: Node) -> Result<(), (u64, u64)> {
+    let single = MAX_CHART_CACHE_POINTS as u64;
+    let total_limit = MAX_CLASSIC_CHART_CACHE_SLOTS as u64;
+    let parse = |value: Option<&str>| value.and_then(|v| v.trim().parse::<u64>().ok());
+    let mut total = 0u64;
+    for node in root.descendants().filter(Node::is_element) {
+        // Collectors without a usable `ptCount` fall back to the number of
+        // `pt` elements, so that count is a width too.
+        let (mut width, mut point_elements) = (0u64, 0u64);
+        for child in node.children().filter(Node::is_element) {
+            let child_width = match child.tag_name().name() {
+                "ptCount" => parse(child.attribute("val")),
+                "pt" => {
+                    point_elements += 1;
+                    parse(child.attribute("idx")).map(|index| index.saturating_add(1))
+                }
+                _ => None,
+            };
+            width = width.max(child_width.unwrap_or(0));
+        }
+        let width = width.max(point_elements);
+        if width > single {
+            return Err((single, width));
+        }
+        total = total.saturating_add(width);
+        // Each `<c:errBars>` of a series materializes plus/minus vectors as
+        // long as the series. The schema allows at most two per series
+        // (CT_ScatterSer x and y); charge every further one at that cost so
+        // repeated error bars cannot multiply a bounded cache.
+        let extra_error_bars = node
+            .children()
+            .filter(|child| child.is_element() && child.tag_name().name() == "errBars")
+            .count()
+            .saturating_sub(2) as u64;
+        if extra_error_bars > 0 {
+            let series_width = node
+                .descendants()
+                .filter(Node::is_element)
+                .filter_map(|child| match child.tag_name().name() {
+                    "ptCount" => parse(child.attribute("val")),
+                    "pt" => parse(child.attribute("idx")).map(|index| index.saturating_add(1)),
+                    _ => None,
+                })
+                .max()
+                .unwrap_or(0);
+            total = total
+                .saturating_add(extra_error_bars.saturating_mul(series_width.saturating_mul(2)));
+        }
+        if total > total_limit {
+            return Err((total_limit, total));
+        }
+    }
+    Ok(())
 }
 
 /// Parse a Microsoft chartEx part into the shared wire model.

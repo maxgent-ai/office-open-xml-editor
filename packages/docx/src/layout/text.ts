@@ -1,6 +1,5 @@
-import type { NativeReadingWordBreaking } from '../native-reading-word-breaking.js';
-import type { NativeReadingPictureBullet } from '../native-reading-picture-bullet.js';
 import { wordTextBoxVerticalMode } from './compatibility.js';
+import { wordArabicTextKerned } from './line-compatibility.js';
 import type { LayoutDiagnostic } from './types.js';
 import {
   classifyFontGeneric,
@@ -24,7 +23,6 @@ import type {
   DocParagraph,
   DocRun,
   DocxTextRun,
-  FieldRun,
   ShapeTextRun,
   TabStop,
 } from '../types.js';
@@ -37,6 +35,7 @@ import type {
 import { containsHanScript } from '@silurus/ooxml-core/internal/script-preload-accumulator';
 import type { TextBoxAcquisitionInput } from './textbox-input.js';
 import type { AnchorAcquisitionInput } from './anchor-input.js';
+import type { InternalParagraphTypographyWire } from './typography-input.js';
 
 /** The subset of a measured text segment needed to resolve its effective size. */
 export interface EffectiveFontSegment {
@@ -140,9 +139,6 @@ type ParagraphTextFacts = Readonly<{
   /** Authored discretionary opportunity with its own conditional glyph style.
    * Its source run is otherwise empty, independent of dictionary hyphenation. */
   optionalHyphen?: boolean;
-  /** Explicit native reading owner; common layout never applies unknown
-   * Hresi dictionary/character transformations. Literal text stays unchanged. */
-  nativeReadingWordBreaking?: Readonly<NativeReadingWordBreaking>;
   /** Parser-projected CT_R boundary constraint around an authored
    * `<w:noBreakHyphen/>`. These names are layout facts, not parser wire keys. */
   noBreakBefore?: boolean;
@@ -164,9 +160,9 @@ type ParagraphTextFacts = Readonly<{
     theme: TextFontSlots;
     themePresent: TextFontSlotPresence;
   }>;
-  /** Private native reserved-separator character (MS-DOC 2.3.3): the
+  /** Private reserved-separator character (ECMA-376 §17.18.33 story): the
    * U+0003/U+0004 control or the story paragraph's content mark. It carries
-   * that character's own effective CHPX and has no text; line acquisition
+   * that character's own effective properties and has no text; line acquisition
    * resolves its selected face as a zero-advance, inkless metric participant.
    * Its rule ink is retained separately, never as a glyph. */
   noteSeparatorCharacter?: 'rule-control' | 'paragraph-mark';
@@ -188,7 +184,7 @@ export type ParagraphMathRun = Readonly<{
   fallbackText: string;
 }>;
 
-export type ParagraphShapeRun = DeepReadonly<Extract<DocRun, { type: 'shape' }>> & Readonly<{
+export type ParagraphShapeRun = DeepReadonly<Extract<DocRun, { type: 'shape' }> & import('./types.js').VmlShapeAcquisitionFacts> & Readonly<{
   vmlTextPathInput?: VmlTextPathAcquisitionInput;
   textBoxInput?: TextBoxAcquisitionInput;
   anchorAcquisitionInput?: AnchorAcquisitionInput;
@@ -243,10 +239,9 @@ export interface ComplexFieldBoundaryInput {
 }
 
 export type ParagraphAcquisitionInput = DeepReadonly<Omit<DocParagraph, 'runs'>> & Readonly<{
-  nativeReadingNumberingWordBreaking?: Readonly<NativeReadingWordBreaking>;
+  typographyInput?: Readonly<InternalParagraphTypographyWire>;
   runs: readonly ParagraphAcquisitionRun[];
   complexFieldBoundaries?: readonly ComplexFieldBoundaryInput[];
-  nativeReadingPictureBullet?: NativeReadingPictureBullet;
   numberingMarkerShapeInput?: NumberingMarkerShapeInput;
   paragraphMarkShapeInput?: NumberingMarkerShapeInput;
 }>;
@@ -257,7 +252,6 @@ export type ParagraphAcquisitionInput = DeepReadonly<Omit<DocParagraph, 'runs'>>
 export type ParagraphLayoutSource = DeepReadonly<Omit<DocParagraph, 'runs'>> & Readonly<{
   runs: readonly (DeepReadonly<DocRun> | ParagraphAcquisitionRun)[];
   complexFieldBoundaries?: readonly ComplexFieldBoundaryInput[];
-  nativeReadingPictureBullet?: NativeReadingPictureBullet;
   numberingMarkerShapeInput?: NumberingMarkerShapeInput;
   paragraphMarkShapeInput?: NumberingMarkerShapeInput;
 }>;
@@ -491,9 +485,33 @@ export interface GlyphInkBounds {
   readonly descentPt: number;
 }
 
+/** Two Canvas routes rasterizing the same text in the same tuple. */
+export interface GlyphRasterComparisonRequest {
+  readonly text: string;
+  readonly weight: number;
+  readonly style: FontStyle;
+  readonly route: CanvasFontRoute;
+  /** Single private family of one loaded exact face; the comparison route. */
+  readonly faceFamily: string;
+}
+
 export interface GlyphMeasurer {
   readonly fingerprint: string;
   measure(request: Readonly<GlyphMeasureRequest>): GlyphMeasurement;
+  /** True only when both routes paint pixel-identical non-empty glyph
+   * rasters for the request. Absent or unable to rasterize → no proof. */
+  sameGlyphRaster?(request: Readonly<GlyphRasterComparisonRequest>): boolean;
+  /** True only when every grapheme of `text` shapes with zero advance
+   * through the size-adjust:0% family, i.e. that exact source owns it. */
+  ownsGlyphs?(request: Readonly<GlyphOwnershipRequest>): boolean;
+}
+
+/** Glyph ownership through one source's size-adjust:0% registration. */
+export interface GlyphOwnershipRequest {
+  readonly text: string;
+  readonly weight: number;
+  readonly style: FontStyle;
+  readonly coverageProbeFamily: string;
 }
 
 export interface TextShapeSpan extends GlyphMeasurement {
@@ -530,6 +548,16 @@ export interface TextShapeResult extends GlyphMeasurement {
   readonly diagnostics: readonly LayoutDiagnostic[];
 }
 
+/** Native font authority acquires glyph contours before layout paint. The
+ * numerical outline precision is in final point space, independent of DPR. */
+export interface GlyphContourRequest {
+  readonly spans: readonly Readonly<{ text: string; advancePt: number; fontRoute: CanvasFontRoute; font: Pick<FontResolution, 'weight' | 'style'> }>[];
+  readonly fontSizePt: number;
+  readonly ink: Readonly<{ xMinPt: number; xMaxPt: number; ascentPt: number; descentPt: number }>;
+  readonly maximumScale: number;
+  readonly maximumWork: number;
+}
+
 export interface TextLayoutService {
   readonly fingerprint: string;
   /** Geometry keyed by a resolved resource identity. This is the authoritative
@@ -539,14 +567,23 @@ export interface TextLayoutService {
   readonly localMetrics: Readonly<Record<string, Readonly<ResolvedFontMetric>>>;
   resolve(request: Readonly<TextFontResolveRequest>): FontResolution;
   shape(request: Readonly<TextShapeRequest>): TextShapeResult;
+  glyphContours?(request: GlyphContourRequest): readonly (readonly Readonly<{x: number; y: number}>[])[] | undefined;
   /** Per-source script-substitute proof, when configured. A mixed scope stays
    * a semantic face-selection boundary; plain runs return no scope key. */
   sourceScopeKey?(request: Readonly<TextShapeRequest>): string | undefined;
+  /** Cached {@link GlyphMeasurer.sameGlyphRaster} proof. */
+  sameGlyphRaster?(request: Readonly<GlyphRasterComparisonRequest>): boolean;
+  /** {@link FontResolver.exactLocalFaces} of this service's resolver. */
+  exactLocalFaces?(requestedFamily: string): readonly Readonly<{ resolvedFamily: string; weight: number; style: FontStyle; coverageProbeFamily?: string }>[];
+  /** {@link GlyphMeasurer.ownsGlyphs} of this service's measurer. */
+  ownsGlyphs?(request: Readonly<GlyphOwnershipRequest>): boolean;
 }
 
 export interface TextLayoutServiceInput {
   readonly fonts: FontResolver;
   readonly measurer: GlyphMeasurer;
+  readonly glyphContours?: TextLayoutService['glyphContours'];
+  readonly glyphContourFingerprint?: string;
   readonly cjkFallback?: CjkLang;
   readonly fontMetrics?: Readonly<Record<string, Readonly<ResolvedFontMetric>>>;
   /** Exact local aliases also participate in resolution; retained separately
@@ -650,6 +687,9 @@ export function snapshotFontMetrics(
       }
       const copy: ResolvedFontMetric = {
         family: metric.family,
+        ...(metric.requiresGlyphCoverage === undefined ? {} : { requiresGlyphCoverage: metric.requiresGlyphCoverage }),
+        ...(metric.glyphCoverageProbeFamily === undefined ? {} : { glyphCoverageProbeFamily: metric.glyphCoverageProbeFamily }),
+        ...(metric.farEastCodePage === undefined ? {} : { farEastCodePage: metric.farEastCodePage }),
         ...(metric.lineHeightRatio === undefined ? {} : { lineHeightRatio: metric.lineHeightRatio }),
         ...(metric.designAscentRatio === undefined ? {} : { designAscentRatio: metric.designAscentRatio }),
         ...(metric.designDescentRatio === undefined ? {} : { designDescentRatio: metric.designDescentRatio }),
@@ -850,7 +890,11 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
       .map(([family, charset]) => [family.trim().toLowerCase(), charset.trim()])
       .sort(([a], [b]) => a.localeCompare(b)),
   ));
+  if (input.glyphContours && !input.glyphContourFingerprint?.trim()) {
+    throw new TypeError('Native glyph contour acquisition requires an authority fingerprint');
+  }
   const fingerprint = stableFingerprint('text', {
+    glyphContours: input.glyphContourFingerprint ?? 'unavailable',
     fonts: input.fonts.fingerprint,
     measurer: input.measurer.fingerprint,
     cjkFallback: input.cjkFallback ?? null,
@@ -983,7 +1027,28 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
   const scopeCache = new Map<string, Map<string, Uint8Array>>();
   let scopeScans = 0;
   let scopeUtf16Units = 0;
+  // Bounded per document service: authored family names are arbitrary.
+  const rasterProofs = new Map<string, boolean>();
+  const rasterProofLimit = 256;
+  const sameGlyphRaster = input.measurer.sameGlyphRaster
+    ? (request: Readonly<GlyphRasterComparisonRequest>): boolean => {
+        const key = JSON.stringify([request.route.fingerprint, request.faceFamily,
+          request.weight, request.style, request.text]);
+        const retained = rasterProofs.get(key);
+        if (retained !== undefined) return retained;
+        const proved = input.measurer.sameGlyphRaster!(request);
+        if (rasterProofs.size >= rasterProofLimit) rasterProofs.clear();
+        rasterProofs.set(key, proved);
+        return proved;
+      }
+    : undefined;
   const service: TextLayoutService = Object.freeze({
+    ...(input.glyphContours ? { glyphContours: input.glyphContours } : {}),
+    ...(sameGlyphRaster ? { sameGlyphRaster } : {}),
+    ...(input.measurer.ownsGlyphs
+      ? { ownsGlyphs: (request: Readonly<GlyphOwnershipRequest>) => input.measurer.ownsGlyphs!(request) } : {}),
+    ...(input.fonts.exactLocalFaces
+      ? { exactLocalFaces: (family: string) => input.fonts.exactLocalFaces!(family) } : {}),
     fingerprint,
     fontMetrics,
     localMetrics: fontMetrics,
@@ -1307,7 +1372,7 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
           weight: font.weight,
           style: font.style,
           letterSpacingPt: request.letterSpacingPt ?? 0,
-          kerning: request.kerning,
+          kerning: wordArabicTextKerned(group.text) ? true : request.kerning,
         });
         return Object.freeze({
           ...group, ...measurement, font, fontRoute: font.route,
@@ -1370,7 +1435,7 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
                   weight: span.font.weight,
                   style: span.font.style,
                   letterSpacingPt: request.letterSpacingPt ?? 0,
-                  kerning: request.kerning,
+                  kerning: wordArabicTextKerned(span.text) ? true : request.kerning,
                 });
                 break;
               }

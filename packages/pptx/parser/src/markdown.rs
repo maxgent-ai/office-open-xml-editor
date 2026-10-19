@@ -2,6 +2,9 @@
 //! feed canonical slides through this one bounded writer and renderer.
 
 use crate::types::*;
+use ooxml_common::markdown::{
+    escape_fragment, escape_text, line_start_after_markup, split_lines, TextContext,
+};
 use ooxml_common::math::nodes_to_text;
 use std::cell::Cell;
 use std::fmt;
@@ -97,7 +100,12 @@ pub(crate) fn render_slide_md(slide: &Slide, out: &mut MarkdownWriter) {
     use std::fmt::Write as _;
     let title = slide_title_md(slide);
     if let Some(t) = title {
-        let _ = writeln!(out, "# {} (slide {})\n", t, slide.slide_number);
+        let _ = writeln!(
+            out,
+            "# {} (slide {})\n",
+            escape_text(&t, TextContext::Heading),
+            slide.slide_number
+        );
     } else {
         let _ = writeln!(out, "# Slide {}\n", slide.slide_number);
     }
@@ -107,7 +115,11 @@ pub(crate) fn render_slide_md(slide: &Slide, out: &mut MarkdownWriter) {
     if let Some(notes) = &slide.notes {
         let trimmed = notes.trim();
         if !trimmed.is_empty() {
-            let _ = writeln!(out, "## Speaker notes\n\n{}\n", trimmed);
+            let _ = writeln!(
+                out,
+                "## Speaker notes\n\n{}\n",
+                escape_text(trimmed, TextContext::Inline)
+            );
         }
     }
 }
@@ -224,10 +236,15 @@ pub(crate) fn render_paragraph_md(
         out.push('\n');
         return;
     }
-    for _ in 0..para.lvl {
-        out.push_str("  ");
+    let kind = paragraph_kind(&para.bullet, inherit_means_bullet);
+    // Nesting indentation belongs to list items only: four or more leading
+    // spaces before a plain paragraph would open an indented code block.
+    if !matches!(kind, ParaKind::Plain) {
+        for _ in 0..para.lvl {
+            out.push_str("  ");
+        }
     }
-    match paragraph_kind(&para.bullet, inherit_means_bullet) {
+    match kind {
         ParaKind::Plain => {}
         ParaKind::Bullet => out.push_str("- "),
         // We deliberately emit `1.` for every numbered paragraph rather than
@@ -249,20 +266,30 @@ fn runs_have_visible_text(runs: &[TextRun]) -> bool {
 }
 
 pub(crate) fn render_runs_md(runs: &[TextRun], out: &mut MarkdownWriter) {
+    // The runs form one line sequence: indentation that opens a projected
+    // line is dropped even when it arrives in its own run.
+    let mut line_start = true;
+    let text = |value: &str, out: &mut MarkdownWriter, line_start: &mut bool| {
+        out.push_str(&escape_fragment(value, TextContext::Inline, line_start));
+    };
+    let markup = |value: &str, out: &mut MarkdownWriter, line_start: &mut bool| {
+        out.push_str(value);
+        *line_start = line_start_after_markup(value, *line_start);
+    };
     for run in runs {
         match run {
             // Intra-paragraph soft break (<a:br/>) → markdown hard line break
             // (two trailing spaces + newline).
-            TextRun::Break { .. } => out.push_str("  \n"),
+            TextRun::Break { .. } => markup("  \n", out, &mut line_start),
             // Equations have no faithful markdown form; emit their flattened text.
-            TextRun::Math { nodes, .. } => out.push_str(&nodes_to_text(nodes)),
+            TextRun::Math { nodes, .. } => text(&nodes_to_text(nodes), out, &mut line_start),
             TextRun::Text(t) => {
                 let raw = &t.text;
                 // Empty / whitespace-only runs (separators between formatted
                 // spans) shouldn't trigger bold/italic wrappers — `**   **`
                 // is awkward and most renderers drop the formatting anyway.
                 if raw.chars().all(|c| c.is_whitespace()) {
-                    out.push_str(raw);
+                    text(raw, out, &mut line_start);
                     continue;
                 }
                 // Preserve leading/trailing whitespace OUTSIDE the formatting
@@ -274,46 +301,44 @@ pub(crate) fn render_runs_md(runs: &[TextRun], out: &mut MarkdownWriter) {
                 let leading = &raw[..leading_len];
                 let trailing = &raw[trail_start..];
                 let trimmed = &raw[leading_len..trail_start];
-                out.push_str(leading);
+                text(leading, out, &mut line_start);
                 if t.italic == Some(true) {
-                    out.push('*');
+                    markup("*", out, &mut line_start);
                 }
                 if t.bold == Some(true) {
-                    out.push_str("**");
+                    markup("**", out, &mut line_start);
                 }
-                if t.hyperlink.is_some() {
-                    out.push('[');
+                // A target outside the viewer's hyperlink scheme policy
+                // (`javascript:`, `data:`, ...) keeps its text but does not
+                // become a Markdown link.
+                let link = t
+                    .hyperlink
+                    .as_deref()
+                    .and_then(ooxml_common::markdown::link_destination);
+                if link.is_some() {
+                    markup("[", out, &mut line_start);
                 }
-                write_escaped_inline_md(trimmed, out);
-                if let Some(url) = &t.hyperlink {
-                    out.push_str("](");
-                    out.push_str(url);
-                    out.push(')');
+                text(trimmed, out, &mut line_start);
+                if let Some(url) = &link {
+                    markup(&format!("]({url})"), out, &mut line_start);
                 }
                 if t.bold == Some(true) {
-                    out.push_str("**");
+                    markup("**", out, &mut line_start);
                 }
                 if t.italic == Some(true) {
-                    out.push('*');
+                    markup("*", out, &mut line_start);
                 }
-                out.push_str(trailing);
+                text(trailing, out, &mut line_start);
             }
         }
     }
 }
 
-/// Escape the markdown inline metacharacters that would otherwise be parsed as
-/// formatting. We deliberately don't escape every potential metachar — pptx
-/// body text contains so much punctuation that aggressive escaping makes the
-/// output noisier than the structure it's trying to expose. Pipe is handled
-/// separately in `render_table_cell_md` since it only matters inside tables.
+/// Write document text into running Markdown
+/// ([`ooxml_common::markdown::escape_text`]). Pipe is handled in
+/// `render_table_cell_md` since it only matters inside tables.
 fn write_escaped_inline_md(value: &str, out: &mut MarkdownWriter) {
-    for character in value.chars() {
-        if matches!(character, '\\' | '*' | '_' | '`') {
-            out.push('\\');
-        }
-        out.push(character);
-    }
+    out.push_str(&escape_text(value, TextContext::Inline));
 }
 
 pub(crate) fn render_table_md(t: &TableElement, out: &mut MarkdownWriter) {
@@ -345,27 +370,50 @@ pub(crate) fn render_table_cell_md(cell: &TableCell) -> String {
     let Some(tb) = &cell.text_body else {
         return String::new();
     };
-    let mut buf = String::new();
-    for (i, para) in tb.paragraphs.iter().enumerate() {
-        if i > 0 {
-            buf.push_str("<br>");
-        }
-        for run in &para.runs {
-            if let TextRun::Text(t) = run {
-                buf.push_str(&t.text);
-            }
-        }
+    // Trim the cell's document text before escaping it, never the escaped
+    // output; paragraphs are joined with the converter's own `<br>`.
+    let mut paragraphs: Vec<String> = tb
+        .paragraphs
+        .iter()
+        .map(|para| {
+            para.runs
+                .iter()
+                .filter_map(|run| match run {
+                    TextRun::Text(t) => Some(t.text.as_str()),
+                    _ => None,
+                })
+                .collect()
+        })
+        .collect();
+    if let Some(first) = paragraphs.first_mut() {
+        *first = first.trim_start().to_string();
     }
-    buf.trim().replace('|', "\\|")
+    if let Some(last) = paragraphs.last_mut() {
+        *last = last.trim_end().to_string();
+    }
+    paragraphs
+        .iter()
+        .map(|text| escape_text(text, TextContext::TableCell))
+        .collect::<Vec<_>>()
+        .join("<br>")
 }
 
 pub(crate) fn render_chart_md(c: &ChartElement, out: &mut MarkdownWriter) {
     use std::fmt::Write as _;
     let chart = &c.chart;
-    let title = chart.title.as_deref().unwrap_or("(untitled)");
-    let _ = writeln!(out, "**Chart ({}): {}**\n", chart.chart_type, title);
+    let title = chart
+        .title
+        .as_deref()
+        .map_or_else(|| "(untitled)".to_string(), escape_inline);
+    let _ = writeln!(
+        out,
+        "**Chart ({}): {}**\n",
+        escape_inline(&chart.chart_type),
+        title
+    );
     if !chart.categories.is_empty() {
-        let _ = writeln!(out, "- Categories: {}", chart.categories.join(", "));
+        let categories: Vec<String> = chart.categories.iter().map(|c| escape_inline(c)).collect();
+        let _ = writeln!(out, "- Categories: {}", categories.join(", "));
     }
     for s in &chart.series {
         let values: Vec<String> = s
@@ -376,9 +424,13 @@ pub(crate) fn render_chart_md(c: &ChartElement, out: &mut MarkdownWriter) {
                 None => "—".to_string(),
             })
             .collect();
-        let _ = writeln!(out, "- {}: {}", s.name, values.join(", "));
+        let _ = writeln!(out, "- {}: {}", escape_inline(&s.name), values.join(", "));
     }
     out.push('\n');
+}
+
+fn escape_inline(value: &str) -> String {
+    escape_text(value, TextContext::Inline)
 }
 
 /// Append slide review metadata to one presentation-level section. Comments
@@ -431,7 +483,7 @@ pub(crate) fn render_review_comments_md(
 fn review_status(status: Option<&str>) -> String {
     match status {
         Some("active") | None => String::new(),
-        Some(status) => format!(" ({status})"),
+        Some(status) => format!(" ({})", escape_text(status, TextContext::Heading)),
     }
 }
 
@@ -451,8 +503,11 @@ fn write_quoted_comment_md(
     if text.is_empty() {
         let _ = writeln!(out, "{prefix}");
     } else {
-        for line in text.lines() {
-            let _ = writeln!(out, "{prefix} {line}");
+        for line in split_lines(text) {
+            out.push_str(prefix);
+            out.push(' ');
+            write_escaped_inline_md(line, out);
+            let _ = writeln!(out);
         }
     }
 }
@@ -483,6 +538,7 @@ pub(crate) fn render_presentation_md(pres: &Presentation) -> String {
 mod tests {
     use super::*;
     use crate::types::{PptxComment, PptxCommentReply};
+    use ooxml_common::chart::ChartSeries;
 
     #[test]
     fn writer_counts_utf8_bytes_and_stops_retaining_at_the_first_crossing() {
@@ -506,6 +562,43 @@ mod tests {
         assert_eq!(body.observed(), 7);
         assert_eq!(body.into_string(), "body");
         assert_eq!(comments.into_string(), "ok");
+    }
+
+    #[test]
+    fn chart_summaries_escape_document_text() {
+        let attack = "<img src=x onerror=alert(1)> [x](javascript:alert(1))";
+        let chart = ChartElement {
+            id: None,
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+            rotation: 0.0,
+            flip_h: false,
+            flip_v: false,
+            chart: ChartModel {
+                chart_type: "bar".to_string(),
+                title: Some(attack.to_string()),
+                categories: vec![attack.to_string(), "Q1 (est.)".to_string()],
+                series: vec![ChartSeries {
+                    name: attack.to_string(),
+                    values: vec![Some(1.0), None],
+                    ..ChartSeries::default()
+                }],
+                ..ChartModel::default()
+            },
+        };
+        let mut out = MarkdownWriter::new(u64::MAX);
+
+        render_chart_md(&chart, &mut out);
+
+        let escaped = r"\<img src=x onerror=alert(1)> \[x\](javascript\:alert(1))";
+        assert_eq!(
+            out.into_string(),
+            format!(
+                "**Chart (bar): {escaped}**\n\n- Categories: {escaped}, Q1 (est.)\n- {escaped}: 1, —\n\n"
+            )
+        );
     }
 
     #[test]

@@ -16,7 +16,7 @@ pnpm --filter @silurus/ooxml-site dev
 
 `predev` / `prebuild` copy the redistributable demo samples from
 `packages/*/public/demo` into `public/samples/` (office files are not committed
-under `site/`). The 3D hero asset `public/cube3.glb` is committed.
+under `site/`).
 
 Dev-only `/preview/*` routes render individual sections in isolation (useful for
 visual checks); they are not linked from the site.

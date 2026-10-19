@@ -25,9 +25,12 @@ export interface OfficeFontFallbackRoute {
    * now emits only positively loaded local faces. */
   source: 'local' | 'substitute';
   resourceIdentity: string;
-  weight: 400 | 700;
+  weight: number;
   style: 'normal' | 'italic';
   metric: ResolvedFontMetric;
+  /** Family of this exact source's size-adjust:0% registration, when a format
+   * prepared one: a scalar it owns shapes with zero advance. */
+  coverageProbeFamily?: string;
 }
 
 export interface LoadedOfficeFontFallbacks {
@@ -46,7 +49,7 @@ export interface LoadedOfficeFontFallbacks {
 
 type Tuple = Readonly<{
   family: string;
-  weight: 400 | 700;
+  weight: number;
   style: 'normal' | 'italic';
   localNames: readonly string[];
 }>;
@@ -62,13 +65,21 @@ function tupleFor(request: OfficeFontFallbackRequest): Tuple | undefined {
   if (!family) return undefined;
   const weight = request.weight ?? 400;
   const style = request.style ?? 'normal';
-  if ((weight !== 400 && weight !== 700) || (style !== 'normal' && style !== 'italic')) return undefined;
+  // Any OpenType usWeightClass value; the catalog lookup below admits only
+  // tuples with a catalogued face (named cuts such as a 300 Light face too).
+  if (!Number.isInteger(weight) || weight < 1 || weight > 1000
+    || (style !== 'normal' && style !== 'italic')) return undefined;
   const profiles = findReferenceFontMetrics(family, { weight, style });
   if (profiles.length === 0) return undefined;
   // An alias shared by regular and bold is a family name, not proof of a
   // styled face. Prefer full/PostScript aliases unique to this tuple. For the
   // regular face only, a family name is also an exact local() candidate.
-  const otherAliases = new Set(findReferenceFontMetrics(family)
+  // A named cut ("Arial Black") can resolve to a profile of another catalog
+  // family ("Arial" 900), whose aliases include that family's own name. Collect
+  // the other tuples of every matched catalog family too, so local("Arial") can
+  // never stand in for the 900 cut and load the regular face.
+  const catalogFamilies = new Set([family, ...profiles.map((profile) => profile.family)]);
+  const otherAliases = new Set([...catalogFamilies].flatMap((name) => findReferenceFontMetrics(name))
     .filter((profile) => profile.weight !== weight || profile.style !== style)
     .flatMap((profile) => profile.aliases.map(normalizeLocalFontMetricFamily)));
   const distinct = [...new Set(profiles.flatMap((profile) => profile.aliases))];
@@ -212,7 +223,20 @@ export function unloadOfficeFontFallbacks(faces: Iterable<FontFace>): void {
  * full/PostScript alias of every weight and style. Presence of the family is a
  * question separate from which styles a document uses. */
 function familyPresenceLocalNames(family: string): string[] {
-  return [...new Set([family, ...findReferenceFontMetrics(family).flatMap((profile) => profile.aliases)])];
+  // A named cut ("Arial Black") can resolve to profiles of a broader catalog
+  // family ("Arial" 900). Those profiles' aliases may name the broader family
+  // or its other cuts, which prove only that family installed, never the cut.
+  // As in tupleFor, keep a borrowed profile's aliases only when no other tuple
+  // of its catalog family shares them.
+  const requested = normalizeLocalFontMetricFamily(family);
+  const names = findReferenceFontMetrics(family).flatMap((profile) => {
+    if (normalizeLocalFontMetricFamily(profile.family) === requested) return profile.aliases;
+    const others = new Set(findReferenceFontMetrics(profile.family)
+      .filter((other) => other.weight !== profile.weight || other.style !== profile.style)
+      .flatMap((other) => other.aliases.map(normalizeLocalFontMetricFamily)));
+    return profile.aliases.filter((alias) => !others.has(normalizeLocalFontMetricFamily(alias)));
+  });
+  return [...new Set([family, ...names])];
 }
 
 /**

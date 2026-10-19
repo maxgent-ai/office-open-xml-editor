@@ -8,10 +8,17 @@
 // Fonts: embedded routes take precedence, and local Office faces avoid redundant
 // Google substitutions. The PPTX font-owner transition is normalized only
 // under the positive Google Fonts opt-in gate below.
+// DOCX native-route measurements start before font loading and must finish
+// after math preparation, before layout publication. The baseline pins this
+// barrier instead of exempting it based on the current Git merge base.
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { parse } from '@babel/parser';
 
+// The opt-in source option key, before and after its per-format rename.
+const SOURCE_KEY = '(?:modelSources|legacyDoc|legacyXls|legacyPpt)';
+const SOURCE_ABSENT = new RegExp(`^options\\.${SOURCE_KEY}===undefined$`);
+const SOURCE_PRESENT = new RegExp(`^(?:__OOXML_MODEL_SOURCES__&&)?(?:opts|options)\\.${SOURCE_KEY}!==undefined$`);
 function children(node) {
   return Object.values(node).flatMap((value) =>
     Array.isArray(value) ? value.filter((child) => child?.type)
@@ -62,7 +69,7 @@ function ooxmlAwaits(node, code, pptxFontOwnerRefactor = false) {
       for (const statement of current.body) {
         if (statement.type === 'IfStatement') {
           const test = code.slice(statement.test.start, statement.test.end).replace(/\s+/g, '');
-          if (test === 'options.modelSources===undefined') {
+          if (SOURCE_ABSENT.test(test)) {
             walk(statement.consequent, googleFontsRequired);
             return;
           }
@@ -75,11 +82,11 @@ function ooxmlAwaits(node, code, pptxFontOwnerRefactor = false) {
       const test = code.slice(current.test.start, current.test.end).replace(/\s+/g, '');
       // The internal comparison-build flag can only narrow the existing
       // selected-source branch; the ordinary OOXML await path is unchanged.
-      if (/^(?:__OOXML_MODEL_SOURCES__&&)?(?:opts|options)\.modelSources!==undefined$/.test(test)) {
+      if (SOURCE_PRESENT.test(test)) {
         if (current.alternate) walk(current.alternate, googleFontsRequired);
         return;
       }
-      if (/^options\.modelSources===undefined$/.test(test)) {
+      if (SOURCE_ABSENT.test(test)) {
         walk(current.consequent, googleFontsRequired);
         return;
       }
@@ -94,7 +101,7 @@ function ooxmlAwaits(node, code, pptxFontOwnerRefactor = false) {
     }
     if (current.type === 'ConditionalExpression') {
       const test = code.slice(current.test.start, current.test.end).replace(/\s+/g, '');
-      if (test === 'options.modelSources===undefined') {
+      if (SOURCE_ABSENT.test(test)) {
         walk(current.consequent, googleFontsRequired);
         return;
       }

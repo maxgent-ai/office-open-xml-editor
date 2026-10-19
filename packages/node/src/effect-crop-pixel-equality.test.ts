@@ -19,13 +19,13 @@ import { loadSkiaForTests } from './test-imports';
  *
  * `packages/core/src/shape/effects.ts` was changed (perf: A4) to allocate the
  * innerShadow / softEdge auxiliary canvases at the shape's device bbox + effect
- * margin instead of the whole live canvas. The claim is that the on-screen
- * pixels are UNCHANGED, one channel at a time. This suite proves it on real
- * skia-canvas pixels:
+ * margin instead of the whole live canvas. Cropping must preserve the on-screen
+ * pixels for the same effect semantics, one channel at a time. This suite
+ * checks that invariant on real skia-canvas pixels:
  *
- *   1. Verbatim FULL-CANVAS oracles (`oracleInnerShadow` / `oracleSoftEdge` /
- *      `oracleReflection`) reproduce the pre-A4 code exactly — aux canvas =
- *      deviceW × deviceH, blit at (0,0).
+ *   1. Independent FULL-CANVAS oracles use aux canvas = deviceW × deviceH,
+ *      blit at (0,0). Inner shadow and soft edge use the current color/opacity
+ *      contract; reflection retains its pre-A4 construction.
  *   2. The SAME shape + effect is rendered twice into two identical live skia
  *      canvases: once by the real core helper, once by the oracle.
  *   3. Deterministic paths must match to the byte. The two interior filter
@@ -119,7 +119,7 @@ function makePaint(cx: number, cy: number, cw: number, ch: number): {
   };
 }
 
-// ── Verbatim full-canvas oracles (pre-A4 effects.ts) ────────────────────────
+// ── Full-canvas oracles (no crop helpers or production compositor reuse) ────
 
 function hexToRgbaLocal(hex: string, alpha: number): string {
   const h = hex.replace('#', '');
@@ -137,28 +137,27 @@ function oracleInnerShadow(
   liveCtx: Ctx2D, paintShape: PaintShape, shadow: Shadow, scale: number, dW: number, dH: number,
 ): void {
   const c = newAux(dW, dH);
+  const mask = newAux(dW, dH);
   const blur = shadow.blur * scale;
   const dist = shadow.dist * scale;
   const dirRad = (shadow.dir * Math.PI) / 180;
   const dx = Math.cos(dirRad) * dist;
   const dy = Math.sin(dirRad) * dist;
-  c.save();
+  // Capture coverage independently of the shadow color and offset. A callback
+  // may set both fillStyle and an absolute transform (as makePaint does).
+  // Replaying it after setting either state would silently undo that state,
+  // retaining the pre-fix color/placement bugs rather than testing cropping.
+  paintShape(mask as never);
   c.fillStyle = hexToRgbaLocal(shadow.color, shadow.alpha);
-  paintShape(c as never);
-  c.restore();
-  c.save();
+  c.fillRect(0, 0, dW, dH);
+  c.globalCompositeOperation = 'destination-in';
+  c.drawImage(mask.canvas as never, 0, 0);
   c.globalCompositeOperation = 'destination-out';
   c.filter = blur > 0 ? `blur(${blur}px)` : 'none';
-  c.translate(dx, dy);
-  c.fillStyle = '#000';
-  paintShape(c as never);
-  c.restore();
-  c.save();
+  c.drawImage(mask.canvas as never, dx, dy);
   c.globalCompositeOperation = 'destination-in';
   c.filter = 'none';
-  c.fillStyle = '#000';
-  paintShape(c as never);
-  c.restore();
+  c.drawImage(mask.canvas as never, 0, 0);
   liveCtx.save();
   liveCtx.drawImage(c.canvas as never, 0, 0);
   liveCtx.restore();
@@ -181,6 +180,11 @@ function oracleSoftEdge(
     bbox.x, bbox.y, bbox.w, bbox.h,
     bbox.x - radius, bbox.y - radius, bbox.w + radius * 2, bbox.h + radius * 2,
   );
+  // Clear the stretched layer under the shape before adding the sharp source:
+  // source-over twice would increase translucent and antialiased coverage.
+  cc.globalCompositeOperation = 'destination-out';
+  cc.drawImage(mc.canvas as never, 0, 0);
+  cc.globalCompositeOperation = 'source-over';
   cc.drawImage(c.canvas as never, 0, 0);
   cc.globalCompositeOperation = 'destination-in';
   cc.filter = `blur(${radius / 3}px)`;
@@ -336,6 +340,38 @@ describe.skipIf(!skia)('A4 effect crop — byte-exact vs full-canvas oracle (rea
   // Shape hugging the top-left ORIGIN so the crop clamps at x=0/y=0 (exercises the
   // `crop.x===0 && crop.y===0` proxy short-circuit + the blit at the clamped edge).
   const AT_ORIGIN = makePaint(1, 1, 70, 45);
+
+  it.each(['cropped', 'full canvas'] as const)(
+    'innerShadow: %s honors shadow color, alpha and offset with an absolute-transform callback',
+    (renderer) => {
+      const paint: PaintShape = c => {
+        c.setTransform(liveTransform() as never);
+        c.fillStyle = '#4488cc'; // Must not override the shadow's own color.
+        c.fillRect(30, 20, 8, 6);
+      };
+      const bbox = { x: 60, y: 40, w: 16, h: 12 };
+      for (const alpha of [0, 0.5]) {
+        const shadow: Shadow = { color: 'ff0000', alpha, blur: 0, dist: 19050, dir: 0 };
+        const live = freshLive();
+        if (renderer === 'cropped') {
+          applyInnerShadow(live.ctx as never, paint, bbox, shadow, SCALE, DEVICE_W, DEVICE_H);
+        } else {
+          oracleInnerShadow(live.ctx, paint, shadow, SCALE, DEVICE_W, DEVICE_H);
+        }
+        const data = pixels(live.ctx);
+        const at = (x: number, y: number) => Array.from(data.slice(
+          (y * DEVICE_W + x) * 4, (y * DEVICE_W + x) * 4 + 4,
+        ));
+        // An opaque rectangle minus its 2px-right-shifted copy leaves exactly
+        // a 2px left strip. These analytical pixels constrain both compositors
+        // independently, so agreement alone cannot preserve a broken oracle.
+        expect(at(60, 44)).toEqual(alpha === 0 ? [255, 255, 255, 255] : [255, 127, 127, 255]);
+        expect(at(61, 44)).toEqual(at(60, 44));
+        expect(at(62, 44)).toEqual([255, 255, 255, 255]);
+        expect(at(76, 44)).toEqual([255, 255, 255, 255]);
+      }
+    },
+  );
 
   it('innerShadow: cropped output equals full-canvas, interior shape', () => {
     const shadow: Shadow = { color: '303030', alpha: 0.75, blur: 28575, dist: 19050, dir: 135 };

@@ -33,3 +33,8 @@ export {
   type XlsxNodeArchive,
   type XlsxNodeSessionArchive,
 } from './node-acquisition.js';
+export {
+  DEFAULT_XLSX_WORKSHEET_POLICY,
+  normalizeXlsxWorksheetPolicy,
+  type NormalizedXlsxWorksheetPolicy,
+} from './worksheet-policy.js';

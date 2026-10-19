@@ -2,7 +2,6 @@ import { describe, it, expect } from 'vitest';
 import {
   isUprightVerticalGlyph,
   verticalDrawMode,
-  verticalGlyphOffset,
   splitVerticalOrientationRuns,
   drawVerticalRun,
   drawVerticalRunWithCapability,
@@ -42,6 +41,15 @@ describe('verticalDrawMode (UAX#50 vo → draw mode)', () => {
 });
 
 describe('planVerticalRunWithCapability (retained vertical paint geometry)', () => {
+  it.each([2, -1])('keeps vertical retained origins aligned with mark-free tracking at %s pt', pitch => {
+    const { ctx } = mockCtx();
+    ctx.measureText = (text: string) => ({ width: [...text].filter(c => c === 'a' || c === 'b' || c === '字').length * 10 } as TextMetrics);
+    const cells = planVerticalRunWithCapability(ctx, 'a\u030Ab字', 10, pitch);
+    expect(cells.map(c => [c.text, c.originPt, c.advancePt])).toEqual([
+      ['a\u030Ab', 0, 20 + 2 * pitch], ['字', 20 + 2 * pitch + (10 + pitch) / 2, 10 + pitch],
+    ]);
+  });
+
   it('retains the font em-box cross-axis correction for a sideways phone number', () => {
     const { ctx } = mockCtx({
       fontBoundingBoxAscent: 10,
@@ -112,7 +120,7 @@ describe('planVerticalRunWithCapability (retained vertical paint geometry)', () 
     expect(cells.map(({ drawOffsetPt }) => drawOffsetPt.xPt)).toEqual([0, 0, 0]);
   });
 
-  it('retains counter-rotated logical block ink after the upright glyph offset', () => {
+  it('retains counter-rotated logical block ink for the upright base glyph', () => {
     const { ctx } = mockCtx({
       inkLR: { '．': { left: 2, right: 6 } },
     });
@@ -129,11 +137,11 @@ describe('planVerticalRunWithCapability (retained vertical paint geometry)', () 
 
     expect(cell).toMatchObject({
       orientation: 'upright',
-      drawOffsetPt: { xPt: 4, yPt: -4 },
-      // Paint rotates the local x ink [4 - 2, 4 + 6] onto logical -y.
+      drawOffsetPt: { xPt: 0, yPt: 0 },
+      // Paint rotates the local x ink [-2, 6] onto logical -y.
       // vertical-rl w:w scales local y, so the 0.5 scale does not alter this
       // block-axis interval.
-      blockAxisInkBounds: { startPt: -10, endPt: -2 },
+      blockAxisInkBounds: { startPt: -6, endPt: 2 },
     });
   });
 });
@@ -145,23 +153,6 @@ describe('isUprightVerticalGlyph (UAX#50 vo ∈ {U, Tu})', () => {
     for (const ch of ['富', 'あ', '、', '。']) expect(isUprightVerticalGlyph(cp(ch))).toBe(true);
     // ー「」（） are Tr (rotate), Latin/digits are R — not upright.
     for (const ch of ['ー', '「', '）', 'A', '5']) expect(isUprightVerticalGlyph(cp(ch))).toBe(false);
-  });
-});
-
-describe('verticalGlyphOffset (upper-right nudge — fallback when no vertical form)', () => {
-  const cp = (ch: string): number => ch.codePointAt(0) ?? 0;
-
-  it('nudges ． (FF0E, no U+FExx vertical form) toward the upper-right corner', () => {
-    const off = verticalGlyphOffset(cp('．'));
-    expect(off.dx).toBeGreaterThan(0); // rightward
-    expect(off.dy).toBeLessThan(0); // upward
-  });
-
-  it('returns {0,0} for glyphs that get a substituted vertical form (、。，) or need no shift', () => {
-    // These have vertical presentation forms → substituted, not nudged.
-    for (const ch of ['、', '。', '，', '富', 'A', 'ー']) {
-      expect(verticalGlyphOffset(cp(ch))).toEqual({ dx: 0, dy: 0 });
-    }
   });
 });
 
@@ -330,6 +321,25 @@ function mockCtx(metrics: MockMetrics = {}): { ctx: any; ops: Op[] } {
 }
 
 describe('drawVerticalRun (§17.6.20 — upright CJK counter-rotated, Latin sideways)', () => {
+  it.each([
+    { fontPx: 12, ink: undefined, expectedY: 0 },
+    { fontPx: 24, ink: { asc: 2, desc: 10 }, expectedY: -4 },
+  ])('uses the ordinary upright fallback for an unreachable fullwidth period at $fontPx px', ({ fontPx, ink, expectedY }) => {
+    const { ctx, ops } = mockCtx({ inkMiddle: ink ? { '．': ink } : undefined });
+    const cells = planVerticalRunWithCapability(ctx, '．', fontPx, 0, 1, false, () => false);
+    drawVerticalRunWithCapability(ctx, '．', 0, 0, fontPx, 0, 1, false, () => false);
+    const fills = ops.filter((op): op is Extract<Op, { op: 'fillText' }> => op.op === 'fillText');
+    // UAX #50 Tu permits the original upright glyph when its vertical alternate
+    // is inaccessible. Horizontal ink metrics cannot recover that alternate.
+    expect(fills).toEqual([
+      { op: 'fillText', text: '．', x: 0, y: expectedY,
+        align: 'center', baseline: 'middle', feature: 'normal' },
+    ]);
+    expect(cells[0].drawOffsetPt).toEqual({ xPt: 0, yPt: expectedY });
+    expect(cells[0].orientation).toBe('upright');
+    expect(cells[0].verticalFeature).toBe(false);
+  });
+
   it('uses the original code point under vert for every reachable Tu/Tr glyph', () => {
     const { ctx, ops } = mockCtx();
     drawVerticalRunWithCapability(
@@ -529,12 +539,12 @@ describe('drawVerticalRun (§17.6.20 — upright CJK counter-rotated, Latin side
 
   it('substitutes a Tu comma/period with its vertical presentation form (、→︑, 。→︒)', () => {
     const { ctx, ops } = mockCtx();
-    drawVerticalRun(ctx, '、。', 0, 0, 12, 0);
+    drawVerticalRun(ctx, '、。，', 0, 0, 12, 0);
     const fills = ops.filter((o): o is Extract<Op, { op: 'fillText' }> => o.op === 'fillText');
-    // Drawn glyphs are the vertical forms U+FE11 / U+FE12; both counter-rotated.
-    expect(fills.map((f) => f.text)).toEqual(['︑', '︒']);
+    // U+FE11 / U+FE12 / U+FE10 keep their designed position.
+    expect(fills.map((f) => f.text)).toEqual(['︑', '︒', '︐']);
     const rotates = ops.filter((o): o is Extract<Op, { op: 'rotate' }> => o.op === 'rotate');
-    expect(rotates).toHaveLength(2);
+    expect(rotates).toHaveLength(3);
     // Substituted forms are pre-positioned by the font → drawn at the cell centre
     // with no upper-right nudge (local x offset 0). With no ink metrics the mock
     // reports none, so the along-column correction is 0 (y = 0) too.
@@ -662,19 +672,21 @@ describe('reachable vert glyph cells (issue #1024 — feature-state measure == p
     expect(secondInkCenter - firstInkCenter).toBe(5);
   });
 
-  it('keeps the feature-designed upper-right placement of 、。', () => {
+  it('keeps the feature-designed upper-right placement of ．、。，', () => {
     const { ctx, ops } = mockCtx({
       vert: {
+        '．': { asc: 8, desc: -3 },
         '、': { asc: 9, desc: -4 },
         '。': { asc: 9, desc: -4 },
+        '，': { asc: 7, desc: -2 },
       },
     });
-    drawVerticalRunWithCapability(ctx, '、。', 0, 0, 12, 0, 1, true, () => true);
+    drawVerticalRunWithCapability(ctx, '．、。，', 0, 0, 12, 0, 1, true, () => true);
     const fills = ops.filter((o): o is Extract<Op, { op: 'fillText' }> => o.op === 'fillText');
-    expect(fills.map((fill) => fill.text)).toEqual(['、', '。']);
+    expect(fills.map((fill) => fill.text)).toEqual(['．', '、', '。', '，']);
     expect(fills.every((fill) => fill.y === 0 && fill.feature === '"vert" 1')).toBe(true);
     const translates = ops.filter((o): o is Extract<Op, { op: 'translate' }> => o.op === 'translate');
-    expect(translates.map((op) => op.x)).toEqual([5, 15]);
+    expect(translates.map((op) => op.x)).toEqual([5, 15, 25, 35]);
   });
 
   it('scales the featured cell and origin before adding letter spacing', () => {

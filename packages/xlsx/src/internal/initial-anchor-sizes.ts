@@ -111,7 +111,7 @@ const bindings = new WeakMap<Worksheet, InitialAnchorBinding>();
 const releasedReferences = new WeakSet<InitialAnchorSizeReference>();
 
 /** True only for anchors whose prepared initial size survives band edits. */
-export function retainsInitialAnchorSize(anchor: CellAnchorSizeFacts): boolean {
+function retainsInitialAnchorSize(anchor: CellAnchorSizeFacts): boolean {
   return anchor.anchorTag === 'twoCellAnchor' && anchor.editAs === 'oneCell';
 }
 

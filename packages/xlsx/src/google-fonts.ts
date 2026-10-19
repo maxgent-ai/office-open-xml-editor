@@ -9,6 +9,7 @@ import {
   type FontPreloadEntry,
   type OfficeFontFallbackRequest,
 } from '@silurus/ooxml-core';
+import { ownValue } from '@silurus/ooxml-core/internal/own-key';
 import type { ParsedWorkbook, Worksheet } from './types.js';
 import { officeRequestKey, shapeLineFontRuns } from './shape-office-line.js';
 
@@ -71,7 +72,7 @@ export function xlsxFontPreloadNames(wb: ParsedWorkbook | undefined, fallback?: 
       const regular = /^(.*?)\s+Regular$/i.exec(f.name.trim());
       if (regular) {
         const base = regular[1]!.trim();
-        const entry = XLSX_GOOGLE_FONTS[base.toLocaleLowerCase('en-US')];
+        const entry = ownValue(XLSX_GOOGLE_FONTS, base.toLocaleLowerCase('en-US'));
         if (entry && (!entry.loadFamily || entry.loadFamily.toLocaleLowerCase('en-US') === base.toLocaleLowerCase('en-US')))
           names.add(base);
       }

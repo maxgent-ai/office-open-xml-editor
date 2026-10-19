@@ -72,7 +72,7 @@ vi.mock('@silurus/ooxml-core/internal/model-source', async (load) => ({
 }));
 
 const modelSource = {
-  protocol: 'ooxml-model-source-module/v1',
+  protocol: 'ooxml-model-source-module/v2',
   target: 'pptx',
   moduleUrl: 'https://example.test/source.mjs',
   config: {},

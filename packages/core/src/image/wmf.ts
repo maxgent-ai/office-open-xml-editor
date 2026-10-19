@@ -14,24 +14,21 @@
 //     param bytes. Loop until function==0x0000 (META_EOF) or bytes exhausted.
 //   - All values little-endian. COLORREF = u32 0x00BBGGRR (low byte = R).
 //
-// Implemented records: SETWINDOWORG, SETWINDOWEXT, SETPOLYFILLMODE,
+// Implemented records: window/viewport org/ext/offset/scale, SAVEDC/RESTOREDC,
+// INTERSECTCLIPRECT/EXCLUDECLIPRECT/OFFSETCLIPRGN, CREATEREGION/SELECTCLIPREGION,
+// SETROP2 (COPYPEN/NOP), SETPOLYFILLMODE,
 // SETTEXTCOLOR, SETTEXTALIGN, CREATEPENINDIRECT, CREATEBRUSHINDIRECT,
 // CREATEFONTINDIRECT, SELECTOBJECT, DELETEOBJECT, POLYLINE, POLYGON,
 // POLYPOLYGON, RECTANGLE, MOVETO, LINETO, TEXTOUT, a bounded ANSI/Symbol
 // EXTTEXTOUT subset,
 // STRETCHDIBITS (embedded raster DIB via the
 // shared decoder in ./dib.ts), EOF.
-// Ignored (no-op, skipped by size): SETROP2,
-// SETSTRETCHBLTMODE, SETMAPMODE, DIBBITBLT/DIBSTRETCHBLT (their exact param
+// Ignored (no-op, skipped by size):
+// SETSTRETCHBLTMODE, DIBBITBLT/DIBSTRETCHBLT (their exact param
 // layout is not decoded here — skipped rather than mis-parsed), and any
 // unrecognized record.
 //
-// Shared across the docx, pptx and xlsx renderers (originally docx-only). The
-// device-boundary edge-suppression heuristic (see `deviceInteriorEdges`) is a
-// docx-specific cosmetic-frame workaround, so it is gated behind the
-// `suppressBoundaryFrame` option (default OFF = spec-clean, draws every edge).
-// docx will opt IN (`suppressBoundaryFrame: true`) when it re-points to core
-// (deferred), to preserve its current behavior.
+// Shared across the DOCX, PPTX and XLSX renderers.
 //
 // True EMF (a separate, larger 32-bit format — see {@link isEmf}) is rasterized
 // by the sibling player {@link ./emf.ts}#renderEmfToBitmap, routed from the
@@ -49,8 +46,23 @@ const META = {
   SETTEXTALIGN: 0x012e,
   SETTEXTCOLOR: 0x0209,
   SETPOLYFILLMODE: 0x0106,
+  SETROP2: 0x0104,
+  SETMAPMODE: 0x0103,
   SETWINDOWORG: 0x020b,
   SETWINDOWEXT: 0x020c,
+  SETVIEWPORTORG: 0x020d,
+  SETVIEWPORTEXT: 0x020e,
+  OFFSETWINDOWORG: 0x020f,
+  OFFSETVIEWPORTORG: 0x0211,
+  SCALEWINDOWEXT: 0x0410,
+  SCALEVIEWPORTEXT: 0x0412,
+  INTERSECTCLIPRECT: 0x0416,
+  EXCLUDECLIPRECT: 0x0415,
+  OFFSETCLIPRGN: 0x0220,
+  CREATEREGION: 0x06ff,
+  SELECTCLIPREGION: 0x012c,
+  SAVEDC: 0x001e,
+  RESTOREDC: 0x0127,
   SELECTOBJECT: 0x012d,
   DELETEOBJECT: 0x01f0,
   LINETO: 0x0213,
@@ -162,7 +174,66 @@ interface Font {
   ansiFace: string;
   validForExt: boolean;
 }
-type WmfObject = Pen | Brush | Font;
+type RectBounds = [number, number, number, number];
+interface Region { kind: 'region'; tree: ClipNode | null; valid: boolean }
+type WmfObject = Pen | Brush | Font | Region;
+// The DC region is independent of both the raster surface and caller clip.
+// An immutable, height-balanced spatial tree owns disjoint rectangle pieces.
+// Saved DCs share untouched subtrees; offsets are O(1), never history replays.
+interface ClipNode {
+  bounds: RectBounds;
+  height: number;
+  children?: readonly [ClipNode, ClipNode];
+}
+interface WmfClip {
+  tree: ClipNode | null;
+  dx: number;
+  dy: number;
+  /** Borrow selected scan bands without copying them for every SELECT/SAVEDC. */
+  mapping?: readonly [number, number, number, number];
+}
+const UNBOUNDED_CLIP: WmfClip = {
+  tree: { bounds: [-Infinity, -Infinity, Infinity, Infinity], height: 1 }, dx: 0, dy: 0,
+};
+
+function clipBranch(a: ClipNode, b: ClipNode): ClipNode {
+  return { bounds: [Math.min(a.bounds[0], b.bounds[0]), Math.min(a.bounds[1], b.bounds[1]),
+    Math.max(a.bounds[2], b.bounds[2]), Math.max(a.bounds[3], b.bounds[3])],
+    height: Math.max(a.height, b.height) + 1, children: [a, b] };
+}
+
+/** Persistent AVL concatenation: retain spatial neighbors and logarithmic
+ * tree depth after a rectangle is split or removed. No saved tree is mutated. */
+function joinClip(a: ClipNode | null, b: ClipNode | null): ClipNode | null {
+  if (!a) return b;
+  if (!b) return a;
+  if (a.height > b.height + 1 && a.children) {
+    const [l, r] = a.children;
+    const next = joinClip(r, b) as ClipNode;
+    if (next.height <= l.height + 1) return clipBranch(l, next);
+    const [nl, nr] = next.children as readonly [ClipNode, ClipNode];
+    if (nr.height >= nl.height) return clipBranch(clipBranch(l, nl), nr);
+    const [nll, nlr] = nl.children as readonly [ClipNode, ClipNode];
+    return clipBranch(clipBranch(l, nll), clipBranch(nlr, nr));
+  }
+  if (b.height > a.height + 1 && b.children) {
+    const [l, r] = b.children;
+    const next = joinClip(a, l) as ClipNode;
+    if (next.height <= r.height + 1) return clipBranch(next, r);
+    const [nl, nr] = next.children as readonly [ClipNode, ClipNode];
+    if (nl.height >= nr.height) return clipBranch(nl, clipBranch(nr, r));
+    const [nrl, nrr] = nr.children as readonly [ClipNode, ClipNode];
+    return clipBranch(clipBranch(nl, nrl), clipBranch(nrr, r));
+  }
+  return clipBranch(a, b);
+}
+
+function clipTree(rects: readonly RectBounds[], start = 0, end = rects.length): ClipNode | null {
+  if (start === end) return null;
+  if (end === start + 1) return { bounds: rects[start], height: 1 };
+  const mid = Math.floor((start + end) / 2);
+  return clipBranch(clipTree(rects, start, mid) as ClipNode, clipTree(rects, mid, end) as ClipNode);
+}
 
 /** Inserts an object at the FIRST free slot (lowest index whose slot is empty
  *  or was deleted), mirroring the WMF object-table allocation rule. */
@@ -231,12 +302,20 @@ interface PlayState {
   ctx: AnyCtx;
   W: number;
   H: number;
-  // window mapping
+  // Window and viewport mapping (MS-WMF 2.3.5.28–31). The caller supplies
+  // the initial target viewport when the metafile leaves it unspecified.
   orgX: number;
   orgY: number;
   extX: number;
   extY: number;
   haveExt: boolean;
+  vpX: number;
+  vpY: number;
+  vpW: number;
+  vpH: number;
+  clip: WmfClip;
+  clipDirty: boolean;
+  mapMode: number;
   // GDI state
   objects: (WmfObject | null)[];
   curPen: Pen | null;
@@ -245,6 +324,7 @@ interface PlayState {
   textColor: string;
   textAlign: number;
   fillRule: CanvasFillRule; // from SETPOLYFILLMODE
+  rop2: number;
   bkMode: number;
   unsupported: Set<string>;
   extTextSafe: boolean;
@@ -254,127 +334,177 @@ interface PlayState {
   currentPositionKnown: boolean;
   lineStateSafe: boolean;
   drew: boolean;
-  // When true, strokes whose edge lies on the window/device boundary are
-  // suppressed (docx cosmetic-frame heuristic; see deviceInteriorEdges). When
-  // false (spec-clean default), every edge is drawn.
-  suppressBoundaryFrame: boolean;
 }
 
 /** logical → device along X. */
 function mapX(s: PlayState, x: number): number {
-  return (x - s.orgX) * (s.W / s.extX);
+  return s.vpX + (x - s.orgX) * (s.vpW / s.extX);
 }
 /** logical → device along Y. */
 function mapY(s: PlayState, y: number): number {
-  return (y - s.orgY) * (s.H / s.extY);
+  return s.vpY + (y - s.orgY) * (s.vpH / s.extY);
+}
+
+/** MS-WMF 2.1.1.16 / 2.3.5.17: fixed-unit modes ignore window/viewport
+ * extent setters and scalers; origins remain independently adjustable.
+ * Library device policy: Canvas pixels are square, 96 pixels per inch (CSS
+ * reference pixels), not the original metafile author's printer/display DPI.
+ * MM_TEXT is exactly one device pixel. Physical modes have upward-positive Y.
+ * The initial mode is caller-defined; only an authored SETMAPMODE selects one
+ * of these fixed mappings. No machine/OS-dependent device capabilities enter.
+ */
+function setMapMode(s: PlayState, mode: number): void {
+  s.mapMode = mode;
+  if (mode <= 6) {
+    const unitsPerInch = [0, 1, 254, 2540, 100, 1000, 1440][mode];
+    s.extX = unitsPerInch; s.extY = unitsPerInch;
+    s.vpW = mode === 1 ? 1 : 96;
+    s.vpH = mode === 1 ? 1 : -96;
+    s.haveExt = true;
+    s.extTextMappingSafe = true;
+  }
+  adjustIsotropic(s);
+}
+
+/** MS-WMF 2.1.1.16 requires equal physical units in MM_ISOTROPIC and
+ * recommends adjusting the viewport when extents change. On the square-pixel
+ * Canvas device, reduce the larger scale to fit both requested extents, while
+ * preserving each authored axis direction. MM_ANISOTROPIC keeps both scales.
+ */
+function adjustIsotropic(s: PlayState): void {
+  if (s.mapMode !== 7) return;
+  const scale = Math.min(Math.abs(s.vpW / s.extX), Math.abs(s.vpH / s.extY));
+  s.vpW = Math.sign(s.vpW) * Math.abs(s.extX) * scale;
+  s.vpH = Math.sign(s.vpH) * Math.abs(s.extY) * scale;
 }
 
 /** Device line width: scale the logical pen width by |W/extX| and clamp to ≥1
  *  so hairlines stay visible after mapping. */
 function deviceLineWidth(s: PlayState, logicalWidth: number): number {
-  const scale = Math.abs(s.W / s.extX);
+  const scale = Math.abs(s.vpW / s.extX);
   const w = logicalWidth * scale;
   return w >= 1 ? w : 1;
 }
 
-// Tolerance (device px) for treating a mapped coordinate as lying ON a device
-// boundary line. The window→device mapping is a float multiply, so an edge that
-// is logically on the window frame can land at e.g. 0.0000001 or W-0.0000002.
-const BOUNDARY_EPS = 1e-3;
-
-/** Whether a device coordinate lies on either of the two boundary lines `lo`/`hi`
- *  (within BOUNDARY_EPS). Used to detect polygon edges that coincide with the
- *  metafile window/device boundary. */
-function onBoundaryLine(v: number, lo: number, hi: number): boolean {
-  return Math.abs(v - lo) <= BOUNDARY_EPS || Math.abs(v - hi) <= BOUNDARY_EPS;
-}
-
-/**
- * HEURISTIC (not a clean ECMA/GDI rule): a cosmetic (hairline) stroke whose edge
- * coincides with the metafile window/device boundary (x∈{0,W} or y∈{0,H}) is
- * suppressed, because Word does not render a visible frame there — the common
- * case being the full-window "frame rectangle" many authoring tools emit with a
- * 1-device-pixel cosmetic pen.
- *
- * This is NOT GDI's actual clip behavior: GDI's `Rectangle` is half-open and
- * excludes only the RIGHT and BOTTOM edges, not all four; here we drop edges on
- * ALL four boundary lines (x=0, x=W, y=0, y=H). That over-broad drop is the
- * pragmatic point — it removes the cosmetic frame — but it may also drop a
- * legitimate full-window border.
- * TODO: replace with a proper WMF window/viewport clip model ([MS-WMF]); tracked
- * as a follow-up.
- *
- * Returns the list of stroke segments to draw — every polygon edge EXCEPT those
- * whose two endpoints both lie on one boundary line (a vertical edge on x=0 or
- * x=W, or a horizontal edge on y=0 or y=H). A rectangle one pixel inside the
- * surface keeps all four edges; only edges literally on the boundary are dropped.
- */
-function deviceInteriorEdges(
-  s: PlayState,
-  pts: Array<[number, number]>,
-  closed: boolean,
-): Array<[[number, number], [number, number]]> {
-  const segs: Array<[[number, number], [number, number]]> = [];
-  const last = closed ? pts.length : pts.length - 1;
-  for (let i = 0; i < last; i++) {
-    const a = pts[i];
-    const b = pts[(i + 1) % pts.length];
-    // A vertical edge sitting on x=0 or x=W, or a horizontal edge on y=0 or y=H,
-    // lies on the window/device boundary → suppressed (see the heuristic above).
-    const verticalOnBoundary =
-      Math.abs(a[0] - b[0]) <= BOUNDARY_EPS &&
-      onBoundaryLine(a[0], 0, s.W) &&
-      onBoundaryLine(b[0], 0, s.W);
-    const horizontalOnBoundary =
-      Math.abs(a[1] - b[1]) <= BOUNDARY_EPS &&
-      onBoundaryLine(a[1], 0, s.H) &&
-      onBoundaryLine(b[1], 0, s.H);
-    if (verticalOnBoundary || horizontalOnBoundary) continue;
-    segs.push([a, b]);
-  }
-  return segs;
-}
-
-/** Stroke a polygon/polyline's edges with the current pen. When
- *  `suppressBoundaryFrame` is set, applies the window/device-boundary
- *  suppression heuristic (see deviceInteriorEdges): edges coincident with the
- *  boundary are dropped, and consecutive KEPT edges are emitted as one
- *  continuous sub-path (a dropped edge breaks the chain). When it is NOT set
- *  (the spec-clean default), the full polygon/polyline strokes as a single path
- *  with no edge dropped. */
+/** Draw the whole authored boundary. MS-WMF 3.1.5 defines the clip separately
+ * from the window/viewport mapping; boundary coincidence never removes edges. */
 function strokeEdges(s: PlayState, pts: Array<[number, number]>, closed: boolean): void {
-  if (!s.curPen || s.curPen.stroke == null) return;
-  if (pts.length < 2) return;
+  if (s.rop2 !== 13 || !s.curPen || s.curPen.stroke == null || pts.length < 2) return;
   const { ctx } = s;
   ctx.strokeStyle = s.curPen.stroke;
   ctx.lineWidth = deviceLineWidth(s, s.curPen.width);
-
-  if (!s.suppressBoundaryFrame) {
-    // Spec-clean path: draw every edge as one continuous sub-path.
-    ctx.beginPath();
-    ctx.moveTo(pts[0][0], pts[0][1]);
-    for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
-    if (closed) ctx.closePath();
-    ctx.stroke();
-    s.drew = true;
-    return;
-  }
-
-  const segs = deviceInteriorEdges(s, pts, closed);
-  if (segs.length === 0) return;
   ctx.beginPath();
-  // Chain consecutive edges that share an endpoint into one sub-path; restart
-  // when the previous edge was dropped (endpoints no longer contiguous).
-  let prevEnd: [number, number] | null = null;
-  for (const [a, b] of segs) {
-    if (!prevEnd || prevEnd[0] !== a[0] || prevEnd[1] !== a[1]) {
-      ctx.moveTo(a[0], a[1]);
-    }
-    ctx.lineTo(b[0], b[1]);
-    prevEnd = b;
-  }
+  ctx.moveTo(pts[0][0], pts[0][1]);
+  for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+  if (closed) ctx.closePath();
   ctx.stroke();
   s.drew = true;
+}
+
+/** Map a selected scan band only when it is consumed; subsequent mapping
+ * changes do not move a region already in device space (MS-WMF 2.3.4.9). */
+function clipRect(clip: WmfClip, rect: RectBounds): RectBounds {
+  if (!clip.mapping) return rect;
+  const [sx, sy, tx, ty] = clip.mapping;
+  const x0 = rect[0] * sx + tx; const x1 = rect[2] * sx + tx;
+  const y0 = rect[1] * sy + ty; const y1 = rect[3] * sy + ty;
+  return [Math.min(x0, x1), Math.min(y0, y1), Math.max(x0, x1), Math.max(y0, y1)];
+}
+
+/** MS-WMF 2.3.5.2–3: Boolean operations affect the actual device region,
+ * including off-surface pieces that OFFSETCLIPRGN can later bring into view.
+ * Prune disjoint/contained subtrees; copy only affected branches. Work follows
+ * visited live geometry, with at most four pieces per split leaf, rather than
+ * scanning/copying every saved region or replaying a growing operation log.
+ * The implicit region is the plane; the surface/caller clip is applied only at
+ * Canvas emission, never used as a subtraction universe. */
+function cutClip(node: ClipNode | null, bounds: RectBounds, exclude: boolean): ClipNode | null {
+  if (!node) return null;
+  const [pl, pt, pr, pb] = node.bounds;
+  const il = Math.max(pl, bounds[0]); const it = Math.max(pt, bounds[1]);
+  const ir = Math.min(pr, bounds[2]); const ib = Math.min(pb, bounds[3]);
+  if (il >= ir || it >= ib) return exclude ? node : null;
+  if (il === pl && it === pt && ir === pr && ib === pb) return exclude ? null : node;
+  if (node.children) {
+    const [a, b] = node.children;
+    const l = cutClip(a, bounds, exclude); const r = cutClip(b, bounds, exclude);
+    return l === a && r === b ? node : joinClip(l, r);
+  }
+  if (!exclude) return { bounds: [il, it, ir, ib], height: 1 };
+  const pieces: RectBounds[] = [];
+  if (pt < it) pieces.push([pl, pt, pr, it]);
+  if (pl < il) pieces.push([pl, it, il, ib]);
+  if (ir < pr) pieces.push([ir, it, pr, ib]);
+  if (ib < pb) pieces.push([pl, ib, pr, pb]);
+  return clipTree(pieces);
+}
+
+function combineClip(s: PlayState, bounds: RectBounds, exclude: boolean): void {
+  const { dx, dy, mapping } = s.clip;
+  let local: RectBounds = [bounds[0] - dx, bounds[1] - dy, bounds[2] - dx, bounds[3] - dy];
+  // Keep a selected region in its captured coordinate space. Inverse-map the
+  // new operand, so a cut copies only affected branches even for a large region
+  // shared by many saved DCs. Signed scales preserve mirrored region membership.
+  if (mapping) {
+    const [sx, sy, tx, ty] = mapping;
+    const x0 = (local[0] - tx) / sx; const x1 = (local[2] - tx) / sx;
+    const y0 = (local[1] - ty) / sy; const y1 = (local[3] - ty) / sy;
+    local = [Math.min(x0, x1), Math.min(y0, y1), Math.max(x0, x1), Math.max(y0, y1)];
+  }
+  s.clip = { ...s.clip, tree: cutClip(s.clip.tree, local, exclude) };
+  s.clipDirty = true;
+}
+
+function applyClip(s: PlayState): void {
+  if (!s.clipDirty) return;
+  // Own one Canvas save frame, independent of WMF DC levels. Replacement
+  // preserves the caller's pre-existing clip. Emit the current region once,
+  // just before drawing; exclude/offset-only files do no Canvas clip work.
+  s.ctx.restore();
+  s.ctx.save();
+  s.ctx.beginPath();
+  const pending = s.clip.tree ? [s.clip.tree] : [];
+  while (pending.length) {
+    const node = pending.pop() as ClipNode;
+    const rect = clipRect(s.clip, node.bounds);
+    const l = Math.max(0, rect[0] + s.clip.dx); const t = Math.max(0, rect[1] + s.clip.dy);
+    const r = Math.min(s.W, rect[2] + s.clip.dx); const b = Math.min(s.H, rect[3] + s.clip.dy);
+    if (l >= r || t >= b) continue;
+    if (node.children) pending.push(...node.children);
+    else s.ctx.rect(l, t, r - l, b - t);
+  }
+  s.ctx.clip();
+  s.clipDirty = false;
+}
+
+function mappedRect(s: PlayState, l: number, t: number, r: number, b: number): RectBounds {
+  const x0 = mapX(s, l); const x1 = mapX(s, r);
+  const y0 = mapY(s, t); const y1 = mapY(s, b);
+  return [Math.min(x0, x1), Math.min(y0, y1), Math.max(x0, x1), Math.max(y0, y1)];
+}
+
+/** MS-WMF 2.2.1.5 and 2.2.2.21: a region is the union of every interval in
+ * every scan band, not its bounding rectangle. Validate counts before reads. */
+function createRegion(c: Cursor): Region {
+  const region: Region = { kind: 'region', tree: null, valid: false };
+  const rects: RectBounds[] = [];
+  if (c.remaining < 22) return region;
+  c.u16(); const type = c.i16(); c.u32(); c.i16();
+  const scans = c.i16(); c.i16(); c.skip(8);
+  if (type !== 6 || scans < 0) return region;
+  for (let i = 0; i < scans; i++) {
+    if (c.remaining < 8) return region;
+    const count = c.u16(); const top = c.u16(); const bottom = c.u16();
+    if (count % 2 !== 0 || c.remaining < count * 2 + 2) return region;
+    for (let j = 0; j < count; j += 2) {
+      const left = c.u16(); const right = c.u16();
+      if (left < right && top < bottom) rects.push([left, top, right, bottom]);
+    }
+    if (c.u16() !== count) return region;
+  }
+  region.valid = c.remaining === 0;
+  if (region.valid) region.tree = clipTree(rects);
+  return region;
 }
 
 // ── per-record handlers ─────────────────────────────────────────────────────
@@ -392,8 +522,6 @@ function readPoints(s: PlayState, c: Cursor, count: number): Array<[number, numb
 
 function strokePolyline(s: PlayState, pts: Array<[number, number]>): void {
   if (pts.length < 2 || !s.curPen || s.curPen.stroke == null) return;
-  // Open polyline: routed through the same edge stroker as polygons so the
-  // boundary-suppression heuristic applies when enabled (see deviceInteriorEdges).
   strokeEdges(s, pts, false);
 }
 
@@ -409,6 +537,7 @@ function strokeLineTo(s: PlayState, x: number, y: number): void {
   s.currentY = y;
   s.currentPositionKnown = true;
   if (
+    s.rop2 !== 13 ||
     !known ||
     !s.lineStateSafe ||
     !s.haveExt ||
@@ -431,7 +560,7 @@ function strokeLineTo(s: PlayState, x: number, y: number): void {
   // empirically clamp positive subpixel widths to one pixel.
   ctx.lineWidth = s.curPen.lineWidth === 0
     ? 1
-    : s.curPen.lineWidth * (s.W / s.extX);
+    : Math.abs(s.curPen.lineWidth * (s.vpW / s.extX));
   // This bounded path supports the normative PS_SOLID default combination:
   // cosmetic pen, round end caps, and round joins (MS-WMF 2.1.1.23).
   ctx.lineCap = 'round';
@@ -442,13 +571,9 @@ function strokeLineTo(s: PlayState, x: number, y: number): void {
   s.drew = true;
 }
 
-/** Fill (current brush) + stroke (current pen) a single closed polygon. The
- *  stroke routes through {@link strokeEdges}, which applies the
- *  window/device-boundary suppression heuristic only when
- *  `suppressBoundaryFrame` is set. The FILL is unaffected — a brush-filled
- *  rectangle at the window bounds still fills the surface. */
+/** Fill and stroke under the current playback DC clip. */
 function fillStrokePolygon(s: PlayState, pts: Array<[number, number]>): void {
-  if (pts.length < 2) return;
+  if (s.rop2 !== 13 || pts.length < 2) return;
   const { ctx } = s;
   if (s.curBrush && s.curBrush.fill != null) {
     ctx.beginPath();
@@ -465,8 +590,11 @@ function fillStrokePolygon(s: PlayState, pts: Array<[number, number]>): void {
 /** POLYPOLYGON: one path spanning every sub-polygon so the fill rule applies
  *  across them as a unit (correct glyph holes). */
 function fillStrokePolyPolygon(s: PlayState, c: Cursor): void {
+  if (s.rop2 !== 13) return;
   const numPolys = c.u16();
-  if (numPolys <= 0 || numPolys > 0x10000) return;
+  // MS-WMF 2.2.2.17: NumberOfPolygons is u16, already bounded by its
+  // representation. There is no additional library polygon-count ceiling.
+  if (numPolys === 0) return;
   const counts: number[] = [];
   for (let i = 0; i < numPolys; i++) {
     if (c.remaining < 2) return;
@@ -631,7 +759,7 @@ function drawExtTextOut(s: PlayState, c: Cursor): void {
     : decodeWindows1252(raw);
   if (text === null) { omit(); return; }
   if (!text.length) return;
-  const px = font.height * (s.H / s.extY);
+  const px = font.height * (s.vpH / s.extY);
   if (!Number.isFinite(px) || px <= 0) { omit(); return; }
   try {
     s.ctx.fillStyle = s.textColor;
@@ -674,9 +802,6 @@ function drawTextOut(s: PlayState, text: string, x: number, y: number): void {
  * `W`×`H` device space. Returns `true` if anything was drawn, `false` for a
  * non-WMF buffer or a metafile that produced no geometry.
  *
- * `suppressBoundaryFrame` (default false) enables the docx cosmetic-frame
- * heuristic (see deviceInteriorEdges); leave it false for a spec-clean render.
- *
  * Pure with respect to the injected `ctx`, so it is unit-testable against a
  * recording mock — no OffscreenCanvas required.
  */
@@ -685,7 +810,6 @@ export function playWmf(
   ctx: AnyCtx,
   W: number,
   H: number,
-  suppressBoundaryFrame = false,
   onUnsupported?: (records: readonly string[]) => void,
 ): boolean {
   if (!isWmf(bytes)) return false;
@@ -709,6 +833,12 @@ export function playWmf(
     extX: W || 1,
     extY: H || 1,
     haveExt: false,
+    vpX: 0, vpY: 0, vpW: W, vpH: H,
+    clip: UNBOUNDED_CLIP,
+    clipDirty: false,
+    // MS-WMF 3.1.5 leaves initial DC attributes device-dependent. Preserve
+    // this player's caller-sized anisotropic viewport until SETMAPMODE.
+    mapMode: 8,
     objects: [],
     curPen: null,
     curBrush: null,
@@ -716,6 +846,7 @@ export function playWmf(
     textColor: '#000000',
     textAlign: 0,
     fillRule: 'nonzero',
+    rop2: 13,
     bkMode: 2,
     unsupported: new Set(),
     extTextSafe: true,
@@ -727,9 +858,23 @@ export function playWmf(
     currentPositionKnown: false,
     lineStateSafe: true,
     drew: false,
-    suppressBoundaryFrame,
   };
 
+  ctx.save();
+  try {
+    replayWmfRecords(bytes, s, pos);
+  } finally {
+    ctx.restore();
+  }
+  if (s.unsupported.size > 0) onUnsupported?.([...s.unsupported]);
+  return s.drew;
+}
+
+/** Replay owns the WMF DC stack; the public wrapper owns Canvas state cleanup. */
+function replayWmfRecords(bytes: Uint8Array, s: PlayState, pos: number): void {
+  // Object table, diagnostics and output are player-owned, not saved DC state.
+  type SavedDc = Omit<PlayState, 'objects' | 'unsupported' | 'drew' | 'ctx' | 'clipDirty'>;
+  const stack: SavedDc[] = [];
   const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
 
   while (pos + 6 <= bytes.length) {
@@ -745,7 +890,94 @@ export function playWmf(
     const paramStart = pos + 6;
     const c = new Cursor(bytes, paramStart, recEnd);
 
+    // All drawing records share the same current device-region clip.
+    if (fn === META.LINETO || fn === META.POLYLINE || fn === META.POLYGON ||
+        fn === META.POLYPOLYGON || fn === META.RECTANGLE || fn === META.TEXTOUT ||
+        fn === META.EXTTEXTOUT || fn === META.STRETCHDIBITS) applyClip(s);
+
     switch (fn) {
+      case META.SETMAPMODE: {
+        if (c.remaining !== 2) { s.unsupported.add('META_SETMAPMODE malformed'); break; }
+        const mode = c.u16();
+        if (mode < 1 || mode > 8) { s.unsupported.add('META_SETMAPMODE invalid mode'); break; }
+        setMapMode(s, mode);
+        break;
+      }
+      case META.SAVEDC: {
+        if (c.remaining !== 0) { s.unsupported.add('META_SAVEDC malformed'); break; }
+        const { objects: _objects, unsupported: _unsupported, drew: _drew, ctx: _ctx, clipDirty: _clipDirty, ...dc } = s;
+        stack.push(dc);
+        break;
+      }
+      case META.RESTOREDC: {
+        if (c.remaining !== 2) { s.unsupported.add('META_RESTOREDC malformed'); break; }
+        const level = c.i16();
+        const index = level < 0 ? stack.length + level : level - 1;
+        if (level === 0 || index < 0 || index >= stack.length) {
+          s.unsupported.add('META_RESTOREDC invalid level'); break;
+        }
+        Object.assign(s, stack[index]);
+        stack.length = index;
+        s.clipDirty = true;
+        break;
+      }
+      case META.CREATEREGION: {
+        const region = createRegion(c);
+        insertObject(s.objects, region);
+        if (!region.valid) s.unsupported.add('META_CREATEREGION malformed');
+        break;
+      }
+      case META.SELECTCLIPREGION: {
+        const region = c.remaining === 2 ? s.objects[c.u16()] : undefined;
+        if (region?.kind !== 'region' || !region.valid) {
+          s.unsupported.add('META_SELECTCLIPREGION invalid region'); break;
+        }
+        s.clip = { tree: region.tree,
+          mapping: [s.vpW / s.extX, s.vpH / s.extY, mapX(s, 0), mapY(s, 0)], dx: 0, dy: 0 };
+        s.clipDirty = true;
+        break;
+      }
+      case META.INTERSECTCLIPRECT:
+      case META.EXCLUDECLIPRECT: {
+        if (c.remaining !== 8) { s.unsupported.add('WMF clip rectangle malformed'); break; }
+        const b = c.i16(); const r = c.i16(); const t = c.i16(); const l = c.i16();
+        combineClip(s, mappedRect(s, l, t, r, b), fn === META.EXCLUDECLIPRECT);
+        break;
+      }
+      case META.OFFSETCLIPRGN: {
+        if (c.remaining !== 4) { s.unsupported.add('META_OFFSETCLIPRGN malformed'); break; }
+        const y = c.i16(); const x = c.i16();
+        if (s.clip !== UNBOUNDED_CLIP) {
+          s.clip = { ...s.clip, dx: s.clip.dx + x * s.vpW / s.extX, dy: s.clip.dy + y * s.vpH / s.extY };
+          s.clipDirty = true;
+        }
+        break;
+      }
+      case META.SETVIEWPORTORG:
+      case META.OFFSETVIEWPORTORG:
+      case META.OFFSETWINDOWORG:
+      case META.SETVIEWPORTEXT: {
+        if (c.remaining !== 4) { s.unsupported.add('WMF viewport mapping malformed'); break; }
+        const y = c.i16(); const x = c.i16();
+        if (fn === META.SETVIEWPORTORG) { s.vpX = x; s.vpY = y; }
+        else if (fn === META.OFFSETVIEWPORTORG) { s.vpX += x; s.vpY += y; }
+        else if (fn === META.OFFSETWINDOWORG) { s.orgX += x; s.orgY += y; }
+        else if (s.mapMode >= 7 && x !== 0 && y !== 0) {
+          s.vpW = x; s.vpH = y; adjustIsotropic(s);
+        }
+        break;
+      }
+      case META.SCALEWINDOWEXT:
+      case META.SCALEVIEWPORTEXT: {
+        if (c.remaining !== 8) { s.unsupported.add('WMF mapping scale malformed'); break; }
+        const yd = c.i16(); const yn = c.i16(); const xd = c.i16(); const xn = c.i16();
+        if (s.mapMode <= 6) break;
+        if (xd === 0 || yd === 0 || xn === 0 || yn === 0) { s.unsupported.add('WMF mapping scale invalid'); break; }
+        if (fn === META.SCALEWINDOWEXT) { s.extX *= xn / xd; s.extY *= yn / yd; }
+        else { s.vpW *= xn / xd; s.vpH *= yn / yd; }
+        adjustIsotropic(s);
+        break;
+      }
       case META.SETWINDOWORG: {
         // params: i16 yOrg, i16 xOrg (Y FIRST)
         if (c.remaining !== 4) {
@@ -767,10 +999,30 @@ export function playWmf(
         }
         const yExt = c.i16();
         const xExt = c.i16();
+        if (s.mapMode <= 6) break;
         s.extTextMappingSafe = xExt > 0 && yExt > 0;
         s.extY = yExt || 1;
         s.extX = xExt || 1;
         s.haveExt = true;
+        adjustIsotropic(s);
+        break;
+      }
+      case META.SETROP2: {
+        // MS-WMF 2.3.5.22 / 2.1.1.2: R2_NOP is D (destination unchanged),
+        // including pens and filled interiors. It is an authored no-op, not a
+        // boundary classifier. MOVETO/LINETO still update the DC position.
+        if (c.remaining !== 2 && c.remaining !== 4) {
+          s.rop2 = 0;
+          s.unsupported.add('META_SETROP2 malformed');
+          break;
+        }
+        s.rop2 = c.u16();
+        if (c.remaining === 2) c.u16(); // Optional Reserved MUST be ignored.
+        // Canvas source-over supplies COPYPEN, while NOP needs no raster work.
+        // Other Boolean RGB mixes need a bitwise compositor (Canvas alpha XOR
+        // is not RGB XOR). Diagnose that existing limitation instead of silently
+        // painting them as COPYPEN; strict metafile callers can reject it.
+        if (s.rop2 !== 11 && s.rop2 !== 13) s.unsupported.add('META_SETROP2 (unsupported binary mix)');
         break;
       }
       case META.SETPOLYFILLMODE: {
@@ -1000,9 +1252,6 @@ export function playWmf(
 
     pos = recEnd;
   }
-
-  if (s.unsupported.size > 0) onUnsupported?.([...s.unsupported]);
-  return s.drew;
 }
 
 // ── raster sizing ───────────────────────────────────────────────────────────
@@ -1034,14 +1283,11 @@ export function wmfRasterTarget(widthPt: number, heightPt: number): { w: number;
  * parseable WMF or nothing drew (so the caller can fall back to the existing
  * "missing image" behavior without crashing).
  *
- * `suppressBoundaryFrame` (default false) enables the docx cosmetic-frame
- * heuristic; pptx/xlsx leave it false for a spec-clean render.
  */
 export async function renderWmfToBitmap(
   bytes: Uint8Array,
   targetW: number,
   targetH: number,
-  suppressBoundaryFrame = false,
   onUnsupported?: (records: readonly string[]) => void,
 ): Promise<ImageBitmap | null> {
   if (!isWmf(bytes)) return null;
@@ -1056,7 +1302,7 @@ export async function renderWmfToBitmap(
   if (!ctx) return null;
   ctx.lineJoin = 'round';
   ctx.lineCap = 'round';
-  const drew = playWmf(bytes, ctx, targetW, targetH, suppressBoundaryFrame, onUnsupported);
+  const drew = playWmf(bytes, ctx, targetW, targetH, onUnsupported);
   if (!drew) return null;
   return createImageBitmap(canvas);
 }

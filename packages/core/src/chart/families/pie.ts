@@ -58,15 +58,27 @@ import { paintClassicDataPointPath, paintClassicDataPointRect } from '../shared/
 // Pie / Doughnut — supports dataPointColors (per slice).
 // ═══════════════════════════════════════════════════════════════════════════
 
-/** Inside-radius fraction (of the outer radius) for a SOLID pie's `ctr` / `inEnd`
- *  / `bestFit` data labels (§21.2.2.48). PowerPoint places these near the rim,
- *  not at the disc mid-radius: four observed slice sizes place labels at
- *  0.878 / 0.888 / 0.887 / 0.912·outerR — a flat near-rim
- *  constant independent of slice angle (see the `labelR` comment in
- *  {@link drawPieRichLabels}). 0.88 is the empirical fit; it is an approximation
- *  of an undocumented PowerPoint layout, not a spec-defined geometry. Doughnut
- *  labels use the exact ring midpoint instead and never consult this. */
-const PIE_CTR_LABEL_RADIUS_FRAC = 0.88;
+/** Legacy fallback for solid-pie inEnd / bestFit, NOT a rule for ctr.
+ * ECMA-376 §§21.2.2.48, 21.2.3.11 distinguish these positions but do not define
+ * their automatic layout. The Windows PowerPoint controls in
+ * controls-auditc-pie/manifest.json (717 charts: 5–350° slices, 2–8 points,
+ * single slices, font sizes 8/12/20pt, wrapped formats, aspect ratios, explosion,
+ * start angles and 10/50/80% doughnut holes) reject a common radius for all
+ * three positions. ctr uses the radial midpoint; its text may cross wedge
+ * boundaries. Glyph bounds are not label frames, so these controls do not
+ * establish a general inEnd padding or bestFit collision algorithm. Keep the
+ * existing 0.88 fallback for those positions rather than refitting a subset.
+ * Glyph-box midpoint errors are at most 2.80pt for solid ctr (229 charts) and
+ * 0.32pt for doughnut (30 charts). Retained inEnd / bestFit anchor errors reach
+ * 62.83 / 87.67pt, including labels overflowing their chart frame in Office.
+ * These are intentional fidelity limits, not Office guarantees. No label-frame
+ * padding, arbitrary backgrounds or automatic collision equivalence is claimed. */
+const LEGACY_PIE_INSIDE_END_RADIUS_FRAC = 0.88;
+
+function pieInsideLabelRadius(position: string, innerR: number, outerR: number): number {
+  if (position === 'ctr' || innerR > 0.01) return (innerR + outerR) / 2;
+  return outerR * LEGACY_PIE_INSIDE_END_RADIUS_FRAC;
+}
 
 interface OfPiePoint {
   sourceIndex: number;
@@ -109,11 +121,10 @@ export function renderOfPieChart(
   }
 
   const legendChart: ChartModel = { ...chart, chartType: 'pie' };
-  const legend = measuredLegendReserve(ctx, legendChart, r.w, r.h, 0.28, ptToPx);
+  const legend = measuredLegendReserve(ctx, legendChart, r.w, r.h, ptToPx);
   const frame = computeChartFrame(chart, r.x, r.y, r.w, r.h, ptToPx, {
     titleTopPadFrac: 0.035,
     titleBottomPadFrac: 0.035,
-    legendSideReserveFrac: 0.28,
     legendReserve: legend,
     radialGapFrac: 0.02,
     honorPlotAreaManualLayout: true,
@@ -128,6 +139,9 @@ export function renderOfPieChart(
   const options = chart.ofPie;
   const sizeRatio = Math.max(0.05, Math.min(2, (options?.secondPieSizePercent ?? 75) / 100));
   const gapUnits = Math.max(0, options?.gapWidthPercent ?? 150) / 100;
+  // The split, secondPieSize and gapWidth follow §21.2.2.126 ofPieChart; the
+  // 44 % height / 90 % width fit is library policy (radial geometry is
+  // application-defined; connector and gap geometry are under audit, C-OFPIE-001).
   const mainRadius = Math.min(ph * 0.44, (pw * 0.9) / (2 + 2 * sizeRatio + gapUnits));
   const detailRadius = mainRadius * sizeRatio;
   if (!(mainRadius > 0) || !(detailRadius > 0)) return;
@@ -297,11 +311,10 @@ export function renderPieChart(
   // labels categories (one row per slice) so it reserves a wider 0.28 side band
   // (vs the default 0.22). The h*0.02 gap below the title/legend before centring
   // is the shared radial gap. Params keep pixels unchanged.
-  const pieLeg = measuredLegendReserve(ctx, legendChart, w, h, 0.28, ptToPx);
+  const pieLeg = measuredLegendReserve(ctx, legendChart, w, h, ptToPx);
   const frame = computeChartFrame(chart, x, y, w, h, ptToPx, {
     titleTopPadFrac: 0.035,
     titleBottomPadFrac: 0.035,
-    legendSideReserveFrac: 0.28,
     legendReserve: pieLeg,
     radialGapFrac: 0.02,
     honorPlotAreaManualLayout: true,
@@ -311,11 +324,15 @@ export function renderPieChart(
   drawChartTitleForLayout(ctx, chart, x, y, w, h, y + frame.title.topPad, titleFontPx);
 
   const { px0: plotLeft, py0: plotTop, pw, ph } = frame.plotRect;
+  // A title band grown by authored lines can exhaust a small frame; paint no
+  // plot into a non-positive rectangle, as the cartesian families do.
+  if (!(pw > 0) || !(ph > 0)) return;
   paintPlotAreaFrame(
     ctx, chart, plotLeft, plotTop, pw, ph, ptToPx, shapeRotationDeg,
   );
   const cx2 = frame.center.cx;
   const cy2 = frame.center.cy;
+  // Pie radius (42 % of the plot): library policy from the initial renderer (#11).
   const outerR = Math.min(pw, ph) * 0.42;
 
   // §21.2.2.52 firstSliceAng: the first slice begins `firstSliceAngle` degrees
@@ -460,6 +477,7 @@ export function renderPieChart(
       cx2, cy2, outerR, outerRingInnerR, startAngle, dLblFont, ptToPx,
       plotLeft, plotTop, pw, ph,
       x, y, w, h,
+      vals.map((_, index) => explodeOffset(s, index)),
       shapeRotationDeg,
     );
   }
@@ -504,6 +522,7 @@ function drawPieRichLabels(
   ptToPx: number,
   plotX: number, plotY: number, plotW: number, plotH: number,
   chartX: number, chartY: number, chartW: number, chartH: number,
+  sliceOffsets: readonly number[],
   shapeRotationDeg: number,
 ): void {
   const overrides = s.dataLabelOverrides ?? [];
@@ -535,7 +554,7 @@ function drawPieRichLabels(
     drawPieCalloutLabels(
       ctx, chart, def, s, cats, vals, total, cx2, cy2, outerR, innerR, startAngle,
       font, ptToPx, plotX, plotW, plotY, plotH, chartX, chartY, chartW, chartH,
-      calloutIndices, overridesByIndex, shapeRotationDeg,
+      calloutIndices, overridesByIndex, sliceOffsets, shapeRotationDeg,
     );
   }
 
@@ -545,6 +564,7 @@ function drawPieRichLabels(
     const slice = (vals[i] / total) * Math.PI * 2;
     const midAngle = angle + slice / 2;
     angle += slice;
+    if (!(slice > 0)) continue;
     if (s.sourceHidden?.[i] === true) continue;
     if (calloutIndices.has(i)) continue;
     // A per-point `<c:dLbl idx>` (§21.2.2.47) overrides the series-level
@@ -599,9 +619,9 @@ function drawPieRichLabels(
     const rich = customRichDataLabelOptions(
       chart, ov, ptToPx, labelFont, bold ?? false, textStyle,
     );
-    const automaticLabelR = innerR > 0.01
-      ? (innerR + outerR) / 2
-      : outerR * PIE_CTR_LABEL_RADIUS_FRAC;
+    // A centered marker belongs to the painted slice, including its explosion.
+    const automaticLabelR = pieInsideLabelRadius(pos, innerR, outerR)
+      + (pos === 'ctr' ? sliceOffsets[i] ?? 0 : 0);
     if (ov?.manualLayout) {
       ctx.font = `${textStyle.fontItalic ? 'italic ' : ''}${bold ? 'bold ' : ''}${sizePx}px ${labelFont}`;
       drawBoundedDataLabelText(
@@ -662,22 +682,9 @@ function drawPieRichLabels(
       ));
       continue;
     }
-    // §21.2.2.48 ST_DLblPos radial placement. The spec enumerates the positions
-    // (bestFit / ctr / inEnd / outEnd …) but gives no geometry, so the inside
-    // radii below reproduce the bounded Office vector observations for solid
-    // pie and doughnut labels:
-    //
-    //   • DOUGHNUT (innerR > 0), ctr / inEnd / bestFit → the RING midpoint
-    //     (innerR + outerR)/2. Verified on the 55%-hole doughnut: labels sit at
-    //     0.772–0.778·outerR ≈ (0.55+1)/2 = 0.775. Byte-stable — unchanged.
-    //   • SOLID pie (innerR ≈ 0), ctr / inEnd / bestFit → ≈0.88·outerR, NOT the
-    //     disc mid-radius. Measured label-centroid ratios across the 54/27/14/5%
-    //     slices were 0.878 / 0.888 / 0.887 / 0.912 (center + outer radius from a
-    //     least-squares rim fit, residual std 0.43pt), i.e. a flat near-rim
-    //     constant independent of slice angle — so it is a fixed fraction, not a
-    //     sector centroid. The 5% sliver rides marginally further out in
-    //     PowerPoint; we do not model that per-slice nudge. This is an empirical
-    //     approximation of an undocumented PowerPoint layout, not a spec formula.
+    // ctr centers the label on the radial marker, including narrow slices;
+    // clipping to a wedge chord would hide their labels or force extra wrapping.
+    // The other automatic positions retain the bounded fallback above.
     const labelR = automaticLabelR;
     const lx2 = cx2 + Math.cos(midAngle) * labelR;
     const ly2 = cy2 + Math.sin(midAngle) * labelR;
@@ -687,16 +694,18 @@ function drawPieRichLabels(
     const radialCapacity = innerR > 0.01
       ? outerR - innerR - sizePx
       : outerR - sizePx;
-    if (!(tangentialCapacity > 0) || !(radialCapacity > 0)) continue;
-    const sliceBounds = dataLabelRectIntersection(
-      {
-        x: lx2 - tangentialCapacity / 2,
-        y: ly2 - radialCapacity / 2,
-        w: tangentialCapacity,
-        h: radialCapacity,
-      },
-      { x: plotX, y: plotY, w: plotW, h: plotH },
-    );
+    if (pos !== 'ctr' && (!(tangentialCapacity > 0) || !(radialCapacity > 0))) continue;
+    const sliceBounds = pos === 'ctr'
+      ? { x: plotX, y: plotY, w: plotW, h: plotH }
+      : dataLabelRectIntersection(
+        {
+          x: lx2 - tangentialCapacity / 2,
+          y: ly2 - radialCapacity / 2,
+          w: tangentialCapacity,
+          h: radialCapacity,
+        },
+        { x: plotX, y: plotY, w: plotW, h: plotH },
+      );
     if (!sliceBounds) continue;
     drawBoundedDataLabelText(
       ctx,
@@ -1004,6 +1013,7 @@ function drawPieCalloutLabels(
   chartX: number, chartY: number, chartW: number, chartH: number,
   indices: ReadonlySet<number>,
   overridesByIndex: ReadonlyMap<number, ChartDataLabelOverride>,
+  sliceOffsets: readonly number[],
   shapeRotationDeg: number,
 ): void {
   const dataLabelLegendKey = createDataLabelLegendKeyResolver(chart, ptToPx);
@@ -1157,9 +1167,8 @@ function drawPieCalloutLabels(
       leftSide = cxBox < cx2;
       manualClip = manual.clip;
     } else if (position !== 'bestFit' && position !== 'outEnd') {
-      const labelR = innerR > 0.01
-        ? (innerR + outerR) / 2
-        : outerR * PIE_CTR_LABEL_RADIUS_FRAC;
+      const labelR = pieInsideLabelRadius(position, innerR, outerR)
+        + (position === 'ctr' ? sliceOffsets[i] ?? 0 : 0);
       const labelX = cx2 + Math.cos(midAngle) * labelR;
       const labelY = cy2 + Math.sin(midAngle) * labelR;
       const tangentialCapacity = 2 * labelR
@@ -1167,15 +1176,17 @@ function drawPieCalloutLabels(
       const radialCapacity = innerR > 0.01
         ? outerR - innerR - fontPx
         : outerR - fontPx;
-      const sliceBounds = dataLabelRectIntersection(
-        {
-          x: labelX - tangentialCapacity / 2,
-          y: labelY - radialCapacity / 2,
-          w: tangentialCapacity,
-          h: radialCapacity,
-        },
-        { x: boundsX, y: boundsY, w: boundsW, h: boundsH },
-      );
+      const sliceBounds = position === 'ctr'
+        ? { x: boundsX, y: boundsY, w: boundsW, h: boundsH }
+        : dataLabelRectIntersection(
+          {
+            x: labelX - tangentialCapacity / 2,
+            y: labelY - radialCapacity / 2,
+            w: tangentialCapacity,
+            h: radialCapacity,
+          },
+          { x: boundsX, y: boundsY, w: boundsW, h: boundsH },
+        );
       if (!sliceBounds) continue;
       if (!rich) {
         lines = fitStyledDataLabelLines(
@@ -1521,7 +1532,7 @@ function drawPieCalloutLabels(
   ctx.restore();
 }
 
-export function paintClassicPiePointOutline(
+function paintClassicPiePointOutline(
   ctx: CanvasRenderingContext2D,
   chart: ChartModel,
   series: ChartSeries,
@@ -1566,7 +1577,7 @@ export function paintClassicPiePointOutline(
   ctx.restore();
 }
 
-export function dataLabelRectIntersection(a: DataLabelRect, b: DataLabelRect): DataLabelRect | null {
+function dataLabelRectIntersection(a: DataLabelRect, b: DataLabelRect): DataLabelRect | null {
   const x = Math.max(a.x, b.x);
   const y = Math.max(a.y, b.y);
   const right = Math.min(a.x + a.w, b.x + b.w);

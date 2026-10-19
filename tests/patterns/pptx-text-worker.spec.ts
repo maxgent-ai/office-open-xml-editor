@@ -3,6 +3,11 @@ import { build } from 'rolldown';
 import { fileURLToPath } from 'node:url';
 
 const entry = fileURLToPath(new URL('../../packages/pptx/src/renderer.ts', import.meta.url));
+// Bundling the renderer dominates each case; build it once per worker.
+let rendererBundle: Promise<string> | undefined;
+const rendererScript = () => rendererBundle ??= build({
+  input: entry, output: { format: 'iife', name: 'pptxRenderer' }, platform: 'browser',
+}).then((bundle) => bundle.output[0].code);
 const pattern = { fillType: 'pattern', preset: 'horz', fg: 'D21D54', bg: '12CED4' };
 const slide = {
   index: 0, slideNumber: 1, background: null,
@@ -51,8 +56,7 @@ function countColors(data: Uint8ClampedArray) {
 
 test('plain PPTX glyph pattern renders on main canvas and OffscreenCanvas worker', async ({ page }) => {
   test.setTimeout(90_000);
-  const bundle = await build({ input: entry, output: { format: 'iife', name: 'pptxRenderer' }, platform: 'browser' });
-  const script = bundle.output[0].code;
+  const script = await rendererScript();
   await page.addScriptTag({ content: script });
   const main = await page.evaluate(async (s) => {
     const canvas = document.createElement('canvas');
@@ -87,8 +91,7 @@ test('PPTX pattern glyphs retain their fill with a run reflection on main and wo
   reflectedSlide.elements = [reflectedSlide.elements[0]];
   const run = reflectedSlide.elements[0].textBody.paragraphs[0].runs[0] as Record<string, unknown>;
   run.reflection = { blur: 0, dist: 25400, dir: 90, stA: 1, stPos: 0, endA: 0, endPos: 1, sx: 1, sy: -1 };
-  const bundle = await build({ input: entry, output: { format: 'iife', name: 'pptxRenderer' }, platform: 'browser' });
-  const script = bundle.output[0].code;
+  const script = await rendererScript();
   await page.addScriptTag({ content: script });
   const colors = await page.evaluate(async ({ script, slide }) => {
     const renderer = (globalThis as typeof globalThis & { pptxRenderer: typeof import('../../packages/pptx/src/renderer.js') }).pptxRenderer;
@@ -119,8 +122,7 @@ test('PPTX pattern glyphs retain their fill with a run reflection on main and wo
 
 test('PPTX underline follows patterned glyphs or its explicit uFill on main and worker', async ({ page }) => {
   test.setTimeout(90_000);
-  const bundle = await build({ input: entry, output: { format: 'iife', name: 'pptxRenderer' }, platform: 'browser' });
-  const script = bundle.output[0].code;
+  const script = await rendererScript();
   await page.addScriptTag({ content: script });
   const results = await page.evaluate(async ({ script, base }) => {
     const renderer = (globalThis as typeof globalThis & {

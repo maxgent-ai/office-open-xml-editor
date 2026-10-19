@@ -1,4 +1,5 @@
 import { createGeometryPath, type GeometryPath } from '../path-data';
+import { hasOwnKey, ownValue } from '../../internal/own-key';
 /**
  * Pure preset-geometry acquisition. Drives ECMA-376 §20.1.9 preset geometries
  * off the authoritative `presetShapeDefinitions.xml` data (shipped as
@@ -74,7 +75,7 @@ function evaluatorForDef(
 }
 
 export function hasPreset(geom: string): boolean {
-  return geom.toLowerCase() in PRESETS;
+  return hasOwnKey(PRESETS, geom.toLowerCase());
 }
 
 /**
@@ -102,7 +103,7 @@ export function buildPresetGeometryPath(
   h: number,
   adj: (number | null | undefined)[] = [],
 ): boolean {
-  const def = PRESETS[geom.toLowerCase()];
+  const def = ownValue(PRESETS, geom.toLowerCase());
   if (!def) return false;
   const evaluator = evaluatorForDef(def, w, h, adj);
   for (const path of def.paths) {
@@ -128,7 +129,7 @@ export function buildPresetGeometryFillPath(
   h: number,
   adj: (number | null | undefined)[] = [],
 ): boolean {
-  const def = PRESETS[geom.toLowerCase()];
+  const def = ownValue(PRESETS, geom.toLowerCase());
   if (!def) return false;
   const evaluator = evaluatorForDef(def, w, h, adj);
   for (const path of def.paths) {
@@ -173,11 +174,11 @@ function effectivePreset(
   h: number,
   adj: (number | null | undefined)[],
 ): { def: PresetDef; adj: (number | null | undefined)[] } | null {
-  let def = PRESETS[key];
+  let def = ownValue(PRESETS, key);
   if (!def) return null;
 
   // Suppress a wedge-callout tail whose tip sits inside the body (see note above).
-  if (key in WEDGE_CALLOUT_BASE) {
+  if (hasOwnKey(WEDGE_CALLOUT_BASE, key)) {
     const a1 = effAdj(adj, def, 0); // dxPos fraction (×1e5) of width from centre
     const a2 = effAdj(adj, def, 1); // dyPos fraction (×1e5) of height from centre
     const xPos = w / 2 + (w * a1) / 100000;
@@ -304,7 +305,7 @@ export function getConnectorAnchors(
    *  callers can retract a decorated end before re-stroking the line. */
   vertices: Array<{ x: number; y: number }>;
 } | null {
-  const def = PRESETS[geom.toLowerCase()];
+  const def = ownValue(PRESETS, geom.toLowerCase());
   if (!def || def.paths.length === 0) return null;
   // The decoratable line is the geometry's LAST <path>. For a connector that is
   // its only path; for a callout it is the leader line, which presets.json

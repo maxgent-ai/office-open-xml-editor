@@ -49,7 +49,7 @@ function anchorFacts(occurrenceId: string) {
 }
 
 describe('RTL header anchor kerning projection', () => {
-  it('retains the anchored image while an absent w:kern disables optional pair kerning', () => {
+  it('retains the anchored image and kerns the Arabic header text without w:kern', () => {
     const occurrenceId = 'wp-anchor-rtl-header';
     const facts = anchorFacts(occurrenceId);
     const header = paragraph([
@@ -122,8 +122,9 @@ describe('RTL header anchor kerning projection', () => {
       }),
     ]);
     expect(rtlMeasurementStates.length).toBeGreaterThan(0);
-    // Font discovery may probe under Canvas `auto`; retained WML text must be
-    // measured under the spec's absent-kerning default.
-    expect(rtlMeasurementStates).toContain('none');
+    // Font discovery may probe under Canvas `auto`; Windows Word kerns Arabic
+    // text whatever w:kern says (WORD_ARABIC_PAIR_KERNING, #1850).
+    expect(rtlMeasurementStates).toContain('normal');
+    expect(rtlMeasurementStates).not.toContain('none');
   });
 });

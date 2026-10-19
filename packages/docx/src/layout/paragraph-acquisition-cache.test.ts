@@ -433,6 +433,52 @@ describe('paragraph acquisition cache', () => {
     expect(second.measured.lines[0]!.layout).not.toBe(first.measured.lines[0]!.layout);
   });
 
+  it('reuses a placed paragraph across pagination passes that change only values it cannot read', () => {
+    const services = scopedServices();
+    const input = paragraphAcquisitionInput(textParagraph(), source);
+    const base = options(services);
+    const first = acquireParagraphResult(input, base);
+    // A later field-convergence pass knows the document's real page count and
+    // page numbering, and every pass carries the whole document's note
+    // numbers. A text-only paragraph at the same placement reads none of them.
+    const laterPass = acquireParagraphResult(input, {
+      ...base,
+      environment: {
+        ...base.environment,
+        totalPages: 700,
+        displayPageNumber: 9,
+        pageNumberFormat: 'upperRoman',
+        currentDateMs: 101,
+        noteNumbers: new Map([['footnote:1', 1], ['footnote:2', 2]]),
+      },
+    });
+
+    expect(laterPass).toBe(first);
+  });
+
+  it('keys page-field and note values for paragraphs that read them', () => {
+    const services = scopedServices();
+    const cache = paragraphAcquisitionCacheOf(services)!;
+    const base = options(services);
+    const run = textParagraph().runs[0]!;
+    const withRun = (extra: object) =>
+      paragraphAcquisitionInput({ ...textParagraph(), runs: [{ ...run, ...extra } as DocRun] }, source);
+    const numPages = withRun({
+      type: 'field', fieldType: 'numPages', instruction: 'NUMPAGES', fallbackText: '1',
+    });
+    const noteReference = withRun({ noteRef: { kind: 'footnote', id: '1' } });
+    const key = (
+      input: ParagraphAcquisitionInput,
+      environment: Partial<ParagraphAcquisitionOptions['environment']>,
+    ) => paragraphAcquisitionCacheKey(cache, input, {
+      ...base, environment: { ...base.environment, ...environment },
+    });
+
+    expect(key(numPages, { totalPages: 2 })).not.toBe(key(numPages, {}));
+    expect(key(noteReference, { noteNumbers: new Map([['footnote:1', 2]]) }))
+      .not.toBe(key(noteReference, { noteNumbers: new Map([['footnote:1', 1]]) }));
+  });
+
   it('keys every value that can change acquisition output', () => {
     const services = scopedServices();
     const cache = paragraphAcquisitionCacheOf(services);

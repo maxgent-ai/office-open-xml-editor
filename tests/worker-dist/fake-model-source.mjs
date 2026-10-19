@@ -43,8 +43,9 @@ export async function openModelSource(bytes, config) {
     });
     await docxReady;
     const archive = new DocxArchive(bytes);
+    const wrapper = delegate(archive, config.minimal ? DOCX_REQUIRED : [...DOCX_REQUIRED, ...DOCX_OPTIONAL]);
     return {
-      archive: delegate(archive, config.minimal ? DOCX_REQUIRED : [...DOCX_REQUIRED, ...DOCX_OPTIONAL]),
+      archive: wrapper,
       viewDefaults: config.showTrackedChanges === true ? { showTrackedChanges: true } : {},
       close: () => archive.free(),
     };

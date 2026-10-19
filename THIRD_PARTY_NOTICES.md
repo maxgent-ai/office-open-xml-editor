@@ -64,10 +64,9 @@ package — noted here for completeness only.
 ## Rust / WebAssembly
 
 The three parser crates (`docx-parser`, `pptx-parser`, `xlsx-parser`), their
-shared `ooxml-common` crate, and the optional purpose-built
-`legacy-office-converter` crate compile to the WASM binaries shipped in `dist/`.
-The converter uses a strict subset of the parser crates' dependencies. The
-parser crates' `wasm32-unknown-unknown` dependency graph is identical across all
+shared `ooxml-common` crate compile to the WASM binaries shipped in `dist/`.
+The separate `@silurus/ooxml-legacy-office` companion ships its own readers and
+notices. The parser crates' `wasm32-unknown-unknown` dependency graph is identical across all
 three crates (verified with `cargo license
 --filter-platform wasm32-unknown-unknown`) and consists entirely of
 permissively-licensed crates — no copyleft (GPL/LGPL/AGPL) dependencies:

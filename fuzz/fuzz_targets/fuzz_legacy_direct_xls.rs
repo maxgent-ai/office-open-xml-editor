@@ -1,6 +1,6 @@
 #![no_main]
 
-use legacy_office_converter::fuzzing;
+use legacy_office_parser::fuzzing;
 use libfuzzer_sys::fuzz_target;
 
 // Exercise the direct XLS session (BIFF8 records, styles, drawings, charts)

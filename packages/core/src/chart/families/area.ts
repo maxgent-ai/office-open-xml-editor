@@ -20,7 +20,6 @@ import {
   catAxisLabelBandH,
   chartLegendBands,
   chartAxisTitleBands,
-  axisTitleFontPx,
   chartTextFontSizePx,
   chartManualOuterAxisInsets,
   categoryTickLabelGapPx,
@@ -29,6 +28,7 @@ import {
 
 import { axisLineWidthPx, resolveAxisLine, isCrossBetween } from '../axis-style.js';
 import { formatCategoryLabel } from '../chart-number-format.js';
+import { authoredExtraLinesHeight, axisLabelLineHeightPx, fillAuthoredText, measureAuthoredTextWidth } from '../chart-text-lines.js';
 
 import { categoryLabelAnchorFraction, categoryLabelOffsetPx } from '../category-spacing.js';
 
@@ -50,7 +50,7 @@ import { chartHasDataTable, chartDataTableBaseHeight, chartDataTableHeaderWidth,
 import { createDataLabelLegendKeyResolver, measuredLegendReserve, drawLegendForLayout } from '../shared/legend.js';
 import { drawAxisTick, strokeAxisSegment, strokeValueGridlineH, valGridStroke, valMinorGridStroke, drawCatMajorGridlines, catGridStroke, catGridlineFractions, catAxisReversed, drawValMajorGridlines, formatPrimaryValueAxisTick, formatAxisTickWithUnits, planValueAxis, axisLabelPx } from '../shared/axis.js';
 import { drawSeriesTrendlines } from '../shared/trendline.js';
-import { chartDateAxisPlan, forEachErrorBarEndpoint, computeSecondaryAxis, drawSecondaryValueGridlines, drawSecondaryValueAxis } from '../shared/secondary-axis.js';
+import { chartDateAxisPlan, forEachErrorBarEndpoint, computeSecondaryAxis, drawSecondaryValueGridlines, drawSecondaryValueAxis, secondaryAxisTitleBandW } from '../shared/secondary-axis.js';
 import { measuredCartesianTitleBand, drawChartTitleForLayout } from '../shared/title.js';
 import { dataLabelWithinAxisMaximum, drawCategoryDataLabels } from '../shared/data-labels.js';
 import { chartCategories } from '../category-spacing.js';
@@ -196,7 +196,7 @@ export function renderAreaChart(
   const titleH = titleBand.bandH;
   const catAxFontPx = axisLabelPx(chart.catAxisFontSizeHpt, h, ptToPx);
   const valAxFontPx = axisLabelPx(chart.valAxisFontSizeHpt, h, ptToPx);
-  const leg = measuredLegendReserve(ctx, chart, w, h, 0.22, ptToPx);
+  const leg = measuredLegendReserve(ctx, chart, w, h, ptToPx);
   const { legRightW, legLeftW, legTopH, legBottomH } = chartLegendBands(
     leg, chart.legendOverlay === true,
   );
@@ -243,13 +243,13 @@ export function renderAreaChart(
     ctx.font = `${secFontPx}px ${chartFontFamily(chart, sec.fontFace, 'minor')}`;
     let wmax = 0;
     for (const value of secScale.majorLines) {
-      wmax = Math.max(wmax, ctx.measureText(formatAxisTickWithUnits(value, sec.formatCode ?? null, chart.date1904, sec.displayUnits)).width);
+      wmax = Math.max(wmax, measureAuthoredTextWidth(ctx, formatAxisTickWithUnits(value, sec.formatCode ?? null, chart.date1904, sec.displayUnits)));
     }
     secLabelBandW = wmax + 18;
     ctx.font = prevFont;
   }
   const secTitleBandW = sec && sec.title
-    ? axisTitleFontPx(sec.titleFontSizeHpt, ptToPx) + 8
+    ? secondaryAxisTitleBandW(sec, ptToPx)
     : 0;
 
   // Resolve the primary extent before frame placement so an authored
@@ -331,11 +331,28 @@ export function renderAreaChart(
     for (const value of provisionalScale.majorLines) {
       primaryLabelWidth = Math.max(
         primaryLabelWidth,
-        ctx.measureText(formatPrimaryValueAxisTick(chart, value, axisIsPercent)).width,
+        measureAuthoredTextWidth(ctx, formatPrimaryValueAxisTick(chart, value, axisIsPercent)),
       );
     }
     ctx.font = prevFont;
   }
+  // Value tick labels with authored breaks (a number format containing a line
+  // feed) are centred on their ticks, so the top label rises half its extra
+  // lines above the single-line half-label reserve. Exactly 0 without breaks.
+  const valueLabelTopExtraH = Math.max(
+    chart.valAxisHidden
+      ? 0
+      : authoredExtraLinesHeight(
+        provisionalScale.majorLines.map(value => formatPrimaryValueAxisTick(chart, value, axisIsPercent)),
+        axisLabelLineHeightPx(manualValTickFontPx),
+      ),
+    sec && secScale && !sec.hidden && sec.tickLabelPos !== 'none'
+      ? authoredExtraLinesHeight(
+        secScale.majorLines.map(value => formatAxisTickWithUnits(value, sec.formatCode ?? null, chart.date1904, sec.displayUnits)),
+        axisLabelLineHeightPx(secFontPx),
+      )
+      : 0,
+  ) / 2;
   const manualOuterInsets = chartManualOuterAxisInsets({
     valAxisHidden: chart.valAxisHidden,
     catAxisHidden: chart.catAxisHidden,
@@ -355,10 +372,12 @@ export function renderAreaChart(
     valTitleBandW: valTitleW,
     catTitleBandH: catTitleH,
     secondaryBandW: secLabelBandW + secTitleBandW,
+    valLabelExtraTopPx: valueLabelTopExtraH,
   });
 
+  // Fixed gutter fractions: library policy, see ChartPad in layout.ts.
   const pad = {
-    t: padT,
+    t: padT + valueLabelTopExtraH,
     r: legRightW + w * 0.05 + secLabelBandW + secTitleBandW,
     b: padB,
     l: legLeftW + Math.max(w * 0.12 + valTitleW, dataTableHeaderW),
@@ -368,7 +387,6 @@ export function renderAreaChart(
 
   const areaFrame = computeChartFrame(chart, x, y, w, h, ptToPx, {
     titleBand,
-    legendSideReserveFrac: 0.22,
     legendReserve: leg,
     pad,
     honorPlotAreaManualLayout: true,
@@ -383,6 +401,32 @@ export function renderAreaChart(
     : null;
   if (dataTableLayout && dataTableLayout.totalHeight > dataTableBaseH) {
     ph = Math.max(1, ph - (dataTableLayout.totalHeight - dataTableBaseH));
+  }
+  const dateAxisPlan = chartDateAxisPlan(chart, cats);
+  const categoryLabelSkip = Math.max(1, Math.floor(chart.catAxisTickLabelSkip ?? 1));
+  // Category labels as painted below (authored tickLblSkip interval, date-axis
+  // ticks formatted by the axis numFmt).
+  const categoryLabelTexts = (): string[] => dateAxisPlan
+    ? dateAxisPlan.majorTicks.map(tick =>
+      formatCategoryLabel(String(tick.serial), chart.catAxisFormatCode, chart.date1904))
+    : Array.from({ length: Math.ceil(n / categoryLabelSkip) }, (_, index) =>
+      formatCategoryLabel((cats[index * categoryLabelSkip] ?? '').toString(), chart.catAxisFormatCode, chart.date1904));
+  // Authored breaks in a category label stack extra lines below the first;
+  // an automatic/outer layout lifts the plot bottom by them (an authored inner
+  // rectangle already leaves its own label band). Exactly 0 without breaks.
+  // Labels at the high (top) edge hang into the plot from its top, so they
+  // need no bottom band.
+  if (!hasDataTable && !chart.catAxisHidden && chart.catAxisTickLabelPos !== 'high') {
+    const labelFontPx = chart.catAxisFontSizeHpt != null
+      ? catAxFontPx
+      : Math.max(8, Math.min(11, pw / n * 0.8));
+    const manualInner = chart.plotAreaManualLayout?.layoutTarget === 'inner' &&
+      chart.plotAreaManualLayout.w != null && chart.plotAreaManualLayout.h != null;
+    const categoryLabelExtraH = authoredExtraLinesHeight(
+      categoryLabelTexts(),
+      axisLabelLineHeightPx(labelFontPx),
+    );
+    if (!manualInner && categoryLabelExtraH > 0) ph = Math.max(1, ph - categoryLabelExtraH);
   }
 
   paintPlotAreaFrame(ctx, chart, px0, py0, pw, ph, ptToPx, shapeRotationDeg);
@@ -403,7 +447,6 @@ export function renderAreaChart(
   // "midCat" anchors points on the category dividers (flush to the axes).
   const between = isCrossBetween(chart);
   const catRev = catAxisReversed(chart);
-  const dateAxisPlan = chartDateAxisPlan(chart, cats);
   const toX = dateAxisPlan
     ? (index: number) => px0 + dateAxisPlan.positions[index]! * pw
     : between
@@ -833,7 +876,10 @@ export function renderAreaChart(
       const gap = chart.valAxisFontSizeHpt != null
         ? valueTickLabelGapPx(drawnValTickFontPx)
         : 6;
-      ctx.fillText(formatPrimaryValueAxisTick(chart, v, axisIsPercent), px0 - gap, gy);
+      fillAuthoredText(
+        ctx, formatPrimaryValueAxisTick(chart, v, axisIsPercent), px0 - gap, gy,
+        axisLabelLineHeightPx(drawnValTickFontPx),
+      );
     }
     if (chart.valAxisMinorTickMark && chart.valAxisMinorTickMark !== 'none') {
       for (const value of areaPlan.minorTicks) {
@@ -953,7 +999,10 @@ export function renderAreaChart(
       const labelAxisY = labelPosition === 'nextTo'
         ? primaryCategoryAxisY
         : labelPosition === 'high' ? py0 : py0 + ph;
-      ctx.fillText(label, anchor ? px0 + anchor.fraction * pw : entry.x, labelAxisY + gap);
+      fillAuthoredText(
+        ctx, label, anchor ? px0 + anchor.fraction * pw : entry.x, labelAxisY + gap,
+        axisLabelLineHeightPx(drawnCatTickFontPx),
+      );
     }
   }
 

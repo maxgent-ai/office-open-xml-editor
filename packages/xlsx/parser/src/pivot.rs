@@ -780,7 +780,7 @@ pub(crate) struct WorkbookTableStyles {
 }
 
 impl WorkbookTableStyles {
-    fn load(archive: &mut XlsxZip, theme_colors: &[String]) -> Self {
+    pub(crate) fn load(archive: &mut XlsxZip, theme_colors: &[String]) -> Self {
         match read_zip_string(archive, "xl/styles.xml") {
             Ok(xml) => Self::from_styles_xml(&xml, theme_colors),
             // A workbook without a styles part defines no table styles.
@@ -869,6 +869,33 @@ impl WorkbookTableStyles {
         name: &str,
         theme_colors: &[String],
     ) -> Result<Option<Vec<PivotTableStyleElement>>, String> {
+        self.elements_with(
+            name,
+            theme_colors,
+            xlsx_model::style_presets::pivot_style_elements,
+        )
+    }
+
+    /// [`Self::elements`] for a Table (§18.5.1.5 tableStyleInfo): a workbook
+    /// style, else a built-in Annex G Table style.
+    pub(crate) fn table_elements(
+        &self,
+        name: &str,
+        theme_colors: &[String],
+    ) -> Result<Option<Vec<PivotTableStyleElement>>, String> {
+        self.elements_with(
+            name,
+            theme_colors,
+            xlsx_model::style_presets::table_style_elements,
+        )
+    }
+
+    fn elements_with(
+        &self,
+        name: &str,
+        theme_colors: &[String],
+        preset: fn(&str, &[String]) -> Option<Vec<PivotTableStyleElement>>,
+    ) -> Result<Option<Vec<PivotTableStyleElement>>, String> {
         if let Some(elements) = self.styles.get(name) {
             let elements = elements.as_ref().map_err(Clone::clone)?;
             return elements
@@ -891,8 +918,7 @@ impl WorkbookTableStyles {
                 .collect::<Result<Vec<_>, String>>()
                 .map(Some);
         }
-        if let Some(elements) = xlsx_model::style_presets::pivot_style_elements(name, theme_colors)
-        {
+        if let Some(elements) = preset(name, theme_colors) {
             return Ok(Some(elements));
         }
         if self.malformed_part {
@@ -1095,6 +1121,41 @@ mod style_tests {
             .is_some());
         assert!(styles(&one_style("", ""))
             .elements("NoSuchStyle", &[])
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn built_in_table_styles_resolve_from_annex_g() {
+        let styles = styles(&format!(r#"<styleSheet xmlns="{SML}"/>"#));
+        let theme: Vec<String> = [
+            "#FFFFFF", "#000000", "#E7E6E6", "#44546A", "#4472C4", "#ED7D31", "#A5A5A5", "#FFC000",
+            "#5B9BD5", "#70AD47", "#0563C1", "#954F72",
+        ]
+        .iter()
+        .map(|c| c.to_string())
+        .collect();
+        // TableStyleMedium2 (Annex G, 1-based dxfIds): an accent1 header with a
+        // bold background-1 font, and 0.8-tint accent1 row stripes.
+        let elements = styles
+            .table_elements("TableStyleMedium2", &theme)
+            .unwrap()
+            .unwrap();
+        let find = |kind: &str| elements.iter().find(|e| e.kind == kind).unwrap();
+        let header = find("headerRow");
+        assert_eq!(
+            header.dxf.fill.as_ref().unwrap().fg_color.as_deref(),
+            Some("#4472C4")
+        );
+        assert!(header.dxf.font.as_ref().unwrap().bold);
+        assert!(find("firstRowStripe").dxf.fill.is_some());
+        // A PivotTable style name is not a Table style, and vice versa.
+        assert!(styles
+            .table_elements("PivotStyleLight16", &theme)
+            .unwrap()
+            .is_none());
+        assert!(styles
+            .elements("TableStyleMedium2", &theme)
             .unwrap()
             .is_none());
     }

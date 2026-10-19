@@ -8,9 +8,7 @@ use ooxml_common::bounded_xml::MCE_NS;
 use ooxml_common::depth::parse_guarded;
 use ooxml_common::mce::select_alternate_content;
 use ooxml_common::ns::{attr_ns, is_w_ns, relationships};
-pub(crate) use ooxml_common::numbering::word_level_use;
-#[cfg(test)]
-use ooxml_common::numbering::{format_counter, format_word_synthetic_zero};
+use ooxml_common::numbering::format_counter;
 use ooxml_common::numbering::{CounterEngine, CounterIdentity, LevelFacts};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -30,6 +28,76 @@ mod counter_instance_tests;
 #[cfg(test)]
 #[path = "numbering/word_ilvl_tests.rs"]
 pub(crate) mod word_ilvl_tests;
+
+/// Word's paragraph level byte (DOCX `w:ilvl` after its lexical narrowing;
+/// see the DOCX adapter) mapped to the level that paints the marker and the
+/// level whose counter advances. Separate the formatting source from the
+/// advancing counter. ECMA-376 Part 1
+/// §17.9 defines only the reference/definition relationship; MS-OI29500
+/// §2.1.277 documents Word's 0..255 authoring limit, not its malformed-value
+/// rendering. These branches are observations from Word 16.113 controls:
+/// every byte 0..255; signed, leading-zero, plus, 2^31 and 2^32 boundaries;
+/// a two-level definition; a level-8 replacement; and style-origin numPr.
+/// Each control placed levels 0, 1, and 8 before/after the target and checked
+/// its marker and subsequent counters. Values 16..255 repeat every 16 bytes;
+/// 9..15 have the special first-block behavior encoded below. The fixed `9`
+/// is a fresh fallback marker value, even when level 8 has startOverride=20.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WordLevelUse {
+    pub marker_level: Option<u32>,
+    pub counter_level: Option<u32>,
+    /// `Some(0)` or `Some(9)` uses a display value independent of any counter.
+    pub fixed_counter: Option<u32>,
+}
+
+pub(crate) fn word_level_use(ilvl: u8) -> WordLevelUse {
+    let (marker_level, counter_level, fixed_counter) = match ilvl {
+        0..=8 => (Some(u32::from(ilvl)), Some(u32::from(ilvl)), None),
+        9..=12 => (None, None, None),
+        13..=14 => (Some(8), None, Some(9)),
+        15 => (Some(0), Some(0), None),
+        _ => match ilvl % 16 {
+            level @ 0..=7 => (Some(8), Some(u32::from(level)), Some(0)),
+            8 => (Some(8), Some(8), None),
+            _ => (Some(8), None, Some(9)),
+        },
+    };
+    WordLevelUse {
+        marker_level,
+        counter_level,
+        fixed_counter,
+    }
+}
+
+/// Word 16.113's display of a counter reset by an ilvl byte in 16..255.
+/// Forty-three supported number formats were measured with level-8 `%9` and
+/// `ilvl=16`; multi-placeholder controls checked zero formatting on `%1`..`%8`.
+/// The ordinary format_counter(0) intentionally keeps its existing library
+/// semantics for unrelated start=0 documents.
+fn format_word_synthetic_zero(format: &str) -> String {
+    match format {
+        "lowerRoman" | "upperRoman" | "lowerLetter" | "upperLetter" | "arabicAlpha"
+        | "arabicAbjad" | "russianLower" | "russianUpper" | "thaiLetters" | "hindiVowels"
+        | "hindiConsonants" | "hebrew1" | "hebrew2" | "none" | "bullet" => String::new(),
+        "decimalZero" => "00".to_string(),
+        "numberInDash" => "- 0 -".to_string(),
+        "decimalFullWidth" => "０".to_string(),
+        "thaiNumbers" => "๐".to_string(),
+        "hindiNumbers" => "०".to_string(),
+        "ideographDigital"
+        | "japaneseDigitalTenThousand"
+        | "japaneseCounting"
+        | "chineseCountingThousand"
+        | "japaneseLegal" => "〇".to_string(),
+        "koreanDigital" | "koreanCounting" => "영".to_string(),
+        "koreanDigital2" => "零".to_string(),
+        "taiwaneseDigital" | "chineseCounting" | "taiwaneseCounting" => "○".to_string(),
+        "taiwaneseCountingThousand" | "chineseLegalSimplified" | "ideographLegalTraditional" => {
+            "零".to_string()
+        }
+        _ => format_counter(0, format),
+    }
+}
 
 /// The authored paragraph reference is an XML Schema integer (ECMA-376 Part 1
 /// §17.9.3). Word 16.113's measured display path first narrows its decimal
@@ -230,6 +298,10 @@ pub struct LevelDef {
     /// marker hangs left of the body), `w:firstLine` ⇒ positive (an additional
     /// first-line indent). Mirrors how `styles.rs` stores a direct `w:ind`.
     pub indent_first: f64,
+    /// §17.9.6 level pPr `w:tabs`: custom stops the level contributes to the
+    /// paragraph cascade at the level's layer (see parser.rs). Windows Word
+    /// 16.0 uses them for a list item's suffix tab (#1883 controls B6/B8).
+    pub tab_stops: Option<Vec<(f64, String, String)>>,
     /// Whether `indent_first` came from authored `w:hanging` / `w:firstLine`.
     pub indent_first_authored: bool,
     /// pt — POSITIVE magnitude of the first-line indent (= `indent_first.abs()`).
@@ -295,6 +367,9 @@ pub struct PicBullet {
     /// Marker height in pt, from the `<v:shape style="height:..">`. `None` ⇒ see
     /// {@link PicBullet::width_pt}.
     pub height_pt: Option<f64>,
+    /// The picture's natural size in points (`picture_bullet::natural_size_pt`),
+    /// resolved from the media part after parsing; `None` when unmeasured.
+    pub natural_size_pt: Option<(f64, f64)>,
 }
 
 impl Default for LevelDef {
@@ -306,6 +381,7 @@ impl Default for LevelDef {
             indent_left_authored: false,
             indent_right: None,
             indent_first: -36.0,
+            tab_stops: None,
             indent_first_authored: false,
             tab: 36.0,
             suff: "tab".to_string(),
@@ -417,7 +493,11 @@ fn parse_level_def(
                 .map(|v| -twips_to_pt(&v))
                 .or_else(|| attr_w(i, "firstLine").map(|v| twips_to_pt(&v)))
         })
-        .unwrap_or(-36.0);
+        // §17.3.1.12: an authored w:ind without hanging/firstLine has a zero
+        // first-line indent (Windows Word 16.0 places the marker at @left;
+        // #1883 control A7). The -36pt hanging is only the per-level default
+        // used when the level has no w:ind at all, like indent_left above.
+        .unwrap_or(if ind_node.is_some() { 0.0 } else { -36.0 });
     let tab = indent_first.abs();
     // §17.9.28: absent <w:suff> means "tab".
     let suff = child_w(lvl_node, "suff")
@@ -449,6 +529,8 @@ fn parse_level_def(
         indent_left_authored,
         indent_right,
         indent_first,
+        tab_stops: child_w(lvl_node, "pPr")
+            .and_then(|p| crate::styles::parse_para_fmt(p).tab_stops),
         indent_first_authored,
         tab,
         suff,
@@ -463,6 +545,27 @@ fn parse_level_def(
 }
 
 impl NumberingMap {
+    /// Resolve every picture bullet's natural size from its media part.
+    pub fn resolve_picture_bullet_natural_sizes(
+        &mut self,
+        mut natural: impl FnMut(&str) -> Option<(f64, f64)>,
+    ) {
+        let levels = self
+            .abstract_nums
+            .values_mut()
+            .flat_map(|levels| levels.iter_mut())
+            .chain(
+                self.num_level_overrides
+                    .values_mut()
+                    .flat_map(|levels| levels.values_mut()),
+            );
+        for level in levels {
+            if let Some(picture) = level.pic_bullet.as_mut() {
+                picture.natural_size_pt = natural(&picture.image_path);
+            }
+        }
+    }
+
     /// Parse `word/numbering.xml`. `media_map` is the numbering part's own
     /// relationship table (rId → zip media path, built from
     /// `word/_rels/numbering.xml.rels`); it is required to resolve the
@@ -525,6 +628,7 @@ impl NumberingMap {
                     mime_type,
                     width_pt,
                     height_pt,
+                    natural_size_pt: None,
                 },
             );
         }
@@ -741,13 +845,23 @@ impl NumberingMap {
                 index,
             )
         };
-        if word_zero {
-            self.counters
-                .resolve_text_word_zero(identity, level, start_at, facts)
-        } else {
-            self.counters
-                .resolve_text(identity, level, counter, start_at, facts)
-        }
+        self.counters.resolve_text_with_formatter(
+            identity,
+            level,
+            counter,
+            facts,
+            |index, live, format| {
+                if word_zero && (index == level || live.is_none()) {
+                    Some(format_word_synthetic_zero(format))
+                } else {
+                    ooxml_common::numbering::format_counter_within(
+                        live.unwrap_or_else(|| start_at(index)),
+                        format,
+                        ooxml_common::numbering::MAX_MARKER_BYTES,
+                    )
+                }
+            },
+        )
     }
 }
 

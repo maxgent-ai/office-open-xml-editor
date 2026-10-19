@@ -1,3 +1,5 @@
+import { OoxmlError } from '../errors/ooxml-error.js';
+import { imageEffectFrame } from './image-effect-frame.js';
 // Shared `<a:srcRect>` source-rectangle crop (ECMA-376 §20.1.8.55) for the docx,
 // pptx and xlsx renderers. The crop is a fraction of the image's NATIVE pixel
 // grid. Browser rasters may use a display-sized grid because the same fractional
@@ -63,27 +65,18 @@ interface CropMapping {
   dxFraction: number; dyFraction: number; dwFraction: number; dhFraction: number;
 }
 
-/** One §20.1.8.55 calculation for ordinary and retained image painting.
- * Strict acquisition distinguishes numerical overflow from legitimate empty
- * crop; ordinary callers retain their historical invalid/empty behavior. */
-export function imageCropProjection(
-  srcRect: SrcRect | null | undefined, strict = false,
+/** One §20.1.8.55 calculation for every image paint. Non-finite fractions
+ * mean no crop; a crop with no positive logical extent paints nothing. */
+function imageCropProjection(
+  srcRect: SrcRect | null | undefined,
 ): Readonly<ImageCropProjection> | null {
   if (!srcRect) return null;
   const values = [srcRect.l, srcRect.t, srcRect.r, srcRect.b];
-  if (!values.every(Number.isFinite)) {
-    if (strict) throw new RangeError('Image crop must contain finite fractions');
-    return null;
-  }
+  if (!values.every(Number.isFinite)) return null;
   if (!(srcRect.l || srcRect.t || srcRect.r || srcRect.b)) return null;
   const logicalX0 = srcRect.l, logicalY0 = srcRect.t;
   const logicalX1 = 1 - srcRect.r, logicalY1 = 1 - srcRect.b;
   const logicalW = logicalX1 - logicalX0, logicalH = logicalY1 - logicalY0;
-  // Checking output fractions alone would accept l=r=-1e308: an infinite
-  // logical width can hide behind finite zero fractions.
-  if (strict && ![logicalX1, logicalY1, logicalW, logicalH].every(Number.isFinite)) {
-    throw new RangeError('Image crop intermediate overflow');
-  }
   if (!(logicalW > 0) || !(logicalH > 0)) return Object.freeze({
     sourceX: 0, sourceY: 0, sourceWidth: 0, sourceHeight: 0,
     dxFraction: 0, dyFraction: 0, dwFraction: 0, dhFraction: 0,
@@ -97,7 +90,24 @@ export function imageCropProjection(
     dyFraction: (sourceY0 - logicalY0) / logicalH,
     dwFraction: sourceW / logicalW, dhFraction: sourceH / logicalH,
   });
-  if (strict && !Object.values(plan).every(Number.isFinite)) throw new RangeError('Image crop projection overflow');
+  return plan;
+}
+
+/** {@link imageCropProjection} for effect and projected-surface frames, where
+ * an unrepresentable crop must fail closed instead of silently meaning "no
+ * crop". Rejects non-finite fractions and intermediate overflow (for example
+ * l = r = -1e308 yields an infinite logical width behind finite fractions). */
+export function checkedImageCropProjection(
+  srcRect: SrcRect | null | undefined,
+): Readonly<ImageCropProjection> | null {
+  if (srcRect) {
+    const { l, t, r, b } = srcRect;
+    if (![l, t, r, b, 1 - r - l, 1 - b - t].every(Number.isFinite)) {
+      throw new RangeError('Image crop is not representable');
+    }
+  }
+  const plan = imageCropProjection(srcRect);
+  if (plan && !Object.values(plan).every(Number.isFinite)) throw new RangeError('Image crop projection overflow');
   return plan;
 }
 
@@ -131,48 +141,28 @@ export interface ImagePaintProjection {
 }
 export interface ImagePaintProjectionOptions {
   readonly transform?: Readonly<ImagePaintTransform>;
-  readonly projection?: Readonly<ImagePaintProjection>;
 }
 
 /** Canonical local-coordinate crop/transform projection. This is a pure
- * drawing primitive, not a layout or contour algorithm. Layout retains its
- * plan and proves allocation; ordinary painting uses the same constructor. */
+ * drawing primitive, not a layout or contour algorithm. */
 export function imagePaintProjection(
   width: number, height: number, srcRect: SrcRect | null | undefined,
-  transform: Readonly<ImagePaintTransform> = {}, strict = true,
+  transform: Readonly<ImagePaintTransform> = {},
 ): Readonly<ImagePaintProjection> {
   const rotation = transform.rotation ?? 0;
   const rotationProduct = rotation * Math.PI;
   const rotationRad = rotationProduct / 180;
   const transformed = rotation !== 0 || Boolean(transform.flipH) || Boolean(transform.flipV);
   const centerX = width / 2, centerY = height / 2;
-  if (strict && (!Number.isFinite(width) || !Number.isFinite(height) || width < 0 || height < 0
-    || ![rotation, rotationProduct, rotationRad, centerX, centerY].every(Number.isFinite)
-    || (transform.flipH !== undefined && typeof transform.flipH !== 'boolean')
-    || (transform.flipV !== undefined && typeof transform.flipV !== 'boolean')
-    || (transform.alpha !== undefined && (!Number.isFinite(transform.alpha) || transform.alpha < 0 || transform.alpha > 1)))) {
-    throw new RangeError('Image projection has invalid or overflowed transform');
-  }
-  const crop = imageCropProjection(srcRect, strict);
+  const crop = imageCropProjection(srcRect);
   const destination = Object.freeze({ x: transformed ? -centerX : 0, y: transformed ? -centerY : 0, width, height });
-  // No clamping of authored fractions. With a nonempty crop, the canonical
-  // source intersection is mathematically inside the full destination frame;
-  // the bound admits only rounding of its subtraction/division/addition.
-  if (strict && crop && crop.sourceWidth > 0 && crop.sourceHeight > 0) {
-    const precision = 4 * Number.EPSILON;
-    if (crop.dxFraction < 0 || crop.dyFraction < 0 || crop.dwFraction < 0 || crop.dhFraction < 0
-      || crop.dxFraction + crop.dwFraction > 1 + precision || crop.dyFraction + crop.dhFraction > 1 + precision
-      || ![crop.dxFraction * width, crop.dyFraction * height, crop.dwFraction * width, crop.dhFraction * height].every(Number.isFinite)) {
-      throw new RangeError('Image crop exceeds its full destination frame');
-    }
-  }
   return Object.freeze({ width, height, transformed, centerX, centerY, rotationRad,
     scaleX: transform.flipH ? -1 : 1, scaleY: transform.flipV ? -1 : 1,
     alpha: transform.alpha ?? 1, destination, crop });
 }
 
-/** Apply retained drawing transforms only. No recorder, bounds or measurement
- * result is produced. Origins may move while the immutable local plan stays. */
+/** Apply the projection's drawing transforms only. No recorder, bounds or
+ * measurement result is produced. */
 export function withImagePaintProjection(
   ctx: AnyCtx, x: number, y: number, plan: Readonly<ImagePaintProjection>,
   draw: (x: number, y: number, width: number, height: number) => void,
@@ -193,24 +183,6 @@ export function withImagePaintProjection(
   } finally { if (hasAlpha) ctx.restore(); }
 }
 
-/** The 9-arg `drawImage` source rectangle for an `<a:srcRect>` crop, or `null`
- *  when there is no (non-empty) crop or the image reports no native size.
- *
- *  The returned rectangle is the intersection of the logical source rectangle
- *  with the actual bitmap. Negative edges therefore return the full affected
- *  source range; {@link drawImageCropped} additionally preserves their outset
- *  as transparent destination space. Callers
- *  that need the rect for auxiliary paints (e.g. pptx effect passes) call this
- *  directly; the common path uses {@link drawImageCropped}. */
-export function cropSourceRect(
-  img: CanvasImageSource,
-  srcRect: SrcRect | null | undefined,
-): { sx: number; sy: number; sw: number; sh: number } | null {
-  const mapping = cropSourceMapping(img, srcRect);
-  if (!mapping) return null;
-  return { sx: mapping.sx, sy: mapping.sy, sw: mapping.sw, sh: mapping.sh };
-}
-
 /** Draw `img` into the destination box `[dx, dy, dw, dh]`, honoring an optional
  *  `<a:srcRect>` crop. The destination box is unchanged — the visible slice is
  *  stretched to fill it (the 9-arg `drawImage` behavior). Crop applies to raster
@@ -222,6 +194,33 @@ export function drawImageCropped(
   options?: Readonly<ImagePaintProjectionOptions>,
 ): void {
   const paint = (x: number, y: number, width: number, height: number, projection?: Readonly<ImageCropProjection> | null) => {
+    const frame = imageEffectFrame(img);
+    if (frame) {
+      // §20.1.8.15 grow changes effect coverage, never the authored picture
+      // frame. A source crop still selects that frame; only an uncropped
+      // picture paints the Gaussian's transparent outset beyond its bounds.
+      const { w, h } = imageNaturalSize(img);
+      let crop: Readonly<ImageCropProjection> | null;
+      try { crop = projection === undefined ? checkedImageCropProjection(srcRect) : projection; }
+      catch { throw new OoxmlError('unsupported-image-effect', 'Unrepresentable image effect crop'); }
+      const draw = (...coordinates: [number, number, number, number] | [number, number, number, number, number, number, number, number]) => {
+        // Canvas may silently ignore non-finite arguments. The effect frame
+        // must not turn a malformed crop/overflow into a missing picture.
+        if (!coordinates.every(Number.isFinite)) throw new OoxmlError('unsupported-image-effect', 'Unrepresentable image effect paint projection');
+        if (coordinates.length === 4) ctx.drawImage(img, ...coordinates);
+        else ctx.drawImage(img, ...coordinates);
+      };
+      if (!crop) {
+        draw(x - frame.x / frame.width * width, y - frame.y / frame.height * height,
+          w / frame.width * width, h / frame.height * height);
+      } else if (crop.sourceWidth > 0 && crop.sourceHeight > 0) {
+        draw(frame.x + crop.sourceX * frame.width, frame.y + crop.sourceY * frame.height,
+          crop.sourceWidth * frame.width, crop.sourceHeight * frame.height,
+          x + crop.dxFraction * width, y + crop.dyFraction * height,
+          crop.dwFraction * width, crop.dhFraction * height);
+      }
+      return;
+    }
     const c = cropSourceMapping(img, srcRect, projection);
     if (!c) ctx.drawImage(img, x, y, width, height);
     else if (c.sw > 0 && c.sh > 0 && c.dwFraction > 0 && c.dhFraction > 0) {
@@ -230,10 +229,9 @@ export function drawImageCropped(
     }
   };
   // Keep all existing seven-argument DOCX/XLSX/PPTX calls exactly on their
-  // crop-only path; a retained projection is an explicit eighth argument.
+  // crop-only path; an authored transform is an explicit eighth argument.
   if (!options) { paint(dx, dy, dw, dh); return; }
-  const plan = options.projection ?? imagePaintProjection(dw, dh, srcRect, options.transform, false);
-  if (plan.width !== dw || plan.height !== dh) throw new RangeError('Image projection destination mismatch');
+  const plan = imagePaintProjection(dw, dh, srcRect, options.transform);
   withImagePaintProjection(ctx, dx, dy, plan, (x, y, width, height) => paint(x, y, width, height, plan.crop));
 }
 
@@ -284,4 +282,25 @@ export function metafileRasterSize(
   const fracW = 1 - srcRect.l - srcRect.r;
   const fracH = 1 - srcRect.t - srcRect.b;
   return { widthPt: widthPt / fracW, heightPt: heightPt / fracH };
+}
+
+/** Physical extent of the whole (uncropped) source of a stretched blip fill
+ * (§20.1.8.55/.56): the fillRect insets shrink the destination, and the
+ * srcRect window is stretched across it, so the full source spans the
+ * destination divided by the visible source fraction. CT_Blip effects that
+ * are measured in EMUs (§20.1.8.15) are evaluated against this frame, the
+ * same mapping core uses for nested stretched fills. */
+export function stretchedSourceFrame(
+  width: number, height: number,
+  srcRect: SrcRect | null | undefined,
+  fillRect: Readonly<{ l?: number; t?: number; r?: number; b?: number }> | null | undefined,
+): { width: number; height: number } {
+  const destW = width * (1 - (fillRect?.l ?? 0) - (fillRect?.r ?? 0));
+  const destH = height * (1 - (fillRect?.t ?? 0) - (fillRect?.b ?? 0));
+  const cropW = 1 - (srcRect?.l ?? 0) - (srcRect?.r ?? 0);
+  const cropH = 1 - (srcRect?.t ?? 0) - (srcRect?.b ?? 0);
+  return {
+    width: Math.max(0, cropW > 0 ? destW / cropW : destW),
+    height: Math.max(0, cropH > 0 ? destH / cropH : destH),
+  };
 }

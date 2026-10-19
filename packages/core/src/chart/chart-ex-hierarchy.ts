@@ -2,7 +2,7 @@ import { MAX_CANVAS_CHART_POINTS } from './resource-limits.js';
 
 // The package parser already applies its XML-depth ceiling. Keep the same kind
 // of stack-safety boundary for caller-constructed public ChartModel objects.
-export const MAX_CANVAS_HIERARCHY_DEPTH = 512;
+const MAX_CANVAS_HIERARCHY_DEPTH = 512;
 
 /** A node in the ChartEx hierarchy tree. `layoutWeight` is the overflow-safe
  * aggregate used for treemap areas and sunburst angles; `value` is the finite,

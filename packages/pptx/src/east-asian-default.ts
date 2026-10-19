@@ -136,3 +136,36 @@ export function eastAsianDefaultFaces(latinFace: string | null, text: string): r
   const first = tiers.slice(0, 2).find((face) => covers(face, text));
   return first ? [first, ...tiers.filter((face) => face !== first)] : [tiers[2], tiers[0], tiers[1]];
 }
+
+// Non-CJK characters PowerPoint draws in a resolved East Asian face (issue
+// #1653). Observed with the reference PDF engine on the #1627 sweep deck
+// (explicit Segoe UI Symbol / Meiryo UI / Microsoft Sans Serif slots, nine
+// languages) and the #1653 boundary deck:
+// * § ¨ ° ± ´ in every measured language.
+// * Enclosed Alphanumerics, Geometric Shapes, Miscellaneous Symbols,
+//   Dingbats and CJK Compatibility Forms (en-US, ja-JP). Every scalar of
+//   these blocks the East Asian face lacked fell back to the Latin face, and
+//   every one it covers was drawn by it, so the block is the slot; the
+//   browser's own per-glyph fallback stands in for Office's.
+// * × ÷ ⁇ ⁈ except in ar, he, hi and th runs (Latin there).
+// * Curly quotes U+2018-201E in ja, ko and zh runs only; U+201F stays Latin.
+// Other languages follow the nearest measured class. Remaining measured slot
+// moves (European digits to cs in Hebrew/Arabic runs, the yen glyph for a
+// Japanese backslash) only swap one proportional glyph for another, so they
+// are deliberately not modelled.
+const EA_SLOT_SYMBOLS = new Set([0xa7, 0xa8, 0xb0, 0xb1, 0xb4]);
+const EA_SLOT_OPERATORS = new Set([0xd7, 0xf7, 0x2047, 0x2048]);
+const CJK_LANG_RE = /^(?:ja|ko|zh)(?:[-_]|$)/i;
+const LATIN_OPERATOR_LANG_RE = /^(?:ar|he|hi|th)(?:[-_]|$)/i;
+
+/**
+ * True when `cp` (outside the CJK break ranges) takes the East Asian slot in a
+ * run of language `lang` whose East Asian face is resolved. Runs with an empty
+ * East Asian slot keep these characters in the Latin face.
+ */
+export function isEastAsianSlotSymbol(cp: number, lang: string | null | undefined): boolean {
+  if (EA_SLOT_SYMBOLS.has(cp) || (cp >= 0x2460 && cp <= 0x24ff)
+    || (cp >= 0x25a0 && cp <= 0x27bf) || (cp >= 0xfe30 && cp <= 0xfe4f)) return true;
+  if (EA_SLOT_OPERATORS.has(cp)) return !LATIN_OPERATOR_LANG_RE.test(lang ?? '');
+  return cp >= 0x2018 && cp <= 0x201e && CJK_LANG_RE.test(lang ?? '');
+}

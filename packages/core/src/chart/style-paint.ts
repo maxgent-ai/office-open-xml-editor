@@ -56,7 +56,7 @@ export function chartStyleFillPaint(
   return paints[paletteIndex % paints.length] ?? null;
 }
 
-export function chartStyleLinePaint(
+function chartStyleLinePaint(
   style: ChartExElementStyle | null | undefined,
   index: number,
 ): ChartModel['plotAreaLineFill'] {
@@ -105,7 +105,7 @@ export type ChartExPointCarrier = Pick<
 
 
 /** Whether a CT_DataPoint `spPr` authors its own fill atom. */
-export function chartExPointAuthorsFill(point: ChartExPointCarrier | null | undefined): boolean {
+function chartExPointAuthorsFill(point: ChartExPointCarrier | null | undefined): boolean {
   const style = point?.chartexStyle;
   return point?.fillHidden === true
     || point?.color != null

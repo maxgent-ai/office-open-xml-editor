@@ -21,22 +21,6 @@ export function parseA1(ref: string): { row: number; col: number } | null {
 }
 
 /**
- * Parse a single A1 cell or retain the two literal endpoints of an A1 range.
- * This is a syntax helper only: endpoint order does not define Excel's
- * ActiveCell. Selection semantics live in `selection.ts`.
- */
-export function parseA1Range(ref: string): {
-  anchor: { row: number; col: number };
-  active: { row: number; col: number };
-} | null {
-  const parts = ref.split(':');
-  if (parts.length > 2) return null;
-  const anchor = parseA1(parts[0]);
-  const active = parts.length === 2 ? parseA1(parts[1]) : anchor;
-  return anchor && active ? { anchor, active } : null;
-}
-
-/**
  * Inverse of {@link parseA1}: format a 1-based (row, col) as an A1 reference
  * (e.g. `(7, 2)` → `"B7"`). Used by IX2 findText to report a match's cell in the
  * A1 notation users know. The column runs the bijective base-26 the spreadsheet

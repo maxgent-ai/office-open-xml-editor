@@ -1,5 +1,5 @@
+import { normalizeXlsxWorksheetPolicy } from './internal/worksheet-policy.js';
 import { describe, expect, it } from 'vitest';
-import { normalizeXlsxWorksheetPolicy } from '@silurus/ooxml-core/worker';
 import { getSheetRenderCache } from './renderer.js';
 import { WorksheetViewProjectionCache } from './worker-protocol.js';
 import { bindWorksheetPolicy, getWorksheetPolicy } from './worksheet-policy-context.js';

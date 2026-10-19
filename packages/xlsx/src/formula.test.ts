@@ -1,6 +1,13 @@
 import { describe, it, expect } from 'vitest';
-import { evaluateFormula, evalFormulaToBool } from './formula.js';
+import { evaluateFormula, formulaEvaluationToBool } from './formula.js';
 import type { Cell } from './types.js';
+
+/** The conditional-formatting match: evaluate, then convert the evaluation. */
+const evalFormulaToBool = (
+  formula: string,
+  ctx: Parameters<typeof evaluateFormula>[1],
+): boolean =>
+  formulaEvaluationToBool(evaluateFormula(formula, ctx));
 
 function numCell(row: number, col: number, n: number): Cell {
   return { row, col, value: { type: 'number', number: n }, styleIndex: 0 };

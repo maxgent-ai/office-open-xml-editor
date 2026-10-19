@@ -23,6 +23,35 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+/// Optional whole-scheme replacements in CT_BaseStylesOverride
+/// (ECMA-376 §20.1.6.12). Presence is distinct from an empty scheme: missing
+/// schemes inherit, present schemes replace every slot of their parent.
+#[derive(Debug, Clone, Default)]
+pub struct ThemeOverride {
+    pub colors: Option<ThemeColorScheme>,
+    pub fonts: Option<ThemeFonts>,
+    pub format: Option<ThemeFormatScheme>,
+}
+
+impl ThemeOverride {
+    pub fn parse(xml: &str) -> Self {
+        let Ok(doc) = crate::depth::parse_guarded(xml) else {
+            return Self::default();
+        };
+        let root = doc.root_element();
+        let present = |name| {
+            root.children().any(|n| {
+                n.is_element() && is_a_ns(n.tag_name().namespace()) && n.tag_name().name() == name
+            })
+        };
+        Self {
+            colors: present("clrScheme").then(|| ThemeColorScheme::parse(xml)),
+            fonts: present("fontScheme").then(|| ThemeFonts::parse(xml)),
+            format: present("fmtScheme").then(|| ThemeFormatScheme::parse(xml)),
+        }
+    }
+}
+
 type NamespaceDeclarations = Arc<[(Option<String>, Arc<str>)]>;
 
 /// One style-matrix entry retained for on-demand self-contained XML.
@@ -55,7 +84,18 @@ impl StandaloneThemeStyleXml {
 
     /// Build a self-contained wrapper on demand. The temporary wrapper lives
     /// only for the caller's DOM parse.
-    pub fn to_xml(&self) -> String {
+    ///
+    /// Every style reference (`fillRef`/`lnRef`/`effectRef`/`bgRef`) rebuilds
+    /// and re-parses its entry, because `phClr` takes the referencing
+    /// element's colour (§20.1.4.2.10), so the parsed result cannot be shared
+    /// between references. The rebuilt bytes are charged to the operation's
+    /// [`MAX_THEME_STYLE_REPARSE_BYTES`] work budget so a large entry
+    /// referenced by many shapes fails closed with a typed resource error
+    /// instead of multiplying parse time.
+    pub fn to_xml(&self) -> Result<String, String> {
+        // A poisoned operation copies nothing; otherwise the exact wrapper
+        // size is charged before the (possibly large) fragment is copied.
+        charge_style_reparse(0)?;
         let mut xml = String::from("<themeStyleRoot");
         for (prefix, uri) in self.namespaces.iter() {
             match prefix {
@@ -70,10 +110,30 @@ impl StandaloneThemeStyleXml {
             xml.push('"');
         }
         xml.push('>');
+        const CLOSE: &str = "</themeStyleRoot>";
+        charge_style_reparse(xml.len() + self.fragment.len() + CLOSE.len())?;
         xml.push_str(&self.fragment);
-        xml.push_str("</themeStyleRoot>");
-        xml
+        xml.push_str(CLOSE);
+        Ok(xml)
     }
+}
+
+/// Library work budget for theme style-matrix XML rebuilt and re-parsed by
+/// style references within one parse operation. Ordinary themes keep each
+/// entry under a few kilobytes, so this admits tens of thousands of
+/// references; it exists to stop (entry size × reference count)
+/// amplification, which costs roughly a second per 64 MiB re-parsed.
+pub const MAX_THEME_STYLE_REPARSE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Charge `bytes` of theme style-matrix XML about to be re-parsed for one
+/// style reference. Hosts that keep their own fragment copies (the PPTX theme
+/// map) charge through this too, so every format shares one budget.
+pub fn charge_style_reparse(bytes: usize) -> Result<(), String> {
+    crate::resource::charge_scope_work(
+        crate::resource::HardResourceLimitKind::ThemeStyleReparseBytes,
+        MAX_THEME_STYLE_REPARSE_BYTES,
+        bytes as u64,
+    )
 }
 
 /// Result of resolving a style-matrix index. `NoStyle` is an authored sentinel
@@ -889,7 +949,7 @@ mod tests {
         let StyleMatrixLookup::Entry(line) = scheme.lookup_line_ref(1) else {
             panic!("line style 1 should exist");
         };
-        let line_xml = line.to_xml();
+        let line_xml = line.to_xml().unwrap();
         let parsed =
             roxmltree::Document::parse(&line_xml).expect("standalone line style must parse");
         assert!(parsed
@@ -912,6 +972,7 @@ mod tests {
         };
         assert!(line
             .to_xml()
+            .unwrap()
             .contains("http://purl.oclc.org/ooxml/drawingml/main"));
     }
 
@@ -928,7 +989,7 @@ mod tests {
         let StyleMatrixLookup::Entry(entry) = scheme.lookup_fill_ref(1) else {
             panic!("fill style should exist");
         };
-        let standalone = entry.to_xml();
+        let standalone = entry.to_xml().unwrap();
         let parsed = roxmltree::Document::parse(&standalone).expect("all prefixes remain bound");
         let blip = parsed
             .descendants()
@@ -958,7 +1019,7 @@ mod tests {
         let StyleMatrixLookup::Entry(entry) = scheme.lookup_fill_ref(1) else {
             panic!("fill style should exist");
         };
-        let standalone = entry.to_xml();
+        let standalone = entry.to_xml().unwrap();
         let parsed = roxmltree::Document::parse(&standalone).expect("all prefixes remain bound");
         let color = parsed
             .descendants()
@@ -1020,5 +1081,104 @@ mod tests {
         assert!(ThemeColorScheme::parse("<not xml").is_empty());
         assert_eq!(ThemeFonts::parse(""), ThemeFonts::default());
         assert_eq!(ThemeFormatScheme::parse(""), ThemeFormatScheme::default());
+    }
+}
+
+#[cfg(test)]
+mod override_tests {
+    use super::*;
+
+    #[test]
+    fn absent_schemes_inherit_but_empty_authored_schemes_replace() {
+        let value = ThemeOverride::parse(
+            r#"<a:themeOverride xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:fontScheme name="Empty"/><a:fmtScheme name="Empty"/></a:themeOverride>"#,
+        );
+        assert!(value.colors.is_none());
+        assert_eq!(value.fonts, Some(ThemeFonts::default()));
+        assert_eq!(value.format, Some(ThemeFormatScheme::default()));
+        let foreign = ThemeOverride::parse(
+            r#"<a:themeOverride xmlns:a="http://purl.oclc.org/ooxml/drawingml/main"><clrScheme xmlns="urn:other"/></a:themeOverride>"#,
+        );
+        assert!(foreign.colors.is_none());
+    }
+}
+
+#[cfg(test)]
+mod reparse_budget_tests {
+    use super::*;
+    use crate::resource::{OoxmlFormat, ResourceGovernor};
+
+    fn violation(error: &str) -> serde_json::Value {
+        let payload: serde_json::Value = serde_json::from_str(
+            error
+                .strip_prefix("OOXML_RESOURCE_LIMIT:")
+                .expect("typed resource error"),
+        )
+        .unwrap();
+        payload["details"]["violation"].clone()
+    }
+
+    /// One fill entry inflated by an ignored extension list, as in a theme
+    /// whose single large entry is referenced by every shape.
+    fn large_entry_scheme(filler_bytes: usize) -> ThemeFormatScheme {
+        let filler = "x".repeat(filler_bytes);
+        ThemeFormatScheme::parse(&format!(
+            r#"<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:themeElements><a:fmtScheme><a:fillStyleLst><a:solidFill><a:schemeClr val="phClr"/><a:extLst><a:ext uri="u">{filler}</a:ext></a:extLst></a:solidFill></a:fillStyleLst></a:fmtScheme></a:themeElements></a:theme>"#
+        ))
+    }
+
+    #[test]
+    fn repeated_style_references_fail_closed_at_the_operation_budget() {
+        let scheme = large_entry_scheme(4 * 1024 * 1024);
+        let StyleMatrixLookup::Entry(entry) = scheme.lookup_fill_ref(1) else {
+            panic!("fill entry");
+        };
+        let entry_len = entry.to_xml().unwrap().len() as u64;
+        let fits = MAX_THEME_STYLE_REPARSE_BYTES / entry_len;
+
+        let governor = ResourceGovernor::from_wasm(OoxmlFormat::Pptx, None, None, None);
+        {
+            let _scope = governor.scope("slide");
+            for _ in 0..fits {
+                entry.to_xml().expect("within the operation budget");
+            }
+            {
+                // A nested scope keeps charging the enclosing operation.
+                let _nested = governor.scope("entry");
+                let error = entry.to_xml().expect_err("budget crossing");
+                let violation = violation(&error);
+                assert_eq!(violation["resource"], "theme-style-reparse");
+                assert_eq!(violation["metric"], "bytes");
+                assert_eq!(violation["limit"], MAX_THEME_STYLE_REPARSE_BYTES);
+                assert_eq!(violation["configurable"], false);
+            }
+        }
+
+        // The budget belongs to one top-level operation: every later
+        // operation of a healthy session starts from zero.
+        let session = ResourceGovernor::from_wasm(OoxmlFormat::Pptx, None, None, None);
+        for _ in 0..2 {
+            let _scope = session.scope("slide");
+            for _ in 0..fits {
+                entry.to_xml().expect("each operation has its own budget");
+            }
+        }
+        assert!(session.first_error().is_none());
+
+        // A logical operation resumed over several bounded pulls keeps one
+        // ledger: its pulls cannot each spend a fresh budget.
+        let pulls = ResourceGovernor::from_wasm(OoxmlFormat::Docx, None, None, None);
+        let operation = pulls.begin_operation("document");
+        {
+            let _pull = pulls.scope_operation(operation).unwrap();
+            for _ in 0..fits {
+                entry.to_xml().expect("first pull within budget");
+            }
+        }
+        {
+            let _pull = pulls.scope_operation(operation).unwrap();
+            let error = entry.to_xml().expect_err("resumed pull shares the ledger");
+            assert_eq!(violation(&error)["resource"], "theme-style-reparse");
+        }
     }
 }

@@ -1,10 +1,12 @@
+import { assertChartImageWork, rejectChartImageGeometry } from './image-fill-errors.js';
 import type { ImageFill } from '../types/common.js';
 import type { ChartThreeDSurface } from '../types/chart.js';
 import { createAuxCanvasForContext, type AuxCanvas, type AuxContext } from '../canvas/aux-canvas.js';
 import { MAX_CANVAS_AREA, MAX_CANVAS_DIMENSION } from '../canvas/clamp.js';
-import { cropSourceMapping, drawImageCropped, imageNaturalSize } from '../image/crop.js';
+import { cropSourceMapping, drawImageCropped, imageNaturalSize, checkedImageCropProjection } from '../image/crop.js';
+import { imageEffectFrame, imageEffectOutsetPeriods } from '../image/image-effect-frame.js';
 import { drawProjected, projectQuadPoint } from '../shape/scene3d-draw.js';
-import { chartImageTileMetrics, chartImageTileOrigin } from './image-fill.js';
+import { chartImageTileMetrics, chartImageTileOrigin, isChartFillPreparationSource } from './image-fill.js';
 import {
   planChartThreeDSurfacePicture,
   surfacePictureFaceIsEnabled,
@@ -37,7 +39,7 @@ function relativeRectQuad(
   ];
   return points.every((point): point is SurfacePicturePoint => point != null)
     ? points as SurfacePictureQuad
-    : null;
+    : rejectChartImageGeometry();
 }
 
 function screenAlignedFace(
@@ -51,6 +53,7 @@ function screenAlignedFace(
     index,
   })).sort((left, right) => left.projected.y - right.projected.y
     || left.projected.x - right.projected.x);
+  if (byY.some(({ projected }) => ![projected.x, projected.y].every(Number.isFinite))) rejectChartImageGeometry();
   const top = byY.slice(0, 2).sort((left, right) => left.projected.x - right.projected.x);
   const bottom = byY.slice(2).sort((left, right) => left.projected.x - right.projected.x);
   if (new Set([...top, ...bottom].map(item => item.index)).size !== 4) return null;
@@ -102,6 +105,18 @@ function sceneMetricDistance(
   );
 }
 
+/** Rendered size (points) of a wall/floor picture: the scene-metric extent of
+ * the surface's inner face, onto which a stretched picture is mapped. It is
+ * the occurrence size for per-occurrence CT_Blip chains (chartFillRenderedSize). */
+export function chartThreeDSurfacePictureSizePt(
+  geometry: ChartThreeDSurfaceGeometry, ptToPx: number,
+): { widthPt: number; heightPt: number } | null {
+  if (geometry.inner.length !== 4 || !(ptToPx > 0)) return null;
+  const width = sceneMetricDistance(geometry.inner[0], geometry.inner[1], geometry.modelDepth) / ptToPx;
+  const height = sceneMetricDistance(geometry.inner[1], geometry.inner[2], geometry.modelDepth) / ptToPx;
+  return [width, height].every(v => Number.isFinite(v) && v > 0) ? { widthPt: width, heightPt: height } : null;
+}
+
 export function paintChartThreeDSurfacePicture(
   ctx: CanvasRenderingContext2D,
   fill: ImageFill,
@@ -112,15 +127,55 @@ export function paintChartThreeDSurfacePicture(
   visibleFaceIndices: readonly number[],
   project: (point: ThreeDScenePoint) => SurfacePicturePoint,
   valueSpan: number,
+  /** Per-mapping source for size-dependent CT_Blip chains: called with the
+   * physical size (pt) of each face or repetition the picture is mapped onto,
+   * so EMU-measured effects match that rendered size. */
+  sourceFor?: (widthPt: number, heightPt: number) => CanvasImageSource | null,
+  ptToPx = 1,
 ): boolean {
   const plan = planChartThreeDSurfacePicture(fill, surface, kind, valueSpan);
-  if (!plan || geometry.inner.length !== 4) return false;
-  const natural = imageNaturalSize(image);
-  if (!(natural.w > 0) || !(natural.h > 0)) return false;
-  const crop = cropSourceMapping(image, fill.srcRect);
-  const sourceRect = crop
-    ? { x0: crop.sx, y0: crop.sy, x1: crop.sx + crop.sw, y1: crop.sy + crop.sh }
-    : undefined;
+  // Scene-metric size of a mapped face span (value axis runs face[3]→face[0]).
+  const mapped = (face: readonly ThreeDScenePoint[], lower = 0, upper = 1): CanvasImageSource | null => {
+    if (!sourceFor) return image;
+    const widthPt = sceneMetricDistance(face[3], face[2], geometry.modelDepth) / ptToPx;
+    const heightPt = sceneMetricDistance(face[3], face[0], geometry.modelDepth) * (upper - lower) / ptToPx;
+    if (![widthPt, heightPt].every(v => Number.isFinite(v) && v > 0)) return null;
+    return sourceFor(widthPt, heightPt);
+  };
+  if (!plan) return false;
+  if (geometry.inner.length !== 4) rejectChartImageGeometry();
+  let projection: ReturnType<typeof checkedImageCropProjection>;
+  try { projection = checkedImageCropProjection(fill.srcRect); } catch { rejectChartImageGeometry(); }
+  // A spatial CT_Blip effect can grow the decoded grid around the authored
+  // picture frame. The frame (not the grown grid) is the picture that maps
+  // onto the face (§20.1.8.14/.55); its outset lies outside the clipped face.
+  // Each per-mapping source has its own grid and outset, so these metrics are
+  // derived from every resolved source before it is projected.
+  const sourceMetrics = (source: CanvasImageSource) => {
+    const effectFrame = imageEffectFrame(source);
+    const grid = imageNaturalSize(source);
+    const natural = effectFrame ? { w: effectFrame.width, h: effectFrame.height } : grid;
+    if (![natural.w, natural.h].every(v => Number.isFinite(v) && v > 0)) rejectChartImageGeometry();
+    const frameGrid = effectFrame
+      ? { width: effectFrame.width, height: effectFrame.height } as unknown as CanvasImageSource
+      : source;
+    const crop = cropSourceMapping(frameGrid, fill.srcRect, projection);
+    const fx = effectFrame?.x ?? 0, fy = effectFrame?.y ?? 0;
+    const sourceRect = crop
+      ? { x0: fx + crop.sx, y0: fy + crop.sy, x1: fx + crop.sx + crop.sw, y1: fy + crop.sy + crop.sh }
+      : effectFrame ? { x0: fx, y0: fy, x1: fx + natural.w, y1: fy + natural.h } : undefined;
+    return { grid, natural, crop, sourceRect };
+  };
+  const { natural } = sourceMetrics(image);
+  // A plain-stack repetition height follows the decoded source aspect. A
+  // preparation placeholder has no source frame, so it records no repetition
+  // size; the host's next round resolves the real source first (see
+  // collectChartFillRenderedSizes).
+  if (plan.mode === 'stack' && isChartFillPreparationSource(image)) return false;
+  const drawSource = (source: CanvasImageSource, destination: SurfacePictureQuad) => {
+    const metrics = sourceMetrics(source);
+    drawProjected(source, ctx, metrics.grid.w, metrics.grid.h, destination, 0.5, metrics.sourceRect);
+  };
   // Preserve the established planar mapping exactly. Positive-thickness
   // joining faces need their own screen-upright ordering because each face has
   // a different scene-space axis pair.
@@ -166,8 +221,9 @@ export function paintChartThreeDSurfacePicture(
     context: AuxContext;
   }> = [];
 
+  try {
   if (plan.mode === 'stack') {
-    if (stackFraction == null) return false;
+    if (stackFraction == null) rejectChartImageGeometry();
     let work = 0;
     let hasFace = false;
     for (const faceIndex of visibleFaceIndices) {
@@ -177,16 +233,17 @@ export function paintChartThreeDSurfacePicture(
       const repetitions = surfacePictureFaceUsesStackedMapping(plan, faceIndex)
         ? Math.ceil(1 / stackFraction)
         : 1;
-      if (!Number.isSafeInteger(repetitions) || repetitions < 1) return false;
+      if (repetitions < 1) rejectChartImageGeometry();
+      assertChartImageWork(repetitions, MAX_CHART_IMAGE_FILL_TILES);
       work += repetitions;
-      if (work > MAX_CHART_IMAGE_FILL_TILES) return false;
+      assertChartImageWork(work, MAX_CHART_IMAGE_FILL_TILES);
       hasFace = true;
     }
     if (!hasFace) return false;
   }
 
   if (plan.mode === 'tile') {
-    if (!tileMetrics) return false;
+    if (!tileMetrics) rejectChartImageGeometry();
     let work = 0;
     let canvasArea = 0;
     let hasFace = false;
@@ -200,28 +257,44 @@ export function paintChartThreeDSurfacePicture(
       // space makes them too large when the authored projection is below 1×.
       const width = sceneMetricDistance(face[0], face[1], geometry.modelDepth);
       const height = sceneMetricDistance(face[0], face[3], geometry.modelDepth);
+      if (![width, height].every(Number.isFinite)) rejectChartImageGeometry();
       if (!(width > 0) || !(height > 0)) continue;
       const origin = chartImageTileOrigin(tileMetrics, width, height);
-      const firstColumn = Math.floor(-origin.x / tileMetrics.tileW);
-      const firstRow = Math.floor(-origin.y / tileMetrics.tileH);
-      const lastColumn = Math.ceil((width - origin.x) / tileMetrics.tileW);
-      const lastRow = Math.ceil((height - origin.y) / tileMetrics.tileH);
+      // Neighbouring tiles whose CT_Blip effect outset reaches the face are
+      // drawn and charged as well; the authored period is unchanged.
+      const reach = imageEffectOutsetPeriods(image, fill.srcRect != null);
+      const firstColumn = Math.floor(-origin.x / tileMetrics.tileW) - reach.x;
+      const firstRow = Math.floor(-origin.y / tileMetrics.tileH) - reach.y;
+      const lastColumn = Math.ceil((width - origin.x) / tileMetrics.tileW) + reach.x;
+      const lastRow = Math.ceil((height - origin.y) / tileMetrics.tileH) + reach.y;
+      // Resource policy: safe work counts alone do not prove that shifted
+      // indices advance or retain alternate-tile parity in IEEE-754.
+      if (![firstColumn, firstRow, lastColumn, lastRow].every(Number.isSafeInteger)) {
+        assertChartImageWork(Number.MAX_SAFE_INTEGER, MAX_CHART_IMAGE_FILL_TILES);
+      }
       const columns = Math.max(0, lastColumn - firstColumn);
       const rows = Math.max(0, lastRow - firstRow);
+      // A positive face always intersects at least one tile. Cancellation
+      // against a large phase must reject, rather than erase that face.
+      if (columns === 0 || rows === 0) rejectChartImageGeometry();
       const repetitions = columns * rows;
-      if (!Number.isSafeInteger(repetitions)) return false;
+      assertChartImageWork(repetitions, MAX_CHART_IMAGE_FILL_TILES);
       work += repetitions;
-      if (work > MAX_CHART_IMAGE_FILL_TILES) return false;
-      if (repetitions === 0) continue;
+      assertChartImageWork(work, MAX_CHART_IMAGE_FILL_TILES);
       const canvasWidth = Math.ceil(width);
       const canvasHeight = Math.ceil(height);
       if (!(canvasWidth > 0 && canvasWidth <= MAX_CANVAS_DIMENSION)
         || !(canvasHeight > 0 && canvasHeight <= MAX_CANVAS_DIMENSION)
-        || canvasWidth > Math.floor((MAX_CANVAS_AREA - canvasArea) / canvasHeight)) return false;
+        || canvasWidth > Math.floor((MAX_CANVAS_AREA - canvasArea) / canvasHeight)) {
+        assertChartImageWork(Number.MAX_SAFE_INTEGER, MAX_CANVAS_AREA);
+      }
       canvasArea += canvasWidth * canvasHeight;
       const canvas = createAuxCanvasForContext(ctx, canvasWidth, canvasHeight);
       const context = canvas?.getContext('2d');
-      if (!canvas || !context) return false;
+      if (!canvas || !context) {
+        if (canvas) canvas.width = 0;
+        rejectChartImageGeometry();
+      }
       tileFaces.push({
         faceIndex,
         width,
@@ -249,6 +322,11 @@ export function paintChartThreeDSurfacePicture(
         ? fullQuad
         : sceneFace?.map(project) as SurfacePictureQuad | undefined;
       if (!quad) continue;
+      // sceneFace shares fullQuad's corner order on the planar face, so its
+      // width runs face[3]→face[2] and its height face[3]→face[0].
+      const faceImage = sceneFace ? mapped(sceneFace) : null;
+      if (!faceImage) continue;
+      const { grid, crop, sourceRect } = sourceMetrics(faceImage);
       const fillDestination = relativeRectQuad(quad, fill.fillRect);
       if (!fillDestination) continue;
       const destination = crop
@@ -266,7 +344,7 @@ export function paintChartThreeDSurfacePicture(
       for (let index = 1; index < quad.length; index++) ctx.lineTo(quad[index].x, quad[index].y);
       ctx.closePath();
       ctx.clip();
-      drawProjected(image, ctx, natural.w, natural.h, destination, 0.5, sourceRect);
+      drawProjected(faceImage, ctx, grid.w, grid.h, destination, 0.5, sourceRect);
       ctx.restore();
     }
   } else {
@@ -293,8 +371,10 @@ export function paintChartThreeDSurfacePicture(
         const scaleY = tileFace.canvas.height / tileFace.height;
         tileFace.context.save();
         tileFace.context.scale(scaleX, scaleY);
-        for (let row = tileFace.firstRow; row < tileFace.lastRow; row++) {
-          for (let column = tileFace.firstColumn; column < tileFace.lastColumn; column++) {
+        for (let ri = 0; ri < tileFace.lastRow - tileFace.firstRow; ri++) {
+          const row = tileFace.firstRow + ri;
+          for (let ci = 0; ci < tileFace.lastColumn - tileFace.firstColumn; ci++) {
+            const column = tileFace.firstColumn + ci;
             const dx = tileFace.origin.x + column * tileMetrics.tileW;
             const dy = tileFace.origin.y + row * tileMetrics.tileH;
             const mirrorX = tileMetrics.flipX && Math.abs(column) % 2 === 1;
@@ -330,27 +410,33 @@ export function paintChartThreeDSurfacePicture(
         if (stackFraction == null) continue;
         if (surfacePictureFaceUsesStackedMapping(plan, faceIndex)) {
           for (let index = 0; index < Math.ceil(1 / stackFraction); index++) {
-            drawProjected(
-              image, ctx, natural.w, natural.h,
-              stackQuad(face, index * stackFraction, (index + 1) * stackFraction),
-              0.5, sourceRect,
-            );
+            const unit = mapped(face, index * stackFraction, (index + 1) * stackFraction);
+            if (unit) drawSource(unit, stackQuad(face, index * stackFraction, (index + 1) * stackFraction));
           }
         } else {
-          drawProjected(image, ctx, natural.w, natural.h, quad, 0.5, sourceRect);
+          const whole = mapped(face);
+          if (whole) drawSource(whole, quad);
         }
       } else if (plan.stackUnit != null && surfacePictureFaceUsesValueAxis(plan, faceIndex)) {
         for (let index = 0; index < repetitions; index++) {
           const lower = index * plan.stackUnit / valueSpan;
           const upper = (index + 1) * plan.stackUnit / valueSpan;
-          drawProjected(image, ctx, natural.w, natural.h, stackQuad(face, lower, upper), 0.5, sourceRect);
+          const unit = mapped(face, lower, upper);
+          if (unit) drawSource(unit, stackQuad(face, lower, upper));
         }
       } else if (plan.stackUnit != null) {
-        drawProjected(image, ctx, natural.w, natural.h, quad, 0.5, sourceRect);
+        const whole = mapped(face);
+        if (whole) drawSource(whole, quad);
       }
       ctx.restore();
     }
   }
   ctx.restore();
   return true;
+  } finally {
+    // A later face can reject after an earlier allocation. Scratch ownership
+    // ends on success and failure; the projected pixels have already been
+    // copied synchronously into the destination when paint succeeds.
+    for (const face of tileFaces) face.canvas.width = 0;
+  }
 }

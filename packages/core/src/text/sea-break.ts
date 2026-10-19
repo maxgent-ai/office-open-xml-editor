@@ -177,21 +177,13 @@ export function isDictionarySeaText(text: string): boolean {
   return hasDict;
 }
 
-// ── Segmenter plumbing (cached + test-injectable) ────────────────────────────
+// ── Segmenter plumbing (cached) ────────────────────────────
 
 /** Minimal shape of one `Intl.Segments` entry we rely on. */
 interface SeaSegment {
   index: number;
   isWordLike?: boolean;
 }
-/** A word segmenter: text (a single SEA span) → its word segments. Injected in
- *  tests for determinism / to exercise the unavailable + throwing paths. */
-export type SeaWordSegmenter = (text: string, script: SeaScript) => Iterable<SeaSegment>;
-
-// `undefined` = use the platform ICU segmenter; `null` = force unavailable
-// (test); a function = use it (test).
-let wordSegmenterOverride: SeaWordSegmenter | null | undefined;
-
 const intlWordCache = new Map<SeaScript, Intl.Segmenter | null>();
 
 function intlWordSegmenter(script: SeaScript): Intl.Segmenter | null {
@@ -210,26 +202,8 @@ function intlWordSegmenter(script: SeaScript): Intl.Segmenter | null {
 }
 
 function wordSegmenterFor(script: SeaScript): ((span: string) => Iterable<SeaSegment>) | null {
-  if (wordSegmenterOverride === null) return null; // forced unavailable (test)
-  if (typeof wordSegmenterOverride === 'function') {
-    const fn = wordSegmenterOverride;
-    return (span) => fn(span, script);
-  }
   const intl = intlWordSegmenter(script);
   return intl ? (span) => intl.segment(span) as Iterable<SeaSegment> : null;
-}
-
-/** Test seam: override the word segmenter. `null` forces the unavailable path;
- *  a function supplies deterministic segments; call {@link resetSeaSegmenterForTest}
- *  to restore the platform ICU segmenter. Not for production use. */
-export function setSeaWordSegmenterForTest(fn: SeaWordSegmenter | null): void {
-  wordSegmenterOverride = fn;
-}
-/** Test seam: restore the default platform ICU segmenter and clear caches. */
-export function resetSeaSegmenterForTest(): void {
-  wordSegmenterOverride = undefined;
-  intlWordCache.clear();
-  graphemeSegmenter = undefined;
 }
 
 // ── Break offsets ────────────────────────────────────────────────────────────
@@ -536,8 +510,19 @@ export function fitSeaWordPrefix(
 // ── Grapheme clusters (emergency over-long-word split) ───────────────────────
 
 let graphemeSegmenter: Intl.Segmenter | null | undefined;
+// Characters whose Grapheme_Cluster_Break value is Control, CR, LF or Other
+// (UAX #29): Basic Latin and Latin-1 Supplement, CJK Symbols and Punctuation
+// without the Extend marks U+302A..U+302F, Hiragana and Katakana without the
+// Extend sound marks U+3099..U+309A, CJK Unified Ideographs and Extension A,
+// and the Halfwidth and Fullwidth Forms up to U+FF9D (U+FF9E..U+FF9F are
+// Extend). None is Extend, ZWJ, SpacingMark, Prepend, Hangul jamo or
+// Regional_Indicator, so GB3 (CR × LF) is the only rule that joins two of
+// them.
+const SINGLE_UNIT_GRAPHEME_TEXT =
+  /^[\u0000-\u00ff\u3000-\u3029\u3030-\u303f\u3041-\u3096\u309b-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uff01-\uff9d]*$/;
 
-function getGraphemeSegmenter(): Intl.Segmenter | null {
+/** The realm's shared extended-grapheme segmenter, created on first use. */
+export function getGraphemeSegmenter(): Intl.Segmenter | null {
   if (graphemeSegmenter !== undefined) return graphemeSegmenter;
   let seg: Intl.Segmenter | null = null;
   try {
@@ -562,6 +547,16 @@ function getGraphemeSegmenter(): Intl.Segmenter | null {
  * grapheme-fill wrap (#961) degrades to a safe code-point split instead of failing.
  */
 export function graphemeClusterOffsets(text: string): number[] {
+  // UAX #29 fast path: text made only of the characters above, without a
+  // CR LF pair, has a boundary between every pair of code units. The segmenter
+  // and the code-point fallback below both return exactly that. Skipping them
+  // avoids constructing an ICU break iterator (several ms on the first call in
+  // each realm) and one segment object per character.
+  if (SINGLE_UNIT_GRAPHEME_TEXT.test(text) && !text.includes('\r\n')) {
+    const out = new Array<number>(Math.max(0, text.length - 1));
+    for (let i = 1; i < text.length; i += 1) out[i - 1] = i;
+    return out;
+  }
   const seg = getGraphemeSegmenter();
   if (seg) {
     try {

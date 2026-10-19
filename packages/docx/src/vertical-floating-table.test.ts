@@ -524,8 +524,10 @@ describe('vertical outer floating tables retain the canonical logical paint doma
       tblpX: 20,
       tblpY: 30,
     };
+    // It ends below the bottom margin with content before it on the page, so
+    // it moves to the next page (Windows Word #1902 controls).
     const relocated = floatingTable([{ text: 'unused', heightPt: 70 }]);
-    relocated.tblpPr = { ...blocker.tblpPr! };
+    relocated.tblpPr = { ...blocker.tblpPr!, tblpY: 120 };
     const nestedTable = floatingTable([{ text: 'LATER_NESTED', heightPt: 20 }]);
     nestedTable.tblpPr = {
       ...nestedTable.tblpPr!,
@@ -545,6 +547,7 @@ describe('vertical outer floating tables retain the canonical logical paint doma
       { type: 'paragraph', ...pageAnchor },
     ] as unknown as DocTableCell['content'];
     const doc = documentWith(blocker);
+    doc.body.push({ type: 'paragraph', ...paragraph('lead') } as unknown as BodyElement);
     doc.body.push({ type: 'table', ...relocated } as unknown as BodyElement);
     const measure = recordingCanvas();
     const pages = layoutPages(

@@ -37,14 +37,14 @@ describe.each([
   { name: 'DocxViewer', create: docxViewer, renderedView: undefined },
   { name: 'DocxScrollViewer', create: scrollViewer, renderedView: true },
 ])('$name load options', ({ create, renderedView }) => {
-  it('forwards modelSources and an explicit showTrackedChanges: false', async () => {
+  it('forwards legacyDoc and an explicit showTrackedChanges: false', async () => {
     const engine = new FakeDocxEngine(1, SIZE);
     const load = vi.spyOn(DocxDocument, 'load').mockResolvedValue(engine.asDoc());
-    const viewer = create({ modelSources: [source], showTrackedChanges: false });
+    const viewer = create({ legacyDoc: source, showTrackedChanges: false });
     await viewer.load(new ArrayBuffer(1));
     expect(load).toHaveBeenCalledExactlyOnceWith(
       expect.any(ArrayBuffer),
-      expect.objectContaining({ modelSources: [source], showTrackedChanges: false }),
+      expect.objectContaining({ legacyDoc: source, showTrackedChanges: false }),
     );
     viewer.destroy();
   });
@@ -54,11 +54,11 @@ describe.each([
     // What a model source's markup view default leaves on the loaded document.
     engine.layoutView = { showTrackedChanges: true, currentDate: 0 };
     const load = vi.spyOn(DocxDocument, 'load').mockResolvedValue(engine.asDoc());
-    const viewer = create({ modelSources: [source] });
+    const viewer = create({ legacyDoc: source });
     await viewer.load(new ArrayBuffer(1));
     const options = load.mock.calls[0]![1]!;
     expect(options).not.toHaveProperty('showTrackedChanges');
-    expect(options.modelSources).toEqual([source]);
+    expect(options.legacyDoc).toBe(source);
     await vi.waitFor(() => expect(engine.renderCalls.length).toBeGreaterThan(0));
     expect(new Set(engine.renderCalls.map((call) => call.showTrackedChanges))).toEqual(new Set([renderedView]));
     viewer.destroy();
@@ -68,10 +68,35 @@ describe.each([
     const engine = new FakeDocxEngine(1, SIZE);
     engine.layoutView = { showTrackedChanges: true, currentDate: 0 };
     const load = vi.spyOn(DocxDocument, 'load').mockResolvedValue(engine.asDoc());
-    const viewer = create({ modelSources: [source] });
+    const viewer = create({ legacyDoc: source });
     await viewer.setShowTrackedChanges(false);
     await viewer.load(new ArrayBuffer(1));
     expect(load.mock.calls[0]![1]).toHaveProperty('showTrackedChanges', false);
     viewer.destroy();
+  });
+});
+
+// Each surface takes only a source for its own format, under its own key.
+describe('DOCX source option typing', () => {
+  it('rejects another format\'s source and the removed modelSources option', () => {
+    const xlsx = { target: 'xlsx', claim: () => false, beginLoad: vi.fn() } as unknown as ModelSource<'xlsx'>;
+    const pptx = { target: 'pptx', claim: () => false, beginLoad: vi.fn() } as unknown as ModelSource<'pptx'>;
+    // @ts-expect-error An XLSX source cannot configure a DOCX surface.
+    const docxViewerXlsx: ConstructorParameters<typeof DocxViewer>[1] = { legacyDoc: xlsx };
+    // @ts-expect-error A PPTX source cannot configure a DOCX surface.
+    const docxViewerPptx: ConstructorParameters<typeof DocxViewer>[1] = { legacyDoc: pptx };
+    // @ts-expect-error The generic list option was replaced by `legacyDoc`.
+    const docxViewerList: ConstructorParameters<typeof DocxViewer>[1] = { modelSources: [] };
+    // @ts-expect-error An XLSX source cannot configure a DOCX surface.
+    const docxScrollViewerXlsx: ConstructorParameters<typeof DocxScrollViewer>[1] = { legacyDoc: xlsx };
+    // @ts-expect-error A PPTX source cannot configure a DOCX surface.
+    const docxScrollViewerPptx: ConstructorParameters<typeof DocxScrollViewer>[1] = { legacyDoc: pptx };
+    // @ts-expect-error The generic list option was replaced by `legacyDoc`.
+    const docxScrollViewerList: ConstructorParameters<typeof DocxScrollViewer>[1] = { modelSources: [] };
+    // @ts-expect-error An XLSX source cannot load DOCX input.
+    const loadXlsx: NonNullable<Parameters<typeof DocxDocument.load>[1]> = { legacyDoc: xlsx };
+    // @ts-expect-error A PPTX source cannot load DOCX input.
+    const loadPptx: NonNullable<Parameters<typeof DocxDocument.load>[1]> = { legacyDoc: pptx };
+    expect([docxViewerXlsx, docxViewerPptx, docxViewerList, docxScrollViewerXlsx, docxScrollViewerPptx, docxScrollViewerList, loadXlsx, loadPptx]).toHaveLength(8);
   });
 });

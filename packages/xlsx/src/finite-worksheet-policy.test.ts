@@ -1,17 +1,19 @@
+import { normalizeXlsxWorksheetPolicy } from './internal/worksheet-policy.js';
 import { describe, expect, it } from 'vitest';
 import { OoxmlResourceLimitError } from '@silurus/ooxml-core';
-import { normalizeXlsxWorksheetPolicy } from '@silurus/ooxml-core/worker';
 import { utf8Bytes } from '@silurus/ooxml-core/internal/resource-measurement';
+import {
+  HARD_MAX_XLSX_WORKBOOK_CACHED_CELLS as XLSX_MAX_CACHED_CELLS,
+  HARD_MAX_XLSX_WORKBOOK_CACHED_JSON_BYTES as XLSX_MAX_CACHED_JSON_BYTES,
+  HARD_MAX_XLSX_WORKBOOK_CACHED_CELL_CONTENT_UTF8_BYTES as XLSX_MAX_CACHED_OWNED_UTF8_BYTES,
+  HARD_MAX_XLSX_WORKBOOK_CACHED_ROWS as XLSX_MAX_CACHED_ROWS,
+  HARD_MAX_XLSX_WORKSHEET_CELLS as XLSX_MAX_MATERIALIZED_CELLS,
+  HARD_MAX_XLSX_WORKSHEET_CELL_CONTENT_UTF8_BYTES as XLSX_MAX_MATERIALIZED_OWNED_UTF8_BYTES,
+  HARD_MAX_XLSX_WORKSHEET_ROWS as XLSX_MAX_MATERIALIZED_ROWS,
+} from '@silurus/ooxml-core/worker';
 import type { Row, Worksheet } from './types.js';
 import {
-  XLSX_MAX_CACHED_CELLS,
-  XLSX_MAX_CACHED_JSON_BYTES,
-  XLSX_MAX_CACHED_OWNED_UTF8_BYTES,
-  XLSX_MAX_CACHED_ROWS,
-  XLSX_MAX_MATERIALIZED_CELLS,
   XLSX_MAX_MATERIALIZED_JSON_BYTES,
-  XLSX_MAX_MATERIALIZED_OWNED_UTF8_BYTES,
-  XLSX_MAX_MATERIALIZED_ROWS,
   addWorksheetCacheUsage,
   addWorksheetUsage,
   assertWorksheetCacheUsage,

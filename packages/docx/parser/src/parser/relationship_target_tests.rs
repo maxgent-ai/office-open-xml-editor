@@ -166,7 +166,7 @@ fn package(form: Form) -> Vec<u8> {
             // Stored as `word/media/image5.%73vg`, an equivalent item name.
             ("rSvg", "image", "word/media/image5.svg"),
             ("rOle", "oleObject", "word/embeddings/oleObject1.bin"),
-            ("rChart", "chart", "word/charts/chart1.xml"),
+            ("rChart", "chart", "word/figures/plot.xml"),
         ],
     );
     let header = format!(
@@ -239,20 +239,20 @@ fn package(form: Form) -> Vec<u8> {
                 r#"<w:comments xmlns:w="{W}"><w:comment w:id="1" w:author="A"><w:p><w:r><w:t>COMMENT-TEXT</w:t></w:r></w:p></w:comment></w:comments>"#
             ),
         ),
-        ("word/charts/chart1.xml", chart.to_string()),
+        ("word/figures/plot.xml", chart.to_string()),
         (
-            "word/charts/_rels/chart1.xml.rels",
+            "word/figures/_rels/plot.xml.rels",
             rels(
                 form,
-                "word/charts",
+                "word/figures",
                 &[(
                     "rStyle",
                     "http://schemas.microsoft.com/office/2011/relationships/chartStyle",
-                    "word/charts/style1.xml",
+                    "word/figures/style1.xml",
                 )],
             ),
         ),
-        ("word/charts/style1.xml", chart_style.to_string()),
+        ("word/figures/style1.xml", chart_style.to_string()),
     ];
     let mut bytes = Vec::new();
     {

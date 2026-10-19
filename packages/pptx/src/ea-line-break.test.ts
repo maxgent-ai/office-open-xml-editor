@@ -141,6 +141,16 @@ describe('pptx kinsoku across run seams (issue #1653 controls K00–K23)', () =>
     }
   });
 
+  it('keeps a ko/zh curly quote in the ideographs\' East Asian face, with in-run kinsoku (#1653)', () => {
+    for (const value of ['ko-KR', 'zh-CN']) {
+      const laid = layoutParagraph(measuringContext(), paragraph([lang('漢漢”漢', value)], true), 20, 20,
+        '000000', 1, 0);
+      expect(laid.map((line) => line.segments.map((segment) => segment.text).join(''))).toEqual(['漢', '漢”', '漢']);
+      expect(laid[1].segments).toHaveLength(1);
+      expect(laid[1].segments[0].font).toMatch(/"Meiryo"/u);
+    }
+  });
+
   it('keeps unobserved punctuation and mixed-language seams outside the new rule', () => {
     expect(lines([lang('漢漢', 'ja-JP'), lang('、漢', 'ja-JP')], 20, true)).toEqual(['漢漢', '、漢']);
     expect(lines([lang('漢“', 'en-US'), lang('）', 'ja-JP'), lang('”漢', 'ja-JP')], 30, true))

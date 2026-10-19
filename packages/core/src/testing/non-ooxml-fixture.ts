@@ -43,7 +43,7 @@ const u32 = (value: number): number[] => [
 ];
 
 /** Minimal stored (uncompressed) ZIP of UTF-8 entries. */
-function storedZip(files: ReadonlyArray<readonly [string, string]>): Uint8Array<ArrayBuffer> {
+export function storedZip(files: ReadonlyArray<readonly [string, string]>): Uint8Array<ArrayBuffer> {
   const encoder = new TextEncoder();
   const local: number[] = [];
   const central: number[] = [];

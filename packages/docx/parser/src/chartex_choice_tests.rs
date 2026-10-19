@@ -1,4 +1,5 @@
 //! Synthetic package tests exercise both production parsing paths.
+use crate::document_projector::STREAMED_XML_EVENT_BYTES;
 use crate::parser;
 use std::io::{Cursor, Write};
 
@@ -191,6 +192,16 @@ fn cases() -> Vec<Case> {
         package(&ac(&live, &pic), "pie"),
         Expected::Picture,
     );
+    // OPC part names are unconstrained by the chart relationship family.
+    add(
+        "03-nonstandard-part",
+        package_with(
+            &ac(&live, &pic),
+            &chart_rel(rel_type, "plots/plot.xml", "Internal"),
+            Some(("word/plots/plot.xml", supported.as_str())),
+        ),
+        Expected::Chart,
+    );
     for (name, rel, part) in [
         (
             "03-missing-rel",
@@ -217,11 +228,6 @@ fn cases() -> Vec<Case> {
             None,
         ),
         ("03-missing-both", String::new(), None),
-        (
-            "03-nonstandard-part",
-            chart_rel(rel_type, "plots/plot.xml", "Internal"),
-            Some(("word/plots/plot.xml", supported.as_str())),
-        ),
         (
             "03-malformed",
             chart_rel(rel_type, "charts/chart.xml", "Internal"),
@@ -417,7 +423,7 @@ fn cases() -> Vec<Case> {
         "<w:smartTag>".repeat(253),
         "</w:smartTag>".repeat(253)
     );
-    let comment = format!("<!--{}-->", "x".repeat(1024 * 1024 + 1));
+    let comment = format!("<!--{}-->", "x".repeat(STREAMED_XML_EVENT_BYTES + 1));
     add(
         "15-depth-plain",
         package_with(&deep, "", None),

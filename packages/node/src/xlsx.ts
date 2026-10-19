@@ -1,11 +1,8 @@
 import type { ParsedWorkbook, Row, Worksheet } from '@silurus/ooxml-xlsx';
-import type { OoxmlResourceUsageSnapshot } from '@silurus/ooxml-core';
+import type { ModelSource, OoxmlResourceUsageSnapshot } from '@silurus/ooxml-core';
 import {
   decodeOoxmlResourceUsage,
-  DEFAULT_XLSX_WORKSHEET_POLICY,
-  normalizeXlsxWorksheetPolicy,
   parseResourceLimitError,
-  type NormalizedXlsxWorksheetPolicy,
   type OoxmlResourceMetricsSession,
   type PullSessionCommand,
   type PullSessionResponse,
@@ -13,6 +10,9 @@ import {
 // The Node facade consumes the format-owned coordinator through its explicit
 // internal entry point rather than reconstructing XLSX orchestration here.
 import {
+  DEFAULT_XLSX_WORKSHEET_POLICY,
+  normalizeXlsxWorksheetPolicy,
+  type NormalizedXlsxWorksheetPolicy,
   acquireXlsxNodeSession,
   addWorksheetCacheUsage,
   addWorksheetUsage,
@@ -55,6 +55,12 @@ export interface MaterializedXlsxWorkbook {
 
 /** Options for the bounded Node workbook session. */
 export type OpenXlsxWorkbookOptions = OoxmlNodeSessionOptions & {
+  /**
+   * Opt-in model source for workbook input that is not an OOXML package (a
+   * `ModelSource<'xlsx'>`). When its `claim()` accepts the bytes, it opens them
+   * in this realm; otherwise the ordinary OOXML path runs unchanged.
+   */
+  readonly legacyXls?: ModelSource<'xlsx'>;
   /** Canvas for a selected model source's Normal-font measurement. */
   readonly factory?: import('./render.ts').NodeCanvasFactory;
 };
@@ -103,10 +109,10 @@ export async function openXlsxWorkbook(
   const policy = normalizeXlsxWorksheetPolicy(options);
   // Rebind the local parameter to an immutable policy capture so later caller
   // mutation cannot affect this session, while keeping the canonical
-  // `options.modelSources !== undefined` branch shape recognized by the
+  // `options.legacyXls !== undefined` branch shape recognized by the
   // source-boundary gate.
   options = { ...options, xlsxWorksheetLimits: policy.worksheet };
-  if (__OOXML_MODEL_SOURCES__ && options.modelSources !== undefined) {
+  if (__OOXML_MODEL_SOURCES__ && options.legacyXls !== undefined) {
     const { openXlsxSource } = await import('./xlsx-model-source.ts');
     return openXlsxSource(buffer, options, getXlsxWasmModule);
   }

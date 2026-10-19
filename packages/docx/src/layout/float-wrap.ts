@@ -210,31 +210,6 @@ export function rectsOverlap(
   );
 }
 
-/**
- * Widest free horizontal interval within [left, right] after removing the
- * `blocked` spans. Returns null when nothing is free. Factored out of
- * resolveLineFloatWindow so the caller holds a properly-typed Gap (the previous
- * inline closure form forced TS to narrow `best` to never, requiring casts).
- */
-export function widestFreeGap(blocked: Gap[], left: number, right: number): Gap | null {
-  const spans = blocked.slice().sort((a, b) => a.l - b.l);
-  let cursor = left;
-  let best: Gap | null = null;
-  const consider = (l: number, r: number): void => {
-    // Adopt only when strictly wider than the current best (0 when none yet),
-    // so a zero/negative-width gap never becomes `best`. Matches the prior inline
-    // form `r - l > (best ? best.r - best.l : 0)`.
-    if (r - l > (best ? best.r - best.l : 0)) best = { l, r };
-  };
-  for (const b of spans) {
-    if (b.l > cursor) consider(cursor, Math.min(b.l, right));
-    cursor = Math.max(cursor, Math.min(b.r, right));
-    if (cursor >= right) break;
-  }
-  if (cursor < right) consider(cursor, right);
-  return best;
-}
-
 interface PreparedFloatRect {
   readonly rect: Readonly<FloatRect>;
   readonly polygon: CompiledPolygonWrap | null;
@@ -1088,7 +1063,6 @@ function objectAffineIntervals(
     exactMidpoint,
     unreducedExactFromNumber(rect.yBottom),
   ) >= 0) return [];
-  const square = polygon === null;
   let intervals: AffineBlockedInterval[] = polygon
     ? polygonBandExactIntervalFunctions(polygon, probeH, lower, upper)
       .map((interval) => ({

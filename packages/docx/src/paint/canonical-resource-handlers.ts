@@ -54,8 +54,8 @@ export function createCanonicalCanvasPaintResourceHandlers(
   chartEx?: ChartExRenderer,
 ): CanvasPaintResourceHandlers {
   return Object.freeze({
-  image(resource, bounds, ctx, nativeImagePlan) {
-    paintImageResource(resource, bounds, ctx, nativeImagePlan);
+  image(resource, bounds, ctx, coverageBounds) {
+    paintImageResource(resource, bounds, ctx, coverageBounds);
   },
   chart(resource, bounds, ctx) {
     // paintLayoutPage has already installed the point-to-device CTM. Passing 1

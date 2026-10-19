@@ -1,3 +1,4 @@
+import { viewerState } from './scroll-viewer-test-dom.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { PptxPresentation } from './presentation.js';
 import { PptxScrollViewer } from './scroll-viewer.js';
@@ -253,7 +254,7 @@ describe('PptxScrollViewer progressive layout', () => {
     expect(calls.map((call) => call.slide)).toEqual([0]);
     scrollHost.scrollTop = 10_000;
     scrollHost.dispatch('scroll');
-    expect(viewer.mountedSlideIndicesForTest()).not.toContain(1);
+    expect(viewerState(viewer).mounted()).not.toContain(1);
 
     engine.setLayoutProgress(2, false);
     await Promise.resolve();

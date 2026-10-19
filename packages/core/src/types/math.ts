@@ -183,9 +183,3 @@ export function isMathNode(v: unknown): v is MathNode {
     KINDS.has((v as { kind?: string }).kind ?? '')
   );
 }
-
-/** Top-level math container as emitted by parsers. `display` = block (`m:oMathPara`). */
-export interface MathFormula {
-  nodes: MathNode[];
-  display: boolean;
-}

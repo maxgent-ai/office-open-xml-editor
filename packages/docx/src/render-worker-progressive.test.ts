@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { vi, afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createLayoutServices } from './layout-runtime.js';
 import { layoutSourceStore } from './layout-source-model-adapter.js';
 import { retainRenderWorkerDocumentLayout } from './render-worker-layout.js';
@@ -11,7 +11,7 @@ import { paginateBody } from './layout/body-paginator.js';
 import { PaginationAbortError } from './layout/pagination-scheduler.js';
 import { layoutFingerprint } from './layout/invariants.js';
 import { layoutOptionsForRender, normalizeLayoutOptions } from './layout/options.js';
-import { setDocumentLayoutValidation } from './layout/validation-policy.js';
+import { setDocumentLayoutValidation } from './testing/validation-policy.js';
 import type { DocumentLayout } from './layout/types.js';
 import {
   paginateRenderWorkerDocumentProgressively,
@@ -37,6 +37,11 @@ import {
 const DEFAULT_CURRENT_DATE_MS = 1_700_000_000_000;
 const DEFAULT_VIEW = layoutOptionsForRender({ defaultCurrentDateMs: DEFAULT_CURRENT_DATE_MS });
 const MARKUP_VIEW = normalizeLayoutOptions(undefined, DEFAULT_CURRENT_DATE_MS, true);
+/** Plain paragraphs for five pages, published after the first and third. */
+const PREVIEW_PARAGRAPHS = 80;
+/** Tracked paragraphs whose markup view (four pages, two publications)
+ * paginates differently from the final view (three pages). */
+const MARKUP_PARAGRAPHS = 60;
 
 function retain(shape: SyntheticDocumentShape, paragraphs: number) {
   const source = layoutSourceStore(syntheticDocxModel(shape, { paragraphs }));
@@ -79,7 +84,7 @@ afterAll(() => {
 
 describe('render worker progressive layout', () => {
   it('primes each prefix before announcing it, and ends on the blocking layout', async () => {
-    const { source, retained } = retain('plain', 300);
+    const { source, retained } = retain('plain', PREVIEW_PARAGRAPHS);
     const store = retained.layoutVariants;
     const recorder = recordingPublisher(() => store.defaultLayout.pages.length);
 
@@ -108,7 +113,7 @@ describe('render worker progressive layout', () => {
     // The store is left holding the AUTHORITATIVE layout under the default key,
     // which is what makes `render-worker.ts`'s unchanged
     // `doc.layoutVariants.defaultLayout` a cache hit rather than a second pass.
-    const fresh = layoutSourceStore(syntheticDocxModel('plain', { paragraphs: 300 }));
+    const fresh = layoutSourceStore(syntheticDocxModel('plain', { paragraphs: PREVIEW_PARAGRAPHS }));
     const blocking = paginateBody(
       fresh.bodyLayoutInput,
       createLayoutServices(fresh),
@@ -213,7 +218,7 @@ describe('render worker progressive layout', () => {
     // so line breaking and page breaks move. Priming under the default key
     // would leave the progressive pass unread AND make the worker build a
     // second full layout for the view it actually paints.
-    const source = layoutSourceStore(syntheticDocxModel('tracked-fields', { paragraphs: 200 }));
+    const source = layoutSourceStore(syntheticDocxModel('tracked-fields', { paragraphs: MARKUP_PARAGRAPHS }));
     const services = createLayoutServices(source);
     const retained = retainRenderWorkerDocumentLayout(source, services, DEFAULT_CURRENT_DATE_MS);
     const store = retained.layoutVariants;
@@ -238,7 +243,7 @@ describe('render worker progressive layout', () => {
     // stylistic one.
     expect(store.layoutFor(DEFAULT_VIEW).pages.length).not.toBe(markupPages);
 
-    const fresh = layoutSourceStore(syntheticDocxModel('tracked-fields', { paragraphs: 200 }));
+    const fresh = layoutSourceStore(syntheticDocxModel('tracked-fields', { paragraphs: MARKUP_PARAGRAPHS }));
     const blocking = paginateBody(
       fresh.bodyLayoutInput,
       createLayoutServices(fresh),
@@ -280,3 +285,5 @@ describe('render worker progressive layout', () => {
     expect(retained.layoutVariants.defaultLayout.pages.length).toBeGreaterThan(0);
   }, 300_000);
 });
+
+vi.mock('./layout/validation-policy.js', () => ({ documentLayoutValidationEnabled: vi.fn(() => true) }));

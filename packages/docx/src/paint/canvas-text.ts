@@ -4,7 +4,7 @@ import {
   withVertFeature,
 } from '@silurus/ooxml-core';
 import type { ParagraphLayout, TextBoxLayout } from '../layout/types.js';
-import type { CanvasPaintContext, PaintCanvas2D } from './types.js';
+import type { CanvasPaintContext } from './types.js';
 import { paintDrawingLayout } from './canvas-drawing.js';
 import { paintRetainedResource } from './canvas-resource.js';
 import { paintTableLayout } from './canvas-table.js';
@@ -109,6 +109,8 @@ function paintRetainedGlyph(
     operation.fontWeight,
     operation.fontStyle,
   );
+  const previousKerning = ctx.fontKerning;
+  if (operation.kerning) ctx.fontKerning = operation.kerning;
   if (upright) {
     ctx.save();
     ctx.translate(operation.origin.xPt, operation.origin.yPt);
@@ -118,6 +120,7 @@ function paintRetainedGlyph(
   } else {
     ctx.fillText(operation.text, operation.origin.xPt, operation.origin.yPt);
   }
+  if (operation.kerning) ctx.fontKerning = previousKerning;
 }
 
 function paintRetainedMarkPath(
@@ -194,7 +197,7 @@ export function paintDrawingWithOwnedTextBoxes(
   }
 }
 
-export function paintParagraphDrawingLayout(
+function paintParagraphDrawingLayout(
   node: ParagraphLayout,
   drawing: import('../layout/types.js').DrawingLayout,
   context: CanvasPaintContext,
@@ -315,6 +318,13 @@ function paintParagraphContents(node: ParagraphLayout, context: CanvasPaintConte
       const previousLetterSpacing = ctx.letterSpacing;
       const previousKerning = ctx.fontKerning;
       for (const op of placement.paintOps) {
+        // §17.3.3.29: an unselected optional hyphen must not affect display.
+        // Strip only the paint string, preserving all retained UTF-16 source
+        // ranges for slicing, hit testing and selection. Keep one contextual
+        // draw even for cs runs containing literal U+00AD (Firefox otherwise
+        // gives it native letterSpacing). Selected breaks already contain '-'.
+        const text = op.text.replace(/\u00AD/gu, '');
+        if (text.length === 0) continue;
         ctx.direction = op.direction;
         ctx.fontKerning = op.kerning;
         const originXPt = placement.origin.xPt + op.offset.xPt;
@@ -335,7 +345,7 @@ function paintParagraphContents(node: ParagraphLayout, context: CanvasPaintConte
           ctx.textAlign = 'center';
           ctx.textBaseline = 'middle';
           ctx.letterSpacing = `${op.letterSpacingPt}px`;
-          const draw = (): void => ctx.fillText(op.text, glyphOffsetXPt, glyphOffsetYPt);
+          const draw = (): void => ctx.fillText(text, glyphOffsetXPt, glyphOffsetYPt);
           if (op.verticalFeature) {
             withVertFeature(ctx as CanvasRenderingContext2D, draw);
           }
@@ -348,18 +358,18 @@ function paintParagraphContents(node: ParagraphLayout, context: CanvasPaintConte
           ctx.textAlign = 'center';
           ctx.textBaseline = 'middle';
           ctx.letterSpacing = `${op.letterSpacingPt / op.scaleX}px`;
-          ctx.fillText(op.text, glyphOffsetXPt, glyphOffsetYPt);
+          ctx.fillText(text, glyphOffsetXPt, glyphOffsetYPt);
           ctx.restore();
         } else if (op.scaleX !== 1) {
           ctx.save();
           ctx.translate(originXPt + glyphOffsetXPt, originYPt + glyphOffsetYPt);
           ctx.scale(op.scaleX, 1);
           ctx.letterSpacing = `${op.letterSpacingPt / op.scaleX}px`;
-          ctx.fillText(op.text, 0, 0);
+          ctx.fillText(text, 0, 0);
           ctx.restore();
         } else {
           ctx.letterSpacing = `${op.letterSpacingPt}px`;
-          ctx.fillText(op.text, originXPt + glyphOffsetXPt, originYPt + glyphOffsetYPt);
+          ctx.fillText(text, originXPt + glyphOffsetXPt, originYPt + glyphOffsetYPt);
         }
       }
       ctx.letterSpacing = previousLetterSpacing;
@@ -463,14 +473,11 @@ export function paintTextBoxLayout(node: TextBoxLayout, context: CanvasPaintCont
       );
     }
   });
-  const clipFrame = node.clipBounds ? canvasPaintFrame(context.ctx, () => {
+  const clipFrame = node.clipBounds || node.clipRects ? canvasPaintFrame(context.ctx, () => {
     context.ctx.beginPath();
-    context.ctx.rect(
-      node.clipBounds!.xPt,
-      node.clipBounds!.yPt,
-      node.clipBounds!.widthPt,
-      node.clipBounds!.heightPt,
-    );
+    for (const rect of node.clipRects ?? [node.clipBounds!]) {
+      context.ctx.rect(rect.xPt, rect.yPt, rect.widthPt, rect.heightPt);
+    }
     context.ctx.clip();
   }) : null;
   const documentDefaultTextColor = context.documentDefaultTextColor

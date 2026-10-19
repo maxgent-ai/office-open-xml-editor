@@ -34,6 +34,7 @@ struct GovernorState {
     format: OoxmlFormat,
     policy: ResourcePolicy,
     operation: String,
+    scoped_operation_id: Option<u64>,
     usage: ResourceUsage,
     // Central-directory identity, not a display path: duplicate ZIP names must
     // not accidentally share accounting state.
@@ -42,12 +43,17 @@ struct GovernorState {
     operations: HashMap<u64, LogicalOperationState>,
     hard_limit_totals: HashMap<HardResourceLimitKind, u64>,
     retained_instance_bytes: HashMap<(HardResourceLimitKind, String, String), u64>,
+    /// Repeatable parser work charged to the outermost active scope of this
+    /// governor (see [`charge_scope_work`]). Nested scopes keep accumulating.
+    scope_work: HashMap<HardResourceLimitKind, u64>,
     first_error: Option<String>,
 }
 
 struct LogicalOperationState {
     name: String,
     inflated_bytes: u64,
+    /// Work ledger kept across every bounded pull of this logical operation.
+    scope_work: HashMap<HardResourceLimitKind, u64>,
 }
 
 /// Opaque identity for a logical operation whose accounting survives multiple
@@ -72,6 +78,7 @@ pub struct ResourceUsage {
 pub enum HardResourceLimitKind {
     XmlEventBytes,
     XmlContextBytes,
+    XmlNamespaceDeclarations,
     XmlNestingDepth,
     DocxBodyBlockXmlBytes,
     DocxBodyChunkJsonBytes,
@@ -82,8 +89,15 @@ pub enum HardResourceLimitKind {
     PptxSlideJsonBytes,
     PptxSharedDependencyXmlBytes,
     XmlDomComplexity,
+    ImageEffectWork,
     ChartexAllocationElements,
     ChartexAllocationBytes,
+    ChartCachePoints,
+    NumberingMarkerBytes,
+    XlsxMarkdownBytes,
+    ChartStyleFormats,
+    ChartCustomNumberFormats,
+    ChartNumberFormatBytes,
     PptxSharedDependencyProjectionBytes,
     PptxSharedCacheEntries,
     PptxSharedCacheProjectionBytes,
@@ -100,6 +114,13 @@ pub enum HardResourceLimitKind {
     WorksheetJsonBytes,
     WorksheetCacheRows,
     WorksheetCacheCells,
+    WorksheetReferenceCells,
+    WorksheetReferenceStringBytes,
+    WorksheetReferenceIndexCells,
+    WorksheetReferenceIndexStringBytes,
+    ThemeStyleReparseBytes,
+    DocxStyleInheritanceDepth,
+    DocxComplexFieldDepth,
 }
 
 impl HardResourceLimitKind {
@@ -107,7 +128,14 @@ impl HardResourceLimitKind {
         match self {
             Self::XmlEventBytes => ("parsing", "xml-event", "bytes"),
             Self::XmlContextBytes => ("parsing", "xml-context", "bytes"),
+            Self::XmlNamespaceDeclarations => ("parsing", "xml-context", "declarations"),
             Self::XmlNestingDepth => ("parsing", "xml-tree", "depth"),
+            Self::WorksheetReferenceCells => ("parsing", "worksheet-reference", "cells"),
+            Self::WorksheetReferenceStringBytes => ("parsing", "worksheet-reference", "bytes"),
+            Self::WorksheetReferenceIndexCells => ("parsing", "worksheet-reference-index", "cells"),
+            Self::WorksheetReferenceIndexStringBytes => {
+                ("parsing", "worksheet-reference-index", "bytes")
+            }
             Self::DocxBodyBlockXmlBytes => ("parsing", "docx-body-block-xml", "bytes"),
             Self::DocxBodyChunkJsonBytes => ("serialization", "docx-body-chunk-json", "bytes"),
             Self::DocxBootstrapJsonBytes => ("serialization", "docx-bootstrap-json", "bytes"),
@@ -122,7 +150,14 @@ impl HardResourceLimitKind {
             }
             Self::ChartexAllocationElements => ("parsing", "chartex-allocation", "elements"),
             Self::ChartexAllocationBytes => ("parsing", "chartex-allocation", "bytes"),
+            Self::ChartCachePoints => ("parsing", "chart-cache", "points"),
+            Self::NumberingMarkerBytes => ("parsing", "numbering-marker", "bytes"),
+            Self::XlsxMarkdownBytes => ("serialization", "xlsx-markdown", "bytes"),
+            Self::ChartStyleFormats => ("parsing", "chart-style-formats", "entries"),
+            Self::ChartCustomNumberFormats => ("parsing", "chart-custom-number-formats", "entries"),
+            Self::ChartNumberFormatBytes => ("parsing", "chart-number-format-bytes", "bytes"),
             Self::XmlDomComplexity => ("parsing", "xml-dom", "complexity-units"),
+            Self::ImageEffectWork => ("parsing", "image-effect", "work"),
             Self::PptxSharedDependencyProjectionBytes => {
                 ("parsing", "pptx-shared-dependency", "projected-bytes")
             }
@@ -151,6 +186,9 @@ impl HardResourceLimitKind {
             Self::WorksheetJsonBytes => ("serialization", "worksheet-json", "bytes"),
             Self::WorksheetCacheRows => ("parsing", "worksheet-cache", "rows"),
             Self::WorksheetCacheCells => ("parsing", "worksheet-cache", "cells"),
+            Self::ThemeStyleReparseBytes => ("parsing", "theme-style-reparse", "bytes"),
+            Self::DocxStyleInheritanceDepth => ("parsing", "style-inheritance", "depth"),
+            Self::DocxComplexFieldDepth => ("parsing", "complex-field", "depth"),
         }
     }
 }
@@ -220,24 +258,44 @@ pub struct ResourceScope {
     governor: ResourceGovernor,
     previous_active: Option<ResourceGovernor>,
     previous_operation: String,
+    previous_logical_operation_id: Option<u64>,
     previous_operation_bytes: u64,
     restore_parent_operation: bool,
     logical_operation_id: Option<u64>,
+    /// Outer scope's work ledger, restored when this outermost scope ends.
+    previous_scope_work: Option<HashMap<HardResourceLimitKind, u64>>,
 }
 
 impl Drop for ResourceScope {
     fn drop(&mut self) {
-        if self.logical_operation_id.is_some() || self.restore_parent_operation {
+        {
             let mut state = self.governor.0.borrow_mut();
             if let Some(id) = self.logical_operation_id {
                 let inflated_bytes = state.usage.operation_inflated_bytes;
+                let work = state.scope_work.clone();
                 if let Some(operation) = state.operations.get_mut(&id) {
                     operation.inflated_bytes = inflated_bytes;
+                    operation.scope_work = work;
                 }
             }
             if self.restore_parent_operation {
                 state.operation = std::mem::take(&mut self.previous_operation);
-                state.usage.operation_inflated_bytes = self.previous_operation_bytes;
+                // A nested entry read may have charged the same logical
+                // operation. Restore its latest ledger, never a stale snapshot.
+                state.usage.operation_inflated_bytes = self
+                    .previous_logical_operation_id
+                    .and_then(|id| state.operations.get(&id).map(|op| op.inflated_bytes))
+                    .unwrap_or(self.previous_operation_bytes);
+            }
+            state.scoped_operation_id = self.previous_logical_operation_id;
+            if let Some(previous) = self.previous_scope_work.take() {
+                // Resume the enclosing logical operation's latest ledger, never
+                // a stale snapshot; otherwise restore the enclosing plain one.
+                state.scope_work = self
+                    .previous_logical_operation_id
+                    .and_then(|id| state.operations.get(&id))
+                    .map(|operation| operation.scope_work.clone())
+                    .unwrap_or(previous);
             }
         }
         ACTIVE_GOVERNOR.with(|active| {
@@ -279,12 +337,14 @@ impl ResourceGovernor {
                 public_entries: decode(max_archive_entries, STANDARD_MAX_ARCHIVE_ENTRIES),
             },
             operation: "open".to_string(),
+            scoped_operation_id: None,
             usage: ResourceUsage::default(),
             max_actual_by_part: HashMap::new(),
             next_operation_id: 1,
             operations: HashMap::new(),
             hard_limit_totals: HashMap::new(),
             retained_instance_bytes: HashMap::new(),
+            scope_work: HashMap::new(),
             first_error: None,
         })))
     }
@@ -302,6 +362,7 @@ impl ResourceGovernor {
             LogicalOperationState {
                 name: name.into(),
                 inflated_bytes: 0,
+                scope_work: HashMap::new(),
             },
         );
         ResourceOperation(id)
@@ -314,7 +375,11 @@ impl ResourceGovernor {
             .get(&operation.0)
             .ok_or_else(|| "resource operation does not belong to this governor".to_string())?;
         let name = logical.name.clone();
-        let inflated_bytes = logical.inflated_bytes;
+        let inflated_bytes = if state.scoped_operation_id == Some(operation.0) {
+            state.usage.operation_inflated_bytes
+        } else {
+            logical.inflated_bytes
+        };
         drop(state);
         Ok(self.enter_scope(name, inflated_bytes, Some(operation.0)))
     }
@@ -326,6 +391,16 @@ impl ResourceGovernor {
         logical_operation_id: Option<u64>,
     ) -> ResourceScope {
         let mut state = self.0.borrow_mut();
+        if let Some(id) = state.scoped_operation_id {
+            let bytes = state.usage.operation_inflated_bytes;
+            let work = state.scope_work.clone();
+            if let Some(parent) = state.operations.get_mut(&id) {
+                parent.inflated_bytes = bytes;
+                parent.scope_work = work;
+            }
+        }
+        let previous_logical_operation_id =
+            std::mem::replace(&mut state.scoped_operation_id, logical_operation_id);
         let previous_operation = std::mem::replace(&mut state.operation, operation);
         let previous_operation_bytes = state.usage.operation_inflated_bytes;
         state.usage.operation_inflated_bytes = operation_inflated_bytes;
@@ -335,10 +410,30 @@ impl ResourceGovernor {
         let restore_parent_operation = previous_active
             .as_ref()
             .is_some_and(|active| Rc::ptr_eq(&active.0, &self.0));
+        // A logical operation resumes its own ledger across bounded pulls. A
+        // nested plain scope (e.g. an entry read) keeps charging the enclosing
+        // ledger; only an outermost plain scope starts a fresh one.
+        let previous_scope_work = {
+            let mut state = self.0.borrow_mut();
+            let next = match logical_operation_id {
+                Some(id) => Some(
+                    state
+                        .operations
+                        .get(&id)
+                        .map(|operation| operation.scope_work.clone())
+                        .unwrap_or_default(),
+                ),
+                None if restore_parent_operation => None,
+                None => Some(HashMap::new()),
+            };
+            next.map(|next| std::mem::replace(&mut state.scope_work, next))
+        };
         ResourceScope {
+            previous_scope_work,
             governor: self.clone(),
             previous_active,
             previous_operation,
+            previous_logical_operation_id,
             previous_operation_bytes,
             restore_parent_operation,
             logical_operation_id,
@@ -437,7 +532,8 @@ impl GovernorState {
         };
         let error = format!(
             "OOXML_RESOURCE_LIMIT:{}",
-            serde_json::to_string(&envelope).expect("resource-limit details serialize")
+            crate::json_measurement::serialize_json_string(&envelope)
+                .expect("resource-limit details serialize")
         );
         self.first_error = Some(error.clone());
         error
@@ -569,6 +665,73 @@ fn observe_limit(
         limit,
         observed,
         configurable,
+    }))
+}
+
+/// Charge actual parser work across a package session before allocating a
+/// referenced effect recipe. Repeated pictures must not amplify a small XML
+/// definition into unbounded model copies. The caller supplies the existing
+/// image-effect work ceiling; this is resource policy, not an OOXML restriction.
+pub(crate) fn charge_image_effect_work(units: u64, limit: u64) -> Result<(), String> {
+    let Some(governor) = active_governor() else {
+        return Ok(());
+    };
+    let mut state = governor.0.borrow_mut();
+    state.assert_healthy()?;
+    let total = state
+        .hard_limit_totals
+        .entry(HardResourceLimitKind::ImageEffectWork)
+        .or_default();
+    *total = total.saturating_add(units);
+    let observed = *total;
+    if observed <= limit {
+        return Ok(());
+    }
+    let (stage, resource, metric) = HardResourceLimitKind::ImageEffectWork.wire_fields();
+    Err(state.fail(LimitCrossing {
+        stage,
+        resource,
+        metric,
+        part: None,
+        limit,
+        observed,
+        configurable: false,
+    }))
+}
+
+/// Charge repeatable, non-retained parser work (for example re-parsing a
+/// theme style-matrix entry for every reference) to the outermost active
+/// scope. The budget bounds CPU for one operation; it is not an input-size
+/// admission rule. Without an active scope this is a no-op.
+pub fn charge_scope_work(
+    kind: HardResourceLimitKind,
+    limit: u64,
+    amount: u64,
+) -> Result<(), String> {
+    let Some(governor) = active_governor() else {
+        return Ok(());
+    };
+    let mut state = governor.0.borrow_mut();
+    state.assert_healthy()?;
+    let total = state
+        .scope_work
+        .get(&kind)
+        .copied()
+        .unwrap_or(0)
+        .saturating_add(amount);
+    state.scope_work.insert(kind, total);
+    if total <= limit {
+        return Ok(());
+    }
+    let (stage, resource, metric) = kind.wire_fields();
+    Err(state.fail(LimitCrossing {
+        stage,
+        resource,
+        metric,
+        part: None,
+        limit,
+        observed: total,
+        configurable: false,
     }))
 }
 
@@ -716,6 +879,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn image_effect_work_accumulates_before_repeated_recipe_allocation() {
+        let governor = ResourceGovernor::from_wasm(OoxmlFormat::Pptx, None, None, None);
+        let _scope = governor.scope("parse");
+        charge_image_effect_work(6, 10).unwrap();
+        let error = charge_image_effect_work(5, 10).unwrap_err();
+        let envelope: serde_json::Value =
+            serde_json::from_str(error.strip_prefix("OOXML_RESOURCE_LIMIT:").unwrap()).unwrap();
+        let violation = &envelope["details"]["violation"];
+        assert_eq!(envelope["details"]["stage"], "parsing");
+        assert_eq!(violation["resource"], "image-effect");
+        assert_eq!(violation["metric"], "work");
+        assert_eq!(violation["limit"], 10);
+        assert_eq!(violation["observed"], 11);
+        assert_eq!(violation["configurable"], false);
+        assert!(charge_image_effect_work(0, 10).is_err());
+    }
+
+    #[test]
     fn zero_wire_value_disables_only_the_public_limit() {
         let governor = ResourceGovernor::from_wasm(OoxmlFormat::Docx, Some(0), Some(0), None);
         let state = governor.0.borrow();
@@ -762,6 +943,35 @@ mod tests {
         let _scope = governor.scope("open");
         observe_archive_metadata(STANDARD_MAX_ARCHIVE_ENTRIES + 1, 0).unwrap();
         assert_eq!(governor.0.borrow().policy.public_entries, None);
+    }
+
+    #[test]
+    fn nested_logical_scopes_preserve_charges_and_limit_error_usage() {
+        let governor = ResourceGovernor::from_wasm(OoxmlFormat::Docx, None, None, None);
+        let operation = governor.begin_operation("parse");
+        {
+            let _outer = governor.scope_operation(operation).unwrap();
+            observe_inflated(0, "document.xml", 4, 4).unwrap();
+            {
+                let _entry = governor.scope_operation(operation).unwrap();
+                observe_inflated(1, "styles.xml", 3, 3).unwrap();
+            }
+            let error =
+                observe_hard_limit(HardResourceLimitKind::XmlNestingDepth, None, 1, 2).unwrap_err();
+            let payload: serde_json::Value =
+                serde_json::from_str(error.strip_prefix("OOXML_RESOURCE_LIMIT:").unwrap()).unwrap();
+            assert_eq!(
+                payload["details"]["violation"]["usage"]["operationInflatedBytes"],
+                7
+            );
+        }
+        assert_eq!(
+            governor
+                .usage_for_operation(operation)
+                .unwrap()
+                .operation_inflated_bytes,
+            7
+        );
     }
 
     #[test]

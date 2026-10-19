@@ -5,6 +5,7 @@ import type {
 import { boundedViewerCommentThreadContext } from '@silurus/ooxml-core/internal/comment-context';
 import type { PptxComment, SlideElementOrigin } from './types.js';
 import { readBoundedNativeTextSelection } from '@silurus/ooxml-core/internal/canvas-viewer-mechanics';
+import { nonNegativeInteger } from '@silurus/ooxml-core/internal/selection-data';
 
 /** Snapshot-local locator for a rendered run intersecting a PPTX text selection. */
 export interface PptxSelectionRunLocator {
@@ -85,12 +86,6 @@ export function createPptxCommentSelectionContext(
     textCharacters: bounded.textCharacters,
     maxTextCharacters: bounded.maxTextCharacters,
   });
-}
-
-function nonNegativeInteger(value: string | undefined): number | null {
-  if (value === undefined || !/^\d+$/.test(value)) return null;
-  const number = Number(value);
-  return Number.isSafeInteger(number) ? number : null;
 }
 
 function slideIndexFor(run: HTMLElement): number | null {

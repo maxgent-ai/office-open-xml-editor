@@ -1,6 +1,5 @@
 import type { ViewportRange, Worksheet } from '../types.js';
 import { baseColWidthToPx, colWidthToPx, rowHeightToPx, uiColWidthToPx } from './grid-metrics.js';
-import { isMacDesktop } from './platform.js';
 import { GridAxisGeometry } from './grid-axis-geometry.js';
 import { columnCssWidths } from './column-css-overrides.js';
 import { rowResizeRanges, rowResizeContains } from './worksheet-size-context.js';
@@ -90,7 +89,7 @@ export class GridGeometry {
     // baseColWidth always wins. Otherwise the absent-sheetFormatPr flag selects
     // UI-character encoding, and an unflagged default is a stored width.
     const defaultColPx = worksheet.baseColWidth !== undefined
-      ? baseColWidthToPx(worksheet.baseColWidth, mdw, isMacDesktop())
+      ? baseColWidthToPx(worksheet.baseColWidth, mdw)
       : worksheet.defaultColWidthIsUi === true
         ? uiColWidthToPx(worksheet.defaultColWidth, mdw)
         : colWidthToPx(worksheet.defaultColWidth, mdw);

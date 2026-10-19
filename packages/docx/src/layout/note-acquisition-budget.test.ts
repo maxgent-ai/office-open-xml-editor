@@ -5,6 +5,18 @@ import { layoutSourceStore } from '../layout-source-model-adapter.js';
 import { noteContinuationModel } from '../testing/note-continuation-model.js';
 import { layoutDocumentInputAsync } from './document.js';
 import type { DocParagraph } from '../types.js';
+import { referenceFontLineMetrics } from '../reference-font-line-metrics.js';
+
+/** The fixture's Times New Roman is present here, as in the convergence
+ * geometry these budgets were sized for (its resource metric is the catalog
+ * projection). An absent face would size lines from its painting fallback. */
+function presentTimes() {
+  return { 'times new roman': {
+    ...referenceFontLineMetrics('Times New Roman', 400, 'normal')!,
+    requestedFamily: 'Times New Roman', family: 'Times New Roman', weight: 400, style: 'normal' as const,
+    sourceIdentity: 'local:times-new-roman',
+  } };
+}
 
 function measureContext(): CanvasRenderingContext2D {
   return { font: '10px serif', letterSpacing: '0px', fontKerning: 'auto',
@@ -36,7 +48,7 @@ describe('cumulative full-footnote acquisition work', () => {
     paragraph.runs.push({ ...run, type: 'field', fieldType: 'page',
       instruction: 'PAGE' + ' '.repeat(900_000), fallbackText: '1' });
     const services = createLayoutServices(model, {
-      measureContext: measureContext(), allowFootnoteContinuation: true,
+      measureContext: measureContext(), allowFootnoteContinuation: true, localMetrics: presentTimes(),
     });
     const source = layoutSourceStore(model);
     const progress: number[] = [];
@@ -54,7 +66,7 @@ describe('cumulative full-footnote acquisition work', () => {
     const paragraph = model.footnotes![0]!.content[0] as DocParagraph;
     paragraph.styleId = 'S'.repeat(900_000);
     const services = createLayoutServices(model, {
-      measureContext: measureContext(), allowFootnoteContinuation: true,
+      measureContext: measureContext(), allowFootnoteContinuation: true, localMetrics: presentTimes(),
     });
     const layout = layoutDocument(model, services, { currentDateMs: 0 });
     expect(layout.pages.length).toBeGreaterThan(32);

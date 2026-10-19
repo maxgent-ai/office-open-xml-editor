@@ -3,10 +3,10 @@ import type { ChartModel, ChartRect, ChartSeries, SecondaryValueAxis } from '../
 import { planDateCategoryAxis } from '../date-axis.js';
 import { isCrossBetween, resolveAxisLine } from '../axis-style.js';
 import { planNumericValueAxis } from '../axis-scale.js';
-import { axisTitleFontPx, categoryTickLabelGapPx, chartTextFontSizePx } from '../layout.js';
+import { axisTitleBreakThicknessPx, axisTitleFontPx, categoryTickLabelGapPx, chartTextFontSizePx } from '../layout.js';
 import { rawLinkedChartStyleRole } from '../effective-style.js';
 import { categoryLabelAnchorFraction, categoryLabelOffsetPx } from '../category-spacing.js';
-import { elideToWidth } from '../text-elide.js';
+import { authoredExtraLinesHeight, axisLabelLineHeightPx, fillAuthoredText } from '../chart-text-lines.js';
 import { formatCategoryLabel } from '../chart-number-format.js';
 import { catAxisReversed, drawAxisTick, drawAxisTitle, formatAxisTickWithUnits, secondaryMajorGridStroke, secondaryMinorGridStroke, strokeAxisSegment, strokeValueGridlineH, valueAxisUnitInRendererSpace } from './axis.js';
 import { chartFontCss, chartFontFamily } from './fonts.js';
@@ -238,7 +238,8 @@ export function drawSecondaryValueAxis(
       // Same tick geometry as the left axis, mirrored to the right edge.
       drawAxisTick(ctx, sec.majorTickMark, 'val', axX, gy, secLineColor, secLineW, side === 'right', sec.lineHidden, 'major', ptToPx, sec.lineDash);
       if (sec.tickLabelPos !== 'none') {
-        ctx.fillText(
+        fillAuthoredText(
+          ctx,
           formatAxisTickWithUnits(
             percentStacked ? sval / 100 : sval,
             sec.formatCode ?? null,
@@ -247,6 +248,7 @@ export function drawSecondaryValueAxis(
           ),
           side === 'left' ? axX - 14 : axX + 14,
           gy,
+          axisLabelLineHeightPx(secFontPx),
         );
       }
     }
@@ -268,7 +270,7 @@ export function drawSecondaryValueAxis(
 /** Draw a secondary value-axis title. Both the duplicated combo-bar path and
  *  the shared line/area path use this helper, so the fixed 10pt
  *  fallback and +90° reading direction cannot drift. */
-export function drawSecondaryAxisTitle(
+function drawSecondaryAxisTitle(
   ctx: CanvasRenderingContext2D,
   chart: ChartModel,
   sec: SecondaryValueAxis,
@@ -283,11 +285,16 @@ export function drawSecondaryAxisTitle(
   const color = sec.titleFontColor
     ? `#${sec.titleFontColor}`
     : (sec.fontColor ? `#${sec.fontColor}` : '#555');
+  // A multi-line block's centre moves outward by half its extra thickness
+  // (reserved by `secondaryAxisTitleBandW`).
+  const extra = axisTitleBreakThicknessPx(
+    sec.title, fontSizePx, side, sec.titleRotation, sec.titleVerticalMode,
+  ) / 2;
   drawAxisTitle(
     ctx,
     sec.title,
-    side === 'left' ? px0 - secLabelBandW - fontSizePx * 0.6
-      : px0 + pw + secLabelBandW + fontSizePx * 0.6,
+    side === 'left' ? px0 - secLabelBandW - fontSizePx * 0.6 - extra
+      : px0 + pw + secLabelBandW + fontSizePx * 0.6 + extra,
     py0 + ph / 2,
     side,
     fontSizePx,
@@ -375,10 +382,13 @@ export function drawSecondaryCategoryAxis(
     for (let index = 0; index < count; index += labelSkip) {
       const anchor = labelAnchor(index);
       ctx.textAlign = anchor.textAlign;
-      ctx.fillText(
-        elideToWidth(ctx, formatCategoryLabel(categories[index], axis.formatCode, chart.date1904), budget),
+      fillAuthoredText(
+        ctx,
+        formatCategoryLabel(categories[index], axis.formatCode, chart.date1904),
         px0 + anchor.fraction * pw,
         py0 - labelGap,
+        axisLabelLineHeightPx(fontPx),
+        budget,
       );
     }
   }
@@ -390,11 +400,15 @@ export function drawSecondaryCategoryAxis(
       px0 + pw / 2,
       py0 - (axis.tickLabelPos === 'none'
         ? 0
-        : fontPx + categoryLabelOffsetPx(
-          categoryTickLabelGapPx(fontPx),
-          axis.labelOffsetPercent,
-        ))
-        - titleFontPx / 2 - 4,
+        : fontPx + secondaryCategoryLabelExtraH(categories, axis, chart, fontPx)
+          + categoryLabelOffsetPx(
+            categoryTickLabelGapPx(fontPx),
+            axis.labelOffsetPercent,
+          ))
+        - titleFontPx / 2 - 4
+        - axisTitleBreakThicknessPx(
+          axis.title, titleFontPx, 'horizontal', axis.titleRotation, axis.titleVerticalMode,
+        ) / 2,
       'horizontal',
       titleFontPx,
       axis.titleFontBold ?? true,
@@ -416,4 +430,33 @@ export function drawSecondaryCategoryAxis(
       ptToPx,
     );
   }
+}
+
+
+/** Height the authored line breaks of the secondary (top) category labels add
+ *  above a single label line: the labels grow upward from the axis, so the
+ *  label band and the title above it grow by this amount. 0 without breaks. */
+export function secondaryCategoryLabelExtraH(
+  categories: readonly string[],
+  axis: SecondaryValueAxis,
+  chart: ChartModel,
+  fontPx: number,
+): number {
+  if (axis.tickLabelPos === 'none') return 0;
+  const labelSkip = Math.max(1, Math.floor(axis.tickLabelSkip ?? 1));
+  const labels: string[] = [];
+  for (let index = 0; index < categories.length; index += labelSkip) {
+    labels.push(formatCategoryLabel(categories[index], axis.formatCode, chart.date1904));
+  }
+  return authoredExtraLinesHeight(labels, axisLabelLineHeightPx(fontPx));
+}
+
+
+/** Gutter width of a secondary value-axis title: one line plus the shared
+ *  gap, and the extra thickness of authored title lines (0 without breaks). */
+export function secondaryAxisTitleBandW(sec: SecondaryValueAxis, ptToPx: number): number {
+  const fontPx = axisTitleFontPx(sec.titleFontSizeHpt, ptToPx);
+  return fontPx + 8 + axisTitleBreakThicknessPx(
+    sec.title, fontPx, 'right', sec.titleRotation, sec.titleVerticalMode,
+  );
 }

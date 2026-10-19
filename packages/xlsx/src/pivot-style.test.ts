@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildPivotStyleMap } from './pivot-style.js';
+import { buildStructuredStyleMap } from './pivot-style.js';
 import type { Dxf, PivotAxisItem, PivotTableMetadata, Worksheet } from './types.js';
 
 const edge = (color: string) => ({ style: 'thin', color });
@@ -64,7 +64,7 @@ describe('PivotTable style regions (ECMA-376 §18.8.41, §18.18.77)', () => {
         { kind: 'grand', depth: 0 }, // row 8
       ])],
     } as unknown as Worksheet;
-    const map = buildPivotStyleMap(worksheet);
+    const map = buildStructuredStyleMap(worksheet);
     // Header row 2 carries only the whole-table colour.
     expect(map.get('2:2')).toEqual({ fontColor: '#595959' });
     // An odd leaf row is boxed across the pivot width.
@@ -88,7 +88,7 @@ describe('PivotTable style regions (ECMA-376 §18.8.41, §18.18.77)', () => {
       size: 1,
       dxf: dxf({ font: font('#595959'), border: { top: none, bottom: none, left: none, right: none } }),
     };
-    const map = buildPivotStyleMap({ pivotTables: [table] } as unknown as Worksheet);
+    const map = buildStructuredStyleMap({ pivotTables: [table] } as unknown as Worksheet);
     // Row 3 is an odd stripe row and a subheading: the box is cleared.
     expect(map.get('3:2')).toMatchObject({ top: none, left: none, bottom: none });
   });
@@ -107,7 +107,7 @@ describe('PivotTable style regions (ECMA-376 §18.8.41, §18.18.77)', () => {
       { kind: 'secondRowSubheading', size: 1, dxf: dxf({ font: font('#000002') }) },
       { kind: 'thirdRowSubheading', size: 1, dxf: dxf({ font: font('#000003') }) },
     );
-    const map = buildPivotStyleMap({ pivotTables: [table] } as unknown as Worksheet);
+    const map = buildStructuredStyleMap({ pivotTables: [table] } as unknown as Worksheet);
     expect([3, 4, 5, 6, 7].map((row) => map.get(`${row}:2`)?.fontColor)).toEqual([
       '#595959', '#000002', '#000003', '#000002', '#000003',
     ]);
@@ -117,7 +117,7 @@ describe('PivotTable style regions (ECMA-376 §18.8.41, §18.18.77)', () => {
     const table = pivot([{ kind: 'data', depth: 0 }, { kind: 'data', depth: 1 }]);
     table.style!.showRowHeaders = false;
     table.style!.showRowStripes = false;
-    const map = buildPivotStyleMap({ pivotTables: [table] } as unknown as Worksheet);
+    const map = buildStructuredStyleMap({ pivotTables: [table] } as unknown as Worksheet);
     expect(map.get('3:2')).toEqual({ fontColor: '#595959' });
   });
 
@@ -134,7 +134,7 @@ describe('PivotTable style regions (ECMA-376 §18.8.41, §18.18.77)', () => {
       { kind: 'totalRow', size: 1, dxf: dxf({ font: font('#000002'), fontToggles: {} }) },
     ];
     table.rowItems = [{ kind: 'data', depth: 1 }, { kind: 'grand', depth: 0 }];
-    const map = buildPivotStyleMap({ pivotTables: [table] } as unknown as Worksheet);
+    const map = buildStructuredStyleMap({ pivotTables: [table] } as unknown as Worksheet);
     expect(map.get('2:2')).toEqual({ fontColor: '#000001', ...off });
     expect(map.get('3:2')).toEqual({ fontColor: '#595959', ...on });
     expect(map.get('4:2')).toEqual({ fontColor: '#000002', ...on });
@@ -143,6 +143,6 @@ describe('PivotTable style regions (ECMA-376 §18.8.41, §18.18.77)', () => {
   it('draws nothing without a style', () => {
     const plain = pivot([{ kind: 'data', depth: 0 }]);
     delete (plain as { style?: unknown }).style;
-    expect(buildPivotStyleMap({ pivotTables: [plain] } as unknown as Worksheet).size).toBe(0);
+    expect(buildStructuredStyleMap({ pivotTables: [plain] } as unknown as Worksheet).size).toBe(0);
   });
 });

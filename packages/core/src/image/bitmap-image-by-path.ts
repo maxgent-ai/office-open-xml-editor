@@ -57,7 +57,7 @@ import {
 } from './adaptive-image-budget.js';
 import type { TiffRenderer } from './tiff-contract.js';
 import { wmfRasterTarget } from './wmf.js';
-import type { SvgBlobDecoder } from '../worker/svg-decode-bridge.js';
+import type { SvgBlobDecoder } from './svg-raster.js';
 
 type FetchImage = (path: string, mime: string) => Promise<Blob>;
 export type DecodedBitmapCacheOwner = object;
@@ -369,6 +369,13 @@ export function releaseOwnedBitmap(bitmap: ImageBitmap | null | undefined): void
   }
 }
 
+/** Nest a dependent-image operation under its owner's current byte policy.
+ * Unlike a fresh default lease this does not lower or raise a configured
+ * render-pass budget while an effect prepares its own image-fill sources. */
+export function acquireCurrentBitmapCacheLease(owner: DecodedBitmapCacheOwner): () => void {
+  return acquireBitmapCacheLease(owner, { decodedByteBudget: bitmapCacheFor(owner).retainedLimit });
+}
+
 /**
  * Hold every decoded bitmap of one document owner alive for
  * the duration of a render pass: while the returned release function has not
@@ -496,17 +503,12 @@ export function deferBitmapCloseWhileLeased(
 
 /** Options for {@link getCachedBitmapByPath}. `widthPt`/`heightPt` size a
  * metafile raster; `targetWidthPx`/`targetHeightPx` select a display-resolution
- * variant for ordinary rasters. `suppressBoundaryFrame` is the docx-only WMF
- * window/device-boundary edge suppression (spec-clean default OFF;
- * pptx/xlsx leave it unset). */
+ * variant for ordinary rasters. */
 export interface CachedBitmapOptions {
   /** Intended draw width in points; sizes any metafile raster target. */
   widthPt?: number;
   /** Intended draw height in points; see `widthPt`. */
   heightPt?: number;
-  /** Enable the docx cosmetic window/device-frame suppression heuristic. Default
-   *  false = spec-clean. Only docx opts in. */
-  suppressBoundaryFrame?: boolean;
   /** Optional TIFF codec retained by the owning document. */
   tiff?: TiffRenderer;
   /** Desired width of the full raster source in device pixels. */
@@ -515,7 +517,7 @@ export interface CachedBitmapOptions {
   targetHeightPx?: number;
   /** Retained base-surface pixel ceiling for multi-surface effect pipelines. */
   maxRetainedPixels?: number;
-  /** Worker-only SVG decoder. Window renderers use HTMLImageElement instead. */
+  /** SVG rasterizer for pixel effects or worker rendering. */
   svgDecoder?: SvgBlobDecoder;
   /** Policy for a metafile that cannot be fully played (default
    *  `'draw-supported'`, the OOXML renderers' compatibility policy); see
@@ -581,7 +583,7 @@ function enforceCachedRetainedBudget(
 }
 
 /** Stable base key shared by the base and derived decoded-surface caches. */
-export function cachedBitmapVariantKey(
+function cachedBitmapVariantKey(
   imagePath: string,
   opts: CachedBitmapOptions = {},
 ): string {
@@ -597,7 +599,6 @@ export function cachedBitmapVariantKey(
 interface MetafileVariant {
   readonly width: number;
   readonly height: number;
-  readonly suppressBoundaryFrame: boolean;
   readonly pixelLimit: number;
   readonly rejectIncomplete: boolean;
 }
@@ -611,7 +612,6 @@ function metafileVariant(opts: CachedBitmapOptions): MetafileVariant {
   return {
     width: target.w,
     height: target.h,
-    suppressBoundaryFrame: opts.suppressBoundaryFrame === true,
     pixelLimit: retainedPixelLimit(opts),
     rejectIncomplete: opts.incompleteMetafile === 'reject',
   };
@@ -620,9 +620,9 @@ function metafileVariant(opts: CachedBitmapOptions): MetafileVariant {
 function metafileVariantPrefix(imagePath: string, variant: MetafileVariant): string {
   const pathKey = `${imagePath.length}:${imagePath}`;
   // A strict (reject) decode must never be satisfied by a partial picture a
-  // compatibility decode cached, nor the reverse; the default key is unchanged.
+  // compatibility decode cached, nor the reverse.
   const strict = variant.rejectIncomplete ? 'r1:' : '';
-  return `metafile:${pathKey}:s${variant.suppressBoundaryFrame ? 1 : 0}:p${variant.pixelLimit}:${strict}`;
+  return `metafile:${pathKey}:p${variant.pixelLimit}:${strict}`;
 }
 
 function metafileVariantKey(
@@ -798,6 +798,7 @@ function getCachedOwnedBitmap(
   key: string,
   owner: DecodedBitmapCacheOwner,
   produce: () => Promise<ProducedBitmap>,
+  prepare?: () => Promise<void>,
 ): Promise<ImageBitmap | null> {
   const state = bitmapCacheFor(owner);
   const cache = state.entries;
@@ -811,7 +812,12 @@ function getCachedOwnedBitmap(
     });
   }
 
-  const produced = withDecodedImageSlot(owner, produce);
+  // A dependency load must finish before taking a decoder slot; cache
+  // publication still happens synchronously, so concurrent callers share the
+  // preparation as well as the transform. Cache hits do not re-decode fills.
+  const produced = prepare
+    ? Promise.resolve().then(prepare).then(() => withDecodedImageSlot(owner, produce))
+    : withDecodedImageSlot(owner, produce);
   // This branch exists only so eviction/teardown can eventually close a surface
   // owned by the entry. A failed producer owns nothing to close, so normalize
   // that outcome immediately instead of retaining a rejected cleanup promise.
@@ -870,7 +876,7 @@ const DERIVED_CACHE_PREFIX = 'derived:';
 /** General document-owned decoded-surface primitive. Loader choice is separate
  * from the owner token; callers sharing a namespace/key dedupe regardless of
  * whether bytes came from an image or media extraction API. */
-export function getCachedDecodedBitmap(
+function getCachedDecodedBitmap(
   namespace: string,
   cacheKey: string,
   owner: DecodedBitmapCacheOwner,
@@ -891,13 +897,21 @@ export function getCachedDerivedBitmap(
   owner: DecodedBitmapCacheOwner,
   create: () => Promise<{ bitmap: ImageBitmap | null; owned: boolean }>,
   epoch?: DecodedBitmapCacheEpoch,
+  prepare?: () => Promise<void>,
 ): Promise<ImageBitmap | null> {
   if (epoch) assertCurrentDerivedEpoch(owner, namespace, epoch);
-  return getCachedDecodedBitmap(
-    `${DERIVED_CACHE_PREFIX}${namespace}`,
-    cacheKey,
+  return getCachedOwnedBitmap(
+    `${DERIVED_CACHE_PREFIX}${namespace}:${cacheKey}`,
     owner,
-    create,
+    () => {
+      if (epoch) assertCurrentDerivedEpoch(owner, namespace, epoch);
+      return create();
+    },
+    prepare ? async () => {
+      if (epoch) assertCurrentDerivedEpoch(owner, namespace, epoch);
+      await prepare();
+      if (epoch) assertCurrentDerivedEpoch(owner, namespace, epoch);
+    } : undefined,
   );
 }
 
@@ -958,7 +972,6 @@ export function getCachedBitmapByPath(
   const {
     widthPt = 0,
     heightPt = 0,
-    suppressBoundaryFrame = false,
     tiff,
     targetWidthPx,
     targetHeightPx,
@@ -971,14 +984,23 @@ export function getCachedBitmapByPath(
       BASE_CACHE_NAMESPACE,
       cachedBitmapVariantKey(imagePath, normalized),
       owner,
-      async () => ({
-        bitmap: await svgDecoder(await fetchImage(imagePath, mimeType), {
+      async () => {
+        const bitmap = await svgDecoder(await fetchImage(imagePath, mimeType), {
           targetWidthPx,
           targetHeightPx,
-        }),
-        owned: true,
-      }),
-    );
+        });
+        // The host decoder has the ordinary image ceiling; effect callers can
+        // require a smaller base because several pixel surfaces coexist. Check
+        // before transferring ownership to the cache or allocating effects.
+        try {
+          enforceCachedRetainedBudget(bitmap, normalized);
+        } catch (error) {
+          closeBitmapOnce(bitmap);
+          throw error;
+        }
+        return { bitmap, owned: true };
+      },
+    ).then((bitmap) => enforceCachedRetainedBudget(bitmap, normalized));
   }
   const decode = (
     cacheKey: string,
@@ -996,7 +1018,6 @@ export function getCachedBitmapByPath(
         const decodeOpts = {
           widthPt,
           heightPt,
-          suppressBoundaryFrame,
           tiff,
           targetWidthPx: resizeToTarget ? targetWidthPx : undefined,
           targetHeightPx: resizeToTarget ? targetHeightPx : undefined,

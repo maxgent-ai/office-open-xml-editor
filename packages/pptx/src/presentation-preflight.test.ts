@@ -7,9 +7,16 @@ import {
   assertPresentationPreflightProjectionBytes,
   normalizePresentationBootstrap,
 } from './presentation-preflight';
-import { pptxFontPreloadNames } from './google-fonts';
+import { PptxFontPreloadAccumulator } from './google-fonts';
 import type { Presentation, Slide } from './types';
 import type { PresentationBootstrap } from './worker-protocol';
+
+/** Reference projection: one accumulator fed the whole parsed deck. */
+function wholeDeckPreloadNames(pres: Presentation): (string | null | undefined)[] {
+  const accumulator = new PptxFontPreloadAccumulator(pres.majorFont, pres.minorFont);
+  for (const slide of pres.slides) accumulator.addSlide(slide);
+  return accumulator.names();
+}
 
 const bootstrap: PresentationBootstrap = {
   slideCount: 2,
@@ -130,7 +137,7 @@ describe('PresentationPreflightBuilder', () => {
       hlinkColor: bootstrap.hlinkColor ?? undefined,
       folHlinkColor: bootstrap.folHlinkColor ?? undefined,
     };
-    expect(facts.fontPreloadNames).toEqual(pptxFontPreloadNames(full));
+    expect(facts.fontPreloadNames).toEqual(wholeDeckPreloadNames(full));
   });
 
   it('accounts for the exact structural JSON projection deterministically', () => {
@@ -204,7 +211,7 @@ describe('PresentationPreflightBuilder', () => {
       operationInflatedBytes: 100,
     };
     const limited = new PresentationPreflightBuilder(bootstrap, {
-      hardLimitForTesting: crossingLimit,
+      maxProjectionBytes: crossingLimit,
     });
     const retainedBeforeFailure = limited.projectedBytes;
     try {
@@ -242,7 +249,7 @@ describe('PresentationPreflightBuilder', () => {
     const builder = new PresentationPreflightBuilder(three);
     for (const item of slides) builder.addSlide(item);
     const facts = builder.finish();
-    expect(facts.fontPreloadNames).toEqual(pptxFontPreloadNames({
+    expect(facts.fontPreloadNames).toEqual(wholeDeckPreloadNames({
       slideWidth: three.slideWidth,
       slideHeight: three.slideHeight,
       slides,

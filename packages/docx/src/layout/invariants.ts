@@ -1,5 +1,4 @@
 import { requireResolvedDrawingMLGeometry } from '@silurus/ooxml-core';
-import { nativeReadingImageFrame } from './native-reading-image-frame.js';
 import { LayoutInvariantError } from './diagnostics.js';
 import {
   createSectionRegionCoordinateSpace,
@@ -31,8 +30,9 @@ import type {
   WritingMode,
 } from './types.js';
 import { unionLayoutRects } from './rect-union.js';
-import { noteOwnedBlocks } from './native-note-separators.js';
+import { noteOwnedBlocks } from './reserved-note-separators.js';
 
+import { isDeepFrozenPlainDataRoot } from './plain-data.js';
 import { documentLayoutValidationEnabled } from './validation-policy.js';
 // Pagination's generator yields page counts for public progress telemetry.
 // Final validation/freezing also needs suspension points, but commits no new
@@ -432,12 +432,12 @@ function collectRetainedNodeIds(
   }
 }
 
-/** Native separator/notice occurrences belong to their note: they lie on its
+/** Reserved separator/notice occurrences belong to their note: they lie on its
  * block interval in its flow domain and replace, never add to, its scalar rule. */
 function requireNoteSeparatorOwnership(node: PaintNode, path: string): void {
   if (node.kind !== 'note') return;
   if (node.leading && node.separator.length !== 0) {
-    throw new LayoutInvariantError('INVALID_GEOMETRY', `${path} paints both a scalar and a native separator`);
+    throw new LayoutInvariantError('INVALID_GEOMETRY', `${path} paints both a scalar and a reserved separator`);
   }
   if (node.trailing && node.trailing.role !== 'continuationNotice') {
     throw new LayoutInvariantError('INVALID_REFERENCE', `${path}.trailing is not a continuation notice`);
@@ -525,6 +525,7 @@ function requireRetainedCollisionGeometry(node: PaintNode, path: string): void {
     return;
   }
   if (node.kind === 'textbox') {
+    node.clipRects?.forEach((rect, index) => requireRect(rect, `${path}.clipRects[${index}]`));
     node.story.blocks.forEach((block, index) =>
       requireRetainedCollisionGeometry(block, `${path}.story.blocks[${index}]`));
   }
@@ -551,6 +552,12 @@ function requireDrawingGeometry(node: DrawingLayout, path: string): void {
     if (command.kind === 'noop') return;
     if (command.kind === 'drawingml-shape') {
       requireDrawingMLShapePlan(command, commandPath);
+      if (command.concentricFill) {
+        const fill = command.concentricFill;
+        if (fill.bounds) requireRect(fill.bounds, `${commandPath}.concentricFill.bounds`);
+        for (const [key,value] of Object.entries(fill.focus)) requireFinite(value, `${commandPath}.concentricFill.focus.${key}`);
+        fill.rings.forEach((ring,i) => { requireFinite(ring.outside, `${commandPath}.concentricFill.rings[${i}]`); });
+      }
       return;
     }
     if (command.kind === 'drawingml-image-fill') {
@@ -558,6 +565,7 @@ function requireDrawingGeometry(node: DrawingLayout, path: string): void {
       if (command.resourceKey.length === 0) {
         throw new LayoutInvariantError('INVALID_GEOMETRY', `${commandPath}.resourceKey is empty`);
       }
+      if (command.maskBounds) requireRect(command.maskBounds, `${commandPath}.maskBounds`);
       if (command.fillRect) {
         for (const edge of ['l', 't', 'r', 'b'] as const) {
           requireFinite(command.fillRect[edge], `${commandPath}.fillRect.${edge}`);
@@ -566,19 +574,6 @@ function requireDrawingGeometry(node: DrawingLayout, path: string): void {
       return;
     }
     requireRect(command.rect, `${commandPath}.rect`);
-    if (command.kind === 'resource' && command.nativeImagePlan) {
-      if (command.resourceKind !== 'image' || command.resourceKey !== command.nativeImagePlan.source.resourceKey
-        || command.orientation !== undefined || node.clip || node.clipBounds) {
-        throw new LayoutInvariantError('INVALID_GEOMETRY', `${commandPath} has an unacquired image orientation/clip/resource`);
-      }
-      try {
-        const local = nativeReadingImageFrame(command.nativeImagePlan, command.rect);
-        const frame = node.transform ? transformRect(node.transform, local) : local;
-        if (!contains(node.flowBounds, frame)) throw new Error('image projection exceeds allocation');
-      } catch (error) {
-        throw new LayoutInvariantError('INVALID_GEOMETRY', `${commandPath}: ${error instanceof Error ? error.message : 'invalid image plan'}`);
-      }
-    }
     if (command.kind === 'stroke-rect') {
       requireFinite(command.lineWidthPt, `${commandPath}.lineWidthPt`);
       command.dashPt.forEach((dash, dashIndex) =>
@@ -589,6 +584,7 @@ function requireDrawingGeometry(node: DrawingLayout, path: string): void {
       requireFinite(command.fontWeight, `${commandPath}.fontWeight`);
     }
     if (command.kind === 'watermark-text') {
+      if (command.maskBounds) requireRect(command.maskBounds, `${commandPath}.maskBounds`);
       requireRect(command.sourceBounds, `${commandPath}.sourceBounds`);
       if (command.sourceBounds.widthPt <= 0 || command.sourceBounds.heightPt <= 0) {
         throw new LayoutInvariantError(
@@ -602,6 +598,9 @@ function requireDrawingGeometry(node: DrawingLayout, path: string): void {
       if (command.opacity < 0 || command.opacity > 1 || command.fontSizePt <= 0) {
         throw new LayoutInvariantError('INVALID_GEOMETRY', `${commandPath} has invalid textPath paint metrics`);
       }
+      command.pathSlices?.forEach((slice, i) => {
+        for (const [key, value] of Object.entries(slice)) requireFinite(value, `${commandPath}.pathSlices[${i}].${key}`);
+      });
       command.spans.forEach((span, spanIndex) => {
         requireFinite(span.advancePt, `${commandPath}.spans[${spanIndex}].advancePt`);
         requireFinite(span.fontWeight, `${commandPath}.spans[${spanIndex}].fontWeight`);
@@ -1163,8 +1162,16 @@ function deepFreeze<T>(value: T, seen: WeakSet<object>): DeepReadonly<T> {
     return value as DeepReadonly<T>;
   }
   if (seen.has(value)) return value as DeepReadonly<T>;
+  // A plain-data root sealed by its own complete freeze walk is already deeply
+  // frozen, and that walk rejected non-finite numbers in its whole graph.
+  if (isDeepFrozenPlainDataRoot(value)) return value as DeepReadonly<T>;
   seen.add(value);
-  for (const child of Object.values(value as Record<string, unknown>)) deepFreeze(child, seen);
+  // Own enumerable string keys, as Object.values, without its array per node.
+  for (const key in value) {
+    if (Object.prototype.hasOwnProperty.call(value, key)) {
+      deepFreeze((value as Record<string, unknown>)[key], seen);
+    }
+  }
   return Object.freeze(value) as DeepReadonly<T>;
 }
 

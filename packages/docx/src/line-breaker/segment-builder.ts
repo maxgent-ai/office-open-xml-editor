@@ -15,6 +15,8 @@ import {
 import { groupFitTextRegions, type FitTextRun } from '../fit-text.js';
 import { mathFallbackText } from '../layout/math-fallback-text.js';
 import type { FontResolution } from '../layout/font-service.js';
+import type { FontDecorationGeometry } from '@silurus/ooxml-core/internal/font-decoration';
+import { referenceFontDecorationMetrics } from '../reference-font-line-metrics.js';
 import type {
   ParagraphLayoutSource,
   ParagraphLayoutRun,
@@ -39,6 +41,7 @@ import {
 } from '../layout/line-compatibility.js';
 import { type LayoutSeg, type LayoutTextSeg, type LineLayoutEnvironment } from './model.js';
 import { charScaleFactor, retainHorizontalPunctuationInkClearance } from './advance.js';
+import { assignEastAsianAutoSpace } from './east-asian-autospace.js';
 import {
   COMPRESSIBLE_TRAILING_FULL_WIDTH_PUNCTUATION,
   characterSpacingControlCompresses,
@@ -58,6 +61,7 @@ import {
   mayUseExactLocalReferenceWidthMetric,
   selectResourceAverageWidthRatio,
   selectResourceMetric,
+  allowsReferenceFontMetric,
   selectedFontLineMetric,
   type MetricTupleIndex,
 } from './font-metrics.js';
@@ -160,7 +164,6 @@ export function appendTextPiece(
   joinPreviousRun = false,
 ): void {
   const {
-    runs,
     environment,
     segs,
     fitTextFragmentEntryByKey,
@@ -904,49 +907,29 @@ export function buildSegments(
   appendRunsToSegments(runs, environment, segs, segmentBuildContext, selectedMetric);
 
   finalizeBuiltSegments(runs, environment, segs);
-  withdrawMixedSpaceEligibilityOutsideScope(environment, segs);
+  assignEastAsianAutoSpace(segs, environment);
+  withdrawMixedSpaceEligibilityOutsideScope(segs);
 
   return segs;
 }
 
-const AUTO_SPACE_EAST_ASIAN = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/u;
-const AUTO_SPACE_LATIN = /\p{Script=Latin}/u;
-const AUTO_SPACE_DIGIT = /[0-9]/u;
-// UAX #29 GB9 extenders and ZWJ can hide a base character's adjacency. Keep
-// the existing scalar checks as well: some extending characters themselves
-// carry Han script membership, and their previous exclusions must remain.
-// Issue #1660's compression observation excludes autospace-on adjacency and
-// does not establish these extender-bearing inputs. Preserve that exclusion;
-// this narrows admission without asserting an Office automatic-spacing amount.
-const AUTO_SPACE_GRAPHEME_EXTEND = /[\p{Grapheme_Extend}\u200D]/u;
+// UAX #29 GB9 extenders and ZWJ can hide a base character's adjacency.
+const GRAPHEME_EXTEND = /[\p{Grapheme_Extend}\u200D]/u;
 
 /**
  * Scope of WORD_COMPRESSED_SPACE_LINE_FIT (see its registered description):
- * the paragraph keeps the unchanged line breaker when
- * - §17.3.1.2-3 automatic spacing applies (enabled, with an ideograph or kana
- *   directly beside a Latin letter or ASCII digit), which the renderer does
- *   not model, or
- * - a compressible closing mark is directly followed by U+0020, where the
- *   registered rule records a full retained cell that
- *   WORD_JAPANESE_PUNCTUATION_COMPRESSION_CELL does not reproduce.
- * Preserve the scalar exclusions on the paragraph's joined text and add
- * extender-transparent base adjacency. This only withdraws additional
- * unsupported paragraphs; it cannot re-admit a previously excluded one.
- * `texts` lists the segments in order; `undefined` marks a non-text segment,
- * which ends both adjacency checks. This is not a full grapheme segmenter.
+ * the paragraph keeps the unchanged line breaker when a compressible closing
+ * mark is directly followed by U+0020, where the registered rule records a
+ * full retained cell that WORD_JAPANESE_PUNCTUATION_COMPRESSION_CELL does not
+ * reproduce. Read on the paragraph's joined text, with extender-transparent
+ * base adjacency as well as scalar adjacency. This only withdraws unsupported
+ * paragraphs; it cannot re-admit an excluded one. `texts` lists the segments
+ * in order; `undefined` marks a non-text segment, which ends the adjacency.
+ * This is not a full grapheme segmenter.
  */
-export function mixedSpaceFitTextOutsideScope(
-  texts: Iterable<string | undefined>,
-  autoSpaceDE: boolean | undefined,
-  autoSpaceDN: boolean | undefined,
-): boolean {
-  const pair = (left: string, right: string): boolean => {
-    if (COMPRESSIBLE_TRAILING_FULL_WIDTH_PUNCTUATION.has(left) && right === ' ') return true;
-    const eastAsian = AUTO_SPACE_EAST_ASIAN.test(left) ? right : AUTO_SPACE_EAST_ASIAN.test(right) ? left : undefined;
-    if (eastAsian === undefined) return false;
-    return (autoSpaceDE !== false && AUTO_SPACE_LATIN.test(eastAsian))
-      || (autoSpaceDN !== false && AUTO_SPACE_DIGIT.test(eastAsian));
-  };
+export function mixedSpaceFitTextOutsideScope(texts: Iterable<string | undefined>): boolean {
+  const pair = (left: string, right: string): boolean =>
+    COMPRESSIBLE_TRAILING_FULL_WIDTH_PUNCTUATION.has(left) && right === ' ';
   let previous: string | undefined;
   let previousBase: string | undefined;
   for (const text of texts) {
@@ -957,7 +940,7 @@ export function mixedSpaceFitTextOutsideScope(
     }
     for (const character of text) {
       if (previous !== undefined && pair(previous, character)) return true;
-      if (!AUTO_SPACE_GRAPHEME_EXTEND.test(character)) {
+      if (!GRAPHEME_EXTEND.test(character)) {
         if (previousBase !== undefined && previousBase !== previous
           && pair(previousBase, character)) return true;
         previousBase = character;
@@ -968,20 +951,18 @@ export function mixedSpaceFitTextOutsideScope(
   return false;
 }
 
-function withdrawMixedSpaceEligibilityOutsideScope(
-  environment: LineLayoutEnvironment,
-  segs: LayoutSeg[],
-): void {
-  if (!segs.some((segment) => 'text' in segment && segment.mixedSpaceAverageWidthRatio !== undefined)) {
+function withdrawMixedSpaceEligibilityOutsideScope(segs: LayoutSeg[]): void {
+  if (!segs.some((segment) => 'text' in segment
+    && (segment.mixedSpaceAverageWidthRatio !== undefined || segment.autoSpaceCompressible))) {
     return;
   }
   if (!mixedSpaceFitTextOutsideScope(
     segs.map((segment) => ('text' in segment ? segment.text : undefined)),
-    environment.autoSpaceDE,
-    environment.autoSpaceDN,
   )) return;
   for (const segment of segs) {
-    if ('text' in segment) segment.mixedSpaceAverageWidthRatio = undefined;
+    if (!('text' in segment)) continue;
+    segment.mixedSpaceAverageWidthRatio = undefined;
+    segment.autoSpaceCompressible = undefined;
   }
 }
 
@@ -1044,22 +1025,11 @@ function pushSegmentPiece(
 ): void {
   const {
     base,
-    joinPreviousRun,
     environment,
-    segs,
-    selectedMetric,
-    selectedAverageWidth,
     r,
-    effectiveVertAlign,
-    effectivePosition,
-    effectiveCharacterSpacing,
     documentCharacterCompressionApplies,
     effectiveCharacterScale,
     effectiveKerningThreshold,
-    effectiveSnapToGrid,
-    ruby,
-    revision,
-    fitTextFragmentEntryIndex,
     fitTextRegionIndex,
     csFontSize,
     csFontFamily,
@@ -1067,12 +1037,6 @@ function pushSegmentPiece(
     csBold,
     csItalic,
     eaFontFamily,
-    digitsAsAN,
-    sourceRunIndex,
-    sourceFragmentIndex,
-    hyperlink,
-    rtl,
-    overflowPunctuationEastAsianRun,
   } = emissionState;
 
   // Consume an exact range of the immutable full display run. A parent
@@ -1311,12 +1275,8 @@ function emitResolvedTextSegment(
     csFontSize,
     csFontFamily,
     highAnsiFontFamily,
-    csBold,
-    csItalic,
     eaFontFamily,
     digitsAsAN,
-    sourceRunIndex,
-    sourceFragmentIndex,
     hyperlink,
     rtl,
     overflowPunctuationEastAsianRun,
@@ -1460,9 +1420,15 @@ function emitResolvedTextSegment(
   // exact spacing instead suppresses it.
   const naturalMetricAllowed = environment.lineSpacing?.rule !== 'exact';
   const { resourceMetric: resourceFamilyLineMetric, referenceMetric: referenceLineMetric,
-    lineMetric: familyLineMetric } = selectedFontLineMetric(resolvedSpan?.font, localFont, naturalMetricAllowed);
-  const { resourceMetric: resourceEaLineMetric, referenceMetric: referenceEaLineMetric,
-    lineMetric: eaLineMetric } = selectedFontLineMetric(eaResolution, localEaFloor, naturalMetricAllowed);
+    lineMetric: familyLineMetric } = selectedFontLineMetric(resolvedSpan?.font, localFont, naturalMetricAllowed,
+      allowsReferenceFontMetric(indexedFontMetrics(environment.layoutServices?.text.fontMetrics
+        ?? environment.layoutServices?.text.localMetrics ?? {}), resolvedSpan?.font),
+      environment.layoutServices ? { text: environment.layoutServices.text, probe: text } : undefined);
+  // LIBRARY_SYNTHESIZED_FACE_LINE_GEOMETRY does not extend to the East Asian
+  // floor of a run painted in another slot (see that rule's scope).
+  const { lineMetric: eaLineMetric } = selectedFontLineMetric(eaResolution, localEaFloor, naturalMetricAllowed,
+      allowsReferenceFontMetric(indexedFontMetrics(environment.layoutServices?.text.fontMetrics
+        ?? environment.layoutServices?.text.localMetrics ?? {}), eaResolution));
   const resolvedEaFloorFamily =
     eaResolution?.resolvedFamily ?? localEaFloor?.family ?? eaFontFamily;
   // WORD_USE_FE_LAYOUT_INHERITED_GRID_MINIMUM was observed for an active
@@ -1478,6 +1444,13 @@ function emitResolvedTextSegment(
     resolvedSpan?.script ??
     authoritativeSpan?.script ??
     (cs ? 'complexScript' : EAST_ASIAN_RE.test(text) ? 'eastAsia' : 'ascii');
+  // WORD_LATIN_INTERWORD_XAVG_FLOOR is independent of glyph kerning
+  // (§17.3.2.19) and enableOpenTypeFeatures. Windows Word 16.0.20430
+  // mode-14 controls vary both switches, MS PMincho/Times New Roman,
+  // linesAndChars/lines/no grid and 100/105/110pt widths (72 cases).
+  // Retaining the existing half-xAvg space floor recovers the 105pt fits;
+  // the four Times New Roman linesAndChars 100pt fits remain unexplained
+  // and do not justify a broader percentage allowance or a lower floor.
   const latinSpaceCompressionEligible =
     environment.characterSpacingControl === 'compressPunctuation' &&
     // MS-OE376 §2.1.472 requires full advance for fit with this
@@ -1494,16 +1467,12 @@ function emitResolvedTextSegment(
     effectiveVertAlign == null &&
     (effectiveCharacterSpacing == null || effectiveCharacterSpacing === 0) &&
     (effectiveCharacterScale == null || effectiveCharacterScale === 1) &&
-    // WORD_LATIN_INTERWORD_XAVG_FLOOR retains its existing OpenType gate;
-    // threshold authority must not widen this separate fit policy's scope.
-    // Evidence gap: disabling implicit/zero kerning exposes justified fitting
-    // losses in mode-15 zero/absent-threshold controls, and mode-14 space fitting
-    // remains unresolved. Preserve this fit gate pending the separate justified
-    // compression correction; do not infer an allowance from pair advances or
-    // apply a font-specific scale. Positive-threshold fit contradictions likewise
-    // do not establish a different shaping-table or kerning-switch rule.
-    environment.enableOpenTypeFeatures !== true &&
-    effectiveKerningThreshold == null;
+    // The switch independence above is measured for compatibilityMode 14
+    // only. Other modes keep the earlier OpenType/kerning exclusion until
+    // Windows controls cover them (a mode-15 homogeneous control kept
+    // natural spaces; word-space-fit-controls.json).
+    (environment.compatibilityMode === 14 ||
+      (environment.enableOpenTypeFeatures !== true && effectiveKerningThreshold == null));
   const latinSpaceAverageWidthRatio = latinSpaceCompressionEligible
     ? selectedAverageWidth(resolvedSpan?.font, text)
     : undefined;
@@ -1557,10 +1526,12 @@ function emitResolvedTextSegment(
     fontFamily: resolvedSpan?.font.resolvedFamily ?? localFont?.family ?? fontFamily,
     authoredFontFamily: resolvedSpan?.font.requestedFamily ?? fontFamily,
     fontSource: resolvedSpan?.font.source,
+    ...(resolvedSpan?.font.installedFamily ? { fontInstalledFamily: true as const } : {}),
     authoredReferenceMetricAllowed: mayUseAuthoredReferenceVerticalMetric(resolvedSpan?.font),
     fontRoute: resolvedSpan?.fontRoute,
     resolvedLineHeightRatio: familyLineMetric?.lineHeightRatio,
-    resolvedLatinGridCellAllocation: referenceLineMetric?.farEastCodePage === false,
+    resolvedLatinGridCellAllocation: (resourceFamilyLineMetric?.farEastCodePage
+      ?? referenceLineMetric?.farEastCodePage) === false,
     ...(resourceFamilyLineMetric?.lineHeightRatio != null
       ? {
           resolvedResourceVerticalMetric: true as const,
@@ -1575,6 +1546,7 @@ function emitResolvedTextSegment(
           resolvedDesignDescentRatio: referenceLineMetric.designDescentRatio,
         }
       : {}),
+    ...admittedFaceDecoration(resolvedSpan?.font, referenceLineMetric != null),
     resolvedEastAsianLineHeightRatio: familyLineMetric?.eastAsianLineHeightRatio,
     ...(latinSpaceAverageWidthRatio != null && latinSpaceAverageWidthRatio > 0
       ? { latinSpaceAverageWidthRatio, latinSpaceCompressionEligible: true as const }
@@ -1674,8 +1646,8 @@ function appendRunsToSegments(
   segmentBuildContext: SegmentBuildContext,
   selectedMetric: SegmentBuildContext['selectedMetric'],
 ): void {
-  // A native reserved-separator paragraph holds only text-free metric
-  // participants; coalescing them would drop a participant's own CHPX.
+  // A reserved-separator paragraph holds only text-free metric
+  // participants; coalescing them would drop a participant's own properties.
   const sequences = runs.some((run) => run.type === 'text'
     && (run as ParagraphTextBearingRun).noteSeparatorCharacter !== undefined)
     ? new Map<number, never>()
@@ -1721,7 +1693,7 @@ function appendRunsToSegments(
         continue;
       }
       if ((run as ParagraphTextBearingRun).noteSeparatorCharacter !== undefined) {
-        // MS-DOC 2.3.3 reserved separator character: the U+0003/U+0004 rule
+        // Reserved separator character: the U+0003/U+0004 rule
         // control or its story's content paragraph mark. Neither has a glyph
         // here; the rule ink is retained separately. As for a suppressed note
         // mark, a bounded Latin probe resolves the run's own four font slots
@@ -1778,6 +1750,11 @@ function appendRunsToSegments(
             if (!('text' in segment)) throw new Error('A note metric probe lost its text authority');
             segment.text = '';
             segment.metricOnly = true;
+            // An absent authored face (native CSS fallback) has no selected-face
+            // metric, so the host's vertical box comes from its painting face.
+            // Every present face (embedded, local, substitute, CSS, Google)
+            // keeps its established metric-only behaviour.
+            if (segment.fontSource === 'native' && segment.fontInstalledFamily !== true) segment.metricProbeText = 'x';
             segment.sourceRunIndex = runIndex;
             if (segment.textShapeRequest) {
               segment.textShapeRequest = Object.freeze(independentTextShapeRequest(segment.textShapeRequest, ''));
@@ -1908,6 +1885,8 @@ function appendRunsToSegments(
         anchorXFromMargin: false,
         anchorYFromPara: false,
         inlineShape: true,
+        ...(run.inlineOffsetXPt ? { inlineOffsetXPt: run.inlineOffsetXPt } : {}),
+        ...(run.inlineOffsetYPt ? { inlineOffsetYPt: run.inlineOffsetYPt } : {}),
         measuredWidth: 0,
       });
     } else if (run.type === 'unavailableDrawing') {
@@ -2014,6 +1993,11 @@ function appendRunsToSegments(
         naturalMetricAllowed || localFont?.designAscentRatio == null ? localFont : undefined;
       const referenceMetric =
         naturalMetricAllowed && !resourceMetric && mayUseAuthoredReferenceVerticalMetric(selected)
+          && allowsReferenceFontMetric(indexedFontMetrics(environment.layoutServices?.text.fontMetrics
+            ?? environment.layoutServices?.text.localMetrics ?? {}), selected)
+          // LIBRARY_SYNTHESIZED_FACE_LINE_GEOMETRY covers measured text
+          // spans and paragraph marks only; an anchor host is outside its
+          // evidence, so only an exact catalogued tuple lends its geometry.
           ? referenceFontLineMetrics(selected.requestedFamily, weight, style)
           : undefined;
       const familyLineMetric = resourceMetric ?? referenceMetric;
@@ -2047,6 +2031,7 @@ function appendRunsToSegments(
               resolvedDesignDescentRatio: referenceMetric.designDescentRatio,
             }
           : {}),
+        ...admittedFaceDecoration(selected, referenceMetric != null),
         resolvedEastAsianLineHeightRatio: familyLineMetric?.eastAsianLineHeightRatio,
         vertAlign: null,
         measuredWidth: 0,
@@ -2138,4 +2123,23 @@ function projectNoBreakRanges(runs: readonly ParagraphLayoutRun[], segs: LayoutS
       displayedCursor = segmentEnd;
     }
   }
+}
+
+/** The catalogued face's underline / strikethrough geometry when the run
+ * paints with that face: an Office-local face loaded for its exact catalogued
+ * tuple, a native installed family, or a face whose reference vertical
+ * geometry was admitted (for a proven synthesized style, the regular face it
+ * is drawn from: LIBRARY_SYNTHESIZED_FACE_LINE_GEOMETRY). Other faces keep
+ * the glyph-probe geometry. */
+function admittedFaceDecoration(
+  font: FontResolution | undefined,
+  referenceAdmitted: boolean,
+): { referenceFontDecoration?: FontDecorationGeometry } {
+  if (!font) return {};
+  const officeLocal = font.source === 'local' && font.resourceIdentity?.startsWith('office-local:') === true;
+  const nativeInstalled = font.source === 'native' && font.installedFamily === true;
+  if (!officeLocal && !nativeInstalled && !referenceAdmitted) return {};
+  const geometry = referenceFontDecorationMetrics(font.requestedFamily, font.weight, font.style)
+    ?? (referenceAdmitted ? referenceFontDecorationMetrics(font.requestedFamily, 400, 'normal') : undefined);
+  return geometry ? { referenceFontDecoration: geometry } : {};
 }

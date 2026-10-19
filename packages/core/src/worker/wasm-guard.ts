@@ -1,3 +1,4 @@
+import { withWasmResourceErrors } from './error-wire.js';
 import { RuntimeGeneration } from '../internal/runtime-generation.js';
 
 export type WasmTrapErrorCode = 'parser-crashed';
@@ -134,7 +135,7 @@ export class WasmParserHost<TArchive = unknown> {
   }
 
   run<TResult>(operation: () => TResult): TResult {
-    return this.runtime.run(operation);
+    return withWasmResourceErrors(() => this.runtime.run(operation));
   }
 
   poison(): void {

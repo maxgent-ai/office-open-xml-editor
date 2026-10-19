@@ -1,5 +1,5 @@
-import { afterEach, describe, expect, it } from 'vitest';
-import {
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+let {
   containsSeaScript,
   fitSeaWordPrefix,
   graphemeClusterOffsets,
@@ -7,15 +7,28 @@ import {
   isGraphemeFillText,
   isSeaGraphemeExtend,
   isSeaScriptCodePoint,
-  resetSeaSegmenterForTest,
   seaMixedBreakOffsets,
   seaTransitionOffsets,
   seaWordBreakOffsets,
-  setSeaWordSegmenterForTest,
-} from './sea-break.js';
+} = await import('./sea-break.js');
 import { DEFAULT_KINSOKU_RULES } from './kinsoku/rules.js';
 
-afterEach(() => resetSeaSegmenterForTest());
+beforeEach(async () => {
+  vi.resetModules();
+  ({ containsSeaScript, fitSeaWordPrefix, graphemeClusterOffsets, isDictionarySeaText,
+    isGraphemeFillText, isSeaGraphemeExtend, isSeaScriptCodePoint, seaMixedBreakOffsets,
+    seaTransitionOffsets, seaWordBreakOffsets } = await import('./sea-break.js'));
+});
+afterEach(() => vi.restoreAllMocks());
+
+function mockWords(segment: (span: string) => Iterable<{ index: number; isWordLike?: boolean }>): void {
+  const Native = Intl.Segmenter;
+  vi.spyOn(Intl, 'Segmenter').mockImplementation(function (locale, options) {
+    return options?.granularity === 'word'
+      ? { segment } as Intl.Segmenter
+      : new Native(locale, options);
+  });
+}
 
 describe('isSeaScriptCodePoint', () => {
   const cases: [number, boolean][] = [
@@ -229,14 +242,14 @@ describe('seaWordBreakOffsets — grapheme-fill (Myanmar / Tibetan, #961)', () =
   });
 });
 
-describe('seaWordBreakOffsets — graceful fallback + filtering (injected segmenter)', () => {
+describe('seaWordBreakOffsets — graceful fallback + filtering (mocked Intl.Segmenter)', () => {
   it('returns [] when the segmenter is unavailable', () => {
-    setSeaWordSegmenterForTest(null);
+    vi.spyOn(Intl, 'Segmenter').mockImplementation(function () { throw new Error('unavailable'); });
     expect(seaWordBreakOffsets('ภาษาไทยเป็นภาษา')).toEqual([]);
   });
 
   it('returns [] when segmentation throws', () => {
-    setSeaWordSegmenterForTest(() => {
+    mockWords(() => {
       throw new Error('boom');
     });
     expect(seaWordBreakOffsets('ภาษาไทยเป็นภาษา')).toEqual([]);
@@ -245,7 +258,7 @@ describe('seaWordBreakOffsets — graceful fallback + filtering (injected segmen
   it('excludes non-word (punctuation) segment starts, keeps word starts', () => {
     // Fake: split the span into fixed segments; one is punctuation (isWordLike:false).
     // span "AAAA.BBBB" (all treated as one SEA span by the test text below).
-    setSeaWordSegmenterForTest((span) => {
+    mockWords(() => {
       // segment boundaries at 0 (word), 4 (punct '.'), 5 (word)
       return [
         { index: 0, isWordLike: true },
@@ -507,6 +520,42 @@ describe('graphemeClusterOffsets', () => {
     const offsets = graphemeClusterOffsets(text);
     // Exactly one interior boundary, between the two clusters (after index 2).
     expect(offsets).toEqual([2]);
+  });
+  it('matches the extended-grapheme segmenter for Latin-1 text, including CR LF and controls', () => {
+    const native = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+    const expected = (text: string) => [...native.segment(text)].map((part) => part.index).filter((index) => index > 0);
+    // Every ordered pair of Basic Latin / Latin-1 Supplement code units covers
+    // each rule that can apply inside the range (GB3 CR × LF, GB4/GB5 around
+    // controls and the soft hyphen, GB999 elsewhere).
+    for (let first = 0; first <= 0xff; first += 1) {
+      for (let second = 0; second <= 0xff; second += 1) {
+        const text = String.fromCharCode(first, second);
+        expect(graphemeClusterOffsets(text)).toEqual(expected(text));
+      }
+    }
+    for (const text of ['', 'a', 'Caf\u00e9 cr\u00e8me', 'one\r\ntwo\r\n\r\n', '\r\r\n\n', 'x\u00ad\ty']) {
+      expect(graphemeClusterOffsets(text)).toEqual(expected(text));
+    }
+  });
+  it('matches the segmenter across the CJK and kana fast-path ranges', () => {
+    const native = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+    const expected = (text: string) => [...native.segment(text)].map((part) => part.index).filter((index) => index > 0);
+    const ranges = [[0x3000, 0x303f], [0x3041, 0x30ff], [0x3400, 0x4dbf], [0x4e00, 0x9fff], [0xff01, 0xff9f]];
+    for (const [first, last] of ranges) {
+      for (let code = first; code <= last; code += 1) {
+        // `a c a c c` exposes every UAX #29 rule that could join c to a
+        // neighbour: Extend/ZWJ/SpacingMark (a c), Prepend (c a), and Hangul
+        // jamo or Regional_Indicator pairs (c c). Characters outside the fast
+        // path (U+302A..U+302F, U+3099..U+309A, U+FF9E..U+FF9F) take the
+        // segmenter and must still match it.
+        const c = String.fromCharCode(code);
+        const text = `a${c}a${c}${c}`;
+        expect(graphemeClusterOffsets(text)).toEqual(expected(text));
+      }
+    }
+    for (const text of ['\u65e5\u672c\u8a9e\u3002', '\u304b\u3099\u304d', '\uff76\uff9e\uff77\uff9e', '\u6f22\r\n\u304b', '\u301c\u300c\u5f15\u300d']) {
+      expect(graphemeClusterOffsets(text)).toEqual(expected(text));
+    }
   });
   it('returns interior offsets only (excludes 0 and length)', () => {
     const offsets = graphemeClusterOffsets('abc');

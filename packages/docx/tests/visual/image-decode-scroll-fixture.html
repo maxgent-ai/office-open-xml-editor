@@ -81,7 +81,7 @@
             maxChannelDelta: closest.maxChannelDelta,
             canvasWidth: closest.canvas.width,
             canvasHeight: closest.canvas.height,
-            mountedPages: viewer.mountedPageIndicesForTest(),
+            mountedPages: [...viewer._slots.keys()],
           };
         }
       }
@@ -113,7 +113,11 @@
         }
         const pages = [];
         for (let index = 0; index < expectations.length; index += 1) {
-          pages.push(await waitForPageColor(host, viewer, index, expectations[index]));
+          try {
+            pages.push(await waitForPageColor(host, viewer, index, expectations[index]));
+          } catch (error) {
+            throw new Error(`${mode}: ${error.message}; viewer errors: ${JSON.stringify(errors)}`);
+          }
         }
         await nextFrame();
         await new Promise((resolve) => setTimeout(resolve, 0));

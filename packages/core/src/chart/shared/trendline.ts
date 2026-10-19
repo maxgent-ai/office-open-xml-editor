@@ -25,7 +25,7 @@ export interface TrendlineLabelContext {
 }
 
 
-export function compactTrendlineNumber(value: number, formatCode?: string | null): string {
+function compactTrendlineNumber(value: number, formatCode?: string | null): string {
   if (formatCode && formatCode.trim().toLowerCase() !== 'general') {
     return formatChartValWithCode(value, formatCode);
   }
@@ -33,7 +33,7 @@ export function compactTrendlineNumber(value: number, formatCode?: string | null
 }
 
 
-export function generatedTrendlineLabel(
+function generatedTrendlineLabel(
   tl: ChartTrendline,
   stats: ReturnType<typeof linearTrendlineStats>,
   sourceFormatCode?: string | null,
@@ -55,7 +55,7 @@ export function generatedTrendlineLabel(
 }
 
 
-export function drawTrendlineLabel(
+function drawTrendlineLabel(
   ctx: CanvasRenderingContext2D,
   tl: ChartTrendline,
   stats: ReturnType<typeof linearTrendlineStats>,

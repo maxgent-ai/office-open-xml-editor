@@ -1,3 +1,4 @@
+import { OoxmlDecodedImageLimitError } from '@silurus/ooxml-core';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { excludeEmbeddedFontFamilies, loadEmbeddedFonts, uncoveredOfficeFontRequests } from './embedded-fonts.js';
 import type { PptxEmbeddedFontRef } from './worker-protocol';
@@ -154,4 +155,11 @@ describe('loadEmbeddedFonts (ECMA-376 §19.2.1.9 / §15.2.13)', () => {
       { family: 'Calibri', weight: 700, style: 'normal' },
     ]);
   });
+});
+
+it('preserves other typed resource-limit errors instead of treating them as malformed fonts', async () => {
+  const error = new OoxmlDecodedImageLimitError('active-decoded-bytes', 1, 2);
+  await expect(loadEmbeddedFonts([{
+    fontName: 'Limited', style: 'regular', partPath: 'font.ttf', contentType: 'application/x-font-ttf',
+  }], async () => { throw error; })).rejects.toBe(error);
 });

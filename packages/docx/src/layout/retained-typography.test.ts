@@ -80,6 +80,48 @@ describe('retained typography geometry', () => {
     });
   });
 
+  // Windows Word 16.0.20430 (#1896 controls), Arial at 48 pt: single
+  // underline 5.04..8.52 below the baseline, thick 2.52..6.72, strike
+  // 12.48..10.08 above, double strike 14.88..12.48 and 10.08..7.68.
+  describe('with the face rule (Arial post / OS/2)', () => {
+    const geometry = {
+      underlineTopEm: 217 / 2048, underlineThicknessEm: 150 / 2048,
+      strikeTopEm: -530 / 2048, strikeThicknessEm: 102 / 2048,
+    };
+    const base = { ascentPt: 43, descentPt: 10, inkBounds: { xMinPt: 0, xMaxPt: 40, ascentPt: 34, descentPt: 10 } };
+    const probe = { ascentPt: 2, descentPt: 2 };
+    const at = (input: Partial<Parameters<typeof retainedTextDecorations>[0]>) => retainedTextDecorations({
+      origin: { xPt: 0, yPt: 100 }, advancePt: 40, base, color: '#000000',
+      fontRule: { geometry, sizePt: 48 }, ...input,
+    });
+    // Word's PDF positions sit on a 0.12 pt grid.
+    const band = (d: { widthPt: number; from: { yPt: number } }) =>
+      [d.from.yPt - d.widthPt / 2 - 100, d.from.yPt + d.widthPt / 2 - 100];
+
+    it('draws the single underline through descenders at the face rule', () => {
+      const [u] = at({ underline: { authoredStyle: 'single', color: '#000000', probe } });
+      const [top, bottom] = band(u!);
+      expect(Math.abs(top - (5.04))).toBeLessThan(0.13);
+      expect(Math.abs(bottom - (8.52))).toBeLessThan(0.13);
+    });
+
+    it('draws a thick underline from half the offset to the single rule centre', () => {
+      const [u] = at({ underline: { authoredStyle: 'thick', color: '#000000', probe } });
+      const [top, bottom] = band(u!);
+      expect(Math.abs(top - (2.52))).toBeLessThan(0.13);
+      expect(Math.abs(bottom - (6.72))).toBeLessThan(0.13);
+    });
+
+    it('draws single and double strikes around the face strikeout', () => {
+      const [single] = at({ strike: { double: false, probe } });
+      expect(Math.abs(band(single!)[0] - (-12.48))).toBeLessThan(0.13);
+      expect(Math.abs(band(single!)[1] - (-10.08))).toBeLessThan(0.13);
+      const [upper, lower] = at({ strike: { double: true, probe } });
+      expect(Math.abs(band(upper!)[0] - (-14.88))).toBeLessThan(0.13);
+      expect(Math.abs(band(lower!)[1] - (-7.68))).toBeLessThan(0.13);
+    });
+  });
+
   it('omits absent optional authored underline style from the canonical retained node', () => {
     const [underline] = retainedTextDecorations({
       origin: { xPt: 5, yPt: 10 }, advancePt: 20,

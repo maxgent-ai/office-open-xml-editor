@@ -1,9 +1,9 @@
 type SelectionAutoScrollMode = 'cells' | 'rows' | 'cols' | 'all';
 
 /** Width of the viewport-edge activation band in CSS pixels. */
-export const SELECTION_AUTO_SCROLL_EDGE_PX = 40;
+const SELECTION_AUTO_SCROLL_EDGE_PX = 40;
 /** Maximum logical viewport speed while drag-selecting outside an edge. */
-export const SELECTION_AUTO_SCROLL_MAX_PX_PER_SECOND = 900;
+const SELECTION_AUTO_SCROLL_MAX_PX_PER_SECOND = 900;
 
 export interface SelectionAutoScrollPoint {
   readonly x: number;

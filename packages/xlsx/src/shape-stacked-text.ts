@@ -1,9 +1,8 @@
 import {
-  layoutStackedText, STACKED_CELL_FACTOR, stackedFaceBox, stackedCellBoxOverride,
-  stackedSidewaysCharacter, stackedVerticalGlyph,
+  layoutStackedText, paintStackedRotated, paintStackedVerticalForm, STACKED_CELL_FACTOR, stackedClusters,
+  stackedFaceBox, stackedUprightBaseline, stackedVerticalGlyphText,
   type DrawingMlInputRun, type DrawingMlTextRect, type StackedGlyph, type StackedParagraph,
 } from '@silurus/ooxml-core/internal/drawingml-text';
-import { graphemeClusterOffsets, verticalFormSubstitute, verticalBracketFormSubstitute } from '@silurus/ooxml-core';
 import { excelShapeSpacing } from './shape-office-line.js';
 import type { ShapeText, ShapeTextRun } from './types.js';
 
@@ -15,7 +14,7 @@ export interface StackedEquation {
 }
 
 type Style = { equation?: StackedEquation; font: string; px: number; face?: string; color: string; spacing: number; bold: boolean; italic: boolean };
-type Glyph = StackedGlyph<Style> & { cell: number; ascent: number; descent: number };
+type Glyph = StackedGlyph<Style> & { cell: number; ascent: number; descent: number; nominal?: true };
 
 /**
  * ECMA-376 §20.1.10.83: letters stacked top-to-bottom; Rtl reverses columns.
@@ -23,8 +22,9 @@ type Glyph = StackedGlyph<Style> & { cell: number; ascent: number; descent: numb
  * Issue #1668 Excel controls measured unequal Arial 24 pt baseline gaps
  * 26.16, 25.92, 22.08, 20.88, 26.16 pt, and Yu Gothic 24 pt gaps
  * 33.84, 34.08, 32.88, 34.08, 30.96, 33.12 pt. The shared 7/6 face-cell
- * metrics and overrides are PowerPoint observations, not an Excel fidelity
- * claim. Glyph metrics, vertical forms and shaping follow the available font.
+ * factor comes from PowerPoint observations; the face box always comes from
+ * font tables (see core stacked-faces.ts). This is not an Excel fidelity claim.
+ * Glyph metrics, vertical forms and shaping follow the available font.
  * Excel's PDF clips at the worksheet print region, not at each shape: keep
  * overflow for the caller's worksheet/viewport clip (no added body clip).
  * OMML uses an atomic upright box from the existing equation renderer; its
@@ -48,23 +48,12 @@ export function drawShapeStackedText(
     // fallback when that engine does not expose font-box metrics.
     const ascent = box ? box.ascent * style.px : probe?.fontBoundingBoxAscent ?? style.px;
     const descent = box ? box.descent * style.px : probe?.fontBoundingBoxDescent ?? 0;
-    const override = stackedCellBoxOverride(style.face ?? '');
-    const cell = STACKED_CELL_FACTOR * (override !== undefined ? override * style.px : ascent + descent);
-    const ends = [...graphemeClusterOffsets(text), text.length];
-    let start = 0;
-    const glyphs: Glyph[] = [];
-    for (const end of ends) {
-      const ch = text.slice(start, end);
-      start = end;
-      if (!ch) continue;
-      const cp = ch.codePointAt(0) ?? 0;
-      const kind = !stackedSidewaysCharacter(cp) ? 'upright'
-        : stackedVerticalGlyph(style.face ?? '', cp) ? 'verticalGlyph' : 'rotated';
-      const advance = kind === 'upright' ? cell : kind === 'verticalGlyph' ? style.px : ctx.measureText(ch).width;
-      glyphs.push({ text: ch, style, kind, advance: advance + style.spacing,
-        thickness: cell, space: ch === ' ', cell, ascent, descent });
-    }
-    return glyphs;
+    const cell = STACKED_CELL_FACTOR * (ascent + descent);
+    const face = { family: style.face ?? '', bold: style.bold, italic: style.italic };
+    return stackedClusters(text, face, {
+      upright: cell, verticalGlyph: style.px, rotated: (ch) => ctx.measureText(ch).width,
+    }).map(({ text: ch, kind, advance, nominal }) => ({ text: ch, style, kind, advance: advance + style.spacing,
+      thickness: cell, space: ch === ' ', cell, ascent, descent, ...(nominal ? { nominal } : {}) }));
   };
   const sameStyle = (a: Style, b: Style) => !a.equation && !b.equation && a.font === b.font && a.color === b.color && a.spacing === b.spacing;
   const paragraphs: StackedParagraph<Style>[] = body.paragraphs.map((para) => {
@@ -134,24 +123,16 @@ export function drawShapeStackedText(
     ctx.fillStyle = glyph.style.color;
     ctx.textAlign = 'center';
     ctx.textBaseline = 'alphabetic';
+    // The face box is held in px here: paint geometry takes size 1.
     if (glyph.kind === 'upright') {
-      ctx.fillText(glyph.text, glyph.axisX, glyph.cellTop + glyph.cell - glyph.descent);
+      ctx.fillText(glyph.text, glyph.axisX, stackedUprightBaseline(glyph.cellTop, glyph.cell, glyph, 1));
     } else {
-      const cp = glyph.text.codePointAt(0) ?? 0;
-      const form = glyph.kind === 'verticalGlyph' && glyph.text === String.fromCodePoint(cp)
-        ? verticalFormSubstitute(cp) ?? verticalBracketFormSubstitute(cp) : null;
-      if (form !== null) {
-        ctx.textAlign = 'left';
-        ctx.fillText(String.fromCodePoint(form), glyph.axisX - (glyph.ascent + glyph.descent) / 2,
-          glyph.cellTop + glyph.ascent);
-      } else {
-        ctx.save();
-        ctx.translate(glyph.axisX - (glyph.ascent - glyph.descent) / 2, glyph.cellTop);
-        ctx.rotate(Math.PI / 2);
-        ctx.textAlign = 'left';
-        ctx.fillText(glyph.text, 0, 0);
-        ctx.restore();
-      }
+      // Library policy: a vertical glyph without a presentation form turns
+      // like a rotated one from the cell top (PPTX centres it in its 1 em
+      // cell instead; the PowerPoint controls do not cover Excel).
+      const form = glyph.kind === 'verticalGlyph' ? stackedVerticalGlyphText(glyph) : null;
+      if (form !== null) paintStackedVerticalForm(ctx, form, glyph.axisX, glyph.cellTop, glyph, 1);
+      else paintStackedRotated(ctx, glyph.text, glyph.axisX, glyph.cellTop, glyph, 1);
     }
   }
   ctx.restore();

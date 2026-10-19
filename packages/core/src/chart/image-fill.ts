@@ -1,8 +1,13 @@
+import { assertChartImageWork, rejectChartImageGeometry } from './image-fill-errors.js';
+import { OoxmlError } from '../errors/ooxml-error.js';
 import type { ImageFill } from '../types/common.js';
 import type {
   ChartDataPointOverride, ChartExElementStyle, ChartModel, ChartSeries, ChartStockBarPaint,
 } from '../types/chart.js';
-import { drawImageCropped, imageNaturalSize, srcRectHasVisibleArea } from '../image/crop.js';
+import { drawImageCropped, imageNaturalSize, srcRectHasVisibleArea, stretchedSourceFrame } from '../image/crop.js';
+import { imageEffectFrame, imageEffectOutsetPeriods } from '../image/image-effect-frame.js';
+import type { BlipPixelEffects } from '../image/blip-effects.js';
+import type { Duotone } from '../image/duotone.js';
 import { fillCanProduceVisiblePixels } from '../shape/paint.js';
 import { EMU_PER_PT, PT_TO_PX } from '../units.js';
 import { boxWhiskerDotCandidateCount, computeBoxWhiskerStats } from './box-whisker.js';
@@ -62,6 +67,7 @@ import {
 import { effectiveLegendFrameFill } from './legend-frame.js';
 import { applyPlotVisibleOnly } from './source-visibility.js';
 import { withActiveChartImageFillPainter } from './image-fill-context.js';
+import { chartImageTilePhase } from './image-fill-geometry.js';
 import {
   visitChartExHierarchyBodySites,
   visitChartExHierarchyLabelSites,
@@ -81,7 +87,20 @@ const SURFACE_PICTURE_FAMILIES = new Set([
   'surface', 'surface3D',
 ]);
 
-export type ChartImageLookup = (fill: ImageFill) => CanvasImageSource | null | undefined;
+/** Full source frame (points) of one rendered occurrence of a stretched
+ * chart picture fill whose CT_Blip chain is measured in physical units. */
+export interface ChartFillRenderedSize {
+  readonly widthPt: number;
+  readonly heightPt: number;
+}
+
+/** Synchronous decoded-source lookup. `occurrence` is present when the fill's
+ * effect output depends on the rendered size (see chartImageFillOccurrence);
+ * work estimators omit it and accept any prepared occurrence. */
+export type ChartImageLookup = (
+  fill: ImageFill,
+  occurrence?: ChartFillRenderedSize,
+) => CanvasImageSource | null | undefined;
 
 /** Stable document-cache key for one decoded chart picture source. */
 export function chartImageFillKey(fill: ImageFill): string {
@@ -90,7 +109,182 @@ export function chartImageFillKey(fill: ImageFill): string {
     fill.svgImagePath ?? null,
     fill.duotone?.clr1 ?? null,
     fill.duotone?.clr2 ?? null,
+    // The ordered CT_Blip chain and its source sampling (fill DPI, see
+    // chartImageFillPixelTransform) are part of the decoded identity
+    // (structural, so no delimiter can alias two recipes).
+    fill.blipEffects?.length ? [fill.blipEffects, chartImageFillEffectDpi(fill)] : null,
   ]);
+}
+
+// Effect kinds whose output depends on the physical frame: EMU radii,
+// distances and offsets (§20.1.8.15/.32/.49/.50/.52/.53/.61) and nested
+// image fills mapped onto the frame. Pointwise effects are size-independent.
+const FRAME_DEPENDENT_EFFECTS = new Set([
+  'blur', 'softEdge', 'glow', 'shadow', 'presetShadow', 'reflection', 'transform', 'alphaOutset',
+]);
+
+function chainDependsOnFrame(effects: readonly unknown[], depth = 0): boolean {
+  // The parser bounds recipe depth with the shared effect-step ledger.
+  if (depth > 64) return true;
+  for (const effect of effects as readonly Record<string, unknown>[]) {
+    const type = effect?.type;
+    if (typeof type !== 'string') continue;
+    if (FRAME_DEPENDENT_EFFECTS.has(type)) return true;
+    if ((type === 'fill' || type === 'fillOverlay')
+      && (effect.fill as { fillType?: string } | undefined)?.fillType === 'image') return true;
+    const container = effect.container as { effects?: unknown[] } | undefined;
+    if (container?.effects && chainDependsOnFrame(container.effects, depth + 1)) return true;
+    const containers = effect.containers as Array<{ effects?: unknown[] }> | undefined;
+    if (containers?.some(c => c?.effects && chainDependsOnFrame(c.effects, depth + 1))) return true;
+  }
+  return false;
+}
+
+/** Whether a fill's effect output depends on each rendered size. A stretched
+ * fill maps its source onto every destination, so an EMU-measured chain
+ * (blur/shadow radius, offset) must be evaluated per occurrence, as Office
+ * applies it at the rendered size. A tiled fill samples at its DPI instead. */
+export function chartImageFillNeedsRenderedSize(fill: ImageFill): boolean {
+  return !fill.tile && !!fill.blipEffects?.length && chainDependsOnFrame(fill.blipEffects);
+}
+
+/** The occurrence a destination box of `widthPt`×`heightPt` represents: the
+ * full source frame after fillRect insets and the srcRect window
+ * (stretchedSourceFrame), quantized to six significant digits so identical
+ * layouts in the preparation and paint passes agree. Undefined for
+ * size-independent fills. */
+export function chartFillRenderedSize(
+  fill: ImageFill, widthPt: number, heightPt: number,
+): ChartFillRenderedSize | undefined {
+  if (!chartImageFillNeedsRenderedSize(fill)) return undefined;
+  const frame = stretchedSourceFrame(widthPt, heightPt, fill.srcRect, fill.fillRect);
+  // Six significant digits: stable across identical layouts in the
+  // preparation and paint passes, and never collapses a positive authored
+  // size to the loader's "unspecified" zero.
+  const quantize = (value: number) => Number(value.toPrecision(6));
+  if (![frame.width, frame.height].every(Number.isFinite)) rejectChartImageGeometry();
+  return { widthPt: quantize(frame.width), heightPt: quantize(frame.height) };
+}
+
+/** Decoded identity of one fill occurrence inside a host frame. */
+export function chartFillRenderedSizeKey(
+  fill: ImageFill, host?: ChartImageFillHost, occurrence?: ChartFillRenderedSize,
+): string {
+  const base = chartImageFillHostKey(fill, host);
+  return occurrence ? JSON.stringify([base, occurrence.widthPt, occurrence.heightPt]) : base;
+}
+
+/** A recorded occurrence request from a preparation pass. */
+export interface ChartFillRenderedSizeRequest {
+  readonly fill: ImageFill;
+  readonly occurrence: ChartFillRenderedSize;
+}
+
+/** Host store for prepared chart sources: an occurrence-keyed entry for each
+ * rendered size of a size-dependent fill, a plain entry otherwise. A lookup
+ * without an occurrence (work estimation) accepts any prepared occurrence. */
+export function chartImageFillStoreLookup(
+  store: ReadonlyMap<string, CanvasImageSource | null>,
+  host?: ChartImageFillHost,
+  /** Paint lookups (the default) reject an occurrence of a prepared fill
+   * that the preparation pass did not record; a further preparation round
+   * passes false to learn which occurrences are still missing. */
+  strict = true,
+): ChartImageLookup {
+  return (fill, occurrence) => {
+    if (!chartImageFillNeedsRenderedSize(fill)) return store.get(chartFillRenderedSizeKey(fill, host));
+    if (occurrence) {
+      const exact = store.get(chartFillRenderedSizeKey(fill, host, occurrence));
+      if (exact !== undefined) return exact;
+      // A preparation round resolves exact canonical sizes only, so a
+      // near-equal size is decoded on its own physical frame.
+      if (!strict) return undefined;
+    }
+    // Work estimation (no occurrence) accepts any prepared size. A paint
+    // occurrence whose host frame arithmetic differs from the preparation
+    // pass by rounding selects the prepared size within 1% on both axes.
+    const prefix = `[${JSON.stringify(chartImageFillHostKey(fill, host))},`;
+    let prepared = false;
+    for (const [key, image] of store) {
+      if (!key.startsWith(prefix)) continue;
+      prepared = true;
+      if (!occurrence) { if (image) return image; continue; }
+      const [, w, h] = JSON.parse(key) as [string, number, number];
+      const near = (a: number, b: number) => Math.abs(a - b) <= Math.max(0.01, 0.01 * Math.max(a, b));
+      if (near(w, occurrence.widthPt) && near(h, occurrence.heightPt)) return image;
+    }
+    // A prepared fill painted at a size the preparation pass never recorded
+    // means the passes diverged; that is a typed failure, never an omission.
+    if (strict && prepared && occurrence) {
+      throw new OoxmlError('unsupported-image-effect', 'Chart picture occurrence was not prepared');
+    }
+    return undefined;
+  };
+}
+
+const preparationSources = new WeakSet<object>();
+
+/** Mark a placeholder returned by a preparation pass in place of a source
+ * whose decoded pixels (and so its frame metrics) are not known yet. */
+export function markChartFillPreparationSource(source: object): void {
+  preparationSources.add(source);
+}
+
+/** Whether `source` is a preparation placeholder without real frame metrics. */
+export function isChartFillPreparationSource(source: object): boolean {
+  return preparationSources.has(source);
+}
+
+function chartImageFillEffectDpi(fill: ImageFill): number {
+  return fill.dpi != null && fill.dpi > 0 ? fill.dpi : 96;
+}
+
+/** Orientation of the frame hosting a chart (e.g. a rotated/flipped PPTX
+ * graphic frame), against which page-fixed CT_Blip effects such as a
+ * `rotWithShape="0"` shadow are evaluated (§20.1.8.45/.49). */
+export interface ChartImageFillHost {
+  readonly rotation?: number;
+  readonly flipH?: boolean;
+  readonly flipV?: boolean;
+}
+
+/** Decode-time pixel transform of a chart picture fill: its ordered CT_Blip
+ * chain, or a lone duotone. A stretched fill whose chain is measured in
+ * physical units is evaluated per rendered occurrence (Office applies blur
+ * and shadow lengths at the rendered size): hosts pass the occurrence from
+ * the preparation pass and its frame as the loader's physical extent. Other
+ * chains (tiled fills, pointwise effects) are size-independent and sampled
+ * on the source grid at the fill DPI (blipFill@dpi, else 96 DPI; §20.1.8.58).
+ * The DPI is part of {@link chartImageFillKey}, the host orientation of
+ * {@link chartImageFillHostKey} and the occurrence of
+ * {@link chartFillRenderedSizeKey}. Hosts decode at native size. */
+export function chartImageFillPixelTransform(
+  fill: ImageFill,
+  host?: ChartImageFillHost,
+  occurrence?: ChartFillRenderedSize,
+): Duotone | BlipPixelEffects | null {
+  if (!fill.blipEffects?.length) return fill.duotone ?? null;
+  const orientation = {
+    hostRotation: fill.rotWithShape === false ? 0 : host?.rotation ?? 0,
+    hostFlipH: host?.flipH ?? false, hostFlipV: host?.flipV ?? false,
+  };
+  // A per-occurrence chain is sampled from the occurrence's physical frame,
+  // which hosts pass as widthPt/heightPt to the shared loader.
+  if (occurrence) return { effects: fill.blipEffects, duotone: fill.duotone ?? null, ...orientation };
+  const emuPerPixel = 914400 / chartImageFillEffectDpi(fill);
+  return {
+    effects: fill.blipEffects, duotone: fill.duotone ?? null, emuPerPixelX: emuPerPixel, emuPerPixelY: emuPerPixel,
+    ...orientation,
+  };
+}
+
+/** Decoded identity of a chart fill as painted inside a host frame. Plain and
+ * duotone fills are orientation-independent and keep {@link chartImageFillKey};
+ * an effect chain adds the effective host orientation as a tuple. */
+export function chartImageFillHostKey(fill: ImageFill, host?: ChartImageFillHost): string {
+  if (!fill.blipEffects?.length) return chartImageFillKey(fill);
+  return JSON.stringify([chartImageFillKey(fill),
+    fill.rotWithShape === false ? 0 : host?.rotation ?? 0, host?.flipH ?? false, host?.flipV ?? false]);
 }
 
 let activeLookup: ChartImageLookup | undefined;
@@ -150,6 +344,9 @@ interface TileGeometry extends ChartImageTileMetrics {
   columns: number;
   rows: number;
   repetitions: number;
+  /** Extra neighbour periods per side reached by an effect outset. */
+  padX: number;
+  padY: number;
 }
 
 interface ChartImageTileStaticMetrics {
@@ -166,6 +363,9 @@ interface ChartImageTileStaticMetrics {
 /** EG_FillModeProperties is a choice with no schema default. Exactly one
  * authored mode must be present; omitting it must not invent stretch. */
 function imageFillModeIsPaintable(fill: ImageFill): boolean {
+  for (const rect of [fill.srcRect, fill.fillRect]) {
+    if (rect && ![rect.l ?? 0, rect.t ?? 0, rect.r ?? 0, rect.b ?? 0].every(Number.isFinite)) rejectChartImageGeometry();
+  }
   return (fill.tile != null) !== (fill.stretch === true)
     && srcRectHasVisibleArea(fill.srcRect);
 }
@@ -183,7 +383,7 @@ function chartImageTileStaticMetrics(fill: ImageFill): ChartImageTileStaticMetri
     || !Number.isFinite(tx) || !Number.isFinite(ty)
     || !(dpi != null && Number.isFinite(dpi) && dpi > 0)
     || !(Number.isFinite(sx) && (sx as number) > 0)
-    || !(Number.isFinite(sy) && (sy as number) > 0)) return null;
+    || !(Number.isFinite(sy) && (sy as number) > 0)) rejectChartImageGeometry();
   return {
     alignment: algn,
     tx: tx as number,
@@ -198,9 +398,11 @@ function chartImageTileStaticMetrics(fill: ImageFill): ChartImageTileStaticMetri
 
 /** Return the synchronously preloaded source for a validated chart image fill.
  * Kept internal to chart modules; hosts still own all fetch/decode work. */
-export function chartImageFillSource(fill: ImageFill): CanvasImageSource | null {
-  if (!fillCanProduceVisiblePixels(fill) || !imageFillModeIsPaintable(fill)) return null;
-  return activeLookup?.(fill) ?? null;
+export function chartImageFillSource(
+  fill: ImageFill, occurrence?: ChartFillRenderedSize,
+): CanvasImageSource | null {
+  if (!imageFillModeIsPaintable(fill) || !fillCanProduceVisiblePixels(fill)) return null;
+  return activeLookup?.(fill, occurrence) ?? null;
 }
 
 /** Resolve the shared DrawingML tile size, offset, alignment and mirroring.
@@ -217,13 +419,17 @@ export function chartImageTileMetrics(
   // not expose, so that case also remains fail-closed.
   const authored = chartImageTileStaticMetrics(fill);
   if (!authored) return null;
-  const natural = imageNaturalSize(image);
+  // §20.1.8.58 repeats the authored picture frame. A spatial CT_Blip effect
+  // (blur grow, glow, shadow) enlarges the decoded grid around that frame;
+  // the outset overlaps neighbouring tiles but never changes the period.
+  const effectFrame = imageEffectFrame(image);
+  const natural = effectFrame ? { w: effectFrame.width, h: effectFrame.height } : imageNaturalSize(image);
   if (!(Number.isFinite(natural.w) && natural.w > 0)
-    || !(Number.isFinite(natural.h) && natural.h > 0)) return null;
+    || !(Number.isFinite(natural.h) && natural.h > 0)) rejectChartImageGeometry();
   const cssPixelsPerImagePixel = 96 / authored.dpi * (ptToPx / PT_TO_PX);
   const tileW = natural.w * authored.sx * cssPixelsPerImagePixel;
   const tileH = natural.h * authored.sy * cssPixelsPerImagePixel;
-  if (!(tileW > 0) || !(tileH > 0)) return null;
+  if (![tileW, tileH].every(v => Number.isFinite(v) && v > 0)) rejectChartImageGeometry();
   return {
     alignment: authored.alignment,
     tileW,
@@ -248,7 +454,10 @@ export function chartImageTileOrigin(
     metrics.tileW,
     metrics.tileH,
   );
-  return { x: anchor.x + metrics.offsetX, y: anchor.y + metrics.offsetY };
+  return {
+    x: chartImageTilePhase(anchor.x + metrics.offsetX, metrics.tileW, width, metrics.flipX),
+    y: chartImageTilePhase(anchor.y + metrics.offsetY, metrics.tileH, height, metrics.flipY),
+  };
 }
 
 function imageTileGeometry(
@@ -261,15 +470,19 @@ function imageTileGeometry(
   const metrics = chartImageTileMetrics(fill, image, ptToPx);
   if (!metrics) return null;
   const { tileW, tileH } = metrics;
-  const columns = Math.ceil(w / tileW) + 2;
-  const rows = Math.ceil(h / tileH) + 2;
+  // Neighbouring tiles whose effect outset reaches into the box are drawn and
+  // charged too; the authored period is unchanged.
+  const pad = imageEffectOutsetPeriods(image, fill.srcRect != null);
+  const columns = Math.ceil(w / tileW) + 2 + 2 * pad.x;
+  const rows = Math.ceil(h / tileH) + 2 + 2 * pad.y;
   const repetitions = columns * rows;
-  if (!Number.isSafeInteger(repetitions)) return null;
-  return { ...metrics, columns, rows, repetitions };
+  if (!Number.isSafeInteger(repetitions)) rejectChartImageGeometry();
+  return { ...metrics, columns, rows, repetitions, padX: pad.x, padY: pad.y };
 }
 
 /** Exact Canvas image-draw work for one picture fill at the destination size.
- * A missing/unsupported authored recipe paints nothing and therefore costs 0. */
+ * Absent/invisible sources cost 0. Malformed geometry and quota crossings
+ * reject the render rather than omitting authored content. */
 export function chartImageFillPaintWork(
   fill: ImageFill,
   lookup: ChartImageLookup | undefined,
@@ -277,15 +490,16 @@ export function chartImageFillPaintWork(
   h: number,
   ptToPx = PT_TO_PX,
 ): number {
+  if (![w, h, ptToPx].every(Number.isFinite) || w < 0 || h < 0) rejectChartImageGeometry();
   if (!(w > 0) || !(h > 0)) return 0;
-  if (!fillCanProduceVisiblePixels(fill) || !imageFillModeIsPaintable(fill)) return 0;
+  if (!imageFillModeIsPaintable(fill) || !fillCanProduceVisiblePixels(fill)) return 0;
   const image = (lookup ?? activeLookup)?.(fill);
   if (!image) return 0;
   if (!fill.tile) return 1;
   const geometry = imageTileGeometry(fill, image, w, h, ptToPx);
-  return geometry && geometry.repetitions <= MAX_CHART_IMAGE_FILL_TILES
-    ? geometry.repetitions
-    : 0;
+  if (!geometry) rejectChartImageGeometry();
+  assertChartImageWork(geometry.repetitions, MAX_CHART_IMAGE_FILL_TILES);
+  return geometry.repetitions;
 }
 
 /** Monotonic work upper bound for a consumer whose destination rectangle is
@@ -298,8 +512,9 @@ export function chartImageFillPaintWorkUpperBound(
   h: number,
   ptToPx = PT_TO_PX,
 ): number {
+  if (![w, h, ptToPx].every(Number.isFinite) || w < 0 || h < 0) rejectChartImageGeometry();
   if (!(w > 0) || !(h > 0)) return 0;
-  if (!fillCanProduceVisiblePixels(fill) || !imageFillModeIsPaintable(fill)) return 0;
+  if (!imageFillModeIsPaintable(fill) || !fillCanProduceVisiblePixels(fill)) return 0;
   const image = (lookup ?? activeLookup)?.(fill);
   if (!image) return 0;
   if (!fill.tile) return 1;
@@ -355,43 +570,43 @@ export function chartImageFillUsageSize(
     || !isPositiveFiniteFactor(usage.metafileWidthFactor)
     || !isPositiveFiniteFactor(usage.metafileHeightFactor)
     || !Number.isFinite(usage.targetWidthFactor) || usage.targetWidthFactor < 0
-    || !Number.isFinite(usage.targetHeightFactor) || usage.targetHeightFactor < 0) return null;
+    || !Number.isFinite(usage.targetHeightFactor) || usage.targetHeightFactor < 0) rejectChartImageGeometry();
   const widthPt = frame.widthPt * usage.metafileWidthFactor;
   const heightPt = frame.heightPt * usage.metafileHeightFactor;
-  if (!isPositiveFiniteFactor(widthPt) || !isPositiveFiniteFactor(heightPt)) return null;
+  if (!isPositiveFiniteFactor(widthPt) || !isPositiveFiniteFactor(heightPt)) rejectChartImageGeometry();
   const targetFrameWidthPx = frame.targetWidthPx;
   const targetFrameHeightPx = frame.targetHeightPx;
   const hasTargetWidth = targetFrameWidthPx != null;
   const hasTargetHeight = targetFrameHeightPx != null;
-  if (hasTargetWidth !== hasTargetHeight) return null;
+  if (hasTargetWidth !== hasTargetHeight) rejectChartImageGeometry();
   if (targetFrameWidthPx == null || targetFrameHeightPx == null) return { widthPt, heightPt };
   if (!isPositiveFiniteFactor(targetFrameWidthPx)
-    || !isPositiveFiniteFactor(targetFrameHeightPx)) return null;
+    || !isPositiveFiniteFactor(targetFrameHeightPx)) rejectChartImageGeometry();
   const rawTargetWidthPx = targetFrameWidthPx * usage.targetWidthFactor;
   const rawTargetHeightPx = targetFrameHeightPx * usage.targetHeightFactor;
   if (!Number.isFinite(rawTargetWidthPx) || rawTargetWidthPx < 0
     || (usage.targetWidthFactor > 0 && rawTargetWidthPx === 0)
     || !Number.isFinite(rawTargetHeightPx) || rawTargetHeightPx < 0
-    || (usage.targetHeightFactor > 0 && rawTargetHeightPx === 0)) return null;
+    || (usage.targetHeightFactor > 0 && rawTargetHeightPx === 0)) rejectChartImageGeometry();
   const targetWidthPx = Math.ceil(rawTargetWidthPx);
   const targetHeightPx = Math.ceil(rawTargetHeightPx);
-  if (!Number.isFinite(targetWidthPx) || !Number.isFinite(targetHeightPx)) return null;
+  if (!Number.isFinite(targetWidthPx) || !Number.isFinite(targetHeightPx)) rejectChartImageGeometry();
   return { widthPt, heightPt, targetWidthPx, targetHeightPx };
 }
 
 function chartImageFillOccurrence(fill: ImageFill): ChartImageFillOccurrence | null {
-  if (!fillCanProduceVisiblePixels(fill) || !imageFillModeIsPaintable(fill)) return null;
+  if (!imageFillModeIsPaintable(fill) || !fillCanProduceVisiblePixels(fill)) return null;
   const logicalWidth = fill.srcRect ? 1 - fill.srcRect.l - fill.srcRect.r : 1;
   const logicalHeight = fill.srcRect ? 1 - fill.srcRect.t - fill.srcRect.b : 1;
   if (!(Number.isFinite(logicalWidth) && logicalWidth > 0)
-    || !(Number.isFinite(logicalHeight) && logicalHeight > 0)) return null;
+    || !(Number.isFinite(logicalHeight) && logicalHeight > 0)) rejectChartImageGeometry();
   const hasSourceCrop = fill.srcRect != null;
   if (fill.tile) {
-    if (!chartImageTileStaticMetrics(fill)) return null;
+    if (!chartImageTileStaticMetrics(fill)) rejectChartImageGeometry();
     const metafileWidthFactor = 1 / logicalWidth;
     const metafileHeightFactor = 1 / logicalHeight;
     if (!isPositiveFiniteFactor(metafileWidthFactor)
-      || !isPositiveFiniteFactor(metafileHeightFactor)) return null;
+      || !isPositiveFiniteFactor(metafileHeightFactor)) rejectChartImageGeometry();
     return {
       preserveNaturalSize: true,
       hasSourceCrop,
@@ -406,15 +621,15 @@ function chartImageFillOccurrence(fill: ImageFill): ChartImageFillOccurrence | n
   const top = rect?.t ?? 0;
   const right = rect?.r ?? 0;
   const bottom = rect?.b ?? 0;
-  if (![left, top, right, bottom].every(Number.isFinite)) return null;
+  if (![left, top, right, bottom].every(Number.isFinite)) rejectChartImageGeometry();
   const destinationWidth = 1 - left - right;
   const destinationHeight = 1 - top - bottom;
   if (!isPositiveFiniteFactor(destinationWidth)
-    || !isPositiveFiniteFactor(destinationHeight)) return null;
+    || !isPositiveFiniteFactor(destinationHeight)) rejectChartImageGeometry();
   const widthFactor = destinationWidth / logicalWidth;
   const heightFactor = destinationHeight / logicalHeight;
   if (!isPositiveFiniteFactor(widthFactor)
-    || !isPositiveFiniteFactor(heightFactor)) return null;
+    || !isPositiveFiniteFactor(heightFactor)) rejectChartImageGeometry();
   return {
     preserveNaturalSize: false,
     hasSourceCrop,
@@ -445,7 +660,6 @@ function mergeChartImageFillUsages(
  * images for markers that cannot be drawn. */
 interface ChartMarkerImageFillResult {
   usages: ChartImageFillUsage[];
-  sourceLimitExceeded: boolean;
   usageRejected: boolean;
 }
 
@@ -455,7 +669,7 @@ function collectChartMarkerImageFillResult(
 ): ChartMarkerImageFillResult {
   const sourceCount = sourceChartStructureCount(chart);
   if (sourceCount > MAX_CANVAS_CHART_POINTS) {
-    return { usages: [], sourceLimitExceeded: false, usageRejected: false };
+    assertChartImageWork(sourceCount, MAX_CANVAS_CHART_POINTS);
   }
   // Match the renderer's first semantic projection. Hidden source points must
   // not consume the decoded-image source ceiling or suppress a visible peer.
@@ -465,7 +679,6 @@ function collectChartMarkerImageFillResult(
   // warmed is exactly the one the renderer can select.
   chart = withEffectiveChartStyleRoles(chart);
   const usages = new Map<string, ChartImageFillUsage>();
-  let sourceLimitExceeded = false;
   let usageRejected = false;
   const add = (fill: unknown) => {
     if (usageRejected) return;
@@ -485,8 +698,7 @@ function collectChartMarkerImageFillResult(
       return;
     }
     if (usages.size >= MAX_CHART_MARKER_IMAGE_SOURCES) {
-      sourceLimitExceeded = true;
-      return;
+      assertChartImageWork(usages.size + 1, MAX_CHART_MARKER_IMAGE_SOURCES);
     }
     usages.set(key, usage);
   };
@@ -1128,8 +1340,7 @@ function collectChartMarkerImageFillResult(
     if (effective?.fillPaint?.fillType === 'image') add(effective.fillPaint);
   });
   return {
-    usages: sourceLimitExceeded || usageRejected ? [] : [...usages.values()],
-    sourceLimitExceeded,
+    usages: usageRejected ? [] : [...usages.values()],
     usageRejected,
   };
 }
@@ -1162,7 +1373,6 @@ export function collectChartImageFillUsagesForCharts(
       // Host frame validation rejects the whole owning chart before either its
       // per-chart source ceiling or the aggregate ceiling can suppress peers.
       if (result.usageRejected) continue;
-      if (result.sourceLimitExceeded) return [];
       for (const usage of result.usages) {
         const key = chartImageFillKey(usage.fill);
         const prior = usages.get(key);
@@ -1170,7 +1380,7 @@ export function collectChartImageFillUsagesForCharts(
           usages.set(key, mergeChartImageFillUsages(prior, usage));
           continue;
         }
-        if (usages.size >= MAX_CHART_MARKER_IMAGE_SOURCES) return [];
+        if (usages.size >= MAX_CHART_MARKER_IMAGE_SOURCES) assertChartImageWork(usages.size + 1, MAX_CHART_MARKER_IMAGE_SOURCES);
         usages.set(key, usage);
       }
     }
@@ -1194,58 +1404,64 @@ export function paintChartImageFill(
   ptToPx = PT_TO_PX,
   shapeRotationDeg = 0,
 ): boolean {
-  if (!fillCanProduceVisiblePixels(fill) || !(w > 0) || !(h > 0)) return false;
-  if (!imageFillModeIsPaintable(fill)) return false;
-  const image = activeLookup?.(fill);
+  if (![x, y, w, h, ptToPx, shapeRotationDeg].every(Number.isFinite) || w < 0 || h < 0) rejectChartImageGeometry();
+  if (!imageFillModeIsPaintable(fill) || !fillCanProduceVisiblePixels(fill) || !(w > 0) || !(h > 0)) return false;
+  const image = activeLookup?.(fill, chartFillRenderedSize(fill, w / ptToPx, h / ptToPx));
   if (!image) return false;
   if (shapeRotationDeg !== 0 && fill.rotWithShape == null) return false;
   ctx.save();
-  ctx.beginPath();
-  ctx.rect(x, y, w, h);
-  ctx.clip();
-  if (fill.rotWithShape === false && shapeRotationDeg !== 0) {
-    ctx.translate(x + w / 2, y + h / 2);
-    ctx.rotate(-shapeRotationDeg * Math.PI / 180);
-    ctx.translate(-(x + w / 2), -(y + h / 2));
-  }
-  if (fill.alpha != null) ctx.globalAlpha *= Math.max(0, Math.min(1, fill.alpha));
-  if (!fill.tile) {
-    const rect = fill.fillRect;
-    const dx = x + (rect?.l ?? 0) * w;
-    const dy = y + (rect?.t ?? 0) * h;
-    const dw = (1 - (rect?.l ?? 0) - (rect?.r ?? 0)) * w;
-    const dh = (1 - (rect?.t ?? 0) - (rect?.b ?? 0)) * h;
-    if (dw > 0 && dh > 0) drawImageCropped(ctx, image, fill.srcRect, dx, dy, dw, dh);
-    ctx.restore();
-    return dw > 0 && dh > 0;
-  }
-
-  const geometry = imageTileGeometry(fill, image, w, h, ptToPx);
-  if (!geometry || geometry.repetitions > MAX_CHART_IMAGE_FILL_TILES) {
-    ctx.restore();
-    return false;
-  }
-  const {
-    tileW, tileH, flipX, flipY, columns, rows,
-  } = geometry;
-  const origin = chartImageTileOrigin(geometry, w, h);
-  const originX = x + origin.x;
-  const originY = y + origin.y;
-  const firstColumn = Math.floor((x - originX) / tileW) - 1;
-  const firstRow = Math.floor((y - originY) / tileH) - 1;
-  for (let row = firstRow; row < firstRow + rows; row++) {
-    for (let column = firstColumn; column < firstColumn + columns; column++) {
-      const dx = originX + column * tileW;
-      const dy = originY + row * tileH;
-      const mirrorX = flipX && Math.abs(column) % 2 === 1;
-      const mirrorY = flipY && Math.abs(row) % 2 === 1;
-      ctx.save();
-      ctx.translate(dx + (mirrorX ? tileW : 0), dy + (mirrorY ? tileH : 0));
-      ctx.scale(mirrorX ? -1 : 1, mirrorY ? -1 : 1);
-      drawImageCropped(ctx, image, fill.srcRect, 0, 0, tileW, tileH);
-      ctx.restore();
+  try {
+    ctx.beginPath();
+    ctx.rect(x, y, w, h);
+    ctx.clip();
+    if (fill.rotWithShape === false && shapeRotationDeg !== 0) {
+      ctx.translate(x + w / 2, y + h / 2);
+      ctx.rotate(-shapeRotationDeg * Math.PI / 180);
+      ctx.translate(-(x + w / 2), -(y + h / 2));
     }
-  }
-  ctx.restore();
-  return true;
+    if (fill.alpha != null) ctx.globalAlpha *= Math.max(0, Math.min(1, fill.alpha));
+    if (!fill.tile) {
+      const rect = fill.fillRect;
+      const dx = x + (rect?.l ?? 0) * w;
+      const dy = y + (rect?.t ?? 0) * h;
+      const dw = (1 - (rect?.l ?? 0) - (rect?.r ?? 0)) * w;
+      const dh = (1 - (rect?.t ?? 0) - (rect?.b ?? 0)) * h;
+      if (![dx, dy, dw, dh].every(Number.isFinite)) rejectChartImageGeometry();
+      if (dw > 0 && dh > 0) drawImageCropped(ctx, image, fill.srcRect, dx, dy, dw, dh);
+      return dw > 0 && dh > 0;
+    }
+
+    const geometry = imageTileGeometry(fill, image, w, h, ptToPx);
+    if (!geometry) rejectChartImageGeometry();
+    assertChartImageWork(geometry.repetitions, MAX_CHART_IMAGE_FILL_TILES);
+    const {
+      tileW, tileH, flipX, flipY, columns, rows,
+    } = geometry;
+    const origin = chartImageTileOrigin(geometry, w, h);
+    const originX = x + origin.x;
+    const originY = y + origin.y;
+    const firstColumn = Math.floor((x - originX) / tileW) - 1 - geometry.padX;
+    const firstRow = Math.floor((y - originY) / tileH) - 1 - geometry.padY;
+    // A bounded repetition count does not make a huge starting index iterable.
+    // Resource policy: reject grids whose integer parity cannot be represented.
+    if (![firstColumn, firstRow, firstColumn + columns, firstRow + rows].every(Number.isSafeInteger)) {
+      assertChartImageWork(Number.MAX_SAFE_INTEGER, MAX_CHART_IMAGE_FILL_TILES);
+    }
+    for (let ri = 0; ri < rows; ri++) {
+      const row = firstRow + ri;
+      for (let ci = 0; ci < columns; ci++) {
+        const column = firstColumn + ci;
+        const dx = originX + column * tileW;
+        const dy = originY + row * tileH;
+        const mirrorX = flipX && Math.abs(column) % 2 === 1;
+        const mirrorY = flipY && Math.abs(row) % 2 === 1;
+        ctx.save();
+        ctx.translate(dx + (mirrorX ? tileW : 0), dy + (mirrorY ? tileH : 0));
+        ctx.scale(mirrorX ? -1 : 1, mirrorY ? -1 : 1);
+        drawImageCropped(ctx, image, fill.srcRect, 0, 0, tileW, tileH);
+        ctx.restore();
+      }
+    }
+    return true;
+  } finally { ctx.restore(); }
 }

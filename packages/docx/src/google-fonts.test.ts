@@ -91,7 +91,23 @@ it('collects the distinct authored font tuples used by rendered text', () => {
   expect(requests).toContainEqual({ family: 'Calibri', weight: 400, style: 'normal' });
   expect(requests).toContainEqual({ family: 'calibri', weight: 700, style: 'italic' });
   expect(requests).toContainEqual({ family: 'Calibri Light', weight: 400, style: 'normal' });
-  expect(requests.filter((request) => request.family.toLowerCase() === 'calibri')).toHaveLength(2);
+  expect(requests.filter((request) => request.family.toLowerCase() === 'calibri' && !request.presenceOnly))
+    .toHaveLength(2);
+  // One family presence probe per authored family, independent of its tuples.
+  expect(requests.filter((request) => request.presenceOnly).map((request) => request.family))
+    .toEqual(['Aptos', 'Calibri', 'Calibri Light']);
+});
+
+it('also requests the catalogued regular face of a styled tuple the catalog lacks', () => {
+  // LIBRARY_SYNTHESIZED_FACE_LINE_GEOMETRY: main and worker share this list,
+  // so both load the regular face a synthesized bold run is compared with.
+  const doc = docWith('body', 'Arial', 'Arial');
+  (doc.body[0] as { runs: object[] }).runs = [
+    { type: 'text', text: '見出し', fontFamily: 'MS Mincho', bold: true, italic: false },
+  ];
+  const requests = docxOfficeFontFallbackRequests(doc);
+  expect(requests).toContainEqual({ family: 'MS Mincho', weight: 700, style: 'normal' });
+  expect(requests).toContainEqual({ family: 'MS Mincho', weight: 400, style: 'normal' });
 });
 
 it('preloads every registered rendered family without theme names and omits unregistered ones', () => {
@@ -115,13 +131,19 @@ it('checks substitute family presence independent of the styles used', () => {
   (doc.body[0] as { runs: object[] }).runs = [
     { type: 'text', text: 'Bold only', fontFamily: 'Franklin Gothic Book', bold: true },
   ];
-  // Only the bold tuple is a style request; presence is asked for the family.
+  // The bold tuple, plus the catalogued regular face the uncatalogued bold
+  // is compared with (LIBRARY_SYNTHESIZED_FACE_LINE_GEOMETRY), are style
+  // requests; presence is asked for the family.
   const requests = docxOfficeFontFallbackRequests(doc, { useGoogleFonts: true });
   expect(requests.filter((request) => request.family === 'Franklin Gothic Book')).toEqual([
     { family: 'Franklin Gothic Book', weight: 700, style: 'normal' },
+    { family: 'Franklin Gothic Book', weight: 400, style: 'normal' },
     { family: 'Franklin Gothic Book', presenceOnly: true },
   ]);
-  expect(docxOfficeFontFallbackRequests(doc).some((request) => request.presenceOnly)).toBe(false);
+  // Without web fonts the family is still probed once (layout's installed
+  // families), so presence never depends on the styles the document uses.
+  expect(docxOfficeFontFallbackRequests(doc).filter((request) => request.presenceOnly))
+    .toEqual([{ family: 'Franklin Gothic Book', presenceOnly: true }]);
 
   for (const officeFonts of [
     { routes: {}, installed: ['franklin gothic book'] },

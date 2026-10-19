@@ -1,8 +1,10 @@
 import { ScriptPreloadAccumulator } from '@silurus/ooxml-core/internal/script-preload-accumulator';
+import { ownValue } from '@silurus/ooxml-core/internal/own-key';
 import type { CjkLang, OfficeFontFallbackRequest } from '@silurus/ooxml-core';
 import {
   classifyCjkFont,
   cjkLangFromLanguage,
+  findReferenceFontMetrics,
   scriptPreloadNamesForText,
   substituteEntryCoversText,
 } from '@silurus/ooxml-core';
@@ -64,7 +66,7 @@ export function docxFontPreloadNames(
     for (const family of usage.fontFamilies) {
       const name = family?.trim();
       const key = name?.toLowerCase();
-      const entry = key ? DOCX_GOOGLE_FONTS[key] : undefined;
+      const entry = ownValue(DOCX_GOOGLE_FONTS, key);
       // A script-scoped visual substitute is fetched only when text in its
       // script actually requests the family (core substitute-script.ts).
       if (name && key && entry && !themeKeys.has(key) && !renderedFamilies.has(key)
@@ -100,7 +102,7 @@ function differentFamilySubstitutes(
   for (const name of names) {
     const family = name?.trim();
     const key = family?.toLowerCase();
-    const loadFamily = key ? DOCX_GOOGLE_FONTS[key]?.loadFamily : undefined;
+    const loadFamily = ownValue(DOCX_GOOGLE_FONTS, key)?.loadFamily;
     if (family && key && loadFamily && loadFamily.toLowerCase() !== key) {
       substitutes.set(key, family);
     }
@@ -165,14 +167,33 @@ export function docxOfficeFontFallbackRequests(
       add(doc.minorFont, usage.bold, usage.italic);
     }
   }
-  // With useGoogleFonts, every family served by a different-family substitute
-  // is checked for installation as a family, independent of the styles the
-  // document uses (docxGoogleFontPlan).
-  const presence = options.useGoogleFonts
-    ? [...differentFamilySubstitutes(docxFontPreloadNames(doc, options.cjkFallback)).values()]
-      .map((family): OfficeFontFallbackRequest => ({ family, presenceOnly: true }))
-    : [];
-  return [...tuples.values(), ...presence];
+  // LIBRARY_SYNTHESIZED_FACE_LINE_GEOMETRY compares a styled run against the
+  // regular face it may be synthesized from, so a styled tuple the catalog
+  // lacks also loads its family's catalogued regular face.
+  for (const request of [...tuples.values()]) {
+    const weight = request.weight ?? 400;
+    const style = request.style ?? 'normal';
+    if (weight === 400 && style === 'normal') continue;
+    if (findReferenceFontMetrics(request.family, { weight, style }).length > 0) continue;
+    if (findReferenceFontMetrics(request.family, { weight: 400, style: 'normal' }).length === 0) continue;
+    add(request.family);
+  }
+  // Every authored family is checked for installation as a family, independent
+  // of the styles the document uses: an installed family paints every tuple
+  // (layout's installedFamilies). With useGoogleFonts, so is every family served
+  // by a different-family substitute (docxGoogleFontPlan).
+  const presence = new Map<string, OfficeFontFallbackRequest>();
+  const addPresence = (family: string) => {
+    const key = family.trim().toLowerCase();
+    if (key && !presence.has(key)) presence.set(key, { family: family.trim(), presenceOnly: true });
+  };
+  for (const request of tuples.values()) addPresence(request.family);
+  if (options.useGoogleFonts) {
+    for (const family of differentFamilySubstitutes(docxFontPreloadNames(doc, options.cjkFallback)).values()) {
+      addPresence(family);
+    }
+  }
+  return [...tuples.values(), ...presence.values()];
 }
 
 

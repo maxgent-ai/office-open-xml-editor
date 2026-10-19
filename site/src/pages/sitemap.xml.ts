@@ -12,6 +12,7 @@ export const sitemapPaths = [
   '/api/xlsx/',
   '/api/pptx/',
   '/production/',
+  '/legacy-office/',
   '/try/',
   '/frameworks/',
   '/frameworks/react/',

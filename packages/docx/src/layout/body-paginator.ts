@@ -4,7 +4,6 @@ import type {
   BodyLayoutInput,
   BodyParagraphSourceInput,
   BodySectionLayoutInput,
-  BodyTableSourceInput,
 } from './body-layout-input.js';
 import type {
   BodyAcquisitionLocation,
@@ -14,6 +13,7 @@ import type {
   PageAnchorPrescanInput,
 } from './body-layout-kernel.js';
 import { NoteCapacityExceededError } from './body-layout-kernel.js';
+import { NoteStack } from './note-stack.js';
 import { createFloatLineBandPredicate, type FloatRect } from './float-wrap.js';
 import {
   commitPageFlowTransition,
@@ -52,7 +52,6 @@ import {
   createPageFlowState,
   placeFlowNode,
   UnsupportedPageFlowTransitionError,
-  type PageFlowState,
 } from './paginator.js';
 
 import {
@@ -90,7 +89,7 @@ import {
   type FootnotePartitionExtent,
   type FootnoteCursor,
 } from './footnote-fragmentation.js';
-import { noteSeparatorOccurrence } from './native-note-separators.js';
+import { noteSeparatorOccurrence } from './reserved-note-separators.js';
 import { paragraphGapAdjustment } from './paragraph-spacing.js';
 import {
   endnoteIdsInRetainedSlice,
@@ -106,8 +105,8 @@ import {
   sectionContentFirstAppearancePageIndices,
 } from './section-page-identity.js';
 import {
-  wordActiveColumnBreakIndexes,
   wordFinalParagraphAdmissionExtentPt,
+  wordGridLineAdmissionExtentPt,
   wordParagraphFootnoteMayContinue,
   wordFootnoteLookaheadBoundary,
   wordEmptyKeepNextBridgesSuccessor,
@@ -167,6 +166,22 @@ import { solveExactTranslation } from './story-page-frames.js';
 // Resource governance independent of compatibility thresholds: each physical
 // page retains flow/paint state. Bound adversarial page generation globally.
 // The full-note acquisition and paginator share one physical-page budget.
+
+// Retain only a small recent exact-state window, as in the reserve solve.
+// This is a retention bound, not a pass limit: independent section openings
+// can each require an observation. The physical-page ceiling and shared hard
+// acquisition ledger bound work even for cycles longer than this window.
+const MAX_OPENED_RESERVE_IDENTITIES = 16;
+
+/** An actual empty page opening supplied new reserve observations, but the
+ * body could not advance in that geometry. Retry the same reserve iteration
+ * with these observations, rather than opening an unbounded run of empty pages.
+ * This is a convergence signal, never a speculative fit or a copied note plan. */
+class OpenedPageReserveObservation extends Error {
+  constructor(readonly reserves: readonly HeaderFooterReserve[]) {
+    super('An empty opened page requires reserve observation before continuing');
+  }
+}
 
 class FootnoteAdmissionOverflowError extends Error {
   readonly code = 'FOOTNOTE_RESERVE_EXCEEDS_FRESH_PAGE' as const;
@@ -363,7 +378,7 @@ function flowSection(owner: BodySectionLayoutInput, pageIndex: number) {
     geometry: context.geometry,
     columns: context.columns,
     textDirection: context.textDirection,
-    ...(context.nativeSectionFlow ? { nativeSectionFlow: context.nativeSectionFlow } : {}),
+    ...(context.sectionFlow ? { sectionFlow: context.sectionFlow } : {}),
     sectionBidi: context.sectionBidi === true,
     grid: context.grid,
   });
@@ -491,7 +506,7 @@ function acquisitionLocation(state: BodyPaginationState): BodyAcquisitionLocatio
 
 function transitionFactory(
   owners: ReadonlyMap<string, BodySectionLayoutInput>,
-  reserves: readonly HeaderFooterReserve[],
+  reserveForOpening: (owner: BodySectionLayoutInput, pageIndex: number, parityBlank?: boolean, automaticOpening?: boolean) => HeaderFooterReserve,
 ): BodyPageTransitionFactory {
   const owner = (id: string) => {
     const result = owners.get(id);
@@ -501,7 +516,7 @@ function transitionFactory(
   return {
     openContentPage(event) {
       const nextOwner = owner(event.sectionOccurrenceId);
-      const reserve = reserves[event.pageIndex] ?? { top: 0, bottom: 0 };
+      const reserve = reserveForOpening(nextOwner, event.pageIndex, false, event.reason === 'overflow');
       const interval = pageBodyInterval(nextOwner, event.pageIndex, reserve);
       const flow = createPageFlowState(flowSection(nextOwner, event.pageIndex), {
         pageIndex: event.pageIndex,
@@ -516,7 +531,7 @@ function transitionFactory(
       const interval = pageBodyInterval(
         blankOwner,
         event.pageIndex,
-        reserves[event.pageIndex] ?? { top: 0, bottom: 0 },
+        reserveForOpening(blankOwner, event.pageIndex, true),
       );
       return createCanonicalPageDraft({
         kind: 'parity-blank', pageIndex: event.pageIndex,
@@ -592,7 +607,6 @@ function acceptNode(
     yPt: number;
     sectionFlowOwnership?: 'host-flow' | 'page';
   }>,
-  retainedSourceContent = false,
 ): BodyPaginationState {
   const page = state.pages.at(-1);
   if (!page || page.kind !== 'content') throw new Error('Body content requires an active page');
@@ -630,7 +644,7 @@ function acceptNode(
     ? projected
     : Object.freeze({ ...projected, sectionFlowOwnership: placement.sectionFlowOwnership });
   const admittedBlockStartPt = placement?.yPt ?? state.flow.cursorBlockPt;
-  const contentOwned = !retainedSourceContent && ownershipRetained.kind === 'paragraph' && ownershipRetained.ordinaryFlow
+  const contentOwned = ownershipRetained.kind === 'paragraph' && ownershipRetained.ordinaryFlow
     ? (() => {
         const contentStartPt = admittedBlockStartPt + ownershipRetained.spacing.beforePt;
         const contentEndPt = admittedBlockStartPt
@@ -736,47 +750,59 @@ function locationAfter(
   });
 }
 
-function finalize(state: BodyPaginationState, owners: ReadonlyMap<string, BodySectionLayoutInput>): DocumentLayout {
-  // Compatibility-owned continuous-section restart arithmetic anchors the
-  // incoming owner to the first physical page that retains its body content.
-  // A transition-only empty region is capacity, not a numbering appearance.
-  // Issue #804 locks the retained-layout and painted-footer observations together
-  // in the continuous-section cases in page-number-field-render.test.ts.
-  const contentFirstAppearance = sectionContentFirstAppearancePageIndices(
-    state.pages.map((draft) => ({
-      pageIndex: draft.accumulator.pageIndex,
-      sectionRegions: draft.accumulator.sectionRegions.map((region) => ({
-        sectionOccurrenceId: region.sectionOccurrenceId,
-        flowDomainIds: (region.columnIndexes
-          ?? region.section.columns.map((_, index) => index))
-          .map((columnIndex) => bodyFlowDomainId(
-            draft.accumulator.pageIndex,
-            region.id,
-            columnIndex,
-          )),
-      })),
-      contentFlowDomainIds: draft.accumulator.readingOrder.map((node) => node.flowDomainId),
+function sectionContentPage(draft: CanonicalPageDraft) {
+  return {
+    pageIndex: draft.accumulator.pageIndex,
+    sectionRegions: draft.accumulator.sectionRegions.map((region) => ({
+      sectionOccurrenceId: region.sectionOccurrenceId,
+      flowDomainIds: (region.columnIndexes ?? region.section.columns.map((_, index) => index))
+        .map((columnIndex) => bodyFlowDomainId(draft.accumulator.pageIndex, region.id, columnIndex)),
     })),
-  );
-  let displayNumber = 0;
-  let priorOwner: string | null = null;
+    contentFlowDomainIds: draft.accumulator.readingOrder.map((node) => node.flowDomainId),
+  };
+}
+
+/** Single authority for page numbering, ownership and story-slot context at
+ * opening and final observation/composition. §17.6.12, §17.10.1/.6.
+ * Compatibility rule: word-continuous-section-page-number-restart anchors
+ * a restart to retained section content,
+ * including shared pages, but excludes transition-only empty regions. */
+function resolvePageStoryContext(
+  owner: BodySectionLayoutInput,
+  pageIndex: number,
+  previousNumber: LayoutPage['pageNumber'] | undefined,
+  firstContentPageIndex: number | undefined,
+  parityBlank: boolean,
+) {
+  const firstPageOfSection = previousNumber?.sectionOccurrenceId !== owner.sectionOccurrenceId;
+  const displayNumber = firstPageOfSection && owner.pageNumbering.start !== null
+    ? wordContinuousSectionRestartDisplayNumber(owner.pageNumbering.start, pageIndex, firstContentPageIndex ?? pageIndex)
+    : (previousNumber?.displayNumber ?? 0) + 1;
+  return {
+    owner,
+    pageIndex,
+    section: sectionContextForPage(owner, pageIndex),
+    firstPageOfSection,
+    parityBlank,
+    firstContentPageIndex,
+    pageNumber: { displayNumber, format: owner.pageNumbering.format ?? 'decimal',
+      sectionOccurrenceId: owner.sectionOccurrenceId },
+  };
+}
+
+type PageStoryContext = ReturnType<typeof resolvePageStoryContext>;
+
+function finalize(state: BodyPaginationState, owners: ReadonlyMap<string, BodySectionLayoutInput>) {
+  const contentFirstAppearance = sectionContentFirstAppearancePageIndices(state.pages.map(sectionContentPage));
+  let previousNumber: LayoutPage['pageNumber'] | undefined;
+  const pageStoryContexts: PageStoryContext[] = [];
   const pages = state.pages.map((draft) => {
     const owner = owners.get(draft.accumulator.sectionOccurrenceId)!;
-    const firstSectionOwnedPage = owner.sectionOccurrenceId !== priorOwner;
-    if (owner.sectionOccurrenceId !== priorOwner && owner.pageNumbering.start !== null) {
-      displayNumber = wordContinuousSectionRestartDisplayNumber(
-        owner.pageNumbering.start,
-        draft.accumulator.pageIndex,
-        contentFirstAppearance.get(owner.sectionOccurrenceId)
-          ?? draft.accumulator.pageIndex,
-      );
-    } else displayNumber += 1;
-    priorOwner = owner.sectionOccurrenceId;
-    const pageNumber = {
-      displayNumber,
-      format: owner.pageNumbering.format ?? 'decimal',
-      sectionOccurrenceId: owner.sectionOccurrenceId,
-    };
+    const context = resolvePageStoryContext(owner, draft.accumulator.pageIndex,
+      previousNumber, contentFirstAppearance.get(owner.sectionOccurrenceId), draft.kind === 'parity-blank');
+    const { pageNumber, firstPageOfSection: firstSectionOwnedPage } = context;
+    previousNumber = pageNumber;
+    pageStoryContexts.push(context);
     if (draft.kind === 'parity-blank') {
       return createParityBlankLayoutPage({
         pageIndex: draft.accumulator.pageIndex,
@@ -798,13 +824,15 @@ function finalize(state: BodyPaginationState, owners: ReadonlyMap<string, BodySe
   // Validating and deep-freezing the full document graph here repeated that
   // O(document) boundary for every anchor/header/footer pass. The accepted
   // composed layout crosses the invariant/freeze boundary exactly once below.
-  return layout;
+  return { layout, pageStoryContexts: Object.freeze(pageStoryContexts) };
 }
 
 /** One completed body-pagination pass. */
 export type BodyPaginationPassResult = Readonly<{
   layout: DocumentLayout;
   session: BodyLayoutSession;
+  /** Finalization resolves these with the same authority used at page opening. */
+  pageStoryContexts: readonly PageStoryContext[];
   allocations: readonly BodyFlowAllocation[];
   footnoteReserveByPage: ReadonlyMap<number, number>;
   footnoteLayoutsByPage: ReadonlyMap<number, readonly NoteLayout[]>;
@@ -897,7 +925,7 @@ function paginationPassResult(
   anchorInputs: readonly PageAnchorInputEvent[] = [],
   serializedAnchorInputs: readonly string[] = [],
 ): BodyPaginationPassResult {
-  const layout = finalize(state, owners);
+  const { layout, pageStoryContexts } = finalize(state, owners);
   const retainedPageIndexes = new Set(layout.pages.map((page) => page.pageIndex));
   const retainedNodeIds = new Set(layout.pages.flatMap((page) => (
     pageLayerNodes(page).map(({ node }) => node.id)
@@ -905,6 +933,7 @@ function paginationPassResult(
   return Object.freeze({
     layout,
     session,
+    pageStoryContexts,
     allocations: Object.freeze(allocations.filter((allocation) => (
       retainedNodeIds.has(allocation.nodeId)
     ))),
@@ -984,7 +1013,74 @@ function* paginateBodyPassSteps(
   const owners = ownerMap(input);
   const acceptedOccurrenceIds = new Set<string>();
   const allocations: BodyFlowAllocation[] = [];
-  const initialReserve = reserves[0] ?? { top: 0, bottom: 0 };
+  let reserveSession: BodyLayoutSession | undefined;
+  let previousPageContext: PageStoryContext | undefined;
+  const contentFirstAppearance = new Map<string, number>();
+  let nextContentPageIndex = 0;
+  const measuredOpeningReserves = new Map<number, HeaderFooterReserve>();
+  // ECMA-376 §17.6.11: when a repeat pass opens an unseen physical page,
+  // measure its selected story with that page's owner/slot/number. Discovery
+  // stays observation-free; no other page's reserve or note plan is borrowed.
+  // Only openings use this lookup. Preflight/admission keeps the previous
+  // pass's observations (zero for unseen pages), preserving its fit decisions;
+  // exact final reserve convergence still validates the resulting pages.
+  const reserveForOpening = (owner: BodySectionLayoutInput, pageIndex: number, parityBlank = false, automaticOpening = false): HeaderFooterReserve => {
+    // A newly measured page may be smaller than the last complete pass's
+    // unseen-page fit input. If overflow leaves that physical page empty,
+    // observe the geometry already opened before trying another opening.
+    // Retry the reserve pass; keep every fit/admission consumer on
+    // the previous-observation contract. Authored blanks and pages that advanced
+    // body or incoming notes are not failed openings. No footnote plan is minted.
+    // Exact numbering does not remove this case: an indivisible row with a note
+    // can fit the unseen-page preflight but not its actual first/default band.
+    // Without refinement the cantSplit production regressions exhaust 10,000
+    // empty pages. Replay shares the hard ledger; it cannot mint work credits.
+    if (automaticOpening && !state.flow.pageHasContent && state.footnoteReservePt === 0
+      && measuredOpeningReserves.has(state.flow.pageIndex)) {
+      throw new OpenedPageReserveObservation(Object.freeze(Array.from(
+        { length: Math.max(reserves.length, state.flow.pageIndex + 1) },
+        (_, index) => measuredOpeningReserves.get(index) ?? reserves[index] ?? Object.freeze({ top: 0, bottom: 0 }),
+      )));
+    }
+    // Every closed content page is scanned once. Reuse finalization's exact
+    // content-domain projection; a continuous empty region earns no restart.
+    if (pageIndex > 0) {
+      while (nextContentPageIndex < state.pages.length) {
+        const draft = state.pages[nextContentPageIndex++]!;
+        for (const [id, first] of sectionContentFirstAppearancePageIndices([sectionContentPage(draft)])) {
+          if (!contentFirstAppearance.has(id)) contentFirstAppearance.set(id, first);
+        }
+      }
+    }
+    const observed = reserves[pageIndex];
+    // Finalization may discover the content anchor after an authored empty page.
+    // Keep that exact observation when the owner matches; current retained
+    // content takes precedence when this pass has already established it.
+    const firstContent = contentFirstAppearance.get(owner.sectionOccurrenceId)
+      ?? (observed?.observedPage?.owner === owner.sectionOccurrenceId
+        ? observed.observedPage.firstContentPageIndex : undefined);
+    const context = resolvePageStoryContext(owner, pageIndex,
+      previousPageContext?.pageNumber, firstContent, parityBlank);
+    const { firstPageOfSection, pageNumber } = context;
+    previousPageContext = context;
+    const matching = observed?.observedPage?.owner === owner.sectionOccurrenceId
+      && observed.observedPage.firstPageOfSection === firstPageOfSection
+      && observed.observedPage.parityBlank === parityBlank
+      && observed.observedPage.pageNumber.displayNumber === pageNumber.displayNumber
+      && observed.observedPage.pageNumber.format === pageNumber.format;
+    if (parityBlank || reserves.length === 0) return { top: 0, bottom: 0 };
+    if (matching) return observed!;
+    if (!reserveSession) throw new Error('Unobserved page reserve requires an open story session');
+    const reserve = Object.freeze({
+      ...measurePageHeaderFooterReserve(reserveSession, context),
+      observedPage: { owner: owner.sectionOccurrenceId, firstPageOfSection, parityBlank, pageNumber,
+        ...(context.firstContentPageIndex === undefined ? {}
+          : { firstContentPageIndex: context.firstContentPageIndex }) },
+    });
+    measuredOpeningReserves.set(pageIndex, reserve);
+    return reserve;
+  };
+  const initialReserve = reserveForOpening(input.initialSection, 0);
   const initialInterval = pageBodyInterval(input.initialSection, 0, initialReserve);
   const initialFlow = createPageFlowState(flowSection(input.initialSection, 0), {
     pageContentStartBlockPt: initialInterval.blockStartPt,
@@ -999,7 +1095,7 @@ function* paginateBodyPassSteps(
     return planned?.pageIndex === target.flow.pageIndex ? planned.targetPt : null;
   };
   state = setBodyBalanceTarget(state, balanceTargetFor(state));
-  const factory = transitionFactory(owners, reserves);
+  const factory = transitionFactory(owners, reserveForOpening);
   // Source entry whose paragraph or keep-with-next set was relocated to a new
   // physical page by automatic overflow. Compatibility rules:
   // word-automatic-paragraph-top-spacing and word-automatic-keep-next-start-spacing.
@@ -1011,6 +1107,7 @@ function* paginateBodyPassSteps(
     section: input.initialSection.context,
     initialLocation: acquisitionLocation(state),
   }, services, options);
+  reserveSession = session;
   const freshPageExtent = (target: BodyPaginationState): number => {
     const owner = owners.get(target.flow.section.sectionOccurrenceId);
     if (!owner) {
@@ -1192,10 +1289,10 @@ function* paginateBodyPassSteps(
   // a notice, a separator-only band or a carried line-free paragraph.
   const incomingTailPages = new Set<number>();
   const partitionFootnote = createFootnotePartitioner();
-  // Native continuation notice (MS-DOC 2.3.3; ECMA-376 §17.18.33). The story
+  // Reserved continuation notice (ECMA-376 §17.18.33). The story
   // is acquired through the ordinary story contract only when a fragment
   // actually continues; its definition is shared, its occurrence page-owned.
-  const continuationNotice = input.noteLayoutSettings?.nativeSeparatorRoles?.footnote?.continuationNotice;
+  const continuationNotice = input.noteLayoutSettings?.reservedSeparatorRoles?.footnote?.continuationNotice;
   const continuationNoticeFor = (
     location: BodyAcquisitionLocation,
     inlineExtentPt: number,
@@ -1638,7 +1735,7 @@ function* paginateBodyPassSteps(
     // measured stories once per event and kept as prefix sums; they are
     // conservative (continuation eligibility is judged with the smallest
     // possible charge, so a note that might have to stay whole is reserved
-    // whole). The page's single native notice is added once if any of those
+    // whole). The page's single reserved notice is added once if any of those
     // minima continues and neither the page nor an accepted plan owns it;
     // the current plan then partitions inside the capacity left after that
     // reserve and, if it continues, carries the same notice, so the notice is
@@ -1797,7 +1894,6 @@ function* paginateBodyPassSteps(
     });
   };
   let previousParagraph: BodyParagraphSourceInput | null = null;
-  const activeColumnBreakIndexes = wordActiveColumnBreakIndexes(input.sequence);
   let terminalDiagnostic: LayoutDiagnostic | null = null;
 
   bodyEntries: for (let entryIndex = 0; entryIndex < input.sequence.length; entryIndex += 1) {
@@ -1826,9 +1922,6 @@ function* paginateBodyPassSteps(
     }
     if (entry.kind === 'authored-break') {
       previousParagraph = null;
-      if (entry.break === 'column' && !activeColumnBreakIndexes.has(entryIndex)) {
-        continue;
-      }
       const pageIndexBeforeBreak = state.flow.pageIndex;
       yield* commitTransition(
         applyAuthoredBreak(state.flow, entry.break, entry.parity),
@@ -1959,11 +2052,9 @@ function* paginateBodyPassSteps(
             || spacing.suppressBefore
             || (
               cursor.boundary === null
-              // Ordinary overflow suppresses top spacing only for ordinary
-              // text. Image-only and mixed-object paragraphs retain their
-              // authored spacing; `inkless` cannot distinguish these cases.
-              && block.inkless !== true
-              && block.onlyVisibleText === true
+              // Windows trr3 C: automatic overflow suppresses before for
+              // empty marks as well as text. Objects remain outside the controls.
+              && (block.inkless === true || block.onlyTextualContent === true)
               && !state.flow.pageHasContent
               && automaticPageStartEntryIndex === entryIndex
             )
@@ -1975,6 +2066,12 @@ function* paginateBodyPassSteps(
               && block.inkless !== true
               && !state.flow.pageHasContent
               && automaticPageStartEntryIndex === entryIndex
+            )
+            || (
+              cursor.boundary === null
+              && block.pageBreakBefore
+              && input.compatibilityMode === 15
+              && !state.flow.pageHasContent
             )
             || (
               cursor.boundary === null
@@ -2020,51 +2117,6 @@ function* paginateBodyPassSteps(
             );
             continue;
           }
-          if (acquired.sourceOwnedAnchorRun) {
-            const atom = acquired.sourceOwnedAnchorRun;
-            if (cursor.boundary !== null || atom.pageIndex !== location.pageIndex
-              || atom.columnIndex !== location.columnIndex || atom.flowDomainId !== location.flowDomainId
-              || atom.startYPt !== location.cursorPt.yPt || atom.extentPt !== relocationExtentPt
-              || !atom.members.length || atom.members.length > 16384)
-              throw new Error('Reading anchor atom admission provenance mismatch');
-            let total = 0;
-            for (let i=0;i<atom.members.length;i++) {
-              const expected = input.sequence[entryIndex+i], member = atom.members[i];
-              if (expected?.kind !== 'body-block' || expected.block.kind !== 'paragraph'
-                || expected.block !== member.input || member.layout.source.story !== member.input.source.story
-                || member.layout.source.storyInstance !== member.input.source.storyInstance
-                || member.layout.source.path.length !== member.input.source.path.length
-                || member.layout.source.path.some((p,j)=>p !== member.input.source.path[j])
-                || member.layout.events.length || member.input.pageBreakBefore || member.input.continuousSectionRole
-                || !Number.isFinite(member.blockExtentPt) || member.blockExtentPt < 0)
-                throw new Error('Reading anchor atom source sequence mismatch');
-              total += member.blockExtentPt;
-            }
-            if (Math.abs(total-atom.extentPt) > Number.EPSILON*Math.max(1,Math.abs(total),Math.abs(atom.extentPt)))
-              throw new Error('Reading anchor atom allocation mismatch');
-            // No scheduler yield or live acceptance mutation until every source
-            // projection succeeds. Members keep content/mark geometry and exact
-            // page/column placement; the final member owns the union reserve.
-            const ids = new Set<string>(), pendingAllocations: BodyFlowAllocation[] = [];
-            let pendingState = state;
-            for (const member of atom.members) {
-              pendingState = acceptNode(pendingState,member.layout,member.input.source,
-                member.blockExtentPt,fragmentStartKey,ids,pendingAllocations,
-                {coordinateSpace:'logical-body',xPt:member.layout.flowBounds.xPt,yPt:member.layout.flowBounds.yPt,sectionFlowOwnership:'host-flow'},true);
-            }
-            for (const id of ids) if (acceptedOccurrenceIds.has(id))
-              throw new Error(`Duplicate body occurrence acceptance: ${id}`);
-            // Registry owners validate their original identity lineage before
-            // mutating it. One consolidated delta registers every peer once.
-            if (acquired.flowRegistryDelta) session.commitFlowRegistryDelta(acquired.flowRegistryDelta);
-            state = pendingState;
-            for (const id of ids) acceptedOccurrenceIds.add(id);
-            allocations.push(...pendingAllocations);
-            previousParagraph = atom.members.at(-1)!.input;
-            entryIndex += atom.members.length-1;
-            session.moveAcquisitionCursor(acquisitionLocation(state));
-            continue bodyEntries;
-          }
           // A placed frame still paints its retained references despite a zero flow
           // charge, so note ownership is committed with the accepted occurrence.
           state = acceptNode(
@@ -2085,9 +2137,21 @@ function* paginateBodyPassSteps(
           session.moveAcquisitionCursor(acquisitionLocation(state));
           continue;
         }
+        // A same-page column reaching the physical bottom has the same edge;
+        // a balanced/shortened column, footer or existing note band does not.
+        const region = activeRegion(state);
+        const physicalBodyBottomPt = region.section.geometry.pageHeight
+          - Math.abs(region.section.geometry.marginBottom);
+        const unreservedBodyBottomPt = region.writingMode === 'horizontal-tb'
+          && activeBlockEndPt(state) === physicalBodyBottomPt
+          && (reserves[state.flow.pageIndex]?.bottom ?? 0) === 0
+          && state.footnoteReservePt === 0
+          ? physicalBodyBottomPt : undefined;
         if (cursor.boundary === null && block.keepNext && state.flow.pageHasContent) {
           let keepSetExtentPt = acquired.blockExtentPt;
           const keepSetReferenceIds = new Set(footnoteIdsInRetainedSlice(acquired.layout));
+          let terminalGridParagraph: ParagraphLayout | undefined;
+          let terminalLeadExtentPt = 0;
           let hasTerminalBlock = false;
           let keepSetBlockedByDeferral = false;
           let bridgeSuccessor = wordEmptyKeepNextBridgesSuccessor({
@@ -2127,6 +2191,10 @@ function* paginateBodyPassSteps(
               ? following.fullFootnoteReferenceIds
               : following.leadFootnoteReferenceIds;
             referenceIds?.forEach((id) => keepSetReferenceIds.add(id));
+            if (!continues) {
+              terminalGridParagraph = following.leadGridParagraph;
+              terminalLeadExtentPt = following.leadContentExtentPt;
+            }
             if (!continues || keepSetBlockedByDeferral) {
               hasTerminalBlock = true;
               break;
@@ -2144,7 +2212,12 @@ function* paginateBodyPassSteps(
             [...keepSetReferenceIds],
             location.availableBounds.widthPt,
           ).reservePt;
-          const keepSetAdmissionPt = keepSetExtentPt + keepSetReservePt;
+          const terminalAdmissionPt = terminalGridParagraph
+            ? wordGridLineAdmissionExtentPt(terminalGridParagraph, terminalLeadExtentPt,
+              unreservedBodyBottomPt, keepSetReservePt, keepSetExtentPt - terminalLeadExtentPt)
+            : terminalLeadExtentPt;
+          const keepSetAdmissionPt = keepSetExtentPt
+            - (terminalLeadExtentPt - terminalAdmissionPt) + keepSetReservePt;
           if (
             hasTerminalBlock
             && (keepSetAdmissionPt > location.availableBounds.heightPt || keepSetBlockedByDeferral)
@@ -2168,6 +2241,7 @@ function* paginateBodyPassSteps(
           // It governs what follows that paragraph; it is not evidence that the
           // preceding inline resource and anchor form a movable keep group.
           && afterNext.sameSourceParagraphAsPrevious !== true;
+        // `word-pre-break-inline-drawing-group`
         const hasInlineDrawingResource = wordPreBreakInlineDrawingResource(acquired.layout);
         if (
           cursor.boundary === null
@@ -2209,6 +2283,7 @@ function* paginateBodyPassSteps(
           cursor.boundary === null
           && followedByHardPageBreak
         ) {
+          // `word-pre-break-anchor-paragraph`
           const neutral = wordFlowNeutralPreBreakAnchorParagraph(acquired.layout);
           if (neutral !== null) {
             state = acceptNode(
@@ -2257,6 +2332,7 @@ function* paginateBodyPassSteps(
             markExtentPt: acquired.blockExtentPt,
             markBelowBaselinePt: acquired.markBelowBaselinePt ?? 0,
             markOnLineGrid: acquired.markOnLineGrid === true,
+            markGridAfterLeadingPt: acquired.markGridAfterLeadingPt,
           });
         // A proven anchor-line deferral ends this page just above that line.
         const anchorLineBreak = deferredAnchorLineIndex(acquired.layout);
@@ -2291,6 +2367,7 @@ function* paginateBodyPassSteps(
             keepLines: block.keepLines,
             widowControl: block.widowControl,
             authoredSpaceAfterPt: block.spaceAfterPt,
+            ...(unreservedBodyBottomPt === undefined ? {} : { unreservedBodyBottomPt }),
             writingMode: activeRegion(state).writingMode,
             ...(anchorLineBreak === undefined ? {} : { lineEndLimit: anchorLineBreak }),
           },
@@ -2408,6 +2485,7 @@ function* paginateBodyPassSteps(
             availableInlineExtentPt: location.availableBounds.widthPt,
             availableBlockExtentPt,
             freshPageBlockExtentPt: freshPageExtent(state),
+            pageHasContent: state.flow.pageHasContent,
             ...(cursor ? { cursor } : {}),
           });
         let availableBlockExtentPt = location.availableBounds.heightPt;
@@ -2525,7 +2603,9 @@ function* paginateBodyPassSteps(
           if (rebasesFloatingTableOnFreshFrame) continue;
           cursor = enteringFreshRegion(cursor);
           yield* commitTransition(
-            advanceColumnOrPage(state.flow, 'overflow'),
+            acquired.requiresFreshPage
+              ? advanceToPage(state.flow, state.flow.section, 'overflow')
+              : advanceColumnOrPage(state.flow, 'overflow'),
             entryIndex,
           );
           continue;
@@ -2722,19 +2802,17 @@ function footnoteStack(
   page: LayoutPage,
   notes: readonly NoteLayout[],
 ): Readonly<{ advancePt: number; targetTopPt: number; topsPt: readonly number[] }> {
-  const advancePt = notes.reduce((sum, note) => sum + note.advancePt, 0);
+  const stack = new NoteStack();
+  notes.forEach((note) => stack.append(note.advancePt));
+  const advancePt = stack.advancePt;
+  // ECMA-376 §17.11.21 defaults footnotes to the current page's bottom.
   const blockEndPt = page.sectionRegions.at(-1)?.blockEndPt
     ?? Math.max(
       0,
       page.section.geometry.pageHeight - Math.abs(page.section.geometry.marginBottom),
     );
   const targetTopPt = blockEndPt - advancePt;
-  let cursorPt = targetTopPt;
-  const topsPt = notes.map((note) => {
-    const topPt = cursorPt;
-    cursorPt += note.advancePt;
-    return topPt;
-  });
+  const topsPt = notes.map((_, index) => stack.topAt(targetTopPt, index));
   return { advancePt, targetTopPt, topsPt };
 }
 
@@ -2777,14 +2855,76 @@ function footnoteBandPlan(
   return Object.freeze(plan);
 }
 
+/** ECMA-376 §17.6.11: page opening and final reserve observation use the same
+ * selected story, band solve and signed-margin overflow rule. Unknown NUMPAGES
+ * remains a pass input; on-demand measurement does not bypass exact convergence. */
+function measurePageHeaderFooterReserve(
+  session: BodyLayoutSession,
+  context: PageStoryContext,
+): HeaderFooterReserve {
+  const { owner, pageIndex, section, firstPageOfSection, pageNumber } = context;
+  // Vertical stories paint in physical page space; their overflow must not
+  // charge the logical body interval. Use the resolved frame, including native
+  // flow facts, rather than the text-direction token alone.
+  if (sectionWritingMode(section) !== 'horizontal-tb') return { top: 0, bottom: 0 };
+  const inlineExtentPt = Math.max(
+    0,
+    section.geometry.pageWidth
+      - Math.abs(section.geometry.marginLeft)
+      - Math.abs(section.geometry.marginRight),
+  );
+  const measure = (kind: 'header' | 'footer') => {
+    const source = selectedHeaderFooterStory(
+      kind === 'header' ? owner.headers : owner.footers,
+      {
+        titlePage: owner.titlePage,
+        firstPageOfSection,
+        evenAndOddHeaders: owner.evenAndOddHeaders,
+        displayPageNumber: pageNumber.displayNumber,
+      },
+    );
+    if (source === null) return 0;
+    const layoutStory = session.layoutStory;
+    if (!layoutStory) {
+      throw new Error('Header/footer story layout requires a story-capable layout session');
+    }
+    // The reserve measures the story exactly as composition lays it out.
+    const { story } = layoutBandStory((band) => layoutStory({
+      source,
+      pageStoryOwner: owner.sectionOccurrenceId,
+      pageIndex,
+      pageNumber: { displayNumber: pageNumber.displayNumber, format: pageNumber.format },
+      section,
+      container: {
+        id: `story:${kind}:page:${pageIndex}`,
+        kind,
+        bounds: {
+          xPt: Math.abs(section.geometry.marginLeft),
+          yPt: 0,
+          widthPt: inlineExtentPt,
+          heightPt: section.geometry.pageHeight,
+        },
+      },
+      ...(band ? { bandTranslationPt: band } : {}),
+    }), kind, section.geometry);
+    return kind === 'header' ? headerStoryBodyReserveExtentPt(story) : story.advancePt;
+  };
+  return Object.freeze({
+    top: headerFooterOverflowReservePt(
+      measure('header'),
+      section.geometry.marginTop,
+      section.geometry.headerDistance,
+    ),
+    bottom: headerFooterOverflowReservePt(
+      measure('footer'),
+      section.geometry.marginBottom,
+      section.geometry.footerDistance,
+    ),
+  });
+}
+
 function headerFooterReserves(
-  pass: Readonly<{
-    layout: DocumentLayout;
-    session: BodyLayoutSession;
-    footnoteLayoutsByPage: ReadonlyMap<number, readonly NoteLayout[]>;
-    footnoteHostShiftsByPage: ReadonlyMap<number, ReadonlyMap<string, number>>;
-  }>,
-  owners: ReadonlyMap<string, BodySectionLayoutInput>,
+  pass: BodyPaginationPassResult,
 ): readonly HeaderFooterReserve[] {
   return Object.freeze(pass.layout.pages.map((page, pageIndex) => {
     if (page.parityBlank) return Object.freeze({ top: 0, bottom: 0 });
@@ -2795,67 +2935,15 @@ function headerFooterReserves(
       pass.footnoteLayoutsByPage.get(page.pageIndex) ?? [],
       pass.footnoteHostShiftsByPage.get(page.pageIndex),
     );
-    // Vertical header/footer stories paint in physical page space; charging their
-    // measured overflow to the logical body interval would create a pagination-only reserve.
-    // The section's own frame decides (a native flow fact included), never
-    // the text-direction token alone; the footnote plan is kept either way.
-    if (sectionWritingMode(page.section) !== 'horizontal-tb') {
-      return Object.freeze({ top: 0, bottom: 0, ...(footnoteTopsPt ? { footnoteTopsPt } : {}) });
-    }
-    const owner = owners.get(page.sectionOccurrenceId);
-    if (!owner) throw new Error(`Unknown body section ${page.sectionOccurrenceId}`);
-    const inlineExtentPt = Math.max(
-      0,
-      page.section.geometry.pageWidth
-        - Math.abs(page.section.geometry.marginLeft)
-        - Math.abs(page.section.geometry.marginRight),
-    );
-    const measure = (kind: 'header' | 'footer') => {
-      const source = selectedHeaderFooterStory(
-        kind === 'header' ? owner.headers : owner.footers,
-        {
-          titlePage: owner.titlePage,
-          firstPageOfSection: isFirstSectionOwnedPage(pass.layout.pages, pageIndex),
-          evenAndOddHeaders: owner.evenAndOddHeaders,
-          displayPageNumber: page.pageNumber.displayNumber,
-        },
-      );
-      if (source === null) return 0;
-      const layoutStory = pass.session.layoutStory;
-      if (!layoutStory) {
-        throw new Error('Header/footer story layout requires a story-capable layout session');
-      }
-      // The reserve measures the story exactly as composition lays it out.
-      const { story } = layoutBandStory((band) => layoutStory({
-        source,
-        pageIndex: page.pageIndex,
-        section: page.section,
-        container: {
-          id: `story:${kind}:page:${page.pageIndex}`,
-          kind,
-          bounds: {
-            xPt: Math.abs(page.section.geometry.marginLeft),
-            yPt: 0,
-            widthPt: inlineExtentPt,
-            heightPt: page.section.geometry.pageHeight,
-          },
-        },
-        ...(band ? { bandTranslationPt: band } : {}),
-      }), kind, page.section.geometry);
-      return kind === 'header' ? headerStoryBodyReserveExtentPt(story) : story.advancePt;
-    };
+    const context = pass.pageStoryContexts[pageIndex]!;
     return Object.freeze({
+      ...measurePageHeaderFooterReserve(pass.session, context),
       ...(footnoteTopsPt ? { footnoteTopsPt } : {}),
-      top: headerFooterOverflowReservePt(
-        measure('header'),
-        page.section.geometry.marginTop,
-        page.section.geometry.headerDistance,
-      ),
-      bottom: headerFooterOverflowReservePt(
-        measure('footer'),
-        page.section.geometry.marginBottom,
-        page.section.geometry.footerDistance,
-      ),
+      observedPage: { owner: context.owner.sectionOccurrenceId,
+        firstPageOfSection: context.firstPageOfSection,
+        parityBlank: false, pageNumber: context.pageNumber,
+        ...(context.firstContentPageIndex === undefined ? {}
+          : { firstContentPageIndex: context.firstContentPageIndex }) },
     });
   }));
 }
@@ -2881,7 +2969,8 @@ function composePageStories(
     }
     const vertical = sectionWritingMode(page.section) !== 'horizontal-tb';
     const geometry = vertical
-      ? physicalSectionGeometry(page.section.geometry, page.section.nativeSectionFlow)
+      // `word-vertical-section-physical-header-footer`
+      ? physicalSectionGeometry(page.section.geometry, page.section.sectionFlow)
       : page.section.geometry;
     const inlineStartPt = Math.abs(geometry.marginLeft);
     const inlineExtentPt = Math.max(
@@ -2891,7 +2980,7 @@ function composePageStories(
     const coordinateSpace = vertical ? 'upright-physical' as const : 'section-logical' as const;
     // Upright physical page stories are horizontal, so a native section frame
     // does not carry into them.
-    const { nativeSectionFlow: _nativeSectionFlow, ...pageSection } = page.section;
+    const { sectionFlow: _sectionFlow, ...pageSection } = page.section;
     const pageStorySection: DeepReadonly<SectionLayoutContext> = vertical
       ? Object.freeze({
           ...pageSection,
@@ -2917,7 +3006,9 @@ function composePageStories(
       if (source === null) return null;
       const { story, translation } = layoutBandStory((band) => session.layoutStory!({
         source,
+        pageStoryOwner: owner.sectionOccurrenceId,
         pageIndex: page.pageIndex,
+        pageNumber: { displayNumber: page.pageNumber.displayNumber, format: page.pageNumber.format },
         section: pageStorySection,
         container: {
           id: `story:${kind}:page:${page.pageIndex}`,
@@ -3125,6 +3216,7 @@ function composeDocumentEndnotes(
     pageFootnoteTopPt,
   );
   const id = `endnotes:page:${page.pageIndex}`;
+  // ECMA-376 §17.11.22 defaults endnotes to the document end.
   // The container is the notes' painted position in the region's logical
   // frame, so note story coordinates are that frame's page coordinates; the
   // region's own transform (applied to the whole note layer) relates them to
@@ -3149,12 +3241,13 @@ function composeDocumentEndnotes(
       firstOnPage: true,
     });
     if (notes.length === 0) return layout;
-    const advancePt = notes.reduce((sum, note) => sum + note.advancePt, 0);
+    const stack = new NoteStack();
+    notes.forEach((note) => stack.append(note.advancePt));
     const endnoteLogicalBounds = Object.freeze({
       xPt: bodyDomain.logicalBounds.xPt,
       yPt: blockStartPt,
       widthPt: bodyDomain.logicalBounds.widthPt,
-      heightPt: advancePt,
+      heightPt: stack.advancePt,
     });
     const endnoteDomain = Object.freeze({
       id,
@@ -3768,6 +3861,17 @@ function anchorPlanIdentity(plan: ReadonlyMap<string, unknown>): string {
   return JSON.stringify([...plan].sort(([left], [right]) => left.localeCompare(right)));
 }
 
+/** Source order of two page-owned table keys (`table:<story>:<instance>:<path>`):
+ * body paths compare element by element, numerically. */
+function compareTableSourceOrder(left: string, right: string): number {
+  const path = (key: string) => key.slice(key.lastIndexOf(':') + 1).split('.').map(Number);
+  const [a, b] = [path(left), path(right)];
+  for (let index = 0; index < Math.min(a.length, b.length); index += 1) {
+    if (a[index] !== b[index]) return a[index]! - b[index]!;
+  }
+  return a.length - b.length || (left < right ? -1 : left > right ? 1 : 0);
+}
+
 function changedAnchorKeys(
   applied: ReadonlyMap<string, PageWrapDestination>,
   observed: ReadonlyMap<string, PageWrapDestination>,
@@ -4130,11 +4234,13 @@ function* paginateBodyWithAnchorConvergenceSteps(
         leadingSecond = null;
         if (initialPlan !== null || !publish || !(error instanceof ExactConvergenceError) || error.reason !== 'cycle'
           || latest.carry === null) throw error;
-        // Library termination policy, not a claim about Word placement:
         // §17.4.57 defines page-relative geometry but not this solver's cycle
-        // recovery. Pin only oscillating tables to the latest page in the
-        // repeated cycle; never return a pass with stale exclusions. Normal
-        // acquisition then rebuilds text and table placement with these floors.
+        // recovery. `word-page-table-later-yields`: pin only the last
+        // oscillating table (in source order) to the latest page it reached
+        // in the repeated cycle, and let the earlier tables settle around it;
+        // a persisting cycle pins the next one on the following recovery.
+        // Never return a pass with stale exclusions: normal acquisition then
+        // rebuilds text and table placement with these floors.
         const repeated = error.states.at(-1)!;
         const cycle = error.states.slice(error.states.indexOf(repeated), -1)
           .map((state) => new Map(JSON.parse(state.split('\u0004')[0]!) as Array<[string, PageWrapDestination]>));
@@ -4147,13 +4253,11 @@ function* paginateBodyWithAnchorConvergenceSteps(
             later.set(key, Math.max(later.get(key) ?? -1, destination.pageIndex));
           }
         }
-        let raised = false;
-        for (const [key, pageIndex] of later) {
-          if (!changed.has(key) || pageIndex <= (settledFloors.get(key) ?? -1)) continue;
-          settledFloors.set(key, pageIndex);
-          raised = true;
-        }
-        if (!raised) throw error;
+        const pinned = [...later]
+          .filter(([key, pageIndex]) => changed.has(key) && pageIndex > (settledFloors.get(key) ?? -1))
+          .sort(([left], [right]) => compareTableSourceOrder(right, left))[0];
+        if (!pinned) throw error;
+        settledFloors.set(pinned[0], pinned[1]);
         // Every settlement strictly raises a table floor: at most one raise
         // per table per page. Restarts share the original operational pass
         // budget as well, so even a growing page count cannot run unbounded.
@@ -4467,7 +4571,7 @@ export function* paginateBodySteps(
     number,
     ReserveRepaginationCarry
   >(seed, {
-    measure: (pass) => headerFooterReserves(pass, owners),
+    measure: (pass) => headerFooterReserves(pass),
     // A repagination reads only these facts of the pass before it (besides
     // the measured reserves). Carrying them, rather than the pass, lets that
     // pass's whole layout and pagination session be collected while the next
@@ -4485,14 +4589,30 @@ export function* paginateBodySteps(
         totalPages: contexts.length,
         resolveDestinationPage: (pageIndex) => contexts[pageIndex],
       });
-      return yield* paginateBodyWithColumnBalancingSteps(
-        input,
-        iterationServices,
-        options,
-        reserves,
-        undefined,
-        carried.anchorPlan,
-      );
+      let observed = reserves;
+      const openingObservations = new Set<string>();
+      // Retry the same algorithm with actual opening observations. Bound retries
+      // by the page ceiling, retain only recent exact identities, and share the
+      // original hard miss ledger. Completed-pass exact reserve, field and anchor
+      // convergence remains unchanged. A fixed small retry cap would reject
+      // documents with many independent first/default section boundaries.
+      for (let refinement = 0; refinement < MAX_BODY_LAYOUT_PAGES; refinement++) {
+        const fingerprint = JSON.stringify(observed);
+        if (openingObservations.has(fingerprint)) throw new LayoutInvariantError('NON_CONVERGENCE', 'Opened page reserve observations did not converge');
+        openingObservations.add(fingerprint);
+        if (openingObservations.size > MAX_OPENED_RESERVE_IDENTITIES) {
+          openingObservations.delete(openingObservations.values().next().value!);
+        }
+        try {
+          return yield* paginateBodyWithColumnBalancingSteps(
+            input, iterationServices, options, observed, undefined, carried.anchorPlan,
+          );
+        } catch (error) {
+          if (!(error instanceof OpenedPageReserveObservation)) throw error;
+          observed = error.reserves;
+        }
+      }
+      throw new LayoutInvariantError('NON_CONVERGENCE', 'Opened page reserve observation refinement limit exceeded');
     },
     identity: (pass) => paginationFieldPageContexts(pass.layout),
     requiresConvergence: seed.session.hasPaginationFields,

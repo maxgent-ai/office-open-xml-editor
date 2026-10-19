@@ -17,7 +17,6 @@ import {
   catAxisLabelBandH,
   chartLegendBands,
   chartAxisTitleBands,
-  axisTitleFontPx,
   chartTextFontSizePx,
   chartManualOuterAxisInsets,
   categoryTickLabelGapPx,
@@ -26,6 +25,7 @@ import {
 
 import { axisLineWidthPx, resolveAxisLine, isCrossBetween } from '../axis-style.js';
 import { formatCategoryLabel } from '../chart-number-format.js';
+import { authoredExtraLinesHeight, axisLabelLineHeightPx, fillAuthoredText, measureAuthoredTextWidth } from '../chart-text-lines.js';
 
 import { categoryLabelAnchorFraction, categoryLabelOffsetPx } from '../category-spacing.js';
 
@@ -43,7 +43,7 @@ import { chartHasDataTable, chartDataTableBaseHeight, chartDataTableHeaderWidth,
 import { createDataLabelLegendKeyResolver, measuredLegendReserve, drawLegendForLayout } from '../shared/legend.js';
 import { drawAxisTick, strokeAxisSegment, strokeValueGridlineH, valGridStroke, valMinorGridStroke, drawCatMajorGridlines, catGridStroke, catGridlineFractions, catAxisReversed, drawValMajorGridlines, formatPrimaryValueAxisTick, displayUnitDivisor, formatAxisTickWithUnits, planValueAxis, axisLabelPx, catLabelsVisible, catLabelRotationRad, drawRotatedCatLabel } from '../shared/axis.js';
 import { drawSeriesTrendlines } from '../shared/trendline.js';
-import { chartDateAxisPlan, forEachErrorBarEndpoint, computeSecondaryAxis, drawSecondaryValueGridlines, drawSecondaryValueAxis } from '../shared/secondary-axis.js';
+import { chartDateAxisPlan, forEachErrorBarEndpoint, computeSecondaryAxis, drawSecondaryValueGridlines, drawSecondaryValueAxis, secondaryAxisTitleBandW } from '../shared/secondary-axis.js';
 import { measuredCartesianTitleBand, drawChartTitleForLayout } from '../shared/title.js';
 import { dataLabelWithinAxisMaximum, drawDataLabelText, drawCategoryDataLabels } from '../shared/data-labels.js';
 import { chartCategories } from '../category-spacing.js';
@@ -201,7 +201,7 @@ export function renderLineChart(
   let titleFontPx = titleBand.fontPx;
   let titleTopPad = titleBand.topPad;
   let titleH = titleBand.bandH;
-  const leg = measuredLegendReserve(ctx, chart, w, h, 0.22, ptToPx);
+  const leg = measuredLegendReserve(ctx, chart, w, h, ptToPx);
   const { legRightW, legLeftW, legTopH, legBottomH } = chartLegendBands(
     leg, chart.legendOverlay === true,
   );
@@ -262,15 +262,17 @@ export function renderLineChart(
     );
     let wmax = 0;
     for (const value of secScale.majorLines) {
-      wmax = Math.max(wmax, ctx.measureText(formatAxisTickWithUnits(value, sec.formatCode ?? null, chart.date1904, sec.displayUnits)).width);
+      wmax = Math.max(wmax, measureAuthoredTextWidth(ctx, formatAxisTickWithUnits(value, sec.formatCode ?? null, chart.date1904, sec.displayUnits)));
     }
     secLabelBandW = wmax + 18;
     ctx.font = prevFont;
   }
   const secTitleBandW = sec && sec.title
-    ? axisTitleFontPx(sec.titleFontSizeHpt, ptToPx) + 8
+    ? secondaryAxisTitleBandW(sec, ptToPx)
     : 0;
 
+  // Fixed gutter terms (2.2 x label font + 10 px, 5 % right): library policy,
+  // see ChartPad in layout.ts.
   let titleLeftBandW = legLeftW + Math.max(
     valAxFontPx * 2.2 + 10 + valTitleW,
     dataTableHeaderW,
@@ -296,7 +298,7 @@ export function renderLineChart(
     for (const value of provisionalPlan.majorLines) {
       primaryLabelWidth = Math.max(
         primaryLabelWidth,
-        ctx.measureText(formatPrimaryValueAxisTick(chart, value, axisIsPercent)).width,
+        measureAuthoredTextWidth(ctx, formatPrimaryValueAxisTick(chart, value, axisIsPercent)),
       );
     }
     ctx.font = previousFont;
@@ -307,6 +309,24 @@ export function renderLineChart(
     titleLeftBandW = Math.max(titleLeftBandW,
       legLeftW + primaryLabelWidth + 10 + valTitleW);
   }
+  // Value tick labels with authored breaks (a number format containing a line
+  // feed) are centred on their ticks, so the top label rises half its extra
+  // lines above the single-line half-label reserve. Exactly 0 without breaks.
+  const valueLabelTopExtraH = Math.max(
+    chart.valAxisHidden || chart.valAxisTickLabelPos === 'none'
+      ? 0
+      : authoredExtraLinesHeight(
+        provisionalPlan.majorLines.map(value => formatPrimaryValueAxisTick(chart, value, axisIsPercent)),
+        axisLabelLineHeightPx(valAxFontPx),
+      ),
+    sec && secScale && !sec.hidden && sec.tickLabelPos !== 'none'
+      ? authoredExtraLinesHeight(
+        secScale.majorLines.map(value => formatAxisTickWithUnits(value, sec.formatCode ?? null, chart.date1904, sec.displayUnits)),
+        axisLabelLineHeightPx(secFontPx),
+      )
+      : 0,
+  ) / 2;
+  padT += valueLabelTopExtraH;
   // Pad based on actual label metrics rather than magic percents so an explicit
   // <c:txPr sz="1000"> (10pt) correctly compresses the plot area.
   const pad = {
@@ -335,11 +355,11 @@ export function renderLineChart(
     valTitleBandW: valTitleW,
     catTitleBandH: catTitleH,
     secondaryBandW: secLabelBandW + secTitleBandW,
+    valLabelExtraTopPx: valueLabelTopExtraH,
   });
 
   let lineFrame = computeChartFrame(chart, x, y, w, h, ptToPx, {
     titleBand,
-    legendSideReserveFrac: 0.22,
     legendReserve: leg,
     pad,
     honorPlotAreaManualLayout: true,
@@ -360,11 +380,10 @@ export function renderLineChart(
     titleFontPx = titleBand.fontPx;
     titleTopPad = titleBand.topPad;
     titleH = titleBand.bandH;
-    padT = titleH + legTopH + valAxFontPx / 2 + 2;
+    padT = titleH + legTopH + valAxFontPx / 2 + 2 + valueLabelTopExtraH;
     pad.t = padT;
     lineFrame = computeChartFrame(chart, x, y, w, h, ptToPx, {
       titleBand,
-      legendSideReserveFrac: 0.22,
       legendReserve: leg,
       pad,
       honorPlotAreaManualLayout: true,
@@ -386,6 +405,32 @@ export function renderLineChart(
     : null;
   if (dataTableLayout && dataTableLayout.totalHeight > dataTableBaseH) {
     ph = Math.max(1, ph - (dataTableLayout.totalHeight - dataTableBaseH));
+  }
+  const dateAxisPlan = chartDateAxisPlan(chart, cats);
+  const catLabelRotation = catLabelRotationRad(chart);
+  // Category labels as painted below (authored tickLblSkip interval, date-axis
+  // ticks formatted by the axis numFmt).
+  const categoryLabelInterval = Math.max(1, Math.floor(chart.catAxisTickLabelSkip ?? 1));
+  const categoryLabelTexts = (): string[] => dateAxisPlan
+    ? dateAxisPlan.majorTicks.map(tick =>
+      formatCategoryLabel(String(tick.serial), chart.catAxisFormatCode, chart.date1904))
+    : Array.from({ length: Math.ceil(n / categoryLabelInterval) }, (_, index) =>
+      formatCategoryLabel((cats[index * categoryLabelInterval] ?? '').toString(), chart.catAxisFormatCode, chart.date1904));
+  // Authored breaks in a category label stack extra lines below the first;
+  // an automatic/outer layout lifts the plot bottom by them, as the column
+  // family does for its wrapped labels. An authored inner rectangle already
+  // leaves its own label band. Exactly 0 without breaks.
+  // Labels at the high (top) edge hang into the plot from its top, so they
+  // need no bottom band.
+  if (!chart.catAxisHidden && !hasDataTable && catLabelsVisible(chart) && chart.catAxisTickLabelPos !== 'high') {
+    const manualInner = chart.plotAreaManualLayout?.layoutTarget === 'inner' &&
+      chart.plotAreaManualLayout.w != null && chart.plotAreaManualLayout.h != null;
+    const categoryLabelExtraH = authoredExtraLinesHeight(
+      categoryLabelTexts(),
+      axisLabelLineHeightPx(catAxFontPx),
+      catLabelRotation,
+    );
+    if (!manualInner && categoryLabelExtraH > 0) ph = Math.max(1, ph - categoryLabelExtraH);
   }
 
   paintPlotAreaFrame(ctx, chart, px0, py0, pw, ph, ptToPx, shapeRotationDeg);
@@ -422,7 +467,6 @@ export function renderLineChart(
   const primaryCatTickWidth = chart.catAxisLineWidthEmu != null ? primaryCatLine.width : undefined;
   const primaryValTickColor = chart.valAxisLineColor != null ? primaryValLine.color : undefined;
   const primaryValTickWidth = chart.valAxisLineWidthEmu != null ? primaryValLine.width : undefined;
-  const dateAxisPlan = chartDateAxisPlan(chart, cats);
   // crossBetween="between" (default) insets the first/last category by half a
   // step so points aren't flush against the axes. "midCat" anchors them.
   // A `maxMin` category orientation (§21.2.2.130) mirrors the index left↔right.
@@ -460,7 +504,10 @@ export function renderLineChart(
         const gap = chart.valAxisFontSizeHpt != null
           ? valueTickLabelGapPx(valAxFontPx)
           : 6;
-        ctx.fillText(formatPrimaryValueAxisTick(chart, v, axisIsPercent), px0 - gap, gy);
+        fillAuthoredText(
+          ctx, formatPrimaryValueAxisTick(chart, v, axisIsPercent), px0 - gap, gy,
+          axisLabelLineHeightPx(valAxFontPx),
+        );
       }
     }
     if (chart.valAxisMinorTickMark && chart.valAxisMinorTickMark !== 'none') {
@@ -780,8 +827,8 @@ export function renderLineChart(
       }
     }
     const showLabels = !hasDataTable && catLabelsVisible(chart);
-    const labelInterval = Math.max(1, Math.floor(chart.catAxisTickLabelSkip ?? 1));
-    const rotRad = catLabelRotationRad(chart);
+    const labelInterval = categoryLabelInterval;
+    const rotRad = catLabelRotation;
     const labelEntries = dateAxisPlan
       ? dateAxisPlan.majorTicks.map(tick => ({
         label: formatCategoryLabel(String(tick.serial), chart.catAxisFormatCode, chart.date1904),
@@ -824,7 +871,7 @@ export function renderLineChart(
       const labelAxisY = labelPosition === 'nextTo'
         ? primaryCategoryAxisY
         : labelPosition === 'high' ? py0 : py0 + ph;
-      drawRotatedCatLabel(ctx, label, tx, labelAxisY + gap, rotRad);
+      drawRotatedCatLabel(ctx, label, tx, labelAxisY + gap, rotRad, axisLabelLineHeightPx(catAxFontPx));
     }
   }
 

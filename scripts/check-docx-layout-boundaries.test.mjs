@@ -666,9 +666,9 @@ test('logical-table preparation retains source ownership and complete column con
       'function resolveColumnWidths(state, paragraph) { return acquireTableColumnInput(state, paragraph); }\n'
       + 'function acquireTableColumnInput(state, paragraph) {')
     .replace('sourceIndex: number)',
-      'sourceIndex: number, prepared?: Readonly<{ columns: readonly number[]; decision: LogicalTableDecision; member: TableMemberDecision }>)')
+      'sourceIndex: number, preparedColumns?: () => Readonly<{ columns: readonly number[]; decision: LogicalTableDecision; member: TableMemberDecision }>, preparedPassKey?: string)')
     .replace('computeTablePtLayout(state, table, 100, 0)',
-      'computeTablePtLayout(state, table, 100, 0, { columns: [], decision: {}, member: {} })');
+      'computeTablePtLayout(state, table, 100, 0, () => ({ columns: [], decision: {}, member: {} }), undefined)');
   write(root, path, canonical);
   assert.equal(runChecker(root, '--final').status, 0);
   for (const [label, source] of [
@@ -678,8 +678,16 @@ test('logical-table preparation retains source ownership and complete column con
     ).replace('    paragraph,\n  );\n  return baseContext;', '    paragraph,\n  ) : {};\n  return baseContext;')],
     ['unowned source', canonical.replace('sourceIndex: number', 'sourceIndex?: number')],
     ['untyped preparation', canonical.replace(
-      'prepared?: Readonly<{ columns: readonly number[]; decision: LogicalTableDecision; member: TableMemberDecision }>',
-      'prepared?: unknown')],
+      'preparedColumns?: () => Readonly<{ columns: readonly number[]; decision: LogicalTableDecision; member: TableMemberDecision }>',
+      'preparedColumns?: unknown')],
+    ['eager preparation', canonical.replace(
+      'preparedColumns?: () => Readonly<',
+      'preparedColumns?: Readonly<')],
+    ['untyped memo key', canonical.replace('preparedPassKey?: string', 'preparedPassKey?: unknown')],
+    ['preparation without memo key', canonical
+      .replace(', preparedPassKey?: string)', ')')
+      .replace(', () => ({ columns: [], decision: {}, member: {} }), undefined)',
+        ', () => ({ columns: [], decision: {}, member: {} }))')],
     ['unwired column authority', canonical.replace(
       'return acquireTableColumnInput(state, paragraph);', 'return [];')],
   ]) {
@@ -956,6 +964,8 @@ test('paint reaches layout affine algebra only through the exact reviewed facade
 
 test('every reviewed atomic core paint binding remains explicitly allowed', () => {
   const valueBindings = [
+    'getCachedDuotoneBitmapByPath',
+    'blipPixelEffectsKey',
     'autoContrastColor',
     'canvasFontString',
     'captureDecodedBitmapCacheEpoch',

@@ -15,7 +15,7 @@ export interface OpenTypeLineMetrics {
   readonly winDescent?: number;
   readonly useTypoMetrics?: boolean;
   /** OS/2 ulCodePageRange1 bits 17–20 identify the Far East code-page class
-   * observed by Word for Mac's automatic line allocation. `null` means the
+   * observed by Word's automatic line allocation. `null` means the
    * OS/2 version/table does not declare code-page ranges; cmap coverage is
    * deliberately independent of this classification. */
   readonly farEastCodePage?: boolean | null;

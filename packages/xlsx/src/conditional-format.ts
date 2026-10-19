@@ -2,7 +2,6 @@ import type { Worksheet, Cell, WorksheetCellRange, CfStop, CfValue, Dxf, CfRule,
 import { dxfFontToggle } from './dxf-font.js';
 import { decodeCfLiteral, decodeCfOperandResult, type CfOperandValue } from './cf-operand.js';
 import { evaluateFormula, formulaEvaluationToBool } from './formula.js';
-import type { CfDiagnosticCollector, CfDiagnosticKind } from './cf-diagnostics.js';
 import { buildCellCoordinateIndex } from './renderer-coordinate-index.js';
 import { getWorksheetPolicy } from './worksheet-policy-context.js';
 
@@ -12,11 +11,6 @@ import { getWorksheetPolicy } from './worksheet-policy-context.js';
 export interface CompiledCfRule {
   rule: CfRule;
   sqref: WorksheetCellRange[];
-  /** Document position (index into `Worksheet.conditionalFormats` and into
-   *  that block's rules), captured before the priority sort. Names the rule
-   *  in conditional-formatting diagnostics. */
-  blockIndex: number;
-  ruleIndex: number;
   scaleMin?: number;
   scaleMax?: number;
   scaleStops?: number[];
@@ -32,15 +26,11 @@ export interface CompiledCfRule {
   iconThresholds?: number[];
   cellIsOperands?: CellIsOperand[];
   /** Threshold admission (#1547): a cfvo the library cannot resolve without
-   *  guessing. Such a scale rule is skipped (no paint, no stop) and reported
-   *  when the visible evaluation reaches it. */
+   *  guessing. Such a scale rule is skipped (no paint, no stop). */
   thresholdUnsupported?: boolean;
   thresholdInvalid?: boolean;
 
 }
-
-// Protocol with CfRule::Other, fixed four bits; allocated once, not per cell.
-const OTHER_FORMULA_PHASES = [[1, 'expression'], [2, 'cellIs'], [4, 'activity'], [8, 'threshold']] as const;
 
 export interface CfContext {
   compiled: CompiledCfRule[];
@@ -106,9 +96,12 @@ function collectNumericValuesInRanges(worksheet: Worksheet, ranges: WorksheetCel
   return out;
 }
 
-/** A resolved cfvo threshold, or the diagnostic kind that keeps the rule from
- *  using a guessed threshold. */
-type CfvoResolution = number | CfDiagnosticKind;
+/** Why a cfvo threshold could not be resolved without guessing. */
+type CfvoFailure = 'unsupported' | 'invalid';
+
+/** A resolved cfvo threshold, or the failure that keeps the rule from using a
+ *  guessed threshold. */
+type CfvoResolution = number | CfvoFailure;
 
 /**
  * The numeric parameter of a non-min/max cfvo (ECMA-376 §18.3.1.11 `val`, or
@@ -120,7 +113,7 @@ type CfvoResolution = number | CfDiagnosticKind;
  * library's existing default. The former `parseFloat` read `1+1` as 1 and a
  * reference as 0, i.e. it invented a threshold.
  */
-function cfvoParameter(cfv: CfValue | CfStop): number | undefined | CfDiagnosticKind {
+function cfvoParameter(cfv: CfValue | CfStop): number | undefined | CfvoFailure {
   const text = cfv.value;
   if (text == null || text.trim() === '') {
     return cfv.kind === 'formula' ? 'invalid' : undefined;
@@ -188,22 +181,19 @@ export function compileCf(
     definedNames.set(dn.name, dn);
   }
   const blocks = worksheet.conditionalFormats ?? [];
-  for (let blockIndex = 0; blockIndex < blocks.length; blockIndex++) {
-    const cf = blocks[blockIndex];
+  for (const cf of blocks) {
     // New provenance-only blocks must not trigger cached-cell scans. Only
     // existing statistical/scale rules need range samples; reuse their work.
     const needsSamples = cf.rules.some(rule => rule.type !== 'expression' && rule.type !== 'cellIs' && rule.type !== 'other' && !(rule.type === 'dataBar' && rule.extThresholdFormula));
     const samples = needsSamples ? collectNumericValuesInRanges(worksheet, cf.sqref) : [];
-    for (let ruleIndex = 0; ruleIndex < cf.rules.length; ruleIndex++) {
-      const rule = cf.rules[ruleIndex];
-      // Document position is captured here, before the priority sort below.
-      const entry: CompiledCfRule = { rule, sqref: cf.sqref, blockIndex, ruleIndex };
+    for (const rule of cf.rules) {
+      const entry: CompiledCfRule = { rule, sqref: cf.sqref };
       if (rule.type === 'colorScale') {
         entry.scaleStops = admitThresholds(entry, rule.stops.map(s => resolveCfvoValue(s, samples)));
       } else if (rule.type === 'dataBar') {
         if (rule.extThresholdFormula) {
           // This marker represents a refused x14 threshold, including a
-          // formula whose body is deliberately not retained. Do not diagnose
+          // formula whose body is deliberately not retained. Do not treat
           // that omitted body as a malformed standard formula or evaluate it.
           entry.thresholdUnsupported = true;
         } else {
@@ -403,8 +393,7 @@ function applyDxfToResult(result: CfResult, dxf: Dxf | null | undefined): void {
  * (`decodeCfOperandResult`).
  *
  * Library policy (#1547): a condition outside that decoder (or a linked x14
- * activity formula) is `unsupported` and is
- * reported; a cached Excel error is inactive. Numeric-result policy: only a
+ * activity formula) is `unsupported`; a cached Excel error is inactive. Numeric-result policy: only a
  * number is established as zero / nonzero; a logical, text or blank result is
  * not converted and stays inactive (the existing matching, not a claim of
  * Excel's conversion). An inactive or unsupported rule neither formats the
@@ -435,43 +424,27 @@ function hasThresholdFailure(entry: CompiledCfRule): boolean {
 }
 
 /** Whether a scale rule that reached a numeric cell formats it: its activity
- *  holds and its thresholds were admitted. A refused rule is reported and
- *  neither paints nor stops. Threshold failures are reported only after the
- *  activity is established, so an inactive rule makes no threshold claim. */
+ *  holds and its thresholds were admitted. A refused rule neither paints nor
+ *  stops. */
 function admitScaleRule(
   entry: CompiledCfRule,
   formula: string | undefined,
   row: number,
   col: number,
   cfCtx: CfContext,
-  diagnostics: CfDiagnosticCollector | undefined,
 ): boolean {
   const activity = scaleRuleActivity(formula, entry, row, col, cfCtx);
-  if (activity === 'unsupported') {
-    diagnostics?.record(entry, 'activity', 'unsupported', row, col);
-    return false;
-  }
-  if (activity === 'inactive') return false;
-  if (!hasThresholdFailure(entry)) return true;
-  if (entry.thresholdUnsupported) diagnostics?.record(entry, 'threshold', 'unsupported', row, col);
-  if (entry.thresholdInvalid) diagnostics?.record(entry, 'threshold', 'invalid', row, col);
-  return false;
+  if (activity === 'unsupported' || activity === 'inactive') return false;
+  return !hasThresholdFailure(entry);
 }
 
-/**
- * Evaluate every rule covering one cell in priority order. `diagnostics` is
- * the operation-local collector of the render that owns this call; the
- * evaluation result is unchanged with or without it. Only rules this call
- * actually reaches are reported; rules after a matching stopIfTrue rule are
- * not reached and make no claim.
- */
+/** Evaluate every rule covering one cell in priority order. */
 export function evaluateCf(
   cell: Cell | undefined,
   row: number,
   col: number,
   cfCtx: CfContext,
   dxfs: Dxf[],
-  diagnostics?: CfDiagnosticCollector,
 ): CfResult {
   const result: CfResult = {};
   if (!cfCtx.compiled.length) return result;
@@ -491,9 +464,8 @@ export function evaluateCf(
     if (rule.type === 'expression') {
       const anchor = entry.sqref[0];
       if (!anchor) continue;
-      // One evaluation, reused for both the match and the diagnostic (TODAY
-      // / NOW stay consistent). A valid FALSE / 0 and an Excel error value
-      // are normal no-matches; only unsupported / invalid are reported.
+      // A valid FALSE / 0 and an Excel error value are normal no-matches; an
+      // unsupported or invalid formula is also no match and no stop.
       const evaluation = evaluateFormula(rule.formula, {
         row, col,
         anchorRow: anchor.top, anchorCol: anchor.left,
@@ -501,9 +473,6 @@ export function evaluateCf(
         definedNames: cfCtx.definedNames,
         depth: 0,
       });
-      if (evaluation.kind === 'unsupported' || evaluation.kind === 'invalid') {
-        diagnostics?.record(entry, 'expression', evaluation.kind, row, col);
-      }
       matched = formulaEvaluationToBool(evaluation);
       if (matched) applyDxfToResult(result, rule.dxfId != null ? dxfs[rule.dxfId] : null);
     } else if (rule.type === 'cellIs') {
@@ -513,17 +482,17 @@ export function evaluateCf(
       // §18.3.1.10: between/notBetween take two formulas, every other
       // operator one; the operator is ST_ConditionalFormattingOperator
       // (§18.18.15). An unknown operator or a missing operand is a
-      // structurally invalid rule: reported, no match, no stop.
+      // structurally invalid rule: no match, no stop.
       const arity = rule.operator === 'between' || rule.operator === 'notBetween' ? 2 : 1;
       if (!CELL_IS_OPERATORS.has(rule.operator) || cellIsOperands.length < arity) {
-        diagnostics?.record(entry, 'cellIs', 'invalid', row, col);
+        // no match
       } else {
         // Compare only with decoded operands. A cached Excel error, or an
         // operand whose type differs from the cell's (blank and logical
         // included), is a normal no-match. An operand outside the decoder's
         // literal / single-cell-reference grammar, or a relative reference
         // shifted past the admitted grid edge, is a library
-        // limitation: reported, no match, no stop.
+        // limitation: no match, no stop.
         const operands: CfOperandValue[] = [];
         let decoded = true;
         for (const operand of cellIsOperands) {
@@ -540,7 +509,6 @@ export function evaluateCf(
             operands.push(value.value);
             continue;
           }
-          if (value.kind === 'unsupported') diagnostics?.record(entry, 'cellIs', 'unsupported', row, col);
           decoded = false;
           break;
         }
@@ -554,14 +522,6 @@ export function evaluateCf(
         }
       }
       if (matched) applyDxfToResult(result, rule.dxfId != null ? dxfs[rule.dxfId] : null);
-    } else if (rule.type === 'other') {
-      // Parser-preserved unimplemented formula inlets: only known fixed bits
-      // at a reached visible cell; no match, decoration or stopIfTrue.
-      for (const [bit, phase] of OTHER_FORMULA_PHASES) {
-        if (((rule.unsupportedFormulaPhases ?? 0) & bit) !== 0) {
-          diagnostics?.record(entry, phase, 'unsupported', row, col);
-        }
-      }
     } else if (rule.type === 'top10') {
       if (numVal == null || entry.top10Threshold == null) continue;
       matched = entry.top10IsTop ? numVal >= entry.top10Threshold : numVal <= entry.top10Threshold;
@@ -583,7 +543,7 @@ export function evaluateCf(
       // while its activity condition holds and its thresholds are admitted
       // (admitScaleRule).
       if (numVal == null || (!hasThresholdFailure(entry) && !entry.iconThresholds?.length)) continue;
-      if (!admitScaleRule(entry, rule.activeFormula, row, col, cfCtx, diagnostics)) continue;
+      if (!admitScaleRule(entry, rule.activeFormula, row, col, cfCtx)) continue;
       const thresholds = entry.iconThresholds;
       if (!thresholds?.length) continue;
       matched = true;
@@ -604,7 +564,7 @@ export function evaluateCf(
       }
     } else if (rule.type === 'colorScale') {
       if (numVal == null || (!hasThresholdFailure(entry) && !entry.scaleStops)) continue;
-      if (!admitScaleRule(entry, rule.activeFormula, row, col, cfCtx, diagnostics)) continue;
+      if (!admitScaleRule(entry, rule.activeFormula, row, col, cfCtx)) continue;
       const scaleStops = entry.scaleStops;
       if (!scaleStops) continue;
       matched = true;
@@ -615,7 +575,7 @@ export function evaluateCf(
     } else if (rule.type === 'dataBar') {
       if (numVal == null
         || (!hasThresholdFailure(entry) && (entry.barMin == null || entry.barMax == null))) continue;
-      if (!admitScaleRule(entry, rule.activeFormula, row, col, cfCtx, diagnostics)) continue;
+      if (!admitScaleRule(entry, rule.activeFormula, row, col, cfCtx)) continue;
       const barMin = entry.barMin;
       const barMax = entry.barMax;
       if (barMin == null || barMax == null) continue;

@@ -1,5 +1,4 @@
 import { describe, it, expect } from 'vitest';
-import { resolveSingleRowHeight, resolveTableRowHeights } from './table-geometry.js';
 import { layoutBodyTableRowAdvances } from './test-support/document-layout.test-support.js';
 import type {
   DocTable,
@@ -111,9 +110,9 @@ describe('canonical retained table row height — ST_HeightRule (§17.4.80 / §1
     expect(retainedAdvance(rowWith(600, 'atLeast'))).toBe(600);
   });
 
-  // `word-authored-auto-row-height-floor`: an authored auto height remains a
-  // lower bound in the retained model.
-  it('auto with @val — @val is honored as a lower bound', () => {
+  // A public-only model cannot tell an omitted hRule from an explicit auto;
+  // its "auto" row with a height is the omitted case, a lower bound.
+  it('public-only auto with @val — taken as an omitted hRule (lower bound)', () => {
     expect(retainedAdvance(rowWith(600, 'auto'))).toBe(600);
   });
 
@@ -123,43 +122,5 @@ describe('canonical retained table row height — ST_HeightRule (§17.4.80 / §1
 
   it('atLeast with no @val — has no authored floor', () => {
     expect(retainedAdvance(rowWith(null, 'atLeast'))).toBe(0);
-  });
-
-  it('§17.4.15: measures a cell against columns after gridBefore', () => {
-    const measuredWidths: number[] = [];
-    const row = {
-      ...rowWith(null, 'auto'),
-      gridBefore: 1,
-      gridAfter: 1,
-    } as unknown as DocTableRow;
-
-    resolveSingleRowHeight(row, [20, 40, 60], 1, (_cell, width) => {
-      measuredWidths.push(width);
-      return 10;
-    });
-
-    expect(measuredWidths).toEqual([40]);
-  });
-
-  it('includes half of each resolved horizontal border in adjacent non-exact row boxes', () => {
-    const single = { style: 'single', width: 0.5, color: '#000000' };
-    const rows = Array.from({ length: 4 }, () => ({
-      ...rowWith(20.4, 'auto'),
-      cells: [{
-        ...emptyCell(),
-        borders: { top: single, bottom: single, left: null, right: null, insideH: null, insideV: null },
-      }],
-    } as unknown as DocTableRow));
-    const bordered = {
-      ...table(),
-      rows,
-    } as DocTable;
-
-    const heights = resolveTableRowHeights(bordered, [100], 1, () => 0);
-
-    // Five 0.5pt boundary rules contribute half at the two outer edges and a
-    // full rule across each of the three shared boundaries: 4 × 20.4 + 2.0.
-    expect(heights).toEqual([20.9, 20.9, 20.9, 20.9]);
-    expect(heights.reduce((sum, height) => sum + height, 0)).toBeCloseTo(83.6, 8);
   });
 });

@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import type { KinsokuRules } from '@silurus/ooxml-core';
 import { buildTextIndex, findMatches, createCanvasFontRoute } from '@silurus/ooxml-core';
+import { paintLayoutPage } from './paint/canvas-page.js';
 import { renderDocumentToCanvas } from './renderer.js';
 import { layoutDocument } from './document-layout.js';
 import { createLayoutServices } from './layout-runtime.js';
@@ -58,7 +59,7 @@ function makeRecordingCanvas(widthOf?: (text: string, fontSize: number) => numbe
     },
     save() {}, restore() {}, beginPath() {}, closePath() {},
     moveTo() {}, lineTo() {}, stroke() {}, fill() {}, fillRect() {}, strokeRect() {},
-    rect() {}, clip() {}, scale() {}, translate() {}, setLineDash() {}, clearRect() {}, arc() {},
+    rect() {}, clip() {}, scale() {}, translate() {}, setTransform() {}, setLineDash() {}, clearRect() {}, arc() {},
     quadraticCurveTo() {}, bezierCurveTo() {},
     createLinearGradient() { return { addColorStop() {} }; },
     drawImage() {},
@@ -475,6 +476,15 @@ describe('noBreakHyphen (§17.3.3.18) and softHyphen (§17.3.3.29)', () => {
       .toBe(whole.at(-1)!.x + whole.at(-1)!.text.length * 10);
   });
 
+  it('lays out an unselected U+00AD in condensed text without a negative advance', async () => {
+    // Canvas measures U+00AD with no advance, as browsers do for an unbroken soft hyphen.
+    const { canvas, fills } = makeRecordingCanvas((text, fontSize) =>
+      [...text].filter((c) => c !== '\u00AD').length * fontSize);
+    const condensed = { ...textRun('br\u00ADeaking'), charSpacing: -0.05 } as DocRun;
+    await renderDocumentToCanvas(doc([para([condensed])]), canvas, 0, { dpr: 1, width: PAGE_W });
+    expect(fills.map((c) => c.text).join('').replace(/[^a-z]/g, '')).toBe('breaking');
+  });
+
   it('selects an authored optional break with its own styled and measured hyphen', () => {
     const marker = { ...textRun(''), optionalHyphen: true, color: 'ff0000', fontSize: 14 } as DocRun;
     const segs = buildSegments([textRun('br'), marker, textRun('eaking')], {} as LineLayoutEnvironment);
@@ -781,5 +791,90 @@ describe('authored optional glyph logical text boundary', () => {
     expect(findMatches(index, '-keep')).toHaveLength(1);
     expect(projected.find(run => run.sourceRunIndex === 1)).toMatchObject({ text: '', optionalHyphenGlyph: true });
     expect(projected.filter(run => run.sourceRunIndex === 2).map(run => run.text).join('')).toBe('eaking-keep');
+  });
+});
+
+
+describe('character pitch retained geometry and contextual paint', () => {
+  // A natural metric with zero-width marks and unselected optional hyphens.
+  // It deliberately ignores Canvas tracking: layout owns the added pitch.
+  const naturalWidth = (text: string, size: number) =>
+    [...text].filter(c => c !== '\u00AD' && !/\p{M}/u.test(c)).length * size;
+  async function acquire(runs: DocRun[], right = 0) {
+    const { canvas, fills } = makeRecordingCanvas(naturalWidth);
+    const model = doc([para(runs, { right })]);
+    const layout = layoutDocument(model, createLayoutServices(model, {
+      measureContext: canvas.getContext('2d') as CanvasRenderingContext2D,
+    }), { currentDateMs: 0 });
+    const paragraph = layout.pages[0].layers.body.find(node => node.kind === 'paragraph');
+    if (!paragraph || paragraph.kind !== 'paragraph') throw new Error('Expected paragraph');
+    const placements = paragraph.lines.flatMap(line => line.placements)
+      .filter(p => p.kind === 'text');
+    await paintLayoutPage(layout, 0, canvas, { scale: 1, dpr: 1 });
+    return { placements, fills, owned: textRunGeometryForPage(layout, 0).map(g => g.placement) };
+  }
+
+  it.each([2, -1])('keeps a + ring + b advance and source-owned clusters aligned at %s pt', async charSpacing => {
+    // cs forces one contextual segment, including the combining mark.
+    const run = (text: string) => ({ ...textRun(text), cs: true, charSpacing });
+    const { placements, owned, fills } = await acquire([run('a\u030A'), run('b')]);
+    expect(placements).toHaveLength(1);
+    const placement = placements[0];
+    expect(placement.advancePt).toBe(20 + 2 * charSpacing);
+    expect(placement.clusters.map(c => [c.range, c.offset.xPt, c.advancePt])).toEqual([
+      [{ start: 0, end: 2 }, 0, 10 + charSpacing],
+      [{ start: 2, end: 3 }, 10 + charSpacing, 10 + charSpacing],
+    ]);
+    expect(owned.map(p => [p.text, p.origin.xPt, p.bounds.widthPt])).toEqual([
+      ['a\u030A', 0, 10 + charSpacing], ['b', 10 + charSpacing, 10 + charSpacing],
+    ]);
+    expect(fills.map(f => f.text)).toEqual(['a\u030Ab']);
+  });
+
+  it('gives a split mark segment no negative condensed advance', async () => {
+    const { placements } = await acquire([{ ...textRun('a\u030Ab'), charSpacing: -1 }]);
+    const mark = placements.find(p => p.text === '\u030A');
+    expect(mark).toBeDefined();
+    expect(mark?.advancePt).toBe(0);
+    expect(mark?.clusters[0].advancePt).toBe(0);
+    expect(placements.reduce((sum, p) => sum + p.advancePt, 0)).toBe(18);
+  });
+
+  it('omits literal SHY inside one cs paint operation without changing source offsets', async () => {
+    const { placements, owned, fills } = await acquire([
+      { ...textRun('a\u00ADb'), cs: true, charSpacing: 2 },
+    ]);
+    expect(placements).toHaveLength(1);
+    expect(placements[0].text).toBe('a\u00ADb');
+    expect(placements[0].range).toEqual({ start: 0, end: 3 });
+    expect(placements[0].advancePt).toBe(24);
+    expect(placements[0].clusters.map(c => [c.range, c.offset.xPt, c.advancePt])).toEqual([
+      [{ start: 0, end: 1 }, 0, 12],
+      [{ start: 1, end: 2 }, 12, 0],
+      [{ start: 2, end: 3 }, 12, 12],
+    ]);
+    expect(owned[0].text).toBe('a\u00ADb');
+    expect(fills.map(f => f.text)).toEqual(['ab']);
+  });
+
+  it('paints a selected optional break as a separately pitched hyphen', async () => {
+    const { placements, fills } = await acquire([
+      { ...textRun('br'), charSpacing: 2 },
+      { ...textRun(''), __optionalHyphen: true, charSpacing: 2 } as DocRun,
+      { ...textRun('eaking'), charSpacing: 2 },
+    ], 228);
+    const hyphen = placements.find(p => p.optionalHyphenGlyph);
+    expect(hyphen?.advancePt).toBe(12);
+    expect(hyphen?.paintOps).toMatchObject([{ text: '-', letterSpacingPt: 2 }]);
+    expect(fills.map(f => f.text)).toEqual(['br', '-', 'eaking']);
+  });
+
+  it('keeps zero-tracking text contextual with one fillText per segment, as on main', async () => {
+    const { placements, fills } = await acquire([
+      { ...textRun('AVoffice'), kerning: 1 },
+      { ...textRun('سلام'), cs: true },
+    ]);
+    expect(placements.map(p => p.text)).toEqual(['AVoffice', 'سلام']);
+    expect(fills.map(f => f.text)).toEqual(['AVoffice', 'سلام']);
   });
 });

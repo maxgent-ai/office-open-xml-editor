@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import { renderDocumentToCanvas } from './renderer.js';
+import { layoutDocument } from './document-layout.js';
+import { createLayoutServices } from './layout-runtime.js';
+import { paintLayoutPage } from './paint/canvas-page.js';
 import type {
   BodyElement,
   DocParagraph,
@@ -25,87 +28,9 @@ import type {
 //   4. vertical tbRl branch (drawVerticalRun per-glyph advance)
 // ─────────────────────────────────────────────────────────────────────────────
 
+import { makeRecordingCanvas, type FillCall } from './test-support/recording-canvas.test-support.js';
+
 const FONT_PX = 20;
-
-interface FillCall {
-  text: string;
-  x: number;
-  y: number;
-  letterSpacing: string;
-  // Naive accumulation of the raw translate() x arguments in effect at fill
-  // time (save/restore-scoped, rotation ignored). Constant page-level offsets
-  // cancel in the DELTAS between fills of the same line, which is all the
-  // vertical assertions read (drawVerticalRun brackets each upright glyph in
-  // save; translate(cellCenter, baseline); rotate; fillText; restore).
-  translateX: number;
-  scaleX: number;
-  scaleY: number;
-}
-
-function makeRecordingCanvas(options: Readonly<{
-  followingGlyphLeftInsetPx?: number;
-  closingPunctuationPairKerningPx?: number;
-  spaceAdvancePx?: number;
-}> = {}): { canvas: HTMLCanvasElement; fills: FillCall[] } {
-  let font = `${FONT_PX}px serif`;
-  let letterSpacing = '0px';
-  const px = () => parseFloat(/(\d+(?:\.\d+)?)px/.exec(font)?.[1] ?? String(FONT_PX));
-  const fills: FillCall[] = [];
-  let scaleX = 1;
-  let scaleY = 1;
-  let translateX = 0;
-  const stack: { scaleX: number; scaleY: number; translateX: number }[] = [];
-  const ctx = {
-    get font() { return font; },
-    set font(v: string) { font = v; },
-    get letterSpacing() { return letterSpacing; },
-    set letterSpacing(v: string) { letterSpacing = v; },
-    fontKerning: 'auto',
-    measureText: (s: string) => {
-      const p = px();
-      const pairCount = s.match(/。）/gu)?.length ?? 0;
-      const w = [...s].reduce(
-        (sum, character) => sum + (character === ' ' ? options.spaceAdvancePx ?? p : p),
-        0,
-      )
-        - pairCount * (options.closingPunctuationPairKerningPx ?? 0);
-      return {
-        width: w,
-        actualBoundingBoxLeft:
-          s === '次'
-            ? -(options.followingGlyphLeftInsetPx ?? 0)
-            : 0,
-        // The punctuation fixture exposes a selected-glyph right ink edge at
-        // half its full-width cell. Other text fills its complete advance.
-        actualBoundingBoxRight:
-          [...s].length === 1 && /[、．：しない）]/u.test(s) ? p / 2 : w,
-        fontBoundingBoxAscent: p * 0.8,
-        fontBoundingBoxDescent: p * 0.2,
-        actualBoundingBoxAscent: p * 0.8,
-        actualBoundingBoxDescent: p * 0.2,
-      } as TextMetrics;
-    },
-    save() { stack.push({ scaleX, scaleY, translateX }); },
-    restore() { const s = stack.pop(); if (s) { scaleX = s.scaleX; scaleY = s.scaleY; translateX = s.translateX; } },
-    beginPath() {}, closePath() {}, moveTo() {}, lineTo() {}, stroke() {}, fill() {},
-    fillRect() {}, strokeRect() {}, clip() {}, rect() {}, setLineDash() {},
-    drawImage() {}, clearRect() {}, arc() {}, quadraticCurveTo() {}, bezierCurveTo() {},
-    createLinearGradient() { return { addColorStop() {} }; },
-    scale(sx: number, sy?: number) { scaleX *= sx; scaleY *= sy ?? sx; },
-    translate(tx: number) { translateX += tx; },
-    rotate() {},
-    fillText(text: string, x: number, y: number) {
-      fills.push({ text, x, y, letterSpacing, translateX, scaleX, scaleY });
-    },
-    strokeText() {},
-    fillStyle: '#000', strokeStyle: '#000', lineWidth: 1,
-    textAlign: 'left' as CanvasTextAlign, textBaseline: 'alphabetic' as CanvasTextBaseline,
-    direction: 'ltr' as CanvasDirection,
-    globalAlpha: 1, lineCap: 'butt' as CanvasLineCap, lineJoin: 'miter' as CanvasLineJoin,
-  };
-  const canvas = { width: 0, height: 0, style: {} as Record<string, string>, getContext: () => ctx };
-  return { canvas: canvas as unknown as HTMLCanvasElement, fills };
-}
 
 function textRun(text: string, extra: Partial<DocxTextRun> = {}): DocxTextRun {
   return {
@@ -420,5 +345,91 @@ describe('run charSpacing/charScale reach the painted glyphs on every branch', (
     // Boundary: (10 + 20) / 2 = 15. With the unscaled per-glyph advance run1's
     // glyphs overrun their cells and run2 paints INSIDE run1's tail.
     expect(ka - e).toBeCloseTo((10 + 20) / 2, 5);
+  });
+});
+
+// These literal call/advance expectations were also run against origin/main
+// 4bcb91c487e38393aadb3f3b70a732adf2c7b708. They pin the pre-PR contextual
+// paint boundary, independently of cluster geometry and the pitch helper.
+describe('character spacing preserves main kerning and joining paint', () => {
+  async function acquire(runs: DocxTextRun[]) {
+    const { canvas, fills } = makeRecordingCanvas({ contextualShaping: true });
+    const model = doc([para(runs)], section());
+    const layout = layoutDocument(model, createLayoutServices(model, {
+      measureContext: canvas.getContext('2d') as CanvasRenderingContext2D,
+    }), { currentDateMs: 0 });
+    const paragraph = layout.pages[0].layers.body.find(node => node.kind === 'paragraph');
+    if (!paragraph || paragraph.kind !== 'paragraph') throw new Error('Expected paragraph');
+    const advances = paragraph.lines.flatMap(line => line.placements)
+      .filter(placement => placement.kind === 'text')
+      .map(placement => [placement.text, placement.advancePt]);
+    await paintLayoutPage(layout, 0, canvas, { scale: 1, dpr: 1 });
+    return { advances, fills: fills.map(({ text, x, y, font, fontKerning, letterSpacing }) =>
+      ({ text, x, y, font, fontKerning, letterSpacing })) };
+  }
+
+  function call(text: string, x: number, letterSpacing: number,
+    fontKerning: CanvasFontKerning = 'none', style = '') {
+    const family = ['"NotInMetrics"', '"Noto Sans"', '"Noto Sans Hebrew"',
+      '"Noto Sans Thai"', '"Noto Sans Devanagari"', '"Arial"', '"Helvetica"',
+      '"Liberation Sans"', '"Noto Sans JP"', '"Hiragino Sans"', '"Meiryo"',
+      '"Noto Sans SC"', '"Noto Sans TC"', '"Noto Sans KR"', '"Noto Naskh Arabic"',
+      '"Noto Sans Arabic"', 'sans-serif'].join(', ');
+    const face = style === 'bold ' ? 'normal 700' : style === 'italic ' ? 'italic 400' : 'normal 400';
+    return { text, x, y: 16, font: `${face} 20px ${family}`,
+      fontKerning, letterSpacing: `${letterSpacing}px` };
+  }
+
+  // w:kern is a minimum size (§17.3.2.19): exercise equality, below threshold,
+  // and absence. Distinct styles keep the two pairs as separate layout runs.
+  for (const kerning of [undefined, 21, 20]) {
+    it.each([0, 2])(`pins Latin pair calls and advances at kern=${kerning}, tracking=%s`, async charSpacing => {
+      const { fills, advances } = await acquire([
+        textRun('AV', { kerning, charSpacing }),
+        textRun('To', { kerning, charSpacing, italic: true }),
+        textRun('|', { bold: true }),
+      ]);
+      const active = kerning === 20;
+      const advance = (active ? 36 : 40) + 2 * charSpacing;
+      expect(advances).toEqual([['AV', advance], ['To', advance], ['|', 20]]);
+      expect(fills).toEqual([
+        call('AV', 0, charSpacing, active ? 'normal' : 'none'),
+        call('To', advance, charSpacing, active ? 'normal' : 'none', 'italic '),
+        call('|', advance * 2, 0, 'none', 'bold '),
+      ]);
+    });
+  }
+
+  it.each([0, 2])('pins Arabic joining calls and advances at tracking=%s pt', async charSpacing => {
+    const { fills, advances } = await acquire([
+      textRun('سلام', { cs: true, charSpacing }), textRun('|', { bold: true }),
+    ]);
+    const advance = 68 + 4 * charSpacing;
+    expect(advances).toEqual([['سلام', advance], ['|', 20]]);
+    // Windows Word kerns Arabic text without w:kern (WORD_ARABIC_PAIR_KERNING).
+    expect(fills).toEqual([
+      call('سلام', 0, charSpacing, 'normal'), call('|', advance, 0, 'none', 'bold '),
+    ]);
+  });
+
+  it('pins mixed marks, SHY, pairs and Arabic to the main fillText partition', async () => {
+    const { fills } = await acquire([
+      textRun('AV', { kerning: 20, charSpacing: 2 }),
+      textRun('a\u030Ab', { cs: true }),
+      textRun('co', { bold: true }),
+      // A parsed w:softHyphen is optional ink on both revisions. Literal
+      // U+00AD has a deliberately changed invisible-call policy on this branch.
+      { ...textRun('', { bold: true }), __optionalHyphen: true } as DocxTextRun,
+      textRun('operate', { bold: true }),
+      textRun('To', { kerning: 20, charSpacing: 2, italic: true }),
+      textRun('سلام', { cs: true, charSpacing: 2 }),
+    ]);
+    expect(fills).toEqual([
+      call('AV', 0, 2, 'normal'),
+      call('a\u030Ab', 40, 0),
+      call('cooperate', 80, 0, 'none', 'bold '),
+      call('To', 260, 2, 'normal', 'italic '),
+      call('سلام', 300, 2, 'normal'),
+    ]);
   });
 });

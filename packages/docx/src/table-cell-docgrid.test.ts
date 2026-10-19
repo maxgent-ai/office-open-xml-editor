@@ -253,11 +253,13 @@ describe('docGrid line-cell integration through the cell measure path', () => {
 
     const designAdvancePt = 10 * RESOLVED_EA_RATIO;
     expect(retainedRow.contentHeightPt).toBeCloseTo(designAdvancePt, 12);
-    expect(retainedRow.advancePt).toBeCloseTo(designAdvancePt + 2, 12);
+    // WORD_COLLAPSED_BORDER_ROW_TRACK_FOOTPRINT: the full top rule and the
+    // table's full bottom rule, each painted inside its own band.
+    expect(retainedRow.advancePt).toBeCloseTo(designAdvancePt + 4, 12);
     expect(retained.advancePt).toBeCloseTo(retainedRow.advancePt, 12);
-    expect(top.from.yPt).toBeCloseTo(retained.flowBounds.yPt, 12);
+    expect(top.from.yPt).toBeCloseTo(retained.flowBounds.yPt + 1, 12);
     expect(bottom.from.yPt).toBeCloseTo(
-      retained.flowBounds.yPt + retained.advancePt,
+      retained.flowBounds.yPt + retained.advancePt - 1,
       12,
     );
   });

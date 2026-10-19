@@ -1,4 +1,5 @@
 import type { BorderSpec, CellBorders, TableBorders } from './types';
+import { hex6ToRgb } from '@silurus/ooxml-core';
 import {
   WORD_TABLE_BORDER_STYLE_PRECEDENCE,
   wordAuthoredBorderParticipates,
@@ -119,14 +120,9 @@ function precedenceIndex(style: string): number {
  *  darkness comparison uses the RENDERED colour, and auto resolves to black. A
  *  malformed value also falls back to black. */
 function rgb(color: string | null): { r: number; g: number; b: number } {
-  if (!color) return { r: 0, g: 0, b: 0 };
-  const hex = color.replace(/^#/, '');
-  if (hex.length !== 6 || /[^0-9a-fA-F]/.test(hex)) return { r: 0, g: 0, b: 0 };
-  return {
-    r: parseInt(hex.slice(0, 2), 16),
-    g: parseInt(hex.slice(2, 4), 16),
-    b: parseInt(hex.slice(4, 6), 16),
-  };
+  const parsed = color ? hex6ToRgb(color.replace(/^#/, '')) : null;
+  if (!parsed) return { r: 0, g: 0, b: 0 };
+  return { r: parsed[0], g: parsed[1], b: parsed[2] };
 }
 
 /** §17.4.66 rules #4a–#4c — compare two colours by brightness, DARKER wins.

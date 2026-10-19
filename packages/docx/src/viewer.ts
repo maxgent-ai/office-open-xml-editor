@@ -1,4 +1,3 @@
-import { updateNativeReadingNotice, noReadingNotices } from './native-reading-notice.js';
 import { DocxDocument, docxViewerLoadSignal } from './document';
 import type { DocxViewerLoadControl, LoadOptions } from './document';
 import {
@@ -13,7 +12,7 @@ import type { DocxTextRunInfo } from './renderer';
 import { buildDocxTextLayer } from './text-layer';
 import { buildDocxHighlightLayer, type DocxHighlightMatch } from './find-highlight-layer';
 import { DocxFindController, type DocxMatchLocation } from './find';
-import { openExternalHyperlink, PT_TO_PX, nextZoomStep, prevZoomStep, clampScale, fitScale } from '@silurus/ooxml-core';
+import { openExternalHyperlink, PT_TO_PX, nextZoomStep, prevZoomStep, clampScale, fitScale, defaultDpr } from '@silurus/ooxml-core';
 import type { FindHighlightColors, HyperlinkTarget, FindMatch, FindMatchesOptions, OoxmlResourceMetrics, ViewerContextMenuEvent, ZoomableViewer } from '@silurus/ooxml-core';
 import {
   CallerCanvasMount,
@@ -323,12 +322,12 @@ export class DocxViewer implements ZoomableViewer {
           // document's own view default applies.
           ...(inheritedRequestedView !== undefined
             ? { showTrackedChanges: inheritedRequestedView }
-            : this._opts.modelSources === undefined
+            : this._opts.legacyDoc === undefined
               ? (this._opts.showTrackedChanges === true ? { showTrackedChanges: true } : {})
               : (!this._showTrackedChangesExplicit
                 ? undefined
                 : { showTrackedChanges: this._opts.showTrackedChanges })),
-          ...(this._opts.modelSources === undefined ? undefined : { modelSources: this._opts.modelSources }),
+          ...(this._opts.legacyDoc === undefined ? undefined : { legacyDoc: this._opts.legacyDoc }),
           ...(this._opts.currentDate === undefined
             ? {}
             : { currentDate: this._opts.currentDate }),
@@ -788,31 +787,20 @@ export class DocxViewer implements ZoomableViewer {
     this._canvasMount.restore();
   }
 
-  private async _render(awaitable = true): Promise<void> {
-    const readingDocument = this._doc?._readingPublicationOwned ? this._doc : null;
-    const render = async (): Promise<void> => {
-      this._syncReadingNotice();
-      const generation = this._renderDispatcher.begin();
-      try {
-        await this._renderPage(generation);
-      } catch (err) {
-        // Revocation clears the canvas and invalidates its dispatcher itself.
-        // Preserve this live owner's rejection; replacement/destroy still wins.
-        if (!this._renderDispatcher.isCurrent(generation)
-          && !(readingDocument && readingDocument === this._doc && readingDocument.pageCount === 0)) return;
-        throw err;
-      }
-    };
-    if (readingDocument && awaitable) await this._errorRouter.ownBackgroundLifecycle(render);
-    else await render();
+  private async _render(): Promise<void> {
+    const generation = this._renderDispatcher.begin();
+    try {
+      await this._renderPage(generation);
+    } catch (err) {
+      if (!this._renderDispatcher.isCurrent(generation)) return;
+      throw err;
+    }
   }
 
   /** Route a render failure to `onError`, or `console.error` when none is given
    *  (never fully silent), and never after teardown. Mirrors the scroll viewers'
    *  `_reportRenderError`. */
   private _reportRenderError(err: unknown): void {
-    // The document owns acquisition/paint failure at its captured publication
-    // epoch. A stale render or consumer error must not revoke a newer owner.
     this._errorRouter.report(err);
   }
 
@@ -837,7 +825,7 @@ export class DocxViewer implements ZoomableViewer {
     // at the zoom-aware `renderWidth` (the geometry follows setScale).
     const runs: DocxTextRunInfo[] = [];
     const onTextRun = (r: DocxTextRunInfo) => runs.push(r);
-    const dpr = this._opts.dpr ?? (typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1);
+    const dpr = this._opts.dpr ?? defaultDpr();
     const renderOptions = {
       width: renderWidth,
       dpr: this._opts.dpr,
@@ -848,7 +836,6 @@ export class DocxViewer implements ZoomableViewer {
       onTextRun,
     };
     if (isWorker) {
-      const doc = this._doc, publication = doc._readingPublicationToken;
       // Only serializable render options may cross to the worker — spreading the
       // full viewer opts would postMessage non-cloneable values (the math
       // engine, callbacks, container element) and throw a DataCloneError. The
@@ -864,18 +851,10 @@ export class DocxViewer implements ZoomableViewer {
       // A worker bitmap's backing resolution may be reduced by the canvas-area
       // clamp. Preserve the requested logical page box; deriving CSS size from
       // bitmap/dpr would collapse a clamped page into the wrapper's top-left.
-      if (publication != null && (doc !== this._doc || publication !== doc._readingPublicationToken)) { bmp.close(); return; }
-      // Only bitmap presentation belongs to this failure boundary. Overlay and
-      // public page-change callbacks cannot revoke valid document data.
-      try {
-        if (!this._renderDispatcher.commitBitmap(generation, bmp, {
-          cssWidth: logicalWidth > 0 ? logicalWidth : Math.round(bmp.width / dpr),
-          cssHeight: logicalHeight > 0 ? logicalHeight : Math.round(bmp.height / dpr),
-        })) return;
-      } catch (error) {
-        if (doc === this._doc && publication != null) doc._invalidateReadingLayout(error, publication);
-        throw error;
-      }
+      if (!this._renderDispatcher.commitBitmap(generation, bmp, {
+        cssWidth: logicalWidth > 0 ? logicalWidth : Math.round(bmp.width / dpr),
+        cssHeight: logicalHeight > 0 ? logicalHeight : Math.round(bmp.height / dpr),
+      })) return;
     } else {
       await renderDocxFocusedPage(
         this._doc,
@@ -898,14 +877,9 @@ export class DocxViewer implements ZoomableViewer {
     this._opts.onPageChange?.(this._currentPage, this.pageCount, this.layoutComplete);
   }
 
-  private _readingNoticeElement: HTMLElement | null = null;
-  private _syncReadingNotice(): void {
-    const notices = this._doc?.readingNotices ?? noReadingNotices;
-    if (this._readingNoticeElement && notices.length === 0) this._clearReadingPages();
-    this._readingNoticeElement = updateNativeReadingNotice(this._wrapper, this._readingNoticeElement, notices);
-  }
-  private _clearReadingPages(): void {
-    this._readingNoticeElement = updateNativeReadingNotice(this._wrapper, this._readingNoticeElement, noReadingNotices);
+  /** A failed layout that publishes no pages must not keep presenting the
+   * previous page: cancel the in-flight render and clear the surface. */
+  private _clearPresentedPage(): void {
     this._renderDispatcher.begin();
     invalidateDocxRenderTarget(this._canvas);
     this._canvas.width = 0; this._canvas.height = 0;
@@ -917,7 +891,6 @@ export class DocxViewer implements ZoomableViewer {
     this._unbindLayoutDocument();
     this._layoutFailed = false;
     this._layoutViewPublicationGeneration = 0;
-    this._syncReadingNotice();
     const unsubscribeView = subscribeDocxLayoutView(
       doc,
       (publication) => this._onLayoutViewPublication(doc, publication),
@@ -947,8 +920,6 @@ export class DocxViewer implements ZoomableViewer {
   }
 
   private _unbindLayoutDocument(): void {
-    if (this._readingNoticeElement) this._clearReadingPages();
-    this._readingNoticeElement = updateNativeReadingNotice(this._wrapper, this._readingNoticeElement, noReadingNotices);
     this._layoutUnsubscribe?.();
     this._layoutUnsubscribe = null;
     this._layoutFailed = false;
@@ -959,7 +930,7 @@ export class DocxViewer implements ZoomableViewer {
     if (this._destroyed || doc !== this._doc) return;
     this._wakeLayoutWaiters();
     if (publication.error !== undefined) {
-      if (publication.pageCount === 0) this._clearReadingPages();
+      if (publication.pageCount === 0) this._clearPresentedPage();
       this._layoutFailed = true;
       this._errorRouter.reportBackground(
         publication.error,
@@ -969,7 +940,7 @@ export class DocxViewer implements ZoomableViewer {
     }
     this._find.invalidate();
     this._currentPage = Math.max(0, Math.min(this._currentPage, publication.pageCount - 1));
-    void this._render(false).catch((error) => this._reportRenderError(error));
+    void this._render().catch((error) => this._reportRenderError(error));
   }
 
   private _onLayoutViewPublication(
@@ -991,7 +962,7 @@ export class DocxViewer implements ZoomableViewer {
     };
     this._find.invalidate();
     this._currentPage = Math.max(0, Math.min(this._currentPage, doc.pageCount - 1));
-    void this._render(false).catch((error) => this._reportRenderError(error));
+    void this._render().catch((error) => this._reportRenderError(error));
   }
 
   private async _waitForPage(
@@ -1051,7 +1022,7 @@ export class DocxViewer implements ZoomableViewer {
     const doc = this._doc;
     // Compare with the document's active view: it may come from the loaded
     // document's own view default rather than from this viewer's options.
-    const current = this._opts.modelSources === undefined
+    const current = this._opts.legacyDoc === undefined
       ? this._opts.showTrackedChanges === true
       : doc
         ? activeDocxLayoutViewOf(doc).showTrackedChanges

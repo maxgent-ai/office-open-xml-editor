@@ -255,25 +255,22 @@ describe('render worker canonical layout parity', () => {
     expect(retry.pages.length).toBeGreaterThan(1);
   });
 
-  it('retains native separator and notice ownership identically in sync, sliced, worker and retried layout', async () => {
-    const address = (headerCp: number) => ({ headerCp, fc: 0x800 + headerCp * 2, prm: 0, paragraphStyle: 0 });
+  it('retains reserved separator and notice ownership identically in sync, sliced, worker and retried layout', async () => {
     const run = { text: '', bold: false, italic: false, underline: false, strikethrough: false,
       fontSize: 10, color: null, fontFamily: 'serif', isLink: false, background: null,
       vertAlign: null, hyperlink: null };
     const paragraph = { alignment: 'left', indentLeft: 0, indentRight: 0, indentFirst: 0,
       spaceBefore: 0, spaceAfter: 2, lineSpacing: null, numbering: null, tabStops: [], runs: [],
       defaultFontSize: 10, paragraphMarkFontFacts: { fontSize: 10 } };
-    const rule = (mark: 'short' | 'full', cp: number) => ({
-      class: 'rule', contentStartCp: cp, contentEndCp: cp + 2, guardCp: cp + 2,
-      rule: { mark, control: { run }, source: address(cp) },
-      paragraph: { paragraph, contentMark: { run }, source: address(cp + 1) },
+    const rule = (mark: 'short' | 'full') => ({
+      rule: { mark, control: { run } },
+      paragraph: { paragraph, contentMark: { run } },
     });
     const build = () => {
       const model = noteContinuationModel() as DocxDocumentModel & { __noteLayoutSettings: object };
-      model.__noteLayoutSettings = { ...model.__noteLayoutSettings, nativeSeparators: { footnote: {
-        separator: rule('short', 0), continuationSeparator: rule('full', 3),
-        continuationNotice: { class: 'paragraphOnly', contentStartCp: 6, contentEndCp: 7, guardCp: 7,
-          paragraph: { paragraph, contentMark: { run }, source: address(6) } },
+      model.__noteLayoutSettings = { ...model.__noteLayoutSettings, reservedSeparators: { footnote: {
+        separator: rule('short'), continuationSeparator: rule('full'),
+        continuationNotice: { paragraph: { paragraph, contentMark: { run } } },
       } } };
       const source = layoutSourceStore(model);
       return { source, services: createLayoutServices(source, {
@@ -366,8 +363,6 @@ describe('render worker canonical layout parity', () => {
     expect(meta.bookmarkPages).toEqual([]);
     expect(meta.commentAnchorRanges).toEqual([]);
     expect(meta.revisionAnchorRanges).toEqual([]);
-    expect(meta.nativeReadingRequested).toBeUndefined();
-    expect(meta.readingNotices).toBeUndefined();
   });
 
   it('withholds future review anchors inside a split paragraph until its final fragment', () => {
@@ -429,7 +424,9 @@ describe('render worker canonical layout parity', () => {
     expect(markupMeta.pageCount).not.toBe(finalMeta.pageCount);
     expect(markupMeta.pageSizes).toHaveLength(markupMeta.pageCount);
     expect(finalMeta.pageSizes).toHaveLength(finalMeta.pageCount);
-  });
+    // Two complete layouts of a 120-paragraph tracked document (~2.7 s on an
+    // idle machine); the default 5 s budget times out on loaded CI runners.
+  }, 30_000);
 
   it('exposes identical review metadata in main and worker modes', () => {
     const model = realModel();

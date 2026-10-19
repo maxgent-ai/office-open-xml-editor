@@ -25,6 +25,8 @@ export interface VerticalGlyphMeasurementService {
     fontKerning: CanvasFontKerning;
     fontSizePt: number;
     letterSpacingPt: number;
+    /** Per-scalar grid/fit contribution, independent of run tracking. */
+    characterGridDeltaPt?: number;
     charScale: number;
     growTrRotateInk: boolean;
     writingMode: WritingMode;

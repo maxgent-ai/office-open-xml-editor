@@ -10,7 +10,7 @@ import {
   isStructuralTrailingParagraph,
 } from './table-cell-blocks.js';
 import type { ParagraphBorderEdges } from './paragraph-border-adjacency.js';
-import { layoutTable, measureTableCellBlockFlowHeightPt } from './table.js';
+import { layoutTable, measureTableCellBlockFlowHeightPt, tableRowRuleInsetsPt } from './table.js';
 import { tableCellHorizontalSpacingInsets } from './table-columns.js';
 import { unmeasuredTableMemberDecision, type LogicalTableDecision, type TableMemberDecision } from './table-layout-decision.js';
 import { snapshotPlainData } from './plain-data.js';
@@ -300,6 +300,118 @@ interface RotatedCellAcquisition {
   readonly cellIndex: number;
   readonly margins: Readonly<{ top: number; bottom: number }>;
   reacquire(lineLengthPt: number): TableLayoutInput['rows'][number]['cells'][number]['blocks'];
+}
+
+type TableCellLayoutInput = TableLayoutInput['rows'][number]['cells'][number];
+
+/** Each retained table's rotated cell acquisitions by cell id, so a
+ * page-local fragment or owner segment of the table can acquire their lines
+ * again at its own length (layoutTableFragment). Keyed by the acquisition's
+ * retained input; a projection with its own input (an owner segment) shares
+ * them through shareRotatedCellReacquisition. Cell ids survive the
+ * per-occurrence cell copies pagination makes. Same-realm only: the closures
+ * re-enter this acquisition's paragraph services. */
+const rotatedCellReacquisitions = new WeakMap<TableLayoutInput, ReadonlyMap<string, RotatedCellAcquisition>>();
+
+/** Let a projection of retained tables (their rows re-sliced, or an adjacent
+ * group's members combined, into a new input) re-acquire their rotated cells. */
+export function shareRotatedCellReacquisition(
+  from: TableLayoutInput | readonly TableLayoutInput[],
+  to: TableLayoutInput,
+): void {
+  const sources = (Array.isArray(from) ? from : [from]) as readonly TableLayoutInput[];
+  const shared = new Map<string, RotatedCellAcquisition>();
+  for (const source of sources) {
+    rotatedCellReacquisitions.get(source)?.forEach((rotated, cellId) => shared.set(cellId, rotated));
+  }
+  if (shared.size > 0) rotatedCellReacquisitions.set(to, shared);
+}
+
+/**
+ * A rotated cell's lines run along its final height. When other cells or a
+ * merge make that height larger than the acquired line length, acquire the
+ * lines again at the final length so paragraph alignment uses it; the row
+ * requirement stays the natural length, so row heights cannot change. The
+ * final length excludes the cell's collapsed rules
+ * (WORD_COLLAPSED_BORDER_ROW_TRACK_FOOTPRINT), which only an exact row's
+ * authored line length did not already leave out: that fixed row is
+ * re-acquired shorter as well. Those rules depend on the rows laid out
+ * together, so a page-local fragment resolves them again.
+ */
+function relayoutRotatedCellLines(
+  input: TableLayoutInput,
+  laidOut: ReturnType<typeof layoutTable>,
+  placement: Parameters<typeof layoutTable>[1],
+  services: Parameters<typeof layoutTable>[2],
+  rotatedOf: (cell: TableCellLayoutInput) => RotatedCellAcquisition | undefined,
+  label: string,
+): { input: TableLayoutInput; laidOut: ReturnType<typeof layoutTable> } {
+  const { layout } = laidOut;
+  let ruleInsets: ReturnType<typeof tableRowRuleInsetsPt> | null = null;
+  const tableBottomPt = layout.flowBounds.yPt + layout.advancePt;
+  const replacements = new Map<string, Pick<TableCellLayoutInput, 'blocks' | 'verticalText'>>();
+  input.rows.forEach((row, rowIndex) => row.cells.forEach((cell, cellIndex) => {
+    const rotated = rotatedOf(cell);
+    const laidOut = layout.rows[rowIndex]?.cells[cellIndex];
+    const current = cell.verticalText;
+    if (!rotated || !laidOut || !current) return;
+    ruleInsets ??= tableRowRuleInsetsPt(input);
+    const reachesTableBottom =
+      laidOut.flowBounds.yPt + laidOut.flowBounds.heightPt >= tableBottomPt - ROTATED_LINE_LENGTH_EPSILON_PT;
+    const finalLengthPt = Math.max(
+      0,
+      laidOut.flowBounds.heightPt - rotated.margins.top - rotated.margins.bottom
+        - (ruleInsets.top[rowIndex] ?? 0)
+        - (reachesTableBottom ? ruleInsets.bottom[input.rows.length - 1] ?? 0 : 0),
+    );
+    const exact = row.heightRule === 'exact';
+    if (
+      finalLengthPt > current.lineLengthPt + ROTATED_LINE_LENGTH_EPSILON_PT
+      || (exact && finalLengthPt < current.lineLengthPt - ROTATED_LINE_LENGTH_EPSILON_PT)
+    ) {
+      replacements.set(`${rowIndex}:${cellIndex}`, {
+        blocks: rotated.reacquire(finalLengthPt),
+        verticalText: { ...current, lineLengthPt: finalLengthPt },
+      });
+    }
+  }));
+  if (replacements.size === 0) return { input, laidOut };
+  const finalInput = snapshotPlainData<TableLayoutInput>({
+    ...input,
+    rows: input.rows.map((row, rowIndex) => ({
+      ...row,
+      cells: row.cells.map((cell, cellIndex) => {
+        const replacement = replacements.get(`${rowIndex}:${cellIndex}`);
+        return replacement ? { ...cell, ...replacement } : cell;
+      }),
+    })),
+  }, label) as TableLayoutInput;
+  return { input: finalInput, laidOut: layoutTable(finalInput, placement, services) };
+}
+
+/**
+ * Lay out a page-local fragment of a retained table. A fragment's first and
+ * last rows take the table's outer rules, so an exact row's rotated cell can
+ * have a different line length than it had in the whole table; its lines are
+ * acquired again at the fragment's length.
+ */
+export function layoutTableFragment(
+  source: RetainedTableAcquisition,
+  input: TableLayoutInput,
+  placement: Parameters<typeof layoutTable>[1],
+  services: Parameters<typeof layoutTable>[2],
+): ReturnType<typeof layoutTable> {
+  const laidOut = layoutTable(input, placement, services);
+  const rotated = rotatedCellReacquisitions.get(source.input);
+  if (!rotated) return laidOut;
+  return relayoutRotatedCellLines(
+    input,
+    laidOut,
+    placement,
+    services,
+    (cell) => rotated.get(cell.id),
+    'TableFragment.input',
+  ).laidOut;
 }
 
 /**
@@ -731,43 +843,23 @@ export function acquireRetainedTable<State>(
     cursor: { xPt: 0, yPt: 0 },
     availableBounds: bounds,
   };
-  let finalInput = input;
-  let layout = layoutTable(input, placement, services).layout;
-  // A rotated cell's lines run along its final height. When other cells or a
-  // merge make that height larger than the acquired line length, acquire the
-  // lines again at the final length so paragraph alignment uses it; the row
-  // requirement stays the natural length, so row heights cannot change.
-  const grown = rotatedCells.flatMap((rotated) => {
-    const laidOut = layout.rows[rotated.rowIndex]?.cells[rotated.cellIndex];
-    const current = input.rows[rotated.rowIndex]?.cells[rotated.cellIndex]?.verticalText;
-    if (!laidOut || !current) return [];
-    const finalLengthPt = Math.max(
-      0,
-      laidOut.flowBounds.heightPt - rotated.margins.top - rotated.margins.bottom,
-    );
-    return finalLengthPt > current.lineLengthPt + ROTATED_LINE_LENGTH_EPSILON_PT
-      ? [{ rotated, finalLengthPt, current }]
-      : [];
-  });
-  if (grown.length > 0) {
-    const replacements = new Map(grown.map(({ rotated, finalLengthPt, current }) => [
-      `${rotated.rowIndex}:${rotated.cellIndex}`,
-      {
-        blocks: rotated.reacquire(finalLengthPt),
-        verticalText: { ...current, lineLengthPt: finalLengthPt },
-      },
-    ]));
-    finalInput = snapshotPlainData<TableLayoutInput>({
-      ...input,
-      rows: input.rows.map((row, rowIndex) => ({
-        ...row,
-        cells: row.cells.map((cell, cellIndex) => {
-          const replacement = replacements.get(`${rowIndex}:${cellIndex}`);
-          return replacement ? { ...cell, ...replacement } : cell;
-        }),
-      })),
-    }, 'RetainedTableAcquisition.input') as TableLayoutInput;
-    layout = layoutTable(finalInput, placement, services).layout;
+  const rotatedByCell = new Map(rotatedCells.map((rotated) => [
+    input.rows[rotated.rowIndex]!.cells[rotated.cellIndex]!,
+    rotated,
+  ]));
+  const { input: finalInput, laidOut: { layout } } = relayoutRotatedCellLines(
+    input,
+    layoutTable(input, placement, services),
+    placement,
+    services,
+    (cell) => rotatedByCell.get(cell),
+    'RetainedTableAcquisition.input',
+  );
+  if (rotatedCells.length > 0) {
+    rotatedCellReacquisitions.set(finalInput, new Map(rotatedCells.map((rotated) => [
+      input.rows[rotated.rowIndex]!.cells[rotated.cellIndex]!.id,
+      rotated,
+    ])));
   }
   return Object.freeze({
     input: finalInput,

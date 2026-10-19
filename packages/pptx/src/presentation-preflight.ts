@@ -508,11 +508,12 @@ interface PendingAcceptance {
  * and allocate no scalar membership cache. ACK transactions stay synchronous. */
 export type FontDemandCollector = (slide: Slide, committed: ReadonlySet<number>, byteAllowance: number) => FontPreloadDemand;
 
-/** @internal Test-only lowering; production cannot raise or replace the hard ceiling. */
+/** Internal admission options; callers may lower but never raise the hard ceiling. */
 export interface PresentationPreflightBuilderOptions {
   readonly cjkFallback?: import('@silurus/ooxml-core').CjkLang;
   readonly collectFontDemand?: FontDemandCollector;
-  readonly hardLimitForTesting?: number;
+  /** Optional lower admission budget; the generated hard ceiling always applies. */
+  readonly maxProjectionBytes?: number;
 }
 
 /**
@@ -553,12 +554,12 @@ export class PresentationPreflightBuilder {
     options: PresentationPreflightBuilderOptions = {},
   ) {
     const normalized = normalizePresentationBootstrap(bootstrap);
-    const requestedLimit = options.hardLimitForTesting ?? PPTX_MAX_PREFLIGHT_PROJECTION_BYTES;
+    const requestedLimit = options.maxProjectionBytes ?? PPTX_MAX_PREFLIGHT_PROJECTION_BYTES;
     if (
       !Number.isSafeInteger(requestedLimit) || requestedLimit <= 0 ||
       requestedLimit > PPTX_MAX_PREFLIGHT_PROJECTION_BYTES
     ) {
-      throw new Error('invalid PPTX presentation preflight test limit');
+      throw new Error('invalid PPTX presentation preflight limit');
     }
     this.limit = requestedLimit;
     this.collectFontDemand = options.collectFontDemand;

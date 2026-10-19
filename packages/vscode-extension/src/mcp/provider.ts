@@ -97,7 +97,7 @@ export class OoxmlMcpProvider implements vscode.McpServerDefinitionProvider {
       new vscode.McpStdioServerDefinition(
         'ooxml-mcp-server',
         binPath,
-        [],
+        allowedRootArgs(),
         { RUST_LOG: 'warn', ...selectionEnvironment },
         (this.context.extension.packageJSON as { version: string }).version,
       ),
@@ -114,6 +114,26 @@ export class OoxmlMcpProvider implements vscode.McpServerDefinitionProvider {
   ): Promise<vscode.McpServerDefinition> {
     return server;
   }
+}
+
+/**
+ * `--allowed-root` arguments confining the server's path-based tools to the
+ * local workspace folders. Tool paths come from the agent, which can be
+ * steered by document content, so by default it may only read inside the
+ * workspace. The arguments are omitted — leaving the server unscoped — when
+ * the user turns `restrictToWorkspaceFolders` off or the window has no local
+ * folder to scope to (for example a single file opened without a folder).
+ * Roots travel as separate arguments rather than a delimiter-joined
+ * environment variable so no folder name can split into extra roots.
+ */
+export function allowedRootArgs(): string[] {
+  const restrict = vscode.workspace
+    .getConfiguration('ooxmlViewer.mcpServer')
+    .get<boolean>('restrictToWorkspaceFolders', true);
+  if (!restrict) return [];
+  return (vscode.workspace.workspaceFolders ?? [])
+    .filter((folder) => folder.uri.scheme === 'file')
+    .flatMap((folder) => ['--allowed-root', folder.uri.fsPath]);
 }
 
 export async function workspaceHasOoxmlFiles(): Promise<boolean> {

@@ -680,13 +680,14 @@ describe('XlsxSheetViewer canvas mount', () => {
     const segments = [...(boundary?.getAttribute('d') ?? '').matchAll(/M(-?[\d.]+) (-?[\d.]+)([HV])(-?[\d.]+)/g)]
       .map((match) => ({ x: Number(match[1]), y: Number(match[2]), axis: match[3], end: Number(match[4]) }));
     const caps = segments.filter((segment) => segment.axis === (range === 'B:D' ? 'H' : 'V'));
-    // 1 CSS-pixel inset keeps the complete two-pixel SVG stroke inside the
-    // visible grid, regardless of devicePixelRatio; pane seams get no cap.
+    // A cap on the overlay edge is inset by 1 CSS pixel so the clip keeps the
+    // whole two-pixel stroke; a cap beside the headers stays on the grid line,
+    // where an ordinary cell selection draws it. Pane seams get no cap.
     expect(caps, boundary?.getAttribute('d') ?? 'No selection border').toHaveLength(2);
     expect(caps.map((segment) => range === 'B:D' ? segment.y : segment.x).sort((a, b) => a - b))
-      .toEqual(range === 'B:D' ? [Math.round(HEADER_H * scale) + 1, 599]
-        : rtl ? [1, 800 - Math.round(HEADER_W * scale) - 1]
-          : [Math.round(HEADER_W * scale) + 1, 799]);
+      .toEqual(range === 'B:D' ? [Math.round(HEADER_H * scale), 599]
+        : rtl ? [1, 800 - Math.round(HEADER_W * scale)]
+          : [Math.round(HEADER_W * scale), 799]);
     viewer.destroy();
   });
 

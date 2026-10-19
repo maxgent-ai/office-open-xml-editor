@@ -41,9 +41,10 @@ export interface OptionalImagePlaceholderBounds {
   readonly height: number;
 }
 
-const OPTIONAL_IMAGE_LABELS: Readonly<Record<OptionalImageCodec | 'pict', string>> = {
+const OPTIONAL_IMAGE_LABELS: Readonly<Record<OptionalImageCodec | 'pict' | 'equation', string>> = {
   tiff: 'TIFF image unavailable',
   pict: 'PICT image unsupported',
+  equation: 'Equation unavailable',
 };
 
 /**
@@ -54,7 +55,7 @@ const OPTIONAL_IMAGE_LABELS: Readonly<Record<OptionalImageCodec | 'pict', string
  */
 export function paintOptionalImagePlaceholder(
   ctx: CanvasRenderingContext2D,
-  codec: OptionalImageCodec | 'pict',
+  codec: OptionalImageCodec | 'pict' | 'equation',
   bounds: OptionalImagePlaceholderBounds,
   options?: Readonly<ImagePaintProjectionOptions>,
 ): void {
@@ -69,7 +70,6 @@ export function paintOptionalImagePlaceholder(
     } finally { ctx.restore(); }
   };
   if (!options) { paint(bounds.x, bounds.y, bounds.width, bounds.height); return; }
-  const plan = options.projection ?? imagePaintProjection(bounds.width, bounds.height, null, options.transform, false);
-  if (plan.width !== bounds.width || plan.height !== bounds.height) throw new RangeError('Image placeholder projection destination mismatch');
+  const plan = imagePaintProjection(bounds.width, bounds.height, null, options.transform);
   withImagePaintProjection(ctx, bounds.x, bounds.y, plan, paint);
 }

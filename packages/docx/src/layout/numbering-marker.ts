@@ -3,7 +3,7 @@ import type { NumberingInfo, TabStop } from '../types.js';
 import { wordNumberingSuffixAcceptsCoincidentListTab } from './line-compatibility.js';
 import { nextTabStop, type TextLayoutService, type TextShapeResult } from './text.js';
 import type { DeepReadonly, NumberingMarkerShapeInput } from './types.js';
-import { indexedFontMetrics, selectResourceMetric, selectedFontLineMetric } from '../line-breaker/font-metrics.js';
+import { allowsReferenceFontMetric, indexedFontMetrics, selectResourceMetric, selectedFontLineMetric } from '../line-breaker/font-metrics.js';
 
 export interface NumberingMarkerTextLayout {
   readonly shape: TextShapeResult;
@@ -129,6 +129,8 @@ export function shapeNumberingMarkerText(
   for (const span of shape.spans) {
     const { resourceMetric, referenceMetric, lineMetric } = selectedFontLineMetric(
       span.font, selectResourceMetric(metrics, span.font, span.text), true,
+      allowsReferenceFontMetric(metrics, span.font),
+      { text: service, probe: span.text },
     );
     const design = resourceMetric?.lineHeightRatio != null ? resourceMetric : referenceMetric;
     // Body text admits these same selected-face sides. Using raw Canvas boxes
@@ -212,6 +214,7 @@ export function resolveNumberingMarkerGeometry(
     )?.shape.advancePt ?? 0;
   } else if (suffix === 'tab') {
     bodyOffsetPt = 0;
+    // `word-numbering-marker-overflow-tab-advance`
     if (markerEndPt > 0) {
       const stop = numberingSuffixTabStop(
         input.physicalIndentLeftPt + markerEndPt,

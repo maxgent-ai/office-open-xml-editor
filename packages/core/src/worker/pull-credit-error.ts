@@ -93,6 +93,26 @@ export function requiredPullCredit(
     : undefined;
 }
 
+/**
+ * Pull one unit with `initialBytes` of credit. When the unit is indivisible
+ * and needs at most `maximumRequiredBytes`, retry once with exactly the
+ * required credit (same sequence); any other failure propagates.
+ */
+export async function pullWithCreditRetry<TChunk>(
+  session: { pull(byteCredit: number, options?: { signal?: AbortSignal }): Promise<TChunk> },
+  initialBytes: number,
+  maximumRequiredBytes: number,
+  signal?: AbortSignal,
+): Promise<TChunk> {
+  try {
+    return await session.pull(initialBytes, { signal });
+  } catch (error) {
+    const required = requiredPullCredit(error, initialBytes, maximumRequiredBytes);
+    if (required === undefined) throw error;
+    return session.pull(required, { signal });
+  }
+}
+
 export function isPullSessionInsufficientCreditError(
   error: unknown,
 ): error is PullSessionInsufficientCreditError {

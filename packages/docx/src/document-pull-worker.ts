@@ -1,3 +1,4 @@
+import { withDocxParserErrors } from './internal/parser-errors.js';
 import {
   decodeOoxmlResourceUsage,
   exactTransferableArrayBuffer,
@@ -171,12 +172,16 @@ export class DocumentPullWorker {
   private host: PullSessionHost<ArrayBuffer, number> | null = null;
   private identity: PullSessionIdentity<number> | null = null;
 
+  private readonly executeArchive: DocxDocumentArchiveExecutor;
+
   constructor(
     private readonly archive: () => DocxDocumentCursorArchive | null | undefined,
-    private readonly executeArchive: <T>(
-      operation: (archive: DocxDocumentCursorArchive) => T,
-    ) => T = (operation) => operation(this.requireArchive()),
-  ) {}
+    executeArchive: DocxDocumentArchiveExecutor = (operation) => operation(this.requireArchive()),
+  ) {
+    // The shared pull host serializes driver failures itself. Decode DOCX
+    // parser-private reasons before handing any archive operation to that host.
+    this.executeArchive = (operation) => withDocxParserErrors(() => executeArchive(operation));
+  }
 
   open(identity: PullSessionIdentity<number>): void {
     if (this.host) throw new Error('a DOCX document pull session is already active');

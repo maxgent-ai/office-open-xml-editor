@@ -24,13 +24,6 @@ export type ResolvedPaintResource<K extends PaintResourceDescriptorKind> = Reado
   handle: unknown;
 }>;
 
-const ownedPaintResourceSessions = new WeakSet<object>();
-
-/** Realm-owned sessions created by the resource registry/handle join. */
-export function isOwnedPaintResourceSession(value: PaintResourceSession): boolean {
-  return ownedPaintResourceSessions.has(value);
-}
-
 export interface PaintResourceSession {
   readonly keys: readonly string[];
   resolve<K extends PaintResourceDescriptorKind>(
@@ -123,7 +116,6 @@ export function createPaintResourceSession(
       return Object.freeze({ descriptor, handle: entry.handle });
     },
   });
-  ownedPaintResourceSessions.add(session);
   return session;
 }
 

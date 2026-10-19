@@ -11,7 +11,7 @@
 
 import { getCachedBitmapByPath } from './bitmap-image-by-path.js';
 import { withDecodedImageSlot } from './decode-gate.js';
-import type { SvgBlobDecoder } from '../worker/svg-decode-bridge.js';
+import type { SvgBlobDecoder } from './svg-raster.js';
 
 type FetchImage = (path: string, mimeType: string) => Promise<Blob>;
 export type SvgImageSource = HTMLImageElement | ImageBitmap;

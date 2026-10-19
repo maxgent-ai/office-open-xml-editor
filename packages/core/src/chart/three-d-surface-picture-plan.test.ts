@@ -142,14 +142,14 @@ describe('positive-thickness CT_Surface picture faces', () => {
       },
     };
     expect(planChartThreeDSurfacePicture(fill, frontOnly, 'backWall', 8_192)).not.toBeNull();
-    expect(planChartThreeDSurfacePicture(fill, frontOnly, 'backWall', 8_194)).toBeNull();
+    expect(() => planChartThreeDSurfacePicture(fill, frontOnly, 'backWall', 8_194)).toThrowError(expect.objectContaining({ code: 'ooxml-decoded-image-limit' }));
 
     const allFaces = {
       thicknessPercent: 25,
       pictureOptions: { pictureFormat: 'stackScale' as const, pictureStackUnit: 2 },
     };
     expect(planChartThreeDSurfacePicture(fill, allFaces, 'backWall', 2_728)).not.toBeNull();
-    expect(planChartThreeDSurfacePicture(fill, allFaces, 'backWall', 2_730)).toBeNull();
+    expect(() => planChartThreeDSurfacePicture(fill, allFaces, 'backWall', 2_730)).toThrowError(expect.objectContaining({ code: 'ooxml-decoded-image-limit' }));
   });
 
   it('retains plain stack only for the observed identity rectangle boundary', () => {

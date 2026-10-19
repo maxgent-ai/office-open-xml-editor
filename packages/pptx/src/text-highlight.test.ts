@@ -151,6 +151,20 @@ describe('paintHighlight — paints the marker box behind the glyphs', () => {
     expect(ctx.fillStyle).toBe('rgba(0,0,0,1)');
   });
 
+  // Windows PowerPoint 16.0.20430 (#1896): Arial at 48 pt draws the marker
+  // from baseline - 42.75 pt over 53.64 pt, the usWin extent ending at the
+  // bottom of the run's 1.2 x size line box.
+  it('uses the face glyph box ending at the run line box bottom', async () => {
+    const { powerPointFaceMetrics } = await import('./powerpoint-line-metrics.js');
+    const arial = powerPointFaceMetrics('Arial', false, false)!;
+    const { ctx, ops } = mockCtx();
+    paintHighlight(ctx, 0, 100, 30, 48, 'rgba(255,255,0,1)', 'rgba(0,0,0,1)', arial);
+    const rect = ops[0]!;
+    if (rect.op !== 'rect') throw new Error('expected a rect');
+    expect(rect.y + rect.h - 100).toBeCloseTo(-42.75 + 53.64, 1);
+    expect(rect.h).toBeCloseTo(53.64, 1);
+  });
+
   it('draws the box under a glyph painted afterwards (background then glyph)', () => {
     const { ctx, ops } = mockCtx();
     // Simulate the renderer's call order: paint the box, then the glyph.

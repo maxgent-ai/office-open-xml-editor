@@ -1,8 +1,9 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { TextRunData } from '@silurus/ooxml-core';
-import { renderTextBody } from './renderer.js';
+import { renderTextBodyWithPresentFaces as renderTextBody } from './test-support/present-faces.js';
+import { renderTextBody as renderTextBodyAsAuthored } from './renderer.js';
 import {
-  powerPointAscentShare, powerPointShareCacheSize, SHARE_CACHE_LIMIT,
+  powerPointAscentShare, SHARE_CACHE_LIMIT,
 } from './powerpoint-line-metrics.js';
 import type { Paragraph, TextBody } from './types.js';
 
@@ -192,11 +193,19 @@ describe('PowerPoint text-box line metrics (#1610)', () => {
   });
 
   it('bounds the share cache while many distinct face names are queried', () => {
-    for (let i = 0; i < SHARE_CACHE_LIMIT * 4; i++) {
-      powerPointAscentShare(`Unresolved Face ${i}`, i % 2 === 0, i % 3 === 0);
-      expect(powerPointShareCacheSize()).toBeLessThanOrEqual(SHARE_CACHE_LIMIT);
-    }
-    expect(powerPointShareCacheSize()).toBe(SHARE_CACHE_LIMIT);
+    let cache: Map<unknown, unknown> | undefined;
+    const set = Map.prototype.set;
+    const insertions = vi.spyOn(Map.prototype, 'set').mockImplementation(function (this: Map<unknown, unknown>, key, value) {
+      if (typeof key === 'string' && key.startsWith('unresolved face ')) cache = this;
+      return set.call(this, key, value);
+    });
+    try {
+      for (let i = 0; i < SHARE_CACHE_LIMIT * 4; i++) {
+        powerPointAscentShare(`Unresolved Face ${i}`, i % 2 === 0, i % 3 === 0);
+        expect(cache?.size).toBeLessThanOrEqual(SHARE_CACHE_LIMIT);
+      }
+      expect(cache?.size).toBe(SHARE_CACHE_LIMIT);
+    } finally { insertions.mockRestore(); }
     // Known faces still resolve after eviction.
     expect(powerPointAscentShare('Arial', false, false)).toBeCloseTo(1854 / 2288, 12);
   });
@@ -475,4 +484,89 @@ describe('pPr fontAlgn and line-break marks (#1636)', () => {
     // stays: ~150 000 metric entries are needed to exceed V8's spread-argument
     // limit (~125 000 here) that this test guards.
   }, 60_000);
+});
+
+describe('absent authored faces (layout follows the painting face)', () => {
+  function absentBaselines(font: string): number[] {
+    const body = {
+      verticalAnchor: 't', paragraphs: [paragraph([{ text: 'Ag', font, size: 100 }]),
+        paragraph([{ text: 'Ag', font, size: 100 }])],
+      defaultFontSize: 18, defaultBold: null, defaultItalic: null,
+      lIns: 0, rIns: 0, tIns: 0, bIns: 0, wrap: 'none', vert: 'horz', autoFit: 'none',
+    } as TextBody;
+    const { ctx, draws } = context();
+    // No office route: the authored face is not installed on the host.
+    renderTextBodyAsAuthored(ctx, body, 0, 0, 2000, 800, SCALE);
+    const ys: number[] = [];
+    for (const d of draws) if (!ys.some((y) => Math.abs(y - d.y) < 1e-6)) ys.push(d.y);
+    return ys;
+  }
+
+  it('keeps the ordinary line model instead of the absent face\'s catalog ascent share', () => {
+    const present = baselines([paragraph([{ text: 'Ag', font: 'Yu Gothic', size: 100 }]),
+      paragraph([{ text: 'Ag', font: 'Yu Gothic', size: 100 }])]);
+    // Same placement as a CSS generic family, which has no catalog face.
+    expect(absentBaselines('Yu Gothic')).toEqual(absentBaselines('sans-serif'));
+    expect(absentBaselines('Yu Gothic')).not.toEqual(present);
+  });
+
+  it('treats a family present by its presence probe as present on a bold-only slide', () => {
+    // No styled tuple loaded (no bold cut installed), but the family presence
+    // probe found the regular face: the installed family paints the bold run.
+    const paragraphs = [paragraph([{ text: 'Ag', font: 'Yu Gothic', size: 100 }]),
+      paragraph([{ text: 'Ag', font: 'Yu Gothic', size: 100 }])];
+    for (const p of paragraphs) for (const run of p.runs) (run as { bold?: boolean }).bold = true;
+    const body = {
+      verticalAnchor: 't', paragraphs, defaultFontSize: 18, defaultBold: null, defaultItalic: null,
+      lIns: 0, rIns: 0, tIns: 0, bIns: 0, wrap: 'none', vert: 'horz', autoFit: 'none',
+    } as TextBody;
+    const ys = (rc: Parameters<typeof renderTextBodyAsAuthored>[13]) => {
+      const { ctx, draws } = context();
+      renderTextBodyAsAuthored(ctx, body, 0, 0, 2000, 800, SCALE, null, 0, false, false, '#000000', undefined, rc);
+      const out: number[] = [];
+      for (const d of draws) if (!out.some((y) => Math.abs(y - d.y) < 1e-6)) out.push(d.y);
+      return out;
+    };
+    const viaPresence = ys({ themeMajorFont: null, themeMinorFont: null, dpr: 1, officeInstalledFamilies: ['yu gothic'] });
+    // Same geometry as an exact bold route: the installed family paints it.
+    const viaRoute = ys({ themeMajorFont: null, themeMinorFont: null, dpr: 1,
+      officeFontRoutes: { 'yu gothic:700:normal': { family: 'Yu Gothic' } as never } });
+    expect(viaPresence).toEqual(viaRoute);
+    expect(viaPresence).not.toEqual(absentBaselines('sans-serif'));
+  });
+
+  it('follows the painting selection for a missing embedded style', () => {
+    // The deck embeds only regular Arial (under a private alias). A bold run
+    // paints the exact installed Arial Bold route, so it takes that face's
+    // metrics like the same run without the embedded metadata; the embedded
+    // regular tuple paints the deck's bytes and keeps the ordinary line model.
+    const body = (bold: boolean) => {
+      const paragraphs = [paragraph([{ text: 'Ag', font: 'Arial', size: 100 }]),
+        paragraph([{ text: 'Ag', font: 'Arial', size: 100 }])];
+      for (const p of paragraphs) for (const run of p.runs) (run as { bold?: boolean }).bold = bold;
+      return {
+        verticalAnchor: 't', paragraphs, defaultFontSize: 18, defaultBold: null, defaultItalic: null,
+        lIns: 0, rIns: 0, tIns: 0, bIns: 0, wrap: 'none', vert: 'horz', autoFit: 'none',
+      } as TextBody;
+    };
+    const ys = (b: TextBody, rc: Parameters<typeof renderTextBodyAsAuthored>[13]) => {
+      const { ctx, draws } = context();
+      renderTextBodyAsAuthored(ctx, b, 0, 0, 2000, 800, SCALE, null, 0, false, false, '#000000', undefined, rc);
+      const out: number[] = [];
+      for (const d of draws) if (!out.some((y) => Math.abs(y - d.y) < 1e-6)) out.push(d.y);
+      return out;
+    };
+    const routes = { 'arial:700:normal': { family: '__local_arial_bold' } as never };
+    const plain = { themeMajorFont: null, themeMinorFont: null, dpr: 1, officeFontRoutes: routes };
+    const embedded = {
+      ...plain,
+      embeddedFontAliases: new Map([['arial', '__embedded_arial']]),
+      embeddedFontAuthoredFamilies: new Map([['__embedded_arial', 'Arial']]),
+      embeddedFontTuples: new Set(['arial:400:normal']),
+      officeInstalledFamilies: ['arial'],
+    };
+    expect(ys(body(true), embedded)).toEqual(ys(body(true), plain));
+    expect(ys(body(true), embedded)).not.toEqual(absentBaselines('sans-serif'));
+    expect(ys(body(false), embedded)).toEqual(absentBaselines('sans-serif'));
+  });
 });

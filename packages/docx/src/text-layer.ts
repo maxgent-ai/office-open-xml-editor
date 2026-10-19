@@ -1,15 +1,7 @@
 import type { DocxTextRunInfo } from './renderer';
 import { overlayPercent, type HyperlinkTarget } from '@silurus/ooxml-core';
 import { tateChuYokoOverlayScale } from './tate-chu-yoko-overlay';
-
-function setSelectionData(element: HTMLElement, key: string, value?: string): void {
-  if (element.dataset) {
-    if (value === undefined) delete element.dataset[key];
-    else element.dataset[key] = value;
-  } else if (value !== undefined) {
-    element.setAttribute?.(`data-${key.replace(/[A-Z]/g, (char) => `-${char.toLowerCase()}`)}`, value);
-  }
-}
+import { setSelectionData } from '@silurus/ooxml-core/internal/selection-data';
 
 /**
  * Build the transparent text-selection overlay for a rendered docx page: one

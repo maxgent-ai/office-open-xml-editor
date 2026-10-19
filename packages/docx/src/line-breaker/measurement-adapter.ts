@@ -1,4 +1,4 @@
-import { wordKerningApplies } from '../layout/line-compatibility.js';
+import { wordArabicTextKerned, wordKerningApplies } from '../layout/line-compatibility.js';
 import type { LayoutTextSeg } from '../line-layout.js';
 import type { MeasurementTextContext, VerticalGlyphMeasurementService } from '../layout/measurement-capabilities.js';
 import { calcEffectiveFontPx, semanticSlotStartIndex } from '../layout/text.js';
@@ -55,6 +55,7 @@ export class LineMeasurementAdapter {
     // The acquisition request owns the mode-scoped decision; retained paint
     // consumes that same value. Standalone segments have no compatibility mode.
     const selected = (segment.textShapeRequest?.kerning ?? wordKerningApplies(segment.fontSize, segment.kerning))
+      || wordArabicTextKerned(segment.text)
       ? 'normal'
       : 'none';
     this.context.fontKerning = selected;

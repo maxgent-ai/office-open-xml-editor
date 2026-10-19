@@ -1,8 +1,8 @@
 export interface FitTextRun {
   /** §17.3.2.14 w:val — target region width in TWIPS. undefined ⇒ not a fitText run. */
   fitTextValTwips?: number;
-  /** §17.3.2.14 w:id — links CONSECUTIVE fitText runs into ONE region. undefined ⇒
-   *  standalone region (an id-less fitText run never links to any neighbour). */
+  /** §17.3.2.14 w:id — links CONSECUTIVE fitText runs into ONE region.
+   *  undefined ⇒ id 0 (WORD_FIT_TEXT_OMITTED_ID_LINKING). */
   fitTextId?: number | string;
   /** Code-point count of the run. */
   charCount: number;
@@ -23,6 +23,15 @@ export interface FitTextRegion {
   trailingPadPx: number;
 }
 
+/** The region id of a fitText run (`WORD_FIT_TEXT_OMITTED_ID_LINKING`): an
+ *  omitted w:id is id 0. Integer ids compare by value (the XSD integer is
+ *  arbitrary precision, so BigInt, not Number). */
+function fitTextRegionId(id: number | string | undefined): string {
+  if (id === undefined) return '0';
+  const text = String(id).trim();
+  return /^[+-]?\d+$/.test(text) ? BigInt(text).toString() : text;
+}
+
 /** ECMA-376 §17.3.2.14. `scale` is px-per-pt. */
 export function groupFitTextRegions(runs: FitTextRun[], scale: number): FitTextRegion[] {
   const regions: FitTextRegion[] = [];
@@ -35,14 +44,13 @@ export function groupFitTextRegions(runs: FitTextRun[], scale: number): FitTextR
     }
 
     let end = start + 1;
-    if (first.fitTextId !== undefined) {
-      while (
-        end < runs.length &&
-        runs[end].fitTextValTwips !== undefined &&
-        runs[end].fitTextId === first.fitTextId
-      ) {
-        end += 1;
-      }
+    const id = fitTextRegionId(first.fitTextId);
+    while (
+      end < runs.length &&
+      runs[end].fitTextValTwips !== undefined &&
+      fitTextRegionId(runs[end].fitTextId) === id
+    ) {
+      end += 1;
     }
 
     let naturalPx = 0;

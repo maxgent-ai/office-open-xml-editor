@@ -11,7 +11,7 @@ function fakeSource(target, config) {
     claim: () => true,
     beginLoad: () => ({
       module: {
-        protocol: 'ooxml-model-source-module/v1',
+        protocol: 'ooxml-model-source-module/v2',
         target,
         moduleUrl: FAKE_MODULE,
         config: { format: target, ...config },
@@ -68,7 +68,7 @@ function assert(condition, message) {
 }
 
 export async function runModelSourceStages({
-  DocxDocument, DocxViewer, XlsxWorkbook, PptxPresentation, legacyDocSource, bytes, paintCanvas,
+  DocxDocument, DocxViewer, XlsxWorkbook, PptxPresentation, legacyDoc, bytes, paintCanvas,
 }) {
   const tracked = await bytes('/consumer/tracked.docx');
   const bordered = await bytes('/consumer/bordered.xlsx');
@@ -77,7 +77,7 @@ export async function runModelSourceStages({
     const canvas = document.createElement('canvas');
     document.body.append(canvas);
     const viewer = new DocxViewer(canvas, {
-      modelSources: [fakeSource('docx', { showTrackedChanges: true, minimal: true })],
+      legacyDoc: fakeSource('docx', { showTrackedChanges: true, minimal: true }),
       useGoogleFonts: false,
       ...(choice === 'setter' ? {} : { showTrackedChanges: choice === 'markup' }),
     });
@@ -105,7 +105,7 @@ export async function runModelSourceStages({
     // The source's view default applies when the caller does not choose.
     const defaulted = await docxPage(DocxDocument, tracked, {
       mode,
-      modelSources: [fakeSource('docx', { showTrackedChanges: true, minimal: true })],
+      legacyDoc: fakeSource('docx', { showTrackedChanges: true, minimal: true }),
     });
     assert(defaulted.image === markup.image, `${mode}: source view default was not applied`);
     // Missing optional capabilities degrade generically.
@@ -120,7 +120,7 @@ export async function runModelSourceStages({
     const explicit = await docxPage(DocxDocument, tracked, {
       mode,
       showTrackedChanges: false,
-      modelSources: [fakeSource('docx', { showTrackedChanges: true })],
+      legacyDoc: fakeSource('docx', { showTrackedChanges: true }),
     });
     explicit.document.destroy();
     assert(explicit.image === final.image, `${mode}: explicit showTrackedChanges:false was not honoured`);
@@ -130,13 +130,13 @@ export async function runModelSourceStages({
     const noRequest = await xlsxView(XlsxWorkbook, bordered, {
       mode,
       useGoogleFonts: false,
-      modelSources: [fakeSource('xlsx', { layoutFamily: '' })],
+      legacyXls: fakeSource('xlsx', { layoutFamily: '' }),
     });
     assert(noRequest === plain, `${mode}: a null host layout request must not change geometry`);
     const wide = await xlsxView(XlsxWorkbook, bordered, {
       mode,
       useGoogleFonts: false,
-      modelSources: [fakeSource('xlsx', { layoutFamily: 'Arial', layoutSizePt: 36, minimal: true })],
+      legacyXls: fakeSource('xlsx', { layoutFamily: 'Arial', layoutSizePt: 36, minimal: true }),
     });
     assert(wide !== plain, `${mode}: the host-measured Normal font must size the grid`);
     document.body.dataset[`xlsxHostLayout${mode === 'main' ? 'Main' : 'Worker'}`] = wide;
@@ -144,7 +144,7 @@ export async function runModelSourceStages({
     document.body.dataset.stage = `model-source-pptx-${mode}`;
     const presentation = await PptxPresentation.load(slides.slice(0), {
       mode,
-      modelSources: [fakeSource('pptx', { minimal: true })],
+      legacyPpt: fakeSource('pptx', { minimal: true }),
     });
     try {
       assert(presentation.slideCount > 0, `${mode}: source presentation is empty`);
@@ -166,7 +166,7 @@ export async function runModelSourceStages({
     document.body.dataset.stage = `legacy-doc-${mode}`;
     const legacy = await DocxDocument.load(await bytes('/consumer/legacy.doc'), {
       mode,
-      modelSources: [legacyDocSource()],
+      legacyDoc,
     });
     try {
       const target = paintCanvas(`legacy-doc-${mode}`);

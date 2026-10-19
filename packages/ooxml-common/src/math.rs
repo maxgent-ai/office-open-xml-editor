@@ -217,18 +217,15 @@ fn on_off(parent: Node, child: &str, default: bool) -> bool {
 /// OMML nests arbitrarily (a fraction's numerator can hold another fraction,
 /// etc.), so this recurses; the descent is bounded by a [`DepthGuard`] to stop a
 /// hand-crafted, thousands-deep math tree from overflowing the WASM stack and
-/// trapping the whole parse. Past the limit the subtree is dropped (its runs do
-/// not survive), which is graceful degradation — the surrounding document still
-/// renders.
+/// trapping the whole parse. A depth crossing latches a typed resource failure;
+/// the package operation rejects the provisional model before publishing it.
 pub fn parse_omath_nodes(el: Node) -> Vec<MathNode> {
     parse_omath_nodes_d(el, DepthGuard::root())
 }
 
 fn parse_omath_nodes_d(el: Node, depth: DepthGuard) -> Vec<MathNode> {
-    // Stop descending once the shared depth limit is reached: a deeper subtree is
-    // dropped rather than recursed into. `descend()` yields the child guard used
-    // for every recursive call below (via `nodes_in`, `parse_matrix`,
-    // `parse_eqarr`, the delimiter map, and the container fallback).
+    // descend() records the hard failure before this bounded return. Container
+    // helpers share this guard; the package boundary rejects their projection.
     let Some(depth) = depth.descend() else {
         return Vec::new();
     };
@@ -664,6 +661,20 @@ mod tests {
     fn parse(xml: &str) -> Vec<MathNode> {
         let doc = roxmltree::Document::parse(xml).unwrap();
         parse_omath_nodes(doc.root_element())
+    }
+
+    #[test]
+    fn omml_depth_crossing_is_a_typed_resource_failure() {
+        use crate::resource::{OoxmlFormat, ResourceGovernor};
+        let governor = ResourceGovernor::from_wasm(OoxmlFormat::Docx, None, None, None);
+        let _scope = governor.scope("math-test");
+        let document = roxmltree::Document::parse("<oMath><f><num><r/></num></f></oMath>").unwrap();
+        let _provisional = parse_omath_nodes_d(document.root_element(), DepthGuard::with_limit(1));
+        let error = governor
+            .first_error()
+            .expect("depth crossing must poison the operation");
+        assert!(error.starts_with("OOXML_RESOURCE_LIMIT:"), "{error}");
+        assert!(error.contains("\"metric\":\"depth\""), "{error}");
     }
 
     #[test]

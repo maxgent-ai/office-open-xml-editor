@@ -1,8 +1,9 @@
-import { describe, it, expect, afterEach } from 'vitest';
-import { retainFace, releaseFaces, _resetFontRegistryForTests } from './font-registry.js';
+import { vi, beforeEach, describe, it, expect } from 'vitest';
+let { retainFace, releaseFaces } = await import('./font-registry.js');
 
-afterEach(() => {
-  _resetFontRegistryForTests(); // the registry is module-global
+beforeEach(async () => {
+  vi.resetModules();
+  ({ retainFace, releaseFaces } = await import('./font-registry.js'));
 });
 
 // A minimal FontFace / FontFaceSet stand-in. The registry only needs identity

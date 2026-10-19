@@ -139,22 +139,30 @@ describe('drawUnderline (core, DrawingML ST_TextUnderlineType §20.1.10.82)', ()
     );
   });
 
-  it('docx w:u val="thick" (mapped to DrawingML "heavy" by docxUnderlineToDrawingML) thickens the line weight ~1.8×', () => {
-    // Regression test for the docx thick → DrawingML heavy pipeline: the
-    // underline-map.ts mapping produces the lowercase 'heavy' token, which
-    // must be recognized here the same as the bare pptx 'heavy' value above.
-    const plain = makeCtx();
-    const heavy = makeCtx();
-    drawUnderline(plain.ctx, 10, 100, 50, 20, '#000', 'sng');
-    drawUnderline(heavy.ctx, 10, 100, 50, 20, '#000', 'heavy'); // docxUnderlineToDrawingML('thick') === 'heavy'
-    expect((heavy.ctx as unknown as { lineWidth: number }).lineWidth).toBeCloseTo(
-      (plain.ctx as unknown as { lineWidth: number }).lineWidth * 1.8,
-      6,
-    );
-  });
-
   it('uses the provided colour for strokeStyle', () => {
     drawUnderline(h.ctx, 10, 100, 50, 20, '#ff0000', 'sng');
     expect((h.ctx as unknown as { strokeStyle: string }).strokeStyle).toBe('#ff0000');
+  });
+});
+
+describe('drawUnderline with the face rule (#1896 Windows PowerPoint controls)', () => {
+  // Arial at 48 pt: post underlinePosition -217, underlineThickness 150 / 2048.
+  const rule = { topPx: 217 / 2048 * 48, thicknessPx: 150 / 2048 * 48 };
+
+  it('centres the single rule on the face underline', () => {
+    const { ctx, ops } = makeCtx();
+    drawUnderline(ctx, 0, 100, 50, 48, '#000', 'sng', 1, undefined, rule);
+    const move = ops.find((op) => op.op === 'moveTo')!;
+    expect(move.args[1]).toBeCloseTo(100 + rule.topPx + rule.thicknessPx / 2, 0);
+    expect(ctx.lineWidth).toBeCloseTo(rule.thicknessPx, 6);
+  });
+
+  it('draws heavy 1.5x as thick with its bottom at the single rule centre', () => {
+    const { ctx, ops } = makeCtx();
+    drawUnderline(ctx, 0, 100, 50, 48, '#000', 'heavy', 1, undefined, rule);
+    const move = ops.find((op) => op.op === 'moveTo')!;
+    const singleCentre = 100 + rule.topPx + rule.thicknessPx / 2;
+    expect(ctx.lineWidth).toBeCloseTo(rule.thicknessPx * 1.5, 6);
+    expect(move.args[1] + ctx.lineWidth / 2).toBeCloseTo(singleCentre, 0);
   });
 });

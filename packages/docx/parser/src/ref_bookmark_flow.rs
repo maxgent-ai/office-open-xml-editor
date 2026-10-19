@@ -45,9 +45,57 @@ pub(crate) fn ref_target(instruction: &str) -> Option<&str> {
 /// blocks, so the small instruction stack survives each block's XML arena.
 #[derive(Default)]
 pub(crate) struct RefInstructionCollector {
-    stack: Vec<Option<String>>,
+    stack: Vec<RefInstruction>,
     overflow_depth: usize,
+    overflow_instruction: RefInstruction,
     pub(crate) targets: HashSet<String>,
+    pub(crate) budget_exceeded: bool,
+}
+
+// Recognize the keyword across instrText chunks without retaining unrelated
+// fields or unbounded leading whitespace. A REF diagnostic belongs only to a
+// relevant acquisition that was actually curtailed, never a long HYPERLINK.
+#[derive(Default)]
+struct RefInstruction {
+    prefix: String,
+    text: String,
+    bytes: usize,
+    relevant: bool,
+    irrelevant: bool,
+}
+impl RefInstruction {
+    fn append(&mut self, text: &str, depth_limited: bool) -> bool {
+        if self.irrelevant {
+            return false;
+        }
+        let mut exceeded = false;
+        for ch in text.chars() {
+            self.bytes = self.bytes.saturating_add(ch.len_utf8());
+            if !self.relevant {
+                if self.prefix.is_empty() && ch.is_whitespace() {
+                    continue;
+                }
+                if ch.is_whitespace() && self.prefix.eq_ignore_ascii_case("REF") {
+                    self.relevant = true;
+                    self.text.push_str("REF ");
+                } else {
+                    self.prefix.push(ch);
+                    if !"REF".starts_with(&self.prefix.to_ascii_uppercase()) {
+                        self.irrelevant = true;
+                        return exceeded;
+                    }
+                }
+            } else if self.bytes <= MAX_FIELD_INSTRUCTION_BYTES && !depth_limited {
+                self.text.push(ch);
+            }
+            if self.relevant && (depth_limited || self.bytes > MAX_FIELD_INSTRUCTION_BYTES) {
+                exceeded = true;
+                self.irrelevant = true;
+                break;
+            }
+        }
+        exceeded
+    }
 }
 
 impl RefInstructionCollector {
@@ -62,16 +110,20 @@ impl RefInstructionCollector {
             match attr_w(node, "fldCharType").as_deref() {
                 Some("begin") => {
                     if self.overflow_depth > 0 || self.stack.len() >= MAX_ACTIVE_BOOKMARKS {
+                        self.overflow_instruction = RefInstruction::default();
                         self.overflow_depth = self.overflow_depth.saturating_add(1);
                     } else {
-                        self.stack.push(Some(String::new()));
+                        self.stack.push(RefInstruction::default());
                     }
                 }
                 Some("separate") if self.overflow_depth == 0 => {
-                    if let Some(Some(instruction)) = self.stack.last() {
-                        if let Some(target) = ref_target(instruction) {
-                            if self.targets.len() < MAX_REF_TARGETS {
+                    if let Some(instruction) = self.stack.last().filter(|i| !i.irrelevant) {
+                        if let Some(target) = ref_target(&instruction.text) {
+                            if self.targets.contains(target) || self.targets.len() < MAX_REF_TARGETS
+                            {
                                 self.targets.insert(target.to_string());
+                            } else {
+                                self.budget_exceeded = true;
                             }
                         }
                     }
@@ -85,16 +137,15 @@ impl RefInstructionCollector {
                 }
                 _ => {}
             }
-        } else if is_word(node, "instrText") && self.overflow_depth == 0 {
-            if let Some(frame) = self.stack.last_mut() {
-                if let Some(instruction) = frame {
-                    let text = node.text().unwrap_or_default();
-                    if instruction.len().saturating_add(text.len()) <= MAX_FIELD_INSTRUCTION_BYTES {
-                        instruction.push_str(text);
-                    } else {
-                        *frame = None;
-                    }
-                }
+        } else if is_word(node, "instrText") {
+            let limited = self.overflow_depth > 0;
+            let frame = if limited {
+                Some(&mut self.overflow_instruction)
+            } else {
+                self.stack.last_mut()
+            };
+            if let Some(frame) = frame {
+                self.budget_exceeded |= frame.append(node.text().unwrap_or_default(), limited);
             }
         }
     }
@@ -120,7 +171,9 @@ struct ActiveBookmark {
 /// `<w:br w:type="page"/>` show that this break also precedes the field result.
 /// We retain only a strict, bounded subset: one initial break paragraph and
 /// one following text-only paragraph. Other structures, stale cached results,
-/// nested targeted bookmarks, and budget overflows use the cached field result.
+/// and nested targeted bookmarks use the cached field result. Resource ceilings
+/// bound retained strings and nested instructions; callers must publish
+/// `budget_exceeded` through the parser diagnostic contract before using cache.
 pub(crate) struct LeadingBreakCollector<'a> {
     requested: &'a HashSet<String>,
     active: Vec<ActiveBookmark>,
@@ -128,6 +181,7 @@ pub(crate) struct LeadingBreakCollector<'a> {
     seen: HashSet<String>,
     ambiguous: HashSet<String>,
     total_text_bytes: usize,
+    pub(crate) budget_exceeded: bool,
 }
 
 impl<'a> LeadingBreakCollector<'a> {
@@ -139,6 +193,7 @@ impl<'a> LeadingBreakCollector<'a> {
             seen: HashSet::new(),
             ambiguous: HashSet::new(),
             total_text_bytes: 0,
+            budget_exceeded: false,
         }
     }
 
@@ -222,6 +277,8 @@ impl<'a> LeadingBreakCollector<'a> {
                             self.total_text_bytes.saturating_add(bookmark.text.len());
                         if self.total_text_bytes <= MAX_TOTAL_TARGET_TEXT_BYTES {
                             self.completed.insert(bookmark.name, bookmark.text);
+                        } else {
+                            self.budget_exceeded = true;
                         }
                     }
                 }
@@ -242,6 +299,9 @@ impl<'a> LeadingBreakCollector<'a> {
                     {
                         bookmark.text.push_str(text);
                     } else {
+                        if bookmark.phase == Phase::Text {
+                            self.budget_exceeded = true;
+                        }
                         bookmark.phase = Phase::Invalid;
                     }
                 }
@@ -364,5 +424,87 @@ pub(crate) fn apply_matching_leading_break(
         let old_index = boundary.run_index;
         boundary.run_index =
             old_index.saturating_add(insertions.partition_point(|index| *index <= old_index));
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    fn observe_instruction(collector: &mut RefInstructionCollector, instruction: &str) {
+        let xml = format!(
+            r#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:fldChar w:fldCharType="begin"/><w:instrText>{instruction}</w:instrText><w:fldChar w:fldCharType="separate"/><w:fldChar w:fldCharType="end"/></w:p>"#
+        );
+        collector.observe(roxmltree::Document::parse(&xml).unwrap().root_element());
+    }
+
+    #[test]
+    fn instruction_and_target_ceiling_crossings_are_observable_but_duplicate_targets_fit() {
+        let mut collector = RefInstructionCollector::default();
+        for index in 0..MAX_REF_TARGETS {
+            observe_instruction(&mut collector, &format!("REF B{index}"));
+        }
+        assert!(!collector.budget_exceeded);
+        observe_instruction(&mut collector, "REF B0");
+        assert!(!collector.budget_exceeded);
+        observe_instruction(&mut collector, "REF Excess");
+        assert!(collector.budget_exceeded);
+        assert_eq!(collector.targets.len(), MAX_REF_TARGETS);
+        let mut collector = RefInstructionCollector::default();
+        observe_instruction(
+            &mut collector,
+            &(" ".repeat(MAX_FIELD_INSTRUCTION_BYTES) + "REF B"),
+        );
+        assert!(collector.budget_exceeded);
+    }
+
+    #[test]
+    fn long_non_ref_instructions_do_not_report_ref_acquisition_failure() {
+        let mut collector = RefInstructionCollector::default();
+        observe_instruction(
+            &mut collector,
+            &format!("HYPERLINK https://example.test/{}", "a".repeat(300)),
+        );
+        assert!(!collector.budget_exceeded);
+        assert!(collector.targets.is_empty());
+        observe_instruction(&mut collector, &format!("REF {}", "a".repeat(300)));
+        assert!(collector.budget_exceeded);
+    }
+
+    #[test]
+    fn per_bookmark_and_aggregate_text_ceiling_crossings_are_observable() {
+        let requested = (0..=MAX_TOTAL_TARGET_TEXT_BYTES / MAX_TARGET_TEXT_BYTES)
+            .map(|index| format!("B{index}"))
+            .collect();
+        let mut collector = LeadingBreakCollector::new(&requested);
+        let mut observe = |index: usize, len: usize| {
+            let start = format!(
+                r#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:bookmarkStart w:id="{index}" w:name="B{index}"/><w:r><w:br w:type="page"/></w:r></w:p>"#
+            );
+            collector.observe(roxmltree::Document::parse(&start).unwrap().root_element());
+            let end = format!(
+                r#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:r><w:t>{}</w:t></w:r><w:bookmarkEnd w:id="{index}"/></w:p>"#,
+                "x".repeat(len)
+            );
+            collector.observe(roxmltree::Document::parse(&end).unwrap().root_element());
+        };
+        for index in 0..=MAX_TOTAL_TARGET_TEXT_BYTES / MAX_TARGET_TEXT_BYTES {
+            observe(index, MAX_TARGET_TEXT_BYTES);
+        }
+        assert!(collector.budget_exceeded);
+        assert_eq!(
+            collector.finish().len(),
+            MAX_TOTAL_TARGET_TEXT_BYTES / MAX_TARGET_TEXT_BYTES
+        );
+        let mut collector = LeadingBreakCollector::new(&requested);
+        let start = r#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:bookmarkStart w:id="0" w:name="B0"/><w:r><w:br w:type="page"/></w:r></w:p>"#;
+        collector.observe(roxmltree::Document::parse(start).unwrap().root_element());
+        let end = format!(
+            r#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:r><w:t>{}</w:t></w:r><w:bookmarkEnd w:id="0"/></w:p>"#,
+            "x".repeat(MAX_TARGET_TEXT_BYTES + 1)
+        );
+        collector.observe(roxmltree::Document::parse(&end).unwrap().root_element());
+        assert!(collector.budget_exceeded);
+        assert!(collector.finish().is_empty());
     }
 }

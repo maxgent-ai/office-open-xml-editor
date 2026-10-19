@@ -6,6 +6,7 @@ import { boundedViewerCommentThreadContext } from '@silurus/ooxml-core/internal/
 import { readBoundedNativeTextSelection } from '@silurus/ooxml-core/internal/canvas-viewer-mechanics';
 import type { CommentAnchorRange } from './comments.js';
 import type { DocComment } from './types.js';
+import { nonNegativeInteger } from '@silurus/ooxml-core/internal/selection-data';
 
 /** Bounds for a DOCX selection-context snapshot. Extensible per format. */
 export type DocxSelectionContextOptions = TextSelectionContextOptions;
@@ -135,12 +136,6 @@ export function createDocxCommentSelectionContext(
     textCharacters: bounded.textCharacters,
     maxTextCharacters: bounded.maxTextCharacters,
   });
-}
-
-function nonNegativeInteger(value: string | undefined): number | null {
-  if (value === undefined || !/^\d+$/.test(value)) return null;
-  const number = Number(value);
-  return Number.isSafeInteger(number) ? number : null;
 }
 
 function pageIndexFor(run: HTMLElement): number | null {

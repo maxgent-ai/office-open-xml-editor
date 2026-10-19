@@ -105,6 +105,14 @@ export function deepFreezePlainDataWithFrozenAliases<T>(
   return frozen;
 }
 
+/** Whether the index loop above already walked `key`: a canonical array
+ * index below the length. A numeric-looking key such as "-1" or "1.5" is an
+ * ordinary property and must be walked separately. */
+function isWalkedArrayIndex(key: string, length: number): boolean {
+  const index = Number(key);
+  return Number.isInteger(index) && index >= 0 && index < length && String(index) === key;
+}
+
 function freezePlainDataGraph<T>(
   value: T,
   seen: WeakSet<object>,
@@ -145,7 +153,7 @@ function freezePlainDataGraph<T>(
     // property too (rather than assuming the contract) means its subgraph can
     // never be left unfrozen when the development pre-pass did not run.
     for (const key in value) {
-      if (String(Number(key)) !== key && Object.prototype.hasOwnProperty.call(value, key)) {
+      if (!isWalkedArrayIndex(key, value.length) && Object.prototype.hasOwnProperty.call(value, key)) {
         freezePlainDataGraph((value as unknown as Record<string, unknown>)[key], seen, frozenAncestors, skipFrozenAliases);
       }
     }
@@ -236,6 +244,13 @@ function cloneAndFreezePlainData<T>(value: T, seen: Map<object, unknown>): DeepR
     }
   }
   Object.freeze(copy);
+  // Every node of a clone is verified plain data by construction, as the
+  // snapshot root is. Block layouts are branded as roots too: a table result
+  // or occurrence snapshot that holds them again (each layout pass, page
+  // fragment and re-layout of the same cells) then shares them instead of
+  // copying their lines once more. Only block layouts are branded, so the
+  // brand set grows with the number of blocks, not of all retained nodes.
+  if (copy.kind === 'paragraph' || copy.kind === 'table') processedPlainData.add(copy);
   return copy as DeepReadonly<T>;
 }
 
@@ -244,9 +259,9 @@ export function snapshotPlainData<T>(value: T, label: string, ownedProjectionOf?
     return value as DeepReadonly<T>;
   }
   // Path-precise contract check on engine-produced data — see
-  // validation-policy.ts. The clone below still rejects the fatal structural
-  // violations without this development pass; the native preflight additionally
-  // pins the platform's Proxy brand check while validation is enabled.
+  // validation-policy.ts. The clone below still rejects non-finite numbers,
+  // functions, symbols, and foreign prototypes without this diagnostic pass;
+  // only the pre-pass promises strict descriptor, cycle, and Proxy rejection.
   if (documentLayoutValidationEnabled()) {
     validatePlainData(value, label);
   }
@@ -263,10 +278,13 @@ export function snapshotPlainData<T>(value: T, label: string, ownedProjectionOf?
     // by the development pre-pass above, and fatally by the unconditional
     // assertDocumentLayout walk over every finished layout. Mutable sources
     // still take the deep-copy path.
+    // The projection allocates only mutable nodes; every frozen node it holds
+    // is an alias into the deeply frozen source root, so the freeze walk need
+    // not re-enter those aliases (deepFreezePlainDataWithFrozenAliases).
     const snapshot = ownedProjectionOf && (
       processedPlainData.has(ownedProjectionOf) || frozenPlainData.has(ownedProjectionOf)
     )
-      ? deepFreezePlainData(value)
+      ? deepFreezePlainDataWithFrozenAliases(value, ownedProjectionOf)
       : cloneAndFreezePlainData(value, new Map<object, unknown>());
     if (typeof snapshot === 'object' && snapshot !== null) processedPlainData.add(snapshot);
     return snapshot;

@@ -1,14 +1,12 @@
-import { describe, it, expect, afterEach, vi } from 'vitest';
-import {
-  preloadGoogleFonts,
-  GoogleFontPreloadLease,
-  unloadGoogleFonts,
-  parseFontFaceRules,
-  _resetCssCacheForTests,
-  type FontPreloadEntry,
-} from './preload.js';
-import { _resetFontRegistryForTests } from './font-registry.js';
+import { beforeEach, describe, it, expect, afterEach, vi } from 'vitest';
+let { preloadGoogleFonts, GoogleFontPreloadLease, unloadGoogleFonts, parseFontFaceRules } = await import('./preload.js');
+import type { FontPreloadEntry } from './preload.js';
 import { SCRIPT_GOOGLE_FONTS } from './scripts.js';
+
+beforeEach(async () => {
+  vi.resetModules();
+  ({ preloadGoogleFonts, GoogleFontPreloadLease, unloadGoogleFonts, parseFontFaceRules } = await import('./preload.js'));
+});
 
 const G = globalThis as Record<string, unknown>;
 const ORIG = { document: G.document, self: G.self, fetch: G.fetch, FontFace: G.FontFace };
@@ -18,8 +16,6 @@ afterEach(() => {
   G.self = ORIG.self;
   G.fetch = ORIG.fetch;
   G.FontFace = ORIG.FontFace;
-  _resetCssCacheForTests();
-  _resetFontRegistryForTests(); // the FontFace refcount registry is module-global
   vi.restoreAllMocks();
   vi.useRealTimers();
 });

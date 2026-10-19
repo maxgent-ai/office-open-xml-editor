@@ -102,8 +102,8 @@ export type {
   ViewerCommentMessageContext,
   ViewerCommentThreadContext,
 } from './comment-ui';
-// Typed load-time error (PD4 seed): the `load()` factories throw this with a
-// stable `code` for container-level failures detected on the main thread.
+// Typed input errors: container admission and configured sources report stable
+// codes; workers reconstruct them for load and lazy-operation callers.
 export {
   OoxmlError,
   OoxmlResourceLimitError,
@@ -113,6 +113,7 @@ export {
   type OoxmlResourceMetric,
   type OoxmlResourceName,
   type OoxmlResourceLimitErrorDetails,
+  type OoxmlUnsupportedContentDetails,
   type OoxmlResourceUsageSnapshot,
   type OoxmlResourceViolation,
 } from './errors/ooxml-error';
@@ -126,7 +127,7 @@ export { sniffCfb, type CfbKind } from './errors/cfb-sniff';
 // call: it returns plaintext ZIP bytes, decrypting an Agile-encrypted file when
 // a password is supplied ([MS-OFFCRYPTO], PD8).
 export { assertNotCfbContainer, resolveOoxmlContainer, toArrayBuffer } from './errors/cfb-guard';
-// Application-supplied model sources (LoadOptions.modelSources): a
+// Application-supplied model sources (each format's opt-in source option): a
 // format-generic contract for opening non-OOXML input into a renderer's own
 // model archive. Core and the format packages never name a concrete source.
 // A type-only root export keeps the optional source runtime out of every
@@ -229,7 +230,7 @@ export {
   symbolTextToUnicodeSegments,
   type SymbolTextSegment,
 } from './fonts/symbol-font';
-export { renderChart } from './chart/renderer';
+export { renderChart, collectChartFillRenderedSizes, assertChartFillRenderedSizeCount } from './chart/renderer';
 export { formatLocalizedExcelShortDate } from './chart/chart-number-format';
 export { autoResize, type AutoResizeOptions } from './autoResize';
 export {
@@ -244,8 +245,11 @@ export {
 } from './shape/custgeom-endpoints';
 export { hexToRgba, relativeLuma, autoContrastColor, resolveFill, usesPathShade, applyStroke, withPatternCoordinateSpace, withInheritedPatternScope } from './shape/paint';
 export { trackPaintPath, currentStrokeBounds } from './shape/paint-bounds';
+export { measurePaintBounds } from './shape/measure-paint-bounds';
 export type { FillOutline } from './shape/path-gradient';
-export { buildShapePath, drawStar, drawPolygon, ooxmlArcTo } from './shape/preset';
+export { buildShapePath } from './shape/preset';
+export { EM_BOX_CENTER_FALLBACK_EM, emBoxCenterAboveBaseline } from './text/em-box-center';
+export { SYNTHETIC_ASCENT_EM, SYNTHETIC_DESCENT_EM } from './text/synthetic-em-box';
 export {
   paintDrawingMLShape,
   clipDrawingMLShape,
@@ -261,6 +265,9 @@ export {
   lineEndPaintExtent,
   lineEndRetract,
   retractLineEndpoint,
+  traceTrimmedPath,
+  tracePresetLeader,
+  trimGeometryPathEnds,
 } from './shape/arrow';
 // Shared embedded-SVG decoder (Microsoft asvg:svgBlip extension) — used by all
 // three renderers to prefer the vector original over the raster fallback.
@@ -272,7 +279,8 @@ export {
   type SvgImageSource,
   type SvgImageDecodeOptions,
 } from './image/svg-image-by-path';
-export type { SvgBlobDecoder, SvgDecodeTarget } from './worker/svg-decode-bridge';
+export { decodeSvgBlobOnMainThread } from './image/svg-raster';
+export type { SvgBlobDecoder, SvgDecodeTarget } from './image/svg-raster';
 // Shared per-document decoded-raster owner: one weighted LRU, decode gate and
 // render-pass lease covers base blips, media posters, and derived effects across
 // all three renderers. `fetchImage` remains the compatibility owner by default,
@@ -286,7 +294,6 @@ export {
   captureDecodedBitmapCacheEpoch,
   dropCachedDerivedBitmapNamespace,
   getCachedBitmapByPath,
-  getCachedDecodedBitmap,
   getCachedDerivedBitmap,
   inspectCachedRasterSource,
   resolvedCachedBitmapVariantKey,
@@ -309,6 +316,15 @@ export {
 } from './image/raster-blob-inspection';
 export {
   chartImageFillKey,
+  chartImageFillPixelTransform,
+  chartImageFillHostKey,
+  chartFillRenderedSize,
+  chartFillRenderedSizeKey,
+  chartImageFillNeedsRenderedSize,
+  chartImageFillStoreLookup,
+  type ChartFillRenderedSize,
+  type ChartFillRenderedSizeRequest,
+  type ChartImageFillHost,
   chartImageFillUsageSize,
   collectChartImageFillUsages,
   collectChartImageFillUsagesForCharts,
@@ -319,8 +335,7 @@ export {
   type ChartImageLookup,
 } from './chart/image-fill';
 // Shared WMF (Windows Metafile) player.
-// The docx-specific cosmetic window/device-frame suppression is gated behind
-// `suppressBoundaryFrame` (default off = spec-clean).
+// WMF clipping follows the playback device context.
 export {
   isWmf,
   isEmf,
@@ -334,7 +349,6 @@ export {
   decodeRasterOrMetafile,
   getIncompleteMetafileReport,
   isOoxmlIncompleteMetafileError,
-  OoxmlIncompleteMetafileError,
   type DecodeRasterOptions,
   type IncompleteMetafilePolicy,
   type IncompleteMetafileReport,
@@ -389,9 +403,6 @@ export {
 // Shared `<a:srcRect>` crop (§20.1.8.55) for all three renderers: the source-rect
 // math, the full-frame raster size for a cropped metafile, and the draw wrapper.
 export {
-  cropSourceRect,
-  imagePaintProjection,
-  type ImagePaintProjection,
   drawImageCropped,
   imageNaturalSize,
   metafileRasterSize,
@@ -405,10 +416,10 @@ export {
 // carry duotone too).
 export {
   applyDuotone,
+  applyImageDataTransform,
   duotoneImageData,
   hex6ToRgb,
   luminance601,
-  defaultOffscreenFactory,
   type Duotone,
   type RgbaBuffer,
   type OffscreenFactory,
@@ -421,12 +432,20 @@ export {
 // CT_Blip pixel effects (grayscl, biLevel, clrChange) applied in document
 // order with the duotone, through the same decode cache.
 export {
-  applyBlipPixelEffects,
+  applyBlipPixelEffects, blipEffectImageFills, blipEffectsMayExtendCoverage, blipEffectsCoverageReach,
   assertBlipPixelEffectsBudget,
   blipLuminance,
+  blipPixelEffectsKey,
   type BlipEffect,
+  type BlipEffectContainer,
+  type BlipEffectFill,
+  type BlipEffectImageFill,
   type BlipPixelEffects,
 } from './image/blip-effects';
+export type { BlendMode } from './image/blip-fill';
+export { imageEffectError } from './image/image-effect-error';
+export { srcRectHasVisibleArea, stretchedSourceFrame } from './image/crop';
+export { imageEffectFrame, imageEffectOutsetPeriods } from './image/image-effect-frame';
 export {
   getCachedDuotoneBitmapByPath,
   duotoneCacheKey,
@@ -439,9 +458,9 @@ export { decodedBitmapTargetResizeOptions } from './image/raster-target';
 // renderers' picture-decode paths.
 export { preferVectorBlip } from './image/blip-gate';
 // ECMA-376 §20.1.9 spec-driven preset geometry engine (presets.json from
-// presetShapeDefinitions.xml). Coexists with the legacy hand-rolled
-// `buildShapePath` above, which the pptx renderer still uses as a silhouette /
-// fallback codepath. Consolidating the two is intentionally out of scope here.
+// presetShapeDefinitions.xml). `buildShapePath` above is only the fallback for
+// names the engine does not define (`rect`, schema-invalid values) and routes
+// every spec-defined name back to this engine.
 export {
   renderPresetShape,
   hasPreset,
@@ -457,7 +476,6 @@ export { type PresetPath } from './shape/preset-geometry/path-executor';
 // the pptx renderer's per-glyph WordArt path.
 export {
   hasTextWarp,
-  isSingleEdgeWarp,
   buildWarpEnvelope,
   samplePolyline,
   warpGlyphTransform,
@@ -468,6 +486,8 @@ export {
   type Polyline,
 } from './shape/text-warp';
 export {
+  createRasterCoveragePaint,
+  rasterEffectCoverageBounds,
   applyOuterShadow,
   applyInnerShadow,
   applySoftEdge,
@@ -503,7 +523,6 @@ export {
   type ExtrusionInput,
   type BevelRegion,
   computeBevelNormals,
-  bevelHeightProfile,
   distanceToEdge,
   lightDirFromRig,
   materialClass,
@@ -531,10 +550,10 @@ export {
   mathToMathML,
   svgExtents,
   recolorSvg,
-  MATH_RASTER_PX_PER_EM,
   rasterizeMathSvg,
   sizeMathSvgForRaster,
   tintMathRaster,
+  cachedTintedMathRaster,
   type MathSvg,
   type MathRenderer,
   type RasterizedMathSvg,
@@ -546,7 +565,6 @@ export type {
   MathBorderBox,
   MathBox,
   MathDelimiter,
-  MathFormula,
   MathFraction,
   MathFunc,
   MathGroup,
@@ -593,7 +611,7 @@ export { doubleRailGeometry, fillDoubleBorder } from './draw/double-border';
 // of truth for underline geometry across the pptx / docx renderers; docx
 // normalizes its §17.18.99 ST_Underline vocabulary to this DrawingML vocabulary
 // before calling in.
-export { drawUnderline } from './text/underline';
+export { drawUnderline, DECORATION_LINE_WIDTH_EM, STRIKE_RISE_EM } from './text/underline';
 export {
   WorkerBridge,
   type WorkerLike,
@@ -647,11 +665,9 @@ export {
 // / Khmer, issue #797): the ICU-backed word-break offset enumerator plus the
 // shared greedy whole-word fit kernel, consumed by all three renderers' wrap
 // loops. Graceful fallback to cluster/character wrap when Intl.Segmenter is
-// unavailable. `setSeaWordSegmenterForTest`/`resetSeaSegmenterForTest` are test
-// seams only.
+// unavailable.
 export {
   type SeaScript,
-  type SeaWordSegmenter,
   type SeaMixedKinsoku,
   isSeaScriptCodePoint,
   isSeaGraphemeExtend,
@@ -663,8 +679,6 @@ export {
   seaMixedBreakOffsets,
   fitSeaWordPrefix,
   graphemeClusterOffsets,
-  setSeaWordSegmenterForTest,
-  resetSeaSegmenterForTest,
 } from './text/sea-break';
 // UAX #50 Vertical_Orientation (vo): how a code point orients in vertical text
 // (tbRl / eaVert). Consumed by the vertical-text draw paths across packages.
@@ -684,6 +698,7 @@ export {
   withVertFeatureCanvasScope,
 } from './text/vertical-vert-feature';
 export type { VerticalGlyphCellMetrics } from './text/vertical-vert-feature';
+export { inkCenterAboveMiddlePx } from './text/vertical-glyph-metrics';
 // Shared Excel serial-date → UTC `Date` conversion (ECMA-376 §18.17.4.1),
 // with the 1900 Lotus leap-year-bug compat and 1900/1904 date-system select.
 // Used by the xlsx cell formatter and the core chart date formatter.
@@ -769,7 +784,6 @@ export {
 // browser-selected face.
 export {
   normalizeFontMetricFamily,
-  openTypeDesignLineRatios,
   type ResolvedFontMetric,
 } from './fonts/resource-metrics';
 export {
@@ -790,6 +804,21 @@ export {
   type ResolvedLocalFontMetric,
   type LoadedLocalFontMetrics,
 } from './fonts/local-metrics';
+export {
+  measureLocalFontNormalLine,
+  loadLocalFontCoverageProbe,
+  localFontMetricCoversText,
+  measureLocalFontSourceNormalLine,
+  type LocalFontNormalLine,
+} from './fonts/local-line-metrics';
+export {
+  loadNativeRouteSentinels,
+  measureNativeRouteNormalLines,
+  verifyNativeRouteNormalLines,
+  type NativeRouteLineRequest,
+  type NativeRouteNormalLine,
+  type NativeRoutePrimaryAdmission,
+} from './fonts/native-route-line-metrics';
 // Deprecated compatibility export; production layout no longer calls it.
 export { fontAdvanceBiasEm } from './text/font-advance-metrics';
 // IX2 in-document text search (findText). Format-agnostic index + match →
@@ -814,3 +843,5 @@ export type { FindHighlightColors } from './search/find-highlight';
 
 export { resolveDrawingMLGeometry, requireResolvedDrawingMLGeometry, drawingMLGeometryBounds, type ResolvedDrawingMLGeometry } from './shape/drawingml-geometry';
 export { GeometryWorkBudgetError, type GeometryPath, type GeometryPathCommand } from './shape/path-data';
+
+export { hasImageEffectOutset } from './image/image-effect-frame.js';

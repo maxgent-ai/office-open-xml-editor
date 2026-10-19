@@ -1,6 +1,3 @@
-import { snapshotPlainData } from './plain-data.js';
-import { createFontResolver } from './font-service.js';
-import { createTextLayoutService } from './text.js';
 import { lineGapModel } from '../line-breaker/line-gaps.js';
 import { describe, expect, it } from 'vitest';
 import { DEFAULT_KINSOKU_RULES } from '@silurus/ooxml-core';
@@ -41,9 +38,7 @@ const acquisitionContext: ParagraphLayoutContext = {
   kinsoku: DEFAULT_KINSOKU_RULES, defaultTabPt: 36,
 };
 
-
-// Shared retained-projection fixture; reading integration uses the same source
-// paragraph facts as the existing ordinary authority cases below.
+// Shared retained-projection fixture for the ordinary authority cases below.
 const paragraph = {
   alignment: 'left', indentLeft: 0, indentRight: 0, indentFirst: 0,
   spaceBefore: 0, spaceAfter: 0, lineSpacing: null, numbering: null,
@@ -863,6 +858,52 @@ describe('paragraphLayoutFromMeasurement retained authorities', () => {
     expect(placements.map((item) => item.advancePt)).toEqual([20, 20, 20]);
     expect(node.drawings.map((drawing) => drawing.flowBounds.xPt)).toEqual([10, 40, 70]);
     expect(node.drawings.every((drawing) => drawing.anchorLayer === undefined)).toBe(true);
+  });
+
+  it('offsets a relative inline shape from its pen position without changing the advance', () => {
+    const inlineShape = (offsetXPt: number, offsetYPt: number) => ({
+      type: 'shape' as const,
+      inline: true,
+      widthPt: 20,
+      heightPt: 10,
+      inlineOffsetXPt: offsetXPt,
+      inlineOffsetYPt: offsetYPt,
+      anchorXPt: 7,
+      anchorYPt: 7,
+      anchorXFromMargin: false,
+      anchorYFromPara: false,
+      zOrder: 0,
+      subpaths: [],
+      presetGeometry: 'rect',
+      fill: { fillType: 'solid' as const, color: '009989' },
+      stroke: null,
+      textBlocks: [],
+    });
+    const offsetParagraph = {
+      ...paragraph,
+      runs: [inlineShape(0, 0), inlineShape(5, 3), inlineShape(0, 0)],
+    } as unknown as DocParagraph;
+    const placement = {
+      startYPt: 10, paragraphXPt: 10, availableWidthPt: 100, maximumYPt: 500,
+      suppressSpaceBefore: false,
+    };
+    const measurer = { context: measureContext, fontFamilyClasses: {} };
+    const environment = {
+      documentHasEastAsianText: false, pageWritingMode: 'horizontal-tb' as const,
+      pageIndex: 0, totalPages: 1,
+    };
+    const context = { ...acquisitionContext, tabStops: [] };
+    const measured = measureParagraph(offsetParagraph as never, context, placement, measurer, environment);
+    const node = paragraphLayoutFromMeasurement(offsetParagraph as never, {
+      id: 'relative-vml', source, flowDomainId: 'body', ordinaryFlow: true,
+      context, placement, measurer, environment, exclusions: [],
+    } as never, measured);
+    const placements = node.lines.flatMap((line) => line.placements)
+      .filter((item) => item.kind === 'drawing');
+    expect(placements.map((item) => item.bounds.xPt)).toEqual([10, 35, 50]);
+    expect(placements[1]!.bounds.yPt - placements[0]!.bounds.yPt).toBe(3);
+    expect(placements.map((item) => item.advancePt)).toEqual([20, 20, 20]);
+    expect(node.drawings.map((drawing) => drawing.flowBounds.xPt)).toEqual([10, 35, 50]);
   });
 
   it('retains selected-face anchor-host metrics instead of font-size ratios', () => {
@@ -3078,148 +3119,5 @@ describe('native separator metric participants in the line pipeline', () => {
     expect(double.ascent).toBeCloseTo(unit.ascent * 2);
     expect(double.descent).toBeCloseTo(unit.descent * 2);
     expect(double.segments.reduce((sum, segment) => sum + segment.measuredWidth, 0)).toBe(0);
-  });
-});
-
-
-describe('native reading integration into retained paragraph flow', () => {
-  it('preserves measured registered Latin slot windows when appending a complete reading scene', () => {
-    // The registered class admits one maximal ascii/highAnsi seam. Alternating
-    // six slots deliberately declines admission and cannot test a retained window.
-    const identity = 'embedded:joint-contextual-latin';
-    const advance = (text: string, kerning = true) => [...text].length * 6
-      - (kerning ? (text.match(/Té/g)?.length ?? 0) : 0);
-    const textService = createTextLayoutService({
-      fonts: createFontResolver([{ requestedFamily: 'Joint Face', resolvedFamily: 'Joint Resource',
-        resourceIdentity: identity, source: 'embedded', weight: 400, style: 'normal' }]),
-      fontMetrics: { one: { family: 'Joint Resource', sourceIdentity: identity, weight: 400,
-        style: 'normal', unicodeRanges: [[0x20, 0x7a], [0xe9, 0xe9]] } },
-      measurer: { fingerprint: 'joint-independent-context-response', measure: ({ text, kerning }) =>
-        ({ advancePt: advance(text, kerning), ascentPt: 9, descentPt: 0 }) },
-    });
-    const measureContext = { font: '', fontKerning: 'none', letterSpacing: '0px',
-      measureText: (text: string) => ({ width: advance(text, false), actualBoundingBoxAscent: 9,
-        actualBoundingBoxDescent: 0, fontBoundingBoxAscent: 9, fontBoundingBoxDescent: 0 }),
-    } as unknown as CanvasRenderingContext2D;
-    const environment = { pageIndex: 0, totalPages: 1, documentHasEastAsianText: false,
-      characterGridActive: false, paragraphRtl: false, pageWritingMode: 'horizontal-tb',
-      layoutServices: { ...createLayoutServices({
-        section: { pageWidth: 200, pageHeight: 300, marginTop: 30, marginRight: 20,
-          marginBottom: 30, marginLeft: 20, headerDistance: 15, footerDistance: 15,
-          titlePage: false, evenAndOddHeaders: false },
-        body: [], headers: { default: null, first: null, even: null },
-        footers: { default: null, first: null, even: null },
-      }, { measureContext }), text: textService } } as const;
-    const occurrenceId = 'joint-reading-vector';
-    const seed = retainedAnchor(occurrenceId);
-    const anchor = retainedAnchor(occurrenceId, {
-      nativeReadingRelocation: 'completeScene',
-      extent: { ...seed.extent, widthPt: 10 },
-      wrap: { ...seed.wrap, kind: 'through', authoredKinds: ['wrapThrough'] },
-      group: { sourceIndex: 0, sourceCount: 1, childSourceId: 'joint-vector', transformChain: [], childTransform: null,
-        resolvedChildFrame: { offsetXPt: 0, offsetYPt: 0, widthPt: 10, heightPt: 10,
-          rotationDeg: 0, flipH: false, flipV: false } },
-    });
-    const input = snapshotPlainData({ ...paragraph, runs: [
-      { ...paragraph.runs[0], text: 'TTTTéé', fontFamily: 'Joint Face', fontFamilyHighAnsi: 'Joint Face', kerning: 1 },
-      { type: 'anchorHost', fontSize: 10, anchorOccurrenceId: occurrenceId },
-      { type: 'shape', presetGeometry: 'rect', subpaths: [], widthPt: 10, heightPt: 10,
-        fill: { fillType: 'solid', color: 'FF0000' }, stroke: null, anchorAcquisitionInput: anchor },
-    ] }, 'joint source-owned paragraph') as unknown as DocParagraph;
-    const ordinaryInput = JSON.parse(JSON.stringify(input));
-    delete ordinaryInput.runs[2].anchorAcquisitionInput.nativeReadingRelocation;
-    const placement = { startYPt: 20, paragraphXPt: 10, availableWidthPt: 11,
-      maximumYPt: 280, suppressSpaceBefore: false };
-    const measurer = { context: measureContext, fontFamilyClasses: {} };
-    const frames = { page: { xPt: 0, yPt: 0, widthPt: 200, heightPt: 300 },
-      margin: { xPt: 10, yPt: 20, widthPt: 180, heightPt: 260 },
-      column: { xPt: 10, yPt: 20, widthPt: 90, heightPt: 260 }, pageParity: 'odd' as const };
-    const acquire = (value: DocParagraph) => {
-      const measured = measureParagraph(value, acquisitionContext, placement, measurer, environment);
-      const retained = paragraphLayoutFromMeasurement(value as never, {
-        id: 'joint-reading', source, flowDomainId: 'body', ordinaryFlow: true,
-        context: acquisitionContext, placement: measured.placement, measurer, environment,
-        exclusions: [], anchorFrames: frames,
-      }, measured);
-      return { measured, retained };
-    };
-    const ordinary = acquire(ordinaryInput);
-    const reading = acquire(input);
-    const measuredText = reading.measured.lines.flatMap(line => line.layout.segments)
-      .filter((segment): segment is LayoutTextSeg => 'text' in segment && !segment.metricOnly);
-    expect(measuredText.map(segment => segment.text).join('')).toBe('TTTTéé');
-    expect(measuredText.some(segment => (segment.semanticSlotRange?.start ?? 0) > 0)).toBe(true);
-    expect(measuredText.every(segment => segment.measuredWidth === advance(segment.text))).toBe(true);
-    const placements = (value: ReturnType<typeof acquire>) => value.retained.lines
-      .flatMap(line => line.placements).filter((p): p is TextPlacement => p.kind === 'text');
-    const actualText = placements(reading);
-    expect(actualText).toEqual(placements(ordinary));
-    expect(actualText.map(p => p.text).join('')).toBe('TTTTéé');
-    for (const placement of actualText) {
-      expect(placement.semanticSlotSpans?.map(span => [span.start, span.end, span.script])).toEqual(
-        // Authored literal slot ownership: contiguous T is ascii, contiguous é
-        // is highAnsi. Each placement must carry only its own local window.
-        [...placement.text.matchAll(/T+|é+/g)].map(match => [
-          match.index, match.index + match[0].length,
-          match[0][0] === 'T' ? 'ascii' : 'highAnsi',
-        ]),
-      );
-    }
-    expect(actualText.some(p => p.semanticSlotSpans?.some(span => span.script === 'ascii'))).toBe(true);
-    expect(actualText.some(p => p.semanticSlotSpans?.some(span => span.script === 'highAnsi'))).toBe(true);
-    expect(reading.retained.lines.slice(0, -1)).toEqual(ordinary.retained.lines);
-    const end = ordinary.retained.lines.at(-1)!.range.end;
-    const top = ordinary.retained.flowBounds.yPt + ordinary.retained.flowBounds.heightPt;
-    expect(reading.retained.lines.at(-1)).toEqual(expect.objectContaining({
-      range: { start: end, end }, bounds: { xPt: 10, yPt: top, widthPt: 10, heightPt: 10 },
-      placements: [expect.objectContaining({ kind: 'drawing', range: { start: end, end } })],
-    }));
-    expect(reading.retained.drawings).toHaveLength(1);
-    expect(reading.retained.flowBounds).toEqual({ ...ordinary.retained.flowBounds,
-      heightPt: ordinary.retained.flowBounds.heightPt + 10 });
-    expect(reading.retained.nativeReadingRelocations).toEqual([reading.retained.drawings[0]!.id]);
-  });
-
-  it('consumes a requested complete group while ordinary acquisition retains an unsupported contour without painting', () => {
-    const occurrenceId = 'invented-reading-vector';
-    const seed = retainedAnchor(occurrenceId);
-    const anchor = retainedAnchor(occurrenceId, {
-      nativeReadingRelocation: 'completeScene',
-      wrap: { ...seed.wrap, kind: 'through', authoredKinds: ['wrapThrough'] },
-      group: { sourceIndex: 0, sourceCount: 1, childSourceId: 'invented-vector', transformChain: [], childTransform: null,
-        resolvedChildFrame: { offsetXPt: 0, offsetYPt: 0, widthPt: 20, heightPt: 10, rotationDeg: 0, flipH: false, flipV: false } },
-    });
-    const input = snapshotPlainData({ ...paragraph, runs: [
-      { type: 'anchorHost', fontSize: 10, anchorOccurrenceId: occurrenceId },
-      { type: 'shape', presetGeometry: 'rect', subpaths: [], widthPt: 20, heightPt: 10,
-        fill: { fillType: 'solid', color: 'FF0000' }, stroke: null, anchorAcquisitionInput: anchor },
-    ] }, 'invented complete reading paragraph') as unknown as DocParagraph;
-    const host = { text: '', metricOnly: true, sourceRunIndex: 0, measuredWidth: 0,
-      fontSize: 10, fontFamily: 'Test Sans', fontRoute } as unknown as LayoutTextSeg;
-    const frames = { page: { xPt: 0, yPt: 0, widthPt: 200, heightPt: 300 },
-      margin: { xPt: 10, yPt: 20, widthPt: 180, heightPt: 260 },
-      column: { xPt: 10, yPt: 20, widthPt: 90, heightPt: 260 }, pageParity: 'odd' as const };
-    const node = projectMeasuredSegment(input, host, acquisitionContext, undefined, frames);
-    expect(node.lines).toHaveLength(2);
-    expect(node.drawings).toHaveLength(1);
-    expect(node.drawings[0]?.commands[0]?.kind).toBe('drawingml-shape');
-    expect(node.drawings[0]?.flowBounds).toEqual({ xPt: 10, yPt: 22, widthPt: 20, heightPt: 10 });
-    expect(node.flowBounds.heightPt).toBe(22);
-    expect(node.exclusions).toEqual([]);
-    expect(node.nativeReadingRelocations).toEqual([node.drawings[0]!.id]);
-    // Native DOC strict refusal is exercised by the full-CFB parser controls;
-    // this direct retained-model call exercises the ordinary diagnostic boundary.
-    const ordinaryInput = JSON.parse(JSON.stringify(input));
-    delete ordinaryInput.runs[1].anchorAcquisitionInput.nativeReadingRelocation;
-    const ordinary = projectMeasuredSegment(ordinaryInput, host, acquisitionContext, undefined, frames);
-    expect(ordinary.drawings).toEqual([]);
-    expect(ordinary.exclusions).toEqual([]);
-    expect(ordinary.nativeReadingRelocations ?? []).toEqual([]);
-    expect(ordinary.anchorFrames).toEqual([
-      expect.objectContaining({
-        status: 'unsupported', occurrenceId,
-        issues: [expect.objectContaining({ code: 'invalid-wrap-polygon', path: 'wrap.polygon' })],
-      }),
-    ]);
   });
 });

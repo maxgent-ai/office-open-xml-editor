@@ -23,7 +23,7 @@ A high-fidelity viewer for `.docx`, `.xlsx`, and `.pptx` files — powered by a 
 - **High fidelity** — Classic and ChartEx charts, 3-D charts, offline Region Maps, conditional formatting, theme colors, custom geometry shapes, math equations (OMML, via MathJax + STIX Two Math), and more rendered straight from the OOXML spec.
 - **MCP server (opt-in)** — Lets GitHub Copilot Chat in Agent mode read `.xlsx` / `.docx` / `.pptx` files and the active Viewer selection through dedicated tools instead of unzipping XML by hand. Claude Code and Codex can use the same binary for file tools through their own MCP configuration, but do not receive active Viewer selection. See [MCP server for AI agents](#mcp-server-for-ai-agents) below.
 
-All three formats share the same Rust parser (`wasm-pack`) for accuracy and speed.
+Each format is parsed by its own Rust parser compiled to WebAssembly (`wasm-pack`) for accuracy and speed.
 
 ## Usage
 
@@ -93,6 +93,7 @@ VS Code extensions.
 
 **Settings:**
 - `ooxmlViewer.mcpServer.enabled`: `auto` (default — prompt only when the workspace contains OOXML files), `always`, or `never`.
+- `ooxmlViewer.mcpServer.restrictToWorkspaceFolders`: `true` (default) lets the MCP file tools read only files inside the local workspace folders; symlinks are resolved before the check, and other paths — including a preview opened from outside the workspace — are rejected with `path_outside_allowed_roots`. A window without a local folder is not restricted. Set it to `false` to let the agent read any local file.
 - `ooxmlViewer.mcpServer.binaryPath`: optional override pointing at a pre-installed binary.
 
 **Commands (Command Palette):**

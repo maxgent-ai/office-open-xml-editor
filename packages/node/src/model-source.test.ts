@@ -39,7 +39,7 @@ function fakeSource<T extends ModelSourceTarget>(
     claim: vi.fn(claim),
     beginLoad: () => ({
       module: {
-        protocol: 'ooxml-model-source-module/v1',
+        protocol: 'ooxml-model-source-module/v2',
         target,
         moduleUrl: fixtureUrl(`${target}-model-source.mjs`),
         config,
@@ -89,10 +89,10 @@ describe('Node sessions with a model source', () => {
     const failure = new Error('release failed');
     probe.release.mockImplementation(() => { throw failure; });
     const load = target === 'docx'
-      ? openDocxDocument(docxSample, { factory, modelSources: [probe.source] })
+      ? openDocxDocument(docxSample, { factory, legacyDoc: probe.source as ModelSource<'docx'> })
       : target === 'xlsx'
-        ? openXlsxWorkbook(xlsxSample, { modelSources: [probe.source] })
-        : openPptxPresentation(pptxSample, { modelSources: [probe.source] });
+        ? openXlsxWorkbook(xlsxSample, { legacyXls: probe.source as ModelSource<'xlsx'> })
+        : openPptxPresentation(pptxSample, { legacyPpt: probe.source as ModelSource<'pptx'> });
     await expect(load).rejects.toBe(failure);
     expect(probe.closes()).toBe(1);
     expect(probe.release).toHaveBeenCalledOnce();
@@ -104,7 +104,7 @@ describe('Node sessions with a model source', () => {
 
     const markup = fakeSource('docx', { showTrackedChanges: true });
     const followed = await openDocxDocument(trackedDocx, {
-      factory, currentDate: 0, modelSources: [markup.source],
+      factory, currentDate: 0, legacyDoc: markup.source,
     });
     expect(markup.release).toHaveBeenCalledOnce();
     expect(followed.pageCount).toBeGreaterThan(finalPages);
@@ -114,7 +114,7 @@ describe('Node sessions with a model source', () => {
 
     const plain = fakeSource('docx', { showTrackedChanges: null });
     const unchosen = await openDocxDocument(trackedDocx, {
-      factory, currentDate: 0, modelSources: [plain.source],
+      factory, currentDate: 0, legacyDoc: plain.source,
     });
     expect(unchosen.pageCount).toBe(finalPages);
     await unchosen.close();
@@ -122,15 +122,15 @@ describe('Node sessions with a model source', () => {
 
   it('fails closed and closes the archive on an unsupported DOCX view default', async () => {
     const invalid = fakeSource('docx', { showTrackedChanges: true, extraViewDefault: 'showComments' });
-    await expect(openDocxDocument(docxSample, { factory, modelSources: [invalid.source] }))
+    await expect(openDocxDocument(docxSample, { factory, legacyDoc: invalid.source }))
       .rejects.toThrow('unsupported DOCX model source view default: showComments');
     expect(invalid.closes()).toBe(1);
     expect(invalid.release).toHaveBeenCalledOnce();
   });
 
-  it('streams a DOCX source that offers only the required archive methods', async () => {
+  it('streams and renders a DOCX source with only the required archive methods', async () => {
     const minimal = fakeSource('docx', { minimal: true });
-    const session = await openDocxDocument(docxSample, { factory, currentDate: 0, modelSources: [minimal.source] });
+    const session = await openDocxDocument(docxSample, { factory, currentDate: 0, legacyDoc: minimal.source });
     expect(session.resourceUsage).toBeUndefined();
     expect(session.pageCount).toBeGreaterThan(0);
     for await (const page of session.pages({ dpr: 1 })) {
@@ -143,7 +143,7 @@ describe('Node sessions with a model source', () => {
 
   it('configures XLSX host layout with the renderer measurement through the factory canvas', async () => {
     const measured = fakeSource('xlsx', { hostLayoutFamily: 'Calibri', hostLayoutSizePt: 11 });
-    const session = await openXlsxWorkbook(xlsxSample, { factory, modelSources: [measured.source] });
+    const session = await openXlsxWorkbook(xlsxSample, { factory, legacyXls: measured.source });
     const context = factory.createCanvas(1, 1).getContext('2d') as unknown as CanvasRenderingContext2D;
     const expected = computeMdw('Calibri', 11, undefined, false, 400, 'normal', context);
     expect(expected).toBeGreaterThan(0);
@@ -160,7 +160,7 @@ describe('Node sessions with a model source', () => {
     expect(measured.closes()).toBe(1);
 
     const unmeasured = fakeSource('xlsx', { hostLayoutFamily: 'Calibri', hostLayoutSizePt: 11 });
-    const withoutFactory = await openXlsxWorkbook(xlsxSample, { modelSources: [unmeasured.source] });
+    const withoutFactory = await openXlsxWorkbook(xlsxSample, { legacyXls: unmeasured.source });
     expect(unmeasured.configures()).toBe(1);
     expect(unmeasured.configuredWidth()).toBeNaN();
     expect(withoutFactory.workbookIndex.layoutMetrics).toBeUndefined();
@@ -169,7 +169,7 @@ describe('Node sessions with a model source', () => {
 
   it('streams PPTX slides without optional capabilities and rejects media reads', async () => {
     const minimal = fakeSource('pptx', { minimal: true });
-    const session = await openPptxPresentation(pptxSample, { modelSources: [minimal.source] });
+    const session = await openPptxPresentation(pptxSample, { legacyPpt: minimal.source });
     expect(session.slideCount).toBeGreaterThan(0);
     expect(session.resourceUsage).toBeUndefined();
     await expect(session.getMedia('ppt/media/media1.mp4'))
@@ -183,20 +183,21 @@ describe('Node sessions with a model source', () => {
 
   it('keeps unclaimed input on the OOXML path and fails closed on invalid sources', async () => {
     const unclaimed = fakeSource('pptx', {}, () => false);
-    const ooxml = await openPptxPresentation(pptxSample, { modelSources: [unclaimed.source] });
+    const ooxml = await openPptxPresentation(pptxSample, { legacyPpt: unclaimed.source });
     expect(unclaimed.source.claim).toHaveBeenCalledOnce();
     expect(unclaimed.release).not.toHaveBeenCalled();
     expect(ooxml.resourceUsage).toBeDefined();
     await ooxml.close();
 
     const mismatched = fakeSource('docx');
-    await expect(openXlsxWorkbook(xlsxSample, { modelSources: [mismatched.source] }))
+    // A source for another format is a runtime TypeError, not only a type error.
+    await expect(openXlsxWorkbook(xlsxSample, { legacyXls: mismatched.source as unknown as ModelSource<'xlsx'> }))
       .rejects.toThrow(TypeError);
     expect(mismatched.source.claim).not.toHaveBeenCalled();
 
     const failure = new Error('claim failed');
     const throwing = fakeSource('xlsx', {}, () => { throw failure; });
-    await expect(openXlsxWorkbook(xlsxSample, { modelSources: [throwing.source] })).rejects.toBe(failure);
+    await expect(openXlsxWorkbook(xlsxSample, { legacyXls: throwing.source })).rejects.toBe(failure);
     expect(throwing.release).not.toHaveBeenCalled();
   });
 });

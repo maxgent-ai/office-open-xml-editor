@@ -148,7 +148,9 @@ describe('formatting-only run boundaries are transparent to text acquisition', (
         }
       }
     }
-  });
+    // ~2.4 s on an idle machine; the default 5 s budget timed out when
+    // the suite ran on a loaded machine.
+  }, 30_000);
 
   it('keeps original source ownership after shaping a sequence', () => {
     const layout = acquire(['A', 'V T', ' i'], 100, 'paragraph');

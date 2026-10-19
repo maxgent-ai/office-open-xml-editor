@@ -44,7 +44,7 @@ interface Picture {
 }
 
 interface Control {
-  readonly mode: 14 | 15;
+  readonly mode: 11 | 14 | 15;
   readonly pictures: readonly Picture[];
   readonly empty?: readonly number[];
   readonly lineHeightPt?: number;
@@ -230,6 +230,21 @@ describe('issue #1623 Word placement of floats from different paragraphs', () =>
     close(left.pictures[1]?.xPt, 72 + 237.35);
     const margin = layOut({ mode: 14, pictures: pair('square', 'margin') });
     close(margin.pictures[1]?.xPt, 79.05);
+  });
+
+  it('keeps the mode-15 column origin and tight-anchor wrap in unmeasured mode 11', () => {
+    // WORD_MODE14_COLUMN_LINE_START_ORIGIN and WORD_MODE14_TIGHT_ANCHOR_LINE_REWRAP
+    // were measured in mode 14 only; lower modes keep the established contract.
+    for (const pictures of [pair('square', 'column'), pair('tight', 'margin'), pair('tight', 'column')]) {
+      const mode11 = layOut({ mode: 11, pictures });
+      const mode15 = layOut({ mode: 15, pictures });
+      expect(mode11.pictures.map((picture) => [picture.xPt, picture.yPt]))
+        .toEqual(mode15.pictures.map((picture) => [picture.xPt, picture.yPt]));
+      expect([...mode11.lines]).toEqual([...mode15.lines]);
+    }
+    // The mode-14 origin differs for the same input.
+    expect(layOut({ mode: 14, pictures: pair('square', 'column') }).pictures[1]?.xPt)
+      .not.toBeCloseTo(layOut({ mode: 11, pictures: pair('square', 'column') }).pictures[1]!.xPt, 3);
   });
 
   it('wraps a line that starts on the bottom edge of a tight polygon', () => {

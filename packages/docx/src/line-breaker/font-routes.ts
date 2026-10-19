@@ -1,5 +1,10 @@
 import type { CjkLang } from '@silurus/ooxml-core';
 import { quoteCssFontFamily } from '@silurus/ooxml-core/internal/css-font-family';
+import {
+  ARABIC_SUBSTITUTE_FACES,
+  NASKH_ARABIC_SUBSTITUTE_FACES,
+  quoteCssFontFamilies,
+} from '@silurus/ooxml-core/internal/font-stack';
 import type { DocxTextRun, FieldRun } from '../types';
 import type { CanvasFontRoute } from '@silurus/ooxml-core';
 import { classifyCjkFont, cjkFallbackChain, NON_CJK_SANS_FALLBACKS, NON_CJK_SERIF_FALLBACKS, classifyFontGeneric, normalizeFontMetricFamily, canvasFontString } from '@silurus/ooxml-core';
@@ -12,34 +17,20 @@ import { type LayoutTextSeg } from './model.js';
 // em-extents synchronously; drawing blits the Canvas. Skipped entirely for
 // math-free documents.
 /** Arabic-script faces that hosts rarely ship; we substitute them with Noto
- *  Naskh/Sans Arabic web fonts (see DOCX_GOOGLE_FONTS in document.ts — this
- *  list MUST mirror the Arabic entries there). A source run whose font is one
- *  of these contains both Arabic and Latin/digit glyphs in one requested face,
- *  so the fallback chain must keep both scripts stylistically
+ *  Naskh/Sans Arabic web fonts (derived from the shared Google-Fonts registry
+ *  that DOCX_GOOGLE_FONTS in document.ts spreads). A source run whose font is
+ *  one of these contains both Arabic and Latin/digit glyphs in one requested
+ *  face, so the fallback chain must keep both scripts stylistically
  *  consistent (Arabic substitute first, serif Latin companion before the sans
  *  generics) rather than letting Latin/digits leak to a CJK sans face. */
-export const ARABIC_SUBSTITUTE_FONTS = new Set([
-  'sakkal majalla',
-  'traditional arabic',
-  'simplified arabic',
-  'arabic typesetting',
-  'univers next arabic',
-  'noto naskh arabic',
-  'noto sans arabic',
-]);
+export const ARABIC_SUBSTITUTE_FONTS = ARABIC_SUBSTITUTE_FACES;
 
 
 /** Naskh-style traditional Arabic faces ship a serif Latin companion; the
  *  geometric/modern ones pair with a sans Latin. Drives whether an Arabic-font
  *  run's Latin+digits route to Noto Naskh Arabic (serif-like) or Noto Sans
  *  Arabic, and which Latin serif/sans companion follows. */
-export const NASKH_SERIF_ARABIC_FONTS = new Set([
-  'sakkal majalla',
-  'traditional arabic',
-  'simplified arabic',
-  'arabic typesetting',
-  'noto naskh arabic',
-]);
+export const NASKH_SERIF_ARABIC_FONTS = NASKH_ARABIC_SUBSTITUTE_FACES;
 
 
 export function isArabicSubstituteFont(family: string): boolean {
@@ -48,9 +39,7 @@ export function isArabicSubstituteFont(family: string): boolean {
 
 
 /** Quote each family for a CSS font-family list. */
-export function quoteAll(names: readonly string[]): string {
-  return names.map(quoteCssFontFamily).join(', ');
-}
+export const quoteAll = quoteCssFontFamilies;
 
 
 /** Generic Arabic web-font fallbacks (loaded when `useGoogleFonts` is on). */

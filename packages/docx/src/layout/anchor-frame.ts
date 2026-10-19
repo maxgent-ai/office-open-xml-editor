@@ -185,10 +185,9 @@ export type AnchorFrameResult = Readonly<{
   issues: readonly AnchorFrameIssue[];
 }>;
 
-/** Canonical authored allocation and axes, independent of wrap exclusion
- * geometry. A completed disclosed reading scene may use this origin without
- * claiming an authored wrap side, contour, effect or distance. */
-export type AnchorPlacementResult = Readonly<{
+/** Canonical authored allocation and axes, resolved before the wrap exclusion
+ * and effect geometry that complete anchor acquisition validates. */
+type AnchorPlacementResult = Readonly<{
   status: 'resolved';
   occurrenceId: string;
   axes: Readonly<{ horizontal: AnchorAxisDiagnostic; vertical: AnchorAxisDiagnostic }>;
@@ -863,7 +862,7 @@ function frozenResult(result: AnchorFrameResult): AnchorFrameResult {
  * §§20.4.3.1-.7; implementation-note evidence is owned by the compatibility
  * decision module.
  */
-export function resolveAnchorPlacement(input: AnchorFrameInput): AnchorPlacementResult {
+function resolveAnchorPlacement(input: AnchorFrameInput): AnchorPlacementResult {
   const { acquisition, frames } = input;
   // CT_Anchor makes these authoring controls required even when a particular
   // layout stage does not consume their values. Rejecting incomplete facts at

@@ -273,16 +273,16 @@ function* bodyUsages(body: readonly BodyElement[], collection: FontCollection): 
   }
 }
 
-/** Native (MS-DOC 2.3.3) reserved separator paragraphs. Their rule control
- * and content mark are text-free runs with their own CHPX; registering them
+/** Reserved separator paragraphs. Their rule control and content mark are
+ * text-free runs with their own character properties; registering them
  * through the ordinary paragraph usages lets a family used only by the
  * control join the same preload/resolution ownership as body text. */
-function* nativeSeparatorUsages(
+function* reservedSeparatorUsages(
   doc: DocxDocumentModel,
   collection: FontCollection,
 ): Generator<DocxRenderedTextUsage> {
-  const native = (doc as InternalDocxDocumentModel).__noteLayoutSettings?.nativeSeparators;
-  for (const stories of [native?.footnote, native?.endnote]) {
+  const reserved = (doc as InternalDocxDocumentModel).__noteLayoutSettings?.reservedSeparators;
+  for (const stories of [reserved?.footnote, reserved?.endnote]) {
     if (!stories) continue;
     for (const story of [stories.separator, stories.continuationSeparator, stories.continuationNotice]) {
       const authored = story.paragraph;
@@ -322,7 +322,7 @@ export function* docxRenderedTextUsages(
   for (const note of [...(doc.footnotes ?? []), ...(doc.endnotes ?? [])]) {
     yield* bodyUsages(note.content, collection);
   }
-  yield* nativeSeparatorUsages(doc, collection);
+  yield* reservedSeparatorUsages(doc, collection);
   yield* selectedSeparatorUsages(doc, collection);
 }
 

@@ -1,7 +1,7 @@
 import {
   DEFAULT_XLSX_WORKSHEET_POLICY,
   type NormalizedXlsxWorksheetPolicy,
-} from '@silurus/ooxml-core/worker';
+} from './worksheet-policy.js';
 import type { Worksheet } from '../types.js';
 import { addWorksheetCacheUsage, type WorksheetCacheUsage } from '../worksheet-resource-limits.js';
 import type { WorksheetViewProjectionCache } from '../worker-protocol.js';

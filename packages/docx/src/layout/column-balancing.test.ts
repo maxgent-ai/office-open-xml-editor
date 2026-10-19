@@ -2,6 +2,29 @@ import { describe, expect, it } from 'vitest';
 import { solveExactColumnBalance } from './column-balancing.js';
 
 describe('solveExactColumnBalance', () => {
+  it('keeps a terminal column break inside the balanced region when a column is left', () => {
+    const result = solveExactColumnBalance({
+      columnCount: 2,
+      fragments: [
+        { extentPt: 10, breakAfter: 'allowed' },
+        { extentPt: 10, breakAfter: 'forced' },
+      ],
+    });
+    // Both paragraphs stay in the first column; the break takes the second.
+    expect(result.cutIndexes).toEqual([2]);
+  });
+
+  it('lets a terminal break in the last column follow it to the next page (control C5)', () => {
+    const result = solveExactColumnBalance({
+      columnCount: 2,
+      fragments: [
+        { extentPt: 10, breakAfter: 'forced' },
+        { extentPt: 10, breakAfter: 'forced' },
+      ],
+    });
+    expect(result.cutIndexes).toEqual([1, 2]);
+  });
+
   it('minimizes the largest exact legal partition without probing numeric caps', () => {
     const result = solveExactColumnBalance({
       columnCount: 2,

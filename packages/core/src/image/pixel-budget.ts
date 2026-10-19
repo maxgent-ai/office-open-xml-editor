@@ -67,9 +67,12 @@ export const MAX_IMAGE_EFFECT_BASE_PIXELS = Math.floor(MAX_RASTER_PIXELS / 4);
 /**
  * Per-picture pixel-effect work ceiling, in pixel visits (one effect pass over
  * one pixel is one visit). CT_Blip's effect list (ECMA-376 §20.1.8.13) is an
- * unbounded `xsd:choice` and every effect is a full pass over the decoded grid,
- * so work = passes × pixels needs its own bound; the retained-surface budgets
- * above bound memory, not passes. The ceiling reuses the per-image work
+ * unbounded `xsd:choice`. Flat point effects cost passes × pixels; spatial
+ * kernels additionally charge separable taps, kernel construction/copies, and
+ * recursive masks charge every evaluated branch. Named-recipe XML lookup
+ * visits consume this same work envelope. Retained-surface budgets bound
+ * memory, while this policy independently bounds total effect work. The ceiling reuses
+ * the per-image work
  * envelope this policy already grants a decoder for one encoded source grid
  * (MAX_RASTER_SOURCE_PIXELS = 2^27): transforming one picture may not visit
  * more pixels than decoding the largest admissible source. Library policy, not
@@ -79,10 +82,10 @@ export const MAX_IMAGE_EFFECT_PIXEL_WORK = MAX_RASTER_SOURCE_PIXELS;
 
 /**
  * Maximum pixel-effect passes per picture: the number of full passes over the
- * largest effect base that fit the work ceiling (2^27 / 2^23 = 16). Every base
- * the effect pipeline admits can therefore run this many passes inside the
- * work ceiling, so the count never rejects a list the work check would admit
- * at the largest base. The count check bounds what the work check cannot see:
+ * largest effect base that fit the work ceiling (2^27 / 2^23 = 16). A flat
+ * point-effect list can run this many passes at the largest base. Spatial
+ * kernels, recursive/control steps and fill work can reach work or workspace
+ * limits sooner. The count check also bounds what pixel work cannot see:
  * per-effect fixed costs (lookup tables, colour parsing, cache-key length) on
  * small rasters, where 2^27 visits would admit millions of passes.
  */
@@ -93,7 +96,13 @@ export type OoxmlDecodedImageLimitMetric =
   | 'image-pixels'
   | 'active-decoded-bytes'
   | 'image-effect-count'
-  | 'image-effect-work';
+  | 'image-effect-work'
+  | 'tiff-lzw-work'
+  | 'metafile-path-commands'
+  | 'metafile-record-points'
+  | 'metafile-record-polygons'
+  | 'metafile-record-rectangles'
+  | 'metafile-record-text-units';
 
 export interface OoxmlDecodedImageLimitDetails {
   readonly metric: OoxmlDecodedImageLimitMetric;
@@ -106,7 +115,13 @@ function isDecodedImageLimitMetric(value: unknown): value is OoxmlDecodedImageLi
     || value === 'image-pixels'
     || value === 'active-decoded-bytes'
     || value === 'image-effect-count'
-    || value === 'image-effect-work';
+    || value === 'image-effect-work'
+    || value === 'tiff-lzw-work'
+    || value === 'metafile-path-commands'
+    || value === 'metafile-record-points'
+    || value === 'metafile-record-polygons'
+    || value === 'metafile-record-rectangles'
+    || value === 'metafile-record-text-units';
 }
 
 function isNonNegativeSafeInteger(value: unknown): value is number {

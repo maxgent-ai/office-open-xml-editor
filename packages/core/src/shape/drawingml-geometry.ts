@@ -2,7 +2,7 @@ import type { Stroke, ArrowEnd } from '../types/common';
 import type { DrawingMLShapePaintPlan } from './drawingml-shape';
 import { createGeometryPath, assertGeometryPath, GeometryWorkBudgetError, type GeometryPath } from './path-data';
 import { resolveStrokeGeometry, type ResolvedStrokeGeometry } from './stroke-geometry';
-import { resolveArrowGeometry, lineEndRetract, retractLineEndpoint, type ResolvedArrowGeometry } from './arrow-geometry';
+import { resolveArrowGeometry, lineEndRetract, trimGeometryPathEnds, type ResolvedArrowGeometry } from './arrow-geometry';
 import { buildShapePath } from './preset';
 import { buildCustomPath } from './custGeom';
 import { getCustGeomEndpoints } from './custgeom-endpoints';
@@ -38,6 +38,10 @@ function sourceKey(plan: DrawingMLShapePaintPlan): string {
   return JSON.stringify({ geometry: plan.geometry, stroke: plan.stroke, fill: plan.fill });
 }
 
+// Retained DrawingML shape plans (DOCX) are authored in points, so their stroke
+// widths are points too; line-end decorations need this for their 2 pt floor.
+const PLAN_UNITS_PER_POINT = 1;
+
 /** Acquire numeric paths and paint scheduling once. No Canvas or painter is called. */
 export function resolveDrawingMLGeometry(plan: DrawingMLShapePaintPlan, scale: number, maximumWork = Infinity): ResolvedDrawingMLGeometry {
   let workUnits = 0;
@@ -59,30 +63,46 @@ export function resolveDrawingMLGeometry(plan: DrawingMLShapePaintPlan, scale: n
   };
   const arrow = (tipX: number, tipY: number, angle: number, end: Readonly<ArrowEnd> | undefined) => {
     if (!end || !strokeSource) return;
-    const geometry = resolveArrowGeometry(end, strokeSource, scale, charge);
+    const geometry = resolveArrowGeometry(end, strokeSource, scale, PLAN_UNITS_PER_POINT, charge);
     if (!geometry) return;
     if (![tipX, tipY, angle].every(Number.isFinite)) throw new RangeError('Invalid resolved DrawingML arrow frame');
     arrows.push(Object.freeze({ tipX, tipY, angle, end: Object.freeze({ ...end }), geometry }));
+  };
+  // How far each decorated end pulls its line back (observed Office rule in
+  // arrow-geometry.ts). Leaders that cannot be re-stroked from straight
+  // vertices (curved connectors, custom paths) are trimmed along the path.
+  const headTrim = strokeSource?.headEnd ? lineEndRetract(strokeSource.headEnd, strokeSource, scale, PLAN_UNITS_PER_POINT) : 0;
+  const tailTrim = strokeSource?.tailEnd ? lineEndRetract(strokeSource.tailEnd, strokeSource, scale, PLAN_UNITS_PER_POINT) : 0;
+  /** Add a stroked path trimmed at its ends; a filled path keeps its untrimmed fill. */
+  const addTrimmed = (path: GeometryPath, fill: string | null, fillRule: 'nonzero' | 'evenodd', head: number, tail: number) => {
+    if (!(head > 0 || tail > 0) || !stroke) { add(path, fill, stroke, fillRule); return; }
+    const trimmed = trimGeometryPathEnds(path, head, tail);
+    // The retained validator charges 1 + arguments per command of every path.
+    charge(trimmed.reduce((units, command) => units + 1 + command.args.length, 0));
+    if (fill !== 'none') add(path, fill, null, fillRule);
+    add(trimmed, 'none', stroke, fillRule);
   };
   const silhouette = createGeometryPath(charge);
   if (plan.geometry.kind === 'preset') {
     charge(plan.geometry.adjustments.length);
     const name = plan.geometry.name.toLowerCase(), adjustments = [...plan.geometry.adjustments];
     const decorated = retractable(name) && !!(strokeSource?.headEnd || strokeSource?.tailEnd);
+    const trimsCurve = name.startsWith('curvedconnector');
     const presetPaths = resolvePresetGeometryPaths(name, w, h, adjustments, charge, x, y);
     if (presetPaths) {
       presetPaths.forEach((path, index) => {
         const trailing = index === presetPaths.length - 1 && (path.fill === 'none' || path.fill == null);
-        add(path.path, path.fill, path.stroke && !(decorated && trailing) ? stroke : null);
+        if (trimsCurve && trailing && path.stroke) addTrimmed(path.path, path.fill, 'nonzero', headTrim, tailTrim);
+        else add(path.path, path.fill, path.stroke && !(decorated && trailing) ? stroke : null);
       });
     } else {
+      // Only names the spec engine does not define reach here: `rect` (implicit
+      // box geometry) or a schema-invalid value (see buildShapePath).
       const path = createGeometryPath(charge);
       buildShapePath(path.sink, name, x, y, w, h, adjustments[0], adjustments[1], adjustments[2], adjustments[3]);
-      add(Object.freeze(path.commands), name === 'arc' ? 'none' : null, stroke,
-        ['donut', 'smileyface', 'frame'].includes(name) ? 'evenodd' : 'nonzero');
+      add(Object.freeze(path.commands), null, stroke, 'nonzero');
     }
-    // Preserve the existing clip/shade silhouette, which intentionally differs
-    // from body fallback geometry for some legacy presets.
+    // The clip/shade silhouette excludes the decorative `fill="none"` paths.
     if (!buildPresetGeometryFillPath(silhouette.sink, plan.geometry.name, x, y, w, h, adjustments)) {
       buildShapePath(silhouette.sink, plan.geometry.name, x, y, w, h, adjustments[0], adjustments[1], adjustments[2], adjustments[3]);
     }
@@ -90,13 +110,13 @@ export function resolveDrawingMLGeometry(plan: DrawingMLShapePaintPlan, scale: n
       const anchors = getConnectorAnchors(name, x, y, w, h, adjustments);
       if (anchors) {
         if (decorated && anchors.vertices.length >= 2) {
-          const points = anchors.vertices.map((point) => ({ ...point }));
-          if (strokeSource.tailEnd) points[points.length - 1] = retractLineEndpoint(points[points.length - 1], points[points.length - 2], lineEndRetract(strokeSource.tailEnd, strokeSource, scale));
-          if (strokeSource.headEnd) points[0] = retractLineEndpoint(points[0], points[1], lineEndRetract(strokeSource.headEnd, strokeSource, scale));
-          const path = createGeometryPath(charge);
+          // Trim across the whole leader, so a short terminal leg cannot stop
+          // the retraction early; a leader consumed by both ends paints nothing.
+          const path = createGeometryPath(charge), points = anchors.vertices;
           path.sink.moveTo(points[0].x, points[0].y);
           for (let i = 1; i < points.length; i++) path.sink.lineTo(points[i].x, points[i].y);
-          add(Object.freeze(path.commands), 'none', stroke);
+          const leader = trimGeometryPathEnds(Object.freeze(path.commands), headTrim, tailTrim);
+          if (leader.length >= 2) add(leader, 'none', stroke);
         }
         arrow(anchors.end.x, anchors.end.y, anchors.end.angle, strokeSource.tailEnd);
         arrow(anchors.start.x, anchors.start.y, anchors.start.angle, strokeSource.headEnd);
@@ -106,16 +126,21 @@ export function resolveDrawingMLGeometry(plan: DrawingMLShapePaintPlan, scale: n
     const { subpaths } = plan.geometry;
     for (const path of subpaths) charge(path.length + 1);
     const paint = plan.geometry.paint?.length === subpaths.length ? plan.geometry.paint : null;
+    const ends = strokeSource && (headTrim > 0 || tailTrim > 0) ? getCustGeomEndpoints(subpaths) : null;
+    const customHead = ends?.start ? headTrim : 0, customTail = ends?.end ? tailTrim : 0;
     if (paint) {
       subpaths.forEach((subpath, index) => {
         const path = createGeometryPath(charge);
         buildCustomPath(path.sink, [subpath], x, y, w, h);
-        add(Object.freeze(path.commands), paint[index].fill ?? null, paint[index].stroke === false ? null : stroke);
+        const commands = Object.freeze(path.commands), fill = paint[index].fill ?? null;
+        if (paint[index].stroke === false) add(commands, fill, null, paint[index].fillRule);
+        else addTrimmed(commands, fill, paint[index].fillRule ?? 'nonzero',
+          index === 0 ? customHead : 0, index === subpaths.length - 1 ? customTail : 0);
       });
     } else {
       const path = createGeometryPath(charge);
       buildCustomPath(path.sink, subpaths, x, y, w, h);
-      add(Object.freeze(path.commands), null, stroke);
+      addTrimmed(Object.freeze(path.commands), null, 'nonzero', customHead, customTail);
     }
     buildCustomPath(silhouette.sink, paint ? subpaths.filter((_, i) => paint[i].fill !== 'none') : subpaths, x, y, w, h);
     if (strokeSource) {
@@ -159,7 +184,7 @@ export function requireResolvedDrawingMLGeometry(plan: DrawingMLShapePaintPlan, 
   }
   return geometry;
 }
-export function composeGeometryMatrix(a: GeometryMatrix, b: GeometryMatrix): GeometryMatrix {
+function composeGeometryMatrix(a: GeometryMatrix, b: GeometryMatrix): GeometryMatrix {
   const m = { a: a.a * b.a + a.c * b.b, b: a.b * b.a + a.d * b.b, c: a.a * b.c + a.c * b.d,
     d: a.b * b.c + a.d * b.d, e: a.a * b.e + a.c * b.f + a.e, f: a.b * b.e + a.d * b.f + a.f };
   if (!Object.values(m).every(Number.isFinite) || !Number.isFinite(m.a * m.d - m.b * m.c) || m.a * m.d - m.b * m.c === 0) throw new RangeError('Invalid DrawingML geometry transform');

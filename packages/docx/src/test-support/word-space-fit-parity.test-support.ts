@@ -1,7 +1,8 @@
-// Inputs outside WORD_COMPRESSED_SPACE_LINE_FIT whose line partitions and
-// segment widths must equal origin/main (4a387ebcb): Latin-only paragraphs in
-// every compatibility setting, and mixed East Asian / Latin paragraphs in
-// every setting the rule excludes.
+// Latin-only paragraphs in every compatibility setting, plus mixed East Asian /
+// Latin paragraphs in settings WORD_COMPRESSED_SPACE_LINE_FIT excludes. The
+// historical digests retain origin/main (4a387ebcb) except Latin compression
+// groups in compatibility mode 14, corrected for Windows-observed
+// kerning/OpenType independence (other modes keep origin/main digests).
 import { createHash } from 'node:crypto';
 import { layoutStubParagraph, type StubParagraph, type StubRun } from './word-space-fit.test-support.js';
 

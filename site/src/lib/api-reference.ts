@@ -75,7 +75,7 @@ export const optionalRenderers: readonly OptionalRendererReference[] = [
     entry: '@silurus/ooxml/tiff',
     exportName: 'tiff',
     contract: 'TiffRenderer',
-    desc: 'Decodes bounded stripped TIFF 6.0 images in DOCX, XLSX and PPTX. Supported classes are uncompressed bilevel, 8-bit grayscale, RGB, RGBA and process-CMYK, plus 1-bit CCITT Group 4. Unsupported or malformed classes make standalone calls and DOCX/PPTX rendering report TiffDecodeError. XLSX rendering, including XlsxViewer, contains the failure at that picture and shows an unavailable-image placeholder.',
+    desc: 'Decodes bounded stripped TIFF 6.0 images in DOCX, XLSX and PPTX. Supported classes are bilevel, 8-bit grayscale, RGB, RGBA and process-CMYK, uncompressed or LZW-compressed (8-bit classes optionally with horizontal differencing), plus 1-bit CCITT Group 4. Unsupported or malformed classes make standalone calls and DOCX/PPTX rendering report TiffDecodeError. XLSX rendering, including XlsxViewer, contains the failure at that picture and shows an unavailable-image placeholder.',
   },
 ];
 
@@ -96,7 +96,19 @@ const MATH = { name: 'math', type: 'MathRenderer', def: 'undefined', desc: 'Opt-
 const THREE_D = { name: 'threeD', type: 'ChartThreeDRenderer', def: 'undefined', desc: 'Opt-in model-space 3-D chart renderer. Import `threeD` from the separate `@silurus/ooxml/three-d` entry and inject it once. Omit it to use the canonical 2-D fallback and avoid loading or evaluating the mesh/camera implementation in main mode. The self-contained worker asset retains the worker-side implementation. It renders the view angle authored in OOXML in main and worker modes.', emphasis: 'Opt-in model-space 3-D chart renderer.' };
 const REGION_MAP = { name: 'regionMap', type: 'ChartRegionMapRenderer', def: 'undefined', desc: 'Opt-in offline ChartEx Region Map renderer using a pinned, public-domain Natural Earth country asset. Import `regionMap` from `@silurus/ooxml/region-map` and inject it once. Unsupported cached or sub-country views fail closed. The built-in renderer works in main and worker modes.', emphasis: 'Opt-in offline ChartEx Region Map renderer' };
 const CHART_EX = { name: 'chartEx', type: 'ChartExRenderer', def: 'undefined', desc: 'Opt-in renderer for Microsoft ChartEx (`cx:*`) chart families. Import `chartEx` from `@silurus/ooxml/chart-ex` and inject it once. Classic 2-D charts stay in the default format entries; ChartEx is opt-in. The built-in renderer works in main and worker modes.', emphasis: 'Classic 2-D charts stay in the default format entries; ChartEx is opt-in.' };
-const TIFF = { name: 'tiff', type: 'TiffRenderer', def: 'undefined', desc: 'Opt-in TIFF image codec shared by DOCX, XLSX and PPTX. Import `tiff` from `@silurus/ooxml/tiff` and inject it once. The bounded codec accepts stripped TIFF 6.0 bilevel, grayscale, RGB, RGBA and process-CMYK images, plus CCITT Group 4 bilevel images. Omit it to keep the implementation out of ordinary format bundles; recognized TIFF images then use an unavailable-image placeholder while the rest of the document keeps rendering. Unsupported or malformed input makes standalone codec calls and DOCX/PPTX rendering report TiffDecodeError; XLSX rendering, including XlsxViewer, contains it at that picture and shows the placeholder. The built-in codec works in main and worker modes.', emphasis: 'Opt-in TIFF image codec shared by DOCX, XLSX and PPTX.' };
+const TIFF = { name: 'tiff', type: 'TiffRenderer', def: 'undefined', desc: 'Opt-in TIFF image codec shared by DOCX, XLSX and PPTX. Import `tiff` from `@silurus/ooxml/tiff` and inject it once. The bounded codec accepts stripped TIFF 6.0 bilevel, grayscale, RGB, RGBA and process-CMYK images, uncompressed or LZW-compressed, plus CCITT Group 4 bilevel images. Omit it to keep the implementation out of ordinary format bundles; recognized TIFF images then use an unavailable-image placeholder while the rest of the document keeps rendering. Unsupported or malformed input makes standalone codec calls and DOCX/PPTX rendering report TiffDecodeError; XLSX rendering, including XlsxViewer, contains it at that picture and shows the placeholder. The built-in codec works in main and worker modes.', emphasis: 'Opt-in TIFF image codec shared by DOCX, XLSX and PPTX.' };
+const LEGACY_SOURCE = (exportName: 'legacyDoc' | 'legacyXls' | 'legacyPpt', entry: 'doc' | 'xls' | 'ppt', format: 'docx' | 'xlsx' | 'pptx', factory: string): ApiOption => ({
+  name: exportName,
+  type: `ModelSource<'${format}'>`,
+  def: 'undefined',
+  desc: `Experimental opt-in reader for a supported subset of legacy .${entry} files, from the separate @silurus/ooxml-legacy-office add-on (install it at exactly the same version). Import \`${exportName}\` from \`@silurus/ooxml-legacy-office/${entry}\` and pass it as \`{ ${exportName} }\`; use \`${factory}({ wasmUrl, moduleUrl })\` for custom asset URLs. Importing it fetches nothing; its reader loads only when a matching file is opened. Unsupported legacy input rejects with OoxmlError('unsupported-content'); without it, legacy files reject with OoxmlError('legacy-binary-format').`,
+  emphasis: 'Experimental opt-in reader',
+  detailsHref: '/legacy-office',
+  detailsLabel: 'Legacy Office guide',
+});
+const LEGACY_DOC = LEGACY_SOURCE('legacyDoc', 'doc', 'docx', 'createLegacyDoc');
+const LEGACY_XLS = LEGACY_SOURCE('legacyXls', 'xls', 'xlsx', 'createLegacyXls');
+const LEGACY_PPT = LEGACY_SOURCE('legacyPpt', 'ppt', 'pptx', 'createLegacyPpt');
 const MODE = { name: 'mode', type: "'main' | 'worker'", def: "'main'", desc: "Use 'main' for the smallest worker download, the lowest single-frame overhead or custom renderer objects; parsing still runs in a Worker, while Canvas rendering runs on the main thread. Use 'worker' when document layout and paint would compete with application UI responsiveness. It requires Worker and OffscreenCanvas, downloads a larger render worker and transfers an ImageBitmap per frame. Built-in math, ChartEx, 3-D, Region Map and TIFF renderers use the same options in both modes. In worker mode, use the bitmap render methods instead of methods that accept a Canvas.", emphasis: "Use 'worker' when document layout and paint would compete with application UI responsiveness." };
 const VIEWER_MODE = { name: 'mode', type: "'main' | 'worker'", def: "'main'", desc: "Use 'main' for ordinary previews, the smallest worker download or custom renderer objects. Use 'worker' when rendering larger or more complex documents would compete with scrolling, navigation or other application UI. Worker mode requires Worker and OffscreenCanvas, downloads a larger render worker and transfers an ImageBitmap per frame. Viewer navigation, zoom, virtualized scrolling, selection, find, hyperlinks and the built-in math, ChartEx, 3-D, Region Map and TIFF renderers remain available in both modes.", emphasis: "Use 'worker' when rendering larger or more complex documents would compete with scrolling, navigation or other application UI." };
 const ZOOM_MIN_MAX = { name: 'zoomMin / zoomMax', type: 'number', def: '0.1 / 4', desc: 'Zoom factor bounds for setScale / fitWidth / fitPage (10%–400%).' };
@@ -271,6 +283,7 @@ export const apiReference: Record<'docx' | 'xlsx' | 'pptx', ApiClass[]> = {
         REGION_MAP,
         CHART_EX,
         TIFF,
+        LEGACY_PPT,
         VIEWER_MODE,
         ...PPTX_PROGRESSIVE_OPTIONS,
         ZOOM_MIN_MAX,
@@ -307,7 +320,7 @@ export const apiReference: Record<'docx' | 'xlsx' | 'pptx', ApiClass[]> = {
       name: 'PptxPresentation',
       ctor: 'await PptxPresentation.load(source, options?)',
       note: 'Headless engine — parse once, render any slide into any canvas you supply (scroll views, thumbnail grids, master–detail).',
-      options: [GFONTS, CJK_FALLBACK, PASSWORD, WASM_URL, ZIP, RESOURCE_LIMITS, RESOURCE_METRICS, DEBUG, WORKER_TIMEOUT, MATH, THREE_D, REGION_MAP, CHART_EX, TIFF, MODE, ...PPTX_PROGRESSIVE_OPTIONS],
+      options: [GFONTS, CJK_FALLBACK, PASSWORD, WASM_URL, ZIP, RESOURCE_LIMITS, RESOURCE_METRICS, DEBUG, WORKER_TIMEOUT, MATH, THREE_D, REGION_MAP, CHART_EX, TIFF, LEGACY_PPT, MODE, ...PPTX_PROGRESSIVE_OPTIONS],
       methods: [
         { sig: 'static load(source, options?): Promise<PptxPresentation>', desc: 'Parse a deck from a URL or ArrayBuffer. With progressiveLayout, resolve when the opening slide is paintable.' },
         { sig: 'get slideCount(): number', desc: 'Total slides.' },
@@ -368,6 +381,7 @@ export const apiReference: Record<'docx' | 'xlsx' | 'pptx', ApiClass[]> = {
         REGION_MAP,
         CHART_EX,
         TIFF,
+        LEGACY_PPT,
         DPR,
         MODE,
         ...PPTX_PROGRESSIVE_OPTIONS,
@@ -421,6 +435,7 @@ export const apiReference: Record<'docx' | 'xlsx' | 'pptx', ApiClass[]> = {
         REGION_MAP,
         CHART_EX,
         TIFF,
+        LEGACY_DOC,
         VIEWER_MODE,
         DOCX_PROGRESSIVE_LAYOUT,
         DOCX_SLICE_LAYOUT,
@@ -457,7 +472,7 @@ export const apiReference: Record<'docx' | 'xlsx' | 'pptx', ApiClass[]> = {
       name: 'DocxDocument',
       ctor: 'await DocxDocument.load(source, options?)',
       note: 'Headless engine — render any page into any canvas you supply.',
-      options: [GFONTS, CJK_FALLBACK, PASSWORD, WASM_URL, ZIP, RESOURCE_LIMITS, RESOURCE_METRICS, DEBUG, WORKER_TIMEOUT, MATH, THREE_D, REGION_MAP, CHART_EX, TIFF, MODE, ...DOCX_LAYOUT_VIEW_OPTIONS, DOCX_FOOTNOTE_CONTINUATION, DOCX_PROGRESSIVE_LAYOUT, DOCX_SLICE_LAYOUT, DOCX_LAYOUT_PROGRESS, DOCX_LAYOUT_PARTIAL, DOCX_LAYOUT_COMPLETE],
+      options: [GFONTS, CJK_FALLBACK, PASSWORD, WASM_URL, ZIP, RESOURCE_LIMITS, RESOURCE_METRICS, DEBUG, WORKER_TIMEOUT, MATH, THREE_D, REGION_MAP, CHART_EX, TIFF, LEGACY_DOC, MODE, ...DOCX_LAYOUT_VIEW_OPTIONS, DOCX_FOOTNOTE_CONTINUATION, DOCX_PROGRESSIVE_LAYOUT, DOCX_SLICE_LAYOUT, DOCX_LAYOUT_PROGRESS, DOCX_LAYOUT_PARTIAL, DOCX_LAYOUT_COMPLETE],
       methods: [
         { sig: 'static load(source, options?): Promise<DocxDocument>', desc: 'Parse a document from a URL or ArrayBuffer. With progressiveLayout, resolve when the opening pages are paintable while pagination continues in the background.' },
         { sig: 'get comments(): readonly Readonly<DocComment>[]', desc: 'Immutable detached comments and replies stored in the document.' },
@@ -467,6 +482,7 @@ export const apiReference: Record<'docx' | 'xlsx' | 'pptx', ApiClass[]> = {
         { sig: 'revisionAnchorRanges(): readonly RevisionAnchorRange[]', desc: 'Logical tracked-change ranges for the currently available page prefix. Await waitUntilLayoutComplete() before treating this as a full-document projection.' },
         { sig: 'getBookmarkPage(name: string): number | undefined', desc: 'Resolve a bookmark in the currently available page prefix. Await waitUntilLayoutComplete() before concluding that an unresolved name is absent from the document.' },
         { sig: 'collectPageRuns(index, options?): Promise<DocxTextRunInfo[]>', desc: 'Collect the same immutable text-run geometry emitted while rendering one page.' },
+        { sig: 'get diagnostics(): readonly DocxDiagnostic[]', desc: 'Parser and layout limitations plus font and image acquisition failures. Available in main and worker modes; read after load/layout and page rendering to inspect fallback or incomplete content.' },
         { sig: 'get pageCount(): number', desc: 'Pages available so far; authoritative only when layoutComplete is true.' },
         { sig: 'get layoutComplete(): boolean', desc: 'True only after the authoritative document layout succeeds. It is false while progressive layout is publishing pages and remains false if background pagination fails; waitUntilLayoutComplete() reports that failure.' },
         { sig: 'waitUntilLayoutComplete(): Promise<void>', desc: 'Wait for the authoritative full layout. Rejects if background pagination fails after load() resolved.' },
@@ -517,6 +533,7 @@ export const apiReference: Record<'docx' | 'xlsx' | 'pptx', ApiClass[]> = {
         REGION_MAP,
         CHART_EX,
         TIFF,
+        LEGACY_DOC,
         DPR,
         MODE,
         DOCX_PROGRESSIVE_LAYOUT,
@@ -579,6 +596,7 @@ export const apiReference: Record<'docx' | 'xlsx' | 'pptx', ApiClass[]> = {
         REGION_MAP,
         CHART_EX,
         TIFF,
+        LEGACY_XLS,
         VIEWER_MODE,
         ON_SCALE_CHANGE,
         ON_HYPERLINK_CLICK,
@@ -658,6 +676,7 @@ export const apiReference: Record<'docx' | 'xlsx' | 'pptx', ApiClass[]> = {
         REGION_MAP,
         CHART_EX,
         TIFF,
+        LEGACY_XLS,
         VIEWER_MODE,
         ON_SCALE_CHANGE,
         ON_HYPERLINK_CLICK,
@@ -701,7 +720,7 @@ export const apiReference: Record<'docx' | 'xlsx' | 'pptx', ApiClass[]> = {
       name: 'XlsxWorkbook',
       ctor: 'await XlsxWorkbook.load(source, options?)',
       note: 'Headless engine — parse once, render any sheet viewport into any canvas you supply.',
-      options: [GFONTS, CJK_FALLBACK, PASSWORD, WASM_URL, ZIP, RESOURCE_LIMITS, XLSX_WORKSHEET_LIMITS, RESOURCE_METRICS, DEBUG, WORKER_TIMEOUT, MATH, THREE_D, REGION_MAP, CHART_EX, TIFF, MODE],
+      options: [GFONTS, CJK_FALLBACK, PASSWORD, WASM_URL, ZIP, RESOURCE_LIMITS, XLSX_WORKSHEET_LIMITS, RESOURCE_METRICS, DEBUG, WORKER_TIMEOUT, MATH, THREE_D, REGION_MAP, CHART_EX, TIFF, LEGACY_XLS, MODE],
       methods: [
         { sig: 'static load(source, options?): Promise<XlsxWorkbook>', desc: 'Parse a workbook from a URL or ArrayBuffer.' },
         { sig: 'get sheetNames(): string[]', desc: 'Names of all sheets.' },

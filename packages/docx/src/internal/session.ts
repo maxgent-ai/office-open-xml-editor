@@ -25,3 +25,4 @@ export {
   type DocxNodePullOptions,
   type DocxNodePullTransport,
 } from './node-acquisition.js';
+export { normalizeDocxParserError } from './parser-errors.js';

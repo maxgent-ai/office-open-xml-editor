@@ -2,7 +2,6 @@
 // Format players remain in their format-specific modules; this module owns the
 // cross-format safety policy, decoder-side resizing, and final surface check.
 
-import { renderEmfToBitmap } from './emf.js';
 import { closeImageBitmapIfSupported } from './image-bitmap-lifecycle.js';
 import {
   MAX_RASTER_DIMENSION,
@@ -27,10 +26,19 @@ import {
 import { OptionalImageCodecUnavailableError } from './optional-image-fallback.js';
 import { isEmf, isWmf, renderWmfToBitmap, wmfRasterTarget } from './wmf.js';
 
+// The EMF/EMF+ player is loaded on the first EMF picture, not with the viewer:
+// most documents carry none, and it is a large share of the default bundle.
+// Decoding is asynchronous already, so the only change is one module load
+// before the first EMF is played. The WMF player stays static: it shares its
+// DIB, canvas and symbol-font helpers with eagerly used chart and image code,
+// so the bundler would keep it in the eager graph anyway.
+const loadEmfPlayer = () => import('./emf.js');
+
 /**
  * What the loading path does with a metafile whose playback could not
  * reproduce all of its content (unimplemented records, an EMF+-only stream
  * that fails validation, damaged records; see `EmfRasterResult` in emf.ts).
+ * Resource ceilings always throw a typed limit error before this policy runs.
  * WMF detection currently covers EXTTEXTOUT exclusions, not every skipped
  * drawing record; a missing report is not a general fidelity guarantee.
  *
@@ -116,7 +124,6 @@ function applyIncompleteMetafilePolicy(
 export interface DecodeRasterOptions {
   widthPt?: number;
   heightPt?: number;
-  suppressBoundaryFrame?: boolean;
   tiff?: TiffRenderer;
   targetWidthPx?: number;
   targetHeightPx?: number;
@@ -213,7 +220,6 @@ export async function decodeRasterOrMetafileWithInspection(
   const {
     widthPt = 0,
     heightPt = 0,
-    suppressBoundaryFrame = false,
     tiff,
     targetWidthPx,
     targetHeightPx,
@@ -229,7 +235,7 @@ export async function decodeRasterOrMetafileWithInspection(
     const { w, h } = wmfRasterTarget(widthPt, heightPt);
     let unsupported: readonly string[] = [];
     const bitmap = await renderWmfToBitmap(
-      new Uint8Array(await data.arrayBuffer()), w, h, suppressBoundaryFrame,
+      new Uint8Array(await data.arrayBuffer()), w, h,
       (records) => { unsupported = records; },
     );
     return enforceDecodedBitmapBudget(
@@ -239,6 +245,7 @@ export async function decodeRasterOrMetafileWithInspection(
   }
   if (isEmf(head)) {
     const { w, h } = wmfRasterTarget(widthPt, heightPt);
+    const { renderEmfToBitmap } = await loadEmfPlayer();
     const played = await renderEmfToBitmap(new Uint8Array(await data.arrayBuffer()), w, h);
     return enforceDecodedBitmapBudget(
       applyIncompleteMetafilePolicy(played.bitmap, played.unsupported, incompleteMetafile),

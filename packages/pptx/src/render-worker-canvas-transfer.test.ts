@@ -92,7 +92,7 @@ class LoopbackWorker implements WorkerLike {
   terminate(): void {}
 }
 
-async function loadWorker(entry: 'render-worker' | 'render-worker-source') {
+async function loadWorker() {
   vi.resetModules();
   const scope = {
     onmessage: null as ((event: MessageEvent) => Promise<void>) | null,
@@ -101,8 +101,7 @@ async function loadWorker(entry: 'render-worker' | 'render-worker-source') {
   const worker = new LoopbackWorker(scope);
   vi.stubGlobal('self', scope);
   vi.stubGlobal('OffscreenCanvas', FakeOffscreenCanvas);
-  if (entry === 'render-worker') await import('./render-worker.js');
-  else await import('./render-worker-source.js');
+  await import('./render-worker.js');
   const dispatch = (data: unknown) => scope.onmessage!({ data } as MessageEvent);
   await dispatch({ kind: 'init', wasmUrl: 'x' });
   await dispatch({
@@ -140,9 +139,9 @@ afterEach(() => {
   FakeOffscreenCanvas.created = [];
 });
 
-describe.each(['render-worker', 'render-worker-source'] as const)('PPTX %s bitmap surface', (entry) => {
+describe('PPTX render worker bitmap surface', () => {
   it('paints renderSlideToBitmap into the contextless 1x1 canvas transferred from the caller', async () => {
-    const { presentation, worker } = await loadWorker(entry);
+    const { presentation, worker } = await loadWorker();
 
     const bitmap = await presentation.renderSlideToBitmap(0, { width: 320, dpr: 1 });
 
@@ -150,7 +149,7 @@ describe.each(['render-worker', 'render-worker-source'] as const)('PPTX %s bitma
   });
 
   it('paints collectSlideRuns into the contextless 1x1 canvas transferred from the caller', async () => {
-    const { presentation, worker } = await loadWorker(entry);
+    const { presentation, worker } = await loadWorker();
     mocks.render.mockImplementationOnce(async (...args: unknown[]) => {
       (args[5] as (run: unknown) => void)({ text: 'run' });
     });
@@ -161,7 +160,7 @@ describe.each(['render-worker', 'render-worker-source'] as const)('PPTX %s bitma
   });
 
   it('keeps a worker-local surface for requests that carry no canvas', async () => {
-    const { worker, dispatch } = await loadWorker(entry);
+    const { worker, dispatch } = await loadWorker();
 
     await dispatch({ kind: 'renderSlide', id: 7, slideIndex: 0, width: 320, dpr: 1 });
     await dispatch({ kind: 'collectRuns', id: 8, slideIndex: 0, width: 320 });

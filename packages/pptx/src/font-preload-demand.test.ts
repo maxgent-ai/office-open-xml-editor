@@ -73,7 +73,7 @@ describe('complete conservative PPTX paint demand', () => {
     const second = baseline.prepareSlide({ ...slide('字'), index: 1 });
     const limit = Math.max(firstPeak, second.projectedBytes) + 10;
     second.commit();
-    const builder = new PresentationPreflightBuilder(bootstrap, { collectFontDemand: collectSlideFontDemand, hardLimitForTesting: limit });
+    const builder = new PresentationPreflightBuilder(bootstrap, { collectFontDemand: collectSlideFontDemand, maxProjectionBytes: limit });
     builder.addSlide(slide(Array.from({ length: 300 }, (_, i) => String.fromCodePoint(0x4e00 + i)).join('')));
     builder.addSlide({ ...slide('字'), index: 1 });
     expect(builder.projectedBytes).toBeLessThanOrEqual(limit);
@@ -90,7 +90,7 @@ it('evicts optional precision under metadata pressure without rejecting or retai
   const required = ordinary.prepareSlide(secondSlide);
   const limit = required.projectedBytes;
   required.rollback();
-  const builder = new PresentationPreflightBuilder(bootstrap, { collectFontDemand: collectSlideFontDemand, hardLimitForTesting: limit });
+  const builder = new PresentationPreflightBuilder(bootstrap, { collectFontDemand: collectSlideFontDemand, maxProjectionBytes: limit });
   builder.addSlide(firstSlide);
   expect(builder.currentFontPreloadDemandDelta).toEqual(expect.arrayContaining([65]));
   const prepared = builder.prepareSlide(secondSlide);
@@ -111,7 +111,7 @@ it('does not repair a saturated mandatory projection by subtracting optional cac
   const probe = ordinary.prepareSlide(second);
   const limit = probe.projectedBytes;
   probe.rollback();
-  const builder = new PresentationPreflightBuilder(bootstrap, { collectFontDemand: collectSlideFontDemand, hardLimitForTesting: limit });
+  const builder = new PresentationPreflightBuilder(bootstrap, { collectFontDemand: collectSlideFontDemand, maxProjectionBytes: limit });
   builder.addSlide(slide('A'));
   const prior = builder.currentFontPreloadDemandDelta;
   expect(() => builder.prepareSlide({ ...second, notes: 'n'.repeat(1000) })).toThrow('hard limit');
@@ -127,10 +127,10 @@ it.each([0, 1])('falls back to all when an empty delta array cannot fit its two-
   const prepared = probe.prepareSlide(second);
   const limit = prepared.projectedBytes - 2 + remaining;
   prepared.rollback();
-  const ordinary = new PresentationPreflightBuilder(bootstrap, { hardLimitForTesting: limit });
+  const ordinary = new PresentationPreflightBuilder(bootstrap, { maxProjectionBytes: limit });
   ordinary.addSlide(first);
   ordinary.addSlide(second);
-  const filtered = new PresentationPreflightBuilder(bootstrap, { collectFontDemand: collectSlideFontDemand, hardLimitForTesting: limit });
+  const filtered = new PresentationPreflightBuilder(bootstrap, { collectFontDemand: collectSlideFontDemand, maxProjectionBytes: limit });
   filtered.addSlide(first);
   expect(() => filtered.addSlide(second)).not.toThrow();
   expect(filtered.finish().fontPreloadDemand).toBeUndefined();

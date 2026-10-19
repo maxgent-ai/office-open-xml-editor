@@ -278,6 +278,143 @@ describe('ECMA-376 §17.4.72 cell text direction', () => {
     expect(text.y).toBeCloseTo(60, 0);
   });
 
+  it('runs an exact rotated line between its top rule and the authored box end', async () => {
+    // WORD_COLLAPSED_BORDER_ROW_TRACK_FOOTPRINT: the 80pt exact box holds its
+    // 6pt top rule; the 6pt bottom rule is appended below it. The line spans
+    // 6..80pt (74pt), so right-aligned text still ends at y=80.
+    const rule = { style: 'single', width: 6, color: null };
+    const ruled = tableOf([
+      row([cell('AB', { textDirection: 'tbRl', alignment: 'right' }), cell('x')], 80, 'exact'),
+    ]);
+    ruled.borders = { ...ruled.borders, top: rule, bottom: rule } as DocTable['borders'];
+    const calls = await render(ruled);
+    const text = calls.find((call) => call.text.includes('AB'))!;
+    expect(text.y).toBeCloseTo(60, 0);
+  });
+
+  it('re-runs an exact rotated line against the rules of its page-local slice', async () => {
+    // In the whole table the second exact row's line spans its 1pt inside
+    // rule to the authored box end (79pt). Moved to the next page it becomes
+    // that slice's first row and takes the 6pt table top rule, so its line
+    // spans 6..80pt (74pt) and right-aligned text still ends at y=80.
+    const rule = { style: 'single', width: 6, color: null };
+    const ruled = tableOf([
+      row([cell('AB', { textDirection: 'tbRl', alignment: 'right' }), cell('x')], 80, 'exact'),
+      row([cell('CD', { textDirection: 'tbRl', alignment: 'right' }), cell('y')], 80, 'exact'),
+    ]);
+    ruled.borders = {
+      ...ruled.borders,
+      top: rule,
+      bottom: rule,
+      insideH: { style: 'single', width: 1, color: null },
+    } as DocTable['borders'];
+    const model = modelOf(ruled);
+    (model.section as { pageHeight: number }).pageHeight = 100;
+    const { canvas, calls } = makeRecordingCanvas();
+    await renderDocumentToCanvas(model, canvas, 1, { dpr: 1, width: 400 });
+    const text = calls.find((call) => call.text.includes('CD'))!;
+    expect(text.y).toBeCloseTo(60, 0);
+  });
+
+  it('keeps the page-local rotated line when a neighbour holds a PAGE field', async () => {
+    // Pagination copies a row's cells to resolve a page-dependent block; the
+    // copied rotated cell still re-runs its line against the slice's rules.
+    const rule = { style: 'single', width: 6, color: null };
+    const pageCell = cell('p');
+    (pageCell.content[0] as unknown as DocParagraph).runs.push({
+      type: 'field', fieldType: 'page', instruction: 'PAGE', fallbackText: '?',
+      ...textRun(''),
+    } as unknown as DocParagraph['runs'][number]);
+    const ruled = tableOf([
+      row([cell('AB', { textDirection: 'tbRl', alignment: 'right' }), cell('x')], 80, 'exact'),
+      row([cell('CD', { textDirection: 'tbRl', alignment: 'right' }), pageCell], 80, 'exact'),
+    ]);
+    ruled.borders = {
+      ...ruled.borders,
+      top: rule,
+      bottom: rule,
+      insideH: { style: 'single', width: 1, color: null },
+    } as DocTable['borders'];
+    const model = modelOf(ruled);
+    (model.section as { pageHeight: number }).pageHeight = 100;
+    const { canvas, calls } = makeRecordingCanvas();
+    await renderDocumentToCanvas(model, canvas, 1, { dpr: 1, width: 400 });
+    const text = calls.find((call) => call.text.includes('CD'))!;
+    expect(text.y).toBeCloseTo(60, 0);
+  });
+
+  it('re-runs a rotated line against the rules of a header owner segment', async () => {
+    for (const nestedPositioned of [false, true]) {
+    // The second row's framePr carrier makes it its own frame-positioned
+    // owner segment at y=100, where it takes the 6pt table top rule: its line
+    // spans 106..180pt and right-aligned text still ends at y=180.
+    const rule = { style: 'single', width: 6, color: null };
+    const carrier = paraOf('F') as unknown as DocParagraph;
+    carrier.framePr = {
+      dropCap: 'none', lines: 1, wrap: 'notBeside', hAnchor: 'page', vAnchor: 'page',
+      hRule: 'auto', hSpace: 0, vSpace: 0, x: 0, y: 100,
+    };
+    // A positioned nested table makes the segment lay out whole at its page
+    // position, through a normalized copy of the segment input.
+    const nested = {
+      type: 'table', ...tableOf([row([cell('n'), cell('m')])]),
+      tblpPr: {
+        leftFromText: 0, rightFromText: 0, topFromText: 0, bottomFromText: 0,
+        horzAnchor: 'page', horzSpecified: true, vertAnchor: 'page', tblpX: 250, tblpY: 300,
+      },
+    } as unknown as CellElement;
+    const ruled = tableOf([
+      row([cell('AB', { textDirection: 'tbRl', alignment: 'right' }), cell('x')], 80, 'exact'),
+      row([
+        cell('y', {
+          content: [carrier as unknown as CellElement, ...(nestedPositioned ? [nested, paraOf('z')] : [])],
+        }),
+        cell('CD', { textDirection: 'tbRl', alignment: 'right' }),
+      ], 80, 'exact'),
+    ]);
+    ruled.borders = {
+      ...ruled.borders,
+      top: rule,
+      bottom: rule,
+      insideH: { style: 'single', width: 1, color: null },
+    } as DocTable['borders'];
+    const model = modelOf(paraOf('body') as unknown as DocTable);
+    model.body = [{ type: 'paragraph', ...(paraOf('body') as object) } as unknown as BodyElement];
+    (model.headers as { default: unknown }).default = { body: [{ type: 'table', ...ruled } as BodyElement] };
+    const { canvas, calls } = makeRecordingCanvas();
+    await renderDocumentToCanvas(model, canvas, 0, { dpr: 1, width: 400 });
+    const text = calls.find((call) => call.text.includes('CD'))!;
+    expect(text.y).toBeCloseTo(160, 0);
+    if (nestedPositioned) expect(calls.some((call) => call.text.includes('n'))).toBe(true);
+    }
+  });
+
+  it('re-runs rotated lines laid out as one adjacent table group', async () => {
+    // Two adjacent tables form one logical table: the second's exact row takes
+    // the group's 1pt inside rule instead of its own 6pt top rule, so its line
+    // spans 81..160pt and right-aligned text ends at y=160, as in one table.
+    const rule = { style: 'single', width: 6, color: null };
+    const ruledTable = (text: string, offset: number) => {
+      const ruled = tableOf([
+        row([cell(text, { textDirection: 'tbRl', alignment: 'right' }), cell('x')], 80, 'exact'),
+      ]);
+      ruled.borders = {
+        ...ruled.borders, top: rule, bottom: rule, insideH: { style: 'single', width: 1, color: null },
+      } as DocTable['borders'];
+      return Object.assign(ruled, {
+        __tableLayout: {
+          effectiveStyleId: null, ordinaryFlow: true,
+          logicalSequenceId: 'table-sequence:0', logicalRowOffset: offset, logicalTotalRows: 2,
+          grid: { authored: true, columns: [{ width: '2000' }, { width: '2000' }], requiredColumnCount: 2 },
+          preferredWidth: null, layout: { kind: 'fixed' }, cellSpacing: null,
+        },
+      });
+    };
+    const calls = await render(ruledTable('CD', 1), [{ type: 'table', ...ruledTable('AB', 0) } as BodyElement]);
+    const text = calls.find((call) => call.text.includes('CD'))!;
+    expect(text.y).toBeCloseTo(140, 0);
+  });
+
   it('lets a taller neighbour lengthen the line and centres text along it', async () => {
     const calls = await render(tableOf([
       row([

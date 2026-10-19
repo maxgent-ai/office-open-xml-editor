@@ -128,6 +128,24 @@ describe('DrawingML table text selection runs', () => {
     ]);
   });
 
+  it.each([
+    ['horz', 'clip'],
+    [' \t horz\r\n', 'clip'],
+    [undefined, 'clip'],
+    ['vert', undefined],
+    ['\u00a0horz\u00a0', undefined],
+    ['ho\trz', undefined],
+    ['unknown', undefined],
+  ] as const)('uses model direction %j for horizontal clipping', (vert, expected) => {
+    const body = textBody('A');
+    if (vert === undefined) Reflect.deleteProperty(body, 'vert');
+    else body.vert = vert;
+    const table = tableOf([[cell({ textBody: body })]], [COL]);
+    const runs = collectRuns(table);
+    expect(runs).toHaveLength(1);
+    expect(runs[0].cellHorzOverflow).toBe(expected);
+  });
+
   it('keeps empty cells as semantic gaps instead of fabricating selectable text', () => {
     const table = tableOf([[
       cell({ textBody: textBody('A') }),

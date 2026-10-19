@@ -18,16 +18,20 @@ export function uiColWidthToPx(chars: number, mdw: number = MDW_FALLBACK): numbe
 
 /** ECMA-376 §18.3.1.81: baseColWidth is a digit count, excluding padding.
  *  At 96 DPI the normative padding is 5 px (two 2 px margins and gridline).
- *  Excel for Mac 16.113.2 instead gave 5 pt of padding and a point-quantized
- *  default-font digit width for observed base widths 8 and 10 and Calibri
- *  9–14 pt, Arial 11 pt, and Meiryo UI 11 pt. This is a bounded Mac display
- *  compatibility rule, not an OOXML requirement or a font-family adjustment. */
-export function baseColWidthToPx(baseWidth: number, mdw: number, macExcel: boolean): number {
-  if (macExcel) {
-    const digitPt = Math.round(mdw / PT_TO_PX);
-    return Math.round((baseWidth * digitPt + 5) * PT_TO_PX);
-  }
-  return Math.round(baseWidth * mdw + 5);
+ *
+ *  Observed Windows Excel behaviour (not in the specification): the derived
+ *  width is rounded UP to the next multiple of 8 px. Excel 16.0 build 20430
+ *  with Calibri 11 (MDW 7) shows base 8/10/12 as 64/80/96 px (not 61/75/89),
+ *  and its PDF export keeps the same ratios. At 200 % display scaling base 13
+ *  reads back as 78 pt (104 CSS px) rather than the normative 76.875 pt, which
+ *  is the same rule in CSS px (13 × 7.5 + 5 = 102.5 -> 104). The rounding is
+ *  applied here in CSS px at 100 %, before zoom and device-pixel scaling; MDW
+ *  is the measured integer digit width. An explicit defaultColWidth is a
+ *  stored width and is not rounded.
+ *
+ *  Layout is independent of the viewer OS; Windows Excel is the reference. */
+export function baseColWidthToPx(baseWidth: number, mdw: number): number {
+  return Math.ceil(Math.round(baseWidth * mdw + 5) / 8) * 8;
 }
 
 /** In-memory inverse used by the viewer's resize interaction. */

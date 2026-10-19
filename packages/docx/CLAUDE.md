@@ -1,82 +1,53 @@
 # @silurus/ooxml-docx — DOCX セッション用
 
-## あなたのロール
-このディレクトリ（`packages/docx/`）の編集責任者。DOCX の parser・renderer を 0 から実装する。
+ルートの `AGENTS.md`（正）と `CLAUDE.md` を先に読むこと。ワークフロー、
+ブランチ、VRT、参照画像のルールはそちらに従う。このファイルは DOCX 固有の
+事実だけを記録する。
 
-## MVP スコープ（Phase 2）
-- ZIP 解凍 + `word/document.xml` パース（Rust）
-- パラグラフ + ラン（bold/italic/color/font-size）
-- 明示改ページ `<w:br w:type="page"/>` のみ
-- `DocxDocument.renderPage(target, pageIndex)` 公開 API
-- 非対応（後続）: テーブル、画像、ヘッダー/フッター、自動改ページ、脚注
+## 編集範囲
+- 主に `packages/docx/**`（`parser/`、`model/` の Rust を含む）。
+- `packages/core` / `packages/ooxml-common` や他フォーマットへの変更は、
+  `AGENTS.md` の Cross-Package Integration に沿った一貫した修正の場合のみ。
 
-## Storybook
-
-Storybook はルート一本化のため、パッケージ単体では起動しない。
-ルートから `pnpm storybook` で全パッケージのストーリーが参照できる。
-
-## 編集してよいもの
-- `packages/docx/**` すべて
-- `packages/docx/parser/src/**`（Rust）
-
-## 絶対に編集してはいけないもの
-- `packages/core/**` ← 共有コード。変更が必要なら main ブランチへ PR
-- `packages/pptx/**` / `packages/xlsx/**` ← 他セッションの領域
-- root の config 類 ← main で管理
-
-## 参考にしてよいもの（読み取り専用）
-- `src/renderer.ts` — Canvas 描画プリミティブの参考
-- `pptx-parser/src/lib.rs` — wasm_bindgen + roxmltree の使い方
-- `src/types.ts` — 型定義パターンの参考
-
-## 参照画像
-`packages/docx/tests/visual/references/` は Word export PNG のみ配置。自動更新禁止。
-
-## ディレクトリ構成
+## ディレクトリ構成（主要なもの）
 
 ```
 packages/docx/
-├── CLAUDE.md
-├── package.json
-├── tsconfig.json
-├── vite.config.ts
-├── public/              ← sample .docx ファイル置き場（git 管理対象外）
+├── parser/src/          Rust パーサー（lib.rs, parser.rs, styles.rs, numbering.rs, …）
+├── model/src/           Rust モデル crate
 ├── src/
-│   ├── index.ts         ← 公開 API
-│   ├── types.ts         ← Document モデル型（Rust JSON 出力と1:1）
-│   ├── document.ts      ← DocxDocument クラス
-│   ├── viewer.ts        ← DocxViewer クラス
-│   ├── renderer.ts      ← renderPage 実装
-│   └── wasm/            ← wasm-pack 出力（git 管理対象外）
-├── parser/
-│   ├── Cargo.toml
-│   └── src/
-│       ├── lib.rs       ← WASM エントリポイント
-│       ├── types.rs     ← Rust 型定義
-│       └── parser.rs    ← DOCX パーサー実装
-└── tests/visual/
-    ├── visual.spec.ts
-    ├── fixture.html
-    ├── references/      ← Word export PNG（git 管理対象外）
-    ├── screenshots/
-    └── diffs/
+│   ├── index.ts         公開 API
+│   ├── document.ts      DocxDocument
+│   ├── viewer.ts        DocxViewer
+│   ├── types.ts         モデル型（Rust 出力と 1:1）
+│   ├── layout/          ページネーション・レイアウト
+│   ├── line-breaker/    行分割
+│   ├── paint/           Canvas 描画
+│   ├── render-worker.ts レンダーワーカー
+│   └── wasm/            wasm-pack 出力（生成物・git 管理対象外）
+├── public/demo/         追跡対象の demo サンプル（sample-1.docx）
+├── public/private/docx/ ローカル専用の private コーパス（git 管理対象外）
+└── tests/visual/        Playwright spec（visual.spec.ts, conformance.spec.ts, …）
+    └── references/demo/<name>/page-N.png + scores.json
+                         採用済みレンダラー出力（Word export ではない）。自動更新禁止。
 ```
 
-## WASM ビルド手順
+## WASM ビルド
 
 ```bash
-cd packages/docx && npm run wasm
-# または
-cd packages/docx/parser && wasm-pack build --target web --out-dir ../src/wasm
+pnpm --filter @silurus/ooxml-docx wasm
 ```
 
-## テスト実行
+`parser/` で `wasm-pack build --target web --out-dir ../src/wasm` を実行し、
+続けて `scripts/append-wasm-reinit.mjs` を適用する。
 
-```bash
-npx playwright test packages/docx/tests/visual
-```
+## テスト
+- ユニットテスト: ルートで `pnpm test`（vitest）。
+- VRT: `pnpm --filter @silurus/ooxml-docx vrt` / `vrt:private` / `vrt:fidelity` /
+  `conformance`。ベースライン用の環境変数はルート `AGENTS.md` を参照。
+- Storybook はルートで `pnpm storybook`。
 
-## ヒューリスティック禁止 (root CLAUDE.md と整合)
+## ヒューリスティック禁止（ルート `AGENTS.md` の OOXML Implementation Policy と整合）
 
 DOCX 描画では特に anchor / wgp / docGrid / ruby 周りでヒューリスティックを入れたくなる場面が多い。以下を遵守すること:
 

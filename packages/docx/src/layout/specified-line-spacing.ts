@@ -17,7 +17,13 @@ function referenceSourceAdmitted(segment: LayoutTextSeg): boolean {
  * do not establish the homogeneous matrix's rule, even on their ASCII-only
  * physical lines. Keeping admission paragraph-wide also avoids quadratic
  * rescans of source runs for long wrapped paragraphs. */
-export function specifiedTextParagraphIsHomogeneous(paragraph: ParagraphLayoutSource): boolean {
+export function specifiedTextParagraphIsHomogeneous(paragraph: ParagraphLayoutSource, gridActive = false): boolean {
+  // One face for all text runs. Without a document grid the paragraph mark may
+  // name another face of the same size: Windows Word 16.0 #1884 controls
+  // (Times New Roman 12pt text, Arial 12pt mark) keep the same partition as
+  // the homogeneous controls. Grid paragraphs keep the homogeneous admission.
+  const textFamily = gridActive ? paragraph.defaultFontFamily
+    : paragraph.runs.find((run) => run.type === 'text')?.fontFamily ?? paragraph.defaultFontFamily;
   return paragraph.runs.every(run => {
     if (run.type === 'field' || run.type === 'math') return false;
     if (run.type !== 'text') return true;
@@ -25,20 +31,25 @@ export function specifiedTextParagraphIsHomogeneous(paragraph: ParagraphLayoutSo
       || run.underline || run.strikethrough || run.hyperlink || run.vertAlign
       || run.position || run.smallCaps || run.allCaps || run.ruby
       || run.charSpacing || (run.charScale !== undefined && run.charScale !== 100)
-      || (run.fontFamily ?? paragraph.defaultFontFamily) !== paragraph.defaultFontFamily
+      || (run.fontFamily ?? paragraph.defaultFontFamily) !== textFamily
       || run.fontSize !== paragraph.defaultFontSize) return false;
     const fontAxes: ParagraphTextBearingRun = run;
-    for (const axis of ['fontFamilyHighAnsi', 'fontFamilyEastAsia', 'fontFamilyCs'] as const) {
-      if (fontAxes[axis] && fontAxes[axis] !== paragraph.defaultFontFamily) return false;
+    // ASCII-only text never selects the East Asian slot (§17.3.2.26); grid
+    // paragraphs keep the homogeneous check of every axis.
+    for (const axis of gridActive
+      ? ['fontFamilyHighAnsi', 'fontFamilyEastAsia', 'fontFamilyCs'] as const
+      : ['fontFamilyHighAnsi', 'fontFamilyCs'] as const) {
+      if (fontAxes[axis] && fontAxes[axis] !== textFamily) return false;
     }
     return true;
   });
 }
 
 /** Evidence gate for the ordinary Latin class in WORD_SPECIFIED_TEXT_LINE_BOX.
- * Other scripts, mixed faces/sizes, transformed runs, inline objects, ruby,
- * numbering, decorated text, differing paragraph marks and non-native resources
- * retain their existing allocation. The authored reference is metadata policy,
+ * Other scripts, mixed text faces/sizes, transformed runs, inline objects,
+ * ruby, decorated text, paragraph marks of another size and non-native
+ * resources retain their existing allocation. Numbered lines and marks of
+ * another face at the same size were measured on Windows (#1884). The authored reference is metadata policy,
  * not proof of an installed paint face. A positively loaded local FontFace
  * installed alias is the same authored-face class as the native route; its selected
  * source and authored name come from the resolver, never CSS-name inference.
@@ -55,6 +66,8 @@ export function specifiedTextLineMetrics(
   mode: number | undefined,
   vertical = false,
   markShape?: NumberingMarkerShapeInput,
+  /** Normal box of a first line a taller numbering marker raised. */
+  markerRaisedNormalPt?: number,
 ): Readonly<{ advancePt: number; baselineOffsetPt: number }> | null {
   const spacing = context.lineSpacing;
   if ((mode !== 14 && mode !== 15) || vertical || context.hasRuby
@@ -108,13 +121,21 @@ export function specifiedTextLineMetrics(
   if (paragraphMark && (paragraphMark.weight !== 400 || paragraphMark.style !== 'normal'
     || paragraphMark.complexScript)) return null;
   const authoredFamily = first?.authoredFontFamily ?? first?.fontFamily;
-  if (!first || mark.defaultFontFamily !== authoredFamily
-    || mark.defaultFontSize !== first.fontSize || first.fontSize <= 0
+  if (!first || mark.defaultFontSize !== first.fontSize || first.fontSize <= 0
     || !Number.isFinite(first.fontSize)) return null;
   if (paragraphMark) {
     if (paragraphMark.fontSizePt !== first.fontSize) return null;
-    for (const family of Object.values(paragraphMark.fonts)) {
-      if (family && family !== authoredFamily) return null;
+  }
+  // The #1884 controls that admitted numbered lines and marks of another face
+  // were mode 15 without a document grid; other paragraphs keep the
+  // homogeneous admission.
+  if (context.lineGrid.active || mode !== 15) {
+    if ('numbering' in mark && (mark as { numbering?: unknown }).numbering) return null;
+    if (mark.defaultFontFamily !== authoredFamily) return null;
+    if (paragraphMark) {
+      for (const family of Object.values(paragraphMark.fonts)) {
+        if (family && family !== authoredFamily) return null;
+      }
     }
   }
   // Host-face/style changes were not part of the homogeneous controls.
@@ -123,13 +144,17 @@ export function specifiedTextLineMetrics(
       && ((segment.authoredFontFamily ?? segment.fontFamily) !== authoredFamily
         || segment.bold || segment.italic || !referenceSourceAdmitted(segment))) return null;
   }
-  const profile = referenceFontLineMetrics(authoredFamily, 400, 'normal');
+  // Ordinary installed faces retain their measured host normal box; the
+  // homogeneous native/local gate above excludes unrelated caller resources.
+  const profile = first.resolvedLineHeightRatio != null && first.resolvedDesignDescentRatio != null
+    ? { lineHeightRatio: first.resolvedLineHeightRatio, designDescentRatio: first.resolvedDesignDescentRatio }
+    : referenceFontLineMetrics(authoredFamily, 400, 'normal');
   if (!profile) return null;
   return wordSpecifiedTextLineMetrics({
     rule: spacing.rule,
     value: spacing.value,
     descentPt: profile.designDescentRatio * first.fontSize,
-    singlePt: profile.lineHeightRatio * first.fontSize,
+    singlePt: Math.max(profile.lineHeightRatio * first.fontSize, markerRaisedNormalPt ?? 0),
     pitchPt: context.lineGrid.active ? context.lineGrid.pitchPt : null,
   });
 }

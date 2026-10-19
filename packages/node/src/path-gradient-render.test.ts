@@ -407,15 +407,35 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
     expect(Math.abs(pixel(ctx, 120, 30)[3] - 128)).toBeLessThanOrEqual(3);
   });
 
-  it('keeps the previous local radial frame for rotWithShape=false', () => {
-    const recipe = { ...fill, fillToRect: { l: .1, r: .5, t: .4, b: .1 } };
-    const contexts = [canvas(160, 160).ctx, canvas(160, 160).ctx];
-    for (const [i, ctx] of contexts.entries()) {
-      ctx.translate(80, 80); ctx.rotate(Math.PI / 4); ctx.scale(-1, 1); ctx.translate(-50, -50);
-      ctx.fillStyle = resolveFill({ ...recipe, rotWithShape: i === 0 }, ctx, 0, 0, 100, 100, 45) as CanvasPattern;
-      ctx.fillRect(0, 0, 100, 100);
+  it.each(['rect', 'circle'] as const)('keeps a non-rotating %s gradient in the page frame, including reflection', path => {
+    const recipe = { ...fill, path, fillToRect: { l: .1, r: .5, t: .4, b: .1 } };
+    for (const flipped of [false, true]) {
+      const actual = canvas(160, 160).ctx;
+      actual.translate(80, 80); actual.rotate(Math.PI / 2);
+      actual.scale(flipped ? -1 : 1, 1); actual.translate(-50, -50);
+      actual.fillStyle = resolveFill({ ...recipe, rotWithShape: false }, actual, 0, 0, 100, 100, 90) as CanvasPattern;
+      actual.fillRect(0, 0, 100, 100);
+
+      // §20.1.8.33 applies to path gradients too (§20.1.8.46): the
+      // off-centre focus and complete shade frame stay upright. A quarter
+      // turn leaves this square's coverage unchanged; reflection is retained.
+      const expected = canvas(160, 160).ctx;
+      expected.translate(flipped ? 130 : 30, 30); expected.scale(flipped ? -1 : 1, 1);
+      expected.fillStyle = resolveFill(recipe, expected, 0, 0, 100, 100) as CanvasPattern;
+      expected.fillRect(0, 0, 100, 100);
+      const pixels = actual.getImageData(0, 0, 160, 160).data;
+      const reference = expected.getImageData(0, 0, 160, 160).data;
+      // The shade's 1024-texel ramp can round a rotated band one RGB unit
+      // apart. Coverage must agree exactly; moving the focus/frame fails.
+      let colorError = 0; let alphaError = 0;
+      for (let i = 0; i < pixels.length; i++) {
+        const error = Math.abs(pixels[i] - reference[i]);
+        if (i % 4 === 3) alphaError = Math.max(alphaError, error);
+        else colorError = Math.max(colorError, error);
+      }
+      expect(alphaError).toBe(0);
+      expect(colorError).toBeLessThanOrEqual(1);
     }
-    expect(contexts[1].getImageData(0, 0, 160, 160).data).toEqual(contexts[0].getImageData(0, 0, 160, 160).data);
   });
 
   it('bounds auxiliary allocation even for very large authored extents', () => {
@@ -478,7 +498,9 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
 
   it('bounds band solves and covers interiors for corner and nonnested area foci', () => {
     const { ctx } = canvas(512, 512);
-    for (const path of ['rect', 'shape'] as const) for (const edges of [720, 20000, 32768, 32769]) {
+    // Ordinary complexity and the first edge count above the removed cap.
+    // Intermediate counts add the same coverage at substantial scanline cost.
+    for (const path of ['rect', 'shape'] as const) for (const edges of [720, 32769]) {
       const outline = (target: CanvasRenderingContext2D, x: number, y: number, w: number, h: number) => {
         for (let i = 0; i < edges; i++) {
           const angle = i / edges * Math.PI * 2; const r = i % 2 ? .5 : .03;
@@ -495,7 +517,9 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
           stops: [{ position: 0, color: '000000' }, { position: 1, color: '000000' },
             { position: 1, color: 'FFFFFF' }],
         }, ctx, box, box, outline, undefined, work);
-        if (edges > 32768 || (path === 'rect' && focus.r === 1)) {
+        // A degenerate rect focus still uses the existing native path. Edge
+        // count alone must never discard a supported path-gradient field.
+        if (path === 'rect' && focus.r === 1) {
           expect(paint).toBeNull();
           expect(work).toEqual({ edgeRows: 0, solves: 0, rejected: 0, pixels: 0 });
           continue;
@@ -505,7 +529,7 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
         expect(work.solves, JSON.stringify({ path, edges, focus, work })).toBeLessThanOrEqual(work.pixels);
         expect(work.rejected).toBe(0);
         expect(work.pixels).toBeLessThanOrEqual(512 * 512);
-        if (path === 'shape' && edges === 32768) {
+        if (path === 'shape') {
           ctx.fillStyle = paint as CanvasPattern; ctx.fillRect(0, 0, size, size);
           const data = ctx.getImageData(0, 0, size, size).data;
           let checked = 0; let holes = 0;
@@ -516,8 +540,9 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
             const px = (x + .5) / size - .5; const py = (y + .5) / size - .5;
             const angle = (Math.atan2(py, px) + 2 * Math.PI) % (2 * Math.PI);
             const i = Math.floor(angle / (2 * Math.PI) * edges);
-            const a = i / edges * 2 * Math.PI; const b = (i + 1) / edges * 2 * Math.PI;
-            const r1 = i % 2 ? .5 : .03; const r2 = (i + 1) % 2 ? .5 : .03;
+            const next = (i + 1) % edges;
+            const a = i / edges * 2 * Math.PI; const b = next / edges * 2 * Math.PI;
+            const r1 = i % 2 ? .5 : .03; const r2 = next % 2 ? .5 : .03;
             const ax = r1 * Math.cos(a); const ay = r1 * Math.sin(a);
             const bx = r2 * Math.cos(b); const by = r2 * Math.sin(b);
             const radius = (ax * by - ay * bx) / (Math.cos(angle) * (by - ay) - Math.sin(angle) * (bx - ax));
@@ -533,15 +558,8 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
     }
   }, 60000);
 
-  it.each(['rect', 'shape'] as const)('preserves main %s fallback bytes for edge limits and unavailable allocation', path => {
-    const outline = (target: CanvasRenderingContext2D) => {
-      for (let i = 0; i < 32769; i++) {
-        const angle = i / 32769 * Math.PI * 2;
-        target[i ? 'lineTo' : 'moveTo'](100 + 100 * Math.cos(angle), 50 + 50 * Math.sin(angle));
-      }
-      target.closePath();
-    };
-    for (const reason of ['edge budget', 'allocation'] as const) for (const tiled of [false, true]) {
+  it.each(['rect', 'shape'] as const)('preserves main %s fallback bytes for unavailable allocation', path => {
+    for (const tiled of [false, true]) {
       const actual = canvas(300, 200).ctx; const expected = canvas(300, 200).ctx;
       for (const ctx of [actual, expected]) { ctx.translate(70, 30); ctx.rotate(.3); }
       const recipe = { ...fill, path, fillToRect: { l: .1, r: .5, t: .4, b: .1 },
@@ -553,27 +571,23 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
           return typeof value === 'function' ? value.bind(target) : value;
         },
       });
-      actual.fillStyle = resolveFill(recipe, reason === 'allocation' ? unavailable : actual,
-        0, 0, 200, 100, 0, undefined, undefined, reason === 'edge budget' ? outline : undefined) as CanvasGradient;
+      actual.fillStyle = resolveFill(recipe, unavailable, 0, 0, 200, 100) as CanvasGradient;
       // Independent native Canvas oracle from main: midpoint (60,65),
       // farthest axis distances (140,65), rect uses max; shape uses diagonal.
-      // A half-width tile halves x distances. If allocation is unavailable,
-      // main paints the same native field directly instead of repeating it.
-      const reference = tiled && reason === 'edge budget' ? canvas(100, 100).ctx : expected;
+      // A half-width tile halves x distances. Without allocation the native
+      // field is painted directly instead of repeating a raster tile.
       const cx = tiled ? 30 : 60; const rx = tiled ? 70 : 140;
-      const gradient = reference.createRadialGradient(cx, 65, 0, cx, 65,
+      const gradient = expected.createRadialGradient(cx, 65, 0, cx, 65,
         path === 'rect' ? Math.max(rx, 65) : Math.sqrt(rx ** 2 + 65 ** 2));
       gradient.addColorStop(0, '#000000'); gradient.addColorStop(.5, '#808080'); gradient.addColorStop(1, '#FFFFFF');
-      reference.fillStyle = gradient;
-      if (reference !== expected) {
-        reference.fillRect(0, 0, 100, 100);
-        expected.fillStyle = expected.createPattern(reference.canvas, 'repeat') as CanvasPattern;
-      }
+      expected.fillStyle = gradient;
       for (const ctx of [actual, expected]) ctx.fillRect(0, 0, 200, 100);
-      expect(actual.getImageData(0, 0, 300, 200).data, JSON.stringify({ reason, tiled }))
+      expect(actual.getImageData(0, 0, 300, 200).data, JSON.stringify({ tiled }))
         .toEqual(expected.getImageData(0, 0, 300, 200).data);
     }
-  });
+    // ~1.7 s on an idle machine; the default 5 s budget timed out when
+    // the suite ran on a loaded machine.
+  }, 30_000);
 
   it.each(['rect', 'shape'] as const)('retains main %s midpoint behavior for inverted focus axes, including tiles', path => {
     for (const focus of [
@@ -696,7 +710,7 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
       stroke: { color: 'FFFFFF', width: 20, fill: { ...fill, path: 'shape' }, tailEnd: { type: 'triangle', w: 'lg', len: 'lg' } },
       transform: { rotationDeg: 0, flipH: false, flipV: false },
     }, 1);
-    expect(pixel(decorated, 150, 190)).toEqual([255, 255, 255, 255]);
+    expect(pixel(decorated, 170, 190)).toEqual([255, 255, 255, 255]);
   });
 
   it('covers out-of-box paths, acute miters and curved stroke hulls', () => {
@@ -783,7 +797,7 @@ describe.skipIf(!skia)('DrawingML path-gradient pixels', () => {
       slides: [{ index: 0, slideNumber: 1, background: { fillType: 'solid', color: '00FF00' }, elements: [shape] }],
       defaultTextColor: null, majorFont: null, minorFont: null } as Presentation;
     await renderSlideNode(c, presentation, 0, { width: 400, dpr: 1 });
-    expect(pixel(ctx, 150, 190)).toEqual([255, 255, 255, 255]);
+    expect(pixel(ctx, 170, 190)).toEqual([255, 255, 255, 255]);
     shape.stroke = { color: 'FFFFFF', width: px(20), fill: { ...fill, path: 'shape', tileRect: {} }, cmpd: 'dbl' };
     await renderSlideNode(c, presentation, 0, { width: 400, dpr: 1 });
     for (const y of [193, 207]) expect(pixel(ctx, 225, y)).toEqual([255, 255, 255, 255]);

@@ -17,7 +17,7 @@ import { computeChartFrame } from '../layout.js';
 import { automaticRadarMajorUnit, planNumericValueAxis } from '../axis-scale.js';
 import { axisLineWidthPx, resolveAxisLine } from '../axis-style.js';
 import { formatCategoryLabel } from '../chart-number-format.js';
-import { elideToWidth } from '../text-elide.js';
+import { axisLabelLineHeightPx, fillAuthoredText } from '../chart-text-lines.js';
 import { categoryLabelOffsetPx } from '../category-spacing.js';
 
 import { chartDataPointStyleRole, chartSeriesVariesByPoint } from '../effective-style.js';
@@ -54,11 +54,10 @@ export function renderRadarChart(
   // Shared frame (radial form). Radar uses title pads 0.035 / 0.035 and the
   // default 0.22 side-legend reserve (unlike pie's 0.28). Params keep pixels
   // unchanged.
-  const leg = measuredLegendReserve(ctx, chart, w, h, 0.22, ptToPx);
+  const leg = measuredLegendReserve(ctx, chart, w, h, ptToPx);
   const frame = computeChartFrame(chart, x, y, w, h, ptToPx, {
     titleTopPadFrac: 0.035,
     titleBottomPadFrac: 0.035,
-    legendSideReserveFrac: 0.22,
     legendReserve: leg,
     radialGapFrac: 0.02,
     honorPlotAreaManualLayout: true,
@@ -67,6 +66,9 @@ export function renderRadarChart(
   drawChartTitleForLayout(ctx, chart, x, y, w, h, y + frame.title.topPad, titleFontPx);
 
   const { px0: plotLeft, py0: plotTop, pw, ph } = frame.plotRect;
+  // A title band grown by authored lines can exhaust a small frame; paint no
+  // plot into a non-positive rectangle, as the cartesian families do.
+  if (!(pw > 0) || !(ph > 0)) return;
   paintPlotAreaFrame(
     ctx, chart, plotLeft, plotTop, pw, ph, ptToPx, shapeRotationDeg,
   );
@@ -85,6 +87,7 @@ export function renderRadarChart(
     && frame.plotAreaManualLayoutApplied;
   const rd = hasExplicitInnerSize
     ? Math.min(pw, ph) / 2
+    // Automatic radar radius (38 % of the plot): library policy (#11).
     : Math.min(pw, ph) * 0.38;
 
   let dataMin = Infinity;
@@ -196,7 +199,7 @@ export function renderRadarChart(
         chart.valAxisLineDash,
       );
       if (chart.valAxisTickLabelPos !== 'none') {
-        ctx.fillText(formatPrimaryValueAxisTick(chart, v, false), cx2 - 3, y);
+        fillAuthoredText(ctx, formatPrimaryValueAxisTick(chart, v, false), cx2 - 3, y, axisLabelLineHeightPx(valAxPx));
       }
     }
     if (needsMinorTicks) {
@@ -259,7 +262,7 @@ export function renderRadarChart(
     // §21.2.2.71: format numeric-serial categories via the category-axis
     // numFmt; string spoke labels pass through unchanged.
     const label = formatCategoryLabel((cats[i] ?? '').toString(), chart.catAxisFormatCode, chart.date1904);
-    ctx.fillText(elideToWidth(ctx, label, maxPx), lx, ly);
+    fillAuthoredText(ctx, label, lx, ly, axisLabelLineHeightPx(radarCatFontPx), maxPx);
   }
 
   // ECMA-376 §21.2.3.10 c:radarStyle — "filled" closes the polygon with a
@@ -272,6 +275,7 @@ export function renderRadarChart(
   const filled = markersSuppressedByChartStyle(
     'radar', chart.chartType, chart.scatterStyle, chart.radarStyle,
   );
+  // Marker radius fallback: library policy, unmeasured.
   const markerRadius = Math.max(2, rd * 0.025);
   for (let si = 0; si < chart.series.length; si++) {
     const s = chart.series[si];

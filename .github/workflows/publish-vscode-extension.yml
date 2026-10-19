@@ -34,7 +34,7 @@ jobs:
             packages/pptx/parser
             packages/xlsx/parser
             packages/docx/parser
-            packages/legacy-converter/parser
+            packages/legacy-office/parser
 
       - name: Install wasm-pack
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
@@ -69,15 +69,27 @@ jobs:
           --filter @silurus/ooxml-docx
           -r --workspace-concurrency=1 build
 
-      - name: Build extension bundle (esbuild --production)
-        working-directory: packages/vscode-extension
-        run: node esbuild.config.mjs --production
-
       # ── Package (.vsix) ────────────────────────────────────────────────────
       # --no-dependencies: extension is fully bundled by esbuild, no node_modules needed.
+      # `vsce package` always runs the extension's `vscode:prepublish` script
+      # (`node esbuild.config.mjs --production`) first, so this step builds the
+      # production bundle itself; a separate esbuild step would only repeat it.
       - name: Package VSIX
         working-directory: packages/vscode-extension
         run: pnpm exec vsce package --no-dependencies --out ooxml-viewer.vsix
+
+      # The webview needs every format's parser. Code-split chunks carry the
+      # DOCX and PPTX parser URLs, so check the packaged files, not the source.
+      - name: Verify the VSIX ships every parser WASM
+        working-directory: packages/vscode-extension
+        run: |
+          for format in docx xlsx pptx; do
+            unzip -l ooxml-viewer.vsix | grep -qE "extension/dist/assets/${format}_parser_bg-[^ ]+\.wasm$" \
+              || { echo "::error::VSIX lacks the ${format} parser WASM"; exit 1; }
+          done
+          if grep -qE '"(docx|xlsx|pptx)_parser_bg\.wasm"' dist/webview.js; then
+            echo "::error::webview.js references a parser WASM outside dist/assets"; exit 1
+          fi
 
       - name: Upload VSIX artifact
         uses: actions/upload-artifact@v7

@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { vi, afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { layoutDocument } from '../document-layout.js';
 import {
   installStubCanvas,
@@ -6,7 +6,7 @@ import {
   type SyntheticDocumentShape,
 } from '../testing/synthetic-document.js';
 import { layoutFingerprint } from './invariants.js';
-import { setDocumentLayoutValidation } from './validation-policy.js';
+import { setDocumentLayoutValidation } from '../testing/validation-policy.js';
 import type { DocumentLayout } from './types.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -67,3 +67,5 @@ describe('layout is identical with and without validation', () => {
     expect(Object.isFrozen(layout.pages[0].layers.body)).toBe(true);
   });
 });
+
+vi.mock('./validation-policy.js', () => ({ documentLayoutValidationEnabled: vi.fn(() => true) }));

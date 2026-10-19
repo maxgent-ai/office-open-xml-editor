@@ -5,6 +5,8 @@ const mocks = vi.hoisted(() => ({
   resolveBinaryPath: vi.fn(),
   enabled: 'always' as 'auto' | 'always' | 'never',
   trusted: true,
+  restrictToWorkspaceFolders: true,
+  workspaceFolders: [] as { uri: { scheme: string; fsPath: string } }[] | undefined,
 }));
 
 vi.mock('vscode', () => ({
@@ -23,10 +25,12 @@ vi.mock('vscode', () => ({
   },
   workspace: {
     get isTrusted() { return mocks.trusted; },
+    get workspaceFolders() { return mocks.workspaceFolders; },
     getConfiguration: () => ({
       get: (key: string, fallback: unknown) => {
         if (key === 'enabled') return mocks.enabled;
         if (key === 'binaryPath') return '';
+        if (key === 'restrictToWorkspaceFolders') return mocks.restrictToWorkspaceFolders;
         return fallback;
       },
     }),
@@ -56,6 +60,8 @@ describe('OoxmlMcpProvider selection bridge', () => {
   beforeEach(() => {
     mocks.enabled = 'always';
     mocks.trusted = true;
+    mocks.restrictToWorkspaceFolders = true;
+    mocks.workspaceFolders = [];
     mocks.resolveBinaryPath.mockReset().mockResolvedValue('/tmp/ooxml-mcp-server');
   });
 
@@ -83,6 +89,32 @@ describe('OoxmlMcpProvider selection bridge', () => {
       },
       version: '0.77.0',
     });
+  });
+
+  it('confines file tools to the local workspace folders unless the user opts out', async () => {
+    mocks.workspaceFolders = [
+      { uri: { scheme: 'file', fsPath: '/work/a' } },
+      { uri: { scheme: 'vscode-remote', fsPath: '/remote/b' } },
+      { uri: { scheme: 'file', fsPath: '/work/c:d' } },
+    ];
+    const provider = new OoxmlMcpProvider(
+      { extension: { packageJSON: { version: '0.77.0' } } } as never,
+      { environment: vi.fn().mockResolvedValue({}) } as never,
+    );
+
+    const [scoped] = await provider.provideMcpServerDefinitions({} as never);
+    expect(scoped).toMatchObject({
+      args: ['--allowed-root', '/work/a', '--allowed-root', '/work/c:d'],
+    });
+
+    mocks.restrictToWorkspaceFolders = false;
+    const [unscoped] = await provider.provideMcpServerDefinitions({} as never);
+    expect(unscoped).toMatchObject({ args: [] });
+
+    mocks.restrictToWorkspaceFolders = true;
+    mocks.workspaceFolders = undefined;
+    const [noFolder] = await provider.provideMcpServerDefinitions({} as never);
+    expect(noFolder).toMatchObject({ args: [] });
   });
 
   it('does not start the bridge when MCP registration is disabled', async () => {

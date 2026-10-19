@@ -1,6 +1,5 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { PptxViewer } from './viewer.js';
-import { PptxScrollViewer } from './scroll-viewer.js';
 import { PptxPresentation } from './presentation.js';
 import {
   installDom,

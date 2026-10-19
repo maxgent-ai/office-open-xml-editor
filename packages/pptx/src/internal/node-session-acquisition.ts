@@ -6,6 +6,9 @@ import {
 import { normalizePresentationBootstrap } from '../presentation-preflight.js';
 import type { PptxSlideCursorArchive } from '../slide-cursor-operation.js';
 import type { PresentationBootstrap } from '../worker-protocol.js';
+import { throwIfAborted } from '@silurus/ooxml-core/internal/abort';
+
+const ABORT_MESSAGE = 'PPTX presentation session was aborted';
 
 export interface PptxNodeAcquisitionOptions {
   readonly resourceLimits?: import('@silurus/ooxml-core').OoxmlResourceLimits;
@@ -70,11 +73,11 @@ export function acquirePptxSessionFromArchive(
       emitToConsole: resourceOptions.debug,
     });
     if (!existingMetrics) metrics.setSourceBytes(source.sourceByteLength);
-    throwIfAborted(options.signal);
+    throwIfAborted(options.signal, ABORT_MESSAGE);
     const bootstrap = normalizePresentationBootstrap(JSON.parse(
       new TextDecoder().decode(source.archive.presentation_bootstrap()),
     ) as PresentationBootstrap);
-    throwIfAborted(options.signal);
+    throwIfAborted(options.signal, ABORT_MESSAGE);
     metrics.checkpoint('presentation bootstrap ready');
     return { archive: source.archive, bootstrap, metrics, closeArchive };
   } catch (error) {
@@ -83,11 +86,4 @@ export function acquirePptxSessionFromArchive(
     metrics?.fail(normalized);
     throw normalized;
   }
-}
-
-function throwIfAborted(signal: AbortSignal | undefined): void {
-  if (!signal?.aborted) return;
-  const error = new Error('PPTX presentation session was aborted');
-  error.name = 'AbortError';
-  throw error;
 }

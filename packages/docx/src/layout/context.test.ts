@@ -116,57 +116,49 @@ function ids(occurrences: readonly BodySectionOccurrence[]): string[] {
   return occurrences.map((occurrence) => occurrence.sectionOccurrenceId);
 }
 
-describe('native section flow normalization', () => {
-  const nativeMarker = (textDirection: string | null, nativeTextFlow?: number): BodyElement => ({
+describe('section flow normalization', () => {
+  const flowMarker = (textDirection: string | null, sectionFlow?: string): BodyElement => ({
     type: 'sectionBreak',
     kind: 'nextPage',
     columns: null,
     textDirection,
     pageNumType: null,
     __sectionPlacement: {
-      sectionId: 'section:native',
+      sectionId: 'section:flow',
       vAlign: null,
       lineNumbering: null,
-      ...(nativeTextFlow === undefined ? {} : { nativeTextFlow }),
+      ...(sectionFlow === undefined ? {} : { sectionFlow }),
     },
   }) as unknown as BodyElement;
-  const withFinalWire = (doc: DocxDocumentModel, nativeTextFlow: number): DocxDocumentModel => {
-    (doc.section as unknown as Record<string, unknown>).__sectionPlacement = {
-      sectionId: 'section:final', vAlign: null, lineNumbering: null, nativeTextFlow,
-    };
-    return doc;
-  };
 
-  it('normalizes only the native BtoT fact, per section, without retaining the raw wire', () => {
-    const doc = withFinalWire(document(
-      [paragraph('a'), nativeMarker('btLr', 2), paragraph('b')],
+  it('normalizes the section flow fact per section', () => {
+    const doc = document(
+      [paragraph('a'), flowMarker('btLr', 'bottomToTop'), paragraph('b')],
       { textDirection: 'btLr' },
-    ), 3);
+    );
     const { occurrences } = bodySectionIndexInput(doc);
-    expect(occurrences.map((occurrence) => occurrence.nativeSectionFlow ?? null))
+    expect(occurrences.map((occurrence) => occurrence.sectionFlow ?? null))
       .toEqual(['bottomToTop', null]);
     expect(occurrences.map((occurrence) => occurrence.textDirection)).toEqual(['btLr', 'btLr']);
-    expect(JSON.stringify(occurrences)).not.toContain('nativeTextFlow');
   });
 
   it.each(['btLr', 'bottomToTop', 'sideways-lr'])
-    ('never derives the native frame from an authored %s token', (textDirection) => {
+    ('never derives the counter-clockwise frame from an authored %s token', (textDirection) => {
       const doc = document(
-        [paragraph('a'), nativeMarker(textDirection), paragraph('b')],
+        [paragraph('a'), flowMarker(textDirection), paragraph('b')],
         { textDirection },
       );
       for (const occurrence of bodySectionIndexInput(doc).occurrences) {
-        expect(occurrence.nativeSectionFlow).toBeUndefined();
+        expect(occurrence.sectionFlow).toBeUndefined();
       }
     });
 
   it.each([
-    ['tbRl', 2],
-    [null, 3],
-    ['btLr', 4],
-    ['btLr', 6],
-  ] as const)('rejects a native wire whose direction is %s for raw flow %i', (textDirection, raw) => {
-    const doc = document([paragraph('a'), nativeMarker(textDirection, raw), paragraph('b')]);
+    ['tbRl', 'bottomToTop'],
+    [null, 'bottomToTop'],
+    ['btLr', 'topToBottom'],
+  ] as const)('rejects a wire whose direction is %s for section flow %s', (textDirection, flow) => {
+    const doc = document([paragraph('a'), flowMarker(textDirection, flow), paragraph('b')]);
     expect(() => bodySectionIndexInput(doc)).toThrow(TypeError);
   });
 });

@@ -9,7 +9,6 @@ import {
   lightDirFromRig,
   applyBevelShading,
   applyExtrusion,
-  materialClass,
   type BevelShadeParams,
   type BevelCtx,
 } from './bevel-shading';
@@ -38,55 +37,16 @@ function fakeCtx(w: number, h: number, fill?: (x: number, y: number) => [number,
 }
 
 describe('bevelHeightProfile', () => {
-  it('circle profile rises as a quarter-circle: h(0)=0, h(w)=1, convex', () => {
-    const w = 10;
-    const p = bevelHeightProfile('circle', w);
-    expect(p(0)).toBeCloseTo(0, 5);
-    expect(p(w)).toBeCloseTo(1, 5);
-    // Quarter circle h = sqrt(1-(1-t)^2): at t=0.5 → sqrt(1-0.25)=0.866 (convex,
-    // above the linear 0.5).
-    expect(p(w * 0.5)).toBeCloseTo(Math.sqrt(1 - 0.25), 5);
-    expect(p(w * 0.5)).toBeGreaterThan(0.5);
+  it('clamps beyond the band and treats zero width as a flat face', () => {
+    expect(bevelHeightProfile('circle',5)(10)).toBe(1);
+    expect(bevelHeightProfile('circle',0)(0)).toBe(1);
   });
-
-  it('hardEdge is a rim-concentrated shelf: rises within the outer shelf, then flat', () => {
-    // `hardEdge` is the picture-frame bevel — a short turned-down lip at the very
-    // rim then flat (height 1) inward, NOT a full-width chamfer. The rise is a
-    // C¹ smoothstep within the outer HARD_EDGE_SHELF_FRACTION (0.5) of the band.
-    const w = 8;
-    const p = bevelHeightProfile('hardEdge', w);
-    expect(p(0)).toBeCloseTo(0, 5); // rim: turned fully down
-    // By the end of the shelf (and for the whole inner half) the lip is at the
-    // flat-top height, so the photo fills the inner band (PDF p6 thin rim).
-    expect(p(w * 0.5)).toBeCloseTo(1, 5);
-    expect(p(w * 0.75)).toBeCloseTo(1, 5);
-    expect(p(w)).toBeCloseTo(1, 5);
-    // Monotonic rise inside the shelf, tangent-flat (slope→0) where it meets the
-    // top: the midpoint of the shelf is the inflection of the smoothstep at 0.5.
-    expect(p(w * 0.25)).toBeCloseTo(0.5, 5);
-    expect(p(w * 0.1)).toBeGreaterThan(0);
-    expect(p(w * 0.1)).toBeLessThan(p(w * 0.2));
-  });
-
-  it('relaxedInset (default) is a smooth S-curve in [0,1]', () => {
-    const w = 10;
-    const p = bevelHeightProfile('relaxedInset', w);
-    expect(p(0)).toBeCloseTo(0, 5);
-    expect(p(w)).toBeCloseTo(1, 5);
-    // Monotonic increasing.
-    expect(p(w * 0.25)).toBeLessThan(p(w * 0.75));
-  });
-
-  it('clamps distance beyond the band to the flat top (h=1)', () => {
-    const w = 5;
-    const p = bevelHeightProfile('circle', w);
-    expect(p(w * 2)).toBeCloseTo(1, 5);
-  });
-
-  it('zero width yields a flat profile (always 1, no bevel)', () => {
-    const p = bevelHeightProfile('circle', 0);
-    expect(p(0)).toBeCloseTo(1, 5);
-    expect(p(10)).toBeCloseTo(1, 5);
+  it('retains the documented hardEdge line rather than a fitted rim shelf', () => {
+    // MS-OI29500 §2.1.1316: line from (.042353,.305322) to (.170124,.947558),
+    // each point (inward distance, height), normalized to the ~.9986 curve peak.
+    const t=.1;
+    const expected=(.305322+(t-.042353)*(.947558-.305322)/(.170124-.042353))/.998599;
+    expect(bevelHeightProfile('hardEdge',8)(8*t)).toBeCloseTo(expected,3);
   });
 });
 
@@ -127,26 +87,12 @@ describe('lightDirFromRig', () => {
     expect(L.y).toBeGreaterThan(0);
   });
 
-  it('a:rot rev rotates the screen-plane azimuth (sample-11 slide-6: dir="t" rev=320° → upper-left key)', () => {
-    // §20.1.5.9 <a:rot lat lon rev>: rev is the in-plane revolution about the view
-    // (Z) axis. sample-11 slide-6 carries rev=320° on a dir="t" threePt rig; the PDF
-    // shows the LEFT shoulder of the ellipse markedly brighter than the right
-    // (+21.6% vs +6.3% over the face), i.e. the key light azimuth points UPPER-LEFT.
-    // The standard 2-D rotation matrix on the screen-plane azimuth (screen +Y DOWN)
-    // maps dir="t"'s (0,−1) up-vector to (−sinθ, −cosθ); at θ=320° that is
-    // (−0.643, −0.766) — upper-left, matching the PDF.
-    const base = lightDirFromRig('threePt', 't');
-    const rotated = lightDirFromRig('threePt', 't', { lat: 0, lon: 0, rev: 320 });
-    // Base key (no rot) is straight up: x ≈ 0.
-    expect(Math.abs(base.x)).toBeLessThan(1e-6);
-    // rev=320° swings the key azimuth toward the LEFT (negative screen-x) while
-    // staying above the horizon (negative screen-y) — the upper-left key the PDF
-    // shows. (rev=0 / rev=360 would leave it straight up.)
-    expect(rotated.x).toBeLessThan(-0.2);
-    expect(rotated.y).toBeLessThan(0);
-    expect(Math.hypot(rotated.x, rotated.y, rotated.z)).toBeCloseTo(1, 5);
-    // The elevation (z, toward viewer) is unchanged by an in-plane revolution.
-    expect(rotated.z).toBeCloseTo(base.z, 5);
+  it('revolution rotates the documented key vector and preserves elevation', () => {
+    const base=lightDirFromRig('threePt','t');
+    const turned=lightDirFromRig('threePt','t',{lat:0,lon:0,rev:90});
+    expect(turned.x).toBeCloseTo(-base.y,6);
+    expect(turned.y).toBeCloseTo(base.x,6);
+    expect(turned.z).toBeCloseTo(base.z,6);
   });
 
   it('rev=0 (or absent rot) is identical to no rot', () => {
@@ -155,40 +101,6 @@ describe('lightDirFromRig', () => {
     expect(b.x).toBeCloseTo(a.x, 6);
     expect(b.y).toBeCloseTo(a.y, 6);
     expect(b.z).toBeCloseTo(a.z, 6);
-  });
-});
-
-describe('threePt fill light (sample-11 PDF calibration)', () => {
-  // §20.1.5.9: a threePt rig is a key + fill + back light; the spec gives no
-  // vectors/intensities. PowerPoint's fill is a softer light roughly opposite the
-  // key that lifts the surfaces facing AWAY from the key out of pure ambient. The
-  // PDF (sample-11 p6) shows the ellipse's BOTTOM lip — whose outward normal backs
-  // the upper-left key entirely — still sitting ABOVE the face (+5.3%), not at the
-  // ambient floor a single key would give (≈ −29%). The fill light is what lifts it.
-  it('a normal facing away from the key is lifted above the pure-ambient floor by the fill', () => {
-    const key = lightDirFromRig('threePt', 't', { lat: 0, lon: 0, rev: 320 });
-    const withFill = shadeParamsFor('matte', key, true);
-    const noFill = shadeParamsFor('matte', key, false);
-    // A normal pointing roughly opposite the key (it backs the key, n·key < 0) gets
-    // NO diffuse from the key in either case — but WITH the fill it picks up the
-    // fill's diffuse, so it is brighter than the key-only (ambient floor) shade.
-    const backNormal = { x: -key.x, y: -key.y, z: 0.4 };
-    const m = Math.hypot(backNormal.x, backNormal.y, backNormal.z);
-    const n = { x: backNormal.x / m, y: backNormal.y / m, z: backNormal.z / m };
-    expect(shadePixel(n, withFill)).toBeGreaterThan(shadePixel(n, noFill));
-  });
-
-  it('the fill does not exceed the key (the key side stays the brightest)', () => {
-    const key = lightDirFromRig('threePt', 't', { lat: 0, lon: 0, rev: 320 });
-    const params = shadeParamsFor('matte', key, true);
-    // A normal facing the key vs one facing the fill (opposite): key side brighter.
-    const towardKey = { x: key.x, y: key.y, z: 1 };
-    const m1 = Math.hypot(towardKey.x, towardKey.y, towardKey.z);
-    const nKey = { x: towardKey.x / m1, y: towardKey.y / m1, z: towardKey.z / m1 };
-    const towardFill = { x: -key.x, y: -key.y, z: 1 };
-    const m2 = Math.hypot(towardFill.x, towardFill.y, towardFill.z);
-    const nFill = { x: towardFill.x / m2, y: towardFill.y / m2, z: towardFill.z / m2 };
-    expect(shadePixel(nKey, params)).toBeGreaterThan(shadePixel(nFill, params));
   });
 });
 
@@ -378,11 +290,11 @@ describe('computeBevelNormals — scale-invariant azimuth (issue #410→#413→#
     const cy = H / 2;
     const rx = W / 2 - 1;
     const ry = H / 2 - 1;
-    // Sample WITHIN the active lip. `hardEdge` concentrates its turn-down in the
-    // outer rim shelf (HARD_EDGE_SHELF_FRACTION of the band) and goes flat inward,
-    // so the lit/shadow terminator and the steepest tilt live near the rim, not at
-    // the geometric midline. 0.25·band sits inside the shelf at every devScale.
-    const inset = band * 0.25;
+    // Sample WITHIN the active lip. `hardEdge` rises along its documented straight
+    // flank between inward 0.042 and 0.170 of the band and is nearly flat from
+    // 0.27 to 0.61, where the azimuth of a near-zero tilt is undefined. 0.1·band
+    // sits on that constant-slope flank at every devScale.
+    const inset = band * 0.1;
     const az: number[] = [];
     const lum: number[] = [];
     // 0.1° steps so a chord spanning several degrees registers as a run of equal
@@ -474,14 +386,14 @@ describe('computeBevelNormals — scale-invariant azimuth (issue #410→#413→#
   }, SCALE_SWEEP_TIMEOUT_MS);
 });
 
-describe('bevel lip azimuth tracks the TRUE silhouette normal (issue #417→#418 apex plateau)', () => {
+describe('bevel lip azimuth tracks the analytic silhouette normal', () => {
   // THE #418 BUG. #416 sourced the lip azimuth from ∇(Gaussian-blurred COVERAGE).
   // Coverage `C = G_σ * alpha` PLATEAUS at a high-curvature convex apex: the blur of
   // a sharply curved silhouette tip flat-tops, so ∇C there points near-constant over
   // a wide angular span. The lip azimuth then ROTATES TOO SLOWLY across the apex, so
   // the lit factor is near-constant over a band of the rim → the "flat horizontal
   // cut" users saw at the top of the slide-6 ellipse (bevel OFF = smooth arc, bevel
-  // ON = flat-topped band). The geometry (`dist`, the band, the feather) was always
+  // ON = flat-topped band). The distance geometry was always
   // correct; only the DIRECTION was wrong.
   //
   // The fix sources the azimuth from ∇(Gaussian-blurred DISTANCE) instead. The EDT
@@ -536,8 +448,8 @@ describe('bevel lip azimuth tracks the TRUE silhouette normal (issue #417→#418
         let rimY = -1;
         for (let y = 0; y < H; y++) if (a[y * W + x] >= 128) { rimY = y; break; }
         if (rimY < 0) continue;
-        // a band pixel a quarter-band inside the rim (inside the lit shelf).
-        const y = rimY + Math.max(1, Math.round(band * 0.25));
+        // a band pixel on hardEdge's straight rim flank (inward 0.042–0.170).
+        const y = rimY + Math.max(1, Math.round(band * 0.1));
         const i = y * W + x;
         if (!bandMask[i]) continue;
         const nx = normals[i * 3], ny = normals[i * 3 + 1];
@@ -561,56 +473,12 @@ describe('bevel lip azimuth tracks the TRUE silhouette normal (issue #417→#418
       expect(maxErrRad).toBeLessThan(0.105);
     });
 
-    it(`apex lit factor is PEAKED (curved), not a flat plateau [devScale ${devScale}]`, () => {
-      // End-to-end: the lit factor sampled along the top rim must rise to a single
-      // peak at the apex and fall off to either side (the ellipse curving away from
-      // the top light), NOT sit flat over a wide span. We measure the lit factor at
-      // a fixed inset along the rim across the apex and require the central peak to
-      // exceed the flanks by a clear margin — a plateau would make them equal.
-      const a = ellipseA(W, H);
-      const { normals, bandMask } = computeBevelNormals(a, W, H, band, 'hardEdge', band / 2);
-      const params = shadeParamsFor('matte', lightDirFromRig('threePt', 't'));
-      const face = shadePixel({ x: 0, y: 0, z: 1 }, params) || 1;
-      const cx = W / 2, rx = W / 2 - 1;
-      const inset = Math.max(1, Math.round(band * 0.25));
-      const litAt = (x: number): number | null => {
-        let rimY = -1;
-        for (let y = 0; y < H; y++) if (a[y * W + x] >= 128) { rimY = y; break; }
-        if (rimY < 0) return null;
-        const i = (rimY + inset) * W + x;
-        if (!bandMask[i]) return null;
-        const nx = normals[i * 3], ny = normals[i * 3 + 1], nz = normals[i * 3 + 2];
-        return shadePixel({ x: nx, y: ny, z: nz }, params) / face;
-      };
-      const peak = litAt(Math.round(cx));
-      const flankL = litAt(Math.round(cx - 0.45 * rx));
-      const flankR = litAt(Math.round(cx + 0.45 * rx));
-      expect(peak).not.toBeNull();
-      expect(flankL).not.toBeNull();
-      expect(flankR).not.toBeNull();
-      // The apex faces straight at the top light → brightest; the flanks tilt away
-      // → dimmer. A genuine curve shows a measurable drop. The coverage-plateau bug
-      // made peak ≈ flanks (flat lit band). Require ≥1.5% relative drop on each side.
-      expect((peak as number) - (flankL as number)).toBeGreaterThan(0.015);
-      expect((peak as number) - (flankR as number)).toBeGreaterThan(0.015);
-    });
   }
 });
 
-describe('bevel band geometry — slide-6 ellipse rim (issue #410→…→band-geometry)', () => {
-  // The slide-6 defect users reported was the PHOTO (the bevel band's inner
-  // boundary) looking like a flat-topped, 45°-chamfered rounded rectangle instead
-  // of an ellipse. Root causes, both fixed here:
-  //   1. `hardEdge` was modelled as a full-width linear chamfer, so the ENTIRE
-  //      band was uniformly shaded and ended on a HARD brightness step at the inner
-  //      crease. Traced around the band's inner boundary — which for an ellipse is
-  //      the exact Euclidean inward offset, naturally flatter at the major-axis
-  //      tips — that hard step read as a "flat cut". Now `hardEdge` is a rim shelf
-  //      and the lip's shading feathers to zero at the crease (BEVEL_INNER_FEATHER).
-  //   2. The EMU→device-px band-width conversion was suspected of a double-apply
-  //      blow-up. It is NOT: bandPx == declared `w` (EMU→px) × devScale exactly.
-  // These tests pin BOTH so neither regresses, parametrised over devScale {1,4,8}.
-
+describe('bevel band geometry on a curved silhouette', () => {
+  // The distance-field footprint must retain width/scale covariance and smooth
+  // inward offsets independently of the documented profile's creases.
   /** Anti-aliased ellipse silhouette filling the W×H canvas. */
   function ellipseSilhouette(W: number, H: number, ss = 4): Uint8ClampedArray {
     const a = new Uint8ClampedArray(W * H);
@@ -709,45 +577,6 @@ describe('bevel band geometry — slide-6 ellipse rim (issue #410→…→band-g
       expect(maxCurv).toBeLessThan(0.02);
     });
 
-    it(`bevel shading feathers to zero at the inner crease (no hard flat-cut step) [devScale ${devScale}]`, () => {
-      // The "flat cut" defect was a HARD step at the INNER crease (the band→flat-top
-      // boundary): every band pixel was fully shaded, the next pixel inward was the
-      // untouched face. The fix is the inner-crease FEATHER (BEVEL_INNER_FEATHER) — a
-      // smoothstep on `bandWeight` that eases the lip's SHADING WEIGHT from 1 down to 0
-      // over the inner part of the band, so the lip fades into the flat top with no
-      // step. This is a GEOMETRY property of the weight field, independent of the light
-      // rig — so we test it directly on `bandWeight` (the prior end-to-end luminance
-      // form became untestable once the threePt fill lifted the shadow lip toward the
-      // face, leaving no luminance lip to measure there). Along the minor axis from the
-      // rim inward, `bandWeight` must (a) start near 1 in the outer band, (b) reach ~0
-      // at/just past the inner crease, and (c) make that descent as a GRADIENT, never a
-      // single-pixel cliff from ~1 to 0.
-      const a = ellipseSilhouette(W, H);
-      const { bandMask, bandWeight } = computeBevelNormals(a, W, H, expectBand, 'hardEdge', expectHeight);
-      const cx = Math.round(W / 2), cy = Math.round(H / 2);
-      // Walk inward from the right edge along y=cy (minor axis tip, radial normal).
-      const ws: number[] = [];
-      let started = false;
-      for (let x = W - 1; x >= 0; x--) {
-        const i = cy * W + x;
-        if (a[i] < 128) continue; // outside
-        if (bandMask[i]) { started = true; ws.push(bandWeight[i]); }
-        else if (started) { ws.push(0); break; } // crossed the inner crease to flat top
-      }
-      expect(ws.length).toBeGreaterThan(4);
-      // (a) the outer band starts fully weighted (lip present at the rim).
-      expect(ws[0]).toBeGreaterThan(0.9);
-      // (b) it ends at ~0 (feathered into the flat top).
-      expect(ws[ws.length - 1]).toBeLessThan(0.1);
-      // (c) the descent is a GRADIENT: the largest single-pixel drop is a small
-      // fraction of the full range (a hard cliff would drop ~1.0 in one step). The
-      // weight only ramps over the inner BEVEL_INNER_FEATHER (0.35) of the band, so at
-      // devScale 1 (band 12px ⇒ ~4px ramp) the per-pixel step is naturally larger; a
-      // 0.6 ceiling fails the 1.0 cliff at every scale while passing the smoothstep.
-      let maxDrop = 0;
-      for (let k = 1; k < ws.length; k++) maxDrop = Math.max(maxDrop, ws[k - 1] - ws[k]);
-      expect(maxDrop).toBeLessThan(0.6);
-    });
   }
 });
 

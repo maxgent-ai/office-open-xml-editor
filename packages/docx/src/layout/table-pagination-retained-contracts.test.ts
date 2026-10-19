@@ -290,7 +290,9 @@ describe('retained table pagination contracts', () => {
     const tables = retainedTopLevelTables(layout);
     const drawing = layout.pages[0]!.layers.paintOrder.find((entry) => entry.kind === 'drawing');
     if (drawing?.kind !== 'drawing') throw new Error('expected drawing');
-    expect(tables.at(-1)!.flowBounds.yPt).toBeCloseTo(60, 10);
+    // Overlap-permitted floats of other paragraphs do not displace the table
+    // (Windows Word 16.0.20430, #1896 float controls).
+    expect(tables.at(-1)!.flowBounds.yPt).toBeCloseTo(55, 10);
     expect(drawing.node.inkBounds.yPt + drawing.layoutTranslationPt.yPt).toBeCloseTo(34, 10);
   });
   it('preserves the reference of a horizontally merged leading carrier', () => {
@@ -543,20 +545,22 @@ describe('retained table pagination contracts', () => {
     expect(fragments).toHaveLength(3);
     for (const fragment of fragments) {
       expect(fragment.rows).toHaveLength(1);
-      expect(fragment.rows[0]?.heightPt).toBe(24);
-      expect(fragment.advancePt).toBe(24);
+      // Each page-local slice adds its full 4pt top and bottom rules.
+      expect(fragment.rows[0]?.heightPt).toBe(28);
+      expect(fragment.advancePt).toBe(28);
       expect(fragment.borders.filter((border) => border.edge === 'top')).toEqual([
         expect.objectContaining({ widthPt: 4 }),
       ]);
       expect(fragment.borders.filter((border) => border.edge === 'bottom')).toEqual([
         expect.objectContaining({ widthPt: 4 }),
       ]);
-      expect(fragment.inkBounds.yPt).toBeCloseTo(fragment.flowBounds.yPt - 2, 6);
-      expect(fragment.inkBounds.heightPt).toBeCloseTo(fragment.flowBounds.heightPt + 4, 6);
+      // The rules lie inside the slice's own box.
+      expect(fragment.inkBounds.yPt).toBeCloseTo(fragment.flowBounds.yPt, 6);
+      expect(fragment.inkBounds.heightPt).toBeCloseTo(fragment.flowBounds.heightPt, 6);
     }
   });
 
-  it('charges thick collapsed outer half-rules only to page-local non-exact tracks', () => {
+  it('charges thick collapsed outer rules to page-local tracks, exact rows only at the table end', () => {
     const outer = singleBorder(12);
     const source = table(
       [
@@ -584,16 +588,50 @@ describe('retained table pagination contracts', () => {
     expect(tableFormatInput(source).rows.map((format) => format.height?.rule ?? 'auto'))
       .toEqual(['auto', 'exact', 'auto', 'exact', 'auto']);
 
+    // WORD_COLLAPSED_BORDER_ROW_TRACK_FOOTPRINT: an auto row adds its full
+    // top rule; the page-local last row adds the full bottom rule, which an
+    // exact row (holding its own top rule) adds alone. Rules lie inside.
     const fragments = retainedTopLevelTables(
-      layoutDocument(documentModel([source as unknown as BodyElement], 52)),
+      layoutDocument(documentModel([source as unknown as BodyElement], 68)),
     );
     expect(fragments).toHaveLength(2);
     expect(fragments.map((fragment) => fragment.rows.map((row) => row.logicalRowIndex)))
       .toEqual([[0, 1, 2, 3], [4]]);
     expect(fragments.map((fragment) => fragment.rows.map((row) => row.heightPt)))
-      .toEqual([[16, 1, 10, 1], [22]]);
-    expect(fragments.map((fragment) => fragment.advancePt)).toEqual([28, 22]);
-    expect(fragments.map((fragment) => fragment.inkBounds.heightPt)).toEqual([40, 34]);
+      .toEqual([[22, 1, 10, 13], [34]]);
+    expect(fragments.map((fragment) => fragment.advancePt)).toEqual([46, 34]);
+    expect(fragments.map((fragment) => fragment.inkBounds.heightPt)).toEqual([46, 34]);
+  });
+
+  it('charges a re-acquired exact row its in-table rule footprint, not a one-row table\'s', () => {
+    // Two 20pt exact rows with 6pt rules: 20 + 20 + the 6pt bottom rule fills
+    // a 46pt band exactly. A PAGE field makes the first row re-acquired per
+    // page; measured alone it would carry the table's bottom rule as well.
+    const rule = singleBorder(6);
+    const field = paragraph('');
+    (field.runs as unknown[]).push({
+      type: 'field', fieldType: 'page', instruction: 'PAGE', fallbackText: '1',
+      bold: false, italic: false, underline: false, strikethrough: false,
+      fontSize: 10, color: null, fontFamily: 'Times New Roman', background: null,
+    });
+    const source = table(
+      [
+        row([cell([{ type: 'paragraph', ...field } as unknown as CellElement])], {
+          rowHeight: 20, rowHeightRule: 'exact',
+        }),
+        row([cell(Array.from({ length: 4 }, () => (
+          { type: 'paragraph', ...paragraph('line') } as unknown as CellElement)))], {
+          rowHeight: 20, rowHeightRule: 'exact',
+        }),
+      ],
+      [120],
+      { borders: { top: rule, bottom: rule, left: null, right: null, insideH: rule, insideV: null } },
+    );
+    const layout = layoutDocument(documentModel([source as unknown as BodyElement], 66));
+    const fragments = retainedTopLevelTables(layout);
+    expect(layout.pages).toHaveLength(1);
+    expect(fragments).toHaveLength(1);
+    expect(fragments[0]!.rows.map((fragmentRow) => fragmentRow.heightPt)).toEqual([20, 26]);
   });
 
   it('re-resolves repeated atLeast header boundaries and row tracks on every slice', () => {
@@ -624,8 +662,9 @@ describe('retained table pagination contracts', () => {
 
     expect(fragments).toHaveLength(3);
     for (const [index, fragment] of fragments.entries()) {
-      expect(fragment.rows.map((fragmentRow) => fragmentRow.heightPt)).toEqual([22.5, 22.5]);
-      expect(fragment.advancePt).toBe(45);
+      // Header: 20 + 4pt top rule; body: 20 + 1pt inside rule + 4pt bottom rule.
+      expect(fragment.rows.map((fragmentRow) => fragmentRow.heightPt)).toEqual([24, 25]);
+      expect(fragment.advancePt).toBe(49);
       expect(fragment.rows[0]?.ownership).toBe(index === 0 ? 'source' : 'repeated-header');
       expect(fragment.borders.filter((border) => border.edge === 'top')).toEqual([
         expect.objectContaining({ widthPt: 4 }),
@@ -639,7 +678,7 @@ describe('retained table pagination contracts', () => {
     }
   });
 
-  it('reserves the repeated header outer half-rule before admitting exact body rows', () => {
+  it('reserves the repeated header outer rule before admitting exact body rows', () => {
     const outer = singleBorder(4);
     const inside = singleBorder(1);
     const source = table(
@@ -666,7 +705,9 @@ describe('retained table pagination contracts', () => {
     );
     expect(fragments).toHaveLength(4);
     expect(fragments.map((fragment) => fragment.rows.length)).toEqual([2, 2, 2, 2]);
-    expect(fragments.map((fragment) => fragment.advancePt)).toEqual([42.5, 42.5, 42.5, 42.5]);
+    // Header 20 + 4pt top rule; the exact row holds its inside rule and adds
+    // the 4pt bottom rule.
+    expect(fragments.map((fragment) => fragment.advancePt)).toEqual([48, 48, 48, 48]);
     for (const [index, fragment] of fragments.entries()) {
       expect(fragment.rows.map((fragmentRow) => fragmentRow.logicalRowIndex)).toEqual([0, index + 1]);
       expect(fragment.borders.filter((border) => border.edge === 'between')).toHaveLength(1);
@@ -702,7 +743,7 @@ describe('retained table pagination contracts', () => {
       const fragmentRow = fragment.rows[0];
       expect(fragmentRow?.logicalRowIndex).toBe(0);
       expect(fragmentRow?.fragmentIndex).toBe(fragmentIndex);
-      expect(fragment.advancePt).toBeCloseTo((fragmentRow?.contentHeightPt ?? 0) + 4, 8);
+      expect(fragment.advancePt).toBeCloseTo((fragmentRow?.contentHeightPt ?? 0) + 8, 8);
       expect(fragment.flowBounds.heightPt).toBeCloseTo(fragment.advancePt, 8);
       expect(fragment.borders.filter((border) => border.edge === 'top')).toEqual([
         expect.objectContaining({ widthPt: 4 }),
@@ -710,8 +751,8 @@ describe('retained table pagination contracts', () => {
       expect(fragment.borders.filter((border) => border.edge === 'bottom')).toEqual([
         expect.objectContaining({ widthPt: 4 }),
       ]);
-      expect(fragment.inkBounds.yPt).toBeCloseTo(fragment.flowBounds.yPt - 2, 8);
-      expect(fragment.inkBounds.heightPt).toBeCloseTo(fragment.advancePt + 4, 8);
+      expect(fragment.inkBounds.yPt).toBeCloseTo(fragment.flowBounds.yPt, 8);
+      expect(fragment.inkBounds.heightPt).toBeCloseTo(fragment.advancePt, 8);
     }
     const lineRanges = fragments.map((fragment) => {
       const range = fragment.rows[0]?.cells[0]?.contentRanges.find(
@@ -725,7 +766,7 @@ describe('retained table pagination contracts', () => {
       expect(lineRanges[index]?.lineStart).toBe(lineRanges[index - 1]?.lineEnd);
     }
     expect(fragments.reduce((sum, fragment) => sum + fragment.advancePt, 0)).toBeCloseTo(
-      fragments.reduce((sum, fragment) => sum + (fragment.rows[0]?.contentHeightPt ?? 0) + 4, 0),
+      fragments.reduce((sum, fragment) => sum + (fragment.rows[0]?.contentHeightPt ?? 0) + 8, 0),
       8,
     );
   });

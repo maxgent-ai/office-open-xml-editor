@@ -1,11 +1,11 @@
-import { bench, describe } from 'vitest';
+import { vi, bench, describe } from 'vitest';
 import { layoutDocument } from '../document-layout.js';
 import {
   installStubCanvas,
   syntheticDocxModel,
   type SyntheticDocumentShape,
 } from '../testing/synthetic-document.js';
-import { setDocumentLayoutValidation } from './validation-policy.js';
+import { setDocumentLayoutValidation } from '../testing/validation-policy.js';
 
 /**
  * Layout-cost benchmark. Run with `pnpm bench:layout` (vitest picks up
@@ -24,7 +24,7 @@ import { setDocumentLayoutValidation } from './validation-policy.js';
  * regression here is a regression in the engine rather than in the environment.
  *
  * Each case is benchmarked twice — with the retained-layout contract checks on
- * and off (see `validation-policy.ts`) — because "on" is what CI pays and "off"
+ * and off (see `validation-policy.ts`) — because "on" enables extra diagnostics and "off"
  * is what a shipped viewer pays.
  */
 
@@ -56,3 +56,5 @@ for (const [shape, paragraphs] of CASES) {
     }, OPTIONS);
   });
 }
+
+vi.mock('./validation-policy.js', () => ({ documentLayoutValidationEnabled: vi.fn(() => true) }));

@@ -73,6 +73,11 @@ export type Bullet = CoreBullet | BlipBullet;
  * variant narrow `bullet` with {@link asBullet} / a `type === 'blip'` check.
  */
 export interface Paragraph extends CoreParagraph {
+  /** Inline MCE alternatives for complete selected run ranges [start, end).
+   * Part 3 §§9.3–9.4 selects a whole branch. Library recovery substitutes its
+   * authored plain-text preview once if any equation in that range fails.
+   * Nested alternatives are ordered inner first, including equal ranges. */
+  mathFallbacks?: { start: number; end: number; text: string }[];
   /**
    * `<a:pPr eaLnBrk>` (ECMA-376 §21.1.2.2.7, xsd:boolean, default true). When
    * true, East Asian text may break at character boundaries (kinsoku rules);
@@ -179,6 +184,9 @@ export interface Presentation {
 }
 
 export interface Slide {
+  /** Effective part-local defaults after layout/slide theme overrides. */
+  theme?: { defaultTextColor: string | null; majorFont: string | null;
+    minorFont: string | null; hlinkColor: string | null };
   index: number;
   /** 1-based slide number (index + 1); used to render slidenum fields */
   slideNumber: number;
@@ -328,7 +336,17 @@ export interface MediaElement {
   mimeType: string;
 }
 
+/** Parsed MCE alternative and complete selected-branch range for equation recovery.
+ * Counts are relative to the shape or table anchor in the flattened element stream. */
+export interface EquationBranchFallback {
+  elements: SlideElement[];
+  before: number;
+  after: number;
+}
+
 export interface ShapeElement {
+  /** Equation Choice preview retained for runtime conversion failures (MCE §9.3). */
+  mathFallback?: EquationBranchFallback;
   type: 'shape';
   x: number;
   y: number;
@@ -517,6 +535,8 @@ export interface Sp3d {
 }
 
 export interface TableElement {
+  /** Whole MCE branch recovery, including equations in table cells (Part 3 §9.3). */
+  mathFallback?: EquationBranchFallback;
   /** Optional `a:tblBg` fill across the entire table beneath cell fills.
    * Resolved from the active theme matrix; omitted means no background paint.
    * Existing model producers may omit it. */
@@ -672,7 +692,7 @@ export interface PictureElement {
    * default to 0), so the renderer reads them without a fallback.
    */
   srcRect?: { l: number; t: number; r: number; b: number };
-  /** a:blip > a:alphaModFix@amt as 0..1. Undefined = fully opaque. */
+  /** Legacy model-source opacity. Parsed alphaModFix is baked once by blipEffects. */
   alpha?: number;
   /**
    * ECMA-376 §20.1.8.23 `<a:duotone>` recolour, resolved to its two endpoint
@@ -682,9 +702,9 @@ export interface PictureElement {
    */
   duotone?: Duotone;
   /**
-   * CT_Blip pixel effects (§20.1.8.13: grayscl, biLevel, clrChange) in
-   * document order, with a `duotone` entry marking where {@link duotone}
-   * applies. Absent when the blip carries none of them.
+   * Ordered CT_Blip effects (§20.1.8.13), including alpha modulation and
+   * independent duotone endpoints. Unsupported entries reject the chain.
+   * Absent for plain pictures and the legacy single-duotone fast path.
    */
   blipEffects?: BlipEffect[];
   /**

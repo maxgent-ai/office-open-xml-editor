@@ -1,24 +1,22 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { vi, afterEach, describe, expect, it } from 'vitest';
+import { documentLayoutValidationEnabled } from './validation-policy.js';
 import {
   assertAndDeepFreezeDocumentLayout,
   deepFreezeDocumentLayout,
 } from './invariants.js';
 import { LayoutInvariantError } from './diagnostics.js';
 import { sealPlainData, snapshotPlainData } from './plain-data.js';
-import {
-  documentLayoutValidationEnabled,
-  setDocumentLayoutValidation,
-} from './validation-policy.js';
+import { setDocumentLayoutValidation } from '../testing/validation-policy.js';
 import type { DocumentLayout } from './types.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
-// The validation policy gates ONLY the path-precise `assertPlainData` pre-pass
-// (a second walk whose sole extra value is the exact property path in the
-// error). Fatal state — non-finite geometry, invariant violations — is
+// The validation policy gates the strict-input `assertPlainData` pre-pass
+// (a second walk that checks descriptors/cycles and gives exact property paths).
+// Fatal state — non-finite geometry, invariant violations — is
 // detected unconditionally, per the layout engine's error contract: it must
 // surface as a typed error in production too, never as a paint defect. This
 // suite pins that split: what always throws, what always freezes, and the one
-// thing the switch actually controls.
+// additional input diagnostics the switch controls.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** A layout carrying a non-finite number: fatal state that must be rejected
@@ -36,7 +34,12 @@ afterEach(() => {
 });
 
 describe('document layout validation policy', () => {
-  it('defaults to enabled under a test runner', () => {
+  it('production omits the redundant pre-pass even under a test runner', async () => {
+    const policy = await vi.importActual<typeof import('./validation-policy.js')>('./validation-policy.js');
+    expect(policy.documentLayoutValidationEnabled()).toBe(false);
+  });
+
+  it('enables extra reports through the test mock', () => {
     expect(documentLayoutValidationEnabled()).toBe(true);
   });
 
@@ -98,10 +101,10 @@ describe('document layout validation policy', () => {
     expect(() => snapshotPlainData({ fn: () => 1 }, 'test')).toThrow(TypeError);
   });
 
-  it('gates only the path-precise pre-pass', () => {
+  it('keeps strict accessor diagnostics optional', () => {
     // An accessor property is invisible to the clone (it reads the produced
     // value) but rejected by the descriptor-checking pre-pass — the one check
-    // that is genuinely development-only.
+    // that is optional for engine-owned input.
     const accessor = Object.defineProperty({}, 'a', {
       enumerable: true,
       get: () => 1,
@@ -112,3 +115,5 @@ describe('document layout validation policy', () => {
     expect(snapshotPlainData(accessor, 'test')).toEqual({ a: 1 });
   });
 });
+
+vi.mock('./validation-policy.js', () => ({ documentLayoutValidationEnabled: vi.fn(() => true) }));

@@ -1,11 +1,14 @@
 #!/usr/bin/env node
 // Keep legacy Office support out of the OOXML packages.
 //
-// The legacy DOC/XLS/PPT readers are an opt-in module (packages/legacy-converter)
+// The legacy DOC/XLS/PPT readers are an opt-in module (packages/legacy-office)
 // that plugs into the renderers only through the format-generic ModelSource
-// contract. Core, DOCX, XLSX, PPTX and the Node facade must therefore carry no
-// legacy-specific names, branches, defaults, dependencies or imports: anything
-// they need must be expressible as a generic contract or capability.
+// contract. Core, DOCX, XLSX, PPTX, the shared OOXML Rust crate, the Node
+// facade and the root package entries must therefore carry no legacy-specific
+// names, branches, defaults, dependencies or imports: anything they need must
+// be expressible as a format-neutral, documented contract or capability.
+// In the other direction, the legacy reader links the OOXML `*-model` crates
+// and only the parser crates listed in ALLOWED_LEGACY_PARSER_DEPENDENCIES.
 // This check catches accidental coupling introduced by maintainers or agents;
 // it is not a sandbox for deliberately adversarial JavaScript.
 //
@@ -24,6 +27,8 @@ export const GUARDED_ROOTS = [
   'packages/xlsx/',
   'packages/pptx/',
   'packages/node/',
+  'packages/ooxml-common/',
+  'src/',
 ];
 
 // Generated or local-only content inside the guarded roots.
@@ -41,7 +46,7 @@ const CHECKED_EXTENSIONS = /\.(?:[cm]?[jt]sx?|rs|json|toml|md|astro|html)$/;
  * stream-name table predate the legacy module and stay allowed.
  */
 export const RULES = [
-  { id: 'legacy-package', pattern: /ooxml-legacy-converter|legacy-converter|legacy_office_converter/ },
+  { id: 'legacy-package', pattern: /ooxml-legacy-office|legacy-office|legacy_office_parser/ },
   { id: 'legacy-format-name', pattern: /legacy[-_ ]?(?:doc|xls|ppt)(?![a-z])/i },
   { id: 'legacy-office-api', pattern: /LegacyOffice|legacyConversion|legacy-office|legacy_office/ },
   { id: 'legacy-sniffer', pattern: /sniffLegacyOfficeFormat|LegacyCfbFormat/ },
@@ -51,7 +56,217 @@ export const RULES = [
   { id: 'legacy-xls-measurement', pattern: /measureLegacy|xls-font|XLS_FONT_|configure_mdw|measurement_request/ },
   // Owner decision: DOCX w:lang/@w:val (langDefault) is not modeled.
   { id: 'docx-lang-default', pattern: /langDefault|lang_default/ },
+  // Wire fields and contracts named for one legacy producer. A capability the
+  // OOXML layout needs from another producer gets a format-neutral name.
+  {
+    id: 'legacy-wire-name',
+    pattern: /native_?reading|NativeReading|NativeNoteSeparator|native_?separators|nativeSeparators|native_?text_?flow|nativeTextFlow|NATIVE_DOC|NativeSectionFlow|nativeSectionFlow/i,
+  },
+  // Binary Office specifications and their record/property vocabulary.
+  // MS-DOCX, MS-XLSX, MS-PPTX and MS-ODRAWXML are OOXML specifications and
+  // stay allowed (the word boundary rejects their longer names).
+  { id: 'legacy-binary-spec', pattern: /\bMS-(?:DOC|PPT|XLS|XLSB|ODRAW)\b|\bBIFF\d*\b/ },
+  {
+    id: 'legacy-binary-structure',
+    pattern: /\bsprm[A-Z]\w*|\b(?:PAPX|CHPX|SEPX|MSOTXFL|PlcfHdd)\b|\bWordDocument\b|PowerPoint Document/,
+  },
 ];
+
+/** A path matcher for exactly the listed files. */
+function exactPaths(...paths) {
+  const listed = new Set(paths);
+  return { test: (path) => listed.has(path) };
+}
+
+/**
+ * Exact allowances for legitimate tokens. Each entry names its rule, the
+ * files it covers and the only token spellings it admits there; any other
+ * match of the same rule on that line is still reported. Citation allowances
+ * are `commentOnly`: they admit the token only inside a comment, so the same
+ * spelling as a wire value or a runtime comparison is still reported.
+ */
+export const ALLOWED_TOKENS = [
+  // Core's CFB container sniffer rejects a raw .doc/.xls/.ppt with the typed
+  // `legacy-binary-format` error. It names their stream identities (with
+  // citations) to recognize and refuse them, not to read them.
+  {
+    rule: 'legacy-binary-spec',
+    path: exactPaths('packages/core/src/errors/cfb-sniff.ts'),
+    token: /^(?:MS-DOC|MS-XLS|MS-PPT|BIFF)$/,
+    commentOnly: true,
+  },
+  {
+    rule: 'legacy-binary-structure',
+    path: exactPaths(
+      'packages/core/src/errors/cfb-sniff.ts',
+      'packages/core/src/errors/cfb-sniff.test.ts',
+      'packages/core/src/errors/cfb-guard.test.ts',
+      'packages/core/src/errors/cfb-guard-resolve.test.ts',
+      'packages/docx/src/document-cfb-guard.test.ts',
+      'packages/docx/src/document-model-source.test.ts',
+      'packages/pptx/src/presentation-cfb-guard.test.ts',
+    ),
+    token: /^(?:WordDocument|PowerPoint Document)$/,
+  },
+  // Each format surface names its opt-in model source option the way the
+  // other opt-in modules are passed (`{ legacyDoc }` beside `{ math }`). Only
+  // that exact camel-case key of the surface's own format is admitted; the
+  // option is typed as the format-generic ModelSource, and no other spelling,
+  // value, branch or import of a legacy reader is.
+  { rule: 'legacy-format-name', path: /^packages\/docx\//, token: /^legacyDoc$/ },
+  { rule: 'legacy-format-name', path: /^packages\/xlsx\//, token: /^legacyXls$/ },
+  { rule: 'legacy-format-name', path: /^packages\/pptx\//, token: /^legacyPpt$/ },
+  // The Node facade carries all three format sessions.
+  { rule: 'legacy-format-name', path: /^packages\/node\//, token: /^legacy(?:Doc|Xls|Ppt)$/ },
+  // XLSX may cite the Excel binary specifications as Excel-behaviour
+  // evidence for SpreadsheetML semantics.
+  { rule: 'legacy-binary-spec', path: /^packages\/xlsx\//, token: /^MS-XLSB?$/, commentOnly: true },
+  // Word-behaviour evidence for WordprocessingML rules: Word's own line
+  // spacing representation (LSPD) and its page-size limit.
+  {
+    rule: 'legacy-binary-spec',
+    path: exactPaths(
+      'packages/docx/src/layout/table-acquisition.ts',
+      'packages/docx/src/line-box-height.test.ts',
+    ),
+    token: /^MS-DOC$/,
+    commentOnly: true,
+  },
+  // The same LSPD evidence as a compatibility-rule reference string.
+  {
+    rule: 'legacy-binary-spec',
+    path: exactPaths('packages/docx/src/layout/line-compatibility.ts'),
+    token: /^MS-DOC$/,
+    commentOnly: true,
+    evidenceLine: /^\s*reference: '\[MS-DOC\] §[\d.]+',$/,
+  },
+  {
+    rule: 'legacy-binary-structure',
+    path: exactPaths('packages/docx/src/layout/table-acquisition.ts'),
+    token: /^sprmS[XY]aPage$/,
+    commentOnly: true,
+  },
+];
+
+/**
+ * Comment spans of a TypeScript/JavaScript or Rust source, as [start, end)
+ * offsets. TypeScript/JavaScript comments come from the Babel parser. Rust is
+ * scanned: line and block comments are tracked across lines and `"` strings
+ * are skipped (a `'` may open a lifetime rather than a char literal).
+ */
+export function commentSpans(text, path = '') {
+  // JavaScript needs a real parser: a regex literal such as /\//g is not a
+  // comment, which no character scanner can decide without the grammar.
+  if (/\.[cm]?[jt]sx?$/.test(path)) {
+    try {
+      const { comments = [] } = parse(text, {
+        sourceType: 'unambiguous', errorRecovery: true, plugins: ['typescript', 'jsx'],
+      });
+      return comments.map((comment) => [comment.start, comment.end]);
+    } catch {
+      // Unparseable source admits no comment-only allowance (fails closed).
+      return [];
+    }
+  }
+  // Manifests, JSON and other non-code files have no comments to admit.
+  if (!path.endsWith('.rs')) return [];
+  const rust = true;
+  const spans = [];
+  let quote = null;
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i];
+    if (quote) {
+      if (char === '\\') i++;
+      else if (char === quote || (char === '\n' && quote !== '`')) quote = null;
+      continue;
+    }
+    if (char === '/' && text[i + 1] === '/') {
+      const end = text.indexOf('\n', i);
+      spans.push([i, end < 0 ? text.length : end]);
+      i = end < 0 ? text.length : end;
+    } else if (char === '/' && text[i + 1] === '*') {
+      const close = text.indexOf('*/', i + 2);
+      const end = close < 0 ? text.length : close + 2;
+      spans.push([i, end]);
+      i = end - 1;
+    } else if (char === '"' || char === '`' || (!rust && char === "'")) {
+      quote = char;
+    }
+  }
+  return spans;
+}
+
+function lineViolations(path, line, offset = 0, spans = []) {
+  const rules = [];
+  const inComment = (index) => spans.some(([start, end]) => offset + index >= start && offset + index < end);
+  for (const rule of RULES) {
+    const global = new RegExp(rule.pattern.source, `${rule.pattern.flags.replace('g', '')}g`);
+    const unexplained = [...line.matchAll(global)].some((match) => !ALLOWED_TOKENS.some((allowance) =>
+      allowance.rule === rule.id && allowance.path.test(path) && allowance.token.test(match[0])
+      && (!allowance.commentOnly || inComment(match.index) || allowance.evidenceLine?.test(line) === true)));
+    if (unexplained) rules.push(rule.id);
+  }
+  return rules;
+}
+
+/**
+ * Parser crates the legacy reader may link, with the reason. Every other OOXML
+ * dependency must be a `*-model` crate or `ooxml-common`, so the reader builds
+ * the direct model instead of reaching into parser internals.
+ */
+export const ALLOWED_LEGACY_PARSER_DEPENDENCIES = new Map([
+  // Direct PPT stores alternative shapes as DrawingML XML parts. The public
+  // standalone shape-part API of the PPTX parser reads them; no model crate
+  // parses XML.
+  ['pptx-parser', 'standalone DrawingML shape parts'],
+]);
+
+/**
+ * Normal and build dependencies of one Cargo manifest, by the package each
+ * resolves to, as Cargo itself reads them (`cargo metadata`). Using Cargo
+ * instead of a hand-written TOML reader keeps every rename, quoted or escaped
+ * key, dotted key, dependency table and `target.<cfg>` form covered.
+ * `dev-dependencies` are test-only and stay unrestricted.
+ */
+export function cargoNormalDependencies(manifestPath) {
+  const absolute = nodePath.resolve(manifestPath);
+  const metadata = JSON.parse(execFileSync('cargo', [
+    'metadata', '--no-deps', '--offline', '--format-version', '1', '--manifest-path', absolute,
+  ], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 }));
+  const pkg = metadata.packages.find((candidate) => candidate.manifest_path === absolute);
+  if (!pkg) throw new Error(`cargo metadata did not report the package at ${absolute}`);
+  return pkg.dependencies
+    .filter((dependency) => dependency.kind !== 'dev')
+    .map((dependency) => ({ key: dependency.rename ?? dependency.name, package: dependency.name }));
+}
+
+/** Report OOXML parser crates in the legacy reader's normal dependencies. */
+export function legacyCargoViolations(manifestPath) {
+  let dependencies;
+  try {
+    dependencies = cargoNormalDependencies(manifestPath);
+  } catch (error) {
+    return [{
+      path: manifestPath, line: 1, rule: 'legacy-parser-dependency',
+      text: `cargo metadata failed: ${String(error?.message ?? error).split('\n')[0]}`,
+    }];
+  }
+  const lines = readFileSync(manifestPath, 'utf8').split('\n');
+  const violations = [];
+  for (const dependency of dependencies) {
+    const name = dependency.package.replaceAll('_', '-');
+    if (/(?:docx|xlsx|pptx)-parser$/.test(name) && !ALLOWED_LEGACY_PARSER_DEPENDENCIES.has(name)) {
+      const index = lines.findIndex((line) => line.includes(dependency.key));
+      violations.push({
+        path: manifestPath,
+        line: index + 1 || 1,
+        rule: 'legacy-parser-dependency',
+        text: `${dependency.key} resolves to ${dependency.package}`,
+      });
+    }
+  }
+  return violations;
+}
 
 // The only computed imports in production source are the six worker-realm
 // sidecars. The main thread supplies these absolute URLs after it selects a
@@ -61,11 +276,11 @@ export const ALLOWED_COMPUTED_IMPORTS = new Map([
   ['packages/core/src/math/engine-runtime.ts', ['src']],
   ['packages/core/src/source/model-source.ts', ['sourceModule.moduleUrl']],
   ['packages/docx/src/worker-source.ts', ['req.sourceOwnerUrl']],
-  ['packages/docx/src/render-worker-source.ts', ['req.sourceOwnerUrl']],
+  ['packages/docx/src/render-worker.ts', ['req.sourceOwnerUrl']],
   ['packages/xlsx/src/worker-source.ts', ['req.sourceOwnerUrl']],
-  ['packages/xlsx/src/render-worker-source.ts', ['req.sourceOwnerUrl']],
+  ['packages/xlsx/src/render-worker.ts', ['req.sourceOwnerUrl']],
   ['packages/pptx/src/worker-source.ts', ['request.sourceOwnerUrl']],
-  ['packages/pptx/src/render-worker-source.ts', ['request.sourceOwnerUrl']],
+  ['packages/pptx/src/render-worker.ts', ['request.sourceOwnerUrl']],
   // Local benchmark CLIs load the caller-specified build they are measuring.
   ['packages/node/src/bench-handle.mjs', ['jsPath']],
   ['packages/node/src/bench-parse.mjs', ['resolve(HERE, relJs)']],
@@ -162,7 +377,7 @@ function isPropertyName(node, parent) {
 }
 
 function isLegacyModule(path) {
-  return /ooxml-legacy-converter|(?:^|[\\/])legacy-converter(?:[\\/]|$)/.test(path);
+  return /ooxml-legacy-office|(?:^|[\\/])legacy-office(?:[\\/]|$)/.test(path);
 }
 
 /** Use the same compiler options and module resolver as TypeScript's program. */
@@ -204,13 +419,16 @@ export function findViolations(files, { resolveModule } = {}) {
     if (seen.has(path)) continue;
     seen.add(path);
     const lines = text.split('\n');
-    if (isGuardedPath(path)) lines.forEach((line, index) => {
-      for (const rule of RULES) {
-        if (rule.pattern.test(line)) {
-          violations.push({ path, line: index + 1, rule: rule.id, text: line.trim().slice(0, 160) });
+    if (isGuardedPath(path)) {
+      const spans = commentSpans(text, path);
+      let offset = 0;
+      lines.forEach((line, index) => {
+        for (const rule of lineViolations(path, line, offset, spans)) {
+          violations.push({ path, line: index + 1, rule, text: line.trim().slice(0, 160) });
         }
-      }
-    });
+        offset += line.length + 1;
+      });
+    }
     if (/\.[cm]?[jt]sx?$/.test(path)) {
       const source = parse(text, { sourceType: 'unambiguous', errorRecovery: true, plugins: ['typescript', 'jsx'] });
       const allowedExpressions = ALLOWED_COMPUTED_IMPORTS.get(path) ?? [];
@@ -376,6 +594,9 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
   // --ref checks lexical/AST rules at that revision. The live compiler graph
   // is checked for the working tree, where its tsconfig and dependencies exist.
   const violations = findViolations(trackedFiles(ref), ref ? {} : { resolveModule: createTypeScriptResolver() });
+  // Cargo resolves the manifest of the working tree only; --ref checks the
+  // lexical rules above.
+  if (!ref) violations.push(...legacyCargoViolations('packages/legacy-office/parser/Cargo.toml'));
   if (violations.length > 0) {
     for (const violation of violations.slice(0, 200)) {
       console.error(`${violation.path}:${violation.line} [${violation.rule}] ${violation.text}`);

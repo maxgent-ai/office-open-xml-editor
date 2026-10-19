@@ -178,3 +178,11 @@ describe('§17.3.2.35 run charSpacing survives into the paint-scale advance', ()
     }
   });
 });
+
+describe('§17.3.2.35 pitch applies once per user-perceived character', () => {
+  it('adds no pitch for a combining mark, with or without its base in the segment', () => {
+    const condensed = { charSpacing: -1 };
+    expect(segAdvanceWidth(textSeg('a\u030A', condensed) as LayoutTextSeg, 6, undefined, 1)).toBe(5);
+    expect(segAdvanceWidth(textSeg('\u030A', condensed) as LayoutTextSeg, 0, undefined, 1)).toBe(0);
+  });
+});

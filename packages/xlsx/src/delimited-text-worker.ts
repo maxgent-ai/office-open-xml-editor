@@ -1,4 +1,5 @@
-import { normalizeXlsxWorksheetPolicy, serializeWorkerError } from '@silurus/ooxml-core/worker';
+import { normalizeXlsxWorksheetPolicy } from './internal/worksheet-policy.js';
+import { serializeWorkerError } from '@silurus/ooxml-core/worker';
 import { parseDelimitedWorksheet } from './delimited-text.js';
 import type {
   DelimitedTextParseRequest,

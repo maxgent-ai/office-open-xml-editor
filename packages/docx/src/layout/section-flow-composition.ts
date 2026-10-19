@@ -126,6 +126,7 @@ export function composeCanonicalSectionFlow(
             node,
             counter,
             Math.max(1, numbering.countBy),
+            // `word-default-line-number-distance`
             wordLineNumberDistancePt(numbering.distance),
             session,
           );

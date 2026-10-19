@@ -131,7 +131,7 @@ fn focused_counter_package(value: &str, level: usize) -> Vec<u8> {
         let mut zip = ZipWriter::new(Cursor::new(&mut output));
         for index in 0..input.len() {
             let mut part = input.by_index(index).expect("test source part");
-            let name = part.name().to_string();
+            let name = part.name().unwrap().into_owned();
             let mut text = String::new();
             part.read_to_string(&mut text).expect("test XML part");
             if name == "word/document.xml" {
@@ -155,7 +155,7 @@ fn package_with_parts(parts: &[(&str, String)]) -> Vec<u8> {
         let mut part = input.by_index(index).expect("test source part");
         let mut text = String::new();
         part.read_to_string(&mut text).expect("test XML part");
-        entries.insert(part.name().to_string(), text);
+        entries.insert(part.name().unwrap().into_owned(), text);
     }
     for (name, xml) in parts {
         entries.insert((*name).to_string(), xml.clone());
@@ -734,5 +734,64 @@ fn strict_story_relationship_types_are_validated_too() {
             ]),
             kind,
         );
+    }
+}
+
+fn single_level_package(start: &str, format: &str, level_text: &str) -> Vec<u8> {
+    let numbering = format!(
+        r#"<w:numbering xmlns:w="{NS}"><w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:start w:val="{start}"/><w:numFmt w:val="{format}"/><w:lvlText w:val="{level_text}"/></w:lvl></w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num></w:numbering>"#
+    );
+    let document = format!(
+        r#"<w:document xmlns:w="{NS}"><w:body><w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>x</w:t></w:r></w:p></w:body></w:document>"#
+    );
+    let mut bytes = Vec::new();
+    {
+        let mut zip = ZipWriter::new(Cursor::new(&mut bytes));
+        write_test_content_types(&mut zip);
+        for (name, text) in [
+            ("word/document.xml", document),
+            ("word/numbering.xml", numbering),
+        ] {
+            zip.start_file(name, SimpleFileOptions::default())
+                .expect("test package entry");
+            zip.write_all(text.as_bytes()).expect("test package write");
+        }
+        zip.finish().expect("test package finish");
+    }
+    bytes
+}
+
+/// `w:start` is an uncapped ST_DecimalNumber and repeating alphabets grow
+/// linearly with the counter, so a hostile start (or a level text repeating
+/// one placeholder) used to expand a single marker into hundreds of
+/// megabytes. Markers past `MAX_MARKER_BYTES` now fail the parse with a typed
+/// `numbering-marker:bytes` violation; ordinary markers are unchanged.
+#[test]
+fn oversized_numbering_markers_fail_with_a_typed_resource_error() {
+    assert_eq!(
+        paragraph_markers(&single_level_package("3", "aiueoFullWidth", "%1.")),
+        vec![Some("\u{30a6}.".to_string())]
+    );
+    for bytes in [
+        single_level_package("4294967295", "aiueoFullWidth", "%1"),
+        single_level_package("4294967295", "lowerLetter", "%1"),
+        single_level_package("30000", "upperLetter", &"%1".repeat(64)),
+        single_level_package("1", "decimal", &"x".repeat(65_537)),
+    ] {
+        let error = crate::parse_docx_native(&bytes).expect_err("oversized marker rejected");
+        let json: serde_json::Value = serde_json::from_str(
+            error
+                .strip_prefix("OOXML_RESOURCE_LIMIT:")
+                .unwrap_or_else(|| panic!("typed prefix: {error}")),
+        )
+        .expect("typed JSON");
+        let violation = &json["details"]["violation"];
+        assert_eq!(violation["resource"], "numbering-marker");
+        assert_eq!(violation["metric"], "bytes");
+        assert_eq!(
+            violation["limit"],
+            ooxml_common::numbering::MAX_MARKER_BYTES as u64
+        );
+        assert_eq!(violation["format"], "docx");
     }
 }

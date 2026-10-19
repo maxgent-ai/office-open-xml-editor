@@ -1,4 +1,4 @@
-//! Built-in PivotTable styles as model formats.
+//! Built-in Table and PivotTable styles as model formats.
 //!
 //! The preset table lives in `ooxml_common::spreadsheet_style_presets`; this
 //! builds the model `Dxf` of each element exactly as the XLSX parser reads a
@@ -80,11 +80,27 @@ pub fn pivot_style_elements(
 ) -> Option<Vec<PivotTableStyleElement>> {
     Some(
         spreadsheet_style_presets::pivot_style(name)?
-            .into_iter()
             .map(|element| PivotTableStyleElement {
                 kind: element.kind.to_string(),
                 size: element.size,
-                dxf: preset_dxf(element.dxf, theme_colors),
+                dxf: preset_dxf(&element.dxf, theme_colors),
+            })
+            .collect(),
+    )
+}
+
+/// The elements of the built-in Table style `name` (e.g. `TableStyleMedium2`),
+/// or `None` when it is not a built-in style.
+pub fn table_style_elements(
+    name: &str,
+    theme_colors: &[String],
+) -> Option<Vec<PivotTableStyleElement>> {
+    Some(
+        spreadsheet_style_presets::table_style(name)?
+            .map(|element| PivotTableStyleElement {
+                kind: element.kind.to_string(),
+                size: element.size,
+                dxf: preset_dxf(&element.dxf, theme_colors),
             })
             .collect(),
     )

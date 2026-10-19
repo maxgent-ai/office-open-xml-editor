@@ -3,7 +3,6 @@ import type { FontPreloadEntry } from '@silurus/ooxml-core';
 import {
   PPTX_GOOGLE_FONTS,
   PptxFontPreloadAccumulator,
-  pptxFontPreloadNames,
   pptxSlideCjkFallback,
   pptxSlideOfficeFontRequests,
 } from './google-fonts';
@@ -45,7 +44,7 @@ describe('PPTX exact Office face requests', () => {
     expect(pptxSlideOfficeFontRequests(slide, 'Calibri Light', 'Calibri')).toEqual([]);
   });
 
-  it('resolves theme, paragraph, and run style while excluding unrelated faces', () => {
+  it('resolves theme, paragraph, and run style for every authored face', () => {
     const slide = {
       elements: [{ type: 'shape', textBody: {
         defaultBold: false, defaultItalic: false,
@@ -60,9 +59,14 @@ describe('PPTX exact Office face requests', () => {
         }],
       } }],
     } as unknown as Slide;
+    // Every authored face is probed (no family-name gate), so line metrics can
+    // admit catalog geometry only for faces proven present.
     expect(pptxSlideOfficeFontRequests(slide, 'Cambria', 'Calibri')).toEqual([
       { family: 'Calibri', weight: 400, style: 'normal' },
+      { family: 'Calibri', presenceOnly: true },
       { family: 'Calibri', weight: 700, style: 'normal' },
+      { family: 'Arial', weight: 700, style: 'italic' },
+      { family: 'Arial', presenceOnly: true },
     ]);
   });
 
@@ -206,7 +210,6 @@ describe('PptxFontPreloadAccumulator', () => {
     };
     const incremental = new PptxFontPreloadAccumulator(pres.majorFont, pres.minorFont);
     incremental.addSlide(slide);
-    expect(incremental.names()).toEqual(pptxFontPreloadNames(pres));
     expect(incremental.names()).toEqual([
       'Yu Gothic', 'Aptos',
       'Noto Sans JP', 'Noto Serif JP',
@@ -236,4 +239,28 @@ it('keeps the union of stable per-slide preferences during progressive preflight
   expect(pptxSlideCjkFallback(han, 'Calibri', 'Calibri', 'sc')).toBe('sc');
   expect(pptxSlideCjkFallback(kana, 'Calibri', 'Calibri', 'sc')).toBe('jp');
   expect(pptxSlideCjkFallback(korean, 'Calibri', 'Calibri', 'sc')).toBe('kr');
+});
+
+it.each(['shape', 'table'])('preloads override defaults and %s equation preview fonts in both render modes', (type) => {
+  const slide = {
+    theme: { majorFont: 'Override Heading', minorFont: 'Override Body', defaultTextColor: null, hlinkColor: null },
+    elements: [{ type, textBody: null, rows: [], mathFallback: { before: 0, after: 0,
+      elements: [{ type: 'shape', textBody: { paragraphs: [{ bullet: { type: 'none' },
+        runs: [{ type: 'text', text: 'Preview', fontFamily: 'Calibri', bold: true }] }] } }],
+    } }],
+  } as unknown as Slide;
+  const accumulator = new PptxFontPreloadAccumulator('Parent Heading', 'Parent Body');
+  accumulator.addSlide(slide);
+  expect(accumulator.names()).toEqual(expect.arrayContaining(['Override Heading', 'Override Body', 'Calibri']));
+  expect(pptxSlideOfficeFontRequests(slide, 'Parent Heading', 'Parent Body'))
+    .toEqual([{ family: 'Calibri', weight: 700, style: 'normal' }, { family: 'Calibri', presenceOnly: true }]);
+});
+
+it('preloads script fonts present only in an inline equation branch preview', () => {
+  const slide = { elements: [{ type: 'shape', textBody: { paragraphs: [{ runs: [],
+    mathFallbacks: [{ start: 0, end: 2, text: '漢字かな' }],
+  }] } }] } as unknown as Slide;
+  const fonts = new PptxFontPreloadAccumulator('Calibri', 'Calibri');
+  fonts.addSlide(slide);
+  expect(fonts.names()).toContain('Noto Sans JP');
 });

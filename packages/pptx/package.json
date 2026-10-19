@@ -1,7 +1,7 @@
 {
   "name": "@silurus/ooxml-pptx",
   "private": true,
-  "version": "0.88.0",
+  "version": "0.89.0",
   "description": "PPTX parser and Canvas renderer (internal workspace package of @silurus/ooxml)",
   "license": "MIT",
   "author": "Yuki Yokotani <silurus.dev@gmail.com>",
@@ -35,15 +35,12 @@
     "src"
   ],
   "scripts": {
-    "dev": "vite",
-    "build": "tsc --build && vite build && node ../../scripts/build-model-source-sidecars.mjs pptx && tsc -p tsconfig.declarations.json",
-    "build:ci": "vite build && node ../../scripts/build-model-source-sidecars.mjs pptx && tsc -p tsconfig.declarations.json",
-    "preview": "vite preview",
+    "build": "tsc --build ../core && vite build && node ../../scripts/build-model-source-sidecars.mjs pptx && tsc -p tsconfig.declarations.json",
+    "typecheck": "tsc --noEmit",
     "wasm": "cd parser && wasm-pack build --target web --out-dir ../src/wasm && node ../../../scripts/append-wasm-reinit.mjs ../src/wasm/pptx_parser.js",
     "vrt": "VRT_MODE=regression playwright test --config playwright.config.ts",
     "vrt:snapshot": "VRT_SNAPSHOT=1 playwright test --config playwright.config.ts",
     "vrt:private": "VRT_PRIVATE_CORPUS=1 VRT_MODE=regression playwright test --config playwright.config.ts --grep 'private corpus (self regression|worker parity)'",
-    "vrt:private:worker": "VRT_PRIVATE_WORKER_PARITY=1 playwright test --config playwright.config.ts --grep 'private corpus worker parity'",
     "vrt:private:snapshot": "VRT_PRIVATE_CORPUS=1 VRT_SNAPSHOT=1 playwright test --config playwright.config.ts --grep 'private corpus self regression'",
     "vrt:fidelity": "VRT_MODE=fidelity playwright test --config playwright.config.ts",
     "vrt:worker": "playwright test --config playwright.config.ts worker-equivalence"

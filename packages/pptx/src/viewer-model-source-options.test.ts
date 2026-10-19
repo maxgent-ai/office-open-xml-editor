@@ -33,14 +33,39 @@ describe.each([
   { name: 'PptxViewer', create: slideViewer },
   { name: 'PptxScrollViewer', create: scrollViewer },
 ])('$name load options', ({ create }) => {
-  it('forwards modelSources to PptxPresentation.load only when configured', async () => {
+  it('forwards legacyPpt to PptxPresentation.load only when configured', async () => {
     const load = vi.spyOn(PptxPresentation, 'load')
       .mockImplementation(async () => new FakePptxEngine(1, 9144000, 6858000).asPres());
-    for (const [options, expected] of [[{ modelSources: [source] }, [source]], [{}, undefined]] as const) {
+    for (const [options, expected] of [[{ legacyPpt: source }, source], [{}, undefined]] as const) {
       const viewer = create(options);
       await viewer.load(new ArrayBuffer(1));
-      expect(load.mock.lastCall?.[1]?.modelSources).toEqual(expected);
+      expect(load.mock.lastCall?.[1]?.legacyPpt).toEqual(expected);
       viewer.destroy();
     }
+  });
+});
+
+// Each surface takes only a source for its own format, under its own key.
+describe('PPTX source option typing', () => {
+  it('rejects another format\'s source and the removed modelSources option', () => {
+    const docx = { target: 'docx', claim: () => false, beginLoad: vi.fn() } as unknown as ModelSource<'docx'>;
+    const xlsx = { target: 'xlsx', claim: () => false, beginLoad: vi.fn() } as unknown as ModelSource<'xlsx'>;
+    // @ts-expect-error A DOCX source cannot configure a PPTX surface.
+    const pptxViewerDocx: ConstructorParameters<typeof PptxViewer>[1] = { legacyPpt: docx };
+    // @ts-expect-error An XLSX source cannot configure a PPTX surface.
+    const pptxViewerXlsx: ConstructorParameters<typeof PptxViewer>[1] = { legacyPpt: xlsx };
+    // @ts-expect-error The generic list option was replaced by `legacyPpt`.
+    const pptxViewerList: ConstructorParameters<typeof PptxViewer>[1] = { modelSources: [] };
+    // @ts-expect-error A DOCX source cannot configure a PPTX surface.
+    const pptxScrollViewerDocx: ConstructorParameters<typeof PptxScrollViewer>[1] = { legacyPpt: docx };
+    // @ts-expect-error An XLSX source cannot configure a PPTX surface.
+    const pptxScrollViewerXlsx: ConstructorParameters<typeof PptxScrollViewer>[1] = { legacyPpt: xlsx };
+    // @ts-expect-error The generic list option was replaced by `legacyPpt`.
+    const pptxScrollViewerList: ConstructorParameters<typeof PptxScrollViewer>[1] = { modelSources: [] };
+    // @ts-expect-error A DOCX source cannot load PPTX input.
+    const loadDocx: NonNullable<Parameters<typeof PptxPresentation.load>[1]> = { legacyPpt: docx };
+    // @ts-expect-error An XLSX source cannot load PPTX input.
+    const loadXlsx: NonNullable<Parameters<typeof PptxPresentation.load>[1]> = { legacyPpt: xlsx };
+    expect([pptxViewerDocx, pptxViewerXlsx, pptxViewerList, pptxScrollViewerDocx, pptxScrollViewerXlsx, pptxScrollViewerList, loadDocx, loadXlsx]).toHaveLength(8);
   });
 });

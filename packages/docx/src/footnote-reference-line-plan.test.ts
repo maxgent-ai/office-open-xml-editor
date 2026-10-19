@@ -448,8 +448,8 @@ it('leaves a one-line after-only note on the unchanged no-head fallback (N03)', 
   expect(notesOnPage(layout.pages[0]!)[0]!.flowBounds.heightPt).toBe(20);
 });
 
-it('continues a later completing reference of a widow unit under one native notice', () => {
-  // Native (MS-DOC) separator wire with exact 10pt stories: separator,
+it('continues a later completing reference of a widow unit under one reserved notice', () => {
+  // Reserved separator wire with exact 10pt stories: separator,
   // continuation separator and a 10pt continuation notice. 144pt region:
   // F (60) + the two-line widow unit P (20 + 6 after). B01 opens note A (one
   // line) and B02 closes with note B (four lines). The unit's later minimum
@@ -458,13 +458,11 @@ it('continues a later completing reference of a widow unit under one native noti
   // charged whole (10 + 10). At B02: 26 + 20 + 40 = 86 > 84, and 80 fits
   // without the after, so B continues with the largest head beside the charged
   // body: 84 - 26 - 20 = 38 holds two lines + the one notice (30).
-  const address = (cp: number) => ({ headerCp: cp, fc: 0x800 + cp * 2, prm: 0, paragraphStyle: 0 });
   const control = textRun('');
   const storyParagraph = { ...paragraph([]), paragraphMarkFontFacts: { fontFamily: 'Arial', fontSize: 10 } };
-  const rule = (mark: 'short' | 'full', cp: number) => ({
-    class: 'rule', contentStartCp: cp, contentEndCp: cp + 2, guardCp: cp + 2,
-    rule: { mark, control: { run: control }, source: address(cp) },
-    paragraph: { paragraph: storyParagraph, contentMark: { run: control }, source: address(cp + 1) },
+  const rule = (mark: 'short' | 'full') => ({
+    rule: { mark, control: { run: control } },
+    paragraph: { paragraph: storyParagraph, contentMark: { run: control } },
   });
   const p = referenceClosing(['B01', 'B02'], 6);
   const unit = { ...p, widowControl: true,
@@ -475,10 +473,9 @@ it('continues a later completing reference of a widow unit under one native noti
   document.section.pageHeight = 164;
   (document as unknown as Record<string, unknown>).__noteLayoutSettings = {
     footnoteSeparator: 'short', footnoteContinuationSeparator: 'full',
-    nativeSeparators: { footnote: {
-      separator: rule('short', 0), continuationSeparator: rule('full', 3),
-      continuationNotice: { class: 'paragraphOnly', contentStartCp: 6, contentEndCp: 7, guardCp: 7,
-        paragraph: { paragraph: storyParagraph, contentMark: { run: control }, source: address(6) } },
+    reservedSeparators: { footnote: {
+      separator: rule('short'), continuationSeparator: rule('full'),
+      continuationNotice: { paragraph: { paragraph: storyParagraph, contentMark: { run: control } } },
     } },
   };
   const layout = render(document);

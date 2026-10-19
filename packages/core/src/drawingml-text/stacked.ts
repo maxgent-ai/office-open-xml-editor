@@ -58,6 +58,13 @@ export interface StackedGlyph<T> {
 export interface StackedParagraph<T> {
   runs: readonly DrawingMlInputRun<T>[];
   alignment?: string;
+  /** Paragraph margins and indent in the column reading direction (px). */
+  marginStart?: number;
+  marginEnd?: number;
+  firstLineIndent?: number;
+  /** Atomic paragraph marker in the reading direction. It precedes text on
+   * the first column only; its advance participates in wrapping/alignment. */
+  firstLinePrefix?: { advance: number; thickness: number };
   lineSpacing?: DrawingMlLineSpacing;
   spaceBefore?: DrawingMlLineSpacing;
   spaceAfter?: DrawingMlLineSpacing;
@@ -96,6 +103,8 @@ export interface StackedColumn {
   /** Natural thickness (largest cell). */
   thickness: number;
   paragraph: number;
+  /** Start of an authored first-column marker, after indent and alignment. */
+  prefixTop?: number;
 }
 
 export interface StackedLayout<G> {
@@ -111,6 +120,7 @@ interface Line<G> {
   lastInParagraph: boolean;
   endsWithBreak: boolean;
   thickness: number;
+  firstInParagraph: boolean;
   ascent: number;
   descent: number;
 }
@@ -137,7 +147,8 @@ export function layoutStackedText<T, G extends StackedGlyph<T> = StackedGlyph<T>
 
   paragraphs.forEach((para, index) => {
     const broken = breakDrawingMlText(para.runs, {
-      maxWidth: options.wrap ? rect.height : Number.POSITIVE_INFINITY,
+      maxWidth: options.wrap ? Math.max(0, rect.height - (para.marginStart ?? 0) - (para.marginEnd ?? 0)) : Number.POSITIVE_INFINITY,
+      firstLineIndent: (para.firstLineIndent ?? 0) + (para.firstLinePrefix?.advance ?? 0),
       measureText: (text, style) => sumAdvance(options.glyphs(text, style)),
       sameStyle: options.sameStyle,
       eastAsianLineBreak: para.eastAsianLineBreak,
@@ -160,10 +171,11 @@ export function layoutStackedText<T, G extends StackedGlyph<T> = StackedGlyph<T>
       // than a call's argument list (no spread into Math.max).
       let thickness = glyphs.length > 0 ? 0 : para.emptyThickness;
       for (const g of glyphs) if (g.thickness > thickness) thickness = g.thickness;
+      if (i === 0 && para.firstLinePrefix) thickness = Math.max(thickness, para.firstLinePrefix.thickness);
       const natural = { ascent: thickness / 2, descent: thickness / 2 };
       const box = drawingMlSpacedLineBox(natural, para.lineSpacing, pxPerPt, reduction);
       return {
-        glyphs, paragraph: index, lastInParagraph: i === broken.length - 1,
+        glyphs, paragraph: index, firstInParagraph: i === 0, lastInParagraph: i === broken.length - 1,
         endsWithBreak: line.endsWithBreak === true, thickness,
         ascent: box.ascent, descent: box.descent,
       };
@@ -171,7 +183,7 @@ export function layoutStackedText<T, G extends StackedGlyph<T> = StackedGlyph<T>
     if (paraLines.length === 0) {
       const t = para.emptyThickness;
       const box = drawingMlSpacedLineBox({ ascent: t / 2, descent: t / 2 }, para.lineSpacing, pxPerPt, reduction);
-      paraLines.push({ glyphs: [], paragraph: index, lastInParagraph: true, endsWithBreak: false, thickness: t,
+      paraLines.push({ glyphs: [], paragraph: index, firstInParagraph: true, lastInParagraph: true, endsWithBreak: false, thickness: t,
         ascent: box.ascent, descent: box.descent });
     }
     const first = index === 0;
@@ -226,7 +238,9 @@ export function layoutStackedText<T, G extends StackedGlyph<T> = StackedGlyph<T>
   let regionLength = rect.height;
   if (options.anchorCtr) {
     let longest = 0;
-    for (const l of lines) longest = Math.max(longest, sumAdvance(l.glyphs.slice(0, contentGlyphs(l.glyphs))));
+    for (const l of lines) longest = Math.max(longest,
+      sumAdvance(l.glyphs.slice(0, contentGlyphs(l.glyphs)))
+        + (l.firstInParagraph ? paragraphs[l.paragraph].firstLinePrefix?.advance ?? 0 : 0));
     regionTop = rect.top + (rect.height - longest) / 2;
     regionLength = longest;
   }
@@ -235,26 +249,35 @@ export function layoutStackedText<T, G extends StackedGlyph<T> = StackedGlyph<T>
   const columns: StackedColumn[] = [];
   lines.forEach((line, column) => {
     const axisX = rtl ? rect.left + rect.width - offset - axisU[column] : rect.left + offset + axisU[column];
-    columns.push({ axisX, thickness: line.thickness, paragraph: line.paragraph });
-    const alignment = paragraphs[line.paragraph].alignment;
+    const paragraph = paragraphs[line.paragraph];
+    const alignment = paragraph.alignment;
+    const prefix = line.firstInParagraph ? paragraph.firstLinePrefix : undefined;
+    const prefixAdvance = prefix?.advance ?? 0;
+    const leading = (paragraph.marginStart ?? 0)
+      + (line.firstInParagraph ? paragraph.firstLineIndent ?? 0 : 0) + prefixAdvance;
+    const trailing = paragraph.marginEnd ?? 0;
+    const columnTop = regionTop + leading;
     const count = contentGlyphs(line.glyphs);
     const length = sumAdvance(line.glyphs.slice(0, count));
-    const extra = regionLength - length;
-    let start = regionTop;
+    const extra = regionLength - leading - trailing - length;
+    let start = columnTop;
     let gapAfter: (i: number) => number = () => 0;
     const lastInPara = line.lastInParagraph;
     const distribute = alignment === 'dist' || alignment === 'thaiDist';
     if (distribute) {
-      if (count <= 1) start = regionTop + extra / 2;
+      if (count <= 1) start = columnTop + extra / 2;
       else gapAfter = (i) => (i < count - 1 ? Math.max(0, extra) / (count - 1) : 0);
     } else if (drawingMlLineShouldJustify(alignment, lastInPara, line.endsWithBreak)) {
       const spaces = line.glyphs.slice(0, count).filter((g) => g.space).length;
       if (spaces > 0) gapAfter = (i) => (i < count && line.glyphs[i].space ? Math.max(0, extra) / spaces : 0);
     } else if (alignment === 'ctr') {
-      start = regionTop + extra / 2;
+      start = columnTop + extra / 2;
     } else if (alignment === 'r') {
-      start = regionTop + extra;
+      start = columnTop + extra;
     }
+    columns.push({ axisX, thickness: line.thickness, paragraph: line.paragraph,
+      ...(prefix ? { prefixTop: start - prefixAdvance } : {}),
+    });
     let y = start;
     line.glyphs.forEach((g, i) => {
       glyphs.push({ ...g, axisX, cellTop: y, column });

@@ -58,6 +58,8 @@ export interface LayoutTextSeg extends LayoutSegSource {
    * substitute without inspecting the CSS alias or changing its paint route. */
   authoredFontFamily?: string | null;
   fontSource?: import('../layout/font-service.js').FontResolutionSource;
+  /** Native resolution of a family installed in another tuple (present). */
+  fontInstalledFamily?: true;
   /** Existing selected-face reference policy; application-provided SFNT
    * resources are local inventory entries but are not installed Office faces. */
   authoredReferenceMetricAllowed?: boolean;
@@ -91,7 +93,7 @@ export interface LayoutTextSeg extends LayoutSegSource {
   /** Zero-advance anchor-character placeholder: contributes run metrics to the
    * line box but paints no glyph. */
   metricOnly?: true;
-  /** Native reserved-separator participant only (MS-DOC 2.3.3 rule control or
+  /** Reserved-separator participant only (rule control or
    * content mark): the bounded selected-face probe whose vertical metrics the
    * metric-only segment keeps. Never display text, glyph ownership, source
    * range length or inline width; other metric-only segments omit it. */
@@ -103,9 +105,9 @@ export interface LayoutTextSeg extends LayoutSegSource {
   bold: boolean;
   italic: boolean;
   underline: boolean;
-  /** ECMA-376 §17.3.2.40 `<w:u w:val>` — raw ST_Underline (§17.18.99) style; the
-   *  renderer maps it to DrawingML §20.1.10.82 for `core.drawUnderline`. Absent
-   *  ⇒ plain single rule. */
+  /** ECMA-376 §17.3.2.40 `<w:u w:val>` — raw ST_Underline (§17.18.99) style;
+   *  retained typography resolves its decoration geometry. Absent ⇒ plain
+   *  single rule. */
   underlineStyle?: string;
   /** ECMA-376 §17.3.2.40 `<w:u w:color>` — underline-only colour (hex 6 or
    *  `auto`). Absent ⇒ the underline follows the glyph colour. */
@@ -126,6 +128,9 @@ export interface LayoutTextSeg extends LayoutSegSource {
   /** Metadata-only vertical reference for a native authored family. It grants
    * no width, cmap, resource ownership, shaping, or paint-route authority. */
   referenceFontVerticalMetric?: true;
+  /** The painted catalogued face's own underline / strikethrough geometry
+   *  (see segment-builder `admittedFaceDecoration`). */
+  referenceFontDecoration?: import('@silurus/ooxml-core/internal/font-decoration').FontDecorationGeometry;
   resolvedDesignAscentRatio?: number;
   resolvedDesignDescentRatio?: number;
   resolvedEastAsianLineHeightRatio?: number;
@@ -162,6 +167,21 @@ export interface LayoutTextSeg extends LayoutSegSource {
   }>[];
   /** Same-line native boundary advance; also shifts retained glyph origins. */
   leadingWordBoundaryPx?: number;
+  /** WORD_EAST_ASIAN_AUTO_SPACE gap (pt) owed before this segment's first
+   * character when its partner across a §17.3.1.2-3 boundary precedes it on
+   * the same line. Assigned once from the paragraph's text; kept only by a
+   * slice that starts at offset 0. */
+  autoSpaceBeforePt?: number;
+  /** The gap (layout px) this placement applies, resolved by the line breaker:
+   * 0 at a line start, otherwise the scaled `autoSpaceBeforePt`, possibly
+   * compressed by a line-fit rule or widened by justification. Absent means
+   * not yet placed; measurement then assumes the same-line value. Included in
+   * `measuredWidth`; shifts retained glyph origins like
+   * {@link leadingWordBoundaryPx}. */
+  autoSpaceLeadingPx?: number;
+  /** The gap may shrink under WORD_COMPRESSED_SPACE_LINE_FIT (its document
+   * gate holds for this paragraph). */
+  autoSpaceCompressible?: true;
   /** Sparse, contextual U+0020 cluster geometry used only during gap fitting. */
   shapedSpaceClusters?: LayoutTextSeg['shapedClusters'];
   /** Tight selected-face ink retained by the authoritative shape call that
@@ -252,8 +272,8 @@ export interface LayoutTextSeg extends LayoutSegSource {
   snapToCharacterGrid?: boolean;
   /** ECMA-376 §17.3.2.35 `<w:spacing>` — character-spacing pitch in POINTS
    *  (signed), added after every character of the run. Applied as a per-glyph
-   *  `ctx.letterSpacing` delta on BOTH measure and paint (measure==paint), on top
-   *  of any docGrid / justify delta. Absent ⇒ 0. */
+   *  layout pitch via textSpacingAdvance; paint uses native `ctx.letterSpacing`
+   *  to preserve contextual shaping, on top of docGrid / justify. Absent ⇒ 0. */
   charSpacing?: number;
   /** ECMA-376 §17.15.1.18 document-level full-width character compression.
    * Each entry belongs to one shaped grapheme and adjusts the advance after its
@@ -392,6 +412,10 @@ export interface LayoutImageSeg extends LayoutSegSource {
   inlinePicture?: true;
   /** Paragraph mark's selected-face natural single line, measured once per paragraph. */
   paragraphMarkSinglePx?: number;
+  /** A picture-bullet marker's height on the paragraph's first line: its
+   * metrics join the line like an inline picture's, but it takes no width,
+   * break opportunity or segment slot (the marker is painted separately). */
+  markerMetric?: true;
   rotation?: number;
   flipH?: boolean;
   flipV?: boolean;
@@ -429,6 +453,10 @@ export interface LayoutImageSeg extends LayoutSegSource {
   /** ECMA-376 §20.4.2.8 — this image-shaped line segment reserves the inline
    * WPS shape's extent; paint is owned by the paragraph's retained drawing. */
   inlineShape?: true;
+  /** Paint offset of an inline shape from its pen position (a VML
+   * position:relative left/top); the line advance is unchanged. */
+  inlineOffsetXPt?: number;
+  inlineOffsetYPt?: number;
   /** Parser-private retained placeholder for a recognized payload whose
    * package part is unavailable. It participates in line/anchor geometry but
    * never enters the paint resource registry. */
@@ -470,6 +498,11 @@ export type LayoutSeg = LayoutTextSeg | LayoutImageSeg | LayoutMathSeg | LayoutL
 
 
 export interface LayoutLine {
+  /** Present on a numbered first line whose leading edge a float moved:
+   * the marker's logical leading edge and the body start, both logical px
+   * from the paragraph's leading indent, and the body start from the line's
+   * own window origin (the line's first-line indent). */
+  numberingFirstLine?: Readonly<{ leadingEdgePx: number; bodyIndentPx: number; lineStartOffsetPx: number }>;
   /** Present (including zero) for the measured proportional gap policy. The
    * natural advances stay intact; layout applies this slack once to paint. */
   justifiedCompressionPx?: number;
@@ -586,6 +619,15 @@ export interface WrapLayoutCtx {
   lineBoxH: (ascentPx: number, descentPx: number, hasRuby?: boolean, intendedSinglePx?: number, eastAsian?: boolean, gridCountSinglePx?: number, uniformPositionAuto?: LayoutLine['uniformPositionAuto'], inlinePictureTextSingle?: number, latinGridCountSingle?: number) => number;
   /** Hard cap on Y to keep layout from running past the page. */
   pageH: number;
+  /** Numbered paragraph whose first line may be narrowed by a float. The
+   * marker occupies the authored first-line position, so the first-line
+   * window is queried with the authored hanging indent; `bodyIndentAt`
+   * resolves the body start (logical px from the indent) for a marker whose
+   * leading edge the window moved. */
+  numberingFirstLine?: Readonly<{
+    authoredFirstIndentPx: number;
+    bodyIndentAt: (markerLeadingEdgePx: number) => number;
+  }>;
 }
 
 
@@ -617,8 +659,8 @@ export interface DocGridCtx {
 export interface LineLayoutEnvironment {
   readonly pageIndex: number;
   readonly totalPages: number;
-  /** Effective §17.3.1.33 paragraph spacing. The Word-for-Mac OpenType
-   * projection has been established for automatic spacing only. */
+  /** Effective §17.3.1.33 paragraph spacing. The Word OpenType
+   * projection supplies the normal box for automatic/atLeast spacing. */
   readonly lineSpacing?: LineSpacing | null;
   readonly displayPageNumber?: number;
   readonly pageNumberFormat?: NumberFormat;
@@ -660,8 +702,7 @@ export interface LineLayoutEnvironment {
    * WORD_COMPRESSED_SPACE_LINE_FIT. */
   readonly compatibilityMode?: number;
   /** Paragraph §17.3.1.2-3 automatic East Asian/Latin and East Asian/number
-   * spacing (absent means on). The renderer does not model that spacing;
-   * WORD_COMPRESSED_SPACE_LINE_FIT stays out of a paragraph it applies to. */
+   * spacing (absent means on), applied as WORD_EAST_ASIAN_AUTO_SPACE. */
   readonly autoSpaceDE?: boolean;
   readonly autoSpaceDN?: boolean;
   /** See WORD_KERN_THRESHOLD_AUTHORITY for absent `w:kern`. */

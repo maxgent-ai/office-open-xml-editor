@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { OoxmlDecodedImageLimitError, OoxmlResourceLimitError } from '@silurus/ooxml-core';
 import type { Slide } from './types.js';
 
 const mocks = vi.hoisted(() => ({
@@ -8,10 +9,12 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock('@silurus/ooxml-core', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@silurus/ooxml-core')>();
-  return { ...actual, getCachedDuotoneBitmapByPath: mocks.decode };
+  return { ...actual, getCachedDuotoneBitmapByPath: mocks.decode,
+    rasterizeMathSvg: async () => ({ source: mocks.image, widthPx: 1, heightPx: 1 }),
+    tintMathRaster: () => mocks.image };
 });
 
-import { paintPreparedShapeImageFill, renderSlide } from './renderer.js';
+import { paintPreparedShapeImageFill, prepareSlideMath, renderSlide } from './renderer.js';
 
 function recordingCanvas() {
   const calls: Array<[string, ...unknown[]]> = [];
@@ -205,7 +208,57 @@ describe('PPTX ordinary-shape image fills', () => {
     expect(textRuns.mock.calls.map(([run]) => run.text).join('')).toBe('Picture fill text');
   });
 
+  it('samples a tiled effect chain at the fill DPI, independent of the shape size', async () => {
+    mocks.decode.mockClear();
+    mocks.decode.mockResolvedValue(mocks.image);
+    const { canvas } = recordingCanvas();
+    const effected = {
+      ...shape('ppt/media/dpi-tile.png'),
+      fill: {
+        fillType: 'image', imagePath: 'ppt/media/dpi-tile.png', mimeType: 'image/png', dpi: 192,
+        tile: { algn: 'tl', tx: 0, ty: 0, sx: 1, sy: 1, flip: 'none' },
+        blipEffects: [{ type: 'blur', radius: 12700, grow: false }],
+      },
+    };
+    await renderSlide(canvas, {
+      index: 0, slideNumber: 1, background: null, elements: [effected],
+    } as unknown as Slide, 9_144_000, 6_858_000, {
+      width: 960, dpr: 1,
+      fetchImage: vi.fn(async () => new Blob([pngHeader(16, 16) as BlobPart], { type: 'image/png' })),
+    }).catch(() => undefined); // tile painting needs a surface; only preparation is asserted
+    expect(mocks.decode).toHaveBeenCalledTimes(1);
+    const [, , transform, , options] = mocks.decode.mock.calls[0]!;
+    expect(transform).toMatchObject({ emuPerPixelX: 4762.5, emuPerPixelY: 4762.5 });
+    expect(options).toMatchObject({ widthPt: 0, heightPt: 0 });
+  });
+
+  it('rejects a tiled effect fill whose source inspection fails natively instead of omitting it', async () => {
+    mocks.decode.mockClear();
+    const { canvas } = recordingCanvas();
+    const effected = {
+      ...shape('ppt/media/effected-tile.png'),
+      fill: {
+        fillType: 'image', imagePath: 'ppt/media/effected-tile.png', mimeType: 'image/png', dpi: 96,
+        tile: { algn: 'tl', tx: 0, ty: 0, sx: 1, sy: 1, flip: 'none' },
+        blipEffects: [{ type: 'grayscale' }],
+      },
+    };
+    await expect(renderSlide(canvas, {
+      index: 0, slideNumber: 1, background: null, elements: [effected],
+    } as unknown as Slide, 9_144_000, 6_858_000, {
+      width: 960, dpr: 1,
+      fetchImage: vi.fn(async () => { throw new TypeError('native read failed'); }),
+    })).rejects.toMatchObject({ code: 'unsupported-image-effect' });
+    expect(mocks.decode).not.toHaveBeenCalled();
+  });
+
   it.each([false, true])('keeps a shared tile native-sized regardless of consumer order (%s)', async (reversed) => {
+    class TileCanvas {
+      getContext() { return recordingCanvas().ctx; }
+    }
+    vi.stubGlobal('OffscreenCanvas', TileCanvas);
+    const target = recordingCanvas();
+    target.state.createPattern = () => ({});
     const shared = 'ppt/media/tile-and-stretch.png';
     const tiled = {
       ...shape(shared),
@@ -223,7 +276,7 @@ describe('PPTX ordinary-shape image fills', () => {
       },
     };
     mocks.decode.mockClear();
-    await renderSlide(recordingCanvas().canvas, {
+    await renderSlide(target.canvas, {
       index: 0, slideNumber: 1, background: null,
       elements: reversed ? [stretched, tiled] : [tiled, stretched],
     } as unknown as Slide, 9_144_000, 6_858_000, {
@@ -234,44 +287,201 @@ describe('PPTX ordinary-shape image fills', () => {
     expect(mocks.decode).toHaveBeenCalledTimes(1);
     expect(mocks.decode.mock.calls[0][4]).not.toHaveProperty('targetWidthPx');
     expect(mocks.decode.mock.calls[0][4]).not.toHaveProperty('targetHeightPx');
+    vi.unstubAllGlobals();
   });
 
   it.each([
     { sx: Number.POSITIVE_INFINITY, sy: 1, flip: 'none' },
-    { sx: 1_000_000, sy: 1_000_000, flip: 'xy' },
   ])('rejects an unbounded tile auxiliary and restores caller state: %o', (tile) => {
     const { ctx, calls, state } = recordingCanvas();
-    expect(paintPreparedShapeImageFill(ctx, {
+    expect(() => paintPreparedShapeImageFill(ctx, {
       fillType: 'image', imagePath: 'ppt/media/huge.png', mimeType: 'image/png',
       dpi: 96, tile: { algn: 'tl', tx: 0, ty: 0, ...tile },
-    }, { image: mocks.image }, { x: 0, y: 0, w: 100, h: 100 }, 1)).toBe(false);
+    }, { image: mocks.image }, { x: 0, y: 0, w: 100, h: 100 }, 1)).toThrowError(expect.objectContaining({ code: 'unsupported-image-effect' }));
     expect(calls.some(([name]) => name === 'drawImage')).toBe(false);
     expect(state.globalAlpha).toBe(1);
   });
 
-  it('checks the rounded tile scratch allocation at the area boundary', () => {
+  it('preserves in-budget tile sampling and bounds only oversized repeating cells', () => {
     const allocations: Array<[number, number]> = [];
+    const patternScales: number[][] = [];
     class ScratchCanvas {
       constructor(width: number, height: number) { allocations.push([width, height]); }
       getContext() { return recordingCanvas().ctx; }
     }
     vi.stubGlobal('OffscreenCanvas', ScratchCanvas);
-    const paint = (sx: number) => {
-      const { ctx } = recordingCanvas();
+    const paint = (sx: number, intrinsicSize?: { width: number; height: number }) => {
+      const { ctx, calls } = recordingCanvas();
       ctx.createPattern = () => ({ setTransform() {} }) as unknown as CanvasPattern;
-      return paintPreparedShapeImageFill(ctx, {
+      const painted = paintPreparedShapeImageFill(ctx, {
         fillType: 'image', imagePath: 'ppt/media/boundary.png', mimeType: 'image/png',
         dpi: 96,
         tile: { algn: 'tl', tx: 0, ty: 0, sx, sy: 4096.1, flip: 'none' },
-      }, { image: mocks.image }, { x: 0, y: 0, w: 100, h: 100 }, 1 / 9525);
+      }, { image: mocks.image, intrinsicSize }, { x: 0, y: 0, w: 100, h: 100 }, 1 / 9525);
+      patternScales.push(calls.find(([name]) => name === 'scale')!.slice(1) as number[]);
+      return painted;
     };
 
-    expect(paint(2047.05)).toBe(true); // cell 4094.1×4096.1 → alloc 4095×4097
+    expect(paint(2047.05)).toBe(true); // ceil(4094.1) × ceil(4096.1) fits the old budget
     expect(allocations).toEqual([[4095, 4097]]);
-    expect(paint(2047.55)).toBe(false); // cell 4095.1×4096.1 → alloc 4096×4097
-    expect(allocations).toEqual([[4095, 4097]]);
+    expect(patternScales[0]).toEqual([1, 1]);
+    expect(paint(2047.55)).toBe(true); // ceil(4095.1) × ceil(4096.1) crosses the old budget
+    expect(allocations).toHaveLength(2);
+    expect(allocations[1]).toEqual([2, 1]);
+    expect(allocations[1][0] * allocations[1][1]).toBeLessThanOrEqual(16_777_216);
+    expect(paint(1_000_000)).toBe(true);
+    expect(allocations[2]).toEqual([2, 1]);
+    expect(allocations[2][0] * patternScales[2][0]).toBeCloseTo(2_000_000);
+    expect(allocations[2][1] * patternScales[2][1]).toBeCloseTo(4096.1);
+    // A cropped/outset native source can itself cross the budget only after
+    // independent rounding: 4095.1×4096.1 would ceil to 4096×4097.
+    expect(paint(1, { width: 4095.1, height: 4096.1 })).toBe(true);
+    expect(allocations[3][0] * allocations[3][1]).toBeLessThanOrEqual(16_777_216);
     vi.unstubAllGlobals();
   });
 
-  it.todo('counter-positions rotWithShape=false image frames under rotated/flipped shapes');
+  it.each([false, true])('counter-rotates an image fill after clipping (flipped=%s)', (flipH) => {
+    const { ctx, calls } = recordingCanvas();
+    expect(paintPreparedShapeImageFill(ctx, {
+      fillType: 'image', imagePath: 'ppt/media/image.png', mimeType: 'image/png',
+      stretch: true, rotWithShape: false,
+    }, { image: mocks.image }, { x: 10, y: 20, w: 100, h: 50 }, 1, false,
+    { rotation: 90, flipH, flipV: false })).toBe(true);
+    const clip = calls.findIndex(([name]) => name === 'clip');
+    const rotate = calls.findIndex(([name]) => name === 'rotate');
+    expect(rotate).toBeGreaterThan(clip);
+    expect(calls[rotate][1]).toBeCloseTo((flipH ? 1 : -1) * Math.PI / 2);
+    expect(calls).toContainEqual(['translate', 60, 45]);
+    expect(calls.some(([name]) => name === 'drawImage')).toBe(true);
+  });
+});
+
+
+it('selects the complete authored equation fallback branch before planning image decodes', async () => {
+  mocks.decode.mockClear();
+  const first = shape('ppt/media/first.png', 0, true);
+  const equation = { ...shape('ppt/media/live.png', 0, true),
+    textBody: { ...first.textBody!, paragraphs: [{ ...first.textBody!.paragraphs[0], runs: [
+      { type: 'math', nodes: [{ kind: 'run', text: 'x', style: 'roman' }], display: false, fontSize: 18 },
+    ] }] },
+    mathFallback: { before: 1, after: 1, elements: [shape('ppt/media/preview.png', 0, true)] },
+  };
+  const slide = { index: 0, slideNumber: 1, background: null,
+    elements: [first, equation, shape('ppt/media/last.png', 0, true)] } as unknown as Slide;
+  const text = vi.fn();
+  await renderSlide(recordingCanvas().canvas, slide, 9_144_000, 6_858_000, {
+    width: 960, dpr: 1,
+    fetchImage: async () => new Blob([pngHeader(2, 1) as BlobPart], { type: 'image/png' }),
+    math: { loadMathJax: async () => {}, mathMLToSvg: async () => { throw new Error('conversion'); } },
+  }, text);
+  expect(mocks.decode.mock.calls.map(args => args[0])).toEqual(['ppt/media/preview.png']);
+  expect(text.mock.calls.map(([run]) => run.text).join('')).toBe('Picture fill text');
+  expect(slide.elements).toHaveLength(3); // rendering never rewrites caller-owned input
+});
+
+it.each([
+  new OoxmlDecodedImageLimitError('active-decoded-bytes', 1, 2),
+  new OoxmlResourceLimitError('equation resource limit', {
+    stage: 'parsing', violation: {
+      format: 'pptx', operation: 'parse-slide', resource: 'xml-tree', metric: 'depth',
+      limit: 1, observed: 2, configurable: false,
+      usage: { archiveEntryCount: 1, declaredInflatedBytes: 2,
+        distinctInflatedBytes: 2, operationInflatedBytes: 2 },
+    },
+  }),
+].flatMap(error => (['load', 'conversion'] as const).map(phase => ({ error, phase }))))(
+  'propagates equation resource failures during $phase instead of selecting a preview ($error.name)', async ({ error, phase }) => {
+    const live = shape('', 0, true);
+    const slide = { elements: [{ ...live, textBody: { ...live.textBody!, paragraphs: [{
+      ...live.textBody!.paragraphs[0], runs: [
+        { type: 'math', nodes: [{ kind: 'run', text: 'x', style: 'roman' }], display: false },
+      ],
+    }] } }] } as unknown as Slide;
+    await expect(prepareSlideMath(slide, {
+      loadMathJax: async () => { if (phase === 'load') throw error; },
+      mathMLToSvg: async () => { throw error; },
+    })).rejects.toBe(error);
+  },
+);
+
+function equationTable(body: unknown, mathFallback?: unknown) {
+  return { type: 'table', x: 0, y: 0, width: 914_400, height: 914_400,
+    rotation: 0, flipH: false, flipV: false, cols: [914_400],
+    rows: [{ height: 914_400, cells: [{ textBody: body, gridSpan: 1, rowSpan: 1 }] }], mathFallback };
+}
+
+it.each(['all', 'first', 'last', 'none'])(
+  'replaces an inline equation branch exactly once after %s conversion failures', async (failure) => {
+    const live = shape('', 0, true);
+    const paragraph = live.textBody!.paragraphs[0];
+    const equations = ['x', 'y'].map(text => ({ type: 'math',
+      nodes: [{ kind: 'run', text, style: 'roman' }], display: false, fontSize: 18 }));
+    const body = { ...live.textBody!, paragraphs: [{ ...paragraph,
+      runs: [{ ...paragraph.runs[0], text: 'before' }, ...equations,
+        { ...paragraph.runs[0], text: 'after' }],
+      mathFallbacks: [{ start: 1, end: 3, text: 'inner preview' },
+        { start: 1, end: 3, text: 'complete preview' }],
+    }] };
+    const slide = { index: 0, slideNumber: 1, background: null,
+      elements: [{ ...live, fill: null, stroke: null, textBody: body }] } as unknown as Slide;
+    const original = JSON.stringify(slide);
+    const recording = recordingCanvas();
+    await renderSlide(recording.canvas, slide, 9_144_000, 6_858_000, { width: 960, dpr: 1,
+      math: { loadMathJax: async () => {}, mathMLToSvg: async xml => {
+        if (failure === 'all' || (failure === 'first' && xml.includes('>x<'))
+          || (failure === 'last' && xml.includes('>y<'))) throw new Error('conversion');
+        return { svg: '', widthEm: 1, ascentEm: 1, descentEm: 0 };
+      } },
+    });
+    const painted = recording.calls.filter(([name]) => name === 'fillText').map(([, text]) => text);
+    expect(painted).toEqual(failure === 'none' ? ['before', 'after'] : ['before', 'complete preview', 'after']);
+    expect(recording.calls.filter(([name]) => name === 'drawImage')).toHaveLength(failure === 'none' ? 2 : 0);
+    expect(JSON.stringify(slide)).toBe(original);
+  },
+);
+
+it.each(['table', 'mixed'])('selects a complete %s equation Choice after a table-cell conversion failure', async (kind) => {
+  mocks.decode.mockClear();
+  const live = shape('ppt/media/live.png', 0, true);
+  const body = { ...live.textBody!, paragraphs: [{ ...live.textBody!.paragraphs[0], runs: [
+    { type: 'math', nodes: [{ kind: 'run', text: 'x', style: 'roman' }], display: false, fontSize: 18 },
+  ] }] };
+  const preview = shape('ppt/media/preview.png', 0, true);
+  const fallback = { before: 0, after: kind === 'mixed' ? 1 : 0, elements: [preview] };
+  const elements = kind === 'table'
+    ? [equationTable(body, fallback)]
+    : [{ ...live, mathFallback: fallback }, equationTable(body)];
+  const text = vi.fn();
+  await renderSlide(recordingCanvas().canvas, { index: 0, slideNumber: 1, background: null, elements } as unknown as Slide,
+    9_144_000, 6_858_000, { width: 960, dpr: 1,
+      fetchImage: async () => new Blob([pngHeader(2, 1) as BlobPart], { type: 'image/png' }),
+      math: { loadMathJax: async () => {}, mathMLToSvg: async () => { throw new Error('conversion'); } },
+    }, text);
+  expect(mocks.decode.mock.calls.map(args => args[0])).toEqual(['ppt/media/preview.png']);
+  expect(text.mock.calls.map(([run]) => run.text).join('')).toBe('Picture fill text');
+});
+
+it('preserves source locators after preview replacement across master, layout and slide origins', async () => {
+  const live = shape('ppt/media/live.png', 0, true);
+  const equation = { ...live, textBody: { ...live.textBody!, paragraphs: [{ ...live.textBody!.paragraphs[0], runs: [
+    { type: 'math', nodes: [{ kind: 'run', text: 'x', style: 'roman' }], display: false, fontSize: 18 },
+  ] }] }, mathFallback: { before: 1, after: 1, elements: [{ ...live, id: 'preview' }] } };
+  const slide = { index: 0, slideNumber: 1, background: null,
+    elements: [live, equation, live, { ...equationTable(live.textBody), id: 'layout' }, { ...live, id: 'slide' }],
+    elementSources: ['master', 'master', 'master', 'layout', 'slide'].map(origin => ({ origin })),
+  } as unknown as Slide;
+  const text = vi.fn();
+  await renderSlide(recordingCanvas().canvas, slide, 9_144_000, 6_858_000, { width: 960, dpr: 1,
+    fetchImage: async () => new Blob([pngHeader(2, 1) as BlobPart], { type: 'image/png' }),
+    math: { loadMathJax: async () => {}, mathMLToSvg: async () => { throw new Error('conversion'); } },
+  }, text);
+  const runs = text.mock.calls.map(([run]) => run);
+  // A preview is display text outside the source element tree: no invented
+  // element/shape locator. Unchanged content retains its original model index.
+  expect([...new Map(runs.map(run => [JSON.stringify([run.elementIndex, run.origin, run.shapeId]),
+    [run.elementIndex, run.origin, run.shapeId]])).values()]).toEqual([
+    [undefined, undefined, undefined], [3, 'layout', 'layout'], [4, 'slide', 'slide'],
+  ]);
+  expect([...new Set(runs.map(run => run.renderElementIndex))]).toEqual([0, 1, 2]);
+  expect(slide.elements).toHaveLength(5);
 });

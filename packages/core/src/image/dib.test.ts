@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import { MAX_RASTER_DIMENSION } from './pixel-budget.js';
 import { decodeDib, decodePackedDib, blitDibToCtx, type DecodedDib } from './dib.js';
 
 // ── DIB decode unit tests ────────────────────────────────────────────────────
@@ -216,86 +217,31 @@ describe('decodePackedDib — contiguous header+palette+bits (WMF-style)', () =>
 });
 
 describe('decodeDib — dimension / megapixel budget (DoS guard)', () => {
+  it('validates encoding and declared byte spans before admitting oversized geometry', () => {
+    const unsupported = new Uint8Array([...bmih(40000, 1, 16).build(), 0, 0, 0, 0]);
+    expect(decodeDib(dvOf(unsupported), 0, 40, 40, 4)).toBeNull();
+    const bytes = new Uint8Array([...bmih(40000, 1, 24).build(), 0, 0, 0, 0]);
+    const dv = dvOf(bytes);
+    expect(decodeDib(dv, 0, 45, 40, 4)).toBeNull(); // header span exceeds view by one byte
+    expect(decodeDib(dv, 0, 40, 40, 5)).toBeNull(); // bits span exceeds view by one byte
+    const truncated = new Uint8Array([...bmih(40000, 2, 24).build(), 0, 0, 0, 0]);
+    expect(decodeDib(dvOf(truncated), 0, 40, 40, 4)).toBeNull(); // already-discarded multi-row bitmap
+    expect(decodeDib(dv, 0, 40, 40, 4)).toBeNull(); // even a one-row bitmap needs its complete pixels to prove a crossing
+  });
+
   // A crafted BITMAPINFOHEADER can declare enormous dimensions while carrying
   // only a few bytes of pixel data. The decode must REJECT such headers before
   // it reaches `new Uint8ClampedArray(width * height * 4)`, otherwise a 65535×
   // 65535 DIB demands a ~16 GiB RGBA buffer and OOMs the tab.
 
-  it('returns null for a megapixel-budget-exceeding header (65535×65535, tiny pixel data)', () => {
-    // Header declares a 65535×65535 image (≈4.29e9 px → ~17 GB RGBA) but the
-    // buffer only holds the 40-byte header + a couple of pixel bytes. Before the
-    // fix, decodeDib allocates the giant Uint8ClampedArray up front and aborts.
-    //
-    // NOTE: 65535 alone already exceeds MAX_DIB_DIMENSION (32767), so this input
-    // is caught by the dimension cap (line ~69) and never actually reaches the
-    // megapixel check (line ~70) — it pins "an absurd header is rejected before
-    // allocation" but does NOT, on its own, prove the megapixel guard is doing
-    // anything. See the next test for a megapixel-guard-ONLY isolation case.
-    const w = new Writer();
-    for (const b of bmih(65535, 65535, 24).build()) w.u8(b);
-    w.u8(0).u8(0).u8(0).u8(0); // 4 stray pixel bytes — nowhere near the claimed size
-    const bytes = w.build();
-    expect(decodeDib(dvOf(bytes), 0, 40, 40, bytes.length - 40)).toBeNull();
-  });
-
-  it('returns null from the MEGAPIXEL guard alone — dimensions in-budget AND pixel buffer fully supplied (2049×32767, 1bpp)', () => {
-    // Isolates MAX_DIB_PIXELS from BOTH other early-outs in decodeDib:
-    //   1. MAX_DIB_DIMENSION: width=2049, height=32767 are each ≤ 32767, so the
-    //      per-dimension cap does NOT fire.
-    //   2. The buffer-bounds check (`bitsOff + rowStride*height > dv.byteLength`):
-    //      the pixel bits are FULLY supplied (real, in-bounds buffer — see below),
-    //      so that check does NOT fire either.
-    // Yet width × height = 67,139,583 px exceeds the 64 MP budget (67,108,864) by
-    // 30,719 px, so ONLY the megapixel guard is left to explain a null result.
-    //
-    // At 1bpp (the cheapest row encoding) rowStride = ((2049+31)>>5)<<2 = 260 B,
-    // so the fully-populated pixel buffer is 260×32767 ≈ 8.1 MiB — large enough
-    // to legitimately satisfy the bounds check, but nowhere near the ~256 MiB the
-    // RGBA output buffer would need if decode proceeded past the megapixel guard.
-    // (A narrower/taller or wider/shorter combination cannot beat ~8 MiB here:
-    // the bounds-check cost is width×height/8 bytes at 1bpp, which is pinned by
-    // the ~64 MP pixel count itself, not by this particular aspect ratio.)
-    //
-    // Isolation verified manually: commenting out ONLY the
-    // `width * height > MAX_DIB_PIXELS` line (leaving the dimension cap and
-    // bounds check intact) makes this exact test fail (decode returns a non-null
-    // 2049×32767 DIB) — confirming the megapixel guard, and only the megapixel
-    // guard, is what makes this test pass. See MAX_DIB_PIXELS in dib.ts.
-    const width = 2049;
-    const height = 32767;
-    expect(width).toBeLessThanOrEqual(32767);
-    expect(height).toBeLessThanOrEqual(32767);
-    expect(width * height).toBeGreaterThan(1 << 26);
-
-    const biBitCount = 1;
-    const rowStride = (((width * biBitCount + 31) >> 5) << 2) >>> 0;
-    const w = new Writer();
-    for (const b of bmih(width, height, biBitCount).build()) w.u8(b);
-    for (let i = 0; i < rowStride * height; i++) w.u8(0); // fully in-bounds pixel data
-    const bytes = w.build();
-    // Assert `null` via a boolean check rather than `toBeNull()`: on a decode
-    // failure (e.g. isolation broken and a real 2049×32767 DIB comes back),
-    // chai's failure-message formatter tries to stringify the multi-hundred-MB
-    // `data` typed array and itself throws `RangeError: Invalid array length`,
-    // masking the actual assertion failure. Verified this is a chai/inspect
-    // limitation, not a decodeDib bug, by reproducing with the guard disabled.
-    const dib = decodeDib(dvOf(bytes), 0, 40, 40, bytes.length - 40);
-    expect(dib === null, `expected null (megapixel guard should reject), got a ${dib?.width}×${dib?.height} DIB`).toBe(true);
-  });
-
-  it('returns null when a single dimension exceeds the max canvas dimension (40000 wide, 1 tall)', () => {
-    // 40000 > 32767 (browser max canvas dimension) but < the old 65536 cap, so
-    // the PRE-fix code accepted it. Height is 1 and the row buffer is fully
-    // supplied, so the buffer-bounds check does NOT bail — decode would succeed
-    // pre-fix (returning a 40000×1 dib) and only the new dimension cap rejects
-    // it. Such a DIB could never be blitted to a canvas anyway (>32767).
-    const width = 40000;
-    const rowStride = (((width * 24 + 31) >> 5) << 2) >>> 0; // 4-byte aligned
-    const w = new Writer();
-    for (const b of bmih(width, 1, 24).build()) w.u8(b); // 40000 × 1, bottom-up
-    for (let i = 0; i < rowStride; i++) w.u8(0); // one full, in-bounds pixel row
-    const bytes = w.build();
-    expect(decodeDib(dvOf(bytes), 0, 40, 40, bytes.length - 40)).toBeNull();
+  it.each([
+    [40000, 1, 'image-dimension', MAX_RASTER_DIMENSION, 40000],
+  ] as const)('throws a typed budget error before allocating %i×%i RGBA', (width, height, metric, limit, observed) => {
+    const bytes = new Uint8Array(40 + width * height * 3);
+    bytes.set(bmih(width, height, 24).build());
+    const expected = expect.objectContaining({ code: 'ooxml-decoded-image-limit', metric, limit, observed });
+    expect(() => decodeDib(dvOf(bytes), 0, 40, 40, bytes.length - 40)).toThrowError(expected);
+    expect(() => decodePackedDib(dvOf(bytes), 0, bytes.length)).toThrowError(expected);
   });
 
   it('still decodes a large-but-in-budget DIB (within dimension and megapixel caps)', () => {

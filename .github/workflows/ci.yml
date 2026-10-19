@@ -43,9 +43,9 @@ jobs:
       - name: Legacy reader clippy (per feature)
         run: |
           for features in direct-doc direct-xls direct-ppt inspection; do
-            cargo clippy -p legacy-office-converter --all-targets --features "$features" -- -D warnings
+            cargo clippy -p legacy-office-parser --all-targets --features "$features" -- -D warnings
           done
-          cargo clippy -p legacy-office-converter --all-targets --all-features -- -D warnings
+          cargo clippy -p legacy-office-parser --all-targets --all-features -- -D warnings
 
       # The cargo-fuzz harness is an intentionally independent workspace, so
       # the root workspace checks above do not format, lint, or compile it.
@@ -63,9 +63,9 @@ jobs:
       - name: Legacy reader tests (per feature)
         run: |
           for features in direct-doc direct-xls direct-ppt; do
-            cargo test -p legacy-office-converter --features "$features"
+            cargo test -p legacy-office-parser --features "$features"
           done
-          cargo test -p legacy-office-converter --all-features
+          cargo test -p legacy-office-parser --all-features
 
   # RB8 — dependency vulnerability audit. Report-only for now
   # (continue-on-error): one known advisory already exists at introduction —
@@ -136,13 +136,16 @@ jobs:
             packages/pptx/parser
             packages/xlsx/parser
             packages/docx/parser
-            packages/legacy-converter/parser
+            packages/legacy-office/parser
 
       - name: Install wasm-pack
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+
+      - name: Verify companion version lockstep
+        run: pnpm check:versions
 
       # ast-grep lint runs on source only (no WASM needed) — fail fast.
       - name: ast-grep rule tests
@@ -158,6 +161,7 @@ jobs:
         run: |
           pnpm test:docx-boundaries
           pnpm test:docx-compatibility
+          pnpm test:docx-compatibility-build
           pnpm test:docx-public-api
           node scripts/check-docx-layout-boundaries.mjs --final
           pnpm check:docx-compatibility
@@ -167,6 +171,7 @@ jobs:
           node --test scripts/check-core-legacy-boundary.test.mjs
           pnpm check:core-legacy-boundary
           node --test scripts/check-model-source-lazy-graph.test.mjs
+          node --test scripts/check-production-render-workers.test.mjs
           node --test scripts/check-model-source-lazy-runtime.test.mjs
           node --test scripts/check-model-source-ooxml-path.test.mjs
           pnpm check:model-source-ooxml-path
@@ -186,11 +191,23 @@ jobs:
         env:
           OOXML_REQUIRE_SKIA: '1'
 
+      # Python regressions for the legacy-office probe tools and the font
+      # reference-metrics generator. uv supplies their pinned dependencies.
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Python tool tests
+        run: pnpm test:python
+
       - name: Typecheck
         run: pnpm typecheck
 
       - name: Build packages
         run: pnpm build:packages:ci
+
+      # Each format's library dist must locate its parser WASM relative to the
+      # loading module, never at the hosting origin's root.
+      - name: Package WASM URLs are module-relative
+        run: pnpm check:relative-wasm-urls packages/docx/dist packages/xlsx/dist packages/pptx/dist
 
       - name: DOCX package build ownership
         run: pnpm test:docx-package-build
@@ -209,6 +226,18 @@ jobs:
           pnpm check:legacy-wasm-exports
           pnpm check:public-type-exports
           pnpm check:public-api:built
+          pnpm check:no-inline-wasm
+          pnpm check:relative-wasm-urls dist packages/legacy-office/dist
+
+      - name: Install Playwright Chrome (only if missing)
+        timeout-minutes: 5
+        run: |
+          if ! command -v google-chrome >/dev/null 2>&1; then
+            pnpm exec playwright install chrome --with-deps
+          fi
+
+      - name: Verify both packed packages in Node and Vite
+        run: pnpm test:packed-packages
 
       # Typecheck resolves the editor against PPTX source types. Build its
       # Vite library output separately to validate the publish configuration.
@@ -239,7 +268,7 @@ jobs:
             packages/pptx/parser
             packages/xlsx/parser
             packages/docx/parser
-            packages/legacy-converter/parser
+            packages/legacy-office/parser
       - name: Install wasm-pack
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
       - name: Install dependencies
@@ -305,10 +334,10 @@ jobs:
 
       - name: Published render-worker smoke
         run: |
-          # This job validates runtime assets, not declarations. Declaration
-          # compatibility has its own clean-build job; avoiding a second
-          # rolldown-plugin-dts invocation also keeps this browser job focused.
+          # Root declarations have their own clean-build job. Build the
+          # companion too: the browser fixture uses its emitted source modules.
           pnpm build:runtime
+          pnpm build:legacy
           pnpm check:model-source-lazy-graph
           pnpm check:model-source-lazy-runtime
           pnpm check:production-render-workers
@@ -330,3 +359,9 @@ jobs:
       # compared between engines.
       - name: DOCX synthetic conformance (all browser engines)
         run: pnpm --filter @silurus/ooxml-docx conformance
+
+      # Focused browser fixtures (pattern fills, text effects, run inheritance,
+      # DOCX watermark and PPTX transform phases) on main and worker canvases.
+      # Chrome only, reusing the Google Chrome and WASM above.
+      - name: Pattern browser tests
+        run: pnpm test:pattern-browser

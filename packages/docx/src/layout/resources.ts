@@ -3,7 +3,6 @@ import { stableFingerprint } from './fingerprint.js';
 import type { BodyElement, DocParagraph, DocxDocumentModel } from '../types.js';
 import type { BodyAcquisitionInputProjections } from './acquisition-input-projections.js';
 import type { MathNode } from '@silurus/ooxml-core';
-import { rasterExceedsBudget, sniffRasterDimensions } from '@silurus/ooxml-core';
 import { mathResourceKey } from './source-key.js';
 import { projectDocumentSnapshotResources } from './production-paint-resources.js';
 
@@ -101,25 +100,6 @@ export function createImageMetadataService(records: readonly ImageMetadataRecord
       return resource;
     },
   });
-}
-
-export function rasterImageMetadataRecord(
-  resourceKey: string,
-  bytes: Uint8Array,
-  mimeType: string,
-  dpi: number,
-): ImageMetadataRecord {
-  const dimensions = sniffRasterDimensions(bytes);
-  if (!dimensions || rasterExceedsBudget(dimensions)) {
-    throw new Error(`Raster dimensions are unavailable or unsafe for ${resourceKey}`);
-  }
-  if (!Number.isFinite(dpi) || dpi <= 0) throw new RangeError('dpi must be positive');
-  return {
-    resourceKey,
-    widthPt: dimensions.width * 72 / dpi,
-    heightPt: dimensions.height * 72 / dpi,
-    mimeType,
-  };
 }
 
 export function createMathMetadataService(records: readonly MathLayoutResource[]): MathMetadataService {

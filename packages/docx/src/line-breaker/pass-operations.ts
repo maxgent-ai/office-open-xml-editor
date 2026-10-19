@@ -12,6 +12,7 @@ import {
   wordSnapToCharsEastAsianCellCount,
   wordIdeographicSpaceLineEndAllowanceCount,
   wordJustifiedInterwordCompressionFactor,
+  WORD_RUBY_LINE_ASCENT,
 } from '../layout/line-compatibility.js';
 import {
   type LayoutImageSeg,
@@ -20,6 +21,7 @@ import {
   type LayoutTabSeg,
   type LayoutTextSeg,
   type LineBoundary,
+  type WrapLayoutCtx,
 } from './model.js';
 import { createLineBreakerState, type GapTransaction, type GapWindow } from './break-queue.js';
 import {
@@ -37,6 +39,7 @@ import {
 import {
   RESET_SLICED_TEXT_MEASUREMENT,
   charScaleFactor,
+  leadingAutoSpacePx,
   segLetterSpacingPx,
   charSpacingDeltaPx,
   protectedNoBreakOffsets,
@@ -95,6 +98,9 @@ export interface PassOperationState extends LineBreakerPassInput {
     asc: number,
     desc: number,
   ) => void;
+  /** Join a metric-only marker's height to the current line (see
+   * `LayoutImageSeg.markerMetric`). */
+  readonly admitLineMetric: (s: LayoutImageSeg, h: number, asc: number) => void;
   readonly measurement: LineMeasurementAdapter;
   readonly effectiveFontPx: (s: LayoutTextSeg) => number;
   readonly measureText: (s: LayoutTextSeg, clusterGeometry?: boolean) => TextMetrics;
@@ -294,6 +300,8 @@ function resetPhysicalLineMetrics({ breakerState }: PassOperationState): void {
   breakerState.lineVisibleDescent = 0;
   breakerState.lineVisibleIntendedSingle = 0;
   breakerState.lineHasVisibleMetrics = false;
+  breakerState.lineMarkerHeight = 0;
+  breakerState.lineMarkerAscent = 0;
   breakerState.lineHasRuby = false;
   breakerState.lineEastAsian = false;
   breakerState.positionReferencePt = undefined;
@@ -357,6 +365,44 @@ export function performStartLine(operationState: PassOperationState, requirement
   placeLineWindow(operationState, transaction, null);
 }
 
+/** Windows Word 16.0 controls (issue #1883: decimal, bullet, picture and long
+ * markers; left/right/center lvlJc; tab/space/nothing suffixes; custom stops;
+ * hanging, first-line and zero indents; 72-360pt floats on either side, distR
+ * 0-30pt, RTL) show a numbered first line beside a float placed exactly like a
+ * plain paragraph that starts with the marker text: the leading edge is
+ * max(max(indent, wrap) + firstLine, wrap), the marker is aligned there and its
+ * suffix tab advances to the paragraph's absolute stops (hanging stop, custom
+ * stops, then default stops from the margin). Lines whose leading edge the
+ * window leaves where the indents put it keep the precomputed body offset. */
+function placeNumberingFirstLine(
+  operationState: PassOperationState,
+  numbering: NonNullable<WrapLayoutCtx['numberingFirstLine']>,
+  hangingOffset: number,
+): void {
+  const { breakerState, maxWidth, baseRtl } = operationState;
+  const base = baseRtl
+    ? maxWidth - (breakerState.lineXOffset + breakerState.lineMaxWidth)
+    : breakerState.lineXOffset;
+  const windowEdge = base + hangingOffset;
+  const authored = numbering.authoredFirstIndentPx;
+  const leadingEdge = Math.max(Math.max(0, windowEdge) + authored, windowEdge);
+  if (leadingEdge <= authored) {
+    breakerState.firstIndentOverride = undefined;
+    breakerState.numberingFirstLine = undefined;
+    return;
+  }
+  const bodyIndent = Math.max(leadingEdge, numbering.bodyIndentAt(leadingEdge));
+  // The breaker reads a line's window start as origin + min(0, first indent).
+  // The body indent is never negative here, so re-anchor the origin at the
+  // window's real leading edge (keeping its trailing edge) before charging it.
+  if (!baseRtl) breakerState.lineXOffset += hangingOffset;
+  breakerState.lineMaxWidth -= hangingOffset;
+  breakerState.firstIndentOverride = bodyIndent - windowEdge;
+  breakerState.numberingFirstLine = {
+    leadingEdgePx: leadingEdge, bodyIndentPx: bodyIndent, lineStartOffsetPx: bodyIndent - windowEdge,
+  };
+}
+
 /** Search the first admissible window for the transaction's requirement:
  * a later gap on the continuation baseline, else a new physical line. */
 function placeLineWindow(
@@ -375,7 +421,9 @@ function placeLineWindow(
   // The measured-line contract still carries the authored firstIndent: restore
   // it in the returned width so fit/tab arithmetic and planLine consume the
   // same safe window, including the mirrored logical start of RTL paragraphs.
-  const hangingOffset = breakerState.isFirst ? Math.min(0, firstIndent) : 0;
+  const numbering = breakerState.isFirst ? wrapCtx.numberingFirstLine : undefined;
+  const hangingOffset = breakerState.isFirst
+    ? Math.min(0, numbering ? numbering.authoredFirstIndentPx : firstIndent) : 0;
   const lineBandX = wrapCtx.paraX + (baseRtl ? 0 : hangingOffset);
   const lineBandWidth = maxWidth - hangingOffset;
   const reference = {
@@ -460,6 +508,7 @@ function placeLineWindow(
   breakerState.currentLineTopY = accepted.topY;
   breakerState.lineXOffset = accepted.xOffset;
   breakerState.lineMaxWidth = accepted.maxWidth;
+  if (numbering) placeNumberingFirstLine(operationState, numbering, hangingOffset);
   // A trailing-indent extension exists only beside an unnarrowed band, and
   // only where no exclusion intersects it on this line (§20.4.2.17–.19).
   const extension = marginExtensionWidth(operationState);
@@ -700,7 +749,7 @@ export function performFlush(
   const linePositionReferencePt = breakerState.positionReferencePt ?? 0;
   // §17.3.3.1 — the break is one run among the line's runs: its own size
   // participates in the line height but must not override a taller peer.
-  const h =
+  const contentHeight =
     forceHeight !== undefined
       ? Math.max(breakerState.lineHeight, forceHeight)
       : breakerState.lineHeight || 10;
@@ -708,23 +757,37 @@ export function performFlush(
   // stable ascent/descent from the effective font size so wrap/baseline math
   // stays consistent with non-empty lines.
   const hasContent = breakerState.lineAscent > 0 || breakerState.lineDescent > 0;
-  const asc = hasContent ? breakerState.lineAscent : h * scale * 0.8;
-  const desc = hasContent ? breakerState.lineDescent : h * scale * 0.2;
-  const visibleAscent = breakerState.lineHasVisibleMetrics ? breakerState.lineVisibleAscent : asc;
+  const contentAscent = hasContent ? breakerState.lineAscent : contentHeight * scale * 0.8;
+  const desc = hasContent ? breakerState.lineDescent : contentHeight * scale * 0.2;
+  // A picture-bullet marker metric joins that box (its own or synthesized)
+  // as a minimum ascent above the baseline.
+  const asc = Math.max(contentAscent, breakerState.lineMarkerAscent);
+  const h = Math.max(contentHeight, breakerState.lineMarkerHeight);
+  const visibleAscent = breakerState.lineHasVisibleMetrics
+    ? Math.max(breakerState.lineVisibleAscent, breakerState.lineMarkerAscent)
+    : asc;
   const visibleDescent = breakerState.lineHasVisibleMetrics
     ? breakerState.lineVisibleDescent
     : desc;
   const visibleIntendedSingle = breakerState.lineHasVisibleMetrics
     ? breakerState.lineVisibleIntendedSingle
     : breakerState.lineIntendedSingle;
-  const gridCountSingle =
+  const gridCountSingle = Math.max(
     breakerState.lineGridCountSingle ||
-    (breakerState.lineEastAsian
-      ? eastAsianGridCountSinglePx(breakerState.lineIntendedSingle, h * scale)
-      : asc + desc);
+      (breakerState.lineEastAsian
+        ? eastAsianGridCountSinglePx(breakerState.lineIntendedSingle, contentHeight * scale)
+        : contentAscent + desc),
+    breakerState.lineMarkerAscent,
+  );
+  // A picture-bullet marker metric takes its line's own text leading: the
+  // natural single line of the content (or of a break's synthesized box),
+  // never the paragraph mark's. An inline picture keeps its established union
+  // with the paragraph mark.
   const inlinePictureTextSingle = breakerState.lineHasInlinePicture
     ? Math.max(breakerState.lineIntendedSingle, breakerState.linePictureMarkSingle)
-    : 0;
+    : breakerState.lineMarkerAscent > 0
+      ? Math.max(breakerState.lineIntendedSingle, contentAscent + desc)
+      : 0;
   // Only project that registered rule when every metric-bearing item is
   // visible text in one admitted face tuple. Canvas fallback geometry does
   // not reveal hhea descent, and mixed styles cannot share one descent
@@ -744,13 +807,28 @@ export function performFlush(
             firstPositioned.resolvedDesignDescentRatio * firstPositioned.fontSize * scale,
         }
       : undefined;
+  const justifiedGapPlan = justifiedCompressionApplies(operationState)
+    ? lineGapModel(breakerState.currentLine.map(s => gapSegment(operationState, s)))
+    : undefined;
   breakerState.lines.push({
+    ...(breakerState.isFirst && breakerState.numberingFirstLine
+      ? { numberingFirstLine: breakerState.numberingFirstLine } : {}),
     physicalLineIndex: breakerState.physicalLineIndex,
-    ...(justifiedCompressionApplies(operationState)
+    ...(justifiedGapPlan
       ? {
-          justifiedCompressionPx: breakerState.justifiedCompressionPx,
+          // A unit forced onto a compressed line afterwards (a kinsoku
+          // leader or glued follower) lengthens it; the retained overflow is
+          // that of the line actually closed, which paint distributes.
+          // The accepted compression, never more than the closed line's own
+          // overflow (a retraction may shorten it). A unit forced onto the
+          // line afterwards (a kinsoku leader or glued follower) overflows
+          // beyond it instead of shrinking gaps past the accepted amount.
+          justifiedCompressionPx: Math.min(
+            breakerState.justifiedCompressionPx,
+            Math.max(0, justifiedGapPlan.visibleWidthPx - operationState.availW()),
+          ),
           gapPlan: {
-            ...lineGapModel(breakerState.currentLine.map(s => gapSegment(operationState, s))),
+            ...justifiedGapPlan,
             // CJK/ideographic/SEA expansion has no proportional measurement.
             // Retain its previous opportunities; family selection lives in core.
             expansionGaps: enumerateGaps(breakerState.currentLine.map(s => ({
@@ -869,8 +947,16 @@ export function performAddToLine(
   } = operationState;
 
   let committedWidth = w;
+  if ('text' in s && s.autoSpaceBeforePt !== undefined) {
+    const delta = resolveAutoSpaceAtPlacement(operationState, s);
+    if (delta !== 0) {
+      w += delta;
+      committedWidth = w;
+    }
+  }
   if ('text' in s) {
     const kind = snapToCharsClass(s, characterGrid);
+    // `word-snap-to-chars-script-block-allocation`
     const naturalWidth = s.snapGridNaturalWidthPx ?? w;
     if (kind && snapPitchPx != null) {
       s.snapGridClass = kind;
@@ -1058,6 +1144,27 @@ export function performAddToLine(
     breakerState.lineGridCountSingle = segGridCount;
 }
 
+/** Admit a metric-only picture-bullet marker that takes no width or segment
+ * slot: `performFlush` unions its height into the line's ascent, visible box
+ * and line-grid cell count, and the line takes inline-picture leading from
+ * its own text single line. */
+export function performAdmitLineMetric(
+  operationState: PassOperationState,
+  s: LayoutImageSeg,
+  h: number,
+  asc: number,
+): void {
+  const { breakerState, scale } = operationState;
+  // Held apart from the content box so that a line without other content
+  // (a leading break) keeps its synthesized font box; `performFlush` unions it.
+  breakerState.lineMarkerHeight = Math.max(breakerState.lineMarkerHeight, h);
+  breakerState.lineMarkerAscent = Math.max(breakerState.lineMarkerAscent, asc);
+  breakerState.linePictureMarkSingle = Math.max(
+    breakerState.linePictureMarkSingle,
+    (s.paragraphMarkSinglePx ?? 0) * scale,
+  );
+}
+
 export function performSegNaturalAdvance(
   operationState: PassOperationState,
   s: LayoutTextSeg,
@@ -1068,7 +1175,32 @@ export function performSegNaturalAdvance(
     measureText(s).width + verticalInkExtra(s, s.text),
     characterGrid,
     scale,
-  );
+  ) + leadingAutoSpacePx(operationState, s);
+}
+
+/** The committed line's last item is text: a following segment's automatic
+ * gap is then on the same line as its partner (assignment already requires
+ * the partner to be the immediately preceding text). */
+export function lineEndsWithText(line: readonly LayoutSeg[]): boolean {
+  const last = line.at(-1);
+  return last !== undefined && 'text' in last;
+}
+
+/** Resolve the gap a segment applies at placement: the same-line value after
+ * text, nothing at a line start. Keeps the committed width and the retained
+ * glyph shift in agreement. Returns the width change. */
+function resolveAutoSpaceAtPlacement(
+  operationState: Pick<PassOperationState, 'characterGrid' | 'scale' | 'breakerState'>,
+  s: LayoutTextSeg,
+): number {
+  if (s.autoSpaceBeforePt === undefined) return 0;
+  const applied = leadingAutoSpacePx(operationState, s);
+  const sameLine = lineEndsWithText(operationState.breakerState.currentLine);
+  const desired = sameLine && operationState.characterGrid?.type !== 'snapToChars'
+    ? (s.autoSpaceLeadingPx ?? s.autoSpaceBeforePt * operationState.scale)
+    : 0;
+  s.autoSpaceLeadingPx = desired;
+  return desired - applied;
 }
 
 export function performStandaloneSnapAdvance(
@@ -1111,6 +1243,7 @@ export function performStrNaturalAdvance(
       Math.max(0, start) + text.length,
     ),
   };
+  const leading = start <= 0 && text.length > 0 ? leadingAutoSpacePx(operationState, s) : 0;
   if (s.textLayoutService && s.textShapeRequest) {
     const shaped = s.textLayoutService.shape({
       ...sliceTextShapeRequest(s.textShapeRequest, Math.max(0, start), Math.max(0, start) + text.length),
@@ -1123,7 +1256,7 @@ export function performStrNaturalAdvance(
       shaped.advancePt + verticalInkExtra(s, text),
       characterGrid,
       scale,
-    );
+    ) + leading;
   }
   const natural = measurement.measureRunText(s, text).width;
   return segAdvanceWidth(
@@ -1131,7 +1264,7 @@ export function performStrNaturalAdvance(
     natural + verticalInkExtra(s, text),
     characterGrid,
     scale,
-  );
+  ) + leading;
 }
 
 export function performEastAsianSnapCellCount(
@@ -1169,7 +1302,10 @@ export function performEastAsianSnapCellCount(
     const measuredSegment = {
       ...s,
       text,
-      ...slicedTextMetadata(s, start, end),
+      // Cell probes need shape/width metadata only, not cloned marker lists.
+      textShapeRequest: s.textShapeRequest
+        ? sliceTextShapeRequest(s.textShapeRequest, start, end) : undefined,
+      punctuationCompressions: slicedPunctuationCompressions(s, start, end),
     };
     let naturalAdvancePx: number;
     if (range.advancePx != null) {
@@ -1207,7 +1343,15 @@ export function performStrAdvance(
     text,
     // Snap-cell acquisition can remeasure this candidate, so it needs the
     // same retained range as strNaturalAdvance, not the parent word request.
-    ...slicedTextMetadata(s, Math.max(0, start), Math.max(0, start) + text.length),
+    // This is a measurement probe, not an accepted source slice. Keep marker
+    // arrays shared: filtering/cloning all optional breaks per candidate prefix
+    // makes dense-marker searches allocate quadratically before their quota.
+    ...(s.textShapeRequest ? { textShapeRequest: sliceTextShapeRequest(
+      s.textShapeRequest, Math.max(0, start), Math.max(0, start) + text.length,
+    ) } : {}),
+    punctuationCompressions: slicedPunctuationCompressions(
+      s, Math.max(0, start), Math.max(0, start) + text.length,
+    ),
     shapedClusters: text === s.text ? s.shapedClusters : undefined,
   };
   return standaloneSnapAdvance(
@@ -1308,12 +1452,43 @@ function gapSegment(state: Pick<PassOperationState, 'strAdvance' | 'scale' | 'ch
     const spacePx = spaceWidths.values().next().value ?? (start >= 0 && !segment.ruby
       ? state.strAdvance({ ...segment, text: ' ', ...slicedTextMetadata(segment, start, start + 1) }, ' ')
       : 0);
+    const leadingGapPx = leadingAutoSpacePx(state, segment);
     return {
       text: segment.metricOnly ? '' : segment.ruby ? undefined : segment.text,
       widthPx: segment.measuredWidth, spacePx, spaceWidths,
+      ...(leadingGapPx > 0 ? { leadingGapPx } : {}),
     };
   }
   return { widthPx: segment.measuredWidth, spacePx: 0 };
+}
+
+/** WORD_JUSTIFIED_INTERWORD_COMPRESSION for a prefix of a breakable (CJK)
+ * segment after the line's content: the overflow C the line keeps when the
+ * prefix is admitted (0 when it fits naturally), or undefined when refused.
+ * The same gap model and factor as a whole unit (fitJustifiedCompression). */
+export function justifiedPrefixCompression(state: Pick<PassOperationState,
+  'justifiedCompression' | 'baseRtl' | 'widthPolicy' | 'characterGrid' | 'breakerState'
+  | 'strAdvance' | 'availW' | 'scale'>, s: LayoutTextSeg, prefix: string): number | undefined {
+  const { breakerState: breaker } = state;
+  if (!justifiedCompressionApplies(state) || s.fitTextRegionIndex !== undefined
+    || breaker.currentLine.length === 0 || prefix.length === 0) return undefined;
+  if (!breaker.justifiedGapModel || breaker.justifiedGapModel.segmentCount !== breaker.currentLine.length) {
+    breaker.justifiedGapModel = lineGapModel(breaker.currentLine.map(item => gapSegment(state, item)), undefined, false);
+  }
+  const previous = breaker.justifiedGapModel;
+  const candidate: LayoutTextSeg = {
+    ...s, ...RESET_SLICED_TEXT_MEASUREMENT, text: prefix,
+    ...slicedTextMetadata(s, 0, prefix.length), measuredWidth: state.strAdvance(s, prefix),
+  };
+  const model = lineGapModel([gapSegment(state, candidate)], previous, false);
+  const overflow = model.visibleWidthPx - state.availW();
+  if (!(overflow > 0)) return 0;
+  return wordJustifiedInterwordCompressionFactor({
+    overflow, naturalGapSum: model.S,
+    candidateLineEndSeparator: model.lineEndSeparatorPx,
+    previousOpportunitySum: previous.S + previous.lineEndSeparatorPx,
+    expansionWithoutCandidate: state.availW() - previous.visibleWidthPx,
+  }) === undefined ? undefined : overflow;
 }
 
 /** Admit the whole unit against the same natural gap model that layout uses
@@ -1409,7 +1584,7 @@ export function performTextSegmentBox(
     measured.width + verticalInkExtra(s, s.text),
     characterGrid,
     scale,
-  );
+  ) + leadingAutoSpacePx(operationState, s);
   s.snapGridNaturalWidthPx = width;
   // Max-content uses the unbroken native context, as its ordinary intrinsic
   // text merge already does. Registered physical units must stay intact;
@@ -1428,7 +1603,7 @@ export function performTextSegmentBox(
   let metricMeasurement = measured;
   let metricEmPx = effectiveFontPx(s);
   if (s.metricOnly && s.metricProbeText) {
-    // Native reserved-separator participant (MS-DOC 2.3.3): its own text is
+    // Reserved-separator participant: its own text is
     // empty, so its vertical metrics come from its bounded probe through the
     // same selected face, at the existing effective metric size in this
     // caller's scale (super/sub scaling; small caps keep the full-size policy
@@ -1484,9 +1659,12 @@ export function performTextSegmentBox(
   // height; native reference sides are policy geometry only. Ruby and an
   // authored baseline position compose additional boxes outside either
   // simple OpenType projection, so retain measured sides for those inputs.
+  // A ruby base with an authored hpsRaise keeps its own design sides: the
+  // guide only raises the ascent (WORD_RUBY_LINE_ASCENT below). Ruby without
+  // hpsRaise is outside that measured class and keeps measured sides.
   const designOwnsSides =
+    (!s.ruby || s.ruby.hpsRaisePt != null) &&
     (s.resolvedResourceVerticalMetric || s.referenceFontVerticalMetric) &&
-    !s.ruby &&
     (s.position ?? 0) === 0 &&
     s.resolvedDesignAscentRatio != null &&
     s.resolvedDesignDescentRatio != null;
@@ -1498,7 +1676,7 @@ export function performTextSegmentBox(
     else if (positionPx < 0) descent -= positionPx;
   }
   if (s.ruby && (!s.textBoxLineFloor || s.textBoxVertical)) {
-    ascent += rubyAscentReservePx(
+    const reserve = rubyAscentReservePx(
       s.ruby.fontSizePt,
       s.ruby.hpsRaisePt,
       scale,
@@ -1506,6 +1684,14 @@ export function performTextSegmentBox(
       ctx,
       fontFamilyClasses,
     );
+    void WORD_RUBY_LINE_ASCENT;
+    // WORD_RUBY_LINE_ASCENT: with an authored hpsRaise the guide's em box
+    // stands that far above the base baseline, and the line's ascent is the
+    // larger of the base ascent and the guide's top. Without hpsRaise the
+    // retained ink-derived reserve keeps its established additive form.
+    ascent = s.ruby.hpsRaisePt != null
+      ? Math.max(ascent, reserve + s.ruby.fontSizePt * scale)
+      : ascent + reserve;
   }
   return { width, height: s.fontSize, ascent, descent };
 }
@@ -1588,6 +1774,7 @@ export function performTabFollowWidth(operationState: PassOperationState, q: Lay
   return segAdvance(q);
 }
 
+// `word-decimal-tab-separator-resolution`
 export function performDecimalAlignmentPoint(
   segments: readonly LayoutSeg[],
 ): Readonly<{ segmentIndex: number; charOffset: number }> | null {

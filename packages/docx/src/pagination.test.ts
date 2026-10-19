@@ -164,7 +164,7 @@ function inlineChartRun(widthPt: number, heightPt: number): DocRun {
 
 /** A single-column block table whose rows each have a fixed `exact` height (pt),
  *  so its measured height is deterministic and independent of cell-content
- *  measurement (resolveTableRowHeights short-circuits on rowHeightRule="exact"). */
+ *  measurement (an exact rowHeightRule short-circuits it). */
 function fixedTable(rowHeightsPt: number[]): BodyElement {
   const rows: DocTableRow[] = rowHeightsPt.map((hPt) => ({
     cells: [
@@ -1799,7 +1799,9 @@ describe('layoutPages — explicit column break (§17.3.1.20)', () => {
     expect(colOf(pages[1].layers.body[0])).toBe(0); // c on page 2, column 0
   });
 
-  it('ignores a trailing column break when no following content exists', () => {
+  // Windows Word 16.0.20430 (#1896 control C4): the last-column break still
+  // starts a page, which stays empty at the end of the document.
+  it('starts an empty page for a last-column break that ends the document', () => {
     const body = [
       para({ text: 'a', fontSize: 20 }),
       colBreak(),
@@ -1807,14 +1809,17 @@ describe('layoutPages — explicit column break (§17.3.1.20)', () => {
       colBreak(),
     ];
     const pages = layoutPages(body, twoCol(), makeCtx());
-    expect(pages.length).toBe(1);
+    expect(pages.length).toBe(2);
     const paras = pages[0].layers.body.filter((e) => e.kind === 'paragraph');
     expect(paras.map(textOf)).toEqual(['a', 'b']);
     expect(colOf(paras[0])).toBe(0);
     expect(colOf(paras[1])).toBe(1);
   });
 
-  it('ignores a terminal last-column break before a hard page boundary', () => {
+  // ECMA-376 §17.18.4: a column break in the last column moves to the next
+  // page even when only a hard page boundary follows (Windows Word 16.0.20430,
+  // #1896 control C1: an empty page 2 precedes the page break's content).
+  it('advances a terminal last-column break to a new page before a hard page boundary', () => {
     const body = [
       para({ text: 'a', fontSize: 20 }),
       colBreak(),
@@ -1825,9 +1830,9 @@ describe('layoutPages — explicit column break (§17.3.1.20)', () => {
     ];
     const pages = layoutPages(body, twoCol(), makeCtx());
 
-    expect(pages).toHaveLength(2);
+    expect(pages).toHaveLength(3);
     expect(pages[0].layers.body.map(textOf)).toEqual(['a', 'b']);
-    expect(pages[1].layers.body.map(textOf)).toEqual(['c']);
+    expect(pages[2].layers.body.map(textOf)).toEqual(['c']);
   });
 });
 

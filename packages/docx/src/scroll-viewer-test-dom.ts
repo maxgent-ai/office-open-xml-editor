@@ -301,6 +301,14 @@ export function makeContainer(clientWidth = 800, clientHeight = 600): FakeEl {
   return c;
 }
 
+const resizeObservers = new Map<object, () => void>();
+
+/** Dispatch a resize through the observer registered on this viewer's container. */
+export function resizeViewer(viewer: unknown): void {
+  const host = (viewer as { _container: object })._container;
+  resizeObservers.get(host)?.();
+}
+
 /** Install a recording document + window + ResizeObserver into globals.
  *  Returns the last-constructed ResizeObserver callback so a test can fire a
  *  synthetic resize. Call `vi.unstubAllGlobals()` in afterEach. */
@@ -308,6 +316,7 @@ export function installDom(): {
   resizeCb: () => (() => void) | undefined;
   dispatchDocument(type: string, event?: unknown): void;
 } {
+  resizeObservers.clear();
   let lastResizeCb: (() => void) | undefined;
   const listeners = new Map<string, Array<(event: unknown) => void>>();
   vi.stubGlobal('document', {
@@ -324,11 +333,13 @@ export function installDom(): {
   vi.stubGlobal(
     'ResizeObserver',
     class {
-      constructor(cb: () => void) {
+      constructor(private readonly cb: () => void) {
         lastResizeCb = cb;
       }
-      observe(): void {}
-      disconnect(): void {}
+      observe(target: object): void { resizeObservers.set(target, this.cb); }
+      disconnect(): void {
+        for (const [target, cb] of resizeObservers) if (cb === this.cb) resizeObservers.delete(target);
+      }
     },
   );
   return {
@@ -595,4 +606,22 @@ export class FakeDocxEngine {
   asDoc(): DocxDocument {
     return this as unknown as DocxDocument;
   }
+}
+
+/** Inspect internal controller contracts without adding methods to shipped viewers. */
+export function viewerState(viewer: unknown) {
+  const state = viewer as {
+    _slots: Map<number, { mediaInteractive?: boolean }>;
+    _baseScale(): number;
+    _renderEpoch: number;
+    _navigation: { contentAtViewportY(y: number): { unit: number; frac: number }; viewportYOf(unit: number, frac: number): number };
+  };
+  return {
+    mounted: () => [...state._slots.keys()],
+    interactive: () => [...state._slots].filter(([, slot]) => slot.mediaInteractive).map(([index]) => index),
+    baseScale: () => state._baseScale(),
+    epoch: () => state._renderEpoch,
+    contentAt: (y: number) => { const p = state._navigation.contentAtViewportY(y); return { page: p.unit, frac: p.frac }; },
+    viewportYOf: (unit: number, frac: number) => state._navigation.viewportYOf(unit, frac),
+  };
 }

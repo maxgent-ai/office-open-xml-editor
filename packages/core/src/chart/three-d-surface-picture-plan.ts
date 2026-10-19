@@ -1,3 +1,4 @@
+import { assertChartImageWork, rejectChartImageGeometry } from './image-fill-errors.js';
 import type { ImageFill } from '../types/common.js';
 import type { ChartThreeDSurface } from '../types/chart.js';
 import { MAX_CHART_IMAGE_FILL_TILES } from './resource-limits.js';
@@ -76,7 +77,7 @@ function boundedSurfacePicturePlan(plan: SurfacePicturePlan): SurfacePicturePlan
   let work = 0;
   for (let faceIndex = 0; faceIndex < 6; faceIndex++) {
     work += surfacePictureFaceRepetitions(plan, faceIndex);
-    if (work > MAX_CHART_IMAGE_FILL_TILES) return null;
+    assertChartImageWork(work, MAX_CHART_IMAGE_FILL_TILES);
   }
   return plan;
 }
@@ -94,8 +95,8 @@ function relativeRectIsSupported(rect: ImageFill['srcRect'] | ImageFill['fillRec
   const values = [l, t, r, b];
   const right = 1 - r;
   const bottom = 1 - b;
-  return values.every(Number.isFinite)
-    && right > l && bottom > t
+  if (!values.every(Number.isFinite) || !Number.isFinite(right - l) || !Number.isFinite(bottom - t)) rejectChartImageGeometry();
+  return right > l && bottom > t
     && Math.min(1, right) > Math.max(0, l)
     && Math.min(1, bottom) > Math.max(0, t);
 }
@@ -130,7 +131,7 @@ export function planChartThreeDSurfacePicture(
     return null;
   }
   const thickness = surface?.thicknessPercent ?? 0;
-  if (!Number.isFinite(thickness) || thickness < 0) return null;
+  if (!Number.isFinite(thickness) || thickness < 0) rejectChartImageGeometry();
   const slabFaces = thickness === 0
     ? undefined
     : {
@@ -165,7 +166,8 @@ export function planChartThreeDSurfacePicture(
   }
   if (format !== 'stackScale') return null;
   const stackUnit = options?.pictureStackUnit;
-  if (!(stackUnit != null && Number.isFinite(stackUnit) && stackUnit > 0)) return null;
+  if (stackUnit == null) return null;
+  if (!(Number.isFinite(stackUnit) && stackUnit > 0)) rejectChartImageGeometry();
   // MS-OE376 §2.1.1543(c): Excel ignores pictureStackUnit on floor.
   if (kind === 'floor') {
     return boundedSurfacePicturePlan({ mode: 'stretch', repetitions: 1, slabFaces });
@@ -173,9 +175,8 @@ export function planChartThreeDSurfacePicture(
   if (valueSpan == null) {
     return boundedSurfacePicturePlan({ mode: 'stackScale', repetitions: 1, stackUnit, slabFaces });
   }
-  if (!(Number.isFinite(valueSpan) && valueSpan > 0)) return null;
+  if (!(Number.isFinite(valueSpan) && valueSpan > 0)) rejectChartImageGeometry();
   const repetitions = Math.ceil(valueSpan / stackUnit);
-  if (!Number.isSafeInteger(repetitions)
-    || repetitions < 1 || repetitions > MAX_CHART_IMAGE_FILL_TILES) return null;
+  assertChartImageWork(repetitions, MAX_CHART_IMAGE_FILL_TILES);
   return boundedSurfacePicturePlan({ mode: 'stackScale', repetitions, stackUnit, slabFaces });
 }

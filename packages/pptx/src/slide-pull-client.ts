@@ -3,7 +3,7 @@ import {
   BoundedPullSession,
   HARD_MAX_PPTX_SLIDE_JSON_BYTES,
   PULL_SESSION_PROTOCOL,
-  requiredPullCredit,
+  pullWithCreditRetry,
   type PullSessionIdentity,
   type PullSessionResponse,
 } from '@silurus/ooxml-core/worker';
@@ -61,7 +61,11 @@ export class PptxSlidePullClient {
     this.active.add(session);
     try {
       await this.options.open(slideIndex, identity, timeoutMs);
-      const chunk = await pullWithCreditRetry(session);
+      const chunk = await pullWithCreditRetry(
+        session,
+        PPTX_INITIAL_SLIDE_PULL_BYTES,
+        HARD_MAX_PPTX_SLIDE_JSON_BYTES,
+      );
       try {
         const usage = chunk.usage ?? session.usageCheckpoint;
         if (usage) this.options.onUsage?.(usage);
@@ -112,24 +116,4 @@ export function isPptxSlidePullResponse(
 ): value is PullSessionResponse<ArrayBuffer, number> {
   return !!value && typeof value === 'object' &&
     (value as { protocol?: unknown }).protocol === PULL_SESSION_PROTOCOL;
-}
-
-async function pullWithCreditRetry(
-  session: BoundedPullSession<ArrayBuffer, number>,
-) {
-  try {
-    return await session.pull(PPTX_INITIAL_SLIDE_PULL_BYTES);
-  } catch (error) {
-    const required = requiredCredit(error);
-    if (required === undefined) throw error;
-    return session.pull(required);
-  }
-}
-
-function requiredCredit(error: unknown): number | undefined {
-  return requiredPullCredit(
-    error,
-    PPTX_INITIAL_SLIDE_PULL_BYTES,
-    HARD_MAX_PPTX_SLIDE_JSON_BYTES,
-  );
 }

@@ -2844,4 +2844,110 @@ mod tests {
         assert!(parse_axis_count(MAX_CHART_PLOT_AXES).is_some());
         assert!(parse_axis_count(MAX_CHART_PLOT_AXES + 1).is_none());
     }
+
+    /// `<c:ptCount>` / `<c:pt idx>` size dense cache vectors. Oversized single
+    /// caches and oversized chart-wide totals are rejected with a typed
+    /// `chart-cache:points` violation before any vector is allocated, in every
+    /// host, while an in-budget cache keeps its declared width.
+    #[test]
+    fn classic_cache_widths_fail_closed_before_allocation() {
+        use crate::resource::{OoxmlFormat, ResourceGovernor};
+        let chart = |series: &str| {
+            format!(
+                r#"<c:chartSpace xmlns:c="{C_NS}"><c:chart><c:plotArea><c:lineChart>{series}</c:lineChart></c:plotArea></c:chart></c:chartSpace>"#
+            )
+        };
+        let num = |count: &str| {
+            format!(
+                r#"<c:ser><c:idx val="0"/><c:val><c:numRef><c:f>S!$A$1</c:f><c:numCache><c:ptCount val="{count}"/><c:pt idx="0"><c:v>1</c:v></c:pt></c:numCache></c:numRef></c:val></c:ser>"#
+            )
+        };
+        let str_cat = |idx: &str| {
+            format!(
+                r#"<c:ser><c:idx val="0"/><c:cat><c:strRef><c:f>S!$A$1</c:f><c:strCache><c:pt idx="{idx}"><c:v>a</c:v></c:pt></c:strCache></c:strRef></c:cat><c:val><c:numLit><c:pt idx="0"><c:v>1</c:v></c:pt></c:numLit></c:val></c:ser>"#
+            )
+        };
+        let wide = (MAX_CHART_CACHE_POINTS as u64).to_string();
+        let rejected = [
+            (
+                chart(&num("18446744073709551615")),
+                MAX_CHART_CACHE_POINTS as u64,
+            ),
+            (chart(&num("4294967295")), MAX_CHART_CACHE_POINTS as u64),
+            (chart(&str_cat("4294967294")), MAX_CHART_CACHE_POINTS as u64),
+            // Collectors that read the last descendant ptCount must not see a
+            // count the admission skipped.
+            (
+                chart(&num("1").replace(
+                    r#"<c:ptCount val="1"/>"#,
+                    r#"<c:ptCount val="1"/><c:ptCount val="4294967295"/>"#,
+                )),
+                MAX_CHART_CACHE_POINTS as u64,
+            ),
+            // Without a ptCount, collectors size by the number of points.
+            (
+                chart(&format!(
+                    r#"<c:ser><c:idx val="0"/><c:val><c:numLit>{}</c:numLit></c:val></c:ser>"#,
+                    r#"<c:pt idx="0"/>"#.repeat(MAX_CHART_CACHE_POINTS + 1)
+                )),
+                MAX_CHART_CACHE_POINTS as u64,
+            ),
+            (
+                chart(&num(&wide).repeat(5)),
+                MAX_CLASSIC_CHART_CACHE_SLOTS as u64,
+            ),
+            // Repeated error bars multiply the series width into plus/minus
+            // vectors; beyond the schema's two per series they are charged.
+            (
+                chart(&num(&(MAX_CHART_CACHE_POINTS / 2).to_string()).replace(
+                    "</c:ser>",
+                    &format!(
+                        "{}</c:ser>",
+                        r#"<c:errBars><c:errValType val="fixedVal"/></c:errBars>"#.repeat(8)
+                    ),
+                )),
+                MAX_CLASSIC_CHART_CACHE_SLOTS as u64,
+            ),
+        ];
+        for (host, format) in [
+            (ChartHost::Unspecified, OoxmlFormat::Pptx),
+            (ChartHost::Word, OoxmlFormat::Docx),
+            (ChartHost::Excel, OoxmlFormat::Xlsx),
+            (ChartHost::PowerPoint, OoxmlFormat::Pptx),
+        ] {
+            for (xml, limit) in &rejected {
+                let doc = root_of(xml);
+                let governor = ResourceGovernor::from_wasm(format, Some(0), Some(0), Some(0));
+                let _scope = governor.scope("parse-chart");
+                let context = ChartParseContext {
+                    host,
+                    ..ChartParseContext::new(&FixtureResolver, None, None, None, None)
+                };
+                assert!(parse_chart_part(doc.root_element(), &context).is_none());
+                let error = governor.first_error().expect("typed resource violation");
+                let json: serde_json::Value = serde_json::from_str(
+                    error
+                        .strip_prefix("OOXML_RESOURCE_LIMIT:")
+                        .expect("resource prefix"),
+                )
+                .expect("envelope JSON");
+                let violation = &json["details"]["violation"];
+                assert_eq!(violation["resource"], "chart-cache", "{host:?}");
+                assert_eq!(violation["metric"], "points");
+                assert_eq!(violation["limit"], *limit);
+                assert_eq!(violation["configurable"], false);
+            }
+            let accepted = chart(&num("3"));
+            let doc = root_of(&accepted);
+            let governor = ResourceGovernor::from_wasm(format, Some(0), Some(0), Some(0));
+            let _scope = governor.scope("parse-chart");
+            let context = ChartParseContext {
+                host,
+                ..ChartParseContext::new(&FixtureResolver, None, None, None, None)
+            };
+            let model = parse_chart_part(doc.root_element(), &context).expect("in-budget chart");
+            assert!(governor.first_error().is_none());
+            assert_eq!(model.series[0].values, vec![Some(1.0), None, None]);
+        }
+    }
 }

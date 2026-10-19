@@ -1,9 +1,17 @@
 import { clipCanvasHorizontally } from '@silurus/ooxml-core/internal/canvas-clip';
+import { ownValue } from '@silurus/ooxml-core/internal/own-key';
 import { quoteCssFontFamily } from '@silurus/ooxml-core/internal/css-font-family';
+import {
+  arabicFallbackFamilies,
+  containsArabicFallbackText,
+  officeFaceWebAlias,
+  quoteCssFontFamilies as quoteAll,
+} from '@silurus/ooxml-core/internal/font-stack';
 import { FONT_TRACKING_SENTINEL, FONT_BASELINE_SENTINEL, FONT_SPACE_SENTINEL } from '@silurus/ooxml-core/internal/font-measurement-sentinels';
 import { preparedPowerPointText } from './font-display-text.js';
 import { pptxSlideCjkFallback } from './google-fonts.js';
 import type { CjkLang } from '@silurus/ooxml-core';
+import { normalizeLocalFontMetricFamily } from '@silurus/ooxml-core';
 import { containsHanScript } from '@silurus/ooxml-core/internal/script-preload-accumulator';
 import type {
   Slide,
@@ -19,8 +27,6 @@ import type {
   Stroke,
   TextBody,
   Paragraph,
-  TextRun,
-  PathCmd,
   Shadow,
   Glow,
   RenderOptions,
@@ -32,6 +38,7 @@ import { asBullet } from './types';
 import {
   usesPathShade,
   trackPaintPath,
+  measurePaintBounds,
   currentStrokeBounds,
   resolveArrowPaint,
   renderChart,
@@ -43,18 +50,21 @@ import {
   withInheritedPatternScope,
   applyStroke as applyStrokeCore,
   buildShapePath,
+  EMU_PER_INCH,
+  EMU_PER_PX,
   EMU_PER_PT as PT_TO_EMU,
   mathToMathML,
   rasterizeMathSvg,
-  tintMathRaster,
+  cachedTintedMathRaster,
   applyOuterShadow,
   applyInnerShadow,
+  createRasterCoveragePaint,
+  rasterEffectCoverageBounds,
   applySoftEdge,
   applyReflection,
   renderPresetShape,
   pathFillModeOverlay,
   hasPreset,
-  buildPresetGeometryPath,
   buildPresetGeometryFillPath,
   getPresetGeometryBounds,
   getCustomGeometryBounds,
@@ -63,7 +73,9 @@ import {
   drawArrowHead,
   lineEndPaintExtent,
   lineEndRetract,
-  retractLineEndpoint,
+  traceTrimmedPath,
+  tracePresetLeader,
+  trimGeometryPathEnds,
   computeScene3dQuad,
   isScene3dNonIdentity,
   drawProjected,
@@ -86,20 +98,25 @@ import {
   cjkFallbackChain,
   NON_CJK_SANS_FALLBACKS,
   NON_CJK_SERIF_FALLBACKS,
-  DEFAULT_KINSOKU_RULES,
   isCjkBreakChar,
   isComplexScriptCodePoint,
-  isUax14NoBreakPair,
-  lineBreakClass,
-  containsSeaScript,
-  isGraphemeFillText,
-  seaMixedBreakOffsets,
-  fitSeaWordPrefix,
   graphemeClusterOffsets,
   getCachedSvgImageByPath,
+  decodeSvgBlobOnMainThread,
   getCachedBitmapByPath,
   getCachedDuotoneBitmapByPath,
+  imageEffectError,
+  imageEffectOutsetPeriods,
+  imageEffectFrame,
+  stretchedSourceFrame,
   chartImageFillKey,
+  chartImageFillPixelTransform,
+  chartImageFillHostKey,
+  chartImageFillNeedsRenderedSize,
+  chartFillRenderedSizeKey,
+  chartImageFillStoreLookup,
+  collectChartFillRenderedSizes,
+  assertChartFillRenderedSizeCount,
   chartImageFillUsageSize,
   collectChartImageFillUsages,
   collectChartImageFillUsagesForCharts,
@@ -112,17 +129,24 @@ import {
   isBrowserResizableRasterMimeType,
   isDecodeTargetResizableRasterFormat,
   peekCachedBitmapByPath,
-  dropDecodedBitmapCache,
   preferVectorBlip,
   drawImageCropped,
+  hasImageEffectOutset,
   metafileRasterSize,
   sourceRasterTargetSize,
   isOoxmlDecodedImageLimitError,
+  OoxmlDecodedImageLimitError,
+  MAX_IMAGE_EFFECT_PASSES,
+  MAX_IMAGE_EFFECT_PIXEL_WORK,
+  OoxmlResourceLimitError,
+  OoxmlError,
   isTiffDecodeError,
   highlightBox,
   symbolFontToUnicode,
   isSymbolFontFamily,
   drawUnderline,
+  DECORATION_LINE_WIDTH_EM,
+  STRIKE_RISE_EM,
   hasTextWarp,
   buildWarpEnvelope,
   warpGlyphTransform,
@@ -162,14 +186,13 @@ import {
   computeLineVisualOrder,
   type LineVisualOrder,
 } from './bidi-line';
-import { fitCjkLine, type MeasuredChar } from './cjk-wrap.js';
 import { justifyLine, type Justified } from './text-justify';
 import { justifiedPiecePositions } from '@silurus/ooxml-core';
 import { resolveTableBorderConflict } from './table-border-conflict.js';
 import { isSmartArtFallbackShape, smartArtFallbackTextColor } from './smartart-fallback-contrast';
-import { resolveTabWidths, type TabItem, type TabStopPx } from './tab-layout.js';
+import { resolveTabWidths } from './tab-layout.js';
 import {
-  powerPointCompatOffNaturalLine, powerPointExactLinePoints, powerPointFaceMetrics,
+  powerPointCompatOffNaturalLine, powerPointExactLinePoints, powerPointFaceMetrics, officeFaceWeight,
   powerPointNaturalLine, type PowerPointFaceMetrics,
   POWERPOINT_FONT_ALGN_UNIT_PT, powerPointFontAlgnOffset, powerPointFontAlgnReference,
 } from './powerpoint-line-metrics.js';
@@ -177,6 +200,7 @@ import { drawEaVertRun } from './vertical-text.js';
 import { renderStackedText, type StackedParagraphInput } from './stacked-text.js';
 import {
   COMPLEX_SCRIPT_DEFAULT_FACES, complexScriptDefaultFace, eastAsianDefaultFaces,
+  isEastAsianSlotSymbol,
 } from './east-asian-default.js';
 import {
   breakDrawingMlText,
@@ -195,6 +219,8 @@ import {
 export interface RenderContext {
   cjkFallback?: CjkLang;
   officeFontRoutes?: Readonly<Record<string, import('@silurus/ooxml-core').OfficeFontFallbackRoute>>;
+  /** Normalized authored families with any installed face (presence probes). */
+  officeInstalledFamilies?: readonly string[];
   /** Presentation load explicitly enabled Google Fonts substitutions. */
   googleSubstitutes?: boolean;
   themeMajorFont: string | null;
@@ -239,7 +265,11 @@ export interface RenderContext {
 
 /** Information about a rendered text segment for building a transparent selection overlay. */
 export interface PptxTextRunInfo {
-  /** Paint-order element index in the rendered slide snapshot. */
+  /** Paint-order index for distinguishing displayed text containers, including
+   * recovery previews. This is not a source-model locator for hit testing. */
+  renderElementIndex?: number;
+  /** Original slide-model element index. Absent for recovery-preview text,
+   * which has no element in the source tree used by hit testing. */
   elementIndex?: number;
   /** Provenance of that rendered element. */
   origin?: import('./types.js').SlideElementOrigin;
@@ -336,16 +366,60 @@ type PlannedRasterOptions = {
   maxRetainedPixels: number;
 };
 
+/** Authored effect diagnostics are terminal even at image decode/fallback
+ * boundaries. Containing them as a missing image would silently accept only
+ * part of a CT_Blip chain. Resource and codec failures keep their own policy. */
+/** A fill that carries a CT_Blip chain is strict across its whole
+ * preparation: a native failure before the shared effect loader (for example
+ * tile-source inspection) is normalized to the same typed effect diagnostic
+ * instead of being contained as a missing fill. */
+function strictEffectPreparation<T>(
+  blip: { readonly blipEffects?: readonly unknown[] | null },
+  pending: Promise<T>,
+): Promise<T> {
+  return blip.blipEffects?.length
+    ? pending.catch((error: unknown) => { throw imageEffectError(error); })
+    : pending;
+}
+
+function isUnsupportedBlipEffectError(error: unknown): boolean {
+  return error instanceof OoxmlError && error.code === 'unsupported-image-effect';
+}
+
 /** The decode-time pixel transform of a blip: its ordered CT_Blip effects
  *  (with the duotone at its position) when it carries any, otherwise just the
  *  duotone, so a duotone-only or plain picture keeps its existing cache key. */
-function pixelTransform(blip: {
+type BlipHostOrientation = { readonly rotation?: number; readonly flipH?: boolean; readonly flipV?: boolean };
+
+function pixelTransform(blip: BlipHostOrientation & {
+  readonly rotWithShape?: boolean;
   readonly duotone?: import('@silurus/ooxml-core').Duotone | null;
   readonly blipEffects?: readonly import('@silurus/ooxml-core').BlipEffect[] | null;
-}): import('@silurus/ooxml-core').Duotone | BlipPixelEffects | undefined {
-  return blip.blipEffects?.length
-    ? { effects: blip.blipEffects, duotone: blip.duotone ?? null }
-    : blip.duotone ?? undefined;
+  readonly tile?: unknown;
+  readonly dpi?: number;
+}, host: BlipHostOrientation = blip): import('@silurus/ooxml-core').Duotone | BlipPixelEffects | undefined {
+  if (!blip.blipEffects?.length) return blip.duotone ?? undefined;
+  // §20.1.8.58: a tile's physical size is set by the fill DPI, not by the
+  // containing shape, so a tiled chain samples the source at that DPI (hosts
+  // then pass no shape extent, see tiledEffectExtent).
+  const tiledEmuPerPixel = blip.tile
+    ? 914400 / (blip.dpi != null && blip.dpi > 0 ? blip.dpi : 96)
+    : undefined;
+  return { effects: blip.blipEffects, duotone: blip.duotone ?? null,
+    // §20.1.8.14: effects belong to the image-fill brush. If its
+    // painter counter-rotates the brush, its net host rotation is zero;
+    // using the containing shape's rotation here cancels it a second time.
+    hostRotation: blip.rotWithShape === false ? 0 : host.rotation, hostFlipH: host.flipH, hostFlipV: host.flipV,
+    ...(tiledEmuPerPixel === undefined ? {} : { emuPerPixelX: tiledEmuPerPixel, emuPerPixelY: tiledEmuPerPixel }) };
+}
+
+/** Physical extent passed to the shared effect loader: none for a tiled
+ * effect chain (sampled at the fill DPI, see pixelTransform), else the frame. */
+function tiledEffectExtent(
+  fill: { readonly tile?: unknown; readonly blipEffects?: readonly unknown[] | null },
+  widthPt: number, heightPt: number,
+): { widthPt: number; heightPt: number } {
+  return fill.tile && fill.blipEffects?.length ? { widthPt: 0, heightPt: 0 } : { widthPt, heightPt };
 }
 
 function imagePlanKey(
@@ -370,7 +444,7 @@ function plannedRasterOptions(
 }
 
 function pictureResourcePath(picture: PictureElement): string {
-  return preferVectorBlip(picture)
+  return !pixelTransform(picture) && preferVectorBlip(picture)
     ? picture.svgImagePath as string
     : picture.imagePath;
 }
@@ -450,7 +524,10 @@ async function planSlideImages(
             retainedSurfaceCount,
           }
         : null)
-      .catch(() => null));
+      .catch((error: unknown) => {
+        if (error instanceof OoxmlResourceLimitError || isUnsupportedBlipEffectError(error) || isOoxmlDecodedImageLimitError(error)) throw error;
+        return null;
+      }));
   };
 
   const background = slide.background;
@@ -519,6 +596,10 @@ async function planSlideImages(
         bitmapOwner ?? loader,
       );
     } else if (element.type === 'chart') {
+      if (!Number.isFinite(element.width) || !Number.isFinite(element.height) || element.width < 0 || element.height < 0) {
+        throw new OoxmlError('unsupported-image-effect', 'Invalid chart image frame');
+      }
+      if (!(element.width > 0 && element.height > 0)) continue;
       const frame = {
         widthPt: element.width / PT_TO_EMU,
         heightPt: element.height / PT_TO_EMU,
@@ -569,7 +650,10 @@ async function planSlideImages(
               sourceWidthPx: inspection.dimensions.width,
               sourceHeightPx: inspection.dimensions.height,
             }
-          : null).catch(() => null));
+          : null).catch((error: unknown) => {
+            if (error instanceof OoxmlResourceLimitError || isUnsupportedBlipEffectError(error) || isOoxmlDecodedImageLimitError(error)) throw error;
+            return null;
+          }));
       }
     }
   }
@@ -586,13 +670,14 @@ async function planSlideImages(
  * changing or predicting text-driven growth. If both are zero, preparation
  * uses a budget-checked native decode: text can still grow the painted row. */
 function* elementImageFillUsages(element: SlideElement): Generator<{
-  fill: ImageFill; width: number; height: number;
+  fill: ImageFill; width: number; height: number; host: BlipHostOrientation;
 }> {
   const usage = (fill: Fill | null | undefined, width: number, height: number) =>
     fill?.fillType === 'image' && shapeImageFillModeIsPaintable(fill)
-      ? { fill, width, height }
+      ? { fill, width, height, host: element }
       : null;
   if (element.type === 'shape') {
+    if (element.fill?.fillType === 'image' && (![element.width, element.height].every(Number.isFinite) || element.width < 0 || element.height < 0)) throw new OoxmlError('unsupported-image-effect', 'Invalid image fill frame');
     const own = usage(element.fill, element.width, element.height);
     if (own && element.height > 0) yield own;
   } else if (element.type === 'table') {
@@ -634,6 +719,7 @@ function slideMayDecodeImages(slide: Slide): boolean {
     if (element.type === 'media') return !!element.posterPath;
     if (element.type === 'chart') return collectChartImageFillUsages(element.chart).length > 0;
     if (!elementImageFillUsages(element).next().done) return true;
+    if ((element.type === 'shape' || element.type === 'table') && element.mathFallback?.elements.length) return true;
     return element.type === 'shape' && (
       element.fill?.fillType === 'image'
       || !!element.textBody?.paragraphs.some(paragraph => asBullet(paragraph.bullet).type === 'blip')
@@ -649,9 +735,15 @@ const hexToRgba = hexToRgbaCore;
  * drawn so they (and any underline / strikethrough) sit on top, and before any
  * shadow is set on the context so the box itself isn't shadowed. `width` is the
  * glyph advance computed by the caller (it differs between the normal and
- * tab-stop paths only by the justification stretch added to it). The vertical
- * band comes from the shared `highlightBox` helper. Restore the resolved glyph
- * paint, which may be a CanvasPattern, before the subsequent fillText.
+ * tab-stop paths only by the justification stretch added to it). Restore the
+ * resolved glyph paint, which may be a CanvasPattern, before the subsequent
+ * fillText.
+ *
+ * With the face's #1610 metrics, the band is the face's glyph box (usWin, or
+ * typo under USE_TYPO_METRICS) ending at the bottom of the run's 1.2 x size
+ * line box: Windows PowerPoint 16.0.20430 #1896 controls (Arial, Times New
+ * Roman, Calibri at 48 pt, mixed sizes, lnSpc 150 %). Otherwise the shared
+ * `highlightBox` library band applies.
  */
 export function paintHighlight(
   ctx: CanvasRenderingContext2D,
@@ -661,26 +753,19 @@ export function paintHighlight(
   fontPx: number,
   highlight: string,
   glyphPaint: string | CanvasGradient | CanvasPattern,
+  metric?: PowerPointFaceMetrics,
 ): void {
-  const { top, height } = highlightBox(baseline, fontPx);
+  const glyph = metric?.glyph;
+  const { top, height } = metric && glyph
+    ? (() => {
+        const bottom = baseline + 1.2 * fontPx * (1 - metric.share);
+        const extent = (glyph.ascent + glyph.descent) * fontPx;
+        return { top: bottom - extent, height: extent };
+      })()
+    : highlightBox(baseline, fontPx);
   ctx.fillStyle = highlight;
   ctx.fillRect(x, top, width, height);
   ctx.fillStyle = glyphPaint;
-}
-
-/** Simple fill resolver that returns a CSS color string.
- *  For gradient/pattern fills, returns a flat colour (used by table cells etc.,
- *  where we don't have ctx scope to build a CanvasPattern). */
-function resolveFill(fill: Fill | null): string | null {
-  if (!fill || fill.fillType === 'none') return null;
-  if (fill.fillType === 'solid') return hexToRgba(fill.color);
-  if (fill.fillType === 'gradient') {
-    return fill.stops.length > 0 ? hexToRgba(fill.stops[0].color) : null;
-  }
-  // Pattern fills degrade to their foreground colour outside the canvas-aware
-  // path; full bitmap rendering happens via resolveShapeFill (core resolveFill).
-  if (fill.fillType === 'pattern') return hexToRgba(fill.fg);
-  return null;
 }
 
 /** Context-aware fill resolver that creates a CanvasGradient for gradient
@@ -695,6 +780,90 @@ export function resolveShapeFill(
   paintBounds?: { x: number; y: number; w: number; h: number },
 ): string | CanvasGradient | CanvasPattern | null {
   return resolveFillCore(fill, ctx, x, y, w, h, shapeRotationDeg, patternPtToUserUnits, undefined, outline, paintBounds);
+}
+
+/** DrawingML underline (§20.1.10.82, §21.1.2.3.9). Horizontal runs use
+ * their drawing size; stacked text supplies its column's common size/frame. */
+function paintRunUnderline(ctx: CanvasRenderingContext2D, seg: LayoutSegment,
+  x: number, baseline: number, width: number, glyphPaint: string | CanvasGradient | CanvasPattern,
+  scale: number, dpr: number, drawSizePx = seg.drawSizePx ?? seg.sizePx): void {
+  if (seg.underline && !seg.underlineLineNoFill
+    && (!seg.noFill || seg.underlineFill || seg.underlineColor || seg.underlineLine?.fill)) {
+    // §21.1.2.3.13 uFillTx follows the actual glyph fill (including
+    // pattFill), while §21.1.2.3.12 uFill supplies its own fill choice.
+    // Office PDF shows a separately chosen underline pattern on the
+    // same slide-aligned grid.
+    const underlinePaint = seg.underlineFill
+      ? resolveFillCore(seg.underlineFill, ctx, x, baseline, width, drawSizePx * DECORATION_LINE_WIDTH_EM,
+          0, scale * PT_TO_EMU) ?? 'rgba(0,0,0,0)'
+      : seg.underlineLine?.fill
+        ? resolveFillCore(seg.underlineLine.fill, ctx, x, baseline, width,
+            drawSizePx * DECORATION_LINE_WIDTH_EM, 0, scale * PT_TO_EMU) ?? 'rgba(0,0,0,0)'
+        : seg.underlineColor ?? glyphPaint;
+    const decoration = seg.lineMetric?.decoration;
+    drawUnderline(ctx, x, baseline, width, drawSizePx,
+      underlinePaint, seg.underlineStyle, dpr,
+      seg.underlineLine?.width ? emuToPx(seg.underlineLine.width, scale) : undefined,
+      decoration ? {
+        topPx: decoration.underlineTopEm * drawSizePx,
+        thicknessPx: decoration.underlineThicknessEm * drawSizePx,
+      } : undefined);
+  }
+}
+
+function paintRunStrike(ctx: CanvasRenderingContext2D, seg: LayoutSegment,
+  x: number, baseline: number, width: number, glyphPaint: string | CanvasGradient | CanvasPattern,
+  dpr: number): void {
+  const drawSizePx = seg.drawSizePx ?? seg.sizePx;
+  if (seg.strikethrough && !seg.noFill) {
+    // The face's own strikeout (OS/2 yStrikeoutPosition top, yStrikeoutSize)
+    // when catalogued; a double strike puts one band on each side of it
+    // (Windows PowerPoint 16.0.20430, #1896 controls).
+    const decoration = seg.lineMetric?.decoration;
+    const lineW = decoration
+      ? decoration.strikeThicknessEm * drawSizePx
+      : Math.max(1, drawSizePx * DECORATION_LINE_WIDTH_EM);
+    ctx.strokeStyle = glyphPaint;
+    ctx.lineWidth = lineW;
+    ctx.setLineDash([]);
+    // Crispness nudge (see crispOffset): the strike is a horizontal stroke;
+    // an odd device-pixel width is centered on one device row by snapping its
+    // y onto the nearest crisp device position (otherwise it straddles two
+    // rows → blurry). Snap each line from its own y.
+    // Strike rise and width: core library policy (see text/underline.ts).
+    const yMid = decoration
+      ? baseline + decoration.strikeTopEm * drawSizePx + lineW / 2
+      : baseline - drawSizePx * STRIKE_RISE_EM;
+    if (seg.strikeDouble) {
+      // Two parallel lines straddling the strike position: one line width
+      // from it with the face's own strikeout (#1896 controls), else 0.9
+      // line widths (library policy; ST_TextStrikeType §20.1.10.79
+      // `dblStrike` gives no spacing).
+      const offset = decoration ? lineW : lineW * 0.9;
+      const yUp = yMid - offset;
+      const yDn = yMid + offset;
+      ctx.beginPath();
+      ctx.moveTo(x, yUp + crispOffset(yUp, lineW, dpr));
+      ctx.lineTo(x + width, yUp + crispOffset(yUp, lineW, dpr));
+      ctx.moveTo(x, yDn + crispOffset(yDn, lineW, dpr));
+      ctx.lineTo(x + width, yDn + crispOffset(yDn, lineW, dpr));
+      ctx.stroke();
+    } else {
+      const sy = yMid + crispOffset(yMid, lineW, dpr);
+      ctx.beginPath();
+      ctx.moveTo(x, sy);
+      ctx.lineTo(x + width, sy);
+      ctx.stroke();
+    }
+  }
+}
+
+/** Horizontal text uses the same frame for both decorations. */
+function paintRunDecorations(ctx: CanvasRenderingContext2D, seg: LayoutSegment,
+  x: number, baseline: number, width: number, glyphPaint: string | CanvasGradient | CanvasPattern,
+  scale: number, dpr: number): void {
+  paintRunUnderline(ctx, seg, x, baseline, width, glyphPaint, scale, dpr);
+  paintRunStrike(ctx, seg, x, baseline, width, glyphPaint, dpr);
 }
 
 // ===== Text layout helpers =====
@@ -720,36 +889,24 @@ interface MathRender {
   tinted: Map<string, CanvasImageSource>;
 }
 const mathRenders = new WeakMap<MathNode[], MathRender>();
+const failedMath = new WeakSet<MathNode[]>();
 
-/**
- * Tint the cached black equation image to `color`. PowerPoint equations follow
- * the run/paragraph text colour, which varies per slide (white on dark, theme
- * accents, …), so we recolour the glyphs at draw time via `source-in` instead
- * of baking a single colour. Cached per colour on the render.
- */
-function tintedMathImage(render: MathRender, color: string): CanvasImageSource {
-  const cached = render.tinted.get(color);
-  if (cached) return cached;
-  const tinted = tintMathRaster(render.raster, color);
-  render.tinted.set(color, tinted);
-  return tinted;
+/** All currently supported text-bearing slide elements, including table cells. */
+function* elementTextBodies(element: SlideElement): Generator<TextBody> {
+  if (element.type === 'shape' && element.textBody) yield element.textBody;
+  else if (element.type === 'table') {
+    for (const row of element.rows) for (const cell of row.cells) {
+      if (cell.textBody) yield cell.textBody;
+    }
+  }
 }
 
 /** Gather every math run reachable from a slide's shapes and table cells. */
 function collectSlideMathRuns(slide: Slide): { nodes: MathNode[]; display: boolean }[] {
   const found: { nodes: MathNode[]; display: boolean }[] = [];
-  const fromBody = (body: TextBody | null) => {
-    if (!body) return;
-    for (const para of body.paragraphs) {
-      for (const run of para.runs) {
-        if (run.type === 'math') found.push({ nodes: run.nodes, display: run.display });
-      }
-    }
-  };
-  for (const el of slide.elements) {
-    if (el.type === 'shape') fromBody(el.textBody);
-    else if (el.type === 'table') {
-      for (const row of el.rows) for (const cell of row.cells) fromBody(cell.textBody);
+  for (const element of slide.elements) for (const body of elementTextBodies(element)) {
+    for (const para of body.paragraphs) for (const run of para.runs) {
+      if (run.type === 'math') found.push({ nodes: run.nodes, display: run.display });
     }
   }
   return found;
@@ -758,17 +915,24 @@ function collectSlideMathRuns(slide: Slide): { nodes: MathNode[]; display: boole
 /**
  * Pre-render every equation on the slide to an image (async), so the
  * synchronous layout/draw passes can place them by reading cached extents.
- * A conversion failure leaves the equation unrendered rather than throwing.
+ * Conversion failures retain their authored fallback or a visible diagnostic.
+ * An absent optional engine remains an explicit caller opt-out.
  */
 export async function prepareSlideMath(slide: Slide, math: MathRenderer): Promise<void> {
   const runs = collectSlideMathRuns(slide);
   if (runs.length === 0) return;
-  await math.loadMathJax();
+  try { await math.loadMathJax(); }
+  catch (error) {
+    if (error instanceof OoxmlResourceLimitError || isOoxmlDecodedImageLimitError(error)) throw error;
+    for (const r of runs) if (!mathRenders.has(r.nodes)) failedMath.add(r.nodes);
+    return;
+  }
   for (const r of runs) {
     if (mathRenders.has(r.nodes)) continue;
     try {
       const out = await math.mathMLToSvg(mathToMathML(r.nodes, r.display));
       const raster = await rasterizeMathSvg(out, '#000000');
+      failedMath.delete(r.nodes);
       mathRenders.set(r.nodes, {
         raster,
         widthEm: out.widthEm,
@@ -776,9 +940,33 @@ export async function prepareSlideMath(slide: Slide, math: MathRenderer): Promis
         descentEm: out.descentEm,
         tinted: new Map(),
       });
-    } catch {
-      // leave unrendered
+    } catch (error) {
+      // Resource governance is fail-closed; only conversion failures select
+      // an authored preview or the unavailable-equation diagnostic.
+      if (error instanceof OoxmlResourceLimitError || isUnsupportedBlipEffectError(error) || isOoxmlDecodedImageLimitError(error)) throw error;
+      failedMath.add(r.nodes);
     }
+  }
+}
+
+/** Reuse the unavailable-content painter for a failed equation with no MCE
+ * preview. This is library failure policy, not a substitute Office equation. */
+function paintEquation(ctx: CanvasRenderingContext2D, style: LayoutSegment, x: number, y: number) {
+  const equation = style.math!;
+  const render = equation.unavailable ? undefined : mathRenders.get(equation.nodes);
+  const height = equation.ascent + equation.descent;
+  if (!(equation.width > 0 && height > 0)) return;
+  if (render) ctx.drawImage(cachedTintedMathRaster(render, style.color), x, y, equation.width, height);
+  else if (equation.fallbackText) {
+    ctx.font = style.font;
+    ctx.fillStyle = style.color;
+    const baseline = ctx.textBaseline;
+    const align = ctx.textAlign;
+    ctx.textBaseline = 'top'; ctx.textAlign = 'left';
+    ctx.fillText(equation.fallbackText, x, y);
+    ctx.textBaseline = baseline; ctx.textAlign = align;
+  } else if (equation.unavailable) {
+    paintOptionalImagePlaceholder(ctx, 'equation', { x, y, width: equation.width, height });
   }
 }
 
@@ -867,6 +1055,8 @@ type LayoutSegment = {
     width: number;
     ascent: number;
     descent: number;
+    fallbackText?: string;
+    unavailable?: boolean;
   };
 };
 
@@ -942,30 +1132,6 @@ function genericFallback(family: string): string {
 }
 
 /**
- * Optional published web aliases for authored Office faces. These enter the
- * canvas stack only when `useGoogleFonts` is enabled. The authored family
- * remains first, followed by a fallback of the same generic class. Keys are
- * lower-cased; this map is not a metric correction or a line-break rule.
- */
-const OFFICE_FONT_SUBSTITUTE: Record<string, string> = {
-  'calibri': 'Carlito',
-  'cambria': 'Caladea',
-  'franklin gothic book': 'Libre Franklin',
-  'franklin gothic medium': 'Libre Franklin',
-  // Optional aliases for common Arabic-script faces. "Naskh" covers
-  // traditional serif-like faces; "Sans" covers geometric ones.
-  'sakkal majalla': 'Noto Naskh Arabic',
-  'traditional arabic': 'Noto Naskh Arabic',
-  'simplified arabic': 'Noto Naskh Arabic',
-  'arabic typesetting': 'Noto Naskh Arabic',
-  'univers next arabic': 'Noto Sans Arabic',
-};
-
-/** Arabic fallbacks apply only to runs containing Arabic codepoints, before
- * the CSS generic so a missing authored face can retain the script. */
-const ARABIC_TEXT_RE = /[\u0600-\u06ff\u0750-\u077f\u08a0-\u08ff]/u;
-
-/**
  * True when `family` names an Arabic-script face. Its Arabic runs place the
  * script fallbacks before CJK and other script tails.
  *
@@ -977,15 +1143,10 @@ const ARABIC_TEXT_RE = /[\u0600-\u06ff\u0750-\u077f\u08a0-\u08ff]/u;
  */
 function isArabicScriptFace(family: string): boolean {
   // Faces we explicitly substitute to a Noto Arabic web font are Arabic-script.
-  if (OFFICE_FONT_SUBSTITUTE[family.toLowerCase()]?.includes('Arabic')) return true;
+  if (officeFaceWebAlias(family)?.includes('Arabic')) return true;
   const l = family.toLowerCase();
   // Common Arabic-script family-name markers (Latin transliterations + Arabic).
   return /arabic|naskh|kufi|nastaliq|amiri|scheherazade|lateef|aldhabi|urdu|farsi|العرب|[؀-ۿ]/.test(l);
-}
-
-/** Quote each family for a CSS font-family list (no trailing comma). */
-function quoteAll(names: readonly string[]): string {
-  return names.map(quoteCssFontFamily).join(', ');
 }
 
 /**
@@ -1009,21 +1170,21 @@ export function cssFontStack(
   googleSubstitutes = false,
 ): string {
   const generic = genericFallback(authoredFamily);
-  const arabicText = ARABIC_TEXT_RE.test(text);
-  const alias = googleSubstitutes ? OFFICE_FONT_SUBSTITUTE[authoredFamily.toLowerCase()] : undefined;
+  const arabicText = containsArabicFallbackText(text);
+  // Optional published web aliases for authored Office faces enter the stack
+  // only with `useGoogleFonts`; the authored family stays first.
+  const alias = googleSubstitutes ? officeFaceWebAlias(authoredFamily) : undefined;
   // Script-scoped visual substitutes (core substitute-script.ts) join only a
   // run that contains their script. A CSS stack cannot split a run, but the
   // authored family stays first, so an installed authored face still wins.
   const sub = alias && substituteEntryCoversText(
-    GOOGLE_FONT_SUBSTITUTES[authoredFamily.toLowerCase()], text, 'any',
+    ownValue(GOOGLE_FONT_SUBSTITUTES, authoredFamily.toLowerCase()), text, 'any',
   ) ? alias : undefined;
   const subPart = sub ? `${quoteCssFontFamily(sub)}, ` : '';
   const googleAlias = googleCjkFontAlias(authoredFamily);
   const aliasPart = googleAlias ? `${quoteCssFontFamily(googleAlias)}, ` : '';
   // Arabic faces lead with script fallbacks only for Arabic runs.
-  const arabicFamilies = generic === 'serif'
-    ? ['Noto Naskh Arabic', 'Noto Sans Arabic']
-    : ['Noto Sans Arabic'];
+  const arabicFamilies = arabicFallbackFamilies(generic === 'serif');
   const arabicPart = arabicText ? `${quoteAll(arabicFamilies)}, ` : '';
   if (isArabicScriptFace(authoredFamily) && arabicText) {
     const cjk = fallback ? cjkFallbackChain(fallback, 'sans') : [];
@@ -1055,25 +1216,25 @@ function hyperlinkKey(t: HyperlinkTarget | undefined): string {
 }
 
 /**
- * Preserve a weight encoded in a specific Office face name when that face is
- * unavailable and the canvas falls through to a generic/substitute family.
- * PowerPoint themes commonly name faces such as "Franklin Gothic Medium" with
- * no separate `b` attribute; treating the missing face as weight 400 makes the
- * fallback visibly lighter than the authored face.
+ * Map weight words in a face name to the OpenType OS/2.usWeightClass name
+ * classes: https://learn.microsoft.com/en-us/typography/opentype/spec/os2#usweightclass
+ * This name-based substitution policy does not read catalog weights: a named
+ * weight can be a separate RIBBI family whose regular face is recorded as 400
+ * (e.g. Franklin Gothic Medium), which loses the design weight on substitution.
+ * Names without a weight word keep the run's regular/bold selection; explicit
+ * run bold takes precedence in buildFont. Never tune for a substitute's stroke.
  */
 function namedFaceWeight(family: string): number | null {
   const name = family.toLowerCase();
-  if (/\b(thin|hairline)\b/.test(name)) return 100;
+  if (/\bthin\b/.test(name)) return 100;
   if (/\b(extra[- ]?light|ultra[- ]?light)\b/.test(name)) return 200;
   if (/\blight\b/.test(name)) return 300;
   if (/\b(black|heavy)\b/.test(name)) return 900;
   if (/\b(extra[- ]?bold|ultra[- ]?bold)\b/.test(name)) return 800;
   if (/\b(semi[- ]?bold|demi[- ]?bold)\b/.test(name)) return 600;
   if (/\bbold\b/.test(name)) return 700;
-  // Office face names such as Franklin Gothic Medium refer to a distinct,
-  // visibly heavier cut. Libre Franklin 600 is the closest web substitute;
-  // 500 makes both the glyphs and their authored reflections too thin.
-  if (/\bmedium\b/.test(name)) return 600;
+  if (/\bmedium\b/.test(name)) return 500;
+  if (/\b(normal|regular)\b/.test(name)) return 400;
   return null;
 }
 
@@ -1209,21 +1370,14 @@ export function buildFont(
 ): string {
   const style  = italic ? 'italic ' : '';
   const normalized = normalizeFontFamily(family, rc);
-  const authoredFamily = rc.embeddedFontAuthoredFamilies?.get(normalized) ?? normalized;
+  const { authoredFamily, officeRoute: selectedRoute } = selectOfficeFace(normalized, bold, italic, rc);
   const inferredWeight = namedFaceWeight(authoredFamily);
   const weight = bold ? 'bold ' : inferredWeight ? `${inferredWeight} ` : '';
-  const routeKey = bold || inferredWeight === 700
-    ? `calibri:700:${italic ? 'italic' : 'normal'}`
-    : italic ? 'calibri:400:italic' : 'calibri';
-  const embeddedTuple = `calibri:${bold || inferredWeight === 700 ? 700 : 400}:${italic ? 'italic' : 'normal'}`;
   // ECMA-376 §19.3.1.52: master txStyles is an optional source of text style.
   // The theme-minor CSS fallback when every font slot is absent is renderer
-  // policy, not evidence that an exact Calibri resource was selected. Preserve
-  // that established fallback until a run or inherited style names a face.
-  const officeRoute = hasNamedFamily && authoredFamily.toLowerCase() === 'calibri'
-    && !rc.embeddedFontTuples?.has(embeddedTuple)
-    ? rc.officeFontRoutes?.[routeKey]
-    : undefined;
+  // policy, not evidence that an exact resource was selected. Preserve that
+  // established fallback until a run or inherited style names a face.
+  const officeRoute = hasNamedFamily ? selectedRoute : undefined;
   const fallback = containsHanScript(text)
     ? rc.cjkFallback ?? classifyCjkFont(rc.themeMajorFont) ?? classifyCjkFont(rc.themeMinorFont) ?? undefined
     : undefined;
@@ -1260,8 +1414,53 @@ function lineMetricFor(
   rc: RenderContext,
 ): PowerPointFaceMetrics | undefined {
   if (CSS_GENERIC_FAMILIES.has(family)) return undefined;
-  if (rc.embeddedFontAuthoredFamilies?.has(family)) return undefined;
+  // Layout follows the face that paints, selected exactly as buildFont does.
+  // Catalog geometry describes a face only when that face is present (an
+  // exact local() route was loaded, or its family is installed); an absent
+  // authored face paints with a browser fallback, so the run keeps the
+  // ordinary line model instead of the absent face's ascent share.
+  const normalized = normalizeFontFamily(family, rc);
+  const { authoredFamily, embedded, officeRoute } = selectOfficeFace(normalized, bold, italic, rc);
+  if (officeRoute) return powerPointFaceMetrics(embedded ? authoredFamily : family, bold, italic);
+  // Deck-embedded bytes (or CSS synthesis from them) paint the embedded alias;
+  // the catalog does not describe those bytes, and the alias shadows any
+  // installed system family of the same authored name.
+  if (embedded || !familyInstalled(authoredFamily, rc)) return undefined;
   return powerPointFaceMetrics(family, bold, italic);
+}
+
+/**
+ * The face selection shared by painting (buildFont) and line metrics: the
+ * authored family behind a deck-embedded alias, and the exact local() route
+ * that paints this tuple. A tuple the deck embeds paints its own bytes; a
+ * missing embedded style falls to the exact installed route when one loaded.
+ */
+function selectOfficeFace(normalized: string, bold: boolean, italic: boolean, rc: RenderContext): {
+  authoredFamily: string;
+  embedded: boolean;
+  officeRoute: import('@silurus/ooxml-core').OfficeFontFallbackRoute | undefined;
+} {
+  const embeddedAuthored = rc.embeddedFontAuthoredFamilies?.get(normalized);
+  const authoredFamily = embeddedAuthored ?? normalized;
+  const inferredWeight = namedFaceWeight(authoredFamily);
+  const embeddedTuple = `${authoredFamily.toLowerCase()}:${bold || inferredWeight === 700 ? 700 : 400}:${italic ? 'italic' : 'normal'}`;
+  const officeRoute = rc.embeddedFontTuples?.has(embeddedTuple)
+    ? undefined
+    : rc.officeFontRoutes?.[officeRouteKey(authoredFamily, officeFaceWeight(authoredFamily, bold, italic), italic)];
+  return { authoredFamily, embedded: embeddedAuthored !== undefined, officeRoute };
+}
+
+/** Whether an installed face of the family paints the authored name (see
+ * AcquiredOfficeRoutes.installed): CSS font matching then paints that
+ * installed family, synthesizing weight/style. */
+function familyInstalled(family: string, rc: RenderContext): boolean {
+  return rc.officeInstalledFamilies?.includes(normalizeLocalFontMetricFamily(family)) === true;
+}
+
+/** The core office-fallback route key for an authored family tuple. */
+function officeRouteKey(family: string, weight: number, italic: boolean): string {
+  const normalized = normalizeLocalFontMetricFamily(family);
+  return weight === 400 && !italic ? normalized : `${normalized}:${weight}:${italic ? 'italic' : 'normal'}`;
 }
 
 /**
@@ -1321,70 +1520,9 @@ function firstLineIndentPxFor(hasBullet: boolean, indentPx: number): number {
   return hasBullet ? 0 : indentPx;
 }
 
-/**
- * Whether the seam is the explicit hyphen boundary of an alphabetic compound.
- *
- * UAX #14 gives HY (U+002D) and HH (for example U+2010) a break opportunity
- * AFTER the hyphen. Keep this helper deliberately narrower than a full UAX #14
- * implementation: it accepts only Latin-letter–hyphen–Latin-letter compounds,
- * rejecting the numeric-range case covered by LB25 and leaving other scripts
- * (including LB21a's Hebrew exception) to their dedicated layout paths.
- * DrawingML `latinLnBrk="0"` forbids splitting a Latin word without adding a
- * hyphen; it does not erase a break opportunity supplied by an authored hyphen.
- */
-const LATIN_SCALAR_RE = /^\p{Script_Extensions=Latin}$/u;
 // The core predicate covers the RTL cs axis. DrawingML also routes Indic and
 // Southeast Asian shaping scripts through a:cs when that font slot is present.
 const INDIC_CS_GLYPH_RE = /[\p{Script=Devanagari}\p{Script=Thai}\p{Script=Bengali}\p{Script=Tamil}\p{Script=Telugu}\p{Script=Kannada}\p{Script=Malayalam}\p{Script=Gujarati}\p{Script=Gurmukhi}\p{Script=Oriya}\p{Script=Sinhala}\p{Script=Khmer}\p{Script=Lao}\p{Script=Myanmar}\p{Script=Tibetan}]/u;
-const LETTER_SCALAR_RE = /^\p{L}$/u;
-const ASCII_SCALARS_RE = /^[\u0000-\u007f]*$/u;
-
-function isLatinCompoundHyphenBoundary(before: string, hyphen: string, after: string): boolean {
-  const hyphenCp = hyphen.codePointAt(0) as number;
-  // All ASCII scalars other than U+002D are permanently outside HY/HH. Most
-  // tokens take this constant-time path without searching the Unicode table.
-  if (hyphenCp <= 0x7f && hyphenCp !== 0x2d) return false;
-  // HY/HH are punctuation classes, so non-ASCII letters cannot be candidates.
-  if (LETTER_SCALAR_RE.test(hyphen)) return false;
-  const hyphenClass = lineBreakClass(hyphenCp);
-  if (hyphenClass !== 'HY' && hyphenClass !== 'HH') return false;
-  return LATIN_SCALAR_RE.test(before) && LATIN_SCALAR_RE.test(after);
-}
-
-/** Split one non-whitespace Latin token at its authored compound hyphens. */
-function splitLatinCompoundToken(text: string): { text: string; breakBefore: boolean }[] {
-  // The overwhelmingly common ASCII token without U+002D cannot contain an
-  // HY/HH scalar. Avoid a scalar array and per-boundary classification there.
-  if (!text.includes('-') && ASCII_SCALARS_RE.test(text)) {
-    return [{ text, breakBefore: false }];
-  }
-  const chars = [...text];
-  const pieces: { text: string; breakBefore: boolean }[] = [];
-  let start = 0;
-  for (let i = 1; i + 1 < chars.length; i++) {
-    if (!isLatinCompoundHyphenBoundary(chars[i - 1], chars[i], chars[i + 1])) {
-      continue;
-    }
-    const end = i + 1;
-    pieces.push({ text: chars.slice(start, end).join(''), breakBefore: pieces.length > 0 });
-    start = end;
-  }
-  pieces.push({ text: chars.slice(start).join(''), breakBefore: pieces.length > 0 });
-  return pieces;
-}
-
-/** Last two painted text scalars, without joining the whole line. */
-function trailingTextScalars(line: LayoutLine): string[] {
-  const tail: string[] = [];
-  for (let i = line.segments.length - 1; i >= 0 && tail.length < 2; i--) {
-    const segment = line.segments[i];
-    if (segment.isTab || segment.math) continue;
-    const chars = [...segment.text];
-    for (let j = chars.length - 1; j >= 0 && tail.length < 2; j--) tail.unshift(chars[j]);
-  }
-  return tail;
-}
-
 /** PowerPoint paints non-zero DrawingML baseline runs at about 65% of their
  * authored size. The authored size still owns line height and baseline offset;
  * this helper is only for the glyph font used by measure and paint. */
@@ -1454,15 +1592,6 @@ export function naturalWidthExceedsBbox(
       previous = item.style;
       if (lineW > textMaxW) return true;
     }
-  }
-  return false;
-}
-
-/** True when any character of `s` is a CJK / ideographic glyph that allows a
- *  per-character line break (see core's `isCjkBreakChar` for the ranges). */
-function tokenHasCjk(s: string): boolean {
-  for (const ch of s) {
-    if (isCjkBreakChar(ch.codePointAt(0) ?? 0)) return true;
   }
   return false;
 }
@@ -1557,6 +1686,7 @@ export function paragraphInputRuns(
   rc: RenderContext,
   /** Horizontal layout only: see {@link powerPointKinsokuAcrossRuns}. */
   quoteSeams = false,
+  measureCtx?: CanvasRenderingContext2D,
 ): {
   input: DrawingMlInputRun<LayoutSegment>[];
   sameStyle: (a: LayoutSegment, b: LayoutSegment) => boolean;
@@ -1595,7 +1725,35 @@ export function paragraphInputRuns(
   // The line-metric mark of every a:br, keyed by its input index (see
   // `followingMark` in layoutParagraph).
   const breakMarks = new Map<number, LayoutSegment>();
+  // Runtime recovery is library policy; Part 3 §§9.3–9.4 defines a complete
+  // MCE alternative, never a per-equation preview. Prefix counts make nested
+  // branch failure checks linear. The outermost failed range wins (the parser
+  // emits inner alternatives first, including equal ranges), suppressing
+  // even successfully converted Choice equations, without rewriting the model
+  // or shifting the source run IDs of surrounding text. Both horizontal and
+  // stacked layout consume this same projection.
+  let previews: Map<number, { end: number; text: string }> | undefined;
+  if (para.mathFallbacks?.length) {
+    previews = new Map();
+    const failures = [0];
+    for (const run of para.runs) {
+      failures.push(failures[failures.length - 1]
+        + (run.type === 'math' && failedMath.has(run.nodes) ? 1 : 0));
+    }
+    for (const fallback of para.mathFallbacks) {
+      const { start, end } = fallback;
+      if (Number.isInteger(start) && Number.isInteger(end) && start >= 0
+        && end <= para.runs.length && end > start && para.runs[start].type === 'math'
+        && failures[end] > failures[start] && end >= (previews.get(start)?.end ?? start)) {
+        previews.set(start, fallback);
+      }
+    }
+  }
+  let previewEnd = 0;
   for (const [sourceRunId, run] of para.runs.entries()) {
+    if (sourceRunId < previewEnd) continue;
+    const preview = previews?.get(sourceRunId);
+    if (preview) previewEnd = preview.end;
     if (run.type !== 'text') seam = null;
     if (run.type === 'break') {
       const sizePx = run.fontSize != null
@@ -1623,18 +1781,23 @@ export function paragraphInputRuns(
       continue;
     }
     if (run.type === 'math') {
-      const render = mathRenders.get(run.nodes);
+      const render = preview ? undefined : mathRenders.get(run.nodes);
       const emPx = run.fontSize != null
         ? run.fontSize * PT_TO_EMU * scale * fontScale : defaultFontSizePx;
-      const width = render ? render.widthEm * emPx : 0;
+      const unavailable = !!preview || (!render && failedMath.has(run.nodes));
+      const fallbackText = preview?.text ?? (unavailable ? run.fallbackText : undefined);
+      if (measureCtx) measureCtx.font = `${emPx}px sans-serif`;
+      const width = render ? render.widthEm * emPx : unavailable
+        ? measureCtx?.measureText(fallbackText ?? 'Equation unavailable').width ?? 0 : 0;
       const style: LayoutSegment = {
         text: '', font: `${emPx}px sans-serif`, sizePx: emPx,
         color: run.color ? hexToRgba(run.color) : defaultColor,
         underline: false, strikethrough: false,
         math: {
           nodes: run.nodes, display: run.display, width,
-          ascent: render ? render.ascentEm * emPx : 0,
+          ascent: render ? render.ascentEm * emPx : unavailable ? emPx : 0,
           descent: render ? render.descentEm * emPx : 0,
+          fallbackText, unavailable,
         },
       };
       input.push({ type: 'object', width, style, display: run.display });
@@ -1685,7 +1848,7 @@ export function paragraphInputRuns(
       // `buildFont` depends on text only through these script predicates. Keep
       // cache cardinality bounded by face/script class, not grapheme count.
       const key = `${face}\0${named ? 1 : 0}\0${containsHanScript(text) ? 1 : 0}`
-        + `\0${ARABIC_TEXT_RE.test(text) ? 1 : 0}\0${extras.join('\0')}`;
+        + `\0${containsArabicFallbackText(text) ? 1 : 0}\0${extras.join('\0')}`;
       const cached = stackFonts.get(key);
       if (cached !== undefined) return cached;
       const built = buildFont(bold, italic, drawSizePx, face, rc, text, named, extras);
@@ -1755,13 +1918,17 @@ export function paragraphInputRuns(
       emitted = true;
       const ch = String.fromCodePoint(cluster.codePointAt(0) ?? 0);
       let glyph = cluster;
-      const eaGlyph = isCjkBreakChar(ch.codePointAt(0) ?? 0);
-      const csGlyph = isComplexScriptCodePoint(ch.codePointAt(0) ?? 0)
-        || INDIC_CS_GLYPH_RE.test(ch);
+      const cp = ch.codePointAt(0) ?? 0;
+      // An East Asian-slot symbol resolves its stack from its own cluster, so
+      // the run's other scripts never pick its fallback face.
+      const eaSymbol = !isCjkBreakChar(cp) && !!run.fontFamilyEa && isEastAsianSlotSymbol(cp, run.lang);
+      const eaGlyph = eaSymbol || isCjkBreakChar(cp);
+      const csGlyph = isComplexScriptCodePoint(cp) || INDIC_CS_GLYPH_RE.test(ch);
       const csFace = csGlyph ? familyCs ?? complexScriptDefaultFace(ch) : family;
-      let font = eaGlyph ? eaFont : csGlyph ? csFontFor(csFace, cluster) : stackFontFor(
-        family, cluster, hasNamedFontFamily(run.fontFamily ?? para.defFontFamily),
-      );
+      let font = eaSymbol ? stackFontFor(familyEa, cluster, true)
+        : eaGlyph ? eaFont : csGlyph ? csFontFor(csFace, cluster) : stackFontFor(
+          family, cluster, hasNamedFontFamily(run.fontFamily ?? para.defFontFamily),
+        );
       let face = eaGlyph ? familyEa : csFace;
       let share = lineMetricFor(face, bold, italic, rc);
       if (/[\uf020-\uf0ff]/u.test(ch) && (familySym != null || isSymbolFontFamily(family))) {
@@ -1827,15 +1994,17 @@ export function paragraphInputRuns(
  * curly quote next to ideographs in one run and split over two runs. Each
  * two-run case breaks like its one-run twin. Under ja-JP, an opening quote
  * never ends a line and a closing quote never starts one, even at the seam.
- * Under en-US, neither rule applies to the quotes. Our curly quotes paint in
- * the Latin slot, so they sit behind a slot seam in both languages; the
- * horizontal input adapter keeps that seam even when the Latin and East Asian
- * faces resolve to one font, so the language alone decides it. Limits: only
+ * Under en-US, neither rule applies to the quotes. Under en-US our curly
+ * quotes paint in the Latin slot; under ja/ko/zh with a resolved East Asian
+ * face they paint in the East Asian slot (isEastAsianSlotSymbol). The
+ * horizontal input adapter keeps a seam in both measured languages even when
+ * the quote and the ideograph share one font, so the language alone decides
+ * it. Limits: only
  * the observed curly-quote/ideograph seams where both runs are Japanese join;
  * other punctuation keeps its old boundary. Retraction never crosses another
- * seam unless that seam meets this same rule. Other East Asian languages,
- * mixed-language seams, and runs without lang keep the seam boundary, as C08
- * observed. Vertical (stacked) text and XLSX shapes have no such controls and
+ * seam unless that seam meets this same rule. Mixed-language seams and runs
+ * without lang keep the seam boundary, as C08 observed; a ko/zh quote that
+ * shares the ideographs' East Asian face has no seam and keeps in-run kinsoku. Vertical (stacked) text and XLSX shapes have no such controls and
  * are not wired.
  */
 const JAPANESE_LANG_RE = /^ja(?:[-_]|$)/i;
@@ -1879,7 +2048,7 @@ export function layoutParagraph(
   firstLineIndentPx: number = 0,
 ): LayoutLine[] {
   const { input, sameStyle, breakMarks } = paragraphInputRuns(
-    para, defaultFontSizePx, defaultColor, scale, defaultBold, defaultItalic, fontScale, slideNumber, rc, true,
+    para, defaultFontSizePx, defaultColor, scale, defaultBold, defaultItalic, fontScale, slideNumber, rc, true, ctx,
   );
   const marRPx = emuToPx(para.marR, scale);
   const broken = breakDrawingMlText(input, {
@@ -2052,7 +2221,7 @@ async function prepareBackground(
           },
         };
       }
-      if (isOoxmlDecodedImageLimitError(error) || isTiffDecodeError(error)) {
+      if (error instanceof OoxmlResourceLimitError || isUnsupportedBlipEffectError(error) || isOoxmlDecodedImageLimitError(error) || isTiffDecodeError(error)) {
         return { paint: paintBase, failure: { error } };
       }
       // Decode failed — the white base remains as the fallback.
@@ -2070,16 +2239,20 @@ async function prepareBackground(
         ? plannedRasterOptions(imagePlan, imagePlanKey(fill.imagePath, pixelTransform(fill)))
         : undefined;
       sourceInspection = fill.tile
-        ? await inspectCachedRasterSource(fill.imagePath, fill.mimeType, fetchImage)
+        ? await strictEffectPreparation(fill, inspectCachedRasterSource(fill.imagePath, fill.mimeType, fetchImage))
         : undefined;
       bitmap = await getCachedDuotoneBitmapByPath(
         fill.imagePath,
         fill.mimeType,
-        pixelTransform(fill),
+        // A tiled background paints at 96 DPI (paintTiledBackground), so its
+        // chain samples at that same DPI.
+        pixelTransform(fill.tile ? { ...fill, dpi: undefined } : fill),
         fetchImage,
         {
-          widthPt: canvasW / scale / PT_TO_EMU,
-          heightPt: canvasH / scale / PT_TO_EMU,
+          ...(fill.blipEffects?.length && !fill.tile
+            ? (frame => ({ widthPt: frame.width, heightPt: frame.height }))(stretchedSourceFrame(
+              canvasW / scale / PT_TO_EMU, canvasH / scale / PT_TO_EMU, fill.srcRect, fill.fillRect))
+            : tiledEffectExtent(fill, canvasW / scale / PT_TO_EMU, canvasH / scale / PT_TO_EMU)),
           ...(planned ?? {}),
           tiff,
           svgDecoder,
@@ -2106,33 +2279,38 @@ async function prepareBackground(
           const dw = canvasW * (1 - l - r);
           const dh = canvasH * (1 - t - b);
           ctx.save();
-          // Clip to the slide rectangle so overscan (negative insets) or tile
-          // bleed is cropped at the slide edge rather than spilling onto
-          // neighbouring content.
-          ctx.beginPath();
-          ctx.rect(0, 0, canvasW, canvasH);
-          ctx.clip();
-          if (fill.alpha != null) ctx.globalAlpha = fill.alpha;
-          if (fill.tile) {
-            // §20.1.8.58 — tiled placement: repeat the blip at its native size.
-            paintTiledBackground(
-              ctx,
-              source,
-              fill.tile,
-              canvasW,
-              canvasH,
-              scale,
-              fill.srcRect,
-              sourceInspection?.dimensions ?? undefined,
-            );
-          } else {
-            // §20.1.8.56 stretch into the destination rect from the §20.1.8.30
-            // fillRect insets. l/t are left/top insets, r/b are right/bottom
-            // insets, so the destination spans [l, 1-r] × [t, 1-b] of the box;
-            // negative edges overscan past the box.
-            drawImageCropped(ctx, source, fill.srcRect, dx, dy, dw, dh);
+          try {
+            // Clip to the slide rectangle so overscan (negative insets) or tile
+            // bleed is cropped at the slide edge rather than spilling onto
+            // neighbouring content.
+            ctx.beginPath();
+            ctx.rect(0, 0, canvasW, canvasH);
+            ctx.clip();
+            if (fill.alpha != null) ctx.globalAlpha = fill.alpha;
+            if (fill.tile) {
+              // §20.1.8.58 — tiled placement: repeat the blip at its native
+              // size. Backgrounds keep their established 96-DPI tile size; the
+              // effect chain samples at that same DPI (backgroundPixelTransform).
+              paintTiledBackground(
+                ctx,
+                source,
+                fill.tile,
+                canvasW,
+                canvasH,
+                scale,
+                fill.srcRect,
+                sourceInspection?.dimensions ?? undefined,
+              );
+            } else {
+              // §20.1.8.56 stretch into the destination rect from the §20.1.8.30
+              // fillRect insets. l/t are left/top insets, r/b are right/bottom
+              // insets, so the destination spans [l, 1-r] × [t, 1-b] of the box;
+              // negative edges overscan past the box.
+              drawImageCropped(ctx, source, fill.srcRect, dx, dy, dw, dh);
+            }
+          } finally {
+            ctx.restore();
           }
-          ctx.restore();
         } catch (error) {
           if (isOptionalImageCodecUnavailableError(error, 'tiff')) {
             paintOptionalImagePlaceholder(ctx, 'tiff', {
@@ -2140,7 +2318,10 @@ async function prepareBackground(
             });
             return;
           }
-          if (isOoxmlDecodedImageLimitError(error) || isTiffDecodeError(error)) throw error;
+          if (error instanceof OoxmlResourceLimitError || isUnsupportedBlipEffectError(error) || isOoxmlDecodedImageLimitError(error) || isTiffDecodeError(error)) throw error;
+          // An authored CT_Blip chain is strict end to end: a native paint
+          // failure is its typed diagnostic, never the white fallback.
+          if (fill.blipEffects?.length) throw imageEffectError(error);
           // Paint failed — the white base painted above remains as the fallback.
         }
       },
@@ -2154,13 +2335,6 @@ async function prepareBackground(
     },
   };
 }
-
-/**
- * EMU per pixel at 96 DPI. A blip without an authored DPI uses this established
- * compatibility basis to get its native EMU size.
- * 914400 EMU / inch ÷ 96 px / inch = 9525 EMU / px.
- */
-const EMU_PER_PX_96 = 9525;
 
 /**
  * Compute the anchor (origin) of the first tile inside the fill box for a
@@ -2227,7 +2401,9 @@ export function tileSourceExtent(
  * `DOMMatrix` translate on the pattern transform.
  *
  * The caller has already clipped to the fill box and set globalAlpha. Background
- * callers omit `dpi` and preserve their prior 96-DPI behavior.
+ * callers omit `dpi` and preserve their prior 96-DPI behavior. `coverage` can
+ * extend beyond this alignment box when the caller counter-rotates the brush;
+ * expanding coverage must not shift the tile registration or phase.
  */
 function paintTiledBackground(
   ctx: CanvasRenderingContext2D,
@@ -2239,6 +2415,7 @@ function paintTiledBackground(
   srcRect?: PictureElement['srcRect'],
   intrinsicSize?: Readonly<{ width: number; height: number }>,
   dpi = 96,
+  coverage = { x: 0, y: 0, w: canvasW, h: canvasH },
 ): boolean {
   // Native tile size in slide px: image px → EMU @96dpi → × sx/sy → × scale.
   // §20.1.8.55 applies before the fill mode: for tile mode the cropped source
@@ -2247,15 +2424,21 @@ function paintTiledBackground(
   // transparent outset through drawImageCropped below.
   // Established shape compatibility defaults remain local to the PPTX shape
   // renderer; the shared model preserves absence for spec-first chart paint.
+  // Without raster header dimensions (SVG, metafile) the authored frame of an
+  // effect-grown grid, not the grown grid, is the native tile extent.
+  const effectFrame = imageEffectFrame(bitmap);
   const source = tileSourceExtent(
-    intrinsicSize?.width ?? bitmap.width,
-    intrinsicSize?.height ?? bitmap.height,
+    intrinsicSize?.width ?? effectFrame?.width ?? bitmap.width,
+    intrinsicSize?.height ?? effectFrame?.height ?? bitmap.height,
     srcRect,
   );
-  const pixelToEmu = EMU_PER_PX_96 * 96 / dpi;
+  // A blip without an authored DPI uses the 96-DPI EMU-per-px basis.
+  const pixelToEmu = EMU_PER_PX * 96 / dpi;
   const tileW = source.width * pixelToEmu * (tile.sx ?? 1) * scale;
   const tileH = source.height * pixelToEmu * (tile.sy ?? 1) * scale;
-  if (!(tileW > 0) || !(tileH > 0)) return false;
+  if (![tileW, tileH].every(v => Number.isFinite(v) && v > 0)) {
+    throw new OoxmlError('unsupported-image-effect', 'Unrepresentable picture tile size');
+  }
 
   const flipX = tile.flip === 'x' || tile.flip === 'xy';
   const flipY = tile.flip === 'y' || tile.flip === 'xy';
@@ -2268,16 +2451,39 @@ function paintTiledBackground(
   // createAuxCanvas rounds each requested axis up. Charge the actual allocation,
   // not the fractional geometry, so two individually-safe fractions cannot
   // cross the retained scratch-area limit after independent ceil operations.
-  const scratchW = Math.max(1, Math.ceil(cellW));
-  const scratchH = Math.max(1, Math.ceil(cellH));
-  if (!Number.isFinite(scratchW) || !Number.isFinite(scratchH)
-    || scratchW > MAX_CANVAS_DIMENSION || scratchH > MAX_CANVAS_DIMENSION
-    || scratchW > Math.floor(MAX_CANVAS_AREA / scratchH)) return false;
-  const aux = createAuxCanvas(cellW, cellH);
-  if (!aux) return false;
+  if (!Number.isFinite(cellW) || !Number.isFinite(cellH)) {
+    throw new OoxmlError('unsupported-image-effect', 'Unrepresentable picture tile cell');
+  }
+  // Preserve the previous rasterization for cells that fit: draw at the
+  // authored size into the ceil-sized canvas and repeat those integer pixels.
+  // Normalizing even fractional cells to their exact extent changes sampling
+  // and seam placement. Only cells previously omitted use the bounded path.
+  let scratchW = Math.max(1, Math.ceil(cellW));
+  let scratchH = Math.max(1, Math.ceil(cellH));
+  const oversized = scratchW > MAX_CANVAS_DIMENSION || scratchH > MAX_CANVAS_DIMENSION
+    || scratchW > Math.floor(MAX_CANVAS_AREA / scratchH);
+  if (oversized) {
+    // Raster size is resource policy, not a DrawingML geometry limit. Avoid
+    // upsampling small sources; the pattern transform restores the authored
+    // extent (§20.1.8.58), including mirrored-neighbour cadence.
+    scratchW = Math.min(MAX_CANVAS_DIMENSION,
+      Math.max(1, Math.ceil(Math.min(cellW, source.width * (flipX ? 2 : 1)))));
+    scratchH = Math.min(MAX_CANVAS_DIMENSION,
+      Math.max(1, Math.ceil(Math.min(cellH, source.height * (flipY ? 2 : 1)))));
+    if (scratchW * scratchH > MAX_CANVAS_AREA) {
+      const reduction = Math.sqrt(MAX_CANVAS_AREA / (scratchW * scratchH));
+      scratchW = Math.max(1, Math.floor(scratchW * reduction));
+      scratchH = Math.max(1, Math.floor(scratchH * reduction));
+    }
+  }
+  const rasterScaleX = oversized ? scratchW / cellW : 1;
+  const rasterScaleY = oversized ? scratchH / cellH : 1;
+  const aux = createAuxCanvas(scratchW, scratchH);
+  if (!aux) throw new OoxmlError('unsupported-image-effect', 'Picture tile surface unavailable');
   const actx = aux.getContext('2d') as CanvasRenderingContext2D | null;
-  if (!actx) return false;
+  if (!actx) throw new OoxmlError('unsupported-image-effect', 'Picture tile surface unavailable');
 
+  actx.scale(rasterScaleX, rasterScaleY);
   const drawCell = (cx: number, cy: number, mx: boolean, my: boolean) => {
     actx.save();
     actx.translate(cx + (mx ? tileW : 0), cy + (my ? tileH : 0));
@@ -2285,14 +2491,40 @@ function paintTiledBackground(
     drawImageCropped(actx, bitmap, srcRect, 0, 0, tileW, tileH);
     actx.restore();
   };
-  // Top-left tile is always un-mirrored; mirror the X/Y neighbours.
-  drawCell(0, 0, false, false);
-  if (flipX) drawCell(tileW, 0, true, false);
-  if (flipY) drawCell(0, tileH, false, true);
-  if (flipX && flipY) drawCell(tileW, tileH, true, true);
+  // A CT_Blip effect outset (blur grow, glow, shadow) overlaps neighbouring
+  // tiles (§20.1.8.58 repeats the authored frame). The pattern cell is one
+  // period, so draw every neighbour whose outset reaches it, wrapped by whole
+  // cells; the period itself is unchanged.
+  const reach = imageEffectOutsetPeriods(bitmap, srcRect != null);
+  const padCellsX = Math.ceil(reach.x / (flipX ? 2 : 1));
+  const padCellsY = Math.ceil(reach.y / (flipY ? 2 : 1));
+  const wrapDraws = (2 * padCellsX + 1) * (2 * padCellsY + 1) * (flipX ? 2 : 1) * (flipY ? 2 : 1);
+  if (!Number.isSafeInteger(wrapDraws) || wrapDraws > MAX_IMAGE_EFFECT_PASSES * MAX_IMAGE_EFFECT_PASSES) {
+    aux.width = 0;
+    throw new OoxmlDecodedImageLimitError('image-effect-work', MAX_IMAGE_EFFECT_PASSES * MAX_IMAGE_EFFECT_PASSES,
+      Number.isSafeInteger(wrapDraws) ? wrapDraws : Number.MAX_SAFE_INTEGER);
+  }
+  // Each wrapped draw can touch the whole scratch cell; charge that pixel work
+  // against the shared effect work ceiling before drawing (resource policy).
+  const wrapWork = wrapDraws > (flipX ? 2 : 1) * (flipY ? 2 : 1) ? wrapDraws * scratchW * scratchH : 0;
+  if (!Number.isSafeInteger(wrapWork) || wrapWork > MAX_IMAGE_EFFECT_PIXEL_WORK) {
+    aux.width = 0;
+    throw new OoxmlDecodedImageLimitError('image-effect-work', MAX_IMAGE_EFFECT_PIXEL_WORK,
+      Number.isSafeInteger(wrapWork) ? wrapWork : Number.MAX_SAFE_INTEGER);
+  }
+  for (let j = -padCellsY; j <= padCellsY; j++) {
+    for (let i = -padCellsX; i <= padCellsX; i++) {
+      const ox = i * cellW, oy = j * cellH;
+      // Top-left tile is always un-mirrored; mirror the X/Y neighbours.
+      drawCell(ox, oy, false, false);
+      if (flipX) drawCell(ox + tileW, oy, true, false);
+      if (flipY) drawCell(ox, oy + tileH, false, true);
+      if (flipX && flipY) drawCell(ox + tileW, oy + tileH, true, true);
+    }
+  }
 
   const pattern = ctx.createPattern(aux as unknown as CanvasImageSource, 'repeat');
-  if (!pattern) return false;
+  if (!pattern) throw new OoxmlError('unsupported-image-effect', 'Picture tile surface unavailable');
 
   // Phase: register the grid against the alignment anchor, then add tx/ty.
   // PowerPoint registers an omitted algn at the top-left. CT_TileInfoProperties
@@ -2301,18 +2533,21 @@ function paintTiledBackground(
   const { ax, ay } = tileAnchorOffset(tile.algn ?? 'tl', canvasW, canvasH, tileW, tileH);
   const px = ax + emuToPx(tile.tx ?? 0, scale);
   const py = ay + emuToPx(tile.ty ?? 0, scale);
+  if (![px, py].every(Number.isFinite)) throw new OoxmlError('unsupported-image-effect', 'Unrepresentable picture tile phase');
   // `setTransform` exists where DOMMatrix is available (browser + skia-canvas).
   // The translate aligns a cell origin with (px, py); `repeat` covers the box.
   if (typeof pattern.setTransform === 'function' && typeof DOMMatrix !== 'undefined') {
-    pattern.setTransform(new DOMMatrix().translateSelf(px, py));
+    pattern.setTransform(new DOMMatrix().translateSelf(px, py).scaleSelf(1 / rasterScaleX, 1 / rasterScaleY));
     ctx.fillStyle = pattern;
-    ctx.fillRect(0, 0, canvasW, canvasH);
+    ctx.fillRect(coverage.x, coverage.y, coverage.w, coverage.h);
   } else {
     // Fallback: bake the phase into the fill origin by translating the context.
     ctx.save();
     ctx.translate(px, py);
+    ctx.scale(1 / rasterScaleX, 1 / rasterScaleY);
     ctx.fillStyle = pattern;
-    ctx.fillRect(-px, -py, canvasW, canvasH);
+    ctx.fillRect((coverage.x - px) * rasterScaleX, (coverage.y - py) * rasterScaleY,
+      coverage.w * rasterScaleX, coverage.h * rasterScaleY);
     ctx.restore();
   }
   return true;
@@ -2329,10 +2564,18 @@ interface PreparedShapeFill {
  * that share a PNG but differ in grayscl/biLevel/clrChange/lum/duotone need
  * distinct prepared images. `imagePlanKey` is the same path + ordered-effect
  * key the decode cache uses. */
-function shapeFillKey(fill: ImageFill): string {
+function shapeFillKey(fill: ImageFill, widthEmu: number, heightEmu: number, host: BlipHostOrientation = {}): string {
   return JSON.stringify([
     fill.svgImagePath ?? null,
-    imagePlanKey(fill.imagePath, pixelTransform(fill)),
+    imagePlanKey(fill.imagePath, pixelTransform(fill, host)),
+    // §20.1.8.15 rad uses physical coordinates. Prepared identity and paint
+    // lookup must retain the same authored frame as the effect decoder: the
+    // full source frame of a stretched fill (fillRect/srcRect included).
+    ...(fill.blipEffects?.length
+      ? (frame => [frame.width, frame.height])(fill.tile
+        ? { width: widthEmu, height: heightEmu }
+        : stretchedSourceFrame(widthEmu, heightEmu, fill.srcRect, fill.fillRect))
+      : []),
   ]);
 }
 
@@ -2355,7 +2598,11 @@ export function paintPreparedShapeImageFill(
   bounds: Readonly<{ x: number; y: number; w: number; h: number }>,
   scale: number,
   evenOdd = false,
+  shapeTransform: Readonly<{ rotation: number; flipH: boolean; flipV: boolean }> = { rotation: 0, flipH: false, flipV: false },
 ): boolean {
+  if (![bounds.x, bounds.y, bounds.w, bounds.h, scale].every(Number.isFinite) || bounds.w < 0 || bounds.h < 0) {
+    throw new OoxmlError('unsupported-image-effect', 'Invalid image fill geometry');
+  }
   if (!prepared || !(bounds.w > 0) || !(bounds.h > 0)) return false;
   if (!shapeImageFillModeIsPaintable(fill)) return false;
   const { x, y, w, h } = bounds;
@@ -2363,21 +2610,45 @@ export function paintPreparedShapeImageFill(
   try {
     ctx.clip(evenOdd ? 'evenodd' : 'nonzero');
     if (fill.alpha != null) ctx.globalAlpha *= Math.max(0, Math.min(1, fill.alpha));
-    // rotWithShape=false needs the image frame counter-transform here. Its
-    // rotated/flipped placement is intentionally not guessed without Office
-    // evidence; absence and true retain the ordinary shape-local frame.
+    // CT_BlipFillProperties (§20.1.8.14): keep the clipped shape geometry,
+    // but cancel its rotation about the fill-box centre. A reflected local
+    // frame reverses the rotation sign (R F R = F); the reflection itself is
+    // retained because rotWithShape controls rotation, not flips.
+    let fillRotation = 0;
+    if (fill.rotWithShape === false && shapeTransform.rotation !== 0) {
+      const sign = shapeTransform.flipH !== shapeTransform.flipV ? 1 : -1;
+      ctx.translate(x + w / 2, y + h / 2);
+      fillRotation = sign * shapeTransform.rotation * Math.PI / 180;
+      ctx.rotate(fillRotation);
+      ctx.translate(-(x + w / 2), -(y + h / 2));
+    }
     if (fill.tile) {
+      // §20.1.8.58 repeats across the entire clipped shape. Counter-rotation
+      // changes the clip's extent in the brush frame, not the tile's phase or
+      // its alignment box. Cover the inverse-rotated box about the same centre.
+      const cos = Math.abs(Math.cos(fillRotation));
+      const sin = Math.abs(Math.sin(fillRotation));
+      const coverW = w * cos + h * sin;
+      const coverH = w * sin + h * cos;
       ctx.translate(x, y);
-      return paintTiledBackground(
-        ctx, prepared.image, fill.tile, w, h, scale, fill.srcRect, prepared.intrinsicSize,
-        fill.dpi && fill.dpi > 0 ? fill.dpi : 96,
-      );
+      try {
+        return paintTiledBackground(
+          ctx, prepared.image, fill.tile, w, h, scale, fill.srcRect, prepared.intrinsicSize,
+          fill.dpi && fill.dpi > 0 ? fill.dpi : 96,
+          { x: (w - coverW) / 2, y: (h - coverH) / 2, w: coverW, h: coverH },
+        );
+      } catch (error) {
+        // A fill carrying a CT_Blip chain is strict end to end: a native tile
+        // surface/pattern failure is its typed diagnostic.
+        throw fill.blipEffects?.length ? imageEffectError(error) : error;
+      }
     }
     const rect = fill.fillRect ?? {};
     const dx = x + (rect.l ?? 0) * w;
     const dy = y + (rect.t ?? 0) * h;
     const dw = (1 - (rect.l ?? 0) - (rect.r ?? 0)) * w;
     const dh = (1 - (rect.t ?? 0) - (rect.b ?? 0)) * h;
+    if (![dx, dy, dw, dh].every(Number.isFinite)) throw new OoxmlError('unsupported-image-effect', 'Unrepresentable image fill rectangle');
     if (!(dw > 0) || !(dh > 0)) return false;
     drawImageCropped(ctx, prepared.image, fill.srcRect, dx, dy, dw, dh);
     return true;
@@ -3188,7 +3459,7 @@ function renderWarpedText(
           ctx.strokeStyle = underlinePaint;
           ctx.lineWidth = seg.underlineLine?.width
             ? emuToPx(seg.underlineLine.width, scale)
-            : Math.max(1, seg.sizePx * 0.05);
+            : Math.max(1, seg.sizePx * DECORATION_LINE_WIDTH_EM);
           ctx.beginPath();
           const samples = Math.max(2, Math.ceil((penW - segmentStartW) / 8));
           for (let sample = 0; sample <= samples; sample++) {
@@ -3357,8 +3628,36 @@ function authoredAlignmentAnchor(
   h: number,
   algn: Shadow['algn'],
 ): [number, number] {
-  const [u, v] = ALIGNMENT_UV[algn ?? 'b'];
+  const [u, v] = ownValue(ALIGNMENT_UV, algn ?? 'b') ?? ALIGNMENT_UV.b;
   return transformPoint(transform, x + u * w, y + v * h);
+}
+
+/** One surface plane for body projection, effect bounds/anchors and masks.
+ * MS-OI29500 §2.1.1268 places bevelB at the extrusion base. Keep the
+ * existing planar compositor's face selection, including its winding test;
+ * effect dispatch must not silently move that surface back to z=0. Depth comes
+ * from a prepared bottom bevel or wireframe input; this planar painter still
+ * does not construct an unbeveled solid's back mesh. Quantize padding here too,
+ * so cache/effect bounds include the same device-pixel margin as the raster.
+ */
+function projectedSurface(
+  camera: CameraInput, w: number, h: number, backDepthCss = 0,
+  edgePadCss = 0, devScale = 1,
+) {
+  // The selected face and its effect footprint belong to one solid, including
+  // when a caller supplies a rear plane without pre-binding sceneDepth.
+  if (backDepthCss > (camera.sceneDepth ?? 0)) camera = { ...camera, sceneDepth: backDepthCss };
+  const front = computeScene3dQuad(camera, w, h);
+  const [p0, p1, , p3] = front.corners;
+  const backFacing = (p1.x - p0.x) * (p3.y - p0.y) - (p1.y - p0.y) * (p3.x - p0.x) < 0;
+  const quad = backFacing && backDepthCss > 0
+    ? computeScene3dQuad(camera, w, h, backDepthCss) : front;
+  let padDev = Math.max(0, Math.ceil(edgePadCss * devScale));
+  const expanded = padDev > 0
+    ? expandProjectedQuad(quad.corners, padDev / devScale / w, padDev / devScale / h) : null;
+  if (!expanded) padDev = 0;
+  return { face: quad.corners, corners: expanded ?? quad.corners,
+    backFacing, padDev, padCss: padDev / devScale };
 }
 
 export function projectedEffectGeometry(
@@ -3370,11 +3669,11 @@ export function projectedEffectGeometry(
   h: number,
   edgePadCss: number,
   algn: Shadow['algn'],
+  backDepthCss = 0,
 ): { bbox: { x: number; y: number; w: number; h: number }; anchor: [number, number] } {
-  const face = computeScene3dQuad(camera, w, h).corners;
-  const painted = edgePadCss > 0
-    ? expandProjectedQuad(face, edgePadCss / w, edgePadCss / h) ?? face
-    : face;
+  const det = Math.abs(transform.a * transform.d - transform.b * transform.c);
+  const devScale = det > 0 ? Math.sqrt(det) : 1;
+  const { face, corners: painted } = projectedSurface(camera, w, h, backDepthCss, edgePadCss, devScale);
   const devicePoints = painted.map((point) => transformPoint(transform, x + point.x, y + point.y));
   const xs = devicePoints.map(([px]) => px);
   const ys = devicePoints.map(([, py]) => py);
@@ -3382,7 +3681,7 @@ export function projectedEffectGeometry(
   const minY = Math.min(...ys);
   const maxX = Math.max(...xs);
   const maxY = Math.max(...ys);
-  const [u, v] = ALIGNMENT_UV[algn ?? 'b'];
+  const [u, v] = ownValue(ALIGNMENT_UV, algn ?? 'b') ?? ALIGNMENT_UV.b;
   const projectedAnchor = projectQuadPoint(face, u, v);
   return {
     bbox: { x: minX, y: minY, w: maxX - minX, h: maxY - minY },
@@ -3448,7 +3747,7 @@ function paintWithRasterEffects(
   effectScale: number,
   liveTransform: EffectTransform,
   hasInterior = true,
-  paintInnerMask: EffectPaint = paintMask,
+  rasterMask = false,
 ): void {
   const deviceW = (ctx.canvas as { width: number }).width || 0;
   const deviceH = (ctx.canvas as { height: number }).height || 0;
@@ -3463,10 +3762,15 @@ function paintWithRasterEffects(
     applyLiveTransform(target);
     withInheritedPatternScope(ctx, target, () => paintMask(target));
   };
-  const innerMask = (target: CanvasRenderingContext2D) => {
-    applyLiveTransform(target);
-    withInheritedPatternScope(ctx, target, () => paintInnerMask(target));
-  };
+  // Projected bodies supply the complete geometry, but their RGBA opacity
+  // and color must never become an effect mask. Convert once and share the
+  // dedicated coverage raster across softEdge and innerShdw.
+  const coverage = rasterMask && haveAux && (effects.softEdge || effects.innerShadow)
+    ? createRasterCoveragePaint(mask as never, rasterEffectCoverageBounds(
+        bbox, effects, effectScale, deviceW, deviceH,
+      ))
+    : null;
+  const haveMask = !rasterMask || Boolean(coverage);
   let nativeShadowFallback = false;
   if (effects.shadow && haveAux) {
     ctx.save();
@@ -3495,7 +3799,7 @@ function paintWithRasterEffects(
   if (nativeShadowFallback) applyShadow(ctx, effects.shadow ?? null, scale);
   else if (effects.glow) applyGlow(ctx, effects.glow, scale);
 
-  if (effects.softEdge && haveAux) {
+  if (effects.softEdge && haveAux && haveMask) {
     ctx.save();
     ctx.setTransform(identity);
     applySoftEdge(
@@ -3506,7 +3810,7 @@ function paintWithRasterEffects(
       effectScale,
       deviceW,
       deviceH,
-      mask as never,
+      (coverage ?? mask) as never,
     );
     ctx.restore();
   } else {
@@ -3514,12 +3818,12 @@ function paintWithRasterEffects(
   }
   if (nativeShadowFallback || effects.glow) clearShadow(ctx);
 
-  if (effects.innerShadow && hasInterior && haveAux) {
+  if (effects.innerShadow && hasInterior && haveAux && haveMask) {
     ctx.save();
     ctx.setTransform(identity);
     applyInnerShadow(
       ctx,
-      innerMask as never,
+      (coverage ?? mask) as never,
       bbox,
       effects.innerShadow,
       effectScale,
@@ -3596,8 +3900,8 @@ function renderShape(ctx: CanvasRenderingContext2D, el: ShapeElement, scale: num
   }
 
   // ── scene3d camera projection for p:sp (ECMA-376 §20.1.5.5, Phase B) ──────
-  // A text-bearing shape with a non-identity 3-D camera is rendered to a local
-  // offscreen (fill + stroke + TEXT), optionally bevel-shaded, then warped onto
+  // A text-bearing shape with a non-identity 3-D camera uses local offscreens:
+  // the body is bevel-shaded and text is painted unshaded onto
   // the live ctx through the camera homography — the same pipeline the picture
   // path uses. Authored flips are part of the local face before projection;
   // the element's 2-D rotation stays on the live ctx outside the warp.
@@ -3607,7 +3911,13 @@ function renderShape(ctx: CanvasRenderingContext2D, el: ShapeElement, scale: num
   // follow the per-pixel perspective warp applied here. So a projected shape's
   // text is drawn into the bitmap but EXCLUDED from the selection overlay
   // (onTextRun is suppressed below). See README "Bevel / 3D" note.
-  const spScene3d = el.scene3d && isScene3dNonIdentity(el.scene3d.camera) ? el.scene3d : null;
+  // Camera framing uses document inches, even when the slide renders at an
+  // arbitrary target width. Group sizing is already folded into w/h by Annex L.
+  const spCamera = el.scene3d && { ...el.scene3d.camera, unitsPerInch: EMU_PER_INCH * scale,
+    sceneDepth: (el.sp3d?.extrusionH ?? 0) * scale };
+  const spScene3d = spCamera && isScene3dNonIdentity(
+    spCamera, w, h, (el.sp3d?.extrusionH ?? 0) * scale,
+  ) ? { ...el.scene3d, camera: spCamera } : null;
   if (spScene3d && w > 0 && h > 0) {
     const tf = ctx.getTransform();
     const det = Math.abs(tf.a * tf.d - tf.b * tf.c);
@@ -3618,7 +3928,9 @@ function renderShape(ctx: CanvasRenderingContext2D, el: ShapeElement, scale: num
       (el.sp3d as { prstMaterial?: string } | undefined)?.prstMaterial,
       scale,
       ctxDevScale,
+      spScene3d.camera,
     );
+    const backDepthCss = (bevels.find(bevel => bevel.bottom)?.depthPx ?? 0) / ctxDevScale;
     const extrusion = buildExtrusion(
       el.sp3d as Sp3dLike | undefined,
       spScene3d.camera,
@@ -3698,13 +4010,19 @@ function renderShape(ctx: CanvasRenderingContext2D, el: ShapeElement, scale: num
           renderShape(octx, projectedElement, scale, themeDefaultColor, slideNumber, rc, undefined);
         },
         padded
-          ? { bevels, extrusion: extrusion ?? undefined, edgePadCss, preservePatternFrame }
-          : { preservePatternFrame },
+          ? { bevels, backDepthCss, extrusion: extrusion ?? undefined, edgePadCss, preservePatternFrame }
+          : { preservePatternFrame, measureOverflow: true },
       );
     const paintProjectedBody = (target: CanvasRenderingContext2D): boolean =>
       paintProjectedElement(target, localBodyEl, true);
-    const paintProjectedText = (target: CanvasRenderingContext2D): boolean =>
-      !el.textBody || paintProjectedElement(target, localTextEl, false, projectedTextHasPattern);
+    const paintProjectedText = (target: CanvasRenderingContext2D): void => {
+      if (!el.textBody || paintProjectedElement(target, localTextEl, false, projectedTextHasPattern)) return;
+      // Match the body allocation/horizon fallback: retain readable flat text.
+      target.save();
+      target.translate(x, y);
+      renderShape(target, localTextEl, scale, themeDefaultColor, slideNumber, rc);
+      target.restore();
+    };
     const hasRasterEffects = Boolean(
       el.shadow || el.innerShadow || el.glow || el.softEdge || el.reflection,
     );
@@ -3721,6 +4039,7 @@ function renderShape(ctx: CanvasRenderingContext2D, el: ShapeElement, scale: num
         h,
         edgePadCss,
         el.shadow?.algn,
+        backDepthCss,
       );
       let projectionSucceeded = false;
       const rawPaint: EffectPaint = (target) => {
@@ -3751,18 +4070,27 @@ function renderShape(ctx: CanvasRenderingContext2D, el: ShapeElement, scale: num
         scale * devScale,
         liveTransform,
         Boolean(el.fill),
+        true,
       );
       if (projectionSucceeded) {
         paintProjectedText(ctx);
         ctx.restore();
         return;
       }
-    } else if (paintProjectedElement(
-      ctx, localEl, true,
-      projectedTextHasPattern && el.fill?.fillType !== 'pattern',
-    )) {
-      ctx.restore();
-      return;
+    } else {
+      // sp3d belongs to the shape body (§20.1.5.12); text has its own run
+      // properties. Use the same unshaded text pass as the raster-effect path.
+      // Without a material pass, retain the combined face's rasterization and
+      // single warp, including the established pattern coordinate frame.
+      const projected = bevels.length > 0
+        ? paintProjectedBody(ctx)
+        : paintProjectedElement(ctx, localEl, true,
+            projectedTextHasPattern && el.fill?.fillType !== 'pattern');
+      if (projected) {
+        if (bevels.length > 0) paintProjectedText(ctx);
+        ctx.restore();
+        return;
+      }
     }
     // Headless fallback (no offscreen): draw flat below, but still without the
     // projection. Restore and fall through to the normal path.
@@ -3797,7 +4125,7 @@ function renderShape(ctx: CanvasRenderingContext2D, el: ShapeElement, scale: num
     ? el.fill
     : null;
   const preparedImageFill = imageFill
-    ? rc.shapeFillImages?.get(shapeFillKey(imageFill))
+    ? rc.shapeFillImages?.get(shapeFillKey(imageFill, el.width, el.height, el))
     : undefined;
   const hasPreparedImageFill = Boolean(imageFill && preparedImageFill);
 
@@ -3826,23 +4154,34 @@ function renderShape(ctx: CanvasRenderingContext2D, el: ShapeElement, scale: num
     'accentbordercallout1', 'accentbordercallout2', 'accentbordercallout3',
   ]);
 
-  // A leader line we re-stroke retracted from its filled decorations: every
-  // callout plus the straight / bent (polyline) connectors. Curved connectors
-  // are excluded — their leader is a Bézier and getConnectorAnchors.vertices only
-  // captures segment endpoints, so retracting from a vertex would straighten the
-  // curve. Those keep their preset-engine leader (decoration overlap unchanged).
+  // A leader line we re-stroke from its vertices, trimmed at its decorated
+  // ends: every callout plus the straight / bent (polyline) connectors.
+  // Curved connectors are excluded here, because their leader is a Bézier and
+  // getConnectorAnchors.vertices only captures segment endpoints, so
+  // re-stroking from vertices would straighten the curve. When an end
+  // retracts, their preset leader is trimmed along the curve instead
+  // (`trimsCurvedLeader` below).
   const isRetractableLeader = (g: string): boolean =>
     CALLOUT_GEOMS.has(g) || g === 'line' || g === 'straightconnector1' || g.startsWith('bentconnector');
+  // How far each decorated end pulls its line back (observed Office rule in
+  // core arrow-geometry.ts). Paths that cannot be re-stroked from straight
+  // vertices — curved connectors, custom geometry, compound lines — are
+  // trimmed along the path instead, so every line kind stops at the same place.
+  const headTrim = el.stroke?.headEnd ? lineEndRetract(el.stroke.headEnd, el.stroke, scale, PT_TO_EMU) : 0;
+  const tailTrim = el.stroke?.tailEnd ? lineEndRetract(el.stroke.tailEnd, el.stroke, scale, PT_TO_EMU) : 0;
+  const trimsCurvedLeader = geom.startsWith('curvedconnector') && (headTrim > 0 || tailTrim > 0);
+  const custEnds = el.custGeom && el.custGeom.length > 0 && (headTrim > 0 || tailTrim > 0)
+    ? getCustGeomEndpoints(el.custGeom) : null;
+  const custHeadTrim = custEnds?.start ? headTrim : 0;
+  const custTailTrim = custEnds?.end ? tailTrim : 0;
 
   // ── Dispatch to preset engine when possible ────────────────────────────
-  // Preference order: custGeom → generic preset engine → legacy switch.
+  // Preference order: custGeom → generic preset engine → buildShapePath
+  // (only `rect` or a schema-invalid name, which the engine does not define).
   // `arc` (ECMA-376 §20.1.10.56 ST_ShapeType "arc") goes through the engine
   // too: its presetShapeDefinitions geometry is a two-<path> shape — path 0
   // (stroke="false") fills the pie wedge (arc + lnTo centre + close) and path 1
-  // (fill="none") strokes only the open arc edge. The engine honours those
-  // per-path fill/stroke flags, so arc renders its true pie-wedge fill + open
-  // outline. The legacy buildShapePath could only draw the open arc (filling it
-  // auto-closes into a *chord*), which is why arc used to be excluded here.
+  // (fill="none") strokes only the open arc edge.
   const usePresetEngine =
     !el.custGeom && hasPreset(geom);
 
@@ -3886,11 +4225,12 @@ function renderShape(ctx: CanvasRenderingContext2D, el: ShapeElement, scale: num
           { x: bx, y: by, w: bw, h: bh },
           scale,
           evenOddFill,
+          el,
         )
       : undefined;
 
     if (usePresetEngine && !silhouette) {
-      const skipTrailingStroke = isRetractableLeader(geom);
+      const skipTrailingStroke = isRetractableLeader(geom) || trimsCurvedLeader;
       renderPresetShape(
         target, geom, bx, by, bw, bh,
         [el.adj, el.adj2, el.adj3, el.adj4, el.adj5, el.adj6, el.adj7, el.adj8],
@@ -3943,7 +4283,15 @@ function renderShape(ctx: CanvasRenderingContext2D, el: ShapeElement, scale: num
             shadowCleared = true;
           }
         }
-        if (paint.stroke && tStroke) tStroke();
+        if (paint.stroke && tStroke) {
+          const head = index === 0 ? custHeadTrim : 0;
+          const tail = index === el.custGeom!.length - 1 ? custTailTrim : 0;
+          if (head > 0 || tail > 0) {
+            target.beginPath();
+            traceTrimmedPath(target, (sink) => buildCustomPath(sink, [cmds], bx, by, bw, bh), head, tail);
+          }
+          tStroke();
+        }
       });
       return;
     }
@@ -3951,18 +4299,15 @@ function renderShape(ctx: CanvasRenderingContext2D, el: ShapeElement, scale: num
     if (el.custGeom && el.custGeom.length > 0) {
       buildCustomPath(target, el.custGeom, bx, by, bw, bh);
     } else if (usePresetEngine) {
-      // Silhouette of a preset shape: build a single filled outline. Preset
-      // path 0 is the body outline (secondary paths are highlights), so the
-      // legacy buildShapePath gives a faithful silhouette of the body.
+      // Silhouette of a preset shape. buildShapePath resolves spec-defined
+      // names through the ECMA-376 preset engine (all of its paths).
       buildShapePath(target, geom, bx, by, bw, bh, el.adj, el.adj2, el.adj3, el.adj4);
     } else {
       buildShapePath(target, geom, bx, by, bw, bh, el.adj, el.adj2, el.adj3, el.adj4);
     }
-    // Normal arc bodies render through the preset engine above; this legacy
-    // path is only reached for an arc as a custGeom/effect silhouette built by
-    // buildShapePath, which draws the OPEN arc — filling that auto-closes into
-    // a chord, not the pie wedge. So skip the fill for arc here (the engine,
-    // not this branch, owns arc's pie-wedge fill).
+    // Arc bodies render through the preset engine above, which owns arc's
+    // pie-wedge fill (path 0) and open-arc stroke (path 1); never fill an arc
+    // outline here, where both paths would be filled together.
     if (paintImageFill && geom !== 'arc') {
       if (paintImageFill(target)) tClearShadow();
     } else if (tFill && geom !== 'arc') {
@@ -3975,6 +4320,10 @@ function renderShape(ctx: CanvasRenderingContext2D, el: ShapeElement, scale: num
       if (!silhouette) tClearShadow();
     }
     if (tStroke) {
+      if (el.custGeom && el.custGeom.length > 0 && (custHeadTrim > 0 || custTailTrim > 0)) {
+        target.beginPath();
+        traceTrimmedPath(target, (sink) => buildCustomPath(sink, el.custGeom!, bx, by, bw, bh), custHeadTrim, custTailTrim);
+      }
       tStroke();
     }
   };
@@ -4014,8 +4363,8 @@ function renderShape(ctx: CanvasRenderingContext2D, el: ShapeElement, scale: num
   const strokeHalf = el.stroke ? el.stroke.width * scale / 2 : 0;
   const lineEndExtent = el.stroke
     ? Math.max(
-        el.stroke.headEnd ? lineEndPaintExtent(el.stroke.headEnd, el.stroke, scale) : 0,
-        el.stroke.tailEnd ? lineEndPaintExtent(el.stroke.tailEnd, el.stroke, scale) : 0,
+        el.stroke.headEnd ? lineEndPaintExtent(el.stroke.headEnd, el.stroke, scale, PT_TO_EMU) : 0,
+        el.stroke.tailEnd ? lineEndPaintExtent(el.stroke.tailEnd, el.stroke, scale, PT_TO_EMU) : 0,
       )
     : 0;
   const contourExtent = el.sp3d?.contourW ? el.sp3d.contourW * scale : 0;
@@ -4046,6 +4395,7 @@ function renderShape(ctx: CanvasRenderingContext2D, el: ShapeElement, scale: num
         el.sp3d?.prstMaterial,
         scale,
         devScale,
+        el.scene3d?.camera,
       )
     : [];
   const flatBevelEdgePadCss = (el.stroke ? (el.stroke.width * scale) / 2 : 0) + 2;
@@ -4067,35 +4417,43 @@ function renderShape(ctx: CanvasRenderingContext2D, el: ShapeElement, scale: num
       const cmpd = el.stroke.cmpd;
       const isStraight = geom === 'line' || geom === 'straightconnector1';
       if (isRetractableLeader(geom) && anchors.vertices.length >= 2 && !(cmpd && isStraight)) {
-        const pts = anchors.vertices.map((v) => ({ x: v.x, y: v.y }));
-        if (el.stroke.tailEnd) {
-          const retract = lineEndRetract(el.stroke.tailEnd, el.stroke, scale);
-          pts[pts.length - 1] = retractLineEndpoint(
-            pts[pts.length - 1],
-            pts[pts.length - 2],
-            retract,
-          );
-        }
-        if (el.stroke.headEnd) {
-          const retract = lineEndRetract(el.stroke.headEnd, el.stroke, scale);
-          pts[0] = retractLineEndpoint(pts[0], pts[1], retract);
-        }
+        // Trim across the whole leader, so a short terminal leg cannot stop
+        // the retraction early; a leader consumed by both ends paints nothing.
+        const pts = anchors.vertices;
         target.beginPath();
-        target.moveTo(pts[0].x, pts[0].y);
-        for (let i = 1; i < pts.length; i++) target.lineTo(pts[i].x, pts[i].y);
+        traceTrimmedPath(target, (sink) => {
+          sink.moveTo(pts[0].x, pts[0].y);
+          for (let i = 1; i < pts.length; i++) sink.lineTo(pts[i].x, pts[i].y);
+        }, headTrim, tailTrim);
         applyStroke(target, el.stroke, scale, { x, y, w, h }, el.rotation);
         target.stroke();
       }
+      if (trimsCurvedLeader) {
+        target.beginPath();
+        if (tracePresetLeader(target, geom, x, y, w, h,
+          [el.adj, el.adj2, el.adj3, el.adj4, el.adj5, el.adj6, el.adj7, el.adj8], headTrim, tailTrim)) {
+          applyStroke(target, el.stroke, scale, { x, y, w, h }, el.rotation);
+          target.stroke();
+        }
+      }
       if (cmpd && isStraight) {
-        drawCompoundLine(
-          target,
-          anchors.start,
-          anchors.end,
-          el.stroke,
-          cmpd,
-          scale,
-          el.rotation,
-        );
+        // Both ends trim the same straight run; when they consume it, no
+        // parallel line remains (independent retraction would cross over).
+        const run = trimGeometryPathEnds([
+          { op: 'moveTo', args: [anchors.start.x, anchors.start.y] },
+          { op: 'lineTo', args: [anchors.end.x, anchors.end.y] },
+        ], headTrim, tailTrim);
+        if (run.length === 2) {
+          drawCompoundLine(
+            target,
+            { x: run[0].args[0], y: run[0].args[1] },
+            { x: run[1].args[0], y: run[1].args[1] },
+            el.stroke,
+            cmpd,
+            scale,
+            el.rotation,
+          );
+        }
       }
       if (el.stroke.tailEnd) {
         drawArrowHead(
@@ -4106,7 +4464,8 @@ function renderShape(ctx: CanvasRenderingContext2D, el: ShapeElement, scale: num
           el.stroke.tailEnd,
           el.stroke,
           scale,
-          resolveArrowPaint(target, el.stroke, scale, anchors.end.x, anchors.end.y, anchors.end.angle,
+          PT_TO_EMU,
+          resolveArrowPaint(target, el.stroke, scale, PT_TO_EMU, anchors.end.x, anchors.end.y, anchors.end.angle,
             el.stroke.tailEnd, { x, y, w, h }, el.rotation, scale * PT_TO_EMU),
         );
       }
@@ -4119,7 +4478,8 @@ function renderShape(ctx: CanvasRenderingContext2D, el: ShapeElement, scale: num
           el.stroke.headEnd,
           el.stroke,
           scale,
-          resolveArrowPaint(target, el.stroke, scale, anchors.start.x, anchors.start.y, anchors.start.angle,
+          PT_TO_EMU,
+          resolveArrowPaint(target, el.stroke, scale, PT_TO_EMU, anchors.start.x, anchors.start.y, anchors.start.angle,
             el.stroke.headEnd, { x, y, w, h }, el.rotation, scale * PT_TO_EMU),
         );
       }
@@ -4144,7 +4504,8 @@ function renderShape(ctx: CanvasRenderingContext2D, el: ShapeElement, scale: num
         el.stroke.headEnd,
         el.stroke,
         scale,
-        resolveArrowPaint(target, el.stroke, scale, x + start.x * w, y + start.y * h,
+        PT_TO_EMU,
+        resolveArrowPaint(target, el.stroke, scale, PT_TO_EMU, x + start.x * w, y + start.y * h,
           Math.atan2(start.dy * h, start.dx * w), el.stroke.headEnd, { x, y, w, h }, el.rotation, scale * PT_TO_EMU),
       );
     }
@@ -4157,7 +4518,8 @@ function renderShape(ctx: CanvasRenderingContext2D, el: ShapeElement, scale: num
         el.stroke.tailEnd,
         el.stroke,
         scale,
-        resolveArrowPaint(target, el.stroke, scale, x + end.x * w, y + end.y * h,
+        PT_TO_EMU,
+        resolveArrowPaint(target, el.stroke, scale, PT_TO_EMU, x + end.x * w, y + end.y * h,
           Math.atan2(end.dy * h, end.dx * w), el.stroke.tailEnd, { x, y, w, h }, el.rotation, scale * PT_TO_EMU),
       );
     }
@@ -4203,7 +4565,7 @@ function renderShape(ctx: CanvasRenderingContext2D, el: ShapeElement, scale: num
     effScale,
     liveTransform,
     Boolean(fillStyle) || hasPreparedImageFill,
-    (target) => paintShapeBody(target, '#000'),
+    true,
   );
 
   // Render text inside the rotation context so text follows shape rotation
@@ -4393,12 +4755,133 @@ export function resolveBulletLabel(
   return '';
 }
 
+/** Shared marker content, font, color and size resolution (§21.1.2.4).
+ * Layout owns placement; the marker's authored properties do not depend on
+ * whether its paragraph advances horizontally or down a stacked column. */
+function paragraphBullet(body: TextBody, para: Paragraph, paraDefaultColor: string,
+  scale: number, fontScale: number, rc: RenderContext, autoNumCounters: Map<number, number>) {
+  // Per ECMA-376 §21.1.2.4.13: when no buSz* is declared, the bullet takes
+  // the first run's font size. Using paraDefaultFontSizePx here (the layout
+  // lvl1pPr defRPr fallback, typically 18pt) oversizes the bullet so a
+  // hanging indent calibrated against the run (12pt) can't contain it —
+  // that's why the em-dash was overlapping the text.
+  const bulletBaseSizePt = (() => {
+    for (const r of para.runs) {
+      if (r.type === 'text' && r.fontSize != null) return r.fontSize;
+    }
+    return para.defFontSize ?? body.defaultFontSize ?? 18;
+  })();
+  const bulletBaseSizePx = bulletBaseSizePt * PT_TO_EMU * scale * fontScale;
+
+  // ECMA-376 §21.1.2.4.4 (CT_TextCharBullet) / §21.1.2.4.10 (buClrTx): when
+  // no explicit `<a:buClr>` is present, the bullet inherits the *first run*'s
+  // color, NOT the shape-level default text color. The two diverge on
+  // templates where `<p:style><a:fontRef>` resolves to white (lt1) — runs
+  // override that with their own `<a:rPr><a:solidFill>`, but bullets without
+  // a buClr would otherwise pick up the white default and become invisible
+  // (the slide-13 sample-2 regression).
+  const firstRunColorHex = (() => {
+    for (const r of para.runs) {
+      if (r.type === 'text' && r.color) return r.color;
+    }
+    return null;
+  })();
+  const bulletInheritedColor = firstRunColorHex
+    ? hexToRgba(firstRunColorHex)
+    : paraDefaultColor;
+  const firstRunFontFamily = (() => {
+    for (const r of para.runs) {
+      if (r.type === 'text' && r.fontFamily) return r.fontFamily;
+    }
+    return para.defFontFamily ?? null;
+  })();
+
+  let bulletLabel  = '';
+  let bulletSizePx = bulletBaseSizePx;
+  let bulletFamily = 'sans-serif';
+  let bulletFont   = buildFont(false, false, bulletSizePx, bulletFamily, rc);
+  let bulletColor  = bulletInheritedColor;
+  let bulletFollowsText = false;
+  // Picture bullet (`<a:buBlip>`, §21.1.2.4.2). Resolved to its image + drawn
+  // size below; stays null for char/number/none bullets.
+  let bulletImage: { imagePath: string; mimeType: string; sizePx: number } | null = null;
+
+  // Resolve the marker label and advance the autoNum counter. Empty
+  // paragraphs (Enter on a blank line) draw no marker and do not advance the
+  // counter — PowerPoint keeps a blank line between numbered items unnumbered
+  // while continuing the sequence. ECMA-376 §21.1.2.4.x gives no numeric
+  // rule, so PowerPoint's behaviour is the reference (see resolveBulletLabel).
+  bulletLabel = resolveBulletLabel(para, autoNumCounters);
+
+  // The parser may emit the picture-bullet variant (`type: "blip"`), which the
+  // shared core `Bullet` type doesn't list — narrow once via asBullet.
+  const bullet = asBullet(para.bullet);
+  if (bullet.type === 'char') {
+    const b = bullet;
+    // ECMA-376 §21.1.2.4.10 (buSzPts): an ABSOLUTE point size sizes the marker
+    // independent of the run — convert pt → px like any run size
+    // (PT_TO_EMU·scale·fontScale). It wins over §21.1.2.4.9 (buSzPct, percent of
+    // the run size); with neither, the marker takes the run size (§21.1.2.4.13).
+    const bSizePx = b.sizePts != null
+      ? b.sizePts * PT_TO_EMU * scale * fontScale
+      : b.sizePct != null
+        ? bulletBaseSizePx * (b.sizePct / 100)
+        : bulletBaseSizePx;
+    // If the char was mapped to a Unicode symbol, use sans-serif for reliable rendering.
+    // Otherwise use the specified font (e.g. Wingdings on systems that have it).
+    const convertedFamily = bulletLabel !== b.char ? 'sans-serif' : normalizeFontFamily(b.fontFamily ?? null, rc);
+    bulletSizePx = bSizePx;
+    bulletFamily = convertedFamily;
+    bulletFont  = buildFont(false, false, bSizePx, convertedFamily, rc, bulletLabel,
+      hasNamedFontFamily(b.fontFamily));
+    bulletColor = b.color ? hexToRgba(b.color) : bulletInheritedColor;
+    bulletFollowsText = !b.color;
+  } else if (bullet.type === 'autoNum') {
+    const b = bullet;
+    const bSizePx = b.sizePts != null
+      ? b.sizePts * PT_TO_EMU * scale * fontScale
+      : b.sizePct != null
+        ? bulletBaseSizePx * (b.sizePct / 100)
+        : bulletBaseSizePx;
+    bulletSizePx = bSizePx;
+    bulletFamily = normalizeFontFamily(b.fontFamily ?? firstRunFontFamily, rc);
+    bulletFont = buildFont(
+      false,
+      false,
+      bSizePx,
+      normalizeFontFamily(b.fontFamily ?? firstRunFontFamily, rc),
+      rc,
+      bulletLabel,
+      hasNamedFontFamily(b.fontFamily ?? firstRunFontFamily),
+    );
+    // ECMA-376 §21.1.2.4.4 (buClr): an explicit `<a:buClr>` colours the
+    // auto-number marker, mirroring the char-bullet branch above. Only when it
+    // is absent does the marker fall back to the buClrTx default
+    // (§21.1.2.4.5 — the inherited first-run colour).
+    bulletColor = bullet.color ? hexToRgba(bullet.color) : bulletInheritedColor;
+    bulletFollowsText = !bullet.color;
+  } else if (bullet.type === 'blip') {
+    // ECMA-376 §21.1.2.4.2 picture bullet. Its height follows the text's em
+    // box, scaled by `<a:buSzPct>`, while paint preserves the source aspect
+    // (§21.1.2.4.9; default 100%). It's not a glyph, so there is no label —
+    // an empty paragraph still draws no marker (bulletLabel stays '' and the
+    // draw site gates the image on the first line having content).
+    // §21.1.2.4.10 (buSzPts): an absolute point size overrides the §21.1.2.4.9
+    // percentage, matching the char-bullet branch above.
+    const b = bullet;
+    const sizePx = pictureBulletSizePt(body, para, b) * PT_TO_EMU * scale * fontScale;
+    bulletImage = { imagePath: b.imagePath, mimeType: b.mimeType, sizePx };
+  }
+
+  return { bulletLabel, bulletFont, bulletSizePx, bulletFamily, bulletColor, bulletFollowsText, bulletImage };
+}
+
 /**
  * PowerPoint input for stacked vertical text. Paragraph defaults, the stored
  * normAutofit fontScale / lnSpcReduction and paragraph spacing follow the
  * horizontal path; spAutoFit keeps the stored geometry (PowerPoint does not
- * refit an unedited shape). Bullets are not drawn for stacked bodies: no
- * control measured one.
+ * refit an unedited shape). Marker properties share the horizontal resolver;
+ * margins and indents are measured in the column reading direction.
  */
 function renderStackedTextBody(
   ctx: CanvasRenderingContext2D,
@@ -4414,6 +4897,7 @@ function renderStackedTextBody(
   slideNumber: number | undefined,
   rc: RenderContext,
   onTextRun?: TextRunCallback,
+  fetchImage?: FetchImage,
 ): void {
   const fontScale = body.autoFit === 'norm' && body.fontScale != null && body.fontScale > 0 && body.fontScale < 1
     ? body.fontScale : 1;
@@ -4423,11 +4907,15 @@ function renderStackedTextBody(
   const bodyDefaultBold = body.defaultBold ?? false;
   const bodyDefaultItalic = body.defaultItalic ?? false;
   let sameStyle: ((a: LayoutSegment, b: LayoutSegment) => boolean) | undefined;
+  const autoNumCounters = new Map<number, number>();
+  const markers: ReturnType<typeof paragraphBullet>[] = [];
   const paragraphs: StackedParagraphInput<LayoutSegment>[] = body.paragraphs.map((para) => {
     const sizePx = para.defFontSize != null ? para.defFontSize * pxPerPt * fontScale : bodyDefaultFontSizePx;
     const color = para.defColor ? hexToRgba(para.defColor) : bodyDefaultColor;
+    const marker = paragraphBullet(body, para, color, scale, fontScale, rc, autoNumCounters);
+    markers.push(marker);
     const built = paragraphInputRuns(para, sizePx, color, scale, bodyDefaultBold, bodyDefaultItalic, fontScale,
-      slideNumber, rc);
+      slideNumber, rc, false, ctx);
     sameStyle ??= built.sameStyle;
     const firstText = built.input.find((item) => item.type === 'text');
     const family = normalizeFontFamily(para.defFontFamily ?? null, rc);
@@ -4437,17 +4925,35 @@ function renderStackedTextBody(
       text: '', font: buildFont(bold, italic, sizePx, family, rc, ''), sizePx, color,
       underline: false, strikethrough: false, lineMetric: lineMetricFor(family, bold, italic, rc), faceFamily: family,
     };
+    // §21.1.2.2.2: the insertion position has its own run properties. In
+    // particular an explicit noStrike must stop inherited final-mark strokes.
+    const endRun = para.endRunProperties;
+    const endInput = endRun ? paragraphInputRuns({ ...para, runs: [{ ...endRun, text: ' ' }] },
+      sizePx, color, scale, bodyDefaultBold, bodyDefaultItalic, fontScale, slideNumber, rc, false, ctx)
+      .input.find(item => item.type === 'text') : undefined;
     const spacing = (pts: number | null, pct: number | undefined): DrawingMlLineSpacing =>
       pct != null ? { type: 'pct', val: pct }
         : pts != null ? { type: 'pts', val: (pts / 100) * fontScale } : undefined;
     return {
       runs: built.input,
+      marginStart: emuToPx(para.marL, scale),
+      marginEnd: emuToPx(para.marR, scale),
+      firstLineIndent: emuToPx(para.indent, scale),
+      marker: !paragraphHasRenderableContent(para) ? undefined : marker.bulletLabel ? {
+        text: marker.bulletLabel,
+        style: { text: marker.bulletLabel, font: marker.bulletFont, sizePx: marker.bulletSizePx,
+          color: marker.bulletColor, underline: false, strikethrough: false,
+          faceFamily: marker.bulletFamily, lineMetric: lineMetricFor(marker.bulletFamily, false, false, rc) },
+      } : marker.bulletImage ? {
+        advance: marker.bulletImage.sizePx, thickness: marker.bulletImage.sizePx,
+      } : undefined,
       alignment: para.alignment,
       lineSpacing: para.spaceLine?.type === 'pts'
         ? { type: 'pts', val: powerPointExactLinePoints(para.spaceLine.val) } : para.spaceLine,
       spaceBefore: spacing(para.spaceBefore, para.spaceBeforePct),
       spaceAfter: spacing(para.spaceAfter, para.spaceAfterPct),
       markStyle,
+      endMarkStyle: endInput?.type === 'text' ? endInput.style : undefined,
       eastAsianLineBreak: para.eaLnBrk !== false,
     };
   });
@@ -4462,16 +4968,45 @@ function renderStackedTextBody(
     pxPerPt,
     paragraphs,
     sameStyle,
-    drawObject: (style, x, y) => {
-      const equation = style.math!;
-      const render = mathRenders.get(equation.nodes);
-      // Match horizontal paint: optional/failed math has no ink or warning.
-      // Core stacked layout preserves the display boundary's blank column.
-      if (!render) return;
-      const height = equation.ascent + equation.descent;
-      if (equation.width > 0 && height > 0) {
-        ctx.drawImage(tintedMathImage(render, style.color), x, y, equation.width, height);
+    drawMarker: (index, axisX, top) => {
+      const para = body.paragraphs[index];
+      if (!paragraphHasRenderableContent(para)) return;
+      const marker = markers[index];
+      const y = top;
+      // §21.1.2.4.2: keep a picture marker per paragraph, sized by the shared
+      // buSzPct/buSzPts resolver. Electronic PDF export has shown a single
+      // image at the box upper-left for stacked text, but that observation is
+      // not isolated across image classes/export paths: no compatibility rule.
+      ctx.save();
+      const image = marker.bulletImage;
+      const bitmap = image ? rc.pictureBulletImages?.has(image.imagePath)
+        ? rc.pictureBulletImages.get(image.imagePath) : fetchImage
+          ? peekCachedBitmapByPath(image.imagePath, fetchImage) : null : null;
+      if (image && bitmap) {
+        const h = image.sizePx;
+        const w = bitmap.height > 0 ? h * bitmap.width / bitmap.height : h;
+        ctx.drawImage(bitmap, axisX - w / 2, y, w, h);
       }
+      ctx.restore();
+    },
+    markerPaint: (index, axisX, baseline) => {
+      const marker = markers[index];
+      const first = paragraphs[index].runs.find(run => run.type === 'text');
+      return marker.bulletFollowsText && first?.type === 'text' && first.style.patternFill
+        ? resolveSegmentTextPaint(ctx, first.style, axisX, baseline, scale) : marker.bulletColor;
+    },
+    drawUnderline: (style, width, columnSizePx) => {
+      paintRunUnderline(ctx, style, 0, 0, width, style.color, scale, rc.dpr, columnSizePx);
+    },
+    sameUnderline: (a, b) => a.underline === b.underline && a.underlineStyle === b.underlineStyle
+      && a.underlineColor === b.underlineColor && a.underlineFill === b.underlineFill
+      && a.underlineLine === b.underlineLine && a.underlineLineNoFill === b.underlineLineNoFill
+      && a.color === b.color && a.noFill === b.noFill,
+    drawStrike: (style, x, baseline, width) => {
+      paintRunStrike(ctx, style, x, baseline, width, style.color, rc.dpr);
+    },
+    drawObject: (style, x, y) => {
+      paintEquation(ctx, style, x, y);
     },
   });
   if (!onTextRun) return;
@@ -4526,7 +5061,7 @@ export function renderTextBody(
     // Like the rotated modes, a table row measures a vertical body by its box.
     if (measureOnly) return bw;
     renderStackedTextBody(ctx, body, body.vert, bx, by, bw, bh, scale, shapeDefaultTextColor ?? themeDefaultColor,
-      shapeRotation, slideNumber, rc, onTextRun);
+      shapeRotation, slideNumber, rc, onTextRun, fetchImage);
     return;
   }
 
@@ -4726,112 +5261,8 @@ export function renderTextBody(
     // dash overlap noted below, and docx PR #476).
     const hasBullet = paragraphHasBullet(para);
 
-    // Per ECMA-376 §21.1.2.4.13: when no buSz* is declared, the bullet takes
-    // the first run's font size. Using paraDefaultFontSizePx here (the layout
-    // lvl1pPr defRPr fallback, typically 18pt) oversizes the bullet so a
-    // hanging indent calibrated against the run (12pt) can't contain it —
-    // that's why the em-dash was overlapping the text.
-    const bulletBaseSizePt = (() => {
-      for (const r of para.runs) {
-        if (r.type === 'text' && r.fontSize != null) return r.fontSize;
-      }
-      return para.defFontSize ?? body.defaultFontSize ?? 18;
-    })();
-    const bulletBaseSizePx = bulletBaseSizePt * PT_TO_EMU * scale * fontScale;
-
-    // ECMA-376 §21.1.2.4.4 (CT_TextCharBullet) / §21.1.2.4.10 (buClrTx): when
-    // no explicit `<a:buClr>` is present, the bullet inherits the *first run*'s
-    // color, NOT the shape-level default text color. The two diverge on
-    // templates where `<p:style><a:fontRef>` resolves to white (lt1) — runs
-    // override that with their own `<a:rPr><a:solidFill>`, but bullets without
-    // a buClr would otherwise pick up the white default and become invisible
-    // (the slide-13 sample-2 regression).
-    const firstRunColorHex = (() => {
-      for (const r of para.runs) {
-        if (r.type === 'text' && r.color) return r.color;
-      }
-      return null;
-    })();
-    const bulletInheritedColor = firstRunColorHex
-      ? hexToRgba(firstRunColorHex)
-      : paraDefaultColor;
-    const firstRunFontFamily = (() => {
-      for (const r of para.runs) {
-        if (r.type === 'text' && r.fontFamily) return r.fontFamily;
-      }
-      return para.defFontFamily ?? null;
-    })();
-
-    let bulletLabel  = '';
-    let bulletFont   = buildFont(false, false, bulletBaseSizePx, 'sans-serif', rc);
-    let bulletColor  = bulletInheritedColor;
-    let bulletFollowsText = false;
-    // Picture bullet (`<a:buBlip>`, §21.1.2.4.2). Resolved to its image + drawn
-    // size below; stays null for char/number/none bullets.
-    let bulletImage: { imagePath: string; mimeType: string; sizePx: number } | null = null;
-
-    // Resolve the marker label and advance the autoNum counter. Empty
-    // paragraphs (Enter on a blank line) draw no marker and do not advance the
-    // counter — PowerPoint keeps a blank line between numbered items unnumbered
-    // while continuing the sequence. ECMA-376 §21.1.2.4.x gives no numeric
-    // rule, so PowerPoint's behaviour is the reference (see resolveBulletLabel).
-    bulletLabel = resolveBulletLabel(para, autoNumCounters);
-
-    // The parser may emit the picture-bullet variant (`type: "blip"`), which the
-    // shared core `Bullet` type doesn't list — narrow once via asBullet.
-    const bullet = asBullet(para.bullet);
-    if (bullet.type === 'char') {
-      const b = bullet;
-      // ECMA-376 §21.1.2.4.10 (buSzPts): an ABSOLUTE point size sizes the marker
-      // independent of the run — convert pt → px like any run size
-      // (PT_TO_EMU·scale·fontScale). It wins over §21.1.2.4.9 (buSzPct, percent of
-      // the run size); with neither, the marker takes the run size (§21.1.2.4.13).
-      const bSizePx = b.sizePts != null
-        ? b.sizePts * PT_TO_EMU * scale * fontScale
-        : b.sizePct != null
-          ? bulletBaseSizePx * (b.sizePct / 100)
-          : bulletBaseSizePx;
-      // If the char was mapped to a Unicode symbol, use sans-serif for reliable rendering.
-      // Otherwise use the specified font (e.g. Wingdings on systems that have it).
-      const convertedFamily = bulletLabel !== b.char ? 'sans-serif' : normalizeFontFamily(b.fontFamily ?? null, rc);
-      bulletFont  = buildFont(false, false, bSizePx, convertedFamily, rc, bulletLabel,
-        hasNamedFontFamily(b.fontFamily));
-      bulletColor = b.color ? hexToRgba(b.color) : bulletInheritedColor;
-      bulletFollowsText = !b.color;
-    } else if (bullet.type === 'autoNum') {
-      const b = bullet;
-      const bSizePx = b.sizePts != null
-        ? b.sizePts * PT_TO_EMU * scale * fontScale
-        : b.sizePct != null
-          ? bulletBaseSizePx * (b.sizePct / 100)
-          : bulletBaseSizePx;
-      bulletFont = buildFont(
-        false,
-        false,
-        bSizePx,
-        normalizeFontFamily(b.fontFamily ?? firstRunFontFamily, rc),
-        rc,
-        bulletLabel,
-        hasNamedFontFamily(b.fontFamily ?? firstRunFontFamily),
-      );
-      // ECMA-376 §21.1.2.4.4 (buClr): an explicit `<a:buClr>` colours the
-      // auto-number marker, mirroring the char-bullet branch above. Only when it
-      // is absent does the marker fall back to the buClrTx default
-      // (§21.1.2.4.5 — the inherited first-run colour).
-      bulletColor = bullet.color ? hexToRgba(bullet.color) : bulletInheritedColor;
-      bulletFollowsText = !bullet.color;
-    } else if (bullet.type === 'blip') {
-      // ECMA-376 §21.1.2.4.2 picture bullet. Its height follows the text's em
-      // box, scaled by `<a:buSzPct>`, while paint preserves the source aspect
-      // (§21.1.2.4.9; default 100%). It's not a glyph, so there is no label —
-      // an empty paragraph still draws no marker (bulletLabel stays '' and the
-      // draw site gates the image on the first line having content).
-      // §21.1.2.4.10 (buSzPts): an absolute point size overrides the §21.1.2.4.9
-      // percentage, matching the char-bullet branch above.
-      const b = bullet;
-      const sizePx = pictureBulletSizePt(body, para, b) * PT_TO_EMU * scale * fontScale;
-      bulletImage = { imagePath: b.imagePath, mimeType: b.mimeType, sizePx };
-    }
+    const { bulletLabel, bulletFont, bulletColor, bulletFollowsText, bulletImage } =
+      paragraphBullet(body, para, paraDefaultColor, scale, fontScale, rc, autoNumCounters);
 
     // Text start X and wrap width.
     //
@@ -5136,7 +5567,7 @@ export function renderTextBody(
     }
     return layout;
   };
-  let { allLines, totalHeight, requiredHeight } = layoutAt(1.0);
+  let { allLines, requiredHeight } = layoutAt(1.0);
 
   // ── normAutoFit ──────────────────────────────────────────────────────────
   // ECMA-376 §21.1.2.1.3 gives an omitted fontScale the value 100% and an
@@ -5150,7 +5581,7 @@ export function renderTextBody(
   // Therefore our own text metrics must not manufacture a new scale here.
   if (body.autoFit === 'norm') {
     if (body.fontScale != null && body.fontScale > 0) {
-      if (body.fontScale < 1.0) ({ allLines, totalHeight, requiredHeight } = layoutAt(body.fontScale));
+      if (body.fontScale < 1.0) ({ allLines, requiredHeight } = layoutAt(body.fontScale));
     }
   }
 
@@ -5575,14 +6006,8 @@ export function renderTextBody(
 
       // ── Equation segment: draw the cached image instead of text ──────────
       if (seg.math) {
-        const render = mathRenders.get(seg.math.nodes);
         const w = seg.math.width;
-        const h = seg.math.ascent + seg.math.descent;
-        if (render && w > 0 && h > 0) {
-          const top = baseline - seg.math.ascent;
-          const img = tintedMathImage(render, seg.color);
-          ctx.drawImage(img, penX, top, w, h);
-        }
+        paintEquation(ctx, seg, penX, baseline - seg.math.ascent);
         penX += w;
         penX += jext;
         continue;
@@ -5603,7 +6028,7 @@ export function renderTextBody(
         const hlW = measureTextAdvance(ctx, seg.text, ls)
           + internalStretch
           + jext;
-        paintHighlight(ctx, penX, segBaseline, hlW, drawSizePx, seg.highlight, glyphPaint);
+        paintHighlight(ctx, penX, segBaseline, hlW, drawSizePx, seg.highlight, glyphPaint, seg.lineMetric);
       }
 
       // noFill is the GLYPH fill choice (§21.1.2.3.9).  It does not erase an
@@ -5853,58 +6278,7 @@ export function renderTextBody(
         });
       }
 
-      if (seg.underline && !seg.underlineLineNoFill
-        && (!seg.noFill || seg.underlineFill || seg.underlineColor || seg.underlineLine?.fill)) {
-        // §21.1.2.3.13 uFillTx follows the actual glyph fill (including
-        // pattFill), while §21.1.2.3.12 uFill supplies its own fill choice.
-        // Office PDF shows a separately chosen underline pattern on the
-        // same slide-aligned grid.
-        const underlinePaint = seg.underlineFill
-          ? resolveFillCore(
-              seg.underlineFill, ctx, penX, segBaseline, segW + jext, drawSizePx * 0.05,
-              0, scale * PT_TO_EMU,
-            ) ?? 'rgba(0,0,0,0)'
-          : seg.underlineLine?.fill
-            ? resolveFillCore(seg.underlineLine.fill, ctx, penX, segBaseline,
-                segW + jext, drawSizePx * 0.05, 0, scale * PT_TO_EMU) ?? 'rgba(0,0,0,0)'
-            : seg.underlineColor ?? glyphPaint;
-        drawUnderline(ctx, penX, segBaseline, segW + jext, drawSizePx,
-          underlinePaint, seg.underlineStyle, rc.dpr,
-          seg.underlineLine?.width ? emuToPx(seg.underlineLine.width, scale) : undefined);
-      }
-
-      if (seg.strikethrough && !seg.noFill) {
-        const lineW = Math.max(1, drawSizePx * 0.05);
-        ctx.strokeStyle = glyphPaint;
-        ctx.lineWidth = lineW;
-        ctx.setLineDash([]);
-        // Crispness nudge (see crispOffset): the strike is a horizontal stroke;
-        // an odd device-pixel width is centered on one device row by snapping its
-        // y onto the nearest crisp device position (otherwise it straddles two
-        // rows → blurry). Snap each line from its own y.
-        const yMid = segBaseline - drawSizePx * 0.32;
-        if (seg.strikeDouble) {
-          // Two parallel lines straddling the standard strike position,
-          // separated by ~ 1.5× the line weight (visually distinct yet
-          // staying inside the glyph's central band).
-          const offset = lineW * 0.9;
-          const yUp = yMid - offset;
-          const yDn = yMid + offset;
-          ctx.beginPath();
-          ctx.moveTo(penX, yUp + crispOffset(yUp, lineW, rc.dpr));
-          ctx.lineTo(penX + segW + jext, yUp + crispOffset(yUp, lineW, rc.dpr));
-          ctx.moveTo(penX, yDn + crispOffset(yDn, lineW, rc.dpr));
-          ctx.lineTo(penX + segW + jext, yDn + crispOffset(yDn, lineW, rc.dpr));
-          ctx.stroke();
-        } else {
-          const sy = yMid + crispOffset(yMid, lineW, rc.dpr);
-          ctx.beginPath();
-          ctx.moveTo(penX, sy);
-          ctx.lineTo(penX + segW + jext, sy);
-          ctx.stroke();
-        }
-      }
-
+      paintRunDecorations(ctx, seg, penX, segBaseline, segW + jext, glyphPaint, scale, rc.dpr);
       penX += segW;
       penX += jext;
     }
@@ -5968,13 +6342,14 @@ export function buildBevelInputs(
   prstMaterial: string | undefined,
   scale: number,
   devScale: number,
+  camera?: CameraInput,
 ): BevelInput[] {
   if (!sp3d) return [];
   const rig = lightRig?.rig ?? 'threePt';
   const dir = lightRig?.dir ?? 't';
-  // §20.1.5.9/§20.1.5.11: the lightRig's `<a:rot>` (rev = in-plane revolution about
-  // the view axis) rotates the key-light azimuth. lat/lon are a documented SPEC GAP
-  // in lightDirFromRig (no calibration sample exercises them).
+  // ECMA §§20.1.5.9/.11 and MS-OI29500 §2.1.1274(b): preserve explicit
+  // zero rot as an override of dir. Core rotates the entire rig (including
+  // flat-face illumination), with revolution about the tilted rig axis.
   const light = lightDirFromRig(rig, dir, lightRig?.rot);
   const material = materialClass(prstMaterial);
   const emuToDev = scale * devScale;
@@ -5986,6 +6361,8 @@ export function buildBevelInputs(
       prst: sp3d.bevelT.prst || 'circle',
       material,
       light,
+      camera,
+      wireframeLinePx: devScale,
     });
   }
   if (sp3d.bevelB && sp3d.bevelB.w > 0 && sp3d.bevelB.h > 0) {
@@ -5996,7 +6373,20 @@ export function buildBevelInputs(
       material,
       light,
       bottom: true,
+      camera,
+      depthPx: (sp3d.extrusionH ?? 0) * emuToDev,
+      wireframeLinePx: devScale,
     });
+  }
+  // Wireframe has geometry even without a bevel; it must not retain a solid
+  // face just because there is no bevel band to send to the compositor.
+  if (material === 'legacyWireframe') {
+    for (const bottom of [false, true]) {
+      if (!out.some(bevel => Boolean(bevel.bottom) === bottom))
+        out.push({ widthPx: 0, heightPx: 0, prst: 'circle', material, light, camera,
+          bottom, depthPx: bottom ? (sp3d.extrusionH ?? 0) * emuToDev : 0,
+          wireframeLinePx: devScale });
+    }
   }
   return out;
 }
@@ -6021,7 +6411,11 @@ function buildExtrusion(
   const depthDev = sp3d.extrusionH * scale * devScale;
   // Depth offset is computed in the device-px box (w·devScale × h·devScale) so
   // it matches the device-resolution offscreen the side wall is baked into.
-  const off = computeDepthOffset(camera, w * devScale, h * devScale, depthDev);
+  const off = computeDepthOffset(
+    { ...camera, unitsPerInch: (camera.unitsPerInch ?? 96) * devScale,
+      sceneDepth: (camera.sceneDepth ?? 0) * devScale },
+    w * devScale, h * devScale, depthDev,
+  );
   if (Math.hypot(off.x, off.y) < 0.75) return null;
   let rgb: [number, number, number] = [64, 64, 64];
   if (sp3d.extrusionClr) {
@@ -6061,6 +6455,11 @@ function buildExtrusion(
  * then fall back to painting directly.
  */
 interface Project3dOpts {
+  /** Preserve overflow of the separate, unshaded text pass. Body material
+   * and effect rasters keep their established domains. */
+  measureOverflow?: boolean;
+  /** Extrusion-base depth of the prepared bottom surface, in CSS px. */
+  backDepthCss?: number;
   /** Text front faces retain the slide pattern frame before camera projection. */
   preservePatternFrame?: boolean;
   /** Bevel lips to bake into the body before the warp (§20.1.5.12 bevelT/B). */
@@ -6098,6 +6497,7 @@ function patternFrameToLocalRaster(
   padDev: number,
   x: number,
   y: number,
+  padYDev = padDev,
 ) {
   const det = tf.a * tf.d - tf.b * tf.c;
   if (Math.abs(det) <= 1e-12) return undefined;
@@ -6111,7 +6511,7 @@ function patternFrameToLocalRaster(
     a: devScale * ia, b: devScale * ib,
     c: devScale * ic, d: devScale * id,
     e: padDev + devScale * (ie - x),
-    f: padDev + devScale * (iff - y),
+    f: padYDev + devScale * (iff - y),
   };
 }
 
@@ -6137,35 +6537,58 @@ function projectScene3dPaint(
   // onto the destination by extrapolating the camera quad through its own
   // homography. The camera is defined for the authored w×h face, so it must not
   // be recomputed from the padded raster size. Degenerate extrapolation → pad 0.
-  let padDev = Math.max(0, Math.ceil((opts.edgePadCss ?? 0) * devScale));
-  const quad = computeScene3dQuad(camera, w, h);
-  let quadCorners = quad.corners;
-  if (padDev > 0) {
-    const padCss = padDev / devScale;
-    const expanded = expandProjectedQuad(quad.corners, padCss / w, padCss / h);
-    if (expanded) quadCorners = expanded;
-    else padDev = 0;
+  const backDepth = opts.backDepthCss ?? 0;
+  const { face, corners: paddedCorners, backFacing, padDev } =
+    projectedSurface(camera, w, h, backDepth, opts.edgePadCss, devScale);
+  let quadCorners = paddedCorners;
+  let originX = padDev, originY = padDev;
+  let ow = Math.max(1, Math.ceil(w * devScale) + 2 * padDev);
+  let oh = Math.max(1, Math.ceil(h * devScale) + 2 * padDev);
+  if (opts.measureOverflow) {
+    // ECMA-376 §21.1.2.1.1 bodyPr defaults horzOverflow/vertOverflow to
+    // overflow; §21.1.2.1.2 noAutofit does not scale text into its box.
+    // Measure actual paint in the local authored frame, including insets,
+    // vertical/stacked text and glyph overhangs. The camera still belongs to
+    // w×h: growing that face would change its centre, lens and text placement.
+    const ink = measurePaintBounds(target, octx => paintBody(octx, 0, 0, w, h));
+    if (ink) {
+      // Independent axis bounds keep a long, thin text run O(ink area), rather
+      // than allocating a square with its longest overflow as four-side padding.
+      // One device pixel encloses raster AA; integer origins preserve the grid.
+      const x0 = Math.min(-padDev, Math.floor(ink.x * devScale) - 1);
+      const y0 = Math.min(-padDev, Math.floor(ink.y * devScale) - 1);
+      const x1 = Math.max(ow - padDev, Math.ceil((ink.x + ink.w) * devScale) + 1);
+      const y1 = Math.max(oh - padDev, Math.ceil((ink.y + ink.h) * devScale) + 1);
+      const expanded = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
+        .map(([px, py]) => projectQuadPoint(face, px / devScale / w, py / devScale / h));
+      // An authored degenerate face has no drawable homography, as in
+      // drawProjected itself. Otherwise a null extrapolation crosses the
+      // projection horizon: retain the flat fallback, not an unbounded warp.
+      if (expanded.some(point => !point)) return projectQuadPoint(face, .5, .5) === null;
+      quadCorners = expanded as [Vec2, Vec2, Vec2, Vec2];
+      originX = -x0; originY = -y0;
+      ow = x1 - x0; oh = y1 - y0;
+    }
   }
-  const padCss = padDev / devScale;
-
-  const ow = Math.max(1, Math.ceil(w * devScale) + 2 * padDev);
-  const oh = Math.max(1, Math.ceil(h * devScale) + 2 * padDev);
+  if (opts.measureOverflow && (!Number.isFinite(ow * oh)
+    || ow > MAX_CANVAS_DIMENSION || oh > MAX_CANVAS_DIMENSION
+    || ow * oh > MAX_CANVAS_AREA)) return false;
   const aux = createAuxCanvas(ow, oh);
   if (!aux) return false;
   const octx = aux.getContext('2d') as CanvasRenderingContext2D | null;
   if (!octx) return false;
 
-  // Paint the body into the offscreen with the origin at (pad,pad); device px.
+  // Paint in authored local coordinates; only the raster origin is displaced.
   octx.save();
   octx.scale(devScale, devScale);
-  octx.translate(padCss, padCss);
+  octx.translate(originX / devScale, originY / devScale);
   // PowerPoint PDF rasterises projected pattern text as a front-face image
   // before the camera warp. Its 8 pt tile stays in the slide frame: moving an
   // otherwise identical dnDiag text shape by 4 pt changes the embedded image's
   // colour phase, while camera rotation and extrusion retain that phase. Map
   // the live slide root into this padded local raster before painting.
   if (opts.preservePatternFrame) {
-    const sourceToAux = patternFrameToLocalRaster(tf, devScale, padDev, x, y);
+    const sourceToAux = patternFrameToLocalRaster(tf, devScale, originX, x, y, originY);
     withInheritedPatternScope(target, octx, () => paintBody(octx, 0, 0, w, h), undefined, sourceToAux);
   } else {
     paintBody(octx, 0, 0, w, h);
@@ -6173,7 +6596,7 @@ function projectScene3dPaint(
   octx.restore();
 
   // The body silhouette occupies the offscreen's inner box (device px):
-  // [padDev, padDev + w·devScale] on each axis (the a:ln border, painted inside
+  // originX/Y + [0, w/h·devScale] (the a:ln border, painted inside
   // paintBody, extends ±half-line-width past it; the pad reserves that room).
   // Restricting the bevel/extrusion distance-transform + sweep to this box grown
   // by the effect's reach (perf: A3) skips the transparent pad border. Equivalent
@@ -6184,8 +6607,8 @@ function projectScene3dPaint(
   const bodyDevW = Math.ceil(w * devScale);
   const bodyDevH = Math.ceil(h * devScale);
   const regionFor = (reachPx: number): BevelRegion => ({
-    x: padDev - reachPx,
-    y: padDev - reachPx,
+    x: originX - reachPx,
+    y: originY - reachPx,
     w: bodyDevW + 2 * reachPx,
     h: bodyDevH + 2 * reachPx,
   });
@@ -6193,17 +6616,33 @@ function projectScene3dPaint(
   // Extrusion side wall first (it sits behind/around the front face), then the
   // bevel lip on the front-face silhouette (§20.1.5.12). Both are baked into the
   // offscreen so they ride the camera warp.
-  if (opts.extrusion) {
-    const reach = Math.ceil(Math.hypot(opts.extrusion.offsetX, opts.extrusion.offsetY)) + 2;
-    applyExtrusion(octx, opts.extrusion, regionFor(reach));
-  }
+  const extrusion = opts.extrusion && backFacing && backDepth > 0
+    ? { ...opts.extrusion, offsetX: -opts.extrusion.offsetX, offsetY: -opts.extrusion.offsetY }
+    : opts.extrusion;
+  const wireframe = opts.bevels?.some(bevel => bevel.material === 'legacyWireframe');
+  const shadeBackBeforeWall = backFacing && opts.bevels?.some(bevel => bevel.bottom);
+  const paintWall = () => {
+    if (!extrusion || wireframe) return;
+    const reach = Math.ceil(Math.hypot(extrusion.offsetX, extrusion.offsetY)) + 2;
+    applyExtrusion(octx, extrusion, regionFor(reach));
+  };
+  if (!shadeBackBeforeWall) paintWall();
   // Bake bevel lip shading into the body bitmap (device-px band) before the
   // warp so the lit/shadowed rim rides the camera homography (§20.1.5.12).
   if (opts.bevels && opts.bevels.length > 0) {
     for (const bevel of opts.bevels) {
-      applyBevelShading(octx, bevel, regionFor(Math.ceil(bevel.widthPx) + 2));
+      const wireframeDepth = wireframe && extrusion
+        ? { x: extrusion.offsetX, y: extrusion.offsetY } : undefined;
+      const reach = bevel.widthPx + (wireframeDepth ? Math.hypot(wireframeDepth.x, wireframeDepth.y) : 0);
+      applyBevelShading(octx, wireframeDepth ? { ...bevel, wireframeDepth } : bevel,
+        regionFor(Math.ceil(reach) + 2));
     }
   }
+
+  // The exposed back lip is measured from the back-face silhouette, not from
+  // the outside of a wall swept toward the front. Shade it before that sweep;
+  // keep the established front-face compositing order above.
+  if (shadeBackBeforeWall) paintWall();
 
   // Post-bevel edges (the contour rim) on top of the beveled body, still
   // pre-projection. The a:ln border is painted inside paintBody (see
@@ -6211,7 +6650,7 @@ function projectScene3dPaint(
   if (opts.paintEdges) {
     octx.save();
     octx.scale(devScale, devScale);
-    octx.translate(padCss, padCss);
+    octx.translate(originX / devScale, originY / devScale);
     opts.paintEdges(octx, 0, 0, w, h);
     octx.restore();
   }
@@ -6455,7 +6894,9 @@ async function preparePicture(
     // `null` is reachable when the raster path resolves to an unsupported
     // metafile (a true EMF, or a WMF with no geometry); guarded below.
     let bitmap: ImageBitmap | HTMLImageElement | null;
-    if (preferVectorBlip(el)) {
+    // Any pixel transform (ordered chain or a lone duotone) needs a readable
+    // raster: the vector original is preferred only for untransformed pictures.
+    if (!pixelTransform(el) && preferVectorBlip(el)) {
       // No crop: prefer the vector original (shared gate; see preferVectorBlip).
       // With an a:srcRect crop we skip this branch — the crop math below
       // multiplies fractional srcRect edges by the source's pixel dims, and an
@@ -6468,7 +6909,8 @@ async function preparePicture(
       // (uncropped is the overwhelmingly common case for icons).
       try {
         bitmap = await getCachedSvgImageByPath(el.svgImagePath, fetchImage, svgOptions);
-      } catch {
+      } catch (error) {
+        if (error instanceof OoxmlResourceLimitError || isUnsupportedBlipEffectError(error) || isOoxmlDecodedImageLimitError(error)) throw error;
         // §20.1.8.23 duotone recolour applies only to the raster fallback — an
         // SVG vector original has no readable pixel grid (matches xlsx).
         bitmap = dataIsSvg
@@ -6480,22 +6922,29 @@ async function preparePicture(
               tiff,
             });
       }
-    } else if (dataIsSvg) {
+    } else if (dataIsSvg && !pixelTransform(el)) {
       // SVG-only picture (here either because it has a crop, or — defensively —
       // because no svgImagePath was surfaced): decode through the SVG path since
-      // createImageBitmap can't. A duotone on a vector picture is a rare edge
-      // case left un-recoloured (no readable pixel grid), matching xlsx.
+      // createImageBitmap can't. A transformed SVG takes the raster path below.
       bitmap = await getCachedSvgImageByPath(el.imagePath, fetchImage, svgOptions);
     } else {
+      // Ordered effects need pixels even for SVG-only sources. The shared
+      // decoder rasterizes SVG via the host bridge before applying the chain.
       // §20.1.8.23 duotone recolour on the raster blip (once, at decode time,
       // cached under a colour-suffixed key). No duotone ⇒ this is exactly the
       // former `getCachedBitmapByPath` decode.
+      // A chain measured in EMUs (§20.1.8.15) is evaluated on the picture's
+      // full source frame: the srcRect window is stretched over the picture.
+      const effectFrame = el.blipEffects?.length
+        ? stretchedSourceFrame(el.width / PT_TO_EMU, el.height / PT_TO_EMU, el.srcRect, null)
+        : null;
       bitmap = await getCachedDuotoneBitmapByPath(
         el.imagePath,
         el.mimeType,
         pixelTransform(el),
         fetchImage,
-        { widthPt, heightPt, ...(target ?? {}), tiff },
+        { widthPt: effectFrame?.width ?? widthPt, heightPt: effectFrame?.height ?? heightPt,
+          ...(target ?? {}), tiff, svgDecoder },
       );
     }
     // Skip a picture whose blip is an unsupported metafile (null bitmap), the
@@ -6513,10 +6962,12 @@ async function preparePicture(
  *  paints the unavailable-picture placeholder, a decoded-image budget or TIFF
  *  decode error propagates, and any other broken image is skipped. */
 function pictureFailure(el: PictureElement, scale: number, error: unknown): PreparedPaint {
+  // Resource failures (including lazy package extraction) are fatal even when
+  // ordinary unsupported/corrupt image content may produce a fallback.
   if (isOptionalImageCodecUnavailableError(error, 'tiff')) {
     return { paint: (ctx) => paintUnavailablePicture(ctx, el, scale) };
   }
-  if (isOoxmlDecodedImageLimitError(error) || isTiffDecodeError(error)) {
+  if (error instanceof OoxmlResourceLimitError || isUnsupportedBlipEffectError(error) || isOoxmlDecodedImageLimitError(error) || isTiffDecodeError(error)) {
     return { ...NO_PAINT, failure: { error } };
   }
   return NO_PAINT;
@@ -6612,7 +7063,10 @@ function paintResolvedPicture(
       cw: number,
       ch: number,
     ): void => {
-      if (el.prstGeom || (el.custGeom && el.custGeom.length > 0)) {
+      // §20.1.8.15 grow=true extends the image's coverage; an explicit
+      // rectangular preset must not re-clip that authored blur outset.
+      const grownRectangle = el.prstGeom === 'rect' && !el.custGeom?.length && hasImageEffectOutset(bitmap);
+      if (!grownRectangle && (el.prstGeom || (el.custGeom && el.custGeom.length > 0))) {
         tracePictureSilhouette(target, cx, cy, cw, ch);
         target.clip();
       }
@@ -6697,7 +7151,11 @@ function paintResolvedPicture(
     // to the normal flat draw (but sp3d bevel/extrusion still apply via the flat
     // path below). sp3d bevel/extrusion shading is wired in just after this; the
     // contour edge is the flat approximation in strokeContourEdge.
-    const scene3d = el.scene3d && isScene3dNonIdentity(el.scene3d.camera) ? el.scene3d : null;
+    const pictureCamera = el.scene3d && { ...el.scene3d.camera, unitsPerInch: EMU_PER_INCH * scale,
+      sceneDepth: (el.sp3d?.extrusionH ?? 0) * scale };
+    const scene3d = pictureCamera && isScene3dNonIdentity(
+      pictureCamera, w, h, (el.sp3d?.extrusionH ?? 0) * scale,
+    ) ? { ...el.scene3d, camera: pictureCamera } : null;
 
     // Paint JUST the (clipped, optionally cropped) bitmap body at a local rect —
     // no border/contour. Separated from the edges so the bevel shading reads the
@@ -6772,7 +7230,9 @@ function paintResolvedPicture(
       (el.sp3d as Sp3dLike | undefined) ? (el.sp3d as { prstMaterial?: string }).prstMaterial : undefined,
       scale,
       ctxDevScale,
+      el.scene3d?.camera,
     );
+    const backDepthCss = (bevels.find(bevel => bevel.bottom)?.depthPx ?? 0) / ctxDevScale;
     // Extrusion side wall only resolves under a camera that turns it visible
     // (§20.1.5.12). Computed against the active camera so a face-on view yields
     // null (no wall) and a tilted view reveals it.
@@ -6804,6 +7264,7 @@ function paintResolvedPicture(
       if (scene3d) {
         const ok = projectScene3dPaint(target, scene3d.camera, x, y, w, h, paintFaceAt, {
           bevels,
+          backDepthCss,
           extrusion: extrusion ?? undefined,
           paintEdges: strokeContourEdge,
           edgePadCss,
@@ -6827,9 +7288,8 @@ function paintResolvedPicture(
       paintImageAt(target, x, y, w, h);
     };
 
-    // Flat opaque silhouette of the clipped picture rectangle, used as the mask
-    // for innerShdw / softEdge. Falls back to the bounding rect when the picture
-    // is a plain rectangle (no clip path).
+    // Flat unbeveled pictures retain their opaque clip mask. Rasterized 3-D
+    // bodies supply full mesh geometry to the dedicated coverage pass below.
     const paintMaskAt = (
       target: CanvasRenderingContext2D,
       color: string,
@@ -6843,16 +7303,6 @@ function paintResolvedPicture(
       target.fillStyle = color;
       target.fillRect(ox, oy, ow, oh);
       target.restore();
-    };
-
-    const paintMask = (target: CanvasRenderingContext2D, color: string): void => {
-      if (scene3d) {
-        const ok = projectScene3dPaint(target, scene3d.camera, x, y, w, h, (octx, ox, oy, ow, oh) =>
-          paintMaskAt(octx, color, ox, oy, ow, oh),
-        );
-        if (ok) return;
-      }
-      paintMaskAt(target, color, x, y, w, h);
     };
 
     // ── effectLst (§19.3.1.37 routes p:pic's spPr through CT_ShapeProperties,
@@ -6886,6 +7336,7 @@ function paintResolvedPicture(
           h,
           edgePadCss,
           el.shadow?.algn,
+          backDepthCss,
         )
       : {
           bbox: transformedEffectBounds(
@@ -6908,19 +7359,21 @@ function paintResolvedPicture(
     const hasRasterEffects = Boolean(
       el.shadow || el.innerShadow || el.glow || el.softEdge || el.reflection,
     );
-    const rawMask: EffectPaint = (target) => paintMask(target, '#000');
+    const rawMask: EffectPaint = (target) => paintMaskAt(target, '#000', x, y, w, h);
     const effectBody = scene3d && hasRasterEffects
       ? cacheDevicePaint(paintImage, liveTransform, projectedGeometry.bbox, {
           w: (ctx.canvas as { width: number }).width || 0,
           h: (ctx.canvas as { height: number }).height || 0,
         })
       : paintImage;
-    const effectMask = scene3d && hasRasterEffects
-      ? cacheDevicePaint(rawMask, liveTransform, projectedGeometry.bbox, {
-          w: (ctx.canvas as { width: number }).width || 0,
-          h: (ctx.canvas as { height: number }).height || 0,
-        })
-      : rawMask;
+    // ECMA-376 §20.1.5.12 includes bevels, extrusion and contour in the 3-D
+    // shape. The shared effects dispatcher derives a dedicated opaque coverage
+    // mask from the complete projected raster, preserving walls and mesh holes.
+    // Its source color/opacity remain exclusively in the body; innerShdw owns
+    // its own color, and softEdge must preserve interior fill opacity (§20.1.8).
+    // Bounds/padding already come from the body's shared projectedSurface.
+    const rasterMask = Boolean(scene3d) || bevels.length > 0;
+    const effectMask = rasterMask ? effectBody : rawMask;
     // The caller paints this prepared picture in the slide pattern scope,
     // including transparent blip areas and any authored rotation or flip.
     paintWithRasterEffects(
@@ -6933,6 +7386,8 @@ function paintResolvedPicture(
       scale,
       effScale,
       liveTransform,
+      true,
+      rasterMask,
     );
 
     ctx.restore();
@@ -6978,7 +7433,7 @@ async function prepareMedia(
       if (isOptionalImageCodecUnavailableError(error, 'tiff')) {
         posterCodecUnavailable = true;
       } else {
-        if (isOoxmlDecodedImageLimitError(error) || isTiffDecodeError(error)) {
+        if (error instanceof OoxmlResourceLimitError || isUnsupportedBlipEffectError(error) || isOoxmlDecodedImageLimitError(error) || isTiffDecodeError(error)) {
           return { ...NO_PAINT, failure: { error } };
         }
         // fall through to plain fill
@@ -7398,12 +7853,12 @@ export function renderTable(
   // rasterizer difference is not a colour compensation rule for Canvas.
   // Image fills share shape decoding, effects, crop/tile placement and cache
   // ownership; ordinary fills keep the canvas-aware gradient/pattern resolver.
-  const paintTableFill = (fill: Fill | null, x: number, y: number, w: number, h: number) => {
+  const paintTableFill = (fill: Fill | null, x: number, y: number, w: number, h: number, authoredWidth: number, authoredHeight: number) => {
     if (fill?.fillType === 'image') {
       ctx.beginPath();
       ctx.rect(x, y, w, h);
-      paintPreparedShapeImageFill(ctx, fill, rc.shapeFillImages?.get(shapeFillKey(fill)),
-        { x, y, w, h }, scale);
+      paintPreparedShapeImageFill(ctx, fill, rc.shapeFillImages?.get(shapeFillKey(fill, authoredWidth, authoredHeight, el)),
+        { x, y, w, h }, scale, false, el);
     } else {
       const paint = resolveShapeFill(fill, ctx, x, y, w, h, el.rotation, scale * PT_TO_EMU);
       if (paint) {
@@ -7412,11 +7867,21 @@ export function renderTable(
       }
     }
   };
-  paintTableFill(el.background ?? null, x0, y0, tableW, tableHeight);
+  // Use the authored frame for both preparation and lookup, including rows
+  // whose painted box grows with text. Prefix sums match merged-cell preload
+  // arithmetic and keep this pass linear in the table grid.
+  const authoredCols = [0], authoredRows = [0];
+  for (const width of el.cols) authoredCols.push(authoredCols[authoredCols.length - 1] + width);
+  for (const row of el.rows) authoredRows.push(authoredRows[authoredRows.length - 1] + row.height);
+  const authoredTableWidth = authoredCols[authoredCols.length - 1];
+  const authoredTableHeight = authoredRows[authoredRows.length - 1] || el.height;
+  paintTableFill(el.background ?? null, x0, y0, tableW, tableHeight, authoredTableWidth, authoredTableHeight);
 
   // Pass 1: fills + text bodies.
   for (const { cell, colX, rowY, cellW, cellH, ci, ri } of jobs) {
-    paintTableFill(cell.fill, colX, rowY, cellW, cellH);
+    const authoredWidth = (authoredCols[Math.min(ci + (cell.gridSpan || 1), el.cols.length)] ?? 0) - (authoredCols[ci] ?? 0);
+    const authoredHeight = (authoredRows[Math.min(ri + (cell.rowSpan || 1), el.rows.length)] - authoredRows[ri]) || el.height;
+    paintTableFill(cell.fill, colX, rowY, cellW, cellH, authoredWidth, authoredHeight);
     // Text body — default run colour comes from the table style's tcTxStyle
     // (e.g. white header text on an accent fill); a run's explicit colour wins.
     // ECMA-376 Part 1 DrawingML CT_TableCell permits txBody to be absent. Empty
@@ -7439,6 +7904,8 @@ export function renderTable(
       // transitional schemas. For this single-word enum, collapse accepts only
       // U+0020/TAB/LF/CR at the ends; NBSP and internal whitespace cannot mean
       // `horz`. Apply this only to admission, leaving the body/paint policy intact.
+      // Keep this tolerant for caller-supplied and previously parsed models too;
+      // normalizing the shared direction would also change orientation dispatch.
       const rawVert = cell.textBody.vert;
       const isHorizontal = rawVert === undefined || typeof rawVert === 'string'
         && /^[ \t\r\n]*horz[ \t\r\n]*$/.test(rawVert);
@@ -7711,6 +8178,8 @@ export type SlideRenderOptions = RenderOptions & {
 type InternalSlideRenderOptions = SlideRenderOptions & {
   cjkFallback?: CjkLang;
   officeFontRoutes?: Readonly<Record<string, import('@silurus/ooxml-core').OfficeFontFallbackRoute>>;
+  /** Normalized authored families with any installed face (presence probes). */
+  officeInstalledFamilies?: readonly string[];
   googleSubstitutes?: boolean;
   embeddedFontAliases?: ReadonlyMap<string, string>;
   embeddedFontAuthoredFamilies?: ReadonlyMap<string, string>;
@@ -7878,6 +8347,11 @@ async function renderSlideLeased(
   bitmapOwner?: PosterFetchImage,
   superseded: () => boolean = () => false,
 ): Promise<HTMLCanvasElement | OffscreenCanvas> {
+  // Explicit image capability: use the host bridge in workers and the same
+  // bounded HTML image/Canvas rasterizer on Window. The shared bitmap owner
+  // remains decoder-agnostic (including Node's injected bitmap factory).
+  const svgDecoder = opts.svgDecoder
+    ?? (typeof Image !== 'undefined' ? decodeSvgBlobOnMainThread : undefined);
   // Cancellation guard. renderSlide is async (it awaits image / equation decode),
   // so rapid navigation can start a newer render of the SAME canvas before this
   // one finishes. The caller stamps a per-canvas token; once a newer render
@@ -7899,6 +8373,60 @@ async function renderSlideLeased(
   // lower-res) backing store to fill it — a visible slide beats a blank one.
   const clamped = clampCanvasSize(canvasW * dpr, canvasH * dpr);
   const effectiveDpr = clamped.clamped ? dpr * clamped.scale : dpr;
+  // Resolve equation previews before image target planning, so a selected
+  // fallback uses the same bounded decode plan as ordinary slide pictures.
+  if (opts.math) {
+    await prepareSlideMath(slide, opts.math);
+    if (superseded()) return canvas;
+  }
+  // Keep model locators separate from paint-order indices. Preview elements
+  // exist only in this projection; source hit testing still uses the input slide.
+  let sourceIndices: (number | undefined)[] | undefined;
+  const sourceSlide = slide;
+  if (opts.math) {
+    // Resolve whole MCE branches atomically, including branches that emit more
+    // than one shape. A prefix count keeps failure checks linear in the slide's
+    // emitted elements rather than rescanning overlapping branch ranges.
+    const failures = [0];
+    const previews = new Map<number, { end: number; elements: SlideElement[] }>();
+    for (const element of slide.elements) {
+      let failed = false;
+      for (const body of elementTextBodies(element)) {
+        if (body.paragraphs.some(para => para.runs.some(run => run.type === 'math' && failedMath.has(run.nodes)))) {
+          failed = true;
+          break;
+        }
+      }
+      failures.push(failures[failures.length - 1] + (failed ? 1 : 0));
+    }
+    slide.elements.forEach((element, index) => {
+      if ((element.type !== 'shape' && element.type !== 'table') || !element.mathFallback) return;
+      const fallback = element.mathFallback;
+      const start = index - fallback.before;
+      const end = index + fallback.after + 1;
+      if (start >= 0 && end <= slide.elements.length && failures[end] > failures[start]
+        && end > (previews.get(start)?.end ?? start)) {
+        previews.set(start, { end, elements: fallback.elements });
+      }
+    });
+    const elements: SlideElement[] = [];
+    sourceIndices = [];
+    for (let i = 0; i < slide.elements.length;) {
+      const preview = previews.get(i);
+      if (preview) {
+        for (const element of preview.elements) {
+          elements.push(element);
+          sourceIndices.push(undefined);
+        }
+        i = preview.end;
+      } else {
+        sourceIndices.push(i);
+        elements.push(slide.elements[i++]);
+      }
+    }
+    slide = { ...slide, elements };
+  }
+
   const plannedImages = planSlideImages(
     slide,
     canvasW,
@@ -7945,21 +8473,23 @@ async function renderSlideLeased(
     return canvas;
   }
 
-  const themeDefaultColor = opts.defaultTextColor
-    ? `#${opts.defaultTextColor}`
+  const defaultTextColor = slide.theme ? slide.theme.defaultTextColor : opts.defaultTextColor;
+  const themeDefaultColor = defaultTextColor
+    ? `#${defaultTextColor}`
     : '#000000';
 
   const pictureBulletImages = new Map<string, SvgImageSource | null>();
   const shapeFillImages = new Map<string, PreparedShapeFill | null>();
   const rc: RenderContext = {
-    cjkFallback: opts.cjkFallback ? pptxSlideCjkFallback(slide, opts.majorFont ?? null, opts.minorFont ?? null, opts.cjkFallback) : undefined,
-    themeMajorFont: opts.majorFont ?? null,
-    themeMinorFont: opts.minorFont ?? null,
-    themeHlinkColor: opts.hlinkColor ?? null,
+    cjkFallback: opts.cjkFallback ? pptxSlideCjkFallback(slide, slide.theme ? slide.theme.majorFont : opts.majorFont ?? null, slide.theme ? slide.theme.minorFont : opts.minorFont ?? null, opts.cjkFallback) : undefined,
+    themeMajorFont: slide.theme ? slide.theme.majorFont : opts.majorFont ?? null,
+    themeMinorFont: slide.theme ? slide.theme.minorFont : opts.minorFont ?? null,
+    themeHlinkColor: slide.theme ? slide.theme.hlinkColor : opts.hlinkColor ?? null,
     embeddedFontAliases: opts.embeddedFontAliases,
     embeddedFontAuthoredFamilies: opts.embeddedFontAuthoredFamilies,
     embeddedFontTuples: opts.embeddedFontTuples,
     officeFontRoutes: opts.officeFontRoutes,
+    officeInstalledFamilies: opts.officeInstalledFamilies,
     googleSubstitutes: opts.googleSubstitutes,
     // The backing store may have been clamped below `canvasSize × dpr`; downstream
     // crisp-offset math must use the SAME effective dpr the ctx was scaled by.
@@ -7983,22 +8513,10 @@ async function renderSlideLeased(
     scale,
     opts.fetchImage,
     opts.tiff,
-    opts.svgDecoder,
+    svgDecoder,
     imagePlan,
   ));
   if (superseded()) return canvas;
-
-  // Pre-rasterize any equations so the synchronous text layout can place them.
-  // `math` is the engine injected once at PptxPresentation.load and threaded in
-  // here; without it, equations are skipped and the asset never enters the bundle.
-  if (!failed() && opts.math) {
-    try {
-      await prepareSlideMath(slide, opts.math);
-    } catch (error) {
-      leadingSteps.push({ ...NO_PAINT, failure: { error } });
-    }
-    if (superseded()) return canvas;
-  }
 
   const slideNumber = slide.slideNumber;
 
@@ -8016,7 +8534,7 @@ async function renderSlideLeased(
           opts.fetchImage,
           opts.tiff,
           effectiveDpr,
-          opts.svgDecoder,
+          svgDecoder,
           imagePlan,
         );
       }
@@ -8029,7 +8547,7 @@ async function renderSlideLeased(
           bitmapOwner,
           opts.tiff,
           effectiveDpr,
-          opts.svgDecoder,
+          svgDecoder,
           imagePlan,
         );
       }
@@ -8049,6 +8567,7 @@ async function renderSlideLeased(
     const fetchImage = opts.fetchImage;
     const shapeFills = new Map<string, {
       fill: ImageFill;
+      host: BlipHostOrientation;
       widthPt: number;
       heightPt: number;
       targetWidthPx?: number;
@@ -8056,12 +8575,17 @@ async function renderSlideLeased(
       preserveNaturalSize: boolean;
       hasSourceCrop: boolean;
     }>();
-    for (const { fill, width, height } of slideImageFillUsages(slide)) {
+    for (const { fill, width, height, host } of slideImageFillUsages(slide)) {
       if (!(width > 0) || !(height >= 0)) continue;
-      const key = shapeFillKey(fill);
+      // A stretched chain is evaluated on the full source frame (fillRect and
+      // srcRect included); that frame is also part of the prepared identity.
+      const effectFrame = fill.blipEffects?.length && !fill.tile
+        ? stretchedSourceFrame(width, height, fill.srcRect, fill.fillRect)
+        : { width, height };
+      const key = shapeFillKey(fill, width, height, host);
       const prior = shapeFills.get(key);
-      const widthPt = width / PT_TO_EMU;
-      const heightPt = height / PT_TO_EMU;
+      const widthPt = effectFrame.width / PT_TO_EMU;
+      const heightPt = effectFrame.height / PT_TO_EMU;
       const fr = fill.fillRect ?? {};
       const target = rasterTargetOptions(
         emuToPx(width, scale) * (1 - (fr.l ?? 0) - (fr.r ?? 0)),
@@ -8071,7 +8595,7 @@ async function renderSlideLeased(
       );
       shapeFills.set(key, prior
         ? {
-            fill: prior.fill,
+            fill: prior.fill, host: prior.host,
             widthPt: Math.max(prior.widthPt, widthPt),
             heightPt: Math.max(prior.heightPt, heightPt),
             targetWidthPx: Math.max(prior.targetWidthPx ?? 0, target?.targetWidthPx ?? 0) || undefined,
@@ -8080,7 +8604,7 @@ async function renderSlideLeased(
             hasSourceCrop: prior.hasSourceCrop || fill.srcRect != null,
           }
         : {
-            fill, widthPt, heightPt,
+            fill, host, widthPt, heightPt,
             targetWidthPx: target?.targetWidthPx,
             targetHeightPx: target?.targetHeightPx,
             preserveNaturalSize: fill.tile != null,
@@ -8130,7 +8654,10 @@ async function renderSlideLeased(
       maxRetainedPixels?: number;
       preserveNaturalSize: boolean;
       hasSourceCrop: boolean;
+      host?: { rotation: number; flipH?: boolean; flipV?: boolean };
+      renderedSize?: import('@silurus/ooxml-core').ChartFillRenderedSize;
     }>();
+    const admittedChartFills = new Set<string>();
     for (const usage of collectChartImageFillUsagesForCharts(
       chartDescriptors.map(({ element }) => element.chart),
       (usage, chartIndex) => chartImageFillUsageSize(
@@ -8138,22 +8665,25 @@ async function renderSlideLeased(
         chartDescriptors[chartIndex]!.frame,
       ) != null,
     )) {
-      const { fill } = usage;
-      const key = chartImageFillKey(fill);
-      if (!chartFillMap.has(key)) chartFillMap.set(key, {
-        fill,
-        widthPt: 0,
-        heightPt: 0,
-        preserveNaturalSize: usage.preserveNaturalSize,
-        hasSourceCrop: usage.hasSourceCrop,
-      });
+      admittedChartFills.add(chartImageFillKey(usage.fill));
     }
-    for (const { usages } of chartDescriptors) {
+    for (const { element, usages } of chartDescriptors) {
+      // A chart frame's rotation/flips host page-fixed effects of its fills.
+      const host = { rotation: element.rotation, flipH: element.flipH, flipV: element.flipV };
       for (const { usage, size } of usages) {
         const { fill } = usage;
-        const key = chartImageFillKey(fill);
-        const prior = chartFillMap.get(key);
-        if (!prior) continue;
+        if (!admittedChartFills.has(chartImageFillKey(fill))) continue;
+        // Size-dependent chains are prepared per rendered size below.
+        if (chartImageFillNeedsRenderedSize(fill)) continue;
+        const key = chartImageFillHostKey(fill, host);
+        const prior = chartFillMap.get(key) ?? {
+          fill,
+          widthPt: 0,
+          heightPt: 0,
+          preserveNaturalSize: usage.preserveNaturalSize,
+          hasSourceCrop: usage.hasSourceCrop,
+          ...(fill.blipEffects?.length ? { host } : {}),
+        };
         // ECMA-376 §20.1.8.58: tile geometry is based on the source's natural
         // pixel dimensions and authored DPI. A display-sized decode would alter
         // the tile size/alignment/repetition count. Because one decoded source
@@ -8195,6 +8725,40 @@ async function renderSlideLeased(
         });
       }
     }
+    // A stretched fill whose chain is measured in physical units is evaluated
+    // per rendered size (Office applies blur/shadow lengths at the rendered
+    // size). A preparation pass of the same chart paint records each distinct
+    // size; each is decoded once under its own key. A later round resolves
+    // through the sources decoded so far (`resolved`); returns the added keys.
+    const prepareChartRenderedSizes = (resolved: boolean): string[] => {
+      const added: string[] = [];
+      for (const { element } of chartDescriptors) {
+        const host = { rotation: element.rotation, flipH: element.flipH, flipV: element.flipV };
+        for (const { fill, occurrence } of collectChartFillRenderedSizes(
+          element.chart,
+          {
+            x: emuToPx(element.x, scale), y: emuToPx(element.y, scale),
+            w: emuToPx(element.width, scale), h: emuToPx(element.height, scale),
+          },
+          PT_TO_EMU * scale, element.rotation, opts.threeD, opts.regionMap, opts.chartEx,
+          resolved ? chartImageFillStoreLookup(chartMarkerImages, host, false) : undefined,
+        )) {
+          if (!admittedChartFills.has(chartImageFillKey(fill))) continue;
+          const key = chartFillRenderedSizeKey(fill, host, occurrence);
+          if (chartFillMap.has(key)) continue;
+          chartFillMap.set(key, {
+            fill, widthPt: occurrence.widthPt, heightPt: occurrence.heightPt,
+            preserveNaturalSize: true, hasSourceCrop: fill.srcRect != null,
+            host, renderedSize: occurrence,
+          });
+          added.push(key);
+        }
+      }
+      // The per-render ceiling covers every prepared chart source.
+      assertChartFillRenderedSizeCount(chartFillMap.size);
+      return added;
+    };
+    prepareChartRenderedSizes(false);
     for (const el of slide.elements) {
       if (el.type !== 'shape' || !el.textBody) continue;
       for (const para of el.textBody.paragraphs) {
@@ -8232,7 +8796,7 @@ async function renderSlideLeased(
           const image = mimeType === 'image/svg+xml'
             ? await getCachedSvgImageByPath(path, fetchImage, {
                 ...target,
-                workerDecoder: opts.svgDecoder,
+                workerDecoder: svgDecoder,
               })
             : await getCachedBitmapByPath(path, mimeType, fetchImage, {
                 tiff: opts.tiff,
@@ -8244,14 +8808,15 @@ async function renderSlideLeased(
             pictureBulletImages.set(path, null);
             return;
           }
-          if (isOoxmlDecodedImageLimitError(error) || isTiffDecodeError(error)) throw error;
+          if (error instanceof OoxmlResourceLimitError || isUnsupportedBlipEffectError(error) || isOoxmlDecodedImageLimitError(error) || isTiffDecodeError(error)) throw error;
           pictureBulletImages.set(path, null);
         }
       });
-      const chartPromises: Promise<unknown>[] = [...chartFillMap].map(async ([key, entry]) => {
+      type ChartFillEntry = typeof chartFillMap extends Map<string, infer Entry> ? Entry : never;
+      const decodeChartFill = async ([key, entry]: [string, ChartFillEntry]) => {
         const {
           fill, widthPt, heightPt, targetWidthPx, targetHeightPx,
-          maxRetainedPixels, hasSourceCrop,
+          maxRetainedPixels, hasSourceCrop, host, renderedSize,
         } = entry;
         const target = targetWidthPx && targetHeightPx
           ? {
@@ -8261,19 +8826,25 @@ async function renderSlideLeased(
             }
           : undefined;
         try {
-          const decodeFallback = () => fill.mimeType === 'image/svg+xml'
-            ? pixelTransform(fill) ? Promise.resolve(null) : getCachedSvgImageByPath(fill.imagePath, fetchImage, {
+          // An SVG-only fill with a pixel transform is rasterized by the host
+          // SVG decoder before the shared effect chain, like pictures and shape
+          // fills; it is never omitted.
+          const decodeFallback = () => fill.mimeType === 'image/svg+xml' && !pixelTransform(fill)
+            ? getCachedSvgImageByPath(fill.imagePath, fetchImage, {
                 ...(target ?? {}),
-                workerDecoder: opts.svgDecoder,
+                workerDecoder: svgDecoder,
               })
             : getCachedDuotoneBitmapByPath(
-                fill.imagePath, fill.mimeType, pixelTransform(fill), fetchImage,
+                fill.imagePath, fill.mimeType, chartImageFillPixelTransform(fill, host, renderedSize) ?? undefined, fetchImage,
                 {
-                  widthPt,
-                  heightPt,
+                  // A per-size chain is evaluated on its rendered frame; any
+                  // other chain samples the source grid at the fill DPI.
+                  widthPt: renderedSize ? renderedSize.widthPt : fill.blipEffects?.length ? 0 : widthPt,
+                  heightPt: renderedSize ? renderedSize.heightPt : fill.blipEffects?.length ? 0 : heightPt,
                   ...(target ?? {}),
                   failClosedOnDuotoneFailure: true,
                   tiff: opts.tiff,
+                  svgDecoder,
                 },
               );
           let bitmap: CanvasImageSource | null;
@@ -8285,9 +8856,10 @@ async function renderSlideLeased(
             try {
               bitmap = await getCachedSvgImageByPath(blip.svgImagePath, fetchImage, {
                 ...(target ?? {}),
-                workerDecoder: opts.svgDecoder,
+                workerDecoder: svgDecoder,
               });
-            } catch {
+            } catch (error) {
+              if (error instanceof OoxmlResourceLimitError || isUnsupportedBlipEffectError(error) || isOoxmlDecodedImageLimitError(error)) throw error;
               bitmap = await decodeFallback();
             }
           } else {
@@ -8299,23 +8871,34 @@ async function renderSlideLeased(
             chartMarkerImages.set(key, null);
             return;
           }
-          if (isOoxmlDecodedImageLimitError(error) || isTiffDecodeError(error)) throw error;
+          if (error instanceof OoxmlResourceLimitError || isUnsupportedBlipEffectError(error) || isOoxmlDecodedImageLimitError(error) || isTiffDecodeError(error)) throw error;
           chartMarkerImages.set(key, null);
         }
-      });
+      };
+      const chartPromises: Promise<unknown>[] = [(async () => {
+        await Promise.all([...chartFillMap].map(decodeChartFill));
+        // Occurrences derived from a decoded source's own frame (3-D
+        // plain-stack repetitions) are recorded once that source is known;
+        // each round repeats the paint with every source decoded so far.
+        for (;;) {
+          const added = prepareChartRenderedSizes(true);
+          if (added.length === 0) break;
+          await Promise.all(added.map(key => decodeChartFill([key, chartFillMap.get(key)!])));
+        }
+      })()];
       const shapePromises: Promise<void>[] = [...shapeFills].map(async (
         [key, {
-          fill, widthPt, heightPt, targetWidthPx, targetHeightPx,
+          fill, host, widthPt, heightPt, targetWidthPx, targetHeightPx,
           preserveNaturalSize, hasSourceCrop,
         }],
       ) => {
-        const vector = !pixelTransform(fill)
-          && (fill.mimeType === 'image/svg+xml' || preferVectorBlip({
+        const vector = fill.mimeType === 'image/svg+xml' || (!pixelTransform(fill, host)
+          && preferVectorBlip({
             svgImagePath: fill.svgImagePath,
             srcRect: hasSourceCrop ? true : null,
           }));
-        const planned = !preserveNaturalSize && !pixelTransform(fill)
-          ? plannedRasterOptions(imagePlan, imagePlanKey(fill.imagePath, pixelTransform(fill)))
+        const planned = !preserveNaturalSize && !pixelTransform(fill, host)
+          ? plannedRasterOptions(imagePlan, imagePlanKey(fill.imagePath, pixelTransform(fill, host)))
           : undefined;
         const rawTarget = !preserveNaturalSize && targetWidthPx && targetHeightPx
           ? { targetWidthPx, targetHeightPx }
@@ -8323,36 +8906,36 @@ async function renderSlideLeased(
         const target = vector ? rawTarget : planned;
         try {
           const intrinsicSize = preserveNaturalSize
-            ? (await inspectCachedRasterSource(fill.imagePath, fill.mimeType, fetchImage))
+            ? (await strictEffectPreparation(fill, inspectCachedRasterSource(fill.imagePath, fill.mimeType, fetchImage)))
                 .dimensions ?? undefined
             : undefined;
-          const fallback = () => fill.mimeType === 'image/svg+xml'
-            ? pixelTransform(fill)
-              ? Promise.resolve(null)
-              : getCachedSvgImageByPath(fill.imagePath, fetchImage, {
-                  ...(target ?? {}), workerDecoder: opts.svgDecoder,
-                })
+          // A pixel transform (ordered chain or lone duotone) on an SVG-only
+          // fill rasterizes through the host decoder first; never omitted.
+          const fallback = () => fill.mimeType === 'image/svg+xml' && !pixelTransform(fill, host)
+            ? getCachedSvgImageByPath(fill.imagePath, fetchImage, {
+                ...(target ?? {}), workerDecoder: svgDecoder,
+              })
             : getCachedDuotoneBitmapByPath(
-                fill.imagePath, fill.mimeType, pixelTransform(fill), fetchImage,
+                fill.imagePath, fill.mimeType, pixelTransform(fill, host), fetchImage,
                 {
-                  widthPt,
-                  heightPt,
+                  ...tiledEffectExtent(fill, widthPt, heightPt),
                   ...(target ?? {}),
                   failClosedOnDuotoneFailure: true,
                   tiff: opts.tiff,
-                  svgDecoder: opts.svgDecoder,
+                  svgDecoder: svgDecoder,
                 },
               );
           let image: SvgImageSource | null;
-          if (!pixelTransform(fill) && preferVectorBlip({
+          if (!pixelTransform(fill, host) && preferVectorBlip({
             svgImagePath: fill.svgImagePath,
             srcRect: hasSourceCrop ? true : null,
           })) {
             try {
               image = await getCachedSvgImageByPath(fill.svgImagePath as string, fetchImage, {
-                ...(target ?? {}), workerDecoder: opts.svgDecoder,
+                ...(target ?? {}), workerDecoder: svgDecoder,
               });
-            } catch {
+            } catch (error) {
+              if (error instanceof OoxmlResourceLimitError || isUnsupportedBlipEffectError(error) || isOoxmlDecodedImageLimitError(error)) throw error;
               image = await fallback();
             }
           } else {
@@ -8364,7 +8947,7 @@ async function renderSlideLeased(
             shapeFillImages.set(key, null);
             return;
           }
-          if (isOoxmlDecodedImageLimitError(error) || isTiffDecodeError(error)) throw error;
+          if (error instanceof OoxmlResourceLimitError || isUnsupportedBlipEffectError(error) || isOoxmlDecodedImageLimitError(error) || isTiffDecodeError(error)) throw error;
           shapeFillImages.set(key, null);
         }
       });
@@ -8407,14 +8990,30 @@ async function renderSlideLeased(
     // A text-run callback may start a newer render of this canvas; stop so we
     // don't paint this (now stale) slide over the newer one.
     if (superseded()) return canvas;
+    const sourceIndex = sourceIndices ? sourceIndices[elementIndex] : elementIndex;
+    const elementTextRun: TextRunCallback | undefined = onTextRun
+      ? (run) => {
+          if (sourceIndex === undefined) {
+            // Preview ids belong to the unselected MCE branch, so neither its
+            // shape id nor a projected array index can address the source model.
+            onTextRun({
+              ...run,
+              renderElementIndex: elementIndex,
+              elementIndex: undefined,
+              origin: undefined,
+              shapeId: undefined,
+            });
+          } else {
+            onTextRun({
+              ...run,
+              renderElementIndex: elementIndex,
+              elementIndex: sourceIndex,
+              origin: sourceSlide.elementSources?.[sourceIndex]?.origin ?? 'slide',
+            });
+          }
+        }
+      : undefined;
     if (el.type === 'shape') {
-      const elementTextRun: TextRunCallback | undefined = onTextRun
-        ? (run) => onTextRun({
-            ...run,
-            elementIndex,
-            origin: slide.elementSources?.[elementIndex]?.origin ?? 'slide',
-          })
-        : undefined;
       withPatternCoordinateSpace(ctx, slidePatternFrame, () =>
         renderShape(ctx, el, scale, themeDefaultColor, slideNumber, rc, elementTextRun, opts.fetchImage));
     } else if (el.type === 'picture' || el.type === 'media') {
@@ -8424,13 +9023,6 @@ async function renderSlideLeased(
         if (step.failure) throw step.failure.error;
       }
     } else if (el.type === 'table') {
-      const elementTextRun: TextRunCallback | undefined = onTextRun
-        ? (run) => onTextRun({
-            ...run,
-            elementIndex,
-            origin: slide.elementSources?.[elementIndex]?.origin ?? 'slide',
-          })
-        : undefined;
       withPatternCoordinateSpace(ctx, slidePatternFrame, () =>
         renderTable(ctx, el, scale, slideNumber, rc, elementTextRun));
     } else if (el.type === 'chart') {
@@ -8455,9 +9047,7 @@ async function renderSlideLeased(
           el.rotation,
           opts.threeD,
           opts.regionMap,
-          fill => chartMarkerImages.get(
-            chartImageFillKey(fill),
-          ),
+          chartImageFillStoreLookup(chartMarkerImages, { rotation: el.rotation, flipH: el.flipH, flipV: el.flipV }),
           opts.chartEx,
         );
         ctx.restore();

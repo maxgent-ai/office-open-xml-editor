@@ -1,11 +1,11 @@
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { vi, afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createLayoutServices } from './layout-runtime.js';
 import { layoutSourceStore } from './layout-source-model-adapter.js';
 import { attachDocumentLayoutVariants } from './layout/document-layout-variants.js';
 import { layoutDocumentInput } from './layout/document.js';
 import { normalizeLayoutOptions, type LayoutOptions } from './layout/options.js';
 import { layoutDocumentProgressively } from './layout/progressive.js';
-import { setDocumentLayoutValidation } from './layout/validation-policy.js';
+import { setDocumentLayoutValidation } from './testing/validation-policy.js';
 import {
   installStubCanvas,
   syntheticDocxModel,
@@ -117,3 +117,5 @@ describe('progressive layout builds only the variant being viewed', () => {
     expect(builds).toEqual([]);
   }, 300_000);
 });
+
+vi.mock('./layout/validation-policy.js', () => ({ documentLayoutValidationEnabled: vi.fn(() => true) }));

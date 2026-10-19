@@ -1,6 +1,5 @@
-import { updateNativeReadingNotice, noReadingNotices } from './native-reading-notice.js';
 import { openExternalHyperlink, PT_TO_PX } from '@silurus/ooxml-core';
-import type { FindHighlightColors, FindMatch, FindMatchesOptions, HyperlinkTarget, OoxmlResourceMetrics, ViewerContextMenuEvent, ZoomableViewer } from '@silurus/ooxml-core';
+import type { FindMatch, FindMatchesOptions, HyperlinkTarget, OoxmlResourceMetrics, ZoomableViewer } from '@silurus/ooxml-core';
 import {
   computeVisibleWindow,
   createVirtualScrollGeometry,
@@ -41,7 +40,6 @@ import type { DocxScrollSlot as PageSlot } from './scroll-slot';
 import { buildDocxTextLayer } from './text-layer';
 import { DocxFindController, type DocxMatchLocation } from './find';
 import { buildDocxHighlightLayer } from './find-highlight-layer';
-import type { RenderPageOptions } from './types';
 import {
   createDocxCommentSelectionContext,
   readDocxTextSelectionContext,
@@ -57,7 +55,6 @@ import type { DocxCommentsOptions } from './comment-margin';
 import type { DocxScrollViewerOptions } from './scroll-viewer-options';
 import { DocxScrollCommentNavigation } from './scroll-comment-navigation';
 import { renderDocxFocusedPage } from './focused-view-runtime';
-import type { DocxLayoutPublication } from './document-layout-events.js';
 import { DocxScrollLayoutController } from './scroll-layout-controller';
 
 const COMMENT_MARGIN_GAP_PX = 12;
@@ -158,10 +155,8 @@ export class DocxScrollViewer implements ZoomableViewer {
     current: () => this._doc,
     destroyed: () => this._destroyed,
     report: (error) => this._reportRenderError(error),
-    reportBackground: (error) => {
-      if (this._doc?.pageCount === 0 && this._doc._readingPublicationOwned) this._clearReadingPages();
-      this._errorRouter.reportBackground(error, this._opts.onLayoutComplete !== undefined);
-    },
+    reportBackground: (error) => this._errorRouter.reportBackground(
+      error, this._opts.onLayoutComplete !== undefined),
     invalidateFind: () => this._find.invalidate(),
     refreshComments: () => this._refreshCommentSurface(),
     adoptView: (publication) => {
@@ -170,7 +165,6 @@ export class DocxScrollViewer implements ZoomableViewer {
       this._showTrackedChanges = publication.view.showTrackedChanges;
       this._currentDate = publication.view.currentDate;
       this._find.invalidate();
-      this._syncReadingNotice();
       this._layout.apply({
         pageCount: this._doc!.pageCount, exact: true, complete: this._doc!.layoutComplete,
       });
@@ -210,15 +204,10 @@ export class DocxScrollViewer implements ZoomableViewer {
         ...(this._showTrackedChanges ? { showTrackedChanges: true } : {}),
         onTextRun,
       }),
-    commitBitmap: (page, slot, dispatcher, generation, bitmap, width) => {
-      const doc = this._doc, publication = doc?._readingPublicationToken;
-      try { return dispatcher.commitBitmap(generation, bitmap, {
+    commitBitmap: (page, slot, dispatcher, generation, bitmap, width) =>
+      dispatcher.commitBitmap(generation, bitmap, {
         cssWidth: width, cssHeight: this._pageHeightPx(page),
-      }); } catch (error) {
-        if (doc === this._doc && publication != null) doc?._invalidateReadingLayout(error, publication);
-        throw error;
-      }
-    },
+      }),
     commitRuns: (page, slot, runs, _width, wantedRuns) =>
       this._commitRenderedRuns(page, slot, runs, slot.canvas, wantedRuns, true),
   });
@@ -340,13 +329,13 @@ export class DocxScrollViewer implements ZoomableViewer {
         // is in progress. An explicit false overrides a model-source default.
         ...(inheritedRequestedView !== undefined
           ? { showTrackedChanges: inheritedRequestedView }
-          : this._opts.modelSources === undefined
+          : this._opts.legacyDoc === undefined
             ? (this._showTrackedChanges ? { showTrackedChanges: true } : {})
             : (this._requestedShowTrackedChanges === undefined
               ? undefined
               : { showTrackedChanges: this._requestedShowTrackedChanges })),
         ...(this._currentDate === undefined ? {} : { currentDate: this._currentDate }),
-        ...(this._opts.modelSources === undefined ? undefined : { modelSources: this._opts.modelSources }),
+        ...(this._opts.legacyDoc === undefined ? undefined : { legacyDoc: this._opts.legacyDoc }),
         ...(this._opts.progressiveLayout ? { progressiveLayout: true } : {}),
         ...(this._opts.sliceLayout === undefined ? {} : { sliceLayout: this._opts.sliceLayout }),
         [docxViewerLoadSignal]: {
@@ -372,7 +361,6 @@ export class DocxScrollViewer implements ZoomableViewer {
       return loaded;
     },
     beforeReplace: (previous) => {
-      this._readingNoticeElement = updateNativeReadingNotice(this._container, this._readingNoticeElement, noReadingNotices);
       this._selection.invalidateElementContext(false);
       this._findRequestGeneration++;
       this._find.invalidate();
@@ -391,10 +379,9 @@ export class DocxScrollViewer implements ZoomableViewer {
         this._showTrackedChanges = this._pendingRequestedView;
         this._requestedShowTrackedChanges = this._pendingRequestedView;
       }
-      if (this._opts.modelSources !== undefined) {
+      if (this._opts.legacyDoc !== undefined) {
         this._showTrackedChanges = activeDocxLayoutViewOf(doc).showTrackedChanges;
       }
-      this._syncReadingNotice();
       this._layout.bind(doc);
       this._find.invalidate();
       this._findActive = false;
@@ -403,30 +390,12 @@ export class DocxScrollViewer implements ZoomableViewer {
       this._commentNavigation.reset();
     },
     mountOpeningWindow: async () => {
-      const doc = this._doc;
-      const readingOwned = doc?._readingPublicationOwned === true;
-      const mount = async (): Promise<void> => {
-        const initialRenders: Promise<void>[] = [];
-        try {
-          this._relayout(initialRenders);
-          await Promise.all(initialRenders);
-          // Slot recycling can suppress its obsolete dispatcher rejection.
-          // The same live reading owner still retains the terminal cause.
-          if (readingOwned && doc && !this._destroyed && doc === this._doc)
-            await doc.waitUntilLayoutComplete();
-        } catch (error) {
-          if (readingOwned && (this._destroyed || doc !== this._doc)) return;
-          throw error;
-        }
-      };
-      if (readingOwned) await this._errorRouter.ownBackgroundLifecycle(mount);
-      else await mount();
+      const initialRenders: Promise<void>[] = [];
+      this._relayout(initialRenders);
+      await Promise.all(initialRenders);
     },
     selectionChanged: () => this._selection.emitChange(),
   });
-  private _layoutUnsubscribe: (() => void) | null = null;
-  /** Page prefix currently represented by the native scroll extent. */
-  private _presentedPageCount = 0;
   private _activeCommentId: string | null = null;
   private _activeCommentPage: number | null = null;
   private _commentUi: DocxCommentUiRuntime | null = null;
@@ -507,7 +476,7 @@ export class DocxScrollViewer implements ZoomableViewer {
    *  clamp (#836). Lazily created; `null` when canvas metrics are unavailable
    *  (headless), in which case the overlay degrades to the un-clamped span. */
   /** Render generation, bumped on every effective `setScale` (and the resize
-   *  re-fit in `_onResize`, which routes through `setScale`). Stamped into each async render
+   *  re-fit in the zoom controller, which routes through `setScale`). Stamped into each async render
    *  dispatch; a resolution whose captured epoch ≠ this value is STALE — its
    *  pixels/geometry are at a superseded scale. Worker path: close the orphan
    *  bitmap + re-dispatch the live slot. Main path: skip the (stale) text-layer
@@ -595,7 +564,7 @@ export class DocxScrollViewer implements ZoomableViewer {
     this._opts = opts;
     this._errorRouter = new CanvasViewerErrorRouter('DocxScrollViewer', opts.onError);
     this._showTrackedChanges = opts.showTrackedChanges === true;
-    if (opts.modelSources !== undefined) this._requestedShowTrackedChanges = opts.showTrackedChanges;
+    if (opts.legacyDoc !== undefined) this._requestedShowTrackedChanges = opts.showTrackedChanges;
     this._currentDate = opts.currentDate;
     // `??` (not `||`): a caller's explicit `false` must disable the shadow, not
     // fall through to the default.
@@ -942,14 +911,12 @@ export class DocxScrollViewer implements ZoomableViewer {
   /** Static slot dispatch is owned by core. */
   private _renderSlot(i: number, slot: PageSlot, reportErrors = true): Promise<void> | null {
     if (!this._doc) return null;
-    this._syncReadingNotice();
     // Slot-identity guard: this slot is already rendering / has rendered page i.
     if (slot.renderedPage === i) return null;
     slot.renderedPage = i;
 
     const dpr = this._viewport.dpr();
     const widthPx = this._pageWidthPx(i);
-    const epoch = this._renderEpoch;
     const scale = this._scale;
     const dispatcher = slot.dispatcher;
     const generation = dispatcher.begin();
@@ -1046,21 +1013,7 @@ export class DocxScrollViewer implements ZoomableViewer {
 
   /** Route an async render failure to `onError`, or `console.error` when none is
    *  set (so failures are never fully silent), and never after teardown. */
-  private _readingNoticeElement: HTMLElement | null = null;
-  private _syncReadingNotice(): void {
-    const notices = this._doc?.readingNotices ?? noReadingNotices;
-    if (this._readingNoticeElement && notices.length === 0) this._clearReadingPages();
-    this._readingNoticeElement = updateNativeReadingNotice(this._container, this._readingNoticeElement, notices);
-  }
-  private _clearReadingPages(): void {
-    this._readingNoticeElement = updateNativeReadingNotice(this._container, this._readingNoticeElement, noReadingNotices);
-    this._renderEpoch++;
-    for (const [index, slot] of [...this._slots]) this._recycleSlot(index, slot);
-    this._find.invalidate(); this._visibleEvents.reset();
-  }
   private _reportRenderError(err: unknown): void {
-    // Failure revocation belongs to the document operation's captured epoch,
-    // never whichever document happens to be current when reporting settles.
     this._errorRouter.report(err);
   }
 
@@ -1098,7 +1051,6 @@ export class DocxScrollViewer implements ZoomableViewer {
     const dpr = this._viewport.dpr();
     const widthPx = this._pageWidthPx(i);
     const scale = this._scale;
-    const epoch = this._renderEpoch;
 
     if (this._mode === 'worker') {
       void this._renderSlotBitmap(i, slot, widthPx, dpr, scale);
@@ -1129,7 +1081,7 @@ export class DocxScrollViewer implements ZoomableViewer {
     const doc = this._doc;
     // Explicitness is independent of the current value: false before load
     // must win over a model source's true view default.
-    if (this._opts.modelSources !== undefined) this._requestedShowTrackedChanges = value;
+    if (this._opts.legacyDoc !== undefined) this._requestedShowTrackedChanges = value;
     if (this._showTrackedChanges === value) {
       if (doc) await selectDocxLayoutView(doc, {
         showTrackedChanges: value,
@@ -1149,9 +1101,8 @@ export class DocxScrollViewer implements ZoomableViewer {
     if (!selected) return;
     if (this._destroyed || generation !== this._layoutViewGeneration || doc !== this._doc) return;
     this._showTrackedChanges = value;
-    if (this._opts.modelSources !== undefined) this._requestedShowTrackedChanges = value;
+    if (this._opts.legacyDoc !== undefined) this._requestedShowTrackedChanges = value;
     this._find.invalidate();
-    this._syncReadingNotice();
     // Re-render every mounted slot at the new variant, and relayout: heights,
     // spacer and mount window all follow the new page count, and a shrinking
     // document must recycle slots that are now out of range rather than ask for
@@ -1303,51 +1254,8 @@ export class DocxScrollViewer implements ZoomableViewer {
   }
 
 
-
-  private _onResize(): void { this._zoom.onResize(); }
-
   get topVisiblePage(): number {
     return this._scroller.lastRange?.topIndex ?? 0;
-  }
-
-  /** @internal test hook: page indices currently mounted. */
-  mountedPageIndicesForTest(): number[] {
-    return [...this._slots.keys()];
-  }
-
-  /** @internal test hook: the current absolute px-per-pt scale. */
-  scaleForTest(): number {
-    return this._scale;
-  }
-
-  /** @internal test hook: the base fit scale (pre-zoom) at the current width. */
-  baseScaleForTest(): number {
-    return this._baseScale();
-  }
-
-  /** @internal test hook: the current render epoch (bumped on setScale + resize). */
-  renderEpochForTest(): number {
-    return this._renderEpoch;
-  }
-
-  /** @internal test hook: fire the observed resize path (a real host drives this
-   *  via the constructor's ResizeObserver). */
-  resizeForTest(): void {
-    this._onResize();
-  }
-
-  /** @internal test hook: the content point (page index + intra-page fraction)
-   *  currently under viewport-y `y` (px from the scroll host top). Lets a test
-   *  capture "what is under the cursor" before a zoom and re-query its on-screen
-   *  y afterwards to assert the pointer-anchored invariant. */
-  contentAtViewportYForTest(y: number): { page: number; frac: number } {
-    const point = this._navigation.contentAtViewportY(y);
-    return { page: point.unit, frac: point.frac };
-  }
-
-  /** @internal test hook: inverse of contentAtViewportYForTest. */
-  viewportYOfForTest(page: number, frac: number): number {
-    return this._navigation.viewportYOf(page, frac);
   }
 
   /** Return the owning engine's latest content-free package-usage snapshot. */
@@ -1388,7 +1296,6 @@ export class DocxScrollViewer implements ZoomableViewer {
    */
   destroy(): void {
     if (this._destroyed) return;
-    this._readingNoticeElement = updateNativeReadingNotice(this._container, this._readingNoticeElement, noReadingNotices);
     this._destroyed = true;
     this._pendingLoadAbort?.abort();
     this._pendingLoadAbort = null;

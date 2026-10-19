@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { layoutBodyModel } from './test-support/document-layout.test-support.js';
 import type { DocumentLayout } from './layout/types.js';
 import type {
-  BodyElement, DocParagraph, DocTable, DocTableRow, DocTableCell,
+  BodyElement, DocTable, DocTableRow, DocTableCell,
   DocxTextRun, SectionProps, TblpPr, } from './types';
 
 // ECMA-376 §17.4.57 — a FLOATING table (`<w:tblpPr>`) is positioned absolutely
@@ -134,12 +134,13 @@ describe('floating-table width cap (§17.4.57) — page width, not the column ba
     expect(resolvedWidth(layout)).toBeCloseTo(600, 1);
   });
 
-  it('still scales a NON-floating fixed table down to the column band (block-table cap unchanged)', () => {
+  it('keeps a NON-floating fixed table at its grid beyond the column band (#1881)', () => {
+    // Windows Word 16.0 #1881 controls: in-flow fixed tracks are final.
     const layout = layoutBodyModel(
       [table([200, 120, 200], { layout: 'fixed' })],
       section(), makeCtx(),
     );
-    expect(resolvedWidth(layout)).toBeCloseTo(450, 1);
+    expect(resolvedWidth(layout)).toBeCloseTo(520, 1);
   });
 
   it('leaves a floating table narrower than the band untouched (cap never bites)', () => {

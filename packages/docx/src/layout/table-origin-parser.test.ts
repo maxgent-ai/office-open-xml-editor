@@ -129,8 +129,10 @@ describe('Word table origin and occupied grid', () => {
     // These synthetic inputs each contain non-dxa cell preferences, outside
     // both Office observations. Main already differs across authored seams;
     // #1664 preserves each form rather than repairing that unrelated defect.
-    // The geometry oracle was captured from the clean main revision in this
-    // fixture using the same parser/measurement inputs, without candidate code.
+    // The geometry oracle was captured from the recorded revision in this
+    // fixture using the same parser/measurement inputs. It was re-recorded for
+    // #1881, whose Word controls keep fixed tracks and absolute-width AutoFit
+    // grids beyond the container; these cases all carry a 540pt dxa tblW.
     const baseline = JSON.parse(await readFile(new URL('./table-origin-disabled-main.json', import.meta.url), 'utf8')) as { revision: string; cases: { split: number[][]; single: number[][] }[] };
     expect(baseline.cases).toHaveLength(128);
     let seed = 1664;

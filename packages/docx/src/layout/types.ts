@@ -1,5 +1,5 @@
 import type { SectionLayoutContext } from '../layout-context.js';
-import type { DocxStorySource, FramePr } from '../types.js';
+import type { DocxDiagnostic, DocxDiagnosticCode, DocxStorySource, FramePr } from '../types.js';
 import type {
   GlyphInkBounds,
   TextFontSlotPresence,
@@ -12,7 +12,6 @@ import type {
   CanvasFontRoute,
   ChartModel,
   DrawingMLShapePaintPlan,
-  ImagePaintProjection,
   Duotone,
   Fill,
   HyperlinkTarget,
@@ -116,13 +115,29 @@ export type DrawingPaintCommand =
     }>
   | Readonly<{
       kind: 'drawingml-shape';
+      insetStroke?: boolean;
+      shadowPass?: boolean;
+      concentricFill?: Readonly<{
+        bounds?: LayoutRect;
+        focus: Readonly<{ l: number; t: number; width: number; height: number }>;
+        rings: readonly Readonly<{ outside: number; inside: number; color: string }>[];
+        centerColor: string;
+      }>;
+      /** Retained VML fill/shadow pass opacity, independent of other passes. */
+      opacity?: number;
       plan: DeepReadonly<DrawingMLShapePaintPlan & { readonly resolvedGeometry: NonNullable<DrawingMLShapePaintPlan['resolvedGeometry']> }>;
     }>
   | Readonly<{
       /** A retained image resource clipped to the authored DrawingML shape. */
       kind: 'drawingml-image-fill';
+      strokeMask?: boolean;
+      maskBounds?: LayoutRect;
+      insetStroke?: boolean;
       plan: DeepReadonly<DrawingMLShapePaintPlan & { readonly resolvedGeometry: NonNullable<DrawingMLShapePaintPlan['resolvedGeometry']> }>;
       resourceKey: string;
+      imageRotationDeg?: number;
+      imageFlipH?: boolean;
+      imageFlipV?: boolean;
       fillRect?: Readonly<{ l: number; t: number; r: number; b: number }>;
     }>
   | Readonly<{
@@ -156,6 +171,16 @@ export type DrawingPaintCommand =
       fill: DeepReadonly<Fill> | null;
       opacity: number;
       rotationDeg: number;
+      flipH?: boolean;
+      flipV?: boolean;
+      glyphTransform?: Matrix2DData;
+      imageResourceKey?: string;
+      maskBounds?: LayoutRect;
+      imageRotationDeg?: number;
+      imageFlipH?: boolean;
+      imageFlipV?: boolean;
+      /** Acquired glyph placements for §19.1.2.23 path fitting. */
+      pathSlices?: readonly Readonly<{ sourceX: number; sourceWidth: number; xPt: number; yPt: number; a: number; b: number; c: number; d: number }>[];
       /** True applies §19.1.2.23 fitshape; false preserves authored font size. */
       fitShape: boolean;
       fontSizePt: number;
@@ -177,8 +202,6 @@ export type DrawingPaintCommand =
       /** Keep a non-text graphic upright after the enclosing section-logical
        * frame is rotated into a vertical physical page. */
       orientation?: UprightResourceOrientation;
-      /** Clone-safe, layout-acquired full-frame reading image projection. */
-      nativeImagePlan?: NativeReadingImagePlan;
     }>;
 
 /** Closed local counter-turn that keeps a non-text graphic upright in its
@@ -241,13 +264,13 @@ export interface TextRange {
 export type TextDirection = 'ltr' | 'rtl';
 /** `sideways-lr` is the counter-clockwise frame (lines advance upward, later
  * lines to the right, every glyph rotated with the page). Only a native
- * {@link NativeSectionFlow} selects it; no OOXML token does. */
+ * {@link SectionFlow} selects it; no OOXML token does. */
 export type WritingMode = 'horizontal-tb' | 'vertical-rl' | 'vertical-lr' | 'sideways-lr';
 
-/** Canonical per-section semantics normalized once from a native MS-DOC flow
+/** Canonical per-section semantics normalized once from a producer's flow
  * that no Transitional ST_TextDirection token expresses in this library:
- * MS-ODRAW 2.4.5 BtoT (upward, later lines rightward, glyph tops left). */
-export type NativeSectionFlow = 'bottomToTop';
+ * bottom to top (upward, later lines rightward, glyph tops left). */
+export type SectionFlow = 'bottomToTop';
 
 export type TextDecorationLayout = Readonly<{
   kind: 'underline' | 'strikethrough' | 'overline';
@@ -271,6 +294,10 @@ export interface RetainedGlyphPaintOperation {
   readonly fontWeight: number;
   readonly fontStyle: 'normal' | 'italic';
   readonly color: TextColorPolicy;
+  /** Present when the operation paints a contextual span whose acquisition
+   * was pair-kerned (WORD_ARABIC_PAIR_KERNING); absent operations paint one
+   * grapheme, which has no pair to kern. */
+  readonly kerning?: 'normal';
   /** Tight selected-face ink relative to this operation's baseline origin. */
   readonly inkBounds?: Readonly<{
     xMinPt: number;
@@ -501,23 +528,23 @@ export type ImagePaintResourceDescriptor = Readonly<{
   alpha?: number;
   colorReplaceFrom?: string;
   duotone?: DeepReadonly<Duotone>;
+  /** Part 4 §19.1.2.21: clr1 replaces black, clr2 replaces coloured pixels. */
+  vmlStrokePattern?: DeepReadonly<Duotone>;
+  vmlFill?: DeepReadonly<Extract<import('../types.js').ShapeFill, { fillType: 'image' }>['vml']>;
+  blipEffects?: DeepReadonly<import('@silurus/ooxml-core').BlipEffect[]>;
+  /** Host shape orientation for CT_Blip effects on a shape blip fill
+   * (§20.1.8.45/.49 rotWithShape): the fill paints inside the rotated shape,
+   * so the image itself carries no rotation but its page-fixed effects must
+   * still be evaluated against the host's rotation and flips. */
+  effectHost?: Readonly<{
+    rotation?: number; flipH?: boolean; flipV?: boolean;
+    /** Stretched fill insets (§20.1.8.56): with srcRect they define the full
+     * source frame the chain's EMU measurements are evaluated on. */
+    fillRect?: Readonly<{ l?: number; t?: number; r?: number; b?: number }>;
+    /** A tiled fill samples its source at the fill DPI (§20.1.8.58). */
+    tileDpi?: number;
+  }>;
 }>;
-
-/** Exact accepted source facts, including decode-order/intrinsic ownership.
- * Null preserves absent scalar options; unsupported substitutions never enter
- * this source class. Bitmap handles are strictly realm-owned session data. */
-export interface NativeReadingImageSourceBinding {
-  readonly resourceKey: string; readonly partPath: string; readonly mimeType: string;
-  readonly documentOrder: number | null;
-  readonly intrinsicSize: Readonly<{ widthPt: number; heightPt: number }>;
-  readonly srcRect: Readonly<{ l: number; t: number; r: number; b: number }> | null;
-  readonly rotation: number | null; readonly flipH: boolean | null; readonly flipV: boolean | null;
-  readonly alpha: number | null;
-}
-export interface NativeReadingImagePlan {
-  readonly source: NativeReadingImageSourceBinding;
-  readonly projection: DeepReadonly<ImagePaintProjection>;
-}
 
 export type ChartPaintResourceDescriptor = Readonly<{
   kind: 'chart';
@@ -597,6 +624,11 @@ export interface LineLayout {
   readonly bounds: LayoutRect;
   readonly baselinePt: number;
   readonly advancePt: number;
+  /** Trailing grid leading eligible for plain-paragraph page-edge admission.
+   * Authored paragraph decorations disable it before continuation slicing;
+   * only whitelisted plain text paint can use it at unreserved body boundaries.
+   * Placement and paint always retain the full advance. */
+  readonly gridAfterLeadingPt?: number;
   readonly placements: readonly ParagraphPlacement[];
   /** §17.18.84 bar-tab vertical rules acquired independently of tab advances. */
   readonly barTabRules?: readonly BorderSegment[];
@@ -700,8 +732,6 @@ export interface ParagraphSpacingLayout {
 }
 
 export interface ParagraphLayout extends LayoutNodeBase {
-  /** Internal capability for this visible stored-size marker, not authored WML. */
-  readonly nativeReadingPictureBullet?: true;
   readonly kind: 'paragraph';
   /** Source `w14:paraId`; identity only, never interpreted by layout or paint. */
   readonly paragraphId?: string;
@@ -727,9 +757,6 @@ export interface ParagraphLayout extends LayoutNodeBase {
   /** @internal */
   readonly anchorCollisions?: readonly DrawingMLCollisionEntryPt[];
   readonly anchorFrames?: readonly AnchorFrameResult[];
-  /** @internal Actual complete scenes relocated by this retained paragraph. */
-  readonly nativeReadingRelocations?: readonly string[];
-  readonly nativeReadingInactivePictureData?: boolean;
   readonly paragraphMark?: ParagraphMarkLayout;
   readonly lineNumbers?: readonly LineNumberLayout[];
   readonly continuation?: Readonly<{
@@ -968,6 +995,7 @@ export interface ResolvedFloatingTablePlacementLayout {
 
 export interface TextBoxLayout extends LayoutNodeBase {
   readonly kind: 'textbox';
+  readonly clipRects?: readonly LayoutRect[];
   readonly story: StoryLayout;
   /** DrawingML fontRef color inherited by runs without an explicit w:color. */
   readonly defaultTextColor?: string;
@@ -1013,8 +1041,8 @@ export interface StoryLayout {
   readonly bandDependent?: true;
 }
 
-/** Page-owned occurrence of one native reserved separator story (MS-DOC
- * 2.3.3): the separator or continuation separator leading a page's note band
+/** Page-owned occurrence of one reserved separator story: the separator or
+ * continuation separator leading a page's note band
  * (ECMA-376 §17.11.23 / §17.11.1), or the continuation notice ending a page on
  * which a note continues (§17.18.33). The canonical reserved source is shared
  * by every occurrence; geometry belongs to this destination page. */
@@ -1036,7 +1064,7 @@ export interface NoteSeparatorLayout {
 export interface NoteLayout extends LayoutNodeBase {
   readonly kind: 'note';
   /** Scalar library rule of the modern/absent-native path. Empty when a
-   * native {@link leading} occurrence owns the separator. */
+   * reserved {@link leading} occurrence owns the separator. */
   readonly separator: readonly BorderSegment[];
   readonly leading?: NoteSeparatorLayout;
   readonly story: StoryLayout;
@@ -1203,23 +1231,10 @@ export interface LayoutPage {
   readonly changeBars?: readonly ChangeBarLayout[];
 }
 
-export type LayoutDiagnosticCode =
-  | 'FLOW_OVERLAP'
-  | 'BOTTOM_MARGIN_INVASION'
-  | 'FLOW_DOMAIN_INVASION'
-  | 'INVALID_REFERENCE'
-  | 'INVALID_GEOMETRY'
-  | 'INVALID_VALUE'
-  | 'MISSING_RESOURCE'
-  | 'NON_CONVERGENCE'
-  | 'UNSUPPORTED_FEATURE';
-
-export interface LayoutDiagnostic {
-  readonly code: LayoutDiagnosticCode;
-  readonly severity: 'warning' | 'error';
-  readonly source?: SourceRef;
-  readonly message: string;
-}
+// Layout and resource acquisition share the public diagnostic value contract.
+// Keeping aliases here does not expose the retained layout implementation.
+export type LayoutDiagnosticCode = DocxDiagnosticCode;
+export type LayoutDiagnostic = DocxDiagnostic;
 
 export interface DocumentLayout {
   readonly pages: readonly LayoutPage[];
@@ -1229,6 +1244,9 @@ export interface DocumentLayout {
 export type CompatibilityEvidence =
   | Readonly<{ kind: 'microsoft-note'; reference: string }>
   | Readonly<{ kind: 'regression-test'; reference: string }>
+  /** Library policy with no Office measurement: the record's description must
+   * give the rationale; `reference` names the DOCX test that pins it. */
+  | Readonly<{ kind: 'library-policy'; reference: string }>
   | Readonly<{
       kind: 'office-observation';
       syntheticFixtureId: string;
@@ -1277,7 +1295,6 @@ export interface ParagraphLayoutInput {
 }
 
 export interface AcquiredParagraphLayoutInput {
-  readonly nativeReadingPictureBullet?: true;
   readonly kind: 'paragraph';
   readonly id: LayoutNodeId;
   readonly source: SourceRef;
@@ -1305,9 +1322,6 @@ export interface AcquiredParagraphLayoutInput {
   /** @internal */
   readonly anchorCollisions?: readonly DrawingMLCollisionEntryPt[];
   readonly anchorFrames?: readonly AnchorFrameResult[];
-  /** @internal Actual complete scenes relocated by this retained paragraph. */
-  readonly nativeReadingRelocations?: readonly string[];
-  readonly nativeReadingInactivePictureData?: boolean;
   readonly paragraphMark?: ParagraphMarkLayout;
   readonly continuation?: Readonly<{
     lineStart: number;
@@ -1440,6 +1454,8 @@ export interface TableRowFormatInput {
 export interface TableFormatInput {
   readonly effectiveStyleId: string | null;
   readonly ordinaryFlow: boolean;
+  /** The producer supplies the indent as the physical outer table edge. */
+  readonly outerEdgeIndent?: boolean;
   /** Parser-owned ECMA-376 §17.4.37 logical table membership. */
   readonly logicalSequenceId?: string | null;
   readonly logicalRowOffset?: number;
@@ -1622,4 +1638,33 @@ export interface BlockLayoutAlgorithms {
     placement: FlowBlockPlacement,
     services: LayoutServices,
   ): BlockLayoutResult<TableLayout>;
+}
+
+/** Effective private VML parser facts, projected before layout acquisition. */
+export interface VmlShapeAcquisitionFacts {
+  /** Cumulative group vector effect in points relative to the leaf origin. */
+  readonly vmlGroupTransform?: readonly [number, number, number, number, number, number];
+  readonly vmlSkew?: Readonly<{
+    offset: NonNullable<import('../types.js').ShapeRun['vmlShadow']>['offset'];
+    origin: readonly [number, number];
+    matrix: readonly [number, number, number, number, number, number];
+    absolutePerspective: boolean;
+  }>;
+  readonly vmlEdgeStrokes?: readonly Readonly<{
+    edge: 'left' | 'top' | 'right' | 'bottom' | 'column';
+    color: string;
+    widthPt: number;
+    dash?: string | null;
+    cap?: 'butt' | 'square' | 'round' | null;
+    join: 'miter' | 'bevel' | 'round';
+    miterLimit: number;
+    compound?: string | null;
+    image?: Extract<import('../types.js').ShapeFill, { fillType: 'image' }> | null;
+    pattern?: import('@silurus/ooxml-core').Duotone | null;
+  }>[];
+  readonly vmlStrokeFill?: Extract<import('../types.js').ShapeFill, { fillType: 'image' }>;
+  readonly vmlStrokePattern?: import('@silurus/ooxml-core').Duotone;
+  readonly vmlInsetPen?: boolean;
+  readonly vmlConcentricGradient?: boolean;
+  readonly vmlTextRects?: Array<[number, number, number, number]>;
 }

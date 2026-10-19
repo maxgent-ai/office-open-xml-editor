@@ -111,7 +111,7 @@ type DocRun = DocParagraph['runs'][number];
 
 function para(
   runs: DocxTextRun[],
-  opts: { alignment?: DocParagraph['alignment'] } = {},
+  opts: { alignment?: DocParagraph['alignment']; autoSpace?: boolean } = {},
 ): BodyElement {
   const p: DocParagraph = {
     alignment: opts.alignment ?? 'left',
@@ -120,6 +120,7 @@ function para(
     runs: runs.map((r) => ({ type: 'text', ...r }) as DocRun),
     defaultFontSize: FONT_PX, defaultFontFamily: 'NotInMetrics',
     widowControl: false,
+    ...(opts.autoSpace === false ? { autoSpaceDE: false, autoSpaceDN: false } : {}),
   };
   return { type: 'paragraph', ...p } as BodyElement;
 }
@@ -204,7 +205,8 @@ describe('docGrid character grid — 約物半角 brackets are drawn contiguousl
   //     overlaps the bracket's tail.
   it('keeps measure==draw so the following Latin run abuts (no overlap)', async () => {
     const { runs, fillTextCalls } = await render(
-      [para([textRun(EA_TEXT), textRun('A')])],
+      // The bracket box edge alone: no automatic East Asian/Latin gap.
+      [para([textRun(EA_TEXT), textRun('A')], { autoSpace: false })],
       section(charGrid(CHARSPACE)),
     );
 

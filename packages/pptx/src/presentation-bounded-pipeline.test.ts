@@ -148,9 +148,13 @@ describe('PptxPresentation bounded main-mode pipeline', () => {
 
     expect(presentation.slideCount).toBe(2);
     expect(presentation.getNotes(0)).toBe('speaker note');
+    // A notes-free slide, an out-of-range index and a non-integer index are
+    // all "no notes" answers; the index is never clamped to a neighbour.
+    for (const index of [1, -1, 2, 0.5]) expect(presentation.getNotes(index)).toBeNull();
     expect(presentation.getComments(0)).toEqual(compact.slides[0].comments);
     expect(presentation.getComments(1)).toEqual([]);
     expect(presentation.isHidden(1)).toBe(true);
+    for (const index of [0, -1, 2, 0.5]) expect(presentation.isHidden(index)).toBe(false);
     expect(presentation.getSlideIndexByPartName('ppt/slides/slide2.xml')).toBe(1);
     expect(ordinary.filter((request) => request.kind === 'openSlideSession')).toHaveLength(2);
     expect(ordinary.findIndex((request) => request.kind === 'extractFont')).toBeLessThan(

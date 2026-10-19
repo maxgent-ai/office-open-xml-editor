@@ -9,7 +9,9 @@ function sameSearchContainer(left: PptxTextRunInfo, right: PptxTextRunInfo): boo
   const rightCell = right.tableCell;
   if (!leftCell && !rightCell) return true;
   if (!leftCell || !rightCell) return false;
-  return left.elementIndex === right.elementIndex &&
+  // Runtime MCE previews have paint identities but no source-model locators.
+  // Keep cells from separate preview tables distinct in both render modes.
+  return (left.renderElementIndex ?? left.elementIndex) === (right.renderElementIndex ?? right.elementIndex) &&
     left.origin === right.origin &&
     left.shapeId === right.shapeId &&
     leftCell.row === rightCell.row &&

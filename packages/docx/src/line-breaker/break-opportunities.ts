@@ -6,6 +6,8 @@ import {
   isDictionarySeaText,
   fitSeaWordPrefix,
   graphemeClusterOffsets,
+  SYNTHETIC_ASCENT_EM,
+  SYNTHETIC_DESCENT_EM,
 } from '@silurus/ooxml-core';
 import { EAST_ASIAN_RE } from '../layout/text.js';
 import {
@@ -25,6 +27,7 @@ import {
   RESET_SLICED_TEXT_MEASUREMENT,
   charScaleFactor,
   charSpacingDeltaPx,
+  leadingAutoSpacePx,
   legalTextSplitAtOrBefore,
   segAdvanceWidth,
   segmentCharacterGridDeltaPx,
@@ -37,7 +40,6 @@ import { buildFont } from './font-routes.js';
 import {
   mixedCandidateMayShrink,
   mixedLineHasVisibleText,
-  noteMixedSpaceWork,
   type MixedSpaceCandidate,
 } from './mixed-space-fit.js';
 import {
@@ -46,7 +48,7 @@ import {
   rebaseSeaBreaks,
 } from './text-runs.js';
 import { fitCJKPrefix, hasEastAsianVisiblePredecessor } from './fit-search.js';
-import { LineGapRejection, fitJustifiedCompression, justifiedCompressionApplies, type PassOperationState } from './pass-operations.js';
+import { LineGapRejection, fitJustifiedCompression, justifiedCompressionApplies, justifiedPrefixCompression, lineEndsWithText, type PassOperationState } from './pass-operations.js';
 
 /** The iterator reads only its declared slice of the explicit pass state. */
 export type BreakOpportunityIteratorContext = Pick<
@@ -56,6 +58,7 @@ export type BreakOpportunityIteratorContext = Pick<
   | 'flush'
   | 'baseRtl'
   | 'addToLine'
+  | 'admitLineMetric'
   | 'scale'
   | 'firstIndent'
   | 'tabOriginPx'
@@ -235,19 +238,21 @@ function processTextSegment(context: BreakOpportunityIteratorContext, seg: Layou
     breakerState,
     flush,
     addToLine,
-    maxWidth,
     characterGrid,
     availW,
     textSegmentBox,
     prospectiveSnapAdvance,
     segAdvance,
     strAdvance,
-    isJustified,
-    stretchLastLine,
     overflowPunct,
     sameLatinSpaceFace,
   } = context;
   const s = seg as LayoutTextSeg;
+  // WORD_EAST_ASIAN_AUTO_SPACE: a segment fitted after text on this line owes
+  // its gap; one that starts the line does not.
+  if (s.autoSpaceBeforePt !== undefined) {
+    s.autoSpaceLeadingPx = lineEndsWithText(breakerState.currentLine) ? undefined : 0;
+  }
   const segmentBox = textSegmentBox(s);
   const w = segmentBox.width;
   const prospectiveWidth = prospectiveSnapAdvance(s, w);
@@ -374,7 +379,6 @@ function processTextSegment(context: BreakOpportunityIteratorContext, seg: Layou
       mixedLineHasVisibleText(breakerState));
   s.mixedNaturalTrailingSpacePx = mixedSpaces ? trailingSpaceW : undefined;
   s.mixedNaturalTrailingSpaceCount = mixedSpaces ? s.text.length - trimmed.length : undefined;
-  const interwordCompression = justifiedCompressionApplies(context);
   // Library containment policy: an RTL line is anchored at its right edge,
   // so even an invisible trailing-space advance shifts visible LTR cells left.
   // Count that advance during fitting instead of admitting glyphs past the band.
@@ -418,7 +422,10 @@ function processTextSegment(context: BreakOpportunityIteratorContext, seg: Layou
   // Complete-unit justified admission precedes the ordinary natural-only
   // joined-unit preflight, so a style/source seam cannot bypass compression.
   s.measuredWidth = w;
-  if (!prefersWholeWordAtScriptBoundary(context, s) && fitJustifiedCompression(context, s)) return;
+  // A whole word after an ideograph owns a WORD_EAST_ASIAN_AUTO_SPACE gap of
+  // the justified-compression family; it is admitted as one unit either way.
+  if ((!prefersWholeWordAtScriptBoundary(context, s) || s.autoSpaceBeforePt !== undefined)
+    && fitJustifiedCompression(context, s)) return;
   // The authored opportunity follows the existing whole-unit justified fit;
   // it must not introduce a wrap before a word admitted by that policy.
   if (placeOptionalHyphenPrefix(context, s)) return;
@@ -440,6 +447,7 @@ function processTextSegment(context: BreakOpportunityIteratorContext, seg: Layou
     breakerState.gapTransaction?.endsAtExclusion !== true &&
     trailingOverflowCharacter !== undefined &&
     (breakerState.currentLine.length > 0 || textBeforeTrailingOverflow.length > 0) &&
+    // `word-overflow-punctuation-latin-parent-run`: classify by the parent run.
     wordIsOverflowPunctuation(
       trailingOverflowCharacter,
       s.eastAsiaLanguage,
@@ -453,7 +461,7 @@ function processTextSegment(context: BreakOpportunityIteratorContext, seg: Layou
   // WORD_COMPRESSED_SPACE_LINE_FIT: once a mixed line's spaces are shrunk, a
   // following unit (such as a closing mark split into its own source run) is
   // judged by the same reduction rule; joined and split runs must agree.
-  if (breakerState.mixedSpace.compressed && mixedCandidateMayShrink(breakerState, s.text)) {
+  if (breakerState.mixedSpace.compressed && mixedCandidateMayShrink(breakerState, s.text, s)) {
     const required = context.mixedSpaceRequirement(mixedSeamCandidate(context, s, s.text, wForFit));
     if (required !== undefined) {
       s.measuredWidth = w;
@@ -507,8 +515,8 @@ function processMathSegment(context: BreakOpportunityIteratorContext, seg: Layou
     setMeasureFont(buildFont(false, false, emPx, null, fontFamilyClasses));
     const m = measurement.measureCurrentText(seg.fallbackText);
     const w = m.width;
-    const asc = m.fontBoundingBoxAscent ?? m.actualBoundingBoxAscent ?? emPx * 0.8;
-    const desc = m.fontBoundingBoxDescent ?? m.actualBoundingBoxDescent ?? emPx * 0.2;
+    const asc = m.fontBoundingBoxAscent ?? m.actualBoundingBoxAscent ?? emPx * SYNTHETIC_ASCENT_EM;
+    const desc = m.fontBoundingBoxDescent ?? m.actualBoundingBoxDescent ?? emPx * SYNTHETIC_DESCENT_EM;
     seg.measuredWidth = w;
     seg.mathAscent = asc;
     seg.mathDescent = desc;
@@ -516,7 +524,7 @@ function processMathSegment(context: BreakOpportunityIteratorContext, seg: Layou
       flush(undefined, false, seg.src);
     }
     if (breakerState.currentLine.length === 0 && w > availW()) context.forcedPlacement(w);
-    addToLine(seg, w, seg.fontSize, Math.max(asc, emPx * 0.8), Math.max(desc, emPx * 0.2));
+    addToLine(seg, w, seg.fontSize, Math.max(asc, emPx * SYNTHETIC_ASCENT_EM), Math.max(desc, emPx * SYNTHETIC_DESCENT_EM));
     return;
   }
   const emPx = seg.fontSize * scale;
@@ -534,8 +542,8 @@ function processMathSegment(context: BreakOpportunityIteratorContext, seg: Layou
   // table row) and pin the glyph to the very top of the cell. Floor to the
   // font's natural ascent/descent so math occupies a full line like text
   // does (tall math — fractions, big operators — keeps its larger ink box).
-  const lineAsc = Math.max(asc, emPx * 0.8);
-  const lineDesc = Math.max(desc, emPx * 0.2);
+  const lineAsc = Math.max(asc, emPx * SYNTHETIC_ASCENT_EM);
+  const lineDesc = Math.max(desc, emPx * SYNTHETIC_DESCENT_EM);
   if (breakerState.currentLine.length > 0 && breakerState.currentWidth + w > availW()) {
     flush(undefined, false, seg.src);
   }
@@ -549,6 +557,11 @@ function processImageSegment(context: BreakOpportunityIteratorContext, seg: Layo
 
   if (seg.anchor) {
     seg.measuredWidth = 0;
+    return;
+  }
+  if (seg.markerMetric) {
+    seg.measuredWidth = 0;
+    context.admitLineMetric(seg, seg.heightPt, seg.heightPt * scale);
     return;
   }
   const w = seg.widthPt * scale;
@@ -581,12 +594,14 @@ function commitAlignedTabCell(context: BreakOpportunityIteratorContext): void {
     } else {
       const m = measureText(q);
       // #1014 — fold the vo=Tr ink deficit into the committed advance too.
-      const w = segAdvanceWidth(q, m.width + verticalInkExtra(q, q.text), characterGrid, scale);
+      // The same-line WORD_EAST_ASIAN_AUTO_SPACE gap is part of the cell.
+      const w = segAdvanceWidth(q, m.width + verticalInkExtra(q, q.text), characterGrid, scale)
+        + leadingAutoSpacePx(context, q);
       q.measuredWidth = w;
       const asc =
-        m.fontBoundingBoxAscent ?? m.actualBoundingBoxAscent ?? q.fontSize * scale * 0.8;
+        m.fontBoundingBoxAscent ?? m.actualBoundingBoxAscent ?? q.fontSize * scale * SYNTHETIC_ASCENT_EM;
       const desc =
-        m.fontBoundingBoxDescent ?? m.actualBoundingBoxDescent ?? q.fontSize * scale * 0.2;
+        m.fontBoundingBoxDescent ?? m.actualBoundingBoxDescent ?? q.fontSize * scale * SYNTHETIC_DESCENT_EM;
       addToLine(q, w, q.fontSize, asc, desc);
     }
   }
@@ -698,7 +713,7 @@ function processTabSegment(
         seg.readingGap = gap;
         seg.measuredWidth = gap;
         seg.leader = stop?.leader;
-        addToLine(seg, gap, seg.fontSize, seg.fontSize * scale * 0.8, seg.fontSize * scale * 0.2);
+        addToLine(seg, gap, seg.fontSize, seg.fontSize * scale * SYNTHETIC_ASCENT_EM, seg.fontSize * scale * SYNTHETIC_DESCENT_EM);
         return;
       }
     } else if (!seg.ptab) {
@@ -708,7 +723,7 @@ function processTabSegment(
       breakerState.currentWidth += resolveCompletedTabCells(input);
     }
     seg.measuredWidth = 0;
-    addToLine(seg, 0, seg.fontSize, seg.fontSize * scale * 0.8, seg.fontSize * scale * 0.2);
+    addToLine(seg, 0, seg.fontSize, seg.fontSize * scale * SYNTHETIC_ASCENT_EM, seg.fontSize * scale * SYNTHETIC_DESCENT_EM);
     return;
   }
 
@@ -767,7 +782,7 @@ function processTabSegment(
       tabW = 0;
     }
     seg.measuredWidth = tabW;
-    addToLine(seg, tabW, seg.fontSize, seg.fontSize * scale * 0.8, seg.fontSize * scale * 0.2);
+    addToLine(seg, tabW, seg.fontSize, seg.fontSize * scale * SYNTHETIC_ASCENT_EM, seg.fontSize * scale * SYNTHETIC_DESCENT_EM);
     // §17.3.3.23 selects the reference target independently of paragraph
     // indents. Library policy limits allocation to the actual paragraph/float
     // band: a fitting cell stays aligned, and all other cells use normal breaks.
@@ -829,7 +844,7 @@ function processTabSegment(
       tabW = 0;
     }
     seg.measuredWidth = tabW;
-    addToLine(seg, tabW, seg.fontSize, seg.fontSize * scale * 0.8, seg.fontSize * scale * 0.2);
+    addToLine(seg, tabW, seg.fontSize, seg.fontSize * scale * SYNTHETIC_ASCENT_EM, seg.fontSize * scale * SYNTHETIC_DESCENT_EM);
     // Keep an aligned cell atomic only when it fits its band. Oversized cells
     // return to the iterator at their ordinary break sites.
     if (breakerState.currentWidth + following.totalWidth <= cellLimit) {
@@ -857,7 +872,7 @@ function processTabSegment(
   }
   tabWidth = Math.max(0, tabWidth);
   seg.measuredWidth = tabWidth;
-  addToLine(seg, tabWidth, seg.fontSize, seg.fontSize * scale * 0.8, seg.fontSize * scale * 0.2);
+  addToLine(seg, tabWidth, seg.fontSize, seg.fontSize * scale * SYNTHETIC_ASCENT_EM, seg.fontSize * scale * SYNTHETIC_DESCENT_EM);
   return;
 }
 
@@ -922,7 +937,6 @@ function mixedSeamCandidate(
     }
     if (take > 0) {
       const piece = characters.slice(0, take).join('');
-      noteMixedSpaceWork(piece.length);
       pieces.push({ segment: follower, text: piece });
       const visible = piece.replace(/ +$/u, '');
       if (visible.length > 0) width += strAdvance(follower, visible);
@@ -938,7 +952,7 @@ function fitMixedSpaces(
   segment: LayoutTextSeg,
   fitWidth: number,
 ): boolean {
-  if (!mixedCandidateMayShrink(context.breakerState, segment.text)) return false;
+  if (!mixedCandidateMayShrink(context.breakerState, segment.text, segment)) return false;
   const required = context.mixedSpaceRequirement(
     mixedSeamCandidate(context, segment, segment.text, fitWidth),
   );
@@ -956,7 +970,24 @@ function prefersWholeWordAtScriptBoundary(context: BreakOpportunityIteratorConte
     && hasCJKBreakOpportunity(previousChar) && !hasCJKBreakOpportunity(s.text);
 }
 
-function placeOrSplitText(context: BreakOpportunityIteratorContext, frame: TextFitFrame): void {
+/** A pre-flush (an atomic group or a SEA chunk moved to a fresh line) can
+ * leave a segment fitted with its WORD_EAST_ASIAN_AUTO_SPACE gap at a line
+ * start; release the gap before the line-start fit. */
+function settleLineStartAutoSpace(
+  context: BreakOpportunityIteratorContext,
+  frame: TextFitFrame,
+): TextFitFrame {
+  const { s } = frame;
+  if (s.autoSpaceBeforePt === undefined || lineEndsWithText(context.breakerState.currentLine)) {
+    return frame;
+  }
+  const leading = leadingAutoSpacePx(context, s);
+  s.autoSpaceLeadingPx = 0;
+  return leading === 0 ? frame : { ...frame, w: frame.w - leading, wForFit: frame.wForFit - leading };
+}
+
+function placeOrSplitText(context: BreakOpportunityIteratorContext, inputFrame: TextFitFrame): void {
+  const frame = settleLineStartAutoSpace(context, inputFrame);
   const {
     breakerState,
     flush,
@@ -977,7 +1008,6 @@ function placeOrSplitText(context: BreakOpportunityIteratorContext, frame: TextF
     asc,
     desc,
     wForFit,
-    paragraphFinalIdeographicSpaceTail,
     admitsTrailingOverflowPunctuation,
   } = frame;
   if (
@@ -1161,7 +1191,7 @@ function prepareAtomicTextFit(
       breakerState.currentWidth + groupFitWidth > availW() &&
       // WORD_COMPRESSED_SPACE_LINE_FIT judges a joined unit as one candidate,
       // so a source-run seam inside it cannot change the decision.
-      !(mixedCandidateMayShrink(breakerState, group.pieces.map((piece) => piece.text).join(''))
+      !(mixedCandidateMayShrink(breakerState, group.pieces.map((piece) => piece.text).join(''), group.pieces[0]?.segment)
         && context.mixedSpaceRequirement({ pieces: group.pieces, fitWidth: groupFitWidth }) !== undefined)
     ) {
       flush(undefined, false, s.src);
@@ -1247,13 +1277,10 @@ function splitCjkOverflow(context: BreakOpportunityIteratorContext, frame: TextF
   } = context;
   const {
     s,
-    w,
     h,
     asc,
     desc,
-    wForFit,
     paragraphFinalIdeographicSpaceTail,
-    admitsTrailingOverflowPunctuation,
   } = frame;
 
   // CJK overflow: split at the maximum prefix that fits, re-queue the tail.
@@ -1348,11 +1375,10 @@ function splitCjkOverflow(context: BreakOpportunityIteratorContext, frame: TextF
   };
   let mixedSpaceExtended = false;
   const naturalRawSplit = [...rawPrefix].length;
-  if (breakerState.currentLine.length > 0 && mixedCandidateMayShrink(breakerState, s.text)) {
+  if (breakerState.currentLine.length > 0 && mixedCandidateMayShrink(breakerState, s.text, s)) {
     const characters = [...s.text];
     const admitted = (count: number): boolean => {
       const candidate = characters.slice(0, count).join('');
-      noteMixedSpaceWork(candidate.length);
       return !candidate.endsWith(' ') && context.mixedSpaceRequirement(
         mixedSeamCandidate(context, s, candidate, strAdvance(s, candidate)),
       ) !== undefined;
@@ -1390,6 +1416,41 @@ function splitCjkOverflow(context: BreakOpportunityIteratorContext, frame: TextF
     if (low > natural) {
       rawPrefix = characters.slice(0, low).join('');
       mixedSpaceExtended = true;
+    }
+  }
+  // WORD_JUSTIFIED_INTERWORD_COMPRESSION: on a justified mode-15 line a CJK
+  // prefix is admitted like a whole unit, by the line's compressible gaps
+  // (U+0020 and WORD_EAST_ASIAN_AUTO_SPACE). Admission is monotone in the
+  // prefix length (C grows; S and E do not), so the same bounded search applies.
+  let justifiedExtended = false;
+  // Only a line holding an automatic gap: other prefixes keep their
+  // established natural CJK fit.
+  if (!mixedSpaceExtended && breakerState.currentLine.length > 0 && justifiedCompressionApplies(context)
+    && (leadingAutoSpacePx(context, s) > 0 || breakerState.currentLine.some((item) =>
+      'text' in item && (item.autoSpaceLeadingPx ?? 0) > 0))) {
+    const characters = [...s.text];
+    const admitted = (count: number): boolean => {
+      const candidate = characters.slice(0, count).join('');
+      return !candidate.endsWith(' ') && justifiedPrefixCompression(context, s, candidate) !== undefined;
+    };
+    const natural = Math.max(naturalRawSplit, [...proposedPrefixFor(naturalRawSplit, true)].length);
+    let low = natural;
+    let high = characters.length;
+    for (let step = 1; low + step <= characters.length; step *= 2) {
+      if (!admitted(low + step)) {
+        high = low + step - 1;
+        break;
+      }
+      low += step;
+    }
+    while (low < high) {
+      const middle = Math.ceil((low + high) / 2);
+      if (admitted(middle)) low = middle;
+      else high = middle - 1;
+    }
+    if (low > natural && low < characters.length) {
+      rawPrefix = characters.slice(0, low).join('');
+      justifiedExtended = true;
     }
   }
   // Apply kinsoku to the break position: retract leftwards so the tail
@@ -1440,6 +1501,20 @@ function splitCjkOverflow(context: BreakOpportunityIteratorContext, frame: TextF
     }
     mixedSpaceExtended = needsShrink(prefix);
   }
+  let justifiedOverflow = 0;
+  if (justifiedExtended) {
+    // The final head (after kinsoku and hanging) is itself admitted, or the
+    // checked head, or the natural break.
+    const overflowOf = (head: string): number | undefined =>
+      head.length === 0 ? 0 : justifiedPrefixCompression(context, s, head);
+    let overflow = overflowOf(prefix);
+    if (overflow === undefined) {
+      const checked = proposedPrefixFor(rawSplit, false);
+      overflow = overflowOf(checked);
+      prefix = overflow === undefined ? proposedPrefixFor(naturalRawSplit, true) : checked;
+    }
+    justifiedOverflow = overflow ?? 0;
+  }
   if (breakerState.currentLine.length === 0) {
     // minSplit keeps progress on an empty line even when no legal prefix
     // fits; that retained prefix is forced unless a legal one exists.
@@ -1454,6 +1529,7 @@ function splitCjkOverflow(context: BreakOpportunityIteratorContext, frame: TextF
       // The retained head overflows naturally and was admitted above.
       context.markMixedSpacesCompressed();
     }
+    if (justifiedOverflow > 0) breakerState.justifiedCompressionPx = justifiedOverflow;
     // Grid advance for the head piece — the same model as the line box / draw.
     const pw = strNaturalAdvance(s, prefix);
     const headSeg: LayoutTextSeg = {
@@ -1568,13 +1644,9 @@ function splitSeaOverflow(context: BreakOpportunityIteratorContext, frame: TextF
   } = context;
   const {
     s: segment,
-    w,
     h,
     asc,
     desc,
-    wForFit,
-    paragraphFinalIdeographicSpaceTail,
-    admitsTrailingOverflowPunctuation,
   } = frame;
   const s = segment as LayoutTextSeg & { seaBreaks: readonly number[] };
 

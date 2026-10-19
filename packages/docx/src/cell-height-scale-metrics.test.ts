@@ -265,7 +265,7 @@ describe('cell content height matches canonical transformed Canvas metrics', () 
 
   it('vAlign=center: the inked block is centred using the PAINTED content height', async () => {
     // Three single-line paragraphs, no spacing. Exact 120 pt row → drawn height is
-    // exactly 120·scale px (resolveSingleRowHeight, ST_HeightRule exact) and is
+    // exactly 120·scale px (ST_HeightRule exact) and is
     // NOT content-measured, so this isolates the vAlign centring consumer. The
     // content (~3 lines) fits well within the row, leaving centring room.
     const t = tableOf(row(

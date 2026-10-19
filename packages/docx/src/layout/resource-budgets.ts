@@ -73,3 +73,49 @@ export function assertFootnoteAcquisitionBudget(source: unknown): number {
   }
   return units;
 }
+
+/** Library resource policy for one paragraph's retained anchor references.
+ * Charge structural source visits plus run/text × exclusion-geometry pairs for
+ * each counterfactual line measurement/projection pair, before doing that work.
+ * Source units count keys/values and UTF-16 string length; line units count runs
+ * and text length; geometry units count exclusions and polygon points. Eight
+ * million units bound aggregate counterfactual amplification independently of the
+ * acquisition-miss and convergence-pass ceilings. This is an operational work
+ * model, not an OOXML rule or a wall-clock guarantee; individual shaping and
+ * polygon algorithms retain their own resource limits. */
+const MAX_PARAGRAPH_ANCHOR_REFERENCE_WORK_UNITS = 8_000_000;
+
+export function createParagraphAnchorReferenceWorkBudget(
+  paragraph: Readonly<{ runs: readonly unknown[] }>,
+): Readonly<{ charge(exclusions: readonly Readonly<{ polygon: readonly unknown[] }>[]): void }> {
+  let sourceUnits: number | undefined;
+  let lineUnits = paragraph.runs.length;
+  let remaining = MAX_PARAGRAPH_ANCHOR_REFERENCE_WORK_UNITS;
+  const fail = (): never => { throw new Error('Paragraph anchor reference work budget exceeded'); };
+  return Object.freeze({ charge(exclusions) {
+    if (sourceUnits === undefined) {
+      sourceUnits = 0;
+      const pending: unknown[] = [paragraph];
+      while (pending.length > 0) {
+        const value = pending.pop();
+        sourceUnits += typeof value === 'string' ? Math.max(1, value.length) : 1;
+        if (sourceUnits + pending.length > remaining) fail();
+        if (value && typeof value === 'object') {
+          for (const key in value) {
+            if (!Object.hasOwn(value, key)) continue;
+            const child = (value as Record<string, unknown>)[key];
+            if (key === 'text' && typeof child === 'string') lineUnits += child.length;
+            if (++sourceUnits + pending.length > remaining) fail();
+            pending.push(child);
+          }
+        }
+      }
+    }
+    let geometryUnits = 1;
+    for (const exclusion of exclusions) geometryUnits += 1 + exclusion.polygon.length;
+    const work = sourceUnits + Math.max(1, lineUnits) * geometryUnits;
+    if (!Number.isSafeInteger(work) || work > remaining) fail();
+    // Never refund attempted work, including on failed acquisition.
+    remaining -= work;
+  } });
+}

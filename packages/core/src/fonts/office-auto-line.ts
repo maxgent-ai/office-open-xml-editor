@@ -1,20 +1,33 @@
 /**
  * Office-observed automatic single-line allocation from one static OpenType
- * face. Word for Mac controls isolated OS/2 code-page bits 17–20 and found a
- * 1.3× hhea glyph box for that class; other faces use signed hhea lineGap above
- * the baseline. Independent Excel DrawingML controls with omitted <a:lnSpc>
- * matched the same projection for Meiryo UI Bold and Arial Bold at 12/25 pt and
- * top/centre/bottom anchors. ECMA-376 defines those spacing/anchor attributes,
- * but does not select the font tables. Callers must gate the rule to their own
- * tested format and to a known font-metric source.
+ * face. Historical Word for Mac synthetic controls isolated OS/2 code-page
+ * bits 17–20 and found 1.3× hhea for that class. Windows Word 16.0.20430 instead
+ * matches 1.3× usWin: Yu Gothic/Mincho have identical vertical tables across the tested
+ * Mac/Windows faces but different hhea/usWin boxes; MS Mincho, MS Gothic and
+ * Meiryo are equal-box counterexamples. Controls cover 8/12/20pt grid/snap-off
+ * and 10/30pt atLeast lines. Library policy selects that Windows result from
+ * each face's own data, independent of the viewer OS. Other faces retain
+ * signed hhea lineGap above the baseline. ECMA-376 §17.3.1.33 defines the
+ * spacing multiplier, not this table choice. Missing usWin data declines the
+ * Far East projection: hhea or Canvas ink cannot establish the Windows box.
  */
 export const OFFICE_FAR_EAST_SINGLE_LINE_FACTOR = 1.3;
+
+function farEastWindowsLineBox(winAscent?: number, winDescent?: number) {
+  if (winAscent == null || winDescent == null
+    || !Number.isFinite(winAscent) || !Number.isFinite(winDescent)
+    || winAscent < 0 || winDescent < 0 || winAscent + winDescent <= 0) return null;
+  const half = ((OFFICE_FAR_EAST_SINGLE_LINE_FACTOR - 1) / 2) * (winAscent + winDescent);
+  return { ascent: winAscent + half, descent: winDescent + half };
+}
 
 export function officeOpenTypeAutoLineRatios(metrics: Readonly<{
   unitsPerEm: number;
   hheaAscent: number;
   hheaDescent: number;
   hheaLineGap: number;
+  winAscent?: number;
+  winDescent?: number;
   farEastCodePage: boolean;
 }>): Readonly<{
   lineHeightRatio: number;
@@ -28,13 +41,11 @@ export function officeOpenTypeAutoLineRatios(metrics: Readonly<{
     && Number.isFinite(hheaLineGap))) return null;
   const glyphBox = hheaAscent - hheaDescent;
   if (!(glyphBox > 0)) return null;
-  const farEastHalfLeading = ((OFFICE_FAR_EAST_SINGLE_LINE_FACTOR - 1) / 2) * glyphBox;
-  const ascent = farEastCodePage
-    ? hheaAscent + farEastHalfLeading
-    : hheaAscent + hheaLineGap;
-  const descent = farEastCodePage
-    ? -hheaDescent + farEastHalfLeading
-    : -hheaDescent;
+  const box = farEastCodePage
+    ? farEastWindowsLineBox(metrics.winAscent, metrics.winDescent)
+    : { ascent: hheaAscent + hheaLineGap, descent: -hheaDescent };
+  if (!box) return null;
+  const { ascent, descent } = box;
   if (!(ascent >= 0 && descent >= 0 && ascent + descent > 0)) return null;
   return Object.freeze({
     lineHeightRatio: (ascent + descent) / unitsPerEm,
@@ -96,10 +107,9 @@ export function excelDrawingMlLineRatios(metrics: Readonly<{
     ascent = hheaAscent + Math.max(0, hheaLineGap);
     descent = -hheaDescent;
   } else if (farEastCodePage) {
-    const box = winAscent + winDescent;
-    const half = ((OFFICE_FAR_EAST_SINGLE_LINE_FACTOR - 1) / 2) * box;
-    ascent = winAscent + half;
-    descent = winDescent + half;
+    const box = farEastWindowsLineBox(winAscent, winDescent);
+    if (!box) return null;
+    ({ ascent, descent } = box);
   } else if (typoMetrics) {
     ascent = typoMetrics[0] + Math.max(0, typoMetrics[2]);
     descent = -typoMetrics[1];

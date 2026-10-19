@@ -1,6 +1,7 @@
 import {
   blockNeedsPageOrigin,
   hasPagePlacedContent,
+  layoutTableFragment,
   needsNestedPageOrigins,
   rowNeedsPageOrigins,
   type RetainedTableAcquisition,
@@ -339,12 +340,32 @@ function paginationRowHeightForOccurrence(
   context: TableFragmentContext,
 ): number {
   if (row === source.input.rows[rowIndex]) return paginationRowHeight(source, rowIndex);
-  const occurrence = layoutTable({
+  const occurrenceInput = {
     ...source.input,
     id: `${source.input.id}:row-occurrence:${context.page.occurrenceId}:${row.logicalRowIndex}`,
     rows: [row],
-  }, context.placement, context.services).layout;
-  return Math.max(0, occurrence.rows[0]?.heightPt ?? occurrence.advancePt);
+  };
+  const occurrence = layoutTable(occurrenceInput, context.placement, context.services).layout;
+  // Measured alone, the row carries the table's own top and bottom rules;
+  // in the table it carries its own collapsed footprint instead
+  // (WORD_COLLAPSED_BORDER_ROW_TRACK_FOOTPRINT).
+  const aloneFootprintPt = tableRowBoundaryFootprintsPt(occurrenceInput)[0] ?? 0;
+  const inTableFootprintPt = sourceRowFootprintsPt(source)[rowIndex] ?? 0;
+  return Math.max(
+    0,
+    (occurrence.rows[0]?.heightPt ?? occurrence.advancePt) - aloneFootprintPt + inTableFootprintPt,
+  );
+}
+
+const sourceRowFootprints = new WeakMap<RetainedTableAcquisition, readonly number[]>();
+
+function sourceRowFootprintsPt(source: RetainedTableAcquisition): readonly number[] {
+  let footprints = sourceRowFootprints.get(source);
+  if (!footprints) {
+    footprints = tableRowBoundaryFootprintsPt(source.input);
+    sourceRowFootprints.set(source, footprints);
+  }
+  return footprints;
 }
 
 function paginationRowTrackHeightForOccurrence(
@@ -695,8 +716,8 @@ function layoutNestedWholeAt(
   context: TableFragmentContext,
 ): TableLayout {
   const sourceRows = nested.input.rows;
-  const layoutRows = (rows: readonly TableRowLayoutInput[]) => layoutTable(
-    { ...nested.input, rows }, context.placement, context.services,
+  const layoutRows = (rows: readonly TableRowLayoutInput[]) => layoutTableFragment(
+    nested, { ...nested.input, rows }, context.placement, context.services,
   ).layout;
   const placedWhole: PlacedWholeLayouts = new Map();
   const placements: readonly (RowPagePlacement | null)[] = needsNestedPageOrigins(nested)
@@ -1844,7 +1865,7 @@ function materializeFragment(
     id: `${source.input.id}:fragment:${context.page.occurrenceId}`,
     rows: selected.map((row) => row.input),
   };
-  const laidOut = layoutTable(fragmentInput, context.placement, context.services).layout;
+  const laidOut = layoutTableFragment(source, fragmentInput, context.placement, context.services).layout;
   const rows = laidOut.rows.map((row, rowIndex): TableRowFragmentLayout => {
     const selection = selected[rowIndex]!;
     return Object.freeze({
@@ -2295,7 +2316,7 @@ function takeTableFragmentPass(
       if (context.availableHeightPt + EPSILON_PT < context.freshPageHeightPt) {
         return passOf({ fragment: null, nextCursor: cursor, requiresFreshPage: true });
       }
-      // Compatibility-owned over-page cantSplit admission.
+      // `word-over-page-cant-split-clip`: compatibility-owned over-page cantSplit admission.
       if (wordClipsOverPageCantSplitRow({
         compatibility: context.compatibility,
         availableHeightPt: context.availableHeightPt,

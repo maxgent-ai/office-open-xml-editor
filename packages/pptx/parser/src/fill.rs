@@ -14,12 +14,6 @@ use ooxml_common::blip::{mime_from_ext, parse_blip_duotone, parse_blip_effects, 
 use ooxml_common::color::ThemeResolver;
 use std::collections::HashMap;
 
-/// Parse `<a:blip><a:alphaModFix amt="..."/></a:blip>` from a blipFill node
-/// (ECMA-376 §20.1.8.6). Thin re-export of the shared
-/// [`ooxml_common::blip::parse_blip_alpha`] so the three formats read the blip
-/// alpha identically (previously a pptx-local copy). Returns the fraction
-/// `amt/100000` when present and < 1.0; `None` otherwise.
-pub(crate) use ooxml_common::blip::parse_blip_alpha;
 pub(crate) use ooxml_common::fill::{parse_fill_rect, parse_tile};
 
 // ===========================
@@ -140,7 +134,7 @@ pub(crate) fn parse_style_matrix_fill_from_source(
         StyleMatrixLookup::Missing => return None,
         StyleMatrixLookup::Entry(entry) => entry,
     };
-    let entry_xml = entry.to_xml();
+    let entry_xml = entry.to_xml().ok()?;
     let document = roxmltree::Document::parse(&entry_xml).ok()?;
     let theme = theme_source.colors();
     let placeholder_color = parse_color_node_tint(style_ref, theme, TintMode::PowerPointLinear);
@@ -201,6 +195,9 @@ pub(crate) fn parse_style_matrix_fill(
 
     let placeholder_color = parse_color_node_tint(style_ref, theme, PowerPointLinear);
 
+    // Shared style-reparse budget (see `ooxml_common::theme::to_xml`),
+    // charged before the wrapper is materialized.
+    ooxml_common::theme::charge_style_reparse(fragment.len() + 160).ok()?;
     let wrapped = format!(
         r#"<root xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">{fragment}</root>"#
     );
@@ -272,7 +269,7 @@ fn parse_blip_fill_with_color_resolver<
     let dpi = attr(&blip_fill, "dpi").and_then(|value| value.parse().ok());
     let rot_with_shape = attr(&blip_fill, "rotWithShape")
         .map(|value| value == "1" || value.eq_ignore_ascii_case("true"));
-    let alpha = parse_blip_alpha(blip_fill);
+    let alpha = None /* alpha is baked by the ordered blip chain */;
     // §20.1.8.23 duotone recolour, resolved through the theme with PowerPoint's
     // linear tint (same call the `<p:pic>` paths use). `None` ⇒ no effect.
     let duotone = parse_blip_duotone(
@@ -281,11 +278,12 @@ fn parse_blip_fill_with_color_resolver<
         ooxml_common::color::TintMode::PowerPointLinear,
     );
     // CT_Blip grayscl/biLevel/clrChange pixel effects in document order.
-    let blip_effects = parse_blip_effects(
+    let mut blip_effects = parse_blip_effects(
         blip_fill,
         color_resolver,
         ooxml_common::color::TintMode::PowerPointLinear,
     );
+    ooxml_common::blip::resolve_blip_effect_images(&mut blip_effects, resolve_blip);
     // EG_FillModeProperties (§20.1.8.14) is an optional choice of `tile`
     // (§20.1.8.58) or `stretch` (§20.1.8.56) with no schema default. Record
     // both authored facts as-is: `stretch` is the presence of `<a:stretch>`
@@ -452,17 +450,6 @@ pub(crate) fn parse_shadow(
     parse_shadow_node(child(effect_lst, "outerShdw")?, theme)
 }
 
-/// Parse spPr > effectLst > innerShdw into a Shadow. ECMA-376 §20.1.8.21
-/// (CT_InnerShadowEffect) — same field shape as outerShdw, semantics differ
-/// at render time (cast inward).
-#[cfg(test)]
-pub(crate) fn parse_inner_shadow(
-    effect_lst: roxmltree::Node<'_, '_>,
-    theme: &HashMap<String, String>,
-) -> Option<Shadow> {
-    parse_shadow_node(child(effect_lst, "innerShdw")?, theme)
-}
-
 /// Shared field reader for innerShdw / outerShdw. Both elements expose
 /// blurRad, dist, dir, and a color child with optional alphaModFix.
 pub(crate) fn parse_shadow_node(
@@ -484,39 +471,6 @@ fn parse_shadow_node_with_resolver<R: ThemeResolver + ?Sized>(
     Some(ooxml_common::effect::parse_shadow_effect(
         n, resolver, tint_mode,
     ))
-}
-
-/// Parse spPr > effectLst > glow into a Glow effect — ECMA-376 §20.1.8.17
-/// (CT_GlowEffect): a coloured halo with a blur radius, no offset.
-#[cfg(test)]
-pub(crate) fn parse_glow(
-    effect_lst: roxmltree::Node<'_, '_>,
-    theme: &HashMap<String, String>,
-) -> Option<Glow> {
-    let g = child(effect_lst, "glow")?;
-    parse_glow_node_with_resolver(
-        g,
-        &PptxSchemeResolver { theme },
-        ooxml_common::color::TintMode::PowerPointLinear,
-    )
-}
-
-#[cfg(test)]
-fn parse_glow_node_with_resolver<R: ThemeResolver + ?Sized>(
-    g: roxmltree::Node<'_, '_>,
-    resolver: &R,
-    tint_mode: ooxml_common::color::TintMode,
-) -> Option<Glow> {
-    Some(ooxml_common::effect::parse_glow_effect(
-        g, resolver, tint_mode,
-    ))
-}
-
-/// Parse spPr > effectLst > softEdge into a SoftEdge — ECMA-376 §20.1.8.31.
-#[cfg(test)]
-pub(crate) fn parse_soft_edge(effect_lst: roxmltree::Node<'_, '_>) -> Option<SoftEdge> {
-    let n = child(effect_lst, "softEdge")?;
-    Some(ooxml_common::effect::parse_soft_edge_effect(n))
 }
 
 /// Parse spPr > effectLst > reflection — ECMA-376 §20.1.8.27. Defaults
@@ -590,6 +544,11 @@ pub(crate) fn parse_style_matrix_effects(
         theme,
         ooxml_common::color::TintMode::PowerPointLinear,
     );
+    // Shared style-reparse budget (see `ooxml_common::theme::to_xml`),
+    // charged before the wrapper is materialized.
+    if ooxml_common::theme::charge_style_reparse(fragment.len() + 80).is_err() {
+        return StyleMatrixEffects::default();
+    }
     let wrapped = format!(
         r#"<root xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">{fragment}</root>"#
     );

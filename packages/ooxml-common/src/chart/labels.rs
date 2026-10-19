@@ -163,6 +163,25 @@ pub(super) fn merge_chart_label_body_styles(
     }
 }
 
+/// A DrawingML `<a:br>` (ECMA-376 §21.1.2.2.1) inside chart rich text: a
+/// vertical line break within the paragraph, carried as a "\n" run so every
+/// chart text consumer (titles, text boxes, data labels) breaks the line once.
+pub(super) fn chart_text_break_run() -> ChartTextRun {
+    ChartTextRun {
+        text: "\n".to_string(),
+        font_size_hpt: None,
+        bold: None,
+        italic: None,
+        color: None,
+        color_paint_authored: None,
+        color_hidden: None,
+        font_face: None,
+        language: None,
+        baseline: None,
+        paragraph_align: None,
+    }
+}
+
 pub(super) fn chart_text_run_from_node(
     run: Node,
     paragraph_default: Option<Node>,
@@ -268,12 +287,16 @@ pub(super) fn parse_chart_title_rich_runs(
             scalar_count += 1;
         }
         let paragraph_default = child(paragraph, "pPr").and_then(|props| child(props, "defRPr"));
-        for run_node in paragraph
-            .children()
-            .filter(|node| node.is_element() && matches!(node.tag_name().name(), "r" | "fld"))
-        {
+        for run_node in paragraph.children().filter(|node| {
+            node.is_element() && matches!(node.tag_name().name(), "r" | "fld" | "br")
+        }) {
             if scalar_count >= MAX_CHART_TITLE_RICH_SCALARS {
                 break;
+            }
+            if run_node.tag_name().name() == "br" {
+                runs.push(chart_text_break_run());
+                scalar_count += 1;
+                continue;
             }
             let Some(mut run) =
                 chart_text_run_from_node(run_node, paragraph_default, text_body_default, resolver)
@@ -288,7 +311,11 @@ pub(super) fn parse_chart_title_rich_runs(
             }
         }
     }
-    (!runs.is_empty()).then_some(runs)
+    // Break-only runs (e.g. `<a:p><a:br/></a:p>`) are no title text, like
+    // empty text, so a synthesized fallback title is not hidden.
+    runs.iter()
+        .any(|run| chart_text_has_content(&run.text))
+        .then_some(runs)
 }
 
 /// Detect the source-shape boundary observed for Office's automatic light
@@ -390,16 +417,36 @@ pub(super) fn parse_chart_user_shapes(
                     let runs = paragraph
                         .children()
                         .filter(|node| {
-                            node.is_element() && matches!(node.tag_name().name(), "r" | "fld")
+                            node.is_element()
+                                && matches!(node.tag_name().name(), "r" | "fld" | "br")
                         })
                         .filter_map(|run| {
+                            if run.tag_name().name() == "br" {
+                                // The break keeps its own (or the paragraph
+                                // default) size: an empty line is that tall.
+                                let mut line_break = chart_text_break_run();
+                                line_break.font_size_hpt = [child(run, "rPr"), paragraph_default]
+                                    .into_iter()
+                                    .flatten()
+                                    .find_map(|node| {
+                                        node.attribute("sz").and_then(parse_text_font_size_hpt)
+                                    });
+                                return Some(line_break);
+                            }
                             chart_text_run_from_node(run, paragraph_default, None, resolver)
                         })
                         .collect();
                     ChartTextParagraph { runs, align }
                 })
                 .collect::<Vec<_>>();
-            if paragraphs.iter().all(|paragraph| paragraph.runs.is_empty()) {
+            // A box whose runs are only line breaks has no text, like a box
+            // with no runs.
+            if paragraphs.iter().all(|paragraph| {
+                paragraph
+                    .runs
+                    .iter()
+                    .all(|run| !run.text.is_empty() && !chart_text_has_content(&run.text))
+            }) {
                 return None;
             }
 

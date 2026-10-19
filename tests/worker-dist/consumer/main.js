@@ -134,13 +134,13 @@ try {
   if (new URLSearchParams(location.search).has('pause-sources')) {
     await new Promise((resolve) => { window.resumeSourceStages = resolve; });
   }
-  const { legacyDocSource } = await import('@silurus/ooxml/legacy-doc');
+  const { legacyDoc } = await import('@silurus/ooxml-legacy-office/doc');
   await runModelSourceStages({
     DocxDocument,
     DocxViewer,
     XlsxWorkbook,
     PptxPresentation,
-    legacyDocSource,
+    legacyDoc,
     bytes,
     paintCanvas: (id) => document.getElementById(id),
   });

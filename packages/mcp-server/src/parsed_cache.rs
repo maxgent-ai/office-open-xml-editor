@@ -68,7 +68,9 @@ fn cache() -> &'static Mutex<CacheState> {
 }
 
 fn identity(path: &str) -> Result<Key, String> {
-    let canonical = fs::canonicalize(path).map_err(|e| format!("Cannot read '{}': {}", path, e))?;
+    // Every tool reaches the file system through this function; the scope
+    // check runs before metadata is read or the file is opened.
+    let canonical = crate::path_scope::canonicalize(path)?;
     let meta = fs::metadata(&canonical).map_err(|e| format!("Cannot read '{}': {}", path, e))?;
     if meta.is_dir() {
         // Preserve the previous fs::read error for directories.

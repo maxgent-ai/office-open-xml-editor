@@ -34,6 +34,8 @@ export type DrawingMLShapeGeometry =
     }>;
 
 export type DrawingMLPathPaint = Readonly<{
+  /** Resolved path winding rule; VML uses parity within an end-delimited set. */
+  fillRule?: 'nonzero' | 'evenodd';
   /** ST_PathFillMode (§20.1.10.37) other than `norm`. */
   fill?: 'none' | 'lighten' | 'lightenLess' | 'darken' | 'darkenLess';
   /** Present only when the path is not stroked. */
@@ -164,7 +166,7 @@ export function paintDrawingMLShape(
     if (stroke) for (const arrow of geometry.arrows) {
       const tipX = x - geometry.originX + arrow.tipX, tipY = y - geometry.originY + arrow.tipY;
       paintResolvedArrowHead(ctx, tipX, tipY, arrow.angle, arrow.geometry, stroke,
-        resolveArrowPaint(ctx, stroke, unitToDevice, tipX, tipY, arrow.angle, arrow.end,
+        resolveArrowPaint(ctx, stroke, unitToDevice, PATTERN_PT_TO_SHAPE_UNITS, tipX, tipY, arrow.angle, arrow.end,
           plan.rect, plan.transform.rotationDeg, PATTERN_PT_TO_SHAPE_UNITS));
     }
   });

@@ -13,7 +13,7 @@ import {
 export { UNICODE_VERSION } from './char-data.generated.js';
 
 /** Bidi_Class index (into BIDI_CLASS_NAMES) for a code point. */
-export function bidiClassIndex(cp: number): number {
+function bidiClassIndex(cp: number): number {
   // Binary search for the greatest range start <= cp. Ranges are gap-free and
   // cover [0, 0x110000), so a match always exists for valid code points.
   let lo = 0;

@@ -59,6 +59,29 @@ describe('Excel DrawingML stacked WordArt', () => {
       expect(Math.sign(calls[2].x - calls[0].x)).toBe(vert === 'wordArtVert' ? 1 : -1);
     },
   );
+  it('uses the reference usWin box for a formerly fitted face', () => {
+    const { ctx, calls } = record();
+    drawShapeText(ctx, body('wordArtVert', {
+      paragraphs: [{ align: 'l', runs: [{ type: 'text', text: '日日', size: 18,
+        bold: false, italic: false, fontFace: 'Yu Gothic' }] }],
+    }), 200, 200, 1);
+    expect(calls[1].y - calls[0].y).toBeCloseTo((7 / 6) * (2636 / 2048) * 24, 6);
+  });
+
+  it.each([false, true])('uses bold-specific vert coverage before wrapping shape text (italic=%s)', (italic) => {
+    const nextGlyphX = [false, true].map((bold) => {
+      const { ctx, calls } = record();
+      drawShapeText(ctx, body('wordArtVert', {
+        wrap: 'square',
+        paragraphs: [{ align: 'l', runs: [{ type: 'text', text: 'ーA', size: 18,
+          bold, italic, fontFace: 'Microsoft JhengHei' }] }],
+      }), 200, 50, 1);
+      return calls[1].x;
+    });
+    // The regular 24px vert cell wraps A; bold's 10px horizontal advance fits.
+    expect(nextGlyphX[0]).toBeGreaterThan(nextGlyphX[1]);
+  });
+
   it('applies the authored normAutofit fontScale before stacked measurement', () => {
     const normal = record(), scaled = record();
     drawShapeText(normal.ctx, body('wordArtVert'), 200, 200, 1);

@@ -2,8 +2,8 @@ import type { AnchorAcquisitionInput } from './anchor-input.js';
 import type { LayoutRect, Matrix2DData } from './types.js';
 import { transformRect } from './coordinate-space.js';
 
-/** Shared retained-group frame projection: normal anchors and an explicit
- * relocated reading scene consume the same acquired child geometry. */
+/** Shared retained-group frame projection of an anchored group member's
+ * acquired child geometry. */
 export function retainedAnchorChildFrame(
   acquisition: AnchorAcquisitionInput,
   outerFrame: LayoutRect,

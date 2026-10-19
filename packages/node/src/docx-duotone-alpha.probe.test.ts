@@ -71,28 +71,45 @@ function storedZip(files: Record<string, string | Uint8Array>): Uint8Array {
 
 /** A `<w:drawing>` inline picture, optionally carrying a duotone and/or an
  *  alphaModFix on its blip. cx/cy in EMU (12700 EMU/pt). */
-function inlinePicXml(opts: { duotone?: boolean; alpha?: string }): string {
-  const cx = 200 * 12700; // 200pt square
-  const effects =
+interface PictureOptions {
+  effects?: string;
+  sizesPt?: number[];
+  sizePt?: number;
+  duotone?: boolean;
+  alpha?: string;
+  bright?: string;
+  contrast?: string;
+  inHeader?: boolean;
+  grouped?: boolean;
+  rotation?: number;
+}
+
+function inlinePicXml(opts: PictureOptions): string {
+  const cx = (opts.sizePt ?? 200) * 12700; // 200pt square
+  const effects = opts.effects ?? (
     (opts.duotone
       ? '<a:duotone><a:srgbClr val="000000"/><a:srgbClr val="DAB6BA"/></a:duotone>'
-      : '') + (opts.alpha ? `<a:alphaModFix amt="${opts.alpha}"/>` : '');
+      : '') + (opts.alpha ? `<a:alphaModFix amt="${opts.alpha}"/>` : '')
+      + (opts.bright || opts.contrast
+        ? `<a:lum bright="${opts.bright ?? '0'}" contrast="${opts.contrast ?? '0'}"/>` : ''));
   return (
     '<w:p><w:r><w:drawing>' +
     `<wp:inline><wp:extent cx="${cx}" cy="${cx}"/>` +
-    '<a:graphic><a:graphicData>' +
+    `<a:graphic><a:graphicData${opts.grouped ? ' uri="http://schemas.microsoft.com/office/word/2010/wordprocessingGroup"' : ''}>` +
+    (opts.grouped ? `<wpg:wgp xmlns:wpg="http://schemas.microsoft.com/office/word/2010/wordprocessingGroup"><wpg:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="${cx}" cy="${cx}"/><a:chOff x="0" y="0"/><a:chExt cx="${cx}" cy="${cx}"/></a:xfrm></wpg:grpSpPr>` : '') +
     '<pic:pic><pic:blipFill>' +
     `<a:blip r:embed="rIdImg">${effects}</a:blip>` +
     '<a:stretch><a:fillRect/></a:stretch>' +
     '</pic:blipFill>' +
-    '<pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="' + cx + '" cy="' + cx + '"/></a:xfrm>' +
+    '<pic:spPr><a:xfrm rot="' + (opts.rotation ?? 0) * 60000 + '"><a:off x="0" y="0"/><a:ext cx="' + cx + '" cy="' + cx + '"/></a:xfrm>' +
     '<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr></pic:pic>' +
+    (opts.grouped ? '</wpg:wgp>' : '') +
     '</a:graphicData></a:graphic></wp:inline>' +
     '</w:drawing></w:r></w:p>'
   );
 }
 
-function buildDocx(pngBytes: Uint8Array, opts: { duotone?: boolean; alpha?: string }): Uint8Array {
+function buildDocx(pngBytes: Uint8Array, opts: PictureOptions): Uint8Array {
   const contentTypes =
     '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
     '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">' +
@@ -100,21 +117,27 @@ function buildDocx(pngBytes: Uint8Array, opts: { duotone?: boolean; alpha?: stri
     '<Default Extension="xml" ContentType="application/xml"/>' +
     '<Default Extension="png" ContentType="image/png"/>' +
     '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>' +
+    (opts.inHeader ? '<Override PartName="/word/header1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml"/>' : '') +
     '</Types>';
   const rootRels =
     '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
     '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
     '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>' +
     '</Relationships>';
-  const docRels =
+  const imageRels =
     '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
     '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
     '<Relationship Id="rIdImg" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/image1.png"/>' +
     '</Relationships>';
+  const docRels = opts.inHeader
+    ? imageRels.replace('</Relationships>', '<Relationship Id="rIdHeader" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header1.xml"/></Relationships>')
+    : imageRels;
   const document =
     `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document ${NS}><w:body>` +
-    inlinePicXml(opts) +
-    '<w:sectPr><w:pgSz w:w="12240" w:h="15840"/>' +
+    (opts.inHeader ? '<w:p/>' : (opts.sizesPt ?? [opts.sizePt ?? 200]).map(sizePt => inlinePicXml({ ...opts, sizePt })).join('')) +
+    '<w:sectPr>' +
+    (opts.inHeader ? '<w:headerReference w:type="default" r:id="rIdHeader"/>' : '') +
+    '<w:pgSz w:w="12240" w:h="15840"/>' +
     '<w:pgMar w:top="720" w:right="720" w:bottom="720" w:left="720" w:header="0" w:footer="0" w:gutter="0"/>' +
     '</w:sectPr></w:body></w:document>';
   return storedZip({
@@ -123,6 +146,10 @@ function buildDocx(pngBytes: Uint8Array, opts: { duotone?: boolean; alpha?: stri
     'word/_rels/document.xml.rels': docRels,
     'word/document.xml': document,
     'word/media/image1.png': pngBytes,
+    ...(opts.inHeader ? {
+      'word/header1.xml': `<w:hdr ${NS}>${inlinePicXml(opts)}</w:hdr>`,
+      'word/_rels/header1.xml.rels': imageRels,
+    } : {}),
   });
 }
 
@@ -180,6 +207,95 @@ function sampleInside(r: Rendered): [number, number, number] {
 }
 
 describe.skipIf(!skia || !docxMod || !rendererMod)('docx duotone + alphaModFix picture render', () => {
+  it('preserves host orientation through DOCX body and header resource acquisition', async () => {
+    const png = await flatPngBytes(16, 16, '#FF0000');
+    const paint = async (rotWithShape: boolean, inHeader: boolean) => {
+      const effects = `<a:alphaMod><a:cont type="tree"><a:outerShdw dist="1270000" dir="0" rotWithShape="${rotWithShape}"><a:srgbClr val="000000"/></a:outerShdw></a:cont></a:alphaMod>`;
+      const bytes = buildDocx(png, { effects, rotation: 90, inHeader });
+      const result = await render(bytes, png);
+      // Inside the east-shifted mask, outside the south-shifted mask.
+      const i = ((48 + 40) * result.w + 48 + 160) * 4;
+      return [...result.data.slice(i, i + 3)];
+    };
+    for (const inHeader of [false, true]) {
+      expect(await paint(true, inHeader), `rotating shadow, header=${inHeader}`).toEqual([255, 255, 255]);
+      expect(await paint(false, inHeader), `page-fixed shadow, header=${inHeader}`).toEqual([255, 0, 0]);
+    }
+  });
+  it('renders authored brightness and contrast through DOCX parsing and paint (§20.1.8.42)', async () => {
+    const black = await flatPngBytes(16, 16, '#000000');
+    expect(sampleInside(await render(buildDocx(black, {}), black))).toEqual([0, 0, 0]);
+    for (const inHeader of [false, true]) {
+      const bright = sampleInside(await render(buildDocx(black, { bright: '90000', inHeader }), black));
+      for (const channel of bright) expect(Math.abs(channel - 230)).toBeLessThanOrEqual(1);
+    }
+    const contrast = sampleInside(await render(buildDocx(black, { contrast: '-50000' }), black));
+    for (const channel of contrast) expect(Math.abs(channel - 64)).toBeLessThanOrEqual(1);
+  });
+
+  it('preserves the existing grouped-picture transparent colour with alphaModFix', async () => {
+    const png = await flatPngBytes(16, 16, '#000000');
+    expect(sampleInside(await render(buildDocx(png, { grouped: true }), png))).toEqual([0, 0, 0]);
+    const effects = '<a:alphaModFix amt="50000"/>' +
+      '<a:clrChange useA="1"><a:clrFrom><a:srgbClr val="000000"><a:alpha val="50000"/></a:srgbClr></a:clrFrom>' +
+      '<a:clrTo><a:srgbClr val="000000"><a:alpha val="0"/></a:srgbClr></a:clrTo></a:clrChange>';
+    expect(sampleInside(await render(buildDocx(png, { effects, grouped: true }), png)))
+      .toEqual([255, 255, 255]);
+  });
+
+  it('keeps an inline alpha-sensitive colour nonmatch unchanged', async () => {
+    const png = await flatPngBytes(16, 16, '#000000');
+    const effects = '<a:alphaModFix amt="50000"/>' +
+      '<a:clrChange useA="1"><a:clrFrom><a:srgbClr val="000000"/></a:clrFrom>' +
+      '<a:clrTo><a:srgbClr val="FF0000"/></a:clrTo></a:clrChange>';
+    const pixel = sampleInside(await render(buildDocx(png, { effects }), png));
+    for (const channel of pixel) expect(Math.abs(channel - 128)).toBeLessThanOrEqual(1);
+  });
+
+  it('does not reapply the first duotone for every palette marker', async () => {
+    const png = await flatPngBytes(16, 16, '#FFFFFF');
+    // Both the established first-palette-only path and the authored two
+    // palettes produce red. Reusing the first palette twice darkens it.
+    const effects = '<a:grayscl/>' +
+      '<a:duotone><a:srgbClr val="000000"/><a:srgbClr val="FF0000"/></a:duotone>' +
+      '<a:duotone><a:srgbClr val="FF0000"/><a:srgbClr val="FF0000"/></a:duotone>';
+    expect(sampleInside(await render(buildDocx(png, { effects }), png))).toEqual([255, 0, 0]);
+  });
+
+  it('preserves alpha-sensitive replacement and independent palettes through body and header paint', async () => {
+    const black = await flatPngBytes(16, 16, '#000000');
+    const chains = [
+      { effects: '<a:alphaModFix amt="50000"/><a:clrChange useA="1">'
+        + '<a:clrFrom><a:srgbClr val="000000"><a:alpha val="50000"/></a:srgbClr></a:clrFrom>'
+        + '<a:clrTo><a:srgbClr val="FF0000"/></a:clrTo></a:clrChange>', expected: [255, 0, 0] },
+      { effects: '<a:lum bright="90000"/>'
+        + '<a:duotone><a:srgbClr val="000000"/><a:srgbClr val="FF0000"/></a:duotone>'
+        + '<a:duotone><a:srgbClr val="000000"/><a:srgbClr val="00FF00"/></a:duotone>', expected: [0, 69, 0] },
+      { effects: '<a:lum bright="90000"/><a:clrRepl><a:srgbClr val="FF0000"/></a:clrRepl>', expected: [255, 0, 0] },
+    ];
+    for (const chain of chains) {
+      for (const inHeader of [false, true]) {
+        const actual = sampleInside(await render(buildDocx(black, { effects: chain.effects, inHeader }), black));
+        actual.forEach((value, index) => expect(Math.abs(value - chain.expected[index])).toBeLessThanOrEqual(1));
+      }
+    }
+  });
+
+  it('renders recursive alpha, blur, HSL, tint and fill overlay in body and header pictures', async () => {
+    const black = await flatPngBytes(16, 16, '#000000');
+    const effects = '<a:clrRepl><a:srgbClr val="FF0000"/></a:clrRepl>'
+      + '<a:hsl hue="7200000"/><a:tint hue="14400000" amt="50000"/>'
+      + '<a:fillOverlay blend="over"><a:solidFill><a:srgbClr val="FF0000"><a:alpha val="50000"/></a:srgbClr></a:solidFill></a:fillOverlay>'
+      + '<a:alphaMod><a:cont type="tree"><a:alphaRepl a="50%"/></a:cont></a:alphaMod>'
+      + '<a:blur rad="12700" grow="false"/>';
+    // Green hue rotation -> cyan tint -> half-red overlay -> half alpha over
+    // white: independently computed byte result (191,159,159).
+    for (const inHeader of [false, true]) {
+      const actual = sampleInside(await render(buildDocx(black, { effects, inHeader }), black));
+      actual.forEach((value, index) => expect(Math.abs(value - [191, 159, 159][index])).toBeLessThanOrEqual(1));
+    }
+  });
+
   it('duotone remaps a mid-grey picture along the clr1→clr2 ramp (§20.1.8.23)', async () => {
     const png = await flatPngBytes(16, 16, '#808080');
     const t = lum(128, 128, 128);
@@ -215,4 +331,17 @@ describe.skipIf(!skia || !docxMod || !rendererMod)('docx duotone + alphaModFix p
     expect(Math.abs(semi[0] - expectedComposite)).toBeLessThan(14);
     expect(semi[0]).toBeGreaterThan(opaque[0] + 30);
   });
+});
+
+
+it.skipIf(!skia || !docxMod || !rendererMod)('keeps the DOCX 8pt picture unchanged beside an 80pt copy sharing its PNG and 1pt blur', async () => {
+  const png = await flatPngBytes(16, 16, '#ff0000');
+  const effects = '<a:blur rad="12700" grow="false"/>';
+  const alone = await render(buildDocx(png, { effects, sizesPt: [8] }), png);
+  const copies = await render(buildDocx(png, { effects, sizesPt: [8, 80] }), png);
+  // The first paragraph and its full 8pt image occupy the same page region.
+  const region = (r: Rendered) => Array.from({ length: 8 }, (_, y) =>
+    [...r.data.slice(((36 + y) * r.w + 36) * 4, ((36 + y) * r.w + 44) * 4)]).flat();
+  expect(region(copies)).toEqual(region(alone));
+  expect(region(alone).some((v, i) => i % 4 === 1 && v > 0 && v < 255)).toBe(true);
 });

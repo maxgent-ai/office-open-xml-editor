@@ -62,6 +62,12 @@ export function imageResourceKey(source: SourceRef, partPath: string): string {
   return `image:${sourceKey(source)}:${encodeURIComponent(partPath)}`;
 }
 
+/** A picture and its backing image brush may reference the same part while
+ * carrying different crops/effects, so they own distinct retained resources. */
+export function vmlPictureResourceKey(source: SourceRef, partPath: string): string {
+  return `vml-picture:${sourceKey(source)}:${encodeURIComponent(partPath)}`;
+}
+
 export function mathResourceKey(source: SourceRef, localName: string): string {
   return `math:${sourceKey(source)}:${encodeURIComponent(localName)}`;
 }
@@ -72,4 +78,14 @@ export function chartResourceKey(source: SourceRef): string {
 
 export function anchorOccurrenceKey(source: SourceRef, parserLocalId: string): string {
   return `anchor:${sourceKey(source)}:${encodeURIComponent(parserLocalId)}`;
+}
+
+/** Separate ownership permits the same part to have different fill/pen effects. */
+export function vmlStrokeResourceKey(source: SourceRef, partPath: string): string {
+  return `${imageResourceKey(source, partPath)}:vml-stroke`;
+}
+
+/** Each border owns an independent brush even when source parts are shared. */
+export function vmlEdgeResourceKey(source: SourceRef, edge = ''): string {
+  return `vml-edge:${sourceKey(source)}:${edge}`;
 }

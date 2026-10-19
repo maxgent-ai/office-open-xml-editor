@@ -4,6 +4,7 @@ import type {
   MathNode,
   ChartModel,
   Duotone,
+  BlipEffect,
   FillRect,
   HyperlinkTarget,
   TileInfo,
@@ -13,6 +14,26 @@ import type {
   PullSessionIdentity,
   WorkerErrorPayload,
 } from '@silurus/ooxml-core/worker';
+
+/** A parser/layout limitation or resource acquisition failure. These immutable
+ * values use the same contract in main-thread and worker rendering. */
+export type DocxDiagnosticCode =
+  | 'FLOW_OVERLAP'
+  | 'BOTTOM_MARGIN_INVASION'
+  | 'FLOW_DOMAIN_INVASION'
+  | 'INVALID_REFERENCE'
+  | 'INVALID_GEOMETRY'
+  | 'INVALID_VALUE'
+  | 'MISSING_RESOURCE'
+  | 'NON_CONVERGENCE'
+  | 'UNSUPPORTED_FEATURE';
+
+export interface DocxDiagnostic {
+  readonly code: DocxDiagnosticCode;
+  readonly severity: 'warning' | 'error';
+  readonly source?: Readonly<DocxStorySource>;
+  readonly message: string;
+}
 
 export interface DocxDocumentModel {
   section: SectionProps;
@@ -89,6 +110,9 @@ export interface EmbeddedFontRef {
 }
 
 export interface DocSettings {
+  /** @internal ECMA-376 Part 4 §14.8.3.38; the parser already applies this
+   *  setting to terminal page breaks, so it is not a renderer model option. */
+  splitPgBreakAndParaMark?: boolean;
   /** ECMA-376 Part 4 §14.8.3.15 fixed HTML automatic paragraph margins. */
   doNotUseHtmlParagraphAutoSpacing?: boolean;
   /** §17.15.1.58 `w:kinsoku` — East-Asian line-breaking toggle. `undefined`
@@ -854,6 +878,11 @@ export interface ShapeRun {
   /** ECMA-376 §20.4.2.8 — true when the shape is hosted by `<wp:inline>` and
    * therefore advances the paragraph pen like an inline drawing object. */
   inline?: boolean;
+  /** Paint offset (pt) of an inline shape from its pen position — a VML
+   * position:relative shape's left/top (ECMA-376 Part 4 §19.1.2.19). The line
+   * advance is unchanged. */
+  inlineOffsetXPt?: number;
+  inlineOffsetYPt?: number;
   widthPt: number;
   heightPt: number;
   /** X offset in pt */
@@ -897,22 +926,39 @@ export interface ShapeRun {
   behindDoc?: boolean;
   /** ECMA-376 §20.4.2.3 `wp:anchor/@relativeHeight`: lower values render first. */
   zOrder: number;
+  /** ECMA-376 Part 4 §19.1.2.18; VML shadow facts resolved by layout. */
+  vmlShadow?: {
+    kind: 'single' | 'double' | 'emboss' | 'perspective';
+    color: string;
+    color2: string;
+    offset: { xPt: number; yPt: number; xFraction: number; yFraction: number };
+    offset2: { xPt: number; yPt: number; xFraction: number; yFraction: number };
+    opacity: number;
+    obscured: boolean;
+    origin: [number, number];
+    matrix: [number, number, number, number, number, number];
+    absolutePerspective: boolean;
+  };
   /** Normalized [0,1] custom-geometry sub-paths. Empty when `presetGeometry`
-   *  is set; the renderer chooses between buildCustomPath and buildShapePath. */
+   *  is set; the renderer then uses core's preset geometry resolver. */
   subpaths: PathCmd[][];
   /** ECMA-376 §20.1.9.15 per-path `fill` mode and `stroke` flag, parallel to
    *  `subpaths`; absent when every path uses the defaults. */
   subpathPaint?: Array<{
+    fillRule?: 'nonzero' | 'evenodd';
     fill?: 'none' | 'lighten' | 'lightenLess' | 'darken' | 'darkenLess';
     stroke?: false;
   }>;
   /** OOXML <a:prstGeom prst> name (e.g. "rect", "ellipse", "rtTriangle").
-   *  When set the renderer calls core's buildShapePath with `adjValues`. */
+   *  When set the renderer resolves it through core's ECMA-376 preset engine
+   *  with `adjValues`. */
   presetGeometry?: string | null;
   /** <a:gd name="adj{n}"> values from prstGeom/avLst in adj1..adj8 order.
    *  `null` preserves omitted named guides so the preset engine can use the
    *  geometry's default for that index. */
   adjValues?: Array<number | null>;
+  /** Part 4 §§19.1.2.10/.11: image above the backing fill, below the outline. */
+  vmlPicture?: Pick<ImageRun, 'imagePath' | 'mimeType' | 'srcRect' | 'colorReplaceFrom' | 'duotone'>;
   fill: ShapeFill | null;
   stroke: string | null;
   strokeWidth?: number;
@@ -1144,6 +1190,13 @@ export type ShapeFill =
   | {
       /** ECMA-376 §20.1.8.14 picture fill on a DrawingML shape. */
       fillType: 'image';
+      /** Part 4 §19.1.2.5 VML brush placement, resolved with lazy image metadata. */
+      vml?: {
+        repeat: boolean;
+        size: [{ value: number; fraction: boolean }, { value: number; fraction: boolean }] | null;
+        origin: [number, number]; position: [number, number];
+        aspect: string; alignShape: boolean;
+      };
       imagePath: string;
       mimeType: string;
       /** Microsoft 2016 SVG original retained beside the raster fallback. */
@@ -1154,6 +1207,9 @@ export type ShapeFill =
       tile?: TileInfo;
       alpha?: number;
       duotone?: Duotone;
+      /** Ordered CT_Blip effects (§20.1.8.13) of a DrawingML blipFill; parsed
+       *  fills carry alphaModFix here rather than in {@link alpha}. */
+      blipEffects?: BlipEffect[];
     };
 
 export type ShapeStrokeFill =
@@ -1202,9 +1258,8 @@ export interface DocxTextRun {
   underline: boolean;
   /** ECMA-376 §17.3.2.40 `<w:u w:val>` — the raw ST_Underline (§17.18.99) style
    *  value (`double` / `thick` / `dotted` / `wave` / `dashLong` / …). Absent for
-   *  the plain single rule (or no underline). The renderer normalizes this
-   *  WordprocessingML vocabulary to the shared DrawingML ST_TextUnderlineType
-   *  (§20.1.10.82) that `core.drawUnderline` dispatches on. */
+   *  the plain single rule (or no underline). Layout resolves this
+   *  WordprocessingML vocabulary into retained decoration geometry. */
   underlineStyle?: string;
   /** ECMA-376 §17.3.2.40 `<w:u w:color>` — underline-only colour (hex 6, or the
    *  literal `auto`). Absent ⇒ the underline follows the glyph colour. */
@@ -1296,7 +1351,8 @@ export interface DocxTextRun {
    *  (`w:val`, 1/20 pt) plus the optional `w:id` that links consecutive runs
    *  into one region. The arbitrary-precision XSD integer id is serialized as a
    *  string; numeric synthetic inputs remain supported for layout tests and
-   *  direct model construction. An id-less run is always standalone. */
+   *  direct model construction. An id-less run has id 0
+   *  (WORD_FIT_TEXT_OMITTED_ID_LINKING). */
   fitTextVal?: number;
   fitTextId?: string | number;
   /** ECMA-376 §17.3.2.43 `<w:w w:val>` — horizontal text scale as a FRACTION of
@@ -1443,10 +1499,11 @@ export interface ImageRun {
    * luminance ramp, and caches the recoloured bitmap under a colour-suffixed key.
    */
   duotone?: Duotone;
+  /** Ordered CT_Blip pixel effects, including §20.1.8.42 picture corrections. */
+  blipEffects?: BlipEffect[];
   /**
-   * ECMA-376 §20.1.8.6 `<a:alphaModFix@amt>` opacity as 0..1. Absent ⇒ fully
-   * opaque. When present the renderer multiplies the picture's `globalAlpha` by
-   * this fraction.
+   * Legacy model-source opacity. Parsed alphaModFix is baked once by
+   * blipEffects, so parsed pictures leave this absent.
    */
   alpha?: number;
   /**
@@ -1601,7 +1658,9 @@ export interface DocTableRow {
    *  after this row's last real cell. Omitted/zero means none. */
   gridAfter?: number;
   rowHeight: number | null;  // pt
-  /** ECMA-376 §17.4.80 hRule. "auto" (default) = informational; "atLeast" =
+  /** ECMA-376 §17.4.80 hRule, "auto" when omitted. Without the parser's
+   *  acquisition facts an "auto" row with a height is taken as an omitted
+   *  hRule, a lower bound (word-omitted-row-height-rule-at-least); "atLeast" =
    *  lower bound; "exact" = fixed clip. */
   rowHeightRule: 'auto' | 'atLeast' | 'exact' | string;
   isHeader: boolean;
@@ -1674,7 +1733,7 @@ export type WorkerRequest =
       id: number;
       data: ArrayBuffer;
       resourcePolicy: NormalizedOoxmlResourcePolicy;
-      /** Application-selected model source (LoadOptions.modelSources). */
+      /** Application-selected model source (LoadOptions.legacyDoc). */
       source?: import('@silurus/ooxml-core').ModelSourceModuleDescriptor;
       sourceTransfer?: readonly Transferable[];
       sourceOwnerUrl?: string;
@@ -1754,7 +1813,7 @@ export interface DocxTextRunInfo {
   fontSize: number;
   /** CSS `font` shorthand used for canvas drawing. */
   font: string;
-  /** Uniform per-code-point pitch in CSS px for horizontal text. */
+  /** Native Canvas tracking pitch in CSS px for horizontal text. */
   letterSpacingPx?: number;
   /** CSS transform used by the overlay for vertical-page text. */
   transform?: string;

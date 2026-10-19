@@ -85,13 +85,13 @@ describe('coordinate-space', () => {
     expect(() => sectionWritingMode({ textDirection: token })).toThrow(RangeError);
   });
 
-  it('selects the counter-clockwise frame only from a native flow fact on its nominal token', () => {
+  it('selects the counter-clockwise frame only from a section flow fact on its nominal token', () => {
     expect(sectionWritingMode({ textDirection: 'btLr' })).toBe('vertical-rl');
     expect(sectionWritingMode({ textDirection: 'tbRl' })).toBe('vertical-rl');
-    expect(sectionWritingMode({ textDirection: 'btLr', nativeSectionFlow: 'bottomToTop' }))
+    expect(sectionWritingMode({ textDirection: 'btLr', sectionFlow: 'bottomToTop' }))
       .toBe('sideways-lr');
     for (const textDirection of ['lrTb', 'tbRl', 'tbLrV']) {
-      expect(() => sectionWritingMode({ textDirection, nativeSectionFlow: 'bottomToTop' }))
+      expect(() => sectionWritingMode({ textDirection, sectionFlow: 'bottomToTop' }))
         .toThrow(RangeError);
     }
   });

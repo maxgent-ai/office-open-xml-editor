@@ -12,18 +12,6 @@ export const WORD_DRAWINGML_PATTERN_PAGE_GRID = defineCompatibilityRule({
   description: 'Header, body and footer anchored DrawingML pct50 and dnDiag fills use a 64×64 image tile at 8pt, with 1pt cells on the page-origin 8pt grid. All three stories preserve page axes under 315-degree rotation; header page-sized controls do as well. Chart and VML hosts are outside this rule.',
 });
 
-export const WORD_VML_TEXTPATH_IMAGE_PATTERN_SOLID = defineCompatibilityRule({
-  id: 'word-vml-textpath-image-pattern-solid',
-  evidence: {
-    kind: 'office-observation',
-    syntheticFixtureId: 'rotated-vml-textpath-image-pattern',
-    application: 'Microsoft Word',
-    version: '16.113.2',
-    platform: 'macOS 27.0',
-  },
-  description: 'A rotated v:textpath watermark with v:fill type="pattern" and a valid image relationship exports as solid foreground ink without a PDF tiling-pattern resource. Non-textpath VML shape hosts remain unmeasured.',
-});
-
 export const WORD_CLASSIC_CHART_SPACE_FRAME = defineCompatibilityRule({
   id: 'word-classic-chart-space-frame',
   evidence: {
@@ -39,28 +27,28 @@ export const WORD_CLASSIC_CHART_SPACE_FRAME = defineCompatibilityRule({
 export const WORD_TRACK_CHANGE_AUTHOR_PALETTE = defineCompatibilityRule({
   id: 'word-track-change-author-palette',
   evidence: {
-    kind: 'regression-test',
+    kind: 'library-policy',
     reference: 'packages/docx/src/layout/compatibility.test.ts#pins the eight track-change author colors independently of author indexing',
   },
-  description: 'Use the established eight-color revision-author palette while keeping the renderer deterministic author-index policy outside this compatibility claim.',
+  description: 'Use the established eight-color revision-author palette while keeping the renderer deterministic author-index policy outside this compatibility claim. Library policy, no Office measurement: stable eight-hue author palette (PR #266); ECMA-376 §17.13 defines no revision display.',
 });
 
 export const WORD_TRACK_CHANGE_DECORATION = defineCompatibilityRule({
   id: 'word-track-change-decoration',
   evidence: {
-    kind: 'regression-test',
+    kind: 'library-policy',
     reference: 'packages/docx/src/layout/compatibility.test.ts#maps visible track-change kinds to their revision decorations',
   },
-  description: 'When revision markup is visible, underline inserted text and strike through deleted text in the selected revision-author color.',
+  description: 'When revision markup is visible, underline inserted text and strike through deleted text in the selected revision-author color. Library policy, no Office measurement: revision decoration styling; ECMA-376 §17.13 defines no display and the Word display settings are not stored in the document.',
 });
 
 export const WORD_PARAGRAPH_SHADING_BORDER_BOX = defineCompatibilityRule({
   id: 'word-paragraph-shading-border-box',
   evidence: {
-    kind: 'regression-test',
+    kind: 'library-policy',
     reference: 'packages/docx/src/layout/paragraph.test.ts#extends paragraph shading through visible border spacing',
   },
-  description: 'Extend paragraph shading through each visible paragraph-border spacing interval so the fill reaches the painted border box.',
+  description: 'Extend paragraph shading through each visible paragraph-border spacing interval so the fill reaches the painted border box. Library policy, no Office measurement: shading extent equals the border box; ECMA-376 §17.3.1.31 does not define it (32ffc42a4, test only).',
 });
 
 export const WORD_AUTO_TEXT_CONTRAST_EFFECTIVE_BACKGROUND = defineCompatibilityRule({
@@ -69,16 +57,16 @@ export const WORD_AUTO_TEXT_CONTRAST_EFFECTIVE_BACKGROUND = defineCompatibilityR
     kind: 'regression-test',
     reference: 'packages/docx/src/cell-shading-auto-contrast.test.ts#paints a color-less run white inside a near-black cell',
   },
-  description: 'Resolve automatic or never-authored text color against the nearest effective run, paragraph, or cell background before applying the deterministic contrast picker.',
+  description: 'Resolve automatic or never-authored text color against the nearest effective run, paragraph, or cell background before applying the deterministic contrast picker. Classification: normative, ECMA-376 §17.3.2.6 color auto (chosen from the background behind the run); the contrast threshold is library policy.',
 });
 
 export const WORD_RUN_DECORATION_JUSTIFIED_ADVANCE = defineCompatibilityRule({
   id: 'word-run-decoration-justified-advance',
   evidence: {
-    kind: 'regression-test',
+    kind: 'library-policy',
     reference: 'packages/docx/src/run-inline-formatting.test.ts#extends the border frame across justified inter-word slack',
   },
-  description: 'Extend run shading, borders, underline, and strike decoration through the justification pitch owned by that run, including widened spaces.',
+  description: 'Extend run shading, borders, underline, and strike decoration through the justification pitch owned by that run, including widened spaces. Library policy, no Office measurement: decorations follow the justified advance (PR #588); asserted, not measured.',
 });
 
 export const WORD_SNAP_TO_CHARS_TERMINAL_UNDERLINE = defineCompatibilityRule({
@@ -99,7 +87,7 @@ export const WORD_PARAGRAPH_BORDER_FLOW_RESERVATION = defineCompatibilityRule({
     kind: 'regression-test',
     reference: 'packages/docx/src/para-bottom-border-flow.test.ts#a bottom border drops the following paragraph by exactly space + width/2',
   },
-  description: 'Reserve a visible bottom paragraph border through its spacing interval and half stroke width so following flow begins below its painted outer edge.',
+  description: 'Reserve a visible bottom paragraph border through its spacing interval and half stroke width so following flow begins below its painted outer edge. Classification: normative, ECMA-376 §17.3.1.7 bottom border space; Word PDF of a corpus document in PR #847.',
 });
 
 export const WORD_TRACK_CHANGE_AUTHOR_COLORS = Object.freeze([
@@ -116,10 +104,10 @@ export const WORD_TRACK_CHANGE_AUTHOR_COLORS = Object.freeze([
 export const WORD_TRACK_CHANGE_BAR = defineCompatibilityRule({
   id: 'word-track-change-bar',
   evidence: {
-    kind: 'regression-test',
+    kind: 'library-policy',
     reference: 'packages/docx/src/track-changes-markup-layout.test.ts#emits one margin change bar per line containing revision text in the markup view',
   },
-  description: 'In the markup view, draw a vertical change bar in the margin beside every line that contains tracked-change content, matching the Word reviewing-pane convention (an app convention; ECMA-376 defines no bar geometry).',
+  description: 'In the markup view, draw a vertical change bar in the margin beside every line that contains tracked-change content, matching the Word reviewing-pane convention (an app convention; ECMA-376 defines no bar geometry). Library policy, no Office measurement: change-bar placement is an application convention (PR #1358); ECMA-376 §17.13 defines no display.',
 });
 
 const NO_TRACK_CHANGE_DECORATION = Object.freeze({

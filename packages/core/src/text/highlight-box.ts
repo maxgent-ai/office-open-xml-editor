@@ -7,9 +7,12 @@
  *
  * Neither ECMA-376 nor ISO/IEC 29500 fixes the box geometry — the marker's
  * vertical band is a rendering detail of Word / PowerPoint. The coefficients
- * below (top = baseline − 0.85·em, height = 1.1·em) reproduce that band and
- * are the single source of truth shared by the docx and pptx renderers; do not
- * re-derive them per package.
+ * below (top = baseline − 0.85·em, height = 1.1·em) are library policy for the
+ * pptx renderer: they date from the initial docx renderer and no Office
+ * measurement is recorded for them. The DOCX layout has since moved to the
+ * font-metric rule (the run's selected face ascent + descent, see
+ * layout/paragraph.ts highlightBounds); adopting that rule for DrawingML text
+ * would change PowerPoint rendering and needs PowerPoint controls first.
  *
  * The horizontal extent (x, width) is the glyph advance and is owned by each
  * renderer's layout, so it stays at the call site.

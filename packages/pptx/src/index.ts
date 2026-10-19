@@ -89,7 +89,11 @@ export type {
   ChartexValueColorStop,
   DrawingMLCustomDashSegment,
   Duotone,
+  BlendMode,
   BlipEffect,
+  BlipEffectContainer,
+  BlipEffectFill,
+  BlipEffectImageFill,
   EquationRun,
   LegendManualLayout,
   MathAccent,
@@ -139,7 +143,7 @@ export { autoResize, type AutoResizeOptions } from '@silurus/ooxml-core';
 // onHyperlinkClick`, `PptxTextRunInfo.hyperlink`, and the 5th arg of
 // `buildPptxTextLayer`, plus the default "open in a new tab, sanitised" helper.
 export { type HyperlinkTarget, openExternalHyperlink } from '@silurus/ooxml-core';
-// Application-supplied model sources (LoadOptions.modelSources): the
+// Application-supplied model sources (LoadOptions.legacyPpt): the
 // format-generic contract for opening input that is not an OOXML package.
 export type {
   ModelSource,
@@ -169,6 +173,7 @@ export {
   type OoxmlFormat,
   type OoxmlResourceLimit,
   type OoxmlResourceLimitErrorDetails,
+  type OoxmlUnsupportedContentDetails,
   type OoxmlResourceLimits,
   type XlsxWorksheetLimits,
   type CjkFallback,
@@ -192,6 +197,7 @@ export type {
   PptxCommentReply,
   SlideElement,
   ShapeElement,
+  EquationBranchFallback,
   PictureElement,
   // SlideElement union members — reachable via Slide.elements; exported so a
   // consumer that narrows on `el.type` has a name for every variant.

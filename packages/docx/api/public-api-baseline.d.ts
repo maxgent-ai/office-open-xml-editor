@@ -14,6 +14,7 @@ export function autoResize(render: (width: number, height: number) => void | Pro
 export interface AutoResizeOptions {
     pauseWhenHidden?: boolean;
 }
+export type BlendMode = 'darken' | 'lighten' | 'mult' | 'over' | 'screen';
 export type BlipEffect = {
     type: 'grayscale';
 } | {
@@ -32,6 +33,116 @@ export type BlipEffect = {
     contrast: number;
 } | {
     type: 'duotone';
+    clr1?: string;
+    clr2?: string;
+} | {
+    type: 'alphaBiLevel';
+    thresh: number;
+} | {
+    type: 'alphaCeiling' | 'alphaFloor';
+} | {
+    type: 'alphaInv';
+    color?: string;
+} | {
+    type: 'hsl';
+    hue: number;
+    sat: number;
+    lum: number;
+} | {
+    type: 'tint';
+    hue: number;
+    amt: number;
+} | {
+    type: 'blur';
+    radius: number;
+    grow: boolean;
+} | {
+    type: 'alphaMod';
+    container: BlipEffectContainer;
+} | {
+    type: 'container';
+    container: BlipEffectContainer;
+} | {
+    type: 'reference';
+    reference: string;
+} | {
+    type: 'definitions';
+    containers: readonly BlipEffectContainer[];
+    work: number;
+} | {
+    type: 'effectCountLimit';
+    observed: number;
+} | {
+    type: 'alphaOutset';
+    radius: number;
+} | {
+    type: 'blend';
+    container: BlipEffectContainer;
+    blend: BlendMode;
+} | {
+    type: 'fill';
+    fill: BlipEffectFill;
+} | {
+    type: 'glow';
+    glow: Glow;
+} | {
+    type: 'shadow';
+    shadow: Shadow;
+    inner: boolean;
+} | {
+    type: 'softEdge';
+    radius: number;
+} | {
+    type: 'reflection';
+    reflection: Reflection & {
+        kx?: number;
+        ky?: number;
+        algn?: Shadow['algn'];
+        fadeDir?: number;
+        rotWithShape?: boolean;
+    };
+} | {
+    type: 'transform';
+    sx: number;
+    sy: number;
+    kx: number;
+    ky: number;
+    tx: number;
+    ty: number;
+} | {
+    type: 'relativeOffset';
+    tx: number;
+    ty: number;
+} | {
+    type: 'presetShadow';
+    shadows: readonly Shadow[];
+} | {
+    type: 'fillOverlay';
+    fill: BlipEffectFill;
+    blend: BlendMode;
+} | {
+    type: 'alphaModFix';
+    amt: number;
+} | {
+    type: 'alphaRepl';
+    alpha: number;
+} | {
+    type: 'colorReplace';
+    color: string;
+} | {
+    type: 'unsupported';
+    effect: string;
+};
+export interface BlipEffectContainer {
+    readonly kind: 'sib' | 'tree';
+    readonly name?: string;
+    readonly effects: readonly BlipEffect[];
+}
+export type BlipEffectFill = SolidFill | NoFill | PatternFill | (Omit<GradientFill, 'stops'> & {
+    readonly stops: readonly GradientStop__emitterCollision1[];
+}) | BlipEffectImageFill;
+export type BlipEffectImageFill = Omit<ImageFill, 'blipEffects'> & {
+    readonly blipEffects?: readonly BlipEffect[];
 };
 export type BodyElement = ({
     type: 'paragraph';
@@ -1235,14 +1346,21 @@ export interface DocxCommentsOptions extends ViewerCommentsOptions {
     readonly markers?: boolean;
     readonly connectors?: ViewerCommentConnectorOptions;
 }
+export interface DocxDiagnostic {
+    readonly code: DocxDiagnosticCode;
+    readonly severity: 'warning' | 'error';
+    readonly source?: Readonly<DocxStorySource>;
+    readonly message: string;
+}
+export type DocxDiagnosticCode = 'FLOW_OVERLAP' | 'BOTTOM_MARGIN_INVASION' | 'FLOW_DOMAIN_INVASION' | 'INVALID_REFERENCE' | 'INVALID_GEOMETRY' | 'INVALID_VALUE' | 'MISSING_RESOURCE' | 'NON_CONVERGENCE' | 'UNSUPPORTED_FEATURE';
 export class DocxDocument {
+    get diagnostics(): readonly DocxDiagnostic[];
     static load(source: string | ArrayBuffer, opts?: LoadOptions): Promise<DocxDocument>;
     destroy(): void;
     getImage(imagePath: string, mimeType: string): Promise<Blob>;
     getFontBytes(partPath: string): Promise<Uint8Array>;
     getResourceMetrics(): Promise<OoxmlResourceMetrics>;
     toMarkdown(): Promise<string>;
-    get readingNotices(): readonly DocxReadingNotice[];
     get pageCount(): number;
     get layoutComplete(): boolean;
     waitUntilLayoutComplete(): Promise<void>;
@@ -1326,10 +1444,6 @@ export interface DocxPageCommentThreadsOptions extends CollectPageRunsOptions, R
 export interface DocxPagePoint {
     readonly xPt: number;
     readonly yPt: number;
-}
-export interface DocxReadingNotice {
-    readonly code: 'DRAWINGS_RELOCATED_FOR_READING' | 'INACTIVE_PICTURE_DATA_RETAINED' | 'WORD_BREAKING_SIMPLIFIED_FOR_READING' | 'PICTURE_BULLETS_SIZED_FOR_READING';
-    readonly message: string;
 }
 export interface DocxRunBorder {
     style: string;
@@ -1695,6 +1809,7 @@ export interface ImageRun {
     anchorYFromPara?: boolean;
     colorReplaceFrom?: string;
     duotone?: Duotone;
+    blipEffects?: BlipEffect[];
     alpha?: number;
     wrapMode?: string;
     distTop?: number;
@@ -1738,6 +1853,7 @@ export interface LineSpacing {
 }
 export interface LoadOptions extends LoadOptions__emitterCollision1 {
     allowFootnoteContinuation?: boolean;
+    legacyDoc?: ModelSource<'docx'>;
     math?: MathRenderer;
     mode?: 'main' | 'worker';
     sliceLayout?: boolean;
@@ -1752,7 +1868,6 @@ interface LoadOptions__emitterCollision1 {
     useGoogleFonts?: boolean;
     cjkFallback?: CjkFallback;
     password?: string;
-    modelSources?: readonly ModelSource[];
     wasmUrl?: string | URL;
     maxZipEntryBytes?: number;
     resourceLimits?: OoxmlResourceLimits;
@@ -1885,7 +2000,7 @@ export interface MathSvg {
     ascentEm: number;
     descentEm: number;
 }
-const MODEL_SOURCE_MODULE_PROTOCOL = 'ooxml-model-source-module/v1';
+const MODEL_SOURCE_MODULE_PROTOCOL = 'ooxml-model-source-module/v2';
 export interface ModelSource<T extends ModelSourceTarget = ModelSourceTarget> {
     readonly target: T;
     claim(bytes: Uint8Array): boolean;
@@ -1943,12 +2058,13 @@ export class OoxmlDecodedImageLimitError extends RangeError {
     readonly code: 'ooxml-decoded-image-limit';
     constructor(metric: OoxmlDecodedImageLimitMetric, limit: number, observed: number);
 }
-export type OoxmlDecodedImageLimitMetric = 'image-dimension' | 'image-pixels' | 'active-decoded-bytes' | 'image-effect-count' | 'image-effect-work';
+export type OoxmlDecodedImageLimitMetric = 'image-dimension' | 'image-pixels' | 'active-decoded-bytes' | 'image-effect-count' | 'image-effect-work' | 'tiff-lzw-work' | 'metafile-path-commands' | 'metafile-record-points' | 'metafile-record-polygons' | 'metafile-record-rectangles' | 'metafile-record-text-units';
 export class OoxmlError extends Error {
     readonly code: OoxmlErrorCode;
-    constructor(code: OoxmlErrorCode, message: string);
+    readonly details?: OoxmlUnsupportedContentDetails;
+    constructor(code: OoxmlErrorCode, message: string, details?: OoxmlUnsupportedContentDetails);
 }
-export type OoxmlErrorCode = 'encrypted' | 'invalid-password' | 'unsupported-encryption' | 'legacy-binary-format' | 'not-ooxml' | 'invalid-numbering';
+export type OoxmlErrorCode = 'encrypted' | 'invalid-password' | 'unsupported-encryption' | 'legacy-binary-format' | 'not-ooxml' | 'unsupported-image-effect' | 'invalid-numbering' | 'unsupported-content';
 export type OoxmlErrorStage = 'container' | 'decompression' | 'parsing' | 'serialization' | 'layout' | 'rendering' | 'worker';
 export type OoxmlFormat = 'docx' | 'xlsx' | 'pptx';
 export type OoxmlResourceLimit = number | null;
@@ -2020,6 +2136,10 @@ export interface OoxmlResourceViolation {
     readonly observed: number;
     readonly configurable: boolean;
     readonly usage: OoxmlResourceUsageSnapshot;
+}
+export interface OoxmlUnsupportedContentDetails {
+    readonly format: string;
+    readonly reason: 'source-subset';
 }
 export interface OpenedModelSource<TArchive> {
     readonly archive: TArchive;
@@ -2294,6 +2414,29 @@ export type ShapeFill = {
     preset: string;
 } | {
     fillType: 'image';
+    vml?: {
+        repeat: boolean;
+        size: [
+            {
+                value: number;
+                fraction: boolean;
+            },
+            {
+                value: number;
+                fraction: boolean;
+            }
+        ] | null;
+        origin: [
+            number,
+            number
+        ];
+        position: [
+            number,
+            number
+        ];
+        aspect: string;
+        alignShape: boolean;
+    };
     imagePath: string;
     mimeType: string;
     svgImagePath?: string;
@@ -2307,9 +2450,12 @@ export type ShapeFill = {
     tile?: TileInfo;
     alpha?: number;
     duotone?: Duotone;
+    blipEffects?: BlipEffect[];
 };
 export interface ShapeRun {
     inline?: boolean;
+    inlineOffsetXPt?: number;
+    inlineOffsetYPt?: number;
     widthPt: number;
     heightPt: number;
     anchorXPt: number;
@@ -2330,13 +2476,47 @@ export interface ShapeRun {
     groupHeightPt?: number | null;
     behindDoc?: boolean;
     zOrder: number;
+    vmlShadow?: {
+        kind: 'single' | 'double' | 'emboss' | 'perspective';
+        color: string;
+        color2: string;
+        offset: {
+            xPt: number;
+            yPt: number;
+            xFraction: number;
+            yFraction: number;
+        };
+        offset2: {
+            xPt: number;
+            yPt: number;
+            xFraction: number;
+            yFraction: number;
+        };
+        opacity: number;
+        obscured: boolean;
+        origin: [
+            number,
+            number
+        ];
+        matrix: [
+            number,
+            number,
+            number,
+            number,
+            number,
+            number
+        ];
+        absolutePerspective: boolean;
+    };
     subpaths: PathCmd[][];
     subpathPaint?: Array<{
+        fillRule?: 'nonzero' | 'evenodd';
         fill?: 'none' | 'lighten' | 'lightenLess' | 'darken' | 'darkenLess';
         stroke?: false;
     }>;
     presetGeometry?: string | null;
     adjValues?: Array<number | null>;
+    vmlPicture?: Pick<ImageRun, 'imagePath' | 'mimeType' | 'srcRect' | 'colorReplaceFrom' | 'duotone'>;
     fill: ShapeFill | null;
     stroke: string | null;
     strokeWidth?: number;
@@ -2372,7 +2552,6 @@ export interface ShapeRun {
     textInsetR?: number;
     textInsetB?: number;
     textVert?: string | null;
-    /** DrawingML bodyPr@upright: keep text independent of the shape rotation. */
     textUpright?: boolean | null;
     textPath?: TextPath | null;
     fillOpacity?: number | null;

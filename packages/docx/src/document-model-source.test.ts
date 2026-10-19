@@ -21,7 +21,7 @@ vi.mock('@silurus/ooxml-core', async (load) => ({
   loadOfficeFontFallbacks: async () => ({ faces: [], routes: {} }),
 }));
 
-// DocxDocument.load() with LoadOptions.modelSources, driven through the real
+// DocxDocument.load() with LoadOptions.legacyDoc, driven through the real
 // WorkerBridge against a scripted worker that speaks the parse / pull protocol.
 // View precedence is one rule for every source: explicit caller option > the
 // source's view default > the renderer default (final view).
@@ -59,7 +59,7 @@ class ProtocolWorker {
 const globals = globalThis as Record<string, unknown>;
 const originals = { Worker: globals.Worker, location: globals.location };
 const descriptor: ModelSourceModuleDescriptor = {
-  protocol: 'ooxml-model-source-module/v1',
+  protocol: 'ooxml-model-source-module/v2',
   target: 'docx',
   moduleUrl: 'https://example.test/source.mjs',
   config: { variant: 'test' },
@@ -163,7 +163,7 @@ describe('DocxDocument.load with model sources', () => {
     install(parseWorkerScript(undefined, 1, noteContinuationModel()));
     const { source, release } = fakeSource();
     const document = await DocxDocument.load(cfbBytes(), {
-      modelSources: [source], sliceLayout, allowFootnoteContinuation: true, currentDate: 0,
+      legacyDoc: source, sliceLayout, allowFootnoteContinuation: true, currentDate: 0,
     });
     try {
       expect(document.pageCount).toBeGreaterThan(1);
@@ -189,7 +189,7 @@ describe('DocxDocument.load with model sources', () => {
     install(parseWorkerScript(undefined, 1, noteContinuationBoundaryModel()));
     const { source } = fakeSource();
     const document = await DocxDocument.load(cfbBytes(), {
-      modelSources: [source], sliceLayout, currentDate: 0,
+      legacyDoc: source, sliceLayout, currentDate: 0,
       ...(option === undefined ? {} : { allowFootnoteContinuation: option }),
     });
     try {
@@ -209,7 +209,7 @@ describe('DocxDocument.load with model sources', () => {
     install(renderWorkerScript(undefined));
     const { source } = fakeSource();
     const document = await DocxDocument.load(cfbBytes(), {
-      mode: 'worker', modelSources: [source],
+      mode: 'worker', legacyDoc: source,
       ...(option === undefined ? {} : { allowFootnoteContinuation: option }),
     });
     expect(ProtocolWorker.instances[0]!.parseRequests()[0]).toMatchObject({ allowFootnoteContinuation: wire });
@@ -223,7 +223,7 @@ describe('DocxDocument.load with model sources', () => {
     install(renderWorkerScript(undefined));
     const transfer = new ArrayBuffer(4);
     const { source, beginLoad, release } = fakeSource({ transfer: [transfer] });
-    const document = await DocxDocument.load(cfbBytes(), { ...options, modelSources: [source], allowFootnoteContinuation: true });
+    const document = await DocxDocument.load(cfbBytes(), { ...options, legacyDoc: source, allowFootnoteContinuation: true });
 
     const [parse, ...others] = ProtocolWorker.instances[0]!.parseRequests();
     expect(others).toEqual([]);
@@ -240,7 +240,7 @@ describe('DocxDocument.load with model sources', () => {
   it('streams a claimed load in main mode and releases it once', async () => {
     install(parseWorkerScript(undefined));
     const { source, release } = fakeSource();
-    const document = await DocxDocument.load(cfbBytes(), { modelSources: [source] });
+    const document = await DocxDocument.load(cfbBytes(), { legacyDoc: source });
     expect(ProtocolWorker.instances[0]!.parseRequests()).toEqual([
       expect.objectContaining({ source: descriptor }),
     ]);
@@ -259,7 +259,7 @@ describe('DocxDocument.load with model sources', () => {
     let viewChanged: (() => void) | null = null;
     let progress = 0;
     const document = await DocxDocument.load(cfbBytes(), {
-      modelSources: [source],
+      legacyDoc: source,
       [docxViewerLoadSignal]: {
         signal: abort.signal,
         requestedView: () => false,
@@ -294,7 +294,7 @@ describe('DocxDocument.load with model sources', () => {
     let changed = false;
     let progress = 0;
     const document = await DocxDocument.load(cfbBytes(), {
-      modelSources: [source],
+      legacyDoc: source,
       [docxViewerLoadSignal]: {
         signal: new AbortController().signal,
         requestedView: () => requested,
@@ -334,7 +334,7 @@ describe('DocxDocument.load with model sources', () => {
     const unload = vi.spyOn(core, 'unloadOfficeFontFallbacks').mockImplementation(() => undefined);
     const abort = new AbortController();
     const loading = DocxDocument.load(cfbBytes(), {
-      modelSources: [source],
+      legacyDoc: source,
       [docxViewerLoadSignal]: {
         signal: abort.signal,
         requestedView: () => undefined,
@@ -354,7 +354,7 @@ describe('DocxDocument.load with model sources', () => {
     const failure = new Error('release failed');
     const { source, release } = fakeSource();
     release.mockImplementation(() => { throw failure; });
-    await expect(DocxDocument.load(cfbBytes(), { mode: 'worker', modelSources: [source] }))
+    await expect(DocxDocument.load(cfbBytes(), { mode: 'worker', legacyDoc: source }))
       .rejects.toBe(failure);
     expect(release).toHaveBeenCalledOnce();
     expect(ProtocolWorker.instances[0]!.terminated).toBe(true);
@@ -363,13 +363,13 @@ describe('DocxDocument.load with model sources', () => {
   it('keeps unclaimed input on the OOXML path', async () => {
     install(renderWorkerScript(true));
     const { source, claim, beginLoad } = fakeSource({ claim: () => false });
-    await expect(DocxDocument.load(cfbBytes(), { modelSources: [source] }))
+    await expect(DocxDocument.load(cfbBytes(), { legacyDoc: source }))
       .rejects.toMatchObject({ code: 'legacy-binary-format' });
     expect(claim).toHaveBeenCalledOnce();
     expect(beginLoad).not.toHaveBeenCalled();
     expect(ProtocolWorker.instances).toEqual([]);
 
-    const document = await DocxDocument.load(new ArrayBuffer(4), { mode: 'worker', modelSources: [source] });
+    const document = await DocxDocument.load(new ArrayBuffer(4), { mode: 'worker', legacyDoc: source });
     const [parse] = ProtocolWorker.instances[0]!.parseRequests();
     expect(parse).not.toHaveProperty('source');
     expect(parse).not.toHaveProperty('showTrackedChanges');
@@ -380,12 +380,12 @@ describe('DocxDocument.load with model sources', () => {
     install(renderWorkerScript(undefined));
     const failure = new Error('claim failed');
     const throwing = fakeSource({ claim: () => { throw failure; } });
-    await expect(DocxDocument.load(new ArrayBuffer(4), { modelSources: [throwing.source] }))
+    await expect(DocxDocument.load(new ArrayBuffer(4), { legacyDoc: throwing.source }))
       .rejects.toBe(failure);
     expect(throwing.beginLoad).not.toHaveBeenCalled();
 
     const mismatched = fakeSource({ target: 'xlsx' });
-    await expect(DocxDocument.load(new ArrayBuffer(4), { modelSources: [mismatched.source] }))
+    await expect(DocxDocument.load(new ArrayBuffer(4), { legacyDoc: mismatched.source }))
       .rejects.toThrow(TypeError);
     expect(mismatched.claim).not.toHaveBeenCalled();
     expect(ProtocolWorker.instances).toEqual([]);
@@ -398,7 +398,7 @@ describe('DocxDocument.load with model sources', () => {
       }
     });
     const { source, release } = fakeSource();
-    await expect(DocxDocument.load(cfbBytes(), { mode: 'worker', modelSources: [source] }))
+    await expect(DocxDocument.load(cfbBytes(), { mode: 'worker', legacyDoc: source }))
       .rejects.toThrow('source parse failed');
     expect(release).toHaveBeenCalledOnce();
     expect(ProtocolWorker.instances[0]!.parseRequests()).toHaveLength(1);
@@ -416,7 +416,7 @@ describe('DocxDocument.load with model sources', () => {
       const { source } = fakeSource();
       const document = await DocxDocument.load(cfbBytes(), {
         mode: 'worker',
-        modelSources: [source],
+        legacyDoc: source,
         ...(caller === undefined ? {} : { showTrackedChanges: caller }),
       });
       const [parse] = ProtocolWorker.instances.at(-1)!.parseRequests();
@@ -431,7 +431,7 @@ describe('DocxDocument.load with model sources', () => {
     install(renderWorkerScript(true, { partial: true }));
     const { source } = fakeSource();
     const document = await DocxDocument.load(cfbBytes(), {
-      mode: 'worker', progressiveLayout: true, modelSources: [source],
+      mode: 'worker', progressiveLayout: true, legacyDoc: source,
     });
     expect(activeDocxLayoutViewOf(document).showTrackedChanges).toBe(true);
     document.destroy();
@@ -439,126 +439,15 @@ describe('DocxDocument.load with model sources', () => {
 
   it('applies the source view default in main mode only when the caller did not choose', async () => {
     install(parseWorkerScript({ showTrackedChanges: true }));
-    const followed = await DocxDocument.load(cfbBytes(), { modelSources: [fakeSource().source] });
+    const followed = await DocxDocument.load(cfbBytes(), { legacyDoc: fakeSource().source });
     expect(activeDocxLayoutViewOf(followed).showTrackedChanges).toBe(true);
     followed.destroy();
 
     install(parseWorkerScript({ showTrackedChanges: true }));
     const explicit = await DocxDocument.load(cfbBytes(), {
-      showTrackedChanges: false, modelSources: [fakeSource().source],
+      showTrackedChanges: false, legacyDoc: fakeSource().source,
     });
     expect(activeDocxLayoutViewOf(explicit).showTrackedChanges).toBe(false);
     explicit.destroy();
   });
-});
-
-
-it('delivers requested progressive completion after native model-source full layout', async () => {
-  const observations: Array<{ native: boolean; progressive: boolean; callbacks: unknown[] }> = [];
-  // Use the existing real load/pull/acquisition/layout fixture, not a stubbed
-  // load, native predicate or completion emitter. Each cursor consumes its
-  // input, so every case owns a fresh model and selected source.
-  for (const [native, progressive] of [[false, true], [true, false], [true, true]] as const) {
-    const input = syntheticDocxModel('plain', { paragraphs: 1, wordsPerParagraph: 1 });
-    const paragraph = input.body[0];
-    if (paragraph.type !== 'paragraph' || paragraph.runs[0]?.type !== 'text') {
-      throw new Error('Public synthetic text paragraph absent');
-    }
-    paragraph.runs[0].text = 'A';
-    // Published valid wire-sidecar from native-reading-word-breaking.test.ts.
-    if (native) Object.assign(paragraph.runs[0], {
-      __nativeReadingWordBreaking: { rawHres: 0, rawChHres: 1 },
-    });
-    install(parseWorkerScript(undefined, 1, input));
-    const { source, claim, beginLoad, release } = fakeSource();
-    const callbacks: unknown[] = [];
-    const document = await DocxDocument.load(cfbBytes(), {
-      mode: 'main', modelSources: [source], currentDate: 0, progressiveLayout: progressive,
-      onLayoutComplete(error) { callbacks.push(error); },
-    });
-    try {
-      await document.waitUntilLayoutComplete();
-      // Admission and native ownership are observed before callback assertions:
-      // losing the sidecar or failing setup cannot manufacture a causal RED.
-      expect(claim).toHaveBeenCalled(); expect(beginLoad).toHaveBeenCalledTimes(1);
-      expect(document.pageCount).toBeGreaterThan(0); expect(document.layoutComplete).toBe(true);
-      expect(document.readingNotices.map(notice => notice.code)).toEqual(native
-        ? ['WORD_BREAKING_SIMPLIFIED_FOR_READING'] : []);
-      expect(release).toHaveBeenCalledTimes(1);
-      observations.push({ native, progressive, callbacks });
-    } finally { document.destroy(); }
-  }
-  expect(observations[0].callbacks).toEqual([undefined]);
-  expect(observations[1].callbacks).toEqual([]);
-  expect(observations[2].callbacks).toEqual([undefined]);
-});
-
-it('does not notify native progressive completion after a viewer abort during telemetry', async () => {
-  const input = syntheticDocxModel('plain', { paragraphs: 1, wordsPerParagraph: 1 });
-  const paragraph = input.body[0];
-  if (paragraph.type !== 'paragraph' || paragraph.runs[0]?.type !== 'text') {
-    throw new Error('Public synthetic text paragraph absent');
-  }
-  paragraph.runs[0].text = 'A';
-  Object.assign(paragraph.runs[0], {
-    __nativeReadingWordBreaking: { rawHres: 0, rawChHres: 1 },
-  });
-  const script = parseWorkerScript(undefined, 1, input);
-  let entered!: () => void;
-  const telemetryStarted = new Promise<void>(resolve => { entered = resolve; });
-  install(async (worker, message) => {
-    // Hold only the real telemetry reply after canonical layout. No loader,
-    // native predicate or completion event is replaced.
-    if (message.type === 'resourceUsage') { entered(); return; }
-    await script(worker, message);
-  });
-  const abort = new AbortController();
-  const { source, release } = fakeSource();
-  const callbacks: unknown[] = [];
-  const loading = DocxDocument.load(cfbBytes(), {
-    mode: 'main', modelSources: [source], currentDate: 0, progressiveLayout: true,
-    onLayoutComplete(error) { callbacks.push(error); },
-    [docxViewerLoadSignal]: {
-      signal: abort.signal,
-      requestedView: () => undefined,
-      subscribeViewChange: () => () => undefined,
-    },
-  } as LoadOptions);
-  await telemetryStarted;
-  abort.abort();
-  await expect(loading).rejects.toBeInstanceOf(PaginationAbortError);
-  expect(callbacks).toEqual([]);
-  expect(release).toHaveBeenCalledOnce();
-  expect(ProtocolWorker.instances.at(-1)!.terminated).toBe(true);
-});
-
-it('does not notify native progressive completion when source release aborts the viewer', async () => {
-  const input = syntheticDocxModel('plain', { paragraphs: 1, wordsPerParagraph: 1 });
-  const paragraph = input.body[0];
-  if (paragraph.type !== 'paragraph' || paragraph.runs[0]?.type !== 'text') {
-    throw new Error('Public synthetic text paragraph absent');
-  }
-  paragraph.runs[0].text = 'A';
-  Object.assign(paragraph.runs[0], {
-    __nativeReadingWordBreaking: { rawHres: 0, rawChHres: 1 },
-  });
-  install(parseWorkerScript(undefined, 1, input));
-  const abort = new AbortController();
-  const { source, release } = fakeSource();
-  // A caller-owned release can synchronously cancel its viewer. Exercise that
-  // public hook, without replacing the loader or completion emitter.
-  release.mockImplementation(() => { abort.abort(); });
-  const callbacks: unknown[] = [];
-  await expect(DocxDocument.load(cfbBytes(), {
-    mode: 'main', modelSources: [source], currentDate: 0, progressiveLayout: true,
-    onLayoutComplete(error) { callbacks.push(error); },
-    [docxViewerLoadSignal]: {
-      signal: abort.signal,
-      requestedView: () => undefined,
-      subscribeViewChange: () => () => undefined,
-    },
-  } as LoadOptions)).rejects.toBeInstanceOf(PaginationAbortError);
-  expect(release).toHaveBeenCalledOnce();
-  expect(ProtocolWorker.instances.at(-1)!.terminated).toBe(true);
-  expect(callbacks).toEqual([]);
 });

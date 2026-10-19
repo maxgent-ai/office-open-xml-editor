@@ -203,6 +203,10 @@ export interface GapTransaction {
 export function createLineBreakerState(maxWidth: number, wrapCtx?: WrapLayoutCtx) {
   return {
     lines: [] as LayoutLine[],
+    /** First-line body indent once a float moved a numbered first line's
+     * leading edge (WrapLayoutCtx.numberingFirstLine); else the pass input. */
+    firstIndentOverride: undefined as number | undefined,
+    numberingFirstLine: undefined as LayoutLine['numberingFirstLine'],
     currentLine: [] as (LayoutTextSeg | LayoutImageSeg | LayoutMathSeg | LayoutTabSeg)[],
     currentWidth: 0,
     justifiedGapModel: undefined as LineGapModel | undefined,
@@ -241,6 +245,9 @@ export function createLineBreakerState(maxWidth: number, wrapCtx?: WrapLayoutCtx
     lineVisibleDescent: 0,
     lineVisibleIntendedSingle: 0,
     lineHasVisibleMetrics: false,
+    /** Picture-bullet marker metric admitted to the current line (pt, px). */
+    lineMarkerHeight: 0,
+    lineMarkerAscent: 0,
     isFirst: true,
     lineMaxWidth: maxWidth,
     lineXOffset: 0,

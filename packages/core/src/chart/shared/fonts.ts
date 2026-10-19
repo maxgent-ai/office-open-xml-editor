@@ -14,6 +14,21 @@ import type { ChartModel } from '../../types/chart';
 // sans-serif rather than a serif default.
 export type ChartFontRole = 'major' | 'minor';
 
+/** Fallback families appended after a resolved chart face.
+ *
+ *  Library policy, not a spec rule: ECMA-376 names the face (element
+ *  `<a:latin>` or the theme font scheme, §20.1.4.1.16/§20.1.4.2) but leaves
+ *  the substitute for an unavailable face to the consumer. Calibri is the body
+ *  face of the Office 2007–2019 default theme and Arial a widely installed
+ *  metric-neutral sans-serif, so a missing face degrades to a sans-serif rather
+ *  than the platform's serif default. No Office measurement backs the order. */
+export const CHART_FALLBACK_FONT_STACK = 'Calibri, Arial, sans-serif';
+
+/** CSS family list for a resolved chart face plus {@link CHART_FALLBACK_FONT_STACK}. */
+export function chartFaceWithFallback(face: string): string {
+  return `"${face}", ${CHART_FALLBACK_FONT_STACK}`;
+}
+
 
 /** Resolve a DrawingML theme font-scheme reference (`+mj-lt` / `+mn-lt` etc.,
  *  ECMA-376 §20.1.4.1.16) to the concrete theme face. `+mj-*` = heading
@@ -35,7 +50,7 @@ export function chartFontFamily(
 ): string {
   const themeFace = role === 'major' ? chart.themeMajorFontLatin : chart.themeMinorFontLatin;
   const face = resolveThemeFontRef(chart, elementFace) ?? themeFace;
-  return face ? `"${face}", Calibri, Arial, sans-serif` : 'sans-serif';
+  return face ? chartFaceWithFallback(face) : 'sans-serif';
 }
 
 

@@ -16,7 +16,8 @@ describe('Node facade ownership boundary', () => {
       expect(facade).not.toMatch(/new\s+\w*Archive\s*\(/);
 
       const acquisition = source(`../../${format}/src/internal/node-acquisition.ts`);
-      expect(acquisition).toContain('WasmRuntimeGenerationHost');
+      // The format package owns its realm runtime host (core's singleton factory).
+      expect(acquisition).toContain('wasmRuntimeSingleton');
       expect(acquisition).toContain('OoxmlResourceMetricsSession');
     });
   }

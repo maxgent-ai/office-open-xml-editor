@@ -22,6 +22,10 @@
  * content never selects, extends or rewrites a module URL or its config.
  */
 
+import { throwIfAborted } from '../internal/abort.js';
+
+const ABORT_MESSAGE = 'model source load was aborted';
+
 export type ModelSourceTarget = 'docx' | 'xlsx' | 'pptx';
 
 /** Scalar configuration passed verbatim to a source module. */
@@ -29,7 +33,7 @@ export type ModelSourceConfigValue = string | number | boolean | null;
 
 export type ModelSourceConfig = Readonly<Record<string, ModelSourceConfigValue>>;
 
-export const MODEL_SOURCE_MODULE_PROTOCOL = 'ooxml-model-source-module/v1';
+export const MODEL_SOURCE_MODULE_PROTOCOL = 'ooxml-model-source-module/v2';
 
 /** Structured-clone-safe instructions for loading one source module. */
 export interface ModelSourceModuleDescriptor {
@@ -79,7 +83,15 @@ export interface OpenedModelSource<TArchive> {
   close(): void;
 }
 
-/** Owning-realm half of a model source: the export `moduleUrl` must provide. */
+/** v2 rejection signal: open or a synchronous archive method may throw a string
+ * `MODEL_SOURCE_UNSUPPORTED:{"format":"source-id","reason":"source-subset"}`.
+ * The viewer validates and reconstructs it as OoxmlError('unsupported-content').
+ * Sources must never use it for quotas, encryption, traps, transport or misuse.
+ * Sources unable to decrypt input may instead throw
+ * `OOXML_SOURCE_UNSUPPORTED_ENCRYPTION` (unsupported-encryption).
+ * Error objects carrying these exact messages are also accepted.
+ *
+ * Owning-realm half of a model source: the export `moduleUrl` must provide. */
 export interface ModelSourceModule<TArchive = unknown> {
   openModelSource(
     bytes: Uint8Array,
@@ -112,9 +124,9 @@ export function selectModelSource<T extends ModelSourceTarget>(
   bytes: Uint8Array,
 ): ModelSource<T> | undefined {
   if (sources === undefined) return undefined;
-  if (!Array.isArray(sources)) throw new TypeError('modelSources must be an array');
+  if (!Array.isArray(sources)) throw new TypeError('model sources must be an array');
   if (sources.length > MAX_MODEL_SOURCES) {
-    throw new RangeError(`modelSources accepts at most ${MAX_MODEL_SOURCES} sources`);
+    throw new RangeError(`model source selection accepts at most ${MAX_MODEL_SOURCES} sources`);
   }
   for (const source of sources as readonly unknown[]) {
     if (typeof source !== 'object' || source === null) {
@@ -199,6 +211,47 @@ export function beginModelSourceLoad(
     try { releaseOnce(); } catch {}
     throw error;
   }
+}
+
+/** How {@link modelSourceWorker} rewrites one format's worker protocol. */
+export interface ModelSourceWorkerOptions {
+  /** The format worker protocol's message discriminator field. */
+  readonly discriminator: 'type' | 'kind';
+  readonly load: AdmittedModelSourceLoad;
+  /** The selected-source `parse` message that replaces the ordinary one. */
+  parseMessage(wire: Record<string, unknown>): unknown;
+  /** Format-owned member overrides (for example message listeners). An
+   *  `undefined` result falls through to the worker's own member. */
+  member?(target: Worker, key: string | symbol): unknown;
+}
+
+/**
+ * Decorate only the selected-source worker; the ordinary bridge stays
+ * unchanged. The source owner initializes itself, so `init` is dropped, and
+ * `parse` is replaced by the format's source parse message, transferring the
+ * load's transferables after the caller's.
+ */
+export function modelSourceWorker(worker: Worker, options: ModelSourceWorkerOptions): Worker {
+  return new Proxy(worker, {
+    get(target, key) {
+      if (key === 'postMessage') return (message: unknown, transfer?: Transferable[]) => {
+        if (typeof message === 'object' && message !== null) {
+          const wire = message as Record<string, unknown>;
+          const kind = wire[options.discriminator];
+          if (kind === 'init') return;
+          if (kind === 'parse') {
+            target.postMessage(options.parseMessage(wire), [...(transfer ?? []), ...options.load.transfer]);
+            return;
+          }
+        }
+        target.postMessage(message, transfer ?? []);
+      };
+      const member = options.member?.(target, key);
+      if (member !== undefined) return member;
+      const value = Reflect.get(target, key, target);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
 }
 
 /**
@@ -327,7 +380,7 @@ export async function openModelSourceModule<TArchive>(
   transfer: readonly Transferable[] = [],
 ): Promise<OpenedModelSourceModule<TArchive>> {
   const sourceModule = validateModelSourceModuleDescriptor(descriptor);
-  throwIfAborted(signal);
+  throwIfAborted(signal, ABORT_MESSAGE);
   const namespace: unknown = await import(/* @vite-ignore */ sourceModule.moduleUrl);
   const open = typeof namespace === 'object' && namespace !== null
     ? (namespace as Partial<ModelSourceModule>).openModelSource
@@ -335,7 +388,7 @@ export async function openModelSourceModule<TArchive>(
   if (typeof open !== 'function') {
     throw new TypeError('model source module must export openModelSource()');
   }
-  throwIfAborted(signal);
+  throwIfAborted(signal, ABORT_MESSAGE);
   const opened: unknown = await open(bytes, sourceModule.config, signal, transfer);
   if (typeof opened !== 'object' || opened === null) {
     throw new TypeError('openModelSource() must return an object');
@@ -354,7 +407,7 @@ export async function openModelSourceModule<TArchive>(
   try {
     const archive = validateArchive(record.archive);
     const viewDefaults = validateViewDefaults(record.viewDefaults);
-    throwIfAborted(signal);
+    throwIfAborted(signal, ABORT_MESSAGE);
     return Object.freeze({ archive, viewDefaults, close: closeOnce });
   } catch (error) {
     try { closeOnce(); } catch {}
@@ -423,11 +476,4 @@ function isPlainRecord(value: unknown): value is object {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
   const prototype: unknown = Object.getPrototypeOf(value);
   return prototype === Object.prototype || prototype === null;
-}
-
-function throwIfAborted(signal: AbortSignal | undefined): void {
-  if (!signal?.aborted) return;
-  const error = new Error('model source load was aborted');
-  error.name = 'AbortError';
-  throw error;
 }

@@ -1,4 +1,5 @@
 import type { FramePr } from '../types.js';
+import { ownValue } from '@silurus/ooxml-core/internal/own-key';
 import { defineCompatibilityRule } from './compatibility.js';
 import { stableFingerprint } from './fingerprint.js';
 import type { ParagraphLayoutSource, ParagraphAcquisitionInput } from './text.js';
@@ -14,7 +15,7 @@ export const WORD_CELL_OWNED_GRID_FRAME = defineCompatibilityRule({
     version: '16.113.3',
     platform: 'macOS 27.0',
   },
-  description: 'Native DOC import controls move six homogeneous fixed-layout horizontal LTR nested grids, including their borders and fills, together for left/center/right/absolute horizontal placement and nonzero text-relative vertical offsets. The producer elects only a first host-cell block at depth two, with every physical cell paragraph agreeing with its first-cell frame before continuation payloads are discarded, and no nondefault TAP positioning. Unpositioned anchors and no-wrap are admission counterexamples; mixed frames, later insertion, recursive child content, AutoFit, bidi and rotated cells retain residual diagnostics. The frame uses margin/text anchors, around wrap and automatic dimensions. [MS-DOC] 2.4.3 establishes row identity and 2.6.2 supplies the coordinates; neither establishes a universal nested-grid placement or AUTO-width rule. In the observed equal host bands, different fixed grid widths have the same aligned displacement, consistent with host content width as the alignment frame. Retain fixed grid ink unchanged, including overhang. Reusing that band for exclusion is a bounded library policy: varied host widths and general wrapping are unproved. Original and vertical-offset controls additionally distinguish the initial, top-aligned empty carrier from a carrier containing authored whitespace: only the former keeps its paragraph-relative wrapNone drawing at its pre-grid-admission insertion reference. Table and text flow still clear the complete grid frame. Other references, collision-constrained drawings, continuations and nonempty carriers retain actual flow ownership. The following paragraph selects the page and wrap acquisition, but its before-spacing does not replace the cell insertion cursor as the vertical frame origin.',
+  description: 'Word controls (synthetic binary Word documents opened in Word) move six homogeneous fixed-layout horizontal LTR nested grids, including their borders and fills, together for left/center/right/absolute horizontal placement and nonzero text-relative vertical offsets. A producer supplies `cellFrame` only for a first host-cell block at depth two, with every physical cell paragraph agreeing with its first-cell frame, and no table-level positioning. Unpositioned anchors and no-wrap are admission counterexamples; mixed frames, later insertion, recursive child content, AutoFit, bidi and rotated cells retain residual diagnostics. The frame uses margin/text anchors, around wrap and automatic dimensions. The source format establishes row identity and frame coordinates, not a universal nested-grid placement or AUTO-width rule. In the observed equal host bands, different fixed grid widths have the same aligned displacement, consistent with host content width as the alignment frame. Retain fixed grid ink unchanged, including overhang. Reusing that band for exclusion is a bounded library policy: varied host widths and general wrapping are unproved. Original and vertical-offset controls additionally distinguish the initial, top-aligned empty carrier from a carrier containing authored whitespace: only the former keeps its paragraph-relative wrapNone drawing at its pre-grid-admission insertion reference. Table and text flow still clear the complete grid frame. Other references, collision-constrained drawings, continuations and nonempty carriers retain actual flow ownership. The following paragraph selects the page and wrap acquisition, but its before-spacing does not replace the cell insertion cursor as the vertical frame origin.',
 });
 
 export function cellOwnedGridFramePosition(frame: Readonly<FramePr>): FloatingTablePositionInput {
@@ -98,7 +99,7 @@ export const WORD_AUTOFIT_OUTER_CELL_MARGIN_BAND = defineCompatibilityRule({
     version: '16.113.2',
     platform: 'macOS 27.0',
   },
-  description: 'For top-level ordinary AutoFit tables, Word permits a saved grid to extend beyond the text band by the resolved outer cell margins. Two-cell controls with 0, 2.7, and 5.4pt margins, dxa 250/300pt and auto cell widths, short/long text, and noWrap on/off establish that allowance. A Word-produced table with 5.4pt margins but a saved grid exactly at the text band retains that narrower grid on current Word PDF export. A nested table with saved grid overhang retains its containing-cell width rather than receiving the page-table allowance. Auto-width tables are now governed by WORD_AUTOFIT_LEADING_INDENT_BAND (compatibility-mode dependent); for a preferred-width table only a top-level outer-margin overhang already present in tblGrid increases the physical ceiling. Skipped outer grid tracks, leading-margin placement, vertical text, and floating tables remain outside this observation.',
+  description: 'For top-level ordinary AutoFit tables, Word permits a saved grid to extend beyond the text band by the resolved outer cell margins. Two-cell controls with 0, 2.7, and 5.4pt margins, dxa 250/300pt and auto cell widths, short/long text, and noWrap on/off establish that allowance. A Word-produced table with 5.4pt margins but a saved grid exactly at the text band retains that narrower grid on current Word PDF export. A nested table with saved grid overhang retains its containing-cell width rather than receiving the page-table allowance. Auto-width tables are now governed by WORD_AUTOFIT_LEADING_INDENT_BAND (compatibility-mode dependent); for a preferred-width table only a top-level outer-margin overhang already present in tblGrid increases the physical ceiling. Skipped outer grid tracks, leading-margin placement, vertical text, and floating tables remain outside this observation. Windows Word 16.0 build 16.0.20430 retest is consistent within the tested subset; see the officeObservations entry for this rule in scripts/docx-compatibility-microsoft-evidence.json for values and evidence limits.',
 });
 
 export const WORD_AUTOFIT_LEADING_INDENT_BAND = defineCompatibilityRule({
@@ -110,7 +111,7 @@ export const WORD_AUTOFIT_LEADING_INDENT_BAND = defineCompatibilityRule({
     version: '16.113.2',
     platform: 'macOS 27.0',
   },
-  description: 'For top-level left-justified auto-width AutoFit tables, the measured ceiling is text band - tblInd + outer cell margins in mode 14 (and with the mode omitted), and text band - tblInd in mode 15. The physical page is not a ceiling. Other explicit compatibility modes retain the established solver contract because they are unmeasured. The original controls cover a 468pt page, 0/18pt side margins, 5.4pt outer cell margins, indents of +5.4/+36/-36pt, wide and band-minus-indent grids, and noWrap on/off. Eight additional wrapping controls reverse the content distribution, vary an omitted first tcW versus a 100.55pt dxa first tcW, and vary grid totals of 426.6/432pt on a 432pt band with +5.4pt indent. Neither that cell preference nor the grid-total equality changes the resulting column starts or line partitions within a mode. The second cell remains auto throughout. An all-dxa multirow mode-15 table also agrees with this ceiling: Word PDF cell clipping bounds constrain its width to approximately 482pt, and the fitted 481.9pt width reproduces both inspected two-line paragraphs with the same Calibri face. Substituting a different face can move those line boundaries; retaining the old wider table would hide that font dependency. Four centered/right controls at that same positive indent and band-minus-indent grid match a 437.4pt mode-14 ceiling and a full-band 432pt mode-15 ceiling. In mode 14 those four controls cannot distinguish band-minus-indent-plus-margins from saved-grid-plus-margins. Other nonleading alignment/grid/indent combinations remain unverified and retain their established solver contract; the new nonleading ceiling is gated to grid-plus-indent equaling the band, where both mode-14 hypotheses agree. These borderless PDFs establish column starts and line partitions. Their integer-point clipping rectangles bound cell/table extents but do not establish an exact trailing table edge. Absolute leading-origin differences remain separate from width fitting. Floating, nested, vertical-text and preferred-table-width tables are outside this rule.',
+  description: 'For top-level left-justified auto-width AutoFit tables, the measured ceiling is text band - tblInd + outer cell margins in mode 14 (and with the mode omitted), and text band - tblInd in mode 15. The physical page is not a ceiling. Other explicit compatibility modes retain the established solver contract because they are unmeasured. The original controls cover a 468pt page, 0/18pt side margins, 5.4pt outer cell margins, indents of +5.4/+36/-36pt, wide and band-minus-indent grids, and noWrap on/off. Eight additional wrapping controls reverse the content distribution, vary an omitted first tcW versus a 100.55pt dxa first tcW, and vary grid totals of 426.6/432pt on a 432pt band with +5.4pt indent. Neither that cell preference nor the grid-total equality changes the resulting column starts or line partitions within a mode. The second cell remains auto throughout. An all-dxa multirow mode-15 table also agrees with this ceiling: Word PDF cell clipping bounds constrain its width to approximately 482pt, and the fitted 481.9pt width reproduces both inspected two-line paragraphs with the same Calibri face. Substituting a different face can move those line boundaries; retaining the old wider table would hide that font dependency. Four centered/right controls at that same positive indent and band-minus-indent grid match a 437.4pt mode-14 ceiling and a full-band 432pt mode-15 ceiling. In mode 14 those four controls cannot distinguish band-minus-indent-plus-margins from saved-grid-plus-margins. Other nonleading alignment/grid/indent combinations remain unverified and retain their established solver contract; the new nonleading ceiling is gated to grid-plus-indent equaling the band, where both mode-14 hypotheses agree. These borderless PDFs establish column starts and line partitions. Their integer-point clipping rectangles bound cell/table extents but do not establish an exact trailing table edge. Absolute leading-origin differences remain separate from width fitting. Floating, nested, vertical-text and preferred-table-width tables are outside this rule. Windows Word 16.0 build 16.0.20430 retest is consistent within the tested subset; see the officeObservations entry for this rule in scripts/docx-compatibility-microsoft-evidence.json for values and evidence limits.',
 });
 
 export const WORD_AUTOFIT_CONTENT_COLUMN_GROWTH = defineCompatibilityRule({
@@ -122,7 +123,7 @@ export const WORD_AUTOFIT_CONTENT_COLUMN_GROWTH = defineCompatibilityRule({
     version: '16.113.2',
     platform: 'macOS 27.0',
   },
-  description: 'In the measured top-level auto-width AutoFit tables, a column without preferred cells grows beyond its initial tblGrid toward maximum content width, up to the occurrence ceiling. Two unpreferred tracks also release saved width beyond a short column maximum. Twelve simultaneous-growth controls in modes 14/15 start at 25/25pt and use breakable ii tokens in ratios 3:2, 1:1 and 5:1, with totals of 30 (nonbinding) and 90 (binding). Nonbinding columns reach their content maxima. Binding column widths match min_i + fraction * (max_i - min_i), where fraction = (ceiling - sum(min)) / sum(max - min), capped at 1. The unequal cases distinguish this from sharing deficits over saved widths, sharing absolute maxima, equal room and sequential growth. Intrinsic maxima must be unbounded by the text band. First-column differences are at most 0.228pt and both cells have identical Word line partitions. Only two nonspanning, wholly unpreferred tracks establish simultaneous sharing; larger grids, spans, and mixed preferred/unpreferred simultaneous growth retain the previous solver result. This is a measured content-interval rule, not an empirical scale factor or an observation of arbitrary multi-column growth.',
+  description: 'In the measured top-level auto-width AutoFit tables, a column without preferred cells grows beyond its initial tblGrid toward maximum content width, up to the occurrence ceiling. Two unpreferred tracks also release saved width beyond a short column maximum. Twelve simultaneous-growth controls in modes 14/15 start at 25/25pt and use breakable ii tokens in ratios 3:2, 1:1 and 5:1, with totals of 30 (nonbinding) and 90 (binding). Nonbinding columns reach their content maxima. Binding column widths match min_i + fraction * (max_i - min_i), where fraction = (ceiling - sum(min)) / sum(max - min), capped at 1. The unequal cases distinguish this from sharing deficits over saved widths, sharing absolute maxima, equal room and sequential growth. Intrinsic maxima must be unbounded by the text band. First-column differences are at most 0.228pt and both cells have identical Word line partitions. Only two nonspanning, wholly unpreferred tracks establish simultaneous sharing; larger grids, spans, and mixed preferred/unpreferred simultaneous growth retain the previous solver result. This is a measured content-interval rule, not an empirical scale factor or an observation of arbitrary multi-column growth. Windows Word 16.0 build 16.0.20430 retest is consistent within the tested subset; see the officeObservations entry for this rule in scripts/docx-compatibility-microsoft-evidence.json for values and evidence limits.',
 });
 
 export const WORD_AUTOFIT_NOWRAP_AUTO_FORCED_FIT = defineCompatibilityRule({
@@ -134,7 +135,7 @@ export const WORD_AUTOFIT_NOWRAP_AUTO_FORCED_FIT = defineCompatibilityRule({
     version: '16.113.2',
     platform: 'macOS 27.0',
   },
-  description: 'When a two-cell AutoFit table has one auto-width noWrap cell whose unbroken minimum alone exceeds the text band, Word scales the content-only widths to that band. It assigns the extra outer-margin width to each cell in proportion to the other cell content width. The observed matrix varies the ordinary cell text width from 5 to 85pt, outer margins from 0 to 5.4pt, and which side owns noWrap. Short noWrap text that fits the band is a counterexample and retains ordinary proportional fitting. More than two cells and spans are outside this compatibility claim.',
+  description: 'When a two-cell AutoFit table has one auto-width noWrap cell whose unbroken minimum alone exceeds the text band, Word scales the content-only widths to that band. It assigns the extra outer-margin width to each cell in proportion to the other cell content width. The observed matrix varies the ordinary cell text width from 5 to 85pt, outer margins from 0 to 5.4pt, and which side owns noWrap. Short noWrap text that fits the band is a counterexample and retains ordinary proportional fitting. More than two cells and spans are outside this compatibility claim. Windows Word 16.0 build 16.0.20430 retest is consistent within the tested subset; see the officeObservations entry for this rule in scripts/docx-compatibility-microsoft-evidence.json for values and evidence limits.',
 });
 
 export function wordAutofitEmptyParagraphHasNoIntrinsicContent(
@@ -174,14 +175,14 @@ export const WORD_TABLE_ORIGIN_COMPATIBILITY = defineCompatibilityRule({
   id: 'word-table-origin-compatibility',
   evidence: { kind: 'office-observation', syntheticFixtureId: 'table-origin-compatibility-and-occupied-grid',
     application: 'Microsoft Word', version: '16.113.2', platform: 'macOS 27.0' },
-  description: '528 ordinary-table controls cover modes 11/12/14/15, LTR/RTL, leading/center/end, omitted/zero/positive/negative indentation, explicit zero/asymmetric cell margins, cell overrides, first-row exceptions, fixed/AutoFit, nested contents, borderless and full-band tables. For top-level body tables with positive dxa cell preferences, explicit legacy horizontal margins and zero spacing (fixed auto/dxa table width or AutoFit dxa table width), modes 11/12/14 hang the first cell left margin: leading placement only with authored indentation and anchored to the first row, end placement per row. Center and end ignore indentation in both placement and width fitting, as ECMA-376 §17.4.50 specifies (contrary to MS-OI29500 §2.1.155). Mode 15 removes the margin hang. Border rasterization is separate from nominal grid geometry. Spaced tables and wholly omitted horizontal margins remain unresolved and retain the previous origin and content-inset behavior; Nested table origins, logical start/end margin spellings, and other compatibility modes are outside the measured scope.',
+  description: '528 ordinary-table controls cover modes 11/12/14/15, LTR/RTL, leading/center/end, omitted/zero/positive/negative indentation, explicit zero/asymmetric cell margins, cell overrides, first-row exceptions, fixed/AutoFit, nested contents, borderless and full-band tables. For top-level body tables with positive dxa cell preferences, explicit legacy horizontal margins and zero spacing (fixed auto/dxa table width or AutoFit dxa table width), modes 11/12/14 hang the first cell left margin: leading placement only with authored indentation and anchored to the first row, end placement per row. Center and end ignore indentation in both placement and width fitting, as ECMA-376 §17.4.50 specifies (contrary to MS-OI29500 §2.1.155). Mode 15 removes the margin hang. Border rasterization is separate from nominal grid geometry. Spaced tables and wholly omitted horizontal margins remain unresolved and retain the previous origin and content-inset behavior; Nested table origins, logical start/end margin spellings, and other compatibility modes are outside the measured scope. Windows Word 16.0 build 16.0.20430 retest is consistent within the tested subset; see the officeObservations entry for this rule in scripts/docx-compatibility-microsoft-evidence.json for values and evidence limits.',
 });
 
 export const WORD_FIXED_UNUSED_LEADING_GRID = defineCompatibilityRule({
   id: 'word-fixed-unused-leading-grid',
   evidence: { kind: 'office-observation', syntheticFixtureId: 'table-origin-compatibility-and-occupied-grid',
     application: 'Microsoft Word', version: '16.113.2', platform: 'macOS 27.0' },
-  description: 'The original fixed gridBefore controls in modes 11/12/14/15 and 48 follow-ups in modes 14/15 show that a leading track skipped by every row has zero layout width. Fixed auto table width retains the occupied 108/180pt tracks; dxa 324pt scales them to 121.5/202.5pt. A preceding row occupying the 36pt track preserves it and ordinary skipped-row placement. wBefore of 0/18/36pt has no effect in either class. This refines ECMA-376 §§17.4.15 and 17.18.87 only for top-level body nonspaced fixed tables with auto/dxa table width and positive dxa cell preferences; nested and nonbody stories, percentage table width, AutoFit, trailing skips, spans, and nonpositive or missing cell preferences remain outside the observation.',
+  description: 'The original fixed gridBefore controls in modes 11/12/14/15 and 48 follow-ups in modes 14/15 show that a leading track skipped by every row has zero layout width. Fixed auto table width retains the occupied 108/180pt tracks; dxa 324pt scales them to 121.5/202.5pt. A preceding row occupying the 36pt track preserves it and ordinary skipped-row placement. wBefore of 0/18/36pt has no effect in either class. This refines ECMA-376 §§17.4.15 and 17.18.87 only for top-level body nonspaced fixed tables with auto/dxa table width and positive dxa cell preferences; nested and nonbody stories, percentage table width, AutoFit, trailing skips, spans, and nonpositive or missing cell preferences remain outside the observation. Windows Word 16.0 build 16.0.20430 retest is consistent within the tested subset; see the officeObservations entry for this rule in scripts/docx-compatibility-microsoft-evidence.json for values and evidence limits.',
 });
 
 /** The observation is deliberately restricted to the exported mode boundaries. */
@@ -192,10 +193,10 @@ export function wordMeasuredTableOriginMode(mode: number | undefined): boolean {
 export const WORD_EXACT_ROW_VERTICAL_CLIP_ONLY = defineCompatibilityRule({
   id: 'word-exact-row-vertical-clip-only',
   evidence: {
-    kind: 'regression-test',
+    kind: 'library-policy',
     reference: 'packages/docx/src/layout/table.test.ts#clips an overflowing merged owner when every row in its span is exact',
   },
-  description: 'Preserve the established exact-row overflow behavior that clips the owned vertical interval without clipping nested table ink horizontally to the cell box.',
+  description: 'Preserve the established exact-row overflow behavior that clips the owned vertical interval without clipping nested table ink horizontally to the cell box. Library policy, no Office measurement: vertical-only clipping of exact-height rows; [MS-OI29500] §2.1.180(d) covers only the exact height.',
 });
 
 export const WORD_OVER_PAGE_CANT_SPLIT_CLIP = defineCompatibilityRule({
@@ -295,25 +296,16 @@ export const WORD_OMITTED_ROW_HEIGHT_RULE_AT_LEAST = defineCompatibilityRule({
   description: 'Treat an omitted trHeight hRule as atLeast while retaining an explicitly authored auto rule as authored input.',
 });
 
-export const WORD_AUTHORED_AUTO_ROW_HEIGHT_FLOOR = defineCompatibilityRule({
-  id: 'word-authored-auto-row-height-floor',
-  evidence: {
-    kind: 'regression-test',
-    reference: 'packages/docx/src/table-row-height.test.ts#auto with @val — @val is honored as a lower bound',
-  },
-  description: 'Preserve the established legacy-model behavior that an auto row with an authored height value uses that value as a lower bound.',
-});
-
 export const WORD_COLLAPSED_BORDER_ROW_TRACK_FOOTPRINT = defineCompatibilityRule({
   id: 'word-collapsed-border-row-track-footprint',
   evidence: {
     kind: 'office-observation',
-    syntheticFixtureId: 'collapsed-border-row-track-matrix',
+    syntheticFixtureId: 'issue-1904-table-rule-extent',
     application: 'Microsoft Word',
-    version: '16.111.1',
-    platform: 'macOS 26.5.2',
+    version: '16.0.20430',
+    platform: 'Windows',
   },
-  description: 'For automatic and at-least table rows with collapsed cell boundaries, Word includes half of the winning top and bottom rule widths in each row track. Exact rows retain their authored complete height, and cell spacing keeps independent edges out of the collapsed footprint.',
+  description: 'With collapsed cell boundaries each horizontal rule counts once, at its full width, inside the table box: a row\'s top rule (the table top rule for the first row, the winning inside rule otherwise) lies at the top of that row and its cell content starts below it, and the table\'s bottom rule is appended below the last row with the content ending above it. An automatic or at-least row adds its top rule to its content or minimum height; an exact row\'s authored height already holds its top rule, and its content is clipped to that authored box. Page-local slices treat their first and last rows as the table\'s. Cell spacing keeps independent edges out of this footprint. Evidence: issue #1904 Windows controls (body and full-width page-anchored floating tables; two exact, at-least and automatic rows; no borders, all 0.5/3/6pt, outer-only 3pt and inside-only 3pt; modes 14 and 15): all 38 match within 0.3pt. Word 16.111.1 on macOS had been observed charging half of each adjacent rule to automatic and at-least rows and none to exact rows; the Windows behaviour is followed where the two differ.',
 });
 
 export const WORD_EFFECTIVE_FLOATING_TABLE_POSITIONING = defineCompatibilityRule({
@@ -364,10 +356,10 @@ export const WORD_FIRST_ROW_TABLE_EXCEPTION_SCOPE = defineCompatibilityRule({
 export const WORD_TRAILING_STRUCTURAL_CELL_MARKER = defineCompatibilityRule({
   id: 'word-trailing-structural-cell-marker',
   evidence: {
-    kind: 'regression-test',
+    kind: 'library-policy',
     reference: 'packages/docx/src/layout/compatibility.test.ts#drops only an empty trailing paragraph after a non-paragraph cell block',
   },
-  description: 'Exclude the required empty trailing cell paragraph from row-height and vertical-alignment measurements when it follows a visible non-paragraph block.',
+  description: 'Exclude the required empty trailing cell paragraph from row-height and vertical-alignment measurements when it follows a visible non-paragraph block. Library policy, no Office measurement: structural trailing cell marker inventory (801aa7986); no evidence.',
 });
 
 export const WORD_CELL_VERTICAL_ALIGNMENT_INK_BLOCK = defineCompatibilityRule({
@@ -376,16 +368,16 @@ export const WORD_CELL_VERTICAL_ALIGNMENT_INK_BLOCK = defineCompatibilityRule({
     kind: 'regression-test',
     reference: 'packages/docx/src/cell-valign-leading-spacing.test.ts#inked block is vertically centred in the cell (midpoint = cell midpoint)',
   },
-  description: 'Center or bottom-align the visible cell ink block without charging the first paragraph spaceBefore or final paragraph spaceAfter at the cell edges.',
+  description: 'Center or bottom-align the visible cell ink block without charging the first paragraph spaceBefore or final paragraph spaceAfter at the cell edges. Evidence (observed Office behaviour): Word PDF of a corpus document in PR #552 (midpoint placement); ECMA-376 §17.4.83 vAlign does not define the ink block.',
 });
 
 export const WORD_VERTICAL_MERGE_TERMINAL_BORDER = defineCompatibilityRule({
   id: 'word-vertical-merge-terminal-border',
   evidence: {
-    kind: 'regression-test',
+    kind: 'library-policy',
     reference: 'packages/docx/src/cell-border-conflict-render.test.ts#uses the final continuation cell border at the bottom of a vertical merge',
   },
-  description: 'Resolve the bottom edge of a vertically merged cell from its terminal continuation cell before applying shared-edge conflict rules.',
+  description: 'Resolve the bottom edge of a vertically merged cell from its terminal continuation cell before applying shared-edge conflict rules. Library policy, no Office measurement: terminal border of a vertical merge (PR #1032); the ECMA-376 §17.4.66 tcBorders note does not address vMerge.',
 });
 
 export const WORD_VERTICAL_SECTION_UPRIGHT_BLOCK_TABLE = defineCompatibilityRule({
@@ -394,7 +386,7 @@ export const WORD_VERTICAL_SECTION_UPRIGHT_BLOCK_TABLE = defineCompatibilityRule
     kind: 'regression-test',
     reference: 'packages/docx/src/vertical-table-upright.test.ts#the table advances the flow by its PHYSICAL WIDTH; body text stays vertical',
   },
-  description: 'Paint a block table in an upright physical frame within a vertical section and charge its physical width as the body-flow advance.',
+  description: 'Paint a block table in an upright physical frame within a vertical section and charge its physical width as the body-flow advance. Evidence (observed Office behaviour): Word output adjudicated in issue #988 (item 4) and PR #999.',
 });
 
 export function wordExactRowFloorPt(
@@ -408,10 +400,12 @@ export function wordExactRowFloorPt(
 /** Compatibility projection governed by
  * {@link WORD_COLLAPSED_BORDER_ROW_TRACK_FOOTPRINT}. */
 export function wordCollapsedBorderRowTrackFootprintPt(
-  topBoundaryWidthPt: number,
-  bottomBoundaryWidthPt: number,
+  exact: boolean,
+  topRuleWidthPt: number,
+  tableBottomRuleWidthPt: number,
 ): number {
-  return (Math.max(0, topBoundaryWidthPt) + Math.max(0, bottomBoundaryWidthPt)) / 2;
+  // An exact row's authored height already holds its top rule.
+  return (exact ? 0 : Math.max(0, topRuleWidthPt)) + Math.max(0, tableBottomRuleWidthPt);
 }
 
 export function wordAuthoredBorderParticipates(
@@ -545,7 +539,7 @@ export function wordTableBorderWeight(
   widthPt: number,
 ): number {
   if (style === 'dotted' || style === 'dashed') return 1;
-  return Math.max(0, widthPt) * 8 * (WORD_BORDER_NUMBER[style] ?? 0);
+  return Math.max(0, widthPt) * 8 * (ownValue(WORD_BORDER_NUMBER, style) ?? 0);
 }
 
 export function wordTableRowHeightRule(
@@ -553,15 +547,6 @@ export function wordTableRowHeightRule(
   authored: boolean,
 ): 'exact' | 'atLeast' | 'auto' {
   return authored ? normalizedRule : 'atLeast';
-}
-
-export function wordAuthoredAutoRowHeightUsesFloor(
-  rule: string | null | undefined,
-  authoredHeight: number | null | undefined,
-): boolean {
-  return rule === 'auto'
-    && authoredHeight !== null
-    && authoredHeight !== undefined;
 }
 
 export function wordTableCellSpacingValuePt(
@@ -584,18 +569,6 @@ export function wordTableMarginValuePt(input: Readonly<{
     if (input.kind === 'pct' || input.kind === 'auto' || input.kind === 'nil') return 0;
   }
   return null;
-}
-
-export function wordDropsTrailingStructuralCellMarker(input: Readonly<{
-  contentLength: number;
-  previousKind: string | undefined;
-  lastKind: string | undefined;
-  lastParagraphRunCount: number | undefined;
-}>): boolean {
-  return input.contentLength >= 2
-    && input.lastKind === 'paragraph'
-    && input.previousKind !== 'paragraph'
-    && input.lastParagraphRunCount === 0;
 }
 
 /** ECMA-376 §17.4.50 and WORD_TABLE_ORIGIN_COMPATIBILITY: measured
@@ -665,12 +638,9 @@ export function wordFixedOccupiedGridInput(
  * Evidence boundary. ECMA-376 §17.3.1.11 defines framePr paragraph frames and
  * §17.4.57 makes a table without effective tblpPr nonfloating; neither
  * assigns a table row to a cell paragraph's frame, and MS-OI29500 2.1.43
- * defines no row promotion. MS-DOC 2.4.3 lets the leading first-cell PAP frame
- * context take part in adjacent-row identity only while both rows lack
- * nondefault TAP position/wrap: a binary row-identity precondition, not a WML
- * row-import rule and not proof that any tuple below is Word's native
- * identity. The rules below are therefore office observations, bounded to
- * their control class; whatever they do not name is library inference.
+ * defines no row promotion. The rules below are therefore office
+ * observations, bounded to their control class; whatever they do not name is
+ * library inference.
  *
  * Common control class (Word 16.113.3, macOS 27.0, public synthetic sources):
  * page/page notBeside carriers unless noted, a fixed 2×189pt grid with frame

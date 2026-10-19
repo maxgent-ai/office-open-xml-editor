@@ -1,8 +1,8 @@
 import type { DocParagraph, DocxDocumentModel } from '../types.js';
 import { syntheticDocxModel } from './synthetic-document.js';
 
-/** Plain shared-model wire fixture; native control/guard decoding is exercised
- * by the native producer's tests, independently of this layout contract. */
+/** Plain shared-model wire fixture; source control decoding is exercised by
+ * the producer's own tests, independently of this layout contract. */
 export function noteContinuationModel(): DocxDocumentModel {
   const model = syntheticDocxModel('plain', { paragraphs: 1, wordsPerParagraph: 1 });
   model.section = { ...model.section, pageWidth: 200, pageHeight: 100,

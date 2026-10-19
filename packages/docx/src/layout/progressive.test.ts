@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { vi, afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createLayoutServices } from '../layout-runtime.js';
 import { layoutSourceStore } from '../layout-source-model-adapter.js';
 import {
@@ -16,7 +16,7 @@ import {
   layoutDocumentProgressively,
   type ProgressiveLayoutPreview,
 } from './progressive.js';
-import { setDocumentLayoutValidation } from './validation-policy.js';
+import { setDocumentLayoutValidation } from '../testing/validation-policy.js';
 import type { DocumentLayout, LayoutPage } from './types.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -31,6 +31,10 @@ import type { DocumentLayout, LayoutPage } from './types.js';
 // ─────────────────────────────────────────────────────────────────────────────
 
 const CURRENT_DATE_MS = 1_700_000_000_000;
+/** Plain paragraphs for five pages: publications after the first and third
+ * pages, then the authoritative layout. Checkpoints double the committed
+ * page count, so a longer document only repeats the same mechanics. */
+const PREVIEW_PARAGRAPHS = 80;
 
 function open(
   shape: SyntheticDocumentShape,
@@ -89,19 +93,23 @@ describe('progressive layout returns the authoritative layout', () => {
 
 describe('preview pages match the final layout', () => {
   it('continues one pagination session instead of replaying growing source prefixes', async () => {
-    const progressiveCase = open('plain', 600);
+    // A replaying implementation re-runs work at each checkpoint, so the
+    // document only has to reach more than one checkpoint (PREVIEW_PARAGRAPHS).
+    const progressiveCase = open('plain', PREVIEW_PARAGRAPHS);
     let progressiveSteps = 0;
+    let previews = 0;
     await layoutDocumentProgressively(
       progressiveCase.source.bodyLayoutInput,
       progressiveCase.services,
       progressiveCase.options,
       {
-        onPreview: () => {},
+        onPreview: () => { previews += 1; },
         scheduler: { onProgress: () => { progressiveSteps += 1; } },
       },
     );
+    expect(previews).toBeGreaterThan(1);
 
-    const directCase = open('plain', 600);
+    const directCase = open('plain', PREVIEW_PARAGRAPHS);
     let directSteps = 0;
     await drainPaginationAsync(
       paginateBodySteps(
@@ -119,7 +127,7 @@ describe('preview pages match the final layout', () => {
     // Long enough to cross several canonical page-count checkpoints; a short
     // document deliberately skips publication because completion is imminent.
     const previews: ProgressiveLayoutPreview[] = [];
-    const testCase = open('plain', 600);
+    const testCase = open('plain', PREVIEW_PARAGRAPHS);
     const final = await layoutDocumentProgressively(
       testCase.source.bodyLayoutInput,
       testCase.services,
@@ -333,3 +341,5 @@ describe('preview pages match the final layout', () => {
     expect(previews).toEqual([]);
   }, 300_000);
 });
+
+vi.mock('./validation-policy.js', () => ({ documentLayoutValidationEnabled: vi.fn(() => true) }));

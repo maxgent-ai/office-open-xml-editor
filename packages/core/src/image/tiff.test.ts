@@ -6,6 +6,7 @@ import {
   TiffDecodeError,
 } from './tiff.js';
 import { isTiff } from './tiff-contract.js';
+import { getOoxmlDecodedImageLimitDetails, OoxmlDecodedImageLimitError } from './pixel-budget.js';
 
 type ByteOrder = 'little' | 'big';
 
@@ -24,6 +25,7 @@ interface TiffFixtureOptions {
   inkSet?: number;
   extraSamples?: readonly number[];
   fillOrder?: number;
+  predictor?: number;
 }
 
 interface FixtureField {
@@ -50,6 +52,7 @@ function classicTiff({
   inkSet,
   extraSamples,
   fillOrder,
+  predictor,
 }: TiffFixtureOptions): Uint8Array {
   const stripCount = Math.ceil(height / rowsPerStrip);
   if (strips.length !== stripCount) throw new Error('fixture strip count mismatch');
@@ -66,6 +69,7 @@ function classicTiff({
     { tag: 279, type: 4 as const, values: strips.map((strip) => strip.length) },
     { tag: 284, type: 3 as const, values: [planarConfiguration] },
     ...(fillOrder === undefined ? [] : [{ tag: 266, type: 3 as const, values: [fillOrder] }]),
+    ...(predictor === undefined ? [] : [{ tag: 317, type: 3 as const, values: [predictor] }]),
     ...(inkSet === undefined ? [] : [{ tag: 332, type: 3 as const, values: [inkSet] }]),
     ...(extraSamples === undefined
       ? []
@@ -148,6 +152,93 @@ function bits(value: string): Uint8Array {
   const output = new Uint8Array(Math.ceil(compact.length / 8));
   for (let index = 0; index < compact.length; index++) {
     if (compact[index] === '1') output[index >> 3] |= 1 << (7 - (index & 7));
+  }
+  return output;
+}
+
+/**
+ * Independent TIFF 6.0 §13 LZW encoder for synthetic fixtures: a leading
+ * ClearCode, MSB-first 9..12-bit codes whose width grows one code early, a
+ * ClearCode when the table reaches 4094 entries, and a closing
+ * EndOfInformation code.
+ */
+function tiffLzw(data: Uint8Array): Uint8Array {
+  const output: number[] = [];
+  let buffer = 0;
+  let bufferBits = 0;
+  let width = 9;
+  let nextCode = 258;
+  let table = new Map<number, number>();
+  const write = (code: number) => {
+    buffer = (buffer << width) | code;
+    bufferBits += width;
+    while (bufferBits >= 8) {
+      bufferBits -= 8;
+      output.push((buffer >>> bufferBits) & 0xff);
+    }
+    buffer &= (1 << bufferBits) - 1;
+  };
+  const advance = () => {
+    nextCode++;
+    if (nextCode === 4094) {
+      write(256);
+      table = new Map();
+      nextCode = 258;
+      width = 9;
+    } else if (nextCode > (1 << width) - 1) {
+      width++;
+    }
+  };
+
+  write(256);
+  let prefix = -1;
+  for (const byte of data) {
+    if (prefix < 0) {
+      prefix = byte;
+      continue;
+    }
+    const code = table.get(prefix * 256 + byte);
+    if (code !== undefined) {
+      prefix = code;
+      continue;
+    }
+    write(prefix);
+    table.set(prefix * 256 + byte, nextCode);
+    advance();
+    prefix = byte;
+  }
+  if (prefix >= 0) {
+    write(prefix);
+    advance();
+  }
+  write(257);
+  if (bufferBits > 0) output.push((buffer << (8 - bufferBits)) & 0xff);
+  return new Uint8Array(output);
+}
+
+/** TIFF 6.0 §14 encoder side: replace each sample by its difference from the
+ * same component of the previous pixel in the row, modulo 2^8. */
+function horizontallyDifferenced(
+  samples: Uint8Array,
+  bytesPerRow: number,
+  samplesPerPixel: number,
+): Uint8Array {
+  const output = samples.slice();
+  for (let row = 0; row < samples.length; row += bytesPerRow) {
+    for (let index = samplesPerPixel; index < bytesPerRow; index++) {
+      output[row + index] = (samples[row + index] - samples[row + index - samplesPerPixel]) & 0xff;
+    }
+  }
+  return output;
+}
+
+/** Deterministic pseudo-random bytes, so LZW sees few repeated strings. */
+function noise(length: number, seed: number): Uint8Array {
+  const output = new Uint8Array(length);
+  let state = seed >>> 0;
+  for (let index = 0; index < length; index++) {
+    state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
+    output[index] = state >>> 24;
   }
   return output;
 }
@@ -326,6 +417,274 @@ describe('TIFF 6.0 decoder', () => {
       targetWidthPx: 1,
       targetHeightPx: 1,
     })?.data ?? [])).toEqual([255, 0, 0, 128]);
+  });
+
+  it.each<ByteOrder>(['little', 'big'])(
+    'undoes horizontal differencing per component in LZW strips (%s endian)',
+    (byteOrder) => {
+      // Two strips of a 3×3 unassociated-alpha image, each LZW-compressed
+      // after TIFF 6.0 §14 horizontal differencing with a 4-sample stride.
+      const rgba = new Uint8Array([
+        10, 200, 30, 255, 250, 5, 40, 128, 7, 9, 11, 0,
+        1, 2, 3, 4, 255, 255, 255, 255, 0, 0, 0, 255,
+        90, 80, 70, 60, 50, 40, 30, 20, 10, 0, 250, 240,
+      ]);
+      const differenced = horizontallyDifferenced(rgba, 12, 4);
+      const tiff = classicTiff({
+        byteOrder,
+        width: 3,
+        height: 3,
+        rowsPerStrip: 2,
+        bitsPerSample: [8, 8, 8, 8],
+        compression: 5,
+        predictor: 2,
+        photometric: 2,
+        samplesPerPixel: 4,
+        extraSamples: [2],
+        strips: [tiffLzw(differenced.subarray(0, 24)), tiffLzw(differenced.subarray(24))],
+      });
+      expect(Array.from(decodeTiffRgba(tiff)?.data ?? [])).toEqual(Array.from(rgba));
+
+      const gray = new Uint8Array([0, 255, 1, 6, 128, 3]);
+      const grayTiff = classicTiff({
+        byteOrder,
+        width: 3,
+        height: 2,
+        bitsPerSample: [8],
+        compression: 5,
+        predictor: 2,
+        photometric: 1,
+        strips: [tiffLzw(horizontallyDifferenced(gray, 3, 1))],
+      });
+      expect(rgbaRows(decodeTiffRgba(grayTiff))).toEqual([[0, 255, 1], [6, 128, 3]]);
+      expect(rgbaRows(decodeTiffRgba(grayTiff, { targetHeightPx: 1 }))).toEqual([[66, 65]]);
+    },
+  );
+
+  it('decodes LZW code-width growth, table resets and self-referencing codes', () => {
+    // 48×48 RGB noise needs well over 4094 table entries, so the stream
+    // crosses all three code-width changes and at least one ClearCode reset;
+    // the constant tail produces KwKwK codes (a code equal to the next entry).
+    const width = 48;
+    const height = 48;
+    const rgb = noise(width * height * 3, 0x5eed);
+    rgb.fill(77, rgb.length - width * 3 * 4);
+    const tiff = classicTiff({
+      width,
+      height,
+      bitsPerSample: [8, 8, 8],
+      compression: 5,
+      photometric: 2,
+      samplesPerPixel: 3,
+      strips: [tiffLzw(rgb)],
+    });
+    const decoded = decodeTiffRgba(tiff);
+    const expected = new Uint8Array(width * height * 4);
+    for (let pixel = 0; pixel < width * height; pixel++) {
+      expected.set(rgb.subarray(pixel * 3, pixel * 3 + 3), pixel * 4);
+      expected[pixel * 4 + 3] = 255;
+    }
+    expect(Array.from(decoded?.data ?? [])).toEqual(Array.from(expected));
+  });
+
+  it('decodes wide LZW rows in bounded spans instead of allocating a source row', () => {
+    // A compact LZW strip can describe a source row far wider than any
+    // retained surface. Downsampling it must not buffer the whole row.
+    const width = 65_536;
+    const rgb = new Uint8Array(width * 3);
+    for (let x = 0; x < width; x++) rgb.set([x & 0xff, 255 - (x & 0xff), 7], x * 3);
+    const strip = tiffLzw(horizontallyDifferenced(rgb, width * 3, 3));
+    const tiff = classicTiff({
+      width,
+      height: 2,
+      rowsPerStrip: 1,
+      bitsPerSample: [8, 8, 8],
+      compression: 5,
+      predictor: 2,
+      photometric: 2,
+      samplesPerPixel: 3,
+      strips: [strip, strip],
+    });
+    expect(tiff.byteLength).toBeLessThan(width);
+
+    const Native = Uint8Array;
+    const allocations: number[] = [];
+    vi.stubGlobal('Uint8Array', function allocate(length: number) {
+      allocations.push(length);
+      return new Native(length);
+    });
+    const decoded = decodeTiffRgba(tiff, { targetWidthPx: 2 });
+    vi.unstubAllGlobals();
+
+    expect(decoded && { width: decoded.width, height: decoded.height }).toEqual({ width: 2, height: 1 });
+    // Each output pixel averages 128 complete 0..255 ramps.
+    expect(Array.from(decoded?.data ?? [])).toEqual([128, 128, 7, 255, 128, 128, 7, 255]);
+    expect(Math.max(...allocations)).toBeLessThanOrEqual(16 * 1024);
+  });
+
+  it('decodes multi-span LZW rows exactly like the equivalent uncompressed strips', () => {
+    // 9000 px rows span three 4096-pixel LZW spans. A 3000×3 target puts an
+    // output column across each span boundary and makes source rows straddle
+    // output rows, so span carries and partial column sums are both exercised.
+    const cases = [
+      {
+        width: 9000,
+        height: 7,
+        bitsPerSample: [8, 8, 8],
+        photometric: 2,
+        samplesPerPixel: 3,
+        bytesPerRow: 9000 * 3,
+        predictor: 2,
+        targets: [{}, { targetWidthPx: 3000 }],
+      },
+      {
+        width: 4096 + 13,
+        height: 3,
+        bitsPerSample: [1],
+        photometric: 0,
+        samplesPerPixel: 1,
+        bytesPerRow: Math.ceil((4096 + 13) / 8),
+        predictor: 1,
+        targets: [{}, { targetWidthPx: 1000 }],
+      },
+    ];
+    for (const { bytesPerRow, predictor, targets, ...layout } of cases) {
+      const samples = noise(bytesPerRow * layout.height, layout.width);
+      const rowsPerStrip = 2;
+      const strips = (encode: (bytes: Uint8Array) => Uint8Array) => {
+        const result: Uint8Array[] = [];
+        for (let row = 0; row < layout.height; row += rowsPerStrip) {
+          result.push(encode(samples.subarray(
+            row * bytesPerRow,
+            Math.min(layout.height, row + rowsPerStrip) * bytesPerRow,
+          )));
+        }
+        return result;
+      };
+      const uncompressed = classicTiff({ ...layout, rowsPerStrip, strips: strips((bytes) => bytes) });
+      const lzw = classicTiff({
+        ...layout,
+        rowsPerStrip,
+        compression: 5,
+        predictor,
+        strips: strips((bytes) => tiffLzw(predictor === 2
+          ? horizontallyDifferenced(bytes, bytesPerRow, layout.samplesPerPixel)
+          : bytes)),
+      });
+      for (const target of targets) {
+        const expected = decodeTiffRgba(uncompressed, target);
+        const decoded = decodeTiffRgba(lzw, target);
+        expect(decoded && { width: decoded.width, height: decoded.height })
+          .toEqual(expected && { width: expected.width, height: expected.height });
+        expect(Buffer.from(decoded?.data ?? []).equals(Buffer.from(expected?.data ?? []))).toBe(true);
+      }
+    }
+  });
+
+  it.each(['before pixels', 'after pixels'])('bounds repeated LZW ClearCodes %s across strips', (position) => {
+    const clear = '100000000';
+    const pixel = '001001101'; // 77
+    const end = '100000001';
+    const strip = bits(position === 'before pixels'
+      ? clear.repeat(3) + pixel + end
+      : clear + pixel + clear.repeat(2) + end);
+    const bytes = classicTiff({
+      width: 1,
+      height: 2,
+      rowsPerStrip: 1,
+      bitsPerSample: [8],
+      compression: 5,
+      photometric: 1,
+      strips: [strip, strip],
+    });
+    // Each strip fits the image allowance; both must charge reads (including
+    // EOI) and expanded bytes without resetting the image's work allowance.
+    let failure: unknown;
+    try { decodeTiffRgba(bytes); } catch (error) { failure = error; }
+    expect(failure).toBeInstanceOf(OoxmlDecodedImageLimitError);
+    expect(getOoxmlDecodedImageLimitDetails(failure)).toMatchObject({ metric: 'tiff-lzw-work' });
+  });
+
+  it.each([
+    ['missing EOI', [256, 77], /truncated/],
+    ['excess literal', [256, 77, 78, 257], /exceeds its declared rows/],
+    ['excess string', [256, 77, 258, 257], /exceeds its declared rows/],
+    ['excess pending string', [256, 77, 258, 257], /exceeds its declared rows/, 2],
+    ['invalid code after pixels', [256, 77, 300, 257], /Invalid TIFF LZW code: 300/],
+  ] as const)('rejects LZW strip termination with %s', (_name, codes, diagnostic, width: number = 1) => {
+    const bytes = classicTiff({
+      width,
+      height: 1,
+      bitsPerSample: [8],
+      compression: 5,
+      photometric: 1,
+      strips: [bits(codes.map((code) => code.toString(2).padStart(9, '0')).join(''))],
+    });
+    expect(() => decodeTiffRgba(bytes)).toThrowError(TiffDecodeError);
+    expect(() => decodeTiffRgba(bytes)).toThrowError(diagnostic);
+  });
+
+  it('accepts a final LZW ClearCode and padding after EOI', () => {
+    const bytes = classicTiff({
+      width: 1,
+      height: 1,
+      bitsPerSample: [8],
+      compression: 5,
+      photometric: 1,
+      strips: [bits('100000000' + '001001101' + '100000000' + '100000001')],
+    });
+    expect(rgbaRows(decodeTiffRgba(bytes))).toEqual([[77]]);
+  });
+
+  it('validates non-final LZW strips when downsampling', () => {
+    const bytes = classicTiff({
+      width: 1,
+      height: 2,
+      rowsPerStrip: 1,
+      bitsPerSample: [8],
+      compression: 5,
+      photometric: 1,
+      strips: [bits('100000000' + '001001101'), tiffLzw(new Uint8Array([88]))],
+    });
+    expect(() => decodeTiffRgba(bytes, { targetWidthPx: 1, targetHeightPx: 1 }))
+      .toThrowError(/TIFF LZW data is truncated/);
+  });
+
+  it('rejects predictors and LZW streams outside the implemented TIFF 6.0 rules', () => {
+    const gray = (overrides: Partial<TiffFixtureOptions>) => classicTiff({
+      width: 2,
+      height: 1,
+      bitsPerSample: [8],
+      compression: 5,
+      photometric: 1,
+      strips: [tiffLzw(new Uint8Array([1, 2]))],
+      ...overrides,
+    });
+    expect(() => decodeTiffRgba(gray({ predictor: 3 })))
+      .toThrowError(/Unsupported TIFF Predictor: 3/);
+    expect(() => decodeTiffRgba(gray({
+      compression: 1,
+      predictor: 2,
+      strips: [new Uint8Array([1, 2])],
+    }))).toThrowError(/Unsupported TIFF Predictor 2 with Compression 1/);
+    expect(() => decodeTiffRgba(gray({
+      bitsPerSample: [1],
+      predictor: 2,
+      strips: [tiffLzw(new Uint8Array([0x40]))],
+    }))).toThrowError(/Unsupported TIFF Predictor 2 with 1-bit samples/);
+
+    const encoded = tiffLzw(new Uint8Array([1, 2]));
+    expect(() => decodeTiffRgba(gray({ strips: [encoded.subarray(0, 2)] })))
+      .toThrowError(/TIFF LZW data is truncated/);
+    expect(() => decodeTiffRgba(gray({ strips: [tiffLzw(new Uint8Array([1]))] })))
+      .toThrowError(/TIFF LZW strip ended before its declared rows/);
+    // A pre-6.0 (LSB-first) stream does not begin with an MSB-first ClearCode.
+    expect(() => decodeTiffRgba(gray({ strips: [new Uint8Array([0x00, 0x01, 0x00])] })))
+      .toThrowError(/TIFF LZW strip must begin with ClearCode/);
+    // ClearCode, literal 1, then code 300, which is not yet in the table.
+    expect(() => decodeTiffRgba(gray({
+      strips: [bits('100000000' + '000000001' + '100101100')],
+    }))).toThrowError(/Invalid TIFF LZW code: 300/);
   });
 
   it('decodes CCITT Group 4 horizontal, vertical and pass modes', () => {
@@ -603,15 +962,15 @@ describe('TIFF 6.0 decoder', () => {
   });
 
   it('throws diagnostics for unsupported recognized TIFF classes and malformed ranges', () => {
-    const lzw = classicTiff({
+    const deflate = classicTiff({
       width: 1,
       height: 1,
       bitsPerSample: [8],
-      compression: 5,
+      compression: 8,
       photometric: 1,
       strips: [new Uint8Array([0])],
     });
-    expect(() => decodeTiffRgba(lzw)).toThrowError(/unsupported TIFF compression: 5/i);
+    expect(() => decodeTiffRgba(deflate)).toThrowError(/unsupported TIFF compression: 8/i);
 
     const malformed = cmykTiff('little');
     const view = new DataView(malformed.buffer);

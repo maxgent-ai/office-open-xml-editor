@@ -2,6 +2,7 @@ import type {
   ViewerCommentMessageContext,
   ViewerCommentThreadContext,
 } from '../comment-ui.js';
+import { safeUtf16Prefix } from './utf16-prefix.js';
 
 export const MAX_COMMENT_CONTEXT_TEXT_CHARACTERS = 65_536;
 
@@ -10,16 +11,6 @@ export interface BoundedViewerCommentThreadContext {
   readonly truncated: boolean;
   readonly textCharacters: number;
   readonly maxTextCharacters: number;
-}
-
-function safeUtf16Prefix(value: string, maxCodeUnits: number): string {
-  let end = Math.min(value.length, maxCodeUnits);
-  if (end > 0 && end < value.length) {
-    const previous = value.charCodeAt(end - 1);
-    const next = value.charCodeAt(end);
-    if (previous >= 0xD800 && previous <= 0xDBFF && next >= 0xDC00 && next <= 0xDFFF) end--;
-  }
-  return value.slice(0, end);
 }
 
 function boundedMaximum(value: number | undefined): number {

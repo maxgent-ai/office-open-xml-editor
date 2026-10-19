@@ -45,6 +45,7 @@ import {
   performFlush,
   performProspectiveSnapAdvance,
   performAddToLine,
+  performAdmitLineMetric,
   performSegNaturalAdvance,
   performStandaloneSnapAdvance,
   performSegAdvance,
@@ -107,23 +108,17 @@ export function runLineBreakerPass(input: LineBreakerPassInput): LayoutLine[] {
     ctx,
     segs,
     maxWidth,
-    firstIndent,
     scale,
     tabStops,
     wrapCtx,
     fontFamilyClasses,
-    tabOriginPx,
     kinsoku,
     characterGrid,
     defaultTabPt,
-    marginRightPx,
     baseRtl,
-    isJustified,
-    stretchLastLine,
     startBoundary,
     widthPolicy,
     verticalGlyphMeasurement,
-    overflowPunct,
     passContext,
   } = input;
 
@@ -136,7 +131,8 @@ export function runLineBreakerPass(input: LineBreakerPassInput): LayoutLine[] {
   // (WORD_IDEOGRAPHIC_SPACE_LINE_END_ALLOWANCE) the observed rule does not
   // define; a paragraph holding U+3000 keeps this compression rule disabled.
   breakerState.mixedSpaceEnabled = segs.some(
-    (segment) => 'text' in segment && segment.mixedSpaceAverageWidthRatio !== undefined,
+    (segment) => 'text' in segment
+      && (segment.mixedSpaceAverageWidthRatio !== undefined || segment.autoSpaceCompressible === true),
   ) && !segs.some((segment) => 'text' in segment && segment.text.includes('\u3000'));
 
   let operationState: PassOperationState;
@@ -204,6 +200,8 @@ export function runLineBreakerPass(input: LineBreakerPassInput): LayoutLine[] {
     asc: number,
     desc: number,
   ) => performAddToLine(operationState, s, w, h, asc, desc);
+  const admitLineMetric = (s: LayoutImageSeg, h: number, asc: number) =>
+    performAdmitLineMetric(operationState, s, h, asc);
 
   const measurement = new LineMeasurementAdapter(
     ctx,
@@ -389,6 +387,7 @@ export function runLineBreakerPass(input: LineBreakerPassInput): LayoutLine[] {
     flush,
     prospectiveSnapAdvance,
     addToLine,
+    admitLineMetric,
     measurement,
     effectiveFontPx,
     measureText,
@@ -416,6 +415,13 @@ export function runLineBreakerPass(input: LineBreakerPassInput): LayoutLine[] {
     retractCurrentLineForLeadingKinsoku,
     keepLeadingKinsokuWithCurrentLine,
   };
+  // The first numbered line's body indent may be resolved against its float
+  // window (placeNumberingFirstLine); every first-line reader sees it.
+  Object.defineProperty(operationState, 'firstIndent', {
+    get: () => breakerState.firstIndentOverride ?? input.firstIndent,
+    enumerable: true,
+  });
+
   startLine(lineHeadRequirement());
 
   iterateBreakOpportunities(operationState, {

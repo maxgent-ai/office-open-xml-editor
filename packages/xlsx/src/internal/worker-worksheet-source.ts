@@ -1,4 +1,4 @@
-import { isWasmTrap, type WasmParserHost } from '@silurus/ooxml-core';
+import type { WasmParserHost } from '@silurus/ooxml-core';
 import {
   copyModelSourceBytes,
   hasModelSourceCapability,
@@ -8,6 +8,10 @@ import {
   type ModelSourceModuleDescriptor,
   type OpenedModelSourceModule,
 } from '@silurus/ooxml-core/internal/model-source';
+import {
+  copyingCursorArchive,
+  runModelSourceOperation,
+} from '@silurus/ooxml-core/internal/worker-model-source';
 import type { WorksheetCursorArchive } from '../worksheet-pull-source-worker.js';
 import {
   configureHostLayout,
@@ -136,16 +140,7 @@ export class WorkerWorksheetSourceOwner<TArchive extends OoxmlWorksheetArchive> 
       try { opened.close(); } catch {}
       throw error;
     }
-    const transferArchive = new Proxy(opened.archive, {
-      get(target, key) {
-        if (key === 'pull_sheet_cursor') {
-          return (...args: Parameters<XlsxModelSourceArchive['pull_sheet_cursor']>) =>
-            new Uint8Array(copyModelSourceBytes(target.pull_sheet_cursor(...args)));
-        }
-        const value = Reflect.get(target, key);
-        return typeof value === 'function' ? value.bind(target) : value;
-      },
-    });
+    const transferArchive = copyingCursorArchive(opened.archive, 'pull_sheet_cursor');
     const source = { archive: opened.archive, transferArchive, close: opened.close };
     this.modelSource = source;
     try {
@@ -178,14 +173,10 @@ export class WorkerWorksheetSourceOwner<TArchive extends OoxmlWorksheetArchive> 
       if (!archive) throw new Error('Workbook not loaded');
       return this.ooxmlHost.run(() => operation(archive));
     }
-    try {
-      return operation(source.transferArchive);
-    } catch (error) {
-      if (isWasmTrap(error) && this.modelSource === source) {
-        try { this.closeModelSource(); } catch {}
-      }
-      throw error;
-    }
+    return runModelSourceOperation(
+      () => operation(source.transferArchive),
+      () => { if (this.modelSource === source) this.closeModelSource(); },
+    );
   }
 
   /** ZIP resource accounting; `undefined` when the source lacks the capability. */

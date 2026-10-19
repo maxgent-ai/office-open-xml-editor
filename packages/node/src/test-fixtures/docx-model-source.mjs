@@ -3,6 +3,7 @@
 //
 // config.showTrackedChanges (boolean | null)  reported view default
 // config.extraViewDefault   (string | null)   an additional, unsupported view key
+// config.openError          (string)          parser failure while opening
 // config.minimal            (boolean)         expose only the required archive methods
 // transfer[0]               (ArrayBuffer)     probe: Float64Array[0] counts close() calls
 import { readFileSync } from 'node:fs';
@@ -15,14 +16,16 @@ const REQUIRED = [
 ];
 
 export async function openModelSource(bytes, config, _signal, transfer = []) {
+  if (typeof config.openError === 'string') throw config.openError;
   initSync({ module: readFileSync(new URL('../../../docx/src/wasm/docx_parser_bg.wasm', import.meta.url)) });
   const parser = new DocxArchive(bytes);
   const probe = transfer[0] instanceof ArrayBuffer ? new Float64Array(transfer[0]) : undefined;
   const viewDefaults = {};
   if (typeof config.showTrackedChanges === 'boolean') viewDefaults.showTrackedChanges = config.showTrackedChanges;
   if (typeof config.extraViewDefault === 'string') viewDefaults[config.extraViewDefault] = true;
+  const archive = config.minimal ? only(parser, REQUIRED) : parser;
   return {
-    archive: config.minimal ? only(parser, REQUIRED) : parser,
+    archive,
     viewDefaults,
     close() {
       if (probe) probe[0] += 1;

@@ -3,65 +3,39 @@ import { findReferenceFontMetrics } from '../fonts/reference-font-metrics.js';
 /**
  * Face and character data for stacked vertical text, `a:bodyPr@vert`
  * `wordArtVert` / `wordArtVertRtl` (ECMA-376 §20.1.10.83 ST_TextVerticalType:
- * "one letter on top of another"). The standard defines no metrics; every
- * value below is observed PowerPoint behaviour (issue #1626 control decks,
- * PowerPoint for Mac 16.x, reference "electronic distribution" PDF export).
+ * "one letter on top of another"). The standard defines no cell metrics.
+ * Library policy: use 7/6 × the font-table face box × size for every face:
+ * usWinAscent + usWinDescent, or sTypoAscender − sTypoDescender +
+ * max(0, sTypoLineGap) under USE_TYPO_METRICS (OpenType OS/2.fsSelection bit 7).
+ * Library policy ignores negative line gaps rather than shrinking the face box.
  *
- * Cell. Each upright glyph takes a cell of 7/6 × the face box × size along
- * the column, where the face box is usWinAscent + usWinDescent, or
- * sTypoAscender − sTypoDescender + sTypoLineGap for a face that sets
- * USE_TYPO_METRICS (the #1610 glyph box). The rule fits 58 of 63 measured
- * faces (12 to 48 pt, regular and bold) to 0.03 %. Five face families do not follow any
- * font-table quantity (usWin, hhea with or without lineGap, typo, head bbox,
- * OS/2 version); their measured boxes are in STACKED_CELL_BOX_OVERRIDES.
+ * Evidence boundary: issue #1626 Mac PowerPoint 16.x PDF controls (12–48 pt,
+ * regular/bold) supported this factor for 58 of 63 measured faces. Yu Gothic,
+ * SimSun/NSimSun, MingLiU variants (including ExtB), Gulim/Dotum and STZhongsong
+ * had larger measured cells. Tests of usWin, hhea with/without lineGap, typo, head bbox
+ * and OS/2 version found no common metric explanation; Yu Mincho versus Yu
+ * Gothic and SimHei/KaiTi/FangSong versus SimSun provided equal-box
+ * counterexamples. Those Mac residuals are accepted differences, not font-name
+ * corrections or evidence of Windows Office behaviour. Windows Office remains
+ * the fidelity reference where platforms differ; this policy makes no claim
+ * of exact Office cell pitch for the exceptional faces.
  */
 
 /** 7/6: the ratio of a stacked cell to the face box. */
 export const STACKED_CELL_FACTOR = 7 / 6;
 
-function normalizeFamily(family: string): string {
-  return family.normalize('NFKC').trim().replace(/\s+/gu, ' ').toLocaleLowerCase('en-US');
+/** Library policy: select the requested weight/style, then relax style before
+ * weight so synthetic italic retains the requested weight's metrics and coverage.
+ * Finally allow any weight for named cuts (e.g. Medium/Light aliases). Keep the
+ * same source preference for the face box and vert coverage at every step. */
+function stackedProfile(family: string, bold: boolean, italic: boolean) {
+  const weight = bold ? 700 : 400;
+  let profiles = findReferenceFontMetrics(family, { weight, style: italic ? 'italic' : 'normal' });
+  if (profiles.length === 0) profiles = findReferenceFontMetrics(family, { weight });
+  if (profiles.length === 0) profiles = findReferenceFontMetrics(family);
+  return profiles.find((p) => p.source === 'macos-supplemental')
+    ?? profiles.find((p) => p.source === 'office-mac') ?? profiles[0];
 }
-
-/**
- * Canonical (reference-catalog) family for `family`, lower-cased, so a
- * localized or PostScript alias (游ゴシック, MS-Gothic, 宋体) finds the same
- * table entry as the English name.
- */
-function canonicalFamily(family: string): string {
-  const profiles = findReferenceFontMetrics(family);
-  return normalizeFamily(profiles.length > 0 ? profiles[0].family : family);
-}
-
-/**
- * Measured face boxes (em, before the 7/6 cell factor) for the families whose
- * stacked cell is not their font-table box. Controls: wordartvert-supp
- * sandwich columns (20 pt) and wordartvert-supp2 cell columns (12, 18, 24, 32,
- * 48 pt, regular and bold), glyph pitch corrected for the export's 1.0015
- * vertical text scale.
- * - Yu Gothic Regular / Light / Medium / Bold: 1.5084 (usWin box 1.2871).
- *   Yu Mincho, with the same usWin/hhea/typo values, follows its usWin box.
- * - SimSun, NSimSun: 1.0380 (usWin 1.0). SimHei, KaiTi and FangSong carry the
- *   same tables and follow usWin.
- * - MingLiU, PMingLiU, MingLiU_HKSCS: 1.1132; MingLiU-ExtB and
- *   PMingLiU-ExtB: 1.1137 (usWin 1.0).
- * - Gulim, Dotum: 1.0481 (usWin 1.0); Batang, BatangChe and Gungsuh follow usWin.
- * - STZhongsong: 1.2165 (usWin 1.137).
- */
-const STACKED_CELL_BOX_OVERRIDES: ReadonlyMap<string, number> = new Map([
-  ['yu gothic', 1.5084],
-  ['yu gothic medium', 1.5084],
-  ['simsun', 1.038],
-  ['nsimsun', 1.038],
-  ['mingliu', 1.1132],
-  ['pmingliu', 1.1132],
-  ['mingliu_hkscs', 1.1132],
-  ['mingliu-extb', 1.1137],
-  ['pmingliu-extb', 1.1137],
-  ['gulim', 1.0481],
-  ['dotum', 1.0481],
-  ['stzhongsong', 1.2165],
-]);
 
 /**
  * The font-table face box (em) of `family`: usWin, or typo under
@@ -74,10 +48,7 @@ export function stackedFaceBox(
   bold: boolean,
   italic: boolean,
 ): { ascent: number; descent: number } | undefined {
-  let profiles = findReferenceFontMetrics(family, { weight: bold ? 700 : 400, style: italic ? 'italic' : 'normal' });
-  if (profiles.length === 0) profiles = findReferenceFontMetrics(family);
-  const profile = profiles.find((p) => p.source === 'macos-supplemental')
-    ?? profiles.find((p) => p.source === 'office-mac') ?? profiles[0];
+  const profile = stackedProfile(family, bold, italic);
   if (!profile || !(profile.unitsPerEm > 0)) return undefined;
   if (profile.typoMetrics) {
     const [ascender, descender, lineGap] = profile.typoMetrics;
@@ -85,12 +56,6 @@ export function stackedFaceBox(
   }
   if (!profile.win) return undefined;
   return { ascent: profile.win[0] / profile.unitsPerEm, descent: profile.win[1] / profile.unitsPerEm };
-}
-
-/** The measured face box of `family` (em), or undefined to use its font tables. */
-export function stackedCellBoxOverride(family: string): number | undefined {
-  return STACKED_CELL_BOX_OVERRIDES.get(canonicalFamily(family))
-    ?? STACKED_CELL_BOX_OVERRIDES.get(normalizeFamily(family));
 }
 
 /**
@@ -101,7 +66,7 @@ export function stackedCellBoxOverride(family: string): number | undefined {
  * in its cell, including ，．：；？！, small kana, 〜, – — and « ».
  * Characters outside the measured set are treated as upright.
  */
-const STACKED_SIDEWAYS = new Set(
+export const STACKED_SIDEWAYS: ReadonlySet<number> = new Set(
   [...'()<>[]{}…‥‐←→↑↓―∥、。ー～＝＿￣｜（）〔〕［］｛｝〈〉《》「」『』【】〖〗'].map((c) => c.codePointAt(0)!),
 );
 
@@ -110,47 +75,53 @@ export function stackedSidewaysCharacter(cp: number): boolean {
 }
 
 /**
- * Which sideways characters a face draws with its own vertical glyph. Such a
- * glyph stands upright in a 1 em cell; a face without one draws the character
- * rotated 90° clockwise. Controls: Yu Gothic, MS Gothic, Meiryo and SimSun
- * draw their vertical glyphs; Arial and Cambria Math rotate. The sets are the
- * members of each Office-bundled face's GSUB `vert` coverage. Yu Gothic also
- * draws ∥ with a vertical glyph (wordartvert-supp slide 7), which its `vert`
- * lookup does not list; the other faces follow their `vert` coverage only.
- * A face not in this table (every Latin face) has no vertical glyphs.
+ * Where a stacked vertical glyph comes from: `vert`, the face's GSUB `vert`
+ * substitute (drawn as the face designs it for vertical text); `nominal`, the
+ * character's own horizontal glyph, standing unturned in the 1 em cell.
  */
-const JP_FULL = '…‥‐←→↑↓―∥、。ー～＝＿￣｜（）〔〕［］｛｝〈〉《》「」『』【】〖〗';
-const MEIRYO_YU = '…‥‐←→↑↓―、。ー～＝＿￣｜（）〔〕［］｛｝〈〉《》「」『』【】〖〗';
-const SC_SONG = '…‥←→↑↓―∥、。ー～＝＿￣｜（）〔〕［］｛｝〈〉《》「」『』【】〖〗';
-const SC_HEI = '…←→↑↓、。～＿￣｜（）〔〕［］｛｝〈〉《》「」『』【】〖〗';
-const DENGXIAN = '←→↑↓∥、。ー～＝＿￣｜（）〔〕［］｛｝〈〉《》「」『』【】〖〗';
-const YAHEI = '…‥←→↑↓―∥、。ー～＝＿（）〔〕［］｛｝〈〉《》「」『』【】〖〗';
-const KOREAN = '…‥、。（）〔〕［］｛｝〈〉《》「」『』【】';
-const MINGLIU = '…‥（）〔〕［］｛｝〈〉《》「」『』【】';
-const VERTICAL_GLYPHS: ReadonlyMap<string, ReadonlySet<number>> = new Map(
-  ([
-    [['ms gothic', 'ms pgothic', 'ms ui gothic', 'ms mincho', 'ms pmincho', 'hggothice', 'hgpgothice', 'hgsgothice',
-      'hgminchoe', 'hgpminchoe', 'hgsminchoe', 'hgmarugothicmpro', 'hgsoeikakugothicub', 'hgpsoeikakugothicub',
-      'hgssoeikakugothicub'], JP_FULL],
-    [['yu gothic'], MEIRYO_YU + '∥'],
-    [['meiryo', 'meiryo ui', 'yu gothic ui', 'yu mincho', 'yu mincho demibold'], MEIRYO_YU],
-    [['yu gothic medium'], '…‥‐←→↑↓―、。ー～＝＿￣｜（）〔〕［］｛｝《》「」『』【】〖〗'],
-    [['simsun', 'nsimsun', 'stzhongsong'], SC_SONG],
-    [['simhei', 'kaiti', 'fangsong', 'sthupo', 'stliti', 'stxingkai', 'stxinwei'], SC_HEI],
-    [['dengxian'], DENGXIAN],
-    [['microsoft yahei', 'microsoft yahei ui'], YAHEI],
-    [['microsoft jhenghei'], '…‥、。ー（）〔〕［］｛｝〈〉《》「」『』【】〖〗'],
-    [['batang', 'batangche', 'gungsuh', 'gungsuhche', 'gulim', 'gulimche', 'dotum', 'dotumche', 'malgun gothic'], KOREAN],
-    [['mingliu', 'pmingliu'], MINGLIU],
-    [['mingliu_hkscs'], '…‥（）〔〕｛｝〈〉《》「」『』【】'],
-  ] as const).flatMap(([families, chars]) => {
-    const set = new Set([...chars].map((c) => c.codePointAt(0)!));
-    return families.map((f) => [f, set] as const);
-  }),
-);
+export type StackedVerticalGlyphSource = 'vert' | 'nominal';
 
-/** Whether `family` draws the sideways character `cp` with a vertical glyph. */
-export function stackedVerticalGlyph(family: string, cp: number): boolean {
-  const set = VERTICAL_GLYPHS.get(canonicalFamily(family)) ?? VERTICAL_GLYPHS.get(normalizeFamily(family));
-  return set?.has(cp) ?? false;
+/**
+ * How the requested face renders a sideways character as a vertical glyph,
+ * or undefined when it rotates by its horizontal advance. Coverage comes from
+ * the generated reference metadata (all scripts/languages), not the host's
+ * selected font.
+ *
+ * - `vert` coverage: the vertical glyph.
+ * - `vrt2` coverage that `vert` lacks, outside Basic Latin (U+0080 and
+ *   above): the nominal glyph, upright in a 1 em cell. Basic Latin uses
+ *   `vert` only.
+ *
+ * Evidence (#1827): PowerPoint for Microsoft 365 16.0.20430 on Windows,
+ * electronic-distribution tagged PDF (SaveAs ppSaveAsPDF), of a synthetic
+ * wordArtVert deck at 32 pt, regular and bold, in Yu Gothic (Regular,
+ * Medium, Light), Yu Gothic UI (Regular, Semibold), Meiryo, Meiryo UI and
+ * Yu Mincho, with MS Gothic and MS Mincho as controls; text A ∥ （ ー and
+ * ASCII ()[]<>{}. In every Yu Gothic / Meiryo / Yu Mincho cut, whose ∥
+ * (U+2225) is covered by vrt2 only, ∥ stood unturned as its horizontal glyph
+ * (as wide as its horizontal advance), advanced 1 em and shared the left
+ * edge of the （ vertical form; it did not take the turned vrt2 design.
+ * MS Gothic and MS Mincho cover ∥ in vert and drew that turned vertical
+ * design. The ASCII brackets, vrt2-only in Yu Gothic, Meiryo and Yu Mincho,
+ * were turned in every face. The Basic Latin bound is the smallest font-data
+ * rule consistent with these controls. Consequence, unverified (macOS fonts
+ * outside the Office set): Hiragino cuts whose U+2010 ‐ is vrt2-only draw it
+ * upright too.
+ */
+export function stackedVerticalGlyphSource(
+  family: string,
+  cp: number,
+  bold = false,
+  italic = false,
+): StackedVerticalGlyphSource | undefined {
+  if (!STACKED_SIDEWAYS.has(cp)) return undefined;
+  const profile = stackedProfile(family, bold, italic);
+  const ch = String.fromCodePoint(cp);
+  if (profile?.stackedVerticalGlyphs?.includes(ch)) return 'vert';
+  return cp >= 0x80 && profile?.stackedVrt2OnlyGlyphs?.includes(ch) ? 'nominal' : undefined;
+}
+
+/** Whether a sideways character stands as a vertical glyph (1 em cell) rather than rotating. */
+export function stackedVerticalGlyph(family: string, cp: number, bold = false, italic = false): boolean {
+  return stackedVerticalGlyphSource(family, cp, bold, italic) !== undefined;
 }

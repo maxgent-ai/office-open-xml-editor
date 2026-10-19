@@ -13,5 +13,5 @@
  * rounding is unchanged, so this is not fractional Office-width support.
  * Worksheets without an override allocate nothing.
  */
-export { columnCssWidths, getColumnCssWidth, setColumnCssWidth, inheritColumnCssWidths }
+export { columnCssWidths, getColumnCssWidth, setColumnCssWidth }
   from './worksheet-size-context.js';

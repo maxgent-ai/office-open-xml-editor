@@ -1,7 +1,6 @@
 import type {
   BodyElement,
   DocNote,
-  DocRun,
   EmbeddedFontRef,
   SectionProps,
   TblpPr,
@@ -13,13 +12,13 @@ import type { ImageMetadataRecord, MathOccurrence } from './resources.js';
 import type { PaintResourceDescriptor, PaintResourceRegistry, SourceRef } from './types.js';
 import type { ParagraphAcquisitionInput } from './text.js';
 import type { DeepReadonly, ParsedUnsupportedTextBoxBlock } from './types.js';
-import { imageResourceKey, sourceKey } from './source-key.js';
+import { imageResourceKey, sourceKey, vmlPictureResourceKey, vmlStrokeResourceKey, vmlEdgeResourceKey } from './source-key.js';
 import { indexSealedPaintResourceDescriptors } from './paint-resources.js';
 import { sealPlainData } from './plain-data.js';
 import {
   isReservedNoteSeparatorInstance,
   reservedNoteSeparatorRole,
-} from './native-note-separators.js';
+} from './reserved-note-separators.js';
 import {
   isSelectedNoteSeparatorInstance,
   selectedNoteSeparatorSource,
@@ -85,7 +84,7 @@ export interface LayoutBlockRepository {
   readonly body: readonly LayoutStoryBlock[];
   readonly footnotes: readonly LayoutStoryNote[];
   readonly endnotes: readonly LayoutStoryNote[];
-  /** Registered native reserved separator roots; never numbered notes. */
+  /** Registered reserved separator roots; never numbered notes. */
   readonly reservedNoteRoots: readonly SourceRef[];
   readonly sources: readonly SourceRef[];
   resolve(source: SourceRef): LayoutFlowBlock;
@@ -174,21 +173,21 @@ function assertExactMembership(
   }
 }
 
-/** Canonical native and ordinary DOCX separator definitions must together
+/** Canonical reserved and ordinary DOCX separator definitions must together
  * name exactly the registered reserved roots, and their paragraph/control refs
  * must resolve to the participants acquired for them. Raw parser wire is never
  * sealed. */
-function validateNativeNoteSeparatorRoles(
+function validateReservedNoteSeparatorRoles(
   input: BodyLayoutInput,
   blocks: LayoutBlockRepository,
 ): void {
   const settings = input.noteLayoutSettings;
-  if (settings?.nativeSeparators !== undefined || settings?.footnoteSeparatorParagraphs !== undefined) {
+  if (settings?.reservedSeparators !== undefined || settings?.footnoteSeparatorParagraphs !== undefined) {
     throw new TypeError('Note separator wire must be normalized before sealing');
   }
   const defined = new Set<string>();
   const stories = settings?.footnoteSeparatorStories;
-  if (stories && settings?.nativeSeparatorRoles?.footnote) {
+  if (stories && settings?.reservedSeparatorRoles?.footnote) {
     throw new TypeError('Native and DOCX footnote separator stories cannot both be sealed');
   }
   for (const [role, definition] of Object.entries(stories ?? {})) {
@@ -211,15 +210,15 @@ function validateNativeNoteSeparatorRoles(
     }
   }
   for (const kind of ['footnote', 'endnote'] as const) {
-    const definitions = settings?.nativeSeparatorRoles?.[kind];
+    const definitions = settings?.reservedSeparatorRoles?.[kind];
     if (!definitions) continue;
     assertExactOwnKeys(definitions, ['separator', 'continuationSeparator', 'continuationNotice'],
-      'Native note separator definitions');
+      'Reserved note separator definitions');
     for (const [role, definition] of Object.entries(definitions)) {
       const { root } = definition;
       if (definition.role !== role || root.story !== kind || root.path.length !== 0
         || reservedNoteSeparatorRole(root) !== role) {
-        throw new TypeError(`Invalid native note separator definition: ${kind}:${role}`);
+        throw new TypeError(`Invalid reserved note separator definition: ${kind}:${role}`);
       }
       defined.add(sourceKey(root));
       const story = blocks.storyRoot(root);
@@ -228,13 +227,13 @@ function validateNativeNoteSeparatorRoles(
       if (definition.paragraph ? story.length !== 1 || story[0] !== paragraph || paragraph?.type !== 'paragraph'
         || sourceKey(definition.paragraph.source) !== sourceKey({ ...root, path: [0] })
         : story.length !== 0) {
-        throw new TypeError(`Native note separator paragraph mismatch: ${sourceKey(root)}`);
+        throw new TypeError(`Reserved note separator paragraph mismatch: ${sourceKey(root)}`);
       }
       if (definition.rule) {
         const control = paragraph?.type === 'paragraph' ? paragraph.runs[0] : undefined;
         if (sourceKey(definition.rule.control) !== sourceKey({ ...root, path: [0, 0] })
           || control?.type !== 'text' || control.noteSeparatorCharacter !== 'rule-control') {
-          throw new TypeError(`Native note separator control mismatch: ${sourceKey(root)}`);
+          throw new TypeError(`Reserved note separator control mismatch: ${sourceKey(root)}`);
         }
       }
     }
@@ -250,7 +249,7 @@ function validateBodyLayoutSources(
   input: BodyLayoutInput,
   blocks: LayoutBlockRepository,
 ): void {
-  validateNativeNoteSeparatorRoles(input, blocks);
+  validateReservedNoteSeparatorRoles(input, blocks);
   const requireStory = (source: SourceRef | null): void => {
     if (!source) return;
     blocks.storyRoot(source);
@@ -336,6 +335,15 @@ function validateResourceManifests(
             }, textBoxParagraph.image.imagePath));
           }
         }
+      }
+      if (run.type === 'shape') for (const edge of run.vmlEdgeStrokes ?? []) {
+        if (edge.image) addImage(vmlEdgeResourceKey(runSource, edge.edge));
+      }
+      if (run.type === 'shape' && run.vmlStrokeFill) {
+        addImage(vmlStrokeResourceKey(runSource, run.vmlStrokeFill.imagePath));
+      }
+      if (run.type === 'shape' && run.vmlPicture) {
+        addImage(vmlPictureResourceKey(runSource, run.vmlPicture.imagePath));
       }
       if (run.type === 'shape' && run.fill?.fillType === 'image') {
         addImage(imageResourceKey(runSource, run.fill.imagePath));
@@ -601,7 +609,7 @@ export interface LayoutBlockRepositoryInput {
   }>[];
   readonly footnotes: readonly LayoutStoryNote[];
   readonly endnotes: readonly LayoutStoryNote[];
-  /** Closed native reserved separator roots (`footnote`/`endnote` kinds,
+  /** Closed reserved separator roots (`footnote`/`endnote` kinds,
    * `reserved:*` instances) and ordinary DOCX selected footnote story roots
    * (`selected:*`), registered once per document. */
   readonly reservedNoteStories?: readonly Readonly<{

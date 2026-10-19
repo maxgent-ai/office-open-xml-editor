@@ -9,7 +9,7 @@ import { createLayoutServices } from '../layout-runtime.js';
 import { layoutDocument } from '../document-layout.js';
 import type { DocParagraph, DocRun, DocxDocumentModel } from '../types.js';
 import type { InternalDocxDocumentModel, InternalFieldRun } from '../parser-model.js';
-import { createTextLayoutService, type TextLayoutService } from './text.js';
+import { createTextLayoutService } from './text.js';
 import { createFontResolver } from './font-service.js';
 import { mathResourceKey } from './resources.js';
 import { layoutSourceStore } from '../layout-source-model-adapter.js';

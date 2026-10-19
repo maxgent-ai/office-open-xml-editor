@@ -24,7 +24,7 @@ export const BUBBLE_3D_MATERIAL_COMPONENTS = 15;
  * The recipe is normalized to bubble-local coordinates and is therefore shared
  * by every colour, size, and host transform rather than fitted per sample.
  * `source-atop` preserves the authored fill alpha on every pass. */
-export function paintBubble3DMaterial(
+function paintBubble3DMaterial(
   ctx: CanvasRenderingContext2D,
   cx: number,
   cy: number,

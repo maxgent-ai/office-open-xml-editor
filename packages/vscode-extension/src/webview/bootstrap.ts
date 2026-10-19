@@ -27,6 +27,7 @@ import { loadAtContainerFit, loadAtNaturalScale } from './naturalScale';
 import { captureUnhandledWheelZoom } from './wheelZoomFallback';
 import { FindPopupController, type FindableViewer } from './findPopup';
 import { fullRenderers } from './advancedChartRenderers';
+import { exactArrayBuffer } from './postedBytes';
 // Side-effect import: bundles the self-contained MathJax + STIX Two Math engine
 // into the webview and sets globalThis.__ooxmlStix2. The library renders OMML
 // equations only when handed a `math` engine; its built-in engine loads lazily
@@ -160,13 +161,15 @@ window.addEventListener('message', async (event: MessageEvent) => {
   // viewers never touch the network — the matching CSP keeps the webview offline.
   const useGoogleFonts: boolean = msg.useGoogleFonts === true;
 
-  let buffer: ArrayBuffer;
-  try {
-    const res = await fetch(msg.url);
-    if (!res.ok) throw new Error(`Fetch failed: ${res.status} ${res.statusText}`);
-    buffer = await res.arrayBuffer();
-  } catch (err) {
-    showError(`Error: ${err instanceof Error ? err.message : String(err)}`);
+  // The host reads the document and posts its bytes; the webview has no
+  // resource root that could fetch it (or its sibling files) directly.
+  if (typeof msg.error === 'string') {
+    showError(`Error: ${msg.error}`);
+    return;
+  }
+  const buffer = exactArrayBuffer(msg.data);
+  if (!buffer) {
+    showError('Error: the document bytes were not received');
     return;
   }
 

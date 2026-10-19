@@ -33,6 +33,7 @@ vi.mock('@silurus/ooxml-core', async importOriginal => ({
   ...await importOriginal<typeof import('@silurus/ooxml-core')>(),
   loadOfficeFontFallbacks: workerMocks.metrics,
   unloadOfficeFontFallbacks: workerMocks.unloadLocal,
+  loadNativeRouteSentinels: async () => [],
 }));
 vi.mock('@silurus/ooxml-core/internal/model-source', async importOriginal => ({
   ...await importOriginal<typeof import('@silurus/ooxml-core/internal/model-source')>(),
@@ -52,7 +53,7 @@ vi.mock('./renderer.js', () => ({ prepareMathRuns: vi.fn(), renderLayoutSourceTo
 vi.mock('./vertical-render-capability.js', () => ({
   documentRequiresDomVerticalGlyphLayout: workerMocks.verticalFallback,
 }));
-vi.mock('./layout-runtime.js', () => ({ createLayoutServices: () => ({}) }));
+vi.mock('./layout-runtime.js', () => ({ createLayoutServices: () => ({}), nativeRouteLineRequests: () => [] }));
 vi.mock('./render-worker-layout.js', () => ({
   retainRenderWorkerDocumentLayout: () => ({
     defaultCurrentDateMs: 0, layoutServices: {},
@@ -68,7 +69,7 @@ vi.mock('./render-worker-metadata.js', () => ({
 }));
 
 const descriptor: ModelSourceModuleDescriptor = {
-  protocol: 'ooxml-model-source-module/v1',
+  protocol: 'ooxml-model-source-module/v2',
   target: 'docx',
   moduleUrl: 'https://example.test/source.mjs',
   config: {},
@@ -80,7 +81,7 @@ async function loadWorker(): Promise<{ dispatch: Dispatch; posts: ReturnType<typ
   vi.resetModules();
   const posts = vi.fn();
   Object.assign(globalThis, { self: { postMessage: posts, onmessage: null } });
-  await import('./render-worker-source.js');
+  await import('./render-worker.js');
   const dispatch = (globalThis.self as unknown as { onmessage: Dispatch }).onmessage;
   return { dispatch, posts };
 }
@@ -104,6 +105,7 @@ beforeEach(() => {
 });
 
 describe('DOCX render worker with a model source', () => {
+
   it('drains a model-source archive through the real pull consumer and keeps images readable', async () => {
     const source = modelSource({
       headers: { default: { body: [{ type: 'paragraph', runs: [] }] }, first: null, even: null },

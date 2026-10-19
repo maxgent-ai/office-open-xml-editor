@@ -1,7 +1,7 @@
 import type {
   LayoutRect,
   Matrix2DData,
-  NativeSectionFlow,
+  SectionFlow,
   PointPt,
   SectionRegionCoordinateSpace,
   UprightResourceOrientation,
@@ -59,16 +59,16 @@ export function writingModeFromTextDirection(textDirection: string): WritingMode
 }
 
 /** Writing mode of one section context. The authored token decides it unless
- * a validated native flow fact selects its canonical frame; that fact is only
- * normalized from the native producer's private wire, never from a token. */
+ * a validated section flow fact selects its canonical frame; that fact is only
+ * normalized from a producer's private wire, never from a token. */
 export function sectionWritingMode(section: Readonly<{
   textDirection: string;
-  nativeSectionFlow?: NativeSectionFlow | null;
+  sectionFlow?: SectionFlow | null;
 }>): WritingMode {
-  if (section.nativeSectionFlow == null) return writingModeFromTextDirection(section.textDirection);
-  if (section.nativeSectionFlow !== 'bottomToTop' || section.textDirection !== 'btLr') {
+  if (section.sectionFlow == null) return writingModeFromTextDirection(section.textDirection);
+  if (section.sectionFlow !== 'bottomToTop' || section.textDirection !== 'btLr') {
     throw new RangeError(
-      `Native section flow ${String(section.nativeSectionFlow)} contradicts text direction ${JSON.stringify(section.textDirection)}`,
+      `Section flow ${String(section.sectionFlow)} contradicts text direction ${JSON.stringify(section.textDirection)}`,
     );
   }
   return 'sideways-lr';

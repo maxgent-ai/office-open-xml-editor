@@ -1,8 +1,10 @@
 // TIFF Revision 6.0 decoder for OOXML image parts. ECMA-376 Part 1
 // §15.2.14 permits TIFF image parts, while browser bitmap decoders do not
 // consistently support them. Keep this compatibility codec deliberately
-// tag-defined: classic TIFF, first IFD, stripped top-left chunky pixels, and the
-// baseline bilevel/grayscale/RGB/process-CMYK classes listed below.
+// tag-defined: classic TIFF, first IFD, stripped top-left chunky pixels, the
+// baseline bilevel/grayscale/RGB/process-CMYK classes listed below, stored
+// uncompressed or LZW-compressed (optionally with the horizontal differencing
+// predictor), plus CCITT Group 4 bilevel images.
 
 import {
   MAX_RASTER_DIMENSION,
@@ -22,6 +24,69 @@ export { TiffDecodeError, isTiffDecodeError, type TiffRenderOptions } from './ti
 
 /** Stable bundle-audit marker retained only by the opt-in TIFF entry. */
 export const TIFF_IMPLEMENTATION_MARKER = 'packages/core/src/image/tiff.ts';
+
+/**
+ * Keep the packed-bit decoder in this module so the optional TIFF bundle audit
+ * covers both LZW and Group 4, including their shared reader.
+ *
+ * TIFF 6.0 §13 LZW and §11/CCITT T.6 (FillOrder 1) use MSB-first packed codes.
+ * The caller validates the strip byte range. Keep byte positions as arithmetic
+ * numbers: even a valid strip can exceed 2^31 bits, where bitwise indexing
+ * wraps. Only the 0..7 bit position and at most 12-bit code values are shifted.
+ */
+export class TiffBitReader {
+  private byteCursor = 0;
+  private byteEnd = 0;
+  private bitInByte = 0;
+
+  constructor(
+    private readonly bytes: ArrayLike<number>,
+    byteOffset: number,
+    byteLength: number,
+    private readonly truncatedMessage: string,
+  ) {
+    this.beginStrip(byteOffset, byteLength);
+  }
+
+  beginStrip(byteOffset: number, byteLength: number): void {
+    this.byteCursor = byteOffset;
+    this.byteEnd = byteOffset + byteLength;
+    this.bitInByte = 0;
+  }
+
+  /** Read one LZW code (9..12 bits), or fewer bits for another packed code. */
+  readBits(count: number): number {
+    if (count > (this.byteEnd - this.byteCursor) * 8 - this.bitInByte) {
+      throw new TiffDecodeError(this.truncatedMessage);
+    }
+    let value = 0;
+    // Consume up to a byte per iteration, with no per-bit division or lookup.
+    while (count > 0) {
+      const available = 8 - this.bitInByte;
+      const take = Math.min(count, available);
+      value = (value << take)
+        | ((this.bytes[this.byteCursor] >> (available - take)) & ((1 << take) - 1));
+      this.bitInByte += take;
+      if (this.bitInByte === 8) {
+        this.byteCursor++;
+        this.bitInByte = 0;
+      }
+      count -= take;
+    }
+    return value;
+  }
+
+  readBit(): number {
+    if (this.byteCursor >= this.byteEnd) throw new TiffDecodeError(this.truncatedMessage);
+    const bit = (this.bytes[this.byteCursor] >> (7 - this.bitInByte)) & 1;
+    this.bitInByte++;
+    if (this.bitInByte === 8) {
+      this.byteCursor++;
+      this.bitInByte = 0;
+    }
+    return bit;
+  }
+}
 
 const TYPE_BYTE = 1;
 const TYPE_SHORT = 3;
@@ -236,6 +301,12 @@ type PixelLayout =
   | { kind: 'cmyk'; bytesPerRow: number }
   | { kind: 'group4'; photometric: 0 | 1 };
 
+type ChunkyLayout = Exclude<PixelLayout, { kind: 'group4' }>;
+
+const COMPRESSION_NONE = 1;
+const COMPRESSION_CCITT_GROUP4 = 4;
+const COMPRESSION_LZW = 5;
+
 interface ParsedTiff {
   directory: Directory;
   width: number;
@@ -244,7 +315,13 @@ interface ParsedTiff {
   stripCount: number;
   stripOffsets: FieldValues;
   stripByteCounts: FieldValues;
+  compression: number;
   layout: PixelLayout;
+  /**
+   * Sample stride of the TIFF 6.0 §14 horizontal differencing predictor, or
+   * `null` when rows are stored without prediction.
+   */
+  differencingStride: number | null;
 }
 
 function assertSourceBudget(width: number, height: number): void {
@@ -297,7 +374,11 @@ function assertUnsignedSamples(directory: Directory, samples: number): void {
 
 function parseLayout(directory: Directory, width: number): { compression: number; layout: PixelLayout } {
   const compression = scalar(directory, TAG.compression, 'Compression', [TYPE_SHORT], 1);
-  if (compression !== 1 && compression !== 4) {
+  if (
+    compression !== COMPRESSION_NONE
+    && compression !== COMPRESSION_CCITT_GROUP4
+    && compression !== COMPRESSION_LZW
+  ) {
     fail(`Unsupported TIFF compression: ${compression}`);
   }
   const photometric = scalar(
@@ -313,7 +394,7 @@ function parseLayout(directory: Directory, width: number): { compression: number
   const bits = readBits(directory, samples);
   assertUnsignedSamples(directory, samples);
 
-  if (compression === 4) {
+  if (compression === COMPRESSION_CCITT_GROUP4) {
     if (
       samples !== 1
       || bits.length !== 1
@@ -387,6 +468,42 @@ function parseLayout(directory: Directory, width: number): { compression: number
   fail(`Unsupported TIFF PhotometricInterpretation: ${photometric}`);
 }
 
+/**
+ * TIFF 6.0 §14 Predictor (tag 317): 1 = no prediction, 2 = horizontal
+ * differencing. §14 defines the predictor for use with LZW (Compression 5), so
+ * it is refused with any other compression rather than silently ignored.
+ * Differencing applies to each component separately, so for chunky pixels the
+ * stride is SamplesPerPixel. The arithmetic is defined per sample; this decoder
+ * implements it for its 8-bit sample classes, where it is modulo 2^8, and
+ * refuses sub-byte (1-bit) rows instead of guessing a bit-level variant.
+ * Other values, such as the floating-point predictor 3 of TIFF Technical
+ * Note 3, stay diagnostic failures.
+ */
+function parseDifferencingStride(
+  directory: Directory,
+  compression: number,
+  layout: PixelLayout,
+): number | null {
+  const predictor = scalar(directory, TAG.predictor, 'Predictor', [TYPE_SHORT], 1);
+  if (predictor === 1) return null;
+  if (predictor !== 2) fail(`Unsupported TIFF Predictor: ${predictor}`);
+  if (compression !== COMPRESSION_LZW) {
+    fail(`Unsupported TIFF Predictor 2 with Compression ${compression}`);
+  }
+  switch (layout.kind) {
+    case 'gray-8':
+      return 1;
+    case 'rgb':
+      return 3;
+    case 'rgba-associated':
+    case 'rgba-unassociated':
+    case 'cmyk':
+      return 4;
+    default:
+      return fail('Unsupported TIFF Predictor 2 with 1-bit samples');
+  }
+}
+
 function parseTiff(bytes: Uint8Array): ParsedTiff | null {
   const directory = firstDirectory(bytes);
   if (!directory) return null;
@@ -410,9 +527,6 @@ function parseTiff(bytes: Uint8Array): ParsedTiff | null {
   if (planar !== 1) fail(`Unsupported TIFF PlanarConfiguration: ${planar}`);
   const fillOrder = scalar(directory, TAG.fillOrder, 'FillOrder', [TYPE_SHORT], 1);
   if (fillOrder !== 1) fail(`Unsupported TIFF FillOrder: ${fillOrder}`);
-  const predictor = scalar(directory, TAG.predictor, 'Predictor', [TYPE_SHORT], 1);
-  if (predictor !== 1) fail(`Unsupported TIFF Predictor: ${predictor}`);
-
   const rowsPerStrip = scalar(
     directory,
     TAG.rowsPerStrip,
@@ -437,20 +551,23 @@ function parseTiff(bytes: Uint8Array): ParsedTiff | null {
     stripCount,
   );
   const { compression, layout } = parseLayout(directory, width);
+  const differencingStride = parseDifferencingStride(directory, compression, layout);
 
   // Validate every declared range before reserving the target RGBA surface.
   // In particular, validate the full declared count, not merely the bytes the
   // supported decoder happens to consume.
+  // Classic TIFF offsets/counts can be unsigned LONGs: their sum can exceed 2^32.
+  // Keep range and row-byte arithmetic as numbers, never 32-bit coercions.
   for (let strip = 0; strip < stripCount; strip++) {
     const offset = stripOffsets.at(strip);
     const byteCount = stripByteCounts.at(strip);
     if (!directory.reader.contains(offset, byteCount)) {
       fail(`Malformed TIFF strip ${strip} byte range`);
     }
-    if (compression === 1) {
+    if (compression === COMPRESSION_NONE) {
       const firstRow = strip * rowsPerStrip;
       const rowCount = Math.min(rowsPerStrip, height - firstRow);
-      const bytesPerRow = (layout as Exclude<PixelLayout, { kind: 'group4' }>).bytesPerRow;
+      const bytesPerRow = (layout as ChunkyLayout).bytesPerRow;
       const required = rowCount * bytesPerRow;
       if (byteCount < required) {
         fail(`Malformed TIFF strip ${strip}: ${byteCount} bytes cannot hold ${required} bytes`);
@@ -466,7 +583,9 @@ function parseTiff(bytes: Uint8Array): ParsedTiff | null {
     stripCount,
     stripOffsets,
     stripByteCounts,
+    compression,
     layout,
+    differencingStride,
   };
 }
 
@@ -531,74 +650,216 @@ function unassociate(channel: number, alpha: number): number {
   return alpha === 0 ? 0 : Math.min(255, Math.round((channel * 255) / alpha));
 }
 
-function decodeUncompressedExact(
+/**
+ * Decoded source pixels [firstX, endX) of one row. The samples of pixel x start
+ * at `bytes[rowOffset + spanBytes(layout, x)]` (1-bit: bit 7 - (x & 7) of
+ * `bytes[rowOffset + (x >> 3)]`), so `rowOffset` may be negative for a span
+ * that begins inside the row. Pixel x is bounded by MAX_RASTER_SOURCE_DIMENSION
+ * (2^27), so its bitwise indexing is safe; strip bit positions have no such bound.
+ */
+interface SourceSpan {
+  bytes: Uint8Array;
+  rowOffset: number;
+  firstX: number;
+  endX: number;
+}
+
+/**
+ * Visits each source row strictly top to bottom as consecutive spans. A span
+ * may be a reused buffer that stays valid only during its visit.
+ */
+type SourceRowReader = (sourceY: number, visit: (span: SourceSpan) => void) => void;
+
+function uncompressedRowReader(parsed: ParsedTiff, layout: ChunkyLayout): SourceRowReader {
+  const span: SourceSpan = {
+    bytes: parsed.directory.reader.bytes,
+    rowOffset: 0,
+    firstX: 0,
+    endX: parsed.width,
+  };
+  return (sourceY, visit) => {
+    const strip = Math.floor(sourceY / parsed.rowsPerStrip);
+    const rowInStrip = sourceY - strip * parsed.rowsPerStrip;
+    span.rowOffset = parsed.stripOffsets.at(strip) + rowInStrip * layout.bytesPerRow;
+    visit(span);
+  };
+}
+
+/**
+ * Pixels decoded per LZW span. A multiple of 8 keeps 1-bit spans byte-aligned.
+ * The span buffer (at most 4 bytes per pixel) bounds decode memory
+ * independently of the source width, which may far exceed the retained width
+ * when a compact strip is downsampled.
+ */
+const LZW_SPAN_PIXELS = 4096;
+
+/** Bytes holding `pixels` consecutive pixels from a byte-aligned row start. */
+function spanBytes(layout: ChunkyLayout, pixels: number): number {
+  switch (layout.kind) {
+    case 'gray-1':
+      return Math.ceil(pixels / 8);
+    case 'gray-8':
+      return pixels;
+    case 'rgb':
+      return pixels * 3;
+    default:
+      return pixels * 4;
+  }
+}
+
+/**
+ * Decode LZW strips span by span into one reusable buffer, so memory stays
+ * one span plus the fixed 4096-entry code table instead of a decompressed
+ * row, strip or frame.
+ */
+function lzwRowReader(parsed: ParsedTiff, layout: ChunkyLayout): SourceRowReader {
+  // Library work policy derived from the source-pixel envelope: at most four
+  // decoded bytes per pixel (including byte-padded bilevel rows). Data codes
+  // cannot outnumber decoded bytes; allow even one clear per data code plus
+  // an initial clear and EOI per strip. Expansion + reads thus fit 3B + 2S,
+  // bounded by 14 * MAX_RASTER_SOURCE_PIXELS, without a compressed-size gate.
+  const workLimit = 3 * layout.bytesPerRow * parsed.height + 2 * parsed.stripCount;
+  const decoder = new TiffLzwDecoder(parsed.directory.reader.bytes, workLimit);
+  const spanPixels = Math.min(parsed.width, LZW_SPAN_PIXELS);
+  const buffer = new Uint8Array(spanBytes(layout, spanPixels));
+  const stride = parsed.differencingStride;
+  const previousPixel = new Uint8Array(4);
+  const span: SourceSpan = { bytes: buffer, rowOffset: 0, firstX: 0, endX: 0 };
+  let activeStrip = -1;
+  let nextSourceY = 0;
+  return (sourceY, visit) => {
+    if (sourceY !== nextSourceY) fail('Internal TIFF LZW row sequence failure');
+    nextSourceY++;
+    const strip = Math.floor(sourceY / parsed.rowsPerStrip);
+    if (strip !== activeStrip) {
+      // TIFF 6.0 §13: every strip is compressed independently.
+      decoder.beginStrip(parsed.stripOffsets.at(strip), parsed.stripByteCounts.at(strip));
+      activeStrip = strip;
+    }
+    for (let firstX = 0; firstX < parsed.width; firstX += spanPixels) {
+      const endX = Math.min(parsed.width, firstX + spanPixels);
+      // TIFF rows are padded to a byte boundary, so only a row's final 1-bit
+      // span can end in padding bits.
+      const bytes = buffer.subarray(0, spanBytes(layout, endX - firstX));
+      decoder.fill(bytes);
+      if (stride !== null) {
+        undoHorizontalDifferencing(bytes, stride, previousPixel, firstX > 0);
+      }
+      span.firstX = firstX;
+      span.endX = endX;
+      span.rowOffset = -spanBytes(layout, firstX);
+      visit(span);
+    }
+    if (nextSourceY === parsed.height || nextSourceY % parsed.rowsPerStrip === 0) {
+      decoder.finishStrip();
+    }
+  };
+}
+
+/**
+ * TIFF 6.0 §14: each stored sample after the first pixel of a row is the
+ * difference from the same component of the previous pixel, modulo 2^8 for
+ * the 8-bit samples this decoder accepts with the predictor. `previousPixel`
+ * holds the last pixel of the preceding span; it is added only when the span
+ * continues a row, and is then replaced by this span's last pixel.
+ */
+function undoHorizontalDifferencing(
+  samples: Uint8Array,
+  stride: number,
+  previousPixel: Uint8Array,
+  continuesRow: boolean,
+): void {
+  if (continuesRow) {
+    for (let index = 0; index < stride; index++) {
+      samples[index] = (samples[index] + previousPixel[index]) & 0xff;
+    }
+  }
+  for (let index = stride; index < samples.length; index++) {
+    samples[index] = (samples[index] + samples[index - stride]) & 0xff;
+  }
+  previousPixel.set(samples.subarray(samples.length - stride));
+}
+
+function chunkyRowReader(parsed: ParsedTiff, layout: ChunkyLayout): SourceRowReader {
+  return parsed.compression === COMPRESSION_LZW
+    ? lzwRowReader(parsed, layout)
+    : uncompressedRowReader(parsed, layout);
+}
+
+function decodeChunkyExact(
   parsed: ParsedTiff,
   output: Uint8ClampedArray,
 ): void {
-  const layout = parsed.layout as Exclude<PixelLayout, { kind: 'group4' }>;
-  const sourceBytes = parsed.directory.reader.bytes;
+  const layout = parsed.layout as ChunkyLayout;
+  const readRow = chunkyRowReader(parsed, layout);
+  let y = 0;
+  const writeSpan = (span: SourceSpan) => writeExactSpan(parsed, layout, span, y, output);
+  for (; y < parsed.height; y++) readRow(y, writeSpan);
+}
 
-  for (let y = 0; y < parsed.height; y++) {
-    const strip = Math.floor(y / parsed.rowsPerStrip);
-    const rowInStrip = y - strip * parsed.rowsPerStrip;
-    const rowOffset = parsed.stripOffsets.at(strip) + rowInStrip * layout.bytesPerRow;
-    for (let x = 0; x < parsed.width; x++) {
-      const destination = (y * parsed.width + x) * 4;
+function writeExactSpan(
+  parsed: ParsedTiff,
+  layout: ChunkyLayout,
+  { bytes: sourceBytes, rowOffset, firstX, endX }: SourceSpan,
+  y: number,
+  output: Uint8ClampedArray,
+): void {
+  for (let x = firstX; x < endX; x++) {
+    const destination = (y * parsed.width + x) * 4;
 
-      if (layout.kind === 'gray-1') {
-        const sample = (sourceBytes[rowOffset + (x >> 3)] >> (7 - (x & 7))) & 1;
-        const gray = layout.photometric === 0
-          ? (sample === 0 ? 255 : 0)
-          : (sample === 0 ? 0 : 255);
-        output[destination] = gray;
-        output[destination + 1] = gray;
-        output[destination + 2] = gray;
-        output[destination + 3] = 255;
-        continue;
-      }
-
-      if (layout.kind === 'gray-8') {
-        const sample = sourceBytes[rowOffset + x];
-        const gray = layout.photometric === 0 ? 255 - sample : sample;
-        output[destination] = gray;
-        output[destination + 1] = gray;
-        output[destination + 2] = gray;
-        output[destination + 3] = 255;
-        continue;
-      }
-
-      if (layout.kind === 'rgb') {
-        const source = rowOffset + x * 3;
-        output[destination] = sourceBytes[source];
-        output[destination + 1] = sourceBytes[source + 1];
-        output[destination + 2] = sourceBytes[source + 2];
-        output[destination + 3] = 255;
-        continue;
-      }
-
-      if (layout.kind === 'rgba-associated' || layout.kind === 'rgba-unassociated') {
-        const source = rowOffset + x * 4;
-        const alpha = sourceBytes[source + 3];
-        output[destination] = layout.kind === 'rgba-associated'
-          ? unassociate(sourceBytes[source], alpha)
-          : sourceBytes[source];
-        output[destination + 1] = layout.kind === 'rgba-associated'
-          ? unassociate(sourceBytes[source + 1], alpha)
-          : sourceBytes[source + 1];
-        output[destination + 2] = layout.kind === 'rgba-associated'
-          ? unassociate(sourceBytes[source + 2], alpha)
-          : sourceBytes[source + 2];
-        output[destination + 3] = alpha;
-        continue;
-      }
-
-      const source = rowOffset + x * 4;
-      const black = sourceBytes[source + 3];
-      output[destination] = cmykChannel(sourceBytes[source], black);
-      output[destination + 1] = cmykChannel(sourceBytes[source + 1], black);
-      output[destination + 2] = cmykChannel(sourceBytes[source + 2], black);
+    if (layout.kind === 'gray-1') {
+      const sample = (sourceBytes[rowOffset + (x >> 3)] >> (7 - (x & 7))) & 1;
+      const gray = layout.photometric === 0
+        ? (sample === 0 ? 255 : 0)
+        : (sample === 0 ? 0 : 255);
+      output[destination] = gray;
+      output[destination + 1] = gray;
+      output[destination + 2] = gray;
       output[destination + 3] = 255;
+      continue;
     }
+
+    if (layout.kind === 'gray-8') {
+      const sample = sourceBytes[rowOffset + x];
+      const gray = layout.photometric === 0 ? 255 - sample : sample;
+      output[destination] = gray;
+      output[destination + 1] = gray;
+      output[destination + 2] = gray;
+      output[destination + 3] = 255;
+      continue;
+    }
+
+    if (layout.kind === 'rgb') {
+      const source = rowOffset + x * 3;
+      output[destination] = sourceBytes[source];
+      output[destination + 1] = sourceBytes[source + 1];
+      output[destination + 2] = sourceBytes[source + 2];
+      output[destination + 3] = 255;
+      continue;
+    }
+
+    if (layout.kind === 'rgba-associated' || layout.kind === 'rgba-unassociated') {
+      const source = rowOffset + x * 4;
+      const alpha = sourceBytes[source + 3];
+      output[destination] = layout.kind === 'rgba-associated'
+        ? unassociate(sourceBytes[source], alpha)
+        : sourceBytes[source];
+      output[destination + 1] = layout.kind === 'rgba-associated'
+        ? unassociate(sourceBytes[source + 1], alpha)
+        : sourceBytes[source + 1];
+      output[destination + 2] = layout.kind === 'rgba-associated'
+        ? unassociate(sourceBytes[source + 2], alpha)
+        : sourceBytes[source + 2];
+      output[destination + 3] = alpha;
+      continue;
+    }
+
+    const source = rowOffset + x * 4;
+    const black = sourceBytes[source + 3];
+    output[destination] = cmykChannel(sourceBytes[source], black);
+    output[destination + 1] = cmykChannel(sourceBytes[source + 1], black);
+    output[destination + 2] = cmykChannel(sourceBytes[source + 2], black);
+    output[destination + 3] = 255;
   }
 }
 
@@ -607,30 +868,32 @@ function clampByte(value: number): number {
 }
 
 /**
- * Accumulate one source row into one retained row using exact integer box-area
+ * Accumulate one source span into one retained row using exact integer box-area
  * overlap weights. Color sums use a channel×alpha representation: associated
  * samples multiply their stored premultiplied channel by 255, unassociated
  * samples multiply straight color by alpha, and opaque samples use alpha 255.
  * Dividing color sums by the accumulated alpha therefore emits straight Canvas
- * RGBA without color bleeding from transparent pixels.
+ * RGBA without color bleeding from transparent pixels. The sums are additive,
+ * so the spans of a row may each contribute part of an output column.
  */
-function accumulateAreaRow(
+function accumulateAreaSpan(
   parsed: ParsedTiff,
   plan: OutputPlan,
-  rowOffset: number,
+  { bytes: sourceBytes, rowOffset, firstX, endX }: SourceSpan,
   yWeight: number,
   accumulator: Float64Array,
 ): void {
-  const layout = parsed.layout as Exclude<PixelLayout, { kind: 'group4' }>;
-  const sourceBytes = parsed.directory.reader.bytes;
+  const layout = parsed.layout as ChunkyLayout;
+  const firstOutputX = Math.floor((firstX * plan.width) / parsed.width);
+  const lastOutputX = Math.floor((endX * plan.width - 1) / parsed.width);
 
-  for (let outputX = 0; outputX < plan.width; outputX++) {
+  for (let outputX = firstOutputX; outputX <= lastOutputX; outputX++) {
     // Work in coordinates scaled by outputWidth. All boundaries and overlap
     // weights remain exact safe integers under the source/retained caps.
     const destinationLeft = outputX * parsed.width;
     const destinationRight = (outputX + 1) * parsed.width;
-    const firstSourceX = Math.floor(destinationLeft / plan.width);
-    const lastSourceX = Math.floor((destinationRight - 1) / plan.width);
+    const firstSourceX = Math.max(firstX, Math.floor(destinationLeft / plan.width));
+    const lastSourceX = Math.min(endX - 1, Math.floor((destinationRight - 1) / plan.width));
     let redAlpha = 0;
     let greenAlpha = 0;
     let blueAlpha = 0;
@@ -728,76 +991,220 @@ function writeAreaRow(
   }
 }
 
-function decodeUncompressedArea(
+function decodeChunkyArea(
   parsed: ParsedTiff,
   plan: OutputPlan,
   output: Uint8ClampedArray,
 ): void {
-  const layout = parsed.layout as Exclude<PixelLayout, { kind: 'group4' }>;
-  const accumulator = new Float64Array(plan.width * 4);
+  const readRow = chunkyRowReader(parsed, parsed.layout as ChunkyLayout);
+  // The target never upscales, so one source row overlaps at most two
+  // consecutive output rows. Rows are visited once (LZW spans cannot be
+  // replayed), so each in-flight output row keeps its own accumulator.
+  const accumulators = [
+    new Float64Array(plan.width * 4),
+    new Float64Array(plan.width * 4),
+  ] as const;
   const normalization = parsed.width * parsed.height;
-  let activeOutputY = -1;
-
-  for (let sourceY = 0; sourceY < parsed.height; sourceY++) {
-    const strip = Math.floor(sourceY / parsed.rowsPerStrip);
-    const rowInStrip = sourceY - strip * parsed.rowsPerStrip;
-    const rowOffset = parsed.stripOffsets.at(strip) + rowInStrip * layout.bytesPerRow;
-    const sourceTop = sourceY * plan.height;
-    const sourceBottom = (sourceY + 1) * plan.height;
-    const firstOutputY = Math.floor(sourceTop / parsed.height);
-    const lastOutputY = Math.floor((sourceBottom - 1) / parsed.height);
-
+  let writtenOutputY = -1;
+  let sourceTop = 0;
+  let sourceBottom = 0;
+  let firstOutputY = 0;
+  let lastOutputY = 0;
+  const flushThrough = (outputY: number) => {
+    while (writtenOutputY < outputY) {
+      writtenOutputY++;
+      const accumulator = accumulators[writtenOutputY & 1];
+      writeAreaRow(accumulator, output, plan.width, writtenOutputY, normalization);
+      accumulator.fill(0);
+    }
+  };
+  const accumulateSpan = (span: SourceSpan) => {
     for (let outputY = firstOutputY; outputY <= lastOutputY; outputY++) {
-      if (outputY !== activeOutputY) {
-        if (activeOutputY >= 0) {
-          writeAreaRow(accumulator, output, plan.width, activeOutputY, normalization);
-          accumulator.fill(0);
-        }
-        if (outputY !== activeOutputY + 1) fail('Internal TIFF area-row sequence failure');
-        activeOutputY = outputY;
-      }
       const destinationTop = outputY * parsed.height;
       const destinationBottom = (outputY + 1) * parsed.height;
       const yWeight = Math.min(sourceBottom, destinationBottom)
         - Math.max(sourceTop, destinationTop);
-      accumulateAreaRow(parsed, plan, rowOffset, yWeight, accumulator);
+      accumulateAreaSpan(parsed, plan, span, yWeight, accumulators[outputY & 1]);
     }
+  };
+
+  for (let sourceY = 0; sourceY < parsed.height; sourceY++) {
+    sourceTop = sourceY * plan.height;
+    sourceBottom = (sourceY + 1) * plan.height;
+    firstOutputY = Math.floor(sourceTop / parsed.height);
+    lastOutputY = Math.floor((sourceBottom - 1) / parsed.height);
+    if (firstOutputY <= writtenOutputY || lastOutputY > firstOutputY + 1) {
+      fail('Internal TIFF area-row sequence failure');
+    }
+    flushThrough(firstOutputY - 1);
+    readRow(sourceY, accumulateSpan);
   }
-  if (activeOutputY !== plan.height - 1) fail('Internal TIFF area-row coverage failure');
-  writeAreaRow(accumulator, output, plan.width, activeOutputY, normalization);
+  if (lastOutputY !== plan.height - 1) fail('Internal TIFF area-row coverage failure');
+  flushThrough(lastOutputY);
 }
 
-function decodeUncompressed(
+function decodeChunky(
   parsed: ParsedTiff,
   plan: OutputPlan,
   output: Uint8ClampedArray,
 ): void {
   if (plan.width === parsed.width && plan.height === parsed.height) {
-    decodeUncompressedExact(parsed, output);
+    decodeChunkyExact(parsed, output);
   } else {
-    decodeUncompressedArea(parsed, plan, output);
+    decodeChunkyArea(parsed, plan, output);
   }
 }
 
-class StripBitReader {
-  private bitOffset = 0;
+const LZW_CLEAR_CODE = 256;
+const LZW_END_OF_INFORMATION = 257;
+const LZW_FIRST_STRING_CODE = 258;
+const LZW_MIN_CODE_WIDTH = 9;
+const LZW_MAX_CODE_WIDTH = 12;
+const LZW_TABLE_SIZE = 1 << LZW_MAX_CODE_WIDTH;
+
+/**
+ * TIFF 6.0 §13 LZW decoder for one strip at a time.
+ *
+ * - Codes are packed most-significant bit first. They start 9 bits wide and
+ *   widen one code early: to 10, 11 and 12 bits once the next free table entry
+ *   is 511, 1023 and 2047. 12 bits is the maximum, so the table never exceeds
+ *   4096 entries; a conforming writer emits ClearCode (256) before that.
+ * - Code 256 resets the table and width; code 257 (EndOfInformation) ends the
+ *   strip. Strings start at code 258.
+ * - §13's encoder writes ClearCode first. A strip that does not begin with it is
+ *   refused, which also rejects the pre-6.0 LSB-first variant that this decoder
+ *   does not implement.
+ *
+ * The table stores each string as (prefix code, final byte, first byte,
+ * length), so expansion costs one write per output byte. Code reads and
+ * expansion bytes share an image-wide budget, including strip finalization.
+ */
+class TiffLzwDecoder {
+  private readonly prefix = new Uint16Array(LZW_TABLE_SIZE);
+  private readonly suffix = new Uint8Array(LZW_TABLE_SIZE);
+  private readonly first = new Uint8Array(LZW_TABLE_SIZE);
+  private readonly length = new Uint16Array(LZW_TABLE_SIZE);
+  private readonly pending = new Uint8Array(LZW_TABLE_SIZE);
+  private pendingStart = 0;
+  private pendingEnd = 0;
+  private readonly reader: TiffBitReader;
+  private codeWidth = LZW_MIN_CODE_WIDTH;
+  private nextCode = LZW_FIRST_STRING_CODE;
+  private previousCode = -1;
+  private ended = false;
+  private work = 0;
 
   constructor(
-    private readonly bytes: Uint8Array,
-    private readonly byteOffset: number,
-    private readonly byteLength: number,
-  ) {}
-
-  readBit(): number {
-    if (this.bitOffset >= this.byteLength * 8) {
-      fail('CCITT Group 4 data is truncated');
+    bytes: Uint8Array,
+    private readonly workLimit: number,
+  ) {
+    this.reader = new TiffBitReader(bytes, 0, 0, 'TIFF LZW data is truncated');
+    for (let code = 0; code < 256; code++) {
+      this.suffix[code] = code;
+      this.first[code] = code;
+      this.length[code] = 1;
     }
-    const bit = (
-      this.bytes[this.byteOffset + (this.bitOffset >> 3)]
-      >> (7 - (this.bitOffset & 7))
-    ) & 1;
-    this.bitOffset++;
-    return bit;
+  }
+
+  beginStrip(byteOffset: number, byteLength: number): void {
+    this.reader.beginStrip(byteOffset, byteLength);
+    this.pendingStart = 0;
+    this.pendingEnd = 0;
+    this.ended = false;
+    this.clearTable();
+    if (this.readCode() !== LZW_CLEAR_CODE) fail('TIFF LZW strip must begin with ClearCode');
+  }
+
+  /** Fill `row` completely with the next decoded bytes of the active strip. */
+  fill(row: Uint8Array): void {
+    let written = 0;
+    while (written < row.length) {
+      if (this.pendingStart === this.pendingEnd) this.decodeNextString();
+      if (this.ended) fail('TIFF LZW strip ended before its declared rows');
+      const count = Math.min(row.length - written, this.pendingEnd - this.pendingStart);
+      row.set(this.pending.subarray(this.pendingStart, this.pendingStart + count), written);
+      this.pendingStart += count;
+      written += count;
+    }
+  }
+
+  finishStrip(): void {
+    if (this.pendingStart !== this.pendingEnd) fail('TIFF LZW data exceeds its declared rows');
+    // TIFF 6.0 §13 requires EOI at strip end. libtiff's LZWPostEncode may
+    // emit a final ClearCode before EOI, then only byte-alignment padding.
+    // Stop at EOI; padding is not another code or decoded data.
+    this.decodeNextString(false);
+  }
+
+  private chargeWork(amount: number): void {
+    this.work += amount;
+    if (this.work > this.workLimit) {
+      throw new OoxmlDecodedImageLimitError('tiff-lzw-work', this.workLimit, this.work);
+    }
+  }
+
+  private clearTable(): void {
+    this.codeWidth = LZW_MIN_CODE_WIDTH;
+    this.nextCode = LZW_FIRST_STRING_CODE;
+    this.previousCode = -1;
+  }
+
+  private readCode(): number {
+    const code = this.reader.readBits(this.codeWidth);
+    this.chargeWork(1);
+    return code;
+  }
+
+  private decodeNextString(allowData = true): void {
+    for (;;) {
+      if (this.ended) fail('TIFF LZW strip ended before its declared rows');
+      const code = this.readCode();
+      if (code === LZW_CLEAR_CODE) {
+        this.clearTable();
+        continue;
+      }
+      if (code === LZW_END_OF_INFORMATION) {
+        this.ended = true;
+        return;
+      }
+      if (this.previousCode < 0) {
+        if (code >= LZW_CLEAR_CODE) fail(`Invalid TIFF LZW code: ${code}`);
+      } else {
+        this.addString(code);
+      }
+      if (!allowData) fail('TIFF LZW data exceeds its declared rows');
+      this.expand(code);
+      this.previousCode = code;
+      return;
+    }
+  }
+
+  /** Add previous string + first byte of `code` (KwKwK when `code` is that new entry). */
+  private addString(code: number): void {
+    if (code > this.nextCode) fail(`Invalid TIFF LZW code: ${code}`);
+    if (this.nextCode >= LZW_TABLE_SIZE) fail('TIFF LZW code table overflow');
+    const previous = this.previousCode;
+    const entry = this.nextCode;
+    this.prefix[entry] = previous;
+    this.suffix[entry] = code === entry ? this.first[previous] : this.first[code];
+    this.first[entry] = this.first[previous];
+    this.length[entry] = this.length[previous] + 1;
+    this.nextCode++;
+    if (this.nextCode >= (1 << this.codeWidth) - 1 && this.codeWidth < LZW_MAX_CODE_WIDTH) {
+      this.codeWidth++;
+    }
+  }
+
+  private expand(code: number): void {
+    let current = code;
+    const length = this.length[current];
+    this.chargeWork(length);
+    for (let index = length - 1; index >= 0; index--) {
+      this.pending[index] = this.suffix[current];
+      current = this.prefix[current];
+    }
+    this.pendingStart = 0;
+    this.pendingEnd = length;
   }
 }
 
@@ -890,7 +1297,7 @@ const MODE_TABLE = new Map<number, TwoDimensionalMode>([
   [(1 << 7) | 0b0000011, 3],
 ]);
 
-function decodeMode(reader: StripBitReader): TwoDimensionalMode {
+function decodeMode(reader: TiffBitReader): TwoDimensionalMode {
   let code = 0;
   for (let length = 1; length <= 7; length++) {
     code = (code << 1) | reader.readBit();
@@ -900,7 +1307,7 @@ function decodeMode(reader: StripBitReader): TwoDimensionalMode {
   fail('Invalid or unsupported CCITT Group 4 two-dimensional mode');
 }
 
-function decodeRun(reader: StripBitReader, black: boolean, maximum: number): number {
+function decodeRun(reader: TiffBitReader, black: boolean, maximum: number): number {
   const table = black ? BLACK_TABLE : WHITE_TABLE;
   let total = 0;
   const maximumCodes = Math.ceil(maximum / 64) + 64;
@@ -991,7 +1398,7 @@ function referenceChanges(
 }
 
 function decodeGroup4Row(
-  reader: StripBitReader,
+  reader: TiffBitReader,
   reference: readonly number[],
   coding: Group4Row,
   width: number,
@@ -1142,10 +1549,11 @@ function decodeGroup4(
     reference[0] = parsed.width;
     const firstRow = strip * parsed.rowsPerStrip;
     const rowCount = Math.min(parsed.rowsPerStrip, parsed.height - firstRow);
-    const reader = new StripBitReader(
+    const reader = new TiffBitReader(
       parsed.directory.reader.bytes,
       parsed.stripOffsets.at(strip),
       parsed.stripByteCounts.at(strip),
+      'CCITT Group 4 data is truncated',
     );
     for (let row = 0; row < rowCount; row++) {
       const sourceY = firstRow + row;
@@ -1202,7 +1610,7 @@ function decodeTiffRgbaInternal(
   const plan = outputPlan(parsed.width, parsed.height, options);
   const output = new Uint8ClampedArray(plan.pixels * 4);
   if (parsed.layout.kind === 'group4') decodeGroup4(parsed, plan, output, diagnostics);
-  else decodeUncompressed(parsed, plan, output);
+  else decodeChunky(parsed, plan, output);
   return { width: plan.width, height: plan.height, data: output };
 }
 

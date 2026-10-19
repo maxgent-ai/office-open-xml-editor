@@ -10,7 +10,7 @@ import type {
 } from '../types.js';
 import type { ImageMetadataRecord, MathOccurrence, PictureBulletSizeResolver } from './resources.js';
 import type { BodyAcquisitionInputProjections } from './acquisition-input-projections.js';
-import { chartResourceKey, imageResourceKey } from './source-key.js';
+import { chartResourceKey, imageResourceKey, vmlPictureResourceKey, vmlStrokeResourceKey, vmlEdgeResourceKey } from './source-key.js';
 import {
   createPaintResourceRegistry,
 } from './paint-resources.js';
@@ -24,13 +24,15 @@ export function chartPaintResourceKey(source: import('./types.js').SourceRef): s
   return chartResourceKey(source);
 }
 
+type ImageDescriptorOptions = Partial<ImageRun> & Pick<ImagePaintResourceDescriptor, 'vmlFill' | 'vmlStrokePattern' | 'effectHost'>;
+
 type ImageDescriptorCandidate = Omit<ImagePaintResourceDescriptor, 'intrinsicSize' | 'mimeType'>;
 
 function imageCandidate(
   kind: 'image' | 'picture-bullet',
   resourceKey: string,
   partPath: string,
-  run: Partial<ImageRun> = {},
+  run: ImageDescriptorOptions = {},
 ): ImageDescriptorCandidate {
   return {
     kind,
@@ -46,6 +48,10 @@ function imageCandidate(
     // every authored string; only None/omission has no decoded effect owner.
     ...(run.colorReplaceFrom == null ? {} : { colorReplaceFrom: run.colorReplaceFrom }),
     ...(run.duotone === undefined ? {} : { duotone: { ...run.duotone } }),
+    ...(run.vmlStrokePattern === undefined ? {} : { vmlStrokePattern: run.vmlStrokePattern }),
+    ...(run.vmlFill === undefined ? {} : { vmlFill: run.vmlFill }),
+    ...(run.blipEffects?.length ? { blipEffects: run.blipEffects.map(effect => ({ ...effect })) } : {}),
+    ...(run.effectHost === undefined ? {} : { effectHost: { ...run.effectHost } }),
   };
 }
 
@@ -65,9 +71,9 @@ function collectDescriptorCandidates(
     mimeType: string,
     widthPt: number,
     heightPt: number,
-    run: Partial<ImageRun> = {},
+    run: ImageDescriptorOptions = {},
+    resourceKey = imageResourceKey(source, partPath),
   ): void => {
-    const resourceKey = imageResourceKey(source, partPath);
     imageCandidates.push(imageCandidate(kind, resourceKey, partPath, run));
     imageMetadata.push({ resourceKey, mimeType, widthPt, heightPt });
   };
@@ -86,7 +92,7 @@ function collectDescriptorCandidates(
       return;
     }
     if (run.type !== 'shape') return;
-    const shape = run as ShapeRun & Readonly<{ textBoxContent?: BodyElement[] }>;
+    const shape = run as ShapeRun & import('./types.js').VmlShapeAcquisitionFacts & Readonly<{ textBoxContent?: BodyElement[] }>;
     if (shape.fill?.fillType === 'image') {
       addImage(
         'image', source, shape.fill.imagePath, shape.fill.mimeType,
@@ -100,8 +106,42 @@ function collectDescriptorCandidates(
           }),
           ...(shape.fill.alpha === undefined ? {} : { alpha: shape.fill.alpha }),
           ...(shape.fill.duotone === undefined ? {} : { duotone: shape.fill.duotone }),
+          ...(shape.fill.blipEffects?.length ? {
+            blipEffects: shape.fill.blipEffects,
+            effectHost: {
+              rotation: shape.rotation, flipH: shape.flipH, flipV: shape.flipV,
+              ...(shape.fill.fillRect === undefined ? {} : { fillRect: { ...shape.fill.fillRect } }),
+              ...(shape.fill.tile ? { tileDpi: 96 } : {}),
+            },
+          } : {}),
+          ...(shape.fill.vml === undefined ? {} : { vmlFill: shape.fill.vml }),
         },
       );
+    }
+    if (shape.vmlStrokeFill) {
+      const fill = shape.vmlStrokeFill;
+      addImage('image', source, fill.imagePath, fill.mimeType, shape.widthPt + (shape.vmlInsetPen === true ? 0 : shape.strokeWidth ?? 0), shape.heightPt + (shape.vmlInsetPen === true ? 0 : shape.strokeWidth ?? 0),
+        { alpha: fill.alpha, duotone: fill.duotone, vmlFill: fill.vml, vmlStrokePattern: shape.vmlStrokePattern },
+        vmlStrokeResourceKey(source, fill.imagePath));
+    }
+    for (const edge of shape.vmlEdgeStrokes ?? []) {
+      const fill = edge.image;
+      if (fill) addImage('image', source, fill.imagePath, fill.mimeType,
+        shape.widthPt + edge.widthPt, shape.heightPt + edge.widthPt,
+        { alpha: fill.alpha, vmlFill: fill.vml, vmlStrokePattern: edge.pattern ?? undefined },
+        vmlEdgeResourceKey(source, edge.edge));
+    }
+    if (shape.vmlPicture) {
+      const picture = shape.vmlPicture;
+      // Part 4 §§19.1.2.10/.11/.19: the host owns picture placement.
+      // Project resource/crop/effect facts explicitly: Rust serializes a full
+      // ImageRun, and a TypeScript Pick does not erase its runtime transforms.
+      addImage('image', source, picture.imagePath, picture.mimeType,
+        shape.widthPt, shape.heightPt, {
+          srcRect: picture.srcRect,
+          colorReplaceFrom: picture.colorReplaceFrom,
+          duotone: picture.duotone,
+        }, vmlPictureResourceKey(source, picture.imagePath));
     }
     const storyInstance = `${source.story}:${source.storyInstance}:${source.path.join('.')}`;
     if (shape.textBoxContent !== undefined) {

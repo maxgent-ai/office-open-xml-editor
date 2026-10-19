@@ -27,7 +27,7 @@ test('a static owner import in the worker graph fails, while a selected-source i
 
 test('named source dispatch allowlist rejects imports outside the owner', () => {
   const path = 'packages/docx/src/document.ts';
-  const dispatch = "class DocxDocument { static async load(opts) { if (opts.modelSources) return import('./internal/document-model-source.js'); } }";
+  const dispatch = "class DocxDocument { static async load(opts) { if (opts.legacyDoc) return import('./internal/document-model-source.js'); } }";
   assert.doesNotThrow(() => checkSourceDispatchImports([{ path, text: dispatch }]));
   assert.throws(() => checkSourceDispatchImports([{
     path, text: `${dispatch}\nvoid import('./internal/document-model-source.js');`,
@@ -42,7 +42,7 @@ test('rejects an unconditional model-source import in a built entry', () => {
     "void import('./document-model-source-CYLDKzzV.js');", 'dist/docx.mjs',
   ), /top level/);
   assert.doesNotThrow(() => assertNoTopLevelModelImport(
-    "async function load(opts) { if (opts.modelSources) await import('./document-model-source-CYLDKzzV.js'); }",
+    "async function load(opts) { if (opts.legacyDoc) await import('./document-model-source-CYLDKzzV.js'); }",
     'dist/docx.mjs',
   ));
 });
@@ -68,7 +68,7 @@ test('each eager entry type rejects a transitive static model-source import', ()
 });
 
 test('a model-source marker leaking into eager emitted code fails', () => {
-  assert.throws(() => assertNoSourceRuntime('const marker="ooxml-model-source-module/v1";', 'entry'), /optional source runtime/);
+  assert.throws(() => assertNoSourceRuntime(JSON.stringify('ooxml-model-source-module/v2'), 'entry'), /optional source runtime/);
 });
 
 test('a model-source helper factored outside the branch is charged to the build difference', async () => {
@@ -81,7 +81,7 @@ test('a model-source helper factored outside the branch is charged to the build 
       `k${index}: 'value-${index}-${(index * 7919).toString(36)}'`).join(',');
     writeFileSync(entry, `function prepareSource(key) { return ({${lookup}})[key]; }
 export async function load(options = {}) {
-  if (__OOXML_MODEL_SOURCES__ && options.modelSources !== undefined) {
+  if (__OOXML_MODEL_SOURCES__ && options.legacyDoc !== undefined) {
     prepareSource(options.key);
     return import('./model-source.js');
   }

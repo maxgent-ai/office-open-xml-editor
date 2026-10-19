@@ -15,7 +15,7 @@ import {
   wordGridRightIndentAdjustmentPt,
 } from './layout/line-compatibility.js';
 import type { NumberingMarkerGeometry } from './layout/numbering-marker.js';
-import type { NativeSectionFlow } from './layout/types.js';
+import type { SectionFlow } from './layout/types.js';
 import type {
   BodyElement,
   ColumnGeom,
@@ -67,9 +67,9 @@ export interface SectionLayoutContext {
   readonly columnSeparator: boolean;
   readonly grid: SectionGridContext;
   readonly textDirection: string;
-  /** Canonical native MS-DOC flow (never authored by OOXML); selects its own
+  /** Canonical producer section flow (never authored by OOXML); selects its own
    * frame for the nominal `textDirection`. Absent for every OOXML section. */
-  readonly nativeSectionFlow?: NativeSectionFlow;
+  readonly sectionFlow?: SectionFlow;
   /** Internal retention of §17.6.1 section-level column population direction. */
   readonly sectionBidi?: boolean;
   readonly verticalAlignment: string;
@@ -248,18 +248,18 @@ function normalizeGridKind(type: string | null | undefined): SectionGridContext[
   }
 }
 
-export function isSectionLineGrid(kind: SectionGridContext['kind']): boolean {
+function isSectionLineGrid(kind: SectionGridContext['kind']): boolean {
   return kind === 'lines' || kind === 'linesAndChars' || kind === 'snapToChars';
 }
 
-export function isSectionCharacterGrid(kind: SectionGridContext['kind']): boolean {
+function isSectionCharacterGrid(kind: SectionGridContext['kind']): boolean {
   return kind === 'linesAndChars' || kind === 'snapToChars';
 }
 
 export function resolveSectionLayoutContext(
   _settings: DocumentLayoutSettings,
   section: SectionProps,
-  nativeSectionFlow?: NativeSectionFlow,
+  sectionFlow?: SectionFlow,
 ): SectionLayoutContext {
   return {
     geometry: {
@@ -281,7 +281,7 @@ export function resolveSectionLayoutContext(
         section.docGridCharSpace == null ? null : section.docGridCharSpace / 4096,
     },
     textDirection: section.textDirection ?? 'lrTb',
-    ...(nativeSectionFlow ? { nativeSectionFlow } : {}),
+    ...(sectionFlow ? { sectionFlow } : {}),
     sectionBidi: false,
     verticalAlignment: section.vAlign ?? 'top',
     lineNumbering: section.lineNumbering ?? undefined,

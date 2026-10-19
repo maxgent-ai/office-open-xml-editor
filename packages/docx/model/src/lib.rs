@@ -28,18 +28,26 @@ pub const PARSE_DIAGNOSTIC_SEVERITY_INVALID_DRAWING_EXTENT: DiagnosticSeverity =
     DiagnosticSeverity::Error;
 pub const PARSE_DIAGNOSTIC_SEVERITY_DEGENERATE_DRAWING_EXTENT: DiagnosticSeverity =
     DiagnosticSeverity::Warning;
-/// Native DOC nested-cell paragraph frames kept as `framePr` facts while the
-/// shared consumer lays their tables out in ordinary cell flow. Word's native
-/// DOC positioning of such frames is not established; this is a library
-/// fallback, reported rather than silent.
-pub const PARSE_DIAGNOSTIC_CODE_NATIVE_DOC_NESTED_CELL_FRAME_FLOW: &str =
-    "NATIVE_DOC_NESTED_CELL_FRAME_FLOW";
-pub const PARSE_DIAGNOSTIC_SEVERITY_NATIVE_DOC_NESTED_CELL_FRAME_FLOW: DiagnosticSeverity =
+/// Nested-cell paragraph frames a producer retained as `framePr` facts while
+/// the shared consumer lays their tables out in ordinary cell flow. Word
+/// evidence for that flow covers WordprocessingML sources only, so a producer
+/// whose source format has no such evidence reports it rather than staying
+/// silent. The WordprocessingML parser never emits this code.
+pub const PARSE_DIAGNOSTIC_CODE_NESTED_CELL_FRAME_FLOW: &str = "NESTED_CELL_FRAME_FLOW";
+pub const PARSE_DIAGNOSTIC_SEVERITY_NESTED_CELL_FRAME_FLOW: DiagnosticSeverity =
     DiagnosticSeverity::Warning;
-/// Source part of a code-specific fact: the [MS-DOC] main stream of a native
-/// Word binary. A code without its own part constant is a WordprocessingML
-/// `word/document.xml` fact; layout accepts each code only from its own part.
-pub const PARSE_DIAGNOSTIC_PART_NATIVE_DOC_NESTED_CELL_FRAME_FLOW: &str = "WordDocument";
+/// Source part of a code-specific fact: the main document story of a
+/// producer that has no WordprocessingML part name. A code without its own
+/// part constant is a WordprocessingML `word/document.xml` fact; layout
+/// accepts each code only from its own part.
+pub const PARSE_DIAGNOSTIC_PART_NESTED_CELL_FRAME_FLOW: &str = "document";
+
+pub const PARSE_DIAGNOSTIC_CODE_REF_BOOKMARK_RESOURCE_LIMIT: &str = "REF_BOOKMARK_RESOURCE_LIMIT";
+pub const PARSE_DIAGNOSTIC_SEVERITY_REF_BOOKMARK_RESOURCE_LIMIT: DiagnosticSeverity =
+    DiagnosticSeverity::Warning;
+pub const PARSE_DIAGNOSTIC_CODE_UNSUPPORTED_VML_CONTENT: &str = "UNSUPPORTED_VML_CONTENT";
+pub const PARSE_DIAGNOSTIC_SEVERITY_UNSUPPORTED_VML_CONTENT: DiagnosticSeverity =
+    DiagnosticSeverity::Warning;
 
 /// Private parser-to-layout diagnostic severity. This wire is intentionally
 /// smaller than the public document model: diagnostics carry stable facts and
@@ -235,62 +243,44 @@ mod serialization_tests {
     }
 
     #[test]
-    fn native_separator_wire_keeps_story_and_mark_distinctions() {
-        let source = |header_cp| NativeNoteSeparatorSourceWire {
-            header_cp,
-            fc: 0x800 + header_cp * 2,
-            prm: 0,
-            paragraph_style: 0,
-        };
-        let story = |class, guard_cp, paragraph| NativeNoteSeparatorStoryWire {
-            class,
-            content_start_cp: 6,
-            content_end_cp: 6,
-            guard_cp,
-            rule: None,
-            paragraph,
-        };
-        let partial = NativeNoteSeparatorParagraphWire {
+    fn reserved_separator_wire_keeps_story_and_mark_distinctions() {
+        let paragraph = ReservedNoteSeparatorParagraphWire {
             paragraph: DocParagraph::default(),
             content_mark: None,
             numbered: false,
             framed: false,
-            source: source(0),
         };
-        let hidden = NativeNoteSeparatorParagraphWire {
-            content_mark: Some(NativeNoteSeparatorCharacterWire {
+        let hidden = ReservedNoteSeparatorParagraphWire {
+            content_mark: Some(ReservedNoteSeparatorCharacterWire {
                 run: None,
                 insertion: false,
             }),
             framed: true,
-            ..partial.clone()
+            ..paragraph.clone()
         };
-        let json = |value: &NativeNoteSeparatorStoryWire| serde_json::to_value(value).unwrap();
-        let empty = json(&story(NativeNoteSeparatorStoryClass::Empty, None, None));
-        assert_eq!(empty["class"], "empty");
-        assert!(empty.get("guardCp").is_none());
-        let guard = json(&story(
-            NativeNoteSeparatorStoryClass::GuardOnly,
-            Some(6),
-            None,
-        ));
-        assert_eq!(guard["class"], "guardOnly");
-        assert_eq!(guard["guardCp"], 6);
-        let partial = json(&story(
-            NativeNoteSeparatorStoryClass::Rule,
-            None,
-            Some(partial),
-        ));
+        let json = |value: &ReservedNoteSeparatorStoryWire| serde_json::to_value(value).unwrap();
+        let empty = json(&ReservedNoteSeparatorStoryWire::default());
+        assert_eq!(empty, serde_json::json!({}));
+        let partial = json(&ReservedNoteSeparatorStoryWire {
+            rule: None,
+            paragraph: Some(paragraph),
+        });
         assert!(partial["paragraph"].get("contentMark").is_none());
         assert!(partial["paragraph"].get("framed").is_none());
-        assert_eq!(partial["paragraph"]["source"]["headerCp"], 0);
-        let hidden = json(&story(
-            NativeNoteSeparatorStoryClass::Rule,
-            None,
-            Some(hidden),
-        ));
+        let hidden = json(&ReservedNoteSeparatorStoryWire {
+            rule: Some(ReservedNoteSeparatorRuleWire {
+                mark: Some(NoteSeparatorMark::Short),
+                control: ReservedNoteSeparatorCharacterWire {
+                    run: None,
+                    insertion: true,
+                },
+            }),
+            paragraph: Some(hidden),
+        });
         assert_eq!(hidden["paragraph"]["contentMark"], serde_json::json!({}));
         assert_eq!(hidden["paragraph"]["framed"], true);
+        assert_eq!(hidden["rule"]["mark"], "short");
+        assert_eq!(hidden["rule"]["control"]["insertion"], true);
     }
 
     #[test]
@@ -371,122 +361,100 @@ pub struct NoteLayoutSettingsWire {
     pub footnote_separator_paragraph: Option<Box<DocParagraph>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub footnote_continuation_separator_paragraph: Option<Box<DocParagraph>>,
-    /// Native (MS-DOC) producer only: supported PAPX/CHPX facts and native
-    /// provenance of the reserved separator stories it admitted. Omitted for
-    /// DOCX and for documents without native notes. The shared consumer uses
-    /// the retained rule/control and paragraph-mark metrics with reserved-story
-    /// ownership. Numeric short-rule geometry remains library layout policy;
-    /// continuation roles apply only while footnote continuation is enabled
-    /// (the default; an explicit `false` keeps whole-note pagination).
+    /// Reserved note separator stories (ECMA-376 §17.11.2/§17.11.10
+    /// `w:footnote`/`w:endnote` of §17.18.33 type `separator`,
+    /// `continuationSeparator` or `continuationNotice`) supplied as resolved
+    /// stories by a producer that admits each one into the closed shape
+    /// below: an optional Short/Full rule control and at most one run-free
+    /// paragraph whose control and paragraph mark keep their own character
+    /// properties. Layout measures each story through the paragraph pipeline
+    /// and reserves it with reserved-story ownership. Numeric short-rule
+    /// geometry remains library layout policy; continuation roles apply only
+    /// while footnote continuation is enabled (the default; an explicit
+    /// `false` keeps whole-note pagination). The WordprocessingML parser does
+    /// not emit this field; its formatted separators use the fields above.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub native_separators: Option<Box<NativeNoteSeparatorsWire>>,
+    pub reserved_separators: Option<Box<ReservedNoteSeparatorsWire>>,
 }
 
-/// MS-DOC 2.3.3 reserved separator stories, retained once per document for
-/// each present note kind (never per note, page or worker).
+/// Reserved separator stories, retained once per document for each present
+/// note kind (never per note, page or worker).
 #[derive(Serialize, Debug, Clone, Default)]
 #[serde(rename_all = "camelCase")]
-pub struct NativeNoteSeparatorsWire {
+pub struct ReservedNoteSeparatorsWire {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub footnote: Option<NativeNoteSeparatorStoriesWire>,
+    pub footnote: Option<ReservedNoteSeparatorStoriesWire>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub endnote: Option<NativeNoteSeparatorStoriesWire>,
+    pub endnote: Option<ReservedNoteSeparatorStoriesWire>,
 }
 
 /// The three role slots of one note kind (separator, continuation separator,
 /// continuation notice). Role does not select the rule kind.
 #[derive(Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
-pub struct NativeNoteSeparatorStoriesWire {
-    pub separator: NativeNoteSeparatorStoryWire,
-    pub continuation_separator: NativeNoteSeparatorStoryWire,
-    pub continuation_notice: NativeNoteSeparatorStoryWire,
+pub struct ReservedNoteSeparatorStoriesWire {
+    pub separator: ReservedNoteSeparatorStoryWire,
+    pub continuation_separator: ReservedNoteSeparatorStoryWire,
+    pub continuation_notice: ReservedNoteSeparatorStoryWire,
 }
 
-/// Closed native story shape. An empty story has no CPs, a guard-only story
-/// only its terminal guard mark, a paragraph-only story one authored
-/// paragraph mark before the guard. The guard is never authored content.
-#[derive(Serialize, Debug, Clone, Copy, Eq, PartialEq)]
+/// Closed story shape. No paragraph is an empty story (no ink, no flow); a
+/// paragraph without a rule is a paragraph-only story; a rule always comes
+/// with the paragraph whose mark ends it.
+#[derive(Serialize, Debug, Clone, Default)]
 #[serde(rename_all = "camelCase")]
-pub enum NativeNoteSeparatorStoryClass {
-    Empty,
-    GuardOnly,
-    ParagraphOnly,
-    Rule,
+pub struct ReservedNoteSeparatorStoryWire {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rule: Option<ReservedNoteSeparatorRuleWire>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paragraph: Option<ReservedNoteSeparatorParagraphWire>,
 }
 
+/// The rule control character (§17.11.23 `separator` / §17.11.1
+/// `continuationSeparator` semantics). `mark` is present only when the
+/// producer established that the control has its rule meaning.
 #[derive(Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
-pub struct NativeNoteSeparatorStoryWire {
-    pub class: NativeNoteSeparatorStoryClass,
-    /// Header-document CPs of the authored content, excluding the guard.
-    pub content_start_cp: usize,
-    pub content_end_cp: usize,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub guard_cp: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rule: Option<NativeNoteSeparatorRuleWire>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub paragraph: Option<NativeNoteSeparatorParagraphWire>,
-}
-
-/// The U+0003/U+0004 control character. `mark` is present only when the
-/// effective sprmCFSpec (MS-DOC 2.6.1) gives the byte its rule meaning.
-#[derive(Serialize, Debug, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct NativeNoteSeparatorRuleWire {
+pub struct ReservedNoteSeparatorRuleWire {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mark: Option<NoteSeparatorMark>,
-    pub control: NativeNoteSeparatorCharacterWire,
-    pub source: NativeNoteSeparatorSourceWire,
+    pub control: ReservedNoteSeparatorCharacterWire,
 }
 
-/// Effective supported paragraph properties of the story's paragraph, kept
-/// separate from the control character. `content_mark` is absent when the
-/// story authors no paragraph mark (a partial rule); the guard never fills in.
+/// Effective paragraph properties of the story's paragraph, kept separate
+/// from the control character. `content_mark` is absent when the story
+/// authors no paragraph mark.
 #[derive(Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
-pub struct NativeNoteSeparatorParagraphWire {
+pub struct ReservedNoteSeparatorParagraphWire {
     pub paragraph: DocParagraph,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub content_mark: Option<NativeNoteSeparatorCharacterWire>,
-    /// Presence only: the owned numbering/frame cascades are not retained,
-    /// so a consumer must not treat such a paragraph as represented.
+    pub content_mark: Option<ReservedNoteSeparatorCharacterWire>,
+    /// Presence only: the producer did not retain the paragraph's numbering
+    /// or frame properties, so a consumer must not treat it as represented.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub numbered: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub framed: bool,
-    pub source: NativeNoteSeparatorSourceWire,
 }
 
-/// Effective supported CHPX of one character. An absent run is an effective
-/// vanish, which differs from an absent character.
+/// Effective character properties of one character. An absent run is an
+/// effectively hidden character, which differs from an absent character.
 #[derive(Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
-pub struct NativeNoteSeparatorCharacterWire {
+pub struct ReservedNoteSeparatorCharacterWire {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run: Option<TextRun>,
-    /// Effective sprmCFRMark tracked insertion; revision metadata is not kept.
+    /// The character is a tracked insertion; revision metadata is not kept.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub insertion: bool,
 }
 
-/// Native-local provenance: header-document CP, file FC, piece PRM and the
-/// paragraph style index. It is not a shared model `SourceRef`.
-#[derive(Serialize, Debug, Clone, Copy, Eq, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct NativeNoteSeparatorSourceWire {
-    pub header_cp: usize,
-    pub fc: usize,
-    pub prm: u16,
-    pub paragraph_style: usize,
-}
-
-/// Closed shared producer fact for a bare separator story. MS-DOC §2.3.3
-/// supplies the role, while §2.6.1 sprmCFSpec supplies Short/Full semantics.
-/// A native producer owns CP guards, effective special-character properties
-/// and formatting admission; this fact does not authorize dropping custom
-/// text or formatting. None suppresses ink under existing band-gap policy.
+/// Closed shared producer fact for a bare separator story: the story role
+/// comes from its note type, Short/Full from the rule control's meaning. A
+/// producer owns story-shape, special-character and formatting admission;
+/// this fact does not authorize dropping custom text or formatting. None
+/// suppresses ink under existing band-gap policy.
 #[derive(Serialize, Debug, Clone, Copy, Eq, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum NoteSeparatorMark {
@@ -515,6 +483,10 @@ pub struct EmbeddedFont {
 #[derive(Serialize, Debug, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct DocumentSettings {
+    /// ECMA-376 Part 4 §14.8.3.38: preserve the paragraph mark after a terminal
+    /// page break. Applied during body normalization, before layout.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub split_pg_break_and_para_mark: Option<bool>,
     /// ECMA-376 Part 4 §14.8.3.15: fixed 5pt/10pt automatic paragraph margins.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub do_not_use_html_paragraph_auto_spacing: Option<bool>,
@@ -949,18 +921,27 @@ pub struct SectionPlacementWire {
     pub gutter_pt: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rtl_gutter: Option<bool>,
-    /// Native (MS-DOC) producer only: the effective raw MS-DOC 2.6.4
-    /// sprmSTextFlow operand (MS-ODRAW 2.4.5 MSOTXFL, 0..=5), omitted when the
-    /// section has no such SPRM. Normalized once at the TS model boundary;
-    /// OOXML producers never emit it.
+    /// Canonical page frame that no Transitional ST_TextDirection token
+    /// expresses in this library: lines advance bottom to top, later lines to
+    /// the right, every glyph turned a quarter counter-clockwise (CSS
+    /// `sideways-lr`). Valid only beside text direction `btLr`, whose own
+    /// mapping is otherwise unchanged. The WordprocessingML parser never
+    /// emits it; a producer whose source distinguishes that frame does.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub native_text_flow: Option<u16>,
+    pub section_flow: Option<SectionFlow>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub page_borders_authored: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub page_borders: Option<PageBorders>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub page_geometry: Option<Box<SectionPageGeometryWire>>,
+}
+
+/// See [`SectionPlacementWire::section_flow`].
+#[derive(Serialize, Debug, Clone, Copy, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum SectionFlow {
+    BottomToTop,
 }
 
 #[derive(Serialize, Debug, Clone, Default)]
@@ -1472,12 +1453,6 @@ pub struct FramePr {
 #[derive(Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct NumberingInfo {
-    /// Native reading owner of the resolved marker, separate from body runs.
-    #[serde(
-        rename = "__nativeReadingWordBreaking",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub native_reading_word_breaking: Option<NativeReadingWordBreakingWire>,
     pub num_id: u32,
     pub level: u32,
     /// "decimal" | "bullet" | "lowerLetter" | "upperLetter" | "lowerRoman" | "upperRoman"
@@ -1548,57 +1523,6 @@ pub struct NumberingInfo {
     /// box; they do not select its size or the font governing native AUTO.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pic_bullet_transform: Option<PictureBulletTransform>,
-    /// Native DOC-only explicit reading source facts. This is not authored
-    /// Word display geometry; ordinary DOCX and strict DOC omit the wire.
-    #[serde(
-        rename = "__nativeReadingPictureBullet",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub native_reading_picture_bullet: Option<Box<NativeReadingPictureBullet>>,
-}
-
-/// Winning MS-DOC picture-SPRM source layer, not an inferred sizing owner.
-#[derive(Serialize, Debug, Clone)]
-#[serde(tag = "kind", rename_all = "camelCase")]
-pub enum NativePictureBulletOrigin {
-    Direct {
-        fc: usize,
-    },
-    Piece {
-        fc: usize,
-        prm: u16,
-    },
-    ListLevel {
-        instance: usize,
-        list: usize,
-        level: u8,
-    },
-}
-#[derive(Serialize, Debug, Clone, Copy)]
-pub struct NativePictureBulletProperty {
-    pub key: u16,
-    pub value: u32,
-}
-/// Raw source/provenance for a marker projected by storedSizeForReading.
-/// PICMID goal/scale are retained, while NumberingInfo owns the sole chosen
-/// display box. The native AUTO font metric is intentionally unresolved.
-#[derive(Serialize, Debug, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct NativeReadingPictureBullet {
-    /// Exact selected embedded resource identity; consumers do not derive DOC paths.
-    pub resource_key: String,
-    pub raw_pbi_flags: u16,
-    pub flags_origin: NativePictureBulletOrigin,
-    pub index_origin: NativePictureBulletOrigin,
-    pub relative_cp: u32,
-    pub picf_offset: usize,
-    pub shape: u16,
-    pub raw_shape_flags: u32,
-    pub goal_twips: [i16; 2],
-    pub scale_per_mille: [u16; 2],
-    pub pib_flags: Option<NativePictureBulletProperty>,
-    pub client_anchor: Option<Vec<u8>>,
-    pub client_anchor_options: Option<u16>,
 }
 
 #[derive(Serialize, Debug, Clone)]
@@ -1959,52 +1883,6 @@ pub struct AnchorGroupWire {
     pub resolved_child_frame: AnchorResolvedChildFrameWire,
 }
 
-/// Parser-private request emitted only by explicit native DOC reading policy.
-/// It records a changed placement request, not a recovered authored contour or
-/// permission to omit members. Retained scene and publication owners must still
-/// prove complete acquisition, fit, decoded resources and visible disclosure.
-#[derive(Serialize, Debug, Clone, Copy)]
-#[serde(rename_all = "camelCase")]
-pub enum NativeReadingRelocationWire {
-    CompleteScene,
-}
-
-/// Passive source metadata from the explicit native DOC reading policy. These
-/// fields are never resource paths or permission to interpret latent payloads.
-#[derive(Serialize, Debug, Clone, Copy)]
-#[serde(rename_all = "camelCase")]
-pub enum NativePicturePropertyScopeWire {
-    DocumentDefault,
-    Shape,
-}
-#[derive(Serialize, Debug, Clone, Copy)]
-#[serde(rename_all = "camelCase")]
-pub enum NativePicturePropertyRetentionWire {
-    PassiveName,
-    InactiveOpaqueNotDecoded,
-    InactiveIndexNotResolved,
-    IgnoredZeroIndex,
-}
-#[derive(Serialize, Debug, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct NativePicturePropertyWire {
-    pub scope: NativePicturePropertyScopeWire,
-    pub opid: u16,
-    pub value: u32,
-    pub text: Option<String>,
-    pub raw_bytes: Vec<u8>,
-    pub retention: NativePicturePropertyRetentionWire,
-}
-#[derive(Serialize, Debug, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct NativePictureMetadataWire {
-    pub blip_name: Option<NativePicturePropertyWire>,
-    pub shape_name: Option<NativePicturePropertyWire>,
-    pub description: Option<NativePicturePropertyWire>,
-    pub inactive_fill_carrier: Option<NativePicturePropertyWire>,
-    pub inactive_line_carrier: Option<NativePicturePropertyWire>,
-}
-
 #[derive(Serialize, Debug, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct AnchorAcquisitionWire {
@@ -2019,10 +1897,59 @@ pub struct AnchorAcquisitionWire {
     pub wrap: AnchorWrapWire,
     pub behavior: AnchorBehaviorWire,
     pub group: Option<AnchorGroupWire>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub native_reading_relocation: Option<NativeReadingRelocationWire>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub native_picture_metadata: Option<Box<NativePictureMetadataWire>>,
+}
+
+/// VML §19.1.2.18 facts. Absolute offsets remain points; fractional offsets
+/// resolve against final layout dimensions, including group scaling.
+#[derive(Serialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct VmlShadowOffset {
+    pub x_pt: f64,
+    pub y_pt: f64,
+    pub x_fraction: f64,
+    pub y_fraction: f64,
+}
+
+#[derive(Serialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct VmlShadow {
+    pub kind: String,
+    pub color: String,
+    pub color2: String,
+    pub offset: VmlShadowOffset,
+    pub offset2: VmlShadowOffset,
+    pub opacity: f64,
+    pub obscured: bool,
+    pub origin: (f64, f64),
+    pub matrix: [f64; 6],
+    pub absolute_perspective: bool,
+}
+
+/// Part 4 §19.2.2.31: vector-only transform, after host rotation.
+#[derive(Serialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct VmlSkew {
+    pub offset: VmlShadowOffset,
+    pub origin: (f64, f64),
+    pub matrix: [f64; 6],
+    pub absolute_perspective: bool,
+}
+
+/// Part 4 §§19.2.2.1/.6/.17/.29/.32: an independent edge pen.
+/// Defaults belong to this pen, never to its parent v:stroke.
+#[derive(Serialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct VmlEdgeStroke {
+    pub edge: String,
+    pub color: String,
+    pub width_pt: f64,
+    pub dash: Option<String>,
+    pub cap: Option<String>,
+    pub join: String,
+    pub miter_limit: f64,
+    pub compound: Option<String>,
+    pub image: Option<ShapeFill>,
+    pub pattern: Option<Duotone>,
 }
 
 /// A drawn shape (wps:wsp inside wp:anchor). Positioned like an anchor image
@@ -2034,6 +1961,13 @@ pub struct ShapeRun {
     /// participates in paragraph line flow like a glyph-sized drawing object.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub inline: bool,
+    /// Paint offset (pt) of an inline shape from its pen position: a VML
+    /// position:relative shape's left/top (ECMA-376 Part 4 §19.1.2.19). The
+    /// line advance is unchanged.
+    #[serde(skip_serializing_if = "is_zero_f64")]
+    pub inline_offset_x_pt: f64,
+    #[serde(skip_serializing_if = "is_zero_f64")]
+    pub inline_offset_y_pt: f64,
     /// pt
     pub width_pt: f64,
     /// pt
@@ -2104,6 +2038,36 @@ pub struct ShapeRun {
     /// anchors sharing the same behindDoc value. Lower value = drawn first.
     /// Group children add their document-order index to the anchor value.
     pub z_order: u32,
+    /// Part 4 §19.1.2.18 shadow acquired independently of its source brush.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vml_shadow: Option<VmlShadow>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vml_skew: Option<VmlSkew>,
+    /// Part 4 §§19.1.2.7/19.2.2.31: cumulative group vector effect,
+    /// in points relative to this leaf's allocation origin. Image data keeps
+    /// its original brush frame. Ancestor effects are composed once per group.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vml_group_transform: Option<[f64; 6]>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub vml_edge_strokes: Vec<VmlEdgeStroke>,
+    /// Part 4 §§19.1.2.10/.11: picture ink is independent of the backing
+    /// fill and outline on the implied rectangle. Only resource/effect facts
+    /// from this image are consumed; placement belongs to the host shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vml_picture: Option<Box<ImageRun>>,
+    /// Part 4 §19.1.2.21: independently acquired textured pen.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vml_stroke_fill: Option<ShapeFill>,
+    /// Part 4 §19.1.2.21: pattern strokes map black and coloured pixels separately.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vml_stroke_pattern: Option<Duotone>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub vml_inset_pen: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub vml_concentric_gradient: bool,
+    /// Part 4 §19.1.2.14: normalized clipping rectangles, in authored order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub vml_text_rects: Vec<[f64; 4]>,
     /// normalized [0,1] custom path commands (one or more sub-paths). Empty
     /// when `preset_geometry` is set; the renderer chooses between
     /// buildCustomPath (custGeom) and buildShapePath (prstGeom).
@@ -2343,6 +2307,25 @@ pub enum ShapeStrokeFill {
     },
 }
 
+/// VML Part 4 §19.1.2.5 brush placement. Native image dimensions are
+/// acquired lazily with the image, never inferred from the shape's extent.
+#[derive(Serialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct VmlFillLength {
+    pub value: f64,
+    pub fraction: bool,
+}
+#[derive(Serialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct VmlImageFill {
+    pub repeat: bool,
+    pub size: Option<(VmlFillLength, VmlFillLength)>,
+    pub origin: (f64, f64),
+    pub position: (f64, f64),
+    pub aspect: String,
+    pub align_shape: bool,
+}
+
 #[derive(Serialize, Debug, Clone)]
 #[serde(tag = "fillType", rename_all = "camelCase")]
 pub enum ShapeFill {
@@ -2396,6 +2379,14 @@ pub enum ShapeFill {
         alpha: Option<f64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         duotone: Option<Duotone>,
+        /// Ordered CT_Blip effects (§20.1.8.13) of a DrawingML blipFill,
+        /// shared with pictures: alphaModFix is baked at its authored position
+        /// (so `alpha` stays empty) and each duotone owns its palette. VML
+        /// fills have no CT_Blip and leave this empty.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        blip_effects: Vec<BlipEffect>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        vml: Option<VmlImageFill>,
     },
 }
 
@@ -2412,6 +2403,9 @@ pub struct GradientStop {
 #[derive(Serialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct PathPaint {
+    /// VML end-delimited path sets use even-odd parity. DrawingML keeps nonzero.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fill_rule: Option<String>,
     /// ST_PathFillMode (§20.1.10.37) other than `norm`: `none`, `lighten`,
     /// `lightenLess`, `darken` or `darkenLess`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2696,14 +2690,6 @@ pub struct ParagraphTypographyWire {
 #[derive(Serialize, Debug, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct FieldRun {
-    /// The evaluated field retains its exact final native character owner.
-    /// This fact participates in stored-result/instruction agreement; native
-    /// reading never silently merges two unresolved word-breaking owners.
-    #[serde(
-        rename = "__nativeReadingWordBreaking",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub native_reading_word_breaking: Option<NativeReadingWordBreakingWire>,
     /// "page" | "numPages" | "other"
     pub field_type: String,
     /// original instruction text (e.g. "PAGE \\* MERGEFORMAT")
@@ -2766,16 +2752,6 @@ pub struct FieldRun {
     pub typography_acquisition: Option<RunTypographyWire>,
 }
 
-/// Parser-private unsupported native word-breaking owner retained only by an
-/// explicitly selected reading capability. These bytes are not a valid Word
-/// enum and never authorize dictionary or character substitutions in layout.
-#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct NativeReadingWordBreakingWire {
-    pub raw_hres: u8,
-    pub raw_ch_hres: u8,
-}
-
 #[derive(Serialize, Debug, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct TextRun {
@@ -2783,19 +2759,14 @@ pub struct TextRun {
     /// An authored discretionary hyphen owns this otherwise empty run's
     /// formatting. ECMA-376 §17.3.3.29: it has zero advance and no glyph until
     /// its break is selected, when the run displays a U+002D hyphen-minus.
-    /// Native DOC U+001F uses the same consumer; this is independent of
-    /// automatic dictionary hyphenation. Keep it separate from ordinary text
+    /// Other producers' optional hyphens use the same consumer; this is
+    /// independent of automatic dictionary hyphenation. Keep it separate from ordinary text
     /// and from a nonbreaking hyphen's always-visible glyph.
     #[serde(
         rename = "__optionalHyphen",
         skip_serializing_if = "std::ops::Not::not"
     )]
     pub optional_hyphen: bool,
-    #[serde(
-        rename = "__nativeReadingWordBreaking",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub native_reading_word_breaking: Option<NativeReadingWordBreakingWire>,
     /// The authored run begins with `<w:noBreakHyphen/>` but could not be
     /// coalesced with its predecessor because a zero-width semantic boundary
     /// (such as a comment anchor) must remain addressable. Layout keeps this
@@ -3252,7 +3223,7 @@ pub struct ShapeText {
 
 /// ECMA-376 §20.1.8.55 `<a:srcRect>` source-image crop, shared across the docx,
 /// pptx and xlsx parsers (see `ooxml_common::blip`).
-pub use ooxml_common::blip::{Duotone, SrcRect};
+pub use ooxml_common::blip::{BlipEffect, Duotone, SrcRect};
 
 #[derive(Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -3308,10 +3279,12 @@ pub struct ImageRun {
     /// matching Word's picture recolour.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duotone: Option<Duotone>,
-    /// ECMA-376 §20.1.8.6 `<a:blip><a:alphaModFix@amt>` opacity as a fraction
-    /// (0.0–1.0). `None` = fully opaque (the common case). When set, the renderer
-    /// multiplies the picture's `globalAlpha` by this fraction, exactly as the
-    /// pptx/xlsx picture paths do.
+    /// Ordered CT_Blip pixel effects, including §20.1.8.42 picture corrections.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub blip_effects: Vec<BlipEffect>,
+    /// Legacy whole-picture opacity for model-source callers. The OOXML parser
+    /// emits alphaModFix in blip_effects and leaves this empty so subsequent
+    /// color/alpha replacements are not modulated a second time.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub alpha: Option<f64>,
     /// Wrap mode for anchor images. One of:
@@ -3699,6 +3672,11 @@ pub struct TableLayoutAcquisitionWire {
     pub layout: Option<TableLayoutKindAcquisitionWire>,
     pub cell_spacing: Option<TableWidthAcquisitionWire>,
     pub cell_margins: Option<TableMarginAcquisitionWire>,
+    /// The producer supplies the table indent as the physical outer table
+    /// edge and its own grid, not the OOXML leading text edge that
+    /// compatibility modes below 15 hang the first cell margin from.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub outer_edge_indent: bool,
 }
 
 #[derive(Serialize, Debug, Clone, Default)]

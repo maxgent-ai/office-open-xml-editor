@@ -38,7 +38,7 @@ export const XLSX_HOST_LAYOUT_RESULT = 'xlsx-host-layout-result';
 /** Implementation bound: the request is a font tuple, never document data. */
 const MAX_REQUEST_BYTES = 4096;
 const MAX_FAMILY_LENGTH = 255;
-/** BIFF/ECMA font sizes are bounded by 16-bit twips (409.55 pt). */
+/** Implementation bound: a font size in 16-bit twips (at most 409.55 pt). */
 const MAX_FONT_SIZE_PT = 65535 / 20;
 /** Implementation bound on a measured digit width, in CSS pixels. */
 const MAX_DIGIT_WIDTH_PX = 4096;
@@ -58,7 +58,7 @@ export function decodeHostLayoutRequest(bytes: Uint8Array): HostLayoutFont | nul
   return validateHostLayoutFont(value);
 }
 
-export function validateHostLayoutFont(value: unknown): HostLayoutFont {
+function validateHostLayoutFont(value: unknown): HostLayoutFont {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
     throw new TypeError('invalid XLSX host layout font');
   }

@@ -1,5 +1,17 @@
 # Experimental legacy Office sources
 
+Install the viewer and its separate optional companion at matching versions:
+
+```sh
+npm i @silurus/ooxml @silurus/ooxml-legacy-office
+```
+
+The companion pins its `@silurus/ooxml` peer to the exact same version.
+A stale runtime or model-source protocol fails before input loading with
+`CompanionRuntimeMismatchError` (`code: 'companion-runtime-mismatch'`), exported
+from the internal `@silurus/ooxml/internal/companion` ABI. That entry is reserved
+for companion packages; applications use the ordinary viewer/loader entries.
+
 Legacy binary Office files can be opened with the ordinary viewers and
 loaders through optional model sources:
 
@@ -22,37 +34,42 @@ executes macros, fields, formulas, actions or embedded objects.
 
 ## Enabling a source
 
-Pass the source in the format-generic `modelSources` option. It is available
-on the DOCX, XLSX and PPTX `load()` options, on the viewers, and on the Node
-session options (`openDocxDocument`, `materializeDocxDocument`,
-`openXlsxWorkbook`, `openPptxPresentation` and their siblings).
+Import the reader and pass it as its own option, like the other opt-in
+modules (`{ math }`, `{ chartEx }`, `{ tiff }`). The option is `legacyDoc` on
+the DOCX surfaces, `legacyXls` on the XLSX surfaces and `legacyPpt` on the
+PPTX surfaces: the `load()` options, the viewers and scroll viewers, and the
+Node session options (`openDocxDocument`, `materializeDocxDocument`,
+`openXlsxWorkbook`, `openPptxPresentation` and their siblings). Each option
+accepts only a source for its own format.
 
 ```typescript
 import { DocxViewer } from '@silurus/ooxml/docx';
-import { legacyDocSource } from '@silurus/ooxml/legacy-doc';
+import { legacyDoc } from '@silurus/ooxml-legacy-office/doc';
 
 const canvas = document.querySelector('canvas') as HTMLCanvasElement;
-const viewer = new DocxViewer(canvas, { modelSources: [legacyDocSource()] });
+const viewer = new DocxViewer(canvas, { legacyDoc });
 await viewer.load(docOrDocxBytes);
 ```
 
-| Input | Entry | Factory | Loaders and viewers |
-| --- | --- | --- | --- |
-| DOC | `@silurus/ooxml/legacy-doc` | `legacyDocSource()` | `DocxViewer`, `DocxDocument.load`, `openDocxDocument`, `materializeDocxDocument` |
-| XLS | `@silurus/ooxml/legacy-xls` | `legacyXlsSource()` | `XlsxViewer`, `XlsxWorkbook.load`, `openXlsxWorkbook` |
-| PPT | `@silurus/ooxml/legacy-ppt` | `legacyPptSource()` | `PptxViewer`, `PptxPresentation.load`, `openPptxPresentation` |
+| Input | Entry | Reader / factory | Option | Loaders and viewers |
+| --- | --- | --- | --- | --- |
+| DOC | `@silurus/ooxml-legacy-office/doc` | `legacyDoc` / `createLegacyDoc()` | `legacyDoc` | `DocxViewer`, `DocxScrollViewer`, `DocxDocument.load`, `openDocxDocument`, `materializeDocxDocument` |
+| XLS | `@silurus/ooxml-legacy-office/xls` | `legacyXls` / `createLegacyXls()` | `legacyXls` | `XlsxViewer`, `XlsxSheetViewer`, `XlsxWorkbook.load`, `openXlsxWorkbook` |
+| PPT | `@silurus/ooxml-legacy-office/ppt` | `legacyPpt` / `createLegacyPpt()` | `legacyPpt` | `PptxViewer`, `PptxScrollViewer`, `PptxPresentation.load`, `openPptxPresentation` |
 
-Each factory accepts the same optional settings:
+`legacyDoc`, `legacyXls` and `legacyPpt` use the bundled asset URLs. To change
+them, or to set an input limit, create a reader with the matching factory; each
+factory accepts the same optional settings:
 
 ```typescript
 interface LegacySourceOptions {
   wasmUrl?: string; // absolute URL of the reader's WASM
   moduleUrl?: string; // absolute URL of the reader's source module
-  maxInputBytes?: number; // defaults to, and may not exceed, 256 MiB
+  maxInputBytes?: number; // optional caller limit; omitted means no whole-file gate
 }
 ```
 
-Creating a source fetches nothing. When a claimed file loads, the parser
+Importing a reader or creating one with a factory fetches nothing. When a claimed file loads, the parser
 Worker (or Node) imports the source's self-contained ES module, emitted as
 `legacy-<format>-source-module*.mjs` next to the package files, and initializes
 the reader's dedicated WASM: `legacy_doc_direct_bg.wasm`, `legacy_xls_direct_bg.wasm` or
@@ -62,10 +79,13 @@ Security Policy restricts `script-src` or Worker imports. Applications with a
 custom asset pipeline pass absolute `moduleUrl` and `wasmUrl` values:
 
 ```typescript
-const source = legacyPptSource({
+import { createLegacyPpt } from '@silurus/ooxml-legacy-office/ppt';
+
+const legacyPpt = createLegacyPpt({
   moduleUrl: new URL('/assets/legacy-ppt-source-module.js', location.href).href,
   wasmUrl: new URL('/assets/legacy_ppt_direct_bg.wasm', location.href).href,
 });
+const viewer = new PptxViewer(canvas, { legacyPpt });
 ```
 
 Module URLs come only from application options; document content never
@@ -92,23 +112,45 @@ source does not claim takes the unchanged OOXML path, so:
 - a legacy file without a matching source rejects with the typed
   `legacy-binary-format` error;
 - encrypted OOXML packages keep their existing encryption errors;
-- configuring `legacyDocSource()` does not enable XLS or PPT input.
+- configuring `legacyDoc` does not enable XLS or PPT input.
 
-Claimed input larger than `maxInputBytes` throws a `RangeError`. The limit is
-resource policy, not an Office format limit. After a source claims a file, a
-reader failure rejects the load: there is no fallback to another source or to
+When the caller sets `maxInputBytes`, claimed input larger than that positive
+safe integer throws a `RangeError`. There is no default or library-imposed
+whole-file size ceiling. Applications that require the former 256 MiB input
+limit must pass `maxInputBytes: 256 * 1024 * 1024` explicitly. Source copies remain
+fallible: allocation failure is a classified resource error. Internal budgets
+apply to actual inflated or retained work, rather than compressed or declared
+sizes. These budgets are library policy, not Office format limits.
+
+After a source claims a file, a reader failure rejects the load: there is no fallback to another source or to
 the OOXML path. Password-protected legacy binaries, pre-CFB Office formats and
 unsupported binary structures are rejected by the readers. These checks are
 structural, never filename-based.
+
+After admission, representational rejections use the viewer-owned `OoxmlError`
+with `code: 'unsupported-content'` and frozen, content-free details:
+`{ format: 'doc' | 'xls' | 'ppt', reason: 'source-subset' }`. Offer conversion
+for this code; do not match diagnostic text. The category includes malformed
+and unknown structures and does not certify file validity. It applies to open
+and lazy worksheet, slide and image operations, in browser main/worker rendering
+modes and Node. Background failures use the same error through `onError`.
+
+Encryption uses `unsupported-encryption`. `OoxmlResourceLimitError`,
+`parser-crashed`, `companion-runtime-mismatch`, network and worker failures keep
+their own meaning. Native budgets without measured resource records remain
+ordinary errors, as does cursor misuse. Input size guards remain `RangeError`.
+The source module protocol is v2; rebuild custom modules using the documented
+model-source rejection signal and install matching viewer/companion versions.
+No migration is required for applications that do not enable model sources.
 
 ## Experimental direct DOC source
 
 ```typescript
 import { DocxDocument } from '@silurus/ooxml/docx';
-import { legacyDocSource } from '@silurus/ooxml/legacy-doc';
+import { legacyDoc } from '@silurus/ooxml-legacy-office/doc';
 
 const document = await DocxDocument.load(legacyDocArrayBuffer, {
-  modelSources: [legacyDocSource()],
+  legacyDoc,
 });
 const canvas = window.document.querySelector('canvas') as HTMLCanvasElement;
 
@@ -123,11 +165,11 @@ Node supports DOC through the same reader:
 
 ```typescript
 import { openDocxDocument } from '@silurus/ooxml/node';
-import { legacyDocSource } from '@silurus/ooxml/legacy-doc';
+import { legacyDoc } from '@silurus/ooxml-legacy-office/doc';
 
 const session = await openDocxDocument(legacyDocBytes, {
   factory,
-  modelSources: [legacyDocSource()],
+  legacyDoc,
 });
 ```
 
@@ -208,10 +250,10 @@ Browser:
 
 ```typescript
 import { PptxPresentation } from '@silurus/ooxml/pptx';
-import { legacyPptSource } from '@silurus/ooxml/legacy-ppt';
+import { legacyPpt } from '@silurus/ooxml-legacy-office/ppt';
 
 const presentation = await PptxPresentation.load(legacyPptArrayBuffer, {
-  modelSources: [legacyPptSource()],
+  legacyPpt,
 });
 const canvas = document.querySelector('canvas') as HTMLCanvasElement;
 
@@ -226,10 +268,10 @@ Node:
 
 ```typescript
 import { openPptxPresentation } from '@silurus/ooxml/node';
-import { legacyPptSource } from '@silurus/ooxml/legacy-ppt';
+import { legacyPpt } from '@silurus/ooxml-legacy-office/ppt';
 
 const session = await openPptxPresentation(legacyPptBytes, {
-  modelSources: [legacyPptSource()],
+  legacyPpt,
 });
 
 try {
@@ -308,15 +350,15 @@ direct PPT source adopts that XML under the rule described below.
 
 ```typescript
 import { XlsxViewer } from '@silurus/ooxml/xlsx';
-import { legacyXlsSource } from '@silurus/ooxml/legacy-xls';
+import { legacyXls } from '@silurus/ooxml-legacy-office/xls';
 
 const container = document.querySelector('#workbook') as HTMLElement;
-const viewer = new XlsxViewer(container, { modelSources: [legacyXlsSource()] });
+const viewer = new XlsxViewer(container, { legacyXls });
 await viewer.load(legacyXlsBytes);
 ```
 
-`XlsxWorkbook.load(bytes, { modelSources: [legacyXlsSource()] })` and the Node
-`openXlsxWorkbook(bytes, { modelSources: [legacyXlsSource()], factory })`
+`XlsxWorkbook.load(bytes, { legacyXls })` and the Node
+`openXlsxWorkbook(bytes, { legacyXls, factory })`
 accept the same source.
 
 The direct XLS source is experimental and bounded. It reads a BIFF8 workbook
@@ -362,7 +404,7 @@ extract the supported passive PNG, JPEG, EMF and WMF entries from a BIFF8 global
 image store without requiring font metrics:
 
 ```sh
-cargo run -p legacy-office-converter --features inspection \
+cargo run -p legacy-office-parser --features inspection \
   --example inspect_xls_images -- sample.xls fresh-output-directory
 ```
 
@@ -379,8 +421,9 @@ fail inspection rather than being silently repaired. Unsupported encodings,
 unreferenced slots and unresolved delayed entries are not exposed. No external
 resource, macro, OLE object or drawing action is evaluated.
 
-Inspection caps the source at 256 MiB, assembled drawing data and retained media
-at 128 MiB each, and the drawing/decoding walk at two million records. Shared
+Native inspection examples read the complete source with fallible allocation and
+no default input-length ceiling. Inspection caps assembled drawing data and retained
+media at 128 MiB each, and the drawing/decoding walk at two million records. Shared
 image limits also apply. These are independent resource ceilings, not a combined
 process-memory guarantee: source, workbook, assembled data and extracted images
 can coexist. The helper is excluded from production WASM even when its Cargo
@@ -390,7 +433,7 @@ The companion `inspect_xls_anchors` native example prints raw worksheet anchor
 metadata without extracting images:
 
 ```sh
-cargo run -p legacy-office-converter --features inspection \
+cargo run -p legacy-office-parser --features inspection \
   --example inspect_xls_anchors -- sample.xls
 ```
 
@@ -438,7 +481,7 @@ helpers remain separate from the direct XLS reader.
 ## Current implementation boundary
 
 The repository contains only the direct readers; legacy input is never
-converted to OOXML. The Rust crate `legacy-office-converter` builds one reader
+converted to OOXML. The Rust crate `legacy-office-parser` builds one reader
 per feature: `direct-doc`, `direct-xls` and `direct-ppt`. Building it for
 `wasm32` with none of them enabled is a compile error. The `inspection`
 feature adds the native-only examples above, and `fuzzing` exposes the fuzz
@@ -469,7 +512,7 @@ Office, with macros disabled and Word/Excel external-link updates disabled,
 and writes a PDF to a fresh output path:
 
 ```bash
-osascript packages/legacy-converter/tools/legacy-office-export.applescript \
+osascript packages/legacy-office/tools/legacy-office-export.applescript \
   doc disposable-copy.doc fresh-output.pdf
 ```
 
@@ -502,7 +545,13 @@ Modern Office can retain DrawingML in an OfficeArt `metroBlob`
 ([MS-ODRAW] §2.3.4.41). The source uses three outcomes: a package with no
 alternative or a verified disagreement uses the binary projection; a verified
 consistent alternative is adopted; an unreadable or unverifiable alternative
-rejects the load. A checksum-only package does not require a theme.
+rejects the load. Exhausting an optional alternative's verification budgets
+keeps that shape's binary projection and does not poison the document. Input
+work uses the standard OOXML package allowance (256 MiB of actual consumed
+input per alternative, including rereads); inflated output remains bounded to
+1 MiB per part and 4 MiB per alternative package. Round-trip theme verification
+also has its own input-work allowance. Failed attempts retain no model, text,
+or image charges. A checksum-only package does not require a theme.
 
 Adopted alternatives retain their formatting and resource references, while
 characters, identifiers and transforms come from the binary. Theme style
