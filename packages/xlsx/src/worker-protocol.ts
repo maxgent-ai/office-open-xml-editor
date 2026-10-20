@@ -1,3 +1,4 @@
+import { inheritCellFontLanguage } from './internal/cell-font-language.js';
 import type {
   ViewportRange,
   RenderViewportOptions,
@@ -22,7 +23,6 @@ import type {
   DelimitedTextParseRequest,
   DelimitedTextParseResponse,
 } from './delimited-text-protocol.js';
-import type { CfRuleDiagnostic } from './cf-diagnostics.js';
 
 /**
  * View-only point and compact row-interval overrides for one sheet, carried with every worker
@@ -117,6 +117,7 @@ function createInitialSizeProjection(
     view.rowHeights = { ...source.rowHeights };
     view.colWidths = { ...source.colWidths };
   }
+  inheritCellFontLanguage(source, view);
   inheritWorksheetPolicy(source, view);
   inheritWorksheetSizeContext(source, view);
   applySizeOverrides(view, overrides);
@@ -224,7 +225,7 @@ export class WorksheetViewProjectionCache {
  *  render-local sheet projection; absent when nothing changed. */
 export type WireRenderViewportOptions = Omit<
   RenderViewportOptions,
-  'onTextRun' | 'loadedImages' | 'fetchImage' | 'cfDiagnostics'
+  'onTextRun' | 'loadedImages' | 'fetchImage'
 > & {
   sizeOverrides?: WireSizeOverrides;
 };
@@ -291,7 +292,7 @@ export function extractViewerRenderContext(opts: WireRenderViewportOptions): {
 // `init` arm is copied verbatim from `WorkerRequest`.
 export type RenderWorkerRequest =
   | { type: 'init'; wasmUrl: string }
-  | { type: 'parse'; id: number; data: ArrayBuffer; resourcePolicy: NormalizedOoxmlResourcePolicy; readonly worksheetPolicy?: import('@silurus/ooxml-core/worker').NormalizedXlsxWorksheetPolicy; useGoogleFonts?: boolean; cjkFallback?: import('@silurus/ooxml-core').CjkLang; renderers?: import('@silurus/ooxml-core/worker').WorkerRendererDescriptors; source?: import('@silurus/ooxml-core').ModelSourceModuleDescriptor; sourceTransfer?: readonly Transferable[]; sourceOwnerUrl?: string }
+  | { type: 'parse'; id: number; data: ArrayBuffer; resourcePolicy: NormalizedOoxmlResourcePolicy; readonly worksheetPolicy?: import('./internal/worksheet-policy.js').NormalizedXlsxWorksheetPolicy; useGoogleFonts?: boolean; japaneseCellFonts?: boolean; cjkFallback?: import('@silurus/ooxml-core').CjkLang; renderers?: import('@silurus/ooxml-core/worker').WorkerRendererDescriptors; source?: import('@silurus/ooxml-core').ModelSourceModuleDescriptor; sourceTransfer?: readonly Transferable[]; sourceOwnerUrl?: string }
   | DelimitedTextParseRequest
   | ({ type: 'openSheetSession'; id: number; sheetIndex: number; sheetName: string } & PullSessionIdentity<number>)
   | {
@@ -340,9 +341,6 @@ export type RenderWorkerResponse =
       type: 'viewportRendered';
       id: number;
       bitmap: ImageBitmap;
-      /** Conditional-formatting diagnostics of THIS frame only (#1547); a
-       *  per-response batch, never a lifetime cursor. */
-      conditionalFormatting: readonly CfRuleDiagnostic[];
     }
   | { type: 'worksheetsEvicted'; id: number }
   | ({ type: 'sheetSessionOpened'; id: number } & PullSessionIdentity<number>);

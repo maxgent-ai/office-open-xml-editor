@@ -51,7 +51,7 @@ const UNIT_CASES = [
 describe('XLSX1709 absent sheetFormatPr fallback width', () => {
   for (const platform of ['MacIntel', 'Win32'] as const) {
     it(`encodes the flagged 8.43 fallback as UI characters (${platform})`, () => {
-      vi.stubGlobal('navigator', { platform, maxTouchPoints: 0 });
+      vi.stubGlobal('navigator', { platform, maxTouchPoints: 0, language: 'ja-JP' });
       for (const { mdw, ui } of UNIT_CASES) {
         const geometry = GridGeometry.forWorksheet(absentFormatWorksheet(), mdw);
         expect(geometry.col.sizeOf(IMPLICIT_COL)).toBe(ui);
@@ -59,7 +59,7 @@ describe('XLSX1709 absent sheetFormatPr fallback width', () => {
     });
 
     it(`keeps an unflagged 8.43 default as a stored width (${platform})`, () => {
-      vi.stubGlobal('navigator', { platform, maxTouchPoints: 0 });
+      vi.stubGlobal('navigator', { platform, maxTouchPoints: 0, language: 'ja-JP' });
       for (const { mdw, stored } of UNIT_CASES) {
         const ws = absentFormatWorksheet();
         delete ws.defaultColWidthIsUi;
@@ -68,12 +68,12 @@ describe('XLSX1709 absent sheetFormatPr fallback width', () => {
     });
 
     it(`keeps explicit column 4 = 20 as a stored width (${platform})`, () => {
-      vi.stubGlobal('navigator', { platform, maxTouchPoints: 0 });
+      vi.stubGlobal('navigator', { platform, maxTouchPoints: 0, language: 'ja-JP' });
       expect(GridGeometry.forWorksheet(absentFormatWorksheet(), 7).col.sizeOf(4)).toBe(140);
     });
 
     it(`lets the existing baseColWidth branch win over the flag (${platform})`, () => {
-      vi.stubGlobal('navigator', { platform, maxTouchPoints: 0 });
+      vi.stubGlobal('navigator', { platform, maxTouchPoints: 0, language: 'ja-JP' });
       const flagged = absentFormatWorksheet();
       flagged.baseColWidth = 8;
       const plain = worksheet();
@@ -113,22 +113,31 @@ describe('XLSX1709 absent sheetFormatPr fallback width', () => {
 
 describe('GridGeometry', () => {
   it('derives implicit base-width columns without overriding an authored default width', () => {
-    vi.stubGlobal('navigator', { platform: 'MacIntel', maxTouchPoints: 0 });
+    vi.stubGlobal('navigator', { platform: 'MacIntel', maxTouchPoints: 0, language: 'ja-JP' });
     const ws = worksheet();
     ws.colWidths = { 1: 12 };
     ws.baseColWidth = 10;
-    expect(GridGeometry.forWorksheet(ws, 8).col.sizeOf(2)).toBe(87);
+    expect(GridGeometry.forWorksheet(ws, 8).col.sizeOf(2)).toBe(88);
 
     ws.baseColWidth = undefined;
     GridGeometry.invalidate(ws);
     expect(GridGeometry.forWorksheet(ws, 8).col.sizeOf(2)).toBe(colWidthToPx(8.43, 8));
   });
 
-  it('uses the specification pixel width for implicit base columns outside Mac Excel', () => {
-    vi.stubGlobal('navigator', { platform: 'Win32', maxTouchPoints: 0 });
+  it.each(['MacIntel', 'Win32'])('rounds implicit base columns up to 8 px on %s', (platform) => {
+    vi.stubGlobal('navigator', { platform, maxTouchPoints: 0, language: 'ja-JP' });
     const ws = worksheet();
-    ws.baseColWidth = 10;
-    expect(GridGeometry.forWorksheet(ws, 8).col.sizeOf(3)).toBe(85);
+    // Windows Excel at MDW 7 shows 61/75/89 px as 64/80/96 px.
+    for (const [base, px] of [[8, 64], [10, 80], [12, 96]] as const) {
+      ws.baseColWidth = base;
+      GridGeometry.invalidate(ws);
+      expect(GridGeometry.forWorksheet(ws, 7).col.sizeOf(3)).toBe(px);
+    }
+    // An authored defaultColWidth is a stored width and is not rounded.
+    ws.baseColWidth = undefined;
+    ws.defaultColWidth = 10.7109375;
+    GridGeometry.invalidate(ws);
+    expect(GridGeometry.forWorksheet(ws, 7).col.sizeOf(3)).toBe(75);
   });
   it('keeps offsets finite when a malformed default size reaches the geometry boundary', () => {
     const axis = new GridAxisGeometry({ 1: 10 }, Number.NaN, (value) => value, 10);

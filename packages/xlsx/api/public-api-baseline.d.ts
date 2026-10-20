@@ -12,6 +12,7 @@ export function autoResize(render: (width: number, height: number) => void | Pro
 export interface AutoResizeOptions {
     pauseWhenHidden?: boolean;
 }
+export type BlendMode = 'darken' | 'lighten' | 'mult' | 'over' | 'screen';
 export type BlipEffect = {
     type: 'grayscale';
 } | {
@@ -30,6 +31,116 @@ export type BlipEffect = {
     contrast: number;
 } | {
     type: 'duotone';
+    clr1?: string;
+    clr2?: string;
+} | {
+    type: 'alphaBiLevel';
+    thresh: number;
+} | {
+    type: 'alphaCeiling' | 'alphaFloor';
+} | {
+    type: 'alphaInv';
+    color?: string;
+} | {
+    type: 'hsl';
+    hue: number;
+    sat: number;
+    lum: number;
+} | {
+    type: 'tint';
+    hue: number;
+    amt: number;
+} | {
+    type: 'blur';
+    radius: number;
+    grow: boolean;
+} | {
+    type: 'alphaMod';
+    container: BlipEffectContainer;
+} | {
+    type: 'container';
+    container: BlipEffectContainer;
+} | {
+    type: 'reference';
+    reference: string;
+} | {
+    type: 'definitions';
+    containers: readonly BlipEffectContainer[];
+    work: number;
+} | {
+    type: 'effectCountLimit';
+    observed: number;
+} | {
+    type: 'alphaOutset';
+    radius: number;
+} | {
+    type: 'blend';
+    container: BlipEffectContainer;
+    blend: BlendMode;
+} | {
+    type: 'fill';
+    fill: BlipEffectFill;
+} | {
+    type: 'glow';
+    glow: Glow;
+} | {
+    type: 'shadow';
+    shadow: Shadow;
+    inner: boolean;
+} | {
+    type: 'softEdge';
+    radius: number;
+} | {
+    type: 'reflection';
+    reflection: Reflection & {
+        kx?: number;
+        ky?: number;
+        algn?: Shadow['algn'];
+        fadeDir?: number;
+        rotWithShape?: boolean;
+    };
+} | {
+    type: 'transform';
+    sx: number;
+    sy: number;
+    kx: number;
+    ky: number;
+    tx: number;
+    ty: number;
+} | {
+    type: 'relativeOffset';
+    tx: number;
+    ty: number;
+} | {
+    type: 'presetShadow';
+    shadows: readonly Shadow[];
+} | {
+    type: 'fillOverlay';
+    fill: BlipEffectFill;
+    blend: BlendMode;
+} | {
+    type: 'alphaModFix';
+    amt: number;
+} | {
+    type: 'alphaRepl';
+    alpha: number;
+} | {
+    type: 'colorReplace';
+    color: string;
+} | {
+    type: 'unsupported';
+    effect: string;
+};
+export interface BlipEffectContainer {
+    readonly kind: 'sib' | 'tree';
+    readonly name?: string;
+    readonly effects: readonly BlipEffect[];
+}
+export type BlipEffectFill = SolidFill | NoFill | PatternFill | (Omit<GradientFill, 'stops'> & {
+    readonly stops: readonly GradientStop[];
+}) | BlipEffectImageFill;
+export type BlipEffectImageFill = Omit<ImageFill, 'blipEffects'> & {
+    readonly blipEffects?: readonly BlipEffect[];
 };
 export interface Border {
     left: BorderEdge | null;
@@ -112,8 +223,6 @@ export interface CellXf {
     readingOrder?: number;
     ownFontColor?: boolean;
 }
-export type CfDiagnosticKind = 'unsupported' | 'invalid';
-export type CfDiagnosticPhase = 'expression' | 'cellIs' | 'activity' | 'threshold';
 export interface CfIcon {
     iconSet: string;
     iconId: number;
@@ -179,14 +288,6 @@ export type CfRule = {
     unsupportedFormulaPhases?: number;
     stopIfTrue?: boolean;
 };
-export interface CfRuleDiagnostic {
-    readonly kind: CfDiagnosticKind;
-    readonly phase: CfDiagnosticPhase;
-    readonly blockIndex: number;
-    readonly ruleIndex: number;
-    readonly row: number;
-    readonly col: number;
-}
 export interface CfStop {
     kind: string;
     value: string | null;
@@ -1187,6 +1288,7 @@ export interface DxfFontToggles {
     italic?: boolean;
     underline?: boolean;
     strike?: boolean;
+    automaticColor?: boolean;
 }
 type ExtensibleLiteral<Known extends string> = Known | (string & Record<never, never>);
 type Fill = SolidFill | NoFill | GradientFill | PatternFill | ImageFill;
@@ -1287,6 +1389,7 @@ export interface ImageAnchor {
     };
     alpha?: number;
     duotone?: Duotone;
+    blipEffects?: BlipEffect[];
 }
 export interface ImageFill {
     fillType: 'image';
@@ -1322,12 +1425,12 @@ export interface LegendManualLayout {
 }
 export interface LoadOptions extends LoadOptions__emitterCollision1 {
     mode?: 'main' | 'worker';
+    legacyXls?: ModelSource<'xlsx'>;
 }
 interface LoadOptions__emitterCollision1 {
     useGoogleFonts?: boolean;
     cjkFallback?: CjkFallback;
     password?: string;
-    modelSources?: readonly ModelSource[];
     wasmUrl?: string | URL;
     maxZipEntryBytes?: number;
     resourceLimits?: OoxmlResourceLimits;
@@ -1465,7 +1568,7 @@ export interface MergeCell {
     bottom: number;
     right: number;
 }
-const MODEL_SOURCE_MODULE_PROTOCOL = 'ooxml-model-source-module/v1';
+const MODEL_SOURCE_MODULE_PROTOCOL = 'ooxml-model-source-module/v2';
 export interface ModelSource<T extends ModelSourceTarget = ModelSourceTarget> {
     readonly target: T;
     claim(bytes: Uint8Array): boolean;
@@ -1502,12 +1605,13 @@ export class OoxmlDecodedImageLimitError extends RangeError {
     readonly code: 'ooxml-decoded-image-limit';
     constructor(metric: OoxmlDecodedImageLimitMetric, limit: number, observed: number);
 }
-export type OoxmlDecodedImageLimitMetric = 'image-dimension' | 'image-pixels' | 'active-decoded-bytes' | 'image-effect-count' | 'image-effect-work';
+export type OoxmlDecodedImageLimitMetric = 'image-dimension' | 'image-pixels' | 'active-decoded-bytes' | 'image-effect-count' | 'image-effect-work' | 'tiff-lzw-work' | 'metafile-path-commands' | 'metafile-record-points' | 'metafile-record-polygons' | 'metafile-record-rectangles' | 'metafile-record-text-units';
 export class OoxmlError extends Error {
     readonly code: OoxmlErrorCode;
-    constructor(code: OoxmlErrorCode, message: string);
+    readonly details?: OoxmlUnsupportedContentDetails;
+    constructor(code: OoxmlErrorCode, message: string, details?: OoxmlUnsupportedContentDetails);
 }
-export type OoxmlErrorCode = 'encrypted' | 'invalid-password' | 'unsupported-encryption' | 'legacy-binary-format' | 'not-ooxml' | 'invalid-numbering';
+export type OoxmlErrorCode = 'encrypted' | 'invalid-password' | 'unsupported-encryption' | 'legacy-binary-format' | 'not-ooxml' | 'unsupported-image-effect' | 'invalid-numbering' | 'unsupported-content';
 export type OoxmlErrorStage = 'container' | 'decompression' | 'parsing' | 'serialization' | 'layout' | 'rendering' | 'worker';
 export type OoxmlFormat = 'docx' | 'xlsx' | 'pptx';
 export type OoxmlResourceLimit = number | null;
@@ -1579,6 +1683,10 @@ export interface OoxmlResourceViolation {
     readonly observed: number;
     readonly configurable: boolean;
     readonly usage: OoxmlResourceUsageSnapshot;
+}
+export interface OoxmlUnsupportedContentDetails {
+    readonly format: string;
+    readonly reason: 'source-subset';
 }
 export interface OpenedModelSource<TArchive> {
     readonly archive: TArchive;
@@ -1930,6 +2038,7 @@ export type ShapeGeom = {
     };
     alpha?: number;
     duotone?: Duotone;
+    blipEffects?: BlipEffect[];
 };
 export interface ShapeInfo {
     zOrder?: number;
@@ -2141,6 +2250,8 @@ export interface TableInfo {
     lastColumnDxf?: number;
     band1HorizontalDxf?: number;
     band2HorizontalDxf?: number;
+    styleElements?: PivotTableStyleElement[];
+    styleError?: string;
     columns: TableColumnInfo[];
 }
 export class TiffDecodeError extends Error {
@@ -2284,11 +2395,6 @@ export interface XlsxCommentReply {
     resolved?: boolean;
 }
 export interface XlsxCommentsOptions extends ViewerCommentsOptions {
-}
-export interface XlsxConditionalFormattingReport {
-    readonly sheetIndex: number;
-    readonly viewport: Readonly<ViewportRange>;
-    readonly diagnostics: readonly CfRuleDiagnostic[];
 }
 export type XlsxCopyResult = Readonly<{
     status: 'copied';
@@ -2586,7 +2692,6 @@ export class XlsxWorkbook {
     cellText(ws: Worksheet, cell: Cell): string;
     renderViewport(target: HTMLCanvasElement | OffscreenCanvas, sheetIndex: number, viewport: ViewportRange, opts?: XlsxRenderViewportOptions): Promise<void>;
     renderViewportToBitmap(sheetIndex: number, viewport: ViewportRange, opts: RenderViewportToBitmapOptions): Promise<ImageBitmap>;
-    getLastConditionalFormattingDiagnostics(): XlsxConditionalFormattingReport | null;
     destroy(): void;
     private __privatePresence;
     private static __staticPrivatePresence;

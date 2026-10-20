@@ -98,6 +98,8 @@ export interface BodyTableAcquisitionInput {
   readonly availableInlineExtentPt: number;
   readonly availableBlockExtentPt: number;
   readonly freshPageBlockExtentPt: number;
+  /** Whether flow content already occupies the current page. */
+  readonly pageHasContent?: boolean;
   readonly cursor?: BodyTableContinuationCursor;
 }
 
@@ -109,6 +111,8 @@ export interface AcquiredParagraphBlock {
   readonly markBelowBaselinePt?: number;
   /** True when this mark's line box occupies a §17.6.5 document-grid cell. */
   readonly markOnLineGrid?: boolean;
+  /** Grid-only leading below a mark's own natural/authored box. */
+  readonly markGridAfterLeadingPt?: number;
   readonly flowRegistryDelta?: BodyFlowRegistryDeltaPt;
   readonly placement?: Readonly<{
     coordinateSpace: 'logical-body';
@@ -119,13 +123,6 @@ export interface AcquiredParagraphBlock {
   /** §17.3.1.11 admits identical adjacent framePr members with their owner. */
   readonly retainedFootnoteReferenceIds?: readonly string[];
   readonly relocationBlockExtentPt?: number;
-  /** Private source-owned reading atom. All members are fully acquired before
-   * any page occurrence is accepted; a flow-region retry reacquires the atom. */
-  readonly sourceOwnedAnchorRun?: Readonly<{
-    members: readonly Readonly<{input: import('./body-layout-input.js').BodyParagraphSourceInput; layout: ParagraphLayout; blockExtentPt: number}>[];
-    pageIndex: number; columnIndex: number; flowDomainId: string;
-    startYPt: number; extentPt: number;
-  }>;
 }
 
 export interface AcquiredTableBlock {
@@ -139,6 +136,9 @@ export interface AcquiredTableBlock {
    * charged with its footnote reserve exactly like a placed paragraph frame. */
   readonly relocationBlockExtentPt?: number;
   readonly requiresFreshFlowRegion?: boolean;
+  /** With requiresFreshFlowRegion: the fresh region must start a new page,
+   * not the next column. */
+  readonly requiresFreshPage?: boolean;
   readonly retryAtBlockStartPt?: number;
   readonly placement?: Readonly<{
     coordinateSpace: 'logical-body' | 'upright-physical';
@@ -149,8 +149,14 @@ export interface AcquiredTableBlock {
 }
 
 export interface StoryLayoutAcquisitionInput {
+  /** Section occurrence selecting this header/footer. Direct root acquisition
+   * defaults to source ownership; production page composers supply the section. */
+  readonly pageStoryOwner?: string;
   readonly source: SourceRef;
   readonly pageIndex: number;
+  /** A selected page story already knows its displayed numbering, including
+   * section restarts on pages not observed by the previous pagination pass. */
+  readonly pageNumber?: Readonly<{ displayNumber: number; format: import('@silurus/ooxml-core').NumberFormat }>;
   readonly section: DeepReadonly<SectionLayoutContext>;
   readonly container: FlowContainer;
   /**
@@ -212,6 +218,9 @@ export interface FollowingBodyBlockMeasurementInput {
 export interface FollowingBodyBlockMeasurement {
   readonly fullExtentPt: number;
   readonly leadContentExtentPt: number;
+  /** Retained first-line slice for reservation-aware grid admission. Only
+   * acquired for grid lines; later paragraph decoration is excluded. */
+  readonly leadGridParagraph?: ParagraphLayout;
   /** References painted when the complete block is retained with a keep chain. */
   readonly fullFootnoteReferenceIds?: readonly string[];
   /** References painted by the first indivisible content admitted with keepNext. */

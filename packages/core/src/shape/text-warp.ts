@@ -22,6 +22,7 @@
  */
 
 import warpPresetsJson from './preset-geometry/text-warp-presets.json';
+import { hasOwnKey, ownValue } from '../internal/own-key';
 import {
   createEvaluator,
   compileFormula,
@@ -57,13 +58,13 @@ const COMPILED = new Map<string, CompiledWarpDef>();
 
 /** True when `preset` (case-insensitive) is a known text-warp envelope. */
 export function hasTextWarp(preset: string): boolean {
-  return preset.toLowerCase() in WARP_PRESETS;
+  return hasOwnKey(WARP_PRESETS, preset.toLowerCase());
 }
 
 function compiledFor(key: string): CompiledWarpDef | null {
   let c = COMPILED.get(key);
   if (c) return c;
-  const def = WARP_PRESETS[key];
+  const def = ownValue(WARP_PRESETS, key);
   if (!def) return null;
   c = {
     adj: def.adj.map(([n, f]) => [n, compileFormula(f)] as [string, CompiledFormula]),
@@ -253,12 +254,6 @@ export function buildWarpEnvelope(
     bottomLen: cumulativeLengths(bottom),
     singleEdge,
   };
-}
-
-/** True when a preset has a single boundary curve (arch/circle baseline). */
-export function isSingleEdgeWarp(preset: string): boolean {
-  const def = WARP_PRESETS[preset.toLowerCase()];
-  return !!def && def.paths.length === 1;
 }
 
 /**

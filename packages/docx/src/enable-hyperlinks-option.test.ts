@@ -1,6 +1,5 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { DocxViewer } from './viewer.js';
-import { DocxScrollViewer } from './scroll-viewer.js';
 import { DocxDocument } from './document.js';
 import {
   installDom,

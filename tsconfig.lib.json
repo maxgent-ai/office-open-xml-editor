@@ -3,7 +3,6 @@
   "include": [
     "src/**/*",
     "packages/core/src/**/*",
-    "packages/legacy-converter/src/**/*",
     "packages/pptx/src/**/*",
     "packages/xlsx/src/**/*",
     "packages/docx/src/**/*",

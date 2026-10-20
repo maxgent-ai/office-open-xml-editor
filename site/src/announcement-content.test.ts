@@ -324,22 +324,19 @@ describe('v0.81 ChartEx migration guide', () => {
 
 describe('stable documentation boundaries', () => {
   it('keeps the current bundle measurements on one stable page', () => {
-    expect(bundleSizePage).toContain('Current production assets for v0.88.0');
+    expect(bundleSizePage).toContain('Current production assets for v0.89.0');
     expect(bundleSizePage).toContain('DOCX static JavaScript');
-    expect(bundleSizePage).toMatch(/<td>2,082 KiB<\/td>\s*<td>508 KiB<\/td>/);
+    expect(bundleSizePage).toMatch(/<td>3,056 KiB<\/td>\s*<td>692 KiB<\/td>/);
     expect(bundleSizePage).toContain('XLSX static JavaScript');
-    expect(bundleSizePage).toMatch(/<td>1,389 KiB<\/td>\s*<td>333 KiB<\/td>/);
+    expect(bundleSizePage).toMatch(/<td>2,103 KiB<\/td>\s*<td>450 KiB<\/td>/);
     expect(bundleSizePage).toContain('PPTX static JavaScript');
-    expect(bundleSizePage).toMatch(/<td>1,432 KiB<\/td>\s*<td>336 KiB<\/td>/);
-    expect(bundleSizePage).toContain('<tr><th>DOCX parser WASM</th><td>1,900 KiB</td><td>787 KiB</td></tr>');
-    expect(bundleSizePage).toContain('<tr><th>XLSX parser WASM</th><td>1,683 KiB</td><td>690 KiB</td></tr>');
-    expect(bundleSizePage).toContain('<tr><th>PPTX parser WASM</th><td>1,782 KiB</td><td>700 KiB</td></tr>');
+    expect(bundleSizePage).toMatch(/<td>2,114 KiB<\/td>\s*<td>454 KiB<\/td>/);
+    expect(bundleSizePage).toContain('<tr><th>DOCX parser WASM</th><td>2,252 KiB</td><td>940 KiB</td></tr>');
+    expect(bundleSizePage).toContain('<tr><th>XLSX parser WASM</th><td>1,923 KiB</td><td>790 KiB</td></tr>');
+    expect(bundleSizePage).toContain('<tr><th>PPTX parser WASM</th><td>2,060 KiB</td><td>806 KiB</td></tr>');
     expect(bundleSizePage).toContain('ChartEx');
     expect(bundleSizePage.match(/<th>TIFF image codec<\/th>/g)).toHaveLength(1);
-    expect(bundleSizePage).toContain('<td>22.2 KiB</td><td>6.7 KiB</td>');
-    expect(bundleSizePage).not.toContain('3.9 KiB');
-    expect(bundleSizePage).not.toContain('7.3 KiB');
-    expect(bundleSizePage).not.toContain('3.1 KiB');
+    expect(bundleSizePage).toContain('<td>27.5 KiB</td><td>8.3 KiB</td>');
     expect(productionPage).toContain('A small TIFF reuse');
     expect(productionPage).toContain('it is not a');
     expect(productionPage).toContain('general-purpose TIFF library');

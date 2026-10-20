@@ -261,6 +261,7 @@ pub(super) fn extract_axis_tick_label_italic(axis_node: Node) -> Option<bool> {
 pub(super) fn extract_chart_title_text(node: Node) -> Option<String> {
     let title = child(node, "title")?;
     let mut text = String::new();
+    let mut rich_paragraphs = 0usize;
     for d in title.descendants().filter(|n| n.is_element()) {
         match d.tag_name().name() {
             "t" | "v" => {
@@ -268,10 +269,23 @@ pub(super) fn extract_chart_title_text(node: Node) -> Option<String> {
                     text.push_str(t);
                 }
             }
+            // DrawingML authored line breaks (ECMA-376 §21.1.2.2.1 `<a:br>`
+            // and §21.1.2.2.6 paragraph boundaries of the title's own
+            // `<c:tx><c:rich>`) start a new line, as in the rich title runs.
+            "br" => text.push('\n'),
+            "p" if d
+                .parent_element()
+                .is_some_and(|parent| parent.tag_name().name() == "rich") =>
+            {
+                if rich_paragraphs > 0 {
+                    text.push('\n');
+                }
+                rich_paragraphs += 1;
+            }
             _ => {}
         }
     }
-    if text.is_empty() {
+    if !chart_text_has_content(&text) {
         None
     } else {
         Some(text)
@@ -1058,7 +1072,7 @@ pub(super) fn chartex_text(container: Node) -> Option<String> {
         .find(|node| node.is_element() && node.tag_name().name() == "rich")
     {
         let text = flatten_rich_text(rich, None);
-        if !text.is_empty() {
+        if chart_text_has_content(&text) {
             return Some(text);
         }
     }

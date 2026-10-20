@@ -1,3 +1,4 @@
+import { inheritCellFontLanguage } from './internal/cell-font-language.js';
 import {
   XlsxWorkbook,
   acquireXlsxWorksheetPreview,
@@ -74,8 +75,6 @@ import { SelectionOverlay } from './internal/viewer/selection-overlay.js';
 import { SelectionNotifier } from './internal/viewer/selection-notifier.js';
 import { SelectionContextReader } from './internal/viewer/selection-context.js';
 import { ChromeTheme } from './internal/viewer/chrome-theme.js';
-import { ConditionalFormattingNotice } from './internal/viewer/cf-notice.js';
-import { withCfReportSink, type XlsxConditionalFormattingReport } from './cf-diagnostics.js';
 import {
   COMMENT_POPUP_MAX_H,
   COMMENT_POPUP_MAX_W,
@@ -557,9 +556,6 @@ class XlsxViewerEngine implements ZoomableViewer {
 
   /** List data-validation dropdown arrow and display-only value panel. */
   private readonly validation: ValidationPanel;
-  /** Default notice for the committed frame's conditional-formatting
-   *  evaluation boundary (#1547). */
-  private readonly cfNotice: ConditionalFormattingNotice;
 
   constructor(
     container: HTMLElement,
@@ -631,7 +627,6 @@ class XlsxViewerEngine implements ZoomableViewer {
       validationMaxWidth: VALIDATION_PANEL_MAX_W,
       validationMaxHeight: VALIDATION_PANEL_MAX_H,
     });
-    this.cfNotice = new ConditionalFormattingNotice(this.hostDocument, this.canvasArea);
     this.notifier = new SelectionNotifier({
       hostWindow: this.hostWindow,
       isDestroyed: () => this._destroyed,
@@ -937,7 +932,7 @@ class XlsxViewerEngine implements ZoomableViewer {
           chartEx: this.opts.chartEx,
           tiff: this.opts.tiff,
           mode: this._mode,
-          ...(this.opts.modelSources === undefined ? undefined : { modelSources: this.opts.modelSources }),
+          ...(this.opts.legacyXls === undefined ? undefined : { legacyXls: this.opts.legacyXls }),
         }, sourceOptions), () => {
           // Claim every async-operation generation before closing the old
           // workbook. Rejections caused by its worker termination are stale
@@ -947,8 +942,6 @@ class XlsxViewerEngine implements ZoomableViewer {
           this.finder.invalidate();
           this.hideValidationPanel();
           this.releaseHostFonts();
-          // The replaced workbook's frame no longer describes the canvas.
-          this.cfNotice.clear();
         });
       if (!wb) return;
       if (this._destroyed) throw this.destroyedError();
@@ -1230,8 +1223,6 @@ class XlsxViewerEngine implements ZoomableViewer {
     this.sheetViews.set(index, worksheet);
     this.currentSheet = index;
     this.currentWorksheet = worksheet;
-    // The previous sheet's report must not describe this sheet's first frame.
-    this.cfNotice.clear();
     this.previewCompletion = previewCompletion;
     this.firstPreviewRender = previewCompletion !== null;
     this.previewPreparedViewport = previewPreparedViewport;
@@ -1299,7 +1290,6 @@ class XlsxViewerEngine implements ZoomableViewer {
         this.releaseCurrentWorksheet?.();
         this.releaseCurrentWorksheet = null;
         this.renderDispatcher.begin();
-        this.cfNotice.clear();
         if (this._mode === 'worker') {
           // A bitmaprenderer canvas has no 2D context, and resizing it can
           // retain the last transferred frame. Replace it with an empty bitmap.
@@ -2110,6 +2100,7 @@ class XlsxViewerEngine implements ZoomableViewer {
     const worksheet = createSheetViewModel(source);
     if (this.opts.comments === false) {
       const hidden = { ...worksheet, commentRefs: [], comments: [] };
+      inheritCellFontLanguage(worksheet, hidden);
       inheritWorksheetPreviewBounds(worksheet, hidden);
       inheritWorksheetPolicy(worksheet, hidden);
       return hidden;
@@ -2131,6 +2122,7 @@ class XlsxViewerEngine implements ZoomableViewer {
       commentRefs: worksheet.commentRefs?.filter((ref) => !resolved.has(ref)),
       comments: worksheet.comments?.filter((comment) => !resolved.has(comment.cellRef)),
     };
+    inheritCellFontLanguage(worksheet, unresolved);
     inheritWorksheetPreviewBounds(worksheet, unresolved);
     inheritWorksheetPolicy(worksheet, unresolved);
     return unresolved;
@@ -2315,9 +2307,6 @@ class XlsxViewerEngine implements ZoomableViewer {
 
   private updateSpacerSize(ws: Worksheet): void {
     const cs = this.viewport.scale;
-    const freezeRows = ws.freezeRows ?? 0;
-    const freezeCols = ws.freezeCols ?? 0;
-
     // Find actual scrollable data extent
     let { maxRow, maxCol } = worksheetContentBounds(ws, this.gridExtent);
     maxRow += this.gridExtent.marginRows;
@@ -2463,14 +2452,6 @@ class XlsxViewerEngine implements ZoomableViewer {
       { worksheet: ws, projection },
     );
 
-    // This invocation's report is delivered only to this call. It is applied
-    // after the frame commits; a stale or failed frame returns/throws below
-    // and leaves the current notice untouched.
-    const frame: { report: XlsxConditionalFormattingReport | null } = { report: null };
-    const reportingOpts = withCfReportSink(viewerRenderOpts, (report) => {
-      frame.report = report;
-    });
-
     if (this._mode === 'worker') {
       // Render the viewport off the main thread and paint the returned bitmap.
       // The selection overlay (geometry-based, from getCellRect) is unaffected.
@@ -2480,7 +2461,7 @@ class XlsxViewerEngine implements ZoomableViewer {
       const bmp = await this.workbook.renderViewportToBitmap(
         this.currentSheet,
         viewport,
-        reportingOpts,
+        viewerRenderOpts,
       );
       if (!this.renderDispatcher.commitBitmap(seq, bmp, w, h)) return;
     } else {
@@ -2488,13 +2469,12 @@ class XlsxViewerEngine implements ZoomableViewer {
         this.canvas,
         this.currentSheet,
         viewport,
-        withXlsxRenderCommitGuard(reportingOpts, () =>
+        withXlsxRenderCommitGuard(viewerRenderOpts, () =>
           !this._destroyed && this.renderDispatcher.isCurrent(seq),
         ),
       );
       if (!this.renderDispatcher.isCurrent(seq) || this._destroyed) return;
     }
-    this.cfNotice.update(frame.report);
     // XL4: repaint the outline gutters over the fresh grid frame, aligned to the
     // same scroll offset. No-op when the sheet has no outlining.
     this.renderGutters();
@@ -2557,7 +2537,6 @@ class XlsxViewerEngine implements ZoomableViewer {
     this.zoomControl?.destroy();
     this.comments.destroy();
     this.validation.destroy();
-    this.cfNotice.destroy();
     // IX2 — drop the find state (matches + cursor) so a stale
     // findNext()/findPrev() after teardown returns null instead of a match
     // pointing into a dead viewer (same fix as DocxViewer/PptxViewer.destroy).

@@ -28,6 +28,24 @@ export interface ExactColumnBalanceResult {
 export function solveExactColumnBalance(
   input: ExactColumnBalanceInput,
 ): ExactColumnBalanceResult {
+  // ECMA-376 §17.18.4: a column break that ends the balanced content still
+  // advances to the next column. Balance into one fewer column so the break
+  // lands on this page; when interior breaks leave no such partition, the
+  // break follows the last column to the next page (Windows Word 16.0.20430,
+  // #1896 control C5).
+  const last = input.fragments.at(-1);
+  if (last?.breakAfter === 'forced' && input.columnCount > 1) {
+    const reserved = solveColumnBalance({ ...input, columnCount: input.columnCount - 1 });
+    if (reserved) return reserved;
+  }
+  const result = solveColumnBalance(input);
+  if (!result) throw new Error('Authored column breaks exceed the available column frontier');
+  return result;
+}
+
+function solveColumnBalance(
+  input: ExactColumnBalanceInput,
+): ExactColumnBalanceResult | null {
   if (!Number.isInteger(input.columnCount) || input.columnCount <= 0) {
     throw new RangeError('Column count must be a positive integer');
   }
@@ -133,9 +151,7 @@ export function solveExactColumnBalance(
       selectedLayer = columns;
     }
   }
-  if (selectedLayer < 0 || !Number.isFinite(targetPt)) {
-    throw new Error('Authored column breaks exceed the available column frontier');
-  }
+  if (selectedLayer < 0 || !Number.isFinite(targetPt)) return null;
 
   const cuts: number[] = [];
   let endPosition = finalPosition;

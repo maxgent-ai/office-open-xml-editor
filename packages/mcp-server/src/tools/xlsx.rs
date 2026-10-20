@@ -596,7 +596,7 @@ mod sample_tests {
         let mut output = ZipWriter::new(Cursor::new(Vec::new()));
         for index in 0..archive.len() {
             let mut part = archive.by_index(index).unwrap();
-            let name = part.name().to_string();
+            let name = part.name().unwrap().into_owned();
             let mut bytes = Vec::new();
             if name == "xl/worksheets/sheet1.xml" {
                 bytes.extend_from_slice(
@@ -683,10 +683,10 @@ mod sample_tests {
         let mut output = ZipWriter::new(Cursor::new(Vec::new()));
         for index in 0..archive.len() {
             let mut part = archive.by_index(index).unwrap();
-            if part.name() == "xl/_rels/workbook.xml.rels" {
+            if part.name().unwrap() == "xl/_rels/workbook.xml.rels" {
                 continue;
             }
-            let name = part.name().to_string();
+            let name = part.name().unwrap().into_owned();
             let mut bytes = Vec::new();
             part.read_to_end(&mut bytes).unwrap();
             output

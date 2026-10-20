@@ -308,15 +308,9 @@ describe('pie per-point dLbl flags override series defaults (§21.2.2.47)', () =
 });
 
 describe('pie / doughnut ctr data-label radius (§21.2.2.48, PowerPoint layout)', () => {
-  // Radial placement of `ctr` (and default) data labels, verified against the
-  // sample-14.pdf ground truth (PowerPoint's own render):
-  //   • SOLID pie   → labels sit near the rim at ≈0.88·outerR (measured 0.878 /
-  //     0.888 / 0.887 / 0.912 across the 54/27/14/5% slices; center + outer
-  //     radius from a least-squares rim fit, residual std 0.43pt). PowerPoint
-  //     does NOT place a pie `ctr` label at the disc's geometric mid-radius.
-  //   • DOUGHNUT    → labels sit at the RING midpoint (innerR+outerR)/2. For the
-  //     55% hole this is 0.775·outerR, matching the PDF (measured 0.772–0.778
-  //     across all five slices). This branch must not move.
+  // `ctr` centers labels halfway along the radial data marker. Unlike inEnd,
+  // it does not require the text rectangle to fit inside the wedge: even a
+  // narrow slice keeps its label. Check the production painter, not a helper.
   const pieModel = (chartType: 'pie' | 'doughnut', position?: string): ChartModel =>
     baseModel({
       chartType,
@@ -336,7 +330,7 @@ describe('pie / doughnut ctr data-label radius (§21.2.2.48, PowerPoint layout)'
       })],
     });
 
-  it('places SOLID-pie ctr labels near the rim (≈0.88R), not at mid-radius', () => {
+  it('centers solid-pie labels at half-radius, including narrow slices', () => {
     const rec = recordingCtx();
     renderChart(rec.ctx, pieModel('pie', 'ctr'), RECT, 1);
     const { cx, cy, outerR } = pieGeometry(rec.arcs);
@@ -344,12 +338,45 @@ describe('pie / doughnut ctr data-label radius (§21.2.2.48, PowerPoint layout)'
     expect(labels.length).toBe(4);
     for (const l of labels) {
       const ratio = Math.hypot(l.x - cx, l.y - cy) / outerR;
-      // Near the rim: comfortably beyond mid-radius, inside the outer edge.
-      expect(ratio).toBeGreaterThan(0.8);
-      expect(ratio).toBeLessThan(1.0);
-      // And specifically close to the PowerPoint-measured ≈0.88 constant.
-      expect(Math.abs(ratio - 0.88)).toBeLessThan(0.06);
+      expect(ratio).toBeCloseTo(0.5, 5);
     }
+  });
+
+  it.each([false, true])('keeps ctr labels visible across a 5-degree wedge (boxed=%s)', boxed => {
+    const model = pieModel('pie', 'inEnd');
+    const s = model.series[0];
+    s.values = [5, 355];
+    s.dataPointOverrides = [{ idx: 0, explosion: 25 }];
+    s.dataLabelOverrides = [{ idx: 0, text: '', position: 'ctr' }];
+    s.seriesDataLabels = {
+      ...s.seriesDataLabels,
+      showVal: true, showPercent: false, showCatName: false, showSerName: false,
+      formatCode: '0', fontSizeHpt: 1200,
+      ...(boxed ? { labelBox: { fill: 'FFFFFF' } } : {}),
+    };
+    const rec = recordingCtx();
+    renderChart(rec.ctx, model, RECT, 1);
+    const { cx, cy, outerR } = pieGeometry(rec.arcs);
+    const label = rec.texts.find(t => t.text === '5');
+    expect(label).toBeDefined();
+    expect(Math.hypot((label as TextCall).x - cx, (label as TextCall).y - cy) / outerR)
+      .toBeCloseTo(0.5, 5);
+    // The point override must not change its sibling's inside-end placement.
+    const sibling = rec.texts.find(t => t.text === '355') as TextCall;
+    expect(sibling).toBeDefined();
+    expect(Math.hypot(sibling.x - cx, sibling.y - cy) / outerR).toBeGreaterThan(0.8);
+  });
+
+  it('does not create a centered label for a zero-area slice', () => {
+    const model = pieModel('pie', 'ctr');
+    model.series[0].values = [0, 360];
+    model.series[0].seriesDataLabels = {
+      showVal: true, showPercent: false, showCatName: false, showSerName: false,
+      position: 'ctr', formatCode: '0', fontSizeHpt: 1200,
+    };
+    const rec = recordingCtx();
+    renderChart(rec.ctx, model, RECT, 1);
+    expect(rec.texts.map(t => t.text)).toEqual(['360']);
   });
 
   it('keeps DOUGHNUT ctr labels at the ring midpoint (0.775R for a 55% hole)', () => {

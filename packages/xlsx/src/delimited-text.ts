@@ -1,7 +1,7 @@
 import {
   DEFAULT_XLSX_WORKSHEET_POLICY,
   type NormalizedXlsxWorksheetPolicy,
-} from '@silurus/ooxml-core/worker';
+} from './internal/worksheet-policy.js';
 import { cappedAdd, utf8Bytes } from '@silurus/ooxml-core/internal/resource-measurement';
 import type { ParsedWorkbook, Row, Styles, Worksheet } from './types.js';
 import { bindWorksheetPolicy } from './worksheet-policy-context.js';

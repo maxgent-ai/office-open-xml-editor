@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { createLayoutServices } from './layout-runtime.js';
 import { decodeRaster, preloadImages } from './test-support/renderer-internals.test-support.js';
 import { dropColorReplacedCache } from './renderer';
+import { imageKey, preloadPaintImages } from './paint/browser-images.js';
 import * as core from '@silurus/ooxml-core';
 import type { DocxDocumentModel } from './types';
 
@@ -46,6 +47,105 @@ describe('docx lazy image bytes', () => {
     );
   });
   afterEach(() => vi.unstubAllGlobals());
+
+  it('preloads distinct authored brightness effects without changing the raw picture', async () => {
+    const written: number[][] = [];
+    class PixelSurface {
+      constructor(readonly width: number, readonly height: number) {}
+      getContext() {
+        return {
+          drawImage() {},
+          getImageData: () => ({
+            data: new Uint8ClampedArray([0, 0, 0, 255, 128, 128, 128, 128]),
+            width: 2,
+            height: 1,
+          }),
+          putImageData: (image: ImageData) => written.push(Array.from(image.data)),
+        };
+      }
+    }
+    vi.stubGlobal('OffscreenCanvas', PixelSurface);
+    vi.stubGlobal('createImageBitmap', vi.fn(async () => ({ width: 2, height: 1, close() {} })));
+    const fetchImage = vi.fn(async () => new Blob([new Uint8Array([1])], { type: 'image/png' }));
+    const picture = {
+      type: 'image', imagePath: 'word/media/shared.png', mimeType: 'image/png',
+      widthPt: 24, heightPt: 12,
+    };
+    const doc = {
+      body: [{ type: 'paragraph', runs: [
+        picture,
+        { ...picture, blipEffects: [{ type: 'luminance', bright: .9, contrast: 0 }] },
+        { ...picture, blipEffects: [{ type: 'luminance', bright: 0, contrast: -.5 }] },
+        { ...picture, duotone: { clr1: '000000', clr2: 'FF0000' }, blipEffects: [
+          { type: 'luminance', bright: .9, contrast: 0 }, { type: 'duotone' },
+        ] },
+        { ...picture, duotone: { clr1: '000000', clr2: 'FF0000' }, blipEffects: [
+          { type: 'duotone' }, { type: 'luminance', bright: .9, contrast: 0 },
+        ] },
+      ] }], headers: {}, footers: {},
+    } as unknown as DocxDocumentModel;
+
+    const images = await preloadImages(doc, fetchImage);
+
+    expect(images.size).toBe(5);
+    expect(fetchImage).toHaveBeenCalledTimes(1);
+    expect(written).toEqual([
+      [230, 230, 230, 255, 255, 255, 255, 128],
+      [64, 64, 64, 255, 128, 128, 128, 128],
+      [230, 0, 0, 255, 255, 0, 0, 128],
+      [230, 230, 230, 255, 255, 230, 230, 128],
+    ]);
+  });
+
+  it.each([
+    { partPath: 'word/media/only.svg', mimeType: 'image/svg+xml' },
+    { partPath: 'word/media/fallback.png', mimeType: 'image/png', svgImagePath: 'word/media/original.svg' },
+  ])('rasterizes $partPath through the SVG host decoder before luminance', async source => {
+    let pixels: number[] = [];
+    class Surface {
+      constructor(readonly width: number, readonly height: number) {}
+      getContext() {
+        return {
+          drawImage() {},
+          getImageData: () => ({ data: new Uint8ClampedArray([0, 0, 0, 255]), width: 1, height: 1 }),
+          putImageData: (data: ImageData) => { pixels = [...data.data]; },
+        };
+      }
+    }
+    vi.stubGlobal('OffscreenCanvas', Surface);
+    vi.stubGlobal('createImageBitmap', vi.fn(async (source: unknown) => {
+      if (source instanceof Blob && source.type === 'image/svg+xml') {
+        throw new Error('SVG Blob is not supported by createImageBitmap');
+      }
+      return { width: 1, height: 1, close() {} };
+    }));
+    const svgDecoder = vi.fn(async () => ({ width: 1, height: 1, close() {} }) as ImageBitmap);
+    const fetchImage = vi.fn(async () => new Blob(['<svg/>'], { type: 'image/svg+xml' }));
+    const effects = [{ type: 'luminance' as const, bright: .9, contrast: 0 }];
+    const decoded = await preloadPaintImages([{
+      ...source, kind: 'image', resourceKey: 'corrected', blipEffects: effects,
+      intrinsicSize: { widthPt: 1, heightPt: 1 },
+    }], [{ resourceKind: 'image', resourceKey: 'corrected', widthPt: 1, heightPt: 1 }],
+    fetchImage, undefined, 1, svgDecoder);
+    // Effected images are keyed per occurrence (physical frame), by resource.
+    expect(decoded.get('corrected')).toMatchObject({ width: 1, height: 1 });
+    expect(pixels).toEqual([230, 230, 230, 255]);
+    expect(svgDecoder).toHaveBeenCalledTimes(1);
+    expect(fetchImage).toHaveBeenCalledWith(source.svgImagePath ?? source.partPath, 'image/svg+xml');
+  });
+
+  it('rejects excessive picture effects before fetching image bytes', async () => {
+    const fetchImage = vi.fn(async () => new Blob());
+    const effects = Array.from({ length: core.MAX_IMAGE_EFFECT_PASSES + 1 }, () => (
+      { type: 'luminance' as const, bright: .9, contrast: 0 }
+    ));
+
+    await expect(decodeRaster(
+      'word/media/effects.png', 'image/png', undefined, fetchImage,
+      0, 0, undefined, undefined, undefined, undefined, undefined, undefined, effects,
+    )).rejects.toThrow();
+    expect(fetchImage).not.toHaveBeenCalled();
+  });
 
   it('decodeRaster pulls bytes by path via fetchImage and passes the MIME through', async () => {
     const fetchImage = vi.fn(
@@ -136,7 +236,6 @@ describe('docx lazy image bytes', () => {
       0,
       0,
       undefined,
-      false,
       undefined,
       { targetWidthPx: 1, targetHeightPx: 1 },
     );
@@ -203,7 +302,7 @@ describe('docx lazy image bytes', () => {
     vi.stubGlobal('createImageBitmap', createBitmap);
     const args = [
       'word/media/chained-effects.png', 'image/png', 'FFFFFF', fetchImage,
-      0, 0, { clr1: '000000', clr2: 'FF0000' }, false, undefined,
+      0, 0, { clr1: '000000', clr2: 'FF0000' }, undefined,
     ] as const;
 
     const wide = await decodeRaster(...args, { targetWidthPx: 4, targetHeightPx: 1 });
@@ -228,15 +327,15 @@ describe('docx lazy image bytes', () => {
       resizeHeight: 3,
       resizeQuality: 'high',
     });
-    // Exact white becomes transparent first; the still-opaque gray neighbour is
-    // then mapped once through the black→red duotone ramp in the same buffer.
+    // White becomes transparent, then duotone transforms all RGB (including
+    // transparent pixels which a later alpha replacement could reveal).
     expect([...writes[0].slice(0, 8)]).toEqual([
-      255, 255, 255, 0,
+      255, 0, 0, 0,
       128, 0, 0, 255,
     ]);
   });
 
-  it('resamples the clrChange result when chained duotone fails, while strict mode returns null', async () => {
+  it('rejects a failed chained duotone instead of painting only clrChange', async () => {
     const written: Uint8ClampedArray[] = [];
     class FallbackSurface {
       constructor(readonly width: number, readonly height: number) {}
@@ -275,28 +374,10 @@ describe('docx lazy image bytes', () => {
 
     try {
       await expect(decodeRaster(
-        ...args,
-        false,
-        undefined,
-        { targetWidthPx: 1, targetHeightPx: 1 },
-      )).resolves.toBe(fallback);
-      await expect(decodeRaster(
-        ...args,
-        true,
-        undefined,
-        { targetWidthPx: 1, targetHeightPx: 1 },
-      )).resolves.toBeNull();
-
-      expect([...written[0].slice(0, 8)]).toEqual([
-        255, 255, 255, 0,
-        128, 128, 128, 255,
-      ]);
-      expect(createBitmap).toHaveBeenCalledTimes(2);
-      expect(createBitmap).toHaveBeenNthCalledWith(2, expect.any(FallbackSurface), {
-        resizeWidth: 1,
-        resizeHeight: 1,
-        resizeQuality: 'high',
-      });
+        ...args, undefined, { targetWidthPx: 1, targetHeightPx: 1 },
+      )).rejects.toThrow('duotone transform unavailable');
+      expect(written).toEqual([]);
+      expect(createBitmap).toHaveBeenCalledTimes(1);
     } finally {
       duotoneTransform.mockRestore();
       dropColorReplacedCache(fetchImage);
@@ -342,7 +423,6 @@ describe('docx lazy image bytes', () => {
       0,
       0,
       { clr1: '000000', clr2: 'FFFFFF' },
-      false,
       undefined,
       { targetWidthPx: 300, targetHeightPx: 250 },
     )).resolves.toMatchObject({ width: 300, height: 250 });
@@ -390,7 +470,6 @@ describe('docx lazy image bytes', () => {
       0,
       0,
       { clr1: '000000', clr2: 'FFFFFF' },
-      false,
       undefined,
       { targetWidthPx: 300, targetHeightPx: 250 },
     )).resolves.toMatchObject({ width: 300, height: 250 });
@@ -659,7 +738,6 @@ describe('docx lazy image bytes', () => {
       0,
       0,
       undefined,
-      false,
       { render },
     )).resolves.toBe(bitmap);
 

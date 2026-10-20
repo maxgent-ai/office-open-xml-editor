@@ -1,7 +1,7 @@
 {
   "name": "@silurus/ooxml-xlsx",
   "private": true,
-  "version": "0.88.0",
+  "version": "0.89.0",
   "description": "XLSX parser and Canvas renderer (internal workspace package of @silurus/ooxml)",
   "license": "MIT",
   "author": "Yuki Yokotani <silurus.dev@gmail.com>",
@@ -39,9 +39,7 @@
   ],
   "scripts": {
     "dev": "vite",
-    "build": "tsc --build && vite build && node ../../scripts/build-model-source-sidecars.mjs xlsx && tsc -p tsconfig.declarations.json",
-    "build:ci": "vite build && node ../../scripts/build-model-source-sidecars.mjs xlsx && tsc -p tsconfig.declarations.json",
-    "preview": "vite preview",
+    "build": "tsc --build ../core && vite build && node ../../scripts/build-model-source-sidecars.mjs xlsx && tsc -p tsconfig.declarations.json",
     "wasm": "cd parser && wasm-pack build --target web --out-dir ../src/wasm && node ../../../scripts/append-wasm-reinit.mjs ../src/wasm/xlsx_parser.js",
     "typecheck": "tsc --noEmit",
     "vrt": "VRT_MODE=regression playwright test --config playwright.config.ts",

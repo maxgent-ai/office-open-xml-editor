@@ -1,5 +1,5 @@
+import { viewerState } from './scroll-viewer-test-dom.js';
 import { describe, it, expect, afterEach, vi } from 'vitest';
-import { PptxScrollViewer } from './scroll-viewer.js';
 import { installDom, makeContainer, makeBorrowedPptxScrollViewer, FakePptxEngine, type FakeEl } from './scroll-viewer-test-dom.js';
 
 afterEach(() => {
@@ -45,7 +45,7 @@ describe('PptxScrollViewer IX9 zoom contract', () => {
     const { v } = setup();
     // base = 200 / 200 = 1.0
     expect(v.getScale()).toBeCloseTo(1.0, 6);
-    expect(v.getScale()).toBeCloseTo(v.scaleForTest(), 10);
+    expect(v.getScale()).toBeCloseTo(v.getScale(), 10);
     v.destroy();
   });
 
@@ -180,12 +180,12 @@ describe('PptxScrollViewer IX9 zoom contract', () => {
     scrollHost.clientWidth = 200;
     scrollHost.clientHeight = 400;
     v.relayout();
-    expect(v.scaleForTest()).toBeCloseTo(2, 6); // applied over the 1.0 base fit
+    expect(v.getScale()).toBeCloseTo(2, 6); // applied over the 1.0 base fit
     expect(v.getScale()).toBeCloseTo(2, 6);
     expect(onScaleChange).toHaveBeenCalledTimes(1);
     expect(onScaleChange).toHaveBeenCalledWith(2);
     // The base fit itself is still the true base (resize re-fit multiplier intact).
-    expect(v.baseScaleForTest()).toBeCloseTo(1.0, 6);
+    expect(viewerState(v).baseScale()).toBeCloseTo(1.0, 6);
     v.destroy();
   });
 
@@ -210,7 +210,7 @@ describe('PptxScrollViewer IX9 zoom contract', () => {
     const { v, scrollHost } = setup();
     scrollHost.scrollTop = 600;
     const pointerY = 250;
-    const before = v.contentAtViewportYForTest(pointerY);
+    const before = viewerState(v).contentAt(pointerY);
     scrollHost.dispatch('wheel', {
       ctrlKey: true,
       deltaY: -60,
@@ -219,7 +219,7 @@ describe('PptxScrollViewer IX9 zoom contract', () => {
       preventDefault() {},
     });
     expect(v.getScale()).toBeGreaterThan(1);
-    expect(v.viewportYOfForTest(before.slide, before.frac)).toBeCloseTo(pointerY, 4);
+    expect(viewerState(v).viewportYOf(before.slide, before.frac)).toBeCloseTo(pointerY, 4);
     v.destroy();
   });
 
@@ -228,7 +228,7 @@ describe('PptxScrollViewer IX9 zoom contract', () => {
     v.setScale(3);
     scrollHost.scrollTop = 500;
     const pointerY = 140;
-    const before = v.contentAtViewportYForTest(pointerY);
+    const before = viewerState(v).contentAt(pointerY);
     scrollHost.dispatch('wheel', {
       ctrlKey: true,
       deltaY: 60,
@@ -237,16 +237,16 @@ describe('PptxScrollViewer IX9 zoom contract', () => {
       preventDefault() {},
     });
     expect(v.getScale()).toBeLessThan(3);
-    expect(v.viewportYOfForTest(before.slide, before.frac)).toBeCloseTo(pointerY, 4);
+    expect(viewerState(v).viewportYOf(before.slide, before.frac)).toBeCloseTo(pointerY, 4);
     v.destroy();
   });
 
   it('a non-gesture setScale still anchors on the viewport top (unchanged)', () => {
     const { v, scrollHost } = setup();
     scrollHost.scrollTop = 600;
-    const topContent = v.contentAtViewportYForTest(0);
+    const topContent = viewerState(v).contentAt(0);
     v.setScale(3);
-    expect(v.viewportYOfForTest(topContent.slide, topContent.frac)).toBeCloseTo(0, 4);
+    expect(viewerState(v).viewportYOf(topContent.slide, topContent.frac)).toBeCloseTo(0, 4);
     v.destroy();
   });
 
@@ -298,9 +298,9 @@ describe('PptxScrollViewer IX9 zoom contract', () => {
       preventDefault() {},
     });
     expect(v.getScale()).toBe(4); // confirmed no-op
-    const topContent = v.contentAtViewportYForTest(0);
+    const topContent = viewerState(v).contentAt(0);
     v.zoomOut(); // non-gesture stepper — must keep the viewport-TOP anchor
-    expect(v.viewportYOfForTest(topContent.slide, topContent.frac)).toBeCloseTo(0, 4);
+    expect(viewerState(v).viewportYOf(topContent.slide, topContent.frac)).toBeCloseTo(0, 4);
     v.destroy();
   });
 });

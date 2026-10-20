@@ -17,11 +17,11 @@
 //! unreachable` **trap** — the browser tab loses the document, not just the
 //! pathological subtree.
 //!
-//! [`DepthGuard`] bounds that recursion. Each recursive call descends the guard
-//! by one; when the configured limit is reached the caller stops descending and
-//! returns whatever it has parsed so far, so the *rest* of the document still
-//! renders (graceful degradation, matching the "skip the blit / drop the
-//! picture, keep rendering" contract used elsewhere in these parsers).
+//! [`DepthGuard`] bounds that recursion. Crossing it latches the existing typed
+//! hard-resource failure in the active package operation. Walkers stop recursing;
+//! their provisional output must never be published after a crossing. Package
+//! operations and cursor pulls check health before returning output. Malformed
+//! XML remains a separate, recoverable content error.
 //!
 //! ## Why 64
 //!
@@ -52,7 +52,7 @@ pub const MAX_PARSE_DEPTH: u32 = 64;
 /// Callers create one at the top of a recursion with [`DepthGuard::root`], then
 /// obtain a child guard for each descent with [`DepthGuard::descend`]. When
 /// `descend` returns `None` the limit has been reached and the caller must stop
-/// recursing (return the partial result) instead of calling itself again.
+/// recursing. The package operation rejects the provisional result.
 ///
 /// The type is `Copy` and holds a single `u32`, so threading it as a by-value
 /// parameter adds no allocation and no borrow-checker friction.
@@ -116,11 +116,12 @@ impl DepthGuard {
     /// A child guard one level deeper, or `None` when the limit is reached.
     ///
     /// `Some(child)` ⇒ recurse with `child`; `None` ⇒ stop and return the
-    /// partial result. The parent guard is unchanged (`Copy`), so sibling
-    /// descents each get their own fresh child.
+    /// provisional result; the package operation must fail. The parent guard is
+    /// unchanged (`Copy`), so sibling descents each get their own fresh child.
     #[inline]
-    pub const fn descend(self) -> Option<Self> {
+    pub fn descend(self) -> Option<Self> {
         if self.depth >= self.limit {
+            report_depth_limit(self.limit);
             None
         } else {
             Some(Self {
@@ -131,6 +132,19 @@ impl DepthGuard {
     }
 }
 
+/// Library resource policy, not a schema restriction. Shared walkers may be
+/// infallible, so latch before returning a bounded provisional projection. This
+/// uses the package-owned governor selected by the synchronous resource scope;
+/// no caller compatibility/unsupported-content policy can clear the failure.
+fn report_depth_limit(limit: u32) {
+    let _ = crate::resource::observe_hard_limit(
+        crate::resource::HardResourceLimitKind::XmlNestingDepth,
+        None,
+        u64::from(limit),
+        u64::from(limit) + 1,
+    );
+}
+
 impl Default for DepthGuard {
     #[inline]
     fn default() -> Self {
@@ -138,98 +152,121 @@ impl Default for DepthGuard {
     }
 }
 
-/// Maximum XML element-nesting depth accepted before handing a part off to
-/// `roxmltree::Document::parse` (see [`xml_nesting_exceeds`]).
-///
-/// This is a *separate* concern from [`MAX_PARSE_DEPTH`], which bounds our own
-/// recursive descent (group shapes / tables / OMML). `roxmltree::Document::parse`
-/// **itself recurses proportionally to element nesting** while building its tree,
-/// so a document with a few thousand nested elements overflows the fixed WASM
-/// linear-memory stack (~1 MiB) and traps the whole parse *before any of our code
-/// runs* — our [`DepthGuard`] alone cannot prevent that. Measured on this
-/// roxmltree (0.20) in an optimized build, ~1000-deep nesting is the overflow
-/// threshold at a 1 MiB stack.
-///
-/// 256 keeps a wide safety margin below that threshold while sitting far above
-/// any legitimate OOXML part: real documents nest on the order of tens of levels
-/// (sectPr › tbl › tr › tc › p › r, group-in-group, etc.), never hundreds. A part
-/// deeper than this is rejected so the caller degrades gracefully (skip the part,
-/// keep the rest of the document) instead of trapping.
+/// Maximum lexical XML content-frame nesting admitted by library resource
+/// policy, not an OOXML schema restriction. Upstream roxmltree 0.20 recursively
+/// parses nonempty elements; preflight must reject unsafe byte streams before
+/// entering it, even when a separate content error would also reject the part.
+/// Empty-element tags do not open recursive content frames.
 pub const MAX_XML_DEPTH: u32 = 256;
 
-/// Scan raw XML `bytes` for element nesting deeper than `limit`, returning `true`
-/// as soon as the limit is exceeded.
+/// Scan tag nesting in the byte stream, independently of XML well-formedness.
+/// Completed nonempty start tags open a frame, end tags close one (saturating
+/// at zero), and empty-element tags open none. Names, duplicate attributes,
+/// entities, namespaces and matching end names are left to roxmltree. A lexical
+/// crossing is a resource violation even if such a content error occurs first.
 ///
-/// This is a cheap, allocation-free, single-pass pre-check run *before*
-/// `roxmltree::Document::parse` so a maliciously deep document is rejected rather
-/// than overflowing roxmltree's recursive tree builder (see [`MAX_XML_DEPTH`]).
-/// It is deliberately a coarse lexer — it does not validate the XML, only tracks
-/// tag nesting well enough to bound depth:
+/// XML 1.0 §§2.3–2.8 and 3.1 delimit the lexical constructs: quotes shield tag
+/// delimiters; comments, CDATA and PIs (including the XML declaration) shield
+/// their bodies; a DOCTYPE shields its external identifier and internal subset,
+/// including quoted declarations, comments and PIs. This is only a depth lexer,
+/// not a second XML validator or an entity expander. The DOM disallows DTDs,
+/// consistent with ECMA-376 Part 2 §6.2.5 for OPC XML.
 ///
-///   * `<name …>`   — a start tag: depth + 1.
-///   * `</name>`    — an end tag: depth − 1.
-///   * `<name … />` — a self-closing tag: no net change (it is a leaf).
-///   * `<?…?>` (PI), `<!-- … -->` (comment), `<![CDATA[ … ]]>`, `<!DOCTYPE …>`
-///     — skipped without affecting depth; their bodies may contain stray `<`/`>`
-///     that must not be miscounted.
-///
-/// A malformed document can only make this over- or under-count by a little; it
-/// exists purely to catch the pathological "thousands deep" case, and roxmltree
-/// (or graceful skipping) handles ordinary malformedness afterwards. The scan
-/// short-circuits the instant `depth` exceeds `limit`, so a decompression-bomb
-/// style input is rejected in O(bytes-until-limit), not O(bytes).
+/// Every cursor advances monotonically, with fixed-size delimiter comparisons:
+/// O(bytes scanned), O(1) space, no recursion or allocation. Return immediately
+/// on crossing. An unfinished token opens no frame; truncated input that has
+/// not already crossed remains an ordinary DOM parse error.
 pub fn xml_nesting_exceeds(bytes: &[u8], limit: u32) -> bool {
-    let mut depth: u32 = 0;
-    let mut i = 0usize;
-    let n = bytes.len();
-    while i < n {
+    let mut depth = 0u32;
+    let mut i = 0;
+    while i < bytes.len() {
         if bytes[i] != b'<' {
             i += 1;
             continue;
         }
-        // At a '<'. Classify what follows.
         match bytes.get(i + 1) {
-            Some(b'/') => {
-                // End tag `</…>` — one level up. Saturating so a stray extra end
-                // tag in malformed input can't underflow.
-                depth = depth.saturating_sub(1);
-                i = skip_to_gt(bytes, i + 2);
+            Some(b'?') => i = skip_xml_delimiter(bytes, i + 2, b"?>"),
+            Some(b'!') if bytes[i..].starts_with(b"<!--") => {
+                i = skip_xml_delimiter(bytes, i + 4, b"-->");
             }
-            Some(b'?') => {
-                // Processing instruction `<?…?>` — skip to `?>`.
-                i = skip_until(bytes, i + 2, b"?>");
+            Some(b'!') if bytes[i..].starts_with(b"<![CDATA[") => {
+                i = skip_xml_delimiter(bytes, i + 9, b"]]>");
             }
-            Some(b'!') => {
-                // `<!-- … -->`, `<![CDATA[ … ]]>`, or `<!DOCTYPE …>`.
-                if bytes[i + 1..].starts_with(b"!--") {
-                    i = skip_until(bytes, i + 4, b"-->");
-                } else if bytes[i + 1..].starts_with(b"![CDATA[") {
-                    i = skip_until(bytes, i + 9, b"]]>");
-                } else {
-                    // DOCTYPE / other declaration — skip to the next '>'. (Internal
-                    // DTD subsets with nested '>' are not produced by OOXML parts.)
-                    i = skip_to_gt(bytes, i + 2);
-                }
-            }
-            Some(_) => {
-                // Start tag `<name …>` or self-closing `<name … />`. Find its '>'
-                // and inspect the byte just before it to tell them apart.
-                let close = skip_to_gt(bytes, i + 2);
-                // `close` points just past '>'; the '>' is at close-1, the char
-                // before it at close-2.
-                let self_closing = close >= 2 && bytes.get(close - 2) == Some(&b'/');
-                if !self_closing {
-                    depth += 1;
-                    if depth > limit {
+            Some(b'!') => i = skip_xml_declaration(bytes, i + 2),
+            Some(next) => {
+                let closing = *next == b'/';
+                let Some(end) = xml_tag_end(bytes, i + 1) else {
+                    return false;
+                };
+                if closing {
+                    depth = depth.saturating_sub(1);
+                } else if bytes[end - 1] != b'/' {
+                    // Check before incrementing, including when limit is u32::MAX.
+                    if depth == limit {
                         return true;
                     }
+                    depth += 1;
                 }
-                i = close;
+                i = end + 1;
             }
-            None => break, // trailing '<' at EOF
+            None => break,
         }
     }
     false
+}
+
+/// Index of the unquoted tag terminator. An incomplete tag has no terminator.
+fn xml_tag_end(bytes: &[u8], mut i: usize) -> Option<usize> {
+    let mut quote = None;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        match quote {
+            Some(delimiter) if byte == delimiter => quote = None,
+            Some(_) => {}
+            None if matches!(byte, b'\'' | b'"') => quote = Some(byte),
+            None if byte == b'>' => return Some(i),
+            None => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Fixed delimiters only (?>, -->, ]]>), so each comparison costs O(1).
+fn skip_xml_delimiter(bytes: &[u8], from: usize, delimiter: &[u8]) -> usize {
+    bytes[from..]
+        .windows(delimiter.len())
+        .position(|w| w == delimiter)
+        .map_or(bytes.len(), |offset| from + offset + delimiter.len())
+}
+
+/// Skip a markup declaration, including DOCTYPE's bracketed internal subset.
+/// Brackets and '>' inside literals, comments and PIs are not delimiters.
+fn skip_xml_declaration(bytes: &[u8], mut i: usize) -> usize {
+    let mut quote = None;
+    let mut brackets = 0usize;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        match quote {
+            Some(delimiter) if byte == delimiter => quote = None,
+            Some(_) => {}
+            None if matches!(byte, b'\'' | b'"') => quote = Some(byte),
+            None if bytes[i..].starts_with(b"<!--") => {
+                i = skip_xml_delimiter(bytes, i + 4, b"-->");
+                continue;
+            }
+            None if bytes[i..].starts_with(b"<?") => {
+                i = skip_xml_delimiter(bytes, i + 2, b"?>");
+                continue;
+            }
+            None if byte == b'[' => brackets += 1,
+            None if byte == b']' => brackets = brackets.saturating_sub(1),
+            None if byte == b'>' && brackets == 0 => return i + 1,
+            None => {}
+        }
+        i += 1;
+    }
+    bytes.len()
 }
 
 /// Allocation-free lexical preflight for DOM-producing XML complexity.
@@ -279,49 +316,15 @@ pub fn xml_dom_complexity_exceeds(xml: &str, limit: u64) -> bool {
     }
 }
 
-/// Advance past the next `>` (returns the index just after it, or `bytes.len()`
-/// if none remains).
-#[inline]
-fn skip_to_gt(bytes: &[u8], from: usize) -> usize {
-    let mut i = from;
-    while i < bytes.len() {
-        if bytes[i] == b'>' {
-            return i + 1;
-        }
-        i += 1;
-    }
-    bytes.len()
-}
-
-/// Advance past the next occurrence of `needle` (returns the index just after it,
-/// or `bytes.len()` if not found).
-#[inline]
-fn skip_until(bytes: &[u8], from: usize, needle: &[u8]) -> usize {
-    let n = bytes.len();
-    if needle.is_empty() || from >= n {
-        return n;
-    }
-    let last = needle.len() - 1;
-    let mut i = from;
-    while i + last < n {
-        if bytes[i] == needle[0] && &bytes[i..i + needle.len()] == needle {
-            return i + needle.len();
-        }
-        i += 1;
-    }
-    n
-}
-
-/// Convenience over [`xml_nesting_exceeds`] using the shared [`MAX_XML_DEPTH`]
-/// limit. `true` ⇒ the part is too deeply nested and must NOT be handed to
-/// `roxmltree::Document::parse` (parse it would risk a stack-overflow trap).
+/// Convenience over [`xml_nesting_exceeds`] using [`MAX_XML_DEPTH`].
+/// A lexical crossing counts regardless of other XML content errors.
 #[inline]
 pub fn xml_too_deep(bytes: &[u8]) -> bool {
     xml_nesting_exceeds(bytes, MAX_XML_DEPTH)
 }
 
-/// Error returned by [`parse_guarded`] — either the depth pre-check rejected the
-/// input, or `roxmltree` itself failed to parse it.
+/// Error returned by [`parse_guarded`]: a lexical depth crossing or a
+/// `roxmltree` parse error for input within the nesting ceiling.
 ///
 /// It implements [`Display`](std::fmt::Display) so the many parse sites that map
 /// a parse failure to a `String` (`.map_err(|e| e.to_string())`) keep working
@@ -331,9 +334,9 @@ pub fn xml_too_deep(bytes: &[u8]) -> bool {
 pub enum GuardedParseError {
     /// The raw XML nests deeper than [`MAX_XML_DEPTH`]; handing it to
     /// `roxmltree::Document::parse` would risk a stack-overflow trap, so the
-    /// caller must degrade gracefully (skip the part) instead.
+    /// caller must reject the package operation instead.
     TooDeep,
-    /// `roxmltree::Document::parse` rejected the (in-depth-budget) input.
+    /// `roxmltree::Document::parse` rejected input within the lexical depth ceiling.
     Xml(roxmltree::Error),
 }
 
@@ -350,25 +353,18 @@ impl std::fmt::Display for GuardedParseError {
 
 impl std::error::Error for GuardedParseError {}
 
-/// Parse `xml` into a [`roxmltree::Document`], but **only after** the
-/// allocation-free [`xml_too_deep`] pre-check confirms the element nesting is
-/// within [`MAX_XML_DEPTH`].
+/// Parse XML only after a non-recursive lexical scan establishes compliance
+/// with [`MAX_XML_DEPTH`]. Well-formedness is checked by roxmltree. All untrusted
+/// package parts use this wrapper so tolerant optional-part handlers cannot
+/// accidentally accept a latched resource crossing.
 ///
-/// `roxmltree`'s tree builder recurses per element-nesting level, so a part
-/// nested a few thousand deep overflows the fixed WASM linear-memory stack and
-/// **traps the whole parse inside `Document::parse`** — before any of our own
-/// depth-guarded walks (see [`DepthGuard`]) get a chance to run. Every parse of
-/// attacker-controllable XML (any part read out of the untrusted ZIP) must go
-/// through this wrapper rather than calling `roxmltree::Document::parse`
-/// directly, so the pre-check is impossible to forget at an individual site.
-///
-/// On success the returned [`roxmltree::Document`] borrows from `xml`, exactly as
-/// `Document::parse` does. On failure the caller degrades gracefully (skip the
-/// part, keep the rest of the document) — matching the existing
-/// "unsupported/oversized ⇒ skip it, keep rendering" contract in these parsers.
+/// On success the returned document borrows from `xml`. A depth crossing also
+/// poisons the active package operation, so callers may still ignore malformed
+/// optional parts without accidentally accepting a resource-limit failure.
 #[inline]
 pub fn parse_guarded(xml: &str) -> Result<roxmltree::Document<'_>, GuardedParseError> {
     if xml_too_deep(xml.as_bytes()) {
+        report_depth_limit(MAX_XML_DEPTH);
         return Err(GuardedParseError::TooDeep);
     }
     roxmltree::Document::parse(xml).map_err(GuardedParseError::Xml)
@@ -387,6 +383,7 @@ pub fn parse_guarded_with_node_limit(
     nodes_limit: u32,
 ) -> Result<roxmltree::Document<'_>, GuardedParseError> {
     if xml_too_deep(xml.as_bytes()) {
+        report_depth_limit(MAX_XML_DEPTH);
         return Err(GuardedParseError::TooDeep);
     }
     roxmltree::Document::parse_with_options(
@@ -513,6 +510,31 @@ mod tests {
     }
 
     #[test]
+    fn quoted_tag_delimiters_do_not_turn_siblings_into_nesting() {
+        for quote in ['\'', '"'] {
+            let mut xml = String::from("<styles>");
+            for id in 0..257 {
+                xml.push_str(&format!("<style id={quote}s{id}>{quote}/>"));
+            }
+            xml.push_str("</styles>");
+            assert!(!xml_too_deep(xml.as_bytes()));
+            assert_eq!(
+                parse_guarded(&xml)
+                    .unwrap()
+                    .root_element()
+                    .children()
+                    .count(),
+                257
+            );
+        }
+        // A quoted '/>' must not hide genuine nesting either.
+        assert!(xml_nesting_exceeds(
+            br#"<a x="/>"><b x='>'><c/></b></a>"#,
+            1
+        ));
+    }
+
+    #[test]
     fn comments_pis_and_cdata_do_not_affect_depth() {
         // Stray '<' and '>' inside comments / PIs / CDATA must not be counted as
         // tags (or the guard could be tricked either way).
@@ -530,11 +552,12 @@ mod tests {
     }
 
     #[test]
-    fn scan_short_circuits_before_reading_the_whole_input() {
-        // The prefix already exceeds the limit; a megabyte of trailing junk after
-        // it need not be scanned. (Behavioural: still returns true quickly.)
-        let mut v = nested_xml(300);
+    fn depth_scan_handles_large_trailing_text() {
+        // Lexical confirmation stays bounded even with a large trailing text token.
+        let mut v = b"<r>".to_vec();
+        v.extend(nested_xml(300));
         v.extend(std::iter::repeat_n(b'x', 1_000_000));
+        v.extend(b"</r>");
         assert!(xml_nesting_exceeds(&v, 256));
     }
 
@@ -547,14 +570,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_guarded_rejects_too_deep_before_roxmltree_runs() {
-        // The load-bearing guarantee: a part nested far past MAX_XML_DEPTH is
-        // rejected by the pre-check and never reaches roxmltree's recursive tree
-        // builder (which would overflow the WASM stack and trap). 10_000-deep is
-        // well past the ~1000 overflow threshold, so if the pre-check were absent
-        // this call would trap instead of returning an Err — this test only runs
-        // on the (small) native stack precisely because parse_guarded short-
-        // circuits before roxmltree is invoked.
+    fn parse_guarded_rejects_too_deep_before_dom_allocation() {
+        // Reject an extreme lexical chain without constructing a DOM or
+        // recursing per element.
         let deep = String::from_utf8(nested_xml(10_000)).unwrap();
         let err = parse_guarded(&deep).expect_err("over-deep XML is rejected");
         assert!(matches!(err, GuardedParseError::TooDeep));
@@ -569,6 +587,96 @@ mod tests {
         assert!(matches!(err, GuardedParseError::Xml(_)));
         // The message is roxmltree's, not the depth message.
         assert_ne!(err.to_string(), "XML nesting depth exceeds the safe limit");
+    }
+
+    #[test]
+    fn lexical_crossings_ignore_content_errors_before_and_after_the_chain() {
+        use crate::resource::{OoxmlFormat, ResourceGovernor};
+        let deep = String::from_utf8(nested_xml(257)).unwrap();
+        for error in ["<x a='1' a='2'/>", "&unknown;", "<missing:x/>", "</wrong>"] {
+            for xml in [
+                format!("<r>{error}{deep}</r>"),
+                format!("<r>{deep}{error}</r>"),
+            ] {
+                let governor = ResourceGovernor::from_wasm(OoxmlFormat::Docx, None, None, None);
+                let _scope = governor.scope("lexical-depth");
+                for result in [
+                    parse_guarded(&xml),
+                    parse_guarded_with_node_limit(&xml, 1000),
+                ] {
+                    assert!(matches!(result, Err(GuardedParseError::TooDeep)), "{xml}");
+                }
+                assert!(governor.first_error().is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn lexical_constructs_have_exact_content_frame_depth() {
+        // Empty elements never open a content frame in roxmltree, so neither
+        // form of empty-element tag contributes to this stack safety ceiling.
+        for (xml, exact) in [
+            ("<x/>", 0),
+            ("<r><x/><x a='1' /></r>", 1),
+            ("<r><a></a><b><c></c></b></r>", 3),
+            (r#"<r a="< > / '" b='< > / "'><a x='/> >'></a></r>"#, 2),
+            ("<r><!-- <x><x> </r> --><a></a></r>", 2),
+            ("<r><![CDATA[ <x><x> </r> ]]><a></a></r>", 2),
+            ("<?xml version='1.0'?><?pi '<x><x>' ?><r><a></a></r>", 2),
+            (r#"<!DOCTYPE r SYSTEM 'a>b<c'><r><a></a></r>"#, 2),
+            (
+                r#"<!DOCTYPE r [<!ELEMENT r ANY><!ENTITY x '<a><b> ] >'><!ENTITY y "[ > <c>"><!-- ] > <x> --><?pi ] > <x> ?>]><r><a></a></r>"#,
+                2,
+            ),
+            ("</extra></extra><r><a></wrong></r>", 2),
+        ] {
+            assert!(!xml_nesting_exceeds(xml.as_bytes(), exact), "{xml}");
+            if exact > 0 {
+                assert!(xml_nesting_exceeds(xml.as_bytes(), exact - 1), "{xml}");
+            }
+        }
+    }
+
+    #[test]
+    fn truncation_only_crosses_after_complete_start_tags() {
+        for suffix in [
+            "<",
+            "<a",
+            "<a x='>",
+            "</a",
+            "<!-- <a>",
+            "<![CDATA[ <a>",
+            "<?pi <a>",
+            "<!DOCTYPE r [<!ENTITY x '<a>'>",
+        ] {
+            let xml = format!("<r>{suffix}");
+            assert!(!xml_nesting_exceeds(xml.as_bytes(), 1), "{xml}");
+            assert!(matches!(
+                parse_guarded(&xml),
+                Err(GuardedParseError::Xml(_))
+            ));
+        }
+        assert!(xml_nesting_exceeds(b"<r><a><", 1));
+        // The scanner operates on bytes and has no UTF-8 validation dependency.
+        assert!(xml_nesting_exceeds(b"<r>\xff<a></a></r>", 1));
+    }
+
+    #[test]
+    fn extreme_lexical_depth_is_safe_on_a_small_stack() {
+        std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(|| {
+                let deep = String::from_utf8(nested_xml(120_000)).unwrap();
+                for xml in [deep.clone(), format!("<r a='1' a='2'>{deep}</r>")] {
+                    assert!(matches!(
+                        parse_guarded(&xml),
+                        Err(GuardedParseError::TooDeep)
+                    ));
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]

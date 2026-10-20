@@ -1,12 +1,11 @@
 import {
   acquireXlsxNodeSession,
+  normalizeXlsxWorksheetPolicy,
   type XlsxNodeAcquisition,
   type XlsxNodeArchive,
 } from '@silurus/ooxml-xlsx/internal/session';
-import { normalizeXlsxWorksheetPolicy } from '@silurus/ooxml-core/worker';
 import { WorksheetPullWorker as SourcePullWorker } from '@silurus/ooxml-xlsx/internal/source-pull-worker';
 import { GridGeometry } from '@silurus/ooxml-xlsx/internal/grid-geometry';
-import type { NodeCanvasFactory } from './render.ts';
 import type { OoxmlNodeSessionOptions } from './session-options.ts';
 import { resolveNodeSessionInput } from './model-source.ts';
 import { XlsxWorkbookSessionImpl, type OpenXlsxWorkbookOptions, type XlsxWorksheetRowChunk } from './xlsx.ts';
@@ -51,7 +50,7 @@ class SourceXlsxWorkbookSession extends XlsxWorkbookSessionImpl {
 /** Selected-source XLSX acquisition and renderer-owned Normal-font layout. */
 export async function acquireXlsxInput(
   buffer: ArrayBuffer | Uint8Array,
-  options: OoxmlNodeSessionOptions & { readonly factory?: NodeCanvasFactory },
+  options: OoxmlNodeSessionOptions & Pick<OpenXlsxWorkbookOptions, 'factory' | 'legacyXls'>,
   wasmModule: () => WebAssembly.Module,
 ): Promise<XlsxNodeAcquisition> {
   const worksheetPolicy = normalizeXlsxWorksheetPolicy(options);
@@ -63,7 +62,7 @@ export async function acquireXlsxInput(
     validateXlsxModelSourceViewDefaults,
   } = await import('@silurus/ooxml-xlsx/internal/model-source-session');
   const input = await resolveNodeSessionInput(
-    buffer, 'xlsx', snapshot, validateXlsxModelSourceArchive,
+    buffer, 'xlsx', { ...snapshot, source: snapshot.legacyXls }, validateXlsxModelSourceArchive,
   );
   if (input.kind === 'ooxml') {
     return acquireXlsxNodeSession(input.bytes, wasmModule(), snapshot);

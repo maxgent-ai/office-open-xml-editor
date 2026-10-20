@@ -311,7 +311,7 @@ export function paintTableLayout(
 }
 
 /** Paint only point-space placements already resolved by the layout adapter. */
-export function paintResolvedFloatingTablePlacements(
+function paintResolvedFloatingTablePlacements(
   placements: readonly ResolvedFloatingTablePlacementLayout[],
   context: CanvasPaintContext,
 ): void {

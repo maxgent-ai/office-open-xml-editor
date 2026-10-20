@@ -1,3 +1,7 @@
+import {
+  DEFAULT_XLSX_WORKSHEET_POLICY,
+  type NormalizedXlsxWorksheetPolicy,
+} from './internal/worksheet-policy.js';
 import { OoxmlResourceLimitError, type OoxmlResourceUsageSnapshot } from '@silurus/ooxml-core';
 import {
   decodeOoxmlResourceUsage,
@@ -6,8 +10,6 @@ import {
   PullSessionHost,
   PullSessionHostCoordinator,
   serializeWorkerError,
-  DEFAULT_XLSX_WORKSHEET_POLICY,
-  type NormalizedXlsxWorksheetPolicy,
   type PullSessionCommand,
   type PullSessionIdentity,
   type PullSessionResponse,

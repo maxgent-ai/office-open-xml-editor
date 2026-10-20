@@ -1,3 +1,4 @@
+import { normalizeXlsxWorksheetPolicy } from './worksheet-policy.js';
 import { resolveBundledAssetUrl } from '@silurus/ooxml-core/internal/bundled-asset-url';
 import {
   resolveCjkFallback,
@@ -8,10 +9,9 @@ import {
   disposeRejectedLoad,
   normalizeLoadResourceOptions,
   OoxmlResourceMetricsSession,
-  normalizeXlsxWorksheetPolicy,
   type NormalizedOoxmlResourcePolicy,
 } from '@silurus/ooxml-core/worker';
-import { beginModelSourceLoad, selectModelSource } from '@silurus/ooxml-core/internal/model-source';
+import { beginModelSourceLoad, modelSourceWorker, selectModelSource } from '@silurus/ooxml-core/internal/model-source';
 import { computeMdw, pinXlsxGridGeometry } from '../renderer.js';
 import { respondToHostLayoutRequest } from './host-layout.js';
 import type { XlsxWorkbook, LoadOptions } from '../workbook.js';
@@ -45,7 +45,7 @@ export async function loadXlsxModelSource(
   const mode = opts.mode ?? 'main';
   const metrics = new OoxmlResourceMetricsSession({
     enabled: true, format: 'xlsx', mode, policy: resourceOptions.policy,
-    xlsxWorksheetPolicy: worksheetPolicy,
+    formatLimits: { xlsxWorksheetLimits: { ...worksheetPolicy.worksheet } },
     onMetrics: resourceOptions.onResourceMetrics, emitToConsole: resourceOptions.debug,
   });
   try {
@@ -60,8 +60,8 @@ export async function loadXlsxModelSource(
     } else {
       buffer = input;
     }
-    const selected = selectModelSource(opts.modelSources, 'xlsx', new Uint8Array(buffer));
-    if (!selected) return workbookType.load(buffer, { ...opts, modelSources: undefined });
+    const selected = selectModelSource(opts.legacyXls === undefined ? undefined : [opts.legacyXls], 'xlsx', new Uint8Array(buffer));
+    if (!selected) return workbookType.load(buffer, { ...opts, legacyXls: undefined });
     // The caller already owns this public constructor. Passing it avoids a
     // static source-only back-edge that splits the ordinary workbook graph;
     // source overrides remain confined to this admitted source's subclass.
@@ -94,7 +94,7 @@ export async function loadXlsxModelSource(
       metrics.setSourceBytes(buffer.byteLength);
       metrics.checkpoint('container ready');
       const worker = mode === 'worker'
-        ? (await import('../render-worker-source-host.js')).createRenderWorker()
+        ? (await import('../render-worker-host.js')).createRenderWorker()
         : new (await import('../worker-source.ts?worker&inline')).default();
       let workbook: SourceWorkbook | undefined;
       const wiredWorker = sourceWorker(worker, load, opts, (mdw) => { if (workbook) workbook.sourceMdw = mdw; });
@@ -134,21 +134,12 @@ function sourceWorker(
     import.meta.env.DEV ? './worker-worksheet-source.ts' : './xlsx-source-worker.mjs',
     import.meta.url,
   ).href, import.meta.url);
-  return new Proxy(worker, {
-    get(target, key) {
-      if (key === 'postMessage') return (message: unknown, transfer?: Transferable[]) => {
-        if (typeof message === 'object' && message !== null) {
-          const wire = message as { type?: string };
-          if (wire.type === 'init') return;
-          if (wire.type === 'parse') {
-            target.postMessage({ ...wire, source: load.module, sourceOwnerUrl,
-              ...(load.transfer.length ? { sourceTransfer: load.transfer } : {}) },
-            [...(transfer ?? []), ...load.transfer]);
-            return;
-          }
-        }
-        target.postMessage(message, transfer ?? []);
-      };
+  return modelSourceWorker(worker, {
+    discriminator: 'type',
+    load,
+    parseMessage: (wire) => ({ ...wire, source: load.module, sourceOwnerUrl,
+      ...(load.transfer.length ? { sourceTransfer: load.transfer } : {}) }),
+    member: (target, key) => {
       if (key === 'addEventListener') return (type: string, listener: EventListener) => {
         if (type !== 'message') return target.addEventListener(type, listener);
         return target.addEventListener('message', ((event: MessageEvent) => {
@@ -164,8 +155,7 @@ function sourceWorker(
           listener(event);
         }) as EventListener);
       };
-      const value = Reflect.get(target, key, target);
-      return typeof value === 'function' ? value.bind(target) : value;
+      return undefined;
     },
   });
 }

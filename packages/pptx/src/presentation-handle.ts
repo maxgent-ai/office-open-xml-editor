@@ -1,7 +1,7 @@
 import type { MediaElement } from './types';
 import { drawPlayBadge } from './media-chrome';
 import { tabularDigitWidth, tabularTextWidth, drawTabularText } from './tabular-text';
-import { EMU_PER_PX } from '@silurus/ooxml-core';
+import { EMU_PER_PX, OoxmlResourceLimitError, isOoxmlDecodedImageLimitError } from '@silurus/ooxml-core';
 
 const emuToPx = (v: number, scale: number) => (v / EMU_PER_PX) * scale;
 
@@ -109,6 +109,9 @@ export async function createPresentationHandle(
       blob = await opts.fetchMedia(el.mediaPath);
     } catch (cause) {
       releaseStates();
+      // Extraction governance must retain its typed contract after cleanup;
+      // only ordinary media failures receive the contextual fetch message.
+      if (cause instanceof OoxmlResourceLimitError || isOoxmlDecodedImageLimitError(cause)) throw cause;
       throw mediaFetchError(el, cause);
     }
     // getMedia already types the blob in main mode; re-wrapping copies the whole

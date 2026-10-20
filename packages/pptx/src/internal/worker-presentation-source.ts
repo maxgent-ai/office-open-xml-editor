@@ -1,4 +1,4 @@
-import { isWasmTrap, type WasmParserHost } from '@silurus/ooxml-core';
+import type { WasmParserHost } from '@silurus/ooxml-core';
 import {
   copyModelSourceBytes,
   hasModelSourceCapability,
@@ -8,6 +8,10 @@ import {
   type ModelSourceModuleDescriptor,
   type OpenedModelSourceModule,
 } from '@silurus/ooxml-core/internal/model-source';
+import {
+  copyingCursorArchive,
+  runModelSourceOperation,
+} from '@silurus/ooxml-core/internal/worker-model-source';
 import type { PptxSlideCursorArchive } from '../slide-cursor-operation.js';
 
 export interface WorkerCursorArchive extends PptxSlideCursorArchive {
@@ -112,16 +116,7 @@ export class WorkerPresentationSourceOwner<TArchive extends OoxmlWorkerArchive> 
       try { opened.close(); } catch {}
       throw error;
     }
-    const transferArchive = new Proxy(opened.archive, {
-      get(target, key) {
-        if (key === 'pull_slide') {
-          return (...args: Parameters<PptxModelSourceArchive['pull_slide']>) =>
-            new Uint8Array(copyModelSourceBytes(target.pull_slide(...args)));
-        }
-        const value = Reflect.get(target, key);
-        return typeof value === 'function' ? value.bind(target) : value;
-      },
-    });
+    const transferArchive = copyingCursorArchive(opened.archive, 'pull_slide');
     this.modelSource = { archive: opened.archive, transferArchive, close: opened.close };
     return opened.archive;
   }
@@ -137,14 +132,10 @@ export class WorkerPresentationSourceOwner<TArchive extends OoxmlWorkerArchive> 
       if (!archive) throw new Error('Presentation not loaded');
       return this.ooxmlHost.run(() => operation(archive));
     }
-    try {
-      return operation(source.transferArchive);
-    } catch (error) {
-      if (isWasmTrap(error) && this.modelSource === source) {
-        try { this.closeModelSource(); } catch {}
-      }
-      throw error;
-    }
+    return runModelSourceOperation(
+      () => operation(source.transferArchive),
+      () => { if (this.modelSource === source) this.closeModelSource(); },
+    );
   }
 
   extractMedia(path: string): Uint8Array {

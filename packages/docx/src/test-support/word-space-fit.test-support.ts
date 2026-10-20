@@ -178,6 +178,8 @@ export interface StubParagraph {
   readonly justification: 'left' | 'both' | 'distribute' | 'center';
   /** Build uncached text services (for measurement counting). */
   readonly freshServices?: boolean;
+  /** Custom tab stops of the retained paragraph. */
+  readonly tabStops?: readonly import('../types.js').TabStop[];
 }
 
 function stubRuns(paragraph: StubParagraph): DocRun[] {
@@ -195,7 +197,8 @@ export function retainStubParagraph(paragraph: StubParagraph) {
   const families = [...new Set(paragraph.runs.flatMap((run) => [run.ascii, run.eastAsia]))];
   const docParagraph = {
     alignment: paragraph.justification, indentLeft: 0, indentRight: 0, indentFirst: 0,
-    spaceBefore: 0, spaceAfter: 0, lineSpacing: null, numbering: null, tabStops: [],
+    spaceBefore: 0, spaceAfter: 0, lineSpacing: null, numbering: null,
+    tabStops: [...(paragraph.tabStops ?? [])],
     runs: stubRuns(paragraph),
   } as unknown as DocParagraph;
   const context: ParagraphLayoutContext = {
@@ -205,7 +208,7 @@ export function retainStubParagraph(paragraph: StubParagraph) {
     physicalIndentLeftPt: 0, physicalIndentRightPt: 0, firstIndentPt: 0,
     lineSpacing: null, spaceBeforePt: 0, spaceAfterPt: 0,
     baseRtl: false, isJustified: false, stretchLastLine: false,
-    tabStops: [], hasRuby: false, hasEastAsianText: true,
+    tabStops: [...(paragraph.tabStops ?? [])], hasRuby: false, hasEastAsianText: true,
     kinsoku: DEFAULT_KINSOKU_RULES, defaultTabPt: 36,
   };
   const placement = {

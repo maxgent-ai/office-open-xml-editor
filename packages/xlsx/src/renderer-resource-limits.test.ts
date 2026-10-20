@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { OoxmlResourceLimitError } from '@silurus/ooxml-core';
 import { deserializeWorkerError, serializeWorkerError } from '@silurus/ooxml-core/worker';
-import { buildTableStyleMap, getSheetRenderCache, renderViewport } from './renderer.js';
+import { getSheetRenderCache, renderViewport } from './renderer.js';
+import { buildStructuredStyleMap } from './pivot-style.js';
 import {
   assertCoordinateRangeArea,
   MAX_RENDERER_COORDINATE_INDEX_ENTRIES,
@@ -80,6 +81,7 @@ function table(range: TableInfo['range']): TableInfo {
     showLastColumn: false,
     accentColor: '#4472C4',
     columns: [],
+    styleElements: [{ kind: 'wholeTable', size: 1, dxf: { font: null, fill: null, border: null } }],
   };
 }
 
@@ -210,30 +212,30 @@ describe('XLSX renderer coordinate-index hard limits', () => {
         table({ top: 1, bottom: 1, left: 1, right: 1 }),
       ],
     });
-    expect(buildTableStyleMap(ws).size).toBe(LIMIT);
+    expect(buildStructuredStyleMap(ws).size).toBe(LIMIT);
   });
 
   it('rejects a styled-table range one entry above the boundary before expansion', () => {
     expectRendererPolicyLimit(
-      () => buildTableStyleMap(worksheet({
+      () => buildStructuredStyleMap(worksheet({
         tables: [table({ top: 1, bottom: 1, left: 1, right: LIMIT + 1 })],
       })),
-      'worksheet-table-style-index',
-      'expand-styled-table-coordinates',
+      'worksheet-structured-style-index',
+      'expand-structured-style-coordinates',
     );
   });
 
   it('rejects cumulative unique table-style entries across individually safe disjoint ranges', () => {
     expectRendererPolicyLimit(
-      () => buildTableStyleMap(worksheet({
+      () => buildStructuredStyleMap(worksheet({
         tables: [
           table({ top: 1, bottom: 250, left: 1, right: 500 }),
           table({ top: 251, bottom: 500, left: 1, right: 500 }),
           table({ top: 501, bottom: 501, left: 1, right: 1 }),
         ],
       })),
-      'worksheet-table-style-index',
-      'expand-styled-table-coordinates',
+      'worksheet-structured-style-index',
+      'expand-structured-style-coordinates',
     );
   });
 
@@ -401,7 +403,7 @@ describe('XLSX renderer coordinate-index hard limits', () => {
   it('preserves renderer limit errors as typed fatal errors across the worker wire', () => {
     let thrown: unknown;
     try {
-      buildTableStyleMap(worksheet({
+      buildStructuredStyleMap(worksheet({
         tables: [table({ top: 1, bottom: 1, left: 1, right: LIMIT + 1 })],
       }));
     } catch (error) {

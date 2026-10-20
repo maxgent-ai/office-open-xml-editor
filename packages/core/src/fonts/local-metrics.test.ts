@@ -1,9 +1,10 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import {
-  loadLocalFontMetrics,
-  unloadLocalFontMetrics,
-} from './local-metrics.js';
-import { _resetFontRegistryForTests } from './font-registry.js';
+import { vi, afterEach, beforeEach, describe, expect, it } from 'vitest';
+let { loadLocalFontMetrics, unloadLocalFontMetrics } = await import('./local-metrics.js');
+
+beforeEach(async () => {
+  vi.resetModules();
+  ({ loadLocalFontMetrics, unloadLocalFontMetrics } = await import('./local-metrics.js'));
+});
 
 const G = globalThis as unknown as Record<string, unknown>;
 const ORIGINALS = {
@@ -13,16 +14,12 @@ const ORIGINALS = {
   OffscreenCanvas: G.OffscreenCanvas,
 };
 
-beforeEach(() => {
-  _resetFontRegistryForTests();
-});
 
 afterEach(() => {
   for (const [key, value] of Object.entries(ORIGINALS)) {
     if (value === undefined) delete G[key];
     else G[key] = value;
   }
-  _resetFontRegistryForTests();
 });
 
 function installFontEnvironment(widthOf: (text: string) => number = () => 50) {

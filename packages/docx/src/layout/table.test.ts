@@ -240,8 +240,10 @@ describe('retained table layout', () => {
     }), placement(), services);
     const layout = result.layout as TableLayout;
 
+    // The frame joins the rules' centre lines: the top rule lies inside the
+    // table below its edge, the bottom rule inside above the extended end.
     expect(layout.compoundBorderFrames).toEqual([{
-      bounds: { xPt: 10, yPt: 20, widthPt: 100, heightPt: 20 },
+      bounds: { xPt: 10, yPt: 20.75, widthPt: 100, heightPt: 20 },
       border: {
         authoredStyle: 'thinThickSmallGap',
         color: '#000000',
@@ -252,7 +254,8 @@ describe('retained table layout', () => {
     }]);
   });
 
-  it('includes half of each collapsed horizontal rule in adjacent non-exact rows', async () => {
+  it('includes each collapsed horizontal rule once, in the row below it, and the bottom rule last', async () => {
+    // WORD_COLLAPSED_BORDER_ROW_TRACK_FOOTPRINT (Windows Word #1904 controls).
     const single = { widthPt: 0.5, color: '#000000', authoredStyle: 'single' };
     const rows = Array.from({ length: 4 }, (_, rowIndex) => ({
       id: `row-${rowIndex}`,
@@ -271,12 +274,12 @@ describe('retained table layout', () => {
     const layout = result.layout as TableLayout;
 
     expect(layout.rows.map((rowLayout) => rowLayout.advancePt)).toEqual([
-      20.9, 20.9, 20.9, 20.9,
+      20.9, 20.9, 20.9, 21.4,
     ]);
-    expect(layout.advancePt).toBeCloseTo(83.6, 8);
+    expect(layout.advancePt).toBeCloseTo(84.1, 8);
   });
 
-  it('does not expand exact rows by collapsed horizontal rule footprints', async () => {
+  it('keeps an exact row, which holds its top rule, and adds only the table bottom rule', async () => {
     const single = { widthPt: 0.5, color: '#000000', authoredStyle: 'single' };
     const input = tableInput([{
       id: 'row-0',
@@ -293,7 +296,62 @@ describe('retained table layout', () => {
 
     const result = layoutTable(input, placement(), services);
 
-    expect((result.layout as TableLayout).rows[0]?.advancePt).toBe(20.4);
+    expect((result.layout as TableLayout).rows[0]?.advancePt).toBeCloseTo(20.9, 8);
+  });
+
+  it('meets each vertical rule with the adjacent top and bottom rules', async () => {
+    // Nonuniform horizontal rules: each vertical edge starts and ends at the
+    // centre line of the rule in its own column, not the table-wide widest.
+    const thin = { widthPt: 0.5, color: '#000000', authoredStyle: 'single' };
+    const thick = { widthPt: 6, color: '#000000', authoredStyle: 'single' };
+    const input = tableInput([{
+      id: 'row-0',
+      source: { story: 'body', storyInstance: 'body', path: [0, 0] },
+      heightPt: 20,
+      heightRule: 'exact',
+      cells: [
+        cellInput('cell-0', 0, [], { borders: { ...noBorderInputs, top: thin, bottom: thin, left: thin } }),
+        cellInput('cell-1', 1, [], { borders: { ...noBorderInputs, top: thick, bottom: thick, right: thick } }),
+      ],
+    }], [40, 60]);
+    const services = createLayoutServices(document([]), { measureContext: measuringContext() });
+    const { layoutTable } = await import('./table.js');
+    const { layout } = layoutTable(input, placement(), services);
+    const edge = (name: 'left' | 'right') => layout.borders.find((border) => border.edge === name)!;
+    const topPt = layout.flowBounds.yPt;
+    const bottomPt = topPt + layout.advancePt;
+    expect([edge('left').from.yPt, edge('left').to.yPt]).toEqual([topPt + 0.25, bottomPt - 0.25]);
+    expect([edge('right').from.yPt, edge('right').to.yPt]).toEqual([topPt + 3, bottomPt - 3]);
+  });
+
+  it('insets a prefix candidate below a merge by the merge terminal rule', async () => {
+    // A vertical merge ending above the candidate ends in its 6pt bottom rule
+    // (on its last cell); the 1pt insideH is only the fallback. The prefix
+    // must resolve that boundary as the whole table does.
+    const owner = { widthPt: 6, color: '#000000', authoredStyle: 'single' };
+    const inside = { widthPt: 1, color: '#000000', authoredStyle: 'single' };
+    const rowAt = (index: number, cell: Record<string, unknown>) => ({
+      id: `row-${index}`,
+      source: { story: 'body', storyInstance: 'body', path: [0, index] },
+      logicalRowIndex: index,
+      heightPt: 20,
+      heightRule: 'atLeast',
+      cells: [cell],
+    });
+    const rows = [
+      rowAt(0, cellInput('cell-0', 0, [], { verticalMerge: 'restart' })),
+      rowAt(1, cellInput('cell-1', 0, [], { verticalMerge: 'continue', borders: { ...noBorderInputs, bottom: owner } })),
+      rowAt(2, cellInput('cell-2', 0, [])),
+    ];
+    const input = tableInput(rows, [100], { ...noBorderInputs, insideH: inside });
+    const services = createLayoutServices(document([]), { measureContext: measuringContext() });
+    const { layoutTable, tablePrefixTracks } = await import('./table.js');
+    const full = layoutTable(input, placement(), services).layout as TableLayout;
+    const prefix = tablePrefixTracks(input).row(input.rows.slice(0, 2), input.rows[2]!, placement())!;
+    const inset = (rowLayout: TableLayout['rows'][number]) =>
+      rowLayout.cells[0]!.contentBounds.yPt - rowLayout.cells[0]!.flowBounds.yPt;
+    expect(inset(full.rows[2]!)).toBeCloseTo(6, 9);
+    expect(inset(prefix)).toBeCloseTo(6, 9);
   });
 
   it('acquires each ordinary and nested cell paragraph final geometry once', () => {
@@ -492,8 +550,10 @@ describe('retained table layout', () => {
 
     const { layout } = layoutTable(input, placement(), services);
 
-    expect(layout.rows.map((row) => row.advancePt)).toEqual([9, 9, 8]);
-    expect(layout.advancePt).toBe(26);
+    // atLeast rows add their top rule; the exact row already holds its own
+    // and the table's bottom rule extends it.
+    expect(layout.rows.map((row) => row.advancePt)).toEqual([9, 9, 9]);
+    expect(layout.advancePt).toBe(27);
   });
 
   it('keeps explicit auto content-sized and adds Word bottom padding to exact heights', async () => {
@@ -1129,10 +1189,10 @@ describe('retained table layout', () => {
 
     expect(layout.borders.filter((border) => border.edge === 'between')).toEqual([
       expect.objectContaining({
-        color: '#0000ff', from: { xPt: 10, yPt: 28 }, to: { xPt: 40, yPt: 28 },
+        color: '#0000ff', from: { xPt: 10, yPt: 28.5 }, to: { xPt: 40, yPt: 28.5 },
       }),
       expect.objectContaining({
-        color: '#ff0000', from: { xPt: 40, yPt: 28 }, to: { xPt: 80, yPt: 28 },
+        color: '#ff0000', from: { xPt: 40, yPt: 28.5 }, to: { xPt: 80, yPt: 28.5 },
       }),
     ]);
   });
@@ -1167,10 +1227,10 @@ describe('retained table layout', () => {
 
     expect(layout.borders.filter((border) => border.edge === 'between')).toEqual([
       expect.objectContaining({
-        color: '#0000ff', from: { xPt: 10, yPt: 28 }, to: { xPt: 40, yPt: 28 },
+        color: '#0000ff', from: { xPt: 10, yPt: 28.5 }, to: { xPt: 40, yPt: 28.5 },
       }),
       expect.objectContaining({
-        color: '#ff0000', from: { xPt: 40, yPt: 28 }, to: { xPt: 80, yPt: 28 },
+        color: '#ff0000', from: { xPt: 40, yPt: 28.5 }, to: { xPt: 80, yPt: 28.5 },
       }),
     ]);
   });

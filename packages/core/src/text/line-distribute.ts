@@ -99,6 +99,10 @@ export interface DistributeOptions {
   /** Keep a space and its following grapheme extension atomic, including
    * across segment seams. Callers that omit this retain their gap policy. */
   atomicSpaceGaps?: boolean;
+  /** Width of a gap a segment carries before its first code point (keyed by
+   * the segment index including any `segmentOffset`); 0 or omitted means none.
+   * It is an opportunity of the same family as the space gaps. */
+  leadingGapWidth?: (segmentIndex: number) => number;
   /** Natural gap advance in the same units as slack. Supplying this selects
    * proportional allocation; omitted callers retain equal per-gap allocation. */
   gapWidth?: (segmentIndex: number, cpOffset: number, cp: number) => number;

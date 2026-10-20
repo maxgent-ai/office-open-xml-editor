@@ -1,0 +1,26 @@
+/**
+ * Lookup tables keyed by document-supplied strings.
+ *
+ * Font names, preset names, style values and chart labels come straight from
+ * untrusted documents. A plain object literal answers `table["constructor"]`
+ * with `Object` and `table["__proto__"]` with `Object.prototype`, and an `in`
+ * check accepts inherited names too, so such a key would be treated as a table
+ * entry and crash or misdirect the caller (for example a slide whose font is
+ * named "constructor" failed to render at all). Tables are often spread into
+ * derived maps, which restores `Object.prototype`, so the guard belongs at the
+ * lookup: every constant table indexed by a document string is read through
+ * {@link ownValue} or {@link hasOwnKey}.
+ */
+
+/** `table[key]` restricted to the table's own properties. */
+export function ownValue<T>(
+  table: Readonly<Record<string, T>>,
+  key: string | null | undefined,
+): T | undefined {
+  return key != null && Object.hasOwn(table, key) ? table[key] : undefined;
+}
+
+/** `key in table`, restricted to the table's own properties. */
+export function hasOwnKey(table: object, key: string | null | undefined): boolean {
+  return key != null && Object.hasOwn(table, key);
+}

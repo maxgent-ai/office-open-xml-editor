@@ -24,9 +24,9 @@ pub struct XmlSourceSpan {
 }
 
 #[derive(Debug)]
-pub struct BoundedXmlEvent {
+pub struct BoundedXmlEvent<'a> {
     pub namespace: Option<String>,
-    pub event: Event<'static>,
+    pub event: Event<'a>,
     pub span: XmlSourceSpan,
 }
 
@@ -34,6 +34,7 @@ pub struct BoundedXmlEvent {
 pub enum BoundedXmlReadError {
     Xml(String),
     EventLimit { limit: usize, observed: usize },
+    NamespaceDeclarationLimit { limit: usize, observed: usize },
 }
 
 /// A `BufRead` adapter whose allowance is reset before every quick-xml event.
@@ -119,7 +120,10 @@ impl<R: BufRead> BoundedXmlReader<R> {
         reader.config_mut().trim_text(false);
         Self {
             reader,
-            event_buf: Vec::with_capacity(event_limit),
+            // Grows to the largest event actually read. `event_limit` is a
+            // ceiling for hostile input, not an expected size, so reserving it
+            // would make every reader pay for the worst case.
+            event_buf: Vec::new(),
             label,
             terminal: None,
         }
@@ -133,19 +137,52 @@ impl<R: BufRead> BoundedXmlReader<R> {
         self.reader.get_ref().max_event_bytes()
     }
 
-    pub fn read_event(&mut self) -> Result<BoundedXmlEvent, BoundedXmlReadError> {
+    pub fn read_event(&mut self) -> Result<BoundedXmlEvent<'static>, BoundedXmlReadError> {
+        let mut buffer = std::mem::take(&mut self.event_buf);
+        let result = self
+            .read_event_into(&mut buffer)
+            .map(|read| BoundedXmlEvent {
+                namespace: read.namespace,
+                event: read.event.into_owned(),
+                span: read.span,
+            });
+        if result.is_ok() {
+            buffer.clear();
+        }
+        self.event_buf = buffer;
+        result
+    }
+
+    /// Borrow one event from caller-owned storage. Large-event consumers can
+    /// project directly without retaining a second owned copy of the token.
+    pub fn read_event_into<'a>(
+        &mut self,
+        buffer: &'a mut Vec<u8>,
+    ) -> Result<BoundedXmlEvent<'a>, BoundedXmlReadError> {
         if let Some(error) = &self.terminal {
             return Err(error.clone());
         }
         self.reader.get_mut().reset_event_budget();
         let start = self.reader.buffer_position();
-        let read = self.reader.read_resolved_event_into(&mut self.event_buf);
+        buffer.clear();
+        let read = self.reader.read_resolved_event_into(buffer);
         let (namespace, event) = match read {
             Ok(read) => read,
             Err(error) => {
                 let terminal = if self.reader.get_ref().exceeded {
                     let limit = self.reader.get_ref().limit;
                     BoundedXmlReadError::EventLimit {
+                        limit,
+                        observed: limit.saturating_add(1),
+                    }
+                } else if let quick_xml::Error::Namespace(
+                    quick_xml::name::NamespaceError::TooManyDeclarations(limit),
+                ) = error
+                {
+                    // Library resource policy, not XML invalidity: retain
+                    // quick-xml's protective count ceiling and latch its typed
+                    // cause just as for the lexical byte ceiling.
+                    BoundedXmlReadError::NamespaceDeclarationLimit {
                         limit,
                         observed: limit.saturating_add(1),
                     }
@@ -164,9 +201,7 @@ impl<R: BufRead> BoundedXmlReader<R> {
                 return Err(terminal);
             }
         };
-        let event = event.into_owned();
         let end = self.reader.buffer_position();
-        self.event_buf.clear();
         Ok(BoundedXmlEvent {
             namespace,
             event,
@@ -312,27 +347,35 @@ impl NamespaceContext {
             })
     }
 
-    pub fn effective_bindings(&self) -> Vec<(Option<String>, String)> {
+    fn borrowed_bindings(&self) -> Vec<(Option<&str>, &str)> {
         let mut chain = Vec::new();
         let mut context = Some(self);
         while let Some(current) = context {
             chain.push(current);
             context = current.parent.as_deref();
         }
-        let mut bindings: Vec<(Option<String>, String)> = Vec::new();
+        let mut bindings: Vec<(Option<&str>, &str)> = Vec::new();
         for current in chain.into_iter().rev() {
             for (prefix, namespace) in &current.declarations {
+                let prefix = prefix.as_deref();
                 if let Some(existing) = bindings
                     .iter_mut()
-                    .find(|(candidate, _)| candidate == prefix)
+                    .find(|(candidate, _)| *candidate == prefix)
                 {
-                    existing.1.clone_from(namespace);
+                    existing.1 = namespace;
                 } else {
-                    bindings.push((prefix.clone(), namespace.clone()));
+                    bindings.push((prefix, namespace));
                 }
             }
         }
         bindings
+    }
+
+    pub fn effective_bindings(&self) -> Vec<(Option<String>, String)> {
+        self.borrowed_bindings()
+            .into_iter()
+            .map(|(prefix, namespace)| (prefix.map(str::to_string), namespace.to_string()))
+            .collect()
     }
 }
 
@@ -625,24 +668,8 @@ pub fn strip_processed_mce_attributes<R>(
     let mut retained = Vec::new();
     for attribute in element.attributes() {
         let attribute = attribute.map_err(|error| format!("{label} MCE attribute: {error}"))?;
-        let (namespace, local_name) = reader.resolver().resolve_attribute(attribute.key);
-        let compatibility_control = resolved_namespace_is(&namespace, |namespace| {
-            namespace == MCE_NS
-                && matches!(
-                    local_name.as_ref(),
-                    b"Ignorable" | b"ProcessContent" | b"MustUnderstand"
-                )
-        });
-        let unsupported_ignorable = match namespace {
-            ResolveResult::Bound(namespace) => {
-                let namespace =
-                    std::str::from_utf8(namespace.as_ref()).map_err(|error| error.to_string())?;
-                scope.is_ignorable(namespace) && !understands(namespace)
-            }
-            _ => false,
-        };
-        if !compatibility_control && !unsupported_ignorable {
-            retained.push(attribute.to_owned());
+        if retain_attribute(reader, &attribute, Some((scope, understands)))? {
+            retained.push(attribute);
         }
     }
     let mut processed = BytesStart::new(name);
@@ -726,11 +753,16 @@ impl MceScope {
 
 /// Repair namespace declarations when preprocessing removes physical XML
 /// ancestors but retains and serializes one of their descendants.
+///
+/// `repaired_tag_limit` bounds the serialized start-tag contents (including
+/// ordinary attributes and escaped injected declarations), not namespace state.
+/// Callers bound retained state separately with [`NamespaceContext::derive`]
+/// and charge the complete event, delimiters included, at projection time.
 pub fn inject_missing_namespaces(
     element: &mut BytesStart<'static>,
     element_context: &NamespaceContext,
     processed_parent_context: Option<&NamespaceContext>,
-    context_limit: usize,
+    repaired_tag_limit: usize,
     label: &str,
 ) -> Result<(), BoundedXmlError> {
     let mut locally_declared = HashSet::new();
@@ -765,7 +797,7 @@ pub fn inject_missing_namespaces(
         if locally_declared.contains(&prefix) || parent_preserves_binding {
             continue;
         }
-        let escaped_namespace_bytes = quick_xml::escape::escape(&namespace).len();
+        let escaped_namespace_bytes = escaped_bytes(namespace.as_bytes(), true);
         injected_bytes = injected_bytes
             .checked_add(escaped_namespace_bytes)
             .and_then(|total| total.checked_add(prefix.as_ref().map_or(9, |p| p.len() + 10)))
@@ -773,9 +805,9 @@ pub fn inject_missing_namespaces(
         missing.push((prefix, namespace));
     }
     let observed = element.len().saturating_add(injected_bytes);
-    if observed > context_limit {
+    if observed > repaired_tag_limit {
         return Err(BoundedXmlError::Limit {
-            limit: context_limit,
+            limit: repaired_tag_limit,
             observed,
         });
     }
@@ -790,6 +822,169 @@ pub fn inject_missing_namespaces(
             None => element.push_attribute(("xmlns", namespace.as_str())),
         }
     }
+    Ok(())
+}
+
+/// Active MCE scope and the consuming format's namespace capability predicate.
+pub type MceAttributePolicy<'a> = (&'a MceScope, &'a dyn Fn(&str) -> bool);
+
+/// Projection policy for one retained start/empty tag. Namespace repair is
+/// required when MCE (ECMA-376 Part 3 §9.4) removes a physical ancestor, or a
+/// host extracts a block root. Opaque extension content bypasses MCE stripping.
+#[derive(Default)]
+pub struct StartTagProjection<'a> {
+    pub repair: Option<(&'a NamespaceContext, Option<&'a NamespaceContext>)>,
+    pub mce: Option<MceAttributePolicy<'a>>,
+    pub empty: bool,
+}
+
+fn retain_attribute<R>(
+    reader: &NsReader<R>,
+    attribute: &quick_xml::events::attributes::Attribute<'_>,
+    mce: Option<MceAttributePolicy<'_>>,
+) -> Result<bool, String> {
+    let Some((scope, understands)) = mce else {
+        return Ok(true);
+    };
+    let (namespace, local) = reader.resolver().resolve_attribute(attribute.key);
+    let ResolveResult::Bound(namespace) = namespace else {
+        return Ok(true);
+    };
+    let namespace = std::str::from_utf8(namespace.as_ref()).map_err(|error| error.to_string())?;
+    Ok(!(namespace == MCE_NS
+        && matches!(
+            local.as_ref(),
+            b"Ignorable" | b"ProcessContent" | b"MustUnderstand"
+        )
+        || scope.is_ignorable(namespace) && !understands(namespace)))
+}
+
+fn escape_replacement(byte: u8, full: bool) -> Option<&'static [u8]> {
+    match byte {
+        b'"' => Some(b"&quot;"),
+        b'\'' if full => Some(b"&apos;"),
+        b'&' if full => Some(b"&amp;"),
+        b'<' if full => Some(b"&lt;"),
+        b'>' if full => Some(b"&gt;"),
+        _ => None,
+    }
+}
+
+fn escaped_bytes(value: &[u8], full: bool) -> usize {
+    value.iter().fold(value.len(), |length, &byte| {
+        length.saturating_add(escape_replacement(byte, full).map_or(0, |s| s.len() - 1))
+    })
+}
+
+fn append_escaped(target: &mut Vec<u8>, value: &[u8], full: bool) {
+    let mut start = 0;
+    for (index, &byte) in value.iter().enumerate() {
+        if let Some(replacement) = escape_replacement(byte, full) {
+            target.extend_from_slice(&value[start..index]);
+            target.extend_from_slice(replacement);
+            start = index + 1;
+        }
+    }
+    target.extend_from_slice(&value[start..]);
+}
+
+/// Preflight the EXACT serialized length, including quote conversion, injected
+/// declarations, delimiters, and the already retained block, before reserving
+/// output. Write straight to that block: no owned event, attribute-value copy,
+/// expanded temporary value, or intermediate repaired tag is needed. Both
+/// passes borrow raw attributes; existing entities and reference whitespace
+/// stay lexical (XML 1.0 §2.3), escaping only a newly conflicting double quote.
+/// Injected namespace values are decoded context strings and need full escaping.
+pub fn append_projected_start_tag<R>(
+    target: &mut Vec<u8>,
+    reader: &NsReader<R>,
+    element: &BytesStart<'_>,
+    policy: StartTagProjection<'_>,
+    limit: usize,
+) -> Result<(), BoundedXmlError> {
+    let mut missing = Vec::new();
+    if let Some((context, parent)) = policy.repair {
+        let mut local = HashSet::new();
+        for attribute in element.attributes() {
+            let attribute = attribute.map_err(|error| BoundedXmlError::Xml(error.to_string()))?;
+            let key = attribute.key.0;
+            if key == b"xmlns" {
+                local.insert(None);
+            } else if let Some(prefix) = key.strip_prefix(b"xmlns:") {
+                local.insert(Some(prefix));
+            }
+        }
+        let parent = parent
+            .map(NamespaceContext::borrowed_bindings)
+            .unwrap_or_default();
+        for (prefix, namespace) in context.borrowed_bindings() {
+            if !local.contains(&prefix.map(str::as_bytes)) && !parent.contains(&(prefix, namespace))
+            {
+                missing.push((prefix, namespace));
+            }
+        }
+    }
+    // With no MCE rewrite, preserve the complete raw tag, including its quote
+    // delimiters. This also preserves application-defined extension infosets.
+    let rewrite = policy.mce.is_some();
+    let mut bytes = if rewrite {
+        element.name().as_ref().len()
+    } else {
+        element.len()
+    };
+    if rewrite {
+        for attribute in element.attributes() {
+            let attribute = attribute.map_err(|error| BoundedXmlError::Xml(error.to_string()))?;
+            if retain_attribute(reader, &attribute, policy.mce)? {
+                bytes = bytes
+                    .saturating_add(attribute.key.as_ref().len())
+                    .saturating_add(4)
+                    .saturating_add(escaped_bytes(&attribute.value, false));
+            }
+        }
+    }
+    for (prefix, namespace) in &missing {
+        bytes = bytes
+            .saturating_add(prefix.map_or(9, |p| p.len() + 10))
+            .saturating_add(escaped_bytes(namespace.as_bytes(), true));
+    }
+    bytes = bytes.saturating_add(if policy.empty { 3 } else { 2 });
+    let observed = target.len().saturating_add(bytes);
+    if observed > limit {
+        return Err(BoundedXmlError::Limit { limit, observed });
+    }
+    target
+        .try_reserve_exact(bytes)
+        .map_err(|error| BoundedXmlError::Xml(error.to_string()))?;
+    let before = target.len();
+    target.push(b'<');
+    if rewrite {
+        target.extend_from_slice(element.name().as_ref());
+        for attribute in element.attributes() {
+            let attribute = attribute.map_err(|error| BoundedXmlError::Xml(error.to_string()))?;
+            if retain_attribute(reader, &attribute, policy.mce)? {
+                target.push(b' ');
+                target.extend_from_slice(attribute.key.as_ref());
+                target.extend_from_slice(b"=\"");
+                append_escaped(target, &attribute.value, false);
+                target.push(b'"');
+            }
+        }
+    } else {
+        target.extend_from_slice(element);
+    }
+    for (prefix, namespace) in missing {
+        target.extend_from_slice(b" xmlns");
+        if let Some(prefix) = prefix {
+            target.push(b':');
+            target.extend_from_slice(prefix.as_bytes());
+        }
+        target.extend_from_slice(b"=\"");
+        append_escaped(target, namespace.as_bytes(), true);
+        target.push(b'"');
+    }
+    target.extend_from_slice(if policy.empty { b"/>" } else { b">" });
+    debug_assert_eq!(target.len() - before, bytes);
     Ok(())
 }
 
@@ -1177,6 +1372,64 @@ mod tests {
                 .uri(),
             "urn:future"
         );
+    }
+
+    #[test]
+    fn direct_tag_projection_preflights_combined_repair_stripping_and_quote_expansion() {
+        let xml = format!(
+            r#"<r xmlns:mc="{MCE_NS}" xmlns:f="urn:future" xmlns:n="urn:&amp;&quot;&apos;&lt;&gt;" mc:Ignorable="f"><n:item f:drop="discard" value='a"&amp;&#x9;'/></r>"#
+        );
+        let mut reader = BoundedXmlReader::new(xml.as_bytes(), 1024, "test");
+        let mut buffer = Vec::new();
+        let root = reader.read_event_into(&mut buffer).unwrap();
+        let Event::Start(root) = root.event else {
+            panic!("root")
+        };
+        let context =
+            NamespaceContext::derive(&root, &NamespaceContext::root(), 1024, "test").unwrap();
+        let attributes = derive_mce_attributes(
+            reader.reader(),
+            &root,
+            &MceScope::root(),
+            &context,
+            1024,
+            "test",
+        )
+        .unwrap();
+        let child = reader.read_event_into(&mut buffer).unwrap();
+        let Event::Empty(child) = child.event else {
+            panic!("child")
+        };
+        let policy = || StartTagProjection {
+            repair: Some((&context, None)),
+            mce: Some((&attributes.scope, &|_| false)),
+            empty: true,
+        };
+        let mut expected = Vec::new();
+        append_projected_start_tag(&mut expected, reader.reader(), &child, policy(), 1024).unwrap();
+        let doc = roxmltree::Document::parse(std::str::from_utf8(&expected).unwrap()).unwrap();
+        assert_eq!(
+            doc.root_element().tag_name().namespace(),
+            Some("urn:&\"'<>")
+        );
+        assert_eq!(doc.root_element().attribute("value"), Some("a\"&\t"));
+        assert_eq!(doc.root_element().attribute(("urn:future", "drop")), None);
+        // Already-retained bytes consume the SAME budget. Failure must not
+        // append anything or grow capacity before exact expansion is known.
+        let mut target = b"prior".to_vec();
+        let capacity = target.capacity();
+        let limit = target.len() + expected.len();
+        assert_eq!(
+            append_projected_start_tag(&mut target, reader.reader(), &child, policy(), limit - 1),
+            Err(BoundedXmlError::Limit {
+                limit: limit - 1,
+                observed: limit
+            })
+        );
+        assert_eq!(target, b"prior");
+        assert_eq!(target.capacity(), capacity);
+        append_projected_start_tag(&mut target, reader.reader(), &child, policy(), limit).unwrap();
+        assert_eq!(&target[5..], expected);
     }
 
     #[test]

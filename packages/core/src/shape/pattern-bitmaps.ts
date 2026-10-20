@@ -13,6 +13,7 @@
 // keeps that grid at the slide origin through rotation, reflection and groups.
 
 import { createAuxCanvas } from '../canvas/aux-canvas.js';
+import { ownValue } from '../internal/own-key.js';
 
 const PATTERN_BITMAPS: Record<string, string> = {
   pct5: '#......./......../......../......../....#.../......../......../........',
@@ -81,7 +82,7 @@ export function buildPatternBitmap(
   fg: string,
   bg: string,
 ): HTMLCanvasElement | OffscreenCanvas | null {
-  const encoded = PATTERN_BITMAPS[preset];
+  const encoded = ownValue(PATTERN_BITMAPS, preset);
   if (typeof encoded !== 'string') return null;
   const tile = createAuxCanvas(64, 64);
   if (!tile) return null;

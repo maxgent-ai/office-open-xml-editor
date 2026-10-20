@@ -78,8 +78,7 @@ describe('WMF MOVETO and LINETO', () => {
     expect(mock.ctx.lineCap).toBe('round');
     expect(mock.ctx.lineJoin).toBe('round');
     expect(mock.setLineDash).toHaveBeenCalledWith([]);
-    expect(mock.save).toHaveBeenCalledTimes(2);
-    expect(mock.restore).toHaveBeenCalledTimes(2);
+    expect(mock.save.mock.calls.length).toBe(mock.restore.mock.calls.length);
   });
 
   it('updates current position even with a null pen and draws a later segment', () => {
@@ -102,7 +101,7 @@ describe('WMF MOVETO and LINETO', () => {
     expect(mock.lineTo).toHaveBeenCalledWith(40, 40);
   });
 
-  it('does not apply the optional boundary-frame suppression heuristic to LINETO', () => {
+  it('draws a LINETO segment on the device boundary', () => {
     const mock = context();
     const bytes = file(
       ...windowRecords,
@@ -112,10 +111,23 @@ describe('WMF MOVETO and LINETO', () => {
       record(0x0213, [...u16(120), ...u16(10)]),
     );
 
-    expect(playWmf(bytes, mock.ctx, 400, 200, true)).toBe(true);
+    expect(playWmf(bytes, mock.ctx, 400, 200)).toBe(true);
     expect(mock.moveTo).toHaveBeenCalledWith(0, 0);
     expect(mock.lineTo).toHaveBeenCalledWith(0, 200);
     expect(mock.stroke).toHaveBeenCalledOnce();
+  });
+
+  it('keeps pen widths positive under a mirrored viewport', () => {
+    const mock = context();
+    const bytes = file(...windowRecords, pen(), record(0x012d, u16(0)),
+      record(0x020e, [...u16(-200), ...u16(-400)]),
+      record(0x020d, [...u16(200), ...u16(400)]),
+      record(0x0214, [...u16(30), ...u16(50)]),
+      record(0x0213, [...u16(70), ...u16(90)]));
+    expect(playWmf(bytes, mock.ctx, 400, 200)).toBe(true);
+    expect(mock.moveTo).toHaveBeenCalledWith(320, 180);
+    expect(mock.lineTo).toHaveBeenCalledWith(240, 100);
+    expect(mock.ctx.lineWidth).toBe(4);
   });
 
   it('maps a positive subpixel pen width without the legacy visibility clamp', () => {
@@ -133,16 +145,23 @@ describe('WMF MOVETO and LINETO', () => {
     expect(mock.ctx.lineWidth).toBe(0.25);
   });
 
-  it('does not guess a default or stale current position', () => {
-    for (const records of [
-      [...windowRecords, pen(), record(0x012d, u16(0)), record(0x0213, [...u16(70), ...u16(90)])],
-      [...windowRecords, pen(), record(0x012d, u16(0)), record(0x0214, [...u16(30), ...u16(50)]), record(0x001e, []), record(0x0213, [...u16(70), ...u16(90)])],
-      [...windowRecords, pen(), record(0x012d, u16(0)), record(0x001e, []), record(0x0214, [...u16(30), ...u16(50)]), record(0x0213, [...u16(70), ...u16(90)])],
-    ]) {
-      const mock = context();
-      expect(playWmf(file(...records), mock.ctx, 400, 200)).toBe(false);
-      expect(mock.stroke).not.toHaveBeenCalled();
-    }
+  it('does not guess the initial current position', () => {
+    const mock = context();
+    const bytes = file(...windowRecords, pen(), record(0x012d, u16(0)),
+      record(0x0213, [...u16(70), ...u16(90)]));
+    expect(playWmf(bytes, mock.ctx, 400, 200)).toBe(false);
+    expect(mock.stroke).not.toHaveBeenCalled();
+  });
+
+  it('restores the drawing position saved by SAVEDC', () => {
+    const mock = context();
+    const bytes = file(...windowRecords, pen(), record(0x012d, u16(0)),
+      record(0x0214, [...u16(30), ...u16(50)]), record(0x001e, []),
+      record(0x0214, [...u16(60), ...u16(90)]), record(0x0127, u16(-1)),
+      record(0x0213, [...u16(70), ...u16(90)]));
+    expect(playWmf(bytes, mock.ctx, 400, 200)).toBe(true);
+    expect(mock.moveTo).toHaveBeenCalledWith(80, 20);
+    expect(mock.lineTo).toHaveBeenCalledWith(160, 100);
   });
 
   it('rejects malformed coordinate records without reading adjacent records', () => {

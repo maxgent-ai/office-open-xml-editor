@@ -268,6 +268,10 @@ export function planLinearValueAxis(options: LinearValueAxisOptions): LinearValu
       : paddedMax * 0.05 - paddedMin * 0.05;
     let lo = anchorPositiveAtZero ? 0 : dataMin - padding;
     let hi = anchorNegativeAtZero ? 0 : dataMax + padding;
+    // Observed Office rule (not in ECMA-376 §21.2.2.107/108/160): the strict
+    // 1.2 zero-pin boundary, the 1/2/5 ladder and the 5 % padding come from
+    // the automatic value-axis corpus summarised in
+    // docs/chart-compatibility-evidence.md (6,354 cases, #1236 / #1246).
     // The 1.2 boundary is intentionally strict: equality remains offset.
     // Once an endpoint is zero-anchored, padding is computed from that same
     // effective span. This keeps identical automatic axes family-invariant

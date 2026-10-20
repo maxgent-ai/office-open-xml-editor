@@ -2,8 +2,8 @@
 import type { ChartModel, ChartRect, ChartSeries } from '../../types/chart';
 import type { Fill } from '../../types/common';
 
-import { chartImageFillSource } from '../image-fill.js';
-import { paintChartThreeDSurfacePicture } from '../three-d-surface-picture.js';
+import { chartImageFillSource, chartFillRenderedSize } from '../image-fill.js';
+import { paintChartThreeDSurfacePicture, chartThreeDSurfacePictureSizePt } from '../three-d-surface-picture.js';
 import { paintChartStyleOuterEffectBehind } from '../style-effects.js';
 
 import { markerPaintComponents } from '../marker-style.js';
@@ -62,6 +62,7 @@ import { strokeAxisSegment, axisTickLengthPx, valMinorGridStroke, catMinorGridSt
 import { measuredCartesianTitleBand, drawChartTitleForLayout } from '../shared/title.js';
 import { chartCategories } from '../category-spacing.js';
 import { MAX_CANVAS_MARKER_GRADIENT_STOPS, MAX_CANVAS_MARKER_PAINT_COMPONENTS } from '../shared/paint-limits.js';
+import { axisLabelLineHeightPx, fillAuthoredText } from '../chart-text-lines.js';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Surface / contour chart (ECMA-376 §21.2.2.204)
@@ -601,7 +602,7 @@ export function renderSurfaceChart(
     legendChart.series.reverse();
     legendFillPaints.reverse();
   }
-  const legend = measuredLegendReserve(ctx, legendChart, w, h, 0.22, ptToPx);
+  const legend = measuredLegendReserve(ctx, legendChart, w, h, ptToPx);
   const { legRightW, legLeftW, legTopH, legBottomH } = chartLegendBands(
     legend, chart.legendOverlay === true,
   );
@@ -617,7 +618,6 @@ export function renderSurfaceChart(
   };
   const frame = computeChartFrame(chart, x, y, w, h, ptToPx, {
     titleBand,
-    legendSideReserveFrac: 0.22,
     legendReserve: legend,
     pad,
     honorPlotAreaManualLayout: true,
@@ -899,7 +899,9 @@ export function renderSurfaceChart(
     const effective = surfaceFacePaints[index];
     const imageFill = effective.fill?.fillType === 'image' ? effective.fill : null;
     if (imageFill) {
-      const image = chartImageFillSource(imageFill);
+      const size = chartThreeDSurfacePictureSizePt(surfaceSlabs[index], ptToPx);
+      const image = chartImageFillSource(imageFill,
+        size ? chartFillRenderedSize(imageFill, size.widthPt, size.heightPt) : undefined);
       const surface = chart.threeD?.[surfaceKinds[index]];
       if (image) {
         const project = (point: ThreeDScenePoint) =>
@@ -912,6 +914,8 @@ export function renderSurfaceChart(
               || projection.cameraFacing(face))
             .map(({ faceIndex }) => faceIndex),
           project, surfaceSpan,
+          (widthPt, heightPt) => chartImageFillSource(imageFill, chartFillRenderedSize(imageFill, widthPt, heightPt)),
+          ptToPx,
         );
       }
     }
@@ -1388,10 +1392,12 @@ export function renderSurfaceChart(
     );
     const point = projection.project(front.x + anchor.fraction * front.w, floorY, nearDepth);
     ctx.textAlign = anchor.textAlign;
-    ctx.fillText(
+    fillAuthoredText(
+      ctx,
       categories[column] ?? '',
       point.x,
       point.y + categoryLabelOffsetPx(8, chart.catAxisLabelOffsetPercent),
+      axisLabelLineHeightPx(catFontPx),
     );
   }
 
@@ -1451,7 +1457,7 @@ export function renderSurfaceChart(
     ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
     for (let row = 0; row < rowCount; row++) {
       const point = projection.project(seriesAxisX, floorY, toDepth(row));
-      ctx.fillText(rows[row].name, point.x + 8, point.y);
+      fillAuthoredText(ctx, rows[row].name, point.x + 8, point.y, axisLabelLineHeightPx(seriesFontPx));
     }
   }
 
@@ -1481,10 +1487,12 @@ export function renderSurfaceChart(
       ctx.textBaseline = 'middle';
       for (const value of surfaceMajorLines) {
         const point = projection.project(valueAxisX, toValueY(value), nearDepth);
-        ctx.fillText(
+        fillAuthoredText(
+          ctx,
           formatChartValWithCode(value, chart.valAxisFormatCode, chart.date1904),
           point.x + (left ? -6 : 6),
           point.y,
+          axisLabelLineHeightPx(valFontPx),
         );
       }
     }

@@ -1,0 +1,211 @@
+---
+import { Code } from 'astro:components';
+import Base from '../layouts/Base.astro';
+import Nav from '../components/Nav.astro';
+import SiteFooter from '../components/SiteFooter.astro';
+import { codeThemes } from '../lib/code-theme';
+
+const install = 'npm i @silurus/ooxml @silurus/ooxml-legacy-office';
+const browserExamples = [
+  {
+    title: 'DOC → DOCX Viewer',
+    code: `import { DocxViewer } from '@silurus/ooxml/docx';
+import { legacyDoc } from '@silurus/ooxml-legacy-office/doc';
+
+const canvas = document.querySelector('#document') as HTMLCanvasElement;
+const viewer = new DocxViewer(canvas, { legacyDoc });
+await viewer.load(await file.arrayBuffer());
+// When the preview is removed:
+viewer.destroy();`,
+  },
+  {
+    title: 'XLS → XLSX Viewer',
+    code: `import { XlsxViewer } from '@silurus/ooxml/xlsx';
+import { legacyXls } from '@silurus/ooxml-legacy-office/xls';
+
+const container = document.querySelector('#workbook') as HTMLElement;
+const viewer = new XlsxViewer(container, { legacyXls });
+await viewer.load(await file.arrayBuffer());
+// When the preview is removed:
+viewer.destroy();`,
+  },
+  {
+    title: 'PPT → PPTX Viewer',
+    code: `import { PptxViewer } from '@silurus/ooxml/pptx';
+import { legacyPpt } from '@silurus/ooxml-legacy-office/ppt';
+
+const canvas = document.querySelector('#presentation') as HTMLCanvasElement;
+const viewer = new PptxViewer(canvas, { legacyPpt });
+await viewer.load(await file.arrayBuffer());
+// When the preview is removed:
+viewer.destroy();`,
+  },
+];
+const nodeExample = `import { readFile } from 'node:fs/promises';
+import { openPptxPresentation } from '@silurus/ooxml/node';
+import { legacyPpt } from '@silurus/ooxml-legacy-office/ppt';
+
+const session = await openPptxPresentation(await readFile('presentation.ppt'), { legacyPpt });
+try {
+  for await (const slide of session.slides()) {
+    // Consume each ordinary slide model in your application.
+  }
+} finally {
+  await session.close();
+}`;
+const assetExample = `import { createLegacyPpt } from '@silurus/ooxml-legacy-office/ppt';
+
+const legacyPpt = createLegacyPpt({
+  moduleUrl: new URL('/assets/legacy-ppt-source-module.mjs', location.href).href,
+  wasmUrl: new URL('/assets/legacy_ppt_direct_bg.wasm', location.href).href,
+});
+const viewer = new PptxViewer(canvas, { legacyPpt });`;
+---
+
+<Base
+  title="Legacy Office files | @silurus/ooxml"
+  description="Enable experimental DOC, XLS and PPT reading through the optional @silurus/ooxml-legacy-office add-on."
+  canonicalPath="/legacy-office/"
+>
+  <Nav />
+  <header class="legacy-hero">
+    <div class="wrap">
+      <p class="eyebrow">Optional add-on · experimental</p>
+      <h1>Legacy Office files.</h1>
+      <p>Read a supported subset of .doc, .xls and .ppt with the same viewers.</p>
+    </div>
+  </header>
+  <main class="wrap legacy-layout">
+    <aside aria-label="Legacy Office guide contents">
+      <p>Contents</p>
+      <nav>
+        <a href="#install">Install</a>
+        <a href="#browser">Browser viewers</a>
+        <a href="#node">Node sessions</a>
+        <a href="#support">Supported subset</a>
+        <a href="#errors">Failures</a>
+        <a href="#loading">Loading and deployment</a>
+      </nav>
+    </aside>
+    <div class="legacy-content">
+      <section id="install">
+        <p class="section-label">Install</p>
+        <h2>An experimental opt-in.</h2>
+        <p>OOXML Viewer remains a viewer for DOCX, XLSX and PPTX. The separate
+          <code>@silurus/ooxml-legacy-office</code> package adds experimental reading of legacy binary
+          Office files. Each reader projects a supported binary subset directly into the existing
+          document, workbook or presentation model; the same layout and Canvas renderers display it.
+          No intermediate OOXML package is generated.</p>
+        <div class="code-card"><Code code={install} lang="sh" themes={codeThemes} defaultColor={false} /></div>
+        <p>The package versions must match exactly. The add-on pins its viewer peer dependency to
+          that exact version. Upgrade both together; stale runtime or protocol combinations fail
+          before input loading with <code>companion-runtime-mismatch</code>.</p>
+        <p>No migration is required for applications that do not opt in. Ordinary viewer imports
+          do not import, fetch or initialize a legacy reader.</p>
+      </section>
+      <section id="browser">
+        <p class="section-label">Browser viewers</p>
+        <h2>Enable each format explicitly.</h2>
+        <p>Import a reader and pass it as its own option, like the other opt-in modules:
+          <code>&#123; legacyDoc &#125;</code>, <code>&#123; legacyXls &#125;</code> or
+          <code>&#123; legacyPpt &#125;</code>. The DOC reader enables DOC only; XLS and PPT each need
+          their own reader. Modern OOXML input continues through the ordinary parser.
+          Admission checks inspect the bytes, not the filename.</p>
+        {browserExamples.map(({ title, code }) => (
+          <><h3>{title}</h3><div class="code-card"><Code code={code} lang="ts" themes={codeThemes} defaultColor={false} /></div></>
+        ))}
+        <p>The same option works with <code>DocxDocument.load()</code>, <code>XlsxWorkbook.load()</code>,
+          <code>PptxPresentation.load()</code> and the scroll viewers, in both main and worker rendering modes.</p>
+      </section>
+      <section id="node">
+        <p class="section-label">Node sessions</p>
+        <h2>Use the same source in a bounded session.</h2>
+        <div class="code-card"><Code code={nodeExample} lang="ts" themes={codeThemes} defaultColor={false} /></div>
+        <p><code>openDocxDocument</code>, <code>openXlsxWorkbook</code> and the materialization APIs also
+          accept the same option. Keep the normal canvas factory options when rendering in Node,
+          and close sessions in <code>finally</code>. Node sessions retain their <code>signal</code> option.</p>
+      </section>
+      <section id="support">
+        <p class="section-label">Supported subset</p>
+        <h2>Check the boundary before enabling it.</h2>
+        <p>The readers are experimental. They reject input they cannot represent instead of
+          showing a partial document. They do not execute macros, fields, formulas, actions or embedded objects.
+          Stored results and supported layout fields can be displayed; this is not an Office fidelity guarantee.</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Reader</th><th>Supported classes</th><th>Boundaries</th></tr></thead>
+            <tbody>
+              <tr><th>DOC</th><td>Word 97–2003 binary content projected to the DOCX model, including supported text, tables, drawings, fields and notes.</td><td>Unimplemented formatting, fields and numbering can reject the document. Notes require supported numbering and placement; custom reference marks and restarts reject.</td></tr>
+              <tr><th>XLS</th><td>A BIFF8 subset: cell values and cached formula results, formatting, merged cells, outlines, frozen panes, tables, supported conditional formatting, charts and drawings.</td><td>Unsupported variants reject, including active AutoFilter criteria. Stored formulas are not recalculated. Print setup, headers and footers do not drive a paginated spreadsheet view.</td></tr>
+              <tr><th>PPT</th><td>Supported binary slides, text, shapes, pictures and fills projected to the PPTX model. Supported embedded objects display their stored picture only.</td><td>No audio/video or embedded fonts. Unresolvable text properties, linked objects, ActiveX and unsupported picture or fill variants reject.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>All three readers lack Markdown export and ZIP accounting. <code>toMarkdown()</code> rejects;
+          resource metrics have no ZIP usage snapshot. Password-protected legacy binaries,
+          pre-CFB formats and unsupported binary structures are outside the supported subset.</p>
+        <p><a href="https://github.com/yukiyokotani/office-open-xml-viewer/blob/main/docs/legacy-office-conversion.md">Read the full support list and compatibility boundaries on GitHub →</a></p>
+      </section>
+      <section id="errors">
+        <p class="section-label">Failures</p>
+        <h2>Keep a conversion fallback.</h2>
+        <p>Without a matching source, legacy binary input rejects with <code>OoxmlError</code>,
+          <code>code === 'legacy-binary-format'</code>. Enable the corresponding add-on source or
+          ask for conversion to DOCX, XLSX or PPTX. An unclaimed or ambiguous container still takes
+          the ordinary OOXML path, including its encryption errors.</p>
+        <p>Once a source claims the file, reader failure rejects the load with no fallback to another
+          source or parser. Unsupported claimed content uses <code>OoxmlError</code> with
+          <code>code === 'unsupported-content'</code> and content-free
+          <code>details: &#123; format: 'doc' | 'xls' | 'ppt', reason: 'source-subset' &#125;</code>.
+          Offer conversion for this code, including failures during lazy reads. Do not branch on message text.
+          Encryption, resource limits, crashes and companion mismatches remain distinct.
+          The optional <code>maxInputBytes</code> guard accepts any positive safe integer
+          and throws a <code>RangeError</code> when claimed input exceeds it. There is no
+          default input-size ceiling. To retain the former 256 MiB limit, explicitly set
+          <code>maxInputBytes: 256 * 1024 * 1024</code>.</p>
+        <p><a href="/errors">Error delivery and application messages →</a></p>
+      </section>
+      <section id="loading">
+        <p class="section-label">Loading and deployment</p>
+        <h2>Pay for the reader only when used.</h2>
+        <p>Each format has its own source entry, self-contained ES source module and dedicated WASM.
+          Importing a reader fetches nothing. Its module and WASM are fetched only when the reader
+          claims a file, in the parser Worker or Node. Import the entry dynamically when selecting a
+          legacy file to defer even the small calling entry.</p>
+        <p>Serve the emitted source modules and <code>legacy_doc_direct_bg.wasm</code>,
+          <code>legacy_xls_direct_bg.wasm</code> or <code>legacy_ppt_direct_bg.wasm</code> with the package
+          assets. A custom asset pipeline can create the reader with <code>createLegacyDoc</code>,
+          <code>createLegacyXls</code> or <code>createLegacyPpt</code> and absolute <code>moduleUrl</code> and
+          <code>wasmUrl</code> options. Allow the source module URL in CSP rules for scripts and Worker imports.</p>
+        <div class="code-card"><Code code={assetExample} lang="ts" themes={codeThemes} defaultColor={false} /></div>
+        <p><a href="/bundle-size">Bundle and runtime asset costs →</a> · <a href="/try">Try a file locally →</a></p>
+      </section>
+    </div>
+  </main>
+  <SiteFooter />
+</Base>
+
+<style>
+  .legacy-hero { padding: 80px 0 56px; border-bottom: 1px solid var(--border); }
+  h1 { margin: 18px 0; font-size: clamp(42px, 7vw, 76px); letter-spacing: -.04em; }
+  .legacy-hero p:last-child { max-width: 58ch; color: var(--text-dim); font-size: 18px; }
+  .legacy-layout { display: grid; grid-template-columns: 180px minmax(0, 1fr); gap: 48px; padding-top: 48px; padding-bottom: 80px; }
+  aside { align-self: start; position: sticky; top: 94px; font-size: 13px; }
+  aside p, .section-label { color: var(--text-faint); font: 500 11px var(--mono); text-transform: uppercase; letter-spacing: .08em; }
+  aside nav { display: grid; gap: 12px; }
+  .legacy-content { min-width: 0; }
+  section { padding-bottom: 36px; margin-bottom: 36px; border-bottom: 1px solid var(--border); scroll-margin-top: 94px; }
+  h2 { font-size: clamp(24px, 3vw, 34px); letter-spacing: -.025em; }
+  h3 { margin-top: 28px; font-size: 18px; }
+  section p { color: var(--text-dim); line-height: 1.7; }
+  section a { text-decoration: underline; text-underline-offset: 3px; }
+  code { font: .88em var(--mono); overflow-wrap: anywhere; }
+  .code-card { border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+  .code-card :global(pre) { padding: 20px; margin: 0; overflow-x: auto; background: var(--code-bg) !important; font-size: 13px; line-height: 1.65; }
+  .table-wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { padding: 14px; text-align: left; vertical-align: top; border-bottom: 1px solid var(--border); }
+  td { color: var(--text-dim); min-width: 200px; }
+  thead { background: var(--bg-elev); }
+  @media (max-width: 800px) { .legacy-layout { grid-template-columns: 1fr; gap: 28px; } aside { position: static; } aside nav { display: flex; flex-wrap: wrap; gap: 10px 20px; } }
+</style>

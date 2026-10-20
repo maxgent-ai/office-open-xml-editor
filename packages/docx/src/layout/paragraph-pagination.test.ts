@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { wordGridLineAdmissionExtentPt } from './body-pagination-compatibility.js';
 import { selectParagraphFragment } from './paragraph-pagination.js';
 import type { LineLayout, ParagraphLayout } from './types.js';
 
@@ -111,6 +112,85 @@ describe('paragraph page-local reserve selection', () => {
     expect(selected.fragment?.lines).toHaveLength(1);
     expect(selected.nextCursor).toBeNull();
   });
+
+  it.each([false, true])('admits a continuing grid line while retaining preceding cells and shading=%s', shaded => {
+    const retained = paragraph();
+    const selected = selectParagraphFragment(
+      { ...retained,
+        ...(shaded ? { shading: { color: '#EEEEEE' } } : {}),
+        lines: retained.lines.map(line => ({ ...line, gridAfterLeadingPt: 2 })) },
+      { boundary: null },
+      splittable([
+        { segIndex: 0, charOffset: 1 },
+        { segIndex: 0, charOffset: 2 },
+        { segIndex: 0, charOffset: 3 },
+      ]),
+      18, 40, true,
+      { keepLines: false, widowControl: false, unreservedBodyBottomPt: 18 },
+    );
+    // Shading paints the complete retained cell, even across a continuation.
+    expect(selected.fragment?.lines).toHaveLength(shaded ? 1 : 2);
+    expect(selected.fragment?.advancePt).toBe(shaded ? 10 : 20);
+    expect(selected.admissionExtentPt).toBe(shaded ? 10 : 18);
+    expect(selected.nextCursor?.boundary).toEqual({ segIndex: 0, charOffset: shaded ? 1 : 2 });
+  });
+
+  it.each([
+    ['candidate note band', 18, 2, false],
+    ['existing reservation or shortened column', undefined, 0, false],
+    ['bottom wrap exclusion', 18, 0, true],
+  ] as const)('charges continuing grid cells against a %s', (_label, bodyBottomPt, reservePt, excluded) => {
+    const retained = paragraph();
+    const selected = selectParagraphFragment({
+      ...retained,
+      lines: retained.lines.map(line => ({ ...line, gridAfterLeadingPt: 2 })),
+      exclusions: excluded ? [{ id: 'bottom', wrap: 'topAndBottom',
+        bounds: { xPt: 0, yPt: 17, widthPt: 100, heightPt: 1 }, polygon: [] }] : [],
+    }, { boundary: { segIndex: 0, charOffset: 0 } }, splittable([
+      { segIndex: 0, charOffset: 1 },
+      { segIndex: 0, charOffset: 2 },
+      { segIndex: 0, charOffset: 3 },
+    ]), 18 + reservePt, 40, true, {
+      keepLines: false, widowControl: false,
+      ...(bodyBottomPt === undefined ? {} : { unreservedBodyBottomPt: bodyBottomPt }),
+    }, () => reservePt);
+    // A discounted second cell would fit exactly, but the retained 20pt
+    // prefix cannot cross a reservation even on a continued paragraph.
+    expect(selected.fragment?.lines).toHaveLength(1);
+    expect(selected.admissionExtentPt).toBe(10);
+    expect(selected.nextCursor?.boundary).toEqual({ segIndex: 0, charOffset: 1 });
+  });
+
+  it.each([[4, 8, 'page'], [17, 10, 'page'], [4, 10, 'host']] as const)('checks exclusions at the keep-next successor position for exclusion top %s, extent %s, owner %s', (exclusionTop, expectedExtent, verticalOwnership) => {
+    const retained = paragraph();
+    const successor = {
+      ...retained,
+      lines: [{ ...retained.lines[0], gridAfterLeadingPt: 2 }],
+      exclusions: [{ id: 'float', wrap: 'topAndBottom' as const, verticalOwnership,
+        bounds: { xPt: 0, yPt: exclusionTop, widthPt: 100, heightPt: 5 }, polygon: [] }],
+    };
+    // Lookahead acquired the successor at y=0; a 10pt heading places its
+    // actual line at y=10. A page-owned exclusion ending at 9pt is above
+    // that line; a host-owned exclusion moves down with its paragraph.
+    expect(wordGridLineAdmissionExtentPt(successor, 10, 18, 0, 10)).toBe(expectedExtent);
+  });
+
+  it.each(['paragraph', 'line', 'text', 'glyph'] as const)(
+    'charges the full cell for an unknown %s paint capability', owner => {
+      const retained = verticalEdgeParagraph('horizontal-tb', 8, undefined, 2);
+      const line = { ...retained.lines[0]!, gridAfterLeadingPt: 2 };
+      const candidate = { ...retained, lines: [line] };
+      expect(wordGridLineAdmissionExtentPt(candidate, 10, 18)).toBe(8);
+      // New retained paint must be reviewed before it joins the plain-text
+      // observation, even when an older admission implementation cannot paint it.
+      Object.assign(owner === 'paragraph' ? candidate
+        : owner === 'line' ? line
+          : owner === 'text' ? line.placements[0]!
+            : (line.placements[0]! as import('./types.js').TextPlacement).paintOps[0]!,
+      { futureDecoration: {} });
+      expect(wordGridLineAdmissionExtentPt(candidate, 10, 18)).toBe(10);
+    },
+  );
 
   it('fails closed when a splittable retained paragraph lacks a continuation boundary', () => {
     expect(() => selectParagraphFragment(

@@ -173,7 +173,7 @@ function compareMarkLocations(left: MarkLocation, right: MarkLocation): number {
 /** First projected location at or after `reference`, using the document-order
  * index produced above. Exported only for focused complexity tests; it is not
  * part of the package entrypoint. */
-export function lowerBoundProjectedTextLocation(
+function lowerBoundProjectedTextLocation(
   locations: readonly MarkLocation[],
   reference: MarkLocation,
 ): number {

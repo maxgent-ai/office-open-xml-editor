@@ -175,7 +175,17 @@ function collectDrawingRasterPaintOccurrences(
       );
       continue;
     }
+    if (command.kind === 'watermark-text' && command.imageResourceKey) {
+      appendRasterPaintOccurrence(context, command.imageResourceKey, 'image', command.maskBounds ?? command.rect, projection.pointToPage);
+    }
     if (command.kind !== 'drawingml-image-fill') continue;
+    // Part 4 §§19.1.2.12/.21: a physical textured pen has ink even on
+    // a zero-height/width line. Decode against its acquired mask extent;
+    // allocation-only demand would silently classify this visible pen as empty.
+    if (command.strokeMask && command.maskBounds) {
+      appendRasterPaintOccurrence(context, command.resourceKey, 'image', command.maskBounds, projection.pointToPage);
+      continue;
+    }
     const { x, y, w, h } = command.plan.rect;
     const fillRect = command.fillRect ?? { l: 0, t: 0, r: 0, b: 0 };
     appendRasterPaintOccurrence(context, command.resourceKey, 'image', {
@@ -728,44 +738,6 @@ export function reviewProjectionIndexForDocument(
     for (const key of page.completedParagraphSources) completedSourceKeys.add(key);
   }
   return Object.freeze({ renderedRunIndex, completedSourceKeys });
-}
-
-/** Canonical paragraph sources that have an occurrence in the supplied layout.
- * Unlike the rendered-run index this includes empty and final-state-hidden
- * paragraphs, so a provisional review projection can distinguish content that
- * is already paginated from content that belongs to a future prefix. */
-export function completedParagraphSourceKeysForDocument(
-  layout: DocumentLayout,
-): ReadonlySet<string> {
-  const result = new Set<string>();
-  for (let pageIndex = 0; pageIndex < layout.pages.length; pageIndex += 1) {
-    const pageSources = pageGeometryIndex(layout, pageIndex, {
-      collectTextRuns: false,
-      collectTextRunSources: false,
-      collectCompletedParagraphSources: true,
-      collectDrawings: false,
-    }).completedParagraphSources;
-    for (const key of pageSources) result.add(key);
-  }
-  return result;
-}
-
-/**
- * Index retained drawings in page paint order. The projection is shared with
- * text-box painting, including vertical-page and page-owned anchor transforms.
- */
-export function drawingGeometryForPage(
-  layout: DocumentLayout,
-  pageIndex: number,
-): readonly DrawingGeometry[] {
-  const drawings = pageGeometryIndex(layout, pageIndex, {
-    collectTextRuns: false,
-    collectTextRunSources: false,
-    collectDrawings: true,
-  }).drawings;
-  drawings.sort((left, right) => left.paintOrderIndex - right.paintOrderIndex ||
-    left.sourceOrder - right.sourceOrder);
-  return Object.freeze(drawings);
 }
 
 /** Index selectable drawings and inline image/chart placements in page paint order. */

@@ -1,4 +1,4 @@
-import { resolveCjkFallback, type CjkFallback } from '@silurus/ooxml-core';
+import { resolveCjkFallback, type CjkFallback, type ModelSource } from '@silurus/ooxml-core';
 import type { DocxDocumentModel, DocxTextRunInfo } from '@silurus/ooxml-docx';
 import type {
   OoxmlResourceUsageSnapshot,
@@ -31,6 +31,9 @@ import {
 } from './render.ts';
 import { createLazyWasmModule, resolveWasm } from './wasm-loader.ts';
 import { usingOwnedSession } from '@silurus/ooxml-core/internal/owned-session';
+import { throwIfAborted } from '@silurus/ooxml-core/internal/abort';
+
+const ABORT_MESSAGE = 'DOCX document session was aborted';
 
 const getDocxWasmModule = createLazyWasmModule(() => resolveWasm(
     import.meta.url,
@@ -40,6 +43,12 @@ const getDocxWasmModule = createLazyWasmModule(() => resolveWasm(
 
 /** Options for the bounded Node DOCX page session. */
 export interface OpenDocxDocumentOptions extends OoxmlNodeSessionOptions {
+  /**
+   * Opt-in model source for document input that is not an OOXML package (a
+   * `ModelSource<'docx'>`). When its `claim()` accepts the bytes, it opens them
+   * in this realm; otherwise the ordinary OOXML path runs unchanged.
+   */
+  legacyDoc?: ModelSource<'docx'>;
   cjkFallback?: CjkFallback;
   /** Canvas implementation used for text measurement and page allocation. */
   factory: NodeCanvasFactory;
@@ -95,7 +104,7 @@ export async function openDocxDocument(
   options: OpenDocxDocumentOptions,
 ): Promise<DocxDocumentSession> {
   if (!options?.factory) throw new TypeError('openDocxDocument requires a canvas factory');
-  if (__OOXML_MODEL_SOURCES__ && options.modelSources !== undefined) {
+  if (__OOXML_MODEL_SOURCES__ && options.legacyDoc !== undefined) {
     const { openDocxSource } = await import('./docx-model-source.ts');
     return openDocxSource(buffer, options, getDocxWasmModule);
   }
@@ -108,7 +117,7 @@ export async function openDocxDocument(
       materializeDocumentPullLayoutSession(transport, identity, pullOptions),
   );
   try {
-    throwIfAborted(options.signal);
+    throwIfAborted(options.signal, ABORT_MESSAGE);
     const measurementCanvas = options.factory.createCanvas(1, 1);
     const services = createLayoutServices(acquired.result, {
       cjkFallback,
@@ -154,9 +163,9 @@ export async function openDocxDocument(
  * body-unit coordinator without creating measurement or page-layout state. */
 export async function materializeDocxDocument(
   buffer: ArrayBuffer | Uint8Array,
-  options: OoxmlNodeSessionOptions = {},
+  options: OoxmlNodeSessionOptions & Pick<OpenDocxDocumentOptions, 'legacyDoc'> = {},
 ): Promise<DocxDocumentModel> {
-  if (__OOXML_MODEL_SOURCES__ && options.modelSources !== undefined) {
+  if (__OOXML_MODEL_SOURCES__ && options.legacyDoc !== undefined) {
     const { materializeDocxSource } = await import('./docx-model-source.ts');
     return materializeDocxSource(buffer, options, getDocxWasmModule);
   }
@@ -273,7 +282,7 @@ export class DocxDocumentSessionImpl implements DocxDocumentSession {
     if (this.resourceFailure) return Promise.reject(this.resourceFailure);
     this.pageSize(pageIndex);
     return this.enqueueRender(async () => {
-      throwIfAborted(this.signal);
+      throwIfAborted(this.signal, ABORT_MESSAGE);
       const state = this.requireState();
       const canvas = this.factory.createCanvas(1, 1);
       await withNodeCanvasRuntime(this.factory, () => renderLayoutSourceToCanvas(
@@ -288,7 +297,7 @@ export class DocxDocumentSessionImpl implements DocxDocumentSession {
           fetchImage: this.fetchImage,
         },
       ));
-      throwIfAborted(this.signal);
+      throwIfAborted(this.signal, ABORT_MESSAGE);
       return canvas;
     }).catch((error: unknown) => {
       const normalized = parseResourceLimitError(error) ?? error;
@@ -371,10 +380,4 @@ function toUint8(buffer: ArrayBuffer | Uint8Array): Uint8Array {
   return buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer as ArrayBuffer);
 }
 
-function throwIfAborted(signal: AbortSignal | undefined): void {
-  if (!signal?.aborted) return;
-  const error = new Error('DOCX document session was aborted');
-  error.name = 'AbortError';
-  throw error;
-}
 declare const __OOXML_MODEL_SOURCES__: boolean;

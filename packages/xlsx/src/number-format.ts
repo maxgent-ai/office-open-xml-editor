@@ -7,6 +7,7 @@ import {
   splitFormatSections,
   textSectionIndex,
 } from '@silurus/ooxml-core';
+import { hasOwnKey } from '@silurus/ooxml-core/internal/own-key';
 import type { Cell, CellValue, Styles } from './types.js';
 
 function cellValueText(value: CellValue): string {
@@ -380,7 +381,7 @@ function parseSection(section: string): ParsedSection {
       const lower = inner.toLowerCase();
       const idxMatch = lower.match(/^color(\d{1,2})$/);
       const condMatch = inner.match(/^(<=|>=|<>|<|>|=)\s*(-?[0-9.]+(?:[eE][-+]?\d+)?)$/);
-      if (lower in NAMED_COLORS) {
+      if (hasOwnKey(NAMED_COLORS, lower)) {
         color = NAMED_COLORS[lower];
       } else if (idxMatch) {
         const n = parseInt(idxMatch[1], 10);

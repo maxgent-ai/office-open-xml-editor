@@ -1,8 +1,7 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { bindXlsxOfficeFontRoutes, bindXlsxWorksheetOfficeFontRoutes, computeMdw, getGridGeometryForWorksheet, getMdwForWorksheet } from './renderer.js';
 import { createSheetViewModel } from './internal/sheet-viewer-runtime.js';
 
-beforeEach(() => vi.stubGlobal('navigator', { platform: 'Win32', userAgent: 'Windows' }));
 afterEach(() => vi.unstubAllGlobals());
 
 function measuringContext(width: number): CanvasRenderingContext2D {
@@ -24,7 +23,7 @@ describe('ECMA-376 maximum digit width authority', () => {
     }) }) });
     const worksheet = { defaultFontFamily: 'Calibri', defaultFontSize: 12 };
     // Canvas would measure the substituted 9px face; the Office Calibri hmtx
-    // maximum is 1038/2048 em, i.e. 8.109375 CSS px before Mac quantization.
+    // maximum is 1038/2048 em, i.e. 8.109375 CSS px before integer CSS-pixel rounding.
     expect(getMdwForWorksheet(worksheet)).toBe(9);
     // A bound route map alone does not establish a paintable face.
     bindXlsxWorksheetOfficeFontRoutes(worksheet as Parameters<typeof bindXlsxWorksheetOfficeFontRoutes>[0], {});
@@ -161,37 +160,17 @@ describe('ECMA-376 maximum digit width authority', () => {
     expect(getMdwForWorksheet(worksheet)).toBe(9);
   });
 
-  it('uses Mac Excel point-quantized widths across a font-size boundary', () => {
-    vi.stubGlobal('OffscreenCanvas', undefined);
-    vi.stubGlobal('navigator', { platform: 'MacIntel', userAgent: 'Macintosh' });
-    let digitWidth = 0;
-    vi.stubGlobal('document', { createElement: () => ({ getContext: () => ({
-      font: '',
-      measureText: () => ({ width: digitWidth }),
-    }) }) });
-
-    // Independent Office-produced controls: Calibri 9/10/11/12/14 pt have
-    // first-column widths 45/45/53/53/61 pt on Mac Excel. Digit advances
-    // come from the Office-bundled Calibri face (1038/2048 em).
-    for (const [sizePt, expectedMdw] of [[9, 7], [10, 7], [11, 8], [12, 8], [14, 9]]) {
-      digitWidth = 1038 / 2048 * sizePt * 96 / 72;
-      expect(computeMdw('Calibri', sizePt)).toBe(expectedMdw);
+  it('rounds the maximum digit advance in CSS pixels identically on Japanese Mac and Windows', () => {
+    const ctx = measuringContext(0);
+    for (const platform of ['Win32', 'MacIntel']) {
+      vi.stubGlobal('navigator', { platform, language: 'ja-JP', maxTouchPoints: 0 });
+      for (const [maximum, expected] of [[7.4, 7], [7.5, 8], [0, 8]]) {
+        ctx.measureText = (digit) => ({
+          width: digit === '7' ? maximum : Math.max(0, maximum - 0.2),
+        } as TextMetrics);
+        expect(computeMdw('Example', 11, undefined, false, 400, 'normal', ctx)).toBe(expected);
+      }
     }
-    // At 11 pt Arial and Meiryo UI independently land in the 6 pt and 7 pt
-    // classes of the same rule; no font-name-specific branch is needed.
-    digitWidth = 1139 / 2048 * 11 * 96 / 72;
-    expect(computeMdw('Arial', 11)).toBe(8);
-    digitWidth = 1272 / 2048 * 11 * 96 / 72;
-    expect(computeMdw('Meiryo UI', 11)).toBe(9);
-  });
-
-  it('retains CSS-pixel quantization on non-Mac platforms', () => {
-    vi.stubGlobal('OffscreenCanvas', undefined);
-    vi.stubGlobal('navigator', { platform: 'Win32', userAgent: 'Windows' });
-    vi.stubGlobal('document', { createElement: () => ({ getContext: () => ({
-      font: '', measureText: () => ({ width: 1038 / 2048 * 11 * 96 / 72 }),
-    }) }) });
-    expect(computeMdw('Calibri', 11)).toBe(7);
   });
 
   it('measures the retained Calibri resource when supplied by the worksheet', () => {

@@ -300,6 +300,29 @@ mod tests {
         assert_eq!(fill_authored, Some(true));
     }
 
+    /// Each errBars block allocates series-length vectors; a schema-invalid
+    /// repeat of a direction is not materialized again (one per direction).
+    #[test]
+    fn parse_error_bars_keeps_one_block_per_direction() {
+        let block = |dir: &str, val: &str| {
+            format!(
+                r#"<c:errBars><c:errDir val="{dir}"/><c:errValType val="fixedVal"/><c:val val="{val}"/></c:errBars>"#
+            )
+        };
+        let xml = format!(
+            r#"<c:ser xmlns:c="{C_NS}">{}{}{}{}</c:ser>"#,
+            block("y", "1"),
+            block("x", "2"),
+            block("y", "3").repeat(50),
+            block("z", "4"),
+        );
+        let d = root_of(&xml);
+        let bars = parse_error_bars(d.root_element(), &[Some(1.0)], &FixtureResolver);
+        assert_eq!(bars.len(), 2);
+        assert_eq!((bars[0].dir.as_str(), bars[0].plus[0]), ("y", Some(1.0)));
+        assert_eq!((bars[1].dir.as_str(), bars[1].plus[0]), ("x", Some(2.0)));
+    }
+
     #[test]
     fn parse_error_bars_fixed_val_both_directions() {
         let xml = format!(

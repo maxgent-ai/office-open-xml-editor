@@ -14,10 +14,6 @@
         {
           "id": "2.1.562",
           "title": "Part 4 Section 2.18.10, ST_CharacterSpacing (Character-Level Whitespace Compression Settings)"
-        },
-        {
-          "id": "2.1.1713",
-          "title": "Part 4 Section 6.1.2.22, textbox (Text Box)"
         }
       ]
     },
@@ -27,6 +23,10 @@
       "published": "2026-05-19",
       "sourceUrl": "https://learn.microsoft.com/en-us/openspecs/office_standards/ms-oi29500/1fd4a662-8623-49c0-82f0-18fa91b413b8",
       "sections": [
+        {
+          "id": "2.1.78",
+          "title": "Part 1 Section 17.3.2.14, fitText (Manual Run Width)"
+        },
         {
           "id": "2.1.116",
           "title": "Part 1 Section 17.4.2, bottom (Table Cell Bottom Margin Exception)"
@@ -66,10 +66,6 @@
         {
           "id": "2.1.154",
           "title": "Part 1 Section 17.4.45, tblCellSpacing (Table Cell Spacing Default)"
-        },
-        {
-          "id": "2.1.155",
-          "title": "Part 1 Section 17.4.50, tblInd (Table Indent from Leading Margin)"
         },
         {
           "id": "2.1.156",
@@ -132,6 +128,233 @@
           "title": "LSPD"
         }
       ]
+    }
+  ],
+  "officeObservations": [
+    {
+      "ruleId": "word-specified-text-line-box",
+      "evidence": {
+        "kind": "office-observation",
+        "syntheticFixtureId": "windows-audit-c-specified-text-line-box",
+        "application": "Microsoft Word",
+        "version": "16.0",
+        "build": "16.0.20430",
+        "platform": "Windows 11 (10.0.26200)"
+      },
+      "comparison": "differs",
+      "scope": "212 pages in compatibility mode 15, six Latin faces, exact 12/20/24/30pt and atLeast 24/40pt, normal and oversized text, with floating-host pairs and grid/no-grid counterexamples.",
+      "description": "Exact-height baseline offsets retain four fifths of the line. Yu Mincho no-grid atLeast 24pt with 10pt text has a 19.20pt baseline offset from paragraph shading top versus 20.16pt in the retained Mac PDF. Oversized 30pt text atLeast 24pt advances 50.16pt versus 42.96pt; 20pt auto1 diagnostics advance about 33.4pt versus 28.7pt.",
+      "limitations": "Adjudication (2026-10-16): read the selected host face tables and use the Windows result when identical vertical data yields different Office output. The tested Mac Office and Windows PDF Yu Mincho faces have hhea=(1802, -455, 1024), usWin=(2038, 598), UPM=2048. Windows matches 1.3 times usWin: 30pt atLeast 24pt advances 50.20pt with baseline offset 35.65pt; 10pt atLeast 24pt has offset 19.15pt, within 0.24pt PDF precision. The Mac hhea result remains historical evidence, not the selected policy. No viewer-OS or font-name selector is used. This establishes the tested regular static faces, not arbitrary Office versions, variable fonts or fallback resource identity."
+    },
+    {
+      "ruleId": "word-east-asian-grid-line-allocation",
+      "evidence": {
+        "kind": "office-observation",
+        "syntheticFixtureId": "windows-audit-c-east-asian-grid-line-allocation",
+        "application": "Microsoft Word",
+        "version": "16.0",
+        "build": "16.0.20430",
+        "platform": "Windows 11 (10.0.26200)"
+      },
+      "comparison": "differs",
+      "scope": "72 regenerated mixed CJK/Latin three-paragraph controls: MS Mincho, MS Gothic, Meiryo and Yu Gothic at 8/12/20pt, grid pitches 12/20/30pt, snap enabled/disabled.",
+      "description": "The whole-pitch rounding pattern is retained, but Yu Gothic single-line height differs from the recorded Mac hhea-based formula. At size/pitch 8/12, 12/20 and 20/30pt, that formula predicts 12/20/30pt grid allocations; Windows produces 24/40/60pt. Snap-disabled Yu Gothic steps are about 13.4/20.1/33.4pt at 8/12/20pt, versus Mac-formula heights 11.46/17.19/28.65pt. MS Mincho, MS Gothic and Meiryo allocations agree with the Mac formula in this sweep.",
+      "limitations": "Adjudication (2026-10-16): use each selected host face's OS/2 usWin ascent/descent for the bits 17–20 class, with 0.15 times their sum added to each side; use Windows output when identical vertical data differs across Office platforms. The tested Mac Office and Windows PDF Yu Gothic faces have hhea=(1802, -455, 1024), usWin=(2017, 619), UPM=2048: 1.6732421875em yields 24/40/60pt cells at size/pitch 8/12, 12/20, 20/30pt. MS Mincho, MS Gothic and Meiryo have equal hhea/usWin boxes and retain their allocations. Mac hhea evidence remains historical; mixed slots and absent exact-source Mac PDFs still limit the platform comparison. No viewer-OS or font-name branch is introduced. Missing usWin declines projection, and other faces retain signed hhea leading."
+    },
+    {
+      "ruleId": "word-japanese-punctuation-compression-cell",
+      "evidence": {
+        "kind": "office-observation",
+        "syntheticFixtureId": "windows-audit-c-japanese-punctuation-compression-cell",
+        "application": "Microsoft Word",
+        "version": "16.0",
+        "build": "16.0.20430",
+        "platform": "Windows 11 (10.0.26200)"
+      },
+      "comparison": "inconclusive",
+      "scope": "Six regenerated 12pt Japanese punctuation controls, three faces, compression enabled/disabled, nine marks between ideographs.",
+      "description": "Enabled and disabled outputs have identical advances in these unconstrained lines. MS Mincho and Meiryo retain 12pt cells; MS PMincho retains natural 7.92pt comma/period and 6pt closing-bracket advances, with 12pt lenticular/exclamation/question cells.",
+      "limitations": "No line-fit pressure is authored and no exact-source Mac PDF exists. These are natural-width counterexamples, not a measurement of the compressed half-cell minimum; do not report a Windows/Mac compression difference."
+    },
+    {
+      "ruleId": "word-compressed-space-line-fit",
+      "evidence": {
+        "kind": "office-observation",
+        "syntheticFixtureId": "windows-audit-c-compressed-space-line-fit",
+        "application": "Microsoft Word",
+        "version": "16.0",
+        "build": "16.0.20430",
+        "platform": "Windows 11 (10.0.26200)"
+      },
+      "comparison": "consistent",
+      "scope": "576 fixed-cell cases across modes 14/15, including mixed-script spaces, source-run boundaries and font variants.",
+      "description": "The retained Mac and Windows PDFs have the same per-line source text partitions after accounting for PDF extraction aliases (a CJK radical maps to the source ideograph) and exporter-inserted trailing spaces. Mode 14 fits more text than mode 15 in the compression cases.",
+      "limitations": "PDF baseline drift reaches about 43pt over a page for some font variants; it is not a space-width rule. This coarse retest does not establish every one-twip floor/overflow boundary from the original larger matrix. Original export build/substitution provenance is incomplete."
+    },
+    {
+      "ruleId": "word-table-origin-compatibility",
+      "evidence": {
+        "kind": "office-observation",
+        "syntheticFixtureId": "windows-audit-c-table-origin-compatibility",
+        "application": "Microsoft Word",
+        "version": "16.0",
+        "build": "16.0.20430",
+        "platform": "Windows 11 (10.0.26200)"
+      },
+      "comparison": "consistent",
+      "scope": "Two ten-page ordinary-table matrices, modes 14/15, alignment/indent/margin/RTL and row variants.",
+      "description": "Matched table-marker origins and border bands retain the mode/indent/margin patterns. Default first text x is about 77.28/77.42pt on Mac/Windows in mode 14 and 77.76/77.66pt in mode 15; small PDF positioning differences remain.",
+      "limitations": "Retest does not resolve originally excluded spaced or omitted-margin cases. PDF-inserted spaces and coincident baseline grouping are extraction differences; nominal table origins are evaluated separately from text rasterization. Existing adjacent Mac exports lack complete export receipts."
+    },
+    {
+      "ruleId": "word-autofit-leading-indent-band",
+      "evidence": {
+        "kind": "office-observation",
+        "syntheticFixtureId": "windows-audit-c-autofit-leading-indent-band",
+        "application": "Microsoft Word",
+        "version": "16.0",
+        "build": "16.0.20430",
+        "platform": "Windows 11 (10.0.26200)"
+      },
+      "comparison": "consistent",
+      "scope": "Four byte-identical wrapping AutoFit controls with positive/small indent, modes 14/15.",
+      "description": "Both-cell line partitions match the recorded Mac evidence. For small indent, first-column native widths are 341.55pt (mode 14) and 330.75pt (mode 15), versus Mac PDF origin differences 341.76pt and 330.72pt; the wider legacy ceiling remains.",
+      "limitations": "Native collection reports only the first cell in these receipts. Trailing/table edges require PDF clip intervals, not a fabricated exact second-cell width. Absolute origins and PDF quantization remain separate."
+    },
+    {
+      "ruleId": "word-autofit-content-column-growth",
+      "evidence": {
+        "kind": "office-observation",
+        "syntheticFixtureId": "windows-audit-c-autofit-content-column-growth",
+        "application": "Microsoft Word",
+        "version": "16.0",
+        "build": "16.0.20430",
+        "platform": "Windows 11 (10.0.26200)"
+      },
+      "comparison": "consistent",
+      "scope": "Four two-column unpreferred 3:2 growth controls: binding/nonbinding and modes 14/15.",
+      "description": "Native first-column widths are 260.30/253.80pt for binding modes 14/15 and 138.05pt in both nonbinding controls. Retained Mac origin differences are 260.40/253.68pt and 138.24/138.00pt; both cells retain the same line partitions.",
+      "limitations": "This is a retest of the two-track observed growth result, not evidence for simultaneous growth with three or more tracks, spans or mixed preferences. PDF widths and native widths have different precision."
+    },
+    {
+      "ruleId": "word-autofit-nowrap-auto-forced-fit",
+      "evidence": {
+        "kind": "office-observation",
+        "syntheticFixtureId": "windows-audit-c-autofit-nowrap-auto-forced-fit",
+        "application": "Microsoft Word",
+        "version": "16.0",
+        "build": "16.0.20430",
+        "platform": "Windows 11 (10.0.26200)"
+      },
+      "comparison": "consistent",
+      "scope": "Four long-token noWrap on/off controls with ordinary/zero outer margins.",
+      "description": "First-column native widths are 445.20pt with noWrap off, 453.60pt with it on and ordinary margins, and 453.30pt with it on and zero margins. Mac PDF origin differences are 445.20/453.60/453.36pt. Both-cell line partitions match, including splitting the short second-cell token when noWrap is enabled in the first cell.",
+      "limitations": "Only the first cell has native geometry in the receipt; exact trailing extents are not inferred from that field. The claim remains limited to these auto-width forced-fit cases."
+    },
+    {
+      "ruleId": "word-autofit-outer-cell-margin-band",
+      "evidence": {
+        "kind": "office-observation",
+        "syntheticFixtureId": "windows-audit-c-autofit-outer-cell-margin-band",
+        "application": "Microsoft Word",
+        "version": "16.0",
+        "build": "16.0.20430",
+        "platform": "Windows 11 (10.0.26200)"
+      },
+      "comparison": "consistent",
+      "scope": "Two preferred-width AutoFit controls with saved outer-margin overhang, noWrap on/off.",
+      "description": "First-column native widths are 241.75pt and 300pt versus Mac origin differences 241.68pt and 300pt. Both-cell line partitions and the retained outer clipping band agree with the existing allowance.",
+      "limitations": "Integer-point clipping bounds are intervals, not exact trailing widths. This subset does not re-establish nested, logical-margin or omitted-margin exclusions."
+    },
+    {
+      "ruleId": "word-float-gap-flow",
+      "evidence": {
+        "kind": "office-observation",
+        "syntheticFixtureId": "windows-audit-c-float-gap-flow",
+        "application": "Microsoft Word",
+        "version": "16.0",
+        "build": "16.0.20430",
+        "platform": "Windows 11 (10.0.26200)"
+      },
+      "comparison": "consistent",
+      "scope": "68 pages in modes 14/15 spanning narrow/multiple gaps, square/tight exclusions and RTL controls.",
+      "description": "All non-whitespace source line partitions match the retained Mac exports. The 40pt left-gap case uses both gaps on the same baseline; the smaller unusable gap is skipped.",
+      "limitations": "A leading PDF extraction space in the RTL continuation is not a changed source partition. Exact x/y positions differ at export precision. Some original Mac input/export bindings lack full receipts; no renderer predictions were used as evidence."
+    },
+    {
+      "ruleId": "word-latin-design-grid-cells",
+      "evidence": {
+        "kind": "office-observation",
+        "syntheticFixtureId": "windows-audit-c-latin-design-grid-cells",
+        "application": "Microsoft Word",
+        "version": "16.0",
+        "build": "16.0.20430",
+        "platform": "Windows 11 (10.0.26200)"
+      },
+      "comparison": "consistent",
+      "scope": "74 pages in modes 14/15 with grid/snap/spacing/font-size/phase counterexamples.",
+      "description": "The 20pt-grid Arial 10/20/30pt controls retain the 20/40/40pt allocation contract. Probe line partitions and relative picture geometry match the Mac observations; shading extents differ by up to one Mac 0.24pt PDF quantum in representative size controls.",
+      "limitations": "Shading height is not itself the full allocated grid cell. No new claim for substitute resources, ruby or unsupported line-spacing classes follows from this retest."
+    },
+    {
+      "ruleId": "word-fixed-paragraph-auto-spacing-stored-margins",
+      "evidence": {
+        "kind": "office-observation",
+        "syntheticFixtureId": "windows-audit-c-fixed-paragraph-auto-spacing-stored-margins",
+        "application": "Microsoft Word",
+        "version": "16.0",
+        "build": "16.0.20430",
+        "platform": "Windows 11 (10.0.26200)"
+      },
+      "comparison": "consistent",
+      "scope": "12 regenerated three-paragraph controls at 12pt: fixed automatic-spacing setting on/off, automatic flags on/off and stored margins 0/5/20pt.",
+      "description": "With the fixed setting enabled, automatic on and off have identical baselines for each stored margin. Stored 0/5/20pt yields baseline steps about 13.8/23.8/53.8pt; stored before spacing moves the first baseline by 0/5/20pt. With the setting off, automatic on ignores stored values and uses about 27.8pt steps.",
+      "limitations": "Comparison is to the stated Mac observation, not a byte-identical old PDF. The setting-off/automatic-off counterexample collapses adjacent margins; this is outside the fixed-setting projection and is not silently generalized."
+    },
+    {
+      "ruleId": "word-fixed-unused-leading-grid",
+      "evidence": {
+        "kind": "office-observation",
+        "syntheticFixtureId": "windows-audit-c-fixed-unused-leading-grid",
+        "application": "Microsoft Word",
+        "version": "16.0",
+        "build": "16.0.20430",
+        "platform": "Windows 11 (10.0.26200)"
+      },
+      "comparison": "consistent",
+      "scope": "48 fixed skipped-leading-grid follow-ups across modes 14/15, with preceding occupied rows, auto/dxa widths and wBefore variants.",
+      "description": "Skipped-everywhere tracks collapse; occupied widths retain 108/180pt under auto table width and 121.5/202.5pt under dxa 324pt. A preceding occupying row preserves the leading track. Marker origins and border partitions reproduce the retained Mac patterns with small PDF coordinate residuals.",
+      "limitations": "The native collection only measures the first cell. PDF marker/border geometry supplies the other tracks; there is no new inference for AutoFit, spans or nonbody stories."
+    },
+    {
+      "ruleId": "word-grid-picture-line-origin",
+      "evidence": {
+        "kind": "office-observation",
+        "syntheticFixtureId": "windows-audit-c-grid-picture-line-origin",
+        "application": "Microsoft Word",
+        "version": "16.0",
+        "build": "16.0.20430",
+        "platform": "Windows 11 (10.0.26200)"
+      },
+      "comparison": "consistent",
+      "scope": "The same 74-page grid-picture matrices, with first/later-line anchors and paragraph-before-spacing counterexamples.",
+      "description": "All paired image rectangles match Mac geometry within the legacy image-matrix serialization precision. First-line/paragraph-relative images stay at the pre-before origin; in the multiline-last-anchor control the line-relative image moves from 116pt to 136pt while the paragraph-relative image stays at 116pt.",
+      "limitations": "Text baseline/shading quantization is separate from image matrices. Native caret positions are not PDF baselines. No new rule for other anchor reference kinds is inferred."
+    },
+    {
+      "ruleId": "word-mode14-column-line-start-origin",
+      "evidence": {
+        "kind": "office-observation",
+        "syntheticFixtureId": "windows-audit-c-mode14-column-line-start-origin",
+        "application": "Microsoft Word",
+        "version": "16.0",
+        "build": "16.0.20430",
+        "platform": "Windows 11 (10.0.26200)"
+      },
+      "comparison": "inconclusive",
+      "scope": "Two single-picture indent controls, modes 14/15.",
+      "description": "Both platforms place the single picture at x=79.05pt, y=288pt, with identical source line partitions.",
+      "limitations": "There is no earlier wrapping float in these selected controls. Column edge and first-free-gap origin coincide, so the pair tests an unobstructed counterexample only and cannot validate the mode-14 displaced-origin branch. Keep the original Mac rule."
     }
   ]
 }

@@ -1,3 +1,5 @@
+import { defaultDpr } from '../canvas/env.js';
+
 export interface ScrollViewportOptions {
   width?: number;
   gap?: number;
@@ -46,7 +48,6 @@ export class ScrollViewportPolicy {
   }
 
   dpr(): number {
-    return this.hooks.options().dpr ??
-      (typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1);
+    return this.hooks.options().dpr ?? defaultDpr();
   }
 }

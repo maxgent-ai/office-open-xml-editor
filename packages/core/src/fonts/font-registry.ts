@@ -31,12 +31,6 @@ interface FontRegistration {
  * so the set identity is part of the registration key. */
 const registry = new Map<string, Map<FontFaceSet, FontRegistration>>();
 
-/** Test hook — clears the shared refcount registry (does NOT touch any
- *  FontFaceSet; tests install a fresh fake set per case). */
-export function _resetFontRegistryForTests(): void {
-  registry.clear();
-}
-
 /** Result of {@link retainFace}: the shared `FontFace` this caller now holds a
  *  reference to, and whether THIS call created it. Loaders may use `isNew` to
  *  avoid redundant work where their failure semantics permit it; loaders that

@@ -1,4 +1,5 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import * as paragraphMeasurement from './paragraph-measure.js';
 import type { AnchorAcquisitionInput, AnchorEdgesInput } from './layout/anchor-input.js';
 import type { ParagraphLayout } from './layout/types.js';
 import { createLayoutServices } from './layout-runtime.js';
@@ -106,7 +107,8 @@ function anchoredImageRuns(options: Readonly<{
   widthPt?: number;
   heightPt?: number;
   allowOverlap?: boolean;
-  wrapKind?: 'none' | 'square';
+  wrapKind?: 'none' | 'square' | 'tight' | 'through' | 'topAndBottom';
+  wrapTopPt?: number;
 }> = {}): DocParagraph['runs'] {
   const occurrenceId = options.occurrenceId ?? 'cell-later';
   const verticalRelativeFrom = options.verticalRelativeFrom ?? 'line';
@@ -137,15 +139,26 @@ function anchoredImageRuns(options: Readonly<{
       widthStatus: 'valid', heightStatus: 'valid',
     },
     parentEffectExtent: missingEdges(),
-    anchorDistances: missingEdges(),
+    anchorDistances: options.wrapTopPt === undefined ? missingEdges() : {
+      ...missingEdges(), topPt: options.wrapTopPt, topStatus: 'valid',
+    },
     relativeSize: { horizontal: null, vertical: null },
     wrap: {
       kind: wrapKind,
-      authoredKinds: [wrapKind === 'none' ? 'wrapNone' : 'wrapSquare'],
-      side: 'bothSides',
+      authoredKinds: [{
+        none: 'wrapNone', square: 'wrapSquare', tight: 'wrapTight',
+        through: 'wrapThrough', topAndBottom: 'wrapTopAndBottom',
+      }[wrapKind]],
+      side: wrapKind === 'topAndBottom' ? null : 'bothSides',
       distances: missingEdges(),
       effectExtent: null,
-      polygon: null,
+      polygon: wrapKind === 'tight' || wrapKind === 'through' ? {
+        edited: false, coordinateSpace: { width: 21600, height: 21600 },
+        points: ([[0, 0], [21600, 0], [21600, 21600], [0, 21600], [0, 0]] as const).map(([x, y]) => ({
+          x, y, rawX: String(x), rawY: String(y),
+        })),
+        invalidPointCount: 0,
+      } : null,
     },
     behavior: {
       behindDoc: false, behindDocStatus: 'valid',
@@ -189,14 +202,14 @@ function noBorders() {
   };
 }
 
-function paragraph(runs: DocParagraph['runs']): DocParagraph {
+function paragraph(runs: DocParagraph['runs']): DocParagraph & { type: 'paragraph' } {
   return {
     type: 'paragraph', alignment: 'left',
     indentLeft: 0, indentRight: 0, indentFirst: 0,
     spaceBefore: 0, spaceAfter: 0, lineSpacing: null,
     numbering: null, tabStops: [], runs,
     defaultFontSize: 20, defaultFontFamily: 'NotInMetrics',
-  } as unknown as DocParagraph;
+  } as unknown as DocParagraph & { type: 'paragraph' };
 }
 
 function model(paragraphs: DocParagraph[] = [
@@ -263,8 +276,9 @@ function cellParagraphs(document = model()): ParagraphLayout[] {
     block.layout.kind === 'paragraph' ? [block.layout] : []) ?? [];
 }
 
-function bodyParagraphs(paragraphs: DocParagraph[]): ParagraphLayout[] {
+function bodyParagraphs(paragraphs: DocParagraph[], compatibilityMode?: number): ParagraphLayout[] {
   const document = model();
+  if (compatibilityMode !== undefined) document.settings = { compatibilityMode };
   document.body = paragraphs as unknown as BodyElement[];
   const layout = layoutDocument(
     document,
@@ -990,5 +1004,201 @@ describe('body parser-owned anchor collision carry', () => {
     expect(moving!.flowBounds.xPt).toBe(
       blocker!.flowBounds.xPt + blocker!.flowBounds.widthPt,
     );
+  });
+});
+
+// Issue #1805 / WORD_LINE_ANCHOR_HOST_LINE_WRAPS: retain the pre-wrap reference
+// while applying the object's exclusion to its host, including padding-only
+// overlap. Office evidence and its scope live in layout/anchor-compatibility.ts.
+describe('line-relative anchor reference acquisition', () => {
+  it.each([
+    { name: 'unpadded overlap', verticalOffsetPt: 5, wrapTopPt: 0 },
+    { name: 'padding-only overlap', verticalOffsetPt: 25, wrapTopPt: 12 },
+  ])('converges with $name', ({ verticalOffsetPt, wrapTopPt }) => {
+    const runs = (paddingPt: number) => [
+      textRun('AAA'),
+      ...anchoredImageRuns({
+        occurrenceId: 'body-line-tab', verticalRelativeFrom: 'line',
+        horizontalOffsetPt: 0, verticalOffsetPt, widthPt: 160, heightPt: 40,
+        wrapKind: 'topAndBottom', wrapTopPt: paddingPt,
+      }),
+      textRun('BBB'),
+    ];
+    if (wrapTopPt > 0) {
+      const baseline = bodyParagraphs([paragraph(runs(0))], 15)[0] as ParagraphLayout;
+      const line = baseline.lines[0] as ParagraphLayout['lines'][number];
+      const drawing = baseline.drawings[0] as ParagraphLayout['drawings'][number];
+      expect(drawing.flowBounds.yPt).toBeGreaterThan(line.bounds.yPt + line.bounds.heightPt);
+      expect(drawing.flowBounds.yPt - wrapTopPt).toBeLessThan(line.bounds.yPt + line.bounds.heightPt);
+    }
+    const result = bodyParagraphs([paragraph(runs(wrapTopPt))], 15)[0]!;
+    const reference = bodyParagraphs([paragraph([textRun('AAABBB')])], 15)[0]!.lines[0]!;
+    const drawing = result.drawings[0]!;
+    expect(drawing.flowBounds.yPt).toBe(reference.bounds.yPt + verticalOffsetPt);
+    expect(result.lines[0]!.bounds.yPt).toBeGreaterThanOrEqual(
+      drawing.flowBounds.yPt + drawing.flowBounds.heightPt,
+    );
+    expect(result.lines[0]!.placements).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'drawing', drawingId: drawing.id }),
+      expect.objectContaining({ kind: 'anchor-host' }),
+    ]));
+  });
+});
+
+describe('line-relative wrap frames across containers and objects', () => {
+  it.each(['square', 'tight', 'through'] as const)('retains the reference for full-width %s wrap', (wrapKind) => {
+    const result = bodyParagraphs([paragraph([
+      textRun('AAA'),
+      ...anchoredImageRuns({
+        occurrenceId: 'full-width-line', horizontalOffsetPt: 0,
+        verticalOffsetPt: 5, widthPt: 160, wrapKind,
+      }),
+      textRun('BBB'),
+    ])], 15)[0]!;
+    expect(result.drawings[0]!.flowBounds.yPt).toBe(25);
+    expect(result.lines[0]!.bounds.yPt).toBeGreaterThanOrEqual(65);
+  });
+
+  it('keeps an external paragraph exclusion in the reference measurement', () => {
+    const result = bodyParagraphs([
+      paragraph([
+        ...anchoredImageRuns({
+          occurrenceId: 'external', verticalRelativeFrom: 'paragraph',
+          horizontalOffsetPt: 0, verticalOffsetPt: 30, widthPt: 160,
+          heightPt: 40, wrapKind: 'topAndBottom',
+        }), textRun('A'),
+      ]),
+      paragraph([
+        ...anchoredImageRuns({
+          occurrenceId: 'line-with-external', horizontalOffsetPt: 0,
+          verticalOffsetPt: 5, widthPt: 160, wrapKind: 'topAndBottom',
+        }), textRun('B'),
+      ]),
+    ], 15)[1]!;
+    // The previous paragraph's object occupies 50..90. The second paragraph
+    // starts at 40, so its counterfactual line must first move to 90.
+    expect(result.drawings[0]!.flowBounds.yPt).toBe(95);
+    expect(result.lines[0]!.bounds.yPt).toBeGreaterThanOrEqual(135);
+  });
+
+  it('uses the same retained line frame in a header story', () => {
+    const document = model();
+    document.settings = { compatibilityMode: 15 };
+    document.body = [paragraph([textRun('Body')])];
+    document.headers.default = { body: [paragraph([
+      textRun('AAA'),
+      ...anchoredImageRuns({
+        occurrenceId: 'header-line', horizontalOffsetPt: 0,
+        verticalOffsetPt: 5, widthPt: 160, wrapKind: 'topAndBottom',
+      }), textRun('BBB'),
+    ])] };
+    const layout = layoutDocument(document,
+      createLayoutServices(document, { measureContext: makeCtx() }), { currentDateMs: 0 });
+    const result = layout.pages[0]!.layers.header.find((node) => node.kind === 'paragraph')!;
+    expect(result.kind).toBe('paragraph');
+    if (result.kind !== 'paragraph') throw new Error('Expected header paragraph');
+    expect(result.drawings[0]!.flowBounds.yPt).toBe(5);
+    expect(result.lines[0]!.bounds.yPt).toBeGreaterThanOrEqual(45);
+  });
+
+  it('retains a later host reference in a table cell', () => {
+    const document = model([paragraph([
+      textRun('A'.repeat(9)),
+      ...anchoredImageRuns({
+        occurrenceId: 'later-cell-line', horizontalOffsetPt: 0,
+        verticalOffsetPt: 5, widthPt: 160, wrapKind: 'topAndBottom',
+      }),
+      textRun('BBB'),
+    ])]);
+    document.settings = { compatibilityMode: 15 };
+    const baseline = cellParagraphs(model([paragraph([textRun('A'.repeat(9) + 'BBB')])]))[0]!;
+    const result = cellParagraphs(document)[0]!;
+    const drawing = result.drawings[0]!;
+    expect(drawing.flowBounds.yPt).toBe(baseline.lines[1]!.bounds.yPt + 5);
+    const host = result.lines.find((line) => line.placements.some((placement) => placement.kind === 'anchor-host'))!;
+    expect(host.bounds.yPt).toBeGreaterThanOrEqual(drawing.flowBounds.yPt + 40);
+  });
+
+  it('shares reference work for many exclusions below every queried line band', () => {
+    const measure = vi.spyOn(paragraphMeasurement, 'measureParagraph');
+    try {
+      const result = bodyParagraphs([paragraph([
+        textRun('A'),
+        ...Array.from({ length: 500 }, (_, index) => anchoredImageRuns({
+          occurrenceId: `noninterfering-${index}`, horizontalOffsetPt: 80,
+          verticalOffsetPt: 60, widthPt: 1, heightPt: 1, wrapKind: 'square',
+        })).flat(),
+      ])], 15)[0]!;
+      expect(result.drawings).toHaveLength(500);
+      expect(result.lines).toHaveLength(1);
+      expect(result.lines[0]!.bounds.yPt).toBe(20);
+      expect(result.drawings.every((drawing) => drawing.flowBounds.yPt === 80)).toBe(true);
+      // A resource contract: unrelated objects must not multiply whole-paragraph
+      // measurement by occurrence count. The spy still executes production code.
+      expect(measure.mock.calls.length).toBeLessThanOrEqual(3);
+    } finally {
+      measure.mockRestore();
+    }
+  });
+
+  it('includes later-line probes when deciding which references can be shared', () => {
+    const result = bodyParagraphs([paragraph([
+      textRun('A'.repeat(9)),
+      ...anchoredImageRuns({
+        occurrenceId: 'later-interfering', horizontalOffsetPt: 0,
+        verticalOffsetPt: 5, widthPt: 160, heightPt: 20, wrapKind: 'topAndBottom',
+      }),
+      ...anchoredImageRuns({
+        occurrenceId: 'later-noninterfering', horizontalOffsetPt: 80,
+        verticalOffsetPt: 60, widthPt: 1, heightPt: 1, wrapKind: 'square',
+      }),
+    ])], 15)[0]!;
+    const first = result.drawings.find((drawing) => drawing.anchorLayer?.occurrenceId.endsWith('later-interfering'))!;
+    const second = result.drawings.find((drawing) => drawing.anchorLayer?.occurrenceId.endsWith('later-noninterfering'))!;
+    // The first exclusion is below the initial line but intersects the second.
+    // Its own counterfactual host is at 40; the other object's host includes
+    // that exclusion and moves to 65. Its counterfactual must retain that shift.
+    expect(first.flowBounds.yPt).toBe(45);
+    expect(second.flowBounds.yPt).toBe(125);
+    expect(result.lines[1]!.bounds.yPt).toBe(65);
+  });
+
+  it('fails closed before counterfactual work exceeds the structural work budget', () => {
+    const measure = vi.spyOn(paragraphMeasurement, 'measureParagraph');
+    try {
+      expect(() => bodyParagraphs([paragraph([
+        textRun('A'),
+        ...Array.from({ length: 200 }, (_, index) => anchoredImageRuns({
+          occurrenceId: `interfering-${index}`, horizontalOffsetPt: index / 200,
+          verticalOffsetPt: 5, widthPt: 160, heightPt: 20, wrapKind: 'topAndBottom',
+        })).flat(),
+      ])], 15)).toThrow('Paragraph anchor reference work budget exceeded');
+      expect(measure.mock.calls.length).toBeLessThan(64);
+    } finally {
+      measure.mockRestore();
+    }
+  });
+
+  it('acquires each reference with the other line-relative object present', () => {
+    const result = bodyParagraphs([paragraph([
+      textRun('AAA'),
+      ...anchoredImageRuns({
+        occurrenceId: 'line-first', horizontalOffsetPt: 0, verticalOffsetPt: 5,
+        widthPt: 160, heightPt: 20, wrapKind: 'topAndBottom',
+      }),
+      ...anchoredImageRuns({
+        occurrenceId: 'line-second', horizontalOffsetPt: 0, verticalOffsetPt: 10,
+        widthPt: 160, heightPt: 20, wrapKind: 'topAndBottom',
+      }),
+      textRun('BBB'),
+    ])], 15)[0]!;
+    const first = result.drawings.find((drawing) => drawing.anchorLayer?.occurrenceId.endsWith('line-first'))!;
+    const second = result.drawings.find((drawing) => drawing.anchorLayer?.occurrenceId.endsWith('line-second'))!;
+    // Initial frames are 25..45 and 30..50; removing just the first
+    // exclusion gives reference Y=50, removing just the second gives Y=45.
+    expect(first.flowBounds.yPt).toBe(55);
+    expect(second.flowBounds.yPt).toBe(55);
+    // The retained objects now clear the original host line, so B leaves it above them.
+    expect(result.lines[0]!.bounds.yPt).toBe(20);
   });
 });

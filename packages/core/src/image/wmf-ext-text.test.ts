@@ -81,7 +81,7 @@ describe('WMF EXTTEXTOUT bounded font encoding', () => {
   it('decodes the published MT Extra ellipsis repertoire without treating its codes as Latin', () => {
     const mock = context();
     const report = vi.fn();
-    playWmf(base(extText([0x4b, 0x4c, 0x4d, 0x4e, 0x4f]), font(-20, 2, 'MT Extra')), mock.ctx, 200, 100, false, report);
+    playWmf(base(extText([0x4b, 0x4c, 0x4d, 0x4e, 0x4f]), font(-20, 2, 'MT Extra')), mock.ctx, 200, 100, report);
     expect(mock.fillText).toHaveBeenCalledWith('…⋯⋮⋰⋱', 24, 24);
     expect(mock.ctx.font).toBe('italic 400 20px serif');
     expect(report).not.toHaveBeenCalled();
@@ -117,7 +117,7 @@ describe('WMF EXTTEXTOUT bounded font encoding', () => {
     const file = base(extText([0xae, 0x41]), font(-20, 2, 'Symbol'));
     const mock = context();
     const report = vi.fn();
-    expect(playWmf(file, mock.ctx, 100, 100, false, report)).toBe(false);
+    expect(playWmf(file, mock.ctx, 100, 100, report)).toBe(false);
     expect(mock.fillText).not.toHaveBeenCalled();
     expect(report).toHaveBeenCalledWith(['META_EXTTEXTOUT (unsupported text state or encoding)']);
     vi.stubGlobal('OffscreenCanvas', class { getContext() { return mock.ctx; } });
@@ -192,7 +192,7 @@ describe('WMF EXTTEXTOUT bounded font encoding', () => {
 
   it('requires transparent mode and positive mapping, and latches unsafe state', () => {
     const files = [
-      join(header(), record(0x0102, u16(1)), record(0x0103, u16(1)), font(), record(0x012d, u16(0)), record(0x012e, u16(0x18)), extText([65]), record(0, [])),
+      join(header(), record(0x0102, u16(1)), font(), record(0x012d, u16(0)), record(0x012e, u16(0x18)), extText([65]), record(0, [])),
       join(header(), record(0x020c, [...u16(100), ...u16(100)]), font(), record(0x012d, u16(0)), record(0x012e, u16(0x18)), extText([65]), record(0, [])),
       join(header(), record(0x020c, [...u16(-100), ...u16(100)]), record(0x0102, u16(1)), font(), record(0x012d, u16(0)), record(0x012e, u16(0x18)), extText([65]), record(0, [])),
     ];
@@ -201,6 +201,14 @@ describe('WMF EXTTEXTOUT bounded font encoding', () => {
       playWmf(file, mock.ctx, 100, 100);
       expect(mock.fillText).not.toHaveBeenCalled();
     }
+  });
+
+  it('accepts an explicit MM_TEXT mapping without requiring SETWINDOWEXT', () => {
+    const mock = context();
+    const file = join(header(), record(0x0102, u16(1)), record(0x0103, u16(1)),
+      font(), record(0x012d, u16(0)), record(0x012e, u16(0x18)), extText([65]), record(0, []));
+    expect(playWmf(file, mock.ctx, 100, 100)).toBe(true);
+    expect(mock.fillText).toHaveBeenCalledOnce();
   });
 
   it('allows SETBKCOLOR and reserved BKMODE/TEXTALIGN words', () => {

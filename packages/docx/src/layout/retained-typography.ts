@@ -1,3 +1,4 @@
+import type { FontDecorationGeometry } from '@silurus/ooxml-core/internal/font-decoration';
 import type {
   BorderSegment,
   LayoutRect,
@@ -79,6 +80,7 @@ export function rubyPaintOperations(input: Readonly<{
     fontWeight: span.fontWeight,
     fontStyle: span.fontStyle,
     color: span.color,
+    ...(span.kerning ? { kerning: span.kerning } : {}),
   }));
 }
 
@@ -142,15 +144,38 @@ export function retainedTextDecorations(input: Readonly<{
      *  author colour); absent = the run text colour. */
     color?: string;
   }>;
+  /** The face's own rule (post / OS/2) when the run's face is the
+   *  catalogued native face. Windows Word 16.0.20430 draws single underline
+   *  and strikethrough there, through descenders, and a thick underline from
+   *  half the underline offset down to the single rule's centre (#1896
+   *  controls, eight faces at 48 pt). */
+  fontRule?: Readonly<{ geometry: FontDecorationGeometry; sizePt: number }>;
 }>): readonly TextDecorationLayout[] {
   const decorations: TextDecorationLayout[] = [];
   const rightPt = input.origin.xPt + input.advancePt;
+  const rule = input.fontRule;
   if (input.underline) {
-    const strokeWidthPt = inkStrokeWidth(input.underline.probe);
-    const nativeCenterPt = input.origin.yPt
-      + (inkTop(input.underline.probe) + inkBottom(input.underline.probe)) / 2;
-    const clearCenterPt = input.origin.yPt + inkBottom(input.base) + strokeWidthPt / 2;
-    const centerPt = Math.max(nativeCenterPt, clearCenterPt);
+    let strokeWidthPt: number;
+    let centerPt: number;
+    if (rule) {
+      const topPt = rule.geometry.underlineTopEm * rule.sizePt;
+      const thicknessPt = rule.geometry.underlineThicknessEm * rule.sizePt;
+      if (input.underline.authoredStyle === 'thick') {
+        const bandTopPt = topPt / 2;
+        const bandBottomPt = topPt + thicknessPt / 2;
+        strokeWidthPt = bandBottomPt - bandTopPt;
+        centerPt = input.origin.yPt + (bandTopPt + bandBottomPt) / 2;
+      } else {
+        strokeWidthPt = thicknessPt;
+        centerPt = input.origin.yPt + topPt + thicknessPt / 2;
+      }
+    } else {
+      strokeWidthPt = inkStrokeWidth(input.underline.probe);
+      const nativeCenterPt = input.origin.yPt
+        + (inkTop(input.underline.probe) + inkBottom(input.underline.probe)) / 2;
+      const clearCenterPt = input.origin.yPt + inkBottom(input.base) + strokeWidthPt / 2;
+      centerPt = Math.max(nativeCenterPt, clearCenterPt);
+    }
     const style = underlineStyle(input.underline.authoredStyle);
     const common = {
       kind: 'underline' as const,
@@ -180,8 +205,22 @@ export function retainedTextDecorations(input: Readonly<{
     }
   }
   if (input.strike) {
-    const strokeWidthPt = inkStrokeWidth(input.strike.probe);
     const strikeColor = input.strike.color ?? input.color;
+    if (rule) {
+      // A double strike puts one band of the face's strikeout thickness on
+      // each side of the single strikeout band (#1896 controls).
+      const strokeWidthPt = rule.geometry.strikeThicknessEm * rule.sizePt;
+      const singleCenterPt = input.origin.yPt + rule.geometry.strikeTopEm * rule.sizePt + strokeWidthPt / 2;
+      const centers = input.strike.double
+        ? [singleCenterPt - strokeWidthPt, singleCenterPt + strokeWidthPt]
+        : [singleCenterPt];
+      for (const yPt of centers) decorations.push({
+        kind: 'strikethrough', color: strikeColor, widthPt: strokeWidthPt, style: 'solid',
+        from: { xPt: input.origin.xPt, yPt }, to: { xPt: rightPt, yPt },
+      });
+      return decorations;
+    }
+    const strokeWidthPt = inkStrokeWidth(input.strike.probe);
     if (input.strike.double && input.strike.doubleProbe) {
       const topPt = input.origin.yPt + inkTop(input.strike.doubleProbe) + strokeWidthPt / 2;
       const bottomPt = input.origin.yPt + inkBottom(input.strike.doubleProbe) - strokeWidthPt / 2;

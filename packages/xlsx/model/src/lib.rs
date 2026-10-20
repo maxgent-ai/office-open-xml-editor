@@ -629,45 +629,49 @@ pub struct TableInfo {
     pub show_first_column: bool,
     /// `<tableStyleInfo showLastColumn>`.
     pub show_last_column: bool,
-    /// Accent color resolved from the built-in style name against this file's
-    /// theme accents (e.g. `TableStyleLight18` → accent3 of theme1.xml). Used
-    /// by the renderer to draw banding, header background, and rules.
+    /// Accent color of a built-in style name under this file's theme
+    /// (e.g. `TableStyleLight18` → accent3). Informational: rendering uses
+    /// `style_elements`.
     pub accent_color: String,
     /// `true` when `style_name` is defined in the file's `<tableStyles>` block,
-    /// i.e. a *custom* style (ECMA-376 §18.5.1.2). The renderer must draw such
-    /// tables strictly from their declared element dxfs and must NOT apply the
-    /// accent-based approximation (banding, synthesized rules/header) that is
-    /// reserved for built-in style names whose definitions are absent.
+    /// i.e. a *custom* style (ECMA-376 §18.5.1.2). Informational.
     #[serde(default)]
     pub is_custom: bool,
-    /// Dxf index for the `wholeTable` element of a custom `<tableStyle>`
-    /// (ECMA-376 §18.8.83). When set, its border/fill apply to every cell
-    /// of the table as a base layer. Built-in style names use the renderer's
-    /// accent-based fallback, not this field.
+    /// Workbook dxf index of the custom style's `wholeTable` element. The
+    /// `*_dxf` indices below are informational: `style_elements` carries
+    /// every element with its format inline.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub whole_table_dxf: Option<u32>,
-    /// Dxf index for the `headerRow` element of a custom `<tableStyle>`.
-    /// Provides the header background fill, font color/weight, and any
-    /// vertical separator borders shown between header cells.
+    /// Workbook dxf index of the custom style's `headerRow` element.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub header_row_dxf: Option<u32>,
-    /// Dxf index for the `totalRow` element (ECMA-376 §18.18.93).
+    /// Workbook dxf index of the `totalRow` element.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_row_dxf: Option<u32>,
-    /// Dxf index for the `firstColumn` element.
+    /// Workbook dxf index of the `firstColumn` element.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub first_column_dxf: Option<u32>,
-    /// Dxf index for the `lastColumn` element.
+    /// Workbook dxf index of the `lastColumn` element.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_column_dxf: Option<u32>,
-    /// Dxf index for the `firstRowStripe` (band1 horizontal) element — the odd
-    /// banded-row stripe applied when `show_row_stripes` is set.
+    /// Workbook dxf index of the `firstRowStripe` element.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub band1_horizontal_dxf: Option<u32>,
-    /// Dxf index for the `secondRowStripe` (band2 horizontal) element — the
-    /// even banded-row stripe.
+    /// Workbook dxf index of the `secondRowStripe` element.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub band2_horizontal_dxf: Option<u32>,
+    /// The table style's elements (§18.8.41) with their formats inline: a
+    /// workbook `<tableStyle>` (§18.8.40), else the built-in Annex G style of
+    /// that name. Empty when the table has no style, names no known style, or
+    /// its style cannot be applied as authored (see `style_error`).
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub style_elements: Vec<PivotTableStyleElement>,
+    /// The field that kept a workbook table style from being applied as
+    /// authored (a malformed element, a `dxfId` outside `<dxfs>`, an
+    /// unreadable styles part). The table is then drawn without its style,
+    /// never with elements missing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub style_error: Option<String>,
     /// Per-column DXF references (ECMA-376 §18.5.1.3 `tableColumn`). Length
     /// matches the number of `<tableColumn>` children in the table XML, so
     /// `columns[c - range.left]` gives the DXFs for the cell column. The
@@ -819,7 +823,7 @@ pub struct ChartAnchor {
 /// object. This is a normative acquisition fact recorded from the actual XML
 /// element name and never inferred from marker or extent values. `None` on a
 /// model means the producer did not record it (older models, VML/OLE previews,
-/// legacy binary conversion), and consumers keep their untagged behaviour.
+/// producers without DrawingML anchors), and consumers keep their untagged behaviour.
 #[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
 pub enum DrawingAnchorTag {
     /// `<xdr:oneCellAnchor>` (§20.5.2.24): `from` + anchor-level `<xdr:ext>`.
@@ -1208,6 +1212,11 @@ pub enum ShapeGeom {
         /// no effect. Remaps the leaf image along the `clr1`→`clr2` ramp.
         #[serde(skip_serializing_if = "Option::is_none")]
         duotone: Option<Duotone>,
+        /// Ordered CT_Blip effects (§20.1.8.13) on the leaf pic. Each duotone
+        /// carries its own palette and alphaModFix is baked at its authored
+        /// position, so the parser leaves `alpha` empty for parsed leaves.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        blip_effects: Vec<BlipEffect>,
     },
 }
 
@@ -1372,7 +1381,7 @@ pub struct ImageAnchor {
     pub edit_as: Option<String>,
     /// XML anchor element kind (normative fact; OOXML pictures parsed here are
     /// `twoCellAnchor` or `oneCellAnchor`). `None` = not recorded (old models,
-    /// OLE/VML previews, legacy binary conversion).
+    /// OLE/VML previews, producers without DrawingML anchors).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub anchor_tag: Option<DrawingAnchorTag>,
     /// `<xdr:oneCellAnchor><xdr:ext cx cy>` in EMU (§20.5.2.24): the picture's
@@ -1431,6 +1440,12 @@ pub struct ImageAnchor {
     /// renderer remaps the image along the `clr1`→`clr2` luminance ramp.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duotone: Option<Duotone>,
+    /// Ordered CT_Blip effects (§20.1.8.13), shared with DOCX and PPTX. Each
+    /// duotone carries its own palette and alphaModFix (§20.1.8.6) is baked at
+    /// its authored position; parsed pictures therefore leave `alpha` empty.
+    /// Empty for a plain picture or a lone duotone (the legacy fast path).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub blip_effects: Vec<BlipEffect>,
 }
 
 /// ECMA-376 §20.1.8.55 `<a:srcRect>` source-image crop, shared across the docx,
@@ -1439,7 +1454,7 @@ pub use ooxml_common::blip::SrcRect;
 
 /// ECMA-376 §20.1.8.23 `<a:duotone>` image effect, shared across the docx, pptx
 /// and xlsx parsers (see `ooxml_common::blip`).
-pub use ooxml_common::blip::Duotone;
+pub use ooxml_common::blip::{BlipEffect, Duotone};
 
 #[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -1897,6 +1912,11 @@ pub struct DxfFontToggles {
     pub underline: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub strike: Option<bool>,
+    /// `true` when the differential font names the automatic color
+    /// (`<color auto="1"/>`, ECMA-376 §18.3.1.15), which a later layered
+    /// format applies over an earlier color; absent when no color is named.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub automatic_color: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]

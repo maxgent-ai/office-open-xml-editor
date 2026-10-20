@@ -1,4 +1,4 @@
-import { EMU_PER_PX, type FindHighlightColors, type FindMatch, type FindMatchesOptions, type HyperlinkTarget, type OoxmlResourceMetrics, type ViewerContextMenuEvent, type ZoomableViewer, openExternalHyperlink } from '@silurus/ooxml-core';
+import { EMU_PER_PX, type FindMatch, type FindMatchesOptions, type HyperlinkTarget, type OoxmlResourceMetrics, type ZoomableViewer, openExternalHyperlink } from '@silurus/ooxml-core';
 import {
   computeUniformVisibleWindow,
   type VisibleWindow,
@@ -24,7 +24,7 @@ import { CommentMarginController } from '@silurus/ooxml-core/internal/comment-ma
 import { ScrollZoomController } from '@silurus/ooxml-core/internal/scroll-zoom-controller';
 import { SelectionContextController } from '@silurus/ooxml-core/internal/selection-context-controller';
 import { CommentOverlayController } from '@silurus/ooxml-core/internal/comment-overlay-controller';
-import { PptxPresentation, type LoadOptions, type RenderSlideOptions } from './presentation';
+import { PptxPresentation, type LoadOptions } from './presentation';
 import type { PptxScrollSlot as SlideSlot } from './scroll-slot';
 import type { PptxTextRunInfo } from './renderer';
 import { buildPptxTextLayer } from './text-layer';
@@ -46,7 +46,6 @@ import {
 import type { PptxCommentsOptions } from './comment-margin';
 import type { PptxScrollViewerOptions } from './scroll-viewer-options';
 import { pptxCommentOccurrenceKey } from './comment-occurrence';
-import type { PptxComment } from './types';
 import { renderPptxFocusedSlide } from './focused-view-runtime';
 import { PptxScrollLayoutController } from './scroll-layout-controller';
 import { createPptxLoadingIndicator } from './loading-indicator';
@@ -331,7 +330,7 @@ export class PptxScrollViewer implements ZoomableViewer {
       chartEx: this._opts.chartEx,
       tiff: this._opts.tiff,
       mode: this._mode,
-      ...(this._opts.modelSources === undefined ? undefined : { modelSources: this._opts.modelSources }),
+      ...(this._opts.legacyPpt === undefined ? undefined : { legacyPpt: this._opts.legacyPpt }),
       progressiveLayout: this._opts.progressiveLayout,
       onLayoutProgress: this._opts.onLayoutProgress,
       onLayoutPartial: this._opts.onLayoutPartial,
@@ -429,7 +428,7 @@ export class PptxScrollViewer implements ZoomableViewer {
    *  rather than surfaced to a `onError` on a dead viewer. */
   private _destroyed = false;
   /** Render generation, bumped on every effective `setScale` (and the resize
-   *  re-fit in `_onResize`, which routes through `setScale`). Stamped into each async render
+   *  re-fit in the zoom controller, which routes through `setScale`). Stamped into each async render
    *  dispatch; a resolution whose captured epoch ≠ this value is STALE — its
    *  pixels/geometry are at a superseded scale. Worker path: close the orphan
    *  bitmap + re-dispatch the live slot. Main path: skip the (stale) text-layer
@@ -1190,57 +1189,8 @@ export class PptxScrollViewer implements ZoomableViewer {
     return idx === undefined ? target : { ...target, slideIndex: idx };
   }
 
-  private _onResize(): void { this._zoom.onResize(); }
-
   get topVisibleSlide(): number {
     return this._scroller.lastRange?.topIndex ?? 0;
-  }
-
-  /** @internal test hook: slide indices currently mounted. */
-  mountedSlideIndicesForTest(): number[] {
-    return [...this._slots.keys()];
-  }
-
-  /** @internal test hook: slots currently owning or awaiting media handles. */
-  interactiveSlideIndicesForTest(): number[] {
-    return [...this._slots]
-      .filter(([, slot]) => slot.mediaInteractive)
-      .map(([index]) => index);
-  }
-
-  /** @internal test hook: the current absolute (dimensionless) zoom scale. */
-  scaleForTest(): number {
-    return this._scale;
-  }
-
-  /** @internal test hook: the base fit scale (pre-zoom) at the current width. */
-  baseScaleForTest(): number {
-    return this._baseScale();
-  }
-
-  /** @internal test hook: the current render epoch (bumped on setScale + resize). */
-  renderEpochForTest(): number {
-    return this._renderEpoch;
-  }
-
-  /** @internal test hook: fire the observed resize path (a real host drives this
-   *  via the constructor's ResizeObserver). */
-  resizeForTest(): void {
-    this._onResize();
-  }
-
-  /** @internal test hook: the content point (slide index + intra-slide fraction)
-   *  currently under viewport-y `y` (px from the scroll host top). Lets a test
-   *  capture "what is under the cursor" before a zoom and re-query its on-screen
-   *  y afterwards to assert the pointer-anchored invariant. */
-  contentAtViewportYForTest(y: number): { slide: number; frac: number } {
-    const point = this._navigation.contentAtViewportY(y);
-    return { slide: point.unit, frac: point.frac };
-  }
-
-  /** @internal test hook: inverse of contentAtViewportYForTest. */
-  viewportYOfForTest(slide: number, frac: number): number {
-    return this._navigation.viewportYOf(slide, frac);
   }
 
   /** Return the owning engine's latest content-free package-usage snapshot. */

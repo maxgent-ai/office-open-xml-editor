@@ -279,6 +279,11 @@ pub enum ChartStyleFill {
         alpha: Option<f64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         duotone: Option<crate::blip::Duotone>,
+        /// Ordered CT_Blip effects (§20.1.8.13), shared with picture paths.
+        /// When present, alphaModFix is baked at its authored position and
+        /// `alpha` stays empty; each duotone owns its palette.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        blip_effects: Vec<crate::blip::BlipEffect>,
     },
 }
 
@@ -435,7 +440,7 @@ pub struct ChartModel {
     pub title_present: bool,
     /// The source chart declares no series at all: every classic CT_PlotArea
     /// chart group is empty (ECMA-376 §21.2.2.145 allows `ser` 0..n), or a
-    /// BIFF chart has no Series record. Excel draws such a chart as its empty
+    /// producer reports a chart without series. Excel draws such a chart as its empty
     /// chart area (its PDF export of a series-less chart sheet shows only the
     /// chart-area border), unlike a chart whose series could not be read.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]

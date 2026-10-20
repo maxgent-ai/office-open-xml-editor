@@ -113,6 +113,10 @@ fn apply_tint(hex: &str, tint: f64) -> String {
     let r = u8::from_str_radix(&hex[0..2], 16).unwrap_or(0) as f64 / 255.0;
     let g = u8::from_str_radix(&hex[2..4], 16).unwrap_or(0) as f64 / 255.0;
     let b = u8::from_str_radix(&hex[4..6], 16).unwrap_or(0) as f64 / 255.0;
+    // This RGB → HLS decomposition intentionally stays separate from
+    // `crate::color::rgb_to_hls`: its hue and l == 0.5 saturation use a
+    // different floating-point operation order, and switching changes about
+    // one in a thousand tinted 8-bit colours by one channel level.
     let max = r.max(g).max(b);
     let min = r.min(g).min(b);
     let l = (max + min) / 2.0;
@@ -138,48 +142,13 @@ fn apply_tint(hex: &str, tint: f64) -> String {
     } else {
         l * (1.0 + tint)
     };
-    let (r, g, b) = hls_to_rgb(h, new_l, s);
+    let (r, g, b) = crate::color::hls_to_rgb(h, new_l, s);
     format!(
         "#{:02X}{:02X}{:02X}",
         (r * 255.0).round() as u8,
         (g * 255.0).round() as u8,
         (b * 255.0).round() as u8
     )
-}
-
-fn hls_to_rgb(h: f64, l: f64, s: f64) -> (f64, f64, f64) {
-    if s == 0.0 {
-        return (l, l, l);
-    }
-    let q = if l < 0.5 {
-        l * (1.0 + s)
-    } else {
-        l + s - l * s
-    };
-    let p = 2.0 * l - q;
-    (
-        hue_to_rgb(p, q, h + 1.0 / 3.0),
-        hue_to_rgb(p, q, h),
-        hue_to_rgb(p, q, h - 1.0 / 3.0),
-    )
-}
-
-fn hue_to_rgb(p: f64, q: f64, mut t: f64) -> f64 {
-    if t < 0.0 {
-        t += 1.0;
-    }
-    if t > 1.0 {
-        t -= 1.0;
-    }
-    if t < 1.0 / 6.0 {
-        p + (q - p) * 6.0 * t
-    } else if t < 0.5 {
-        q
-    } else if t < 2.0 / 3.0 {
-        p + (q - p) * (2.0 / 3.0 - t) * 6.0
-    } else {
-        p
-    }
 }
 
 #[cfg(test)]

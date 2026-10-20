@@ -38,6 +38,10 @@ export function activateMcp(
         })();
       }
     }),
+    // The allowed roots follow the workspace folders.
+    vscode.workspace.onDidChangeWorkspaceFolders(() => {
+      void provider.refresh();
+    }),
     vscode.workspace.onDidGrantWorkspaceTrust(() => {
       void provider.refresh();
       void promptIfNeeded(context, provider);

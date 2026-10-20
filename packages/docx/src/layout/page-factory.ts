@@ -185,7 +185,7 @@ export function sectionLayoutContextsEqual(
     && equalColumns(left.columns, right.columns)
     && left.columnSeparator === right.columnSeparator
     && left.textDirection === right.textDirection
-    && (left.nativeSectionFlow ?? null) === (right.nativeSectionFlow ?? null)
+    && (left.sectionFlow ?? null) === (right.sectionFlow ?? null)
     && (left.sectionBidi === true) === (right.sectionBidi === true)
     && left.grid.kind === right.grid.kind
     && left.grid.linePitchPt === right.grid.linePitchPt

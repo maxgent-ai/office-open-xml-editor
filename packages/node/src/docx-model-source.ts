@@ -4,6 +4,7 @@ import {
   materializeDocumentPullLayoutSession,
   materializeDocumentPullSession,
   normalizeDocxDocumentModel,
+  normalizeDocxParserError,
   normalizeLayoutOptions,
   retainRenderWorkerDocumentLayout,
   type AcquiredDocxNodeDocument,
@@ -14,7 +15,7 @@ import {
   type DocxNodeArchive,
 } from '@silurus/ooxml-docx/internal/session';
 import { resolveCjkFallback } from '@silurus/ooxml-core';
-import { parseResourceLimitError } from '@silurus/ooxml-core/worker';
+import { parseResourceLimitError, parseTypedParserError } from '@silurus/ooxml-core/worker';
 import { usingOwnedSession } from '@silurus/ooxml-core/internal/owned-session';
 import type { DocxDocumentModel } from '@silurus/ooxml-docx';
 import type { OoxmlNodeSessionOptions } from './session-options.ts';
@@ -87,7 +88,7 @@ export async function openDocxSource(
 
 export async function materializeDocxSource(
   buffer: ArrayBuffer | Uint8Array,
-  options: OoxmlNodeSessionOptions,
+  options: OoxmlNodeSessionOptions & Pick<OpenDocxDocumentOptions, 'legacyDoc'>,
   wasmModule: () => WebAssembly.Module,
 ): Promise<DocxDocumentModel> {
   return usingOwnedSession(
@@ -130,10 +131,10 @@ function normalizeCurrentDate(value: Date | number | undefined): number {
   return current;
 }
 
-/** Selected-source DOCX acquisition, loaded only after modelSources dispatch. */
+/** Selected-source DOCX acquisition, loaded only after legacyDoc dispatch. */
 export async function acquireDocxInput<TResult>(
   buffer: ArrayBuffer | Uint8Array,
-  options: OoxmlNodeSessionOptions & DocxNodeAcquisitionOptions,
+  options: OoxmlNodeSessionOptions & DocxNodeAcquisitionOptions & Pick<OpenDocxDocumentOptions, 'legacyDoc'>,
   wasmModule: () => WebAssembly.Module,
   consume: (
     transport: DocxNodePullTransport,
@@ -150,7 +151,8 @@ export async function acquireDocxInput<TResult>(
     validateDocxModelSourceViewDefaults,
   } = await import('@silurus/ooxml-docx/internal/model-source-session');
   const input = await resolveNodeSessionInput(
-    buffer, 'docx', options, validateDocxModelSourceArchive,
+    buffer, 'docx', { ...options, source: options.legacyDoc }, validateDocxModelSourceArchive,
+    error => parseTypedParserError(error) ?? normalizeDocxParserError(error),
   );
   if (input.kind === 'ooxml') {
     return {

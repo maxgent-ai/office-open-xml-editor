@@ -105,7 +105,7 @@ For a narrow DOCX renderer fix, a good verification set is:
   packages/docx/src/cell-border-conflict-render.test.ts \
   packages/docx/src/column-widths.test.ts
 
-./node_modules/.pnpm/typescript@*/node_modules/typescript/bin/tsc --build --pretty false
+./node_modules/.bin/tsc --build --pretty false
 git diff --check
 ```
 
@@ -273,7 +273,9 @@ Typical local-only paths:
 - `packages/xlsx/public/private/xlsx/`
 - `packages/pptx/public/private/pptx/`
 - `packages/*/src/*privateDemo.stories.ts`
-- `packages/*/src/wasm/`
+
+Generated build output such as `packages/*/src/wasm/` is also git-ignored and
+must not be committed; rebuild it instead of copying it between worktrees.
 
 When using a Codex/Claude worktree, copy local private stories/samples from the
 main local checkout if needed. Avoid copying `.DS_Store`, temporary Office lock
@@ -449,7 +451,8 @@ When the user asks for a release, prepare a dedicated PR named
 
 Release checklist:
 
-1. Update README screenshots in `docs/images/{pptx,docx,xlsx}.png`.
+1. Update README screenshots in `docs/images/{pptx,docx,xlsx}.png` with
+   `pnpm screenshots:readme`.
 2. Review README against the current implementation:
    - ESM-only package format,
    - install/import examples,
@@ -460,6 +463,7 @@ Release checklist:
    - `site/src/lib/api-reference.ts`,
    - `site/src/components/Capabilities.astro` when capabilities changed.
    - `site/src/pages/bundle-size.astro` with the latest production measurements.
+     Measure with `node scripts/measure-bundle-size.mjs` after `pnpm build:wasm && pnpm build`.
 4. Add a new top `CHANGELOG.md` section:
    `## 0.x.0 — YYYY-MM-DD`.
 5. Bump all versions consistently:
@@ -467,6 +471,14 @@ Release checklist:
    - `packages/{core,pptx,xlsx,docx,markdown,node,vscode-extension}/package.json`,
    - `site/package.json`,
    - `packages/mcp-server/Cargo.toml`.
+
+   After bumping the root version, run `pnpm sync:versions` to synchronize
+   `packages/legacy-office/package.json` (the public
+   `@silurus/ooxml-legacy-office` package), its exact `@silurus/ooxml` peer pin,
+   and the compiled companion runtime version. Run `pnpm install --lockfile-only`
+   and `pnpm check:versions`; CI and publishing reject any mismatch. Both npm
+   packages publish from the same tag, viewer first; retries skip exact versions
+   already present on npm.
 6. Run `cargo check -p ooxml-mcp-server` after bumping the MCP server so
    `Cargo.lock` follows.
 7. Open PR `chore(release): 0.x.0`.

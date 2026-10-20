@@ -1,8 +1,8 @@
-import type { Worksheet } from './types.js';
 import {
   DEFAULT_XLSX_WORKSHEET_POLICY,
   type NormalizedXlsxWorksheetPolicy,
-} from '@silurus/ooxml-core/worker';
+} from './internal/worksheet-policy.js';
+import type { Worksheet } from './types.js';
 
 /**
  * Realm-local association between a library-owned worksheet model and the

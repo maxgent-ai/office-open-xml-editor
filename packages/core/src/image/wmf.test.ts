@@ -12,21 +12,8 @@ import { TiffDecodeError } from './tiff-contract.js';
 import { isOptionalImageCodecUnavailableError } from './optional-image-fallback.js';
 
 // ── WMF (Windows Metafile) player unit tests ────────────────────────────────
-// The renderer falls back to this player for `.wmf`/`.emf` blips the browser
-// can't decode (createImageBitmap throws on metafiles). image1.emf in
-// sample-10.docx is, despite the extension, a *standard* (non-placeable) WMF
-// whose labels are vector POLYPOLYGON glyph outlines (no text-out records), so
-// the player only needs window mapping, an object table (pens+brushes), and
-// POLYLINE/POLYGON/POLYPOLYGON/RECTANGLE drawing.
-//
-// `playWmf(bytes, ctx, W, H, suppressBoundaryFrame?)` is the pure record-replay
-// core: it issues moveTo/lineTo/stroke/fill calls onto an injected ctx, so a
-// recording mock pins coordinate mapping + state without needing OffscreenCanvas
-// (absent in the node test env).
-//
-// Shared in core (originally docx-only). The window/device-boundary cosmetic
-// stroke suppression is now a HEURISTIC gated behind `suppressBoundaryFrame`
-// (default OFF = spec-clean, every edge drawn); docx opts IN when it re-points.
+// The shared player replays WMF records into a recording Canvas context.
+// Pixel-level clipping coverage is in node/src/core-paint-audit.test.ts.
 
 // ── byte builders ───────────────────────────────────────────────────────────
 
@@ -157,6 +144,7 @@ function makeRecordingCtx(): MockCtx {
     moveTo(x: number, y: number) { calls.push({ op: 'moveTo', args: [x, y] }); },
     lineTo(x: number, y: number) { calls.push({ op: 'lineTo', args: [x, y] }); },
     rect(x: number, y: number, w: number, h: number) { calls.push({ op: 'rect', args: [x, y, w, h] }); },
+    clip() { calls.push({ op: 'clip', args: [] }); },
     stroke() {
       calls.push({ op: 'stroke', args: [] });
       styles.stroke.push(_stroke);
@@ -282,7 +270,7 @@ describe('playWmf — window mapping, pen, polyline', () => {
     playWmf(file, m.ctx, 100, 100);
     const moves = m.calls.filter((c) => c.op === 'moveTo');
     // logical (10,10) is the origin → device (0,0) even with the flip.
-    expect(moves[0].args).toEqual([0, -0]);
+    expect(moves[0].args).toEqual([0, 0]);
     const lines = m.calls.filter((c) => c.op === 'lineTo');
     // (60,60): dx=50 → x=50; dy=50, yExt=-100 → device y = 50 * (100 / -100) = -50.
     expect(lines[0].args[0]).toBe(50);
@@ -378,12 +366,12 @@ describe('playWmf — polygon / polypolygon fill', () => {
   });
 });
 
-// ── playWmf: spec-clean default draws boundary edges (heuristic OFF) ─────────
+// ── playWmf: authored boundary edges ──────────────────────────────────────
 
-describe('playWmf — spec-clean default (suppressBoundaryFrame=false) draws all edges', () => {
+describe('playWmf — authored boundary edges', () => {
   it('a RECTANGLE coincident with the device bounds STILL strokes its outline by default', () => {
     // window org (0,0) ext (100,100), device 100×100 ⇒ logical==device. The rect
-    // spans the full window; with the heuristic OFF every edge is drawn.
+    // spans the full window; every authored edge is drawn.
     const file = concat(
       wmfHeader(),
       record(FN.SETWINDOWORG, (w) => w.i16(0).i16(0)),
@@ -395,7 +383,7 @@ describe('playWmf — spec-clean default (suppressBoundaryFrame=false) draws all
       record(FN.EOF, () => {}),
     );
     const m = makeRecordingCtx();
-    playWmf(file, m.ctx, 100, 100); // default: suppressBoundaryFrame=false
+    playWmf(file, m.ctx, 100, 100);
     // Spec-clean: the boundary-coincident outline IS stroked as one closed path.
     expect(m.calls.some((c) => c.op === 'stroke')).toBe(true);
     expect(m.calls.filter((c) => c.op === 'moveTo').length).toBe(1);
@@ -404,100 +392,52 @@ describe('playWmf — spec-clean default (suppressBoundaryFrame=false) draws all
   });
 });
 
-// ── playWmf: window/device-boundary cosmetic-stroke suppression (heuristic) ──
-
-describe('playWmf — window/device-boundary stroke suppression (suppressBoundaryFrame=true)', () => {
-  // HEURISTIC (see deviceInteriorEdges in wmf.ts): a cosmetic stroke whose edge
-  // coincides with the metafile window/device boundary (x∈{0,W} or y∈{0,H}) is
-  // suppressed, because Word renders no visible frame there. This is NOT GDI's
-  // actual clip (which excludes only the right/bottom edges); we drop all four
-  // boundary lines to remove the common full-window "frame rectangle" drawn with
-  // a 1px cosmetic pen. Opt-in via the suppressBoundaryFrame flag (docx behavior).
-
-  it('a RECTANGLE coincident with the device bounds paints NO outline (frame suppressed)', () => {
-    // window org (0,0) ext (100,100), device 100×100 ⇒ logical==device. The rect
-    // spans the full window, so all four edges land on the boundary.
-    const file = concat(
-      wmfHeader(),
-      record(FN.SETWINDOWORG, (w) => w.i16(0).i16(0)),
-      record(FN.SETWINDOWEXT, (w) => w.i16(100).i16(100)),
-      // cosmetic (width 0) PS_SOLID black pen — a typical full-window frame pen.
-      record(FN.CREATEPENINDIRECT, (w) => w.u16(0).i16(0).i16(0).u32(0x00000000)),
-      record(FN.SELECTOBJECT, (w) => w.u16(0)),
-      // RECTANGLE params: bottom, right, top, left (full window).
-      record(FN.RECTANGLE, (w) => w.i16(100).i16(100).i16(0).i16(0)),
-      record(FN.EOF, () => {}),
-    );
-    const m = makeRecordingCtx();
-    playWmf(file, m.ctx, 100, 100, true);
-    // No brush selected ⇒ no fill; and the boundary-coincident outline is not
-    // stroked ⇒ the rectangle contributes nothing.
-    expect(m.calls.some((c) => c.op === 'stroke')).toBe(false);
-    expect(m.calls.some((c) => c.op === 'fill')).toBe(false);
+describe('playWmf — clip and raster-state diagnostics', () => {
+  it.each([false, true])('bounds exclude/offset Canvas work with drawing=%s', drawEach => {
+    const draw = record(FN.RECTANGLE, w => w.i16(100).i16(100).i16(0).i16(0));
+    const pair = [record(0x0415, w => w.i16(100).i16(60).i16(0).i16(50)),
+      record(0x0220, w => w.i16(0).i16(1)), ...(drawEach ? [draw] : [])];
+    const file = concat(wmfHeader(),
+      record(FN.CREATEBRUSHINDIRECT, w => w.u16(0).u32(0xff).u16(0)),
+      record(FN.SELECTOBJECT, w => w.u16(0)),
+      ...Array.from({ length: 1000 }, () => pair).flat());
+    const mock = makeRecordingCtx();
+    playWmf(file, mock.ctx, 100, 100);
+    expect(mock.calls.filter(c => c.op === 'clip').length).toBe(drawEach ? 1000 : 0);
+    expect(mock.calls.filter(c => c.op === 'rect').length).toBeLessThanOrEqual(drawEach ? 4000 : 0);
   });
 
-  it('a RECTANGLE one pixel INSIDE the bounds still strokes all four edges (not a size rule)', () => {
-    // Same pen/window, but the rect is inset by 1 unit on every side, so no edge
-    // lies on the surface boundary — the outline must paint normally.
-    const file = concat(
-      wmfHeader(),
-      record(FN.SETWINDOWORG, (w) => w.i16(0).i16(0)),
-      record(FN.SETWINDOWEXT, (w) => w.i16(100).i16(100)),
-      record(FN.CREATEPENINDIRECT, (w) => w.u16(0).i16(0).i16(0).u32(0x00000000)),
-      record(FN.SELECTOBJECT, (w) => w.u16(0)),
-      record(FN.RECTANGLE, (w) => w.i16(99).i16(99).i16(1).i16(1)),
-      record(FN.EOF, () => {}),
-    );
-    const m = makeRecordingCtx();
-    playWmf(file, m.ctx, 100, 100, true);
-    expect(m.calls.some((c) => c.op === 'stroke')).toBe(true);
-    // All four interior edges drawn: a single continuous sub-path (1 moveTo) with
-    // four lineTo's (closed rectangle).
-    expect(m.calls.filter((c) => c.op === 'moveTo').length).toBe(1);
-    expect(m.calls.filter((c) => c.op === 'lineTo').length).toBe(4);
+  it.each([{ params: [] }, { params: [9] }])('diagnoses an invalid or malformed mapping mode $params', ({ params }) => {
+    const report = vi.fn();
+    playWmf(concat(wmfHeader(), record(0x0103, w => params.forEach(p => w.u16(p)))),
+      makeRecordingCtx().ctx, 100, 100, report);
+    expect(report).toHaveBeenCalledWith([params.length ? 'META_SETMAPMODE invalid mode' : 'META_SETMAPMODE malformed']);
   });
 
-  it('a boundary RECTANGLE WITH a brush still FILLS (only the cosmetic outline is suppressed)', () => {
-    const file = concat(
-      wmfHeader(),
-      record(FN.SETWINDOWORG, (w) => w.i16(0).i16(0)),
-      record(FN.SETWINDOWEXT, (w) => w.i16(100).i16(100)),
-      // green solid brush + cosmetic black pen.
-      record(FN.CREATEBRUSHINDIRECT, (w) => w.u16(0).u32(0x0000ff00).u16(0)),
-      record(FN.SELECTOBJECT, (w) => w.u16(0)),
-      record(FN.CREATEPENINDIRECT, (w) => w.u16(0).i16(0).i16(0).u32(0x00000000)),
-      record(FN.SELECTOBJECT, (w) => w.u16(1)),
-      record(FN.RECTANGLE, (w) => w.i16(100).i16(100).i16(0).i16(0)),
-      record(FN.EOF, () => {}),
-    );
-    const m = makeRecordingCtx();
-    playWmf(file, m.ctx, 100, 100, true);
-    expect(m.calls.some((c) => c.op === 'fill')).toBe(true);
-    expect(m.styles.fill.at(-1)?.toLowerCase()).toBe('#00ff00');
-    // Outline still suppressed (all edges on the boundary).
-    expect(m.calls.some((c) => c.op === 'stroke')).toBe(false);
+  it('reports unsupported Boolean raster mixes instead of silently copying the pen', () => {
+    const file = concat(wmfHeader(),
+      record(FN.CREATEPENINDIRECT, w => w.u16(0).i16(0).i16(0).u32(0)),
+      record(FN.SELECTOBJECT, w => w.u16(0)),
+      record(0x0104, w => w.u16(7)),
+      record(FN.RECTANGLE, w => w.i16(100).i16(100).i16(0).i16(0)),
+      record(FN.EOF, () => {}));
+    const report = vi.fn();
+    const mock = makeRecordingCtx();
+    expect(playWmf(file, mock.ctx, 100, 100, report)).toBe(false);
+    expect(mock.calls.some(c => c.op === 'stroke')).toBe(false);
+    expect(report).toHaveBeenCalledWith(['META_SETROP2 (unsupported binary mix)']);
   });
 
-  it('only the boundary edges of a partially-coincident polygon are dropped', () => {
-    // A right triangle whose bottom edge runs along y=0 (on the boundary) but
-    // whose other two edges are interior: the bottom edge is dropped, the other
-    // two still stroke.
-    const file = concat(
-      wmfHeader(),
-      record(FN.SETWINDOWORG, (w) => w.i16(0).i16(0)),
-      record(FN.SETWINDOWEXT, (w) => w.i16(100).i16(100)),
-      record(FN.CREATEPENINDIRECT, (w) => w.u16(0).i16(0).i16(0).u32(0x000000ff)),
-      record(FN.SELECTOBJECT, (w) => w.u16(0)),
-      // vertices (0,0)-(100,0)-(50,50): edge (0,0)->(100,0) is on y=0.
-      record(FN.POLYGON, (w) => w.i16(3).i16(0).i16(0).i16(100).i16(0).i16(50).i16(50)),
-      record(FN.EOF, () => {}),
-    );
-    const m = makeRecordingCtx();
-    playWmf(file, m.ctx, 100, 100, true);
-    expect(m.calls.some((c) => c.op === 'stroke')).toBe(true);
-    // Two surviving edges, contiguous: (100,0)->(50,50)->(0,0). One sub-path.
-    expect(m.calls.filter((c) => c.op === 'moveTo').length).toBe(1);
-    expect(m.calls.filter((c) => c.op === 'lineTo').length).toBe(2);
+  it('reports malformed region scans through the existing incomplete-metafile channel', () => {
+    const file = concat(wmfHeader(),
+      record(0x06ff, w => w.u16(0).i16(6).u32(0).i16(34).i16(1).i16(2)
+        .i16(0).i16(0).i16(100).i16(100)
+        .u16(2).u16(0).u16(100).u16(0).u16(100).u16(4)),
+      record(0x012c, w => w.u16(0)),
+      record(FN.EOF, () => {}));
+    const report = vi.fn();
+    expect(playWmf(file, makeRecordingCtx().ctx, 100, 100, report)).toBe(false);
+    expect(report).toHaveBeenCalledWith(expect.arrayContaining(['META_CREATEREGION malformed']));
   });
 });
 
@@ -615,6 +555,44 @@ describe('playWmf — robustness', () => {
 // ── playWmf: STRETCHDIBITS embedded raster DIB ──────────────────────────────
 
 describe('playWmf — STRETCHDIBITS (embedded raster DIB)', () => {
+  it('does not borrow a following record to admit a truncated packed DIB', () => {
+    const bitmap = record(FN.STRETCHDIBITS, (w) => {
+      w.u32(0x00cc0020);
+      for (let i = 0; i < 9; i++) w.u16(1);
+      w.u32(40).u32(40000).u32(2).u16(1).u16(32).u32(0).u32(0)
+        .u32(0).u32(0).u32(0).u32(0).raw(0, 0, 0, 0);
+    });
+    const following = new Uint8Array(320006);
+    const view = new DataView(following.buffer);
+    view.setUint32(0, following.length / 2, true);
+    view.setUint16(4, 0xffff, true); // unsupported record, skipped by size
+    for (const tail of [new Uint8Array(0), following]) {
+      const m = makeRecordingCtx();
+      expect(() => playWmf(concat(
+        wmfHeader(), bitmap, tail,
+        record(FN.CREATEPENINDIRECT, (w) => w.u16(0).i16(1).i16(0).u32(0xff)),
+        record(FN.SELECTOBJECT, (w) => w.u16(0)),
+        record(FN.RECTANGLE, (w) => w.i16(10).i16(10).i16(0).i16(0)),
+        record(FN.EOF, () => {}),
+      ), m.ctx, 100, 100)).not.toThrow();
+      expect(m.calls.some((call) => call.op === 'stroke')).toBe(true);
+    }
+  });
+
+  it('propagates a packed DIB budget crossing out of WMF playback', () => {
+    const bitmap = record(FN.STRETCHDIBITS, (w) => {
+      w.u32(0x00cc0020);
+      for (let i = 0; i < 9; i++) w.u16(1);
+      w.u32(40).u32(40000).u32(1).u16(1).u16(24).u32(0).u32(0)
+        .u32(0).u32(0).u32(0).u32(0);
+      for (let i = 0; i < 120000; i++) w.raw(0);
+    });
+    expect(() => playWmf(concat(wmfHeader(), bitmap, record(FN.EOF, () => {})), makeRecordingCtx().ctx, 100, 100))
+      .toThrowError(expect.objectContaining({
+        code: 'ooxml-decoded-image-limit', metric: 'image-dimension', limit: 32767, observed: 40000,
+      }));
+  });
+
   // A META_STRETCHDIBITS record wraps a packed DIB. Its params (after the 6-byte
   // header) are: u32 RasterOp, i16 SrcHeight/SrcWidth/YSrc/XSrc, u16 UsageSrc,
   // i16 DestHeight/DestWidth/YDest/XDest, then the packed DIB. OffscreenCanvas is
@@ -1516,56 +1494,7 @@ describe('decodeRasterOrMetafile', () => {
     expect(bmp).toBeNull();
   });
 
-  it('suppressBoundaryFrame defaults OFF (full-window rect draws its frame) and can be opted IN', async () => {
-    // Capture whether the player stroked by recording on the offscreen ctx.
-    let strokeCount = 0;
-    vi.stubGlobal(
-      'OffscreenCanvas',
-      class {
-        width: number;
-        height: number;
-        constructor(w: number, h: number) { this.width = w; this.height = h; }
-        getContext() {
-          return {
-            fillStyle: '#000', strokeStyle: '#000', lineWidth: 1,
-            lineJoin: 'miter', lineCap: 'butt',
-            save() {}, restore() {}, beginPath() {}, closePath() {},
-            moveTo() {}, lineTo() {}, rect() {},
-            stroke() { strokeCount++; }, fill() {},
-          };
-        }
-      },
-    );
-    vi.stubGlobal('createImageBitmap', vi.fn(async (src: { width: number; height: number }) =>
-      ({ width: src.width, height: src.height, close() {} }) as unknown as ImageBitmap));
-    // Full-window rectangle with a cosmetic pen at device == window (200×200 for
-    // widthPt/heightPt 100 → ×2). The window ext must match the device so the
-    // rect edges land exactly on the boundary.
-    const mkFile = () =>
-      concat(
-        wmfHeader(),
-        record(FN.SETWINDOWORG, (w) => w.i16(0).i16(0)),
-        record(FN.SETWINDOWEXT, (w) => w.i16(200).i16(200)),
-        record(FN.CREATEPENINDIRECT, (w) => w.u16(0).i16(0).i16(0).u32(0x00000000)),
-        record(FN.SELECTOBJECT, (w) => w.u16(0)),
-        record(FN.RECTANGLE, (w) => w.i16(200).i16(200).i16(0).i16(0)),
-        record(FN.EOF, () => {}),
-      );
 
-    strokeCount = 0;
-    const def = await decodeRasterOrMetafile(new Blob([mkFile() as BlobPart], { type: 'image/wmf' }), { widthPt: 100, heightPt: 100 });
-    // Default OFF: the frame strokes, so the bitmap is non-null.
-    expect(strokeCount).toBe(1);
-    expect(def).not.toBeNull();
-
-    strokeCount = 0;
-    const sup = await decodeRasterOrMetafile(new Blob([mkFile() as BlobPart], { type: 'image/wmf' }), {
-      widthPt: 100, heightPt: 100, suppressBoundaryFrame: true,
-    });
-    // Opted IN: every edge is on the boundary → nothing strokes → no geometry → null.
-    expect(strokeCount).toBe(0);
-    expect(sup).toBeNull();
-  });
 });
 
 describe('isMetafileMime', () => {

@@ -3,13 +3,6 @@ export {
   type LoadOptions,
   type RenderViewportToBitmapOptions,
 } from './workbook.js';
-// Conditional-formatting evaluation boundary (#1547).
-export type {
-  CfDiagnosticKind,
-  CfDiagnosticPhase,
-  CfRuleDiagnostic,
-  XlsxConditionalFormattingReport,
-} from './cf-diagnostics.js';
 export { XlsxViewer, XlsxSheetViewer } from './viewer.js';
 // Resolved list-validation values (reachable via XlsxWorkbook.resolveValidationList).
 export type { ResolvedList } from './validation-list.js';
@@ -139,7 +132,7 @@ export { type HyperlinkTarget, openExternalHyperlink } from '@silurus/ooxml-core
 // (ECMA-376 §18.4.8). Exported so headless callers that parse a Worksheet
 // directly (for example a bounded Node worksheet session) can concretize cell text.
 export { resolveSharedStrings } from './shared-strings.js';
-// Application-supplied model sources (LoadOptions.modelSources): the
+// Application-supplied model sources (LoadOptions.legacyXls): the
 // format-generic contract for opening input that is not an OOXML package.
 export type {
   ModelSource,
@@ -169,6 +162,7 @@ export {
   type OoxmlFormat,
   type OoxmlResourceLimit,
   type OoxmlResourceLimitErrorDetails,
+  type OoxmlUnsupportedContentDetails,
   type OoxmlResourceLimits,
   type XlsxWorksheetLimits,
   type CjkFallback,
@@ -285,3 +279,5 @@ export type {
   ChartManualLayout,
   LegendManualLayout,
 } from './types.js';
+
+export type { BlendMode, BlipEffectContainer, BlipEffectFill, BlipEffectImageFill } from '@silurus/ooxml-core';

@@ -1,6 +1,6 @@
 #![no_main]
 
-use legacy_office_converter::fuzzing;
+use legacy_office_parser::fuzzing;
 use libfuzzer_sys::fuzz_target;
 
 // Exercise alternative shape XML (metroBlob) resolution directly: package and

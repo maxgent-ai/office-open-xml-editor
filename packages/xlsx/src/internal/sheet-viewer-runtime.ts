@@ -1,3 +1,4 @@
+import { inheritCellFontLanguage } from './cell-font-language.js';
 import type { Worksheet } from '../types.js';
 import { inheritWorksheetPreviewBounds } from './worksheet-content-bounds.js';
 import { inheritWorksheetPolicy } from '../worksheet-policy-context.js';
@@ -47,6 +48,7 @@ export function createSheetViewModel(source: Worksheet): Worksheet {
     colWidths: { ...source.colWidths },
   };
   if (source.colCollapsed) view.colCollapsed = { ...source.colCollapsed };
+  inheritCellFontLanguage(source, view);
   inheritWorksheetPreviewBounds(source, view);
   inheritWorksheetPolicy(source, view);
   inheritWorksheetSizeContext(source, view);

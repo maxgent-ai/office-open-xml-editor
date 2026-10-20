@@ -113,7 +113,8 @@ export async function loadLocalFontMetrics(
     if (request.lineHeightMultiplier != null && !(request.lineHeightMultiplier > 0)) continue;
     const weight = request.weight ?? 400;
     const style = request.style ?? 'normal';
-    if (!(weight >= 100 && weight <= 900) || (style !== 'normal' && style !== 'italic')) continue;
+    if (!(Number.isInteger(weight) && weight >= 1 && weight <= 1000)
+      || (style !== 'normal' && style !== 'italic')) continue;
     const source = localNames.map(quoteLocalName).join(', ');
     const normalizedFamily = normalizeLocalFontMetricFamily(family);
     const signature = `local-face:${source}:${weight}:${style}`;

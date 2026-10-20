@@ -39,7 +39,7 @@ export type {
   OoxmlResourceMetricsCheckpoint,
   OoxmlResourcePolicySnapshot,
 } from '@silurus/ooxml-core';
-// Application-supplied model sources (OoxmlNodeSessionOptions.modelSources).
+// Application-supplied model sources (each format's opt-in source option).
 export type {
   ModelSource,
   ModelSourceConfig,
@@ -52,11 +52,14 @@ export type {
 } from '@silurus/ooxml-core';
 export {
   OoxmlDecodedImageLimitError,
+  OoxmlError,
+  type OoxmlErrorCode,
   OoxmlResourceLimitError,
   isOoxmlDecodedImageLimitError,
   type OoxmlDecodedImageLimitMetric,
   type OoxmlResourceLimit,
   type OoxmlResourceLimitErrorDetails,
+  type OoxmlUnsupportedContentDetails,
   type OoxmlResourceLimits,
   type OoxmlResourceUsageSnapshot,
   type XlsxWorksheetLimits,

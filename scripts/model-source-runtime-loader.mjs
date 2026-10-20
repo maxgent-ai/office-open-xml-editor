@@ -14,7 +14,7 @@ export async function load(url, context, nextLoad) {
   const result = await nextLoad(url, context);
   const source = typeof result.source === 'string' ? result.source
     : result.source ? Buffer.from(result.source).toString('utf8') : '';
-  if (source.includes('ooxml-model-source-module/v1')
+  if (source.includes('ooxml-model-source-module/v2')
     || source.includes('model source view default')) {
     appendFileSync(process.env.OOXML_SOURCE_REQUEST_LOG, `${url}\n`);
   }

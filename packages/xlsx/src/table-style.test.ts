@@ -1,84 +1,135 @@
 import { describe, it, expect } from 'vitest';
-import { renderViewport, tableOverlayBorder, type TableCellStyle } from './renderer.js';
-import type { CellFont, Dxf, PivotTableMetadata, Styles, Worksheet } from './types.js';
+import { renderViewport } from './renderer.js';
+import { buildStructuredStyleMap } from './pivot-style.js';
+import type { CellFont, Dxf, PivotTableMetadata, PivotTableStyleElement, Styles, TableInfo, Worksheet } from './types.js';
 
 /**
- * Regression tests for spurious table borders on *custom* `<tableStyle>`s
- * (ECMA-376 §18.8.83 / §18.5.1.2).
- *
- * A custom style contributes only the dxfs of its declared
- * `<tableStyleElement>`s. When none of those dxfs define a border, Excel draws
- * no table-level border at all — the only structure lines come from theme
- * borders baked into each cell `xf`. The renderer previously synthesized
- * accent-colored rules in that case (an approximation meant only for built-in
- * `TableStyle{Light,Medium,Dark}N` styles whose definitions are absent from the
- * file), which produced gray lines Excel never draws (sample-6 B23:E23 etc.).
+ * Table style layering (ECMA-376 §18.8.41 Table Style Element Order over the
+ * §18.18.77 Table regions; [MS-XLS] 2.5.176 gating). Built-in and custom
+ * styles arrive alike as inline elements (`styleElements`).
  */
+describe('table style element layering', () => {
+  const fill = (color: string): Dxf => ({
+    font: null, border: null,
+    fill: { patternType: 'solid', fgColor: color, bgColor: color },
+  } as unknown as Dxf);
+  const edge = { style: 'thin', color: '#000000' };
+  const element = (kind: string, dxf: Dxf, size = 1): PivotTableStyleElement => ({ kind, size, dxf });
+  const table = (over: Partial<TableInfo>, styleElements: PivotTableStyleElement[]): Worksheet => ({
+    tables: [{
+      range: { top: 1, left: 1, bottom: 6, right: 4 }, styleName: 'S', headerRowCount: 1, totalsRowCount: 1,
+      showRowStripes: true, showColumnStripes: true, showFirstColumn: true, showLastColumn: true,
+      accentColor: '#808080', columns: [], styleElements, ...over,
+    }],
+  } as unknown as Worksheet);
+  const fg = (map: ReturnType<typeof buildStructuredStyleMap>, r: number, c: number) =>
+    (map.get(`${r}:${c}`)?.fill as { fgColor?: string } | undefined)?.fgColor;
 
-function cell(overrides: Partial<TableCellStyle>): TableCellStyle {
-  return {
-    accent: '#808080',
-    isCustom: false,
-    isHeader: false,
-    isTotals: false,
-    isBanded: false,
-    isFirstCol: false,
-    isLastCol: false,
-    isTopEdge: false,
-    isBottomEdge: false,
-    ...overrides,
-  };
-}
-
-const borderDxf: Dxf = {
-  font: null,
-  fill: null,
-  border: { left: null, right: null, top: null, bottom: { style: 'thin', color: '#000000' } },
-};
-
-describe('tableOverlayBorder', () => {
-  it('custom style with no border dxf draws nothing (no accent synthesis)', () => {
-    // sample-6: custom "交通費" header row, dxf has fill only, no border.
-    const ts = cell({ isCustom: true, isHeader: true, isTopEdge: true });
-    const overlay = tableOverlayBorder(ts, undefined, undefined, 0);
-    expect(overlay.kind).toBe('none');
+  it('applies the elements in the Table style element order', () => {
+    const map = buildStructuredStyleMap(table({}, [
+      // Listed in reverse: the order of application is the spec's, not the file's.
+      element('lastTotalCell', fill('#00000C')),
+      element('firstHeaderCell', fill('#000009')),
+      element('totalRow', fill('#000008')),
+      element('headerRow', fill('#000007')),
+      element('firstColumn', fill('#000006')),
+      element('lastColumn', fill('#000005')),
+      element('firstRowStripe', fill('#000003')),
+      element('firstColumnStripe', fill('#000001')),
+      element('wholeTable', fill('#000000')),
+    ]));
+    expect(fg(map, 1, 1)).toBe('#000009'); // first header cell
+    expect(fg(map, 1, 2)).toBe('#000007'); // header row
+    expect(fg(map, 6, 4)).toBe('#00000C'); // last total cell
+    expect(fg(map, 6, 2)).toBe('#000008'); // total row
+    expect(fg(map, 2, 1)).toBe('#000006'); // first column over the stripes
+    expect(fg(map, 2, 4)).toBe('#000005'); // last column
+    expect(fg(map, 2, 3)).toBe('#000003'); // row stripe over column stripe
+    expect(fg(map, 3, 3)).toBe('#000001'); // second row band: column stripe
+    expect(fg(map, 3, 2)).toBe('#000000'); // second band of both: whole table
   });
 
-  it('custom style with no border dxf on a data row draws nothing', () => {
-    const ts = cell({ isCustom: true, isBanded: true });
-    const overlay = tableOverlayBorder(ts, undefined, undefined, 2);
-    expect(overlay.kind).toBe('none');
+  it('gates first/last column and the stripes by tableStyleInfo, not the end cells', () => {
+    const map = buildStructuredStyleMap(table(
+      { showRowStripes: false, showColumnStripes: false, showFirstColumn: false, showLastColumn: false },
+      [
+        element('wholeTable', fill('#000000')),
+        element('firstRowStripe', fill('#000003')),
+        element('firstColumnStripe', fill('#000001')),
+        element('firstColumn', fill('#000006')),
+        element('firstHeaderCell', fill('#000009')),
+      ],
+    ));
+    expect(fg(map, 2, 1)).toBe('#000000');
+    expect(fg(map, 1, 1)).toBe('#000009');
   });
 
-  it('custom style WITH a header-row border dxf draws that border', () => {
-    const ts = cell({ isCustom: true, isHeader: true });
-    const overlay = tableOverlayBorder(ts, undefined, borderDxf, 0);
-    expect(overlay.kind).toBe('dxf');
-    if (overlay.kind === 'dxf') {
-      expect(overlay.border.bottom?.style).toBe('thin');
-    }
+  it('honours stripe band sizes over the data body only', () => {
+    const map = buildStructuredStyleMap(table({ showColumnStripes: false, totalsRowCount: 0 }, [
+      element('firstRowStripe', fill('#000003'), 2),
+      element('secondRowStripe', fill('#000004')),
+    ]));
+    expect([1, 2, 3, 4, 5, 6].map((r) => fg(map, r, 2))).toEqual(
+      [undefined, '#000003', '#000003', '#000004', '#000003', '#000003'],
+    );
   });
 
-  it('built-in style with no border dxf still synthesizes accent rules', () => {
-    // Built-in TableStyleLight* etc. are not in the file; the accent
-    // approximation must remain until we ship a real preset catalog.
-    const ts = cell({ isCustom: false, isHeader: true, isTopEdge: true, accent: '#4472C4' });
-    const overlay = tableOverlayBorder(ts, undefined, undefined, 0);
-    expect(overlay.kind).toBe('accent');
-    if (overlay.kind === 'accent') {
-      expect(overlay.color).toBe('#4472C4');
-      expect(overlay.topEdge).toBe(true);
-    }
+  it('bands the visible rows only, around a hidden data row', () => {
+    const ws = table({ showColumnStripes: false, totalsRowCount: 0 }, [
+      element('firstRowStripe', fill('#000003')),
+    ]) as Worksheet & { rows: unknown[] };
+    (ws as unknown as { rows: unknown[] }).rows = [{ index: 2, hidden: true, cells: [] }];
+    const map = buildStructuredStyleMap(ws);
+    expect([2, 3, 4, 5, 6].map((r) => fg(map, r, 2))).toEqual(
+      [undefined, '#000003', undefined, '#000003', undefined],
+    );
+  });
+
+  it('draws region border edges on the outline and horizontal/vertical inside', () => {
+    const border = {
+      font: null, fill: null,
+      border: { left: edge, right: edge, top: edge, bottom: edge, horizontal: { style: 'dashed', color: '#000000' } },
+    } as unknown as Dxf;
+    const map = buildStructuredStyleMap(table({ showRowStripes: false, showColumnStripes: false }, [
+      element('wholeTable', border),
+    ]));
+    expect(map.get('1:2')?.top?.style).toBe('thin');
+    expect(map.get('1:2')?.bottom?.style).toBe('dashed');
+    expect(map.get('6:2')?.bottom?.style).toBe('thin');
+    expect(map.get('3:1')?.left?.style).toBe('thin');
+    expect(map.get('3:2')?.left).toBeUndefined();
+  });
+
+  it('lets an explicit automatic color clear an earlier element color', () => {
+    const blue = { font: { color: '#0000FF' }, fill: null, border: null } as unknown as Dxf;
+    const auto = { font: { color: null }, fontToggles: { automaticColor: true }, fill: null, border: null } as unknown as Dxf;
+    const map = buildStructuredStyleMap(table({}, [element('wholeTable', blue), element('headerRow', auto)]));
+    expect(map.get('1:2')?.fontColor).toBeUndefined();
+    expect(map.get('1:2')?.fontColorAuto).toBe(true);
+    expect(map.get('2:2')?.fontColor).toBe('#0000FF');
+  });
+
+  it('paints a style element solid fill with its bgColor', () => {
+    const solid = {
+      font: null, border: null, fill: { patternType: 'solid', fgColor: '#D9D9D9', bgColor: '#F2F2F2' },
+    } as unknown as Dxf;
+    const map = buildStructuredStyleMap(table({}, [element('wholeTable', solid)]));
+    expect(fg(map, 2, 2)).toBe('#F2F2F2');
+  });
+
+  it('resolves legacy dxf indices for a model without styleElements', () => {
+    const ws = table({ headerRowDxf: 0 } as Partial<TableInfo>, []);
+    delete (ws.tables![0] as { styleElements?: unknown }).styleElements;
+    const map = buildStructuredStyleMap(ws, [fill('#000007')]);
+    expect(fg(map, 1, 2)).toBe('#000007');
+    expect(buildStructuredStyleMap(ws).size).toBe(0);
+  });
+
+  it('applies nothing for a table without style elements', () => {
+    expect(buildStructuredStyleMap(table({}, [])).size).toBe(0);
   });
 });
 
-/**
- * Font color precedence between a custom table style (ECMA-376 §18.8.40
- * tableStyle / §18.8.41 tableStyleElement) and the cell font, as measured in
- * Excel: a cell whose font color is its own formatting (`ownFontColor`, set by
- * the parser) keeps that color, including an automatic one; any other cell
- * takes the table element's font color.
- */
 describe('custom table style font color vs the cell font', () => {
   const font = (color: string | null): CellFont => ({
     bold: false, italic: false, underline: false, strike: false, size: 11, color, name: 'Arial',
@@ -105,7 +156,8 @@ describe('custom table style font color vs the cell font', () => {
     tables: [{
       range: { top: 1, left: 1, bottom: 2, right: 3 }, styleName: 'Custom', headerRowCount: 1, totalsRowCount: 0,
       showRowStripes: false, showColumnStripes: false, showFirstColumn: false, showLastColumn: false,
-      accentColor: '#808080', isCustom: true, headerRowDxf: 0, columns: [],
+      accentColor: '#808080', isCustom: true, columns: [],
+      styleElements: [{ kind: 'headerRow', size: 1, dxf: { font: font('#00B050'), fill: null, border: null } }],
     }],
   } as unknown as Worksheet;
 
@@ -129,6 +181,48 @@ describe('custom table style font color vs the cell font', () => {
     expect(color('inherited')).toMatch(/^(#00b050|rgba\(0,176,80,1\))$/);
     expect(color('own')).toMatch(/^(#ffffff|rgba\(255,255,255,1\))$/);
     expect(color('own auto')).toMatch(/^(#000000|rgba\(0,0,0,1\))$/);
+  });
+});
+
+describe('an automatic table-element color over an inherited font color', () => {
+  it('draws automatic black, not the inherited red', () => {
+    const font = (color: string | null): CellFont => ({
+      bold: false, italic: false, underline: false, strike: false, size: 11, color, name: 'Arial',
+    });
+    const styles: Styles = {
+      fonts: [font('#FF0000')], fills: [], borders: [],
+      cellXfs: [{ fontId: 0, fillId: 0, borderId: 0, numFmtId: 0, alignH: null, alignV: null, wrapText: false }],
+      numFmts: [], dxfs: [],
+    };
+    const ws = {
+      name: 'T',
+      rows: [{ index: 1, height: null, cells: [{ row: 1, col: 1, styleIndex: 0, value: { type: 'text' as const, text: 'head' } }] }],
+      colWidths: {}, rowHeights: {}, defaultColWidth: 8.43, defaultRowHeight: 15,
+      mergeCells: [], freezeRows: 0, freezeCols: 0, conditionalFormats: [], images: [], charts: [],
+      tables: [{
+        range: { top: 1, left: 1, bottom: 2, right: 1 }, styleName: 'Custom', headerRowCount: 1, totalsRowCount: 0,
+        showRowStripes: false, showColumnStripes: false, showFirstColumn: false, showLastColumn: false,
+        accentColor: '#808080', columns: [],
+        styleElements: [
+          { kind: 'wholeTable', size: 1, dxf: { font: font('#0000FF'), fill: null, border: null } },
+          { kind: 'headerRow', size: 1, dxf: { font: font(null), fontToggles: { automaticColor: true }, fill: null, border: null } },
+        ],
+      }],
+    } as unknown as Worksheet;
+    let fillStyle = '';
+    const drawn = new Map<string, string>();
+    const noop = () => {};
+    const ctx = new Proxy({
+      canvas: { width: 400, height: 100 }, font: '11px Arial',
+      get fillStyle() { return fillStyle; }, set fillStyle(value: string) { fillStyle = value; },
+      measureText: (t: string) => ({ width: t.length * 7 }) as TextMetrics,
+      fillText: (t: string) => { drawn.set(t, fillStyle); },
+    } as Record<string | symbol, unknown>, {
+      get: (target, key) => (key in target ? target[key] : noop),
+      set: (target, key, value) => { target[key] = value; return true; },
+    }) as unknown as CanvasRenderingContext2D;
+    renderViewport(ctx, ws, styles, { row: 1, col: 1, rows: 1, cols: 1 });
+    expect(drawn.get('head')?.replace(/\s/g, '').toLowerCase()).toMatch(/^(#000000|rgba\(0,0,0,1\))$/);
   });
 });
 
@@ -185,7 +279,8 @@ describe('rich-text runs under a custom table style font color', () => {
     tables: [{
       range: { top: 1, left: 1, bottom: 2, right: 5 }, styleName: 'Custom', headerRowCount: 1, totalsRowCount: 0,
       showRowStripes: false, showColumnStripes: false, showFirstColumn: false, showLastColumn: false,
-      accentColor: '#808080', isCustom: true, wholeTableDxf: 0, columns: [],
+      accentColor: '#808080', isCustom: true, columns: [],
+      styleElements: [{ kind: 'wholeTable', size: 1, dxf: { font: font('#0070C0'), fill: null, border: null } }],
     }],
   } as unknown as Worksheet;
 

@@ -6,8 +6,7 @@
 //! `MasterBundle` → `ParsedMaster` type rename (fields unchanged).
 
 use crate::fill::{
-    parse_background, parse_blip_alpha, parse_cust_geom_with_paint, parse_fill, parse_reflection,
-    parse_xfrm,
+    parse_background, parse_cust_geom_with_paint, parse_fill, parse_reflection, parse_xfrm,
 };
 use crate::shape::{
     extract_decorative_shapes, resolve_picture_shape_properties, PictureShapeProperties,
@@ -238,35 +237,43 @@ impl InheritedShapeGeometry {
                     .collect()
             })
             .unwrap_or_default();
-        let adjustment = |index: usize| -> Option<f64> {
-            let expected_name = if index == 0 {
-                None
-            } else {
-                Some(format!("adj{}", index + 1))
-            };
-            gd_nodes
-                .iter()
-                .find(|n| {
-                    let name = attr(n, "name");
-                    if index == 0 {
-                        matches!(name.as_deref(), Some("adj") | Some("adj1"))
-                    } else {
-                        name == expected_name
-                    }
-                })
-                .or_else(|| gd_nodes.get(index))
-                .and_then(|gd| attr(gd, "fmla"))
-                .and_then(|fmla| fmla.strip_prefix("val ").map(str::to_owned))
-                .and_then(|value| value.parse::<f64>().ok())
-        };
-
         Some(Self {
             geometry,
             cust_geom: None,
             cust_geom_paint: None,
-            adjustments: std::array::from_fn(adjustment),
+            adjustments: std::array::from_fn(|index| preset_adjustment(&gd_nodes, index)),
         })
     }
+}
+
+/// Adjust handle `index` (0 = `adj`/`adj1`) from a `<a:prstGeom><a:avLst>`'s
+/// `<a:gd>` guides, as PowerPoint shapes and connectors read it.
+///
+/// This intentionally differs from the DOCX/XLSX
+/// `ooxml_common::preset_geometry::parse_preset_adj`: when no guide carries
+/// the handle's name, the guide at the same position is used even in a named
+/// list, and the `val` operand is not trimmed. Changing it would move shapes
+/// in decks that author only some of a multi-handle preset's guides.
+pub(crate) fn preset_adjustment(gd_nodes: &[roxmltree::Node<'_, '_>], index: usize) -> Option<f64> {
+    let expected_name = if index == 0 {
+        None
+    } else {
+        Some(format!("adj{}", index + 1))
+    };
+    gd_nodes
+        .iter()
+        .find(|n| {
+            let name = attr(n, "name");
+            if index == 0 {
+                matches!(name.as_deref(), Some("adj") | Some("adj1"))
+            } else {
+                name == expected_name
+            }
+        })
+        .or_else(|| gd_nodes.get(index))
+        .and_then(|gd| attr(gd, "fmla"))
+        .and_then(|fmla| fmla.strip_prefix("val ").map(str::to_owned))
+        .and_then(|value| value.parse::<f64>().ok())
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -2235,7 +2242,7 @@ pub(crate) fn parse_layout_placeholders(
                 image_path,
                 mime_type,
                 src_rect: parse_src_rect(bf),
-                alpha: parse_blip_alpha(bf),
+                alpha: None, /* alpha is baked by the ordered blip chain */
                 // §20.1.8.23 duotone on the layout placeholder blipFill, resolved
                 // through the theme; inherited onto the slide picture placeholder.
                 duotone: parse_blip_duotone(
@@ -2244,11 +2251,19 @@ pub(crate) fn parse_layout_placeholders(
                     ooxml_common::color::TintMode::PowerPointLinear,
                 ),
                 // CT_Blip pixel effects travel with the inherited blipFill.
-                blip_effects: parse_blip_effects(
-                    bf,
-                    &PptxSchemeResolver { theme },
-                    ooxml_common::color::TintMode::PowerPointLinear,
-                ),
+                blip_effects: {
+                    let mut effects = parse_blip_effects(
+                        bf,
+                        &PptxSchemeResolver { theme },
+                        ooxml_common::color::TintMode::PowerPointLinear,
+                    );
+                    ooxml_common::blip::resolve_blip_effect_images(&mut effects, &mut |rid| {
+                        layout_rels
+                            .get(rid)
+                            .map(|target| resolve_path(layout_part, target))
+                    });
+                    effects
+                },
             })
         });
 
@@ -2795,12 +2810,13 @@ pub(crate) struct EffectiveMaster {
 /// has no `/theme` relationship of its own (keeps simple single-theme decks and
 /// malformed packages working).
 ///
-/// TODO: themeOverride (slide/layout `/themeOverride`, ECMA-376 §14.2.7) is not
-/// yet honored — overrides on the layout or slide would replace parts of the
-/// master theme. Out of scope for per-slide master resolution.
+/// A slide/layout theme override supplies `effective_theme` before extraction:
+/// fonts and style-matrix recipes in inherited master content must be resolved
+/// again as well as colors (CT_BaseStylesOverride, §20.1.6.12).
 pub(crate) fn build_master_bundle(
     master_path: &str,
     fallback_theme: &PptxTheme,
+    effective_theme: Option<&PptxTheme>,
     default_text_style_xml: Option<&str>,
     zip: &mut PptxZip,
 ) -> ParsedMaster {
@@ -2832,10 +2848,12 @@ pub(crate) fn build_master_bundle(
     // presentation theme when the master declares no /theme relationship.
     let theme_path: Option<String> =
         find_rel_target_by_type(&master_rels_xml, "/theme").map(|t| resolve_path(&master_part, &t));
-    let mut theme = theme_path
-        .as_deref()
-        .map(|path| parse_theme_part(path, zip))
-        .unwrap_or_else(|| fallback_theme.clone());
+    let mut theme = effective_theme.cloned().unwrap_or_else(|| {
+        theme_path
+            .as_deref()
+            .map(|path| parse_theme_part(path, zip))
+            .unwrap_or_else(|| fallback_theme.clone())
+    });
     // Bake the master's <p:clrMap> logical-name → slot mapping into the theme.
     bake_clr_map(&mut theme, master_xml_opt.as_deref());
 

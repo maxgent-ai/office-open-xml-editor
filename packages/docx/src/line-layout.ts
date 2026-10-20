@@ -12,10 +12,9 @@ export { gridCharDeltaPx, eaGlyphCount, gridSegDeltaPx, segmentCharacterGridDelt
 export { rubyAscentReservePx } from './line-breaker/ruby-metrics.js';
 export { ARABIC_SUBSTITUTE_FONTS, NASKH_SERIF_ARABIC_FONTS, isArabicSubstituteFont, quoteAll, ARABIC_TAIL_SANS, sansTail, serifTail, fontFamilyNormalizeCache, fontFamilyPitchesByClasses, fontClassesWithPitches, normalizeFontFamily, normalizeFontFamilyUncached, buildFont, segmentIntendedSingleLinePx, segmentEastAsiaFloorSingleLinePx, getDefaultFontSize, getDefaultFontFamily } from './line-breaker/font-routes.js';
 export { docGridLineCells, eastAsianGridCountSinglePx, lineBoxHeight, emptyLineNaturalPx, type MarkLineMetrics, paragraphMarkLineMetrics, paragraphMarkLineHeight, lineBelowBaselinePx, paragraphMarkBelowBaselinePt } from './line-breaker/line-metrics.js';
-export { splitSmallCapsCase, type NoteNumbering, formatNoteNumber, findNearbyFontSize, resolveFieldText, mathPlainText, hasCJKBreakOpportunity, isRtlBidiLang, splitByComplexScript, splitByEastAsia, splitDigitGroups, splitTextForLayout } from './line-breaker/text-runs.js';
+export { splitSmallCapsCase, type NoteNumbering, formatNoteNumber, findNearbyFontSize, resolveFieldText, hasCJKBreakOpportunity, isRtlBidiLang, splitByComplexScript, splitByEastAsia, splitDigitGroups, splitTextForLayout } from './line-breaker/text-runs.js';
 export { fitCJKPrefix } from './line-breaker/fit-search.js';
 export { DEFAULT_TAB_PT, resolveDefaultTabPt, type BidiTabItem, type BidiTabResult, layoutBidiTabStops } from './line-breaker/tabs.js';
-export { kinsokuRulesEquivalent } from './line-breaker/kinsoku.js';
 export { buildSegments } from './line-breaker/segment-builder.js';
 
 export function layoutLines(

@@ -1,5 +1,7 @@
+import { counterRotatedFillTransform } from './fill-frame';
 import type { GradientFill, GradientStop } from '../types/common';
 import { createAuxCanvasForContext } from '../canvas/aux-canvas';
+import { brushSurfaceUnavailable } from '../canvas/strict-brush-surface';
 
 /** Append the fill-bearing outline; coordinates belong to the supplied box.
  * The caller owns beginPath. Decorative, unfilled paths must be excluded. */
@@ -11,27 +13,15 @@ export interface ShadeBox { x: number; y: number; w: number; h: number }
 type Point = [number, number];
 type Matrix = [number, number, number, number, number, number];
 
-// Resource policy, not an OOXML rule: at most 512² raster pixels. Exact
-// row intersections of bilinear bands avoid probing their bounding boxes.
-// For E flattened edges, R <= 512 rows and P <= 512² pixels, geometry work is
-// O(N + E R (log(E + 1) + alpha(P)) + P alpha(P)):
-// focus crossings are sorted per row,
-// N is input outline work; E <= 32768 after the explicit support budget.
-// Each band has constant-degree row extrema, and successor links remove
-// assigned pixels. Geometry memory is O(N + P); no shade geometry is
-// clustered or cached. Stop sorting/ramp construction is separate.
-// This is an inherent additive cost over main's native point-focus brush,
-// not a constant-factor latency promise. A sequential Node/Skia resolve-only
-// probe at 512px with 32768 alternating-radius edges measured medians of
-// 0.14s (center), 0.35s (corner), 0.45s (outside-area focus) after replacing
-// rational extrema with shared-edge scans for convex bands. The previous
-// renderer measured 1.00s/2.20s/2.25s in the same three-run comparison.
-// Hardware-dependent times include outline traversal and raster generation,
-// not the subsequent paint; folded bands still require rational extrema.
-// Work guards cover the maximum supported edge count and reject larger inputs
-// before raster allocation. Tiled paints retain the native brush entirely.
+// Resource policy, not an OOXML rule: at most 512² raster pixels. For E
+// flattened edges, R <= 512 rows and P <= 512² pixels, scanline geometry work
+// is O(N + E R log(E + 1) + (E R + P) alpha(P)); memory is O(N + P).
+// Reading the authored outline necessarily costs O(N). Increasing its edge
+// count never increases raster size or the number of successful pixel solves:
+// successor sets assign each pixel once, without an E × P shading loop.
+// ECMA-376 §20.1.8.46 does not limit path complexity: keep the authored field
+// for every edge count rather than substituting a circular gradient.
 const MAX_EDGE = 512;
-const EDGE_LIMIT = 32768;
 const MARGIN = 2;
 const BEZIER_SEGMENTS = 16;
 const ARC_STEP = Math.PI / 32;
@@ -222,7 +212,7 @@ export function isStrictlyStarShaped(polygons: Point[][], center: Point, box: Sh
  * regions, but do not determine a replacement region for negative extents.
  * Preserve the previous native midpoint approximation for this input class;
  * choosing a collapse point requires new Office boundary evidence (#1599). */
-export function hasInvertedPathShadeFocus(fill: GradientFill): boolean {
+function hasInvertedPathShadeFocus(fill: GradientFill): boolean {
   const rect = fill.fillToRect;
   return !!rect && ((rect.l ?? 0) + (rect.r ?? 0) > 1 || (rect.t ?? 0) + (rect.b ?? 0) > 1);
 }
@@ -366,7 +356,7 @@ function convexRowSpan(polygon: Point[], y: number): Array<[number, number]> {
  * crossings and the denominator zero; extrema are endpoints or roots of
  * the quadratic derivative. This includes folded bands' interior envelope,
  * which a quadrilateral bounding-box/edge crossing scan misses. */
-export function bandRowSpans(corners: Point[], y: number): Array<[number, number]> {
+function bandRowSpans(corners: Point[], y: number): Array<[number, number]> {
   const [a, b, outerB, outerA] = corners;
   const ax = outerA[0] - a[0]; const ay = outerA[1] - a[1];
   const bx = b[0] - a[0]; const by = b[1] - a[1];
@@ -456,7 +446,8 @@ export function bandRowSpans(corners: Point[], y: number): Array<[number, number
  * and is a library support boundary, not an Office brush classifier.
  * Unsupported outlines keep the previous path-specific native resolver;
  * adjustment/aspect/topology boundaries lack live Office evidence (#1599).
- * Rotation framing also keeps the previous local frame pending live evidence.
+ * ECMA-376 §20.1.8.33 applies rotWithShape to every gradient style, including
+ * path shades (§20.1.8.46); counter-rotate the complete field when false.
  * Returns null when the host cannot allocate the shade raster.
  */
 export function resolvePathShade(
@@ -464,6 +455,7 @@ export function resolvePathShade(
   frame: ShadeBox, shapeBox: ShadeBox, outline?: FillOutline,
   paintBounds?: ShadeBox,
   work?: ShadeWork,
+  rotation = 0,
 ): CanvasPattern | null {
   if (hasInvertedPathShadeFocus(fill)) return null;
   const focus = pathShadeFocusRect(fill);
@@ -484,9 +476,6 @@ export function resolvePathShade(
     && box.w > 0 && box.h > 0)) return null;
   if (typeof ctx.getTransform !== 'function' || fill.stops.length === 0) return null;
   const outlinePolygons = outline ? flattenFillOutline(outline, ctx, shapeBox) : [];
-  // Explicit resource policy: above this edge budget retain main's native
-  // circle approximation. Never cluster geometry or silently alter its shape.
-  if (outlinePolygons.reduce((n, polygon) => n + polygon.length, 0) > EDGE_LIMIT) return null;
   const coverage = outlinePolygons.length > 0 ? outlinePolygons : [rectangle(shapeBox)];
   // Host topology constrains rect shades too: rect only changes the field,
   // not the evidence boundary. Non-kernel outlines (arrows, chevrons, holes,
@@ -509,7 +498,19 @@ export function resolvePathShade(
   // The authored shade frame stays separate from these raster bounds.
   const painted = boundsOf([...coverageField.flat(), ...rectangle(fieldFrame)]
     .map(p => apply(user, p[0], p[1])));
-  const device = paintBounds ? boundsOf([...rectangle(painted), ...rectangle(paintBounds)]) : painted;
+  let device = paintBounds ? boundsOf([...rectangle(painted), ...rectangle(paintBounds)]) : painted;
+  if (rotation !== 0) {
+    // The non-repeating brush must cover the clipped shape after its paint
+    // frame counter-rotates. Include the inverse-rotated coverage; outside
+    // the authored shade contour the field already uses the final stop.
+    const expanded = rectangle(device).map(point => {
+      const local = apply(userInverse, point[0], point[1]);
+      const turned = counterRotatedFillTransform({ e: local[0], f: local[1] },
+        -rotation, shapeBox.x + shapeBox.w / 2, shapeBox.y + shapeBox.h / 2);
+      return apply(user, turned.e ?? local[0], turned.f ?? local[1]);
+    });
+    device = boundsOf([...rectangle(device), ...expanded]);
+  }
   if (![device.x, device.y, device.w, device.h].every(Number.isFinite)) return null;
   const k = Math.min(1, (MAX_EDGE - 2 * MARGIN - 1) / Math.max(device.w, 1e-9),
     (MAX_EDGE - 2 * MARGIN - 1) / Math.max(device.h, 1e-9));
@@ -531,7 +532,7 @@ export function resolvePathShade(
   const target = surface?.getContext('2d') as CanvasRenderingContext2D | null | undefined;
   const stops = [...fill.stops].sort((a, b) => a.position - b.position);
   const ramp = colorTable(ctx, stops);
-  if (!surface || !target || !ramp || typeof target.createImageData !== 'function') return null;
+  if (!surface || !target || !ramp || typeof target.createImageData !== 'function') return brushSurfaceUnavailable();
   const first = rgba(stops[0].color);
   const last = rgba(stops[stops.length - 1].color);
   // Keep the solver's double precision: Float32 can round s<1 to exactly 1
@@ -661,10 +662,18 @@ export function resolvePathShade(
   }
   target.putImageData(pixels, 0, 0);
   const pattern = ctx.createPattern(surface, 'no-repeat');
-  if (!pattern || typeof pattern.setTransform !== 'function') return null;
+  if (!pattern || typeof pattern.setTransform !== 'function') return brushSurfaceUnavailable();
   const auxToUser = multiply(userInverse, auxToDevice);
-  pattern.setTransform({
+  pattern.setTransform(counterRotatedFillTransform({
     a: auxToUser[0], b: auxToUser[1], c: auxToUser[2], d: auxToUser[3], e: auxToUser[4], f: auxToUser[5],
-  });
+  }, rotation, shapeBox.x + shapeBox.w / 2, shapeBox.y + shapeBox.h / 2));
   return pattern;
+}
+
+/** Conservative peak of this painter's bounded raster workspace: backing +
+ * ImageData + Float64 shade + two Int32 successor grids + Uint8 rank, and
+ * the 1024-color canvas/readback ramp. Callers with a whole-pipeline image
+ * quota charge this before calling resolveFill. */
+export function pathShadeWorkspaceBytes(): number {
+  return MAX_EDGE * MAX_EDGE * (4 + 4 + 8 + 4 + 4 + 1) + MAX_EDGE * (4 + 4 + 1) + 1024 * 8;
 }

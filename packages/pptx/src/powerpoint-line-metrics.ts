@@ -1,5 +1,7 @@
-import { findReferenceFontMetrics } from '@silurus/ooxml-core';
+import { findReferenceFontMetrics, SYNTHETIC_ASCENT_EM, SYNTHETIC_DESCENT_EM } from '@silurus/ooxml-core';
+import { ownValue } from '@silurus/ooxml-core/internal/own-key';
 import { excelDrawingMlLineRatios } from '@silurus/ooxml-core/internal/office-auto-line';
+import type { FontDecorationGeometry } from '@silurus/ooxml-core/internal/font-decoration';
 
 /**
  * PowerPoint's split of a text line at its baseline (observed behaviour; the
@@ -7,7 +9,9 @@ import { excelDrawingMlLineRatios } from '@silurus/ooxml-core/internal/office-au
  * sits inside a line).
  *
  * PowerPoint for Mac 16.113.2 PDF controls (#1610). Two decks with 432
- * boxes, every face verified from the embedded PDF fonts:
+ * boxes, every face verified from the embedded PDF fonts. Windows PowerPoint
+ * 16.0.20430 re-exports of all four #1610 decks (#1896) place every baseline
+ * within 0.96 pt of the Mac export (median 0.18 pt):
  * - The line box is 1.2 × the largest run size for every face.
  * - A run's ascent share of that box is usWinAscent / (usWinAscent +
  *   usWinDescent). A face that sets fsSelection USE_TYPO_METRICS uses
@@ -47,11 +51,6 @@ const OBSERVED_SUBSTITUTES: Readonly<Record<string, string>> = {
 export const SHARE_CACHE_LIMIT = 256;
 const shareCache = new Map<string, number | null>();
 
-/** @internal Test hook: current number of cached face keys. */
-export function powerPointShareCacheSize(): number {
-  return shareCache.size;
-}
-
 export function powerPointAscentShare(
   family: string,
   bold: boolean,
@@ -73,13 +72,31 @@ export function powerPointAscentShare(
   return share;
 }
 
+/**
+ * The catalogued face weight a run selects: the requested regular/bold weight
+ * when the catalog has it, else the single cut a family name selects ("Calibri
+ * Light" is weight 300; a bold run synthesizes bold on that face). Acquisition,
+ * presence keys and metric lookup share this tuple so an installed named cut is
+ * probed and recognized under the same weight. Uncatalogued names keep the
+ * requested weight (they have no catalog geometry either way).
+ */
+export function officeFaceWeight(family: string, bold: boolean, italic: boolean): number {
+  const requested = bold ? 700 : 400;
+  const name = ownValue(OBSERVED_SUBSTITUTES, family.trim().toLocaleLowerCase('en-US')) ?? family.trim();
+  if (!name) return requested;
+  const style = italic ? 'italic' : 'normal';
+  if (findReferenceFontMetrics(name, { weight: requested, style }).length > 0) return requested;
+  const named = findReferenceFontMetrics(name, { style });
+  return named.length > 0 && named.every((p) => p.weight === named[0].weight) ? named[0].weight : requested;
+}
+
 type Profile = ReturnType<typeof findReferenceFontMetrics>[number];
 
 /** The profiles of the copy PowerPoint lays the face out with (see above). */
 function chosenProfiles(family: string, bold: boolean, italic: boolean): Profile[] {
   const trimmed = family.trim();
   if (!trimmed) return [];
-  const name = OBSERVED_SUBSTITUTES[trimmed.toLocaleLowerCase('en-US')] ?? trimmed;
+  const name = ownValue(OBSERVED_SUBSTITUTES, trimmed.toLocaleLowerCase('en-US')) ?? trimmed;
   const style = italic ? 'italic' : 'normal';
   let profiles = findReferenceFontMetrics(name, { weight: bold ? 700 : 400, style });
   if (profiles.length === 0) {
@@ -176,6 +193,32 @@ function resolveExcelBox(family: string, bold: boolean, italic: boolean): ExcelL
   return box;
 }
 
+/**
+ * The face's own underline and strikethrough geometry (post / OS/2) of the
+ * copy PowerPoint lays the face out with; undefined when that copy records
+ * none or the copies disagree.
+ */
+function resolveDecoration(family: string, bold: boolean, italic: boolean): FontDecorationGeometry | undefined {
+  let geometry: FontDecorationGeometry | undefined;
+  for (const profile of chosenProfiles(family, bold, italic)) {
+    const decoration = profile.decoration;
+    if (!decoration || !(profile.unitsPerEm > 0)) return undefined;
+    const [underlinePosition, underlineThickness, strikeoutPosition, strikeoutSize] = decoration;
+    if (!(underlineThickness > 0) || !(strikeoutSize > 0) || !(strikeoutPosition > 0)) return undefined;
+    const em = profile.unitsPerEm;
+    const next = {
+      underlineTopEm: -underlinePosition / em,
+      underlineThicknessEm: underlineThickness / em,
+      strikeTopEm: -strikeoutPosition / em,
+      strikeThicknessEm: strikeoutSize / em,
+    };
+    if (geometry && (Object.keys(next) as (keyof FontDecorationGeometry)[])
+      .some((key) => Math.abs(geometry![key] - next[key]) > 1e-12)) return undefined;
+    geometry = Object.freeze(next);
+  }
+  return geometry;
+}
+
 /** A face's natural line box as em ratios. */
 export interface ExcelLineBox {
   ascent: number;
@@ -195,6 +238,10 @@ export interface PowerPointFaceMetrics {
   readonly glyph: ExcelLineBox | undefined;
   /** #1604 natural box, used under an explicit compatLnSpc="0". */
   readonly excel: ExcelLineBox | undefined;
+  /** The face's own underline / strikethrough geometry (see
+   * `resolveDecoration`). Windows PowerPoint 16.0.20430 draws single
+   * underline and strikethrough from it (#1896 controls). */
+  readonly decoration: FontDecorationGeometry | undefined;
 }
 
 const faceCache = new Map<string, PowerPointFaceMetrics | null>();
@@ -220,6 +267,7 @@ export function powerPointFaceMetrics(
   const metrics = share === undefined ? null
     : Object.freeze({
       share, glyph: resolveGlyphBox(family, bold, italic), excel: resolveExcelBox(family, bold, italic),
+      decoration: resolveDecoration(family, bold, italic),
     });
   faceCache.set(key, metrics);
   if (faceCache.size > SHARE_CACHE_LIMIT) {
@@ -255,7 +303,7 @@ export function powerPointNaturalLine(runs: readonly PowerPointLineRun[]): { asc
     descent = Math.max(descent, 1.2 * run.sizePx * (1 - run.share));
   }
   const height = 1.2 * maxSize;
-  if (!(ascent + descent > 0)) return { ascent: height * 0.8, descent: height * 0.2 };
+  if (!(ascent + descent > 0)) return { ascent: height * SYNTHETIC_ASCENT_EM, descent: height * SYNTHETIC_DESCENT_EM };
   const a = height * ascent / (ascent + descent);
   return { ascent: a, descent: height - a };
 }

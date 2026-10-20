@@ -1,6 +1,7 @@
 import type { Shadow, SoftEdge, Reflection } from '../types/common';
 import { hexToRgba } from './paint';
 import { createAuxCanvas, type AuxCanvas, type AuxContext } from '../canvas/aux-canvas';
+import { clampCanvasSize } from '../canvas/clamp';
 
 // createAuxCanvas moved to canvas/aux-canvas.ts so the image/ metafile players
 // can share it without an image → shape dependency. Re-exported here to preserve
@@ -28,6 +29,63 @@ export { createAuxCanvas };
  */
 
 export type PaintShape = (ctx: AuxContext) => void;
+
+let rasterCoverageWarned = false;
+function rasterCoverageUnavailable(): null {
+  // Match the scene3d fallback warning: report degradation once per process,
+  // without flooding the console for every affected shape or chart mark.
+  if (!rasterCoverageWarned && typeof console !== 'undefined' && typeof console.warn === 'function') {
+    rasterCoverageWarned = true;
+    console.warn('[ooxml] effects: geometric coverage canvas unavailable or exceeds canvas limits; ' +
+      'soft edge and inner shadow omitted; the original body is still painted.');
+  }
+  return null;
+}
+
+/** Make a dedicated opaque geometric mask from a complete painted raster.
+ * Raster policy: every nonzero-alpha sample belongs to the visible geometry;
+ * zero-alpha samples remain holes. Source color and opacity are not coverage.
+ * This preserves walls, wire rims, contours and transparent image holes without
+ * inventing a second front-face geometry. Subpixel coverage cannot be recovered
+ * separately from opacity in an RGBA source, so this is binary raster support,
+ * not a claim of exact vector antialiasing or Office mesh fidelity.
+ * `bbox` must cover the consumer's entire source raster, including strokes,
+ * joins/caps and effect padding, rather than just vector geometry. Use
+ * rasterEffectCoverageBounds when the consumer is a cropped edge effect.
+ * The bounded mask belongs to this paint call; allocation failure warns once
+ * and lets callers omit mask-dependent effects while painting the original body.
+ */
+export function createRasterCoveragePaint(
+  paint: PaintShape,
+  bbox: EffectBBox,
+): PaintShape | null {
+  // bbox is the consumer's complete source domain, including its effect
+  // padding and viewport clipping. Round out to cover its raster samples, but
+  // do not add another guard outside that domain: those pixels cannot reach
+  // the consumer, and would reject sources at the canvas area/axis limit.
+  // The size guard is library resource policy, not a DrawingML effect rule.
+  const x = Math.floor(bbox.x), y = Math.floor(bbox.y);
+  const w = Math.max(1, Math.ceil(bbox.x + bbox.w) - x);
+  const h = Math.max(1, Math.ceil(bbox.y + bbox.h) - y);
+  if (clampCanvasSize(w, h).clamped) return rasterCoverageUnavailable();
+  let canvas: AuxCanvas | null;
+  try { canvas = createAuxCanvas(w, h); } catch { return rasterCoverageUnavailable(); }
+  const ctx = canvas ? get2d(canvas) : null;
+  if (!canvas || !ctx) return rasterCoverageUnavailable();
+  paint(offsetPaintCtx(ctx, { x, y, w, h }));
+  const image = ctx.getImageData(0, 0, w, h);
+  for (let i = 0; i < image.data.length; i += 4) {
+    image.data[i] = image.data[i + 1] = image.data[i + 2] = 0;
+    image.data[i + 3] = image.data[i + 3] > 0 ? 255 : 0;
+  }
+  ctx.putImageData(image, 0, 0);
+  return target => {
+    target.save();
+    target.setTransform({ a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 } as DOMMatrix);
+    target.drawImage(canvas as CanvasImageSource, x, y);
+    target.restore();
+  };
+}
 
 /** Bounding box of the shape in device pixels (post-scale). */
 export interface EffectBBox {
@@ -118,6 +176,42 @@ function computeCrop(
   const x1 = Math.min(deviceW, Math.ceil(bbox.x + bbox.w + margin));
   const y1 = Math.min(deviceH, Math.ceil(bbox.y + bbox.h + margin));
   return { x: x0, y: y0, w: Math.max(1, x1 - x0), h: Math.max(1, y1 - y0) };
+}
+
+function softEdgeMargin(softEdge: SoftEdge, scale: number): number {
+  return Math.ceil(emuToPx(softEdge.radius, scale)) + 2;
+}
+
+function innerShadowMargin(shadow: Shadow, scale: number): number {
+  return Math.ceil(3 * emuToPx(shadow.blur, scale) + Math.abs(emuToPx(shadow.dist, scale))) + 2;
+}
+
+/**
+ * Union of the source domains read by the mask-dependent edge effects.
+ * ECMA-376 §§20.1.8.40/.53 apply to the painted object, including its outline.
+ * A geometry bbox (even expanded by half the line width) need not contain a
+ * miter join, square cap, arrowhead or contour. Capture all raster support in
+ * the consumers' source domains instead of imposing a second, tighter clip.
+ * This also handles callbacks whose actual line style is resolved while painting.
+ *
+ * These are the existing compositor crops, not newly inferred vector bounds:
+ * pixels outside them were already unavailable to the effects. Keep that crop
+ * policy and effect alignment/stretch unchanged; the coverage conversion must
+ * preserve every previously available source pixel. Projected callers retain
+ * their prepared body/cache bounds, including walls, back rims and padding.
+ */
+export function rasterEffectCoverageBounds(
+  bbox: EffectBBox,
+  effects: { softEdge?: SoftEdge | null; innerShadow?: Shadow | null },
+  scale: number,
+  deviceW: number,
+  deviceH: number,
+): EffectBBox {
+  const margin = Math.max(
+    effects.softEdge ? softEdgeMargin(effects.softEdge, scale) : 0,
+    effects.innerShadow ? innerShadowMargin(effects.innerShadow, scale) : 0,
+  );
+  return computeCrop(bbox, margin, deviceW, deviceH);
 }
 
 /** The subset of a 2D affine matrix `setTransform(m)` reads (DOMMatrix-shaped). */
@@ -258,9 +352,8 @@ export function applyOuterShadow(
  * covered by an offset copy of the shape — i.e. it hugs the inside of the edge
  * opposite the offset direction.
  *
- * Construction (all on an auxiliary canvas the size of the live canvas so the
- * shadow can bleed up to `blur` px past the silhouette before being clipped):
- *   1. Paint the silhouette filled with the shadow colour.
+ * Construction (on cropped device-space surfaces with effect padding):
+ *   1. Capture the silhouette, then recolour it with the shadow colour.
  *   2. `destination-out` an offset + blurred copy of the silhouette. What
  *      remains is a blurred crescent inside the original edge — the inner shadow.
  *   3. `destination-in` the (un-offset, un-blurred) silhouette so the shadow is
@@ -294,36 +387,34 @@ export function applyInnerShadow(
   // edge) is fully represented within bbox + (|dist| + 3·blur). +2 px guards the
   // fractional-pixel silhouette edge. The step-3 destination-in additionally clips
   // the result to the interior (⊆ bbox), so nothing outside the crop survives.
-  const margin = Math.ceil(3 * blur + Math.abs(dist)) + 2;
+  const margin = innerShadowMargin(shadow, scale);
   const crop = computeCrop(bbox, margin, deviceW, deviceH);
   const aux = createAuxCanvas(crop.w, crop.h);
   if (!aux) return;
   const cReal = get2d(aux);
   if (!cReal) return;
-  const c = offsetPaintCtx(cReal, crop);
+  const maskAux = createAuxCanvas(crop.w, crop.h);
+  const mc = maskAux ? get2d(maskAux) : null;
+  if (!maskAux || !mc) return;
+  // Paint geometry once. Callbacks own their fillStyle and absolute transform;
+  // setting shadow color or translating before replaying them would be undone.
+  // Apply color and offset/blur to the captured raster at identity instead.
+  paintShape(offsetPaintCtx(mc, crop));
 
-  // 1. Silhouette in the shadow colour.
-  c.save();
-  c.fillStyle = hexToRgba(shadow.color, shadow.alpha);
-  paintShape(c);
-  c.restore();
+  // CT_InnerShadowEffect owns its color (ECMA-376 §20.1.8.40), regardless
+  // of whether the mask callback fills a path or blits a geometric raster.
+  cReal.drawImage(maskAux as CanvasImageSource, 0, 0);
+  cReal.globalCompositeOperation = 'source-in';
+  cReal.fillStyle = hexToRgba(shadow.color, shadow.alpha);
+  cReal.fillRect(0, 0, crop.w, crop.h);
 
-  // 2. Carve out the offset + blurred copy; the leftover is the inner shadow.
-  c.save();
-  c.globalCompositeOperation = 'destination-out';
-  c.filter = blur > 0 ? `blur(${blur}px)` : 'none';
-  c.translate(dx, dy);
-  c.fillStyle = '#000';
-  paintShape(c);
-  c.restore();
-
-  // 3. Clip the surviving shadow to the shape interior.
-  c.save();
-  c.globalCompositeOperation = 'destination-in';
-  c.filter = 'none';
-  c.fillStyle = '#000';
-  paintShape(c);
-  c.restore();
+  // Carve with an offset/blurred mask, then clip to the unshifted interior.
+  cReal.globalCompositeOperation = 'destination-out';
+  cReal.filter = blur > 0 ? `blur(${blur}px)` : 'none';
+  cReal.drawImage(maskAux as CanvasImageSource, dx, dy);
+  cReal.globalCompositeOperation = 'destination-in';
+  cReal.filter = 'none';
+  cReal.drawImage(maskAux as CanvasImageSource, 0, 0);
 
   // 4. Composite over the live shape at the crop origin.
   liveCtx.save();
@@ -339,14 +430,15 @@ export function applyInnerShadow(
  *
  * Masking a hard-clipped image with a feathered silhouette would feather only
  * inward and leave a hard outer step (the image has no pixels outside the rect).
- * Instead this helper builds an OPAQUE colour layer that extends past the
- * geometry via an edge-clamp stretch, then replaces its alpha with the blurred
+ * Instead this helper extends the colour layer (with its source opacity) past
+ * the geometry via an edge-clamp stretch, then clips it to the blurred
  * silhouette — yielding a clean, symmetric Gaussian falloff. The blur std-dev is
  * `rad/3` (the soft-edge `rad` spans ~3σ), matching PowerPoint's rasterised
  * falloff.
  *
- * `paintMask` paints a flat opaque silhouette (filled path, no stroke). When
- * omitted, `paintShape` is reused (correct only for unstroked shapes).
+ * `paintMask` paints opaque geometric coverage, including any painted edges
+ * and holes, independently of source opacity. When omitted, `paintShape` is
+ * reused (correct only for an opaque body).
  */
 export function applySoftEdge(
   liveCtx: AuxContext,
@@ -369,7 +461,7 @@ export function applySoftEdge(
   // (edge-clamp bleed), so no soft-edge pixel exists past bbox + radius; the
   // radius/3-σ mask blur (≤3σ = radius extent) can only carve within that band.
   // +2 px covers the fractional silhouette edge. So `radius` is the exact reach.
-  const margin = Math.ceil(radius) + 2;
+  const margin = softEdgeMargin(softEdge, scale);
   const crop = computeCrop(bbox, margin, deviceW, deviceH);
   // bbox expressed in the cropped canvas's local coordinates.
   const bx = bbox.x - crop.x;
@@ -408,21 +500,26 @@ export function applySoftEdge(
     //    transform itself). Blurred in step (c) into the alpha ramp.
     mc.fillStyle = '#000';
     mask(mc);
-    // b. Build an OPAQUE colour layer that extends past the geometry: draw the
+    // b. Extend the colour layer past the geometry: draw the
     //    image's bbox stretched outward by `radius` (edge-clamp → border colours
     //    bleed out), then the sharp image on top to keep the interior crisp.
     //    Source/dest rects are in the cropped canvas's local space (bx,by).
-    //    Because the layer is opaque across the whole feather band, step (c)'s
-    //    destination-in yields EXACTLY the blurred-silhouette alpha — a clean,
-    //    symmetric Gaussian falloff (PowerPoint's soft edge), not a hard outer
-    //    step (image-only) nor a doubly-faded halo (blurred-image bleed).
+    //    Step (c) multiplies this source opacity by the blurred geometric
+    //    coverage, giving the existing symmetric falloff without treating
+    //    material opacity as a second geometric mask.
     cc.drawImage(
       aux as CanvasImageSource,
       bx, by, bbox.w, bbox.h,
       bx - radius, by - radius, bbox.w + radius * 2, bbox.h + radius * 2,
     );
+    // Replace the stretched layer beneath the actual geometry before drawing
+    // the sharp source. Source-over twice would raise a translucent interior's
+    // opacity, contrary to §20.1.8.53 (the fill is not affected).
+    cc.globalCompositeOperation = 'destination-out';
+    cc.drawImage(maskAux as CanvasImageSource, 0, 0);
+    cc.globalCompositeOperation = 'source-over';
     cc.drawImage(aux as CanvasImageSource, 0, 0);
-    // c. Replace alpha with the blurred silhouette → symmetric feather. The
+    // c. Attenuate source alpha by the blurred coverage → symmetric feather. The
     //    soft-edge `rad` is a blur radius spanning ~3σ (the kernel extent), so
     //    the Gaussian std-dev — which is what CSS blur() takes — is rad/3. This
     //    matches PowerPoint's rasterised falloff (measured σ ≈ rad/3).

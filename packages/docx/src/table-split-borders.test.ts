@@ -172,9 +172,9 @@ describe('mid-row page-cut border semantics (§17.4.66 conflict at the cut)', ()
     const p1H = horizontals(p1);
     // Top frame at y=0 present…
     expect(p1H.some((s) => Math.abs(s.y1 - 0) <= 1)).toBe(true);
-    // …and the cut draws the conflict winner (single ∨ single) at the
-    // retained page-local fragment bottom, including the hairline offset.
-    const expectedCutY = firstFragment.flowBounds.yPt + firstFragment.flowBounds.heightPt + 0.5;
+    // …and the cut draws the conflict winner (single ∨ single) inside the
+    // retained page-local fragment bottom (WORD_COLLAPSED_BORDER_ROW_TRACK_FOOTPRINT).
+    const expectedCutY = firstFragment.flowBounds.yPt + firstFragment.flowBounds.heightPt - 0.5;
     const cut = p1H.filter((s) => Math.abs(s.y1 - expectedCutY) <= 0.1);
     expect(cut.length).toBe(1);
     expect(Math.min(cut[0].x1, cut[0].x2)).toBeLessThanOrEqual(1);
@@ -196,7 +196,7 @@ describe('mid-row page-cut border semantics (§17.4.66 conflict at the cut)', ()
     expect(layout.pages.length).toBeGreaterThan(1);
     const p1H = horizontals(await renderPage(layout, 0));
     const firstFragment = retainedTableOnPage(layout, 0);
-    const expectedCutY = firstFragment.flowBounds.yPt + firstFragment.flowBounds.heightPt + 0.5;
+    const expectedCutY = firstFragment.flowBounds.yPt + firstFragment.flowBounds.heightPt - 0.5;
     expect(p1H.filter((s) => Math.abs(s.y1 - expectedCutY) <= 0.1)).toHaveLength(1);
   });
 
@@ -213,9 +213,8 @@ describe('mid-row page-cut border semantics (§17.4.66 conflict at the cut)', ()
 
   it('keeps the row-boundary page cut borders unchanged', async () => {
     // Three 20pt single-line rows in a 40pt page body: the cut falls BETWEEN
-    // rows (no mid-row slice) — the existing behavior (whatever the resolved
-    // row-boundary edges draw today) must not change. Pin: a horizontal rule IS
-    // drawn at the page-1 bottom (y=40) — the row's own boundary edge.
+    // rows (no mid-row slice). Pin: a horizontal rule IS drawn at the page-1
+    // fragment bottom, inside its box — the row's own boundary edge.
     const model = splitDoc([shortRow('a'), shortRow('b'), shortRow('c')], 40);
     const layout = layoutDocument(model);
     expect(layout.pages.length).toBeGreaterThan(1);
@@ -224,6 +223,7 @@ describe('mid-row page-cut border semantics (§17.4.66 conflict at the cut)', ()
 
     const p1 = await renderPage(layout, 0);
     const p1H = horizontals(p1);
-    expect(p1H.filter((s) => Math.abs(s.y1 - 40) <= 1).length).toBeGreaterThan(0);
+    const fragmentBottomPt = firstFragment.flowBounds.yPt + firstFragment.flowBounds.heightPt;
+    expect(p1H.filter((s) => Math.abs(s.y1 - (fragmentBottomPt - 0.5)) <= 0.1).length).toBeGreaterThan(0);
   });
 });

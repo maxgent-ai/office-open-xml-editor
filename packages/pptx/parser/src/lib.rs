@@ -2,7 +2,9 @@ use ooxml_common::content_types::PackageContentTypes;
 use ooxml_common::depth::{
     parse_guarded_with_node_limit, xml_dom_complexity_exceeds, GuardedParseError,
 };
-use ooxml_common::json_measurement::{measure_json, serialize_json_with_limit};
+use ooxml_common::json_measurement::{
+    measure_json, serialize_json, serialize_json_string, serialize_json_with_limit,
+};
 use ooxml_common::ns::{is_p_ns, is_r_ns};
 use ooxml_common::package_session::{
     PackageLimitReporter, PackageOperation, PackageSessionHandle, RetainedPackageOperation,
@@ -199,8 +201,7 @@ pub fn parse_pptx(
         "parse",
     )
     .map_err(pptx_parser_js_error)?;
-    serde_json::to_vec(&presentation)
-        .map_err(|e| JsValue::from_str(&format!("serialize error: {e}")))
+    serialize_json(&presentation).map_err(|e| JsValue::from_str(&format!("serialize error: {e}")))
 }
 
 /// WASM-callable markdown projection. Shares the body of `to_markdown_native`
@@ -220,7 +221,7 @@ pub fn pptx_to_markdown(
 /// Native equivalent of `parse_pptx` for use from the MCP server.
 pub fn parse_pptx_native(data: &[u8]) -> Result<String, String> {
     let presentation = parse_pptx_model_native(data)?;
-    serde_json::to_string(&presentation).map_err(|e| e.to_string())
+    serialize_json_string(&presentation).map_err(|e| e.to_string())
 }
 
 /// Native typed equivalent of `parse_pptx_native` with identical limits.
@@ -620,7 +621,7 @@ impl PptxArchive {
             shared.finish(slides).map_err(|e| e.to_string())
         })();
         let presentation = settle_pptx_operation(&mut self.archive, result)?;
-        serde_json::to_vec(&presentation).map_err(|e| format!("serialize error: {e}"))
+        serialize_json(&presentation).map_err(|e| format!("serialize error: {e}"))
     }
 
     /// Open presentation metadata without parsing any slide parts. Hidden state,
@@ -816,7 +817,7 @@ impl PptxArchive {
             .usage()
             .or(self.last_slide_usage)
             .ok_or_else(|| JsValue::from_str("slide cursor usage is unavailable"))?;
-        serde_json::to_vec(&usage)
+        serialize_json(&usage)
             .map_err(|error| JsValue::from_str(&format!("serialize error: {error}")))
     }
 
@@ -825,7 +826,7 @@ impl PptxArchive {
     /// allocator-memory estimate.
     pub fn resource_usage(&self) -> Result<Vec<u8>, JsValue> {
         let usage = self.archive.usage();
-        serde_json::to_vec(&usage)
+        serialize_json(&usage)
             .map_err(|error| JsValue::from_str(&format!("serialize error: {error}")))
     }
 
@@ -932,6 +933,7 @@ impl PptxZip {
         run: impl FnOnce(&mut Self) -> Result<T, String>,
     ) -> Result<T, String> {
         self.begin_operation(name)?;
+        let _resource_scope = self.operation()?.resource_scope()?;
         let result = run(self);
         self.operation.settle(&self.session, result)
     }
@@ -1233,13 +1235,7 @@ struct ResolvedTableCellStyle {
 //  XML helpers (roxmltree)
 // ===========================
 
-pub(crate) fn child<'a, 'i>(
-    node: roxmltree::Node<'a, 'i>,
-    local: &str,
-) -> Option<roxmltree::Node<'a, 'i>> {
-    node.children()
-        .find(|n| n.is_element() && n.tag_name().name() == local)
-}
+pub(crate) use ooxml_common::xml_node::{attr, attr_f64, attr_i64, child};
 
 pub(crate) fn children_vec<'a, 'i>(
     node: roxmltree::Node<'a, 'i>,
@@ -1250,26 +1246,12 @@ pub(crate) fn children_vec<'a, 'i>(
         .collect()
 }
 
-pub(crate) fn attr(node: &roxmltree::Node<'_, '_>, local: &str) -> Option<String> {
-    node.attributes()
-        .find(|a| a.name() == local && a.namespace().is_none())
-        .map(|a| a.value().to_owned())
-}
-
 /// Attribute in the r: (relationships) namespace — e.g. r:id, r:embed. Accepts
 /// both the Transitional and Strict (ISO/IEC 29500) relationships URIs.
 pub(crate) fn attr_r(node: &roxmltree::Node<'_, '_>, local: &str) -> Option<String> {
     node.attributes()
         .find(|a| a.name() == local && is_r_ns(a.namespace()))
         .map(|a| a.value().to_owned())
-}
-
-pub(crate) fn attr_i64(node: &roxmltree::Node<'_, '_>, local: &str) -> Option<i64> {
-    attr(node, local)?.parse().ok()
-}
-
-pub(crate) fn attr_f64(node: &roxmltree::Node<'_, '_>, local: &str) -> Option<f64> {
-    attr(node, local)?.parse().ok()
 }
 
 // ===========================
@@ -1284,10 +1266,9 @@ pub(crate) fn parse_rels(xml: &str) -> HashMap<String, String> {
     let Ok(doc) = parse_preflighted_pptx_xml(xml) else {
         return HashMap::new();
     };
-    doc.root_element()
-        .children()
-        .filter(|node| node.is_element() && node.tag_name().name() == "Relationship")
-        .filter_map(|node| Some((attr(&node, "Id")?, attr(&node, "Target")?)))
+    ooxml_common::rels::parse_rels_document(&doc)
+        .into_iter()
+        .map(|(id, relationship)| (id, relationship.target))
         .collect()
 }
 
@@ -1430,15 +1411,7 @@ fn find_internal_rel_target_by_types(
     relationship_types: &[&str],
 ) -> Option<String> {
     let doc = parse_preflighted_pptx_xml(rels_xml).ok()?;
-    doc.root_element()
-        .children()
-        .filter(|node| node.is_element() && node.tag_name().name() == "Relationship")
-        .filter(|node| matches!(attr(node, "TargetMode").as_deref(), None | Some("Internal")))
-        .find_map(|node| {
-            attr(&node, "Type")
-                .filter(|rel_type| relationship_types.contains(&rel_type.as_str()))
-                .and_then(|_| attr(&node, "Target"))
-        })
+    ooxml_common::rels::find_internal_rel_target_by_types(&doc, relationship_types)
 }
 
 const FONT_RELATIONSHIP_TYPES: &[&str] = &[
@@ -1667,11 +1640,8 @@ fn parse_slide(
     }
 
     note_layout_master_parse();
-    // Guard against a pathologically deep slide XML: roxmltree's tree builder
-    // recurses per element-nesting level, so a slide nested thousands deep
-    // overflows the fixed WASM stack and traps *inside* `Document::parse` before
-    // our own depth-guarded shape walk runs. The nesting-depth pre-check that
-    // rejects it now lives in `parse_preflighted_pptx_xml`.
+    // Lexical depth is bounded before the recursive DOM parser runs. A crossing
+    // poisons the operation even when the part also has a content error.
     let doc = parse_preflighted_pptx_xml_with_limit(
         xml,
         pptx_internal_limits().slide_xml_dom_complexity,
@@ -1848,6 +1818,12 @@ fn parse_slide(
     );
 
     Ok(Slide {
+        theme: (!theme.is_empty()).then(|| SlideTheme {
+            default_text_color: theme.get("dk1").cloned(),
+            major_font: theme.get("+mj-lt").cloned(),
+            minor_font: theme.get("+mn-lt").cloned(),
+            hlink_color: theme.get("hlink").cloned(),
+        }),
         index,
         slide_number: index + 1,
         // Stamped by the build loop, which owns the resolved slide part path.
@@ -1867,6 +1843,7 @@ fn parse_slide(
 /// (e.g. `ppt/slides/slide3.xml`) so the message pinpoints which slide broke.
 fn broken_slide(index: usize, part: &str, detail: &str) -> Slide {
     Slide {
+        theme: None,
         index,
         slide_number: index + 1,
         // `part` IS the slide part path here (broken_slide is called with it), so
@@ -1890,6 +1867,8 @@ fn load_notes_slide(
     slide_part: &str,
     rels: &HashMap<String, String>,
 ) -> Option<String> {
+    // Notes are projected to plain text only (no color/font/format model).
+    // Their §14.2.8 theme override therefore has no observable style to resolve.
     // rels here is the slide's _rels map (rId → Target) parsed by the caller.
     // The relationship Type ends with "/notesSlide". The cleanest way to find
     // the right entry is to look at every value in the map and pick the one
@@ -2486,6 +2465,7 @@ struct LayoutSource {
     rels: HashMap<String, String>,
     dir: String,
     master_path: Option<String>,
+    theme_override_xml: Option<String>,
 }
 
 /// Owned presentation-wide bootstrap state. XML trees are intentionally not
@@ -2570,6 +2550,7 @@ fn escape_xml_attr(value: &str) -> String {
 fn bootstrap_presentation(
     zip: &mut PptxZip,
 ) -> Result<PresentationShared, Box<dyn std::error::Error>> {
+    let _resource_scope = zip.operation()?.resource_scope()?;
     // --- presentation.xml ---
     let pres_xml = read_zip_str(zip, "ppt/presentation.xml")?;
     let pres_doc = parse_preflighted_pptx_xml(&pres_xml)?;
@@ -2779,6 +2760,7 @@ fn produce_slide_unit_with_journal<T>(
     mut journal: Option<&mut SlideCacheJournal>,
     finish_output: impl FnOnce(&Slide, &PackageLimitReporter) -> Result<T, String>,
 ) -> Result<ProducedSlide<T>, Box<dyn std::error::Error>> {
+    let _resource_scope = zip.operation()?.resource_scope()?;
     let descriptor = shared
         .slide_descriptors
         .get(index)
@@ -2860,7 +2842,9 @@ fn produce_slide_unit_with_journal<T>(
                 let rels = parse_rels(&rels_xml);
                 let master_path = find_rel_target_by_type(&rels_xml, "/slideMaster")
                     .map(|target| resolve_path(path, &target));
+                let theme_override_xml = load_theme_override(path, &rels_xml, zip);
                 let source = LayoutSource {
+                    theme_override_xml,
                     xml,
                     rels,
                     dir,
@@ -2931,8 +2915,13 @@ fn produce_slide_unit_with_journal<T>(
         let bundle: &ParsedMaster = match resolved_master_path {
             Some(master_path) => {
                 if !master_cache.contains_key(master_path) {
-                    let candidate =
-                        build_master_bundle(master_path, theme, default_text_style.as_deref(), zip);
+                    let candidate = build_master_bundle(
+                        master_path,
+                        theme,
+                        None,
+                        default_text_style.as_deref(),
+                        zip,
+                    );
                     zip.assert_healthy()?;
                     let reporter = zip.operation()?.limit_reporter()?;
                     observe_shared_cache_candidate(
@@ -2952,7 +2941,7 @@ fn produce_slide_unit_with_journal<T>(
             None => {
                 if no_master_bundle.is_none() {
                     let candidate =
-                        build_master_bundle("", theme, default_text_style.as_deref(), zip);
+                        build_master_bundle("", theme, None, default_text_style.as_deref(), zip);
                     zip.assert_healthy()?;
                     let reporter = zip.operation()?.limit_reporter()?;
                     observe_shared_cache_candidate(
@@ -2969,6 +2958,35 @@ fn produce_slide_unit_with_journal<T>(
                     .expect("fallback master initialized above")
             }
         };
+
+        // §14.2.8 / §20.1.6.12: layout schemes inherit the master;
+        // slide schemes replace the layout's present schemes. Rebuild all
+        // theme-dependent inheritance, including fonts and matrix recipes.
+        // Keep this slide-owned bundle outside the shared master/layout caches.
+        let slide_override = load_theme_override(&raw.slide_part, &raw.slide_rels_xml, zip);
+        let layout_override = raw
+            .layout_source
+            .as_ref()
+            .and_then(|source| source.theme_override_xml.as_deref());
+        let override_bundle = if layout_override.is_some() || slide_override.is_some() {
+            let mut effective_theme = bundle.theme.clone();
+            if let Some(xml) = layout_override {
+                apply_theme_override(&mut effective_theme, xml);
+            }
+            if let Some(xml) = slide_override.as_deref() {
+                apply_theme_override(&mut effective_theme, xml);
+            }
+            Some(build_master_bundle(
+                resolved_master_path.unwrap_or(""),
+                theme,
+                Some(&effective_theme),
+                default_text_style.as_deref(),
+                zip,
+            ))
+        } else {
+            None
+        };
+        let bundle = override_bundle.as_ref().unwrap_or(bundle);
 
         // Per-slide color-mapping override (ECMA-376 §19.3.1.7 clrMapOvr).
         // Precedence: the slide's own `<a:overrideClrMapping>` wins; else the
@@ -3159,7 +3177,7 @@ fn produce_slide_unit_with_journal<T>(
         // slide on this layout shares). Otherwise build a fresh, uncached one
         // (override slide, or the rare no-layout-path case).
         let fresh_layout: Option<ParsedLayout> = match (
-            effective_master.is_none(),
+            effective_master.is_none() && override_bundle.is_none(),
             layout_xml,
             raw.layout_path.as_deref(),
         ) {
@@ -3972,6 +3990,246 @@ mod tests {
     // Default master txStyles: titleStyle centred, bodyStyle left, otherStyle right.
     const DEFAULT_TXSTYLES: &str = r#"<p:txStyles><p:titleStyle><a:lvl1pPr algn="ctr"><a:defRPr sz="4400"/></a:lvl1pPr></p:titleStyle><p:bodyStyle><a:lvl1pPr algn="l"><a:defRPr sz="2800"/></a:lvl1pPr></p:bodyStyle><p:otherStyle><a:lvl1pPr algn="r"><a:defRPr sz="1800"/></a:lvl1pPr></p:otherStyle></p:txStyles>"#;
 
+    #[test]
+    fn nested_group_depth_fails_closed_at_the_native_package_boundary() {
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let shapes = "<p:grpSp>".repeat(65) + "<p:sp/>" + &"</p:grpSp>".repeat(65);
+                let bytes = build_align_pptx(&shapes, "", "");
+                let error = parse_pptx_native(&bytes).unwrap_err();
+                let payload: serde_json::Value = serde_json::from_str(
+                    error.strip_prefix("OOXML_RESOURCE_LIMIT:").expect(&error),
+                )
+                .unwrap();
+                assert_eq!(payload["details"]["violation"]["metric"], "depth");
+                assert_eq!(payload["details"]["violation"]["limit"], 64);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// Markdown consumers render links and HTML: a document hyperlink target
+    /// outside the viewer's scheme policy must not become a link, a target
+    /// cannot break out of its destination, and run text cannot open raw HTML
+    /// or an image.
+    #[test]
+    fn markdown_links_and_text_cannot_inject_markup() {
+        let run = |id: &str, text: &str| {
+            format!(r#"<a:r><a:rPr><a:hlinkClick r:id="{id}"/></a:rPr><a:t>{text}</a:t></a:r>"#)
+        };
+        let slide_sp = format!(
+            r#"<p:sp><p:nvSpPr><p:cNvPr id="5" name="Links"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="1000000" cy="1000000"/></a:xfrm></p:spPr><p:txBody><a:bodyPr/><a:lstStyle/><a:p>{}{}{}<a:r><a:t> &lt;img src=x onerror=alert(1)&gt; ![p](https://t.example/p.png)</a:t></a:r></a:p></p:txBody></p:sp>"#,
+            run("rJs", "script"),
+            run("rBreak", "safe"),
+            run("rOk", "ok"),
+        );
+        let rel = |id: &str, url: &str| {
+            format!(
+                r#"<Relationship Id="{id}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="{url}" TargetMode="External"/>"#
+            )
+        };
+        let rels = [
+            rel("rJs", "javascript:alert(document.domain)"),
+            rel("rBreak", "https://e.example/x) [y](https://evil.example/"),
+            rel("rOk", "https://example.com/a?b=c"),
+        ]
+        .concat();
+        let data = build_align_pptx_with_rels(&slide_sp, "", "", &rels, "", "");
+        let markdown = to_markdown_native(&data).expect("markdown projects");
+        assert!(!markdown.contains("javascript:"), "{markdown}");
+        assert!(markdown.contains("script"), "link text is kept: {markdown}");
+        assert!(
+            markdown.contains("[safe](https://e.example/x%29%20[y]%28https://evil.example/)"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("[ok](https://example.com/a?b=c)"),
+            "{markdown}"
+        );
+        assert!(markdown.contains(r"\<img src=x"), "{markdown}");
+        assert!(
+            markdown.contains(r"\!\[p\](https\://t.example/p.png)"),
+            "{markdown}"
+        );
+    }
+
+    /// Slide titles, body text, table cells, equations, speaker notes and
+    /// review comments carry document text into the Markdown projection. The
+    /// output, parsed as GFM (tables, strikethrough, extended autolinks), may
+    /// contain only the converter's own structure: the document text forms no
+    /// table, link, autolink, heading, list, strikethrough, code or HTML node,
+    /// and a lone CR cannot end a comment quote.
+    #[test]
+    fn markdown_document_text_forms_no_markdown_structure() {
+        use std::io::{Read, Write};
+        const INLINE: &str = "&lt;img src=x onerror=alert(1)&gt; [x](javascript:alert(1)) https://evil.example/ www.evil.example a@evil.example ~~del~~ &amp;copy; `c`";
+        const INLINE_TEXT: &str = "<img src=x onerror=alert(1)> [x](javascript:alert(1)) https://evil.example/ www.evil.example a@evil.example ~~del~~ &copy; `c`";
+        const LINES: &str = "alpha&#13;&#13;```&#13;| a | b |&#13;| :-- | --: |&#13;forged | row&#13;# h&#13;&#160;# nbsp&#13;&#xFEFF;# bom&#13;&gt; q&#13;- item&#13;1. item&#13;===&#13;    Cost: 50% &amp; tax&#13;&#9;Tabbed: 2&#13;&#160;&#160;Kept nbsp&#13;&#x3000;Kept ideographic&#13;&#x2003;# Kept em";
+        let text_shape = |id: u32, ph: &str, paragraphs: &str| {
+            format!(
+                r#"<p:sp><p:nvSpPr><p:cNvPr id="{id}" name="S{id}"/><p:cNvSpPr/><p:nvPr>{ph}</p:nvPr></p:nvSpPr><p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="1000000" cy="1000000"/></a:xfrm></p:spPr><p:txBody><a:bodyPr/><a:lstStyle/>{paragraphs}</p:txBody></p:sp>"#
+            )
+        };
+        let para =
+            |text: &str| format!(r#"<a:p><a:r><a:t xml:space="preserve">{text}</a:t></a:r></a:p>"#);
+        let cell = |text: &str| {
+            format!(
+                r#"<a:tc><a:txBody><a:bodyPr/><a:p><a:r><a:t xml:space="preserve">{text}</a:t></a:r></a:p></a:txBody><a:tcPr/></a:tc>"#
+            )
+        };
+        let body = [
+            para(INLINE),
+            para("| a | b |"),
+            para("| :-- | --: |"),
+            para("forged | row"),
+            para("&#160;# forged nbsp"),
+            para("&#xFEFF;# forged bom"),
+            para("- forged item"),
+            para("```"),
+            r#"<a:p><a:r><a:t>intro</a:t></a:r><a:br/><a:r><a:t xml:space="preserve">    Body cost: 50% &amp; tax</a:t></a:r></a:p>"#.to_string(),
+            r#"<a:p><a:r><a:t>intro</a:t></a:r><a:br/><a:r><a:t xml:space="preserve">  </a:t></a:r><a:r><a:t xml:space="preserve">  Split indent: 1</a:t></a:r></a:p>"#.to_string(),
+            r#"<a:p><a:r><a:t>intro</a:t></a:r><a:br/><a:r><a:t xml:space="preserve">&#9;Body tab: 2</a:t></a:r></a:p>"#.to_string(),
+            r#"<a:p><a:pPr lvl="2"/><a:r><a:t>Deep plain: 3</a:t></a:r></a:p>"#.to_string(),
+            r#"<a:p><a:r><a:t>First</a:t></a:r><a:br/><a:r><a:t xml:space="preserve">&#160;&#160;Second nbsp</a:t></a:r></a:p>"#.to_string(),
+            r#"<a:p><a:r><a:t>First</a:t></a:r><a:br/><a:r><a:t xml:space="preserve">&#x3000;</a:t></a:r><a:r><a:t xml:space="preserve"># Second ideographic</a:t></a:r></a:p>"#.to_string(),
+            r#"<a:p><a:r><a:t>First</a:t></a:r><a:br/><a:r><a:t xml:space="preserve">  </a:t></a:r><a:r><a:t xml:space="preserve">&#x2003;Second em</a:t></a:r></a:p>"#.to_string(),
+            r#"<a:p><a:r><a:t>ww</a:t></a:r><a:r><a:t>w.split.example</a:t></a:r></a:p>"#.to_string(),
+            r#"<a:p><mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:a14="http://schemas.microsoft.com/office/drawing/2010/main" xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math"><mc:Choice Requires="a14"><a14:m><m:oMath><m:r><m:t>&lt;img src=x onerror=alert(2)&gt; https://evil.example/</m:t></m:r></m:oMath></a14:m></mc:Choice><mc:Fallback/></mc:AlternateContent></a:p>"#.to_string(),
+        ]
+        .concat();
+        let slide_sp = [
+            text_shape(
+                2,
+                r#"<p:ph type="title"/>"#,
+                &para(&format!("{INLINE} #")),
+            ),
+            format!(
+                r#"<p:graphicFrame><p:nvGraphicFramePr><p:cNvPr id="3" name="T"/><p:cNvGraphicFramePr/><p:nvPr/></p:nvGraphicFramePr><p:xfrm><a:off x="0" y="0"/><a:ext cx="1000000" cy="1000000"/></p:xfrm><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/table"><a:tbl><a:tblGrid><a:gridCol w="500000"/><a:gridCol w="500000"/></a:tblGrid><a:tr h="100000">{}{}</a:tr></a:tbl></a:graphicData></a:graphic></p:graphicFrame>"#,
+                cell(INLINE),
+                cell("a|b&#13;# forged, 50% done"),
+            ),
+            text_shape(4, "", &body),
+        ]
+        .concat();
+        let rels = r#"<Relationship Id="rNotes" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide" Target="../notesSlides/notesSlide1.xml"/><Relationship Id="rComments" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments" Target="../comments/comment1.xml"/>"#;
+        let base = build_align_pptx_with_rels(&slide_sp, "", "", rels, "", "");
+        let notes = format!(
+            r#"<p:notes xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree><a:p><a:r><a:t xml:space="preserve">{INLINE}&#13;{LINES}</a:t></a:r></a:p></p:spTree></p:cSld></p:notes>"#
+        );
+        let comments = format!(
+            r#"<p:cmLst xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:cm authorId="0"><p:text>{INLINE}&#13;{LINES}</p:text></p:cm></p:cmLst>"#
+        );
+        let mut source = zip::ZipArchive::new(Cursor::new(base)).unwrap();
+        let mut data = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(Cursor::new(&mut data));
+            let options = zip::write::SimpleFileOptions::default();
+            for index in 0..source.len() {
+                let mut entry = source.by_index(index).unwrap();
+                let name = entry.name().unwrap().into_owned();
+                let mut body = Vec::new();
+                entry.read_to_end(&mut body).unwrap();
+                writer.start_file(name, options).unwrap();
+                writer.write_all(&body).unwrap();
+            }
+            for (name, xml) in [
+                ("ppt/notesSlides/notesSlide1.xml", &notes),
+                ("ppt/comments/comment1.xml", &comments),
+            ] {
+                writer.start_file(name, options).unwrap();
+                writer.write_all(xml.as_bytes()).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+
+        let markdown = to_markdown_native(&data).expect("markdown projects");
+        let gfm = ooxml_common::markdown::gfm_check::summarize(&markdown);
+
+        assert_eq!(
+            gfm.headings,
+            [
+                format!("{INLINE_TEXT} # (slide 1)"),
+                "Speaker notes".to_string(),
+                "Review comments".to_string(),
+                "Slide 1 — Comment 1".to_string(),
+            ],
+            "{markdown}"
+        );
+        assert_eq!(gfm.tables, 1, "{markdown}");
+        assert_eq!(
+            gfm.table_cells,
+            [INLINE_TEXT.to_string(), "a|b# forged, 50% done".to_string()],
+            "{markdown}"
+        );
+        assert_eq!(gfm.block_quotes, 1, "{markdown}");
+        assert_eq!(
+            (gfm.links, gfm.images, gfm.html, gfm.strikethrough, gfm.code),
+            (0, 0, 0, 0, 0),
+            "{markdown}"
+        );
+        assert_eq!((gfm.list_items, gfm.thematic_breaks), (0, 0), "{markdown}");
+        for literal in [
+            INLINE_TEXT,
+            "| a | b |",
+            "| :-- | --: |",
+            "forged | row",
+            "# forged nbsp",
+            "# forged bom",
+            "- forged item",
+            "```",
+            "www.split.example",
+            "<img src=x onerror=alert(2)> https://evil.example/",
+            "# h",
+            "> q",
+            "1. item",
+            "===",
+            "Cost: 50% & tax",
+            "Tabbed: 2",
+            "\u{a0}\u{a0}Kept nbsp",
+            "\u{3000}Kept ideographic",
+            "\u{2003}# Kept em",
+            "Body cost: 50% & tax",
+            "Split indent: 1",
+            "Body tab: 2",
+            "Deep plain: 3",
+            "\u{a0}\u{a0}Second nbsp",
+            "\u{3000}# Second ideographic",
+            "\u{2003}Second em",
+        ] {
+            assert!(gfm.text.contains(literal), "{literal:?} in {markdown}");
+        }
+        // The lone CRs in the comment keep every line inside the quote.
+        assert!(
+            markdown.contains("> alpha\n> \n> \\`\\`\\`\n"),
+            "{markdown}"
+        );
+    }
+
+    /// A BOM before indentation at the start of a slide's first paragraph is
+    /// dropped with that indentation: renderers strip the BOM, which would
+    /// otherwise expose an indented code block showing the escapes.
+    #[test]
+    fn markdown_line_start_bom_cannot_expose_an_indented_code_block() {
+        for runs in [
+            r#"<a:r><a:t xml:space="preserve">&#xFEFF;    Cost: 1</a:t></a:r>"#,
+            r#"<a:r><a:t xml:space="preserve">&#xFEFF;</a:t></a:r><a:r><a:t xml:space="preserve">&#9;Cost: 1</a:t></a:r>"#,
+        ] {
+            let slide_sp = format!(
+                r#"<p:sp><p:nvSpPr><p:cNvPr id="5" name="Body"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="1000000" cy="1000000"/></a:xfrm></p:spPr><p:txBody><a:bodyPr/><a:lstStyle/><a:p>{runs}</a:p></p:txBody></p:sp>"#
+            );
+            let data = build_align_pptx(&slide_sp, "", "");
+
+            let markdown = to_markdown_native(&data).expect("markdown projects");
+            let gfm = ooxml_common::markdown::gfm_check::summarize(&markdown);
+
+            assert_eq!(gfm.headings, ["Slide 1"], "{markdown:?}");
+            assert_eq!(gfm.code, 0, "{markdown:?}");
+            assert_eq!(gfm.text.trim(), "Slide 1\nCost: 1", "{markdown:?}");
+        }
+    }
+
     fn build_align_pptx(slide_sp: &str, layout_extra_sp: &str, master_txstyles: &str) -> Vec<u8> {
         build_align_pptx_with_rels(slide_sp, layout_extra_sp, master_txstyles, "", "", "")
     }
@@ -4512,6 +4770,32 @@ mod tests {
         ) {
             Bullet::Char { ch, .. } => assert_eq!(ch, "🡆x"),
             other => panic!("expected Char, got {other:?}"),
+        }
+    }
+
+    /// `startAt` outside ST_TextBulletStartAtNum (1..=32767) is schema-invalid
+    /// and reads as absent, so the renderer never formats a counter in the
+    /// billions (a roman numeral millions of characters long).
+    #[test]
+    fn auto_number_start_outside_schema_range_reads_as_absent() {
+        let theme = HashMap::new();
+        let mut resolve_blip = |_: &str| None;
+        for (value, expected) in [
+            ("1", Some(1)),
+            ("32767", Some(32767)),
+            ("32768", None),
+            ("4294967295", None),
+            ("0", None),
+            ("-5", None),
+        ] {
+            let xml = format!(
+                r#"<a:pPr xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:buAutoNum type="romanUcPeriod" startAt="{value}"/></a:pPr>"#
+            );
+            let doc = roxmltree::Document::parse(&xml).expect("valid paragraph properties");
+            match parse_bullet(Some(doc.root_element()), &theme, &mut resolve_blip) {
+                Bullet::AutoNum { start_at, .. } => assert_eq!(start_at, expected, "{value}"),
+                other => panic!("expected AutoNum, got {other:?}"),
+            }
         }
     }
 
@@ -5396,26 +5680,6 @@ mod tests {
         }
     }
 
-    /// ECMA-376 §20.1.8.21 — innerShdw shares the field shape of outerShdw
-    /// (blurRad, dist, dir, color child). parse_inner_shadow should round-trip
-    /// all of them, including the alphaModFix encoded as 8-char hex.
-    #[test]
-    fn test_parse_inner_shadow_extracts_fields() {
-        let xml = r#"<effectLst xmlns="http://schemas.openxmlformats.org/drawingml/2006/main">
-            <innerShdw blurRad="50800" dist="38100" dir="2700000">
-                <srgbClr val="000000"><alphaModFix amt="50000"/></srgbClr>
-            </innerShdw>
-        </effectLst>"#;
-        let doc = roxmltree::Document::parse(xml).unwrap();
-        let theme = HashMap::new();
-        let s = parse_inner_shadow(doc.root_element(), &theme).expect("innerShdw should resolve");
-        assert_eq!(s.blur, 50_800);
-        assert_eq!(s.dist, 38_100);
-        assert!((s.dir - 45.0).abs() < 0.001);
-        assert!((s.alpha - 0.5).abs() < 0.01);
-        assert_eq!(s.color.to_lowercase(), "000000");
-    }
-
     /// ECMA-376 §20.1.8.14 + §20.1.8.58 + §20.1.8.30 — a `bgPr > blipFill`
     /// with a `stretch > fillRect` (incl. negative overscan edges) parses into
     /// `Fill::Image` carrying the resolved zip path + mime, the fractional
@@ -5462,7 +5726,7 @@ mod tests {
                 assert!((fr.b - (-0.09)).abs() < 1e-9, "b={}", fr.b);
                 assert!(fr.l.abs() < 1e-9 && fr.r.abs() < 1e-9);
                 assert!(tile.is_none(), "stretch fill must not carry tile");
-                assert!((alpha.expect("alpha") - 0.8).abs() < 1e-6);
+                assert!(alpha.is_none(), "ordered effects own alpha modulation");
             }
             other => panic!("expected Fill::Image, got {other:?}"),
         }
@@ -6474,34 +6738,6 @@ mod tests {
         assert!(r.font_family_ea.is_none());
     }
 
-    /// ECMA-376 §20.1.8.17 — glow has a single rad attribute and a colour
-    /// child. parse_glow should preserve the radius and resolve alphaModFix.
-    #[test]
-    fn test_parse_glow_extracts_radius_and_color() {
-        let xml = r#"<effectLst xmlns="http://schemas.openxmlformats.org/drawingml/2006/main">
-            <glow rad="38100">
-                <srgbClr val="FF0000"><alphaModFix amt="80000"/></srgbClr>
-            </glow>
-        </effectLst>"#;
-        let doc = roxmltree::Document::parse(xml).unwrap();
-        let theme = HashMap::new();
-        let g = parse_glow(doc.root_element(), &theme).expect("glow should resolve");
-        assert_eq!(g.radius, 38_100);
-        assert_eq!(g.color.to_uppercase(), "FF0000");
-        assert!((g.alpha - 0.8).abs() < 0.01);
-    }
-
-    /// ECMA-376 §20.1.8.31 — softEdge has a single `rad` attribute in EMU.
-    #[test]
-    fn test_parse_soft_edge_extracts_radius() {
-        let xml = r#"<effectLst xmlns="http://schemas.openxmlformats.org/drawingml/2006/main">
-            <softEdge rad="63500"/>
-        </effectLst>"#;
-        let doc = roxmltree::Document::parse(xml).unwrap();
-        let s = parse_soft_edge(doc.root_element()).expect("softEdge should resolve");
-        assert_eq!(s.radius, 63_500);
-    }
-
     /// ECMA-376 §20.1.8.27 — reflection: blur, dist, dir, stA/stPos/endA/endPos
     /// (1000ths of percent), sx/sy (1000ths of percent, sy negative for mirror).
     #[test]
@@ -6536,7 +6772,7 @@ mod tests {
                     <srgbClr val="000000"><alpha val="40000"/></srgbClr>
                 </outerShdw>
                 <innerShdw blurRad="63500" dist="50800" dir="5400000"><srgbClr val="111111"/></innerShdw>
-                <glow rad="63500"><srgbClr val="FFCC00"/></glow>
+                <glow rad="63500"><srgbClr val="FFCC00"><alphaModFix amt="80000"/></srgbClr></glow>
                 <softEdge rad="25400"/>
                 <reflection blurRad="12700" stA="38000" endPos="28000" dist="5000" dir="5400000" sy="-100000" algn="bl" rotWithShape="0"/>
             </effectLst>
@@ -6559,10 +6795,13 @@ mod tests {
 
         let inner = eff.inner_shadow.expect("innerShdw should resolve");
         assert_eq!(inner.blur, 63_500);
+        assert_eq!(inner.dist, 50_800);
+        assert!((inner.dir - 90.0).abs() < 0.001);
 
         let glow = eff.glow.expect("glow should resolve");
         assert_eq!(glow.radius, 63_500);
         assert_eq!(glow.color, "FFCC00");
+        assert!((glow.alpha - 0.8).abs() < 0.01);
 
         let soft = eff.soft_edge.expect("softEdge should resolve");
         assert_eq!(soft.radius, 25_400);
@@ -7360,7 +7599,8 @@ mod tests {
             .unwrap();
         let theme = HashMap::new();
         let mut runs = Vec::new();
-        push_math_runs(ac, Some(18.0), &theme, &mut runs);
+        let mut fallbacks = Vec::new();
+        push_math_runs(ac, Some(18.0), &theme, &mut runs, &mut fallbacks);
         assert_eq!(runs.len(), 1, "exactly one math run, fallback ignored");
         match &runs[0] {
             TextRun::Math {
@@ -7372,8 +7612,181 @@ mod tests {
                 assert!(*display, "oMathPara → display math");
                 assert_eq!(*font_size, Some(18.0));
                 assert_eq!(nodes_to_text(nodes), "x");
+                assert_eq!(fallbacks.len(), 1);
+                assert_eq!((fallbacks[0].start, fallbacks[0].end), (0, 1));
+                assert_eq!(fallbacks[0].text, "fallback");
             }
             other => panic!("expected math run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inline_math_preview_selects_nested_alternatives() {
+        for (choices, expected) in [
+            (
+                r#"<mc:Choice Requires="u"><a:r><a:t>unsupported</a:t></a:r></mc:Choice>
+                <mc:Choice Requires="a14"><a:r><a:t>chosen</a:t></a:r></mc:Choice>
+                <mc:Choice Requires="a14"><a:r><a:t>later choice</a:t></a:r></mc:Choice>"#,
+                "beforechosenafter",
+            ),
+            (
+                r#"<mc:Choice Requires="u"><a:r><a:t>unsupported</a:t></a:r></mc:Choice>
+                <mc:Choice Requires="a14 u"><a:r><a:t>partly understood</a:t></a:r></mc:Choice>"#,
+                "beforefallbackafter",
+            ),
+        ] {
+            let xml = format!(
+                r#"<mc:AlternateContent
+                xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+                xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+                xmlns:a14="http://schemas.microsoft.com/office/drawing/2010/main"
+                xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math"
+                xmlns:u="urn:unsupported">
+                <mc:Choice Requires="a14"><a14:m><m:oMath><m:r><m:t>x</m:t></m:r></m:oMath></a14:m></mc:Choice>
+                <mc:Fallback><a:r><a:t>before</a:t></a:r>
+                  <mc:AlternateContent>{choices}<mc:Fallback>
+                    <mc:AlternateContent><mc:Choice Requires="a14"><a:r><a:t>fallback</a:t></a:r></mc:Choice>
+                      <mc:Fallback><a:r><a:t>discarded nested fallback</a:t></a:r></mc:Fallback>
+                    </mc:AlternateContent>
+                  </mc:Fallback></mc:AlternateContent>
+                  <u:t>foreign text</u:t><a:r><a:t>after</a:t></a:r>
+                </mc:Fallback></mc:AlternateContent>"#
+            );
+            let doc = roxmltree::Document::parse(&xml).unwrap();
+            let mut runs = Vec::new();
+            let mut fallbacks = Vec::new();
+            push_math_runs(
+                doc.root_element(),
+                None,
+                &HashMap::new(),
+                &mut runs,
+                &mut fallbacks,
+            );
+            assert_eq!(runs.len(), 1);
+            assert_eq!(fallbacks.len(), 1);
+            assert_eq!(fallbacks[0].text, expected);
+        }
+    }
+
+    #[test]
+    fn inline_math_preview_applies_inherited_ignorable_and_process_content() {
+        for (outer_process, local_process, expected) in [
+            ("", "", "beforeafter"),
+            (
+                r#"mc:ProcessContent="u:wrap""#,
+                "",
+                "beforekeptselectedafter",
+            ),
+            (
+                "",
+                r#"mc:ProcessContent="u:wrap""#,
+                "beforekeptselectedafter",
+            ),
+            (
+                r#"mc:ProcessContent="u:*""#,
+                "",
+                "beforekeptselectedsiblingafter",
+            ),
+        ] {
+            let xml = format!(
+                r#"<a:p xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+                xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+                xmlns:a14="http://schemas.microsoft.com/office/drawing/2010/main"
+                xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math"
+                xmlns:u="urn:unsupported" mc:Ignorable="u a a14" {outer_process}>
+                <mc:AlternateContent>
+                  <mc:Choice Requires="a14"><a14:m><m:oMath><m:r><m:t>x</m:t></m:r></m:oMath></a14:m></mc:Choice>
+                  <mc:Fallback><a:r><a:t>before</a:t></a:r>
+                    <u:wrap {local_process}><a:r><a:t>kept</a:t></a:r>
+                      <mc:AlternateContent>
+                        <mc:Choice Requires="a14"><a:r><a:t>selected</a:t></a:r></mc:Choice>
+                        <mc:Fallback><a:r><a:t>unselected</a:t></a:r></mc:Fallback>
+                      </mc:AlternateContent>
+                    </u:wrap>
+                    <u:other><a:r><a:t>sibling</a:t></a:r></u:other>
+                    <v:wrap xmlns:v="urn:local" mc:Ignorable="v"><a:r><a:t>locally ignored</a:t></a:r></v:wrap>
+                    <a:r><a:t>after</a:t></a:r>
+                  </mc:Fallback>
+                </mc:AlternateContent></a:p>"#
+            );
+            let doc = roxmltree::Document::parse(&xml).unwrap();
+            let ac = doc.root_element().first_element_child().unwrap();
+            let mut runs = Vec::new();
+            let mut fallbacks = Vec::new();
+            push_math_runs(ac, None, &HashMap::new(), &mut runs, &mut fallbacks);
+            assert_eq!(runs.len(), 1);
+            assert_eq!(fallbacks.len(), 1);
+            assert_eq!(
+                fallbacks[0].text, expected,
+                "{outer_process} / {local_process}"
+            );
+        }
+    }
+
+    #[test]
+    fn inline_math_retains_one_fallback_for_the_complete_choice_range() {
+        let equation = "<m:oMath><m:r><m:t>x</m:t></m:r></m:oMath>";
+        for (choice, expected_previews) in [
+            (
+                format!("<a14:m>{equation}</a14:m><a14:m>{equation}</a14:m>"),
+                vec!["complete preview"],
+            ),
+            (
+                format!("<a14:m><m:oMathPara>{equation}{equation}</m:oMathPara></a14:m>"),
+                vec!["complete preview"],
+            ),
+            (
+                format!(
+                    r#"<mc:AlternateContent><mc:Choice Requires="a14"><a14:m>{equation}{equation}</a14:m></mc:Choice>
+              <mc:Fallback><r><t>inner preview</t></r></mc:Fallback></mc:AlternateContent>"#
+                ),
+                vec!["inner preview", "complete preview"],
+            ),
+        ] {
+            let xml = format!(
+                r#"<mc:AlternateContent
+                xmlns="http://schemas.openxmlformats.org/drawingml/2006/main"
+                xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+                xmlns:a14="http://schemas.microsoft.com/office/drawing/2010/main"
+                xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math">
+                <mc:Choice Requires="a14">{choice}</mc:Choice>
+                <mc:Fallback><r><t>complete preview</t></r></mc:Fallback>
+                </mc:AlternateContent>"#
+            );
+            let doc = roxmltree::Document::parse(&xml).unwrap();
+            let mut runs = Vec::new();
+            let mut fallbacks = Vec::new();
+            // A preceding run makes the retained range paragraph-relative.
+            push_math_runs(
+                doc.descendants().find(|n| n.has_tag_name("oMath")).unwrap(),
+                None,
+                &HashMap::new(),
+                &mut runs,
+                &mut fallbacks,
+            );
+            push_math_runs(
+                doc.root_element(),
+                None,
+                &HashMap::new(),
+                &mut runs,
+                &mut fallbacks,
+            );
+            assert_eq!(runs.len(), 3);
+            assert_eq!(
+                fallbacks
+                    .iter()
+                    .map(|f| f.text.as_str())
+                    .collect::<Vec<_>>(),
+                expected_previews
+            );
+            assert!(fallbacks.iter().all(|f| (f.start, f.end) == (1, 3)));
+            assert!(runs.iter().all(|run| matches!(
+                run,
+                TextRun::Math {
+                    fallback_text: None,
+                    ..
+                }
+            )));
         }
     }
 
@@ -7395,7 +7808,7 @@ mod tests {
         let doc = roxmltree::Document::parse(xml).unwrap();
         let theme = HashMap::new();
         let mut runs = Vec::new();
-        push_math_runs(doc.root_element(), None, &theme, &mut runs);
+        push_math_runs(doc.root_element(), None, &theme, &mut runs, &mut Vec::new());
         assert_eq!(runs.len(), 1);
         match &runs[0] {
             TextRun::Math {
@@ -7403,6 +7816,7 @@ mod tests {
                 font_size,
                 nodes,
                 color,
+                ..
             } => {
                 assert!(!*display, "bare a14:m with m:oMath → inline");
                 assert_eq!(*font_size, Some(28.0), "size read from math run rPr sz");
@@ -10206,6 +10620,10 @@ mod tests {
     <a:blip r:embed="rIdPng">
       <a:clrChange><a:clrFrom><a:srgbClr val="FFFFFF"/></a:clrFrom>
         <a:clrTo><a:srgbClr val="FFFFFF"><a:alpha val="0"/></a:srgbClr></a:clrTo></a:clrChange>
+      <a:alphaModFix amt="50000"/>
+      <a:duotone><a:srgbClr val="000000"/><a:srgbClr val="FF0000"/></a:duotone>
+      <a:duotone><a:srgbClr val="000000"/><a:srgbClr val="00FF00"/></a:duotone>
+      <a:clrRepl><a:srgbClr val="FF0000"/></a:clrRepl>
       <a:grayscl/>
       <a:biLevel thresh="50000"/>
     </a:blip>
@@ -10225,7 +10643,7 @@ mod tests {
         let mut zip = PptxZip::new(cursor).unwrap();
         let pic = parse_picture(pic_node, "ppt/slides/slide1.xml", &rels, &theme, &mut zip)
             .expect("parse_picture should succeed for a duotone picture");
-        assert!(pic.duotone.is_none());
+        assert!(pic.alpha.is_none(), "alpha is baked once");
         assert_eq!(
             pic.blip_effects,
             vec![
@@ -10236,12 +10654,24 @@ mod tests {
                     to_alpha: 0.0,
                     use_alpha: false,
                 },
+                ooxml_common::blip::BlipEffect::AlphaModFix { amt: 0.5 },
+                ooxml_common::blip::BlipEffect::Duotone {
+                    clr1: "000000".into(),
+                    clr2: "FF0000".into()
+                },
+                ooxml_common::blip::BlipEffect::Duotone {
+                    clr1: "000000".into(),
+                    clr2: "00FF00".into()
+                },
+                ooxml_common::blip::BlipEffect::ColorReplace {
+                    color: "FF0000".into()
+                },
                 ooxml_common::blip::BlipEffect::Grayscale,
                 ooxml_common::blip::BlipEffect::BiLevel { thresh: 0.5 },
             ]
         );
         let json = serde_json::to_value(&pic).unwrap();
-        assert_eq!(json["blipEffects"][1]["type"], "grayscale");
+        assert_eq!(json["blipEffects"][5]["type"], "grayscale");
     }
 
     #[test]
@@ -10955,6 +11385,90 @@ mod tests {
             zw.finish().unwrap();
         }
         buf
+    }
+
+    #[test]
+    fn theme_override_replaces_layout_then_slide_schemes() {
+        use std::io::{Read, Write};
+        let input = build_clr_map_ovr_pptx("");
+        let mut archive = zip::ZipArchive::new(Cursor::new(input)).unwrap();
+        let mut output = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        let mut ordinary_slide = String::new();
+        for i in 0..archive.len() {
+            let mut entry = archive.by_index(i).unwrap();
+            let name = entry.name().unwrap().into_owned();
+            let mut xml = String::new();
+            entry.read_to_string(&mut xml).unwrap();
+            if name == "ppt/presentation.xml" {
+                xml = xml.replace(
+                    "</p:sldIdLst>",
+                    r#"<p:sldId id="257" r:id="second"/></p:sldIdLst>"#,
+                );
+            }
+            if name == "ppt/_rels/presentation.xml.rels" {
+                xml = xml.replace("</Relationships>", r#"<Relationship Id="second" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide2.xml"/></Relationships>"#);
+            }
+            let target = match name.as_str() {
+                "ppt/slides/_rels/slide1.xml.rels" => Some("slide"),
+                "ppt/slideLayouts/_rels/slideLayout1.xml.rels" => Some("layout"),
+                _ => None,
+            };
+            if let Some(target) = target {
+                xml = xml.replace("</Relationships>", &format!(r#"<Relationship Id="override" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/themeOverride" Target="../theme/{target}.xml"/></Relationships>"#));
+            }
+            if name == "ppt/slides/slide1.xml" {
+                xml = xml.replace("</p:sp>", r#"<p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:rPr><a:latin typeface="+mn-lt"/></a:rPr><a:t>Theme text</a:t></a:r></a:p></p:txBody></p:sp>"#);
+            }
+            if name == "ppt/slides/slide1.xml" {
+                ordinary_slide = xml.clone();
+            }
+            output.start_file(name, options).unwrap();
+            output.write_all(xml.as_bytes()).unwrap();
+        }
+        output.start_file("ppt/slides/slide2.xml", options).unwrap();
+        output.write_all(ordinary_slide.as_bytes()).unwrap();
+        output
+            .start_file("ppt/slides/_rels/slide2.xml.rels", options)
+            .unwrap();
+        output.write_all(br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="layout" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="../slideLayouts/slideLayout1.xml"/></Relationships>"#).unwrap();
+        for (part, xml) in [
+            (
+                "layout",
+                r#"<a:themeOverride xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:clrScheme name="C"><a:dk1><a:srgbClr val="123456"/></a:dk1></a:clrScheme><a:fontScheme name="F"><a:majorFont><a:latin typeface="Override Major"/></a:majorFont><a:minorFont><a:latin typeface="Override Minor"/></a:minorFont></a:fontScheme></a:themeOverride>"#,
+            ),
+            (
+                "slide",
+                r#"<a:themeOverride xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:fmtScheme name="S"><a:fillStyleLst><a:solidFill><a:srgbClr val="ABCDEF"/></a:solidFill></a:fillStyleLst><a:lnStyleLst/><a:effectStyleLst/><a:bgFillStyleLst/></a:fmtScheme></a:themeOverride>"#,
+            ),
+        ] {
+            output
+                .start_file(format!("ppt/theme/{part}.xml"), options)
+                .unwrap();
+            output.write_all(xml.as_bytes()).unwrap();
+        }
+        let bytes = output.finish().unwrap().into_inner();
+        let parsed = parse_presentation_from_bytes(&bytes).unwrap();
+        let slide = &parsed.slides[0];
+        assert_eq!(
+            slide.theme.as_ref().unwrap().default_text_color.as_deref(),
+            Some("123456")
+        );
+        let SlideElement::Shape(shape) = &slide.elements[0] else {
+            panic!("shape")
+        };
+        let TextRun::Text(run) = &shape.text_body.as_ref().unwrap().paragraphs[0].runs[0] else {
+            panic!("text")
+        };
+        assert_eq!(run.font_family.as_deref(), Some("Override Minor"));
+        assert_eq!(
+            shape_fill_color_by_name(slide, "Tx1Rect").as_deref(),
+            Some("ABCDEF")
+        );
+        assert_eq!(
+            shape_fill_color_by_name(&parsed.slides[1], "Tx1Rect").as_deref(),
+            Some("123456")
+        );
     }
 
     /// §19.3.1.7 clrMapOvr / §20.1.6.8 overrideClrMapping: a slide whose
@@ -12146,7 +12660,7 @@ mod tests {
             retained_ptr,
             "prepared bytes move; they are not cloned"
         );
-        const FIXED_SLIDE_3: &str = r#"{"index":2,"slideNumber":3,"partName":"ppt/slides/slide3.xml","background":null,"elements":[{"type":"shape","x":0,"y":0,"width":1000000,"height":1000000,"rotation":0.0,"flipH":false,"flipV":false,"geometry":"rect","fill":null,"stroke":null,"textBody":{"verticalAnchor":"t","paragraphs":[{"alignment":"l","marL":0,"marR":0,"indent":0,"spaceBefore":null,"spaceAfter":null,"spaceLine":null,"lvl":0,"bullet":{"type":"inherit"},"defFontSize":18.0,"defColor":null,"defBold":null,"defItalic":null,"defFontFamily":"Arial","tabStops":[],"eaLnBrk":true,"runs":[{"type":"text","text":"slide 3","bold":null,"italic":null,"underline":false,"strikethrough":false,"fontSize":18.0,"color":null,"fontFamily":"Arial","fieldType":null}]}],"defaultFontSize":18.0,"defaultBold":null,"defaultItalic":null,"lIns":91440,"rIns":91440,"tIns":45720,"bIns":45720,"wrap":"square","vert":"horz","autoFit":"none"},"defaultTextColor":null,"custGeom":null,"adj":null,"adj2":null,"adj3":null,"adj4":null,"adj5":null,"adj6":null,"adj7":null,"adj8":null,"shadow":null,"id":"2","name":"T"}],"elementSources":[{"origin":"slide"}]}"#;
+        const FIXED_SLIDE_3: &str = r#"{"theme":{"defaultTextColor":"000000","majorFont":"Arial","minorFont":"Arial","hlinkColor":"000000"},"index":2,"slideNumber":3,"partName":"ppt/slides/slide3.xml","background":null,"elements":[{"type":"shape","x":0,"y":0,"width":1000000,"height":1000000,"rotation":0.0,"flipH":false,"flipV":false,"geometry":"rect","fill":null,"stroke":null,"textBody":{"verticalAnchor":"t","paragraphs":[{"alignment":"l","marL":0,"marR":0,"indent":0,"spaceBefore":null,"spaceAfter":null,"spaceLine":null,"lvl":0,"bullet":{"type":"inherit"},"defFontSize":18.0,"defColor":null,"defBold":null,"defItalic":null,"defFontFamily":"Arial","tabStops":[],"eaLnBrk":true,"runs":[{"type":"text","text":"slide 3","bold":null,"italic":null,"underline":false,"strikethrough":false,"fontSize":18.0,"color":null,"fontFamily":"Arial","fieldType":null}]}],"defaultFontSize":18.0,"defaultBold":null,"defaultItalic":null,"lIns":91440,"rIns":91440,"tIns":45720,"bIns":45720,"wrap":"square","vert":"horz","autoFit":"none"},"defaultTextColor":null,"custGeom":null,"adj":null,"adj2":null,"adj3":null,"adj4":null,"adj5":null,"adj6":null,"adj7":null,"adj8":null,"shadow":null,"id":"2","name":"T"}],"elementSources":[{"origin":"slide"}]}"#;
         assert_eq!(bytes, FIXED_SLIDE_3.as_bytes());
         let legacy: serde_json::Value =
             serde_json::from_str(&parse_pptx_native(&legacy_data).unwrap()).unwrap();
@@ -12709,6 +13223,32 @@ mod tests {
         );
     }
 
+    mod lexical_depth_cases {
+        include!("../../../ooxml-common/tests/support/lexical_depth_cases.rs");
+    }
+
+    #[test]
+    fn optional_relationships_distinguish_lexical_depth_from_shallow_content_errors() {
+        let base = build_three_slide_deck(usize::MAX, "");
+        let path = "ppt/slides/_rels/slide1.xml.rels";
+        let baseline = rewrite_deck_xml(base.clone(), path, |_| "<broken".into());
+        let expected = parse_pptx_native(&baseline).unwrap();
+        for (name, xml, crossing) in lexical_depth_cases::lexical_depth_cases() {
+            let bytes = rewrite_deck_xml(base.clone(), path, |_| xml.clone());
+            let result = parse_pptx_native(&bytes);
+            if crossing {
+                let error = result.unwrap_err();
+                let payload: serde_json::Value = serde_json::from_str(
+                    error.strip_prefix("OOXML_RESOURCE_LIMIT:").expect(&error),
+                )
+                .unwrap();
+                assert_eq!(payload["details"]["violation"]["metric"], "depth", "{name}");
+            } else {
+                assert_eq!(result.expect(name), expected, "{name}");
+            }
+        }
+    }
+
     #[test]
     fn generic_dependency_limit_poison_is_not_swallowed_but_malformed_xml_still_degrades() {
         let base = build_three_slide_deck(usize::MAX, "");
@@ -12768,7 +13308,7 @@ mod tests {
             let options = zip::write::SimpleFileOptions::default();
             for index in 0..source.len() {
                 let mut entry = source.by_index(index).unwrap();
-                let name = entry.name().to_owned();
+                let name = entry.name().unwrap().into_owned();
                 let mut body = Vec::new();
                 entry.read_to_end(&mut body).unwrap();
                 if name == "ppt/slides/slide1.xml" {
@@ -12800,7 +13340,7 @@ mod tests {
                 .compression_method(zip::CompressionMethod::Stored);
             for index in 0..source.len() {
                 let mut entry = source.by_index(index).unwrap();
-                let name = entry.name().to_owned();
+                let name = entry.name().unwrap().into_owned();
                 let mut body = Vec::new();
                 entry.read_to_end(&mut body).unwrap();
                 writer.start_file(name, options).unwrap();
@@ -12947,7 +13487,7 @@ mod tests {
             let o = zip::write::SimpleFileOptions::default();
             for i in 0..zip.len() {
                 let mut f = zip.by_index(i).unwrap();
-                let name = f.name().to_owned();
+                let name = f.name().unwrap().into_owned();
                 if name == "ppt/slides/slide3.xml" {
                     continue; // omit → its read fails → placeholder
                 }
@@ -12971,7 +13511,7 @@ mod tests {
             let options = zip::write::SimpleFileOptions::default();
             for index in 0..source.len() {
                 let mut entry = source.by_index(index).unwrap();
-                let name = entry.name().to_owned();
+                let name = entry.name().unwrap().into_owned();
                 let mut body = Vec::new();
                 entry.read_to_end(&mut body).unwrap();
                 if name == target {
@@ -12995,7 +13535,7 @@ mod tests {
             let options = zip::write::SimpleFileOptions::default();
             for index in 0..source.len() {
                 let mut entry = source.by_index(index).unwrap();
-                let name = entry.name().to_owned();
+                let name = entry.name().unwrap().into_owned();
                 let mut bytes = Vec::new();
                 entry.read_to_end(&mut bytes).unwrap();
                 writer.start_file(name, options).unwrap();
@@ -13022,7 +13562,7 @@ mod tests {
             let options = zip::write::SimpleFileOptions::default();
             for index in 0..source.len() {
                 let mut entry = source.by_index(index).unwrap();
-                let name = entry.name().to_owned();
+                let name = entry.name().unwrap().into_owned();
                 let mut body = Vec::new();
                 entry.read_to_end(&mut body).unwrap();
                 for (slide, is_referenced) in referenced.iter().copied().enumerate() {
@@ -13084,7 +13624,7 @@ mod tests {
             let options = zip::write::SimpleFileOptions::default();
             for index in 0..source.len() {
                 let mut entry = source.by_index(index).unwrap();
-                let name = entry.name().to_owned();
+                let name = entry.name().unwrap().into_owned();
                 let mut body = Vec::new();
                 entry.read_to_end(&mut body).unwrap();
                 if name == "ppt/slides/_rels/slide1.xml.rels" {
@@ -13136,7 +13676,7 @@ mod tests {
             let options = zip::write::SimpleFileOptions::default();
             for index in 0..source.len() {
                 let mut entry = source.by_index(index).unwrap();
-                let name = entry.name().to_owned();
+                let name = entry.name().unwrap().into_owned();
                 let mut body = Vec::new();
                 entry.read_to_end(&mut body).unwrap();
                 if name == "ppt/slides/_rels/slide1.xml.rels" {
@@ -13670,7 +14210,7 @@ mod tests {
             let options = zip::write::SimpleFileOptions::default();
             for index in 0..source.len() {
                 let mut entry = source.by_index(index).unwrap();
-                let name = entry.name().to_owned();
+                let name = entry.name().unwrap().into_owned();
                 let mut body = Vec::new();
                 entry.read_to_end(&mut body).unwrap();
                 let body: &[u8] = match name.as_str() {

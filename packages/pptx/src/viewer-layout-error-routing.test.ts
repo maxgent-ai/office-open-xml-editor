@@ -1,6 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { PptxPresentation, type LoadOptions } from './presentation.js';
-import { publishPptxLayout } from './presentation-layout-events.js';
 import { PptxViewer } from './viewer.js';
 import { PptxScrollViewer } from './scroll-viewer.js';
 import { FakePptxEngine, installDom, makeContainer, makeEl } from './scroll-viewer-test-dom.js';

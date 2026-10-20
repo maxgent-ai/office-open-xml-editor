@@ -1,5 +1,3 @@
-#!/usr/bin/env node
-
 import {
   existsSync,
   readFileSync,
@@ -17,6 +15,7 @@ const require = createRequire(new URL('../package.json', import.meta.url));
 const ts = require('typescript-compiler-api');
 
 const DOCX_SOURCE = 'packages/docx/src';
+const DOCX_PARSER_SOURCE = 'packages/docx/parser/src';
 const COMPATIBILITY_OWNER = `${DOCX_SOURCE}/layout/compatibility.ts`;
 const OBSERVATION_BASELINE =
   'scripts/docx-compatibility-observation-baseline.json';
@@ -285,9 +284,11 @@ function microsoftEvidenceCatalog(root) {
   return documents;
 }
 
-function verifyEvidence(root, file, ruleId, evidence, microsoftCatalog) {
+function verifyEvidence(root, file, ruleId, evidence, microsoftCatalog, citedMicrosoftSections) {
   const kind = stringValue(evidence, 'kind', file);
-  if (kind === 'regression-test') {
+  // A library policy carries no Office measurement; like a regression-test
+  // record it must name the concrete DOCX test that pins the behaviour.
+  if (kind === 'regression-test' || kind === 'library-policy') {
     const reference = stringValue(evidence, 'reference', file);
     const separator = reference.indexOf('#');
     if (separator <= 0 || separator === reference.length - 1) {
@@ -336,6 +337,7 @@ function verifyEvidence(root, file, ruleId, evidence, microsoftCatalog) {
         `${ruleId} references an uncatalogued Microsoft section: ${reference}`,
       );
     }
+    for (const sectionId of sectionIds) citedMicrosoftSections.add(`${match[1]} ${sectionId}`);
     return;
   }
   if (kind === 'office-observation') {
@@ -354,7 +356,14 @@ function verifyEvidence(root, file, ruleId, evidence, microsoftCatalog) {
   fail('COMPATIBILITY_EVIDENCE_KIND', `${ruleId} has unknown evidence kind ${kind}`);
 }
 
-function inspectSource(root, absolute, rules, microsoftCatalog) {
+function inspectSource(
+  root,
+  absolute,
+  rules,
+  microsoftCatalog,
+  citedMicrosoftSections,
+  declarationRanges,
+) {
   const file = posixPath(relative(root, absolute));
   const source = ts.createSourceFile(
     absolute,
@@ -402,12 +411,200 @@ function inspectSource(root, absolute, rules, microsoftCatalog) {
       id,
       objectValue(object, 'evidence', file),
       microsoftCatalog,
+      citedMicrosoftSections,
     );
     const prior = rules.get(id);
     if (prior) {
-      fail('COMPATIBILITY_DUPLICATE_ID', `${id} is declared by ${prior} and ${file}`);
+      fail('COMPATIBILITY_DUPLICATE_ID', `${id} is declared by ${prior.file} and ${file}`);
     }
-    rules.set(id, file);
+    rules.set(id, { file, name });
+  }
+  // Rule declarations (including descriptions that mention sibling rules)
+  // never count as a citation of a rule.
+  declarationRanges.set(file, calls.map((call) => {
+    const statement = call.parent.parent.parent;
+    return [statement.getStart(source), statement.getEnd()];
+  }));
+}
+
+// A catalog entry is evidence only while a rule cites it. Reject entries that
+// no rule cites so the catalog cannot accumulate unreviewed claims.
+function verifyMicrosoftCatalogCited(microsoftCatalog, citedMicrosoftSections) {
+  const unused = [...microsoftCatalog].flatMap(([document, sections]) =>
+    sections.size === 0
+      ? [document]
+      : [...sections]
+        .map((section) => `${document} ${section}`)
+        .filter((key) => !citedMicrosoftSections.has(key)));
+  if (unused.length > 0) {
+    fail(
+      'COMPATIBILITY_MICROSOFT_CATALOG_UNUSED',
+      `no rule cites ${unused.join(', ')}`,
+    );
+  }
+}
+
+function isCitationSource(file) {
+  return !file.includes('/test-support/')
+    && !file.includes('/testing/')
+    && !/\.test-support\.(?:[cm]?[jt]s|[jt]sx)$/.test(file);
+}
+
+function escapeRegExp(text) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// "Rendering logic must consume the ID" (compatibility.ts): every rule must be
+// cited, by its kebab-case id or its exported name, from at least one
+// non-test production source other than its own declaration.
+function withoutDeclarations(text, ranges = []) {
+  let result = text;
+  for (const [start, end] of [...ranges].sort((a, b) => b[0] - a[0])) {
+    result = result.slice(0, start) + result.slice(end);
+  }
+  return result;
+}
+
+// Length of the Rust string, raw string or char literal starting at `index`,
+// or 0 when `index` does not start one. Lifetimes ('a) are not literals.
+function rustLiteralLength(text, index) {
+  const raw = /^b?r(#*)"/.exec(text.slice(index, index + 260));
+  if (raw) {
+    const close = text.indexOf(`"${raw[1]}`, index + raw[0].length);
+    return close < 0 ? text.length - index : close + 1 + raw[1].length - index;
+  }
+  const quote = text[index] === 'b' ? index + 1 : index;
+  if (text[quote] === '"') {
+    let cursor = quote + 1;
+    while (cursor < text.length && text[cursor] !== '"') cursor += text[cursor] === '\\' ? 2 : 1;
+    return cursor + 1 - index;
+  }
+  if (text[quote] === "'") {
+    const char = /^'(?:\\(?:u\{[0-9a-fA-F]+\}|x[0-9a-fA-F]{2}|.)|[^\\'])'/.exec(text.slice(quote, quote + 12));
+    if (char) return quote - index + char[0].length;
+  }
+  return 0;
+}
+
+// End offset of the Rust item starting at `start`: the matching close brace
+// of its first block, or its terminating semicolon. Comments and literals are
+// skipped so braces inside them do not count.
+function rustItemEnd(text, start) {
+  let depth = 0;
+  let cursor = start;
+  while (cursor < text.length) {
+    if (text.startsWith('//', cursor)) {
+      const newline = text.indexOf('\n', cursor);
+      cursor = newline < 0 ? text.length : newline + 1;
+      continue;
+    }
+    if (text.startsWith('/*', cursor)) {
+      const close = text.indexOf('*/', cursor + 2);
+      cursor = close < 0 ? text.length : close + 2;
+      continue;
+    }
+    // A literal cannot start inside an identifier (for example `br` in `bar`).
+    const literal = /[A-Za-z0-9_]/.test(text[cursor - 1] ?? '') ? 0 : rustLiteralLength(text, cursor);
+    if (literal > 0) {
+      cursor += literal;
+      continue;
+    }
+    const char = text[cursor];
+    if (char === '{') depth += 1;
+    if (char === '}') {
+      depth -= 1;
+      if (depth === 0) return cursor + 1;
+    }
+    if (char === ';' && depth === 0) return cursor + 1;
+    cursor += 1;
+  }
+  return text.length;
+}
+
+// Rust tests are not production citations: drop every test-only item (test
+// modules, helpers, impls) and every `#[test]` function, together with the doc
+// comments, comments and attributes attached above it. A `cfg` predicate that
+// mentions `test` outside `not(test)` counts as test-only; this errs toward
+// stripping, which can only make the citation gate stricter.
+// Outer attributes `#[...]` with balanced brackets, so nested cfg predicates
+// such as cfg(any(all(test, feature = "x"))) are read whole.
+function rustAttributes(text) {
+  const attributes = [];
+  for (let start = text.indexOf('#['); start >= 0; start = text.indexOf('#[', start + 2)) {
+    let depth = 0;
+    let end = -1;
+    for (let i = start + 1; i < text.length; i++) {
+      if (text[i] === '[') depth += 1;
+      else if (text[i] === ']' && --depth === 0) { end = i + 1; break; }
+    }
+    if (end > 0) attributes.push({ index: start, text: text.slice(start, end) });
+  }
+  return attributes;
+}
+
+function isTestOnlyAttribute(attribute) {
+  const body = attribute.replace(/\s+/g, '');
+  if (body === '#[test]') return true;
+  if (!body.startsWith('#[cfg(')) return false;
+  return /\btest\b/.test(body.slice('#[cfg'.length).replace(/not\(test\)/g, ''));
+}
+
+// Start of the comment and attribute lines directly attached above `index`,
+// including `/** ... */` and `/* ... */` blocks that end on their own line.
+function attachedItemStart(text, index) {
+  let start = text.lastIndexOf('\n', index - 1) + 1;
+  while (start > 0) {
+    const previousStart = text.lastIndexOf('\n', start - 2) + 1;
+    const line = text.slice(previousStart, start - 1).trim();
+    if (line.startsWith('//') || (line.startsWith('#[') && line.endsWith(']'))) {
+      start = previousStart;
+    } else if (line.endsWith('*/')) {
+      const open = text.lastIndexOf('/*', start - 1);
+      if (open < 0) break;
+      start = text.lastIndexOf('\n', open - 1) + 1;
+    } else {
+      break;
+    }
+  }
+  return Math.max(start, 0);
+}
+
+function withoutRustTestItems(text) {
+  let result = '';
+  let cursor = 0;
+  for (const attribute of rustAttributes(text)) {
+    if (attribute.index < cursor || !isTestOnlyAttribute(attribute.text)) continue;
+    const end = rustItemEnd(text, attribute.index + attribute.text.length);
+    result += text.slice(cursor, Math.max(cursor, attachedItemStart(text, attribute.index)));
+    cursor = end;
+  }
+  return result + text.slice(cursor);
+}
+
+function verifyRulesCited(root, rules, declarationRanges) {
+  const sources = listFiles(resolve(root, DOCX_SOURCE))
+    .filter(isProductionTypeScript)
+    .map((absolute) => posixPath(relative(root, absolute)))
+    .filter(isCitationSource)
+    .map((file) => withoutDeclarations(
+      readFileSync(resolve(root, file), 'utf8'),
+      declarationRanges.get(file),
+    ))
+    // Parser-owned rules (for example chart-space defaults) are implemented
+    // in the DOCX Rust parser and cite their id there.
+    .concat(listFiles(resolve(root, DOCX_PARSER_SOURCE))
+      .filter((absolute) => absolute.endsWith('.rs'))
+      .map((absolute) => withoutRustTestItems(readFileSync(absolute, 'utf8'))));
+  const uncited = [...rules].filter(([id, { name }]) => {
+    const idPattern = new RegExp(`(?<![a-z0-9-])${escapeRegExp(id)}(?![a-z0-9-])`);
+    const namePattern = new RegExp(`(?<![A-Za-z0-9_$])${name}(?![A-Za-z0-9_$])`);
+    return !sources.some((text) => idPattern.test(text) || namePattern.test(text));
+  }).map(([id]) => id);
+  if (uncited.length > 0) {
+    fail(
+      'COMPATIBILITY_RULE_UNCITED',
+      `no production source cites ${uncited.join(', ')}`,
+    );
   }
 }
 
@@ -458,14 +655,25 @@ function verifyObservationBaseline(root, observations) {
 export function checkDocxCompatibilityEvidence(root) {
   const rules = new Map();
   const microsoftCatalog = microsoftEvidenceCatalog(root);
+  const citedMicrosoftSections = new Set();
+  const declarationRanges = new Map();
   const sourceRoot = resolve(root, DOCX_SOURCE);
   for (const file of listFiles(sourceRoot).filter(isProductionTypeScript)) {
-    inspectSource(root, file, rules, microsoftCatalog);
+    inspectSource(
+      root,
+      file,
+      rules,
+      microsoftCatalog,
+      citedMicrosoftSections,
+      declarationRanges,
+    );
   }
   if (rules.size === 0) fail('COMPATIBILITY_REGISTRY_EMPTY', DOCX_SOURCE);
+  verifyMicrosoftCatalogCited(microsoftCatalog, citedMicrosoftSections);
+  verifyRulesCited(root, rules, declarationRanges);
   const observations = observationKeys(root);
   verifyObservationBaseline(root, observations);
-  return Object.freeze([...rules].map(([id, file]) => Object.freeze({ id, file })));
+  return Object.freeze([...rules].map(([id, { file }]) => Object.freeze({ id, file })));
 }
 
 if (process.argv[1]

@@ -25,7 +25,7 @@
  * contract (fonts must be ready before the caller measures/paints text).
  */
 import { activeFontSet, withFontCeiling } from './preload.js';
-import { retainFace, releaseFaces, _resetFontRegistryForTests } from './font-registry.js';
+import { retainFace, releaseFaces } from './font-registry.js';
 import { HARD_MAX_EMBEDDED_FONT_BYTES } from '../worker/resource-policy.generated.js';
 
 /** Shared admission check for work that must inspect an embedded font before
@@ -37,12 +37,6 @@ export function embeddedFontBytesAreWithinLimit(
 ): boolean {
   return bytes.byteLength > 0 && bytes.byteLength <= maxBytes;
 }
-
-/** Test hook — clears the shared FontFace refcount registry (does NOT touch any
- *  FontFaceSet; tests install a fresh fake set per case). Re-exported here under
- *  the embedded name so existing embedded-font tests keep their reset call; the
- *  registry itself is now shared with the Google-Fonts preloader. */
-export const _resetEmbeddedRegistryForTests = _resetFontRegistryForTests;
 
 /**
  * ECMA-376 §17.8.1 — de-obfuscate a WordprocessingML embedded font (`.odttf`).

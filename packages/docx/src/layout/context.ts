@@ -12,7 +12,7 @@ import {
   type SectionLayoutContext,
   type SectionGridContext,
 } from '../layout-context.js';
-import type { DeepReadonly, NativeSectionFlow } from './types.js';
+import type { DeepReadonly, SectionFlow } from './types.js';
 import { wordBookFoldGutterEdge } from './section-compatibility.js';
 import {
   logicalToPhysicalMatrix,
@@ -30,8 +30,8 @@ export interface PageFlowSectionContext {
   readonly geometry: Readonly<SectionGeom>;
   readonly columns: readonly Readonly<ColumnGeom>[];
   readonly textDirection: string;
-  /** Canonical native flow; absent for every OOXML section. */
-  readonly nativeSectionFlow?: NativeSectionFlow;
+  /** Canonical producer section flow; absent for every OOXML section. */
+  readonly sectionFlow?: SectionFlow;
   /** §17.6.1 section direction controls newspaper-column population order. */
   readonly sectionBidi: boolean;
   readonly grid: Readonly<SectionGridContext>;
@@ -42,7 +42,7 @@ export function createPageFlowSectionContext(input: Readonly<{
   geometry: SectionGeom;
   columns: readonly Readonly<ColumnGeom>[];
   textDirection: string;
-  nativeSectionFlow?: NativeSectionFlow;
+  sectionFlow?: SectionFlow;
   sectionBidi?: boolean;
   grid?: Readonly<SectionGridContext>;
 }>): PageFlowSectionContext {
@@ -57,7 +57,7 @@ export function createPageFlowSectionContext(input: Readonly<{
     geometry: Object.freeze({ ...input.geometry }),
     columns: Object.freeze(input.columns.map((column) => Object.freeze({ ...column }))),
     textDirection: input.textDirection,
-    ...(input.nativeSectionFlow ? { nativeSectionFlow: input.nativeSectionFlow } : {}),
+    ...(input.sectionFlow ? { sectionFlow: input.sectionFlow } : {}),
     sectionBidi: input.sectionBidi ?? false,
     grid: Object.freeze(input.grid ?? {
       kind: 'none',
@@ -83,14 +83,14 @@ export function sectionBodyInsetPt(marginPt: number): number {
 }
 
 /** Physical-to-logical quarter turn for vertical section body layout. The
- * established Transitional-token mapping is unchanged; a native flow derives
- * its edges from its own canonical matrix (BtoT: logical left/right/top/bottom
+ * established Transitional-token mapping is unchanged; a section flow derives
+ * its edges from its own canonical matrix (bottomToTop: logical left/right/top/bottom
  * are the physical bottom/top/left/right margins). */
 export function logicalSectionGeometry(
   physical: SectionGeom,
-  nativeSectionFlow?: NativeSectionFlow | null,
+  sectionFlow?: SectionFlow | null,
 ): SectionGeom {
-  if (nativeSectionFlow != null) {
+  if (sectionFlow != null) {
     const edges = transformRectEdges(
       physicalToLogicalMatrix('sideways-lr', {
         widthPt: physical.pageWidth,
@@ -129,9 +129,9 @@ export function logicalSectionGeometry(
 /** Inverse logical-to-physical quarter turn for a vertical section page box. */
 export function physicalSectionGeometry(
   logical: SectionGeom,
-  nativeSectionFlow?: NativeSectionFlow | null,
+  sectionFlow?: SectionFlow | null,
 ): SectionGeom {
-  if (nativeSectionFlow != null) {
+  if (sectionFlow != null) {
     const edges = transformRectEdges(
       logicalToPhysicalMatrix('sideways-lr', {
         widthPt: logical.pageHeight,
@@ -201,6 +201,7 @@ export function effectivePhysicalSectionGeometry(
     pageWidth /= 2;
     // ECMA-376 §§17.15.1.11/.13 define a half-sheet editing page and automatic
     // gutter placement; the bisector edge is compatibility-owned.
+    // `word-book-fold-gutter-right-edge`
     if (wordBookFoldGutterEdge() === 'right') marginRight += policy.gutterPt;
   } else if (policy.printTwoOnOne) {
     pageHeight /= 2;
@@ -233,7 +234,7 @@ export function resolveSectionContextForPage(
 ): SectionLayoutContext {
   const physical = effectivePhysicalSectionGeometry(policy, pageIndex);
   const geometry = isVerticalSectionDirection(policy.textDirection)
-    ? logicalSectionGeometry(physical, base.nativeSectionFlow)
+    ? logicalSectionGeometry(physical, base.sectionFlow)
     : physical;
   return Object.freeze({
     ...base,
@@ -283,9 +284,9 @@ export interface BodySectionOccurrence {
   /** Physical §17.6.13/§17.6.11 page box; writing-mode transforms happen later. */
   readonly geometry: SectionGeom;
   readonly textDirection: string | null;
-  /** Canonical native flow normalized at the parser-model boundary; absent for
+  /** Canonical section flow normalized at the parser-model boundary; absent for
    * OOXML sections. Layout never sees the raw parser wire. */
-  readonly nativeSectionFlow?: NativeSectionFlow;
+  readonly sectionFlow?: SectionFlow;
   readonly pageNumType: PageNumType | null;
   readonly headers: HeadersFooters;
   readonly footers: HeadersFooters;
@@ -341,7 +342,7 @@ export function defaultSectionGeometry(): SectionGeom {
 export function resolveAcquiredSectionLayoutContext(
   section: SectionProps,
   sectionBidi = false,
-  nativeSectionFlow?: NativeSectionFlow,
+  sectionFlow?: SectionFlow,
 ): SectionLayoutContext {
   const gridKind = section.docGridType === 'lines'
     || section.docGridType === 'linesAndChars'
@@ -358,7 +359,7 @@ export function resolveAcquiredSectionLayoutContext(
       charSpacePt: section.docGridCharSpace == null ? null : section.docGridCharSpace / 4096,
     }),
     textDirection: section.textDirection ?? 'lrTb',
-    ...(nativeSectionFlow ? { nativeSectionFlow } : {}),
+    ...(sectionFlow ? { sectionFlow } : {}),
     sectionBidi,
     verticalAlignment: section.vAlign ?? 'top',
     ...(section.lineNumbering === null || section.lineNumbering === undefined

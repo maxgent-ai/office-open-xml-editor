@@ -57,10 +57,7 @@ for (const slide of SLIDES) {
   });
 }
 
-const PRIVATE_CORPUS = (
-  process.env.VRT_PRIVATE_CORPUS === '1'
-  || process.env.VRT_PRIVATE_WORKER_PARITY === '1'
-)
+const PRIVATE_CORPUS = process.env.VRT_PRIVATE_CORPUS === '1'
   ? readdirSync('public/private/pptx')
       .filter((file) => file.endsWith('.pptx') && !file.startsWith('~$'))
       .map((file) => `pptx/${file}`)

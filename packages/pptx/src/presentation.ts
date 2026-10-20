@@ -13,6 +13,7 @@ import {
   resolveInternalSlideTarget,
   type SlidePartNames,
 } from './slide-nav';
+import { acquireOfficeRoutes, distinctOfficeRouteLoads, type AcquiredOfficeRoutes } from './office-route-acquisition.js';
 import {
   GoogleFontPreloadLease,
   type FontPreloadDemand,
@@ -28,6 +29,7 @@ import {
   toArrayBuffer,
   OoxmlResourceLimitError,
   type LoadOptions as CoreLoadOptions,
+  type ModelSource,
   type ProgressiveLayoutPartial,
   type ProgressiveLayoutProgress,
   type MathRenderer,
@@ -38,7 +40,6 @@ import {
   type ImageResourceOptions,
   type OoxmlResourceMetrics,
   type LoadedOfficeFontFallbacks,
-  type OfficeFontFallbackRoute,
   workerRendererDescriptors,
 } from '@silurus/ooxml-core';
 import {
@@ -95,9 +96,18 @@ import {
 } from './element-selection';
 import { publishPptxLayout } from './presentation-layout-events';
 import { yieldToHostTaskQueue } from './worker-task-scheduler';
+import { deferred, type Deferred } from '@silurus/ooxml-core/internal/deferred';
 
 /** Options for {@link PptxPresentation.load}. */
 export type LoadOptions = CoreLoadOptions & {
+  /**
+   * Opt-in model source for presentation input that is not an OOXML package (a
+   * `ModelSource<'pptx'>`). When its `claim()` accepts the raw bytes, it
+   * opens them in the parser realm through its own module; otherwise the
+   * ordinary OOXML path runs unchanged. A source for another format is a
+   * `TypeError`. Omitting this option imports and runs nothing extra.
+   */
+  legacyPpt?: ModelSource<'pptx'>;
   /**
    * 'main' (default): parse in a worker, render on the main thread (current
    * behaviour). 'worker': parse AND render inside the worker; use
@@ -130,22 +140,6 @@ export type LoadOptions = CoreLoadOptions & {
    * directly and does not call this observer. Observer failures are isolated. */
   onLayoutComplete?: (error?: unknown) => void;
 };
-
-interface Deferred<T> {
-  readonly promise: Promise<T>;
-  resolve(value: T | PromiseLike<T>): void;
-  reject(reason?: unknown): void;
-}
-
-function deferred<T>(): Deferred<T> {
-  let resolve!: Deferred<T>['resolve'];
-  let reject!: Deferred<T>['reject'];
-  const promise = new Promise<T>((res, rej) => {
-    resolve = res;
-    reject = rej;
-  });
-  return { promise, resolve, reject };
-}
 
 interface ProgressiveLoad {
   readonly onProgress?: LoadOptions['onLayoutProgress'];
@@ -341,7 +335,7 @@ export class PptxPresentation {
     source: string | ArrayBuffer,
     opts: LoadOptions = {},
   ): Promise<PptxPresentation> {
-    if (__OOXML_MODEL_SOURCES__ && opts.modelSources !== undefined) {
+    if (__OOXML_MODEL_SOURCES__ && opts.legacyPpt !== undefined) {
       const { loadPptxModelSource } = await import('./internal/presentation-model-source.js');
       return loadPptxModelSource(source, opts);
     }
@@ -529,6 +523,9 @@ export class PptxPresentation {
         this._embeddedFontTuples = loaded.tuples;
       }
     });
+    // Preflight can outlast a font failure. Observe it immediately while keeping
+    // the original rejection for the authoritative await below.
+    void embeddedFontLoad.catch(() => undefined);
     this._slidePullClient = new PptxSlidePullClient({
       slideCount: bootstrap.slideCount,
       transport: this._bridge.transport(isPptxSlidePullResponse),
@@ -617,6 +614,9 @@ export class PptxPresentation {
         this._embeddedFontTuples = loaded.tuples;
       }
     });
+    // Preflight can outlast a font failure. Observe it immediately while keeping
+    // the original rejection for the authoritative await below.
+    void embeddedFontLoad.catch(() => undefined);
     this._slidePullClient = this._createSlidePullClient(bootstrap.slideCount, timeoutMs, onUsage);
     this._slides = new PptxSlideRepository({
       slideCount: bootstrap.slideCount,
@@ -1046,26 +1046,19 @@ export class PptxPresentation {
   private async _officeRoutesForRequests(
     requests: readonly import('@silurus/ooxml-core').OfficeFontFallbackRequest[],
     fontSet: FontFaceSet | null,
-  ): Promise<Record<string, OfficeFontFallbackRoute>> {
+  ): Promise<AcquiredOfficeRoutes> {
     if (this._destroyed) throw new Error('Presentation destroyed');
-    if (!fontSet) return {};
+    if (!fontSet) return { routes: {}, installed: [] };
     const uncovered = uncoveredOfficeFontRequests(requests, this._embeddedFontTuples);
     let loads = this._officeFontLoads.get(fontSet);
     if (!loads) {
       loads = new Map();
       this._officeFontLoads.set(fontSet, loads);
     }
-    const loaded = await Promise.all(uncovered.map((request) => {
-      const key = `calibri:${request.weight}:${request.style}`;
-      let pending = loads.get(key);
-      if (!pending) {
-        pending = loadOfficeFontFallbacks([request], fontSet);
-        loads.set(key, pending);
-      }
-      return pending;
-    }));
+    const acquired = await acquireOfficeRoutes(loads, uncovered,
+      (fresh) => loadOfficeFontFallbacks(fresh, fontSet), fontSet);
     if (this._destroyed) throw new Error('Presentation destroyed');
-    return Object.assign({}, ...loaded.map((entry) => entry.routes)) as Record<string, OfficeFontFallbackRoute>;
+    return acquired;
   }
 
   /** Render a slide onto the given canvas. */
@@ -1095,7 +1088,7 @@ export class PptxPresentation {
       const fontSet = isHTMLCanvas(canvas)
         ? canvas.ownerDocument.fonts
         : (typeof document !== 'undefined' ? document.fonts : null);
-      const officeFontRoutes = await this._officeRoutesForRequests(requests, fontSet);
+      const { routes: officeFontRoutes, installed: officeInstalledFamilies } = await this._officeRoutesForRequests(requests, fontSet);
       await repository.withSlide(slideIndex, (slide) => {
         // A render may have waited behind another consumer after its public
         // entrance check. Re-check the presentation poison at the ownership
@@ -1119,6 +1112,7 @@ export class PptxPresentation {
             embeddedFontAuthoredFamilies: this._embeddedFontAuthoredFamilies,
             embeddedFontTuples: this._embeddedFontTuples,
             officeFontRoutes,
+            officeInstalledFamilies,
             googleSubstitutes: this._googleSubstitutes,
             fetchMedia: this._fetchMedia,
             fetchImage: this._fetchImage,
@@ -1635,7 +1629,7 @@ export class PptxPresentation {
     this._googleFonts?.release();
     this._googleFonts = null;
     for (const loads of this._officeFontLoads.values()) {
-      for (const pending of loads.values()) {
+      for (const pending of distinctOfficeRouteLoads(loads)) {
         void pending.then((loaded) => unloadOfficeFontFallbacks(loaded.faces));
       }
     }

@@ -44,60 +44,13 @@ import {
   verticalTrLongMark,
   verticalVertGlyphReachable,
   withVertFeature,
+  emBoxCenterAboveBaseline,
+  inkCenterAboveMiddlePx,
 } from '@silurus/ooxml-core';
 
 type Ctx2D = CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D;
 type VertCapability = (cp: number) => boolean;
 const NO_VERT_CAPABILITY: VertCapability = () => false;
-
-/**
- * Cross-axis (column-thickness) offset, in px, from the alphabetic baseline to
- * the font's EM-BOX CENTRE — `(fontBoundingBoxAscent − fontBoundingBoxDescent)/2`.
- *
- * In the rotated eaVert frame the horizontal layout hands us the run's ALPHABETIC
- * baseline; the column's cross-axis centre (where the sideways glyphs' ink already
- * sits and where the upright cells must centre) is this many px ABOVE it. Using
- * the font metric keeps upright and sideways glyphs sharing one centreline.
- *
- * Falls back to `0.38 × fontPx` when the Canvas does not report `fontBoundingBox*`.
- */
-function emBoxCenterAboveBaselinePx(ctx: Ctx2D, sample: string, fontPx: number): number {
-  const prevBaseline = ctx.textBaseline;
-  ctx.textBaseline = 'alphabetic';
-  const m = ctx.measureText(sample);
-  ctx.textBaseline = prevBaseline;
-  const asc = m.fontBoundingBoxAscent;
-  const desc = m.fontBoundingBoxDescent;
-  if (typeof asc === 'number' && typeof desc === 'number' && (asc !== 0 || desc !== 0)) {
-    return (asc - desc) / 2;
-  }
-  return 0.38 * fontPx;
-}
-
-/**
- * Along-column offset, in px, from a glyph's own cell centre to its INK centre
- * when drawn UPRIGHT — `(actualBoundingBoxAscent − actualBoundingBoxDescent)/2`
- * measured with a `middle` textBaseline. For an ordinary ideograph/kana this is
- * ≈0; for a substituted vertical bracket (︵ ︶ ﹁ ﹂, whose ink hugs one cell end)
- * it is the shift that re-centres the ink so the two halves sit a full cell apart.
- *
- * Returns 0 when the Canvas does not report `actualBoundingBox*` (older engines).
- */
-function inkCenterAboveMiddlePx(ctx: Ctx2D, drawStr: string): number {
-  const prevAlign = ctx.textAlign;
-  const prevBaseline = ctx.textBaseline;
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-  const m = ctx.measureText(drawStr);
-  ctx.textAlign = prevAlign;
-  ctx.textBaseline = prevBaseline;
-  const asc = m.actualBoundingBoxAscent;
-  const desc = m.actualBoundingBoxDescent;
-  if (typeof asc === 'number' && typeof desc === 'number') {
-    return (asc - desc) / 2;
-  }
-  return 0;
-}
 
 /**
  * Paint one run's glyphs for an `eaVert` text body. The context is assumed to be
@@ -143,7 +96,7 @@ export function drawEaVertRunWithCapability(
   // The alphabetic `baseline` sits this many px BELOW the em-box centre; the
   // sideways (Latin) glyphs already centre their ink there, so the upright cells
   // centre on the same line by drawing at `crossCenterY`.
-  const emBoxCenterPx = emBoxCenterAboveBaselinePx(ctx, text, fontPx);
+  const emBoxCenterPx = emBoxCenterAboveBaseline(ctx, text, fontPx);
   const crossCenterY = baseline - emBoxCenterPx;
   let ax = 0; // cumulative advance from the run's left (logical +x)
   for (const ch of text) {

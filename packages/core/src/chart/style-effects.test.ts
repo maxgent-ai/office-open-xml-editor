@@ -104,6 +104,18 @@ function recordingContext() {
 }
 
 describe('chart style effect painting', () => {
+  it('budgets the complete padded coverage raster and fractional-pixel rounding', () => {
+    const work = chartEffectRasterWorkUpperBound({
+      softEdge: { radius: 10 * 12_700 },
+      innerShadow: { ...SHADOW, blur: 4 * 12_700, dist: 3 * 12_700 },
+    }, { x: 100.25, y: 100.25, w: 100, h: 100 }, 1 / 12_700, 400, 400);
+    // Existing soft-edge work allowance: 32px per side, three surfaces.
+    // Inner shadow: 17px per side, two surfaces. Coverage uses their source
+    // union (17px), for both canvas and RGBA readback.
+    // Fractional origins require ceil(end) - floor(start), not ceil(width).
+    expect(work).toBe(165 * 165 * 3 + 135 * 135 * 2 + 135 * 135 * 2);
+  });
+
   it('charges a reflection as one full-canvas surface', () => {
     const reflection = {
       blur: 0, dist: 0, dir: 90, stA: 1, stPos: 0,

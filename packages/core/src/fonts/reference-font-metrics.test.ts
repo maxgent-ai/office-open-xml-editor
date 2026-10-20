@@ -28,21 +28,21 @@ describe('findReferenceFontMetrics', () => {
     expect(postscript[0]?.family).toBe('Times New Roman');
   });
 
-  it('retains only source-verified normal-style tuples from published open fonts', () => {
-    const regular = findReferenceFontMetrics('BIZ UDMincho', {
+  it.each(['BIZ UDMincho', 'BIZ UDGothic'])('retains source-verified normal-style tuples for %s', (family) => {
+    const regular = findReferenceFontMetrics(family, {
       source: 'published-open-font', weight: 400, style: 'normal',
     });
-    const bold = findReferenceFontMetrics('BIZUDMincho-Bold', {
+    const bold = findReferenceFontMetrics(family.replace(' ', '') + '-Bold', {
       source: 'published-open-font', weight: 700, style: 'normal',
     });
     expect(regular).toHaveLength(1);
     expect(bold).toHaveLength(1);
     for (const profile of [regular[0], bold[0]]) {
       expect(profile).toMatchObject({
-        unitsPerEm: 2048, hhea: [1802, -246, 0], farEastCodePage: true,
+        unitsPerEm: 2048, hhea: [1802, -246, 0], win: [1802, 246], farEastCodePage: true,
       });
     }
-    expect(findReferenceFontMetrics('BIZ UDMincho', {
+    expect(findReferenceFontMetrics(family, {
       source: 'published-open-font', weight: 400, style: 'italic',
     })).toHaveLength(0);
   });

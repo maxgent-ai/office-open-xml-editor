@@ -1,3 +1,5 @@
+import { safeUtf16Prefix } from './utf16-prefix.js';
+
 /**
  * Small browser-viewer mechanics shared by the format packages. This module is
  * intentionally an internal subpath: it owns DOM/canvas lifecycle facts, never
@@ -25,16 +27,6 @@ function boundedSelectionLimit(value: number | undefined, maximum: number, name:
     throw new RangeError(`${name} must be a finite non-negative number.`);
   }
   return Math.min(maximum, Math.floor(requested));
-}
-
-function safeUtf16Prefix(value: string, maxCodeUnits: number): string {
-  let end = Math.min(value.length, maxCodeUnits);
-  if (end > 0 && end < value.length) {
-    const previous = value.charCodeAt(end - 1);
-    const next = value.charCodeAt(end);
-    if (previous >= 0xD800 && previous <= 0xDBFF && next >= 0xDC00 && next <= 0xDFFF) end--;
-  }
-  return value.slice(0, end);
 }
 
 function* descendantTextNodes(root: Node): Iterable<Text> {

@@ -68,10 +68,12 @@ export function resolvePointSpaceFloatingTableBoxPt(
     : verticalFrame.yPt + positioning.yPt;
   if (!skipVerticalClamp
     && (positioning.vertAnchor === 'page' || positioning.vertAnchor === 'margin')
-    && y + heightPt > endY(verticalFrame)) {
-    // ECMA-376 leaves mid-cell/page overflow policy open; retain the explicit
-    // bottom-clamp already used by this renderer without claiming Word normativity.
-    y = Math.max(verticalFrame.yPt, endY(verticalFrame) - heightPt);
+    && y + heightPt > endY(frames.page)) {
+    // ECMA-376 leaves page overflow open. `word-page-anchored-table-text-area-move`:
+    // clamp a page- or margin-anchored table up to the page's bottom edge
+    // only, never into the margin band; pagination moves a table that ends
+    // below the bottom margin.
+    y = Math.max(frames.page.yPt, endY(frames.page) - heightPt);
   }
   return Object.freeze({ x, y, w: widthPt, h: heightPt });
 }
@@ -240,16 +242,14 @@ export function resolveFloatingTablePlacementInTransaction(
     blockers: registry
       .filter((entry) => entry.kind !== 'shape' || entry.wrap !== undefined)
       .map(floatRegistryParticipant),
-    avoidance: floatingTableAvoidance(
-      placement.overlap,
-      transaction.nextParagraphId,
-    ),
+    avoidance: floatingTableAvoidance(),
     rightBoundaryPt: endX(frames.page),
     // Preserve the numeric policy used by the former scalar adapter. This is
     // especially important at an authored page edge, where sub-twip rounding
     // must not turn a horizontal fit into a vertical displacement.
     overlapEpsilonPt: FLOAT_OVERLAP_EPS,
     rightBoundarySlackPt: FLOAT_PAGE_RIGHT_SLACK,
+    pageVerticalBoundsPt: { topPt: frames.page.yPt, bottomPt: frames.page.yPt + frames.page.heightPt },
   });
   const finalPlacement = resolvedPlacement(
     placement,

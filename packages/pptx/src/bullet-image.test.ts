@@ -244,6 +244,20 @@ describe('renderTextBody — picture bullet (buBlip) draws the bitmap', () => {
     expect(d.w).toBeCloseTo(d.h * SENTINEL_RATIO, 6);
   });
 
+  it.each(['wordArtVert', 'wordArtVertRtl'])('draws a warmed picture marker in %s', async (vert) => {
+    const path = 'ppt/media/vertical-bullet.png';
+    await getCachedBitmap(path, 'image/png', fetchImage);
+    const body = bodyWithBullet(blipBullet({ imagePath: path }));
+    body.vert = vert;
+    const { ctx, draws } = mockCtx();
+    renderTextBody(ctx, body, 0, 0, 4000, 2000, SCALE, null, 0, false, false, '#000000', 1,
+      { themeMajorFont: null, themeMinorFont: null, dpr: 1 }, undefined, false, fetchImage);
+    expect(draws).toHaveLength(1);
+    expect(draws[0].img).toBe(SENTINEL);
+    expect(draws[0].h).toBeCloseTo(20);
+    expect(draws[0].w).toBeCloseTo(20 * SENTINEL_RATIO);
+  });
+
   it('preserves a safe native cache variant prepared by renderSlide', async () => {
     const path = 'ppt/media/large-picture-bullet.png';
     const largePng = pngHeader(4096, 2048);

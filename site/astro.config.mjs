@@ -1,6 +1,7 @@
 import { defineConfig } from 'astro/config';
 import wasm from 'vite-plugin-wasm';
 import { fileURLToPath } from 'node:url';
+import { docxCompatibilityMetadata } from '../scripts/docx-compatibility-build.mjs';
 
 const pkgSrc = (p) => fileURLToPath(new URL(`../packages/${p}/src/index.ts`, import.meta.url));
 
@@ -19,10 +20,10 @@ export default defineConfig({
     // leave Astro's separately emitted page scripts using Viewer exports before
     // their chunks have initialized.
     build: { target: 'esnext' },
-    plugins: [wasm()],
+    plugins: [docxCompatibilityMetadata(), wasm()],
     worker: {
       format: 'es',
-      plugins: () => [wasm()],
+      plugins: () => [docxCompatibilityMetadata(), wasm()],
       // Inline parser workers run from Blob URLs and cannot resolve relative
       // sibling chunks. Keep dynamic analysis within the emitted worker module.
       rollupOptions: { output: { inlineDynamicImports: true } },
@@ -31,6 +32,11 @@ export default defineConfig({
       // Pull the workspace packages from source so Vite processes their
       // `?worker&inline` / `?url` imports (same flow as Storybook).
       alias: {
+        // The built optional companion uses the installed viewer ABI; site demos
+        // compile that viewer from source. Keep both on this one runtime contract.
+        '@silurus/ooxml/internal/companion': fileURLToPath(
+          new URL('../src/internal-companion.ts', import.meta.url),
+        ),
         // Public package entry used by executable documentation examples.
         // Resolve it to the same source entry as the site's internal package
         // import so the displayed code is also the code that runs.
@@ -41,6 +47,9 @@ export default defineConfig({
         // Keep core subpaths ahead of the package-root prefix alias; otherwise
         // Vite appends them to the root entry file (for example,
         // `src/index.ts/internal/resource-measurement`).
+        '@silurus/ooxml-core/internal/duotone-only-bitmap': fileURLToPath(
+          new URL('../packages/core/src/image/duotone-only-bitmap-by-path.ts', import.meta.url),
+        ),
         '@silurus/ooxml-core/internal/model-source': fileURLToPath(
           new URL('../packages/core/src/source/model-source.ts', import.meta.url),
         ),
@@ -55,6 +64,9 @@ export default defineConfig({
         ),
         '@silurus/ooxml-core/internal/office-auto-line': fileURLToPath(
           new URL('../packages/core/src/fonts/office-auto-line.ts', import.meta.url),
+        ),
+        '@silurus/ooxml-core/internal/font-decoration': fileURLToPath(
+          new URL('../packages/core/src/text/font-decoration.ts', import.meta.url),
         ),
         '@silurus/ooxml-core/internal/bounded-async-lru-cache': fileURLToPath(
           new URL('../packages/core/src/internal/bounded-async-lru-cache.ts', import.meta.url),
@@ -97,6 +109,15 @@ export default defineConfig({
         ),
         '@silurus/ooxml-core/internal/script-preload-accumulator': fileURLToPath(
           new URL('../packages/core/src/internal/script-preload-accumulator.ts', import.meta.url),
+        ),
+        '@silurus/ooxml-core/internal/sha256': fileURLToPath(
+          new URL('../packages/core/src/crypto/sha256.ts', import.meta.url),
+        ),
+        '@silurus/ooxml-core/internal/font-stack': fileURLToPath(
+          new URL('../packages/core/src/fonts/font-stack.ts', import.meta.url),
+        ),
+        '@silurus/ooxml-core/internal/worker-model-source': fileURLToPath(
+          new URL('../packages/core/src/source/worker-model-source.ts', import.meta.url),
         ),
         // Viewer collaborators have matching source and declaration shims in
         // core/src/internal; resolve them before the bare core entry alias.

@@ -4,7 +4,7 @@ import {
   seaMixedBreakOffsets,
   seaTransitionOffsets,
 } from '@silurus/ooxml-core';
-import { layoutLines, type LayoutLine, type LayoutSeg, type LayoutTextSeg } from './line-layout.js';
+import { layoutLines, type LayoutLine, type LayoutTextSeg } from './line-layout.js';
 
 // Issue #960 — no-space SEA↔Latin/CJK/digit script-transition boundaries, and
 // mixed CJK+SEA runs. Adjudicated against Word-exported ground truth

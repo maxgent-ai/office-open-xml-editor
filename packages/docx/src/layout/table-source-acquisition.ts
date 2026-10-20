@@ -40,6 +40,9 @@ export interface TableLayoutAcquisitionWire {
   readonly effectiveStyleId: string | null;
   readonly cellFrame?: DeepReadonly<FramePr> | null;
   readonly ordinaryFlow: boolean;
+  /** The producer supplies the indent as the physical outer table edge and
+   * its own grid, so OOXML table compatibility modes do not apply. */
+  readonly outerEdgeIndent?: boolean;
   readonly logicalSequenceId?: string | null;
   readonly logicalRowOffset?: number;
   readonly logicalTotalRows?: number;
@@ -213,6 +216,17 @@ export function projectEffectiveTablePreferredWidthPt(
     return input.semantic.widthPct / 5000 * availableWidthPt;
   }
   return null;
+}
+
+/** The effective tblW when it is an absolute length (dxa), else null. */
+export function absoluteTablePreferredWidthPt(input: TableSourceAcquisitionInput): number | null {
+  if (input.format.firstRowException?.preferredWidthAuthored) {
+    const exception = input.format.firstRowException.preferredWidth;
+    return exception?.kind === 'dxa' && exception.value > 0 ? exception.value : null;
+  }
+  const lexical = tableWidthConstraintFromLexical(input.lexical.table?.preferredWidth);
+  if (lexical) return lexical.kind === 'dxa' && lexical.value > 0 ? lexical.value : null;
+  return input.semantic.widthPt != null && input.semantic.widthPt > 0 ? input.semantic.widthPt : null;
 }
 
 const tableGridPointFactors: Readonly<Record<string, string>> = Object.freeze({

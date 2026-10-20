@@ -16,13 +16,12 @@ import {
   catAxisLabelBandH,
   chartLegendBands,
   chartAxisTitleBands,
-  axisTitleFontPx,
   chartTextFontSizePx,
 } from '../layout.js';
 
 import { axisLineWidthPx, resolveAxisLine, isCrossBetween } from '../axis-style.js';
 import { formatCategoryLabel } from '../chart-number-format.js';
-import { elideToWidth } from '../text-elide.js';
+import { authoredExtraLinesHeight, axisLabelLineHeightPx, fillAuthoredText, measureAuthoredTextWidth } from '../chart-text-lines.js';
 import { categoryLabelAnchorFraction, categoryLabelOffsetPx } from '../category-spacing.js';
 
 import { chartSeriesVariesByPoint } from '../effective-style.js';
@@ -37,7 +36,7 @@ import { chartHasDataTable, chartDataTableBaseHeight, chartDataTableHeaderWidth,
 import { createDataLabelLegendKeyResolver, measuredLegendReserve, drawLegendForLayout } from '../shared/legend.js';
 import { drawAxisTick, strokeAxisSegment, strokeValueGridlineH, valGridStroke, valMinorGridStroke, catAxisReversed, drawValMajorGridlines, formatPrimaryValueAxisTick, formatAxisTickWithUnits, planValueAxis, axisLabelPx, catLabelsVisible, catLabelRotationRad, drawRotatedCatLabel } from '../shared/axis.js';
 import { drawSeriesTrendlines } from '../shared/trendline.js';
-import { chartDateAxisPlan, forEachErrorBarEndpoint, computeSecondaryAxis, drawSecondaryValueGridlines, drawSecondaryValueAxis } from '../shared/secondary-axis.js';
+import { chartDateAxisPlan, forEachErrorBarEndpoint, computeSecondaryAxis, drawSecondaryValueGridlines, drawSecondaryValueAxis, secondaryAxisTitleBandW } from '../shared/secondary-axis.js';
 import { measuredCartesianTitleBand, drawChartTitleForLayout } from '../shared/title.js';
 import { dataLabelWithinAxisMaximum, drawSeriesDataLabels } from '../shared/data-labels.js';
 import { chartCategories } from '../category-spacing.js';
@@ -116,7 +115,7 @@ export function renderStockChart(
   const titleFontPx = titleBand.fontPx;
   const titleTopPad = titleBand.topPad;
   const titleH = titleBand.bandH;
-  const leg = measuredLegendReserve(ctx, chart, w, h, 0.22, ptToPx);
+  const leg = measuredLegendReserve(ctx, chart, w, h, ptToPx);
   const { legRightW, legLeftW, legBottomH, legTopH } = chartLegendBands(
     leg, chart.legendOverlay === true,
   );
@@ -152,45 +151,16 @@ export function renderStockChart(
     );
     let maxLabelWidth = 0;
     for (const value of secScale.majorLines) {
-      maxLabelWidth = Math.max(maxLabelWidth, ctx.measureText(formatAxisTickWithUnits(
+      maxLabelWidth = Math.max(maxLabelWidth, measureAuthoredTextWidth(ctx, formatAxisTickWithUnits(
         value, sec.formatCode ?? null, chart.date1904, sec.displayUnits,
-      )).width);
+      )));
     }
     secLabelBandW = maxLabelWidth + 18;
     ctx.font = previousFont;
   }
   const secTitleBandW = sec?.title
-    ? axisTitleFontPx(sec.titleFontSizeHpt, ptToPx) + 8
+    ? secondaryAxisTitleBandW(sec, ptToPx)
     : 0;
-
-  const pad = {
-    t: padT,
-    r: legRightW + w * 0.05 + secLabelBandW + secTitleBandW,
-    b: padB,
-    l: legLeftW + Math.max(valAxFontPx * 2.2 + 10 + valTitleW, dataTableHeaderW),
-  };
-
-  drawChartTitleForLayout(ctx, chart, x, y, w, h, y + titleTopPad, titleFontPx);
-
-  const stockFrame = computeChartFrame(chart, x, y, w, h, ptToPx, {
-    titleBand,
-    legendSideReserveFrac: 0.22,
-    legendReserve: leg,
-    pad,
-    honorPlotAreaManualLayout: true,
-  });
-  const { px0, py0, pw } = stockFrame.plotRect;
-  let { ph } = stockFrame.plotRect;
-  if (pw <= 0 || ph <= 0) return;
-
-  const dataTableLayout = hasDataTable
-    ? measureChartDataTable(ctx, chart, pw / n, ptToPx)
-    : null;
-  if (dataTableLayout && dataTableLayout.totalHeight > dataTableBaseH) {
-    ph = Math.max(1, ph - (dataTableLayout.totalHeight - dataTableBaseH));
-  }
-
-  paintPlotAreaFrame(ctx, chart, px0, py0, pw, ph, ptToPx, shapeRotationDeg);
 
   // ── Value-axis extent: across every series' plotted values (the hi-lo line
   // needs both the low and high extremes). Authored bounds are retained and
@@ -222,6 +192,77 @@ export function renderStockChart(
   if (chart.valMin != null) dataMin = chart.valMin;
   if (chart.valMax != null) dataMax = chart.valMax;
 
+  // Value tick labels with authored breaks (a number format containing a line
+  // feed) are centred on their ticks, so the top label rises half its extra
+  // lines above the single-line half-label reserve. Counted on the scale the
+  // estimated plot height yields; exactly 0 without breaks.
+  const valueLabelTopExtraH = Math.max(
+    chart.valAxisHidden || chart.valAxisTickLabelPos === 'none'
+      ? 0
+      : authoredExtraLinesHeight(
+        planValueAxis(chart, dataMin, dataMax, phEst / ptToPx).majorLines
+          .map(value => formatPrimaryValueAxisTick(chart, value, false)),
+        axisLabelLineHeightPx(valAxFontPx),
+      ),
+    sec && secScale && !sec.hidden && sec.tickLabelPos !== 'none'
+      ? authoredExtraLinesHeight(
+        secScale.majorLines.map(value => formatAxisTickWithUnits(
+          value, sec.formatCode ?? null, chart.date1904, sec.displayUnits,
+        )),
+        axisLabelLineHeightPx(secFontPx),
+      )
+      : 0,
+  ) / 2;
+
+  // Fixed gutter terms: library policy, see ChartPad in layout.ts.
+  const pad = {
+    t: padT + valueLabelTopExtraH,
+    r: legRightW + w * 0.05 + secLabelBandW + secTitleBandW,
+    b: padB,
+    l: legLeftW + Math.max(valAxFontPx * 2.2 + 10 + valTitleW, dataTableHeaderW),
+  };
+
+  drawChartTitleForLayout(ctx, chart, x, y, w, h, y + titleTopPad, titleFontPx);
+
+  const stockFrame = computeChartFrame(chart, x, y, w, h, ptToPx, {
+    titleBand,
+    legendReserve: leg,
+    pad,
+    honorPlotAreaManualLayout: true,
+  });
+  const { px0, py0, pw } = stockFrame.plotRect;
+  let { ph } = stockFrame.plotRect;
+  if (pw <= 0 || ph <= 0) return;
+
+  const dataTableLayout = hasDataTable
+    ? measureChartDataTable(ctx, chart, pw / n, ptToPx)
+    : null;
+  if (dataTableLayout && dataTableLayout.totalHeight > dataTableBaseH) {
+    ph = Math.max(1, ph - (dataTableLayout.totalHeight - dataTableBaseH));
+  }
+  const dateAxisPlan = chartDateAxisPlan(chart, cats);
+  // Authored breaks in a category label stack extra lines below the first;
+  // an automatic/outer layout lifts the plot bottom by them (an authored inner
+  // rectangle already leaves its own label band). Exactly 0 without breaks.
+  if (!chart.catAxisHidden && !hasDataTable && catLabelsVisible(chart)) {
+    const labelInterval = Math.max(1, Math.floor(chart.catAxisTickLabelSkip ?? 1));
+    const labels = dateAxisPlan && dateAxisPlan.majorTicks.length > 0
+      ? dateAxisPlan.majorTicks.map(tick =>
+        formatCategoryLabel(String(tick.serial), chart.catAxisFormatCode, chart.date1904))
+      : Array.from({ length: Math.ceil(n / labelInterval) }, (_, index) =>
+        formatCategoryLabel((cats[index * labelInterval] ?? '').toString(), chart.catAxisFormatCode, chart.date1904));
+    const manualInner = chart.plotAreaManualLayout?.layoutTarget === 'inner' &&
+      chart.plotAreaManualLayout.w != null && chart.plotAreaManualLayout.h != null;
+    const categoryLabelExtraH = authoredExtraLinesHeight(
+      labels,
+      axisLabelLineHeightPx(catAxFontPx),
+      catLabelRotationRad(chart),
+    );
+    if (!manualInner && categoryLabelExtraH > 0) ph = Math.max(1, ph - categoryLabelExtraH);
+  }
+
+  paintPlotAreaFrame(ctx, chart, px0, py0, pw, ph, ptToPx, shapeRotationDeg);
+
   const plan = planValueAxis(chart, dataMin, dataMax, ph / ptToPx);
   if (plan.max - plan.min === 0) return;
   const toY = (v: number) => py0 + ph - plan.frac(v) * ph;
@@ -233,7 +274,6 @@ export function renderStockChart(
   // the first/last hi-lo line isn't flush against the axes (matches Excel).
   const between = isCrossBetween(chart);
   const catRev = catAxisReversed(chart);
-  const dateAxisPlan = chartDateAxisPlan(chart, cats);
   const toX = dateAxisPlan
     ? (i0: number) => px0 + dateAxisPlan.positions[i0]! * pw
     : between
@@ -261,7 +301,10 @@ export function renderStockChart(
       if (drawLabels) {
         ctx.fillStyle = chart.valAxisFontColor ? `#${chart.valAxisFontColor}` : '#555';
         ctx.textAlign = 'right';
-        ctx.fillText(formatPrimaryValueAxisTick(chart, v, false), px0 - 6, gy);
+        fillAuthoredText(
+          ctx, formatPrimaryValueAxisTick(chart, v, false), px0 - 6, gy,
+          axisLabelLineHeightPx(valAxFontPx),
+        );
       }
     }
     for (const v of plan.minorTicks) {
@@ -369,6 +412,8 @@ export function renderStockChart(
     const pointOverrides = indexPointOverrides(s.dataPointOverrides);
     const seriesMarkerVisible = s.markerSymbol != null && s.markerSymbol !== 'none'
       && seriesHasMarkerDetail(s);
+    // Open/close tick length (22 % of a category slot): library policy; #753
+    // compared bar heights and close marks with Word, not the tick length.
     const tickLen = Math.max(3, (pw / n) * 0.22);
     for (let ci = 0; ci < n; ci++) {
       const v = s.values[ci];
@@ -669,10 +714,12 @@ export function renderStockChart(
       const budget = rotRad === 0 ? catSlotMaxPx : ph * 0.4;
       drawRotatedCatLabel(
         ctx,
-        elideToWidth(ctx, label, budget),
+        label,
         tx,
         py0 + ph + categoryLabelOffsetPx(5, chart.catAxisLabelOffsetPercent),
         rotRad,
+        axisLabelLineHeightPx(catAxFontPx),
+        budget,
       );
     }
     if (chart.catAxisMinorTickMark && chart.catAxisMinorTickMark !== 'none' && dateAxisPlan) {

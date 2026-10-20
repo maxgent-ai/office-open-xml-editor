@@ -88,9 +88,9 @@ export interface ThreeDShapeMeshOptions {
   readonly roundSegments?: number;
 }
 
-export const DEFAULT_THREE_D_ROUND_SEGMENTS = 32;
+const DEFAULT_THREE_D_ROUND_SEGMENTS = 32;
 
-export function normalizeThreeDMeshShape(shape: string): ThreeDMeshShape {
+function normalizeThreeDMeshShape(shape: string): ThreeDMeshShape {
   switch (shape) {
     case 'cylinder':
     case 'cone':

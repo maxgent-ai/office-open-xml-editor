@@ -11,7 +11,9 @@ import { readFile } from 'node:fs/promises';
 export const bundledAssetSidecars = {
   name: 'bundled-asset-sidecars',
   setup(build) {
-    build.onLoad({ filter: /\/packages\/(?:docx|xlsx|pptx)\/dist\/[^/]+\.mjs$/ }, async ({ path }) => {
+    // Entry modules are .mjs, but code-split chunks (where the DOCX and PPTX
+    // parsers live) are emitted as .js; both carry asset URLs.
+    build.onLoad({ filter: /\/packages\/(?:docx|xlsx|pptx)\/dist\/[^/]+\.m?js$/ }, async ({ path }) => {
       const source = await readFile(path, 'utf8');
       const imports = new Map();
       const contents = source.replace(

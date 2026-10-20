@@ -1,11 +1,6 @@
 use super::*;
 
-/// Find a direct child of `parent` whose local name is `name`.
-pub(super) fn child<'a, 'i>(parent: Node<'a, 'i>, name: &str) -> Option<Node<'a, 'i>> {
-    parent
-        .children()
-        .find(|n| n.is_element() && n.tag_name().name() == name)
-}
+pub(super) use crate::xml_node::{attr, child};
 
 /// Retain one custom of-pie split atomically. The limit bounds the owned wire
 /// vector before allocation/serialization; an oversized list is unresolved,
@@ -33,18 +28,6 @@ pub(super) fn parse_of_pie_custom_split_with_limit(
         }
     }
     Some(indices)
-}
-
-/// Read a no-namespace attribute `local` off `node` as an owned `String`.
-///
-/// Mirrors the pptx/xlsx crate-local `attr` helper exactly (matches only
-/// attributes with no namespace, the shape every chart attribute uses), so the
-/// chart-structure parse moved into [`parse_chart_part`] stays byte-identical
-/// to the per-crate bodies it replaces.
-pub(super) fn attr(node: &Node, local: &str) -> Option<String> {
-    node.attributes()
-        .find(|a| a.name() == local && a.namespace().is_none())
-        .map(|a| a.value().to_owned())
 }
 
 pub(super) fn parse_chart_axis_id_value(value: &str) -> Option<String> {
@@ -911,6 +894,15 @@ pub(super) fn collect_dlbl_range_cache(ser_node: Node) -> std::collections::Hash
 /// plain text. `<a:fld type="CELLRANGE">` placeholders are substituted from
 /// `cellrange_cache`. Other field types and runs are concatenated; newlines
 /// come from paragraph breaks.
+/// Whether flattened chart text has content beyond authored line breaks.
+/// A title, label or text made only of `<a:br>`/paragraph breaks is absent,
+/// exactly like empty text, so presence gates (fallback titles, reserved
+/// bands) do not treat bare newlines as text.
+pub(super) fn chart_text_has_content(text: &str) -> bool {
+    text.chars()
+        .any(|character| character != '\n' && character != '\r')
+}
+
 pub(super) fn flatten_rich_text(rich_root: Node, cellrange_cache: Option<&str>) -> String {
     let mut out = String::new();
     let mut first_para = true;
@@ -924,6 +916,9 @@ pub(super) fn flatten_rich_text(rich_root: Node, cellrange_cache: Option<&str>) 
         first_para = false;
         for c in p.children().filter(|n| n.is_element()) {
             match c.tag_name().name() {
+                // `<a:br>` (ECMA-376 §21.1.2.2.1) is a line break within the
+                // paragraph.
+                "br" => out.push('\n'),
                 "r" => {
                     if let Some(t) = c.children().find(|n| n.tag_name().name() == "t") {
                         if let Some(s) = t.text() {
@@ -1275,7 +1270,7 @@ pub(super) fn parse_axis_display_units(
         });
         let explicit_text = child(label, "tx")
             .map(|tx| flatten_rich_text(tx, None))
-            .filter(|text| !text.is_empty());
+            .filter(|text| chart_text_has_content(text));
         let text_paint = chart_text_paint([run_props], resolver);
         ChartDisplayUnitsLabel {
             text: explicit_text,
@@ -1881,6 +1876,7 @@ pub(super) fn parse_error_bars(
     resolver: &dyn ColorResolver,
 ) -> Vec<ChartErrBars> {
     let mut result = Vec::new();
+    let (mut seen_x, mut seen_other) = (false, false);
     for eb in ser_node
         .children()
         .filter(|n| n.is_element() && n.tag_name().name() == "errBars")
@@ -1889,6 +1885,20 @@ pub(super) fn parse_error_bars(
             .and_then(|n| n.attribute("val"))
             .unwrap_or("y")
             .to_string();
+        // At most one block per direction (CT_ScatterSer allows two errBars,
+        // one per axis; other series types allow one). A schema-invalid
+        // repeat of a direction would otherwise allocate another pair of
+        // series-length vectors per copy — and a formula-resolved series can
+        // be long without any cache `ptCount` to admit against. ST_ErrDir
+        // has only `x` and `y`; any other value shares the `y` slot.
+        let seen = if dir == "x" {
+            &mut seen_x
+        } else {
+            &mut seen_other
+        };
+        if std::mem::replace(seen, true) {
+            continue;
+        }
         let bar_type = child(eb, "errBarType")
             .and_then(|n| n.attribute("val"))
             .unwrap_or("both")

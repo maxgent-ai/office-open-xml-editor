@@ -150,27 +150,42 @@ describe.skipIf(!skia)('node bevel rendering (OffscreenCanvas shim)', () => {
     // Shim must not leak out of renderSlideNode.
     expect(typeof g.OffscreenCanvas).toBe('undefined');
 
-    // The picture occupies px (50,50)..(350,350) at dpr=1. Sample a horizontal
-    // band a few px inside the top edge — that's where the top-bevel lip shades
-    // brightest/darkest. Count how many pixels differ from the flat render.
+    // The picture occupies px (50,50)..(350,350) at dpr=1. The top bevel lip
+    // spans the rows from the top edge (y=50) inward by the bevel width,
+    // bevelT w = 360000 EMU / 9525 EMU per px ≈ 37.8 px (ECMA-376 §20.1.5.3).
+    // Where in that band the swing peaks depends on the preset's profile and
+    // the light. The convex circle is near-vertical at the silhouette, where
+    // its diffuse term under the top light is close to the face's; the swing
+    // peaks mid-band, where the normal leans most toward the light. So scan
+    // every lip row (excluding the antialiased edge row) and take the
+    // strongest. Columns stay clear of the side lips.
     const { data: fd, width } = flat;
     const { data: bd } = beveled;
-    const yBand = 56; // ~6 px below the top edge of the picture
+    const top = 50;
+    const bandPx = 360000 / EMU_PER_PX;
     let diffCount = 0;
     let maxDelta = 0;
-    for (let x = 60; x < 340; x++) {
-      const i = (yBand * width + x) * 4;
-      const dr = Math.abs(fd[i] - bd[i]);
-      const dgc = Math.abs(fd[i + 1] - bd[i + 1]);
-      const db = Math.abs(fd[i + 2] - bd[i + 2]);
-      const delta = Math.max(dr, dgc, db);
-      if (delta > 8) diffCount++;
-      if (delta > maxDelta) maxDelta = delta;
+    for (let y = top + 1; y < top + Math.floor(bandPx); y++) {
+      let rowCount = 0;
+      let rowMax = 0;
+      for (let x = top + Math.ceil(bandPx); x < 350 - Math.ceil(bandPx); x++) {
+        const i = (y * width + x) * 4;
+        const delta = Math.max(
+          Math.abs(fd[i] - bd[i]),
+          Math.abs(fd[i + 1] - bd[i + 1]),
+          Math.abs(fd[i + 2] - bd[i + 2]),
+        );
+        if (delta > 8) rowCount++;
+        if (delta > rowMax) rowMax = delta;
+      }
+      diffCount = Math.max(diffCount, rowCount);
+      maxDelta = Math.max(maxDelta, rowMax);
     }
 
     // Without the shim the flat render fills this band with the flat grey; with
-    // the shim the bevel lip lightens/darkens it. Expect a substantial run of
-    // differing pixels and a clear luminance swing.
+    // the shim the bevel lip lightens/darkens it. Expect some lip row with a
+    // substantial run of differing pixels, and some lip row with a clear
+    // luminance swing (each maximized over the band independently).
     expect(diffCount).toBeGreaterThan(40);
     expect(maxDelta).toBeGreaterThan(20);
   });

@@ -1,4 +1,4 @@
-import type { DocxReadingNotice } from './native-reading-notice.js';
+import type { LayoutDiagnostic } from './layout/types.js';
 import type { DocComment, DocNote, DocRevision, RenderPageOptions, WorkerResponse } from './types';
 import type { CommentAnchorRange } from './comments';
 import type { RevisionAnchorRange } from './revisions';
@@ -18,10 +18,8 @@ import type { DocxElementContext, DocxPagePoint } from './selection-context';
  *  the main-thread proxy needs for its synchronous getters. The full model
  *  stays in the worker. */
 export interface DocumentMeta {
-  /** Document-level source requests own publication even when this view has no relocated scenes. */
-  nativeReadingRequested?: true;
-  /** Changed-layout disclosure for this exact retained variant. */
-  readingNotices?: readonly DocxReadingNotice[];
+  diagnostics?: readonly LayoutDiagnostic[];
+  resourceDiagnostics?: readonly LayoutDiagnostic[];
   pageCount: number;
   revisions: DocRevision[];
   comments: DocComment[];
@@ -54,13 +52,12 @@ export interface DocumentMeta {
  * can change. */
 export type DocumentLayoutMeta = Pick<
   DocumentMeta,
+  | 'diagnostics'
   | 'pageCount'
   | 'pageSizes'
   | 'bookmarkPages'
   | 'commentAnchorRanges'
   | 'revisionAnchorRanges'
-  | 'readingNotices'
-  | 'nativeReadingRequested'
 >;
 
 /**
@@ -72,6 +69,7 @@ export type DocumentLayoutMeta = Pick<
  * bookmark, comment and tracked-change capabilities in main and worker modes.
  */
 export interface DocumentLayoutPartial {
+  diagnostics?: readonly LayoutDiagnostic[];
   /** Pages published so far — NOT the document's total. */
   pageCount: number;
   /** Per-page size (pt) for the published pages, index-aligned with `pageCount`. */
@@ -95,7 +93,7 @@ export interface DocumentLayoutPartial {
    *  to produce — but re-cloning it on every publication would be real wire
    *  bandwidth on a heavily reviewed document. The host seeds its metadata from
    *  this and keeps it across later publications. */
-  review?: Pick<DocumentMeta, 'revisions' | 'comments' | 'footnotes' | 'endnotes'>;
+  review?: Pick<DocumentMeta, 'revisions' | 'comments' | 'footnotes' | 'endnotes' | 'resourceDiagnostics'>;
 }
 
 /** Serializable subset of RenderPageOptions (callbacks cannot cross the wire). */
@@ -107,6 +105,8 @@ export type WireRenderPageOptions = Omit<RenderPageOptions, 'onTextRun'>;
 // `init` arm is copied verbatim from `WorkerRequest`.
 export type RenderWorkerRequest =
   | { type: 'init'; wasmUrl: string }
+  | { type: 'hostFontLinesMeasured'; forId: number; measurements: import('./host-font-line-metrics.js').HostFontLineMeasurement[] }
+  | { type: 'nativeRouteLinesMeasured'; forId: number; lines: (import('@silurus/ooxml-core').NativeRouteNormalLine | null)[] }
   // `currentDateMs` / `showTrackedChanges` select the layout VARIANT the worker
   // paginates and reports metadata for. They are acquisition inputs, not paint
   // flags: hiding deletions changes line breaking, and DATE/TIME field text
@@ -120,7 +120,7 @@ export type RenderWorkerRequest =
       id: number;
       data: ArrayBuffer;
       resourcePolicy: NormalizedOoxmlResourcePolicy;
-      /** Application-selected model source (LoadOptions.modelSources). */
+      /** Application-selected model source (LoadOptions.legacyDoc). */
       source?: import('@silurus/ooxml-core').ModelSourceModuleDescriptor;
       sourceTransfer?: readonly Transferable[];
       sourceOwnerUrl?: string;
@@ -163,6 +163,8 @@ export type RenderWorkerWireRequest =
   | PullSessionCommand<number>;
 
 export type RenderWorkerResponse =
+  | { type: 'measureHostFontLines'; forId: number; routes: import('@silurus/ooxml-core').OfficeFontFallbackRoute[] }
+  | { type: 'measureNativeRouteLines'; forId: number; requests: import('@silurus/ooxml-core').NativeRouteLineRequest[] }
   | Exclude<WorkerResponse, { type: 'documentSessionOpened' }>
   | PullSessionResponse<ArrayBuffer, number>
   | {
@@ -181,16 +183,20 @@ export type RenderWorkerResponse =
   // worker that parses vertical East-Asian content opens a bounded model stream
   // so the proxy can continue through main-thread rendering instead of silently
   // painting horizontal glyph forms or receiving one monolithic JSON value.
+  // The same continuation serves a worker realm that cannot register the
+  // native-route sentinels (native-route-line-metrics.ts).
   | ({
       type: 'mainThreadVerticalFallback';
       id: number;
+      /** Omitted for DOM vertical glyph selection. */
+      reason?: 'nativeRouteSentinels';
       usage?: OoxmlResourceUsageSnapshot;
       /** The model source's own view preferences, validated in the worker. */
       viewDefaults?: { showTrackedChanges?: boolean };
     } & PullSessionIdentity<number>)
   // The worker projects structured-clone-safe run geometry from the same
   // retained layout variant it paints and ships it beside the bitmap.
-  | { type: 'pageRendered'; id: number; bitmap: ImageBitmap; runs: DocxTextRunInfo[] }
+  | { type: 'pageRendered'; id: number; bitmap: ImageBitmap; runs: DocxTextRunInfo[]; diagnostics?: readonly LayoutDiagnostic[] }
   | { type: 'runsCollected'; id: number; runs: DocxTextRunInfo[] }
   // Progressive layout in worker mode: the worker publishes its provisional
   // prefixes as they are primed, then answers the original `parse` with the

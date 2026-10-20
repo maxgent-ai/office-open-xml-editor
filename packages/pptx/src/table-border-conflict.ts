@@ -1,4 +1,4 @@
-import type { Stroke } from '@silurus/ooxml-core';
+import { hex6ToRgb, type Stroke } from '@silurus/ooxml-core';
 
 /**
  * DrawingML table (`<a:tbl>`) — adjacent-cell border conflict resolution.
@@ -39,14 +39,9 @@ import type { Stroke } from '@silurus/ooxml-core';
  *  DrawingML stroke colour is stored without a leading `#`; an 8-hex value's
  *  trailing alpha pair is ignored for the luminance comparison. */
 function rgb(color: string | null | undefined): { r: number; g: number; b: number } {
-  if (!color) return { r: 0, g: 0, b: 0 };
-  const hex = color.replace(/^#/, '');
-  if (hex.length < 6 || /[^0-9a-fA-F]/.test(hex.slice(0, 6))) return { r: 0, g: 0, b: 0 };
-  return {
-    r: parseInt(hex.slice(0, 2), 16),
-    g: parseInt(hex.slice(2, 4), 16),
-    b: parseInt(hex.slice(4, 6), 16),
-  };
+  const parsed = color ? hex6ToRgb(color.replace(/^#/, '').slice(0, 6)) : null;
+  if (!parsed) return { r: 0, g: 0, b: 0 };
+  return { r: parsed[0], g: parsed[1], b: parsed[2] };
 }
 
 /** Perceived luminance (Rec. 601 weights). Smaller = darker. Only the ORDERING

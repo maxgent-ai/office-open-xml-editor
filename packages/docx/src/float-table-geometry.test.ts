@@ -257,13 +257,15 @@ describe('floating table geometry (§17.4.57) — page/margin-anchored Office cl
     expect(b.y).toBe(0); // clamped to the page top, not −100
   });
 
-  it('vertAnchor="margin": a box overflowing the bottom margin is clamped to (pageH − marginBottom) − boxH', () => {
-    // margin band [72, 728]: tblpY=700 ⇒ y=772, bottom 872 > 728 ⇒ clamp to
-    // 728 − 100 = 628 (the container end is the bottom text margin, ASSUMED — no
-    // fixture pins where Word clamps a margin-anchored overflow; symmetric with page).
-    const st = makeState(); // margin band [72, 728]
-    const b = box(tblp({ vertAnchor: 'margin', tblpY: 700 }), st, 300, 150, 100);
-    expect(b.y).toBe(728 - 100); // 628 — clamped to the margin band bottom
+  it('vertAnchor="margin": a box overflowing the page bottom is clamped to the page, not the margin band', () => {
+    // Windows Word 16.0.20430 #1902 controls clamp a margin-anchored table up
+    // to the page bottom edge only: past the bottom margin it keeps its
+    // authored y (pagination then moves it to the next page).
+    const st = makeState(); // margin band [72, 728], page 800
+    // tblpY=700 ⇒ y=772, bottom 872 > 800 ⇒ clamp to 800 − 100.
+    expect(box(tblp({ vertAnchor: 'margin', tblpY: 700 }), st, 300, 150, 100).y).toBe(700);
+    // tblpY=620 ⇒ y=692, bottom 792: past the margin band, inside the page.
+    expect(box(tblp({ vertAnchor: 'margin', tblpY: 620 }), st, 300, 150, 100).y).toBe(692);
   });
 
   it('vertAnchor="text": an overflowing box is NOT clamped (paginator row-split handles it)', () => {

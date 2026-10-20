@@ -1,3 +1,5 @@
+import { safeUtf16Prefix } from './utf16-prefix.js';
+
 export const MAX_CHART_CONTEXT_TEXT_CHARACTERS = 65_536;
 export const DEFAULT_CHART_CONTEXT_TEXT_CHARACTERS = 16_384;
 
@@ -17,16 +19,6 @@ export interface ChartContextModel {
     readonly name: string;
     readonly values: readonly (number | null)[];
   }>[];
-}
-
-function safeUtf16Prefix(value: string, maxCodeUnits: number): string {
-  let end = Math.min(value.length, maxCodeUnits);
-  if (end > 0 && end < value.length) {
-    const previous = value.charCodeAt(end - 1);
-    const next = value.charCodeAt(end);
-    if (previous >= 0xD800 && previous <= 0xDBFF && next >= 0xDC00 && next <= 0xDFFF) end--;
-  }
-  return value.slice(0, end);
 }
 
 function normalizeLimit(requested: number | undefined): number {

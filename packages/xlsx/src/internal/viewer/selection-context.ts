@@ -12,6 +12,7 @@ import {
   selectionCoordinateCountUpperBound,
 } from '../../selection.js';
 import { MAX_WORKSHEET_COL, MAX_WORKSHEET_ROW } from '../grid-geometry.js';
+import { safeUtf16Prefix as sharedSafeUtf16Prefix } from '@silurus/ooxml-core/internal/utf16-prefix';
 
 type SelectionInterval = Readonly<{ first: number; last: number }>;
 
@@ -66,13 +67,7 @@ const DEFAULT_SELECTION_CONTEXT_TEXT_CHARACTERS = 1 * 1_024 * 1_024;
 const MAX_SELECTION_CONTEXT_FIELD_CHARACTERS = 65_536;
 
 function safeUtf16Prefix(value: string, maxCodeUnits: number): string {
-  let end = Math.min(value.length, Math.max(0, maxCodeUnits));
-  if (end > 0 && end < value.length) {
-    const previous = value.charCodeAt(end - 1);
-    const next = value.charCodeAt(end);
-    if (previous >= 0xD800 && previous <= 0xDBFF && next >= 0xDC00 && next <= 0xDFFF) end--;
-  }
-  return value.slice(0, end);
+  return sharedSafeUtf16Prefix(value, Math.max(0, maxCodeUnits));
 }
 
 /**

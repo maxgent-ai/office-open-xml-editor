@@ -8,6 +8,7 @@ import type {
   ChartThreeDRenderer,
   ChartRegionMapRenderer,
   ChartExRenderer,
+  BlipEffect,
 } from '@silurus/ooxml-core';
 
 export type ShapeFill = Exclude<Fill, { fillType: 'image' } | { fillType: 'none' }>;
@@ -16,7 +17,6 @@ import type {
   PullSessionIdentity,
   WorkerErrorPayload,
 } from '@silurus/ooxml-core/worker';
-import type { CfDiagnosticCollector } from './cf-diagnostics.js';
 
 export interface Workbook {
   sheets: SheetMeta[];
@@ -184,7 +184,9 @@ export interface Worksheet {
    *  `defaultFontSize` when absent. */
   normalFontSize?: number;
   /** Workbook theme major Jpan face (`<a:majorFont><a:font script="Jpan">`).
-   *  Used only for scheme-marked cells under the Japanese Mac Excel locale. */
+   *  Used for scheme-marked cells when the workbook's load-time viewer language
+   *  starts with 'ja', a proxy for Excel's unencoded UI/editing language on any
+   *  OS. Re-open the workbook to apply a viewer language change. */
   themeJapaneseMajorFont?: string;
   /** Workbook theme minor Jpan face; see `themeJapaneseMajorFont`. */
   themeJapaneseMinorFont?: string;
@@ -394,32 +396,37 @@ export interface TableInfo {
   showColumnStripes: boolean;
   showFirstColumn: boolean;
   showLastColumn: boolean;
-  /** Accent color resolved by the parser from the built-in style name against
-   *  the file's theme accents (e.g. `TableStyleLight18` → accent3). */
+  /** Accent color of a built-in style name under the file's theme
+   *  (e.g. `TableStyleLight18` → accent3). Informational: rendering uses
+   *  `styleElements`. */
   accentColor: string;
   /** `true` when `styleName` is defined in the file's `<tableStyles>` block,
-   *  i.e. a *custom* style (ECMA-376 §18.5.1.2). The renderer draws such tables
-   *  strictly from their declared element dxfs and must NOT apply the accent
-   *  approximation (banding / synthesized rules / header) reserved for built-in
-   *  style names whose definitions are absent from the file. */
+   *  i.e. a *custom* style (ECMA-376 §18.5.1.2). Informational. */
   isCustom?: boolean;
-  /** Dxf index for the `wholeTable` element of a custom `<tableStyle>`
-   *  (ECMA-376 §18.8.83). When set, its border/fill apply to every cell of
-   *  the table as a base layer. Undefined for built-in style names. */
+  /** Workbook dxf index of the custom style's `wholeTable` element. The
+   *  `*Dxf` indices below are informational: `styleElements` carries every
+   *  element with its format inline. */
   wholeTableDxf?: number;
-  /** Dxf index for the `headerRow` element of a custom `<tableStyle>` —
-   *  provides header background, font color/weight, and vertical separators. */
+  /** Workbook dxf index of the custom style's `headerRow` element. */
   headerRowDxf?: number;
-  /** Dxf index for the `totalRow` element (ECMA-376 §18.18.93). */
+  /** Workbook dxf index of the `totalRow` element. */
   totalRowDxf?: number;
-  /** Dxf index for the `firstColumn` element. */
+  /** Workbook dxf index of the `firstColumn` element. */
   firstColumnDxf?: number;
-  /** Dxf index for the `lastColumn` element. */
+  /** Workbook dxf index of the `lastColumn` element. */
   lastColumnDxf?: number;
-  /** Dxf index for `firstRowStripe` (band1 horizontal) — odd banded-row stripe. */
+  /** Workbook dxf index of `firstRowStripe`. */
   band1HorizontalDxf?: number;
-  /** Dxf index for `secondRowStripe` (band2 horizontal) — even banded-row stripe. */
+  /** Workbook dxf index of `secondRowStripe`. */
   band2HorizontalDxf?: number;
+  /** The table style's elements (ECMA-376 §18.8.41) with their formats
+   *  inline: a workbook `<tableStyle>` (§18.8.40), else the built-in Annex G
+   *  style of that name. Absent when the table has no style, names no known
+   *  style, or its style cannot be applied as authored (`styleError`). */
+  styleElements?: PivotTableStyleElement[];
+  /** The field that kept a workbook table style from being applied as
+   *  authored; the table is then drawn without its style. */
+  styleError?: string;
   /** Per-column DXF references (ECMA-376 §18.5.1.3 `tableColumn`). Index by
    *  `cellCol - range.left`. The renderer can use these to apply column-level
    *  overlays for named-style tables; for files where Excel pre-bakes the
@@ -547,7 +554,7 @@ export interface ChartAnchor {
 /** Which DrawingML anchor element (ECMA-376 Part 1 §20.5.2) carried the
  *  object. This is a normative fact recorded from the actual XML element name
  *  and is never inferred from geometry. Absent means "not recorded" (older
- *  models, VML/OLE previews, legacy binary conversion). */
+ *  models, VML/OLE previews, producers without DrawingML anchors). */
 export type DrawingAnchorTag = 'oneCellAnchor' | 'twoCellAnchor';
 
 export interface ShapeAnchor {
@@ -746,12 +753,17 @@ export type ShapeGeom =
        *  1-b]`). Absent ⇒ the whole blip fills the leaf rect. Honored identically
        *  to the top-level {@link ImageAnchor.srcRect} (raster only). */
       srcRect?: { l: number; t: number; r: number; b: number };
-      /** ECMA-376 §20.1.8.6 `<a:alphaModFix@amt>` opacity fraction (0..1) on the
-       *  leaf pic. Absent ⇒ opaque. Applied via `globalAlpha`. */
+      /** Legacy whole-leaf opacity (0..1) for model-source callers, applied
+       *  via `globalAlpha`. Parsed leaves carry `<a:alphaModFix>` in
+       *  {@link blipEffects} instead, so it is never applied twice. */
       alpha?: number;
       /** ECMA-376 §20.1.8.23 `<a:duotone>` recolour on the leaf pic. Absent ⇒
        *  no effect. */
       duotone?: Duotone;
+      /** Ordered CT_Blip effects (§20.1.8.13) on the leaf pic, applied to the
+       *  decoded pixels in authored order. Absent for a plain picture or a
+       *  lone duotone (see {@link duotone}). */
+      blipEffects?: BlipEffect[];
     };
 
 /** ECMA-376 §20.1.8.23 `<a:duotone>` image effect, resolved to its two endpoint
@@ -841,15 +853,19 @@ export interface ImageAnchor {
    *  cropped sub-rectangle (raster only — a metafile is rasterized to the
    *  display box, so its crop can't be honored faithfully and is skipped). */
   srcRect?: { l: number; t: number; r: number; b: number };
-  /** ECMA-376 §20.1.8.6 `<a:alphaModFix@amt>` — the blip's overall opacity as a
-   *  fraction (0..1). Absent ⇒ opaque. The renderer sets `ctx.globalAlpha` so the
-   *  picture composites over the cells beneath it (e.g. a pink translucent photo
-   *  over a matching cell fill). */
+  /** Legacy whole-picture opacity (0..1) for model-source callers. The
+   *  renderer sets `ctx.globalAlpha` so the picture composites over the cells
+   *  beneath it. Parsed pictures carry `<a:alphaModFix>` (§20.1.8.6) in
+   *  {@link blipEffects} instead, so the modulation is applied exactly once. */
   alpha?: number;
   /** ECMA-376 §20.1.8.23 `<a:duotone>` recolour effect. Absent (the common case)
    *  ⇒ no effect. When present, the renderer remaps the image along the
    *  `clr1`→`clr2` luminance ramp before drawing. */
   duotone?: Duotone;
+  /** Ordered CT_Blip effects (§20.1.8.13), shared with DOCX and PPTX: each
+   *  duotone carries its own palette and alpha effects apply at their
+   *  authored position. Absent for a plain picture or a lone duotone. */
+  blipEffects?: BlipEffect[];
 }
 
 /** Rectangular worksheet-model range; distinct from Viewer selection state. */
@@ -888,12 +904,11 @@ export interface ConditionalFormat {
  * own formula, [MS-XLSX] 2.6.27) is nonzero. Formulas are not evaluated: an
  * activity formula or `cellIs` operand is used only when it is a literal or
  * a single-cell reference to a cached value, and otherwise the rule does not
- * match. A rule the evaluator cannot evaluate is reported by
- * `XlsxWorkbook.getLastConditionalFormattingDiagnostics()` (#1547).
- * `extThresholdFormula` marks an effective linked x14 threshold that cannot
- * be admitted. Ambiguous extension IDs use an `other` marker. Its provenance
- * uses fixed bits expression=1, cellIs=2, activity=4, threshold=8; unknown bits
- * have no diagnostic meaning. No raw formulas are exposed in render reports.
+ * match. A rule the evaluator cannot evaluate neither formats nor stops lower
+ * rules (#1547). `extThresholdFormula` marks an effective linked x14
+ * threshold that cannot be admitted. Ambiguous extension IDs use an `other`
+ * marker. Its provenance uses fixed bits expression=1, cellIs=2, activity=4,
+ * threshold=8; unknown bits have no meaning.
  */
 export type CfRule =
   | { type: 'cellIs'; operator: string; formulas: string[]; dxfId: number | null; priority: number; stopIfTrue?: boolean }
@@ -1115,6 +1130,10 @@ export interface DxfFontToggles {
   italic?: boolean;
   underline?: boolean;
   strike?: boolean;
+  /** `true` when the differential font names the automatic color
+   *  (`<color auto="1"/>`), which a later layered format applies over an
+   *  earlier color. */
+  automaticColor?: boolean;
 }
 
 export interface CellFont {
@@ -1296,10 +1315,6 @@ export interface RenderViewportOptions extends XlsxRenderViewportOptions {
   regionMap?: ChartRegionMapRenderer;
   /** @internal Optional Microsoft ChartEx renderer. */
   chartEx?: ChartExRenderer;
-  /** @internal Operation-local CF diagnostics for ONE render invocation.
-   *  Never cached on a worksheet or CfContext and never posted to a worker
-   *  (excluded from WireRenderViewportOptions). */
-  cfDiagnostics?: CfDiagnosticCollector;
 }
 
 export type WorkerRequest =
@@ -1310,8 +1325,8 @@ export type WorkerRequest =
       data: ArrayBuffer;
       resourcePolicy: NormalizedOoxmlResourcePolicy;
       /** Normalized worksheet admission policy. Optional for older internal requests. */
-      readonly worksheetPolicy?: import('@silurus/ooxml-core/worker').NormalizedXlsxWorksheetPolicy;
-      /** Application-selected model source (LoadOptions.modelSources). */
+      readonly worksheetPolicy?: import('./internal/worksheet-policy.js').NormalizedXlsxWorksheetPolicy;
+      /** Application-selected model source (LoadOptions.legacyXls). */
       source?: import('@silurus/ooxml-core').ModelSourceModuleDescriptor;
       sourceTransfer?: readonly Transferable[];
       sourceOwnerUrl?: string;

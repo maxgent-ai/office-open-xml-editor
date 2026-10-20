@@ -107,11 +107,14 @@ function translateOccurrenceGeometry<T extends ParagraphLayout | TableLayout>(
       return prior.value;
     }
     const translatedBase = translateCompleteParagraphLayout(paragraph, delta);
-    const translated = Object.freeze({
+    // Left mutable: the projection snapshot freezes every node it allocated
+    // and skips only frozen aliases of the retained root, so a shallowly
+    // frozen new node here would leave its translated children unfrozen.
+    const translated: ParagraphLayout = {
       ...translatedBase,
       ...(paragraph.sectionFlowOwnership === undefined
         ? {} : { sectionFlowOwnership: paragraph.sectionFlowOwnership }),
-    });
+    };
     paragraphMemo.set(paragraph, { key, value: translated });
     return translated;
   };
@@ -265,11 +268,6 @@ export function projectBodyOccurrence<T extends ParagraphLayout | TableLayout>(
         ...line, placements: line.placements.map(projectPlacement),
       })),
       drawings: paragraph.drawings.map((drawing) => projectDrawing(drawing, domain)),
-      // Completeness references use the same occurrence-local drawing owners.
-      // Keep the acquired source graph intact for other page occurrences.
-      ...(paragraph.nativeReadingRelocations ? {
-        nativeReadingRelocations: paragraph.nativeReadingRelocations.map(nodeId),
-      } : {}),
       textBoxes: paragraph.textBoxes.map(projectTextBox),
       exclusions: paragraph.exclusions.map((exclusion) => ({
         ...exclusion,

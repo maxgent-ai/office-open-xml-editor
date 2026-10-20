@@ -19,9 +19,10 @@ import { CHART_PALETTE, chartColor, chartExSeriesFormatIndex, piePointStyleIndex
 import { bubblePointFill, bubblePointLine } from './bubble-paint.js';
 import { drawMarker } from './markers.js';
 import { paintClassicDataPointRect } from './chartex-style.js';
-import { resolveThemeFontRef } from './fonts.js';
+import { chartFaceWithFallback, resolveThemeFontRef } from './fonts.js';
 import { dashPatternForPreset } from './geometry.js';
 import { wrapMeasuredText } from './axis.js';
+import { authoredLineCount, authoredTextLines, fillAuthoredText, measureAuthoredTextWidth } from '../chart-text-lines.js';
 import { legendSeriesWithTrendlines } from './trendline.js';
 
 
@@ -76,7 +77,7 @@ export interface LegendMarker {
  *  whether points are connected, and a series-level `<a:noFill/>` line override
  *  (§21.2.2.198, `lineHidden`) suppresses the connecting line even when the group
  *  style is `line`/`lineMarker`. Bubble charts are always markers-only. */
-export function scatterSeriesDrawsLine(
+function scatterSeriesDrawsLine(
   chartType: string | undefined,
   scatterStyle: string | null | undefined,
   series: ChartSeries,
@@ -96,7 +97,7 @@ export function scatterSeriesDrawsLine(
  *  swatch. Returns null when a marker key does not apply (non-scatter, or a
  *  scatter series that does draw a line). Colors/symbol resolve exactly like the
  *  plotted markers in {@link renderScatterChart}. */
-export function legendMarkerFor(
+function legendMarkerFor(
   chartType: string | undefined,
   scatterStyle: string | null | undefined,
   radarStyle: string | null | undefined,
@@ -405,7 +406,7 @@ export function drawLegendSwatch(
 }
 
 
-export function drawLegendSwatchBody(
+function drawLegendSwatchBody(
   ctx: CanvasRenderingContext2D,
   style: LegendSwatchStyle,
   color: string,
@@ -530,7 +531,7 @@ export interface LegendEntry {
 }
 
 
-export function applyLegendEntryOverrides(
+function applyLegendEntryOverrides(
   entries: readonly LegendEntry[],
   overrides: readonly ChartLegendEntryOverride[],
 ): LegendEntry[] {
@@ -804,7 +805,7 @@ export interface LegendTextStyle {
 }
 
 
-export function legendEntryTextStyle(
+function legendEntryTextStyle(
   chart: ChartModel,
   base: LegendTextStyle,
   override: ChartLegendEntryOverride | null,
@@ -813,7 +814,7 @@ export function legendEntryTextStyle(
   if (!override) return base;
   const face = resolveThemeFontRef(chart, override.fontFace) ?? override.fontFace;
   return {
-    fontFamily: face ? `"${face}", Calibri, Arial, sans-serif` : base.fontFamily,
+    fontFamily: face ? chartFaceWithFallback(face) : base.fontFamily,
     color: override.fontColor ? `#${override.fontColor}` : base.color,
     bold: override.fontBold ?? base.bold,
     italic: override.fontItalic ?? base.italic,
@@ -822,14 +823,14 @@ export function legendEntryTextStyle(
 }
 
 
-export function setLegendFont(ctx: CanvasRenderingContext2D, style: LegendTextStyle, ptToPx: number): number {
+function setLegendFont(ctx: CanvasRenderingContext2D, style: LegendTextStyle, ptToPx: number): number {
   const size = legendFontSizePx(style, ptToPx);
   ctx.font = `${style.italic ? 'italic ' : ''}${style.bold ? 'bold ' : ''}${size}px ${style.fontFamily}`;
   return size;
 }
 
 
-export const DEFAULT_LEGEND_STYLE: LegendTextStyle = {
+const DEFAULT_LEGEND_STYLE: LegendTextStyle = {
   fontFamily: 'sans-serif',
   color: '#333',
   bold: false,
@@ -840,7 +841,7 @@ export const DEFAULT_LEGEND_STYLE: LegendTextStyle = {
 
 export const LEGEND_SWATCH_TEXT_GAP = 4;
 
-export const LEGEND_ITEM_GAP = 12;
+const LEGEND_ITEM_GAP = 12;
 
 export const LEGEND_ROW_EXTRA_PX = 4;
 
@@ -848,9 +849,9 @@ export const LEGEND_HORIZONTAL_INSET = 4;
 
 export const LEGEND_HORIZONTAL_PADDING = LEGEND_HORIZONTAL_INSET * 2;
 
-export const LEGEND_VERTICAL_PADDING = 4;
+const LEGEND_VERTICAL_PADDING = 4;
 
-export const LEGEND_SIDE_PADDING = 8;
+const LEGEND_SIDE_PADDING = 8;
 
 // The item width is measured as key + gap + text, then split back into those
 // components for paint. Fractional Canvas metrics can lose one ULP in that
@@ -858,7 +859,7 @@ export const LEGEND_SIDE_PADDING = 8;
 // eliding a label that was already proven to fit. A hundredth of a CSS pixel is
 // safely below a visible/device-pixel overflow while absorbing that arithmetic
 // roundoff.
-export const LEGEND_MEASUREMENT_EPSILON_PX = 0.01;
+const LEGEND_MEASUREMENT_EPSILON_PX = 0.01;
 
 // Office vector output keeps a filled legend key at roughly 7pt square even
 // when the legend text is larger (for example, a 15pt legend still has a 7pt
@@ -867,7 +868,7 @@ export const LEGEND_MEASUREMENT_EPSILON_PX = 0.01;
 export const FILLED_LEGEND_KEY_PT = 7;
 
 
-export function legendFontSizePx(style: LegendTextStyle, ptToPx: number): number {
+function legendFontSizePx(style: LegendTextStyle, ptToPx: number): number {
   return style.sizePx ?? 10 * ptToPx;
 }
 
@@ -896,6 +897,15 @@ export function legendSwatchWidths(
 }
 
 
+/** Height of one top/bottom legend row: the tallest entry's authored line
+ *  block (lines one font size apart) plus the row extra. Text without breaks
+ *  keeps the single-line `max(fontSize) + extra` row. */
+function legendRowHeight(entries: readonly LegendEntry[], fontSizes: readonly number[]): number {
+  return Math.max(0, ...fontSizes.map((fontSize, index) =>
+    authoredLineCount(entries[index]?.label ?? '') * fontSize)) + LEGEND_ROW_EXTRA_PX;
+}
+
+
 export function legendSwatchHeight(entry: LegendEntry, fontSize: number, ptToPx: number): number {
   return entry.swatchStyle === 'fill' ? FILLED_LEGEND_KEY_PT * ptToPx : fontSize;
 }
@@ -906,12 +916,18 @@ export function legendSwatchHeight(entry: LegendEntry, fontSize: number, ptToPx:
  * (rather than replacing the whole second half with an ellipsis). Two lines
  * keep the automatic side band bounded; only text that still exceeds that
  * contract is elided on the final line. */
-export function sideLegendLabelLines(
+function sideLegendLabelLines(
   ctx: CanvasRenderingContext2D,
   label: string,
   maxWidth: number,
 ): string[] {
   if (!(maxWidth > 0)) return [];
+  // Every authored line (including an interior blank line) is kept; the
+  // two-line wrap bound applies within each authored line.
+  const authored = authoredTextLines(label);
+  if (authored.length > 1) {
+    return authored.flatMap(line => sideLegendLabelLines(ctx, line, maxWidth));
+  }
   const wrapped = wrapMeasuredText(ctx, label, maxWidth);
   if (wrapped.length <= 2) return wrapped;
   return [
@@ -936,7 +952,6 @@ export function measuredLegendReserve(
   chart: ChartModel,
   w: number,
   h: number,
-  sideReserveFrac: number,
   ptToPx: number,
 ): MeasuredLegendLayout | null {
   if (!chart.showLegend) return null;
@@ -963,14 +978,16 @@ export function measuredLegendReserve(
   ctx.save();
   const itemWidths = entries.map((entry, index) => {
     setLegendFont(ctx, entryStyles[index], ptToPx);
-    return swatches[index] + LEGEND_SWATCH_TEXT_GAP + ctx.measureText(entry.label).width;
+    return swatches[index] + LEGEND_SWATCH_TEXT_GAP + measureAuthoredTextWidth(ctx, entry.label);
   });
   ctx.restore();
   const pos = chart.legendPos ?? 'r';
   const horizontal = pos === 't' || pos === 'b';
-  const reserve = chartLegendReserve(chart, w, h, sideReserveFrac, {
+  const reserve = chartLegendReserve(chart, w, h, {
     itemWidths,
-    rowHeight: Math.max(0, ...fontSizes) + LEGEND_ROW_EXTRA_PX,
+    // A top/bottom row is as tall as its tallest entry; an entry with authored
+    // breaks stacks its lines at one font-size interval.
+    rowHeight: legendRowHeight(entries, fontSizes),
     itemGap: LEGEND_ITEM_GAP,
     horizontalPadding: horizontal ? LEGEND_HORIZONTAL_PADDING : LEGEND_SIDE_PADDING,
     verticalPadding: LEGEND_VERTICAL_PADDING,
@@ -1030,7 +1047,7 @@ export function drawLegend(
     : entryStyles.map(entryStyle => legendFontSizePx(entryStyle, ptToPx));
   if (entryStyles[0]) setLegendFont(ctx, entryStyles[0], ptToPx);
   ctx.textBaseline = 'middle';
-  const rowH = Math.max(0, ...fontSizes) + LEGEND_ROW_EXTRA_PX;
+  const rowH = legendRowHeight(entries, fontSizes);
   const swatches = canReuseMeasure
     ? measured.swatches
     : entries.map((entry, index) =>
@@ -1040,7 +1057,7 @@ export function drawLegend(
     ? measured.itemWidths
     : entries.map((entry, index) => {
         setLegendFont(ctx, entryStyles[index], ptToPx);
-        return swatches[index] + gap + ctx.measureText(entry.label).width;
+        return swatches[index] + gap + measureAuthoredTextWidth(ctx, entry.label);
       });
   if (orient === 'horizontal') {
     const rows = packLegendRows(itemWidths, lw, LEGEND_ITEM_GAP);
@@ -1069,7 +1086,6 @@ export function drawLegend(
           effectiveWidth - sw - gap + LEGEND_MEASUREMENT_EPSILON_PX,
         );
         setLegendFont(ctx, entryStyles[index], ptToPx);
-        const label = elideToWidth(ctx, entries[index].label, maxTextPx);
         const swatchH = legendSwatchHeight(entries[index], fontSizes[index], ptToPx);
         drawLegendSwatch(
           ctx, entries[index].swatchStyle, entries[index].color,
@@ -1085,7 +1101,7 @@ export function drawLegend(
         );
         ctx.fillStyle = entryStyles[index].color;
         ctx.textAlign = 'left';
-        ctx.fillText(label, rx + sw + gap, ry);
+        fillAuthoredText(ctx, entries[index].label, rx + sw + gap, ry, fontSizes[index], maxTextPx);
         rx += effectiveWidth + LEGEND_ITEM_GAP;
       }
     }
@@ -1105,7 +1121,7 @@ export function drawLegend(
     setLegendFont(ctx, entryStyles[index], ptToPx);
     return wrapSeriesNames
       ? sideLegendLabelLines(ctx, entry.label, maxTextPx)
-      : [elideToWidth(ctx, entry.label, maxTextPx)];
+      : authoredTextLines(entry.label).map(line => elideToWidth(ctx, line, maxTextPx));
   });
   const entryHeights = labelLines.map((lines, index) =>
     lines.length * fontSizes[index] + LEGEND_ROW_EXTRA_PX
@@ -1155,10 +1171,10 @@ export function drawLegend(
 /** Build the resolved legend text style for a chart (CH10). Absent legend
  *  `<c:txPr>` fields use the theme minor face when available and the shared
  *  automatic defaults otherwise. */
-export function legendTextStyle(chart: ChartModel, ptToPx: number): LegendTextStyle {
+function legendTextStyle(chart: ChartModel, ptToPx: number): LegendTextStyle {
   const face = resolveThemeFontRef(chart, chart.legendFontFace) ?? chart.themeMinorFontLatin;
   return {
-    fontFamily: face ? `"${face}", Calibri, Arial, sans-serif` : 'sans-serif',
+    fontFamily: face ? chartFaceWithFallback(face) : 'sans-serif',
     color: chart.legendFontColor ? `#${chart.legendFontColor}` : '#333',
     bold: chart.legendFontBold ?? false,
     italic: chart.legendFontItalic ?? false,

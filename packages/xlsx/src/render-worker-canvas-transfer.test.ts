@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { WorkerBridge, type WorkerLike } from '@silurus/ooxml-core/worker';
 import { XlsxWorkbook } from './workbook.js';
 import type { RenderWorkerResponse } from './worker-protocol.js';
-import type { ViewportRange } from './types.js';
+import type { ViewportRange, Worksheet } from './types.js';
 
 /**
  * Worker-mode viewport painting must use a surface created by the caller and
@@ -70,7 +70,7 @@ class LoopbackWorker implements WorkerLike {
 
 const VIEWPORT = { row: 1, col: 1, rows: 1, cols: 1 } as unknown as ViewportRange;
 
-async function loadWorker(entry: 'render-worker' | 'render-worker-source') {
+async function loadWorker(japaneseCellFonts = false) {
   vi.resetModules();
   const scope = {
     onmessage: null as ((event: MessageEvent) => Promise<void>) | null,
@@ -79,12 +79,12 @@ async function loadWorker(entry: 'render-worker' | 'render-worker-source') {
   const worker = new LoopbackWorker(scope);
   vi.stubGlobal('self', scope);
   vi.stubGlobal('OffscreenCanvas', FakeOffscreenCanvas);
-  if (entry === 'render-worker') await import('./render-worker.js');
-  else await import('./render-worker-source.js');
+  await import('./render-worker.js');
   const dispatch = (data: unknown) => scope.onmessage!({ data } as MessageEvent);
   await dispatch({
     type: 'parseDelimitedText', id: 100, data: new TextEncoder().encode('a,b\n').buffer,
     options: { delimiter: ',', encoding: 'utf-8', sheetName: 'Sheet1' },
+    japaneseCellFonts,
   });
   expect(worker.received).toContainEqual(expect.objectContaining({ type: 'delimitedTextParsed', id: 100 }));
   const bridge = new WorkerBridge<RenderWorkerResponse>(worker, {
@@ -107,9 +107,30 @@ afterEach(() => {
   FakeOffscreenCanvas.created = [];
 });
 
-describe.each(['render-worker', 'render-worker-source'] as const)('XLSX %s bitmap surface', (entry) => {
+describe('XLSX render worker bitmap surface', () => {
+  it.each([false, true])('uses the caller snapshot (%s) for worker projections despite worker language changes', async (japanese) => {
+    vi.stubGlobal('navigator', { language: japanese ? 'en-US' : 'ja-JP' });
+    const { dispatch } = await loadWorker(japanese);
+    const { resolvedThemeCellFont } = await import('./renderer.js');
+    for (const language of ['en-US', 'ja-JP', 'en-US']) {
+      vi.stubGlobal('navigator', { language });
+      await dispatch({
+        type: 'renderViewport', id: 7, sheetIndex: 0, viewport: VIEWPORT,
+        opts: { width: 100, height: 80, dpr: 1, sizeOverrides: { rows: { 1: 30 } } },
+        viewProjection: { id: 1, revision: 1, autoRowHeightsPrepared: true },
+      });
+      const deps = mocks.render.mock.calls.at(-1)?.[0] as { ws: Worksheet };
+      // Supply a theme on this parser-free fixture; the real worker owns its
+      // model binding and creates/reuses the prepared display projection.
+      deps.ws.themeJapaneseMinorFont = 'Meiryo';
+      expect(resolvedThemeCellFont({
+        name: 'Calibri', scheme: 'minor', bold: false, italic: false,
+      }, deps.ws).family).toBe(japanese ? 'Meiryo' : 'Calibri');
+    }
+  });
+
   it('paints renderViewportToBitmap into the contextless 1x1 canvas transferred from the caller', async () => {
-    const { workbook, worker } = await loadWorker(entry);
+    const { workbook, worker } = await loadWorker();
 
     const bitmap = await workbook.renderViewportToBitmap(0, VIEWPORT, { width: 100, height: 80, dpr: 1 });
 
@@ -126,7 +147,7 @@ describe.each(['render-worker', 'render-worker-source'] as const)('XLSX %s bitma
   });
 
   it('keeps a worker-local surface for a request that carries no canvas', async () => {
-    const { worker, dispatch } = await loadWorker(entry);
+    const { worker, dispatch } = await loadWorker();
 
     await dispatch({ type: 'renderViewport', id: 7, sheetIndex: 0, viewport: VIEWPORT, opts: { width: 100, height: 80, dpr: 1 } });
 

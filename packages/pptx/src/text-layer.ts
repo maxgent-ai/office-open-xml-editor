@@ -2,15 +2,7 @@ import { overlayPercent, type HyperlinkTarget } from '@silurus/ooxml-core';
 import type { PptxTextRunInfo } from './renderer';
 import { pptxRunFrameKey, pptxRunFrameTransform } from './run-frame-transform.js';
 import { createPptxRunFrame } from './run-frame-dom.js';
-
-function setSelectionData(element: HTMLElement, key: string, value?: string): void {
-  if (element.dataset) {
-    if (value === undefined) delete element.dataset[key];
-    else element.dataset[key] = value;
-  } else if (value !== undefined) {
-    element.setAttribute?.(`data-${key.replace(/[A-Z]/g, (char) => `-${char.toLowerCase()}`)}`, value);
-  }
-}
+import { setSelectionData } from '@silurus/ooxml-core/internal/selection-data';
 
 /**
  * Build the transparent text-selection overlay for a rendered pptx slide. Unlike

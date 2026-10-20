@@ -78,14 +78,14 @@ describe('duotoneImageData', () => {
     expect(b.data[2]).toBe(Math.round(0 + (0xba - 0) * t));
   });
 
-  it('preserves per-pixel alpha and skips fully transparent pixels', () => {
+  it('preserves per-pixel alpha while recoloring every pixel', () => {
     const b = buf([
       [255, 255, 255, 128], // semi-transparent white → clr2, alpha kept
-      [10, 20, 30, 0], // fully transparent → RGB untouched
+      [0, 0, 0, 0], // fully transparent black → dark endpoint
     ]);
-    duotoneImageData(b, DARK, LIGHT);
+    duotoneImageData(b, 'FF0000', LIGHT);
     expect([b.data[0], b.data[1], b.data[2], b.data[3]]).toEqual([0xda, 0xb6, 0xba, 128]);
-    expect([b.data[4], b.data[5], b.data[6], b.data[7]]).toEqual([10, 20, 30, 0]);
+    expect([b.data[4], b.data[5], b.data[6], b.data[7]]).toEqual([255, 0, 0, 0]);
   });
 
   it('respects colour role order (swapping endpoints inverts the ramp)', () => {

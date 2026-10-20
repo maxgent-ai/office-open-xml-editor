@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 // Verify one legacy Office model source entry of the published dist:
 //
-//  - `legacy-<f>.mjs` exports its ModelSource factory and reaches neither the
-//    reader runtime nor the WASM glue (creating a source fetches nothing);
+//  - `<f>.mjs` exports its default ModelSource constant and its factory and
+//    reaches neither the reader runtime nor the WASM glue (importing the entry
+//    or creating a source fetches nothing);
 //  - it references its WASM asset and its source module asset;
 //  - the source module asset is one self-contained ES module (no import of any
 //    sibling chunk or package) that exports `openModelSource`;
@@ -14,21 +15,22 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 const FORMATS = {
-  doc: { target: 'docx', factory: 'legacyDocSource', nativeClass: 'LegacyDocDocument' },
-  xls: { target: 'xlsx', factory: 'legacyXlsSource', nativeClass: 'LegacyXlsWorkbook' },
-  ppt: { target: 'pptx', factory: 'legacyPptSource', nativeClass: 'LegacyPptPresentation' },
+  doc: { target: 'docx', constant: 'legacyDoc', factory: 'createLegacyDoc', nativeClass: 'LegacyDocDocument' },
+  xls: { target: 'xlsx', constant: 'legacyXls', factory: 'createLegacyXls', nativeClass: 'LegacyXlsWorkbook' },
+  ppt: { target: 'pptx', constant: 'legacyPpt', factory: 'createLegacyPpt', nativeClass: 'LegacyPptPresentation' },
 };
 
 const family = process.argv[2];
 const format = FORMATS[family];
 if (!format) throw new Error('usage: check-optional-legacy-source.mjs <doc|xls|ppt> [dist]');
-const distDir = resolve(process.argv[3] ?? 'dist');
-const entry = `legacy-${family}.mjs`;
+const distDir = resolve(process.argv[3] ?? 'packages/legacy-office/dist');
+const entry = `${family}.mjs`;
+const rootDistDir = resolve('dist');
 const wasmAsset = `legacy_${family}_direct_bg.wasm`;
 const moduleAssetPattern = new RegExp(`^legacy-${family}-source-module(?:-[\\w-]+)?\\.m?js$`);
 const runtimeMarkers = [
-  `packages/legacy-converter/src/direct-${family}-engine.ts`,
-  'packages/legacy-converter/src/direct-source-runtime.ts',
+  `packages/legacy-office/src/direct-${family}-engine.ts`,
+  'packages/legacy-office/src/direct-source-runtime.ts',
   `wasm-direct-${family}/legacy_${family}_direct.js`,
 ];
 
@@ -73,7 +75,7 @@ if (moduleAssets.length !== 1) {
 const moduleAsset = moduleAssets[0];
 const moduleName = basename(moduleAsset);
 
-// 1. Entry: factory only.
+// 1. Entry: constant and factory only.
 const closure = await dependencyClosure(join(distDir, entry));
 for (const marker of runtimeMarkers) assertAbsent(closure, marker, entry);
 assertAbsent(closure, format.nativeClass, entry);
@@ -95,7 +97,7 @@ const load = source.beginLoad();
 if (
   !Object.isFrozen(source) || source.target !== format.target
   || source.claim(new Uint8Array([0x50, 0x4b, 0x03, 0x04])) !== false
-  || load.module.protocol !== 'ooxml-model-source-module/v1'
+  || load.module.protocol !== 'ooxml-model-source-module/v2'
   || load.module.target !== format.target
   || load.module.moduleUrl !== 'https://example.test/source-module.mjs'
   || load.module.config.wasmUrl !== 'https://example.test/reader.wasm'
@@ -105,6 +107,15 @@ if (
 const defaults = factoryModule[format.factory]().beginLoad().module;
 if (!defaults.moduleUrl.endsWith(`/${moduleName}`) || !defaults.config.wasmUrl.endsWith(`/${wasmAsset}`)) {
   throw new Error(`${entry} default URLs do not name its emitted assets`);
+}
+const constant = factoryModule[format.constant];
+if (
+  typeof constant !== 'object' || constant === null || !Object.isFrozen(constant)
+  || constant.target !== format.target
+  || constant.claim(new Uint8Array([0x50, 0x4b, 0x03, 0x04])) !== false
+  || JSON.stringify(constant.beginLoad().module) !== JSON.stringify(defaults)
+) {
+  throw new Error(`${entry} does not export ${format.constant} as the default model source`);
 }
 
 // 2. Source module: self-contained, exports openModelSource.
@@ -125,18 +136,20 @@ const wasm = await stat(join(distDir, wasmAsset));
 if (!wasm.isFile() || wasm.size === 0) throw new Error(`${wasmAsset} is missing or empty`);
 
 // 3. Nothing else reaches this reader.
-const otherEntries = ['index.mjs', 'docx.mjs', 'xlsx.mjs', 'pptx.mjs', 'node.mjs',
-  ...Object.keys(FORMATS).filter((other) => other !== family).map((other) => `legacy-${other}.mjs`)];
+const otherEntries = [
+  ...['index', 'docx', 'xlsx', 'pptx', 'node', 'internal-companion'].map(other => join(rootDistDir, `${other}.mjs`)),
+  ...Object.keys(FORMATS).filter(other => other !== family).map(other => join(distDir, `${other}.mjs`)),
+];
 for (const other of otherEntries) {
-  const otherClosure = await dependencyClosure(join(distDir, other));
+  const otherClosure = await dependencyClosure(other);
   assertAbsent(otherClosure, wasmAsset, other);
   assertAbsent(otherClosure, moduleName, other);
   assertAbsent(otherClosure, format.nativeClass, other);
 }
-const workers = all.filter((path) => /render-worker|(?:^|[/\\])worker-[\w-]+\.js$/.test(path) && path.endsWith('.js'));
+const workers = (await filesUnder(rootDistDir)).filter((path) => /render-worker|(?:^|[/\\])worker-[\w-]+\.js$/.test(path) && path.endsWith('.js'));
 for (const worker of workers) {
   const text = await readFile(worker, 'utf8');
-  for (const marker of [format.nativeClass, wasmAsset, 'legacy-converter']) {
+  for (const marker of [format.nativeClass, wasmAsset, 'legacy-office']) {
     if (text.includes(marker)) throw new Error(`${basename(worker)} contains ${marker}`);
   }
 }

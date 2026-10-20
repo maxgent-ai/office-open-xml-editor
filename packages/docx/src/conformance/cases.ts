@@ -8,7 +8,7 @@
  * reference frame) are deliberately excluded.
  */
 
-export const CONFORMANCE_AXES = {
+const CONFORMANCE_AXES = {
   story: ['body', 'header', 'footer'],
   container: ['paragraph', 'table', 'nestedTable'],
   paragraph: ['single', 'wrapped'],
@@ -169,7 +169,7 @@ const SEED_ROWS: readonly ConformanceAxisValues[] = [
  * lexicographically first row covering the most still-uncovered feasible pairs
  * wins.  Reverse elimination then removes redundant non-seed rows.
  */
-export function generatePairwiseAxes(): readonly {
+function generatePairwiseAxes(): readonly {
   readonly axes: ConformanceAxisValues;
   readonly seed: boolean;
 }[] {

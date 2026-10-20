@@ -43,7 +43,7 @@ export const OUTLINE_BUTTON_PX = 12;
 export const OUTLINE_BUTTON_GAP_PX = 2;
 
 /** Leading inset of the numbered level-button bank. */
-export const OUTLINE_BUTTON_INSET_PX = 2;
+const OUTLINE_BUTTON_INSET_PX = 2;
 
 /** Center coordinate of a numbered outline-level button within its bank. */
 export function outlineLevelButtonCenterPx(level: number): number {

@@ -595,7 +595,6 @@ describe('getCachedBitmapByPath', () => {
       heightPt: 500,
       targetWidthPx: 100,
       targetHeightPx: 50,
-      suppressBoundaryFrame: true,
     });
     const native = await getCachedBitmapByPath(path, 'image/wmf', fetchImage, {
       widthPt: 10,
@@ -616,7 +615,7 @@ describe('getCachedBitmapByPath', () => {
     expect(create).toHaveBeenNthCalledWith(2, expect.any(Blob));
   });
 
-  it('reuses a larger WMF raster for a smaller frame but isolates suppression variants', async () => {
+  it('reuses a larger WMF raster for a smaller frame', async () => {
     const { create, closes } = stubMetafileSurfaceCreation();
     const wmf = buildMinimalWmf();
     const fetchImage = vi.fn(async () =>
@@ -631,19 +630,12 @@ describe('getCachedBitmapByPath', () => {
       widthPt: 50,
       heightPt: 40,
     });
-    const suppressedSmall = await getCachedBitmapByPath(path, 'image/wmf', fetchImage, {
-      widthPt: 50,
-      heightPt: 40,
-      suppressBoundaryFrame: true,
-    });
 
     expect(large).toMatchObject({ width: 300, height: 200 });
     expect(coveredSmall).toBe(large);
-    expect(suppressedSmall).toMatchObject({ width: 100, height: 80 });
-    expect(suppressedSmall).not.toBe(large);
-    expect(fetchImage).toHaveBeenCalledTimes(2);
-    expect(create).toHaveBeenCalledTimes(2);
-    const [regularKey, suppressedKey] = await Promise.all([
+    expect(fetchImage).toHaveBeenCalledTimes(1);
+    expect(create).toHaveBeenCalledTimes(1);
+    const [regularKey, smallKey] = await Promise.all([
       resolvedCachedBitmapVariantKey(
         path,
         'image/wmf',
@@ -656,17 +648,17 @@ describe('getCachedBitmapByPath', () => {
         path,
         'image/wmf',
         fetchImage,
-        { widthPt: 50, heightPt: 40, suppressBoundaryFrame: true },
+        { widthPt: 50, heightPt: 40 },
         undefined,
-        suppressedSmall as ImageBitmap,
+        coveredSmall as ImageBitmap,
       ),
     ]);
-    expect(suppressedKey).not.toBe(regularKey);
+    expect(smallKey).toBe(regularKey);
 
     dropBitmapCacheByPath(fetchImage);
     await Promise.resolve();
     await Promise.resolve();
-    expect(closes).toHaveLength(2);
+    expect(closes).toHaveLength(1);
     expect(closes.every((close) => close.mock.calls.length === 1)).toBe(true);
   });
 

@@ -1,7 +1,7 @@
 import { sliceParagraphLayout } from './paragraph.js';
 import { projectBodyOccurrence } from './occurrence-projection.js';
 import { isDeepFrozenPlainDataRoot } from './plain-data.js';
-import { placeNoteSeparatorOccurrence } from './native-note-separators.js';
+import { placeNoteSeparatorOccurrence } from './reserved-note-separators.js';
 import { unionLayoutRects } from './rect-union.js';
 import type { NoteLayout, NoteSeparatorLayout, PaintNode, ParagraphLayout, StoryLayout } from './types.js';
 
@@ -115,7 +115,7 @@ export type FootnotePartition = Readonly<{
  * mandatory body unit. A note that cannot partition still returns null. */
 export type FootnotePartitionExtent = 'largest' | 'largest-with-reserved-notice' | 'minimum';
 
-/** Lazily acquired, unplaced native continuation notice occurrence; null when
+/** Lazily acquired, unplaced reserved continuation notice occurrence; null when
  * the story is absent, empty, guard-only or fully hidden. */
 export type ContinuationNoticeProvider = () => NoteSeparatorLayout | null;
 

@@ -1,8 +1,10 @@
+import {
+  normalizeXlsxWorksheetPolicy,
+  type NormalizedXlsxWorksheetPolicy,
+} from './internal/worksheet-policy.js';
 import { describe, expect, it, vi } from 'vitest';
 import {
   PULL_SESSION_PROTOCOL,
-  normalizeXlsxWorksheetPolicy,
-  type NormalizedXlsxWorksheetPolicy,
   type PullSessionCommand,
   type PullSessionResponse,
 } from '@silurus/ooxml-core/worker';

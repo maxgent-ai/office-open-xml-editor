@@ -13,7 +13,9 @@ type Rgba = readonly [number, number, number, number];
 interface SyntheticImageCase {
   readonly id: string;
   readonly filename: string;
+  readonly duotone?: true;
   readonly bytes: Uint8Array;
+  readonly effects?: string;
   /** Expected pixel after the image is composited onto the white DOCX page. */
   readonly expected: Rgba;
 }
@@ -181,6 +183,11 @@ function syntheticImageCases(): readonly SyntheticImageCase[] {
   const smallWidth = 8;
   const smallHeight = 8;
   return [
+    // A viewBox-only SVG requires explicit host rasterization in Chromium.
+    // Its white authored pixels must pass through duotone in both realms.
+    { id: 'svg-duotone', filename: 'duotone.svg', duotone: true,
+      bytes: new TextEncoder().encode('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><rect width="10" height="10" fill="white"/></svg>'),
+      expected: [255, 0, 0, 255] },
     {
       id: 'bilevel-tiff',
       filename: 'bilevel.tif',
@@ -248,6 +255,24 @@ function syntheticImageCases(): readonly SyntheticImageCase[] {
       expected: [30, 70, 220, 255],
     },
     {
+      id: 'svg-with-authored-brightness',
+      filename: 'corrected.svg',
+      bytes: new TextEncoder().encode('<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><rect width="8" height="8" fill="black"/></svg>'),
+      effects: '<a:lum bright="90000"/>',
+      expected: [230, 230, 230, 255],
+    },
+    {
+      id: 'svg-with-recursive-color-and-blur-effects',
+      filename: 'recursive-effects.svg',
+      bytes: new TextEncoder().encode('<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><rect width="8" height="8" fill="red"/></svg>'),
+      effects: '<a:hsl hue="7200000"/><a:tint hue="0" amt="50000"/>'
+        + '<a:fillOverlay blend="mult"><a:solidFill><a:srgbClr val="808080"/></a:solidFill></a:fillOverlay>'
+        + '<a:alphaMod><a:cont type="tree"><a:alphaModFix amt="50000"/></a:cont></a:alphaMod>'
+        + '<a:blur rad="9525" grow="0"/>',
+      // Red -> green -> olive -> (64,64,0), half alpha over white.
+      expected: [159, 159, 127, 255],
+    },
+    {
       id: 'large-indexed-png-1',
       filename: 'large-1.png',
       bytes: indexedPng(LARGE_RASTER_WIDTH, LARGE_RASTER_HEIGHT, [17, 34, 51]),
@@ -284,7 +309,7 @@ function xml(value: string): Uint8Array {
   return encoder.encode(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>${value}`);
 }
 
-function inlinePicture(relationshipId: string, index: number, name: string): string {
+function inlinePicture(relationshipId: string, index: number, name: string, effects = ''): string {
   const extent = 2_286_000; // 180 pt square: a small display target for every source raster.
   return `<w:p><w:r><w:drawing><wp:inline distT="0" distB="0" distL="0" distR="0">
     <wp:extent cx="${extent}" cy="${extent}"/>
@@ -293,7 +318,7 @@ function inlinePicture(relationshipId: string, index: number, name: string): str
     <a:graphic><a:graphicData uri="${PICTURE_NS}">
       <pic:pic><pic:nvPicPr><pic:cNvPr id="${index + 1}" name="${name}"/>
         <pic:cNvPicPr/></pic:nvPicPr>
-        <pic:blipFill><a:blip r:embed="${relationshipId}"/>
+        <pic:blipFill><a:blip r:embed="${relationshipId}">${effects}</a:blip>
           <a:stretch><a:fillRect/></a:stretch></pic:blipFill>
         <pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="${extent}" cy="${extent}"/></a:xfrm>
           <a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr>
@@ -307,7 +332,7 @@ function syntheticImageDocx(images: readonly SyntheticImageCase[]): Uint8Array {
     `<Relationship Id="rIdImage${index + 1}" Type="${REL_IMAGE}" Target="media/${image.filename}"/>`,
   ).join('');
   const body = images.map((image, index) =>
-    `${inlinePicture(`rIdImage${index + 1}`, index, image.id)}${index === images.length - 1
+    `${inlinePicture(`rIdImage${index + 1}`, index, image.id, (image.effects ?? '') + (image.duotone ? '<a:duotone><a:srgbClr val="000000"/><a:srgbClr val="FF0000"/></a:duotone>' : ''))}${index === images.length - 1
       ? ''
       : '<w:p><w:r><w:br w:type="page"/></w:r></w:p>'}`,
   ).join('');
@@ -320,6 +345,7 @@ function syntheticImageDocx(images: readonly SyntheticImageCase[]): Uint8Array {
       <Default Extension="tiff" ContentType="image/tiff"/>
       <Default Extension="bin" ContentType="application/octet-stream"/>
       <Default Extension="png" ContentType="image/png"/>
+      <Default Extension="svg" ContentType="image/svg+xml"/>
       <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
     </Types>`)],
     ['_rels/.rels', xml(`<Relationships xmlns="${PACKAGE_REL_NS}">
@@ -341,7 +367,7 @@ function syntheticImageDocx(images: readonly SyntheticImageCase[]): Uint8Array {
   return storeZip(parts);
 }
 
-test('synthetic TIFF classes and aggregate-large rasters survive DocxScrollViewer main/worker traversal', async ({ page }) => {
+test('synthetic image codecs, corrected SVG effects and aggregate-large rasters survive DocxScrollViewer main/worker traversal', async ({ page }) => {
   test.setTimeout(180_000);
   const images = syntheticImageCases();
   const docx = syntheticImageDocx(images);

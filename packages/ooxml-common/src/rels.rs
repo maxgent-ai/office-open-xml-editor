@@ -65,14 +65,19 @@ pub struct RelTarget {
 /// This does not resolve targets to part names — Targets are stored verbatim;
 /// call [`resolve_target`] per source part for Internal entries.
 pub fn parse_rels(xml: &str) -> BTreeMap<String, RelTarget> {
-    let mut map = BTreeMap::new();
     if xml.is_empty() {
-        return map;
+        return BTreeMap::new();
     }
-    let doc = match crate::depth::parse_guarded(xml) {
-        Ok(d) => d,
-        Err(_) => return map,
-    };
+    match crate::depth::parse_guarded(xml) {
+        Ok(doc) => parse_rels_document(&doc),
+        Err(_) => BTreeMap::new(),
+    }
+}
+
+/// [`parse_rels`] over a `.rels` document the caller already parsed, so a
+/// host can apply its own (stricter) XML preflight and node ceiling.
+pub fn parse_rels_document(doc: &roxmltree::Document<'_>) -> BTreeMap<String, RelTarget> {
+    let mut map = BTreeMap::new();
     for rel in doc
         .root_element()
         .children()
@@ -98,6 +103,30 @@ pub fn parse_rels(xml: &str) -> BTreeMap<String, RelTarget> {
         );
     }
     map
+}
+
+/// Target of the first relationship, in document order, whose `Type` is one
+/// of the exact `relationship_types` URIs and that names a package part.
+///
+/// ECMA-376 Part 2 §9.3 makes `TargetMode` part of relationship semantics: an
+/// omitted `TargetMode` is `Internal`, and `External` targets do not name
+/// package parts. Only an omitted or exactly `"Internal"` mode is accepted.
+/// The target is returned verbatim (unresolved).
+pub fn find_internal_rel_target_by_types(
+    doc: &roxmltree::Document<'_>,
+    relationship_types: &[&str],
+) -> Option<String> {
+    doc.root_element()
+        .children()
+        .filter(|node| node.is_element() && node.tag_name().name() == "Relationship")
+        .filter(|node| matches!(node.attribute("TargetMode"), None | Some("Internal")))
+        .find_map(|node| {
+            let relationship_type = node.attribute("Type")?;
+            relationship_types
+                .contains(&relationship_type)
+                .then_some(())?;
+            node.attribute("Target").map(str::to_owned)
+        })
 }
 
 /// Resolve an OPC relationship `Target` to a normalized zip part name.
@@ -495,6 +524,21 @@ impl RelTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn find_internal_target_skips_external_and_keeps_document_order() {
+        const COMMENTS: &str =
+            "http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments";
+        let xml = format!(
+            r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId9" Type="{COMMENTS}" Target="https://example.invalid/c.xml" TargetMode="External"/><Relationship Id="rId8" Type="{COMMENTS}" Target="comments2.xml"/><Relationship Id="rId1" Type="{COMMENTS}" Target="comments1.xml"/></Relationships>"#
+        );
+        let doc = roxmltree::Document::parse(&xml).unwrap();
+        assert_eq!(
+            find_internal_rel_target_by_types(&doc, &[COMMENTS]).as_deref(),
+            Some("comments2.xml")
+        );
+        assert_eq!(find_internal_rel_target_by_types(&doc, &["other"]), None);
+    }
 
     #[test]
     fn parse_reads_id_target_and_mode() {

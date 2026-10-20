@@ -20,6 +20,7 @@
 //! rendering hints.
 
 use crate::color::{parse_color_node, ThemeResolver, TintMode};
+use crate::xml_node::{attr, child, parse_st_on_off};
 use roxmltree::Node;
 
 /// ECMA-376 §20.1.8.30 `a:fillRect` (CT_RelativeRect) destination insets.
@@ -120,35 +121,13 @@ pub struct PatternFill {
     pub preset: String,
 }
 
-/// Unqualified (no-namespace) attribute lookup, matching the pptx `attr` helper
-/// the moved code used.
-fn attr(node: Node<'_, '_>, local: &str) -> Option<String> {
-    node.attributes()
-        .find(|a| a.name() == local && a.namespace().is_none())
-        .map(|a| a.value().to_owned())
-}
-
-/// First child element with the given local name, matching pptx's `child`.
-fn child<'a, 'i>(node: Node<'a, 'i>, local: &str) -> Option<Node<'a, 'i>> {
-    node.children()
-        .find(|n| n.is_element() && n.tag_name().name() == local)
-}
-
-fn parse_bool(value: &str) -> Option<bool> {
-    match value {
-        "1" | "true" | "on" => Some(true),
-        "0" | "false" | "off" => Some(false),
-        _ => None,
-    }
-}
-
 /// Parse a DrawingML `CT_RelativeRect` node without collapsing an explicitly
 /// authored all-zero rectangle into absence. That distinction matters for
 /// gradient focus/tile rectangles even though it is redundant for stretched
 /// image fills.
 pub fn parse_relative_rect(node: Node<'_, '_>) -> FillRect {
     let read = |name: &str| {
-        attr(node, name)
+        attr(&node, name)
             .and_then(|value| crate::units::drawingml_percentage_to_fraction(&value))
             .unwrap_or(0.0)
     };
@@ -165,7 +144,7 @@ pub fn parse_relative_rect(node: Node<'_, '_>) -> FillRect {
 pub fn parse_fill_rect(stretch: Node<'_, '_>) -> Option<FillRect> {
     let fill_rect = child(stretch, "fillRect")?;
     let read = |name: &str| {
-        attr(fill_rect, name)
+        attr(&fill_rect, name)
             .and_then(|value| crate::units::drawingml_percentage_to_fraction(&value))
             .unwrap_or(0.0)
     };
@@ -185,14 +164,14 @@ pub fn parse_fill_rect(stretch: Node<'_, '_>) -> Option<FillRect> {
 /// Parse `<a:tile>`, applying only the schema-defined `flip="none"` default.
 pub fn parse_tile(tile: Node<'_, '_>) -> TileInfo {
     TileInfo {
-        tx: attr(tile, "tx").and_then(|value| crate::units::coordinate_to_emu(&value)),
-        ty: attr(tile, "ty").and_then(|value| crate::units::coordinate_to_emu(&value)),
-        sx: attr(tile, "sx")
+        tx: attr(&tile, "tx").and_then(|value| crate::units::coordinate_to_emu(&value)),
+        ty: attr(&tile, "ty").and_then(|value| crate::units::coordinate_to_emu(&value)),
+        sx: attr(&tile, "sx")
             .and_then(|value| crate::units::drawingml_percentage_to_fraction(&value)),
-        sy: attr(tile, "sy")
+        sy: attr(&tile, "sy")
             .and_then(|value| crate::units::drawingml_percentage_to_fraction(&value)),
-        flip: Some(attr(tile, "flip").unwrap_or_else(|| "none".to_string())),
-        algn: attr(tile, "algn"),
+        flip: Some(attr(&tile, "flip").unwrap_or_else(|| "none".to_string())),
+        algn: attr(&tile, "algn"),
     }
 }
 
@@ -214,10 +193,10 @@ pub fn parse_grad_fill<R: ThemeResolver + ?Sized>(
                 .children()
                 .filter(|n| n.is_element() && n.tag_name().name() == "gs")
                 .filter_map(|gs| {
-                    let position = attr(gs, "pos")
-                        .and_then(|v| v.parse::<f64>().ok())
-                        .unwrap_or(0.0)
-                        / 100_000.0;
+                    // §20.1.8.36: numeric and Strict percent lexemes share one unit parser.
+                    let position = attr(&gs, "pos")
+                        .and_then(|v| crate::units::drawingml_percentage_to_fraction(&v))
+                        .unwrap_or(0.0);
                     let color = parse_color_node(gs, resolver, tint_mode)?;
                     Some(GradStop { position, color })
                 })
@@ -237,7 +216,7 @@ pub fn parse_grad_fill<R: ThemeResolver + ?Sized>(
     let path_node = child(grad_fill, "path");
     let (grad_type, angle) = if let Some(lin) = linear {
         // OOXML ang: 60000ths of degree, 0 = left→right, 5400000 = top→bottom
-        let ang = attr(lin, "ang")
+        let ang = attr(&lin, "ang")
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(0.0)
             / 60_000.0;
@@ -252,18 +231,18 @@ pub fn parse_grad_fill<R: ThemeResolver + ?Sized>(
         angle,
         grad_type,
         scaled: linear
-            .and_then(|node| attr(node, "scaled"))
+            .and_then(|node| attr(&node, "scaled"))
             .as_deref()
-            .and_then(parse_bool),
-        path: path_node.and_then(|node| attr(node, "path")),
+            .and_then(parse_st_on_off),
+        path: path_node.and_then(|node| attr(&node, "path")),
         fill_to_rect: path_node
             .and_then(|node| child(node, "fillToRect"))
             .map(parse_relative_rect),
         tile_rect: child(grad_fill, "tileRect").map(parse_relative_rect),
-        flip: attr(grad_fill, "flip"),
-        rot_with_shape: attr(grad_fill, "rotWithShape")
+        flip: attr(&grad_fill, "flip"),
+        rot_with_shape: attr(&grad_fill, "rotWithShape")
             .as_deref()
-            .and_then(parse_bool),
+            .and_then(parse_st_on_off),
     })
 }
 
@@ -277,7 +256,7 @@ pub fn parse_patt_fill<R: ThemeResolver + ?Sized>(
     resolver: &R,
     tint_mode: TintMode,
 ) -> PatternFill {
-    let preset = attr(patt_fill, "prst").unwrap_or_else(|| "pct50".to_owned());
+    let preset = attr(&patt_fill, "prst").unwrap_or_else(|| "pct50".to_owned());
     let fg = child(patt_fill, "fgClr")
         .and_then(|n| parse_color_node(n, resolver, tint_mode))
         .unwrap_or_else(|| "000000".to_owned());

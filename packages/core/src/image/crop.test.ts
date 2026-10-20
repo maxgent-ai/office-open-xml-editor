@@ -1,7 +1,6 @@
+import { setImageEffectFrame } from './image-effect-frame.js';
 import { describe, it, expect, vi } from 'vitest';
 import {
-  cropSourceRect,
-  imagePaintProjection,
   drawImageCropped,
   imageNaturalSize,
   metafileRasterSize,
@@ -38,26 +37,6 @@ describe('imageNaturalSize', () => {
   });
   it('returns 0×0 when no size is reported', () => {
     expect(imageNaturalSize({} as unknown as CanvasImageSource)).toEqual({ w: 0, h: 0 });
-  });
-});
-
-describe('cropSourceRect', () => {
-  it('returns null for no crop, an all-zero crop, or no native size', () => {
-    expect(cropSourceRect(fakeImg(100, 100), undefined)).toBeNull();
-    expect(cropSourceRect(fakeImg(100, 100), { l: 0, t: 0, r: 0, b: 0 })).toBeNull();
-    expect(cropSourceRect(fakeImg(0, 0), { l: 0.1, t: 0, r: 0.1, b: 0 })).toBeNull();
-  });
-  it('computes the source sub-rectangle from fractional insets', () => {
-    const c = cropSourceRect(fakeImg(2860, 1368), { l: 0.3256, t: 0, r: 0.03829, b: 0 });
-    expect(c).not.toBeNull();
-    expect(c!.sx).toBeCloseTo(0.3256 * 2860, 3);
-    expect(c!.sy).toBe(0);
-    expect(c!.sw).toBeCloseTo((1 - 0.3256 - 0.03829) * 2860, 3);
-    expect(c!.sh).toBe(1368);
-  });
-  it('intersects a normative negative outset with the actual source bitmap', () => {
-    const c = cropSourceRect(fakeImg(100, 100), { l: -0.5, t: 0, r: 0, b: 0 });
-    expect(c).toEqual({ sx: 0, sy: 0, sw: 100, sh: 100 });
   });
 });
 
@@ -164,24 +143,25 @@ describe('sourceRasterTargetSize', () => {
   });
 });
 
-describe('retained image paint projection', () => {
-  it('rejects strict intermediate overflow while preserving ordinary invalid/empty crop behavior', () => {
-    const negative = { l: -1e308, t: 0, r: -1e308, b: 0 };
-    const positive = { l: 1e308, t: 0, r: 1e308, b: 0 };
-    expect(() => imagePaintProjection(40, 20, negative)).toThrow(/intermediate overflow/);
-    expect(() => imagePaintProjection(40, 20, positive)).toThrow(/intermediate overflow/);
-    expect(() => imagePaintProjection(40, 20, null, { rotation: 1e308 })).toThrow(/overflowed transform/);
-    expect(() => imagePaintProjection(40, 20, { l: NaN, t: 0, r: 0, b: 0 })).toThrow(/finite fractions/);
+describe('image crop overflow', () => {
+  it('paints nothing for overflowing crops and ignores non-finite crop fractions', () => {
     const { ctx, drawImage } = spyCtx();
-    drawImageCropped(ctx, fakeImg(100, 80), negative, 0, 0, 40, 20);
-    drawImageCropped(ctx, fakeImg(100, 80), positive, 0, 0, 40, 20);
+    drawImageCropped(ctx, fakeImg(100, 80), { l: -1e308, t: 0, r: -1e308, b: 0 }, 0, 0, 40, 20);
+    drawImageCropped(ctx, fakeImg(100, 80), { l: 1e308, t: 0, r: 1e308, b: 0 }, 0, 0, 40, 20);
     expect(drawImage).not.toHaveBeenCalled();
     drawImageCropped(ctx, fakeImg(100, 80), { l: NaN, t: 0, r: 0, b: 0 }, 0, 0, 40, 20);
     expect(drawImage).toHaveBeenCalledExactlyOnceWith(expect.anything(), 0, 0, 40, 20);
-    const empty = imagePaintProjection(40, 20, { l: 2, t: 0, r: 0, b: 0 });
-    drawImage.mockClear();
-    drawImageCropped(ctx, fakeImg(100, 80), undefined, 0, 0, 40, 20, { projection: empty });
-    expect(drawImage).not.toHaveBeenCalled();
-    expect(empty.destination).toEqual({ x: 0, y: 0, width: 40, height: 20 });
   });
+});
+
+
+it.each(['crop', 'projection'] as const)('rejects a non-finite effect-frame %s before Canvas can omit the picture', kind => {
+  const image = { width: 3, height: 3 } as CanvasImageSource;
+  setImageEffectFrame(image, { x: 1, y: 1, width: 1, height: 1 });
+  const drawImage = vi.fn();
+  expect(() => drawImageCropped({ drawImage } as unknown as CanvasRenderingContext2D, image,
+    kind === 'crop' ? { l: NaN, t: 0, r: 0, b: 0 } : undefined,
+    0, 0, kind === 'projection' ? Number.MAX_VALUE : 1, 1))
+    .toThrowError(expect.objectContaining({ code: 'unsupported-image-effect' }));
+  expect(drawImage).not.toHaveBeenCalled();
 });

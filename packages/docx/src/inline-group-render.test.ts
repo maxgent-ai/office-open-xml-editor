@@ -1,4 +1,6 @@
 /// <reference types="node" />
+import { layoutDocument } from './document-layout.js';
+import { createLayoutServices } from './layout-runtime.js';
 import { readFile } from 'node:fs/promises';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import init, { DocxArchive } from './wasm/docx_parser.js';
@@ -21,8 +23,8 @@ function inlineGroup(): string {
   return `<w:r><w:drawing><wp:inline><wp:extent cx="${36 * EMU}" cy="${20 * EMU}"/><wp:docPr id="1" name="inline group"/><a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingGroup"><wpg:wgp><wpg:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="${36 * EMU}" cy="${20 * EMU}"/><a:chOff x="0" y="0"/><a:chExt cx="${36 * EMU}" cy="${20 * EMU}"/></a:xfrm></wpg:grpSpPr>${shape('0000FF')}<pic:pic><pic:nvPicPr><pic:cNvPr id="2" name="middle.png"/><pic:cNvPicPr/></pic:nvPicPr><pic:blipFill><a:blip r:embed="rIdImage"/></pic:blipFill><pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="${36 * EMU}" cy="${20 * EMU}"/></a:xfrm><a:prstGeom prst="rect"/></pic:spPr></pic:pic>${shape('00FF00')}</wpg:wgp></a:graphicData></a:graphic></wp:inline></w:drawing></w:r>`;
 }
 
-function docx(): Uint8Array {
-  const document = `<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture" xmlns:wpg="http://schemas.microsoft.com/office/word/2010/wordprocessingGroup" xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"><w:body><w:p><w:r><w:t>BEFORE</w:t></w:r>${inlineGroup()}<w:r><w:t>AFTER</w:t></w:r></w:p><w:sectPr><w:pgSz w:w="15840" w:h="12240"/><w:pgMar w:top="0" w:right="0" w:bottom="0" w:left="0"/></w:sectPr></w:body></w:document>`;
+function docx(kind: string, unsupported: boolean | 'sibling' = false): Uint8Array {
+  const document = `<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:v="urn:schemas-microsoft-com:vml" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture" xmlns:wpg="http://schemas.microsoft.com/office/word/2010/wordprocessingGroup" xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"><w:body><w:p><w:r><w:t>BEFORE</w:t></w:r>${kind === 'DrawingML' ? inlineGroup() : `<w:r><w:pict><v:group style="width:36pt;height:20pt" coordsize="360,200"><v:rect style="width:360;height:200" fillcolor="blue" stroked="f"/><v:shape style="width:360;height:200"><v:imagedata r:id="rIdImage"/></v:shape><v:rect style="width:360;height:200" fillcolor="lime" stroked="f"/>${unsupported === true ? '<v:rect style="width:10;height:10"><v:unavailable-decoration/></v:rect>' : ''}</v:group>${unsupported === 'sibling' ? '<v:rect style="width:10pt;height:10pt"><v:unavailable-decoration/></v:rect>' : ''}</w:pict></w:r>`}<w:r><w:t>AFTER</w:t></w:r></w:p><w:sectPr><w:pgSz w:w="15840" w:h="12240"/><w:pgMar w:top="0" w:right="0" w:bottom="0" w:left="0"/></w:sectPr></w:body></w:document>`;
   return storeZip(new Map([
     ['[Content_Types].xml', encoder.encode('<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Default Extension="png" ContentType="image/png"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>')],
     ['_rels/.rels', encoder.encode('<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>')],
@@ -30,6 +32,27 @@ function docx(): Uint8Array {
     ['word/document.xml', encoder.encode(document)],
     ['word/media/one.png', PNG],
   ]));
+}
+
+function storyGroupDocx(story: string, width: string): Uint8Array {
+  const w = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
+  const r = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+  const namespaces = `xmlns:w="${w}" xmlns:r="${r}" xmlns:v="urn:schemas-microsoft-com:vml"`;
+  const group = `<w:p><w:r><w:pict><v:group style="width:${width};height:20pt"><v:rect style="width:100;height:100" fillcolor="red" stroked="f"/></v:group></w:pict></w:r></w:p>`;
+  const headerFooter = story === 'header' || story === 'footer';
+  const note = story === 'footnote' || story === 'endnote';
+  const root = story === 'header' ? 'hdr' : 'ftr';
+  const body = story === 'body' ? group : `<w:p><w:r><w:t>Body</w:t>${note ? `<w:${story}Reference w:id="1"/>` : ''}</w:r></w:p>`;
+  const parts = new Map([
+    ['[Content_Types].xml', '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>'],
+    ['_rels/.rels', `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="doc" Type="${r}/officeDocument" Target="word/document.xml"/></Relationships>`],
+    ['word/_rels/document.xml.rels', `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">${story === 'body' ? '' : `<Relationship Id="story" Type="${r}/${note ? `${story}s` : story}" Target="story.xml"/>`}</Relationships>`],
+    ['word/document.xml', `<w:document ${namespaces}><w:body>${body}<w:sectPr>${headerFooter ? `<w:${story}Reference w:type="default" r:id="story"/>` : ''}</w:sectPr></w:body></w:document>`],
+  ]);
+  if (story !== 'body') parts.set('word/story.xml', headerFooter
+    ? `<w:${root} ${namespaces}>${group}</w:${root}>`
+    : `<w:${story}s ${namespaces}><w:${story} w:id="1">${group}</w:${story}></w:${story}s>`);
+  return storeZip(new Map([...parts].map(([path, xml]) => [path, encoder.encode(xml)])));
 }
 
 function recordingCanvas(): {
@@ -75,10 +98,37 @@ beforeAll(async () => {
 
 afterEach(() => vi.unstubAllGlobals());
 
-describe('inline WPG group through DOCX parse and render', () => {
-  it('keeps mixed child paint order and advances paragraph once by wp:extent', async () => {
+describe('inline groups through DOCX parse and render', () => {
+  it.each(['body', 'header', 'footer', 'footnote', 'endnote'])('discloses unacquired root VML groups from the %s part through layout', story => {
+    // Part 4 §19.1.2.7 permits auto sizing. Acquisition currently requires a
+    // concrete box, so this early return has no retained unsupported marker.
+    for (const width of ['auto', '36pt']) {
+      const archive = new DocxArchive(storyGroupDocx(story, width));
+      let wire;
+      try { wire = JSON.parse(new TextDecoder().decode(archive.parse())); }
+      finally { archive.free(); }
+      const model = normalizeInternalDocumentModel(wire).document;
+      const measureContext = recordingCanvas().canvas.getContext('2d');
+      const layout = layoutDocument(model, createLayoutServices(model, { measureContext }));
+      if (width === 'auto') {
+        expect(wire.diagnostics).toEqual([{
+          code: 'UNSUPPORTED_VML_CONTENT', severity: 'warning',
+          part: 'word/document.xml', path: story === 'body' ? [0] : [],
+        }]);
+        expect(layout.diagnostics).toEqual([{
+          code: 'UNSUPPORTED_FEATURE', severity: 'warning',
+          source: { story: 'body', storyInstance: 'body', path: story === 'body' ? [0] : [] },
+          message: 'Some VML content could not be rendered',
+        }]);
+      } else {
+        expect(layout.diagnostics).toEqual([]);
+      }
+    }
+  });
+
+  it.each(['DrawingML', 'VML'])('%s keeps mixed child paint order and advances the paragraph once', async kind => {
     vi.stubGlobal('createImageBitmap', vi.fn(async () => ({ width: 1, height: 1, close() {} })));
-    const archive = new DocxArchive(docx());
+    const archive = new DocxArchive(docx(kind));
     let model;
     try {
       model = normalizeInternalDocumentModel(
@@ -96,11 +146,31 @@ describe('inline WPG group through DOCX parse and render', () => {
       onTextRun: (run) => runs.push(run),
     });
 
-    expect(paint.events).toEqual(['rgba(0,0,255,1)', 'image', 'rgba(0,255,0,1)']);
+    expect(paint.events).toEqual(kind === 'VML'
+      ? ['rgba(0,0,255,1)', 'rgba(255,255,255,1)', 'image', 'rgba(0,255,0,1)']
+      : ['rgba(0,0,255,1)', 'image', 'rgba(0,255,0,1)']);
     const before = paint.fillText.find((run) => run.text === 'BEFORE');
     const after = paint.fillText.find((run) => run.text === 'AFTER');
     const beforeRun = runs.find((run) => run.text === 'BEFORE');
     if (!before || !after || !beforeRun) throw new Error('rendered text callbacks missing');
     expect(after.x - (before.x + beforeRun.w)).toBeCloseTo(36, 2);
   });
+  it.each(['body', 'header'].flatMap(story => [true, 'sibling' as const].map(kind => [story, kind] as const)))('retains unsupported VML %s story diagnostics for %s', (story, kind) => {
+    const archive = new DocxArchive(docx('VML', kind));
+    let wire;
+    try { wire = JSON.parse(new TextDecoder().decode(archive.parse())); }
+    finally { archive.free(); }
+    if (story === 'header') {
+      wire.headers.default = { body: wire.body };
+      wire.body = [{ ...wire.body[0], runs: [{ ...wire.body[0].runs[0], text: 'Body' }] }];
+      wire.section.marginTop = 72;
+    }
+    const model = normalizeInternalDocumentModel(wire).document;
+    const measureContext = recordingCanvas().canvas.getContext('2d');
+    const layout = layoutDocument(model, createLayoutServices(model, { measureContext }));
+    expect(layout.diagnostics).toEqual(expect.arrayContaining([expect.objectContaining({
+      code: 'UNSUPPORTED_FEATURE', message: expect.stringContaining(kind === 'sibling' ? 'v:shape' : 'v:group'),
+    })]));
+  });
+
 });

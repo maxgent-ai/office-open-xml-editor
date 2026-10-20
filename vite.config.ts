@@ -5,6 +5,7 @@ import { resolve, dirname, basename } from 'path';
 import { fileURLToPath } from 'url';
 import { readFile } from 'fs/promises';
 import { rolldown } from 'rolldown';
+import { docxCompatibilityMetadata } from './scripts/docx-compatibility-build.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -42,6 +43,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
  */
 export function wasmAssetUrl(
   readAsset: (path: string) => Promise<Uint8Array> = readFile,
+  modulePlugins: Plugin[] = [],
 ): Plugin {
   const SUFFIX = '?url';
   return {
@@ -57,12 +59,12 @@ export function wasmAssetUrl(
       const filePath = id.slice(0, -SUFFIX.length);
       // A `?url` import of a TypeScript module names a self-contained ES
       // module asset (an application-loaded model source module, see
-      // packages/legacy-converter/src/legacy-*.ts). It is bundled on its own,
+      // packages/legacy-office/src/legacy-*.ts). It is bundled on its own,
       // with every dependency inlined and its exports preserved, because the
       // realm that imports it by URL cannot resolve sibling chunks.
       const moduleAsset = /\.[cm]?ts$/.test(filePath);
       const source = moduleAsset
-        ? await bundleSelfContainedModule(filePath)
+        ? await bundleSelfContainedModule(filePath, modulePlugins)
         : await readAsset(filePath);
       const referenceId = this.emitFile({
         type: 'asset',
@@ -101,13 +103,12 @@ export function legacyBundleBoundary(): Plugin {
   return {
     name: 'legacy-bundle-boundary',
     generateBundle(_options, bundle) {
-      // Optional legacy-* entries are allowed to contain the reader. Follow
-      // static and dynamic edges from ordinary entries and workers; a relay
-      // outside the guarded source roots cannot hide the reader in a chunk.
+      // Every root entry and worker must stay independent of the companion.
+      // Follow static and dynamic edges so a relay outside the guarded
+      // source roots cannot hide a reader in a shared chunk.
       const entries = Object.values(bundle).filter((output) =>
         output.type === 'chunk' && output.isEntry
-        && !output.fileName.startsWith('.types-work/')
-        && !/(?:^|[\\/])legacy-(?:doc|xls|ppt)\./.test(output.fileName));
+        && !output.fileName.startsWith('.types-work/'));
       const visited = new Set<string>();
       const pending = [...entries];
       while (pending.length > 0) {
@@ -116,8 +117,8 @@ export function legacyBundleBoundary(): Plugin {
         if (visited.has(output.fileName)) continue;
         visited.add(output.fileName);
         for (const moduleId of Object.keys(output.modules)) {
-          if (/(?:^|[\\/])packages[\\/]legacy-converter(?:[\\/]|$)/.test(moduleId)
-            || moduleId.includes('@silurus/ooxml-legacy-converter')) {
+          if (/(?:^|[\\/])packages[\\/]legacy-office(?:[\\/]|$)/.test(moduleId)
+            || /@silurus\/ooxml-legacy-office/.test(moduleId)) {
             this.error(`${output.fileName} contains forbidden legacy module ${moduleId}`);
           }
         }
@@ -130,10 +131,37 @@ export function legacyBundleBoundary(): Plugin {
   };
 }
 
+/** The installed viewer owns layout, selected-source sidecars and transport.
+ * Check retained modules after tree shaking: importing stateless WASM guards
+ * through core's worker barrel must not count its unused transport exports.
+ * Apply this to opaque source-module builds too; the outer build sees only
+ * their emitted asset bytes, not their dependency graphs. */
+export function companionBundleBoundary(): Plugin {
+  return {
+    name: 'companion-bundle-boundary',
+    generateBundle(_options, bundle) {
+      for (const output of Object.values(bundle)) {
+        if (output.type !== 'chunk') continue;
+        for (const [id, module] of Object.entries(output.modules)) {
+          if (module.renderedLength === 0) continue;
+          const path = id.replaceAll('\\', '/');
+          if (/\/packages\/(?:docx|xlsx|pptx|node)\/src\//.test(path)
+            || /\/packages\/core\/src\/source\/model-source\.ts$/.test(path)
+            || (/\/packages\/core\/src\/worker\//.test(path)
+              && !/\/(?:index|wasm-guard)\.ts$/.test(path))) {
+            this.error(`${output.fileName} contains viewer-owned runtime ${id}`);
+          }
+        }
+      }
+    },
+  };
+}
+
 /** Bundle one ES module with all of its imports inlined and its exports kept. */
-async function bundleSelfContainedModule(entry: string): Promise<string> {
+async function bundleSelfContainedModule(entry: string, plugins: Plugin[]): Promise<string> {
   const bundle = await rolldown({
     input: entry,
+    plugins: [docxCompatibilityMetadata(), ...plugins],
     platform: 'neutral',
     resolve: {
       alias: {
@@ -166,6 +194,7 @@ export default defineConfig(({ command, mode }) => ({
   // package below a subpath or from a CDN.
   base: './',
   plugins: [
+    docxCompatibilityMetadata(),
     wasmAssetUrl(),
     wasm(),
     legacyBundleBoundary(),
@@ -209,12 +238,7 @@ export default defineConfig(({ command, mode }) => ({
         // Opt-in TIFF 6.0 software decoder. Native raster users retain only the
         // lightweight codec contract and header guard.
         tiff: resolve(__dirname, 'src/tiff.ts'),
-        // Opt-in legacy Office model sources (ModelSource factories). Each
-        // entry emits its reader's WASM and self-contained source module as
-        // assets; nothing is fetched until a claimed input is loaded.
-        'legacy-doc': resolve(__dirname, 'src/legacy-doc.ts'),
-        'legacy-ppt': resolve(__dirname, 'src/legacy-ppt.ts'),
-        'legacy-xls': resolve(__dirname, 'src/legacy-xls.ts'),
+        'internal-companion': resolve(__dirname, 'src/internal-companion.ts'),
         // Node-only bounded sessions and server render helpers. Kept as a
         // separate entry so browser consumers never load Node built-ins.
         node:  resolve(__dirname, 'src/node.ts'),
@@ -246,7 +270,7 @@ export default defineConfig(({ command, mode }) => ({
     // Built-in worker renderers lazy-import the same optional math engine. Keep
     // its ~3 MB `?url` asset external in nested worker builds too; otherwise
     // library mode base64-inlines one copy into every format worker chunk.
-    plugins: () => [wasmAssetUrl(), wasm(), legacyBundleBoundary()],
+    plugins: () => [docxCompatibilityMetadata(), wasmAssetUrl(), wasm(), legacyBundleBoundary()],
     rollupOptions: {
       output: {
         assetFileNames: '[name][extname]',

@@ -1,10 +1,10 @@
-import { describe, expect, it } from 'vitest';
-import { OoxmlResourceLimitError } from '@silurus/ooxml-core';
 import {
   DEFAULT_XLSX_WORKSHEET_POLICY,
   normalizeXlsxWorksheetPolicy,
   type NormalizedXlsxWorksheetPolicy,
-} from '@silurus/ooxml-core/worker';
+} from './internal/worksheet-policy.js';
+import { describe, expect, it } from 'vitest';
+import { OoxmlResourceLimitError } from '@silurus/ooxml-core';
 import { getSheetRenderCache, inheritSheetRenderCache } from './renderer.js';
 import { bindWorksheetPolicy, getWorksheetPolicy } from './worksheet-policy-context.js';
 import { createSheetViewModel } from './internal/sheet-viewer-runtime.js';
@@ -186,6 +186,7 @@ describe('renderer coordinate index honours the bound worksheet policy', () => {
       showLastColumn: false,
       accentColor: '#4472C4',
       columns: [],
+      styleElements: [{ kind: 'wholeTable', size: 1, dxf: { font: null, fill: null, border: null } }],
     };
     const tabled = baseWorksheet({ rows: twoCellRows(), tables: [tableInfo] } as Partial<Worksheet>);
     bindWorksheetPolicy(tabled, raisedPolicy());

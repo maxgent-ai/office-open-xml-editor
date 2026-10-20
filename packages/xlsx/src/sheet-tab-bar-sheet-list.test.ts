@@ -205,4 +205,35 @@ describe('SheetTabBar sheet list', () => {
       expect(focused.element).toBeNull();
     }
   });
+
+  it('opens the list at the nav group edge from either button, mirrored in RTL', () => {
+    const rect = (left: number, width: number, top = 700, height = 20) => () =>
+      ({ left, top, right: left + width, bottom: top + height, width, height });
+    const cases = [
+      // LTR: the list's left edge follows the group's left edge.
+      { rtl: false, group: 100, expected: '100px' },
+      // RTL: the list's right edge follows the group's right edge (140 - 60).
+      { rtl: true, group: 100, expected: '80px' },
+      // Clamped to the viewport edge (8 px) when the group sits at the edge.
+      { rtl: true, group: 0, expected: '8px' },
+    ];
+    for (const { rtl, group, expected } of cases) {
+      const { doc } = makePopoverDocument();
+      const { bar, navGroup, list } = makeBar(doc, 'show', []);
+      bar.build(['A', 'B'], [null, null]);
+      bar.setDirection(rtl);
+      Object.assign(navGroup, { getBoundingClientRect: rect(group, 40) });
+      Object.assign(bar.navPrev, { getBoundingClientRect: rect(group, 20) });
+      Object.assign(bar.navNext, { getBoundingClientRect: rect(group + 20, 20) });
+      for (const opener of [bar.navPrev, bar.navNext]) {
+        navGroup.dispatch('contextmenu', contextMenu(opener, 0));
+        const opened = list()!;
+        Object.assign(opened, { getBoundingClientRect: rect(0, 60, 0, 100) });
+        navGroup.dispatch('contextmenu', contextMenu(opener, 0));
+        expect(opened.matches(':popover-open')).toBe(true);
+        expect(opened.style.left).toBe(expected);
+        (opened as unknown as { hidePopover(): void }).hidePopover();
+      }
+    }
+  });
 });

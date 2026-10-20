@@ -1,9 +1,10 @@
-import { classifyCjkFont, type CjkLang, type OfficeFontFallbackRoute } from '@silurus/ooxml-core';
+import { classifyCjkFont, type CjkLang, type NativeRouteLineRequest, type OfficeFontFallbackRoute } from '@silurus/ooxml-core';
 import { activeFontSet, isHTMLCanvas, withVertFeatureCanvasScope } from '@silurus/ooxml-core';
 import type { DocxDocumentModel } from './types.js';
 import type { LoadedEmbeddedFontRoute } from './embedded-fonts.js';
 import type { ResolvedFontMetric } from './layout/text.js';
 import { snapshotFontMetrics } from './layout/text.js';
+import type { NativeRouteLineMetric } from './layout/font-service.js';
 import type { MathLayoutResource } from './layout/resources.js';
 import type { BodyLayoutKernel } from './layout/body-layout-kernel.js';
 import type { LayoutServices } from './layout/types.js';
@@ -14,7 +15,12 @@ import type {
 import {
   createProductionBodyLayoutRuntime,
 } from './layout/production-body-layout.js';
-import { createProductionLayoutServices } from './layout/production-services.js';
+import { createProductionLayoutServices, createProductionTextLayoutService } from './layout/production-services.js';
+import {
+  admitDocxNativeRouteLines,
+  docxNativeRouteRequests,
+  measureDocxNativeRouteLines,
+} from './native-route-line-metrics.js';
 import {
   isLayoutSourceStore,
   type LayoutSourceStore,
@@ -44,6 +50,50 @@ function createConcreteBodyLayoutKernel(
   ).kernel;
 }
 
+function layoutCjkFallback(source: LayoutSourceStore, requested: CjkLang | undefined): CjkLang | undefined {
+  return source.fonts.scriptCjkLanguage
+    ?? classifyCjkFont(source.fonts.majorFamily) ?? classifyCjkFont(source.fonts.minorFamily) ?? requested;
+}
+
+/** Every native route family list that {@link createLayoutServices} can
+ * request for this document (native-route-line-metrics.ts), resolved through
+ * the production text service itself. A native route's family list depends
+ * only on the authored family, the document's family facts, language, script
+ * slot, generic family, CJK fallback and the optional-substitute policy, never
+ * on which resources load: a loaded resource only turns a tuple into a
+ * registered route. So the service is built without any resource inventory,
+ * which makes every tuple native, and the result is the complete set of
+ * native lists before any font is loaded. Lists that later resolve to a
+ * registered or installed route are measured but never looked up. */
+export function nativeRouteLineRequests(
+  input: DocxDocumentModel | LayoutSourceStore,
+  model: DocxDocumentModel,
+  options: Readonly<{ useGoogleFonts?: boolean; cjkFallback?: CjkLang }> = {},
+): NativeRouteLineRequest[] {
+  const source = isLayoutSourceStore(input) ? input : layoutSourceStore(input);
+  const text = createProductionTextLayoutService(source, {
+    useGoogleFonts: options.useGoogleFonts,
+    cjkFallback: layoutCjkFallback(source, options.cjkFallback),
+    measureContext: null,
+    fontSet: null,
+  });
+  return docxNativeRouteRequests(model, text);
+}
+
+/** Main-thread preparation: enumerate, measure and admit in this realm. The
+ * returned sentinel faces belong in the document's release list; they judge
+ * glyph ownership while this realm lays out. */
+export async function prepareMainThreadNativeRouteMetrics(
+  input: LayoutSourceStore,
+  model: DocxDocumentModel,
+  options: Readonly<{ useGoogleFonts?: boolean; cjkFallback?: CjkLang }> = {},
+): Promise<{ nativeRouteMetrics?: Record<string, NativeRouteLineMetric>; faces: FontFace[] }> {
+  const measured = await measureDocxNativeRouteLines(nativeRouteLineRequests(input, model, options), true);
+  return measured.faces.length > 0
+    ? { nativeRouteMetrics: admitDocxNativeRouteLines(measured.lines, activeFontSet()), faces: measured.faces }
+    : { faces: [] };
+}
+
 export function createLayoutServices(
   input: DocxDocumentModel | LayoutSourceStore,
   options: {
@@ -58,7 +108,10 @@ export function createLayoutServices(
     readonly officeRoutes?: readonly OfficeFontFallbackRoute[];
     readonly googleFaces?: readonly FontFace[];
     readonly installedSubstituteFamilies?: readonly string[];
+    readonly installedFamilies?: readonly string[];
     readonly allowFootnoteContinuation?: boolean;
+    /** Admitted native route lines (native-route-line-metrics.ts). */
+    readonly nativeRouteMetrics?: Readonly<Record<string, NativeRouteLineMetric>>;
   } = {},
 ): LayoutServices {
   const source = isLayoutSourceStore(input) ? input : layoutSourceStore(input);
@@ -134,6 +187,7 @@ export function createLayoutServices(
             input.growTrRotateInk,
             (cp) => verticalVertGlyphReachable(canvasContext, cp),
             input.writingMode,
+            input.characterGridDeltaPt,
           );
         } finally {
           canvasContext.font = previousFont;
@@ -147,8 +201,7 @@ export function createLayoutServices(
     ...localMetrics,
     ...options.fontMetrics,
   });
-  const cjkFallback = source.fonts.scriptCjkLanguage
-    ?? classifyCjkFont(source.fonts.majorFamily) ?? classifyCjkFont(source.fonts.minorFamily) ?? options.cjkFallback;
+  const cjkFallback = layoutCjkFallback(source, options.cjkFallback);
   const services = createProductionLayoutServices(source, {
     ...options,
     cjkFallback,

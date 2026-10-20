@@ -142,14 +142,6 @@ class SymbolDag {
   }
 }
 
-let lastSymbolNodeCountForTest = 0;
-
-/** Test-only diagnostic. This module is internal and is not re-exported from the
- * package root, so the counter cannot become public API. */
-export function adjacentTableSymbolNodeCountForTest(): number {
-  return lastSymbolNodeCountForTest;
-}
-
 function boundary(position: ExactLengthKey, sym = 0): GroupBoundary {
   return Object.freeze({ position, sym, identity: `${position}|${sym}` });
 }
@@ -254,6 +246,7 @@ export function combineAdjacentTableLayoutInputs(
 ): AdjacentTableGroupLayoutInput {
   if (groupId.length === 0) throw new RangeError('Adjacent table group id must not be empty');
   if (inputs.length === 0) throw new RangeError('Adjacent table group requires at least one table');
+  // `word-positioned-table-adjacency-exclusion`
   if (inputs.some((input) => !input.ordinaryFlow)) {
     throw new Error('An absolutely positioned table cannot join an adjacent table group');
   }
@@ -512,8 +505,6 @@ export function combineAdjacentTableLayoutInputs(
       cells: Object.freeze(cells),
     });
   });
-
-  lastSymbolNodeCountForTest = dag.nodes.length;
 
   return Object.freeze({
     kind: 'adjacent-table-group-grid',

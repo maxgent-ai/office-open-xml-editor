@@ -1,9 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   defineCompatibilityRule,
-  WORD_FLOAT_DIFFERENT_PARAGRAPH_DISPLACEMENT,
   WORD_EMPTY_MARK_FLOAT_SIDE_GAP,
-  WORD_PAGE_ANCHORED_TABLE_COLLISION_DEFERRAL,
   WORD_SECTION_BTLR_TBRL_PAGE_FRAME,
   wordEmptyMarkMinimumStartWidthPx,
 } from './compatibility.js';
@@ -14,7 +12,6 @@ import {
   WORD_CONTEXTUAL_SPACING_PER_SIDE,
   WORD_TRAILING_SPACE_AFTER_FIT_ADMISSION,
   WORD_VERTICAL_RL_FINAL_LINE_BASELINE_ADMISSION,
-  WORD_TERMINAL_COLUMN_BREAK,
   wordFramePositionExtendsLineBox,
   wordFinalParagraphAdmissionExtentPt,
 } from './body-pagination-compatibility.js';
@@ -63,7 +60,6 @@ import {
   WORD_TABLE_CELL_IGNORES_GRID_RIGHT_INDENT_ADJUSTMENT,
   WORD_THAI_DISTRIBUTE_CLUSTER_POLICY,
   WORD_UNIFORM_RUN_POSITION_LEADING,
-  wordAutoMultipleCenterBoxPx,
   wordBalancedConsecutiveSpaceCellApplies,
   wordBalancedLinesAndCharsGridDeltaFactor,
   wordBalancedSpaceCellAdjustmentApplies,
@@ -71,7 +67,6 @@ import {
   wordEastAsianGridLineCells,
   wordFarEastSingleLinePx,
   wordOpenTypeAutoLineRatios,
-  wordFirstJustifiedContentSegment,
   wordGridAtLeastLineHeightPx,
   wordGridRightIndentAdjustmentPt,
   wordUseFeLayoutParagraphMarkGridAdvancePx,
@@ -79,12 +74,10 @@ import {
   wordDocumentCharacterCompressionApplies,
   wordJapanesePunctuationRetainedExtentPt,
   wordNumberingSuffixAcceptsCoincidentListTab,
-  wordRubyUniformLineHeightPx,
   wordSnapToCharsEastAsianCellCount,
   wordSourceRunSpaceContinuesSequence,
   wordContainerAllowsGridRightIndentAdjustment,
   wordUniformRunPositionPaintPt,
-  wordVisibleLineMetricPx,
 } from './line-compatibility.js';
 import {
   WORD_AUTO_TEXT_CONTRAST_EFFECTIVE_BACKGROUND,
@@ -126,7 +119,6 @@ import {
   WORD_CELL_VERTICAL_ALIGNMENT_INK_BLOCK,
   WORD_EXACT_ROW_HEIGHT_BOTTOM_PADDING,
   WORD_EXACT_ROW_VERTICAL_CLIP_ONLY,
-  WORD_AUTHORED_AUTO_ROW_HEIGHT_FLOOR,
   WORD_EFFECTIVE_FLOATING_TABLE_POSITIONING,
   WORD_FIRST_ROW_TABLE_EXCEPTION_SCOPE,
   WORD_OMITTED_ROW_HEIGHT_RULE_AT_LEAST,
@@ -145,11 +137,9 @@ import {
   WORD_VERTICAL_SECTION_UPRIGHT_BLOCK_TABLE,
   wordAlignedTableOriginPt,
   wordAutofitEmptyParagraphHasNoIntrinsicContent,
-  wordAuthoredAutoRowHeightUsesFloor,
   wordAuthoredBorderParticipates,
   wordClipsOverPageCantSplitRow,
   wordRelocatesParallelParagraphRowCut,
-  wordDropsTrailingStructuralCellMarker,
   wordExactRowFloorPt,
   wordExactRowVerticalClipBounds,
   wordSpacedCellInsideBorderOverridesTable,
@@ -158,6 +148,7 @@ import {
   wordTableMarginValuePt,
   wordTableRowHeightRule,
 } from './table-compatibility.js';
+import { isStructuralTrailingParagraph } from './table-cell-blocks.js';
 
 describe('defineCompatibilityRule', () => {
   it('retains explicit Microsoft evidence as immutable data', () => {
@@ -218,6 +209,11 @@ describe('defineCompatibilityRule', () => {
       evidence: { kind: 'regression-test', reference: 'a test somewhere' },
       description: 'Invalid regression evidence',
     })).toThrow(/path#test-title/);
+    expect(() => defineCompatibilityRule({
+      id: 'bad-library-policy-reference',
+      evidence: { kind: 'library-policy', reference: 'a test somewhere' },
+      description: 'Library policy without a pinning test',
+    })).toThrow(/path#test-title/);
   });
 
   it('records the approved Word section btLr page-frame difference', () => {
@@ -238,7 +234,6 @@ describe('defineCompatibilityRule', () => {
   it('pins every regression-test reference to a concrete repository test', () => {
     const rules = [
       WORD_SECTION_BTLR_TBRL_PAGE_FRAME,
-      WORD_TERMINAL_COLUMN_BREAK,
       WORD_PRE_BREAK_ANCHOR_PARAGRAPH,
       WORD_PRE_BREAK_INLINE_DRAWING_GROUP,
       WORD_CONTINUOUS_SECTION_MARK_SPACING,
@@ -246,11 +241,10 @@ describe('defineCompatibilityRule', () => {
     ];
 
     expect(rules.map((rule) => (
-      rule.evidence.kind === 'regression-test' ? rule.evidence.reference : null
+      'reference' in rule.evidence ? rule.evidence.reference : null
     ))).toEqual([
       'packages/docx/src/layout/coordinate-space.test.ts#maps Transitional text direction %s to %s',
-      'packages/docx/src/pagination.test.ts#ignores a terminal last-column break before a hard page boundary',
-      'packages/docx/src/pagination.test.ts#does not push an anchor-only pre-break paragraph to a new page just for its empty mark',
+        'packages/docx/src/pagination.test.ts#does not push an anchor-only pre-break paragraph to a new page just for its empty mark',
       'packages/docx/src/pagination.test.ts#moves a preceding image with its pre-break callout when the pair only fits fresh',
       'packages/docx/src/body-layout-input.test.ts#projects mutually exclusive collapsed-mark and drop-previous-after roles',
       'packages/docx/src/contextual-spacing-body-paint.test.ts#paints the adjudicated six-case gap table',
@@ -306,22 +300,6 @@ describe('Word table row-cut observations', () => {
       compatibility: 'standard',
       hasUnfinishedParagraphWithoutProgress: true,
     })).toBe(false);
-  });
-});
-
-describe('float compatibility evidence', () => {
-  it('names the established different-paragraph displacement policy', () => {
-    expect(WORD_FLOAT_DIFFERENT_PARAGRAPH_DISPLACEMENT).toMatchObject({
-      id: 'word-float-different-paragraph-displacement',
-      evidence: { kind: 'regression-test' },
-    });
-  });
-
-  it('names absolute floating-table collision deferral as compatibility behavior', () => {
-    expect(WORD_PAGE_ANCHORED_TABLE_COLLISION_DEFERRAL).toMatchObject({
-      id: 'word-page-anchored-table-collision-deferral',
-      evidence: { kind: 'regression-test' },
-    });
   });
 });
 
@@ -398,7 +376,6 @@ describe('layout compatibility inventory', () => {
       WORD_LOWER_LAYER_SAME_PARAGRAPH_ANCHOR_COMPOSITION,
       WORD_TABLE_BORDER_WEIGHT_PRECEDENCE,
       WORD_OMITTED_ROW_HEIGHT_RULE_AT_LEAST,
-      WORD_AUTHORED_AUTO_ROW_HEIGHT_FLOOR,
       WORD_EFFECTIVE_FLOATING_TABLE_POSITIONING,
       WORD_TABLE_CELL_SPACING_SCOPE_SHADOW,
       WORD_TABLE_MARGIN_SCOPE_SHADOW,
@@ -692,10 +669,26 @@ describe('layout compatibility inventory', () => {
     };
     expect(wordOpenTypeAutoLineRatios({ ...hhea, farEastCodePage: false }))
       .toEqual({ lineHeightRatio: 1.1, designAscentRatio: 0.9, designDescentRatio: 0.2 });
-    expect(wordOpenTypeAutoLineRatios({ ...hhea, farEastCodePage: true }))
+    expect(wordOpenTypeAutoLineRatios({ ...hhea, winAscent: 800, winDescent: 200, farEastCodePage: true }))
       .toEqual({ lineHeightRatio: 1.3, designAscentRatio: 0.95, designDescentRatio: 0.35 });
     expect(wordOpenTypeAutoLineRatios({ ...hhea, hheaLineGap: -100, farEastCodePage: false }))
       .toEqual({ lineHeightRatio: 0.9, designAscentRatio: 0.7, designDescentRatio: 0.2 });
+  });
+
+  it('uses the Far East usWin box when hhea differs, including grid boundaries', () => {
+    const metrics = {
+      unitsPerEm: 2048, hheaAscent: 1802, hheaDescent: -455, hheaLineGap: 1024,
+      winAscent: 2017, winDescent: 619, farEastCodePage: true,
+    };
+    const line = wordOpenTypeAutoLineRatios(metrics)!;
+    expect(line.lineHeightRatio).toBeCloseTo(1.6732421875, 12);
+    expect(line.designAscentRatio).toBeCloseTo((2017 + 0.15 * 2636) / 2048, 12);
+    expect(line.designDescentRatio).toBeCloseTo((619 + 0.15 * 2636) / 2048, 12);
+    expect([[8, 12], [12, 20], [20, 30]].map(([size, pitch]) =>
+      wordEastAsianGridLineCells(size * line.lineHeightRatio, pitch) * pitch))
+      .toEqual([24, 40, 60]);
+    expect(wordOpenTypeAutoLineRatios({ ...metrics, winAscent: undefined })).toBeNull();
+    expect(wordOpenTypeAutoLineRatios({ ...metrics, winDescent: -1 })).toBeNull();
   });
 
   it('pins the eight track-change author colors independently of author indexing', () => {
@@ -760,20 +753,6 @@ describe('layout compatibility inventory', () => {
     expect(markGridAdvance({ rule: 'atLeast', value: -1, explicit: true }, false)).toBe(16);
     expect(wordDegenerateLineSpacingIsSingle('exact', 0)).toBe(true);
     expect(wordDegenerateLineSpacingIsSingle('atLeast', 0)).toBe(false);
-    expect(wordAutoMultipleCenterBoxPx(true, false, 10, 12, 24)).toBe(12);
-    expect(wordAutoMultipleCenterBoxPx(true, true, 10, 12, 6)).toBe(6);
-    expect(wordVisibleLineMetricPx(20, 8)).toBe(8);
-    expect(wordVisibleLineMetricPx(20, undefined)).toBe(20);
-    expect(wordFirstJustifiedContentSegment(
-      [{ text: '  ' }, { text: 'body' }],
-      false,
-    )).toBe(1);
-    expect(wordFirstJustifiedContentSegment(
-      [{ text: '  ' }, { text: 'body' }],
-      true,
-    )).toBe(0);
-    expect(wordRubyUniformLineHeightPx(true, [12, 18, 14])).toBe(18);
-    expect(wordRubyUniformLineHeightPx(false, [12, 18, 14])).toBe(0);
     expect(wordRtlAmbiguousCharacter('.')).toBe(true);
     expect(wordRtlAmbiguousCharacter('A')).toBe(false);
     expect(wordKashidaFinalFormApplies(3, 3)).toBe(true);
@@ -791,9 +770,6 @@ describe('layout compatibility inventory', () => {
     expect(wordTableBorderWeight('unknown', 2)).toBe(0);
     expect(wordTableRowHeightRule('auto', false)).toBe('atLeast');
     expect(wordTableRowHeightRule('auto', true)).toBe('auto');
-    expect(wordAuthoredAutoRowHeightUsesFloor('auto', 0)).toBe(true);
-    expect(wordAuthoredAutoRowHeightUsesFloor('auto', Number.POSITIVE_INFINITY)).toBe(true);
-    expect(wordAuthoredAutoRowHeightUsesFloor('atLeast', 10)).toBe(false);
     expect(wordTableCellSpacingValuePt('pct', null)).toBe(0);
     expect(wordTableCellSpacingValuePt('dxa', 4)).toBe(4);
     expect(wordTableMarginValuePt({
@@ -808,29 +784,14 @@ describe('layout compatibility inventory', () => {
   });
 
   it('drops only an empty trailing paragraph after a non-paragraph cell block', () => {
-    expect(wordDropsTrailingStructuralCellMarker({
-      contentLength: 2,
-      previousKind: 'table',
-      lastKind: 'paragraph',
-      lastParagraphRunCount: 0,
-    })).toBe(true);
-    expect(wordDropsTrailingStructuralCellMarker({
-      contentLength: 2,
-      previousKind: 'paragraph',
-      lastKind: 'paragraph',
-      lastParagraphRunCount: 0,
-    })).toBe(false);
-    expect(wordDropsTrailingStructuralCellMarker({
-      contentLength: 2,
-      previousKind: 'table',
-      lastKind: 'paragraph',
-      lastParagraphRunCount: 1,
-    })).toBe(false);
-    expect(wordDropsTrailingStructuralCellMarker({
-      contentLength: 1,
-      previousKind: undefined,
-      lastKind: 'paragraph',
-      lastParagraphRunCount: 0,
-    })).toBe(false);
+    type CellContent = Parameters<typeof isStructuralTrailingParagraph>[0];
+    const content = (...blocks: readonly object[]) => blocks as unknown as CellContent;
+    const table = { type: 'table' };
+    const empty = { type: 'paragraph', runs: [] };
+    const filled = { type: 'paragraph', runs: [{}] };
+    expect(isStructuralTrailingParagraph(content(table, empty), 1)).toBe(true);
+    expect(isStructuralTrailingParagraph(content(empty, empty), 1)).toBe(false);
+    expect(isStructuralTrailingParagraph(content(table, filled), 1)).toBe(false);
+    expect(isStructuralTrailingParagraph(content(empty), 0)).toBe(false);
   });
 });

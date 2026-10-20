@@ -4,7 +4,7 @@ import {
   HARD_MAX_DOCX_BODY_CHUNK_JSON_BYTES,
   HARD_MAX_DOCX_BOOTSTRAP_JSON_BYTES,
   PULL_SESSION_PROTOCOL,
-  requiredPullCredit,
+  pullWithCreditRetry,
   type PullSessionIdentity,
   type PullSessionResponse,
 } from '@silurus/ooxml-core/worker';
@@ -16,7 +16,7 @@ import {
 } from './layout-source-model-adapter.js';
 import type { LayoutSourceStore } from './layout/layout-source-store.js';
 
-export const DOCX_INITIAL_BODY_PULL_BYTES = 1024 * 1024;
+const DOCX_INITIAL_BODY_PULL_BYTES = 1024 * 1024;
 const MAX_DOCUMENT_UNIT_BYTES = Math.max(
   HARD_MAX_DOCX_BODY_CHUNK_JSON_BYTES,
   HARD_MAX_DOCX_BOOTSTRAP_JSON_BYTES,
@@ -141,7 +141,12 @@ async function drainDocumentPullSession<TResult>(
   });
   try {
     for (;;) {
-      const chunk = await pullWithCreditRetry(session, options.signal);
+      const chunk = await pullWithCreditRetry(
+        session,
+        DOCX_INITIAL_BODY_PULL_BYTES,
+        MAX_DOCUMENT_UNIT_BYTES,
+        options.signal,
+      );
       try {
         const usage = chunk.usage ?? session.usageCheckpoint;
         if (usage) options.onUsage?.(usage);
@@ -188,25 +193,4 @@ function parseDocumentUnit(payload: ArrayBuffer): DocumentUnit {
     return record as unknown as Extract<DocumentUnit, { kind: 'complete' }>;
   }
   throw new TypeError('DOCX document unit has an unknown shape');
-}
-
-async function pullWithCreditRetry(
-  session: BoundedPullSession<ArrayBuffer, number>,
-  signal?: AbortSignal,
-) {
-  try {
-    return await session.pull(DOCX_INITIAL_BODY_PULL_BYTES, { signal });
-  } catch (error) {
-    const required = requiredCredit(error);
-    if (required === undefined) throw error;
-    return session.pull(required, { signal });
-  }
-}
-
-function requiredCredit(error: unknown): number | undefined {
-  return requiredPullCredit(
-    error,
-    DOCX_INITIAL_BODY_PULL_BYTES,
-    MAX_DOCUMENT_UNIT_BYTES,
-  );
 }

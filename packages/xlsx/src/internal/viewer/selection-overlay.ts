@@ -240,15 +240,20 @@ export class SelectionOverlay {
         fillSubpaths.push(
           `M${screenLeft} ${y}h${fragmentW}v${fragmentH}h${-fragmentW}Z`,
         );
-        // Inset only the new caps by half the centered 2 CSS-pixel stroke so
-        // clipping keeps the whole stroke, including the physical RTL left edge.
-        // Fill and authored geometry remain unchanged.
+        // A cap on the overlay's own edge (bottom, right, or the physical left
+        // edge in RTL) is inset by half the centered 2 CSS-pixel stroke so the
+        // clip keeps the whole stroke. A cap beside the row/column headers sits
+        // on the grid line, exactly where an ordinary cell selection draws it.
         const insetX = Math.min(1, fragmentW / 2);
         const insetY = Math.min(1, fragmentH / 2);
-        const outlineLeft = screenLeft + ((this.host.isRtl() ? rightCap : leftCap) ? insetX : 0);
-        const outlineRight = screenLeft + fragmentW - ((this.host.isRtl() ? leftCap : rightCap) ? insetX : 0);
-        const outlineTop = y + (topCap ? insetY : 0);
-        const outlineBottom = y2 - (bottomCap ? insetY : 0);
+        const physicalLeftCap = this.host.isRtl() ? rightCap : leftCap;
+        const physicalRightCap = this.host.isRtl() ? leftCap : rightCap;
+        const atOverlayEdge = (edge: number, limit: number) => edge <= 0 || edge >= limit;
+        const outlineLeft = screenLeft + (physicalLeftCap && atOverlayEdge(screenLeft, width) ? insetX : 0);
+        const outlineRight = screenLeft + fragmentW
+          - (physicalRightCap && atOverlayEdge(screenLeft + fragmentW, width) ? insetX : 0);
+        const outlineTop = y + (topCap && atOverlayEdge(y, height) ? insetY : 0);
+        const outlineBottom = y2 - (bottomCap && atOverlayEdge(y2, height) ? insetY : 0);
         overlayRects.push({
           x: outlineLeft,
           y: outlineTop,

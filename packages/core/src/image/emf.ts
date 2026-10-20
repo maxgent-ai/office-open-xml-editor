@@ -1,3 +1,4 @@
+import { OoxmlDecodedImageLimitError, isOoxmlDecodedImageLimitError } from './pixel-budget.js';
 // ── EMF (Enhanced Metafile) player ───────────────────────────────────────────
 //
 // Browsers cannot decode EMF via `createImageBitmap`, so the renderer falls back
@@ -296,7 +297,7 @@ class EmfCursor {
   private p: number;
   constructor(
     private readonly dv: DataView,
-    start: number,
+    private readonly start: number,
     private readonly end: number, // exclusive
   ) {
     this.p = start;
@@ -305,13 +306,17 @@ class EmfCursor {
     return this.p;
   }
   set pos(v: number) {
+    if (!Number.isInteger(v) || v < this.start || v > this.end) throw new RangeError('Invalid EMF cursor position');
     this.p = v;
   }
   get remaining(): number {
     return this.end - this.p;
   }
   private require(size: number): void {
-    if (this.p < 0 || this.remaining < size) throw new RangeError('Truncated EMF record');
+    // MS-EMF 2.3: every field belongs to this record, even when the backing
+    // DataView also contains the next record. Truncation is content damage,
+    // never evidence of geometry that would cross a resource ceiling.
+    if (!Number.isInteger(size) || size < 0 || this.remaining < size) throw new RangeError('Truncated EMF record');
   }
   u16(): number {
     this.require(2);
@@ -320,21 +325,25 @@ class EmfCursor {
     return v;
   }
   i16(): number {
+    this.require(2);
     const v = this.dv.getInt16(this.p, true);
     this.p += 2;
     return v;
   }
   i32(): number {
+    this.require(4);
     const v = this.dv.getInt32(this.p, true);
     this.p += 4;
     return v;
   }
   u32(): number {
+    this.require(4);
     const v = this.dv.getUint32(this.p, true);
     this.p += 4;
     return v;
   }
   f32(): number {
+    this.require(4);
     const v = this.dv.getFloat32(this.p, true);
     this.p += 4;
     return v;
@@ -351,6 +360,7 @@ class EmfCursor {
     };
   }
   skip(n: number): void {
+    this.require(n);
     this.p += n;
   }
 }
@@ -561,12 +571,10 @@ function discardPath(s: PlayState): void {
   s.pathDiscarded = false;
 }
 
-const PATH_BUDGET_FAILURE = 'EMF path (path command budget)';
-
 /** Charge `additional` commands to the open bracket before they are recorded.
  *  Past MAX_EMF_PATH_COMMANDS for everything the DC retains, the bracket is
- *  discarded (never a paintable prefix) and the picture is reported as
- *  incomplete. */
+ *  rejected. This is a resource ceiling, independent of the caller's
+ *  incomplete-metafile compatibility policy. */
 function reservePathCommands(s: PlayState, additional: number): boolean {
   if (!s.inPath) return true;
   if (s.pathDiscarded) return false;
@@ -574,8 +582,10 @@ function reservePathCommands(s: PlayState, additional: number): boolean {
   if (!Number.isSafeInteger(next) || additional < 0 || next > s.maxPathCommands) {
     replacePathBuffer(s);
     s.pathDiscarded = true;
-    s.unsupported.add(PATH_BUDGET_FAILURE);
-    return false;
+    throw new OoxmlDecodedImageLimitError(
+      'metafile-path-commands', s.maxPathCommands,
+      Number.isSafeInteger(next) && next > s.maxPathCommands ? next : Number.MAX_SAFE_INTEGER,
+    );
   }
   s.pathRetained = next;
   s.path.buf.commands += additional;
@@ -865,15 +875,33 @@ type PointReader = (c: EmfCursor) => [number, number];
 const readPoint16: PointReader = (c) => [c.i16(), c.i16()];
 const readPoint32: PointReader = (c) => [c.i32(), c.i32()];
 
+// Existing per-record work/allocation ceilings are library policy, not MS-EMF
+// count restrictions. An oversized declaration is only proof when its complete
+// payload is present; otherwise keep the old malformed-record fallback.
+const MAX_EMF_RECORD_POINTS = 0x100000;
+const MAX_EMF_POLYPOLY_POINTS = 0x200000;
+const MAX_EMF_RECORD_POLYGONS = 0x10000;
+const MAX_EMF_REGION_RECTANGLES = 0x10000;
+const MAX_EMF_TEXT_UNITS = 0x10000;
+
+function admitRecordPoints(c: EmfCursor, count: number, rp: PointReader): boolean {
+  if (count <= MAX_EMF_RECORD_POINTS) return true;
+  if (readablePointCount(c, count, rp) !== count) return false;
+  throw new OoxmlDecodedImageLimitError('metafile-record-points', MAX_EMF_RECORD_POINTS, count);
+}
+
 // ── poly drawing ────────────────────────────────────────────────────────────
 
 /** EMR_POLYLINE(16): open path stroked with the current pen. */
 function strokePolyline(s: PlayState, c: EmfCursor, rp: PointReader): void {
+  if (c.remaining < 20) return; // incomplete bounds/count header is malformed
   c.skip(16); // RECTL rclBounds — drawing uses world transform, not bounds
   const count = c.u32();
-  if (count < 2 || count > 0x100000) return;
+  if (count < 2) return;
+  if (!admitRecordPoints(c, count, rp)) return;
   if (!s.inPath && (!s.curPen || s.curPen.stroke == null)) {
-    // still drop current position to the last point for ...TO continuity callers
+    // No geometry to paint. Per-record admission still precedes this no-op:
+    // a fully supplied oversized record must not depend on selected DC state.
     return;
   }
   const { ctx } = s;
@@ -882,8 +910,7 @@ function strokePolyline(s: PlayState, c: EmfCursor, rp: PointReader): void {
   if (!s.inPath) ctx.beginPath();
   let lx = 0;
   let ly = 0;
-  for (let i = 0; i < count; i++) {
-    if (c.remaining < 4) break;
+  for (let i = 0, readable = readablePointCount(c, count, rp); i < readable; i++) {
     const [xl, yl] = rp(c);
     const [px, py] = toPx(s, xl, yl);
     if (appendPath) {
@@ -906,9 +933,10 @@ function strokePolyline(s: PlayState, c: EmfCursor, rp: PointReader): void {
 /** EMR_POLYLINETO(16): like POLYLINE but the implicit first point is the
  *  current position; updates current position. */
 function strokePolylineTo(s: PlayState, c: EmfCursor, rp: PointReader): void {
+  if (c.remaining < 20) return; // incomplete bounds/count header is malformed
   c.skip(16);
   const count = c.u32();
-  if (count < 1 || count > 0x100000) return;
+  if (count < 1 || !admitRecordPoints(c, count, rp)) return;
   const { ctx } = s;
   const draw = s.inPath || (s.curPen != null && s.curPen.stroke != null);
   const appendPath = !s.inPath || reservePathCommands(s, readablePointCount(c, count, rp));
@@ -919,8 +947,7 @@ function strokePolylineTo(s: PlayState, c: EmfCursor, rp: PointReader): void {
       ctx.moveTo(px0, py0);
     }
   }
-  for (let i = 0; i < count; i++) {
-    if (c.remaining < 4) break;
+  for (let i = 0, readable = readablePointCount(c, count, rp); i < readable; i++) {
     const [xl, yl] = rp(c);
     if (draw && appendPath) {
       const [px, py] = toPx(s, xl, yl);
@@ -939,16 +966,18 @@ function strokePolylineTo(s: PlayState, c: EmfCursor, rp: PointReader): void {
 
 /** EMR_POLYGON(16): closed path filled (brush) + stroked (pen). */
 function fillStrokePolygon(s: PlayState, c: EmfCursor, rp: PointReader): void {
+  if (c.remaining < 20) return; // incomplete bounds/count header is malformed
   c.skip(16);
   const count = c.u32();
-  if (count < 2 || count > 0x100000) return;
+  if (count < 2 || !admitRecordPoints(c, count, rp)) return;
   const { ctx } = s;
   const sink = geometrySink(s);
-  const appendPath = reservePathCommands(s, readablePointCount(c, count, rp) + 1);
+  const readableCount = readablePointCount(c, count, rp);
+  // No first point means no figure and no closePath command to retain.
+  const appendPath = reservePathCommands(s, readableCount > 0 ? readableCount + 1 : 0);
   if (!s.inPath) ctx.beginPath();
   let started = false;
-  for (let i = 0; i < count; i++) {
-    if (c.remaining < 4) break;
+  for (let i = 0, readable = readablePointCount(c, count, rp); i < readable; i++) {
     const [xl, yl] = rp(c);
     const [px, py] = toPx(s, xl, yl);
     if (!started) {
@@ -980,11 +1009,15 @@ function strokePolyBezier(
   rp: PointReader,
   isTo: boolean,
 ): void {
+  if (c.remaining < 20) return; // incomplete bounds/count header is malformed
   c.skip(16);
   const count = c.u32();
-  if (count < 1 || count > 0x100000) return;
+  if (count < 1 || !admitRecordPoints(c, count, rp)) return;
   const readableCount = readablePointCount(c, count, rp);
-  const appendPath = !s.inPath || reservePathCommands(s, readableCount);
+  const startPoints = isTo ? 0 : 1;
+  const commands = readableCount < startPoints + 3
+    ? 0 : startPoints + Math.floor((readableCount - startPoints) / 3);
+  const appendPath = !s.inPath || reservePathCommands(s, commands);
   if (s.inPath && !appendPath) {
     for (let i = 0; i < readableCount; i++) {
       const [xl, yl] = rp(c);
@@ -994,8 +1027,7 @@ function strokePolyBezier(
     return;
   }
   const pts: Array<[number, number]> = [];
-  for (let i = 0; i < count; i++) {
-    if (c.remaining < 4) break;
+  for (let i = 0, readable = readablePointCount(c, count, rp); i < readable; i++) {
     pts.push(rp(c));
   }
   if (pts.length < (isTo ? 3 : 4)) {
@@ -1045,36 +1077,59 @@ function fillStrokePolyPoly(
   rp: PointReader,
   isPolygon: boolean,
 ): void {
+  if (c.remaining < 24) return; // incomplete bounds/count header is malformed
   c.skip(16); // RECTL rclBounds
   const numPolys = c.u32();
   const totalPoints = c.u32();
-  if (numPolys <= 0 || numPolys > 0x10000) return;
-  if (totalPoints <= 0 || totalPoints > 0x200000) return;
-  const counts: number[] = [];
+  if (numPolys === 0 || numPolys > Math.floor(c.remaining / 4)) return;
+  const countsStart = c.pos;
   let countedPoints = 0;
   for (let i = 0; i < numPolys; i++) {
-    if (c.remaining < 4) return;
-    const count = c.u32();
-    countedPoints += count;
-    if (!Number.isSafeInteger(countedPoints) || countedPoints > 0x200000) return;
-    counts.push(count);
+    countedPoints += c.u32();
+    if (countedPoints > totalPoints) return; // inconsistent, with arithmetic bounded by u32 totals
   }
   if (countedPoints !== totalPoints) return;
+  const readableCount = readablePointCount(c, totalPoints, rp);
+  if (numPolys > MAX_EMF_RECORD_POLYGONS || totalPoints > MAX_EMF_POLYPOLY_POINTS) {
+    // Validate both count tables and actual payload before classifying a
+    // resource crossing; never allocate an oversized counts/points array.
+    if (readableCount !== totalPoints) return;
+    if (numPolys > MAX_EMF_RECORD_POLYGONS) {
+      throw new OoxmlDecodedImageLimitError('metafile-record-polygons', MAX_EMF_RECORD_POLYGONS, numPolys);
+    }
+    throw new OoxmlDecodedImageLimitError('metafile-record-points', MAX_EMF_POLYPOLY_POINTS, totalPoints);
+  }
+  // Empty sub-polygons paint nothing, but a complete count table still
+  // proves its polygon-count crossing. Do not let zero total points bypass
+  // admission; inconsistent or truncated tables already returned above.
+  if (totalPoints === 0) return;
+  const pointsStart = c.pos;
+  c.pos = countsStart;
+  const counts: number[] = [];
+  let remainingPoints = readableCount;
+  let commands = 0;
+  for (let i = 0; i < numPolys; i++) {
+    const count = c.u32();
+    const readable = Math.min(count, remainingPoints);
+    remainingPoints -= readable;
+    counts.push(count);
+    // Counts below two are skipped. A truncated nonempty polygon retains its
+    // readable prefix and closing command, but an empty one appends nothing.
+    if (count >= 2 && readable > 0) commands += readable + (isPolygon ? 1 : 0);
+  }
+  c.pos = pointsStart;
   const { ctx } = s;
-  const appendPath = reservePathCommands(
-    s,
-    readablePointCount(c, totalPoints, rp) + (isPolygon ? numPolys : 0),
-  );
+  const appendPath = reservePathCommands(s, commands);
   const sink = geometrySink(s);
   if (!s.inPath) ctx.beginPath(); // in a path bracket: accumulate in the DC path
   let any = false;
   for (const cnt of counts) {
-    if (cnt < 2) {
-      for (let i = 0; i < cnt && c.remaining >= 4; i++) rp(c);
+    const readable = readablePointCount(c, cnt, rp);
+    if (cnt < 2 || readable === 0) {
+      for (let i = 0; i < readable; i++) rp(c);
       continue;
     }
-    for (let i = 0; i < cnt; i++) {
-      if (c.remaining < 4) break;
+    for (let i = 0; i < readable; i++) {
       const [xl, yl] = rp(c);
       if (appendPath) {
         const [px, py] = toPx(s, xl, yl);
@@ -1308,8 +1363,10 @@ function drawRadialArc(s: PlayState, c: EmfCursor, kind: ArcKind, name: string):
   const geometry = radialArc(box, p0, p1, s.arcDirection);
   if (!geometry) return; // an empty bounding box has no curve
   // Inside a path bracket the geometry is appended to the DC path
-  // under the bracket's command budget (move/line, curves, radial, close).
-  if (!reservePathCommands(s, geometry.curves.length + 3)) return;
+  // under the bracket's command budget. MS-EMF 2.3.5.2–4 / 2.3.5.15:
+  // ARC/ARCTO append one move/line, CHORD also closes, PIE also has a radial.
+  const extra = kind === 'pie' ? 3 : kind === 'chord' ? 2 : 1;
+  if (!reservePathCommands(s, geometry.curves.length + extra)) return;
   const { ctx } = s;
   const sink = geometrySink(s);
   const start = toPx(s, geometry.start[0], geometry.start[1]);
@@ -1360,7 +1417,8 @@ function drawAngleArc(s: PlayState, c: EmfCursor): void {
   // Counterclockwise on a y-down surface = decreasing parametric angle.
   const theta0 = (-startDeg * Math.PI) / 180;
   const geometry = ellipseArc(cx, cy, radius, radius, theta0, (-sweep * Math.PI) / 180);
-  if (!reservePathCommands(s, geometry.curves.length + 1)) return;
+  // Zero sweep appends only the connecting line; no cubic is emitted below.
+  if (!reservePathCommands(s, (sweep === 0 ? 0 : geometry.curves.length) + 1)) return;
   const { ctx } = s;
   const sink = geometrySink(s);
   const start = toPx(s, geometry.start[0], geometry.start[1]);
@@ -1393,8 +1451,9 @@ function drawRoundRect(s: PlayState, c: EmfCursor): void {
   const [t, b] = t0 <= b0 ? [t0, b0] : [b0, t0];
   const rx = Math.min(Math.abs(cw) / 2, (r - l) / 2);
   const ry = Math.min(Math.abs(ch) / 2, (b - t) / 2);
-  // Four corners of at most one curve each, four joining moves/lines, close.
-  if (!reservePathCommands(s, 9)) return;
+  // Four joining moves/lines and a close; curves only for nonzero corners.
+  const curved = rx > 0 && ry > 0;
+  if (!reservePathCommands(s, curved ? 9 : 5)) return;
   const { ctx } = s;
   const sink = geometrySink(s);
   if (!s.inPath) ctx.beginPath();
@@ -1415,7 +1474,7 @@ function drawRoundRect(s: PlayState, c: EmfCursor): void {
     const start = toPx(s, arc.start[0], arc.start[1]);
     if (i === 0) sink.moveTo(start[0], start[1]);
     else sink.lineTo(start[0], start[1]);
-    if (rx > 0 && ry > 0) emitCurves(s, sink, arc);
+    if (curved) emitCurves(s, sink, arc);
   });
   sink.closePath();
   if (!s.inPath) paintFigure(s, true);
@@ -1496,10 +1555,6 @@ function extSelectClipRgn(s: PlayState, c: EmfCursor): void {
     resetClip(s, name);
     return;
   }
-  if (mode !== RGN_AND && mode !== RGN_COPY && mode !== RGN_DIFF) {
-    s.unsupported.add(`${name} (mode ${mode})`);
-    return;
-  }
   // RegionDataHeader: dwSize (32), iType (1), nCount,
   // nRgnSize, rclBounds; then nCount RECTL.
   if (size < 32 || c.remaining < size) throw new RangeError('Truncated EMF region');
@@ -1508,7 +1563,17 @@ function extSelectClipRgn(s: PlayState, c: EmfCursor): void {
   const count = c.u32();
   c.u32();
   c.skip(16);
-  if (count > Math.floor((size - 32) / 16) || count > 0x10000) throw new RangeError('Invalid EMF region');
+  if (count > Math.floor((size - 32) / 16)) throw new RangeError('Invalid EMF region');
+  // MS-EMF 2.2.24 / 2.3.2.2: Count rectangles must fit RgnDataSize.
+  // The ceiling is library policy, applied only after those bytes are proven
+  // present, before allocation or any clip/mode fallback can hide a crossing.
+  if (count > MAX_EMF_REGION_RECTANGLES) {
+    throw new OoxmlDecodedImageLimitError('metafile-record-rectangles', MAX_EMF_REGION_RECTANGLES, count);
+  }
+  if (mode !== RGN_AND && mode !== RGN_COPY && mode !== RGN_DIFF) {
+    s.unsupported.add(`${name} (mode ${mode})`);
+    return;
+  }
   if (mode === RGN_COPY && !resetClip(s, name)) return;
   const dev = (x: number, y: number): [number, number] => [
     ((x - s.left) * s.W) / s.boundsW,
@@ -1586,6 +1651,18 @@ function readCreateBrush(c: EmfCursor): [number, Brush] {
   return [ih, { kind: 'brush', fill }];
 }
 
+function decodeRecordDib(
+  c: EmfCursor, dv: DataView, recStart: number,
+  offBmi: number, cbBmi: number, offBits: number, cbBits: number,
+): DecodedDib | null {
+  // MS-EMF 2.3.1 / 2.3.7 bitmap offsets address data after the fixed fields,
+  // inside this record. Reject invalid ranges before the shared decoder can
+  // interpret header fields as a bitmap or classify a resource crossing.
+  const headerSize = c.pos - recStart;
+  if (offBmi < headerSize || offBits < headerSize) return null;
+  return decodeDib(dv, recStart + offBmi, cbBmi, recStart + offBits, cbBits);
+}
+
 /**
  * EMR_CREATEMONOBRUSH(93) / EMR_CREATEDIBPATTERNBRUSHPT(94): u32 ihObject,
  * u32 iUsage, u32 offBmi, u32 cbBmi, u32 offBits, u32 cbBits, then a DIB.
@@ -1603,9 +1680,10 @@ function readDibPatternBrush(c: EmfCursor, dv: DataView, recStart: number): [num
   const cbBits = c.u32();
   let fill = '#808080';
   try {
-    const dib = decodeDib(dv, recStart + offBmi, cbBmi, recStart + offBits, cbBits);
+    const dib = decodeRecordDib(c, dv, recStart, offBmi, cbBmi, offBits, cbBits);
     if (dib) fill = dibAverageColor(dib);
-  } catch {
+  } catch (error) {
+    if (isOoxmlDecodedImageLimitError(error)) throw error;
     /* keep mid-gray fallback */
   }
   return [ih, { kind: 'brush', fill }];
@@ -1668,11 +1746,17 @@ function drawText(s: PlayState, c: EmfCursor, dv: DataView, recStart: number): v
   // moving offDx and the minimum string offset earlier in the record.
   const headerSize = options & 0x100 ? 60 : 76;
   if (recStart + headerSize > recEnd) throw new RangeError('Truncated EMF text header');
-  if (nChars <= 0 || nChars > 0x10000) return;
+  if (nChars === 0) return;
   // MS-EMF 2.2.5 offsets address data inside the containing record. Do not
   // normalize a truncated string using unrelated bytes from following records.
   if (offString < headerSize || recStart + offString + nChars * 2 > recEnd) {
     throw new RangeError('Truncated EMF text string');
+  }
+  // MS-EMF 2.2.5 / 2.3.5.8 defines UTF-16LE units, not a 64K format
+  // maximum. Only a complete string proves this library work-limit crossing;
+  // malformed offsets and truncated strings retain content fallback above.
+  if (nChars > MAX_EMF_TEXT_UNITS) {
+    throw new OoxmlDecodedImageLimitError('metafile-record-text-units', MAX_EMF_TEXT_UNITS, nChars);
   }
   // Read nChars UTF-16LE code units at recStart + offString.
   let str = '';
@@ -1752,6 +1836,7 @@ function drawText(s: PlayState, c: EmfCursor, dv: DataView, recStart: number): v
  *  toPx). Skips gracefully on unsupported DIBs or missing OffscreenCanvas. */
 function blitDib(
   s: PlayState,
+  c: EmfCursor,
   dv: DataView,
   recStart: number,
   offBmi: number,
@@ -1764,7 +1849,7 @@ function blitDib(
   destB: number,
 ): void {
   if (cbBmi === 0 || cbBits === 0) return; // no source bitmap (see doBitBlt)
-  const dib = decodeDib(dv, recStart + offBmi, cbBmi, recStart + offBits, cbBits);
+  const dib = decodeRecordDib(c, dv, recStart, offBmi, cbBmi, offBits, cbBits);
   if (!dib) {
     s.unsupported.add('EMF bitmap (DIB encoding)');
     return;
@@ -1823,7 +1908,7 @@ function doBitBlt(s: PlayState, c: EmfCursor, dv: DataView, recStart: number): v
     return;
   }
   blitDib(
-    s, dv, recStart, offBmi, cbBmi, offBits, cbBits,
+    s, c, dv, recStart, offBmi, cbBmi, offBits, cbBits,
     xDest, yDest, xDest + cxDest, yDest + cyDest,
   );
 }
@@ -1846,7 +1931,7 @@ function doStretchDibits(s: PlayState, c: EmfCursor, dv: DataView, recStart: num
   const cxDest = c.i32();
   const cyDest = c.i32();
   blitDib(
-    s, dv, recStart, offBmi, cbBmi, offBits, cbBits,
+    s, c, dv, recStart, offBmi, cbBmi, offBits, cbBits,
     xDest, yDest, xDest + cxDest, yDest + cyDest,
   );
 }
@@ -1996,11 +2081,26 @@ function replayRecords(
   // save, so a clip reset can restore to it, and playback leaves the caller's
   // context state (including clips) as it found it.
   ctx.save();
+  try {
+    replayRecordStream(s, plus, stopOnPlusFailure, dv, bytes);
+  } finally {
+    // Unwind even on a resource failure; the caller may reuse the context.
+    for (let i = 0; i <= s.stack.length; i++) ctx.restore();
+  }
+}
 
+function replayRecordStream(
+  s: PlayState,
+  plus: EmfPlusPlayer | null,
+  stopOnPlusFailure: boolean,
+  fileView: DataView,
+  bytes: Uint8Array,
+): void {
+  const ctx = s.ctx;
   let pos = 0;
   while (pos + 8 <= bytes.length) {
-    const iType = dv.getUint32(pos, true);
-    const nSize = dv.getUint32(pos + 4, true);
+    const iType = fileView.getUint32(pos, true);
+    const nSize = fileView.getUint32(pos + 4, true);
     // Validate: nSize ≥ 8 (the iType+nSize header) and 4-aligned and in-bounds.
     // A damaged record walk ends playback; what drew so far is kept and the
     // damage is reported.
@@ -2010,6 +2110,10 @@ function replayRecords(
     }
     const recEnd = pos + nSize;
     if (iType === EMR.EOF) break;
+
+    // Also bound direct header/DIB reads. Keep absolute offsets, but never
+    // let an offset or palette borrow bytes beyond this record (MS-EMF 2.3).
+    const dv = new DataView(fileView.buffer, fileView.byteOffset, recEnd);
 
     // A cursor over the data region (starts at record offset 8).
     const c = new EmfCursor(dv, pos + 8, recEnd);
@@ -2037,10 +2141,10 @@ function replayRecords(
           // device units) @ record offset 8; rclFrame (the intended PICTURE
           // FRAME, in .01 mm) @ 24; szlDevice (reference device size, px) @ 72;
           // szlMillimeters (reference device size, mm) @ 80.
-          const bLeft = dv.getInt32(pos + 8, true);
-          const bTop = dv.getInt32(pos + 12, true);
-          const bRight = dv.getInt32(pos + 16, true);
-          const bBottom = dv.getInt32(pos + 20, true);
+          const bLeft = c.i32();
+          const bTop = c.i32();
+          const bRight = c.i32();
+          const bBottom = c.i32();
           // Default mapping: the ink bounds fill the target. Used when the frame
           // or reference device size is absent/degenerate (mirrors the
           // LibreOffice/POI fallback to the bounds rectangle).
@@ -2106,8 +2210,10 @@ function replayRecords(
         }
         case EMR.SETWINDOWORGEX: {
           // data: POINTL { i32 x, i32 y } ([MS-EMF] 2.3.11).
-          s.winOrgX = c.i32();
-          s.winOrgY = c.i32();
+          const x = c.i32();
+          const y = c.i32();
+          s.winOrgX = x;
+          s.winOrgY = y;
           break;
         }
         case EMR.SETWINDOWEXTEX: {
@@ -2119,8 +2225,10 @@ function replayRecords(
           break;
         }
         case EMR.SETVIEWPORTORGEX: {
-          s.vpOrgX = c.i32();
-          s.vpOrgY = c.i32();
+          const x = c.i32();
+          const y = c.i32();
+          s.vpOrgX = x;
+          s.vpOrgY = y;
           break;
         }
         case EMR.SETVIEWPORTEXTEX: {
@@ -2431,8 +2539,10 @@ function replayRecords(
           fillStrokePolyPoly(s, c, readPoint32, false);
           break;
         case EMR.MOVETOEX: {
-          s.curX = c.i32();
-          s.curY = c.i32();
+          const x = c.i32();
+          const y = c.i32();
+          s.curX = x;
+          s.curY = y;
           if (s.inPath && reservePathCommands(s, 1)) {
             const [px, py] = toPx(s, s.curX, s.curY);
             s.path.moveTo(px, py);
@@ -2570,7 +2680,8 @@ function replayRecords(
           break;
         }
       }
-    } catch {
+    } catch (error) {
+      if (isOoxmlDecodedImageLimitError(error)) throw error;
       // A malformed record must never abort the whole render: it is reported
       // and playback advances to the next record.
       s.unsupported.add(`EMF record ${iType} (malformed)`);
@@ -2578,9 +2689,6 @@ function replayRecords(
 
     pos = recEnd;
   }
-
-  // Unwind the SAVEDC levels left open by the metafile and the base save.
-  for (let i = 0; i <= s.stack.length; i++) ctx.restore();
 }
 
 /**

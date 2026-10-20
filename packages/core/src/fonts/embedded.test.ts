@@ -1,12 +1,11 @@
-import { describe, it, expect, afterEach, vi } from 'vitest';
-import {
-  deobfuscateOdttf,
-  embeddedFontBytesAreWithinLimit,
-  registerEmbeddedFonts,
-  unregisterEmbeddedFonts,
-  _resetEmbeddedRegistryForTests,
-  type EmbeddedFontFace,
-} from './embedded.js';
+import { beforeEach, describe, it, expect, afterEach, vi } from 'vitest';
+let { deobfuscateOdttf, embeddedFontBytesAreWithinLimit, registerEmbeddedFonts, unregisterEmbeddedFonts } = await import('./embedded.js');
+import type { EmbeddedFontFace } from './embedded.js';
+
+beforeEach(async () => {
+  vi.resetModules();
+  ({ deobfuscateOdttf, embeddedFontBytesAreWithinLimit, registerEmbeddedFonts, unregisterEmbeddedFonts } = await import('./embedded.js'));
+});
 
 const G = globalThis as Record<string, unknown>;
 const ORIG = { document: G.document, self: G.self, FontFace: G.FontFace };
@@ -15,7 +14,6 @@ afterEach(() => {
   G.document = ORIG.document;
   G.self = ORIG.self;
   G.FontFace = ORIG.FontFace;
-  _resetEmbeddedRegistryForTests(); // dedup registry is module-global
   vi.restoreAllMocks();
   vi.useRealTimers();
 });

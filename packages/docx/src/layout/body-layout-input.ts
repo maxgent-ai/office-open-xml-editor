@@ -17,76 +17,65 @@ import { snapshotPlainData } from './plain-data.js';
 import type { DeepReadonly, LayoutDiagnostic, SourceRef } from './types.js';
 import { wordContinuousSectionRole } from './body-pagination-compatibility.js';
 
-/** ECMA-376 §17.11.1/.23 and MS-DOC §2.6.1 sprmCFSpec define the
- * mark kind independently of the separator story's ordinary/continuation role.
- * Default is an absent producer fact, not an explicitly authored mark. Native
- * producers must validate control semantics/formatting before emitting a mode. */
+/** ECMA-376 §17.11.1/.23 define the mark kind independently of the separator
+ * story's ordinary/continuation role. Default is an absent producer fact, not
+ * an explicitly authored mark. A producer must validate control
+ * semantics/formatting before emitting a mode. */
 export type NoteSeparatorMark = 'short' | 'full' | 'none';
 export type NoteSeparatorInput = NoteSeparatorMark | 'default';
 
-/** Native (MS-DOC 2.3.3) reserved separator story shape. The guard mark is
- * never authored content. */
-export type NativeNoteSeparatorStoryClass = 'empty' | 'guardOnly' | 'paragraphOnly' | 'rule';
-
-/** Native-local header CP/FC/PRM/paragraph-style address; not a SourceRef. */
-export interface NativeNoteSeparatorSourceInput {
-  readonly headerCp: number;
-  readonly fc: number;
-  readonly prm: number;
-  readonly paragraphStyle: number;
-}
-
-/** Effective supported CHPX of one character. No run means an effective
- * vanish, which differs from an absent character. Parser-private run keys
- * (for example typography acquisition) are retained verbatim. */
-export interface NativeNoteSeparatorCharacterInput {
+/** Effective character properties of one character. No run means an
+ * effectively hidden character, which differs from an absent character.
+ * Parser-private run keys (for example typography acquisition) are retained
+ * verbatim. */
+export interface ReservedNoteSeparatorCharacterInput {
   readonly run?: DeepReadonly<DocxTextRun>;
+  /** A tracked insertion; revision metadata is not retained. */
   readonly insertion?: boolean;
 }
 
-export interface NativeNoteSeparatorStoryInput {
-  readonly class: NativeNoteSeparatorStoryClass;
-  readonly contentStartCp: number;
-  readonly contentEndCp: number;
-  readonly guardCp?: number;
+/** One reserved separator story (ECMA-376 §17.18.33 `separator`,
+ * `continuationSeparator` or `continuationNotice`) in its closed shape: no
+ * paragraph is an empty story, a paragraph without a rule is a
+ * paragraph-only story, and a rule always comes with its paragraph. */
+export interface ReservedNoteSeparatorStoryInput {
   readonly rule?: Readonly<{
-    /** Present only when effective sprmCFSpec gives the control its meaning. */
+    /** Present only when the producer established the control's rule meaning. */
     mark?: Exclude<NoteSeparatorMark, 'none'>;
-    control: NativeNoteSeparatorCharacterInput;
-    source: NativeNoteSeparatorSourceInput;
+    control: ReservedNoteSeparatorCharacterInput;
   }>;
   readonly paragraph?: Readonly<{
     paragraph: DeepReadonly<DocParagraph>;
-    /** Absent when the story authors no paragraph mark (a partial rule). */
-    contentMark?: NativeNoteSeparatorCharacterInput;
-    /** Presence only; numbering/frame cascades are not retained. */
+    /** Absent when the story authors no paragraph mark. */
+    contentMark?: ReservedNoteSeparatorCharacterInput;
+    /** Presence only; numbering/frame properties are not retained. */
     numbered?: boolean;
     framed?: boolean;
-    source: NativeNoteSeparatorSourceInput;
   }>;
 }
 
-export interface NativeNoteSeparatorStoriesInput {
-  readonly separator: NativeNoteSeparatorStoryInput;
-  readonly continuationSeparator: NativeNoteSeparatorStoryInput;
-  readonly continuationNotice: NativeNoteSeparatorStoryInput;
+export interface ReservedNoteSeparatorStoriesInput {
+  readonly separator: ReservedNoteSeparatorStoryInput;
+  readonly continuationSeparator: ReservedNoteSeparatorStoryInput;
+  readonly continuationNotice: ReservedNoteSeparatorStoryInput;
 }
 
-/** Raw parser-boundary facts retained once per document for the separator
- * stories a native producer admitted; absent for DOCX. The source-model
- * adapter replaces them with {@link NativeNoteSeparatorRolesInput} before the
- * layout source is sealed, so layout never reads native CP/FC/PAPX wire. */
-export interface NativeNoteSeparatorsInput {
-  readonly footnote?: NativeNoteSeparatorStoriesInput;
-  readonly endnote?: NativeNoteSeparatorStoriesInput;
+/** Parser-boundary facts retained once per document for the reserved
+ * separator stories a producer admitted; the WordprocessingML parser does not
+ * emit them. The source-model adapter replaces them with
+ * {@link ReservedNoteSeparatorRolesInput} before the layout source is sealed,
+ * so layout never reads the raw wire. */
+export interface ReservedNoteSeparatorsInput {
+  readonly footnote?: ReservedNoteSeparatorStoriesInput;
+  readonly endnote?: ReservedNoteSeparatorStoriesInput;
 }
 
-export type NativeNoteSeparatorRole = keyof NativeNoteSeparatorStoriesInput;
+export type ReservedNoteSeparatorRole = keyof ReservedNoteSeparatorStoriesInput;
 
 /** Canonical definition of one reserved separator story: a source definition
  * shared by every page occurrence, never a numbered note. */
-export interface NativeNoteSeparatorDefinitionInput {
-  readonly role: NativeNoteSeparatorRole;
+export interface ReservedNoteSeparatorDefinitionInput {
+  readonly role: ReservedNoteSeparatorRole;
   /** Closed reserved story root (`footnote`/`endnote` + `reserved:*`). */
   readonly root: SourceRef;
   /** The story's authored paragraph `[0]`. `hidden` follows the shared
@@ -102,14 +91,14 @@ export interface NativeNoteSeparatorDefinitionInput {
   }>;
 }
 
-export type NativeNoteSeparatorDefinitionsInput = Readonly<
-  Record<NativeNoteSeparatorRole, NativeNoteSeparatorDefinitionInput>
+export type ReservedNoteSeparatorDefinitionsInput = Readonly<
+  Record<ReservedNoteSeparatorRole, ReservedNoteSeparatorDefinitionInput>
 >;
 
 /** At most six canonical definitions per document (two note kinds, three roles). */
-export interface NativeNoteSeparatorRolesInput {
-  readonly footnote?: NativeNoteSeparatorDefinitionsInput;
-  readonly endnote?: NativeNoteSeparatorDefinitionsInput;
+export interface ReservedNoteSeparatorRolesInput {
+  readonly footnote?: ReservedNoteSeparatorDefinitionsInput;
+  readonly endnote?: ReservedNoteSeparatorDefinitionsInput;
 }
 
 /** Ordinary DOCX listed footnote story roles that can retain a formatted
@@ -150,8 +139,8 @@ export interface BodyParagraphSourceInput {
   readonly styleId: string | null;
   /** Source-level visibility used only for pagination look-ahead across unmeasured blocks. */
   readonly inkless?: boolean;
-  /** Parser-established ordinary text, excluding inline objects and mark-only paragraphs. */
-  readonly onlyVisibleText?: boolean;
+  /** Parser-established text/line-break-only content, including an empty mark; excludes objects. */
+  readonly onlyTextualContent?: boolean;
   /** Mutually exclusive Word/LibreOffice section-mark spacing interop role. */
   readonly continuousSectionRole?:
     | 'suppress-before'
@@ -213,6 +202,8 @@ export type BodyLayoutSequenceEntryFor<TSection> =
 export type BodyLayoutSequenceEntry = BodyLayoutSequenceEntryFor<BodySectionLayoutInput>;
 
 export interface BodyLayoutInput {
+  /** `w:compatSetting` compatibilityMode value from settings (§17.15.3.4). */
+  readonly compatibilityMode?: number;
   readonly source: SourceRef;
   readonly initialSection: BodySectionLayoutInput;
   readonly sequence: readonly BodyLayoutSequenceEntry[];
@@ -234,10 +225,10 @@ export interface BodyLayoutInput {
      * only the scalar band height of its role, never its mark. */
     footnoteSeparatorStories?: SelectedNoteSeparatorDefinitionsInput;
     /** Parser-boundary only; rejected by the sealed layout source. */
-    nativeSeparators?: NativeNoteSeparatorsInput;
-    /** Canonical native separator definitions; they replace the scalar
+    reservedSeparators?: ReservedNoteSeparatorsInput;
+    /** Canonical reserved separator definitions; they replace the scalar
      * separator modes for their note kind. */
-    nativeSeparatorRoles?: NativeNoteSeparatorRolesInput;
+    reservedSeparatorRoles?: ReservedNoteSeparatorRolesInput;
   }>;
 }
 
@@ -250,6 +241,7 @@ export interface NoteNumberingInput {
 }
 
 export interface BodyLayoutAcquisitionInput {
+  readonly compatibilityMode?: number;
   readonly sectionIndex: BodySectionIndexInput;
   readonly evenAndOddHeaders: boolean;
   readonly parserDiagnostics?: readonly LayoutDiagnostic[];
@@ -263,7 +255,7 @@ export interface BodyLayoutAcquisitionInput {
     endnoteSeparator?: NoteSeparatorInput;
     footnoteContinuationSeparator?: NoteSeparatorInput;
     footnoteSeparatorParagraphs?: SelectedNoteSeparatorParagraphsInput;
-    nativeSeparators?: NativeNoteSeparatorsInput;
+    reservedSeparators?: ReservedNoteSeparatorsInput;
   }>;
   readonly pageLayoutSettings: Readonly<{
     mirrorMargins: boolean;
@@ -348,7 +340,7 @@ function sectionInput(
     context: Object.freeze(resolveAcquiredSectionLayoutContext(
       sectionProps(occurrence),
       occurrence.sectionBidi,
-      occurrence.nativeSectionFlow,
+      occurrence.sectionFlow,
     )),
     pageNumbering: Object.freeze({
       start: occurrence.pageNumType?.start ?? null,
@@ -401,6 +393,7 @@ export function projectBodyLayoutInput(acquired: BodyLayoutAcquisitionInput): Bo
   });
   return snapshotPlainData({
     source: { story: 'body', storyInstance: 'body', path: [] },
+    compatibilityMode: acquired.compatibilityMode,
     initialSection,
     sequence,
     parserDiagnostics: acquired.parserDiagnostics ?? [],

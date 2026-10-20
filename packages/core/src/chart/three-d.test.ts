@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import type { ChartModel } from '../types/chart.js';
 import {
   fitChartThreeDProjectionToWallThickness,
   fitChartThreeDProjectionToPoints,
@@ -16,12 +17,24 @@ import {
 } from './three-d-mesh.js';
 import {
   bucketThreeDStackItems,
+  elementFontFamily,
   threeDMeshOutlineWidthPx,
   threeDPieSliceAngles,
   threeDWallGeometry,
 } from './three-d-renderer.js';
 
 const PLOT = { x: 20, y: 10, w: 360, h: 180 };
+
+describe('elementFontFamily', () => {
+  it('resolves DrawingML theme font references before the Arial fallback', () => {
+    const themed = { themeMajorFontLatin: 'Major Face', themeMinorFontLatin: 'Minor Face' } as ChartModel;
+    expect(elementFontFamily(themed, '+mn-lt')).toBe('"Minor Face"');
+    expect(elementFontFamily(themed, '+mj-lt')).toBe('"Major Face"');
+    expect(elementFontFamily(themed, 'Authored Face')).toBe('"Authored Face"');
+    expect(elementFontFamily(themed, null)).toBe('"Arial"');
+    expect(elementFontFamily({} as ChartModel, '+mn-lt')).toBe('"Arial"');
+  });
+});
 
 describe('pieThreeDThicknessMultiplier', () => {
   it('distinguishes omitted hPercent from an authored value and its bare 100% default', () => {

@@ -2,7 +2,7 @@
   "name": "office-open-xml-viewer",
   "displayName": "Office Viewer — DOCX, XLSX, PPTX",
   "description": "High-fidelity local viewer for Office files (.docx / .xlsx / .pptx), powered by Rust/WASM and Canvas. Optional MCP integration can share requested context with an AI agent.",
-  "version": "0.88.0",
+  "version": "0.89.0",
   "publisher": "silurus",
   "license": "MIT",
   "icon": "icon.png",
@@ -41,6 +41,7 @@
       "restrictedConfigurations": [
         "ooxmlViewer.useGoogleFonts",
         "ooxmlViewer.mcpServer.enabled",
+        "ooxmlViewer.mcpServer.restrictToWorkspaceFolders",
         "ooxmlViewer.mcpServer.binaryPath"
       ]
     }
@@ -154,6 +155,12 @@
           ],
           "default": "auto",
           "description": "Controls when the OOXML MCP server is registered with GitHub Copilot Chat in Agent mode through VS Code. The server lets agents read .xlsx / .docx / .pptx files and active Viewer context via dedicated tools. Claude Code and Codex require separate MCP configuration and do not receive active Viewer context."
+        },
+        "ooxmlViewer.mcpServer.restrictToWorkspaceFolders": {
+          "type": "boolean",
+          "default": true,
+          "scope": "machine",
+          "markdownDescription": "Allow the MCP server's file tools to read only files inside the local workspace folders (symlinks are resolved before the check). Paths outside, including an open preview outside the workspace, are rejected; `ooxml_get_active_context` is unaffected. When the window has no local folder the server is not restricted. Turn this off to let the connected agent read any local file."
         },
         "ooxmlViewer.mcpServer.binaryPath": {
           "type": "string",

@@ -1,3 +1,5 @@
+import { setImageEffectFrame } from '../image/image-effect-frame';
+import { markChartFillPreparationSource } from './image-fill.js';
 import { describe, expect, it } from 'vitest';
 import type { ImageFill } from '../types/common.js';
 import {
@@ -8,6 +10,7 @@ import {
 function paint(
   fill: ImageFill,
   options: {
+    rejectSourceDraw?: boolean;
     imageWidth?: number;
     imageHeight?: number;
     faceWidth?: number;
@@ -18,6 +21,9 @@ function paint(
     thicknessPercent?: number;
     faceIndex?: number;
     faceIndices?: readonly number[];
+    effectFrame?: { x: number; y: number; width: number; height: number };
+    sourceFor?: (widthPt: number, heightPt: number) => CanvasImageSource | null;
+    preparationSource?: boolean;
   } = {},
 ): {
   painted: boolean;
@@ -33,6 +39,8 @@ function paint(
     width: options.imageWidth ?? 100,
     height: options.imageHeight ?? 100,
   } as unknown as CanvasImageSource;
+  if (options.effectFrame) setImageEffectFrame(image, options.effectFrame);
+  if (options.preparationSource) markChartFillPreparationSource(image);
   const makeContext = (canvas: object): CanvasRenderingContext2D => {
     const state: Record<string, unknown> = { globalAlpha: 1, canvas };
     return new Proxy(state, {
@@ -44,7 +52,10 @@ function paint(
           return (...args: number[]) => transforms.push(args);
         }
         if (property === 'drawImage') {
-          return (...args: unknown[]) => draws.push(args);
+          return (...args: unknown[]) => {
+            if (options.rejectSourceDraw && args[0] === image) throw new Error('unsafe grid reached paint');
+            draws.push(args);
+          };
         }
         if (property === 'translate' || property === 'scale') {
           return (...values: number[]) => operations.push({ kind: property, values });
@@ -109,6 +120,7 @@ function paint(
     faceIndices,
     point => ({ x: point.x * (options.projectXScale ?? 1), y: point.y }),
     10,
+    options.sourceFor,
   );
   return {
     painted,
@@ -276,13 +288,11 @@ describe('CT_Surface plain stacked pictures', () => {
   });
 
   it('fails closed before drawing when aspect repetition exceeds the image-work ceiling', () => {
-    const result = paint(imageFill, {
+    expect(() => paint(imageFill, {
       imageWidth: 4_097 * 400, imageHeight: 100,
       faceWidth: 400, faceHeight: 100,
       pictureFormat: 'stack',
-    });
-    expect(result.painted).toBe(false);
-    expect(result.draws).toHaveLength(0);
+    })).toThrowError(expect.objectContaining({ code: 'ooxml-decoded-image-limit' }));
   });
 
   it('bounds the aggregate plain-stack work across every thick slab face', () => {
@@ -299,9 +309,8 @@ describe('CT_Surface plain stacked pictures', () => {
     expect(withinLimit.painted).toBe(true);
     expect(withinLimit.draws).toHaveLength(4_094);
 
-    const exceeded = paint(imageFill, { ...common, imageWidth: 400 * 1_365 });
-    expect(exceeded.painted).toBe(false);
-    expect(exceeded.draws).toHaveLength(0);
+    expect(() => paint(imageFill, { ...common, imageWidth: 400 * 1_365 }))
+      .toThrowError(expect.objectContaining({ code: 'ooxml-decoded-image-limit' }));
   });
 });
 
@@ -319,10 +328,12 @@ describe('CT_Surface DrawingML tiles', () => {
       faceHeight: 40,
       projectXScale: 0.4,
     });
-    const projectedCanvas = result.draws
-      .map(call => call[0] as { width?: number })
-      .find(source => source && source !== result.sourceDraws[0]?.[0] && source.width != null);
-    expect(projectedCanvas?.width).toBe(1_080);
+    const projectedDraw = result.draws.find(call => {
+      const source = call[0] as { width?: number };
+      return source && source !== result.sourceDraws[0]?.[0] && source.width != null;
+    });
+    // Assert the source extent passed to real paint, before scratch release.
+    expect(projectedDraw?.[3]).toBe(1_080);
     // 1,080 / 80 = 13.5 tiles: the final half tile leaves 27 visible
     // half-width colour blocks after the complete grid is projected.
     expect(result.sourceDraws).toHaveLength(14);
@@ -336,6 +347,13 @@ describe('CT_Surface tiled pictures', () => {
     dpi: 96,
     tile: { tx: 0, ty: 0, sx: 1, sy: 1, flip: 'none', algn: 'tl' },
   } satisfies ImageFill;
+
+  it('rejects the reviewer’s valid-coordinate unsafe tile indices before painting', () => {
+    expect(() => paint({ ...tiled, dpi: 65535,
+      tile: { ...tiled.tile, tx: 27273042316900, sx: .0001, sy: 10000 } },
+      { imageWidth: 1, imageHeight: 1, faceWidth: 1 / 9525, faceHeight: 1 / 9525, rejectSourceDraw: true }))
+      .toThrowError(expect.objectContaining({ code: 'ooxml-decoded-image-limit' }));
+  });
 
   it('repeats the physical source size in face-local coordinates', () => {
     const result = paint(tiled, {
@@ -431,13 +449,95 @@ describe('CT_Surface tiled pictures', () => {
     expect(exact.painted).toBe(true);
     expect(exact.sourceDraws).toHaveLength(4096);
 
-    const exceeded = paint(tiled, {
+    expect(() => paint(tiled, {
       imageWidth: 1,
       imageHeight: 1,
       faceWidth: 65,
       faceHeight: 64,
-    });
-    expect(exceeded.painted).toBe(false);
-    expect(exceeded.draws).toHaveLength(0);
+    })).toThrowError(expect.objectContaining({ code: 'ooxml-decoded-image-limit' }));
   });
+});
+
+
+it('maps only the authored frame of an effect-grown picture onto a stretched face', () => {
+  const result = paint(imageFill, { effectFrame: { x: 25, y: 25, width: 50, height: 50 } });
+  expect(result.painted).toBe(true);
+  expect(result.sourceDraws.length).toBeGreaterThan(0);
+  for (const draw of result.sourceDraws) {
+    const [, sx, sy, sw, sh] = draw as number[];
+    // drawProjected pads each source cell by half a pixel against seams.
+    expect(sx).toBeGreaterThanOrEqual(24.5 - 1e-9);
+    expect(sy).toBeGreaterThanOrEqual(24.5 - 1e-9);
+    expect(sx + sw).toBeLessThanOrEqual(75.5 + 1e-9);
+    expect(sy + sh).toBeLessThanOrEqual(75.5 + 1e-9);
+  }
+});
+
+it('draws neighbouring 3-D tiles whose effect outset reaches the face', () => {
+  const tiled = { ...imageFill, stretch: false, dpi: 96,
+    tile: { tx: 0, ty: 0, sx: 1, sy: 1, flip: 'none', algn: 'tl' } } satisfies ImageFill;
+  const options = { imageWidth: 20, imageHeight: 10, faceWidth: 20, faceHeight: 10 };
+  const plain = paint(tiled, options);
+  // A 5 px outset each side of a 10 px frame reaches one more period.
+  const grown = paint(tiled, { ...options, effectFrame: { x: 5, y: 0, width: 10, height: 10 } });
+  expect(plain.painted && grown.painted).toBe(true);
+  expect(grown.sourceDraws.length).toBeGreaterThan(plain.sourceDraws.length);
+});
+
+it('resolves a size-dependent source per stacked repetition at its mapped size', () => {
+  const sizes: Array<[number, number]> = [];
+  const unit = { width: 800, height: 100 } as unknown as CanvasImageSource;
+  const result = paint(imageFill, {
+    imageWidth: 800, imageHeight: 100, faceWidth: 400, faceHeight: 100, pictureFormat: 'stack',
+    sourceFor: (widthPt, heightPt) => { sizes.push([widthPt, heightPt]); return unit; },
+  });
+  expect(result.painted).toBe(true);
+  // Two stacked repetitions, each mapped onto half the face height.
+  expect(sizes).toHaveLength(2);
+  for (const [widthPt, heightPt] of sizes) {
+    expect(widthPt).toBeCloseTo(400, 6);
+    expect(heightPt).toBeCloseTo(50, 6);
+  }
+});
+
+it('sizes a planar stretched picture as face width by face height', () => {
+  const sizes: Array<[number, number]> = [];
+  const result = paint(imageFill, {
+    faceWidth: 400, faceHeight: 100,
+    sourceFor: (widthPt, heightPt) => {
+      sizes.push([widthPt, heightPt]);
+      return { width: 100, height: 100 } as unknown as CanvasImageSource;
+    },
+  });
+  expect(result.painted).toBe(true);
+  expect(sizes).toHaveLength(1);
+  expect(sizes[0]![0]).toBeCloseTo(400, 6);
+  expect(sizes[0]![1]).toBeCloseTo(100, 6);
+});
+
+it('projects each per-mapping source with its own grid and effect frame', () => {
+  // The per-size source grew a 10 px outset around its 100 px frame; the
+  // initial whole-face source has none. Each draw must use the resolved
+  // source's metrics, exactly as when that source is the only one.
+  const grown = { width: 120, height: 120 } as unknown as CanvasImageSource;
+  setImageEffectFrame(grown, { x: 10, y: 10, width: 100, height: 100 });
+  const mapped = paint(imageFill, { sourceFor: () => grown });
+  const direct = paint(imageFill, { imageWidth: 120, imageHeight: 120,
+    effectFrame: { x: 10, y: 10, width: 100, height: 100 } });
+  expect(mapped.painted && direct.painted).toBe(true);
+  const strip = (calls: unknown[][]) => calls.map(call => call.slice(1));
+  expect(mapped.draws.length).toBeGreaterThan(0);
+  expect(mapped.draws.every(call => call[0] === grown)).toBe(true);
+  expect(strip(mapped.draws)).toEqual(strip(direct.sourceDraws));
+});
+
+it('records no plain-stack repetition from a preparation placeholder', () => {
+  const sizes: Array<[number, number]> = [];
+  const result = paint(imageFill, {
+    imageWidth: 800, imageHeight: 100, faceWidth: 400, faceHeight: 100, pictureFormat: 'stack',
+    preparationSource: true,
+    sourceFor: (widthPt, heightPt) => { sizes.push([widthPt, heightPt]); return null; },
+  });
+  expect(result.painted).toBe(false);
+  expect(sizes).toEqual([]);
 });

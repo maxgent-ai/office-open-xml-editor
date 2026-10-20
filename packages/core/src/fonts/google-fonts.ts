@@ -43,6 +43,7 @@
  * before lookup).
  */
 import type { FontPreloadEntry } from './preload.js';
+import { ownValue } from '../internal/own-key.js';
 
 const NOTO_NASKH_ARABIC_URL =
   'https://fonts.googleapis.com/css2?family=Noto+Naskh+Arabic:wght@400;700&display=swap';
@@ -120,7 +121,7 @@ export function loadedGoogleRegularAliases(
     if (face.status !== 'loaded' || face.style !== 'normal' || face.weight !== '400') continue;
     const family = face.family.replace(/^['"]|['"]$/g, '').trim();
     const key = family.toLocaleLowerCase('en-US');
-    const entry = entries[key];
+    const entry = ownValue(entries, key);
     if (!entry || (entry.loadFamily && entry.loadFamily.toLocaleLowerCase('en-US') !== key)) continue;
     aliases.set(`${key} regular`, family);
   }

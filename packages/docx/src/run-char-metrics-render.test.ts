@@ -226,14 +226,15 @@ describe('WD4 run character metrics reach the glyph draw (measure==paint)', () =
     ).toBeCloseTo(4, 5);
   });
 
-  it('keeps authored w:kern thresholds authoritative for complex-script runs', async () => {
+  it('kerns Arabic complex-script runs whatever their w:kern threshold', async () => {
+    // Windows Word 16.0 #1850 controls: WORD_ARABIC_PAIR_KERNING.
     const { fills } = await render([
       textRun('نص', { rtl: true, cs: true, fontSizeCs: FONT_PX, kerning: 14 }),
       textRun('عنوان', { rtl: true, cs: true, fontSizeCs: FONT_PX, kerning: 28 }),
     ]);
 
     expect(drawOf(fills, 'نص').fontKerning).toBe('normal');
-    expect(drawOf(fills, 'عنوان').fontKerning).toBe('none');
+    expect(drawOf(fills, 'عنوان').fontKerning).toBe('normal');
   });
 
   // CAL-K measured sizes/thresholds plus K1/K4 boundaries. Both flag values

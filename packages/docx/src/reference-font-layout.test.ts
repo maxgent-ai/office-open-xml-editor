@@ -205,9 +205,13 @@ describe('native reference font vertical layout', () => {
     }
   });
 
-  it('uses authored Calibri vertical geometry with a native CSS fallback, without borrowing widths', () => {
-    // A CSS fallback does not prove that Calibri paints the glyph. Its catalog
-    // sides still define Word pagination; glyph advances remain measured.
+  it('sizes an absent authored face from its painting fallback, not the authored catalog', () => {
+    // Layout follows the face that paints: with Calibri absent, a native CSS
+    // family list paints a browser fallback, so the authored catalog line box
+    // is not admitted and the span keeps that fallback's Canvas box unless the
+    // fallback's measured normal line was admitted for this route (a browser
+    // realm; see native-route-line-metrics.browser.test.ts). Pagination
+    // differences from Office caused by the missing face are accepted.
     const layoutServices = services();
     const segment = buildSegments([{
       type: 'text', text: 'A B', fontFamily: 'Calibri', fontFamilyEastAsia: 'Calibri',
@@ -217,11 +221,11 @@ describe('native reference font vertical layout', () => {
       pageIndex: 0, totalPages: 1, layoutServices,
       characterSpacingControl: 'compressPunctuation',
     })[0] as LayoutTextSeg;
-    expect(segment.referenceFontVerticalMetric).toBe(true);
-    expect(segment.resolvedLineHeightRatio).toBe(2500 / 2048);
+    expect(segment.referenceFontVerticalMetric).toBeFalsy();
+    expect(segment.resolvedLineHeightRatio).toBeUndefined();
     expect(segment.latinSpaceAverageWidthRatio).toBeUndefined();
     const line = layoutLines(context, [segment], 100, 0, 1)[0]!;
-    expect(line.intendedSingle).toBeCloseTo(10 * 2500 / 2048, 8);
+    expect(line.ascent + line.descent).toBeCloseTo(8 + 2, 8);
     expect(line.segments[0]?.measuredWidth).toBe(10);
   });
 
@@ -272,6 +276,77 @@ describe('native reference font vertical layout', () => {
       sourceIdentity: 'provided-sfnt:unrelated' } }).latinSpaceAverageWidthRatio)
       .toBeUndefined();
   });
+  // Windows Word 16.0.20430 mode-14 Latin controls fit at 105pt independently
+  // of w:kern=0 and enableOpenTypeFeatures, with either tested Latin face.
+  // Use an independent synthetic face to pin the existing xAvg floor and its
+  // rejection boundary, rather than introducing the old percentage allowance.
+  it.each([
+    { kerning: undefined, enableOpenTypeFeatures: false },
+    { kerning: undefined, enableOpenTypeFeatures: true },
+    { kerning: 0, enableOpenTypeFeatures: false },
+    { kerning: 0, enableOpenTypeFeatures: true },
+  ])('keeps mode-14 Latin space fit with kern=$kerning, OT=$enableOpenTypeFeatures', (switches) => {
+    const family = 'Synthetic Latin';
+    const layoutServices = verifiedReferenceServices([{ family }], {
+      selected: {
+        family, sourceIdentity: `office-local:local("${family}")`,
+        averageCharWidthRatio: 0.4, unicodeRanges: [[32, 32], [65, 66]],
+      },
+    });
+    const segments = buildSegments([{
+      type: 'text', text: 'A B', fontFamily: family, fontSize: 10,
+      bold: false, italic: false, underline: false, strikethrough: false,
+      color: null, isLink: false, background: null, vertAlign: null, hyperlink: null,
+      kerning: switches.kerning,
+    }], {
+      pageIndex: 0, totalPages: 1, layoutServices,
+      compatibilityMode: 14, characterSpacingControl: 'compressPunctuation',
+      balanceSingleByteDoubleByteWidth: true,
+      enableOpenTypeFeatures: switches.enableOpenTypeFeatures,
+    });
+    const grid = { type: 'linesAndChars' as const, charSpacePt: -1, linePitchPt: 12 };
+    const lines = (width: number) => layoutLines(context, segments, width, 0, 1,
+      [], undefined, {}, 0, undefined, grid);
+    // Natural 15pt minus 1.5pt grid delta; the sole 5pt space can shrink
+    // only to 2pt (half xAvg), independently of the grid's pitch adjustment.
+    expect(lines(10.5)).toHaveLength(1);
+    expect(lines(10.4)).toHaveLength(2);
+  });
+
+  // The Windows evidence covers mode 14 only. Other modes keep the earlier
+  // OpenType/kerning exclusion: the same line wraps instead of shrinking the
+  // space, while the switch-free case still fits.
+  it.each([
+    { compatibilityMode: 15, kerning: undefined, enableOpenTypeFeatures: true, fits: false },
+    { compatibilityMode: 15, kerning: 0, enableOpenTypeFeatures: false, fits: false },
+    { compatibilityMode: 12, kerning: 0, enableOpenTypeFeatures: true, fits: false },
+    { compatibilityMode: undefined, kerning: undefined, enableOpenTypeFeatures: true, fits: false },
+    { compatibilityMode: 15, kerning: undefined, enableOpenTypeFeatures: false, fits: true },
+  ])('keeps the switch exclusion outside mode 14 (mode=$compatibilityMode, kern=$kerning, OT=$enableOpenTypeFeatures)', (c) => {
+    const family = 'Synthetic Latin';
+    const layoutServices = verifiedReferenceServices([{ family }], {
+      selected: {
+        family, sourceIdentity: `office-local:local("${family}")`,
+        averageCharWidthRatio: 0.4, unicodeRanges: [[32, 32], [65, 66]],
+      },
+    });
+    const segments = buildSegments([{
+      type: 'text', text: 'A B', fontFamily: family, fontSize: 10,
+      bold: false, italic: false, underline: false, strikethrough: false,
+      color: null, isLink: false, background: null, vertAlign: null, hyperlink: null,
+      kerning: c.kerning,
+    }], {
+      pageIndex: 0, totalPages: 1, layoutServices,
+      ...(c.compatibilityMode === undefined ? {} : { compatibilityMode: c.compatibilityMode }),
+      characterSpacingControl: 'compressPunctuation',
+      balanceSingleByteDoubleByteWidth: true,
+      enableOpenTypeFeatures: c.enableOpenTypeFeatures,
+    });
+    const grid = { type: 'linesAndChars' as const, charSpacePt: -1, linePitchPt: 12 };
+    expect(layoutLines(context, segments, 10.5, 0, 1, [], undefined, {}, 0, undefined, grid))
+      .toHaveLength(c.fits ? 1 : 2);
+  });
+
   it('keeps an untabled East Asian grid count independent of the native Canvas box', () => {
     const nativeContext = {
       font: '10px serif', letterSpacing: '0px', fontKerning: 'auto',
@@ -404,12 +479,109 @@ describe('native reference font vertical layout', () => {
     expect(referenceFontLineMetrics('BIZ UDMincho', 400, 'italic')).toBeUndefined();
   });
 
-  it('allocates the BIZ UD line box for its Japanese family names at 10.5 pt', () => {
-    // Name identity is shared font metadata (core catalogue aliases), not a
-    // Word policy: the Japanese names reach the same pinned vertical profile.
-    // No local resource is confirmed here, so Canvas glyph widths stay in force.
+  it('treats a family installed in another tuple as present (synthesized bold)', () => {
+    // Only the regular BIZ UDMincho face is installed; a bold run still paints
+    // that installed family through CSS font matching, so the family is
+    // present and its catalog line box applies, unlike a fully absent face.
+    const layoutServices = services({ 'biz udmincho': {
+      requestedFamily: 'BIZ UDMincho', family: 'BIZ UDMincho', weight: 400, style: 'normal',
+      sourceIdentity: 'office-local:local("BIZ UDMincho")',
+    } });
+    const resolution = layoutServices.text.resolve({
+      fonts: { ascii: 'BIZ UDMincho' }, slot: 'ascii', weight: 700, style: 'normal',
+    });
+    expect(resolution.source).toBe('native');
+    expect(resolution.installedFamily).toBe(true);
+    const segment = buildSegments([{
+      type: 'text', text: '資料', fontFamily: 'BIZ UDMincho', fontFamilyEastAsia: 'BIZ UDMincho',
+      fontSize: 10.5, bold: true, italic: false, underline: false, strikethrough: false,
+    }] as DocRun[], { pageIndex: 0, totalPages: 1, layoutServices })[0] as LayoutTextSeg;
+    expect(segment.referenceFontVerticalMetric).toBe(true);
+    expect(segment.resolvedLineHeightRatio).toBeCloseTo(1.3, 8);
+  });
+
+  it('does not treat an application resource under a private alias as an installed family', () => {
+    const layoutServices = services({ 'biz udmincho': {
+      requestedFamily: 'BIZ UDMincho', family: 'BIZ UDMincho', weight: 400, style: 'normal',
+      sourceIdentity: 'provided-sfnt:app',
+    } });
+    const resolution = layoutServices.text.resolve({
+      fonts: { ascii: 'BIZ UDMincho' }, slot: 'ascii', weight: 700, style: 'normal',
+    });
+    expect(resolution.source).toBe('native');
+    expect(resolution.installedFamily).toBeUndefined();
+  });
+
+  it('treats a family found by its presence probe as present in a bold-only document', () => {
+    // No styled tuple of BIZ UDMincho loaded (the bold cut is not installed and
+    // no regular text requested the regular route), but the family presence
+    // probe found the regular face: the bold run paints that installed family.
+    const empty = { default: null, first: null, even: null };
+    const layoutServices = createLayoutServices({
+      section: {
+        pageWidth: 612, pageHeight: 792, marginTop: 72, marginRight: 72,
+        marginBottom: 72, marginLeft: 72, headerDistance: 36, footerDistance: 36,
+        titlePage: false, evenAndOddHeaders: false,
+      },
+      body: [], headers: empty, footers: empty,
+    } as DocxDocumentModel, { measureContext: context, installedFamilies: ['biz udmincho'] });
+    const resolution = layoutServices.text.resolve({
+      fonts: { ascii: 'BIZ UDMincho' }, slot: 'ascii', weight: 700, style: 'normal',
+    });
+    expect(resolution.source).toBe('native');
+    expect(resolution.installedFamily).toBe(true);
+    const segment = buildSegments([{
+      type: 'text', text: '資料', fontFamily: 'BIZ UDMincho', fontFamilyEastAsia: 'BIZ UDMincho',
+      fontSize: 10.5, bold: true, italic: false, underline: false, strikethrough: false,
+    }] as DocRun[], { pageIndex: 0, totalPages: 1, layoutServices })[0] as LayoutTextSeg;
+    expect(segment.referenceFontVerticalMetric).toBe(true);
+    expect(segment.resolvedLineHeightRatio).toBeCloseTo(1.3, 8);
+  });
+
+  it('does not treat a family shadowed by an application @font-face as installed', () => {
+    // A declared application face owns the authored family name for every
+    // tuple, so the system installation cannot describe what paints.
+    const resolver = createFontResolver([{
+      requestedFamily: 'BIZ UDMincho', resolvedFamily: 'BIZ UDMincho', source: 'css', weight: 400, style: 'normal',
+    }], { installedFamilies: ['biz udmincho'] });
+    const resolution = resolver.resolve({ requestedFamily: 'BIZ UDMincho', weight: 700, style: 'normal' });
+    expect(resolution.source).toBe('native');
+    expect(resolution.installedFamily).toBeUndefined();
+  });
+
+  it.each([
+    ['400', 'oblique'], ['950', 'normal'],
+  ])('lets a loaded application face (%s %s) shadow an installed family', (weight, style) => {
+    // These descriptors have no exact WML tuple, but the face is still a CSS
+    // candidate for the family and paints instead of the system installation.
+    const empty = { default: null, first: null, even: null };
+    const declared = [{ family: 'Arial', status: 'loaded', weight, style }];
+    vi.stubGlobal('document', { fonts: { [Symbol.iterator]: () => declared[Symbol.iterator]() } });
+    const layoutServices = createLayoutServices({
+      section: {
+        pageWidth: 612, pageHeight: 792, marginTop: 72, marginRight: 72,
+        marginBottom: 72, marginLeft: 72, headerDistance: 36, footerDistance: 36,
+        titlePage: false, evenAndOddHeaders: false,
+      },
+      body: [{ type: 'paragraph', runs: [{ type: 'text', text: 'Ag', fontFamily: 'Arial', bold: true }] }],
+      headers: empty, footers: empty,
+    } as unknown as DocxDocumentModel, { measureContext: context, installedFamilies: ['arial'] });
+    vi.unstubAllGlobals();
+    const resolution = layoutServices.text.resolve({
+      fonts: { ascii: 'Arial' }, slot: 'ascii', weight: 700, style: 'normal',
+    });
+    expect(resolution.source).toBe('native');
+    expect(resolution.installedFamily).toBeUndefined();
+  });
+
+  it('keeps absent BIZ UD faces on their painting fallback, whatever the family spelling', () => {
+    // Name identity is shared font metadata (core catalogue aliases): the
+    // Japanese names reach the same pinned profile. No local resource is
+    // confirmed here, so the face is absent and its catalog line box is not
+    // admitted; the painting fallback's Canvas box and widths stay in force.
     const layoutServices = services();
     for (const family of ['BIZ UD明朝', 'BIZ UDゴシック']) {
+      expect(referenceFontLineMetrics(family, 400, 'normal')?.lineHeightRatio).toBeCloseTo(1.3, 8);
       for (const bold of [false, true]) {
         const segments = buildSegments([{
           type: 'text', text: '資料を確認します。',
@@ -419,15 +591,15 @@ describe('native reference font vertical layout', () => {
         }] as DocRun[], { pageIndex: 0, totalPages: 1, layoutServices });
         const segment = segments[0] as LayoutTextSeg;
         const line = layoutLines(context, segments, 200, 0, 1)[0]!;
-        expect(segment.referenceFontVerticalMetric).toBe(true);
-        expect(line.ascent + line.descent).toBeCloseTo(13.65, 8);
+        expect(segment.referenceFontVerticalMetric).toBeFalsy();
+        expect(line.ascent + line.descent).not.toBeCloseTo(13.65, 2);
         expect(line.segments[0]?.measuredWidth).toBe(45);
       }
       expect(referenceFontLineMetrics(family, 400, 'italic')).toBeUndefined();
     }
   });
 
-  it('allocates an auto table row from BIZ UDGothic normal spacing and cell margins', () => {
+  it('allocates an auto table row for an absent BIZ UDGothic from its painting fallback and cell margins', () => {
     const section = {
       pageWidth: 612, pageHeight: 792, marginTop: 72, marginRight: 72,
       marginBottom: 72, marginLeft: 72, headerDistance: 36,
@@ -463,7 +635,8 @@ describe('native reference font vertical layout', () => {
         cellMarginTop: 0, cellMarginBottom: 0, cellMarginLeft: 0, cellMarginRight: 0,
         jc: 'left',
       } as unknown as DocTable;
-      expect(layoutBodyTableRowAdvances(table, section, context)).toEqual([20.65]);
+      // Absent face: the fallback's Canvas box (8 + 2) plus the 3.5 pt margins.
+      expect(layoutBodyTableRowAdvances(table, section, context)).toEqual([3.5 + 10 + 3.5]);
     }
     expect(referenceFontLineMetrics('BIZ UDGothic', 400, 'italic')).toBeUndefined();
   });
@@ -509,7 +682,7 @@ describe('native reference font vertical layout', () => {
     const segment = segments[0] as LayoutTextSeg;
 
     // Meiryo advertises a Far-East code page, so Word allocates 1.3 times
-    // its hhea box rather than using the signed hhea line gap.
+    // its usWin box rather than using the signed hhea line gap.
     expect(segment.resolvedEaFloorLineHeightRatio).toBeCloseTo(1.3 * 3072 / 2048, 12);
     expect(segmentEastAsiaFloorSingleLinePx(segment, 10, true)).toBeCloseTo(10 * 1.3 * 3072 / 2048, 8);
   });
@@ -842,7 +1015,7 @@ describe('native reference font vertical layout', () => {
   });
 
   it('keeps the Word-observed Calibri normal line until an atLeast floor exceeds it', () => {
-    const metric = referenceFontLineMetrics('Calibri', 400, 'normal', 'other');
+    const metric = referenceFontLineMetrics('Calibri', 400, 'normal');
     expect(metric).toBeDefined();
     const natural = 11 * metric!.lineHeightRatio;
     const minimum = (twips: number) => lineBoxHeight(

@@ -15,7 +15,7 @@ import type {
   TableLayout,
   TextBoxLayout,
 } from './types.js';
-import { noteOwnedBlocks } from './native-note-separators.js';
+import { noteOwnedBlocks } from './reserved-note-separators.js';
 
 export const PAGE_LAYER_IDS = [
   'background',
@@ -352,6 +352,7 @@ function collectRetainedNodeResourceKeys(
   seen.add(node);
   if (node.kind === 'drawing') {
     for (const command of node.commands) {
+      if (command.kind === 'watermark-text' && command.imageResourceKey) keys.add(command.imageResourceKey);
       if (command.kind === 'resource' || command.kind === 'drawingml-image-fill') {
         keys.add(command.resourceKey);
       }

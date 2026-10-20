@@ -1,8 +1,12 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { SectionLayoutContext } from '../layout-context.js';
 import { deepFreezeDocumentLayout, layoutFingerprint } from './invariants.js';
 import type { DocumentLayout } from './types.js';
 import { buildPageLayers } from './page-graph.js';
+
+// Exercise the optional strict descriptor/cycle diagnostics as well as freezing.
+// The production policy stays independent of the test runner's environment.
+vi.mock('./validation-policy.js', () => ({ documentLayoutValidationEnabled: vi.fn(() => true) }));
 
 describe('DocumentLayout data boundary', () => {
   it('is deeply immutable and structured-clone safe without platform objects', () => {

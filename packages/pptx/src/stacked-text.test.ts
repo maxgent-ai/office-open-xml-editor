@@ -16,9 +16,11 @@ vi.mock('@silurus/ooxml-core', async (load) => ({
 // glyph class paints as the issue #1626 controls show.
 const SCALE = 1 / 12700; // 1 pt → 1 px
 
+interface Stroke { points: { x: number; y: number }[]; width: number; color: unknown }
+
 interface Call { text: string; x: number; y: number; rot: number; tx: number; ty: number; align: string }
 
-function mockCtx(): { ctx: CanvasRenderingContext2D; calls: Call[]; images: { x: number; y: number; w: number; h: number; rot: number }[] } {
+function mockCtx(): { ctx: CanvasRenderingContext2D; calls: Call[]; images: { x: number; y: number; w: number; h: number; rot: number }[]; strokes: Stroke[] } {
   let font = '24px serif';
   let textAlign: CanvasTextAlign = 'left';
   let textBaseline: CanvasTextBaseline = 'alphabetic';
@@ -29,6 +31,12 @@ function mockCtx(): { ctx: CanvasRenderingContext2D; calls: Call[]; images: { x:
   const px = () => parseFloat(/(\d+(?:\.\d+)?)px/.exec(font)?.[1] ?? '24');
   const calls: Call[] = [];
   const images: { x: number; y: number; w: number; h: number; rot: number }[] = [];
+  const strokes: Stroke[] = [];
+  let points: Stroke['points'] = [];
+  const point = (x: number, y: number) => points.push({
+    x: tx + x * Math.cos(rot) - y * Math.sin(rot),
+    y: ty + x * Math.sin(rot) + y * Math.cos(rot),
+  });
   const ctx = {
     canvas: { style: {} },
     get font() { return font; }, set font(v: string) { font = v; },
@@ -46,10 +54,11 @@ function mockCtx(): { ctx: CanvasRenderingContext2D; calls: Call[]; images: { x:
     restore: () => { const s = stack.pop(); if (s) [rot, tx, ty] = s; },
     translate: (x: number, y: number) => { tx += x; ty += y; },
     rotate: (a: number) => { rot += a; },
-    scale: () => {}, beginPath: () => {}, moveTo: () => {}, lineTo: () => {}, stroke: () => {},
+    scale: () => {}, beginPath: () => { points = []; }, moveTo: point, lineTo: point,
+    stroke: () => strokes.push({ points: [...points], width: ctx.lineWidth, color: ctx.strokeStyle }),
     fill: () => {}, clip: () => {}, rect: () => {}, fillRect: () => {}, setLineDash: () => {},
   };
-  return { ctx: ctx as unknown as CanvasRenderingContext2D, calls, images };
+  return { ctx: ctx as unknown as CanvasRenderingContext2D, calls, images, strokes };
 }
 
 function body(text: string, vert: string, fontFamilyEa?: string, hyperlink?: string): TextBody {
@@ -103,6 +112,19 @@ describe('pptx stacked vertical text (wordArtVert / wordArtVertRtl)', () => {
     expect(r.calls[0].x).toBeCloseTo(60 - 7.2 - CELL / 2, 6);
   });
 
+  it('uses the font-table cell for an exceptional drawing face and its Latin column face', () => {
+    const { ctx, calls } = mockCtx();
+    const b = body('日日', 'wordArtVert', 'Yu Gothic');
+    renderTextBody(ctx, b, 0, 0, 100, 470, SCALE);
+    const cell = (7 / 6) * (2636 / 2048) * 24; // OS/2 usWin box, not a fitted pitch.
+    expect(calls[1].y - calls[0].y).toBeCloseTo(cell, 6);
+    const latin = mockCtx();
+    const mixed = body('日日', 'wordArtVert', 'MS Mincho');
+    (mixed.paragraphs[0].runs[0] as TextRunData).fontFamily = 'Yu Gothic';
+    renderTextBody(latin.ctx, mixed, 0, 0, 100, 470, SCALE);
+    expect(latin.calls[0].x).toBeCloseTo(7.2 + cell / 2, 6);
+  });
+
   it('turns ASCII brackets 90° and draws CJK brackets with the face vertical glyph', () => {
     const { ctx, calls } = mockCtx();
     renderTextBody(ctx, body('(A「', 'wordArtVert', 'Yu Gothic'), 0, 0, 60, 470, SCALE);
@@ -112,6 +134,44 @@ describe('pptx stacked vertical text (wordArtVert / wordArtVertRtl)', () => {
     const bracket = calls.find((c) => c.text === '﹁');
     expect(bracket?.rot).toBe(0);
     expect(calls.some((c) => c.text === '「')).toBe(false);
+  });
+
+  // #1827 PowerPoint controls: vrt2-only ∥ (Yu Gothic) stands unturned in a
+  // 1 em cell, left-aligned with the （ form; MS Gothic's vert ∥ is turned.
+  it('draws a vrt2-only ∥ unturned in the vertical-form frame and a vert ∥ turned', () => {
+    const face = (text: string, family: string) => {
+      const b = body(text, 'wordArtVert', family);
+      (b.paragraphs[0].runs[0] as TextRunData).fontFamily = family;
+      return b;
+    };
+    const { ctx, calls } = mockCtx();
+    const runs: PptxTextRunInfo[] = [];
+    renderTextBody(ctx, face('∥（', 'Yu Gothic'), 0, 0, 60, 470, SCALE,
+      null, 0, false, false, '#000000', undefined, undefined, (run) => runs.push(run));
+    const bar = calls.find((c) => c.text === '∥')!;
+    const form = calls.find((c) => c.text === '︵')!;
+    expect(bar).toMatchObject({ rot: 0, align: 'left' });
+    expect(bar.x).toBeCloseTo(form.x, 6);
+    expect(form.y - bar.y).toBeCloseTo(24, 6);
+    expect(runs[0].h).toBeCloseTo(24, 6);
+    const ms = mockCtx();
+    renderTextBody(ms.ctx, face('∥', 'MS Gothic'), 0, 0, 60, 470, SCALE);
+    expect(ms.calls[0].rot).toBeCloseTo(Math.PI / 2, 6);
+  });
+
+  it.each([false, true])('uses bold-specific vert coverage for the drawing face (italic=%s)', (italic) => {
+    const advances = [false, true].map((bold) => {
+      const { ctx } = mockCtx();
+      const b = body('ーA', 'wordArtVert', 'Microsoft JhengHei');
+      (b.paragraphs[0].runs[0] as TextRunData).bold = bold;
+      (b.paragraphs[0].runs[0] as TextRunData).italic = italic;
+      const runs: PptxTextRunInfo[] = [];
+      renderTextBody(ctx, b, 0, 0, 100, 470, SCALE,
+        null, 0, false, false, '#000000', undefined, undefined, (run) => runs.push(run));
+      return runs[0].h;
+    });
+    // Regular has a vert glyph (one em); bold rotates the horizontal glyph.
+    expect(advances).toEqual([24, 24 * 0.6]);
   });
 
   it('stacks a grapheme cluster in one cell', () => {
@@ -275,7 +335,8 @@ it.each(['cached', 'no engine', 'conversion', 'rasterization'] as const)('%s pre
             expect(image.x + image.w / 2 - calls[0].x).toBeCloseTo(display ? sign * (CELL + image.w) / 2 : 0);
             expect(image.y).toBeCloseTo(3.6 + (display ? 0 : CELL));
           }
-        } else {
+        } else if (failure === 'no engine') {
+          // Explicit engine opt-out preserves the existing empty geometry.
           // Horizontal reserves a blank display line, but no inline advance.
           // Its stacked counterpart uses the mark cell for that blank column.
           const control = mockCtx();
@@ -296,9 +357,14 @@ it.each(['cached', 'no engine', 'conversion', 'rasterization'] as const)('%s pre
             expect(calls[1].y - calls[0].y).toBeCloseTo(display ? 2 * (24 * 1.1 - 1.2) : 0);
           }
         }
+        if (failure === 'conversion' || failure === 'rasterization') {
+          expect(images).toHaveLength(0);
+          expect(calls.map(c => c.text)).toEqual(['A', 'Equation unavailable', 'B']);
+          expect(calls[2].x !== calls[0].x || calls[2].y !== calls[0].y).toBe(true);
+        }
         const outcome = { text: calls.map((c) => c.text).join(''), images: images.length,
           warnings: [...warn.mock.calls], errors: [...error.mock.calls] };
-        expect(outcome).toEqual({ text: 'AB', images: failure === 'cached' ? 1 : 0, warnings: [], errors: [] });
+        expect(outcome).toEqual({ text: failure === 'conversion' || failure === 'rasterization' ? 'AEquation unavailableB' : 'AB', images: failure === 'cached' ? 1 : 0, warnings: [], errors: [] });
         outcomes.push(outcome);
       }
       expect(outcomes.slice(1)).toEqual([outcomes[0], outcomes[0]]);
@@ -306,4 +372,149 @@ it.each(['cached', 'no engine', 'conversion', 'rasterization'] as const)('%s pre
   } finally {
     vi.mocked(rasterizeMathSvg).mockResolvedValue({ source: {} as CanvasImageSource, widthPx: 3, heightPx: 2 });
   }
+});
+
+
+// Office-export controls: both column progressions keep underlines on the left;
+// strike strokes follow upright glyphs, and markers consume full stacked cells.
+it.each(['wordArtVert', 'wordArtVertRtl'])('paints glyph-sized horizontal strikes in %s', (vert) => {
+  const b = body('A', vert);
+  const r = b.paragraphs[0].runs[0] as TextRunData;
+  Object.assign(r, { strikethrough: true, strikeDouble: true });
+  b.paragraphs[0].runs.push({ ...r, text: 'B', fontSize: 32 });
+  const { ctx, calls, strokes } = mockCtx();
+  const measure = ctx.measureText.bind(ctx);
+  ctx.measureText = text => text === ' ' ? { ...measure(text), width: 8 } : measure(text);
+  renderTextBody(ctx, b, 0, 0, 200, 200, SCALE);
+  expect(strokes).toHaveLength(3); // two glyphs and the invisible paragraph mark
+  expect(strokes[2].points[1].x - strokes[2].points[0].x).toBeCloseTo(8);
+  expect(strokes[2].points[0].y - strokes[1].points[0].y).toBeCloseTo(CELL * 32 / 24, 0);
+  for (const [i, stroke] of strokes.slice(0, 2).entries()) {
+    expect(stroke.points).toHaveLength(4);
+    for (const pair of [stroke.points.slice(0, 2), stroke.points.slice(2)]) {
+      expect(pair[0].y).toBeCloseTo(pair[1].y);
+      expect(pair[1].x - pair[0].x).toBeCloseTo((i === 0 ? 24 : 32) * .6);
+      expect((pair[0].x + pair[1].x) / 2).toBeCloseTo(calls[i].x);
+      expect(pair[0].y).toBeLessThan(calls[i].y);
+      expect(pair[0].y).toBeGreaterThan(calls[i].y - (i === 0 ? 24 : 32) * .5);
+    }
+  }
+});
+
+it('keeps strikes in a rotated glyph frame and a vertical presentation glyph frame', () => {
+  const b = body('(A「', 'wordArtVert', 'Yu Gothic');
+  Object.assign(b.paragraphs[0].runs[0], { strikethrough: true });
+  const { ctx, strokes } = mockCtx();
+  renderTextBody(ctx, b, 0, 0, 200, 200, SCALE);
+  expect(strokes).toHaveLength(4);
+  expect(strokes[0].points[0].x).toBeCloseTo(strokes[0].points[1].x);
+  expect(strokes[0].points[1].y - strokes[0].points[0].y).toBeCloseTo(24 * .6);
+  for (const stroke of strokes.slice(1)) expect(stroke.points[0].y).toBeCloseTo(stroke.points[1].y);
+});
+
+it('honors an explicit unstruck paragraph insertion style', () => {
+  const b = body('A', 'wordArtVert');
+  const run = b.paragraphs[0].runs[0] as TextRunData;
+  b.paragraphs[0].endRunProperties = { ...run, text: '' };
+  run.strikethrough = true;
+  const { ctx, strokes } = mockCtx();
+  renderTextBody(ctx, b, 0, 0, 200, 200, SCALE);
+  expect(strokes).toHaveLength(1);
+});
+
+it.each(['wordArtVert', 'wordArtVertRtl'])('uses one underline frame per mixed-size wrapped %s column', (vert) => {
+  for (const underlineStyle of ['sng', 'dbl', 'wavy']) {
+    const b = body('A', vert);
+    const r = b.paragraphs[0].runs[0] as TextRunData;
+    Object.assign(r, { underline: true, underlineStyle, underlineColor: 'FF0000' });
+    b.paragraphs[0].runs.push({ ...r, text: 'B', fontSize: 32 }, { ...r, text: 'CD', fontSize: 18 });
+    const { ctx, calls, strokes } = mockCtx();
+    // First column A/B/C, second column D.
+    renderTextBody(ctx, b, 0, 0, 200, 110, SCALE);
+    expect(calls[0].x).toBe(calls[1].x);
+    expect(calls[1].x).toBe(calls[2].x);
+    expect(calls[3].x).not.toBe(calls[0].x);
+    expect(strokes).toHaveLength(2);
+    expect(strokes.map(s => s.width)).toEqual([32 * .05, 1]);
+    expect(strokes.every(s => s.color === 'rgba(255,0,0,1)')).toBe(true);
+    for (const [i, stroke] of strokes.entries()) {
+      const axis = calls[i === 0 ? 0 : 3].x;
+      expect(stroke.points.every(p => p.x < axis)).toBe(true);
+    }
+    // Include the stacked cell's extra leading in the rotated baseline.
+    // A raw (ascent-descent)/2 baseline is too far right by half that leading.
+    if (underlineStyle === 'sng') {
+      const columnLeft = calls[0].x - CELL * (32 / 24) / 2;
+      expect(strokes[0].points[0].x).toBeCloseTo(columnLeft + (434 / 2048) * 32 - 2);
+    }
+  }
+});
+
+it('places underline from the drawing face descent and full cell rather than a font-specific offset', () => {
+  const b = body('A', 'wordArtVert');
+  Object.assign(b.paragraphs[0].runs[0], { fontFamily: 'Yu Gothic', underline: true });
+  const { ctx, strokes } = mockCtx();
+  renderTextBody(ctx, b, 0, 0, 200, 200, SCALE);
+  // Yu Gothic's usWin descent is 619/2048 em. A 24px single underline
+  // uses the same 1.2px weight and 2.5px snapped offset as horizontal text.
+  expect(strokes).toHaveLength(1);
+  expect(strokes[0].points[0].x).toBeCloseTo(7.2 + (619 / 2048) * 24 - 2.5);
+});
+
+it.each(['wordArtVert', 'wordArtVertRtl'])('reserves stacked character and number prefixes only at paragraph start in %s', (vert) => {
+  for (const bullet of [
+    { type: 'char' as const, char: 'R', fontFamily: 'Arial', color: null, sizePct: null },
+    { type: 'autoNum' as const, numType: 'arabicPeriod', startAt: 12, color: null },
+  ]) {
+    const b = body('ABCDEFGHIJKLMNO', vert);
+    const para = b.paragraphs[0];
+    para.bullet = bullet;
+    b.paragraphs.push({ ...para, runs: [{ ...(para.runs[0] as TextRunData), text: 'X' }] });
+    const { ctx, calls } = mockCtx();
+    renderTextBody(ctx, b, 0, 0, 300, 250, SCALE);
+    const prefix = bullet.type === 'char' ? ['R'] : ['1', '2', '.'];
+    const firstColumn = calls.filter(c => c.x === calls.find(c => c.text === 'A')!.x);
+    expect(firstColumn.slice(0, prefix.length).map(c => c.text)).toEqual(prefix);
+    const a = calls.find(c => c.text === 'A')!;
+    expect(a.y - firstColumn[0].y).toBeCloseTo(CELL * prefix.length);
+    expect(firstColumn.every(c => c.rot === 0 && c.align === 'center')).toBe(true);
+    expect(calls.filter(c => c.text === prefix[0])).toHaveLength(2);
+    if (bullet.type === 'autoNum') expect(calls.map(c => c.text).join('')).toContain('13.X');
+    const continuation = calls.find(c => /^[B-O]$/.test(c.text) && c.x !== a.x)!;
+    expect(continuation.y).toBeCloseTo(firstColumn[0].y);
+    const indented = mockCtx();
+    Object.assign(para, { marL: 36 * 12700, indent: -24 * 12700 });
+    renderTextBody(indented.ctx, b, 0, 0, 300, 250, SCALE);
+    expect(indented.calls.find(c => c.text === prefix[0])!.y - firstColumn[0].y).toBeCloseTo(12);
+    expect(indented.calls.find(c => c.text === 'A')!.y - a.y).toBeCloseTo(12);
+  }
+});
+
+it('keeps picture markers per paragraph with authored size and source aspect', () => {
+  const b = body('A', 'wordArtVertRtl');
+  const para = b.paragraphs[0];
+  Object.assign(para, { bullet: { type: 'blip', imagePath: 'marker.png', mimeType: 'image/png', sizePct: 50 } });
+  const second = { ...para, runs: [{ ...(para.runs[0] as TextRunData), text: 'B' }] };
+  Object.assign(second, { bullet: { type: 'blip', imagePath: 'marker.png', mimeType: 'image/png', sizePct: 50, sizePts: 10 } });
+  b.paragraphs.push(second);
+  const { ctx, images } = mockCtx();
+  renderTextBody(ctx, b, 0, 0, 200, 200, SCALE, null, 0, false, false, '#000000', undefined, {
+    themeMajorFont: null, themeMinorFont: null, dpr: 1,
+    pictureBulletImages: new Map([['marker.png', { width: 36, height: 24 } as ImageBitmap]]),
+  });
+  expect(images.map(({ w, h, rot }) => ({ w, h, rot }))).toEqual([
+    { w: 18, h: 12, rot: 0 }, { w: 15, h: 10, rot: 0 },
+  ]);
+});
+
+it.each(['horz', 'wordArtVert', 'wordArtVertRtl'])('replaces a complete inline equation branch in %s', async (vert) => {
+  const b = body('', vert);
+  b.paragraphs[0].runs = ['x', 'y'].map(text => ({ type: 'math',
+    nodes: [{ kind: 'run', text, style: 'roman' }], display: false, fontSize: 18 }));
+  b.paragraphs[0].mathFallbacks = [{ start: 0, end: 2, text: 'authored preview' }];
+  await prepareSlideMath({ elements: [{ type: 'shape', textBody: b }] } as unknown as import('./types.js').Slide,
+    { loadMathJax: async () => {}, mathMLToSvg: async () => { throw new Error('conversion'); } });
+  const { ctx, calls } = mockCtx();
+  renderTextBody(ctx, b, 0, 0, 200, 200, SCALE);
+  expect(calls.map(c => c.text)).toEqual(['authored preview']);
 });

@@ -25,6 +25,8 @@
  * timers and listeners are torn down on settle so nothing leaks.
  */
 
+import { createAbortError } from '../internal/abort.js';
+
 /** The subset of the DOM `Worker` interface the bridge depends on. Keeping it
  *  structural lets tests substitute an in-memory fake. The real `Worker`
  *  satisfies this — it exposes the `error` / `messageerror` events too. */
@@ -115,9 +117,7 @@ interface PendingEntry<TRes> {
 /** Build an `AbortError`-flavoured Error without depending on the environment's
  *  `DOMException` constructor (absent in some worker/test runtimes). */
 function abortError(): Error {
-  const err = new Error('worker request aborted');
-  err.name = 'AbortError';
-  return err;
+  return createAbortError('worker request aborted');
 }
 
 export class WorkerBridge<TRes = unknown> {

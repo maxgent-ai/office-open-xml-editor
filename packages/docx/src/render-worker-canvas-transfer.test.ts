@@ -1,6 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { WorkerBridge, deserializeWorkerError, type WorkerLike } from '@silurus/ooxml-core/worker';
-import { ProgressiveLayoutLifecycle } from '@silurus/ooxml-core/internal/progressive-layout-lifecycle';
 import { acquireDocumentCanvasTargetContext } from './paint/canvas-document.js';
 import { DocxDocument } from './document.js';
 import { attachDocumentLayoutRuntime } from './layout/runtime-state.js';
@@ -17,6 +16,9 @@ import type { RenderWorkerResponse } from './worker-protocol.js';
 const mocks = vi.hoisted(() => ({
   render: vi.fn(async (..._args: unknown[]) => undefined),
   store: {},
+  paginationFailure: undefined as 'before-publication' | 'after-publication' | 'abort' | undefined,
+  registeredFonts: new Set<FontFace>(),
+  nativeSentinels: [] as FontFace[] | null,
 }));
 
 class FakeDocxArchive {
@@ -35,7 +37,15 @@ vi.mock('./wasm/docx_parser.js', () => ({
 }));
 vi.mock('@silurus/ooxml-core', async (load) => ({
   ...await load<typeof import('@silurus/ooxml-core')>(),
-  loadOfficeFontFallbacks: async () => ({ faces: [], routes: {} }),
+  loadOfficeFontFallbacks: async () => {
+    const face = {} as FontFace;
+    mocks.registeredFonts.add(face);
+    return { faces: [face], routes: {} };
+  },
+  unloadOfficeFontFallbacks: (faces: FontFace[]) => {
+    for (const face of faces) mocks.registeredFonts.delete(face);
+  },
+  loadNativeRouteSentinels: async () => mocks.nativeSentinels,
 }));
 vi.mock('./document-pull-worker.js', async (load) => ({
   ...await load<typeof import('./document-pull-worker.js')>(),
@@ -52,7 +62,7 @@ vi.mock('./vertical-render-capability.js', async (load) => ({
 }));
 vi.mock('./layout-source-model-adapter.js', () => ({
   layoutSourceModelAdapterFromOwnedModel: () => ({
-    document: {}, source: { fatalParse: null, mathOccurrences: [] },
+    document: {}, source: { fatalParse: null, mathOccurrences: [], blocks: { sources: [] } },
   }),
 }));
 vi.mock('./google-fonts.js', async (load) => ({
@@ -62,6 +72,7 @@ vi.mock('./google-fonts.js', async (load) => ({
 vi.mock('./layout-runtime.js', async (load) => ({
   ...await load<typeof import('./layout-runtime.js')>(),
   createLayoutServices: () => ({}),
+  nativeRouteLineRequests: () => [],
 }));
 vi.mock('./render-worker-layout.js', () => ({
   retainRenderWorkerDocumentLayout: () => ({
@@ -72,6 +83,20 @@ vi.mock('./render-worker-layout.js', () => ({
 vi.mock('./render-worker-metadata.js', () => ({
   projectRenderWorkerLayoutMeta: () => ({ pageCount: 1, pageSizes: [], bookmarkPages: [] }),
   renderWorkerLayoutMeta: () => ({ pageCount: 1, pageSizes: [], bookmarkPages: [] }),
+}));
+vi.mock('./render-worker-progressive.js', async () => ({
+  paginateRenderWorkerDocumentProgressively: async (
+    _doc: unknown, _source: unknown, sink: { publish(value: unknown): void },
+  ) => {
+    if (mocks.paginationFailure === 'abort') {
+      const { PaginationAbortError } = await import('./layout/pagination-scheduler.js');
+      throw new PaginationAbortError();
+    }
+    if (mocks.paginationFailure === 'before-publication') throw new Error('pagination failure');
+    sink.publish({ pageCount: 1, unchangedPages: 0 });
+    if (mocks.paginationFailure === 'after-publication') throw new Error('pagination failure');
+    return 1;
+  },
 }));
 vi.mock('./layout/runtime-state.js', async (load) => ({
   ...await load<typeof import('./layout/runtime-state.js')>(),
@@ -126,20 +151,21 @@ class LoopbackWorker implements WorkerLike {
   terminate(): void {}
 }
 
-async function loadWorker(entry: 'render-worker' | 'render-worker-source') {
+async function loadWorker(parse = true) {
   vi.resetModules();
   const scope = {
+    // A realm FontFaceSet; registrations themselves are mocked above.
+    fonts: {} as FontFaceSet,
     onmessage: null as ((event: MessageEvent) => Promise<void>) | null,
     postMessage: (message: unknown) => worker.receive(message),
   };
   const worker = new LoopbackWorker(scope);
   vi.stubGlobal('self', scope);
   vi.stubGlobal('OffscreenCanvas', FakeOffscreenCanvas);
-  if (entry === 'render-worker') await import('./render-worker.js');
-  else await import('./render-worker-source.js');
+  await import('./render-worker.js');
   const dispatch = (data: unknown) => scope.onmessage!({ data } as MessageEvent);
   await dispatch({ type: 'init', wasmUrl: 'x' });
-  await dispatch({
+  if (parse) await dispatch({
     type: 'parse', id: 100, data: new ArrayBuffer(1), defaultCurrentDateMs: 0,
     resourcePolicy: { maxArchiveEntryBytes: null, maxTotalInflatedBytes: null, maxArchiveEntries: null },
   });
@@ -156,12 +182,107 @@ async function loadWorker(entry: 'render-worker' | 'render-worker-source') {
 afterEach(() => {
   vi.unstubAllGlobals();
   mocks.render.mockReset();
+  mocks.paginationFailure = undefined;
+  mocks.registeredFonts.clear();
+  mocks.nativeSentinels = [];
   FakeOffscreenCanvas.created = [];
 });
 
-describe.each(['render-worker', 'render-worker-source'] as const)('DOCX %s bitmap surface', (entry) => {
+describe('DOCX render worker bitmap surface', () => {
+  it('retains ordinary progressive page reuse metadata after source dispatch is shared', async () => {
+    const { worker, dispatch } = await loadWorker();
+    await dispatch({
+      type: 'parse', id: 101, data: new ArrayBuffer(1), defaultCurrentDateMs: 0,
+      resourcePolicy: { maxArchiveEntryBytes: null, maxTotalInflatedBytes: null, maxArchiveEntries: null },
+      progressiveLayout: true,
+    });
+    expect(worker.received).toContainEqual(expect.objectContaining({
+      type: 'layoutPartial', forId: 101,
+      partial: expect.objectContaining({ pageCount: 1, unchangedPages: 0 }),
+    }));
+    expect(worker.received).toContainEqual(expect.objectContaining({
+      type: 'parsedMeta', id: 101, unchangedPages: 1,
+    }));
+  });
+
+  it('keeps published pages and their fonts usable after a late pagination failure until replacement', async () => {
+    const { document, worker, dispatch } = await loadWorker(false);
+    mocks.paginationFailure = 'after-publication';
+    await dispatch({
+      type: 'parse', id: 101, data: new ArrayBuffer(1), defaultCurrentDateMs: 0,
+      resourcePolicy: { maxArchiveEntryBytes: null, maxTotalInflatedBytes: null, maxArchiveEntries: null },
+      progressiveLayout: true,
+    });
+    expect(worker.received).toContainEqual(expect.objectContaining({ type: 'layoutPartial', forId: 101 }));
+    expect(worker.received).toContainEqual(expect.objectContaining({
+      type: 'error', id: 101, message: 'pagination failure',
+    }));
+    mocks.render.mockImplementation(async () => {
+      if (mocks.registeredFonts.size !== 1) throw new Error('Published fonts were released');
+    });
+    await expect(document.renderPageToBitmap(0, { dpr: 1 })).resolves.toBeDefined();
+
+    const publishedFonts = [...mocks.registeredFonts];
+    mocks.paginationFailure = undefined;
+    await dispatch({
+      type: 'parse', id: 102, data: new ArrayBuffer(1), defaultCurrentDateMs: 0,
+      resourcePolicy: { maxArchiveEntryBytes: null, maxTotalInflatedBytes: null, maxArchiveEntries: null },
+    });
+    expect(worker.received).toContainEqual(expect.objectContaining({ type: 'parsedMeta', id: 102 }));
+    expect(publishedFonts.every((face) => !mocks.registeredFonts.has(face))).toBe(true);
+    await expect(document.renderPageToBitmap(0, { dpr: 1 })).resolves.toBeDefined();
+  });
+
+  it('releases unpublished pages and fonts when pagination fails before publication', async () => {
+    const { document, worker, dispatch } = await loadWorker(false);
+    mocks.paginationFailure = 'before-publication';
+    await dispatch({
+      type: 'parse', id: 101, data: new ArrayBuffer(1), defaultCurrentDateMs: 0,
+      resourcePolicy: { maxArchiveEntryBytes: null, maxTotalInflatedBytes: null, maxArchiveEntries: null },
+      progressiveLayout: true,
+    });
+    expect(worker.received).toContainEqual(expect.objectContaining({ type: 'error', id: 101 }));
+    expect(worker.received).not.toContainEqual(expect.objectContaining({ type: 'layoutPartial', forId: 101 }));
+    expect(mocks.registeredFonts.size).toBe(0);
+    await expect(document.renderPageToBitmap(0, { dpr: 1 })).rejects.toThrow('Document not loaded');
+  });
+
+  it('continues on the main thread when this realm cannot register the route sentinels', async () => {
+    // Main mode admits measured native-route lines with its own sentinels; a
+    // worker that cannot register them must not lay the document out without
+    // them, or the two modes would paginate differently.
+    const { worker, dispatch } = await loadWorker(false);
+    mocks.nativeSentinels = null;
+    await dispatch({
+      type: 'parse', id: 101, data: new ArrayBuffer(1), defaultCurrentDateMs: 0,
+      resourcePolicy: { maxArchiveEntryBytes: null, maxTotalInflatedBytes: null, maxArchiveEntries: null },
+    });
+    expect(worker.received).toContainEqual(expect.objectContaining({ type: 'mainThreadVerticalFallback', id: 101 }));
+    expect(worker.received).not.toContainEqual(expect.objectContaining({ type: 'parsedMeta', id: 101 }));
+  });
+
+  it('suppresses ordinary progressive cancellation responses', async () => {
+    const { worker, dispatch } = await loadWorker(false);
+    mocks.paginationFailure = 'abort';
+    await dispatch({
+      type: 'parse', id: 101, data: new ArrayBuffer(1), defaultCurrentDateMs: 0,
+      resourcePolicy: { maxArchiveEntryBytes: null, maxTotalInflatedBytes: null, maxArchiveEntries: null },
+      progressiveLayout: true,
+    });
+    expect(worker.received).not.toContainEqual(expect.objectContaining({ type: 'error', id: 101 }));
+    expect(worker.received).not.toContainEqual(expect.objectContaining({ type: 'parsedMeta', id: 101 }));
+  });
+
+  it('rejects resource usage before an ordinary document is loaded', async () => {
+    const { worker, dispatch } = await loadWorker(false);
+    await dispatch({ type: 'resourceUsage', id: 101 });
+    expect(worker.received).toContainEqual(expect.objectContaining({
+      type: 'error', id: 101, message: 'No docx loaded',
+    }));
+  });
+
   it('paints renderPageToBitmap into the contextless 1x1 canvas transferred from the caller', async () => {
-    const { document, worker } = await loadWorker(entry);
+    const { document, worker } = await loadWorker();
 
     const bitmap = await document.renderPageToBitmap(0, { dpr: 1 });
 
@@ -176,21 +297,8 @@ describe.each(['render-worker', 'render-worker-source'] as const)('DOCX %s bitma
     expect(bitmap).toBe(canvas!.bitmap);
   });
 
-  it('revokes reading publication when its transferred bitmap target cannot acquire a context', async () => {
-    const { document } = await loadWorker(entry);
-    Object.assign(document, { _layoutLifecycle: new ProgressiveLayoutLifecycle(), _layoutViewGeneration: 0,
-      _meta: { pageCount: 1, pageSizes: [], bookmarkPages: [], nativeReadingRequested: true, readingNotices: [] } });
-    mocks.render.mockImplementation(async (_source, canvas, _page, options) => {
-      acquireDocumentCanvasTargetContext(canvas as OffscreenCanvas,
-        (options as { callerOwnedCanvasTarget?: boolean }).callerOwnedCanvasTarget !== false);
-    });
-    await expect(document.renderPageToBitmap(0)).rejects.toThrow('internally acquired');
-    expect(document.pageCount).toBe(0); expect(document.readingNotices).toEqual([]);
-    expect(FakeOffscreenCanvas.created[0]!.width).toBe(1);
-    expect(FakeOffscreenCanvas.created[0]!.height).toBe(1);
-  });
   it('keeps a worker-created context failure terminal on the ordinary worker error wire', async () => {
-    const { worker, dispatch } = await loadWorker(entry);
+    const { worker, dispatch } = await loadWorker();
     mocks.render.mockImplementation(async (_source, canvas, _page, options) => {
       acquireDocumentCanvasTargetContext(canvas as OffscreenCanvas,
         (options as { callerOwnedCanvasTarget?: boolean }).callerOwnedCanvasTarget !== false);
@@ -206,7 +314,7 @@ describe.each(['render-worker', 'render-worker-source'] as const)('DOCX %s bitma
     expect(FakeOffscreenCanvas.created[0]!.height).toBe(1);
   });
   it('keeps a worker-local surface for a request that carries no canvas', async () => {
-    const { worker, dispatch } = await loadWorker(entry);
+    const { worker, dispatch } = await loadWorker();
 
     await dispatch({ type: 'renderPage', id: 7, pageIndex: 0, opts: { dpr: 1 } });
 

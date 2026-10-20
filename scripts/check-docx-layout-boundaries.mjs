@@ -99,6 +99,8 @@ const SHARED_PAINT_IMPORTS = new Map([
   ['@silurus/ooxml-core', new Map([
     ['acquireBitmapCacheLease', 'value'],
     ['applyDuotone', 'value'],
+    // Pixel corrections, effect budgets and cache keys consume decoded resources without acquiring layout.
+    ['blipPixelEffectsKey', 'value'],
     ['autoContrastColor', 'value'],
     // A retained run-shading preset is rasterized as an 8x8 paint tile;
     // this helper cannot measure text or change the layout result.
@@ -109,6 +111,14 @@ const SHARED_PAINT_IMPORTS = new Map([
     // Chart picture-marker discovery and lookup warm the document-owned image
     // cache before measurement-free chart paint. They expose no layout API.
     ['chartImageFillKey', 'value'],
+    ['chartImageFillPixelTransform', 'value'],
+    // Per-rendered-size chart picture preparation: a scratch-surface chart
+    // paint records the sizes; keys/lookups address the decoded sources.
+    ['chartImageFillNeedsRenderedSize', 'value'],
+    ['chartFillRenderedSizeKey', 'value'],
+    ['chartImageFillStoreLookup', 'value'],
+    ['collectChartFillRenderedSizes', 'value'],
+    ['assertChartFillRenderedSizeCount', 'value'],
     ['chartImageFillUsageSize', 'value'],
     ['collectChartImageFillUsages', 'value'],
     ['collectChartImageFillUsagesForCharts', 'value'],
@@ -122,6 +132,9 @@ const SHARED_PAINT_IMPORTS = new Map([
     ['deferBitmapCloseWhileLeased', 'value'],
     ['docxBorderDashArray', 'value'],
     ['drawImageCropped', 'value'],
+    // Pure geometry: the full source frame a stretched/cropped CT_Blip chain
+    // is evaluated on. It reads authored fractions only, never layout.
+    ['stretchedSourceFrame', 'value'],
     ['doubleRailGeometry', 'value'],
     ['fillDoubleBorder', 'value'],
     // Shared decoded-surface ownership is a paint resource concern. DOCX may
@@ -129,7 +142,13 @@ const SHARED_PAINT_IMPORTS = new Map([
     ['dropCachedDerivedBitmapNamespace', 'value'],
     ['decodedBitmapTargetResizeOptions', 'value'],
     ['duotoneImageData', 'value'],
+    ['applyImageDataTransform', 'value'],
+    ['decodeSvgBlobOnMainThread', 'value'],
+    ['OoxmlDecodedImageLimitError', 'value'],
     ['getCachedBitmapByPath', 'value'],
+    // Shared CT_Blip decoding/effects own bounded image resources only; the
+    // interpreter never acquires text, layout, or parser-model geometry.
+    ['getCachedDuotoneBitmapByPath', 'value'],
     ['getCachedDerivedBitmap', 'value'],
     ['getCachedSvgImageByPath', 'value'],
     // Header inspection reuses the document-owned byte profile to decide
@@ -139,6 +158,10 @@ const SHARED_PAINT_IMPORTS = new Map([
     ['isBrowserResizableRasterMimeType', 'value'],
     ['isDecodeTargetResizableRasterFormat', 'value'],
     ['isOoxmlDecodedImageLimitError', 'value'],
+    // Lazy archive admission errors remain terminal at paint-resource catches.
+    ['OoxmlResourceLimitError', 'value'],
+    // An invalid authored CT_Blip chain cannot be replaced by a raw fallback.
+    ['OoxmlError', 'value'],
     ['isTiffDecodeError', 'value'],
     // Missing optional image codecs are contained at paint-resource acquisition;
     // the placeholder consumes only the already-retained authored bounds.
@@ -163,6 +186,8 @@ const SHARED_PAINT_IMPORTS = new Map([
     ['normalizeImageResourceOptions', 'value'],
     ['planDecodedImageTargets', 'value'],
     ['paintDrawingMLShape', 'value'],
+    // Bounded VML mask/concentric compositing allocates temporary paint-only surfaces.
+    ['createAuxCanvas', 'value'],
     ['withVertFeature', 'value'],
     ['preferVectorBlip', 'value'],
     ['releaseOwnedBitmap', 'value'],
@@ -189,9 +214,12 @@ const SHARED_PAINT_IMPORTS = new Map([
     ['ChartExRenderer', 'type'],
     ['ChartImageLookup', 'type'],
     ['Duotone', 'type'],
+    ['BlipEffect', 'type'],
     ['ImageResourceOptions', 'type'],
     ['MathRenderer', 'type'],
     ['TiffRenderer', 'type'],
+    // Erased SVG decoder capability; paint forwards it to the shared image owner.
+    ['SvgBlobDecoder', 'type'],
   ])],
 ]);
 
@@ -644,8 +672,13 @@ function assertProductionBodyAcquisitionAuthority(root) {
 
   const table = uniqueFunction('computeTablePtLayout');
   const tableSourceIndex = table?.parameters[3];
+  // Adjacent members pass their preparation lazily, so a cross-pass memo hit
+  // (retained-table-pass-cache.ts) skips the logical-table column solve.
   const prepared = table?.parameters[4];
-  const preparedType = prepared?.type;
+  const preparedPassKey = table?.parameters[5];
+  const preparedGetter = prepared?.type;
+  const preparedType = preparedGetter && ts.isFunctionTypeNode(preparedGetter)
+    && preparedGetter.parameters.length === 0 ? preparedGetter.type : undefined;
   const preparationFields = preparedType && ts.isTypeReferenceNode(preparedType)
     && ts.isIdentifier(preparedType.typeName) && preparedType.typeName.text === 'Readonly'
     && preparedType.typeArguments?.length === 1
@@ -656,8 +689,11 @@ function assertProductionBodyAcquisitionAuthority(root) {
   const preparedMember = preparationFields.find((field) => field.name?.getText(source) === 'member')?.type;
   // Permit only immutable solved columns and the acquired logical/member decision;
   // sourceIndex remains a required number at every call, including group rows.
-  const allowsPreparation = prepared && ts.isIdentifier(prepared.name) && prepared.name.text === 'prepared'
+  const allowsPreparation = prepared && ts.isIdentifier(prepared.name) && prepared.name.text === 'preparedColumns'
     && prepared.questionToken && preparationFields.length === 3
+    && preparedPassKey && ts.isIdentifier(preparedPassKey.name)
+    && preparedPassKey.name.text === 'preparedPassKey' && preparedPassKey.questionToken
+    && preparedPassKey.type?.kind === ts.SyntaxKind.StringKeyword
     && preparedColumns && ts.isTypeOperatorNode(preparedColumns)
     && preparedColumns.operator === ts.SyntaxKind.ReadonlyKeyword
     && ts.isArrayTypeNode(preparedColumns.type)
@@ -674,14 +710,14 @@ function assertProductionBodyAcquisitionAuthority(root) {
     'measureRetainedCellContentHeightPt',
   ].flatMap((name) => table?.body ? callsNamed(table.body, name) : []);
   if (!table?.body
-    || (table.parameters.length !== 4 && !(table.parameters.length === 5 && allowsPreparation))
+    || (table.parameters.length !== 4 && !(table.parameters.length === 6 && allowsPreparation))
     || !tableSourceIndex
     || tableSourceIndex.questionToken
     || tableSourceIndex.type?.kind !== ts.SyntaxKind.NumberKeyword
     || tableBodyCalls.length !== 1
     || tableCalls.length === 0
     || tableCalls.some((call) => call.arguments.length !== 4
-      && !(allowsPreparation && call.arguments.length === 5))
+      && !(allowsPreparation && call.arguments.length === 6))
     || forbiddenTableCalls.length !== 0) {
     fail('PRODUCTION_ACQUISITION_AUTHORITY', `${PRODUCTION_BODY_LAYOUT}#computeTablePtLayout`);
   }
@@ -2138,6 +2174,10 @@ function assertBodyKernelServiceOwner(root) {
   }
 }
 
+// `legacyDoc` is the public opt-in key for the optional binary DOC reader
+// (an input format, like `math` or `chartEx`), not a layout migration switch.
+const INPUT_FORMAT_OPTION_IDENTIFIERS = new Set(['legacyDoc']);
+
 const MIGRATION_IDENTIFIER = /(?:legacy|(?:use|enable|prefer|require)[a-z0-9]*(?:old|previous|alternate)[a-z0-9]*(?:engine|layout|path|algorithm)|(?:reuse|paint)enabled|requireslegacy|dryrun)/i;
 
 function matchingIdentifierCounts(root, predicate) {
@@ -2766,7 +2806,10 @@ function currentLegacyInventory(root) {
   return {
     version: 3,
     legacySymbolCounts: identifierCounts(root),
-    migrationIdentifierCounts: matchingIdentifierCounts(root, (name) => MIGRATION_IDENTIFIER.test(name)),
+    migrationIdentifierCounts: matchingIdentifierCounts(
+      root,
+      (name) => MIGRATION_IDENTIFIER.test(name) && !INPUT_FORMAT_OPTION_IDENTIFIERS.has(name),
+    ),
     rendererImportEdges: rendererImportEdges(root),
   };
 }

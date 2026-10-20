@@ -1,6 +1,7 @@
 import type { Slide, SlideElement, SlideElementOrigin, TextBody } from './types.js';
 import type { TextSelectionContextOptions } from '@silurus/ooxml-core';
 import { boundedChartContextText } from '@silurus/ooxml-core/internal/chart-context';
+import { safeUtf16Prefix } from '@silurus/ooxml-core/internal/utf16-prefix';
 
 /** Bounds for a PPTX text-or-element selection-context snapshot. */
 export type PptxSelectionContextOptions = TextSelectionContextOptions;
@@ -152,16 +153,6 @@ function* elementTextParts(element: SlideElement): Iterable<ElementTextPiece> {
     }
     return;
   }
-}
-
-function safeUtf16Prefix(value: string, maxCodeUnits: number): string {
-  let end = Math.min(value.length, maxCodeUnits);
-  if (end > 0 && end < value.length) {
-    const previous = value.charCodeAt(end - 1);
-    const next = value.charCodeAt(end);
-    if (previous >= 0xD800 && previous <= 0xDBFF && next >= 0xDC00 && next <= 0xDFFF) end--;
-  }
-  return value.slice(0, end);
 }
 
 export function limitPptxElementContext(

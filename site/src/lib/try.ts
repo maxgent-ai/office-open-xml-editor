@@ -101,10 +101,13 @@ export async function renderFile(
     ext !== 'docx'
     && ext !== 'xlsx'
     && ext !== 'pptx'
+    && ext !== 'doc'
+    && ext !== 'xls'
+    && ext !== 'ppt'
     && ext !== 'csv'
     && ext !== 'tsv'
   ) {
-    throw new Error('Unsupported file — choose a .docx, .xlsx or .pptx file.');
+    throw new Error('Unsupported file — choose .docx, .xlsx or .pptx, or experimental .doc, .xls or .ppt.');
   }
 
   if ((ext === 'csv' || ext === 'tsv') && file.size > MAX_DELIMITED_TEXT_FILE_BYTES) {
@@ -115,7 +118,20 @@ export async function renderFile(
   assertCurrentRender(generation);
   stage.innerHTML = '';
 
-  if (ext === 'xlsx') {
+  // Only Try Yours opts in, and only the selected binary family is imported.
+  // Source modules and reader WASM remain URL assets loaded on a structural claim.
+  const legacyDoc = ext === 'doc'
+    ? (await import('@silurus/ooxml-legacy-office/doc')).legacyDoc
+    : undefined;
+  const legacyXls = ext === 'xls'
+    ? (await import('@silurus/ooxml-legacy-office/xls')).legacyXls
+    : undefined;
+  const legacyPpt = ext === 'ppt'
+    ? (await import('@silurus/ooxml-legacy-office/ppt')).legacyPpt
+    : undefined;
+  assertCurrentRender(generation);
+
+  if (ext === 'xlsx' || ext === 'xls') {
     const host = document.createElement('div');
     host.className = 'lv-xlsx';
     stage.appendChild(host);
@@ -124,6 +140,7 @@ export async function renderFile(
       useGoogleFonts: true,
       showZoomSlider: true,
       comments: false,
+      ...(legacyXls === undefined ? {} : { legacyXls }),
       math,
       ...fullRenderers,
     });
@@ -170,7 +187,7 @@ export async function renderFile(
     return { format: 'xlsx', units: 0, unitLabel: 'sheet' };
   }
 
-  if (ext === 'pptx') {
+  if (ext === 'pptx' || ext === 'ppt') {
     const host = scrollViewerHost(stage);
     let viewer!: PptxScrollViewer;
     const viewerOptions: PptxScrollViewerOptions = {
@@ -184,6 +201,7 @@ export async function renderFile(
       pageShadow: false,
       useGoogleFonts: true,
       comments: false,
+      ...(legacyPpt === undefined ? {} : { legacyPpt }),
       math,
       // Keep progressive preflight and paint off the UI thread while the user
       // scrolls through slides that are still becoming available.
@@ -249,6 +267,7 @@ export async function renderFile(
     pageShadow: false,
     useGoogleFonts: true,
     comments: false,
+    ...(legacyDoc === undefined ? {} : { legacyDoc }),
     math,
     // Keep progressive pagination and painting off the UI thread so scrolling
     // remains responsive while later pages are still being prepared.

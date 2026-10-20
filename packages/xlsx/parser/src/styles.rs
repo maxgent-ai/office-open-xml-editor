@@ -97,7 +97,10 @@ pub(crate) fn parse_styles(
 
     let normal_font_size = parse_normal_font_size(&doc);
     let default_font = parse_default_font(&doc);
-    let chart_number_formats = crate::chart::ChartNumberFormatCache::from_document(&doc);
+    let chart_number_formats = crate::chart::ChartNumberFormatCache::from_document(
+        &doc,
+        &archive.operation()?.limit_reporter()?,
+    )?;
     let num_fmts = parse_num_fmts(&doc);
     let fonts = parse_fonts(&doc, theme_colors);
     let fills = parse_fills(&doc, theme_colors);
@@ -136,7 +139,10 @@ pub(crate) fn parse_style_projection(
         default_font: parse_default_font(&doc),
         normal_font_size: parse_normal_font_size(&doc),
         normal_font_color: normal_font_color_key(&doc),
-        chart_number_formats: crate::chart::ChartNumberFormatCache::from_document(&doc),
+        chart_number_formats: crate::chart::ChartNumberFormatCache::from_document(
+            &doc,
+            &archive.operation()?.limit_reporter()?,
+        )?,
     })
 }
 
@@ -217,6 +223,9 @@ pub(crate) fn parse_dxf(dxf_node: roxmltree::Node, theme_colors: &[String]) -> D
                         }
                         "color" => {
                             f.color = parse_color(&fc, theme_colors);
+                            if matches!(fc.attribute("auto"), Some("1" | "true")) {
+                                toggles.automatic_color = Some(true);
+                            }
                         }
                         _ => {}
                     }

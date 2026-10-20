@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { TextRunData } from '@silurus/ooxml-core';
-import { renderTextBody } from './renderer.js';
+import { renderTextBodyWithPresentFaces as renderTextBody } from './test-support/present-faces.js';
 import type { Paragraph, TextBody } from './types.js';
 
 const SCALE = 1 / 12700; // 1 point => 1 canvas unit

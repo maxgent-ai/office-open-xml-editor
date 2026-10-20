@@ -6,10 +6,9 @@
 
 use crate::chart::{parse_chartex_with_images, parse_legacy_chart_with_style_parts_and_images};
 use crate::fill::{
-    line_properties_to_stroke, parse_blip_alpha, parse_color_node, parse_cust_geom,
-    parse_effect_lst, parse_fill, parse_scene3d, parse_sp3d, parse_stroke,
-    parse_style_matrix_effects, parse_style_matrix_fill_from_source, parse_table_style_fill,
-    parse_xfrm, EffectLst,
+    line_properties_to_stroke, parse_color_node, parse_cust_geom, parse_effect_lst, parse_fill,
+    parse_scene3d, parse_sp3d, parse_stroke, parse_style_matrix_effects,
+    parse_style_matrix_fill_from_source, parse_table_style_fill, parse_xfrm, EffectLst,
 };
 use crate::master::{
     DefaultTextLevels, InheritedShapeGeometry, LayoutPlaceholders, TableTextLevels,
@@ -26,15 +25,12 @@ use crate::{
     table_style_presets, PptxZip, ResolvedTableCellStyle, TableCellBorderStyle, TableLineStyle,
     TablePartStyle, TableStyleDef, TableStyleFlags, TableStyleFont, TableTextStyle,
 };
-use ooxml_common::blip::{
-    mime_from_ext, parse_blip_duotone, parse_blip_effects, parse_src_rect, svg_blip_rid,
-};
+use ooxml_common::blip::{mime_from_ext, parse_blip_duotone, parse_src_rect, svg_blip_rid};
 use ooxml_common::depth::DepthGuard;
 use ooxml_common::line::{
     parse_line_properties, LineDash, LineEnd, LineJoin, LinePaint, LineProperties,
 };
 use ooxml_common::ns::{is_diagram_uri, is_pml_ole_uri};
-use ooxml_common::rels::relationship_part_path;
 use ooxml_common::units::EMU_PER_PX_96DPI;
 use std::collections::HashMap;
 
@@ -47,77 +43,6 @@ use std::collections::HashMap;
 /// render, so a Choice requiring them yields the Fallback preview.
 pub(crate) fn pptx_understands_ns(ns: &str) -> bool {
     ns.contains("chartex") || ns == "http://schemas.microsoft.com/office/drawing/2010/main"
-}
-
-/// Read the chartStyle part (`styleN.xml`) associated with a chart part at
-/// `chart_path` (e.g. `ppt/charts/chart1.xml`), following that part's own
-/// relationships (`ppt/charts/_rels/chart1.xml.rels`) to the
-/// Office 2011 or MS-ODRAWXML 2012 `chartStyle` target. Returns `None` when the chart
-/// has no chartStyle relationship or the part cannot be read (the chartEx
-/// title then falls back to its inline size, or the renderer's default).
-struct ChartRelatedParts {
-    style_xml: Option<String>,
-    color_style_xml: Option<String>,
-    image_relationships: ooxml_common::chart::ChartImageRelationships,
-}
-
-fn load_chart_related_parts(zip: &mut PptxZip, chart_path: &str) -> ChartRelatedParts {
-    let mut result = ChartRelatedParts {
-        style_xml: None,
-        color_style_xml: None,
-        image_relationships: Default::default(),
-    };
-    let rels_path = relationship_part_path(chart_path);
-    let Ok(rels_xml) = read_zip_str(zip, &rels_path) else {
-        return result;
-    };
-    let relationships = ooxml_common::rels::parse_rels(&rels_xml);
-    result.image_relationships.insert_parsed_relationships(
-        ooxml_common::chart::ChartImageSource::Chart,
-        chart_path,
-        &relationships,
-    );
-    let internal_target = |suffix: &str| {
-        relationships.values().find(|relationship| {
-            relationship.mode == ooxml_common::rels::TargetMode::Internal
-                && relationship
-                    .relationship_type
-                    .as_deref()
-                    .is_some_and(|kind| kind.ends_with(suffix))
-        })
-    };
-    let style_relationship = relationships.values().find(|relationship| {
-        relationship.mode == ooxml_common::rels::TargetMode::Internal
-            && relationship
-                .relationship_type
-                .as_deref()
-                .is_some_and(ooxml_common::chart::is_chart_style_relationship_type)
-    });
-    if let Some(style_relationship) = style_relationship {
-        let style_path = style_relationship
-            .resolve_part(chart_path)
-            .unwrap_or_default();
-        result.style_xml = Some(read_zip_str(zip, &style_path).unwrap_or_else(|_| "\0".to_owned()));
-        let style_rels_path = relationship_part_path(&style_path);
-        if let Ok(style_rels_xml) = read_zip_str(zip, &style_rels_path) {
-            let style_relationships = ooxml_common::rels::parse_rels(&style_rels_xml);
-            result.image_relationships.insert_parsed_relationships(
-                ooxml_common::chart::ChartImageSource::Style,
-                &style_path,
-                &style_relationships,
-            );
-        }
-    }
-    if let Some(color_relationship) =
-        internal_target(ooxml_common::chart::CHART_COLOR_STYLE_REL_TYPE_SUFFIX)
-    {
-        let color_path = color_relationship
-            .resolve_part(chart_path)
-            .unwrap_or_default();
-        result.color_style_xml =
-            Some(read_zip_str(zip, &color_path).unwrap_or_else(|_| "\0".to_owned()));
-    }
-    result
 }
 
 #[cfg(test)]
@@ -133,9 +58,9 @@ mod chartex_sidecar_package_tests {
         let slide_xml = r#"<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:cx="http://schemas.microsoft.com/office/drawing/2014/chartex"><p:cSld><p:spTree><p:graphicFrame><p:nvGraphicFramePr><p:cNvPr id="2" name="Chart 1"/><p:cNvGraphicFramePr/><p:nvPr/></p:nvGraphicFramePr><p:xfrm><a:off x="0" y="0"/><a:ext cx="4000000" cy="3000000"/></p:xfrm><a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/drawing/2014/chartex"><cx:chart r:id="rIdChart"/></a:graphicData></a:graphic></p:graphicFrame></p:spTree></p:cSld></p:sld>"#;
         let slide_rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdChart" Type="http://schemas.microsoft.com/office/2014/relationships/chartEx" Target="../charts/chartEx1.xml"/></Relationships>"#;
         let chart_xml = r#"<cx:chartSpace xmlns:cx="http://schemas.microsoft.com/office/drawing/2014/chartex"><cx:chartData><cx:data id="0"><cx:numDim type="val"><cx:lvl ptCount="1"><cx:pt idx="0">1</cx:pt></cx:lvl></cx:numDim></cx:data></cx:chartData><cx:chart><cx:plotArea><cx:plotAreaRegion><cx:series layoutId="boxWhisker"/></cx:plotAreaRegion></cx:plotArea></cx:chart></cx:chartSpace>"#;
-        let rels_xml = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdExternalStyle" Type="http://schemas.microsoft.com/office/2011/relationships/chartStyle" Target="https://example.invalid/style.xml" TargetMode="External"/><Relationship Id="rIdStyle" Type="http://schemas.microsoft.com/office/2011/relationships/chartStyle" Target="style1.xml"/><Relationship Id="rIdColors" Type="http://schemas.microsoft.com/office/2011/relationships/chartColorStyle" Target="colors1.xml"/></Relationships>"#;
+        let rels_xml = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdExternalStyle" Type="http://schemas.microsoft.com/office/2011/relationships/chartStyle" Target="https://example.invalid/style.xml" TargetMode="External"/><Relationship Id="rIdStyle" Type="http://schemas.microsoft.com/office/2011/relationships/chartStyle" Target="style1.xml"/><Relationship Id="rIdColors" Type="http://schemas.microsoft.com/office/2011/relationships/chartColorStyle" Target="colors1.xml"/><Relationship Id="override" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/themeOverride" Target="../theme/chartOverride.xml"/></Relationships>"#;
         let style_xml = r#"<cs:chartStyle xmlns:cs="http://schemas.microsoft.com/office/drawing/2012/chartStyle" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><cs:dataPoint><cs:fillRef idx="1"><cs:styleClr val="auto"/></cs:fillRef><cs:spPr><a:pattFill prst="diagCross"><a:fgClr><a:schemeClr val="phClr"/></a:fgClr><a:bgClr><a:srgbClr val="FFFFFF"/></a:bgClr></a:pattFill></cs:spPr></cs:dataPoint><cs:dataPointMarker><cs:fillRef idx="1"><cs:styleClr val="auto"/></cs:fillRef></cs:dataPointMarker><cs:dataLabelCallout><cs:defRPr><a:noFill/></cs:defRPr><cs:bodyPr/></cs:dataLabelCallout><cs:trendlineLabel><cs:defRPr><a:solidFill><a:srgbClr val="112233"/></a:solidFill></cs:defRPr></cs:trendlineLabel></cs:chartStyle>"#;
-        let colors_xml = r#"<cs:colorStyle xmlns:cs="http://schemas.microsoft.com/office/drawing/2012/chartStyle" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" meth="cycle"><a:srgbClr val="336699"/></cs:colorStyle>"#;
+        let colors_xml = r#"<cs:colorStyle xmlns:cs="http://schemas.microsoft.com/office/drawing/2012/chartStyle" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" meth="cycle"><a:schemeClr val="accent1"/></cs:colorStyle>"#;
         let theme_xml = r#"<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" name="Theme"><a:themeElements><a:fmtScheme name="Theme"><a:fillStyleLst><a:blipFill><a:blip r:embed="rIdThemeMarker"/><a:stretch/></a:blipFill></a:fillStyleLst><a:lnStyleLst/><a:effectStyleLst/><a:bgFillStyleLst/></a:fmtScheme></a:themeElements></a:theme>"#;
 
         let mut bytes = Vec::new();
@@ -158,6 +83,10 @@ mod chartex_sidecar_package_tests {
                 ),
                 ("ppt/charts/colors1.xml", colors_xml),
                 ("ppt/theme/theme1.xml", theme_xml),
+                (
+                    "ppt/theme/chartOverride.xml",
+                    r#"<a:themeOverride xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:clrScheme name="Chart"><a:accent1><a:srgbClr val="336699"/></a:accent1></a:clrScheme></a:themeOverride>"#,
+                ),
                 (
                     "ppt/theme/_rels/theme1.xml.rels",
                     r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdThemeMarker" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/theme-marker.png"/></Relationships>"#,
@@ -211,26 +140,6 @@ mod chartex_sidecar_package_tests {
                 "stretch": true,
             }),
         );
-    }
-
-    #[test]
-    fn pptx_chart_related_parts_preserve_missing_sidecar_relationships() {
-        let mut bytes = Vec::new();
-        {
-            let mut writer = zip::ZipWriter::new(Cursor::new(&mut bytes));
-            writer
-                .start_file(
-                    "ppt/charts/_rels/chart9.xml.rels",
-                    zip::write::SimpleFileOptions::default(),
-                )
-                .unwrap();
-            writer.write_all(br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rStyle" Type="http://schemas.microsoft.com/office/2011/relationships/chartStyle" Target="missing-style.xml"/><Relationship Id="rColors" Type="http://schemas.microsoft.com/office/2011/relationships/chartColorStyle" Target="missing-colors.xml"/></Relationships>"#).unwrap();
-            writer.finish().unwrap();
-        }
-        let mut archive = super::PptxZip::new(Cursor::new(bytes)).unwrap();
-        let related = super::load_chart_related_parts(&mut archive, "ppt/charts/chart9.xml");
-        assert_eq!(related.style_xml.as_deref(), Some("\0"));
-        assert_eq!(related.color_style_xml.as_deref(), Some("\0"));
     }
 
     #[test]
@@ -325,34 +234,6 @@ mod chartex_sidecar_package_tests {
             }),
         );
     }
-}
-
-fn load_chart_user_shapes_xml(
-    zip: &mut PptxZip,
-    chart_path: &str,
-    chart_xml: &str,
-) -> Option<String> {
-    let chart_doc = crate::parse_preflighted_pptx_xml(chart_xml).ok()?;
-    let rid = chart_doc
-        .root_element()
-        .descendants()
-        .find(|node| node.is_element() && node.tag_name().name() == "userShapes")?
-        .attributes()
-        .find(|attribute| {
-            attribute.name() == "id"
-                && attribute
-                    .namespace()
-                    .is_some_and(|namespace| namespace.ends_with("/relationships"))
-        })?
-        .value();
-    let rels_path = relationship_part_path(chart_path);
-    let rels_xml = read_zip_str(zip, &rels_path).ok()?;
-    let target = ooxml_common::rels::parse_rels(&rels_xml)
-        .get(rid)?
-        .target
-        .clone();
-    let user_shapes_path = resolve_path(chart_path, &target);
-    read_zip_str(zip, &user_shapes_path).ok()
 }
 
 /// OOXML spec default positions for common placeholder types.
@@ -681,7 +562,7 @@ fn resolve_style_line_ref(
         }
         ooxml_common::theme::StyleMatrixLookup::Entry(entry) => entry,
     };
-    let entry_xml = entry.to_xml();
+    let entry_xml = entry.to_xml().ok()?;
     let document = roxmltree::Document::parse(&entry_xml).ok()?;
     let line = document.root_element().children().find(|node| {
         node.is_element()
@@ -722,7 +603,9 @@ fn style_line_ref_is_explicit_no_line(
     let StyleMatrixLookup::Entry(entry) = format_scheme.lookup_line_ref(index) else {
         return false;
     };
-    let entry_xml = entry.to_xml();
+    let Ok(entry_xml) = entry.to_xml() else {
+        return false;
+    };
     let Ok(document) = roxmltree::Document::parse(&entry_xml) else {
         return false;
     };
@@ -1341,6 +1224,7 @@ pub(crate) fn parse_shape(
     };
 
     Some(ShapeElement {
+        math_fallback: None,
         x: t.x,
         y: t.y,
         width: t.cx,
@@ -1482,6 +1366,20 @@ pub(crate) struct BlipSource {
 ///
 /// Shared by `parse_picture` and `parse_ole_preview_picture` so the ordinary and
 /// OLE-preview picture paths resolve blips identically.
+fn parse_picture_blip_effects<R: ooxml_common::color::ThemeResolver + ?Sized>(
+    blip_fill: roxmltree::Node<'_, '_>,
+    resolver: &R,
+    tint_mode: ooxml_common::color::TintMode,
+    part: &str,
+    rels: &HashMap<String, String>,
+) -> Vec<ooxml_common::blip::BlipEffect> {
+    let mut effects = ooxml_common::blip::parse_blip_effects(blip_fill, resolver, tint_mode);
+    ooxml_common::blip::resolve_blip_effect_images(&mut effects, &mut |rid| {
+        rels.get(rid).map(|target| resolve_path(part, target))
+    });
+    effects
+}
+
 pub(crate) fn resolve_blip_source(
     blip_fill: roxmltree::Node<'_, '_>,
     slide_part: &str,
@@ -1594,7 +1492,7 @@ pub(crate) fn parse_picture(
         prst_geom,
         prst_adjust,
         src_rect: parse_src_rect(blip_fill),
-        alpha: parse_blip_alpha(blip_fill),
+        alpha: None, /* alpha is baked by the ordered blip chain */
         // §20.1.8.23 `<a:duotone>` recolour, resolved through the slide's theme
         // palette with PowerPoint's linear tint. `None` ⇒ no effect.
         duotone: parse_blip_duotone(
@@ -1602,10 +1500,12 @@ pub(crate) fn parse_picture(
             &PptxSchemeResolver { theme },
             ooxml_common::color::TintMode::PowerPointLinear,
         ),
-        blip_effects: parse_blip_effects(
+        blip_effects: parse_picture_blip_effects(
             blip_fill,
             &PptxSchemeResolver { theme },
             ooxml_common::color::TintMode::PowerPointLinear,
+            slide_part,
+            rels,
         ),
         cust_geom,
         shadow,
@@ -1665,16 +1565,18 @@ pub(crate) fn parse_ole_preview_picture(
         prst_geom: None,
         prst_adjust: None,
         src_rect: parse_src_rect(blip_fill),
-        alpha: parse_blip_alpha(blip_fill),
+        alpha: None, /* alpha is baked by the ordered blip chain */
         duotone: parse_blip_duotone(
             blip_fill,
             &PptxSchemeResolver { theme },
             ooxml_common::color::TintMode::PowerPointLinear,
         ),
-        blip_effects: parse_blip_effects(
+        blip_effects: parse_picture_blip_effects(
             blip_fill,
             &PptxSchemeResolver { theme },
             ooxml_common::color::TintMode::PowerPointLinear,
+            slide_part,
+            rels,
         ),
         cust_geom: None,
         shadow: None,
@@ -2451,6 +2353,7 @@ pub(crate) fn parse_table(
     }
 
     Some(TableElement {
+        math_fallback: None,
         // §21.1.3.15 CT_TableProperties admits direct EG_FillProperties.
         // Direct table formatting overrides the style's tblBg, including noFill.
         background: tbl_pr
@@ -2841,6 +2744,61 @@ pub(crate) fn parse_sp_tree_node(
                     );
                 }
             }
+            // Part 3 §9.3 defines whole-branch alternatives. As library recovery
+            // policy, retain the alternative when the selected equation branch
+            // may fail at runtime; it can contain text, tables or pictures. This
+            // does not change normative Requires-based selection above.
+            if !selected_is_fallback {
+                // Shapes and table cells both carry DrawingML paragraphs. The
+                // anchor stores the range; it does not limit recovery to its own text.
+                let has_math = |body: &TextBody| {
+                    body.paragraphs.iter().any(|para| {
+                        para.runs
+                            .iter()
+                            .any(|run| matches!(run, TextRun::Math { .. }))
+                    })
+                };
+                let owner = out[before..].iter().position(|element| match element {
+                    SlideElement::Shape(shape) => shape.text_body.as_ref().is_some_and(has_math),
+                    SlideElement::Table(table) => table.rows.iter().any(|row| {
+                        row.cells
+                            .iter()
+                            .any(|cell| cell.text_body.as_ref().is_some_and(has_math))
+                    }),
+                    _ => false,
+                });
+                if let (Some(owner), Some(fallback)) = (owner, child(node, "Fallback")) {
+                    let mut elements = Vec::new();
+                    for child_node in fallback.children().filter(|n| n.is_element()) {
+                        parse_sp_tree_node(
+                            child_node,
+                            lph,
+                            slide_part,
+                            rels,
+                            smartart_drawings,
+                            zip,
+                            theme_source,
+                            &mut elements,
+                            skip_placeholders,
+                            group_fill,
+                            depth,
+                        );
+                    }
+                    let after = out.len() - before - owner - 1;
+                    if !elements.is_empty() {
+                        let recovery = EquationBranchFallback {
+                            elements,
+                            before: owner,
+                            after,
+                        };
+                        match &mut out[before + owner] {
+                            SlideElement::Shape(shape) => shape.math_fallback = Some(recovery),
+                            SlideElement::Table(table) => table.math_fallback = Some(recovery),
+                            _ => unreachable!("equation anchor must carry text"),
+                        }
+                    }
+                }
+            }
             if is_ink && selected_is_fallback {
                 // Render the fallback PNG at its natural pixel size centered
                 // inside the original bounding box, so a 6×6 px empty-stroke
@@ -2916,9 +2874,8 @@ pub(crate) fn parse_sp_tree_node(
                 group_fill.cloned()
             };
 
-            // Bound the group nesting: once the shared depth limit is reached,
-            // stop descending into this group's children (drop the subtree) so a
-            // pathologically deep `<p:grpSp>` nest cannot overflow the stack.
+            // Stop recursion at the existing ceiling. descend() latches a
+            // typed resource failure, so the package rejects this projection.
             let start = out.len();
             if let Some(child_depth) = depth.descend() {
                 for child_node in node.children().filter(|n| n.is_element()) {
@@ -3047,7 +3004,7 @@ fn parse_sp_node(
                     prst_geom,
                     prst_adjust,
                     src_rect: blip_fill_node.and_then(parse_src_rect),
-                    alpha: blip_fill_node.and_then(parse_blip_alpha),
+                    alpha: None, /* alpha is baked by the ordered blip chain */
                     duotone: blip_fill_node.and_then(|bf| {
                         parse_blip_duotone(
                             bf,
@@ -3057,10 +3014,12 @@ fn parse_sp_node(
                     }),
                     blip_effects: blip_fill_node
                         .map(|bf| {
-                            parse_blip_effects(
+                            parse_picture_blip_effects(
                                 bf,
                                 &PptxSchemeResolver { theme },
                                 ooxml_common::color::TintMode::PowerPointLinear,
+                                slide_part,
+                                rels,
                             )
                         })
                         .unwrap_or_default(),
@@ -3245,7 +3204,7 @@ fn parse_pic_node(
                                 prst_geom: None,
                                 prst_adjust: None,
                                 src_rect: blip_fill.and_then(parse_src_rect),
-                                alpha: blip_fill.and_then(parse_blip_alpha),
+                                alpha: None, /* alpha is baked by the ordered blip chain */
                                 duotone: blip_fill.and_then(|bf| {
                                     parse_blip_duotone(
                                         bf,
@@ -3255,10 +3214,12 @@ fn parse_pic_node(
                                 }),
                                 blip_effects: blip_fill
                                     .map(|bf| {
-                                        parse_blip_effects(
+                                        parse_picture_blip_effects(
                                             bf,
                                             &PptxSchemeResolver { theme },
                                             ooxml_common::color::TintMode::PowerPointLinear,
+                                            slide_part,
+                                            rels,
                                         )
                                     })
                                     .unwrap_or_default(),
@@ -3381,12 +3342,32 @@ fn parse_graphic_frame(
                         .position(|candidate| candidate.id() == node.id())
                         .unwrap_or(0);
                     let retention_site = format!("graphicFrame:{graphic_frame_ordinal}");
-                    let related_parts = load_chart_related_parts(zip, &chart_path);
+                    let related_parts = ooxml_common::chart::load_chart_related_parts(
+                        |part| read_zip_str(zip, part).ok(),
+                        &chart_path,
+                    );
+                    let chart_theme = related_parts.theme_override_xml.as_deref().map(|xml| {
+                        let mut theme = crate::theme::PptxTheme::from_source(theme_source);
+                        crate::theme::apply_theme_override(&mut theme, xml);
+                        theme
+                    });
+                    let theme = chart_theme
+                        .as_ref()
+                        .map(|theme| theme.colors())
+                        .unwrap_or(theme);
+                    let format_scheme = chart_theme
+                        .as_ref()
+                        .and_then(|theme| theme.format_scheme())
+                        .or_else(|| theme_source.format_scheme());
                     let empty_theme_images =
                         ooxml_common::chart::ChartImageRelationships::default();
                     let image_resolver = ooxml_common::chart::ChartImageResolverChain::new(
                         &related_parts.image_relationships,
-                        theme_source.chart_images().unwrap_or(&empty_theme_images),
+                        chart_theme
+                            .as_ref()
+                            .and_then(|theme| theme.chart_images())
+                            .or_else(|| theme_source.chart_images())
+                            .unwrap_or(&empty_theme_images),
                     );
                     let chart_opt = if uri.contains("chartex") || uri.contains("chartEx") {
                         // chartEx title font size lives in the chart
@@ -3402,7 +3383,7 @@ fn parse_graphic_frame(
                                     related_parts.style_xml.as_deref(),
                                     related_parts.color_style_xml.as_deref(),
                                     theme,
-                                    theme_source.format_scheme(),
+                                    format_scheme,
                                     &image_resolver,
                                     Some(&reporter),
                                     Some(ooxml_common::chart::ChartRetentionKey {
@@ -3412,15 +3393,22 @@ fn parse_graphic_frame(
                                 )
                             })
                     } else {
-                        let user_shapes_xml =
-                            load_chart_user_shapes_xml(zip, &chart_path, &chart_xml);
+                        let user_shapes_xml = crate::parse_preflighted_pptx_xml(&chart_xml)
+                            .ok()
+                            .and_then(|chart_doc| {
+                                ooxml_common::chart::load_chart_user_shapes_xml(
+                                    |part| read_zip_str(zip, part).ok(),
+                                    &chart_path,
+                                    &chart_doc,
+                                )
+                            });
                         parse_legacy_chart_with_style_parts_and_images(
                             &chart_xml,
                             related_parts.style_xml.as_deref(),
                             related_parts.color_style_xml.as_deref(),
                             user_shapes_xml.as_deref(),
                             theme,
-                            theme_source.format_scheme(),
+                            format_scheme,
                             &image_resolver,
                         )
                     };
@@ -3724,11 +3712,6 @@ pub(crate) fn parse_connector(
         .unwrap_or_else(|| "line".to_owned());
 
     // Pull connector adjust values from avLst (e.g. bentConnector3 adj1 = bend %).
-    let parse_gd_val = |gd: roxmltree::Node<'_, '_>| -> Option<f64> {
-        attr(&gd, "fmla")
-            .and_then(|f| f.strip_prefix("val ").map(|s| s.to_owned()))
-            .and_then(|s| s.parse::<f64>().ok())
-    };
     let av_node = prst_geom_node.and_then(|n| child(n, "avLst"));
     let gd_nodes: Vec<_> = av_node
         .map(|av| {
@@ -3737,28 +3720,11 @@ pub(crate) fn parse_connector(
                 .collect()
         })
         .unwrap_or_default();
-    let adj: Option<f64> = gd_nodes
-        .iter()
-        .find(|n| matches!(attr(n, "name").as_deref(), Some("adj") | Some("adj1")))
-        .or_else(|| gd_nodes.first())
-        .and_then(|n| parse_gd_val(*n));
-    let adj2: Option<f64> = gd_nodes
-        .iter()
-        .find(|n| attr(n, "name").as_deref() == Some("adj2"))
-        .or_else(|| gd_nodes.get(1))
-        .and_then(|n| parse_gd_val(*n));
-    let adj3: Option<f64> = gd_nodes
-        .iter()
-        .find(|n| attr(n, "name").as_deref() == Some("adj3"))
-        .or_else(|| gd_nodes.get(2))
-        .and_then(|n| parse_gd_val(*n));
-    let adj4: Option<f64> = gd_nodes
-        .iter()
-        .find(|n| attr(n, "name").as_deref() == Some("adj4"))
-        .or_else(|| gd_nodes.get(3))
-        .and_then(|n| parse_gd_val(*n));
+    let [adj, adj2, adj3, adj4] =
+        std::array::from_fn(|index| crate::master::preset_adjustment(&gd_nodes, index));
 
     Some(ShapeElement {
+        math_fallback: None,
         x: t.x,
         y: t.y,
         width: t.cx,
@@ -4261,6 +4227,68 @@ mod style_ref_tests {
                 &mut zip,
             );
             assert_eq!(cell.horz_overflow.as_deref(), expected, "{attribute}");
+        }
+    }
+
+    #[test]
+    fn table_cell_vertical_tokens_preserve_raw_direction() {
+        for (raw, expected) in [
+            ("horz", "horz"),
+            ("&#x20;&#x9;horz&#xA;&#xD;", " \thorz\n\r"),
+            ("&#xA0;horz&#xA0;", "\u{a0}horz\u{a0}"),
+            ("ho&#x9;rz", "ho\trz"),
+            (" vert270 ", " vert270 "),
+            (" vert ", " vert "),
+            (" wordArtVert ", " wordArtVert "),
+        ] {
+            // Keep the direction unchanged for orientation dispatch; only the
+            // renderer's horizontal clip admission tolerates XML token padding.
+            // bodyPr serves table and shape text; tcPr overrides it for cells.
+            for on_cell in [false, true] {
+                let (body_attr, cell_attr) = if on_cell {
+                    (r#"vert="vert""#.to_owned(), format!(r#"vert="{raw}""#))
+                } else {
+                    (format!(r#"vert="{raw}""#), String::new())
+                };
+                let xml = format!(
+                    r#"<a:tc xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+                      <a:txBody><a:bodyPr {body_attr}/><a:p/></a:txBody>
+                      <a:tcPr {cell_attr}/>
+                    </a:tc>"#
+                );
+                let doc = roxmltree::Document::parse(&xml).unwrap();
+                let mut zip = empty_zip();
+                let cell = parse_table_cell(
+                    doc.root_element(),
+                    &HashMap::new(),
+                    &HashMap::new(),
+                    "ppt/slides/slide1.xml",
+                    &crate::master::TableTextLevels::default(),
+                    &mut zip,
+                );
+                assert_eq!(
+                    cell.text_body.unwrap().vert,
+                    expected,
+                    "{raw}, tcPr={on_cell}"
+                );
+                if !on_cell {
+                    let body_pr = doc
+                        .descendants()
+                        .find(|n| {
+                            n.has_tag_name((
+                                "http://schemas.openxmlformats.org/drawingml/2006/main",
+                                "bodyPr",
+                            ))
+                        })
+                        .unwrap();
+                    assert_eq!(
+                        crate::text::InheritedBodyPr::from_body_pr(body_pr)
+                            .vert
+                            .as_deref(),
+                        Some(expected)
+                    );
+                }
+            }
         }
     }
 
@@ -4919,6 +4947,89 @@ mod ole_tests {
         run(&xml, &mut zip, &rels)
     }
 
+    #[test]
+    fn equation_mce_retains_picture_preview_and_complete_choice_range() {
+        let shape = r#"<p:sp xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math">
+          <p:nvSpPr><p:cNvPr id="8" name="Equation"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr>
+          <p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="914400"/></a:xfrm><a:prstGeom prst="rect"/></p:spPr>
+          <p:txBody><a:bodyPr/><a:lstStyle/><a:p><a14:m><m:oMath><m:r><m:t>x</m:t></m:r></m:oMath></a14:m></a:p></p:txBody>
+        </p:sp>"#;
+        let selected = format!("{}{}{}", mce_pic("rIdChoice"), shape, shape);
+        let out = mce_selected_pic_path("a14", &selected);
+        assert_eq!(out.len(), 3);
+        let SlideElement::Shape(shape) = &out[1] else {
+            panic!("equation")
+        };
+        let fallback = shape.math_fallback.as_ref().expect("retained preview");
+        assert_eq!((fallback.before, fallback.after), (1, 1));
+        assert_eq!(only_pic_path(&fallback.elements), "ppt/media/fallback.png");
+    }
+
+    #[test]
+    fn equation_table_mce_retains_complete_preview_for_table_only_and_mixed_branches() {
+        let table = r#"<p:graphicFrame xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math">
+          <p:nvGraphicFramePr><p:cNvPr id="9" name="Table"/><p:cNvGraphicFramePr/><p:nvPr/></p:nvGraphicFramePr>
+          <p:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="914400"/></p:xfrm>
+          <a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/table"><a:tbl>
+          <a:tblPr/><a:tblGrid><a:gridCol w="914400"/></a:tblGrid><a:tr h="914400"><a:tc>
+          <a:txBody><a:bodyPr/><a:lstStyle/><a:p><a14:m><m:oMath><m:r><m:t>x</m:t></m:r></m:oMath></a14:m></a:p></a:txBody>
+          <a:tcPr/></a:tc></a:tr></a:tbl></a:graphicData></a:graphic>
+        </p:graphicFrame>"#;
+        let text_shape = r#"<p:sp><p:nvSpPr><p:cNvPr id="10" name="Text"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr>
+          <p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="914400"/></a:xfrm></p:spPr>
+          <p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:t>Text</a:t></a:r></a:p></p:txBody></p:sp>"#;
+        for mixed in [false, true] {
+            let choice = if mixed {
+                format!("{}{}{}", text_shape, table, mce_pic("rIdChoice"))
+            } else {
+                table.to_string()
+            };
+            let mut out = mce_selected_pic_path("a14", &choice);
+            let owner = usize::from(mixed);
+            let SlideElement::Table(table) = &out[owner] else {
+                panic!("equation table")
+            };
+            assert!(table.rows[0].cells[0]
+                .text_body
+                .as_ref()
+                .unwrap()
+                .paragraphs[0]
+                .runs
+                .iter()
+                .any(|run| matches!(run, TextRun::Math { .. })));
+            let value = serde_json::to_value(&out[owner]).unwrap();
+            let preview = &value["mathFallback"];
+            assert_eq!(preview["before"], owner);
+            assert_eq!(preview["after"], owner);
+            assert_eq!(
+                preview["elements"][0]["imagePath"],
+                "ppt/media/fallback.png"
+            );
+            // Recovery content follows its owning group just like the live table.
+            apply_group_transform_to_element(
+                &mut out[owner],
+                &GroupTransform {
+                    x: 100,
+                    y: 200,
+                    cx: 1828800,
+                    cy: 1828800,
+                    ch_x: 0,
+                    ch_y: 0,
+                    ch_cx: 914400,
+                    ch_cy: 914400,
+                    rot: 0.0,
+                    flip_h: false,
+                    flip_v: false,
+                },
+            );
+            let transformed = serde_json::to_value(&out[owner]).unwrap();
+            let picture = &transformed["mathFallback"]["elements"][0];
+            assert_eq!(picture["x"], 100);
+            assert_eq!(picture["y"], 200);
+            assert_eq!(picture["width"], 1828800);
+        }
+    }
+
     fn only_pic_path(out: &[SlideElement]) -> String {
         let pics: Vec<&String> = out
             .iter()
@@ -5387,16 +5498,38 @@ mod hidden_tests {
     }
 
     fn run_deep(levels: usize) -> Vec<SlideElement> {
-        // roxmltree::Document::parse itself recurses on nesting, so parse on a
-        // generous stack; this test targets OUR grpSp guard. (The roxmltree layer
-        // is bounded separately by the raw-XML depth pre-check in
-        // `ooxml_common::depth`.)
+        // Exercise the recursive group-shape walker with native stack headroom;
+        // trusted fixtures bypass the separate production XML depth policy.
         std::thread::Builder::new()
             .stack_size(256 * 1024 * 1024)
             .spawn(move || run(&nested_groups(levels)))
             .unwrap()
             .join()
             .unwrap()
+    }
+
+    #[test]
+    fn group_depth_crossing_is_a_typed_resource_failure() {
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let governor = ooxml_common::resource::ResourceGovernor::from_wasm(
+                    ooxml_common::resource::OoxmlFormat::Pptx,
+                    None,
+                    None,
+                    None,
+                );
+                let _scope = governor.scope("group-depth-test");
+                let _provisional = run(&nested_groups(65));
+                let error = governor
+                    .first_error()
+                    .expect("group depth must fail closed");
+                assert!(error.starts_with("OOXML_RESOURCE_LIMIT:"), "{error}");
+                assert!(error.contains("\"limit\":64"), "{error}");
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]

@@ -39,6 +39,53 @@ describe('shape effect bounds', () => {
     expect(geometry.anchor).not.toEqual([geometry.bbox.x + geometry.bbox.w, geometry.bbox.y]);
   });
 
+  it('includes raster padding rounded up to device pixels under camera zoom', () => {
+    const geometry = projectedEffectGeometry(
+      { prst: 'orthographicFront', zoom: 4 },
+      { a: 2, b: 0, c: 0, d: 2, e: 0, f: 0 },
+      0, 0, 100, 50, 1.1, 'tr',
+    );
+    // 1.1 CSS px rounds to 3 device px. Camera zoom scales that local margin.
+    expect(geometry.bbox.x).toBeCloseTo(-312, 10);
+    expect(geometry.bbox.w).toBeCloseTo(824, 10);
+  });
+
+  it('bounds and anchors the exposed back surface at the extrusion base', () => {
+    const geometry = projectedEffectGeometry(
+      { prst: 'orthographicFront', rot: { lat: 0, lon: 150, rev: 0 } },
+      { a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 },
+      0, 0, 100, 50, 0, 'tr', 40,
+    );
+    // Parallel projection: width=100*cos(30), centre=50+40*sin(150).
+    // The back-facing top-right corner is the left end of the projected box.
+    expect(geometry.bbox.x).toBeCloseTo(70 - 50 * Math.cos(Math.PI / 6), 10);
+    expect(geometry.bbox.w).toBeCloseTo(100 * Math.cos(Math.PI / 6), 10);
+    expect(geometry.anchor[0]).toBeCloseTo(geometry.bbox.x, 10);
+    expect(geometry.anchor[1]).toBe(0);
+  });
+
+  it('keeps a camera-crossing rear face and its effect anchor in the same finite scene', () => {
+    const units = 96, w = 8 * units, h = units, depth = 8 * units;
+    const extent = 2 * Math.sqrt(3) * units;
+    const distance = extent + 4 * units + .02 * (2 * extent + 4 * units);
+    const q = [-1, 1].flatMap(sx => [-1, 1].map(sy => {
+      const z = sx * extent + 4 * units;
+      return [w / 2 + (-sx * 2 + 4 * Math.sqrt(3)) * units / (1 - z / distance),
+        h / 2 + sy * h / 2 / (1 - z / distance)];
+    }));
+    const geometry = projectedEffectGeometry(
+      { prst: 'perspectiveFront', fov: 90, rot: { lat: 0, lon: 120, rev: 0 } },
+      { a: 2, b: 0, c: 0, d: 2, e: 5, f: 7 },
+      0, 0, w, h, 0, 'tr', depth,
+    );
+    expect(geometry.bbox.x).toBeCloseTo(5 + 2 * Math.min(...q.map(p => p[0])), 7);
+    expect(geometry.bbox.y).toBeCloseTo(7 + 2 * Math.min(...q.map(p => p[1])), 7);
+    expect(geometry.bbox.w).toBeCloseTo(2 * (Math.max(...q.map(p => p[0])) - Math.min(...q.map(p => p[0]))), 7);
+    expect(geometry.bbox.h).toBeCloseTo(2 * (Math.max(...q.map(p => p[1])) - Math.min(...q.map(p => p[1]))), 7);
+    expect(geometry.anchor[0]).toBeCloseTo(5 + 2 * q[2][0], 7);
+    expect(geometry.anchor[1]).toBeCloseTo(7 + 2 * q[2][1], 7);
+  });
+
   it('reuses one device-space projection across multiple effect passes', () => {
     const cacheContext = { setTransform: vi.fn() };
     class TestOffscreenCanvas {

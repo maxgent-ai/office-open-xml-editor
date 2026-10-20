@@ -21,7 +21,3 @@ export function fragmentLineAdvancesPt(fragment: ParagraphLayout): number {
 export function paragraphFragmentAdvancePt(fragment: ParagraphLayout): number {
   return fragment.advancePt;
 }
-
-export function flowFragmentAdvancePt(fragment: FlowFragment): number {
-  return fragment.advancePt;
-}

@@ -4,7 +4,7 @@ import { chartDataTableFamilyIsPainted } from '../marker-style.js';
 import { chartTextFontSizePx } from '../layout.js';
 import { formatCategoryLabel, formatChartValWithCode, formatLocalizedExcelShortDate } from '../chart-number-format.js';
 import { legendEntryGlobalIndex, legendEntryRanges } from '../legend-entry-plan.js';
-import { elideToWidth } from '../text-elide.js';
+import { authoredLineCount, authoredTextLines, fillAuthoredText, measureAuthoredTextWidth } from '../chart-text-lines.js';
 import { axisLineWidthPx } from '../axis-style.js';
 import { chartFontCss, chartFontFamily } from './fonts.js';
 import { chartCategories } from '../category-spacing.js';
@@ -18,7 +18,11 @@ export type ChartDataTableLayout = {
   lineHeight: number;
   headerLines: string[][];
   headerHeight: number;
+  /** Height of a single-line body row. */
   rowHeight: number;
+  /** Extra height per body row (in paint order) for authored line breaks in
+   *  its series name or value text; 0 for single-line rows. */
+  rowExtraHeights: number[];
   totalHeight: number;
 };
 
@@ -33,12 +37,18 @@ export function chartHasDataTable(chart: ChartModel): boolean {
 }
 
 
-export function chartDataTableRows(chart: ChartModel): Array<{ series: ChartSeries; sourceIndex: number }> {
+function chartDataTableRows(chart: ChartModel): Array<{ series: ChartSeries; sourceIndex: number }> {
   const horizontal = chart.chartType === 'clusteredBarH'
     || chart.chartType === 'stackedBarH'
     || chart.chartType === 'stackedBarHPct';
   const rows = chart.series.map((series, sourceIndex) => ({ series, sourceIndex }));
   return horizontal ? rows.reverse() : rows;
+}
+
+
+function dataTableValueText(chart: ChartModel, series: ChartSeries, categoryIndex: number): string {
+  const value = series.values[categoryIndex];
+  return value == null ? '' : formatChartValWithCode(value, series.valFormatCode, chart.date1904);
 }
 
 
@@ -68,7 +78,7 @@ export function chartDataTableHeaderWidth(
   ctx.save();
   ctx.font = chartFontCss(fontPx, face, table.fontBold ?? false, table.fontItalic ?? false);
   const nameWidth = chart.series.reduce(
-    (width, series) => Math.max(width, ctx.measureText(series.name).width),
+    (width, series) => Math.max(width, measureAuthoredTextWidth(ctx, series.name)),
     0,
   );
   ctx.restore();
@@ -106,13 +116,25 @@ export function measureChartDataTable(
   ctx.restore();
   const maxHeaderLines = Math.max(1, ...headerLines.map(lines => lines.length));
   const headerHeight = maxHeaderLines * lineHeight + 4 * ptToPx;
+  // A series name or value with authored breaks makes its row a block of lines.
+  const tableRows = chartDataTableRows(chart);
+  const categoryCount = chartCategories(chart).length;
+  const rowExtraHeights = tableRows.map(({ series }) => {
+    let lines = authoredLineCount(series.name);
+    for (let categoryIndex = 0; categoryIndex < categoryCount; categoryIndex++) {
+      lines = Math.max(lines, authoredLineCount(dataTableValueText(chart, series, categoryIndex)));
+    }
+    return (lines - 1) * lineHeight;
+  });
+  const rowExtraTotal = rowExtraHeights.reduce((sum, extra) => sum + extra, 0);
   return {
     fontPx,
     lineHeight,
     headerLines,
     headerHeight,
     rowHeight,
-    totalHeight: headerHeight + chartDataTableRows(chart).length * rowHeight,
+    rowExtraHeights,
+    totalHeight: headerHeight + tableRows.length * rowHeight + rowExtraTotal,
   };
 }
 
@@ -145,7 +167,7 @@ export function drawChartDataTable(
   ctx.save();
   ctx.font = font;
   const longestName = chart.series.reduce(
-    (width, series) => Math.max(width, ctx.measureText(series.name).width),
+    (width, series) => Math.max(width, measureAuthoredTextWidth(ctx, series.name)),
     0,
   );
   const desiredHeaderWidth = longestName + keyWidth + keyGap + 6 * ptToPx;
@@ -180,6 +202,17 @@ export function drawChartDataTable(
     ? 'transparent'
     : table.fontColor ? `#${table.fontColor}` : '#000000';
   const drawBodyText = (text: string, centerX: number, centerY: number): void => {
+    const lines = authoredTextLines(text);
+    if (lines.length > 1) {
+      // Authored breaks: one text box per line, centred as a block.
+      const firstY = centerY - (lines.length - 1) * layout.lineHeight / 2;
+      lines.forEach((line, index) => drawBodyLine(line, centerX, firstY + index * layout.lineHeight));
+      return;
+    }
+    // Outer breaks are trimmed (e.g. a `0"\n"` format yields "10\n").
+    drawBodyLine(lines[0], centerX, centerY);
+  };
+  const drawBodyLine = (text: string, centerX: number, centerY: number): void => {
     // Desktop Excel scopes a direct dTable/spPr fill to the generated body
     // text boxes. It does not fill the table frame or the leading series-name
     // cells. The text layout box is the measured advance by the measured line
@@ -213,17 +246,23 @@ export function drawChartDataTable(
     });
   }
 
+  let rowExtraBefore = 0;
   for (let seriesIndex = 0; seriesIndex < tableRows.length; seriesIndex++) {
     const { series, sourceIndex } = tableRows[seriesIndex];
-    const rowTop = tableY + layout.headerHeight + seriesIndex * layout.rowHeight;
-    const rowCenter = rowTop + layout.rowHeight / 2;
+    const rowExtra = layout.rowExtraHeights[seriesIndex] ?? 0;
+    const rowTop = tableY + layout.headerHeight + seriesIndex * layout.rowHeight + rowExtraBefore;
+    const rowCenter = rowTop + (layout.rowHeight + rowExtra) / 2;
+    rowExtraBefore += rowExtra;
     if (headerWidth > 0) {
       const textLeft = tableX + 3 * ptToPx + keyWidth + keyGap;
       ctx.textAlign = 'left';
-      ctx.fillText(
-        elideToWidth(ctx, series.name, Math.max(0, plotX - textLeft - 2 * ptToPx)),
+      fillAuthoredText(
+        ctx,
+        series.name,
         textLeft,
         rowCenter,
+        layout.lineHeight,
+        Math.max(0, plotX - textLeft - 2 * ptToPx),
       );
       if (table.showKeys && keyWidth > 0) {
         const keyX = tableX + 3 * ptToPx;
@@ -260,9 +299,11 @@ export function drawChartDataTable(
       }
     }
     for (let categoryIndex = 0; categoryIndex < categories.length; categoryIndex++) {
-      const value = series.values[categoryIndex];
-      const text = value == null ? '' : formatChartValWithCode(value, series.valFormatCode, chart.date1904);
-      drawBodyText(text, plotX + (categoryIndex + 0.5) * categoryWidth, rowCenter);
+      drawBodyText(
+        dataTableValueText(chart, series, categoryIndex),
+        plotX + (categoryIndex + 0.5) * categoryWidth,
+        rowCenter,
+      );
     }
   }
 
@@ -277,7 +318,7 @@ export function drawChartDataTable(
       let lineY = tableY + layout.headerHeight;
       for (let row = 0; row < tableRows.length; row++) {
         ctx.beginPath(); ctx.moveTo(tableX, lineY); ctx.lineTo(tableX + tableWidth, lineY); ctx.stroke();
-        lineY += layout.rowHeight;
+        lineY += layout.rowHeight + (layout.rowExtraHeights[row] ?? 0);
       }
     }
     if (table.showVerticalBorder) {

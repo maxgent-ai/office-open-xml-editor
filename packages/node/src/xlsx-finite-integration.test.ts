@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import type { Worksheet } from '@silurus/ooxml-xlsx';
 import type { ModelSource, ModelSourceConfig } from '@silurus/ooxml-core';
-import { DEFAULT_XLSX_WORKSHEET_POLICY } from '@silurus/ooxml-core/worker';
+import { DEFAULT_XLSX_WORKSHEET_POLICY } from '@silurus/ooxml-xlsx/internal/session';
 import { generateSyntheticXlsx } from '../scripts/generate-synthetic-xlsx.mjs';
 // Test-only internal Node seams (no public API is added by this file).
 import { loadSkiaForTests } from './test-imports.ts';
@@ -139,7 +139,7 @@ function fakeSource(config: ModelSourceConfig = { minimal: true }) {
     claim: vi.fn(() => true),
     beginLoad: () => ({
       module: {
-        protocol: 'ooxml-model-source-module/v1',
+        protocol: 'ooxml-model-source-module/v2',
         target: 'xlsx',
         moduleUrl: new URL('./test-fixtures/xlsx-model-source.mjs', import.meta.url).href,
         config,
@@ -157,7 +157,7 @@ describe('application minimal ModelSource without the worksheet-limit setter', (
     const low = fakeSource();
     await expect(materializeXlsxWorksheet(small, 0, {
       xlsxWorksheetLimits: { maxRows: 1 },
-      modelSources: [low.source],
+      legacyXls: low.source,
     })).rejects.toMatchObject({
       code: 'ooxml-resource-limit',
       details: expect.objectContaining({
@@ -170,7 +170,7 @@ describe('application minimal ModelSource without the worksheet-limit setter', (
     const high = fakeSource();
     const worksheet = await materializeXlsxWorksheet(small, 0, {
       xlsxWorksheetLimits: { maxRows: 3 },
-      modelSources: [high.source],
+      legacyXls: high.source,
     });
     expect(worksheet.rows).toHaveLength(3);
     expect(high.source.claim).toHaveBeenCalled();
@@ -180,7 +180,7 @@ describe('application minimal ModelSource without the worksheet-limit setter', (
 
   it('rejects malformed limits before any claim or load', async () => {
     const fake = fakeSource();
-    const options: MaterializeOptions = { xlsxWorksheetLimits: { maxRows: 0 }, modelSources: [fake.source] };
+    const options: MaterializeOptions = { xlsxWorksheetLimits: { maxRows: 0 }, legacyXls: fake.source };
     await expect(materializeXlsxWorksheet(small, 0, options)).rejects.toBeInstanceOf(RangeError);
     expect(fake.source.claim).not.toHaveBeenCalled();
     expect(fake.release).not.toHaveBeenCalled();

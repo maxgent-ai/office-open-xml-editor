@@ -10,13 +10,14 @@ import { parse } from '@babel/parser';
 import { execFileSync } from 'node:child_process';
 import { performance } from 'node:perf_hooks';
 import { tmpdir } from 'node:os';
+import { gzipSync } from 'node:zlib';
 import { createTypeScriptResolver } from './check-core-legacy-boundary.mjs';
 
 const resolveModule = createTypeScriptResolver();
 
 // The only entry-to-source transitions are these opt-in dispatch functions.
 // Keep this list exact: a new caller must explain why it can run only after
-// modelSources (or a worker source descriptor) is present.
+// a format's opt-in source option (or a worker source descriptor) is present.
 export const SOURCE_DISPATCH = new Map([
   ['packages/core/src/source/model-source.ts', ['openModelSourceModule']],
   ['packages/docx/src/document.ts', ['load']],
@@ -30,7 +31,7 @@ export const SOURCE_DISPATCH = new Map([
   ['packages/node/src/pptx-model-source.ts', ['acquirePptxInput']],
   ...['docx', 'xlsx', 'pptx'].flatMap((format) => [
     [`packages/${format}/src/worker-source.ts`, ['self.onmessage']],
-    [`packages/${format}/src/render-worker-source.ts`,
+    [`packages/${format}/src/render-worker.ts`,
       format === 'pptx' ? ['executeArchiveFromNew'] : ['self.onmessage']],
   ]),
 ]);
@@ -39,6 +40,19 @@ export const SOURCE_DISPATCH = new Map([
 // eagerly retained byte that disappears when selected-source dispatch is
 // compiled out, even if preparation was moved into another static module.
 const DISPATCH_COST_BUDGET = Object.freeze({ docx: 2_500, xlsx: 3_000, pptx: 2_500, node: 4_500 });
+
+// Independent sidecar compression plus registration/owner bindings adds a
+// small overhead to the reading code moved out of the eager worker. This
+// budget allows that code, not another copy of shared geometry or layout.
+const DOCX_SOURCE_SIDECAR_GZIP_BUDGET = 16 * 1024;
+
+function assertSidecarBudget(file) {
+  const bytes = gzipSync(readFileSync(file), { level: 9 }).length;
+  if (bytes > DOCX_SOURCE_SIDECAR_GZIP_BUDGET) {
+    throw new Error(`${file} exceeds ${DOCX_SOURCE_SIDECAR_GZIP_BUDGET}-byte gzip sidecar budget: ${bytes}`);
+  }
+  console.log(`${file}: ${bytes}/${DOCX_SOURCE_SIDECAR_GZIP_BUDGET} gzip bytes`);
+}
 
 export function checkSourceDispatchImports(files) {
   for (const { path, text } of files) {
@@ -225,7 +239,7 @@ function withDisabledBuild(check) {
 }
 
 export function assertNoSourceRuntime(code, name) {
-  if (code.includes('ooxml-model-source-module/v1') || code.includes('model source view default')) {
+  if (code.includes('ooxml-model-source-module/v2') || code.includes('model source view default')) {
     throw new Error(`${name} includes optional source runtime in its eager OOXML code`);
   }
 }
@@ -246,6 +260,7 @@ export function checkBuiltBundles(dist = 'dist', { packages = false, disabledDis
       if (!existsSync(sidecar)) throw new Error(`Missing optional source sidecar ${sidecar}`);
       const sidecarImports = staticSpecifiers(parse(readFileSync(sidecar, 'utf8'), { sourceType: 'module' }));
       if (sidecarImports.length > 0) throw new Error(`${sidecar} is not self-contained`);
+      if (format === 'docx') assertSidecarBudget(sidecar);
       const packageSidecar = join('packages', format, 'dist', `${format}-source-worker.mjs`);
       if (packages && !existsSync(packageSidecar)) {
         throw new Error(`Missing optional package source sidecar ${packageSidecar}`);
@@ -254,6 +269,7 @@ export function checkBuiltBundles(dist = 'dist', { packages = false, disabledDis
         && staticSpecifiers(parse(readFileSync(packageSidecar, 'utf8'), { sourceType: 'module' })).length > 0) {
         throw new Error(`${packageSidecar} is not self-contained`);
       }
+      if (packages && format === 'docx') assertSidecarBudget(packageSidecar);
       const packageEntry = join('packages', format, 'dist', 'index.mjs');
       if (packages) {
         if (!existsSync(packageEntry)) throw new Error(`Missing package entry ${packageEntry}`);
@@ -267,7 +283,7 @@ export function checkBuiltBundles(dist = 'dist', { packages = false, disabledDis
   }
   let ordinaryWorkers = 0;
   for (const file of readdirSync(join(dist, 'assets')).filter((name) => /^render-worker-.*\.js$/.test(name))) {
-    if (!file.startsWith('render-worker-source-')) ordinaryWorkers++;
+    ordinaryWorkers++;
     assertNoSourceRuntime(readFileSync(join(dist, 'assets', file), 'utf8'), file);
   }
   if (ordinaryWorkers !== 3) {
@@ -310,7 +326,6 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     'packages/pptx/src/internal/presentation-model-source.ts',
     ...['docx', 'xlsx', 'pptx'].flatMap((format) => [
       `packages/${format}/src/worker-source.ts`,
-      `packages/${format}/src/render-worker-source.ts`,
     ]),
   ];
   assertEagerSourceEntries([

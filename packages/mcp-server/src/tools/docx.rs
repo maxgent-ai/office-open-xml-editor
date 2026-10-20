@@ -390,7 +390,7 @@ mod sample_tests {
         let minimal_document = r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"><w:body><w:p><w:r><w:drawing><wp:inline><wp:extent cx="2540000" cy="635000"/><wp:docPr id="1" name="Minimal rectangle"/><a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"><wps:wsp><wps:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="1270000" cy="317500"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></wps:spPr></wps:wsp></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p></w:body></w:document>"#;
         for index in 0..archive.len() {
             let mut part = archive.by_index(index).unwrap();
-            let name = part.name().to_string();
+            let name = part.name().unwrap().into_owned();
             let mut bytes = Vec::new();
             part.read_to_end(&mut bytes).unwrap();
             output

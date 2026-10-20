@@ -1,4 +1,5 @@
 import type { MathNode, MathStyle } from '../types/math';
+import { ownValue } from '../internal/own-key';
 
 // Convert the shared OMML AST to MathML for MathJax. MathJax owns the typesetting
 // (spacing, italic/upright, stretchy glyphs), so this layer only maps structure.
@@ -224,7 +225,7 @@ function accentToMathML(node: Extract<MathNode, { kind: 'accent' }>): string {
   if (OVERLINE_CHARS.has(node.char)) {
     return `<mover>${b}<mo stretchy="true">&#x2015;</mo></mover>`;
   }
-  const ch = ACCENT_MAP[node.char] ?? node.char;
+  const ch = ownValue(ACCENT_MAP, node.char) ?? node.char;
   const stretchy = ch === '→' || ch === '←' ? 'true' : 'false';
   return `<mover accent="true">${b}<mo stretchy="${stretchy}">${esc(ch)}</mo></mover>`;
 }

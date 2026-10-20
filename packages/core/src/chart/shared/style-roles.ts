@@ -245,7 +245,7 @@ export function chartStyleRoleLeaderLine(
 }
 
 
-export function chartStyleRoleTrendline(
+function chartStyleRoleTrendline(
   chart: ChartModel,
   direct: NonNullable<ChartSeries['trendLines']>[number],
 ): NonNullable<ChartSeries['trendLines']>[number] {
@@ -268,7 +268,7 @@ export function chartStyleRoleTrendline(
 }
 
 
-export function chartStyleRoleDataTable(
+function chartStyleRoleDataTable(
   chart: ChartModel,
   direct: NonNullable<ChartModel['dataTable']>,
 ): NonNullable<ChartModel['dataTable']> {
@@ -337,7 +337,7 @@ export interface LinkedGridlineResult {
 }
 
 
-export function chartStyleRoleGridline(
+function chartStyleRoleGridline(
   chart: ChartModel,
   role: 'gridlineMajor' | 'gridlineMinor',
   visible: boolean | null | undefined,
@@ -364,7 +364,7 @@ export function chartStyleRoleGridline(
 }
 
 
-export function chartStyleRoleSecondaryGridlines(
+function chartStyleRoleSecondaryGridlines(
   chart: ChartModel,
   axis: SecondaryValueAxis | null | undefined,
 ): SecondaryValueAxis | null | undefined {
@@ -408,7 +408,7 @@ export function chartStyleRoleSecondaryGridlines(
 }
 
 
-export function chartStyleRoleAxisLine(
+function chartStyleRoleAxisLine(
   chart: ChartModel,
   role: 'categoryAxis' | 'valueAxis',
   color: string | null | undefined,
@@ -435,12 +435,12 @@ export function chartStyleRoleAxisLine(
  * DrawingML stroke paint. Preserve authored ownership by suppressing an
  * unresolved/structured paint here instead of reviving the semantic black
  * fallback in `resolveAxisLine`. */
-export function chartAxisLineIsHidden(line: ChartDecorationLineStyle): boolean {
+function chartAxisLineIsHidden(line: ChartDecorationLineStyle): boolean {
   return line.hidden === true || (line.paintAuthored === true && line.color == null);
 }
 
 
-export function chartStyleRoleSecondaryAxisLine(
+function chartStyleRoleSecondaryAxisLine(
   chart: ChartModel,
   axis: SecondaryValueAxis | null | undefined,
   role: 'categoryAxis' | 'valueAxis',
@@ -511,7 +511,7 @@ export function chartStyleRoleSecondaryAxisLine(
 }
 
 
-export function chartStyleRoleSeriesAxis(chart: ChartModel): ChartModel {
+function chartStyleRoleSeriesAxis(chart: ChartModel): ChartModel {
   const axis = chart.threeD?.seriesAxis;
   const style = chart.chartStyleRoles?.seriesAxis;
   if (!axis || (!style && !chart.chartTextStyle)) return chart;
@@ -588,7 +588,7 @@ export function chartStyleRoleSeriesAxis(chart: ChartModel): ChartModel {
 }
 
 
-export function isClassicMarkerSeries(
+function isClassicMarkerSeries(
   chart: ChartModel,
   series: ChartSeries,
   group: NonNullable<ChartModel['plotGroups']>[number] | undefined,
@@ -607,7 +607,7 @@ export function isClassicMarkerSeries(
 }
 
 
-export function chartStyleRoleMarker(
+function chartStyleRoleMarker(
   chart: ChartModel,
   direct: ChartSeries,
   index: number,
@@ -779,7 +779,7 @@ export interface EffectiveFrameLineStyle {
 /** Merge one chart-frame outline property-by-property. Direct DrawingML paint
  * and dash choices remain authoritative; linked Chart Style geometry fills
  * only genuinely omitted properties. */
-export function effectiveFrameLineStyle(
+function effectiveFrameLineStyle(
   chart: ChartModel,
   direct: EffectiveFrameLineStyle,
   linked: ChartExStyle | null | undefined,
@@ -912,7 +912,7 @@ export function effectiveLinkedLabelBox(
  * cannot be resolved to a Canvas paint; omitted geometry continues to inherit
  * from the lower-precedence series/linked shape. */
 
-export function chartStyleRoleDataLabels(
+function chartStyleRoleDataLabels(
   chart: ChartModel,
   direct: ChartSeriesDataLabels,
   styleIndex: number,
@@ -1040,7 +1040,7 @@ export function chartStyleRoleTrendlineLabel(
 }
 
 
-export function chartStyleRoleDataLabelOverride(
+function chartStyleRoleDataLabelOverride(
   chart: ChartModel,
   direct: ChartDataLabelOverride,
   seriesDirect: ChartSeriesDataLabels | null | undefined,
@@ -1123,7 +1123,7 @@ export function chartStyleRoleDataLabelOverride(
 }
 
 
-export function chartStyleRoleLegend(chart: ChartModel): ChartModel {
+function chartStyleRoleLegend(chart: ChartModel): ChartModel {
   const linked = chart.chartStyleRoles?.legend;
   const rawLinked = rawLinkedChartStyleRole(chart, 'legend');
   if (!linked && !chart.chartTextStyle) return chart;
@@ -1239,7 +1239,7 @@ export function chartStyleRoleLegend(chart: ChartModel): ChartModel {
 /** Resolve a chart text paint as one atomic DrawingML component. Authored
  * noFill and paints that cannot be represented by Canvas become transparent;
  * neither may reveal a lower linked/numeric/default colour. */
-export function effectiveChartTextPaint(
+function effectiveChartTextPaint(
   directColor: string | null | undefined,
   directAuthored: boolean | null | undefined,
   linked: ChartExStyle | null | undefined,
@@ -1267,7 +1267,7 @@ export function effectiveChartTextPaint(
 /** Resolve the chart-wide txPr between element-local text and the style role.
  * Paint remains atomic so an authored noFill/unresolved chart default cannot
  * leak through to linked or numeric colors. */
-export function effectiveInheritedChartTextPaint(
+function effectiveInheritedChartTextPaint(
   chart: ChartModel,
   directColor: string | null | undefined,
   directAuthored: boolean | null | undefined,
@@ -1282,7 +1282,7 @@ export function effectiveInheritedChartTextPaint(
 }
 
 
-export function chartStyleRolePlotArea(chart: ChartModel): ChartModel {
+function chartStyleRolePlotArea(chart: ChartModel): ChartModel {
   // MS-ODRAWXML defines plotArea and plotArea3D as separate required style
   // entries. Do not infer one from the other in a malformed/partial sidecar;
   // direct chart formatting stays authoritative below.
@@ -1459,7 +1459,7 @@ export function chartStyleRoleChartArea(chart: ChartModel): ChartModel {
  * consumes directly from `ChartSeries`. Keeping this projection in core means
  * the 2-D, 3-D, DOCX, XLSX, and PPTX paths receive one effective precedence
  * result without teaching an optional renderer about package sidecars. */
-export function withOfficeStyleRasterLineFloor(chart: ChartModel, ptToPx: number): ChartModel {
+function withOfficeStyleRasterLineFloor(chart: ChartModel, ptToPx: number): ChartModel {
   const roles = chart.chartStyleRoles;
   if (!roles || !(Number.isFinite(ptToPx) && ptToPx > 0)) return chart;
   // Office keeps the authored/theme width in its vector output (for example,

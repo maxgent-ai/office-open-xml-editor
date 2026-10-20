@@ -1,4 +1,4 @@
-//! Measurement and bounded serialization of JSON resources.
+//! Shared serialization and measurement of JSON resources.
 //!
 //! The JSON byte count is the exact output size produced by `serde_json`. The
 //! string-value count measures decoded UTF-8 content and deliberately excludes
@@ -10,6 +10,65 @@ use std::io::{self, Write};
 
 use crate::package_session::PackageLimitReporter;
 use crate::resource::HardResourceLimitKind;
+
+// One concrete sink adapter keeps the entire model Serialize tree shared by
+// buffer, bounded-buffer and measurement callers. Dispatch directly to each
+// writer rather than paying a virtual call for every JSON token. Keep the
+// boundary out of line so LTO cannot specialize it for each output mode again.
+enum JsonWriter<'a> {
+    Buffer(&'a mut Vec<u8>),
+    Limited(&'a mut LimitedJsonWriter),
+    Measurement(&'a mut JsonMeasurementWriter),
+}
+
+impl Write for JsonWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Buffer(writer) => writer.write(bytes),
+            Self::Limited(writer) => writer.write(bytes),
+            Self::Measurement(writer) => writer.write(bytes),
+        }
+    }
+
+    fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        // Delegate the same token-sized writes as serde's original writer.
+        // In particular, buffering/coalescing them would change the first
+        // rejected write's observation at a bounded JSON ceiling.
+        match self {
+            Self::Buffer(writer) => writer.write_all(bytes),
+            Self::Limited(writer) => writer.write_all(bytes),
+            Self::Measurement(writer) => writer.write_all(bytes),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[inline(never)]
+fn write_json<T: Serialize + ?Sized>(
+    value: &T,
+    writer: &mut JsonWriter<'_>,
+) -> Result<(), serde_json::Error> {
+    serde_json::to_writer(writer, value)
+}
+
+/// Compact serde JSON bytes with the ordinary, unbounded Vec allocation policy.
+/// Unlike bounded output, this path adds no resource ceiling or error prefix.
+pub fn serialize_json<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, serde_json::Error> {
+    // Match serde_json::to_vec's initial reservation as well as its growth.
+    let mut bytes = Vec::with_capacity(128);
+    write_json(value, &mut JsonWriter::Buffer(&mut bytes))?;
+    Ok(bytes)
+}
+
+/// String form of the same serializer, retaining serde's UTF-8 JSON bytes.
+pub fn serialize_json_string<T: Serialize + ?Sized>(
+    value: &T,
+) -> Result<String, serde_json::Error> {
+    serialize_json(value).map(|bytes| String::from_utf8(bytes).expect("serde JSON is UTF-8"))
+}
 
 /// Independent hard bound on one serialized JSON buffer: a single `Vec<u8>`
 /// can never exceed `isize::MAX` bytes on the compiled target (2147483647 on
@@ -92,7 +151,7 @@ fn serialize_json_limited<T: Serialize>(
         limit,
         exceeded: None,
     };
-    if let Err(error) = serde_json::to_writer(&mut writer, value) {
+    if let Err(error) = write_json(value, &mut JsonWriter::Limited(&mut writer)) {
         if let Some(observed) = writer.exceeded {
             return Err(LimitedJsonError::LimitExceeded { observed });
         }
@@ -375,7 +434,7 @@ impl Write for JsonMeasurementWriter {
 /// Measures exact serde JSON bytes and decoded UTF-8 bytes in string values.
 pub fn measure_json<T: Serialize>(value: &T) -> Result<JsonMeasurement, String> {
     let mut counter = JsonMeasurementWriter::default();
-    serde_json::to_writer(&mut counter, value)
+    write_json(value, &mut JsonWriter::Measurement(&mut counter))
         .map_err(|error| format!("serialize measurement error: {error}"))?;
     counter
         .finish()
@@ -390,6 +449,8 @@ mod tests {
     fn bounded_serialization_preserves_bytes_and_rejects_the_first_overflow() {
         let value = serde_json::json!({"text": "quote\" slash\\ é😀", "items": [1, null, true]});
         let expected = serde_json::to_vec(&value).unwrap();
+        assert_eq!(serialize_json(&value).unwrap(), expected);
+        assert_eq!(serialize_json_string(&value).unwrap().as_bytes(), expected);
         assert_eq!(
             serialize_json_limited(&value, expected.len() as u64).unwrap(),
             expected
@@ -429,6 +490,20 @@ mod tests {
                 Err(serde::ser::Error::custom("failed value"))
             }
         }
+        assert_eq!(
+            serialize_json(&FailingValue).unwrap_err().to_string(),
+            "failed value"
+        );
+        assert_eq!(
+            serialize_json_string(&FailingValue)
+                .unwrap_err()
+                .to_string(),
+            "failed value"
+        );
+        assert_eq!(
+            measure_json(&FailingValue).unwrap_err(),
+            "serialize measurement error: failed value"
+        );
         assert_eq!(
             serialize_json_with_limit(
                 &FailingValue,

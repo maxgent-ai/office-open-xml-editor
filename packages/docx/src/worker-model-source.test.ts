@@ -39,7 +39,7 @@ vi.mock('./wasm/docx_parser.js', () => ({
 }));
 
 const source: ModelSourceModuleDescriptor = {
-  protocol: 'ooxml-model-source-module/v1',
+  protocol: 'ooxml-model-source-module/v2',
   target: 'docx',
   moduleUrl: 'https://example.test/source.mjs',
   config: {},

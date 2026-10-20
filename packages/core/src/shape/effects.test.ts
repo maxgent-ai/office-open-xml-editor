@@ -1,10 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   applyOuterShadow,
-  applyInnerShadow,
   applySoftEdge,
   applyReflection,
   createAuxCanvas,
+  createRasterCoveragePaint,
+  rasterEffectCoverageBounds,
 } from './effects';
 import { createAuxCanvasForContext } from '../canvas/aux-canvas';
 import type { Shadow, SoftEdge, Reflection } from '../types/common';
@@ -83,6 +84,57 @@ const DEVICE_H = 600;
 // scale is px-per-EMU; 1 px == 9525 EMU in DrawingML, but the effect helper just
 // multiplies, so pick a scale where the arithmetic is easy to read.
 const SCALE = 1 / 9525; // 9525 EMU -> 1 px
+
+describe('raster effect coverage allocation', () => {
+  afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); });
+
+  it.each([
+    { width: 4096, height: 4096, bbox: { x: 10, y: 10, w: 4076, h: 4076 } },
+    { width: 32767, height: 1, bbox: { x: 10, y: 0, w: 32747, h: 1 } },
+  ])('keeps coverage available at the supported $width × $height boundary', ({ width, height, bbox }) => {
+    const allocations: number[][] = [];
+    vi.stubGlobal('OffscreenCanvas', class {
+      constructor(w: number, h: number) { allocations.push([w, h]); }
+      getContext() {
+        // Exercise the allocation guard without allocating a maximum-size
+        // backing store or readback buffer. Pixel semantics are covered by
+        // the real-canvas effect suites.
+        return Object.assign(new RecordingCtx(), {
+          getImageData: () => ({ data: new Uint8ClampedArray(0) }),
+          putImageData: () => {},
+        });
+      }
+    });
+    const bounds = rasterEffectCoverageBounds(bbox, {
+      softEdge: { radius: 8 },
+      innerShadow: { color: '000000', alpha: 0.5, blur: 2, dist: 2, dir: 0 },
+    }, 1, width, height);
+
+    const coverage = createRasterCoveragePaint(() => {}, bounds);
+
+    expect(coverage).toBeTypeOf('function');
+    expect(allocations).toEqual([[width, height]]);
+    const live = new RecordingCtx();
+    coverage?.(live as never);
+    expect(live.ops.find(op => op.op === 'drawImage')?.args?.slice(1)).toEqual([0, 0]);
+  });
+
+  it('rejects an oversized source before allocation and warns once about omitted effects', () => {
+    const allocate = vi.fn();
+    vi.stubGlobal('OffscreenCanvas', allocate);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const paint = vi.fn();
+    const bbox = { x: 0, y: 0, w: 4097, h: 4096 };
+
+    expect(createRasterCoveragePaint(paint, bbox)).toBeNull();
+    expect(createRasterCoveragePaint(paint, bbox)).toBeNull();
+
+    expect(allocate).not.toHaveBeenCalled();
+    expect(paint).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('soft edge and inner shadow omitted'));
+  });
+});
 
 describe('createAuxCanvas', () => {
   afterEach(() => vi.unstubAllGlobals());
@@ -222,43 +274,6 @@ describe('applyOuterShadow (ECMA-376 §20.1.8.45)', () => {
       o.op === 'translate' || o.op === 'rotate' || o.op === 'transform');
     expect(transforms[0]).toEqual({ op: 'translate', args: [1, 0] });
     expect(transforms.some(o => o.op === 'rotate')).toBe(false);
-  });
-});
-
-describe('applyInnerShadow (ECMA-376 §20.1.8.40)', () => {
-  let fake: { auxCtxs: RecordingCtx[] };
-  beforeEach(() => { fake = installFakeCanvas(); });
-  afterEach(() => vi.unstubAllGlobals());
-
-  const shadow: Shadow = { color: '404040', alpha: 0.8, blur: 19050, dist: 9525, dir: 90 };
-
-  it('paints silhouette, carves an offset+blurred copy, clips, then blits', () => {
-    const live = new RecordingCtx();
-    const paint = vi.fn((c: unknown) => { (c as RecordingCtx).ops.push({ op: 'paintShape' }); });
-    applyInnerShadow(live as never, paint as never, BBOX, shadow, SCALE, DEVICE_W, DEVICE_H);
-
-    expect(fake.auxCtxs).toHaveLength(1);
-    const aux = fake.auxCtxs[0];
-    const ops = aux.ops.map(o => o.op);
-    // 3 silhouette paints on the aux canvas: colour fill, destination-out, destination-in.
-    expect(ops.filter(o => o === 'paintShape')).toHaveLength(3);
-    // The blurred offset pass translates by (cos90*dist, sin90*dist) = (0, 1px).
-    const translate = aux.ops.find(o => o.op === 'translate');
-    expect(translate?.args?.[0]).toBeCloseTo(0, 6);
-    expect(translate?.args?.[1]).toBeCloseTo(1, 6); // dist 9525 EMU * scale = 1px, dir=90 -> +y
-    // Result is composited onto the live context exactly once.
-    const liveDraws = live.ops.filter(o => o.op === 'drawImage');
-    expect(liveDraws).toHaveLength(1);
-  });
-
-  it('skips the blur filter when blurRad is 0', () => {
-    const live = new RecordingCtx();
-    const paint = vi.fn();
-    const noBlur: Shadow = { ...shadow, blur: 0 };
-    // Spy on the filter assignments by recording them via a getter/setter proxy
-    // is overkill; instead assert no throw and a single blit (smoke).
-    applyInnerShadow(live as never, paint as never, BBOX, noBlur, SCALE, DEVICE_W, DEVICE_H);
-    expect(live.ops.filter(o => o.op === 'drawImage')).toHaveLength(1);
   });
 });
 

@@ -1,4 +1,4 @@
-import { normalizeXlsxWorksheetPolicy } from '@silurus/ooxml-core/worker';
+import { normalizeXlsxWorksheetPolicy } from './worksheet-policy.js';
 import { describe, expect, it } from 'vitest';
 import type { Worksheet } from '../types.js';
 import { WorksheetViewProjectionCache } from '../worker-protocol.js';

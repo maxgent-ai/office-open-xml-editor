@@ -10,6 +10,9 @@ export interface GapSegment {
   spacePx: number;
   /** Contextual per-space advances, indexed in code points. */
   spaceWidths?: ReadonlyMap<number, number>;
+  /** WORD_EAST_ASIAN_AUTO_SPACE gap included in `widthPx` before the first
+   * character; a gap of the same family as U+0020. */
+  leadingGapPx?: number;
 }
 
 export const textCellGapOptions: DistributeOptions = {
@@ -53,6 +56,7 @@ export function lineGapModel(
     prefix: prefix?.scan,
     collect,
     gapWidth: (si, cpOffset) => segments[si - offset].spaceWidths?.get(cpOffset) ?? segments[si - offset].spacePx,
+    leadingGapWidth: (si) => segments[si - offset]?.leadingGapPx ?? 0,
   });
   let naturalWidthPx = prefix?.naturalWidthPx ?? 0;
   let lineEndSeparatorPx = prefix?.lineEndSeparatorPx ?? 0;
@@ -91,7 +95,10 @@ export function candidateUnit(first: LayoutSeg, queue: Iterable<LayoutSeg>): Lay
   let hasSeparator = first.text.endsWith(' ');
   for (const next of queue) {
     if (!('text' in next) || next.ruby || next.fitTextRegionIndex !== undefined
-      || (hasSeparator && /[^ ]/u.test(next.text) && !next.joinPrev && !next.hardJoinPrev)) break;
+      || (hasSeparator && /[^ ]/u.test(next.text) && !next.joinPrev && !next.hardJoinPrev)
+      // A WORD_EAST_ASIAN_AUTO_SPACE seam is a legal East Asian/Latin break
+      // (UAX #14) unless segmentation glued it.
+      || (next.autoSpaceBeforePt !== undefined && !next.joinPrev && !next.hardJoinPrev)) break;
     segments.push(next);
     if (next.text.length > 0) hasSeparator = next.text.endsWith(' ');
   }

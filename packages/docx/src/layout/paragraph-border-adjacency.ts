@@ -21,7 +21,8 @@ export interface ParagraphBorderSegment {
 }
 
 /** Vertical extent reserved below text for a visible bottom paragraph border.
- * ECMA-376 §17.3.1.7 places the centered stroke after `w:space`. */
+ * ECMA-376 §17.3.1.7 places the centered stroke after `w:space`.
+ * `word-paragraph-border-flow-reservation` */
 export function bottomBorderExtentPt(
   borders: ParagraphBorders | null | undefined,
   merge?: ParagraphBorderMerge,

@@ -6,7 +6,9 @@ import type { LayoutVariantStore } from './variant-store.js';
 import type { VerticalGlyphMeasurementService } from './measurement-capabilities.js';
 import type { LayoutSourceStore } from './layout-source-store.js';
 import type { LayoutOptions } from './options.js';
-import { LayoutInvariantError } from './diagnostics.js';
+import { createPaginationWorkBudget, type PaginationWorkBudget } from './pagination-work-budget.js';
+import { createHeaderFooterLayoutCache } from './header-footer-layout-cache.js';
+import type { StoryLayoutCache } from './story-layout-cache.js';
 import { createFootnoteAcquisitionWorkBudget, type FootnoteAcquisitionWorkBudget } from './resource-budgets.js';
 
 export interface DocumentLayoutRuntimeState {
@@ -99,34 +101,18 @@ export interface ParagraphAcquisitionRuntimeCache {
   getLineBreaking(input: object, key: string): unknown;
   setLineBreaking(input: object, key: string, value: unknown): void;
   noteMiss(): void;
+  readonly workBudget: PaginationWorkBudget;
 }
 
-/**
- * Fail closed before cache-missed paragraph acquisition can exhaust the host.
- * One pagination session may incur 25,000 misses; miss 25,001 throws
- * NON_CONVERGENCE. Each paragraph retains only its two most recent placements.
- * The budget belongs to the pagination cache scope so field-convergence service
- * views cannot reset it while sharing the same retained acquisition values.
- * Speculative re-layouts that page-placed content (header/footer root
- * cell-owner hosts, positioned tables of story and nested tables) nests
- * inside one another are charged to the same budget, so nested solves are
- * bounded in aggregate, not only per loop: a story laid out for a trial band
- * or page frames (production-body-layout.ts createStoryLayoutCache) and a
- * nested table laid out whole through a page origin (table-pagination.ts
- * layoutNestedWhole). Documents without such content incur none of them.
- *
- * Scope and cleanup: the count is owned by one pagination scope
- * (createParagraphAcquisitionCacheServicesView, opened per document layout),
- * never by the document services or source, so a later layout starts fresh.
- * The miss that crosses the budget throws before its acquisition runs; the
- * caches retain only completed acquisitions (story-layout-cache.ts) and the
- * immutable source is never written, so a failed session leaves nothing.
- * Converging nested solves reach their retained trial placements again and
- * are not charged twice for them; what the budget still bounds is speculative
- * work that keeps producing new placements, each per-solve limit permitting
- * it (story-layout-cache.test.ts: charging, release and fail-closed order).
- */
-export const PARAGRAPH_ACQUISITION_MISS_BUDGET = 25_000;
+/** Minimum operational allowance; source-sized pagination scopes may receive more.
+ * See pagination-work-budget.ts for the aggregate cap and credit ownership. */
+export { PARAGRAPH_ACQUISITION_MISS_BUDGET } from './pagination-work-budget.js';
+
+const headerFooterLayoutCaches = new WeakMap<LayoutServices, StoryLayoutCache>();
+
+export function headerFooterLayoutCacheOf(services: LayoutServices): StoryLayoutCache | undefined {
+  return headerFooterLayoutCaches.get(services);
+}
 
 const paragraphAcquisitionCaches = new WeakMap<
   LayoutServices,
@@ -138,7 +124,7 @@ export function footnoteAcquisitionWorkBudgetOf(services: LayoutServices): Footn
   return footnoteAcquisitionWorkBudgets.get(services);
 }
 
-function createParagraphAcquisitionRuntimeCache(): ParagraphAcquisitionRuntimeCache {
+function createParagraphAcquisitionRuntimeCache(workBudget: PaginationWorkBudget): ParagraphAcquisitionRuntimeCache {
   const identities = new WeakMap<object, number>();
   const results = new WeakMap<object, Map<string, unknown>>();
   const lineBreaks = new WeakMap<object, Map<string, unknown>>();
@@ -152,7 +138,7 @@ function createParagraphAcquisitionRuntimeCache(): ParagraphAcquisitionRuntimeCa
   // this map keeps each string itself (no copy), so ordinals stay one-to-one.
   const fingerprintOrdinals = new Map<string, number>();
   let nextIdentity = 1;
-  let missCount = 0;
+
   return Object.freeze({
     objectIdentity(value: object): number {
       let retained = identities.get(value);
@@ -239,15 +225,8 @@ function createParagraphAcquisitionRuntimeCache(): ParagraphAcquisitionRuntimeCa
       // paragraph. Bound them separately from its two retained placements.
       while (byKey.size > 2) byKey.delete(byKey.keys().next().value!);
     },
-    noteMiss(): void {
-      missCount += 1;
-      if (missCount > PARAGRAPH_ACQUISITION_MISS_BUDGET) {
-        throw new LayoutInvariantError(
-          'NON_CONVERGENCE',
-          `layout acquisition exceeded the operational miss budget ${PARAGRAPH_ACQUISITION_MISS_BUDGET}`,
-        );
-      }
-    },
+    workBudget,
+    noteMiss: () => workBudget.noteMiss(),
   });
 }
 
@@ -404,6 +383,8 @@ export function createLayoutServicesRuntimeView(
   if (registry) paintResourceRegistries.set(view, registry);
   const paragraphCache = paragraphAcquisitionCaches.get(services);
   if (paragraphCache) paragraphAcquisitionCaches.set(view, paragraphCache);
+  const storyCache = headerFooterLayoutCaches.get(services);
+  if (storyCache) headerFooterLayoutCaches.set(view, storyCache);
   const footnoteBudget = footnoteAcquisitionWorkBudgets.get(services);
   if (footnoteBudget) footnoteAcquisitionWorkBudgets.set(view, footnoteBudget);
   return view;
@@ -416,7 +397,9 @@ export function createParagraphAcquisitionCacheServicesView(
   services: LayoutServices,
 ): LayoutServices {
   const view = createLayoutServicesRuntimeView(services);
-  paragraphAcquisitionCaches.set(view, createParagraphAcquisitionRuntimeCache());
+  const workBudget = createPaginationWorkBudget(layoutSourceStoreOf(services));
+  paragraphAcquisitionCaches.set(view, createParagraphAcquisitionRuntimeCache(workBudget));
+  headerFooterLayoutCaches.set(view, createHeaderFooterLayoutCache(() => workBudget.noteMiss()));
   if (services.allowFootnoteContinuation === true) {
     footnoteAcquisitionWorkBudgets.set(view, createFootnoteAcquisitionWorkBudget());
   }

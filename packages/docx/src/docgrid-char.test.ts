@@ -93,6 +93,8 @@ function para(
     alignment?: string;
     runSnapToGrid?: boolean;
     paragraphSnapToGrid?: boolean;
+    /** §17.3.1.2-3 automatic East Asian/Latin spacing (default on). */
+    autoSpace?: boolean;
   } = {},
 ): BodyElement {
   const fontSize = opts.fontSize ?? FONT_PX;
@@ -108,6 +110,10 @@ function para(
   };
   if (opts.paragraphSnapToGrid !== undefined) {
     p.snapToGrid = opts.paragraphSnapToGrid;
+  }
+  if (opts.autoSpace === false) {
+    p.autoSpaceDE = false;
+    p.autoSpaceDN = false;
   }
   return { type: 'paragraph', ...p } as BodyElement;
 }
@@ -202,7 +208,8 @@ describe('docGrid character grid — measure==draw invariant (§17.6.5)', () => 
 
   it('keeps every segment of an opted-out mixed-script run off the grid', async () => {
     const rendered = await renderRun(
-      [para('あA本', { runSnapToGrid: false })],
+      // Grid pitch alone: no automatic East Asian/Latin gap (§17.3.1.2).
+      [para('あA本', { runSnapToGrid: false, autoSpace: false })],
       section(charGrid(4096)),
     );
 
@@ -271,7 +278,8 @@ describe('docGrid character grid — measure==draw invariant (§17.6.5)', () => 
     const charSpace = -1161;
     const pitchedAdvance = FONT_PX + charSpace / 4096;
     const { runs, fillTextCalls } = await renderRun(
-      [para('あA本')],
+      // Grid pitch alone: no automatic East Asian/Latin gap (§17.3.1.2).
+      [para('あA本', { autoSpace: false })],
       section(charGrid(charSpace)),
     );
 

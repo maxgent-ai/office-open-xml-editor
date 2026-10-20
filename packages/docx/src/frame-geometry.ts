@@ -365,9 +365,9 @@ export function pushFloatRect(state: FloatRegistrationState, o: PushFloatOpts): 
       moving,
       blockers: state.floats.map(floatRectParticipant),
       avoidance: o.kind === 'table'
-        ? floatingTableAvoidance(o.tableOverlap!, o.paraId)
+        ? floatingTableAvoidance()
         : o.kind === 'frame'
-          ? frameAvoidance(o.paraId)
+          ? frameAvoidance()
           : drawingMLAvoidance(o.allowOverlap ?? true),
       rightBoundaryPt: state.pageWidth,
       overlapEpsilonPt: FLOAT_OVERLAP_EPS,

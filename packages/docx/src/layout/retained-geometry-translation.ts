@@ -62,13 +62,21 @@ function translateDrawingCommand(command: DrawingPaintCommand, delta: LayoutTran
   if (command.kind === 'noop') return command;
   if (command.kind === 'drawingml-shape' || command.kind === 'drawingml-image-fill') return {
     ...command,
+    ...(command.kind === 'drawingml-shape' && command.concentricFill?.bounds ? { concentricFill: { ...command.concentricFill, bounds: translateRect(command.concentricFill.bounds, delta) } } : {}),
+    ...(command.kind === 'drawingml-image-fill' && command.maskBounds ? { maskBounds: translateRect(command.maskBounds, delta) } : {}),
     plan: { ...command.plan, rect: {
       ...command.plan.rect,
       x: command.plan.rect.x + delta.xPt,
       y: command.plan.rect.y + delta.yPt,
     } },
   };
-  return { ...command, rect: translateRect(command.rect, delta) };
+  return { ...command,
+    ...(command.kind === 'watermark-text' && command.glyphTransform ? { glyphTransform: {
+      ...command.glyphTransform,
+      e: command.glyphTransform.e + delta.xPt - command.glyphTransform.a * delta.xPt - command.glyphTransform.c * delta.yPt,
+      f: command.glyphTransform.f + delta.yPt - command.glyphTransform.b * delta.xPt - command.glyphTransform.d * delta.yPt,
+    } } : {}),
+    ...(command.kind === 'watermark-text' && command.maskBounds ? { maskBounds: translateRect(command.maskBounds, delta) } : {}), rect: translateRect(command.rect, delta) };
 }
 
 export function translateDrawing(drawing: DrawingLayout, delta: LayoutTranslation): DrawingLayout {
@@ -328,6 +336,7 @@ function translateTextBoxWithContext(
     flowBounds: translateRect(textBox.flowBounds, delta), inkBounds: translateRect(textBox.inkBounds, delta),
     ...(textBox.clipBounds ? { clipBounds: pageRelativeContent
       ? translateRect(textBox.clipBounds, delta) : textBox.clipBounds } : {}),
+    ...(textBox.clipRects ? { clipRects: pageRelativeContent ? textBox.clipRects.map(rect => translateRect(rect, delta)) : textBox.clipRects } : {}),
     ...(textBox.contentBounds ? { contentBounds: pageRelativeContent
       ? translateRect(textBox.contentBounds, delta) : textBox.contentBounds } : {}),
     transform: pageRelativeContent ? textBox.transform : {

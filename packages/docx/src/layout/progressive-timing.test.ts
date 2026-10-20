@@ -1,5 +1,5 @@
 import { writeFileSync } from 'node:fs';
-import { beforeAll, describe, expect, it } from 'vitest';
+import { vi, beforeAll, describe, expect, it } from 'vitest';
 import { createLayoutServices } from '../layout-runtime.js';
 import { layoutSourceStore } from '../layout-source-model-adapter.js';
 import {
@@ -10,7 +10,7 @@ import {
 import { paginateBody } from './body-paginator.js';
 import { layoutOptionsForRender } from './options.js';
 import { layoutDocumentProgressively } from './progressive.js';
-import { setDocumentLayoutValidation } from './validation-policy.js';
+import { setDocumentLayoutValidation } from '../testing/validation-policy.js';
 
 /**
  * Progressive-layout latency harness. Run with `pnpm bench:progressive`; it is
@@ -117,8 +117,8 @@ describe.skipIf(!ENABLED)('progressive layout latency', () => {
 
   beforeAll(() => {
     ({ measureTextCalls } = installStubCanvas());
-    // `validation-policy.ts` turns path-precise retained-layout validation ON
-    // whenever VITEST is set. Leaving it on would measure what CI pays, not
+    // The test mock enables path-precise retained-layout validation. Leaving
+    // it on would measure the extra diagnostic traversal instead of
     // what a shipped viewer pays.
     setDocumentLayoutValidation(false);
   });
@@ -266,3 +266,5 @@ describe.skipIf(!ENABLED)('progressive layout latency', () => {
     expect(rows).toHaveLength(CASES.length);
   }, 1_800_000);
 });
+
+vi.mock('./validation-policy.js', () => ({ documentLayoutValidationEnabled: vi.fn(() => true) }));

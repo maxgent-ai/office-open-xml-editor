@@ -44,30 +44,12 @@ export function resolveMathJaxAssetUrl(): string {
   return new URL(mathjaxAssetUrl, import.meta.url).href;
 }
 
-function normalizedAssetUrl(assetUrl?: string): string {
-  return assetUrl ? new URL(assetUrl, import.meta.url).href : resolveMathJaxAssetUrl();
-}
-
 /** Preload the math engine. Call once before rendering equations. */
 export async function loadMathJax(): Promise<void> {
   await loadMathJaxFromResolvedAsset(resolveMathJaxAssetUrl());
 }
 
-/** Internal worker entry: use the asset URL resolved by the consumer bundler
- * in the main realm instead of resolving relative to an opaque worker asset. */
-export async function loadMathJaxFromAsset(assetUrl: string): Promise<void> {
-  await loadMathJaxFromResolvedAsset(normalizedAssetUrl(assetUrl));
-}
-
 /** Convert a MathML string to a standalone SVG + its baseline-relative extents. */
 export async function mathMLToSvg(mathml: string): Promise<MathSvg> {
   return mathMLToSvgFromResolvedAsset(mathml, resolveMathJaxAssetUrl());
-}
-
-/** Internal worker entry paired with {@link loadMathJaxFromAsset}. */
-export async function mathMLToSvgFromAsset(
-  mathml: string,
-  assetUrl: string,
-): Promise<MathSvg> {
-  return mathMLToSvgFromResolvedAsset(mathml, normalizedAssetUrl(assetUrl));
 }

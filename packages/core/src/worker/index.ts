@@ -6,6 +6,8 @@ export {
   type WorkerRequestOptions,
 } from './bridge.js';
 export { decodeDataUrl } from './decode-data-url.js';
+// Parser adapters share the wire error class without loading the rendering barrel.
+export { OoxmlError } from '../errors/ooxml-error.js';
 export {
   WasmParserHost,
   WasmTrapError,
@@ -22,7 +24,9 @@ export {
   decodeOoxmlResourceUsage,
   deserializeWorkerError,
   parseResourceLimitError,
+  withWasmResourceErrors,
   parseTypedParserError,
+  resourceLimitMessage,
   serializeWorkerError,
   type WorkerErrorPayload,
 } from './error-wire.js';
@@ -33,6 +37,7 @@ export {
   isPullSessionInsufficientCreditError,
   normalizePullSessionInsufficientCreditError,
   parsePullSessionInsufficientCreditError,
+  pullWithCreditRetry,
   requiredPullCredit,
   type PullSessionInsufficientCreditDetails,
 } from './pull-credit-error.js';
@@ -59,13 +64,6 @@ export {
   type NormalizedOoxmlResourceOptions,
   type NormalizedOoxmlResourcePolicy,
 } from './resource-policy.js';
-export {
-  DEFAULT_XLSX_WORKSHEET_POLICY,
-  normalizeXlsxWorksheetPolicy,
-  xlsxWorksheetPolicyForWasm,
-  type NormalizedXlsxWorksheetPolicy,
-  type ResolvedXlsxWorksheetLimits,
-} from './xlsx-worksheet-policy.js';
 export {
   OOXML_RESOURCE_METRICS_PROBE_TIMEOUT_MS,
   OoxmlResourceMetricsSession,
@@ -110,7 +108,6 @@ export {
   WorkerSvgDecodeClient,
   boundedSvgRasterSize,
   decodeSvgBlobOnMainThread,
-  isWorkerSvgDecodeRequest,
   isWorkerSvgDecodeResponse,
   respondToWorkerSvgDecodeRequest,
   type SvgBlobDecoder,
@@ -120,7 +117,6 @@ export {
 } from './svg-decode-bridge.js';
 export {
   BoundedPullSession,
-  DEFAULT_PULL_CANCEL_GRACE_MS,
   PULL_SESSION_PROTOCOL,
   PullSessionHost,
   PullSessionHostCoordinator,

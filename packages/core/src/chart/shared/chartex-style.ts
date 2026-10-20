@@ -40,7 +40,7 @@ export function chartExStyleColor(
 }
 
 
-export function chartExPaletteColor(
+function chartExPaletteColor(
   chart: ChartModel,
   colors: ReadonlyArray<string | null | undefined>,
   colorIndex: number,
@@ -64,7 +64,7 @@ export function chartExPaletteColor(
 }
 
 
-export function chartExSemanticFill(chart: ChartModel, index: number, count: number): string {
+function chartExSemanticFill(chart: ChartModel, index: number, count: number): string {
   return (chart.chartexColorPalette
       ? chartExPaletteColor(chart, chart.chartexColorPalette, index, count)
       : null)

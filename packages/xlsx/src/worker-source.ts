@@ -1,3 +1,9 @@
+import {
+  normalizeXlsxWorksheetPolicy,
+  xlsxWorksheetPolicyForWasm,
+  DEFAULT_XLSX_WORKSHEET_POLICY,
+  type NormalizedXlsxWorksheetPolicy,
+} from './internal/worksheet-policy.js';
 import init, { XlsxArchive, reinit } from './wasm/xlsx_parser.js';
 import {
   decodeDataUrl,
@@ -7,10 +13,6 @@ import {
   decodeOoxmlResourceUsage,
   resourcePolicyForWasm,
   serializeWorkerError,
-  normalizeXlsxWorksheetPolicy,
-  xlsxWorksheetPolicyForWasm,
-  DEFAULT_XLSX_WORKSHEET_POLICY,
-  type NormalizedXlsxWorksheetPolicy,
   type PullSessionCommand,
 } from '@silurus/ooxml-core/worker';
 import type { WorkerRequest, WorkerResponse } from './types.js';

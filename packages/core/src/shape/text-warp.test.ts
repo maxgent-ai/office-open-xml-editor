@@ -3,7 +3,6 @@ import {
   buildWarpEnvelope,
   followPathUScale,
   hasTextWarp,
-  isSingleEdgeWarp,
   samplePolyline,
   warpGlyphTransform,
   warpArcLength,
@@ -24,11 +23,12 @@ describe('text-warp preset registry', () => {
   });
 
   it('classifies single-edge (arch/circle) vs paired-edge warps', () => {
-    expect(isSingleEdgeWarp('textArchUp')).toBe(true);
-    expect(isSingleEdgeWarp('textArchDown')).toBe(true);
-    expect(isSingleEdgeWarp('textCircle')).toBe(true);
-    expect(isSingleEdgeWarp('textPlain')).toBe(false);
-    expect(isSingleEdgeWarp('textWave1')).toBe(false);
+    const singleEdge = (preset: string) => buildWarpEnvelope(preset, [], W, H)?.singleEdge;
+    expect(singleEdge('textArchUp')).toBe(true);
+    expect(singleEdge('textArchDown')).toBe(true);
+    expect(singleEdge('textCircle')).toBe(true);
+    expect(singleEdge('textPlain')).toBe(false);
+    expect(singleEdge('textWave1')).toBe(false);
   });
 
   it('returns null for an unknown preset', () => {

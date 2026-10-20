@@ -6,11 +6,11 @@ import {
   GOOGLE_FONT_SUBSTITUTES,
   SCRIPT_GOOGLE_FONTS,
   type FontPreloadEntry,
-  type TextBody,
   type OfficeFontFallbackRequest,
 } from '@silurus/ooxml-core';
 import { ScriptPreloadAccumulator } from '@silurus/ooxml-core/internal/script-preload-accumulator';
-import type { Presentation, Slide, SlideElement } from './types';
+import type { Presentation, Slide, SlideElement, TextBody } from './types';
+import { officeFaceWeight } from './powerpoint-line-metrics.js';
 
 /** Theme-referenced typefaces commonly used by PPTX templates. Keys are
  *  lower-cased family names.
@@ -30,11 +30,29 @@ export const PPTX_GOOGLE_FONTS: Record<string, FontPreloadEntry> = {
   ...SCRIPT_GOOGLE_FONTS,
 };
 
+/** Include authored equation previews in font preparation, so runtime recovery
+ * uses the same fonts in main-thread and worker rendering. Iterators retain
+ * only the branch stack rather than flattening a second slide model. */
+function* fontElements(elements: readonly SlideElement[]): Generator<SlideElement> {
+  const pending: Iterator<SlideElement>[] = [elements[Symbol.iterator]()];
+  while (pending.length) {
+    const next = pending[pending.length - 1].next();
+    if (next.done) { pending.pop(); continue; }
+    const element = next.value;
+    yield element;
+    if ((element.type === 'shape' || element.type === 'table') && element.mathFallback) {
+      pending.push(element.mathFallback.elements[Symbol.iterator]());
+    }
+  }
+}
+
 /** Yield every painted text string in a text body (paragraph runs). */
 function* textBodyRuns(body: TextBody | null | undefined): Generator<string> {
   for (const p of body?.paragraphs ?? []) {
+    for (const fallback of p.mathFallbacks ?? []) yield fallback.text;
     for (const r of p.runs) {
       if (r.type === 'text') yield r.text;
+      if (r.type === 'math' && r.fallbackText) yield r.fallbackText;
     }
   }
 }
@@ -60,7 +78,7 @@ function* textBodyFontFamilies(body: TextBody | null | undefined): Generator<str
  *  cell text and chart labels across all slides. Speaker notes and comments are
  *  not painted on the slide, so they are excluded (the renderer ignores them). */
 export function* pptxSlideTextRuns(slide: Slide): Generator<string> {
-  for (const el of slide.elements as SlideElement[]) {
+  for (const el of fontElements(slide.elements)) {
     if (el.type === 'shape') {
       yield* textBodyRuns(el.textBody);
     } else if (el.type === 'table') {
@@ -96,14 +114,17 @@ export class PptxFontPreloadAccumulator {
   }
 
   addSlide(slide: Slide): void {
+    if (slide.theme?.majorFont) this.families.add(slide.theme.majorFont);
+    if (slide.theme?.minorFont) this.families.add(slide.theme.minorFont);
     this.scripts.addText(pptxSlideTextRuns(slide));
     // Keep the union of per-slide choices: later kana must not remove a Han-only
     // slide's SC preload after that slide has already been published.
     for (const name of scriptPreloadNamesForText(pptxSlideTextRuns(slide),
-      classifyCjkFont(this.majorFont) ?? classifyCjkFont(this.minorFont) ?? this.fallback ?? null)) {
+      classifyCjkFont(slide.theme ? slide.theme.majorFont : this.majorFont)
+        ?? classifyCjkFont(slide.theme ? slide.theme.minorFont : this.minorFont) ?? this.fallback ?? null)) {
       this.scriptNames.add(name);
     }
-    for (const el of slide.elements as SlideElement[]) {
+    for (const el of fontElements(slide.elements)) {
       if (el.type === 'shape') {
         for (const family of textBodyFontFamilies(el.textBody)) this.families.add(family);
       } else if (el.type === 'table') {
@@ -134,33 +155,9 @@ export class PptxFontPreloadAccumulator {
   }
 }
 
-/**
- * The font-family names to preload for a presentation: the theme major/minor
- * fonts, plus only the script-fallback Noto faces whose script the slide TEXT
- * actually contains ({@link PptxFontPreloadAccumulator}). The renderer's canvas
- * font stack still ends with the full Noto set, but eagerly fetching the
- * multi-MB CJK families for a deck with no CJK glyphs would block first paint
- * for nothing; an un-preloaded face loads lazily if it ever proves needed.
- *
- * Single source of truth shared by the main-thread `load()` and the render
- * worker. Both derive the set from the SAME parsed {@link Presentation}, so both
- * modes preload an identical set — worker/main rendering must stay
- * pixel-equivalent.
- */
-export function pptxFontPreloadNames(
-  pres: Presentation,
-  fallback?: CjkLang,
-): (string | null | undefined)[] {
-  const accumulator = new PptxFontPreloadAccumulator(
-    pres.majorFont,
-    pres.minorFont,
-    undefined, undefined, fallback,
-  );
-  for (const slide of pres.slides) accumulator.addSlide(slide);
-  return accumulator.names();
-}
+const CSS_GENERIC_FAMILY_NAMES = new Set(['serif', 'sans-serif', 'monospace', 'cursive', 'fantasy', 'system-ui']);
 
-/** Calibri tuples actually painted by this slide. DrawingML run properties
+/** Authored face tuples actually painted by this slide. DrawingML run properties
  * inherit through paragraph/body defaults (§21.1.2.3.9); theme tokens resolve
  * against the same major/minor values used by the renderer. Loading is delayed
  * until the slide is requested, so unused slides and styles fetch no assets. */
@@ -169,6 +166,7 @@ export function pptxSlideOfficeFontRequests(
   majorFont: string | null,
   minorFont: string | null,
 ): OfficeFontFallbackRequest[] {
+  if (slide.theme) { majorFont = slide.theme.majorFont; minorFont = slide.theme.minorFont; }
   const requests = new Map<string, OfficeFontFallbackRequest>();
   const resolved = (family: string | null | undefined): string | null => {
     // A missing family has no authored or inherited font resource. The theme
@@ -180,14 +178,28 @@ export function pptxSlideOfficeFontRequests(
     return family.split(',')[0]?.trim() ?? null;
   };
   const add = (family: string | null | undefined, bold: boolean, italic: boolean) => {
-    if (resolved(family)?.toLowerCase() !== 'calibri') return;
-    const weight = bold ? 700 : 400;
+    // Every authored face is probed, so layout can admit catalog geometry
+    // only for faces proven present (no family-name gate).
+    const name = resolved(family);
+    if (!name || CSS_GENERIC_FAMILY_NAMES.has(name.toLowerCase())) return;
+    const weight = officeFaceWeight(name, bold, italic);
     const style = italic ? 'italic' : 'normal';
-    requests.set(`${weight}:${style}`, { family: 'Calibri', weight, style });
+    requests.set(`${name.toLowerCase()}:${weight}:${style}`, { family: name, weight, style });
+    // Family presence is probed independently of the styled tuples a slide
+    // uses, so an installed regular-only family stays present for bold runs.
+    requests.set(`presence:${name.toLowerCase()}`, { family: name, presenceOnly: true });
   };
   const body = (textBody: TextBody | null | undefined) => {
     for (const paragraph of textBody?.paragraphs ?? []) {
       for (const run of paragraph.runs) {
+        if (run.type === 'break') {
+          // a:br carries its own character properties (CT_TextLineBreak); the
+          // renderer sizes the break's line with that face.
+          add(run.fontFamily ?? paragraph.defFontFamily,
+            run.bold ?? paragraph.defBold ?? textBody?.defaultBold ?? false,
+            run.italic ?? paragraph.defItalic ?? textBody?.defaultItalic ?? false);
+          continue;
+        }
         if (run.type !== 'text') continue;
         const bold = run.bold ?? paragraph.defBold ?? textBody?.defaultBold ?? false;
         const italic = run.italic ?? paragraph.defItalic ?? textBody?.defaultItalic ?? false;
@@ -195,6 +207,13 @@ export function pptxSlideOfficeFontRequests(
         if (run.fontFamilyEa) add(run.fontFamilyEa, bold, italic);
         if (run.fontFamilyCs) add(run.fontFamilyCs, bold, italic);
         if (run.fontFamilySym) add(run.fontFamilySym, bold, italic);
+      }
+      // a:endParaRPr: the end mark contributes its face to the last line.
+      const end = paragraph.endRunProperties;
+      if (end) {
+        add(end.fontFamily ?? paragraph.defFontFamily,
+          end.bold ?? paragraph.defBold ?? textBody?.defaultBold ?? false,
+          end.italic ?? paragraph.defItalic ?? textBody?.defaultItalic ?? false);
       }
       if (paragraph.bullet.type === 'char' || paragraph.bullet.type === 'autoNum') {
         // The marker renderer uses normal weight/style for both bullet kinds.
@@ -207,7 +226,7 @@ export function pptxSlideOfficeFontRequests(
       }
     }
   };
-  for (const element of slide.elements) {
+  for (const element of fontElements(slide.elements)) {
     if (element.type === 'shape') body(element.textBody);
     if (element.type === 'table') {
       for (const row of element.rows) for (const cell of row.cells) body(cell.textBody);

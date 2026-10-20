@@ -9,9 +9,11 @@ const require = createRequire(new URL('../package.json', import.meta.url));
 const ts = require('typescript-compiler-api');
 const typesDir = path.resolve(process.cwd(), 'dist/types');
 const formats = ['docx', 'pptx', 'xlsx'];
-const files = ['index', ...formats, 'math', 'three-d', 'region-map', 'chart-ex', 'tiff', 'legacy-doc', 'legacy-ppt', 'legacy-xls']
+const files = ['index', ...formats, 'math', 'three-d', 'region-map', 'chart-ex', 'tiff', 'internal-companion', 'node']
   .map((entry) => path.join(typesDir, `${entry}.d.ts`));
 
+const legacyTypesDir = path.resolve('packages/legacy-office/dist/types');
+files.push(...['doc', 'xls', 'ppt'].map(entry => path.join(legacyTypesDir, `${entry}.d.ts`)));
 const program = ts.createProgram(files, {
   module: ts.ModuleKind.ESNext,
   moduleResolution: ts.ModuleResolutionKind.Bundler,
@@ -57,6 +59,7 @@ for (const [index, format] of formats.entries()) {
 const sharedOoxmlTypes = [
   'LoadOptions',
   'OoxmlError',
+  'OoxmlUnsupportedContentDetails',
   'OoxmlErrorStage',
   'OoxmlFormat',
   'OoxmlResourceLimit',
@@ -88,6 +91,14 @@ for (const name of sharedOoxmlTypes) {
   }
 }
 
+const nodeExports = moduleExports(path.join(typesDir, 'node.d.ts'));
+for (const name of ['OoxmlError', 'OoxmlErrorCode', 'OoxmlUnsupportedContentDetails']) {
+  const nodeType = declaredType(nodeExports, name, 'Node');
+  const formatType = declaredType(formatExports[0], name, 'DOCX');
+  assert.ok(checker.isTypeAssignableTo(nodeType, formatType) && checker.isTypeAssignableTo(formatType, nodeType),
+    `Node and format entries disagree on ${name}.`);
+}
+
 const tiffExports = moduleExports(path.join(typesDir, 'tiff.d.ts'));
 assert.deepEqual(
   [...tiffExports.keys()].sort(),
@@ -95,18 +106,21 @@ assert.deepEqual(
   'The ./tiff declaration entry must expose the runtime codec and its shared contract.',
 );
 
-for (const [entry, factory, options] of [
-  ['legacy-doc', 'legacyDocSource', 'LegacyDocSourceOptions'],
-  ['legacy-ppt', 'legacyPptSource', 'LegacyPptSourceOptions'],
-  ['legacy-xls', 'legacyXlsSource', 'LegacyXlsSourceOptions'],
+for (const [entry, constant, factory, options] of [
+  ['doc', 'legacyDoc', 'createLegacyDoc', 'LegacyDocOptions'],
+  ['ppt', 'legacyPpt', 'createLegacyPpt', 'LegacyPptOptions'],
+  ['xls', 'legacyXls', 'createLegacyXls', 'LegacyXlsOptions'],
 ]) {
-  const exports = moduleExports(path.join(typesDir, `${entry}.d.ts`));
+  const exports = moduleExports(path.join(legacyTypesDir, `${entry}.d.ts`));
   assert.deepEqual(
     [...exports.keys()].sort(),
-    [options, factory].sort(),
-    `The ./${entry} declaration entry must expose only its model source factory and options.`,
+    [constant, options, factory].sort(),
+    `The ./${entry} declaration entry must preserve its default model source, factory and option types.`,
   );
 }
+
+assert.deepEqual([...moduleExports(path.join(typesDir, 'internal-companion.d.ts')).keys()].sort(),
+  ['CompanionRuntimeMismatchError', 'MODEL_SOURCE_MODULE_PROTOCOL', 'assertCompanionRuntime'].sort());
 
 process.stdout.write(
   'Published declaration entries compile; root namespace exports and shared OOXML contracts match.\n',

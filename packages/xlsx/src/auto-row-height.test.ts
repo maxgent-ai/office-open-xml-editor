@@ -1,8 +1,12 @@
-import { DEFAULT_XLSX_WORKSHEET_POLICY, normalizeXlsxWorksheetPolicy } from '@silurus/ooxml-core/worker';
+import {
+  DEFAULT_XLSX_WORKSHEET_POLICY,
+  normalizeXlsxWorksheetPolicy,
+} from './internal/worksheet-policy.js';
 import { bindWorksheetPolicy, getWorksheetPolicy } from './worksheet-policy-context.js';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   applyAutoRowHeights,
+  bindXlsxOfficeFontRoutes,
   getGridGeometryForWorksheet,
   invalidateAutoRowHeights,
   markAutoRowHeightsPrepared,
@@ -12,6 +16,8 @@ import { worksheetWithAutoRowHeights } from './render-orchestrator.js';
 import { GridGeometry } from './internal/grid-geometry.js';
 import { setRowResizeRanges } from './internal/row-resize-overrides.js';
 import type { CellFont, CellXf, Styles, Worksheet } from './types.js';
+
+afterEach(() => vi.unstubAllGlobals());
 
 function measurementContext(): CanvasRenderingContext2D {
   let font = '15px sans-serif';
@@ -137,6 +143,41 @@ function worksheet(): Worksheet {
 }
 
 describe('XLSX automatic row height (ECMA-376 §18.3.1.73 / Office auto-fit)', () => {
+  it.each(['projection', 'prepared'] as const)('keeps %s fitting on the worksheet language snapshot', (mode) => {
+    const ws = worksheet();
+    ws.themeJapaneseMinorFont = 'Meiryo';
+    const themedStyles: Styles = {
+      ...styles,
+      fonts: styles.fonts.map((font) => ({ ...font, scheme: 'minor' })),
+    };
+    const ctx = measurementContext();
+    ctx.measureText = (text: string) => ({
+      width: [...text].length * (ctx.font.includes('"Meiryo"') ? 14 : 7),
+    }) as TextMetrics;
+    const fit = (sheet: Worksheet): Worksheet => {
+      bindXlsxOfficeFontRoutes(ctx, sheet);
+      if (mode === 'projection') return worksheetWithAutoRowHeights(ctx, sheet, themedStyles);
+      applyAutoRowHeights(ctx, sheet, themedStyles);
+      return sheet;
+    };
+    vi.stubGlobal('navigator', { language: 'en-US' });
+    const english = fit(ws);
+    const englishHeight = english.rowHeights[1];
+    for (const language of ['ja-JP', 'en-US']) {
+      vi.stubGlobal('navigator', { language });
+      expect(fit(ws)).toBe(english);
+      expect(fit(ws).rowHeights[1]).toBe(englishHeight);
+    }
+    vi.stubGlobal('navigator', { language: 'ja-JP' });
+    const fresh = worksheet();
+    fresh.themeJapaneseMinorFont = ws.themeJapaneseMinorFont;
+    expect(fit(fresh).rowHeights[1]).toBeGreaterThan(englishHeight);
+    // A real size invalidation must still measure with the original language.
+    invalidateAutoRowHeights(english);
+    expect(fit(english).rowHeights[1]).toBe(englishHeight);
+    expect(english.rowHeights[2]).toBe(15);
+  });
+
   it('preserves compact manual row dimensions through auto-height clones and column refits', () => {
     const ws = worksheet();
     setRowResizeRanges(ws, [{ first: 1, last: 1048576, height: 63 }]);

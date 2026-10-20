@@ -134,7 +134,7 @@ function projectPlotGroups(
   });
 }
 
-export const EXCEL_AUTOMATIC_SCATTER_MARKERS = [
+const EXCEL_AUTOMATIC_SCATTER_MARKERS = [
   'diamond', 'square', 'triangle', 'x', 'star', 'circle',
 ] as const;
 

@@ -24,6 +24,7 @@
 // the caller keeps the section format instead of choosing the wrong script.
 
 import type { NumberFormat } from './number-format';
+import { ownValue } from '../internal/own-key';
 
 // Case-sensitive switch-argument → ST_NumberFormat, restricted to the values
 // `formatOrdinalNumber` renders natively AND unambiguous across locales. Text
@@ -69,7 +70,7 @@ export function parseFieldFormatSwitch(instruction: string): NumberFormat | null
   const re = /\\\*\s+(\S+)/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(instruction)) !== null) {
-    const fmt = SWITCH_TO_FORMAT[m[1]];
+    const fmt = ownValue(SWITCH_TO_FORMAT, m[1]);
     if (fmt) return fmt;
   }
   return null;

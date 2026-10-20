@@ -20,7 +20,7 @@ function legacyTypeMatchesGroup(chartType: string, kind: ChartPlotGroup['kind'])
  * Axis resolution is dispatch-specific: a small number of Office-authored
  * compatibility layouts deliberately retain an ambiguous same-side numeric
  * axis while their legacy renderer still has an exact primary/secondary route. */
-export function chartPlotGroupsAreValid(chart: ChartModel): boolean {
+function chartPlotGroupsAreValid(chart: ChartModel): boolean {
   if (chart.plotGroups == null) return true;
   let next = 0;
   for (const group of chart.plotGroups) {

@@ -25,7 +25,7 @@ import { bubblePointFill, bubblePointLine } from './bubble-paint.js';
 import { chartExMarkerPaint } from './chartex-style.js';
 
 
-export function markerKeyPaintSizesPx(
+function markerKeyPaintSizesPx(
   chart: ChartModel,
   series: ChartSeries,
   ptToPx: number,

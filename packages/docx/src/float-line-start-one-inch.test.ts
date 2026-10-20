@@ -173,52 +173,50 @@ describe('resolveLineFloatWindow — float geometry and numeric domain', () => {
     expect(actual).toEqual(perStepReference(floats, 20, 58, 1, 0, 100));
   });
 
-  it('matches per-step retries on random tight polygons that cross the paragraph bounds', () => {
-    let seed = 0x1623;
-    const random = () => {
-      seed = (seed * 1103515245 + 12345) >>> 0;
-      return seed / 2 ** 32;
-    };
-    const sides = ['bothSides', 'left', 'right', 'largest'] as const;
-    let compared = 0;
-    for (let trial = 0; trial < 400; trial += 1) {
-      // Half of the trials use only axis-aligned rectangles, whose boundaries
-      // are constant inside a structural slab.
-      const rectangles = random() < 0.5;
-      const floats = Array.from({ length: 1 + Math.floor(random() * 3) }, () => {
-        const side = sides[Math.floor(random() * sides.length)]!;
-        if (rectangles) {
-          const x0 = Math.round(-40 + random() * 150);
-          const y0 = Math.round(random() * 90);
-          const x1 = x0 + 5 + Math.round(random() * 90);
-          const y1 = y0 + 5 + Math.round(random() * 60);
-          return polygonFloat('tight', [
-            { xPt: x0, yPt: y0 }, { xPt: x1, yPt: y0 }, { xPt: x1, yPt: y1 }, { xPt: x0, yPt: y1 },
-          ], { side });
-        }
-        return polygonFloat(
-          'tight',
-          Array.from({ length: 3 + Math.floor(random() * 3) }, () => ({
-            xPt: Math.round(-40 + random() * 180),
-            yPt: Math.round(random() * 120),
-          })),
-          { side },
-        );
-      }).filter((float) => float.yBottom > float.yTop && float.xRight > float.xLeft);
-      if (floats.length === 0) continue;
-      const start = Math.round(random() * 30);
-      const required = 5 + Math.round(random() * 70);
-      const lineHeight = [0.7, 1, 2.5, 5][Math.floor(random() * 4)]!;
-      const expected = perStepReference(floats, start, required, lineHeight, 0, 100);
-      if (expected === null) continue;
-      const actual = computePreparedLineFloatWindow(
-        start, required, lineHeight, 0, 100, prepareFloatWrap(floats),
-      );
-      expect(actual, `trial ${trial}`).toEqual(expected);
-      compared += 1;
+  /** Compact literal geometry for the representative search cases below. */
+  type CaseFloat = Readonly<{
+    side: string;
+    points?: readonly (readonly [number, number])[];
+    square?: readonly [number, number, number, number];
+    topAndBottom?: true;
+    exempt?: number;
+  }>;
+  const caseFloat = (spec: CaseFloat, offset = 0): FloatRect => {
+    const extra = spec.exempt === undefined ? {} : { exemptLineTopPt: spec.exempt };
+    if (spec.square) {
+      const [x0, y0, x1, y1] = spec.square;
+      const rect = { ...squareRect(x0, offset + y0, x1, offset + y1, spec.side), ...extra };
+      return spec.topAndBottom ? { ...rect, mode: 'topAndBottom' } : rect;
     }
-    expect(compared).toBeGreaterThan(200);
-  }, 120_000);
+    return polygonFloat('tight', spec.points!.map(([xPt, yPt]) => ({ xPt, yPt: offset + yPt })), {
+      side: spec.side, ...extra,
+    } as Partial<Extract<FloatRect, { kind: 'shape' }>>);
+  };
+
+  // Representative cases distilled from a 400-trial seeded search (#1852).
+  // Each was chosen because it fails when the walk drops the bottom-edge
+  // line-step region, skips grid positions, or steps from the previous
+  // candidate instead of the line's own grid; the remaining trials caught no
+  // additional local mutant of the search. One mixes sloped polygons, the
+  // other axis-aligned rectangles crossing the paragraph bounds.
+  it.each([
+    { specs: [
+      { side: 'right', points: [[45, 104], [23, 65], [-20, 5], [-21, 7]] },
+      { side: 'left', points: [[-8, 70], [29, 3], [88, 81]] },
+      { side: 'left', points: [[56, 32], [133, 106], [93, 112], [129, 29]] },
+    ], start: 22, required: 62, lineHeight: 0.7 },
+    { specs: [
+      { side: 'left', points: [[11, 15], [42, 15], [42, 44], [11, 44]] },
+      { side: 'right', points: [[100, 44], [193, 44], [193, 74], [100, 74]] },
+      { side: 'right', points: [[74, 4], [88, 4], [88, 55], [74, 55]] },
+    ], start: 20, required: 37, lineHeight: 0.7 },
+  ] as const)('matches per-step retries on tight polygons that cross the paragraph bounds (%#)', ({ specs, start, required, lineHeight }) => {
+    const floats = specs.map((spec) => caseFloat(spec as CaseFloat));
+    const expected = perStepReference(floats, start, required, lineHeight, 0, 100);
+    expect(expected).not.toBeNull();
+    expect(computePreparedLineFloatWindow(start, required, lineHeight, 0, 100, prepareFloatWrap(floats)))
+      .toEqual(expected);
+  });
 
   it('bounds tight line stepping by the polygons it has to pass', () => {
     for (const count of [10, 50, 75]) {
@@ -344,57 +342,36 @@ describe('resolveLineFloatWindow — float geometry and numeric domain', () => {
     expect(window).toEqual(mixedReference(floats, 3, 30, 10));
   });
 
-  it('matches the oracle on random mixed square and tight stacks from varied line tops', () => {
-    let seed = 0x5eed;
-    const random = () => {
-      seed = (seed * 1103515245 + 12345) >>> 0;
-      return seed / 2 ** 32;
-    };
-    const sides = ['bothSides', 'left', 'right', 'largest'] as const;
-    let compared = 0;
-    for (let trial = 0; trial < 400; trial += 1) {
-      const floats: FloatRect[] = [];
-      const count = 1 + Math.floor(random() * 4);
-      for (let index = 0; index < count; index += 1) {
-        const side = sides[Math.floor(random() * sides.length)]!;
-        const x0 = Math.round(-30 + random() * 120);
-        const y0 = Math.round(random() * 120);
-        const x1 = x0 + 10 + Math.round(random() * 100);
-        const y1 = y0 + 5 + Math.round(random() * 60);
-        if (random() < 0.5) {
-          floats.push(squareRect(x0, y0, x1, y1, side));
-          if (random() < 0.25) {
-            floats[floats.length - 1] = { ...floats.at(-1)!, exemptLineTopPt: Math.round(random() * 130) };
-          }
-        } else if (random() < 0.5) {
-          floats.push(polygonFloat('tight', [
-            { xPt: x0, yPt: y0 }, { xPt: x1, yPt: y0 }, { xPt: x1, yPt: y1 }, { xPt: x0, yPt: y1 },
-          ], { side }));
-        } else {
-          floats.push(polygonFloat('tight', [
-            { xPt: x0, yPt: y0 }, { xPt: x1, yPt: y0 + Math.round(random() * 20) },
-            { xPt: Math.round((x0 + x1) / 2), yPt: y1 },
-          ], { side }));
-        }
-      }
-      const start = Math.round(random() * 60);
-      const required = 5 + Math.round(random() * 60);
-      const lineHeight = [0.7, 1, 2.5, 5, 12][Math.floor(random() * 5)]!;
-      // Exempt anchor lines on tight polygons: on the retry grid or off it.
-      for (let index = 0; index < floats.length; index += 1) {
-        if (floats[index]!.authoredWrap !== 'tight' || random() >= 0.35) continue;
-        const exempt = random() < 0.5
-          ? start + Math.floor(random() * 12) * lineHeight
-          : Math.round(random() * 130);
-        floats[index] = { ...floats[index]!, exemptLineTopPt: exempt };
-      }
-      const expected = mixedReference(floats, start, required, lineHeight);
-      const actual = computePreparedLineFloatWindow(start, required, lineHeight, 0, 100, prepareFloatWrap(floats));
-      expect(actual, `trial ${trial}`).toEqual(expected);
-      compared += 1;
-    }
-    expect(compared).toBe(400);
-  }, 120_000);
+  // Representative cases distilled from a 400-trial seeded search (#1852):
+  // exempt square and tight anchor lines, a sloped polygon entered from the
+  // sweep, and `largest` squares above a tight triangle. Together they fail
+  // when the sweep stops line-stepping into a tight slab, exempt lines stop
+  // being events, the bottom edge leaves the line-step region, steps skip or
+  // drift off the line grid, or the step-limit jump passes unmet polygons; the
+  // remaining trials caught no additional local mutant of the search.
+  it.each([
+    { specs: [
+      { square: [11, 79, 47, 96], side: 'bothSides', exempt: 12 },
+      { square: [82, 118, 189, 124], side: 'left' },
+      { side: 'bothSides', points: [[-19, 26], [23, 26], [23, 35], [-19, 35]] },
+      { square: [28, 31, 127, 69], side: 'right', exempt: 51 },
+    ], start: 28, required: 37, lineHeight: 5 },
+    { specs: [
+      { side: 'right', points: [[18, 92], [77, 92], [77, 101], [18, 101]] },
+      { side: 'left', points: [[-27, 30], [52, 40], [13, 86]], exempt: 33 },
+      { square: [74, 2, 151, 65], side: 'right', exempt: 64 },
+    ], start: 26, required: 62, lineHeight: 1 },
+    { specs: [
+      { square: [89, 46, 186, 86], side: 'largest' },
+      { square: [19, 56, 65, 62], side: 'largest' },
+      { square: [11, 47, 99, 101], side: 'largest' },
+      { side: 'right', points: [[16, 98], [40, 109], [28, 121]] },
+    ], start: 45, required: 38, lineHeight: 5 },
+  ] as const)('matches the oracle on mixed square and tight stacks from varied line tops (%#)', ({ specs, start, required, lineHeight }) => {
+    const floats = specs.map((spec) => caseFloat(spec as CaseFloat));
+    expect(computePreparedLineFloatWindow(start, required, lineHeight, 0, 100, prepareFloatWrap(floats)))
+      .toEqual(mixedReference(floats, start, required, lineHeight));
+  });
 
   it('caps tight line steps and falls back to the sweep aligned to the line grid', () => {
     const tall = polygonFloat('tight', [
@@ -508,119 +485,98 @@ describe('resolveLineFloatWindow — float geometry and numeric domain', () => {
     expect(() => lineGridAfter(100, Number.MIN_VALUE, 100)).toThrow(RangeError);
   });
 
-  it('keeps the search invariants on random square, topAndBottom and tight sets against a brute-force grid oracle', () => {
-    let seed = 0xb1a5;
-    const random = () => {
-      seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
-      return seed / 2 ** 32;
-    };
-    const sides = ['bothSides', 'left', 'right', 'largest'] as const;
-    const heights = [0, 1e-3, 0.05, 0.7, 2.5, 12];
-    for (let trial = 0; trial < 300; trial += 1) {
-      // Occasionally shift everything to a large in-domain coordinate.
-      const offset = trial % 10 === 0 ? 2 ** 32 : 0;
-      const floats: FloatRect[] = [];
-      const count = 1 + Math.floor(random() * 5);
-      for (let index = 0; index < count; index += 1) {
-        const side = sides[Math.floor(random() * sides.length)]!;
-        const x0 = Math.round(-30 + random() * 120);
-        const x1 = x0 + 10 + Math.round(random() * 100);
-        const y0 = offset + Math.round(random() * 40) / 2;
-        const y1 = y0 + 1 + Math.round(random() * 30) / 2;
-        const kind = random();
-        if (kind < 0.35) floats.push(squareRect(x0, y0, x1, y1, side));
-        else if (kind < 0.5) floats.push({ ...squareRect(x0, y0, x1, y1, side), mode: 'topAndBottom' });
-        else if (kind < 0.8) {
-          floats.push(polygonFloat('tight', [
-            { xPt: x0, yPt: y0 }, { xPt: x1, yPt: y0 }, { xPt: x1, yPt: y1 }, { xPt: x0, yPt: y1 },
-          ], { side }));
-        } else {
-          floats.push(polygonFloat('tight', [
-            { xPt: x0, yPt: y0 }, { xPt: x1, yPt: y0 + Math.round(random() * 10) },
-            { xPt: Math.round((x0 + x1) / 2), yPt: y1 },
-          ], { side }));
-        }
-      }
-      const start = offset + Math.round(random() * 20) / 4;
-      const required = 5 + Math.round(random() * 60);
-      const height = heights[Math.floor(random() * heights.length)]!;
-      const prepared = prepareFloatWrap(floats);
-      const started = performance.now();
-      const { window, diagnostics } = computePreparedLineFloatWindowWithDiagnostics(
-        start, required, height, 0, 100, prepared,
-      );
-      const label = `trial ${trial} (height ${height})`;
-      expect(performance.now() - started, label).toBeLessThan(5_000);
-      expect(diagnostics.evaluatedYCount, label).toBeLessThanOrEqual(20_000 + 64 * count + 64);
-      expect(Number.isFinite(window.topY), label).toBe(true);
-      expect(window.topY, label).toBeGreaterThanOrEqual(start);
-      // The answer fits: re-querying at it returns it unchanged.
-      expect(computePreparedLineFloatWindow(window.topY, required, height, 0, 100, prepared), label)
-        .toEqual(window);
-      // Nothing above the answer on the domain grid (start + k * pitch) fits
-      // (within the step cap).
-      const pitch = lineSearchPitch(height);
-      if (pitch === null || (window.topY - start) / pitch > 5_000) continue;
-      for (let k = 0; start + k * pitch < window.topY; k += 1) {
-        const y = start + k * pitch;
-        expect(computePreparedLineFloatWindow(y, required, height, 0, 100, prepared).topY, `${label} k=${k}`)
-          .not.toBe(y);
-      }
+  // Representative cases distilled from a 300-trial seeded search (#1852):
+  // the first two fail when the bottom edge leaves the line-step region, steps
+  // skip grid positions, or drift off the line grid; the remaining trials
+  // caught no additional local mutant. The third keeps a large in-domain
+  // coordinate (2^32 pt) with a one-twip line.
+  it.each([
+    { offset: 0, specs: [
+      { side: 'bothSides', points: [[85, 13], [121, 13], [103, 25.5]] },
+      { square: [25, 18, 92, 29.5], side: 'bothSides' },
+      { square: [39, 5, 97, 11.5], side: 'right' },
+    ], start: 2.75, required: 43, height: 2.5 },
+    { offset: 0, specs: [
+      { side: 'bothSides', points: [[37, 14.5], [133, 14.5], [133, 29.5], [37, 29.5]] },
+      { side: 'right', points: [[76, 0.5], [104, 0.5], [104, 4], [76, 4]] },
+      { side: 'largest', points: [[25, 19.5], [64, 19.5], [64, 28.5], [25, 28.5]] },
+      { square: [55, 12.5, 89, 26], side: 'right' },
+      { side: 'left', points: [[41, 7.5], [88, 16.5], [65, 14.5]] },
+    ], start: 2.5, required: 35, height: 0.001 },
+    { offset: 2 ** 32, specs: [
+      { side: 'bothSides', points: [[6, 5.5], [22, 5.5], [22, 10.5], [6, 10.5]] },
+      { square: [12, 17.5, 39, 32.5], side: 'right' },
+      { square: [44, 14, 67, 23.5], side: 'right' },
+      { side: 'largest', points: [[-19, 11.5], [22, 16.5], [2, 18]] },
+      { side: 'right', points: [[77, 13], [101, 13], [101, 26], [77, 26]] },
+    ], start: 2 ** 32 + 4.75, required: 22, height: 0.05 },
+  ] as const)('keeps the search invariants against a brute-force grid oracle (%#)', ({ offset, specs, start, required, height }) => {
+    const floats = specs.map((spec) => caseFloat(spec as CaseFloat, offset));
+    const prepared = prepareFloatWrap(floats);
+    const { window, diagnostics } = computePreparedLineFloatWindowWithDiagnostics(
+      start, required, height, 0, 100, prepared,
+    );
+    expect(diagnostics.evaluatedYCount).toBeLessThanOrEqual(20_000 + 64 * specs.length + 64);
+    expect(Number.isFinite(window.topY)).toBe(true);
+    expect(window.topY).toBeGreaterThanOrEqual(start);
+    // The answer fits: re-querying at it returns it unchanged.
+    expect(computePreparedLineFloatWindow(window.topY, required, height, 0, 100, prepared)).toEqual(window);
+    // Nothing above the answer on the domain grid (start + k * pitch) fits.
+    const pitch = lineSearchPitch(height)!;
+    for (let k = 0; start + k * pitch < window.topY; k += 1) {
+      const y = start + k * pitch;
+      expect(computePreparedLineFloatWindow(y, required, height, 0, 100, prepared).topY, `k=${k}`).not.toBe(y);
     }
-  }, 120_000);
+  });
 
-  it('terminates and returns a usable position no earlier than the direct rectangle oracle after the limit', () => {
-    let seed = 0x1623;
-    const random = () => {
-      seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
-      return seed / 2 ** 32;
-    };
-    for (let trial = 0; trial < 16; trial += 1) {
-      const height = [0.25, 0.5, 1][trial % 3]!;
-      const start = trial % 4 / 8;
-      const firstBottom = start + (20_000 + Math.floor(random() * 1000)) * height;
-      const regions = [{ top: start, bottom: firstBottom, tight: true }];
-      let bottom = firstBottom;
-      const count = 1 + Math.floor(random() * 4);
-      for (let index = 0; index < count; index += 1) {
-        const nextTop = bottom + (10 + Math.floor(random() * 20)) * height;
-        const nextBottom = nextTop + (10 + Math.floor(random() * 20)) * height;
-        // Alternate a square ending inside the next tight region and one
-        // covering it. Fractional tops exercise slab entry between grid steps.
-        regions.push({ top: bottom - height, bottom: nextBottom + (trial % 2 ? 5 : -5) * height, tight: false });
-        regions.push({ top: nextTop + (trial % 2) * height / 2, bottom: nextBottom, tight: true });
-        bottom = Math.max(...regions.map((region) => region.bottom));
+  // Two representative stacks distilled from a 16-trial seeded search
+  // (#1852): a tight region longer than the step limit followed by squares that
+  // end inside, or cover, the next tight region, on the line grid and with
+  // fractional tops between grid steps. They fail when the post-limit jump
+  // lands a grid step late, never jumps, or ordinary steps skip positions.
+  it.each([
+    { start: 0, height: 0.25, regions: [
+      { top: 0, bottom: 5108, tight: true },
+      { top: 5107.75, bottom: 5114, tight: false },
+      { top: 5110.75, bottom: 5115.25, tight: true },
+      { top: 5115, bottom: 5124.25, tight: false },
+      { top: 5118.75, bottom: 5125.5, tight: true },
+    ] },
+    { start: 0.125, height: 0.5, regions: [
+      { top: 0.125, bottom: 10015.125, tight: true },
+      { top: 10014.625, bottom: 10032.125, tight: false },
+      { top: 10023.875, bottom: 10029.625, tight: true },
+      { top: 10031.625, bottom: 10050.625, tight: false },
+      { top: 10037.875, bottom: 10048.125, tight: true },
+    ] },
+  ] as const)('terminates and returns the first directly usable position after the limit (%#)', ({ start, height, regions }) => {
+    const floats = regions.map(({ top, bottom: end, tight }) => tight
+      ? polygonFloat('tight', [
+        { xPt: 0, yPt: top }, { xPt: 100, yPt: top }, { xPt: 100, yPt: end }, { xPt: 0, yPt: end },
+      ])
+      : squareRect(0, top, 100, end));
+    // Independent direct rectangle test: squares have an open bottom;
+    // tight rectangles also block a line resting on their bottom edge.
+    const usable = (y: number) => !regions.some((region) =>
+      y + height > region.top && (region.tight ? y <= region.bottom : y < region.bottom));
+    const bottom = Math.max(...regions.map((region) => region.bottom));
+    let earliest = Number.POSITIVE_INFINITY;
+    for (const region of regions) if (!region.tight && usable(region.bottom)) earliest = Math.min(earliest, region.bottom);
+    for (let step = 0; step <= Math.ceil((bottom - start) / height) + 1; step += 1) {
+      const y = start + step * height;
+      if (usable(y)) {
+        earliest = Math.min(earliest, y);
+        break;
       }
-      const floats = regions.map(({ top, bottom: end, tight }) => tight
-        ? polygonFloat('tight', [
-          { xPt: 0, yPt: top }, { xPt: 100, yPt: top }, { xPt: 100, yPt: end }, { xPt: 0, yPt: end },
-        ])
-        : squareRect(0, top, 100, end));
-      // Independent direct rectangle test: squares have an open bottom;
-      // tight rectangles also block a line resting on their bottom edge.
-      const usable = (y: number) => !regions.some((region) =>
-        y + height > region.top && (region.tight ? y <= region.bottom : y < region.bottom));
-      const squareBottoms = regions.filter((region) => !region.tight).map((region) => region.bottom);
-      let earliest = Number.POSITIVE_INFINITY;
-      for (const y of squareBottoms) if (usable(y)) earliest = Math.min(earliest, y);
-      for (let step = 0; step <= Math.ceil((bottom - start) / height) + 1; step += 1) {
-        const y = start + step * height;
-        if (usable(y)) {
-          earliest = Math.min(earliest, y);
-          break;
-        }
-      }
-      const { window, diagnostics } = computePreparedLineFloatWindowWithDiagnostics(
-        start, 10, height, 0, 100, prepareFloatWrap(floats),
-      );
-      expect(Number.isFinite(window.topY), `trial ${trial}`).toBe(true);
-      expect(usable(window.topY), `trial ${trial}`).toBe(true);
-      expect(window.topY, `trial ${trial}`).toBeGreaterThanOrEqual(earliest);
-      // These full-width rectangles cannot open an interior gap, so the
-      // resource fallback must also retain the first directly usable position.
-      expect(window.topY, `trial ${trial}`).toBe(earliest);
-      expect(diagnostics.evaluatedYCount, `trial ${trial}`).toBeLessThan(20_000 + 12 * regions.length);
     }
+    const { window, diagnostics } = computePreparedLineFloatWindowWithDiagnostics(
+      start, 10, height, 0, 100, prepareFloatWrap(floats),
+    );
+    expect(usable(window.topY)).toBe(true);
+    // These full-width rectangles cannot open an interior gap, so the
+    // resource fallback must also retain the first directly usable position.
+    expect(window.topY).toBe(earliest);
+    expect(diagnostics.evaluatedYCount).toBeLessThan(20_000 + 12 * regions.length);
   }, 60_000);
 
   it('keeps sweeping to the earliest contour root for through wrap', () => {

@@ -7,7 +7,7 @@ import { FONT_TRACKING_SENTINEL } from '../internal/font-measurement-sentinels.j
  */
 const nativeSpacing = new WeakMap<CanvasRenderingContext2D, boolean>();
 
-export function drawingMlCodePointCount(text: string): number {
+function drawingMlCodePointCount(text: string): number {
   let n = 0;
   for (const _ of text) n++;
   return n;

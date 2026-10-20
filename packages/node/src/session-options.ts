@@ -1,5 +1,4 @@
 import type {
-  ModelSource,
   OoxmlResourceLimits,
   OoxmlResourceMetrics,
   XlsxWorksheetLimits,
@@ -9,12 +8,6 @@ import type {
 export interface OoxmlNodeSessionOptions {
   /** Password for an Agile-encrypted OOXML container. */
   password?: string;
-  /**
-   * Application-supplied sources for input that is not an OOXML package (see
-   * `LoadOptions.modelSources`). Each must target the session's format; the
-   * first whose `claim()` accepts the bytes opens them in this realm.
-   */
-  modelSources?: readonly ModelSource[];
   /** Package-level inflated ZIP admission limits. */
   resourceLimits?: OoxmlResourceLimits;
   /** XLSX-only logical worksheet admission limits; ignored by DOCX and PPTX. */

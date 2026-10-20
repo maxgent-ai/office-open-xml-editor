@@ -274,7 +274,8 @@ describe('table row split fidelity — fragment-owned paint geometry', () => {
     const second = await renderPage(layout, 0);
     expect(second.texts).toEqual(first.texts);
     expect(first.texts.map(({ text, x, y }) => ({ text, x, y }))).toEqual([
-      { text: 'CENTER', x: 0, y: 36 },
+      // Centred in the exact box below its 1pt top rule.
+      { text: 'CENTER', x: 0, y: 36.5 },
     ]);
     expect(first.measureCount()).toBe(0);
     expect(second.measureCount()).toBe(0);

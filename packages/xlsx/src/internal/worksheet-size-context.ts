@@ -95,11 +95,3 @@ export function inheritWorksheetSizeContext(source: Worksheet, projection: Works
     columns: context.columns && new Map(context.columns),
   });
 }
-
-/** Column-only compatibility seam; preserve any existing row context. */
-export function inheritColumnCssWidths(source: Worksheet, projection: Worksheet): void {
-  const columns = sizes.get(source)?.columns, context = { ...sizes.get(projection) };
-  if (columns) context.columns = new Map(columns);
-  else delete context.columns;
-  retain(projection, context);
-}

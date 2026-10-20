@@ -6,9 +6,11 @@ import type { DistributeSeg, DistributeOptions } from './line-distribute.js';
  *  space. */
 const defaultIsWhitespace = (cp: number): boolean => cp === 0x20 || cp === 0x3000;
 
-/** One opportunity after a code point; widths are supplied by the caller. */
+/** One opportunity after a code point; widths are supplied by the caller.
+ * `leading` is a caller-measured gap that a segment carries before its first
+ * code point (see `leadingGapWidth`), owned by the preceding code point. */
 export interface LineGap {
-  kind: 'space' | 'boundary';
+  kind: 'space' | 'boundary' | 'leading';
   codePoint?: number;
   segIndex: number;
   cpOffset: number;
@@ -58,6 +60,15 @@ export function enumerateGaps<T extends DistributeSeg>(
   const visit = (u: GapUnit): void => {
     const previous = state.last;
     const textCell = (v: GapUnit | undefined): boolean => v?.cp !== undefined && v.cp !== 0x09;
+    // A caller-measured gap before a segment's first code point opens only
+    // between two text cells on the same line, with no space run between.
+    const leadingPx = u.off === 0 && !u.ws && opts.leadingGapWidth ? opts.leadingGapWidth(u.si) : 0;
+    if (leadingPx > 0 && state.hasContent && state.pendingCount === 0
+      && textCell(previous) && textCell(u) && previous!.si !== final) {
+      state.naturalGapSum += leadingPx;
+      state.gapCount += 1;
+      if (collect) gaps.push({ ...descriptor(previous!, 'leading'), naturalPx: leadingPx });
+    }
     if (u.ws) {
       if (state.hasContent && u.si !== final) {
         state.pendingLastWidth = width(u);

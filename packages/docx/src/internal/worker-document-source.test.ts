@@ -11,7 +11,7 @@ import {
 } from './worker-document-source.js';
 
 const descriptor: ModelSourceModuleDescriptor = {
-  protocol: 'ooxml-model-source-module/v1',
+  protocol: 'ooxml-model-source-module/v2',
   target: 'docx',
   moduleUrl: 'https://example.test/source.mjs',
   config: {},

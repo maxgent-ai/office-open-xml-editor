@@ -57,6 +57,34 @@ describe.each(['viewer', 'scroll'] as const)('DOCX %s progressive failure routin
     surface.destroy();
   });
 
+  it.runIf(kind === 'viewer')('clears the presented page on a zero-page failure and drops the in-flight render', async () => {
+    installDom();
+    const onError = vi.fn(), onPageChange = vi.fn();
+    const engine = new FakeDocxEngine(2, [{ widthPt: 612, heightPt: 792 }]);
+    engine.setLayoutComplete(false);
+    vi.spyOn(DocxDocument, 'load').mockResolvedValue(engine.asDoc());
+    const canvas = makeEl('canvas');
+    const viewer = new DocxViewer(canvas as unknown as HTMLCanvasElement, { width: 100, onError, onPageChange });
+    await viewer.load('progressive.docx');
+    expect(canvas.width).toBeGreaterThan(0);
+    // The next page starts painting, then layout fails with no pages left.
+    Object.assign(engine, { deferred: true });
+    const navigation = viewer.nextPage();
+    await vi.waitFor(() => expect(engine.renderCalls.at(-1)?.page).toBe(1));
+    onPageChange.mockClear();
+    const error = new Error('layout failed with no pages');
+    engine.setPageCount(0);
+    engine.setLayoutFailure(error);
+    publishDocxLayout(engine.asDoc(), { pageCount: 0, exact: false, complete: false, error });
+    expect([canvas.width, canvas.height]).toEqual([0, 0]);
+    engine.renderCalls.at(-1)!.resolve();
+    await navigation;
+    expect([canvas.width, canvas.height]).toEqual([0, 0]);
+    expect(onPageChange).not.toHaveBeenCalled();
+    expect(onError).toHaveBeenCalledWith(error);
+    viewer.destroy();
+  });
+
   it('leaves an explicitly configured completion callback as the sole owner', async () => {
     const onError = vi.fn();
     const onLayoutComplete = vi.fn();

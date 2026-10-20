@@ -21,6 +21,7 @@ import { resolveWorksheetAnchorRect } from './internal/initial-anchor-sizes.js';
 import { inverseImageTransformPoint, rotatedImageBounds } from './internal/image-anchor-transform.js';
 import type { GridAxisGeometry } from './internal/grid-axis-geometry.js';
 import type { XlsxElementContext } from './selection.js';
+import { safeUtf16Prefix } from '@silurus/ooxml-core/internal/utf16-prefix';
 
 type CellAnchorLike = CellAnchorSizeFacts;
 
@@ -210,16 +211,6 @@ function anchorLocator(anchor: CellAnchorLike): XlsxElementContext['anchor'] {
       offsetY: anchor.toRowOff,
     },
   };
-}
-
-function safeUtf16Prefix(value: string, maxCodeUnits: number): string {
-  let end = Math.min(value.length, maxCodeUnits);
-  if (end > 0 && end < value.length) {
-    const previous = value.charCodeAt(end - 1);
-    const next = value.charCodeAt(end);
-    if (previous >= 0xD800 && previous <= 0xDBFF && next >= 0xDC00 && next <= 0xDFFF) end--;
-  }
-  return value.slice(0, end);
 }
 
 function shapeText(shape: ShapeInfo, maxTextCharacters: number): {

@@ -1,3 +1,4 @@
+import { ownValue } from '../internal/own-key';
 /**
  * Shared script → Noto fallback definitions used by the docx / pptx / xlsx
  * renderers and their Google-Fonts preload maps.
@@ -59,7 +60,7 @@ export const GOOGLE_CJK_FONT_ALIASES = {
 export function googleCjkFontAlias(family: string | null | undefined): string | null {
   if (!family) return null;
   const key = family.trim().toLowerCase() as keyof typeof GOOGLE_CJK_FONT_ALIASES;
-  return GOOGLE_CJK_FONT_ALIASES[key] ?? null;
+  return ownValue<string>(GOOGLE_CJK_FONT_ALIASES, key) ?? null;
 }
 
 /**

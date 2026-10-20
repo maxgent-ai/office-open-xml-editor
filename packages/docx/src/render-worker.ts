@@ -1,4 +1,13 @@
-import { hasNativeReadingRequests } from './native-reading-notice.js';
+import { prepareDocxHostFontMetrics, type HostFontLineMeasurement } from './host-font-line-metrics.js';
+import {
+  activeFontSet,
+  loadNativeRouteSentinels,
+  loadOfficeFontFallbacks,
+  type NativeRouteNormalLine,
+} from '@silurus/ooxml-core';
+import { admitDocxNativeRouteLines } from './native-route-line-metrics.js';
+import { normalizeDocxParserError } from './internal/parser-errors.js';
+import type { LayoutDiagnostic } from './layout/types.js';
 /**
  * Render-capable worker entry: parse → font preload → paginate, all
  * worker-side; renders pages into an OffscreenCanvas and replies with
@@ -12,7 +21,6 @@ import init, { DocxArchive, reinit } from './wasm/docx_parser.js';
 import {
   decodeDataUrl,
   preloadGoogleFonts,
-  loadOfficeFontFallbacks,
   unloadOfficeFontFallbacks,
   unloadGoogleFonts,
   unregisterEmbeddedFonts,
@@ -38,7 +46,7 @@ import {
   type WorkerSvgDecodeResponse,
 } from '@silurus/ooxml-core/worker';
 import { prepareMathRuns, renderLayoutSourceToCanvas } from './renderer';
-import { createLayoutServices } from './layout-runtime.js';
+import { createLayoutServices, nativeRouteLineRequests } from './layout-runtime.js';
 import { DOCX_GOOGLE_FONTS, docxGoogleFontPlan, docxOfficeFontFallbackRequests } from './google-fonts';
 import { loadEmbeddedFonts } from './embedded-fonts';
 import type {
@@ -71,6 +79,11 @@ import {
   isDocumentPullCommand,
   MaterializedDocumentCursorArchive,
 } from './document-pull-worker.js';
+import {
+  type WorkerDocumentSourceOwner,
+  type WorkerDocumentArchive,
+  type DocxModelSourceViewDefaults,
+} from './internal/worker-document-source.js';
 
 // RB6: self-poison + auto-respawn. A trap during parse (or an in-worker image /
 // embedded-font read) recycles the instance so the next document renders on
@@ -81,15 +94,25 @@ const host = new WasmParserHost<DocxArchive>(init, {
   // wasm-bindgen singleton). `reinit` forces fresh linear memory after a trap.
   reinit,
 });
+let sourceOwner: WorkerDocumentSourceOwner<DocxArchive> | undefined;
+function executeArchive<T>(operation: (archive: WorkerDocumentArchive) => T): T {
+  if (sourceOwner) return sourceOwner.execute(operation);
+  const archive = host.archive;
+  if (!archive) throw new Error('No docx loaded');
+  return host.run(() => operation(archive));
+}
+function sourceUsage(): Uint8Array | undefined {
+  if (sourceOwner) return sourceOwner.resourceUsage();
+  const archive = host.archive;
+  if (!archive) throw new Error('No docx loaded');
+  return host.run(() => archive.resource_usage());
+}
 const documentPull = new DocumentPullWorker(
-  () => host.archive,
-  (operation) => host.run(() => {
-    const archive = host.archive;
-    if (!archive) throw new Error('No docx loaded');
-    return operation(archive);
-  }),
+  () => sourceOwner?.cursor() ?? host.archive,
+  (operation) => executeArchive(operation),
 );
 let documentGeneration = 0;
+let parseGeneration = 0;
 let fallbackPull: DocumentPullWorker | null = null;
 let doc: RetainedRenderWorkerDocumentLayout | null = null;
 /** Compact model-derived inputs needed to re-project variant-specific review
@@ -107,7 +130,19 @@ const LAYOUT_PROGRESS_POST_INTERVAL_MS = 100;
 let renderers: LoadedWorkerRenderers = {};
 let googleFontFaces: FontFace[] = [];
 let embeddedFontFaces: FontFace[] = [];
+let fontDiagnostics: readonly LayoutDiagnostic[] = [];
 let officeFontFaces: FontFace[] = [];
+function releaseRetainedFonts(): void {
+  const office = officeFontFaces;
+  const google = googleFontFaces;
+  const embedded = embeddedFontFaces;
+  officeFontFaces = [];
+  googleFontFaces = [];
+  embeddedFontFaces = [];
+  try { unloadOfficeFontFallbacks(office); } catch {}
+  try { unloadGoogleFonts(google); } catch {}
+  try { unregisterEmbeddedFonts(embedded); } catch {}
+}
 const rawParts = new BoundedRawPartCache({
   maxEntries: HARD_MAX_RAW_PART_CACHE_ENTRIES,
   maxBytes: HARD_MAX_RAW_PART_CACHE_BYTES,
@@ -129,12 +164,13 @@ const svgDecodeClient = new WorkerSvgDecodeClient(rawPost);
  *  Mime travels on the element, so the caller supplies it. */
 function getImage(path: string, mimeType: string): Promise<Blob> {
   return rawParts.get(path, mimeType, async () => {
-    const loaded = host.archive;
-    if (!loaded) throw new Error('No docx loaded');
-    const bytes = host.run(() => loaded.extract_image(path));
+    const bytes = executeArchive((loaded) => loaded.extract_image(path));
     return new Blob([bytes as BlobPart], { type: mimeType });
   });
 }
+
+const hostFontMeasurements = new Map<number, (measurements: HostFontLineMeasurement[]) => void>();
+const nativeRouteMeasurements = new Map<number, (lines: (NativeRouteNormalLine | null)[]) => void>();
 
 self.onmessage = async (e: MessageEvent<RenderWorkerWireRequest | WorkerSvgDecodeResponse>) => {
   const req = e.data;
@@ -154,9 +190,19 @@ self.onmessage = async (e: MessageEvent<RenderWorkerWireRequest | WorkerSvgDecod
         operationId: req.operationId,
         generation: req.generation,
         requestId: req.requestId,
-        error: serializeWorkerError(error),
+        error: serializeWorkerError(normalizeDocxParserError(error)),
       });
     }
+    return;
+  }
+  if (req.type === 'hostFontLinesMeasured') {
+    hostFontMeasurements.get(req.forId)?.(req.measurements);
+    hostFontMeasurements.delete(req.forId);
+    return;
+  }
+  if (req.type === 'nativeRouteLinesMeasured') {
+    nativeRouteMeasurements.get(req.forId)?.(req.lines);
+    nativeRouteMeasurements.delete(req.forId);
     return;
   }
   if (req.type === 'init') {
@@ -164,36 +210,40 @@ self.onmessage = async (e: MessageEvent<RenderWorkerWireRequest | WorkerSvgDecod
     return;
   }
   const id = req.id;
+  let requestedGeneration: number | undefined;
+  let publishedPages = false;
   try {
-    await host.ensureReady();
-    if (req.type !== 'parse' && host.archive) {
-      const retained = host.archive;
-      host.run(() => retained.assert_healthy());
+    if (req.type === 'parse' ? !req.source : !sourceOwner) await host.ensureReady();
+    if (req.type !== 'parse' && (sourceOwner?.cursor() ?? host.archive)) {
+      executeArchive((retained) => retained.assert_healthy());
     }
     if (req.type === 'parse') {
+      requestedGeneration = ++parseGeneration;
+      for (const resolve of hostFontMeasurements.values()) resolve([]);
+      hostFontMeasurements.clear();
+      // A superseded parse's measurement reply is discarded by the host.
+      for (const resolve of nativeRouteMeasurements.values()) resolve([]);
+      nativeRouteMeasurements.clear();
       layoutAbort?.abort();
       layoutAbort = null;
       await documentPull.reset();
-      await fallbackPull?.reset();
-      fallbackPull = null;
+      if (requestedGeneration !== parseGeneration) throw new Error('render-worker parse was superseded');
+      const previousFallback = fallbackPull;
+      await previousFallback?.reset();
+      if (requestedGeneration !== parseGeneration) throw new Error('render-worker parse was superseded');
+      if (fallbackPull === previousFallback) fallbackPull = null;
+      sourceOwner?.closeModelSource();
+      sourceOwner = undefined;
+      host.run(() => host.disposeArchive());
       doc = null;
       reviewIndexInput = null;
-      if (googleFontFaces.length > 0) {
-        unloadGoogleFonts(googleFontFaces);
-        googleFontFaces = [];
-      }
-      if (embeddedFontFaces.length > 0) {
-        unregisterEmbeddedFonts(embeddedFontFaces);
-        embeddedFontFaces = [];
-      }
-      if (officeFontFaces.length > 0) {
-        unloadOfficeFontFallbacks(officeFontFaces);
-        officeFontFaces = [];
-      }
+      releaseRetainedFonts();
       // Cached blobs belong to the previous document; serving them after a
       // re-parse would silently return the wrong file's image.
       rawParts.clear();
-      renderers = await loadWorkerRenderers(req.renderers);
+      const requestedRenderers = await loadWorkerRenderers(req.renderers);
+      if (requestedGeneration !== parseGeneration) throw new Error('render-worker parse was superseded');
+      renderers = requestedRenderers;
       // A re-parse starts a fresh document: also drop the shared decoded owner
       // (base raster + derived colour surfaces) and SVG lookup owner, symmetric
       // with DocxDocument.destroy(). The worker's `getImage`
@@ -203,15 +253,27 @@ self.onmessage = async (e: MessageEvent<RenderWorkerWireRequest | WorkerSvgDecod
       // workers (issue #781).
       dropDecodedBitmapCache(getImage);
       dropSvgImageCache(getImage);
-      const [maxEntry, maxTotal, maxEntries] = resourcePolicyForWasm(req.resourcePolicy);
       const bytes = new Uint8Array(req.data);
-      // Construction and every later cursor call run under `host.run`. Render
-      // mode drains the same pull/ACK state machine locally, so it avoids both a
-      // monolithic Rust model JSON value and an unnecessary Worker transfer.
-      host.run(() => {
-        const archive = new DocxArchive(bytes, maxEntry, maxTotal, maxEntries);
-        host.setArchive(archive);
-      });
+      // Both sources drain the same pull/ACK state machine locally. OOXML
+      // construction/calls use host.run; a model source applies its own trap
+      // boundary. Neither route creates a monolithic model JSON value.
+      let viewDefaults: DocxModelSourceViewDefaults | undefined;
+      if (req.source) {
+        if (!req.sourceOwnerUrl) throw new TypeError('DOCX source owner URL is missing');
+        const { WorkerDocumentSourceOwner } = await import(/* @vite-ignore */ req.sourceOwnerUrl) as typeof import('./internal/worker-document-source.js');
+        sourceOwner = new WorkerDocumentSourceOwner(host);
+        viewDefaults = await sourceOwner.openModelSource(bytes, req.source, req.sourceTransfer);
+        if (requestedGeneration !== parseGeneration) {
+          throw new Error('render-worker parse was superseded');
+        }
+      } else {
+        if (requestedGeneration !== parseGeneration) throw new Error('render-worker parse was superseded');
+        const [maxEntry, maxTotal, maxEntries] = resourcePolicyForWasm(req.resourcePolicy);
+        host.run(() => {
+          const archive = new DocxArchive(bytes, maxEntry, maxTotal, maxEntries);
+          host.setArchive(archive);
+        });
+      }
       documentGeneration += 1;
       const identity = {
         sessionId: documentGeneration,
@@ -228,9 +290,27 @@ self.onmessage = async (e: MessageEvent<RenderWorkerWireRequest | WorkerSvgDecod
           { onUsage: (usage) => { resourceUsage = usage; } },
         );
       } finally {
-        await documentPull.reset().catch(() => undefined);
+        if (requestedGeneration === parseGeneration) {
+          await documentPull.reset().catch(() => undefined);
+        }
       }
-      if (documentRequiresDomVerticalGlyphLayout(pulledModels.document)) {
+      if (requestedGeneration !== parseGeneration) throw new Error('render-worker parse was superseded');
+      // Absent authored faces (native-route-line-metrics.ts) are sized from
+      // measurements this realm must re-verify and complete with its own
+      // sentinel registrations. A realm that cannot register them would lay out
+      // differently from main mode, which can; such a document continues on
+      // the main thread instead, exactly like DOM-dependent vertical text.
+      // A realm without any FontFaceSet (a headless host) registers no font
+      // at all, embedded or local, and declines every measured line as main
+      // mode in that host does; it keeps laying out here.
+      const workerFontSet = activeFontSet();
+      const nativeSentinels = workerFontSet ? await loadNativeRouteSentinels(workerFontSet) : [];
+      if (requestedGeneration !== parseGeneration) {
+        if (nativeSentinels) unloadOfficeFontFallbacks(nativeSentinels);
+        throw new Error('render-worker parse was superseded');
+      }
+      if (!nativeSentinels || documentRequiresDomVerticalGlyphLayout(pulledModels.document)) {
+        if (nativeSentinels) unloadOfficeFontFallbacks(nativeSentinels);
         // The normalized public model deliberately omits parser-only sidecars
         // such as unavailable-drawing geometry. Stream the untouched parser
         // model to the main-thread normalization boundary one body block at a
@@ -244,75 +324,150 @@ self.onmessage = async (e: MessageEvent<RenderWorkerWireRequest | WorkerSvgDecod
           generation: documentGeneration,
         };
         fallbackPull.open(fallbackIdentity);
-        post({ type: 'mainThreadVerticalFallback', id, ...fallbackIdentity, usage: resourceUsage });
+        post({
+          type: 'mainThreadVerticalFallback',
+          id,
+          ...(nativeSentinels ? {} : { reason: 'nativeRouteSentinels' as const }),
+          ...fallbackIdentity,
+          usage: resourceUsage,
+          ...(req.source ? { viewDefaults } : {}),
+        });
         return;
       }
-      const adapted = layoutSourceModelAdapterFromOwnedModel(
-        pulledModels.document,
-        pulledModels.ownedLayoutDocument,
-      );
+      let adapted: ReturnType<typeof layoutSourceModelAdapterFromOwnedModel>;
+      let nativeRouteRequests: ReturnType<typeof nativeRouteLineRequests>;
+      try {
+        adapted = layoutSourceModelAdapterFromOwnedModel(
+          pulledModels.document,
+          pulledModels.ownedLayoutDocument,
+        );
+        nativeRouteRequests = nativeRouteLineRequests(adapted.source, adapted.document, {
+          useGoogleFonts: !!req.useGoogleFonts, cjkFallback: req.cjkFallback,
+        });
+      } catch (error) {
+        unloadOfficeFontFallbacks(nativeSentinels);
+        throw error;
+      }
       const source = adapted.source;
       const model = adapted.document;
-      reviewIndexInput = {
+      const requestedReviewIndexInput = {
         comments: model.comments ?? [],
         revisions: model.revisions ?? [],
       };
-      // ECMA-376 §17.8.1 / §17.8.3 — register embedded fonts into the worker's
-      // FontFaceSet (self.fonts) before pagination measures text. Bytes are read
-      // straight from the retained archive (extract_image reads any zip entry).
-      let embeddedFonts: Awaited<ReturnType<typeof loadEmbeddedFonts>> = { faces: [], metrics: {}, routes: [] };
-      if (model.embeddedFonts?.length) {
-        embeddedFonts = await loadEmbeddedFonts(model, async (p) => {
-          const loaded = host.archive;
-          if (!loaded) throw new Error('No docx loaded');
-          return host.run(() => loaded.extract_image(p));
-        });
-      }
-      embeddedFontFaces = embeddedFonts.faces;
-      const officeFonts = await loadOfficeFontFallbacks(docxOfficeFontFallbackRequests(model, { useGoogleFonts: req.useGoogleFonts, cjkFallback: req.cjkFallback }).filter((request) =>
-        !embeddedFonts.routes.some((route) => route.requestedFamily.toLowerCase() === request.family.toLowerCase()
-          && route.weight === (request.weight ?? 400) && route.style === (request.style ?? 'normal'))));
-      officeFontFaces = officeFonts.faces;
       let googleFaces: FontFace[] = [];
-      let installedSubstituteFamilies: readonly string[] = [];
-      if (req.useGoogleFonts) {
-        // Pagination measures text, so each admitted face must be available
-        // before canonical layout in both worker and main mode.
-        const plan = docxGoogleFontPlan(model, req.cjkFallback, officeFonts);
-        installedSubstituteFamilies = plan.installedSubstituteFamilies;
-        googleFaces = await preloadGoogleFonts(plan.names, DOCX_GOOGLE_FONTS);
+      let embeddedFonts: Awaited<ReturnType<typeof loadEmbeddedFonts>> = { faces: [], metrics: {}, routes: [] };
+      let officeFaces: FontFace[] = [];
+      let fontsTransferred = false;
+      // Absent authored faces (native-route-line-metrics.ts): this realm has no
+      // DOM, so the owning document measures the native routes. Their lists do
+      // not depend on loaded resources, so the request leaves now and the
+      // document measures while this realm loads fonts; this realm loads its
+      // own sentinels to re-verify each measurement and to judge glyph
+      // ownership during layout.
+      const pendingNativeRouteLines = nativeRouteRequests.length > 0
+        ? new Promise<(NativeRouteNormalLine | null)[]>(resolve => {
+            nativeRouteMeasurements.set(id, resolve);
+            post({ type: 'measureNativeRouteLines', forId: id, requests: nativeRouteRequests });
+          })
+        : Promise.resolve([]);
+      try {
+        // ECMA-376 §17.8.1 / §17.8.3 — register embedded fonts into the worker's
+        // FontFaceSet (self.fonts) before pagination measures text. Bytes are read
+        // straight from the retained archive (extract_image reads any zip entry).
+        if (model.embeddedFonts?.length) {
+          embeddedFonts = await loadEmbeddedFonts(model, async (p) => {
+            if (requestedGeneration !== parseGeneration) {
+              throw new Error('render-worker parse was superseded');
+            }
+            return executeArchive((loaded) => loaded.extract_image(p));
+          });
+          if (requestedGeneration !== parseGeneration) throw new Error('render-worker parse was superseded');
+        }
+        let officeFonts = await loadOfficeFontFallbacks(docxOfficeFontFallbackRequests(model, { useGoogleFonts: req.useGoogleFonts, cjkFallback: req.cjkFallback }).filter((request) =>
+          request.presenceOnly || !embeddedFonts.routes.some((route) => route.requestedFamily.toLowerCase() === request.family.toLowerCase()
+            && route.weight === (request.weight ?? 400) && route.style === (request.style ?? 'normal'))));
+        officeFaces = officeFonts.faces;
+        if (requestedGeneration !== parseGeneration) throw new Error('render-worker parse was superseded');
+        const routes = Object.values(officeFonts.routes);
+        if (routes.length > 0) {
+          const hostMeasurements = await new Promise<HostFontLineMeasurement[]>(resolve => {
+            hostFontMeasurements.set(id, resolve);
+            post({ type: 'measureHostFontLines', forId: id, routes });
+          });
+          officeFonts = await prepareDocxHostFontMetrics(officeFonts, activeFontSet(), hostMeasurements);
+        }
+        if (requestedGeneration !== parseGeneration) throw new Error('render-worker parse was superseded');
+        let installedSubstituteFamilies: readonly string[] = [];
+        if (req.useGoogleFonts) {
+          // Pagination measures text, so each admitted face must be available
+          // before canonical layout in both worker and main mode.
+          const plan = docxGoogleFontPlan(model, req.cjkFallback, officeFonts);
+          installedSubstituteFamilies = plan.installedSubstituteFamilies;
+          googleFaces = await preloadGoogleFonts(plan.names, DOCX_GOOGLE_FONTS);
+          if (requestedGeneration !== parseGeneration) throw new Error('render-worker parse was superseded');
+        }
+        const preparedMath = requestedRenderers.math && source.mathOccurrences.length > 0
+          ? await prepareMathRuns(model, requestedRenderers.math)
+          : undefined;
+        if (requestedGeneration !== parseGeneration) throw new Error('render-worker parse was superseded');
+        const serviceOptions = {
+          allowFootnoteContinuation: req.allowFootnoteContinuation === true,
+          fontMetrics: embeddedFonts.metrics,
+          useGoogleFonts: !!req.useGoogleFonts,
+          cjkFallback: req.cjkFallback,
+          embeddedRoutes: embeddedFonts.routes,
+          officeRoutes: Object.values(officeFonts.routes),
+          googleFaces,
+          installedSubstituteFamilies,
+          installedFamilies: officeFonts.installed,
+          mathResources: preparedMath?.records,
+          mathDrawables: preparedMath?.drawables,
+        };
+        let nativeRouteMetrics: ReturnType<typeof admitDocxNativeRouteLines> | undefined;
+        const nativeRouteLines = await pendingNativeRouteLines;
+        officeFaces = [...officeFaces, ...nativeSentinels];
+        if (nativeRouteLines.some(Boolean)) {
+          nativeRouteMetrics = admitDocxNativeRouteLines(nativeRouteLines, activeFontSet());
+        }
+        if (requestedGeneration !== parseGeneration) throw new Error('render-worker parse was superseded');
+        const layoutServices = createLayoutServices(source, { ...serviceOptions, nativeRouteMetrics });
+        const requestedDoc = retainRenderWorkerDocumentLayout(
+          source,
+          layoutServices,
+          req.defaultCurrentDateMs,
+        );
+        if (requestedGeneration !== parseGeneration) throw new Error('render-worker parse was superseded');
+        officeFontFaces = officeFaces;
+        googleFontFaces = googleFaces;
+        embeddedFontFaces = embeddedFonts.faces;
+        fontDiagnostics = embeddedFonts.diagnostics ?? [];
+        fontsTransferred = true;
+        reviewIndexInput = requestedReviewIndexInput;
+        doc = requestedDoc;
+      } finally {
+        if (!fontsTransferred) {
+          if (!officeFaces.includes(nativeSentinels[0]!)) unloadOfficeFontFallbacks(nativeSentinels);
+          try { unloadOfficeFontFallbacks(officeFaces); } catch {}
+          try { unloadGoogleFonts(googleFaces); } catch {}
+          try { unregisterEmbeddedFonts(embeddedFonts.faces); } catch {}
+        }
       }
-      googleFontFaces = googleFaces;
-      const preparedMath = renderers.math && source.mathOccurrences.length > 0
-        ? await prepareMathRuns(model, renderers.math)
-        : undefined;
-      const layoutServices = createLayoutServices(source, {
-        allowFootnoteContinuation: req.allowFootnoteContinuation === true,
-        fontMetrics: embeddedFonts.metrics,
-        useGoogleFonts: !!req.useGoogleFonts,
-        cjkFallback: req.cjkFallback,
-        embeddedRoutes: embeddedFonts.routes,
-        officeRoutes: Object.values(officeFonts.routes),
-        googleFaces,
-        installedSubstituteFamilies,
-        mathResources: preparedMath?.records,
-        mathDrawables: preparedMath?.drawables,
-      });
-      doc = retainRenderWorkerDocumentLayout(
-        source,
-        layoutServices,
-        req.defaultCurrentDateMs,
-      );
       // The variant this load will actually be viewed as. Everything below —
       // the progressive prefix, the authoritative layout, and the metadata the
       // host's geometry accessors read — is built for THIS view, so a
       // tracked-changes or explicit-date load no longer reports a page count
       // belonging to a pagination nobody is going to paint.
+      // One precedence for every source: the caller's explicit choice, else the
+      // model source's own view default, else the renderer default (final
+      // view). The parse request is this worker's own structured clone, so the
+      // resolved view is recorded on it for every later use in this load.
+      if (viewDefaults) req.showTrackedChanges ??= viewDefaults.showTrackedChanges;
       const layoutOptions = normalizeLayoutOptions(
         req.currentDateMs,
         req.defaultCurrentDateMs,
         req.showTrackedChanges,
       );
+      const showTrackedChanges = layoutOptions.showTrackedChanges === true;
       // Progressive layout: publish the opening pages long before the whole
       // document is paginated, so the host can resolve load() and paint while
       // the rest is still being laid out. Every publication primes the variant
@@ -323,12 +478,13 @@ self.onmessage = async (e: MessageEvent<RenderWorkerWireRequest | WorkerSvgDecod
       // document is served a synthetic error page by the variant store's
       // builder, and neither previewing nor slicing may route around that.
       let unchangedPages: number | undefined;
-      if (req.progressiveLayout && source.fatalParse === null && !hasNativeReadingRequests(source)) {
+      if (req.progressiveLayout && source.fatalParse === null) {
         // The parsed model is the source of review data, so the first
         // publication carries it: the host has nothing else to answer
         // `comments` / `revisions` from until `parsedMeta` arrives, and load()
         // is about to resolve on that first publication.
         let review: DocumentLayoutPartial['review'] | undefined = {
+          resourceDiagnostics: fontDiagnostics,
           revisions: model.revisions ?? [],
           comments: model.comments ?? [],
           footnotes: model.footnotes ?? [],
@@ -339,14 +495,18 @@ self.onmessage = async (e: MessageEvent<RenderWorkerWireRequest | WorkerSvgDecod
         layoutAbort = abort;
         unchangedPages = await paginateRenderWorkerDocumentProgressively(doc, source, {
           publish: (publication) => {
+            if (requestedGeneration !== parseGeneration) return;
             post({
               type: 'layoutPartial',
               forId: id,
+              ...(req.source ? { showTrackedChanges } : {}),
               partial: review ? { ...publication, review } : publication,
             });
+            publishedPages ||= publication.pageCount > 0;
             review = undefined;
           },
           progress: (committedPages) => {
+            if (requestedGeneration !== parseGeneration) return;
             const now = Date.now();
             if (now - lastProgressMs < LAYOUT_PROGRESS_POST_INTERVAL_MS) return;
             lastProgressMs = now;
@@ -355,26 +515,26 @@ self.onmessage = async (e: MessageEvent<RenderWorkerWireRequest | WorkerSvgDecod
         }, layoutOptions, abort.signal, reviewIndexInput);
         if (layoutAbort === abort) layoutAbort = null;
       }
+      if (requestedGeneration !== parseGeneration) throw new Error('render-worker parse was superseded');
       // Usually a cache hit: the progressive drive above primed this exact
       // variant, so this reads the authoritative layout back rather than
       // paginating a second time. Without progressive layout it is the
       // blocking build, as it always was.
       const layout = doc.layoutVariants.layoutFor(layoutOptions);
       const meta: DocumentMeta = {
+        resourceDiagnostics: fontDiagnostics,
         revisions: model.revisions ?? [],
         comments: model.comments ?? [],
         footnotes: model.footnotes ?? [],
         endnotes: model.endnotes ?? [],
         ...projectRenderWorkerLayoutMeta(layout, source, reviewIndexInput),
       };
-      const loadedArchive = host.archive;
-      if (!loadedArchive) throw new Error('No docx loaded');
-      resourceUsage = decodeOoxmlResourceUsage(
-        host.run(() => loadedArchive.resource_usage()),
-      );
+      const usageBytes = sourceUsage();
+      if (usageBytes) resourceUsage = decodeOoxmlResourceUsage(usageBytes);
       post({
         type: 'parsedMeta', id, meta, usage: resourceUsage,
-        ...(unchangedPages === undefined ? {} : { unchangedPages }),
+        ...(req.source ? { showTrackedChanges }
+          : unchangedPages === undefined ? {} : { unchangedPages }),
       });
       return;
     }
@@ -399,10 +559,12 @@ self.onmessage = async (e: MessageEvent<RenderWorkerWireRequest | WorkerSvgDecod
       const canvas = req.canvas ?? new OffscreenCanvas(1, 1);
       const source = layoutSourceStoreOf(doc.layoutServices);
       if (!source) throw new Error('Document layout source is not initialized');
+      const diagnostics: LayoutDiagnostic[] = [];
       await renderLayoutSourceToCanvas(source, canvas, req.pageIndex, {
         ...req.opts,
         // Transferred bitmap surfaces and worker fallbacks are document-owned.
         callerOwnedCanvasTarget: false,
+        onDiagnostic: diagnostic => diagnostics.push(diagnostic),
         fetchImage: getImage,
         svgDecoder: svgDecodeClient.decode,
         layoutServices: doc.layoutServices,
@@ -417,7 +579,7 @@ self.onmessage = async (e: MessageEvent<RenderWorkerWireRequest | WorkerSvgDecod
         defaultCurrentDateMs: doc.defaultCurrentDateMs,
       });
       const bitmap = canvas.transferToImageBitmap();
-      postOwnedImageBitmap(post, { type: 'pageRendered', id, bitmap, runs });
+      postOwnedImageBitmap(post, { type: 'pageRendered', id, bitmap, runs, diagnostics });
       return;
     }
     if (req.type === 'collectRuns') {
@@ -445,35 +607,43 @@ self.onmessage = async (e: MessageEvent<RenderWorkerWireRequest | WorkerSvgDecod
       // this arm exists only for protocol parity with worker.ts. Raw bytes are
       // read straight from the retained archive (no mime needed for a byte
       // transfer).
-      const archive = host.archive;
-      if (!archive) throw new Error('No docx loaded');
       // wasm-bindgen returns an owned full-span Uint8Array; transfer its
       // standalone buffer directly, matching the parse worker contract.
-      const bytes = host.run(() => archive.extract_image(req.path).buffer as ArrayBuffer);
+      const bytes = executeArchive((archive) => sourceOwner
+        ? sourceOwner.copyBytes(archive.extract_image(req.path))
+        : archive.extract_image(req.path).buffer as ArrayBuffer);
       post({ type: 'imageExtracted', id, bytes }, [bytes]);
       return;
     }
     if (req.type === 'resourceUsage') {
-      const archive = host.archive;
-      if (!archive) throw new Error('No docx loaded');
-      const usage = decodeOoxmlResourceUsage(host.run(() => archive.resource_usage()));
-      post({ type: 'resourceUsage', id, usage });
+      const bytes = sourceUsage();
+      post({ type: 'resourceUsage', id, usage: bytes ? decodeOoxmlResourceUsage(bytes) : undefined });
       return;
     }
     if (req.type === 'toMarkdown') {
       // Project the retained archive to markdown, straight from the handle the
       // worker already holds (same source as worker.ts's parse-mode arm).
-      const archive = host.archive;
-      if (!archive) throw new Error('No docx loaded');
-      const markdown = host.run(() => archive.to_markdown());
+      const markdown = sourceOwner ? sourceOwner.toMarkdown() : executeArchive((archive) => (archive as DocxArchive).to_markdown());
       post({ type: 'markdownRendered', id, markdown });
       return;
     }
   } catch (err) {
-    // A superseded progressive drain is not a failure the requester can act on:
-    // the `parse` that aborted it has already moved on, and posting a
-    // correlated error would reject a request nobody is waiting for.
-    if (err instanceof PaginationAbortError) return;
+    // Ordinary progressive loads have always suppressed cancellation. Model
+    // sources still receive their terminal response to release source claims;
+    // generation checks prevent stale loads from closing the newer owner.
+    if (err instanceof PaginationAbortError && (req.type !== 'parse' || !req.source)) return;
+    if (requestedGeneration !== undefined && requestedGeneration === parseGeneration && !publishedPages) {
+      // A published prefix remains paintable after a late pagination failure:
+      // retain its layout, archive and registered fonts until replacement or
+      // worker disposal. Only an unpublished failure can release these here.
+      // Cleanup must not replace the parse failure or its terminal response.
+      try { sourceOwner?.closeModelSource(); } catch {}
+      releaseRetainedFonts();
+      try { host.run(() => host.disposeArchive()); } catch {}
+      rawParts.clear();
+      doc = null;
+      reviewIndexInput = null;
+    }
     const error = err instanceof Error ? err : new Error(String(err));
     const details = error as Error & {
       code?: string;
@@ -485,7 +655,7 @@ self.onmessage = async (e: MessageEvent<RenderWorkerWireRequest | WorkerSvgDecod
     post({
       type: 'error',
       id,
-      ...serializeWorkerError(error),
+      ...serializeWorkerError(normalizeDocxParserError(error)),
       ...(details.code !== undefined ? { code: details.code } : {}),
       ...(details.reason !== undefined ? { reason: details.reason } : {}),
       ...(details.outgoingColumnIndex !== undefined

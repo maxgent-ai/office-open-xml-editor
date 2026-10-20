@@ -30,8 +30,34 @@ describe('shared retained DrawingML geometry', () => {
       stroke: { color: '000000', width: 2, tailEnd: { type: 'triangle', w: 'lg', len: 'lg' } },
     });
     const leader = plan.resolvedGeometry.paths.find(p => p.stroke !== null)!;
-    expect(leader.path).toEqual([{ op: 'moveTo', args: [10, 20] }, { op: 'lineTo', args: [24, 20] }]);
-    expect(drawingMLGeometryBounds(plan)).toEqual({ x: 10, y: 12, w: 30, h: 16 });
+    expect(leader.path).toEqual([{ op: 'moveTo', args: [10, 20] }, { op: 'lineTo', args: [31, 20] }]);
+    expect(drawingMLGeometryBounds(plan)).toEqual({ x: 10, y: 15, w: 30, h: 10 });
+  });
+  it('trims a decorated custom path for its stroke but keeps the untrimmed fill', () => {
+    // 2 pt line, lg/lg triangle: e = 2 pt, the line stops 10 − 1 = 9 pt short.
+    const plan = retained({ ...rectangle, rect: { x: 0, y: 0, w: 40, h: 40 },
+      geometry: { kind: 'custom', subpaths: [[{ cmd: 'moveTo', x: 0, y: 0 }, { cmd: 'cubicBezTo', x1: 1, y1: 0, x2: 1, y2: 0, x: 1, y: 1 }]] },
+      stroke: { color: '000000', width: 2, tailEnd: { type: 'triangle', w: 'lg', len: 'lg' } },
+    });
+    const [fill, line] = plan.resolvedGeometry.paths;
+    expect(fill.stroke).toBeNull();
+    expect(fill.path.at(-1)!.args.slice(4)).toEqual([40, 40]);
+    expect(line.fill).toBe('none');
+    const [ex, ey] = line.path.at(-1)!.args.slice(4);
+    expect(Math.hypot(ex - 40, ey - 40)).toBeCloseTo(9, 6);
+    // The split paths stay within the acquired work the painter validates.
+    expect(requireResolvedDrawingMLGeometry(plan, 1)).toBe(plan.resolvedGeometry);
+  });
+  it('retracts a bent leader across a terminal leg shorter than the retraction', () => {
+    // bentConnector2 ends with a 1 pt leg; lg/lg triangle on a 2 pt line stops the line 9 pt short.
+    const plan = retained({ ...rectangle, rect: { x: 0, y: 0, w: 100, h: 1 }, fill: null,
+      geometry: { kind: 'preset', name: 'bentConnector2', adjustments: [] },
+      stroke: { color: '000000', width: 2, tailEnd: { type: 'triangle', w: 'lg', len: 'lg' } },
+    });
+    const leader = plan.resolvedGeometry.paths.find(p => p.stroke !== null)!;
+    const [ex, ey] = leader.path.at(-1)!.args;
+    expect(Math.hypot(ex - 100, ey - 1)).toBeCloseTo(9, 6);
+    expect(ey).toBeCloseTo(0, 6);
   });
   it('keeps origin translation compatible with a cloned immutable local plan', () => {
     const original = retained(rectangle), copy = structuredClone(original);

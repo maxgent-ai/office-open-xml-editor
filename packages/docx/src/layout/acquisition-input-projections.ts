@@ -3,7 +3,6 @@ import type { ParagraphAcquisitionInput } from './text.js';
 import type { ParagraphLayoutSource } from './text.js';
 import type { TableSourceAcquisitionInput, TableLayoutSource } from './table-source-acquisition.js';
 import type {
-  DeepReadonly,
   NumberingMarkerShapeInput,
   SourceRef,
   TableColumnLayoutInput,

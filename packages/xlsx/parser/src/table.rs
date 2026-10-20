@@ -8,31 +8,9 @@ use ooxml_common::ns::is_x_ns;
 /// collect them for the renderer. Each table carries a ref range, style name
 /// (e.g. "TableStyleLight18"), and the banded-rows / banded-cols flags from
 /// `<tableStyleInfo>` (ECMA-376 §18.5).
-/// Resolve a built-in table style's accent color from the theme.
-///
-/// Built-in style names follow the pattern `TableStyle{Light|Medium|Dark}{N}`
-/// (ECMA-376 §18.5.1.4). Excel's UI lays the 21/28/11 built-ins out in a grid
-/// of rows × 7 columns: column 0 is a "none" style (no accent), columns 1–6
-/// map to accent1–accent6. So the accent index is `(N - 1) mod 7` where 0
-/// means "no accent" and 1..=6 map to the theme's accent slots.
-///
-/// `theme_colors` is in OOXML natural order — accent1 lives at index 4, so
-/// accent_n is at `theme_colors[3 + n]`. Falls back to a neutral gray when
-/// the style name is unrecognised or the theme is missing accents.
-/// dxf indices for the ECMA-376 §18.8.83 `<tableStyleElement>` roles we
-/// render. The presence of an entry in the file's `<tableStyles>` block marks
-/// a *custom* style: built-in styles (`TableStyleLight18`, etc.) have no entry
-/// here and fall through to accent-based rendering, whereas custom styles
-/// (`"予算"`, `"交通費"`) reference dxfs from `<dxfs>` and must be drawn from
-/// those dxfs alone — a custom style contributes ONLY what its declared
-/// elements define (§18.5.1.2 tableStyleInfo). If none of its elements carry a
-/// border dxf, Excel draws no table-level border at all.
-///
-/// `ST_TableStyleType` (§18.18.93) defines many element types. We cover the
-/// region-level ones that affect rendering here: wholeTable, headerRow,
-/// totalRow, firstColumn, lastColumn, and the two horizontal banding stripes
-/// (firstRowStripe / secondRowStripe). Vertical banding stripes and the corner
-/// cell types (first/last header/total cell) are out of scope for now.
+/// Workbook dxf indices of a custom `<tableStyle>`'s region elements, kept
+/// as the informational `TableInfo` `*_dxf` fields. Rendering uses the inline
+/// `style_elements` (every element type, built-in or custom).
 #[derive(Debug, Clone, Default)]
 pub(crate) struct TableStyleElements {
     whole_table: Option<u32>,
@@ -96,6 +74,17 @@ pub(crate) fn parse_table_styles_map(
     map
 }
 
+/// Resolve a built-in table style's accent color from the theme.
+///
+/// Built-in style names follow the pattern `TableStyle{Light|Medium|Dark}{N}`
+/// (ECMA-376 §18.5.1.4). Excel's UI lays the 21/28/11 built-ins out in a grid
+/// of rows × 7 columns: column 0 is a "none" style (no accent), columns 1–6
+/// map to accent1–accent6. So the accent index is `(N - 1) mod 7` where 0
+/// means "no accent" and 1..=6 map to the theme's accent slots.
+///
+/// `theme_colors` is in OOXML natural order — accent1 lives at index 4, so
+/// accent_n is at `theme_colors[3 + n]`. Falls back to a neutral gray when
+/// the style name is unrecognised or the theme is missing accents.
 pub(crate) fn resolve_table_style_accent(style_name: &str, theme_colors: &[String]) -> String {
     let fallback = "#808080".to_string();
     let Some(rest) = style_name.strip_prefix("TableStyle") else {
@@ -124,6 +113,7 @@ pub(crate) fn load_sheet_tables(
     theme_colors: &[String],
 ) -> Vec<TableInfo> {
     let custom_styles = parse_table_styles_map(archive);
+    let mut workbook_styles: Option<crate::pivot::WorkbookTableStyles> = None;
     let Some((sheet_dir, sheet_file)) = sheet_path.rsplit_once('/') else {
         return Vec::new();
     };
@@ -213,11 +203,23 @@ pub(crate) fn load_sheet_tables(
                 ),
                 None => (false, false, false, false),
             };
+        // §18.5.1.5 / §18.8.41: the style's elements with their formats
+        // inline, from the workbook's `<tableStyles>` or Annex G. A style
+        // that cannot be applied as authored is reported and not applied.
+        let (style_elements, style_error) = if style_name.is_empty() {
+            (Vec::new(), None)
+        } else {
+            let styles = workbook_styles.get_or_insert_with(|| {
+                crate::pivot::WorkbookTableStyles::load(archive, theme_colors)
+            });
+            match styles.table_elements(&style_name, theme_colors) {
+                Ok(elements) => (elements.unwrap_or_default(), None),
+                Err(field) => (Vec::new(), Some(field)),
+            }
+        };
         let accent_color = resolve_table_style_accent(&style_name, theme_colors);
         // §18.5.1.2: a style is *custom* iff it is defined in the file's
-        // `<tableStyles>` block. Custom styles render strictly from their
-        // declared element dxfs (no accent approximation); built-in style
-        // names (absent from the block) keep the accent-based fallback.
+        // `<tableStyles>` block.
         let style_elems = custom_styles.get(&style_name);
         let is_custom = style_elems.is_some();
         let whole_table_dxf = style_elems.and_then(|e| e.whole_table);
@@ -258,6 +260,8 @@ pub(crate) fn load_sheet_tables(
             last_column_dxf,
             band1_horizontal_dxf,
             band2_horizontal_dxf,
+            style_elements,
+            style_error,
             columns,
         });
     }

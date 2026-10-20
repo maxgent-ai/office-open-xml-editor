@@ -184,15 +184,23 @@ describe('chartTitleBand', () => {
   });
 });
 
+const LEGEND_METRICS = {
+  itemWidths: [100],
+  rowHeight: 16,
+  itemGap: 12,
+  horizontalPadding: 8,
+  verticalPadding: 4,
+};
+
 describe('chartLegendReserve + bands', () => {
   it('returns null when the legend is hidden', () => {
-    expect(chartLegendReserve(model({ showLegend: false }), W, H, 0.22)).toBeNull();
+    expect(chartLegendReserve(model({ showLegend: false }), W, H, LEGEND_METRICS)).toBeNull();
   });
   it('reserves a right band by default (legendPos null)', () => {
-    const leg = chartLegendReserve(model({ showLegend: true }), W, H, 0.22);
-    expect(leg).toEqual({ side: 'r', reserveW: Math.max(80, W * 0.22), reserveH: 0 });
+    const leg = chartLegendReserve(model({ showLegend: true }), W, H, LEGEND_METRICS);
+    expect(leg).toEqual({ side: 'r', reserveW: 108, reserveH: 0 });
     expect(chartLegendBands(leg)).toEqual({
-      legRightW: Math.max(80, W * 0.22),
+      legRightW: 108,
       legLeftW: 0,
       legTopH: 0,
       legBottomH: 0,
@@ -200,7 +208,7 @@ describe('chartLegendReserve + bands', () => {
   });
   it('keeps the legend paint rectangle but removes every reserved band for overlay', () => {
     for (const legendPos of ['r', 'l', 't', 'b', 'tr'] as const) {
-      const leg = chartLegendReserve(model({ showLegend: true, legendPos }), W, H, 0.22);
+      const leg = chartLegendReserve(model({ showLegend: true, legendPos }), W, H, LEGEND_METRICS);
       expect(leg, legendPos).not.toBeNull();
       expect(chartLegendBands(leg, true), legendPos).toEqual({
         legRightW: 0,
@@ -210,21 +218,11 @@ describe('chartLegendReserve + bands', () => {
       });
     }
   });
-  it('honors the wider pie side fraction (0.28)', () => {
-    const leg = chartLegendReserve(model({ showLegend: true, legendPos: 'l' }), W, H, 0.28);
-    expect(leg).toEqual({ side: 'l', reserveW: Math.max(80, W * 0.28), reserveH: 0 });
-  });
-  it('reserves a bottom strip for top/bottom placement', () => {
-    const leg = chartLegendReserve(model({ showLegend: true, legendPos: 'b' }), W, H, 0.22);
-    expect(leg).toEqual({ side: 'b', reserveW: 0, reserveH: Math.max(18, H * 0.08) });
-    expect(chartLegendBands(leg).legBottomH).toBe(Math.max(18, H * 0.08));
-  });
   it('derives a bounded top band from measured greedy row packing', () => {
     const leg = chartLegendReserve(
       model({ showLegend: true, legendPos: 't' }),
       W,
       H,
-      0.22,
       {
         itemWidths: Array(12).fill(120),
         rowHeight: 16,
@@ -240,7 +238,6 @@ describe('chartLegendReserve + bands', () => {
       model({ showLegend: true, legendPos: 't' }),
       W,
       H,
-      0.22,
       {
         itemWidths: [300, 322],
         rowHeight: 16,
@@ -257,7 +254,6 @@ describe('chartLegendReserve + bands', () => {
       model({ showLegend: true, legendPos: 'r' }),
       W,
       H,
-      0.22,
       {
         itemWidths: [240],
         rowHeight: 16,
@@ -273,7 +269,6 @@ describe('chartLegendReserve + bands', () => {
       model({ showLegend: true, legendPos: 'r' }),
       W,
       H,
-      0.22,
       {
         itemWidths: [40],
         rowHeight: 16,
@@ -322,7 +317,8 @@ describe('computeChartFrame — cartesian', () => {
     const chart = model({ title: 'T', showLegend: true, legendPos: 'r' });
     // Reproduce the bar column pad prefix by hand.
     const title = chartTitleBand(chart, H, PTPX, 0.02, 0.025);
-    const bands = chartLegendBands(chartLegendReserve(chart, W, H, 0.22));
+    const legendReserve = chartLegendReserve(chart, W, H, LEGEND_METRICS);
+    const bands = chartLegendBands(legendReserve);
     const at = chartAxisTitleBands(chart, W, H, PTPX);
     const pad = {
       t: title.bandH + bands.legTopH + H * 0.02,
@@ -333,7 +329,7 @@ describe('computeChartFrame — cartesian', () => {
     const params: FrameParams = {
       titleTopPadFrac: 0.02,
       titleBottomPadFrac: 0.025,
-      legendSideReserveFrac: 0.22,
+      legendReserve,
       pad,
       honorPlotAreaManualLayout: true,
     };
@@ -357,7 +353,7 @@ describe('computeChartFrame — cartesian', () => {
     const band = cartesianTitleBand(chart, H, PTPX);
     const frame = computeChartFrame(chart, X, Y, W, H, PTPX, {
       titleBand: band,
-      legendSideReserveFrac: 0.22,
+      legendReserve: null,
       pad: { t: band.bandH, r: 10, b: 20, l: 30 },
     });
     // frame.title is exactly the passed band, NOT a frac-derived chartTitleBand.
@@ -373,7 +369,7 @@ describe('computeChartFrame — cartesian', () => {
     const frame = computeChartFrame(chart, X, Y, W, H, PTPX, {
       titleTopPadFrac: 0.02,
       titleBottomPadFrac: 0.025,
-      legendSideReserveFrac: 0.22,
+      legendReserve: null,
       pad: { t: 1, r: 2, b: 3, l: 4 },
       honorPlotAreaManualLayout: true,
     });
@@ -400,7 +396,7 @@ describe('computeChartFrame — cartesian', () => {
     const frame = computeChartFrame(chart, X, Y, W, H, PTPX, {
       titleTopPadFrac: 0.02,
       titleBottomPadFrac: 0.025,
-      legendSideReserveFrac: 0.22,
+      legendReserve: null,
       pad: { t: 20, r: 10, b: 30, l: 40 },
       honorPlotAreaManualLayout: true,
     });
@@ -429,7 +425,7 @@ describe('computeChartFrame — cartesian', () => {
     const frame = computeChartFrame(chart, X, Y, W, H, PTPX, {
       titleTopPadFrac: 0.02,
       titleBottomPadFrac: 0.025,
-      legendSideReserveFrac: 0.22,
+      legendReserve: null,
       pad: { t: 20, r: 10, b: 30, l: 40 },
       honorPlotAreaManualLayout: true,
       manualOuterInsets: { t: 6, r: 8, b: 18, l: 28 },
@@ -449,7 +445,7 @@ describe('computeChartFrame — cartesian', () => {
     const frame = computeChartFrame(chart, X, Y, W, H, PTPX, {
       titleTopPadFrac: 0.035,
       titleBottomPadFrac: 0.035,
-      legendSideReserveFrac: 0.22,
+      legendReserve: null,
       pad: { t: 1, r: 2, b: 3, l: 4 },
     });
     expect(frame.plotRect).toEqual({ px0: X + 4, py0: Y + 1, pw: W - 4 - 2, ph: H - 1 - 3 });
@@ -460,14 +456,15 @@ describe('computeChartFrame — radial', () => {
   it('centres the plot below the title/legend bands', () => {
     const chart = model({ title: 'Share', showLegend: true, legendPos: 'r' });
     const title = chartTitleBand(chart, H, PTPX, 0.035, 0.035);
-    const bands = chartLegendBands(chartLegendReserve(chart, W, H, 0.28));
+    const legendReserve = chartLegendReserve(chart, W, H, LEGEND_METRICS);
+    const bands = chartLegendBands(legendReserve);
     const gap = H * 0.02;
     const pw = W - bands.legRightW - bands.legLeftW;
     const ph = H - title.bandH - bands.legTopH - bands.legBottomH - gap;
     const frame = computeChartFrame(chart, X, Y, W, H, PTPX, {
       titleTopPadFrac: 0.035,
       titleBottomPadFrac: 0.035,
-      legendSideReserveFrac: 0.28,
+      legendReserve,
       radialGapFrac: 0.02,
     });
     expect(frame.plotRect).toEqual({ px0: X + bands.legLeftW, py0: Y + title.bandH + bands.legTopH + gap, pw, ph });

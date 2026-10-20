@@ -96,6 +96,8 @@ const single = (width = 1): BorderSpec => ({ style: 'single', width, color: '000
 const noBorders: TableBorders = {
   top: null, bottom: null, left: null, right: null, insideH: null, insideV: null,
 };
+// A cell's text sits below its row's top rule (WORD_COLLAPSED_BORDER_ROW_TRACK_FOOTPRINT).
+const TOP_RULE_INSET = 1;
 const boxBorders: TableBorders = {
   top: single(), bottom: single(), left: single(), right: single(),
   insideH: single(), insideV: single(),
@@ -288,7 +290,7 @@ function tables(result: DocumentLayout, pageIndex = 0): readonly TableFragmentLa
 
 const horizontalBorders = (node: TableLayout) => node.borders
   .filter((segment) => segment.from.yPt === segment.to.yPt)
-  .map((segment) => ({ y: segment.from.yPt, style: segment.authoredStyle }));
+  .map((segment) => ({ y: segment.from.yPt, style: segment.authoredStyle, widthPt: segment.widthPt }));
 
 /** A one-column outer table whose cell holds PRE, `inner` (if any) and POST. */
 const nestedIn = (inner: BodyElement | null, colWidths: number[]) => table([row([
@@ -383,8 +385,9 @@ describe('cell-owner row host at the production layout boundary', () => {
     for (const host of [first!, second!]) {
       const edges = horizontalBorders(host);
       expect(edges.map((edge) => edge.style)).toEqual(['double', 'thick']);
-      expect(edges[0]!.y).toBe(host.flowBounds.yPt);
-      expect(edges[1]!.y).toBe(host.flowBounds.yPt + host.flowBounds.heightPt);
+      // The top and bottom rules lie inside the segment's box.
+      expect(edges[0]!.y).toBeCloseTo(host.flowBounds.yPt + edges[0]!.widthPt / 2, 9);
+      expect(edges[1]!.y).toBeCloseTo(host.flowBounds.yPt + host.flowBounds.heightPt - edges[1]!.widthPt / 2, 9);
     }
     const unequalRuns = runs(unequal);
     expect(unequalRuns.map((box) => box.text)).toEqual([
@@ -802,7 +805,7 @@ describe('cell-owner row host at the production layout boundary', () => {
       }
       expect(at(boxes, 'm2a')).toMatchObject({ x: 90 + inside('m1a').x, y: 210 + inside('m1a').y });
       // Neither host advances the story.
-      expect(at(boxes, 'hdr')).toMatchObject({ x: MARGIN, y: at(control, 'm1a').y });
+      expect(at(boxes, 'hdr')).toMatchObject({ x: MARGIN, y: at(control, 'm1a').y - TOP_RULE_INSET });
     });
   });
 
@@ -1502,7 +1505,7 @@ describe('cell-owner row host at the production layout boundary', () => {
       expect(at(hosted, text)).toEqual({ ...before, x: before.x + dx });
     }
     // HDR starts at the host's own story cursor, beside the host exclusion.
-    expect(at(hosted, 'hdr')).toMatchObject({ x: MARGIN, y: at(control, 'hc').y });
+    expect(at(hosted, 'hdr')).toMatchObject({ x: MARGIN, y: at(control, 'hc').y - TOP_RULE_INSET });
   });
 
   it('keeps page and margin anchors of header and footer hosts on the page, not the story band', () => {
@@ -1526,7 +1529,7 @@ describe('cell-owner row host at the production layout boundary', () => {
       expect(at(hosted, 'hc')).toMatchObject({ x: at(control, 'hc').x + 200 - MARGIN, y: top + y + tableTopToText });
       expect(at(hosted, 'hd').y).toBe(top + y + tableTopToText);
       // Zero story advance; the band still starts at headerDistance.
-      expect(at(hosted, 'hdr')).toMatchObject({ x: MARGIN, y: at(control, 'hc').y });
+      expect(at(hosted, 'hdr')).toMatchObject({ x: MARGIN, y: at(control, 'hc').y - TOP_RULE_INSET });
     }
 
     const footer = (carrier: FramePr | null) => runs(layout([paragraph('body') as BodyElement], {
@@ -1594,7 +1597,9 @@ describe('cell-owner row host at the production layout boundary', () => {
       const lineTops = (boxes: readonly Box[]) => [...new Set(own(boxes).map((box) => box.y))];
       expect(lineTops(runs(result, 1)), label).toEqual(lineTops(runs(document(null), 1)));
     }
-  });
+    // Four layouts of a 400-word cell paragraph cut across pages (~3.5 s on an
+    // idle machine); the default 5 s budget is too tight on loaded CI runners.
+  }, 30_000);
 
   it('places an upright vertical-section host at its physical frame with zero flow advance', () => {
     const vertical = section({ textDirection: 'tbRl' } as Partial<SectionProps>);
@@ -1626,16 +1631,16 @@ describe('cell-owner row host at the production layout boundary', () => {
     expect(at(blocking, 'after').y).toBe(PAGE - 200);
   });
 
-  describe('owner segments of an upright table on a native BtoT section page', () => {
-    // A native producer's BtoT section (raw MS-ODRAW MSOTXFL 2 on its nominal
-    // btLr token) has a counter-clockwise frame: logical inline runs
+  describe('owner segments of an upright table on a bottomToTop section page', () => {
+    // A producer's bottomToTop section flow (on its nominal btLr token) has
+    // a counter-clockwise frame: logical inline runs
     // physically upward from the bottom edge and logical block runs
     // rightward, so logical y = physical x. The Transitional btLr token keeps
     // the clockwise frame. Physical margins top 30 / bottom 70 keep the two
     // column ends apart; left/right stay 40.
     const nativeSection = () => ({
       ...section({ textDirection: 'btLr', marginTop: 30, marginBottom: 70 } as Partial<SectionProps>),
-      __sectionPlacement: { sectionId: 'section:0', nativeTextFlow: 2 },
+      __sectionPlacement: { sectionId: 'section:0', sectionFlow: 'bottomToTop' },
     }) as unknown as SectionProps;
     const native = (body: BodyElement[]) => layout(body, { section: nativeSection() });
     const hostedTable = (framePr: FramePr, ...rows: DocTableRow[]) =>
@@ -1767,14 +1772,14 @@ describe('cell-owner row host at the production layout boundary', () => {
 describe('page placement of positioned tables below table cells and in stories', () => {
   // A one-cell nested table holding marker row r1, positioned by tblpPr:
   // page (60, 100) or text (cell content x + 20, anchor top + 5).
-  const positionedParent = (anchors: 'page' | 'text') => table([row([cell([
+  const positionedParent = (anchors: 'page' | 'text', pageTopPt = 100) => table([row([cell([
     table([markerRow('r1', null)]) as unknown as CellElement,
   ])])], {
     colWidths: [210],
     tblpPr: {
       leftFromText: 0, rightFromText: 0, topFromText: 0, bottomFromText: 0,
       horzAnchor: anchors, horzSpecified: true, vertAnchor: anchors,
-      tblpX: anchors === 'page' ? 60 : 20, tblpY: anchors === 'page' ? 100 : 5,
+      tblpX: anchors === 'page' ? 60 : 20, tblpY: anchors === 'page' ? pageTopPt : 5,
     },
   } as Partial<DocTable>);
   // A positioned holder whose cell holds a positioned child and its anchor
@@ -1792,7 +1797,7 @@ describe('page placement of positioned tables below table cells and in stories',
   const markerTexts = ['r1a1', 'r1a2', 'r1a3', 'r1b'];
   // The page-positioned child as a direct child of a body table cell: its
   // final frame is the page's (60, 100).
-  const direct = () => runs(layout([nestedIn(positionedParent('page'), [320])]));
+  const direct = (pageTopPt = 100) => runs(layout([nestedIn(positionedParent('page', pageTopPt), [320])]));
 
   it('paints a text-anchored positioned nested table at its anchor and wraps its anchor text', () => {
     // §17.4.57 text/text in a body table cell: the frame is the cell content
@@ -1850,11 +1855,11 @@ describe('page placement of positioned tables below table cells and in stories',
     });
     const textChild = positionedParent('text');
     // Page holder at (50, 60): cell content x 50 + 5; MID, the anchor, starts
-    // the cell at y 60.
+    // the cell at y 60, below the holder's top rule.
     const inPageHolder = runs(layout([nestedIn(positionedHolder(textChild, 'page'), [320])]));
     for (const text of markerTexts) {
       expect(at(inPageHolder, text)).toMatchObject({
-        x: 50 + 5 + 20 + inside(text).x, y: 60 + 5 + inside(text).y,
+        x: 50 + 5 + 20 + inside(text).x, y: 60 + TOP_RULE_INSET + 5 + inside(text).y,
       });
     }
     // In-flow holder: cell content x is the inner PRE's x; POST (the anchor)
@@ -2155,8 +2160,10 @@ describe('page placement of positioned tables below table cells and in stories',
       };
       // Precondition: P is translated by its cell, so a painter that undid
       // that translation inside the story would move the child.
-      expect(pageOrigin('p').topLeft).toEqual({ x: 45, y: 40 });
-      expect(pageOrigin('r1a1').topLeft).toEqual({ x: 70, y: 100 });
+      // Below the cell's 1pt top rule.
+      expect(pageOrigin('p').topLeft).toEqual({ x: 45, y: 40 + TOP_RULE_INSET });
+      // Inside the child's and the marker table's top rules.
+      expect(pageOrigin('r1a1').topLeft).toEqual({ x: 70, y: 100 + 2 * TOP_RULE_INSET });
 
       const recorder = recordingCanvas();
       await paintLayoutPage(result, 0, recorder.canvas, { dpr: 1, scale: 1 }, { paint() {} });
@@ -2169,7 +2176,7 @@ describe('page placement of positioned tables below table cells and in stories',
       for (const text of ['p', ...markerTexts]) {
         expect(paintedAt(text), text).toEqual(pageOrigin(text).origin);
       }
-      expect(paintedAt('r1a1')).toEqual({ x: 70, y: 100 + pageOrigin('r1a1').baselinePt });
+      expect(paintedAt('r1a1')).toEqual({ x: 70, y: 100 + 2 * TOP_RULE_INSET + pageOrigin('r1a1').baselinePt });
     });
 
     it('acquires a text box in the continued part of a footnote on that part\'s page', () => {
@@ -2267,9 +2274,12 @@ describe('page placement of positioned tables below table cells and in stories',
       };
       const textStory = () => [nestedIn(positionedParent('text'), [280]), paragraph('tp') as BodyElement];
       const storyTexts = ['pre', 'post', 'tp'];
-      const page = direct();
+      // The page child sits clear of the tail's host-following lines, so only
+      // the host's movement (not a boundary wrap) is under test.
+      const page = direct(110);
+      const tailStory = () => [nestedIn(positionedParent('page', 110), [280]), paragraph('tp') as BodyElement];
 
-      for (const [label, content] of [['page', storyContent], ['text', textStory]] as const) {
+      for (const [label, content] of [['page', tailStory], ['text', textStory]] as const) {
         const result = noteTail(content);
         const boxes = indexed(result);
         const controlBoxes = indexed(bodyControl(content));
@@ -2301,7 +2311,8 @@ describe('page placement of positioned tables below table cells and in stories',
             expect({ x: once(boxes, text).x, y: once(boxes, text).y }, `page ${text}`)
               .toEqual({ x: at(page, text).x, y: at(page, text).y });
           }
-          expect({ x: once(boxes, 'r1a1').x, y: once(boxes, 'r1a1').y }).toEqual({ x: 70, y: 100 });
+          expect({ x: once(boxes, 'r1a1').x, y: once(boxes, 'r1a1').y })
+            .toEqual({ x: 70, y: 110 + 2 * TOP_RULE_INSET });
         }
 
         // Production paint of the tail page through its full transforms: each
@@ -2318,7 +2329,7 @@ describe('page placement of positioned tables below table cells and in stories',
         if (label === 'page') {
           const r1a1 = once(boxes, 'r1a1');
           const call = recorder.texts.find((candidate) => candidate.text === 'r1a1')!;
-          expect({ x: call.x, y: call.y }).toEqual({ x: 70, y: 100 + r1a1.origin.y - r1a1.y });
+          expect({ x: call.x, y: call.y }).toEqual({ x: 70, y: 110 + 2 * TOP_RULE_INSET + r1a1.origin.y - r1a1.y });
         }
       }
     });

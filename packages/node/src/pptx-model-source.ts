@@ -34,7 +34,7 @@ export async function openPptxSource(
 /** Selected-source PPTX acquisition, absent from the ordinary Node entry. */
 export async function acquirePptxInput(
   buffer: ArrayBuffer | Uint8Array,
-  options: OoxmlNodeSessionOptions,
+  options: OoxmlNodeSessionOptions & Pick<OpenPptxPresentationOptions, 'legacyPpt'>,
   wasmModule: () => WebAssembly.Module,
 ): Promise<PptxModelSourceAcquisition> {
   const {
@@ -43,7 +43,7 @@ export async function acquirePptxInput(
     validatePptxModelSourceViewDefaults,
   } = await import('@silurus/ooxml-pptx/internal/model-source-session');
   const input = await resolveNodeSessionInput(
-    buffer, 'pptx', options, validatePptxModelSourceArchive,
+    buffer, 'pptx', { ...options, source: options.legacyPpt }, validatePptxModelSourceArchive,
   );
   if (input.kind === 'ooxml') {
     return acquirePptxNodeSession(input.bytes, wasmModule(), options);

@@ -5,38 +5,65 @@ semantic versioning. While the major version is zero, minor releases may contain
 explicitly documented breaking changes; patch releases remain compatible with
 the corresponding minor release.
 
-## Unreleased
+## 0.89.0 — 2026-10-19
 
-- **Excel pictures anchored to one cell:** pictures saved with a one-cell
-  anchor (a top-left cell plus a fixed size, as written for example by
-  openpyxl) are now displayed at that size. Previously such a picture was
-  missing when its shape properties had no transform. No migration is
-  required.
-- **legacy Word section text flow:** with the experimental direct DOC source,
-  sections whose text flow runs downward with every character rotated, or
-  upward with later lines to the right, are now displayed in that direction
-  instead of horizontally. Horizontal and the existing upright-vertical
-  sections are unchanged, and the section direction authored in DOCX documents
-  is interpreted as before.
-- **Word text boxes in headers, footers and notes:** a text box inside a
-  header, footer or note now takes its page and section from that story. A
-  PAGE field in a header text box shows the number of the page it is printed
-  on; previously every page could show the same number. This also applies to
-  DOCX documents.
-- **pictures in tables on vertical Word pages:** an inline picture or chart in
-  a table that is laid out upright on a vertical page is now drawn upright
-  instead of turned a quarter turn. This also applies to DOCX documents.
-- **zero-height PowerPoint shapes:** a rectangle or other shape without text
-  whose height is zero now renders as a horizontal rule, as it does in
-  PowerPoint and Keynote, instead of a two-inch outlined box. Shapes that carry
-  text keep the existing auto-height behavior.
-- **cached Excel values only:** cells with `TODAY()` or `NOW()` formulas now
-  show the value saved with the workbook instead of the current date and time.
-  Cell formulas are never recalculated, so these cells stay consistent with
-  every cell derived from them. Conditional-formatting formulas are still
-  evaluated as before (including `TODAY()`/`NOW()` there); complete evaluation
-  is tracked in #1547. No migration is required; affected workbooks render
-  their saved dates.
+Compatible minor release laying out documents from the host's installed fonts
+and Windows Office rules, rendering full picture effects, speeding up first
+display, hardening parsing, and adding optional experimental legacy Office
+reading.
+
+- **Word layout from the host font:** lines are sized from the installed face
+  that paints each run (including absent authored faces and empty paragraph
+  marks), and DOCX/XLSX layout no longer depends on the viewer OS; where Word
+  for Windows and Mac differ on identical font data, Windows is followed.
+- **Windows Word rules:** single-sample constants were replaced with rules
+  measured against Windows Word: East Asian/Latin automatic spacing, justified
+  compression and kerning, line-grid snapping, blank-header reserve, page-top
+  spacing, footnote stacking, collapsed table rules, and page-anchored floating
+  tables that flow by their anchor. Picture bullets, picture brightness and
+  contrast, grouped VML, inline groups, rotated text boxes, numbering levels,
+  and text boxes in headers, footers and notes (including PAGE fields) now
+  render as authored.
+- **picture effects and fills:** the full DrawingML picture-effect chain renders
+  in DOCX, XLSX and PPTX, together with path gradients, preset patterns, WMF
+  clipping, Office-sized line ends and LZW-compressed TIFF strips (optional
+  codec). Tiled chart picture fills with huge offsets no longer hang.
+- **PowerPoint text:** faces, sizes and paragraph spacing follow the list-style
+  chain, built-in text styles, font alignment, compatible line spacing,
+  per-language theme fonts and stacked vertical WordArt; table styles, theme
+  overrides and equation fallbacks match PowerPoint more closely, and
+  zero-height text-less shapes render as rules.
+- **Excel sheets:** column widths derive from the first font; table and
+  PivotTable style font colours, time-only and fractional-second formats,
+  one-cell-anchored pictures and cached `TODAY()`/`NOW()` values display as
+  Excel saved them. The viewer adds a sheet list popover, whole-row/column
+  selection outlines and multi-band resizing; `XlsxSheetViewer` gains
+  `minRows`, `minCols`, `marginRows` and `marginCols`, and `xlsxWorksheetLimits`
+  adjusts worksheet budgets per load.
+- **charts:** box-and-whisker, histogram and Pareto ChartEx charts follow Office
+  aggregation, binning and paint order; date and time axis labels use the
+  worksheet formatter; chart category, value, legend, data-table, title and
+  text-box labels now keep authored line breaks.
+- **faster first display:** XLSX paints the first viewport before the worksheet
+  pull completes, PPTX regains its pre-v0.88.0 first-display speed, DOCX
+  main-mode layout is sliced to keep the UI responsive with lower retained
+  heap, and CJK line breaking is linear.
+- **hardening:** parser amplification and input-sized allocations are bounded,
+  parser and image budgets fail closed with messages naming the resource and
+  stage, Markdown output escapes document text, the MCP server and VS Code
+  webview confine file access, and the Rust zip dependency was upgraded for
+  published advisories.
+- **experimental legacy Office add-on:** the new `@silurus/ooxml-legacy-office`
+  package reads a supported subset of `.doc`, `.xls` and `.ppt` directly into
+  the existing viewers. Import `legacyDoc` from
+  `@silurus/ooxml-legacy-office/doc` and pass `{ legacyDoc }` (likewise
+  `legacyXls`, `legacyPpt`; `createLegacyDoc(...)` etc. for custom asset URLs).
+  Its version must match `@silurus/ooxml` exactly; unsupported input rejects.
+- **compatibility:** no option or method is removed or renamed, and no migration
+  is required. Applications that branch on `OoxmlError.code` should handle the
+  new codes `not-ooxml`, `unsupported-image-effect`, `invalid-numbering` and
+  `unsupported-content`. Rendering changes are intentional for affected
+  documents.
 
 ## 0.88.0 — 2026-09-21
 

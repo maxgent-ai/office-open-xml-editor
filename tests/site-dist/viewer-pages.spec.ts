@@ -289,3 +289,53 @@ test('PPTX single-comment margin has no trailing scroll range', async ({ page })
   await page.mouse.wheel(0, 100);
   await expect.poll(() => margin.evaluate((element) => element.scrollTop)).toBe(0);
 });
+
+// Exercise the actual published source modules and WASM URLs through the site's
+// production bundle. Mocked viewer tests cannot detect missing/rewritten sidecars.
+test('Try Yours loads only the selected experimental legacy reader', async ({ page }) => {
+  test.setTimeout(120_000);
+  const { buildDocFixture, buildXlsFixture } = await import('../../packages/legacy-office/src/test-fixtures');
+  const { buildPptShapeImageFillFixture } = await import('../../packages/legacy-office/src/ppt-shape-image-fill-fixture');
+  await page.route('https://fonts.googleapis.com/**', (route) => route.abort());
+  await page.route('https://fonts.gstatic.com/**', (route) => route.abort());
+  const requested: string[] = [];
+  const failures: string[] = [];
+  page.on('request', (request) => requested.push(request.url()));
+  page.on('pageerror', (error) => failures.push(error.message));
+  page.on('response', (response) => {
+    if (response.status() >= 400 && new URL(response.url()).origin === new URL(page.url()).origin) {
+      failures.push(`${response.status()} ${response.url()}`);
+    }
+  });
+  const legacyRequests = () => requested.filter((url) => /legacy[-_]/.test(url));
+  await page.goto('/');
+  await expect(page.locator('.caps-legacy')).toBeVisible();
+  expect(legacyRequests()).toEqual([]);
+  await page.goto('/try/');
+  await page.locator('#file').setInputFiles(docxSample);
+  await expect(page.locator('#status')).toContainText('rendered in', { timeout: 60_000 });
+  expect(legacyRequests()).toEqual([]);
+
+  for (const [family, format, bytes] of [
+    ['doc', 'docx', buildDocFixture({ text: 'Experimental document\r' })],
+    ['xls', 'xlsx', buildXlsFixture()],
+    ['ppt', 'pptx', buildPptShapeImageFillFixture()],
+  ] as const) {
+    requested.length = 0;
+    await page.locator('#file').setInputFiles({
+      name: `example.${family}`,
+      mimeType: 'application/octet-stream',
+      buffer: Buffer.from(bytes),
+    });
+    await expect(page.locator('#status')).toContainText('rendered in', { timeout: 60_000 });
+    await expect(page.locator('.try-preview')).toHaveAttribute('data-format', format);
+    await expect(page.locator('#stage canvas').first()).toBeVisible();
+    const urls = legacyRequests().join('\n');
+    expect(urls).toMatch(new RegExp(`legacy-${family}-source-module.*\\.mjs`));
+    expect(urls).toMatch(new RegExp(`legacy_${family}_direct_bg.*\\.wasm`));
+    for (const other of ['doc', 'xls', 'ppt'].filter((value) => value !== family)) {
+      expect(urls).not.toMatch(new RegExp(`legacy[-_]${other}[-_]`));
+    }
+  }
+  expect(failures).toEqual([]);
+});

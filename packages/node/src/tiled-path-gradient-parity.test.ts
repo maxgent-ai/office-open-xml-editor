@@ -23,13 +23,16 @@ describe.skipIf(!skia)('tiled path gradients retain main pixels in every format'
   let previous: PreviousPainters;
   beforeAll(async () => { previous = await loadPreviousPainters(); }, 60000);
   it.each(['rect', 'shape'] as const)('%s retains main tiled connector decoration bytes', path => {
-    const pixels = (paint: PreviousPainters['paintDrawingMLShape']) => {
+    // Line ends follow the Office-measured size rule (core arrow-geometry.ts),
+    // which main predates: main's 25 px sm head and today's 20 px lg head are
+    // the same 100 px triangle (no shaft survives retraction in either).
+    const pixels = (paint: PreviousPainters['paintDrawingMLShape'], main = false) => {
       const c = new (skia as NonNullable<typeof skia>).Canvas(400, 400);
       const ctx = c.getContext('2d') as unknown as CanvasRenderingContext2D;
       paint(ctx, {
         rect: { x: 200, y: 200, w: 50, h: 1 },
         geometry: { kind: 'preset', name: 'line', adjustments: [] }, fill: null,
-        stroke: { color: '000000', width: 20, tailEnd: { type: 'triangle', w: 'lg', len: 'lg' },
+        stroke: { color: '000000', width: main ? 25 : 20, tailEnd: { type: 'triangle', w: main ? 'sm' : 'lg', len: main ? 'sm' : 'lg' },
           fill: { fillType: 'gradient', gradType: 'radial', path, angle: 0,
             tileRect: { r: .5 }, flip: 'xy', fillToRect: { l: .1, r: .5, t: .4, b: .1 },
             stops: [{ position: 0, color: '000000' }, { position: .5, color: '808080' },
@@ -38,7 +41,7 @@ describe.skipIf(!skia)('tiled path gradients retain main pixels in every format'
       }, 1);
       return ctx.getImageData(0, 0, 400, 400).data;
     };
-    expect(pixels(paintDrawingMLShape)).toEqual(pixels(previous.paintDrawingMLShape));
+    expect(pixels(paintDrawingMLShape)).toEqual(pixels(previous.paintDrawingMLShape, true));
   }, 30000);
 
   it.each(['docx', 'pptx', 'xlsx'] as const)('%s retains rect/shape tile bytes', async format => {

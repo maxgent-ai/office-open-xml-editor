@@ -64,6 +64,7 @@
       "loadOfficeFontFallbacks",
       "preloadGoogleFonts",
       "prepareMathRuns",
+      "nativeRoutesPending",
       "firstPublication.promise",
       "layoutDocumentInputAsync",
       "doc._resourceUsage.then"

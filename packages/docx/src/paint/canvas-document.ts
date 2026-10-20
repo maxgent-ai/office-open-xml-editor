@@ -1,15 +1,19 @@
-import { assertNativeReadingImageAvailable } from './native-reading-image-availability.js';
-import { readingPictureBulletKeys } from './reading-picture-bullets.js';
+import { acquireVmlImageBrush } from './browser-vml-image-brush.js';
 import {
   withBitmapCacheLease,
+  OoxmlError,
   clampCanvasSize,
   defaultDpr,
   isHTMLCanvas,
-  isOoxmlDecodedImageLimitError,
-  isTiffDecodeError,
   isOptionalImageCodecUnavailableError,
   PT_TO_PX,
   chartImageFillKey,
+  chartImageFillNeedsRenderedSize,
+  chartImageFillPixelTransform,
+  chartFillRenderedSizeKey,
+  chartImageFillStoreLookup,
+  collectChartFillRenderedSizes,
+  assertChartFillRenderedSizeCount,
   chartImageFillUsageSize,
   collectChartImageFillUsages,
   collectChartImageFillUsagesForCharts,
@@ -28,6 +32,7 @@ import type {
 } from '../layout/types.js';
 import {
   decodeRaster,
+  isTerminalImageAcquisitionError,
   preloadPaintImages,
   imageKey,
   type DocxFetchImage,
@@ -45,7 +50,6 @@ import {
 import {
   createProductionPaintResourceSession,
   unavailablePaintResourceHandle,
-  isUnavailablePaintResourceHandle,
 } from './resource-session.js';
 import type { PaintCanvas2D } from './types.js';
 
@@ -55,9 +59,7 @@ interface PrivatePaintResourceLookup {
 }
 
 export interface CanvasDocumentPaintOptions<TTextRun> {
-  /** Internal document ownership check after every async acquisition, before
-   * the first clear/paint. It is not serialized or exposed as authored facts. */
-  readonly assertPublicationCurrent?: () => void;
+  readonly onDiagnostic?: (diagnostic: import('../layout/types.js').LayoutDiagnostic) => void;
   /** Internal provenance: bitmap/worker surfaces belong to the document, not a caller target. */
   readonly callerOwnedCanvasTarget?: boolean;
   /** The renderer validates this context before layout and paint retain the same instance. */
@@ -229,6 +231,7 @@ async function preparePageImages<TTextRun>(
       scale * effectiveDpr,
       options.svgDecoder,
       options.imageResources,
+      options.onDiagnostic,
     );
   } catch (error) {
     // A superseded render never reported an image preload failure.
@@ -280,10 +283,10 @@ async function resolveChartImages<TTextRun>(
     for (const descriptor of descriptors) {
       if (descriptor.kind !== 'chart') continue;
       for (const occurrence of chartOccurrencesByResource.get(descriptor.resourceKey) ?? []) {
-        if (!Number.isFinite(occurrence.widthPt)
-          || occurrence.widthPt <= 0
-          || !Number.isFinite(occurrence.heightPt)
-          || occurrence.heightPt <= 0) continue;
+        if (!Number.isFinite(occurrence.widthPt) || !Number.isFinite(occurrence.heightPt) || occurrence.widthPt < 0 || occurrence.heightPt < 0) {
+          throw new OoxmlError('unsupported-image-effect', 'Invalid chart image occurrence geometry');
+        }
+        if (occurrence.widthPt <= 0 || occurrence.heightPt <= 0) continue;
         const frame = {
           widthPt: occurrence.widthPt,
           heightPt: occurrence.heightPt,
@@ -305,7 +308,7 @@ async function resolveChartImages<TTextRun>(
         if (valid) chartOccurrences.push({ descriptor, frame, usages });
       }
     }
-    const chartEntries = new Map<string, {
+    type ChartEntry = {
       fill: ReturnType<typeof collectChartImageFillUsages>[number]['fill'];
       widthPt: number;
       heightPt: number;
@@ -313,7 +316,9 @@ async function resolveChartImages<TTextRun>(
       targetHeightPx?: number;
       preserveNaturalSize: boolean;
       hasSourceCrop: boolean;
-    }>();
+      renderedSize?: import('@silurus/ooxml-core').ChartFillRenderedSize;
+    };
+    const chartEntries = new Map<string, ChartEntry>();
     for (const usage of collectChartImageFillUsagesForCharts(
       chartOccurrences.map(
         ({ descriptor }) => descriptor.model as import('@silurus/ooxml-core').ChartModel,
@@ -324,7 +329,9 @@ async function resolveChartImages<TTextRun>(
       ) != null,
     )) {
       const { fill } = usage;
-      const key = chartImageFillKey(fill);
+      // Size-dependent chains are prepared per rendered size below.
+      if (chartImageFillNeedsRenderedSize(fill)) continue;
+      const key = chartFillRenderedSizeKey(fill);
       if (!chartEntries.has(key)) chartEntries.set(key, {
         fill,
         widthPt: 0,
@@ -333,10 +340,42 @@ async function resolveChartImages<TTextRun>(
         hasSourceCrop: usage.hasSourceCrop,
       });
     }
+    const admittedChartFills = new Set(collectChartImageFillUsagesForCharts(
+      chartOccurrences.map(({ descriptor }) => descriptor.model as import('@silurus/ooxml-core').ChartModel),
+      (usage, chartIndex) => chartImageFillUsageSize(usage, chartOccurrences[chartIndex]!.frame) != null,
+    ).map(({ fill }) => chartImageFillKey(fill)));
+    // A stretched fill whose chain is measured in physical units is
+    // evaluated per rendered size: a preparation pass of the same chart paint
+    // (canonical handler: point units, ptToPx 1) records each size. Returns
+    // the keys this round added.
+    const prepareRenderedSizes = (resolved?: import('@silurus/ooxml-core').ChartImageLookup): string[] => {
+      const added: string[] = [];
+      for (const { descriptor, frame } of chartOccurrences) {
+        for (const { fill, occurrence } of collectChartFillRenderedSizes(
+          descriptor.model as import('@silurus/ooxml-core').ChartModel,
+          { x: 0, y: 0, w: frame.widthPt, h: frame.heightPt },
+          1, 0, options.threeD, options.regionMap, options.chartEx, resolved,
+        )) {
+          if (!admittedChartFills.has(chartImageFillKey(fill))) continue;
+          const key = chartFillRenderedSizeKey(fill, undefined, occurrence);
+          if (chartEntries.has(key)) continue;
+          chartEntries.set(key, {
+            fill, widthPt: occurrence.widthPt, heightPt: occurrence.heightPt,
+            preserveNaturalSize: true, hasSourceCrop: fill.srcRect != null, renderedSize: occurrence,
+          });
+          added.push(key);
+        }
+      }
+      // The per-render ceiling covers every prepared chart source.
+      assertChartFillRenderedSizeCount(chartEntries.size);
+      return added;
+    };
+    prepareRenderedSizes();
     for (const { usages } of chartOccurrences) {
       for (const { usage, size } of usages) {
         const { fill } = usage;
-        const key = chartImageFillKey(fill);
+        if (chartImageFillNeedsRenderedSize(fill)) continue;
+        const key = chartFillRenderedSizeKey(fill);
         const prior = chartEntries.get(key);
         if (!prior) continue;
         const preserveNaturalSize = prior.preserveNaturalSize || usage.preserveNaturalSize;
@@ -358,9 +397,11 @@ async function resolveChartImages<TTextRun>(
         });
       }
     }
-    await Promise.all([...chartEntries].map(async ([key, entry]) => {
-      if (images.has(key)) {
-        const image = images.get(key);
+    const decodeChartEntry = async ([key, entry]: [string, ChartEntry]) => {
+      // The source preload keys plain chart fills by chartImageFillKey.
+      const preloadKey = entry.renderedSize ? undefined : chartImageFillKey(entry.fill);
+      if (preloadKey !== undefined && images.has(preloadKey)) {
+        const image = images.get(preloadKey);
         chartImages.set(
           key,
           isOptionalImageCodecUnavailableError(image, 'tiff') ? null : image ?? null,
@@ -368,8 +409,16 @@ async function resolveChartImages<TTextRun>(
         return;
       }
       const {
-        fill, widthPt, heightPt, targetWidthPx, targetHeightPx, hasSourceCrop,
+        fill, widthPt, heightPt, targetWidthPx, targetHeightPx, hasSourceCrop, renderedSize,
       } = entry;
+      // A per-size chain is evaluated on its rendered frame; other chains
+      // sample the source grid at the fill DPI (chartImageFillPixelTransform).
+      const transform = chartImageFillPixelTransform(fill, undefined, renderedSize);
+      const effectOrientation = transform && 'effects' in transform && !renderedSize
+        ? { emuPerPixelX: transform.emuPerPixelX, emuPerPixelY: transform.emuPerPixelY }
+        : undefined;
+      const effectWidthPt = fill.blipEffects?.length ? renderedSize?.widthPt ?? 0 : widthPt;
+      const effectHeightPt = fill.blipEffects?.length ? renderedSize?.heightPt ?? 0 : heightPt;
       const target = targetWidthPx && targetHeightPx
         ? { targetWidthPx, targetHeightPx }
         : undefined;
@@ -380,36 +429,55 @@ async function resolveChartImages<TTextRun>(
               workerDecoder: options.svgDecoder,
             })
           : getCachedSvgImageByPath(path, fetchImage);
-        const decodeFallback = () => fill.mimeType === 'image/svg+xml'
-          ? fill.duotone ? Promise.resolve(null) : decodeSvg(fill.imagePath)
+        const decodePath = (path: string, mime: string) => mime === 'image/svg+xml' && !fill.duotone
+          && !fill.blipEffects?.length
+          ? decodeSvg(path)
           : decodeRaster(
-              fill.imagePath, fill.mimeType, undefined, fetchImage as DocxFetchImage,
-              widthPt, heightPt, fill.duotone, true, options.tiff, target,
+              path, mime, undefined, fetchImage as DocxFetchImage,
+              effectWidthPt, effectHeightPt, fill.duotone, options.tiff,
+              fill.blipEffects?.length ? undefined : target,
+              undefined, options.svgDecoder, undefined,
+              fill.blipEffects?.length ? fill.blipEffects : undefined, effectOrientation,
             );
         let image: CanvasImageSource | null;
-        const blip = {
-          svgImagePath: fill.svgImagePath,
-          srcRect: hasSourceCrop ? true : null,
-        };
-        if (!fill.duotone && preferVectorBlip(blip)) {
+        const blip = { svgImagePath: fill.svgImagePath, srcRect: hasSourceCrop ? true : null };
+        if (!fill.blipEffects?.length && preferVectorBlip(blip)) {
           try {
-            image = await decodeSvg(blip.svgImagePath);
-          } catch {
-            image = await decodeFallback();
+            image = await decodePath(blip.svgImagePath, 'image/svg+xml');
+          } catch (error) {
+            if (isTerminalImageAcquisitionError(error)) throw error;
+            image = await decodePath(fill.imagePath, fill.mimeType);
           }
         } else {
-          image = await decodeFallback();
+          image = await decodePath(fill.imagePath, fill.mimeType);
         }
         chartImages.set(key, image);
+        if (!image) options.onDiagnostic?.({
+          code: 'MISSING_RESOURCE', severity: 'warning',
+          message: 'A chart picture fill produced no drawable output; the remaining chart content is rendered',
+        });
       } catch (error) {
         if (isOptionalImageCodecUnavailableError(error, 'tiff')) {
           chartImages.set(key, null);
           return;
         }
-        if (isOoxmlDecodedImageLimitError(error) || isTiffDecodeError(error)) throw error;
+        if (isTerminalImageAcquisitionError(error)) throw error;
+        options.onDiagnostic?.({
+          code: 'MISSING_RESOURCE', severity: 'warning',
+          message: 'A chart picture fill could not be acquired; the remaining chart content is rendered',
+        });
         chartImages.set(key, null);
       }
-    }));
+    };
+    await Promise.all([...chartEntries].map(decodeChartEntry));
+    // Occurrences derived from a decoded source's own frame (3-D plain-stack
+    // repetitions) are recorded once that source is known; each round
+    // repeats the paint with every source decoded so far.
+    for (;;) {
+      const added = prepareRenderedSizes(chartImageFillStoreLookup(chartImages, undefined, false));
+      if (added.length === 0) break;
+      await Promise.all(added.map(key => decodeChartEntry([key, chartEntries.get(key)!])));
+    }
   }
   return chartImages;
 }
@@ -483,7 +551,6 @@ async function renderSelectedDocumentPageLeased<TTextRun>(
 
     // Clearing the target (by resizing it) starts the page paint.
     const clearPage = (): void => {
-      options.assertPublicationCurrent?.();
       canvas.width = clamped.width;
       canvas.height = clamped.height;
       if (paintCanvas !== canvas) {
@@ -521,12 +588,9 @@ async function renderSelectedDocumentPageLeased<TTextRun>(
       return;
     }
 
-    // Changed resource owners must all be validated before clearing. Strict
-    // pages retain their established background-before-error behavior.
-    const readingBulletKeys = readingPictureBulletKeys(page);
-    const readingPage = readingBulletKeys.length !== 0 || page.layers.body.some(node =>
-      node.kind === 'paragraph' && (node.nativeReadingRelocations?.length ?? 0) > 0);
-    if (outcome.kind === 'failed') { if (!readingPage) clearPage(); throw outcome.error; }
+    // Decode and budget failures surface after the page background, before
+    // any content.
+    if (outcome.kind === 'failed') { clearPage(); throw outcome.error; }
     const { images, chartImages } = outcome.images;
 
     const session = createProductionPaintResourceSession(options.registry, (descriptor) => {
@@ -536,10 +600,12 @@ async function renderSelectedDocumentPageLeased<TTextRun>(
           : unavailablePaintResourceHandle('optional math renderer unavailable');
       }
       if (descriptor.kind === 'image' || descriptor.kind === 'picture-bullet') {
-        const image = images.get(imageKey(
+        const image = images.get(descriptor.blipEffects?.length ? descriptor.resourceKey : imageKey(
           descriptor.partPath,
           descriptor.colorReplaceFrom,
           descriptor.duotone as Duotone | undefined,
+          descriptor.vmlStrokePattern as Duotone | undefined,
+          descriptor.blipEffects,
         ));
         if (isOptionalImageCodecUnavailableError(image, 'tiff')) {
           return unavailablePaintResourceHandle(
@@ -547,6 +613,7 @@ async function renderSelectedDocumentPageLeased<TTextRun>(
             { placeholder: 'tiff' },
           );
         }
+        if (image && descriptor.vmlFill) return acquireVmlImageBrush(descriptor, image);
         return image ?? unavailablePaintResourceHandle(
           options.fetchImage
             ? 'unsupported image format produced no drawable output'
@@ -555,29 +622,6 @@ async function renderSelectedDocumentPageLeased<TTextRun>(
       }
       return undefined;
     });
-    for (const node of page.layers.body) {
-      if (node.kind !== 'paragraph' || !node.nativeReadingRelocations?.length) continue;
-      for (const id of node.nativeReadingRelocations) {
-        const drawing = node.drawings.find(candidate => candidate.id === id);
-        if (!drawing) throw new Error('Reading page lost a complete drawing');
-        for (const command of drawing.commands) {
-          if (command.kind !== 'resource') continue;
-          if (command.resourceKind !== 'image') throw new Error('Reading scene changed its resource class');
-          if (!command.nativeImagePlan || command.nativeImagePlan.source.resourceKey !== command.resourceKey
-            || command.orientation !== undefined) throw new Error('Reading image lost its acquired projection');
-          assertNativeReadingImageAvailable(session, command.nativeImagePlan, command.rect);
-        }
-      }
-    }
-    // Reading publication cannot replace a missing owned image with an
-    // optional-codec placeholder or silently paint nothing. Verify every
-    // selected marker before clearing the caller's existing surface.
-    for (const key of readingBulletKeys) {
-      const resource = session.resolve(key, 'picture-bullet');
-      if (isUnavailablePaintResourceHandle(resource.handle)) {
-        throw new Error('Reading picture bullet has no decoded owned image');
-      }
-    }
     // From this single clear through completed painting there is no await.
     clearPage();
 
@@ -587,7 +631,7 @@ async function renderSelectedDocumentPageLeased<TTextRun>(
         ? createCanonicalCanvasPaintResourceHandlers(
             options.threeD,
             options.regionMap,
-            fill => chartImages.get(chartImageFillKey(fill)),
+            chartImageFillStoreLookup(chartImages),
             options.chartEx,
           )
         : canonicalCanvasPaintResourceHandlers,
@@ -611,7 +655,7 @@ async function renderSelectedDocumentPageLeased<TTextRun>(
       destination.drawImage(paintCanvas, 0, 0);
     }
     if (options.onTextRun) {
-      for (const run of options.textRuns) { options.assertPublicationCurrent?.(); options.onTextRun(run); }
+      for (const run of options.textRuns) options.onTextRun(run);
     }
   } finally {
     releasePaintSurface?.();

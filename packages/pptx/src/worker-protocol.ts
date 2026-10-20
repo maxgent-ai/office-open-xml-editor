@@ -50,7 +50,7 @@ export type PptxWorkerRequest =
       kind: 'parse';
       id: number;
       buffer: ArrayBuffer;
-      /** Application-selected model source (LoadOptions.modelSources). */
+      /** Application-selected model source (LoadOptions.legacyPpt). */
       source?: import('@silurus/ooxml-core').ModelSourceModuleDescriptor;
       sourceTransfer?: readonly Transferable[];
       sourceOwnerUrl?: string;
@@ -101,7 +101,7 @@ export type RenderWorkerRequest =
       kind: 'parse';
       id: number;
       buffer: ArrayBuffer;
-      /** Application-selected model source (LoadOptions.modelSources). */
+      /** Application-selected model source (LoadOptions.legacyPpt). */
       source?: import('@silurus/ooxml-core').ModelSourceModuleDescriptor;
       sourceTransfer?: readonly Transferable[];
       sourceOwnerUrl?: string;

@@ -5,6 +5,16 @@ import type { StoryLayout } from './types.js';
 export interface HeaderFooterReserve {
   readonly top: number;
   readonly bottom: number;
+  /** Previous-pass provenance. A physical index can change section or slot when
+   * content moves; that observation cannot reserve a different destination. */
+  readonly observedPage?: Readonly<{
+    owner: string;
+    firstPageOfSection: boolean;
+    parityBlank: boolean;
+    /** Final retained-content anchor; it can lie after an authored empty page. */
+    firstContentPageIndex?: number;
+    pageNumber: Readonly<{ displayNumber: number; format: import('@silurus/ooxml-core').NumberFormat }>;
+  }>;
   /**
    * Page-final flow top of each footnote, by note id, whose story is band
    * dependent (StoryLayout.bandDependent: it holds §17.4.57 positioned
@@ -91,50 +101,15 @@ export function headerFooterOverflowReservePt(
 }
 
 /**
- * ECMA-376 §17.6.11 bases a non-negative top margin on the extent of header
- * text. Controlled Word output showed that an undecorated paragraph containing
- * only U+0020 contributes no body overflow even at 36 pt, while a visible glyph
- * at that size does. A paragraph border also contributes. This intentionally
- * recognizes only that measured non-painting class; tabs, other whitespace,
- * fields, objects, and decorations keep their acquired extent.
+ * ECMA-376 §17.6.11: use the acquired header story extent for a non-negative
+ * top margin, including empty and space-only paragraphs. Windows Word
+ * 16.0.20430 controls retain that extent across default/first/both selections,
+ * empty/space/glyph content, tight/room geometry, 11/36pt, 0/8pt spacing-after,
+ * and Header/Normal styles (144 cases). Earlier Mac Word evidence suggesting
+ * zero reserve for a single undecorated blank paragraph does not hold here.
  */
 export function headerStoryBodyReserveExtentPt(story: StoryLayout): number {
-  // The Office controls covered one paragraph. A longer blank header can
-  // carry its own vertical extent, so do not infer the same suppression there.
-  const onlyUndecoratedSpaces = story.blocks.length <= 1 && story.blocks.every((block) =>
-    block.kind === 'paragraph'
-    && block.borders.length === 0
-    && block.shading === undefined
-    && block.resources.length === 0
-    && block.drawings.length === 0
-    && block.textBoxes.length === 0
-    && block.events.length === 0
-    && block.exclusions.length === 0
-    && (block.lineNumbers?.length ?? 0) === 0
-    && (block.anchorFrames?.length ?? 0) === 0
-    && block.lines.every((line) =>
-      (line.barTabRules?.length ?? 0) === 0
-      && line.placements.every((placement) =>
-        placement.kind === 'text'
-        && /^ *$/.test(placement.text)
-        && placement.role !== 'field-result'
-        && placement.dependency === undefined
-        && placement.hyperlink === undefined
-        && placement.paintOps.every((op) => /^ *$/.test(op.text))
-        && placement.decorations.length === 0
-        && placement.highlight === undefined
-        && (placement.highlightFragments?.length ?? 0) === 0
-        && placement.background === undefined
-        && placement.runBorder === undefined
-        && (placement.runBorderFragments?.length ?? 0) === 0
-        && placement.ruby === undefined
-        && placement.emphasis === undefined
-        && placement.emphasisMark === undefined
-        && placement.noteReference === undefined,
-      ),
-    ),
-  );
-  return onlyUndecoratedSpaces ? 0 : story.advancePt;
+  return story.advancePt;
 }
 
 export interface HeaderFooterReserveIteration<T> extends LayoutIteration {

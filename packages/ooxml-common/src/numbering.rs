@@ -9,9 +9,7 @@ use std::hash::Hash;
 
 mod format;
 #[doc(hidden)]
-pub use format::format_counter;
-#[doc(hidden)]
-pub use format::format_word_synthetic_zero;
+pub use format::{format_counter, format_counter_within};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CounterError {
@@ -271,34 +269,36 @@ where
         identity: CounterIdentity<Shared, Orphan>,
         level: u32,
         counter: u32,
-        start_at: impl FnMut(u32) -> u32,
+        mut start_at: impl FnMut(u32) -> u32,
         effective_level: impl FnMut(u32) -> Option<LevelFacts<'a>>,
     ) -> String {
-        self.resolve_text_with_zero_mode(identity, level, counter, false, start_at, effective_level)
+        self.resolve_text_with_formatter(
+            identity,
+            level,
+            counter,
+            effective_level,
+            |index, live, format| {
+                format::format_counter_within(
+                    live.unwrap_or_else(|| start_at(index)),
+                    format,
+                    MAX_MARKER_BYTES,
+                )
+            },
+        )
     }
 
-    /// Resolve a marker whose own level shows Word's synthetic zero (see
-    /// [`word_level_use`]). This is a display-only value, not a live counter;
-    /// a reset placeholder also shows its format's synthetic zero until its
-    /// counter becomes live.
-    pub fn resolve_text_word_zero<'a>(
-        &self,
-        identity: CounterIdentity<Shared, Orphan>,
-        level: u32,
-        start_at: impl FnMut(u32) -> u32,
-        effective_level: impl FnMut(u32) -> Option<LevelFacts<'a>>,
-    ) -> String {
-        self.resolve_text_with_zero_mode(identity, level, 0, true, start_at, effective_level)
-    }
-
-    fn resolve_text_with_zero_mode<'a>(
+    /// Expand level text using the adapter's counter-display policy. The
+    /// formatter receives the referenced level, its live value (the supplied
+    /// `counter` for the marker's own level), and its effective number format.
+    /// An absent ancestor value is left for the adapter to resolve; display-only
+    /// fallback values must not become live counter state.
+    pub fn resolve_text_with_formatter<'a>(
         &self,
         identity: CounterIdentity<Shared, Orphan>,
         level: u32,
         counter: u32,
-        word_zero: bool,
-        mut start_at: impl FnMut(u32) -> u32,
         mut effective_level: impl FnMut(u32) -> Option<LevelFacts<'a>>,
+        mut render_counter: impl FnMut(u32, Option<u32>, &str) -> Option<String>,
     ) -> String {
         let Some(current) = effective_level(level) else {
             return format!("{counter}.");
@@ -313,7 +313,6 @@ where
                     .get(&identity)
                     .and_then(|counts| counts.get(ancestor))
             };
-            let value = live.unwrap_or_else(|| start_at(ancestor));
             // 17.9.4 applies to this marker's entire displayed level text,
             // including its own placeholder. Keep authored formats intact so
             // other markers continue to use their own definitions.
@@ -327,14 +326,50 @@ where
             let rendered = if format == "bullet" {
                 // A bullet uses literal lvlText; Word suppresses a numeric
                 // placeholder even when the level text contains one.
-                String::new()
-            } else if word_zero && (ancestor == level || live.is_none()) {
-                format::format_word_synthetic_zero(format)
+                Some(String::new())
             } else {
-                format::format_counter(value, format)
+                render_counter(ancestor, live, format)
             };
-            text = text.replace(&format!("%{}", u64::from(ancestor) + 1), &rendered);
+            let placeholder = format!("%{}", u64::from(ancestor) + 1);
+            // Bound the expanded marker before allocating it: a huge counter
+            // value in a repeating alphabet (`w:start`/`w:startOverride` are
+            // uncapped ST_DecimalNumber values) or a level text repeating one
+            // placeholder many times would otherwise multiply into gigabytes.
+            // Crossing MAX_MARKER_BYTES fails the parse with a typed hard-limit
+            // violation rather than truncating the marker.
+            let limit = MAX_MARKER_BYTES as u64;
+            // A counter whose own rendering already exceeds the budget is
+            // reported as one byte over it (its exact size is never built).
+            let observed = match &rendered {
+                Some(rendered) => {
+                    let occurrences = text.matches(placeholder.as_str()).count() as u64;
+                    (text.len() as u64 - occurrences * placeholder.len() as u64)
+                        .saturating_add(occurrences.saturating_mul(rendered.len() as u64))
+                }
+                None => limit + 1,
+            };
+            let Some(rendered) = rendered.filter(|_| observed <= limit) else {
+                let _ = crate::resource::observe_hard_limit(
+                    crate::resource::HardResourceLimitKind::NumberingMarkerBytes,
+                    None,
+                    limit,
+                    observed,
+                );
+                return String::new();
+            };
+            text = text.replace(&placeholder, &rendered);
             highest = ancestor.checked_sub(1);
+        }
+        // Literal level text without placeholders never enters the loop; the
+        // retained marker obeys the same ceiling.
+        if text.len() > MAX_MARKER_BYTES {
+            let _ = crate::resource::observe_hard_limit(
+                crate::resource::HardResourceLimitKind::NumberingMarkerBytes,
+                None,
+                MAX_MARKER_BYTES as u64,
+                text.len() as u64,
+            );
+            return String::new();
         }
         text
     }
@@ -369,46 +404,6 @@ where
             },
             format_at,
         )
-    }
-}
-
-/// Word's paragraph level byte (DOCX `w:ilvl` after its lexical narrowing;
-/// see the DOCX adapter) mapped to the level that paints the marker and the
-/// level whose counter advances. Separate the formatting source from the
-/// advancing counter. ECMA-376 Part 1
-/// §17.9 defines only the reference/definition relationship; MS-OI29500
-/// §2.1.277 documents Word's 0..255 authoring limit, not its malformed-value
-/// rendering. These branches are observations from Word 16.113 controls:
-/// every byte 0..255; signed, leading-zero, plus, 2^31 and 2^32 boundaries;
-/// a two-level definition; a level-8 replacement; and style-origin numPr.
-/// Each control placed levels 0, 1, and 8 before/after the target and checked
-/// its marker and subsequent counters. Values 16..255 repeat every 16 bytes;
-/// 9..15 have the special first-block behavior encoded below. The fixed `9`
-/// is a fresh fallback marker value, even when level 8 has startOverride=20.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WordLevelUse {
-    pub marker_level: Option<u32>,
-    pub counter_level: Option<u32>,
-    /// `Some(0)` or `Some(9)` uses a display value independent of any counter.
-    pub fixed_counter: Option<u32>,
-}
-
-pub fn word_level_use(ilvl: u8) -> WordLevelUse {
-    let (marker_level, counter_level, fixed_counter) = match ilvl {
-        0..=8 => (Some(u32::from(ilvl)), Some(u32::from(ilvl)), None),
-        9..=12 => (None, None, None),
-        13..=14 => (Some(8), None, Some(9)),
-        15 => (Some(0), Some(0), None),
-        _ => match ilvl % 16 {
-            level @ 0..=7 => (Some(8), Some(u32::from(level)), Some(0)),
-            8 => (Some(8), Some(8), None),
-            _ => (Some(8), None, Some(9)),
-        },
-    };
-    WordLevelUse {
-        marker_level,
-        counter_level,
-        fixed_counter,
     }
 }
 

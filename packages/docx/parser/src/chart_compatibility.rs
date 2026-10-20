@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 /// default-theme output is #898989 without hard-coding that color across
 /// custom themes. Styles 41..48 retain Table 3's chart-area fill and suppress
 /// the outline. Linked style roles remain a separate, higher layer.
+/// `word-classic-chart-space-frame`
 pub(crate) fn apply_word_classic_chart_space_frame(chart: &mut ChartModel) {
     // ECMA-376 leaves automatic plot placement to the consumer. Across a
     // Word-produced matrix covering all built-in numeric styles 1..48, classic

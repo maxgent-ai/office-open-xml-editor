@@ -10,6 +10,9 @@ import {
 import type { ParsedWorkbook, Row, Worksheet } from './types.js';
 import { XLSX_WORKSHEET_PULL_BYTES } from './worksheet-pull-worker.js';
 import { decodeWorksheetPullChunk, type WorksheetPreviewBlocker } from './worksheet-pull-codec.js';
+import { throwIfAborted } from '@silurus/ooxml-core/internal/abort';
+
+const ABORT_MESSAGE = 'XLSX workbook session was aborted';
 
 export type XlsxWorksheetPullUnit =
   | {
@@ -81,7 +84,7 @@ export class XlsxWorksheetPullClient {
       throw new RangeError('sheetIndex must be a non-negative safe integer');
     }
     if (!sheetName) throw new TypeError('sheetName must be non-empty');
-    throwIfAborted(signal);
+    throwIfAborted(signal, ABORT_MESSAGE);
 
     const sessionId = this.nextSessionId++;
     const identity = {
@@ -101,7 +104,7 @@ export class XlsxWorksheetPullClient {
     try {
       await this.options.open(sheetIndex, sheetName, identity, this.options.timeoutMs);
       for (;;) {
-        throwIfAborted(signal);
+        throwIfAborted(signal, ABORT_MESSAGE);
         const chunk = await session.pull(XLSX_WORKSHEET_PULL_BYTES, { signal });
         try {
           const usage = chunk.usage ?? session.usageCheckpoint;
@@ -186,11 +189,4 @@ function cancelReason(error: unknown): PullCancelReason {
     return 'abort';
   }
   return error === undefined ? 'closed' : 'request-error';
-}
-
-function throwIfAborted(signal: AbortSignal | undefined): void {
-  if (!signal?.aborted) return;
-  const error = new Error('XLSX workbook session was aborted');
-  error.name = 'AbortError';
-  throw error;
 }

@@ -87,7 +87,9 @@ describe('Node bounded XLSX worksheet row iterator', () => {
     expect(complete.workbookIndex).toEqual(index);
     expect(complete.worksheets).toEqual([worksheet]);
     expect(Object.isFrozen(complete.workbookIndex)).toBe(false);
-  });
+    // ~2.0 s on an idle machine; the default 5 s budget timed out when
+    // the suite ran on a loaded machine.
+  }, 30_000);
 
   it('matches the synchronous compatibility parse across multiple pulls', async () => {
     const expected = await materializeXlsxWorksheet(bytes, 0);
@@ -109,7 +111,9 @@ describe('Node bounded XLSX worksheet row iterator', () => {
     expect(terminal).toBeDefined();
     expect(terminal?.rows).toEqual([]);
     expect({ ...terminal, rows }).toEqual(expected);
-  });
+    // ~2.4 s on an idle machine; the default 5 s budget timed out when
+    // the suite ran on a loaded machine.
+  }, 30_000);
 
   it('honors an exact per-entry boundary and returns the canonical typed error one byte below it', async () => {
     let rowCount = 0;

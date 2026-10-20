@@ -48,9 +48,21 @@ pub struct Presentation {
     pub fol_hlink_color: Option<String>,
 }
 
+/// Part-local renderer defaults after theme and color-map inheritance.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SlideTheme {
+    pub default_text_color: Option<String>,
+    pub major_font: Option<String>,
+    pub minor_font: Option<String>,
+    pub hlink_color: Option<String>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Slide {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub theme: Option<SlideTheme>,
     pub index: usize,
     /// 1-based slide number (index + 1); used for slidenum field rendering
     pub slide_number: usize,
@@ -238,6 +250,9 @@ pub struct ChartElement {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct TableElement {
+    /// Part 3 §9.3: whole-branch recovery also applies to equations in table cells.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub math_fallback: Option<EquationBranchFallback>,
     /// ECMA-376 §20.1.4.2.25 `tblBg`: painted once below cell fills so
     /// transparent bands reveal the theme background rather than the slide.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -449,9 +464,24 @@ pub struct Sp3d {
     pub bevel_b: Option<Bevel3d>,
 }
 
+/// One equation MCE branch's emitted element range and parsed preview.
+/// Counts are relative to a text-bearing anchor in the flattened spTree stream.
+/// Recovery replaces the complete branch, independently of the anchor kind.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct EquationBranchFallback {
+    pub elements: Vec<SlideElement>,
+    pub before: usize,
+    pub after: usize,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ShapeElement {
+    /// Part 3 §9.3: retained equation preview for a runtime conversion failure.
+    /// The live Choice is authoritative while its equations render successfully.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub math_fallback: Option<EquationBranchFallback>,
     pub x: i64,
     pub y: i64,
     pub width: i64,
@@ -628,7 +658,8 @@ pub struct PictureElement {
     /// source width/height. Only serialized when any edge is non-zero.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub src_rect: Option<SrcRect>,
-    /// a:blip > a:alphaModFix@amt (0.0–1.0). None = fully opaque.
+    /// Legacy picture opacity. Parsed alphaModFix lives in blip_effects; this
+    /// remains empty to avoid modulating later color/alpha replacements twice.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub alpha: Option<f64>,
     /// ECMA-376 §20.1.8.23 `<a:duotone>` recolour effect, resolved to its two
@@ -790,7 +821,8 @@ pub enum Fill {
         /// `fill_rect` is then `None`.
         #[serde(skip_serializing_if = "Option::is_none")]
         tile: Option<TileInfo>,
-        /// `a:blip > a:alphaModFix@amt` as a fraction (0.0–1.0). None = opaque.
+        /// Legacy image-fill opacity. Parsed alphaModFix is baked once by
+        /// blip_effects; this stays empty for parsed DrawingML.
         #[serde(skip_serializing_if = "Option::is_none")]
         alpha: Option<f64>,
         /// ECMA-376 §20.1.8.23 `<a:duotone>` recolour effect, resolved to its two
@@ -1117,6 +1149,20 @@ pub struct TabStop {
     pub algn: String,
 }
 
+/// Inline MCE recovery retains one alternative for the complete selected run
+/// range [start, end), not one copy per equation (ECMA-376 Part 3 §§9.3–9.4).
+/// Requires-based selection is normative; conversion-failure recovery is library
+/// policy. Only the authored fallback's plain text is retained here.
+/// Nested alternatives are emitted inner first, so equal ranges end with the
+/// outermost alternative.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct InlineEquationFallback {
+    pub start: usize,
+    pub end: usize,
+    pub text: String,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Paragraph {
@@ -1185,6 +1231,8 @@ pub struct Paragraph {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub font_algn: Option<String>,
     pub runs: Vec<TextRun>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub math_fallbacks: Vec<InlineEquationFallback>,
     /// Formatting at the insertion point after the last character.  It is
     /// never merged into existing a:r/a:fld runs (ECMA-376 §21.1.2.2.2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1221,6 +1269,10 @@ pub enum TextRun {
     /// for `m:oMathPara` (block) math, false for inline `m:oMath`.
     #[serde(rename_all = "camelCase")]
     Math {
+        /// Legacy per-equation preview; newly parsed inline MCE alternatives use
+        /// Paragraph.math_fallbacks to preserve the complete branch boundary.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fallback_text: Option<String>,
         nodes: Vec<MathNode>,
         display: bool,
         /// Paragraph default run size (pt) if declared; None → renderer inherits.
@@ -1458,6 +1510,11 @@ impl GroupTransform {
 pub fn apply_group_transform_to_element(el: &mut SlideElement, gt: &GroupTransform) {
     match el {
         SlideElement::Shape(s) => {
+            if let Some(fallback) = &mut s.math_fallback {
+                for element in &mut fallback.elements {
+                    apply_group_transform_to_element(element, gt);
+                }
+            }
             let t = Transform {
                 x: s.x,
                 y: s.y,
@@ -1515,6 +1572,11 @@ pub fn apply_group_transform_to_element(el: &mut SlideElement, gt: &GroupTransfo
             p.flip_v = nt.flip_v;
         }
         SlideElement::Table(tbl) => {
+            if let Some(fallback) = &mut tbl.math_fallback {
+                for element in &mut fallback.elements {
+                    apply_group_transform_to_element(element, gt);
+                }
+            }
             // If the table has no xfrm (zero dimensions), it fills the group's child space.
             let (ex, ey, ecx, ecy) = if tbl.width == 0 && tbl.height == 0 {
                 (gt.ch_x, gt.ch_y, gt.ch_cx, gt.ch_cy)

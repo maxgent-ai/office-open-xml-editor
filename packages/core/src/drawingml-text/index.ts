@@ -1,4 +1,4 @@
-export { drawingMlCodePointCount, measureDrawingMlAdvance } from './measure.js';
+export { measureDrawingMlAdvance } from './measure.js';
 export { breakDrawingMlText } from './break.js';
 export type {
   DrawingMlInputRun,
@@ -14,13 +14,16 @@ export { drawingMlLineX, drawingMlLineShouldJustify } from './align.js';
 export { paintDrawingMlLine } from './paint.js';
 export { resolveDrawingMlTabWidths } from './tab.js';
 export type { DrawingMlTabItem, DrawingMlTabStop } from './tab.js';
-export { wrapSpreadsheetCellParagraph, layoutSpreadsheetCellRichLines } from './spreadsheet-cell.js';
-export type { SpreadsheetCellRichSeg, SpreadsheetCellRichLine } from './spreadsheet-cell.js';
 export { layoutStackedText } from './stacked.js';
 export type {
   StackedDirection, StackedGlyph, StackedGlyphKind, StackedParagraph, StackedLayoutOptions, StackedPlacedGlyph,
   StackedColumn, StackedLayout,
 } from './stacked.js';
 export {
-  STACKED_CELL_FACTOR, stackedCellBoxOverride, stackedFaceBox, stackedSidewaysCharacter, stackedVerticalGlyph,
+  STACKED_CELL_FACTOR, stackedFaceBox, stackedSidewaysCharacter, stackedVerticalGlyph,
 } from './stacked-faces.js';
+export {
+  stackedClusters, stackedVerticalGlyphText, stackedUprightBaseline, paintStackedVerticalForm,
+  paintStackedRotated,
+} from './stacked-glyphs.js';
+export type { StackedFace, StackedCluster, StackedClusterAdvances } from './stacked-glyphs.js';

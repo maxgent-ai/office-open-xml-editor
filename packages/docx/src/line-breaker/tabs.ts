@@ -166,6 +166,7 @@ function resolveBidiTabStops(
 
   // Width of the content run immediately FOLLOWING index `i` in reading order
   // (up to the next tab / line end) — the trailing/centered stop needs it.
+  // `word-rtl-decimal-tab-physical-alignment`
   const followAlignmentWidth = (
     from: number,
     role: ReturnType<typeof tabAlignmentRole>,

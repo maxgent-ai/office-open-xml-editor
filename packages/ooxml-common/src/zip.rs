@@ -5,7 +5,7 @@
 
 use crate::resource::{
     self, OoxmlFormat, ResourceGovernor, ResourceScope, HARD_MAX_ARCHIVE_ENTRIES,
-    HARD_MAX_ARCHIVE_ENTRY_BYTES, HARD_MAX_CENTRAL_DIRECTORY_BYTES,
+    HARD_MAX_CENTRAL_DIRECTORY_BYTES,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -56,6 +56,11 @@ struct ArchivePreflight {
     entry_count: u64,
     entries: Vec<PreflightEntryIdentity>,
     archive_base: u64,
+    /// What the ZIP reader may see while it builds its index.
+    index_view: IndexView,
+    /// (locator, record) offsets when the directory was validated through a
+    /// ZIP64 footer; `None` for a classic footer.
+    zip64_footer: Option<(usize, usize)>,
 }
 
 #[derive(Debug)]
@@ -100,7 +105,7 @@ impl ArchivePreflight {
             let matches = entry.name_raw() == expected.name.as_ref()
                 && entry.central_header_start() == expected.central_header_start
                 && entry.header_start() == expected.local_header_start
-                && entry.data_start() == expected.data_start
+                && entry.data_start() == Some(expected.data_start)
                 && entry.compressed_size() == expected.compressed_size
                 && entry.size() == expected.uncompressed_size
                 && entry.crc32() == expected.crc32
@@ -284,15 +289,18 @@ fn inspect_zip64_candidates(
         if validate_central_directory_structure(data, directory).is_err() {
             continue;
         }
-        if resolved_directory.replace(directory).is_some() {
+        if resolved_directory.replace((directory, zip64)).is_some() {
             return Err("ambiguous ZIP64 end-of-central-directory records".to_string());
         }
     }
-    let Some(directory) = resolved_directory else {
+    let Some((directory, zip64)) = resolved_directory else {
         return Ok(None);
     };
     match inspect_central_directory(data, directory) {
-        Ok(preflight) => Ok(Some(preflight)),
+        Ok(mut preflight) => {
+            preflight.zip64_footer = Some((locator, zip64));
+            Ok(Some(preflight))
+        }
         Err(CandidateError::Malformed) => Ok(None),
         Err(CandidateError::Rejected(error)) => Err(error),
     }
@@ -804,7 +812,224 @@ fn inspect_central_directory(
         entry_count: directory.entry_count,
         entries,
         archive_base: directory.archive_base,
+        index_view: IndexView {
+            range: directory.start..directory.start,
+            rewrites: Vec::new(),
+            hidden: Vec::new(),
+            footers: Vec::new(),
+        },
+        zip64_footer: None,
     })
+}
+
+/// ZIP64 extended information extra field id (APPNOTE 4.5.3).
+const ZIP64_EXTRA_FIELD_ID: u16 = 0x0001;
+/// An extra-field id the ZIP reader does not interpret.
+const OPAQUE_EXTRA_FIELD_ID: u16 = 0x7a7a;
+
+/// The extra block the ZIP reader sees: the first complete ZIP64 field, then
+/// one opaque filler field (or, for fewer than four remaining bytes, zero
+/// padding the reader skips). The length is unchanged, the reader keeps one
+/// ignored field per record however many fields the block holds, and it
+/// cannot reject unrelated or truncated metadata.
+fn opaque_extra_block(extra: &[u8]) -> Box<[u8]> {
+    let mut block = Vec::with_capacity(extra.len());
+    let mut cursor = 0;
+    while let (Some(id), Some(len)) = (le_u16(extra, cursor), le_u16(extra, cursor + 2)) {
+        let Some(field) = extra.get(cursor..cursor + 4 + len as usize) else {
+            break;
+        };
+        // Only the first ZIP64 field carries the validated sizes and offsets
+        // (the preflight reads the same one); repeats join the filler.
+        if id == ZIP64_EXTRA_FIELD_ID && block.is_empty() {
+            block.extend_from_slice(field);
+        }
+        cursor += field.len();
+    }
+    let rest = extra.len() - block.len();
+    if rest >= 4 {
+        block.extend_from_slice(&OPAQUE_EXTRA_FIELD_ID.to_le_bytes());
+        block.extend_from_slice(&((rest - 4) as u16).to_le_bytes());
+    }
+    block.resize(extra.len(), 0);
+    block.into_boxed_slice()
+}
+
+/// What a ZIP reader may observe while it builds its index from a package
+/// whose footer and central directory a preflight has already validated.
+///
+/// - Only `range` (the central directory through the EOCD fixed fields) is
+///   visible; payloads and the archive comment read as zero, so inert bytes
+///   there can never be taken for a footer.
+/// - Every central extra field except ZIP64 (which carries the validated
+///   sizes and offsets) is opaque. OPC never uses that metadata, and the
+///   reader would otherwise reject some APPNOTE-valid encodings (an NTFS
+///   attribute sequence, an empty timestamp) and then retry other footers.
+/// - Entry comments read as zero, so their bytes are never footer-like.
+/// - A fixed-size footer read (EOCD, ZIP64 locator or record) at any other
+///   position than the validated ones fails, so the reader can never index an
+///   unvalidated directory. Comments read as zero and non-ZIP64 extra ids
+///   are remapped, so only a name that itself begins with a footer
+///   signature (never a valid OPC part name in practice) can collide; such a
+///   package fails closed.
+#[derive(Debug, Clone)]
+pub struct IndexView {
+    range: std::ops::Range<usize>,
+    /// Replacement bytes for each directory record's extra block, sorted by
+    /// offset: its complete ZIP64 fields, then one opaque filler field.
+    rewrites: Vec<(usize, Box<[u8]>)>,
+    /// Entry comments: metadata OPC never uses, read as zero while indexing.
+    hidden: Vec<std::ops::Range<usize>>,
+    footers: Vec<usize>,
+}
+
+impl IndexView {
+    /// Build the view for a validated `[directory_start, eocd)` central
+    /// directory region ending in the EOCD at `eocd`; `zip64_records` are the
+    /// validated ZIP64 locator/record offsets, if any.
+    pub fn for_validated_directory(
+        data: &[u8],
+        directory_start: usize,
+        eocd: usize,
+        zip64_records: &[usize],
+    ) -> Self {
+        let mut rewrites = Vec::new();
+        let mut hidden = Vec::new();
+        let mut cursor = directory_start;
+        while cursor + 46 <= eocd
+            && le_u32(data, cursor) == Some(CENTRAL_DIRECTORY_HEADER_SIGNATURE)
+        {
+            let (Some(name_len), Some(extra_len), Some(comment_len)) = (
+                le_u16(data, cursor + 28),
+                le_u16(data, cursor + 30),
+                le_u16(data, cursor + 32),
+            ) else {
+                break;
+            };
+            let name_start = cursor + 46;
+            let extra_start = name_start + name_len as usize;
+            let extra_end = (extra_start + extra_len as usize).min(eocd);
+            let comment_start = extra_start + extra_len as usize;
+            hidden.push(comment_start..comment_start + comment_len as usize);
+            if extra_len > 0 && extra_end == extra_start + extra_len as usize {
+                rewrites.push((
+                    extra_start,
+                    opaque_extra_block(&data[extra_start..extra_end]),
+                ));
+            }
+            cursor = extra_start + extra_len as usize + comment_len as usize;
+        }
+        let mut footers = zip64_records.to_vec();
+        footers.push(eocd);
+        Self {
+            range: directory_start..eocd + 22,
+            rewrites,
+            hidden,
+            footers,
+        }
+    }
+
+    /// Fill `output` with the view of `data` starting at `start`.
+    pub fn read(&self, data: &[u8], start: usize, output: &mut [u8]) -> std::io::Result<usize> {
+        let start = start.min(data.len());
+        let count = output.len().min(data.len() - start);
+        let end = start + count;
+        let footer_block = match output.len() {
+            22 => Some(EOCD_SIGNATURE),
+            20 => Some(ZIP64_LOCATOR_SIGNATURE),
+            56 => Some(ZIP64_EOCD_SIGNATURE),
+            _ => None,
+        };
+        output[..count].fill(0);
+        let visible_start = start.max(self.range.start);
+        let visible_end = end.min(self.range.end);
+        if visible_start < visible_end {
+            output[visible_start - start..visible_end - start]
+                .copy_from_slice(&data[visible_start..visible_end]);
+        }
+        let first = self
+            .rewrites
+            .partition_point(|(at, bytes)| at + bytes.len() <= start);
+        for (at, bytes) in self.rewrites[first..]
+            .iter()
+            .take_while(|(at, _)| *at < end)
+        {
+            let from = (*at).max(start);
+            let to = (at + bytes.len()).min(end);
+            output[from - start..to - start].copy_from_slice(&bytes[from - at..to - at]);
+        }
+        let first_hidden = self.hidden.partition_point(|range| range.end <= start);
+        for range in self.hidden[first_hidden..]
+            .iter()
+            .take_while(|range| range.start < end)
+        {
+            let hidden_start = range.start.max(start);
+            let hidden_end = range.end.min(end);
+            if hidden_start < hidden_end {
+                output[hidden_start - start..hidden_end - start].fill(0);
+            }
+        }
+        // Judge what the reader would see: hidden bytes are never footers.
+        if footer_block.is_some_and(|signature| le_u32(output, 0) == Some(signature))
+            && !self.footers.contains(&start)
+        {
+            return Err(std::io::Error::other("unvalidated ZIP footer record"));
+        }
+        Ok(count)
+    }
+}
+
+/// The reader handed to the ZIP crate. While it builds its index (the only
+/// time it reads footers and the central directory), just `index_range` (the
+/// validated directory, any ZIP64 footer records and the EOCD fixed fields)
+/// is visible: every other byte, payloads and the archive comment included,
+/// reads as zero and the view's rewrites apply. The crate therefore sees exactly
+/// one footer and directory, so it cannot retry an unvalidated EOCD, and NTFS
+/// metadata it would reject stays opaque. Afterwards every read passes
+/// through to the real bytes unchanged; lengths and offsets never differ.
+#[derive(Debug)]
+pub struct PackageReader<T> {
+    cursor: std::io::Cursor<T>,
+    view: IndexView,
+    /// Shared with the opener, which clears it once the index is built.
+    indexing: std::rc::Rc<std::cell::Cell<bool>>,
+}
+
+impl<T: AsRef<[u8]>> PackageReader<T> {
+    /// A reader that shows `view` until the returned flag is cleared, then
+    /// the real bytes. For ZIP readers outside this module that validate an
+    /// embedded package with their own preflight.
+    pub fn with_view(data: T, view: IndexView) -> (Self, std::rc::Rc<std::cell::Cell<bool>>) {
+        let indexing = std::rc::Rc::new(std::cell::Cell::new(true));
+        (
+            Self {
+                cursor: std::io::Cursor::new(data),
+                view,
+                indexing: std::rc::Rc::clone(&indexing),
+            },
+            indexing,
+        )
+    }
+}
+
+impl<T: AsRef<[u8]>> std::io::Read for PackageReader<T> {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        if !self.indexing.get() {
+            return std::io::Read::read(&mut self.cursor, output);
+        }
+        let data = self.cursor.get_ref().as_ref();
+        let start = usize::try_from(self.cursor.position()).unwrap_or(usize::MAX);
+        let count = self.view.read(data, start, output)?;
+        self.cursor
+            .set_position((start.min(data.len()) + count) as u64);
+        Ok(count)
+    }
+}
+
+impl<T: AsRef<[u8]>> std::io::Seek for PackageReader<T> {
+    fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
+        std::io::Seek::seek(&mut self.cursor, position)
+    }
 }
 
 /// Validate the legal EOCD tail and walk its central directory before
@@ -838,12 +1063,22 @@ fn inspect_archive(data: &[u8]) -> Result<Option<ArchivePreflight>, String> {
             continue;
         }
         if let Some(preflight) = inspect_eocd_candidate(data, eocd)? {
-            if resolved.replace(preflight).is_some() {
+            if resolved.replace((eocd, preflight)).is_some() {
                 return Err("ambiguous ZIP end-of-central-directory records".to_string());
             }
         }
     }
-    Ok(resolved)
+    let Some((eocd, mut preflight)) = resolved else {
+        return Ok(None);
+    };
+    // Only records validated by the ZIP64 path are footers besides the EOCD.
+    let footers: Vec<usize> = preflight
+        .zip64_footer
+        .map(|(locator, record)| vec![locator, record])
+        .unwrap_or_default();
+    preflight.index_view =
+        IndexView::for_validated_directory(data, preflight.index_view.range.start, eocd, &footers);
+    Ok(Some(preflight))
 }
 
 /// Enforce the OPC package-wide part identity constraint before consumers can
@@ -865,24 +1100,41 @@ fn validate_archive_item_names<R: std::io::Read + std::io::Seek>(
 /// preflight, then revalidate the complete consumer index before returning it.
 ///
 /// This is the single construction path for both legacy owned archives and
-/// package sessions. It deliberately returns raw container errors; format
+/// package sessions (`open_validated_slice` / `open_validated_zip`). It deliberately returns raw container errors; format
 /// facades own their historical user-visible error context.
-pub(crate) fn open_validated_cursor<T: AsRef<[u8]>>(
-    cursor: std::io::Cursor<T>,
-) -> Result<zip::ZipArchive<std::io::Cursor<T>>, String> {
-    let preflight = preflight_archive_limits(cursor.get_ref().as_ref())?;
-    let mut archive = zip::ZipArchive::with_config(preflight.read_config(), cursor)
+pub(crate) fn open_validated_slice(
+    data: &[u8],
+) -> Result<zip::ZipArchive<PackageReader<&[u8]>>, String> {
+    let preflight = preflight_archive_limits(data)?;
+    open_preflighted(preflight, data)
+}
+
+fn open_preflighted<T: AsRef<[u8]>>(
+    preflight: ArchivePreflight,
+    data: T,
+) -> Result<zip::ZipArchive<PackageReader<T>>, String> {
+    let indexing = std::rc::Rc::new(std::cell::Cell::new(true));
+    let reader = PackageReader {
+        cursor: std::io::Cursor::new(data),
+        view: preflight.index_view.clone(),
+        indexing: std::rc::Rc::clone(&indexing),
+    };
+    let mut archive = zip::ZipArchive::with_config(preflight.read_config(), reader)
         .map_err(|error| error.to_string())?;
+    // The index is built; every later read (local headers, payloads) sees
+    // the real bytes.
+    indexing.set(false);
     preflight.validate_archive_item_names(&mut archive)?;
     validate_archive_limits(&mut archive)?;
     Ok(archive)
 }
 
-/// Open an owned ZIP through the shared validated construction path.
-pub fn open_validated_zip(
-    data: Vec<u8>,
-) -> Result<zip::ZipArchive<std::io::Cursor<Vec<u8>>>, String> {
-    open_validated_cursor(std::io::Cursor::new(data))
+/// Open an owned ZIP through the shared validated construction path (tests;
+/// production opens borrowed bytes through `open_validated_slice`).
+#[cfg(test)]
+fn open_validated_zip(data: Vec<u8>) -> Result<zip::ZipArchive<PackageReader<Vec<u8>>>, String> {
+    let preflight = preflight_archive_limits(&data)?;
+    open_preflighted(preflight, data)
 }
 
 /// Preserve the machine-readable resource envelope while adding the historical
@@ -911,11 +1163,6 @@ pub fn scoped_limits(
     .scope(operation)
 }
 
-/// Install a retained archive's persistent governor for one synchronous method.
-pub fn scoped_governor(governor: &ResourceGovernor, operation: &str) -> ResourceScope {
-    governor.scope(operation)
-}
-
 /// Record accessible central-directory metadata and enforce hard entry count.
 /// Declared bytes are diagnostic/early-entry evidence, never treated as proof of
 /// actual total inflation.
@@ -931,6 +1178,67 @@ fn validate_archive_limits<R: std::io::Read + std::io::Seek>(
         declared_total = declared_total.saturating_add(entry.size());
     }
     resource::observe_archive_metadata(archive.len() as u64, declared_total)
+}
+
+/// Inflate one entry from its raw stored bytes. Declared sizes only seed the
+/// resource allowance; actual output is charged by `read_entry` until EOF,
+/// where the CRC-32 is verified (APPNOTE 4.4.7), as the retained session's
+/// decoder does. The ZIP crate's own decompressing reader is not used because
+/// it rejects output past the declared size before that output is charged,
+/// which would hide an actual-inflation limit crossing.
+fn open_entry_content<'a, R: std::io::Read + std::io::Seek>(
+    archive: &'a mut zip::ZipArchive<R>,
+    part_id: usize,
+    path: &str,
+) -> Result<(CrcCheckedEntry<Box<dyn std::io::Read + 'a>>, u64), String> {
+    let raw = archive
+        .by_index_raw(part_id)
+        .map_err(|e| format!("entry not found: {path}: {e}"))?;
+    if raw.encrypted() {
+        return Err(format!(
+            "entry not found: {path}: unsupported Zip archive: Password required to decrypt file"
+        ));
+    }
+    let declared_size = raw.size();
+    let expected_crc = raw.crc32();
+    let content: Box<dyn std::io::Read + 'a> = match raw.compression() {
+        zip::CompressionMethod::Stored => Box::new(raw),
+        zip::CompressionMethod::Deflated => Box::new(flate2::read::DeflateDecoder::new(raw)),
+        _ => {
+            return Err(format!(
+                "entry not found: {path}: unsupported Zip archive: Compression method not supported"
+            ))
+        }
+    };
+    Ok((
+        CrcCheckedEntry {
+            inner: content,
+            hasher: crc32fast::Hasher::new(),
+            expected: expected_crc,
+        },
+        declared_size,
+    ))
+}
+
+/// Verifies the entry CRC-32 when the inflated stream ends.
+struct CrcCheckedEntry<R> {
+    inner: R,
+    hasher: crc32fast::Hasher,
+    expected: u32,
+}
+
+impl<R: std::io::Read> std::io::Read for CrcCheckedEntry<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let count = self.inner.read(buf)?;
+        if count == 0 && !buf.is_empty() && self.hasher.clone().finalize() != self.expected {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Invalid checksum",
+            ));
+        }
+        self.hasher.update(&buf[..count]);
+        Ok(count)
+    }
 }
 
 fn read_entry<R: std::io::Read>(
@@ -998,7 +1306,7 @@ pub fn extract_zip_entry(
         max_archive_entry_bytes,
         max_total_inflated_bytes,
     );
-    let mut archive = open_validated_cursor(std::io::Cursor::new(data)).map_err(|error| {
+    let mut archive = open_validated_slice(data).map_err(|error| {
         if error.starts_with("OOXML_RESOURCE_LIMIT:") {
             error
         } else {
@@ -1021,8 +1329,9 @@ fn equivalent_entry_index<R: std::io::Read + std::io::Seek>(
         let key = crate::rels::part_name_equivalence_key(path);
         archive
             .file_names()
+            .filter_map(Result::ok)
             .find(|name| crate::rels::part_name_equivalence_key(name) == key)
-            .and_then(|name| archive.index_for_name(name))
+            .and_then(|name| archive.index_for_name(&name))
     })
 }
 
@@ -1033,10 +1342,7 @@ pub fn read_zip_bytes<R: std::io::Read + std::io::Seek>(
     resource::assert_healthy()?;
     let part_id =
         equivalent_entry_index(archive, path).ok_or_else(|| format!("entry not found: {path}"))?;
-    let mut entry = archive
-        .by_index(part_id)
-        .map_err(|e| format!("entry not found: {path}: {e}"))?;
-    let declared_size = entry.size();
+    let (mut entry, declared_size) = open_entry_content(archive, part_id, path)?;
     read_entry(&mut entry, part_id, path, declared_size, None)
 }
 
@@ -1057,10 +1363,7 @@ pub fn read_zip_string_head<R: std::io::Read + std::io::Seek>(
     resource::assert_healthy()?;
     let part_id =
         equivalent_entry_index(archive, path).ok_or_else(|| format!("entry not found: {path}"))?;
-    let mut entry = archive
-        .by_index(part_id)
-        .map_err(|e| format!("entry not found: {path}: {e}"))?;
-    let declared_size = entry.size();
+    let (mut entry, declared_size) = open_entry_content(archive, part_id, path)?;
     let mut bytes = read_entry(
         &mut entry,
         part_id,
@@ -1076,12 +1379,6 @@ pub fn read_zip_string_head<R: std::io::Read + std::io::Seek>(
         }
         Err(error) => Err(format!("read error: {error}")),
     }
-}
-
-/// Legacy fallback used only when a parser test/helper has not installed a
-/// governor. Public browser paths always install a normalized session policy.
-pub fn fallback_max_archive_entry_bytes() -> u64 {
-    HARD_MAX_ARCHIVE_ENTRY_BYTES
 }
 
 #[cfg(test)]
@@ -1137,7 +1434,9 @@ mod tests {
         {
             let mut writer = zip::ZipWriter::new(Cursor::new(&mut bytes));
             if zip64 {
-                writer.set_zip64_comment(Some("metadata PK\u{6}\u{6} with a false signature"));
+                writer.set_raw_zip64_extensible_data_sector(
+                    b"metadata PK\x06\x06 with a false signature"[..].into(),
+                );
             }
             let options = zip::write::SimpleFileOptions::default();
             writer.start_file("word/a.xml", options).unwrap();
@@ -1436,8 +1735,8 @@ mod tests {
             writer.finish().unwrap();
         }
         // Forge both local and central uncompressed-size fields down to one.
-        // The stored payload still delivers eight bytes, so metadata alone must
-        // not authorize the read.
+        // The payload still delivers eight bytes, so metadata alone must not
+        // authorize the read: the actual-inflation limit stops it, typed.
         bytes[22..26].copy_from_slice(&1u32.to_le_bytes());
         let central = bytes
             .windows(4)
@@ -1455,6 +1754,257 @@ mod tests {
         assert_eq!(violation["metric"], "actual-inflated-bytes");
         assert_eq!(violation["limit"], 4);
         assert_eq!(violation["observed"], 5);
+    }
+
+    #[test]
+    fn eocd_signature_in_the_archive_comment_cannot_select_a_decoy_directory() {
+        // The comment holds a decoy EOCD describing one directory entry at
+        // offset 0 (a local header), which the reader alone would try first.
+        let mut bytes = zip_bytes(false);
+        let eocd = last_signature(&bytes, EOCD_SIGNATURE);
+        let mut decoy = EOCD_SIGNATURE.to_le_bytes().to_vec();
+        decoy.extend_from_slice(&[0, 0, 0, 0, 1, 0, 1, 0]);
+        decoy.extend_from_slice(&46u32.to_le_bytes());
+        decoy.extend_from_slice(&0u32.to_le_bytes());
+        decoy.extend_from_slice(&0u16.to_le_bytes());
+        bytes[eocd + 20..eocd + 22].copy_from_slice(&(decoy.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(&decoy);
+        let mut archive = open_validated_zip(bytes.clone()).expect("validated directory");
+        assert_eq!(archive.len(), 2);
+        assert_eq!(read_zip_bytes(&mut archive, "word/b.xml").unwrap(), b"b");
+        let borrowed = open_validated_slice(&bytes).expect("validated directory");
+        assert_eq!(borrowed.len(), 2);
+    }
+
+    #[test]
+    fn index_view_exposes_only_the_validated_directory_until_indexing_ends() {
+        // A stored entry whose payload holds footer signatures, plus a stray
+        // EOCD signature inside a directory record's file comment.
+        let mut bytes = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(Cursor::new(&mut bytes));
+            let stored = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            writer.start_file("word/a.xml", stored).unwrap();
+            writer
+                .write_all(b"PK\x05\x06 PK\x06\x06 PK\x06\x07")
+                .unwrap();
+            writer.finish().unwrap();
+        }
+        let preflight = preflight_archive_limits(&bytes).unwrap();
+        let payload = bytes.windows(4).position(|w| w == b"PK\x05\x06").unwrap();
+        let indexing = std::rc::Rc::new(std::cell::Cell::new(true));
+        let mut reader = PackageReader {
+            cursor: Cursor::new(bytes.as_slice()),
+            view: preflight.index_view.clone(),
+            indexing: std::rc::Rc::clone(&indexing),
+        };
+        let mut seen = Vec::new();
+        reader.read_to_end(&mut seen).unwrap();
+        assert_eq!(seen.len(), bytes.len());
+        assert!(seen[..preflight.index_view.range.start]
+            .iter()
+            .all(|byte| *byte == 0));
+        assert_eq!(
+            seen.windows(4)
+                .filter(|w| *w == EOCD_SIGNATURE.to_le_bytes())
+                .count(),
+            1,
+            "only the validated EOCD is visible while indexing"
+        );
+        assert_eq!(&seen[payload..payload + 4], &[0, 0, 0, 0]);
+
+        indexing.set(false);
+        std::io::Seek::seek(&mut reader, std::io::SeekFrom::Start(0)).unwrap();
+        let mut real = Vec::new();
+        reader.read_to_end(&mut real).unwrap();
+        assert_eq!(real, bytes, "after indexing every read is byte-exact");
+
+        let mut archive = open_validated_zip(bytes).unwrap();
+        assert_eq!(
+            read_zip_bytes(&mut archive, "word/a.xml").unwrap(),
+            b"PK\x05\x06 PK\x06\x06 PK\x06\x07"
+        );
+    }
+
+    #[test]
+    fn opaque_metadata_the_reader_would_reject_does_not_reach_payload_footers() {
+        // A zero-length Extended Timestamp passes preflight; the reader would
+        // reject it and then try the footer of the complete inner archive
+        // stored as a payload. It stays opaque, so the validated directory
+        // opens (as it did before the reader upgrade) and only it is indexed.
+        let mut inner = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(Cursor::new(&mut inner));
+            writer
+                .start_file("x.xml", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(b"x").unwrap();
+            writer.finish().unwrap();
+        }
+        let mut outer = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(Cursor::new(&mut outer));
+            let stored = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            writer.start_file("word/a.xml", stored).unwrap();
+            writer.write_all(&inner).unwrap();
+            writer.finish().unwrap();
+        }
+        let timestamp = [0x55, 0x54, 0, 0];
+        let bytes = with_central_extra(&outer, &timestamp);
+        assert!(preflight_archive_limits(&bytes).is_ok());
+        let mut archive = open_validated_zip(bytes).expect("opaque timestamp metadata");
+        assert_eq!(archive.len(), 1);
+        assert_eq!(read_zip_bytes(&mut archive, "word/a.xml").unwrap(), inner);
+    }
+
+    #[test]
+    fn signature_valued_metadata_fields_still_index() {
+        for signature in [
+            EOCD_SIGNATURE,
+            ZIP64_EOCD_SIGNATURE,
+            ZIP64_LOCATOR_SIGNATURE,
+        ] {
+            let mut bytes = zip_bytes(false);
+            // Forge the first entry's CRC (local and central) to a footer
+            // signature value; the index must still open unchanged.
+            bytes[14..18].copy_from_slice(&signature.to_le_bytes());
+            let eocd = last_signature(&bytes, EOCD_SIGNATURE);
+            let central = le_u32(&bytes, eocd + 16).unwrap() as usize;
+            bytes[central + 16..central + 20].copy_from_slice(&signature.to_le_bytes());
+            let archive = open_validated_zip(bytes).expect("signature-valued CRC indexes");
+            assert_eq!(archive.len(), 2);
+        }
+    }
+
+    #[test]
+    fn entry_comments_shaped_like_footer_records_still_open() {
+        for comment in [
+            [&b"PK\x05\x06"[..], &[b'x'; 18][..]].concat(),
+            [&b"PK\x06\x06"[..], &[b'x'; 52][..]].concat(),
+            [&b"PK\x06\x07"[..], &[b'x'; 16][..]].concat(),
+        ] {
+            let mut bytes = Vec::new();
+            {
+                let mut writer = zip::ZipWriter::new(Cursor::new(&mut bytes));
+                let stored = zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored);
+                writer.start_file("word/a.xml", stored).unwrap();
+                writer.write_all(b"a").unwrap();
+                writer.finish().unwrap();
+            }
+            // Splice an entry comment into the only central record.
+            let eocd = last_signature(&bytes, EOCD_SIGNATURE);
+            let central = le_u32(&bytes, eocd + 16).unwrap() as usize;
+            let name_len = le_u16(&bytes, central + 28).unwrap() as usize;
+            let extra_len = le_u16(&bytes, central + 30).unwrap() as usize;
+            let at = central + 46 + name_len + extra_len;
+            let mut out = bytes[..at].to_vec();
+            out.extend_from_slice(&comment);
+            out.extend_from_slice(&bytes[at..]);
+            out[central + 32..central + 34].copy_from_slice(&(comment.len() as u16).to_le_bytes());
+            let eocd = eocd + comment.len();
+            let size = le_u32(&out, eocd + 12).unwrap() + comment.len() as u32;
+            out[eocd + 12..eocd + 16].copy_from_slice(&size.to_le_bytes());
+            let mut archive = open_validated_zip(out.clone()).expect("entry comment is metadata");
+            assert_eq!(read_zip_bytes(&mut archive, "word/a.xml").unwrap(), b"a");
+            assert!(open_validated_slice(&out).is_ok());
+        }
+    }
+
+    #[test]
+    fn a_footer_shaped_entry_name_fails_closed_instead_of_steering_the_index() {
+        // A 22-byte name that begins with an EOCD signature: the reader's
+        // fixed-size read there must never be accepted as a footer.
+        let name = "PK\u{5}\u{6}aaaaaaaaaaaaaaaaaa";
+        let mut bytes = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(Cursor::new(&mut bytes));
+            writer
+                .start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(b"a").unwrap();
+            writer.finish().unwrap();
+        }
+        let view = preflight_archive_limits(&bytes).unwrap().index_view;
+        let name_at =
+            le_u32(&bytes, last_signature(&bytes, EOCD_SIGNATURE) + 16).unwrap() as usize + 46;
+        let mut block = [0u8; 22];
+        assert!(view.read(&bytes, name_at, &mut block).is_err());
+    }
+
+    #[test]
+    fn unused_extra_metadata_is_tolerated_and_coalesced_for_the_index() {
+        // A truncated Extended Timestamp (declares 9 bytes, carries 1).
+        let truncated = [0x55, 0x54, 9, 0, 1];
+        let bytes = with_central_extra(&zip_bytes(false), &truncated);
+        let mut archive = open_validated_zip(bytes).expect("truncated unused metadata");
+        assert_eq!(read_zip_bytes(&mut archive, "word/a.xml").unwrap(), b"a");
+
+        // Many short unknown fields become one opaque field for the reader.
+        let many: Vec<u8> = (0..2_000u16)
+            .flat_map(|id| [(id | 0x8000).to_le_bytes(), [0, 0]].concat())
+            .collect();
+        let bytes = with_central_extra(&zip_bytes(false), &many);
+        let preflight = preflight_archive_limits(&bytes).unwrap();
+        assert_eq!(preflight.index_view.rewrites.len(), 1);
+        let mut archive = open_validated_zip(bytes).expect("many unknown fields");
+        assert_eq!(read_zip_bytes(&mut archive, "word/b.xml").unwrap(), b"b");
+    }
+
+    #[test]
+    fn truncated_unicode_fields_and_repeated_zip64_fields_stay_opaque() {
+        for truncated in [[0x75, 0x70, 9, 0, 1], [0x75, 0x63, 9, 0, 1]] {
+            let bytes = with_central_extra(&zip_bytes(false), &truncated);
+            let mut archive = open_validated_zip(bytes).expect("truncated Unicode metadata");
+            assert_eq!(read_zip_bytes(&mut archive, "word/a.xml").unwrap(), b"a");
+        }
+        let repeated: Vec<u8> = (0..500).flat_map(|_| [1u8, 0, 0, 0]).collect();
+        let block = opaque_extra_block(&repeated);
+        assert_eq!(&block[..4], &[1, 0, 0, 0], "first ZIP64 field kept");
+        assert_eq!(le_u16(&block, 4), Some(OPAQUE_EXTRA_FIELD_ID));
+        assert_eq!(block.len(), repeated.len());
+    }
+
+    #[test]
+    fn extended_ntfs_extra_fields_stay_opaque_metadata() {
+        // APPNOTE 4.5.5: reserved u32, then attribute records. One timestamp
+        // record plus a further (unknown) attribute is valid NTFS metadata
+        // that OPC ignores; the package must open and read unchanged.
+        let mut ntfs = 0x000au16.to_le_bytes().to_vec();
+        let mut body = vec![0u8; 4];
+        body.extend_from_slice(&1u16.to_le_bytes());
+        body.extend_from_slice(&24u16.to_le_bytes());
+        body.extend_from_slice(&[0u8; 24]);
+        body.extend_from_slice(&2u16.to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes());
+        ntfs.extend_from_slice(&(body.len() as u16).to_le_bytes());
+        ntfs.extend_from_slice(&body);
+        let bytes = with_central_extra(&zip_bytes(false), &ntfs);
+        assert!(zip::ZipArchive::new(Cursor::new(bytes.as_slice())).is_err());
+        let mut archive = open_validated_zip(bytes.clone()).expect("opaque NTFS metadata");
+        assert_eq!(read_zip_bytes(&mut archive, "word/a.xml").unwrap(), b"a");
+        let mut borrowed = open_validated_slice(&bytes).expect("borrowed open");
+        assert_eq!(read_zip_bytes(&mut borrowed, "word/a.xml").unwrap(), b"a");
+    }
+
+    /// Splice `extra` into the first central-directory entry.
+    fn with_central_extra(zip: &[u8], extra: &[u8]) -> Vec<u8> {
+        let eocd = last_signature(zip, EOCD_SIGNATURE);
+        let central = le_u32(zip, eocd + 16).unwrap() as usize;
+        let name_len = le_u16(zip, central + 28).unwrap() as usize;
+        let extra_len = le_u16(zip, central + 30).unwrap() as usize;
+        let at = central + 46 + name_len + extra_len;
+        let mut out = zip[..at].to_vec();
+        out.extend_from_slice(extra);
+        out.extend_from_slice(&zip[at..]);
+        out[central + 30..central + 32]
+            .copy_from_slice(&((extra_len + extra.len()) as u16).to_le_bytes());
+        let eocd = eocd + extra.len();
+        let size = le_u32(&out, eocd + 12).unwrap() + extra.len() as u32;
+        out[eocd + 12..eocd + 16].copy_from_slice(&size.to_le_bytes());
+        out
     }
 
     #[test]
@@ -1741,7 +2291,7 @@ mod tests {
         {
             let mut writer = zip::ZipWriter::new(Cursor::new(&mut bytes));
             let comment = "x".repeat(128);
-            writer.set_zip64_comment(Some(comment));
+            writer.set_raw_zip64_extensible_data_sector(comment.into_bytes().into());
             writer
                 .start_file(
                     "word/document.xml",
@@ -1822,7 +2372,6 @@ mod tests {
             if offset == 8 {
                 let error = preflight_archive_limits(&bytes).unwrap_err();
                 assert!(!error.starts_with("OOXML_RESOURCE_LIMIT:"));
-                assert!(zip::ZipArchive::new(Cursor::new(bytes)).is_err());
             } else {
                 let preflight = preflight_archive_limits(&bytes).unwrap();
                 assert_eq!(preflight.entry_count, 2);

@@ -45,7 +45,7 @@ class ProtocolWorker {
 const globals = globalThis as Record<string, unknown>;
 const originals = { Worker: globals.Worker, location: globals.location };
 const descriptor: ModelSourceModuleDescriptor = {
-  protocol: 'ooxml-model-source-module/v1',
+  protocol: 'ooxml-model-source-module/v2',
   target: 'xlsx',
   moduleUrl: 'https://example.test/source.mjs',
   config: {},
@@ -110,7 +110,7 @@ describe('XlsxWorkbook.load with model sources', () => {
       freezeRows: 0, freezeCols: 0, conditionalFormats: [], images: [], charts: [] } as Worksheet;
     vi.spyOn(XlsxWorkbook.prototype, 'getWorksheet').mockResolvedValue(sheet);
     const { source, release } = fakeSource();
-    const workbook = await XlsxWorkbook.load(cfbBytes(), { modelSources: [source] });
+    const workbook = await XlsxWorkbook.load(cfbBytes(), { legacyXls: source });
 
     const worker = ProtocolWorker.instances[0]!;
     expect(worker.messages.filter((message) => message.type === 'parse')).toEqual([
@@ -138,7 +138,7 @@ describe('XlsxWorkbook.load with model sources', () => {
     const failure = new Error('release failed');
     const { source, release } = fakeSource();
     release.mockImplementation(() => { throw failure; });
-    await expect(XlsxWorkbook.load(cfbBytes(), { modelSources: [source] })).rejects.toBe(failure);
+    await expect(XlsxWorkbook.load(cfbBytes(), { legacyXls: source })).rejects.toBe(failure);
     expect(release).toHaveBeenCalledOnce();
     expect(ProtocolWorker.instances[0]!.terminated).toBe(true);
   });
@@ -146,7 +146,7 @@ describe('XlsxWorkbook.load with model sources', () => {
   it('keeps unclaimed input on the OOXML path and releases a failed load once', async () => {
     install(() => undefined);
     const unclaimed = fakeSource(false);
-    await expect(XlsxWorkbook.load(cfbBytes(), { modelSources: [unclaimed.source] }))
+    await expect(XlsxWorkbook.load(cfbBytes(), { legacyXls: unclaimed.source }))
       .rejects.toMatchObject({ code: 'legacy-binary-format' });
     expect(unclaimed.beginLoad).not.toHaveBeenCalled();
     expect(ProtocolWorker.instances).toEqual([]);
@@ -157,7 +157,7 @@ describe('XlsxWorkbook.load with model sources', () => {
       }
     });
     const failing = fakeSource();
-    await expect(XlsxWorkbook.load(cfbBytes(), { modelSources: [failing.source] }))
+    await expect(XlsxWorkbook.load(cfbBytes(), { legacyXls: failing.source }))
       .rejects.toThrow('source parse failed');
     expect(failing.release).toHaveBeenCalledOnce();
     expect(ProtocolWorker.instances[0]!.terminated).toBe(true);

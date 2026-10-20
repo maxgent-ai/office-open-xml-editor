@@ -6,6 +6,12 @@
 // touch a format here, mirror it there (and vice versa); the TS unit tests are
 // the reference values. `bullet` is a list-only concern (no §17.18.59 numeric
 // meaning) and stays Rust-only.
+/// [`format_counter_bounded`] for adapters: `None` when the rendered counter
+/// would exceed `limit` bytes (nothing larger is ever allocated).
+pub fn format_counter_within(n: u32, format: &str, limit: usize) -> Option<String> {
+    format_counter_bounded(n, format, limit).ok()
+}
+
 /// Bound expansions before allocating them. Non-repeating formats below do
 /// bounded work on at most ten decimal digits; their small result is checked
 /// after formatting. This is a caller-owned byte budget, not a numeric cutoff.
@@ -526,36 +532,6 @@ fn to_hebrew2(n: u32) -> String {
         HEBREW_ALPHABET[(remainder - 1) as usize],
         "ת".repeat(subtractions as usize)
     )
-}
-
-/// Word 16.113's display of a counter reset by an ilvl byte in 16..255.
-/// Forty-three supported number formats were measured with level-8 `%9` and
-/// `ilvl=16`; multi-placeholder controls checked zero formatting on `%1`..`%8`.
-/// The ordinary format_counter(0) intentionally keeps its existing library
-/// semantics for unrelated start=0 documents.
-pub fn format_word_synthetic_zero(format: &str) -> String {
-    match format {
-        "lowerRoman" | "upperRoman" | "lowerLetter" | "upperLetter" | "arabicAlpha"
-        | "arabicAbjad" | "russianLower" | "russianUpper" | "thaiLetters" | "hindiVowels"
-        | "hindiConsonants" | "hebrew1" | "hebrew2" | "none" | "bullet" => String::new(),
-        "decimalZero" => "00".to_string(),
-        "numberInDash" => "- 0 -".to_string(),
-        "decimalFullWidth" => "０".to_string(),
-        "thaiNumbers" => "๐".to_string(),
-        "hindiNumbers" => "०".to_string(),
-        "ideographDigital"
-        | "japaneseDigitalTenThousand"
-        | "japaneseCounting"
-        | "chineseCountingThousand"
-        | "japaneseLegal" => "〇".to_string(),
-        "koreanDigital" | "koreanCounting" => "영".to_string(),
-        "koreanDigital2" => "零".to_string(),
-        "taiwaneseDigital" | "chineseCounting" | "taiwaneseCounting" => "○".to_string(),
-        "taiwaneseCountingThousand" | "chineseLegalSimplified" | "ideographLegalTraditional" => {
-            "零".to_string()
-        }
-        _ => format_counter(0, format),
-    }
 }
 
 #[cfg(test)]

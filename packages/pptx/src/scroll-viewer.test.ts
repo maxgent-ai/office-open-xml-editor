@@ -1,3 +1,4 @@
+import { resizeViewer, viewerState } from './scroll-viewer-test-dom.js';
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { PptxScrollViewer } from './scroll-viewer.js';
 import { PptxPresentation } from './presentation.js';
@@ -694,7 +695,7 @@ describe('PptxScrollViewer — layout + virtualization (T2)', () => {
     // spacer(1) + at most a couple of window-sized generations of slots.
     expect(seen.size).toBeLessThanOrEqual(12);
     // Coming back to the top mounts slide 0 again, drawn from the pool.
-    expect(v.mountedSlideIndicesForTest()).toContain(0);
+    expect(viewerState(v).mounted()).toContain(0);
   });
 
   it('mounts the correct window for a mid-deck scrollTop', () => {
@@ -705,7 +706,7 @@ describe('PptxScrollViewer — layout + virtualization (T2)', () => {
     scrollHost.scrollTop = 1300;
     scrollHost.dispatch('scroll');
     const top = v.topVisibleSlide;
-    const mountedSlides = v.mountedSlideIndicesForTest(); // T2 test hook
+    const mountedSlides = viewerState(v).mounted(); // T2 test hook
     expect(mountedSlides).toContain(top);
     expect(Math.max(...mountedSlides) - Math.min(...mountedSlides)).toBeLessThanOrEqual(6);
   });
@@ -727,7 +728,7 @@ describe('PptxScrollViewer — rendering (T3)', () => {
     scrollHost.clientWidth = 200;
     v.relayout();
     // Every mounted slide got exactly one renderSlide call, no more no less.
-    const mounted = v.mountedSlideIndicesForTest().sort((a, b) => a - b);
+    const mounted = viewerState(v).mounted().sort((a, b) => a - b);
     const rendered = engine.renderCalls.map((c) => c.slide).sort((a, b) => a - b);
     expect(rendered).toEqual(mounted);
     // Each renderSlide call carried the per-call px width. pptx slides are uniform,
@@ -759,7 +760,7 @@ describe('PptxScrollViewer — rendering (T3)', () => {
     v.relayout();
     // Both slides mount (slide 0 height px = 120 at base scale 1.0; slide 1 top 130
     // within the 400px viewport), so both get exactly one render.
-    const mounted = v.mountedSlideIndicesForTest().sort((a, b) => a - b);
+    const mounted = viewerState(v).mounted().sort((a, b) => a - b);
     expect(mounted).toEqual([0, 1]);
     // Per-slide px widths in call order: uniform 200 each.
     const widths = engine.renderCalls
@@ -814,7 +815,7 @@ describe('PptxScrollViewer — rendering (T3)', () => {
     await Promise.resolve();
     expect(engine.renderCalls).toHaveLength(0); // renderSlide never touched
     // Every mounted slide dispatched exactly one bitmap render.
-    const mounted = v.mountedSlideIndicesForTest().sort((a, b) => a - b);
+    const mounted = viewerState(v).mounted().sort((a, b) => a - b);
     const bitmapSlides = [...new Set(engine.bitmapCalls.map((c) => c.slide))].sort((a, b) => a - b);
     expect(bitmapSlides).toEqual(mounted);
     v.destroy();
@@ -896,7 +897,7 @@ describe('PptxScrollViewer — rendering (T3)', () => {
     // Scroll far away so slide 0's slot recycles while its render is in flight.
     scrollHost.scrollTop = 6000;
     scrollHost.dispatch('scroll');
-    expect(v.mountedSlideIndicesForTest()).not.toContain(0);
+    expect(viewerState(v).mounted()).not.toContain(0);
     // Now the stale render for slide 0 resolves — the viewer must NOT paint it and
     // must close the orphaned bitmap.
     const bmp0 = engine.createdBitmaps[engine.bitmapCalls.indexOf(slide0!)];
@@ -938,10 +939,10 @@ describe('PptxScrollViewer — rendering (T3)', () => {
     // (slide 0 re-mounts on a fresh slot) — all while the initial render is deferred.
     scrollHost.scrollTop = 12000;
     scrollHost.dispatch('scroll');
-    expect(v.mountedSlideIndicesForTest()).not.toContain(0);
+    expect(viewerState(v).mounted()).not.toContain(0);
     scrollHost.scrollTop = 0;
     scrollHost.dispatch('scroll');
-    expect(v.mountedSlideIndicesForTest()).toContain(0);
+    expect(viewerState(v).mounted()).toContain(0);
     // Coalescing pin: slide 0's render is STILL in flight (initial deferred call not
     // yet resolved), so the re-mount must NOT dispatch a second render for slide 0
     // — the in-flight guard swallows it. Exactly one dispatch so far.
@@ -989,7 +990,7 @@ describe('PptxScrollViewer — rendering (T3)', () => {
 
     const slide0 = engine.bitmapCalls.find((c) => c.slide === 0);
     expect(slide0).toBeDefined();
-    expect(v.mountedSlideIndicesForTest()).toContain(0); // slot still live
+    expect(viewerState(v).mounted()).toContain(0); // slot still live
     const dispatchesForSlide0 = () => engine.bitmapCalls.filter((c) => c.slide === 0).length;
     expect(dispatchesForSlide0()).toBe(1);
 
@@ -1067,8 +1068,8 @@ describe('PptxScrollViewer — rendering (T3)', () => {
 
     // Zoom mid-flight: bumps the render epoch and re-mounts. Slide 0's re-mount is
     // coalesced away by the in-flight guard (same index still in flight).
-    v.setScale(v.scaleForTest() * 2);
-    expect(v.mountedSlideIndicesForTest()).toContain(0); // slide 0 still visible at top
+    v.setScale(v.getScale() * 2);
+    expect(viewerState(v).mounted()).toContain(0); // slide 0 still visible at top
     expect(engine.bitmapCalls.filter((c) => c.slide === 0).length).toBe(1); // no double-dispatch yet
 
     // The OLD-scale render resolves. Epoch moved ⇒ STALE: close, do not paint,
@@ -1130,8 +1131,8 @@ describe('PptxScrollViewer — rendering (T3)', () => {
     const oldWidth = slide0Old!.width;
 
     // Zoom mid-flight: bumps the epoch. Slide 0's re-mount is coalesced away.
-    v.setScale(v.scaleForTest() * 2);
-    expect(v.mountedSlideIndicesForTest()).toContain(0);
+    v.setScale(v.getScale() * 2);
+    expect(viewerState(v).mounted()).toContain(0);
     expect(dispatchesForSlide0()).toBe(1);
 
     // REJECT the old-scale dispatch. Epoch moved ⇒ stale ⇒ re-dispatch (not a plain
@@ -1197,8 +1198,8 @@ describe('PptxScrollViewer — zoom (T4)', () => {
   it('base fit scale maps the slide width to the container width', () => {
     const { v } = setup();
     // base = 200 / 200 (natural width) = 1.0
-    expect(v.scaleForTest()).toBeCloseTo(1.0, 6);
-    expect(v.baseScaleForTest()).toBeCloseTo(1.0, 6);
+    expect(v.getScale()).toBeCloseTo(1.0, 6);
+    expect(viewerState(v).baseScale()).toBeCloseTo(1.0, 6);
     v.destroy();
   });
 
@@ -1208,9 +1209,9 @@ describe('PptxScrollViewer — zoom (T4)', () => {
     scrollHost.scrollTop = 390;
     scrollHost.dispatch('scroll');
     expect(v.topVisibleSlide).toBe(3);
-    const cur = v.scaleForTest(); // 1.0
+    const cur = v.getScale(); // 1.0
     v.setScale(cur * 2); // 2.0 (within default [0.1, 4], no clamp)
-    expect(v.scaleForTest()).toBeCloseTo(2.0, 6);
+    expect(v.getScale()).toBeCloseTo(2.0, 6);
     // slide 3 stays the top slide; new offset = 3 * (240 + 10) = 750
     expect(v.topVisibleSlide).toBe(3);
     expect(Math.abs(scrollHost.scrollTop - 750)).toBeLessThan(2);
@@ -1224,7 +1225,7 @@ describe('PptxScrollViewer — zoom (T4)', () => {
     scrollHost.scrollTop = 450;
     scrollHost.dispatch('scroll');
     expect(v.topVisibleSlide).toBe(3);
-    v.setScale(v.scaleForTest() * 2); // 1.0 → 2.0; heights' = 240
+    v.setScale(v.getScale() * 2); // 1.0 → 2.0; heights' = 240
     // newScrollTop = offset'[3] + 0.5 * 240 = 750 + 120 = 870
     expect(Math.abs(scrollHost.scrollTop - 870)).toBeLessThan(2);
     // Slide 3 is still under the viewport top: offset'[3]=750 <= 870 < 1000.
@@ -1236,9 +1237,9 @@ describe('PptxScrollViewer — zoom (T4)', () => {
     // Explicit bounds so the clamp is unambiguous (base fit is 1.0, inside them).
     const { v } = setup(20, { zoomMin: 0.5, zoomMax: 3 });
     v.setScale(100); // above zoomMax 3 (absolute, NOT a multiple of base)
-    expect(v.scaleForTest()).toBeCloseTo(3, 6);
+    expect(v.getScale()).toBeCloseTo(3, 6);
     v.setScale(0.001); // below zoomMin 0.5
-    expect(v.scaleForTest()).toBeCloseTo(0.5, 6);
+    expect(v.getScale()).toBeCloseTo(0.5, 6);
     v.destroy();
   });
 
@@ -1255,9 +1256,9 @@ describe('PptxScrollViewer — zoom (T4)', () => {
     scrollHost.clientWidth = 200;
     v.relayout();
     v.setScale(999);
-    expect(v.scaleForTest()).toBeCloseTo(4, 5); // default zoomMax
+    expect(v.getScale()).toBeCloseTo(4, 5); // default zoomMax
     v.setScale(0.0001);
-    expect(v.scaleForTest()).toBeCloseTo(0.1, 5); // default zoomMin
+    expect(v.getScale()).toBeCloseTo(0.1, 5); // default zoomMin
     v.destroy();
   });
 
@@ -1289,7 +1290,7 @@ describe('PptxScrollViewer — zoom (T4)', () => {
     v.relayout();
 
     // base = 1200 / 1280 = 0.9375 — INSIDE [0.1, 4], so relayout did NOT clamp.
-    const base = v.scaleForTest();
+    const base = v.getScale();
     expect(base).toBeCloseTo(0.9375, 6);
     expect(base).toBeGreaterThan(0.1);
     expect(base).toBeLessThan(4);
@@ -1298,7 +1299,7 @@ describe('PptxScrollViewer — zoom (T4)', () => {
 
     // One pixel-mode Ctrl+wheel tick up (deltaY −100) is one 10% zoom step.
     scrollHost.dispatch('wheel', { deltaY: -100, deltaMode: 0, ctrlKey: true, metaKey: false, preventDefault() {} });
-    const zoomed = v.scaleForTest();
+    const zoomed = v.getScale();
     expect(zoomed).toBeCloseTo(0.9375 * 1.1, 6);
     expect(zoomed).toBeLessThan(4);
 
@@ -1313,62 +1314,62 @@ describe('PptxScrollViewer — zoom (T4)', () => {
 
     // setScale(999) still clamps hard to the default zoomMax 4.
     v.setScale(999);
-    expect(v.scaleForTest()).toBeCloseTo(4, 5);
+    expect(v.getScale()).toBeCloseTo(4, 5);
     v.destroy();
   });
 
   it('Ctrl+wheel zooms in and calls preventDefault; bare wheel does not zoom or preventDefault', () => {
     const { v, scrollHost } = setup();
-    const before = v.scaleForTest();
+    const before = v.getScale();
 
     // Bare wheel: no zoom, native scroll (preventDefault NOT called).
     const barePrevent = vi.fn();
     scrollHost.dispatch('wheel', { deltaY: -100, ctrlKey: false, metaKey: false, preventDefault: barePrevent });
-    expect(v.scaleForTest()).toBe(before);
+    expect(v.getScale()).toBe(before);
     expect(barePrevent).not.toHaveBeenCalled();
 
     // Ctrl+wheel (deltaY<0 = zoom in): scale increases, preventDefault called.
     const ctrlPrevent = vi.fn();
     scrollHost.dispatch('wheel', { deltaY: -100, deltaMode: 0, ctrlKey: true, metaKey: false, preventDefault: ctrlPrevent });
-    expect(v.scaleForTest()).toBeCloseTo(before * 1.1, 10);
+    expect(v.getScale()).toBeCloseTo(before * 1.1, 10);
     expect(ctrlPrevent).toHaveBeenCalledTimes(1);
     v.destroy();
   });
 
   it('Cmd(meta)+wheel also zooms', () => {
     const { v, scrollHost } = setup();
-    const before = v.scaleForTest();
+    const before = v.getScale();
     scrollHost.dispatch('wheel', { deltaY: -100, ctrlKey: false, metaKey: true, preventDefault() {} });
-    expect(v.scaleForTest()).toBeGreaterThan(before);
+    expect(v.getScale()).toBeGreaterThan(before);
     v.destroy();
   });
 
   it('positive deltaY (ctrl+wheel down) zooms out', () => {
     const { v, scrollHost } = setup();
-    const before = v.scaleForTest();
+    const before = v.getScale();
     scrollHost.dispatch('wheel', { deltaY: 100, ctrlKey: true, metaKey: false, preventDefault() {} });
-    expect(v.scaleForTest()).toBeLessThan(before);
+    expect(v.getScale()).toBeLessThan(before);
     v.destroy();
   });
 
   it('enableZoom:false installs no wheel handler — ctrl+wheel is inert', () => {
     const { v, scrollHost } = setup(20, { enableZoom: false });
-    const before = v.scaleForTest();
+    const before = v.getScale();
     // No wheel listener was registered at all.
     expect(scrollHost._listeners.has('wheel')).toBe(false);
     const prevent = vi.fn();
     scrollHost.dispatch('wheel', { deltaY: -100, ctrlKey: true, preventDefault: prevent });
-    expect(v.scaleForTest()).toBe(before);
+    expect(v.getScale()).toBe(before);
     expect(prevent).not.toHaveBeenCalled();
     v.destroy();
   });
 
   it('a wheel with deltaY 0 is a no-op even with ctrl held', () => {
     const { v, scrollHost } = setup();
-    const before = v.scaleForTest();
+    const before = v.getScale();
     const prevent = vi.fn();
     scrollHost.dispatch('wheel', { deltaY: 0, ctrlKey: true, preventDefault: prevent });
-    expect(v.scaleForTest()).toBe(before);
+    expect(v.getScale()).toBe(before);
     v.destroy();
   });
 
@@ -1377,10 +1378,10 @@ describe('PptxScrollViewer — zoom (T4)', () => {
     scrollHost.scrollTop = 390;
     scrollHost.dispatch('scroll');
     const topBefore = scrollHost.scrollTop;
-    const epochBefore = v.renderEpochForTest();
-    v.setScale(v.scaleForTest()); // identical scale
+    const epochBefore = viewerState(v).epoch();
+    v.setScale(v.getScale()); // identical scale
     expect(scrollHost.scrollTop).toBe(topBefore); // unchanged
-    expect(v.renderEpochForTest()).toBe(epochBefore); // no epoch bump
+    expect(viewerState(v).epoch()).toBe(epochBefore); // no epoch bump
     v.destroy();
   });
 });
@@ -1413,7 +1414,7 @@ describe('PptxScrollViewer — self-load path (T7 story)', () => {
       }),
     );
     // Layout happened: slots mounted and the spacer was sized.
-    expect(v.mountedSlideIndicesForTest().length).toBeGreaterThan(0);
+    expect(viewerState(v).mounted().length).toBeGreaterThan(0);
     const spacer = scrollHost.children[0] as FakeEl;
     expect(parseFloat(spacer.style.height)).toBeGreaterThan(0);
     // The mounted slides were actually rendered (main mode → renderSlide).
@@ -1447,7 +1448,7 @@ describe('PptxScrollViewer — self-load path (T7 story)', () => {
     await vi.waitFor(() => expect(engine.bitmapCalls).toHaveLength(1));
     const initial = engine.bitmapCalls[0]!;
 
-    v.setScale(v.scaleForTest() * 2);
+    v.setScale(v.getScale() * 2);
     initial.resolve();
     await vi.waitFor(() => expect(engine.bitmapCalls).toHaveLength(2));
     expect(loadSettled).toBe(false);
@@ -1547,8 +1548,8 @@ describe('PptxScrollViewer — interactive media lifecycle', () => {
     scrollHost.clientHeight = 400;
     v.relayout();
 
-    expect(v.mountedSlideIndicesForTest()).toHaveLength(1_000);
-    expect(v.interactiveSlideIndicesForTest().length).toBeLessThanOrEqual(5);
+    expect(viewerState(v).mounted()).toHaveLength(1_000);
+    expect(viewerState(v).interactive().length).toBeLessThanOrEqual(5);
     expect(engine.presentationCalls.length).toBeLessThanOrEqual(5);
     // The remaining mounted slides use the static renderer, retaining their
     // text overlays for browser-native Find without allocating media blobs/RAF.
@@ -1640,7 +1641,7 @@ describe('PptxScrollViewer — interactive media lifecycle', () => {
     expect(newCalls.length).toBeGreaterThan(0);
     expect(newCalls.length).toBeLessThanOrEqual(6);
     expect(newCalls.some((call) => call.slide >= 35)).toBe(true);
-    expect(v.interactiveSlideIndicesForTest().length).toBeLessThanOrEqual(6);
+    expect(viewerState(v).interactive().length).toBeLessThanOrEqual(6);
     v.destroy();
   });
 
@@ -1788,7 +1789,7 @@ describe('PptxScrollViewer — interactive media lifecycle', () => {
       const settleCalls = engine.presentationCalls.slice(before);
       expect(settleCalls.length).toBeGreaterThan(0);
       expect(settleCalls.length).toBeLessThanOrEqual(6);
-      const active = new Set(v.interactiveSlideIndicesForTest());
+      const active = new Set(viewerState(v).interactive());
       expect(settleCalls.every((call) => active.has(call.slide))).toBe(true);
       v.destroy();
     } finally {
@@ -1990,7 +1991,7 @@ describe('PptxScrollViewer — text selection (T5)', () => {
     await Promise.resolve();
     await Promise.resolve();
     // Every mounted slot got its overlay built from that slide's render.
-    const mounted = v.mountedSlideIndicesForTest();
+    const mounted = viewerState(v).mounted();
     expect(mounted.length).toBeGreaterThan(0);
     for (const wrapper of scrollHost.children.filter((c) => c.children.some((k) => k.tag === 'canvas'))) {
       const textLayer = findTextLayer(wrapper);
@@ -2156,7 +2157,7 @@ describe('PptxScrollViewer — text selection (T5)', () => {
     // The worker path (renderSlideToBitmap), NOT renderSlide, was used.
     expect(engine.renderCalls.length).toBe(0);
     expect(engine.bitmapCalls.length).toBeGreaterThan(0);
-    const mounted = v.mountedSlideIndicesForTest();
+    const mounted = viewerState(v).mounted();
     expect(mounted.length).toBeGreaterThan(0);
     for (const wrapper of scrollHost.children.filter((c) => c.children.some((k) => k.tag === 'canvas'))) {
       const textLayer = wrapper.children.find((c) => c.tag === 'div') as FakeEl;
@@ -2196,7 +2197,7 @@ describe('PptxScrollViewer — text selection (T5)', () => {
     const staleCall = engine.renderCalls.find((c) => c.slide === 0)!;
     // Zoom mid-flight: bumps the epoch and force-re-mounts every slot (which
     // re-dispatches a fresh slide-0 render at the new scale).
-    v.setScale(v.scaleForTest() * 2);
+    v.setScale(v.getScale() * 2);
     // Now resolve the STALE (old-epoch) render. Its .then must bail on the epoch
     // guard and NOT build the overlay.
     staleCall.resolve();
@@ -2523,7 +2524,7 @@ describe('PptxScrollViewer — navigation, resize, empty (T6)', () => {
     const { v, scrollHost, container } = setup();
     container.clientWidth = 199.9;
     scrollHost.clientWidth = 199.9; // fractional fit scale → fractional slide px
-    v.resizeForTest();
+    resizeViewer(v);
 
     let requestedTop = -1;
     (scrollHost as FakeEl & {
@@ -2548,13 +2549,13 @@ describe('PptxScrollViewer — navigation, resize, empty (T6)', () => {
     // dimensionless bounds (design §8.2), so a low zoomMax would legitimately CLAMP
     // the re-fit and break preservation. Give the multiplier room to survive.
     const { v, container } = setup(20, { zoomMax: 10 });
-    v.setScale(v.baseScaleForTest() * 2); // 2× zoom
-    const zoomMultiplier = v.scaleForTest() / v.baseScaleForTest();
+    v.setScale(viewerState(v).baseScale() * 2); // 2× zoom
+    const zoomMultiplier = v.getScale() / viewerState(v).baseScale();
     // Container widens; the observer callback re-fits base and re-applies the mult.
     container.clientWidth = 400;
     (container.children[0] as FakeEl).children[0].clientWidth = 400;
-    v.resizeForTest(); // fires the observed resize path
-    expect(v.scaleForTest() / v.baseScaleForTest()).toBeCloseTo(zoomMultiplier, 5);
+    resizeViewer(v); // fires the observed resize path
+    expect(v.getScale() / viewerState(v).baseScale()).toBeCloseTo(zoomMultiplier, 5);
     v.destroy();
   });
 
@@ -2563,37 +2564,37 @@ describe('PptxScrollViewer — navigation, resize, empty (T6)', () => {
     const { v, container } = setup(20, { refitOnResize: false, onScaleChange });
     v.setScale(1);
     onScaleChange.mockClear();
-    const epochBefore = v.renderEpochForTest();
+    const epochBefore = viewerState(v).epoch();
 
     container.clientWidth = 400;
     (container.children[0] as FakeEl).children[0].clientWidth = 400;
-    v.resizeForTest();
+    resizeViewer(v);
 
-    expect(v.scaleForTest()).toBe(1);
-    expect(v.renderEpochForTest()).toBe(epochBefore);
+    expect(v.getScale()).toBe(1);
+    expect(viewerState(v).epoch()).toBe(epochBefore);
     expect(onScaleChange).not.toHaveBeenCalled();
     v.destroy();
   });
 
   it('ResizeObserver re-fit bumps the render epoch (resize is an epoch event)', () => {
     const { v, container } = setup();
-    const before = v.renderEpochForTest();
+    const before = viewerState(v).epoch();
     container.clientWidth = 400;
     (container.children[0] as FakeEl).children[0].clientWidth = 400;
-    v.resizeForTest();
+    resizeViewer(v);
     // A width change re-fits the base scale (routed through setScale), which bumps
     // the epoch so any bitmap in flight at the old scale is treated as stale.
-    expect(v.renderEpochForTest()).toBeGreaterThan(before);
+    expect(viewerState(v).epoch()).toBeGreaterThan(before);
     v.destroy();
   });
 
   it('ResizeObserver re-fit with an UNCHANGED width does not re-fit or bump the epoch', () => {
     const { v } = setup();
-    const scaleBefore = v.scaleForTest();
-    const epochBefore = v.renderEpochForTest();
-    v.resizeForTest(); // same width — no-op re-fit
-    expect(v.scaleForTest()).toBe(scaleBefore);
-    expect(v.renderEpochForTest()).toBe(epochBefore);
+    const scaleBefore = v.getScale();
+    const epochBefore = viewerState(v).epoch();
+    resizeViewer(v); // same width — no-op re-fit
+    expect(v.getScale()).toBe(scaleBefore);
+    expect(viewerState(v).epoch()).toBe(epochBefore);
     v.destroy();
   });
 
@@ -2606,23 +2607,23 @@ describe('PptxScrollViewer — navigation, resize, empty (T6)', () => {
     // stay valid), and no onVisibleSlideChange fire (topIndex stays 0).
     const changes: number[] = [];
     const { v, scrollHost } = setup(20, { onVisibleSlideChange: (i: number) => changes.push(i) });
-    const mountedBefore = v.mountedSlideIndicesForTest().slice().sort((a, b) => a - b);
+    const mountedBefore = viewerState(v).mounted().slice().sort((a, b) => a - b);
     expect(mountedBefore.length).toBeGreaterThan(0);
     expect(changes).toEqual([0]); // initial mount fired 0
-    const epochBefore = v.renderEpochForTest();
-    const scaleBefore = v.scaleForTest();
+    const epochBefore = viewerState(v).epoch();
+    const scaleBefore = v.getScale();
 
     // Grow HEIGHT only; width (and thus the fit-width base scale) is unchanged.
     scrollHost.clientHeight = 1600;
-    v.resizeForTest(); // NO scroll event dispatched
+    resizeViewer(v); // NO scroll event dispatched
 
-    const mountedAfter = v.mountedSlideIndicesForTest().slice().sort((a, b) => a - b);
+    const mountedAfter = viewerState(v).mounted().slice().sort((a, b) => a - b);
     // The revealed window strictly grows (taller viewport intersects more slides).
     expect(mountedAfter.length).toBeGreaterThan(mountedBefore.length);
     expect(Math.max(...mountedAfter)).toBeGreaterThan(Math.max(...mountedBefore));
     // No epoch bump — nothing was re-scaled, so no in-flight render is stale.
-    expect(v.renderEpochForTest()).toBe(epochBefore);
-    expect(v.scaleForTest()).toBe(scaleBefore);
+    expect(viewerState(v).epoch()).toBe(epochBefore);
+    expect(v.getScale()).toBe(scaleBefore);
     // topIndex is still 0 at scrollTop 0 ⇒ callback did NOT fire again.
     expect(changes).toEqual([0]);
     v.destroy();
@@ -2639,10 +2640,10 @@ describe('PptxScrollViewer — navigation, resize, empty (T6)', () => {
       zoomMax: BASE, // 1.0 — clamps the re-fit back to the current scale
       onVisibleSlideChange: (i: number) => changes.push(i),
     });
-    expect(v.scaleForTest()).toBe(BASE);
-    const mountedBefore = v.mountedSlideIndicesForTest().slice().sort((a, b) => a - b);
+    expect(v.getScale()).toBe(BASE);
+    const mountedBefore = viewerState(v).mounted().slice().sort((a, b) => a - b);
     expect(mountedBefore.length).toBeGreaterThan(0);
-    const epochBefore = v.renderEpochForTest();
+    const epochBefore = viewerState(v).epoch();
 
     // Grow BOTH width and height. The width grow triggers the re-fit branch, but the
     // clamp pins the scale unchanged ⇒ setScale no-ops. Heights are therefore
@@ -2652,13 +2653,13 @@ describe('PptxScrollViewer — navigation, resize, empty (T6)', () => {
     (container.children[0] as FakeEl).children[0].clientWidth = 400;
     scrollHost.clientWidth = 400;
     scrollHost.clientHeight = 1600;
-    v.resizeForTest();
+    resizeViewer(v);
 
-    const mountedAfter = v.mountedSlideIndicesForTest().slice().sort((a, b) => a - b);
+    const mountedAfter = viewerState(v).mounted().slice().sort((a, b) => a - b);
     expect(mountedAfter.length).toBeGreaterThan(mountedBefore.length);
     // Scale stayed pinned at the clamp, so setScale no-oped ⇒ no epoch bump.
-    expect(v.scaleForTest()).toBe(BASE);
-    expect(v.renderEpochForTest()).toBe(epochBefore);
+    expect(v.getScale()).toBe(BASE);
+    expect(viewerState(v).epoch()).toBe(epochBefore);
     // topIndex still 0 ⇒ no extra callback.
     expect(changes).toEqual([0]);
     v.destroy();
@@ -2670,12 +2671,12 @@ describe('PptxScrollViewer — navigation, resize, empty (T6)', () => {
     const engine = new FakePptxEngine(5, SLIDE_W_EMU, SLIDE_H_EMU);
     const v = makeBorrowedPptxScrollViewer(container as unknown as HTMLElement, { presentation: engine.asPres() });
     const scrollHost = (container.children[0] as FakeEl).children[0] as FakeEl;
-    expect(v.mountedSlideIndicesForTest().length).toBe(0); // deferred
+    expect(viewerState(v).mounted().length).toBe(0); // deferred
     container.clientWidth = 300;
     scrollHost.clientWidth = 300;
     scrollHost.clientHeight = 400;
-    v.resizeForTest();
-    expect(v.mountedSlideIndicesForTest().length).toBeGreaterThan(0);
+    resizeViewer(v);
+    expect(viewerState(v).mounted().length).toBeGreaterThan(0);
     v.destroy();
   });
 
@@ -2687,7 +2688,7 @@ describe('PptxScrollViewer — navigation, resize, empty (T6)', () => {
     v.relayout();
     const spacer = (container.children[0] as FakeEl).children[0].children[0] as FakeEl;
     expect(parseFloat(spacer.style.height || '0')).toBe(0);
-    expect(v.mountedSlideIndicesForTest().length).toBe(0);
+    expect(viewerState(v).mounted().length).toBe(0);
     v.scrollToSlide(0); // no throw
     v.destroy();
   });
@@ -2703,8 +2704,8 @@ describe('PptxScrollViewer — navigation, resize, empty (T6)', () => {
     });
     container.clientWidth = 300;
     (container.children[0] as FakeEl).children[0].clientWidth = 300;
-    v.resizeForTest(); // no slides ⇒ no-op
-    expect(v.mountedSlideIndicesForTest().length).toBe(0);
+    resizeViewer(v); // no slides ⇒ no-op
+    expect(viewerState(v).mounted().length).toBe(0);
     expect(changes).toEqual([]);
     v.destroy();
   });
@@ -2767,7 +2768,7 @@ describe('PptxScrollViewer — paddingTop/paddingBottom (desk margin)', () => {
 
   it('explicit paddingTop mounts the first slot at top = paddingTop px', () => {
     const { v, scrollHost } = setup({ paddingTop: 24, paddingBottom: 24 });
-    expect(v.mountedSlideIndicesForTest()).toContain(0);
+    expect(viewerState(v).mounted()).toContain(0);
     expect(slotTopFor(scrollHost, 0, STRIDE, 24)).toBeDefined();
     v.destroy();
   });
@@ -2783,7 +2784,7 @@ describe('PptxScrollViewer — paddingTop/paddingBottom (desk margin)', () => {
     // No paddingTop/paddingBottom → each defaults to `gap` (10). Slide 0 sits at
     // top:10px, NOT flush 0 (this is the sanctioned pre-release default change).
     const { v, scrollHost } = setup();
-    expect(v.mountedSlideIndicesForTest()).toContain(0);
+    expect(viewerState(v).mounted()).toContain(0);
     expect(slotTopFor(scrollHost, 0, STRIDE, GAP)).toBeDefined();
     const spacer = scrollHost.children[0] as FakeEl;
     const expected = GAP + 20 * SLIDE_H + 19 * GAP + GAP;
@@ -2822,8 +2823,8 @@ describe('PptxScrollViewer — paddingTop/paddingBottom (desk margin)', () => {
     scrollHost.scrollTop = 24 + 3 * STRIDE;
     scrollHost.dispatch('scroll');
     expect(v.topVisibleSlide).toBe(3);
-    v.setScale(v.scaleForTest() * 2); // 1.0 → 2.0; SLIDE_H' = 240, STRIDE' = 250
-    expect(v.scaleForTest()).toBeCloseTo(2, 5);
+    v.setScale(v.getScale() * 2); // 1.0 → 2.0; SLIDE_H' = 240, STRIDE' = 250
+    expect(v.getScale()).toBeCloseTo(2, 5);
     // Slide 3 stays the top slide; padding is intact so offset'[3] = 24 + 3*250 = 774.
     expect(v.topVisibleSlide).toBe(3);
     expect(Math.abs(scrollHost.scrollTop - (24 + 3 * 250))).toBeLessThan(2);
@@ -2833,7 +2834,7 @@ describe('PptxScrollViewer — paddingTop/paddingBottom (desk margin)', () => {
   it('keeps the leading desk padding visible when setScale runs at the top', () => {
     const { v, scrollHost } = setup({ paddingTop: 24, paddingBottom: 24, zoomMin: 0.5, zoomMax: 3 });
     expect(scrollHost.scrollTop).toBe(0);
-    v.setScale(v.scaleForTest() * 0.75);
+    v.setScale(v.getScale() * 0.75);
     expect(scrollHost.scrollTop).toBe(0);
     expect(slotTopFor(scrollHost, 0, SLIDE_H * 0.75 + GAP, 24)).toBeDefined();
     v.destroy();
@@ -2871,8 +2872,8 @@ describe('PptxScrollViewer — paddingLeft/paddingRight (horizontal desk gutters
     // 232 − 16 (padL) − 16 (padR) = 200, the same fit the old 200-container tests
     // used, so the dimensionless base scale matches their 1.0 (natural width 200).
     const { v } = setup(232);
-    expect(v.baseScaleForTest()).toBeCloseTo(1.0, 6);
-    expect(v.scaleForTest()).toBeCloseTo(1.0, 6);
+    expect(viewerState(v).baseScale()).toBeCloseTo(1.0, 6);
+    expect(v.getScale()).toBeCloseTo(1.0, 6);
     v.destroy();
   });
 
@@ -2880,7 +2881,7 @@ describe('PptxScrollViewer — paddingLeft/paddingRight (horizontal desk gutters
     // Gutters pinned to 0 ⇒ fit is the full 200 container ⇒ base 1.0, exactly the
     // pre-feature behavior.
     const { v } = setup(200, { paddingLeft: 0, paddingRight: 0 });
-    expect(v.baseScaleForTest()).toBeCloseTo(1.0, 6);
+    expect(viewerState(v).baseScale()).toBeCloseTo(1.0, 6);
     v.destroy();
   });
 
@@ -2888,7 +2889,7 @@ describe('PptxScrollViewer — paddingLeft/paddingRight (horizontal desk gutters
     // opts.width 150 stays 150 regardless of the gutters: base = 150 / 200 (natural)
     // = 0.75. The gutters still apply to PLACEMENT, just not to the width.
     const { v } = setup(400, { width: 150, paddingLeft: 24, paddingRight: 24 });
-    expect(v.baseScaleForTest()).toBeCloseTo(0.75, 6);
+    expect(viewerState(v).baseScale()).toBeCloseTo(0.75, 6);
     v.destroy();
   });
 
@@ -2939,8 +2940,8 @@ describe('PptxScrollViewer — paddingLeft/paddingRight (horizontal desk gutters
       zoomMin: 0.5,
       zoomMax: 4,
     });
-    expect(v.scaleForTest()).toBeCloseTo(1.0, 6);
-    v.setScale(v.scaleForTest() * 2); // slide px 200 → 400
+    expect(v.getScale()).toBeCloseTo(1.0, 6);
+    v.setScale(v.getScale() * 2); // slide px 200 → 400
     const s0 = scrollHost.children.find(
       (c) => c.tag === 'div' && c.children.some((k) => k.tag === 'canvas') && c.style.top === '0px',
     ) as FakeEl | undefined;
@@ -2967,7 +2968,7 @@ describe('PptxScrollViewer — paddingLeft/paddingRight (horizontal desk gutters
     // outer container remains 232px wide. Re-fit must use 215, yielding slide 183
     // + two 16px gutters = exactly 215px, not the stale outer width.
     scrollHost.clientWidth = 215;
-    v.resizeForTest();
+    resizeViewer(v);
     const spacer = scrollHost.children[0] as FakeEl;
     expect(parseFloat(spacer.style.width)).toBeCloseTo(215, 3);
     expect(container.clientWidth).toBe(232);
@@ -2978,7 +2979,7 @@ describe('PptxScrollViewer — paddingLeft/paddingRight (horizontal desk gutters
     // padL + padR = 300 > container 200 ⇒ fit ≤ 0 ⇒ deferred (no slots mounted),
     // mirroring the zero-width container deferral.
     const { v } = setup(200, { paddingLeft: 150, paddingRight: 150 });
-    expect(v.mountedSlideIndicesForTest().length).toBe(0);
+    expect(viewerState(v).mounted().length).toBe(0);
     v.destroy();
   });
 
@@ -3040,7 +3041,7 @@ describe('PptxScrollViewer — flicker-free zoom (T8)', () => {
     const beforeCanvas = before!.children.find((k) => k.tag === 'canvas') as FakeEl;
     const resizesBefore = beforeCanvas._deviceResizes.length;
 
-    v.setScale(v.scaleForTest() * 2); // zoom in
+    v.setScale(v.getScale() * 2); // zoom in
 
     const after = slotAtTop(scrollHost, '0px');
     expect(after).toBe(before); // same wrapper (not recycled + re-mounted)
@@ -3055,7 +3056,7 @@ describe('PptxScrollViewer — flicker-free zoom (T8)', () => {
     const slot = slotAtTop(scrollHost, '0px')!;
     const canvas = slot.children.find((k) => k.tag === 'canvas') as FakeEl;
     // base 1.0 ⇒ slide px 200×120. Zoom ×2 ⇒ CSS 400×240.
-    v.setScale(v.scaleForTest() * 2);
+    v.setScale(v.getScale() * 2);
     expect(canvas.style.width).toBe('400px');
     expect(canvas.style.height).toBe('240px');
     v.destroy();
@@ -3116,7 +3117,7 @@ describe('PptxScrollViewer — flicker-free zoom (T8)', () => {
     const textLayer = slot.children.find((k) => k.tag === 'div') as FakeEl;
     // Zoom ×2 — overlay built at base 1.0; preview scales by newScale/renderedScale
     // = 2.0/1.0 = 2.
-    v.setScale(v.scaleForTest() * 2);
+    v.setScale(v.getScale() * 2);
     expect(textLayer.style.transform).toBe('scale(2)');
     expect(textLayer.style.transformOrigin).toBe('0 0');
     // The wrapper has already grown to 400x240. A width/height:100% overlay
@@ -3136,15 +3137,15 @@ describe('PptxScrollViewer — flicker-free zoom (T8)', () => {
     try {
       const { v, engine } = setup();
       const dispatchesBefore = engine.renderCalls.length;
-      v.setScale(v.scaleForTest() * 1.1);
+      v.setScale(v.getScale() * 1.1);
       vi.advanceTimersByTime(50);
-      v.setScale(v.scaleForTest() * 1.1);
+      v.setScale(v.getScale() * 1.1);
       vi.advanceTimersByTime(50);
-      v.setScale(v.scaleForTest() * 1.1);
+      v.setScale(v.getScale() * 1.1);
       vi.advanceTimersByTime(50); // timer reset each tick — still inside window
       expect(engine.renderCalls.length).toBe(dispatchesBefore);
       vi.advanceTimersByTime(150); // past the settle timeout from the LAST setScale
-      const mounted = v.mountedSlideIndicesForTest();
+      const mounted = viewerState(v).mounted();
       const settleRenders = engine.renderCalls.length - dispatchesBefore;
       expect(settleRenders).toBe(mounted.length);
     } finally {
@@ -3163,7 +3164,7 @@ describe('PptxScrollViewer — flicker-free zoom (T8)', () => {
       const onScreenUid = onScreenCanvas._uid;
       const resizesOnScreenBefore = onScreenCanvas._deviceResizes.length;
 
-      v.setScale(v.scaleForTest() * 2);
+      v.setScale(v.getScale() * 2);
       vi.advanceTimersByTime(200);
 
       const settleCall = engine.renderCalls.filter((c) => c.slide === 0).pop()!;
@@ -3197,7 +3198,7 @@ describe('PptxScrollViewer — flicker-free zoom (T8)', () => {
     const canvasUid = canvas._uid;
     const bitmapsBefore = engine.bitmapCalls.length;
 
-    v.setScale(v.scaleForTest() * 2);
+    v.setScale(v.getScale() * 2);
     vi.advanceTimersByTime(200);
 
     expect(engine.bitmapCalls.length).toBeGreaterThan(bitmapsBefore);
@@ -3222,11 +3223,11 @@ describe('PptxScrollViewer — flicker-free zoom (T8)', () => {
       const slot = slotAtTop(scrollHost, '0px')!;
       const onScreenCanvas = slot.children.find((k) => k.tag === 'canvas') as FakeEl;
 
-      v.setScale(v.scaleForTest() * 2);
+      v.setScale(v.getScale() * 2);
       vi.advanceTimersByTime(200); // settle dispatched (deferred, in flight)
       const settleCall = engine.renderCalls.filter((c) => c.slide === 0).pop()!;
 
-      v.setScale(v.scaleForTest() * 1.1); // bump epoch mid-settle-render
+      v.setScale(v.getScale() * 1.1); // bump epoch mid-settle-render
 
       settleCall.resolve();
       return Promise.resolve()
@@ -3248,7 +3249,7 @@ describe('PptxScrollViewer — flicker-free zoom (T8)', () => {
     try {
       const { v, engine } = setup();
       const dispatchesBefore = engine.renderCalls.length;
-      v.setScale(v.scaleForTest() * 2); // schedules a settle timer
+      v.setScale(v.getScale() * 2); // schedules a settle timer
       v.destroy();
       vi.advanceTimersByTime(500);
       expect(engine.renderCalls.length).toBe(dispatchesBefore);
@@ -3265,7 +3266,7 @@ describe('PptxScrollViewer — flicker-free zoom (T8)', () => {
       for (const c of engine.renderCalls.slice()) c.resolve();
       const slot = slotAtTop(scrollHost, '0px')!;
       const onScreenCanvas = slot.children.find((k) => k.tag === 'canvas') as FakeEl;
-      v.setScale(v.scaleForTest() * 2);
+      v.setScale(v.getScale() * 2);
       vi.advanceTimersByTime(200);
       const settleCall = engine.renderCalls.filter((c) => c.slide === 0).pop()!;
       v.destroy();
@@ -3306,7 +3307,7 @@ describe('PptxScrollViewer — flicker-free zoom (T8)', () => {
     const slot = slotAtTop(scrollHost, '0px')!;
     const textLayer = slot.children.find((k) => k.tag === 'div') as FakeEl;
 
-    v.setScale(v.scaleForTest() * 2);
+    v.setScale(v.getScale() * 2);
     expect(textLayer.style.transform).toBe('scale(2)'); // preview transform applied
     vi.advanceTimersByTime(200);
     const settleCall = engine.renderCalls.filter((c) => c.slide === 0).pop()!;
@@ -3398,7 +3399,7 @@ describe('PptxScrollViewer — pageShadow (T9)', () => {
       // Resolve the initial mount renders so the on-screen canvases are painted.
       for (const c of engine.renderCalls.slice()) c.resolve();
 
-      v.setScale(v.scaleForTest() * 2); // zoom → schedules a settle
+      v.setScale(v.getScale() * 2); // zoom → schedules a settle
       vi.advanceTimersByTime(200); // past ZOOM_SETTLE_MS → settle dispatched
 
       // The settle render for slide 0 targets a fresh SPARE canvas — it must

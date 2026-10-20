@@ -12,7 +12,7 @@ import {
 import { respondToHostLayoutRequest, XLSX_HOST_LAYOUT_REQUEST, XLSX_HOST_LAYOUT_RESULT } from './host-layout.js';
 
 const descriptor: ModelSourceModuleDescriptor = {
-  protocol: 'ooxml-model-source-module/v1',
+  protocol: 'ooxml-model-source-module/v2',
   target: 'xlsx',
   moduleUrl: 'https://example.test/source.mjs',
   config: {},

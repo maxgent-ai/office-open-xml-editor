@@ -14,11 +14,13 @@ import BrandIcon from '../components/BrandIcon.astro';
         <p class="try-lead">DOCX, XLSX and PPTX are parsed and rendered locally in your browser. Your file is never uploaded.</p>
       </div>
 
-      <input type="file" id="file" accept=".docx,.xlsx,.pptx,.csv,.tsv" hidden />
+      <input type="file" id="file" accept=".docx,.xlsx,.pptx,.doc,.xls,.ppt,.csv,.tsv" hidden />
       <button class="dropzone" id="dropzone" type="button">
         <span class="dz-action"><strong>Choose or drop a file</strong><small>.docx · .xlsx · .pptx</small></span>
         <span class="dz-arrow" aria-hidden="true">＋</span>
       </button>
+
+      <p class="try-legacy">Experimental: .doc · .xls · .ppt via the <a href="/legacy-office">legacy Office add-on</a>. Unsupported files reject.</p>
 
       <div class="try-status" id="status" hidden></div>
       <div class="try-privacy">
@@ -77,7 +79,7 @@ import BrandIcon from '../components/BrandIcon.astro';
     const dz = document.getElementById('dropzone') as HTMLButtonElement;
     const input = document.getElementById('file') as HTMLInputElement;
     const empty = document.getElementById('empty') as HTMLElement;
-    const preview = document.querySelector<HTMLElement>('.try-preview')!;
+    const preview = document.querySelector('.try-preview') as HTMLElement;
     const status = document.getElementById('status') as HTMLElement;
     const panel = document.getElementById('panel') as HTMLElement;
     const stage = document.getElementById('stage') as HTMLElement;
@@ -176,6 +178,8 @@ import BrandIcon from '../components/BrandIcon.astro';
 </Base>
 
 <style>
+  .try-legacy { color: var(--text-dim); font-size: 13px; }
+  .try-legacy a { text-decoration: underline; }
   .try-workspace {
     display: grid;
     grid-template-columns: repeat(12, minmax(0, 1fr));

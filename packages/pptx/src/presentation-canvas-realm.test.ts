@@ -33,7 +33,7 @@ describe('PptxPresentation canvas font ownership', () => {
     instance._assertSlideIndex = () => undefined;
     instance._waitForSlide = async () => undefined;
     instance._rethrowWithResourceFailure = (error: unknown) => { throw error; };
-    const selectRoutes = vi.fn(async (requests: unknown[], set: FontFaceSet | null) => ({ set }));
+    const selectRoutes = vi.fn(async (requests: unknown[], set: FontFaceSet | null) => ({ routes: { set }, installed: [] }));
     instance._officeRoutesForRequests = selectRoutes;
     const presentation = instance as unknown as PptxPresentation;
 

@@ -54,6 +54,8 @@ type Ctx2D = CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D;
  *                  `top`-baseline y.
  * @param charH     Height of one stacked cell slot (px) — used to centre a rotated
  *                  glyph within its slot.
+ * @param paintText Optional cell painter, used after glyph substitution and
+ *                  rotation so synthetic bold follows the same geometry.
  */
 export function drawStackedVerticalChar(
   ctx: Ctx2D,
@@ -62,6 +64,7 @@ export function drawStackedVerticalChar(
   cellTopY: number,
   charH: number,
   vertCapable = false,
+  paintText: (text: string, x: number, y: number) => void = (text, x, y) => ctx.fillText(text, x, y),
 ): void {
   const cp = ch.codePointAt(0) ?? 0;
   const vo = verticalOrientation(cp);
@@ -71,7 +74,7 @@ export function drawStackedVerticalChar(
     ctx.translate(centerX, cellTopY + charH / 2);
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
-    withVertFeature(ctx, () => ctx.fillText(ch, 0, 0));
+    withVertFeature(ctx, () => paintText(ch, 0, 0));
     ctx.restore();
     return;
   }
@@ -82,7 +85,7 @@ export function drawStackedVerticalChar(
     // like an ideograph, so the caller's center/top placement lands it correctly.
     const bracket = verticalBracketFormSubstitute(cp);
     if (bracket !== null) {
-      ctx.fillText(String.fromCodePoint(bracket), centerX, cellTopY);
+      paintText(String.fromCodePoint(bracket), centerX, cellTopY);
       return;
     }
     // Semicolon ；(FF1B): its FE14 vertical form is an upright dot-over-comma (not a
@@ -91,7 +94,7 @@ export function drawStackedVerticalChar(
     // forms are absent from most render fonts). The colon ：falls through to rotate,
     // reproducing FE13's side-by-side dots.
     if (verticalTrUprightFallback(cp)) {
-      ctx.fillText(ch, centerX, cellTopY);
+      paintText(ch, centerX, cellTopY);
       return;
     }
     // Fallback: no vertical form (ー U+30FC, wave dash / tilde 〜 ～, quotes, colon ：)
@@ -106,7 +109,7 @@ export function drawStackedVerticalChar(
     ctx.rotate(Math.PI / 2);
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
-    ctx.fillText(ch, 0, 0);
+    paintText(ch, 0, 0);
     ctx.restore();
     return;
   }
@@ -114,5 +117,5 @@ export function drawStackedVerticalChar(
   // vo=U / vo=R → upright unchanged; vo=Tu → substitute a vertical form when one
   // exists (、。，), else upright unchanged (！？, small kana).
   const sub = vo === 'Tu' ? verticalFormSubstitute(cp) : null;
-  ctx.fillText(sub !== null ? String.fromCodePoint(sub) : ch, centerX, cellTopY);
+  paintText(sub !== null ? String.fromCodePoint(sub) : ch, centerX, cellTopY);
 }

@@ -2,7 +2,7 @@
 
 Paragraph footnotes continue across physical pages by default in
 `DocxDocument.load`, `DocxViewer`, `DocxScrollViewer`, the Node
-`openDocxDocument` session, and documents loaded through `modelSources` in
+`openDocxDocument` session, and documents loaded through the `legacyDoc` option in
 either environment. This is a library display default chosen to follow
 Word's page allocation in the finite controls described below; it is not a
 normative ECMA-376 algorithm and does not promise identical Word pagination or
@@ -74,7 +74,7 @@ unchanged library policy.
 
 Ordinary and continuation separator stories are independent. Explicit short and
 full marks remain distinct from absent/default facts through the shared model,
-including models supplied through `modelSources`. The rule's kind determines
+including models supplied through the `legacyDoc` option. The rule's kind determines
 its width even when a short mark appears in a continuation story. A bare empty
 reserved story suppresses its rule while preserving the note-band gap. A bare
 `separator` mark uses the existing short-rule policy (one third of text width);
@@ -94,13 +94,13 @@ and endnote stories keep the 6pt band, with the rule at its midpoint.
 General authored
 separator text, paragraph borders or shading, and mark-run formatting that
 differs from the paragraph mark are not yet retained; they use the existing DOCX
-default rule. This is not permission for a native
+default rule. This is not permission for another
 producer to discard separator formatting: it must admit its formatting class
 and special-character semantics before emitting the closed shared rule fact.
-Native CP-empty, guard-only and paragraph-only stories are not implicitly
+Its empty and paragraph-only reserved stories are not implicitly
 equivalent to DOCX default or bare-empty facts. Ordinary DOCX continuation
 notices keep no story geometry, and they and endnote continuation are outside
-this footnote continuation contract. The native (MS-DOC) footnote continuation
+this footnote continuation contract. A producer-supplied reserved continuation
 notice has its own closed contract: only an empty or paragraph-only notice story
 is admitted (notice text is rejected), with its acquired paragraph and mark
 formatting. When a footnote continues, that paragraph is laid out as a story

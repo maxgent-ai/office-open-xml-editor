@@ -8,7 +8,7 @@
 // palette + pixels contiguously — via {@link decodePackedDib}).
 
 import { createAuxCanvas } from '../canvas/aux-canvas.js';
-import { MAX_RASTER_DIMENSION, MAX_RASTER_PIXELS } from './pixel-budget.js';
+import { MAX_RASTER_DIMENSION, MAX_RASTER_PIXELS, OoxmlDecodedImageLimitError, isOoxmlDecodedImageLimitError } from './pixel-budget.js';
 
 /**
  * Maximum width or height (px) accepted for a decoded DIB, and the megapixel
@@ -44,32 +44,59 @@ export function decodeDib(
   bitsOff: number,
   bitsLen: number,
 ): DecodedDib | null {
-  if (bmiLen < 40 || bmiOff + 40 > dv.byteLength) return null;
+  // Offsets and declared spans must belong to the containing view (the EMF
+  // player supplies a view ending at its record). Invalid ranges and encodings
+  // are content fallback, before any decoded-surface resource admission.
+  if (bmiOff < 0 || bitsOff < 0 || bitsLen < 0 || bmiLen < 40
+    || bmiOff + bmiLen > dv.byteLength || bitsOff + bitsLen > dv.byteLength) return null;
   const biSize = dv.getUint32(bmiOff, true);
-  if (biSize < 40) return null; // only BITMAPINFOHEADER (or larger) supported
+  if (biSize < 40 || biSize > bmiLen) return null; // complete BITMAPINFOHEADER (or larger)
   const biWidth = dv.getInt32(bmiOff + 4, true);
   const biHeightRaw = dv.getInt32(bmiOff + 8, true);
   const biBitCount = dv.getUint16(bmiOff + 14, true);
   const biCompression = dv.getUint32(bmiOff + 16, true);
   if (biCompression !== 0) return null; // BI_RGB only
+  if (![1, 4, 8, 24, 32].includes(biBitCount)) return null;
   const topDown = biHeightRaw < 0;
   const width = Math.abs(biWidth);
   const height = Math.abs(biHeightRaw);
+  if (width <= 0 || height <= 0) return null;
+  // Preserve the existing short-data tolerance: at most one missing row can
+  // produce a partial bitmap; more is discarded. Check that content fallback
+  // before surface admission. Arithmetic (rather than 32-bit shifts) keeps
+  // row sizes valid even for oversized headers that have not been admitted.
+  const rowStride = Math.ceil(width * biBitCount / 32) * 4;
+  // EMF records may carry unrelated data after the explicit pixel span too.
+  // Only bitsLen proves bitmap bytes; the enclosing view is not pixel data.
+  if (rowStride * height > bitsLen + rowStride) return null;
+  // A tolerated partial row is not proof of a resource crossing. Preserve
+  // partial decoding within budget, but oversized inputs need all pixel bytes
+  // before a terminal resource error can replace malformed-content fallback.
+  const oversized = width > MAX_DIB_DIMENSION || height > MAX_DIB_DIMENSION || width * height > MAX_DIB_PIXELS;
+  if (oversized) {
+    if (rowStride * height > bitsLen) return null;
+    // MS-WMF 2.2.2.9: RGBQUAD entries are the indexed palette, or the
+    // optional optimization table at >8bpp. Ordinary decoding tolerates a
+    // short palette (black for missing indices) and ignores optimization
+    // colors; absent declared bytes cannot prove a terminal policy crossing.
+    const entries = dv.getUint32(bmiOff + 32, true) || (biBitCount <= 8 ? 1 << biBitCount : 0);
+    if (entries * 4 > bmiLen - biSize) return null;
+  }
   // Validate dimensions BEFORE the RGBA allocation. Reject non-positive dims,
   // any dimension past the max canvas size, and any total pixel count over the
   // megapixel budget — a crafted header (e.g. 65535×65535) otherwise reaches
   // `new Uint8ClampedArray(width*height*4)` and OOMs the tab (~17 GB). See
   // MAX_DIB_DIMENSION / MAX_DIB_PIXELS.
-  if (width <= 0 || height <= 0) return null;
-  if (width > MAX_DIB_DIMENSION || height > MAX_DIB_DIMENSION) return null;
-  if (width * height > MAX_DIB_PIXELS) return null;
+  // Library resource policy is terminal, including inside a metafile's
+  // compatibility fallback. Unsupported encodings still return null above.
+  if (width > MAX_DIB_DIMENSION || height > MAX_DIB_DIMENSION) {
+    throw new OoxmlDecodedImageLimitError('image-dimension', MAX_DIB_DIMENSION, Math.max(width, height));
+  }
+  if (width * height > MAX_DIB_PIXELS) {
+    throw new OoxmlDecodedImageLimitError('image-pixels', MAX_DIB_PIXELS, width * height);
+  }
 
   const out = new Uint8ClampedArray(width * height * 4);
-  const rowStride = (((width * biBitCount + 31) >> 5) << 2) >>> 0; // 4-byte aligned
-  if (bitsOff + rowStride * height > bitsOff + bitsLen + rowStride) {
-    // Tolerate slight over-read; only bail if obviously out of buffer.
-    if (bitsOff + rowStride * height > dv.byteLength) return null;
-  }
 
   // Palette for ≤8bpp follows the header.
   let palette: number[] | null = null;
@@ -80,7 +107,7 @@ export function decodeDib(
     palette = [];
     for (let i = 0; i < clrUsed; i++) {
       const o = palOff + i * 4;
-      if (o + 4 > dv.byteLength) break;
+      if (o + 4 > bmiOff + bmiLen) break;
       const b = dv.getUint8(o);
       const g = dv.getUint8(o + 1);
       const r = dv.getUint8(o + 2);
@@ -101,7 +128,7 @@ export function decodeDib(
     const srcRow = topDown ? y : height - 1 - y; // bottom-up unless negative
     const dstRow = y;
     const rowOff = bitsOff + srcRow * rowStride;
-    if (rowOff + rowStride > dv.byteLength) break;
+    if (rowOff + rowStride > bitsOff + bitsLen) break;
     if (biBitCount === 32) {
       for (let x = 0; x < width; x++) {
         const o = rowOff + x * 4;
@@ -167,7 +194,12 @@ export function decodeDib(
  * {@link decodeDib}. `dibOff`/`dibLen` bound the packed blob within `dv`.
  */
 export function decodePackedDib(dv: DataView, dibOff: number, dibLen: number): DecodedDib | null {
-  if (dibLen < 40 || dibOff + 40 > dv.byteLength) return null;
+  if (dibOff < 0 || dibLen < 40 || dibOff + dibLen > dv.byteLength) return null;
+  // MS-WMF 2.3.1.6: the packed bitmap belongs to this record alone. Bound
+  // every header/palette/pixel read before decodeDib tests truncation or admits
+  // a surface; following records cannot supply this bitmap's missing bytes.
+  dv = new DataView(dv.buffer, dv.byteOffset + dibOff, dibLen);
+  dibOff = 0;
   const biSize = dv.getUint32(dibOff, true);
   if (biSize < 40) return null;
   const biBitCount = dv.getUint16(dibOff + 14, true);
@@ -224,7 +256,8 @@ export function blitDibToCtx(
     const dh = Math.abs(y1 - y0);
     ctx.drawImage(tmp, dx, dy, dw, dh);
     return true;
-  } catch {
+  } catch (error) {
+    if (isOoxmlDecodedImageLimitError(error)) throw error;
     // Unsupported / missing image API → skip the blit, keep rendering.
     return false;
   }

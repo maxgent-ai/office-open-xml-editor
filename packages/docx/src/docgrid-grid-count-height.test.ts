@@ -10,7 +10,7 @@
  * or under-tall box from changing the cell count (sample-9/sample-52).
  *
  * A linear stub context makes the metrics analytic: measured box = fontSize
- * (0.8 + 0.2 em); Yu Mincho's tabled EA design height = 1.43267 × em.
+ * (0.8 + 0.2 em); Yu Mincho's tabled EA design height = 1.67324 × em.
  */
 import { describe, expect, it } from 'vitest';
 import { DEFAULT_KINSOKU_RULES } from '@silurus/ooxml-core';
@@ -78,8 +78,8 @@ function layout(segs: LayoutTextSeg[], width = 400) {
   );
 }
 
-// Yu Mincho tabled EA design single-line height per pt: 1.3 × hhea box = 1.43267 em.
-const YU = (2257 * 1.3) / 2048;
+// Yu Mincho tabled EA design single-line height per pt: 1.3 × usWin box = 1.67324 em.
+const YU = (2636 * 1.3) / 2048;
 
 describe('layoutLines — per-line gridCountSingle (§17.6.5 docGrid cell height)', () => {
   it('a resolved EA line counts from its resource DESIGN height, not the measured box', () => {
@@ -94,21 +94,21 @@ describe('layoutLines — per-line gridCountSingle (§17.6.5 docGrid cell height
     // SUBSTITUTED Canvas box overshoots the real Latin height — Word measured
     // sample-52's exact table at x0=417 == the CJK-design (1-cell) layout, so
     // the ASCII box must NOT drive the count. This test uses a deliberately
-    // TALL 20pt Latin run (box 20px > the 12pt CJK design 17.19px) to
-    // DISCRIMINATE the exclusion: were it counted the result would be 20; the
+    // TALL 24pt Latin run (box 24px > the 12pt CJK design 20.08px) to
+    // DISCRIMINATE the exclusion: were it counted the result would be 24; the
     // §17.6.5 "Latin is not cell-rounded" rule yields the CJK design alone.
     // (The tall-Latin mixed line has no Word ground truth of its own — this
     // characterizes the deliberate rule, consistent with the Latin-only case.)
     const [line] = layout([
-      seg('TABLE 1 = ', 'Arbitrary Resolved EA', 20, YU),
+      seg('TABLE 1 = ', 'Arbitrary Resolved EA', 24, YU),
       seg('固定幅（両軸拘束）。', 'Arbitrary Resolved EA', 12, YU),
     ]);
     expect(line.gridCountSingle).toBeCloseTo(12 * YU, 4);
-    expect(line.gridCountSingle).toBeLessThan(20); // the 20pt Latin box did NOT count
+    expect(line.gridCountSingle).toBeLessThan(24); // the 24pt Latin box did NOT count
   });
 
   it('counts a genuinely TALL untabled EA run from the Word FE design fallback', () => {
-    // Small 12pt Yu Mincho (design 17.19) + a large 24pt untabled CJK face.
+    // Small 12pt Yu Mincho (design 20.08) + a large 24pt untabled CJK face.
     // Word's untabled FE fallback is 1.3em, so the latter contributes 31.2px;
     // its substituted Canvas box (24px in this stub) is irrelevant.
     const [line] = layout([

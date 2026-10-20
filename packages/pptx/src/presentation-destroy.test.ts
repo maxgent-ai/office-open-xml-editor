@@ -1,16 +1,16 @@
-import { _resetCssCacheForTests } from '../../core/src/fonts/preload.js';
-import { describe, it, expect, afterEach, vi } from 'vitest';
+import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
 import {
   WorkerBridge,
-  registerEmbeddedFonts,
   type ModelSource,
   type WorkerLike,
   type FontPreloadEntry,
 } from '@silurus/ooxml-core';
 import { BoundedRawPartCache } from '@silurus/ooxml-core/internal/bounded-raw-part-cache';
 import { ProgressiveLayoutLifecycle } from '@silurus/ooxml-core/internal/progressive-layout-lifecycle';
-import { PptxPresentation } from './presentation';
-import { loadEmbeddedFonts } from './embedded-fonts';
+let { PptxPresentation } = await import('./presentation');
+let { registerEmbeddedFonts } = await import('@silurus/ooxml-core');
+import type { PptxPresentation as Presentation } from './presentation';
+let { loadEmbeddedFonts } = await import('./embedded-fonts');
 import type { PptxEmbeddedFontRef } from './worker-protocol';
 
 /**
@@ -53,8 +53,14 @@ const ORIG_FONTS = {
   Worker: G.Worker,
   location: G.location,
 };
+beforeEach(async () => {
+  vi.resetModules();
+  ({ PptxPresentation } = await import('./presentation'));
+  ({ registerEmbeddedFonts } = await import('@silurus/ooxml-core'));
+  ({ loadEmbeddedFonts } = await import('./embedded-fonts'));
+});
+
 afterEach(() => {
-  _resetCssCacheForTests();
   G.document = ORIG_FONTS.document;
   G.self = ORIG_FONTS.self;
   G.fetch = ORIG_FONTS.fetch;
@@ -144,7 +150,7 @@ describe('PptxPresentation.destroy() — rejects in-flight worker requests', () 
     const loadRoutes = vi.spyOn(pres as unknown as {
       _officeRoutesForRequests(requests: unknown[], set: FontFaceSet | null): Promise<object>;
     }, '_officeRoutesForRequests').mockResolvedValue({});
-    const rendering = (pres as unknown as PptxPresentation).renderSlide({} as HTMLCanvasElement, 0);
+    const rendering = (pres as unknown as Presentation).renderSlide({} as HTMLCanvasElement, 0);
     await Promise.resolve();
     pres.destroy();
     releaseSlide?.();
@@ -184,7 +190,7 @@ describe('PptxPresentation.destroy() — rejects in-flight worker requests', () 
       claim: () => true,
       beginLoad: () => ({
         module: {
-          protocol: 'ooxml-model-source-module/v1',
+          protocol: 'ooxml-model-source-module/v2',
           target: 'pptx', moduleUrl: 'https://example.test/source.mjs', config: {},
         },
         release,
@@ -194,7 +200,7 @@ describe('PptxPresentation.destroy() — rejects in-flight worker requests', () 
       _parse(buffer: ArrayBuffer, resourcePolicy: object): Promise<void>;
     }, '_parse').mockResolvedValueOnce(undefined);
 
-    await expect(PptxPresentation.load(new ArrayBuffer(0), { modelSources: [source] }))
+    await expect(PptxPresentation.load(new ArrayBuffer(0), { legacyPpt: source }))
       .rejects.toBe(failure);
     expect(release).toHaveBeenCalledOnce();
     expect(SilentWorker.instances).toHaveLength(1);
@@ -234,7 +240,7 @@ describe('PptxPresentation.destroy() — rejects in-flight worker requests', () 
         _parse(buffer: ArrayBuffer, resourcePolicy: object): Promise<void>;
       },
       '_parse',
-    ).mockImplementationOnce(async function (this: PptxPresentation) {
+    ).mockImplementationOnce(async function (this: Presentation) {
       const embeddedFonts: PptxEmbeddedFontRef[] = [{
         fontName: 'Main Deck Font',
         style: 'regular' as const,
@@ -282,7 +288,7 @@ describe('PptxPresentation.destroy() — rejects in-flight worker requests', () 
         _parse(buffer: ArrayBuffer, resourcePolicy: object): Promise<void>;
       },
       '_parse',
-    ).mockImplementationOnce(async function (this: PptxPresentation) {
+    ).mockImplementationOnce(async function (this: Presentation) {
       (this as unknown as { _preflight: object })._preflight = {
         slideCount: 0,
         slideWidth: 914400,
@@ -382,7 +388,7 @@ it.each(['ordinary', 'selected-source'] as const)('filters ordinary Window prelo
   };
   vi.spyOn(PptxPresentation.prototype as unknown as {
     _parse(buffer: ArrayBuffer, resourcePolicy: object): Promise<void>;
-  }, '_parse').mockImplementationOnce(async function (this: PptxPresentation) {
+  }, '_parse').mockImplementationOnce(async function (this: Presentation) {
     (this as unknown as { _preflight: object })._preflight = {
       slideCount: 0, slideWidth: 914400, slideHeight: 914400,
       defaultTextColor: null, majorFont: 'Calibri', minorFont: null,
@@ -391,11 +397,11 @@ it.each(['ordinary', 'selected-source'] as const)('filters ordinary Window prelo
     };
   });
   const source: ModelSource<'pptx'> = { target: 'pptx', claim: () => true, beginLoad: () => ({
-    module: { protocol: 'ooxml-model-source-module/v1', target: 'pptx', moduleUrl: 'https://example.test/source.mjs', config: {} },
+    module: { protocol: 'ooxml-model-source-module/v2', target: 'pptx', moduleUrl: 'https://example.test/source.mjs', config: {} },
     release: () => undefined,
   }) };
   const presentation = await PptxPresentation.load(new ArrayBuffer(0), { useGoogleFonts: true,
-    ...(variant === 'selected-source' ? { modelSources: [source] } : {}),
+    ...(variant === 'selected-source' ? { legacyPpt: source } : {}),
   });
   expect(added).toHaveLength(2);
   expect(loads).toEqual([expect.stringContaining('a.woff2')]);

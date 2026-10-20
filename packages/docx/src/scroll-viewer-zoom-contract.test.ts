@@ -1,3 +1,4 @@
+import { viewerState } from './scroll-viewer-test-dom.js';
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { DocxScrollViewer } from './scroll-viewer.js';
 import { DocxDocument } from './document.js';
@@ -67,7 +68,7 @@ describe('DocxScrollViewer IX9 zoom contract', () => {
     const { v } = setup();
     // base = 200 / (100 × 4/3) = 1.5
     expect(v.getScale()).toBeCloseTo(1.5, 5);
-    expect(v.getScale()).toBeCloseTo(v.scaleForTest(), 10);
+    expect(v.getScale()).toBeCloseTo(v.getScale(), 10);
     v.destroy();
   });
 
@@ -235,12 +236,12 @@ describe('DocxScrollViewer IX9 zoom contract', () => {
     scrollHost.clientWidth = 200;
     scrollHost.clientHeight = 400;
     v.relayout();
-    expect(v.scaleForTest()).toBeCloseTo(2, 6); // applied over the 1.5 base fit
+    expect(v.getScale()).toBeCloseTo(2, 6); // applied over the 1.5 base fit
     expect(v.getScale()).toBeCloseTo(2, 6);
     expect(onScaleChange).toHaveBeenCalledTimes(1);
     expect(onScaleChange).toHaveBeenCalledWith(2);
     // The base fit itself is still the true base (resize re-fit multiplier intact).
-    expect(v.baseScaleForTest()).toBeCloseTo(1.5, 5);
+    expect(viewerState(v).baseScale()).toBeCloseTo(1.5, 5);
     v.destroy();
   });
 
@@ -265,7 +266,7 @@ describe('DocxScrollViewer IX9 zoom contract', () => {
     const { v, scrollHost } = setup();
     scrollHost.scrollTop = 500; // scrolled into the document
     const pointerY = 250; // mid-viewport
-    const before = v.contentAtViewportYForTest(pointerY);
+    const before = viewerState(v).contentAt(pointerY);
     scrollHost.dispatch('wheel', {
       ctrlKey: true,
       deltaY: -60, // zoom in
@@ -275,7 +276,7 @@ describe('DocxScrollViewer IX9 zoom contract', () => {
     });
     expect(v.getScale()).toBeGreaterThan(1.5); // zoomed in past the base
     // The same content point (page + intra-page fraction) is back under pointerY.
-    expect(v.viewportYOfForTest(before.page, before.frac)).toBeCloseTo(pointerY, 4);
+    expect(viewerState(v).viewportYOf(before.page, before.frac)).toBeCloseTo(pointerY, 4);
     v.destroy();
   });
 
@@ -284,7 +285,7 @@ describe('DocxScrollViewer IX9 zoom contract', () => {
     v.setScale(3); // start zoomed in so there is room to zoom out
     scrollHost.scrollTop = 400;
     const pointerY = 120;
-    const before = v.contentAtViewportYForTest(pointerY);
+    const before = viewerState(v).contentAt(pointerY);
     scrollHost.dispatch('wheel', {
       ctrlKey: true,
       deltaY: 60, // zoom out
@@ -293,17 +294,17 @@ describe('DocxScrollViewer IX9 zoom contract', () => {
       preventDefault() {},
     });
     expect(v.getScale()).toBeLessThan(3);
-    expect(v.viewportYOfForTest(before.page, before.frac)).toBeCloseTo(pointerY, 4);
+    expect(viewerState(v).viewportYOf(before.page, before.frac)).toBeCloseTo(pointerY, 4);
     v.destroy();
   });
 
   it('a non-gesture setScale still anchors on the viewport top (unchanged)', () => {
     const { v, scrollHost } = setup();
     scrollHost.scrollTop = 500;
-    const topContent = v.contentAtViewportYForTest(0); // what sits at the viewport top
+    const topContent = viewerState(v).contentAt(0); // what sits at the viewport top
     v.setScale(3); // public API, no pointer anchor
     // The viewport-top content is preserved (historical top-anchor behaviour).
-    expect(v.viewportYOfForTest(topContent.page, topContent.frac)).toBeCloseTo(0, 4);
+    expect(viewerState(v).viewportYOf(topContent.page, topContent.frac)).toBeCloseTo(0, 4);
     v.destroy();
   });
 
@@ -355,9 +356,9 @@ describe('DocxScrollViewer IX9 zoom contract', () => {
       preventDefault() {},
     });
     expect(v.getScale()).toBe(4); // confirmed no-op
-    const topContent = v.contentAtViewportYForTest(0);
+    const topContent = viewerState(v).contentAt(0);
     v.zoomOut(); // non-gesture stepper — must keep the viewport-TOP anchor
-    expect(v.viewportYOfForTest(topContent.page, topContent.frac)).toBeCloseTo(0, 4);
+    expect(viewerState(v).viewportYOf(topContent.page, topContent.frac)).toBeCloseTo(0, 4);
     v.destroy();
   });
 });

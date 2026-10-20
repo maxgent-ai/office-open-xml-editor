@@ -14,6 +14,9 @@
   <canvas id="pptx-chart-ex"></canvas>
   <canvas id="legacy-doc-main"></canvas>
   <canvas id="legacy-doc-worker"></canvas>
+  <script type="importmap">
+    { "imports": { "@silurus/ooxml/internal/companion": "/dist/internal-companion.mjs" } }
+  </script>
   <script type="module">
     import { DocxDocument, DocxViewer } from '/dist/docx.mjs';
     import { XlsxSheetViewer, XlsxWorkbook } from '/dist/xlsx.mjs';
@@ -154,13 +157,13 @@
         await new Promise((resolve) => { window.resumeSourceStages = resolve; });
       }
       // The optional legacy entry is part of the selected-source stage.
-      const { legacyDocSource } = await import('/dist/legacy-doc.mjs');
+      const { legacyDoc } = await import('/packages/legacy-office/dist/doc.mjs');
       await runModelSourceStages({
         DocxDocument,
         DocxViewer,
         XlsxWorkbook,
         PptxPresentation,
-        legacyDocSource,
+        legacyDoc,
         bytes,
         paintCanvas: (id) => document.getElementById(id),
       });

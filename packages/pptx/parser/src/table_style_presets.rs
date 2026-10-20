@@ -10,62 +10,9 @@
 use std::collections::HashMap;
 
 use crate::{Fill, Stroke, TableLineStyle, TableStyleDef, TableTextStyle};
-use ooxml_common::color::{apply_tint_channels, TintMode};
+use ooxml_common::color::{apply_tint_channels, hls_to_rgb, rgb_to_hls, TintMode};
 
 // ── Color helpers ────────────────────────────────────────────────────────────
-
-fn rgb_to_hls(r: f64, g: f64, b: f64) -> (f64, f64, f64) {
-    let max = r.max(g).max(b);
-    let min = r.min(g).min(b);
-    let l = (max + min) / 2.0;
-    let d = max - min;
-    if d < 1e-10 {
-        return (0.0, l, 0.0);
-    }
-    let s = if l < 0.5 {
-        d / (max + min)
-    } else {
-        d / (2.0 - max - min)
-    };
-    let h = if (r - max).abs() < 1e-10 {
-        (g - b) / d + if g < b { 6.0 } else { 0.0 }
-    } else if (g - max).abs() < 1e-10 {
-        (b - r) / d + 2.0
-    } else {
-        (r - g) / d + 4.0
-    } / 6.0;
-    (h, l, s)
-}
-
-fn hue_to_rgb(p: f64, q: f64, t: f64) -> f64 {
-    let t = t.rem_euclid(1.0);
-    if t < 1.0 / 6.0 {
-        p + (q - p) * 6.0 * t
-    } else if t < 1.0 / 2.0 {
-        q
-    } else if t < 2.0 / 3.0 {
-        p + (q - p) * (2.0 / 3.0 - t) * 6.0
-    } else {
-        p
-    }
-}
-
-fn hls_to_rgb(h: f64, l: f64, s: f64) -> (f64, f64, f64) {
-    if s < 1e-10 {
-        return (l, l, l);
-    }
-    let q = if l < 0.5 {
-        l * (1.0 + s)
-    } else {
-        l + s - l * s
-    };
-    let p = 2.0 * l - q;
-    (
-        hue_to_rgb(p, q, h + 1.0 / 3.0),
-        hue_to_rgb(p, q, h),
-        hue_to_rgb(p, q, h - 1.0 / 3.0),
-    )
-}
 
 /// Apply a sequence of (name, val) color transforms to a hex color.
 /// val uses OOXML units (100_000 = 100%).
@@ -73,9 +20,9 @@ pub(crate) fn apply_transforms(hex: &str, transforms: &[(&str, i64)]) -> String 
     if hex.len() < 6 {
         return hex.to_owned();
     }
-    let r = u8::from_str_radix(&hex[0..2], 16).unwrap_or(0);
-    let g = u8::from_str_radix(&hex[2..4], 16).unwrap_or(0);
-    let b = u8::from_str_radix(&hex[4..6], 16).unwrap_or(0);
+    let r = u8::from_str_radix(hex.get(0..2).unwrap_or(""), 16).unwrap_or(0);
+    let g = u8::from_str_radix(hex.get(2..4).unwrap_or(""), 16).unwrap_or(0);
+    let b = u8::from_str_radix(hex.get(4..6).unwrap_or(""), 16).unwrap_or(0);
     let mut rf = r as f64 / 255.0;
     let mut gf = g as f64 / 255.0;
     let mut bf = b as f64 / 255.0;
@@ -98,6 +45,10 @@ pub(crate) fn apply_transforms(hex: &str, transforms: &[(&str, i64)]) -> String 
                 bf = nb;
             }
             "shade" => {
+                // Generated table presets shade the encoded sRGB channels,
+                // unlike `ooxml_common::color::apply_color_transforms`, which
+                // shades PowerPoint colours in linear light. Keep this space
+                // choice local: moving it changes preset table colours.
                 rf *= v;
                 gf *= v;
                 bf *= v;
@@ -996,6 +947,14 @@ pub fn lookup_builtin_table_style(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Theme scheme colours reach the preset table-style transforms verbatim;
+    /// a non-ASCII value must not panic on a char-boundary slice.
+    #[test]
+    fn apply_transforms_tolerates_non_ascii_hex() {
+        let out = apply_transforms("a\u{e9}000", &[("tint", 50000)]);
+        assert!(out.is_ascii() && out.len() >= 6, "{out:?}");
+    }
 
     fn solid_color(fill: &Option<Fill>) -> Option<&str> {
         match fill {

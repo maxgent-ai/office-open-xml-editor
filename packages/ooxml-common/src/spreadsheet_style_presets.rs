@@ -63,65 +63,245 @@ pub struct PresetElement {
     pub kind: &'static str,
     /// Band size (`size`, default 1).
     pub size: u32,
-    pub dxf: &'static PresetDxf,
+    pub dxf: PresetDxf,
 }
 
-impl PresetDxf {
-    /// Theme indices this format references.
-    pub fn theme_indices(&self) -> impl Iterator<Item = u32> + '_ {
-        let font = self.font.and_then(|font| font.color);
-        let fill = self.fill.into_iter().flat_map(|fill| [fill.fg, fill.bg]);
-        let border = self.border.into_iter().flat_map(|border| {
-            [
-                border.left,
-                border.right,
-                border.top,
-                border.bottom,
-                border.horizontal,
-                border.vertical,
-            ]
-            .into_iter()
-            .map(|edge| edge.and_then(|edge| edge.color))
-        });
-        std::iter::once(font)
-            .chain(fill)
-            .chain(border)
-            .flatten()
-            .map(|color| color.theme)
-    }
-}
-
-/// A generated style entry: (name, [(element type, band size, format index)]).
-type PresetStyleEntry = (&'static str, &'static [(&'static str, u32, u16)]);
+// Small component dictionaries avoid repeating Option/f64 and string-pointer
+// padding in WASM for every Annex G Dxf. Zero denotes absence and
+// positive indices denote present components (including empty, style-less
+// edges). This preserves §18.8.6's explicit edge clearing and §18.8.41's
+// element layering. Tints retain the original f64 values; no quantization or
+// theme substitution occurs. Decode only the requested style, without a
+// global decoded cache or an intermediate allocation.
+type PresetStyleEntry = (&'static str, u16, u16);
 
 include!("spreadsheet_style_presets.generated.rs");
 
+fn component<T: Copy>(table: &[T], index: impl Into<usize>) -> Option<T> {
+    index.into().checked_sub(1).map(|index| table[index])
+}
+
+fn preset_color(index: u8) -> Option<PresetColor> {
+    let [theme, tint] = component(&PRESET_COLORS, index)?;
+    Some(PresetColor {
+        theme: u32::from(theme),
+        tint: component(&PRESET_TINTS, tint),
+    })
+}
+
+fn preset_edge(index: u8) -> Option<PresetEdge> {
+    let [style, color] = component(&PRESET_EDGES, index)?;
+    Some(PresetEdge {
+        style: component(&PRESET_EDGE_STYLES, style),
+        color: preset_color(color),
+    })
+}
+
+fn decode_dxf(index: u16) -> PresetDxf {
+    let [font, fill, border_lo, border_hi] = PRESET_DXFS[usize::from(index)];
+    PresetDxf {
+        font: component(&PRESET_FONTS, font).map(|[bold, color]| PresetFont {
+            bold: bold != 0,
+            color: preset_color(color),
+        }),
+        fill: component(&PRESET_FILLS, fill).map(|[pattern, fg, bg]| PresetFill {
+            pattern_type: PRESET_PATTERNS[usize::from(pattern) - 1],
+            fg: preset_color(fg),
+            bg: preset_color(bg),
+        }),
+        border: component(&PRESET_BORDERS, u16::from_le_bytes([border_lo, border_hi])).map(
+            |[left, right, top, bottom, horizontal, vertical]| PresetBorder {
+                left: preset_edge(left),
+                right: preset_edge(right),
+                top: preset_edge(top),
+                bottom: preset_edge(bottom),
+                horizontal: preset_edge(horizontal),
+                vertical: preset_edge(vertical),
+            },
+        ),
+    }
+}
+
+fn style_elements(
+    styles: &'static [PresetStyleEntry],
+    name: &str,
+) -> Option<impl ExactSizeIterator<Item = PresetElement>> {
+    let &(_, start, end) = styles.iter().find(|(preset, _, _)| *preset == name)?;
+    Some(
+        PRESET_ELEMENTS[usize::from(start)..usize::from(end)]
+            .iter()
+            .map(|&[kind, size, dxf_lo, dxf_hi]| PresetElement {
+                kind: PRESET_KINDS[usize::from(kind) - 1],
+                size: PRESET_SIZES[usize::from(size) - 1],
+                dxf: decode_dxf(u16::from_le_bytes([dxf_lo, dxf_hi])),
+            }),
+    )
+}
+
 /// The elements of the built-in PivotTable style `name` (e.g.
 /// `PivotStyleLight16`), or `None` when `name` is not a built-in style.
-pub fn pivot_style(name: &str) -> Option<Vec<PresetElement>> {
-    let (_, elements) = PIVOT_STYLES.iter().find(|(preset, _)| *preset == name)?;
-    Some(
-        elements
-            .iter()
-            .map(|&(kind, size, index)| PresetElement {
-                kind,
-                size,
-                dxf: &PIVOT_DXFS[usize::from(index)],
-            })
-            .collect(),
-    )
+/// Elements retain Annex G order and band sizes (§18.18.82 / §18.8.41).
+pub fn pivot_style(name: &str) -> Option<impl ExactSizeIterator<Item = PresetElement>> {
+    style_elements(&PIVOT_STYLES, name)
+}
+
+/// The elements of the built-in Table style `name` (e.g.
+/// `TableStyleMedium2`), or `None` when `name` is not a built-in style.
+/// Elements retain Annex G order and band sizes (§18.18.82 / §18.8.41).
+pub fn table_style(name: &str) -> Option<impl ExactSizeIterator<Item = PresetElement>> {
+    style_elements(&TABLE_STYLES, name)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    // Captured from the pre-packing implementation at 41d29dbd6. Every preset
+    // crosses all ST_TableStyleType values, including absent elements. This
+    // catches lost presence/clearing, order, band sizes and exact tint values.
     #[test]
-    fn built_in_pivot_styles_resolve_by_name() {
-        let light16 = pivot_style("PivotStyleLight16").unwrap();
-        assert!(light16.iter().any(|element| element.kind == "headerRow"));
-        assert!(pivot_style("PivotStyleDark28").is_some());
-        assert!(pivot_style("NoSuchStyle").is_none());
+    fn packed_presets_match_original_resolution_exhaustively() {
+        use std::fmt::Write;
         assert_eq!(PIVOT_STYLES.len(), 84);
+        assert!(pivot_style("NoSuchStyle").is_none());
+        let mut actual = String::new();
+        for name in [
+            "PivotStyleMedium28",
+            "PivotStyleMedium27",
+            "PivotStyleMedium26",
+            "PivotStyleMedium25",
+            "PivotStyleMedium24",
+            "PivotStyleMedium23",
+            "PivotStyleMedium22",
+            "PivotStyleMedium21",
+            "PivotStyleMedium20",
+            "PivotStyleMedium19",
+            "PivotStyleMedium18",
+            "PivotStyleMedium17",
+            "PivotStyleMedium16",
+            "PivotStyleMedium15",
+            "PivotStyleMedium14",
+            "PivotStyleMedium13",
+            "PivotStyleMedium12",
+            "PivotStyleMedium11",
+            "PivotStyleMedium10",
+            "PivotStyleMedium9",
+            "PivotStyleMedium8",
+            "PivotStyleMedium7",
+            "PivotStyleMedium6",
+            "PivotStyleMedium5",
+            "PivotStyleMedium4",
+            "PivotStyleMedium3",
+            "PivotStyleMedium2",
+            "PivotStyleMedium1",
+            "PivotStyleLight28",
+            "PivotStyleLight27",
+            "PivotStyleLight26",
+            "PivotStyleLight25",
+            "PivotStyleLight24",
+            "PivotStyleLight23",
+            "PivotStyleLight22",
+            "PivotStyleLight21",
+            "PivotStyleLight20",
+            "PivotStyleLight19",
+            "PivotStyleLight18",
+            "PivotStyleLight17",
+            "PivotStyleLight16",
+            "PivotStyleLight15",
+            "PivotStyleLight14",
+            "PivotStyleLight13",
+            "PivotStyleLight12",
+            "PivotStyleLight11",
+            "PivotStyleLight10",
+            "PivotStyleLight9",
+            "PivotStyleLight8",
+            "PivotStyleLight7",
+            "PivotStyleLight6",
+            "PivotStyleLight5",
+            "PivotStyleLight4",
+            "PivotStyleLight3",
+            "PivotStyleLight2",
+            "PivotStyleLight1",
+            "PivotStyleDark28",
+            "PivotStyleDark27",
+            "PivotStyleDark26",
+            "PivotStyleDark25",
+            "PivotStyleDark24",
+            "PivotStyleDark23",
+            "PivotStyleDark22",
+            "PivotStyleDark21",
+            "PivotStyleDark20",
+            "PivotStyleDark19",
+            "PivotStyleDark18",
+            "PivotStyleDark17",
+            "PivotStyleDark16",
+            "PivotStyleDark15",
+            "PivotStyleDark14",
+            "PivotStyleDark13",
+            "PivotStyleDark12",
+            "PivotStyleDark11",
+            "PivotStyleDark10",
+            "PivotStyleDark9",
+            "PivotStyleDark8",
+            "PivotStyleDark7",
+            "PivotStyleDark6",
+            "PivotStyleDark5",
+            "PivotStyleDark4",
+            "PivotStyleDark3",
+            "PivotStyleDark2",
+            "PivotStyleDark1",
+        ] {
+            let elements = pivot_style(name).unwrap().collect::<Vec<_>>();
+            writeln!(
+                actual,
+                "{} order {:?}",
+                name,
+                elements.iter().map(|e| e.kind).collect::<Vec<_>>()
+            )
+            .unwrap();
+            for kind in [
+                "wholeTable",
+                "headerRow",
+                "totalRow",
+                "firstColumn",
+                "lastColumn",
+                "firstRowStripe",
+                "secondRowStripe",
+                "firstColumnStripe",
+                "secondColumnStripe",
+                "firstHeaderCell",
+                "lastHeaderCell",
+                "firstTotalCell",
+                "lastTotalCell",
+                "firstSubtotalColumn",
+                "secondSubtotalColumn",
+                "thirdSubtotalColumn",
+                "firstSubtotalRow",
+                "secondSubtotalRow",
+                "thirdSubtotalRow",
+                "blankRow",
+                "firstColumnSubheading",
+                "secondColumnSubheading",
+                "thirdColumnSubheading",
+                "firstRowSubheading",
+                "secondRowSubheading",
+                "thirdRowSubheading",
+                "pageFieldLabels",
+                "pageFieldValues",
+            ] {
+                writeln!(
+                    actual,
+                    "{} {} {:?}",
+                    name,
+                    kind,
+                    elements
+                        .iter()
+                        .find(|e| e.kind == kind)
+                        .map(|e| (e.size, e.dxf))
+                )
+                .unwrap();
+            }
+        }
+        assert_eq!(actual, include_str!("../tests/fixtures/pivot-presets.txt"));
     }
 }

@@ -1,15 +1,17 @@
+import {
+  normalizeXlsxWorksheetPolicy,
+  xlsxWorksheetPolicyForWasm,
+  type NormalizedXlsxWorksheetPolicy,
+} from './worksheet-policy.js';
 import type { OoxmlResourceUsageSnapshot } from '@silurus/ooxml-core';
 import {
   normalizeLoadResourceOptions,
-  normalizeXlsxWorksheetPolicy,
   OoxmlResourceMetricsSession,
   parseTypedParserError,
   resourcePolicyForWasm,
-  xlsxWorksheetPolicyForWasm,
-  type NormalizedXlsxWorksheetPolicy,
 } from '@silurus/ooxml-core/worker';
 import {
-  WasmRuntimeGenerationHost,
+  wasmRuntimeSingleton,
   type WasmArchiveHandle,
   type WasmModuleRuntime,
 } from '@silurus/ooxml-core/internal/wasm-runtime-generation';
@@ -17,6 +19,9 @@ import type { ParsedWorkbook } from '../types.js';
 import { readXlsxArchiveBootstrap } from './archive-bootstrap.js';
 // @ts-ignore wasm-pack generated module has no declaration entry
 import * as xlsxWasm from '../wasm/xlsx_parser.js';
+import { createAbortError, throwIfAborted } from '@silurus/ooxml-core/internal/abort';
+
+const ABORT_MESSAGE = 'XLSX workbook session was aborted';
 
 export interface XlsxNodeAcquisitionOptions {
   readonly resourceLimits?: import('@silurus/ooxml-core').OoxmlResourceLimits;
@@ -55,21 +60,10 @@ interface XlsxArchiveConstructor {
   ): XlsxNodeArchive;
 }
 
-let runtimeModule: WebAssembly.Module | undefined;
-let runtimeHost: WasmRuntimeGenerationHost<XlsxNodeArchive> | undefined;
-
-function formatRuntime(wasmModule: WebAssembly.Module): WasmRuntimeGenerationHost<XlsxNodeArchive> {
-  if (!runtimeHost) {
-    runtimeModule = wasmModule;
-    runtimeHost = new WasmRuntimeGenerationHost(
-      xlsxWasm as unknown as WasmModuleRuntime,
-      wasmModule,
-    );
-  } else if (runtimeModule !== wasmModule) {
-    throw new Error('XLSX runtime was already initialized with another WebAssembly.Module');
-  }
-  return runtimeHost;
-}
+const formatRuntime = wasmRuntimeSingleton<XlsxNodeArchive>(
+  xlsxWasm as unknown as WasmModuleRuntime,
+  'XLSX',
+);
 
 export interface XlsxNodeAcquisition {
   readonly archive: XlsxNodeSessionArchive;
@@ -109,25 +103,25 @@ export async function acquireXlsxNodeSession(
     mode: 'node',
     scope: 'session',
     policy: resourceOptions.policy,
-    xlsxWorksheetPolicy: worksheetPolicy,
+    formatLimits: { xlsxWorksheetLimits: { ...worksheetPolicy.worksheet } },
     onMetrics: resourceOptions.onResourceMetrics,
     emitToConsole: resourceOptions.debug,
   });
   metrics.setSourceBytes(bytes.byteLength);
   let handle: WasmArchiveHandle<XlsxNodeArchive> | undefined;
   try {
-    throwIfAborted(options.signal);
+    throwIfAborted(options.signal, ABORT_MESSAGE);
     const [maxEntry, maxTotal, maxEntries] = resourcePolicyForWasm(resourceOptions.policy);
     const Archive = (xlsxWasm as unknown as { XlsxArchive: XlsxArchiveConstructor }).XlsxArchive;
     handle = await formatRuntime(wasmModule).open(
       () => new Archive(bytes, maxEntry, maxTotal, maxEntries),
       {
         signal: options.signal,
-        abortError: createAbortError,
+        abortError: () => createAbortError(ABORT_MESSAGE),
         disposeOnAbort: (archive) => archive.free(),
       },
     );
-    throwIfAborted(options.signal);
+    throwIfAborted(options.signal, ABORT_MESSAGE);
     const archive = handle.proxy;
     const [maxRows, maxCells, maxOwnedUtf8Bytes, maxJsonBytes] =
       xlsxWorksheetPolicyForWasm(worksheetPolicy);
@@ -152,15 +146,4 @@ export async function acquireXlsxNodeSession(
     metrics.fail(normalized);
     throw normalized;
   }
-}
-
-function throwIfAborted(signal: AbortSignal | undefined): void {
-  if (!signal?.aborted) return;
-  throw createAbortError();
-}
-
-function createAbortError(): Error {
-  const error = new Error('XLSX workbook session was aborted');
-  error.name = 'AbortError';
-  return error;
 }

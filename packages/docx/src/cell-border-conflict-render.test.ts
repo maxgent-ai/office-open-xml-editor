@@ -148,8 +148,10 @@ const bs = (over: Partial<BorderSpec>): BorderSpec => ({ style: 'single', width:
 function verticalAt(strokes: StrokeSeg[], x: number): StrokeSeg[] {
   return strokes.filter((s) => Math.abs(s.x1 - s.x2) < 0.5 && Math.abs(s.x1 - x) <= 1);
 }
+// A collapsed horizontal rule occupies the band starting at its row boundary
+// (WORD_COLLAPSED_BORDER_ROW_TRACK_FOOTPRINT), so match its band top.
 function horizontalAt(strokes: StrokeSeg[], y: number): StrokeSeg[] {
-  return strokes.filter((s) => Math.abs(s.y1 - s.y2) < 0.5 && Math.abs(s.y1 - y) <= 1);
+  return strokes.filter((s) => Math.abs(s.y1 - s.y2) < 0.5 && Math.abs(s.y1 - s.width / 2 - y) <= 1);
 }
 
 describe('§17.4.66 — adjacent cell border conflict, end-to-end render', () => {

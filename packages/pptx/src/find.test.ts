@@ -34,3 +34,14 @@ it('matches within a table cell but rejects text crossing cell boundaries', asyn
   find.setSlideRuns(0, adjacentCells);
   await expect(find.find('foobar')).resolves.toEqual([]);
 });
+
+it('keeps preview tables separate when they have no source-model locator', async () => {
+  const previewRuns = [
+    run('Hel', { renderElementIndex: 0, tableCell: { row: 0, column: 0 } }),
+    run('lo', { renderElementIndex: 0, tableCell: { row: 0, column: 0 } }),
+    run('world', { renderElementIndex: 1, tableCell: { row: 0, column: 0 } }),
+  ];
+  const find = new PptxFindController(() => 1, async () => previewRuns);
+  await expect(find.find('Hello')).resolves.toHaveLength(1);
+  await expect(find.find('Helloworld')).resolves.toEqual([]);
+});

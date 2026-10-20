@@ -14,9 +14,9 @@ preset geometry pixel-for-pixel.
 ## Regenerating `presets.json`
 
 ```bash
-node scripts/extract-presets.mjs scripts/preset-shape-definitions.xml src/preset-shape/presets.json
+node scripts/extract-presets.mjs scripts/preset-shape-definitions.xml ../core/src/shape/preset-geometry/presets.json
 ```
 
-The runtime engine (`src/preset-shape/`) consumes only the generated JSON;
+The runtime engine (`packages/core/src/shape/preset-geometry/`) consumes only the generated JSON;
 the XML is kept in-tree so anyone can re-run the extractor and audit the
 compact output against the source.

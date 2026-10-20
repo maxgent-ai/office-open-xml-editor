@@ -282,7 +282,7 @@ it.each([false, true])(
   },
 );
 
-it('does not let statically invalid tile recipes force native-size decoding', () => {
+it('rejects statically invalid tile recipes before decoding', () => {
   const shared = {
     fillType: 'image' as const,
     imagePath: 'xl/media/invalid-tile.png',
@@ -300,13 +300,11 @@ it('does not let statically invalid tile recipes force native-size decoding', ()
     { ...shared, ...complete, tile: { ...complete.tile, algn: 'unknown' } },
   ];
   for (const tile of invalid) {
-    const usages = collectChartImageFillUsages(baseModel({
+    expect(() => collectChartImageFillUsages(baseModel({
       chartFill: stretch,
       plotAreaFill: tile,
       series: [series({ values: [1] })],
-    }));
-    expect(usages).toHaveLength(1);
-    expect(usages[0]?.preserveNaturalSize).toBe(false);
+    }))).toThrowError(expect.objectContaining({ code: 'unsupported-image-effect' }));
   }
 });
 
@@ -341,10 +339,10 @@ it.each([
     stretch: true,
     ...geometry,
   };
-  expect(collectChartImageFillUsages(baseModel({
+  expect(() => collectChartImageFillUsages(baseModel({
     chartFill: fill,
     series: [series({ values: [1] })],
-  }))).toEqual([]);
+  }))).toThrowError(expect.objectContaining({ code: 'unsupported-image-effect' }));
 });
 
 it.each([
@@ -363,13 +361,13 @@ it.each([
     },
     series: [series({ values: [1] })],
   }))[0]!;
-  expect(chartImageFillUsageSize(usage, {
+  expect(() => chartImageFillUsageSize(usage, {
     widthPt: 1,
     heightPt: 1,
     targetWidthPx: 1,
     targetHeightPx: 1,
     ...override,
-  })).toBeNull();
+  })).toThrowError(expect.objectContaining({ code: 'unsupported-image-effect' }));
 });
 
 it('collects only the effective direct bubble point picture', () => {
@@ -2883,10 +2881,10 @@ describe('classic 3-D compatibility projection', () => {
       ...model('backWall', 'stackScale'),
       valMax: 8_192,
     })).toEqual([picture]);
-    expect(collectChartMarkerImageFills({
+    expect(() => collectChartMarkerImageFills({
       ...model('backWall', 'stackScale'),
       valMax: 8_194,
-    })).toEqual([]);
+    })).toThrowError(expect.objectContaining({ code: 'ooxml-decoded-image-limit' }));
   });
 
   it('projects bounded DrawingML tile grids across planar and thick Surface faces', () => {
@@ -12123,16 +12121,16 @@ describe('CH9 — line/area consume marker detail (§21.2.2.32)', () => {
     for (const key of ['tx', 'ty', 'sx', 'sy', 'algn'] as const) {
       const tile: Partial<typeof complete> = { ...complete };
       delete tile[key];
-      expect(chartImageFillPaintWork({ ...base, tile }, lookup, 20, 20)).toBe(0);
+      expect(() => chartImageFillPaintWork({ ...base, tile }, lookup, 20, 20)).toThrowError(expect.objectContaining({ code: 'unsupported-image-effect' }));
     }
     expect(chartImageFillPaintWork({
       ...base,
       tile: { tx: 0, ty: 0, sx: 1, sy: 1, algn: 'tl' },
     }, lookup, 20, 20)).toBeGreaterThan(0);
-    expect(chartImageFillPaintWork({
+    expect(() => chartImageFillPaintWork({
       ...base,
       tile: { tx: 0, ty: 0, sx: -1, sy: 1, flip: 'none', algn: 'tl' },
-    }, lookup, 20, 20)).toBe(0);
+    }, lookup, 20, 20)).toThrowError(expect.objectContaining({ code: 'unsupported-image-effect' }));
   });
 
   it('prefetches only effective picture-marker consumers', () => {
@@ -12336,7 +12334,7 @@ describe('CH9 — line/area consume marker detail (§21.2.2.32)', () => {
         showMarker: true, markerSymbol: 'picture', markerFillPaint: picture,
       })],
     });
-    expect(collectChartMarkerImageFills(model)).toEqual([]);
+    expect(() => collectChartMarkerImageFills(model)).toThrowError(expect.objectContaining({ code: 'ooxml-decoded-image-limit' }));
   });
 
   it('rejects oversized public chart models before effect-site traversal', () => {
@@ -12368,7 +12366,7 @@ describe('CH9 — line/area consume marker detail (§21.2.2.32)', () => {
         values: [], showMarker: true, markerSymbol: 'picture',
       })),
     });
-    expect(collectChartMarkerImageFills(manySeries)).toEqual([]);
+    expect(() => collectChartMarkerImageFills(manySeries)).toThrowError(expect.objectContaining({ code: 'ooxml-decoded-image-limit' }));
 
     const manyLabels = baseModel({
       chartType: 'line', categories: ['A'],
@@ -12379,7 +12377,7 @@ describe('CH9 — line/area consume marker detail (§21.2.2.32)', () => {
         })),
       })],
     });
-    expect(collectChartMarkerImageFills(manyLabels)).toEqual([]);
+    expect(() => collectChartMarkerImageFills(manyLabels)).toThrowError(expect.objectContaining({ code: 'ooxml-decoded-image-limit' }));
 
     let legendIndexReads = 0;
     const boundedLegend = baseModel({
@@ -12401,7 +12399,7 @@ describe('CH9 — line/area consume marker detail (§21.2.2.32)', () => {
         trendLines: Array.from({ length: 101 }, () => ({ trendlineType: 'linear' })),
       })],
     });
-    expect(collectChartMarkerImageFills(trendlineWork)).toEqual([]);
+    expect(() => collectChartMarkerImageFills(trendlineWork)).toThrowError(expect.objectContaining({ code: 'ooxml-decoded-image-limit' }));
 
     const errorBar = {
       dir: 'y', barType: 'both', plus: values, minus: values, noEndCap: false,
@@ -12410,7 +12408,7 @@ describe('CH9 — line/area consume marker detail (§21.2.2.32)', () => {
       chartType: 'line',
       series: [series({ values, errBars: Array.from({ length: 101 }, () => errorBar) })],
     });
-    expect(collectChartMarkerImageFills(errorBarWork)).toEqual([]);
+    expect(() => collectChartMarkerImageFills(errorBarWork)).toThrowError(expect.objectContaining({ code: 'ooxml-decoded-image-limit' }));
     const emptyErrorBars = baseModel({
       chartType: 'line',
       series: [series({
@@ -12420,7 +12418,7 @@ describe('CH9 — line/area consume marker detail (§21.2.2.32)', () => {
         })),
       })],
     });
-    expect(collectChartMarkerImageFills(emptyErrorBars)).toEqual([]);
+    expect(() => collectChartMarkerImageFills(emptyErrorBars)).toThrowError(expect.objectContaining({ code: 'ooxml-decoded-image-limit' }));
   });
 
   it('matches ChartEx box marker visibility and fill-layer precedence during prefetch', () => {
@@ -12490,8 +12488,8 @@ describe('CH9 — line/area consume marker detail (§21.2.2.32)', () => {
       })],
     });
     expect(collectChartMarkerImageFills(model(256))).toHaveLength(256);
-    expect(collectChartMarkerImageFills(model(257))).toEqual([]);
-    expect(collectChartMarkerImageFillsForCharts([model(128), {
+    expect(() => collectChartMarkerImageFills(model(257))).toThrowError(expect.objectContaining({ code: 'ooxml-decoded-image-limit' }));
+    expect(() => collectChartMarkerImageFillsForCharts([model(128), {
       ...model(129),
       series: [series({
         values: Array.from({ length: 129 }, () => 1), showMarker: false,
@@ -12503,9 +12501,9 @@ describe('CH9 — line/area consume marker detail (§21.2.2.32)', () => {
           },
         })),
       })],
-    }])).toEqual([]);
-    expect(collectChartMarkerImageFillsForCharts([model(257), model(1)])).toEqual([]);
-    expect(collectChartMarkerImageFillsForCharts([model(1), model(257)])).toEqual([]);
+    }])).toThrowError(expect.objectContaining({ code: 'ooxml-decoded-image-limit' }));
+    expect(() => collectChartMarkerImageFillsForCharts([model(257), model(1)])).toThrowError(expect.objectContaining({ code: 'ooxml-decoded-image-limit' }));
+    expect(() => collectChartMarkerImageFillsForCharts([model(1), model(257)])).toThrowError(expect.objectContaining({ code: 'ooxml-decoded-image-limit' }));
     expect(collectChartImageFillUsagesForCharts(
       [model(1), model(257)],
       (usage, chartIndex) => chartIndex === 0
@@ -16385,14 +16383,14 @@ describe('CH8 — pie / doughnut geometry', () => {
     },
   );
 
-  it('inside pie labels respect tiny-slice capacity', () => {
+  it('inside-end pie labels retain their tiny-slice capacity bound', () => {
     const rec = ringRecordingCtx();
     renderChart(rec.ctx, pieModel({
       series: [series({
         name: 'S', categories: ['TINY_LABEL_LONG', 'Large'], values: [1, 999],
         seriesDataLabels: {
           showVal: false, showCatName: true, showSerName: false, showPercent: false,
-          position: 'ctr',
+          position: 'inEnd',
         },
       })],
     }), RECT, 1);
@@ -25227,5 +25225,125 @@ describe('ChartEx box-and-whisker line paint (PowerPoint 16.113)', () => {
 
   it('paints every box line 0.75 pt and ignores the dataPointLine width', () => {
     expect(boxLines({}).every(line => line.lineWidth === 0.75)).toBe(true);
+  });
+});
+
+describe('per-rendered-size chart picture-fill effects', () => {
+  it('evaluates a blur per marker size: each size is prepared once and its outset scales', async () => {
+    const { collectChartFillRenderedSizes } = await import('./renderer.js');
+    const { chartFillRenderedSizeKey, chartImageFillStoreLookup, chartImageFillPixelTransform } = await import('./image-fill.js');
+    const { applyBlipPixelEffects } = await import('../image/blip-effects.js');
+    const picture = {
+      fillType: 'image' as const, stretch: true,
+      imagePath: 'xl/media/marker.png', mimeType: 'image/png',
+      blipEffects: [{ type: 'blur' as const, radius: 2 * 12700, grow: true }],
+    };
+    const model = baseModel({
+      chartType: 'line', categories: ['A', 'B'],
+      series: [
+        series({ values: [1, 2], showMarker: true, markerSymbol: 'picture', markerSize: 8, markerFillPaint: picture }),
+        series({ values: [2, 1], showMarker: true, markerSymbol: 'picture', markerSize: 16, markerFillPaint: picture }),
+      ],
+    });
+    const recorded = recordingCtx();
+    vi.stubGlobal('OffscreenCanvas', class { width = 1; height = 1; getContext() { return recorded.ctx; } });
+    try {
+      const sizes = collectChartFillRenderedSizes(model, RECT, 1);
+      // One request per distinct rendered size, not per marker.
+      expect(sizes).toHaveLength(2);
+      const [small, large] = [...sizes].sort((a, b) => a.occurrence.widthPt - b.occurrence.widthPt);
+      expect(large!.occurrence.widthPt / small!.occurrence.widthPt).toBeCloseTo(2, 1);
+      // The same 10 px source evaluated on each occurrence's physical frame:
+      // the 2 pt blur spans half as many source pixels on the larger marker.
+      const outset = (widthPt: number, heightPt: number) => {
+        const value = chartImageFillPixelTransform(picture, undefined, { widthPt, heightPt });
+        if (!value || !('effects' in value)) throw new Error('expected an effect chain');
+        const result = applyBlipPixelEffects({ data: new Uint8ClampedArray(10 * 10 * 4).fill(255), width: 10, height: 10 },
+          { ...value, emuPerPixelX: widthPt * 12700 / 10, emuPerPixelY: heightPt * 12700 / 10 }) as { frame?: { x: number } };
+        return result.frame?.x ?? 0;
+      };
+      const smallOutset = outset(small!.occurrence.widthPt, small!.occurrence.heightPt);
+      const largeOutset = outset(large!.occurrence.widthPt, large!.occurrence.heightPt);
+      expect(smallOutset).toBeGreaterThan(largeOutset);
+      // Paint lookups address each prepared size independently.
+      const store = new Map<string, CanvasImageSource | null>([
+        [chartFillRenderedSizeKey(picture, undefined, small!.occurrence), { width: 1, height: 1 } as CanvasImageSource],
+        [chartFillRenderedSizeKey(picture, undefined, large!.occurrence), { width: 2, height: 2 } as CanvasImageSource],
+      ]);
+      const lookup = chartImageFillStoreLookup(store);
+      expect(lookup(picture, small!.occurrence)).toMatchObject({ width: 1 });
+      expect(lookup(picture, large!.occurrence)).toMatchObject({ width: 2 });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
+describe('per-rendered-size preparation failures and sizes', () => {
+  const blurred = {
+    fillType: 'image' as const, stretch: true, imagePath: 'xl/media/marker.png', mimeType: 'image/png',
+    blipEffects: [{ type: 'blur' as const, radius: 12700, grow: true }],
+  };
+  it('normalizes a native scratch-surface failure to the typed effect error', async () => {
+    const { collectChartFillRenderedSizes } = await import('./renderer.js');
+    const model = baseModel({ chartType: 'line', categories: ['A'], series: [
+      series({ values: [1], showMarker: true, markerSymbol: 'picture', markerSize: 8, markerFillPaint: blurred }),
+    ] });
+    vi.stubGlobal('OffscreenCanvas', class { constructor() { throw new TypeError('native allocation failed'); } });
+    try {
+      expect(() => collectChartFillRenderedSizes(model, RECT, 1))
+        .toThrowError(expect.objectContaining({ code: 'unsupported-image-effect' }));
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+  it('keeps a tiny positive rendered size positive', async () => {
+    const { chartFillRenderedSize } = await import('./image-fill.js');
+    const size = chartFillRenderedSize(blurred, 0.001, 0.002);
+    expect(size!.widthPt).toBeGreaterThan(0);
+    expect(size!.heightPt).toBeGreaterThan(0);
+  });
+  it('rejects a paint occurrence the preparation pass never recorded', async () => {
+    const { chartFillRenderedSizeKey, chartImageFillStoreLookup } = await import('./image-fill.js');
+    const prepared = { widthPt: 10, heightPt: 10 };
+    const store = new Map<string, CanvasImageSource | null>([
+      [chartFillRenderedSizeKey(blurred, undefined, prepared), { width: 1, height: 1 } as CanvasImageSource],
+    ]);
+    expect(() => chartImageFillStoreLookup(store)(blurred, { widthPt: 20, heightPt: 10 }))
+      .toThrowError(expect.objectContaining({ code: 'unsupported-image-effect' }));
+    // A further preparation round asks without rejecting, to learn the miss.
+    expect(chartImageFillStoreLookup(store, undefined, false)(blurred, { widthPt: 20, heightPt: 10 })).toBeUndefined();
+    // A preparation round never substitutes a near-equal prepared size,
+    // although paint tolerates host rounding within 1%.
+    const near = { widthPt: 10, heightPt: 9.95 };
+    expect(chartImageFillStoreLookup(store, undefined, false)(blurred, near)).toBeUndefined();
+    expect(chartImageFillStoreLookup(store)(blurred, near)).toMatchObject({ width: 1 });
+    // A fill that was never prepared stays an ordinary miss.
+    expect(chartImageFillStoreLookup(new Map())(blurred, prepared)).toBeUndefined();
+  });
+  it('records only occurrences that a further round cannot resolve', async () => {
+    const { collectChartFillRenderedSizes } = await import('./renderer.js');
+    const { chartFillRenderedSizeKey, chartImageFillStoreLookup } = await import('./image-fill.js');
+    const model = baseModel({ chartType: 'line', categories: ['A', 'B'], series: [
+      series({ values: [1, 2], showMarker: true, markerSymbol: 'picture', markerSize: 8, markerFillPaint: blurred }),
+      series({ values: [2, 1], showMarker: true, markerSymbol: 'picture', markerSize: 16, markerFillPaint: blurred }),
+    ] });
+    const recorded = recordingCtx();
+    vi.stubGlobal('OffscreenCanvas', class { width = 1; height = 1; getContext() { return recorded.ctx; } });
+    try {
+      const first = collectChartFillRenderedSizes(model, RECT, 1);
+      expect(first).toHaveLength(2);
+      const store = new Map<string, CanvasImageSource | null>([[
+        chartFillRenderedSizeKey(blurred, undefined, first[0]!.occurrence), { width: 4, height: 4 } as CanvasImageSource,
+      ]]);
+      const second = collectChartFillRenderedSizes(model, RECT, 1, 0, undefined, undefined, undefined,
+        chartImageFillStoreLookup(store, undefined, false));
+      expect(second.map(request => request.occurrence)).toEqual([first[1]!.occurrence]);
+      store.set(chartFillRenderedSizeKey(blurred, undefined, first[1]!.occurrence), null);
+      expect(collectChartFillRenderedSizes(model, RECT, 1, 0, undefined, undefined, undefined,
+        chartImageFillStoreLookup(store, undefined, false))).toEqual([]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });

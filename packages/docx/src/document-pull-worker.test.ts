@@ -90,6 +90,21 @@ describe('DOCX document pull integration', () => {
     }
   });
 
+  it('normalizes a late parser rejection before the shared pull host serializes it', async () => {
+    const archive = new FakeArchive();
+    const worker = new DocumentPullWorker(() => archive);
+    worker.open(identity);
+    vi.spyOn(archive, 'pull_document_chunk').mockImplementation(() => {
+      throw new Error('OOXML_DOCX_ILVL:cannot-open:non-decimal');
+    });
+    await expect(materializeDocumentPullSession(
+      createLocalDocumentPullTransport(worker), identity,
+    )).rejects.toMatchObject({
+      code: 'invalid-numbering',
+      message: 'Word cannot open this DOCX numbering level (non-decimal).',
+    });
+  });
+
   it('materializes acknowledged body units and a body-free terminal envelope', async () => {
     const archive = new FakeArchive();
     const worker = new DocumentPullWorker(() => archive);

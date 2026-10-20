@@ -4,7 +4,7 @@ import {
   resolveDelimitedTextOptions,
 } from './delimited-text.js';
 import { MAX_WORKSHEET_COL } from './internal/grid-geometry.js';
-import { XLSX_MAX_MATERIALIZED_ROWS } from './worksheet-resource-limits.js';
+import { HARD_MAX_XLSX_WORKSHEET_ROWS as XLSX_MAX_MATERIALIZED_ROWS } from '@silurus/ooxml-core/worker';
 
 const encode = (value: string): ArrayBuffer => new TextEncoder().encode(value).buffer;
 

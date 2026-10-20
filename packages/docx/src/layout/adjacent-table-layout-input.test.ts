@@ -1,8 +1,7 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { tableColumnLayoutInput } from '../parser-model.js';
 import type { DocTable } from '../types.js';
 import {
-  adjacentTableSymbolNodeCountForTest,
   combineAdjacentTableLayoutInputs,
   type AdjacentTableGroupLayoutInput,
 } from './adjacent-table-layout-input.js';
@@ -314,21 +313,26 @@ describe('adjacent-table logical layout input (transient union grid)', () => {
     expect(cellIntervals(combined, 1)).toEqual([[1, 2], [0, 1]]);
   });
 
-  it('keeps symbolic node growth linear in unknown tracks and row boundaries', () => {
-    const nodesFor = (count: number): number => {
+  it('keeps map insertions linear in unknown tracks and row boundaries', () => {
+    const insertionsFor = (count: number): number => {
       const unknown = tableInput(1, Array.from({ length: count }, () => 0));
       const input: TableLayoutInput = {
         ...unknown,
         columnWidthKeys: Array.from({ length: count }, () => null),
       };
-      combineAdjacentTableLayoutInputs(`group:complexity:${count}`, [tableInput(0, [80]), input]);
-      return adjacentTableSymbolNodeCountForTest();
+      const insertions = vi.spyOn(Map.prototype, 'set');
+      try {
+        combineAdjacentTableLayoutInputs(`group:complexity:${count}`, [tableInput(0, [80]), input]);
+        return insertions.mock.calls.length;
+      } finally { insertions.mockRestore(); }
     };
 
-    const small = nodesFor(100);
-    const large = nodesFor(2000);
-    expect(small).toBeLessThanOrEqual(8 * 100 + 64);
-    expect(large).toBeLessThanOrEqual(8 * 2000 + 64);
+    const small = insertionsFor(100);
+    const large = insertionsFor(2000);
+    // Count all map work, including symbol interning and grid reconciliation.
+    // Twenty times the input must stay near twenty times the insertions.
+    expect(small).toBeLessThanOrEqual(16 * 100 + 64);
+    expect(large).toBeLessThanOrEqual(16 * 2000 + 64);
     expect(large / small).toBeLessThanOrEqual(25);
   });
 

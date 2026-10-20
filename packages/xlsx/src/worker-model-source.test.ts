@@ -71,7 +71,7 @@ vi.mock('./delimited-text.js', () => ({}));
 const bootstrap = { workbook: { sheets: [] }, styles: {}, sharedStrings: [] };
 const CALIBRI_11 = { family: 'Calibri', sizePt: 11, bold: false, italic: false };
 const descriptor: ModelSourceModuleDescriptor = {
-  protocol: 'ooxml-model-source-module/v1',
+  protocol: 'ooxml-model-source-module/v2',
   target: 'xlsx',
   moduleUrl: 'https://example.test/source.mjs',
   config: {},
@@ -225,7 +225,7 @@ describe('XLSX workers with a model source', () => {
     state.openSource
       .mockResolvedValueOnce({ archive: first, viewDefaults: {}, close: firstClose })
       .mockResolvedValueOnce({ archive: second, viewDefaults: {}, close: secondClose });
-    await import('./render-worker-source.js');
+    await import('./render-worker.js');
     const dispatch = scope.onmessage!;
 
     await dispatch({ data: {

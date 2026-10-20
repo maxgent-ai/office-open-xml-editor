@@ -24,7 +24,6 @@ import {
 import {
   floatRegistryParticipant,
   resolveBlockFlowAdmission,
-  resolvePageAnchoredTableDeferral,
 } from './floats.js';
 import { ExactConvergenceError, convergeExactState } from './convergence.js';
 import { LayoutInvariantError } from './diagnostics.js';
@@ -35,7 +34,7 @@ import type {
   OwnerSegmentEntry,
 } from './body-layout-kernel.js';
 import { retainedTableRecord } from './acquisition-state.js';
-import { type RetainedTableAcquisition } from './table-acquisition.js';
+import { type RetainedTableAcquisition, shareRotatedCellReacquisition } from './table-acquisition.js';
 import { combineAdjacentTableLayoutInputs } from './adjacent-table-layout-input.js';
 import { layoutTable as layoutRetainedTableInput } from './table.js';
 import {
@@ -120,6 +119,7 @@ export function bodyTableAcquisitionState(
   table: TableLayoutSource,
   effectiveTablePositioning: BodyTableMeasurementContext['effectiveTablePositioning'],
 ): BodyAcquisitionState {
+  // `word-vertical-section-upright-block-table`
   const upright = state.verticalPhys !== undefined
     && !state.acquisitionInputs.tableFormatInput(table).positioning
     && !effectiveTablePositioning(table);
@@ -131,7 +131,7 @@ export function bodyTableAcquisitionState(
  * logical block band [cursor y, cursor y + grid width] of a vertical section
  * (§17.6.20). The Transitional clockwise frame maps it to physical x = page
  * width − logical y − grid width and starts it at the column top (physical
- * y = logical x). A native BtoT frame maps logical y to physical x unchanged
+ * y = logical x). A counter-clockwise section frame maps logical y to physical x unchanged
  * and its column starts at the bottom (physical y = page height − logical x),
  * so the block ends there. That native placement is generic library policy
  * transformed through the section's own frame. No comparison with a
@@ -143,7 +143,7 @@ function uprightBlockPhysicalOrigin(
   gridWidthPt: number,
   physicalHeightPt: number,
 ): Readonly<{ xPt: number; yPt: number }> {
-  return physical.nativeSectionFlow == null
+  return physical.sectionFlow == null
     ? { xPt: physical.physicalPageWidthPt - cursorPt.yPt - gridWidthPt, yPt: cursorPt.xPt }
     : { xPt: cursorPt.yPt, yPt: physical.pageHeight - cursorPt.xPt - physicalHeightPt };
 }
@@ -157,7 +157,7 @@ function uprightColumnPhysicalTopPt(
   cursorPt: Readonly<{ xPt: number }>,
   inlineExtentPt: number,
 ): number {
-  return physical.nativeSectionFlow == null
+  return physical.sectionFlow == null
     ? cursorPt.xPt
     : physical.pageHeight - (cursorPt.xPt + inlineExtentPt);
 }
@@ -170,7 +170,7 @@ function uprightPhysicalRectToLogical(
   section: BodyAcquisitionState['sectionLayout'],
   rect: LayoutRect,
 ): LayoutRect {
-  if (physical.nativeSectionFlow == null) {
+  if (physical.sectionFlow == null) {
     return Object.freeze({
       xPt: rect.yPt,
       yPt: physical.physicalPageWidthPt - rect.xPt - rect.widthPt,
@@ -588,7 +588,7 @@ function measureAdjacentTableGroup(
   request: AdjacentBodyTableRequest,
   operations: BodyTableMeasurementOperations,
 ): TableMeasureResult {
-  const { dependencies, services, state } = context;
+  const { dependencies, state } = context;
 
   if (request.cursor && request.cursor.kind !== 'adjacent-table-group') {
     throw new Error('Adjacent table group acquisition received an ordinary table cursor');
@@ -678,6 +678,7 @@ function combinedAdjacentGroupAcquisition(
       records.map((record) => record.input),
     ),
   );
+  shareRotatedCellReacquisition(records.map((record) => record.input), combinedInput);
   const combinedLayout = layoutRetainedTableInput(
     combinedInput, adjacentGroupPlacement(request), services,
   ).layout;
@@ -817,8 +818,8 @@ function measurePositionedTable(
   operations: BodyTableMeasurementOperations,
   frame: PositionedTableFrame,
 ): TableMeasureResult {
-  const { dependencies, services, state, sessionState } = context;
-  const { table, sourceIndex, retained, cursor, pageHeightPt, authoredPositioning } = frame;
+  const { state, sessionState } = context;
+  const { table, retained, cursor, pageHeightPt, authoredPositioning } = frame;
 
   const positioning =
     request.cursor?.kind === 'table' && request.cursor.floatingContinuationFrame === 'fresh-text'
@@ -870,53 +871,22 @@ function measurePositionedTable(
         ),
       })
     : sessionState.floatRegistry;
-  const pageAnchoredCollision =
-    request.cursor?.kind !== 'table' &&
-    (positioning.vertAnchor === 'page' || positioning.vertAnchor === 'margin') &&
-    resolvePageAnchoredTableDeferral({
-      bounds: {
-        xPt: raw.x,
-        yPt: raw.y,
-        widthPt: raw.w,
-        heightPt: raw.h,
-      },
-      blockers: sessionState.floatRegistry.entries
-        .filter((entry) => entry.occurrenceId !== ownPrescanOccurrenceId)
-        .map(floatRegistryParticipant),
-      overlapEpsilonPt: FLOAT_OVERLAP_EPS,
-    }).defer;
-  if (pageAnchoredCollision) {
-    // `word-page-anchored-table-collision-deferral`: a fresh page
-    // preserves the authored absolute anchor instead of converting
-    // the colliding table to a text continuation.
-    return Object.freeze({
-      layout: retained.layout,
-      blockExtentPt: 0,
-      nextCursor: Object.freeze({
-        kind: 'table' as const,
-        cursor,
-        floatingContinuationFrame: 'authored' as const,
-      }),
-      requiresFreshFlowRegion: true,
-    });
-  }
   const absoluteAnchorMustSplit =
     (positioning.vertAnchor === 'page' || positioning.vertAnchor === 'margin') &&
     retained.layout.advancePt > request.freshPageBlockExtentPt;
+  // A page- or margin-anchored table is admitted against the page, as it is
+  // clamped (resolveFloatingTableBoxPt); leaving the text area is decided
+  // below, after placement (`word-page-anchored-table-text-area-move`).
   const admissionBlockEndPt = absoluteAnchorMustSplit
     ? request.location.availableBounds.yPt + request.location.availableBounds.heightPt
-    : positioning.vertAnchor === 'page'
+    : positioning.vertAnchor === 'page' || positioning.vertAnchor === 'margin'
       ? frames.page.yPt + frames.page.heightPt
-      : positioning.vertAnchor === 'margin'
-        ? frames.margin.yPt + frames.margin.heightPt
-        : request.location.availableBounds.yPt + request.location.availableBounds.heightPt;
+      : request.location.availableBounds.yPt + request.location.availableBounds.heightPt;
   const freshAdmissionHeightPt = absoluteAnchorMustSplit
     ? request.freshPageBlockExtentPt
-    : positioning.vertAnchor === 'page'
+    : positioning.vertAnchor === 'page' || positioning.vertAnchor === 'margin'
       ? frames.page.heightPt
-      : positioning.vertAnchor === 'margin'
-        ? frames.margin.heightPt
-        : request.freshPageBlockExtentPt;
+      : request.freshPageBlockExtentPt;
   const transaction = convergeFloatingParentTransaction(context, request, operations, {
     table,
     retained,
@@ -965,6 +935,34 @@ function measurePositionedTable(
         floatingContinuationFrame: 'fresh-text' as const,
       }),
       requiresFreshFlowRegion: true,
+    });
+  }
+  // `word-page-anchored-table-text-area-move`: a page- or margin-anchored
+  // table whose box ends below the bottom margin, or that never-displacement
+  // moved above the top margin, moves to the next page together with the
+  // flow after it to the next page (not the next column), unless nothing
+  // precedes it on this page (moving would gain nothing there). Its
+  // authored position applies on the next page.
+  const box = resolved.placement.bounds;
+  const textArea = frames.margin;
+  if (
+    (positioning.vertAnchor === 'page' || positioning.vertAnchor === 'margin') &&
+    !isFloatingContinuation &&
+    !absoluteAnchorMustSplit &&
+    request.pageHasContent === true &&
+    (box.yPt + box.heightPt > textArea.yPt + textArea.heightPt + FLOAT_OVERLAP_EPS ||
+      (box.yPt < raw.y - FLOAT_OVERLAP_EPS && box.yPt < textArea.yPt - FLOAT_OVERLAP_EPS))
+  ) {
+    return Object.freeze({
+      layout: retained.layout,
+      blockExtentPt: 0,
+      nextCursor: Object.freeze({
+        kind: 'table' as const,
+        cursor,
+        floatingContinuationFrame: 'authored' as const,
+      }),
+      requiresFreshFlowRegion: true,
+      requiresFreshPage: true,
     });
   }
   return Object.freeze({
@@ -1226,6 +1224,7 @@ function ownerSegmentAcquisition(
   const cached = cache.get(key);
   if (cached) return cached;
   const input = ownerSegmentInput(retained.input, segment, leadingRows);
+  shareRotatedCellReacquisition(retained.input, input);
   const bounds = { xPt: 0, yPt: 0, widthPt, heightPt: 1 };
   const acquisition: RetainedTableAcquisition = Object.freeze({
     input,
@@ -1591,7 +1590,7 @@ function measureOwnerHost(
  *   enters the logical body registry through the inverse of the section's
  *   upright projection (uprightPhysicalRectToLogical: clockwise, logical
  *   inline = physical y and logical block start = physical page width −
- *   physical right edge; native BtoT, its own counter-clockwise inverse), so
+ *   physical right edge; a section flow, its own counter-clockwise inverse), so
  *   notBeside blocks the vertical lines crossing the host's physical span.
  * Cell content is acquired and reacquired by `acquisitionOwner`, the
  * upright physical owner of the whole table (bodyTableAcquisitionState).

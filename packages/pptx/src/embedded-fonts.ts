@@ -1,9 +1,12 @@
 import {
+  OoxmlResourceLimitError,
+  isOoxmlDecodedImageLimitError,
   registerEmbeddedFonts,
   unregisterEmbeddedFonts,
   type EmbeddedFontFace,
   type OfficeFontFallbackRequest,
 } from '@silurus/ooxml-core';
+import { parseResourceLimitError } from '@silurus/ooxml-core/worker';
 import type { PptxEmbeddedFontRef } from './worker-protocol';
 
 export interface LoadedPptxEmbeddedFonts {
@@ -59,34 +62,46 @@ export async function loadEmbeddedFonts(
   const loaded: FontFace[] = [];
   const held = new Set<FontFace>();
   const batchSize = 2;
-  for (let offset = 0; offset < refs.length; offset += batchSize) {
-    const faces = await Promise.all(refs.slice(offset, offset + batchSize).map(
-      async (ref): Promise<EmbeddedFontFace | null> => {
-        try {
-          return {
-            family: candidateAliases.get(normalizedFamily(ref.fontName)) as string,
-            bytes: await fetchFontBytes(ref.partPath),
-            odttf: false,
-            weight: ref.style === 'bold' || ref.style === 'boldItalic' ? 'bold' : 'normal',
-            style: ref.style === 'italic' || ref.style === 'boldItalic' ? 'italic' : 'normal',
-          };
-        } catch {
-          return null;
+  try {
+    for (let offset = 0; offset < refs.length; offset += batchSize) {
+      const faces = await Promise.all(refs.slice(offset, offset + batchSize).map(
+        async (ref): Promise<EmbeddedFontFace | null> => {
+          try {
+            return {
+              family: candidateAliases.get(normalizedFamily(ref.fontName)) as string,
+              bytes: await fetchFontBytes(ref.partPath),
+              odttf: false,
+              weight: ref.style === 'bold' || ref.style === 'boldItalic' ? 'bold' : 'normal',
+              style: ref.style === 'italic' || ref.style === 'boldItalic' ? 'italic' : 'normal',
+            };
+          } catch (error) {
+            // Missing/malformed fonts are optional; archive/resource policy is not.
+            if (error instanceof OoxmlResourceLimitError || isOoxmlDecodedImageLimitError(error)) throw error;
+            // Worker rendering reads WASM directly, before bridge deserialization.
+            const resourceError = parseResourceLimitError(error);
+            if (resourceError) throw resourceError;
+            return null;
+          }
+        },
+      ));
+      const loadable = faces.filter((face): face is EmbeddedFontFace => face !== null);
+      if (loadable.length === 0) continue;
+      for (const face of await registerEmbeddedFonts(loadable)) {
+        if (held.has(face)) {
+          // A content-identical face retained by an earlier batch needs no second
+          // holder from this presentation. Balance that registry retain now.
+          unregisterEmbeddedFonts([face]);
+        } else {
+          held.add(face);
+          loaded.push(face);
         }
-      },
-    ));
-    const loadable = faces.filter((face): face is EmbeddedFontFace => face !== null);
-    if (loadable.length === 0) continue;
-    for (const face of await registerEmbeddedFonts(loadable)) {
-      if (held.has(face)) {
-        // A content-identical face retained by an earlier batch needs no second
-        // holder from this presentation. Balance that registry retain now.
-        unregisterEmbeddedFonts([face]);
-      } else {
-        held.add(face);
-        loaded.push(face);
       }
     }
+  } catch (error) {
+    // The caller cannot own a rejected result. Balance only this load's retains,
+    // including faces registered before a later extraction batch crossed a cap.
+    unregisterEmbeddedFonts(loaded);
+    throw error;
   }
   const loadedAliases = new Set(loaded.map((face) => normalizedFamily(face.family)));
   const aliases = new Map(

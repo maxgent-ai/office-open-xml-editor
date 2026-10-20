@@ -142,7 +142,7 @@ if (bitmap) {
           self-contained so it can render enabled first-party modules without another download.
         </p>
         <p>
-          Try Yours and the VS Code extension enable every first-party optional module. Applications
+          Try Yours and the VS Code extension enable every first-party optional rendering module. Applications
           built with the library choose their own set using the imports below.
         </p>
         <div class="code-card">
@@ -162,6 +162,14 @@ if (bitmap) {
             </tbody>
           </table>
         </div>
+        <h3>Experimental legacy Office add-on</h3>
+        <p>
+          Legacy .doc, .xls and .ppt reading is a separate, experimental opt-in package,
+          <code>@silurus/ooxml-legacy-office</code>. Pass each format's reader as its own option,
+          such as <code>&#123; legacyDoc &#125;</code>; unsupported content rejects instead of producing a partial
+          document. The viewer and add-on versions must match exactly.
+          <a href="/legacy-office">Install and enable legacy sources →</a>
+        </p>
         <h3>A small TIFF reuse</h3>
         <p>
           The TIFF module exists to display images embedded in Office files; it is not a

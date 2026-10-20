@@ -7,7 +7,7 @@ use crate::{parse_rels_map, resolve_zip_path};
 // a blip's `<a:extLst>`. Replaces xlsx's former local `mime_from_ext` (a strict
 // subset that lacked the `svg` arm and so dropped SVG parts).
 use ooxml_common::blip::{
-    blip_embed_rid, mime_from_ext, parse_blip_alpha, parse_blip_duotone, parse_src_rect,
+    blip_embed_rid, mime_from_ext, parse_blip_duotone, parse_blip_effects, parse_src_rect,
     svg_blip_rid,
 };
 use ooxml_common::depth::{parse_guarded, DepthGuard};
@@ -126,6 +126,7 @@ fn selected_anchor_content<'a, 'input>(
 /// Parse `<xdr:twoCellAnchor>` and `<xdr:oneCellAnchor>` pictures from a drawing
 /// XML and resolve embedded pictures into data URLs. `drawing_path` is the OPC
 /// source part.
+#[cfg(test)]
 pub(crate) fn parse_drawing_anchors(
     drawing_xml: &str,
     drawing_rels: &HashMap<String, String>,
@@ -138,6 +139,17 @@ pub(crate) fn parse_drawing_anchors(
     let Ok(doc) = parse_guarded(drawing_xml) else {
         return Vec::new();
     };
+    parse_drawing_doc_anchors(&doc, drawing_rels, drawing_path, archive, theme_colors)
+}
+
+/// [`parse_drawing_anchors`] over an already parsed drawing part.
+fn parse_drawing_doc_anchors(
+    doc: &roxmltree::Document<'_>,
+    drawing_rels: &HashMap<String, String>,
+    drawing_path: &str,
+    archive: &mut crate::XlsxZip,
+    theme_colors: &[String],
+) -> Vec<ImageAnchor> {
     let mut anchors: Vec<ImageAnchor> = Vec::new();
 
     for anchor in doc.descendants() {
@@ -169,8 +181,11 @@ pub(crate) fn parse_drawing_anchors(
         let mut src_rect: Option<SrcRect> = None;
         // ECMA-376 §20.1.8.6 `<a:alphaModFix>` opacity (None ⇒ opaque) and
         // §20.1.8.23 `<a:duotone>` recolour (None ⇒ no effect).
-        let mut alpha: Option<f64> = None;
+        // Parsed pictures leave `alpha` empty: alphaModFix lives in the
+        // ordered `blip_effects` chain and is baked there exactly once.
+        let alpha: Option<f64> = None;
         let mut duotone: Option<Duotone> = None;
+        let mut blip_effects = Vec::new();
         // ECMA-376 §20.5.2.33 `twoCellAnchor@editAs` (normative fact): "twoCell"
         // (default), "oneCell", "absolute". It governs how later band edits
         // move/resize the picture (§20.5.3.2). The initial display rect of a
@@ -258,12 +273,18 @@ pub(crate) fn parse_drawing_anchors(
                         }
                         // `<a:srcRect>` is a sibling of `<a:blip>` inside blipFill.
                         src_rect = parse_src_rect(bf);
-                        // Blip effects: `<a:alphaModFix>` opacity (§20.1.8.6) and
-                        // `<a:duotone>` recolour (§20.1.8.23). The duotone colours
-                        // resolve through the shared DrawingML grammar using the
-                        // sheet's theme palette.
-                        alpha = parse_blip_alpha(bf);
+                        // Ordered CT_Blip effects (§20.1.8.13), shared with
+                        // DOCX/PPTX: alphaModFix (§20.1.8.6) at its authored
+                        // position and each duotone (§20.1.8.23) with its own
+                        // palette. A lone duotone keeps the legacy `duotone`
+                        // fast path (the shared parser then returns no list).
+                        // Colours resolve through the sheet's theme palette.
                         duotone = parse_blip_duotone(
+                            bf,
+                            &XlsxSchemeResolver { theme_colors },
+                            ooxml_common::color::TintMode::PowerPointLinear,
+                        );
+                        blip_effects = parse_blip_effects(
                             bf,
                             &XlsxSchemeResolver { theme_colors },
                             ooxml_common::color::TintMode::PowerPointLinear,
@@ -322,6 +343,11 @@ pub(crate) fn parse_drawing_anchors(
             (None, None) => continue,
         };
         let mime_type = mime_from_ext(&image_path).to_string();
+        // Nested CT_Blip image fills (fillOverlay/fill) carry relationship ids;
+        // resolve them against this drawing part, never send an id as a path.
+        ooxml_common::blip::resolve_blip_effect_images(&mut blip_effects, &mut |rid| {
+            resolve_drawing_media_path(drawing_rels, drawing_path, archive, rid)
+        });
 
         anchors.push(ImageAnchor {
             z_order: anchor
@@ -357,6 +383,7 @@ pub(crate) fn parse_drawing_anchors(
             src_rect,
             alpha,
             duotone,
+            blip_effects,
         });
     }
     anchors
@@ -582,7 +609,7 @@ fn resolve_xlsx_fill_ref(
     let StyleMatrixLookup::Entry(entry) = format_scheme.lookup_fill_ref(index) else {
         return None;
     };
-    let entry_xml = entry.to_xml();
+    let entry_xml = entry.to_xml().ok()?;
     let document = roxmltree::Document::parse(&entry_xml).ok()?;
     let fill = document
         .root_element()
@@ -616,7 +643,7 @@ fn resolve_xlsx_line_ref(
     let StyleMatrixLookup::Entry(entry) = format_scheme.lookup_line_ref(index) else {
         return None;
     };
-    let entry_xml = entry.to_xml();
+    let entry_xml = entry.to_xml().ok()?;
     let document = roxmltree::Document::parse(&entry_xml).ok()?;
     let line = document.root_element().children().find(|node| {
         node.is_element()
@@ -1188,62 +1215,6 @@ pub(crate) fn parse_tx_body(
     }
 }
 
-/// Parse the adjust handles from a `<a:prstGeom>`'s `<a:avLst>` into an
-/// `adj1..adj8`-ordered vector. ECMA-376 §19.5.31.3 / §20.1.9.5: each
-/// `<a:gd name="adjN" fmla="val X"/>` supplies one handle. Matching is by name
-/// (`adj`/`adj1`, `adj2`, …) with a positional fallback, mirroring the pptx
-/// parser so the shared `renderPresetShape` engine receives an identical shape.
-/// Trailing `None`s are trimmed so a plain rect/ellipse yields an empty vec.
-fn parse_preset_adj(prst_geom: &roxmltree::Node) -> Vec<Option<f64>> {
-    let av = prst_geom
-        .children()
-        .find(|n| n.is_element() && n.tag_name().name() == "avLst");
-    let Some(av) = av else {
-        return Vec::new();
-    };
-    let gd_nodes: Vec<roxmltree::Node> = av
-        .children()
-        .filter(|n| n.is_element() && n.tag_name().name() == "gd")
-        .collect();
-    if gd_nodes.is_empty() {
-        return Vec::new();
-    }
-
-    let parse_val = |gd: &roxmltree::Node| -> Option<f64> {
-        gd.attribute("fmla")
-            .and_then(|f| f.strip_prefix("val "))
-            .and_then(|s| s.trim().parse::<f64>().ok())
-    };
-
-    // When the handles carry `name` attributes, match strictly by name so a
-    // missing adjN leaves a `None` gap (its index still aligns with the engine's
-    // adj1..adj8 expectations). Positional fallback is used only for legacy
-    // unnamed `<a:gd>` lists.
-    let named = gd_nodes.iter().any(|n| n.attribute("name").is_some());
-    let mut out: Vec<Option<f64>> = (1..=8)
-        .map(|i| {
-            let by_name = gd_nodes.iter().find(|n| {
-                let name = n.attribute("name");
-                if i == 1 {
-                    matches!(name, Some("adj") | Some("adj1"))
-                } else {
-                    name == Some(&format!("adj{i}")[..])
-                }
-            });
-            if named {
-                by_name.and_then(parse_val)
-            } else {
-                gd_nodes.get(i - 1).and_then(parse_val)
-            }
-        })
-        .collect();
-
-    while matches!(out.last(), Some(None)) {
-        out.pop();
-    }
-    out
-}
-
 pub(crate) fn parse_sp_geom(
     sp_pr: &roxmltree::Node,
     shape_width: f64,
@@ -1254,7 +1225,7 @@ pub(crate) fn parse_sp_geom(
             "prstGeom" => {
                 return Some(ShapeGeom::Preset {
                     name: c.attribute("prst").unwrap_or("rect").to_string(),
-                    adj: parse_preset_adj(&c),
+                    adj: ooxml_common::preset_geometry::parse_preset_adj(c),
                 });
             }
             "custGeom" => {
@@ -1303,9 +1274,8 @@ pub(crate) fn collect_shapes(
             continue;
         }
         if tag == "grpSp" {
-            // Bound the group nesting: once the shared depth limit is reached,
-            // drop this group's subtree rather than recurse into it, so a
-            // pathologically deep `<xdr:grpSp>` nest cannot overflow the stack.
+            // Stop recursion at the existing ceiling. descend() latches a
+            // typed resource failure, so the package rejects this projection.
             let Some(child_depth) = depth.descend() else {
                 continue;
             };
@@ -1575,13 +1545,27 @@ pub(crate) fn collect_shapes(
                 .descendants()
                 .find(|n| n.is_element() && n.tag_name().name() == "blipFill");
             let src_rect = leaf_blip_fill.and_then(parse_src_rect);
-            let alpha = leaf_blip_fill.and_then(parse_blip_alpha);
+            // alphaModFix is part of the ordered effect chain (see the
+            // top-level picture path); `alpha` stays empty for parsed leaves.
+            let alpha = None;
             let duotone = leaf_blip_fill.and_then(|bf| {
                 parse_blip_duotone(
                     bf,
                     &XlsxSchemeResolver { theme_colors },
                     ooxml_common::color::TintMode::PowerPointLinear,
                 )
+            });
+            let mut blip_effects = leaf_blip_fill
+                .map(|bf| {
+                    parse_blip_effects(
+                        bf,
+                        &XlsxSchemeResolver { theme_colors },
+                        ooxml_common::color::TintMode::PowerPointLinear,
+                    )
+                })
+                .unwrap_or_default();
+            ooxml_common::blip::resolve_blip_effect_images(&mut blip_effects, &mut |rid| {
+                rid_urls.get(rid).cloned()
             });
 
             // Prefer the raster as `image_path`; fall back to the SVG when no
@@ -1648,6 +1632,7 @@ pub(crate) fn collect_shapes(
                     src_rect,
                     alpha,
                     duotone,
+                    blip_effects,
                 },
                 text: None,
             });
@@ -1656,6 +1641,7 @@ pub(crate) fn collect_shapes(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn parse_shape_anchors(
     drawing_xml: &str,
     theme_colors: &[String],
@@ -1665,6 +1651,16 @@ pub(crate) fn parse_shape_anchors(
     let Ok(doc) = parse_guarded(drawing_xml) else {
         return Vec::new();
     };
+    parse_shape_doc_anchors(&doc, theme_colors, theme_format_scheme, rid_urls)
+}
+
+/// [`parse_shape_anchors`] over an already parsed drawing part.
+fn parse_shape_doc_anchors(
+    doc: &roxmltree::Document<'_>,
+    theme_colors: &[String],
+    theme_format_scheme: &ThemeFormatScheme,
+    rid_urls: &HashMap<String, String>,
+) -> Vec<ShapeAnchor> {
     let mut anchors: Vec<ShapeAnchor> = Vec::new();
 
     for anchor in doc.descendants() {
@@ -1910,45 +1906,24 @@ pub(crate) fn parse_shape_anchors(
 
 pub(crate) fn load_sheet_shape_groups(
     archive: &mut crate::XlsxZip,
-    sheet_path: &str,
+    drawings: &[ParsedSheetDrawing<'_>],
     theme_colors: &[String],
     theme_format_scheme: &ThemeFormatScheme,
 ) -> Vec<ShapeAnchor> {
-    let Some((sheet_dir, sheet_file)) = sheet_path.rsplit_once('/') else {
-        return Vec::new();
-    };
-    let sheet_rels_path = format!("xl/{}/_rels/{}.rels", sheet_dir, sheet_file);
-    let Ok(sheet_rels_xml) = read_zip_string(archive, &sheet_rels_path) else {
-        return Vec::new();
-    };
-    let Ok(rels_doc) = parse_guarded(&sheet_rels_xml) else {
-        return Vec::new();
-    };
-    let mut drawing_targets: Vec<String> = Vec::new();
-    for rel in rels_doc
-        .root_element()
-        .children()
-        .filter(|n| n.is_element())
-    {
-        if rel.attribute("Type").unwrap_or("").ends_with("/drawing") {
-            if let Some(t) = rel.attribute("Target") {
-                drawing_targets.push(t.to_string());
-            }
-        }
-    }
     let mut all: Vec<ShapeAnchor> = Vec::new();
-    for target in drawing_targets {
-        let drawing_path = resolve_zip_path(&format!("xl/{sheet_path}"), &target);
-        let Ok(drawing_xml) = read_zip_string(archive, &drawing_path) else {
+    for drawing in drawings {
+        if !drawing.read {
             continue;
-        };
-        let rid_urls = build_drawing_rid_urls(archive, &drawing_path);
-        all.extend(parse_shape_anchors(
-            &drawing_xml,
-            theme_colors,
-            theme_format_scheme,
-            &rid_urls,
-        ));
+        }
+        let rid_urls = build_drawing_rid_urls(archive, drawing.path);
+        if let Some(doc) = &drawing.doc {
+            all.extend(parse_shape_doc_anchors(
+                doc,
+                theme_colors,
+                theme_format_scheme,
+                &rid_urls,
+            ));
+        }
     }
     all
 }
@@ -2002,11 +1977,90 @@ pub(crate) fn build_drawing_rid_urls(
 /// its drawing(s), and return all image anchors found.
 pub(crate) fn load_sheet_images(
     archive: &mut crate::XlsxZip,
-    sheet_path: &str, // e.g. "worksheets/sheet1.xml"
+    drawings: &[ParsedSheetDrawing<'_>],
     // Positional clrScheme palette, for resolving a picture's `<a:duotone>`
     // effect colours (§20.1.8.23) via the shared DrawingML colour grammar.
     theme_colors: &[String],
 ) -> Vec<ImageAnchor> {
+    let mut all_anchors: Vec<ImageAnchor> = Vec::new();
+    for drawing in drawings {
+        if !drawing.read {
+            continue;
+        }
+        // Drawing rels:  xl/drawings/_rels/drawing1.xml.rels
+        let Some((drawing_dir, drawing_file)) = drawing.path.rsplit_once('/') else {
+            continue;
+        };
+        let drawing_rels_path = format!("{}/_rels/{}.rels", drawing_dir, drawing_file);
+        let drawing_rels = read_zip_string(archive, &drawing_rels_path)
+            .ok()
+            .map(|xml| parse_rels_map(&xml))
+            .unwrap_or_default();
+
+        if let Some(doc) = &drawing.doc {
+            let mut anchors =
+                parse_drawing_doc_anchors(doc, &drawing_rels, drawing.path, archive, theme_colors);
+            all_anchors.append(&mut anchors);
+        }
+    }
+    all_anchors
+}
+
+/// One relationship's drawing, parsed once and borrowed by all three loaders.
+pub(crate) struct ParsedSheetDrawing<'a> {
+    pub(crate) path: &'a str,
+    /// Whether the part was read. A loader skips an unread part.
+    pub(crate) read: bool,
+    /// `None` when the part was unread or is not well-formed XML.
+    pub(crate) doc: Option<roxmltree::Document<'a>>,
+}
+
+impl<'a> ParsedSheetDrawing<'a> {
+    fn new(path: &'a str, xml: Option<&'a str>) -> Self {
+        let doc = xml.and_then(|xml| parse_guarded(xml).ok());
+        #[cfg(test)]
+        if doc.is_some() {
+            drawing_lifetime_tests::record_parse();
+        }
+        Self {
+            path,
+            read: xml.is_some(),
+            doc,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for ParsedSheetDrawing<'_> {
+    fn drop(&mut self) {
+        if self.doc.is_some() {
+            drawing_lifetime_tests::record_drop();
+        }
+    }
+}
+
+/// Visit `/drawing` relationships in order, sharing one read and DOM parse
+/// between the picture, chart and shape loaders for each relationship.
+///
+/// Library resource policy: release the XML and DOM before reading the next
+/// target, including repeated targets. ZIP inflation accounting counts distinct
+/// entries, so it cannot bound copies retained per relationship. Only owned
+/// loader output may outlive the callback; never cache drawing XML or DOMs.
+pub(crate) fn for_each_sheet_drawing(
+    archive: &mut crate::XlsxZip,
+    sheet_path: &str,
+    mut visit: impl FnMut(&mut crate::XlsxZip, &ParsedSheetDrawing<'_>),
+) {
+    for path in sheet_drawing_paths(archive, sheet_path) {
+        let xml = read_zip_string(archive, &path).ok();
+        let drawing = ParsedSheetDrawing::new(&path, xml.as_deref());
+        visit(archive, &drawing);
+    }
+}
+
+/// Collect only paths, preserving relationship order and duplicate targets
+/// (ECMA-376 Part 2, CT_Relationships / CT_Relationship@Target).
+fn sheet_drawing_paths(archive: &mut crate::XlsxZip, sheet_path: &str) -> Vec<String> {
     // sheet rels path:  xl/worksheets/_rels/sheet1.xml.rels
     let Some((sheet_dir, sheet_file)) = sheet_path.rsplit_once('/') else {
         return Vec::new();
@@ -2015,8 +2069,6 @@ pub(crate) fn load_sheet_images(
     let Ok(sheet_rels_xml) = read_zip_string(archive, &sheet_rels_path) else {
         return Vec::new();
     };
-
-    // Find all drawing relationships
     let Ok(rels_doc) = parse_guarded(&sheet_rels_xml) else {
         return Vec::new();
     };
@@ -2026,45 +2078,105 @@ pub(crate) fn load_sheet_images(
         .children()
         .filter(|n| n.is_element())
     {
-        let rel_type = rel.attribute("Type").unwrap_or("");
-        if rel_type.ends_with("/drawing") {
+        if rel.attribute("Type").unwrap_or("").ends_with("/drawing") {
             if let Some(t) = rel.attribute("Target") {
                 drawing_targets.push(t.to_string());
             }
         }
     }
-    if drawing_targets.is_empty() {
-        return Vec::new();
+    drawing_targets
+        .into_iter()
+        .map(|target| {
+            // sheet_dir is "worksheets", target typically "../drawings/drawing1.xml"
+            // → "xl/drawings/drawing1.xml"
+            resolve_zip_path(&format!("xl/{sheet_path}"), &target)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod drawing_lifetime_tests {
+    use std::{cell::Cell, io::Write};
+
+    // Track the actual parsed-drawing owners, rather than callback entry/exit:
+    // collecting DOMs before invoking a per-drawing callback must fail too.
+    thread_local! {
+        static COUNTS: Cell<(usize, usize, usize)> = const { Cell::new((0, 0, 0)) };
     }
 
-    let mut all_anchors: Vec<ImageAnchor> = Vec::new();
-    for target in drawing_targets {
-        // sheet_dir is "worksheets", target typically "../drawings/drawing1.xml"
-        // base dir for the drawing = "xl/worksheets/sheet1.xml" + "../drawings" → "xl/drawings/drawing1.xml"
-        let drawing_path = resolve_zip_path(&format!("xl/{sheet_path}"), &target);
-        let Ok(drawing_xml) = read_zip_string(archive, &drawing_path) else {
-            continue;
-        };
-        // Drawing rels:  xl/drawings/_rels/drawing1.xml.rels
-        let Some((drawing_dir, drawing_file)) = drawing_path.rsplit_once('/') else {
-            continue;
-        };
-        let drawing_rels_path = format!("{}/_rels/{}.rels", drawing_dir, drawing_file);
-        let drawing_rels = read_zip_string(archive, &drawing_rels_path)
-            .ok()
-            .map(|xml| parse_rels_map(&xml))
-            .unwrap_or_default();
+    pub(super) fn record_parse() {
+        COUNTS.with(|counts| {
+            let (live, peak, parsed) = counts.get();
+            counts.set((live + 1, peak.max(live + 1), parsed + 1));
+        });
+    }
 
-        let mut anchors = parse_drawing_anchors(
-            &drawing_xml,
-            &drawing_rels,
-            &drawing_path,
-            archive,
-            theme_colors,
+    pub(super) fn record_drop() {
+        COUNTS.with(|counts| {
+            let (live, peak, parsed) = counts.get();
+            counts.set((live - 1, peak, parsed));
+        });
+    }
+
+    fn workbook(relationships: usize) -> Vec<u8> {
+        let rels = (0..relationships)
+            .map(|i| format!(r#"<Relationship Id="r{i}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/>"#))
+            .collect::<String>();
+        let rels = format!(
+            r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">{rels}</Relationships>"#
         );
-        all_anchors.append(&mut anchors);
+        let drawing = format!(
+            r#"<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"><!--{}--></xdr:wsDr>"#,
+            "x".repeat(16 * 1024)
+        );
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (path, body) in [
+            (
+                "xl/workbook.xml",
+                r#"<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Sheet1" sheetId="1" r:id="rSheet"/></sheets></workbook>"#,
+            ),
+            (
+                "xl/_rels/workbook.xml.rels",
+                r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rSheet" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#,
+            ),
+            (
+                "xl/worksheets/sheet1.xml",
+                r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData/></worksheet>"#,
+            ),
+            ("xl/worksheets/_rels/sheet1.xml.rels", &rels),
+            ("xl/drawings/drawing1.xml", &drawing),
+        ] {
+            writer
+                .start_file(path, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(body.as_bytes()).unwrap();
+        }
+        crate::write_test_content_types(&mut writer);
+        writer.finish().unwrap().into_inner()
     }
-    all_anchors
+
+    #[test]
+    fn repeated_drawing_target_keeps_only_one_dom_live_per_finalization() {
+        let expected = crate::parse_sheet_native(&workbook(1), 0, "Sheet1").unwrap();
+        let data = workbook(96);
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(&data)).unwrap();
+        let distinct_bytes: u64 = (0..zip.len())
+            .map(|i| zip.by_index(i).unwrap().size())
+            .sum();
+        // Repeat relationships must remain legal within a distinct-entry ZIP
+        // budget. Bound the lifetime, without changing inflation accounting.
+        let mut archive =
+            crate::open_workbook_package(data, None, Some(distinct_bytes), None).unwrap();
+        COUNTS.with(|counts| counts.set((0, 0, 0)));
+        let actual = crate::parse_sheet_native_in(&mut archive, 0, "Sheet1").unwrap();
+        assert_eq!(actual, expected, "empty drawings preserve exact JSON");
+        COUNTS.with(|counts| {
+            let (live, peak, parsed) = counts.get();
+            assert_eq!(live, 0, "no drawing DOM survives finalization");
+            assert_eq!(parsed, 96, "parse once per relationship, without caching");
+            assert_eq!(peak, 1, "release each drawing before parsing the next");
+        });
+    }
 }
 
 /// The two-cell `<from>`/`<to>` marker rect of an OLE-object anchor, in the same
@@ -2405,6 +2517,7 @@ pub(crate) fn parse_ole_object_anchors(
             // OLE object previews carry no blip effects.
             alpha: None,
             duotone: None,
+            blip_effects: Vec::new(),
         });
     }
     anchors
@@ -3569,10 +3682,8 @@ mod hidden_tests {
     }
 
     fn anchors_deep(levels: usize) -> Vec<ShapeAnchor> {
-        // roxmltree::Document::parse itself recurses on nesting depth, so parse on
-        // a generous stack; this test targets OUR collect_shapes guard. (The
-        // roxmltree layer is bounded separately by the raw-XML depth pre-check in
-        // `ooxml_common::depth`.)
+        // Exercise the recursive drawing-group walker with native stack headroom;
+        // trusted fixtures bypass the separate production XML depth policy.
         std::thread::Builder::new()
             .stack_size(256 * 1024 * 1024)
             .spawn(move || {
@@ -3586,6 +3697,35 @@ mod hidden_tests {
             .unwrap()
             .join()
             .unwrap()
+    }
+
+    #[test]
+    fn group_depth_crossing_is_a_typed_resource_failure() {
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let governor = ooxml_common::resource::ResourceGovernor::from_wasm(
+                    ooxml_common::resource::OoxmlFormat::Xlsx,
+                    None,
+                    None,
+                    None,
+                );
+                let _scope = governor.scope("group-depth-test");
+                let _provisional = parse_shape_anchors(
+                    &nested_group_anchor(66),
+                    &theme(),
+                    &ThemeFormatScheme::default(),
+                    &HashMap::new(),
+                );
+                let error = governor
+                    .first_error()
+                    .expect("group depth must fail closed");
+                assert!(error.starts_with("OOXML_RESOURCE_LIMIT:"), "{error}");
+                assert!(error.contains("\"limit\":64"), "{error}");
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]
@@ -3612,19 +3752,12 @@ mod hidden_tests {
         );
     }
 
-    // ── RB2 neutralization (roxmltree layer): a pathologically deep drawing XML
-    //    is rejected by the depth pre-check in `parse_guarded` BEFORE roxmltree's
-    //    recursive tree builder runs, so `parse_shape_anchors` returns gracefully
-    //    instead of trapping. Unlike the two tests above (which spawn a 256 MB
-    //    stack to exercise OUR collect_shapes guard), this runs on the DEFAULT
-    //    (small) test-thread stack ON PURPOSE: handing 5 000-deep XML straight to
-    //    roxmltree here would overflow and abort the process. That it returns is
-    //    the guarantee.
+    // Extreme XML depth is rejected before retaining a DOM or entering the
+    // recursive OOXML walker. Streaming validation fits the default test stack.
     #[test]
     fn deeply_nested_drawing_xml_is_rejected_not_trapped() {
         let mut xml = format!(r#"<xdr:wsDr {NS}>"#, NS = NS);
-        // 5 000 levels — ~20× MAX_XML_DEPTH and far past roxmltree's ~1 000-deep
-        // small-stack overflow threshold.
+        // Approximately twenty times the production XML depth ceiling.
         for _ in 0..5_000 {
             xml.push_str("<xdr:grpSp>");
         }
@@ -3656,22 +3789,6 @@ mod geom_tests {
     fn geom_of(sp_pr_xml: &str) -> ShapeGeom {
         let doc = roxmltree::Document::parse(sp_pr_xml).unwrap();
         parse_sp_geom(&doc.root_element(), 100.0, 100.0).expect("sp_pr has geometry")
-    }
-
-    /// A preset with no `<a:avLst>` yields an empty adjust vector — the engine
-    /// then falls back to each shape's declared defaults.
-    #[test]
-    fn preset_without_avlst_has_empty_adj() {
-        let geom = geom_of(&format!(
-            r#"<a:spPr {NS}><a:prstGeom prst="parallelogram"/></a:spPr>"#
-        ));
-        match geom {
-            ShapeGeom::Preset { name, adj } => {
-                assert_eq!(name, "parallelogram");
-                assert!(adj.is_empty(), "no avLst → empty adj, got {adj:?}");
-            }
-            other => panic!("expected Preset, got {other:?}"),
-        }
     }
 
     #[test]
@@ -3731,41 +3848,6 @@ mod geom_tests {
                 assert_eq!(name, "parallelogram");
                 assert_eq!(adj, vec![Some(41667.0)]);
             }
-            other => panic!("expected Preset, got {other:?}"),
-        }
-    }
-
-    /// Multiple named handles (`adj1`/`adj2`) land in declaration order; a gap
-    /// produces a `None` placeholder so later indices stay aligned.
-    #[test]
-    fn preset_reads_named_adj1_adj2_and_fills_gaps() {
-        let geom = geom_of(&format!(
-            r#"<a:spPr {NS}><a:prstGeom prst="wedgeRectCallout">
-                 <a:avLst>
-                   <a:gd name="adj1" fmla="val -20000"/>
-                   <a:gd name="adj3" fmla="val 55000"/>
-                 </a:avLst>
-               </a:prstGeom></a:spPr>"#
-        ));
-        match geom {
-            ShapeGeom::Preset { adj, .. } => {
-                // adj1 set, adj2 missing → None, adj3 set, rest trimmed.
-                assert_eq!(adj, vec![Some(-20000.0), None, Some(55000.0)]);
-            }
-            other => panic!("expected Preset, got {other:?}"),
-        }
-    }
-
-    /// Unnamed `<a:gd>` handles fall back to declaration position.
-    #[test]
-    fn preset_positional_fallback_for_unnamed_gd() {
-        let geom = geom_of(&format!(
-            r#"<a:spPr {NS}><a:prstGeom prst="roundRect">
-                 <a:avLst><a:gd fmla="val 16667"/></a:avLst>
-               </a:prstGeom></a:spPr>"#
-        ));
-        match geom {
-            ShapeGeom::Preset { adj, .. } => assert_eq!(adj, vec![Some(16667.0)]),
             other => panic!("expected Preset, got {other:?}"),
         }
     }
@@ -4188,6 +4270,7 @@ mod blip_svg_tests {
             src_rect: None,
             alpha: None,
             duotone: None,
+            blip_effects: Vec::new(),
         };
         let json = serde_json::to_string(&anchor).unwrap();
         assert!(json.contains("\"imagePath\":\"xl/media/image1.png\""));
@@ -4221,6 +4304,7 @@ mod blip_svg_tests {
             src_rect: None,
             alpha: None,
             duotone: None,
+            blip_effects: Vec::new(),
         };
         let json = serde_json::to_string(&geom).unwrap();
         assert!(json.contains("\"type\":\"image\""));

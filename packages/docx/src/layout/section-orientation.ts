@@ -1,5 +1,5 @@
 import type { DocxDocumentModel, SectionProps } from '../types.js';
-import type { NativeSectionFlow } from './types.js';
+import type { SectionFlow } from './types.js';
 import {
   isVerticalSectionDirection,
   logicalSectionGeometry,
@@ -8,8 +8,8 @@ import {
 
 /** True when a section flows vertically. The Transitional ST_TextDirection
  * values `tbRl`, `tbRlV`, `tbLrV`, and `btLr` share the rotated page frame (a
- * native BtoT section is nominally `btLr`; its own frame is selected by its
- * canonical `nativeSectionFlow`). */
+ * bottomToTop section flow is nominally `btLr`; its own frame is selected by its
+ * canonical `sectionFlow`). */
 export function isVerticalSection(section: SectionProps): boolean {
   return isVerticalTextDirection(section.textDirection);
 }
@@ -33,11 +33,11 @@ export function isAllRotatedVerticalTextDirection(
  * used by retained acquisition. ECMA-376 §17.6.11 defines the page margins. */
 export function verticalLayoutSection(
   physical: SectionProps,
-  nativeSectionFlow?: NativeSectionFlow,
+  sectionFlow?: SectionFlow,
 ): SectionProps {
   return {
     ...physical,
-    ...logicalSectionGeometry(physical, nativeSectionFlow),
+    ...logicalSectionGeometry(physical, sectionFlow),
   };
 }
 
@@ -52,10 +52,10 @@ export function verticalLayoutDoc(document: DocxDocumentModel): DocxDocumentMode
 /** Map a logical vertical frame back to physical page geometry. */
 export function physicalLayoutSection(
   logical: SectionProps,
-  nativeSectionFlow?: NativeSectionFlow,
+  sectionFlow?: SectionFlow,
 ): SectionProps {
   return {
     ...logical,
-    ...physicalSectionGeometry(logical, nativeSectionFlow),
+    ...physicalSectionGeometry(logical, sectionFlow),
   };
 }

@@ -1,3 +1,5 @@
+import { acquireCanvasGlyphContours } from '../native-glyph-contours.js';
+import { ownValue } from '@silurus/ooxml-core/internal/own-key';
 import { type CjkLang } from '@silurus/ooxml-core';
 import {
   activeFontSet,
@@ -10,7 +12,7 @@ import { DOCX_GOOGLE_FONTS } from '../google-font-registry.js';
 import type { LoadedEmbeddedFontRoute } from '../embedded-fonts.js';
 import { normalizeFontFamilyUncached } from '../line-layout.js';
 import type { LayoutSourceStore } from './layout-source-store.js';
-import { createFontResolver, type FontInventoryFace } from './font-service.js';
+import { createFontResolver, type FontInventoryFace, type NativeRouteLineMetric } from './font-service.js';
 import type {
   MeasurementTextContext,
   VerticalGlyphMeasurementService,
@@ -31,8 +33,10 @@ import {
   createTextLayoutService,
   snapshotFontMetrics,
   type GlyphMeasureRequest,
+  type TextLayoutService,
 } from './text.js';
 import type { LayoutServices } from './types.js';
+import { ownsGlyphs, sameGlyphRaster } from '../glyph-raster-proof.js';
 
 export interface LoadedFontFaceRecord {
   readonly family: string;
@@ -61,6 +65,10 @@ export interface ProductionLayoutServiceOptions {
   /** Normalized families whose authored face is installed; they are never
    * routed to a different-family Google substitute (`docxGoogleFontPlan`). */
   readonly installedSubstituteFamilies?: readonly string[];
+  /** Normalized authored families the family presence probe found installed. */
+  readonly installedFamilies?: readonly string[];
+  /** Admitted native route lines (native-route-line-metrics.ts). */
+  readonly nativeRouteMetrics?: Readonly<Record<string, NativeRouteLineMetric>>;
 }
 
 /** Registry families with a script-scoped visual substitute (core
@@ -83,10 +91,13 @@ function docxScriptScopedFamilies(
     }]));
 }
 
-export function createProductionLayoutServices(
+/** The production text service alone: font inventory, resolver and Canvas
+ * measurer. Native route enumeration resolves through this same service, so
+ * the routes it measures are exactly the routes layout requests. */
+export function createProductionTextLayoutService(
   source: LayoutSourceStore,
-  options: ProductionLayoutServiceOptions,
-): LayoutServices {
+  options: Omit<ProductionLayoutServiceOptions, 'verticalGlyphMeasurement'>,
+): TextLayoutService {
   const fontFamilyCharsets = Object.freeze(Object.fromEntries(
     Object.entries(source.fontFamilyCharsets)
       .map(([family, charset]) => [family.trim().toLowerCase(), charset]),
@@ -168,6 +179,7 @@ export function createProductionLayoutServices(
       resourceIdentity: route.resourceIdentity,
       weight: route.weight,
       style: route.style,
+      ...(route.coverageProbeFamily ? { coverageProbeFamily: route.coverageProbeFamily } : {}),
     });
   }
   for (const [requestedFamily, metric] of Object.entries(localMetrics)) {
@@ -188,7 +200,7 @@ export function createProductionLayoutServices(
       const key = name.toLowerCase();
       if (seen.has(key)) continue;
       seen.add(key);
-      const entry = DOCX_GOOGLE_FONTS[key];
+      const entry = ownValue(DOCX_GOOGLE_FONTS, key);
       const resolvedFamily = entry?.loadFamily ?? name;
       if (!entry) continue;
       if (normalizedFaceFamily(resolvedFamily) !== normalizedFaceFamily(name)
@@ -223,9 +235,14 @@ export function createProductionLayoutServices(
   // A face loaded after this snapshot needs a new layout service/pagination.
   const requestedNames = new Set(routedFontFamilies.map(normalizedFaceFamily));
   const fontSet = options.fontSet === undefined ? activeFontSet() : options.fontSet;
+  // Any loaded application face declaring an authored family shadows the
+  // system family for every tuple, whatever its descriptors (oblique, weight
+  // 950...), even ones the exact-tuple inventory below cannot represent.
+  const shadowedFamilies = new Set<string>();
   if (fontSet && typeof fontSet[Symbol.iterator] === 'function') {
     for (const face of fontSet) {
       if (!requestedNames.has(normalizedFaceFamily(face.family))) continue;
+      if (face.status === 'loaded') shadowedFamilies.add(normalizedFaceFamily(face.family));
       for (const loaded of loadedFaces([face])) {
         inventory.push({
           requestedFamily: loaded.displayFamily,
@@ -237,8 +254,11 @@ export function createProductionLayoutServices(
       }
     }
   }
-  const text = createTextLayoutService({
+  return createTextLayoutService({
+    ...(context ? { glyphContours: acquireCanvasGlyphContours, glyphContourFingerprint: 'canvas-half-coverage-contours-v1' } : {}),
     fonts: createFontResolver(inventory, {
+      installedFamilies: options.installedFamilies,
+      shadowedFamilies: [...shadowedFamilies],
       regionalFamilyLists: Object.fromEntries((['sc', 'tc', 'hk', 'jp', 'kr'] as const).map(region => [
         region,
         Object.fromEntries([...new Set([...routedFontFamilies, 'sans-serif', 'serif', 'monospace'])]
@@ -249,6 +269,7 @@ export function createProductionLayoutServices(
       scriptScopedFamilies: options.useGoogleFonts
         ? docxScriptScopedFamilies(options.installedSubstituteFamilies ?? [])
         : undefined,
+      nativeRouteMetrics: options.nativeRouteMetrics,
       nativeFamilyLists: Object.fromEntries(routedFontFamilies.map((family) => [
         family,
         normalizeFontFamilyUncached(
@@ -270,7 +291,9 @@ export function createProductionLayoutServices(
       // DOM-dependent vertical documents cannot retain worker mode, so folding
       // that unused capability into the general text snapshot would make equal
       // horizontal main/worker services advertise unequal cache identities.
-      fingerprint: context ? 'canvas-text-metrics-v1' : 'deterministic-text-metrics-v1',
+      // v2: the Canvas measurer also proves synthesized faces (#1848).
+      fingerprint: context ? 'canvas-text-metrics-v2' : 'deterministic-text-metrics-v1',
+      ...(context ? { sameGlyphRaster, ownsGlyphs } : {}),
       measure(request: Readonly<GlyphMeasureRequest>) {
         if (!context) return {
           advancePt: [...request.text].length * request.fontSizePt * 0.5,
@@ -322,6 +345,13 @@ export function createProductionLayoutServices(
       },
     },
   });
+}
+
+export function createProductionLayoutServices(
+  source: LayoutSourceStore,
+  options: ProductionLayoutServiceOptions,
+): LayoutServices {
+  const text = createProductionTextLayoutService(source, options);
   const mathResources = options.mathResources ?? source.mathOccurrences.map(({ display, source: occurrenceSource }) => ({
     resourceKey: mathResourceKey(occurrenceSource, display ? 'display' : 'inline'),
     widthEm: 0,

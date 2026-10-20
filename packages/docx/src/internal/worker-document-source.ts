@@ -1,4 +1,4 @@
-import { isWasmTrap, type WasmParserHost } from '@silurus/ooxml-core';
+import type { WasmParserHost } from '@silurus/ooxml-core';
 import {
   copyModelSourceBytes,
   hasModelSourceCapability,
@@ -8,6 +8,10 @@ import {
   type ModelSourceModuleDescriptor,
   type OpenedModelSourceModule,
 } from '@silurus/ooxml-core/internal/model-source';
+import {
+  copyingCursorArchive,
+  runModelSourceOperation,
+} from '@silurus/ooxml-core/internal/worker-model-source';
 import type { DocxDocumentCursorArchive } from '../document-pull-worker.js';
 
 export interface WorkerDocumentArchive extends DocxDocumentCursorArchive {
@@ -136,16 +140,7 @@ export class WorkerDocumentSourceOwner<TArchive extends OoxmlWorkerDocumentArchi
       }
       // Normalize at the source boundary. The ordinary pull coordinator can
       // keep its original transfer path and never inspect source ownership.
-      const archive = new Proxy(opened.archive, {
-        get(target, key) {
-          if (key === 'pull_document_chunk') {
-            return (...args: Parameters<DocxModelSourceArchive['pull_document_chunk']>) =>
-              new Uint8Array(copyModelSourceBytes(target.pull_document_chunk(...args)));
-          }
-          const value = Reflect.get(target, key);
-          return typeof value === 'function' ? value.bind(target) : value;
-        },
-      });
+      const archive = copyingCursorArchive(opened.archive, 'pull_document_chunk');
       this.modelSource = { archive: opened.archive, transferArchive: archive, viewDefaults, close: opened.close };
       return viewDefaults;
     } finally {
@@ -168,14 +163,10 @@ export class WorkerDocumentSourceOwner<TArchive extends OoxmlWorkerDocumentArchi
       if (!archive) throw new Error('Document not loaded');
       return this.ooxmlHost.run(() => operation(archive));
     }
-    try {
-      return operation(source.transferArchive);
-    } catch (error) {
-      if (isWasmTrap(error) && this.modelSource === source) {
-        try { this.closeModelSource(); } catch {}
-      }
-      throw error;
-    }
+    return runModelSourceOperation(
+      () => operation(source.transferArchive),
+      () => { if (this.modelSource === source) this.closeModelSource(); },
+    );
   }
 
   /** ZIP resource accounting; `undefined` when the source lacks the capability. */

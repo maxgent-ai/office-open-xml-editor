@@ -5,6 +5,7 @@
 //! path commands once; format parsers only adapt the result to their existing
 //! wire models.
 
+use crate::xml_node::{attr_finite_f64, child};
 use std::collections::HashMap;
 
 const FULL_CIRCLE: f64 = 21_600_000.0;
@@ -63,19 +64,6 @@ pub enum PathCommand {
         sw_ang: f64,
     },
     Close,
-}
-
-fn child<'a, 'input>(
-    node: roxmltree::Node<'a, 'input>,
-    name: &str,
-) -> Option<roxmltree::Node<'a, 'input>> {
-    node.children()
-        .find(|child| child.is_element() && child.tag_name().name() == name)
-}
-
-fn attr_f64(node: roxmltree::Node<'_, '_>, name: &str) -> Option<f64> {
-    let value = node.attribute(name)?.parse::<f64>().ok()?;
-    value.is_finite().then_some(value)
 }
 
 fn resolve(token: &str, env: &HashMap<String, f64>) -> Option<f64> {
@@ -148,7 +136,7 @@ fn guide_environment(
         shape_width
     } else {
         first_path
-            .and_then(|path| attr_f64(path, "w"))
+            .and_then(|path| attr_finite_f64(&path, "w"))
             .unwrap_or(1.0)
             .max(1.0)
     };
@@ -156,7 +144,7 @@ fn guide_environment(
         shape_height
     } else {
         first_path
-            .and_then(|path| attr_f64(path, "h"))
+            .and_then(|path| attr_finite_f64(&path, "h"))
             .unwrap_or(1.0)
             .max(1.0)
     };
@@ -274,10 +262,10 @@ pub fn parse_custom_geometry(
         .children()
         .filter(|node| node.is_element() && node.tag_name().name() == "path")
         .map(|path| {
-            let width = attr_f64(path, "w")
+            let width = attr_finite_f64(&path, "w")
                 .filter(|value| *value > 0.0)
                 .unwrap_or(shape_width.max(1.0));
-            let height = attr_f64(path, "h")
+            let height = attr_finite_f64(&path, "h")
                 .filter(|value| *value > 0.0)
                 .unwrap_or(shape_height.max(1.0));
             let commands = path

@@ -273,17 +273,40 @@ describe('buildFont — style encoded in a face name', () => {
     expect(font.endsWith('serif')).toBe(true);
   });
 
-  it('preserves a Medium theme face when the browser falls back', () => {
+  it('preserves a family-named Medium weight when the browser falls back', () => {
     const font = buildFont(false, false, 48, 'Franklin Gothic Medium', {
       themeMajorFont: null,
       themeMinorFont: null,
       dpr: 1,
     });
-    expect(font).toMatch(/^600 48px "Franklin Gothic Medium"/);
+    expect(font).toMatch(/^500 48px "Franklin Gothic Medium"/);
     expect(font).not.toContain('"Libre Franklin"');
-    expect(buildFont(false, false, 48, 'Franklin Gothic Medium', {
+    const substituted = buildFont(false, false, 48, 'Franklin Gothic Medium', {
       themeMajorFont: null, themeMinorFont: null, dpr: 1, googleSubstitutes: true,
-    })).toContain('"Libre Franklin"');
+    });
+    expect(substituted).toMatch(/^500 48px "Franklin Gothic Medium"/);
+    expect(substituted).toContain('"Libre Franklin"');
+  });
+
+  it.each([
+    ['Thin', 100],
+    ['ExtraLight', 200],
+    ['Light', 300],
+    ['Regular', 400],
+    ['Medium', 500],
+    ['SemiBold', 600],
+    ['Bold', 700],
+    ['ExtraBold', 800],
+    ['Black', 900],
+  ])('maps the OpenType weight name %s to %i', (name, weight) => {
+    const rc = { themeMajorFont: null, themeMinorFont: null, dpr: 1 };
+    expect(buildFont(false, false, 24, `Example ${name}`, rc)).toMatch(new RegExp(`^${weight} 24px `));
+  });
+
+  it('keeps unnamed families regular and recognizes hyphenated bold names', () => {
+    const rc = { themeMajorFont: null, themeMinorFont: null, dpr: 1 };
+    expect(buildFont(false, false, 24, 'Yu Gothic', rc)).toMatch(/^24px /);
+    expect(buildFont(false, false, 24, 'Courier-Bold', rc)).toMatch(/^700 24px /);
   });
 
   it('lets an explicit bold run override a named Medium face', () => {

@@ -10,7 +10,7 @@ import {
 } from './pull-credit-error.js';
 export { PULL_SESSION_INSUFFICIENT_CREDIT_CODE } from './pull-credit-error.js';
 
-export const DEFAULT_PULL_CANCEL_GRACE_MS = 1_000;
+const DEFAULT_PULL_CANCEL_GRACE_MS = 1_000;
 export const PULL_SESSION_PROTOCOL = 'ooxml-pull-v1' as const;
 
 export type PullSessionKey = string | number;

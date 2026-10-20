@@ -56,8 +56,34 @@ export function drawChartTextBoxes(
       };
     };
 
-    const lines = box.paragraphs.flatMap(paragraph => {
-      const measuredRuns = paragraph.runs.map(run => {
+    type TextRun = ChartTextBox['paragraphs'][number]['runs'][number];
+    // An authored line break inside a run (a literal newline in <a:t>, or the
+    // "\n" run the parser emits for <a:br>) ends the line in both wrapping
+    // modes. Each break-delimited segment keeps its paragraph's alignment; a
+    // segment with no text keeps an empty run so its line has the break run's
+    // height. Paragraphs without breaks are laid out exactly as before.
+    const lineSegments = (paragraph: ChartTextBox['paragraphs'][number]): TextRun[][] => {
+      if (!paragraph.runs.some(run => /[\r\n]/.test(run.text))) return [paragraph.runs];
+      const segments: TextRun[][] = [[]];
+      const emptyRuns: Array<TextRun | undefined> = [undefined];
+      for (const run of paragraph.runs) {
+        run.text.split(/\r\n|\r|\n/).forEach((part, index) => {
+          if (index > 0) {
+            segments.push([]);
+            emptyRuns.push(undefined);
+          }
+          if (part) segments[segments.length - 1].push({ ...run, text: part });
+          else emptyRuns[segments.length - 1] ??= run;
+        });
+      }
+      return segments.map((segment, index) => segment.length
+        ? segment
+        : [{ ...(emptyRuns[index] ?? paragraph.runs[0]), text: '' }]);
+    };
+
+    const lines = box.paragraphs.flatMap(paragraph => lineSegments(paragraph).map(runs => ({ paragraph, runs })))
+      .flatMap(({ paragraph, runs }) => {
+      const measuredRuns = runs.map(run => {
         const fontPx = Math.max(1, ((run.fontSizeHpt ?? 1000) / 100) * ptToPx);
         const font = `${run.bold ? 'bold ' : ''}${fontPx}px ${chartFontFamily(chart, run.fontFace, 'minor')}`;
         ctx.font = font;

@@ -381,6 +381,8 @@ export type TextRun = TextRunData | LineBreak | EquationRun;
  * PowerPoint stores these as `a14:m` inside `mc:AlternateContent`.
  */
 export interface EquationRun {
+  /** Plain text retained from an inline MCE Fallback; used on conversion failure. */
+  fallbackText?: string;
   type: 'math';
   /** Parsed OMML node list. */
   nodes: MathNode[];

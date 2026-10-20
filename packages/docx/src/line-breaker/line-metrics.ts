@@ -1,6 +1,6 @@
 import type { LineSpacing } from '../types';
 import type { CanvasFontRoute, ResolvedFontMetric } from '@silurus/ooxml-core';
-import { measureResolvedCanvasFontBoxRatio } from '@silurus/ooxml-core';
+import { measureResolvedCanvasFontBoxRatio, SYNTHETIC_ASCENT_EM, SYNTHETIC_DESCENT_EM } from '@silurus/ooxml-core';
 import type { NumberingMarkerShapeInput } from '../layout/types.js';
 import type { MeasurementTextContext } from '../layout/measurement-capabilities.js';
 import type { ParagraphLayoutSource, TextLayoutService } from '../layout/text.js';
@@ -9,7 +9,7 @@ import { wordDegenerateLineSpacingIsSingle, wordEastAsianGridLineCells, wordFarE
 import { type DocGridCtx, type LayoutLine } from './model.js';
 import { isGridLineRule } from './advance.js';
 import { buildFont, getDefaultFontFamily, getDefaultFontSize } from './font-routes.js';
-import { indexedFontMetrics, mayUseAuthoredReferenceVerticalMetric, selectResourceMetric } from './font-metrics.js';
+import { allowsReferenceFontMetric, authoredReferenceVerticalMetric, indexedFontMetrics, mayUseAuthoredReferenceVerticalMetric, selectResourceMetric } from './font-metrics.js';
 
 /**
  * ECMA-376 §17.6.5 docGrid line grid — number of whole grid CELLS a
@@ -40,13 +40,13 @@ export function docGridLineCells(naturalPx: number, pitchPx: number): number {
 /** Deterministic single-line height used to count docGrid cells for one East
  * Asian text run. Resolved font resources contribute their parsed design height.
  *
- * The `word-east-asian-grid-line-allocation` rule supplies the 1.3 × hhea-box
+ * The `word-east-asian-grid-line-allocation` rule supplies the 1.3 × usWin-box
  * fallback measured for the Far East grid path; §17.6.5 does not define this
  * factor.
  *
- * When the font resource is unavailable, its hhea box is unknown, so the
+ * When the font resource is unavailable, its usWin box is unknown, so the
  * compatibility fallback uses 1.3em (WORD_FAR_EAST_SINGLE_LINE_FACTOR).
- * This assumes an unknown hhea box of 1em and can choose the wrong cell near
+ * This assumes an unknown usWin box of 1em and can choose the wrong cell near
  * a grid boundary. It is an explicit unavailable-resource fallback, not a
  * normative font-metrics claim or an error bound. Issue #1525 tracks its
  * replacement when the actual face geometry or a justified substitute exists.
@@ -129,10 +129,6 @@ export function lineBoxHeight(
       // Canvas boxes and Far-East reference faces keep the existing floor.
       return wordLatinDesignGridSingleHeight(natural, pitchPx, latinGridCountSinglePx);
     }
-    // Ruby lines reserve real furigana height (base + rt); honor the measured
-    // glyph box so the annotation is not clipped. Plain EA lines snap their
-    // design single-line height to whole cells.
-    if (hasRuby) return Math.max(pitchPx, Math.ceil(glyphNatural / pitchPx) * pitchPx);
     // `word-east-asian-grid-line-allocation`: count cells from the source face's
     // design single-line height, not a substituted Canvas glyph box. Prefer the
     // per-line design-grid height; direct unresolved callers may supply the run em.
@@ -143,7 +139,13 @@ export function lineBoxHeight(
         : untabledEastAsianEmPx === undefined
           ? pitchPx
           : eastAsianGridCountSinglePx(0, untabledEastAsianEmPx));
-    return docGridLineCells(cellCountHeight, pitchPx) * pitchPx;
+    // ECMA-376 §17.3.3.25 places the ruby guide above the normal base text;
+    // §17.6.5 defines the single-spaced grid pitch. Within the compatibility
+    // whole-cell allocation, reserve the measured base + rt extent without
+    // dropping the admitted design minimum: ruby may add cells, never remove
+    // cells that the same line without its annotation would occupy.
+    const requiredHeight = hasRuby ? Math.max(glyphNatural, cellCountHeight) : cellCountHeight;
+    return docGridLineCells(requiredHeight, pitchPx) * pitchPx;
   };
   const inheritedOnly = ls !== null && ls.explicit !== true;
   if (!ls) {
@@ -215,7 +217,7 @@ export function lineBoxHeight(
 
 /** Natural single-line height in px for an empty paragraph (no rendered text). */
 export function emptyLineNaturalPx(fontSizePt: number, scale: number): { asc: number; desc: number } {
-  return { asc: fontSizePt * scale * 0.8, desc: fontSizePt * scale * 0.2 };
+  return { asc: fontSizePt * scale * SYNTHETIC_ASCENT_EM, desc: fontSizePt * scale * SYNTHETIC_DESCENT_EM };
 }
 
 
@@ -224,8 +226,8 @@ export function measuredLineMetrics(
   fallbackEmPx: number,
 ): { ascent: number; descent: number } {
   return {
-    ascent: m.fontBoundingBoxAscent ?? m.actualBoundingBoxAscent ?? fallbackEmPx * 0.8,
-    descent: m.fontBoundingBoxDescent ?? m.actualBoundingBoxDescent ?? fallbackEmPx * 0.2,
+    ascent: m.fontBoundingBoxAscent ?? m.actualBoundingBoxAscent ?? fallbackEmPx * SYNTHETIC_ASCENT_EM,
+    descent: m.fontBoundingBoxDescent ?? m.actualBoundingBoxDescent ?? fallbackEmPx * SYNTHETIC_DESCENT_EM,
   };
 }
 
@@ -308,8 +310,12 @@ export function nativeCanvasLineRatio(
  *  the ascent/descent to locate the mark baseline within the box). */
 export interface MarkLineMetrics {
   readonly advancePx: number;
+  /** Grid-only leading below the centered own (natural/authored) box. */
+  readonly gridAfterLeadingPx: number;
   readonly ascentPx: number;
   readonly descentPx: number;
+  /** The mark face's intended single-line height. */
+  readonly intendedSinglePx: number;
 }
 
 
@@ -326,6 +332,9 @@ export function paragraphMarkLineMetrics(
   textLayoutService?: TextLayoutService,
   markShapeInput?: NumberingMarkerShapeInput,
   useFeLayout = false,
+  // px — a picture bullet on an empty list item stands on the mark line's
+  // baseline: its height is a minimum ascent of the mark line.
+  minimumAscentPx = 0,
 ): MarkLineMetrics {
   const effectiveMarkShapeInput = markShapeInput;
   // ECMA-376 §17.3.2.26 `w:rFonts@w:hint`: an empty paragraph has no code
@@ -333,7 +342,10 @@ export function paragraphMarkLineMetrics(
   // the face used to measure the mark. It does NOT make an otherwise Latin-only
   // paragraph occupy East-Asian docGrid cells: grid-cell classification remains
   // content/document based, independently of font routing.
-  const markUsesEastAsianFace = eastAsian || effectiveMarkShapeInput?.fontHint === 'eastAsia';
+  // WORD_PICTURE_BULLET_LINE_PARTICIPATION: beside a picture bullet the empty
+  // mark is measured with its own (non-East-Asian) face.
+  const markUsesEastAsianFace = (eastAsian && minimumAscentPx <= 0)
+    || effectiveMarkShapeInput?.fontHint === 'eastAsia';
   const forceCs = effectiveMarkShapeInput?.complexScript === true;
   const fs = effectiveMarkShapeInput?.fontSizePt ?? getDefaultFontSize(para);
   const authoredFamily = getDefaultFontFamily(para, markUsesEastAsianFace);
@@ -384,21 +396,22 @@ export function paragraphMarkLineMetrics(
     // The paragraph mark has no visible run, but Canvas selects its probe
     // through the same CSS face tuple as text. Resolve against the complete
     // resource set: an authored alias cannot disambiguate overlapping faces.
+    // The probe selects the mark's face but is never painted, so painted-glyph
+    // ownership does not apply (see metricCoversText).
     resolvedLocalFont = selectedFont
       ? selectResourceMetric(indexedFontMetrics(
           textLayoutService.fontMetrics ?? textLayoutService.localMetrics,
-        ), selectedFont, markProbe)
+        ), selectedFont, markProbe, false)
       : undefined;
     if (!naturalMetricAllowed && resolvedLocalFont?.designAscentRatio != null) {
       resolvedLocalFont = undefined;
     }
     referenceMarkMetric = naturalMetricAllowed
       && !resolvedLocalFont && mayUseAuthoredReferenceVerticalMetric(selectedFont)
-      ? referenceFontLineMetrics(
-          selectedFont.requestedFamily,
-          selectedFont.weight,
-          selectedFont.style,
-        )
+      && allowsReferenceFontMetric(indexedFontMetrics(
+        textLayoutService.fontMetrics ?? textLayoutService.localMetrics ?? {},
+      ), selectedFont)
+      ? authoredReferenceVerticalMetric(selectedFont, { text: textLayoutService, probe: markProbe })
       : undefined;
     if (naturalMetricAllowed && !resolvedLocalFont && !referenceMarkMetric
       && selectedFont?.source === 'native' && ctx) {
@@ -448,6 +461,11 @@ export function paragraphMarkLineMetrics(
     asc = designSides.designAscentRatio! * fs * scale;
     desc = designSides.designDescentRatio! * fs * scale;
   }
+  // WORD_PICTURE_BULLET_LINE_PARTICIPATION: an empty list item's picture
+  // bullet makes the mark line max(mark ascent, picture height) high above
+  // the baseline, and that whole box then follows the paragraph's line rule.
+  // Exact spacing ignores the picture (the caller passes no minimum).
+  asc = Math.max(asc, minimumAscentPx);
   const resourceRatio = markUsesEastAsianFace
     ? resolvedLocalFont?.eastAsianLineHeightRatio ?? resolvedLocalFont?.lineHeightRatio
     : resolvedLocalFont?.lineHeightRatio;
@@ -461,7 +479,10 @@ export function paragraphMarkLineMetrics(
   // Keep an untabled mark on the same 1.3em grid fallback as visible text.
   const intendedSingle = Math.max(designIntendedSingle, (nativeMarkRatio ?? 0) * fs * scale);
   const gridCountSingle = eastAsian
-    ? eastAsianGridCountSinglePx(designIntendedSingle, fs * scale)
+    ? Math.max(
+        eastAsianGridCountSinglePx(designIntendedSingle, fs * scale),
+        minimumAscentPx > 0 ? asc + desc : 0,
+      )
     : undefined;
   const ordinaryAdvancePx = lineBoxHeight(
     effectiveLineSpacing,
@@ -505,6 +526,7 @@ export function paragraphMarkLineMetrics(
       )
     : ordinaryAdvancePx;
   const advancePx = useFeLayout
+    // `word-use-fe-layout-empty-mark-grid-allocation`
     ? wordUseFeLayoutParagraphMarkGridAdvancePx({
         ordinaryAdvancePx,
         allocatedGridAdvancePx,
@@ -514,7 +536,19 @@ export function paragraphMarkLineMetrics(
         scale,
       })
     : ordinaryAdvancePx;
-  return { advancePx, ascentPx: asc, descentPx: desc };
+  // WORD_GRID_LINE_CONTENT_FIT_ADMISSION also covers an empty mark. Resolve
+  // its own box from the same selected font and spacing, without re-shaping.
+  // §17.6.5 grid allocation remains the full retained advance; authored exact,
+  // atLeast and automatic multiples never become an admission allowance.
+  const ownAdvancePx = lineBoxHeight(
+    effectiveLineSpacing, asc, desc, scale, undefined, paraHasRuby,
+    intendedSingle, eastAsian, gridCountSingle,
+  );
+  const gridAfterLeadingPx = isGridLineRule(grid)
+    ? Math.max(0, Math.min((advancePx - ownAdvancePx) / 2,
+        lineBelowBaselinePx(advancePx, asc, desc) - desc))
+    : 0;
+  return { advancePx, gridAfterLeadingPx, ascentPx: asc, descentPx: desc, intendedSinglePx: intendedSingle };
 }
 
 

@@ -27,6 +27,9 @@ import * as docxWasm from '@silurus/ooxml-docx/wasm';
 // @ts-ignore
 import * as xlsxWasm from '@silurus/ooxml-xlsx/wasm';
 import { parseTypedParserError } from '@silurus/ooxml-core/worker';
+// Keep parser-private decoding format-owned without loading DOCX layout/paint
+// into the Markdown adapter's source/CLI graph.
+import { withDocxParserErrors } from '@silurus/ooxml-docx/internal/parser-errors';
 
 type WasmModule = {
   initSync: (init: { module: WebAssembly.Module }) => unknown;
@@ -97,7 +100,9 @@ export function pptxToMarkdown(buffer: ArrayBuffer | Uint8Array): string {
  *  preserve vMerge continuation, footnotes/endnotes/comments are collated. */
 export function docxToMarkdown(buffer: ArrayBuffer | Uint8Array): string {
   if (!docxState.initialized) throw new Error('docx wasm not initialized — call initDocxFromBytes() first');
-  return project((docxWasm as unknown as { docx_to_markdown: (b: Uint8Array) => string }).docx_to_markdown, buffer);
+  return withDocxParserErrors(() => project(
+    (docxWasm as unknown as { docx_to_markdown: (b: Uint8Array) => string }).docx_to_markdown, buffer,
+  ));
 }
 
 /** Convert a `.xlsx` archive's bytes to GitHub-flavoured markdown. Each

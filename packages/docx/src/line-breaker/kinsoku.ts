@@ -6,24 +6,6 @@ import { createLineBreakerState } from './break-queue.js';
 import { RESET_SLICED_TEXT_MEASUREMENT, protectedNoBreakOffsets, slicedTextMetadata } from './advance.js';
 import { rebaseSeaBreaks } from './text-runs.js';
 
-/** Value equivalence of two resolved kinsoku rule sets, with a reference fast
- *  path. The reuse gate cannot rely on `===` alone: `resolveKinsokuRules` builds
- *  a FRESH object (fresh Sets) on every call, and canonical layout variants
- *  resolve it independently — same `doc.settings`, different references.
- *  Both derive from the same immutable settings so they are value-equal there;
- *  this check is pure defense so a genuinely different rule set (which would
- *  change CJK retract decisions in layoutLines) can never reuse stale lines. */
-export function kinsokuRulesEquivalent(a: KinsokuRules, b: KinsokuRules): boolean {
-  if (a === b) return true;
-  if (a.enabled !== b.enabled) return false;
-  const setEq = (x: Set<number>, y: Set<number>): boolean => {
-    if (x.size !== y.size) return false;
-    for (const cp of x) if (!y.has(cp)) return false;
-    return true;
-  };
-  return setEq(a.lineStartForbidden, b.lineStartForbidden) && setEq(a.lineEndForbidden, b.lineEndForbidden);
-}
-
 
 export type CrossRunKinsokuRetraction =
   | { readonly kind: 'none' }

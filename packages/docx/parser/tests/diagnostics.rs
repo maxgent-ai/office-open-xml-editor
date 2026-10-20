@@ -72,6 +72,12 @@ fn build_docx_with_parts(body: &str, styles: Option<&str>, footnotes: Option<&st
             zip.start_file("word/footnotes.xml", SimpleFileOptions::default())
                 .expect("footnotes entry");
             zip.write_all(footnotes.as_bytes()).expect("footnotes XML");
+            zip.start_file(
+                "word/_rels/footnotes.xml.rels",
+                SimpleFileOptions::default(),
+            )
+            .unwrap();
+            zip.write_all(format!(r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdImage" Type="{R_NS}/image" Target="media/image.png"/></Relationships>"#).as_bytes()).unwrap();
         }
         zip.finish().expect("finish zip");
     }
@@ -259,7 +265,7 @@ fn table_and_nested_table_diagnostics_use_the_owning_body_index() {
 }
 
 #[test]
-fn non_body_story_facts_do_not_claim_the_document_part() {
+fn non_body_story_facts_are_document_diagnostics_without_a_body_block_claim() {
     let footnotes = format!(
         r#"<w:footnotes xmlns:w="{W_NS}" xmlns:wp="{WP_NS}" xmlns:a="{A_NS}" xmlns:r="{R_NS}">
              <w:footnote w:id="1"><w:p><w:r>
@@ -275,9 +281,23 @@ fn non_body_story_facts_do_not_claim_the_document_part() {
     );
 
     assert_eq!(document["footnotes"].as_array().unwrap().len(), 1);
-    assert!(
-        document.get("diagnostics").is_none(),
-        "facts from word/footnotes.xml must not be mislabeled as word/document.xml"
+    assert_eq!(
+        document["diagnostics"],
+        json!([
+            {
+                "code": "UNSUPPORTED_TEXT_EFFECT",
+                "severity": "warning",
+                "part": "word/document.xml",
+                "path": []
+            },
+            {
+                "code": "INVALID_DRAWING_EXTENT",
+                "severity": "error",
+                "part": "word/document.xml",
+                "path": []
+            }
+        ]),
+        "story failures must be disclosed without naming an unrelated body block"
     );
 }
 

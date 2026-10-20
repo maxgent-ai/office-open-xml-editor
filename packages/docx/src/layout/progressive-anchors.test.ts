@@ -275,14 +275,14 @@ describe('progressive layout with page-owned anchors', () => {
   }, 300_000);
 
   it('lowers the bound to the reach page of a table placed at or past it', async () => {
-    // Two page-positioned tables whose bands collide: the second is deferred
-    // from the page where the flow reaches it to the next page (§17.4.56).
-    // A checkpoint whose live page holds the deferred table must not publish
-    // its reach page, because a later floor could still act there.
+    // A page-positioned table that ends below the bottom margin, with text
+    // before it on the page where the flow reaches it, moves to the next page
+    // (Windows Word #1902 controls). A checkpoint whose live page holds the
+    // moved table must not publish its reach page, because a later floor
+    // could still act there.
     const secondTableIndex = 62;
     const model = documentModel(300, [
-      [60, pageFloatingTable(300, 72, 3, 120, 0)],
-      [secondTableIndex, pageFloatingTable(300, 100, 3, 120, 0)],
+      [secondTableIndex, pageFloatingTable(300, 400, 3, 110, 0)],
     ]);
     const blocking = blockingLayout(model);
     const { reachedPage, placedPage } = tablePages(blocking.layout, secondTableIndex);
@@ -455,10 +455,19 @@ describe('page-table destination cycle settlement', () => {
     ]);
     model.section.pageHeight = 842;
     const { layout } = blockingLayout(model);
-    // Main alternates (0, 1) and (2, 3). Recovery pins those later floors;
-    // subsequent ordinary collision admission may move a table farther.
-    expect(tablePages(layout, 26).placedPage).toBe(2);
-    expect(tablePages(layout, 55).placedPage).toBeGreaterThanOrEqual(3);
+    // Main alternates (0, 1) and (2, 3). Each table's exclusion would push
+    // the text before it off its page, so it moves to the next page with that
+    // text (Windows Word #1902 controls); the text resumes below the table.
+    expect(tablePages(layout, 26).placedPage).toBe(1);
+    expect(tablePages(layout, 55).placedPage).toBe(3);
+    for (const index of [26, 55]) {
+      const page = layout.pages[tablePages(layout, index).placedPage]!;
+      const table = page.layers.body.find((node) => node.kind === 'table')!;
+      const lines = page.layers.body.flatMap((node) => node.kind === 'paragraph' ? node.lines : []);
+      expect(lines.length).toBeGreaterThan(0);
+      expect(lines.every((line) =>
+        line.bounds.yPt >= table.flowBounds.yPt + table.flowBounds.heightPt)).toBe(true);
+    }
   });
 
   it('settles the coupled T1/T2/T3 cycle deterministically without overlapping body text', () => {
@@ -467,14 +476,16 @@ describe('page-table destination cycle settlement', () => {
     expect(layoutFingerprint(blockingLayout(model).layout)).toBe(layoutFingerprint(layout));
     expect(layout.pages.flatMap((page) => page.layers.body)
       .filter((node) => node.kind === 'table')).toHaveLength(3);
+    // T1 and T2 each move off the page whose text they would cover. Both
+    // permit overlap, so they may share page 1 overlapping each other
+    // (§17.4.56; Windows Word #1902 controls); body text never sits under one.
+    expect([13, 15, 33].map((index) => tablePages(layout, index).placedPage)).toEqual([1, 1, 2]);
     for (const page of layout.pages) {
       const tables = page.layers.body.filter((node) => node.kind === 'table');
       const lines = page.layers.body.flatMap((node) => node.kind === 'paragraph' ? node.lines : []);
-      const bands = [...tables.map((table) => table.flowBounds), ...lines.map((line) => line.bounds)];
       for (const table of tables) {
-        for (const b of bands) {
+        for (const b of lines.map((line) => line.bounds)) {
           const a = table.flowBounds;
-          if (a === b) continue;
           expect(a.xPt >= b.xPt + b.widthPt || b.xPt >= a.xPt + a.widthPt
             || a.yPt >= b.yPt + b.heightPt || b.yPt >= a.yPt + a.heightPt).toBe(true);
         }

@@ -31,11 +31,11 @@ const CONTRACT_MISMATCH = {
   message: 'The parser diagnostic contract did not match this renderer build',
 } as const;
 
-const NATIVE_DOC_FRAME_FLOW = {
+const NESTED_CELL_FRAME_FLOW = {
   code: 'UNSUPPORTED_FEATURE',
   severity: 'warning',
   source: { story: 'body', storyInstance: 'body', path: [0] },
-  message: 'Native DOC nested-cell paragraph frames are retained but laid out in ordinary cell flow; Word frame positioning is not implemented',
+  message: 'Nested-cell paragraph frames are retained but laid out in ordinary cell flow; their frame positioning is not implemented for this source',
 } as const;
 
 const section: SectionProps = {
@@ -153,18 +153,18 @@ describe('private parser diagnostic mapping', () => {
     }]);
   });
 
-  it('accepts the native DOC frame-flow fact only from the exact WordDocument part', () => {
+  it('accepts the nested-cell frame-flow fact only from the exact producer document part', () => {
     expect(mapParseDiagnostics([
-      wire('NATIVE_DOC_NESTED_CELL_FRAME_FLOW', 'warning', [0], 'WordDocument'),
-    ], 1)).toEqual([NATIVE_DOC_FRAME_FLOW]);
+      wire('NESTED_CELL_FRAME_FLOW', 'warning', [0], 'document'),
+    ], 1)).toEqual([NESTED_CELL_FRAME_FLOW]);
 
-    // Each code is bound to one exact part: neither source format can claim
-    // the other's fact, and no near-miss part or severity is normalized.
+    // Each code is bound to one exact part: neither producer can claim the
+    // other's fact, and no near-miss part or severity is normalized.
     for (const candidate of [
-      wire('NATIVE_DOC_NESTED_CELL_FRAME_FLOW', 'warning', [0]),
-      wire('NATIVE_DOC_NESTED_CELL_FRAME_FLOW', 'warning', [0], 'worddocument'),
-      wire('NATIVE_DOC_NESTED_CELL_FRAME_FLOW', 'error', [0], 'WordDocument'),
-      wire('UNSUPPORTED_TEXT_EFFECT', 'warning', [0], 'WordDocument'),
+      wire('NESTED_CELL_FRAME_FLOW', 'warning', [0]),
+      wire('NESTED_CELL_FRAME_FLOW', 'warning', [0], 'Document'),
+      wire('NESTED_CELL_FRAME_FLOW', 'error', [0], 'document'),
+      wire('UNSUPPORTED_TEXT_EFFECT', 'warning', [0], 'document'),
     ]) {
       expect(mapParseDiagnostics([candidate], 1)).toEqual([CONTRACT_MISMATCH]);
     }
@@ -218,14 +218,14 @@ describe('private parser diagnostic mapping', () => {
     ));
   });
 
-  it('attaches the native DOC frame-flow warning to the final production layout', () => {
+  it('attaches the nested-cell frame-flow warning to the final production layout', () => {
     const model = document([
-      wire('NATIVE_DOC_NESTED_CELL_FRAME_FLOW', 'warning', [0], 'WordDocument'),
+      wire('NESTED_CELL_FRAME_FLOW', 'warning', [0], 'document'),
     ]);
     const services = createLayoutServices(model, { measureContext: measureContext() });
 
     expect(layoutDocument(model, services, { currentDateMs: 0 }).diagnostics)
-      .toEqual([NATIVE_DOC_FRAME_FLOW]);
+      .toEqual([NESTED_CELL_FRAME_FLOW]);
   });
 
   it('crosses acquisition once and freezes the final layout diagnostic graph', () => {

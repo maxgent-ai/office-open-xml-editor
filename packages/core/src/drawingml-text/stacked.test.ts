@@ -1,8 +1,10 @@
+import referenceData from '../fonts/reference-font-metrics-data.json';
 import { describe, expect, it } from 'vitest';
 import { layoutStackedText, type StackedParagraph, type StackedLayoutOptions } from './stacked.js';
 import {
-  stackedCellBoxOverride, stackedFaceBox, stackedSidewaysCharacter, stackedVerticalGlyph, STACKED_CELL_FACTOR,
+  stackedFaceBox, stackedVerticalGlyph, STACKED_CELL_FACTOR, STACKED_SIDEWAYS,
 } from './stacked-faces.js';
+import { stackedClusters, stackedVerticalGlyphText } from './stacked-glyphs.js';
 
 // Arial 24 pt at 1 px/pt: cell = 7/6 × usWin (1.1172 em) × 24 = 31.28.
 const CELL = STACKED_CELL_FACTOR * (2288 / 2048) * 24;
@@ -127,24 +129,100 @@ describe('layoutStackedText input size', () => {
 });
 
 describe('stacked face and character tables', () => {
-  it('uses measured boxes for the faces that do not follow their font tables', () => {
-    expect(stackedCellBoxOverride('游ゴシック')).toBe(1.5084);
-    expect(stackedCellBoxOverride('SimSun')).toBe(1.038);
-    expect(stackedCellBoxOverride('Yu Mincho')).toBeUndefined();
+  it('uses usWin metrics even for formerly fitted faces and their aliases', () => {
+    expect(stackedFaceBox('游ゴシック', false, false)).toEqual({ ascent: 2017 / 2048, descent: 619 / 2048 });
+    expect(stackedFaceBox('SimSun', false, false)).toEqual({ ascent: 220 / 256, descent: 36 / 256 });
+    expect(stackedFaceBox('Yu Gothic', true, false)).toEqual({ ascent: 2024 / 2048, descent: 612 / 2048 });
     const light = stackedFaceBox('Yu Mincho Light', false, false);
     expect((light?.ascent ?? 0) + (light?.descent ?? 0)).toBeCloseTo(2636 / 2048, 6);
     expect(stackedFaceBox('No Such Face', false, false)).toBeUndefined();
   });
 
-  it('turns only the measured set sideways and knows which faces have vertical glyphs', () => {
-    const cp = (c: string) => c.codePointAt(0) as number;
-    for (const c of '(（「、ー…∥') expect(stackedSidewaysCharacter(cp(c)), c).toBe(true);
-    for (const c of '，．：-!—ぁ〜A日') expect(stackedSidewaysCharacter(cp(c)), c).toBe(false);
-    expect(stackedVerticalGlyph('Yu Gothic', cp('∥'))).toBe(true);
-    expect(stackedVerticalGlyph('Meiryo', cp('∥'))).toBe(false);
-    expect(stackedVerticalGlyph('ＭＳ ゴシック', cp('（'))).toBe(true);
-    expect(stackedVerticalGlyph('Yu Gothic', cp('('))).toBe(false);
-    expect(stackedVerticalGlyph('Arial', cp('（'))).toBe(false);
+  it('uses typo metrics including lineGap when USE_TYPO_METRICS is set', () => {
+    // Gabriola's usWin box (7540 units) differs from its typo box (6963).
+    expect(stackedFaceBox('Gabriola', false, false)).toEqual({ ascent: (2800 + 2867) / 4096, descent: 1296 / 4096 });
+  });
+
+  it('does not shrink the typo box for a negative lineGap', () => {
+    // Tamil Sangam MN sets USE_TYPO_METRICS with sTypoLineGap = -210.
+    expect(stackedFaceBox('Tamil Sangam MN', false, false))
+      .toEqual({ ascent: 1550 / 2048, descent: 717 / 2048 });
+  });
+
+  it('uses the requested face coverage when weights differ, including named aliases', () => {
+    const cp = (ch: string) => ch.codePointAt(0) as number;
+    expect(stackedVerticalGlyph('Microsoft JhengHei', cp('ー'))).toBe(true);
+    expect(stackedVerticalGlyph('Microsoft JhengHei', cp('ー'), true)).toBe(false);
+    expect(stackedVerticalGlyph('MicrosoftJhengHeiBold', cp('ー'))).toBe(false);
+    expect(stackedVerticalGlyph('Yu Gothic', cp('〈'))).toBe(true);
+    expect(stackedVerticalGlyph('Yu Gothic Medium', cp('〈'))).toBe(false);
+  });
+
+  it('preserves bold coverage and metrics when the italic face is missing', () => {
+    for (const ch of 'ー‥') {
+      const cp = ch.codePointAt(0) as number;
+      expect(stackedVerticalGlyph('Microsoft JhengHei', cp, true, true)).toBe(false);
+      expect(stackedVerticalGlyph('MicrosoftJhengHeiBold', cp, true, true)).toBe(false);
+    }
+    // Yu Gothic's bold face box differs from Regular, unlike JhengHei's.
+    expect(stackedFaceBox('Yu Gothic', true, true))
+      .toEqual({ ascent: 2024 / 2048, descent: 612 / 2048 });
+  });
+
+  it('uses regular coverage and metrics when only italic is requested but missing', () => {
+    for (const ch of 'ー‥') {
+      expect(stackedVerticalGlyph('Microsoft JhengHei', ch.codePointAt(0) as number, false, true)).toBe(true);
+    }
+    expect(stackedFaceBox('Yu Gothic', false, true))
+      .toEqual({ ascent: 2017 / 2048, descent: 619 / 2048 });
+  });
+
+  it('retains a named weight when the requested weight is missing', () => {
+    for (const [bold, italic] of [[false, false], [true, true]] as const) {
+      // Medium has no vert substitution for 〈, whereas Regular does.
+      expect(stackedVerticalGlyph('Yu Gothic Medium', 0x3008, bold, italic)).toBe(false);
+      expect(stackedVerticalGlyph('Yu Gothic Medium', 0xff08, bold, italic)).toBe(true);
+      expect(stackedFaceBox('Yu Gothic Medium', bold, italic))
+        .toEqual({ ascent: 2028 / 2048, descent: 608 / 2048 });
+    }
+  });
+
+  it('measures only the measured set sideways, upright in faces with vert glyphs', () => {
+    const advances = { upright: 10, verticalGlyph: 20, rotated: (ch: string) => 30 + ch.length };
+    const kinds = (family: string, text: string, bold = false) =>
+      stackedClusters(text, { family, bold, italic: false }, advances)
+        .map((c) => (c.nominal ? 'n' : c.kind[0])).join('');
+    // u = upright, v = vertical glyph (vert), n = unturned nominal glyph in a
+    // 1 em cell (vrt2 only, outside Basic Latin), r = rotated.
+    expect(kinds('ＭＳ ゴシック', '(（「、ー…∥，．：-!—ぁ〜A日')).toBe('rvvvvvv' + 'u'.repeat(10));
+    // #1827 PowerPoint controls: ∥ is vrt2-only in Yu Gothic, Meiryo and Yu
+    // Mincho and stood unturned; the vrt2-only ASCII brackets still turned.
+    for (const family of ['Yu Gothic', 'Yu Gothic Medium', 'Yu Gothic UI', 'Meiryo', 'Meiryo UI', 'Yu Mincho']) {
+      for (const bold of [false, true]) expect(kinds(family, '(<[{（∥', bold), family).toBe('rrrrvn');
+    }
+    expect(kinds('ＭＳ 明朝', '(∥')).toBe('rv');
+    expect(kinds('Arial', '(（')).toBe('rr');
+    expect(kinds('Yu Mincho Light', '（')).toBe('v');
+    expect(kinds('Arial Unicode MS', '(')).toBe('v');
+    expect(kinds('No Such Face', '（')).toBe('r');
+    // One cell per grapheme cluster, classed by its base; advances by class.
+    expect(stackedClusters('（́A(', { family: 'MS Gothic', bold: false, italic: false }, advances))
+      .toEqual([
+        { text: '（́', kind: 'verticalGlyph', advance: 20 },
+        { text: 'A', kind: 'upright', advance: 10 },
+        { text: '(', kind: 'rotated', advance: 31 },
+      ]);
+    // Paragraph markers stand upright whatever their characters.
+    expect(stackedClusters('（', { family: 'MS Gothic', bold: false, italic: false }, advances, true)[0].kind)
+      .toBe('upright');
+  });
+
+  it('draws a lone vert glyph as its presentation form and a nominal glyph as itself', () => {
+    expect(stackedVerticalGlyphText({ text: '（' })).toBe('︵');
+    expect(stackedVerticalGlyphText({ text: '、' })).toBe('︑');
+    expect(stackedVerticalGlyphText({ text: '（́' })).toBeNull();
+    expect(stackedVerticalGlyphText({ text: 'ー' })).toBeNull();
+    expect(stackedVerticalGlyphText({ text: '∥', nominal: true })).toBe('∥');
   });
 });
 
@@ -182,4 +260,26 @@ it.each(['wordArtVert', 'wordArtVertRtl'] as const)('%s preserves blank display 
     ]);
     expect(b.axisX - a.axisX).toBeCloseTo(display ? (direction === 'wordArtVert' ? 2 : -2) * CELL : 0);
   }
+});
+
+// The prefix is atomic: it consumes the first column's wrap/alignment budget,
+// never repeats on a continuation, and participates in that column's thickness.
+it('includes an atomic prefix in first-column wrapping, alignment and anchoring', () => {
+  const p = para(['ABC'], { firstLineIndent: -CELL / 2,
+    firstLinePrefix: { advance: 2 * CELL, thickness: 2 * CELL } });
+  const l = layoutStackedText([p], options({ rect: { ...RECT, height: 3 * CELL } }));
+  expect(l.glyphs.map(g => [g.text, g.column, g.cellTop / CELL])).toEqual([
+    ['A', 0, 1.5], ['B', 1, 0], ['C', 1, 1],
+  ]);
+  expect(l.columns[0].thickness).toBe(2 * CELL);
+  expect(l.columns[0].prefixTop).toBeCloseTo(-CELL / 2);
+  expect(l.columns[1].prefixTop).toBeUndefined();
+  const centered = layoutStackedText([para(['A'], { firstLinePrefix: p.firstLinePrefix })],
+    options({ rect: { ...RECT, height: 4 * CELL }, anchorCtr: true }));
+  expect(centered.columns[0].prefixTop).toBeCloseTo(CELL / 2);
+  expect(centered.glyphs[0].cellTop).toBeCloseTo(2.5 * CELL);
+});
+
+it('keeps the generator coverage domain identical to the stacked sideways classifier', () => {
+  expect([...referenceData.stackedSideways].map((ch) => ch.codePointAt(0))).toEqual([...STACKED_SIDEWAYS]);
 });

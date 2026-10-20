@@ -194,7 +194,8 @@ retained_struct!(DxfFontToggles {
     bold,
     italic,
     underline,
-    strike
+    strike,
+    automatic_color
 });
 
 retained_struct!(Fill {
@@ -262,7 +263,8 @@ retained_struct!(ImageAnchor {
     svg_image_path,
     src_rect,
     alpha,
-    duotone
+    duotone,
+    blip_effects
 });
 
 retained_struct!(NumFmt {
@@ -492,13 +494,15 @@ impl RetainedBytes for ShapeGeom {
                 src_rect,
                 alpha,
                 duotone,
+                blip_effects,
             } => 0u64
                 .saturating_add(image_path.heap_bytes())
                 .saturating_add(mime_type.heap_bytes())
                 .saturating_add(svg_image_path.heap_bytes())
                 .saturating_add(src_rect.heap_bytes())
                 .saturating_add(alpha.heap_bytes())
-                .saturating_add(duotone.heap_bytes()),
+                .saturating_add(duotone.heap_bytes())
+                .saturating_add(blip_effects.heap_bytes()),
         }
     }
 }
@@ -666,6 +670,8 @@ retained_struct!(TableInfo {
     last_column_dxf,
     band1_horizontal_dxf,
     band2_horizontal_dxf,
+    style_elements,
+    style_error,
     columns
 });
 

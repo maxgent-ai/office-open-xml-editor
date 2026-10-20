@@ -1,9 +1,11 @@
+import { counterRotatedFillTransform } from './fill-frame';
 import type { Fill, GradientFill, PatternFill, Stroke } from '../types/common';
 import { buildPatternBitmap } from './pattern-bitmaps';
 import { resolveStrokeGeometry, type ResolvedStrokeGeometry } from './stroke-geometry';
 import { createAuxCanvasForContext } from '../canvas/aux-canvas';
-import { resolvePathShade, type FillOutline, type ShadeBox } from './path-gradient';
+import { pathShadeWorkspaceBytes, resolvePathShade, type FillOutline, type ShadeBox } from './path-gradient';
 import { hostStrokeBounds, paintPathSource } from './paint-bounds';
+import { brushSurfaceUnavailable } from '../canvas/strict-brush-surface';
 
 const MAX_GRADIENT_TILE_EDGE = 512;
 
@@ -53,8 +55,8 @@ function tiledGradient(
   const baseH = Math.max(1, Math.ceil(Math.abs(tileH) * scale));
   const base = createAuxCanvasForContext(ctx, baseW, baseH);
   const baseCtx = base?.getContext('2d');
-  if (!base || !baseCtx) return null;
-  const tileFill = { ...fill, tileRect: undefined, flip: undefined };
+  if (!base || !baseCtx) return brushSurfaceUnavailable();
+  const tileFill = { ...fill, tileRect: undefined, flip: undefined, rotWithShape: true };
   // Tiled rect/shape shades are outside the measured untiled model (#1599).
   // ECMA-376 §20.1.8.31 and [MS-OE376] §2.1.1377 differ on the focus frame;
   // point-focus exports do not settle live tiled inscribed-area geometry.
@@ -63,7 +65,7 @@ function tiledGradient(
   const basePaint = fill.gradType === 'radial'
     ? nativeRadialFill(tileFill, baseCtx as CanvasRenderingContext2D, { x: 0, y: 0, w: baseW, h: baseH })
     : resolveFill(tileFill, baseCtx as CanvasRenderingContext2D, 0, 0, baseW, baseH, shapeRotationDeg);
-  if (!basePaint) return null;
+  if (!basePaint) return brushSurfaceUnavailable();
   baseCtx.fillStyle = basePaint;
   baseCtx.fillRect(0, 0, baseW, baseH);
 
@@ -75,7 +77,7 @@ function tiledGradient(
     const repeatH = baseH * (flipY ? 2 : 1);
     const repeat = createAuxCanvasForContext(ctx, repeatW, repeatH);
     const repeatCtx = repeat?.getContext('2d');
-    if (!repeat || !repeatCtx) return null;
+    if (!repeat || !repeatCtx) return brushSurfaceUnavailable();
     for (let row = 0; row < (flipY ? 2 : 1); row += 1) {
       for (let col = 0; col < (flipX ? 2 : 1); col += 1) {
         repeatCtx.save();
@@ -88,27 +90,29 @@ function tiledGradient(
     patternSource = repeat;
   }
   const pattern = ctx.createPattern(patternSource, 'repeat');
-  if (!pattern || typeof pattern.setTransform !== 'function') return null;
-  pattern.setTransform({
+  if (!pattern || typeof pattern.setTransform !== 'function') return brushSurfaceUnavailable();
+  pattern.setTransform(counterRotatedFillTransform({
     a: tileW / baseW,
     b: 0,
     c: 0,
     d: tileH / baseH,
     e: tileX,
     f: tileY,
-  });
+  }, fill.rotWithShape === false ? shapeRotationDeg : 0, x + w / 2, y + h / 2));
   return pattern;
 }
 
-/** Compatibility fallback, deliberately identical to the previous native
- * radial resolver: authored midpoint and max-axis radius for rect, diagonal
- * radius for circle/shape. Resource/allocation rejection must preserve these
- * bytes rather than recursively changing the authored path type.
+/** Native fallback retains the previous midpoint/radius approximation:
+ * authored midpoint and max-axis radius for rect, diagonal radius for
+ * circle/shape. Resource/allocation rejection must preserve that shading
+ * model rather than recursively changing the authored path type.
  * ECMA-376 §20.1.8.31 defines the center-shade rectangle. Native Canvas has
  * only a point focus, so this approximation uses its authored midpoint.
  * Concentric PowerPoint PDF exports do not establish a general live circle
- * focus rule; retain the previous local-frame reading pending evidence. */
-function nativeRadialFill(fill: GradientFill, ctx: CanvasRenderingContext2D, box: ShadeBox): CanvasGradient {
+ * focus rule; retain the midpoint approximation. The complete focus frame
+ * still honors rotWithShape (§20.1.8.33), as all gradient styles must. */
+function nativeRadialFill(fill: GradientFill, ctx: CanvasRenderingContext2D, box: ShadeBox,
+  rotation = 0, shapeBox = box): CanvasGradient {
   const focus = fill.fillToRect;
   const focusX = box.x + box.w * (focus?.l ?? 0);
   const focusY = box.y + box.h * (focus?.t ?? 0);
@@ -118,7 +122,10 @@ function nativeRadialFill(fill: GradientFill, ctx: CanvasRenderingContext2D, box
   const rx = Math.max(Math.abs(cx - box.x), Math.abs(box.x + box.w - cx));
   const ry = Math.max(Math.abs(cy - box.y), Math.abs(box.y + box.h - cy));
   const radius = fill.path === 'rect' ? Math.max(rx, ry) : Math.sqrt(rx * rx + ry * ry);
-  const gradient = ctx.createRadialGradient(cx, cy, 0, cx, cy, Math.max(radius, 1e-9));
+  const focusFrame = counterRotatedFillTransform({ e: cx, f: cy },
+    fill.rotWithShape === false ? rotation : 0, shapeBox.x + shapeBox.w / 2, shapeBox.y + shapeBox.h / 2);
+  const gradient = ctx.createRadialGradient(focusFrame.e ?? cx, focusFrame.f ?? cy, 0,
+    focusFrame.e ?? cx, focusFrame.f ?? cy, Math.max(radius, 1e-9));
   for (const stop of fill.stops) {
     gradient.addColorStop(Math.min(1, Math.max(0, stop.position)), hexToRgba(stop.color));
   }
@@ -196,6 +203,17 @@ export function autoContrastColor(bgHex: string | null): '#000000' | '#FFFFFF' {
   return relativeLuma(bgHex) < 128 ? '#FFFFFF' : '#000000';
 }
 
+/** Bounded auxiliary surfaces used while producing one shared fill brush.
+ * This excludes the caller-owned destination canvas/readback and decoded
+ * image, which are charged by the image owner/effect planner separately. */
+export function fillPaintWorkspaceBytes(fill: Readonly<Pick<Fill, 'fillType'>> & { readonly gradType?: string; readonly path?: string; readonly tileRect?: unknown }): number {
+  if (fill.fillType === 'pattern') return 64 * 64 * 4;
+  if (fill.fillType !== 'gradient') return 0;
+  if (fill.tileRect) return MAX_GRADIENT_TILE_EDGE ** 2 * 4 * 5;
+  if (fill.gradType === 'radial' && (fill.path === 'shape' || fill.path === 'rect')) return pathShadeWorkspaceBytes();
+  return 0;
+}
+
 /**
  * Resolve a Fill to a CanvasRenderingContext2D-compatible paint.
  * Gradients require pixel bounds (x, y, w, h) to construct the CanvasGradient.
@@ -239,6 +257,9 @@ function resolveFillImpl(
     );
   }
   if (fill.fillType === 'gradient') {
+    // Reflection reverses the local rotation sign, while retaining the flip.
+    const ctm = ctx.getTransform?.();
+    if (ctm && ctm.a * ctm.d - ctm.b * ctm.c < 0) shapeRotationDeg = -shapeRotationDeg;
     const stops = fill.stops;
     if (stops.length === 0) return null;
     if (stops.length === 1) return hexToRgba(stops[0].color);
@@ -254,22 +275,21 @@ function resolveFillImpl(
     const tileH = h * (1 - (tile?.t ?? 0) - (tile?.b ?? 0));
     if (pathShading && usesPathShade(fill)) {
       // Canvas has no shape-following shade; resolvePathShade rasterizes it.
-      // Unsupported topology, resource limits and allocation-unavailable
+      // Unsupported topology and allocation-unavailable
       // hosts retain main's path-specific native approximation. Its midpoint focus
       // is unchanged: the Office fallback classifier is outside this feature.
       return resolvePathShade(
         fill, ctx, { x: tileX, y: tileY, w: tileW, h: tileH }, { x, y, w, h }, outline,
         paintBounds ?? hostStrokeBounds(ctx, { x, y, w, h }),
-      ) ?? nativeRadialFill(fill, ctx, { x: tileX, y: tileY, w: tileW, h: tileH });
+        undefined, fill.rotWithShape === false ? shapeRotationDeg : 0,
+      ) ?? nativeRadialFill(fill, ctx, { x: tileX, y: tileY, w: tileW, h: tileH }, shapeRotationDeg, { x, y, w, h });
     }
     if (fill.gradType === 'radial') {
       // Different tile frames, invalid tile extents and charts stay native.
       // Tiling is out of scope; failure to build a repeat is not raster support.
-      return nativeRadialFill(fill, ctx, { x: tileX, y: tileY, w: tileW, h: tileH });
+      return nativeRadialFill(fill, ctx, { x: tileX, y: tileY, w: tileW, h: tileH }, shapeRotationDeg, { x, y, w, h });
     } else {
-      const authoredAngle = fill.rotWithShape === false
-        ? fill.angle - shapeRotationDeg
-        : fill.angle;
+      const authoredAngle = fill.angle;
       const rad = (authoredAngle * Math.PI) / 180;
       let dx = Math.cos(rad);
       let dy = Math.sin(rad);
@@ -287,10 +307,10 @@ function resolveFillImpl(
       const cx = tileX + tileW / 2;
       const cy = tileY + tileH / 2;
       const gradLen = (Math.abs(dx) * tileW + Math.abs(dy) * tileH) / 2;
-      gradient = ctx.createLinearGradient(
-        cx - dx * gradLen, cy - dy * gradLen,
-        cx + dx * gradLen, cy + dy * gradLen,
-      );
+      const rotation = fill.rotWithShape === false ? shapeRotationDeg : 0;
+      const start = counterRotatedFillTransform({ e: cx - dx * gradLen, f: cy - dy * gradLen }, rotation, x + w / 2, y + h / 2);
+      const end = counterRotatedFillTransform({ e: cx + dx * gradLen, f: cy + dy * gradLen }, rotation, x + w / 2, y + h / 2);
+      gradient = ctx.createLinearGradient(start.e!, start.f!, end.e!, end.f!);
     }
     // Two-stop midpoint/transfer behaviour is out of scope (#1599): PowerPoint's
     // primary-colour exports do not determine a general blend rule, and Word/
