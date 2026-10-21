@@ -39,7 +39,7 @@ const loadEmfPlayer = () => import('./emf.js');
  * reproduce all of its content (unimplemented records, an EMF+-only stream
  * that fails validation, damaged records; see `EmfRasterResult` in emf.ts).
  * Resource ceilings always throw a typed limit error before this policy runs.
- * WMF detection currently covers EXTTEXTOUT exclusions, not every skipped
+ * WMF detection currently covers TEXTOUT/EXTTEXTOUT exclusions, not every skipped
  * drawing record; a missing report is not a general fidelity guarantee.
  *
  * - `'draw-supported'` (default): return what playback drew, with the gap

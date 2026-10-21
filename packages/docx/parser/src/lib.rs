@@ -1129,6 +1129,26 @@ mod tests {
             .is_some_and(|error| error.starts_with("word/document.xml:")));
     }
 
+    #[test]
+    fn partial_local_sizes_with_data_descriptors_parse() {
+        use std::io::Write;
+        let main = br#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>descriptor compatibility</w:t></w:r></w:p></w:body></w:document>"#;
+        let mut writer = zip::ZipWriter::new_stream(Vec::new());
+        writer
+            .start_file(
+                "word/document.xml",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        writer.write_all(main).unwrap();
+        parser::write_test_content_types(&mut writer);
+        let mut bytes = writer.finish().unwrap().into_inner();
+        // Converter-style bit-3 header: only the uncompressed size is filled.
+        bytes[22..26].copy_from_slice(&(main.len() as u32).to_le_bytes());
+        let parsed = parse_docx_native(&bytes).expect("partial local sizes are compatible");
+        assert!(parsed.contains("descriptor compatibility"));
+    }
+
     /// Input that is not a WordprocessingML package fails closed at every public
     /// Rust boundary instead of materializing a placeholder with a 0x0 section.
     #[test]

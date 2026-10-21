@@ -1,6 +1,6 @@
 {
   "name": "@silurus/ooxml-site",
-  "version": "0.89.0",
+  "version": "0.89.2",
   "private": true,
   "type": "module",
   "description": "Showcase / marketing site for @silurus/ooxml",

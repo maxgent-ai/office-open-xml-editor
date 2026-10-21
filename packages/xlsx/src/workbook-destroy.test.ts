@@ -9,7 +9,7 @@ import {
   type FontPreloadEntry,
   type OffscreenFactory,
 } from '@silurus/ooxml-core';
-import { XlsxWorkbook, retainXlsxViewerFonts } from './workbook.js';
+import { XlsxWorkbook, acquireXlsxWorksheetPreview, retainXlsxViewerFonts } from './workbook.js';
 
 /**
  * `XlsxWorkbook.destroy()` tears the parser worker down via
@@ -26,7 +26,7 @@ class SilentWorker implements WorkerLike {
   constructor() {
     SilentWorker.instances.push(this);
   }
-  postMessage(): void {}
+  postMessage(_message: unknown): void {}
   addEventListener(): void {}
   removeEventListener(): void {}
   terminated = false;
@@ -117,6 +117,35 @@ describe('XlsxWorkbook.destroy() — rejects in-flight worker requests', () => {
     wb.destroy();
     expect(worker.terminated).toBe(true);
     await expect(inFlight).rejects.toThrow(/terminated/i);
+  });
+
+  it('observes the sheet completion when destroyed before a preview is ready', async () => {
+    const { wb, worker } = makeWorkbook();
+    const workbook = wb as XlsxWorkbook;
+    Object.assign(workbook, {
+      parsedWorkbook: { workbook: { sheets: [{ name: 'Sheet1' }] }, sharedStrings: [], styles: {} },
+    });
+    let opened!: () => void;
+    const opening = new Promise<void>((resolve) => { opened = resolve; });
+    vi.spyOn(worker, 'postMessage').mockImplementation((message) => {
+      if ((message as { type?: string }).type === 'openSheetSession') opened();
+    });
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      const preview = acquireXlsxWorksheetPreview(workbook, 0);
+      // Keep the real WorkerBridge request pending until teardown rejects it.
+      await opening;
+      workbook.destroy();
+      await expect(preview).rejects.toThrow('XLSX workbook has been destroyed');
+      await flush();
+      expect(worker.terminated).toBe(true);
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+      workbook.destroy();
+    }
   });
 
   it('is safe to call destroy() twice', () => {

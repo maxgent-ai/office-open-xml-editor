@@ -83,20 +83,16 @@ function concat(...parts: Uint8Array[]): Uint8Array {
 // WMF record function codes
 const FN = {
   EOF: 0x0000,
-  SETTEXTALIGN: 0x012e,
-  SETTEXTCOLOR: 0x0209,
   SETPOLYFILLMODE: 0x0106,
   SETWINDOWORG: 0x020b,
   SETWINDOWEXT: 0x020c,
   SELECTOBJECT: 0x012d,
   DELETEOBJECT: 0x01f0,
-  TEXTOUT: 0x0521,
   POLYGON: 0x0324,
   POLYLINE: 0x0325,
   POLYPOLYGON: 0x0538,
   RECTANGLE: 0x041b,
   CREATEPENINDIRECT: 0x02fa,
-  CREATEFONTINDIRECT: 0x02fb,
   CREATEBRUSHINDIRECT: 0x02fc,
   STRETCHDIBITS: 0x0f43,
 } as const;
@@ -487,43 +483,6 @@ describe('playWmf — object table create / delete / slot reuse', () => {
 });
 
 // ── playWmf: text-out labels ────────────────────────────────────────────────
-
-describe('playWmf — TEXTOUT text labels', () => {
-  it('draws a META_TEXTOUT string with the selected font color at the mapped point', () => {
-    const text = '10';
-    const file = concat(
-      wmfHeader(),
-      record(FN.SETWINDOWORG, (w) => w.i16(0).i16(0)),
-      record(FN.SETWINDOWEXT, (w) => w.i16(100).i16(100)),
-      record(FN.CREATEFONTINDIRECT, (w) => {
-        w.i16(-12).i16(0).i16(0).i16(0).i16(400);
-        w.raw(0, 0, 0, 0, 0, 0, 0, 0);
-        const face = Array.from(Buffer.from('Arial\0', 'latin1'));
-        w.raw(...face);
-        for (let i = face.length; i < 32; i++) w.raw(0);
-      }),
-      record(FN.SELECTOBJECT, (w) => w.u16(0)),
-      record(FN.SETTEXTCOLOR, (w) => w.u32(0x000000ff)), // red
-      record(FN.SETTEXTALIGN, (w) => w.u16(0x0006)), // TA_CENTER
-      record(FN.TEXTOUT, (w) => {
-        w.u16(text.length);
-        w.raw(...Array.from(Buffer.from(text, 'latin1')));
-        w.i16(30).i16(20); // yStart, xStart
-      }),
-      record(FN.EOF, () => {}),
-    );
-
-    const m = makeRecordingCtx();
-    expect(playWmf(file, m.ctx, 100, 100)).toBe(true);
-
-    const texts = m.calls.filter((c) => c.op === 'fillText');
-    expect(texts).toHaveLength(1);
-    expect(texts[0].args).toEqual(['10', 20, 30]);
-    expect(m.styles.text.at(-1)?.toLowerCase()).toBe('#ff0000');
-    expect(m.ctx.textAlign).toBe('center');
-    expect(m.ctx.textBaseline).toBe('top');
-  });
-});
 
 // ── playWmf: graceful bail on malformed records ─────────────────────────────
 

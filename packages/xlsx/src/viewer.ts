@@ -320,6 +320,39 @@ export interface XlsxViewerOptions extends XlsxSheetViewerOptions {
   showZoomSlider?: boolean;
 }
 
+/** Every {@link LoadOptions} field a self-loading Viewer must forward to
+ *  {@link XlsxWorkbook}. Mapping over `keyof LoadOptions` makes a newly added
+ *  load option a type error here until it is forwarded, so the viewer path
+ *  cannot silently drop it while the workbook API honours it (#1917). */
+type ForwardedViewerLoadOptions = {
+  [K in Exclude<keyof Required<LoadOptions>, 'legacyXls'>]: LoadOptions[K] | undefined;
+};
+
+/** Project viewer options onto the workbook load contract. Validation and
+ *  normalization (e.g. `xlsxWorksheetLimits`) stay owned by the workbook load,
+ *  so both entry points accept and reject exactly the same values. */
+function viewerLoadOptions(opts: LoadOptions, mode: 'main' | 'worker'): LoadOptions {
+  const forwarded: ForwardedViewerLoadOptions = {
+    password: opts.password,
+    useGoogleFonts: opts.useGoogleFonts,
+    cjkFallback: opts.cjkFallback,
+    maxZipEntryBytes: opts.maxZipEntryBytes,
+    resourceLimits: opts.resourceLimits,
+    xlsxWorksheetLimits: opts.xlsxWorksheetLimits,
+    debug: opts.debug,
+    onResourceMetrics: opts.onResourceMetrics,
+    workerTimeoutMs: opts.workerTimeoutMs,
+    wasmUrl: opts.wasmUrl,
+    math: opts.math,
+    threeD: opts.threeD,
+    regionMap: opts.regionMap,
+    chartEx: opts.chartEx,
+    tiff: opts.tiff,
+    mode,
+  };
+  return opts.legacyXls === undefined ? forwarded : { ...forwarded, legacyXls: opts.legacyXls };
+}
+
 type InternalXlsxViewerOptions = (XlsxViewerOptions | XlsxSheetViewerOptions) & {
   [borrowedWorkbookOption]?: XlsxWorkbook;
 };
@@ -916,24 +949,11 @@ class XlsxViewerEngine implements ZoomableViewer {
     // than dropping to an empty viewer. The 2× memory window is bounded to the
     // load itself (the old workbook is freed the moment the new model arrives).
     try {
-      const wb = await this.acquisition.replace(() => XlsxWorkbook[loadXlsxSheetSource](source, {
-          password: this.opts.password,
-          useGoogleFonts: this.opts.useGoogleFonts,
-          cjkFallback: this.opts.cjkFallback,
-          maxZipEntryBytes: this.opts.maxZipEntryBytes,
-          resourceLimits: this.opts.resourceLimits,
-          debug: this.opts.debug,
-          onResourceMetrics: this.opts.onResourceMetrics,
-          workerTimeoutMs: this.opts.workerTimeoutMs,
-          wasmUrl: this.opts.wasmUrl,
-          math: this.opts.math,
-          threeD: this.opts.threeD,
-          regionMap: this.opts.regionMap,
-          chartEx: this.opts.chartEx,
-          tiff: this.opts.tiff,
-          mode: this._mode,
-          ...(this.opts.legacyXls === undefined ? undefined : { legacyXls: this.opts.legacyXls }),
-        }, sourceOptions), () => {
+      const wb = await this.acquisition.replace(() => XlsxWorkbook[loadXlsxSheetSource](
+          source,
+          viewerLoadOptions(this.opts, this._mode),
+          sourceOptions,
+        ), () => {
           // Claim every async-operation generation before closing the old
           // workbook. Rejections caused by its worker termination are stale
           // completion, not errors belonging to the new workbook.

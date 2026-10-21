@@ -39,7 +39,11 @@ import { chartColor, indexPointOverrides, applyClassicStyleLine, paintClassicVar
 import type { IndexedLinePoint } from '../shared/palette.js';
 import { chartFontFamily, chartFontCss } from '../shared/fonts.js';
 import { drawAxisTitles } from '../shared/axis.js';
-import { chartHasDataTable, chartDataTableBaseHeight, chartDataTableHeaderWidth, measureChartDataTable, drawChartDataTable } from '../shared/data-table.js';
+import {
+  chartDataTableSharesCategoryAxis, chartDataTableGap, chartDataTableCategoryWidth,
+  chartHasDataTable, chartDataTableBaseHeight, chartDataTableHeaderWidth,
+  measureChartDataTable, drawChartDataTable,
+} from '../shared/data-table.js';
 import { createDataLabelLegendKeyResolver, measuredLegendReserve, drawLegendForLayout } from '../shared/legend.js';
 import { drawAxisTick, strokeAxisSegment, strokeValueGridlineH, valGridStroke, valMinorGridStroke, drawCatMajorGridlines, catGridStroke, catGridlineFractions, catAxisReversed, drawValMajorGridlines, formatPrimaryValueAxisTick, displayUnitDivisor, formatAxisTickWithUnits, planValueAxis, axisLabelPx, catLabelsVisible, catLabelRotationRad, drawRotatedCatLabel } from '../shared/axis.js';
 import { drawSeriesTrendlines } from '../shared/trendline.js';
@@ -215,6 +219,8 @@ export function renderLineChart(
   const catTitleH = axBands.catBandH;
   const valTitleW = axBands.valBandW;
   const hasDataTable = chartHasDataTable(chart);
+  const tableOwnsCategoryLabels = hasDataTable && chartDataTableSharesCategoryAxis(chart);
+  let dataTableGap = chartDataTableGap(chart, catAxFontPx);
   const dataTableBaseH = chartDataTableBaseHeight(chart, ptToPx);
   const dataTableHeaderW = chartDataTableHeaderWidth(ctx, chart, ptToPx);
 
@@ -225,7 +231,7 @@ export function renderLineChart(
   // PowerPoint's full category-label band (gap + line-height + margin).
   let padT = titleH + legTopH + valAxFontPx / 2 + 2;
   const padB = (hasDataTable
-    ? dataTableBaseH
+    ? dataTableBaseH + dataTableGap
     : catAxisLabelBandH(catAxFontPx, chart.catAxisLabelOffsetPercent))
     + catTitleH + legBottomH;
   const phEst = h - padT - padB;
@@ -400,8 +406,9 @@ export function renderLineChart(
   );
   if (pw <= 0 || ph <= 0) return;
 
+  const dataTableWidth = chartDataTableCategoryWidth(chart, pw, secLabelBandW + secTitleBandW);
   const dataTableLayout = hasDataTable
-    ? measureChartDataTable(ctx, chart, pw / n, ptToPx)
+    ? measureChartDataTable(ctx, chart, dataTableWidth / n, ptToPx)
     : null;
   if (dataTableLayout && dataTableLayout.totalHeight > dataTableBaseH) {
     ph = Math.max(1, ph - (dataTableLayout.totalHeight - dataTableBaseH));
@@ -422,7 +429,7 @@ export function renderLineChart(
   // leaves its own label band. Exactly 0 without breaks.
   // Labels at the high (top) edge hang into the plot from its top, so they
   // need no bottom band.
-  if (!chart.catAxisHidden && !hasDataTable && catLabelsVisible(chart) && chart.catAxisTickLabelPos !== 'high') {
+  if (!chart.catAxisHidden && !tableOwnsCategoryLabels && catLabelsVisible(chart) && chart.catAxisTickLabelPos !== 'high') {
     const manualInner = chart.plotAreaManualLayout?.layoutTarget === 'inner' &&
       chart.plotAreaManualLayout.w != null && chart.plotAreaManualLayout.h != null;
     const categoryLabelExtraH = authoredExtraLinesHeight(
@@ -430,6 +437,7 @@ export function renderLineChart(
       axisLabelLineHeightPx(catAxFontPx),
       catLabelRotation,
     );
+    if (hasDataTable) dataTableGap += categoryLabelExtraH;
     if (!manualInner && categoryLabelExtraH > 0) ph = Math.max(1, ph - categoryLabelExtraH);
   }
 
@@ -826,7 +834,7 @@ export function renderLineChart(
         );
       }
     }
-    const showLabels = !hasDataTable && catLabelsVisible(chart);
+    const showLabels = !tableOwnsCategoryLabels && catLabelsVisible(chart);
     const labelInterval = categoryLabelInterval;
     const rotRad = catLabelRotation;
     const labelEntries = dateAxisPlan
@@ -887,7 +895,7 @@ export function renderLineChart(
 
   if (dataTableLayout) {
     drawChartDataTable(
-      ctx, chart, dataTableLayout, px0, py0 + ph, pw, x + legLeftW, ptToPx,
+      ctx, chart, dataTableLayout, px0, py0 + ph + dataTableGap, dataTableWidth, x + legLeftW, ptToPx,
     );
   }
 

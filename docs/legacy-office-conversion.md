@@ -219,10 +219,12 @@ Footnotes and endnotes become DOCX notes. Automatic reference marks and the
 numbers inside each note use the document-wide note format and starting
 value. Arabic, Roman and letter formats are supported, with Word's
 lowercase-Roman default for endnotes in later Word versions. Footnotes must be
-at the page bottom and endnotes at the end of the document. Documents are
-rejected if they use custom reference marks, number restarts per section or
-per page, sections with different note numbering, or custom separator
-stories.
+at the page bottom and endnotes at the end of the document. A custom
+reference mark is shown as its own literal text and does not use up a number,
+as in Word. A separator story that is only an empty paragraph keeps that
+paragraph's space with no line. Documents are rejected if they use number
+restarts per section or per page, sections with different note numbering, or
+other custom separator stories.
 
 Section text flow (MS-DOC sprmSTextFlow, an MS-ODRAW MSOTXFL value) is shown
 per section, following the basic rules of the specification:

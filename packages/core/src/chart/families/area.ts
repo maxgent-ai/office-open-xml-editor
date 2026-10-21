@@ -46,9 +46,13 @@ import { chartColor, indexPointOverrides, applyClassicStyleLine, paintClassicVar
 import type { IndexedLinePoint } from '../shared/palette.js';
 import { chartFontFamily, chartFontCss } from '../shared/fonts.js';
 import { drawAxisTitles } from '../shared/axis.js';
-import { chartHasDataTable, chartDataTableBaseHeight, chartDataTableHeaderWidth, measureChartDataTable, drawChartDataTable } from '../shared/data-table.js';
+import {
+  chartDataTableSharesCategoryAxis, chartDataTableGap, chartDataTableCategoryWidth,
+  chartHasDataTable, chartDataTableBaseHeight, chartDataTableHeaderWidth,
+  measureChartDataTable, drawChartDataTable,
+} from '../shared/data-table.js';
 import { createDataLabelLegendKeyResolver, measuredLegendReserve, drawLegendForLayout } from '../shared/legend.js';
-import { drawAxisTick, strokeAxisSegment, strokeValueGridlineH, valGridStroke, valMinorGridStroke, drawCatMajorGridlines, catGridStroke, catGridlineFractions, catAxisReversed, drawValMajorGridlines, formatPrimaryValueAxisTick, formatAxisTickWithUnits, planValueAxis, axisLabelPx } from '../shared/axis.js';
+import { catLabelsVisible, drawAxisTick, strokeAxisSegment, strokeValueGridlineH, valGridStroke, valMinorGridStroke, drawCatMajorGridlines, catGridStroke, catGridlineFractions, catAxisReversed, drawValMajorGridlines, formatPrimaryValueAxisTick, formatAxisTickWithUnits, planValueAxis, axisLabelPx } from '../shared/axis.js';
 import { drawSeriesTrendlines } from '../shared/trendline.js';
 import { chartDateAxisPlan, forEachErrorBarEndpoint, computeSecondaryAxis, drawSecondaryValueGridlines, drawSecondaryValueAxis, secondaryAxisTitleBandW } from '../shared/secondary-axis.js';
 import { measuredCartesianTitleBand, drawChartTitleForLayout } from '../shared/title.js';
@@ -206,6 +210,8 @@ export function renderAreaChart(
   const catTitleH = axBands.catBandH;
   const valTitleW = axBands.valBandW;
   const hasDataTable = chartHasDataTable(chart);
+  const tableOwnsCategoryLabels = hasDataTable && chartDataTableSharesCategoryAxis(chart);
+  let dataTableGap = chartDataTableGap(chart, catAxFontPx);
   const dataTableBaseH = chartDataTableBaseHeight(chart, ptToPx);
   const dataTableHeaderW = chartDataTableHeaderWidth(ctx, chart, ptToPx);
 
@@ -215,7 +221,7 @@ export function renderAreaChart(
   // PowerPoint's category-label band (gap + line-height + margin).
   const padT = titleH + legTopH + valAxFontPx / 2 + 2;
   const padB = (hasDataTable
-    ? dataTableBaseH
+    ? dataTableBaseH + dataTableGap
     : catAxisLabelBandH(catAxFontPx, chart.catAxisLabelOffsetPercent))
     + catTitleH + legBottomH;
   const phEst = h - padT - padB;
@@ -396,8 +402,9 @@ export function renderAreaChart(
   let { ph } = areaFrame.plotRect;
   if (pw <= 0 || ph <= 0) return;
 
+  const dataTableWidth = chartDataTableCategoryWidth(chart, pw, secLabelBandW + secTitleBandW);
   const dataTableLayout = hasDataTable
-    ? measureChartDataTable(ctx, chart, pw / n, ptToPx)
+    ? measureChartDataTable(ctx, chart, dataTableWidth / n, ptToPx)
     : null;
   if (dataTableLayout && dataTableLayout.totalHeight > dataTableBaseH) {
     ph = Math.max(1, ph - (dataTableLayout.totalHeight - dataTableBaseH));
@@ -416,7 +423,7 @@ export function renderAreaChart(
   // rectangle already leaves its own label band). Exactly 0 without breaks.
   // Labels at the high (top) edge hang into the plot from its top, so they
   // need no bottom band.
-  if (!hasDataTable && !chart.catAxisHidden && chart.catAxisTickLabelPos !== 'high') {
+  if (!tableOwnsCategoryLabels && !chart.catAxisHidden && chart.catAxisTickLabelPos !== 'high') {
     const labelFontPx = chart.catAxisFontSizeHpt != null
       ? catAxFontPx
       : Math.max(8, Math.min(11, pw / n * 0.8));
@@ -426,6 +433,7 @@ export function renderAreaChart(
       categoryLabelTexts(),
       axisLabelLineHeightPx(labelFontPx),
     );
+    if (hasDataTable) dataTableGap += categoryLabelExtraH;
     if (!manualInner && categoryLabelExtraH > 0) ph = Math.max(1, ph - categoryLabelExtraH);
   }
 
@@ -940,7 +948,7 @@ export function renderAreaChart(
     }
   }
 
-  if (!hasDataTable && !chart.catAxisHidden) {
+  if (!tableOwnsCategoryLabels && !chart.catAxisHidden && catLabelsVisible(chart)) {
     const drawnCatTickFontPx = chart.catAxisFontSizeHpt != null
       ? catAxFontPx
       : Math.max(8, Math.min(11, pw / n * 0.8));
@@ -1018,7 +1026,7 @@ export function renderAreaChart(
 
   if (dataTableLayout) {
     drawChartDataTable(
-      ctx, chart, dataTableLayout, px0, py0 + ph, pw, x + legLeftW, ptToPx,
+      ctx, chart, dataTableLayout, px0, py0 + ph + dataTableGap, dataTableWidth, x + legLeftW, ptToPx,
     );
   }
 

@@ -150,6 +150,24 @@ impl AcquiredSeparator<'_> {
             && self.paragraph.is_none()
     }
 
+    /// MS-DOC 2.3.3: a non-empty story whose only content is one paragraph
+    /// mark before its guard, with no U+0003/U+0004 control. Word lays the
+    /// story out as that empty paragraph: no rule ink, one line of the
+    /// paragraph's own height and spacing. The shared wire represents it as
+    /// a rule-free paragraph story; admission additionally requires the
+    /// metric-only facts the consumer represents (no numbering, frame,
+    /// tracked insertion or symbol text on the mark).
+    pub(super) fn paragraph_only(&self) -> bool {
+        self.source.guard_cp.is_some()
+            && self.source.content == "\r"
+            && self.rule.is_none()
+            && self
+                .paragraph
+                .as_ref()
+                .is_some_and(|paragraph| paragraph.source.cp + 1 == self.source.content_cp.end)
+            && self.metric_only()
+    }
+
     pub(super) fn standard_rule(&self, kind: RuleKind) -> bool {
         let expected = match kind {
             RuleKind::Short => "\u{3}\r",

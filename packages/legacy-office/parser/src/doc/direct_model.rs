@@ -98,7 +98,6 @@ pub(super) fn build(
     }
     let note_layout_settings = notes::validate(
         &facts.note_stories,
-        &facts.note_references,
         facts.effective_nfib,
         facts.document_settings.as_ref(),
         &facts.sections,

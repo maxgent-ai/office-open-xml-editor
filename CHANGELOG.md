@@ -5,6 +5,38 @@ semantic versioning. While the major version is zero, minor releases may contain
 explicitly documented breaking changes; patch releases remain compatible with
 the corresponding minor release.
 
+## 0.89.2 — 2026-10-21
+
+Compatible patch release. No migration is required.
+
+- **Office file compatibility:** more converter-generated DOCX, XLSX and PPTX
+  files now open successfully. ZIP integrity checks and resource limits remain
+  enforced (#1924, #1927).
+- **XLSX loading:** destroying a viewer while its first worksheet preview is
+  loading no longer causes an unhandled promise rejection (#1923, #1925).
+- **Chart data tables:** date-axis charts retain their date labels and place
+  data tables separately below the plot, including charts with secondary value
+  axes (#1926).
+
+## 0.89.1 — 2026-10-20
+
+Compatible patch release.
+
+- **XLSX viewer limits:** `XlsxViewer` and `XlsxSheetViewer` now forward
+  `xlsxWorksheetLimits` (and every other load option) when they load a file
+  themselves, so a configured worksheet limit applies as it does with
+  `XlsxWorkbook.load` (#1917).
+- **XLSX viewer chrome:** the sheet-list popover opens at the same place from
+  either sheet-tab scroll button (mirrored in right-to-left sheets), and
+  whole-row/column selection borders beside the headers sit on the grid line
+  like ordinary cell selections.
+- **WMF text:** metafile text records (for example MathType equations) render
+  with MS-WMF text semantics: alignment, spacing, background, clipping,
+  escapement, character-set decoding and Symbol fonts, including joined
+  Arabic text and right-to-left ordering.
+- **Experimental legacy DOC:** documents with custom footnote reference marks,
+  empty-paragraph note separators and per-cell table border colours now open.
+
 ## 0.89.0 — 2026-10-19
 
 Compatible minor release laying out documents from the host's installed fonts

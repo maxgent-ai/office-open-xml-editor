@@ -8092,6 +8092,28 @@ mod rb7_partial_degradation_tests {
         );
     }
 
+    #[test]
+    fn partial_local_sizes_with_data_descriptors_parse() {
+        let main = br#"<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheets><sheet name="Descriptor" sheetId="1"/></sheets></workbook>"#;
+        let mut writer = zip::ZipWriter::new_stream(Vec::new());
+        writer
+            .start_file("xl/workbook.xml", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(main).unwrap();
+        writer
+            .start_file("xl/styles.xml", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(br#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"/>"#).unwrap();
+        write_test_content_types(&mut writer);
+        let mut bytes = writer.finish().unwrap().into_inner();
+        // Exercise the format's public admission and workbook projection too.
+        bytes[22..26].copy_from_slice(&(main.len() as u32).to_le_bytes());
+        let workbook =
+            parse_workbook_model_native(&bytes).expect("partial local sizes are compatible");
+        assert_eq!(workbook.sheets.len(), 1);
+        assert_eq!(workbook.sheets[0].name, "Descriptor");
+    }
+
     /// Input that is not a SpreadsheetML package fails closed at every public
     /// Rust boundary instead of materializing a placeholder workbook.
     #[test]

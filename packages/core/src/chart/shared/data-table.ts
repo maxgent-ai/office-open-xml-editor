@@ -1,7 +1,7 @@
 // Classic chart data table helpers.
 import type { ChartModel, ChartSeries } from '../../types/chart';
 import { chartDataTableFamilyIsPainted } from '../marker-style.js';
-import { chartTextFontSizePx } from '../layout.js';
+import { catAxisLabelBandH, chartTextFontSizePx } from '../layout.js';
 import { formatCategoryLabel, formatChartValWithCode, formatLocalizedExcelShortDate } from '../chart-number-format.js';
 import { legendEntryGlobalIndex, legendEntryRanges } from '../legend-entry-plan.js';
 import { authoredLineCount, authoredTextLines, fillAuthoredText, measureAuthoredTextWidth } from '../chart-text-lines.js';
@@ -34,6 +34,45 @@ export type ChartDataTableLayout = {
  * inventing different applicability rules. */
 export function chartHasDataTable(chart: ChartModel): boolean {
   return chart.dataTable != null && chartDataTableFamilyIsPainted(chart.chartType);
+}
+
+/** ECMA-376 §21.2.2.54 defines CT_DTable but not its automatic geometry.
+ * Observed desktop Excel behavior (column/line/area/stock, day/month date axes,
+ * with/without a secondary value axis): a date table retains one column per
+ * source category, independently of calendar ticks, and keeps the axis labels.
+ * A text-axis table instead replaces those labels and shares the plot span.
+ * Horizontal bars retain their separate value-axis band in the family renderer.
+ */
+export function chartDataTableSharesCategoryAxis(chart: ChartModel): boolean {
+  return chart.catAxisIsDate !== true
+    || chart.chartType === 'clusteredBarH'
+    || chart.chartType === 'stackedBarH'
+    || chart.chartType === 'stackedBarHPct';
+}
+
+export function chartDataTableGap(chart: ChartModel, categoryFontPx: number): number {
+  if (!chartHasDataTable(chart) || chartDataTableSharesCategoryAxis(chart)) return 0;
+  // Excel also separates the table when date tick labels are hidden. Library
+  // spacing policy uses one font-height there; visible labels use our normal axis
+  // band (including the authored lblOffset), rather than a sample-sized gap.
+  return chart.catAxisHidden || chart.catAxisTickLabelPos === 'none'
+    || chart.catAxisTickLabelPos === 'high'
+    ? categoryFontPx
+    : catAxisLabelBandH(categoryFontPx, chart.catAxisLabelOffsetPercent,
+      chart.cartesianAutoLayoutProfile);
+}
+
+export function chartDataTableCategoryWidth(
+  chart: ChartModel,
+  plotWidth: number,
+  secondaryRightBand: number,
+): number {
+  // Excel's automatic date table extends beneath the secondary labels/title.
+  // Keep the chart/legend outer margin intact. Authored manual plot layouts
+  // have not been validated for that extension: retain their explicit span.
+  return !chartDataTableSharesCategoryAxis(chart) && !chart.plotAreaManualLayout
+    ? plotWidth + secondaryRightBand
+    : plotWidth;
 }
 
 
@@ -139,8 +178,8 @@ export function measureChartDataTable(
 }
 
 
-/** Draw `CT_DTable` as a measured chart foreground band. Category columns are
- * aligned to the plot's category span; the leading key/name column occupies
+/** Draw `CT_DTable` as a measured chart foreground band. Category columns use
+ * the resolved table span; the leading key/name column occupies
  * the already-reserved value-axis gutter. Border switches are honored
  * independently, as authored by the four CT_Boolean children. */
 export function drawChartDataTable(

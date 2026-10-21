@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { XlsxWorkbook, acquireXlsxWorksheet } from './workbook.js';
+import { XlsxWorkbook, acquireXlsxWorksheet, acquireXlsxWorksheetPreview } from './workbook.js';
 import { OoxmlResourceLimitError } from '@silurus/ooxml-core';
 import type { PullSessionCommand } from '@silurus/ooxml-core/worker';
 import type { ParsedWorkbook, Worksheet, WorkerRequest } from './types.js';
@@ -483,6 +483,29 @@ describe('XlsxWorkbook.getWorksheet compatibility materializer', () => {
     await expect(workbook.getWorksheet(0)).resolves.toMatchObject({ name: 'Sheet1' });
     // Failed open + correlated cancel, followed by a full successful stream.
     expect(request).toHaveBeenCalledTimes(7);
+  });
+
+  it('propagates a failed preview load and permits a later retry', async () => {
+    const failure = new Error('injected sheet failure');
+    let failed = false;
+    const { workbook } = makeWorkbook('main', async (message) => {
+      if (!failed) {
+        failed = true;
+        throw failure;
+      }
+      return streamResponse(message);
+    });
+
+    await expect(acquireXlsxWorksheetPreview(workbook as unknown as XlsxWorkbook, 0)).rejects.toBe(failure);
+    // Let unobserved completions reach the test runner's rejection handler.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const lease = await acquireXlsxWorksheetPreview(workbook as unknown as XlsxWorkbook, 0);
+    try {
+      await expect(lease.completion).resolves.toBe(lease.worksheet);
+      expect(lease.worksheet.rows[0].cells[0].value).toEqual({ type: 'text', text: 'resolved' });
+    } finally {
+      lease.release();
+    }
   });
 
   it('cancels a failed open so a later ordinary archive operation proceeds', async () => {

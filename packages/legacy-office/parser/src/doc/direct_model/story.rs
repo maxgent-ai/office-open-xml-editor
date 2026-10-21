@@ -481,6 +481,7 @@ pub(super) fn project(
                         cp,
                         reference.kind(),
                         &id,
+                        reference.custom(),
                         link,
                         budget,
                     )?;
@@ -505,6 +506,7 @@ pub(super) fn project(
                         cp,
                         kind,
                         "",
+                        false,
                         link,
                         budget,
                     )?;
@@ -771,8 +773,9 @@ fn linked_text_run(
 }
 
 /// ECMA-376 17.11.6/7/16/17 as parsed by the DOCX parser: a note mark is a
-/// `TextRun` with the run's properties, forced superscript, its id as
-/// fallback text and `NoteRef { kind, id }`. An empty id is the in-note
+/// `TextRun` with the run's properties, its id as fallback text and
+/// `NoteRef { kind, id, custom_mark_follows }`. An automatic mark is forced
+/// superscript; a custom-mark host is not. An empty id is the in-note
 /// number, which the renderer resolves to the enclosing note's number.
 #[allow(clippy::too_many_arguments)]
 fn push_note_mark(
@@ -784,6 +787,7 @@ fn push_note_mark(
     cp: usize,
     kind: crate::doc::notes::Kind,
     id: &str,
+    custom: bool,
     link: Option<&super::fields::Link>,
     budget: &mut ModelBudget,
 ) -> Result<(), String> {
@@ -800,13 +804,23 @@ fn push_note_mark(
         link,
     )?
     .ok_or_else(|| unsupported("hidden Word note mark is not supported"))?;
-    run.vert_align = Some("super".to_string());
+    if custom {
+        // A sprmCSymbol mark resolves its glyph into the run; that glyph is
+        // the following literal mark's text, never the host's. The host keeps
+        // the mark's effective (symbol) face as its metric-only face.
+        run.text.clear();
+    } else {
+        run.vert_align = Some("super".to_string());
+    }
     run.note_ref = Some(docx_model::NoteRef {
         kind: kind.tag().to_string(),
         id: id.to_string(),
-        // Direct DOC rejects custom note references in direct_model::notes
-        // before story projection; only automatic references reach this path.
-        custom_mark_follows: false,
+        // MS-DOC 2.8.19/2.8.17 aFtnIdx/aEdnIdx == 0: the reference uses the
+        // custom mark character at its CP. As in the DOCX Word writes for it
+        // (`footnoteReference customMarkFollows` sharing that character's
+        // rPr, ECMA-376 17.11.14), the host keeps the mark character's own
+        // effective properties and the mark follows as ordinary text.
+        custom_mark_follows: custom,
     });
     budget.text(&mut paragraph.runs, &mut run, id)
 }

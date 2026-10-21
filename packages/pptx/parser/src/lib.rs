@@ -3290,6 +3290,34 @@ mod tests {
     use ooxml_common::math::nodes_to_text;
     use std::io::Write;
 
+    #[test]
+    fn partial_local_sizes_with_data_descriptors_parse() {
+        let main = br#"<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:sldSz cx="12192000" cy="6858000"/></p:presentation>"#;
+        let mut writer = zip::ZipWriter::new_stream(Vec::new());
+        writer
+            .start_file(
+                "ppt/presentation.xml",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        writer.write_all(main).unwrap();
+        writer
+            .start_file(
+                "ppt/_rels/presentation.xml.rels",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        writer.write_all(br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>"#).unwrap();
+        write_test_content_types(&mut writer);
+        let mut bytes = writer.finish().unwrap().into_inner();
+        // Exercise the format's public admission and presentation projection too.
+        bytes[22..26].copy_from_slice(&(main.len() as u32).to_le_bytes());
+        let presentation =
+            parse_pptx_model_native(&bytes).expect("partial local sizes are compatible");
+        assert_eq!(presentation.slide_width, 12_192_000);
+        assert_eq!(presentation.slide_height, 6_858_000);
+    }
+
     // Local-only sample (redistribution-prohibited, gitignored). Tests that
     // depend on it must skip gracefully on a clean checkout / in CI where the
     // file is absent. See packages/pptx/public/private/pptx/.
