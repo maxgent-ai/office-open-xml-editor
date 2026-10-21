@@ -643,17 +643,23 @@ fn validate_local_entry(
         let valid_descriptor = signed_descriptor
             || descriptor_fields_match(data, payload_end, directory.start, fields);
         // ECMA-376 Part 2, Annex B.2/Table B.5 requires zero local fields when
-        // bit 3 is set. NPOI 2.3.0 output reported in #1428 is a legacy form
-        // that Excel accepts: non-ZIP64, with a signed descriptor and all three
-        // local fields populated. Keep that exception bounded to exact agreement.
+        // bit 3 is set. Compatibility policy (#1428, #1924): accept zero or
+        // matching values independently, only for signed descriptors with 32-bit
+        // entry sizes.
+        // Word 16.114 on macOS opened Word-produced DOCX entries repackaged as
+        // Stored/Deflate with all eight zero/matching combinations, without a
+        // repair dialog, including a typed empty Deflate entry (CRC/size zero,
+        // compressed size populated). This extends the NPOI 2.3.0 form that
+        // Excel accepts. It does not establish Office behavior for conflicting
+        // values or populated unsigned/ZIP64 headers; keep those excluded.
+        // Central sizes still bound the payload and descriptor, and the signed
+        // descriptor must agree exactly with the central CRC and both sizes.
         let compatible_populated_local_fields = !fields.zip64_sizes
             && signed_descriptor
-            && local_crc != 0
-            && local_compressed != 0
-            && local_uncompressed != 0
-            && local_crc == fields.crc32
-            && u64::from(local_compressed) == fields.compressed_size
-            && u64::from(local_uncompressed) == fields.uncompressed_size;
+            && (local_crc == 0 || local_crc == fields.crc32)
+            && (local_compressed == 0 || u64::from(local_compressed) == fields.compressed_size)
+            && (local_uncompressed == 0
+                || u64::from(local_uncompressed) == fields.uncompressed_size);
         if (!canonical_local_fields && !compatible_populated_local_fields) || !valid_descriptor {
             return None;
         }
@@ -1593,7 +1599,7 @@ mod tests {
         bytes
     }
 
-    fn npoi_230_descriptor_zip(body: &[u8]) -> Vec<u8> {
+    fn populated_deflate_descriptor_zip(body: &[u8]) -> Vec<u8> {
         const NAME: &str = "xl/worksheets/sheet1.xml";
         let mut bytes = Vec::new();
         {
@@ -1614,9 +1620,6 @@ mod tests {
         let crc = le_u32(&bytes, central + 16).unwrap();
         let compressed = le_u32(&bytes, central + 20).unwrap();
         let uncompressed = le_u32(&bytes, central + 24).unwrap();
-        assert_ne!(crc, 0);
-        assert_ne!(compressed, 0);
-        assert_ne!(uncompressed, 0);
 
         bytes[6..8].copy_from_slice(&(1u16 << 3).to_le_bytes());
         bytes[central + 8..central + 10].copy_from_slice(&(1u16 << 3).to_le_bytes());
@@ -2209,29 +2212,64 @@ mod tests {
     }
 
     #[test]
-    fn compatibility_accepts_matching_populated_local_fields_with_signed_descriptor() {
-        let bytes = npoi_230_descriptor_zip(b"confirmed NPOI 2.3.0 compatibility shape");
-        let preflight = preflight_archive_limits(&bytes).unwrap();
-        let mut archive =
-            zip::ZipArchive::with_config(preflight.read_config(), Cursor::new(bytes.as_slice()))
-                .unwrap();
-        preflight.validate_archive_item_names(&mut archive).unwrap();
-        let mut entry = archive.by_name("xl/worksheets/sheet1.xml").unwrap();
-        let mut body = Vec::new();
-        entry.read_to_end(&mut body).unwrap();
-        assert_eq!(body, b"confirmed NPOI 2.3.0 compatibility shape");
+    fn compatibility_accepts_partial_local_fields_with_signed_descriptor() {
+        let body = b"partial descriptor compatibility";
+        for bytes in [
+            stored_descriptor_zip(body),
+            populated_deflate_descriptor_zip(body),
+        ] {
+            let central = last_signature(&bytes, CENTRAL_DIRECTORY_HEADER_SIGNATURE);
+            // Each field can independently be zero or its central value. Include
+            // a mixed pair as well as the already-supported fully populated form.
+            for mask in [1, 2, 4, 6, 7] {
+                let mut partial = bytes.clone();
+                for (bit, (local, directory)) in
+                    [(14, 16), (18, 20), (22, 24)].into_iter().enumerate()
+                {
+                    let value = if mask & (1 << bit) != 0 {
+                        le_u32(&bytes, central + directory).unwrap()
+                    } else {
+                        0
+                    };
+                    partial[local..local + 4].copy_from_slice(&value.to_le_bytes());
+                }
+                let mut archive = open_validated_zip(partial)
+                    .unwrap_or_else(|error| panic!("local field mask {mask}: {error}"));
+                let mut actual = Vec::new();
+                archive
+                    .by_index(0)
+                    .unwrap()
+                    .read_to_end(&mut actual)
+                    .unwrap();
+                assert_eq!(actual, body);
+            }
+        }
     }
 
     #[test]
-    fn compatibility_rejects_partial_or_mismatched_populated_local_fields() {
-        let bytes = npoi_230_descriptor_zip(b"bounded compatibility");
+    fn compatibility_reads_empty_deflated_entry_with_populated_compressed_size() {
+        let mut archive = open_validated_zip(populated_deflate_descriptor_zip(b"")).expect(
+            "empty Deflate entry has zero CRC/uncompressed size but nonzero compressed size",
+        );
+        let mut actual = Vec::new();
+        archive
+            .by_index(0)
+            .unwrap()
+            .read_to_end(&mut actual)
+            .unwrap();
+        assert!(actual.is_empty());
+    }
+
+    #[test]
+    fn compatibility_rejects_mismatched_or_unsigned_populated_local_fields() {
+        let bytes = populated_deflate_descriptor_zip(b"bounded compatibility");
 
         for field in [14, 18, 22] {
-            let mut partial = bytes.clone();
-            partial[field..field + 4].copy_from_slice(&0u32.to_le_bytes());
-            assert!(preflight_archive_limits(&partial).is_err());
-
             let mut mismatched = bytes.clone();
+            // A partially filled header is tolerated only when its populated
+            // field agrees; zero placeholders must not hide a conflicting value.
+            mismatched[14..26].fill(0);
+            mismatched[field..field + 4].copy_from_slice(&bytes[field..field + 4]);
             mismatched[field] ^= 1;
             assert!(preflight_archive_limits(&mismatched).is_err());
         }

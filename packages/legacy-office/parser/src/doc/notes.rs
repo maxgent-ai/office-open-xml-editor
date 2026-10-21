@@ -71,6 +71,17 @@ impl References {
         self.by_cp.values()
     }
 
+    /// Custom-mark references whose mark character lies in `cps`, by CP.
+    pub(in crate::doc) fn custom_in(
+        &self,
+        cps: Range<usize>,
+    ) -> impl Iterator<Item = (usize, &Reference)> {
+        self.by_cp
+            .range(cps)
+            .filter(|(_, reference)| reference.custom)
+            .map(|(cp, reference)| (*cp, reference))
+    }
+
     pub fn read(
         notes: &[Option<Notes<'_>>],
         main: &Story<'_>,

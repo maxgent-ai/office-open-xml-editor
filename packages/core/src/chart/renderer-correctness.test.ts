@@ -15252,6 +15252,47 @@ describe('CH9 — line/area smooth splines (§21.2.2.194)', () => {
 });
 
 describe('classic chart data table (CT_DTable)', () => {
+  it.each(['clusteredBar', 'line', 'area', 'stock'] as const)(
+    'keeps date ticks above an independent data table for %s',
+    chartType => {
+      const rec = recordingCtx();
+      const secondary = chartType !== 'stock';
+      renderChart(rec.ctx, baseModel({
+        chartType,
+        categories: ['45658', '45689', '45717'],
+        catAxisIsDate: true,
+        catAxisBaseTimeUnit: 'months',
+        catAxisMajorTimeUnit: 'months',
+        catAxisMajorUnit: 1,
+        catAxisFormatCode: 'mmm-yy',
+        catAxisFontSizeHpt: 1000,
+        plotAreaBg: 'ABCDEF',
+        series: [
+          series({ name: 'High', values: [30, 40, 35] }),
+          series({ name: 'Low', values: [10, 15, 20] }),
+          series({ name: 'Close', values: [20, 30, 25], useSecondaryAxis: secondary }),
+        ],
+        secondaryValAxis: secondary ? {
+          min: 0, max: 50, title: 'Secondary', hidden: false,
+          lineHidden: false, majorTickMark: 'out',
+        } : null,
+        dataTable: {
+          showHorizontalBorder: true, showVerticalBorder: true,
+          showOutline: true, showKeys: false, lineColor: '445566',
+        },
+      }), RECT, 1);
+      const plot = rec.rects.find(rect => rect.fs === '#ABCDEF')!;
+      const table = rec.strokeRects.find(rect => rect.ss === '#445566')!;
+      const january = rec.texts.filter(call => call.text === 'Jan-25');
+      expect(january).toHaveLength(2);
+      expect(january[0].y).toBeGreaterThan(plot.y + plot.h);
+      expect(table.y).toBeGreaterThan(january[0].y + 10);
+      const right = table.x + table.w + 0.375; // outline is inset by half its stroke
+      if (secondary) expect(right).toBeGreaterThan(plot.x + plot.w);
+      else expect(right).toBeCloseTo(plot.x + plot.w);
+    },
+  );
+
   it('reserves a table band and paints keys, names, values, and authored borders', () => {
     const rec = recordingCtx();
     renderChart(rec.ctx, baseModel({
@@ -15295,6 +15336,45 @@ describe('classic chart data table (CT_DTable)', () => {
       && rect.y <= sales.y && rect.y + rect.h >= sales.y,
     )).toBe(false);
     expect(rec.arcs.length).toBeGreaterThan(0); // line-series key marker
+  });
+
+  it.each([
+    { name: 'text categories', date: false, labels: 'nextTo' as const, manual: false },
+    { name: 'hidden date labels', date: true, labels: 'none' as const, manual: false },
+    { name: 'an authored date plot', date: true, labels: 'nextTo' as const, manual: true },
+  ])('keeps table geometry bounded for $name', ({ date, labels, manual }) => {
+    const rec = recordingCtx();
+    renderChart(rec.ctx, baseModel({
+      chartType: 'line', categories: ['45658', '45689'],
+      catAxisIsDate: date, catAxisTickLabelPos: labels,
+      catAxisBaseTimeUnit: 'months', catAxisMajorTimeUnit: 'months', catAxisMajorUnit: 1,
+      catAxisFormatCode: 'mmm-yy', catAxisFontSizeHpt: 1000,
+      plotAreaBg: 'ABCDEF',
+      plotAreaManualLayout: manual ? {
+        layoutTarget: 'inner', x: 0.2, y: 0.1, w: 0.5, h: 0.4,
+      } : null,
+      series: [
+        series({ name: 'Primary', values: [10, 20] }),
+        series({ name: 'Secondary', values: [20, 30], useSecondaryAxis: true }),
+      ],
+      secondaryValAxis: {
+        min: 0, max: 50, title: 'Secondary', hidden: false,
+        lineHidden: false, majorTickMark: 'out',
+      },
+      dataTable: {
+        showHorizontalBorder: true, showVerticalBorder: true,
+        showOutline: true, showKeys: false, lineColor: '445566',
+      },
+    }), RECT, 1);
+    const plot = rec.rects.find(rect => rect.fs === '#ABCDEF')!;
+    const table = rec.strokeRects.find(rect => rect.ss === '#445566')!;
+    const tableTop = table.y - 0.375;
+    const tableRight = table.x + table.w + 0.375;
+    if (date) expect(tableTop).toBeGreaterThan(plot.y + plot.h);
+    else expect(tableTop).toBeCloseTo(plot.y + plot.h);
+    if (date && !manual) expect(tableRight).toBeGreaterThan(plot.x + plot.w);
+    else expect(tableRight).toBeCloseTo(plot.x + plot.w);
+    expect(rec.texts.filter(call => call.text === 'Jan-25')).toHaveLength(manual ? 2 : 1);
   });
 
   it('formats data table values in the chart date system', () => {

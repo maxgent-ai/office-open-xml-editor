@@ -891,7 +891,7 @@ describe('playEmf — EXTTEXTOUTW text', () => {
   });
 
   it.each([
-    ['Symbol', '\uf0ae\uf041', 0],
+    ['Symbol', '\uf0ae\uf0e6', 0], // 0xE6 has only an Adobe Corporate-Use target
     ['SymbolMT', '\uf0ae', 0],
     ['Symbol', '\uf0ae', 0x10],
   ])('does not partially decode unknown glyphs, faces or glyph-index options (%s)', (face, text, options) => {

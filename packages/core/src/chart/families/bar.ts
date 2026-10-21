@@ -72,7 +72,11 @@ import { chartColor, indexPointOverrides, pieSliceColor, applyClassicStyleLine, 
 import type { IndexedLinePoint } from '../shared/palette.js';
 import { chartFontFamily, chartFontCss } from '../shared/fonts.js';
 import { drawAxisTitles } from '../shared/axis.js';
-import { chartHasDataTable, chartDataTableBaseHeight, chartDataTableHeaderWidth, measureChartDataTable, drawChartDataTable } from '../shared/data-table.js';
+import {
+  chartDataTableSharesCategoryAxis, chartDataTableGap, chartDataTableCategoryWidth,
+  chartHasDataTable, chartDataTableBaseHeight, chartDataTableHeaderWidth,
+  measureChartDataTable, drawChartDataTable,
+} from '../shared/data-table.js';
 import { createDataLabelLegendKeyResolver, measuredLegendReserve, drawLegendForLayout, LEGEND_HORIZONTAL_INSET, LEGEND_HORIZONTAL_PADDING } from '../shared/legend.js';
 import type { DataLabelLegendKey, MeasuredLegendLayout } from '../shared/legend.js';
 import { drawAxisTick, strokeAxisSegment, axisTickLengthPx, strokeValueGridlineH, valGridStroke, valMinorGridStroke, drawCatMajorGridlines, catGridStroke, catGridlineFractions, catAxisReversed, drawValMajorGridlines, formatPrimaryValueAxisTick, formatAxisTickWithUnits, planValueAxis, axisLabelPx, wrapMeasuredText, catLabelsVisible, catLabelRotationRad, drawRotatedCatLabel } from '../shared/axis.js';
@@ -368,6 +372,8 @@ export function renderBarChart(
     multiLevelCategoryBandH += outerCategoryLevelExtraH(levelIndex, catAxFontPx);
   }
   const hasDataTable = chartHasDataTable(chart);
+  const tableOwnsCategoryLabels = hasDataTable && chartDataTableSharesCategoryAxis(chart);
+  let dataTableGap = chartDataTableGap(chart, catAxFontPx);
   const dataTableBaseH = chartDataTableBaseHeight(chart, ptToPx);
   const dataTableHeaderW = chartDataTableHeaderWidth(ctx, chart, ptToPx);
   const leg = measuredLegendReserve(ctx, legendChart, w, h, ptToPx);
@@ -438,7 +444,7 @@ export function renderBarChart(
       chart.catAxisLabelOffsetPercent,
       chart.cartesianAutoLayoutProfile,
     ))
-      + multiLevelCategoryBandH + dataTableBaseH + catTitleH + legBottomH;
+      + multiLevelCategoryBandH + dataTableBaseH + dataTableGap + catTitleH + legBottomH;
   const phEst = h - padT - padB;
   let horizontalCategoryLabelBandW = 0;
   if (isH && !chart.catAxisHidden && catLabelsVisible(chart)) {
@@ -911,7 +917,7 @@ export function renderBarChart(
   // Width-wrapped text without breaks keeps its historical outer-row offset.
   let innerCategoryExtraH = 0;
   let innerAuthoredExtraH = 0;
-  if (!hasDataTable && !isH && !dateAxisPlan && !chart.catAxisHidden && catLabelsVisible(chart) && catLabelRotation === 0) {
+  if (!tableOwnsCategoryLabels && !isH && !dateAxisPlan && !chart.catAxisHidden && catLabelsVisible(chart) && catLabelRotation === 0) {
     const slotW = pw / n;
     const wrapFontPx = chart.catAxisFontSizeHpt != null
       ? catAxFontPx
@@ -943,7 +949,7 @@ export function renderBarChart(
       cats.map(category => formatCategoryLabel(category, chart.catAxisFormatCode, chart.date1904)),
       axisLabelLineHeightPx(wrapFontPx),
     );
-  } else if (!hasDataTable && !isH && !chart.catAxisHidden && catLabelsVisible(chart)) {
+  } else if (!tableOwnsCategoryLabels && !isH && !chart.catAxisHidden && catLabelsVisible(chart)) {
     // Date-axis and rotated column labels are not width-wrapped, but their
     // authored breaks still stack lines (perpendicular to rotated text).
     const labelFontPx = chart.catAxisFontSizeHpt != null
@@ -963,12 +969,16 @@ export function renderBarChart(
   }
   const manualInner = chart.plotAreaManualLayout?.layoutTarget === 'inner' &&
     chart.plotAreaManualLayout.w != null && chart.plotAreaManualLayout.h != null;
+  if (hasDataTable) dataTableGap += innerCategoryExtraH;
   if (!manualInner && innerCategoryExtraH > 0) {
     ph = Math.max(1, ph - innerCategoryExtraH);
   }
 
+  const dataTableWidth = chartDataTableCategoryWidth(
+    chart, pw, primaryAxisRight ? 0 : secLabelBandW + secTitleBandW,
+  );
   const dataTableLayout = hasDataTable
-    ? measureChartDataTable(ctx, chart, pw / n, ptToPx)
+    ? measureChartDataTable(ctx, chart, dataTableWidth / n, ptToPx)
     : null;
   if (dataTableLayout && dataTableLayout.totalHeight > dataTableBaseH) {
     ph = Math.max(1, ph - (dataTableLayout.totalHeight - dataTableBaseH));
@@ -1947,7 +1957,7 @@ export function renderBarChart(
     );
   }
 
-  if ((!hasDataTable || isH) && !chart.catAxisHidden && catLabelsVisible(chart)) {
+  if ((!tableOwnsCategoryLabels || isH) && !chart.catAxisHidden && catLabelsVisible(chart)) {
     // `<c:catAx><c:txPr>…<a:solidFill>` colors the category tick labels.
     ctx.fillStyle = chart.catAxisFontColor ? `#${chart.catAxisFontColor}` : '#555';
     const drawnCatTickFontPx = chart.catAxisFontSizeHpt != null
@@ -2431,9 +2441,9 @@ export function renderBarChart(
   if (dataTableLayout) {
     const tableY = py0 + ph + (isH
       ? (chart.valAxisHidden ? h * 0.02 : catAxisLabelBandH(valAxLabelFontPx))
-      : 0);
+      : dataTableGap);
     drawChartDataTable(
-      ctx, chart, dataTableLayout, px0, tableY, pw, x + legLeftW, ptToPx,
+      ctx, chart, dataTableLayout, px0, tableY, dataTableWidth, x + legLeftW, ptToPx,
     );
   }
 

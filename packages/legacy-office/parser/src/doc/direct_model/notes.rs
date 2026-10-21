@@ -17,13 +17,18 @@
 //! for its metric consumer. Numeric short-rule span remains library policy,
 //! without a claim of Word-exact width or placement.
 //!
-//! Accepted note properties require automatic marks, continuous numbering
-//! with one format/start per note kind (Arabic, Roman or letters), bottom-of-
-//! page footnotes, document-end endnotes and the separator classes gated below.
-//! Other properties stay rejected; literal custom marks need a separate shared
-//! contract for marks that do not consume a number.
+//! A custom-mark reference (aFtnIdx/aEdnIdx == 0) projects as the DOCX
+//! `customMarkFollows` reference host followed by its literal mark text; it
+//! consumes no automatic number (ECMA-376 17.11.14 / the shared renderer).
+//! Accepted note properties require continuous numbering with one
+//! format/start per note kind (Arabic, Roman or letters), bottom-of-page
+//! footnotes, document-end endnotes and the separator classes gated below.
+//! Other properties stay rejected.
 
-use super::{fields::StoryFields, story, ModelBudget};
+use super::{
+    fields::{Linked, StoryFields},
+    story, ModelBudget,
+};
 use crate::doc::{
     formatting, header_fields, headers, notes, numbering, pictures, sections, settings,
     tokenize_with_fields, unsupported, Fields, Paragraph, Token,
@@ -47,7 +52,6 @@ const DOP_NOTE_PROPERTIES_MAX_NFIB: u16 = 0x00d9;
 #[allow(clippy::too_many_arguments)]
 pub(super) fn validate(
     stories: &[Option<notes::Notes<'_>>],
-    references: &notes::References,
     effective_nfib: u16,
     dop: Option<&settings::Properties>,
     sections: &[sections::Section],
@@ -67,11 +71,6 @@ pub(super) fn validate(
     );
     if !footnotes && !endnotes {
         return Ok(None);
-    }
-    if references.iter().any(notes::Reference::custom) {
-        return Err(unsupported(
-            "Word custom note reference marks are not supported",
-        ));
     }
     let dop = dop
         .map(|dop| dop.notes)
@@ -189,10 +188,16 @@ pub(super) fn validate(
         // shared native-story consumer already represents empty stories with
         // no ink or flow. Preserve the equal CPs and explicit None mark;
         // never substitute a default rule or discard custom content.
-        if !(ordinary.standard_rule(separators::RuleKind::Short) || ordinary.empty_story())
+        // A paragraph-only story (one empty paragraph, no rule) reserves
+        // that paragraph without ink in the shared reserved-story consumer.
+        // Endnote continuation keeps its existing envelope (see above).
+        if !(ordinary.standard_rule(separators::RuleKind::Short)
+            || ordinary.empty_story()
+            || ordinary.paragraph_only())
             || !(continuation.standard_rule(separators::RuleKind::Full)
                 || short_continuation
-                || continuation.empty_story())
+                || continuation.empty_story()
+                || (base == 0 && continuation.paragraph_only()))
             || !matches!(headers.separator_text(base + 2), "" | "\r\r")
         {
             return Err(unsupported("custom Word note separators are not supported"));
@@ -251,27 +256,83 @@ fn endnote_message() -> &'static str {
     "Word endnote numbering other than continuous Roman, letter or Arabic numbering is not supported"
 }
 
-/// Turn main-story automatic note characters into references. Every
-/// character must name a reference and every reference must be displayed.
+/// Turn main-story note characters into references. Every automatic U+0002
+/// must name a reference; a custom mark (MS-DOC 2.8.19/2.8.17 aFtnIdx/aEdnIdx
+/// == 0) is an ordinary displayed character at the reference CP, so a
+/// zero-width custom reference host is inserted before it and the character
+/// stays text — the shape of DOCX `footnoteReference customMarkFollows`
+/// followed by its mark (ECMA-376 17.11.14). `check_all_references_placed`
+/// then requires every reference, automatic or custom, to be displayed.
 pub(super) fn restore_references(
     references: &notes::References,
     paragraphs: &mut [Paragraph],
     placed: &mut usize,
 ) -> Result<(), String> {
     for paragraph in paragraphs {
-        for (token, cp) in &mut paragraph.tokens {
-            let token = match token {
-                Token::Linked(linked) => &mut linked.token,
-                token => token,
+        let source = std::mem::take(&mut paragraph.tokens);
+        let mut tokens = Vec::with_capacity(source.len());
+        for (mut token, cp) in source {
+            let (inner, link) = match &mut token {
+                Token::Linked(linked) => (&mut linked.token, Some(&linked.link)),
+                token => (token, None),
             };
-            if matches!(token, Token::NoteMarker) {
-                let reference = references.get(*cp).ok_or_else(|| {
-                    unsupported("Word automatic note character without a note reference")
-                })?;
-                *token = Token::NoteReference(reference.clone());
-                *placed += 1;
+            match inner {
+                Token::NoteMarker => {
+                    let reference = references.get(cp).ok_or_else(|| {
+                        unsupported("Word automatic note character without a note reference")
+                    })?;
+                    *inner = Token::NoteReference(reference.clone());
+                    *placed += 1;
+                }
+                Token::Text(text) => {
+                    let end = cp + text.encode_utf16().count();
+                    let mut marks = references.custom_in(cp..end).peekable();
+                    if marks.peek().is_some() {
+                        let link = link.cloned();
+                        let wrap = |token| match &link {
+                            Some(link) => Token::Linked(Box::new(Linked {
+                                token,
+                                link: link.clone(),
+                            })),
+                            None => token,
+                        };
+                        let text = std::mem::take(text);
+                        let (mut start_byte, mut start_cp) = (0, cp);
+                        let mut chars = text.char_indices();
+                        let mut at = cp;
+                        for (mark_cp, reference) in marks {
+                            // Advance to the mark character's byte offset.
+                            while at < mark_cp {
+                                let (_, ch) = chars.next().ok_or_else(|| {
+                                    unsupported("Word custom note mark outside its text")
+                                })?;
+                                at += ch.len_utf16();
+                            }
+                            let byte = chars.offset();
+                            if at != mark_cp {
+                                return Err(unsupported(
+                                    "Word note reference splits Unicode character",
+                                ));
+                            }
+                            if byte > start_byte {
+                                tokens.push((
+                                    wrap(Token::Text(text[start_byte..byte].to_string())),
+                                    start_cp,
+                                ));
+                            }
+                            tokens.push((wrap(Token::NoteReference(reference.clone())), mark_cp));
+                            *placed += 1;
+                            (start_byte, start_cp) = (byte, mark_cp);
+                        }
+                        tokens.push((wrap(Token::Text(text[start_byte..].to_string())), start_cp));
+                        continue;
+                    }
+                }
+                _ => {}
             }
+            tokens.push((token, cp));
         }
+        paragraph.tokens = tokens;
     }
     Ok(())
 }
@@ -317,8 +378,10 @@ pub(super) fn project(
                     token => token,
                 };
                 if matches!(token, Token::NoteMarker) {
-                    // `validate` rejected custom marks, so every note is
-                    // automatic; each U+0002 shows the enclosing note number.
+                    // Each U+0002 shows the enclosing note's number. A
+                    // custom-mark note consumes no number, so the shared
+                    // renderer suppresses it there, as for a DOCX `footnoteRef`
+                    // inside a `customMarkFollows` note.
                     *token = Token::NoteNumber(notes.kind);
                 }
             }
@@ -471,7 +534,6 @@ mod tests {
             // formatting rather than substituting the continuation-role default.
             let settings = super::validate(
                 &facts.note_stories,
-                &facts.note_references,
                 facts.effective_nfib,
                 facts.document_settings.as_ref(),
                 &facts.sections,
@@ -595,7 +657,6 @@ mod tests {
                 let mut budget = super::super::ModelBudget::new(limit);
                 let result = super::validate(
                     &facts.note_stories,
-                    &facts.note_references,
                     facts.effective_nfib,
                     facts.document_settings.as_ref(),
                     &facts.sections,
@@ -691,6 +752,78 @@ mod tests {
     }
 
     #[test]
+    fn custom_note_marks_project_as_custom_mark_follows_references() {
+        // MS-DOC 2.8.19 aFtnIdx == 0: the literal mark at the reference CP
+        // stays ordinary text after a custom reference host, as DOCX
+        // `footnoteReference customMarkFollows` + its mark, and the note's own
+        // text keeps its literal mark. Automatic notes still number.
+        let notes = ["\u{2020} custom\r", "\u{2} auto\r"];
+        let references = [(1, false), (4, true)];
+        let projected = document("A\u{2020}BC\u{2}\r", &fixture(&notes, &references)).unwrap();
+        let BodyElement::Paragraph(paragraph) = &projected.body[0] else {
+            panic!("paragraph expected");
+        };
+        let notes_refs: Vec<_> = paragraph
+            .runs
+            .iter()
+            .filter_map(|run| match run {
+                DocRun::Text(text) => text.note_ref.as_ref().map(|note| note.custom_mark_follows),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(notes_refs, [true, false]);
+        assert_eq!(
+            runs(&projected.body[0]),
+            ["A", "footnote:1:1:", "\u{2020}BC", "footnote:2:2:super"]
+        );
+        assert_eq!(
+            runs(&projected.footnotes[0].content[0]),
+            ["\u{2020} custom"]
+        );
+        assert_eq!(
+            runs(&projected.footnotes[1].content[0]),
+            ["footnote:::super", " auto"]
+        );
+        // A custom mark at the start or end of a text token, and adjacent
+        // custom marks, each keep their own host and literal character.
+        let notes = ["* one\r", "* two\r"];
+        let projected =
+            document("*\u{2020}\r", &fixture(&notes, &[(0, false), (1, false)])).unwrap();
+        assert_eq!(
+            runs(&projected.body[0]),
+            ["footnote:1:1:", "*", "footnote:2:2:", "\u{2020}"]
+        );
+        // A custom mark must still be a displayed character.
+        let reject = |fixture: NotesFixture<'_>, text: &str| document(text, &fixture).unwrap_err();
+        assert!(
+            reject(fixture(&notes[..1], &[(1, false)]), "A\tB\r").contains("custom note marker")
+        );
+    }
+
+    #[test]
+    fn paragraph_only_separator_stories_reserve_their_paragraph_without_a_rule() {
+        // MS-DOC 2.3.3: a separator story holding only an empty paragraph.
+        let notes = ["\u{2} one\r"];
+        let references = [(1, true)];
+        let mut properties = fixture(&notes, &references);
+        properties.separators[0] = "\r\r";
+        properties.separators[1] = "\r\r";
+        let projected = document("A\u{2}\r", &properties).unwrap();
+        let settings = serde_json::to_value(projected.note_layout_settings.unwrap()).unwrap();
+        for role in ["separator", "continuationSeparator"] {
+            let story = &settings["reservedSeparators"]["footnote"][role];
+            assert!(story.get("rule").is_none());
+            assert!(story["paragraph"]["contentMark"]["run"].is_object());
+        }
+        // A rule-free story with authored text is still a custom separator.
+        let mut properties = fixture(&notes, &references);
+        properties.separators[0] = "x\r\r";
+        assert!(document("A\u{2}\r", &properties)
+            .unwrap_err()
+            .contains("custom Word note separators"));
+    }
+
+    #[test]
     fn note_fields_use_the_footnote_field_table() {
         let notes = ["\u{2} p\u{13}PAGE\u{14}9\u{15}\r"];
         let references = [(1, true)];
@@ -725,9 +858,6 @@ mod tests {
         let notes = ["\u{2} one\r"];
         let references = [(1, true)];
         let reject = |fixture: NotesFixture<'_>, text: &str| document(text, &fixture).unwrap_err();
-        // A literal custom mark would still be numbered by the renderer.
-        let custom = [(1, false)];
-        assert!(reject(fixture(&notes, &custom), "A*\r").contains("custom note reference"));
         for (offset, value, message) in [
             // Chicago numbering, per-section and per-page restarts, a zero
             // start and beneath-text placement have no shared rendering.

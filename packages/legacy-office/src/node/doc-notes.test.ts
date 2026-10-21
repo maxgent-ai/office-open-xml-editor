@@ -85,13 +85,6 @@ it.each([
   }))).rejects.toMatchObject({ code: 'unsupported-content', details: { format: 'doc', reason: 'source-subset' } });
 });
 
-it('direct rejects custom note reference marks', async () => {
-  // The converter kept "*" as literal text with customMarkFollows; the shared
-  // renderer has no literal-mark notes that do not consume a number.
-  await expect(load(buildDocFixture({ text: 'A* B\u0013DDE hidden\u0014cached\u0015\r',
-    footnotes: [{ cp: 1, text: '* Note\u0013DDE hidden\u0014safe cache\u0015\r', automatic: false }] }))).rejects.toMatchObject({ code: 'unsupported-content', details: { format: 'doc', reason: 'source-subset' } });
-});
-
 it.each([
   { text: 'Ax\r', characterProperties: new Uint8Array([0x55, 0x08, 1]), reason: 'invalid Word automatic note marker' },
   { text: 'A\u0002\r', characterProperties: new Uint8Array(), reason: 'Word note reference lacks special-character property' },
@@ -154,5 +147,32 @@ it.skipIf(!skia).each([
     // Arabic footnotes and lowercase-Roman endnotes (the fixture's DOP).
     const mark = kind === 'footnotes' ? '1' : 'i';
     expect(runs.filter(r => r.text === mark).length).toBeGreaterThanOrEqual(2);
+  } finally { await session.close(); }
+});
+
+// MS-DOC 2.8.19 aFtnIdx == 0 (custom mark) and a 2.3.3 paragraph-only
+// ordinary separator story: the literal mark stays text, consumes no number,
+// and the separator reserves its empty paragraph without a rule.
+it.skipIf(!skia)('renders a custom-mark footnote without consuming the automatic numbering', async () => {
+  const bytes = buildDocFixture({ text: 'A*B\u0002\r',
+    footnotes: [{ cp: 1, automatic: false, text: '*Custom note\r' }, { cp: 3, text: '\u0002Automatic note\r' }],
+    noteSeparators: ['\r\r', '\u0004\r\r', '', '', '', ''],
+    characterProperties: new Uint8Array([0x55, 0x08, 1]), defaultTabTwips: 720 });
+  const model = await load(bytes) as unknown as Model;
+  const marks = model.body[0].runs.filter(r => r.noteRef);
+  expect(marks.map(r => r.noteRef)).toEqual([
+    { kind: 'footnote', id: '1', customMarkFollows: true }, { kind: 'footnote', id: '2' },
+  ]);
+  const separator = (model as unknown as { __noteLayoutSettings: { reservedSeparators: { footnote: { separator: { rule?: unknown; paragraph?: unknown } } } } })
+    .__noteLayoutSettings.reservedSeparators.footnote.separator;
+  expect(separator.rule).toBeUndefined();
+  expect(separator.paragraph).toBeDefined();
+  const session = await openDocxDocument(bytes, { factory: skiaFactory(), currentDate: 0, legacyDoc: testDocSource() });
+  try {
+    const runs: string[] = [];
+    for (let page = 0; page < session.pageCount; page++) await session.renderPage(page, { dpr: 1, onTextRun: r => runs.push(r.text) });
+    // Body: A, the literal *, then the automatic reference numbered 1; the
+    // custom note keeps its literal mark and the automatic note shows 1.
+    expect(runs.join('')).toBe('A*B1*Custom note1Automatic note');
   } finally { await session.close(); }
 });

@@ -852,6 +852,10 @@ export class XlsxWorkbook {
     const release = () => { releasePin(); };
     try {
       const completion = this.getOrLoadWorksheet(sheetIndex);
+      // Preview readiness can reject before this lease exposes completion (for
+      // example, on destroy). Observe both promises immediately; callers still
+      // receive failures through ready or the original completion promise.
+      void completion.catch(() => undefined);
       const progress = this.sheetPreviews?.get(sheetIndex);
       const worksheet = progress ? await progress.ready : await completion;
       return {

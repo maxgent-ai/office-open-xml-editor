@@ -121,7 +121,7 @@ Unicode copyright header; not part of the npm tarball):
   Vertical_Orientation, UCD 17.0.0)
 - `packages/docx/scripts/ArabicShaping.txt` (Joining_Type / Joining_Group,
   UCD 17.0.0)
-- `packages/docx/scripts/DerivedJoiningType.txt` (UCD 17.0.0)
+- `packages/core/scripts/DerivedJoiningType.txt` (UCD 17.0.0)
 
 Shipped in `dist/` as UCD-derived data compiled from the above and from
 `LineBreak.txt` / `DerivedGeneralCategory.txt` / `EastAsianWidth.txt`

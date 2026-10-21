@@ -19,8 +19,8 @@
 // SETROP2 (COPYPEN/NOP), SETPOLYFILLMODE,
 // SETTEXTCOLOR, SETTEXTALIGN, CREATEPENINDIRECT, CREATEBRUSHINDIRECT,
 // CREATEFONTINDIRECT, SELECTOBJECT, DELETEOBJECT, POLYLINE, POLYGON,
-// POLYPOLYGON, RECTANGLE, MOVETO, LINETO, TEXTOUT, a bounded ANSI/Symbol
-// EXTTEXTOUT subset,
+// POLYPOLYGON, RECTANGLE, MOVETO, LINETO, TEXTOUT and EXTTEXTOUT (with
+// SETBKCOLOR/SETBKMODE/SETTEXTCHAREXTRA/SETTEXTJUSTIFICATION; see ./wmf-text.ts),
 // STRETCHDIBITS (embedded raster DIB via the
 // shared decoder in ./dib.ts), EOF.
 // Ignored (no-op, skipped by size):
@@ -36,13 +36,18 @@
 
 import { decodePackedDib, blitDibToCtx } from './dib.js';
 import { createAuxCanvas } from '../canvas/aux-canvas.js';
-import { decodeMetafileSymbolText } from '../fonts/metafile-symbol-encoding.js';
+import { drawWmfText, parseWmfFont, ETO_CLIPPED, ETO_OPAQUE, TA_UPDATECP, type WmfFont } from './wmf-text.js';
 
 // WMF record function codes (the subset we act on; others are skipped by size).
 const META = {
   EOF: 0x0000,
   SETBKMODE: 0x0102,
   SETBKCOLOR: 0x0201,
+  SETTEXTCHAREXTRA: 0x0108,
+  SETTEXTJUSTIFICATION: 0x020a,
+  CREATEPALETTE: 0x00f7,
+  CREATEPATTERNBRUSH: 0x01f9,
+  DIBCREATEPATTERNBRUSH: 0x0142,
   SETTEXTALIGN: 0x012e,
   SETTEXTCOLOR: 0x0209,
   SETPOLYFILLMODE: 0x0106,
@@ -158,25 +163,13 @@ interface Brush {
   kind: 'brush';
   fill: string | null; // null = BS_NULL / hollow (no fill)
 }
-interface Font {
-  kind: 'font';
-  height: number; // |lfHeight|, logical units
-  signedHeight: number;
-  width: number;
-  escapement: number;
-  orientation: number;
-  weight: number; // lfWeight (400 normal, 700 bold)
-  italic: boolean;
-  underline: boolean;
-  strikeout: boolean;
-  charset: number;
-  face: string;
-  ansiFace: string;
-  validForExt: boolean;
-}
+type Font = WmfFont;
+/** An object a record creates but this player does not interpret (palette,
+ *  pattern brush). It occupies its object-table slot so later indices align. */
+interface OtherObject { kind: 'other' }
 type RectBounds = [number, number, number, number];
 interface Region { kind: 'region'; tree: ClipNode | null; valid: boolean }
-type WmfObject = Pen | Brush | Font | Region;
+type WmfObject = Pen | Brush | Font | Region | OtherObject;
 // The DC region is independent of both the raster surface and caller clip.
 // An immutable, height-balanced spatial tree owns disjoint rectangle pieces.
 // Saved DCs share untouched subtrees; offsets are O(1), never history replays.
@@ -322,7 +315,12 @@ interface PlayState {
   curBrush: Brush | null;
   curFont: Font | null;
   textColor: string;
+  bkColor: string;
   textAlign: number;
+  charExtra: number;
+  breakCount: number;
+  breakQuotientPx: number;
+  breakErrorPx: number;
   fillRule: CanvasFillRule; // from SETPOLYFILLMODE
   rop2: number;
   bkMode: number;
@@ -659,141 +657,78 @@ function createBrush(c: Cursor): Brush {
   return { kind: 'brush', fill };
 }
 
-function decodeSingleByteText(bytes: Uint8Array): string {
-  const end = bytes.indexOf(0);
-  const body = end >= 0 ? bytes.subarray(0, end) : bytes;
-  if (body.length === 0) return '';
+/** META_TEXTOUT / META_EXTTEXTOUT through the shared text model. */
+function drawText(s: PlayState, record: string, output: Parameters<typeof drawWmfText>[1]): void {
+  if (!s.extTextSafe) {
+    s.unsupported.add(`${record} (text state undefined after an unsupported record)`);
+    if (s.textAlign & TA_UPDATECP) s.currentPositionKnown = false;
+    return;
+  }
   try {
-    return new TextDecoder('shift_jis').decode(body);
+    const result = drawWmfText(s, output);
+    if ('problem' in result) {
+      s.unsupported.add(`${record} (${result.problem})`);
+      if (s.textAlign & TA_UPDATECP) s.currentPositionKnown = false;
+    } else if (result.drew) s.drew = true;
   } catch {
-    return String.fromCharCode(...body);
+    // A context without text support (some test or server-side contexts).
+    s.unsupported.add(`${record} (text output failed)`);
+    if (s.textAlign & TA_UPDATECP) s.currentPositionKnown = false;
   }
 }
 
-// WHATWG Encoding §9.1, index-windows-1252.txt (identifier e56d49d9,
-// 2024-09-18). Decode directly so WMF ANSI text is deterministic even on
-// hosts whose TextDecoder delegates this label to an ISO-8859-1 codec.
-const WINDOWS_1252_C1 = [
-  0x20ac, 0x0081, 0x201a, 0x0192, 0x201e, 0x2026, 0x2020, 0x2021,
-  0x02c6, 0x2030, 0x0160, 0x2039, 0x0152, 0x008d, 0x017d, 0x008f,
-  0x0090, 0x2018, 0x2019, 0x201c, 0x201d, 0x2022, 0x2013, 0x2014,
-  0x02dc, 0x2122, 0x0161, 0x203a, 0x0153, 0x009d, 0x017e, 0x0178,
-] as const;
-
-function decodeWindows1252(bytes: Uint8Array): string {
-  return Array.from(bytes, (byte) =>
-    String.fromCharCode(byte >= 0x80 && byte <= 0x9f ? WINDOWS_1252_C1[byte - 0x80] : byte),
-  ).join('');
-}
-
-function createFont(c: Cursor): Font {
-  const validLength = c.remaining === 50;
-  const signedHeight = c.i16();
-  const height = Math.abs(signedHeight);
-  const width = c.i16();
-  const escapement = c.i16();
-  const orientation = c.i16();
-  const weight = c.i16();
-  const italic = c.u8() !== 0;
-  const underline = c.u8() !== 0;
-  const strikeout = c.u8() !== 0;
-  const charset = c.u8();
-  c.u8(); // lfOutPrecision
-  c.u8(); // lfClipPrecision
-  c.u8(); // lfQuality
-  c.u8(); // lfPitchAndFamily
-  const faceBytes = c.bytes(Math.min(32, c.remaining));
-  const face = decodeSingleByteText(faceBytes);
-  const nul = faceBytes.indexOf(0);
-  const ansiFace = String.fromCharCode(...faceBytes.subarray(0, nul < 0 ? faceBytes.length : nul));
-  return { kind: 'font', height, signedHeight, width, escapement, orientation, weight, italic, underline, strikeout, charset, face, ansiFace, validForExt: validLength && nul >= 0 };
-}
-
-/** MS-WMF 2.3.3.5, 2.2.1.2 and 2.1.2.3. This implementation intentionally
- * omits valid variants outside the bounded ANSI/Symbol transparent baseline subset;
- * omission is implementation policy, not a claim that those records are invalid. */
+/** MS-WMF 2.3.3.5 META_EXTTEXTOUT. */
 function drawExtTextOut(s: PlayState, c: Cursor): void {
-  // Report EXTTEXTOUT omissions even when other records draw. This is a bounded
-  // text diagnostic, not a complete audit of the WMF player's skipped records.
-  const omit = () => { s.unsupported.add('META_EXTTEXTOUT (unsupported text state or encoding)'); };
-  if (c.remaining < 8) { omit(); return; }
+  const record = 'META_EXTTEXTOUT';
+  if (c.remaining < 8) { s.unsupported.add(`${record} (malformed)`); return; }
   const y = c.i16();
   const x = c.i16();
   const length = c.i16();
   const options = c.u16();
-  if (length < 0) { omit(); return; }
-  if (options !== 0) { omit(); return; } // Rectangle-bearing/clipped/opaque variants are outside this subset.
-  const padded = length + (length & 1);
-  if (c.remaining !== padded) { omit(); return; } // Reject truncation and any optional Dx array.
-  const raw = c.bytes(length);
+  const hasRect = (options & (ETO_OPAQUE | ETO_CLIPPED)) !== 0;
+  if (length < 0 || c.remaining < (hasRect ? 8 : 0) + length) { s.unsupported.add(`${record} (malformed)`); return; }
+  let rect: [number, number, number, number] | null = null;
+  if (hasRect) rect = [c.i16(), c.i16(), c.i16(), c.i16()];
+  const bytes = c.bytes(length);
   if (length & 1) c.skip(1);
-  const font = s.curFont;
-  const horizontal = s.textAlign & 0x6;
-  const unsupportedAlignment = (s.textAlign & ~0x1e) !== 0 || (s.textAlign & 0x18) !== 0x18 || ![0, 2, 6].includes(horizontal);
-  if (
-    !s.extTextSafe ||
-    !s.extTextMappingSafe ||
-    s.bkMode !== 1 ||
-    unsupportedAlignment ||
-    !s.haveExt ||
-    !(s.extX > 0 && s.extY > 0 && s.W > 0 && s.H > 0) ||
-    ![s.extX, s.extY, s.W, s.H].every(Number.isFinite) ||
-    !font ||
-    (font.charset !== 0 && font.charset !== 2) ||
-    font.signedHeight >= 0 ||
-    font.width !== 0 ||
-    font.escapement !== 0 ||
-    font.orientation !== 0 ||
-    font.underline ||
-    font.strikeout ||
-    !font.ansiFace ||
-    /[\x00-\x1f\x7f]/.test(font.ansiFace) ||
-    !font.validForExt ||
-    font.weight < 1 ||
-    font.weight > 1000
-  ) { omit(); return; }
-  // MS-WMF 2.2.1.2 Font.CharSet selects the byte encoding. SYMBOL_CHARSET
-  // is font-specific, not Windows-1252; only a fully known repertoire is drawn.
-  const text = font.charset === 2
-    ? decodeMetafileSymbolText(Array.from(raw, (byte) => String.fromCharCode(byte)).join(''), font.ansiFace)
-    : decodeWindows1252(raw);
-  if (text === null) { omit(); return; }
-  if (!text.length) return;
-  const px = font.height * (s.vpH / s.extY);
-  if (!Number.isFinite(px) || px <= 0) { omit(); return; }
-  try {
-    s.ctx.fillStyle = s.textColor;
-    const family = `"${font.ansiFace.replaceAll('\\', '\\\\').replaceAll('"', '\\"')}"`;
-    s.ctx.font = `${font.italic ? 'italic ' : ''}${font.weight} ${px}px ${font.charset === 2 ? 'serif' : family}`;
-    const horiz = s.textAlign & 0x6;
-    s.ctx.textAlign = horiz === 2 ? 'right' : horiz === 6 ? 'center' : 'left';
-    s.ctx.textBaseline = 'alphabetic';
-    s.ctx.fillText(text, mapX(s, x), mapY(s, y));
-    s.drew = true;
-  } catch { omit(); }
+  // The optional Dx array has one 16-bit entry per String byte (two with
+  // ETO_PDY); absent when the record ends with the string.
+  const entries = length * ((options & 0x2000) ? 2 : 1);
+  let dx: Int16Array | null = null;
+  if (c.remaining > 0 && length > 0) {
+    if (c.remaining < entries * 2) { s.unsupported.add(`${record} (malformed Dx array)`); return; }
+    dx = new Int16Array(entries);
+    for (let i = 0; i < entries; i++) dx[i] = c.i16();
+  }
+  drawText(s, record, { x, y, bytes, options, rect, dx });
 }
 
-function drawTextOut(s: PlayState, text: string, x: number, y: number): void {
-  if (text.length === 0) return;
-  const font = s.curFont;
-  const logicalHeight = font?.height || 12;
-  const px = Math.abs(mapY(s, s.orgY + logicalHeight) - mapY(s, s.orgY));
-  if (!Number.isFinite(px) || px < 1) return;
-  const { ctx } = s;
-  try {
-    ctx.fillStyle = s.textColor;
-    const weight = font && font.weight >= 700 ? 'bold ' : '';
-    const italic = font?.italic ? 'italic ' : '';
-    ctx.font = `${italic}${weight}${px}px ${font?.face || 'sans-serif'}`;
-    const horiz = s.textAlign & 0x6;
-    ctx.textAlign = horiz === 0x2 ? 'right' : horiz === 0x6 ? 'center' : 'left';
-    ctx.textBaseline = (s.textAlign & 0x18) === 0x18 ? 'alphabetic' : 'top';
-    ctx.fillText(text, mapX(s, x), mapY(s, y));
-    s.drew = true;
-  } catch {
-    // Some test or server-side contexts may not implement fillText.
-  }
-}
+const STATE_NEUTRAL_RECORDS: ReadonlySet<number> = new Set([
+  0x0035, // META_REALIZEPALETTE
+  0x0037, // META_SETPALENTRIES
+  0x0105, // META_SETRELABS (reserved)
+  0x0107, // META_SETSTRETCHBLTMODE
+  0x012a, // META_INVERTREGION
+  0x012b, // META_PAINTREGION
+  0x0139, // META_RESIZEPALETTE
+  0x0228, // META_FILLREGION
+  0x0231, // META_SETMAPPERFLAGS (font-mapper aspect matching only)
+  0x0234, // META_SELECTPALETTE
+  0x0418, // META_ELLIPSE
+  0x0419, // META_FLOODFILL
+  0x041f, // META_SETPIXEL
+  0x0429, // META_FRAMEREGION
+  0x0436, // META_ANIMATEPALETTE
+  0x0548, // META_EXTFLOODFILL
+  0x061c, // META_ROUNDRECT
+  0x061d, // META_PATBLT
+  0x0817, // META_ARC
+  0x081a, // META_PIE
+  0x0830, // META_CHORD
+  0x0922, // META_BITBLT
+  0x0b23, // META_STRETCHBLT
+  0x0d33, // META_SETDIBTODEV
+]);
 
 // ── core record-replay loop (pure; testable with a mock ctx) ────────────────
 
@@ -844,7 +779,13 @@ export function playWmf(
     curBrush: null,
     curFont: null,
     textColor: '#000000',
+    // Win32 DC defaults: white background, OPAQUE mode (SetBkColor/SetBkMode).
+    bkColor: '#ffffff',
     textAlign: 0,
+    charExtra: 0,
+    breakCount: 0,
+    breakQuotientPx: 0,
+    breakErrorPx: 0,
     fillRule: 'nonzero',
     rop2: 13,
     bkMode: 2,
@@ -1052,8 +993,35 @@ function replayWmfRecords(bytes: Uint8Array, s: PlayState, pos: number): void {
         break;
       }
       case META.SETBKCOLOR: {
-        // Background color cannot affect this supported transparent-text subset.
-        if (c.remaining !== 4) s.extTextSafe = false;
+        if (c.remaining !== 4) { s.extTextSafe = false; break; }
+        s.bkColor = colorRefToCss(c.u32());
+        break;
+      }
+      case META.SETTEXTCHAREXTRA: {
+        // MS-WMF 2.3.5.25: u16 CharExtra, logical units added per character.
+        if (c.remaining !== 2) { s.extTextSafe = false; break; }
+        s.charExtra = c.u16();
+        break;
+      }
+      case META.SETTEXTJUSTIFICATION: {
+        // MS-WMF 2.3.5.27: u16 BreakCount, then u16 BreakExtra (logical units
+        // shared by the break characters of following text output).
+        if (c.remaining !== 4) { s.extTextSafe = false; break; }
+        // GDI transforms BreakExtra to device units, rounds it, and shares it
+        // over the break characters: each gets the quotient, and the error
+        // (remainder) is paid one unit at a time by successive break
+        // characters, across text outputs, until the next justification.
+        s.breakCount = c.u16();
+        const breakExtraPx = Math.round(c.u16() * Math.abs(s.vpW / s.extX));
+        s.breakQuotientPx = s.breakCount > 0 && Number.isFinite(breakExtraPx) ? Math.trunc(breakExtraPx / s.breakCount) : 0;
+        s.breakErrorPx = s.breakCount > 0 && Number.isFinite(breakExtraPx) ? breakExtraPx - s.breakQuotientPx * s.breakCount : 0;
+        break;
+      }
+      case META.CREATEPALETTE:
+      case META.CREATEPATTERNBRUSH:
+      case META.DIBCREATEPATTERNBRUSH: {
+        // MS-WMF 3.1.4.1: every object record takes the lowest free slot.
+        insertObject(s.objects, { kind: 'other' });
         break;
       }
       case META.CREATEPENINDIRECT: {
@@ -1067,13 +1035,12 @@ function replayWmfRecords(bytes: Uint8Array, s: PlayState, pos: number): void {
         break;
       }
       case META.CREATEFONTINDIRECT: {
-        if (c.remaining < 18) {
-          s.extTextSafe = false;
-          s.lineStateSafe = false;
-          break;
-        }
-        if (c.remaining !== 50) s.lineStateSafe = false;
-        insertObject(s.objects, createFont(c));
+        // MS-WMF 2.2.1.2: FaceName is NUL-terminated within at most 32 bytes,
+        // so writers may store fewer than 50 parameter bytes. Every record
+        // takes an object slot; a malformed font is reported when used.
+        const created = parseWmfFont(c.bytes(c.remaining));
+        if (!created.valid) s.lineStateSafe = false;
+        insertObject(s.objects, created);
         break;
       }
       case META.SELECTOBJECT: {
@@ -1087,6 +1054,7 @@ function replayWmfRecords(bytes: Uint8Array, s: PlayState, pos: number): void {
         if (obj?.kind === 'pen') s.curPen = obj;
         else if (obj?.kind === 'brush') s.curBrush = obj;
         else if (obj?.kind === 'font') s.curFont = obj;
+        else if (obj?.kind === 'other') s.lineStateSafe = false;
         else {
           s.extTextSafe = false;
           s.lineStateSafe = false;
@@ -1164,18 +1132,18 @@ function replayWmfRecords(bytes: Uint8Array, s: PlayState, pos: number): void {
       case META.TEXTOUT: {
         // META_TEXTOUT params: u16 StringLength, String bytes padded to a WORD
         // boundary, then i16 yStart and i16 xStart.
+        if (c.remaining < 2) { s.unsupported.add('META_TEXTOUT (malformed)'); break; }
         const len = c.u16();
-        const text = decodeSingleByteText(c.bytes(len));
+        if (c.remaining < len + (len & 1) + 4) { s.unsupported.add('META_TEXTOUT (malformed)'); break; }
+        const bytes = c.bytes(len);
         if (len % 2 !== 0) c.skip(1);
         const y = c.i16();
         const x = c.i16();
-        drawTextOut(s, text, x, y);
-        if ((s.textAlign & 0x1) !== 0) s.currentPositionKnown = false;
+        drawText(s, 'META_TEXTOUT', { x, y, bytes, options: 0, rect: null, dx: null });
         break;
       }
       case META.EXTTEXTOUT: {
         drawExtTextOut(s, c);
-        if ((s.textAlign & 0x1) !== 0) s.currentPositionKnown = false;
         break;
       }
       case META.ESCAPE: {
@@ -1241,7 +1209,12 @@ function replayWmfRecords(bytes: Uint8Array, s: PlayState, pos: number): void {
         // common embedded-raster case.
         break;
       default:
-        // Unsupported graphics-state changes make later EXTTEXTOUT unsafe for
+        // MS-WMF 2.1.1.1 records that neither create objects nor change the DC
+        // text, line or mapping state (drawing-only operations, palette
+        // realization, font-mapper hints, the reserved SETRELABS) are skipped
+        // by size without affecting later records.
+        if (STATE_NEUTRAL_RECORDS.has(fn)) break;
+        // Unsupported graphics-state changes make later text output unsafe for
         // this bounded player, although established geometry handlers remain
         // unaffected and the record is still skipped by its declared size.
         s.extTextSafe = false;

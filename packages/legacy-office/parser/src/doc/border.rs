@@ -179,6 +179,21 @@ impl Border {
         })
     }
 
+    /// Replace the color of a visible border with a COLORREF (None is
+    /// cvAuto), keeping its type, width and flags. A cleared or absent border
+    /// has no color to refine.
+    pub(in crate::doc) fn refine_color(&mut self, color: Option<[u8; 3]>) {
+        if self.is_cleared() {
+            return;
+        }
+        if let Some(facts) = &mut self.facts {
+            facts.color = Some(color.map_or_else(
+                || "auto".into(),
+                |[r, g, b]| format!("{r:02X}{g:02X}{b:02X}"),
+            ));
+        }
+    }
+
     /// True for the documented no-border values: NilBrc/Brc80MayBeNil and a
     /// border type of zero (none). A cleared diagonal equals its absence.
     pub(in crate::doc) fn is_cleared(&self) -> bool {

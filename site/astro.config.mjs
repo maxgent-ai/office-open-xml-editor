@@ -68,6 +68,9 @@ export default defineConfig({
         '@silurus/ooxml-core/internal/font-decoration': fileURLToPath(
           new URL('../packages/core/src/text/font-decoration.ts', import.meta.url),
         ),
+        '@silurus/ooxml-core/internal/joining-type': fileURLToPath(
+          new URL('../packages/core/src/text/joining-type.ts', import.meta.url),
+        ),
         '@silurus/ooxml-core/internal/bounded-async-lru-cache': fileURLToPath(
           new URL('../packages/core/src/internal/bounded-async-lru-cache.ts', import.meta.url),
         ),
