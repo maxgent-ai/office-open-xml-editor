@@ -9,6 +9,7 @@
     "url": "git+https://github.com/yukiyokotani/office-open-xml-viewer.git",
     "directory": "packages/legacy-office"
   },
+  "homepage": "https://ooxml.silurus.dev",
   "type": "module",
   "sideEffects": false,
   "exports": {
