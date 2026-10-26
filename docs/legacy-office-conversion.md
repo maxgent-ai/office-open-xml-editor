@@ -192,6 +192,13 @@ Explicit values, including zero, win. Unlisted languages keep the
 unresolved-margin recovery. The host locale and the document's text language
 are not used to guess the producer's settings.
 
+A default character language of 0x007F (reserved in MS-LCID 2.2; Windows
+names it LOCALE_INVARIANT), stamped by some third-party producers, projects
+no language: Word opens such documents and writes an empty `w:lang
+w:val=""` on DOCX save, which the DOCX reader treats as no language. The
+other language axes have no Office evidence for this value and stay
+rejected, as do unlisted LCIDs.
+
 Fields in the direct DOC source are checked against each story's own field
 table: the main document, headers and footers, footnotes, endnotes and
 textboxes (MS-DOC 2.8.25). They map onto the fields the DOCX reader already
