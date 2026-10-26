@@ -199,6 +199,12 @@ w:val=""` on DOCX save, which the DOCX reader treats as no language. The
 other language axes have no Office evidence for this value and stay
 rejected, as do unlisted LCIDs.
 
+A table whose style selection resolves to istd 0x000B (MS-DOC 2.6.3
+sprmTIstd) in a stylesheet that does not define even that slot gets no
+table style: Word opens such documents and saves the tables without
+`w:tblStyle`. Unsupported content inside a defined table style stays
+rejected.
+
 Fields in the direct DOC source are checked against each story's own field
 table: the main document, headers and footers, footnotes, endnotes and
 textboxes (MS-DOC 2.8.25). They map onto the fields the DOCX reader already
