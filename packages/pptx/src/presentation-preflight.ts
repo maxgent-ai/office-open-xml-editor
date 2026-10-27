@@ -8,7 +8,8 @@ import {
   measureStructuralJson,
 } from '@silurus/ooxml-core/internal/resource-measurement';
 import { HARD_MAX_PPTX_PREFLIGHT_PROJECTION_BYTES } from '@silurus/ooxml-core/worker';
-import { PptxFontPreloadAccumulator } from './google-fonts';
+import { FONT_SUBSTITUTE_SCRIPTS } from '@silurus/ooxml-core/internal/font-sources';
+import { PptxFontPreloadAccumulator, type PptxFontDemandFacts } from './font-requests';
 import type {
   MediaElement,
   PptxComment,
@@ -63,6 +64,46 @@ export interface PresentationPreflight {
   readonly slides: readonly PresentationPreflightSlide[];
   readonly fontPreloadNames: readonly (string | null)[];
   readonly fontPreloadDemand?: FontPreloadDemand;
+  /** Present only when font sources are configured (`LoadOptions.fonts`). */
+  readonly fontPreloadFacts?: PptxFontDemandFacts;
+}
+
+/** The font fields of a preflight projection. Their measured bytes are one
+ * unit of the projection budget, so the facts that exist only with font
+ * sources are charged exactly like the names. */
+function fontProjection(
+  names: readonly (string | null)[],
+  facts: PptxFontDemandFacts | undefined,
+): { fontPreloadNames: readonly (string | null)[]; fontPreloadFacts?: PptxFontDemandFacts } {
+  return facts ? { fontPreloadNames: names, fontPreloadFacts: facts } : { fontPreloadNames: names };
+}
+
+const KNOWN_SUBSTITUTE_SCRIPTS: ReadonlySet<string> = new Set(FONT_SUBSTITUTE_SCRIPTS);
+
+function normalizeFontDemandFacts(value: unknown, nameCount: number): PptxFontDemandFacts {
+  const invalid = () => new Error('invalid PPTX presentation preflight font demand facts');
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw invalid();
+  const candidate = value as Partial<Record<keyof PptxFontDemandFacts, unknown>>;
+  const familyCount = candidate.familyCount;
+  if (typeof familyCount !== 'number' || !Number.isSafeInteger(familyCount) || familyCount < 0 || familyCount > nameCount
+    || !Array.isArray(candidate.tuples)) throw invalid();
+  const tuples = candidate.tuples.map((tuple: unknown) => {
+    const fields = (tuple ?? {}) as Partial<Record<'family' | 'weight' | 'style', unknown>>;
+    if (typeof fields.family !== 'string' || typeof fields.weight !== 'number' || !Number.isFinite(fields.weight)
+      || (fields.style !== 'normal' && fields.style !== 'italic')) throw invalid();
+    return Object.freeze({ family: fields.family, weight: fields.weight, style: fields.style });
+  });
+  const scripts = candidate.substituteScripts;
+  if (!scripts || typeof scripts !== 'object' || Array.isArray(scripts)) throw invalid();
+  // Null prototype: keys are document font names (e.g. `__proto__`).
+  const substituteScripts = Object.create(null) as Record<string, readonly import('@silurus/ooxml-core').FontSubstituteScript[]>;
+  for (const [family, list] of Object.entries(scripts)) {
+    if (!Array.isArray(list) || !list.every((script) => typeof script === 'string' && KNOWN_SUBSTITUTE_SCRIPTS.has(script))) {
+      throw invalid();
+    }
+    substituteScripts[family] = Object.freeze([...list] as import('@silurus/ooxml-core').FontSubstituteScript[]);
+  }
+  return Object.freeze({ familyCount, tuples: Object.freeze(tuples), substituteScripts: Object.freeze(substituteScripts) });
 }
 
 function assertNullableString(value: unknown, field: string): asserts value is string | null {
@@ -388,6 +429,8 @@ function normalizePresentationPreflightValue(
     }
     return name;
   });
+  const fontPreloadFacts = candidate.fontPreloadFacts === undefined
+    ? undefined : normalizeFontDemandFacts(candidate.fontPreloadFacts, fontPreloadNames.length);
   return Object.freeze({
     slideCount: candidate.slideCount as number,
     slideWidth: candidate.slideWidth as number,
@@ -403,6 +446,7 @@ function normalizePresentationPreflightValue(
     slides: Object.freeze(slides),
     fontPreloadNames: Object.freeze(fontPreloadNames),
     ...(fontPreloadDemand === undefined ? {} : { fontPreloadDemand }),
+    ...(fontPreloadFacts === undefined ? {} : { fontPreloadFacts }),
   });
 }
 
@@ -496,6 +540,7 @@ interface PendingAcceptance {
   readonly fact: PresentationPreflightSlide;
   readonly fonts: PptxFontPreloadAccumulator;
   readonly fontNames: readonly (string | null)[];
+  readonly fontFacts: PptxFontDemandFacts | undefined;
   readonly fontBytes: number;
   readonly committedBytes: number;
   readonly demandDelta?: FontPreloadDemand;
@@ -504,8 +549,9 @@ interface PendingAcceptance {
   readonly demandDeltaBytes: number;
 }
 
-/** Injected after opt-in lazy import; Google-off builders import no analysis
- * and allocate no scalar membership cache. ACK transactions stay synchronous. */
+/** Injected after opt-in lazy import when font sources are configured; a
+ * builder without sources imports no analysis and allocates no scalar
+ * membership cache. ACK transactions stay synchronous. */
 export type FontDemandCollector = (slide: Slide, committed: ReadonlySet<number>, byteAllowance: number) => FontPreloadDemand;
 
 /** Internal admission options; callers may lower but never raise the hard ceiling. */
@@ -535,6 +581,7 @@ export class PresentationPreflightBuilder {
   private slides: PresentationPreflightSlide[] = [];
   private fonts: PptxFontPreloadAccumulator;
   private fontPreloadNames: readonly (string | null)[];
+  private fontPreloadFacts: PptxFontDemandFacts | undefined;
   private fontProjectionBytes: number;
   private projectionBytesValue: number;
   private readonly limit: number;
@@ -583,11 +630,15 @@ export class PresentationPreflightBuilder {
     this.fonts = new PptxFontPreloadAccumulator(
       this.majorFontValue,
       this.minorFontValue,
-      undefined, undefined, options.cjkFallback,
+      undefined, undefined, options.cjkFallback, undefined,
+      // Font-source demand facts exist only with font sources, which are
+      // also what installs a demand collector.
+      this.collectFontDemand !== undefined,
     );
     this.fontPreloadNames = Object.freeze(this.fonts.names());
+    this.fontPreloadFacts = this.fonts.demandFacts();
     this.fontProjectionBytes = measureStructuralJson(
-      this.fontPreloadNames,
+      fontProjection(this.fontPreloadNames, this.fontPreloadFacts),
       this.limit,
     ).jsonBytes;
     this.projectionBytesValue = measureStructuralJson({
@@ -602,7 +653,7 @@ export class PresentationPreflightBuilder {
       embeddedFonts: this.embeddedFontsValue,
       remainingSlides: this.descriptors,
       slides: [],
-      fontPreloadNames: this.fontPreloadNames,
+      ...fontProjection(this.fontPreloadNames, this.fontPreloadFacts),
     }, this.limit).jsonBytes;
     // Demand is an evictable precision cache, not required document metadata.
     // At the hard ceiling omit it: omission has legacy conservative all meaning.
@@ -637,6 +688,11 @@ export class PresentationPreflightBuilder {
     return this.fontPreloadNames;
   }
 
+  /** Font-source demand facts of the committed prefix (font sources only). */
+  get currentFontPreloadFacts(): PptxFontDemandFacts | undefined {
+    return this.fontPreloadFacts;
+  }
+
   /** Delta from the last committed admission, never an uncommitted candidate.
    * Progressive owners consume this before publishing that slide. */
   get currentFontPreloadDemandDelta(): FontPreloadDemand | undefined { return this.demandDelta; }
@@ -661,7 +717,7 @@ export class PresentationPreflightBuilder {
       folHlinkColor: this.folHlinkColorValue,
       embeddedFonts: this.embeddedFontsValue,
       slides: Object.freeze([...this.slides]),
-      fontPreloadNames: this.fontPreloadNames,
+      ...fontProjection(this.fontPreloadNames, this.fontPreloadFacts),
     });
   }
 
@@ -684,8 +740,11 @@ export class PresentationPreflightBuilder {
     const fact = projectSlide(slide, descriptor);
     const nextFonts = this.fonts.withSlide(slide);
     const nextFontNames = Object.freeze(nextFonts.names());
+    const nextFontFacts = nextFonts.demandFacts();
+    // Measured as the same font-field object as the constructor's, so the
+    // fixed key bytes cancel in the exact replace-delta below.
     const nextFontBytes = measureStructuralJson(
-      nextFontNames,
+      fontProjection(nextFontNames, nextFontFacts),
       this.limit,
     ).jsonBytes;
     const slideBytes = measureStructuralJson(
@@ -710,7 +769,7 @@ export class PresentationPreflightBuilder {
     // the existing retained state, then enforce the worse of prepare/commit.
     const candidateBytes = measureStructuralJson({
       slide: fact,
-      fontPreloadNames: nextFontNames,
+      ...fontProjection(nextFontNames, nextFontFacts),
     }, this.limit).jsonBytes;
     const basePreparedBytes = cappedAdd(this.projectionBytesValue - this.demandBytes, candidateBytes, this.limit);
     const baseCommittedBytes = committedBytes;
@@ -772,6 +831,7 @@ export class PresentationPreflightBuilder {
       fact,
       fonts: nextFonts,
       fontNames: nextFontNames,
+      fontFacts: nextFontFacts,
       fontBytes: nextFontBytes,
       committedBytes,
       demandDelta,
@@ -794,6 +854,7 @@ export class PresentationPreflightBuilder {
         this.slides.push(pending.fact);
         this.fonts = pending.fonts;
         this.fontPreloadNames = pending.fontNames;
+        this.fontPreloadFacts = pending.fontFacts;
         this.fontProjectionBytes = pending.fontBytes;
         this.projectionBytesValue = pending.committedBytes;
         this.demandDelta = pending.demandDelta;
@@ -838,7 +899,7 @@ export class PresentationPreflightBuilder {
       folHlinkColor: this.folHlinkColorValue,
       embeddedFonts: this.embeddedFontsValue,
       slides: Object.freeze([...this.slides]),
-      fontPreloadNames: this.fontPreloadNames,
+      ...fontProjection(this.fontPreloadNames, this.fontPreloadFacts),
       ...(this.collectFontDemand && !this.demandAll && this.demandBytes ? { fontPreloadDemand: Object.freeze([...(this.demandPoints ?? [])]) } : {}),
     });
     // The frozen compact model owns its slide-array storage from here. The

@@ -4,7 +4,7 @@
 // parse the same file many times at once.
 import { PptxPresentation, PptxScrollViewer, PptxViewer } from '@silurus/ooxml-pptx';
 import { DocxDocument, DocxScrollViewer, DocxViewer } from '@silurus/ooxml-docx';
-import { XlsxSheetViewer, XlsxViewer, XlsxWorkbook } from '@silurus/ooxml-xlsx';
+import { XlsxSheetViewer, XlsxViewer, XlsxWorkbook, googleFonts } from '@silurus/ooxml-xlsx';
 
 export type Format = 'pptx' | 'docx' | 'xlsx';
 export type DemoKind = 'demo' | 'scroll' | 'thumbnails' | 'masterdetail' | 'sheet' | 'sheetWindows';
@@ -26,7 +26,7 @@ type LoadedDoc = {
 
 async function loadDoc(format: Format, url: string): Promise<LoadedDoc> {
   if (format === 'pptx') {
-    const presentation = await PptxPresentation.load(url, { useGoogleFonts: true });
+    const presentation = await PptxPresentation.load(url, { fonts: [googleFonts()] });
     return {
       kind: 'pptx',
       engine: presentation,
@@ -34,7 +34,7 @@ async function loadDoc(format: Format, url: string): Promise<LoadedDoc> {
       render: (c, i, width) => presentation.renderSlide(c, i, { width, dpr: DPR() }),
     };
   }
-  const document = await DocxDocument.load(url, { useGoogleFonts: true });
+  const document = await DocxDocument.load(url, { fonts: [googleFonts()] });
   return {
     kind: 'docx',
     engine: document,
@@ -62,13 +62,13 @@ function makeViewer(format: Format, canvas: HTMLCanvasElement, width: number): V
   // scroll area and add a big empty gap below the page. Text selection is shown
   // in the API reference instead.
   if (format === 'pptx') {
-    const v = new PptxViewer(canvas, { width, useGoogleFonts: true });
+    const v = new PptxViewer(canvas, { width, fonts: [googleFonts()] });
     return {
       load: (u) => v.load(u), go: (i) => v.goToSlide(i), next: () => v.nextSlide(),
       prev: () => v.prevSlide(), index: () => v.slideIndex, count: () => v.slideCount,
     };
   }
-  const v = new DocxViewer(canvas, { width, dpr: DPR(), useGoogleFonts: true });
+  const v = new DocxViewer(canvas, { width, dpr: DPR(), fonts: [googleFonts()] });
   return {
     load: (u) => v.load(u), go: (i) => v.goToPage(i), next: () => v.nextPage(),
     prev: () => v.prevPage(), index: () => v.currentPage, count: () => v.pageCount,
@@ -124,7 +124,7 @@ function mountSheetWindows(el: HTMLElement, url: string): void {
   el.appendChild(launcher);
   const st = status(launcher, 'Parsing workbook once…');
 
-  XlsxWorkbook.load(url, { useGoogleFonts: true })
+  XlsxWorkbook.load(url, { fonts: [googleFonts()] })
     .then((workbook) => {
       const sessions = new Map<number, SheetWindowSession>();
       const summary = document.createElement('div');
@@ -381,8 +381,8 @@ function mountScroll(el: HTMLElement, format: Format, url: string): void {
   el.appendChild(sc);
   const st = status(sc, 'Parsing…');
   const viewer = format === 'pptx'
-    ? new PptxScrollViewer(sc, { gap: 22, useGoogleFonts: true })
-    : new DocxScrollViewer(sc, { gap: 22, useGoogleFonts: true });
+    ? new PptxScrollViewer(sc, { gap: 22, fonts: [googleFonts()] })
+    : new DocxScrollViewer(sc, { gap: 22, fonts: [googleFonts()] });
   window.addEventListener('pagehide', (event) => {
     if (event.persisted) return;
     viewer.destroy();
@@ -474,7 +474,7 @@ function mountSheet(el: HTMLElement, url: string): void {
   const host = document.createElement('div');
   host.className = 'demo-xlsx';
   el.appendChild(host);
-  const viewer = new XlsxViewer(host, { useGoogleFonts: true, showZoomSlider: true });
+  const viewer = new XlsxViewer(host, { fonts: [googleFonts()], showZoomSlider: true });
   viewer.load(url).catch((error) => host.setAttribute('data-error', err(error)));
 }
 

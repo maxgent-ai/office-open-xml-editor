@@ -1,5 +1,5 @@
 import { retainFace, releaseFaces } from './font-registry.js';
-import { activeFontSet, withFontCeiling } from './preload.js';
+import { activeFontSet, withFontCeiling } from './font-registry.js';
 
 /** A family-level local-font measurement request. This API is shared by all
  * OOXML formats; each format decides which Office behavior requires a measured
@@ -96,7 +96,8 @@ export async function loadLocalFontMetrics(
   if (!set || typeof FontFace === 'undefined') return { faces: [], metrics: {} };
 
   const faces: FontFace[] = [];
-  const metrics: Record<string, ResolvedLocalFontMetric> = {};
+  // Null prototype: keys are document font names (e.g. `__proto__`).
+  const metrics = Object.create(null) as Record<string, ResolvedLocalFontMetric>;
   let timedOut = false;
   type PreparedRequest = LocalFontMetricRequest & {
     family: string;

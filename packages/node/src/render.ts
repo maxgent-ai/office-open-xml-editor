@@ -6,12 +6,12 @@ import { resolveCjkFallback, type CjkFallback } from '@silurus/ooxml-core';
  *
  * The original renderers reach for a few browser-only globals:
  *   - `createImageBitmap` — used to paint embedded raster pictures
- *   - `document.fonts.add(new FontFace(...))` — used by the Google-Fonts loader
+ *   - `document.fonts.add(new FontFace(...))` — used by the font-source loaders
  *
  * We provide minimal Node shims for bitmap decode and auxiliary canvases. The
  * shared SVG loader detects the absence of `Image` and uses this same bitmap
  * decoder. Font loading stays opt-in
- * via `useGoogleFonts: false`. The user passes in a canvas factory so the
+ * (no `fonts` sources are configured here). The user passes in a canvas factory so the
  * package itself does not pin a particular Node canvas implementation;
  * `skia-canvas` is recommended in the README.
  */

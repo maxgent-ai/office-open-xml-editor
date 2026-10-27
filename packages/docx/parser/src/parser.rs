@@ -1949,16 +1949,21 @@ fn finish_document(
     if footnote_stories.separator.is_some()
         || endnote_stories.separator.is_some()
         || footnote_stories.continuation_separator.is_some()
+        || endnote_stories.continuation_separator.is_some()
     {
         let settings = environment
             .note_layout_settings
             .get_or_insert_with(Default::default);
         settings.footnote_separator = footnote_stories.separator;
         settings.endnote_separator = endnote_stories.separator;
+        settings.endnote_continuation_separator = endnote_stories.continuation_separator;
         settings.footnote_continuation_separator = footnote_stories.continuation_separator;
         settings.footnote_separator_paragraph = footnote_stories.separator_paragraph;
         settings.footnote_continuation_separator_paragraph =
             footnote_stories.continuation_separator_paragraph;
+        settings.endnote_separator_paragraph = endnote_stories.separator_paragraph;
+        settings.endnote_continuation_separator_paragraph =
+            endnote_stories.continuation_separator_paragraph;
     }
 
     Ok(Document {
@@ -2311,11 +2316,13 @@ fn parse_notes(
         // Observed Word behavior: an explicitly empty story prints without the
         // default rule; a missing reserved story still uses it. Limit the
         // empty case to a single bare paragraph, as observed in Word controls.
-        // A formatted footnote story also keeps its effective paragraph; the
-        // endnote formatted class stays unsupported (absent).
-        let mut story = || match reserved_note_separator_mark(n) {
-            Some(mark) => (Some(mark), None),
-            None if element_name == "footnote" => formatted_note_separator_paragraph(
+        // Every supported selected story keeps its effective paragraph for
+        // line measurement, including bare stories with inherited properties.
+        // §17.11.3/.9 selected separators are paragraph stories even when
+        // they author no pPr: their line height still inherits from styles.
+        // Prefer retained paragraph metrics over the absent-story scalar fallback.
+        let mut story = || {
+            selected_note_separator_paragraph(
                 n,
                 style_map,
                 num_map,
@@ -2324,10 +2331,10 @@ fn parse_notes(
                 &local_rel_map,
                 theme,
             )
-            .map_or((None, None), |(mark, paragraph)| {
-                (Some(mark), Some(Box::new(paragraph)))
-            }),
-            None => (None, None),
+            .map_or_else(
+                || (reserved_note_separator_mark(n), None),
+                |(mark, paragraph)| (Some(mark), Some(Box::new(paragraph))),
+            )
         };
         if selected && note_type.as_deref() == Some("continuationSeparator") {
             (
@@ -2366,8 +2373,8 @@ fn parse_notes(
     (out, selected_stories)
 }
 
-/// Selected special story facts of one note part. Paragraphs are retained
-/// only for the formatted footnote class.
+/// Selected special story facts of one note part. A supported single
+/// paragraph is retained even when all its properties are inherited.
 #[derive(Default)]
 struct SelectedNoteSeparators {
     separator: Option<crate::types::NoteSeparatorMark>,
@@ -2376,8 +2383,9 @@ struct SelectedNoteSeparators {
     continuation_separator_paragraph: Option<Box<DocParagraph>>,
 }
 
-/// The formatted class of a listed story (§17.11.9): one `w:p` holding an
-/// optional `w:pPr` and one run of an optional `w:rPr` plus one
+/// The closed single-paragraph class of a listed story (§17.11.3/.9):
+/// a bare empty `w:p`, or a paragraph holding optional `w:pPr` and one run
+/// of optional `w:rPr` plus one
 /// §17.11.23/§17.11.1 mark. Its effective paragraph (style cascade, §17.3.1.33
 /// spacing, line rule) is kept so layout measures the band from these facts
 /// instead of a mark-only scalar.
@@ -2386,7 +2394,7 @@ struct SelectedNoteSeparators {
 /// child. Paragraph ink, numbering, frames, a hidden mark and authored text are
 /// not represented here either; those stories stay unsupported (absent).
 #[allow(clippy::too_many_arguments)]
-fn formatted_note_separator_paragraph(
+fn selected_note_separator_paragraph(
     note: roxmltree::Node<'_, '_>,
     style_map: &StyleMap,
     num_map: &mut NumberingMap,
@@ -2409,25 +2417,32 @@ fn formatted_note_separator_paragraph(
         .filter(|child| child.is_element())
         .peekable();
     let properties = children.next_if(|child| is_w(*child, "pPr"));
-    let run = children.next()?;
-    if !is_w(run, "r") || children.next().is_some() {
+    let mark = if let Some(run) = children.next() {
+        if !is_w(run, "r") || children.next().is_some() {
+            return None;
+        }
+        let mut run_children = run.children().filter(|child| child.is_element()).peekable();
+        let run_properties = run_children.next_if(|child| is_w(*child, "rPr"));
+        let marker = run_children.next()?;
+        if run_children.next().is_some() || !is_w_ns(marker.tag_name().namespace()) {
+            return None;
+        }
+        let mark = match marker.tag_name().name() {
+            "separator" => NoteSeparatorMark::Short,
+            "continuationSeparator" => NoteSeparatorMark::Full,
+            _ => return None,
+        };
+        let mark_properties = properties.and_then(|node| child_w(node, "rPr"));
+        if !same_xml_element(mark_properties, run_properties) {
+            return None;
+        }
+        mark
+    } else if properties.is_none() {
+        // Bare empty stories suppress rule ink but keep their inherited line box.
+        NoteSeparatorMark::None
+    } else {
         return None;
-    }
-    let mut run_children = run.children().filter(|child| child.is_element()).peekable();
-    let run_properties = run_children.next_if(|child| is_w(*child, "rPr"));
-    let marker = run_children.next()?;
-    if run_children.next().is_some() || !is_w_ns(marker.tag_name().namespace()) {
-        return None;
-    }
-    let mark = match marker.tag_name().name() {
-        "separator" => NoteSeparatorMark::Short,
-        "continuationSeparator" => NoteSeparatorMark::Full,
-        _ => return None,
     };
-    let mark_properties = properties.and_then(|node| child_w(node, "rPr"));
-    if !same_xml_element(mark_properties, run_properties) {
-        return None;
-    }
     let parsed = parse_paragraph_with_diagnostics(
         paragraph,
         style_map,
@@ -2571,10 +2586,11 @@ mod note_separator_tests {
             let mut writer = zip::ZipWriter::new(Cursor::new(&mut bytes));
             write_test_content_types(&mut writer);
             let mut parts = vec![
+                ("word/styles.xml", format!(r#"<w:styles xmlns:w="{namespace}"><w:docDefaults><w:rPrDefault><w:rPr><w:sz w:val="24"/></w:rPr></w:rPrDefault><w:pPrDefault><w:pPr><w:spacing w:line="240" w:lineRule="exact"/></w:pPr></w:pPrDefault></w:docDefaults></w:styles>"#)),
                 ("word/document.xml", format!(r#"<w:document xmlns:w="{namespace}"><w:body><w:p><w:r><w:footnoteReference w:id="1"/><w:endnoteReference w:id="1"/></w:r></w:p></w:body></w:document>"#)),
                 ("word/_rels/document.xml.rels", r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="f" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes" Target="footnotes.xml"/><Relationship Id="e" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/endnotes" Target="endnotes.xml"/></Relationships>"#.to_string()),
                 ("word/footnotes.xml", format!(r#"<w:footnotes xmlns:w="{namespace}" xmlns:x="urn:foreign">{special_story}<w:footnote w:type="continuationSeparator" w:id="0"><w:p><w:r><w:continuationSeparator/></w:r></w:p></w:footnote><w:footnote w:id="1"><w:p><w:r><w:t>footnote</w:t></w:r></w:p></w:footnote></w:footnotes>"#)),
-                ("word/endnotes.xml", format!(r#"<w:endnotes xmlns:w="{namespace}"><w:endnote w:type="separator" w:id="{special_id}"><w:p><w:r><w:continuationSeparator/></w:r></w:p></w:endnote><w:endnote w:id="1"><w:p><w:r><w:t>endnote</w:t></w:r></w:p></w:endnote></w:endnotes>"#)),
+                ("word/endnotes.xml", format!(r#"<w:endnotes xmlns:w="{namespace}"><w:endnote w:type="separator" w:id="{special_id}"><w:p><w:r><w:continuationSeparator/></w:r></w:p></w:endnote><w:endnote w:type="continuationSeparator" w:id="0"><w:p><w:r><w:separator/></w:r></w:p></w:endnote><w:endnote w:id="1"><w:p><w:r><w:t>endnote</w:t></w:r></w:p></w:endnote></w:endnotes>"#)),
             ];
             if let Some(properties) = properties {
                 parts.push(("word/settings.xml", format!(r#"<w:settings xmlns:w="{namespace}" xmlns:x="urn:foreign">{properties}</w:settings>"#)));
@@ -2688,8 +2704,30 @@ mod note_separator_tests {
             .expect("formatted continuation paragraph");
         assert_eq!(continuation.line_spacing.as_ref().unwrap().value, 6.0);
 
-        // Bare stories keep the scalar contract; formatting this boundary does
-        // not represent (differing marker rPr, paragraph ink, authored text)
+        let continued_endnotes = selected_note_package(
+            Some(r#"<w:endnotePr><w:endnote w:id="0"/></w:endnotePr>"#),
+            crate::xml_util::W_NS,
+            "42",
+            None,
+        )
+        .note_layout_settings
+        .unwrap();
+        assert_eq!(
+            continued_endnotes.endnote_continuation_separator,
+            Some(Short)
+        );
+        assert_eq!(
+            continued_endnotes
+                .endnote_continuation_separator_paragraph
+                .unwrap()
+                .line_spacing
+                .unwrap()
+                .value,
+            12.0
+        );
+
+        // Bare stories inherit their paragraph metrics. Formatting this boundary
+        // does not represent (differing marker rPr, paragraph ink, authored text)
         // stays the existing unsupported class: no mark and no paragraph.
         let bare = selected_note_package(
             Some(r#"<w:footnotePr><w:footnote w:id="42"/><w:footnote w:id="0"/></w:footnotePr>"#),
@@ -2706,8 +2744,42 @@ mod note_separator_tests {
             ),
             (Some(Short), Some(Full))
         );
-        assert!(bare.footnote_separator_paragraph.is_none());
-        assert!(bare.footnote_continuation_separator_paragraph.is_none());
+        for paragraph in [
+            bare.footnote_separator_paragraph,
+            bare.footnote_continuation_separator_paragraph,
+        ] {
+            let paragraph =
+                paragraph.expect("bare selected story retains inherited paragraph metrics");
+            assert_eq!(paragraph.line_spacing.as_ref().unwrap().value, 12.0);
+            assert!(paragraph.runs.is_empty());
+        }
+        let empty = selected_note_package(
+            Some(r#"<w:footnotePr><w:footnote w:id="42"/></w:footnotePr><w:endnotePr><w:endnote w:id="42"/></w:endnotePr>"#),
+            crate::xml_util::W_NS, "42",
+            Some(r#"<w:footnote w:type="separator" w:id="42"><w:p/></w:footnote>"#),
+        ).note_layout_settings.unwrap();
+        assert_eq!(
+            empty.footnote_separator,
+            Some(crate::types::NoteSeparatorMark::None)
+        );
+        assert_eq!(
+            empty
+                .footnote_separator_paragraph
+                .unwrap()
+                .line_spacing
+                .unwrap()
+                .value,
+            12.0
+        );
+        assert_eq!(
+            empty
+                .endnote_separator_paragraph
+                .unwrap()
+                .line_spacing
+                .unwrap()
+                .value,
+            12.0
+        );
         for paragraph in [
             formatted("separator", "480", "", &arial),
             formatted(
@@ -2994,7 +3066,7 @@ impl ThemeColors {
 
     /// Read a theme typeface directly by group ("major" / "minor") and axis
     /// ("latin" / "ea" / "cs"). Used by the document loader to expose the
-    /// heading / body fonts to TS callers (e.g. for Google Fonts preload).
+    /// heading / body fonts to TS callers (e.g. for font-source demand).
     pub fn theme_font(&self, group: &str, axis: &str) -> Option<String> {
         self.fonts.get(&format!("{group}/{axis}")).cloned()
     }
@@ -3225,9 +3297,12 @@ fn parse_note_layout_settings(
         endnote_number_start: start("endnotePr"),
         footnote_separator: None,
         endnote_separator: None,
+        endnote_continuation_separator: None,
         footnote_continuation_separator: None,
         footnote_separator_paragraph: None,
         footnote_continuation_separator_paragraph: None,
+        endnote_separator_paragraph: None,
+        endnote_continuation_separator_paragraph: None,
         reserved_separators: None,
     };
     if result.footnote_position.is_none()
@@ -3408,6 +3483,9 @@ fn parse_document_settings(settings_xml: &str) -> Option<crate::types::DocumentS
         .find(|n| n.is_element() && n.tag_name().name() == "compat");
     let compat_bool = |name: &str| -> Option<bool> { bool_prop(compat?, name) };
     let line_wrap_like_word6 = compat_bool("lineWrapLikeWord6");
+    // ECMA-376 Part 4 §14.8.3.20: preserve absence and explicit false;
+    // paragraph/page placement consumes the flag after canonical projection.
+    let footnote_layout_like_ww8 = compat_bool("footnoteLayoutLikeWW8");
     let do_not_use_html_paragraph_auto_spacing = compat_bool("doNotUseHTMLParagraphAutoSpacing");
     // [MS-DOCX] §2.3.3: Office stores this as a named `compatSetting`, not a
     // direct `w:compat` boolean. The setting is off when absent.
@@ -3461,6 +3539,7 @@ fn parse_document_settings(settings_xml: &str) -> Option<crate::types::DocumentS
         && default_tab_stop.is_none()
         && character_spacing_control.is_none()
         && line_wrap_like_word6.is_none()
+        && footnote_layout_like_ww8.is_none()
         && do_not_use_html_paragraph_auto_spacing.is_none()
         && enable_open_type_features.is_none()
         && use_fe_layout.is_none()
@@ -3479,6 +3558,7 @@ fn parse_document_settings(settings_xml: &str) -> Option<crate::types::DocumentS
         default_tab_stop,
         character_spacing_control,
         line_wrap_like_word6,
+        footnote_layout_like_ww8,
         do_not_use_html_paragraph_auto_spacing,
         enable_open_type_features,
         use_fe_layout,
@@ -6495,7 +6575,10 @@ fn parse_paragraph_cond_at_depth_with_diagnostics(
         snap_to_grid: base_para.snap_to_grid,
         // ECMA-376 §17.3.1.11 — text-frame / drop-cap properties, resolved
         // through the style chain. Some ⇒ paragraph is part of a text frame.
-        frame_pr: base_para.frame_pr.clone(),
+        frame_pr: base_para
+            .frame_pr
+            .as_deref()
+            .map(|facts| Box::new(facts.resolve())),
         paragraph_typography_acquisition: base_para.paragraph_typography.clone(),
     }
 }
@@ -10229,6 +10312,116 @@ fn parse_anchor_group_wire(
     }
 }
 
+/// [MS-OI29500] §§2.1.1354/.1357 (DrawingML `wp:wrapPolygon`) and
+/// [MS-OE376] §2.1.1692(uu) (VML `wrapcoords`; the shared VML attribute notes
+/// that §§2.1.1710-.1711 apply to shape and shapetype) both place Word's wrap polygon
+/// in one fixed 21600×21600 square mapped anisotropically onto the shape's
+/// bounding rectangle with its origin at the top-left corner.
+///
+/// Neither schema bounds the vertex count, and retained layout compiles tight
+/// and through polygons exactly; a self-intersecting polygon has up to
+/// V(V-3)/2 crossings, so time and memory grow quadratically (measured worst
+/// case for random 256-vertex contours: about 0.1s and 14MB). Library resource
+/// governance, not an Office rule: a polygon above the budget wraps around its
+/// own bounding rectangle, so the object still paints and excludes text from
+/// the authored extent. An invalid polygon keeps only its invalid count, which
+/// already rejects it.
+const MAX_WRAP_POLYGON_POINTS: usize = 256;
+
+/// Longest excerpt of an unparseable coordinate kept for diagnostics. Every
+/// i64 fits in 20 bytes, so a valid coordinate never needs more.
+const MAX_INVALID_WRAP_COORDINATE_TEXT_BYTES: usize = 32;
+
+/// The retained text of one authored polygon coordinate. Rust's integer parser
+/// accepts any number of leading zeros and a `+` sign, so a token's length does
+/// not bound its value's size; a parsed coordinate keeps its canonical decimal
+/// form (byte-identical to what Word writes), and an unparseable one, including
+/// an i64 overflow, keeps a bounded leading excerpt so it stays distinguishable
+/// from an absent attribute. Retained bytes per polygon are therefore
+/// O(`MAX_WRAP_POLYGON_POINTS`) whatever the token lengths.
+fn wrap_coordinate_text(raw: Option<&str>, value: Option<i64>) -> Option<String> {
+    match (raw, value) {
+        // No authored text (absent attribute, or a generated fallback vertex).
+        (None, _) => None,
+        (Some(_), Some(value)) => Some(value.to_string()),
+        (Some(raw), None) => {
+            let mut end = raw.len().min(MAX_INVALID_WRAP_COORDINATE_TEXT_BYTES);
+            while !raw.is_char_boundary(end) {
+                end -= 1;
+            }
+            Some(raw[..end].to_string())
+        }
+    }
+}
+
+/// One-pass wrap polygon accumulator. It keeps at most
+/// `MAX_WRAP_POLYGON_POINTS` vertices and allocates their bounded coordinate
+/// text only while they can still be retained, so memory stays bounded by the
+/// budget and work stays linear in the authored list however long it is.
+#[derive(Default)]
+struct WrapPolygonBuilder {
+    points: Vec<AnchorPointWire>,
+    point_count: usize,
+    invalid_point_count: usize,
+    x_range: Option<(i64, i64)>,
+    y_range: Option<(i64, i64)>,
+}
+
+impl WrapPolygonBuilder {
+    fn push(&mut self, x: Option<i64>, y: Option<i64>, raw_x: Option<&str>, raw_y: Option<&str>) {
+        fn widen(range: &mut Option<(i64, i64)>, value: Option<i64>) {
+            if let Some(value) = value {
+                *range =
+                    Some(range.map_or((value, value), |(lo, hi)| (lo.min(value), hi.max(value))));
+            }
+        }
+        self.point_count += 1;
+        if x.is_none() || y.is_none() {
+            self.invalid_point_count += 1;
+        }
+        widen(&mut self.x_range, x);
+        widen(&mut self.y_range, y);
+        if self.point_count <= MAX_WRAP_POLYGON_POINTS {
+            self.points.push(AnchorPointWire {
+                x,
+                y,
+                raw_x: wrap_coordinate_text(raw_x, x),
+                raw_y: wrap_coordinate_text(raw_y, y),
+            });
+        } else if self.point_count == MAX_WRAP_POLYGON_POINTS + 1 {
+            self.points = Vec::new();
+        }
+    }
+
+    fn finish(self, edited: bool) -> AnchorPolygonWire {
+        let points = if self.point_count > MAX_WRAP_POLYGON_POINTS {
+            match (self.invalid_point_count, self.x_range, self.y_range) {
+                (0, Some((x0, x1)), Some((y0, y1))) => [(x0, y0), (x0, y1), (x1, y1), (x1, y0)]
+                    .into_iter()
+                    .map(|(x, y)| AnchorPointWire {
+                        x: Some(x),
+                        y: Some(y),
+                        raw_x: None,
+                        raw_y: None,
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            }
+        } else {
+            self.points
+        };
+        AnchorPolygonWire {
+            edited,
+            coordinate_space: AnchorPolygonSpaceWire {
+                width: 21600,
+                height: 21600,
+            },
+            points,
+            invalid_point_count: self.invalid_point_count,
+        }
+    }
+}
+
 /// Private, lossless acquisition facts for retained layout. The public run
 /// model intentionally remains unchanged. ECMA-376 Part 1 §§20.4.2.3,
 /// 20.4.2.6 and 20.4.2.16 require anchor and child-wrap distances/effects to
@@ -10265,38 +10458,24 @@ fn parse_anchor_acquisition_wire(container: &roxmltree::Node) -> AnchorAcquisiti
             .children()
             .find(|child| child.is_element() && child.tag_name().name() == "wrapPolygon");
         let polygon = polygon_node.map(|polygon| {
-            let points: Vec<_> = polygon
-                .children()
-                .filter(|point| {
-                    point.is_element() && matches!(point.tag_name().name(), "start" | "lineTo")
-                })
-                .map(|point| {
-                    let raw_x = point.attribute("x").map(str::to_string);
-                    let raw_y = point.attribute("y").map(str::to_string);
-                    AnchorPointWire {
-                        x: raw_x.as_deref().and_then(|raw| raw.parse::<i64>().ok()),
-                        y: raw_y.as_deref().and_then(|raw| raw.parse::<i64>().ok()),
-                        raw_x,
-                        raw_y,
-                    }
-                })
-                .collect();
-            let invalid_point_count = points
-                .iter()
-                .filter(|point| point.x.is_none() || point.y.is_none())
-                .count();
-            AnchorPolygonWire {
-                edited: polygon
+            let mut points = WrapPolygonBuilder::default();
+            for point in polygon.children().filter(|point| {
+                point.is_element() && matches!(point.tag_name().name(), "start" | "lineTo")
+            }) {
+                let (raw_x, raw_y) = (point.attribute("x"), point.attribute("y"));
+                points.push(
+                    raw_x.and_then(|raw| raw.parse::<i64>().ok()),
+                    raw_y.and_then(|raw| raw.parse::<i64>().ok()),
+                    raw_x,
+                    raw_y,
+                );
+            }
+            points.finish(
+                polygon
                     .attribute("edited")
                     .and_then(parse_on_off)
                     .unwrap_or(false),
-                coordinate_space: AnchorPolygonSpaceWire {
-                    width: 21600,
-                    height: 21600,
-                },
-                points,
-                invalid_point_count,
-            }
+            )
         });
         AnchorWrapWire {
             kind: match node.tag_name().name() {
@@ -12388,10 +12567,22 @@ fn parse_vml_pict(
                 .any(|c| c.is_element() && c.tag_name().name() == "imagedata")
     })?;
 
-    // A shape type is defined once per part and referenced by later shapes
-    // (ECMA-376 Part 4 §14.1.2.20 shapetype; Word writes it in the first
-    // w:pict that uses it): search this pict, then the definitions that
-    // precede the shape in its story.
+    with_vml_shape_type(pict, shape, |shape_type| {
+        parse_vml_pict_shape(
+            style_map, num_map, shape, shape_type, theme, media_map, chart_map, rel_map, depth,
+        )
+    })
+}
+
+/// A shape type is defined once per part and referenced by later shapes
+/// (ECMA-376 Part 4 §14.1.2.20 shapetype; Word writes it in the first
+/// w:pict that uses it): search this pict, then the definitions that
+/// precede the shape in its story.
+fn with_vml_shape_type<R>(
+    pict: roxmltree::Node,
+    shape: roxmltree::Node,
+    use_type: impl FnOnce(Option<roxmltree::Node>) -> R,
+) -> R {
     let type_id = shape
         .attribute("type")
         .map(|value| value.trim_start_matches('#'));
@@ -12400,18 +12591,78 @@ fn parse_vml_pict(
             && node.tag_name().name() == "shapetype"
             && type_id.is_some_and(|id| node.attribute("id") == Some(id))
     };
-    let local_type = type_id.and_then(|_| pict.descendants().find(is_type));
-    let recorded = if local_type.is_none() {
-        type_id.and_then(|id| preceding_vml_shape_type(id, shape.range().start))
-    } else {
-        None
+    with_recorded_vml_shape_type(
+        type_id.and_then(|_| pict.descendants().find(is_type)),
+        shape,
+        use_type,
+    )
+}
+
+/// Use `local_type` when the shape's own pict defines it; otherwise fall back
+/// to the definition recorded earlier in the story.
+pub(super) fn with_recorded_vml_shape_type<R>(
+    local_type: Option<roxmltree::Node>,
+    shape: roxmltree::Node,
+    use_type: impl FnOnce(Option<roxmltree::Node>) -> R,
+) -> R {
+    if local_type.is_some() {
+        return use_type(local_type);
+    }
+    let Some(type_id) = shape
+        .attribute("type")
+        .map(|value| value.trim_start_matches('#'))
+    else {
+        return use_type(None);
     };
+    let recorded = preceding_vml_shape_type(type_id, shape.range().start);
     let recorded_doc = recorded.as_deref().and_then(|xml| parse_guarded(xml).ok());
-    let shape_type = local_type.or_else(|| {
-        recorded_doc
-            .as_ref()
-            .and_then(|doc| doc.root_element().children().find(is_type))
+    let definition = recorded_doc.as_ref().and_then(|doc| {
+        doc.root_element().children().find(|node| {
+            node.is_element()
+                && node.tag_name().name() == "shapetype"
+                && node.attribute("id") == Some(type_id)
+        })
     });
+    let Some(definition) = definition else {
+        return use_type(None);
+    };
+    struct Restore(Option<(*const (), String)>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let previous = self.0.take();
+            let _ = RECORDED_VML_SHAPE_TYPE.try_with(|active| active.replace(previous));
+        }
+    }
+    let _restore = Restore(RECORDED_VML_SHAPE_TYPE.with(|active| {
+        active.replace(Some((
+            std::ptr::from_ref(definition.document()).cast(),
+            type_id.to_string(),
+        )))
+    }));
+    use_type(Some(definition))
+}
+
+std::thread_local! {
+    /// The transient document holding the recorded definition currently in
+    /// use, and the index id it was recorded under, so inherited data parsed
+    /// from it can be cached on the index entry (see
+    /// `inherited_vml_wrap_polygon`).
+    static RECORDED_VML_SHAPE_TYPE: std::cell::RefCell<Option<(*const (), String)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[allow(clippy::too_many_arguments)]
+fn parse_vml_pict_shape(
+    style_map: &StyleMap,
+    num_map: &mut NumberingMap,
+    shape: roxmltree::Node,
+    shape_type: Option<roxmltree::Node>,
+    theme: &ThemeColors,
+    media_map: &HashMap<String, String>,
+    chart_map: &ChartMap,
+    rel_map: &HashMap<String, String>,
+    depth: DepthGuard,
+) -> Option<ShapeRun> {
     // A top-level shape whose authored CSS style is not position:absolute
     // flows in the line as an inline object (ECMA-376 Part 4 §14.1.2.19
     // style; Windows Word 16.0.20430 #1896 controls stack such WordArt shapes
@@ -12469,6 +12720,10 @@ struct RecordedVmlShapeType {
     /// Byte offset in the document being parsed; `None` once that document
     /// is an earlier streamed block.
     start: Option<usize>,
+    /// The `wrapcoords` polygon shapes inherit from this definition, parsed
+    /// on first use. Every referencing shape re-parses `xml` into a transient
+    /// document, so a node-keyed memo cannot recognise the definition.
+    wrap_polygon: Option<AnchorPolygonWire>,
 }
 
 const VML_SHAPE_TYPE_ENTRY_LIMIT: usize = 256;
@@ -12559,6 +12814,7 @@ impl VmlShapeTypeIndex {
                 RecordedVmlShapeType {
                     xml,
                     start: Some(node.range().start),
+                    wrap_polygon: None,
                 },
             );
         }
@@ -12856,10 +13112,19 @@ fn parse_vml_shape(
         && stroke_image.is_none();
     let malformed_text_rects =
         vml_geometry::path_attr(shape, shape_type, "textboxrect").is_some() && text_rects.is_none();
+    let anchor = vml_css_str(style, "position")
+        .is_some_and(|value| value.eq_ignore_ascii_case("absolute"))
+        && vml_word_has_complete_anchor_reference(shape, style);
+    // Only anchor acquisition consumes `wrapcoords`; a shape without complete
+    // relative frames keeps its legacy placement, which applies no wrapping.
+    let unacquired_wrap_polygon = !anchor
+        && (shape.attribute("wrapcoords").is_some()
+            || shape_type.is_some_and(|node| node.attribute("wrapcoords").is_some()));
     if geometry_unavailable
         || missing_pen
         || missing_edge_pen
         || malformed_text_rects
+        || unacquired_wrap_polygon
         || resolved_fill.incomplete
         || vml_geometry::incomplete_leaf(shape, shape_type)
     {
@@ -12914,11 +13179,8 @@ fn parse_vml_shape(
             .map(|value| vec![Some(value * 100000.0 / 21600.0)])
             .unwrap_or_default()
     };
-    let anchor = vml_css_str(style, "position")
-        .is_some_and(|value| value.eq_ignore_ascii_case("absolute"))
-        && vml_word_has_complete_anchor_reference(shape, style);
     let anchor_acquisition =
-        anchor.then(|| vml_word_anchor_acquisition(shape, style, width_pt, height_pt));
+        anchor.then(|| vml_word_anchor_acquisition(shape, shape_type, style, width_pt, height_pt));
     let [text_inset_l, text_inset_t, text_inset_r, text_inset_b] =
         vml_textbox_insets(text_box_node);
 
@@ -13651,7 +13913,11 @@ fn vml_word_anchor_choice(style: &str, axis: &str) -> AnchorAxisChoiceWire {
     }
 }
 
-fn vml_word_anchor_wrap(shape: roxmltree::Node, style: &str) -> AnchorWrapWire {
+fn vml_word_anchor_wrap(
+    shape: roxmltree::Node,
+    definition: Option<roxmltree::Node>,
+    style: &str,
+) -> AnchorWrapWire {
     let wrap = shape
         .children()
         .find(|child| child.is_element() && child.tag_name().name() == "wrap");
@@ -13685,6 +13951,21 @@ fn vml_word_anchor_wrap(shape: roxmltree::Node, style: &str) -> AnchorWrapWire {
             )
             .then(|| "bothSides".to_string())
         });
+    let polygon = matches!(
+        kind,
+        AnchorWrapKindWire::Tight | AnchorWrapKindWire::Through
+    )
+    .then(|| {
+        // `wrapcoords` is a CT_Shapetype core attribute too; the instance
+        // overrides its template (Part 4 §§19.1.2.19-20).
+        match (shape.attribute("wrapcoords"), definition) {
+            (Some(own), _) => vml_word_wrap_polygon(Some(own)),
+            (None, Some(definition)) if definition.attribute("wrapcoords").is_some() => {
+                inherited_vml_wrap_polygon(definition)
+            }
+            (None, _) => vml_word_wrap_polygon(None),
+        }
+    });
     AnchorWrapWire {
         kind,
         authored_kinds: authored
@@ -13698,8 +13979,135 @@ fn vml_word_anchor_wrap(shape: roxmltree::Node, style: &str) -> AnchorWrapWire {
             }),
         side,
         distances: vml_word_wrap_distances(style),
+        polygon,
         ..Default::default()
     }
+}
+
+/// Tight and through wrapping follow the shape's `wrapcoords` polygon
+/// (ECMA-376 Part 4 §19.1.2.19). [MS-OE376] §2.1.1692(uu-vv), which
+/// §§2.1.1710-.1711 apply to shape and shapetype: Word writes the
+/// points space-delimited in the same 21600-unit square as DrawingML
+/// `wp:wrapPolygon`; the standard's comma-delimited form is accepted too.
+///
+/// Part 4 gives the attribute no default value, and DrawingML has no
+/// polygon-less tight wrap to borrow one from (CT_WrapTight requires
+/// `wrapPolygon`). Library policy: when `wrapcoords` is absent or unusable
+/// (a non-integer token, an odd coordinate count, or fewer than three points),
+/// wrap tightly around the shape's whole bounding rectangle, i.e. the corners
+/// of the same coordinate square. That keeps the object painted and its text
+/// exclusion on the frame Word positions, rather than dropping the anchor.
+fn vml_word_wrap_polygon(wrapcoords: Option<&str>) -> AnchorPolygonWire {
+    #[cfg(test)]
+    WRAPCOORDS_SCANNED_BYTES
+        .with(|scanned| scanned.set(scanned.get() + wrapcoords.map_or(0, str::len)));
+    wrapcoords
+        .and_then(vml_authored_wrap_polygon)
+        .unwrap_or_else(|| {
+            let mut frame = WrapPolygonBuilder::default();
+            for (x, y) in [(0, 0), (0, 21600), (21600, 21600), (21600, 0), (0, 0)] {
+                frame.push(Some(x), Some(y), None, None);
+            }
+            frame
+        })
+        .finish(false)
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// Total `wrapcoords` bytes handed to the parser on this thread.
+    static WRAPCOORDS_SCANNED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+std::thread_local! {
+    /// Polygons of shapetypes in the pict whose groups are being acquired,
+    /// keyed by node within that pict's document (see
+    /// `with_vml_wrap_polygon_memo`).
+    static VML_WRAP_POLYGON_MEMO: std::cell::RefCell<Option<VmlWrapPolygonMemo>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+struct VmlWrapPolygonMemo {
+    /// Identity of a document that outlives the memo, so no other document
+    /// can reuse its address while entries are live.
+    document: *const (),
+    polygons: HashMap<roxmltree::NodeId, AnchorPolygonWire>,
+}
+
+/// Run `parse` with a memo of inherited `wrapcoords` polygons for `pict`'s
+/// document installed. Any number of sibling leaves may reference one local
+/// shapetype; each then reuses one bounded parse instead of rescanning an
+/// arbitrarily long attribute per reference.
+pub(super) fn with_vml_wrap_polygon_memo<R>(pict: roxmltree::Node, parse: impl FnOnce() -> R) -> R {
+    struct Restore(Option<VmlWrapPolygonMemo>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let previous = self.0.take();
+            let _ = VML_WRAP_POLYGON_MEMO.try_with(|memo| memo.replace(previous));
+        }
+    }
+    let memo = VmlWrapPolygonMemo {
+        document: std::ptr::from_ref(pict.document()).cast(),
+        polygons: HashMap::new(),
+    };
+    let _restore = Restore(VML_WRAP_POLYGON_MEMO.with(|active| active.replace(Some(memo))));
+    parse()
+}
+
+/// The wrap polygon a shape inherits from `definition`, parsed once per
+/// definition: memoised by node when the definition belongs to the document
+/// of the installed memo, and on the story's index entry when it is a
+/// recorded definition re-parsed into a transient document.
+fn inherited_vml_wrap_polygon(definition: roxmltree::Node) -> AnchorPolygonWire {
+    let parse = || vml_word_wrap_polygon(definition.attribute("wrapcoords"));
+    let document: *const () = std::ptr::from_ref(definition.document()).cast();
+    let recorded_id = RECORDED_VML_SHAPE_TYPE.with(|active| {
+        active
+            .borrow()
+            .as_ref()
+            .filter(|(recorded, _)| std::ptr::eq(*recorded, document))
+            .map(|(_, id)| id.clone())
+    });
+    if let Some(id) = recorded_id {
+        let cached = ACTIVE_VML_SHAPE_TYPES.with(|active| {
+            let mut active = active.borrow_mut();
+            let recorded = active.as_mut()?.types.get_mut(&id)?;
+            Some(recorded.wrap_polygon.get_or_insert_with(parse).clone())
+        });
+        return cached.unwrap_or_else(parse);
+    }
+    VML_WRAP_POLYGON_MEMO.with(|active| {
+        let mut active = active.borrow_mut();
+        match active.as_mut() {
+            Some(memo)
+                if std::ptr::eq(
+                    memo.document,
+                    std::ptr::from_ref(definition.document()).cast(),
+                ) =>
+            {
+                memo.polygons
+                    .entry(definition.id())
+                    .or_insert_with(parse)
+                    .clone()
+            }
+            _ => parse(),
+        }
+    })
+}
+
+/// The authored `wrapcoords` polygon, read token by token; `None` when it is
+/// unusable (see `vml_word_wrap_polygon`).
+fn vml_authored_wrap_polygon(raw: &str) -> Option<WrapPolygonBuilder> {
+    let mut tokens = raw
+        .split(|c: char| c == ',' || c.is_ascii_whitespace())
+        .filter(|token| !token.is_empty());
+    let mut polygon = WrapPolygonBuilder::default();
+    while let Some(raw_x) = tokens.next() {
+        let raw_y = tokens.next()?;
+        let (x, y) = (raw_x.parse().ok()?, raw_y.parse().ok()?);
+        polygon.push(Some(x), Some(y), Some(raw_x), Some(raw_y));
+    }
+    (polygon.point_count >= 3).then_some(polygon)
 }
 
 fn vml_word_wrap_distances(style: &str) -> AnchorEdgesWire {
@@ -13758,6 +14166,7 @@ fn vml_word_z_order(style: &str) -> (bool, Option<u32>, AnchorValueStatusWire) {
 
 fn vml_word_anchor_acquisition(
     shape: roxmltree::Node,
+    definition: Option<roxmltree::Node>,
     style: &str,
     width_pt: f64,
     height_pt: f64,
@@ -13792,7 +14201,7 @@ fn vml_word_anchor_acquisition(
             width_status: AnchorValueStatusWire::Valid,
             height_status: AnchorValueStatusWire::Valid,
         },
-        wrap: vml_word_anchor_wrap(shape, style),
+        wrap: vml_word_anchor_wrap(shape, definition, style),
         behavior: AnchorBehaviorWire {
             behind_doc: Some(behind_doc),
             behind_doc_status: AnchorValueStatusWire::Valid,
@@ -13964,6 +14373,7 @@ fn vml_image_source(node: roxmltree::Node, media_map: &HashMap<String, String>) 
 
 fn vml_image_run(
     shape: roxmltree::Node,
+    definition: Option<roxmltree::Node>,
     image_path: String,
     width_pt: f64,
     height_pt: f64,
@@ -13999,7 +14409,7 @@ fn vml_image_run(
             None | Some("paragraph") | Some("line") | Some("character")
         );
     let anchor_acquisition =
-        anchor.then(|| vml_word_anchor_acquisition(shape, style, width_pt, height_pt));
+        anchor.then(|| vml_word_anchor_acquisition(shape, definition, style, width_pt, height_pt));
 
     ImageRun {
         mime_type: mime_from_ext(&image_path).to_string(),
@@ -14082,9 +14492,11 @@ fn parse_vml_pict_image(
         return None;
     }
 
-    Some(vml_image_run(
-        shape, image_path, width_pt, height_pt, imagedata,
-    ))
+    Some(with_vml_shape_type(pict, shape, |definition| {
+        vml_image_run(
+            shape, definition, image_path, width_pt, height_pt, imagedata,
+        )
+    }))
 }
 
 /// Extract the preview image from an embedded OLE object (`<w:object>`,
@@ -14145,9 +14557,11 @@ fn parse_object_ole_image(
         return None;
     }
 
-    Some(vml_image_run(
-        shape, image_path, width_pt, height_pt, imagedata,
-    ))
+    Some(with_vml_shape_type(object, shape, |definition| {
+        vml_image_run(
+            shape, definition, image_path, width_pt, height_pt, imagedata,
+        )
+    }))
 }
 
 /// Result of inspecting a shape's spPr for a direct fill.
@@ -14496,7 +14910,7 @@ fn docx_gradient_fill(gradient: ooxml_common::fill::GradientFill) -> ShapeFill {
 
 fn parse_docx_drawingml_fill(
     fill: roxmltree::Node,
-    resolver: &(impl ooxml_common::color::ThemeResolver + ?Sized),
+    resolver: &dyn ooxml_common::color::ThemeResolver,
 ) -> Option<ShapeFill> {
     let tint_mode = ooxml_common::color::TintMode::WordLiteral;
     match fill.tag_name().name() {
@@ -19160,6 +19574,305 @@ mod anchor_acquisition_wire_tests {
         assert_eq!(polygon.points[1].raw_y, None);
     }
 
+    fn polygon_coords(polygon: &AnchorPolygonWire) -> Vec<(Option<i64>, Option<i64>)> {
+        polygon
+            .points
+            .iter()
+            .map(|point| (point.x, point.y))
+            .collect()
+    }
+
+    fn drawing_polygon(points: &str) -> AnchorPolygonWire {
+        facts(&format!(
+            r#"<wp:anchor xmlns:wp="urn:wp"><wp:extent cx="12700" cy="12700"/>
+              <wp:wrapTight wrapText="bothSides"><wp:wrapPolygon>{points}</wp:wrapPolygon>
+              </wp:wrapTight></wp:anchor>"#
+        ))
+        .wrap
+        .polygon
+        .unwrap()
+    }
+
+    fn drawing_points(count: usize) -> String {
+        (0..count)
+            .map(|i| {
+                let tag = if i == 0 { "start" } else { "lineTo" };
+                format!(r#"<wp:{tag} x="{}" y="{}"/>"#, i % 300, 21600 - i % 500)
+            })
+            .collect()
+    }
+
+    const FRAME: [(Option<i64>, Option<i64>); 5] = [
+        (Some(0), Some(0)),
+        (Some(0), Some(21600)),
+        (Some(21600), Some(21600)),
+        (Some(21600), Some(0)),
+        (Some(0), Some(0)),
+    ];
+
+    #[test]
+    fn wrapcoords_over_budget_parse_in_bounded_memory() {
+        let raw = format!(
+            "0 0 0 21600 21600 21600 21600 0 {}",
+            "0 0 ".repeat(2_000_000)
+        );
+        let mut polygon = None;
+        let peak = crate::allocation_tests::peak(|| {
+            polygon = Some(vml_word_wrap_polygon(Some(&raw)));
+        });
+        assert!(peak < 64 * 1024, "wrapcoords peak {peak} bytes");
+        let polygon = polygon.unwrap();
+        assert_eq!(polygon.invalid_point_count, 0);
+        assert_eq!(&polygon_coords(&polygon), &FRAME[..4]);
+        assert!(polygon
+            .points
+            .iter()
+            .all(|p| p.raw_x.is_none() && p.raw_y.is_none()));
+    }
+
+    #[test]
+    fn wrap_polygon_over_budget_acquires_in_bounded_memory() {
+        let xml = format!(
+            r#"<wp:anchor xmlns:wp="urn:wp"><wp:extent cx="12700" cy="12700"/>
+              <wp:wrapTight wrapText="bothSides"><wp:wrapPolygon>{}</wp:wrapPolygon>
+              </wp:wrapTight></wp:anchor>"#,
+            drawing_points(300_000)
+        );
+        let doc = roxmltree::Document::parse_with_options(
+            &xml,
+            roxmltree::ParsingOptions {
+                nodes_limit: u32::MAX,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut wire = None;
+        let peak = crate::allocation_tests::peak(|| {
+            wire = Some(parse_anchor_acquisition_wire(&doc.root_element()));
+        });
+        assert!(peak < 128 * 1024, "wrapPolygon peak {peak} bytes");
+        let polygon = wire.unwrap().wrap.polygon.unwrap();
+        assert_eq!(
+            polygon_coords(&polygon),
+            [
+                (Some(0), Some(21101)),
+                (Some(0), Some(21600)),
+                (Some(299), Some(21600)),
+                (Some(299), Some(21101)),
+            ]
+        );
+    }
+
+    /// Parse a body of `paragraphs` in which 100 tight-wrapped shapes reference
+    /// shapetype `t`, check every shape acquires its polygon, and return the
+    /// `wrapcoords` bytes scanned.
+    fn parse_inherited_wrapcoords(paragraphs: &str) -> usize {
+        use std::io::{Cursor, Write};
+        let document = format!(
+            r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:w10="urn:schemas-microsoft-com:office:word"><w:body>{paragraphs}<w:sectPr/></w:body></w:document>"#
+        );
+        let mut bytes = Vec::new();
+        {
+            let mut archive = zip::ZipWriter::new(Cursor::new(&mut bytes));
+            crate::parser::write_test_content_types(&mut archive);
+            archive
+                .start_file(
+                    "word/document.xml",
+                    zip::write::SimpleFileOptions::default(),
+                )
+                .unwrap();
+            archive.write_all(document.as_bytes()).unwrap();
+            archive.finish().unwrap();
+        }
+        WRAPCOORDS_SCANNED_BYTES.with(|scanned| scanned.set(0));
+        let mut json = String::new();
+        let peak = crate::allocation_tests::peak(|| {
+            json = crate::parse_docx_native(&bytes).unwrap();
+        });
+        let scanned = WRAPCOORDS_SCANNED_BYTES.with(std::cell::Cell::get);
+        assert!(json.len() < 1024 * 1024, "JSON is {} bytes", json.len());
+        assert!(peak < 32 * 1024 * 1024, "parse peak {peak} bytes");
+        let model: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let mut polygons = Vec::new();
+        let mut pending = vec![&model];
+        while let Some(value) = pending.pop() {
+            match value {
+                serde_json::Value::Object(map) => {
+                    if let Some(polygon) = map.get("polygon").filter(|p| p.is_object()) {
+                        polygons.push(polygon.clone());
+                    }
+                    pending.extend(map.values());
+                }
+                serde_json::Value::Array(items) => pending.extend(items),
+                _ => {}
+            }
+        }
+        assert_eq!(polygons.len(), 100);
+        assert!(polygons.iter().all(|polygon| polygon["points"]
+            == serde_json::json!([
+                { "x": 0, "y": 0, "rawX": "0", "rawY": "0" },
+                { "x": 0, "y": 21600, "rawX": "0", "rawY": "21600" },
+                { "x": 21600, "y": 21600, "rawX": "21600", "rawY": "21600" },
+                { "x": 21600, "y": 0, "rawX": "21600", "rawY": "0" },
+            ])));
+        scanned
+    }
+
+    const INHERITING_SHAPE: &str = r##"<v:shape type="#t" style="position:absolute;margin-left:10pt;margin-top:10pt;width:100pt;height:100pt;mso-position-horizontal-relative:page;mso-position-vertical-relative:page"><w10:wrap type="tight"/></v:shape>"##;
+
+    fn zero_padded_shapetype(zeros: usize) -> (String, String) {
+        let wrapcoords = format!("{} 0 0 21600 21600 21600 21600 0", "0".repeat(zeros));
+        let shapetype = format!(
+            r#"<v:shapetype id="t" o:spt="1" coordsize="21600,21600" wrapcoords="{wrapcoords}"/>"#
+        );
+        (wrapcoords, shapetype)
+    }
+
+    #[test]
+    fn inherited_zero_padded_wrapcoords_stay_bounded_per_shape() {
+        let (wrapcoords, shapetype) = zero_padded_shapetype(1_000_000);
+        let scanned = parse_inherited_wrapcoords(&format!(
+            "<w:p><w:r><w:pict>{shapetype}{}<v:group/></w:pict></w:r></w:p>",
+            INHERITING_SHAPE.repeat(100)
+        ));
+        // One local definition is parsed once, not once per referencing shape.
+        assert_eq!(scanned, wrapcoords.len());
+    }
+
+    #[test]
+    fn recorded_shapetype_wrapcoords_are_parsed_once_per_definition() {
+        // Small enough for the story's shapetype index, which re-parses the
+        // recorded definition for every referencing shape.
+        let (wrapcoords, shapetype) = zero_padded_shapetype(60_000);
+        let earlier = format!("<w:p><w:r><w:pict>{shapetype}</w:pict></w:r></w:p>");
+        // Shapes beside a group in one later pict, and one shape per pict.
+        for later in [
+            format!(
+                "<w:p><w:r><w:pict>{}<v:group/></w:pict></w:r></w:p>",
+                INHERITING_SHAPE.repeat(100)
+            ),
+            format!("<w:p><w:r><w:pict>{INHERITING_SHAPE}</w:pict></w:r></w:p>").repeat(100),
+        ] {
+            let scanned = parse_inherited_wrapcoords(&format!("{earlier}{later}"));
+            assert_eq!(scanned, wrapcoords.len());
+        }
+    }
+
+    #[test]
+    fn coordinate_text_is_canonical_or_a_bounded_invalid_excerpt() {
+        let vml = vml_word_wrap_polygon(Some("+0 007 21600,0 0 21600"));
+        assert_eq!(
+            vml.points
+                .iter()
+                .map(|p| (p.raw_x.as_deref(), p.raw_y.as_deref()))
+                .collect::<Vec<_>>(),
+            [
+                (Some("0"), Some("7")),
+                (Some("21600"), Some("0")),
+                (Some("0"), Some("21600"))
+            ]
+        );
+        // An i64 overflow is unparseable, so VML keeps its frame fallback.
+        let overflow = vml_word_wrap_polygon(Some("0 0 99999999999999999999 0 0 1"));
+        assert_eq!(polygon_coords(&overflow), FRAME);
+        let long_invalid = format!("{}x", "9".repeat(10_000));
+        let drawing = drawing_polygon(&format!(
+            r#"<wp:start x="{}" y="{long_invalid}"/><wp:lineTo x="99999999999999999999" y="{}é{long_invalid}"/><wp:lineTo x="1" y="2"/>"#,
+            "0".repeat(10_000),
+            "9".repeat(31)
+        ));
+        assert_eq!(drawing.invalid_point_count, 2);
+        let texts: Vec<_> = drawing
+            .points
+            .iter()
+            .map(|p| (p.x, p.raw_x.as_deref(), p.y, p.raw_y.as_deref()))
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                (Some(0), Some("0"), None, Some(&"9".repeat(32)[..])),
+                (
+                    None,
+                    Some("99999999999999999999"),
+                    None,
+                    Some(&"9".repeat(31)[..])
+                ),
+                (Some(1), Some("1"), Some(2), Some("2")),
+            ]
+        );
+    }
+
+    #[test]
+    fn wrapcoords_budget_boundary_and_malformed_lists() {
+        let coords = |count: usize| {
+            (0..count)
+                .map(|i| format!("{} {}", i % 300, 21600 - i % 500))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let at_limit = vml_word_wrap_polygon(Some(&coords(256)));
+        assert_eq!(at_limit.points.len(), 256);
+        assert_eq!(at_limit.points[255].x, Some(255));
+        assert_eq!(at_limit.points[255].raw_y.as_deref(), Some("21345"));
+        let over = vml_word_wrap_polygon(Some(&coords(257)));
+        assert_eq!(
+            polygon_coords(&over),
+            [
+                (Some(0), Some(21344)),
+                (Some(0), Some(21600)),
+                (Some(256), Some(21600)),
+                (Some(256), Some(21344)),
+            ]
+        );
+        let comma = vml_word_wrap_polygon(Some("0,0, 10,0 ,10,10"));
+        assert_eq!(comma.points.len(), 3);
+        assert_eq!(comma.points[2].raw_x.as_deref(), Some("10"));
+        for malformed in [
+            None,
+            Some(""),
+            Some("0 0 10 0"),
+            Some("0 0 10 0 10"),
+            Some("0 0 10 0 10 1.5"),
+            Some("0 0 10 0 10 x"),
+            Some(format!("{} 7", coords(300)).as_str()),
+            Some(format!("{} 7 x", coords(300)).as_str()),
+        ] {
+            let polygon = vml_word_wrap_polygon(malformed);
+            assert_eq!(polygon_coords(&polygon), FRAME, "{malformed:?}");
+            assert!(polygon
+                .points
+                .iter()
+                .all(|p| p.raw_x.is_none() && p.raw_y.is_none()));
+            assert_eq!(polygon.invalid_point_count, 0);
+        }
+    }
+
+    #[test]
+    fn wrap_polygon_budget_boundary_keeps_invalid_counts() {
+        let at_limit = drawing_polygon(&drawing_points(256));
+        assert_eq!(at_limit.points.len(), 256);
+        assert_eq!(at_limit.points[255].raw_x.as_deref(), Some("255"));
+        let over = drawing_polygon(&drawing_points(257));
+        assert_eq!(over.points.len(), 4);
+        assert_eq!(over.points[2].x, Some(256));
+        let invalid_at_limit =
+            drawing_polygon(&format!(r#"{}<wp:lineTo x="1"/>"#, drawing_points(255)));
+        assert_eq!(invalid_at_limit.points.len(), 256);
+        assert_eq!(invalid_at_limit.invalid_point_count, 1);
+        let invalid_over = drawing_polygon(&format!(
+            r#"{}<wp:lineTo x="1" y="z"/><wp:lineTo y="2"/>"#,
+            drawing_points(256)
+        ));
+        assert!(invalid_over.points.is_empty());
+        assert_eq!(invalid_over.invalid_point_count, 2);
+        let invalid_first_over = drawing_polygon(&format!(
+            r#"<wp:start x="q" y="0"/>{}"#,
+            drawing_points(256)
+        ));
+        assert!(invalid_first_over.points.is_empty());
+        assert_eq!(invalid_first_over.invalid_point_count, 1);
+    }
+
     #[test]
     fn unknown_axis_alignment_values_are_invalid() {
         let wire = facts(
@@ -19495,6 +20208,26 @@ mod math_jc_tests {
         );
         let enabled = parse_document_settings(&enabled_xml).expect("enabled balance setting");
         assert_eq!(enabled.balance_single_byte_double_byte_width, Some(true));
+    }
+
+    #[test]
+    fn settings_footnote_layout_like_ww8_preserves_explicit_on_off_and_absence() {
+        for (element, expected) in [
+            ("<w:footnoteLayoutLikeWW8/>", Some(true)),
+            (r#"<w:footnoteLayoutLikeWW8 w:val="0"/>"#, Some(false)),
+            ("<w:useFELayout/>", None),
+        ] {
+            let xml = format!(
+                r#"<w:settings xmlns:w="{W_NS}"><w:compat>{element}</w:compat></w:settings>"#
+            );
+            let settings = parse_document_settings(&xml).expect("compat setting");
+            assert_eq!(settings.footnote_layout_like_ww8, expected);
+            let wire = serde_json::to_value(settings).unwrap();
+            assert_eq!(
+                wire.get("footnoteLayoutLikeWW8").and_then(|v| v.as_bool()),
+                expected
+            );
+        }
     }
 
     #[test]

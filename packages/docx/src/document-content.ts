@@ -22,10 +22,10 @@ import type { NumberingMarkerShapeInput } from './layout/types.js';
 
 type InternalRenderedFontAxes = Readonly<InternalRunSlotMetadata>;
 
-// Web preload admits newly resolved slot families. Native preflight retains
-// its existing projection so enabling this optional resource feature cannot
-// change default local registrations or layout.
-type FontCollection = 'native-preflight' | 'google-preload';
+// Font-source demand (LoadOptions.fonts) admits newly resolved slot families.
+// Native preflight retains its existing projection so configuring an optional
+// font source cannot change default local registrations or layout.
+type FontCollection = 'native-preflight' | 'font-demand';
 
 type SlotRequest = Pick<NumberingMarkerShapeInput, 'fonts' | 'themeFonts' | 'themeFontPresence'>;
 
@@ -106,7 +106,7 @@ function* shapeTextUsages(shape: ShapeRun, collection: FontCollection): Generato
   // (paragraphs AND tables, recursively). The legacy textBlocks projection
   // omits tables, so it is consulted only for hand-built public shapes.
   const content = (shape as InternalShapeRun).textBoxContent;
-  if (collection === 'google-preload' && content !== undefined) {
+  if (collection === 'font-demand' && content !== undefined) {
     yield* bodyUsages(content as BodyElement[], collection);
     return;
   }
@@ -158,7 +158,7 @@ function* textResultUsages(
 ): Generator<DocxRenderedTextUsage> {
   const request = runSlotRequest(ascii, facts);
   const [asciiFamily, highAnsiFamily, eastAsiaFamily] =
-    collection === 'google-preload'
+    collection === 'font-demand'
       ? slotFamilies(request, ['ascii', 'highAnsi', 'eastAsia'])
       : [ascii, facts.fontFamilyHighAnsi, facts.fontFamilyEastAsia];
   yield {
@@ -169,8 +169,8 @@ function* textResultUsages(
     bold,
     italic,
   };
-  if (collection === 'google-preload' ? runUsesComplexScriptSlot(facts) : facts.fontFamilyCs != null) {
-    const complexScriptFamily = collection === 'google-preload'
+  if (collection === 'font-demand' ? runUsesComplexScriptSlot(facts) : facts.fontFamilyCs != null) {
+    const complexScriptFamily = collection === 'font-demand'
       ? requestedFamily(request, 'complexScript') : facts.fontFamilyCs;
     if (complexScriptFamily) yield {
       text,
@@ -209,14 +209,14 @@ function* paragraphUsages(paragraph: DocParagraph, collection: FontCollection): 
     text: '',
     fontFamilies: [paragraph.defaultFontFamily, paragraph.defaultFontFamilyEastAsia],
   };
-  if (collection === 'google-preload') {
+  if (collection === 'font-demand') {
     const mark = paragraphMarkShapeInput(paragraph);
     if (mark) yield shapeInputUsage('', mark);
   }
   if (paragraph.numbering) {
     // Same effective numbering-level rPr projection (all four slots and their
     // theme references) that production marker shaping consumes.
-    if (collection === 'google-preload') yield shapeInputUsage(
+    if (collection === 'font-demand') yield shapeInputUsage(
       paragraph.numbering.text,
       numberingMarkerShapeInput(paragraph.numbering, paragraph.defaultFontSize ?? 10),
     );
@@ -303,7 +303,8 @@ function* selectedSeparatorUsages(
   collection: FontCollection,
 ): Generator<DocxRenderedTextUsage> {
   const settings = (doc as InternalDocxDocumentModel).__noteLayoutSettings;
-  for (const paragraph of [settings?.footnoteSeparatorParagraph, settings?.footnoteContinuationSeparatorParagraph]) {
+  for (const paragraph of [settings?.footnoteSeparatorParagraph, settings?.footnoteContinuationSeparatorParagraph,
+    settings?.endnoteSeparatorParagraph, settings?.endnoteContinuationSeparatorParagraph]) {
     if (paragraph) yield* paragraphUsages({ ...paragraph, runs: [] }, collection);
   }
 }

@@ -224,14 +224,15 @@ fn automatic_spacing_native_body_header_footer_and_note_keep_their_own_paragraph
 }
 
 #[test]
-fn automatic_spacing_dop_setting_reaches_canonical_document_without_neighbor_bit_aliasing() {
-    for (size, flags, expected) in [
-        (84, 0, None),
-        (500, 0, None),
-        (544, 0, Some(false)),
-        (544, 4, Some(true)),
-        (544, 8, Some(false)),
-        (694, 12, Some(true)),
+fn dop_compatibility_settings_reach_canonical_document_without_neighbor_bit_aliasing() {
+    for (size, flags, expected, footnote_layout) in [
+        (84, 0, None, None),
+        (500, 0, None, None),
+        (544, 0, Some(false), Some(false)),
+        (544, 2, Some(false), Some(true)),
+        (544, 4, Some(true), Some(false)),
+        (544, 8, Some(false), Some(false)),
+        (694, 12, Some(true), Some(false)),
     ] {
         let bytes = base("settings\r");
         let cfb = CompoundFile::open(&bytes).unwrap();
@@ -258,6 +259,7 @@ fn automatic_spacing_dop_setting_reaches_canonical_document_without_neighbor_bit
             settings.do_not_use_html_paragraph_auto_spacing, expected,
             "DOP {size}, flags {flags}"
         );
+        assert_eq!(settings.footnote_layout_like_ww8, footnote_layout);
         assert_eq!(settings.adjust_line_height_in_table, Some(flags & 8 == 0));
         // Word opens every binary document in compatibility mode 11.
         assert_eq!(settings.compatibility_mode, Some(11));

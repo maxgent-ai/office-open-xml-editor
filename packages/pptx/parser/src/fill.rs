@@ -68,9 +68,9 @@ fn parse_fill_tint(
     parse_fill_with_resolver(node, &PptxSchemeResolver { theme }, tint_mode)
 }
 
-fn parse_fill_with_resolver<R: ThemeResolver + ?Sized>(
+fn parse_fill_with_resolver(
     node: roxmltree::Node<'_, '_>,
-    resolver: &R,
+    resolver: &dyn ThemeResolver,
     tint_mode: ooxml_common::color::TintMode,
 ) -> Option<Fill> {
     for c in node.children().filter(|n| n.is_element()) {
@@ -248,12 +248,9 @@ pub(crate) fn parse_blip_fill<F: FnMut(&str) -> Option<String>>(
     parse_blip_fill_with_color_resolver(blip_fill, &PptxSchemeResolver { theme }, resolve_blip)
 }
 
-fn parse_blip_fill_with_color_resolver<
-    R: ThemeResolver + ?Sized,
-    F: FnMut(&str) -> Option<String>,
->(
+fn parse_blip_fill_with_color_resolver<F: FnMut(&str) -> Option<String>>(
     blip_fill: roxmltree::Node<'_, '_>,
-    color_resolver: &R,
+    color_resolver: &dyn ThemeResolver,
     resolve_blip: &mut F,
 ) -> Option<Fill> {
     let r_id = child(blip_fill, "blip").and_then(|b| attr_r(&b, "embed"))?;
@@ -463,9 +460,9 @@ pub(crate) fn parse_shadow_node(
     )
 }
 
-fn parse_shadow_node_with_resolver<R: ThemeResolver + ?Sized>(
+fn parse_shadow_node_with_resolver(
     n: roxmltree::Node<'_, '_>,
-    resolver: &R,
+    resolver: &dyn ThemeResolver,
     tint_mode: ooxml_common::color::TintMode,
 ) -> Option<Shadow> {
     Some(ooxml_common::effect::parse_shadow_effect(
@@ -510,9 +507,9 @@ pub(crate) fn parse_effect_lst(
     )
 }
 
-fn parse_effect_lst_with_resolver<R: ThemeResolver + ?Sized>(
+fn parse_effect_lst_with_resolver(
     effect_lst: Option<roxmltree::Node<'_, '_>>,
-    resolver: &R,
+    resolver: &dyn ThemeResolver,
     tint_mode: ooxml_common::color::TintMode,
 ) -> EffectLst {
     effect_lst
@@ -647,9 +644,9 @@ pub(crate) fn parse_sp3d(
     )
 }
 
-fn parse_sp3d_with_resolver<R: ThemeResolver + ?Sized>(
+fn parse_sp3d_with_resolver(
     sppr: roxmltree::Node<'_, '_>,
-    resolver: &R,
+    resolver: &dyn ThemeResolver,
     tint_mode: ooxml_common::color::TintMode,
 ) -> Option<Sp3d> {
     let n = child(sppr, "sp3d")?;

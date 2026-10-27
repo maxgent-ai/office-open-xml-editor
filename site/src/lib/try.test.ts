@@ -13,6 +13,7 @@ const mocks = vi.hoisted(() => ({
   legacyXls: vi.fn(() => ({ target: 'xlsx' })),
   legacyPpt: vi.fn(() => ({ target: 'pptx' })),
   math: { loadMathJax: vi.fn(), mathMLToSvg: vi.fn() },
+  googleFontsSource: { kind: 'css-api' },
   threeD: { render: vi.fn() },
   regionMap: { render: vi.fn() },
   chartEx: { render: vi.fn() },
@@ -123,6 +124,7 @@ vi.mock('@silurus/ooxml-pptx', () => {
 });
 
 vi.mock('@silurus/ooxml-xlsx', () => ({
+  googleFonts: () => mocks.googleFontsSource,
   XlsxViewer: class {
     destroyed = false;
     readonly loadCalls: unknown[][] = [];
@@ -388,7 +390,7 @@ describe('Try Yours ScrollViewer integration', () => {
     expect(viewer.opts.threeD).toBe(mocks.threeD);
     expect(viewer.opts.regionMap).toBe(mocks.regionMap);
     expect(viewer.opts.chartEx).toBe(mocks.chartEx);
-    expect(viewer.opts.useGoogleFonts).toBe(true);
+    expect(viewer.opts.fonts).toEqual([mocks.googleFontsSource]);
   });
 
   it.each(['csv', 'tsv'] as const)(

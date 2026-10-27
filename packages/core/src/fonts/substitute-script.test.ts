@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { GOOGLE_FONT_SUBSTITUTES } from './google-fonts.js';
+import { OFFICE_FONT_SUBSTITUTIONS } from './substitutions.js';
 import {
   fontSubstituteScriptClusterClass,
   fontSubstituteScriptCoversText,
@@ -8,8 +8,8 @@ import {
 
 describe('script-scoped visual substitutes', () => {
   it('scopes only the Arabic visual substitutes, never metric or same-name faces', () => {
-    const scoped = Object.entries(GOOGLE_FONT_SUBSTITUTES)
-      .filter(([, entry]) => entry.script !== undefined).map(([key]) => key).sort();
+    const scoped = OFFICE_FONT_SUBSTITUTIONS
+      .filter((entry) => entry.script !== undefined).map((entry) => entry.for.toLowerCase()).sort();
     expect(scoped).toEqual([
       'arabic typesetting', 'sakkal majalla', 'simplified arabic', 'traditional arabic', 'univers next arabic',
     ]);
@@ -47,7 +47,8 @@ describe('script-scoped visual substitutes', () => {
   });
 
   it('lets unscoped entries cover any text', () => {
-    expect(substituteEntryCoversText(GOOGLE_FONT_SUBSTITUTES.calibri, 'Latin', 'exclusive')).toBe(true);
-    expect(substituteEntryCoversText(GOOGLE_FONT_SUBSTITUTES['sakkal majalla'], 'Latin', 'any')).toBe(false);
+    const policy = (family: string) => OFFICE_FONT_SUBSTITUTIONS.find((entry) => entry.for === family);
+    expect(substituteEntryCoversText(policy('Calibri'), 'Latin', 'exclusive')).toBe(true);
+    expect(substituteEntryCoversText(policy('Sakkal Majalla'), 'Latin', 'any')).toBe(false);
   });
 });

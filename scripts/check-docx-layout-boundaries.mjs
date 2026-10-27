@@ -221,6 +221,11 @@ const SHARED_PAINT_IMPORTS = new Map([
     // Erased SVG decoder capability; paint forwards it to the shared image owner.
     ['SvgBlobDecoder', 'type'],
   ])],
+  // Chart paint stamps the document's loaded font substitutions onto the chart
+  // model; a pure map over already-loaded state, no measurement or layout.
+  ['@silurus/ooxml-core/internal/chart-font-sources', new Map([
+    ['withChartFontSubstitutions', 'value'],
+  ])],
 ]);
 
 const LEGACY_SYMBOLS = [

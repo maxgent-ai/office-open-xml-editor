@@ -1,5 +1,5 @@
 import { hadLocalFontProbeTimeout, loadLocalFontMetrics, normalizeLocalFontMetricFamily, unloadLocalFontMetrics } from './local-metrics.js';
-import { activeFontSet } from './preload.js';
+import { activeFontSet } from './font-registry.js';
 import { findReferenceFontMetrics } from './reference-font-metrics.js';
 import type { ResolvedFontMetric } from './resource-metrics.js';
 
@@ -45,6 +45,10 @@ export interface LoadedOfficeFontFallbacks {
   checked: string[];
   /** Normalized families of `presenceOnly` requests whose face is installed. */
   installed?: string[];
+  /** Normalized families of `presenceOnly` requests whose presence probe
+   * completed (installed or not). A family past the source cap or the
+   * deadline is absent: it is unproven, not missing. */
+  presenceChecked?: string[];
 }
 
 type Tuple = Readonly<{
@@ -136,9 +140,14 @@ export async function loadOfficeFontFallbacks(
     loadOfficeFontRoutes(requests.filter((request) => !request.presenceOnly), targetFontSet),
     presence.length > 0
       ? probeInstalledFontFamilies(presence, targetFontSet)
-      : Promise.resolve(new Set<string>()),
+      : Promise.resolve(undefined),
   ]);
-  return installed.size > 0 ? { ...loaded, installed: [...installed].sort() } : loaded;
+  if (!installed) return loaded;
+  return {
+    ...loaded,
+    ...(installed.installed.size > 0 ? { installed: [...installed.installed].sort() } : {}),
+    presenceChecked: [...installed.checked].sort(),
+  };
 }
 
 async function loadOfficeFontRoutes(
@@ -194,8 +203,9 @@ async function loadOfficeFontRoutes(
     unloadLocalFontMetrics(loaded.flatMap((result) => result?.faces ?? []));
     throw failure.reason;
   }
-  const metrics = Object.assign({}, ...loaded.flatMap((result) => result ? [result.metrics] : [])) as Record<string, ResolvedFontMetric>;
-  const routes: Record<string, OfficeFontFallbackRoute> = {};
+  // Null prototype: keys are document font names (e.g. `__proto__`).
+  const metrics = Object.assign(Object.create(null), ...loaded.flatMap((result) => result ? [result.metrics] : [])) as Record<string, ResolvedFontMetric>;
+  const routes = Object.create(null) as Record<string, OfficeFontFallbackRoute>;
   for (const tuple of tuples) {
     const key = routeKey(tuple);
     const metric = metrics[key];
@@ -255,17 +265,26 @@ function familyPresenceLocalNames(family: string): string[] {
  * completes later only releases its face. A timeout or a missing face is not
  * proof of absence; it only leaves the substitute enabled.
  */
+/** Outcome of one bounded family presence probe: normalized families found
+ * installed, and every normalized family whose probe completed (installed or
+ * not). A family over the source cap or past the deadline is in neither. */
+export interface FontFamilyPresence {
+  readonly installed: ReadonlySet<string>;
+  readonly checked: ReadonlySet<string>;
+}
+
 async function probeInstalledFontFamilies(
   families: readonly string[],
   targetFontSet: FontFaceSet | null,
-): Promise<ReadonlySet<string>> {
+): Promise<FontFamilyPresence> {
   const unique = [...new Map(families
     .map((family) => family.trim())
     .filter(Boolean)
     .map((family) => [normalizeLocalFontMetricFamily(family), family] as const)).values()]
     .slice(0, MAX_PREFLIGHT_SOURCES);
   const installed = new Set<string>();
-  if (!targetFontSet || typeof FontFace === 'undefined' || unique.length === 0) return installed;
+  const checked = new Set<string>();
+  if (!targetFontSet || typeof FontFace === 'undefined' || unique.length === 0) return { installed, checked };
   let next = 0;
   let accepting = true;
   const workers = Array.from({ length: Math.min(4, unique.length) }, async () => {
@@ -276,9 +295,9 @@ async function probeInstalledFontFamilies(
         targetFontSet,
       );
       unloadLocalFontMetrics(result.faces);
-      if (accepting && Object.keys(result.metrics).length > 0) {
-        installed.add(normalizeLocalFontMetricFamily(family));
-      }
+      if (!accepting) continue;
+      checked.add(normalizeLocalFontMetricFamily(family));
+      if (Object.keys(result.metrics).length > 0) installed.add(normalizeLocalFontMetricFamily(family));
     }
   });
   let deadline: ReturnType<typeof setTimeout> | undefined;
@@ -288,5 +307,31 @@ async function probeInstalledFontFamilies(
   ]);
   if (deadline !== undefined) clearTimeout(deadline);
   accepting = false;
-  return new Set(installed);
+  return { installed: new Set(installed), checked: new Set(checked) };
+}
+
+/**
+ * Presence of every family in `families`, probed in batches of the per-call
+ * source cap (the same `local()` probe as presence-only fallback requests).
+ * Used where a font source must not shadow an installed face, so every
+ * demanded family is probed rather than only the first batch. Each batch keeps
+ * its own deadline; a family whose probe did not complete is absent from
+ * `checked`, and callers must not treat it as proven missing.
+ */
+export async function probeFontFamilyPresence(
+  families: readonly string[],
+  targetFontSet: FontFaceSet | null = activeFontSet(),
+): Promise<FontFamilyPresence> {
+  const unique = [...new Map(families
+    .map((family) => family.trim())
+    .filter(Boolean)
+    .map((family) => [normalizeLocalFontMetricFamily(family), family] as const)).values()];
+  const installed = new Set<string>();
+  const checked = new Set<string>();
+  for (let start = 0; start < unique.length; start += MAX_PREFLIGHT_SOURCES) {
+    const batch = await probeInstalledFontFamilies(unique.slice(start, start + MAX_PREFLIGHT_SOURCES), targetFontSet);
+    for (const family of batch.installed) installed.add(family);
+    for (const family of batch.checked) checked.add(family);
+  }
+  return { installed, checked };
 }

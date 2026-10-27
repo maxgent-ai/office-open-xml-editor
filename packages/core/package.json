@@ -1,7 +1,7 @@
 {
   "name": "@silurus/ooxml-core",
   "private": true,
-  "version": "0.89.2",
+  "version": "0.89.4",
   "description": "Shared rendering primitives and types (internal workspace package of @silurus/ooxml)",
   "license": "MIT",
   "author": "Yuki Yokotani <silurus.dev@gmail.com>",
@@ -75,6 +75,9 @@
     "./internal/css-font-family": "./src/internal/css-font-family.ts",
     "./internal/own-key": "./src/internal/own-key.ts",
     "./internal/script-preload-accumulator": "./src/internal/script-preload-accumulator.ts",
+    "./internal/font-scalar-demand": "./src/internal/font-scalar-demand.ts",
+    "./internal/chart-font-sources": "./src/internal/chart-font-sources.ts",
+    "./internal/font-sources": "./src/internal/font-sources.ts",
     "./internal/wasm-runtime-generation": "./src/internal/wasm-runtime-generation.ts",
     "./internal/abort": "./src/internal/abort.ts",
     "./internal/deferred": "./src/internal/deferred.ts",

@@ -211,6 +211,20 @@ describe('measureParagraph', () => {
     );
     expect(exact.lines[0]?.advancePt).toBeCloseTo(12);
   });
+  it.each([undefined, 12])('keeps marker descent out of a legacy list line (mode %s)', (compatibilityMode) => {
+    const doc = paragraph({ runs: [{ type: 'text', ...textRun('List item') }] });
+    const context = layoutContext({ spaceBeforePt: 0,
+      lineSpacing: { rule: 'auto', value: 1.15, explicit: true } });
+    const at = placement({ startYPt: 0 });
+    const plain = measureParagraph(doc, context, at, measurer, environment());
+    const marked = measureParagraph(doc, context, at, measurer,
+      environment({ compatibilityMode, firstLineNumberingMarkerBox: {
+        ascentPt: 8, descentPt: 6, intendedSinglePt: 14,
+      } }));
+    // Windows Word: a same-size marker can have a deeper selected font box
+    // without raising the text ascent or moving the following paragraph.
+    expect(marked.contentEndYPt).toBeCloseTo(plain.contentEndYPt);
+  });
   it('treats implicit single spacing and explicit auto1 equally for a taller text marker', () => {
     const doc = paragraph({ runs: [{ type: 'text', ...textRun('List item') }] });
     const marker = environment({ firstLineNumberingMarkerBox: { ascentPt: 12, descentPt: 1 } });
@@ -509,6 +523,42 @@ describe('measureParagraph', () => {
     expect(paragraphOnlyMetrics.contentEndYPt).toBe(22);
   });
 
+  it('keeps useFELayout from selecting an East Asian mark face without a line grid', () => {
+    const text = createTextLayoutService({
+      fonts: createFontResolver(['Latin Mark', 'EA Mark'].map((family) => ({
+        requestedFamily: family, resolvedFamily: family, source: 'local' as const,
+      }))),
+      measurer: {
+        fingerprint: 'different-latin-and-east-asian-mark-boxes',
+        measure: (request) => ({
+          advancePt: request.fontSizePt * 0.5,
+          ascentPt: request.fontSizePt * (request.fontRoute.familyList.includes('EA Mark') ? 1.2 : 0.8),
+          descentPt: request.fontSizePt * 0.2,
+        }),
+      },
+    });
+    const advance = (useFeLayout: boolean, eastAsianHint = false): number => measureParagraph(
+      paragraph({ defaultFontSize: 10, defaultFontFamily: 'Latin Mark', defaultFontFamilyEastAsia: 'EA Mark' }),
+      layoutContext({ spaceBeforePt: 0 }),
+      placement({ startYPt: 0 }),
+      measurer,
+      environment({
+        useFeLayout,
+        layoutServices: { text } as NonNullable<ParagraphMeasurementEnvironment['layoutServices']>,
+        paragraphMarkShapeInput: {
+          fonts: { ascii: 'Latin Mark', highAnsi: 'Latin Mark', eastAsia: 'EA Mark' },
+          fontSizePt: 10, weight: 400, style: 'normal', complexScript: false,
+          ...(eastAsianHint ? { fontHint: 'eastAsia' as const } : {}),
+        },
+      }),
+    ).contentEndYPt;
+
+    expect(advance(false)).toBe(10);
+    expect(advance(true)).toBe(10);
+    // An authored mark hint still selects the East Asian face without a grid.
+    expect(advance(true, true)).toBe(14);
+  });
+
   it('applies useFELayout grid-cell allocation to an empty paragraph mark', () => {
     const tallMeasurer: TextMeasurer = {
       context: makeContext(0.9, 0.2),
@@ -662,7 +712,9 @@ describe('measureParagraph', () => {
       layoutContext({ lineGrid, lineSpacing, spaceBeforePt: 0 }),
       placement({ startYPt: 0 }),
       measurer,
-      resolvedEaEnvironment(RESOLVED_EA_RATIO),
+      // Keep the East Asian content classification independent of useFELayout:
+      // disabling the line grid removes its signed-spacing projection only.
+      { ...resolvedEaEnvironment(RESOLVED_EA_RATIO), documentHasEastAsianText: true },
     );
 
     expect(result.contentEndYPt).toBeCloseTo(10 * RESOLVED_EA_RATIO, 12);

@@ -1,3 +1,4 @@
+import type { NoteSourceContinuation } from './body-layout-kernel.js';
 import { sliceParagraphLayout } from './paragraph.js';
 import { projectBodyOccurrence } from './occurrence-projection.js';
 import { isDeepFrozenPlainDataRoot } from './plain-data.js';
@@ -6,6 +7,8 @@ import { unionLayoutRects } from './rect-union.js';
 import type { NoteLayout, NoteSeparatorLayout, PaintNode, ParagraphLayout, StoryLayout } from './types.js';
 
 export interface FootnoteCursor {
+  readonly sourceContinuation?: NoteSourceContinuation;
+  readonly acquisitionStart?: NoteSourceContinuation;
   readonly blockIndex: number;
   readonly lineIndex: number;
   readonly inlineExtentPt: number;
@@ -14,8 +17,8 @@ export interface FootnoteCursor {
 
 /** Resolve a shaped cut back to its source run, independent of preceding
  * PAGE/NUMPAGES display lengths. A line cursor may be reused only when its
- * source cut is unchanged. Source-offset reflow is separate layout work; this
- * guard prevents repeated or omitted text while that work remains unresolved. */
+ * source cut is unchanged. A width change starts a fresh shaped suffix at
+ * sourceContinuation instead; this guard protects reuse of a shaped epoch. */
 interface ParagraphContinuationIndex {
   readonly advances: Float64Array;
   readonly runStarts: ReadonlyMap<number, number>;
@@ -72,7 +75,12 @@ function sameSourcePosition(a: FootnoteCursor['sourcePosition'], b: FootnoteCurs
 /**
  * ECMA-376 §17.11.1 illustrates a footnote continued across pages, and
  * §17.11.21 locates its band at the page bottom. Once pagination admits a
- * continuation, library policy retains complete shaped lines within capacity. The following page owns a
+ * continuation, library policy retains complete shaped lines within capacity.
+ * Windows Word document-end endnote controls (Latin 12pt single-spaced body
+ * and separator, 10pt exact note lines) also move a line whose full box exceeds
+ * the bottom, even when its baseline fits; increasing capacity by 2pt retains
+ * it. Baseline-only fitting or an extra descent allowance is not supported.
+ * The following page owns a
  * fresh note separator and resumes at the first unpainted line. A note whose
  * first line cannot fit is left to ordinary reference relocation.
  */
@@ -190,9 +198,9 @@ function partitionIndexedFootnote(acquired: NoteLayout, cursor: FootnoteCursor |
 ): FootnotePartition | null {
   if (!Number.isFinite(capacityPt) || capacityPt < 0) throw new RangeError('Invalid footnote capacity');
   // A cursor counts shaped lines, so continuing it in a different text width
-  // could silently skip or repeat source text. Reflow-aware source offsets are
-  // required before that case can be supported.
-  if (cursor && Math.abs(cursor.inlineExtentPt - acquired.flowBounds.widthPt) > 1e-6) {
+  // could silently skip or repeat source text. The caller must reacquire the
+  // source suffix and start a fresh line cursor before changing widths.
+  if (cursor && cursor.inlineExtentPt !== acquired.flowBounds.widthPt) {
     throw new Error('Footnote continuation across different text widths is unsupported');
   }
   if (cursor) {
@@ -233,7 +241,17 @@ function partitionIndexedFootnote(acquired: NoteLayout, cursor: FootnoteCursor |
   };
   const cut = (block: ParagraphLayout, blockIndex: number, lineIndex: number): FootnoteCursor =>
     Object.freeze({ blockIndex, lineIndex, inlineExtentPt: acquired.flowBounds.widthPt,
-      sourcePosition: lineSourcePosition(block, lineIndex, indexOf(block)) });
+      sourcePosition: lineSourcePosition(block, lineIndex, indexOf(block)),
+      ...(acquired.acquisitionSourceStart ? { acquisitionStart: acquired.acquisitionSourceStart } : {}),
+      ...(block.noteLineEndBoundaries ? { sourceContinuation: Object.freeze({
+        blockIndex: block.source.path[0]!,
+        paragraph: Object.freeze({
+          boundary: lineIndex > 0 ? block.noteLineEndBoundaries[lineIndex - 1]!
+            : block.noteSourceStart?.boundary ?? null,
+          ...(block.lines[lineIndex] ? { sourceRangeStart: block.lines[lineIndex]!.range.start } : {}),
+        }),
+      }) } : {}),
+    });
   for (let blockIndex = startBlock; blockIndex < acquired.story.blocks.length; blockIndex += 1) {
     const block = acquired.story.blocks[blockIndex]!;
     if (block.kind !== 'paragraph') throw new Error('Unsupported footnote block');
@@ -250,7 +268,7 @@ function partitionIndexedFootnote(acquired: NoteLayout, cursor: FootnoteCursor |
       occurrenceId: `${acquired.id}:block:${blockIndex}`,
       destination: {
         coordinateSpace: 'logical-page-points',
-        flowDomainId: `${acquired.flowDomainId}:footnote:${acquired.source.storyInstance}`,
+        flowDomainId: `${acquired.flowDomainId}:${acquired.source.story}:${acquired.source.storyInstance}`,
         translation: { xPt: 0,
           yPt: acquired.story.flowBounds.yPt + usedPt - separatorPt - paragraph.flowBounds.yPt },
       },

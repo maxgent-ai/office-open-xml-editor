@@ -547,7 +547,7 @@ pub(crate) fn parse_solid_fill(
 
 fn parse_xlsx_drawingml_fill(
     fill: roxmltree::Node,
-    resolver: &(impl ooxml_common::color::ThemeResolver + ?Sized),
+    resolver: &dyn ooxml_common::color::ThemeResolver,
 ) -> Option<ShapeFill> {
     let tint_mode = ooxml_common::color::TintMode::PowerPointLinear;
     match fill.tag_name().name() {

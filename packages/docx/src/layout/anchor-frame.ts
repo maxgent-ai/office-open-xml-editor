@@ -404,16 +404,17 @@ function resolveSize(
     if (status === 'missing') {
       return { problem: issue('missing-size', `extent.${axisName}`, `${axisName} is required`) };
     }
-    // Library limitation: anchor layout requires a positive outer
-    // wp:extent even though ST_PositiveCoordinate permits zero. Retaining a
-    // zero shape-local axis inside a positive outer/group frame does not add
-    // support for a zero outer extent; that case stays explicitly unsupported.
-    if (status !== 'valid' || !finite(value) || value <= 0) {
+    // ECMA-376 §20.4.2.7: wp:extent uses CT_PositiveSize2D, whose
+    // ST_PositiveCoordinate axes include zero (minInclusive=0). Preserve a
+    // line's collapsed axis; effectExtent and wrap distances expand its bounds
+    // independently. Requiring area here would abort page-anchor prescan for
+    // valid horizontal/vertical lines with square wrapping.
+    if (status !== 'valid' || !finite(value) || value < 0) {
       return {
         problem: issue(
           'invalid-size',
           `extent.${axisName}`,
-          `${axisName} extent must be finite and positive`,
+          `${axisName} extent must be finite and non-negative`,
         ),
       };
     }
@@ -822,12 +823,17 @@ function polygonGeometry(
       yPt: frame.yPt + (point.y / FIXED_WRAP_COORDINATE_SIZE) * frame.heightPt,
     });
   }
-  const xs = points.map((point) => point.xPt);
-  const ys = points.map((point) => point.yPt);
-  const minX = Math.min(...xs);
-  const maxX = Math.max(...xs);
-  const minY = Math.min(...ys);
-  const maxY = Math.max(...ys);
+  // Do not spread authored vertices into Math.min/max arguments.
+  let minX = Infinity;
+  let maxX = -Infinity;
+  let minY = Infinity;
+  let maxY = -Infinity;
+  for (const point of points) {
+    minX = Math.min(minX, point.xPt);
+    maxX = Math.max(maxX, point.xPt);
+    minY = Math.min(minY, point.yPt);
+    maxY = Math.max(maxY, point.yPt);
+  }
   return {
     polygon: { edited: polygon.edited, points },
     bounds: { xPt: minX, yPt: minY, widthPt: maxX - minX, heightPt: maxY - minY },

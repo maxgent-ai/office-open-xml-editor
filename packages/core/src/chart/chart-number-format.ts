@@ -35,6 +35,56 @@ export function formatLocalizedExcelShortDate(
   return formatter.format(excelSerialToUtcDate(serial, date1904));
 }
 
+/**
+ * The texts {@link formatLocalizedExcelShortDate} paints for `locale`, for
+ * font-source demand (library policy). `complete` is true when they are the
+ * whole output set: a Gregorian calendar with Latin (ASCII) digits paints, for
+ * Excel's date range (years 1900–9999), only ASCII digits and the pattern's
+ * literal separators, which do not depend on the date. Any other calendar
+ * (`roc`, `japanese`, `buddhist`, …) or numbering system can paint era names,
+ * signs and digits no finite sample proves, so `complete` is false; the texts
+ * are then a sample over every year and month of the range's eras, enough to
+ * prove which scripts the output uses (CJK era names, native digits), while
+ * scalar demand must be `'all'`.
+ */
+export function localizedExcelShortDateTexts(
+  locale = typeof navigator === 'undefined' ? undefined : navigator.language,
+): { readonly texts: readonly string[]; readonly complete: boolean } {
+  const formatter = new Intl.DateTimeFormat(locale, {
+    year: 'numeric', month: 'numeric', day: 'numeric', timeZone: 'UTC',
+  });
+  const resolved = formatter.resolvedOptions();
+  const sample = (years: Iterable<number>, months: readonly number[]) => {
+    const texts: string[] = [];
+    for (const year of years) for (const month of months) texts.push(formatter.format(Date.UTC(year, month, 28)));
+    return texts;
+  };
+  const decades = (from: number, to: number, step: number) =>
+    Array.from({ length: Math.floor((to - from) / step) + 1 }, (_, index) => from + index * step);
+  if (resolved.calendar !== 'gregory' || resolved.numberingSystem !== 'latn') {
+    // Every year of 1899–2101 (any era boundary of a modern calendar), then
+    // every decade to 9999, each in January and December, and serial 1.
+    return Object.freeze({
+      texts: Object.freeze([
+        formatter.format(Date.UTC(1900, 0, 1)),
+        ...sample(decades(1899, 2101, 1), [0, 11]),
+        ...sample(decades(2110, 9990, 10), [0]),
+      ]),
+      complete: false,
+    });
+  }
+  const texts = ['0123456789'];
+  for (const date of [Date.UTC(1900, 0, 1), Date.UTC(2000, 11, 31), Date.UTC(9999, 11, 31)]) {
+    for (const part of formatter.formatToParts(date)) {
+      if (part.type === 'literal') texts.push(part.value);
+      else if ((part.type !== 'year' && part.type !== 'month' && part.type !== 'day') || !/^[0-9]+$/.test(part.value)) {
+        return Object.freeze({ texts: Object.freeze([...texts, part.value]), complete: false });
+      }
+    }
+  }
+  return Object.freeze({ texts: Object.freeze(texts), complete: true });
+}
+
 /** Excel's default `formatCode="General"` for charts: raw numbers with no
  *  "k"/"M" abbreviation, trailing decimal zeros trimmed. */
 export function formatChartVal(v: number): string {

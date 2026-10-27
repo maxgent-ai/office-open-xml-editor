@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import { sourceFontLayoutOptions } from './testing/font-sources.js';
 import { createLayoutServices } from './layout-runtime.js';
 import { resolveColumnWidths } from './test-support/renderer-internals.test-support.js';
 import { buildSegments, layoutLines } from './line-layout.js';
@@ -180,10 +181,9 @@ describe('resolveColumnWidths — a tblW=auto table sizes to tcW/content, ignori
       section: {}, body: [], headers: {}, footers: {}, majorFont: 'Calibri',
     } as unknown as DocxDocumentModel;
     const services = createLayoutServices(doc, {
-      useGoogleFonts: true,
-      googleFaces: [{
+      ...sourceFontLayoutOptions(doc, [{
         family: 'Carlito', weight: '400', style: 'normal', status: 'loaded',
-      } as FontFace],
+      }]),
       measureContext: ctx,
     });
     const run = {
@@ -306,11 +306,10 @@ describe('resolveColumnWidths — a tblW=auto table sizes to tcW/content, ignori
       section: {}, body: [], headers: {}, footers: {}, majorFont: 'Calibri',
     } as unknown as DocxDocumentModel;
     const services = createLayoutServices(doc, {
-      useGoogleFonts: true,
-      googleFaces: [
+      ...sourceFontLayoutOptions(doc, [
         { family: 'Carlito', weight: '400', style: 'normal', status: 'loaded' },
         { family: 'Caladea', weight: '400', style: 'normal', status: 'loaded' },
-      ] as FontFace[],
+      ]),
       measureContext: ctx,
     });
     const textRun = (text: string, family: string): DocParagraph['runs'][number] => ({

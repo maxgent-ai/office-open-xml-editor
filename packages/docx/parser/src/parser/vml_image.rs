@@ -68,6 +68,7 @@ pub(super) fn acquire(
     let coordinates = VmlStyleCoordinates::for_node(shape);
     let mut picture = vml_image_run(
         shape,
+        definition,
         path,
         coordinates.css_length(style, "width")?,
         coordinates.css_length(style, "height")?,

@@ -102,7 +102,6 @@ test.describe('local Word PDF acceptance', () => {
       const { DocxDocument } = await import('/src/document.ts');
       const { math } = await import('/tests/visual/math-engine.ts');
       const document = await DocxDocument.load(`/${path}`, {
-        useGoogleFonts: false,
         math,
       });
       const pages = [];

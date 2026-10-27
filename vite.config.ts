@@ -6,6 +6,8 @@ import { fileURLToPath } from 'url';
 import { readFile } from 'fs/promises';
 import { rolldown } from 'rolldown';
 import { docxCompatibilityMetadata } from './scripts/docx-compatibility-build.mjs';
+import { optionalRendererMarkers } from './scripts/optional-renderer-markers.mjs';
+import { moduleStatsPlugin } from './scripts/module-stats-plugin.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -195,9 +197,11 @@ export default defineConfig(({ command, mode }) => ({
   base: './',
   plugins: [
     docxCompatibilityMetadata(),
+    optionalRendererMarkers(),
     wasmAssetUrl(),
     wasm(),
     legacyBundleBoundary(),
+    moduleStatsPlugin(__dirname),
     // Storybook loads the root Vite config in serve mode. The declaration
     // plugins are build-only: their Rolldown buildStart hooks expect library
     // inputs and fail against Storybook's dev-server graph.
@@ -254,6 +258,21 @@ export default defineConfig(({ command, mode }) => ({
           : `${name}.mjs`,
     },
     rollupOptions: {
+      // Keep consumer PURE annotations; omit only per-module debug regions.
+      // The boundary checks retain their explicit ownership markers instead.
+      experimental: {
+        attachDebugInfo: 'none',
+        // Keep modules a lazy chunk shares with its importer in their own
+        // chunk instead of folding them into the importer. Folding makes
+        // lazy chunks import the format chunk back, and a consumer's Rolldown
+        // keeps a chunk that two of its lazy chunks import back even when
+        // nothing in it is used: a factories-only import such as
+        // `import { googleFonts } from '@silurus/ooxml'` then retained the
+        // whole DOCX and PPTX runtime (scripts/check-font-source-tree-shaking.mjs).
+        // Upstream: rolldown/rolldown#11213 (still open as of Rolldown 1.2.15);
+        // re-test before removing this once it is fixed.
+        chunkOptimization: { avoidRedundantChunkLoads: false },
+      },
       external: [/^node:/, 'skia-canvas'],
       output: {
         assetFileNames: '[name][extname]',
@@ -272,6 +291,7 @@ export default defineConfig(({ command, mode }) => ({
     // library mode base64-inlines one copy into every format worker chunk.
     plugins: () => [docxCompatibilityMetadata(), wasmAssetUrl(), wasm(), legacyBundleBoundary()],
     rollupOptions: {
+      experimental: { attachDebugInfo: 'none' },
       output: {
         assetFileNames: '[name][extname]',
         // The published format entry is commonly re-bundled by a consumer.

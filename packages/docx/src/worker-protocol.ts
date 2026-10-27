@@ -100,7 +100,7 @@ export interface DocumentLayoutPartial {
 export type WireRenderPageOptions = Omit<RenderPageOptions, 'onTextRun'>;
 
 // The base `parse` arm from types.ts is intentionally NOT reused: the render
-// worker's `parse` carries an extra `useGoogleFonts` flag, and two `parse`
+// worker's `parse` carries the font-source descriptors, and two `parse`
 // arms in one union would defeat `type`-based narrowing at use sites. The
 // `init` arm is copied verbatim from `WorkerRequest`.
 export type RenderWorkerRequest =
@@ -124,7 +124,11 @@ export type RenderWorkerRequest =
       source?: import('@silurus/ooxml-core').ModelSourceModuleDescriptor;
       sourceTransfer?: readonly Transferable[];
       sourceOwnerUrl?: string;
-      useGoogleFonts?: boolean;
+      /** Validated `LoadOptions.fonts` descriptors (plain, structured-clone
+       * safe data; `fontFiles` bytes are copied, never transferred). The worker
+       * re-validates them and runs the same font-source session as main mode
+       * against its own FontFaceSet. Never the deprecated `useGoogleFonts`. */
+      fonts?: readonly import('@silurus/ooxml-core/internal/font-sources').FontSource[];
       allowFootnoteContinuation?: boolean;
       cjkFallback?: import('@silurus/ooxml-core').CjkLang;
       defaultCurrentDateMs: number;

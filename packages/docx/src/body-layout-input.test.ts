@@ -108,6 +108,7 @@ describe('canonical body layout input', () => {
       endnoteNumbering: { format: 'decimal', start: 1 },
       footnoteSeparator: 'default',
       endnoteSeparator: 'default',
+      endnoteContinuationSeparator: 'default',
       footnoteContinuationSeparator: 'default',
     });
   });
@@ -137,6 +138,7 @@ describe('canonical body layout input', () => {
       endnoteNumbering: { format: 'lowerRoman', start: 1 },
       footnoteSeparator: 'none',
       endnoteSeparator: 'default',
+      endnoteContinuationSeparator: 'default',
       footnoteContinuationSeparator: 'short',
     });
   });

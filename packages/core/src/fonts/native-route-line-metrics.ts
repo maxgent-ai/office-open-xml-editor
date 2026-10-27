@@ -1,5 +1,5 @@
 import { retainFace, releaseFaces } from './font-registry.js';
-import { withFontCeiling } from './preload.js';
+import { withFontCeiling } from './font-registry.js';
 import type { CanvasFontBoxProbeContext } from './canvas-font-box.js';
 import { quoteCssFontFamily } from '../internal/css-font-family.js';
 

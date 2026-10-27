@@ -12,6 +12,9 @@ pub(super) struct Properties {
     pub adjust_line_height_in_table: bool,
     /// MS-DOC §2.7.13 Copts.b, mapped to ECMA-376 Part 4 §14.8.3.38.
     pub split_pg_break_and_para_mark: Option<bool>,
+    /// MS-DOC §2.7.13 Copts.B (bit1), mapped to ECMA-376 Part4 §14.8.3.20.
+    /// None when the selected DOP owner predates Dop2000.
+    pub footnote_layout_like_ww8: Option<bool>,
     /// MS-DOC 2.7.13 Copts.fDontUseHTMLParagraphAutoSpacing, mapped to
     /// ECMA-376 Part 4 14.8.3.15. None when the DOP predates Dop2000.
     pub do_not_use_html_paragraph_auto_spacing: Option<bool>,
@@ -122,6 +125,12 @@ pub(super) fn read(
     } else {
         true
     };
+    // Copts.B is independent of neighboring shape and HTML-spacing flags.
+    let footnote_layout_like_ww8 = if owns_copts {
+        Some(u32_at(dop, 512)? & (1 << 1) != 0)
+    } else {
+        None
+    };
     let split_pg_break_and_para_mark = if owns_copts {
         Some(u32_at(dop, 512)? & (1 << 27) != 0)
     } else {
@@ -165,6 +174,7 @@ pub(super) fn read(
         notes,
         adjust_line_height_in_table,
         split_pg_break_and_para_mark,
+        footnote_layout_like_ww8,
         do_not_use_html_paragraph_auto_spacing,
         balance_single_byte_double_byte_width,
         character_spacing_control,
@@ -223,6 +233,7 @@ mod tests {
             let properties = super::read(&word, &table, schema).unwrap().unwrap();
             assert!(properties.adjust_line_height_in_table);
             assert_eq!(properties.do_not_use_html_paragraph_auto_spacing, None);
+            assert_eq!(properties.footnote_layout_like_ww8, None);
             assert_eq!(properties.character_spacing_control, Some("doNotCompress"));
             assert_eq!(properties.notes.formats, Some((0, 0)));
         }

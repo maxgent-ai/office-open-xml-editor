@@ -1,6 +1,6 @@
 import type { DocParagraph, DocRun, DocxDocumentModel, HeadersFooters } from './types.js';
 import { docxRenderedFontFamilies } from './document-content.js';
-import { docxFontPreloadNames, docxScriptCjkLanguage } from './google-fonts.js';
+import { docxScriptCjkLanguage } from './font-plan.js';
 import { resolveDocumentLayoutSettings } from './layout-context.js';
 import { getDefaultFontSize } from './line-layout.js';
 import { docDefaultFontSizePt } from './layout/measurement-environment.js';
@@ -385,16 +385,20 @@ function withCanonicalNoteSeparators(
   input: BodyLayoutInput,
   roles: ReservedNoteSeparatorRolesInput | undefined,
   stories: SelectedNoteSeparatorDefinitionsInput | undefined,
+  endnoteStories: SelectedNoteSeparatorDefinitionsInput | undefined,
 ): BodyLayoutInput {
   const settings = input.noteLayoutSettings;
-  if (settings?.reservedSeparators === undefined && settings?.footnoteSeparatorParagraphs === undefined) return input;
-  const { reservedSeparators: _reservedWire, footnoteSeparatorParagraphs: _storyWire, ...retained } = settings;
+  if (settings?.reservedSeparators === undefined && settings?.footnoteSeparatorParagraphs === undefined
+    && settings?.endnoteSeparatorParagraphs === undefined) return input;
+  const { reservedSeparators: _reservedWire, footnoteSeparatorParagraphs: _storyWire,
+    endnoteSeparatorParagraphs: _endnoteWire, ...retained } = settings;
   return {
     ...input,
     noteLayoutSettings: {
       ...retained,
       ...(roles ? { reservedSeparatorRoles: roles } : {}),
       ...(stories ? { footnoteSeparatorStories: stories } : {}),
+      ...(endnoteStories ? { endnoteSeparatorStories: endnoteStories } : {}),
     },
   };
 }
@@ -499,7 +503,6 @@ function buildLayoutSourceModelAdapter(
     minorFamily: privateDocument.minorFont ?? null,
     embeddedFonts: [...(privateDocument.embeddedFonts ?? [])],
     renderedFamilies: docxRenderedFontFamilies(privateDocument),
-    preloadNames: docxFontPreloadNames(privateDocument),
     scriptCjkLanguage: docxScriptCjkLanguage(privateDocument),
     defaultBodyFontSizePt: docDefaultFontSizePt(privateDocument),
   };
@@ -559,9 +562,19 @@ function buildLayoutSourceModelAdapter(
     },
     selectedNoteSeparatorParagraphAcquisitionInput,
   );
+  if (reservedSeparators?.roles.endnote && settings?.endnoteSeparatorParagraphs !== undefined) {
+    throw new Error('Native and DOCX endnote separator stories cannot both be retained');
+  }
+  const selectedEndnoteSeparators = normalizeSelectedNoteSeparators(
+    settings?.endnoteSeparatorParagraphs,
+    { separator: settings?.endnoteSeparator, continuationSeparator: settings?.endnoteContinuationSeparator },
+    selectedNoteSeparatorParagraphAcquisitionInput,
+    'endnote',
+  );
   const reservedNoteStories = [
     ...(reservedSeparators?.stories ?? []),
     ...(selectedSeparators?.stories ?? []),
+    ...(selectedEndnoteSeparators?.stories ?? []),
   ].map(({ source, body }) => {
     body.forEach((retained, index) => {
       const paragraphSource: SourceRef = { ...source, path: [index] };
@@ -612,6 +625,7 @@ function buildLayoutSourceModelAdapter(
   const source = sealLayoutSourceStore({
     bodyLayoutInput: withCanonicalNoteSeparators(
       bodyLayoutInput, reservedSeparators?.roles, selectedSeparators?.definitions,
+      selectedEndnoteSeparators?.definitions,
     ),
     blockRepository: {
       body: canonicalDocument.body as unknown as readonly LayoutStoryBlock[],

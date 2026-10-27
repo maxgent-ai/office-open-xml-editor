@@ -1,6 +1,8 @@
 import {
+  excelDateTimeSectionNameTexts,
   formatExcelDateTime,
   formatLocalizedExcelShortDate,
+  localizedExcelShortDateTexts,
   isDateFormatSection,
   isExcelDisplayDateSerial,
   roundDecimalHalfUp,
@@ -178,6 +180,23 @@ const BUILTIN_DATE_FMT: Record<number, string> = {
   58: '[$-411]ggge"年"m"月"d"日"',
 };
 
+// Built-in numeric numFmtIds with a well-defined pattern (§18.8.30 p.1776
+// "All Languages" table), formatted by the same grammar engine as custom codes.
+const BUILTIN_NUMERIC_FMT: Record<number, string> = {
+  1: '0',
+  2: '0.00',
+  3: '#,##0',
+  4: '#,##0.00',
+  9: '0%',
+  10: '0.00%',
+  11: '0.00E+00',
+  37: '#,##0 ;(#,##0)',
+  38: '#,##0 ;[Red](#,##0)',
+  39: '#,##0.00;(#,##0.00)',
+  40: '#,##0.00;[Red](#,##0.00)',
+  48: '##0.0E+0',
+};
+
 // Excel's General format does not round-trip the raw IEEE-754 double: the
 // display engine rounds to 11 significant digits (of the 15-17 significant
 // digits a double can carry), which is what keeps binary floating point
@@ -278,27 +297,102 @@ function applyFormat(num: number, numFmtId: number, formatCode: string | null, d
   if (formatCode) return applyFormatCode(num, formatCode, date1904);
   const builtinFmt = BUILTIN_DATE_FMT[numFmtId];
   if (builtinFmt) return dateFormattedCell(formatExcelDateTime(num, builtinFmt, date1904), num, date1904);
-  switch (numFmtId) {
-    // Built-in numeric numFmtIds without an explicit formatCode. Route the ones
-    // that have a well-defined pattern (§18.8.30 p.1776 "All Languages" table)
-    // through the same grammar engine as custom codes so their placeholder /
-    // sign-section semantics match exactly.
-    case 0: return { text: formatGeneralNumber(num) };
-    case 1: return applyFormatCode(num, '0');
-    case 2: return applyFormatCode(num, '0.00');
-    case 3: return applyFormatCode(num, '#,##0');
-    case 4: return applyFormatCode(num, '#,##0.00');
-    case 9: return applyFormatCode(num, '0%');
-    case 10: return applyFormatCode(num, '0.00%');
-    case 11: return applyFormatCode(num, '0.00E+00');
-    case 37: return applyFormatCode(num, '#,##0 ;(#,##0)');
-    case 38: return applyFormatCode(num, '#,##0 ;[Red](#,##0)');
-    case 39: return applyFormatCode(num, '#,##0.00;(#,##0.00)');
-    case 40: return applyFormatCode(num, '#,##0.00;[Red](#,##0.00)');
-    case 48: return applyFormatCode(num, '##0.0E+0');
-    case 49: return { text: String(num) };
-    default: return { text: formatGeneralNumber(num) };
+  // Built-in numeric numFmtIds without an explicit formatCode. Route the ones
+  // that have a well-defined pattern (§18.8.30 p.1776 "All Languages" table)
+  // through the same grammar engine as custom codes so their placeholder /
+  // sign-section semantics match exactly.
+  const builtinNumeric = BUILTIN_NUMERIC_FMT[numFmtId];
+  if (builtinNumeric) return applyFormatCode(num, builtinNumeric);
+  if (numFmtId === 49) return { text: String(num) };
+  // 0 (General) and every unknown id.
+  return { text: formatGeneralNumber(num) };
+}
+
+/** Number-format paint texts of a workbook's styles (see
+ * {@link numberFormatPaintTexts}). */
+export interface NumberFormatPaintTexts {
+  /** Per `cellXfs` index, the texts that style's number format can paint. */
+  readonly cellXfs: readonly (readonly string[])[];
+  /** Texts the conditional-format differential numFmts can paint; any cell
+   * may take them, whatever its font. */
+  readonly dxfs: readonly string[];
+  /** False when some format's output set is not enumerated (a
+   * locale/calendar-dependent built-in): scalar demand must then be `'all'`,
+   * while the texts still prove the output's scripts. */
+  readonly complete: boolean;
+}
+
+/**
+ * Every non-value text the cell formatter can paint for number cells under
+ * `styles`, per style: the input of font-source demand (library policy; see
+ * `font-source-load.ts`), which charges it to each style's font as painted
+ * cell text. Number cells paint, besides ASCII (digits, signs, separators,
+ * `E`, `%`, space, `#` fill, General output), only
+ *
+ * - characters of the format code that formats them: literals, quoted and
+ *   escaped text, currency symbols, `*` fill characters (the whole code is
+ *   returned, so bracket metadata adds harmless extra scalars);
+ * - the formatter's own name tables for a date / time section (month and
+ *   weekday names, AM/PM, Japanese weekdays and eras:
+ *   `excelDateTimeSectionNameTexts`);
+ * - for built-in 14 without a code, the host locale's numeric short date
+ *   (`localizedExcelShortDateTexts`): its complete output set for a
+ *   Gregorian, ASCII-digit locale; otherwise a sample over the date range,
+ *   with `complete: false` (another calendar or numbering system can paint
+ *   era names and digits no finite sample proves).
+ *
+ * Codes come from the style numFmts and the differential formats a
+ * conditional format may apply (§18.8.15); built-in ids are resolved as
+ * {@link formatCellValueWithColor} resolves them.
+ */
+export function numberFormatPaintTexts(styles: Pick<Styles, 'numFmts' | 'cellXfs' | 'dxfs'>): NumberFormatPaintTexts {
+  const codeOf = new Map<number, string>();
+  for (const format of styles.numFmts ?? []) {
+    if (format.formatCode !== null && format.formatCode !== undefined && !codeOf.has(format.numFmtId)) {
+      codeOf.set(format.numFmtId, format.formatCode);
+    }
   }
+  let complete = true;
+  const ofCode = new Map<string, readonly string[]>();
+  const codeTexts = (code: string): readonly string[] => {
+    let texts = ofCode.get(code);
+    if (!texts) {
+      const list = [code];
+      for (const section of splitFormatSections(code)) {
+        if (isDateFormatSection(section)) list.push(...excelDateTimeSectionNameTexts(section));
+      }
+      texts = Object.freeze(list);
+      ofCode.set(code, texts);
+    }
+    return texts;
+  };
+  const ofBuiltin = new Map<number, readonly string[]>();
+  const builtinTexts = (id: number): readonly string[] => {
+    let texts = ofBuiltin.get(id);
+    if (!texts) {
+      if (id === 14) {
+        const shortDate = localizedExcelShortDateTexts();
+        if (!shortDate.complete) complete = false;
+        texts = shortDate.texts;
+      } else {
+        const code = BUILTIN_DATE_FMT[id] ?? BUILTIN_NUMERIC_FMT[id];
+        texts = code ? codeTexts(code) : Object.freeze([]);
+      }
+      ofBuiltin.set(id, texts);
+    }
+    return texts;
+  };
+  const cellXfs = (styles.cellXfs ?? []).map((xf) => {
+    const id = xf.numFmtId ?? 0;
+    const code = codeOf.get(id);
+    return code ? codeTexts(code) : builtinTexts(id);
+  });
+  const dxfs: string[] = [];
+  for (const dxf of styles.dxfs ?? []) {
+    if (!dxf.numFmt) continue;
+    dxfs.push(...(dxf.numFmt.formatCode ? codeTexts(dxf.numFmt.formatCode) : builtinTexts(dxf.numFmt.numFmtId)));
+  }
+  return Object.freeze({ cellXfs: Object.freeze(cellXfs), dxfs: Object.freeze(dxfs), complete });
 }
 
 /** Invalid dates use '#'. Keep width-dependent painting out of cellText/find;

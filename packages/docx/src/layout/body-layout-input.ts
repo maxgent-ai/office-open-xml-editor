@@ -101,12 +101,12 @@ export interface ReservedNoteSeparatorRolesInput {
   readonly endnote?: ReservedNoteSeparatorDefinitionsInput;
 }
 
-/** Ordinary DOCX listed footnote story roles that can retain a formatted
+/** Ordinary DOCX listed separator story roles that can retain an effective
  * paragraph. DOCX continuation notices keep no story geometry. */
 export type SelectedNoteSeparatorRole = 'separator' | 'continuationSeparator';
 
-/** Raw parser-boundary effective paragraphs of document-listed (§17.11.9)
- * formatted footnote separator stories. The source-model adapter replaces them
+/** Raw parser-boundary effective paragraphs of document-listed (§17.11.3/.9)
+ * separator stories. The source-model adapter replaces them
  * with {@link SelectedNoteSeparatorDefinitionsInput} before sealing. */
 export type SelectedNoteSeparatorParagraphsInput = Readonly<
   Partial<Record<SelectedNoteSeparatorRole, DeepReadonly<DocParagraph>>>
@@ -133,6 +133,8 @@ export interface BodyParagraphSourceInput {
   readonly keepLines: boolean;
   readonly keepNext: boolean;
   readonly widowControl: boolean;
+  /** WORD_TEXT_FRAME_PRECEDING_TEXT_PUSH: detached from paragraph-gap flow. */
+  readonly textFrameMember?: true;
   readonly spaceBeforePt: number;
   readonly spaceAfterPt: number;
   readonly contextualSpacing: boolean;
@@ -204,6 +206,7 @@ export type BodyLayoutSequenceEntry = BodyLayoutSequenceEntryFor<BodySectionLayo
 export interface BodyLayoutInput {
   /** `w:compatSetting` compatibilityMode value from settings (§17.15.3.4). */
   readonly compatibilityMode?: number;
+  readonly footnoteLayoutLikeWW8?: boolean;
   readonly source: SourceRef;
   readonly initialSection: BodySectionLayoutInput;
   readonly sequence: readonly BodyLayoutSequenceEntry[];
@@ -218,12 +221,15 @@ export interface BodyLayoutInput {
     endnoteNumbering?: NoteNumberingInput;
     footnoteSeparator?: NoteSeparatorInput;
     endnoteSeparator?: NoteSeparatorInput;
+    endnoteContinuationSeparator?: NoteSeparatorInput;
     footnoteContinuationSeparator?: NoteSeparatorInput;
     /** Parser-boundary only; rejected by the sealed layout source. */
     footnoteSeparatorParagraphs?: SelectedNoteSeparatorParagraphsInput;
+    endnoteSeparatorParagraphs?: SelectedNoteSeparatorParagraphsInput;
     /** Canonical ordinary DOCX formatted story definitions; each replaces
      * only the scalar band height of its role, never its mark. */
     footnoteSeparatorStories?: SelectedNoteSeparatorDefinitionsInput;
+    endnoteSeparatorStories?: SelectedNoteSeparatorDefinitionsInput;
     /** Parser-boundary only; rejected by the sealed layout source. */
     reservedSeparators?: ReservedNoteSeparatorsInput;
     /** Canonical reserved separator definitions; they replace the scalar
@@ -242,6 +248,7 @@ export interface NoteNumberingInput {
 
 export interface BodyLayoutAcquisitionInput {
   readonly compatibilityMode?: number;
+  readonly footnoteLayoutLikeWW8?: boolean;
   readonly sectionIndex: BodySectionIndexInput;
   readonly evenAndOddHeaders: boolean;
   readonly parserDiagnostics?: readonly LayoutDiagnostic[];
@@ -253,8 +260,10 @@ export interface BodyLayoutAcquisitionInput {
     endnoteNumbering?: NoteNumberingInput;
     footnoteSeparator?: NoteSeparatorInput;
     endnoteSeparator?: NoteSeparatorInput;
+    endnoteContinuationSeparator?: NoteSeparatorInput;
     footnoteContinuationSeparator?: NoteSeparatorInput;
     footnoteSeparatorParagraphs?: SelectedNoteSeparatorParagraphsInput;
+    endnoteSeparatorParagraphs?: SelectedNoteSeparatorParagraphsInput;
     reservedSeparators?: ReservedNoteSeparatorsInput;
   }>;
   readonly pageLayoutSettings: Readonly<{
@@ -394,6 +403,7 @@ export function projectBodyLayoutInput(acquired: BodyLayoutAcquisitionInput): Bo
   return snapshotPlainData({
     source: { story: 'body', storyInstance: 'body', path: [] },
     compatibilityMode: acquired.compatibilityMode,
+    footnoteLayoutLikeWW8: acquired.footnoteLayoutLikeWW8,
     initialSection,
     sequence,
     parserDiagnostics: acquired.parserDiagnostics ?? [],

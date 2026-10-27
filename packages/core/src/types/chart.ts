@@ -1158,6 +1158,14 @@ export interface ChartModel {
    */
   themeMajorFontLatin?: string | null;
   themeMinorFontLatin?: string | null;
+  /**
+   * Renderer-supplied, never parser output: lower-cased authored family → the
+   * family an application font source (`LoadOptions.fonts`) loaded for it.
+   * Chart text paints the substitute after the authored face. Only unscoped
+   * substitutions are supplied (chart labels are not split by script).
+   * Absent: no font source, and chart font stacks are unchanged.
+   */
+  fontSubstitutions?: Readonly<Record<string, string>>;
   /** Explicit chart border color (hex without '#') from
    *  `<c:chartSpace><c:spPr><a:ln><a:solidFill><a:srgbClr>`. Only set when the
    *  XML explicitly declares a paintable line; null otherwise (no default

@@ -311,3 +311,15 @@ export const WORD_GRID_PICTURE_LINE_ORIGIN = defineCompatibilityRule({
 export function wordGridPictureLineOriginPt(lineTop: number, paragraphTop: number, contentStart: number): number {
   return lineTop - (contentStart - paragraphTop);
 }
+
+export const WORD_TEXT_FRAME_PRECEDING_TEXT_PUSH = defineCompatibilityRule({
+  id: 'word-text-frame-preceding-text-push',
+  evidence: {
+    kind: 'office-observation',
+    syntheticFixtureId: 'text-frame-stacking-ieee-controls',
+    application: 'Microsoft Word',
+    version: 'Microsoft 365',
+    platform: 'Windows (ExportAsFixedFormat)',
+  },
+  description: 'ECMA-376 §17.3.1.11 anchors a text frame to the next non-frame paragraph without saying where consecutive differing frames go. Their placement from the preceding paragraph is an Office observation bounded by the controls below. 28 Windows Word controls (two to four consecutive notBeside/around frames of differing width, vSpace 0/18pt on either or both, y omitted/+36/-18/-30pt, frames first in the body, identical framePr, a page-anchored first frame, frame paragraph spacing, preceding text of one to three lines, a preceding paragraph with space after, two preceding paragraphs, a preceding table and empty paragraph, a two-column hAnchor=text case, a page-bottom case, and two replicas of a paper title block in modes 11 and 15) establish: a vAnchor=text frame (not a drop cap) is placed at the bottom of the preceding in-flow content, space after included, plus its y; frames never avoid each other (equal bases overlap, horizontally disjoint frames sit side by side). When a frame\'s exclusion (the frame box with vSpace, the §17.18.104 wrap mode) meets lines or tables laid out before it in its column on that page, those earlier lines wrap around it exactly like later text (topAndBottom lines move below it, each line separately, and following lines flow on), the frame keeps the position of that first placement, and the frames of the same run placed before it, which did not push, move to the new bottom of the preceding content; a later frame of the run is placed from that new bottom and may push again. The next in-flow paragraph collapses its spacing against the content before the frames, not against the frame paragraphs. A frame run whose anchor paragraph starts in a later column or page than the frames moves to that later column or page (a page-bottom control: the frames open the next page at its top and the anchor follows their exclusion). Page- and margin-anchored frames, drop caps, frames inside table cells, a table following the frames and frames whose exclusions push earlier content off the page remain outside the measured scope.',
+});

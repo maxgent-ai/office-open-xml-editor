@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import test from 'node:test';
 import { build } from 'vite';
+import { moduleStatsPlugin } from './module-stats-plugin.mjs';
 import { assertDispatchCost, assertLazySourceOwner, assertNoTopLevelModelImport, assertEagerSourceEntries, assertNoSourceRuntime, checkSourceDispatchImports } from './check-model-source-lazy-graph.mjs';
 
 const tempRoot = process.platform === 'darwin' ? '/private/tmp' : tmpdir();
@@ -89,13 +90,83 @@ export async function load(options = {}) {
 }
 `);
     writeFileSync(join(root, 'model-source.js'), 'export const source = true;\n');
+    const stats = {};
     for (const [flag, outDir] of [['true', enabledDir], ['false', disabledDir]]) {
+      process.env.OOXML_MODULE_STATS = `${outDir}.json`;
       await build({ configFile: false, logLevel: 'silent', define: { __OOXML_MODEL_SOURCES__: flag },
+        plugins: [moduleStatsPlugin(root)],
         build: { outDir, lib: { entry, formats: ['es'], fileName: () => 'entry.mjs' } } });
+      stats[flag] = JSON.parse(readFileSync(`${outDir}.json`, 'utf8'));
     }
-    assert.throws(() => assertDispatchCost(join(enabledDir, 'entry.mjs'),
-      join(disabledDir, 'entry.mjs'), 3_000, 'fixture'), /dispatch cost exceeds/);
+    delete process.env.OOXML_MODULE_STATS;
+    assert.throws(() => assertDispatchCost(stats.true, stats.false, 'entry.mjs', 3_000, 'fixture'),
+      /dispatch cost exceeds/);
+    assert.ok(assertDispatchCost(stats.true, stats.false, 'entry.mjs', 100_000, 'fixture') > 3_000);
   } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('dispatch cost ignores naming and partitioning, and a shrink never offsets growth', () => {
+  const stats = (chunks) => ({ chunks });
+  const disabled = stats({
+    'entry.mjs': { imports: ['a.js', 'node:path'], modules: { 'src/entry.ts': 'const a = 1; f(a);' } },
+    'a.js': { imports: [], modules: { 'src/shared.ts': 'function f(x) { return g(x, "shared"); }', 'src/other.ts': 'const o = [1, 2];' } },
+  });
+  // The same modules, renamed by chunk-scoped deconfliction and split across
+  // other chunks with other placeholder ids, cost nothing.
+  const repartitioned = stats({
+    'entry.mjs': { imports: ['b.js', 'c.js'], modules: { 'src/entry.ts': 'const a$1 = 1; f$2(a$1);' } },
+    'b.js': { imports: [], modules: { 'src/shared.ts': 'function f$2(x) { return g$1(x, "shared"); }' } },
+    'c.js': { imports: [], modules: { 'src/other.ts': 'const o = [1, 2];' } },
+  });
+  assert.equal(assertDispatchCost(repartitioned, disabled, 'entry.mjs', 0, 'fixture'), 0);
+  // Growth in one module is charged even when the same module shrinks.
+  const grownAndShrunk = stats({
+    'entry.mjs': { imports: ['a.js'], modules: { 'src/entry.ts': 'const a = 1; f(a);' } },
+    'a.js': { imports: [], modules: { 'src/shared.ts': 'function f(x) { return "dispatch-only-table"; }', 'src/other.ts': 'const o = [1, 2];' } },
+  });
+  assert.equal(assertDispatchCost(grownAndShrunk, disabled, 'entry.mjs', 100, 'fixture'), Buffer.byteLength('"dispatch-only-table"'));
+  // A module only the enabled graph retains counts whole.
+  const added = stats({
+    ...disabled.chunks,
+    'entry.mjs': { imports: ['a.js'], modules: { 'src/entry.ts': 'const a = 1; f(a);', 'src/dispatch.ts': 'h("x");' } },
+  });
+  assert.ok(assertDispatchCost(added, disabled, 'entry.mjs', 100, 'fixture') > 0);
+});
+
+test('a source-only table hidden behind same-module shrinkage under repartitioning fails the budget', async () => {
+  const root = mkdtempSync(join(tempRoot, 'ooxml-source-hide-'));
+  try {
+    const words = (prefix) => Array.from({ length: 80 }, (_, index) => `'${prefix}-${index}-${(index * 7919).toString(36)}'`).join(', ');
+    writeFileSync(join(root, 'entry.js'), `import { shared } from './shared.js';
+export async function load(options = {}) {
+  if (__OOXML_MODEL_SOURCES__ && options.legacyDoc !== undefined) return import('./model-source.js');
+  return shared(options.key);
+}
+`);
+    // The enabled build retains a source-only table; the disabled build retains
+    // a fallback of about the same size in the same module instead.
+    writeFileSync(join(root, 'shared.js'), `const TABLE = __OOXML_MODEL_SOURCES__ ? [${words('source')}] : null;
+const FALLBACK = __OOXML_MODEL_SOURCES__ ? null : [${words('fallbk')}];
+export function shared(key) { return (TABLE ?? FALLBACK)[key]; }
+`);
+    // Importing the shared module from the source chunk moves it into its own
+    // chunk in the enabled build only (repartitioning).
+    writeFileSync(join(root, 'model-source.js'), "import { shared } from './shared.js';\nexport const source = shared(0);\n");
+    const stats = {};
+    for (const flag of ['true', 'false']) {
+      const outDir = join(root, flag);
+      process.env.OOXML_MODULE_STATS = `${outDir}.json`;
+      await build({ configFile: false, logLevel: 'silent', define: { __OOXML_MODEL_SOURCES__: flag },
+        plugins: [moduleStatsPlugin(root)],
+        build: { outDir, minify: false, lib: { entry: join(root, 'entry.js'), formats: ['es'], fileName: () => 'entry.mjs' } } });
+      stats[flag] = JSON.parse(readFileSync(`${outDir}.json`, 'utf8'));
+    }
+    delete process.env.OOXML_MODULE_STATS;
+    assert.throws(() => assertDispatchCost(stats.true, stats.false, 'entry.mjs', 1_000, 'fixture'), /dispatch cost exceeds 1000-byte budget/);
+  } finally {
+    delete process.env.OOXML_MODULE_STATS;
     rmSync(root, { recursive: true, force: true });
   }
 });

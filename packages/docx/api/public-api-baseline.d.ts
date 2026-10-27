@@ -657,6 +657,7 @@ export interface ChartModel {
     legendLinePaintAuthored?: boolean | null;
     themeMajorFontLatin?: string | null;
     themeMinorFontLatin?: string | null;
+    fontSubstitutions?: Readonly<Record<string, string>>;
     chartBorderColor?: string | null;
     chartBorderLineFill?: SolidFill | GradientFill | PatternFill | null;
     chartBorderWidthEmu?: number | null;
@@ -1171,6 +1172,21 @@ export interface CommentAnchorRange {
     readonly reference: CommentAnchorPoint;
     readonly geometryFallback?: CommentAnchorGeometryFallback;
 }
+export function cssApi(options: CssApiOptions): CssApiSource;
+export interface CssApiOptions {
+    readonly urlTemplate: string;
+    readonly query?: string;
+    readonly families?: Readonly<Record<string, string | true>>;
+    readonly substitutes?: readonly FontSubstitution[];
+    readonly credentials?: FontSourceCredentials;
+}
+export interface CssApiSource extends FontSourceBase {
+    readonly kind: 'css-api';
+    readonly urlTemplate: string;
+    readonly query?: string;
+    readonly families?: Readonly<Record<string, string | true>>;
+    readonly credentials?: FontSourceCredentials;
+}
 export type DecodedImageBudgetStrategy = 'adaptive' | 'strict';
 export interface DocComment {
     id: string;
@@ -1258,6 +1274,7 @@ type DocRunContent = ({
     type: 'ptab';
 } & PTabRun);
 export interface DocSettings {
+    footnoteLayoutLikeWW8?: boolean;
     doNotUseHtmlParagraphAutoSpacing?: boolean;
     kinsoku?: boolean;
     noLineBreaksBefore?: string;
@@ -1710,6 +1727,72 @@ export interface FindMatch<Loc = unknown> {
 export interface FindMatchesOptions {
     caseSensitive?: boolean;
 }
+const FONT_SOURCE_PROTOCOL = 'ooxml-font-source/v1';
+export interface FontDemand {
+    readonly families: readonly string[];
+    readonly tuples: readonly {
+        readonly family: string;
+        readonly weight: number;
+        readonly style: 'normal' | 'italic';
+    }[];
+    readonly fallbackFamilies: readonly string[];
+    readonly scalars: 'all' | readonly number[];
+    readonly substituteScripts?: Readonly<Record<string, readonly FontSubstituteScript[]>>;
+}
+export function fontFaceCss(options: FontFaceCssOptions): FontFaceCssSource;
+export interface FontFaceCssOptions {
+    readonly url: string;
+    readonly substitutes?: readonly FontSubstitution[];
+    readonly credentials?: FontSourceCredentials;
+}
+export interface FontFaceCssSource extends FontSourceBase {
+    readonly kind: 'font-face-css';
+    readonly url: string;
+    readonly credentials?: FontSourceCredentials;
+}
+export interface FontFaceDeclaration {
+    readonly family: string;
+    readonly url?: string;
+    readonly data?: ArrayBuffer;
+    readonly weight?: string;
+    readonly style?: string;
+    readonly stretch?: string;
+    readonly unicodeRange?: string;
+}
+export function fontFiles(options: FontFilesOptions): FontFilesSource;
+export interface FontFilesOptions {
+    readonly faces: readonly FontFaceDeclaration[];
+    readonly substitutes?: readonly FontSubstitution[];
+}
+export interface FontFilesSource extends FontSourceBase {
+    readonly kind: 'font-files';
+    readonly faces: readonly FontFaceDeclaration[];
+}
+export interface FontResolveContext {
+    readonly signal: AbortSignal;
+}
+export type FontResolveFn = (demand: FontDemand, context: FontResolveContext) => readonly FontFaceDeclaration[] | Promise<readonly FontFaceDeclaration[]>;
+export function fontResolver(resolve: FontResolveFn, options?: FontResolverOptions): FontResolverSource;
+export interface FontResolverOptions {
+    readonly substitutes?: readonly FontSubstitution[];
+}
+export interface FontResolverSource extends FontSourceBase {
+    readonly kind: 'font-resolver';
+    readonly id: string;
+}
+export type FontSource = CssApiSource | FontFaceCssSource | FontFilesSource | FontResolverSource;
+interface FontSourceBase {
+    readonly protocol: typeof FONT_SOURCE_PROTOCOL;
+    readonly kind: string;
+    readonly substitutes?: readonly FontSubstitution[];
+}
+export type FontSourceCredentials = 'omit' | 'same-origin';
+export type FontSubstituteScript = 'arabic';
+export interface FontSubstitution {
+    readonly for: string;
+    readonly use: string;
+    readonly script?: FontSubstituteScript;
+}
 export interface FramePr {
     dropCap: 'none' | 'drop' | 'margin' | string;
     lines: number;
@@ -1730,6 +1813,10 @@ export interface Glow {
     color: string;
     alpha: number;
     radius: number;
+}
+export function googleFonts(options?: GoogleFontsOptions): CssApiSource;
+export interface GoogleFontsOptions {
+    readonly cssOrigin?: string;
 }
 export interface GradientFill {
     fillType: 'gradient';
@@ -1865,6 +1952,7 @@ export interface LoadOptions extends LoadOptions__emitterCollision1 {
     currentDate?: Date | number;
 }
 interface LoadOptions__emitterCollision1 {
+    fonts?: readonly FontSource[];
     useGoogleFonts?: boolean;
     cjkFallback?: CjkFallback;
     password?: string;
@@ -2051,6 +2139,7 @@ export interface NumberingInfo {
     picBulletHeightPt?: number;
     picBulletTransform?: Pick<ImageRun, 'srcRect' | 'rotation' | 'flipH' | 'flipV'>;
 }
+export const officeFontSubstitutions: readonly FontSubstitution[];
 export class OoxmlDecodedImageLimitError extends RangeError {
     readonly metric: OoxmlDecodedImageLimitMetric;
     readonly limit: number;
@@ -2062,10 +2151,19 @@ export type OoxmlDecodedImageLimitMetric = 'image-dimension' | 'image-pixels' | 
 export class OoxmlError extends Error {
     readonly code: OoxmlErrorCode;
     readonly details?: OoxmlUnsupportedContentDetails;
-    constructor(code: OoxmlErrorCode, message: string, details?: OoxmlUnsupportedContentDetails);
+    readonly violation?: OoxmlFontSourceViolation;
+    constructor(code: OoxmlErrorCode, message: string, details?: OoxmlUnsupportedContentDetails | OoxmlFontSourceViolation);
 }
-export type OoxmlErrorCode = 'encrypted' | 'invalid-password' | 'unsupported-encryption' | 'legacy-binary-format' | 'not-ooxml' | 'unsupported-image-effect' | 'invalid-numbering' | 'unsupported-content';
+export type OoxmlErrorCode = 'encrypted' | 'invalid-password' | 'unsupported-encryption' | 'legacy-binary-format' | 'not-ooxml' | 'unsupported-image-effect' | 'invalid-numbering' | 'unsupported-content' | 'font-source-limit';
 export type OoxmlErrorStage = 'container' | 'decompression' | 'parsing' | 'serialization' | 'layout' | 'rendering' | 'worker';
+export type OoxmlFontSourceQuota = 'stylesheet' | 'declarations' | 'families' | 'face' | 'retained' | 'url';
+export interface OoxmlFontSourceViolation {
+    readonly resource: 'font-source';
+    readonly quota: OoxmlFontSourceQuota;
+    readonly metric: 'bytes' | 'entry-count' | 'length';
+    readonly limit: number;
+    readonly observed: number;
+}
 export type OoxmlFormat = 'docx' | 'xlsx' | 'pptx';
 export type OoxmlResourceLimit = number | null;
 export class OoxmlResourceLimitError extends Error {

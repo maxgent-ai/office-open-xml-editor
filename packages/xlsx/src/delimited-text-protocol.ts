@@ -12,7 +12,11 @@ export type DelimitedTextParseRequest = {
   readonly data: ArrayBuffer;
   readonly options: ResolvedDelimitedTextOptions;
   readonly worksheetPolicy?: NormalizedXlsxWorksheetPolicy;
-  readonly useGoogleFonts?: boolean;
+  /** Validated `LoadOptions.fonts` descriptors (plain, structured-clone
+   * safe data). The render worker re-validates them and runs the same demand
+   * and session as main mode in its own FontFaceSet; the parse-only worker
+   * ignores them. Never the deprecated `useGoogleFonts`. */
+  readonly fonts?: readonly import('@silurus/ooxml-core/internal/font-sources').FontSource[];
   /** Caller-owned load-time cell-font language gate, shared with main layout. */
   readonly japaneseCellFonts?: boolean;
   readonly cjkFallback?: import('@silurus/ooxml-core').CjkLang;

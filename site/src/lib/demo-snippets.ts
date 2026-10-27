@@ -33,22 +33,22 @@ export interface DemoSnippets {
 
 function build(c: Cfg): DemoSnippets {
   return {
-    demo: `import { ${c.Viewer} } from '@silurus/ooxml/${c.sub}';
+    demo: `import { ${c.Viewer}, googleFonts } from '@silurus/ooxml/${c.sub}';
 
 // The built-in viewer tracks the current ${c.sub === 'pptx' ? 'slide' : 'page'} for you.
-const viewer = new ${c.Viewer}(canvas, { width: 960, useGoogleFonts: true });
+const viewer = new ${c.Viewer}(canvas, { width: 960, fonts: [googleFonts()] });
 await viewer.load('/sample.${c.sub}');
 
 nextBtn.addEventListener('click', () => viewer.${c.next}());
 prevBtn.addEventListener('click', () => viewer.${c.prev}());`,
 
-    scroll: `import { ${c.ScrollViewer} } from '@silurus/ooxml/${c.sub}';
+    scroll: `import { ${c.ScrollViewer}, googleFonts } from '@silurus/ooxml/${c.sub}';
 
 // The built-in scroll viewer virtualizes a long ${c.sub === 'pptx' ? 'slide deck' : 'document'} for you.
 const scroller = document.querySelector('#scroller') as HTMLElement;
 const viewer = new ${c.ScrollViewer}(scroller, {
   enableTextSelection: true,
-  useGoogleFonts: true,
+  fonts: [googleFonts()],
 });
 
 await viewer.load('/sample.${c.sub}');

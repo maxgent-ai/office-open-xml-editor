@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import { googleFonts } from '@silurus/ooxml-core/internal/font-sources';
 import type { BodyElement, DocParagraph, DocxDocumentModel, SectionProps } from './types.js';
 import {
   attachDocumentLayoutVariants,
@@ -777,7 +778,7 @@ describe('render worker canonical layout parity', () => {
 
   it('pins worker request and response protocol shapes including structured failures', () => {
     const parse = {
-      type: 'parse', id: 1, data: new ArrayBuffer(0), useGoogleFonts: false,
+      type: 'parse', id: 1, data: new ArrayBuffer(0), fonts: [googleFonts()],
       resourcePolicy: DEFAULT_OOXML_RESOURCE_LIMITS,
       defaultCurrentDateMs: 10,
     } satisfies RenderWorkerRequest;
@@ -815,7 +816,7 @@ describe('render worker canonical layout parity', () => {
       },
     } satisfies RenderWorkerResponse;
     const progressiveParse = {
-      type: 'parse', id: 5, data: new ArrayBuffer(0), useGoogleFonts: false,
+      type: 'parse', id: 5, data: new ArrayBuffer(0),
       resourcePolicy: DEFAULT_OOXML_RESOURCE_LIMITS,
       defaultCurrentDateMs: 10,
       currentDateMs: 20,
@@ -851,7 +852,7 @@ describe('render worker canonical layout parity', () => {
     } satisfies RenderWorkerResponse;
 
     expect(Object.keys(parse).sort()).toEqual([
-      'data', 'defaultCurrentDateMs', 'id', 'resourcePolicy', 'type', 'useGoogleFonts',
+      'data', 'defaultCurrentDateMs', 'fonts', 'id', 'resourcePolicy', 'type',
     ]);
     expect(Object.keys(render).sort()).toEqual(['id', 'opts', 'pageIndex', 'type']);
     expect(Object.keys(collect).sort()).toEqual(['id', 'opts', 'pageIndex', 'type']);
@@ -867,7 +868,7 @@ describe('render worker canonical layout parity', () => {
     expect(Object.keys(layoutMetaResponse).sort()).toEqual(['id', 'meta', 'type']);
     expect(Object.keys(progressiveParse).sort()).toEqual([
       'currentDateMs', 'data', 'defaultCurrentDateMs', 'id', 'progressiveLayout',
-      'resourcePolicy', 'showTrackedChanges', 'type', 'useGoogleFonts',
+      'resourcePolicy', 'showTrackedChanges', 'type',
     ]);
     expect(Object.keys(layoutPartial).sort()).toEqual(['forId', 'partial', 'type']);
     expect(Object.keys(layoutPartial.partial).sort()).toEqual([

@@ -145,7 +145,7 @@ describe('Node sessions with a model source', () => {
     const measured = fakeSource('xlsx', { hostLayoutFamily: 'Calibri', hostLayoutSizePt: 11 });
     const session = await openXlsxWorkbook(xlsxSample, { factory, legacyXls: measured.source });
     const context = factory.createCanvas(1, 1).getContext('2d') as unknown as CanvasRenderingContext2D;
-    const expected = computeMdw('Calibri', 11, undefined, false, 400, 'normal', context);
+    const expected = computeMdw('Calibri', 11, undefined, undefined, 400, 'normal', context);
     expect(expected).toBeGreaterThan(0);
     expect(measured.configures()).toBe(1);
     expect(measured.configuredWidth()).toBe(expected);

@@ -34,6 +34,7 @@ import {
   wordDocumentCharacterCompressionApplies,
   wordJapanesePunctuationRetainedExtentPt,
   wordCompressedSpaceLineFitApplies,
+  wordLatinInterwordXavgFloorApplies,
   wordSourceRunSpaceContinuesSequence,
   wordBalancedConsecutiveSpaceCellApplies,
   wordBalancedLinesAndCharsGridDeltaFactor,
@@ -1444,20 +1445,18 @@ function emitResolvedTextSegment(
     resolvedSpan?.script ??
     authoritativeSpan?.script ??
     (cs ? 'complexScript' : EAST_ASIAN_RE.test(text) ? 'eastAsia' : 'ascii');
-  // WORD_LATIN_INTERWORD_XAVG_FLOOR is independent of glyph kerning
-  // (§17.3.2.19) and enableOpenTypeFeatures. Windows Word 16.0.20430
-  // mode-14 controls vary both switches, MS PMincho/Times New Roman,
-  // linesAndChars/lines/no grid and 100/105/110pt widths (72 cases).
-  // Retaining the existing half-xAvg space floor recovers the 105pt fits;
-  // the four Times New Roman linesAndChars 100pt fits remain unexplained
-  // and do not justify a broader percentage allowance or a lower floor.
+  // WORD_LATIN_INTERWORD_XAVG_FLOOR: the document gate (compatibility mode,
+  // lineWrapLikeWord6, OpenType features, kerning threshold) lives with the
+  // rule; the four Times New Roman linesAndChars 100pt fits recorded there
+  // remain unexplained and do not justify a broader allowance or lower floor.
   const latinSpaceCompressionEligible =
     environment.characterSpacingControl === 'compressPunctuation' &&
-    // MS-OE376 §2.1.472 requires full advance for fit with this
-    // compatibility switch, even if display uses compression. This gate
-    // covers the measured Latin fit behavior; display-space placement
-    // under the switch has not yet been established.
-    environment.lineWrapLikeWord6 !== true &&
+    wordLatinInterwordXavgFloorApplies({
+      compatibilityMode: environment.compatibilityMode,
+      lineWrapLikeWord6: environment.lineWrapLikeWord6,
+      enableOpenTypeFeatures: environment.enableOpenTypeFeatures,
+      hasExplicitKerningThreshold: effectiveKerningThreshold != null,
+    }) &&
     // The xAvg floor was measured for horizontal Latin words; upright
     // vertical runs and tate-chu-yoko use distinct advance allocation.
     environment.verticalCJK !== true &&
@@ -1466,13 +1465,7 @@ function emitResolvedTextSegment(
     !emissionState.reduced &&
     effectiveVertAlign == null &&
     (effectiveCharacterSpacing == null || effectiveCharacterSpacing === 0) &&
-    (effectiveCharacterScale == null || effectiveCharacterScale === 1) &&
-    // The switch independence above is measured for compatibilityMode 14
-    // only. Other modes keep the earlier OpenType/kerning exclusion until
-    // Windows controls cover them (a mode-15 homogeneous control kept
-    // natural spaces; word-space-fit-controls.json).
-    (environment.compatibilityMode === 14 ||
-      (environment.enableOpenTypeFeatures !== true && effectiveKerningThreshold == null));
+    (effectiveCharacterScale == null || effectiveCharacterScale === 1);
   const latinSpaceAverageWidthRatio = latinSpaceCompressionEligible
     ? selectedAverageWidth(resolvedSpan?.font, text)
     : undefined;
@@ -1752,7 +1745,7 @@ function appendRunsToSegments(
             segment.metricOnly = true;
             // An absent authored face (native CSS fallback) has no selected-face
             // metric, so the host's vertical box comes from its painting face.
-            // Every present face (embedded, local, substitute, CSS, Google)
+            // Every present face (embedded, local, substitute, CSS, font source)
             // keeps its established metric-only behaviour.
             if (segment.fontSource === 'native' && segment.fontInstalledFamily !== true) segment.metricProbeText = 'x';
             segment.sourceRunIndex = runIndex;

@@ -62,7 +62,6 @@ describe('Try Yours parsing progress', () => {
 
   it('prewarms parser engines without downloading fonts for bundled samples', () => {
     const prewarm = renderer.slice(renderer.indexOf('export function prewarmEngines'));
-    expect(prewarm).not.toContain('useGoogleFonts: true');
-    expect(prewarm.match(/useGoogleFonts:\s*false/g)).toHaveLength(3);
+    expect(prewarm).not.toMatch(/fonts:|googleFonts|useGoogleFonts/);
   });
 });

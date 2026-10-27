@@ -35,8 +35,10 @@ describe('buildContentSecurityPolicy', () => {
   it('whitelists only the two font CDN origins when enabled', () => {
     const csp = buildContentSecurityPolicy(CSP_SOURCE, NONCE, true);
 
-    // The stylesheet itself is served from fonts.googleapis.com → style-src.
-    expect(csp).toMatch(/style-src[^;]*https:\/\/fonts\.googleapis\.com/);
+    // The library fetch()es the stylesheet from fonts.googleapis.com → connect-src.
+    expect(csp).toMatch(/connect-src[^;]*https:\/\/fonts\.googleapis\.com/);
+    // No stylesheet element is injected, so style-src stays un-widened.
+    expect(csp.match(/style-src ([^;]*)/)?.[1]).toBe("'unsafe-inline'");
     // The woff2 files referenced by the stylesheet come from fonts.gstatic.com → font-src.
     expect(csp).toMatch(/font-src[^;]*https:\/\/fonts\.gstatic\.com/);
 
@@ -45,9 +47,8 @@ describe('buildContentSecurityPolicy', () => {
     expect(fontSrc).toContain('https://fonts.gstatic.com');
     expect(fontSrc).not.toContain('googleapis');
 
-    // The library never fetch()es the CDN, so connect-src must stay un-widened.
+    // Font binaries are fetched by the font engine, never by fetch().
     const connectSrc = csp.match(/connect-src ([^;]*)/)?.[1] ?? '';
-    expect(connectSrc).not.toContain('googleapis');
     expect(connectSrc).not.toContain('gstatic');
     expect(csp).toContain(`media-src ${CSP_SOURCE} blob:`);
   });

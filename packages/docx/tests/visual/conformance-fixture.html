@@ -88,11 +88,9 @@
       if (!testCase) throw new RangeError(`unknown conformance case ${index}`);
       const bytes = generateConformanceDocx(testCase);
       const main = await DocxDocument.load(bytes.slice().buffer, {
-        useGoogleFonts: false,
       });
       const worker = await DocxDocument.load(bytes.slice().buffer, {
         mode: 'worker',
-        useGoogleFonts: false,
       });
       try {
         const services = createLayoutServices(main.document);

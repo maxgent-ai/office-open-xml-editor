@@ -6,21 +6,23 @@ import {
   cjkFallbackChain,
   NON_CJK_SANS_FALLBACKS,
   NON_CJK_SERIF_FALLBACKS,
-  GOOGLE_CJK_FONT_ALIASES,
-  googleCjkFontAlias,
-  SCRIPT_GOOGLE_FONTS,
-  SCRIPT_PRELOAD_NAMES,
   ScriptPreloadAccumulator,
   scriptPreloadNamesForText,
 } from './scripts.js';
 
-/** Lower-case every name and assert it is resolvable in the preload URL map. */
+/** The library fallback vocabulary: every family a renderer stack may append
+ *  for a script (CJK chains, non-CJK Notos, Arabic Notos). */
+const LIBRARY_FALLBACK_FAMILIES = new Set([
+  ...(['kr', 'sc', 'tc', 'hk', 'jp'] as const).flatMap((lang) =>
+    [...cjkFallbackChain(lang, 'sans'), ...cjkFallbackChain(lang, 'serif')]),
+  ...NON_CJK_SANS_FALLBACKS, ...NON_CJK_SERIF_FALLBACKS,
+  'Noto Naskh Arabic', 'Noto Sans Arabic',
+]);
+
+/** Assert every demanded fallback name belongs to the library vocabulary. */
 function assertResolvable(names: string[]): void {
   for (const n of names) {
-    expect(
-      SCRIPT_GOOGLE_FONTS[n.toLowerCase()],
-      `${n} missing from SCRIPT_GOOGLE_FONTS`,
-    ).toBeDefined();
+    expect(LIBRARY_FALLBACK_FAMILIES.has(n), `${n} is not a library fallback family`).toBe(true);
   }
 }
 
@@ -217,50 +219,10 @@ describe('non-CJK fallback constants', () => {
   });
 });
 
-describe('SCRIPT_GOOGLE_FONTS / SCRIPT_PRELOAD_NAMES', () => {
-  it('maps every native Noto CJK name to its Google Fonts family', () => {
-    expect(GOOGLE_CJK_FONT_ALIASES).toEqual({
-      'noto sans cjk sc': 'Noto Sans SC',
-      'noto serif cjk sc': 'Noto Serif SC',
-      'noto sans cjk tc': 'Noto Sans TC',
-      'noto serif cjk tc': 'Noto Serif TC',
-      'noto sans cjk jp': 'Noto Sans JP',
-      'noto serif cjk jp': 'Noto Serif JP',
-      'noto sans cjk kr': 'Noto Sans KR',
-      'noto serif cjk kr': 'Noto Serif KR',
-      'noto sans cjk hk': 'Noto Sans HK',
-    });
-    expect(googleCjkFontAlias('  NOTO SANS CJK SC ')).toBe('Noto Sans SC');
-    expect(googleCjkFontAlias('Noto Serif CJK KR')).toBe('Noto Serif KR');
-    expect(googleCjkFontAlias('Noto Sans CJK HK')).toBe('Noto Sans HK');
-    expect(googleCjkFontAlias('Noto Serif CJK HK')).toBeNull();
-    expect(googleCjkFontAlias('Noto Sans SC')).toBeNull();
-
-    for (const [alias, family] of Object.entries(GOOGLE_CJK_FONT_ALIASES)) {
-      expect(SCRIPT_GOOGLE_FONTS[alias]).toEqual({
-        ...SCRIPT_GOOGLE_FONTS[family.toLowerCase()],
-        loadFamily: family,
-      });
-    }
-  });
-
-  it('maps every script Noto family to a Google Fonts URL', () => {
-    for (const name of SCRIPT_PRELOAD_NAMES) {
-      const entry = SCRIPT_GOOGLE_FONTS[name.toLowerCase()];
-      expect(entry, `missing Google Fonts entry for ${name}`).toBeDefined();
-      expect(entry.url).toMatch(/fonts\.googleapis\.com/);
-    }
-  });
-
-  it('includes CJK, Cyrillic-covering, Thai, Devanagari, Hebrew families', () => {
-    expect(SCRIPT_GOOGLE_FONTS['noto sans kr']).toBeDefined();
-    expect(SCRIPT_GOOGLE_FONTS['noto sans hk']).toBeDefined();
-    expect(SCRIPT_GOOGLE_FONTS['noto serif hk']).toBeUndefined();
-    expect(SCRIPT_GOOGLE_FONTS['noto serif sc']).toBeDefined();
-    expect(SCRIPT_GOOGLE_FONTS['noto sans thai']).toBeDefined();
-    expect(SCRIPT_GOOGLE_FONTS['noto sans devanagari']).toBeDefined();
-    expect(SCRIPT_GOOGLE_FONTS['noto sans hebrew']).toBeDefined();
-    expect(SCRIPT_GOOGLE_FONTS['noto serif hebrew']).toBeDefined();
+describe('library fallback families', () => {
+  it('has no HK serif fallback family', () => {
+    expect(LIBRARY_FALLBACK_FAMILIES.has('Noto Serif HK')).toBe(false);
+    expect(cjkFallbackChain('hk', 'serif')).toEqual([]);
   });
 
   it('preloads only the available HK sans family for shared Han text', () => {
@@ -377,7 +339,7 @@ describe('scriptPreloadNamesForText — script-aware preload set from document t
     expect([...a].sort()).toEqual([...b].sort());
   });
 
-  it('every returned name is resolvable in SCRIPT_GOOGLE_FONTS (CJK + Cyrillic + scripts)', () => {
+  it('every returned name is a library fallback family (CJK + Cyrillic + scripts)', () => {
     const out = scriptPreloadNamesForText(['漢字 Привет สวัสดी नमस्ते שלום'], null);
     assertResolvable(out);
   });

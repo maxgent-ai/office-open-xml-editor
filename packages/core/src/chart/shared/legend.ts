@@ -814,7 +814,7 @@ function legendEntryTextStyle(
   if (!override) return base;
   const face = resolveThemeFontRef(chart, override.fontFace) ?? override.fontFace;
   return {
-    fontFamily: face ? chartFaceWithFallback(face) : base.fontFamily,
+    fontFamily: face ? chartFaceWithFallback(face, chart) : base.fontFamily,
     color: override.fontColor ? `#${override.fontColor}` : base.color,
     bold: override.fontBold ?? base.bold,
     italic: override.fontItalic ?? base.italic,
@@ -1174,7 +1174,7 @@ export function drawLegend(
 function legendTextStyle(chart: ChartModel, ptToPx: number): LegendTextStyle {
   const face = resolveThemeFontRef(chart, chart.legendFontFace) ?? chart.themeMinorFontLatin;
   return {
-    fontFamily: face ? chartFaceWithFallback(face) : 'sans-serif',
+    fontFamily: face ? chartFaceWithFallback(face, chart) : 'sans-serif',
     color: chart.legendFontColor ? `#${chart.legendFontColor}` : '#333',
     bold: chart.legendFontBold ?? false,
     italic: chart.legendFontItalic ?? false,

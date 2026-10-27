@@ -4,13 +4,15 @@ export const MAX_BODY_LAYOUT_PAGES = 10_000;
 
 /** Full-note acquisition needs a bound independent of point advance: zero-
  * height paragraphs can contain arbitrarily many source nodes. One million
- * source units is a library resource ceiling for continuation-enabled acquisition,
+ * source units is a library resource ceiling for continuation-enabled footnotes
+ * and document-end notes,
  * independent of authored layout semantics. Count strings by UTF-16 length and every
  * container/primitive once per source occurrence before any shaping occurs. */
 export const MAX_FOOTNOTE_ACQUISITION_UNITS = 1_000_000;
 
 /** Operational ceiling for one complete pagination execution, including all
- * field, reserve and anchor convergence passes and every continued footnote.
+ * field, reserve and anchor convergence passes and every continued footnote
+ * and endnote. The legacy Footnote-prefixed identifiers serve both note kinds.
  * 32 million source units permit at most 32 maximum-sized full acquisitions;
  * smaller notes share the same aggregate allowance. This is library resource
  * governance, not an Office layout rule or a wall-clock/peak-memory guarantee.

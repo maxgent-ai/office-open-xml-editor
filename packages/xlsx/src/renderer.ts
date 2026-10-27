@@ -5,6 +5,7 @@ import {
 import { ownValue } from '@silurus/ooxml-core/internal/own-key';
 import { inheritCellFontLanguage, usesJapaneseCellFonts } from './internal/cell-font-language.js';
 import { drawShapeStackedText } from './shape-stacked-text.js';
+import { cellXfAt, effectiveCellStyleIndex } from './internal/cell-style.js';
 import type { CjkLang } from '@silurus/ooxml-core';
 import { quoteCssFontFamily } from '@silurus/ooxml-core/internal/css-font-family';
 import { arabicFallbackFamilies, containsArabicFallbackText } from '@silurus/ooxml-core/internal/font-stack';
@@ -14,8 +15,11 @@ import {
   type DrawingMlInputRun,
 } from '@silurus/ooxml-core/internal/drawingml-text';
 import { containsHanScript } from '@silurus/ooxml-core/internal/script-preload-accumulator';
-import { activeFontSet, findReferenceFontMetrics, isHTMLCanvas, loadedGoogleRegularAliases } from '@silurus/ooxml-core';
+import { activeFontSet, findReferenceFontMetrics, isHTMLCanvas, substituteEntryCoversText, type FontSubstituteScript } from '@silurus/ooxml-core';
+import { fontFamilyKey } from '@silurus/ooxml-core/internal/font-sources';
+import { chartFontSubstitutions, withChartFontSubstitutions } from '@silurus/ooxml-core/internal/chart-font-sources';
 import { buildStructuredStyleMap, type StructuredCellFormat } from './pivot-style.js';
+import { buildMergeCoverageIndex } from './merge-coverage-index.js';
 import type {
   Worksheet, Styles, Cell, CellValue, CellFont, CellFill, Border, BorderEdge, CellXf,
   ViewportRange, RenderViewportOptions, XlsxTextRunInfo,
@@ -23,6 +27,7 @@ import type {
   Run, GradientFillSpec, ShapeInfo, ShapeAnchor, ImageAnchor, ChartAnchor,
   SlicerItem, SlicerStyle, SlicerElementStyle,
   PhoneticRun, PhoneticProperties, PhoneticAlignment, Duotone, PathInfo,
+  XlsxLoadedFontSources,
 } from './types.js';
 import type {
   Stroke,
@@ -33,12 +38,11 @@ import type {
 import { blipEffectsMayExtendCoverage, blipPixelEffectsKey, imageEffectFrame, stretchedSourceFrame, type BlipEffect, type BlipPixelEffects } from '@silurus/ooxml-core';
 import { usesPathShade, trackPaintPath, currentStrokeBounds, chartImageFillStoreLookup, paintOptionalImagePlaceholder, pathFillModeOverlay, withDrawingMLShapeTransform, buildPresetGeometryFillPath } from '@silurus/ooxml-core';
 import { placePhoneticRuns } from './phonetic.js';
-import { crispOffset, renderChart, renderSparkline, renderPresetShape, createAuxCanvas, PT_TO_PX, EMU_PER_PX, mathToMathML, rasterizeMathSvg, cachedTintedMathRaster, classifyCjkFont, classifyFontGeneric, googleCjkFontAlias, cjkFallbackChain, NON_CJK_SANS_FALLBACKS, NON_CJK_SERIF_FALLBACKS, isCjkBreakChar, xlsxBorderDashArray, drawImageCropped, hexToRgba, verticalTrLongMark, verticalVertGlyphReachable, applyStroke, resolveFill, type SparklineModel, type MathNode, type MathRenderer, type RasterizedMathSvg } from '@silurus/ooxml-core';
+import { crispOffset, renderChart, renderSparkline, renderPresetShape, createAuxCanvas, PT_TO_PX, EMU_PER_PX, mathToMathML, rasterizeMathSvg, cachedTintedMathRaster, classifyCjkFont, classifyFontGeneric, cjkFallbackChain, NON_CJK_SANS_FALLBACKS, NON_CJK_SERIF_FALLBACKS, isCjkBreakChar, xlsxBorderDashArray, drawImageCropped, hexToRgba, verticalTrLongMark, verticalVertGlyphReachable, applyStroke, resolveFill, type SparklineModel, type MathNode, type MathRenderer, type RasterizedMathSvg } from '@silurus/ooxml-core';
 import {
   canvasShapeFontBoxProbe, excelShapeSpacing, officeRequestKey, shapeOfficeRouteKey, shapeRunLineRatios,
   type ShapeRunLineRatios,
 } from './shape-office-line.js';
-import { XLSX_GOOGLE_FONTS } from './google-fonts.js';
 import { formatCellValueWithColor } from './number-format.js';
 import { type CfContext, type CfResult, compileCf, evaluateCf } from './conditional-format.js';
 import { computeLineVisualOrder, cellBaseRtl, resolveCellBidi } from './bidi-line.js';
@@ -203,17 +207,17 @@ export function imagePixelTransform(image: {
 
 // Calibri is the workbook default font in Excel. When absent, keep the
 // authored sans class rather than silently selecting another named face.
-// `useGoogleFonts` explicitly permits the legacy Calibri → Carlito webfont
-// substitute; that optional route is threaded per worksheet/canvas below.
-// Caladea is likewise an opt-in web alias for Cambria. No other named face
-// inherits these aliases merely because its authored font is unavailable.
+// A family that an application font source (`LoadOptions.fonts`) actually
+// loaded for the authored face (Calibri → Carlito, …) follows it; that
+// optional route is threaded per worksheet/canvas below. No named face
+// inherits a substitute merely because its authored font is unavailable.
 // Arabic fallbacks enter a run's stack only when its text contains Arabic;
 // Noto Naskh Arabic also carries Latin glyphs, so putting it in every sans
 // stack would change the fallback class of ordinary Latin text.
 // The trailing non-CJK Noto faces (Hebrew / Thai / Devanagari, plus "Noto Sans"
 // for Cyrillic) extend the same per-glyph fallback idea to the other
 // non-Latin, non-CJK scripts: any such codepoint resolves to a real web font
-// (loaded opt-in via useGoogleFonts) instead of an OS face or tofu. CJK is NOT
+// (loaded opt-in from a font source) instead of an OS face or tofu. CJK is NOT
 // appended here — shared Han glyphs differ in shape per language, so the
 // correct Noto CJK is chosen per cell from the cell's font name; see
 // fontStackFor() / cssTailFor().
@@ -221,18 +225,13 @@ const NON_CJK_SANS_TAIL = NON_CJK_SANS_FALLBACKS.map((n) => `"${n}"`).join(', ')
 const NON_CJK_SERIF_TAIL = NON_CJK_SERIF_FALLBACKS.map((n) => `"${n}"`).join(', ');
 const DEFAULT_FONT_FAMILY =
   `"Calibri", Arial, ${NON_CJK_SANS_TAIL}, sans-serif`;
-const GOOGLE_DEFAULT_FONT_FAMILY =
-  `"Calibri", "Carlito", Arial, ${NON_CJK_SANS_TAIL}, sans-serif`;
-// The authored face is prepended by fontStackFor. Only the corresponding base
-// text face gets its advance-width substitute; other named faces use the
-// generic chain for their font class. This is font-resource routing policy,
+// The authored face is prepended by fontStackFor. Only the authored face's own
+// loaded substitute precedes the generic chain for its font class. This is font-resource routing policy,
 // not a claim that the substitutes reproduce every Excel line break.
 const NAMED_SANS_TAIL =
   `Arial, Helvetica, "Liberation Sans", ${NON_CJK_SANS_TAIL}, sans-serif`;
 const NAMED_SERIF_TAIL =
   `"Times New Roman", "Liberation Serif", ${NON_CJK_SERIF_TAIL}, serif`;
-const CALIBRI_TAIL = `"Carlito", ${NAMED_SANS_TAIL}`;
-const CAMBRIA_TAIL = `"Caladea", ${NAMED_SERIF_TAIL}`;
 type OfficeRoutes = Readonly<Record<string, import('@silurus/ooxml-core').OfficeFontFallbackRoute>>;
 const officeRoutesByContext = new WeakMap<object, OfficeRoutes>();
 const officeRoutesByWorksheet = new WeakMap<Worksheet, OfficeRoutes>();
@@ -243,10 +242,42 @@ type NormalFontBinding = {
   canvasMdw?: number;
 };
 const normalFontBindingByWorksheet = new WeakMap<Worksheet, NormalFontBinding>();
-const googleSubstitutesByContext = new WeakMap<object, boolean>();
-const googleSubstitutesByWorksheet = new WeakMap<Worksheet, boolean>();
-const regularAliasesByContext = new WeakMap<object, ReadonlyMap<string, string>>();
-const regularAliasesByWorksheet = new WeakMap<Worksheet, ReadonlyMap<string, string>>();
+export type { XlsxLoadedFontSources };
+type LoadedSubstitutions = XlsxLoadedFontSources['substitutions'];
+const NO_ALIASES: ReadonlyMap<string, string> = new Map();
+const fontSourcesByContext = new WeakMap<object, XlsxLoadedFontSources>();
+const fontSourcesByWorksheet = new WeakMap<Worksheet, XlsxLoadedFontSources>();
+const fontSourceFingerprints = new WeakMap<XlsxLoadedFontSources, string>();
+const fontSourceKeyByWorksheet = new WeakMap<Worksheet, string>();
+
+/** Content identity of a loaded snapshot: every ensure publishes a new
+ *  snapshot object, so geometry invalidates only when the substitutions or
+ *  aliases that stacks read actually changed. */
+function fontSourceFingerprint(sources: XlsxLoadedFontSources | undefined): string {
+  if (!sources) return '';
+  let key = fontSourceFingerprints.get(sources);
+  if (key === undefined) {
+    key = JSON.stringify([
+      [...sources.substitutions].map(([family, sub]) => [family, sub.family, sub.script ?? '']).sort(),
+      [...sources.regularAliases].sort(),
+    ]);
+    fontSourceFingerprints.set(sources, key);
+  }
+  return key;
+}
+
+function bindFontSources(worksheet: Worksheet, sources: XlsxLoadedFontSources | undefined): boolean {
+  const key = fontSourceFingerprint(sources);
+  const changed = (fontSourceKeyByWorksheet.get(worksheet) ?? '') !== key;
+  fontSourceKeyByWorksheet.set(worksheet, key);
+  if (sources) fontSourcesByWorksheet.set(worksheet, sources);
+  else fontSourcesByWorksheet.delete(worksheet);
+  return changed;
+}
+
+function regularAliasOf(sources: XlsxLoadedFontSources | undefined, name: string | null | undefined): string | undefined {
+  return name ? (sources?.regularAliases ?? NO_ALIASES).get(name.trim().toLocaleLowerCase('en-US')) : undefined;
+}
 type ResolvedThemeCellFont = {
   family: string | null; weight: number; fallbackAlias?: string; syntheticBold?: true;
 };
@@ -276,23 +307,22 @@ function bindThemeCellFontState(ctx: CanvasRenderingContext2D, worksheet: Worksh
 
 function bindNormalFontState(
   worksheet: Worksheet, routes: OfficeRoutes | undefined,
-  fontSet: FontFaceSet | null, googleSubstitutes: boolean,
+  fontSet: FontFaceSet | null, sources: XlsxLoadedFontSources | undefined,
   measureCtx?: CanvasRenderingContext2D,
-  regularAliases: ReadonlyMap<string, string> = new Map(),
 ): void {
   const tupleKey = worksheet.defaultFontFamily
     ? officeRequestKey({ family: worksheet.defaultFontFamily,
       weight: worksheet.defaultFontBold ? 700 : 400,
       style: worksheet.defaultFontItalic ? 'italic' : 'normal' })
     : null;
-  const route = tupleKey === null ? undefined : routes?.[tupleKey];
+  const route = tupleKey === null || !routes ? undefined : ownValue(routes, tupleKey);
   const hasDeclaredFace = worksheet.defaultFontFamily
     ? hasDeclaredFamilyFace(worksheet.defaultFontFamily, fontSet) : false;
   const canvasMdw = measureCtx && worksheet.defaultFontFamily && worksheet.defaultFontSize
     ? computeMdw(worksheet.defaultFontFamily, worksheet.defaultFontSize, route,
-      googleSubstitutes, worksheet.defaultFontBold ? 700 : 400,
+      sources?.substitutions, worksheet.defaultFontBold ? 700 : 400,
       worksheet.defaultFontItalic ? 'italic' : 'normal', measureCtx,
-      regularAliases.get(worksheet.defaultFontFamily.trim().toLocaleLowerCase('en-US')))
+      regularAliasOf(sources, worksheet.defaultFontFamily))
     : undefined;
   const next = { tupleKey, route, hasDeclaredFace, canvasMdw };
   const old = normalFontBindingByWorksheet.get(worksheet);
@@ -311,20 +341,16 @@ export function bindXlsxOfficeFontRoutes(
   ctx: CanvasRenderingContext2D,
   worksheet: Worksheet,
   routes?: OfficeRoutes,
-  googleSubstitutes = false,
+  fontSources?: XlsxLoadedFontSources,
 ): void {
   bindThemeCellFontState(ctx, worksheet);
-  if (officeRoutesByWorksheet.get(worksheet) !== routes ||
-      googleSubstitutesByWorksheet.get(worksheet) !== googleSubstitutes) GridGeometry.invalidate(worksheet);
-  googleSubstitutesByContext.set(ctx, googleSubstitutes);
+  const sourcesChanged = bindFontSources(worksheet, fontSources);
+  if (officeRoutesByWorksheet.get(worksheet) !== routes || sourcesChanged) GridGeometry.invalidate(worksheet);
+  if (fontSources) fontSourcesByContext.set(ctx, fontSources);
+  else fontSourcesByContext.delete(ctx);
   const fontSet = (isHTMLCanvas(ctx.canvas) ? ctx.canvas.ownerDocument?.fonts : undefined)
     ?? activeFontSet();
-  const regularAliases = googleSubstitutes
-    ? loadedGoogleRegularAliases(fontSet, XLSX_GOOGLE_FONTS) : new Map<string, string>();
-  regularAliasesByContext.set(ctx, regularAliases);
-  regularAliasesByWorksheet.set(worksheet, regularAliases);
-  bindNormalFontState(worksheet, routes, fontSet, googleSubstitutes, ctx, regularAliases);
-  googleSubstitutesByWorksheet.set(worksheet, googleSubstitutes);
+  bindNormalFontState(worksheet, routes, fontSet, fontSources, ctx);
   if (routes) {
     officeRoutesByContext.set(ctx, routes);
     officeRoutesByWorksheet.set(worksheet, routes);
@@ -335,22 +361,21 @@ export function bindXlsxOfficeFontRoutes(
 }
 
 function contextRegularAlias(ctx: CanvasRenderingContext2D, name: string | null | undefined): string | undefined {
-  return name ? regularAliasesByContext.get(ctx)?.get(name.trim().toLocaleLowerCase('en-US')) : undefined;
+  return regularAliasOf(fontSourcesByContext.get(ctx), name);
+}
+
+function contextSubstitutions(ctx: CanvasRenderingContext2D): LoadedSubstitutions | undefined {
+  return fontSourcesByContext.get(ctx)?.substitutions;
 }
 
 export function bindXlsxWorksheetOfficeFontRoutes(
-  worksheet: Worksheet, routes?: OfficeRoutes, googleSubstitutes = false,
+  worksheet: Worksheet, routes?: OfficeRoutes, fontSources?: XlsxLoadedFontSources,
 ): void {
-  if (officeRoutesByWorksheet.get(worksheet) !== routes ||
-      googleSubstitutesByWorksheet.get(worksheet) !== googleSubstitutes) GridGeometry.invalidate(worksheet);
+  const sourcesChanged = bindFontSources(worksheet, fontSources);
+  if (officeRoutesByWorksheet.get(worksheet) !== routes || sourcesChanged) GridGeometry.invalidate(worksheet);
   if (routes) officeRoutesByWorksheet.set(worksheet, routes);
   else officeRoutesByWorksheet.delete(worksheet);
-  googleSubstitutesByWorksheet.set(worksheet, googleSubstitutes);
-  const fontSet = activeFontSet();
-  const regularAliases = googleSubstitutes
-    ? loadedGoogleRegularAliases(fontSet, XLSX_GOOGLE_FONTS) : new Map<string, string>();
-  regularAliasesByWorksheet.set(worksheet, regularAliases);
-  bindNormalFontState(worksheet, routes, fontSet, googleSubstitutes, undefined, regularAliases);
+  bindNormalFontState(worksheet, routes, activeFontSet(), fontSources);
 }
 
 function officeRoute(
@@ -365,7 +390,10 @@ function officeRoute(
   // still painted with a wider CSS fallback.
   const key = officeRequestKey({ family: name?.trim() || 'Calibri',
     weight: bold ? 700 : 400, style: italic ? 'italic' : 'normal' });
-  return officeRoutesByContext.get(ctx)?.[key];
+  // Route keys are authored face names; read own entries only (routes may
+  // arrive through structured clone as an ordinary object).
+  const routes = officeRoutesByContext.get(ctx);
+  return routes ? ownValue(routes, key) : undefined;
 }
 
 /** Keep a viewer-owned column metric after local font binding. The main realm
@@ -384,13 +412,28 @@ const DEFAULT_MONO_FONT_FAMILY = `"Courier New", "Liberation Mono", monospace`;
 
 /**
  * CSS font-family TAIL (everything after the cell's named face) for an xlsx
- * cell. An unnamed cell keeps the workbook default chain. Named Calibri and
- * Cambria get their corresponding web alias only with `useGoogleFonts`;
- * other named faces use a fallback of the same generic class. For a CJK face the matching Noto CJK
+ * cell. An unnamed cell keeps the workbook default chain (Calibri-headed). A
+ * family that a font source loaded for the authored face
+ * (`substitutions`, keyed per authored family; a script-scoped substitute only
+ * for text of its script) leads the generic fallback of the face's class; no
+ * other named face is substituted. For a CJK face the matching Noto CJK
  * leads so shared Han glyphs take the document language's shapes; see
  * core/fonts/scripts.ts. Exported for unit testing.
  */
-export function cssTailFor(name: string | null | undefined, fallback?: CjkLang, googleSubstitutes = false, text = ''): string {
+/** `"Substitute", ` when a font source loaded a substitute for `family`
+ * that covers `text` (script-scoped ones only for text of their script),
+ * else `''`: the one substitution rule every XLSX stack builder uses. */
+function loadedSubstitutePart(substitutions: LoadedSubstitutions | undefined, family: string, text: string): string {
+  const loaded = substitutions?.get(fontFamilyKey(family));
+  return loaded && substituteEntryCoversText(loaded, text, 'any') ? `${quoteCssFontFamily(loaded.family)}, ` : '';
+}
+
+export function cssTailFor(
+  name: string | null | undefined,
+  fallback?: CjkLang,
+  substitutions?: LoadedSubstitutions,
+  text = '',
+): string {
   const authored = name?.trim() || null;
   const cjk = authored ? classifyCjkFont(authored) : null;
   const generic = classifyFontGeneric(authored); // 'serif' | 'sans' | 'mono'
@@ -404,22 +447,26 @@ export function cssTailFor(name: string | null | undefined, fallback?: CjkLang, 
     const split = base.lastIndexOf(',');
     return `${base.slice(0, split)}, ${families.map((family) => `"${family}"`).join(', ')}${base.slice(split)}`;
   };
+  // The authored face's loaded substitute (design §3.6: data from loaded
+  // faces, no vendor table). Unnamed cells paint the Calibri-headed default.
+  const loaded = substitutions?.get(fontFamilyKey(authored ?? 'Calibri'));
+  const substitute = loaded && substituteEntryCoversText(loaded, text, 'any') ? loaded.family : undefined;
   if (!cjk) {
-    // An explicit opt-in can use the legacy webfont substitute. Otherwise a
-    // missing authored Calibri face falls through to the same sans class.
-    const base = !authored ? (googleSubstitutes ? GOOGLE_DEFAULT_FONT_FAMILY : DEFAULT_FONT_FAMILY)
-      : authored.toLowerCase() === 'calibri' ? (googleSubstitutes ? CALIBRI_TAIL : NAMED_SANS_TAIL)
-      : authored.toLowerCase() === 'cambria' ? (googleSubstitutes ? CAMBRIA_TAIL : NAMED_SERIF_TAIL)
-      : generic === 'serif' ? NAMED_SERIF_TAIL
+    const classTail = generic === 'serif' ? NAMED_SERIF_TAIL
       : generic === 'mono' ? DEFAULT_MONO_FONT_FAMILY : NAMED_SANS_TAIL;
+    const base = !authored
+      ? (substitute ? `"Calibri", ${quoteCssFontFamily(substitute)}, Arial, ${NON_CJK_SANS_TAIL}, sans-serif` : DEFAULT_FONT_FAMILY)
+      : substitute ? `${quoteCssFontFamily(substitute)}, ${classTail}` : classTail;
     return appendScriptFallbacks(base);
   }
   const serif = generic === 'serif';
-  const googleAlias = googleCjkFontAlias(authored);
+  // A native Noto CJK name a source serves under another family (its
+  // distribution name) leads the regional chain; the chain itself already
+  // starts with the authored region's family.
   const cjkFamilies = [
-    ...(googleAlias ? [googleAlias] : []),
+    ...(substitute ? [substitute] : []),
     ...cjkFallbackChain(cjk, serif ? 'serif' : 'sans')
-      .filter((family) => family !== googleAlias),
+      .filter((family) => family !== substitute),
   ];
   const cjkPart = cjkFamilies
     .map((n) => `"${n}"`)
@@ -439,7 +486,7 @@ export function fontStackFor(
   cjkFallback?: CjkLang,
   text = '',
   route?: import('@silurus/ooxml-core').OfficeFontFallbackRoute,
-  googleSubstitutes = false,
+  substitutions?: LoadedSubstitutions,
   fallbackAlias?: string,
   regularAlias?: string,
 ): string {
@@ -452,8 +499,8 @@ export function fontStackFor(
   const regularPart = regularAlias && regularAlias.toLocaleLowerCase('en-US') !== normalized?.toLocaleLowerCase('en-US')
     ? `${quoteCssFontFamily(regularAlias)}, ` : '';
   return selected
-    ? `${quoteCssFontFamily(selected.family)}, ${aliasPart}${regularPart}${cssTailFor(normalized, fallback, googleSubstitutes, text)}`
-    : normalized ? `${quoteCssFontFamily(normalized)}, ${aliasPart}${regularPart}${cssTailFor(normalized, fallback, googleSubstitutes, text)}` : cssTailFor(null, fallback, googleSubstitutes, text);
+    ? `${quoteCssFontFamily(selected.family)}, ${aliasPart}${regularPart}${cssTailFor(normalized, fallback, substitutions, text)}`
+    : normalized ? `${quoteCssFontFamily(normalized)}, ${aliasPart}${regularPart}${cssTailFor(normalized, fallback, substitutions, text)}` : cssTailFor(null, fallback, substitutions, text);
 }
 
 const DEFAULT_FONT_SIZE = 11;
@@ -519,7 +566,7 @@ const FREEZE_LINE_COLOR = '#7a7a7a';
 export function computeMdw(
   family: string, sizePt: number,
   route?: import('@silurus/ooxml-core').OfficeFontFallbackRoute,
-  googleSubstitutes = false,
+  substitutions?: LoadedSubstitutions,
   weight: 400 | 700 = 400,
   style: 'normal' | 'italic' = 'normal',
   ownerCtx?: CanvasRenderingContext2D,
@@ -537,7 +584,7 @@ export function computeMdw(
   const stylePrefix = weight !== 400 || style !== 'normal' ? `${style} ${weight} ` : '';
   if (ownerCtx) ctx.save();
   try {
-    ctx.font = `${stylePrefix}${sizePx}px ${fontStackFor(family, undefined, '', route, googleSubstitutes, undefined, regularAlias)}`;
+    ctx.font = `${stylePrefix}${sizePx}px ${fontStackFor(family, undefined, '', route, substitutions, undefined, regularAlias)}`;
     let mdw = 0;
     for (const d of '0123456789') {
       const w = ctx.measureText(d).width;
@@ -576,16 +623,17 @@ export function getMdwForWorksheet(ws: Pick<Worksheet,
   const weight = ws.defaultFontBold ? 700 : 400;
   const style = ws.defaultFontItalic ? 'italic' : 'normal';
   const tupleKey = officeRequestKey({ family: ws.defaultFontFamily, weight, style });
-  const route = officeRoutesByWorksheet.get(ws as Worksheet)?.[tupleKey];
+  const worksheetRoutes = officeRoutesByWorksheet.get(ws as Worksheet);
+  const route = worksheetRoutes ? ownValue(worksheetRoutes, tupleKey) : undefined;
   const boundFont = normalFontBindingByWorksheet.get(ws as Worksheet);
   return boundFont?.canvasMdw ?? computeMdw(
     ws.defaultFontFamily, ws.defaultFontSize,
     route,
-    googleSubstitutesByWorksheet.get(ws as Worksheet) === true,
+    fontSourcesByWorksheet.get(ws as Worksheet)?.substitutions,
     weight,
     style,
     undefined,
-    regularAliasesByWorksheet.get(ws as Worksheet)?.get(ws.defaultFontFamily.trim().toLocaleLowerCase('en-US')),
+    regularAliasOf(fontSourcesByWorksheet.get(ws as Worksheet), ws.defaultFontFamily),
   );
 }
 
@@ -1109,7 +1157,7 @@ function buildFont(ctx: CanvasRenderingContext2D, font: CellFont, cs = 1, cjkFal
   return `${style}${weight}${sizePx}px ${fontStackFor(
     selected.family, cjkFallback, text,
     officeRoute(ctx, selected.family, font.bold, font.italic),
-    googleSubstitutesByContext.get(ctx) === true,
+    contextSubstitutions(ctx),
     selected.fallbackAlias,
     contextRegularAlias(ctx, selected.family),
   )}`;
@@ -1269,30 +1317,13 @@ function applyRunFont(base: CellFont, run: Run): CellFont {
 }
 
 function resolveXf(styles: Styles, styleIndex: number): { font: CellFont; fill: CellFill; border: Border; xf: CellXf } {
-  const xf: CellXf = styles.cellXfs[styleIndex] ?? styles.cellXfs[0] ?? {
+  const xf: CellXf = cellXfAt(styles, styleIndex) ?? {
     fontId: 0, fillId: 0, borderId: 0, numFmtId: 0, alignH: null, alignV: null, wrapText: false,
   };
   const font: CellFont = styles.fonts[xf.fontId] ?? { bold: false, italic: false, underline: false, strike: false, size: DEFAULT_FONT_SIZE, color: null, name: null };
   const fill: CellFill = styles.fills[xf.fillId] ?? { patternType: 'none', fgColor: null, bgColor: null };
   const border: Border = styles.borders[xf.borderId] ?? { left: null, right: null, top: null, bottom: null };
   return { font, fill, border, xf };
-}
-
-function columnStyleIndex(worksheet: Worksheet, col: number): number {
-  const ranges = worksheet.colStyleRanges ?? [];
-  for (let index = ranges.length - 1; index >= 0; index--) {
-    const range = ranges[index];
-    if (col >= range.min && col <= range.max) return range.styleIndex;
-  }
-  return 0;
-}
-
-function effectiveCellStyleIndex(
-  worksheet: Worksheet,
-  cell: Cell | undefined,
-  col: number,
-): number {
-  return cell?.styleIndex ?? columnStyleIndex(worksheet, col);
 }
 
 function wrapTextLines(
@@ -2980,8 +3011,6 @@ export function getSheetRenderCache(worksheet: Worksheet, styles?: Styles): Shee
 
   // Merge skip-set is pure topology (no scaled sizes) so it is cacheable; the
   // anchor map's pixel sizes depend on cellScale and stay per-frame.
-  const mergeSkipSet = new Set<string>();
-  const mergeAnchorSet = new Set<string>();
   const mergeAnchorIdentity = coordinateIndexIdentity(
     worksheet,
     'worksheet-merge-anchor-index',
@@ -2992,16 +3021,11 @@ export function getSheetRenderCache(worksheet: Worksheet, styles?: Styles): Shee
     'worksheet-merge-skip-index',
     'expand-merged-cell-coordinates',
   );
-  for (const mc of worksheet.mergeCells ?? []) {
-    addCoordinateIndexEntry(mergeAnchorSet, `${mc.top}:${mc.left}`, mergeAnchorIdentity);
-    assertCoordinateRangeArea(mc, mergeIdentity, 1);
-    for (let r = mc.top; r <= mc.bottom; r++) {
-      for (let c = mc.left; c <= mc.right; c++) {
-        if (r === mc.top && c === mc.left) continue;
-        addCoordinateIndexEntry(mergeSkipSet, `${r}:${c}`, mergeIdentity);
-      }
-    }
-  }
+  const { anchors: mergeAnchorSet, continuations: mergeSkipSet } = buildMergeCoverageIndex(
+    worksheet.mergeCells ?? [],
+    mergeAnchorIdentity,
+    mergeIdentity,
+  );
 
   const autoFilterCells = new Set<string>();
   if (worksheet.autoFilter) {
@@ -3648,7 +3672,7 @@ export function renderViewport(
   opts: RenderViewportOptions = {},
   cjkFallback?: CjkLang,
 ): void {
-  bindXlsxOfficeFontRoutes(ctx, worksheet, opts.officeFontRoutes, opts.googleSubstitutes === true);
+  bindXlsxOfficeFontRoutes(ctx, worksheet, opts.officeFontRoutes, opts.fontSources);
   pinXlsxGridGeometry(worksheet, opts.authoritativeMdw);
   const dpr = opts.dpr ?? 1;
   const cs = opts.cellScale ?? 1;
@@ -4742,7 +4766,7 @@ export function drawShapeText(
     const px = size * PT_TO_PX * cs * fontScale;
     const family = fontStackFor(run.fontFace, cjkFallback, run.text,
       officeRoute(ctx, run.fontFace, run.bold, run.italic),
-      googleSubstitutesByContext.get(ctx) === true,
+      contextSubstitutions(ctx),
       undefined, contextRegularAlias(ctx, run.fontFace));
     return { font: `${run.italic ? 'italic ' : ''}${run.bold ? 'bold ' : ''}${px}px ${family}`, px };
   };
@@ -4786,7 +4810,7 @@ export function drawShapeText(
     if (!metricBody) break;
     if (run.type !== 'text') continue;
     const ratios = run.fontFace
-      ? shapeRunLineRatios(run, routes?.[shapeOfficeRouteKey(run)], fontBoxProbe)
+      ? shapeRunLineRatios(run, routes ? ownValue(routes, shapeOfficeRouteKey(run)) : undefined, fontBoxProbe)
       : undefined;
     if (!ratios) metricBody = false;
     else runLineRatios.set(run, ratios);
@@ -4934,7 +4958,7 @@ export function drawShapeText(
       return {
         height: pxSize * 1.2,
         ascent: measuredAscent(`${pxSize}px ${fontStackFor(face, undefined, '',
-          officeRoute(ctx, face), googleSubstitutesByContext.get(ctx) === true,
+          officeRoute(ctx, face), contextSubstitutions(ctx),
           undefined, contextRegularAlias(ctx, face))}`, pxSize),
       };
     };
@@ -5619,9 +5643,11 @@ function renderCharts(
     // `anchor.chart` is already the canonical ChartModel emitted by the Rust
     // parser (`ooxml_common::chart::ChartModel`) — the former `adaptChartData`
     // default/mapping logic now lives in the parser's `From<ChartData>`.
+    // Chart text paints the unscoped substitutions this realm's font sources
+    // loaded (ChartModel.fontSubstitutions), as cell text does.
     renderChart(
       ctx,
-      anchor.chart,
+      withChartFontSubstitutions(anchor.chart, chartFontSubstitutions(contextSubstitutions(ctx))),
       cs === 1
         ? { x: cx, y: cy, w: cw, h: ch }
         : { x: cx / cs, y: cy / cs, w: cw / cs, h: ch / cs },
@@ -5754,7 +5780,7 @@ export function drawSlicerFrame(
     ctx.fillRect(x + 1, y + 1, w - 2, headerH);
   }
   ctx.fillStyle = style?.header?.fontColor ?? SLICER_HEADER_FG;
-  ctx.font = slicerFont(style?.header, SLICER_HEADER_FONT, cs);
+  ctx.font = slicerFont(style?.header, SLICER_HEADER_FONT, cs, contextSubstitutions(ctx), caption);
   ctx.textBaseline = 'middle';
   ctx.textAlign = 'left';
   const headerPad = 6 * cs;
@@ -5811,7 +5837,7 @@ export function drawSlicerFrame(
         ctx.strokeRect(listX + 0.5, iy + 0.5, listW - 1, itemH - 1);
       }
     }
-    ctx.font = slicerFont(itemStyle, SLICER_ITEM_FONT, cs);
+    ctx.font = slicerFont(itemStyle, SLICER_ITEM_FONT, cs, contextSubstitutions(ctx), item.name);
     ctx.fillStyle = itemStyle?.fontColor ??
       (selected ? SLICER_ITEM_SEL_FG : SLICER_ITEM_OFF_FG);
     drawClippedText(ctx, item.name, listX + itemPad, iy + itemH / 2 + 1, listW - 2 * itemPad);
@@ -5844,12 +5870,16 @@ function slicerFont(
   style: SlicerElementStyle | undefined,
   fallback: string,
   cs: number,
+  substitutions: LoadedSubstitutions | undefined,
+  text: string,
 ): string {
   if (!style) return scaleFont(fallback, cs);
   const size = Math.round((style.fontSize ?? 11) * cs);
   const weight = style.fontBold ? 'bold ' : '';
+  // An authored slicer face takes the substitute a font source loaded for
+  // it, exactly as cell and shape text do (script-gated by the painted text).
   const family = style.fontFamily
-    ? `"${style.fontFamily}", "Segoe UI", sans-serif`
+    ? `${quoteCssFontFamily(style.fontFamily)}, ${loadedSubstitutePart(substitutions, style.fontFamily, text)}"Segoe UI", sans-serif`
     : '"Meiryo UI", "Segoe UI", sans-serif';
   return `${weight}${size}px ${family}`;
 }

@@ -1,8 +1,9 @@
 // Latin-only paragraphs in every compatibility setting, plus mixed East Asian /
 // Latin paragraphs in settings WORD_COMPRESSED_SPACE_LINE_FIT excludes. The
 // historical digests retain origin/main (4a387ebcb) except Latin compression
-// groups in compatibility mode 14, corrected for Windows-observed
-// kerning/OpenType independence (other modes keep origin/main digests).
+// groups below compatibility mode 15, corrected for the Windows-observed
+// kerning/OpenType (mode 14) and kerning/lineWrapLikeWord6 (mode 11)
+// independence of WORD_LATIN_INTERWORD_XAVG_FLOOR.
 import { createHash } from 'node:crypto';
 import { layoutStubParagraph, type StubParagraph, type StubRun } from './word-space-fit.test-support.js';
 

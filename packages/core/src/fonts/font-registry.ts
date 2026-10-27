@@ -1,6 +1,6 @@
 /**
  * Refcounted FontFace registry shared by the embedded-font loader
- * ({@link ./embedded.ts}) and the Google-Fonts preloader ({@link ./preload.ts}).
+ * ({@link ./embedded.ts}) and the font-source session ({@link ./source-session.ts}).
  *
  * Each DOM/worker realm owns a FontFaceSet. Opening the same font repeatedly in
  * one set would otherwise add duplicate faces and leak them; same-origin child
@@ -9,8 +9,8 @@
  * removed only when that set's last holder releases it.
  *
  * The registry is deliberately format-agnostic: callers own how they compute a
- * face's signature (embedded fonts hash the de-obfuscated bytes; Google Fonts
- * key on the CSS url + family + descriptors) and how they build the `FontFace`.
+ * face's signature (embedded fonts hash the de-obfuscated bytes; font sources
+ * key on the source identity + family + descriptors + src) and how they build the `FontFace`.
  * The registry owns only the shared concern — *this exact face is referenced by
  * N holders; delete it from its set at N = 0* — so neither loader duplicates the
  * refcount / last-release / double-release-safety logic.
@@ -126,3 +126,47 @@ export function releaseFaces(faces: Iterable<FontFace>): void {
     }
   }
 }
+
+// ---- realm font-set primitives -----------------------------------------------
+// Shared by every font loader (font sources, embedded fonts, installed-face
+// probes and line-metric preflights): library resource policy, not OOXML
+// behaviour. Each JS realm owns one FontFaceSet.
+
+/**
+ * Hard ceiling so a wedged network (a stylesheet fetch that never settles, or a
+ * `FontFace.load()` that never resolves) cannot hang the caller forever. This is
+ * a SAFETY NET, not the normal exit: on a reachable network every awaited
+ * promise settles well within it, so first paint is deterministic. It is
+ * intentionally generous — racing font loads against a short timeout could
+ * resolve while faces were still downloading, which is exactly the cold-cache
+ * flicker the await-before-paint contract prevents.
+ */
+export const FONT_LOAD_CEILING_MS = 15000;
+
+/** Race a font-load promise against {@link FONT_LOAD_CEILING_MS} so a wedged
+ *  network or a `FontFace.load()` that never settles cannot hang the caller
+ *  forever. Shared by the embedded-font and local-face loaders (same
+ *  first-paint determinism contract); font sources abort at the same ceiling
+ *  instead of racing it (`source-session.ts`). */
+export function withFontCeiling<T>(p: Promise<T>): Promise<T | void> {
+  return Promise.race([
+    p,
+    new Promise<void>((resolve) => setTimeout(resolve, FONT_LOAD_CEILING_MS)),
+  ]);
+}
+
+/** The FontFaceSet of the current context: `document.fonts` on the main
+ *  thread, `self.fonts` in a worker, null elsewhere (Node without a shim).
+ *  Every loader resolves its default target through this one rule, so faces of
+ *  one document land in the same set. */
+export function activeFontSet(): FontFaceSet | null {
+  if (typeof document !== 'undefined' && document && document.fonts) return document.fonts;
+  if (typeof self !== 'undefined' && self && 'fonts' in self) {
+    return (self as unknown as { fonts: FontFaceSet }).fonts;
+  }
+  return null;
+}
+
+/** Demanded Unicode scalars of one load (sorted or first-seen), or `'all'`:
+ *  the conservative answer that loads every `unicode-range` subset. */
+export type FontPreloadDemand = 'all' | readonly number[];

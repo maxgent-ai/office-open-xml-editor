@@ -80,6 +80,9 @@ export interface RenderDocumentOptions {
   tiff?: TiffRenderer;
   /** Adaptive decoded-raster memory policy shared by every OOXML renderer. */
   imageResources?: ImageResourceOptions;
+  /** Internal: the unscoped substitutions this document's font sources
+   * loaded, painted by chart text (`ChartModel.fontSubstitutions`). */
+  chartFontSubstitutions?: Readonly<Record<string, string>>;
 }
 
 export function dropColorReplacedCache(
@@ -148,6 +151,7 @@ function normalizeRenderOptions(
       chartEx: options.chartEx,
       tiff: options.tiff,
       imageResources: options.imageResources,
+      chartFontSubstitutions: options.chartFontSubstitutions,
     },
   };
 }

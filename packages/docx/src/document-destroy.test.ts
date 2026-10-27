@@ -3,10 +3,9 @@ import { BoundedRawPartCache } from '@silurus/ooxml-core/internal/bounded-raw-pa
 import {
   WorkerBridge,
   registerEmbeddedFonts,
-  preloadGoogleFonts,
   type WorkerLike,
-  type FontPreloadEntry,
 } from '@silurus/ooxml-core';
+import { FontSourceSession, googleFonts } from '@silurus/ooxml-core/internal/font-sources';
 import { DocxDocument } from './document';
 import { attachDocumentLayoutRuntime } from './layout/runtime-state.js';
 
@@ -82,7 +81,7 @@ function installFontFaceSet(): { added: FakeFace[] } {
   return { added };
 }
 
-// ── Google-Fonts flavored fake: `preloadGoogleFonts` needs `fetch` (to pull
+// ── Font-source flavored fake: a CSS source needs `fetch` (to pull
 // the CSS) and a string-`src` `FontFace` constructor, unlike the ArrayBuffer
 // source used by the embedded-font fake above. Mirrors the fake used by
 // `presentation-destroy.test.ts` / `workbook-destroy.test.ts`. ──────────────
@@ -105,10 +104,6 @@ function installGoogleFontFaceSet(): { added: FakeFace[] } {
   delete G.self;
   return { added };
 }
-
-const GOOGLE_FONT_MAP: Record<string, FontPreloadEntry> = {
-  calibri: { url: 'https://fonts.googleapis.com/css2?family=Carlito', loadFamily: 'Carlito' },
-};
 
 /** A minimal valid sfnt header so registerEmbeddedFonts accepts the face. */
 const validHeader = (): Uint8Array =>
@@ -136,7 +131,7 @@ describe('DocxDocument.destroy() — rejects in-flight worker requests', () => {
     instance._rawParts = new BoundedRawPartCache({ maxEntries: 4, maxBytes: 1024 });
     instance._embeddedFontFaces = [];
     instance._officeFontFaces = [];
-    instance._googleFontFaces = [];
+    instance._fontSourceSession = null;
     instance._fetchImage = () => Promise.resolve(new Blob());
     return { doc: instance as unknown as DestroyProbe, bridge, worker };
   }
@@ -165,7 +160,7 @@ describe('DocxDocument.destroy() — rejects in-flight worker requests', () => {
         _parse(
           buffer: ArrayBuffer,
           resourcePolicy: object,
-          useGoogleFonts?: boolean,
+          fonts?: readonly unknown[],
           timeoutMs?: number,
         ): Promise<void>;
       },
@@ -186,7 +181,7 @@ describe('DocxDocument.destroy() — rejects in-flight worker requests', () => {
         _parse(
           buffer: ArrayBuffer,
           resourcePolicy: object,
-          useGoogleFonts?: boolean,
+          fonts?: readonly unknown[],
           timeoutMs?: number,
         ): Promise<void>;
       },
@@ -263,27 +258,25 @@ describe('DocxDocument.destroy() — rejects in-flight worker requests', () => {
     expect((doc as unknown as { _embeddedFontFaces: FontFace[] })._embeddedFontFaces).toHaveLength(0);
   });
 
-  // Wiring guard: destroy() must actually release the Google-Fonts substitutes
-  // the document preloaded into the shared FontFaceSet. The other tests set
-  // `_googleFontFaces = []`, so they never exercise the unload branch — a
-  // dropped call (or a wrong field name) would go unnoticed. Preload a real
-  // face through core, hand it to the document, then assert destroy() removes
-  // it from the (fake) FontFaceSet and clears the held array. Twin of the
-  // embedded-fonts guard above; same shape as
-  // `presentation-destroy.test.ts` / `workbook-destroy.test.ts`.
-  it('destroy() releases the document’s Google fonts from the FontFaceSet', async () => {
+  // Wiring guard: destroy() must actually release the font-source faces the
+  // document registered into the shared FontFaceSet. The other tests hold no
+  // session, so they never exercise the release branch — a dropped call (or a
+  // wrong field name) would go unnoticed. Load a real face through a core
+  // session, hand it to the document, then assert destroy() removes it from
+  // the (fake) FontFaceSet and drops the session. Twin of the embedded-fonts
+  // guard above.
+  it('destroy() releases the document’s font-source faces from the FontFaceSet', async () => {
     const { added } = installGoogleFontFaceSet();
-    const held = await preloadGoogleFonts(['Calibri'], GOOGLE_FONT_MAP);
-    expect(added).toHaveLength(1); // the web font is in the shared set
+    const session = new FontSourceSession({ sources: [googleFonts()] });
+    await session.ensure({ families: ['Calibri'], tuples: [], fallbackFamilies: [], scalars: 'all' });
+    expect(added).toHaveLength(1); // the source face is in the shared set
 
     const { doc } = makeDocument();
-    (doc as unknown as { _googleFontFaces: FontFace[] })._googleFontFaces = held;
+    (doc as unknown as { _fontSourceSession: FontSourceSession })._fontSourceSession = session;
     doc.destroy();
 
-    // destroy() called unloadGoogleFonts(held): last holder gone → the face
-    // left the FontFaceSet, and the held array was cleared.
     expect(added).toHaveLength(0);
-    expect((doc as unknown as { _googleFontFaces: FontFace[] })._googleFontFaces).toHaveLength(0);
+    expect((doc as unknown as { _fontSourceSession: unknown })._fontSourceSession).toBeNull();
   });
 
 });

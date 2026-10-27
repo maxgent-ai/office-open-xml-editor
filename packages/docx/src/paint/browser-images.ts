@@ -473,13 +473,15 @@ export async function preloadPaintImages(
 ): Promise<Map<string, DecodedPaintImage>> {
   if (!fetchImage) return new Map();
   const policy = normalizeImageResourceOptions(imageResources);
+  // SVG targets are coverage minimums: the rasterizer keeps the SVG's aspect,
+  // so a square SVG in a 96x87 box retains 96x96. Core admits exactly that
+  // coverage grid (plus the per-image hard quota); a `width x height` ceiling
+  // here would reject every aspect-mismatched picture in worker mode only,
+  // while main mode draws the same SVG element without a raster surface.
   const decodeSvg = (path: string, request: ImageDecodeRequest) => svgDecoder
     ? getCachedSvgImageByPath(path, fetchImage, {
         targetWidthPx: request.targetWidthPx,
         targetHeightPx: request.targetHeightPx,
-        maxRetainedPixels: request.targetWidthPx && request.targetHeightPx
-          ? request.targetWidthPx * request.targetHeightPx
-          : undefined,
         workerDecoder: svgDecoder,
       })
     : getCachedSvgImageByPath(path, fetchImage);

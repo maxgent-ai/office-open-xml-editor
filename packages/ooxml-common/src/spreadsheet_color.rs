@@ -23,13 +23,26 @@ pub enum SpreadsheetColor {
     Theme(u32),
 }
 
+/// Canonical `#RRGGBB` (uppercase) for exactly six ASCII hex digits with an
+/// optional single leading `#`, else `None`. Every resolved SpreadsheetML color
+/// passes through this, so the output contract is a validated color value, not
+/// document text: hosts paint it into CSS (the XLSX sheet-tab bar), where an
+/// unchecked string such as `FF0000;background-image:url(...)` would add
+/// declarations (#1957).
+pub fn canonical_rgb_hex(value: &str) -> Option<String> {
+    let hex = value.strip_prefix('#').unwrap_or(value);
+    (hex.len() == 6 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| format!("#{}", hex.to_ascii_uppercase()))
+}
+
 /// Resolve a typed SpreadsheetML color using the XLSX parser's existing policy.
 ///
 /// `Auto` remains unresolved for its caller to interpret. ARGB alpha is dropped
 /// because the existing renderer color contract is RGB. Indexed values 64 and
 /// 65 resolve to black and white, and invalid indexed values resolve to black;
 /// these are compatibility policies carried over from the parser rather than
-/// general claims about every SpreadsheetML consumer.
+/// general claims about every SpreadsheetML consumer. A theme slot that is not
+/// a six-digit hex color resolves to `None` (see [`canonical_rgb_hex`]).
 pub fn resolve_color(
     color: SpreadsheetColor,
     tint: Option<f64>,
@@ -41,11 +54,17 @@ pub fn resolve_color(
         SpreadsheetColor::Indexed(index) => indexed_color(index as usize).into(),
         SpreadsheetColor::Theme(index) => theme_colors.get(theme_index(index as usize))?.into(),
     };
-    Some(finish(base, valid_tint(tint)))
+    Some(finish(&canonical_rgb_hex(&base)?, valid_tint(tint)))
 }
 
-/// Attribute adapter preserving the XLSX parser's established precedence and
-/// malformed-input behavior. Direct producers should use [`resolve_color`].
+/// Attribute adapter preserving the XLSX parser's established precedence.
+/// Direct producers should use [`resolve_color`].
+///
+/// `rgb` is `ST_UnsignedIntHex` (§18.18.86, four bytes: `AARRGGBB`); the
+/// six-digit `RRGGBB` form is also accepted, as before. Any other `rgb` value
+/// (wrong length, non-hex, a `#` prefix) resolves to `None` rather than falling
+/// through to `theme`/`indexed`: the attribute is present but carries no color.
+/// Theme slots are validated like [`resolve_color`]'s.
 pub fn resolve_color_attrs(
     rgb: Option<&str>,
     theme: Option<&str>,
@@ -55,16 +74,19 @@ pub fn resolve_color_attrs(
 ) -> Option<String> {
     let tint = valid_tint(tint.and_then(|value| value.trim().parse().ok()));
     if let Some(rgb) = rgb {
-        let rgb = if rgb.len() == 8 { rgb.get(2..)? } else { rgb };
-        return Some(finish(format!("#{}", rgb.to_uppercase()).into(), tint));
+        if !rgb.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return None;
+        }
+        let rgb = if rgb.len() == 8 { &rgb[2..] } else { rgb };
+        return Some(finish(&canonical_rgb_hex(rgb)?, tint));
     }
     if let Some(index) = theme.and_then(|value| value.parse::<usize>().ok()) {
         if let Some(base) = theme_colors.get(theme_index(index)) {
-            return Some(finish(base.as_str().into(), tint));
+            return Some(finish(&canonical_rgb_hex(base)?, tint));
         }
     }
     if let Some(index) = indexed.and_then(|value| value.parse::<usize>().ok()) {
-        return Some(finish(indexed_color(index).into(), tint));
+        return Some(finish(indexed_color(index), tint));
     }
     None
 }
@@ -96,12 +118,12 @@ fn indexed_color(index: usize) -> &'static str {
     }
 }
 
-fn finish(base: Cow<'_, str>, tint: f64) -> String {
-    let hex = base.strip_prefix('#').unwrap_or(&base);
-    if tint != 0.0 && hex.len() == 6 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        apply_tint(&base, tint)
+/// Apply `tint` to a canonical `#RRGGBB` base.
+fn finish(base: &str, tint: f64) -> String {
+    if tint != 0.0 {
+        apply_tint(base, tint)
     } else {
-        base.into_owned()
+        base.to_owned()
     }
 }
 
@@ -242,6 +264,46 @@ mod tests {
         // Eight UTF-8 bytes, but byte offset two is not a character boundary.
         assert_eq!(
             resolve_color_attrs(Some("€abcde"), None, None, None, &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn non_color_rgb_and_theme_text_never_reaches_the_output() {
+        // #1957: the resolved string is painted into CSS by the sheet-tab bar.
+        for rgb in [
+            "FF0000;background-image:url(http://x.invalid/p)",
+            "FFFF0000;x",
+            "#FF0000",
+            "F00",
+            "FF00000",
+            "GG000000",
+            "",
+        ] {
+            assert_eq!(
+                resolve_color_attrs(Some(rgb), Some("4"), Some("0.5"), Some("2"), &[]),
+                None,
+                "{rgb}"
+            );
+        }
+        assert_eq!(
+            resolve_color_attrs(Some("ff00aa"), None, None, None, &[]).as_deref(),
+            Some("#FF00AA")
+        );
+        let theme = [
+            "#000000",
+            "#FFFFFF",
+            "#111111",
+            "#EEEEEE",
+            "#ff0000;x:url(y)",
+        ]
+        .map(str::to_owned);
+        assert_eq!(
+            resolve_color_attrs(None, Some("4"), None, None, &theme),
+            None
+        );
+        assert_eq!(
+            resolve_color(SpreadsheetColor::Theme(4), Some(0.2), &theme),
             None
         );
     }

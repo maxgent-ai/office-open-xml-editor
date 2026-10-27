@@ -31,7 +31,7 @@ describe('ECMA-376 maximum digit width authority', () => {
     // A completed lookup cannot make the unavailable Calibri face paint text.
     // Narrowing columns to its catalog digit width would newly clip fallback
     // glyphs, so the same painted fallback remains authoritative.
-    bindXlsxOfficeFontRoutes(measuringContext(9), worksheet as Parameters<typeof bindXlsxOfficeFontRoutes>[1], {}, false);
+    bindXlsxOfficeFontRoutes(measuringContext(9), worksheet as Parameters<typeof bindXlsxOfficeFontRoutes>[1], {});
     expect(getMdwForWorksheet(worksheet)).toBe(9);
   });
 
@@ -47,9 +47,9 @@ describe('ECMA-376 maximum digit width authority', () => {
     } as Parameters<typeof getGridGeometryForWorksheet>[0];
     const routes = {};
     const ctx = measuringContext(9);
-    bindXlsxOfficeFontRoutes(ctx, worksheet, routes, false);
+    bindXlsxOfficeFontRoutes(ctx, worksheet, routes);
     const before = getGridGeometryForWorksheet(worksheet);
-    bindXlsxOfficeFontRoutes(ctx, worksheet, routes, false);
+    bindXlsxOfficeFontRoutes(ctx, worksheet, routes);
     const after = getGridGeometryForWorksheet(worksheet);
     expect(before.maximumDigitWidth).toBe(9);
     expect(after.maximumDigitWidth).toBe(9);
@@ -69,8 +69,8 @@ describe('ECMA-376 maximum digit width authority', () => {
     } as unknown as Parameters<typeof createSheetViewModel>[0];
     const first = createSheetViewModel(source);
     const second = createSheetViewModel(source);
-    bindXlsxOfficeFontRoutes(measuringContext(9), first, {}, false);
-    bindXlsxOfficeFontRoutes(measuringContext(12), second, {}, false);
+    bindXlsxOfficeFontRoutes(measuringContext(9), first, {});
+    bindXlsxOfficeFontRoutes(measuringContext(12), second, {});
     expect(getGridGeometryForWorksheet(first).maximumDigitWidth).toBe(9);
     expect(getGridGeometryForWorksheet(second).maximumDigitWidth).toBe(12);
     expect(getGridGeometryForWorksheet(first).maximumDigitWidth).toBe(9);
@@ -92,12 +92,12 @@ describe('ECMA-376 maximum digit width authority', () => {
       restore(this: { font: string }) { this.font = savedFont; },
       measureText: () => ({ width: 12 }) } as unknown as CanvasRenderingContext2D;
     const worksheet = { defaultFontFamily: 'Calibri', defaultFontSize: 12 } as Parameters<typeof bindXlsxOfficeFontRoutes>[1];
-    bindXlsxOfficeFontRoutes(ctx, worksheet, {}, false);
+    bindXlsxOfficeFontRoutes(ctx, worksheet, {});
     expect(getMdwForWorksheet(worksheet)).toBe(12);
     expect(ctx.font).toBe(initialFont);
   });
 
-  it('binds a loaded regular alias from a foreign canvas owner document', () => {
+  it('binds the regular alias the canvas realm\'s font sources loaded', () => {
     class MainCanvas {}
     class PopupCanvas {
       readonly nodeType = 1;
@@ -120,7 +120,9 @@ describe('ECMA-376 maximum digit width authority', () => {
       },
     } as unknown as CanvasRenderingContext2D;
     const worksheet = { defaultFontFamily: 'Lato Regular', defaultFontSize: 11 } as Parameters<typeof bindXlsxOfficeFontRoutes>[1];
-    bindXlsxOfficeFontRoutes(ctx, worksheet, {}, true);
+    bindXlsxOfficeFontRoutes(ctx, worksheet, {}, {
+      substitutions: new Map(), regularAliases: new Map([['lato regular', 'Lato']]),
+    });
     expect(observedFonts[0]).toContain('"Lato Regular", "Lato",');
   });
 
@@ -155,7 +157,7 @@ describe('ECMA-376 maximum digit width authority', () => {
       defaultFontFamily: 'Meiryo UI', defaultFontSize: 12,
       defaultFontBold: true,
     };
-    bindXlsxOfficeFontRoutes(measuringContext(9), worksheet as Parameters<typeof bindXlsxOfficeFontRoutes>[1], {}, false);
+    bindXlsxOfficeFontRoutes(measuringContext(9), worksheet as Parameters<typeof bindXlsxOfficeFontRoutes>[1], {});
     // The catalogued bold face would quantize to 11px, but cannot paint.
     expect(getMdwForWorksheet(worksheet)).toBe(9);
   });
@@ -168,7 +170,7 @@ describe('ECMA-376 maximum digit width authority', () => {
         ctx.measureText = (digit) => ({
           width: digit === '7' ? maximum : Math.max(0, maximum - 0.2),
         } as TextMetrics);
-        expect(computeMdw('Example', 11, undefined, false, 400, 'normal', ctx)).toBe(expected);
+        expect(computeMdw('Example', 11, undefined, undefined, 400, 'normal', ctx)).toBe(expected);
       }
     }
   });
@@ -220,4 +222,42 @@ describe('ECMA-376 maximum digit width authority', () => {
     expect(computeMdw('Example', 11)).toBe(8);
   });
 
+});
+
+describe('Normal-font routes for face names that are prototype members', () => {
+  it.each(['__proto__', 'constructor', 'toString', 'hasOwnProperty'])(
+    'measures a Normal font named %s like any family without a loaded route',
+    (name) => {
+      vi.stubGlobal('navigator', { platform: 'MacIntel', userAgent: 'Macintosh' });
+      const fontsFor = (family: string) => {
+        const observed: string[] = [];
+        const ctx = {
+          save() {}, restore() {},
+          set font(value: string) { observed.push(value); },
+          get font() { return observed.at(-1) ?? ''; },
+          measureText: () => ({ width: 7 }),
+        } as unknown as CanvasRenderingContext2D;
+        const worksheet = { defaultFontFamily: family, defaultFontSize: 11 } as Parameters<typeof bindXlsxOfficeFontRoutes>[1];
+        bindXlsxOfficeFontRoutes(ctx, worksheet, {});
+        return observed.map((font) => font.replaceAll(family, '<family>'));
+      };
+      expect(fontsFor(name)).toEqual(fontsFor('Ordinary Face'));
+    },
+  );
+});
+describe('worksheet default fonts named like Object.prototype members', () => {
+  it('measures with a structured-cloned empty route map without throwing', () => {
+    vi.stubGlobal('OffscreenCanvas', undefined);
+    vi.stubGlobal('document', { createElement: () => ({ getContext: () => ({
+      font: '', measureText: () => ({ width: 7 }),
+    }) }) });
+    for (const family of ['__proto__', 'constructor', 'toString', 'hasOwnProperty']) {
+      const worksheet = { defaultFontFamily: family, defaultFontSize: 11 };
+      bindXlsxWorksheetOfficeFontRoutes(
+        worksheet as Parameters<typeof bindXlsxWorksheetOfficeFontRoutes>[0],
+        structuredClone({}),
+      );
+      expect(() => getMdwForWorksheet(worksheet)).not.toThrow();
+    }
+  });
 });

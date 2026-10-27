@@ -73,4 +73,21 @@ describe('cumulative full-footnote acquisition work', () => {
     expect(layout.pages.flatMap(page => page.layers.notes).flatMap(note =>
       note.kind === 'note' ? note.story.blocks : [])).toHaveLength(80);
   }, 20_000);
+
+  it('bounds unbounded endnote acquisition even when footnote continuation is disabled', () => {
+    const model = largeSourceNote(1);
+    const note = model.footnotes![0]!;
+    (note.content[0] as DocParagraph).styleId = 'S'.repeat(1_000_001);
+    for (const block of model.body) {
+      if (block.type !== 'paragraph') continue;
+      for (const run of block.runs) if (run.type === 'text' && run.noteRef) run.noteRef.kind = 'endnote';
+    }
+    model.endnotes = [note];
+    model.footnotes = [];
+    const services = createLayoutServices(model, {
+      measureContext: measureContext(), allowFootnoteContinuation: false, localMetrics: presentTimes(),
+    });
+    expect(() => layoutDocument(model, services, { currentDateMs: 0 }))
+      .toThrow('Footnote acquisition source budget exceeded');
+  });
 });

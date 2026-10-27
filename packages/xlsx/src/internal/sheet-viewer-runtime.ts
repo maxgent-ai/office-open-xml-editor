@@ -176,17 +176,15 @@ export class SheetRenderDispatcher {
     });
   }
 
-  schedule(render: () => void | Promise<void>): void {
+  /** Scroll-only requests may finish the active frame before starting the
+   * latest queued viewport. Invalidating every completed frame under continuous
+   * input would starve presentation whenever a worker takes longer than one
+   * input interval. Other changes still supersede the active generation. */
+  schedule(render: () => void | Promise<void>, viewportOnly = false): void {
     if (this.destroyed) return;
     this.pendingRender = render;
     if (this.activeRender) {
-      // A queued viewport supersedes the frame currently awaiting a worker
-      // bitmap immediately, not only when the queued callback eventually gets
-      // its backpressure slot. Otherwise the old bitmap can still commit after
-      // scroll/resize state has changed and briefly disagree with the live
-      // gutters/overlays. The queued callback calls begin() again when it starts
-      // and becomes the sole current generation.
-      this.begin();
+      if (!viewportOnly) this.begin();
       return;
     }
     if (this.animationFrame !== null) return;

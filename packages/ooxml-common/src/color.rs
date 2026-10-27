@@ -493,6 +493,10 @@ pub fn extract_color_source<'a, 'input>(
 /// Returning `None` leaves the color unresolved (the caller then falls back —
 /// e.g. to a shape's style color). Implementations must return the base
 /// **without** a leading `#` so the shared transform sees clean input.
+// The shared color/fill/line/effect parsers borrow this object-safe resolver
+// through `&dyn ThemeResolver`: only slot lookup varies by host. Keep the XML
+// grammar compiled once instead of monomorphizing it for every theme adapter.
+// Dispatch adds no allocation and preserves each format's resolver/tint policy.
 pub trait ThemeResolver {
     /// Resolve a scheme/logical color name to its base hex (no `#`). `name` is
     /// the raw `<a:schemeClr val>` string.
@@ -546,9 +550,9 @@ impl<R: ThemeResolver + ?Sized> ThemeResolver for StyleMatrixColorResolver<'_, R
 /// casing / `#` convention in a thin adapter. `tint_mode` selects the Word vs
 /// PowerPoint `<a:tint>` interpretation ([`TintMode`]). Returns `None` when no
 /// color child is present or a `schemeClr` fails to resolve.
-pub fn parse_color_node<R: ThemeResolver + ?Sized>(
+pub fn parse_color_node(
     container: Node<'_, '_>,
-    resolver: &R,
+    resolver: &dyn ThemeResolver,
     tint_mode: TintMode,
 ) -> Option<String> {
     resolve_color_source(extract_color_source(container)?, resolver, tint_mode)
@@ -623,9 +627,9 @@ pub fn color_source_from_element<'a, 'input>(
 /// applying its EG_ColorTransform children. Split out of [`parse_color_node`] so
 /// callers that already hold a `ColorSource` (e.g. from
 /// [`color_source_from_element`]) can resolve it without re-scanning.
-pub fn resolve_color_source<R: ThemeResolver + ?Sized>(
+pub fn resolve_color_source(
     source: ColorSource<'_, '_>,
-    resolver: &R,
+    resolver: &dyn ThemeResolver,
     tint_mode: TintMode,
 ) -> Option<String> {
     match source {

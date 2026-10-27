@@ -2825,7 +2825,7 @@ fn parse_projected_worksheet(
         default_col_width_is_ui,
         default_row_height,
         default_row_height_custom,
-        merge_cells,
+        merge_cells: without_repeated_merge_ranges(merge_cells),
         freeze_rows,
         freeze_cols,
         conditional_formats,
@@ -3000,6 +3000,27 @@ fn load_sheet_comments(
     }
 
     merge_sheet_comments(threaded_comments, classic_comments)
+}
+
+/// §18.3.1.55 lists the merged ranges and does not define a repeated
+/// `<mergeCell>`; a repeat of an identical (corner-normalized) range names no
+/// new cells, so it is dropped (#1958: thousands of repeats of one large
+/// range otherwise multiply every per-range consumer's work). The LAST
+/// occurrence is kept, in place: consumers that key ranges by top-left cell
+/// let a later range win (the renderer's anchor map), and keeping each
+/// range's last position preserves which range wins and the order in which
+/// distinct ranges are painted. Distinct overlapping ranges stay as authored;
+/// consumers resolve them by coverage (`buildMergeCoverageIndex`, markdown
+/// `clear_merge_continuation_cells`).
+fn without_repeated_merge_ranges(merge_cells: Vec<MergeCell>) -> Vec<MergeCell> {
+    let mut seen: HashSet<(u32, u32, u32, u32)> = HashSet::with_capacity(merge_cells.len());
+    let mut kept: Vec<MergeCell> = merge_cells
+        .into_iter()
+        .rev()
+        .filter(|m| seen.insert((m.top, m.left, m.bottom, m.right)))
+        .collect();
+    kept.reverse();
+    kept
 }
 
 /// Reconcile modern threads with the legacy placeholders required by MS-XLSX
@@ -5060,6 +5081,25 @@ mod tab_color_tests {
             r#"<worksheet><sheetPr/><sheetData><c><is><t>tabColor rgb="00FF00"</t></is></c>"#;
         assert_eq!(extract_tab_color_from_head(head, &theme()), None);
     }
+
+    #[test]
+    fn tab_color_that_is_not_a_color_is_dropped() {
+        // #1957: the tab color is painted into CSS, so text after the hex
+        // (here a second declaration loading a URL) must never survive.
+        let head = r#"<worksheet><sheetPr><tabColor rgb="FF0000;background-image:url(http://tabcolor-beacon.invalid/pixel)"/></sheetPr><sheetData/></worksheet>"#;
+        assert_eq!(extract_tab_color_from_head(head, &theme()), None);
+        // The same text arriving through a theme slot.
+        let theme = super::XlsxThemeData::parse(
+            r#"<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:themeElements><a:clrScheme name="x">
+              <a:dk1><a:srgbClr val="000000"/></a:dk1><a:lt1><a:srgbClr val="FFFFFF"/></a:lt1>
+              <a:dk2><a:srgbClr val="44546A"/></a:dk2><a:lt2><a:srgbClr val="E7E6E6"/></a:lt2>
+              <a:accent1><a:srgbClr val="4472C4;background-image:url(http://x.invalid/p)"/></a:accent1>
+            </a:clrScheme></a:themeElements></a:theme>"#,
+        )
+        .colors;
+        let head = r#"<worksheet><sheetPr><tabColor theme="4"/></sheetPr><sheetData/></worksheet>"#;
+        assert_eq!(extract_tab_color_from_head(head, &theme), None);
+    }
 }
 
 #[cfg(test)]
@@ -5163,12 +5203,9 @@ mod color_tint_tests {
             resolve_color_attrs(Some("FF808080"), None, Some(" 0.5 "), None, &[]).as_deref(),
             Some("#C0C0C0")
         );
-        // Malformed non-ASCII RGB must not reach byte-indexed HLS conversion.
+        // Malformed non-hex RGB is not a color (#1957), whatever its length.
         assert!(resolve_color_attrs(Some("あ12345"), None, Some("0.5"), None, &[]).is_none());
-        assert_eq!(
-            resolve_color_attrs(Some("あ123"), None, Some("0.5"), None, &[]).as_deref(),
-            Some("#あ123")
-        );
+        assert!(resolve_color_attrs(Some("あ123"), None, Some("0.5"), None, &[]).is_none());
     }
 }
 
@@ -8245,6 +8282,43 @@ mod rb7_partial_degradation_tests {
         );
         assert_eq!(merges[1]["bottom"], 1_048_576);
         assert_eq!(merges[1]["right"], 16_384);
+    }
+
+    /// Repeated identical ranges (#1958) — including the same range written
+    /// with swapped corners — collapse to their last occurrence, while
+    /// distinct overlapping ranges stay as authored, in document order. For
+    /// a shared top-left cell the last-authored range stays last.
+    #[test]
+    fn repeated_identical_merge_cells_collapse_to_one() {
+        let mut merges = String::new();
+        for _ in 0..1200 {
+            merges.push_str(r#"<mergeCell ref="A1:ZZ300"/>"#);
+        }
+        let sheet = format!(
+            r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData/><mergeCells count="1207">{merges}<mergeCell ref="C3:B2"/><mergeCell ref="B2:C3"/><mergeCell ref="A1:ZZ299"/><mergeCell ref="ZZ300:A1"/><mergeCell ref="E5:F5"/><mergeCell ref="E5:G5"/><mergeCell ref="E5:F5"/></mergeCells></worksheet>"#
+        );
+        let json = parse_sheet_native(&build_single_sheet_workbook(&sheet), 0, "Sheet1")
+            .expect("sheet parses");
+        let sheet: serde_json::Value = serde_json::from_str(&json).expect("sheet JSON");
+        let merges: Vec<(u64, u64, u64, u64)> = sheet["mergeCells"]
+            .as_array()
+            .expect("merges")
+            .iter()
+            .map(|m| {
+                let n = |k: &str| m[k].as_u64().expect("coordinate");
+                (n("top"), n("left"), n("bottom"), n("right"))
+            })
+            .collect();
+        assert_eq!(
+            merges,
+            vec![
+                (2, 2, 3, 3),
+                (1, 1, 299, 702),
+                (1, 1, 300, 702),
+                (5, 5, 5, 7),
+                (5, 5, 5, 6),
+            ]
+        );
     }
 
     /// Far-apart cells project to rows of 16384 columns each; past the

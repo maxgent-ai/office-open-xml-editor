@@ -6,12 +6,12 @@
  * authored face, and where CJK, Arabic and other script faces go): those
  * orders differ per format and are format policy. What is shared here is the
  * data every order draws from — CSS quoting, the Arabic-run test and Arabic
- * fallback faces, and the Office-face web aliases derived from the single
- * Google-Fonts substitute registry.
+ * fallback faces, and the Office-face aliases derived from the vendor-neutral
+ * substitution policy (`substitutions.ts`).
  */
 import { quoteCssFontFamily } from '../internal/css-font-family.js';
 import { ownValue } from '../internal/own-key.js';
-import { GOOGLE_FONT_SUBSTITUTES } from './google-fonts.js';
+import { OFFICE_FONT_SUBSTITUTIONS } from './substitutions.js';
 
 /** Quote each family for a CSS font-family list (no trailing comma). */
 export function quoteCssFontFamilies(names: readonly string[]): string {
@@ -34,38 +34,40 @@ export function arabicFallbackFamilies(serif: boolean): readonly string[] {
 }
 
 /**
- * Office faces whose Google substitute is a DIFFERENT family (Calibri →
- * Carlito, Cambria → Caladea, the Arabic faces → Noto Arabic, …), keyed by the
- * lower-cased authored name. Entries Google serves under the requested name,
- * and the self-referencing Noto entries, are not aliases.
+ * Office faces whose openly licensed substitute is a DIFFERENT family (Calibri
+ * → Carlito, Cambria → Caladea, the Arabic faces → Noto Arabic, …), keyed by
+ * the lower-cased authored name: the vendor-neutral
+ * {@link OFFICE_FONT_SUBSTITUTIONS} policy. A font stack that inserts a
+ * substitute at paint time takes it from the substitutions a font source
+ * actually loaded; this static alias serves only paint paths with no font
+ * source session (metafile text) and script-class predicates.
  */
 const OFFICE_FACE_WEB_ALIASES: Readonly<Record<string, string>> = Object.freeze(
-  Object.fromEntries(
-    Object.entries(GOOGLE_FONT_SUBSTITUTES)
-      .filter(([key, entry]) => entry.loadFamily !== undefined
-        && entry.loadFamily.toLowerCase() !== key)
-      .map(([key, entry]) => [key, entry.loadFamily!]),
-  ),
+  Object.fromEntries(OFFICE_FONT_SUBSTITUTIONS.map((entry) => [entry.for.toLowerCase(), entry.use])),
 );
 
-/** The different-family web alias for an authored Office face, if any.
+/** The different-family substitute for an authored Office face, if any.
  *  `family` is matched case-insensitively. */
 export function officeFaceWebAlias(family: string): string | undefined {
   return ownValue(OFFICE_FACE_WEB_ALIASES, family.toLowerCase());
 }
 
-/** Lower-cased names of the Arabic-script faces the Google registry maps to a
- *  Noto Arabic substitute, including the Noto Arabic faces themselves. */
-export const ARABIC_SUBSTITUTE_FACES: ReadonlySet<string> = new Set(
-  Object.entries(GOOGLE_FONT_SUBSTITUTES)
-    .filter(([, entry]) => entry.loadFamily === 'Noto Naskh Arabic' || entry.loadFamily === 'Noto Sans Arabic')
-    .map(([key]) => key),
-);
+const ARABIC_SUBSTITUTE_FAMILIES = ['Noto Naskh Arabic', 'Noto Sans Arabic'];
+
+/** Lower-cased names of the Arabic-script faces the substitution policy maps
+ *  to a Noto Arabic substitute, including the Noto Arabic faces themselves. */
+export const ARABIC_SUBSTITUTE_FACES: ReadonlySet<string> = new Set([
+  ...OFFICE_FONT_SUBSTITUTIONS
+    .filter((entry) => ARABIC_SUBSTITUTE_FAMILIES.includes(entry.use))
+    .map((entry) => entry.for.toLowerCase()),
+  ...ARABIC_SUBSTITUTE_FAMILIES.map((family) => family.toLowerCase()),
+]);
 
 /** The subset of {@link ARABIC_SUBSTITUTE_FACES} substituted by the
  *  Naskh-style (serif-like) Noto Naskh Arabic. */
-export const NASKH_ARABIC_SUBSTITUTE_FACES: ReadonlySet<string> = new Set(
-  Object.entries(GOOGLE_FONT_SUBSTITUTES)
-    .filter(([, entry]) => entry.loadFamily === 'Noto Naskh Arabic')
-    .map(([key]) => key),
-);
+export const NASKH_ARABIC_SUBSTITUTE_FACES: ReadonlySet<string> = new Set([
+  ...OFFICE_FONT_SUBSTITUTIONS
+    .filter((entry) => entry.use === 'Noto Naskh Arabic')
+    .map((entry) => entry.for.toLowerCase()),
+  'noto naskh arabic',
+]);

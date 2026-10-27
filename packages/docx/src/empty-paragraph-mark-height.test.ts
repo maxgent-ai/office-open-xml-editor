@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import { sourceFontLayoutOptions } from './testing/font-sources.js';
 import { createLayoutServices } from './layout-runtime.js';
 import { layoutDocument } from './document-layout.js';
 import { renderDocumentToCanvas } from './renderer.js';
@@ -577,10 +578,9 @@ describe('empty paragraph mark line height (§17.3.1.29 / §17.3.1.33)', () => {
     const mainContext = makeContext();
     const workerContext = makeContext();
     const options = (ctx: CanvasRenderingContext2D) => ({
-      useGoogleFonts: true,
-      googleFaces: [{
+      ...sourceFontLayoutOptions(model, [{
         family: 'Carlito', weight: '400', style: 'normal', status: 'loaded',
-      } as FontFace],
+      }]),
       measureContext: ctx,
     });
     const main = createLayoutServices(model, options(mainContext.ctx));

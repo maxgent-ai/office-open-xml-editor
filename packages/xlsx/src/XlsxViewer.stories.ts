@@ -1,3 +1,4 @@
+import { googleFonts } from '@silurus/ooxml-core/internal/font-sources';
 import type { Meta, StoryObj } from '@storybook/html';
 import { XlsxViewer } from './viewer';
 import { math } from '../../../src/math';
@@ -48,7 +49,7 @@ export function buildViewerUI(
   const viewer = new XlsxViewer(viewerContainer, {
     cellScale: args.scale,
     selectionColor: args.selectionColor,
-    useGoogleFonts: true,
+    fonts: [googleFonts()],
     math,
     threeD,
     regionMap,
@@ -108,7 +109,7 @@ function renderFileUpload(args: Args, mode: 'main' | 'worker'): HTMLElement {
         mode,
         cellScale: args.scale,
         debug: args.debug,
-        useGoogleFonts: true,
+        fonts: [googleFonts()],
         math,
         threeD,
         regionMap,

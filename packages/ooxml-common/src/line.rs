@@ -121,9 +121,9 @@ fn parse_positive_percentage(value: &str) -> Option<f64> {
 /// Parse only the paint choice of one DrawingML `<a:ln>`. Chart Style palette
 /// expansion uses this narrower path so a long custom dash recipe is not
 /// reparsed once per palette color.
-pub fn parse_line_paint<R: ThemeResolver + ?Sized>(
+pub fn parse_line_paint(
     line: Node<'_, '_>,
-    resolver: &R,
+    resolver: &dyn ThemeResolver,
     tint_mode: TintMode,
 ) -> Option<LinePaint> {
     line.children().find_map(|child| {
@@ -147,9 +147,9 @@ pub fn parse_line_paint<R: ThemeResolver + ?Sized>(
 }
 
 /// Parse one DrawingML `<a:ln>` into a presence-preserving descriptor.
-pub fn parse_line_properties<R: ThemeResolver + ?Sized>(
+pub fn parse_line_properties(
     line: Node<'_, '_>,
-    resolver: &R,
+    resolver: &dyn ThemeResolver,
     tint_mode: TintMode,
 ) -> LineProperties {
     let paint = parse_line_paint(line, resolver, tint_mode);

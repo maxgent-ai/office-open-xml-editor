@@ -16,9 +16,9 @@ import { type LayoutTextSeg } from './model.js';
 // to an auxiliary Canvas once (async, before pagination). Layout reads cached
 // em-extents synchronously; drawing blits the Canvas. Skipped entirely for
 // math-free documents.
-/** Arabic-script faces that hosts rarely ship; we substitute them with Noto
- *  Naskh/Sans Arabic web fonts (derived from the shared Google-Fonts registry
- *  that DOCX_GOOGLE_FONTS in document.ts spreads). A source run whose font is
+/** Arabic-script faces that hosts rarely ship, which the vendor-neutral
+ *  substitution policy maps to Noto Naskh/Sans Arabic (core
+ *  `OFFICE_FONT_SUBSTITUTIONS`). A source run whose font is
  *  one of these contains both Arabic and Latin/digit glyphs in one requested
  *  face, so the fallback chain must keep both scripts stylistically
  *  consistent (Arabic substitute first, serif Latin companion before the sans
@@ -42,7 +42,7 @@ export function isArabicSubstituteFont(family: string): boolean {
 export const quoteAll = quoteCssFontFamilies;
 
 
-/** Generic Arabic web-font fallbacks (loaded when `useGoogleFonts` is on). */
+/** Generic Arabic fallback families (loaded when a font source serves them). */
 export const ARABIC_TAIL_SANS = ['Noto Naskh Arabic', 'Noto Sans Arabic'] as const;
 
 

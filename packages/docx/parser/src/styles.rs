@@ -278,9 +278,111 @@ pub struct ParaFmt {
     /// compact natural line height rather than the 18 pt grid pitch.
     pub snap_to_grid: Option<bool>,
     /// ECMA-376 §17.3.1.11 w:framePr — text-frame / drop-cap properties.
-    /// Resolved through the style chain like other pPr; `Some` ⇒ this paragraph
-    /// is part of a text frame. Boxed to match `DocParagraph::frame_pr`.
-    pub frame_pr: Option<Box<crate::types::FramePr>>,
+    /// Each attribute is inherited independently through the style chain (see
+    /// [`FramePrFacts`]); `Some` ⇒ this paragraph is part of a text frame.
+    /// [`FramePrFacts::resolve`] applies the defaults once the cascade is done.
+    pub frame_pr: Option<Box<FramePrFacts>>,
+}
+
+/// The authored attributes of one `<w:framePr>` level, every one optional so
+/// that the style hierarchy can layer them attribute by attribute.
+///
+/// Inheritance (observed Word behavior; ECMA-376 §17.3.1.11 is silent): Word
+/// keeps each frame attribute as an independent paragraph property. A Windows
+/// Word export of a paragraph whose direct `<w:framePr w:wrap="notBeside"/>`
+/// overrides a styled frame (`w`, `xAlign="center"`, `hAnchor="page"`,
+/// `vAnchor="text"`) lays the paragraph out with the style's width, centering
+/// and anchors. A level therefore replaces only the attributes it names.
+///
+/// Defaults are applied by [`FramePrFacts::resolve`] after the whole cascade,
+/// using Word's documented values where they differ from ECMA-376
+/// ([MS-OI29500] 2.1.43 §17.3.1.11 d-g): hAnchor and vAnchor default to
+/// `text`, `h="0"` means automatic height, and hRule defaults to `atLeast`
+/// when a nonzero `h` is present.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FramePrFacts {
+    pub anchor_lock: Option<bool>,
+    pub drop_cap: Option<String>,
+    pub lines: Option<u32>,
+    pub wrap: Option<String>,
+    pub h_anchor: Option<String>,
+    pub v_anchor: Option<String>,
+    pub h_rule: Option<String>,
+    pub h_space: Option<f64>,
+    pub v_space: Option<f64>,
+    pub w: Option<f64>,
+    pub h: Option<f64>,
+    pub x: Option<f64>,
+    pub y: Option<f64>,
+    pub x_align: Option<String>,
+    pub y_align: Option<String>,
+}
+
+impl FramePrFacts {
+    /// Layer `src` (a later style-hierarchy level) over `self`.
+    pub(crate) fn layer(&mut self, src: &FramePrFacts) {
+        macro_rules! take {
+            ($($field:ident),*) => {
+                $(if src.$field.is_some() { self.$field = src.$field.clone(); })*
+            };
+        }
+        take!(
+            anchor_lock,
+            drop_cap,
+            lines,
+            wrap,
+            h_anchor,
+            v_anchor,
+            h_rule,
+            h_space,
+            v_space,
+            w,
+            h,
+            x,
+            y,
+            x_align,
+            y_align
+        );
+    }
+
+    /// The effective frame after the cascade, with defaults applied.
+    pub fn resolve(&self) -> crate::types::FramePr {
+        // [MS-OI29500] 2.1.43 d: Word treats h="0" as automatic height.
+        let h = self.h.filter(|value| *value != 0.0);
+        crate::types::FramePr {
+            // CT_FramePr identity includes anchorLock. Retain it on the private
+            // wire without widening the stable public FramePr projection.
+            anchor_lock: self.anchor_lock.unwrap_or(false),
+            // ST_DropCap default "none" (§17.18.20).
+            drop_cap: self.drop_cap.clone().unwrap_or_else(|| "none".to_string()),
+            // §17.3.1.11 lines default 1.
+            lines: self.lines.unwrap_or(1),
+            // ST_Wrap default "around" (§17.3.1.11 / §17.18.104).
+            wrap: self.wrap.clone().unwrap_or_else(|| "around".to_string()),
+            // [MS-OI29500] 2.1.43 e/g: Word's hAnchor/vAnchor default is
+            // "text" (ECMA-376 states "page").
+            h_anchor: self.h_anchor.clone().unwrap_or_else(|| "text".to_string()),
+            v_anchor: self.v_anchor.clone().unwrap_or_else(|| "text".to_string()),
+            // [MS-OI29500] 2.1.43 d/f: atLeast when a nonzero h is present,
+            // otherwise auto; an explicit rule with h="0" sizes automatically.
+            h_rule: match h {
+                None => "auto".to_string(),
+                Some(_) => self.h_rule.clone().unwrap_or_else(|| "atLeast".to_string()),
+            },
+            // hSpace / vSpace default 0 (§17.3.1.11).
+            h_space: self.h_space.unwrap_or(0.0),
+            v_space: self.v_space.unwrap_or(0.0),
+            // w/h/x/y are kept Option so the renderer can tell "auto" (absent)
+            // from an explicit 0; §17.3.1.11 assumes 0 when consumed.
+            w: self.w,
+            h,
+            x: self.x,
+            y: self.y,
+            // ST_XAlign / ST_YAlign — supersede x/y when present (§17.3.1.11).
+            x_align: self.x_align.clone(),
+            y_align: self.y_align.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1187,8 +1289,8 @@ pub(crate) fn apply_para(dst: &mut ParaFmt, src: &ParaFmt) {
         // omitted ... its value is determined by the setting previously set at any
         // level of the style hierarchy". So merge edge-by-edge over the inherited
         // box rather than replacing it wholesale: a level that names only
-        // `<w:bottom>` keeps the inherited top/left/right/between. (Contrast
-        // `frame_pr` below, §17.3.1.11 — one grouped element, replaced wholesale.)
+        // `<w:bottom>` keeps the inherited top/left/right/between. (`frame_pr`
+        // below, §17.3.1.11, layers attribute by attribute in the same way.)
         // An EXPLICIT `<w:bottom w:val="nil"/>` is a present "cleared" edge (style
         // "none", emitted by parse_edge — distinct from an OMITTED edge which is
         // `None` and inherits), so it overrides here and removes the inherited edge.
@@ -1240,11 +1342,13 @@ pub(crate) fn apply_para(dst: &mut ParaFmt, src: &ParaFmt) {
     if src.snap_to_grid.is_some() {
         dst.snap_to_grid = src.snap_to_grid;
     }
-    // §17.3.1.11: framePr is a single grouped element — a later level that
-    // specifies it replaces the whole frame definition (Word does not merge
-    // individual frame attributes across the style chain).
-    if src.frame_pr.is_some() {
-        dst.frame_pr = src.frame_pr.clone();
+    // §17.3.1.11 framePr: each attribute inherits independently (see
+    // FramePrFacts); a level naming only `wrap` keeps the inherited anchors,
+    // width and alignment.
+    if let Some(src_frame) = &src.frame_pr {
+        dst.frame_pr
+            .get_or_insert_with(Default::default)
+            .layer(src_frame);
     }
 }
 
@@ -1743,38 +1847,24 @@ pub fn parse_para_fmt(ppr: roxmltree::Node) -> ParaFmt {
     }
 
     // Text frame / drop cap (ECMA-376 §17.3.1.11 w:framePr). Presence makes the
-    // paragraph part of a text frame; all attributes are optional with the
-    // spec-defined defaults applied here so the renderer never re-derives them.
+    // paragraph part of a text frame. Only the authored attributes are kept;
+    // FramePrFacts::resolve applies the defaults after the style cascade.
     if let Some(fp) = child_w(ppr, "framePr") {
-        use crate::types::FramePr;
         let twips = |name: &str| attr_w(fp, name).map(|s| twips_to_pt(&s));
-        fmt.frame_pr = Some(Box::new(FramePr {
-            // CT_FramePr identity includes anchorLock. Retain it on the private
-            // wire without widening the stable public FramePr projection.
-            anchor_lock: on_off_attr(fp, "anchorLock").unwrap_or(false),
-            // ST_DropCap default "none" (§17.18.20).
-            drop_cap: attr_w(fp, "dropCap").unwrap_or_else(|| "none".to_string()),
-            // §17.3.1.11 lines default 1.
-            lines: attr_w(fp, "lines")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(1),
-            // ST_Wrap default "around" (§17.3.1.11 / §17.18.104).
-            wrap: attr_w(fp, "wrap").unwrap_or_else(|| "around".to_string()),
-            // ST_HAnchor / ST_VAnchor default "page" (§17.3.1.11).
-            h_anchor: attr_w(fp, "hAnchor").unwrap_or_else(|| "page".to_string()),
-            v_anchor: attr_w(fp, "vAnchor").unwrap_or_else(|| "page".to_string()),
-            // ST_HeightRule default "auto" (§17.18.37).
-            h_rule: attr_w(fp, "hRule").unwrap_or_else(|| "auto".to_string()),
-            // hSpace / vSpace default 0 (§17.3.1.11).
-            h_space: twips("hSpace").unwrap_or(0.0),
-            v_space: twips("vSpace").unwrap_or(0.0),
-            // w/h/x/y are kept Option so the renderer can tell "auto" (absent)
-            // from an explicit 0; §17.3.1.11 assumes 0 when consumed.
+        fmt.frame_pr = Some(Box::new(FramePrFacts {
+            anchor_lock: on_off_attr(fp, "anchorLock"),
+            drop_cap: attr_w(fp, "dropCap"),
+            lines: attr_w(fp, "lines").and_then(|v| v.parse().ok()),
+            wrap: attr_w(fp, "wrap"),
+            h_anchor: attr_w(fp, "hAnchor"),
+            v_anchor: attr_w(fp, "vAnchor"),
+            h_rule: attr_w(fp, "hRule"),
+            h_space: twips("hSpace"),
+            v_space: twips("vSpace"),
             w: twips("w"),
             h: twips("h"),
             x: twips("x"),
             y: twips("y"),
-            // ST_XAlign / ST_YAlign — supersede x/y when present (§17.3.1.11).
             x_align: attr_w(fp, "xAlign"),
             y_align: attr_w(fp, "yAlign"),
         }));
@@ -3012,7 +3102,8 @@ mod tests {
         // layout acquisition under an explicitly private wire name.
         let locked = para_fmt_from(r#"<w:framePr w:anchorLock="on"/>"#)
             .frame_pr
-            .expect("framePr parses");
+            .expect("framePr parses")
+            .resolve();
         assert!(locked.anchor_lock);
         let locked_wire = serde_json::to_value(&locked).expect("framePr serializes");
         assert_eq!(locked_wire["__anchorLock"], serde_json::json!(true));
@@ -3020,10 +3111,52 @@ mod tests {
 
         let unlocked = para_fmt_from(r#"<w:framePr/>"#)
             .frame_pr
-            .expect("framePr parses");
+            .expect("framePr parses")
+            .resolve();
         assert!(!unlocked.anchor_lock);
         let unlocked_wire = serde_json::to_value(&unlocked).expect("framePr serializes");
         assert!(unlocked_wire.get("__anchorLock").is_none());
+    }
+
+    #[test]
+    fn frame_pr_attributes_inherit_independently_with_word_defaults() {
+        // A direct framePr naming only `wrap` keeps the style's width,
+        // alignment and anchors (Word lays such a paragraph out in the
+        // styled frame), and the defaults apply only after the cascade.
+        let mut cascade = para_fmt_from(
+            r#"<w:framePr w:w="9360" w:vSpace="187" w:wrap="around" w:vAnchor="text" w:hAnchor="page" w:xAlign="center" w:y="1" w:anchorLock="1"/>"#,
+        );
+        apply_para(
+            &mut cascade,
+            &para_fmt_from(r#"<w:framePr w:wrap="notBeside"/>"#),
+        );
+        let frame = cascade.frame_pr.expect("framePr inherits").resolve();
+        assert_eq!(frame.wrap, "notBeside");
+        assert_eq!(frame.w, Some(468.0));
+        assert_eq!(frame.x_align.as_deref(), Some("center"));
+        assert_eq!(
+            (frame.h_anchor.as_str(), frame.v_anchor.as_str()),
+            ("page", "text")
+        );
+        assert_eq!((frame.y, frame.v_space), (Some(0.05), 9.35));
+        assert!(frame.anchor_lock);
+
+        // [MS-OI29500] 2.1.43 d-g: Word's anchors default to text, h="0" is
+        // automatic, and a nonzero h defaults to atLeast.
+        let bare = para_fmt_from(r#"<w:framePr w:h="0" w:hRule="exact"/>"#)
+            .frame_pr
+            .unwrap()
+            .resolve();
+        assert_eq!(
+            (bare.h_anchor.as_str(), bare.v_anchor.as_str()),
+            ("text", "text")
+        );
+        assert_eq!((bare.h, bare.h_rule.as_str()), (None, "auto"));
+        let sized = para_fmt_from(r#"<w:framePr w:h="720"/>"#)
+            .frame_pr
+            .unwrap()
+            .resolve();
+        assert_eq!((sized.h, sized.h_rule.as_str()), (Some(36.0), "atLeast"));
     }
 
     // Extreme XML depth is rejected before retaining a DOM or entering the

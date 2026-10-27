@@ -1294,6 +1294,17 @@ export interface XlsxChromeColors {
   readonly accent?: string;
 }
 
+/** @internal What the renderer reads from a font-source session
+ *  (`LoadOptions.fonts`) in the painting realm: the substitutions whose served
+ *  face loaded (keyed per lower-cased authored family; a script-scoped one
+ *  paints only runs of its script) and regular full-name aliases
+ *  ('lato regular' → 'Lato'). Absent without sources: font stacks are then
+ *  exactly the offline stacks. */
+export interface XlsxLoadedFontSources {
+  readonly substitutions: ReadonlyMap<string, { readonly family: string; readonly script?: import('@silurus/ooxml-core').FontSubstituteScript }>;
+  readonly regularAliases: ReadonlyMap<string, string>;
+}
+
 /** Internal renderer options. The workbook owns both the byte source and the
  * frame-local decoded image map, so these fields are not part of its public
  * method contract. */
@@ -1303,8 +1314,9 @@ export interface RenderViewportOptions extends XlsxRenderViewportOptions {
   authoritativeMdw?: number;
   /** @internal Exact local resources retained in this canvas's FontFaceSet. */
   officeFontRoutes?: Readonly<Record<string, import('@silurus/ooxml-core').OfficeFontFallbackRoute>>;
-  /** @internal Preserve the caller's explicit Google Fonts substitution opt-in. */
-  googleSubstitutes?: boolean;
+  /** @internal Substitutions and aliases this canvas realm's font-source
+   * session (`LoadOptions.fonts`) loaded. Absent without sources. */
+  fontSources?: XlsxLoadedFontSources;
   /** @internal Viewer chrome only; never applied to authored worksheet content. */
   chromeColors?: XlsxChromeColors;
   loadedImages?: Map<string, CanvasImageSource | null>;

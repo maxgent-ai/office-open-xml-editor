@@ -110,6 +110,9 @@ export interface EmbeddedFontRef {
 }
 
 export interface DocSettings {
+  /** ECMA-376 Part 4 §14.8.3.20: allow reference-free text following a
+   * continuous section break on a page containing earlier footnotes. */
+  footnoteLayoutLikeWW8?: boolean;
   /** @internal ECMA-376 Part 4 §14.8.3.38; the parser already applies this
    *  setting to terminal page breaks, so it is not a renderer model option. */
   splitPgBreakAndParaMark?: boolean;

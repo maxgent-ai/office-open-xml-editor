@@ -1,6 +1,7 @@
 import { classifyCjkFont, type CjkLang, type NativeRouteLineRequest, type OfficeFontFallbackRoute } from '@silurus/ooxml-core';
 import { activeFontSet, isHTMLCanvas, withVertFeatureCanvasScope } from '@silurus/ooxml-core';
 import type { DocxDocumentModel } from './types.js';
+import type { FontSubstitution, LoadedFontSources } from '@silurus/ooxml-core/internal/font-sources';
 import type { LoadedEmbeddedFontRoute } from './embedded-fonts.js';
 import type { ResolvedFontMetric } from './layout/text.js';
 import { snapshotFontMetrics } from './layout/text.js';
@@ -68,11 +69,11 @@ function layoutCjkFallback(source: LayoutSourceStore, requested: CjkLang | undef
 export function nativeRouteLineRequests(
   input: DocxDocumentModel | LayoutSourceStore,
   model: DocxDocumentModel,
-  options: Readonly<{ useGoogleFonts?: boolean; cjkFallback?: CjkLang }> = {},
+  options: Readonly<{ fontSubstitutes?: readonly FontSubstitution[]; cjkFallback?: CjkLang }> = {},
 ): NativeRouteLineRequest[] {
   const source = isLayoutSourceStore(input) ? input : layoutSourceStore(input);
   const text = createProductionTextLayoutService(source, {
-    useGoogleFonts: options.useGoogleFonts,
+    fontSubstitutes: options.fontSubstitutes,
     cjkFallback: layoutCjkFallback(source, options.cjkFallback),
     measureContext: null,
     fontSet: null,
@@ -86,7 +87,7 @@ export function nativeRouteLineRequests(
 export async function prepareMainThreadNativeRouteMetrics(
   input: LayoutSourceStore,
   model: DocxDocumentModel,
-  options: Readonly<{ useGoogleFonts?: boolean; cjkFallback?: CjkLang }> = {},
+  options: Readonly<{ fontSubstitutes?: readonly FontSubstitution[]; cjkFallback?: CjkLang }> = {},
 ): Promise<{ nativeRouteMetrics?: Record<string, NativeRouteLineMetric>; faces: FontFace[] }> {
   const measured = await measureDocxNativeRouteLines(nativeRouteLineRequests(input, model, options), true);
   return measured.faces.length > 0
@@ -99,14 +100,14 @@ export function createLayoutServices(
   options: {
     readonly localMetrics?: Readonly<Record<string, ResolvedFontMetric>>;
     readonly fontMetrics?: Readonly<Record<string, ResolvedFontMetric>>;
-    readonly useGoogleFonts?: boolean;
+    readonly fontSubstitutes?: readonly FontSubstitution[];
     readonly cjkFallback?: CjkLang;
     readonly mathResources?: readonly MathLayoutResource[];
     readonly mathDrawables?: ReadonlyMap<string, CanvasImageSource>;
     readonly measureContext?: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D | null;
     readonly embeddedRoutes?: readonly LoadedEmbeddedFontRoute[];
     readonly officeRoutes?: readonly OfficeFontFallbackRoute[];
-    readonly googleFaces?: readonly FontFace[];
+    readonly sourceFonts?: Readonly<{ names: readonly string[]; loaded: LoadedFontSources }>;
     readonly installedSubstituteFamilies?: readonly string[];
     readonly installedFamilies?: readonly string[];
     readonly allowFootnoteContinuation?: boolean;

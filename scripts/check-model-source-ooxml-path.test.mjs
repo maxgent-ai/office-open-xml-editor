@@ -48,17 +48,23 @@ test('the CLI checks the reviewed await baseline without Git history', () => {
   assert.match(result.stdout, /XLSX render worker keeps construction and parse/);
 });
 
-test('PPTX retains the same opt-in font barrier when its owner becomes a lease', () => {
+test('PPTX keeps the reviewed font-source await behind its positive opt-in gate', () => {
   const file = 'packages/pptx/src/presentation.ts';
-  const previous = ['parse', 'preloadGoogleFonts'];
-  const changed = 'async function load() { await parse(); if (mode === "main" && opts.useGoogleFonts && ready) await pres._ensureGoogleFonts(names); }';
+  const previous = ['parse', 'pres._ensureFontSources'];
+  const changed = 'async function load() { await parse(); if (mode === "main" && opts.fonts && ready) await pres._ensureFontSources(names); }';
   assert.equal(auditAwaitCase(file, 'load', previous, changed), 2);
-  const unguarded = 'async function load() { await parse(); await pres._ensureGoogleFonts(names); }';
-  assert.throws(() => auditAwaitCase(file, 'load', previous, unguarded), /OOXML awaits changed/);
-  const extra = 'async function load() { await parse(); if (opts.useGoogleFonts) { await pres._ensureGoogleFonts(names); await helper(); } }';
+  const unguarded = 'async function load() { await parse(); await pres._ensureFontSources(names); }';
+  assert.throws(() => auditAwaitCase(file, 'load', previous, unguarded), /positive opts.fonts gate/);
+  const extra = 'async function load() { await parse(); if (opts.fonts) { await pres._ensureFontSources(names); await helper(); } }';
   assert.throws(() => auditAwaitCase(file, 'load', previous, extra), /OOXML awaits changed/);
-  const optional = 'async function load() { await parse(); if (mode === "main" || opts.useGoogleFonts) await pres._ensureGoogleFonts(names); }';
-  assert.throws(() => auditAwaitCase(file, 'load', previous, optional), /OOXML awaits changed/);
+  const optional = 'async function load() { await parse(); if (mode === "main" || opts.fonts) await pres._ensureFontSources(names); }';
+  assert.throws(() => auditAwaitCase(file, 'load', previous, optional), /positive opts.fonts gate/);
+  const alternate = 'async function load() { await parse(); if (opts.fonts) {} else await pres._ensureFontSources(names); }';
+  assert.throws(() => auditAwaitCase(file, 'load', previous, alternate), /positive opts.fonts gate/);
+  const moved = 'async function load() { if (opts.fonts) await pres._ensureFontSources(names); await parse(); }';
+  assert.throws(() => auditAwaitCase(file, 'load', previous, moved), /OOXML awaits changed/);
+  const twice = 'async function load() { await parse(); if (opts.fonts) { await pres._ensureFontSources(names); await pres._ensureFontSources(names); } }';
+  assert.throws(() => auditAwaitCase(file, 'load', previous, twice), /OOXML awaits changed/);
 });
 
 test('DOCX requires the reviewed native route barrier after math preparation', () => {

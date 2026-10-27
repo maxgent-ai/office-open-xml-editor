@@ -419,3 +419,83 @@ test('synthetic image codecs, corrected SVG effects and aggregate-large rasters 
     }
   }
 });
+
+/** #1950: a square `asvg:svgBlip` (with a differently coloured PNG fallback)
+ * in boxes whose aspect differs from the SVG's. The host rasterizer covers the
+ * box without distorting the SVG, so the worker must admit that coverage grid
+ * and paint the SVG exactly as main mode does. */
+function aspectMismatchedSvgDocx(heightsIn: readonly number[]): Uint8Array {
+  const emuPerInch = 914_400;
+  const svgBlipExt = '<a:extLst><a:ext uri="{96DAC541-7B7A-43D3-8B79-37D633B846F1}">'
+    + '<asvg:svgBlip xmlns:asvg="http://schemas.microsoft.com/office/drawing/2016/SVG/main" r:embed="rIdSvg"/>'
+    + '</a:ext></a:extLst>';
+  const body = heightsIn.map((heightIn, index) => {
+    const cx = emuPerInch;
+    const cy = Math.round(heightIn * emuPerInch);
+    return `<w:p><w:r><w:drawing><wp:inline distT="0" distB="0" distL="0" distR="0">
+      <wp:extent cx="${cx}" cy="${cy}"/><wp:docPr id="${index + 1}" name="svg-${index}"/>
+      <a:graphic><a:graphicData uri="${PICTURE_NS}"><pic:pic>
+        <pic:nvPicPr><pic:cNvPr id="${index + 1}" name="svg-${index}"/><pic:cNvPicPr/></pic:nvPicPr>
+        <pic:blipFill><a:blip r:embed="rIdPng">${svgBlipExt}</a:blip>
+          <a:stretch><a:fillRect/></a:stretch></pic:blipFill>
+        <pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="${cx}" cy="${cy}"/></a:xfrm>
+          <a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr>
+      </pic:pic></a:graphicData></a:graphic>
+    </wp:inline></w:drawing></w:r></w:p>${index === heightsIn.length - 1
+      ? ''
+      : '<w:p><w:r><w:br w:type="page"/></w:r></w:p>'}`;
+  }).join('');
+  return storeZip(new Map<string, Uint8Array>([
+    ['[Content_Types].xml', xml(`<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+      <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+      <Default Extension="xml" ContentType="application/xml"/>
+      <Default Extension="png" ContentType="image/png"/>
+      <Default Extension="svg" ContentType="image/svg+xml"/>
+      <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+    </Types>`)],
+    ['_rels/.rels', xml(`<Relationships xmlns="${PACKAGE_REL_NS}">
+      <Relationship Id="rId1" Type="${OFFICE_REL_NS}/officeDocument" Target="word/document.xml"/>
+    </Relationships>`)],
+    ['word/_rels/document.xml.rels', xml(`<Relationships xmlns="${PACKAGE_REL_NS}">
+      <Relationship Id="rIdPng" Type="${REL_IMAGE}" Target="media/fallback.png"/>
+      <Relationship Id="rIdSvg" Type="${REL_IMAGE}" Target="media/square.svg"/>
+    </Relationships>`)],
+    ['word/document.xml', xml(`<w:document xmlns:w="${WORD_NS}" xmlns:r="${OFFICE_REL_NS}"
+        xmlns:wp="${WORD_DRAWING_NS}" xmlns:a="${DRAWING_NS}" xmlns:pic="${PICTURE_NS}">
+      <w:body>${body}<w:sectPr><w:pgSz w:w="12240" w:h="15840"/>
+        <w:pgMar w:top="720" w:right="720" w:bottom="720" w:left="720"
+          w:header="0" w:footer="0" w:gutter="0"/></w:sectPr></w:body>
+    </w:document>`)],
+    ['word/media/fallback.png', indexedPng(96, 96, [200, 40, 40])],
+    ['word/media/square.svg', encoder.encode(
+      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96">'
+      + '<rect width="96" height="96" fill="#0078d7"/></svg>',
+    )],
+  ]));
+}
+
+test('aspect-mismatched SVG pictures render the SVG in both main and worker modes (#1950)', async ({ page }) => {
+  test.setTimeout(120_000);
+  const heightsIn = [0.9, 0.98, 0.99, 1] as const;
+  const docx = aspectMismatchedSvgDocx(heightsIn);
+  await page.goto('/tests/visual/image-decode-scroll-fixture.html');
+  await page.waitForFunction(() => document.body.dataset.status === 'ready');
+  const report = await page.evaluate(async ({ base64, expectations }) =>
+    (window as unknown as {
+      runSyntheticImageAcceptance: (
+        encodedDocx: string,
+        expected: readonly { id: string; rgba: Rgba }[],
+      ) => Promise<BrowserAcceptanceReport>;
+    }).runSyntheticImageAcceptance(base64, expectations), {
+    base64: Buffer.from(docx).toString('base64'),
+    // The SVG colour, not the PNG fallback's.
+    expectations: heightsIn.map((heightIn) => ({
+      id: `svg-1.00x${heightIn.toFixed(2)}in`, rgba: [0, 120, 215, 255] as Rgba,
+    })),
+  });
+  for (const mode of [report.main, report.worker]) {
+    expect(mode.errors).toEqual([]);
+    expect(mode.pageCount).toBe(heightsIn.length);
+    for (const rendered of mode.pages) expect(rendered.maxChannelDelta).toBeLessThanOrEqual(8);
+  }
+});

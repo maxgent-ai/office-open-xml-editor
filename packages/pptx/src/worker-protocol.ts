@@ -63,7 +63,9 @@ export type PptxWorkerRequest =
        *  region, and dropping it silently preloads the `jp` default while the
        *  renderer paints the resolved one. */
       cjkFallback: import('@silurus/ooxml-core').CjkLang;
-      /** Internal opt-in only; omission preserves ordinary parse payloads. */
+      /** Font sources are configured: the parse worker's preflight also
+       * collects the font-source demand facts and scalars. Internal opt-in
+       * only; omission preserves ordinary parse payloads. */
       collectFontDemand?: boolean;
       progressiveLayout?: boolean;
     }
@@ -106,7 +108,12 @@ export type RenderWorkerRequest =
       sourceTransfer?: readonly Transferable[];
       sourceOwnerUrl?: string;
       resourcePolicy: NormalizedOoxmlResourcePolicy;
-      useGoogleFonts?: boolean;
+      /** Validated `LoadOptions.fonts` descriptors (plain, structured-clone
+       * safe data; `fontFiles` bytes are copied, never transferred). The worker
+       * re-validates them and runs the same font-source demand and session as
+       * main mode against its own FontFaceSet. Never the deprecated
+       * `useGoogleFonts`. */
+      fonts?: readonly import('@silurus/ooxml-core/internal/font-sources').FontSource[];
       cjkFallback?: import('@silurus/ooxml-core').CjkLang;
       renderers?: WorkerRendererDescriptors;
       progressiveLayout?: boolean;

@@ -114,6 +114,8 @@ export {
   type OoxmlResourceName,
   type OoxmlResourceLimitErrorDetails,
   type OoxmlUnsupportedContentDetails,
+  type OoxmlFontSourceQuota,
+  type OoxmlFontSourceViolation,
   type OoxmlResourceUsageSnapshot,
   type OoxmlResourceViolation,
 } from './errors/ooxml-error';
@@ -157,12 +159,7 @@ export {
   type AgileEncryptionDescriptor,
 } from './crypto';
 export { readCfbStream } from './errors/cfb-read';
-export {
-  preloadGoogleFonts, GoogleFontPreloadLease, type FontPreloadDemand,
-  unloadGoogleFonts,
-  activeFontSet,
-  type FontPreloadEntry,
-} from './fonts/preload';
+export { activeFontSet, type FontPreloadDemand } from './fonts/font-registry';
 // Embedded-font registration: docx `.odttf` (§17.8.1 obfuscated) + pptx
 // `.fntdata` (raw sfnt) faces turned into FontFace objects in the active set.
 export {
@@ -172,11 +169,6 @@ export {
   embeddedFontBytesAreWithinLimit,
   type EmbeddedFontFace,
 } from './fonts/embedded';
-// Shared Office-font → Google-Fonts substitute registry (Calibri → Carlito,
-// Cambria → Caladea, popular web fonts, Arabic Noto fallbacks). Each package
-// spreads this into its own map; script-fallback Noto faces live in
-// SCRIPT_GOOGLE_FONTS below.
-export { GOOGLE_FONT_SUBSTITUTES, loadedGoogleRegularAliases } from './fonts/google-fonts';
 export {
   fontSubstituteScriptClusterClass,
   fontSubstituteScriptCoversText,
@@ -209,14 +201,10 @@ export {
   classifyCjkFont,
   cjkFallbackForText,
   classifyFontGeneric,
-  GOOGLE_CJK_FONT_ALIASES,
-  googleCjkFontAlias,
   isComplexScriptCodePoint,
   cjkFallbackChain,
   NON_CJK_SANS_FALLBACKS,
   NON_CJK_SERIF_FALLBACKS,
-  SCRIPT_GOOGLE_FONTS,
-  SCRIPT_PRELOAD_NAMES,
   scriptPreloadNamesForText,
   type CjkLang,
   type FontGenericClass,
@@ -231,7 +219,7 @@ export {
   type SymbolTextSegment,
 } from './fonts/symbol-font';
 export { renderChart, collectChartFillRenderedSizes, assertChartFillRenderedSizeCount } from './chart/renderer';
-export { formatLocalizedExcelShortDate } from './chart/chart-number-format';
+export { formatLocalizedExcelShortDate, localizedExcelShortDateTexts } from './chart/chart-number-format';
 export { autoResize, type AutoResizeOptions } from './autoResize';
 export {
   buildCustomPath,
@@ -704,6 +692,7 @@ export { inkCenterAboveMiddlePx } from './text/vertical-glyph-metrics';
 // Used by the xlsx cell formatter and the core chart date formatter.
 export { excelSerialToUtcDate, utcDateToExcelSerial, isExcelDisplayDateSerial } from './excel-date';
 export {
+  excelDateTimeSectionNameTexts,
   formatExcelDateTime,
   isDateFormatSection,
   splitFormatSections,

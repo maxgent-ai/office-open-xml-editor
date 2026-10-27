@@ -42,9 +42,9 @@ vi.mock('@silurus/ooxml-core/internal/model-source', async importOriginal => ({
 vi.mock('./wasm/docx_parser.js', () => ({
   default: workerMocks.parserInit, reinit: vi.fn(), DocxArchive: class {},
 }));
-vi.mock('./google-fonts.js', async importOriginal => ({
-  ...await importOriginal<typeof import('./google-fonts.js')>(),
-  DOCX_GOOGLE_FONTS: {}, docxFontPreloadNames: () => [], docxOfficeFontFallbackRequests: () => [],
+vi.mock('./font-plan.js', async importOriginal => ({
+  ...await importOriginal<typeof import('./font-plan.js')>(),
+  docxOfficeFontFallbackRequests: () => [],
 }));
 vi.mock('./embedded-fonts.js', () => ({
   loadEmbeddedFonts: async () => ({ faces: [], metrics: {}, routes: [] }),
@@ -255,6 +255,6 @@ function parseRequest(id: number) {
   return {
     type: 'parse' as const, id, data: new ArrayBuffer(1), source: descriptor,
     sourceOwnerUrl: './internal/worker-document-source.js',
-    resourcePolicy: {}, useGoogleFonts: false, defaultCurrentDateMs: 0,
+    resourcePolicy: {}, defaultCurrentDateMs: 0,
   };
 }

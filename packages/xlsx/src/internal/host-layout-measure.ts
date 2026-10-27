@@ -14,7 +14,7 @@ export function measureHostLayoutFont(
     font.family,
     font.sizePt,
     undefined,
-    false,
+    undefined,
     font.bold ? 700 : 400,
     font.italic ? 'italic' : 'normal',
     context,

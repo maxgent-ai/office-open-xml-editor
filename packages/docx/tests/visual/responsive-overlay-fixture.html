@@ -30,7 +30,7 @@
        scrollbar onto the #stage scroll area. -->
   <div id="stage"></div>
   <script type="module">
-    import { DocxViewer } from '/src/index.ts';
+    import { DocxViewer, googleFonts } from '/src/index.ts';
 
     const params = new URLSearchParams(location.search);
     const name = params.get('docx') ?? 'demo/sample-1';
@@ -51,7 +51,7 @@
         width: 794,
         enableTextSelection: true,
         enableElementSelection: true,
-        useGoogleFonts: true,
+        fonts: [googleFonts()],
       });
       await viewer.load(buf);
       await viewer.findText(query);

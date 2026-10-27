@@ -1,5 +1,6 @@
 import { decodeSvgBlobOnMainThread } from '@silurus/ooxml-core/worker';
 import type { CjkLang } from '@silurus/ooxml-core';
+import { chartFontSubstitutions, withChartFontSubstitutions } from '@silurus/ooxml-core/internal/chart-font-sources';
 import {
   defaultDpr,
   isHTMLCanvas,
@@ -459,6 +460,8 @@ export async function prefetchImages(
     threeD?: ChartThreeDRenderer;
     regionMap?: ChartRegionMapRenderer;
     chartEx?: ChartExRenderer;
+    /** The canvas realm's loaded font sources (chart text substitutions). */
+    fontSources?: import('./types.js').XlsxLoadedFontSources;
   },
 ): Promise<void> {
   // This map is only the synchronous lookup for the current frame. Never keep
@@ -679,7 +682,8 @@ export async function prefetchImages(
     const scale = opts?.cellScale ?? 1;
     for (const descriptor of chartDescriptors) {
       for (const { fill, occurrence } of collectChartFillRenderedSizes(
-        descriptor.chart.chart,
+        // The same substituted model the paint pass draws (renderCharts).
+        withChartFontSubstitutions(descriptor.chart.chart, chartFontSubstitutions(opts?.fontSources?.substitutions)),
         { x: 0, y: 0, w: descriptor.displayWidth / scale, h: descriptor.displayHeight / scale },
         PT_TO_PX, 0, opts?.threeD, opts?.regionMap, opts?.chartEx, resolved,
       )) {
@@ -961,7 +965,7 @@ async function renderWorksheetViewportLeased(
   const styles = deps.styles;
   const measurementCtx = target.getContext('2d') as CanvasRenderingContext2D | null;
   if (!measurementCtx) throw new Error('XLSX render target does not provide a 2-D canvas context');
-  bindXlsxOfficeFontRoutes(measurementCtx, deps.ws, opts.officeFontRoutes, opts.googleSubstitutes === true);
+  bindXlsxOfficeFontRoutes(measurementCtx, deps.ws, opts.officeFontRoutes, opts.fontSources);
   pinXlsxGridGeometry(deps.ws, opts.authoritativeMdw);
   const ws = deps.ws.isDialogSheet
     ? deps.ws
@@ -1005,6 +1009,7 @@ async function renderWorksheetViewportLeased(
       threeD: deps.threeD,
       regionMap: deps.regionMap,
       chartEx: deps.chartEx,
+      fontSources: opts.fontSources,
     });
   }
 

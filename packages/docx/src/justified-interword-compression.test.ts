@@ -391,7 +391,6 @@ describe('WORD_JUSTIFIED_INTERWORD_COMPRESSION', () => {
     ['kashida', paragraph(CONTROL, 'lowKashida'), {}, {}],
     ['RTL', withRuns([textRun(CONTROL)], { bidi: true }), {}, {}],
     ['left', paragraph(CONTROL, 'left'), {}, {}],
-    ['Word6', paragraph(CONTROL, 'both'), {}, { lineWrapLikeWord6: true }],
   ] as const)('preserves the previous partition for %s', async (_name, element, section, settings) => {
     for (const width of [233.3, 237.3]) {
       const partition = (lines: DocxTextRunInfo[][]) => lines.map(line => words(line));
@@ -399,6 +398,17 @@ describe('WORD_JUSTIFIED_INTERWORD_COMPRESSION', () => {
       const current = await renderLines(element, width, { compatibilityMode: 15, ...settings }, section as Partial<SectionProps>);
       expect(partition(current)).toEqual(partition(previous));
     }
+  });
+
+  // Windows Word exports identical compressed justified lines with and
+  // without lineWrapLikeWord6 in mode 15.
+  it('compresses justified mode-15 lines regardless of lineWrapLikeWord6', async () => {
+    const [first] = await renderLines(paragraph(CONTROL, 'both'), 233.3,
+      { compatibilityMode: 15, lineWrapLikeWord6: true });
+    expect(words(first).at(-1)).toBe('valley');
+    const last = first.at(-1)!;
+    const bareAdvance = GEORGIA_SUM(last.text.trimEnd()) * 11 / 2048;
+    expect(last.x + bareAdvance).toBeCloseTo(233.3, 3);
   });
 
   it('keeps natural-width fitting outside compatibility mode 15', async () => {

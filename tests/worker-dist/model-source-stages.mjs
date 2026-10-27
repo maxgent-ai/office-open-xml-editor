@@ -78,7 +78,6 @@ export async function runModelSourceStages({
     document.body.append(canvas);
     const viewer = new DocxViewer(canvas, {
       legacyDoc: fakeSource('docx', { showTrackedChanges: true, minimal: true }),
-      useGoogleFonts: false,
       ...(choice === 'setter' ? {} : { showTrackedChanges: choice === 'markup' }),
     });
     try {
@@ -126,16 +125,14 @@ export async function runModelSourceStages({
     assert(explicit.image === final.image, `${mode}: explicit showTrackedChanges:false was not honoured`);
 
     document.body.dataset.stage = `model-source-xlsx-${mode}`;
-    const plain = await xlsxView(XlsxWorkbook, bordered, { mode, useGoogleFonts: false });
+    const plain = await xlsxView(XlsxWorkbook, bordered, { mode });
     const noRequest = await xlsxView(XlsxWorkbook, bordered, {
       mode,
-      useGoogleFonts: false,
       legacyXls: fakeSource('xlsx', { layoutFamily: '' }),
     });
     assert(noRequest === plain, `${mode}: a null host layout request must not change geometry`);
     const wide = await xlsxView(XlsxWorkbook, bordered, {
       mode,
-      useGoogleFonts: false,
       legacyXls: fakeSource('xlsx', { layoutFamily: 'Arial', layoutSizePt: 36, minimal: true }),
     });
     assert(wide !== plain, `${mode}: the host-measured Normal font must size the grid`);

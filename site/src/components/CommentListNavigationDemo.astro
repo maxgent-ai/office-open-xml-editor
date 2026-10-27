@@ -41,7 +41,7 @@ const demoId = 'comment-list-navigation';
 </div>
 
 <script>
-  import { DocxDocument, DocxScrollViewer, type DocComment } from '@silurus/ooxml-docx';
+  import { DocxDocument, DocxScrollViewer, googleFonts, type DocComment } from '@silurus/ooxml-docx';
   import { PptxPresentation, PptxScrollViewer, type PptxComment } from '@silurus/ooxml-pptx';
   import { XlsxViewer, type XlsxComment } from '@silurus/ooxml-xlsx';
 
@@ -241,7 +241,7 @@ const demoId = 'comment-list-navigation';
       try {
         let threads: ListThread[] = [];
         if (format === 'docx') {
-          const doc = await DocxDocument.load(sampleUrl(format), { useGoogleFonts: true });
+          const doc = await DocxDocument.load(sampleUrl(format), { fonts: [googleFonts()] });
           if (request !== generation || disposed) {
             doc.destroy();
             return;
@@ -254,7 +254,7 @@ const demoId = 'comment-list-navigation';
           viewer = next;
           threads = docxThreads(doc.comments, next);
         } else if (format === 'pptx') {
-          const presentation = await PptxPresentation.load(sampleUrl(format), { useGoogleFonts: true });
+          const presentation = await PptxPresentation.load(sampleUrl(format), { fonts: [googleFonts()] });
           if (request !== generation || disposed) {
             presentation.destroy();
             return;

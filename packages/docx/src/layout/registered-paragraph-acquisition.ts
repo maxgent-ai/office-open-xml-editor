@@ -24,6 +24,7 @@ export function acquireRegisteredParagraph(
   input: Parameters<typeof acquireParagraphResult>[0],
   options: ParagraphAcquisitionOptions,
   inherited?: InheritedParagraphAuthority,
+  continuation?: Parameters<typeof acquireParagraphResult>[2],
 ): ReturnType<typeof acquireParagraphResult> {
   const registry = accessParagraphWrapRegistry(owner, options.flowDomainId);
   const acquired = acquireParagraphResult(input, {
@@ -38,7 +39,7 @@ export function acquireRegisteredParagraph(
       ...registry.collisions,
       ...(inherited?.collisions ?? []),
     ]),
-  });
+  }, continuation);
   commitOwnedParagraphWrapRegistry(owner, registry, acquired.layout);
   return acquired;
 }

@@ -5,7 +5,7 @@ import type {
   ParagraphFragmentCursor,
 } from './paragraph-pagination.js';
 import type { TableFragmentCursor } from './table-pagination.js';
-import type { BodyAdjacentTableGroupInput } from './body-layout-input.js';
+import type { BodyAdjacentTableGroupInput, BodyParagraphSourceInput } from './body-layout-input.js';
 import type {
   BodyFlowRegistryDeltaPt,
   BodyFlowRegistrySnapshotPt,
@@ -20,6 +20,11 @@ import type {
   NoteLayout,
   TableLayout,
 } from './types.js';
+
+/** A note can occur in multiple column bands of one physical page. */
+export function noteBandKey(bandId: string, noteId: string): string {
+  return JSON.stringify([bandId, noteId]);
+}
 
 export class NoteCapacityExceededError extends Error {
   readonly code = 'NOTE_CAPACITY_EXCEEDED' as const;
@@ -52,7 +57,7 @@ export interface BodyLayoutSessionInput {
 }
 
 export interface BodyParagraphAcquisitionInput {
-  readonly input: Readonly<{ kind: 'paragraph'; source: SourceRef }>;
+  readonly input: Pick<BodyParagraphSourceInput, 'kind' | 'source' | 'textFrameMember'>;
   readonly location: BodyAcquisitionLocation;
   readonly availableInlineExtentPt: number;
   readonly suppressSpaceBefore: boolean;
@@ -123,7 +128,24 @@ export interface AcquiredParagraphBlock {
   /** §17.3.1.11 admits identical adjacent framePr members with their owner. */
   readonly retainedFootnoteReferenceIds?: readonly string[];
   readonly relocationBlockExtentPt?: number;
+  /** Owner of a text-anchored frame group: the facts the paginator needs to
+   * carry the frame to its page start (WORD_TEXT_FRAME_PRECEDING_TEXT_PUSH). */
+  readonly frameCarry?: FrameCarryObservation;
 }
+
+/** One text-anchored frame group as placed in a pass. */
+export type FrameCarryObservation = Readonly<{
+  /** Frame group identity, stable across passes. */
+  key: string;
+  /** The run of consecutive framed paragraphs the group belongs to. */
+  runKey: string;
+  paragraphSource: SourceRef;
+  /** Placed at a carried first-placement position in this pass. */
+  frozen: boolean;
+  bounds: Readonly<{ xPt: number; yPt: number; widthPt: number; heightPt: number }>;
+  exclusionBounds: Readonly<{ xPt: number; yPt: number; widthPt: number; heightPt: number }>;
+  exclusionMode: 'square' | 'topAndBottom';
+}>;
 
 export interface AcquiredTableBlock {
   readonly layout: TableLayout;
@@ -148,7 +170,14 @@ export interface AcquiredTableBlock {
   }>;
 }
 
+/** Immutable source cut, independent of a prior column's shaped line index. */
+export interface NoteSourceContinuation {
+  readonly blockIndex: number;
+  readonly paragraph: ParagraphFragmentCursor;
+}
+
 export interface StoryLayoutAcquisitionInput {
+  readonly sourceStart?: NoteSourceContinuation;
   /** Section occurrence selecting this header/footer. Direct root acquisition
    * defaults to source ownership; production page composers supply the section. */
   readonly pageStoryOwner?: string;
@@ -180,6 +209,11 @@ export interface StoryLayoutAcquisitionInput {
 }
 
 export interface NoteLayoutAcquisitionInput {
+  /** Page-wide area only: the first column's measured separator advance,
+   * retained as a blank top band in another column. No separator is acquired
+   * or painted there; its text width must not change the shared top edge. */
+  readonly blankLeadingAdvancePt?: number;
+  readonly sourceStart?: NoteSourceContinuation;
   readonly kind: 'footnote' | 'endnote';
   readonly referenceIds: readonly string[];
   readonly pageIndex: number;
@@ -200,7 +234,7 @@ export interface NoteLayoutAcquisitionInput {
   readonly bandTranslationPt?: Readonly<{ xPt: number; yPt: number }>;
   /**
    * Footnotes: the page-final flow top a previous pass composed for a note
-   * whose story is band dependent (header-footer-reserve.ts
+   * whose story is band dependent, keyed by noteBandKey (header-footer-reserve.ts
    * `footnoteTopsPt`; for a continued tail, moved by its source cut). That
    * note's story is laid out with the band that moves its flow top there,
    * the translation composition then applies to its retained content.
@@ -264,6 +298,14 @@ export interface PageAnchorPrescanInput {
         occurrenceId: string;
         paragraphSource: SourceRef;
         carry: CarriedHostAnchor;
+      }>
+    | Readonly<{
+        /** WORD_TEXT_FRAME_PRECEDING_TEXT_PUSH: a text-anchored frame carried
+         * from a previous pass with its first-placement geometry. */
+        kind: 'frame';
+        occurrenceId: string;
+        paragraphSource: SourceRef;
+        carry: FrameCarryObservation;
       }>
   )[];
   readonly location: BodyAcquisitionLocation;

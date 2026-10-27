@@ -177,3 +177,36 @@ export function layoutLines(
     widthPolicy, verticalGlyphMeasurement, overflowPunct, justifiedCompression, passContext,
   });
 }
+
+/**
+ * Scalars layout itself paints or measures that the document text need not
+ * spell, for font-source subset demand (`font-source-load.ts`). Every
+ * document's demand includes them, so a `unicode-range` subset holding any of
+ * them loads whenever its family is claimed. Keep this next to the emitters:
+ *
+ * - ASCII U+0020–U+007E: PAGE / NUMPAGES results and automatic note numbers in
+ *   the ASCII number formats (`resolveFieldText`, `formatNoteNumber`; other
+ *   formats make demand `'all'`), DATE / TIME picture items (digits, English
+ *   month and weekday names, AM/PM; `formatDateTimePicture`), tab leaders
+ *   `.` `-` `_` (layout/paragraph.ts), optional and automatic hyphens `-`
+ *   (segment-builder.ts), the `x` metric probe, the underline probe `_` and
+ *   baseline probe `M` (paragraph.ts), and the shared Canvas sentinels;
+ * - U+00B7 MIDDLE DOT: the `middleDot` tab leader (layout/paragraph.ts);
+ * - U+3042 HIRAGANA LETTER A: the East Asian paragraph-mark probe
+ *   (line-breaker/line-metrics.ts, segment-builder.ts);
+ * - U+4E00 CJK UNIFIED IDEOGRAPH-4E00: the ideographic-cell probe of
+ *   character-grid and full-width punctuation metrics (segment-builder.ts).
+ *
+ * `font-demand-coverage.test.ts` asserts that finite demand covers every
+ * scalar layout measures or paints over a representative corpus.
+ *
+ * Emphasis-mark glyphs (§17.3.2.12) are demanded per run that carries one
+ * (layout/paragraph.ts `emphasisGlyph`), not here, so a document without them never
+ * loads the subsets holding them.
+ */
+export const LAYOUT_SYNTHESIZED_SCALARS: readonly number[] = Object.freeze([
+  ...Array.from({ length: 0x7e - 0x20 + 1 }, (_, index) => 0x20 + index),
+  0x00b7,
+  0x3042,
+  0x4e00,
+]);

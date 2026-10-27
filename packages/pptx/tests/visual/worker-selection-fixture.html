@@ -15,7 +15,7 @@
   <div id="main-host"></div>
   <div id="worker-host"></div>
   <script type="module">
-    import { PptxViewer } from '/src/index.ts';
+    import { PptxViewer, googleFonts } from '/src/index.ts';
 
     const params = new URLSearchParams(location.search);
     const name = params.get('pptx') ?? 'demo/sample-1';
@@ -103,7 +103,7 @@
         width,
         enableTextSelection: true,
         enableElementSelection: true,
-        useGoogleFonts: true,
+        fonts: [googleFonts()],
       });
       await viewer.load(buf);
       // findText scans every slide; findNext navigates to the first match's

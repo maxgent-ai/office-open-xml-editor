@@ -1,12 +1,19 @@
 import { describe, expect, it } from 'vitest';
 import { paragraphInputRuns } from './renderer.js';
 import type { Paragraph } from './types.js';
+import { OFFICE_FONT_SUBSTITUTIONS, fontFamilyKey } from '@silurus/ooxml-core/internal/font-sources';
+
+/** Every Office substitution as if its served face had loaded (the shape the
+ * font-source session reports in `LoadedFontSources.substitutions`). */
+const LOADED_OFFICE_SUBSTITUTIONS = new Map(OFFICE_FONT_SUBSTITUTIONS.map((entry) =>
+  [fontFamilyKey(entry.for), { family: entry.use, ...(entry.script ? { script: entry.script } : {}) }]));
+
 
 const renderContext = {
   themeMajorFont: null,
   themeMinorFont: null,
   dpr: 1,
-  googleSubstitutes: true,
+  fontSubstitutions: LOADED_OFFICE_SUBSTITUTIONS,
 } as const;
 
 function paragraph(text: string): Paragraph {

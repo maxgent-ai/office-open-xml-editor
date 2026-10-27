@@ -1,10 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-let { loadOfficeFontFallbacks, unloadOfficeFontFallbacks } = await import('./office-fallback.js');
+let { loadOfficeFontFallbacks, unloadOfficeFontFallbacks, probeFontFamilyPresence } = await import('./office-fallback.js');
 import referenceData from './reference-font-metrics-data.json';
 
 beforeEach(async () => {
   vi.resetModules();
-  ({ loadOfficeFontFallbacks, unloadOfficeFontFallbacks } = await import('./office-fallback.js'));
+  ({ loadOfficeFontFallbacks, unloadOfficeFontFallbacks, probeFontFamilyPresence } = await import('./office-fallback.js'));
 });
 
 const globals = globalThis as unknown as Record<string, unknown>;
@@ -240,6 +240,29 @@ describe('loadOfficeFontFallbacks', () => {
     await vi.advanceTimersByTimeAsync(20_000);
     expect(added).toHaveLength(5);
     expect(added.filter((face) => !deleted.includes(face))).toHaveLength(0);
+  });
+
+  it('probes every family for font-source demand, past the per-call source cap', async () => {
+    // 40 uncatalogued families, the last one installed: one presence call
+    // stops at the cap, the batched probe reaches it.
+    const families = Array.from({ length: 40 }, (_, index) => `Face ${index}`);
+    const { set } = fontSet(['Face 39']);
+    const capped = await loadOfficeFontFallbacks(families.map((family) => ({ family, presenceOnly: true })), set);
+    expect(capped.installed).toBeUndefined();
+    const presence = await probeFontFamilyPresence(families, set);
+    expect([...presence.installed]).toEqual(['face 39']);
+    expect(presence.checked.size).toBe(40);
+  });
+
+  it('reports a family whose probe missed the deadline as unchecked, not missing', async () => {
+    vi.useFakeTimers();
+    const stalled = ['Stall A', 'Stall B', 'Stall C', 'Stall D'];
+    const { set } = fontSet(['Late Face'], 0, [], stalled);
+    const pending = probeFontFamilyPresence([...stalled, 'Late Face', 'Missing Face'], set);
+    await vi.advanceTimersByTimeAsync(8_000);
+    const presence = await pending;
+    expect(presence.installed.size).toBe(0);
+    expect(presence.checked.size).toBe(0);
   });
 
   it('probes uncatalogued installed families by exact name and releases the probe faces', async () => {
