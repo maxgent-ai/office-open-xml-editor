@@ -205,6 +205,12 @@ table style: Word opens such documents and saves the tables without
 `w:tblStyle`. Unsupported content inside a defined table style stays
 rejected.
 
+A table-styled cell whose modern compatibility shading array
+(sprmTDefTableShd and its later segments, MS-DOC 2.6.3) carries the clear
+pattern over automatic colors (ShdAuto, MS-DOC 2.9.247) projects as an
+explicit no-fill value, the same projection the Raw shading arrays already
+give it. Patterned entries remain unsupported.
+
 Fields in the direct DOC source are checked against each story's own field
 table: the main document, headers and footers, footnotes, endnotes and
 textboxes (MS-DOC 2.8.25). They map onto the fields the DOCX reader already
