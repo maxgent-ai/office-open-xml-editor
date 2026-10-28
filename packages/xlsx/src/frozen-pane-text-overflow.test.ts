@@ -8,6 +8,7 @@ import type { Cell, Styles, Worksheet, XlsxTextRunInfo } from './types.js';
 // frozen, unscrolled and scrolled). See virtualizedTextOverflowOverscan.
 
 const LONG = 'LEFT aaaa|bbbb|cccc|dddd|eeee|ffff|gggg|hhhh|iiii|jjjj|END';
+const CENTERED = 'CENTER 1111|2222|3333|4444|END';
 const RIGHT = 'RIGHT rrrr|ssss|tttt|uuuu|END';
 const BORDER_COLOR = 'FF0000';
 
@@ -27,11 +28,15 @@ const STYLES: Styles = {
   borders: [
     { left: null, right: null, top: null, bottom: null },
     { left: null, right: { style: 'thin', color: BORDER_COLOR }, top: null, bottom: null },
+    { left: null, right: { style: 'hair', color: BORDER_COLOR }, top: null, bottom: null },
   ],
   cellXfs: [
     { fontId: 0, fillId: 0, borderId: 0, numFmtId: 0, alignH: 'left', wrapText: false },
     { fontId: 0, fillId: 0, borderId: 0, numFmtId: 0, alignH: 'right', wrapText: false },
     { fontId: 0, fillId: 0, borderId: 1, numFmtId: 0, alignH: null, wrapText: false },
+    { fontId: 0, fillId: 0, borderId: 0, numFmtId: 0, alignH: 'center', wrapText: false },
+    { fontId: 0, fillId: 0, borderId: 2, numFmtId: 0, alignH: 'left', wrapText: false },
+    { fontId: 0, fillId: 0, borderId: 1, numFmtId: 0, alignH: 'right', wrapText: false },
   ] as Styles['cellXfs'],
   numFmts: [],
   dxfs: [],
@@ -40,6 +45,9 @@ const STYLES: Styles = {
 const LEFT_XF = 0;
 const RIGHT_XF = 1;
 const RIGHT_BORDER_XF = 2;
+const CENTER_XF = 3;
+const LEFT_HAIR_BORDER_XF = 4;
+const RIGHT_ALIGNED_RIGHT_BORDER_XF = 5;
 
 function cell(col: number, text: string, styleIndex = LEFT_XF): Cell {
   return { row: 1, col, styleIndex, value: { type: 'text', text } } as Cell;
@@ -214,6 +222,7 @@ describe('text overflow across a frozen-column boundary', () => {
   });
 
   it('spills a right-aligned scrollable value into the frozen pane', () => {
+    const frozenX: number[] = [];
     for (const view of [VIEW_UNSCROLLED, VIEW_SCROLLED_TO_H]) {
       const { ctx, texts } = recordingContext();
       renderViewport(ctx, worksheet([cell(5, RIGHT, RIGHT_XF)]), STYLES, view,
@@ -223,7 +232,50 @@ describe('text overflow across a frozen-column boundary', () => {
       // position, including after column E has scrolled out of view.
       const { frozen } = paneSplit(texts, RIGHT);
       expect(frozen).toHaveLength(1);
+      frozenX.push(frozen[0].x);
     }
+    expect(frozenX[1]).toBe(frozenX[0]);
+  });
+
+  it('honours a column-inherited alignment when spilling into the frozen pane', () => {
+    // E1 has no own style; column E is right-aligned (§18.3.1.13).
+    const { ctx, texts } = recordingContext();
+    const ws = {
+      ...worksheet([{ ...cell(5, RIGHT), styleIndex: undefined } as Cell]),
+      colStyleRanges: [{ min: 5, max: 5, styleIndex: RIGHT_XF }],
+    } as Worksheet;
+    renderViewport(ctx, ws, STYLES, VIEW_SCROLLED_TO_H, { width: 600, height: 60, freezeCols: 3 });
+    expect(paneSplit(texts, RIGHT).frozen).toHaveLength(1);
+  });
+
+  it('splits a centred frozen-column value across the freeze line', () => {
+    const unscrolled = recordingContext();
+    renderViewport(unscrolled.ctx, worksheet([cell(3, CENTERED, CENTER_XF)]), STYLES,
+      VIEW_UNSCROLLED, { width: 600, height: 60, freezeCols: 3 });
+    const split = paneSplit(unscrolled.texts, CENTERED);
+    expect(split.frozen).toHaveLength(1);
+    expect(split.scroll).toHaveLength(1);
+    expect(split.scroll[0].x).toBe(split.frozen[0].x);
+
+    // Scrolled to H, its right half lies in the scrolled-off D:G.
+    const scrolled = recordingContext();
+    renderViewport(scrolled.ctx, worksheet([cell(3, CENTERED, CENTER_XF)]), STYLES,
+      VIEW_SCROLLED_TO_H, { width: 600, height: 60, freezeCols: 3 });
+    const scrolledSplit = paneSplit(scrolled.texts, CENTERED);
+    expect(scrolledSplit.frozen).toHaveLength(1);
+    expect(scrolledSplit.scroll).toHaveLength(0);
+  });
+
+  it('crosses the freeze line in frozen rows too', () => {
+    // Row 1 is frozen as well: the frozen corner and the frozen-rows strip
+    // are a pane pair of their own.
+    const { ctx, texts } = recordingContext();
+    renderViewport(ctx, worksheet([cell(2, LONG)]), STYLES, { row: 2, col: 4, rows: 1, cols: 6 },
+      { width: 600, height: 60, freezeRows: 1, freezeCols: 3 });
+    const { frozen, scroll } = paneSplit(texts, LONG);
+    expect(frozen).toHaveLength(1);
+    expect(scroll).toHaveLength(1);
+    expect(scroll[0].x).toBe(frozen[0].x);
   });
 
   it('crosses the mirrored freeze line on a right-to-left sheet', () => {
@@ -254,6 +306,53 @@ describe('text overflow across a frozen-column boundary', () => {
     const e = runs.find((run) => run.cellRef === 'E1')!;
     // Unscrolled, owner-pane geometry is contiguous sheet geometry.
     expect(e.x - b.x).toBeCloseTo(3 * b.width, 6);
+  });
+
+  it('reports a value painted only in the other pane once, with owning-pane geometry', () => {
+    // Scrolled to H, E1 is culled from its own (scrollable) pane but still
+    // paints its leftward spill in the frozen pane.
+    const runs: XlsxTextRunInfo[] = [];
+    const { ctx, texts } = recordingContext();
+    renderViewport(ctx, worksheet([cell(5, RIGHT, RIGHT_XF)]), STYLES, VIEW_SCROLLED_TO_H,
+      { width: 600, height: 60, freezeCols: 3, onTextRun: (run) => runs.push(run) });
+
+    expect(runs.map((run) => run.cellRef)).toEqual(['E1']);
+    // In the scrollable pane, E lies three columns (E:G) left of the freeze line.
+    const freezeLine = Math.max(...texts.filter((t) => t.clip.y === 0).map((t) => t.clip.x));
+    expect(runs[0].x).toBeCloseTo(freezeLine - 3 * runs[0].width, 6);
+  });
+
+  it('does not re-stroke a border its painted overflow anchor already draws', () => {
+    // No freeze: C1 overflows into the visible D1 and owns a right hairline.
+    // C1 is painted as an off-screen anchor and strokes that edge itself; D1
+    // must not stroke it a second time.
+    const { ctx, lines } = recordingContext();
+    const ws = { ...worksheet([cell(3, LONG, LEFT_HAIR_BORDER_XF)]), freezeCols: 0 } as Worksheet;
+    renderViewport(ctx, ws, STYLES, VIEW_UNSCROLLED, { width: 600, height: 60 });
+
+    const edges = lines.filter((line) => (
+      line.x1 === line.x2 && /255,\s*0,\s*0|ff0000/i.test(line.color) && line.clip.w > 0 &&
+      line.x1 >= line.clip.x - 1 && line.x1 <= line.clip.x + line.clip.w + 1
+    ));
+    expect(new Set(edges.map((line) => Math.round(line.x1))).size).toBe(edges.length);
+  });
+
+  it('does not move an overflow anchor border onto its neighbour in a right-to-left sheet', () => {
+    // No freeze, mirrored grid: C1 (right border) spills into the visible D1.
+    // Its edge borders B1, which is off-screen, so no red edge is visible.
+    const { ctx, lines } = recordingContext();
+    const ws = {
+      ...worksheet([cell(3, LONG, RIGHT_ALIGNED_RIGHT_BORDER_XF)]),
+      freezeCols: 0,
+      rightToLeft: true,
+    } as Worksheet;
+    renderViewport(ctx, ws, STYLES, VIEW_UNSCROLLED, { width: 600, height: 60 });
+
+    const visible = lines.filter((line) => (
+      line.x1 === line.x2 && /255,\s*0,\s*0|ff0000/i.test(line.color) && line.clip.w > 0 &&
+      line.x1 > line.clip.x && line.x1 < line.clip.x + line.clip.w
+    ));
+    expect(visible).toEqual([]);
   });
 
   it('keeps the left-pane neighbour border at the scrollable pane edge', () => {

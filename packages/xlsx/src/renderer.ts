@@ -1778,6 +1778,13 @@ function colToLetter(col: number): string {
   return result;
 }
 
+interface TextRunBuffer {
+  /** Runs reported by the pane that owns the cell, in paint order. */
+  owned: Map<string, XlsxTextRunInfo>;
+  /** Runs painted only as cross-pane overflow so far. */
+  foreign: Map<string, XlsxTextRunInfo>;
+}
+
 interface RenderContext {
   worksheet: Worksheet;
   styles: Styles;
@@ -1812,17 +1819,19 @@ interface RenderContext {
    *  neighbours. These anchors bypass the ordinary cell-rectangle cull so the
    *  existing overflow clip can paint the still-visible portion of the text. */
   overflowTextAnchors: Set<string>;
-  /** Inclusive logical column range whose cells this pane reports through
-   *  `onTextRun`. Each pane paints the sheet in its own coordinates, so a
-   *  value can also be painted as overflow into the other pane across the
-   *  freeze line; only its owning pane reports it, keeping the callback at
-   *  once per cell with that pane's cell geometry. */
-  textRunCols: { first: number; last: number };
+  /** Text-run reporting for this pane. Each pane paints the sheet in its own
+   *  coordinates, so a value can also be painted as overflow into the other
+   *  pane across the freeze line. `first..last` is the inclusive logical
+   *  column range this pane owns; `ownerShiftX` converts this pane's un-mirrored
+   *  canvas x into the owning pane's for any other column. */
+  textRunPane: { first: number; last: number; ownerShiftX: number };
+  /** Per-frame `onTextRun` buffer shared by all panes, so every painted value
+   *  is reported once with its owning pane's cell geometry. */
+  textRuns?: TextRunBuffer;
   /** Max Digit Width resolved for the workbook's default font, `<fonts>[0]`
    *  (ECMA-376 §18.3.1.13). Used by `colWidthToPx` to convert character-
    *  unit column widths into pixels. */
   mdw: number;
-  onTextRun?: (info: XlsxTextRunInfo) => void;
   /** Sheet-level right-to-left grid mirror (ECMA-376 §18.3.1.87
    *  `<sheetView rightToLeft>`). When true the whole grid is mirrored:
    *  column A sits at the right edge, columns flow right-to-left, and the
@@ -2018,16 +2027,6 @@ function renderQuadrant(
     colXs.push(x);
     x += colWidths[ci];
   }
-
-  // Measured overflow overscan can prepend columns that lie left of this
-  // quadrant's clip (off-screen anchors, or frozen-column anchors drawn in the
-  // scrollable pane). Edge handling that belongs to the quadrant's first
-  // column applies to the first column that actually reaches the clip.
-  let firstVisibleCi = 0;
-  while (
-    firstVisibleCi < numCols - 1 &&
-    originX + colXs[firstVisibleCi] + colWidths[firstVisibleCi] <= clipX
-  ) firstVisibleCi++;
 
   // Canvas y for each row
   const rowYs: number[] = [];
@@ -2286,14 +2285,24 @@ function renderQuadrant(
       }
     }
 
+    // Measured overflow overscan can prepend columns left of this quadrant's
+    // clip (off-screen anchors, or frozen-column anchors drawn in the
+    // scrollable pane). Only those that are painted stroke their own facing
+    // edge; a culled one leaves its edge to the next cell, exactly as when the
+    // quadrant's first column has no rendered left neighbour at all.
+    let leftNeighbourCulled = true;
     for (let ci = 0; ci < numCols; ci++) {
       const colIndex = colIndices[ci];
       const ltrCx = originX + colXs[ci];
       const cw = colWidths[ci];
+      const leftCulled = leftNeighbourCulled;
       // Cull against the (un-mirrored) clip band — visibility is preserved
       // by the mirror, so the LTR test is correct for both directions.
       const key = `${rowIndex}:${colIndex}`;
-      if (mergeSkipSet.has(key)) continue;
+      if (mergeSkipSet.has(key)) {
+        leftNeighbourCulled = false;
+        continue;
+      }
 
       // Use the authored merge rectangle for virtualization. A merge anchor's
       // own row/column band may remain materialized while that single band is
@@ -2307,7 +2316,11 @@ function renderQuadrant(
       if (
         verticallyOutside ||
         (horizontallyOutside && !rc.overflowTextAnchors.has(key))
-      ) continue;
+      ) {
+        leftNeighbourCulled = true;
+        continue;
+      }
+      leftNeighbourCulled = false;
       // Mirror the cell's canvas x for RTL. Uses the *full* drawn width
       // (merge span included) so the rect lands at the correct mirror band.
       const cx = mirrorX(ltrCx, cellW);
@@ -2377,7 +2390,7 @@ function renderQuadrant(
           ctx.moveTo(cx, ty);
           ctx.lineTo(cx + cellW, ty);
         }
-        if (ci === firstVisibleCi) {               // left edge for first column
+        if (leftCulled) {                          // left edge for first column
           const lx = cx + crispOffset(cx, 0.5, dpr);
           ctx.moveTo(lx, cy);
           ctx.lineTo(lx, cy + cellH);
@@ -2424,8 +2437,8 @@ function renderQuadrant(
       // (sample-6). This replaces the old fill-repair (`paintedFill` gate +
       // `invertedTop` / `invertedLeft`), which is gone.
       //
-      // EXCEPTION — the quadrant's first visible row/column (`ri === 0` /
-      // `ci === firstVisibleCi`):
+      // EXCEPTION — the quadrant's first rendered row/column (`ri === 0` /
+      // `leftCulled`):
       // the upper / left neighbour lies OUTSIDE this quadrant (the viewport has
       // no top/left overscan — viewer.ts walks forward from startRow/startCol
       // with a +2 buffer only at the bottom/right), so when scrolled it is never
@@ -2451,7 +2464,7 @@ function renderQuadrant(
               styles, effectiveCellStyleIndex(rc.worksheet, leftCell, colIndex - 1),
             ).border.right
           : null;
-        if (leftRight?.style && (ci === firstVisibleCi || mergedBorder.left?.style)) {
+        if (leftRight?.style && (leftCulled || mergedBorder.left?.style)) {
           mergedBorder = { ...mergedBorder, left: pickStrongerEdge(mergedBorder.left, leftRight) };
         }
       }
@@ -2920,21 +2933,22 @@ function renderQuadrant(
 
       ctx.restore();
 
-      if (
-        text && rc.onTextRun &&
-        colIndex >= rc.textRunCols.first && colIndex <= rc.textRunCols.last
-      ) {
-        rc.onTextRun({
-          sheetName: rc.worksheet.name,
-          cellRef: formatA1(rowIndex, colIndex),
-          text,
-          x: cx,
-          y: cy,
-          width: cellW,
-          height: cellH,
-          row: rowIndex,
-          col: colIndex,
-        });
+      if (text && rc.textRuns) {
+        const owned = colIndex >= rc.textRunPane.first && colIndex <= rc.textRunPane.last;
+        const runs = owned ? rc.textRuns.owned : rc.textRuns.foreign;
+        if (!runs.has(key)) {
+          runs.set(key, {
+            sheetName: rc.worksheet.name,
+            cellRef: formatA1(rowIndex, colIndex),
+            text,
+            x: owned ? cx : mirrorX(ltrCx + rc.textRunPane.ownerShiftX, cellW),
+            y: cy,
+            width: cellW,
+            height: cellH,
+            row: rowIndex,
+            col: colIndex,
+          });
+        }
       }
       });
     }
@@ -3597,7 +3611,9 @@ function virtualizedTextOverflowOverscan(
     const cell = cellMap.get(key);
     if (!cell || cell.value.type === 'empty' || mergeAnchorMap.has(key)) return false;
 
-    const { font, xf } = resolveXf(styles, cell.styleIndex ?? 0);
+    // Resolve the style exactly as paint does (a cell without its own `s`
+    // inherits the column style, §18.3.1.13).
+    const { font, xf } = resolveXf(styles, effectiveCellStyleIndex(worksheet, cell, col));
     const cf = evaluateCf(cell, row, col, cfContext, styles.dxfs ?? []);
     const formatted = formatCellValueWithColor(cell, styles, cf.numFmt, worksheet.date1904);
     const text = formatted.text;
@@ -3877,18 +3893,12 @@ export function renderViewport(
     structuredStyleMap,
     sparklineMap,
     overflowTextAnchors: overflowOverscan.anchorKeys,
-    textRunCols: { first: freezeCols + 1, last: Number.POSITIVE_INFINITY },
+    textRunPane: { first: freezeCols + 1, last: Number.POSITIVE_INFINITY, ownerShiftX: 0 },
+    textRuns: opts.onTextRun ? { owned: new Map(), foreign: new Map() } : undefined,
     mdw,
-    onTextRun: opts.onTextRun,
     rtl: worksheet.rightToLeft === true,
     canvasW,
     threeD: opts.threeD,
-  };
-
-  const frozenRc: RenderContext = {
-    ...rc,
-    overflowTextAnchors: frozenOverflowOverscan.anchorKeys,
-    textRunCols: { first: 1, last: freezeCols },
   };
 
   // Canvas areas for each quadrant
@@ -3898,6 +3908,24 @@ export function renderViewport(
   const scrollAreaY = cellAreaY + frozenH;
   const scrollAreaW = Math.max(0, canvasW - scrollAreaX);
   const scrollAreaH = Math.max(0, canvasH - scrollAreaY);
+
+  // Un-mirrored canvas x of sheet offset 0 in each pane; their difference maps
+  // a cell painted as cross-pane overflow back to its owning pane.
+  const frozenPaneOrigin = cellAreaX - colAxis.offsetOf(1);
+  const scrollPaneOrigin = scrollAreaX - scrollOffsetX - colAxis.offsetOf(visibleStartCol);
+  const scrollRc: RenderContext = {
+    ...rc,
+    textRunPane: {
+      first: freezeCols + 1,
+      last: Number.POSITIVE_INFINITY,
+      ownerShiftX: frozenPaneOrigin - scrollPaneOrigin,
+    },
+  };
+  const frozenRc: RenderContext = {
+    ...rc,
+    overflowTextAnchors: frozenOverflowOverscan.anchorKeys,
+    textRunPane: { first: 1, last: freezeCols, ownerShiftX: scrollPaneOrigin - frozenPaneOrigin },
+  };
 
   // ── Q1: frozen rows × frozen cols ───────────────────────────
   if (freezeRows > 0 && freezeCols > 0) {
@@ -3912,7 +3940,7 @@ export function renderViewport(
 
   // ── Q2: frozen rows × scrollable cols ───────────────────────
   if (freezeRows > 0) {
-    renderQuadrant(ctx, rc,
+    renderQuadrant(ctx, scrollRc,
       1, overflowOverscan.startCol, renderScrollColWidths, frozenRowHeights,
       renderScrollColIndices, frozenRowIndices,
       renderScrollOffsetX, 0,
@@ -3934,13 +3962,22 @@ export function renderViewport(
 
   // ── Q4: scrollable rows × scrollable cols (main area) ───────
   if (!chartSheet) {
-    renderQuadrant(ctx, rc,
+    renderQuadrant(ctx, scrollRc,
       startRow, overflowOverscan.startCol, renderScrollColWidths, scrollRowHeights,
       renderScrollColIndices, scrollRowIndices,
       renderScrollOffsetX, scrollOffsetY,
       scrollAreaX, scrollAreaY,
       scrollAreaX, scrollAreaY, scrollAreaW, scrollAreaH, cjkFallback
     );
+  }
+
+  // Report each painted value once: owned runs in paint order, then values
+  // painted only as cross-pane overflow (their owning pane culled them).
+  if (rc.textRuns && opts.onTextRun) {
+    for (const run of rc.textRuns.owned.values()) opts.onTextRun(run);
+    for (const [key, run] of rc.textRuns.foreign) {
+      if (!rc.textRuns.owned.has(key)) opts.onTextRun(run);
+    }
   }
 
   // ── Anchored DrawingML objects, in authored z-order ───────────
