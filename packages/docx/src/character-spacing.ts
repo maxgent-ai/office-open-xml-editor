@@ -111,11 +111,58 @@ export function resolvedBidiLevels(text: string, direction: 'ltr' | 'rtl'): Uint
   return resolved;
 }
 
-/** Whether the UAX#9 level of `text[index]` differs from the previous code
- * unit's in either paint direction. */
+/** Code units of `text` inside an explicit directional override (UAX#9
+ * X4/X5: LRO, RLO), tracking embeddings, isolates and PDF/PDI; undefined when
+ * the text has no override. An overridden sequence's order cannot be
+ * reproduced by drawing a slice of it without its control. */
+function bidiOverriddenUnits(text: string): Uint8Array | undefined {
+  if (!/[\u202D\u202E]/u.test(text)) return undefined;
+  const overridden = new Uint8Array(text.length);
+  // Each entry: whether it overrides, and whether it is an isolate. UAX#9
+  // BD2 bounds the depth at 125; deeper initiators overflow and change nothing.
+  const stack: Array<{ override: boolean; isolate: boolean }> = [];
+  let openIsolates = 0;
+  const push = (entry: { override: boolean; isolate: boolean }): void => {
+    if (stack.length >= 125) return;
+    stack.push(entry);
+    if (entry.isolate) openIsolates += 1;
+  };
+  for (let index = 0; index < text.length; index += 1) {
+    const code = text.charCodeAt(index);
+    if (code === 0x202A || code === 0x202B) push({ override: false, isolate: false });
+    else if (code === 0x202D || code === 0x202E) push({ override: true, isolate: false });
+    else if (code === 0x2066 || code === 0x2067 || code === 0x2068) {
+      push({ override: false, isolate: true });
+    } else if (code === 0x202C) {
+      if (stack.length > 0 && !stack.at(-1)!.isolate) stack.pop();
+    } else if (code === 0x2069) {
+      // X6a: a PDI closes the innermost open isolate and the embeddings
+      // inside it; without an open isolate it does nothing.
+      if (openIsolates > 0) {
+        while (!stack.pop()!.isolate) {
+          // Embeddings inside the isolate close with it.
+        }
+        openIsolates -= 1;
+      }
+    } else if (code === 0x2029 || code === 0x0A || code === 0x0D) {
+      stack.length = 0;
+      openIsolates = 0;
+    } else if (stack.at(-1)?.override) {
+      overridden[index] = 1;
+    }
+  }
+  return overridden;
+}
+
+/** Whether a split paint operation must end before `text[index]`: its UAX#9
+ * level differs from the previous code unit's in either paint direction, or
+ * either unit lies inside a directional override (whose order only the
+ * whole sequence carries, so its clusters are placed one by one). */
 export function bidiLevelChanges(text: string): (index: number) => boolean {
   const ltr = resolvedBidiLevels(text, 'ltr');
   const rtl = resolvedBidiLevels(text, 'rtl');
+  const overridden = bidiOverriddenUnits(text);
   return (index) => index > 0 && index < text.length
-    && (ltr[index] !== ltr[index - 1] || rtl[index] !== rtl[index - 1]);
+    && (ltr[index] !== ltr[index - 1] || rtl[index] !== rtl[index - 1]
+      || overridden?.[index] === 1 || overridden?.[index - 1] === 1);
 }

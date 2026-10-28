@@ -288,6 +288,33 @@ describe('#1975 condensed floor in right-to-left text', () => {
     expect(byText(node.lines[0]!, 'ب\u200Dت').paintOps.map((op) => op.text)).toEqual(['ب\u200Dت']);
   });
 
+  it.each([
+    ['RLO', 'horizontal', undefined, '\u202E'],
+    ['RLO', 'vertical', 'tbRl', '\u202E'],
+    ['LRO', 'horizontal', undefined, '\u202D'],
+    ['LRO', 'vertical', 'tbRl', '\u202D'],
+  ] as const)('keeps a %s override\'s order across split operations (%s)', (control, _name, textDirection, mark) => {
+    // ABiC (i floors) inside RLO reads C i B A; inside LRO, A B i C.
+    const text = `אב${mark}ABiC\u202Cגד`;
+    const node = layoutBodyModel(
+      [para([textRun(text, { rtl: true, charSpacing: -6 })], { bidi: true } as Partial<DocParagraph>)],
+      textDirection ? { ...section, textDirection } as SectionProps : section,
+      makeCtx(),
+    ).pages[0]!.layers.body[0]!;
+    if (node.kind !== 'paragraph') throw new Error('expected a paragraph');
+    const ops = byText(node.lines[0]!, text).paintOps;
+    const x = (glyph: string) => ops.find((op) => op.text.replace(/[\u202C-\u202E]/gu, '') === glyph)!.offset.xPt;
+    expect(ops.every((op) => op.text.replace(/[\u202C-\u202E]/gu, '').length <= 1
+      || !/[ABC]/u.test(op.text))).toBe(true);
+    if (control === 'RLO') {
+      expect(x('C')).toBeLessThan(x('B'));
+      expect(x('B')).toBeLessThan(x('A'));
+    } else {
+      expect(x('A')).toBeLessThan(x('B'));
+      expect(x('B')).toBeLessThan(x('C'));
+    }
+  });
+
   it('draws a split operation in its own level direction', () => {
     // "A-" resolves to level 2 inside the RTL text; drawn alone with RTL
     // direction Canvas would make the trailing "-" level 1 and reorder it.
