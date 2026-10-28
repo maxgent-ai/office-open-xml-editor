@@ -3956,7 +3956,7 @@ export function renderViewport(
       last: authoredFreezeCols,
       ownerShiftX: scrollPaneOrigin - frozenPaneOrigin,
     },
-    firstViewportCol: 1,
+    firstViewportCol: frozenColIndices[0] ?? 1,
   };
 
   // ── Q1: frozen rows × frozen cols ───────────────────────────

@@ -408,6 +408,21 @@ describe('text overflow across a frozen-column boundary', () => {
     expect(visible).toEqual([]);
   });
 
+  it('keeps the frozen pane left gridline when its first column is hidden', () => {
+    // Column A is hidden: B is the frozen pane's first column and still
+    // draws the pane's left gridline.
+    const { ctx, texts, lines } = recordingContext();
+    const ws = { ...worksheet([]), colWidths: { 1: 0 } } as Worksheet;
+    renderViewport(ctx, ws, STYLES, VIEW_UNSCROLLED, { width: 600, height: 60, freezeCols: 3 });
+    // The frozen column-header clip starts where the frozen pane does.
+    const paneLeft = Math.min(...texts.filter((t) => t.clip.y === 0).map((t) => t.clip.x));
+    const leftEdge = lines.filter((line) => (
+      line.x1 === line.x2 && line.color === '#d0d0d0' && line.clip.x === paneLeft &&
+      Math.abs(line.x1 - paneLeft) <= 1
+    ));
+    expect(leftEdge.length).toBeGreaterThan(0);
+  });
+
   it('keeps the left-pane neighbour border at the scrollable pane edge', () => {
     // C1 carries a right border. Pulling the frozen B1 value into the
     // scrollable pane must not stop D1, the pane's first visible column, from
