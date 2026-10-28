@@ -239,6 +239,9 @@ export interface PlannedVerticalGlyphCell {
   /** WORD_CONDENSED_SPACING_ADVANCE_FLOOR took this cell's advance (or, for
    * an unsplit cursive piece, one of its graphemes' advances) to zero. */
   readonly floored?: true;
+  /** Drawn advance of a floored sideways cluster painted on its own (its
+   * isolated shaped width), for direction-aware placement of its ink. */
+  readonly naturalAdvancePt?: number;
 }
 
 function plannedVerticalBlockAxisInkBounds(
@@ -404,28 +407,59 @@ export function planVerticalRunWithCapability(
       // Floored: non-cursive graphemes paint from their own origins; each run
       // of cursive graphemes stays one contextual cell (Canvas does not track
       // inside cursive scripts) advancing by its graphemes' floored sum.
-      const pieceCells: Array<{ text: string; start: number; advancePt: number; floored: boolean }> =
+      // A cursive group keeps its classification and source range; its text
+      // is sliced once when the cell is emitted, so grouping stays linear.
+      const pieceCells: Array<{
+        start: number;
+        end: number;
+        advancePt: number;
+        floored: boolean;
+        cursive: boolean;
+      }> =
         unitPlaces.some((placed) => placed.floored)
           ? []
           : (() => {
               const placed = unitAdvance(piece.text, sourceOffset, ctx.measureText(piece.text).width * charScale);
-              return [{ text: piece.text, start: sourceOffset, advancePt: placed.advancePt, floored: placed.floored }];
+              return [{
+                start: sourceOffset,
+                end: sourceOffset + piece.text.length,
+                advancePt: placed.advancePt,
+                floored: placed.floored,
+                cursive: false,
+              }];
             })();
-      if (pieceCells.length === 0) {
+      const split = pieceCells.length === 0;
+      if (split) {
         units.forEach((unit, index) => {
           const placed = unitPlaces[index]!;
           const previous = pieceCells.at(-1);
           const cursive = hasCursiveJoining(unit.text);
-          if (cursive && previous && hasCursiveJoining(previous.text)) {
-            previous.text += unit.text;
+          if (cursive && previous?.cursive) {
+            previous.end = unit.start + unit.text.length;
             previous.advancePt += placed.advancePt;
             previous.floored ||= placed.floored;
           } else {
-            pieceCells.push({ text: unit.text, start: unit.start, advancePt: placed.advancePt, floored: placed.floored });
+            pieceCells.push({
+              start: unit.start,
+              end: unit.start + unit.text.length,
+              advancePt: placed.advancePt,
+              floored: placed.floored,
+              cursive,
+            });
           }
         });
       }
-      for (const cell of pieceCells) {
+      for (const pieceCell of pieceCells) {
+        const cell = {
+          ...pieceCell,
+          text: piece.text.slice(pieceCell.start - sourceOffset, pieceCell.end - sourceOffset),
+        };
+        // A split non-cursive floored cell paints one isolated cluster whose
+        // ink runs past its zero allocation; directional placement anchors
+        // that drawn advance.
+        const naturalAdvancePt = split && cell.floored && !cell.cursive
+          ? ctx.measureText(cell.text).width * charScale
+          : undefined;
         const blockAxisInkBounds = plannedVerticalBlockAxisInkBounds(
           ctx, cell.text, 'sideways', drawOffsetPt, charScale, writingMode, false,
         );
@@ -439,6 +473,7 @@ export function planVerticalRunWithCapability(
           verticalFeature: false,
           ...(blockAxisInkBounds ? { blockAxisInkBounds } : {}),
           ...(cell.floored ? { floored: true as const } : {}),
+          ...(naturalAdvancePt !== undefined ? { naturalAdvancePt } : {}),
         });
         ax += cell.advancePt;
       }

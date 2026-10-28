@@ -260,6 +260,20 @@ describe('#1975 condensed floor in right-to-left text', () => {
     expect(relative(offsets('מיא '))).toEqual(bare);
     expect(relative(offsets('מיא  '))).toEqual(bare);
   });
+
+  it('keeps right-to-left order in a floored vertical sideways piece', () => {
+    // tbRl: the same visual placement as horizontally (מ 4, י 0, א 0 from the
+    // piece's start), not the logical origins 0, 4, 4.
+    const node = layoutBodyModel(
+      [para([textRun('מיא', { rtl: true, charSpacing: -6 })], { bidi: true } as Partial<DocParagraph>)],
+      { ...section, textDirection: 'tbRl' } as SectionProps,
+      makeCtx(),
+    ).pages[0]!.layers.body[0]!;
+    if (node.kind !== 'paragraph') throw new Error('expected a paragraph');
+    const ops = byText(node.lines[0]!, 'מיא').paintOps;
+    expect(ops.map((op) => [op.text, op.glyphOrientation, op.offset.xPt]))
+      .toEqual([['מ', 'sideways', 4], ['י', 'sideways', 0], ['א', 'sideways', 0]]);
+  });
 });
 
 describe('#1975 condensed floor and kashida justification', () => {

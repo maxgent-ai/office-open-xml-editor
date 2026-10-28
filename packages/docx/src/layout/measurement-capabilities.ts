@@ -44,5 +44,6 @@ export interface VerticalGlyphMeasurementService {
     verticalFeature: boolean;
     blockAxisInkBounds?: Readonly<{ startPt: number; endPt: number }>;
     floored?: true;
+    naturalAdvancePt?: number;
   }>[];
 }

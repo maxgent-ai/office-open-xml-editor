@@ -745,6 +745,37 @@ function flooredRtlVisualPaintOperations(
   });
 }
 
+/** WORD_CONDENSED_SPACING_ADVANCE_FLOOR in a right-to-left vertical run. An
+ * unsplit sideways piece paints as one contextual operation whose bidi order
+ * Canvas resolves; a floored piece paints its clusters from logical origins,
+ * so mirror each cell within its piece (a maximal run of sideways cells): the
+ * pen runs from the piece's far end, and a floored cluster's ink sits its
+ * drawn advance behind the pen, as {@link flooredRtlVisualPaintOperations}
+ * places it horizontally. Upright and rotated cells keep their origins. */
+function flooredRtlVerticalCellOrigins(
+  cells: ReturnType<VerticalGlyphMeasurementService['planRun']>,
+): readonly number[] {
+  const origins = cells.map((cell) => cell.originPt);
+  let index = 0;
+  while (index < cells.length) {
+    if (cells[index]!.orientation !== 'sideways') {
+      index += 1;
+      continue;
+    }
+    let end = index;
+    while (end < cells.length && cells[end]!.orientation === 'sideways') end += 1;
+    const startPt = cells[index]!.originPt;
+    const last = cells[end - 1]!;
+    const endPt = last.originPt + last.advancePt;
+    for (let cursor = index; cursor < end; cursor += 1) {
+      const cell = cells[cursor]!;
+      origins[cursor] = startPt + endPt - cell.originPt - (cell.naturalAdvancePt ?? cell.advancePt);
+    }
+    index = end;
+  }
+  return origins;
+}
+
 function sameDashPattern(
   left: readonly number[] | undefined,
   right: readonly number[] | undefined,
@@ -2645,7 +2676,11 @@ function textPlanSegment(
           throw new Error('Vertical glyph planning capability is required for vertical text');
         }
         const template = paintOps[0]!;
-        return (flooredVerticalCells ?? verticalCells ?? []).map((cell) => ({
+        const plannedCells = flooredVerticalCells ?? verticalCells ?? [];
+        const flooredRtlOrigins = flooredVerticalCells && template.direction === 'rtl'
+          ? flooredRtlVerticalCellOrigins(flooredVerticalCells)
+          : null;
+        return plannedCells.map((cell, index) => ({
           ...template,
           text: cell.text,
           range: {
@@ -2653,7 +2688,7 @@ function textPlanSegment(
             end: sourceOffset + cell.range.end,
           },
           offset: {
-            xPt: cell.originPt + (flooredVerticalCells ? 0 : (
+            xPt: (flooredRtlOrigins?.[index] ?? cell.originPt) + (flooredVerticalCells ? 0 : (
               segment.punctuationCompressions
                 ?.filter((compression) => compression.end <= cell.range.start)
                 .reduce((sum, compression) => sum + compression.adjustmentPt, 0)
