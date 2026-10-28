@@ -182,9 +182,9 @@ pub fn parse_tile(tile: Node<'_, '_>) -> TileInfo {
 /// when there are no resolvable stops, so the caller can keep scanning sibling
 /// fill elements (verbatim of the pptx behavior). `resolver` / `tint_mode` are
 /// threaded to the stop colors.
-pub fn parse_grad_fill<R: ThemeResolver + ?Sized>(
+pub fn parse_grad_fill(
     grad_fill: Node<'_, '_>,
-    resolver: &R,
+    resolver: &dyn ThemeResolver,
     tint_mode: TintMode,
 ) -> Option<GradientFill> {
     let mut stops: Vec<GradStop> = child(grad_fill, "gsLst")
@@ -251,9 +251,9 @@ pub fn parse_grad_fill<R: ThemeResolver + ?Sized>(
 /// [`parse_color_node`], defaulting fg→`000000` / bg→`ffffff` when absent or
 /// unresolved (verbatim of the pptx behavior). `resolver` / `tint_mode` are
 /// threaded to the colors.
-pub fn parse_patt_fill<R: ThemeResolver + ?Sized>(
+pub fn parse_patt_fill(
     patt_fill: Node<'_, '_>,
-    resolver: &R,
+    resolver: &dyn ThemeResolver,
     tint_mode: TintMode,
 ) -> PatternFill {
     let preset = attr(&patt_fill, "prst").unwrap_or_else(|| "pct50".to_owned());

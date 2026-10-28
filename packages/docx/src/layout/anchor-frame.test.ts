@@ -329,19 +329,33 @@ describe('retained anchor frame geometry', () => {
     });
   });
 
-  it('reports a valid zero outer extent as unsupported on either anchor axis', () => {
-    for (const axis of ['horizontal', 'vertical'] as const) {
-      const acquisition = anchor({
-        extent: {
-          ...anchor().extent,
-          [axis === 'horizontal' ? 'widthPt' : 'heightPt']: 0,
-        },
+  it.each([[0, 10], [20, 0], [0, 0]])(
+    'resolves schema-valid outer extent %s × %s without inflating the object',
+    (widthPt, heightPt) => {
+      const result = resolved(resolveAnchorFrame(input(anchor({
+        extent: { widthPt, heightPt, widthStatus: 'valid', heightStatus: 'valid' },
+        parentEffectExtent: validEdges(1, 2, 3, 4),
+        anchorDistances: validEdges(5, 6, 7, 8),
+      }))));
+      expect(result.geometry.objectFrame).toEqual({ xPt: 10, yPt: 20, widthPt, heightPt });
+      expect(result.geometry.inkBounds).toEqual({
+        xPt: 6, yPt: 19, widthPt: widthPt + 6, heightPt: heightPt + 4,
       });
-      const result = resolveAnchorFrame(input(acquisition));
+      expect(result.geometry.wrapBounds).toEqual({
+        xPt: -2, yPt: 14, widthPt: widthPt + 20, heightPt: heightPt + 16,
+      });
+    },
+  );
+
+  it.each([-1, NaN, Infinity])('still rejects an invalid outer extent %s', (value) => {
+    for (const axis of ['width', 'height'] as const) {
+      const result = resolveAnchorFrame(input(anchor({
+        extent: { ...anchor().extent, [`${axis}Pt`]: value },
+      })));
       expect(result.status).toBe('unsupported');
-      expect(result.axes[axis]).toMatchObject({
-        status: 'unsupported', issueCode: 'invalid-size',
-      });
+      expect(result.issues).toContainEqual(expect.objectContaining({
+        code: 'invalid-size', path: `extent.${axis}`,
+      }));
     }
   });
 

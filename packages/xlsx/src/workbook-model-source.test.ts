@@ -116,7 +116,7 @@ describe('XlsxWorkbook.load with model sources', () => {
     expect(worker.messages.filter((message) => message.type === 'parse')).toEqual([
       expect.objectContaining({ source: descriptor }),
     ]);
-    expect(mocks.computeMdw).toHaveBeenCalledExactlyOnceWith('Calibri', 11, undefined, false, 400, 'normal');
+    expect(mocks.computeMdw).toHaveBeenCalledExactlyOnceWith('Calibri', 11, undefined, undefined, 400, 'normal');
     expect(worker.messages).toContainEqual({
       type: XLSX_HOST_LAYOUT_RESULT, requestId: 41, maximumDigitWidth: 8,
     });

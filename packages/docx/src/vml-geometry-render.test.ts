@@ -677,7 +677,9 @@ it('paints fitted text outlines with independent fill, pen alpha and image brush
 });
 
 it('reflects asymmetric text and its image mask through the acquired host rotation and nested frame', async () => {
-  const draw = (flip: string, rotation: number, image = false, nested = false, shadow = false) => renderVml(`<v:group style="width:180pt;height:180pt" coordsize="180,180">${nested ? `<v:group style="left:20;top:20;width:140;height:140;flip:${flip};rotation:${rotation}" coordsize="140,140">` : ''}<v:shape style="left:${nested ? 10 : 30};top:${nested ? 40 : 60};width:120;height:60;flip:${nested ? '' : flip};rotation:${nested ? 0 : rotation}" stroked="f" fillcolor="red">${image ? '<v:fill type="pattern" r:id="pic" color="red" color2="red" size="10pt,10pt"/>' : ''}${shadow ? '<v:shadow on="t" color="lime" offset="0,70pt"/>' : ''}<v:path textpathok="t"/><v:textpath on="t" fitshape="t" string="Fjp" style="font:24pt Arial"/></v:shape>${nested ? '</v:group>' : ''}</v:group>`, true);
+  // Page anchoring keeps this pixel-reflection oracle independent of the
+  // paragraph baseline's fractional offset and native font grid fitting.
+  const draw = (flip: string, rotation: number, image = false, nested = false, shadow = false) => renderVml(`<v:group style="position:absolute;mso-position-horizontal-relative:page;mso-position-vertical-relative:page;mso-position-horizontal:absolute;mso-position-vertical:absolute;left:0;top:0;width:180pt;height:180pt" coordsize="180,180">${nested ? `<v:group style="left:20;top:20;width:140;height:140;flip:${flip};rotation:${rotation}" coordsize="140,140">` : ''}<v:shape style="left:${nested ? 10 : 30};top:${nested ? 40 : 60};width:120;height:60;flip:${nested ? '' : flip};rotation:${nested ? 0 : rotation}" stroked="f" fillcolor="red">${image ? '<v:fill type="pattern" r:id="pic" color="red" color2="red" size="10pt,10pt"/>' : ''}${shadow ? '<v:shadow on="t" color="lime" offset="0,70pt"/>' : ''}<v:path textpathok="t"/><v:textpath on="t" fitshape="t" string="Fjp" style="font:24pt Arial"/></v:shape>${nested ? '</v:group>' : ''}</v:group>`, true);
   const mass = (pixels: Uint8ClampedArray, channel = 1) => {
     let x = 0, y = 0, n = 0;
     for (let i = 0; i < pixels.length; i += 4) {
@@ -694,6 +696,7 @@ it('reflects asymmetric text and its image mask through the acquired host rotati
   };
   const baseResult = await draw('', 0);
   const frame = findRect(baseResult.layout)!;
+  expect(frame).toEqual({ xPt: 30, yPt: 60, widthPt: 120, heightPt: 60 });
   const cx = frame.xPt + frame.widthPt / 2, cy = frame.yPt + frame.heightPt / 2;
   const base = mass(baseResult.pixels);
   const imageBase = mass((await draw('', 0, true)).pixels);

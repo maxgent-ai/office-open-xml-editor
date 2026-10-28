@@ -610,113 +610,11 @@ describe('canonical body producer', () => {
     expect(first!.flowBounds.yPt + first!.flowBounds.heightPt).toBe(second!.flowBounds.yPt);
   });
 
-  it('retains endnotes after terminal body flow in authored order', () => {
-    const services = Object.freeze({
-      text: { fingerprint: 'text' }, images: { fingerprint: 'images' }, math: { fingerprint: 'math' },
-    }) as LayoutServices;
-    attachBodyLayoutKernel(services, {
-      openBodyLayoutSession: () => ({
-        hasPaginationFields: false,
-        measureParagraph: ({ input }) => ({
-          layout: paragraphWithEndnotes('body', input.source, 20, ['end-1', 'end-2']),
-          blockExtentPt: 20,
-          fragmentation: { kind: 'splittable', lineEndBoundaries: [{ segIndex: 0, charOffset: 1 }] },
-        }),
-        measureTable: () => { throw new Error('unused'); },
-        measureStoryExtent: () => 0,
-        measureFootnoteReserve: ({ referenceIds }) => referenceIds.length * 10,
-        measureFollowingBlock: () => ({ fullExtentPt: 0, leadContentExtentPt: 0 }),
-        measureLineNumberGlyph: () => ({ widthPt: 0, ascentPt: 0, descentPt: 0 }),
-        resetPageAcquisition: () => undefined,
-        moveAcquisitionCursor: () => undefined,
-        flowRegistrySnapshot: emptyFlowRegistrySnapshot,
-        commitFlowRegistryDelta: () => undefined,
-      }),
-    });
-    const input: BodyLayoutInput = {
-      source: { story: 'body', storyInstance: 'body', path: [] },
-      initialSection: bodyOwner(),
-      sequence: [{
-        kind: 'body-block',
-        block: {
-          kind: 'paragraph', source: source(0), pageBreakBefore: false,
-          keepLines: false, keepNext: false, widowControl: true,
-          spaceBeforePt: 0, spaceAfterPt: 0, contextualSpacing: false, styleId: null,
-        },
-      }],
-      endnoteIds: ['end-1', 'end-2'],
-    };
-
-    const layout = paginateBody(input, services, { currentDateMs: 0 });
-    const page = layout.pages[0]!;
-    const note = page.layers.notes[0]!;
-
-    expect(layout.diagnostics).toEqual([]);
-    expect(note).toMatchObject({
-      kind: 'note',
-      source: { story: 'endnote', storyInstance: 'end-1' },
-      flowDomainId: 'endnotes:page:0',
-      flowBounds: { yPt: 30, heightPt: 20 },
-    });
-    expect(page.flowDomains.find((domain) => domain.kind === 'endnote')?.sectionRegionId)
-      .toBe(page.sectionRegions[0]!.id);
-    expect(page.readingOrder).toEqual([page.layers.body[0]!.id, note.id]);
-  });
-
-  it('reports a retained endnote story that cannot fit the terminal flow region', () => {
-    const services = Object.freeze({
-      text: { fingerprint: 'text' }, images: { fingerprint: 'images' }, math: { fingerprint: 'math' },
-    }) as LayoutServices;
-    attachBodyLayoutKernel(services, {
-      openBodyLayoutSession: () => ({
-        hasPaginationFields: false,
-        measureParagraph: ({ input }) => ({
-          layout: paragraphWithFootnote('body', input.source, 20, 'end-1', 'endnote'),
-          blockExtentPt: 20,
-          fragmentation: { kind: 'splittable', lineEndBoundaries: [{ segIndex: 0, charOffset: 1 }] },
-        }),
-        measureTable: () => { throw new Error('unused'); },
-        layoutNotes: () => {
-          throw new NoteCapacityExceededError('endnote', 0, 'endnotes:page:0');
-        },
-        measureFollowingBlock: () => ({ fullExtentPt: 0, leadContentExtentPt: 0 }),
-        measureLineNumberGlyph: () => ({ widthPt: 0, ascentPt: 0, descentPt: 0 }),
-        resetPageAcquisition: () => undefined,
-        moveAcquisitionCursor: () => undefined,
-        flowRegistrySnapshot: emptyFlowRegistrySnapshot,
-        commitFlowRegistryDelta: () => undefined,
-      }),
-    });
-
-    const layout = paginateBody({
-      source: { story: 'body', storyInstance: 'body', path: [] },
-      initialSection: bodyOwner(),
-      sequence: [{
-        kind: 'body-block',
-        block: {
-          kind: 'paragraph', source: source(0), pageBreakBefore: false,
-          keepLines: false, keepNext: false, widowControl: true,
-          spaceBeforePt: 0, spaceAfterPt: 0, contextualSpacing: false, styleId: null,
-        },
-      }],
-      endnoteIds: ['end-1'],
-    }, services, { currentDateMs: 0 });
-
-    expect(layout.pages[0]!.layers.notes).toEqual([]);
-    expect(layout.diagnostics).toEqual([
-      expect.objectContaining({
-        code: 'UNSUPPORTED_FEATURE',
-        severity: 'error',
-        source: expect.objectContaining({ story: 'endnote', storyInstance: 'end-1' }),
-        message: expect.stringContaining('do not fit the retained terminal flow region'),
-      }),
-    ]);
-  });
-
   it.each([
     new Error('endnote implementation bug'),
+    new NoteCapacityExceededError('endnote', 0, 'endnotes:page:0'),
     new NoteCapacityExceededError('endnote', 1, 'endnotes:page:1'),
-  ])('does not misreport an unrelated failure as the terminal endnote capacity limit', (failure) => {
+  ])('propagates endnote acquisition failures without dropping the story', (failure) => {
     const services = Object.freeze({
       text: { fingerprint: 'text' }, images: { fingerprint: 'images' }, math: { fingerprint: 'math' },
     }) as LayoutServices;

@@ -20,9 +20,7 @@ import type { LayoutDiagnostic } from './layout/types.js';
 import init, { DocxArchive, reinit } from './wasm/docx_parser.js';
 import {
   decodeDataUrl,
-  preloadGoogleFonts,
   unloadOfficeFontFallbacks,
-  unloadGoogleFonts,
   unregisterEmbeddedFonts,
   WasmParserHost,
   dropDecodedBitmapCache,
@@ -47,7 +45,9 @@ import {
 } from '@silurus/ooxml-core/worker';
 import { prepareMathRuns, renderLayoutSourceToCanvas } from './renderer';
 import { createLayoutServices, nativeRouteLineRequests } from './layout-runtime.js';
-import { DOCX_GOOGLE_FONTS, docxGoogleFontPlan, docxOfficeFontFallbackRequests } from './google-fonts';
+import { completeDocxFontPresence, declaredFontSubstitutions, docxFontFamilyPlan, docxOfficeFontFallbackRequests } from './font-plan.js';
+import { loadDocxFontSources, type DocxLoadedFontSources } from './font-source-load.js';
+import { assertFontSourceDescriptors, chartFontSubstitutions, WorkerFontResolverClient, type FontSource } from '@silurus/ooxml-core/internal/font-sources';
 import { loadEmbeddedFonts } from './embedded-fonts';
 import type {
   RenderWorkerResponse,
@@ -128,19 +128,23 @@ let layoutAbort: AbortController | null = null;
  *  host can only render one of per frame. */
 const LAYOUT_PROGRESS_POST_INTERVAL_MS = 100;
 let renderers: LoadedWorkerRenderers = {};
-let googleFontFaces: FontFace[] = [];
+/** This document's font-source session (LoadOptions.fonts) in self.fonts. */
+let fontSourceSession: DocxLoadedFontSources['session'] | null = null;
+/** The unscoped substitutions it loaded, painted by chart text. */
+let chartFontSubstitutionsOfDoc: Readonly<Record<string, string>> | undefined;
 let embeddedFontFaces: FontFace[] = [];
 let fontDiagnostics: readonly LayoutDiagnostic[] = [];
 let officeFontFaces: FontFace[] = [];
 function releaseRetainedFonts(): void {
   const office = officeFontFaces;
-  const google = googleFontFaces;
+  const sources = fontSourceSession;
   const embedded = embeddedFontFaces;
   officeFontFaces = [];
-  googleFontFaces = [];
+  fontSourceSession = null;
+  chartFontSubstitutionsOfDoc = undefined;
   embeddedFontFaces = [];
   try { unloadOfficeFontFallbacks(office); } catch {}
-  try { unloadGoogleFonts(google); } catch {}
+  try { sources?.release(); } catch {}
   try { unregisterEmbeddedFonts(embedded); } catch {}
 }
 const rawParts = new BoundedRawPartCache({
@@ -157,6 +161,9 @@ const post = (
   transfer?: Transferable[],
 ) => rawPost(msg, transfer);
 const svgDecodeClient = new WorkerSvgDecodeClient(rawPost);
+/** Runs `fontResolver` sources on main (core `resolver-bridge.ts`); reset with
+ * every parse, so a reply for a superseded document is dropped. */
+const fontResolverClient = new WorkerFontResolverClient(rawPost);
 
 /** In-worker image-byte loader (twin of pptx's render-worker `getImage`). The
  *  renderer's `fetchImage` routes here in worker mode, so image bytes are
@@ -178,6 +185,7 @@ self.onmessage = async (e: MessageEvent<RenderWorkerWireRequest | WorkerSvgDecod
     svgDecodeClient.accept(req);
     return;
   }
+  if (fontResolverClient.accept(req)) return;
   if (isDocumentPullCommand(req)) {
     try {
       if (!fallbackPull) throw new Error('DOCX vertical fallback session is not open');
@@ -219,6 +227,7 @@ self.onmessage = async (e: MessageEvent<RenderWorkerWireRequest | WorkerSvgDecod
     }
     if (req.type === 'parse') {
       requestedGeneration = ++parseGeneration;
+      fontResolverClient.reset();
       for (const resolve of hostFontMeasurements.values()) resolve([]);
       hostFontMeasurements.clear();
       // A superseded parse's measurement reply is discarded by the host.
@@ -336,13 +345,17 @@ self.onmessage = async (e: MessageEvent<RenderWorkerWireRequest | WorkerSvgDecod
       }
       let adapted: ReturnType<typeof layoutSourceModelAdapterFromOwnedModel>;
       let nativeRouteRequests: ReturnType<typeof nativeRouteLineRequests>;
+      let fontSources: readonly FontSource[];
       try {
+        // Descriptors crossed the realm boundary: validate them as strictly as
+        // the factories did (TypeError / font-source-limit reject the load).
+        fontSources = req.fonts === undefined ? [] : assertFontSourceDescriptors(req.fonts);
         adapted = layoutSourceModelAdapterFromOwnedModel(
           pulledModels.document,
           pulledModels.ownedLayoutDocument,
         );
         nativeRouteRequests = nativeRouteLineRequests(adapted.source, adapted.document, {
-          useGoogleFonts: !!req.useGoogleFonts, cjkFallback: req.cjkFallback,
+          fontSubstitutes: declaredFontSubstitutions(fontSources), cjkFallback: req.cjkFallback,
         });
       } catch (error) {
         unloadOfficeFontFallbacks(nativeSentinels);
@@ -354,7 +367,7 @@ self.onmessage = async (e: MessageEvent<RenderWorkerWireRequest | WorkerSvgDecod
         comments: model.comments ?? [],
         revisions: model.revisions ?? [],
       };
-      let googleFaces: FontFace[] = [];
+      let loadedSources: DocxLoadedFontSources | undefined;
       let embeddedFonts: Awaited<ReturnType<typeof loadEmbeddedFonts>> = { faces: [], metrics: {}, routes: [] };
       let officeFaces: FontFace[] = [];
       let fontsTransferred = false;
@@ -383,7 +396,7 @@ self.onmessage = async (e: MessageEvent<RenderWorkerWireRequest | WorkerSvgDecod
           });
           if (requestedGeneration !== parseGeneration) throw new Error('render-worker parse was superseded');
         }
-        let officeFonts = await loadOfficeFontFallbacks(docxOfficeFontFallbackRequests(model, { useGoogleFonts: req.useGoogleFonts, cjkFallback: req.cjkFallback }).filter((request) =>
+        let officeFonts = await loadOfficeFontFallbacks(docxOfficeFontFallbackRequests(model, { fontDemand: fontSources.length > 0, cjkFallback: req.cjkFallback }).filter((request) =>
           request.presenceOnly || !embeddedFonts.routes.some((route) => route.requestedFamily.toLowerCase() === request.family.toLowerCase()
             && route.weight === (request.weight ?? 400) && route.style === (request.style ?? 'normal'))));
         officeFaces = officeFonts.faces;
@@ -398,12 +411,15 @@ self.onmessage = async (e: MessageEvent<RenderWorkerWireRequest | WorkerSvgDecod
         }
         if (requestedGeneration !== parseGeneration) throw new Error('render-worker parse was superseded');
         let installedSubstituteFamilies: readonly string[] = [];
-        if (req.useGoogleFonts) {
+        if (fontSources.length > 0) {
           // Pagination measures text, so each admitted face must be available
-          // before canonical layout in both worker and main mode.
-          const plan = docxGoogleFontPlan(model, req.cjkFallback, officeFonts);
+          // before canonical layout in both worker and main mode. Same plan,
+          // demand and session as main mode, registered into self.fonts.
+          const presence = await completeDocxFontPresence(model, fontSources, req.cjkFallback, officeFonts);
+          if (requestedGeneration !== parseGeneration) throw new Error('render-worker parse was superseded');
+          const plan = docxFontFamilyPlan(model, fontSources, req.cjkFallback, presence);
           installedSubstituteFamilies = plan.installedSubstituteFamilies;
-          googleFaces = await preloadGoogleFonts(plan.names, DOCX_GOOGLE_FONTS);
+          loadedSources = await loadDocxFontSources(model, plan, fontSources, fontResolverClient.sessionOptions);
           if (requestedGeneration !== parseGeneration) throw new Error('render-worker parse was superseded');
         }
         const preparedMath = requestedRenderers.math && source.mathOccurrences.length > 0
@@ -413,11 +429,11 @@ self.onmessage = async (e: MessageEvent<RenderWorkerWireRequest | WorkerSvgDecod
         const serviceOptions = {
           allowFootnoteContinuation: req.allowFootnoteContinuation === true,
           fontMetrics: embeddedFonts.metrics,
-          useGoogleFonts: !!req.useGoogleFonts,
+          fontSubstitutes: declaredFontSubstitutions(fontSources),
           cjkFallback: req.cjkFallback,
           embeddedRoutes: embeddedFonts.routes,
           officeRoutes: Object.values(officeFonts.routes),
-          googleFaces,
+          sourceFonts: loadedSources,
           installedSubstituteFamilies,
           installedFamilies: officeFonts.installed,
           mathResources: preparedMath?.records,
@@ -438,7 +454,8 @@ self.onmessage = async (e: MessageEvent<RenderWorkerWireRequest | WorkerSvgDecod
         );
         if (requestedGeneration !== parseGeneration) throw new Error('render-worker parse was superseded');
         officeFontFaces = officeFaces;
-        googleFontFaces = googleFaces;
+        fontSourceSession = loadedSources?.session ?? null;
+        chartFontSubstitutionsOfDoc = chartFontSubstitutions(loadedSources?.loaded.substitutions);
         embeddedFontFaces = embeddedFonts.faces;
         fontDiagnostics = embeddedFonts.diagnostics ?? [];
         fontsTransferred = true;
@@ -448,7 +465,7 @@ self.onmessage = async (e: MessageEvent<RenderWorkerWireRequest | WorkerSvgDecod
         if (!fontsTransferred) {
           if (!officeFaces.includes(nativeSentinels[0]!)) unloadOfficeFontFallbacks(nativeSentinels);
           try { unloadOfficeFontFallbacks(officeFaces); } catch {}
-          try { unloadGoogleFonts(googleFaces); } catch {}
+          try { loadedSources?.session.release(); } catch {}
           try { unregisterEmbeddedFonts(embeddedFonts.faces); } catch {}
         }
       }
@@ -573,6 +590,7 @@ self.onmessage = async (e: MessageEvent<RenderWorkerWireRequest | WorkerSvgDecod
         regionMap: renderers.regionMap,
         chartEx: renderers.chartEx,
         tiff: renderers.tiff,
+        chartFontSubstitutions: chartFontSubstitutionsOfDoc,
       });
       const runs = textRunsForSelectedPage(doc.layoutServices, req.pageIndex, {
         ...req.opts,

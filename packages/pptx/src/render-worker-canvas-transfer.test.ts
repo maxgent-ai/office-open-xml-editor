@@ -46,8 +46,8 @@ class FakePptxArchive {
 vi.mock('./wasm/pptx_parser.js', () => ({
   default: async () => undefined, reinit: async () => undefined, PptxArchive: FakePptxArchive,
 }));
-vi.mock('./google-fonts', async (load) => ({
-  ...await load<typeof import('./google-fonts')>(),
+vi.mock('./font-requests', async (load) => ({
+  ...await load<typeof import('./font-requests')>(),
   pptxSlideOfficeFontRequests: () => [],
 }));
 vi.mock('./renderer', () => ({ renderSlideWithEmbeddedFonts: mocks.render, dropImageBitmapCache: vi.fn() }));

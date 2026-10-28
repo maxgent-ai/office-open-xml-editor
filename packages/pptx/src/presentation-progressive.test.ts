@@ -136,7 +136,7 @@ describe('PptxPresentation progressive layout lifecycle', () => {
       _parse(
         buffer: ArrayBuffer,
         resourcePolicy: typeof policy,
-        useGoogleFonts: boolean,
+        fonts: unknown,
       timeoutMs: number,
         onUsage: undefined,
         renderers: undefined,
@@ -287,7 +287,7 @@ describe('PptxPresentation progressive layout lifecycle', () => {
       _parse(
         buffer: ArrayBuffer,
         resourcePolicy: typeof policy,
-        useGoogleFonts: boolean,
+        fonts: unknown,
         timeoutMs: undefined,
         onUsage: undefined,
         renderers: undefined,
@@ -416,7 +416,7 @@ describe('PptxPresentation progressive layout lifecycle', () => {
       _parse(
         buffer: ArrayBuffer,
         resourcePolicy: typeof policy,
-        useGoogleFonts: boolean,
+        fonts: unknown,
         timeoutMs: undefined,
         onUsage: undefined,
         renderers: undefined,
@@ -492,7 +492,7 @@ describe('PptxPresentation progressive layout lifecycle', () => {
       _parse(
         buffer: ArrayBuffer,
         resourcePolicy: typeof policy,
-        useGoogleFonts: boolean,
+        fonts: unknown,
         timeoutMs: undefined,
         onUsage: undefined,
         renderers: undefined,
@@ -681,7 +681,7 @@ describe('PptxPresentation progressive layout lifecycle', () => {
 
     await (presentation as unknown as {
       _parse(
-        buffer: ArrayBuffer, resourcePolicy: typeof policy, useGoogleFonts: boolean,
+        buffer: ArrayBuffer, resourcePolicy: typeof policy, fonts: unknown,
         timeoutMs: undefined, onUsage: undefined, renderers: undefined,
         progressive: typeof lifecycle,
       ): Promise<void>;
@@ -732,7 +732,7 @@ describe('PptxPresentation progressive layout lifecycle', () => {
     let released = false;
     const parsing = (presentation as unknown as {
       _parse(
-        buffer: ArrayBuffer, resourcePolicy: typeof policy, useGoogleFonts: boolean,
+        buffer: ArrayBuffer, resourcePolicy: typeof policy, fonts: unknown,
         timeoutMs: undefined, onUsage: undefined, renderers: undefined,
         progressive: typeof lifecycle,
       ): Promise<void>;

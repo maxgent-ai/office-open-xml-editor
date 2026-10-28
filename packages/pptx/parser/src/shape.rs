@@ -1366,9 +1366,9 @@ pub(crate) struct BlipSource {
 ///
 /// Shared by `parse_picture` and `parse_ole_preview_picture` so the ordinary and
 /// OLE-preview picture paths resolve blips identically.
-fn parse_picture_blip_effects<R: ooxml_common::color::ThemeResolver + ?Sized>(
+fn parse_picture_blip_effects(
     blip_fill: roxmltree::Node<'_, '_>,
-    resolver: &R,
+    resolver: &dyn ooxml_common::color::ThemeResolver,
     tint_mode: ooxml_common::color::TintMode,
     part: &str,
     rels: &HashMap<String, String>,

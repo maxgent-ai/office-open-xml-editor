@@ -49,7 +49,11 @@ export function boundedSvgRasterSize(width: number, height: number): { width: nu
 
 /** Smallest bounded source grid that covers the requested axes without changing
  * the SVG's intrinsic aspect ratio. Target axes are coverage requirements, as
- * they are for ordinary raster decode; they are not a replacement aspect ratio. */
+ * they are for ordinary raster decode; they are not a replacement aspect ratio.
+ * Consequently the grid is not the target box: a square SVG requested at 96×87
+ * yields 96×96. Retained-surface ceilings for an SVG raster must be derived from
+ * this grid (see `assertSvgRasterCoverage`), never from `width × height` of the
+ * request. */
 function svgRasterCoverageSize(
   sourceWidth: number,
   sourceHeight: number,
@@ -93,6 +97,34 @@ function svgRasterCoverageSize(
     );
   }
   return boundedSvgRasterSize(Math.ceil(sourceWidth), Math.ceil(sourceHeight));
+}
+
+/** Fail closed when a decoded SVG raster is larger than the coverage grid its
+ * request admits. The admitted grid is `svgRasterCoverageSize` of the
+ * surface's own aspect ratio, which a conforming decoder already returned:
+ * one requested axis matches its target and the other follows the authored
+ * aspect, or both shrink under the per-image quota. A surface that exceeds
+ * every requested axis was over-rasterized (for example by an injected
+ * decoder) and is rejected here instead of being retained. The hard per-image
+ * dimension/pixel quota is enforced separately by the caller. */
+export function assertSvgRasterCoverage(
+  width: number,
+  height: number,
+  target: SvgDecodeTarget,
+): void {
+  const targetWidth = finitePositive(target.targetWidthPx);
+  const targetHeight = finitePositive(target.targetHeightPx);
+  if (targetWidth === undefined && targetHeight === undefined) return;
+  if (!(width > 0) || !(height > 0)) return;
+  const exceedsWidth = targetWidth === undefined || width > targetWidth;
+  const exceedsHeight = targetHeight === undefined || height > targetHeight;
+  if (!exceedsWidth || !exceedsHeight) return;
+  const admitted = svgRasterCoverageSize(width, height, targetWidth, targetHeight);
+  throw new OoxmlDecodedImageLimitError(
+    'image-pixels',
+    admitted.width * admitted.height,
+    width * height,
+  );
 }
 
 /** Decode SVG with the Window's standards-compliant image pipeline, then

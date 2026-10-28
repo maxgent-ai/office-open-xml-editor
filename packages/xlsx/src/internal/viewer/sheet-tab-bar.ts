@@ -21,6 +21,10 @@ const SHEET_LIST_EDGE = 8;
 const SHEET_LIST_MAX_W = 320;
 /** Tooltip suffix on the scroll buttons where the sheet list is available. */
 const SHEET_LIST_HINT = ' (right-click for sheet list)';
+/** The parser's resolved tab-color contract (`canonical_rgb_hex` in
+ *  ooxml-common): `#RRGGBB`. Checked again here because the value is painted
+ *  into CSS; anything else draws no bar (#1957). */
+const TAB_COLOR = /^#[0-9A-Fa-f]{6}$/;
 
 /** Workbook facts and navigation the tab strip needs from its engine. */
 export interface SheetTabBarHost {
@@ -62,7 +66,8 @@ export class SheetTabBar {
   /** Popover listing every sheet; attached only where the Popover API exists. */
   readonly sheetList: HTMLDivElement;
   tabs: HTMLButtonElement[] = [];
-  /** Per-tab colors parallel to `tabs`, from `<sheetPr><tabColor>`. */
+  /** Per-tab `#RRGGBB` colors parallel to `tabs`, from `<sheetPr><tabColor>`;
+   *  `null` for no (or a non-`#RRGGBB`) color. */
   tabColors: (string | null)[] = [];
   private readonly ownerDocument: Document;
   private readonly navGroup: HTMLDivElement;
@@ -154,12 +159,15 @@ export class SheetTabBar {
     this.tabListeners = new ListenerScope();
     this.tabList.innerHTML = '';
     this.tabs = [];
-    this.tabColors = tabColors;
+    this.tabColors = sheetNames.map((_, i) => {
+      const color = tabColors[i];
+      return color && TAB_COLOR.test(color) ? color : null;
+    });
     sheetNames.forEach((name, i) => {
       const btn = this.ownerDocument.createElement('button');
       btn.textContent = name;
       btn.title = name;
-      btn.style.cssText = this.tabCss(i, false);
+      this.styleTab(btn, i, false);
       this.tabListeners.on(btn, 'click', () => this.host.selectSheet(i));
       this.tabList.appendChild(btn);
       this.tabs.push(btn);
@@ -241,9 +249,7 @@ export class SheetTabBar {
     // An open sheet list updates its two affected items in place.
     this.styleListItem(previous);
     this.styleListItem(index);
-    this.tabs.forEach((btn, i) => {
-      btn.style.cssText = this.tabCss(i, i === index);
-    });
+    this.tabs.forEach((btn, i) => this.styleTab(btn, i, i === index));
     // Keep the active tab visible by scrolling the tab strip HORIZONTALLY only.
     // `scrollIntoView` walks every scrollable ancestor, so it also scrolls the
     // page vertically — on first load that jumped the whole page down to the
@@ -278,7 +284,7 @@ export class SheetTabBar {
     this.tabList.style.flexDirection = rtl ? 'row-reverse' : 'row';
   }
 
-  private tabStyle(active: boolean, tabColor?: string | null): string {
+  private tabStyle(active: boolean): string {
     // Active tab renders taller than inactive so the selected sheet draws the
     // eye. Tabs align to flex-end, so shorter inactive tabs sit lower and the
     // active tab sticks up. Font size also bumps a hair on active.
@@ -290,26 +296,29 @@ export class SheetTabBar {
       `border-radius:3px 3px 0 0;` +
       `cursor:pointer;white-space:nowrap;max-width:160px;overflow:hidden;text-overflow:ellipsis;` +
       `outline:none;box-sizing:border-box;`;
-    // `<sheetPr><tabColor>` renders as a color bar along the tab's bottom edge
-    // (Excel's "sheet tab color" treatment), drawn as an inset bottom shadow so
-    // it doesn't fight the tab's own border/background. The active tab keeps a
-    // thinner bar since its bottom merges into the white sheet body.
-    const bar = tabColor
-      ? `box-shadow:inset 0 -${active ? 2 : 3}px 0 0 ${tabColor};`
-      : '';
     return active
       ? base +
         `height:${activeH}px;font-size:13px;` +
         `background:var(--ooxml-xlsx-chrome-surface,#fff);` +
         `color:var(--ooxml-xlsx-chrome-text,#000);` +
         `border-bottom:1px solid var(--ooxml-xlsx-chrome-surface,#fff);` +
-        `font-weight:600;top:1px;` +
-        bar
+        `font-weight:600;top:1px;`
       : base +
         `height:${inactiveH}px;font-size:11px;` +
         `background:var(--ooxml-xlsx-chrome-surface-muted,#e0e0e0);` +
-        `color:var(--ooxml-xlsx-chrome-text-muted,#555);` +
-        bar;
+        `color:var(--ooxml-xlsx-chrome-text-muted,#555);`;
+  }
+
+  /** Apply the tab's full style. `<sheetPr><tabColor>` renders as a color bar
+   *  along the tab's bottom edge (Excel's "sheet tab color" treatment), drawn as
+   *  an inset bottom shadow so it doesn't fight the tab's own border/background.
+   *  The active tab keeps a thinner bar since its bottom merges into the white
+   *  sheet body. The color is set as its own property, never spliced into
+   *  `cssText`, so document text cannot add declarations. */
+  private styleTab(btn: HTMLButtonElement, i: number, active: boolean): void {
+    btn.style.cssText = this.tabCss(i, active);
+    const color = this.tabColors[i];
+    if (color) btn.style.boxShadow = `inset 0 -${active ? 2 : 3}px 0 0 ${color}`;
   }
 
   /**
@@ -319,7 +328,7 @@ export class SheetTabBar {
    * by both build and setActive so navigation never wipes the styling.
    */
   private tabCss(i: number, active: boolean): string {
-    let css = this.tabStyle(active, this.tabColors[i]);
+    let css = this.tabStyle(active);
     const mode = this.host.hiddenSheetMode();
     if (mode !== 'show' && this.host.isHidden(i)) {
       css += mode === 'skip' ? 'display:none;' : `opacity:${HIDDEN_TAB_DIM_OPACITY};`;

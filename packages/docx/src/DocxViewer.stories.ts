@@ -1,6 +1,7 @@
 import type { Meta, StoryObj } from '@storybook/html';
 import { DocxDocument } from './document';
 import { DocxViewer } from './viewer';
+import { googleFonts } from '@silurus/ooxml-core/internal/font-sources';
 import { math } from '../../../src/math';
 import { threeD } from '../../../src/three-d';
 import { regionMap } from '../../../src/region-map';
@@ -72,7 +73,7 @@ export function buildViewerUI(
     width: args.width,
     dpr: window.devicePixelRatio,
     enableTextSelection: true,
-    useGoogleFonts: true,
+    fonts: [googleFonts()],
     math,
     threeD,
     regionMap,
@@ -202,7 +203,7 @@ function renderFileUpload(args: Args, mode: 'main' | 'worker'): HTMLElement {
         dpr: window.devicePixelRatio,
         debug: args.debug,
         enableTextSelection: true,
-        useGoogleFonts: true,
+        fonts: [googleFonts()],
         math,
         threeD,
         regionMap,

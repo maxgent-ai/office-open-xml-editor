@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { sourceFontLayoutOptions } from '../testing/font-sources.js';
 import {
   buildSegments,
   layoutLines,
@@ -817,8 +818,7 @@ describe('production layout service integration', () => {
     });
     const failed = createLayoutServices(doc, {
       measureContext: measureContext(),
-      googleFaces: [],
-      useGoogleFonts: true,
+      ...sourceFontLayoutOptions(doc, []),
     });
     const missingEmbedded = failed.text.shape({ text: 'x', fontSizePt: 10, fonts: { ascii: 'Broken Embedded' } });
     const missingGoogle = failed.text.shape({ text: 'x', fontSizePt: 10, fonts: { ascii: 'Calibri' } });
@@ -829,12 +829,55 @@ describe('production layout service integration', () => {
     const carlito = { family: 'Carlito', weight: '400', style: 'normal', status: 'loaded' } as FontFace;
     const loaded = createLayoutServices(doc, {
       measureContext: measureContext(),
-      googleFaces: [carlito],
-      useGoogleFonts: true,
+      ...sourceFontLayoutOptions(doc, [carlito]),
     });
     const substituted = loaded.text.shape({ text: 'x', fontSizePt: 10, fonts: { ascii: 'Calibri' } });
     expect(substituted.spans[0]?.font).toMatchObject({ source: 'substitute', resolvedFamily: 'Carlito' });
     expect(substituted.diagnostics[0]?.message).toMatch(/implementation-dependent/i);
+    // CSS font matching: a regular-only loaded substitute still paints bold
+    // and italic (synthesized) instead of dropping to the host fallback.
+    for (const [weight, style] of [[700, 'normal'], [400, 'italic'], [700, 'italic']] as const) {
+      const styled = loaded.text.shape({ text: 'x', fontSizePt: 10, fonts: { ascii: 'Calibri' }, weight, style });
+      expect(styled.spans[0]?.font).toMatchObject({ source: 'substitute', resolvedFamily: 'Carlito', weight, style });
+      expect(styled.spans[0]?.font.route.familyList).toMatch(/^"Carlito"/);
+    }
+  });
+
+  it('keeps a loaded source family whatever its face descriptors declare', () => {
+    const doc = model({ majorFont: 'Calibri' });
+    // Oblique (with an angle range), a weight range and a stretch: CSS
+    // matching paints the family for every tuple, so none may be filtered.
+    for (const descriptors of [
+      { style: 'oblique', weight: '400', stretch: 'normal' },
+      { style: 'oblique 10deg 20deg', weight: '100 900', stretch: 'condensed' },
+      { style: 'normal', weight: '350', stretch: '75%' },
+    ]) {
+      const face = { family: 'Review Served', unicodeRange: 'U+0-10FFFF', sourceIndex: 0, face: {} as FontFace, ...descriptors };
+      for (const [requested, substitution] of [
+        ['Review Missing', { family: 'Review Served' }],
+        ['Review Served', undefined],
+      ] as const) {
+        const services = createLayoutServices(doc, {
+          measureContext: measureContext(),
+          fontSubstitutes: [{ for: 'Review Missing', use: 'Review Served' }],
+          sourceFonts: {
+            names: [requested],
+            loaded: {
+              faces: [face],
+              substitutions: new Map(substitution ? [['review missing', substitution]] : []),
+              regularAliases: new Map(),
+            },
+          },
+        });
+        for (const [weight, style] of [[400, 'normal'], [700, 'normal'], [400, 'italic'], [700, 'italic']] as const) {
+          const shaped = services.text.shape({ text: 'x', fontSizePt: 10, fonts: { ascii: requested }, weight, style });
+          expect(shaped.spans[0]?.font, `${descriptors.style} ${requested} ${weight} ${style}`).toMatchObject({
+            source: substitution ? 'substitute' : 'source', resolvedFamily: 'Review Served',
+          });
+          expect(shaped.spans[0]?.font.route.familyList).toMatch(/^"Review Served"/);
+        }
+      }
+    }
   });
 
   it('collects every currently representable math story, including rich text boxes and nested tables', () => {
@@ -944,7 +987,6 @@ describe('production layout service integration', () => {
       measureContext: measureContext(),
       embeddedRoutes: [{ requestedFamily: 'Embedded', resolvedFamily: '__ooxml_docx_embedded_same',
         weight: 700, style: 'italic' as const, resourceIdentity: 'embedded:__ooxml_docx_embedded_same' }],
-      googleFaces: [] as FontFace[],
       localMetrics: { authored: { family: '__local_authored', lineHeightRatio: 1.25 } },
     };
     const main = createLayoutServices(model(), options);
@@ -959,8 +1001,8 @@ describe('production layout service integration', () => {
 
 it('retains CJK routes in registered and generic fonts with different service fingerprints', () => {
   const document = model({ majorFont: 'Calibri', minorFont: 'Calibri' });
-  const options = { measureContext: measureContext(), useGoogleFonts: true,
-    googleFaces: [{ family: 'Carlito', status: 'loaded', weight: '400', style: 'normal' }] as FontFace[],
+  const options = { measureContext: measureContext(),
+    ...sourceFontLayoutOptions(document, [{ family: 'Carlito', status: 'loaded', weight: '400', style: 'normal' }]),
   };
   const sc = createLayoutServices(document, { ...options, cjkFallback: 'sc' });
   const tc = createLayoutServices(document, { ...options, cjkFallback: 'tc' });

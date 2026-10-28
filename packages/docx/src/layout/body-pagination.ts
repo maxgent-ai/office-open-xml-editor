@@ -107,6 +107,21 @@ export function addPageFootnoteReserves(
   });
 }
 
+/** Replace the active flow region's footnote reserve, for note bands owned by
+ * one column (see the paginator's per-column footnote bands). */
+export function setBodyFootnoteReserve(
+  state: BodyPaginationState,
+  footnoteReservePt: number,
+): BodyPaginationState {
+  if (!Number.isFinite(footnoteReservePt) || footnoteReservePt < 0) {
+    throw new RangeError('A footnote reserve must be finite and non-negative');
+  }
+  return footnoteReservePt === state.footnoteReservePt ? state : retain({
+    ...state,
+    footnoteReservePt,
+  });
+}
+
 /** The reducer is the sole page-sequence owner. Acquisition can request a
  * transition, but it cannot mutate or append a canonical page draft. */
 export function commitPageFlowTransition(

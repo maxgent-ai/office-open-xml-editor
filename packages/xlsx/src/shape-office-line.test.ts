@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { PT_TO_PX, type OfficeFontFallbackRoute } from '@silurus/ooxml-core';
 import { bindXlsxOfficeFontRoutes, drawShapeText } from './renderer.js';
-import { xlsxWorksheetOfficeFontRequests } from './google-fonts.js';
+import { xlsxWorksheetOfficeFontRequests } from './font-requests.js';
 import {
   canvasShapeFontBoxProbe, excelShapeSpacing, shapeRunLineRatios, type ShapeFontBoxProbe,
 } from './shape-office-line.js';

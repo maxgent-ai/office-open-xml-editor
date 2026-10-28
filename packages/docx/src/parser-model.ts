@@ -266,11 +266,14 @@ export interface InternalDocxDocumentModel extends DocxDocumentModel {
     endnoteNumberStart?: number;
     footnoteSeparator?: NoteSeparatorMark;
     endnoteSeparator?: NoteSeparatorMark;
+    endnoteContinuationSeparator?: NoteSeparatorMark;
     footnoteContinuationSeparator?: NoteSeparatorMark;
-    /** Ordinary DOCX producer only: effective paragraphs of listed formatted
-     * footnote separator stories; see SelectedNoteSeparatorParagraphsInput. */
+    /** Ordinary DOCX producer only: effective paragraphs of listed separator
+     * stories; see SelectedNoteSeparatorParagraphsInput. */
     footnoteSeparatorParagraph?: DocParagraph;
     footnoteContinuationSeparatorParagraph?: DocParagraph;
+    endnoteSeparatorParagraph?: DocParagraph;
+    endnoteContinuationSeparatorParagraph?: DocParagraph;
     /** Producer extension only (not WordprocessingML); see
      * ReservedNoteSeparatorsInput. */
     reservedSeparators?: ReservedNoteSeparatorsInput;
@@ -321,8 +324,10 @@ export interface DocumentNoteLayoutSettingsInput {
   readonly endnoteNumbering: Readonly<{ format: string; start: number }>;
   readonly footnoteSeparator: NoteSeparatorInput;
   readonly endnoteSeparator: NoteSeparatorInput;
+  readonly endnoteContinuationSeparator: NoteSeparatorInput;
   readonly footnoteContinuationSeparator: NoteSeparatorInput;
   readonly footnoteSeparatorParagraphs?: SelectedNoteSeparatorParagraphsInput;
+  readonly endnoteSeparatorParagraphs?: SelectedNoteSeparatorParagraphsInput;
   readonly reservedSeparators?: ReservedNoteSeparatorsInput;
 }
 
@@ -392,17 +397,18 @@ function reservedNoteSeparatorsInput(
     ? value : { ...value, footnote, endnote } };
 }
 
-/** Ordinary DOCX formatted separator paragraphs (footnote kind). Each enters
- * only beside its own Short/Full mark; the closed shape is validated once at
+/** Ordinary DOCX effective separator paragraphs (both note kinds). Each enters
+ * only beside its own Short/Full/None mark; the closed shape is validated once at
  * normalization (layout/selected-note-separators). Automatic paragraph spacing
  * resolves here with the same document setting as every other story. */
 function selectedNoteSeparatorParagraphsInput(
   settings: InternalDocxDocumentModel['__noteLayoutSettings'],
   fixedParagraphAutoSpacing: boolean,
-): Readonly<{ footnoteSeparatorParagraphs?: SelectedNoteSeparatorParagraphsInput }> {
+): Readonly<{ footnoteSeparatorParagraphs?: SelectedNoteSeparatorParagraphsInput;
+  endnoteSeparatorParagraphs?: SelectedNoteSeparatorParagraphsInput }> {
   const resolve = (paragraph: DocParagraph | undefined, mark: unknown): DocParagraph | undefined => {
     if (paragraph === undefined) return undefined;
-    if (mark !== 'short' && mark !== 'full') throw new Error('Unsupported note separator story paragraph');
+    if (mark !== 'short' && mark !== 'full' && mark !== 'none') throw new Error('Unsupported note separator story paragraph');
     if (paragraph.beforeAutospacing !== true && paragraph.afterAutospacing !== true) return paragraph;
     return {
       ...paragraph,
@@ -413,11 +419,18 @@ function selectedNoteSeparatorParagraphsInput(
   const continuationSeparator = resolve(
     settings?.footnoteContinuationSeparatorParagraph, settings?.footnoteContinuationSeparator,
   );
-  if (!separator && !continuationSeparator) return {};
-  return { footnoteSeparatorParagraphs: {
-    ...(separator ? { separator } : {}),
-    ...(continuationSeparator ? { continuationSeparator } : {}),
-  } };
+  const endnoteSeparator = resolve(settings?.endnoteSeparatorParagraph, settings?.endnoteSeparator);
+  const endnoteContinuationSeparator = resolve(settings?.endnoteContinuationSeparatorParagraph, settings?.endnoteContinuationSeparator);
+  return {
+    ...(endnoteSeparator || endnoteContinuationSeparator ? { endnoteSeparatorParagraphs: {
+      ...(endnoteSeparator ? { separator: endnoteSeparator } : {}),
+      ...(endnoteContinuationSeparator ? { continuationSeparator: endnoteContinuationSeparator } : {}),
+    } } : {}),
+    ...(separator || continuationSeparator ? { footnoteSeparatorParagraphs: {
+      ...(separator ? { separator } : {}),
+      ...(continuationSeparator ? { continuationSeparator } : {}),
+    } } : {}),
+  };
 }
 
 /** §17.11.17/.18 numFmt defaults to decimal and §17.11.20 numStart to 1 for
@@ -450,6 +463,7 @@ function documentNoteLayoutSettingsInput(
     ),
     footnoteSeparator: noteSeparatorInput(settings?.footnoteSeparator),
     endnoteSeparator: noteSeparatorInput(settings?.endnoteSeparator),
+    endnoteContinuationSeparator: noteSeparatorInput(settings?.endnoteContinuationSeparator),
     footnoteContinuationSeparator: noteSeparatorInput(settings?.footnoteContinuationSeparator),
     ...selectedNoteSeparatorParagraphsInput(settings, doc.settings?.doNotUseHtmlParagraphAutoSpacing === true),
     // Closed tags only here; the source-model adapter validates the complete
@@ -1034,6 +1048,8 @@ function acquiredBodyParagraph(paragraph: DocParagraph, source: SourceRef) {
     keepLines: paragraph.keepLines === true,
     keepNext: paragraph.keepNext === true,
     widowControl: paragraph.widowControl !== false,
+    ...(paragraph.framePr?.vAnchor === 'text' && paragraph.framePr.dropCap === 'none'
+      ? { textFrameMember: true as const } : {}),
     spaceBeforePt: paragraph.spaceBefore ?? 0,
     spaceAfterPt: paragraph.spaceAfter ?? 0,
     contextualSpacing: paragraph.contextualSpacing === true,
@@ -1399,6 +1415,7 @@ export function bodyLayoutAcquisitionInput(doc: DocxDocumentModel): BodyLayoutAc
   return {
     sectionIndex,
     compatibilityMode: doc.settings?.compatibilityMode,
+    footnoteLayoutLikeWW8: doc.settings?.footnoteLayoutLikeWW8,
     evenAndOddHeaders: doc.section.evenAndOddHeaders,
     endnoteIds: (doc.endnotes ?? []).map((note) => note.id),
     noteLayoutSettings: documentNoteLayoutSettingsInput(doc),

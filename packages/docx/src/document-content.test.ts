@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { docxRenderedTextUsages } from './document-content.js';
-import { docxOfficeFontFallbackRequests } from './google-fonts.js';
+import { docxOfficeFontFallbackRequests } from './font-plan.js';
 import type { InternalFieldRun } from './parser-model.js';
 import type { DocxDocumentModel } from './types.js';
 

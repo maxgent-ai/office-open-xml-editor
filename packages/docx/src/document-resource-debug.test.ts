@@ -39,7 +39,7 @@ function installLoadHarness(): void {
       _parse(
         buffer: ArrayBuffer,
         resourcePolicy: object,
-        useGoogleFonts?: boolean,
+        fonts?: readonly unknown[],
         timeoutMs?: number,
       ): Promise<void>;
     },

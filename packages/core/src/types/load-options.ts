@@ -5,6 +5,7 @@ import type { ChartRegionMapRenderer } from '../chart/region-map-contract';
 import type { ChartExRenderer } from '../chart/chart-ex-contract';
 import type { TiffRenderer } from '../image/tiff-contract';
 import type { OoxmlResourceMetrics } from './resource-metrics.js';
+import type { FontSource } from '../fonts/source.js';
 
 /** A positive safe-integer byte count, or `null` to disable one public limit. */
 export type OoxmlResourceLimit = number | null;
@@ -101,14 +102,34 @@ export interface ProgressiveLayoutPartial {
  */
 export interface LoadOptions {
   /**
+   * Ordered font sources consulted for authored and library fallback families
+   * the host lacks. Default: none, so no font is requested from any network
+   * host and the canvas falls back to locally available fonts.
+   *
+   * Build the entries with the factories exported next to this type
+   * (`googleFonts()`, `cssApi()`, `fontFaceCss()`, `fontFiles()`). The first
+   * source that declares a face for a family claims it; later sources are not
+   * consulted for that family, and a claimed family never retries another
+   * source if its faces fail to load (the family then keeps its host fallback
+   * with a `console.warn`). Faces register under their real CSS family in the
+   * painting realm, and only the `unicode-range` subsets that intersect the
+   * document's painted characters are loaded.
+   *
+   * A hosted source receives the end user's IP address and User-Agent, which
+   * may have privacy / GDPR implications for your application.
+   */
+  fonts?: readonly FontSource[];
+  /**
+   * @deprecated Since 0.90; removed in 0.91. Replace `useGoogleFonts: true`
+   * with `fonts: [googleFonts()]`. Every format normalises it to exactly that and
+   * warns once per JavaScript realm; passing it together with `fonts` throws
+   * a `TypeError`, and `false` is a no-op that still warns.
+   *
    * Opt in to loading webfont substitutes from Google Fonts
    * (`fonts.googleapis.com`). Default `false` — the canvas falls back to
-   * locally available fonts.
-   *
-   * When enabled, end-user IP / User-Agent is sent to Google, which may
-   * have privacy / GDPR implications for your application. To avoid the
-   * third-party request, host the substitutes yourself and reference them
-   * via `@font-face` in your application CSS.
+   * locally available fonts. When enabled, end-user IP / User-Agent is sent
+   * to Google, which may have privacy / GDPR implications for your
+   * application.
    */
   useGoogleFonts?: boolean;
   /**

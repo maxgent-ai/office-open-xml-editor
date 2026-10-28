@@ -275,6 +275,7 @@ export class UpdateTextMutation extends Mutation {
       return Object.freeze([first, ...rest]) as NonEmptyReadonlyArray<OfficeCliCommand>;
     }
 
+    // ast-grep-ignore: no-plain-object-string-map -- keys are fixed OfficeCLI property names, never document names.
     const props: Record<string, string> = {};
     if (this.value !== undefined) props.text = this.value;
 
@@ -438,6 +439,7 @@ function styleToOfficeCliProps(
     );
   }
 
+  // ast-grep-ignore: no-plain-object-string-map -- this translator writes only fixed OfficeCLI property names.
   const props: Record<string, string> = {};
 
   if ('bold' in style && style.bold !== undefined) {

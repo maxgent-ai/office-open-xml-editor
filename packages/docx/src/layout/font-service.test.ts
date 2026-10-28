@@ -15,7 +15,7 @@ const faces: readonly FontInventoryFace[] = [
   { requestedFamily: 'Embedded Sans', resolvedFamily: 'Embedded Sans', source: 'embedded', weight: 400, style: 'normal' },
   { requestedFamily: 'Embedded Sans', resolvedFamily: 'Embedded Sans', source: 'embedded', weight: 700, style: 'italic' },
   { requestedFamily: 'Meiryo', resolvedFamily: '__ooxml_local_meiryo', source: 'local', weight: 400, style: 'normal' },
-  { requestedFamily: 'Calibri', resolvedFamily: 'Carlito', source: 'google' },
+  { requestedFamily: 'Calibri', resolvedFamily: 'Carlito', source: 'source' },
   { requestedFamily: 'Legacy Arabic', resolvedFamily: 'Noto Naskh Arabic', source: 'substitute' },
   { requestedFamily: 'Theme Serif', resolvedFamily: 'Theme Serif', source: 'local' },
 ];
@@ -196,7 +196,7 @@ describe('font layout services', () => {
     expect(resolver.resolve({ requestedFamily: 'Meiryo', weight: 700 }))
       .toMatchObject({ source: 'native', resolvedFamily: 'Meiryo', genericFamily: 'sans-serif' });
     expect(resolver.resolve({ requestedFamily: 'Calibri' }))
-      .toMatchObject({ source: 'google', resolvedFamily: 'Carlito' });
+      .toMatchObject({ source: 'source', resolvedFamily: 'Carlito' });
 
     const substituted = resolver.resolve({ requestedFamily: 'Legacy Arabic' });
     expect(substituted).toMatchObject({ source: 'substitute', resolvedFamily: 'Noto Naskh Arabic' });

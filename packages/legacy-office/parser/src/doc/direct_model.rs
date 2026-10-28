@@ -63,6 +63,7 @@ pub(super) fn build(
             default_tab_stop: Some(f64::from(settings.default_tab_twips) / 20.0),
             adjust_line_height_in_table: Some(settings.adjust_line_height_in_table),
             split_pg_break_and_para_mark: settings.split_pg_break_and_para_mark,
+            footnote_layout_like_ww8: settings.footnote_layout_like_ww8,
             do_not_use_html_paragraph_auto_spacing: settings.do_not_use_html_paragraph_auto_spacing,
             balance_single_byte_double_byte_width: Some(
                 settings.balance_single_byte_double_byte_width,

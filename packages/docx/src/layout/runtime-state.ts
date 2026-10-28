@@ -400,9 +400,9 @@ export function createParagraphAcquisitionCacheServicesView(
   const workBudget = createPaginationWorkBudget(layoutSourceStoreOf(services));
   paragraphAcquisitionCaches.set(view, createParagraphAcquisitionRuntimeCache(workBudget));
   headerFooterLayoutCaches.set(view, createHeaderFooterLayoutCache(() => workBudget.noteMiss()));
-  if (services.allowFootnoteContinuation === true) {
-    footnoteAcquisitionWorkBudgets.set(view, createFootnoteAcquisitionWorkBudget());
-  }
+  // Endnotes always continue independently of the footnote display option.
+  // Every pagination scope owns the same aggregate ledger for both kinds.
+  footnoteAcquisitionWorkBudgets.set(view, createFootnoteAcquisitionWorkBudget());
   return view;
 }
 

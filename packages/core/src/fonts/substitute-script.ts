@@ -12,11 +12,17 @@
  *
  * This is library font-substitution policy (ECMA-376 §17.8.2 leaves
  * substitution implementation-defined), not an Office layout rule. It is shared
- * by every format that consults {@link GOOGLE_FONT_SUBSTITUTES}.
+ * by every format that consumes script-scoped font substitutions
+ * (`substitutions.ts`, `FontSubstitution.script`).
  */
 import { graphemeClusterOffsets } from '../text/sea-break.js';
 
 export type FontSubstituteScript = 'arabic';
+
+/** Every {@link FontSubstituteScript}, for callers that admit all scoped
+ * substitutes of a family whatever its text (theme fonts, which govern
+ * inherited runs) or validate a demand's scripts. */
+export const FONT_SUBSTITUTE_SCRIPTS: readonly FontSubstituteScript[] = Object.freeze(['arabic']);
 
 const FORMAT_CONTROL = /^\p{Cf}$/u;
 const WHITE_SPACE = /^\s$/u;

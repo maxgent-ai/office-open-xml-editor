@@ -1,3 +1,4 @@
+import { googleFonts } from '@silurus/ooxml-core/internal/font-sources';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
 /**
@@ -102,12 +103,28 @@ vi.mock('@silurus/ooxml-core', async (importOriginal) => ({
   loadOfficeFontFallbacks: fontMocks.load,
   unloadOfficeFontFallbacks: fontMocks.unload,
 }));
+// No family is installed on the test host: every presence probe completes
+// and finds nothing, without driving the fake FontFace through local() loads.
+vi.mock('@silurus/ooxml-core/internal/font-sources', async (importOriginal) => {
+  const original = await importOriginal<typeof import('@silurus/ooxml-core/internal/font-sources')>();
+  const probe = async (families: readonly string[]) => ({
+    installed: new Set<string>(),
+    checked: new Set(families.map((family) => family.trim().toLowerCase())),
+  });
+  return {
+    ...original,
+    probeFontFamilyPresence: probe,
+    InstalledFamilyExclusion: class extends original.InstalledFamilyExclusion {
+      constructor() { super(probe); }
+    },
+  };
+});
 vi.mock('@silurus/ooxml-core/internal/model-source', async (importOriginal) => ({
   ...await importOriginal<typeof import('@silurus/ooxml-core/internal/model-source')>(),
   openModelSourceModule: (...args: unknown[]) => openSourceMock(...args),
 }));
-vi.mock('./google-fonts', async (importOriginal) => ({
-  ...await importOriginal<typeof import('./google-fonts')>(),
+vi.mock('./font-requests', async (importOriginal) => ({
+  ...await importOriginal<typeof import('./font-requests')>(),
   pptxSlideOfficeFontRequests: fontMocks.requests,
 }));
 vi.mock('./renderer', () => ({ renderSlideWithEmbeddedFonts: fontMocks.render }));
@@ -348,7 +365,7 @@ describe('pptx render-worker.ts — init failure never hangs a request (AR4)', S
 });
 
 
-describe('Google subset readiness in progressive render owners', SUITE_OPTIONS, () => {
+describe('font-source subset readiness in progressive render owners', SUITE_OPTIONS, () => {
   it.each(['default', 'source'] as const)('loads a later subset of an already requested family before publication (%s)', async (variant) => {
     subsetSlides = ['A', 'B'];
     initMock.mockResolvedValue(undefined);
@@ -368,7 +385,7 @@ describe('Google subset readiness in progressive render owners', SUITE_OPTIONS, 
     const fake = await loadRenderWorker();
     fake.fonts = { add: (f: FontFace) => faces.push(f as unknown as typeof faces[number]), delete: () => true } as unknown as FontFaceSet;
     fake.onmessage?.({ data: { kind: 'init', wasmUrl: 'x' } } as MessageEvent);
-    fake.onmessage?.({ data: { kind: 'parse', id: 71, buffer: new ArrayBuffer(4), resourcePolicy, useGoogleFonts: true, progressiveLayout: true,
+    fake.onmessage?.({ data: { kind: 'parse', id: 71, buffer: new ArrayBuffer(4), resourcePolicy, fonts: [googleFonts()], progressiveLayout: true,
       ...(variant === 'source' ? { source: modelSource, sourceOwnerUrl: './internal/worker-presentation-source.js' } : {}),
     } } as MessageEvent);
     await settle(() => expect(faces.map(f => f.loadCalls)).toEqual([0, 1]));
@@ -411,12 +428,12 @@ describe('Google subset readiness in progressive render owners', SUITE_OPTIONS, 
     fake.fonts = { add: (f: FontFace) => faces.push(f as unknown as typeof faces[number]), delete: () => true } as unknown as FontFaceSet;
     const send = (data: unknown) => fake.onmessage?.({ data } as MessageEvent);
     send({ kind: 'init', wasmUrl: 'x' });
-    send({ kind: 'parse', id: 90, buffer: new ArrayBuffer(4), resourcePolicy, useGoogleFonts: true,
+    send({ kind: 'parse', id: 90, buffer: new ArrayBuffer(4), resourcePolicy, fonts: [googleFonts()],
       renderers: { chartEx: { protocol: 'ooxml-worker-renderer-module/v1', builtin: 'chartEx' } },
       ...(variant === 'source' ? { source: modelSource, sourceOwnerUrl: './internal/worker-presentation-source.js' } : {}),
     });
     await settle(() => expect(fake.posted).toContainEqual(expect.objectContaining({ kind: 'presentationReady', id: 90 })));
-    // collectRuns awaits the worker's settled Google preload.
+    // collectRuns awaits the worker's settled font-source preload.
     send({ kind: 'collectRuns', id: 91, slideIndex: 0, width: 100 });
     await settle(() => expect(fake.posted).toContainEqual(expect.objectContaining({ kind: 'runsCollected', id: 91 })));
     expect(faces.filter((f) => f.status === 'loaded').map((f) => f.source)).toEqual([expect.stringContaining('/a.woff2')]);

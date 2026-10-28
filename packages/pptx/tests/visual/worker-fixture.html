@@ -8,7 +8,7 @@
   <canvas id="main-canvas"></canvas>
   <canvas id="worker-canvas"></canvas>
   <script type="module">
-    import { PptxPresentation } from '/src/index.ts';
+    import { PptxPresentation, googleFonts } from '/src/index.ts';
     import { math } from '@ooxml-test-math-renderer';
     import { threeD } from '@ooxml-test-three-d-renderer';
     import { regionMap } from '@ooxml-test-region-map-renderer';
@@ -34,8 +34,8 @@
       };
 
       const renderers = { math, threeD, regionMap, chartEx };
-      const main = await PptxPresentation.load(buf.slice(0), { useGoogleFonts: true, ...renderers });
-      const wk = await PptxPresentation.load(buf.slice(0), { mode: 'worker', useGoogleFonts: true, ...renderers });
+      const main = await PptxPresentation.load(buf.slice(0), { fonts: [googleFonts()], ...renderers });
+      const wk = await PptxPresentation.load(buf.slice(0), { mode: 'worker', fonts: [googleFonts()], ...renderers });
       const renderBoth = async (slideIndex) => {
         paint('main-canvas', await main.renderSlideToBitmap(slideIndex, { width, dpr }));
         paint('worker-canvas', await wk.renderSlideToBitmap(slideIndex, { width, dpr }));

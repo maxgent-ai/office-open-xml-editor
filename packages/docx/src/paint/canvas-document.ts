@@ -1,3 +1,4 @@
+import { withChartFontSubstitutions } from '@silurus/ooxml-core/internal/chart-font-sources';
 import { acquireVmlImageBrush } from './browser-vml-image-brush.js';
 import {
   withBitmapCacheLease,
@@ -81,6 +82,10 @@ export interface CanvasDocumentPaintOptions<TTextRun> {
   readonly chartEx?: ChartExRenderer;
   readonly tiff?: TiffRenderer;
   readonly imageResources?: ImageResourceOptions;
+  /** The unscoped substitutions this document's font sources loaded
+   * (`ChartModel.fontSubstitutions`); chart text paints them after the
+   * authored face. Absent without sources. */
+  readonly chartFontSubstitutions?: Readonly<Record<string, string>>;
 }
 
 /** Per-canvas cancellation token: only the newest asynchronous image preload
@@ -352,7 +357,9 @@ async function resolveChartImages<TTextRun>(
       const added: string[] = [];
       for (const { descriptor, frame } of chartOccurrences) {
         for (const { fill, occurrence } of collectChartFillRenderedSizes(
-          descriptor.model as import('@silurus/ooxml-core').ChartModel,
+          // Laid out exactly as the paint draws it (with its substitutions).
+          withChartFontSubstitutions(descriptor.model as import('@silurus/ooxml-core').ChartModel,
+            options.chartFontSubstitutions),
           { x: 0, y: 0, w: frame.widthPt, h: frame.heightPt },
           1, 0, options.threeD, options.regionMap, options.chartEx, resolved,
         )) {
@@ -628,11 +635,13 @@ async function renderSelectedDocumentPageLeased<TTextRun>(
     const resources = createCanvasPaintResourcePainter(
       session,
       options.threeD || options.regionMap || options.chartEx || chartImages.size > 0
+        || options.chartFontSubstitutions
         ? createCanonicalCanvasPaintResourceHandlers(
             options.threeD,
             options.regionMap,
             chartImageFillStoreLookup(chartImages),
             options.chartEx,
+            options.chartFontSubstitutions,
           )
         : canonicalCanvasPaintResourceHandlers,
     );

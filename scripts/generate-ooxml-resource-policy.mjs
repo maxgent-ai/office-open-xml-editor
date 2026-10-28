@@ -84,6 +84,12 @@ function readPolicy(root) {
     'maxWorkbookCachedCellContentUtf8Bytes',
     'maxWorkbookCachedJsonBytes',
     'maxRendererCoordinateIndexEntries',
+    'maxFontSourceStylesheetBytes',
+    'maxFontSourceDeclarations',
+    'maxFontSourceFamilies',
+    'maxFontSourceRetainedBytes',
+    'maxFontSourceUrlLength',
+    'maxFontDemandScalars',
   ];
   requireExactObject(value, SOURCE, ['defaults', 'hardCeilings']);
   requireExactObject(value.defaults, `${SOURCE}.defaults`, defaultKeys);
@@ -140,6 +146,13 @@ function readPolicy(root) {
       `${SOURCE}.hardCeilings.maxPptxCachedSlideProjectionBytes must not be smaller than maxPptxSlideJsonBytes.`,
     );
   }
+  // One admitted font-source face (bounded like an embedded font) must fit in
+  // the per-realm retained font-source budget.
+  if (value.hardCeilings.maxFontSourceRetainedBytes < value.hardCeilings.maxEmbeddedFontBytes) {
+    throw new Error(
+      `${SOURCE}.hardCeilings.maxFontSourceRetainedBytes must not be smaller than maxEmbeddedFontBytes.`,
+    );
+  }
   for (const [cacheKey, worksheetKey] of [
     ['maxWorkbookCachedRows', 'maxWorksheetRows'],
     ['maxWorkbookCachedCells', 'maxWorksheetCells'],
@@ -166,7 +179,7 @@ function render(policy) {
   };
   return {
     ...outputs,
-    typescript: `${outputs.typescript}export const HARD_MAX_CHARTEX_ALLOCATION_ELEMENTS = ${hard.maxChartexAllocationElements};\nexport const HARD_MAX_CHARTEX_ALLOCATION_BYTES = ${hard.maxChartexAllocationBytes};\nexport const HARD_MAX_PPTX_SLIDE_XML_DOM_COMPLEXITY = ${hard.maxPptxSlideXmlDomComplexity};\nexport const HARD_MAX_DOCX_MARKDOWN_BYTES = ${hard.maxDocxMarkdownBytes};\nexport const HARD_MAX_EMBEDDED_FONT_BYTES = ${hard.maxEmbeddedFontBytes};\n`,
+    typescript: `${outputs.typescript}export const HARD_MAX_CHARTEX_ALLOCATION_ELEMENTS = ${hard.maxChartexAllocationElements};\nexport const HARD_MAX_CHARTEX_ALLOCATION_BYTES = ${hard.maxChartexAllocationBytes};\nexport const HARD_MAX_PPTX_SLIDE_XML_DOM_COMPLEXITY = ${hard.maxPptxSlideXmlDomComplexity};\nexport const HARD_MAX_DOCX_MARKDOWN_BYTES = ${hard.maxDocxMarkdownBytes};\nexport const HARD_MAX_EMBEDDED_FONT_BYTES = ${hard.maxEmbeddedFontBytes};\nexport const HARD_MAX_FONT_SOURCE_STYLESHEET_BYTES = ${hard.maxFontSourceStylesheetBytes};\nexport const HARD_MAX_FONT_SOURCE_DECLARATIONS = ${hard.maxFontSourceDeclarations};\nexport const HARD_MAX_FONT_SOURCE_FAMILIES = ${hard.maxFontSourceFamilies};\nexport const HARD_MAX_FONT_SOURCE_FACE_BYTES = ${hard.maxEmbeddedFontBytes};\nexport const HARD_MAX_FONT_SOURCE_RETAINED_BYTES = ${hard.maxFontSourceRetainedBytes};\nexport const HARD_MAX_FONT_SOURCE_URL_LENGTH = ${hard.maxFontSourceUrlLength};\nexport const HARD_MAX_FONT_DEMAND_SCALARS = ${hard.maxFontDemandScalars};\n`,
     rust: `${outputs.rust}pub const HARD_MAX_CHARTEX_ALLOCATION_ELEMENTS: u64 = ${hard.maxChartexAllocationElements};\npub const HARD_MAX_CHARTEX_ALLOCATION_BYTES: u64 = ${hard.maxChartexAllocationBytes};\npub const HARD_MAX_PPTX_SLIDE_XML_DOM_COMPLEXITY: u64 = ${hard.maxPptxSlideXmlDomComplexity};\npub const HARD_MAX_XLSX_WORKBOOK_CACHED_CELL_CONTENT_UTF8_BYTES: u64 = ${hard.maxWorkbookCachedCellContentUtf8Bytes};\npub const HARD_MAX_XLSX_WORKBOOK_CACHED_JSON_BYTES: u64 = ${hard.maxWorkbookCachedJsonBytes};\npub const HARD_MAX_DOCX_MARKDOWN_BYTES: u64 = ${hard.maxDocxMarkdownBytes};\npub const HARD_MAX_EMBEDDED_FONT_BYTES: u64 = ${hard.maxEmbeddedFontBytes};\n`,
   };
 }

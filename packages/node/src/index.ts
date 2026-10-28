@@ -60,6 +60,8 @@ export {
   type OoxmlResourceLimit,
   type OoxmlResourceLimitErrorDetails,
   type OoxmlUnsupportedContentDetails,
+  type OoxmlFontSourceQuota,
+  type OoxmlFontSourceViolation,
   type OoxmlResourceLimits,
   type OoxmlResourceUsageSnapshot,
   type XlsxWorksheetLimits,

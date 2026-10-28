@@ -1,4 +1,5 @@
 import { paintOptionalImagePlaceholder, renderChart } from '@silurus/ooxml-core';
+import { withChartFontSubstitutions } from '@silurus/ooxml-core/internal/chart-font-sources';
 import type {
   ChartImageLookup,
   ChartThreeDRenderer,
@@ -52,6 +53,8 @@ export function createCanonicalCanvasPaintResourceHandlers(
   regionMap?: ChartRegionMapRenderer,
   chartImageLookup?: ChartImageLookup,
   chartEx?: ChartExRenderer,
+  /** `ChartModel.fontSubstitutions` of the document's loaded font sources. */
+  chartFontSubstitutions?: Readonly<Record<string, string>>,
 ): CanvasPaintResourceHandlers {
   return Object.freeze({
   image(resource, bounds, ctx, coverageBounds) {
@@ -62,7 +65,10 @@ export function createCanonicalCanvasPaintResourceHandlers(
     // keeps chart font/line point sizes in that same space instead of scaling twice.
     renderChart(
       ctx as CanvasRenderingContext2D,
-      resource.descriptor.model as import('@silurus/ooxml-core').ChartModel,
+      withChartFontSubstitutions(
+        resource.descriptor.model as import('@silurus/ooxml-core').ChartModel,
+        chartFontSubstitutions,
+      ),
       { x: bounds.xPt, y: bounds.yPt, w: bounds.widthPt, h: bounds.heightPt },
       1,
       0,

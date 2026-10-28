@@ -20,12 +20,12 @@
  *   for WordprocessingML, so pptx font bytes are consumed as-is (no XOR).
  *
  * The registration mechanism (build `FontFace` from bytes, add to the set,
- * await each face's `load()`) mirrors {@link preloadGoogleFonts}: the
- * two loaders share {@link activeFontSet} and the same first-paint determinism
- * contract (fonts must be ready before the caller measures/paints text).
+ * await each face's `load()`) mirrors the font-source session
+ * (`source-session.ts`): every loader shares {@link activeFontSet} and the same
+ * first-paint determinism contract (fonts must be ready before the caller
+ * measures/paints text).
  */
-import { activeFontSet, withFontCeiling } from './preload.js';
-import { retainFace, releaseFaces } from './font-registry.js';
+import { activeFontSet, retainFace, releaseFaces, withFontCeiling } from './font-registry.js';
 import { HARD_MAX_EMBEDDED_FONT_BYTES } from '../worker/resource-policy.generated.js';
 
 /** Shared admission check for work that must inspect an embedded font before
@@ -113,7 +113,7 @@ export interface EmbeddedFontFace {
  * ({@link contentSignature}) and refcount: the first registration adds the
  * `FontFace`; later ones reuse it and bump refs; {@link unregisterEmbeddedFonts}
  * decrements and only `document.fonts.delete()`s the face when the last holder
- * releases it. The refcount machinery is shared with the Google-Fonts preloader.
+ * releases it. The refcount machinery is shared with the font-source session.
  */
 
 /** Cheap 32-bit FNV-1a over the (de-obfuscated) font bytes — the content key for
@@ -145,7 +145,7 @@ function contentSignature(family: string, weight: string, style: string, bytes: 
  * them — the face leaves the FontFaceSet only when the last holder releases it.
  *
  * No-ops (resolves to `[]`) when there is no FontFaceSet or `FontFace` in the
- * current context (e.g. Node without a shim), matching {@link preloadGoogleFonts}.
+ * current context (e.g. Node without a shim), matching the font-source session.
  *
  * @param faces      the embedded faces to register
  * @param maxBytes   per-face size ceiling; faces larger than this are skipped
@@ -173,7 +173,7 @@ export async function registerEmbeddedFonts(
         ? deobfuscateOdttf(face.bytes, face.fontKey ?? '')
         : face.bytes;
       // `embedded:` namespaces the signature so an embedded face can never share
-      // a registry entry with a Google-Fonts face (a different keyspace).
+      // a registry entry with a font-source face (a different keyspace).
       const sig = `embedded:${contentSignature(face.family, face.weight, face.style, data)}`;
       // One package can legally point multiple slots at the same part. Retain a
       // content-identical face only once per caller so release remains exactly

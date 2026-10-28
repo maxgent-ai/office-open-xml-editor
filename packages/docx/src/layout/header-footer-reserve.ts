@@ -16,7 +16,8 @@ export interface HeaderFooterReserve {
     pageNumber: Readonly<{ displayNumber: number; format: import('@silurus/ooxml-core').NumberFormat }>;
   }>;
   /**
-   * Page-final flow top of each footnote, by note id, whose story is band
+   * Page-final flow top of each footnote, by noteBandKey (band and note id),
+   * whose story is band
    * dependent (StoryLayout.bandDependent: it holds §17.4.57 positioned
    * tables that only a page position places).
    * Footnotes are stacked only once their page closes, so the composed

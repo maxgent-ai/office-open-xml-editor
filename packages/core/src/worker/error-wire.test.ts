@@ -5,6 +5,7 @@ import {
   HARD_MAX_CHARTEX_ALLOCATION_ELEMENTS,
 } from './resource-policy.generated.js';
 import { OoxmlError, OoxmlResourceLimitError } from '../errors/ooxml-error.js';
+import { fontSourceLimitError } from '../errors/font-source-limit.js';
 import {
   OoxmlDecodedImageLimitError,
   isOoxmlDecodedImageLimitError,
@@ -764,4 +765,36 @@ it('transports an actual recursive image-effect budget failure with its typed qu
   const received = deserializeWorkerError(serializeWorkerError(failure));
   expect(received).toBeInstanceOf(OoxmlDecodedImageLimitError);
   expect(received).toMatchObject({ code: 'ooxml-decoded-image-limit', metric: 'image-effect-work' });
+});
+
+it('restores font-source limit violations across the worker boundary with a canonical message', () => {
+  const original = fontSourceLimitError('face', 31457280, 31457281);
+  expect(original.violation).toEqual({ resource: 'font-source', quota: 'face', metric: 'bytes',
+    limit: 31457280, observed: 31457281 });
+  const restored = deserializeWorkerError(structuredClone(serializeWorkerError(original)));
+  expect(restored).toBeInstanceOf(OoxmlError);
+  expect(restored).toMatchObject({ code: 'font-source-limit', message: original.message,
+    violation: original.violation });
+});
+
+it('rejects font-source limit payloads with a mismatched axis, no breach or extra diagnostics', () => {
+  for (const fontSourceLimit of [
+    { resource: 'font-source', quota: 'face', metric: 'entry-count', limit: 1, observed: 2 },
+    { resource: 'font-source', quota: 'url', metric: 'length', limit: 2, observed: 2 },
+    { resource: 'font-source', quota: 'unknown', metric: 'bytes', limit: 1, observed: 2 },
+  ]) {
+    const restored = deserializeWorkerError({ code: 'font-source-limit', message: 'PRIVATE',
+      fontSourceLimit } as unknown as WorkerErrorPayload);
+    expect(restored).not.toBeInstanceOf(OoxmlError);
+    expect(restored.message).not.toContain('PRIVATE');
+  }
+  class SourceBundleError extends Error {
+    readonly code = 'font-source-limit';
+    readonly violation = { resource: 'font-source', quota: 'stylesheet', metric: 'bytes',
+      limit: 1, observed: 2, url: 'https://private.example/' };
+  }
+  const payload = serializeWorkerError(new SourceBundleError('PRIVATE'));
+  expect(JSON.stringify(payload)).not.toMatch(/PRIVATE|private\.example/);
+  expect(deserializeWorkerError(structuredClone(payload))).toMatchObject({ code: 'font-source-limit',
+    violation: { quota: 'stylesheet', limit: 1, observed: 2 } });
 });

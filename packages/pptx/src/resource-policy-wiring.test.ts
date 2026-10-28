@@ -47,7 +47,7 @@ describe('PptxPresentation resource-policy wiring', () => {
         _parse(
           data: ArrayBuffer,
           resourcePolicy: typeof policy,
-          useGoogleFonts: boolean,
+          fonts: unknown,
           timeout: number,
           onUsage: (usage: unknown) => void,
           renderers?: unknown,

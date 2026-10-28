@@ -4,10 +4,10 @@
 // after merge. Update the baseline only after reviewing a loader's await order.
 // Source-only branches are excluded. XLSX construction and parse must still
 // share one host.run. This detects accidental edits, not hostile code.
-// The DOCX baseline loads embedded fonts before Office fallbacks, then Google
-// Fonts: embedded routes take precedence, and local Office faces avoid redundant
-// Google substitutions. The PPTX font-owner transition is normalized only
-// under the positive Google Fonts opt-in gate below.
+// The DOCX baseline loads embedded fonts before Office fallbacks, then configured
+// sources: embedded routes take precedence, and local Office faces avoid redundant
+// source substitutions. The baseline names the current font-source helpers;
+// PPTX must retain the positive fonts opt-in gate around its source await.
 // DOCX native-route measurements start before font loading and must finish
 // after math preparation, before layout publication. The baseline pins this
 // barrier instead of exempting it based on the current Git merge base.
@@ -53,28 +53,28 @@ function callName(node) {
   return node.type;
 }
 
-function requiresGoogleFonts(node) {
+function requiresFontSources(node) {
   if (node.type === 'LogicalExpression' && node.operator === '&&') {
-    return requiresGoogleFonts(node.left) || requiresGoogleFonts(node.right);
+    return requiresFontSources(node.left) || requiresFontSources(node.right);
   }
   return node.type === 'MemberExpression' && !node.computed
     && node.object.type === 'Identifier' && node.object.name === 'opts'
-    && node.property.type === 'Identifier' && node.property.name === 'useGoogleFonts';
+    && node.property.type === 'Identifier' && node.property.name === 'fonts';
 }
 
-function ooxmlAwaits(node, code, pptxFontOwnerRefactor = false) {
+function ooxmlAwaits(node, code, pptxLoad = false) {
   const awaits = [];
-  function walk(current, googleFontsRequired = false) {
+  function walk(current, fontsRequired = false) {
     if (current.type === 'BlockStatement') {
       for (const statement of current.body) {
         if (statement.type === 'IfStatement') {
           const test = code.slice(statement.test.start, statement.test.end).replace(/\s+/g, '');
           if (SOURCE_ABSENT.test(test)) {
-            walk(statement.consequent, googleFontsRequired);
+            walk(statement.consequent, fontsRequired);
             return;
           }
         }
-        walk(statement, googleFontsRequired);
+        walk(statement, fontsRequired);
       }
       return;
     }
@@ -83,54 +83,50 @@ function ooxmlAwaits(node, code, pptxFontOwnerRefactor = false) {
       // The internal comparison-build flag can only narrow the existing
       // selected-source branch; the ordinary OOXML await path is unchanged.
       if (SOURCE_PRESENT.test(test)) {
-        if (current.alternate) walk(current.alternate, googleFontsRequired);
+        if (current.alternate) walk(current.alternate, fontsRequired);
         return;
       }
       if (SOURCE_ABSENT.test(test)) {
-        walk(current.consequent, googleFontsRequired);
+        walk(current.consequent, fontsRequired);
         return;
       }
       if (/^!sourceLoad$/.test(test)) {
-        walk(current.consequent, googleFontsRequired);
+        walk(current.consequent, fontsRequired);
         return;
       }
-      walk(current.test, googleFontsRequired);
-      walk(current.consequent, googleFontsRequired || requiresGoogleFonts(current.test));
-      if (current.alternate) walk(current.alternate, googleFontsRequired);
+      walk(current.test, fontsRequired);
+      walk(current.consequent, fontsRequired || requiresFontSources(current.test));
+      if (current.alternate) walk(current.alternate, fontsRequired);
       return;
     }
     if (current.type === 'ConditionalExpression') {
       const test = code.slice(current.test.start, current.test.end).replace(/\s+/g, '');
       if (SOURCE_ABSENT.test(test)) {
-        walk(current.consequent, googleFontsRequired);
+        walk(current.consequent, fontsRequired);
         return;
       }
       if (test === 'sourceLoad' || test === 'this._sourceLoad' || test.startsWith('sourceLoad&&')) {
-        walk(current.alternate, googleFontsRequired);
+        walk(current.alternate, fontsRequired);
         return;
       }
     }
     if (current.type === 'AwaitExpression') {
-      let name = callName(current.argument);
-      // The PPTX font barrier moved from a per-call array owner to the shared
-      // presentation lease. Normalize only this known callee transition under
-      // its positive opt-in AND gate. Every await is still visited, so additions
-      // or reordering inside the gate fail; unguarded/OR/alternate calls and
-      // every other package/helper retain their original identity checks.
-      if (pptxFontOwnerRefactor && googleFontsRequired && name === 'pres._ensureGoogleFonts') {
-        name = 'preloadGoogleFonts';
+      const name = callName(current.argument);
+      // Equal await sequences alone cannot detect removal of the opt-in gate.
+      if (pptxLoad && name === 'pres._ensureFontSources' && !fontsRequired) {
+        throw new Error('PPTX font-source await requires a positive opts.fonts gate');
       }
       awaits.push(name);
     }
-    children(current).forEach(child => walk(child, googleFontsRequired));
+    children(current).forEach(child => walk(child, fontsRequired));
   }
   walk(node.body);
   return awaits;
 }
 
 export function auditAwaitCase(file, name, baseline, current) {
-  const pptxFontOwnerRefactor = file === 'packages/pptx/src/presentation.ts' && name === 'load';
-  const candidate = ooxmlAwaits(findFunction(parse(current, { sourceType: 'module', plugins: ['typescript', 'jsx'] }), name), current, pptxFontOwnerRefactor);
+  const pptxLoad = file === 'packages/pptx/src/presentation.ts' && name === 'load';
+  const candidate = ooxmlAwaits(findFunction(parse(current, { sourceType: 'module', plugins: ['typescript', 'jsx'] }), name), current, pptxLoad);
   if (JSON.stringify(candidate) !== JSON.stringify(baseline)) {
     throw new Error(`${file} ${name}: OOXML awaits changed\nbaseline ${JSON.stringify(baseline)}\nhead ${JSON.stringify(candidate)}`);
   }

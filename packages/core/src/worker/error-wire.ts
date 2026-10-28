@@ -2,6 +2,7 @@ import {
   OoxmlError,
   OoxmlResourceLimitError,
   type OoxmlErrorCode,
+  type OoxmlFontSourceViolation,
   type OoxmlUnsupportedContentDetails,
   type OoxmlErrorStage,
   type OoxmlFormat,
@@ -9,6 +10,7 @@ import {
   type OoxmlResourceUsageSnapshot,
   type OoxmlResourceViolation,
 } from '../errors/ooxml-error.js';
+import { fontSourceLimitMessage, fontSourceViolationFromWire } from '../errors/font-source-limit.js';
 import {
   OoxmlDecodedImageLimitError,
   getOoxmlDecodedImageLimitDetails,
@@ -37,6 +39,7 @@ export interface WorkerErrorPayload {
   code?: string;
   resourceLimit?: OoxmlResourceLimitErrorDetails;
   unsupportedContent?: OoxmlUnsupportedContentDetails;
+  fontSourceLimit?: OoxmlFontSourceViolation;
   insufficientCredit?: PullSessionInsufficientCreditDetails;
   decodedImage?: {
     metric: OoxmlDecodedImageLimitMetric;
@@ -384,6 +387,11 @@ function serializeWorkerErrorUnchecked(error: unknown): WorkerErrorPayload {
     if (!details) return { message: 'Invalid unsupported-content error payload', errorName: 'Error' };
     return { message: unsupportedContentError(details).message, code: 'unsupported-content', unsupportedContent: details };
   }
+  if (source && typeof source === 'object' && (source as { code?: unknown }).code === 'font-source-limit') {
+    const violation = fontSourceViolationFromWire((source as { violation?: unknown }).violation);
+    if (!violation) return { message: 'Invalid font-source-limit error payload', errorName: 'Error' };
+    return { message: fontSourceLimitMessage(violation), errorName: 'OoxmlError', code: 'font-source-limit', fontSourceLimit: violation };
+  }
 
   if (typed instanceof OoxmlError) {
     return {
@@ -488,6 +496,7 @@ function deserializeWorkerErrorUnchecked(payload: WorkerErrorPayload): Error {
   const insufficientCreditPayload = payload.insufficientCredit as unknown;
   const resourceLimitPayload = payload.resourceLimit as unknown;
   const unsupportedContentPayload = payload.unsupportedContent as unknown;
+  const fontSourceLimitPayload = payload.fontSourceLimit as unknown;
   const message = typeof rawMessage === 'string'
     ? rawMessage
     : 'Worker operation failed with an invalid error payload';
@@ -498,6 +507,12 @@ function deserializeWorkerErrorUnchecked(payload: WorkerErrorPayload): Error {
   if (code === 'unsupported-content') {
     const details = unsupportedContentDetails(unsupportedContentPayload);
     return details ? unsupportedContentError(details) : new Error('Invalid unsupported-content error payload');
+  }
+  if (code === 'font-source-limit') {
+    const violation = fontSourceViolationFromWire(fontSourceLimitPayload);
+    return violation
+      ? new OoxmlError('font-source-limit', fontSourceLimitMessage(violation), violation)
+      : new Error('Invalid font-source-limit error payload');
   }
   const decodedImage = decodedImageLimitDetailsFromWire(code, decodedImagePayload);
   if (decodedImage) {

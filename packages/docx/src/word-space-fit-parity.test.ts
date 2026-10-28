@@ -3,8 +3,9 @@ import { describe, expect, it } from 'vitest';
 import { parityGroups } from './test-support/word-space-fit-parity.test-support.js';
 
 // Partition/width digests for excluded mixed-script groups retain origin/main
-// 4a387ebcb. Latin compressPunctuation groups incorporate the kerning/OpenType
-// independence confirmed by mode-14 Windows Word 16.0.20430 controls; their xAvg fit
+// 4a387ebcb. Latin compressPunctuation groups below mode 15 incorporate the
+// kerning, OpenType (mode 14) and lineWrapLikeWord6 (mode 11) independence
+// confirmed by Windows Word controls; their xAvg fit
 // and rejection boundaries are independently tested in reference-font-layout.
 // Other Latin settings retain the historical results.
 const EXPECTED = JSON.parse(readFileSync(

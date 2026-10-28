@@ -43,6 +43,12 @@
     "maxWorkbookCachedCells": 500000,
     "maxWorkbookCachedCellContentUtf8Bytes": 67108864,
     "maxWorkbookCachedJsonBytes": 134217728,
-    "maxRendererCoordinateIndexEntries": 250000
+    "maxRendererCoordinateIndexEntries": 250000,
+    "maxFontSourceStylesheetBytes": 1048576,
+    "maxFontSourceDeclarations": 2048,
+    "maxFontSourceFamilies": 256,
+    "maxFontSourceRetainedBytes": 268435456,
+    "maxFontSourceUrlLength": 8192,
+    "maxFontDemandScalars": 65536
   }
 }

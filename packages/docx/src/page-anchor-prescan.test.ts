@@ -332,6 +332,31 @@ describe('preRegisterPageFloats — isPageLevelAnchorY classifier (§20.4.3.5)',
 });
 
 describe('canonical page-owned anchor prescan (§20.4.2.3/.17/.20)', () => {
+  it.each([[80, 0], [0, 60]])(
+    'retains a square-wrapped line with zero outer extent (%s × %s)',
+    (widthPt, heightPt) => {
+      const acquisition = parserAnchor('zero-extent-line', { widthPt, heightPt });
+      const [host] = parserAnchoredImage(acquisition);
+      const line = {
+        ...pageShapeRun({ widthPt, heightPt, wrapMode: 'square' }),
+        presetGeometry: 'line', fill: null, stroke: '000000', strokeWidth: 1,
+        __anchorAcquisition: acquisition,
+      } as unknown as DocRun;
+      const text = 'Text before the line';
+      const layout = canonicalLayout([
+        para({ text, fontSize: 10 }),
+        paraWith([host!, line]),
+      ]);
+
+      expect(layout.pages).toHaveLength(1);
+      expect(retainedText(sourceParagraphs(layout, 0))).toBe(text);
+      const drawings = sourceParagraphs(layout, 1).flatMap((paragraph) => paragraph.drawings);
+      expect(drawings).toHaveLength(1);
+      expect(drawings[0]!.flowBounds).toEqual({ xPt: 100, yPt: 20, widthPt, heightPt });
+      expect(drawings[0]!.commands).toContainEqual(expect.objectContaining({ kind: 'drawingml-shape' }));
+    },
+  );
+
   it('preserves page-owned wrapping for a hand-built public image anchor', () => {
     const layout = canonicalLayout([
       para({ text: 'あ'.repeat(40), fontSize: 20 }),

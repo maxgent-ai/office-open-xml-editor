@@ -26,6 +26,11 @@
  *     image-effect/fill geometry at render time.
  *   - `'invalid-numbering'`     — a DOCX numbering level that Word cannot open
  *     normally (invalid paragraph ilvl or an out-of-range level definition).
+ *   - `'font-source-limit'`     — a configured font source exceeded a generated
+ *     hard ceiling (stylesheet bytes, declaration/family count, face bytes,
+ *     retained bytes or URL length); {@link OoxmlError.violation} names it.
+ *     A breach is a misconfigured or hostile source, so it rejects the
+ *     operation instead of degrading to host fonts.
  */
 export type OoxmlErrorCode =
   | 'encrypted'
@@ -35,7 +40,8 @@ export type OoxmlErrorCode =
   | 'not-ooxml'
   | 'unsupported-image-effect'
   | 'invalid-numbering'
-  | 'unsupported-content';
+  | 'unsupported-content'
+  | 'font-source-limit';
 
 export type OoxmlErrorStage =
   | 'container'
@@ -54,6 +60,26 @@ export interface OoxmlUnsupportedContentDetails {
   readonly reason: 'source-subset';
 }
 
+/** Font-source quota, named after its generated `HARD_MAX_FONT_SOURCE_*`
+ * ceiling. Library resource policy, not an OOXML rule. */
+export type OoxmlFontSourceQuota =
+  | 'stylesheet'
+  | 'declarations'
+  | 'families'
+  | 'face'
+  | 'retained'
+  | 'url';
+
+/** Violation record carried by `OoxmlError('font-source-limit')`. It names
+ * the quota and its measurement only: no family, URL or font bytes. */
+export interface OoxmlFontSourceViolation {
+  readonly resource: 'font-source';
+  readonly quota: OoxmlFontSourceQuota;
+  readonly metric: 'bytes' | 'entry-count' | 'length';
+  readonly limit: number;
+  readonly observed: number;
+}
+
 /**
  * Typed error thrown by load factories and the image paint pipeline for failures
  * that carry a stable, programmatic {@link OoxmlErrorCode} (e.g. a
@@ -68,12 +94,28 @@ export class OoxmlError extends Error {
 
   readonly details?: OoxmlUnsupportedContentDetails;
 
-  constructor(code: OoxmlErrorCode, message: string, details?: OoxmlUnsupportedContentDetails) {
+  /** Present only for `'font-source-limit'`. */
+  readonly violation?: OoxmlFontSourceViolation;
+
+  constructor(
+    code: OoxmlErrorCode,
+    message: string,
+    details?: OoxmlUnsupportedContentDetails | OoxmlFontSourceViolation,
+  ) {
     super(message);
     this.name = 'OoxmlError';
     this.code = code;
-    if (code === 'unsupported-content' && details) {
+    if (code === 'unsupported-content' && details && 'format' in details) {
       this.details = Object.freeze({ format: details.format, reason: details.reason });
+    }
+    if (code === 'font-source-limit' && details && 'quota' in details) {
+      this.violation = Object.freeze({
+        resource: 'font-source',
+        quota: details.quota,
+        metric: details.metric,
+        limit: details.limit,
+        observed: details.observed,
+      });
     }
     // Restore the prototype chain for environments that down-level `extends
     // Error` (e.g. older TS `target`), so `instanceof OoxmlError` holds.

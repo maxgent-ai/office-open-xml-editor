@@ -4,7 +4,7 @@
 import { EMU_PER_PX, PT_TO_PX } from '@silurus/ooxml-core';
 import { PptxPresentation, PptxScrollViewer } from '@silurus/ooxml-pptx';
 import { DocxDocument, DocxScrollViewer } from '@silurus/ooxml-docx';
-import { XlsxViewer } from '@silurus/ooxml-xlsx';
+import { XlsxViewer, googleFonts } from '@silurus/ooxml-xlsx';
 
 export type LiveController = {
   destroy: () => void;
@@ -71,7 +71,7 @@ function mountPaginated(
   };
 
   if (kind === 'pptx') {
-    PptxPresentation.load(url, { useGoogleFonts: true }).then((presentation) => {
+    PptxPresentation.load(url, { fonts: [googleFonts()] }).then((presentation) => {
       if (destroyed) {
         presentation.destroy();
         return;
@@ -92,7 +92,7 @@ function mountPaginated(
       if (!destroyed) status.textContent = message(error);
     });
   } else {
-    DocxDocument.load(url, { useGoogleFonts: true }).then((document) => {
+    DocxDocument.load(url, { fonts: [googleFonts()] }).then((document) => {
       if (destroyed) {
         document.destroy();
         return;
@@ -147,7 +147,7 @@ export function mountXlsx(root: HTMLElement, url: string): LiveController {
   root.append(host);
 
   const viewer = new XlsxViewer(host, {
-    useGoogleFonts: true,
+    fonts: [googleFonts()],
     showZoomSlider: true,
     onError: (error: Error) => host.setAttribute('data-error', error.message),
   });

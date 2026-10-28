@@ -45,14 +45,14 @@ describe('DocxDocument resource-policy wiring', () => {
         _parse(
           data: ArrayBuffer,
           resourcePolicy: typeof policy,
-          useGoogleFonts: boolean,
+          fonts: readonly unknown[] | undefined,
           timeout: number,
           onUsage: (usage: unknown) => void,
           renderers?: unknown,
           progressive?: unknown,
         ): Promise<void>;
       }
-    )._parse(new ArrayBuffer(1), policy, false, 30_000, onUsage);
+    )._parse(new ArrayBuffer(1), policy, undefined, 30_000, onUsage);
 
     expect(request).toMatchObject({
       type: 'parse',

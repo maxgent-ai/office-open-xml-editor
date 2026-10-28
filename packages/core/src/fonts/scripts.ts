@@ -1,11 +1,10 @@
-import { ownValue } from '../internal/own-key';
 /**
  * Shared script → Noto fallback definitions used by the docx / pptx / xlsx
- * renderers and their Google-Fonts preload maps.
+ * renderers and their font-source demand (library fallback families).
  *
  * The library ships NO font binaries; these Noto families are loaded on demand
- * from the Google Fonts CDN only when the caller opts in with
- * `useGoogleFonts: true`. The renderers append the relevant Noto family names
+ * from the application's font sources (`LoadOptions.fonts`) only when one is
+ * configured and serves them. The renderers append the relevant Noto family names
  * to the CSS font stack so the browser's per-glyph fallback resolves CJK /
  * Cyrillic / Thai / Devanagari / Hebrew glyphs to a real web font instead of an
  * oversized OS face or tofu.
@@ -38,32 +37,6 @@ export type CjkLang = 'kr' | 'sc' | 'tc' | 'hk' | 'jp';
 export type FontVariant = 'sans' | 'serif';
 
 /**
- * Native Noto CJK family names used by Linux packages → Google Fonts CSS
- * family names. The browser treats these as distinct families, so preload and
- * Canvas routing must consult this same table.
- */
-export const GOOGLE_CJK_FONT_ALIASES = {
-  'noto sans cjk sc': 'Noto Sans SC',
-  'noto serif cjk sc': 'Noto Serif SC',
-  'noto sans cjk tc': 'Noto Sans TC',
-  'noto serif cjk tc': 'Noto Serif TC',
-  'noto sans cjk jp': 'Noto Sans JP',
-  'noto serif cjk jp': 'Noto Serif JP',
-  'noto sans cjk kr': 'Noto Sans KR',
-  'noto serif cjk kr': 'Noto Serif KR',
-  'noto sans cjk hk': 'Noto Sans HK',
-  // Google Fonts does not provide Noto Serif HK. Keep the native serif name
-  // authored by OOXML and do not infer a TC web-font alias.
-} as const satisfies Record<string, string>;
-
-/** Return the Google Fonts family for a native Noto CJK name. */
-export function googleCjkFontAlias(family: string | null | undefined): string | null {
-  if (!family) return null;
-  const key = family.trim().toLowerCase() as keyof typeof GOOGLE_CJK_FONT_ALIASES;
-  return ownValue<string>(GOOGLE_CJK_FONT_ALIASES, key) ?? null;
-}
-
-/**
  * Classify a requested Office font name into a CJK language, or `null` when it
  * is not a known CJK face. Based on the well-known default East-Asian fonts
  * Office ships per locale (names verified against the Windows/Office font set):
@@ -76,9 +49,9 @@ export function googleCjkFontAlias(family: string | null | undefined): string | 
  *             STKaiti, STFangsong, STHeiti, STXihei, LiSu, YouYuan.
  * - Traditional Chinese : PMingLiU/MingLiU (細明體/新細明體), Microsoft JhengHei
  *             (微軟正黑體), DFKai-SB (標楷體), MingLiU_HKSCS, Kaiti TC.
- * - Hong Kong : Noto Sans/Serif CJK HK. Only the sans family has a matching
- *             Google Fonts family; serif classification remains useful as a
- *             locale hint but has no inferred web-font substitute.
+ * - Hong Kong : Noto Sans/Serif CJK HK. Classification is a locale hint; the
+ *             library fallback chain has no HK serif family (see
+ *             {@link cjkFallbackChain}).
  * - Japanese : Yu Gothic/Mincho (游ゴシック/游明朝), Meiryo (メイリオ),
  *             MS Gothic/Mincho (ＭＳ ゴシック/明朝), Hiragino (ヒラギノ),
  *             plus the Hiragana/Katakana marker in the name.
@@ -89,7 +62,7 @@ export function googleCjkFontAlias(family: string | null | undefined): string | 
  */
 export function classifyCjkFont(family: string | null | undefined): CjkLang | null {
   if (!family) return null;
-  const normalized = googleCjkFontAlias(family) ?? family.trim();
+  const normalized = family.trim();
   const l = normalized.toLowerCase();
 
   const noto = l.match(/^noto\s+(?:sans|serif)\s+(?:cjk\s+)?(sc|tc|hk|jp|kr)$/);
@@ -220,8 +193,9 @@ export function isComplexScriptCodePoint(cp: number): boolean {
 /**
  * Ordered Noto CJK family names for a given language, primary face first so the
  * browser resolves shared Han glyphs to that language's shapes. Other available
- * regional faces follow as a last resort. Google Fonts has no Noto Serif HK, so
- * the HK serif chain is intentionally empty instead of silently substituting TC.
+ * regional faces follow as a last resort. The library fallback set has no HK
+ * serif family, so the HK serif chain is intentionally empty instead of
+ * silently substituting TC (an authored "Noto Serif CJK HK" still leads).
  */
 export function cjkFallbackChain(lang: CjkLang, variant: FontVariant): string[] {
   if (lang === 'hk' && variant === 'serif') return [];
@@ -266,65 +240,6 @@ export const NON_CJK_SERIF_FALLBACKS = [
   'Noto Serif Hebrew',  // Hebrew (RTL; bidi handled separately)
 ] as const;
 
-// ---- Google Fonts preload definitions (script Noto families) ----
-
-const w = (q: string) =>
-  `https://fonts.googleapis.com/css2?family=${q}:wght@400;700&display=swap`;
-
-const CJK_GOOGLE_FONTS: Record<string, { url: string; loadFamily?: string }> = {
-  'noto sans kr': { url: w('Noto+Sans+KR') },
-  'noto sans sc': { url: w('Noto+Sans+SC') },
-  'noto sans tc': { url: w('Noto+Sans+TC') },
-  'noto sans hk': { url: w('Noto+Sans+HK') },
-  'noto sans jp': { url: w('Noto+Sans+JP') },
-  'noto serif kr': { url: w('Noto+Serif+KR') },
-  'noto serif sc': { url: w('Noto+Serif+SC') },
-  'noto serif tc': { url: w('Noto+Serif+TC') },
-  'noto serif jp': { url: w('Noto+Serif+JP') },
-};
-
-const CJK_GOOGLE_FONT_ALIAS_PRELOADS = Object.fromEntries(
-  Object.entries(GOOGLE_CJK_FONT_ALIASES).map(([alias, family]) => [
-    alias,
-    { ...CJK_GOOGLE_FONTS[family.toLowerCase()], loadFamily: family },
-  ]),
-) as Record<string, { url: string; loadFamily: string }>;
-
-/**
- * Lower-cased Noto family name → Google Fonts CSS URL for every script face the
- * renderers may reference. Merged into each package's `*_GOOGLE_FONTS` map so a
- * single source of truth defines the URLs. Native CJK alias entries set
- * `loadFamily` because Google Fonts registers the shorter family name.
- */
-export const SCRIPT_GOOGLE_FONTS: Record<string, { url: string; loadFamily?: string }> = {
-  // CJK — sans + serif per language, except HK (sans only on Google Fonts).
-  ...CJK_GOOGLE_FONTS,
-  ...CJK_GOOGLE_FONT_ALIAS_PRELOADS,
-  // Latin/Cyrillic/Greek base (also the non-CJK sans/serif tail head).
-  'noto sans': { url: w('Noto+Sans') },
-  'noto serif': { url: w('Noto+Serif') },
-  // Indic / SE-Asian.
-  'noto sans devanagari': { url: w('Noto+Sans+Devanagari') },
-  'noto sans thai': { url: w('Noto+Sans+Thai') },
-  // Hebrew (RTL).
-  'noto sans hebrew': { url: w('Noto+Sans+Hebrew') },
-  'noto serif hebrew': { url: w('Noto+Serif+Hebrew') },
-};
-
-/**
- * Family names always queued for preload (self-referencing) when
- * `useGoogleFonts` is on, so every Noto face the renderer might append to a
- * font stack is actually loaded even when no document font maps to it by name.
- * Mirrors the existing Arabic self-referencing entries.
- */
-export const SCRIPT_PRELOAD_NAMES: string[] = [
-  'Noto Sans KR', 'Noto Sans SC', 'Noto Sans TC', 'Noto Sans HK', 'Noto Sans JP',
-  'Noto Serif KR', 'Noto Serif SC', 'Noto Serif TC', 'Noto Serif JP',
-  'Noto Sans', 'Noto Serif',
-  'Noto Sans Devanagari', 'Noto Sans Thai',
-  'Noto Sans Hebrew', 'Noto Serif Hebrew',
-];
-
 /** Shared scalar predicate for the ambiguous Han policy. Kept internal to the
  * workspace packages so preload, measurement, and paint cannot drift. */
 export function containsHanScript(text: string): boolean {
@@ -336,7 +251,7 @@ export function containsHanScript(text: string): boolean {
  * a document, by scanning its rendered text for the Unicode scripts that require
  * a script-specific web font.
  *
- * Why scan the text rather than always preload {@link SCRIPT_PRELOAD_NAMES}: the
+ * Why scan the text rather than always demand every script family: the
  * CJK Noto families have no `text=` subset (the full multi-MB family is fetched),
  * so eagerly loading all eight CJK faces for a pure-Latin document blocks first
  * paint on megabytes of fonts that will never paint a glyph. We force-load only
@@ -368,10 +283,6 @@ export function containsHanScript(text: string): boolean {
  * present. For each detected CJK language BOTH the Sans and Serif face are
  * emitted (the renderer may pick either depending on the run's serif-ness). When
  * multiple CJK languages appear (e.g. Hangul + Kana), each contributes its pair.
- *
- * Note the Arabic names are NOT keys of {@link SCRIPT_GOOGLE_FONTS} — they live
- * in each package's own `*_GOOGLE_FONTS` map (which also spreads SCRIPT_GOOGLE_FONTS),
- * mirroring the unconditional Arabic preload entries the callers already queue.
  *
  * The result is a deduplicated, deterministically-ordered array, so the
  * main-thread `load()` and the render worker — given the same parsed model —
@@ -489,8 +400,8 @@ export class ScriptPreloadAccumulator {
     if (this.hasHan && (cjkLangs.size === 0 || explicitCjkHint)) {
       cjkLangs.add(this.cjkLang ?? 'jp');
     }
-    // Stable order: kr, sc, tc, hk, jp. HK is sans-only because Google Fonts
-    // does not provide Noto Serif HK.
+    // Stable order: kr, sc, tc, hk, jp. HK is sans-only: the library fallback
+    // set has no HK serif family (cjkFallbackChain).
     for (const lang of ['kr', 'sc', 'tc', 'hk', 'jp'] as const) {
       if (cjkLangs.has(lang)) {
         const suffix = { kr: 'KR', sc: 'SC', tc: 'TC', hk: 'HK', jp: 'JP' }[lang];

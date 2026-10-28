@@ -135,6 +135,7 @@ describe('self-loading viewers forward xlsxWorksheetLimits (#1917)', () => {
     const sentinel = (name: string) => ({ sentinel: name });
     const options = {
       password: 'pw',
+      fonts: [sentinel('fonts')],
       useGoogleFonts: false,
       cjkFallback: 'sc',
       maxZipEntryBytes: 1234,

@@ -8,7 +8,7 @@
   <canvas id="main-canvas"></canvas>
   <canvas id="worker-canvas"></canvas>
   <script type="module">
-    import { DocxDocument } from '/src/index.ts';
+    import { DocxDocument, googleFonts } from '/src/index.ts';
     import { math } from '@ooxml-test-math-renderer';
     import { threeD } from '@ooxml-test-three-d-renderer';
     import { regionMap } from '@ooxml-test-region-map-renderer';
@@ -34,11 +34,11 @@
       };
 
       const renderers = { math, threeD, regionMap, chartEx };
-      const main = await DocxDocument.load(buf.slice(0), { useGoogleFonts: true, ...renderers });
+      const main = await DocxDocument.load(buf.slice(0), { fonts: [googleFonts()], ...renderers });
       paint('main-canvas', await main.renderPageToBitmap(page, { width, dpr }));
       main.destroy();
 
-      const wk = await DocxDocument.load(buf.slice(0), { mode: 'worker', useGoogleFonts: true, ...renderers });
+      const wk = await DocxDocument.load(buf.slice(0), { mode: 'worker', fonts: [googleFonts()], ...renderers });
       paint('worker-canvas', await wk.renderPageToBitmap(page, { width, dpr }));
       wk.destroy();
 

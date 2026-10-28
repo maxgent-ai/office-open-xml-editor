@@ -163,6 +163,8 @@ export {
   type OoxmlResourceLimit,
   type OoxmlResourceLimitErrorDetails,
   type OoxmlUnsupportedContentDetails,
+  type OoxmlFontSourceQuota,
+  type OoxmlFontSourceViolation,
   type OoxmlResourceLimits,
   type XlsxWorksheetLimits,
   type CjkFallback,
@@ -281,3 +283,28 @@ export type {
 } from './types.js';
 
 export type { BlendMode, BlipEffectContainer, BlipEffectFill, BlipEffectImageFill } from '@silurus/ooxml-core';
+// Font sources for `LoadOptions.fonts` (structured-clone-safe descriptors).
+export {
+  cssApi,
+  fontFaceCss,
+  fontFiles,
+  fontResolver,
+  googleFonts,
+  OFFICE_FONT_SUBSTITUTIONS as officeFontSubstitutions,
+  type CssApiOptions,
+  type CssApiSource,
+  type FontFaceCssOptions,
+  type FontFaceCssSource,
+  type FontDemand,
+  type FontFaceDeclaration,
+  type FontFilesOptions,
+  type FontFilesSource,
+  type FontResolveContext,
+  type FontResolveFn,
+  type FontResolverOptions,
+  type FontResolverSource,
+  type FontSource,
+  type FontSourceCredentials,
+  type FontSubstitution,
+  type GoogleFontsOptions,
+} from '@silurus/ooxml-core/internal/font-sources';

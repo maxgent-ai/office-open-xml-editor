@@ -77,3 +77,29 @@ describe('custom slicer styles', () => {
     ]);
   });
 });
+
+describe('slicer text and font sources', () => {
+  it('paints an authored slicer face with the substitute a font source loaded for it', async () => {
+    const { bindXlsxOfficeFontRoutes } = await import('./renderer.js');
+    const fonts: string[] = [];
+    const state: Record<string, unknown> = { font: '10px sans-serif', canvas: { width: 400, height: 300 } };
+    const ctx = new Proxy(state, {
+      get(_target, prop: string) {
+        if (prop in state) return state[prop];
+        if (prop === 'measureText') return (text: string) => ({ width: text.length * 7 });
+        if (prop === 'fillText') return () => fonts.push(String(state.font));
+        return () => undefined;
+      },
+      set(_target, prop: string, value) { state[prop] = value; return true; },
+    }) as unknown as CanvasRenderingContext2D;
+    const custom = { fontFamily: 'Custom UI', fontSize: 11 };
+    const style = { whole: {}, header: custom, selectedItemWithData: custom, unselectedItemWithData: custom } as SlicerStyle;
+    bindXlsxOfficeFontRoutes(ctx, { rows: [] } as never, undefined, {
+      substitutions: new Map([['custom ui', { family: 'Served UI' }]]),
+      regularAliases: new Map(),
+    });
+    drawSlicerFrame(ctx, 'Region', [{ name: 'North', selected: true }], 0, 0, 200, 150, 1, style);
+    expect(fonts.length).toBeGreaterThan(1);
+    for (const font of fonts) expect(font).toContain('"Custom UI", "Served UI", "Segoe UI", sans-serif');
+  });
+});

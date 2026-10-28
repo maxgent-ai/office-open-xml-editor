@@ -14,7 +14,8 @@ import {
   type WorkerRendererDescriptors,
 } from '@silurus/ooxml-core/worker';
 import { selectModelSource, beginModelSourceLoad, modelSourceWorker } from '@silurus/ooxml-core/internal/model-source';
-import { excludeEmbeddedFontFamilies } from '../embedded-fonts.js';
+import type { FontSource } from '@silurus/ooxml-core/internal/font-sources';
+import type { PptxFontDemandFacts } from '../font-requests.js';
 import { PptxPresentation, type LoadOptions } from '../presentation.js';
 import { deferred } from '@silurus/ooxml-core/internal/deferred';
 
@@ -26,14 +27,21 @@ type MutablePresentation = {
   _regionMap: LoadOptions['regionMap'];
   _chartEx: LoadOptions['chartEx'];
   _tiff: LoadOptions['tiff'];
-  _googleSubstitutes: boolean;
-  _preflight: { fontPreloadNames: readonly (string | null)[]; fontPreloadDemand?: FontPreloadDemand } | null;
-  _embeddedFontAliases: ReadonlyMap<string, string>;
-  _ensureGoogleFonts: (names: Iterable<string | null | undefined>, demand?: FontPreloadDemand) => Promise<void>;
+  _fonts: readonly FontSource[] | undefined;
+  _preflight: {
+    fontPreloadNames: readonly (string | null)[];
+    fontPreloadFacts?: PptxFontDemandFacts;
+    fontPreloadDemand?: FontPreloadDemand;
+  } | null;
+  _ensureFontSources: (
+    names: readonly (string | null)[],
+    facts: PptxFontDemandFacts | undefined,
+    scalars: FontPreloadDemand | undefined,
+  ) => Promise<void>;
   _parse: (
     buffer: ArrayBuffer,
     resourcePolicy: NormalizedOoxmlResourcePolicy,
-    useGoogleFonts: boolean,
+    fonts: readonly FontSource[] | undefined,
     timeoutMs: number | undefined,
     onUsage: (usage: import('@silurus/ooxml-core').OoxmlResourceUsageSnapshot) => void,
     renderers: WorkerRendererDescriptors | undefined,
@@ -41,7 +49,9 @@ type MutablePresentation = {
   ) => Promise<void>;
 };
 
-/** All source admission, wire decoration and cleanup live behind opt-in import. */
+/** All source admission, wire decoration and cleanup live behind opt-in import.
+ * `opts` arrives normalised by {@link PptxPresentation.load} (`fonts` only,
+ * never `useGoogleFonts`). */
 export async function loadPptxModelSource(
   input: string | ArrayBuffer,
   opts: LoadOptions,
@@ -91,7 +101,7 @@ export async function loadPptxModelSource(
         state._regionMap = mode === 'worker' ? undefined : opts.regionMap;
         state._chartEx = mode === 'worker' ? undefined : opts.chartEx;
         state._tiff = mode === 'worker' ? undefined : opts.tiff;
-        state._googleSubstitutes = !!opts.useGoogleFonts;
+        state._fonts = opts.fonts;
         warnUnserializableRenderers(opts, mode, renderers);
         const progressive = opts.progressiveLayout ? {
           onProgress: opts.onLayoutProgress,
@@ -101,14 +111,15 @@ export async function loadPptxModelSource(
           published: false, deferred: false, settled: false,
         } : undefined;
         await state._parse(
-          buffer, resourceOptions.policy, !!opts.useGoogleFonts,
+          buffer, resourceOptions.policy, opts.fonts,
           opts.workerTimeoutMs, (usage) => metrics.observeUsage(usage),
           renderers, progressive,
         );
         metrics.checkpoint('presentation preflight ready');
-        if (mode === 'main' && opts.useGoogleFonts && state._preflight && !progressive) {
-          await state._ensureGoogleFonts(
-            excludeEmbeddedFontFamilies(state._preflight.fontPreloadNames, state._embeddedFontAliases),
+        if (mode === 'main' && opts.fonts && state._preflight && !progressive) {
+          await state._ensureFontSources(
+            state._preflight.fontPreloadNames,
+            state._preflight.fontPreloadFacts,
             state._preflight.fontPreloadDemand,
           );
         }

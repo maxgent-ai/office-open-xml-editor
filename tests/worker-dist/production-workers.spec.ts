@@ -152,7 +152,7 @@ async function viewerPathShadeSamples(
     for (const mode of ['main', 'worker']) {
       const canvas = document.createElement('canvas');
       document.body.append(canvas);
-      const viewer = new PptxViewer(canvas, { mode, width, dpr: 1, useGoogleFonts: false });
+      const viewer = new PptxViewer(canvas, { mode, width, dpr: 1 });
       try {
         await viewer.load(bytes.slice(0));
         if (slide !== 0) await viewer.goToSlide(slide);
@@ -224,7 +224,7 @@ test('published XLSX viewer isolates an out-of-range date and retains other shee
       host.style.cssText = 'width:800px;height:400px';
       document.body.append(host);
       const errors: string[] = [];
-      const viewer = new XlsxViewer(host, { mode, useGoogleFonts: false, onError: (e: Error) => errors.push(e.message) });
+      const viewer = new XlsxViewer(host, { mode, onError: (e: Error) => errors.push(e.message) });
       try {
         await viewer.load(new Uint8Array(bytes).buffer);
         await viewer.goToSheet(1);
@@ -264,7 +264,7 @@ test('published XLSX resolves built-in time formats without custom numFmts', asy
     const results = [];
     for (const mode of ['main', 'worker']) {
       const data = new Uint8Array(bytes).buffer;
-      const wb = await XlsxWorkbook.load(data.slice(0), { mode, useGoogleFonts: false });
+      const wb = await XlsxWorkbook.load(data.slice(0), { mode });
       let texts;
       try {
         const sheet = await wb.getWorksheet(0);
@@ -275,7 +275,7 @@ test('published XLSX resolves built-in time formats without custom numFmts', asy
       const host = document.createElement('div');
       host.style.cssText = 'width:800px;height:400px';
       document.body.append(host);
-      const viewer = new XlsxViewer(host, { mode, useGoogleFonts: false });
+      const viewer = new XlsxViewer(host, { mode });
       try {
         await viewer.load(data);
         const matches = await viewer.findText('1084818:00:00');

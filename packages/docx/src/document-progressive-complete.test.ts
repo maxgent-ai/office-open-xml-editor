@@ -68,7 +68,7 @@ function installMainModeParse(paragraphs: number, kind: 'plain' | 'tracked' = 'p
       _parse(
         buffer: ArrayBuffer,
         resourcePolicy: unknown,
-        useGoogleFonts?: boolean,
+        fonts?: readonly unknown[],
         timeoutMs?: number,
         onUsage?: unknown,
         renderers?: unknown,

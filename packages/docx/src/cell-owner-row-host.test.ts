@@ -2056,16 +2056,17 @@ describe('page placement of positioned tables below table cells and in stories',
       content: BodyElement[],
       extra: Record<string, unknown> = {},
       vertical: Record<string, unknown> = {},
+      occurrenceId = 'box',
     ) => {
       const host = paragraph('p');
-      host.runs.push({ type: 'anchorHost', fontSize: 10, anchorOccurrenceId: 'box' } as never);
+      host.runs.push({ type: 'anchorHost', fontSize: 10, anchorOccurrenceId: occurrenceId } as never);
       host.runs.push({
         type: 'shape', widthPt: 300, heightPt: 150, anchorXPt: 50, anchorYPt: 100,
         anchorXFromMargin: false, anchorYFromPara: false, zOrder: 0, subpaths: [],
         presetGeometry: 'rect', fill: null, stroke: null, wrapMode: 'none',
         textInsetL: 0, textInsetT: 0, textInsetR: 0, textInsetB: 0, textAutofit: 'none',
         textBlocks: [{ text: 'x', fontSizePt: 10 }], textBoxContent: content, ...extra,
-        anchorAcquisitionInput: anchorInput(150, vertical),
+        anchorAcquisitionInput: { ...anchorInput(150, vertical), occurrenceId },
       } as never);
       return host;
     };
@@ -2217,6 +2218,32 @@ describe('page placement of positioned tables below table cells and in stories',
         .filter((run) => JSON.stringify(run.source) === JSON.stringify(owner))
         .map((run) => run.placement.text).join(''))
         .toBe(`pg${pageIndex + 1}`);
+    });
+
+    it('keeps page-positioned tables fixed across two column bands of one continued note', () => {
+      // §17.4.57 page anchoring survives both the band's final top and the
+      // continuation's source cut. Each column needs its own plan for f1.
+      const body = paragraph('body');
+      body.runs.push({ ...body.runs[0]!, text: '1', noteRef: { kind: 'footnote', id: 'f1' } } as never);
+      const box = (id: string) => anchoredParagraph([
+        nestedIn(positionedParent('page', 110), [280]), paragraph('tp') as BodyElement,
+      ], {}, { relativeFrom: 'paragraph', choice: { kind: 'offset', valuePt: -280 } }, id) as BodyElement;
+      const result = laidOut({
+        section: section({ pageWidth: 760, columns: {
+          count: 2, spacePt: 20, equalWidth: true, sep: false, cols: [],
+        } }),
+        settings: { compatibilityMode: 11 },
+        body: [body as BodyElement],
+        footnotes: [{ id: 'f1', content: [
+          box('head'), ...Array.from({ length: 40 }, () => paragraph('n') as BodyElement), box('tail'),
+        ] }],
+      }, true);
+      const positions = result.pages.flatMap((_, pageIndex) => textRunGeometryForPage(result, pageIndex)
+        .filter((run) => run.placement.text === 'r1a1')
+        .map((run) => ({ pageIndex, y: run.pointToPage.b * run.placement.bounds.xPt
+          + run.pointToPage.d * run.placement.bounds.yPt + run.pointToPage.f })));
+      // The table's top border contributes 2pt above its text.
+      expect(positions).toEqual([{ pageIndex: 0, y: 112 }, { pageIndex: 0, y: 112 }]);
     });
 
     it('keeps a page-positioned table of a box story in a continued footnote tail at its page frame', async () => {

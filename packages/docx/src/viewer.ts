@@ -287,6 +287,7 @@ export class DocxViewer implements ZoomableViewer {
         const loaded = await DocxDocument.load(source, {
           password: this._opts.password,
           useGoogleFonts: this._opts.useGoogleFonts,
+          fonts: this._opts.fonts,
           allowFootnoteContinuation: this._opts.allowFootnoteContinuation,
           cjkFallback: this._opts.cjkFallback,
           maxZipEntryBytes: this._opts.maxZipEntryBytes,

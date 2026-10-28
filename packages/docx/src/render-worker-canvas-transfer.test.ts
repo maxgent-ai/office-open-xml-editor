@@ -65,8 +65,8 @@ vi.mock('./layout-source-model-adapter.js', () => ({
     document: {}, source: { fatalParse: null, mathOccurrences: [], blocks: { sources: [] } },
   }),
 }));
-vi.mock('./google-fonts.js', async (load) => ({
-  ...await load<typeof import('./google-fonts.js')>(),
+vi.mock('./font-plan.js', async (load) => ({
+  ...await load<typeof import('./font-plan.js')>(),
   docxOfficeFontFallbackRequests: () => [],
 }));
 vi.mock('./layout-runtime.js', async (load) => ({

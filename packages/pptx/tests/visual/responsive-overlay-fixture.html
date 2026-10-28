@@ -34,7 +34,7 @@
        measurements taken AFTER a find highlight + selection overlay are built. -->
   <div id="stage"></div>
   <script type="module">
-    import { PptxViewer } from '/src/index.ts';
+    import { PptxViewer, googleFonts } from '/src/index.ts';
 
     const params = new URLSearchParams(location.search);
     const name = params.get('pptx') ?? 'demo/sample-1';
@@ -56,7 +56,7 @@
         width: 960,
         enableTextSelection: true,
         enableElementSelection: true,
-        useGoogleFonts: true,
+        fonts: [googleFonts()],
       });
       await viewer.load(buf);
       await viewer.findText(query);

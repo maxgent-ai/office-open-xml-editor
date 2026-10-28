@@ -241,7 +241,7 @@ describe('XLSX viewer composition roles', () => {
     expect(popupScheduler.cancelAnimationFrame).toHaveBeenCalledWith(41);
   });
 
-  it('invalidates an active worker bitmap as soon as a newer viewport is queued', async () => {
+  it('invalidates an active worker bitmap when a non-scroll update is queued', async () => {
     const transfer = vi.fn();
     const canvas = {
       width: 0,

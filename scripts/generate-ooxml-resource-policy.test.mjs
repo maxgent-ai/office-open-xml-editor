@@ -52,6 +52,12 @@ function fixture(policy = {
     maxWorkbookCachedCellContentUtf8Bytes: 640,
     maxWorkbookCachedJsonBytes: 1280,
     maxRendererCoordinateIndexEntries: 250,
+    maxFontSourceStylesheetBytes: 64,
+    maxFontSourceDeclarations: 8,
+    maxFontSourceFamilies: 4,
+    maxFontSourceRetainedBytes: 640,
+    maxFontSourceUrlLength: 32,
+    maxFontDemandScalars: 16,
   },
 }) {
   const root = mkdtempSync(path.join(tmpdir(), 'ooxml-resource-policy-'));
@@ -167,6 +173,19 @@ test('generates matching TypeScript and Rust constants from one policy source', 
     readFileSync(path.join(root, 'packages/core/src/worker/resource-policy.generated.ts'), 'utf8'),
     /HARD_MAX_EMBEDDED_FONT_BYTES = 320/,
   );
+  // A font-source face is bounded exactly like an embedded font; the other
+  // font-source ceilings are TypeScript-only (fonts never reach the parser).
+  const generatedTypeScript = readFileSync(
+    path.join(root, 'packages/core/src/worker/resource-policy.generated.ts'),
+    'utf8',
+  );
+  assert.match(generatedTypeScript, /HARD_MAX_FONT_SOURCE_FACE_BYTES = 320/);
+  assert.match(generatedTypeScript, /HARD_MAX_FONT_SOURCE_RETAINED_BYTES = 640/);
+  assert.match(generatedTypeScript, /HARD_MAX_FONT_DEMAND_SCALARS = 16/);
+  assert.doesNotMatch(
+    readFileSync(path.join(root, 'packages/ooxml-common/src/resource-policy.generated.rs'), 'utf8'),
+    /FONT_SOURCE/,
+  );
   assert.match(
     readFileSync(path.join(root, 'packages/ooxml-common/src/resource-policy.generated.rs'), 'utf8'),
     /HARD_MAX_XLSX_RENDERER_COORDINATE_INDEX_ENTRIES: u64 = 250/,
@@ -235,6 +254,12 @@ test('rejects invalid or internally inconsistent policy values', (context) => {
       maxWorkbookCachedCellContentUtf8Bytes: 640,
       maxWorkbookCachedJsonBytes: 1280,
       maxRendererCoordinateIndexEntries: 250,
+      maxFontSourceStylesheetBytes: 64,
+      maxFontSourceDeclarations: 8,
+      maxFontSourceFamilies: 4,
+      maxFontSourceRetainedBytes: 640,
+      maxFontSourceUrlLength: 32,
+      maxFontDemandScalars: 16,
     },
   });
   context.after(() => rmSync(root, { recursive: true, force: true }));
@@ -309,6 +334,20 @@ test('rejects a retained DOCX projection smaller than one document unit', (conte
   assert.throws(
     () => synchronizeResourcePolicy({ root, write: true }),
     /maxDocxRetainedModelJsonBytes must not be smaller than a DOCX document unit/,
+  );
+});
+
+test('rejects a retained font-source budget smaller than one face', (context) => {
+  const root = fixture();
+  context.after(() => rmSync(root, { recursive: true, force: true }));
+  const policyPath = path.join(root, 'packages/ooxml-common/resource-policy.json');
+  const policy = JSON.parse(readFileSync(policyPath, 'utf8'));
+  policy.hardCeilings.maxFontSourceRetainedBytes = policy.hardCeilings.maxEmbeddedFontBytes - 1;
+  writeFileSync(policyPath, `${JSON.stringify(policy, null, 2)}\n`);
+
+  assert.throws(
+    () => synchronizeResourcePolicy({ root, write: true }),
+    /maxFontSourceRetainedBytes must not be smaller than maxEmbeddedFontBytes/,
   );
 });
 

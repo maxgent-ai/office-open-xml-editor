@@ -36,10 +36,14 @@ export const SOURCE_DISPATCH = new Map([
   ]),
 ]);
 
-// A feature budget, not a historical whole-entry baseline. It includes every
-// eagerly retained byte that disappears when selected-source dispatch is
-// compiled out, even if preparation was moved into another static module.
-const DISPATCH_COST_BUDGET = Object.freeze({ docx: 2_500, xlsx: 3_000, pptx: 2_500, node: 4_500 });
+// A feature budget, not a historical whole-entry baseline. It counts every
+// eagerly retained rendered byte that disappears when selected-source dispatch
+// is compiled out, per module, even if preparation was moved into another
+// static module (assertDispatchCost, normalised token bytes). Measured at
+// introduction: docx 217, xlsx 81, pptx 92, node 494; each budget leaves room
+// for a small dispatch change, not for another copy of shared geometry or
+// layout.
+const DISPATCH_COST_BUDGET = Object.freeze({ docx: 800, xlsx: 500, pptx: 500, node: 1_200 });
 
 // Independent sidecar compression plus registration/owner bindings adds a
 // small overhead to the reading code moved out of the eager worker. This
@@ -209,32 +213,115 @@ function inlineWorkers(code) {
   return outputs;
 }
 
-export function assertDispatchCost(enabledEntry, disabledEntry, budget, label, enabledGraph) {
-  const enabled = enabledGraph ?? bundleGraph(enabledEntry);
-  const disabled = bundleGraph(disabledEntry);
-  assertNoSourceRuntime(disabled.joined, `${label} feature-disabled graph`);
-  const bytes = enabled.bytes - disabled.bytes;
-  if (bytes < 0 || bytes > budget) {
-    throw new Error(`${label} model-source dispatch cost exceeds ${budget}-byte budget: ${bytes}`);
+/** Static module closure of an entry chunk in a build's module stats
+ * (scripts/module-stats-plugin.mjs): module id → rendered code. */
+export function staticModuleCode(stats, entryFile) {
+  const code = new Map();
+  const visited = new Set();
+  const pending = [entryFile];
+  while (pending.length) {
+    const file = pending.pop();
+    if (visited.has(file)) continue;
+    visited.add(file);
+    const chunk = stats.chunks[file];
+    if (!chunk) throw new Error(`Module stats lack chunk ${file}`);
+    for (const [id, text] of Object.entries(chunk.modules)) code.set(id, `${code.get(id) ?? ''}\n${text}`);
+    // External specifiers (node: built-ins, skia-canvas) are not chunks.
+    pending.push(...chunk.imports.filter((imported) => stats.chunks[imported]));
   }
-  console.log(`${label} dispatch cost: ${bytes}/${budget} bytes (${enabled.files} vs ${disabled.files} static chunks)`);
+  return code;
+}
+
+/** Cost of one identifier occurrence, whatever its spelling: identifier text
+ * depends on the bundler's per-chunk deconfliction, not on the source. */
+const IDENTIFIER_COST = 1;
+
+/**
+ * A module's code as a multiset of normalised tokens with their byte cost:
+ * every identifier becomes one fixed-cost token (its text depends on chunk-
+ * scoped renaming), every other token (keywords, punctuators, string, number,
+ * template and regex literals) keeps its exact text and byte length. Comments
+ * and whitespace are ignored, and the bundler's per-build chunk-reference
+ * placeholders (`!~{…}~`) are normalised.
+ */
+export function moduleTokenCosts(code) {
+  const ast = parse(code, {
+    sourceType: 'module', tokens: true, errorRecovery: true,
+    allowAwaitOutsideFunction: true, allowReturnOutsideFunction: true, allowUndeclaredExports: true,
+  });
+  const costs = new Map();
+  for (const token of ast.tokens) {
+    const label = token.type?.label ?? token.type;
+    if (label === 'eof' || label === 'CommentLine' || label === 'CommentBlock') continue;
+    // A chunk reference inside a module (a dynamic import of another chunk)
+    // is a bundler placeholder whose id is assigned per build.
+    const text = code.slice(token.start, token.end).replace(/!~\{[^}]*\}~/g, '!~{chunk}~');
+    const key = label === 'name' || label === 'jsxName' || label === '#name' ? 'identifier' : `${label}:${text}`;
+    const entry = costs.get(key) ?? { count: 0, cost: key === 'identifier' ? IDENTIFIER_COST : Buffer.byteLength(text) };
+    entry.count++;
+    costs.set(key, entry);
+  }
+  return costs;
+}
+
+/**
+ * Dispatch cost: the code the selected-source dispatch adds to an entry's
+ * eager static graph. Per eager module, the enabled build's normalised token
+ * multiset is compared with the disabled build's, and every token occurrence
+ * the enabled build has beyond the disabled one is charged at its byte cost
+ * (a module only the enabled build retains counts whole). The measure is
+ * independent of identifier naming and of how the bundler partitions modules
+ * into chunks, and growth is charged even when other code of the same module
+ * shrinks (only an identical token can cancel). No noise allowance is needed.
+ */
+export function assertDispatchCost(enabledStats, disabledStats, entryFile, budget, label) {
+  const enabled = staticModuleCode(enabledStats, entryFile);
+  const disabled = staticModuleCode(disabledStats, entryFile);
+  let bytes = 0;
+  const grown = [];
+  for (const [id, code] of enabled) {
+    const before = disabled.has(id) ? moduleTokenCosts(disabled.get(id)) : new Map();
+    let added = 0;
+    for (const [key, { count, cost }] of moduleTokenCosts(code)) {
+      const extra = count - (before.get(key)?.count ?? 0);
+      if (extra > 0) added += extra * cost;
+    }
+    if (added > 0) {
+      bytes += added; grown.push(`${id} +${added}`);
+      if (process.env.OOXML_DISPATCH_DEBUG) for (const [key, { count }] of moduleTokenCosts(code)) {
+        const extra = count - (before.get(key)?.count ?? 0);
+        if (extra > 0) console.log(`  ${id}: ${extra} × ${key}`);
+      }
+    }
+  }
+  if (bytes > budget) {
+    throw new Error(`${label} model-source dispatch cost exceeds ${budget}-byte budget: ${bytes} (${grown.join(', ')})`);
+  }
+  console.log(`${label} dispatch cost: ${bytes}/${budget} token bytes (${grown.join(', ') || 'no module'})`);
   return bytes;
 }
 
-function withDisabledBuild(check) {
-  const disabledDist = mkdtempSync(join(process.platform === 'darwin' ? '/private/tmp' : tmpdir(), 'ooxml-source-off-'));
+function withComparisonBuilds(check) {
+  const root = mkdtempSync(join(process.platform === 'darwin' ? '/private/tmp' : tmpdir(), 'ooxml-source-cost-'));
   const started = performance.now();
   try {
-    execFileSync(process.execPath, [
-      'node_modules/vite/bin/vite.js', 'build', '--mode', 'model-sources-off',
-      '--outDir', disabledDist, '--emptyOutDir',
-    ], { encoding: 'utf8', timeout: 180_000, maxBuffer: 10 * 1024 * 1024 });
-    console.log(`model-source-disabled build: ${((performance.now() - started) / 1000).toFixed(2)}s`);
-    check(disabledDist);
+    // Both comparison builds run here with module stats, so the accounting
+    // never mixes a published build with a differently configured one.
+    const stats = {};
+    for (const [label, mode] of [['enabled', 'production'], ['disabled', 'model-sources-off']]) {
+      const statsPath = join(root, `${label}.json`);
+      execFileSync(process.execPath, [
+        'node_modules/vite/bin/vite.js', 'build', '--mode', mode,
+        '--outDir', join(root, label), '--emptyOutDir',
+      ], { encoding: 'utf8', timeout: 300_000, maxBuffer: 10 * 1024 * 1024, env: { ...process.env, OOXML_MODULE_STATS: statsPath } });
+      stats[label] = JSON.parse(readFileSync(statsPath, 'utf8'));
+    }
+    console.log(`model-source comparison builds: ${((performance.now() - started) / 1000).toFixed(2)}s`);
+    check(join(root, 'disabled'), stats);
   } finally {
     // This unique directory is created by this invocation and contains only
-    // its generated comparison build. rmSync does not follow symlink targets.
-    rmSync(disabledDist, { recursive: true, force: true });
+    // its generated comparison builds. rmSync does not follow symlink targets.
+    rmSync(root, { recursive: true, force: true });
   }
 }
 
@@ -244,11 +331,9 @@ export function assertNoSourceRuntime(code, name) {
   }
 }
 
-export function checkBuiltBundles(dist = 'dist', { packages = false, disabledDist } = {}) {
-  const entryGraphs = new Map();
+export function checkBuiltBundles(dist = 'dist', { packages = false, disabledDist, stats } = {}) {
   for (const format of ['docx', 'xlsx', 'pptx', 'node']) {
     const graph = bundleGraph(join(dist, `${format}.mjs`));
-    entryGraphs.set(format, graph);
     assertNoSourceRuntime(graph.joined, `${format} static entry graph`);
     console.log(`${format} static JS: ${graph.bytes} bytes across ${graph.files} files`);
     if (format !== 'node') {
@@ -290,9 +375,13 @@ export function checkBuiltBundles(dist = 'dist', { packages = false, disabledDis
     throw new Error(`Expected 3 ordinary render workers, found ${ordinaryWorkers}`);
   }
   if (disabledDist) {
+    for (const format of Object.keys(DISPATCH_COST_BUDGET)) {
+      assertNoSourceRuntime(bundleGraph(join(disabledDist, `${format}.mjs`)).joined, `${format} feature-disabled graph`);
+    }
+  }
+  if (stats) {
     for (const [format, budget] of Object.entries(DISPATCH_COST_BUDGET)) {
-      assertDispatchCost(join(dist, `${format}.mjs`), join(disabledDist, `${format}.mjs`),
-        budget, format, entryGraphs.get(format));
+      assertDispatchCost(stats.enabled, stats.disabled, `${format}.mjs`, budget, format);
     }
   }
 }
@@ -338,8 +427,8 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     'packages/node/src/index.ts',
   ], forbidden);
   if (existsSync('dist/docx.mjs')) {
-    withDisabledBuild((disabledDist) => checkBuiltBundles('dist', {
-      packages: process.argv.includes('--packages'), disabledDist,
+    withComparisonBuilds((disabledDist, stats) => checkBuiltBundles('dist', {
+      packages: process.argv.includes('--packages'), disabledDist, stats,
     }));
   }
   console.log('OOXML entries and workers keep model-source runtime behind dynamic loads.');

@@ -115,6 +115,8 @@ Enabling **`ooxmlViewer.useGoogleFonts`** lets the preview load optional substit
 **Settings:**
 - `ooxmlViewer.useGoogleFonts`: `false` (default — fully offline) or `true` (load optional webfont substitutes and script fallbacks from the CDN). Force-disabled in untrusted workspaces. Toggling it re-renders already-open previews immediately.
 
+The setting keeps its name. When it is on, the preview passes the library's `fonts: [googleFonts()]` load option (the library's own `useGoogleFonts` option is deprecated), so the requests and the two CSP origins are exactly those of `googleFonts()`: stylesheets under `connect-src`, font files under `font-src`.
+
 ## Privacy & Security
 
 - **Local file I/O only.** The viewer reads bytes via `vscode.workspace.fs.readFile` and never writes back — files are opened read-only.

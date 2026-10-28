@@ -287,12 +287,12 @@ export function extractViewerRenderContext(opts: WireRenderViewportOptions): {
 }
 
 // The base `parse` arm from types.ts is intentionally NOT reused: the render
-// worker's `parse` carries an extra `useGoogleFonts` flag, and two `parse`
+// worker's `parse` carries extra fields (font sources, renderers), and two `parse`
 // arms in one union would defeat `type`-based narrowing at use sites. The
 // `init` arm is copied verbatim from `WorkerRequest`.
 export type RenderWorkerRequest =
   | { type: 'init'; wasmUrl: string }
-  | { type: 'parse'; id: number; data: ArrayBuffer; resourcePolicy: NormalizedOoxmlResourcePolicy; readonly worksheetPolicy?: import('./internal/worksheet-policy.js').NormalizedXlsxWorksheetPolicy; useGoogleFonts?: boolean; japaneseCellFonts?: boolean; cjkFallback?: import('@silurus/ooxml-core').CjkLang; renderers?: import('@silurus/ooxml-core/worker').WorkerRendererDescriptors; source?: import('@silurus/ooxml-core').ModelSourceModuleDescriptor; sourceTransfer?: readonly Transferable[]; sourceOwnerUrl?: string }
+  | { type: 'parse'; id: number; data: ArrayBuffer; resourcePolicy: NormalizedOoxmlResourcePolicy; readonly worksheetPolicy?: import('./internal/worksheet-policy.js').NormalizedXlsxWorksheetPolicy; fonts?: readonly import('@silurus/ooxml-core/internal/font-sources').FontSource[]; japaneseCellFonts?: boolean; cjkFallback?: import('@silurus/ooxml-core').CjkLang; renderers?: import('@silurus/ooxml-core/worker').WorkerRendererDescriptors; source?: import('@silurus/ooxml-core').ModelSourceModuleDescriptor; sourceTransfer?: readonly Transferable[]; sourceOwnerUrl?: string }
   | DelimitedTextParseRequest
   | ({ type: 'openSheetSession'; id: number; sheetIndex: number; sheetName: string } & PullSessionIdentity<number>)
   | {

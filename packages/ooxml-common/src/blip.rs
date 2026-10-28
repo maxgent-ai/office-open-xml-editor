@@ -212,9 +212,9 @@ pub struct Duotone {
 /// tolerates a direct blipFill child (outside the schema). Returns `None` when there is no
 /// duotone or fewer than two resolvable colours (a malformed effect is dropped
 /// rather than half-applied). The returned hexes carry NO `#` and are uppercase.
-pub fn parse_blip_duotone<R: crate::color::ThemeResolver + ?Sized>(
+pub fn parse_blip_duotone(
     blip_fill: Node<'_, '_>,
-    resolver: &R,
+    resolver: &dyn crate::color::ThemeResolver,
     tint_mode: crate::color::TintMode,
 ) -> Option<Duotone> {
     // `<a:duotone>` lives on the blip itself (a blip-effect child), with the
@@ -529,9 +529,9 @@ impl EffectParseContext {
 
 /// Parse CT_Blip effects without losing order or silently dropping effects.
 /// A single duotone retains the legacy fast path; every other chain is complete.
-pub fn parse_blip_effects<R: crate::color::ThemeResolver + ?Sized>(
+pub fn parse_blip_effects(
     blip_fill: Node<'_, '_>,
-    resolver: &R,
+    resolver: &dyn crate::color::ThemeResolver,
     tint_mode: crate::color::TintMode,
 ) -> Vec<BlipEffect> {
     let Some(blip) = blip_fill
@@ -576,9 +576,9 @@ pub fn parse_blip_effects<R: crate::color::ThemeResolver + ?Sized>(
     }
 }
 
-fn parse_effect_children<R: crate::color::ThemeResolver + ?Sized>(
+fn parse_effect_children(
     blip: Node<'_, '_>,
-    resolver: &R,
+    resolver: &dyn crate::color::ThemeResolver,
     tint_mode: crate::color::TintMode,
     context: &mut EffectParseContext,
 ) -> Vec<BlipEffect> {
@@ -613,9 +613,9 @@ fn parse_effect_children<R: crate::color::ThemeResolver + ?Sized>(
 // Recursive dispatch has a small stack frame. Keeping nonrecursive leaf
 // parsing separate avoids multiplying its large enum-construction workspace
 // by the allowed nesting depth (including native debug and WASM builds).
-fn parse_effect_node<R: crate::color::ThemeResolver + ?Sized>(
+fn parse_effect_node(
     node: Node<'_, '_>,
-    resolver: &R,
+    resolver: &dyn crate::color::ThemeResolver,
     tint_mode: crate::color::TintMode,
     context: &mut EffectParseContext,
 ) -> Option<BlipEffect> {
@@ -651,9 +651,9 @@ fn parse_effect_node<R: crate::color::ThemeResolver + ?Sized>(
     }
 }
 
-fn parse_leaf_effect<R: crate::color::ThemeResolver + ?Sized>(
+fn parse_leaf_effect(
     node: Node<'_, '_>,
-    resolver: &R,
+    resolver: &dyn crate::color::ThemeResolver,
     tint_mode: crate::color::TintMode,
 ) -> Option<BlipEffect> {
     let color = |container: Option<Node<'_, '_>>| -> Option<(String, f64)> {
@@ -934,10 +934,10 @@ fn parse_leaf_effect<R: crate::color::ThemeResolver + ?Sized>(
 /// and projected recipe nodes count against the same 2^27 image-effect-work
 /// policy used in core, also accumulated by the package resource governor. These are
 /// resource limits, not OOXML limits or compatibility guesses.
-fn complete_named_effects<R: crate::color::ThemeResolver + ?Sized>(
+fn complete_named_effects(
     effects: &mut Vec<BlipEffect>,
     blip: Node<'_, '_>,
-    resolver: &R,
+    resolver: &dyn crate::color::ThemeResolver,
     tint_mode: crate::color::TintMode,
     context: &mut EffectParseContext,
 ) {
@@ -1055,9 +1055,9 @@ fn complete_named_effects<R: crate::color::ThemeResolver + ?Sized>(
 
 /// §20.1.8.49 / §20.1.10.52 gives each preset as one or two outer
 /// shadows. Values below are normative preset parameters, not measured tuning.
-fn parse_preset_shadow<R: crate::color::ThemeResolver + ?Sized>(
+fn parse_preset_shadow(
     node: Node<'_, '_>,
-    resolver: &R,
+    resolver: &dyn crate::color::ThemeResolver,
     tint_mode: crate::color::TintMode,
 ) -> Option<Vec<crate::effect::Shadow>> {
     let preset: u8 = node.attribute("prst")?.strip_prefix("shdw")?.parse().ok()?;
@@ -1124,9 +1124,9 @@ fn parse_preset_shadow<R: crate::color::ThemeResolver + ?Sized>(
     Some(result)
 }
 
-fn parse_container<R: crate::color::ThemeResolver + ?Sized>(
+fn parse_container(
     node: Node<'_, '_>,
-    resolver: &R,
+    resolver: &dyn crate::color::ThemeResolver,
     tint_mode: crate::color::TintMode,
     context: &mut EffectParseContext,
 ) -> EffectContainer {
@@ -1137,9 +1137,9 @@ fn parse_container<R: crate::color::ThemeResolver + ?Sized>(
     }
 }
 
-fn parse_effect_fill<R: crate::color::ThemeResolver + ?Sized>(
+fn parse_effect_fill(
     parent: Node<'_, '_>,
-    resolver: &R,
+    resolver: &dyn crate::color::ThemeResolver,
     tint_mode: crate::color::TintMode,
     context: &mut EffectParseContext,
 ) -> Option<EffectFill> {

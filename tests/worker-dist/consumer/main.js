@@ -61,7 +61,7 @@ try {
 
   const textPptx = await PptxPresentation.load(
     await bytes('/consumer/text.pptx'),
-    { mode: 'worker', useGoogleFonts: false },
+    { mode: 'worker' },
   );
   paint('pptx-text', await textPptx.renderSlideToBitmap(0, { width: 640, dpr: 1 }));
   window.pptxTextRuns = await textPptx.collectSlideRuns(0, 640);
@@ -69,7 +69,7 @@ try {
 
   const borderedXlsx = await XlsxWorkbook.load(
     await bytes('/consumer/bordered.xlsx'),
-    { mode: 'worker', useGoogleFonts: false },
+    { mode: 'worker' },
   );
   paint('xlsx-bordered', await borderedXlsx.renderViewportToBitmap(
     0,

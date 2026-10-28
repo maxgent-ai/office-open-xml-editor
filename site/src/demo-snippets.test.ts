@@ -3,7 +3,7 @@ import { docxSnippets, pptxSnippets } from './lib/demo-snippets.js';
 
 describe('official-site engine snippet names', () => {
   it('uses document for DocxDocument values', () => {
-    expect(docxSnippets.scroll).toContain("import { DocxScrollViewer } from '@silurus/ooxml/docx'");
+    expect(docxSnippets.scroll).toContain("import { DocxScrollViewer, googleFonts } from '@silurus/ooxml/docx'");
     expect(docxSnippets.scroll).toContain('new DocxScrollViewer(scroller');
     expect(docxSnippets.scroll).not.toContain('DocxDocument.load');
     expect(docxSnippets.thumbnails).toContain('const document = await DocxDocument.load');
@@ -13,7 +13,7 @@ describe('official-site engine snippet names', () => {
   });
 
   it('uses presentation for PptxPresentation values', () => {
-    expect(pptxSnippets.scroll).toContain("import { PptxScrollViewer } from '@silurus/ooxml/pptx'");
+    expect(pptxSnippets.scroll).toContain("import { PptxScrollViewer, googleFonts } from '@silurus/ooxml/pptx'");
     expect(pptxSnippets.scroll).toContain('new PptxScrollViewer(scroller');
     expect(pptxSnippets.scroll).not.toContain('PptxPresentation.load');
     expect(pptxSnippets.thumbnails).toContain('const presentation = await PptxPresentation.load');

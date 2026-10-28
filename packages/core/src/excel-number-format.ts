@@ -352,6 +352,28 @@ export function formatExcelDateTime(serial: number, section: string, date1904 = 
   return result;
 }
 
+/**
+ * Every name-table text {@link formatExcelDateTime} can paint for one date /
+ * time section, beyond the section's own characters and ASCII digits: the
+ * English month and weekday names (`mmm…`, `ddd…`), AM/PM and A/P, the
+ * Japanese weekday names (`aaa`, `aaaa`) and, under a ja-JP locale, the
+ * Japanese era names (`g…`). Font-source scalar demand (library policy) uses
+ * it so a date cell never paints a scalar the demand left out. The token test
+ * deliberately over-approximates (a quoted `"mmm"` also adds the month names):
+ * a superset only loads more subsets, a missing scalar would paint a fallback.
+ */
+export function excelDateTimeSectionNameTexts(section: string): string[] {
+  const texts: string[] = [];
+  if (/m{3}/i.test(section)) texts.push(...MONTH_NAMES);
+  if (/d{3}/i.test(section)) texts.push(...WEEKDAY_NAMES);
+  if (/a{3}/i.test(section)) texts.push(...JP_WEEKDAY_SHORT, ...JP_WEEKDAY_LONG);
+  if (/[ap]/i.test(section)) texts.push('AM', 'PM', 'A', 'P');
+  if (/g/i.test(section) && sectionHasJapaneseLocale(section)) {
+    for (const era of JP_ERAS) texts.push(era.abbr, era.short, era.long);
+  }
+  return texts;
+}
+
 /** Whether era codes in a section read as the Japanese era: the section
  *  carries a `[$…-LCID]` bracket (outside quotes) whose language ID is
  *  0x0411 ja-JP. Measured in Excel (ja-JP macOS): `[$-411]` renders the

@@ -98,7 +98,7 @@ function progressiveDocument(opts: {
     _rawParts: new BoundedRawPartCache({ maxEntries: 4, maxBytes: 1024 }),
     _embeddedFontFaces: [],
     _officeFontFaces: [],
-    _googleFontFaces: [],
+    _fontSourceSession: null,
     _bridge: {
       request: (factory: (id: number) => RenderWorkerRequest) => {
         requests.push(factory(11));

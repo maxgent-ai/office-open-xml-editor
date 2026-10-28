@@ -187,6 +187,33 @@ pub(super) fn parse_groups(
     if !pict.children().any(|n| n.has_tag_name((VML, "group"))) {
         return None;
     }
+    with_vml_wrap_polygon_memo(pict, || {
+        parse_present_groups(
+            style_map,
+            num_map,
+            pict,
+            theme,
+            media_map,
+            chart_map,
+            rel_map,
+            depth,
+            document_diagnostics,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn parse_present_groups(
+    style_map: &StyleMap,
+    num_map: &mut NumberingMap,
+    pict: roxmltree::Node,
+    theme: &ThemeColors,
+    media_map: &HashMap<String, String>,
+    chart_map: &ChartMap,
+    rel_map: &HashMap<String, String>,
+    depth: DepthGuard,
+    document_diagnostics: &mut Vec<PendingParseDiagnostic>,
+) -> Option<Vec<DocRun>> {
     // Resolve definitions once per pict, not once per leaf in large groups.
     let shape_types: HashMap<_, _> = pict
         .descendants()
@@ -360,7 +387,7 @@ pub(super) fn parse_groups(
         }
         if absolute {
             wrapper.anchor_acquisition = Some(vml_word_anchor_acquisition(
-                group, style, spec.ext_x, spec.ext_y,
+                group, None, style, spec.ext_x, spec.ext_y,
             ));
         }
         result.push(DocRun::Shape(Box::new(wrapper)));
@@ -425,11 +452,48 @@ fn acquire_leaf<'a, 'input>(
             return None;
         }
     }
-    let style = child.attribute("style").unwrap_or("");
-    let shape_type = child
+    let local_type = child
         .attribute("type")
         .and_then(|id| shape_types.get(id.trim_start_matches('#')))
         .copied();
+    // Like an ungrouped pict shape, a definition Word wrote in an earlier
+    // pict of the same story still applies (Part 4 §19.1.2.20).
+    with_recorded_vml_shape_type(local_type, child, |shape_type| {
+        acquire_typed_leaf(
+            style_map,
+            num_map,
+            child,
+            shape_type,
+            transform,
+            within_group,
+            z_order,
+            theme,
+            media_map,
+            chart_map,
+            rel_map,
+            depth,
+            diagnostics,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn acquire_typed_leaf(
+    style_map: &StyleMap,
+    num_map: &mut NumberingMap,
+    child: roxmltree::Node,
+    shape_type: Option<roxmltree::Node>,
+    transform: GroupTransform,
+    within_group: bool,
+    z_order: u32,
+    theme: &ThemeColors,
+    media_map: &HashMap<String, String>,
+    chart_map: &ChartMap,
+    rel_map: &HashMap<String, String>,
+    depth: DepthGuard,
+    diagnostics: &mut Vec<PendingParseDiagnostic>,
+) -> Option<DocRun> {
+    let style = child.attribute("style").unwrap_or("");
     let hidden = hidden(child);
     if !hidden && vml_geometry::incomplete_leaf(child, shape_type) {
         unsupported(diagnostics);

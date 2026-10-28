@@ -62,7 +62,7 @@
       "doc._parse",
       "loadEmbeddedFonts",
       "loadOfficeFontFallbacks",
-      "preloadGoogleFonts",
+      "doc._loadFontSources",
       "prepareMathRuns",
       "nativeRoutesPending",
       "firstPublication.promise",
@@ -90,7 +90,7 @@
       "resolveOoxmlContainer",
       "import",
       "pres._parse",
-      "preloadGoogleFonts"
+      "pres._ensureFontSources"
     ]
   }
 ]

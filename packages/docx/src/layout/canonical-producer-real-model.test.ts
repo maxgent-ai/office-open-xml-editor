@@ -760,7 +760,7 @@ describe('canonical producer with a real document model', () => {
       .toMatchObject({ kind: 'text', text: '1' });
   });
 
-  it('reports concrete document-end note overflow without hiding other layout failures', () => {
+  it('retains the entire document-end note when it needs additional pages', () => {
     const section = {
       pageWidth: 80, pageHeight: 50,
       marginTop: 10, marginRight: 10, marginBottom: 10, marginLeft: 10,
@@ -780,15 +780,14 @@ describe('canonical producer with a real document model', () => {
 
     const layout = layoutDocument(model, services, { currentDateMs: 0 });
 
-    expect(layout.pages.flatMap((page) => page.layers.notes)).toEqual([]);
-    expect(layout.diagnostics).toEqual([
-      expect.objectContaining({
-        code: 'UNSUPPORTED_FEATURE',
-        severity: 'error',
-        source: expect.objectContaining({ story: 'endnote', storyInstance: '1' }),
-        message: expect.stringContaining('do not fit the retained terminal flow region'),
-      }),
-    ]);
+    expect(layout.diagnostics).toEqual([]);
+    expect(layout.pages.length).toBeGreaterThan(1);
+    const painted = layout.pages.flatMap(page => page.layers.notes)
+      .flatMap(note => note.kind === 'note' ? note.story.blocks : [])
+      .flatMap(block => block.kind === 'paragraph' ? block.lines : [])
+      .flatMap(line => line.placements.flatMap(placement => placement.kind === 'text' ? [placement.text] : []))
+      .join('');
+    expect(painted.replace(/\s/g, '')).toBe('endnote'.repeat(80));
   });
 
   it('surfaces unsupported authored note positions instead of silently treating them as defaults', () => {

@@ -2060,7 +2060,9 @@ function completeInkBounds(
   };
 }
 
-function emphasisGlyph(mark: string): string {
+/** The glyph painted for one §17.18.24 ST_Em mark (implementation-dependent
+ * per §17.18.24). Font-source demand reads it so the glyph's subset loads. */
+export function emphasisGlyph(mark: string): string {
   if (mark === 'circle') return '○';
   if (mark === 'comma') return '﹅';
   return '•';

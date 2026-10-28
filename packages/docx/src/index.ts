@@ -7,6 +7,32 @@ export {
   type RenderPageToBitmapOptions,
 } from './document';
 export { DocxViewer, type DocxViewerOptions } from './viewer';
+// Font sources for `LoadOptions.fonts` (structured-clone-safe descriptors).
+export {
+  cssApi,
+  fontFaceCss,
+  fontFiles,
+  fontResolver,
+  googleFonts,
+  OFFICE_FONT_SUBSTITUTIONS as officeFontSubstitutions,
+  type CssApiOptions,
+  type CssApiSource,
+  type FontFaceCssOptions,
+  type FontFaceCssSource,
+  type FontDemand,
+  type FontFaceDeclaration,
+  type FontFilesOptions,
+  type FontFilesSource,
+  type FontResolveContext,
+  type FontResolveFn,
+  type FontResolverOptions,
+  type FontResolverSource,
+  type FontSource,
+  type FontSourceCredentials,
+  type FontSubstitution,
+  type GoogleFontsOptions,
+} from '@silurus/ooxml-core/internal/font-sources';
+export type { FontSubstituteScript } from '@silurus/ooxml-core';
 export { DocxScrollViewer, type DocxScrollViewerOptions } from './scroll-viewer';
 export type { DocxCommentsOptions } from './comment-margin';
 export type {
@@ -194,6 +220,8 @@ export {
   type OoxmlResourceLimit,
   type OoxmlResourceLimitErrorDetails,
   type OoxmlUnsupportedContentDetails,
+  type OoxmlFontSourceQuota,
+  type OoxmlFontSourceViolation,
   type OoxmlResourceLimits,
   type XlsxWorksheetLimits,
   type CjkFallback,

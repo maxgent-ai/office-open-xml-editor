@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import { sourceFontLayoutOptions } from './testing/font-sources.js';
 import { createLayoutServices } from './layout-runtime.js';
 import { renderDocumentToCanvas, type DocxTextRunInfo } from './renderer.js';
 import {
@@ -188,8 +189,10 @@ describe('numbering marker + body eastAsia font routing (§17.3.2.26 / §17.9.6)
     // Windows Word 16.0 (#1884): the 20pt marker raises the line by its 16pt
     // ascent over the 8pt text ascent; its descent does not join the union.
     expect(tallMarker - plain).toBeCloseTo(8);
-    // Other compatibility modes keep the established union, descent included.
-    expect(await renderedSuccessorTop(20, 14) - await renderedSuccessorTop(null, 14)).toBeCloseTo(10);
+    // Windows mode-14 controls have the same first-line union as mode 15.
+    expect(await renderedSuccessorTop(20, 14) - await renderedSuccessorTop(null, 14)).toBeCloseTo(8);
+    // Unmeasured older modes retain the previous union, descent included.
+    expect(await renderedSuccessorTop(20, 10) - await renderedSuccessorTop(null, 10)).toBeCloseTo(10);
   });
   it('routes the CJK title to the eastAsia (MS Gothic / sans) face', async () => {
     const { runs } = await render(numbering());
@@ -291,8 +294,7 @@ describe('numbering marker + body eastAsia font routing (§17.3.2.26 / §17.9.6)
       dpr: 1,
       width: 400,
       layoutServices: createLayoutServices(model, {
-        useGoogleFonts: true,
-        googleFaces: [carlito],
+        ...sourceFontLayoutOptions(model, [carlito]),
         measureContext: canvas.getContext('2d'),
       }),
     });
@@ -442,10 +444,9 @@ describe('numbering marker + body eastAsia font routing (§17.3.2.26 / §17.9.6)
     } as unknown as NumberingInfo;
     const doc = { ...headingDoc(num), majorFont: 'Calibri' };
     const services = createLayoutServices(doc, {
-      useGoogleFonts: true,
-      googleFaces: [{
+      ...sourceFontLayoutOptions(doc, [{
         family: 'Carlito', weight: '400', style: 'normal', status: 'loaded',
-      } as FontFace],
+      }]),
       measureContext: ctx,
     });
     const state = shapeAcquisitionState(ctx, {});

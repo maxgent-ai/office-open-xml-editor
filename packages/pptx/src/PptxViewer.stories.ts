@@ -1,3 +1,4 @@
+import { googleFonts } from '@silurus/ooxml-core/internal/font-sources';
 import type { Meta, StoryObj } from '@storybook/html';
 import { PptxViewer } from './viewer';
 import { math } from '../../../src/math';
@@ -68,7 +69,7 @@ export function buildViewerUI(
 
   const viewer = new PptxViewer(canvas, {
     width: args.width,
-    useGoogleFonts: true,
+    fonts: [googleFonts()],
     enableTextSelection: true,
     math,
     threeD,

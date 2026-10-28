@@ -5,6 +5,76 @@ semantic versioning. While the major version is zero, minor releases may contain
 explicitly documented breaking changes; patch releases remain compatible with
 the corresponding minor release.
 
+## 0.90.0 — Unreleased
+
+Minor release that lets applications choose where web fonts come from. Migration
+is required only if you pass `useGoogleFonts`: replace `useGoogleFonts: true`
+with `fonts: [googleFonts()]`. The alias still works in 0.90 with a warning and
+is removed in 0.91.0. See the [0.89 to 0.90 migration guide](docs/migration-0.90.md).
+
+- **Font sources:** the new `fonts` load option takes an ordered list of
+  sources, built with `googleFonts({ cssOrigin? })`, `cssApi()`,
+  `fontFaceCss()`, `fontFiles()` (URLs, `data:` URLs or bytes) and
+  `fontResolver()` for authenticated or private services. The factories are
+  exported from `@silurus/ooxml` and from each format entry, along with
+  `officeFontSubstitutions`. DOCX, XLSX and PPTX behave the same in main and
+  worker mode. Nothing is requested without a source (#1497).
+- **Custom Google Fonts origin:** `googleFonts({ cssOrigin })` sends the
+  stylesheet requests to a regional mirror or an internal proxy instead of
+  `fonts.googleapis.com`. Redirects are followed and the font file URLs in the
+  returned CSS are used as given, so the mirror controls where those go. A
+  failing origin keeps the host fonts and is never replaced by another source
+  (#1497).
+- **Fewer font downloads:** DOCX and XLSX now load only the `unicode-range`
+  subsets that the document's text paints, as PPTX already did.
+- **Resource safety:** font sources have fixed limits and fail closed with the
+  new `OoxmlError` code `font-source-limit`.
+- **Deprecated:** `useGoogleFonts` is an alias of `fonts: [googleFonts()]` and
+  warns once per JavaScript realm. Combining `useGoogleFonts: true` with
+  `fonts` throws a `TypeError`. The VS Code extension keeps its
+  `ooxmlViewer.useGoogleFonts` setting.
+
+## 0.89.5 — 2026-10-26
+
+Compatible patch release. No migration is required.
+
+- **Word progressive layout:** documents whose sections have page borders and
+  a page- or margin-relative floating picture with text wrapping load again
+  with `progressiveLayout: true` instead of failing with "Page-border
+  finalization requires explicit section-owned page identity" (#1949).
+- **Word SVG pictures in worker mode:** an SVG picture whose aspect ratio
+  differs from its frame no longer fails `load()` with
+  `ooxml-decoded-image-limit` in `mode: 'worker'`; worker and main-thread modes
+  now apply the same image budget, which still rejects genuinely oversized
+  images (#1950).
+
+## 0.89.4 — 2026-10-25
+
+Compatible patch release. No migration is required.
+
+- **XLSX worker scrolling:** in `mode: 'worker'`, `XlsxViewer` and
+  `XlsxSheetViewer` keep repainting during continuous scrolling instead of
+  freezing until scrolling stops (#1938).
+- **XLSX selection and overlays:** drag-selection keeps extending while the
+  viewer auto-scrolls in worker mode, and `onViewportChange` fires once when a
+  delayed worker frame moves the displayed cell geometry, so overlays placed
+  from `getCellViewportRect` follow it.
+
+## 0.89.3 — 2026-10-24
+
+Compatible patch release. No migration is required.
+
+- **Word pagination:** multi-column documents place footnotes, document-end
+  endnotes and their separators more faithfully. Paragraph endnotes continue
+  across pages, and list markers no longer add excess line height in affected
+  compatibility modes (#1921, #1932, #1933, #1935).
+- **Word frames and wrapping:** paragraph text frames retain inherited spacing
+  and placement, and zero-size drawing anchors preserve authored text wrapping
+  (#1921, #1931).
+- **Smaller downloads:** shrink parser downloads for DOCX, XLSX and PPTX and
+  reduce JavaScript build overhead, while preserving public APIs and loading
+  behavior (#1914, #1936).
+
 ## 0.89.2 — 2026-10-21
 
 Compatible patch release. No migration is required.

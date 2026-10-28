@@ -94,9 +94,9 @@ pub struct DrawingMlEffects {
     pub unsupported: bool,
 }
 
-fn try_resolved_color<R: ThemeResolver + ?Sized>(
+fn try_resolved_color(
     node: Node<'_, '_>,
-    resolver: &R,
+    resolver: &dyn ThemeResolver,
     tint_mode: TintMode,
 ) -> Option<(String, f64)> {
     let color = parse_color_node(node, resolver, tint_mode)?;
@@ -109,9 +109,9 @@ fn try_resolved_color<R: ThemeResolver + ?Sized>(
 }
 
 /// Parse one `<a:outerShdw>` or `<a:innerShdw>` element.
-pub fn parse_shadow_effect<R: ThemeResolver + ?Sized>(
+pub fn parse_shadow_effect(
     node: Node<'_, '_>,
-    resolver: &R,
+    resolver: &dyn ThemeResolver,
     tint_mode: TintMode,
 ) -> Shadow {
     let (color, alpha) =
@@ -136,9 +136,9 @@ pub fn parse_shadow_effect<R: ThemeResolver + ?Sized>(
 /// Parse one `<a:effectLst>`. The caller owns precedence: in particular, an
 /// authored empty list is a meaningful clear and must remain distinguishable
 /// from an absent effect component.
-pub fn parse_effect_list<R: ThemeResolver + ?Sized>(
+pub fn parse_effect_list(
     effect_list: Node<'_, '_>,
-    resolver: &R,
+    resolver: &dyn ThemeResolver,
     tint_mode: TintMode,
 ) -> DrawingMlEffects {
     let supported = ["outerShdw", "innerShdw", "glow", "softEdge", "reflection"];
@@ -178,9 +178,9 @@ pub fn parse_effect_list<R: ThemeResolver + ?Sized>(
 }
 
 /// Parse one `<a:glow>` element.
-pub fn parse_glow_effect<R: ThemeResolver + ?Sized>(
+pub fn parse_glow_effect(
     node: Node<'_, '_>,
-    resolver: &R,
+    resolver: &dyn ThemeResolver,
     tint_mode: TintMode,
 ) -> Glow {
     let (color, alpha) =

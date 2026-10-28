@@ -945,7 +945,10 @@ pub(super) fn incomplete_host(shape: roxmltree::Node, definition: Option<roxmltr
                 | "userhidden" | "userdrawn" | "preferrelative" | "ole" | "oleicon"
                 | "allowincell" | "allowoverlap" | "insetmode" | "master" | "gfxdata"
                 | "equationxml" | "connectortype" | "dgmlayoutmru" | "dgmnodekind"
-                | "editas" | "tableproperties" | "tablelimits")
+                | "editas" | "tableproperties" | "tablelimits"
+                // Tight/through wrap polygon: anchor acquisition consumes it;
+                // parse_vml_shape discloses it on unacquired legacy placement.
+                | "wrapcoords")
                 // Inactive optional modes do not change screen output. An
                 // enabled inset pen is handled below after the path override.
                 && !(matches!(a.name(), "hr" | "hrstd" | "hrnoshade" | "bullet"

@@ -47,7 +47,7 @@ import {
 } from './layout.js';
 import { elideToWidth } from './text-elide.js';
 import { authoredExtraLinesHeight, authoredLineCount, authoredTextLines, axisLabelLineHeightPx, fillAuthoredText, measureAuthoredTextWidth } from './chart-text-lines.js';
-import { resolveThemeFontRef } from './shared/fonts.js';
+import { chartFaceList, resolveThemeFontRef } from './shared/fonts.js';
 import { fitDataLabelLines, resolveDataLabelPlacement } from './data-label-layout.js';
 import { paintRichDataLabelBlock, resolveRichDataLabelBlock } from './rich-data-label.js';
 import { effectiveDataLabelText } from './data-label-content.js';
@@ -688,16 +688,16 @@ function meshMaterialFactor(
 // 3-D renderer falls back to Arial. ECMA-376 defines no last-resort face; it is
 // left to the consumer. An unresolved theme reference (`+mn-*` / `+mj-*` with no
 // theme threaded into the chart) takes the same fallback.
-const fontFamily = (face: string | null | undefined): string => {
+const fontFamily = (face: string | null | undefined, chart?: ChartModel): string => {
   const safe = face && !face.startsWith('+') ? face.replace(/["\\]/g, '') : 'Arial';
-  return `"${safe}"`;
+  return chartFaceList(safe, chart);
 };
 
 /** Resolve an element face, including a DrawingML theme font reference
  *  (`+mj-*` / `+mn-*`, ECMA-376 §20.1.4.1.16 against the theme font scheme),
  *  before applying {@link fontFamily}. An absent face keeps the fallback. */
 export const elementFontFamily = (chart: ChartModel, face: string | null | undefined): string =>
-  fontFamily(resolveThemeFontRef(chart, face));
+  fontFamily(resolveThemeFontRef(chart, face), chart);
 
 const chartFontFamily = (
   chart: ChartModel,
@@ -708,7 +708,7 @@ const chartFontFamily = (
     ? chart.themeMajorFontLatin
     : face?.startsWith('+mn-') ? chart.themeMinorFontLatin : face;
   const resolved = reference ?? (role === 'major' ? chart.themeMajorFontLatin : chart.themeMinorFontLatin);
-  return fontFamily(resolved);
+  return fontFamily(resolved, chart);
 };
 
 function polygon(ctx: CanvasRenderingContext2D, points: readonly Point[]): void {

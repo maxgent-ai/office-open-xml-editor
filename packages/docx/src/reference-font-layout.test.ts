@@ -347,6 +347,37 @@ describe('native reference font vertical layout', () => {
       .toHaveLength(c.fits ? 1 : 2);
   });
 
+  // Windows Word mode-11 controls compress Latin spaces to the xAvg floor with
+  // an explicit kerning threshold and with lineWrapLikeWord6; mode 15 keeps
+  // both exclusions.
+  it.each([
+    { compatibilityMode: 11, kerning: 0, lineWrapLikeWord6: true, fits: true },
+    { compatibilityMode: 11, kerning: 0, lineWrapLikeWord6: false, fits: true },
+    { compatibilityMode: 15, kerning: undefined, lineWrapLikeWord6: true, fits: false },
+  ])('applies the Latin floor below mode 15 regardless of kerning and Word 6 wrapping (mode=$compatibilityMode, kern=$kerning, word6=$lineWrapLikeWord6)', (c) => {
+    const family = 'Synthetic Latin';
+    const layoutServices = verifiedReferenceServices([{ family }], {
+      selected: {
+        family, sourceIdentity: `office-local:local("${family}")`,
+        averageCharWidthRatio: 0.4, unicodeRanges: [[32, 32], [65, 66]],
+      },
+    });
+    const segments = buildSegments([{
+      type: 'text', text: 'A B', fontFamily: family, fontSize: 10,
+      bold: false, italic: false, underline: false, strikethrough: false,
+      color: null, isLink: false, background: null, vertAlign: null, hyperlink: null,
+      kerning: c.kerning,
+    }], {
+      pageIndex: 0, totalPages: 1, layoutServices,
+      compatibilityMode: c.compatibilityMode,
+      characterSpacingControl: 'compressPunctuation',
+      lineWrapLikeWord6: c.lineWrapLikeWord6,
+    });
+    // Natural 15pt; the sole 5pt space can shrink only to 2pt (half xAvg).
+    expect(layoutLines(context, segments, 12, 0, 1, [], undefined, {}, 0)).toHaveLength(c.fits ? 1 : 2);
+    expect(layoutLines(context, segments, 11.9, 0, 1, [], undefined, {}, 0)).toHaveLength(2);
+  });
+
   it('keeps an untabled East Asian grid count independent of the native Canvas box', () => {
     const nativeContext = {
       font: '10px serif', letterSpacing: '0px', fontKerning: 'auto',

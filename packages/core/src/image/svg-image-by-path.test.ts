@@ -1,6 +1,7 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { getCachedSvgImageByPath, dropSvgImageCache } from './svg-image-by-path';
 import { getCachedBitmapByPath } from './bitmap-image-by-path';
+import { decodeSvgBlobOnMainThread } from './svg-raster';
 
 describe('getCachedSvgImageByPath', () => {
   afterEach(() => vi.unstubAllGlobals());
@@ -186,5 +187,89 @@ describe('getCachedSvgImageByPath', () => {
     }
     await Promise.all(pending);
     expect(maximum).toBe(2);
+  });
+
+  describe('worker SVG coverage admission (#1950)', () => {
+    /** The production Window rasterizer, with only the DOM image stubbed: it
+     * reports a 96x96 intrinsic size (a square viewBox) and rasterizes into an
+     * OffscreenCanvas whose transferred bitmap has the canvas grid. */
+    const hostDecoder = (naturalWidth: number, naturalHeight: number) =>
+      async (blob: Blob, target?: { targetWidthPx?: number; targetHeightPx?: number }) => {
+        class HostImage {
+          naturalWidth = naturalWidth; naturalHeight = naturalHeight;
+          width = 0; height = 0;
+          onload: (() => void) | null = null;
+          set src(_v: string) { queueMicrotask(() => this.onload?.()); }
+        }
+        vi.stubGlobal('Image', HostImage);
+        try {
+          return await decodeSvgBlobOnMainThread(blob, target);
+        } finally {
+          vi.stubGlobal('Image', undefined);
+        }
+      };
+
+    function stubWorkerRealm() {
+      vi.stubGlobal('Image', undefined);
+      vi.stubGlobal('URL', { createObjectURL: () => 'blob:x', revokeObjectURL: () => {} });
+      vi.stubGlobal('OffscreenCanvas', class {
+        constructor(readonly width: number, readonly height: number) {}
+        getContext() { return { drawImage() {} }; }
+        transferToImageBitmap() {
+          return { width: this.width, height: this.height, close() {} } as unknown as ImageBitmap;
+        }
+      });
+    }
+
+    it.each([0.9, 0.98, 0.99, 1])(
+      'admits the aspect-preserving 96x96 grid of a square SVG in a 96 x (96*%s) box',
+      async (ratio) => {
+        stubWorkerRealm();
+        const fetchImage = vi.fn(async () => new Blob(['<svg/>'], { type: 'image/svg+xml' }));
+        const targetHeightPx = Math.ceil(96 * ratio);
+        const result = await getCachedSvgImageByPath('square.svg', fetchImage, {
+          targetWidthPx: 96,
+          targetHeightPx,
+          workerDecoder: hostDecoder(96, 96),
+        }) as ImageBitmap;
+        expect({ width: result.width, height: result.height }).toEqual({ width: 96, height: 96 });
+      },
+    );
+
+    it('rejects and closes a worker raster larger than the coverage grid it was asked for', async () => {
+      stubWorkerRealm();
+      const close = vi.fn();
+      // Ten times the request on both axes: no aspect ratio needs that grid.
+      const workerDecoder = vi.fn(async () => (
+        { width: 960, height: 870, close } as unknown as ImageBitmap
+      ));
+      const fetchImage = vi.fn(async () => new Blob(['<svg/>'], { type: 'image/svg+xml' }));
+      await expect(getCachedSvgImageByPath('oversized.svg', fetchImage, {
+        targetWidthPx: 96,
+        targetHeightPx: 87,
+        workerDecoder,
+      })).rejects.toMatchObject({
+        code: 'ooxml-decoded-image-limit',
+        metric: 'image-pixels',
+        limit: 96 * 87,
+        observed: 960 * 870,
+      });
+      expect(close).toHaveBeenCalledTimes(1);
+    });
+
+    it('keeps non-finite worker raster dimensions a terminal quota failure', async () => {
+      stubWorkerRealm();
+      const close = vi.fn();
+      const workerDecoder = vi.fn(async () => (
+        { width: Infinity, height: Infinity, close } as unknown as ImageBitmap
+      ));
+      const fetchImage = vi.fn(async () => new Blob(['<svg/>'], { type: 'image/svg+xml' }));
+      await expect(getCachedSvgImageByPath('non-finite.svg', fetchImage, {
+        targetWidthPx: 96,
+        targetHeightPx: 87,
+        workerDecoder,
+      })).rejects.toMatchObject({ code: 'ooxml-decoded-image-limit', metric: 'image-dimension' });
+      expect(close).toHaveBeenCalledTimes(1);
+    });
   });
 });

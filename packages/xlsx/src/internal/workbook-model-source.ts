@@ -149,7 +149,9 @@ function sourceWorker(
           }
           if (type === 'message') respondToHostLayoutRequest(
             (reply) => target.postMessage(reply), event.data,
-            (font) => computeMdw(font.family, font.sizePt, undefined, !!opts.useGoogleFonts,
+            // Measured while the model source opens, before this workbook's font
+            // sources load: no source substitution yet (as in worker mode).
+            (font) => computeMdw(font.family, font.sizePt, undefined, undefined,
               font.bold ? 700 : 400, font.italic ? 'italic' : 'normal'),
           );
           listener(event);

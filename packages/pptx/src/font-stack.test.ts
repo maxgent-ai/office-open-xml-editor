@@ -1,6 +1,13 @@
 import { describe, it, expect } from 'vitest';
 import { buildFont, cssFontStack, renderTextBody } from './renderer.js';
 import type { TextBody } from './types.js';
+import { GOOGLE_NOTO_CJK_NAMING, OFFICE_FONT_SUBSTITUTIONS, fontFamilyKey } from '@silurus/ooxml-core/internal/font-sources';
+
+/** Every Office substitution as if its served face had loaded (the shape the
+ * font-source session reports in `LoadedFontSources.substitutions`). */
+const LOADED_OFFICE_SUBSTITUTIONS = new Map(OFFICE_FONT_SUBSTITUTIONS.map((entry) =>
+  [fontFamilyKey(entry.for), { family: entry.use, ...(entry.script ? { script: entry.script } : {}) }]));
+
 
 describe('cssFontStack — Arabic faces keep the Arabic chain (regression)', () => {
   it('uses Arabic fallbacks only for Arabic text and keeps the default class', () => {
@@ -12,15 +19,28 @@ describe('cssFontStack — Arabic faces keep the Arabic chain (regression)', () 
     expect(stack).not.toContain('Noto Sans KR');
     expect(stack).not.toContain('Noto Sans Thai');
     expect(cssFontStack('Sakkal Majalla')).not.toContain('Noto Naskh Arabic');
-    expect(cssFontStack('Sakkal Majalla', 'Sakkal Majalla', undefined, 'Latin', true))
+    expect(cssFontStack('Sakkal Majalla', 'Sakkal Majalla', undefined, 'Latin', LOADED_OFFICE_SUBSTITUTIONS))
       .not.toContain('Noto Naskh Arabic');
-    expect(cssFontStack('Sakkal Majalla', 'Sakkal Majalla', undefined, 'العربية', true))
+    expect(cssFontStack('Sakkal Majalla', 'Sakkal Majalla', undefined, 'العربية', LOADED_OFFICE_SUBSTITUTIONS))
       .toContain('"Noto Naskh Arabic"');
   });
 });
 
 describe('cssFontStack — CJK language-specific Noto ordering', () => {
-  it('routes a native Noto CJK name through the loaded Google family', () => {
+  it('places a loaded native-to-distribution Noto CJK substitute where the chain already lists it', () => {
+    // Without a source the CJK chain already follows a native Noto CJK name
+    // with its distribution family, so the vendor alias the renderer used to
+    // insert unconditionally changes nothing; a loaded naming substitution
+    // occupies the same position, once.
+    for (const { for: authored, use } of GOOGLE_NOTO_CJK_NAMING) {
+      const offline = cssFontStack(authored);
+      expect(offline.startsWith(`"${authored}", "${use}", `), authored).toBe(true);
+      expect(cssFontStack(authored, authored, undefined, '', new Map([[fontFamilyKey(authored), { family: use }]])))
+        .toBe(offline);
+    }
+  });
+
+  it('routes a native Noto CJK name through the distribution family', () => {
     const sans = cssFontStack('Noto Sans CJK SC');
     expect(sans.startsWith('"Noto Sans CJK SC", "Noto Sans SC", ')).toBe(true);
     expect(sans.match(/"Noto Sans SC"/g)).toHaveLength(1);
@@ -97,7 +117,7 @@ describe('cssFontStack — serif/sans generic classification (core classifier)',
     expect(stack.endsWith('serif')).toBe(true);
     expect(stack.endsWith('sans-serif')).toBe(false);
     expect(stack).not.toContain('"Caladea"');
-    expect(cssFontStack('Cambria', 'Cambria', undefined, '', true)).toContain('"Caladea"');
+    expect(cssFontStack('Cambria', 'Cambria', undefined, '', LOADED_OFFICE_SUBSTITUTIONS)).toContain('"Caladea"');
   });
 
   it('does not substitute distinct light and mathematical faces', () => {
@@ -108,7 +128,7 @@ describe('cssFontStack — serif/sans generic classification (core classifier)',
   it('regression: Calibri stays sans, Times New Roman stays serif', () => {
     expect(cssFontStack('Calibri').endsWith('sans-serif')).toBe(true);
     expect(cssFontStack('Calibri')).not.toContain('"Carlito"');
-    expect(cssFontStack('Calibri', 'Calibri', undefined, '', true)).toContain('"Carlito"');
+    expect(cssFontStack('Calibri', 'Calibri', undefined, '', LOADED_OFFICE_SUBSTITUTIONS)).toContain('"Carlito"');
     expect(cssFontStack('Times New Roman').endsWith('serif')).toBe(true);
   });
 });
@@ -282,7 +302,7 @@ describe('buildFont — style encoded in a face name', () => {
     expect(font).toMatch(/^500 48px "Franklin Gothic Medium"/);
     expect(font).not.toContain('"Libre Franklin"');
     const substituted = buildFont(false, false, 48, 'Franklin Gothic Medium', {
-      themeMajorFont: null, themeMinorFont: null, dpr: 1, googleSubstitutes: true,
+      themeMajorFont: null, themeMinorFont: null, dpr: 1, fontSubstitutions: LOADED_OFFICE_SUBSTITUTIONS,
     });
     expect(substituted).toMatch(/^500 48px "Franklin Gothic Medium"/);
     expect(substituted).toContain('"Libre Franklin"');
@@ -323,7 +343,7 @@ describe('buildFont — style encoded in a face name', () => {
 it('uses per-presentation fallback for neutral fonts while preserving named regions', () => {
   const sc = cssFontStack('Calibri', 'Calibri', 'sc');
   expect(sc).not.toContain('"Carlito"');
-  const optedIn = cssFontStack('Calibri', 'Calibri', 'sc', '', true);
+  const optedIn = cssFontStack('Calibri', 'Calibri', 'sc', '', LOADED_OFFICE_SUBSTITUTIONS);
   expect(optedIn.indexOf('"Carlito"')).toBeLessThan(optedIn.indexOf('"Noto Sans SC"'));
   expect(sc.indexOf('"Noto Sans SC"')).toBeLessThan(sc.indexOf('"Noto Sans JP"'));
   const tc = cssFontStack('Calibri', 'Calibri', 'tc');

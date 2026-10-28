@@ -1,3 +1,4 @@
+import { googleFonts } from '@silurus/ooxml-core/internal/font-sources';
 import type { Meta, StoryObj } from '@storybook/html';
 import { buildViewerUI } from './PptxViewer.stories';
 import { PptxPresentation } from './presentation';
@@ -74,7 +75,7 @@ export const ScrollView: LayoutStory = {
       'max-height:720px;overflow-y:auto;border:1px solid #ccc;background:#f5f5f5;padding:12px;';
     root.appendChild(scroller);
 
-    PptxPresentation.load(SAMPLE_URL, { useGoogleFonts: true, ...fullRenderers })
+    PptxPresentation.load(SAMPLE_URL, { fonts: [googleFonts()], ...fullRenderers })
       .then(async (pres) => {
         status.textContent = `Rendering ${pres.slideCount} slides…`;
         const widthPx = 800;
@@ -147,7 +148,7 @@ export const ScrollViewer: LayoutStory = {
       paddingRight: 24, // horizontal desk gutter right of the slides
       overscan: 1,
       enableTextSelection: true,
-      useGoogleFonts: true,
+      fonts: [googleFonts()],
       background: '#f5f5f5', // light desk behind/between slides (matches the ScrollView recipe)
       onVisibleSlideChange: (top, total) => {
         status.textContent = `Slide ${top + 1} / ${total}`;
@@ -188,7 +189,7 @@ export const ThumbnailGrid: LayoutStory = {
       'display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:16px;';
     root.appendChild(grid);
 
-    PptxPresentation.load(SAMPLE_URL, { useGoogleFonts: true, ...fullRenderers })
+    PptxPresentation.load(SAMPLE_URL, { fonts: [googleFonts()], ...fullRenderers })
       .then(async (pres) => {
         status.textContent = `Rendering ${pres.slideCount} thumbnails…`;
         const thumbWidth = 240;
@@ -251,14 +252,14 @@ export const MasterDetail: LayoutStory = {
     detailCol.appendChild(detailCanvas);
     const detailViewer = new PptxViewer(detailCanvas, {
       width: 800,
-      useGoogleFonts: true,
+      fonts: [googleFonts()],
       enableTextSelection: true,
       ...fullRenderers,
     });
 
     // Load thumbnails using PptxPresentation; detail viewer loads independently
     Promise.all([
-      PptxPresentation.load(SAMPLE_URL, { useGoogleFonts: true, ...fullRenderers }),
+      PptxPresentation.load(SAMPLE_URL, { fonts: [googleFonts()], ...fullRenderers }),
       detailViewer.load(SAMPLE_URL),
     ])
       .then(async ([pres]) => {

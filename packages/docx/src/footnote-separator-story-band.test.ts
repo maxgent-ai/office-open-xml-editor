@@ -218,3 +218,60 @@ it.each([
   } as unknown as DocxDocumentModel;
   expect(() => render(document)).toThrow(/note separator story/);
 });
+
+// Parser tests establish that a bare selected story retains its inherited
+// exact 12pt paragraph. Both note kinds use that retained paragraph here.
+it.each(['footnote', 'endnote'] as const)('measures bare selected %s stories with and without rule ink', (kind) => {
+  for (const mark of ['short', 'none'] as const) {
+    const reference = paragraph(['B01'], [['1']]);
+    reference.runs = reference.runs.map(run => 'noteRef' in run
+      ? { ...run, noteRef: { kind, id: '1' } } : run);
+    const document = {
+      ...model(324, [reference], paragraph(['N01']), {}),
+      [kind === 'footnote' ? 'footnotes' : 'endnotes']: [{ id: '1', content: [paragraph(['N01'])] }],
+      __noteLayoutSettings: {
+        [kind === 'footnote' ? 'footnoteSeparator' : 'endnoteSeparator']: mark,
+        [kind === 'footnote' ? 'footnoteSeparatorParagraph' : 'endnoteSeparatorParagraph']: story(12),
+      },
+    } as unknown as DocxDocumentModel;
+    const [note] = notesOnPage(render(document).pages[0]!);
+    expect(note!.flowBounds.heightPt - note!.story.advancePt).toBe(12);
+    expect(note!.separator).toHaveLength(mark === 'none' ? 0 : 1);
+  }
+});
+
+it.each([false, true])('uses the continued endnote area story even at a new-note boundary (%s)', separateNotes => {
+  const base = model(324, [paragraph(['B01'])], paragraph([]), {});
+  const body = paragraph(['B01']);
+  body.runs.push(textRun('e', { noteRef: { kind: 'endnote', id: '1' } }) as DocParagraph['runs'][number]);
+  if (separateNotes) body.runs.push(textRun('e', { noteRef: { kind: 'endnote', id: '2' } }) as DocParagraph['runs'][number]);
+  const document = {
+    ...base, body: [body], footnotes: [],
+    endnotes: separateNotes
+      ? [{ id: '1', content: [paragraph(lines('E', 14))] }, { id: '2', content: [paragraph(lines('E', 30).slice(14))] }]
+      : [{ id: '1', content: [paragraph(lines('E', 30))] }],
+    __noteLayoutSettings: { endnoteSeparator: 'short', endnoteContinuationSeparator: 'full',
+      endnoteSeparatorParagraph: story(24), endnoteContinuationSeparatorParagraph: story(12) },
+  } as unknown as DocxDocumentModel;
+  const layout = render(document);
+  expect(pages(layout).map(page => page.notes.join(''))).toEqual([
+    lines('E', 14).join(''), lines('E', 30).slice(14).join(''),
+  ]);
+  expect(band(layout, 0)).toEqual({ heightPt: 24, ruleOffsetPt: 12, ruleWidthPt: 60 });
+  expect(band(layout, 1)).toEqual({ heightPt: 12, ruleOffsetPt: 6, ruleWidthPt: 180 });
+});
+
+it('admits a listed endnote continuation story when the ordinary separator is absent', () => {
+  const base = model(324, [paragraph(['B01'])], paragraph([]), {});
+  const body = paragraph(['B01']);
+  body.runs.push(textRun('e', { noteRef: { kind: 'endnote', id: '1' } }) as DocParagraph['runs'][number]);
+  const document = { ...base, body: [body], footnotes: [],
+    endnotes: [{ id: '1', content: [paragraph(lines('E', 30))] }],
+    __noteLayoutSettings: { endnoteContinuationSeparator: 'full', endnoteContinuationSeparatorParagraph: story(12) },
+  } as unknown as DocxDocumentModel;
+  const layout = render(document);
+  expect(pages(layout).map(page => page.notes.join(''))).toEqual([
+    lines('E', 16).join(''), lines('E', 30).slice(16).join(''),
+  ]);
+  expect(band(layout, 1)).toEqual({ heightPt: 12, ruleOffsetPt: 6, ruleWidthPt: 180 });
+});

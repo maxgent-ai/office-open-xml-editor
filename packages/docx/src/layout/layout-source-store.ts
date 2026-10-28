@@ -76,7 +76,6 @@ export interface LayoutSourceFontFacts {
   readonly embeddedFonts: readonly EmbeddedFontRef[];
   readonly renderedFamilies: readonly string[];
   readonly scriptCjkLanguage?: import('@silurus/ooxml-core').CjkLang | null;
-  readonly preloadNames: readonly (string | null | undefined)[];
   readonly defaultBodyFontSizePt: number;
 }
 
@@ -182,31 +181,36 @@ function validateReservedNoteSeparatorRoles(
   blocks: LayoutBlockRepository,
 ): void {
   const settings = input.noteLayoutSettings;
-  if (settings?.reservedSeparators !== undefined || settings?.footnoteSeparatorParagraphs !== undefined) {
+  if (settings?.reservedSeparators !== undefined || settings?.footnoteSeparatorParagraphs !== undefined
+    || settings?.endnoteSeparatorParagraphs !== undefined) {
     throw new TypeError('Note separator wire must be normalized before sealing');
   }
   const defined = new Set<string>();
-  const stories = settings?.footnoteSeparatorStories;
-  if (stories && settings?.reservedSeparatorRoles?.footnote) {
-    throw new TypeError('Native and DOCX footnote separator stories cannot both be sealed');
-  }
-  for (const [role, definition] of Object.entries(stories ?? {})) {
-    if (role !== 'separator' && role !== 'continuationSeparator') {
-      throw new TypeError(`Invalid note separator story definition: ${role}`);
+  for (const kind of ['footnote', 'endnote'] as const) {
+    const stories = kind === 'footnote' ? settings?.footnoteSeparatorStories : settings?.endnoteSeparatorStories;
+    if (stories && settings?.reservedSeparatorRoles?.[kind]) {
+      throw new TypeError(`Native and DOCX ${kind} separator stories cannot both be sealed`);
     }
-    const mode = role === 'separator' ? settings?.footnoteSeparator : settings?.footnoteContinuationSeparator;
-    const root = selectedNoteSeparatorSource(role);
-    if (!definition || definition.role !== role || sourceKey(definition.root) !== sourceKey(root)
-      || sourceKey(definition.paragraph) !== sourceKey({ ...root, path: [0] })
-      || (mode !== 'short' && mode !== 'full')) {
-      throw new TypeError(`Invalid note separator story definition: footnote:${role}`);
-    }
-    defined.add(sourceKey(root));
-    const story = blocks.storyRoot(root);
-    const paragraph = blocks.resolve(definition.paragraph);
-    if (story.length !== 1 || story[0] !== paragraph || paragraph.type !== 'paragraph'
-      || paragraph.runs.length !== 0) {
-      throw new TypeError(`Note separator story paragraph mismatch: ${sourceKey(root)}`);
+    for (const [role, definition] of Object.entries(stories ?? {})) {
+      if (role !== 'separator' && role !== 'continuationSeparator') {
+        throw new TypeError(`Invalid note separator story definition: ${role}`);
+      }
+      const mode = kind === 'endnote'
+        ? role === 'separator' ? settings?.endnoteSeparator : settings?.endnoteContinuationSeparator
+        : role === 'separator' ? settings?.footnoteSeparator : settings?.footnoteContinuationSeparator;
+      const root = selectedNoteSeparatorSource(role, [], kind);
+      if (!definition || definition.role !== role || sourceKey(definition.root) !== sourceKey(root)
+        || sourceKey(definition.paragraph) !== sourceKey({ ...root, path: [0] })
+        || (mode !== 'short' && mode !== 'full' && mode !== 'none')) {
+        throw new TypeError(`Invalid note separator story definition: ${kind}:${role}`);
+      }
+      defined.add(sourceKey(root));
+      const story = blocks.storyRoot(root);
+      const paragraph = blocks.resolve(definition.paragraph);
+      if (story.length !== 1 || story[0] !== paragraph || paragraph.type !== 'paragraph'
+        || paragraph.runs.length !== 0) {
+        throw new TypeError(`Note separator story paragraph mismatch: ${sourceKey(root)}`);
+      }
     }
   }
   for (const kind of ['footnote', 'endnote'] as const) {
@@ -660,7 +664,7 @@ export function createLayoutBlockRepository(
   for (const { source, body } of reservedInput) {
     if (source.path.length !== 0 || (source.story !== 'footnote' && source.story !== 'endnote')
       || !(isReservedNoteSeparatorInstance(source.storyInstance)
-        || (source.story === 'footnote' && isSelectedNoteSeparatorInstance(source.storyInstance)))) {
+        || isSelectedNoteSeparatorInstance(source.storyInstance))) {
       throw new TypeError(`Unsupported reserved note story source: ${storyKey(source)}`);
     }
     const key = storyKey(source);

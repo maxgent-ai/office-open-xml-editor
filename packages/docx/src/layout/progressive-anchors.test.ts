@@ -391,6 +391,26 @@ describe('progressive layout with page-owned anchors', () => {
     expect(large / medium).toBeLessThan(2.5);
   }, 300_000);
 
+  it('discovers destinations on closed pages of a section with page borders', async () => {
+    // #1949: the opening pass finalizes each closed page to read its anchor
+    // destinations; a bordered section needs that page's section-owned
+    // identity (§17.6.10 display) there as in final composition.
+    const model = anchoredImageModel();
+    const edge = { style: 'single', width: 1.5, space: 24 };
+    model.section.pageBorders = {
+      offsetFrom: 'page', display: 'firstPage', zOrder: 'front',
+      top: edge, bottom: edge, left: edge, right: edge,
+    };
+    const blocking = blockingLayout(model);
+    expect(blocking.layout.pages.map((page) => page.pageBorder !== null).slice(0, 2))
+      .toEqual([true, false]);
+
+    const { previews, final } = await progressiveRun(model);
+    expect(layoutFingerprint(final)).toBe(layoutFingerprint(blocking.layout));
+    expect(previews.length).toBeGreaterThan(0);
+    expectPublishedPagesFinal(previews, final);
+  }, 300_000);
+
   it('emits no stale page when cancelled during convergence', async () => {
     const model = anchoredImageModel();
     const { layout: final } = blockingLayout(model);

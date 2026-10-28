@@ -233,7 +233,7 @@ describe('XLSX workers with a model source', () => {
     } } as MessageEvent);
     expect(state.ensureReady).not.toHaveBeenCalled();
     expect(state.setWasmInput).not.toHaveBeenCalled();
-    expect(state.computeMdw).toHaveBeenCalledExactlyOnceWith('Calibri', 11, undefined, false, 400, 'normal');
+    expect(state.computeMdw).toHaveBeenCalledExactlyOnceWith('Calibri', 11, undefined, undefined, 400, 'normal');
     expect(first.configure_host_layout).toHaveBeenCalledExactlyOnceWith(9);
     expect(ofType(posted, XLSX_HOST_LAYOUT_REQUEST)).toEqual([]);
     expect(ofType(posted, 'parsed')).toEqual([expect.objectContaining({

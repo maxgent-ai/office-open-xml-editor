@@ -1,6 +1,7 @@
 import { test, expect } from '@playwright/test';
 import { PNG } from 'pngjs';
 import pixelmatch from 'pixelmatch';
+import { storeZip } from '../../src/conformance/generate.js';
 // @ts-ignore - shared plain-JS test fixture builder.
 import { chartExDocxBytes } from '../../../../tests/fixtures/chart-ex-packages.mjs';
 
@@ -126,4 +127,71 @@ test('worker mode matches main mode › ChartEx waterfall', async ({ page }) => 
   expect(coloured(worker)).toBeGreaterThan(500);
   const diff = pixelmatch(main.data, worker.data, undefined, main.width, main.height, { threshold: 0.1 });
   expect((diff / (main.width * main.height)) * 100).toBeLessThanOrEqual(0.1);
+});
+
+// wp:extent is CT_PositiveSize2D: either axis may be zero. Exercise actual
+// parser acquisition, page-start square-wrap prescan and paint in both realms;
+// pixel equality alone could miss both renderers silently omitting the lines.
+test('worker mode paints square-wrapped zero-extent horizontal and vertical lines', async ({ page }) => {
+  const line = (id: number, cx: number, cy: number, color: string) => `
+    <w:r><w:drawing>
+      <wp:anchor simplePos="0" relativeHeight="${id}" behindDoc="0" locked="0"
+          layoutInCell="1" allowOverlap="1" distT="0" distB="0" distL="0" distR="0">
+        <wp:simplePos x="0" y="0"/>
+        <wp:positionH relativeFrom="page"><wp:posOffset>914400</wp:posOffset></wp:positionH>
+        <wp:positionV relativeFrom="page"><wp:posOffset>1828800</wp:posOffset></wp:positionV>
+        <wp:extent cx="${cx}" cy="${cy}"/>
+        <wp:effectExtent l="0" t="0" r="0" b="0"/>
+        <wp:wrapSquare wrapText="bothSides"/>
+        <wp:docPr id="${id}" name="Line ${id}"/>
+        <a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">
+          <wps:wsp><wps:cNvSpPr/><wps:spPr>
+            <a:xfrm><a:off x="0" y="0"/><a:ext cx="${cx}" cy="${cy}"/></a:xfrm>
+            <a:prstGeom prst="line"><a:avLst/></a:prstGeom><a:noFill/>
+            <a:ln w="25400"><a:solidFill><a:srgbClr val="${color}"/></a:solidFill></a:ln>
+          </wps:spPr><wps:bodyPr/></wps:wsp>
+        </a:graphicData></a:graphic>
+      </wp:anchor>
+    </w:drawing></w:r>`;
+  const xml = new TextEncoder();
+  const bytes = storeZip(new Map([
+    ['[Content_Types].xml', xml.encode(`<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+      <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+      <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+    </Types>`)],
+    ['_rels/.rels', xml.encode(`<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+      <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+    </Relationships>`)],
+    ['word/document.xml', xml.encode(`<w:document
+      xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+      xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+      xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+      xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">
+      <w:body><w:p><w:r><w:t>Text before the lines</w:t></w:r></w:p>
+        <w:p>${line(1, 1828800, 0, 'FF0000')}${line(2, 0, 914400, '0000FF')}</w:p>
+        <w:sectPr><w:pgSz w:w="12240" w:h="15840"/><w:pgMar w:top="1440" w:bottom="1440" w:left="1440" w:right="1440"/></w:sectPr>
+      </w:body></w:document>`)],
+  ]));
+  await page.route('**/generated/zero-extent-lines.docx', (route) => route.fulfill({
+    contentType: 'application/octet-stream', body: Buffer.from(bytes),
+  }));
+  await page.goto('/tests/visual/worker-fixture.html?docx=generated/zero-extent-lines&page=0');
+  await page.waitForFunction(() => ['ready', 'error'].includes(document.body.dataset.status ?? ''));
+  expect(await page.evaluate(() => document.body.dataset.errorMessage)).toBeUndefined();
+  const urls = await page.locator('canvas').evaluateAll((canvases) =>
+    canvases.map((canvas) => (canvas as HTMLCanvasElement).toDataURL('image/png')));
+  const [main, worker] = urls.map((url) => PNG.sync.read(Buffer.from(url.split(',')[1], 'base64')));
+  expect(worker.width).toBe(main.width);
+  expect(worker.height).toBe(main.height);
+  for (const png of [main, worker]) {
+    let red = 0, blue = 0;
+    for (let i = 0; i < png.data.length; i += 4) {
+      if (png.data[i] > 200 && png.data[i + 1] < 50 && png.data[i + 2] < 50) red++;
+      if (png.data[i] < 50 && png.data[i + 1] < 50 && png.data[i + 2] > 200) blue++;
+    }
+    expect(red).toBeGreaterThan(500);
+    expect(blue).toBeGreaterThan(250);
+  }
+  const diff = pixelmatch(main.data, worker.data, undefined, main.width, main.height, { threshold: 0.1 });
+  expect(diff / (main.width * main.height)).toBeLessThanOrEqual(0.001);
 });

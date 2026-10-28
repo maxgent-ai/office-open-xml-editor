@@ -169,7 +169,7 @@ pres.destroy();
 
 - **Canvas-only rendering.** No HTML/script from the source file is ever executed or injected into the DOM.
 - **Zip-bomb safe.** Each ZIP entry is capped at 512 MiB of uncompressed output.
-- **No network by default.** Google Fonts for PPTX themes is opt-in (`useGoogleFonts: true`).
+- **No network by default.** Web fonts are opt-in through `fonts`, for example `fonts: [googleFonts()]` (DOCX, XLSX and PPTX).
 - **Tree-shakable.** Import a single format (e.g. `@silurus/ooxml/pptx`) and the other two are dropped entirely.
 
 ## License

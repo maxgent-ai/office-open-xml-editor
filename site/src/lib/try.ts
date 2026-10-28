@@ -11,7 +11,7 @@ import {
   DocxScrollViewer,
   type DocxScrollViewerOptions,
 } from '@silurus/ooxml-docx';
-import { XlsxSheetViewer, XlsxViewer } from '@silurus/ooxml-xlsx';
+import { XlsxSheetViewer, XlsxViewer, googleFonts } from '@silurus/ooxml-xlsx';
 import { math } from '../../../src/math';
 import { threeD } from '../../../src/three-d';
 import { regionMap } from '../../../src/region-map';
@@ -137,7 +137,7 @@ export async function renderFile(
     stage.appendChild(host);
     const viewer = new XlsxViewer(host, {
       mode: 'main',
-      useGoogleFonts: true,
+      fonts: [googleFonts()],
       showZoomSlider: true,
       comments: false,
       ...(legacyXls === undefined ? {} : { legacyXls }),
@@ -168,7 +168,7 @@ export async function renderFile(
     stage.appendChild(host);
     const viewer = new XlsxSheetViewer(canvas, {
       mode: 'main',
-      useGoogleFonts: true,
+      fonts: [googleFonts()],
       comments: false,
       math,
       ...fullRenderers,
@@ -199,7 +199,7 @@ export async function renderFile(
       enableZoom: true,
       zoomMin: MIN_SCALE,
       pageShadow: false,
-      useGoogleFonts: true,
+      fonts: [googleFonts()],
       comments: false,
       ...(legacyPpt === undefined ? {} : { legacyPpt }),
       math,
@@ -265,7 +265,7 @@ export async function renderFile(
     enableZoom: true,
     zoomMin: MIN_SCALE,
     pageShadow: false,
-    useGoogleFonts: true,
+    fonts: [googleFonts()],
     comments: false,
     ...(legacyDoc === undefined ? {} : { legacyDoc }),
     math,
@@ -341,18 +341,16 @@ export function prewarmEngines(): void {
   const sample = (f: string) => `${base}samples/${f}`.replace(/([^:])\/\/+/g, '$1/');
 
   const run = (): void => {
-    // Fonts are intentionally disabled here. Prewarming should prime only the
-    // parser binaries; downloading fonts used by bundled samples would compete
-    // with (and may be irrelevant to) the user's own file.
+    // No `fonts` sources here, so no font is downloaded. Prewarming should
+    // prime only the parser binaries; fonts used by bundled samples would
+    // compete with (and may be irrelevant to) the user's own file.
     void PptxPresentation.load(sample('sample-1.pptx'), {
-      useGoogleFonts: false,
       mode: 'main',
       ...fullRenderers,
     })
       .then((d) => d.destroy())
       .catch(() => {});
     void DocxDocument.load(sample('sample-1.docx'), {
-      useGoogleFonts: false,
       mode: 'main',
       ...fullRenderers,
     })
@@ -362,7 +360,6 @@ export function prewarmEngines(): void {
     // DOM, then dispose. The parse + one render warms the xlsx WASM engine.
     const host = document.createElement('div');
     const v = new XlsxViewer(host, {
-      useGoogleFonts: false,
       mode: 'main',
       ...fullRenderers,
     });

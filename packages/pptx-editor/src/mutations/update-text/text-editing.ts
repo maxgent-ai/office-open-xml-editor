@@ -890,6 +890,7 @@ function captureStyleFromRun(
 ): TextStylePatch | undefined {
   if (!run && hasRunScopedKeys(patch)) return undefined;
 
+  // ast-grep-ignore: no-plain-object-string-map -- captured keys are the explicit TextStylePatch properties below.
   const captured: Record<string, unknown> = {};
   if ('bold' in patch) captured.bold = run?.bold ?? null;
   if ('italic' in patch) captured.italic = run?.italic ?? null;

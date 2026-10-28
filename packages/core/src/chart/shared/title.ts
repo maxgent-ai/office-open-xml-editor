@@ -5,7 +5,7 @@ import { fillAuthoredText, measureAuthoredTextWidth } from '../chart-text-lines.
 import type { ChartTitleBand } from '../layout.js';
 import { rawLinkedChartStyleRole } from '../effective-style.js';
 import { paintChartLabelBox } from '../label-box.js';
-import { CHART_FALLBACK_FONT_STACK, chartFaceWithFallback, chartFontCss, resolveThemeFontRef } from './fonts.js';
+import { chartFallbackFontStack, chartFaceWithFallback, chartFontCss, resolveThemeFontRef } from './fonts.js';
 import { effectiveLinkedLabelBox } from './style-roles.js';
 
 
@@ -37,7 +37,7 @@ function chartTitleRunFont(
   const effectivePtToPx = fallbackFontSize / titleSizePt;
   const fontSize = chartTextFontSizePx(run.fontSizeHpt, effectivePtToPx) ?? fallbackFontSize;
   const titleFace = resolveThemeFontRef(chart, run.fontFace ?? chart.titleFontFace);
-  const face = titleFace ? chartFaceWithFallback(titleFace) : CHART_FALLBACK_FONT_STACK;
+  const face = titleFace ? chartFaceWithFallback(titleFace, chart) : chartFallbackFontStack(chart);
   return {
     font: chartFontCss(
       fontSize,
@@ -144,8 +144,8 @@ function drawChartTitle(
   if (!chart.titleRichRuns?.length) {
     const titleFace = resolveThemeFontRef(chart, chart.titleFontFace);
     const face = titleFace
-      ? chartFaceWithFallback(titleFace)
-      : CHART_FALLBACK_FONT_STACK;
+      ? chartFaceWithFallback(titleFace, chart)
+      : chartFallbackFontStack(chart);
     ctx.font = chartFontCss(
       fontSize,
       face,
@@ -208,7 +208,7 @@ export function drawChartTitleForLayout(
   const ml = chart.titleManualLayout;
   if (ml) {
     const titleFace = resolveThemeFontRef(chart, chart.titleFontFace);
-    const face = titleFace ? chartFaceWithFallback(titleFace) : CHART_FALLBACK_FONT_STACK;
+    const face = titleFace ? chartFaceWithFallback(titleFace, chart) : chartFallbackFontStack(chart);
     ctx.font = chartFontCss(
       fontSize,
       face,

@@ -45,7 +45,6 @@ test.describe('legacy DOC corpus survey', () => {
           if (!response.ok) throw new Error(`fetch failed: ${response.status}`);
           const bytes = await response.arrayBuffer();
           const document = await DocxDocument.load(bytes, {
-            useGoogleFonts: false,
             math,
             legacyDoc,
           });

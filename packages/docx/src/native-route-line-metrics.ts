@@ -7,6 +7,7 @@ import {
   type NativeRouteNormalLine,
   unloadOfficeFontFallbacks,
 } from '@silurus/ooxml-core';
+import { nullRecord } from '@silurus/ooxml-core/internal/own-key';
 import { docxRenderedTextUsages } from './document-content.js';
 import { nativeRouteMetricKey, type NativeRouteLineMetric } from './layout/font-service.js';
 import type { TextLayoutService } from './layout/text.js';
@@ -81,7 +82,7 @@ export function docxNativeRouteRequests(
   };
   visit(doc.majorFont, false, false, undefined);
   visit(doc.minorFont, false, false, undefined);
-  for (const usage of docxRenderedTextUsages(doc, 'google-preload')) {
+  for (const usage of docxRenderedTextUsages(doc, 'font-demand')) {
     const bold = usage.bold === true;
     const italic = usage.italic === true;
     for (const family of usage.fontFamilies) visit(family, bold, italic, usage.eastAsiaLanguage);
@@ -125,7 +126,8 @@ export function admitDocxNativeRouteLines(
   const measured = lines.filter((line): line is NativeRouteNormalLine => line !== null
     && docxNativeRoutePrimaryAdmitted(line.primaryFamily));
   const verified = verifyNativeRouteNormalLines(measured, fontSet);
-  const metrics: Record<string, NativeRouteLineMetric> = {};
+  // Keys embed authored family lists; keep every key an own entry.
+  const metrics = nullRecord<NativeRouteLineMetric>();
   measured.forEach((line, index) => {
     if (!verified[index]) return;
     const ascent = line.ascentRatio + line.lineGapRatio;

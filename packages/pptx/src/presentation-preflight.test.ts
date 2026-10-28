@@ -6,8 +6,9 @@ import {
   PresentationPreflightBuilder,
   assertPresentationPreflightProjectionBytes,
   normalizePresentationBootstrap,
+  normalizePresentationPreflight,
 } from './presentation-preflight';
-import { PptxFontPreloadAccumulator } from './google-fonts';
+import { PptxFontPreloadAccumulator } from './font-requests';
 import type { Presentation, Slide } from './types';
 import type { PresentationBootstrap } from './worker-protocol';
 
@@ -351,5 +352,108 @@ describe('normalizePresentationBootstrap', () => {
       ...bootstrap,
       slides: [{ index: 1 }, { index: 0 }],
     })).toThrow(/slide index/);
+  });
+});
+
+describe('font-source demand facts (LoadOptions.fonts)', () => {
+  const arabicDeck = (index: number, text: string, family: string): Slide => ({
+    ...slide(index, text),
+    elements: [{ type: 'shape', textBody: { paragraphs: [{ bullet: { type: 'none' },
+      runs: [{ type: 'text', text, fontFamily: family, bold: index === 1 }] }] } }] as Slide['elements'],
+  });
+
+  it('collects split, tuples and per-family scoped scripts only with a demand collector', () => {
+    const ordinary = new PresentationPreflightBuilder(bootstrap);
+    ordinary.addSlide(arabicDeck(0, 'العربية', 'Sakkal Majalla'));
+    ordinary.addSlide(arabicDeck(1, 'Latin', 'Traditional Arabic'));
+    const plain = ordinary.finish();
+    expect(plain).not.toHaveProperty('fontPreloadFacts');
+
+    const builder = new PresentationPreflightBuilder(bootstrap, { collectFontDemand: () => 'all' });
+    builder.addSlide(arabicDeck(0, 'العربية', 'Sakkal Majalla'));
+    // The progressive prefix exposes the committed facts.
+    expect(builder.currentFontPreloadFacts?.familyCount).toBe(3);
+    builder.addSlide(arabicDeck(1, 'Latin', 'Traditional Arabic'));
+    const full = builder.finish();
+    // Same names as without sources; the facts only add precision.
+    expect(full.fontPreloadNames).toEqual(plain.fontPreloadNames);
+    const facts = full.fontPreloadFacts!;
+    expect(full.fontPreloadNames.slice(0, facts.familyCount))
+      .toEqual(['SimSun', 'Aptos', 'Sakkal Majalla', 'Traditional Arabic']);
+    expect(full.fontPreloadNames.slice(facts.familyCount)).toContain('Noto Naskh Arabic');
+    expect(facts.tuples).toEqual([
+      { family: 'Sakkal Majalla', weight: 400, style: 'normal' },
+      { family: 'Traditional Arabic', weight: 700, style: 'normal' },
+    ]);
+    // Arabic text proves Sakkal Majalla; Latin-only Traditional Arabic proves
+    // nothing; theme fonts govern inherited runs whatever their text.
+    expect(facts.substituteScripts).toEqual({ simsun: ['arabic'], aptos: ['arabic'], 'sakkal majalla': ['arabic'] });
+    expect(normalizePresentationPreflight(full)).toEqual(full);
+  });
+
+  it('rejects malformed facts from a worker', () => {
+    const builder = new PresentationPreflightBuilder(bootstrap, { collectFontDemand: () => 'all' });
+    builder.addSlide(arabicDeck(0, 'A', 'Arial'));
+    builder.addSlide(arabicDeck(1, 'B', 'Arial'));
+    const full = builder.finish();
+    const facts = full.fontPreloadFacts!;
+    for (const bad of [
+      { ...facts, familyCount: full.fontPreloadNames.length + 1 },
+      { ...facts, tuples: [{ family: 'A', weight: 400, style: 'oblique' }] },
+      { ...facts, substituteScripts: { a: ['latin'] } },
+      [],
+    ]) {
+      expect(() => normalizePresentationPreflight({ ...full, fontPreloadFacts: bad })).toThrow('font demand facts');
+    }
+  });
+
+  it('keeps facts for families named like Object.prototype members', () => {
+    const builder = new PresentationPreflightBuilder(bootstrap, { collectFontDemand: () => 'all' });
+    builder.addSlide(arabicDeck(0, 'العربية', '__proto__'));
+    builder.addSlide(arabicDeck(1, 'العربية', 'constructor'));
+    const full = builder.finish();
+    const scripts = full.fontPreloadFacts!.substituteScripts;
+    expect(Object.prototype.hasOwnProperty.call(scripts, '__proto__')).toBe(true);
+    expect(Object.prototype.hasOwnProperty.call(scripts, 'constructor')).toBe(true);
+    // The worker → main round trip keeps them as own entries too.
+    const cloned = structuredClone(full);
+    const normalized = normalizePresentationPreflight(cloned).fontPreloadFacts!.substituteScripts;
+    expect(Object.keys(normalized).sort()).toEqual(Object.keys(scripts).sort());
+  });
+
+  it('demands bullet, break and end-of-paragraph faces, not only run families', () => {
+    const marked: Slide = {
+      ...slide(0, 'Item'),
+      elements: [{ type: 'shape', textBody: { paragraphs: [{
+        bullet: { type: 'char', char: '•', fontFamily: 'BulletFace' },
+        runs: [{ type: 'text', text: 'Item', fontFamily: 'BodyFace' }, { type: 'break', fontFamily: 'BreakFace' }],
+        endRunProperties: { fontFamily: 'EndFace' },
+      }] } }] as Slide['elements'],
+    };
+    const builder = new PresentationPreflightBuilder(bootstrap, { collectFontDemand: () => 'all' });
+    builder.addSlide(marked);
+    builder.addSlide(slide(1, 'B', { elements: [] }));
+    const full = builder.finish();
+    expect(full.fontPreloadNames.slice(0, full.fontPreloadFacts!.familyCount))
+      .toEqual(expect.arrayContaining(['BodyFace', 'BulletFace', 'BreakFace', 'EndFace']));
+  });
+
+  it('proves a marker\'s script under the marker\'s own family', () => {
+    // Latin body text; an Arabic character bullet in its own face, and an
+    // auto-number (ASCII labels) whose face proves nothing.
+    const marked: Slide = {
+      ...slide(0, 'Latin'),
+      elements: [{ type: 'shape', textBody: { paragraphs: [
+        { bullet: { type: 'char', char: 'ا', fontFamily: 'Bullet Face' },
+          runs: [{ type: 'text', text: 'Latin body', fontFamily: 'Body Face' }] },
+        { bullet: { type: 'autoNum', numType: 'arabicPeriod', fontFamily: 'Number Face' },
+          runs: [{ type: 'text', text: 'Item', fontFamily: 'Body Face' }] },
+      ] } }] as Slide['elements'],
+    };
+    const builder = new PresentationPreflightBuilder({ ...bootstrap, majorFont: null, minorFont: null },
+      { collectFontDemand: () => 'all' });
+    builder.addSlide(marked);
+    builder.addSlide(slide(1, 'B', { elements: [] }));
+    expect(builder.finish().fontPreloadFacts?.substituteScripts).toEqual({ 'bullet face': ['arabic'] });
   });
 });

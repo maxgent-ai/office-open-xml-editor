@@ -361,12 +361,15 @@ describe('render-orchestrator image decode (lazy bytes)', () => {
   });
 
   it('retains the authored display target for worker-decoded SVG images', async () => {
+    // Targets are coverage minimums (#1950): an SVG taller than its anchor box
+    // keeps its own aspect, so the retained grid exceeds the box on one axis
+    // and must still be admitted.
     const svgDecoder = vi.fn(async (_blob: Blob, target?: {
       targetWidthPx?: number;
       targetHeightPx?: number;
     }) => ({
       width: target?.targetWidthPx ?? 1,
-      height: target?.targetHeightPx ?? 1,
+      height: (target?.targetHeightPx ?? 1) * 2,
       close() {},
     }) as unknown as ImageBitmap);
     const fetchImage = vi.fn(async () => new Blob([
@@ -380,11 +383,14 @@ describe('render-orchestrator image decode (lazy bytes)', () => {
       mimeType: 'image/svg+xml',
     };
 
-    await prefetchImages(ws, new Map(), fetchImage, {
+    const images = new Map<string, CanvasImageSource | null>();
+    await prefetchImages(ws, images, fetchImage, {
       effectiveDpr: 2,
       svgDecoder,
     });
 
+    expect([...images.values()]).toHaveLength(1);
+    expect([...images.values()][0]).toBeTruthy();
     expect(svgDecoder).toHaveBeenCalledWith(expect.any(Blob), {
       targetWidthPx: expect.any(Number),
       targetHeightPx: expect.any(Number),

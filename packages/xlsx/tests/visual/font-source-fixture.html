@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <style>* { margin: 0; padding: 0; } canvas { display: block; }</style>
+</head>
+<body>
+  <canvas id="canvas"></canvas>
+  <script type="module">
+    // Font-source worker equivalence (font-source-worker-equivalence.spec.ts):
+    // one load per page so each mode's font requests are counted on their own.
+    import { XlsxWorkbook, fontFaceCss } from '/src/index.ts';
+
+    const params = new URLSearchParams(location.search);
+    const mode = params.get('mode') ?? 'main';
+    try {
+      const resp = await fetch('/generated/font-source.xlsx');
+      if (!resp.ok) throw new Error(`fetch font-source.xlsx -> ${resp.status}`);
+      const buf = await resp.arrayBuffer();
+      // ?substitute=1: the workbook names a face no source serves by name;
+      // the source declares the fixture family as its substitute.
+      const substitutes = params.get('substitute') === '1'
+        ? [{ for: 'Absent Office Face', use: 'Ooxml Fixture' }] : undefined;
+      const fonts = mode === 'none' ? undefined
+        : [fontFaceCss({ url: new URL('/generated/fixture-fonts.css', location.href).href, ...(substitutes ? { substitutes } : {}) })];
+      const wb = await XlsxWorkbook.load(buf, {
+        ...(mode === 'worker' ? { mode: 'worker' } : {}),
+        ...(fonts ? { fonts } : {}),
+      });
+      const bmp = await wb.renderViewportToBitmap(0, { row: 1, col: 1, rows: 8, cols: 6 }, { width: 640, height: 240, dpr: 1 });
+      const canvas = document.getElementById('canvas');
+      canvas.width = bmp.width;
+      canvas.height = bmp.height;
+      canvas.getContext('2d').drawImage(bmp, 0, 0);
+      bmp.close();
+      wb.destroy();
+      document.body.dataset.status = 'ready';
+    } catch (err) {
+      document.body.dataset.status = 'error';
+      document.body.dataset.errorMessage = err.message;
+      console.error('[font-source-fixture] error:', err);
+    }
+  </script>
+</body>
+</html>

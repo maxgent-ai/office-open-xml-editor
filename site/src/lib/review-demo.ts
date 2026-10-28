@@ -5,6 +5,7 @@ import {
   type DocComment,
   type DocRevision,
   type DocxTextRunInfo,
+  googleFonts,
 } from '@silurus/ooxml/docx';
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
@@ -165,7 +166,7 @@ export function mountReviewDemo(root: HTMLElement, url: string): ReviewDemoContr
     loaded = undefined;
   };
 
-  void DocxDocument.load(url, { useGoogleFonts: true }).then(async (documentModel) => {
+  void DocxDocument.load(url, { fonts: [googleFonts()] }).then(async (documentModel) => {
     if (destroyed) {
       documentModel.destroy();
       return;

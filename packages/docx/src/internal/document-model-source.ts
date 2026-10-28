@@ -3,9 +3,7 @@ import { recordResourceDiagnostics } from '../resource-diagnostics.js';
 import { resolveBundledAssetUrl } from '@silurus/ooxml-core/internal/bundled-asset-url';
 import { resolveCjkFallback } from '@silurus/ooxml-core';
 import {
-  preloadGoogleFonts,
   unloadOfficeFontFallbacks,
-  unloadGoogleFonts,
   unregisterEmbeddedFonts,
   type AdmittedModelSourceLoad,
   workerRendererDescriptors,
@@ -19,7 +17,7 @@ import {
 import { documentHasMath, prepareMathRuns } from '../renderer';
 import { createLayoutServices, prepareMainThreadNativeRouteMetrics } from '../layout-runtime.js';
 import { mainThreadFallbackWarning } from '../main-thread-fallback.js';
-import { DOCX_GOOGLE_FONTS, docxGoogleFontPlan, docxOfficeFontFallbackRequests } from '../google-fonts';
+import { declaredFontSubstitutions, docxOfficeFontFallbackRequests } from '../font-plan.js';
 import { loadEmbeddedFonts } from '../embedded-fonts';
 import {
   documentLayoutRuntimeOf,
@@ -54,7 +52,7 @@ function modelSourceFields(
 type SourceDocxFriend = Pick<DocxDocument, keyof DocxDocument> & Record<
   '_metrics' | '_cjkFallback' | '_parse' | '_mode' | '_threeD' | '_regionMap' |
   '_chartEx' | '_tiff' | '_document' | '_embeddedFontFaces' | '_officeFontFaces' |
-  '_googleFontFaces' | '_source' | '_layoutObservers' | '_layoutAbort' |
+  '_loadFontSources' | '_source' | '_layoutObservers' | '_layoutAbort' |
   '_replaceMainLayoutPublication' | '_isLayoutViewActive' | '_layoutLifecycle' |
   '_layoutCompletion' | '_resourceUsage' | '_progressive' | '_allowFootnoteContinuation' |
   '_mainThreadFallbackReason',
@@ -166,7 +164,7 @@ export async function loadDocxModelSource(
       await doc._parse(
         buffer,
         resourceOptions.policy,
-        mode === 'worker' ? !!opts.useGoogleFonts : false,
+        mode === 'worker' ? opts.fonts : undefined,
         opts.workerTimeoutMs,
         (usage: import('@silurus/ooxml-core').OoxmlResourceUsageSnapshot) => metrics.observeUsage(usage),
         rendererDescriptors,
@@ -240,7 +238,7 @@ export async function loadDocxModelSource(
         embeddedRoutes = loadedEmbedded.routes;
       }
       const officeFonts = doc._mode === 'main' && doc._document
-        ? await loadOfficeFontFallbacks(docxOfficeFontFallbackRequests(doc._document, { useGoogleFonts: opts.useGoogleFonts, cjkFallback: cjkFallback }).filter((request) =>
+        ? await loadOfficeFontFallbacks(docxOfficeFontFallbackRequests(doc._document, { fontDemand: !!opts.fonts, cjkFallback: cjkFallback }).filter((request) =>
             request.presenceOnly || !embeddedRoutes?.some((route) => route.requestedFamily.toLowerCase() === request.family.toLowerCase()
               && route.weight === (request.weight ?? 400) && route.style === (request.style ?? 'normal'))))
         : { faces: [], routes: {} };
@@ -249,19 +247,7 @@ export async function loadDocxModelSource(
         throw new PaginationAbortError();
       }
       doc._officeFontFaces = officeFonts.faces;
-      let installedSubstituteFamilies: readonly string[] = [];
-      if (doc._mode === 'main' && opts.useGoogleFonts && doc._document) {
-        // An installed authored face is never displaced by a different-family
-        // substitute (docxGoogleFontPlan).
-        const plan = docxGoogleFontPlan(doc._document, cjkFallback, officeFonts);
-        installedSubstituteFamilies = plan.installedSubstituteFamilies;
-        const googleFaces = await preloadGoogleFonts(plan.names, DOCX_GOOGLE_FONTS);
-        if (signal?.aborted) {
-          unloadGoogleFonts(googleFaces);
-          throw new PaginationAbortError();
-        }
-        doc._googleFontFaces = googleFaces;
-      }
+      const { installedSubstituteFamilies, sourceFonts } = await doc._loadFontSources(opts.fonts, cjkFallback, officeFonts, signal);
       // Equations are converted + rasterized before pagination (which reads their
       // extents synchronously). Requires the opt-in `math` engine; without it,
       // equations are skipped (and the engine asset is never bundled). Worker
@@ -277,11 +263,11 @@ export async function loadDocxModelSource(
         const serviceOptions = {
           allowFootnoteContinuation: doc._allowFootnoteContinuation,
           fontMetrics: embeddedMetrics,
-          useGoogleFonts: !!opts.useGoogleFonts,
+          fontSubstitutes: declaredFontSubstitutions(opts.fonts),
           cjkFallback,
           embeddedRoutes,
           officeRoutes: Object.values(officeFonts.routes),
-          googleFaces: doc._googleFontFaces,
+          sourceFonts,
           installedSubstituteFamilies,
           installedFamilies: 'installed' in officeFonts ? officeFonts.installed : undefined,
           mathResources: preparedMath?.records,
@@ -289,7 +275,7 @@ export async function loadDocxModelSource(
         };
         // Absent authored faces: see native-route-line-metrics.ts.
         const nativeRoutes = await prepareMainThreadNativeRouteMetrics(
-          doc._source, doc._document, { useGoogleFonts: !!opts.useGoogleFonts, cjkFallback },
+          doc._source, doc._document, { fontSubstitutes: declaredFontSubstitutions(opts.fonts), cjkFallback },
         );
         // destroy() may have drained this document's faces while the
         // sentinels loaded: release a late acquisition before aborting.

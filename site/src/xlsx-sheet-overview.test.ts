@@ -15,9 +15,9 @@ describe('XLSX multi-window sheet demo', () => {
   });
 
   it('parses once and opens borrowed sheet viewers in same-origin popup canvases', () => {
-    expect(demos).toContain("import { XlsxSheetViewer, XlsxViewer, XlsxWorkbook } from '@silurus/ooxml-xlsx';");
+    expect(demos).toContain("import { XlsxSheetViewer, XlsxViewer, XlsxWorkbook, googleFonts } from '@silurus/ooxml-xlsx';");
     expect(demos).toContain("case 'sheetWindows': return mountSheetWindows(el, url);");
-    expect(demos).toContain('XlsxWorkbook.load(url, { useGoogleFonts: true })');
+    expect(demos).toContain('XlsxWorkbook.load(url, { fonts: [googleFonts()] })');
     expect(demos).toContain("window.open(");
     expect(demos).toContain('const popupDocument = popup.document');
     expect(demos).toContain('const viewer = XlsxSheetViewer.fromWorkbook(canvas, workbook, {');

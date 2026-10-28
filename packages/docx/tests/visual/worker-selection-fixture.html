@@ -15,7 +15,7 @@
   <div id="main-host"></div>
   <div id="worker-host"></div>
   <script type="module">
-    import { DocxViewer } from '/src/index.ts';
+    import { DocxViewer, googleFonts } from '/src/index.ts';
 
     const params = new URLSearchParams(location.search);
     const name = params.get('docx') ?? 'demo/sample-1';
@@ -85,7 +85,7 @@
         width,
         enableTextSelection: true,
         enableElementSelection: true,
-        useGoogleFonts: true,
+        fonts: [googleFonts()],
       });
       await viewer.load(buf);
       // findText scans every page; findNext navigates to the first match's page

@@ -242,7 +242,7 @@ it('requires every resource sharing the selected Canvas face to cover all or non
 it('requires nonmissing resource identity on registered faces', () => {
   expect(fixture(undefined, {}, { resourceIdentity: undefined }).shape(request).spans).toHaveLength(2);
 });
-it.each(['css', 'google', 'substitute'] as const)('does not admit unproven registration source %s', source => {
+it.each(['css', 'source', 'substitute'] as const)('does not admit unproven registration source %s', source => {
   expect(fixture(undefined, {}, { source }).shape(request).spans).toHaveLength(2);
 });
 

@@ -86,7 +86,8 @@ const RESOURCE_METRICS = { name: 'onResourceMetrics', type: '(metrics: OoxmlReso
 const RESOURCE_METRICS_METHOD = { sig: 'getResourceMetrics(): Promise<OoxmlResourceMetrics>', desc: 'Return a fresh, content-free package-usage snapshot, including lazy archive work observed since load. Collection is always active; debug controls only console output.', emphasis: 'Collection is always active; debug controls only console output.' };
 const DEBUG = { name: 'debug', type: 'boolean', def: 'false', desc: 'Print one content-free, Ratatui-inspired resource report when the measured load or Node session finishes or fails. Browser DevTools use typography-only %c styling to keep Unicode borders and gauges aligned without changing foreground or background colours; Node and Worker consoles receive one plain argument. Use onResourceMetrics instead for production collection.', emphasis: 'Use onResourceMetrics instead for production collection.' };
 const ZIP = { name: 'maxZipEntryBytes', type: 'number', def: 'resource policy default', desc: 'Deprecated compatibility alias for resourceLimits.maxArchiveEntryBytes. It is scheduled for removal in a future breaking release; new code should use resourceLimits. Existing positive values retain their per-entry meaning; zero / negative values fall back to the standard default.', emphasis: 'It is scheduled for removal in a future breaking release; new code should use resourceLimits.' };
-const GFONTS = { name: 'useGoogleFonts', type: 'boolean', def: 'false', desc: 'Load optional webfont substitutes and non-Latin script fallbacks (Noto Arabic / CJK KR·SC·TC·HK·JP / Cyrillic / Hebrew / Thai / Devanagari) from Google Fonts. Carlito and Caladea can improve text widths when the base Calibri or Cambria face is missing, but they do not guarantee Office line breaks or vertical layout. Off by default for privacy.', emphasis: 'Off by default for privacy.' };
+const FONTS = { name: 'fonts', type: 'readonly FontSource[]', def: '[] (offline)', desc: 'Ordered application font sources for authored and script-fallback families the host lacks, built with googleFonts({ cssOrigin? }), cssApi({ urlTemplate, … }), fontFaceCss({ url }), fontFiles({ faces }) or fontResolver(fn) from @silurus/ooxml or the docx, xlsx and pptx entries. googleFonts({ cssOrigin }) sends the stylesheet requests to that Google-compatible origin; redirects are followed and the font file URLs in the returned CSS are used as given, so for network isolation the mirror must control both. fontResolver runs on the main thread in both modes, for authenticated or private services that return URLs or bytes. Sources are consulted per family in option order: the first source that has a face for a family claims it, and a failed stylesheet, resolver or face keeps the host fallback with a console.warn and never retries another source. Faces register under their real CSS family in the painting realm (main thread or render worker, identically), and only the unicode-range subsets the document paints are loaded. An installed authored face is never displaced. Cross-origin fonts need CORS; a CSP needs connect-src for stylesheet origins and font-src for font file origins. Fixed source limits reject with OoxmlError(\'font-source-limit\'). Off by default: no network request is made without a source.', emphasis: 'Off by default: no network request is made without a source.', detailsHref: 'https://github.com/yukiyokotani/office-open-xml-viewer/blob/main/docs/migration-0.90.md', detailsLabel: 'Font sources guide' };
+const GFONTS_DEPRECATED = { name: 'useGoogleFonts', type: 'boolean', def: 'false', desc: 'Deprecated alias of fonts: [googleFonts()], warned once per JavaScript realm and removed in 0.91.0. false is a no-op that still warns; combining true with fonts throws a TypeError.', emphasis: 'Deprecated alias of fonts: [googleFonts()]' };
 const CJK_FALLBACK = { name: 'cjkFallback', type: "'auto' | 'sc' | 'tc' | 'hk' | 'jp' | 'kr'", def: "'auto'", desc: 'Regional preference used when Han text reaches font fallback and the document has not already identified a region. The requested font remains first; recognized regional CJK font names, an East Asian run language where available, and unambiguous Kana or Hangul take priority. Auto snapshots HTML lang, then navigator.languages and navigator.language; otherwise JP. Hans or Hant selects SC or TC; without an explicit script, HK/MO selects HK, TW selects TC, and bare zh selects SC. An explicit value makes the regional choice independent of the host locale, but does not download fonts or by itself guarantee pixel-identical output across different font environments.' };
 const PASSWORD = { name: 'password', type: 'string', def: 'undefined', desc: 'Password for an Agile-encrypted OOXML file. Available on self-loading Viewer constructors and headless load(); borrowed fromDocument(), fromPresentation(), and fromWorkbook() factories omit load-only options because their engine is already loaded.', emphasis: 'Available on self-loading Viewer constructors and headless load()' };
 const DPR = { name: 'dpr', type: 'number', def: 'devicePixelRatio', desc: 'Device pixel ratio for the backing store (crispness on HiDPI).' };
@@ -152,7 +153,7 @@ const DOCX_CURRENT_DATE: ApiOption = {
 };
 const DOCX_FOOTNOTE_CONTINUATION: ApiOption = {
   name: 'allowFootnoteContinuation', type: 'boolean', def: 'true',
-  desc: 'Paragraph footnotes continue across physical pages by default, including for ordinary DOCX input. This can change page placement. Pass false to retain the previous whole-note pagination. With continuation, fitting tables remain whole. Notes requiring table splitting, changed text widths or field reflow that changes the source cut can reject layout. Full-note acquisition has library source and page budgets.',
+  desc: 'Paragraph footnotes continue across physical pages by default, including for ordinary DOCX input. This can change page placement. Column placement and separators follow the document settings. Pass false to retain the previous whole-note pagination. With continuation, fitting tables remain whole. Notes requiring table splitting or field reflow that changes the source cut can reject layout. Full-note acquisition has library source and page budgets.',
   emphasis: 'Pass false to retain the previous whole-note pagination.',
 };
 const DOCX_LAYOUT_VIEW_OPTIONS: readonly ApiOption[] = [
@@ -261,7 +262,7 @@ export const apiReference: Record<'docx' | 'xlsx' | 'pptx', ApiClass[]> = {
       options: [
         { name: 'width', type: 'number', def: '960', desc: 'Canvas CSS width in px; height is derived from the slide aspect ratio.' },
         DPR,
-        GFONTS,
+        FONTS, GFONTS_DEPRECATED,
         CJK_FALLBACK,
         PASSWORD,
         { name: 'enableTextSelection', type: 'boolean', def: 'false', desc: 'Overlay a transparent text layer so users can select & copy slide text.' },
@@ -320,7 +321,7 @@ export const apiReference: Record<'docx' | 'xlsx' | 'pptx', ApiClass[]> = {
       name: 'PptxPresentation',
       ctor: 'await PptxPresentation.load(source, options?)',
       note: 'Headless engine — parse once, render any slide into any canvas you supply (scroll views, thumbnail grids, master–detail).',
-      options: [GFONTS, CJK_FALLBACK, PASSWORD, WASM_URL, ZIP, RESOURCE_LIMITS, RESOURCE_METRICS, DEBUG, WORKER_TIMEOUT, MATH, THREE_D, REGION_MAP, CHART_EX, TIFF, LEGACY_PPT, MODE, ...PPTX_PROGRESSIVE_OPTIONS],
+      options: [FONTS, GFONTS_DEPRECATED, CJK_FALLBACK, PASSWORD, WASM_URL, ZIP, RESOURCE_LIMITS, RESOURCE_METRICS, DEBUG, WORKER_TIMEOUT, MATH, THREE_D, REGION_MAP, CHART_EX, TIFF, LEGACY_PPT, MODE, ...PPTX_PROGRESSIVE_OPTIONS],
       methods: [
         { sig: 'static load(source, options?): Promise<PptxPresentation>', desc: 'Parse a deck from a URL or ArrayBuffer. With progressiveLayout, resolve when the opening slide is paintable.' },
         { sig: 'get slideCount(): number', desc: 'Total slides.' },
@@ -368,7 +369,7 @@ export const apiReference: Record<'docx' | 'xlsx' | 'pptx', ApiClass[]> = {
         { name: 'mediaOverscan', type: 'number', def: '1', desc: 'Slides beyond the real viewport that may keep interactive media handles. Independent from the general overscan used for mounted canvases/text overlays.' },
         ON_HYPERLINK_CLICK,
         ENABLE_HYPERLINKS,
-        GFONTS,
+        FONTS, GFONTS_DEPRECATED,
         CJK_FALLBACK,
         PASSWORD,
         ZIP,
@@ -416,7 +417,7 @@ export const apiReference: Record<'docx' | 'xlsx' | 'pptx', ApiClass[]> = {
       options: [
         { name: 'width', type: 'number', desc: 'Canvas CSS width in px; height is auto-computed from the page aspect ratio.' },
         DPR,
-        GFONTS,
+        FONTS, GFONTS_DEPRECATED,
         CJK_FALLBACK,
         PASSWORD,
         { name: 'enableTextSelection', type: 'boolean', def: 'false', desc: 'Overlay a transparent text layer for native selection & copy.' },
@@ -472,7 +473,7 @@ export const apiReference: Record<'docx' | 'xlsx' | 'pptx', ApiClass[]> = {
       name: 'DocxDocument',
       ctor: 'await DocxDocument.load(source, options?)',
       note: 'Headless engine — render any page into any canvas you supply.',
-      options: [GFONTS, CJK_FALLBACK, PASSWORD, WASM_URL, ZIP, RESOURCE_LIMITS, RESOURCE_METRICS, DEBUG, WORKER_TIMEOUT, MATH, THREE_D, REGION_MAP, CHART_EX, TIFF, LEGACY_DOC, MODE, ...DOCX_LAYOUT_VIEW_OPTIONS, DOCX_FOOTNOTE_CONTINUATION, DOCX_PROGRESSIVE_LAYOUT, DOCX_SLICE_LAYOUT, DOCX_LAYOUT_PROGRESS, DOCX_LAYOUT_PARTIAL, DOCX_LAYOUT_COMPLETE],
+      options: [FONTS, GFONTS_DEPRECATED, CJK_FALLBACK, PASSWORD, WASM_URL, ZIP, RESOURCE_LIMITS, RESOURCE_METRICS, DEBUG, WORKER_TIMEOUT, MATH, THREE_D, REGION_MAP, CHART_EX, TIFF, LEGACY_DOC, MODE, ...DOCX_LAYOUT_VIEW_OPTIONS, DOCX_FOOTNOTE_CONTINUATION, DOCX_PROGRESSIVE_LAYOUT, DOCX_SLICE_LAYOUT, DOCX_LAYOUT_PROGRESS, DOCX_LAYOUT_PARTIAL, DOCX_LAYOUT_COMPLETE],
       methods: [
         { sig: 'static load(source, options?): Promise<DocxDocument>', desc: 'Parse a document from a URL or ArrayBuffer. With progressiveLayout, resolve when the opening pages are paintable while pagination continues in the background.' },
         { sig: 'get comments(): readonly Readonly<DocComment>[]', desc: 'Immutable detached comments and replies stored in the document.' },
@@ -520,7 +521,7 @@ export const apiReference: Record<'docx' | 'xlsx' | 'pptx', ApiClass[]> = {
         FIND_HIGHLIGHT_COLORS,
         ON_HYPERLINK_CLICK,
         ENABLE_HYPERLINKS,
-        GFONTS,
+        FONTS, GFONTS_DEPRECATED,
         CJK_FALLBACK,
         PASSWORD,
         ZIP,
@@ -582,7 +583,7 @@ export const apiReference: Record<'docx' | 'xlsx' | 'pptx', ApiClass[]> = {
         { name: 'comments', type: 'boolean | XlsxCommentsOptions', def: 'true', desc: 'Show authored cell note or threaded-comment markers and their anchored read-only popup. Pass an options object to control resolved-thread visibility. Theme the popup with documented CSS custom properties or classes on the Viewer container.', detailsHref: '/review-ui', detailsLabel: 'Comment UI guide' },
         FIND_HIGHLIGHT_COLORS,
         { name: 'hiddenSheetMode', type: "'show' | 'skip' | 'dim'", def: "'show'", desc: 'How hidden / very-hidden sheets (`<sheet state>`, §18.2.19) appear in the tab bar. `show` renders a tab like any other; `skip` hides the tab (`display:none`) and makes sequential navigation jump over it; `dim` renders the tab at reduced opacity. Mirrors pptx `hiddenSlideMode`.' },
-        GFONTS,
+        FONTS, GFONTS_DEPRECATED,
         CJK_FALLBACK,
         PASSWORD,
         ZIP,
@@ -606,7 +607,7 @@ export const apiReference: Record<'docx' | 'xlsx' | 'pptx', ApiClass[]> = {
         { name: 'onSelectionStateChange', type: '(sel: XlsxSelectionState | null) => void', desc: 'Called only when canonical selection state changes; geometry, ActiveCell, extension anchor, and multiple areas remain distinct.' },
         { name: 'onSelectionContextChange', type: '(context: XlsxSelectionContext | null) => void', desc: 'Receive bounded detached selected-cell content, including attached comments, or element context for read-only AI/MCP handoff. This callback does not enable element hit-testing; rapid changes are coalesced per animation frame.' },
         CONTEXT_MENU('XlsxSelectionContext'),
-        { name: 'onViewportChange', type: '(offset: XlsxViewportOffset) => void', desc: 'Called with the clamped logical CSS-pixel offset after the active viewport moves. Horizontal x is measured from column A in both LTR and RTL sheets.' },
+        { name: 'onViewportChange', type: '(offset: XlsxViewportOffset) => void', desc: 'Called with the clamped logical CSS-pixel offset after the active viewport moves. Horizontal x is measured from column A in both LTR and RTL sheets. In worker mode it also fires once when a lagging frame lands and moves the cell geometry that getCellViewportRect() reports.' },
         VIEWER_ON_ERROR,
       ],
       methods: [
@@ -627,7 +628,7 @@ export const apiReference: Record<'docx' | 'xlsx' | 'pptx', ApiClass[]> = {
         { sig: 'getViewportOffset(): XlsxViewportOffset', desc: 'Return the active sheet viewport offset in logical CSS pixels.' },
         { sig: 'setViewportOffset(offset: XlsxViewportOffset): Promise<void>', desc: 'Move the active viewport to a finite offset, clamped to the used scroll extent.' },
         { sig: 'scrollToCell(ref: string, options?: XlsxScrollToCellOptions): Promise<void>', desc: 'Scroll a cell reference into view, optionally aligning it to the start, center, end, or nearest edge.' },
-        { sig: 'getCellViewportRect(cell: CellAddress | string): XlsxCellViewportRect | null', desc: 'Return one cell’s CSS-pixel bounds relative to the worksheet viewport. Use it to anchor application-owned comments or annotations.' },
+        { sig: 'getCellViewportRect(cell: CellAddress | string): XlsxCellViewportRect | null', desc: 'Return one cell’s CSS-pixel bounds relative to the worksheet viewport. Use it to anchor application-owned comments or annotations. In worker mode the bounds follow the last painted frame; refresh overlays from onViewportChange.' },
         { sig: 'relayout(): Promise<void>', desc: 'Re-read the viewport box, clamp the current offset, and render again after an external layout change.' },
         { sig: 'getScale(): number', desc: 'The current zoom factor (1 = 100%).' },
         { sig: 'setScale(scale: number): void', desc: 'Set the zoom factor (1 = 100%), clamped to [zoomMin, zoomMax] and snapped to whole percent; re-renders and fires onScaleChange when it changes. View-only.' },
@@ -659,8 +660,8 @@ export const apiReference: Record<'docx' | 'xlsx' | 'pptx', ApiClass[]> = {
         { name: 'comments', type: 'boolean | XlsxCommentsOptions', def: 'true', desc: 'Show authored cell note or threaded-comment markers and their anchored read-only popup. Pass an options object to control resolved-thread visibility. Theme the popup with documented CSS custom properties or classes on the Viewer container.', detailsHref: '/review-ui', detailsLabel: 'Comment UI guide' },
         FIND_HIGHLIGHT_COLORS,
         { name: 'hiddenSheetMode', type: "'show' | 'skip' | 'dim'", def: "'show'", desc: 'Controls sequential navigation and hidden-sheet visibility without adding tab chrome.' },
-        { name: 'onViewportChange', type: '(offset: XlsxViewportOffset) => void', desc: 'Called with the clamped logical CSS-pixel offset after the active viewport moves. Horizontal x is measured from column A independently of browser RTL scrollLeft conventions.' },
-        GFONTS,
+        { name: 'onViewportChange', type: '(offset: XlsxViewportOffset) => void', desc: 'Called with the clamped logical CSS-pixel offset after the active viewport moves. Horizontal x is measured from column A independently of browser RTL scrollLeft conventions. In worker mode it also fires once when a lagging frame lands and moves the cell geometry that getCellViewportRect() reports.' },
+        FONTS, GFONTS_DEPRECATED,
         CJK_FALLBACK,
         PASSWORD,
         WASM_URL,
@@ -702,7 +703,7 @@ export const apiReference: Record<'docx' | 'xlsx' | 'pptx', ApiClass[]> = {
         { sig: 'getViewportOffset(): XlsxViewportOffset', desc: 'Read the logical start-anchored viewport offset in CSS pixels at the current scale.' },
         { sig: 'setViewportOffset(offset: XlsxViewportOffset): Promise<void>', desc: 'Move to a finite logical offset, clamped to the used scroll extent.' },
         { sig: 'scrollToCell(ref: string, options?: { align?: "nearest" | "start" | "center" | "end" }): Promise<void>', desc: 'Move the viewport to an A1 cell reference with the requested alignment.' },
-        { sig: 'getCellViewportRect(cell: CellAddress | string): XlsxCellViewportRect | null', desc: 'Return one cell’s CSS-pixel bounds relative to the worksheet viewport. Use it to anchor application-owned comments or annotations.' },
+        { sig: 'getCellViewportRect(cell: CellAddress | string): XlsxCellViewportRect | null', desc: 'Return one cell’s CSS-pixel bounds relative to the worksheet viewport. Use it to anchor application-owned comments or annotations. In worker mode the bounds follow the last painted frame; refresh overlays from onViewportChange.' },
         { sig: 'relayout(): Promise<void>', desc: 'Re-read the canvas CSS box and repaint the current viewport.' },
         ...zoomMethods(false),
         ...findMethods('XlsxMatchLocation'),
@@ -720,7 +721,7 @@ export const apiReference: Record<'docx' | 'xlsx' | 'pptx', ApiClass[]> = {
       name: 'XlsxWorkbook',
       ctor: 'await XlsxWorkbook.load(source, options?)',
       note: 'Headless engine — parse once, render any sheet viewport into any canvas you supply.',
-      options: [GFONTS, CJK_FALLBACK, PASSWORD, WASM_URL, ZIP, RESOURCE_LIMITS, XLSX_WORKSHEET_LIMITS, RESOURCE_METRICS, DEBUG, WORKER_TIMEOUT, MATH, THREE_D, REGION_MAP, CHART_EX, TIFF, LEGACY_XLS, MODE],
+      options: [FONTS, GFONTS_DEPRECATED, CJK_FALLBACK, PASSWORD, WASM_URL, ZIP, RESOURCE_LIMITS, XLSX_WORKSHEET_LIMITS, RESOURCE_METRICS, DEBUG, WORKER_TIMEOUT, MATH, THREE_D, REGION_MAP, CHART_EX, TIFF, LEGACY_XLS, MODE],
       methods: [
         { sig: 'static load(source, options?): Promise<XlsxWorkbook>', desc: 'Parse a workbook from a URL or ArrayBuffer.' },
         { sig: 'get sheetNames(): string[]', desc: 'Names of all sheets.' },

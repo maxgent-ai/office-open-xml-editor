@@ -2,13 +2,13 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import { BoundedRawPartCache } from '@silurus/ooxml-core/internal/bounded-raw-part-cache';
 import {
   WorkerBridge,
-  preloadGoogleFonts,
   getCachedBitmapByPath,
   getCachedDuotoneBitmapByPath,
   type WorkerLike,
-  type FontPreloadEntry,
   type OffscreenFactory,
 } from '@silurus/ooxml-core';
+import { fontFiles, OFFICE_FONT_SUBSTITUTIONS } from '@silurus/ooxml-core/internal/font-sources';
+import type { ParsedWorkbook } from './types.js';
 import { XlsxWorkbook, acquireXlsxWorksheetPreview, retainXlsxViewerFonts } from './workbook.js';
 
 /**
@@ -42,7 +42,7 @@ interface DestroyProbe {
   destroy(): void;
 }
 
-// ── Fake FontFaceSet so destroy()'s Google-Fonts release is observable ───────
+// ── Fake FontFaceSet so destroy()'s font-source release is observable ───────
 const G = globalThis as Record<string, unknown>;
 const ORIG_FONTS = {
   document: G.document,
@@ -63,29 +63,51 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-const CSS = `@font-face { font-family: 'Carlito'; font-style: normal; font-weight: 400; src: url(https://fonts.gstatic.com/s/carlito/y.woff2) format('woff2'); }`;
 interface FakeFace { family: string }
-function installFontFaceSet(): { added: FakeFace[] } {
+/** Faces load when `gate` resolves. With `missingLocal`, `local()` probes miss
+ * (the host has no authored face), so a font source is consulted. */
+function installFontFaceSet(gate: Promise<void> = Promise.resolve(), missingLocal: boolean | ((source: string) => boolean) = false): { added: FakeFace[] } {
   const added: FakeFace[] = [];
   class FakeFontFace {
-    status = 'loaded';
+    status: FontFaceLoadStatus = 'unloaded';
+    weight = '400';
+    style = 'normal';
     constructor(public family: string, public source: string, public descriptors?: object) {}
-    load(): Promise<FakeFontFace> { return Promise.resolve(this); }
+    async load(): Promise<FakeFontFace> {
+      if (typeof this.source === 'string' && this.source.startsWith('local(')
+        && (typeof missingLocal === 'function' ? missingLocal(this.source) : missingLocal)) {
+        this.status = 'error';
+        throw new Error('not installed');
+      }
+      await gate;
+      this.status = 'loaded';
+      return this;
+    }
   }
   const set = {
     add: (f: FakeFace) => { added.push(f); },
     delete: (f: FakeFace) => { const i = added.indexOf(f); if (i >= 0) added.splice(i, 1); return i >= 0; },
+    has: (f: FakeFace) => added.includes(f),
     [Symbol.iterator]() { return added[Symbol.iterator](); },
     ready: Promise.resolve(),
   };
   G.FontFace = FakeFontFace;
   G.document = { fonts: set };
-  G.fetch = async () => ({ ok: true, text: async () => CSS });
+  G.fetch = vi.fn(async () => { throw new Error('no network'); });
   delete G.self;
   return { added };
 }
-const MAP: Record<string, FontPreloadEntry> = {
-  calibri: { url: 'https://fonts.googleapis.com/css2?family=Carlito', loadFamily: 'Carlito' },
+/** An application font source serving Carlito for Calibri / Cambria. */
+const FONTS = [fontFiles({
+  faces: [{ family: 'Carlito', url: 'https://fonts.example/carlito.woff2' }],
+  substitutes: OFFICE_FONT_SUBSTITUTIONS,
+})];
+const FONT_WORKBOOK = {
+  styles: { fonts: [{ name: 'Calibri', bold: false, italic: false }], cellXfs: [], numFmts: [], dxfs: [] },
+  sharedStrings: [],
+} as unknown as ParsedWorkbook;
+type FontSourceInternals = {
+  prepareFontSources(workbook: ParsedWorkbook, fonts: typeof FONTS): Promise<void>;
 };
 
 describe('XlsxWorkbook.destroy() — rejects in-flight worker requests', () => {
@@ -103,7 +125,7 @@ describe('XlsxWorkbook.destroy() — rejects in-flight worker requests', () => {
     instance.evictingSheets = new Map();
     instance.sheetLoads = new Map();
     instance.rawParts = new BoundedRawPartCache({ maxEntries: 4, maxBytes: 1024 });
-    instance.googleFontNames = [];
+    instance.fontDeltas = [];
     instance.officeFontRequests = [];
     instance.retainedFontSets = new Map();
     instance.fontsDestroyed = false;
@@ -215,53 +237,64 @@ describe('XlsxWorkbook.destroy() — rejects in-flight worker requests', () => {
     expect(SilentWorker.instances).toHaveLength(0);
   });
 
-  // Wiring guard: destroy() must actually release the Google-Fonts substitutes
+  // Wiring guard: destroy() must actually release the font-source faces
   // retained in the workbook's per-document FontFaceSet registry.
-  it('destroy() releases the workbook’s Google fonts from the FontFaceSet', async () => {
-    const { added } = installFontFaceSet();
-    const held = await preloadGoogleFonts(['Calibri'], MAP);
-    expect(added).toHaveLength(1);
-
+  it('destroy() releases the workbook’s font-source faces from the FontFaceSet', async () => {
+    const { added } = installFontFaceSet(Promise.resolve(), true);
     const { wb } = makeWorkbook();
-    const retainedFontSets = (wb as unknown as {
-      retainedFontSets: Map<FontFaceSet, { refs: number; loaded: { google: FontFace[]; office: { faces: FontFace[]; routes: Record<string, never> } }; loading: Promise<unknown> }>;
-    }).retainedFontSets;
-    const fontSet = (G.document as { fonts: FontFaceSet }).fonts;
-    const loaded = { google: held, office: { faces: [], routes: {} } };
-    retainedFontSets.set(fontSet, { refs: 1, loaded, loading: Promise.resolve(loaded) });
+    const workbook = wb as unknown as XlsxWorkbook;
+    await (workbook as unknown as FontSourceInternals).prepareFontSources(FONT_WORKBOOK, FONTS);
+    await workbook[retainXlsxViewerFonts](G.document as Document);
+    expect(added.map((face) => face.family)).toEqual(['Carlito']);
     wb.destroy();
-
     expect(added).toHaveLength(0);
-    expect(retainedFontSets.size).toBe(0);
+    expect((wb as unknown as { retainedFontSets: Map<unknown, unknown> }).retainedFontSets.size).toBe(0);
   });
 
   it('an in-flight destroy releases once and preserves another workbook holder', async () => {
-    const { added } = installFontFaceSet();
-    let resolveFetch!: (response: { ok: boolean; text(): Promise<string> }) => void;
-    let signalFetchStarted!: () => void;
-    const fetchStarted = new Promise<void>(resolve => { signalFetchStarted = resolve; });
-    G.fetch = vi.fn(() => new Promise((resolve) => {
-      resolveFetch = resolve;
-      signalFetchStarted();
-    }));
+    let open!: () => void;
+    const { added } = installFontFaceSet(new Promise<void>((resolve) => { open = resolve; }), true);
     const first = makeWorkbook().wb as unknown as XlsxWorkbook;
     const second = makeWorkbook().wb as unknown as XlsxWorkbook;
-    (first as unknown as { googleFontNames: string[] }).googleFontNames = ['Cambria'];
-    (second as unknown as { googleFontNames: string[] }).googleFontNames = ['Cambria'];
+    await (first as unknown as FontSourceInternals).prepareFontSources(FONT_WORKBOOK, FONTS);
+    await (second as unknown as FontSourceInternals).prepareFontSources(FONT_WORKBOOK, FONTS);
     const targetDocument = G.document as Document;
 
     const firstRetain = first[retainXlsxViewerFonts](targetDocument);
     const secondRetain = second[retainXlsxViewerFonts](targetDocument);
-    // Destroy during the actual pending request, independently of whether the
-    // shared loader starts that request synchronously or through its queue.
-    await fetchStarted;
+    // Destroy while the shared face is still loading.
+    await vi.waitFor(() => expect(added).toHaveLength(1));
     first.destroy();
-    resolveFetch({ ok: true, text: async () => CSS });
+    open();
     const [releaseFirst] = await Promise.all([firstRetain, secondRetain]);
     releaseFirst(); // stale viewer completion after workbook teardown: no-op
 
     expect(added).toHaveLength(1);
     second.destroy();
+    expect(added).toHaveLength(0);
+  });
+
+  it('releases the Office faces it loaded when the parallel font-source load rejects', async () => {
+    // Local Calibri is installed; 257 other authored families are not, which
+    // breaches the 256-family font-source ceiling.
+    const { added } = installFontFaceSet(Promise.resolve(), (source) => !/calibri/i.test(source));
+    const { wb } = makeWorkbook();
+    const workbook = wb as unknown as XlsxWorkbook;
+    const parsed = {
+      ...FONT_WORKBOOK,
+      styles: { ...FONT_WORKBOOK.styles, fonts: [
+        { name: 'Calibri', bold: false, italic: false },
+        ...Array.from({ length: 257 }, (_, index) => ({ name: `Absent ${index}`, bold: false, italic: false })),
+      ] },
+    } as unknown as ParsedWorkbook;
+    const internals = workbook as unknown as FontSourceInternals & {
+      officeFontRequests: unknown[];
+      retainFontsInSet(set: FontFaceSet): Promise<() => void>;
+    };
+    internals.officeFontRequests = [{ family: 'Calibri', weight: 400, style: 'normal' }];
+    await internals.prepareFontSources(parsed, FONTS);
+    await expect(internals.retainFontsInSet((G.document as Document).fonts)).rejects.toMatchObject({ code: 'font-source-limit' });
+    wb.destroy();
     expect(added).toHaveLength(0);
   });
 
@@ -303,10 +336,10 @@ describe('XlsxWorkbook.destroy() — rejects in-flight worker requests', () => {
     const { added } = installFontFaceSet();
     const { wb } = makeWorkbook();
     const set = (G.document as { fonts: FontFaceSet }).fonts;
-    const loaded = { google: [], office: { faces: [], routes: {} } };
+    const loaded = { office: { faces: [], routes: {} } };
     let resolveInitial!: (value: typeof loaded) => void;
     const loading = new Promise<typeof loaded>((resolve) => { resolveInitial = resolve; });
-    const retained = { refs: 1, loaded: null, loading };
+    const retained = { refs: 1, loaded: null, loading, session: null, fontQueue: Promise.resolve() };
     const internals = wb as unknown as {
       retainedFontSets: Map<FontFaceSet, typeof retained>;
       retainWorksheetOfficeFonts(worksheet: object): Promise<void>;
@@ -348,7 +381,7 @@ describe('XlsxWorkbook.destroy() — drops the shared image caches (GPU-leak gua
     instance.evictingSheets = new Map();
     instance.sheetLoads = new Map();
     instance.rawParts = new BoundedRawPartCache({ maxEntries: 4, maxBytes: 1024 });
-    instance.googleFontNames = [];
+    instance.fontDeltas = [];
     instance.retainedFontSets = new Map();
     instance.fontsDestroyed = false;
     instance._fetchImage = fetchImage;

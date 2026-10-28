@@ -1,8 +1,16 @@
 import { describe, it, expect } from 'vitest';
-import { loadedGoogleRegularAliases } from '@silurus/ooxml-core';
 import { cssTailFor, fontStackFor } from './renderer.js';
-import { xlsxFontPreloadNames, xlsxOfficeFontRequests, xlsxWorksheetOfficeFontRequests } from './google-fonts.js';
+import { xlsxOfficeFontRequests, xlsxWorksheetOfficeFontRequests } from './font-requests.js';
 import type { ParsedWorkbook, Worksheet } from './types.js';
+
+/** Substitutions a font source loaded (LoadedFontSources.substitutions). */
+const LOADED = new Map<string, { family: string; script?: 'arabic' }>([
+  ['calibri', { family: 'Carlito' }],
+  ['cambria', { family: 'Caladea' }],
+  ['franklin gothic book', { family: 'Libre Franklin' }],
+  ['sakkal majalla', { family: 'Noto Naskh Arabic', script: 'arabic' }],
+  ['noto sans cjk jp', { family: 'Noto Sans JP' }],
+]);
 
 describe('XLSX exact Office face requests', () => {
   it('retains only Calibri tuples used in styled fonts and rich text', () => {
@@ -37,30 +45,12 @@ describe('XLSX exact Office face requests', () => {
 });
 
 describe('fontStackFor — default Latin chain (regression)', () => {
-  it('uses a loaded same-family regular webfont after its authored full name', () => {
-    const faces = [
-      { family: 'Lato', weight: '400', style: 'normal', status: 'loaded' },
-      { family: 'Carlito', weight: '400', style: 'normal', status: 'loaded' },
-      { family: 'Roboto', weight: '400', style: 'normal', status: 'error' },
-    ] as unknown as FontFaceSet;
-    const aliases = loadedGoogleRegularAliases(faces);
-    expect(aliases.get('lato regular')).toBe('Lato');
-    expect(aliases.has('carlito regular')).toBe(false);
-    expect(aliases.has('roboto regular')).toBe(false);
-    expect(fontStackFor('Lato Regular', undefined, '', undefined, true,
-      undefined, aliases.get('lato regular')).startsWith('"Lato Regular", "Lato", Arial')).toBe(true);
+  it('uses a loaded same-family regular face after its authored full name', () => {
+    expect(fontStackFor('Lato Regular', undefined, '', undefined, LOADED,
+      undefined, 'Lato').startsWith('"Lato Regular", "Lato", Arial')).toBe(true);
     expect(fontStackFor('Lato Regular').startsWith('"Lato Regular", Arial')).toBe(true);
   });
 
-  it('preloads the base only for a known same-family regular face', () => {
-    const wb = { styles: { fonts: [
-      { name: 'Lato Regular' }, { name: 'Calibri Regular' }, { name: 'Unknown Regular' },
-    ] } } as unknown as ParsedWorkbook;
-    const names = xlsxFontPreloadNames(wb);
-    expect(names.has('Lato')).toBe(true);
-    expect(names.has('Calibri')).toBe(false);
-    expect(names.has('Unknown')).toBe(false);
-  });
   it('uses a retained tuple alias only for the requested Calibri face', () => {
     const route = {
       requestedFamily: 'Calibri' as const, family: '__pinned_regular',
@@ -93,17 +83,29 @@ describe('fontStackFor — default Latin chain (regression)', () => {
     expect(stack).not.toContain('"Caladea"');
   });
 
-  it('keeps same-class generics by default and opts into published web aliases', () => {
+  it('keeps same-class generics by default and inserts only loaded substitutes', () => {
     expect(fontStackFor('Calibri').startsWith('"Calibri", Arial')).toBe(true);
     expect(fontStackFor('Calibri')).not.toContain('"Carlito"');
     expect(fontStackFor('Cambria').startsWith('"Cambria", "Times New Roman"')).toBe(true);
     expect(fontStackFor('Cambria')).not.toContain('"Caladea"');
-    expect(fontStackFor('Calibri', undefined, 'text', undefined, true))
-      .toContain('"Carlito"');
-    expect(fontStackFor('Cambria', undefined, 'text', undefined, true))
-      .toContain('"Caladea"');
-    expect(fontStackFor('Calibri Light')).not.toContain('"Carlito"');
-    expect(fontStackFor('Cambria Math')).not.toContain('"Caladea"');
+    expect(fontStackFor('Calibri', undefined, 'text', undefined, LOADED))
+      .toBe(`"Calibri", "Carlito", ${cssTailFor('Arial')}`);
+    expect(fontStackFor('Cambria', undefined, 'text', undefined, LOADED))
+      .toBe(`"Cambria", "Caladea", ${cssTailFor('Times New Roman')}`);
+    expect(fontStackFor(null, undefined, 'text', undefined, LOADED).startsWith('"Calibri", "Carlito", Arial'))
+      .toBe(true);
+    // Every authored family takes its own loaded substitute, keyed per family.
+    expect(fontStackFor('Franklin Gothic Book', undefined, 'text', undefined, LOADED))
+      .toBe(`"Franklin Gothic Book", "Libre Franklin", ${cssTailFor('Arial')}`);
+    expect(fontStackFor('Calibri Light', undefined, 'text', undefined, LOADED)).not.toContain('"Carlito"');
+    expect(fontStackFor('Cambria Math', undefined, 'text', undefined, LOADED)).not.toContain('"Caladea"');
+    expect(fontStackFor('Arial', undefined, 'text', undefined, LOADED)).not.toContain('"Carlito"');
+  });
+
+  it('inserts a script-scoped substitute only for text of its script', () => {
+    expect(fontStackFor('Sakkal Majalla', undefined, 'Latin', undefined, LOADED)).not.toContain('"Noto Naskh Arabic", Arial');
+    expect(fontStackFor('Sakkal Majalla', undefined, 'مرحبا', undefined, LOADED)
+      .startsWith('"Sakkal Majalla", "Noto Naskh Arabic", ')).toBe(true);
   });
 
   it('adds Arabic support only for Arabic text without importing a serif face into a sans tail', () => {
@@ -118,7 +120,9 @@ describe('fontStackFor — default Latin chain (regression)', () => {
 });
 
 describe('fontStackFor — CJK language-specific Noto ordering', () => {
-  it('routes a native Noto CJK name through the loaded Google family', () => {
+  it('keeps a native Noto CJK name\'s regional chain, and leads with a loaded distribution name', () => {
+    const loaded = fontStackFor(' Noto Sans CJK JP ', undefined, '', undefined, LOADED);
+    expect(loaded).toBe(fontStackFor(' Noto Sans CJK JP '));
     const sans = fontStackFor(' Noto Sans CJK JP ');
     expect(sans.startsWith('"Noto Sans CJK JP", "Noto Sans JP", ')).toBe(true);
     expect(sans.match(/"Noto Sans JP"/g)).toHaveLength(1);
@@ -128,7 +132,7 @@ describe('fontStackFor — CJK language-specific Noto ordering', () => {
     expect(serif.endsWith('serif')).toBe(true);
   });
 
-  it('routes HK sans through Google Fonts without inventing an HK serif alias', () => {
+  it('chains HK sans without inventing an HK serif family', () => {
     expect(fontStackFor('Noto Sans CJK HK').startsWith(
       '"Noto Sans CJK HK", "Noto Sans HK", ',
     )).toBe(true);
@@ -226,7 +230,7 @@ it('uses per-workbook fallback only for Han while preserving authored regions', 
     const sc = fontStackFor(family, 'sc', '漢');
     expect(sc).not.toContain('"Carlito"');
     if (family !== 'Arial') {
-      const optedIn = fontStackFor(family, 'sc', '漢', undefined, true);
+      const optedIn = fontStackFor(family, 'sc', '漢', undefined, LOADED);
       expect(optedIn.indexOf('"Carlito"')).toBeLessThan(optedIn.indexOf('"Noto Sans SC"'));
     }
     expect(sc.indexOf('"Noto Sans SC"')).toBeLessThan(sc.indexOf('"Noto Sans JP"'));

@@ -220,6 +220,7 @@ jobs:
           pnpm check:production-render-workers
           pnpm check:optional-chart-ex
           pnpm check:optional-tiff
+          pnpm check:font-source-tree-shaking
           pnpm check:optional-legacy-doc
           pnpm check:optional-legacy-ppt
           pnpm check:optional-legacy-xls

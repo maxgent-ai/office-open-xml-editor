@@ -1,3 +1,6 @@
+import type { NoteSourceContinuation } from './body-layout-kernel.js';
+import type { LineBoundary } from '../line-layout.js';
+import type { ParagraphFragmentCursor } from './paragraph-pagination.js';
 import type { SectionLayoutContext } from '../layout-context.js';
 import type { DocxDiagnostic, DocxDiagnosticCode, DocxStorySource, FramePr } from '../types.js';
 import type {
@@ -745,6 +748,10 @@ export interface ParagraphLayout extends LayoutNodeBase {
   readonly spacing: ParagraphSpacingLayout;
   readonly contextualSpacing: boolean;
   readonly lines: readonly LineLayout[];
+  /** Note-flow acquisition retains source boundaries so another column can
+   * shape the unconsumed suffix at its own width through the same paragraph engine. */
+  readonly noteLineEndBoundaries?: readonly LineBoundary[];
+  readonly noteSourceStart?: ParagraphFragmentCursor;
   readonly borders: readonly BorderSegment[];
   readonly shading?: FillPaint;
   readonly resources: readonly InlineResourceLayout[];
@@ -1062,6 +1069,10 @@ export interface NoteSeparatorLayout {
 }
 
 export interface NoteLayout extends LayoutNodeBase {
+  /** One page-wide area: a common reserve and this column chunk's top offset. */
+  readonly pageArea?: Readonly<{ heightPt: number; offsetPt: number }>;
+  /** Acquisition origin for reusing equal-width shaped suffixes. */
+  readonly acquisitionSourceStart?: NoteSourceContinuation;
   readonly kind: 'note';
   /** Scalar library rule of the modern/absent-native path. Empty when a
    * reserved {@link leading} occurrence owns the separator. */
