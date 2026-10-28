@@ -222,34 +222,53 @@ pub(crate) struct ChartReferenceContext<'a, 'input, 'session> {
     pub(crate) session: &'session mut WorksheetReferenceSession,
 }
 
-/// Distinct first cells a drawing prefetch may queue per load. Beyond it a
-/// lookup queues only its own cell, as the per-reference path always did.
-const MAX_PREFETCHED_SOURCE_STYLE_CELLS: usize =
-    crate::worksheet_reference::MAX_TOTAL_REFERENCE_CELLS;
+/// Cells the cache may hold per load. A drawing prefetch stops queueing at
+/// it, and a whole-part index (below) is only kept while it fits.
+const MAX_CHART_SOURCE_STYLE_CELLS: usize = crate::worksheet_reference::MAX_TOTAL_REFERENCE_CELLS;
 
 /// First-cell style indices of chart source references, shared by every
 /// chart of one worksheet load. The first lookup that needs a source part
 /// queues the first cell of every formula in the drawing's charts, so each
 /// source worksheet is parsed once for all of them instead of once per axis
-/// or series. Entries are bounded by the distinct formulas authored in those
-/// chart parts (and the prefetch cap), never by the size of the source sheet.
+/// or series. A later miss on an already parsed part (another drawing, or a
+/// prefetch stopped by the cap) indexes every cell of that part in one more
+/// parse, so further lookups never reparse it. Entries never exceed
+/// [`MAX_CHART_SOURCE_STYLE_CELLS`] plus the cells lookups demanded; only a
+/// part that cannot be indexed within that ceiling is parsed per new cell.
 #[derive(Default)]
 pub(crate) struct ChartSourceStyleCache {
     prefetched_drawings: HashSet<String>,
     pending: HashMap<String, HashSet<(u32, u32)>>,
     resolved: HashMap<String, HashMap<(u32, u32), Option<u32>>>,
+    /// Parts already parsed once for queued cells.
+    parsed_parts: HashSet<String>,
+    /// Parts whose every `<c r>` is in `resolved`; an absent cell is `None`.
+    indexed_parts: HashSet<String>,
     entries: usize,
+    #[cfg(test)]
+    cap: Option<usize>,
     #[cfg(test)]
     source_parts_parsed: usize,
 }
 
 impl ChartSourceStyleCache {
+    fn cap(&self) -> usize {
+        #[cfg(test)]
+        if let Some(cap) = self.cap {
+            return cap;
+        }
+        MAX_CHART_SOURCE_STYLE_CELLS
+    }
+
+    fn lookup(&self, part: &str, cell: (u32, u32)) -> Option<Option<u32>> {
+        if let Some(style) = self.resolved.get(part).and_then(|cells| cells.get(&cell)) {
+            return Some(*style);
+        }
+        self.indexed_parts.contains(part).then_some(None)
+    }
+
     fn queue(&mut self, part: String, cell: (u32, u32)) {
-        if self
-            .resolved
-            .get(&part)
-            .is_some_and(|cells| cells.contains_key(&cell))
-        {
+        if self.lookup(&part, cell).is_some() {
             return;
         }
         if self.pending.entry(part).or_default().insert(cell) {
@@ -350,24 +369,22 @@ impl XlsxChartReferenceResolver<'_, '_, '_, '_> {
                 })
                 .map(|cell| cell.style_index.unwrap_or(0)),
             SourceStyleTarget::Part { part, cell } => {
-                if let Some(style) = self
+                if let Some(style) = self.session.chart_source_styles.lookup(&part, cell) {
+                    return style;
+                }
+                let reparse = self
                     .session
                     .chart_source_styles
-                    .resolved
-                    .get(&part)
-                    .and_then(|cells| cells.get(&cell))
-                {
-                    return *style;
+                    .parsed_parts
+                    .contains(&part);
+                if !reparse {
+                    self.prefetch_drawing_source_cells();
                 }
-                self.prefetch_drawing_source_cells();
                 self.session.chart_source_styles.queue(part.clone(), cell);
-                self.parse_pending_source_styles(&part);
+                self.parse_source_styles(&part, reparse);
                 self.session
                     .chart_source_styles
-                    .resolved
-                    .get(&part)
-                    .and_then(|cells| cells.get(&cell))
-                    .copied()
+                    .lookup(&part, cell)
                     .flatten()
             }
         }
@@ -425,7 +442,9 @@ impl XlsxChartReferenceResolver<'_, '_, '_, '_> {
                 .filter(|node| node.is_element() && node.tag_name().name() == "f")
                 .filter_map(|node| node.text())
             {
-                if self.session.chart_source_styles.entries >= MAX_PREFETCHED_SOURCE_STYLE_CELLS {
+                if self.session.chart_source_styles.entries
+                    >= self.session.chart_source_styles.cap()
+                {
                     return;
                 }
                 let formula = self.expand_defined_name(text);
@@ -440,21 +459,32 @@ impl XlsxChartReferenceResolver<'_, '_, '_, '_> {
 
     /// Resolve every queued cell of `part` in one parse. The first `<c>` whose
     /// `r` names the cell wins; a missing cell or unreadable part stays `None`.
-    fn parse_pending_source_styles(&mut self, part: &str) {
-        let Some(pending) = self.session.chart_source_styles.pending.remove(part) else {
+    /// With `index_all`, every cell of the part is kept as long as the cache
+    /// stays within its cap, so the part is never parsed again this load.
+    fn parse_source_styles(&mut self, part: &str, index_all: bool) {
+        let cache = &mut self.session.chart_source_styles;
+        let Some(pending) = cache.pending.remove(part) else {
             return;
         };
-        let mut styles: HashMap<(u32, u32), Option<u32>> =
-            pending.iter().map(|cell| (*cell, None)).collect();
+        cache.parsed_parts.insert(part.to_string());
+        let previous = cache.resolved.get(part).map_or(0, HashMap::len);
+        // Everything but this part's own entries, which a full index replaces.
+        let others = cache.entries - previous - pending.len();
+        let mut index_budget = index_all.then(|| cache.cap().saturating_sub(others));
         #[cfg(test)]
         {
-            self.session.chart_source_styles.source_parts_parsed += 1;
+            cache.source_parts_parsed += 1;
         }
+        let mut styles: HashMap<(u32, u32), Option<u32>> =
+            pending.iter().map(|cell| (*cell, None)).collect();
+        let mut index: HashMap<(u32, u32), Option<u32>> = HashMap::new();
+        let mut unresolved = pending;
+        let mut parsed = false;
         if let Ok(xml) = read_zip_string(self.archive, part) {
             if let Ok(document) = parse_guarded(&xml) {
-                let mut unresolved = pending;
+                parsed = true;
                 for node in document.descendants() {
-                    if unresolved.is_empty() {
+                    if unresolved.is_empty() && index_budget.is_none() {
                         break;
                     }
                     if !node.is_element() || node.tag_name().name() != "c" {
@@ -467,25 +497,43 @@ impl XlsxChartReferenceResolver<'_, '_, '_, '_> {
                     else {
                         continue;
                     };
+                    let style = Some(
+                        node.attribute("s")
+                            .and_then(|value| value.parse::<u32>().ok())
+                            .unwrap_or(0),
+                    );
                     if unresolved.remove(&cell) {
-                        styles.insert(
-                            cell,
-                            Some(
-                                node.attribute("s")
-                                    .and_then(|value| value.parse::<u32>().ok())
-                                    .unwrap_or(0),
-                            ),
-                        );
+                        styles.insert(cell, style);
+                    }
+                    if let Some(budget) = index_budget {
+                        if !index.contains_key(&cell) {
+                            if index.len() < budget {
+                                index.insert(cell, style);
+                            } else {
+                                index_budget = None;
+                                index = HashMap::new();
+                            }
+                        }
                     }
                 }
             }
         }
-        self.session
-            .chart_source_styles
-            .resolved
-            .entry(part.to_string())
-            .or_default()
-            .extend(styles);
+        let cache = &mut self.session.chart_source_styles;
+        if !parsed {
+            // Every cell of an unreadable part resolves to `None`.
+            index = HashMap::new();
+        }
+        if !parsed || index_budget.is_some() {
+            cache.entries = others + index.len();
+            cache.resolved.insert(part.to_string(), index);
+            cache.indexed_parts.insert(part.to_string());
+        } else {
+            cache
+                .resolved
+                .entry(part.to_string())
+                .or_default()
+                .extend(styles);
+        }
     }
 
     fn number_format_id_for_style(&mut self, style_index: u32) -> Option<u32> {
@@ -2106,6 +2154,89 @@ mod worksheet_reference_tests {
         let loaded = load_charts_with_session(&mut archive, &mut session, &number_formats);
         assert_eq!(loaded.len(), 3);
         assert_eq!(session.chart_source_styles.source_parts_parsed, 1);
+    }
+
+    fn capped_chart_load(cap: usize, extra_rows: std::ops::Range<u32>) -> Vec<String> {
+        // Formulas beyond the cap: the prefetch stops early and later charts
+        // demand cells it never queued.
+        let extra: Vec<String> = extra_rows
+            .map(|row| format!("'التقرير'!Z{row}:Z{}", row + 2))
+            .collect();
+        let mut formulas: Vec<String> = extra.clone();
+        formulas.extend(
+            STYLE_EDGE_FORMULAS
+                .iter()
+                .map(|formula| formula.to_string()),
+        );
+        let charts: Vec<(String, bool)> = formulas
+            .chunks(4)
+            .map(|chunk| {
+                let chunk: Vec<&str> = chunk.iter().map(String::as_str).collect();
+                (column_chart_xml(&chunk), false)
+            })
+            .collect();
+        let mut archive = multi_chart_archive_with(&charts, STYLE_EDGE_DATA_XML, 1);
+        let theme = vec!["#4472C4".into(); 12];
+        let styles = crate::styles::parse_styles(&mut archive, &theme).expect("styles");
+        let number_formats = ChartNumberFormatCache::from_styles(&styles.styles);
+        let mut session = WorksheetReferenceSession::default();
+        session.chart_source_styles.cap = Some(cap);
+        load_charts_with_session(&mut archive, &mut session, &number_formats);
+        let parsed_after_load = session.chart_source_styles.source_parts_parsed;
+        assert_style_parity(
+            &mut archive,
+            &mut session,
+            &number_formats,
+            STYLE_EDGE_DATA_XML,
+        );
+        let rels = parse_guarded(workbook_rels_xml()).unwrap();
+        let sheet_metas = sheets();
+        let mut resolver = XlsxChartReferenceResolver {
+            archive: &mut archive,
+            materialized_rows: None,
+            materialized_col_hidden: None,
+            sheet_name: "Dashboard",
+            sheets: &sheet_metas,
+            workbook_rels: &rels,
+            shared_strings: &[],
+            defined_names: &[],
+            number_formats: &number_formats,
+            session: &mut session,
+            visibility_cache: HashMap::new(),
+            style_prefetch: None,
+        };
+        for formula in &extra {
+            assert_eq!(resolver.source_style_index(formula), None, "{formula}");
+        }
+        let cache = &session.chart_source_styles;
+        vec![
+            format!("after-load:{parsed_after_load}"),
+            format!("total:{}", cache.source_parts_parsed),
+            format!("indexed:{}", cache.indexed_parts.len()),
+            format!(
+                "within-cap:{}",
+                cache.entries <= cap.max(1) + extra.len() + 11
+            ),
+        ]
+    }
+
+    #[test]
+    fn chart_source_styles_index_a_part_once_when_the_prefetch_cap_is_reached() {
+        // 20 missing cells queue first and exhaust a cap of 15; the first
+        // demanded cell beyond them indexes all 11 data cells in one more
+        // parse, after which no lookup reparses the part.
+        assert_eq!(
+            capped_chart_load(15, 100..120),
+            ["after-load:2", "total:2", "indexed:1", "within-cap:true"],
+        );
+    }
+
+    #[test]
+    fn chart_source_styles_keep_answers_when_no_index_fits_the_cap() {
+        // At the memory ceiling the cache trades parses for entries, but the
+        // answers still match the per-reference parse.
+        let report = capped_chart_load(2, 100..104);
+        assert_eq!(report[2], "indexed:0");
     }
 
     #[test]
