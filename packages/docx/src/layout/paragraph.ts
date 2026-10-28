@@ -2621,6 +2621,13 @@ function textPlanSegment(
   // A cursive cluster stays in its contextual operation: splitting it would
   // break its joined forms, and Canvas applies no tracking inside cursive
   // scripts, so its paint is untracked whatever the pitch.
+  // Known limitation (accepted scope of #1975): an over-condensed cursive run
+  // is laid out, wrapped, aligned and hit-tested at Word's floored per-
+  // character advances, but its glyphs paint at their natural contextual
+  // advances instead of stacking. This is the same pre-existing gap as every
+  // tracked cursive run (Canvas letterSpacing is ignored for Arabic); painting
+  // stacked joined forms needs per-glyph joined-form placement, tracked as a
+  // follow-up.
   const splitFlooredStarts = new Set<number>();
   if (flooredClusterNaturalPt.size > 0) {
     for (const cluster of clusters) {
