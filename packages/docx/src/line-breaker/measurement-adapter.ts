@@ -19,8 +19,9 @@ import { verticalRunInkExtra } from './vertical-text.js';
 /** Measured UTF-16 units per text unit charged for one vertical cell plan:
  * routing probes (natural, vertical-form and ink probes) plus one
  * {@link CONDENSED_CONTEXT_GRAPHEMES}-bounded context pair per sideways
- * grapheme, the whole sideways piece and a floored cluster's drawn advance. */
-const VERTICAL_PLAN_WORK_PER_UNIT = 2 * (CONDENSED_CONTEXT_GRAPHEMES + 1) + 7;
+ * grapheme, the whole sideways piece and a floored cluster's drawn advance,
+ * plus the two bidi level passes of a split piece. */
+const VERTICAL_PLAN_WORK_PER_UNIT = 2 * (CONDENSED_CONTEXT_GRAPHEMES + 1) + 9;
 
 /** Ownership retains the source's slots even after emergency slicing. Only
  * overlapping slots describe the current physical seam; an all-ASCII suffix

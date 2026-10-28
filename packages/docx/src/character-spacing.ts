@@ -1,4 +1,5 @@
 import { joiningType } from '@silurus/ooxml-core/internal/joining-type';
+import { getDefaultBidiEngine } from '@silurus/ooxml-core';
 
 /** ECMA-376 §17.3.2.35 adds pitch after each rendered character. For run
  * tracking, combining marks (\p{M}) get no w:spacing, even when
@@ -81,3 +82,13 @@ export function hasCursiveJoining(text: string): boolean {
 }
 
 const COMBINING_MARK = /^\p{M}$/u;
+
+/** Whether the UAX#9 level of `text[index]` differs from the previous code
+ * unit's in either paint direction. */
+export function bidiLevelChanges(text: string): (index: number) => boolean {
+  const engine = getDefaultBidiEngine();
+  const ltr = engine.computeLevels(text, 'ltr').levels;
+  const rtl = engine.computeLevels(text, 'rtl').levels;
+  return (index) => index > 0 && index < text.length
+    && (ltr[index] !== ltr[index - 1] || rtl[index] !== rtl[index - 1]);
+}

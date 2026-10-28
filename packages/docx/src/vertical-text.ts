@@ -1,5 +1,10 @@
 import { graphemeClusterOffsets } from '@silurus/ooxml-core';
-import { CONDENSED_CONTEXT_GRAPHEMES, hasCursiveJoining, textSpacingAdvance } from './character-spacing.js';
+import {
+  bidiLevelChanges,
+  CONDENSED_CONTEXT_GRAPHEMES,
+  hasCursiveJoining,
+  textSpacingAdvance,
+} from './character-spacing.js';
 // ECMA-376 §17.6.20 vertical writing (`<w:textDirection w:val="tbRl">`) — the
 // glyph-level primitives for rendering a page that has been laid out in the
 // SWAPPED logical coordinate space and rotated +90° into physical space by the
@@ -430,11 +435,14 @@ export function planVerticalRunWithCapability(
             })();
       const split = pieceCells.length === 0;
       if (split) {
+        // Split cells are placed in bidi order at paint, so a cursive group
+        // stays level-uniform.
+        const levelChanges = bidiLevelChanges(piece.text);
         units.forEach((unit, index) => {
           const placed = unitPlaces[index]!;
           const previous = pieceCells.at(-1);
           const cursive = hasCursiveJoining(unit.text);
-          if (cursive && previous?.cursive) {
+          if (cursive && previous?.cursive && !levelChanges(unit.start - sourceOffset)) {
             previous.end = unit.start + unit.text.length;
             previous.advancePt += placed.advancePt;
             previous.floored ||= placed.floored;

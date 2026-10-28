@@ -246,6 +246,34 @@ describe('#1975 condensed floor in right-to-left text', () => {
       .toEqual([['بي', 8], ['!', 4], ['ب', 0]]);
   });
 
+  it.each([
+    ['horizontal', undefined,
+      [['אב', 'rtl', 16], ['A', 'rtl', 8], ['i', 'rtl', 12], ['B', 'rtl', 12], ['גד', 'rtl', 0]]],
+    // A floored vertical piece paints one cell per grapheme.
+    ['vertical', 'tbRl',
+      [['א', 'rtl', 20], ['ב', 'rtl', 16], ['A', 'rtl', 8], ['i', 'rtl', 12], ['B', 'rtl', 12],
+        ['ג', 'rtl', 4], ['ד', 'rtl', 0]]],
+  ] as const)('keeps embedded left-to-right order in a floored right-to-left run (%s)', (_name, textDirection, expected) => {
+    // אב, A, i (floored), B, גד at logical 0, 8, 12, 12, 16 over width 24.
+    // UAX#9 (base RTL): AiB is level 2 and keeps its order, so visually
+    // גד | A i B | אב, as one contextual Canvas operation would draw it.
+    const node = layoutBodyModel(
+      [para([textRun('אבAiBגד', { rtl: true, charSpacing: -6 })], { bidi: true } as Partial<DocParagraph>)],
+      textDirection ? { ...section, textDirection } as SectionProps : section,
+      makeCtx(),
+    ).pages[0]!.layers.body[0]!;
+    if (node.kind !== 'paragraph') throw new Error('expected a paragraph');
+    expect(byText(node.lines[0]!, 'אבAiBגד').paintOps.map((op) => [op.text, op.direction, op.offset.xPt]))
+      .toEqual(expected);
+  });
+
+  it('places a floored mixed word as Canvas orders it', () => {
+    // ab (level 2), ג, י (floored), ד (level 1): visually ד/י | ג | ab.
+    const [line] = lines([para([textRun('abגיד', { charSpacing: -6 })])]);
+    expect(byText(line!, 'abגיד').paintOps.map((op) => [op.text, op.direction, op.offset.xPt]))
+      .toEqual([['ab', 'rtl', 8], ['ג', 'rtl', 4], ['י', 'rtl', 0], ['ד', 'rtl', 0]]);
+  });
+
   it('keeps a floored cursive run as one contextual operation', () => {
     // Splitting would break the joined forms; Canvas does not track inside
     // cursive scripts, so only the advance is floored.
@@ -264,7 +292,8 @@ describe('#1975 condensed floor in right-to-left text', () => {
     // A w:cs run keeps Latin, Arabic and join controls in one segment. The
     // ZWJ is pitch-bearing, so 'M\u200D' (10 - 2 x 6) floors too.
     for (const [text, expected] of [
-      ['MiMب', [['M', -6], ['i', 0], ['Mب', -6]]],
+      // Latin and Arabic take different bidi levels, so they split too.
+      ['MiMب', [['M', -6], ['i', 0], ['M', -6], ['ب', -6]]],
       ['MiM\u200D', [['M', -6], ['i', 0], ['M\u200D', 0]]],
     ] as const) {
       const [line] = lines([para([textRun(text, { charSpacing: -6, cs: true } as Partial<DocxTextRun>)])]);
@@ -480,7 +509,7 @@ describe('condensed advance units work', () => {
     for (let end = 1; end <= 50; end += 1) {
       adapter.condensedAdvanceUnits(segment, text.slice(0, end), 0, undefined, (units) => { reserved += units; });
     }
-    expect(reserved).toBeLessThanOrEqual(50 * 51 / 2 * 17);
+    expect(reserved).toBeLessThanOrEqual(50 * 51 / 2 * 19);
   });
 
   it('charges vertical cell planning for every measured unit', () => {

@@ -1,6 +1,7 @@
 import {
   countedSpacingAdvance,
   countSpacingCharacters,
+  bidiLevelChanges,
   hasCursiveJoining,
   textSpacingAdvance,
 } from '../character-spacing.js';
@@ -30,7 +31,13 @@ import type { LineGapPlan } from '../line-breaker/line-gaps.js';
 import { distributeLineSlack as distributeProportionalSlack } from '@silurus/ooxml-core';
 import { specifiedTextLineMetrics, specifiedTextParagraphIsHomogeneous } from './specified-line-spacing.js';
 import { wordTextBoxVerticalMode } from './compatibility.js';
-import { autoContrastColor, canvasFontString, createCanvasFontRoute } from '@silurus/ooxml-core';
+import {
+  autoContrastColor,
+  canvasFontString,
+  createCanvasFontRoute,
+  getDefaultBidiEngine,
+  hasStrongRtl,
+} from '@silurus/ooxml-core';
 import { quoteCssFontFamily } from '@silurus/ooxml-core/internal/css-font-family';
 import {
   effectiveParagraphTabStops,
@@ -704,76 +711,151 @@ function retainedRtlPaintOperations(
   });
 }
 
-/** WORD_CONDENSED_SPACING_ADVANCE_FLOOR in a right-to-left segment. Floored
- * clusters paint as their own operations from logical (left-to-right) cluster
- * origins; place every operation of such a segment visually instead. The pen
- * runs leftwards from the segment's right edge, so an operation's left edge is
- * the pen minus its advance, and a floored glyph's trailing (left) edge sits
- * its natural advance left of the pen. Offsets stay relative to the paint
- * origin, which `rtlLeadingGapPt` has already moved past trailing whitespace. */
-function flooredRtlVisualPaintOperations(
+/** UAX#9 X9: the level the bidi engine reports for a removed control. */
+const UAX9_REMOVED_LEVEL = 255;
+
+/** WORD_CONDENSED_SPACING_ADVANCE_FLOOR splits a segment's paint at floored
+ * clusters, and Canvas resolves bidirectional order only inside one
+ * `fillText`. Place the split operations as the single operation they replace
+ * would have been drawn: UAX#9 levels of the painted text in the paint
+ * direction (Canvas applies no higher-level overrides), then each L2 reversal
+ * (highest level first, down to the lowest odd level) mirrors its contiguous
+ * run of operations within the run's own span. Operations are level-uniform
+ * (split at level changes). A floored cluster drawn alone at an odd level
+ * keeps its glyph's trailing edge on the right-to-left pen, its drawn
+ * advance behind it. Work is linear per level. */
+function bidiPlacedOffsets(
+  items: readonly Readonly<{ xPt: number; advancePt: number; drawnAdvancePt?: number; level: number }>[],
+): number[] {
+  const xs = items.map((item) => item.xPt);
+  let order = items.map((_, index) => index);
+  let highest = 0;
+  let lowestOdd = Number.POSITIVE_INFINITY;
+  for (const item of items) {
+    highest = Math.max(highest, item.level);
+    if (item.level % 2 === 1) lowestOdd = Math.min(lowestOdd, item.level);
+  }
+  for (let level = highest; level >= lowestOdd; level -= 1) {
+    const next: number[] = [];
+    let cursor = 0;
+    while (cursor < order.length) {
+      if (items[order[cursor]!]!.level < level) {
+        next.push(order[cursor]!);
+        cursor += 1;
+        continue;
+      }
+      let end = cursor;
+      let startPt = Number.POSITIVE_INFINITY;
+      let endPt = Number.NEGATIVE_INFINITY;
+      while (end < order.length && items[order[end]!]!.level >= level) {
+        const index = order[end]!;
+        startPt = Math.min(startPt, xs[index]!);
+        endPt = Math.max(endPt, xs[index]! + items[index]!.advancePt);
+        end += 1;
+      }
+      for (let member = end - 1; member >= cursor; member -= 1) {
+        const index = order[member]!;
+        xs[index] = startPt + endPt - xs[index]! - items[index]!.advancePt;
+        next.push(index);
+      }
+      cursor = end;
+    }
+    order = next;
+  }
+  return items.map((item, index) => item.drawnAdvancePt !== undefined && item.level % 2 === 1
+    ? xs[index]! + item.advancePt - item.drawnAdvancePt
+    : xs[index]!);
+}
+
+/** Per-operation visible advance from the retained clusters (both run in
+ * source order; clusters from `visibleEnd` on are trailing whitespace). */
+function operationVisibleAdvancesPt(
   operations: readonly TextPaintOp[],
   clusters: readonly TextClusterLayout[],
-  rtlLeadingGapPt: number,
   visibleEnd: number,
-): readonly TextPaintOp[] {
-  if (!operations.some((operation) => operation.naturalAdvancePt !== undefined)) return operations;
-  let widthPt = 0;
-  for (const cluster of clusters) {
-    widthPt = Math.max(widthPt, cluster.offset.xPt + cluster.advancePt);
-  }
-  // Operations and clusters both run in source order: one cursor sums each
-  // operation's visible advance (trailing whitespace is trimmed from paint).
+): number[] {
   let cursor = 0;
   return operations.map((operation) => {
-    let visibleAdvancePt = 0;
+    let advancePt = 0;
     while (cursor < clusters.length && clusters[cursor]!.range.start < operation.range.end) {
       const cluster = clusters[cursor]!;
       if (cluster.range.start >= operation.range.start && cluster.range.start < visibleEnd) {
-        visibleAdvancePt += cluster.advancePt;
+        advancePt += cluster.advancePt;
       }
       cursor += 1;
     }
-    const advancePt = operation.naturalAdvancePt ?? visibleAdvancePt;
-    return {
-      ...operation,
-      offset: {
-        ...operation.offset,
-        xPt: widthPt - operation.offset.xPt - advancePt - rtlLeadingGapPt,
-      },
-    };
+    return advancePt;
   });
 }
 
-/** WORD_CONDENSED_SPACING_ADVANCE_FLOOR in a right-to-left vertical run. An
- * unsplit sideways piece paints as one contextual operation whose bidi order
- * Canvas resolves; a floored piece paints several operations from logical
- * origins (including a floored cursive group beside unfloored neighbours),
- * so mirror each operation within its piece (a maximal run of sideways
- * operations; pieces alternate draw mode) over the piece's visible
- * extent: a floored cluster's ink sits its drawn advance behind the pen, as
- * {@link flooredRtlVisualPaintOperations} places it horizontally. Trailing
- * whitespace stays outside the extent, since the paint origin has already
- * moved past it. Upright and rotated cells keep their origins. */
-function flooredRtlVerticalPaintOperations(
+/** Whether placing split operations in `direction` can differ from logical
+ * order: right-to-left paint, or right-to-left text inside left-to-right. */
+function splitPaintNeedsBidi(text: string, direction: 'ltr' | 'rtl'): boolean {
+  return direction === 'rtl' || hasStrongRtl(text);
+}
+
+/** {@link bidiPlacedOffsets} for a horizontal segment whose floored clusters
+ * paint as their own operations. Visible operations are placed within the
+ * visible extent; in right-to-left paint the origin has already moved past
+ * trailing whitespace (`rtlLeadingGapPt`), whose zero-ink operations mirror
+ * into that gap. */
+function flooredVisualPaintOperations(
   operations: readonly TextPaintOp[],
   clusters: readonly TextClusterLayout[],
+  text: string,
+  textStart: number,
+  direction: 'ltr' | 'rtl',
+  visibleEnd: number,
+): readonly TextPaintOp[] {
+  if (!operations.some((operation) => operation.naturalAdvancePt !== undefined)) return operations;
+  const visibleText = text.slice(0, visibleEnd - textStart);
+  if (!splitPaintNeedsBidi(visibleText, direction)) return operations;
+  const { levels, paragraphLevel } = getDefaultBidiEngine().computeLevels(visibleText, direction);
+  const advances = operationVisibleAdvancesPt(operations, clusters, visibleEnd);
+  const visible = operations.flatMap((operation, index) => operation.range.start < visibleEnd ? [index] : []);
+  const placed = bidiPlacedOffsets(visible.map((index) => {
+    const operation = operations[index]!;
+    const level = levels[operation.range.start - textStart]!;
+    return {
+      xPt: operation.offset.xPt,
+      advancePt: advances[index]!,
+      ...(operation.naturalAdvancePt !== undefined ? { drawnAdvancePt: operation.naturalAdvancePt } : {}),
+      level: level === UAX9_REMOVED_LEVEL ? paragraphLevel : level,
+    };
+  }));
+  let visibleEndPt = 0;
+  for (const index of visible) {
+    visibleEndPt = Math.max(visibleEndPt, operations[index]!.offset.xPt + advances[index]!);
+  }
+  let member = 0;
+  return operations.map((operation) => {
+    if (operation.range.start < visibleEnd) {
+      return { ...operation, offset: { ...operation.offset, xPt: placed[member++]! } };
+    }
+    return direction === 'rtl'
+      ? { ...operation, offset: { ...operation.offset, xPt: visibleEndPt - operation.offset.xPt } }
+      : operation;
+  });
+}
+
+/** {@link bidiPlacedOffsets} for a vertical run. An unsplit sideways piece
+ * paints as one contextual operation whose bidi order Canvas resolves; a
+ * floored piece paints several operations (a maximal run of sideways
+ * operations; pieces alternate draw mode), placed within the piece's visible
+ * extent. Trailing whitespace keeps its origin, since the paint origin has
+ * already moved past it. Upright and rotated cells keep their origins. */
+function flooredVerticalPaintOperations(
+  operations: readonly TextPaintOp[],
+  clusters: readonly TextClusterLayout[],
+  text: string,
+  textStart: number,
+  direction: 'ltr' | 'rtl',
   visibleEnd: number,
 ): readonly TextPaintOp[] {
   // Only the floored plan gives a sideways piece several operations.
   if (!operations.some((operation, index) => index > 0 && operation.glyphOrientation === 'sideways'
     && operations[index - 1]!.glyphOrientation === 'sideways')) return operations;
-  // Operations and clusters both run in source order.
-  const advances: number[] = [];
-  let cursor = 0;
-  for (const operation of operations) {
-    let advancePt = 0;
-    while (cursor < clusters.length && clusters[cursor]!.range.start < operation.range.end) {
-      if (clusters[cursor]!.range.start >= operation.range.start) advancePt += clusters[cursor]!.advancePt;
-      cursor += 1;
-    }
-    advances.push(advancePt);
-  }
+  const advances = operationVisibleAdvancesPt(operations, clusters, visibleEnd);
   const placed = [...operations];
   let index = 0;
   while (index < operations.length) {
@@ -782,27 +864,31 @@ function flooredRtlVerticalPaintOperations(
       continue;
     }
     let end = index;
-    while (end < operations.length && operations[end]!.glyphOrientation === 'sideways') end += 1;
-    if (end - index > 1) {
-      const startPt = operations[index]!.offset.xPt;
-      let endPt = startPt;
-      for (let member = index; member < end; member += 1) {
-        if (operations[member]!.range.start >= visibleEnd) continue;
-        endPt = Math.max(endPt, operations[member]!.offset.xPt + advances[member]!);
-      }
-      for (let member = index; member < end; member += 1) {
-        const operation = operations[member]!;
-        if (operation.range.start >= visibleEnd) continue;
-        placed[member] = {
-          ...operation,
-          offset: {
-            ...operation.offset,
-            xPt: startPt + endPt - operation.offset.xPt - (operation.naturalAdvancePt ?? advances[member]!),
-          },
+    while (end < operations.length && operations[end]!.glyphOrientation === 'sideways'
+      && operations[end]!.range.start < visibleEnd) end += 1;
+    const pieceStart = operations[index]!.range.start;
+    const pieceText = end > index
+      ? text.slice(pieceStart - textStart, operations[end - 1]!.range.end - textStart)
+      : '';
+    if (end - index > 1 && splitPaintNeedsBidi(pieceText, direction)) {
+      const { levels, paragraphLevel } = getDefaultBidiEngine().computeLevels(pieceText, direction);
+      const members = operations.slice(index, end);
+      const offsets = bidiPlacedOffsets(members.map((operation, member) => {
+        const level = levels[operation.range.start - pieceStart]!;
+        return {
+          xPt: operation.offset.xPt,
+          advancePt: advances[index + member]!,
+          ...(operation.naturalAdvancePt !== undefined ? { drawnAdvancePt: operation.naturalAdvancePt } : {}),
+          level: level === UAX9_REMOVED_LEVEL ? paragraphLevel : level,
         };
-      }
+      }));
+      members.forEach((operation, member) => {
+        placed[index + member] = { ...operation, offset: { ...operation.offset, xPt: offsets[member]! } };
+      });
     }
-    index = end;
+    index = Math.max(end, index + 1);
+    while (index < operations.length && operations[index]!.glyphOrientation === 'sideways'
+      && operations[index]!.range.start >= visibleEnd) index += 1;
   }
   return placed;
 }
@@ -1255,23 +1341,19 @@ export function planLine(input: PlanLineInput): LineLayout {
             .filter((cluster) => cluster.range.start >= segment.range.start + trailingWhitespaceStart)
             .reduce((sum, cluster) => sum + cluster.advancePt, 0)
         : 0;
+      const placedPaintOps = ((textGeometry.paintOps[0]?.writingMode ?? 'horizontal-tb') !== 'horizontal-tb'
+        ? flooredVerticalPaintOperations
+        : flooredVisualPaintOperations)(
+        textGeometry.paintOps,
+        textGeometry.clusters,
+        segment.text,
+        segment.range.start,
+        direction,
+        segment.range.start + trailingWhitespaceStart,
+      );
       const paintOps = direction === 'rtl'
-        ? retainedRtlPaintOperations(
-            (textGeometry.paintOps[0]?.writingMode ?? 'horizontal-tb') !== 'horizontal-tb'
-              ? flooredRtlVerticalPaintOperations(
-                  textGeometry.paintOps,
-                  textGeometry.clusters,
-                  segment.range.start + trailingWhitespaceStart,
-                )
-              : flooredRtlVisualPaintOperations(
-                  textGeometry.paintOps,
-                  textGeometry.clusters,
-                  rtlLeadingGapPt,
-                  segment.range.start + trailingWhitespaceStart,
-                ),
-            textGeometry.clusters,
-          )
-        : textGeometry.paintOps;
+        ? retainedRtlPaintOperations(placedPaintOps, textGeometry.clusters)
+        : placedPaintOps;
       // `word-run-decoration-justified-advance`
       const ownedTrailingSlackPt = stretch?.trailingGap ? stretch.trailingDelta ?? perGapPt : 0;
       const origin = { xPt: xPt + rtlLeadingGapPt, yPt: line.baselinePt };
@@ -2752,6 +2834,9 @@ function textPlanSegment(
       : clusterOriginPaintOps
         ? (() => {
             const template = paintOps[0]!;
+            // Split operations are placed in bidi order at paint, so each
+            // stays level-uniform whichever direction the line resolves.
+            const levelChanges = hasFlooredClusters ? bidiLevelChanges(segment.text) : undefined;
             const groups: Array<{
               start: number;
               end: number;
@@ -2767,7 +2852,8 @@ function textPlanSegment(
               const floored = splitFlooredStarts.has(cluster.range.start);
               const previous = groups.at(-1);
               if (previous && !floored && !previous.floored
-                && previous.adjustmentPt === adjustmentPt) {
+                && previous.adjustmentPt === adjustmentPt
+                && !levelChanges?.(cluster.range.start - sourceOffset)) {
                 previous.end = cluster.range.end;
               } else {
                 groups.push({
