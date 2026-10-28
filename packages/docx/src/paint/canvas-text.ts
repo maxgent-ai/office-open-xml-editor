@@ -16,10 +16,7 @@ import {
 } from './affine.js';
 import { canvasPaintFrame } from './deferred-paint-frame.js';
 import { applyCanvasTransform } from './canvas-transform.js';
-
-function withJoiners(text: string, joiners: 'before' | 'after' | 'both'): string {
-  return `${joiners === 'after' ? '' : '\u200D'}${text}${joiners === 'before' ? '' : '\u200D'}`;
-}
+import { withPaintJoiners } from '../cursive-joins.js';
 
 function validateTextSlices(placement: import('../layout/types.js').TextPlacement): void {
   const optionalGlyph = placement.optionalHyphenGlyph === true;
@@ -59,7 +56,7 @@ function validateTextSlices(placement: import('../layout/types.js').TextPlacemen
     const invalidTextMapping = !optionalGlyph && op.sourceMapping !== 'kashida'
       && (op.joiners === undefined
         ? op.text.length !== op.range.end - op.range.start
-        : op.text !== withJoiners(
+        : op.text !== withPaintJoiners(
           placement.text.slice(op.range.start - placement.range.start, op.range.end - placement.range.start),
           op.joiners,
         ));

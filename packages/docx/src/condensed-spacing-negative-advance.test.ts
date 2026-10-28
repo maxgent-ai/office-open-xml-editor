@@ -4,6 +4,7 @@ import { segAdvanceWidth, type CondensedAdvanceUnits, type LayoutTextSeg } from 
 import { LineMeasurementAdapter } from './line-breaker/measurement-adapter.js';
 import { paintLayoutPage } from './paint/canvas-page.js';
 import { planVerticalRunWithCapability } from './vertical-text.js';
+import { cursiveJoinContext } from './cursive-joins.js';
 import type { VerticalGlyphMeasurementService } from './layout/measurement-capabilities.js';
 import { makeRecordingCanvas } from './test-support/recording-canvas.test-support.js';
 import type { LineLayout, TextPlacement } from './layout/types.js';
@@ -234,6 +235,22 @@ describe('#1975 condensed floor in right-to-left text', () => {
     }
   });
 
+  it('anchors a floored RTL glyph by the width it draws', () => {
+    // After U+0640 the stub draws alif 4 pt wider: its bounded contextual
+    // advance is 14 pt, but its own operation draws '\u200Dا' (10 pt).
+    const layout = layoutOf([para(
+      [textRun('\u0640ا', { rtl: true, charSpacing: -20 })],
+      { bidi: true } as Partial<DocParagraph>,
+    )], true);
+    const node = layout.pages[0]!.layers.body[0]!;
+    if (node.kind !== 'paragraph') throw new Error('expected a paragraph');
+    const ops = byText(node.lines[0]!, '\u0640ا').paintOps;
+    const alif = ops.find((op) => op.text.endsWith('ا'))!;
+    expect(alif.naturalAdvancePt).toBe(10);
+    // Both glyphs stack at the zero-width segment: alif ends on the pen.
+    expect(alif.offset.xPt + alif.naturalAdvancePt!).toBeCloseTo(0, 9);
+  });
+
   it('does not open a gap for trailing whitespace', () => {
     const offsets = (text: string) => {
       const [line] = lines([para(
@@ -299,10 +316,11 @@ describe('segAdvanceWidth condensed floor', () => {
   });
 
   it('measures vertical runs from their planned cells', () => {
-    // Planned cells already carry pitch and floor; compression is folded per cell.
+    // Planned cells already carry pitch, character adjustments and floor.
     const vertical = seg('ーー', -30, { verticalRun: true });
     const cells: CondensedAdvanceUnits = {
-      kind: 'vertical-cells', cells: [{ text: 'ー', advancePx: 0 }, { text: 'ー', advancePx: 0 }],
+      kind: 'vertical-cells',
+      cells: [{ text: 'ー', advancePx: 0, floored: true }, { text: 'ー', advancePx: 0, floored: true }],
     };
     expect(segAdvanceWidth(vertical, 40, undefined, 1, cells)).toBe(0);
   });
@@ -311,6 +329,18 @@ describe('segAdvanceWidth condensed floor', () => {
     const units = natural([['M', 10], ['i', 4]]);
     expect(segAdvanceWidth(seg('Mi', -2), 14, undefined, 1, units)).toBe(10);
     expect(segAdvanceWidth(seg('Mi', 3), 14, undefined, 1)).toBe(20);
+  });
+});
+
+describe('cursive join context', () => {
+  it('joins across transparent runs in linear time', () => {
+    const marks = '\u064B'.repeat(50_000);
+    const text = `ب${marks}ت`;
+    const joinsAt = cursiveJoinContext(text);
+    expect(joinsAt(0, 1)).toBe('after');
+    expect(joinsAt(1 + marks.length, text.length)).toBe('before');
+    expect(joinsAt(1, 2)).toBeUndefined();
+    expect(cursiveJoinContext('اب')(1, 2)).toBeUndefined();
   });
 });
 

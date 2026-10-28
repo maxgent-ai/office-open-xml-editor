@@ -1,5 +1,6 @@
 import { graphemeClusterOffsets } from '@silurus/ooxml-core';
-import { CONDENSED_CONTEXT_GRAPHEMES, condensedClusterFloorPx, textSpacingAdvance } from './character-spacing.js';
+import { CONDENSED_CONTEXT_GRAPHEMES, textSpacingAdvance } from './character-spacing.js';
+import { cursiveJoinContext, withPaintJoiners, type PaintJoiners } from './cursive-joins.js';
 // ECMA-376 §17.6.20 vertical writing (`<w:textDirection w:val="tbRl">`) — the
 // glyph-level primitives for rendering a page that has been laid out in the
 // SWAPPED logical coordinate space and rotated +90° into physical space by the
@@ -236,6 +237,10 @@ export interface PlannedVerticalGlyphCell {
   readonly drawOffsetPt: Readonly<{ xPt: number; yPt: number }>;
   readonly verticalFeature: boolean;
   readonly blockAxisInkBounds?: Readonly<{ startPt: number; endPt: number }>;
+  /** WORD_CONDENSED_SPACING_ADVANCE_FLOOR took this cell's advance to zero. */
+  readonly floored?: true;
+  /** Synthetic U+200D in `text` (a floored split of a cursive sideways piece). */
+  readonly joiners?: PaintJoiners;
 }
 
 function plannedVerticalBlockAxisInkBounds(
@@ -348,6 +353,7 @@ export function planVerticalRunWithCapability(
   vertCapability: VertCapability = NO_VERT_CAPABILITY,
   writingMode: WritingMode = 'vertical-rl',
   characterGridDeltaPt = 0,
+  characterAdjustmentPt?: (start: number, end: number) => number,
 ): readonly PlannedVerticalGlyphCell[] {
   const cells: PlannedVerticalGlyphCell[] = [];
   const emBoxCenterPt = emBoxCenterAboveBaseline(ctx, text, fontPt);
@@ -355,12 +361,23 @@ export function planVerticalRunWithCapability(
   let sourceOffset = 0;
   const charSpacingPt = letterSpacingPt - characterGridDeltaPt;
   // WORD_CONDENSED_SPACING_ADVANCE_FLOOR: no character advance below zero.
+  // `characterAdjustmentPt` (punctuation compression and width balance of a
+  // source range) joins the floored advance when the caller supplies it; the
+  // reported advances then include it. Unfloored cells keep their centring.
   const mayFloor = letterSpacingPt < 0 || characterGridDeltaPt < 0;
-  const flooredAdvance = (unit: string, scaledNaturalPt: number): number => {
-    const raw = scaledNaturalPt
+  const unitAdvance = (unit: string, start: number, scaledNaturalPt: number): Readonly<{
+    advancePt: number;
+    cellPt: number;
+    floored: boolean;
+  }> => {
+    const spacedPt = scaledNaturalPt
       + textSpacingAdvance(unit, characterGridDeltaPt, charSpacingPt, letterSpacingPt);
-    return mayFloor && raw < 0 ? 0 : raw;
+    if (!mayFloor) return { advancePt: spacedPt, cellPt: spacedPt, floored: false };
+    const rawPt = spacedPt + (characterAdjustmentPt?.(start, start + unit.length) ?? 0);
+    if (rawPt < 0) return { advancePt: 0, cellPt: 0, floored: true };
+    return { advancePt: characterAdjustmentPt ? rawPt : spacedPt, cellPt: spacedPt, floored: false };
   };
+  const joinsAt = mayFloor ? cursiveJoinContext(text) : undefined;
   for (const piece of splitVerticalOrientationRuns(text)) {
     if (piece.mode === 'sideways') {
       const drawOffsetPt = { xPt: 0, yPt: emBoxCenterPt };
@@ -369,45 +386,45 @@ export function planVerticalRunWithCapability(
       // Contextual grapheme advances (bounded preceding context, as line
       // fitting measures them): an over-condensed cluster stops the pen at its
       // floor, which a shared Canvas letterSpacing cannot express, so the
-      // piece then paints each cluster from its own origin.
+      // piece then paints each cluster from its own origin, keeping cursive
+      // joins across the new boundaries.
       const units = mayFloor
         ? offsets.slice(0, -1).map((start, index) => {
             const end = offsets[index + 1]!;
             const context = offsets[Math.max(0, index - CONDENSED_CONTEXT_GRAPHEMES)]!;
             return {
               text: piece.text.slice(start, end),
+              start: sourceOffset + start,
               naturalPt: ctx.measureText(piece.text.slice(context, end)).width
                 - (context < start ? ctx.measureText(piece.text.slice(context, start)).width : 0),
             };
           })
         : [];
       const splitPiece = units.some((unit) =>
-        condensedClusterFloorPx(
-          unit.text, unit.naturalPt * charScale, characterGridDeltaPt, charSpacingPt,
-        ) > 0);
-      for (const { text: unit, naturalPt } of splitPiece
+        unitAdvance(unit.text, unit.start, unit.naturalPt * charScale).floored);
+      for (const { text: unit, start, naturalPt } of splitPiece
         ? units
-        : [{ text: piece.text, naturalPt: ctx.measureText(piece.text).width }]) {
-        const advancePt = splitPiece
-          ? flooredAdvance(unit, naturalPt * charScale)
-          : naturalPt * charScale
-            + textSpacingAdvance(unit, characterGridDeltaPt, charSpacingPt, letterSpacingPt);
+        : [{ text: piece.text, start: sourceOffset, naturalPt: ctx.measureText(piece.text).width }]) {
+        const placed = unitAdvance(unit, start, naturalPt * charScale);
+        const joiners = splitPiece ? joinsAt?.(start, start + unit.length) : undefined;
         const blockAxisInkBounds = plannedVerticalBlockAxisInkBounds(
           ctx, unit, 'sideways', drawOffsetPt, charScale, writingMode, false,
         );
         cells.push({
-          range: { start: sourceOffset, end: sourceOffset + unit.length },
-          text: unit,
+          range: { start, end: start + unit.length },
+          text: withPaintJoiners(unit, joiners),
           orientation: 'sideways',
           originPt: ax,
-          advancePt,
+          advancePt: placed.advancePt,
           drawOffsetPt,
           verticalFeature: false,
           ...(blockAxisInkBounds ? { blockAxisInkBounds } : {}),
+          ...(placed.floored ? { floored: true as const } : {}),
+          ...(joiners ? { joiners } : {}),
         });
-        ax += advancePt;
-        sourceOffset += unit.length;
+        ax += placed.advancePt;
       }
+      sourceOffset += piece.text.length;
       continue;
     }
     for (const ch of piece.text) {
@@ -418,7 +435,9 @@ export function planVerticalRunWithCapability(
         && bracketCp === null
         && verticalTrUprightFallback(cp);
       const routed = routedVerticalGlyphCell(ctx, ch, cp, vertCapability, growTrRotateInk);
-      const advancePt = flooredAdvance(ch, routed.naturalPx * charScale);
+      const placed = unitAdvance(ch, sourceOffset, routed.naturalPx * charScale);
+      const advancePt = placed.advancePt;
+      const flooredCell = placed.floored ? { floored: true as const } : {};
       const range = { start: sourceOffset, end: sourceOffset + ch.length };
       if (routed.vert !== null) {
         const drawOffsetPt = { xPt: 0, yPt: 0 };
@@ -434,6 +453,7 @@ export function planVerticalRunWithCapability(
           drawOffsetPt,
           verticalFeature: true,
           ...(blockAxisInkBounds ? { blockAxisInkBounds } : {}),
+          ...flooredCell,
         });
       } else if (mode === 'upright' || bracketCp !== null || uprightFallback) {
         const puncCp = bracketCp !== null ? null : verticalFormSubstitute(cp);
@@ -454,11 +474,12 @@ export function planVerticalRunWithCapability(
           range,
           text: drawText,
           orientation: 'upright',
-          originPt: ax + advancePt / 2,
+          originPt: ax + placed.cellPt / 2,
           advancePt,
           drawOffsetPt,
           verticalFeature: false,
           ...(blockAxisInkBounds ? { blockAxisInkBounds } : {}),
+          ...flooredCell,
         });
       } else {
         const drawOffsetPt = { xPt: 0, yPt: 0 };
@@ -469,11 +490,12 @@ export function planVerticalRunWithCapability(
           range,
           text: ch,
           orientation: 'rotate',
-          originPt: ax + advancePt / 2 + charScale * routed.rotateInkShiftPx,
+          originPt: ax + placed.cellPt / 2 + charScale * routed.rotateInkShiftPx,
           advancePt,
           drawOffsetPt,
           verticalFeature: false,
           ...(blockAxisInkBounds ? { blockAxisInkBounds } : {}),
+          ...flooredCell,
         });
       }
       ax += advancePt;

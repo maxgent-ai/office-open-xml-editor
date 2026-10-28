@@ -470,6 +470,8 @@ export function segLetterSpacingPx(
 export interface NaturalClusterAdvance {
   readonly text: string;
   readonly advancePx: number;
+  /** Vertical cells only: the planner floored this cell. */
+  readonly floored?: boolean;
 }
 
 
@@ -514,11 +516,26 @@ function unitPunctuationCompressionPt(seg: LayoutTextSeg, start: number, end: nu
 }
 
 
-/** Each unit's whole signed advance (px): horizontal clusters scale their
- * natural advance and add grid/run pitch; vertical cells already carry pitch
- * and the planner's floor. Both add the unit's punctuation compression and
- * width balance, so the floor covers the character's whole advance. Shared by
- * measurement ({@link segAdvanceWidth}) and retained cluster geometry. */
+/** Punctuation compression plus width balance of `seg.text[start, end)` (px):
+ * the per-character adjustments the floor covers together with the glyph and
+ * pitch. Vertical planning receives it as `characterAdjustmentPt`. */
+export function condensedCharacterAdjustmentPx(
+  seg: LayoutTextSeg,
+  grid: DocGridCtx | undefined,
+  scale: number,
+  start: number,
+  end: number,
+): number {
+  return unitPunctuationCompressionPt(seg, start, end) * scale
+    + widthBalanceSpaceAdjustmentForTextPt(seg, seg.text.slice(start, end), grid)
+      * scale * charScaleFactor(seg);
+}
+
+
+/** Each unit's whole signed advance (px). Horizontal clusters scale their
+ * natural advance and add grid/run pitch plus the character adjustments;
+ * vertical cells were planned with pitch, adjustments and floor already.
+ * Shared by measurement ({@link segAdvanceWidth}) and retained geometry. */
 export function condensedUnitAdvancesPx(
   seg: LayoutTextSeg,
   grid: DocGridCtx | undefined,
@@ -531,17 +548,15 @@ export function condensedUnitAdvancesPx(
   let offset = 0;
   const list = units.kind === 'natural-clusters' ? units.clusters : units.cells;
   const advances = list.map((unit) => {
-    const end = offset + unit.text.length;
-    const adjustmentsPx = unitPunctuationCompressionPt(seg, offset, end) * scale
-      + widthBalanceSpaceAdjustmentForTextPt(seg, unit.text, grid) * scale * charScale;
-    offset = end;
+    const start = offset;
+    offset += unit.text.length;
     return units.kind === 'natural-clusters'
       ? unit.advancePx * charScale
         + countedSpacingAdvance(
           countSpacingCharacters(unit.text), gridPx, spacingPx, gridPx + spacingPx,
         )
-        + adjustmentsPx
-      : unit.advancePx + adjustmentsPx;
+        + condensedCharacterAdjustmentPx(seg, grid, scale, start, offset)
+      : unit.advancePx;
   });
   if (offset !== seg.text.length) {
     throw new Error('Condensed advance units do not cover their segment');
@@ -550,14 +565,15 @@ export function condensedUnitAdvancesPx(
 }
 
 
-/** Whether {@link condensedUnitAdvancesPx} reaches the floor: a negative unit,
- * or a vertical cell the planner already floored. */
+/** Whether {@link condensedUnitAdvancesPx} reaches the floor: a negative
+ * horizontal unit, or a vertical cell the planner floored. */
 export function condensedUnitsFloor(
   units: CondensedAdvanceUnits,
   advances: readonly number[],
 ): boolean {
-  return advances.some((advance, index) => advance < 0
-    || (units.kind === 'vertical-cells' && units.cells[index]!.advancePx === 0));
+  return units.kind === 'vertical-cells'
+    ? units.cells.some((cell) => cell.floored === true)
+    : advances.some((advance) => advance < 0);
 }
 
 

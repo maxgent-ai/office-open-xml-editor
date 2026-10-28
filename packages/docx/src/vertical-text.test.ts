@@ -68,6 +68,35 @@ describe('planVerticalRunWithCapability (retained vertical paint geometry)', () 
     expect(planVerticalRunWithCapability(ctx, 'MM', 10, -2).map(c => c.text)).toEqual(['MM']);
   });
 
+  // The floor covers each character's punctuation compression / width balance
+  // supplied by acquisition, whatever their sign.
+  it('floors vertical cells together with their character adjustments', () => {
+    const { ctx } = mockCtx();
+    ctx.measureText = (text: string) => ({
+      width: [...text].reduce((sum, c) => sum + (c === 'M' ? 20 : c === ' ' ? 12 : 10), 0),
+    } as TextMetrics);
+    const positive = planVerticalRunWithCapability(
+      ctx, '  ', 10, -30, 1, false, () => false, 'vertical-rl', 0, () => 5,
+    );
+    expect(positive.map(c => [c.advancePt, c.floored ?? false])).toEqual([[0, true], [0, true]]);
+    const balanced = planVerticalRunWithCapability(
+      ctx, 'M  ', 10, -11, 1, false, () => false, 'vertical-rl', 0,
+      (start, end) => (start === 0 && end === 1 ? 0 : -2),
+    );
+    expect(balanced.map(c => [c.text, c.advancePt])).toEqual([['M', 9], [' ', 0], [' ', 0]]);
+  });
+
+  it('keeps cursive joins when a floored sideways piece splits', () => {
+    const { ctx } = mockCtx();
+    ctx.measureText = (text: string) => ({
+      width: [...text].filter(c => c !== '\u200D').length * 10,
+    } as TextMetrics);
+    const cells = planVerticalRunWithCapability(ctx, 'بيت', 10, -30);
+    expect(cells.map(c => [c.text, c.joiners ?? null])).toEqual([
+      ['ب\u200D', 'after'], ['\u200Dي\u200D', 'both'], ['\u200Dت', 'before'],
+    ]);
+  });
+
   it('retains the font em-box cross-axis correction for a sideways phone number', () => {
     const { ctx } = mockCtx({
       fontBoundingBoxAscent: 10,

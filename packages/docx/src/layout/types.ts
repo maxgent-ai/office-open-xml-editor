@@ -1,3 +1,4 @@
+import type { PaintJoiners } from '../cursive-joins.js';
 import type { NoteSourceContinuation } from './body-layout-kernel.js';
 import type { LineBoundary } from '../line-layout.js';
 import type { ParagraphFragmentCursor } from './paragraph-pagination.js';
@@ -360,7 +361,7 @@ export interface TextPaintOp {
    * one piece of a cursive word split by WORD_CONDENSED_SPACING_ADVANCE_FLOOR
    * and keeps its joined form across that paint boundary. `text` is exactly
    * the source slice with these joiners. */
-  readonly joiners?: 'before' | 'after' | 'both';
+  readonly joiners?: PaintJoiners;
   /** WORD_CONDENSED_SPACING_ADVANCE_FLOOR: this operation draws one cluster
    * whose advance took the zero floor; its glyph's natural advance. RTL paint
    * anchors the glyph's trailing (left) edge on the pen with it. */

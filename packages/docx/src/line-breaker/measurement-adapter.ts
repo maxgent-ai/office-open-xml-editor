@@ -5,6 +5,7 @@ import { calcEffectiveFontPx, semanticSlotStartIndex } from '../layout/text.js';
 import {
   charScaleFactor,
   CONDENSED_CONTEXT_GRAPHEMES,
+  condensedCharacterAdjustmentPx,
   condensedSpacingMayFloor,
   contextualGraphemeAdvances,
   segLetterSpacingPx,
@@ -229,12 +230,16 @@ export class LineMeasurementAdapter {
         charScale: charScaleFactor(segment),
         growTrRotateInk: true,
         writingMode: 'vertical-rl',
+        characterAdjustmentPt: (from, to) => condensedCharacterAdjustmentPx(
+          segment, grid, this.scale, start + from, start + to,
+        ),
       });
       return {
         kind: 'vertical-cells',
         cells: cells.map((cell) => ({
           text: text.slice(cell.range.start, cell.range.end),
           advancePx: cell.advancePt,
+          ...(cell.floored ? { floored: true } : {}),
         })),
       };
     }
