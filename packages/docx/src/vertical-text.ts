@@ -1,6 +1,5 @@
 import { graphemeClusterOffsets } from '@silurus/ooxml-core';
-import { CONDENSED_CONTEXT_GRAPHEMES, textSpacingAdvance } from './character-spacing.js';
-import { cursiveJoinContext, withPaintJoiners, type PaintJoiners } from './cursive-joins.js';
+import { CONDENSED_CONTEXT_GRAPHEMES, hasCursiveJoining, textSpacingAdvance } from './character-spacing.js';
 // ECMA-376 §17.6.20 vertical writing (`<w:textDirection w:val="tbRl">`) — the
 // glyph-level primitives for rendering a page that has been laid out in the
 // SWAPPED logical coordinate space and rotated +90° into physical space by the
@@ -237,10 +236,9 @@ export interface PlannedVerticalGlyphCell {
   readonly drawOffsetPt: Readonly<{ xPt: number; yPt: number }>;
   readonly verticalFeature: boolean;
   readonly blockAxisInkBounds?: Readonly<{ startPt: number; endPt: number }>;
-  /** WORD_CONDENSED_SPACING_ADVANCE_FLOOR took this cell's advance to zero. */
+  /** WORD_CONDENSED_SPACING_ADVANCE_FLOOR took this cell's advance (or, for
+   * an unsplit cursive piece, one of its graphemes' advances) to zero. */
   readonly floored?: true;
-  /** Synthetic U+200D in `text` (a floored split of a cursive sideways piece). */
-  readonly joiners?: PaintJoiners;
 }
 
 function plannedVerticalBlockAxisInkBounds(
@@ -360,11 +358,13 @@ export function planVerticalRunWithCapability(
   let ax = 0;
   let sourceOffset = 0;
   const charSpacingPt = letterSpacingPt - characterGridDeltaPt;
-  // WORD_CONDENSED_SPACING_ADVANCE_FLOOR: no character advance below zero.
-  // `characterAdjustmentPt` (punctuation compression and width balance of a
-  // source range) joins the floored advance when the caller supplies it; the
-  // reported advances then include it. Unfloored cells keep their centring.
-  const mayFloor = letterSpacingPt < 0 || characterGridDeltaPt < 0;
+  // WORD_CONDENSED_SPACING_ADVANCE_FLOOR, only when acquisition opts in by
+  // supplying `characterAdjustmentPt` (punctuation compression and width
+  // balance of a source range, floored with the cell): no character advance
+  // below zero, and the reported advances include the adjustment. Without it
+  // the plan is the ordinary unfloored one. Unfloored cells keep their centring.
+  const mayFloor = characterAdjustmentPt !== undefined
+    && (letterSpacingPt < 0 || characterGridDeltaPt < 0);
   const unitAdvance = (unit: string, start: number, scaledNaturalPt: number): Readonly<{
     advancePt: number;
     cellPt: number;
@@ -373,11 +373,10 @@ export function planVerticalRunWithCapability(
     const spacedPt = scaledNaturalPt
       + textSpacingAdvance(unit, characterGridDeltaPt, charSpacingPt, letterSpacingPt);
     if (!mayFloor) return { advancePt: spacedPt, cellPt: spacedPt, floored: false };
-    const rawPt = spacedPt + (characterAdjustmentPt?.(start, start + unit.length) ?? 0);
+    const rawPt = spacedPt + characterAdjustmentPt!(start, start + unit.length);
     if (rawPt < 0) return { advancePt: 0, cellPt: 0, floored: true };
-    return { advancePt: characterAdjustmentPt ? rawPt : spacedPt, cellPt: spacedPt, floored: false };
+    return { advancePt: rawPt, cellPt: spacedPt, floored: false };
   };
-  const joinsAt = mayFloor ? cursiveJoinContext(text) : undefined;
   for (const piece of splitVerticalOrientationRuns(text)) {
     if (piece.mode === 'sideways') {
       const drawOffsetPt = { xPt: 0, yPt: emBoxCenterPt };
@@ -386,8 +385,9 @@ export function planVerticalRunWithCapability(
       // Contextual grapheme advances (bounded preceding context, as line
       // fitting measures them): an over-condensed cluster stops the pen at its
       // floor, which a shared Canvas letterSpacing cannot express, so the
-      // piece then paints each cluster from its own origin, keeping cursive
-      // joins across the new boundaries.
+      // piece then paints each cluster from its own origin. Cursive text stays
+      // one contextual cell (Canvas does not track inside cursive scripts)
+      // advancing by its graphemes' floored sum.
       const units = mayFloor
         ? offsets.slice(0, -1).map((start, index) => {
             const end = offsets[index + 1]!;
@@ -400,19 +400,25 @@ export function planVerticalRunWithCapability(
             };
           })
         : [];
-      const splitPiece = units.some((unit) =>
-        unitAdvance(unit.text, unit.start, unit.naturalPt * charScale).floored);
+      const unitPlaces = units.map((unit) => unitAdvance(unit.text, unit.start, unit.naturalPt * charScale));
+      const floors = unitPlaces.some((placed) => placed.floored);
+      const cursive = floors && hasCursiveJoining(piece.text);
+      const splitPiece = floors && !cursive;
       for (const { text: unit, start, naturalPt } of splitPiece
         ? units
         : [{ text: piece.text, start: sourceOffset, naturalPt: ctx.measureText(piece.text).width }]) {
-        const placed = unitAdvance(unit, start, naturalPt * charScale);
-        const joiners = splitPiece ? joinsAt?.(start, start + unit.length) : undefined;
+        const placed = cursive
+          ? {
+              advancePt: unitPlaces.reduce((sum, unitPlaced) => sum + unitPlaced.advancePt, 0),
+              floored: true,
+            }
+          : unitAdvance(unit, start, naturalPt * charScale);
         const blockAxisInkBounds = plannedVerticalBlockAxisInkBounds(
           ctx, unit, 'sideways', drawOffsetPt, charScale, writingMode, false,
         );
         cells.push({
           range: { start, end: start + unit.length },
-          text: withPaintJoiners(unit, joiners),
+          text: unit,
           orientation: 'sideways',
           originPt: ax,
           advancePt: placed.advancePt,
@@ -420,7 +426,6 @@ export function planVerticalRunWithCapability(
           verticalFeature: false,
           ...(blockAxisInkBounds ? { blockAxisInkBounds } : {}),
           ...(placed.floored ? { floored: true as const } : {}),
-          ...(joiners ? { joiners } : {}),
         });
         ax += placed.advancePt;
       }

@@ -16,7 +16,6 @@ import {
 } from './affine.js';
 import { canvasPaintFrame } from './deferred-paint-frame.js';
 import { applyCanvasTransform } from './canvas-transform.js';
-import { withPaintJoiners } from '../cursive-joins.js';
 
 function validateTextSlices(placement: import('../layout/types.js').TextPlacement): void {
   const optionalGlyph = placement.optionalHyphenGlyph === true;
@@ -54,12 +53,7 @@ function validateTextSlices(placement: import('../layout/types.js').TextPlacemen
   let previousEnd = placement.range.start;
   for (const op of placement.paintOps) {
     const invalidTextMapping = !optionalGlyph && op.sourceMapping !== 'kashida'
-      && (op.joiners === undefined
-        ? op.text.length !== op.range.end - op.range.start
-        : op.text !== withPaintJoiners(
-          placement.text.slice(op.range.start - placement.range.start, op.range.end - placement.range.start),
-          op.joiners,
-        ));
+      && op.text.length !== op.range.end - op.range.start;
     const invalidGeometry = !Number.isFinite(op.offset.xPt) || !Number.isFinite(op.offset.yPt)
       || (op.glyphOffsetPt !== undefined
         && (!Number.isFinite(op.glyphOffsetPt.xPt) || !Number.isFinite(op.glyphOffsetPt.yPt)))

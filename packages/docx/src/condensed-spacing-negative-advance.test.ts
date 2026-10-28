@@ -4,7 +4,6 @@ import { segAdvanceWidth, type CondensedAdvanceUnits, type LayoutTextSeg } from 
 import { LineMeasurementAdapter } from './line-breaker/measurement-adapter.js';
 import { paintLayoutPage } from './paint/canvas-page.js';
 import { planVerticalRunWithCapability } from './vertical-text.js';
-import { cursiveJoinContext } from './cursive-joins.js';
 import type { VerticalGlyphMeasurementService } from './layout/measurement-capabilities.js';
 import { makeRecordingCanvas } from './test-support/recording-canvas.test-support.js';
 import type { LineLayout, TextPlacement } from './layout/types.js';
@@ -107,9 +106,10 @@ describe('#1975 condensed w:spacing larger than the glyph advance', () => {
     expect(byText(line!, 'CD').bounds.xPt).toBeCloseTo(byText(line!, 'AB').bounds.xPt + 24, 9);
     const offsets = run.clusters.map((c) => [c.offset.xPt, c.advancePt]);
     expect(offsets).toEqual(text === 'Mi' ? [[0, 4], [4, 0]] : [[0, 0], [0, 4]]);
-    // The unfloored M keeps native letterSpacing; the floored i is separate.
+    // The unfloored M keeps native letterSpacing; the floored i is separate
+    // and carries no internal pitch.
     expect(run.paintOps.map((op) => [op.text, op.offset.xPt, op.letterSpacingPt]))
-      .toEqual(text === 'Mi' ? [['M', 0, -6], ['i', 4, -6]] : [['i', 0, -6], ['M', 0, -6]]);
+      .toEqual(text === 'Mi' ? [['M', 0, -6], ['i', 4, 0]] : [['i', 0, 0], ['M', 0, -6]]);
   });
 
   it('floors a condensed space run', () => {
@@ -203,52 +203,32 @@ describe('#1975 condensed floor in right-to-left text', () => {
     expect(byText(line!, 'גד').bounds.xPt + 20).toBeCloseTo(run.bounds.xPt, 9);
   });
 
-  it('keeps joined forms on both sides of every paint boundary a floor creates', () => {
+  it('keeps a floored cursive run as one contextual operation', () => {
+    // Splitting would break the joined forms; Canvas does not track inside
+    // cursive scripts, so only the advance is floored.
     const [line] = lines([para(
-      [textRun('بيت', { rtl: true, charSpacing: -6 })],
+      [textRun('بيت', { rtl: true, charSpacing: -6 }), textRun('من', { rtl: true })],
       { bidi: true } as Partial<DocParagraph>,
     )]);
-    expect(byText(line!, 'بيت').paintOps.map((op) => [op.text, op.joiners ?? null]))
-      .toEqual([['ب\u200D', 'after'], ['\u200Dي\u200D', 'both'], ['\u200Dت', 'before']]);
+    const run = byText(line!, 'بيت');
+    expect(run.paintOps.map((op) => op.text)).toEqual(['بيت']);
+    // ب 10 → 4, ي 4 → 0, ت 10 → 4.
+    expect(run.advancePt).toBeCloseTo(8, 9);
+    expect(run.clusters.map((c) => c.advancePt)).toEqual([4, 0, 4]);
   });
 
-  it('keeps an authored joiner apart from the synthetic ones', () => {
-    // The final cluster 'ي\u200D' carries an authored ZWJ.
-    const [line] = lines([para(
-      [textRun('مي\u200D', { rtl: true, charSpacing: -6 })],
-      { bidi: true } as Partial<DocParagraph>,
-    )]);
-    const ops = byText(line!, 'مي\u200D').paintOps;
-    expect(ops.map((op) => [op.text, op.joiners ?? null]))
-      .toEqual([['م\u200D', 'after'], ['\u200Dي\u200D', 'before']]);
-  });
-
-  it('paints joined operations through retained-slice validation', async () => {
-    for (const text of ['بيت', 'مي\u200D', 'بيت ']) {
-      const layout = layoutOf([para(
-        [textRun(text, { rtl: true, charSpacing: -6 })],
-        { bidi: true } as Partial<DocParagraph>,
-      )]);
-      const { canvas, fills } = makeRecordingCanvas();
-      await paintLayoutPage(layout, 0, canvas, { dpr: 1, scale: 1 });
-      expect(fills.some((fill) => fill.text.includes('\u200D'))).toBe(true);
-    }
-  });
-
-  it('anchors a floored RTL glyph by the width it draws', () => {
-    // After U+0640 the stub draws alif 4 pt wider: its bounded contextual
-    // advance is 14 pt, but its own operation draws '\u200Dا' (10 pt).
+  it('paints a floored non-cursive cluster without internal pitch', async () => {
     const layout = layoutOf([para(
-      [textRun('\u0640ا', { rtl: true, charSpacing: -20 })],
+      [textRun('מיא', { rtl: true, charSpacing: -6 })],
       { bidi: true } as Partial<DocParagraph>,
-    )], true);
+    )]);
     const node = layout.pages[0]!.layers.body[0]!;
     if (node.kind !== 'paragraph') throw new Error('expected a paragraph');
-    const ops = byText(node.lines[0]!, '\u0640ا').paintOps;
-    const alif = ops.find((op) => op.text.endsWith('ا'))!;
-    expect(alif.naturalAdvancePt).toBe(10);
-    // Both glyphs stack at the zero-width segment: alif ends on the pen.
-    expect(alif.offset.xPt + alif.naturalAdvancePt!).toBeCloseTo(0, 9);
+    const ops = byText(node.lines[0]!, 'מיא').paintOps;
+    expect(ops.map((op) => [op.text, op.letterSpacingPt])).toEqual([['מ', -6], ['י', 0], ['א', -6]]);
+    expect(ops.find((op) => op.text === 'י')?.naturalAdvancePt).toBe(4);
+    const { canvas } = makeRecordingCanvas();
+    await expect(paintLayoutPage(layout, 0, canvas, { dpr: 1, scale: 1 })).resolves.not.toThrow();
   });
 
   it('does not open a gap for trailing whitespace', () => {
@@ -329,18 +309,6 @@ describe('segAdvanceWidth condensed floor', () => {
     const units = natural([['M', 10], ['i', 4]]);
     expect(segAdvanceWidth(seg('Mi', -2), 14, undefined, 1, units)).toBe(10);
     expect(segAdvanceWidth(seg('Mi', 3), 14, undefined, 1)).toBe(20);
-  });
-});
-
-describe('cursive join context', () => {
-  it('joins across transparent runs in linear time', () => {
-    const marks = '\u064B'.repeat(50_000);
-    const text = `ب${marks}ت`;
-    const joinsAt = cursiveJoinContext(text);
-    expect(joinsAt(0, 1)).toBe('after');
-    expect(joinsAt(1 + marks.length, text.length)).toBe('before');
-    expect(joinsAt(1, 2)).toBeUndefined();
-    expect(cursiveJoinContext('اب')(1, 2)).toBeUndefined();
   });
 });
 

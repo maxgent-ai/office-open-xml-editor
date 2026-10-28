@@ -10,7 +10,10 @@ export type SourceOwnedTextGeometry = Omit<TextPlacement, 'paintOps'> & Readonly
 
 export function sourceOwnedTextPlacements(placement: TextPlacement): readonly SourceOwnedTextGeometry[] {
   const { paintOps, trailingSpaceCompressionPt, ...geometry } = placement;
-  const unreduced = { ...geometry, letterSpacingPt: paintOps[0]?.letterSpacingPt ?? 0 };
+  // A floored single-cluster operation (WORD_CONDENSED_SPACING_ADVANCE_FLOOR)
+  // paints without pitch; the run's tracking is that of its other operations.
+  const tracked = paintOps.find((operation) => operation.naturalAdvancePt === undefined) ?? paintOps[0];
+  const unreduced = { ...geometry, letterSpacingPt: tracked?.letterSpacingPt ?? 0 };
   const projected = trailingSpaceCompressionPt === undefined
     ? unreduced : { ...unreduced, trailingSpaceCompressionPt };
   if (!placement.sourceRuns) return [projected];

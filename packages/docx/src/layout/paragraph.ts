@@ -1,4 +1,9 @@
-import { countedSpacingAdvance, countSpacingCharacters, textSpacingAdvance } from '../character-spacing.js';
+import {
+  countedSpacingAdvance,
+  countSpacingCharacters,
+  hasCursiveJoining,
+  textSpacingAdvance,
+} from '../character-spacing.js';
 import { ownValue } from '@silurus/ooxml-core/internal/own-key';
 import {
   charSpacingDeltaPx,
@@ -81,7 +86,6 @@ import {
   type SegStretch,
 } from '../text-distribute.js';
 import { computeKashidaDistribution, type KashidaLevel } from '../kashida-justify.js';
-import { cursiveJoinContext, withPaintJoiners } from '../cursive-joins.js';
 import { imageResourceKey, vmlPictureResourceKey, vmlStrokeResourceKey, vmlEdgeResourceKey } from './source-key.js';
 import { stableFingerprint } from './fingerprint.js';
 import { chartResourceKey as canonicalChartResourceKey } from './source-key.js';
@@ -438,9 +442,9 @@ function kashidaLevel(alignment: string | undefined): KashidaLevel | null {
   return null;
 }
 
-/** Width of the string a floored operation draws (its glyph and any
- * synthetic joiners), for anchoring the glyph's trailing edge on the pen in
- * RTL paint. Allocation uses the bounded contextual advance instead. */
+/** Width of the cluster a floored operation draws, for anchoring the glyph's
+ * trailing edge on the pen in RTL paint. Allocation uses the bounded
+ * contextual advance instead. Floored operations are never cursive. */
 function drawnGlyphAdvancePt(
   segment: LayoutTextSeg,
   drawnText: string,
@@ -563,24 +567,6 @@ function keepGraphemeSafeCuts(
 /** Merge sorted gap, cluster and paint-op boundaries. Every cursor only moves
  * forward: O(code points + clusters + gaps + operations), including long runs
  * of consecutive spaces. Deltas are owned by the accepted line's gap plan. */
-/** A justification slice of an operation carrying synthetic joiners: the
- * source slice, keeping a joiner only on an outer side the slice still owns. */
-function joinedSlice(
-  operation: TextPaintOp,
-  segmentText: string,
-  segmentStart: number,
-  start: number,
-  end: number,
-): Pick<TextPaintOp, 'text' | 'joiners'> {
-  const before = start === operation.range.start
-    && (operation.joiners === 'before' || operation.joiners === 'both');
-  const after = end === operation.range.end
-    && (operation.joiners === 'after' || operation.joiners === 'both');
-  const joiners = before && after ? 'both' : before ? 'before' : after ? 'after' : undefined;
-  const text = withPaintJoiners(segmentText.slice(start - segmentStart, end - segmentStart), joiners);
-  return joiners ? { text, joiners } : { text };
-}
-
 function retainedTextGeometry(
   segment: MeasuredTextPlanSegment,
   stretch: SegStretch | undefined,
@@ -663,12 +649,9 @@ function retainedTextGeometry(
         throw new Error('Internal paragraph justification is missing retained slice geometry');
       }
       const end = Math.min(operation.range.end, absoluteCuts[gapCursor] ?? operation.range.end);
-      const { joiners: _joiners, ...unjoined } = operation;
       paintOps.push({
-        ...unjoined,
-        ...(operation.joiners === undefined
-          ? { text: operation.text.slice(start - operation.range.start, end - operation.range.start) }
-          : joinedSlice(operation, segment.text, segment.range.start, start, end)),
+        ...operation,
+        text: operation.text.slice(start - operation.range.start, end - operation.range.start),
         range: { start, end },
         offset: start === operation.range.start
           ? { ...operation.offset, xPt: operation.offset.xPt + cumulativePt }
@@ -698,14 +681,11 @@ function retainedRtlPaintOperations(
     if (text === '' || text.length === operation.text.length) return [operation];
     if (operation.sourceMapping === 'kashida') return [{ ...operation, text }];
 
-    // Trailing whitespace never joins, so only a leading joiner can remain.
-    const leadingJoiner = operation.joiners === 'before' || operation.joiners === 'both' ? 1 : 0;
-    const trailingStart = operation.range.start + text.length - leadingJoiner;
+    const trailingStart = operation.range.start + text.length;
     const trailingCluster = clusters.find((cluster) => cluster.range.start === trailingStart);
     const {
       inkBounds: _inkBounds,
       blockAxisInkBounds: _blockAxisInkBounds,
-      joiners: _joiners,
       ...zeroInkOperation
     } = operation;
     return [
@@ -2639,7 +2619,10 @@ function textPlanSegment(
     ?.some((compression) => compression.end < segment.text.length) ?? false;
   // A floored cluster cannot share Canvas letterSpacing with its neighbours:
   // its pen must stop at the floor, so it paints from its own retained origin.
-  const hasFlooredClusters = flooredClusterNaturalPt.size > 0;
+  // Cursive text stays one contextual operation: splitting it would break its
+  // joined forms, and Canvas applies no tracking inside cursive scripts, so
+  // its paint is untracked whatever the pitch (only its advance is floored).
+  const hasFlooredClusters = flooredClusterNaturalPt.size > 0 && !hasCursiveJoining(segment.text);
   const clusterOriginPaintOps = !segment.verticalRun && !segment.tateChuYoko
     && (hasInternalPunctuationCompression || hasFlooredClusters);
   const unpaddedPaintOps = segment.verticalRun
@@ -2651,7 +2634,6 @@ function textPlanSegment(
         return (flooredVerticalCells ?? verticalCells ?? []).map((cell) => ({
           ...template,
           text: cell.text,
-          ...(cell.joiners ? { joiners: cell.joiners } : {}),
           range: {
             start: sourceOffset + cell.range.start,
             end: sourceOffset + cell.range.end,
@@ -2714,25 +2696,19 @@ function textPlanSegment(
                 });
               }
             }
-            // Pieces of a cursive word split around a floored cluster keep
-            // their joined forms on both sides of every new boundary.
-            const joinsAt = hasFlooredClusters ? cursiveJoinContext(segment.text) : undefined;
             return groups.map((group) => {
-              const start = group.start - sourceOffset;
-              const end = group.end - sourceOffset;
-              const text = segment.text.slice(start, end);
-              const joiners = joinsAt?.(start, end);
+              const text = segment.text.slice(group.start - sourceOffset, group.end - sourceOffset);
               return {
                 ...template,
-                text: withPaintJoiners(text, joiners),
+                text,
                 range: { start: group.start, end: group.end },
                 offset: group.offset,
-                letterSpacingPt: pitchPt + (group.adjustmentPt ?? 0),
-                ...(joiners ? { joiners } : {}),
+                // A floored operation draws one cluster: no internal pitch,
+                // and its glyph stays on its own origin in either direction.
+                letterSpacingPt: group.floored ? 0 : pitchPt + (group.adjustmentPt ?? 0),
                 ...(group.floored
                   ? { naturalAdvancePt: drawnGlyphAdvancePt(
-                      segment, withPaintJoiners(text, joiners), scaleX,
-                      flooredClusterNaturalPt.get(group.start)!,
+                      segment, text, scaleX, flooredClusterNaturalPt.get(group.start)!,
                     ) }
                   : {}),
               };

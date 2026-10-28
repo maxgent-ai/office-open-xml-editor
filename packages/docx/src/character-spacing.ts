@@ -1,3 +1,5 @@
+import { joiningType } from '@silurus/ooxml-core/internal/joining-type';
+
 /** ECMA-376 §17.3.2.35 adds pitch after each rendered character. For run
  * tracking, combining marks (\p{M}) get no w:spacing, even when
  * §17.3.2.26 font-slot selection splits a mark from its base. Unselected U+00AD
@@ -65,5 +67,16 @@ export function condensedClusterFloorPx(
  * cluster for its contextual advance (pair kerning, cursive joining and
  * ligature context), so floor probes stay linear in the text length. */
 export const CONDENSED_CONTEXT_GRAPHEMES = 4;
+
+/** Whether `text` contains a character that joins cursively (Unicode
+ * Joining_Type D, R, L or C). Canvas applies no tracking inside cursive
+ * scripts, so a floored cursive run is painted as one contextual operation. */
+export function hasCursiveJoining(text: string): boolean {
+  for (const character of text) {
+    const type = joiningType(character.codePointAt(0)!);
+    if (type === 'D' || type === 'R' || type === 'L' || type === 'C') return true;
+  }
+  return false;
+}
 
 const COMBINING_MARK = /^\p{M}$/u;

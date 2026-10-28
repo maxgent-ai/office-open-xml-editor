@@ -50,22 +50,27 @@ describe('planVerticalRunWithCapability (retained vertical paint geometry)', () 
     ]);
   });
 
-  // #1975 WORD_CONDENSED_SPACING_ADVANCE_FLOOR: an over-condensed character
-  // advances zero; a sideways piece that floors paints per cluster.
+  // #1975 WORD_CONDENSED_SPACING_ADVANCE_FLOOR: with acquisition's opt-in an
+  // over-condensed character advances zero; a sideways piece that floors
+  // paints per cluster. Without it the plan is the ordinary unfloored one.
   it('floors over-condensed vertical cells at zero advance', () => {
+    const floor = () => 0;
     const { ctx } = mockCtx();
     ctx.measureText = (text: string) => ({
       width: [...text].reduce((sum, c) => sum + (c === 'i' ? 4 : 10), 0),
     } as TextMetrics);
-    const cells = planVerticalRunWithCapability(ctx, 'Mi字字', 10, -6);
+    const cells = planVerticalRunWithCapability(ctx, 'Mi字字', 10, -6, 1, false, () => false, 'vertical-rl', 0, floor);
     expect(cells.map(c => [c.text, c.orientation, c.advancePt])).toEqual([
       ['M', 'sideways', 4], ['i', 'sideways', 0], ['字', 'upright', 4], ['字', 'upright', 4],
     ]);
     expect(cells.map(c => c.originPt)).toEqual([0, 4, 6, 10]);
-    const deep = planVerticalRunWithCapability(ctx, '字', 10, -30);
+    const deep = planVerticalRunWithCapability(ctx, '字', 10, -30, 1, false, () => false, 'vertical-rl', 0, floor);
     expect(deep[0]!.advancePt).toBe(0);
     // Unfloored pieces keep one contextual operation.
-    expect(planVerticalRunWithCapability(ctx, 'MM', 10, -2).map(c => c.text)).toEqual(['MM']);
+    expect(planVerticalRunWithCapability(ctx, 'MM', 10, -2, 1, false, () => false, 'vertical-rl', 0, floor)
+      .map(c => c.text)).toEqual(['MM']);
+    // No opt-in (e.g. fitText's own allocation): the ordinary signed plan.
+    expect(planVerticalRunWithCapability(ctx, '字', 10, -30)[0]!.advancePt).toBe(-20);
   });
 
   // The floor covers each character's punctuation compression / width balance
@@ -86,15 +91,15 @@ describe('planVerticalRunWithCapability (retained vertical paint geometry)', () 
     expect(balanced.map(c => [c.text, c.advancePt])).toEqual([['M', 9], [' ', 0], [' ', 0]]);
   });
 
-  it('keeps cursive joins when a floored sideways piece splits', () => {
+  it('keeps a floored cursive sideways piece as one cell advancing by its floored sum', () => {
     const { ctx } = mockCtx();
     ctx.measureText = (text: string) => ({
-      width: [...text].filter(c => c !== '\u200D').length * 10,
+      width: [...text].reduce((sum, c) => sum + (c === 'ي' ? 4 : 10), 0),
     } as TextMetrics);
-    const cells = planVerticalRunWithCapability(ctx, 'بيت', 10, -30);
-    expect(cells.map(c => [c.text, c.joiners ?? null])).toEqual([
-      ['ب\u200D', 'after'], ['\u200Dي\u200D', 'both'], ['\u200Dت', 'before'],
-    ]);
+    const cells = planVerticalRunWithCapability(
+      ctx, 'بيت', 10, -6, 1, false, () => false, 'vertical-rl', 0, () => 0,
+    );
+    expect(cells.map(c => [c.text, c.advancePt, c.floored ?? false])).toEqual([['بيت', 8, true]]);
   });
 
   it('retains the font em-box cross-axis correction for a sideways phone number', () => {

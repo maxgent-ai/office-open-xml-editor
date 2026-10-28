@@ -1,4 +1,3 @@
-import type { PaintJoiners } from '../cursive-joins.js';
 import type { WritingMode } from './types.js';
 
 /** Canvas capabilities that retained layout may use synchronously.
@@ -45,6 +44,5 @@ export interface VerticalGlyphMeasurementService {
     verticalFeature: boolean;
     blockAxisInkBounds?: Readonly<{ startPt: number; endPt: number }>;
     floored?: true;
-    joiners?: PaintJoiners;
   }>[];
 }
