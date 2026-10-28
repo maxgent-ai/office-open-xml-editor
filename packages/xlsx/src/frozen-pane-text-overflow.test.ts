@@ -89,7 +89,7 @@ function intersect(a: Rect, b: Rect): Rect {
 
 /** A canvas double that records painted text and vertical lines together with
  *  the clip rectangle in force, so each pane's visible output can be read. */
-function recordingContext(): {
+function recordingContext(width = 600): {
   ctx: CanvasRenderingContext2D;
   texts: TextPaint[];
   lines: LinePaint[];
@@ -103,7 +103,7 @@ function recordingContext(): {
   let start: { x: number; y: number } | null = null;
   let segments: Array<{ x1: number; x2: number }> = [];
   const state: Record<string, unknown> = {
-    canvas: { width: 600, height: 60 },
+    canvas: { width, height: 60 },
     fillStyle: '#000000',
     strokeStyle: '#000000',
     lineWidth: 1,
@@ -237,6 +237,22 @@ describe('text overflow across a frozen-column boundary', () => {
     expect(frozenX[1]).toBe(frozenX[0]);
   });
 
+  it('spills past a value in a hidden column, as paint does', () => {
+    // D1 is populated but its column is hidden (zero width); paint walks
+    // only visible columns, so B1 continues into the scrollable pane at E.
+    const { ctx, texts } = recordingContext();
+    const ws = {
+      ...worksheet([cell(2, LONG), cell(4, 'hidden')]),
+      colWidths: { 4: 0 },
+    } as Worksheet;
+    renderViewport(ctx, ws, STYLES, { row: 1, col: 5, rows: 1, cols: 6 },
+      { width: 600, height: 60, freezeCols: 3 });
+    const { frozen, scroll } = paneSplit(texts, LONG);
+    expect(frozen).toHaveLength(1);
+    expect(scroll).toHaveLength(1);
+    expect(scroll[0].x).toBe(frozen[0].x);
+  });
+
   it('honours a column-inherited alignment when spilling into the frozen pane', () => {
     // E1 has no own style; column E is right-aligned (§18.3.1.13).
     const { ctx, texts } = recordingContext();
@@ -288,6 +304,21 @@ describe('text overflow across a frozen-column boundary', () => {
     const painted = texts.filter((t) => t.text === LONG && t.clip.w > 0);
     expect(painted).toHaveLength(2);
     expect(painted[0].x).toBe(painted[1].x);
+  });
+
+  it('reports a frozen value beyond the canvas with frozen-pane geometry', () => {
+    // A:J are frozen but only part of them fits the canvas. E1 still belongs
+    // to the frozen pane, whatever the canvas cuts off.
+    const runs: XlsxTextRunInfo[] = [];
+    const { ctx, texts } = recordingContext(240);
+    renderViewport(ctx, worksheet([cell(5, RIGHT, RIGHT_XF)]), STYLES,
+      { row: 1, col: 11, rows: 1, cols: 4 },
+      { width: 240, height: 60, freezeCols: 10, onTextRun: (run) => runs.push(run) });
+
+    expect(runs.map((run) => run.cellRef)).toEqual(['E1']);
+    const columnPx = headerX(texts, 'B') - headerX(texts, 'A');
+    const columnA = headerX(texts, 'A') - columnPx / 2;
+    expect(runs[0].x).toBeCloseTo(columnA + 4 * columnPx, 6);
   });
 
   it('reports each value once, from the pane that owns its column', () => {
@@ -348,6 +379,28 @@ describe('text overflow across a frozen-column boundary', () => {
     } as Worksheet;
     renderViewport(ctx, ws, STYLES, VIEW_UNSCROLLED, { width: 600, height: 60 });
 
+    const visible = lines.filter((line) => (
+      line.x1 === line.x2 && /255,\s*0,\s*0|ff0000/i.test(line.color) && line.clip.w > 0 &&
+      line.x1 > line.clip.x && line.x1 < line.clip.x + line.clip.w
+    ));
+    expect(visible).toEqual([]);
+  });
+
+  it('keeps first-column edges of a scrolled right-to-left view without overflow', () => {
+    // No text, no freeze: C1's right border lies on its scrolled-away side.
+    // Only the viewport's own first column takes first-column edge handling.
+    const probe = recordingContext();
+    const ws = {
+      ...worksheet([{ ...cell(3, ''), styleIndex: RIGHT_BORDER_XF, value: { type: 'empty' } } as Cell]),
+      freezeCols: 0,
+      rightToLeft: true,
+    } as Worksheet;
+    renderViewport(probe.ctx, ws, STYLES, VIEW_UNSCROLLED, { width: 600, height: 60 });
+    const columnPx = headerX(probe.texts, 'E') - headerX(probe.texts, 'D');
+
+    const { ctx, lines } = recordingContext();
+    renderViewport(ctx, ws, STYLES, { row: 1, col: 3, rows: 1, cols: 6 },
+      { width: 600, height: 60, scrollOffsetX: Math.abs(columnPx) });
     const visible = lines.filter((line) => (
       line.x1 === line.x2 && /255,\s*0,\s*0|ff0000/i.test(line.color) && line.clip.w > 0 &&
       line.x1 > line.clip.x && line.x1 < line.clip.x + line.clip.w
