@@ -476,9 +476,9 @@ impl<'a> Formatting<'a> {
             return Ok(false);
         };
         let profile = self.table_style_profile(table_style.selected_style)?;
-        // A missing or wrong-kind slot (including the sprmTIstd fallback
-        // istd 0x000B, MS-DOC 2.6.3) yields an empty profile, so nothing is
-        // applied; the profile build carries the gate for unresolved ids.
+        // An empty or nonexistent sprmTIstd fallback slot 0x000B (MS-DOC
+        // 2.6.3) yields an empty profile, so nothing is applied; the profile
+        // build carries the gate for every other unresolved slot.
         // Apply the table-style base before paragraph styles and direct PAPX;
         // the normal property pipeline preserves authored zero and overrides.
         if let Some(before) = profile.paragraph_before {
@@ -1334,6 +1334,28 @@ mod tests {
         assert!(!formatting.unsupported_table_properties);
         assert!(!formatting.unsupported_character_properties);
         assert!(!formatting.unsupported_paragraph_properties);
+    }
+
+    #[test]
+    fn wrong_kind_table_normal_slot_stays_refused() {
+        // Only an empty or nonexistent 0x000B slot has the Word no-table-style
+        // observation; a slot defined with another style type stays refused.
+        let mut formatting = empty();
+        formatting.styles.resize_with(12, || None);
+        formatting.styles[11] = Some(Style {
+            base: 0xfff,
+            kind: 1,
+            chpx: &[],
+            papx: &[],
+            table: None,
+            language_compatibility: StyleLanguageCompatibility::default(),
+        });
+        assert_eq!(formatting.resolve_table_style_id(Some(0)), Some(0x000b));
+        let key = formatting
+            .table_formatting_key(Some(0x000b), None, [None; 5])
+            .unwrap();
+        assert_eq!(formatting.table_cell_shading(key).unwrap(), None);
+        assert!(formatting.unsupported_table_properties);
     }
 
     #[test]

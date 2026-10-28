@@ -319,10 +319,13 @@ impl Formatting<'_> {
             // leaves Table Normal itself undefined: Word opens such
             // documents and applies no table style (on DOCX save the tables
             // carry no w:tblStyle), so project an empty profile instead of
-            // refusing the document. An unresolved non-fallback id stays
-            // refused.
+            // refusing the document. Only an empty or nonexistent slot is
+            // covered by that observation: a 0x000B slot defined with another
+            // style type, and an unresolved non-fallback id, stay refused.
+            let undefined_default =
+                id == 0x000b && self.styles.get(id).and_then(Option::as_ref).is_none();
             return Ok(Profile {
-                unsupported_table: id != 0x000b,
+                unsupported_table: !undefined_default,
                 ..Profile::default()
             });
         }

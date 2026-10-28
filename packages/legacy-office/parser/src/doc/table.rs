@@ -24,6 +24,11 @@ pub(crate) use width::PreferredWidth;
 pub(in crate::doc) enum PreparedCellShading {
     StyleDeferred,
     Explicit(Shading),
+    /// A modern compatibility ShdAuto entry retained for an explicit Raw
+    /// ShdNil cell. Whether current Word lets it override a filled table
+    /// style is unverified, so it resolves only when the style gives the
+    /// cell no fill, where either precedence yields no fill.
+    CompatibilityAuto,
     Unsupported,
 }
 
@@ -646,10 +651,10 @@ impl Row {
     /// that interpret table styles to ignore the compatibility arrays and use
     /// the Raw arrays. Raw ShdNil and omitted entries defer to the style;
     /// ShdAuto is an explicit no-fill value. The bounded current-Word fallback
-    /// retains clear-pattern modern arrays as the fallback for explicit Raw
-    /// ShdNil — an RGB background is an explicit fill, an automatic background
-    /// the same explicit no fill the Raw arrays give ShdAuto — including when
-    /// a later compatibility replacement changes that fallback.
+    /// retains clear RGB modern arrays as the fallback for explicit Raw ShdNil,
+    /// including when a later compatibility replacement changes that fallback.
+    /// A clear automatic-background entry there is admitted only where the
+    /// style also gives the cell no fill (see [`PreparedCellShading`]).
     pub(in crate::doc) fn apply_style_aware_shading(
         &mut self,
         code: u16,
@@ -705,13 +710,19 @@ impl Row {
                             Some(value) if value.direct_facts().pattern == "nil" => {
                                 // [MS-DOC] 2.6.3 ignores these modern arrays
                                 // when table styles are understood. Nil has no
-                                // RGB fallback under the observed clear-pattern
+                                // RGB fallback under the observed clear-RGB
                                 // exception above: Raw ShdNil still delegates
                                 // to style (2.9.247), never to a guessed fill.
                                 None
                             }
-                            Some(value) if value.is_clear_pattern() => {
+                            Some(value) if value.is_clear_rgb_background() => {
                                 Some(PreparedCellShading::Explicit(value))
+                            }
+                            // [MS-DOC] 2.6.3 writes ShdAuto for non-shaded
+                            // cells of these arrays. Its fallback only agrees
+                            // with a style that gives the cell no fill.
+                            Some(value) if value.is_clear_auto_background() => {
+                                Some(PreparedCellShading::CompatibilityAuto)
                             }
                             Some(_) | None => {
                                 supported = false;
@@ -1951,10 +1962,11 @@ mod tests {
     }
 
     #[test]
-    fn modern_compatibility_clear_auto_shading_projects_explicit_no_fill() {
-        // ShdAuto (clear pattern, cvAuto colors) is an explicit no-fill value
-        // in the Raw arrays; the same value in a modern compatibility array
-        // must project identically instead of failing the whole document.
+    fn modern_compatibility_clear_auto_shading_is_a_style_checked_fallback() {
+        // [MS-DOC] 2.6.3 writes ShdAuto (clear pattern, cvAuto colors) for
+        // non-shaded cells of the compatibility arrays. It is admitted as a
+        // Raw ShdNil fallback that the story resolves against the style fill
+        // instead of failing the whole document.
         let auto = [0, 0, 0, 255, 0, 0, 0, 255, 0, 0];
         let nil = [255, 255, 255, 255, 255, 255, 255, 255, 0, 0];
         for compat in [0xd612, 0xd616, 0xd60c] {
@@ -1981,12 +1993,10 @@ mod tests {
                 0xd60c => 44,
                 _ => 0,
             };
-            assert!(matches!(
+            assert_eq!(
                 row.cells[start].prepared_shading,
-                Some(PreparedCellShading::Explicit(ref shading))
-                    if shading.direct_facts().pattern == "clear"
-                        && shading.direct_background().is_none()
-            ));
+                Some(PreparedCellShading::CompatibilityAuto)
+            );
         }
     }
 

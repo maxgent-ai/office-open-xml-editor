@@ -84,13 +84,15 @@ fn pattern(ipat: u16) -> Result<Option<&'static str>, String> {
 }
 
 impl Shading {
-    /// True when the value is the `clear` pattern (ipatAuto): its fill is
-    /// exactly its background color, so an RGB background is an explicit fill
-    /// and cvAuto is ShdAuto, which applies no shading (MS-DOC 2.9.247) —
-    /// both projectable. Patterned values are not (the renderer model keeps
-    /// only an RGB fill).
-    pub(in crate::doc) fn is_clear_pattern(&self) -> bool {
-        self.pattern == "clear"
+    pub(in crate::doc) fn is_clear_rgb_background(&self) -> bool {
+        self.pattern == "clear" && matches!(self.background, Color::Rgb(_))
+    }
+
+    /// The `clear` pattern fills with its background only, so a cvAuto
+    /// background paints nothing whatever the foreground; ShdAuto
+    /// ([MS-DOC] 2.9.247) is the canonical form.
+    pub(in crate::doc) fn is_clear_auto_background(&self) -> bool {
+        self.pattern == "clear" && self.background == Color::Auto
     }
 
     pub fn read(bytes: &[u8], old: bool) -> Result<Option<Self>, String> {
