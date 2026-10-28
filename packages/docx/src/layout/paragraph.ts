@@ -76,6 +76,7 @@ import {
   type SegStretch,
 } from '../text-distribute.js';
 import { computeKashidaDistribution, type KashidaLevel } from '../kashida-justify.js';
+import { joiningType, joinsToFollowing, joinsToPreceding } from '@silurus/ooxml-core/internal/joining-type';
 import { imageResourceKey, vmlPictureResourceKey, vmlStrokeResourceKey, vmlEdgeResourceKey } from './source-key.js';
 import { stableFingerprint } from './fingerprint.js';
 import { chartResourceKey as canonicalChartResourceKey } from './source-key.js';
@@ -432,6 +433,64 @@ function kashidaLevel(alignment: string | undefined): KashidaLevel | null {
   return null;
 }
 
+/** Whether the cluster `text[start, end)` joins cursively (Unicode
+ * Joining_Type, transparent marks skipped) to its neighbours in the same
+ * segment. A floored cluster painted on its own keeps that contextual form. */
+function cursiveJoins(text: string, start: number, end: number): Readonly<{ before: boolean; after: boolean }> {
+  const forward = (from: number, to: number): number | undefined => {
+    for (let index = from; index < to;) {
+      const cp = text.codePointAt(index)!;
+      if (joiningType(cp) !== 'T') return cp;
+      index += cp > 0xFFFF ? 2 : 1;
+    }
+    return undefined;
+  };
+  const backward = (from: number, to: number): number | undefined => {
+    for (let index = from; index > to;) {
+      const low = text.charCodeAt(index - 1);
+      const pair = low >= 0xDC00 && low <= 0xDFFF && index - 2 >= to
+        && text.charCodeAt(index - 2) >= 0xD800 && text.charCodeAt(index - 2) <= 0xDBFF;
+      index -= pair ? 2 : 1;
+      const cp = text.codePointAt(index)!;
+      if (joiningType(cp) !== 'T') return cp;
+    }
+    return undefined;
+  };
+  const first = forward(start, end);
+  const last = backward(end, start);
+  const previous = backward(start, 0);
+  const next = forward(end, text.length);
+  return {
+    before: previous !== undefined && first !== undefined
+      && joinsToFollowing(previous) && joinsToPreceding(first),
+    after: next !== undefined && last !== undefined
+      && joinsToFollowing(last) && joinsToPreceding(next),
+  };
+}
+
+/** Whether `text` shaped in `segment`'s context has a cluster whose advance
+ * reaches the WORD_CONDENSED_SPACING_ADVANCE_FLOOR. */
+function contextualTextFloors(segment: MeasuredTextPlanSegment, text: string): boolean {
+  const pitchPt = segment.basePaintOps[0]?.letterSpacingPt ?? 0;
+  const gridPt = segment.characterGridDeltaPt ?? 0;
+  if (pitchPt >= 0 && gridPt >= 0) return false;
+  if (!segment.textLayoutService || !segment.textShapeRequest) {
+    throw new Error('Kashida acquisition requires the retained TextLayoutService authority');
+  }
+  const scaleX = segment.basePaintOps[0]?.scaleX ?? 1;
+  const shaped = segment.textLayoutService.shape({
+    ...replaceTextShapeRequest(segment.textShapeRequest, text),
+    measure: true,
+    clusterGeometry: true,
+  });
+  return (shaped.clusters ?? []).some((cluster) => condensedClusterFloorPx(
+    text.slice(cluster.range.start, cluster.range.end),
+    cluster.advancePt * scaleX,
+    gridPt,
+    pitchPt - gridPt,
+  ) > 0);
+}
+
 function contextualAdvance(segment: MeasuredTextPlanSegment, text: string): number {
   if (!segment.textLayoutService || !segment.textShapeRequest) {
     throw new Error('Kashida acquisition requires the retained TextLayoutService authority');
@@ -600,7 +659,10 @@ function retainedTextGeometry(
       const end = Math.min(operation.range.end, absoluteCuts[gapCursor] ?? operation.range.end);
       paintOps.push({
         ...operation,
-        text: operation.text.slice(start - operation.range.start, end - operation.range.start),
+        // A joining-context operation is one floored cluster; never cut.
+        text: start === operation.range.start && end === operation.range.end
+          ? operation.text
+          : operation.text.slice(start - operation.range.start, end - operation.range.start),
         range: { start, end },
         offset: start === operation.range.start
           ? { ...operation.offset, xPt: operation.offset.xPt + cumulativePt }
@@ -650,6 +712,37 @@ function retainedRtlPaintOperations(
         offset: trailingCluster?.offset ?? operation.offset,
       },
     ];
+  });
+}
+
+/** WORD_CONDENSED_SPACING_ADVANCE_FLOOR in a right-to-left segment. Floored
+ * clusters paint as their own operations from logical (left-to-right) cluster
+ * origins; place every operation of such a segment visually instead. The pen
+ * runs leftwards from the segment's right edge, so an operation's left edge is
+ * the pen minus its advance, and a floored glyph's trailing (left) edge sits
+ * its natural advance left of the pen. Offsets stay relative to the paint
+ * origin, which `rtlLeadingGapPt` has already moved past trailing whitespace. */
+function flooredRtlVisualPaintOperations(
+  operations: readonly TextPaintOp[],
+  clusters: readonly TextClusterLayout[],
+  rtlLeadingGapPt: number,
+): readonly TextPaintOp[] {
+  if (!operations.some((operation) => operation.naturalAdvancePt !== undefined)) return operations;
+  const widthPt = clusters.reduce(
+    (edge, cluster) => Math.max(edge, cluster.offset.xPt + cluster.advancePt), 0,
+  );
+  return operations.map((operation) => {
+    const advancePt = operation.naturalAdvancePt ?? clusters
+      .filter((cluster) => cluster.range.start >= operation.range.start
+        && cluster.range.end <= operation.range.end)
+      .reduce((sum, cluster) => sum + cluster.advancePt, 0);
+    return {
+      ...operation,
+      offset: {
+        ...operation.offset,
+        xPt: widthPt - operation.offset.xPt - advancePt - rtlLeadingGapPt,
+      },
+    };
   });
 }
 
@@ -862,10 +955,16 @@ export function planLine(input: PlanLineInput): LineLayout {
   const applyJustify = edge === 'justify' && (!endsLogicalLine || input.stretchLastLine);
   const kashida = applyJustify ? kashidaLevel(input.alignment) : null;
   if (kashida && lineSlackPt > 0) {
-    const distribution = computeKashidaDistribution(
-      // Kashida rewrites one contextual paint operation; a segment already
-      // split into cluster-origin operations offers no elongation point.
-      segments.map((segment) => segment.kind === 'text' && segment.basePaintOps.length === 1
+    // Kashida rewrites one contextual paint operation. A segment already split
+    // into cluster-origin operations, or whose elongated text would reach the
+    // WORD_CONDENSED_SPACING_ADVANCE_FLOOR, offers no elongation point; the
+    // slack is redistributed over the remaining segments.
+    const excluded = new Set<number>();
+    const distribute = () => computeKashidaDistribution(
+      segments.map((segment, segmentIndex) => segment.kind === 'text'
+        && segment.basePaintOps.length === 1
+        && segment.basePaintOps[0]!.naturalAdvancePt === undefined
+        && !excluded.has(segmentIndex)
         ? { text: segment.text }
         : {}),
       lineSlackPt,
@@ -876,6 +975,17 @@ export function planLine(input: PlanLineInput): LineLayout {
         return contextualAdvance(segment, text);
       },
     );
+    let distribution = distribute();
+    for (;;) {
+      const floored = [...(distribution?.perSeg ?? [])]
+        .filter(([segmentIndex, plan]) => {
+          const segment = segments[segmentIndex];
+          return segment?.kind === 'text' && contextualTextFloors(segment, plan.text);
+        });
+      if (floored.length === 0) break;
+      for (const [segmentIndex] of floored) excluded.add(segmentIndex);
+      distribution = distribute();
+    }
     if (distribution) {
       segments = segments.map((segment, segmentIndex): MeasuredLinePlanSegment => {
         if (segment.kind !== 'text') return segment;
@@ -1078,15 +1188,18 @@ export function planLine(input: PlanLineInput): LineLayout {
       } = segment;
       const textGeometry = retainedTextGeometry(segment, stretch, perGapPt);
       const direction = visual.rtl[segmentIndex] ? 'rtl' : 'ltr';
-      const paintOps = direction === 'rtl'
-        ? retainedRtlPaintOperations(textGeometry.paintOps, textGeometry.clusters)
-        : textGeometry.paintOps;
       const trailingWhitespaceStart = segment.text.trimEnd().length;
       const rtlLeadingGapPt = direction === 'rtl'
         ? (style.fitText?.trailingPadPt ?? 0) + segment.clusters
             .filter((cluster) => cluster.range.start >= segment.range.start + trailingWhitespaceStart)
             .reduce((sum, cluster) => sum + cluster.advancePt, 0)
         : 0;
+      const paintOps = direction === 'rtl'
+        ? retainedRtlPaintOperations(
+            flooredRtlVisualPaintOperations(textGeometry.paintOps, textGeometry.clusters, rtlLeadingGapPt),
+            textGeometry.clusters,
+          )
+        : textGeometry.paintOps;
       // `word-run-decoration-justified-advance`
       const ownedTrailingSlackPt = stretch?.trailingGap ? stretch.trailingDelta ?? perGapPt : 0;
       const origin = { xPt: xPt + rtlLeadingGapPt, yPt: line.baselinePt };
@@ -2252,24 +2365,11 @@ function textPlanSegment(
   }
   let precedingScalars = 0;
   let precedingPitchBearing = 0;
-  // WORD_CONDENSED_SPACING_ADVANCE_FLOOR: the same per-cluster floor the
-  // breaker folded into measuredWidth (segAdvanceWidth).
-  const condensedFloors = condensedSpacingMayFloor(segment, characterGrid, 1);
-  let precedingFloorPt = 0;
-  /** Source starts of clusters whose advance took the floor. */
-  const flooredClusterStarts = new Set<number>();
   let clusters = (shapedClusters ?? []).map((cluster, index) => {
     const prefix = segment.text.slice(0, cluster.range.start);
     const text = segment.text.slice(cluster.range.start, cluster.range.end);
     const counts = countSpacingCharacters(text);
-    const clusterFloorPt = condensedFloors
-      ? condensedClusterFloorPx(text, cluster.advancePt * scaleX, gridPt, trackingPt)
-      : 0;
-    const clusterSpacingPt = countedSpacingAdvance(counts, gridPt, trackingPt, pitchPt)
-      + clusterFloorPt;
-    const clusterPrecedingFloorPt = precedingFloorPt;
-    precedingFloorPt += clusterFloorPt;
-    if (clusterFloorPt > 0) flooredClusterStarts.add(sourceOffset + cluster.range.start);
+    const clusterSpacingPt = countedSpacingAdvance(counts, gridPt, trackingPt, pitchPt);
     const prefixSpacingPt = countedSpacingAdvance(
       { scalars: precedingScalars, pitchBearing: precedingPitchBearing }, gridPt, trackingPt, pitchPt,
     );
@@ -2305,7 +2405,6 @@ function textPlanSegment(
           + (segment.leadingWordBoundaryPx ?? 0)
           + (segment.autoSpaceLeadingPx ?? 0)
           + prefixSpacingPt
-          + clusterPrecedingFloorPt
           + precedingWidthBalanceAdjustment
           + precedingPunctuationCompression,
         yPt: baselineOffsetPt,
@@ -2318,6 +2417,79 @@ function textPlanSegment(
         + clusterPunctuationCompression,
     };
   });
+  // WORD_CONDENSED_SPACING_ADVANCE_FLOOR, as measured by segAdvanceWidth: an
+  // over-condensed cluster advances zero and later clusters follow the floored
+  // pen. Vertical runs take the floor from their planned cells below.
+  /** Natural (scaled, unspaced) advance of each floored cluster, by source start. */
+  const flooredClusterNaturalPt = new Map<number, number>();
+  if (!segment.verticalRun && condensedSpacingMayFloor(segment, characterGrid, 1)
+    && clusters.some((cluster) => cluster.advancePt < 0)) {
+    let penPt = clusters[0]?.offset.xPt ?? 0;
+    clusters = clusters.map((cluster, index) => {
+      if (cluster.advancePt < 0) {
+        flooredClusterNaturalPt.set(
+          cluster.range.start,
+          (shapedClusters?.[index]?.advancePt ?? 0) * scaleX,
+        );
+      }
+      const placed = {
+        ...cluster,
+        offset: { ...cluster.offset, xPt: penPt },
+        advancePt: cluster.advancePt > 0 ? cluster.advancePt : 0,
+      };
+      penPt += placed.advancePt;
+      return placed;
+    });
+  }
+  // Vertical runs paint planned glyph cells; with a floored cell, retained
+  // clusters and measurement (CondensedAdvanceUnits 'vertical-cells') follow
+  // those cells. A compression on a floored cell cannot pull later cells back.
+  const verticalCells = segment.verticalRun && verticalGlyphMeasurement
+    ? verticalGlyphMeasurement.planRun({
+        text: segment.text,
+        font: canvasFontString(
+          projected.fontRoute,
+          projected.fontSizePt,
+          projected.fontWeight,
+          projected.fontStyle,
+        ),
+        fontKerning: projected.paintOps[0]!.kerning,
+        fontSizePt: projected.fontSizePt,
+        letterSpacingPt: pitchPt,
+        characterGridDeltaPt: gridPt,
+        charScale: scaleX,
+        growTrRotateInk: true,
+        writingMode: projected.paintOps[0]!.writingMode,
+      })
+    : undefined;
+  let verticalFloorCorrectionPt: number[] | undefined;
+  if (verticalCells && condensedSpacingMayFloor(segment, characterGrid, 1)) {
+    const raw = verticalCells.map((cell) => cell.advancePt + (
+      segment.punctuationCompressions
+        ?.filter((compression) =>
+          compression.end > cell.range.start && compression.end <= cell.range.end)
+        .reduce((sum, compression) => sum + compression.adjustmentPt, 0)
+      ?? 0
+    ));
+    if (verticalCells.some((cell, index) => cell.advancePt === 0 || raw[index]! < 0)) {
+      let penPt = clusters[0]?.offset.xPt ?? 0;
+      let correctionPt = 0;
+      const corrections: number[] = [];
+      clusters = verticalCells.map((cell, index) => {
+        corrections.push(correctionPt);
+        const advancePt = raw[index]! > 0 ? raw[index]! : 0;
+        correctionPt += advancePt - raw[index]!;
+        const placed = {
+          range: { start: sourceOffset + cell.range.start, end: sourceOffset + cell.range.end },
+          offset: { xPt: penPt, yPt: baselineOffsetPt },
+          advancePt,
+        };
+        penPt += advancePt;
+        return placed;
+      });
+      if (correctionPt > 0) verticalFloorCorrectionPt = corrections;
+    }
+  }
   if (segment.latinSpaceCompressionPx && segment.text.endsWith(' ') && clusters.length > 0) {
     // The fit projections remove only the segment's trailing invisible U+0020
     // advances, shrinking each by the same share: one space under
@@ -2419,7 +2591,7 @@ function textPlanSegment(
     ?.some((compression) => compression.end < segment.text.length) ?? false;
   // A floored cluster cannot share Canvas letterSpacing with its neighbours:
   // its pen must stop at the floor, so it paints from its own retained origin.
-  const hasFlooredClusters = flooredClusterStarts.size > 0;
+  const hasFlooredClusters = flooredClusterNaturalPt.size > 0;
   const clusterOriginPaintOps = !segment.verticalRun && !segment.tateChuYoko
     && (hasInternalPunctuationCompression || hasFlooredClusters);
   const unpaddedPaintOps = segment.verticalRun
@@ -2428,22 +2600,7 @@ function textPlanSegment(
           throw new Error('Vertical glyph planning capability is required for vertical text');
         }
         const template = paintOps[0]!;
-        return verticalGlyphMeasurement.planRun({
-          text: segment.text,
-          font: canvasFontString(
-            projected.fontRoute,
-            projected.fontSizePt,
-            projected.fontWeight,
-            projected.fontStyle,
-          ),
-          fontKerning: template.kerning,
-          fontSizePt: projected.fontSizePt,
-          letterSpacingPt: pitchPt,
-          characterGridDeltaPt: gridPt,
-          charScale: scaleX,
-          growTrRotateInk: true,
-          writingMode: template.writingMode,
-        }).map((cell) => ({
+        return (verticalCells ?? []).map((cell, cellIndex) => ({
           ...template,
           text: cell.text,
           range: {
@@ -2456,7 +2613,7 @@ function textPlanSegment(
                 ?.filter((compression) => compression.end <= cell.range.start)
                 .reduce((sum, compression) => sum + compression.adjustmentPt, 0)
               ?? 0
-            ),
+            ) + (verticalFloorCorrectionPt?.[cellIndex] ?? 0),
             yPt: baselineOffsetPt,
           },
           letterSpacingPt: pitchPt,
@@ -2493,7 +2650,7 @@ function textPlanSegment(
               const adjustmentPt = segment.punctuationCompressions
                 ?.find((compression) => compression.end === relativeEnd)
                 ?.adjustmentPt ?? null;
-              const floored = flooredClusterStarts.has(cluster.range.start);
+              const floored = flooredClusterNaturalPt.has(cluster.range.start);
               const previous = groups.at(-1);
               if (previous && !floored && !previous.floored
                 && previous.adjustmentPt === adjustmentPt) {
@@ -2508,16 +2665,30 @@ function textPlanSegment(
                 });
               }
             }
-            return groups.map((group) => ({
-              ...template,
-              text: segment.text.slice(
-                group.start - sourceOffset,
-                group.end - sourceOffset,
-              ),
-              range: { start: group.start, end: group.end },
-              offset: group.offset,
-              letterSpacingPt: pitchPt + (group.adjustmentPt ?? 0),
-            }));
+            return groups.map((group) => {
+              const start = group.start - sourceOffset;
+              const end = group.end - sourceOffset;
+              const text = segment.text.slice(start, end);
+              if (!group.floored) {
+                return {
+                  ...template,
+                  text,
+                  range: { start: group.start, end: group.end },
+                  offset: group.offset,
+                  letterSpacingPt: pitchPt + (group.adjustmentPt ?? 0),
+                };
+              }
+              const joins = cursiveJoins(segment.text, start, end);
+              return {
+                ...template,
+                text: `${joins.before ? '\u200D' : ''}${text}${joins.after ? '\u200D' : ''}`,
+                range: { start: group.start, end: group.end },
+                offset: group.offset,
+                letterSpacingPt: pitchPt + (group.adjustmentPt ?? 0),
+                ...(joins.before || joins.after ? { sourceMapping: 'joining-context' as const } : {}),
+                naturalAdvancePt: flooredClusterNaturalPt.get(group.start)!,
+              };
+            });
           })()
         : paintOps;
   const basePaintOps = segment.snapGridClass === 'eastAsia'

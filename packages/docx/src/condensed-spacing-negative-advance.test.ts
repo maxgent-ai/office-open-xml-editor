@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { layoutBodyModel } from './test-support/document-layout.test-support.js';
-import { segAdvanceWidth, type LayoutTextSeg } from './line-layout.js';
+import { segAdvanceWidth, type CondensedAdvanceUnits, type LayoutTextSeg } from './line-layout.js';
+import { LineMeasurementAdapter } from './line-breaker/measurement-adapter.js';
 import type { LineLayout, TextPlacement } from './layout/types.js';
 import type { BodyElement, DocParagraph, DocxTextRun, SectionProps } from './types';
 
@@ -11,8 +12,9 @@ import type { BodyElement, DocParagraph, DocxTextRun, SectionProps } from './typ
 // in both orders, and an over-condensed run collapses its underline and
 // shading to nothing.
 
-/** Stub glyph advance: 'i' is 0.2 em, every other character 0.5 em. */
-function makeCtx(): CanvasRenderingContext2D {
+/** Stub glyph advance: 'i', 'י' and 'ي' are 0.2 em, U+0640 is 0.1 em, every
+ * other character 0.5 em. */
+function makeCtx(contextual = false): CanvasRenderingContext2D {
   let font = '10px serif';
   const px = () => parseFloat(/(\d+(?:\.\d+)?)px/.exec(font)?.[1] ?? '10');
   const ctx = {
@@ -22,7 +24,10 @@ function makeCtx(): CanvasRenderingContext2D {
     measureText: (s: string) => {
       const p = px();
       return {
-        width: [...s].reduce((sum, ch) => sum + p * (ch === 'i' ? 0.2 : 0.5), 0),
+        width: [...s].reduce((sum, ch, index, all) => sum + p * (
+          ch === '\u200D' ? 0 : ch === '\u0640' ? 0.1 : 'iיي'.includes(ch) ? 0.2 : 0.5
+        // Optionally a letter after U+0640 takes a 0.2 em wider joined form.
+        ) + (contextual && index > 0 && all[index - 1] === '\u0640' ? p * 0.2 : 0), 0),
         fontBoundingBoxAscent: p * 0.8, fontBoundingBoxDescent: p * 0.2,
         actualBoundingBoxAscent: p * 0.8, actualBoundingBoxDescent: p * 0.2,
       } as TextMetrics;
@@ -55,8 +60,8 @@ function para(runs: DocParagraph['runs'], extra: Partial<DocParagraph> = {}): Bo
   return { type: 'paragraph', ...p } as BodyElement;
 }
 
-function lines(body: BodyElement[]): LineLayout[] {
-  const node = layoutBodyModel(body, section, makeCtx()).pages[0]!.layers.body[0]!;
+function lines(body: BodyElement[], contextual = false): LineLayout[] {
+  const node = layoutBodyModel(body, section, makeCtx(contextual)).pages[0]!.layers.body[0]!;
   if (node.kind !== 'paragraph') throw new Error('expected a paragraph');
   return [...node.lines];
 }
@@ -113,50 +118,160 @@ describe('#1975 condensed w:spacing larger than the glyph advance', () => {
   it('breaks lines with the floored width, never borrowing room from negative advances', () => {
     // 360 pt band. "Q" + 20 over-condensed M (0 pt) + 36 'x' (360 pt): a signed
     // run (-400 pt) would pull every x onto line 1; floored, they overflow it.
-    const [first, second] = lines([para([
+    const source = `Q${'M'.repeat(20)}${'x'.repeat(36)}`;
+    const all = lines([para([
       textRun('Q'), textRun('M'.repeat(20), { charSpacing: -30 }), textRun('x'.repeat(36)),
     ])]);
-    expect(second).toBeDefined();
-    const firstWidth = texts(first!).reduce((sum, p) => sum + p.advancePt, 0);
-    expect(firstWidth).toBeLessThanOrEqual(360 + 1e-9);
-    expect(texts(first!).every((p) => p.advancePt >= 0)).toBe(true);
+    expect(all.length).toBe(2);
+    expect(all.flatMap(texts).map((p) => p.text).join('')).toBe(source);
+    const firstWidth = texts(all[0]!).reduce((sum, p) => sum + p.advancePt, 0);
+    expect(firstWidth).toBeCloseTo(360, 9);
+    expect(all.flatMap(texts).every((p) => p.advancePt >= 0)).toBe(true);
   });
 
-  it('justifies a line holding a floored run without negative geometry', () => {
-    const words = 'aa bb cc dd ee ff gg hh ii jj kk ll mm nn oo pp qq rr ss tt uu vv ';
-    const [first] = lines([para([
+  it('justifies the line holding a floored run to the band edge', () => {
+    // Word lengths leave slack on every full line.
+    const words = 'aa bbb cc ddd ee fff gg hhh ii jjj kk lll mm nnn oo ppp qq rrr ss ttt ';
+    const all = lines([para([
       textRun(words), textRun('MMMM', { charSpacing: -30 }), textRun(words),
     ], { alignment: 'both' })]);
-    const placed = texts(first!);
+    const line = all.find((candidate) => texts(candidate).some((p) => p.text === 'MMMM'))!;
+    expect(line).not.toBe(all.at(-1));
+    const placed = texts(line);
     expect(placed.every((p) => p.bounds.widthPt >= 0)).toBe(true);
+    // The justified line still ends on the band edge, as uncondensed lines do.
     const last = placed.at(-1)!;
-    expect(last.bounds.xPt + last.bounds.widthPt).toBeLessThanOrEqual(380 + 1e-6);
+    expect(last.bounds.xPt + last.advancePt).toBeCloseTo(380, 6);
   });
 
-  it('collapses the decoration of a fully floored run', () => {
+  it('draws no underline under a fully floored run', () => {
+    // AB [20, 40), MMMM floored at 40, CD [40, 60): only CD's underline remains.
     const [line] = lines([para([
-      textRun('AB'), textRun('MMMM', { charSpacing: -30, underline: true }), textRun('CD'),
+      textRun('AB'), textRun('MMMM', { charSpacing: -30, underline: true }),
+      textRun('CD', { underline: true }),
     ])]);
-    const lengths = line!.placements.flatMap((p) => p.kind === 'text' ? p.decorations ?? [] : [])
-      .map((d) => 'to' in d && 'from' in d ? (d as { to: { xPt: number }; from: { xPt: number } }).to.xPt
-        - (d as { from: { xPt: number } }).from.xPt : 0);
-    expect(lengths.every((length) => length === 0)).toBe(true);
+    const spans = line!.placements.flatMap((p) => p.kind === 'text' ? p.decorations ?? [] : [])
+      .filter((d) => d.kind === 'underline')
+      .map((d) => [(d as { from: { xPt: number } }).from.xPt, (d as { to: { xPt: number } }).to.xPt]);
+    expect(spans).toEqual([[40, 60]]);
+  });
+});
+
+describe('#1975 condensed floor in right-to-left text', () => {
+  it('places floored operations visually from the right edge', () => {
+    // מ 10 → 4, י 4 → -2 floored, א 10 → 4: logical origins 0, 4, 4; width 8.
+    const [line] = lines([para(
+      [textRun('אב', { rtl: true }), textRun('מיא', { rtl: true, charSpacing: -6 }), textRun('גד', { rtl: true })],
+      { bidi: true } as Partial<DocParagraph>,
+    )]);
+    const run = byText(line!, 'מיא');
+    expect(run.advancePt).toBeCloseTo(8, 9);
+    expect(run.paintOps.map((op) => [op.text, op.direction, op.offset.xPt]))
+      .toEqual([['מ', 'rtl', 4], ['י', 'rtl', 0], ['א', 'rtl', 0]]);
+    // Following text continues leftwards from the floored pen.
+    expect(byText(line!, 'גד').bounds.xPt + 20).toBeCloseTo(run.bounds.xPt, 9);
+  });
+
+  it('keeps the joined form of a floored cluster inside a cursive word', () => {
+    const [line] = lines([para(
+      [textRun('بيت', { rtl: true, charSpacing: -6 })],
+      { bidi: true } as Partial<DocParagraph>,
+    )]);
+    const floored = byText(line!, 'بيت').paintOps.find((op) => op.range.end - op.range.start === 1
+      && op.naturalAdvancePt !== undefined);
+    expect(floored?.text).toBe('\u200Dي\u200D');
+    expect(floored?.sourceMapping).toBe('joining-context');
+  });
+});
+
+describe('#1975 condensed floor and kashida justification', () => {
+  const kashidaParagraph = (charSpacing: number) => lines([para(
+    [textRun('بنت سلام كتب '.repeat(12), { rtl: true, charSpacing })],
+    { bidi: true, alignment: 'lowKashida' } as Partial<DocParagraph>,
+  )], true);
+  const tatweels = (all: LineLayout[]) => all.flatMap(texts)
+    .flatMap((p) => p.paintOps).filter((op) => op.text.includes('\u0640')).length;
+
+  it('inserts no elongation that would itself reach the floor', () => {
+    // U+0640 is 2 pt in the stub: at -6 pt pitch an inserted tatweel floors,
+    // while the wider joined letter after it would still gain width.
+    expect(tatweels(kashidaParagraph(-6))).toBe(0);
+  });
+
+  it('still elongates when the tatweel keeps a positive advance', () => {
+    expect(tatweels(kashidaParagraph(-1))).toBeGreaterThan(0);
   });
 });
 
 describe('segAdvanceWidth condensed floor', () => {
-  const seg = (text: string, charSpacing: number): LayoutTextSeg => ({
+  const seg = (text: string, charSpacing: number, extra: Partial<LayoutTextSeg> = {}): LayoutTextSeg => ({
     text, bold: false, italic: false, underline: false, strikethrough: false,
-    fontSize: 20, color: null, fontFamily: 'X', vertAlign: null, measuredWidth: 0, charSpacing,
+    fontSize: 20, color: null, fontFamily: 'X', vertAlign: null, measuredWidth: 0, charSpacing, ...extra,
   } as LayoutTextSeg);
-
-  it('sums per-cluster floors when the caller supplies clusters', () => {
-    const clusters = [{ text: 'M', advancePx: 10 }, { text: 'i', advancePx: 4 }];
-    expect(segAdvanceWidth(seg('Mi', -6), 14, undefined, 1, clusters)).toBeCloseTo(4, 12);
+  const natural = (clusters: Array<[string, number]>): CondensedAdvanceUnits => ({
+    kind: 'natural-clusters',
+    clusters: clusters.map(([text, advancePx]) => ({ text, advancePx })),
   });
 
-  it('is unchanged for ordinary and mildly condensed spacing', () => {
-    expect(segAdvanceWidth(seg('Mi', -2), 14, undefined, 1)).toBe(10);
+  it('sums floored cluster advances', () => {
+    expect(segAdvanceWidth(seg('Mi', -6), 14, undefined, 1, natural([['M', 10], ['i', 4]])))
+      .toBeCloseTo(4, 12);
+  });
+
+  it('keeps a fully floored run exactly zero under fractional spacing and w:w', () => {
+    const units = natural([['M', 10], ['M', 10], ['M', 10]]);
+    expect(segAdvanceWidth(seg('MMM', -30.1), 30, undefined, 1, units)).toBe(0);
+    expect(segAdvanceWidth(seg('MMM', -7.3, { charScale: 0.7 }), 30, undefined, 1, units)).toBe(0);
+  });
+
+  it('floors punctuation compression together with the run pitch', () => {
+    const compressed = seg('。', -30, { punctuationCompressions: [{ end: 1, adjustmentPt: -5 }] });
+    expect(segAdvanceWidth(compressed, 10, undefined, 1, natural([['。', 10]]))).toBe(0);
+    expect(segAdvanceWidth(compressed, 10, undefined, 1)).toBe(0);
+  });
+
+  it('measures vertical runs from their planned cells', () => {
+    // Planned cells already carry pitch and floor; compression is folded per cell.
+    const vertical = seg('ーー', -30, { verticalRun: true });
+    const cells: CondensedAdvanceUnits = {
+      kind: 'vertical-cells', cells: [{ text: 'ー', advancePx: 0 }, { text: 'ー', advancePx: 0 }],
+    };
+    expect(segAdvanceWidth(vertical, 40, undefined, 1, cells)).toBe(0);
+  });
+
+  it('is unchanged when no character reaches the floor', () => {
+    const units = natural([['M', 10], ['i', 4]]);
+    expect(segAdvanceWidth(seg('Mi', -2), 14, undefined, 1, units)).toBe(10);
     expect(segAdvanceWidth(seg('Mi', 3), 14, undefined, 1)).toBe(20);
+  });
+});
+
+describe('condensed advance units work', () => {
+  function countingContext(): { ctx: CanvasRenderingContext2D; measured: () => number } {
+    let units = 0;
+    const ctx = makeCtx();
+    const measure = ctx.measureText.bind(ctx);
+    ctx.measureText = (text: string) => {
+      units += text.length;
+      return measure(text);
+    };
+    return { ctx, measured: () => units };
+  }
+
+  it.each([100, 200, 400])('is linear in the run length (%s characters)', (length) => {
+    const { ctx, measured } = countingContext();
+    const adapter = new LineMeasurementAdapter(ctx, 1, () => '20px serif');
+    const segment = { ...textRun('M'.repeat(length), { charSpacing: -30 }), measuredWidth: 0 } as unknown as LayoutTextSeg;
+    let reserved = 0;
+    const reserve = (units: number) => { reserved += units; };
+    adapter.condensedAdvanceUnits(segment, segment.text, 0, undefined, reserve);
+    const whole = measured();
+    expect(whole).toBeLessThanOrEqual(12 * length);
+    expect(reserved).toBeGreaterThanOrEqual(whole);
+    // Prefix probes reuse the whole-segment clusters.
+    for (let end = 1; end <= length; end += 1) {
+      adapter.condensedAdvanceUnits(segment, segment.text.slice(0, end), 0, undefined, reserve);
+    }
+    expect(measured()).toBe(whole);
   });
 });

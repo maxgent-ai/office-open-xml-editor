@@ -42,8 +42,7 @@ import {
   leadingAutoSpacePx,
   segLetterSpacingPx,
   charSpacingDeltaPx,
-  condensedSpacingMayFloor,
-  type NaturalClusterAdvance,
+  type CondensedAdvanceUnits,
   protectedNoBreakOffsets,
   hardJoinPrefixEnd,
   legalTextSplitAtOrBefore,
@@ -1181,18 +1180,16 @@ export function performSegNaturalAdvance(
   ) + leadingAutoSpacePx(operationState, s);
 }
 
-/** Per-cluster natural advances for WORD_CONDENSED_SPACING_ADVANCE_FLOOR, only
- * when `text` (a slice of `s` at `start`) can reach the zero floor. */
+/** WORD_CONDENSED_SPACING_ADVANCE_FLOOR units for `text` (a slice of `s` at
+ * `start`), only when the segment can reach the zero floor. */
 function condensedNaturalClusters(
-  operationState: Pick<PassOperationState, 'measurement' | 'scale' | 'characterGrid'>,
+  operationState: Pick<PassOperationState, 'measurement' | 'characterGrid' | 'reservePrefixWork'>,
   s: LayoutTextSeg,
   text: string,
   start = 0,
-): readonly NaturalClusterAdvance[] | undefined {
-  const { measurement, scale, characterGrid } = operationState;
-  return condensedSpacingMayFloor(s, characterGrid, scale)
-    ? measurement.naturalClusterAdvances(s, text, start)
-    : undefined;
+): CondensedAdvanceUnits | undefined {
+  const { measurement, characterGrid, reservePrefixWork } = operationState;
+  return measurement.condensedAdvanceUnits(s, text, start, characterGrid, reservePrefixWork);
 }
 
 /** The committed line's last item is text: a following segment's automatic

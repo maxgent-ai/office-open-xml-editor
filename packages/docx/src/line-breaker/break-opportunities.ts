@@ -30,7 +30,6 @@ import {
   leadingAutoSpacePx,
   legalTextSplitAtOrBefore,
   segAdvanceWidth,
-  condensedSpacingMayFloor,
   segmentCharacterGridDeltaPx,
   slicedTextMetadata,
   snapToCharsClass,
@@ -603,9 +602,7 @@ function commitAlignedTabCell(context: BreakOpportunityIteratorContext): void {
         m.width + verticalInkExtra(q, q.text),
         characterGrid,
         scale,
-        condensedSpacingMayFloor(q, characterGrid, scale)
-          ? measurement.naturalClusterAdvances(q, q.text)
-          : undefined,
+        measurement.condensedAdvanceUnits(q, q.text, 0, characterGrid, context.reservePrefixWork),
       ) + leadingAutoSpacePx(context, q);
       q.measuredWidth = w;
       const asc =

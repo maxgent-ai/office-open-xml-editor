@@ -53,7 +53,9 @@ function validateTextSlices(placement: import('../layout/types.js').TextPlacemen
   let previousEnd = placement.range.start;
   for (const op of placement.paintOps) {
     const invalidTextMapping = !optionalGlyph && op.sourceMapping !== 'kashida'
-      && op.text.length !== op.range.end - op.range.start;
+      && (op.sourceMapping === 'joining-context'
+        ? op.text.replace(/^\u200D|\u200D$/gu, '').length !== op.range.end - op.range.start
+        : op.text.length !== op.range.end - op.range.start);
     const invalidGeometry = !Number.isFinite(op.offset.xPt) || !Number.isFinite(op.offset.yPt)
       || (op.glyphOffsetPt !== undefined
         && (!Number.isFinite(op.glyphOffsetPt.xPt) || !Number.isFinite(op.glyphOffsetPt.yPt)))

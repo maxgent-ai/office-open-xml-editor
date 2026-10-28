@@ -354,8 +354,14 @@ export interface TextPaintOp {
   readonly verticalFeature?: boolean;
   /** Glyph-local offset retained from vertical-form ink/corner geometry. */
   readonly glyphOffsetPt?: PointPt;
-  /** `kashida` permits acquisition-inserted U+0640 glyphs over one source range. */
-  readonly sourceMapping?: 'identity' | 'kashida';
+  /** `kashida` permits acquisition-inserted U+0640 glyphs over one source range.
+   * `joining-context` draws one over-condensed cluster of a cursive word with
+   * U+200D on its joined sides, keeping its contextual form (§17.3.2.35). */
+  readonly sourceMapping?: 'identity' | 'kashida' | 'joining-context';
+  /** WORD_CONDENSED_SPACING_ADVANCE_FLOOR: this operation draws one cluster
+   * whose advance took the zero floor; its glyph's natural advance. RTL paint
+   * anchors the glyph's trailing (left) edge on the pen with it. */
+  readonly naturalAdvancePt?: number;
   /** Selected-face ink relative to this operation's alphabetic baseline.
    * Pagination may consume it, but paint must never reconstruct it. */
   readonly inkBounds?: GlyphInkBounds;

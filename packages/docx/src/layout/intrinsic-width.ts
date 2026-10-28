@@ -11,7 +11,6 @@ import {
   hasCJKBreakOpportunity,
   layoutLines,
   segAdvanceWidth,
-  condensedSpacingMayFloor,
   snapToCharsAllocatedWidthPx,
   snapToCharsClass,
   slicedPunctuationCompressions,
@@ -293,6 +292,7 @@ function measureTextRange(
   // Keep physical word units intact; the same bounded boundary oracle used by
   // justified line layout preserves registered compound/Latin context here.
   let boundaryAdapter: LineMeasurementAdapter | undefined;
+  let condensedAdapter: LineMeasurementAdapter | undefined;
   let previousCandidate: LayoutTextSeg | undefined;
   let pendingSnapBlock: Readonly<{
     kind: 'latin' | 'complexScript';
@@ -353,27 +353,22 @@ function measureTextRange(
     }
     previousCandidate = candidate;
     const measureCandidate = (measured: LayoutTextSeg): number => {
-      // WORD_CONDENSED_SPACING_ADVANCE_FLOOR needs each cluster's natural advance.
-      const floors = condensedSpacingMayFloor(measured, characterGrid, 1);
+      // WORD_CONDENSED_SPACING_ADVANCE_FLOOR needs each cluster's advance.
+      condensedAdapter ??= new LineMeasurementAdapter(measurer.context, 1, s => buildFont(
+        s.bold, s.italic, calcEffectiveFontPx(s, 1), s.fontFamily,
+        measurer.fontFamilyClasses as Record<string, string>, s.fontRoute,
+      ));
+      const units = condensedAdapter.condensedAdvanceUnits(
+        measured, measured.text, 0, characterGrid, () => {},
+      );
       if (measured.textLayoutService && measured.textShapeRequest) {
         const shaped = measured.textLayoutService.shape({
           ...measured.textShapeRequest,
           fontSizePt: calcEffectiveFontPx(measured, 1),
           measure: true,
-          clusterGeometry: floors,
+          clusterGeometry: false,
         });
-        return segAdvanceWidth(
-          measured,
-          shaped.advancePt,
-          characterGrid,
-          1,
-          floors
-            ? (shaped.clusters ?? []).map((cluster) => ({
-                text: measured.text.slice(cluster.range.start, cluster.range.end),
-                advancePx: cluster.advancePt,
-              }))
-            : undefined,
-        );
+        return segAdvanceWidth(measured, shaped.advancePt, characterGrid, 1, units);
       }
       measurer.context.font = buildFont(
         measured.bold,
@@ -383,21 +378,12 @@ function measureTextRange(
         measurer.fontFamilyClasses as Record<string, string>,
         measured.fontRoute,
       );
-      const offsets = floors
-        ? [...new Set([0, ...graphemeClusterOffsets(measured.text), measured.text.length])]
-            .sort((a, b) => a - b)
-        : [];
       return segAdvanceWidth(
         measured,
         measurer.context.measureText(measured.text).width,
         characterGrid,
         1,
-        floors
-          ? offsets.slice(0, -1).map((offset, index) => {
-              const text = measured.text.slice(offset, offsets[index + 1]);
-              return { text, advancePx: measurer.context.measureText(text).width };
-            })
-          : undefined,
+        units,
       );
     };
     const kind = snapToCharsClass(candidate, characterGrid);

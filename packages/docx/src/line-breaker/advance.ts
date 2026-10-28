@@ -1,4 +1,4 @@
-import { condensedClusterFloorPx, countSpacingCharacters } from '../character-spacing.js';
+import { condensedClusterFloorPx, countedSpacingAdvance, countSpacingCharacters } from '../character-spacing.js';
 export { condensedClusterFloorPx };
 import { sliceTextBreakWindow } from './text-break-window.js';
 import { graphemeClusterOffsets } from '@silurus/ooxml-core';
@@ -468,14 +468,26 @@ export interface NaturalClusterAdvance {
 }
 
 
+/** Per-unit geometry {@link segAdvanceWidth} needs to apply the
+ * {@link condensedSpacingMayFloor} floor: horizontal text supplies its natural
+ * grapheme-cluster advances; a vertical run supplies the planned glyph cells
+ * (`planVerticalRunWithCapability`), whose advances already carry the run
+ * pitch and the floor, so measurement and painted cells share one authority. */
+export type CondensedAdvanceUnits =
+  | Readonly<{ kind: 'natural-clusters'; clusters: readonly NaturalClusterAdvance[] }>
+  | Readonly<{ kind: 'vertical-cells'; cells: readonly NaturalClusterAdvance[] }>;
+
+
 /** WORD_CONDENSED_SPACING_ADVANCE_FLOOR: §17.3.2.35 removes pitch "after each
  * character" but never moves the pen backwards. Word floors each character's
- * advance (scaled glyph + grid delta + run pitch) at zero, so an over-condensed
- * character stacks on its successor and the run, its line fit, alignment and
- * decorations all use the floored advance. True only when some character of
- * the segment can reach a negative advance; ordinary text never pays for the
- * per-cluster probe. §17.3.2.14 fitText and §17.3.2.10 tate-chu-yoko own their
- * allocation and are outside this rule. */
+ * advance at zero, so an over-condensed character stacks on its successor and
+ * the run, its line fit, alignment and decorations all use the floored
+ * advance. The floored advance is the character's whole advance: scaled glyph,
+ * grid delta, run pitch, width balance and punctuation compression (compression
+ * never adds advance, so max(0, max(0, glyph + pitch) + compression) is the
+ * same value). True only when some character can reach a negative advance;
+ * §17.3.2.14 fitText and §17.3.2.10 tate-chu-yoko own their allocation and are
+ * outside this rule. */
 export function condensedSpacingMayFloor(
   seg: LayoutTextSeg,
   grid: DocGridCtx | undefined,
@@ -487,26 +499,57 @@ export function condensedSpacingMayFloor(
 }
 
 
-/** Total {@link condensedClusterFloorPx} over a segment's clusters. Without a
- * cluster breakdown the text is one unit, which is exact for a single
- * cluster and keeps any other caller's advance non-negative. */
-export function condensedSpacingFloorPx(
+/** Punctuation compression (§17.15.1.18 projection) owned by the unit ending
+ * in `(start, end]`, in the segment's points. */
+function unitPunctuationCompressionPt(seg: LayoutTextSeg, start: number, end: number): number {
+  return seg.punctuationCompressions
+    ?.filter((compression) => compression.end > start && compression.end <= end)
+    .reduce((sum, compression) => sum + compression.adjustmentPt, 0)
+    ?? 0;
+}
+
+
+/** The segment's advance as the sum of its floored unit advances, or
+ * `undefined` when no unit reaches the floor (callers then keep the signed
+ * whole-segment arithmetic unchanged). Summing the non-negative units directly
+ * keeps a fully floored run exactly zero. */
+function condensedFlooredAdvancePx(
   seg: LayoutTextSeg,
-  naturalWidthPx: number,
   grid: DocGridCtx | undefined,
   scale: number,
-  clusters?: readonly NaturalClusterAdvance[],
-): number {
-  if (!condensedSpacingMayFloor(seg, grid, scale)) return 0;
+  units: CondensedAdvanceUnits,
+): number | undefined {
   const gridPx = segmentCharacterGridDeltaPx(seg, grid, scale);
   const spacingPx = charSpacingDeltaPx(seg, scale);
   const charScale = charScaleFactor(seg);
-  const units = clusters ?? [{ text: seg.text, advancePx: naturalWidthPx }];
-  let floorPx = 0;
-  for (const unit of units) {
-    floorPx += condensedClusterFloorPx(unit.text, unit.advancePx * charScale, gridPx, spacingPx);
+  let offset = 0;
+  let total = 0;
+  let floored = false;
+  const list = units.kind === 'natural-clusters' ? units.clusters : units.cells;
+  for (const unit of list) {
+    const end = offset + unit.text.length;
+    const adjustmentsPx = unitPunctuationCompressionPt(seg, offset, end) * scale
+      + (units.kind === 'natural-clusters'
+        ? widthBalanceSpaceAdjustmentForTextPt(seg, unit.text, grid) * scale * charScale
+        : 0);
+    const raw = units.kind === 'natural-clusters'
+      ? unit.advancePx * charScale
+        + countedSpacingAdvance(
+          countSpacingCharacters(unit.text), gridPx, spacingPx, gridPx + spacingPx,
+        )
+        + adjustmentsPx
+      : unit.advancePx + adjustmentsPx;
+    if (raw < 0 || (units.kind === 'vertical-cells' && unit.advancePx === 0)) floored = true;
+    total += raw > 0 ? raw : 0;
+    offset = end;
   }
-  return floorPx;
+  if (offset !== seg.text.length) {
+    throw new Error('Condensed advance units do not cover their segment');
+  }
+  if (!floored) return undefined;
+  return units.kind === 'vertical-cells'
+    ? total + widthBalanceSpaceAdjustmentTotalPt(seg, grid) * scale * charScale
+    : total;
 }
 
 
@@ -515,13 +558,14 @@ export function condensedSpacingFloorPx(
  *  glyph width first, then add run pitch per rendered character;
  *  these are independent OOXML properties. Over-condensed characters take
  *  the {@link condensedSpacingMayFloor} zero floor; callers that can reach it
- *  pass the segment's natural cluster advances. */
+ *  pass the segment's {@link CondensedAdvanceUnits}. Without units the text
+ *  is one unit, which is exact for a single cluster. */
 export function segAdvanceWidth(
   seg: LayoutTextSeg,
   naturalWidthPx: number,
   grid: DocGridCtx | undefined,
   scale: number,
-  clusters?: readonly NaturalClusterAdvance[],
+  units?: CondensedAdvanceUnits,
 ): number {
   if (seg.fitTextPerGapPx !== undefined) {
     const charCount = [...seg.text].length;
@@ -541,7 +585,7 @@ export function segAdvanceWidth(
   // rotation — see vertical-text.ts and renderer's page transform.)
   if (seg.tateChuYoko) return seg.fontSize * scale;
   const segmentDelta = segmentCharacterGridDeltaPx(seg, grid, scale);
-  return textAdvanceWidth(
+  const signed = textAdvanceWidth(
     naturalWidthPx,
     seg.text,
     segmentDelta,
@@ -549,8 +593,10 @@ export function segAdvanceWidth(
     charSpacingDeltaPx(seg, scale),
   )
     + widthBalanceSpaceAdjustmentTotalPt(seg, grid) * scale * charScaleFactor(seg)
-    + punctuationCompressionTotalPt(seg) * scale
-    + condensedSpacingFloorPx(seg, naturalWidthPx, grid, scale, clusters);
+    + punctuationCompressionTotalPt(seg) * scale;
+  if (!condensedSpacingMayFloor(seg, grid, scale)) return signed;
+  if (!units) return signed > 0 ? signed : 0;
+  return condensedFlooredAdvancePx(seg, grid, scale, units) ?? signed;
 }
 
 
