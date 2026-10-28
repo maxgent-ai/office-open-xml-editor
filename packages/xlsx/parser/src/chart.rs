@@ -166,6 +166,15 @@ fn collect_selected_graphic_frames<'a, 'input>(
     }
 }
 
+fn is_chart_anchor(anchor: roxmltree::Node<'_, '_>) -> bool {
+    anchor.is_element()
+        && matches!(
+            anchor.tag_name().name(),
+            "twoCellAnchor" | "oneCellAnchor" | "absoluteAnchor"
+        )
+        && is_xdr_ns(anchor.tag_name().namespace())
+}
+
 /// Resolve a selected `<xdr:graphicFrame>` to its chart part and whether it is
 /// a chartEx part. `<a:graphicData uri>` and its child namespace distinguish
 /// modern `<cx:chart>` from legacy `<c:chart>`.
@@ -213,17 +222,23 @@ pub(crate) struct ChartReferenceContext<'a, 'input, 'session> {
     pub(crate) session: &'session mut WorksheetReferenceSession,
 }
 
+/// Distinct first cells a drawing prefetch may queue per load. Beyond it a
+/// lookup queues only its own cell, as the per-reference path always did.
+const MAX_PREFETCHED_SOURCE_STYLE_CELLS: usize =
+    crate::worksheet_reference::MAX_TOTAL_REFERENCE_CELLS;
+
 /// First-cell style indices of chart source references, shared by every
 /// chart of one worksheet load. The first lookup that needs a source part
 /// queues the first cell of every formula in the drawing's charts, so each
 /// source worksheet is parsed once for all of them instead of once per axis
-/// or series. Entries are bounded by the formulas authored in those chart
-/// parts, never by the size of the source sheet.
+/// or series. Entries are bounded by the distinct formulas authored in those
+/// chart parts (and the prefetch cap), never by the size of the source sheet.
 #[derive(Default)]
 pub(crate) struct ChartSourceStyleCache {
     prefetched_drawings: HashSet<String>,
     pending: HashMap<String, HashSet<(u32, u32)>>,
     resolved: HashMap<String, HashMap<(u32, u32), Option<u32>>>,
+    entries: usize,
     #[cfg(test)]
     source_parts_parsed: usize,
 }
@@ -237,7 +252,9 @@ impl ChartSourceStyleCache {
         {
             return;
         }
-        self.pending.entry(part).or_default().insert(cell);
+        if self.pending.entry(part).or_default().insert(cell) {
+            self.entries += 1;
+        }
     }
 }
 
@@ -359,6 +376,8 @@ impl XlsxChartReferenceResolver<'_, '_, '_, '_> {
     /// Queue the first cell of every formula in the drawing's charts. The
     /// `<f>` superset covers every reference the shared chart parser can ask
     /// a style for; extra cells only cost an entry in the same single pass.
+    /// Only chart parts the drawing loader itself reads and parses are
+    /// visited (same anchors, hidden frames skipped), each once.
     fn prefetch_drawing_source_cells(&mut self) {
         let Some(prefetch) = self.style_prefetch.as_ref() else {
             return;
@@ -372,20 +391,28 @@ impl XlsxChartReferenceResolver<'_, '_, '_, '_> {
             return;
         }
         let mut chart_parts = Vec::new();
+        let mut seen_parts = HashSet::new();
         for anchor in prefetch
             .drawing_doc
             .root_element()
             .children()
-            .filter(|node| node.is_element())
+            .filter(|node| is_chart_anchor(*node))
         {
             let mut graphic_frames = Vec::new();
             collect_selected_graphic_frames(anchor, &mut graphic_frames);
-            chart_parts.extend(graphic_frames.into_iter().filter_map(|frame| {
-                graphic_frame_chart_part(frame, prefetch.drawing_rels, prefetch.drawing_path)
-                    .map(|(path, _)| path)
-            }));
+            for frame in graphic_frames {
+                if crate::drawing::xdr_node_hidden(&frame) {
+                    continue;
+                }
+                if let Some((path, _)) =
+                    graphic_frame_chart_part(frame, prefetch.drawing_rels, prefetch.drawing_path)
+                {
+                    if seen_parts.insert(path.clone()) {
+                        chart_parts.push(path);
+                    }
+                }
+            }
         }
-        let mut formulas = Vec::new();
         for chart_path in chart_parts {
             let Ok(chart_xml) = read_zip_string(self.archive, &chart_path) else {
                 continue;
@@ -393,18 +420,20 @@ impl XlsxChartReferenceResolver<'_, '_, '_, '_> {
             let Ok(chart_doc) = parse_guarded(&chart_xml) else {
                 continue;
             };
-            formulas.extend(
-                chart_doc
-                    .descendants()
-                    .filter(|node| node.is_element() && node.tag_name().name() == "f")
-                    .filter_map(|node| node.text())
-                    .map(|text| self.expand_defined_name(text)),
-            );
-        }
-        for formula in formulas {
-            if let Some(SourceStyleTarget::Part { part, cell }) = self.source_style_target(&formula)
+            for text in chart_doc
+                .descendants()
+                .filter(|node| node.is_element() && node.tag_name().name() == "f")
+                .filter_map(|node| node.text())
             {
-                self.session.chart_source_styles.queue(part, cell);
+                if self.session.chart_source_styles.entries >= MAX_PREFETCHED_SOURCE_STYLE_CELLS {
+                    return;
+                }
+                let formula = self.expand_defined_name(text);
+                if let Some(SourceStyleTarget::Part { part, cell }) =
+                    self.source_style_target(&formula)
+                {
+                    self.session.chart_source_styles.queue(part, cell);
+                }
             }
         }
     }
@@ -699,14 +728,12 @@ pub(crate) fn load_sheet_charts_observing_frames(
             .children()
             .filter(|n| n.is_element())
         {
+            if !is_chart_anchor(anchor) {
+                continue;
+            }
             let anchor_tag = anchor.tag_name().name();
             let is_one_cell = anchor_tag == "oneCellAnchor";
             let is_absolute = anchor_tag == "absoluteAnchor";
-            if (anchor_tag != "twoCellAnchor" && !is_one_cell && !is_absolute)
-                || !is_xdr_ns(anchor.tag_name().namespace())
-            {
-                continue;
-            }
 
             let (mut from_col, mut from_col_off, mut from_row, mut from_row_off) =
                 (0u32, 0i64, 0u32, 0i64);
@@ -1842,6 +1869,20 @@ mod worksheet_reference_tests {
     ];
 
     fn multi_chart_archive(chart_xmls: &[String], data_xml: &str) -> crate::XlsxZip {
+        let charts: Vec<(String, bool)> = chart_xmls
+            .iter()
+            .map(|chart_xml| (chart_xml.clone(), false))
+            .collect();
+        multi_chart_archive_with(&charts, data_xml, 1)
+    }
+
+    /// `charts` pairs each chart part with whether its frame is hidden; the
+    /// sheet lists the one drawing through `drawing_rels` relationships.
+    fn multi_chart_archive_with(
+        charts: &[(String, bool)],
+        data_xml: &str,
+        drawing_rels: usize,
+    ) -> crate::XlsxZip {
         let mut bytes = Vec::new();
         {
             let mut writer = zip::ZipWriter::new(Cursor::new(&mut bytes));
@@ -1849,22 +1890,27 @@ mod worksheet_reference_tests {
             writer
                 .start_file("xl/worksheets/_rels/sheet1.xml.rels", options)
                 .unwrap();
-            writer.write_all(br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rDrawing" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/></Relationships>"#).unwrap();
-            let anchors: String = (0..chart_xmls.len())
-                .map(|index| format!(r#"<xdr:twoCellAnchor><xdr:from><xdr:col>0</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>{index}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:to><xdr:col>4</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>{}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to><xdr:graphicFrame><xdr:nvGraphicFramePr><xdr:cNvPr id="{}" name="Chart"/></xdr:nvGraphicFramePr><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart r:id="rChart{index}"/></a:graphicData></a:graphic></xdr:graphicFrame><xdr:clientData/></xdr:twoCellAnchor>"#, index + 1, index + 1))
+            let sheet_rels: String = (0..drawing_rels)
+                .map(|index| format!(r#"<Relationship Id="rDrawing{index}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/>"#))
+                .collect();
+            write!(writer, r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">{sheet_rels}</Relationships>"#).unwrap();
+            let anchors: String = charts
+                .iter()
+                .enumerate()
+                .map(|(index, (_, hidden))| format!(r#"<xdr:twoCellAnchor><xdr:from><xdr:col>0</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>{index}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:to><xdr:col>4</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>{}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to><xdr:graphicFrame><xdr:nvGraphicFramePr><xdr:cNvPr id="{}" name="Chart" hidden="{}"/></xdr:nvGraphicFramePr><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart r:id="rChart{index}"/></a:graphicData></a:graphic></xdr:graphicFrame><xdr:clientData/></xdr:twoCellAnchor>"#, index + 1, index + 1, u8::from(*hidden)))
                 .collect();
             writer
                 .start_file("xl/drawings/drawing1.xml", options)
                 .unwrap();
             write!(writer, r#"<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">{anchors}</xdr:wsDr>"#).unwrap();
-            let rels: String = (0..chart_xmls.len())
+            let rels: String = (0..charts.len())
                 .map(|index| format!(r#"<Relationship Id="rChart{index}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="../charts/chart{index}.xml"/>"#))
                 .collect();
             writer
                 .start_file("xl/drawings/_rels/drawing1.xml.rels", options)
                 .unwrap();
             write!(writer, r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">{rels}</Relationships>"#).unwrap();
-            for (index, chart_xml) in chart_xmls.iter().enumerate() {
+            for (index, (chart_xml, _)) in charts.iter().enumerate() {
                 writer
                     .start_file(format!("xl/charts/chart{index}.xml"), options)
                     .unwrap();
@@ -1876,6 +1922,7 @@ mod worksheet_reference_tests {
             writer.write_all(data_xml.as_bytes()).unwrap();
             writer.start_file("xl/styles.xml", options).unwrap();
             writer.write_all(br#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><cellXfs count="3"><xf numFmtId="0"/><xf numFmtId="3"/><xf numFmtId="10"/></cellXfs></styleSheet>"#).unwrap();
+            crate::write_test_content_types(&mut writer);
             writer.finish().unwrap();
         }
         crate::XlsxZip::new(Cursor::new(bytes)).unwrap()
@@ -2004,6 +2051,60 @@ mod worksheet_reference_tests {
         assert_eq!(session.chart_source_styles.source_parts_parsed, 1);
         // That single pass resolved every formula of every chart.
         assert_style_parity(&mut archive, &mut session, &number_formats, &data_xml);
+        assert_eq!(session.chart_source_styles.source_parts_parsed, 1);
+    }
+
+    #[test]
+    fn chart_source_style_prefetch_skips_parts_the_loader_skips() {
+        // A hidden frame's chart part is never parsed by the loader; the
+        // prefetch must not parse it either, or its nesting-depth refusal
+        // would reject a package that loads today.
+        let deep = format!(
+            "<c:chartSpace xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\"><c:f>'التقرير'!H2</c:f>{}{}</c:chartSpace>",
+            "<c:x>".repeat(400),
+            "</c:x>".repeat(400)
+        );
+        let charts = vec![
+            (column_chart_xml(&STYLE_EDGE_FORMULAS[..4]), false),
+            (deep, true),
+        ];
+        let mut archive = multi_chart_archive_with(&charts, STYLE_EDGE_DATA_XML, 1);
+        let mut session = WorksheetReferenceSession::default();
+        let loaded = archive
+            .run_operation("parse-sheet", |archive| {
+                let theme = vec!["#4472C4".into(); 12];
+                let styles = crate::styles::parse_styles(archive, &theme)?;
+                let number_formats = ChartNumberFormatCache::from_styles(&styles.styles);
+                Ok(load_charts_with_session(
+                    archive,
+                    &mut session,
+                    &number_formats,
+                ))
+            })
+            .expect("the loader never parses the hidden chart part");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(session.chart_source_styles.source_parts_parsed, 1);
+        assert!(archive.assert_healthy().is_ok());
+        let hidden_cell = (2, 8);
+        assert!(!session
+            .chart_source_styles
+            .resolved
+            .values()
+            .any(|cells| cells.contains_key(&hidden_cell)));
+    }
+
+    #[test]
+    fn chart_source_styles_survive_repeated_drawing_relationships() {
+        // Repeated `/drawing` targets reload the same charts; their lookups
+        // reuse the first visit's pass instead of reparsing the source part.
+        let charts = vec![(column_chart_xml(&STYLE_EDGE_FORMULAS), false)];
+        let mut archive = multi_chart_archive_with(&charts, STYLE_EDGE_DATA_XML, 3);
+        let theme = vec!["#4472C4".into(); 12];
+        let styles = crate::styles::parse_styles(&mut archive, &theme).expect("styles");
+        let number_formats = ChartNumberFormatCache::from_styles(&styles.styles);
+        let mut session = WorksheetReferenceSession::default();
+        let loaded = load_charts_with_session(&mut archive, &mut session, &number_formats);
+        assert_eq!(loaded.len(), 3);
         assert_eq!(session.chart_source_styles.source_parts_parsed, 1);
     }
 
