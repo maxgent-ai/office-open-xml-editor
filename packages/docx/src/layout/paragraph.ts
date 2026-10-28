@@ -747,33 +747,61 @@ function flooredRtlVisualPaintOperations(
 
 /** WORD_CONDENSED_SPACING_ADVANCE_FLOOR in a right-to-left vertical run. An
  * unsplit sideways piece paints as one contextual operation whose bidi order
- * Canvas resolves; a floored piece paints its clusters from logical origins,
- * so mirror each cell within its piece (a maximal run of sideways cells): the
- * pen runs from the piece's far end, and a floored cluster's ink sits its
- * drawn advance behind the pen, as {@link flooredRtlVisualPaintOperations}
- * places it horizontally. Upright and rotated cells keep their origins. */
-function flooredRtlVerticalCellOrigins(
-  cells: ReturnType<VerticalGlyphMeasurementService['planRun']>,
-): readonly number[] {
-  const origins = cells.map((cell) => cell.originPt);
+ * Canvas resolves; a floored piece paints several operations from logical
+ * origins, so mirror each operation within its piece (a maximal run of
+ * sideways operations; pieces alternate draw mode) over the piece's visible
+ * extent: a floored cluster's ink sits its drawn advance behind the pen, as
+ * {@link flooredRtlVisualPaintOperations} places it horizontally. Trailing
+ * whitespace stays outside the extent, since the paint origin has already
+ * moved past it. Upright and rotated cells keep their origins. */
+function flooredRtlVerticalPaintOperations(
+  operations: readonly TextPaintOp[],
+  clusters: readonly TextClusterLayout[],
+  visibleEnd: number,
+): readonly TextPaintOp[] {
+  if (!operations.some((operation) => operation.naturalAdvancePt !== undefined)) return operations;
+  // Operations and clusters both run in source order.
+  const advances: number[] = [];
+  let cursor = 0;
+  for (const operation of operations) {
+    let advancePt = 0;
+    while (cursor < clusters.length && clusters[cursor]!.range.start < operation.range.end) {
+      if (clusters[cursor]!.range.start >= operation.range.start) advancePt += clusters[cursor]!.advancePt;
+      cursor += 1;
+    }
+    advances.push(advancePt);
+  }
+  const placed = [...operations];
   let index = 0;
-  while (index < cells.length) {
-    if (cells[index]!.orientation !== 'sideways') {
+  while (index < operations.length) {
+    if (operations[index]!.glyphOrientation !== 'sideways') {
       index += 1;
       continue;
     }
     let end = index;
-    while (end < cells.length && cells[end]!.orientation === 'sideways') end += 1;
-    const startPt = cells[index]!.originPt;
-    const last = cells[end - 1]!;
-    const endPt = last.originPt + last.advancePt;
-    for (let cursor = index; cursor < end; cursor += 1) {
-      const cell = cells[cursor]!;
-      origins[cursor] = startPt + endPt - cell.originPt - (cell.naturalAdvancePt ?? cell.advancePt);
+    while (end < operations.length && operations[end]!.glyphOrientation === 'sideways') end += 1;
+    if (end - index > 1) {
+      const startPt = operations[index]!.offset.xPt;
+      let endPt = startPt;
+      for (let member = index; member < end; member += 1) {
+        if (operations[member]!.range.start >= visibleEnd) continue;
+        endPt = Math.max(endPt, operations[member]!.offset.xPt + advances[member]!);
+      }
+      for (let member = index; member < end; member += 1) {
+        const operation = operations[member]!;
+        if (operation.range.start >= visibleEnd) continue;
+        placed[member] = {
+          ...operation,
+          offset: {
+            ...operation.offset,
+            xPt: startPt + endPt - operation.offset.xPt - (operation.naturalAdvancePt ?? advances[member]!),
+          },
+        };
+      }
     }
     index = end;
   }
-  return origins;
+  return placed;
 }
 
 function sameDashPattern(
@@ -1226,12 +1254,18 @@ export function planLine(input: PlanLineInput): LineLayout {
         : 0;
       const paintOps = direction === 'rtl'
         ? retainedRtlPaintOperations(
-            flooredRtlVisualPaintOperations(
-              textGeometry.paintOps,
-              textGeometry.clusters,
-              rtlLeadingGapPt,
-              segment.range.start + trailingWhitespaceStart,
-            ),
+            (textGeometry.paintOps[0]?.writingMode ?? 'horizontal-tb') !== 'horizontal-tb'
+              ? flooredRtlVerticalPaintOperations(
+                  textGeometry.paintOps,
+                  textGeometry.clusters,
+                  segment.range.start + trailingWhitespaceStart,
+                )
+              : flooredRtlVisualPaintOperations(
+                  textGeometry.paintOps,
+                  textGeometry.clusters,
+                  rtlLeadingGapPt,
+                  segment.range.start + trailingWhitespaceStart,
+                ),
             textGeometry.clusters,
           )
         : textGeometry.paintOps;
@@ -2676,11 +2710,7 @@ function textPlanSegment(
           throw new Error('Vertical glyph planning capability is required for vertical text');
         }
         const template = paintOps[0]!;
-        const plannedCells = flooredVerticalCells ?? verticalCells ?? [];
-        const flooredRtlOrigins = flooredVerticalCells && template.direction === 'rtl'
-          ? flooredRtlVerticalCellOrigins(flooredVerticalCells)
-          : null;
-        return plannedCells.map((cell, index) => ({
+        return (flooredVerticalCells ?? verticalCells ?? []).map((cell) => ({
           ...template,
           text: cell.text,
           range: {
@@ -2688,7 +2718,7 @@ function textPlanSegment(
             end: sourceOffset + cell.range.end,
           },
           offset: {
-            xPt: (flooredRtlOrigins?.[index] ?? cell.originPt) + (flooredVerticalCells ? 0 : (
+            xPt: cell.originPt + (flooredVerticalCells ? 0 : (
               segment.punctuationCompressions
                 ?.filter((compression) => compression.end <= cell.range.start)
                 .reduce((sum, compression) => sum + compression.adjustmentPt, 0)
@@ -2699,6 +2729,7 @@ function textPlanSegment(
           letterSpacingPt: pitchPt,
           glyphOrientation: cell.orientation,
           ...(cell.verticalFeature ? { verticalFeature: true } : {}),
+          ...(cell.naturalAdvancePt !== undefined ? { naturalAdvancePt: cell.naturalAdvancePt } : {}),
           ...(cell.blockAxisInkBounds ? { blockAxisInkBounds: cell.blockAxisInkBounds } : {}),
           ...(cell.drawOffsetPt.xPt !== 0 || cell.drawOffsetPt.yPt !== 0
             ? { glyphOffsetPt: cell.drawOffsetPt }
