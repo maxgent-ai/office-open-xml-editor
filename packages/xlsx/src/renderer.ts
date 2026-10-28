@@ -2302,7 +2302,9 @@ function renderQuadrant(
       // by the mirror, so the LTR test is correct for both directions.
       const key = `${rowIndex}:${colIndex}`;
       if (mergeSkipSet.has(key)) {
-        leftNeighbourCulled = false;
+        // A covered cell is painted (by its anchor or the pre-pass) only
+        // where its own band reaches the clip.
+        leftNeighbourCulled = ltrCx + cw <= clipX || ltrCx >= clipX + clipW;
         continue;
       }
 

@@ -423,6 +423,33 @@ describe('text overflow across a frozen-column boundary', () => {
     expect(leftEdge.length).toBeGreaterThan(0);
   });
 
+  it('keeps a scrolled-away merge border at the pane edge when another row overflows', () => {
+    // F2:G2 is an empty merge whose G2 carries a right border; both have
+    // scrolled out of the pane that starts at H. B1's overflow prepends
+    // columns to the pane, which must not stop H2 from drawing that edge.
+    const ws = {
+      ...worksheet([cell(2, LONG)]),
+      mergeCells: [{ top: 2, left: 6, bottom: 2, right: 7 }],
+    } as Worksheet;
+    ws.rows = [
+      ...ws.rows,
+      { index: 2, height: null, cells: [
+        { row: 2, col: 7, styleIndex: RIGHT_BORDER_XF, value: { type: 'empty' } } as Cell,
+      ] },
+    ];
+    const view = { row: 1, col: 8, rows: 2, cols: 6 };
+    const { ctx, texts, lines } = recordingContext();
+    renderViewport(ctx, ws, STYLES, view, { width: 600, height: 60, freezeCols: 3 });
+
+    expect(paneSplit(texts, LONG).scroll).toHaveLength(1);
+    const freezeLine = Math.max(...texts.filter((t) => t.clip.y === 0).map((t) => t.clip.x));
+    const edge = lines.filter((line) => (
+      line.x1 === line.x2 && /255,\s*0,\s*0|ff0000/i.test(line.color) &&
+      line.clip.x === freezeLine && Math.abs(line.x1 - freezeLine) <= 1
+    ));
+    expect(edge.length).toBeGreaterThan(0);
+  });
+
   it('keeps the left-pane neighbour border at the scrollable pane edge', () => {
     // C1 carries a right border. Pulling the frozen B1 value into the
     // scrollable pane must not stop D1, the pane's first visible column, from
