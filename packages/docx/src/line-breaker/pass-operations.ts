@@ -42,6 +42,8 @@ import {
   leadingAutoSpacePx,
   segLetterSpacingPx,
   charSpacingDeltaPx,
+  condensedSpacingMayFloor,
+  type NaturalClusterAdvance,
   protectedNoBreakOffsets,
   hardJoinPrefixEnd,
   legalTextSplitAtOrBefore,
@@ -1175,7 +1177,22 @@ export function performSegNaturalAdvance(
     measureText(s).width + verticalInkExtra(s, s.text),
     characterGrid,
     scale,
+    condensedNaturalClusters(operationState, s, s.text),
   ) + leadingAutoSpacePx(operationState, s);
+}
+
+/** Per-cluster natural advances for WORD_CONDENSED_SPACING_ADVANCE_FLOOR, only
+ * when `text` (a slice of `s` at `start`) can reach the zero floor. */
+function condensedNaturalClusters(
+  operationState: Pick<PassOperationState, 'measurement' | 'scale' | 'characterGrid'>,
+  s: LayoutTextSeg,
+  text: string,
+  start = 0,
+): readonly NaturalClusterAdvance[] | undefined {
+  const { measurement, scale, characterGrid } = operationState;
+  return condensedSpacingMayFloor(s, characterGrid, scale)
+    ? measurement.naturalClusterAdvances(s, text, start)
+    : undefined;
 }
 
 /** The committed line's last item is text: a following segment's automatic
@@ -1256,6 +1273,7 @@ export function performStrNaturalAdvance(
       shaped.advancePt + verticalInkExtra(s, text),
       characterGrid,
       scale,
+      condensedNaturalClusters(operationState, s, text, Math.max(0, start)),
     ) + leading;
   }
   const natural = measurement.measureRunText(s, text).width;
@@ -1264,6 +1282,7 @@ export function performStrNaturalAdvance(
     natural + verticalInkExtra(s, text),
     characterGrid,
     scale,
+    condensedNaturalClusters(operationState, s, text, Math.max(0, start)),
   ) + leading;
 }
 
@@ -1584,6 +1603,7 @@ export function performTextSegmentBox(
     measured.width + verticalInkExtra(s, s.text),
     characterGrid,
     scale,
+    condensedNaturalClusters(operationState, s, s.text),
   ) + leadingAutoSpacePx(operationState, s);
   s.snapGridNaturalWidthPx = width;
   // Max-content uses the unbroken native context, as its ordinary intrinsic

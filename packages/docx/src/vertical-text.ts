@@ -1,4 +1,5 @@
-import { textSpacingAdvance } from './character-spacing.js';
+import { graphemeClusterOffsets } from '@silurus/ooxml-core';
+import { condensedClusterFloorPx, textSpacingAdvance } from './character-spacing.js';
 // ECMA-376 §17.6.20 vertical writing (`<w:textDirection w:val="tbRl">`) — the
 // glyph-level primitives for rendering a page that has been laid out in the
 // SWAPPED logical coordinate space and rotated +90° into physical space by the
@@ -352,26 +353,50 @@ export function planVerticalRunWithCapability(
   const emBoxCenterPt = emBoxCenterAboveBaseline(ctx, text, fontPt);
   let ax = 0;
   let sourceOffset = 0;
+  const charSpacingPt = letterSpacingPt - characterGridDeltaPt;
+  // WORD_CONDENSED_SPACING_ADVANCE_FLOOR: no character advance below zero.
+  const mayFloor = letterSpacingPt < 0 || characterGridDeltaPt < 0;
+  const flooredAdvance = (unit: string, scaledNaturalPt: number): number =>
+    scaledNaturalPt
+      + textSpacingAdvance(unit, characterGridDeltaPt, charSpacingPt, letterSpacingPt)
+      + (mayFloor
+        ? condensedClusterFloorPx(unit, scaledNaturalPt, characterGridDeltaPt, charSpacingPt)
+        : 0);
   for (const piece of splitVerticalOrientationRuns(text)) {
     if (piece.mode === 'sideways') {
-      const advancePt = ctx.measureText(piece.text).width * charScale
-        + textSpacingAdvance(piece.text, characterGridDeltaPt, letterSpacingPt - characterGridDeltaPt, letterSpacingPt);
       const drawOffsetPt = { xPt: 0, yPt: emBoxCenterPt };
-      const blockAxisInkBounds = plannedVerticalBlockAxisInkBounds(
-        ctx, piece.text, 'sideways', drawOffsetPt, charScale, writingMode, false,
-      );
-      cells.push({
-        range: { start: sourceOffset, end: sourceOffset + piece.text.length },
-        text: piece.text,
-        orientation: 'sideways',
-        originPt: ax,
-        advancePt,
-        drawOffsetPt,
-        verticalFeature: false,
-        ...(blockAxisInkBounds ? { blockAxisInkBounds } : {}),
-      });
-      ax += advancePt;
-      sourceOffset += piece.text.length;
+      const offsets = [...new Set([0, ...graphemeClusterOffsets(piece.text), piece.text.length])]
+        .sort((a, b) => a - b);
+      const units = mayFloor
+        ? offsets.slice(0, -1).map((start, index) => piece.text.slice(start, offsets[index + 1]))
+        : [];
+      // An over-condensed cluster stops the pen at its floor, which a shared
+      // Canvas letterSpacing cannot express: paint each cluster from its origin.
+      const splitPiece = units.some((unit) =>
+        condensedClusterFloorPx(
+          unit, ctx.measureText(unit).width * charScale, characterGridDeltaPt, charSpacingPt,
+        ) > 0);
+      for (const unit of splitPiece ? units : [piece.text]) {
+        const advancePt = splitPiece
+          ? flooredAdvance(unit, ctx.measureText(unit).width * charScale)
+          : ctx.measureText(unit).width * charScale
+            + textSpacingAdvance(unit, characterGridDeltaPt, charSpacingPt, letterSpacingPt);
+        const blockAxisInkBounds = plannedVerticalBlockAxisInkBounds(
+          ctx, unit, 'sideways', drawOffsetPt, charScale, writingMode, false,
+        );
+        cells.push({
+          range: { start: sourceOffset, end: sourceOffset + unit.length },
+          text: unit,
+          orientation: 'sideways',
+          originPt: ax,
+          advancePt,
+          drawOffsetPt,
+          verticalFeature: false,
+          ...(blockAxisInkBounds ? { blockAxisInkBounds } : {}),
+        });
+        ax += advancePt;
+        sourceOffset += unit.length;
+      }
       continue;
     }
     for (const ch of piece.text) {
@@ -382,8 +407,7 @@ export function planVerticalRunWithCapability(
         && bracketCp === null
         && verticalTrUprightFallback(cp);
       const routed = routedVerticalGlyphCell(ctx, ch, cp, vertCapability, growTrRotateInk);
-      const advancePt = routed.naturalPx * charScale
-        + textSpacingAdvance(ch, characterGridDeltaPt, letterSpacingPt - characterGridDeltaPt, letterSpacingPt);
+      const advancePt = flooredAdvance(ch, routed.naturalPx * charScale);
       const range = { start: sourceOffset, end: sourceOffset + ch.length };
       if (routed.vert !== null) {
         const drawOffsetPt = { xPt: 0, yPt: 0 };

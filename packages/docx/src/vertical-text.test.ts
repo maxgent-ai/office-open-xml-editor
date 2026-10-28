@@ -50,6 +50,24 @@ describe('planVerticalRunWithCapability (retained vertical paint geometry)', () 
     ]);
   });
 
+  // #1975 WORD_CONDENSED_SPACING_ADVANCE_FLOOR: an over-condensed character
+  // advances zero; a sideways piece that floors paints per cluster.
+  it('floors over-condensed vertical cells at zero advance', () => {
+    const { ctx } = mockCtx();
+    ctx.measureText = (text: string) => ({
+      width: [...text].reduce((sum, c) => sum + (c === 'i' ? 4 : 10), 0),
+    } as TextMetrics);
+    const cells = planVerticalRunWithCapability(ctx, 'Mi字字', 10, -6);
+    expect(cells.map(c => [c.text, c.orientation, c.advancePt])).toEqual([
+      ['M', 'sideways', 4], ['i', 'sideways', 0], ['字', 'upright', 4], ['字', 'upright', 4],
+    ]);
+    expect(cells.map(c => c.originPt)).toEqual([0, 4, 6, 10]);
+    const deep = planVerticalRunWithCapability(ctx, '字', 10, -30);
+    expect(deep[0]!.advancePt).toBe(0);
+    // Unfloored pieces keep one contextual operation.
+    expect(planVerticalRunWithCapability(ctx, 'MM', 10, -2).map(c => c.text)).toEqual(['MM']);
+  });
+
   it('retains the font em-box cross-axis correction for a sideways phone number', () => {
     const { ctx } = mockCtx({
       fontBoundingBoxAscent: 10,

@@ -1,6 +1,11 @@
 import { countedSpacingAdvance, countSpacingCharacters, textSpacingAdvance } from '../character-spacing.js';
 import { ownValue } from '@silurus/ooxml-core/internal/own-key';
-import { charSpacingDeltaPx, segmentCharacterGridDeltaPx } from '../line-breaker/advance.js';
+import {
+  charSpacingDeltaPx,
+  condensedClusterFloorPx,
+  condensedSpacingMayFloor,
+  segmentCharacterGridDeltaPx,
+} from '../line-breaker/advance.js';
 import {
   authoredReferenceVerticalMetric,
   mayUseAuthoredReferenceVerticalMetric,
@@ -431,14 +436,26 @@ function contextualAdvance(segment: MeasuredTextPlanSegment, text: string): numb
   if (!segment.textLayoutService || !segment.textShapeRequest) {
     throw new Error('Kashida acquisition requires the retained TextLayoutService authority');
   }
-  const shaped = segment.textLayoutService.shape({
-    ...replaceTextShapeRequest(segment.textShapeRequest, text),
-    measure: true,
-  });
   const scaleX = segment.basePaintOps[0]?.scaleX ?? 1;
   const pitchPt = segment.basePaintOps[0]?.letterSpacingPt ?? 0;
   const gridPt = segment.characterGridDeltaPt ?? 0;
-  return shaped.advancePt * scaleX + textSpacingAdvance(text, gridPt, pitchPt - gridPt, pitchPt);
+  // WORD_CONDENSED_SPACING_ADVANCE_FLOOR, as in segAdvanceWidth.
+  const floors = pitchPt < 0 || gridPt < 0;
+  const shaped = segment.textLayoutService.shape({
+    ...replaceTextShapeRequest(segment.textShapeRequest, text),
+    measure: true,
+    ...(floors ? { clusterGeometry: true } : {}),
+  });
+  const floorPt = floors
+    ? (shaped.clusters ?? []).reduce((sum, cluster) => sum + condensedClusterFloorPx(
+        text.slice(cluster.range.start, cluster.range.end),
+        cluster.advancePt * scaleX,
+        gridPt,
+        pitchPt - gridPt,
+      ), 0)
+    : 0;
+  return shaped.advancePt * scaleX + textSpacingAdvance(text, gridPt, pitchPt - gridPt, pitchPt)
+    + floorPt;
 }
 
 function keepGraphemeSafeCuts(
@@ -846,7 +863,11 @@ export function planLine(input: PlanLineInput): LineLayout {
   const kashida = applyJustify ? kashidaLevel(input.alignment) : null;
   if (kashida && lineSlackPt > 0) {
     const distribution = computeKashidaDistribution(
-      segments.map((segment) => segment.kind === 'text' ? { text: segment.text } : {}),
+      // Kashida rewrites one contextual paint operation; a segment already
+      // split into cluster-origin operations offers no elongation point.
+      segments.map((segment) => segment.kind === 'text' && segment.basePaintOps.length === 1
+        ? { text: segment.text }
+        : {}),
       lineSlackPt,
       kashida,
       (segmentIndex, text) => {
@@ -2231,11 +2252,24 @@ function textPlanSegment(
   }
   let precedingScalars = 0;
   let precedingPitchBearing = 0;
+  // WORD_CONDENSED_SPACING_ADVANCE_FLOOR: the same per-cluster floor the
+  // breaker folded into measuredWidth (segAdvanceWidth).
+  const condensedFloors = condensedSpacingMayFloor(segment, characterGrid, 1);
+  let precedingFloorPt = 0;
+  /** Source starts of clusters whose advance took the floor. */
+  const flooredClusterStarts = new Set<number>();
   let clusters = (shapedClusters ?? []).map((cluster, index) => {
     const prefix = segment.text.slice(0, cluster.range.start);
     const text = segment.text.slice(cluster.range.start, cluster.range.end);
     const counts = countSpacingCharacters(text);
-    const clusterSpacingPt = countedSpacingAdvance(counts, gridPt, trackingPt, pitchPt);
+    const clusterFloorPt = condensedFloors
+      ? condensedClusterFloorPx(text, cluster.advancePt * scaleX, gridPt, trackingPt)
+      : 0;
+    const clusterSpacingPt = countedSpacingAdvance(counts, gridPt, trackingPt, pitchPt)
+      + clusterFloorPt;
+    const clusterPrecedingFloorPt = precedingFloorPt;
+    precedingFloorPt += clusterFloorPt;
+    if (clusterFloorPt > 0) flooredClusterStarts.add(sourceOffset + cluster.range.start);
     const prefixSpacingPt = countedSpacingAdvance(
       { scalars: precedingScalars, pitchBearing: precedingPitchBearing }, gridPt, trackingPt, pitchPt,
     );
@@ -2271,6 +2305,7 @@ function textPlanSegment(
           + (segment.leadingWordBoundaryPx ?? 0)
           + (segment.autoSpaceLeadingPx ?? 0)
           + prefixSpacingPt
+          + clusterPrecedingFloorPt
           + precedingWidthBalanceAdjustment
           + precedingPunctuationCompression,
         yPt: baselineOffsetPt,
@@ -2382,8 +2417,11 @@ function textPlanSegment(
     : 1;
   const hasInternalPunctuationCompression = segment.punctuationCompressions
     ?.some((compression) => compression.end < segment.text.length) ?? false;
+  // A floored cluster cannot share Canvas letterSpacing with its neighbours:
+  // its pen must stop at the floor, so it paints from its own retained origin.
+  const hasFlooredClusters = flooredClusterStarts.size > 0;
   const clusterOriginPaintOps = !segment.verticalRun && !segment.tateChuYoko
-    && hasInternalPunctuationCompression;
+    && (hasInternalPunctuationCompression || hasFlooredClusters);
   const unpaddedPaintOps = segment.verticalRun
     ? (() => {
         if (!verticalGlyphMeasurement) {
@@ -2440,7 +2478,7 @@ function textPlanSegment(
           glyphOrientation: 'upright' as const,
           ...(tateChuYokoScaleY !== 1 ? { scaleY: tateChuYokoScaleY } : {}),
         }))
-      : hasInternalPunctuationCompression
+      : clusterOriginPaintOps
         ? (() => {
             const template = paintOps[0]!;
             const groups: Array<{
@@ -2448,14 +2486,17 @@ function textPlanSegment(
               end: number;
               offset: typeof clusters[number]['offset'];
               adjustmentPt: number | null;
+              floored: boolean;
             }> = [];
             for (const cluster of clusters) {
               const relativeEnd = cluster.range.end - sourceOffset;
               const adjustmentPt = segment.punctuationCompressions
                 ?.find((compression) => compression.end === relativeEnd)
                 ?.adjustmentPt ?? null;
+              const floored = flooredClusterStarts.has(cluster.range.start);
               const previous = groups.at(-1);
-              if (previous && previous.adjustmentPt === adjustmentPt) {
+              if (previous && !floored && !previous.floored
+                && previous.adjustmentPt === adjustmentPt) {
                 previous.end = cluster.range.end;
               } else {
                 groups.push({
@@ -2463,6 +2504,7 @@ function textPlanSegment(
                   end: cluster.range.end,
                   offset: cluster.offset,
                   adjustmentPt,
+                  floored,
                 });
               }
             }
@@ -2544,7 +2586,7 @@ function textPlanSegment(
       letterSpacingPt:
         segment.verticalRun && operation.glyphOrientation !== 'sideways'
           ? 0
-          : hasInternalPunctuationCompression
+          : clusterOriginPaintOps
             ? operation.letterSpacingPt
             : pitchPt,
       ...(!segment.verticalRun && segment.selectedFaceInkBounds

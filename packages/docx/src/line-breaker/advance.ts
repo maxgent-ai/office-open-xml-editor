@@ -1,4 +1,5 @@
-import { countSpacingCharacters } from '../character-spacing.js';
+import { condensedClusterFloorPx, countSpacingCharacters } from '../character-spacing.js';
+export { condensedClusterFloorPx };
 import { sliceTextBreakWindow } from './text-break-window.js';
 import { graphemeClusterOffsets } from '@silurus/ooxml-core';
 import { EAST_ASIAN_RE, sliceTextShapeRequest, semanticSlotStartIndex } from '../layout/text.js';
@@ -459,15 +460,68 @@ export function segLetterSpacingPx(
 }
 
 
+/** One grapheme cluster's natural (unspaced, unscaled) advance, in the same
+ * px space as the caller's natural segment width. */
+export interface NaturalClusterAdvance {
+  readonly text: string;
+  readonly advancePx: number;
+}
+
+
+/** WORD_CONDENSED_SPACING_ADVANCE_FLOOR: §17.3.2.35 removes pitch "after each
+ * character" but never moves the pen backwards. Word floors each character's
+ * advance (scaled glyph + grid delta + run pitch) at zero, so an over-condensed
+ * character stacks on its successor and the run, its line fit, alignment and
+ * decorations all use the floored advance. True only when some character of
+ * the segment can reach a negative advance; ordinary text never pays for the
+ * per-cluster probe. §17.3.2.14 fitText and §17.3.2.10 tate-chu-yoko own their
+ * allocation and are outside this rule. */
+export function condensedSpacingMayFloor(
+  seg: LayoutTextSeg,
+  grid: DocGridCtx | undefined,
+  scale: number,
+): boolean {
+  if (seg.fitTextPerGapPx !== undefined || seg.tateChuYoko) return false;
+  const gridPx = segmentCharacterGridDeltaPx(seg, grid, scale);
+  return gridPx + charSpacingDeltaPx(seg, scale) < 0 || gridPx < 0;
+}
+
+
+/** Total {@link condensedClusterFloorPx} over a segment's clusters. Without a
+ * cluster breakdown the text is one unit, which is exact for a single
+ * cluster and keeps any other caller's advance non-negative. */
+export function condensedSpacingFloorPx(
+  seg: LayoutTextSeg,
+  naturalWidthPx: number,
+  grid: DocGridCtx | undefined,
+  scale: number,
+  clusters?: readonly NaturalClusterAdvance[],
+): number {
+  if (!condensedSpacingMayFloor(seg, grid, scale)) return 0;
+  const gridPx = segmentCharacterGridDeltaPx(seg, grid, scale);
+  const spacingPx = charSpacingDeltaPx(seg, scale);
+  const charScale = charScaleFactor(seg);
+  const units = clusters ?? [{ text: seg.text, advancePx: naturalWidthPx }];
+  let floorPx = 0;
+  for (const unit of units) {
+    floorPx += condensedClusterFloorPx(unit.text, unit.advancePx * charScale, gridPx, spacingPx);
+  }
+  return floorPx;
+}
+
+
 /** A text segment's laid-out advance including the §17.3.2.43 horizontal scale
  *  and §17.3.2.35 character spacing on top of the docGrid delta. Scale natural
  *  glyph width first, then add run pitch per rendered character;
- *  these are independent OOXML properties. */
+ *  these are independent OOXML properties. Over-condensed characters take
+ *  the {@link condensedSpacingMayFloor} zero floor; callers that can reach it
+ *  pass the segment's natural cluster advances. */
 export function segAdvanceWidth(
   seg: LayoutTextSeg,
   naturalWidthPx: number,
   grid: DocGridCtx | undefined,
   scale: number,
+  clusters?: readonly NaturalClusterAdvance[],
 ): number {
   if (seg.fitTextPerGapPx !== undefined) {
     const charCount = [...seg.text].length;
@@ -495,7 +549,8 @@ export function segAdvanceWidth(
     charSpacingDeltaPx(seg, scale),
   )
     + widthBalanceSpaceAdjustmentTotalPt(seg, grid) * scale * charScaleFactor(seg)
-    + punctuationCompressionTotalPt(seg) * scale;
+    + punctuationCompressionTotalPt(seg) * scale
+    + condensedSpacingFloorPx(seg, naturalWidthPx, grid, scale, clusters);
 }
 
 

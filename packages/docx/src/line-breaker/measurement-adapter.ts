@@ -1,8 +1,9 @@
 import { wordArabicTextKerned, wordKerningApplies } from '../layout/line-compatibility.js';
 import type { LayoutTextSeg } from '../line-layout.js';
 import type { MeasurementTextContext, VerticalGlyphMeasurementService } from '../layout/measurement-capabilities.js';
-import { calcEffectiveFontPx, semanticSlotStartIndex } from '../layout/text.js';
-import { charScaleFactor } from './advance.js';
+import { graphemeClusterOffsets } from '@silurus/ooxml-core';
+import { calcEffectiveFontPx, semanticSlotStartIndex, sliceTextShapeRequest } from '../layout/text.js';
+import { charScaleFactor, type NaturalClusterAdvance } from './advance.js';
 import { verticalRunInkExtra } from './vertical-text.js';
 
 /** Ownership retains the source's slots even after emergency slicing. Only
@@ -169,6 +170,38 @@ export class LineMeasurementAdapter {
     });
     if (physicalUnit && !(joined.spans.length === 1 && joined.spans[0]?.semanticSlotSpans)) return 0;
     return (joined.advancePt - measure(l).advancePt - measure(r).advancePt) * charScaleFactor(right);
+  }
+
+  /** Natural advance of each grapheme cluster of `segment.text[start, start +
+   * text.length)`, from the same authority as {@link measureSegment} /
+   * {@link measureRunText}. Input to WORD_CONDENSED_SPACING_ADVANCE_FLOOR. */
+  naturalClusterAdvances(
+    segment: LayoutTextSeg,
+    text: string,
+    start = 0,
+  ): readonly NaturalClusterAdvance[] {
+    if (segment.textLayoutService && segment.textShapeRequest) {
+      if (segment.textShapeRequest.text !== segment.text
+        || segment.text.slice(start, start + text.length) !== text) {
+        throw new Error('Cluster measurement does not match its retained text range context');
+      }
+      const shaped = segment.textLayoutService.shape({
+        ...sliceTextShapeRequest(segment.textShapeRequest, start, start + text.length),
+        fontSizePt: calcEffectiveFontPx(segment, this.scale),
+        measure: true,
+        clusterGeometry: true,
+      });
+      return (shaped.clusters ?? []).map((cluster) => ({
+        text: text.slice(cluster.range.start, cluster.range.end),
+        advancePx: cluster.advancePt,
+      }));
+    }
+    const offsets = [...new Set([0, ...graphemeClusterOffsets(text), text.length])]
+      .sort((a, b) => a - b);
+    return offsets.slice(0, -1).map((offset, index) => {
+      const cluster = text.slice(offset, offsets[index + 1]);
+      return { text: cluster, advancePx: this.measureRunText(segment, cluster).width };
+    });
   }
 
   measureRunText(segment: LayoutTextSeg, text: string): TextMetrics {

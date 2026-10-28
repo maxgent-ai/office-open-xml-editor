@@ -11,6 +11,7 @@ import {
   hasCJKBreakOpportunity,
   layoutLines,
   segAdvanceWidth,
+  condensedSpacingMayFloor,
   snapToCharsAllocatedWidthPx,
   snapToCharsClass,
   slicedPunctuationCompressions,
@@ -352,14 +353,27 @@ function measureTextRange(
     }
     previousCandidate = candidate;
     const measureCandidate = (measured: LayoutTextSeg): number => {
+      // WORD_CONDENSED_SPACING_ADVANCE_FLOOR needs each cluster's natural advance.
+      const floors = condensedSpacingMayFloor(measured, characterGrid, 1);
       if (measured.textLayoutService && measured.textShapeRequest) {
         const shaped = measured.textLayoutService.shape({
           ...measured.textShapeRequest,
           fontSizePt: calcEffectiveFontPx(measured, 1),
           measure: true,
-          clusterGeometry: false,
+          clusterGeometry: floors,
         });
-        return segAdvanceWidth(measured, shaped.advancePt, characterGrid, 1);
+        return segAdvanceWidth(
+          measured,
+          shaped.advancePt,
+          characterGrid,
+          1,
+          floors
+            ? (shaped.clusters ?? []).map((cluster) => ({
+                text: measured.text.slice(cluster.range.start, cluster.range.end),
+                advancePx: cluster.advancePt,
+              }))
+            : undefined,
+        );
       }
       measurer.context.font = buildFont(
         measured.bold,
@@ -369,11 +383,21 @@ function measureTextRange(
         measurer.fontFamilyClasses as Record<string, string>,
         measured.fontRoute,
       );
+      const offsets = floors
+        ? [...new Set([0, ...graphemeClusterOffsets(measured.text), measured.text.length])]
+            .sort((a, b) => a - b)
+        : [];
       return segAdvanceWidth(
         measured,
         measurer.context.measureText(measured.text).width,
         characterGrid,
         1,
+        floors
+          ? offsets.slice(0, -1).map((offset, index) => {
+              const text = measured.text.slice(offset, offsets[index + 1]);
+              return { text, advancePx: measurer.context.measureText(text).width };
+            })
+          : undefined,
       );
     };
     const kind = snapToCharsClass(candidate, characterGrid);

@@ -43,4 +43,22 @@ export function countedSpacingAdvance(
     : scalars * characterGridDeltaPx + pitchBearing * charSpacingPx;
 }
 
+/** Advance one cluster gains from the zero floor: the amount by which its
+ * scaled glyph advance plus its counted grid/run pitch falls below zero. */
+export function condensedClusterFloorPx(
+  text: string,
+  scaledNaturalPx: number,
+  characterGridDeltaPx: number,
+  charSpacingPx: number,
+): number {
+  const raw = scaledNaturalPx
+    + countedSpacingAdvance(
+      countSpacingCharacters(text),
+      characterGridDeltaPx,
+      charSpacingPx,
+      characterGridDeltaPx + charSpacingPx,
+    );
+  return raw < 0 ? -raw : 0;
+}
+
 const COMBINING_MARK = /^\p{M}$/u;
