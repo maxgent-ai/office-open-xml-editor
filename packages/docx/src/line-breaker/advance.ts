@@ -506,29 +506,28 @@ export function condensedSpacingMayFloor(
 }
 
 
-/** Punctuation compression (§17.15.1.18 projection) owned by the unit ending
- * in `(start, end]`, in the segment's points. */
-function unitPunctuationCompressionPt(seg: LayoutTextSeg, start: number, end: number): number {
-  return seg.punctuationCompressions
-    ?.filter((compression) => compression.end > start && compression.end <= end)
-    .reduce((sum, compression) => sum + compression.adjustmentPt, 0)
-    ?? 0;
-}
-
-
-/** Punctuation compression plus width balance of `seg.text[start, end)` (px):
- * the per-character adjustments the floor covers together with the glyph and
- * pitch. Vertical planning receives it as `characterAdjustmentPt`. */
-export function condensedCharacterAdjustmentPx(
+/** Punctuation compression plus width balance of a source range of
+ * `seg.text` (px): the per-character adjustments the floor covers together
+ * with the glyph and pitch. Built once per segment in linear time (each
+ * compression is owned by the unit containing its end offset); vertical
+ * planning receives it as `characterAdjustmentPt`. */
+export function condensedCharacterAdjustments(
   seg: LayoutTextSeg,
   grid: DocGridCtx | undefined,
   scale: number,
-  start: number,
-  end: number,
-): number {
-  return unitPunctuationCompressionPt(seg, start, end) * scale
-    + widthBalanceSpaceAdjustmentForTextPt(seg, seg.text.slice(start, end), grid)
-      * scale * charScaleFactor(seg);
+): (start: number, end: number) => number {
+  const compressionBefore = new Float64Array(seg.text.length + 2);
+  for (const compression of seg.punctuationCompressions ?? []) {
+    if (compression.end >= 0 && compression.end <= seg.text.length) {
+      compressionBefore[compression.end + 1]! += compression.adjustmentPt;
+    }
+  }
+  for (let index = 1; index < compressionBefore.length; index += 1) {
+    compressionBefore[index]! += compressionBefore[index - 1]!;
+  }
+  const charScale = charScaleFactor(seg);
+  return (start, end) => (compressionBefore[end + 1]! - compressionBefore[start + 1]!) * scale
+    + widthBalanceSpaceAdjustmentForTextPt(seg, seg.text.slice(start, end), grid) * scale * charScale;
 }
 
 
@@ -545,17 +544,20 @@ export function condensedUnitAdvancesPx(
   const gridPx = segmentCharacterGridDeltaPx(seg, grid, scale);
   const spacingPx = charSpacingDeltaPx(seg, scale);
   const charScale = charScaleFactor(seg);
+  const adjustmentPx = units.kind === 'natural-clusters'
+    ? condensedCharacterAdjustments(seg, grid, scale)
+    : undefined;
   let offset = 0;
   const list = units.kind === 'natural-clusters' ? units.clusters : units.cells;
   const advances = list.map((unit) => {
     const start = offset;
     offset += unit.text.length;
-    return units.kind === 'natural-clusters'
+    return adjustmentPx
       ? unit.advancePx * charScale
         + countedSpacingAdvance(
           countSpacingCharacters(unit.text), gridPx, spacingPx, gridPx + spacingPx,
         )
-        + condensedCharacterAdjustmentPx(seg, grid, scale, start, offset)
+        + adjustmentPx(start, offset)
       : unit.advancePx;
   });
   if (offset !== seg.text.length) {

@@ -68,13 +68,14 @@ export function condensedClusterFloorPx(
  * ligature context), so floor probes stay linear in the text length. */
 export const CONDENSED_CONTEXT_GRAPHEMES = 4;
 
-/** Whether `text` contains a character that joins cursively (Unicode
- * Joining_Type D, R, L or C). Canvas applies no tracking inside cursive
- * scripts, so a floored cursive run is painted as one contextual operation. */
+/** Whether `text` contains a cursively joining letter (Unicode Joining_Type
+ * D, R or L; join controls and transparent marks alone are not letters).
+ * Canvas applies no tracking inside cursive scripts, so floored cursive
+ * clusters stay in their contextual paint operation. */
 export function hasCursiveJoining(text: string): boolean {
   for (const character of text) {
     const type = joiningType(character.codePointAt(0)!);
-    if (type === 'D' || type === 'R' || type === 'L' || type === 'C') return true;
+    if (type === 'D' || type === 'R' || type === 'L') return true;
   }
   return false;
 }

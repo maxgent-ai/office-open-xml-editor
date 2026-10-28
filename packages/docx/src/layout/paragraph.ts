@@ -7,7 +7,7 @@ import {
 import { ownValue } from '@silurus/ooxml-core/internal/own-key';
 import {
   charSpacingDeltaPx,
-  condensedCharacterAdjustmentPx,
+  condensedCharacterAdjustments,
   condensedClusterFloorPx,
   condensedSpacingMayFloor,
   condensedUnitAdvancesPx,
@@ -2501,8 +2501,7 @@ function textPlanSegment(
       charScale: scaleX,
       growTrRotateInk: true,
       writingMode: projected.paintOps[0]!.writingMode,
-      characterAdjustmentPt: (start, end) =>
-        condensedCharacterAdjustmentPx(segment, characterGrid, 1, start, end),
+      characterAdjustmentPt: condensedCharacterAdjustments(segment, characterGrid, 1),
     });
     if (planned.some((cell) => cell.floored)) {
       flooredVerticalCells = planned;
@@ -2619,10 +2618,18 @@ function textPlanSegment(
     ?.some((compression) => compression.end < segment.text.length) ?? false;
   // A floored cluster cannot share Canvas letterSpacing with its neighbours:
   // its pen must stop at the floor, so it paints from its own retained origin.
-  // Cursive text stays one contextual operation: splitting it would break its
-  // joined forms, and Canvas applies no tracking inside cursive scripts, so
-  // its paint is untracked whatever the pitch (only its advance is floored).
-  const hasFlooredClusters = flooredClusterNaturalPt.size > 0 && !hasCursiveJoining(segment.text);
+  // A cursive cluster stays in its contextual operation: splitting it would
+  // break its joined forms, and Canvas applies no tracking inside cursive
+  // scripts, so its paint is untracked whatever the pitch.
+  const splitFlooredStarts = new Set<number>();
+  if (flooredClusterNaturalPt.size > 0) {
+    for (const cluster of clusters) {
+      if (flooredClusterNaturalPt.has(cluster.range.start) && !hasCursiveJoining(
+        segment.text.slice(cluster.range.start - sourceOffset, cluster.range.end - sourceOffset),
+      )) splitFlooredStarts.add(cluster.range.start);
+    }
+  }
+  const hasFlooredClusters = splitFlooredStarts.size > 0;
   const clusterOriginPaintOps = !segment.verticalRun && !segment.tateChuYoko
     && (hasInternalPunctuationCompression || hasFlooredClusters);
   const unpaddedPaintOps = segment.verticalRun
@@ -2681,7 +2688,7 @@ function textPlanSegment(
               const adjustmentPt = segment.punctuationCompressions
                 ?.find((compression) => compression.end === relativeEnd)
                 ?.adjustmentPt ?? null;
-              const floored = flooredClusterNaturalPt.has(cluster.range.start);
+              const floored = splitFlooredStarts.has(cluster.range.start);
               const previous = groups.at(-1);
               if (previous && !floored && !previous.floored
                 && previous.adjustmentPt === adjustmentPt) {
@@ -2768,10 +2775,13 @@ function textPlanSegment(
       ...operation,
       ...(segment.optionalHyphenGlyph ? { range: { start: sourceOffset, end: sourceOffset } } : {}),
       offset: { ...operation.offset,
-        xPt: operation.offset.xPt + (segment.leadingWordBoundaryPx ?? 0)
-          // Punctuation-compressed groups take their origins from the
-          // clusters, which already hold the automatic East Asian gap.
-          + (clusterOriginPaintOps ? 0 : segment.autoSpaceLeadingPx ?? 0) },
+        // Cluster-origin groups (punctuation compression, condensed floor)
+        // take their origins from the clusters, which already hold the word
+        // boundary and the automatic East Asian gap.
+        xPt: clusterOriginPaintOps
+          ? operation.offset.xPt
+          : operation.offset.xPt + (segment.leadingWordBoundaryPx ?? 0)
+            + (segment.autoSpaceLeadingPx ?? 0) },
       // Measurement resolves w:spacing, docGrid character pitch, and w:fitText
       // into one authoritative per-scalar pitch. A planned vertical upright or
       // rotate cell already owns that pitch in its retained origin and advance;

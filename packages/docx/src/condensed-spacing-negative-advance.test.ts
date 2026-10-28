@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { layoutBodyModel } from './test-support/document-layout.test-support.js';
 import { segAdvanceWidth, type CondensedAdvanceUnits, type LayoutTextSeg } from './line-layout.js';
+import { condensedCharacterAdjustments } from './line-breaker/advance.js';
 import { LineMeasurementAdapter } from './line-breaker/measurement-adapter.js';
 import { paintLayoutPage } from './paint/canvas-page.js';
 import { planVerticalRunWithCapability } from './vertical-text.js';
@@ -217,6 +218,18 @@ describe('#1975 condensed floor in right-to-left text', () => {
     expect(run.clusters.map((c) => c.advancePt)).toEqual([4, 0, 4]);
   });
 
+  it('splits floored non-cursive clusters beside cursive text in one segment', () => {
+    // A w:cs run keeps Latin, Arabic and join controls in one segment. The
+    // ZWJ is pitch-bearing, so 'M\u200D' (10 - 2 x 6) floors too.
+    for (const [text, expected] of [
+      ['MiMب', [['M', -6], ['i', 0], ['Mب', -6]]],
+      ['MiM\u200D', [['M', -6], ['i', 0], ['M\u200D', 0]]],
+    ] as const) {
+      const [line] = lines([para([textRun(text, { charSpacing: -6, cs: true } as Partial<DocxTextRun>)])]);
+      expect(byText(line!, text).paintOps.map((op) => [op.text, op.letterSpacingPt])).toEqual(expected);
+    }
+  });
+
   it('paints a floored non-cursive cluster without internal pitch', async () => {
     const layout = layoutOf([para(
       [textRun('מיא', { rtl: true, charSpacing: -6 })],
@@ -312,6 +325,22 @@ describe('segAdvanceWidth condensed floor', () => {
   });
 });
 
+describe('condensed character adjustments', () => {
+  it('assigns each compression to the unit holding its end, in linear time', () => {
+    const text = '甲、'.repeat(20_000);
+    const segment = {
+      ...textRun(text, { charSpacing: -1 }), measuredWidth: 0,
+      punctuationCompressions: Array.from({ length: 20_000 }, (_, index) => ({
+        end: index * 2 + 2, adjustmentPt: -5,
+      })),
+    } as unknown as LayoutTextSeg;
+    const adjustment = condensedCharacterAdjustments(segment, undefined, 1);
+    expect(adjustment(0, 1)).toBe(0);
+    expect(adjustment(1, 2)).toBe(-5);
+    expect(adjustment(0, text.length)).toBe(-100_000);
+  });
+});
+
 describe('condensed advance units work', () => {
   function countingContext(): { ctx: CanvasRenderingContext2D; measured: () => number } {
     let units = 0;
@@ -347,6 +376,7 @@ describe('condensed advance units work', () => {
       planRun: (input: Parameters<VerticalGlyphMeasurementService['planRun']>[0]) => planVerticalRunWithCapability(
         ctx, input.text, input.fontSizePt, input.letterSpacingPt, input.charScale,
         input.growTrRotateInk, () => false, input.writingMode, input.characterGridDeltaPt,
+        input.characterAdjustmentPt,
       ),
     } as unknown as VerticalGlyphMeasurementService);
     const text = 'ffiffiあいう'.repeat(25);

@@ -401,33 +401,46 @@ export function planVerticalRunWithCapability(
           })
         : [];
       const unitPlaces = units.map((unit) => unitAdvance(unit.text, unit.start, unit.naturalPt * charScale));
-      const floors = unitPlaces.some((placed) => placed.floored);
-      const cursive = floors && hasCursiveJoining(piece.text);
-      const splitPiece = floors && !cursive;
-      for (const { text: unit, start, naturalPt } of splitPiece
-        ? units
-        : [{ text: piece.text, start: sourceOffset, naturalPt: ctx.measureText(piece.text).width }]) {
-        const placed = cursive
-          ? {
-              advancePt: unitPlaces.reduce((sum, unitPlaced) => sum + unitPlaced.advancePt, 0),
-              floored: true,
-            }
-          : unitAdvance(unit, start, naturalPt * charScale);
+      // Floored: non-cursive graphemes paint from their own origins; each run
+      // of cursive graphemes stays one contextual cell (Canvas does not track
+      // inside cursive scripts) advancing by its graphemes' floored sum.
+      const pieceCells: Array<{ text: string; start: number; advancePt: number; floored: boolean }> =
+        unitPlaces.some((placed) => placed.floored)
+          ? []
+          : (() => {
+              const placed = unitAdvance(piece.text, sourceOffset, ctx.measureText(piece.text).width * charScale);
+              return [{ text: piece.text, start: sourceOffset, advancePt: placed.advancePt, floored: placed.floored }];
+            })();
+      if (pieceCells.length === 0) {
+        units.forEach((unit, index) => {
+          const placed = unitPlaces[index]!;
+          const previous = pieceCells.at(-1);
+          const cursive = hasCursiveJoining(unit.text);
+          if (cursive && previous && hasCursiveJoining(previous.text)) {
+            previous.text += unit.text;
+            previous.advancePt += placed.advancePt;
+            previous.floored ||= placed.floored;
+          } else {
+            pieceCells.push({ text: unit.text, start: unit.start, advancePt: placed.advancePt, floored: placed.floored });
+          }
+        });
+      }
+      for (const cell of pieceCells) {
         const blockAxisInkBounds = plannedVerticalBlockAxisInkBounds(
-          ctx, unit, 'sideways', drawOffsetPt, charScale, writingMode, false,
+          ctx, cell.text, 'sideways', drawOffsetPt, charScale, writingMode, false,
         );
         cells.push({
-          range: { start, end: start + unit.length },
-          text: unit,
+          range: { start: cell.start, end: cell.start + cell.text.length },
+          text: cell.text,
           orientation: 'sideways',
           originPt: ax,
-          advancePt: placed.advancePt,
+          advancePt: cell.advancePt,
           drawOffsetPt,
           verticalFeature: false,
           ...(blockAxisInkBounds ? { blockAxisInkBounds } : {}),
-          ...(placed.floored ? { floored: true as const } : {}),
+          ...(cell.floored ? { floored: true as const } : {}),
         });
-        ax += placed.advancePt;
+        ax += cell.advancePt;
       }
       sourceOffset += piece.text.length;
       continue;

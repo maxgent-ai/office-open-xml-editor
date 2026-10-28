@@ -1140,6 +1140,28 @@ describe('paragraphLayoutFromMeasurement retained authorities', () => {
     ]);
   });
 
+  it('paints cluster-origin operations at their retained origins once (#1975)', () => {
+    // A floored cluster splits paint into cluster-origin operations; their
+    // origins already hold the leading word-boundary adjustment.
+    const segment = {
+      text: 'MiM', sourceRunIndex: 0, measuredWidth: 6.5,
+      fontSize: 10, fontFamily: 'Test Sans', fontRoute,
+      charSpacing: -6, leadingWordBoundaryPx: -1.5,
+      shapedClusters: [
+        { range: { start: 0, end: 1 }, offsetPt: 0, advancePt: 10 },
+        { range: { start: 1, end: 2 }, offsetPt: 10, advancePt: 4 },
+        { range: { start: 2, end: 3 }, offsetPt: 14, advancePt: 10 },
+      ],
+    } as unknown as LayoutTextSeg;
+    const node = projectMeasuredSegment(paragraph, segment, acquisitionContext);
+    const placement = node.lines[0]?.placements[0];
+    if (placement?.kind !== 'text') throw new Error('expected retained text placement');
+    expect(placement.clusters.map((cluster) => [cluster.offset.xPt, cluster.advancePt]))
+      .toEqual([[-1.5, 4], [2.5, 0], [2.5, 4]]);
+    expect(placement.paintOps.map((op) => [op.text, op.offset.xPt]))
+      .toEqual([['M', -1.5], ['i', 2.5], ['M', 2.5]]);
+  });
+
   it('retains balanced authored-space width in LTR cluster geometry', () => {
     const segment = {
       text: 'AB  ', sourceRunIndex: 0, measuredWidth: 18,
