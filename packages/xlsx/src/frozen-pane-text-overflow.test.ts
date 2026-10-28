@@ -37,6 +37,7 @@ const STYLES: Styles = {
     { fontId: 0, fillId: 0, borderId: 0, numFmtId: 0, alignH: 'center', wrapText: false },
     { fontId: 0, fillId: 0, borderId: 2, numFmtId: 0, alignH: 'left', wrapText: false },
     { fontId: 0, fillId: 0, borderId: 1, numFmtId: 0, alignH: 'right', wrapText: false },
+    { fontId: 0, fillId: 0, borderId: 0, numFmtId: 0, alignH: 'centerContinuous', wrapText: false },
   ] as Styles['cellXfs'],
   numFmts: [],
   dxfs: [],
@@ -48,6 +49,7 @@ const RIGHT_BORDER_XF = 2;
 const CENTER_XF = 3;
 const LEFT_HAIR_BORDER_XF = 4;
 const RIGHT_ALIGNED_RIGHT_BORDER_XF = 5;
+const CENTER_CONTINUOUS_XF = 6;
 
 function cell(col: number, text: string, styleIndex = LEFT_XF): Cell {
   return { row: 1, col, styleIndex, value: { type: 'text', text } } as Cell;
@@ -319,6 +321,31 @@ describe('text overflow across a frozen-column boundary', () => {
     const columnPx = headerX(texts, 'B') - headerX(texts, 'A');
     const columnA = headerX(texts, 'A') - columnPx / 2;
     expect(runs[0].x).toBeCloseTo(columnA + 4 * columnPx, 6);
+  });
+
+  it('keeps a frozen centre-across-selection label in place when another row overflows', () => {
+    // C1:E1 share centerContinuous; E2 spills into the frozen pane, which
+    // must not re-centre C1's selection in the frozen pane.
+    const ws = worksheet([
+      cell(3, 'HELLO', CENTER_CONTINUOUS_XF),
+      { row: 1, col: 4, styleIndex: CENTER_CONTINUOUS_XF, value: { type: 'empty' } } as Cell,
+      { row: 1, col: 5, styleIndex: CENTER_CONTINUOUS_XF, value: { type: 'empty' } } as Cell,
+    ]);
+    const alone = recordingContext();
+    renderViewport(alone.ctx, ws, STYLES, { row: 1, col: 4, rows: 2, cols: 6 },
+      { width: 600, height: 60, freezeCols: 3 });
+    const before = paneSplit(alone.texts, 'HELLO').frozen;
+
+    ws.rows = [...ws.rows, { index: 2, height: null, cells: [
+      { row: 2, col: 5, styleIndex: RIGHT_XF, value: { type: 'text', text: RIGHT } } as Cell,
+    ] }];
+    const mixed = recordingContext();
+    renderViewport(mixed.ctx, ws, STYLES, { row: 1, col: 4, rows: 2, cols: 6 },
+      { width: 600, height: 60, freezeCols: 3 });
+
+    expect(paneSplit(mixed.texts, RIGHT).frozen).toHaveLength(1);
+    expect(paneSplit(mixed.texts, 'HELLO').frozen.map((t) => t.x)).toEqual(before.map((t) => t.x));
+    expect(before).toHaveLength(1);
   });
 
   it('reports each value once, from the pane that owns its column', () => {
