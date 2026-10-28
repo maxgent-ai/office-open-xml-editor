@@ -3,6 +3,7 @@ import {
   countSpacingCharacters,
   bidiLevelChanges,
   hasCursiveJoining,
+  resolvedBidiLevels,
   textSpacingAdvance,
 } from '../character-spacing.js';
 import { ownValue } from '@silurus/ooxml-core/internal/own-key';
@@ -35,7 +36,6 @@ import {
   autoContrastColor,
   canvasFontString,
   createCanvasFontRoute,
-  getDefaultBidiEngine,
   hasStrongRtl,
 } from '@silurus/ooxml-core';
 import { quoteCssFontFamily } from '@silurus/ooxml-core/internal/css-font-family';
@@ -711,8 +711,12 @@ function retainedRtlPaintOperations(
   });
 }
 
-/** UAX#9 X9: the level the bidi engine reports for a removed control. */
-const UAX9_REMOVED_LEVEL = 255;
+/** A placed operation is level-uniform; drawing it in its level's direction
+ * lets Canvas resolve its neutrals and mirrored brackets as they resolve in
+ * the whole text. */
+function levelDirection(level: number): 'ltr' | 'rtl' {
+  return level % 2 === 1 ? 'rtl' : 'ltr';
+}
 
 /** WORD_CONDENSED_SPACING_ADVANCE_FLOOR splits a segment's paint at floored
  * clusters, and Canvas resolves bidirectional order only inside one
@@ -810,17 +814,16 @@ function flooredVisualPaintOperations(
   if (!operations.some((operation) => operation.naturalAdvancePt !== undefined)) return operations;
   const visibleText = text.slice(0, visibleEnd - textStart);
   if (!splitPaintNeedsBidi(visibleText, direction)) return operations;
-  const { levels, paragraphLevel } = getDefaultBidiEngine().computeLevels(visibleText, direction);
+  const levels = resolvedBidiLevels(visibleText, direction);
   const advances = operationVisibleAdvancesPt(operations, clusters, visibleEnd);
   const visible = operations.flatMap((operation, index) => operation.range.start < visibleEnd ? [index] : []);
   const placed = bidiPlacedOffsets(visible.map((index) => {
     const operation = operations[index]!;
-    const level = levels[operation.range.start - textStart]!;
     return {
       xPt: operation.offset.xPt,
       advancePt: advances[index]!,
       ...(operation.naturalAdvancePt !== undefined ? { drawnAdvancePt: operation.naturalAdvancePt } : {}),
-      level: level === UAX9_REMOVED_LEVEL ? paragraphLevel : level,
+      level: levels[operation.range.start - textStart]!,
     };
   }));
   let visibleEndPt = 0;
@@ -830,7 +833,11 @@ function flooredVisualPaintOperations(
   let member = 0;
   return operations.map((operation) => {
     if (operation.range.start < visibleEnd) {
-      return { ...operation, offset: { ...operation.offset, xPt: placed[member++]! } };
+      return {
+        ...operation,
+        offset: { ...operation.offset, xPt: placed[member++]! },
+        direction: levelDirection(levels[operation.range.start - textStart]!),
+      };
     }
     return direction === 'rtl'
       ? { ...operation, offset: { ...operation.offset, xPt: visibleEndPt - operation.offset.xPt } }
@@ -871,19 +878,20 @@ function flooredVerticalPaintOperations(
       ? text.slice(pieceStart - textStart, operations[end - 1]!.range.end - textStart)
       : '';
     if (end - index > 1 && splitPaintNeedsBidi(pieceText, direction)) {
-      const { levels, paragraphLevel } = getDefaultBidiEngine().computeLevels(pieceText, direction);
+      const levels = resolvedBidiLevels(pieceText, direction);
       const members = operations.slice(index, end);
-      const offsets = bidiPlacedOffsets(members.map((operation, member) => {
-        const level = levels[operation.range.start - pieceStart]!;
-        return {
-          xPt: operation.offset.xPt,
-          advancePt: advances[index + member]!,
-          ...(operation.naturalAdvancePt !== undefined ? { drawnAdvancePt: operation.naturalAdvancePt } : {}),
-          level: level === UAX9_REMOVED_LEVEL ? paragraphLevel : level,
-        };
-      }));
+      const offsets = bidiPlacedOffsets(members.map((operation, member) => ({
+        xPt: operation.offset.xPt,
+        advancePt: advances[index + member]!,
+        ...(operation.naturalAdvancePt !== undefined ? { drawnAdvancePt: operation.naturalAdvancePt } : {}),
+        level: levels[operation.range.start - pieceStart]!,
+      })));
       members.forEach((operation, member) => {
-        placed[index + member] = { ...operation, offset: { ...operation.offset, xPt: offsets[member]! } };
+        placed[index + member] = {
+          ...operation,
+          offset: { ...operation.offset, xPt: offsets[member]! },
+          direction: levelDirection(levels[operation.range.start - pieceStart]!),
+        };
       });
     }
     index = Math.max(end, index + 1);
@@ -1344,7 +1352,7 @@ export function planLine(input: PlanLineInput): LineLayout {
       const placedPaintOps = ((textGeometry.paintOps[0]?.writingMode ?? 'horizontal-tb') !== 'horizontal-tb'
         ? flooredVerticalPaintOperations
         : flooredVisualPaintOperations)(
-        textGeometry.paintOps,
+        textGeometry.paintOps.map((operation) => ({ ...operation, direction })),
         textGeometry.clusters,
         segment.text,
         segment.range.start,
@@ -1408,7 +1416,7 @@ export function planLine(input: PlanLineInput): LineLayout {
         highlightBounds,
         advancePt: widthPt,
         clusters: textGeometry.clusters,
-        paintOps: paintOps.map((operation) => ({ ...operation, direction })),
+        paintOps,
         decorations,
         ...(emphasis ? { emphasis } : {}),
         direction,

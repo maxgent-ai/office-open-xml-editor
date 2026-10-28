@@ -83,12 +83,39 @@ export function hasCursiveJoining(text: string): boolean {
 
 const COMBINING_MARK = /^\p{M}$/u;
 
+/** UAX#9 X9: the level the bidi engine reports for a removed control. */
+const UAX9_REMOVED_LEVEL = 255;
+
+/** UAX#9 levels of `text` as Canvas resolves it in `direction` (no higher-
+ * level overrides). A code unit removed by X9 (join controls, soft hyphen,
+ * embedding controls) takes the level of the preceding retained one, or the
+ * following one at the start (UAX#9 §5.2), so it never breaks a run. */
+export function resolvedBidiLevels(text: string, direction: 'ltr' | 'rtl'): Uint8Array {
+  const { levels, paragraphLevel } = getDefaultBidiEngine().computeLevels(text, direction);
+  const resolved = Uint8Array.from(levels);
+  let previous = -1;
+  let pendingFrom = -1;
+  for (let index = 0; index < resolved.length; index += 1) {
+    if (resolved[index] === UAX9_REMOVED_LEVEL) {
+      if (previous >= 0) resolved[index] = previous;
+      else if (pendingFrom < 0) pendingFrom = index;
+      continue;
+    }
+    if (pendingFrom >= 0) {
+      resolved.fill(resolved[index]!, pendingFrom, index);
+      pendingFrom = -1;
+    }
+    previous = resolved[index]!;
+  }
+  if (pendingFrom >= 0) resolved.fill(paragraphLevel, pendingFrom);
+  return resolved;
+}
+
 /** Whether the UAX#9 level of `text[index]` differs from the previous code
  * unit's in either paint direction. */
 export function bidiLevelChanges(text: string): (index: number) => boolean {
-  const engine = getDefaultBidiEngine();
-  const ltr = engine.computeLevels(text, 'ltr').levels;
-  const rtl = engine.computeLevels(text, 'rtl').levels;
+  const ltr = resolvedBidiLevels(text, 'ltr');
+  const rtl = resolvedBidiLevels(text, 'rtl');
   return (index) => index > 0 && index < text.length
     && (ltr[index] !== ltr[index - 1] || rtl[index] !== rtl[index - 1]);
 }

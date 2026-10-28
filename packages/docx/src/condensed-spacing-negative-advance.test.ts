@@ -237,15 +237,16 @@ describe('#1975 condensed floor in right-to-left text', () => {
 
   it.each([
     ['horizontal', undefined,
-      [['אב', 'rtl', 16], ['A', 'rtl', 8], ['i', 'rtl', 12], ['B', 'rtl', 12], ['גד', 'rtl', 0]]],
+      [['אב', 'rtl', 16], ['A', 'ltr', 8], ['i', 'ltr', 12], ['B', 'ltr', 12], ['גד', 'rtl', 0]]],
     // A floored vertical piece paints one cell per grapheme.
     ['vertical', 'tbRl',
-      [['א', 'rtl', 20], ['ב', 'rtl', 16], ['A', 'rtl', 8], ['i', 'rtl', 12], ['B', 'rtl', 12],
+      [['א', 'rtl', 20], ['ב', 'rtl', 16], ['A', 'ltr', 8], ['i', 'ltr', 12], ['B', 'ltr', 12],
         ['ג', 'rtl', 4], ['ד', 'rtl', 0]]],
   ] as const)('keeps embedded left-to-right order in a floored right-to-left run (%s)', (_name, textDirection, expected) => {
     // אב, A, i (floored), B, גד at logical 0, 8, 12, 12, 16 over width 24.
     // UAX#9 (base RTL): AiB is level 2 and keeps its order, so visually
-    // גד | A i B | אב, as one contextual Canvas operation would draw it.
+    // גד | A i B | אב, as one contextual Canvas operation would draw it; each
+    // operation draws in its level's direction.
     const node = layoutBodyModel(
       [para([textRun('אבAiBגד', { rtl: true, charSpacing: -6 })], { bidi: true } as Partial<DocParagraph>)],
       textDirection ? { ...section, textDirection } as SectionProps : section,
@@ -256,11 +257,54 @@ describe('#1975 condensed floor in right-to-left text', () => {
       .toEqual(expected);
   });
 
+  it.each([
+    ['horizontal', undefined, [['אב', 26], ['A\u00ADB', 8], ['i', 26], ['גד', 0]]],
+    ['vertical', 'tbRl',
+      [['א', 30], ['ב', 26], ['A', 8], ['\u00AD', 12], ['B', 22], ['i', 26], ['ג', 4], ['ד', 0]]],
+  ] as const)('does not let a removed control break an embedded run (%s)', (_name, textDirection, expected) => {
+    // U+00AD (stub width 10, no pitch) is removed by UAX#9 X9 and takes its
+    // neighbours' level: A, U+00AD, B and the floored i stay one LTR run
+    // (8..26), visually between גד and אב.
+    const text = 'אבA\u00ADBiגד';
+    // U+00AD is removed by UAX#9 X9; A, B and the floored i keep their order.
+    const node = layoutBodyModel(
+      [para([textRun(text, { rtl: true, charSpacing: -6 })], { bidi: true } as Partial<DocParagraph>)],
+      textDirection ? { ...section, textDirection } as SectionProps : section,
+      makeCtx(),
+    ).pages[0]!.layers.body[0]!;
+    if (node.kind !== 'paragraph') throw new Error('expected a paragraph');
+    const ops = byText(node.lines[0]!, text).paintOps;
+    expect(ops.map((op) => [op.text, op.offset.xPt])).toEqual(expected);
+  });
+
+  it('keeps a join control inside its vertical cursive group', () => {
+    // U+200D is removed by UAX#9 X9; it must not split ب‍ت's contextual cell.
+    const node = layoutBodyModel(
+      [para([textRun('ب\u200Dت', { rtl: true, charSpacing: -12 })], { bidi: true } as Partial<DocParagraph>)],
+      { ...section, textDirection: 'tbRl' } as SectionProps,
+      makeCtx(),
+    ).pages[0]!.layers.body[0]!;
+    if (node.kind !== 'paragraph') throw new Error('expected a paragraph');
+    expect(byText(node.lines[0]!, 'ب\u200Dت').paintOps.map((op) => op.text)).toEqual(['ب\u200Dت']);
+  });
+
+  it('draws a split operation in its own level direction', () => {
+    // "A-" resolves to level 2 inside the RTL text; drawn alone with RTL
+    // direction Canvas would make the trailing "-" level 1 and reorder it.
+    const [line] = lines([para(
+      [textRun('אבA-iBגד', { rtl: true, charSpacing: -6 })],
+      { bidi: true } as Partial<DocParagraph>,
+    )]);
+    const ops = byText(line!, 'אבA-iBגד').paintOps;
+    expect(ops.find((op) => op.text === 'A-')?.direction).toBe('ltr');
+    expect(ops.find((op) => op.text === 'אב')?.direction).toBe('rtl');
+  });
+
   it('places a floored mixed word as Canvas orders it', () => {
     // ab (level 2), ג, י (floored), ד (level 1): visually ד/י | ג | ab.
     const [line] = lines([para([textRun('abגיד', { charSpacing: -6 })])]);
     expect(byText(line!, 'abגיד').paintOps.map((op) => [op.text, op.direction, op.offset.xPt]))
-      .toEqual([['ab', 'rtl', 8], ['ג', 'rtl', 4], ['י', 'rtl', 0], ['ד', 'rtl', 0]]);
+      .toEqual([['ab', 'ltr', 8], ['ג', 'rtl', 4], ['י', 'rtl', 0], ['ד', 'rtl', 0]]);
   });
 
   it('keeps a floored cursive run as one contextual operation', () => {
