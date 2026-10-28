@@ -625,11 +625,9 @@ function condensedFlooredAdvancePx(
 /** The single contextual-advance authority for
  * WORD_CONDENSED_SPACING_ADVANCE_FLOOR, used by line fitting and retained
  * geometry alike: each grapheme of `segment.text[start, end)` measured with up
- * to {@link CONDENSED_CONTEXT_GRAPHEMES} following graphemes of the same slice,
- * minus that context. A pair adjustment (kerning) therefore belongs to the
- * earlier grapheme, as shaped glyph positions place it, so a cluster painted
- * from its own origin sits where contextual shaping puts it. Linear in the
- * slice length; every measured UTF-16 unit is charged to `reserveWork`. */
+ * to {@link CONDENSED_CONTEXT_GRAPHEMES} preceding graphemes of the same slice,
+ * minus that context. Linear in the slice length; every measured UTF-16 unit
+ * is charged to `reserveWork`. */
 export function contextualGraphemeAdvances(
   segment: LayoutTextSeg,
   start: number,
@@ -663,10 +661,10 @@ export function contextualGraphemeAdvances(
   for (let index = 0; index < offsets.length - 1; index += 1) {
     const clusterStart = offsets[index]!;
     const clusterEnd = offsets[index + 1]!;
-    const contextEnd = offsets[Math.min(offsets.length - 1, index + 1 + CONDENSED_CONTEXT_GRAPHEMES)]!;
+    const contextStart = offsets[Math.max(0, index - CONDENSED_CONTEXT_GRAPHEMES)]!;
     clusters.push({
       text: segment.text.slice(clusterStart, clusterEnd),
-      advancePx: width(clusterStart, contextEnd) - width(clusterEnd, contextEnd),
+      advancePx: width(contextStart, clusterEnd) - width(contextStart, clusterStart),
     });
   }
   return clusters;

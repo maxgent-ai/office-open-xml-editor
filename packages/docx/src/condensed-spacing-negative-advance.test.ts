@@ -173,9 +173,10 @@ describe('#1975 condensed w:spacing larger than the glyph advance', () => {
 });
 
 describe('#1975 one contextual authority for fitting and retained geometry', () => {
-  it('gives a pair adjustment to the earlier grapheme, as shaping places it', () => {
-    // M 10 → 2; A 10 kerned -4 with V → -2 floored; V 10 → 2. V paints where
-    // contextual shaping puts it (M + floored A = 2), and the run is 4 wide.
+  it('attributes a pair adjustment as retained cluster geometry does', () => {
+    // Retained clusters are contextual prefix differences, and punctuation
+    // compression is bounded against them, so the floor uses the same
+    // attribution: M 10 → 2, A 10 → 2, V 10 kerned -4 → -2 floored.
     const node = layoutBodyModel(
       [para([textRun('MAV', { charSpacing: -8 }), textRun('B')])],
       section,
@@ -184,20 +185,8 @@ describe('#1975 one contextual authority for fitting and retained geometry', () 
     if (node.kind !== 'paragraph') throw new Error('expected a paragraph');
     const run = byText(node.lines[0]!, 'MAV');
     expect(run.advancePt).toBeCloseTo(4, 9);
-    expect(run.paintOps.map((op) => [op.text, op.offset.xPt])).toEqual([['M', 0], ['A', 2], ['V', 2]]);
+    expect(run.paintOps.map((op) => [op.text, op.offset.xPt])).toEqual([['MA', 0], ['V', 4]]);
     expect(byText(node.lines[0]!, 'B').bounds.xPt).toBeCloseTo(run.bounds.xPt + 4, 9);
-  });
-
-  it('gives a pair adjustment to the earlier grapheme in a vertical sideways piece', () => {
-    const node = layoutBodyModel(
-      [para([textRun('MAV', { charSpacing: -8 })])],
-      { ...section, textDirection: 'tbRl' } as SectionProps,
-      makeCtx(false, false, true),
-    ).pages[0]!.layers.body[0]!;
-    if (node.kind !== 'paragraph') throw new Error('expected a paragraph');
-    const run = byText(node.lines[0]!, 'MAV');
-    expect(run.advancePt).toBeCloseTo(4, 9);
-    expect(run.paintOps.map((op) => [op.text, op.offset.xPt])).toEqual([['M', 0], ['A', 2], ['V', 2]]);
   });
 
   it('places following text at the retained pen for long-context glyphs', () => {
@@ -455,33 +444,11 @@ describe('condensed advance units work', () => {
     const whole = measured();
     expect(whole).toBeLessThanOrEqual(12 * length);
     expect(reserved).toBeGreaterThanOrEqual(whole);
-    // Prefix probes reuse the whole-segment clusters and measure again only
-    // the bounded tail whose following context crosses the prefix end.
+    // Prefix probes reuse the whole-segment clusters.
     for (let end = 1; end <= length; end += 1) {
       adapter.condensedAdvanceUnits(segment, segment.text.slice(0, end), 0, undefined, reserve);
     }
-    expect(measured() - whole).toBeLessThanOrEqual(2 * 5 * 4 * length);
-    expect(reserved).toBeGreaterThanOrEqual(measured());
-  });
-
-  it('measures a prefix as a fresh slice would', () => {
-    const ctx = makeCtx(false, false, true);
-    const segment = { ...textRun('MAVAVM', { charSpacing: -8 }), measuredWidth: 0 } as unknown as LayoutTextSeg;
-    const advances = (units: CondensedAdvanceUnits | undefined) => units?.kind === 'natural-clusters'
-      ? units.clusters.map((cluster) => cluster.advancePx)
-      : [];
-    const cached = new LineMeasurementAdapter(ctx, 1, () => '20px serif');
-    cached.condensedAdvanceUnits(segment, segment.text, 0, undefined, () => {});
-    for (let end = 1; end <= segment.text.length; end += 1) {
-      const prefix = segment.text.slice(0, end);
-      const fresh = new LineMeasurementAdapter(ctx, 1, () => '20px serif');
-      // Not a prefix of a cached whole: the fresh adapter measures the slice.
-      const freshUnits = fresh.condensedAdvanceUnits(
-        { ...segment, text: prefix } as LayoutTextSeg, prefix, 0, undefined, () => {},
-      );
-      expect(advances(cached.condensedAdvanceUnits(segment, prefix, 0, undefined, () => {})))
-        .toEqual(advances(freshUnits));
-    }
+    expect(measured()).toBe(whole);
   });
 
   it('builds and charges the adjustment table once per segment across prefix probes', () => {

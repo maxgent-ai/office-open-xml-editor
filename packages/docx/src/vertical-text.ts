@@ -390,7 +390,7 @@ export function planVerticalRunWithCapability(
       const drawOffsetPt = { xPt: 0, yPt: emBoxCenterPt };
       const offsets = [...new Set([0, ...graphemeClusterOffsets(piece.text), piece.text.length])]
         .sort((a, b) => a - b);
-      // Contextual grapheme advances (bounded following context, as line
+      // Contextual grapheme advances (bounded preceding context, as line
       // fitting measures them): an over-condensed cluster stops the pen at its
       // floor, which a shared Canvas letterSpacing cannot express, so the
       // piece then paints each cluster from its own origin. Cursive text stays
@@ -399,12 +399,12 @@ export function planVerticalRunWithCapability(
       const units = mayFloor
         ? offsets.slice(0, -1).map((start, index) => {
             const end = offsets[index + 1]!;
-            const context = offsets[Math.min(offsets.length - 1, index + 1 + CONDENSED_CONTEXT_GRAPHEMES)]!;
+            const context = offsets[Math.max(0, index - CONDENSED_CONTEXT_GRAPHEMES)]!;
             return {
               text: piece.text.slice(start, end),
               start: sourceOffset + start,
-              naturalPt: ctx.measureText(piece.text.slice(start, context)).width
-                - (end < context ? ctx.measureText(piece.text.slice(end, context)).width : 0),
+              naturalPt: ctx.measureText(piece.text.slice(context, end)).width
+                - (context < start ? ctx.measureText(piece.text.slice(context, start)).width : 0),
             };
           })
         : [];

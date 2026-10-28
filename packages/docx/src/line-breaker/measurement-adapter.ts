@@ -200,11 +200,9 @@ export class LineMeasurementAdapter {
    * Vertical runs use the planned glyph cells paint draws. Horizontal text uses
    * each grapheme cluster's contextual advance from {@link contextualGraphemeAdvances},
    * the authority retained geometry shares, so a probe is linear in its length. Whole-segment
-   * units are computed once per segment text and reused by its prefixes; a
-   * cluster's context looks forward only {@link CONDENSED_CONTEXT_GRAPHEMES}
-   * graphemes, so a prefix measures again just its clusters whose context
-   * crosses its end. Work is charged to `reserveWork` in the UTF-16 units
-   * measured. */
+   * units are computed once per segment text and reused by its prefixes (a
+   * cluster's context never looks forward). Work is charged to `reserveWork`
+   * in the UTF-16 units measured. */
   condensedAdvanceUnits(
     segment: LayoutTextSeg,
     text: string,
@@ -262,11 +260,6 @@ export class LineMeasurementAdapter {
       }
       if (end === text.length) {
         reserveWork(clusters.length);
-        if (end === segment.text.length) return { kind: 'natural-clusters', clusters };
-        // The last clusters' following context crosses the prefix end.
-        const tail = clusters.splice(Math.max(0, clusters.length - CONDENSED_CONTEXT_GRAPHEMES));
-        const tailStart = end - tail.reduce((sum, cluster) => sum + cluster.text.length, 0);
-        clusters.push(...this.contextualClusters(segment, tailStart, end, reserveWork));
         return { kind: 'natural-clusters', clusters };
       }
     }
