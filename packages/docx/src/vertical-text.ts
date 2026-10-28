@@ -1,5 +1,5 @@
 import { graphemeClusterOffsets } from '@silurus/ooxml-core';
-import { condensedClusterFloorPx, textSpacingAdvance } from './character-spacing.js';
+import { CONDENSED_CONTEXT_GRAPHEMES, condensedClusterFloorPx, textSpacingAdvance } from './character-spacing.js';
 // ECMA-376 §17.6.20 vertical writing (`<w:textDirection w:val="tbRl">`) — the
 // glyph-level primitives for rendering a page that has been laid out in the
 // SWAPPED logical coordinate space and rotated +90° into physical space by the
@@ -356,30 +356,41 @@ export function planVerticalRunWithCapability(
   const charSpacingPt = letterSpacingPt - characterGridDeltaPt;
   // WORD_CONDENSED_SPACING_ADVANCE_FLOOR: no character advance below zero.
   const mayFloor = letterSpacingPt < 0 || characterGridDeltaPt < 0;
-  const flooredAdvance = (unit: string, scaledNaturalPt: number): number =>
-    scaledNaturalPt
-      + textSpacingAdvance(unit, characterGridDeltaPt, charSpacingPt, letterSpacingPt)
-      + (mayFloor
-        ? condensedClusterFloorPx(unit, scaledNaturalPt, characterGridDeltaPt, charSpacingPt)
-        : 0);
+  const flooredAdvance = (unit: string, scaledNaturalPt: number): number => {
+    const raw = scaledNaturalPt
+      + textSpacingAdvance(unit, characterGridDeltaPt, charSpacingPt, letterSpacingPt);
+    return mayFloor && raw < 0 ? 0 : raw;
+  };
   for (const piece of splitVerticalOrientationRuns(text)) {
     if (piece.mode === 'sideways') {
       const drawOffsetPt = { xPt: 0, yPt: emBoxCenterPt };
       const offsets = [...new Set([0, ...graphemeClusterOffsets(piece.text), piece.text.length])]
         .sort((a, b) => a - b);
+      // Contextual grapheme advances (bounded preceding context, as line
+      // fitting measures them): an over-condensed cluster stops the pen at its
+      // floor, which a shared Canvas letterSpacing cannot express, so the
+      // piece then paints each cluster from its own origin.
       const units = mayFloor
-        ? offsets.slice(0, -1).map((start, index) => piece.text.slice(start, offsets[index + 1]))
+        ? offsets.slice(0, -1).map((start, index) => {
+            const end = offsets[index + 1]!;
+            const context = offsets[Math.max(0, index - CONDENSED_CONTEXT_GRAPHEMES)]!;
+            return {
+              text: piece.text.slice(start, end),
+              naturalPt: ctx.measureText(piece.text.slice(context, end)).width
+                - (context < start ? ctx.measureText(piece.text.slice(context, start)).width : 0),
+            };
+          })
         : [];
-      // An over-condensed cluster stops the pen at its floor, which a shared
-      // Canvas letterSpacing cannot express: paint each cluster from its origin.
       const splitPiece = units.some((unit) =>
         condensedClusterFloorPx(
-          unit, ctx.measureText(unit).width * charScale, characterGridDeltaPt, charSpacingPt,
+          unit.text, unit.naturalPt * charScale, characterGridDeltaPt, charSpacingPt,
         ) > 0);
-      for (const unit of splitPiece ? units : [piece.text]) {
+      for (const { text: unit, naturalPt } of splitPiece
+        ? units
+        : [{ text: piece.text, naturalPt: ctx.measureText(piece.text).width }]) {
         const advancePt = splitPiece
-          ? flooredAdvance(unit, ctx.measureText(unit).width * charScale)
-          : ctx.measureText(unit).width * charScale
+          ? flooredAdvance(unit, naturalPt * charScale)
+          : naturalPt * charScale
             + textSpacingAdvance(unit, characterGridDeltaPt, charSpacingPt, letterSpacingPt);
         const blockAxisInkBounds = plannedVerticalBlockAxisInkBounds(
           ctx, unit, 'sideways', drawOffsetPt, charScale, writingMode, false,

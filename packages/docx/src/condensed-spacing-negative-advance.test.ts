@@ -2,6 +2,10 @@ import { describe, it, expect } from 'vitest';
 import { layoutBodyModel } from './test-support/document-layout.test-support.js';
 import { segAdvanceWidth, type CondensedAdvanceUnits, type LayoutTextSeg } from './line-layout.js';
 import { LineMeasurementAdapter } from './line-breaker/measurement-adapter.js';
+import { paintLayoutPage } from './paint/canvas-page.js';
+import { planVerticalRunWithCapability } from './vertical-text.js';
+import type { VerticalGlyphMeasurementService } from './layout/measurement-capabilities.js';
+import { makeRecordingCanvas } from './test-support/recording-canvas.test-support.js';
 import type { LineLayout, TextPlacement } from './layout/types.js';
 import type { BodyElement, DocParagraph, DocxTextRun, SectionProps } from './types';
 
@@ -14,7 +18,7 @@ import type { BodyElement, DocParagraph, DocxTextRun, SectionProps } from './typ
 
 /** Stub glyph advance: 'i', 'י' and 'ي' are 0.2 em, U+0640 is 0.1 em, every
  * other character 0.5 em. */
-function makeCtx(contextual = false): CanvasRenderingContext2D {
+function makeCtx(contextual = false, longContext = false): CanvasRenderingContext2D {
   let font = '10px serif';
   const px = () => parseFloat(/(\d+(?:\.\d+)?)px/.exec(font)?.[1] ?? '10');
   const ctx = {
@@ -27,7 +31,10 @@ function makeCtx(contextual = false): CanvasRenderingContext2D {
         width: [...s].reduce((sum, ch, index, all) => sum + p * (
           ch === '\u200D' ? 0 : ch === '\u0640' ? 0.1 : 'iיي'.includes(ch) ? 0.2 : 0.5
         // Optionally a letter after U+0640 takes a 0.2 em wider joined form.
-        ) + (contextual && index > 0 && all[index - 1] === '\u0640' ? p * 0.2 : 0), 0),
+        ) + (contextual && index > 0 && all[index - 1] === '\u0640' ? p * 0.2 : 0)
+        // Optionally each 'l' widens by 0.01 em per preceding 'l' (context
+        // longer than any bounded window).
+        + (longContext && ch === 'l' ? p * 0.01 * all.slice(0, index).filter((c) => c === 'l').length : 0), 0),
         fontBoundingBoxAscent: p * 0.8, fontBoundingBoxDescent: p * 0.2,
         actualBoundingBoxAscent: p * 0.8, actualBoundingBoxDescent: p * 0.2,
       } as TextMetrics;
@@ -60,8 +67,12 @@ function para(runs: DocParagraph['runs'], extra: Partial<DocParagraph> = {}): Bo
   return { type: 'paragraph', ...p } as BodyElement;
 }
 
+function layoutOf(body: BodyElement[], contextual = false, longContext = false) {
+  return layoutBodyModel(body, section, makeCtx(contextual, longContext));
+}
+
 function lines(body: BodyElement[], contextual = false): LineLayout[] {
-  const node = layoutBodyModel(body, section, makeCtx(contextual)).pages[0]!.layers.body[0]!;
+  const node = layoutOf(body, contextual).pages[0]!.layers.body[0]!;
   if (node.kind !== 'paragraph') throw new Error('expected a paragraph');
   return [...node.lines];
 }
@@ -157,6 +168,25 @@ describe('#1975 condensed w:spacing larger than the glyph advance', () => {
   });
 });
 
+describe('#1975 one contextual authority for fitting and retained geometry', () => {
+  it('places following text at the retained pen for long-context glyphs', () => {
+    // 'l' is 10 pt + 0.2 pt per preceding 'l'; at -10.3 the first two floor
+    // and later ones advance by an amount that depends on unbounded context.
+    const layout = layoutOf([para([
+      textRun('A'), textRun('l'.repeat(20), { charSpacing: -10.3 }), textRun('B'),
+    ])], false, true);
+    const node = layout.pages[0]!.layers.body[0]!;
+    if (node.kind !== 'paragraph') throw new Error('expected a paragraph');
+    const line = node.lines[0]!;
+    const run = byText(line, 'l'.repeat(20));
+    const retainedEnd = run.clusters.reduce(
+      (end, cluster) => Math.max(end, cluster.offset.xPt + cluster.advancePt), 0,
+    );
+    expect(run.advancePt).toBeCloseTo(retainedEnd, 9);
+    expect(byText(line, 'B').bounds.xPt).toBeCloseTo(run.bounds.xPt + retainedEnd, 9);
+  });
+});
+
 describe('#1975 condensed floor in right-to-left text', () => {
   it('places floored operations visually from the right edge', () => {
     // מ 10 → 4, י 4 → -2 floored, א 10 → 4: logical origins 0, 4, 4; width 8.
@@ -172,15 +202,53 @@ describe('#1975 condensed floor in right-to-left text', () => {
     expect(byText(line!, 'גד').bounds.xPt + 20).toBeCloseTo(run.bounds.xPt, 9);
   });
 
-  it('keeps the joined form of a floored cluster inside a cursive word', () => {
+  it('keeps joined forms on both sides of every paint boundary a floor creates', () => {
     const [line] = lines([para(
       [textRun('بيت', { rtl: true, charSpacing: -6 })],
       { bidi: true } as Partial<DocParagraph>,
     )]);
-    const floored = byText(line!, 'بيت').paintOps.find((op) => op.range.end - op.range.start === 1
-      && op.naturalAdvancePt !== undefined);
-    expect(floored?.text).toBe('\u200Dي\u200D');
-    expect(floored?.sourceMapping).toBe('joining-context');
+    expect(byText(line!, 'بيت').paintOps.map((op) => [op.text, op.joiners ?? null]))
+      .toEqual([['ب\u200D', 'after'], ['\u200Dي\u200D', 'both'], ['\u200Dت', 'before']]);
+  });
+
+  it('keeps an authored joiner apart from the synthetic ones', () => {
+    // The final cluster 'ي\u200D' carries an authored ZWJ.
+    const [line] = lines([para(
+      [textRun('مي\u200D', { rtl: true, charSpacing: -6 })],
+      { bidi: true } as Partial<DocParagraph>,
+    )]);
+    const ops = byText(line!, 'مي\u200D').paintOps;
+    expect(ops.map((op) => [op.text, op.joiners ?? null]))
+      .toEqual([['م\u200D', 'after'], ['\u200Dي\u200D', 'before']]);
+  });
+
+  it('paints joined operations through retained-slice validation', async () => {
+    for (const text of ['بيت', 'مي\u200D', 'بيت ']) {
+      const layout = layoutOf([para(
+        [textRun(text, { rtl: true, charSpacing: -6 })],
+        { bidi: true } as Partial<DocParagraph>,
+      )]);
+      const { canvas, fills } = makeRecordingCanvas();
+      await paintLayoutPage(layout, 0, canvas, { dpr: 1, scale: 1 });
+      expect(fills.some((fill) => fill.text.includes('\u200D'))).toBe(true);
+    }
+  });
+
+  it('does not open a gap for trailing whitespace', () => {
+    const offsets = (text: string) => {
+      const [line] = lines([para(
+        [textRun(text, { rtl: true, charSpacing: -6 })],
+        { bidi: true } as Partial<DocParagraph>,
+      )]);
+      const run = byText(line!, text);
+      return run.paintOps.filter((op) => op.text.trim() !== '')
+        .map((op) => run.origin.xPt + op.offset.xPt);
+    };
+    // Visible glyphs keep their relative placement whatever whitespace follows.
+    const relative = (xs: number[]) => xs.map((x) => x - xs[0]!);
+    const bare = relative(offsets('מיא'));
+    expect(relative(offsets('מיא '))).toEqual(bare);
+    expect(relative(offsets('מיא  '))).toEqual(bare);
   });
 });
 
@@ -273,5 +341,23 @@ describe('condensed advance units work', () => {
       adapter.condensedAdvanceUnits(segment, segment.text.slice(0, end), 0, undefined, reserve);
     }
     expect(measured()).toBe(whole);
+  });
+
+  it('charges vertical cell planning for every measured unit', () => {
+    const { ctx, measured } = countingContext();
+    const adapter = new LineMeasurementAdapter(ctx, 1, () => '20px serif', {
+      planRun: (input: Parameters<VerticalGlyphMeasurementService['planRun']>[0]) => planVerticalRunWithCapability(
+        ctx, input.text, input.fontSizePt, input.letterSpacingPt, input.charScale,
+        input.growTrRotateInk, () => false, input.writingMode, input.characterGridDeltaPt,
+      ),
+    } as unknown as VerticalGlyphMeasurementService);
+    const text = 'ffiffiあいう'.repeat(25);
+    const segment = {
+      ...textRun(text, { charSpacing: -30 }), measuredWidth: 0, verticalRun: true,
+    } as unknown as LayoutTextSeg;
+    let reserved = 0;
+    adapter.condensedAdvanceUnits(segment, text, 0, undefined, (units) => { reserved += units; });
+    expect(measured()).toBeGreaterThan(0);
+    expect(measured()).toBeLessThanOrEqual(reserved);
   });
 });

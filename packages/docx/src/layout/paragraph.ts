@@ -4,7 +4,11 @@ import {
   charSpacingDeltaPx,
   condensedClusterFloorPx,
   condensedSpacingMayFloor,
+  condensedUnitAdvancesPx,
+  condensedUnitsFloor,
+  contextualGraphemeAdvances,
   segmentCharacterGridDeltaPx,
+  type CondensedAdvanceUnits,
 } from '../line-breaker/advance.js';
 import {
   authoredReferenceVerticalMetric,
@@ -575,6 +579,24 @@ function keepGraphemeSafeCuts(
 /** Merge sorted gap, cluster and paint-op boundaries. Every cursor only moves
  * forward: O(code points + clusters + gaps + operations), including long runs
  * of consecutive spaces. Deltas are owned by the accepted line's gap plan. */
+/** A justification slice of an operation carrying synthetic joiners: the
+ * source slice, keeping a joiner only on an outer side the slice still owns. */
+function joinedSlice(
+  operation: TextPaintOp,
+  segmentText: string,
+  segmentStart: number,
+  start: number,
+  end: number,
+): Pick<TextPaintOp, 'text' | 'joiners'> {
+  const before = start === operation.range.start
+    && (operation.joiners === 'before' || operation.joiners === 'both');
+  const after = end === operation.range.end
+    && (operation.joiners === 'after' || operation.joiners === 'both');
+  const text = `${before ? '\u200D' : ''}${segmentText.slice(start - segmentStart, end - segmentStart)}${after ? '\u200D' : ''}`;
+  const joiners = before && after ? 'both' : before ? 'before' : after ? 'after' : undefined;
+  return joiners ? { text, joiners } : { text };
+}
+
 function retainedTextGeometry(
   segment: MeasuredTextPlanSegment,
   stretch: SegStretch | undefined,
@@ -657,12 +679,12 @@ function retainedTextGeometry(
         throw new Error('Internal paragraph justification is missing retained slice geometry');
       }
       const end = Math.min(operation.range.end, absoluteCuts[gapCursor] ?? operation.range.end);
+      const { joiners: _joiners, ...unjoined } = operation;
       paintOps.push({
-        ...operation,
-        // A joining-context operation is one floored cluster; never cut.
-        text: start === operation.range.start && end === operation.range.end
-          ? operation.text
-          : operation.text.slice(start - operation.range.start, end - operation.range.start),
+        ...unjoined,
+        ...(operation.joiners === undefined
+          ? { text: operation.text.slice(start - operation.range.start, end - operation.range.start) }
+          : joinedSlice(operation, segment.text, segment.range.start, start, end)),
         range: { start, end },
         offset: start === operation.range.start
           ? { ...operation.offset, xPt: operation.offset.xPt + cumulativePt }
@@ -692,11 +714,14 @@ function retainedRtlPaintOperations(
     if (text === '' || text.length === operation.text.length) return [operation];
     if (operation.sourceMapping === 'kashida') return [{ ...operation, text }];
 
-    const trailingStart = operation.range.start + text.length;
+    // Trailing whitespace never joins, so only a leading joiner can remain.
+    const leadingJoiner = operation.joiners === 'before' || operation.joiners === 'both' ? 1 : 0;
+    const trailingStart = operation.range.start + text.length - leadingJoiner;
     const trailingCluster = clusters.find((cluster) => cluster.range.start === trailingStart);
     const {
       inkBounds: _inkBounds,
       blockAxisInkBounds: _blockAxisInkBounds,
+      joiners: _joiners,
       ...zeroInkOperation
     } = operation;
     return [
@@ -726,16 +751,26 @@ function flooredRtlVisualPaintOperations(
   operations: readonly TextPaintOp[],
   clusters: readonly TextClusterLayout[],
   rtlLeadingGapPt: number,
+  visibleEnd: number,
 ): readonly TextPaintOp[] {
   if (!operations.some((operation) => operation.naturalAdvancePt !== undefined)) return operations;
-  const widthPt = clusters.reduce(
-    (edge, cluster) => Math.max(edge, cluster.offset.xPt + cluster.advancePt), 0,
-  );
+  let widthPt = 0;
+  for (const cluster of clusters) {
+    widthPt = Math.max(widthPt, cluster.offset.xPt + cluster.advancePt);
+  }
+  // Operations and clusters both run in source order: one cursor sums each
+  // operation's visible advance (trailing whitespace is trimmed from paint).
+  let cursor = 0;
   return operations.map((operation) => {
-    const advancePt = operation.naturalAdvancePt ?? clusters
-      .filter((cluster) => cluster.range.start >= operation.range.start
-        && cluster.range.end <= operation.range.end)
-      .reduce((sum, cluster) => sum + cluster.advancePt, 0);
+    let visibleAdvancePt = 0;
+    while (cursor < clusters.length && clusters[cursor]!.range.start < operation.range.end) {
+      const cluster = clusters[cursor]!;
+      if (cluster.range.start >= operation.range.start && cluster.range.start < visibleEnd) {
+        visibleAdvancePt += cluster.advancePt;
+      }
+      cursor += 1;
+    }
+    const advancePt = operation.naturalAdvancePt ?? visibleAdvancePt;
     return {
       ...operation,
       offset: {
@@ -1196,7 +1231,12 @@ export function planLine(input: PlanLineInput): LineLayout {
         : 0;
       const paintOps = direction === 'rtl'
         ? retainedRtlPaintOperations(
-            flooredRtlVisualPaintOperations(textGeometry.paintOps, textGeometry.clusters, rtlLeadingGapPt),
+            flooredRtlVisualPaintOperations(
+              textGeometry.paintOps,
+              textGeometry.clusters,
+              rtlLeadingGapPt,
+              segment.range.start + trailingWhitespaceStart,
+            ),
             textGeometry.clusters,
           )
         : textGeometry.paintOps;
@@ -2417,29 +2457,43 @@ function textPlanSegment(
         + clusterPunctuationCompression,
     };
   });
-  // WORD_CONDENSED_SPACING_ADVANCE_FLOOR, as measured by segAdvanceWidth: an
-  // over-condensed cluster advances zero and later clusters follow the floored
-  // pen. Vertical runs take the floor from their planned cells below.
+  // WORD_CONDENSED_SPACING_ADVANCE_FLOOR, from the contextual-advance
+  // authority line fitting measured (segAdvanceWidth): an over-condensed
+  // grapheme advances zero and later graphemes follow the floored pen.
+  // Vertical runs take the floor from their planned cells below.
   /** Natural (scaled, unspaced) advance of each floored cluster, by source start. */
   const flooredClusterNaturalPt = new Map<number, number>();
-  if (!segment.verticalRun && condensedSpacingMayFloor(segment, characterGrid, 1)
-    && clusters.some((cluster) => cluster.advancePt < 0)) {
-    let penPt = clusters[0]?.offset.xPt ?? 0;
-    clusters = clusters.map((cluster, index) => {
-      if (cluster.advancePt < 0) {
-        flooredClusterNaturalPt.set(
-          cluster.range.start,
-          (shapedClusters?.[index]?.advancePt ?? 0) * scaleX,
-        );
-      }
-      const placed = {
-        ...cluster,
-        offset: { ...cluster.offset, xPt: penPt },
-        advancePt: cluster.advancePt > 0 ? cluster.advancePt : 0,
-      };
-      penPt += placed.advancePt;
-      return placed;
-    });
+  if (!segment.verticalRun && condensedSpacingMayFloor(segment, characterGrid, 1)) {
+    // Without a shaping service the retained clusters are the only authority.
+    const units: CondensedAdvanceUnits = {
+      kind: 'natural-clusters',
+      clusters: segment.textLayoutService && segment.textShapeRequest
+        ? contextualGraphemeAdvances(
+            segment, 0, segment.text.length, calcEffectiveFontPx(segment, 1),
+            () => {
+              throw new Error('Condensed cluster acquisition requires TextLayoutService');
+            },
+            () => {},
+          )
+        : (shapedClusters ?? []).map((cluster) => ({
+            text: segment.text.slice(cluster.range.start, cluster.range.end),
+            advancePx: cluster.advancePt,
+          })),
+    };
+    const advances = condensedUnitAdvancesPx(segment, characterGrid, 1, units);
+    if (condensedUnitsFloor(units, advances)) {
+      let penPt = clusters[0]?.offset.xPt ?? 0;
+      let unitStart = sourceOffset;
+      clusters = units.clusters.map((unit, index) => {
+        const range = { start: unitStart, end: unitStart + unit.text.length };
+        unitStart = range.end;
+        const advancePt = advances[index]! > 0 ? advances[index]! : 0;
+        if (advances[index]! < 0) flooredClusterNaturalPt.set(range.start, unit.advancePx * scaleX);
+        const placed = { range, offset: { xPt: penPt, yPt: baselineOffsetPt }, advancePt };
+        penPt += advancePt;
+        return placed;
+      });
+    }
   }
   // Vertical runs paint planned glyph cells; with a floored cell, retained
   // clusters and measurement (CondensedAdvanceUnits 'vertical-cells') follow
@@ -2464,30 +2518,37 @@ function textPlanSegment(
     : undefined;
   let verticalFloorCorrectionPt: number[] | undefined;
   if (verticalCells && condensedSpacingMayFloor(segment, characterGrid, 1)) {
-    const raw = verticalCells.map((cell) => cell.advancePt + (
-      segment.punctuationCompressions
-        ?.filter((compression) =>
-          compression.end > cell.range.start && compression.end <= cell.range.end)
-        .reduce((sum, compression) => sum + compression.adjustmentPt, 0)
-      ?? 0
-    ));
-    if (verticalCells.some((cell, index) => cell.advancePt === 0 || raw[index]! < 0)) {
+    const units: CondensedAdvanceUnits = {
+      kind: 'vertical-cells',
+      cells: verticalCells.map((cell) => ({
+        text: segment.text.slice(cell.range.start, cell.range.end),
+        advancePx: cell.advancePt,
+      })),
+    };
+    const advances = condensedUnitAdvancesPx(segment, characterGrid, 1, units);
+    if (condensedUnitsFloor(units, advances)) {
+      // Paint follows the floored pen: each cell keeps its origin within its
+      // planned cell, moved from the planned cell start to the floored pen.
       let penPt = clusters[0]?.offset.xPt ?? 0;
-      let correctionPt = 0;
+      let cellStartPt = 0;
       const corrections: number[] = [];
       clusters = verticalCells.map((cell, index) => {
-        corrections.push(correctionPt);
-        const advancePt = raw[index]! > 0 ? raw[index]! : 0;
-        correctionPt += advancePt - raw[index]!;
+        const precedingCompressionPt = segment.punctuationCompressions
+          ?.filter((compression) => compression.end <= cell.range.start)
+          .reduce((sum, compression) => sum + compression.adjustmentPt, 0)
+          ?? 0;
+        corrections.push(penPt - cellStartPt - precedingCompressionPt);
+        const advancePt = advances[index]! > 0 ? advances[index]! : 0;
         const placed = {
           range: { start: sourceOffset + cell.range.start, end: sourceOffset + cell.range.end },
           offset: { xPt: penPt, yPt: baselineOffsetPt },
           advancePt,
         };
         penPt += advancePt;
+        cellStartPt += cell.advancePt;
         return placed;
       });
-      if (correctionPt > 0) verticalFloorCorrectionPt = corrections;
+      verticalFloorCorrectionPt = corrections;
     }
   }
   if (segment.latinSpaceCompressionPx && segment.text.endsWith(' ') && clusters.length > 0) {
@@ -2669,24 +2730,24 @@ function textPlanSegment(
               const start = group.start - sourceOffset;
               const end = group.end - sourceOffset;
               const text = segment.text.slice(start, end);
-              if (!group.floored) {
-                return {
-                  ...template,
-                  text,
-                  range: { start: group.start, end: group.end },
-                  offset: group.offset,
-                  letterSpacingPt: pitchPt + (group.adjustmentPt ?? 0),
-                };
-              }
-              const joins = cursiveJoins(segment.text, start, end);
+              // Pieces of a cursive word split around a floored cluster keep
+              // their joined forms on both sides of every new boundary.
+              const joins = hasFlooredClusters
+                ? cursiveJoins(segment.text, start, end)
+                : { before: false, after: false };
+              const joiners = joins.before && joins.after ? 'both' as const
+                : joins.before ? 'before' as const
+                  : joins.after ? 'after' as const : undefined;
               return {
                 ...template,
                 text: `${joins.before ? '\u200D' : ''}${text}${joins.after ? '\u200D' : ''}`,
                 range: { start: group.start, end: group.end },
                 offset: group.offset,
                 letterSpacingPt: pitchPt + (group.adjustmentPt ?? 0),
-                ...(joins.before || joins.after ? { sourceMapping: 'joining-context' as const } : {}),
-                naturalAdvancePt: flooredClusterNaturalPt.get(group.start)!,
+                ...(joiners ? { joiners } : {}),
+                ...(group.floored
+                  ? { naturalAdvancePt: flooredClusterNaturalPt.get(group.start)! }
+                  : {}),
               };
             });
           })()

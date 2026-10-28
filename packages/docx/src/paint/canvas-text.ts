@@ -17,6 +17,10 @@ import {
 import { canvasPaintFrame } from './deferred-paint-frame.js';
 import { applyCanvasTransform } from './canvas-transform.js';
 
+function withJoiners(text: string, joiners: 'before' | 'after' | 'both'): string {
+  return `${joiners === 'after' ? '' : '\u200D'}${text}${joiners === 'before' ? '' : '\u200D'}`;
+}
+
 function validateTextSlices(placement: import('../layout/types.js').TextPlacement): void {
   const optionalGlyph = placement.optionalHyphenGlyph === true;
   if (optionalGlyph && (placement.text !== '-' || placement.clusters.length !== 1
@@ -53,9 +57,12 @@ function validateTextSlices(placement: import('../layout/types.js').TextPlacemen
   let previousEnd = placement.range.start;
   for (const op of placement.paintOps) {
     const invalidTextMapping = !optionalGlyph && op.sourceMapping !== 'kashida'
-      && (op.sourceMapping === 'joining-context'
-        ? op.text.replace(/^\u200D|\u200D$/gu, '').length !== op.range.end - op.range.start
-        : op.text.length !== op.range.end - op.range.start);
+      && (op.joiners === undefined
+        ? op.text.length !== op.range.end - op.range.start
+        : op.text !== withJoiners(
+          placement.text.slice(op.range.start - placement.range.start, op.range.end - placement.range.start),
+          op.joiners,
+        ));
     const invalidGeometry = !Number.isFinite(op.offset.xPt) || !Number.isFinite(op.offset.yPt)
       || (op.glyphOffsetPt !== undefined
         && (!Number.isFinite(op.glyphOffsetPt.xPt) || !Number.isFinite(op.glyphOffsetPt.yPt)))

@@ -1,5 +1,10 @@
-import { condensedClusterFloorPx, countedSpacingAdvance, countSpacingCharacters } from '../character-spacing.js';
-export { condensedClusterFloorPx };
+import {
+  CONDENSED_CONTEXT_GRAPHEMES,
+  condensedClusterFloorPx,
+  countedSpacingAdvance,
+  countSpacingCharacters,
+} from '../character-spacing.js';
+export { CONDENSED_CONTEXT_GRAPHEMES, condensedClusterFloorPx };
 import { sliceTextBreakWindow } from './text-break-window.js';
 import { graphemeClusterOffsets } from '@silurus/ooxml-core';
 import { EAST_ASIAN_RE, sliceTextShapeRequest, semanticSlotStartIndex } from '../layout/text.js';
@@ -509,6 +514,53 @@ function unitPunctuationCompressionPt(seg: LayoutTextSeg, start: number, end: nu
 }
 
 
+/** Each unit's whole signed advance (px): horizontal clusters scale their
+ * natural advance and add grid/run pitch; vertical cells already carry pitch
+ * and the planner's floor. Both add the unit's punctuation compression and
+ * width balance, so the floor covers the character's whole advance. Shared by
+ * measurement ({@link segAdvanceWidth}) and retained cluster geometry. */
+export function condensedUnitAdvancesPx(
+  seg: LayoutTextSeg,
+  grid: DocGridCtx | undefined,
+  scale: number,
+  units: CondensedAdvanceUnits,
+): readonly number[] {
+  const gridPx = segmentCharacterGridDeltaPx(seg, grid, scale);
+  const spacingPx = charSpacingDeltaPx(seg, scale);
+  const charScale = charScaleFactor(seg);
+  let offset = 0;
+  const list = units.kind === 'natural-clusters' ? units.clusters : units.cells;
+  const advances = list.map((unit) => {
+    const end = offset + unit.text.length;
+    const adjustmentsPx = unitPunctuationCompressionPt(seg, offset, end) * scale
+      + widthBalanceSpaceAdjustmentForTextPt(seg, unit.text, grid) * scale * charScale;
+    offset = end;
+    return units.kind === 'natural-clusters'
+      ? unit.advancePx * charScale
+        + countedSpacingAdvance(
+          countSpacingCharacters(unit.text), gridPx, spacingPx, gridPx + spacingPx,
+        )
+        + adjustmentsPx
+      : unit.advancePx + adjustmentsPx;
+  });
+  if (offset !== seg.text.length) {
+    throw new Error('Condensed advance units do not cover their segment');
+  }
+  return advances;
+}
+
+
+/** Whether {@link condensedUnitAdvancesPx} reaches the floor: a negative unit,
+ * or a vertical cell the planner already floored. */
+export function condensedUnitsFloor(
+  units: CondensedAdvanceUnits,
+  advances: readonly number[],
+): boolean {
+  return advances.some((advance, index) => advance < 0
+    || (units.kind === 'vertical-cells' && units.cells[index]!.advancePx === 0));
+}
+
+
 /** The segment's advance as the sum of its floored unit advances, or
  * `undefined` when no unit reaches the floor (callers then keep the signed
  * whole-segment arithmetic unchanged). Summing the non-negative units directly
@@ -519,37 +571,60 @@ function condensedFlooredAdvancePx(
   scale: number,
   units: CondensedAdvanceUnits,
 ): number | undefined {
-  const gridPx = segmentCharacterGridDeltaPx(seg, grid, scale);
-  const spacingPx = charSpacingDeltaPx(seg, scale);
-  const charScale = charScaleFactor(seg);
-  let offset = 0;
+  const advances = condensedUnitAdvancesPx(seg, grid, scale, units);
+  if (!condensedUnitsFloor(units, advances)) return undefined;
   let total = 0;
-  let floored = false;
-  const list = units.kind === 'natural-clusters' ? units.clusters : units.cells;
-  for (const unit of list) {
-    const end = offset + unit.text.length;
-    const adjustmentsPx = unitPunctuationCompressionPt(seg, offset, end) * scale
-      + (units.kind === 'natural-clusters'
-        ? widthBalanceSpaceAdjustmentForTextPt(seg, unit.text, grid) * scale * charScale
-        : 0);
-    const raw = units.kind === 'natural-clusters'
-      ? unit.advancePx * charScale
-        + countedSpacingAdvance(
-          countSpacingCharacters(unit.text), gridPx, spacingPx, gridPx + spacingPx,
-        )
-        + adjustmentsPx
-      : unit.advancePx + adjustmentsPx;
-    if (raw < 0 || (units.kind === 'vertical-cells' && unit.advancePx === 0)) floored = true;
-    total += raw > 0 ? raw : 0;
-    offset = end;
+  for (const advance of advances) total += advance > 0 ? advance : 0;
+  return total;
+}
+
+
+/** The single contextual-advance authority for
+ * WORD_CONDENSED_SPACING_ADVANCE_FLOOR, used by line fitting and retained
+ * geometry alike: each grapheme of `segment.text[start, end)` measured with up
+ * to {@link CONDENSED_CONTEXT_GRAPHEMES} preceding graphemes of the same slice,
+ * minus that context. Linear in the slice length; every measured UTF-16 unit
+ * is charged to `reserveWork`. */
+export function contextualGraphemeAdvances(
+  segment: LayoutTextSeg,
+  start: number,
+  end: number,
+  fontSizePx: number,
+  measureFallback: (text: string) => number,
+  reserveWork: (utf16Units: number) => void,
+): readonly NaturalClusterAdvance[] {
+  const offsets = [...new Set([
+    start,
+    ...graphemeClusterOffsets(segment.text.slice(start, end)).map((offset) => start + offset),
+    end,
+  ])].sort((a, b) => a - b);
+  const width = (from: number, to: number): number => {
+    if (to <= from) return 0;
+    reserveWork(to - from);
+    if (segment.textLayoutService && segment.textShapeRequest) {
+      if (segment.textShapeRequest.text !== segment.text) {
+        throw new Error('Cluster measurement does not match its retained text range context');
+      }
+      return segment.textLayoutService.shape({
+        ...sliceTextShapeRequest(segment.textShapeRequest, from, to),
+        fontSizePt: fontSizePx,
+        measure: true,
+        clusterGeometry: false,
+      }).advancePt;
+    }
+    return measureFallback(segment.text.slice(from, to));
+  };
+  const clusters: NaturalClusterAdvance[] = [];
+  for (let index = 0; index < offsets.length - 1; index += 1) {
+    const clusterStart = offsets[index]!;
+    const clusterEnd = offsets[index + 1]!;
+    const contextStart = offsets[Math.max(0, index - CONDENSED_CONTEXT_GRAPHEMES)]!;
+    clusters.push({
+      text: segment.text.slice(clusterStart, clusterEnd),
+      advancePx: width(contextStart, clusterEnd) - width(contextStart, clusterStart),
+    });
   }
-  if (offset !== seg.text.length) {
-    throw new Error('Condensed advance units do not cover their segment');
-  }
-  if (!floored) return undefined;
-  return units.kind === 'vertical-cells'
-    ? total + widthBalanceSpaceAdjustmentTotalPt(seg, grid) * scale * charScale
-    : total;
+  return clusters;
 }
 
 

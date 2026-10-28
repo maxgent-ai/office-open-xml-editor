@@ -1,11 +1,12 @@
 import { wordArabicTextKerned, wordKerningApplies } from '../layout/line-compatibility.js';
 import type { LayoutTextSeg } from '../line-layout.js';
 import type { MeasurementTextContext, VerticalGlyphMeasurementService } from '../layout/measurement-capabilities.js';
-import { graphemeClusterOffsets } from '@silurus/ooxml-core';
-import { calcEffectiveFontPx, semanticSlotStartIndex, sliceTextShapeRequest } from '../layout/text.js';
+import { calcEffectiveFontPx, semanticSlotStartIndex } from '../layout/text.js';
 import {
   charScaleFactor,
+  CONDENSED_CONTEXT_GRAPHEMES,
   condensedSpacingMayFloor,
+  contextualGraphemeAdvances,
   segLetterSpacingPx,
   segmentCharacterGridDeltaPx,
   type CondensedAdvanceUnits,
@@ -14,9 +15,11 @@ import {
 import type { DocGridCtx } from './model.js';
 import { verticalRunInkExtra } from './vertical-text.js';
 
-/** Preceding graphemes measured with a cluster for its contextual advance
- * (pair kerning, cursive joining and ligature context). */
-const CONDENSED_CONTEXT_GRAPHEMES = 4;
+/** Measured UTF-16 units per text unit charged for one vertical cell plan:
+ * routing probes (natural, vertical-form and ink probes) plus one
+ * {@link CONDENSED_CONTEXT_GRAPHEMES}-bounded context pair per sideways
+ * grapheme and the whole sideways piece. */
+const VERTICAL_PLAN_WORK_PER_UNIT = 2 * (CONDENSED_CONTEXT_GRAPHEMES + 1) + 6;
 
 /** Ownership retains the source's slots even after emergency slicing. Only
  * overlapping slots describe the current physical seam; an all-ASCII suffix
@@ -193,11 +196,8 @@ export class LineMeasurementAdapter {
    * negative advance (the signed segment arithmetic is then exact).
    *
    * Vertical runs use the planned glyph cells paint draws. Horizontal text uses
-   * each grapheme cluster's contextual advance: the width of the cluster with
-   * up to {@link CONDENSED_CONTEXT_GRAPHEMES} preceding graphemes of the same
-   * slice minus the width of that preceding context. This is the retained
-   * cluster geometry's prefix difference with a bounded context, so a probe is
-   * linear in its length rather than re-measuring every prefix. Whole-segment
+   * each grapheme cluster's contextual advance from {@link contextualGraphemeAdvances},
+   * the authority retained geometry shares, so a probe is linear in its length. Whole-segment
    * units are computed once per segment text and reused by its prefixes (a
    * cluster's context never looks forward). Work is charged to `reserveWork`
    * in the UTF-16 units measured. */
@@ -215,7 +215,9 @@ export class LineMeasurementAdapter {
     // Measurement without the vertical capability (intrinsic table widths)
     // already measures vertical text horizontally; keep that authority.
     if (segment.verticalRun && this.verticalGlyphMeasurement) {
-      reserveWork(text.length);
+      // Upper bound of the planner's measured UTF-16 units: per-character
+      // routing probes plus bounded-context sideways graphemes.
+      reserveWork(VERTICAL_PLAN_WORK_PER_UNIT * text.length);
       const gridPx = segmentCharacterGridDeltaPx(segment, grid, this.scale);
       const cells = this.verticalGlyphMeasurement.planRun({
         text,
@@ -271,38 +273,11 @@ export class LineMeasurementAdapter {
     end: number,
     reserveWork: (utf16Units: number) => void,
   ): readonly NaturalClusterAdvance[] {
-    const offsets = [...new Set([
-      start,
-      ...graphemeClusterOffsets(segment.text.slice(start, end)).map((offset) => start + offset),
-      end,
-    ])].sort((a, b) => a - b);
-    const width = (from: number, to: number): number => {
-      if (to <= from) return 0;
-      reserveWork(to - from);
-      if (segment.textLayoutService && segment.textShapeRequest) {
-        if (segment.textShapeRequest.text !== segment.text) {
-          throw new Error('Cluster measurement does not match its retained text range context');
-        }
-        return segment.textLayoutService.shape({
-          ...sliceTextShapeRequest(segment.textShapeRequest, from, to),
-          fontSizePt: calcEffectiveFontPx(segment, this.scale),
-          measure: true,
-          clusterGeometry: false,
-        }).advancePt;
-      }
-      return this.measureRunText(segment, segment.text.slice(from, to)).width;
-    };
-    const clusters: NaturalClusterAdvance[] = [];
-    for (let index = 0; index < offsets.length - 1; index += 1) {
-      const clusterStart = offsets[index]!;
-      const clusterEnd = offsets[index + 1]!;
-      const contextStart = offsets[Math.max(0, index - CONDENSED_CONTEXT_GRAPHEMES)]!;
-      clusters.push({
-        text: segment.text.slice(clusterStart, clusterEnd),
-        advancePx: width(contextStart, clusterEnd) - width(contextStart, clusterStart),
-      });
-    }
-    return clusters;
+    return contextualGraphemeAdvances(
+      segment, start, end, calcEffectiveFontPx(segment, this.scale),
+      (text) => this.measureRunText(segment, text).width,
+      reserveWork,
+    );
   }
 
   measureRunText(segment: LayoutTextSeg, text: string): TextMetrics {

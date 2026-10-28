@@ -61,4 +61,9 @@ export function condensedClusterFloorPx(
   return raw < 0 ? -raw : 0;
 }
 
+/** WORD_CONDENSED_SPACING_ADVANCE_FLOOR: preceding graphemes measured with a
+ * cluster for its contextual advance (pair kerning, cursive joining and
+ * ligature context), so floor probes stay linear in the text length. */
+export const CONDENSED_CONTEXT_GRAPHEMES = 4;
+
 const COMBINING_MARK = /^\p{M}$/u;
