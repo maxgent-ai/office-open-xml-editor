@@ -450,6 +450,30 @@ describe('text overflow across a frozen-column boundary', () => {
     expect(leftEdge.length).toBeGreaterThan(0);
   });
 
+  it('strokes a scrolled-away merge border once when another row overflows', () => {
+    // No freeze: B1 overflows into the pane starting at D, prepending B:C.
+    // A2:C2 is an empty merge whose C2 has a right hairline; the shared edge
+    // with D2 must be stroked exactly once.
+    const ws = {
+      ...worksheet([cell(2, LONG)]),
+      freezeCols: 0,
+      mergeCells: [{ top: 2, left: 1, bottom: 2, right: 3 }],
+    } as Worksheet;
+    ws.rows = [...ws.rows, { index: 2, height: null, cells: [
+      { row: 2, col: 3, styleIndex: LEFT_HAIR_BORDER_XF, value: { type: 'empty' } } as Cell,
+    ] }];
+    const { ctx, texts, lines } = recordingContext();
+    renderViewport(ctx, ws, STYLES, { row: 1, col: 4, rows: 2, cols: 6 }, { width: 600, height: 60 });
+
+    expect(texts.some((t) => t.text === LONG && t.clip.w > 0)).toBe(true);
+    const paneLeft = Math.min(...texts.filter((t) => t.clip.y === 0).map((t) => t.clip.x));
+    const edge = lines.filter((line) => (
+      line.x1 === line.x2 && /255,\s*0,\s*0|ff0000/i.test(line.color) && line.clip.w > 0 &&
+      Math.abs(line.x1 - paneLeft) <= 1
+    ));
+    expect(edge).toHaveLength(1);
+  });
+
   it('keeps a scrolled-away merge border at the pane edge when another row overflows', () => {
     // F2:G2 is an empty merge whose G2 carries a right border; both have
     // scrolled out of the pane that starts at H. B1's overflow prepends

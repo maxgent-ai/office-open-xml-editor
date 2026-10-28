@@ -2100,6 +2100,12 @@ function renderQuadrant(
       + rc.rowAxis.offsetOf(aRow) - rc.rowAxis.offsetOf(startRow);
 
     const cW = info.totalW, cH = info.totalH;
+    // Cull by the full merge rectangle, as the main loop culls merge anchors.
+    // A merge wholly outside the clip contributes nothing visible; its shared
+    // edge is left to the first-column edge handling of the visible cell.
+    if (aCx + cW <= clipX || aCx >= clipX + clipW || aCy + cH <= clipY || aCy >= clipY + clipH) {
+      continue;
+    }
     aCx = mirrorX(aCx, cW);
     const key = `${aRow}:${aCol}`;
     const cell = rc.cellMap.get(key);
