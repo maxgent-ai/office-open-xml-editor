@@ -19,7 +19,7 @@ import type { BodyElement, DocParagraph, DocxTextRun, SectionProps } from './typ
 
 /** Stub glyph advance: 'i', 'י' and 'ي' are 0.2 em, U+0640 is 0.1 em, every
  * other character 0.5 em. */
-function makeCtx(contextual = false, longContext = false): CanvasRenderingContext2D {
+function makeCtx(contextual = false, longContext = false, kerning = false): CanvasRenderingContext2D {
   let font = '10px serif';
   const px = () => parseFloat(/(\d+(?:\.\d+)?)px/.exec(font)?.[1] ?? '10');
   const ctx = {
@@ -35,7 +35,9 @@ function makeCtx(contextual = false, longContext = false): CanvasRenderingContex
         ) + (contextual && index > 0 && all[index - 1] === '\u0640' ? p * 0.2 : 0)
         // Optionally each 'l' widens by 0.01 em per preceding 'l' (context
         // longer than any bounded window).
-        + (longContext && ch === 'l' ? p * 0.01 * all.slice(0, index).filter((c) => c === 'l').length : 0), 0),
+        + (longContext && ch === 'l' ? p * 0.01 * all.slice(0, index).filter((c) => c === 'l').length : 0)
+        // Optionally the pair "AV" kerns by -0.2 em.
+        + (kerning && ch === 'A' && all[index + 1] === 'V' ? -p * 0.2 : 0), 0),
         fontBoundingBoxAscent: p * 0.8, fontBoundingBoxDescent: p * 0.2,
         actualBoundingBoxAscent: p * 0.8, actualBoundingBoxDescent: p * 0.2,
       } as TextMetrics;
@@ -171,6 +173,33 @@ describe('#1975 condensed w:spacing larger than the glyph advance', () => {
 });
 
 describe('#1975 one contextual authority for fitting and retained geometry', () => {
+  it('gives a pair adjustment to the earlier grapheme, as shaping places it', () => {
+    // M 10 → 2; A 10 kerned -4 with V → -2 floored; V 10 → 2. V paints where
+    // contextual shaping puts it (M + floored A = 2), and the run is 4 wide.
+    const node = layoutBodyModel(
+      [para([textRun('MAV', { charSpacing: -8 }), textRun('B')])],
+      section,
+      makeCtx(false, false, true),
+    ).pages[0]!.layers.body[0]!;
+    if (node.kind !== 'paragraph') throw new Error('expected a paragraph');
+    const run = byText(node.lines[0]!, 'MAV');
+    expect(run.advancePt).toBeCloseTo(4, 9);
+    expect(run.paintOps.map((op) => [op.text, op.offset.xPt])).toEqual([['M', 0], ['A', 2], ['V', 2]]);
+    expect(byText(node.lines[0]!, 'B').bounds.xPt).toBeCloseTo(run.bounds.xPt + 4, 9);
+  });
+
+  it('gives a pair adjustment to the earlier grapheme in a vertical sideways piece', () => {
+    const node = layoutBodyModel(
+      [para([textRun('MAV', { charSpacing: -8 })])],
+      { ...section, textDirection: 'tbRl' } as SectionProps,
+      makeCtx(false, false, true),
+    ).pages[0]!.layers.body[0]!;
+    if (node.kind !== 'paragraph') throw new Error('expected a paragraph');
+    const run = byText(node.lines[0]!, 'MAV');
+    expect(run.advancePt).toBeCloseTo(4, 9);
+    expect(run.paintOps.map((op) => [op.text, op.offset.xPt])).toEqual([['M', 0], ['A', 2], ['V', 2]]);
+  });
+
   it('places following text at the retained pen for long-context glyphs', () => {
     // 'l' is 10 pt + 0.2 pt per preceding 'l'; at -10.3 the first two floor
     // and later ones advance by an amount that depends on unbounded context.
@@ -397,11 +426,33 @@ describe('condensed advance units work', () => {
     const whole = measured();
     expect(whole).toBeLessThanOrEqual(12 * length);
     expect(reserved).toBeGreaterThanOrEqual(whole);
-    // Prefix probes reuse the whole-segment clusters.
+    // Prefix probes reuse the whole-segment clusters and measure again only
+    // the bounded tail whose following context crosses the prefix end.
     for (let end = 1; end <= length; end += 1) {
       adapter.condensedAdvanceUnits(segment, segment.text.slice(0, end), 0, undefined, reserve);
     }
-    expect(measured()).toBe(whole);
+    expect(measured() - whole).toBeLessThanOrEqual(2 * 5 * 4 * length);
+    expect(reserved).toBeGreaterThanOrEqual(measured());
+  });
+
+  it('measures a prefix as a fresh slice would', () => {
+    const ctx = makeCtx(false, false, true);
+    const segment = { ...textRun('MAVAVM', { charSpacing: -8 }), measuredWidth: 0 } as unknown as LayoutTextSeg;
+    const advances = (units: CondensedAdvanceUnits | undefined) => units?.kind === 'natural-clusters'
+      ? units.clusters.map((cluster) => cluster.advancePx)
+      : [];
+    const cached = new LineMeasurementAdapter(ctx, 1, () => '20px serif');
+    cached.condensedAdvanceUnits(segment, segment.text, 0, undefined, () => {});
+    for (let end = 1; end <= segment.text.length; end += 1) {
+      const prefix = segment.text.slice(0, end);
+      const fresh = new LineMeasurementAdapter(ctx, 1, () => '20px serif');
+      // Not a prefix of a cached whole: the fresh adapter measures the slice.
+      const freshUnits = fresh.condensedAdvanceUnits(
+        { ...segment, text: prefix } as LayoutTextSeg, prefix, 0, undefined, () => {},
+      );
+      expect(advances(cached.condensedAdvanceUnits(segment, prefix, 0, undefined, () => {})))
+        .toEqual(advances(freshUnits));
+    }
   });
 
   it('charges vertical cell planning for every measured unit', () => {
