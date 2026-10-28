@@ -3525,12 +3525,32 @@ interface OverflowColumnOverscan {
 
 // Paint walks only materialized (non-hidden) column bands, so a value in a
 // hidden column neither paints nor blocks a neighbour's spill. The overscan
-// search skips hidden columns the same way.
-function precedingColumn(
+// search skips hidden columns the same way. A row's visible value columns
+// depend only on the (memoized, per-scale) axis, so they are filtered once per
+// row and axis and only when the nearest value is actually hidden.
+const visibleValueColsByAxis = new WeakMap<
+  GridAxisGeometry,
+  WeakMap<readonly number[], readonly number[]>
+>();
+
+function visibleValueCols(
   cols: readonly number[],
-  boundary: number,
   colAxis: GridAxisGeometry,
-): number | undefined {
+): readonly number[] {
+  let byRow = visibleValueColsByAxis.get(colAxis);
+  if (!byRow) {
+    byRow = new WeakMap();
+    visibleValueColsByAxis.set(colAxis, byRow);
+  }
+  let visible = byRow.get(cols);
+  if (!visible) {
+    visible = cols.filter((col) => colAxis.sizeOf(col) > 0);
+    byRow.set(cols, visible);
+  }
+  return visible;
+}
+
+function precedingIndex(cols: readonly number[], boundary: number): number {
   let low = 0;
   let high = cols.length;
   while (low < high) {
@@ -3538,17 +3558,10 @@ function precedingColumn(
     if (cols[middle] < boundary) low = middle + 1;
     else high = middle;
   }
-  for (let index = low - 1; index >= 0; index--) {
-    if (colAxis.sizeOf(cols[index]) > 0) return cols[index];
-  }
-  return undefined;
+  return low - 1;
 }
 
-function followingColumn(
-  cols: readonly number[],
-  boundary: number,
-  colAxis: GridAxisGeometry,
-): number | undefined {
+function followingIndex(cols: readonly number[], boundary: number): number {
   let low = 0;
   let high = cols.length;
   while (low < high) {
@@ -3556,10 +3569,29 @@ function followingColumn(
     if (cols[middle] <= boundary) low = middle + 1;
     else high = middle;
   }
-  for (let index = low; index < cols.length; index++) {
-    if (colAxis.sizeOf(cols[index]) > 0) return cols[index];
-  }
-  return undefined;
+  return low;
+}
+
+function precedingColumn(
+  cols: readonly number[],
+  boundary: number,
+  colAxis: GridAxisGeometry,
+): number | undefined {
+  const nearest = cols[precedingIndex(cols, boundary)];
+  if (nearest == null || colAxis.sizeOf(nearest) > 0) return nearest;
+  const visible = visibleValueCols(cols, colAxis);
+  return visible[precedingIndex(visible, boundary)];
+}
+
+function followingColumn(
+  cols: readonly number[],
+  boundary: number,
+  colAxis: GridAxisGeometry,
+): number | undefined {
+  const nearest = cols[followingIndex(cols, boundary)];
+  if (nearest == null || colAxis.sizeOf(nearest) > 0) return nearest;
+  const visible = visibleValueCols(cols, colAxis);
+  return visible[followingIndex(visible, boundary)];
 }
 
 function mergeBlocksOverflow(
