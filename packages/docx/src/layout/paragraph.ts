@@ -2627,7 +2627,7 @@ function textPlanSegment(
   // advances instead of stacking. This is the same pre-existing gap as every
   // tracked cursive run (Canvas letterSpacing is ignored for Arabic); painting
   // stacked joined forms needs per-glyph joined-form placement, tracked as a
-  // follow-up.
+  // follow-up (#1981).
   const splitFlooredStarts = new Set<number>();
   if (flooredClusterNaturalPt.size > 0) {
     for (const cluster of clusters) {
