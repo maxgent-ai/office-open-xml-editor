@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { layoutBodyModel } from './test-support/document-layout.test-support.js';
 import { segAdvanceWidth, type CondensedAdvanceUnits, type LayoutTextSeg } from './line-layout.js';
 import { condensedCharacterAdjustments } from './line-breaker/advance.js';
+import { resolvedBidiLevels } from './character-spacing.js';
 import { LineMeasurementAdapter } from './line-breaker/measurement-adapter.js';
 import { paintLayoutPage } from './paint/canvas-page.js';
 import { planVerticalRunWithCapability } from './vertical-text.js';
@@ -207,6 +208,32 @@ describe('#1975 one contextual authority for fitting and retained geometry', () 
   });
 });
 
+/** UAX#9 L2 order of `text` drawn alone by Canvas in `direction`. */
+function canvasVisualOrder(text: string, direction: 'ltr' | 'rtl'): string[] {
+  const levels = resolvedBidiLevels(text, direction);
+  // The tested strings are BMP-only, so code points index the levels.
+  let units = [...text].map((unit, index) => ({ unit, level: levels[index]! }));
+  const highest = Math.max(0, ...units.map((entry) => entry.level));
+  const lowestOdd = Math.min(...units.map((entry) => entry.level).filter((level) => level % 2 === 1));
+  for (let level = highest; level >= lowestOdd; level -= 1) {
+    const next: typeof units = [];
+    let cursor = 0;
+    while (cursor < units.length) {
+      if (units[cursor]!.level < level) {
+        next.push(units[cursor]!);
+        cursor += 1;
+        continue;
+      }
+      let end = cursor;
+      while (end < units.length && units[end]!.level >= level) end += 1;
+      next.push(...units.slice(cursor, end).reverse());
+      cursor = end;
+    }
+    units = next;
+  }
+  return units.map((entry) => entry.unit);
+}
+
 describe('#1975 condensed floor in right-to-left text', () => {
   it('places floored operations visually from the right edge', () => {
     // מ 10 → 4, י 4 → -2 floored, א 10 → 4: logical origins 0, 4, 4; width 8.
@@ -293,6 +320,10 @@ describe('#1975 condensed floor in right-to-left text', () => {
     ['RLO', 'vertical', 'tbRl', '\u202E'],
     ['LRO', 'horizontal', undefined, '\u202D'],
     ['LRO', 'vertical', 'tbRl', '\u202D'],
+    // At the UAX#9 depth limit the RLO reaches level 125 and the LRE after
+    // it overflows, so the override still orders ABiC.
+    ['RLO', 'horizontal at the depth limit', undefined, `${'\u202B'.repeat(61)}\u202E\u202A`],
+    ['RLO', 'vertical at the depth limit', 'tbRl', `${'\u202B'.repeat(61)}\u202E\u202A`],
   ] as const)('keeps a %s override\'s order across split operations (%s)', (control, _name, textDirection, mark) => {
     // ABiC (i floors) inside RLO reads C i B A; inside LRO, A B i C.
     const text = `אב${mark}ABiC\u202Cגד`;
@@ -302,17 +333,14 @@ describe('#1975 condensed floor in right-to-left text', () => {
       makeCtx(),
     ).pages[0]!.layers.body[0]!;
     if (node.kind !== 'paragraph') throw new Error('expected a paragraph');
-    const ops = byText(node.lines[0]!, text).paintOps;
-    const x = (glyph: string) => ops.find((op) => op.text.replace(/[\u202C-\u202E]/gu, '') === glyph)!.offset.xPt;
-    expect(ops.every((op) => op.text.replace(/[\u202C-\u202E]/gu, '').length <= 1
-      || !/[ABC]/u.test(op.text))).toBe(true);
-    if (control === 'RLO') {
-      expect(x('C')).toBeLessThan(x('B'));
-      expect(x('B')).toBeLessThan(x('A'));
-    } else {
-      expect(x('A')).toBeLessThan(x('B'));
-      expect(x('B')).toBeLessThan(x('C'));
-    }
+    // Visual order: operations by placed origin, each resolved by Canvas as
+    // its own UAX#9 paragraph in its paint direction.
+    const visual = byText(node.lines[0]!, text).paintOps
+      .map((op, index) => ({ op, index }))
+      .sort((left, right) => left.op.offset.xPt - right.op.offset.xPt || left.index - right.index)
+      .flatMap(({ op }) => canvasVisualOrder(op.text, op.direction).filter((unit) => /[ABC]/u.test(unit)))
+      .join('');
+    expect(visual).toBe(control === 'RLO' ? 'CBA' : 'ABC');
   });
 
   it('draws a split operation in its own level direction', () => {
