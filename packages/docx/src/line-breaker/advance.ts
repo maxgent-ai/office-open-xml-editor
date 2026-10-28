@@ -508,14 +508,22 @@ export function condensedSpacingMayFloor(
 
 /** Punctuation compression plus width balance of a source range of
  * `seg.text` (px): the per-character adjustments the floor covers together
- * with the glyph and pitch. Built once per segment in linear time (each
- * compression is owned by the unit containing its end offset); vertical
- * planning receives it as `characterAdjustmentPt`. */
+ * with the glyph and pitch. Built once per segment in linear time and
+ * memoised, so repeated prefix probes reuse it (each compression is owned by
+ * the unit containing its end offset); a build charges the segment length to
+ * `reserveWork`. Vertical planning receives it as `characterAdjustmentPt`. */
 export function condensedCharacterAdjustments(
   seg: LayoutTextSeg,
   grid: DocGridCtx | undefined,
   scale: number,
+  reserveWork?: (utf16Units: number) => void,
 ): (start: number, end: number) => number {
+  const cached = condensedAdjustmentCache.get(seg);
+  if (cached && cached.text === seg.text && cached.compressions === seg.punctuationCompressions
+    && cached.grid === grid && cached.scale === scale) {
+    return cached.adjustmentPx;
+  }
+  reserveWork?.(seg.text.length);
   const compressionBefore = new Float64Array(seg.text.length + 2);
   for (const compression of seg.punctuationCompressions ?? []) {
     if (compression.end >= 0 && compression.end <= seg.text.length) {
@@ -526,9 +534,26 @@ export function condensedCharacterAdjustments(
     compressionBefore[index]! += compressionBefore[index - 1]!;
   }
   const charScale = charScaleFactor(seg);
-  return (start, end) => (compressionBefore[end + 1]! - compressionBefore[start + 1]!) * scale
+  const adjustmentPx = (start: number, end: number): number =>
+    (compressionBefore[end + 1]! - compressionBefore[start + 1]!) * scale
     + widthBalanceSpaceAdjustmentForTextPt(seg, seg.text.slice(start, end), grid) * scale * charScale;
+  condensedAdjustmentCache.set(seg, {
+    text: seg.text,
+    compressions: seg.punctuationCompressions,
+    grid,
+    scale,
+    adjustmentPx,
+  });
+  return adjustmentPx;
 }
+
+const condensedAdjustmentCache = new WeakMap<LayoutTextSeg, Readonly<{
+  text: string;
+  compressions: LayoutTextSeg['punctuationCompressions'];
+  grid: DocGridCtx | undefined;
+  scale: number;
+  adjustmentPx: (start: number, end: number) => number;
+}>>();
 
 
 /** Each unit's whole signed advance (px). Horizontal clusters scale their

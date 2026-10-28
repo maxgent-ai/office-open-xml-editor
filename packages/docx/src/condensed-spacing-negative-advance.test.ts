@@ -455,6 +455,34 @@ describe('condensed advance units work', () => {
     }
   });
 
+  it('builds and charges the adjustment table once per segment across prefix probes', () => {
+    const ctx = makeCtx();
+    const text = 'あいう'.repeat(2_000);
+    const segment = {
+      ...textRun(text, { charSpacing: -30 }), measuredWidth: 0, verticalRun: true,
+    } as unknown as LayoutTextSeg;
+    let tableCharges = 0;
+    const first = condensedCharacterAdjustments(segment, undefined, 1, (units) => { tableCharges += units; });
+    for (let end = 1; end <= 200; end += 1) {
+      expect(condensedCharacterAdjustments(segment, undefined, 1, (units) => { tableCharges += units; }))
+        .toBe(first);
+    }
+    expect(tableCharges).toBe(text.length);
+    // A probe of the same segment reuses the memoised table.
+    const adapter = new LineMeasurementAdapter(ctx, 1, () => '20px serif', {
+      planRun: (input: Parameters<VerticalGlyphMeasurementService['planRun']>[0]) => planVerticalRunWithCapability(
+        ctx, input.text, input.fontSizePt, input.letterSpacingPt, input.charScale,
+        input.growTrRotateInk, () => false, input.writingMode, input.characterGridDeltaPt,
+        input.characterAdjustmentPt,
+      ),
+    } as unknown as VerticalGlyphMeasurementService);
+    let reserved = 0;
+    for (let end = 1; end <= 50; end += 1) {
+      adapter.condensedAdvanceUnits(segment, text.slice(0, end), 0, undefined, (units) => { reserved += units; });
+    }
+    expect(reserved).toBeLessThanOrEqual(50 * 51 / 2 * 17);
+  });
+
   it('charges vertical cell planning for every measured unit', () => {
     const { ctx, measured } = countingContext();
     const adapter = new LineMeasurementAdapter(ctx, 1, () => '20px serif', {

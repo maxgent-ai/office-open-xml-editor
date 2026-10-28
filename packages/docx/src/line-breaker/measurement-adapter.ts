@@ -215,6 +215,9 @@ export class LineMeasurementAdapter {
     if (segment.text.slice(start, start + text.length) !== text) {
       throw new Error('Condensed advance units do not match their segment text range');
     }
+    // The segment's adjustment table (built and charged once, then reused by
+    // every probe and by segAdvanceWidth).
+    const adjustmentPx = condensedCharacterAdjustments(segment, grid, this.scale, reserveWork);
     // Measurement without the vertical capability (intrinsic table widths)
     // already measures vertical text horizontally; keep that authority.
     if (segment.verticalRun && this.verticalGlyphMeasurement) {
@@ -232,10 +235,7 @@ export class LineMeasurementAdapter {
         charScale: charScaleFactor(segment),
         growTrRotateInk: true,
         writingMode: 'vertical-rl',
-        characterAdjustmentPt: (() => {
-          const adjustmentPx = condensedCharacterAdjustments(segment, grid, this.scale);
-          return (from: number, to: number) => adjustmentPx(start + from, start + to);
-        })(),
+        characterAdjustmentPt: (from: number, to: number) => adjustmentPx(start + from, start + to),
       });
       return {
         kind: 'vertical-cells',
