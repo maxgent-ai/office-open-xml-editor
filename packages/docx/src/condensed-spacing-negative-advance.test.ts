@@ -204,6 +204,19 @@ describe('#1975 condensed floor in right-to-left text', () => {
     expect(byText(line!, 'גד').bounds.xPt + 20).toBeCloseTo(run.bounds.xPt, 9);
   });
 
+  it('mirrors a floored vertical piece without a split floored cluster', () => {
+    // بي floors (ي 4 - 6) and stays one cursive cell; ! and ب do not floor:
+    // logical origins 0, 4, 8 over width 12 paint at 8, 4, 0.
+    const node = layoutBodyModel(
+      [para([textRun('بي!ب', { rtl: true, charSpacing: -6 })], { bidi: true } as Partial<DocParagraph>)],
+      { ...section, textDirection: 'tbRl' } as SectionProps,
+      makeCtx(),
+    ).pages[0]!.layers.body[0]!;
+    if (node.kind !== 'paragraph') throw new Error('expected a paragraph');
+    expect(byText(node.lines[0]!, 'بي!ب').paintOps.map((op) => [op.text, op.offset.xPt]))
+      .toEqual([['بي', 8], ['!', 4], ['ب', 0]]);
+  });
+
   it('keeps a floored cursive run as one contextual operation', () => {
     // Splitting would break the joined forms; Canvas does not track inside
     // cursive scripts, so only the advance is floored.

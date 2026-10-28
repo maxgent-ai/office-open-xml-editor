@@ -748,8 +748,9 @@ function flooredRtlVisualPaintOperations(
 /** WORD_CONDENSED_SPACING_ADVANCE_FLOOR in a right-to-left vertical run. An
  * unsplit sideways piece paints as one contextual operation whose bidi order
  * Canvas resolves; a floored piece paints several operations from logical
- * origins, so mirror each operation within its piece (a maximal run of
- * sideways operations; pieces alternate draw mode) over the piece's visible
+ * origins (including a floored cursive group beside unfloored neighbours),
+ * so mirror each operation within its piece (a maximal run of sideways
+ * operations; pieces alternate draw mode) over the piece's visible
  * extent: a floored cluster's ink sits its drawn advance behind the pen, as
  * {@link flooredRtlVisualPaintOperations} places it horizontally. Trailing
  * whitespace stays outside the extent, since the paint origin has already
@@ -759,7 +760,9 @@ function flooredRtlVerticalPaintOperations(
   clusters: readonly TextClusterLayout[],
   visibleEnd: number,
 ): readonly TextPaintOp[] {
-  if (!operations.some((operation) => operation.naturalAdvancePt !== undefined)) return operations;
+  // Only the floored plan gives a sideways piece several operations.
+  if (!operations.some((operation, index) => index > 0 && operation.glyphOrientation === 'sideways'
+    && operations[index - 1]!.glyphOrientation === 'sideways')) return operations;
   // Operations and clusters both run in source order.
   const advances: number[] = [];
   let cursor = 0;
