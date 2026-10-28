@@ -61,7 +61,7 @@ export class UpdateShapeMutation extends Mutation {
   inverse(presentation: Presentation): UpdateShapeMutation {
     const { element } = resolveMutationTarget(presentation, this);
     const shape = requireShape(element, this);
-    const value: Record<string, unknown> = {};
+    const value: Record<string, unknown> = Object.create(null);
     for (const key of Object.keys(this.value) as Array<keyof ShapePatch>) {
       value[key] = shape[key];
     }
@@ -77,6 +77,7 @@ export class UpdateShapeMutation extends Mutation {
   ): OfficeCliCommand {
     const { element } = resolveMutationTarget(presentation, this);
     requireShape(element, this);
+    // ast-grep-ignore: no-plain-object-string-map -- transform, fill and pen translators emit fixed OfficeCLI property names.
     const props: Record<string, string> = {};
     appendTransformProps(props, this.value, context, this);
     if ('fill' in this.value) {
