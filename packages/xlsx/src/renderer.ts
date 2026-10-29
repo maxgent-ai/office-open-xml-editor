@@ -1778,6 +1778,13 @@ function colToLetter(col: number): string {
   return result;
 }
 
+interface TextRunBuffer {
+  /** Runs reported by the pane that owns the cell, in paint order. */
+  owned: Map<string, XlsxTextRunInfo>;
+  /** Runs painted only as cross-pane overflow so far. */
+  foreign: Map<string, XlsxTextRunInfo>;
+}
+
 interface RenderContext {
   worksheet: Worksheet;
   styles: Styles;
@@ -1812,11 +1819,25 @@ interface RenderContext {
    *  neighbours. These anchors bypass the ordinary cell-rectangle cull so the
    *  existing overflow clip can paint the still-visible portion of the text. */
   overflowTextAnchors: Set<string>;
+  /** Text-run reporting for this pane. Each pane paints the sheet in its own
+   *  coordinates, so a value can also be painted as overflow into the other
+   *  pane across the freeze line. `first..last` is the inclusive logical
+   *  column range this pane owns; `ownerShiftX` converts this pane's un-mirrored
+   *  canvas x into the owning pane's for any other column. */
+  textRunPane: { first: number; last: number; ownerShiftX: number };
+  /** Per-frame `onTextRun` buffer shared by all panes, so every painted value
+   *  is reported once with its owning pane's cell geometry. */
+  textRuns?: TextRunBuffer;
+  /** This pane's first viewport column, before any overflow overscan. */
+  firstViewportCol: number;
+  /** Last column a `centerContinuous` selection (§18.18.40) may span in this
+   *  pane. The frozen pane keeps its selections inside its own band whatever
+   *  overflow overscan another row adds to its column list. */
+  selectionLastCol: number;
   /** Max Digit Width resolved for the workbook's default font, `<fonts>[0]`
    *  (ECMA-376 §18.3.1.13). Used by `colWidthToPx` to convert character-
    *  unit column widths into pixels. */
   mdw: number;
-  onTextRun?: (info: XlsxTextRunInfo) => void;
   /** Sheet-level right-to-left grid mirror (ECMA-376 §18.3.1.87
    *  `<sheetView rightToLeft>`). When true the whole grid is mirrored:
    *  column A sits at the right edge, columns flow right-to-left, and the
@@ -2079,6 +2100,12 @@ function renderQuadrant(
       + rc.rowAxis.offsetOf(aRow) - rc.rowAxis.offsetOf(startRow);
 
     const cW = info.totalW, cH = info.totalH;
+    // Cull by the full merge rectangle, as the main loop culls merge anchors.
+    // A merge wholly outside the clip contributes nothing visible; its shared
+    // edge is left to the first-column edge handling of the visible cell.
+    if (aCx + cW <= clipX || aCx >= clipX + clipW || aCy + cH <= clipY || aCy >= clipY + clipH) {
+      continue;
+    }
     aCx = mirrorX(aCx, cW);
     const key = `${aRow}:${aCol}`;
     const cell = rc.cellMap.get(key);
@@ -2248,7 +2275,7 @@ function renderQuadrant(
     for (let ci = 0; ci <= numCols; ci++) {
       let isCC = false;
       let hasValue = false;
-      if (ci < numCols) {
+      if (ci < numCols && colIndices[ci] <= rc.selectionLastCol) {
         const ckey = `${rowIndex}:${colIndices[ci]}`;
         if (!mergeSkipSet.has(ckey) && !mergeAnchorMap.has(ckey)) {
           const c = cellMap.get(ckey);
@@ -2270,14 +2297,26 @@ function renderQuadrant(
       }
     }
 
+    // Measured overflow overscan can prepend columns before the pane's first
+    // viewport column (off-screen anchors, or frozen-column anchors drawn in
+    // the scrollable pane). That first column keeps its first-column edge
+    // handling unless the prepended column beside it is painted, in which
+    // case that cell strokes the shared edge itself.
+    let leftNeighbourCulled = true;
     for (let ci = 0; ci < numCols; ci++) {
       const colIndex = colIndices[ci];
       const ltrCx = originX + colXs[ci];
       const cw = colWidths[ci];
+      const leftCulled = colIndex === rc.firstViewportCol && leftNeighbourCulled;
       // Cull against the (un-mirrored) clip band — visibility is preserved
       // by the mirror, so the LTR test is correct for both directions.
       const key = `${rowIndex}:${colIndex}`;
-      if (mergeSkipSet.has(key)) continue;
+      if (mergeSkipSet.has(key)) {
+        // A covered cell is painted (by its anchor or the pre-pass) only
+        // where its own band reaches the clip.
+        leftNeighbourCulled = ltrCx + cw <= clipX || ltrCx >= clipX + clipW;
+        continue;
+      }
 
       // Use the authored merge rectangle for virtualization. A merge anchor's
       // own row/column band may remain materialized while that single band is
@@ -2291,7 +2330,11 @@ function renderQuadrant(
       if (
         verticallyOutside ||
         (horizontallyOutside && !rc.overflowTextAnchors.has(key))
-      ) continue;
+      ) {
+        leftNeighbourCulled = true;
+        continue;
+      }
+      leftNeighbourCulled = false;
       // Mirror the cell's canvas x for RTL. Uses the *full* drawn width
       // (merge span included) so the rect lands at the correct mirror band.
       const cx = mirrorX(ltrCx, cellW);
@@ -2361,7 +2404,7 @@ function renderQuadrant(
           ctx.moveTo(cx, ty);
           ctx.lineTo(cx + cellW, ty);
         }
-        if (ci === 0) {                            // left edge for first column
+        if (leftCulled) {                          // left edge for first column
           const lx = cx + crispOffset(cx, 0.5, dpr);
           ctx.moveTo(lx, cy);
           ctx.lineTo(lx, cy + cellH);
@@ -2408,7 +2451,8 @@ function renderQuadrant(
       // (sample-6). This replaces the old fill-repair (`paintedFill` gate +
       // `invertedTop` / `invertedLeft`), which is gone.
       //
-      // EXCEPTION — the quadrant's first rendered row/column (`ri`/`ci` === 0):
+      // EXCEPTION — the quadrant's first rendered row/column (`ri === 0` /
+      // `leftCulled`):
       // the upper / left neighbour lies OUTSIDE this quadrant (the viewport has
       // no top/left overscan — viewer.ts walks forward from startRow/startCol
       // with a +2 buffer only at the bottom/right), so when scrolled it is never
@@ -2434,7 +2478,7 @@ function renderQuadrant(
               styles, effectiveCellStyleIndex(rc.worksheet, leftCell, colIndex - 1),
             ).border.right
           : null;
-        if (leftRight?.style && (ci === 0 || mergedBorder.left?.style)) {
+        if (leftRight?.style && (leftCulled || mergedBorder.left?.style)) {
           mergedBorder = { ...mergedBorder, left: pickStrongerEdge(mergedBorder.left, leftRight) };
         }
       }
@@ -2509,7 +2553,7 @@ function renderQuadrant(
       let centerContinuousW = cellW;
       let centerContinuousLastCi = ci;
       if (alignH === 'centerContinuous' && !mergeInfo) {
-        for (let oci = ci + 1; oci < numCols; oci++) {
+        for (let oci = ci + 1; oci < numCols && colIndices[oci] <= rc.selectionLastCol; oci++) {
           const adjKey = `${rowIndex}:${colIndices[oci]}`;
           if (mergeSkipSet.has(adjKey) || mergeAnchorMap.has(adjKey)) break;
           const adjCell = cellMap.get(adjKey);
@@ -2903,18 +2947,22 @@ function renderQuadrant(
 
       ctx.restore();
 
-      if (text && rc.onTextRun) {
-        rc.onTextRun({
-          sheetName: rc.worksheet.name,
-          cellRef: formatA1(rowIndex, colIndex),
-          text,
-          x: cx,
-          y: cy,
-          width: cellW,
-          height: cellH,
-          row: rowIndex,
-          col: colIndex,
-        });
+      if (text && rc.textRuns) {
+        const owned = colIndex >= rc.textRunPane.first && colIndex <= rc.textRunPane.last;
+        const runs = owned ? rc.textRuns.owned : rc.textRuns.foreign;
+        if (!runs.has(key)) {
+          runs.set(key, {
+            sheetName: rc.worksheet.name,
+            cellRef: formatA1(rowIndex, colIndex),
+            text,
+            x: owned ? cx : mirrorX(ltrCx + rc.textRunPane.ownerShiftX, cellW),
+            y: cy,
+            width: cellW,
+            height: cellH,
+            row: rowIndex,
+            col: colIndex,
+          });
+        }
       }
       });
     }
@@ -3487,7 +3535,34 @@ interface OverflowColumnOverscan {
   anchorKeys: Set<string>;
 }
 
-function precedingColumn(cols: readonly number[], boundary: number): number | undefined {
+// Paint walks only materialized (non-hidden) column bands, so a value in a
+// hidden column neither paints nor blocks a neighbour's spill. The overscan
+// search skips hidden columns the same way. A row's visible value columns
+// depend only on the (memoized, per-scale) axis, so they are filtered once per
+// row and axis and only when the nearest value is actually hidden.
+const visibleValueColsByAxis = new WeakMap<
+  GridAxisGeometry,
+  WeakMap<readonly number[], readonly number[]>
+>();
+
+function visibleValueCols(
+  cols: readonly number[],
+  colAxis: GridAxisGeometry,
+): readonly number[] {
+  let byRow = visibleValueColsByAxis.get(colAxis);
+  if (!byRow) {
+    byRow = new WeakMap();
+    visibleValueColsByAxis.set(colAxis, byRow);
+  }
+  let visible = byRow.get(cols);
+  if (!visible) {
+    visible = cols.filter((col) => colAxis.sizeOf(col) > 0);
+    byRow.set(cols, visible);
+  }
+  return visible;
+}
+
+function precedingIndex(cols: readonly number[], boundary: number): number {
   let low = 0;
   let high = cols.length;
   while (low < high) {
@@ -3495,10 +3570,10 @@ function precedingColumn(cols: readonly number[], boundary: number): number | un
     if (cols[middle] < boundary) low = middle + 1;
     else high = middle;
   }
-  return low > 0 ? cols[low - 1] : undefined;
+  return low - 1;
 }
 
-function followingColumn(cols: readonly number[], boundary: number): number | undefined {
+function followingIndex(cols: readonly number[], boundary: number): number {
   let low = 0;
   let high = cols.length;
   while (low < high) {
@@ -3506,7 +3581,29 @@ function followingColumn(cols: readonly number[], boundary: number): number | un
     if (cols[middle] <= boundary) low = middle + 1;
     else high = middle;
   }
-  return low < cols.length ? cols[low] : undefined;
+  return low;
+}
+
+function precedingColumn(
+  cols: readonly number[],
+  boundary: number,
+  colAxis: GridAxisGeometry,
+): number | undefined {
+  const nearest = cols[precedingIndex(cols, boundary)];
+  if (nearest == null || colAxis.sizeOf(nearest) > 0) return nearest;
+  const visible = visibleValueCols(cols, colAxis);
+  return visible[precedingIndex(visible, boundary)];
+}
+
+function followingColumn(
+  cols: readonly number[],
+  boundary: number,
+  colAxis: GridAxisGeometry,
+): number | undefined {
+  const nearest = cols[followingIndex(cols, boundary)];
+  if (nearest == null || colAxis.sizeOf(nearest) > 0) return nearest;
+  const visible = visibleValueCols(cols, colAxis);
+  return visible[followingIndex(visible, boundary)];
 }
 
 function mergeBlocksOverflow(
@@ -3514,11 +3611,15 @@ function mergeBlocksOverflow(
   row: number,
   left: number,
   right: number,
+  colAxis: GridAxisGeometry,
 ): boolean {
-  return (worksheet.mergeCells ?? []).some((merge) => (
-    row >= merge.top && row <= merge.bottom &&
-    merge.right >= left && merge.left <= right
-  ));
+  return (worksheet.mergeCells ?? []).some((merge) => {
+    if (row < merge.top || row > merge.bottom) return false;
+    const first = Math.max(left, merge.left);
+    const last = Math.min(right, merge.right);
+    // A merge blocks only where it covers a visible column.
+    return first <= last && colAxis.offsetOf(last + 1) > colAxis.offsetOf(first);
+  });
 }
 
 /**
@@ -3532,6 +3633,17 @@ function mergeBlocksOverflow(
  * any earlier cell is necessarily blocked by that nearer value. A candidate is
  * admitted only when its measured overflow crosses the sheet-space viewport
  * boundary, so this does not introduce an arbitrary overscan column count.
+ *
+ * The band is one pane's column band. Excel paints each freeze pane as its own
+ * window onto the sheet (observed in Excel 16.114 with frozen columns, both
+ * unscrolled and scrolled): the frozen pane shows columns 1..xSplit at their
+ * sheet offsets, the scrollable pane shows the sheet from its first scrolled
+ * column, and in each pane a value spills through empty neighbours in that
+ * pane's sheet coordinates regardless of which side of the freeze line the
+ * value lies on. A frozen-column value therefore continues into the
+ * scrollable pane (and moves with its scroll), and a right-aligned or centred
+ * value right of the freeze line spills into the frozen pane, even after its
+ * own column has scrolled out of view.
  */
 function virtualizedTextOverflowOverscan(
   ctx: CanvasRenderingContext2D,
@@ -3547,7 +3659,6 @@ function virtualizedTextOverflowOverscan(
   rowIndices: readonly number[],
   visibleStartCol: number,
   visibleEndCol: number,
-  firstScrollableCol: number,
   cs: number,
   mdw: number,
   rtl: boolean,
@@ -3567,7 +3678,9 @@ function virtualizedTextOverflowOverscan(
     const cell = cellMap.get(key);
     if (!cell || cell.value.type === 'empty' || mergeAnchorMap.has(key)) return false;
 
-    const { font, xf } = resolveXf(styles, cell.styleIndex ?? 0);
+    // Resolve the style exactly as paint does (a cell without its own `s`
+    // inherits the column style, §18.3.1.13).
+    const { font, xf } = resolveXf(styles, effectiveCellStyleIndex(worksheet, cell, col));
     const cf = evaluateCf(cell, row, col, cfContext, styles.dxfs ?? []);
     const formatted = formatCellValueWithColor(cell, styles, cf.numFmt, worksheet.date1904);
     const text = formatted.text;
@@ -3615,13 +3728,12 @@ function virtualizedTextOverflowOverscan(
     const nonEmptyCols = nonEmptyColsByRow.get(row);
     if (!nonEmptyCols) continue;
 
-    const before = precedingColumn(nonEmptyCols, visibleStartCol);
+    const before = precedingColumn(nonEmptyCols, visibleStartCol, colAxis);
     const visibleStartCell = cellMap.get(`${row}:${visibleStartCol}`);
     if (
       before != null &&
-      before >= firstScrollableCol &&
       (!visibleStartCell || visibleStartCell.value.type === 'empty') &&
-      !mergeBlocksOverflow(worksheet, row, before + 1, visibleStartCol) &&
+      !mergeBlocksOverflow(worksheet, row, before + 1, visibleStartCol, colAxis) &&
       reaches(
         row,
         before,
@@ -3633,13 +3745,13 @@ function virtualizedTextOverflowOverscan(
       anchorKeys.add(`${row}:${before}`);
     }
 
-    const after = followingColumn(nonEmptyCols, visibleEndCol);
+    const after = followingColumn(nonEmptyCols, visibleEndCol, colAxis);
     const visibleEndCell = cellMap.get(`${row}:${visibleEndCol}`);
     if (
       after != null &&
       after <= MAX_WORKSHEET_COL &&
       (!visibleEndCell || visibleEndCell.value.type === 'empty') &&
-      !mergeBlocksOverflow(worksheet, row, visibleEndCol, after - 1) &&
+      !mergeBlocksOverflow(worksheet, row, visibleEndCol, after - 1, colAxis) &&
       reaches(
         row,
         after,
@@ -3790,11 +3902,37 @@ export function renderViewport(
     overflowRows,
     visibleStartCol,
     visibleEndCol,
-    freezeCols + 1,
     cs,
     mdw,
     worksheet.rightToLeft === true, cjkFallback
   );
+  // The frozen pane has the same rule on its own fixed band 1..freezeCols:
+  // only values to its right can reach it, through leftward or centred spill.
+  const frozenOverflowOverscan = freezeCols > 0
+    ? virtualizedTextOverflowOverscan(
+      ctx,
+      worksheet,
+      styles,
+      cellMap,
+      nonEmptyColsByRow,
+      cfContext,
+      structuredStyleMap,
+      mergeAnchorMap,
+      colAxis,
+      rowAxis,
+      overflowRows,
+      1,
+      freezeCols,
+      cs,
+      mdw,
+      worksheet.rightToLeft === true, cjkFallback
+    )
+    : { startCol: 1, endCol: 0, anchorKeys: new Set<string>() };
+  const renderFrozenColBands = frozenOverflowOverscan.endCol > freezeCols
+    ? colAxis.bandsToCover(1, frozenOverflowOverscan.endCol)
+    : frozenColBands;
+  const renderFrozenColIndices = renderFrozenColBands.map(({ index }) => index);
+  const renderFrozenColWidths = renderFrozenColBands.map(({ size }) => size);
   const renderScrollColBands = colAxis.bandsToCover(
     overflowOverscan.startCol,
     overflowOverscan.endCol,
@@ -3822,8 +3960,11 @@ export function renderViewport(
     structuredStyleMap,
     sparklineMap,
     overflowTextAnchors: overflowOverscan.anchorKeys,
+    textRunPane: { first: freezeCols + 1, last: Number.POSITIVE_INFINITY, ownerShiftX: 0 },
+    firstViewportCol: visibleStartCol,
+    selectionLastCol: Number.POSITIVE_INFINITY,
+    textRuns: opts.onTextRun ? { owned: new Map(), foreign: new Map() } : undefined,
     mdw,
-    onTextRun: opts.onTextRun,
     rtl: worksheet.rightToLeft === true,
     canvasW,
     threeD: opts.threeD,
@@ -3837,11 +3978,38 @@ export function renderViewport(
   const scrollAreaW = Math.max(0, canvasW - scrollAreaX);
   const scrollAreaH = Math.max(0, canvasH - scrollAreaY);
 
+  // Un-mirrored canvas x of sheet offset 0 in each pane; their difference maps
+  // a cell painted as cross-pane overflow back to its owning pane.
+  const frozenPaneOrigin = cellAreaX - colAxis.offsetOf(1);
+  const scrollPaneOrigin = scrollAreaX - scrollOffsetX - colAxis.offsetOf(visibleStartCol);
+  // Ownership follows the authored freeze: columns frozen but beyond the
+  // canvas still belong to the frozen pane.
+  const authoredFreezeCols = chartSheet ? 0 : Math.max(0, Math.trunc(opts.freezeCols ?? 0));
+  const scrollRc: RenderContext = {
+    ...rc,
+    textRunPane: {
+      first: authoredFreezeCols + 1,
+      last: Number.POSITIVE_INFINITY,
+      ownerShiftX: frozenPaneOrigin - scrollPaneOrigin,
+    },
+  };
+  const frozenRc: RenderContext = {
+    ...rc,
+    overflowTextAnchors: frozenOverflowOverscan.anchorKeys,
+    textRunPane: {
+      first: 1,
+      last: authoredFreezeCols,
+      ownerShiftX: scrollPaneOrigin - frozenPaneOrigin,
+    },
+    firstViewportCol: frozenColIndices[0] ?? 1,
+    selectionLastCol: freezeCols,
+  };
+
   // ── Q1: frozen rows × frozen cols ───────────────────────────
   if (freezeRows > 0 && freezeCols > 0) {
-    renderQuadrant(ctx, rc,
-      1, 1, frozenColWidths, frozenRowHeights,
-      frozenColIndices, frozenRowIndices,
+    renderQuadrant(ctx, frozenRc,
+      1, 1, renderFrozenColWidths, frozenRowHeights,
+      renderFrozenColIndices, frozenRowIndices,
       0, 0,
       cellAreaX, cellAreaY,
       cellAreaX, cellAreaY, frozenW, frozenH, cjkFallback
@@ -3850,7 +4018,7 @@ export function renderViewport(
 
   // ── Q2: frozen rows × scrollable cols ───────────────────────
   if (freezeRows > 0) {
-    renderQuadrant(ctx, rc,
+    renderQuadrant(ctx, scrollRc,
       1, overflowOverscan.startCol, renderScrollColWidths, frozenRowHeights,
       renderScrollColIndices, frozenRowIndices,
       renderScrollOffsetX, 0,
@@ -3861,9 +4029,9 @@ export function renderViewport(
 
   // ── Q3: scrollable rows × frozen cols ───────────────────────
   if (freezeCols > 0) {
-    renderQuadrant(ctx, rc,
-      startRow, 1, frozenColWidths, scrollRowHeights,
-      frozenColIndices, scrollRowIndices,
+    renderQuadrant(ctx, frozenRc,
+      startRow, 1, renderFrozenColWidths, scrollRowHeights,
+      renderFrozenColIndices, scrollRowIndices,
       0, scrollOffsetY,
       cellAreaX, scrollAreaY,
       cellAreaX, scrollAreaY, frozenW, scrollAreaH, cjkFallback
@@ -3872,13 +4040,22 @@ export function renderViewport(
 
   // ── Q4: scrollable rows × scrollable cols (main area) ───────
   if (!chartSheet) {
-    renderQuadrant(ctx, rc,
+    renderQuadrant(ctx, scrollRc,
       startRow, overflowOverscan.startCol, renderScrollColWidths, scrollRowHeights,
       renderScrollColIndices, scrollRowIndices,
       renderScrollOffsetX, scrollOffsetY,
       scrollAreaX, scrollAreaY,
       scrollAreaX, scrollAreaY, scrollAreaW, scrollAreaH, cjkFallback
     );
+  }
+
+  // Report each painted value once: owned runs in paint order, then values
+  // painted only as cross-pane overflow (their owning pane culled them).
+  if (rc.textRuns && opts.onTextRun) {
+    for (const run of rc.textRuns.owned.values()) opts.onTextRun(run);
+    for (const [key, run] of rc.textRuns.foreign) {
+      if (!rc.textRuns.owned.has(key)) opts.onTextRun(run);
+    }
   }
 
   // ── Anchored DrawingML objects, in authored z-order ───────────

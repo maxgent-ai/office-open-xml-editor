@@ -144,7 +144,7 @@ const GRID_PLAIN_TEXT_KEYS = new Set([
 const GRID_PLAIN_GLYPH_KEYS = new Set([
   'text', 'range', 'offset', 'letterSpacingPt', 'scaleX', 'scaleY', 'direction',
   'kerning', 'writingMode', 'glyphOrientation', 'verticalFeature', 'glyphOffsetPt',
-  'sourceMapping', 'inkBounds', 'blockAxisInkBounds',
+  'sourceMapping', 'inkBounds', 'blockAxisInkBounds', 'naturalAdvancePt',
 ]);
 const GRID_PLAIN_TYPOGRAPHY_KEYS = new Set([
   'caps', 'smallCaps', 'strike', 'doubleStrike', 'verticalAlign', 'positionPt', 'emphasis',

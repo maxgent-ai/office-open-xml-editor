@@ -1,4 +1,10 @@
-import { countSpacingCharacters } from '../character-spacing.js';
+import {
+  CONDENSED_CONTEXT_GRAPHEMES,
+  condensedClusterFloorPx,
+  countedSpacingAdvance,
+  countSpacingCharacters,
+} from '../character-spacing.js';
+export { CONDENSED_CONTEXT_GRAPHEMES, condensedClusterFloorPx };
 import { sliceTextBreakWindow } from './text-break-window.js';
 import { graphemeClusterOffsets } from '@silurus/ooxml-core';
 import { EAST_ASIAN_RE, sliceTextShapeRequest, semanticSlotStartIndex } from '../layout/text.js';
@@ -459,15 +465,225 @@ export function segLetterSpacingPx(
 }
 
 
+/** One grapheme cluster's natural (unspaced, unscaled) advance, in the same
+ * px space as the caller's natural segment width. */
+export interface NaturalClusterAdvance {
+  readonly text: string;
+  readonly advancePx: number;
+  /** Vertical cells only: the planner floored this cell. */
+  readonly floored?: boolean;
+}
+
+
+/** Per-unit geometry {@link segAdvanceWidth} needs to apply the
+ * {@link condensedSpacingMayFloor} floor: horizontal text supplies its natural
+ * grapheme-cluster advances; a vertical run supplies the planned glyph cells
+ * (`planVerticalRunWithCapability`), whose advances already carry the run
+ * pitch and the floor, so measurement and painted cells share one authority. */
+export type CondensedAdvanceUnits =
+  | Readonly<{ kind: 'natural-clusters'; clusters: readonly NaturalClusterAdvance[] }>
+  | Readonly<{ kind: 'vertical-cells'; cells: readonly NaturalClusterAdvance[] }>;
+
+
+/** WORD_CONDENSED_SPACING_ADVANCE_FLOOR: §17.3.2.35 removes pitch "after each
+ * character" but never moves the pen backwards. Word floors each character's
+ * advance at zero, so an over-condensed character stacks on its successor and
+ * the run, its line fit, alignment and decorations all use the floored
+ * advance. The floored advance is the character's whole advance: scaled glyph,
+ * grid delta, run pitch, width balance and punctuation compression (compression
+ * never adds advance, so max(0, max(0, glyph + pitch) + compression) is the
+ * same value). True only when some character can reach a negative advance;
+ * §17.3.2.14 fitText and §17.3.2.10 tate-chu-yoko own their allocation and are
+ * outside this rule. */
+export function condensedSpacingMayFloor(
+  seg: LayoutTextSeg,
+  grid: DocGridCtx | undefined,
+  scale: number,
+): boolean {
+  if (seg.fitTextPerGapPx !== undefined || seg.tateChuYoko) return false;
+  const gridPx = segmentCharacterGridDeltaPx(seg, grid, scale);
+  return gridPx + charSpacingDeltaPx(seg, scale) < 0 || gridPx < 0;
+}
+
+
+/** Punctuation compression plus width balance of a source range of
+ * `seg.text` (px): the per-character adjustments the floor covers together
+ * with the glyph and pitch. Built once per segment in linear time and
+ * memoised, so repeated prefix probes reuse it (each compression is owned by
+ * the unit containing its end offset); a build charges the segment length to
+ * `reserveWork`. Vertical planning receives it as `characterAdjustmentPt`. */
+export function condensedCharacterAdjustments(
+  seg: LayoutTextSeg,
+  grid: DocGridCtx | undefined,
+  scale: number,
+  reserveWork?: (utf16Units: number) => void,
+): (start: number, end: number) => number {
+  const cached = condensedAdjustmentCache.get(seg);
+  if (cached && cached.text === seg.text && cached.compressions === seg.punctuationCompressions
+    && cached.grid === grid && cached.scale === scale) {
+    return cached.adjustmentPx;
+  }
+  reserveWork?.(seg.text.length);
+  const compressionBefore = new Float64Array(seg.text.length + 2);
+  for (const compression of seg.punctuationCompressions ?? []) {
+    if (compression.end >= 0 && compression.end <= seg.text.length) {
+      compressionBefore[compression.end + 1]! += compression.adjustmentPt;
+    }
+  }
+  for (let index = 1; index < compressionBefore.length; index += 1) {
+    compressionBefore[index]! += compressionBefore[index - 1]!;
+  }
+  const charScale = charScaleFactor(seg);
+  const adjustmentPx = (start: number, end: number): number =>
+    (compressionBefore[end + 1]! - compressionBefore[start + 1]!) * scale
+    + widthBalanceSpaceAdjustmentForTextPt(seg, seg.text.slice(start, end), grid) * scale * charScale;
+  condensedAdjustmentCache.set(seg, {
+    text: seg.text,
+    compressions: seg.punctuationCompressions,
+    grid,
+    scale,
+    adjustmentPx,
+  });
+  return adjustmentPx;
+}
+
+const condensedAdjustmentCache = new WeakMap<LayoutTextSeg, Readonly<{
+  text: string;
+  compressions: LayoutTextSeg['punctuationCompressions'];
+  grid: DocGridCtx | undefined;
+  scale: number;
+  adjustmentPx: (start: number, end: number) => number;
+}>>();
+
+
+/** Each unit's whole signed advance (px). Horizontal clusters scale their
+ * natural advance and add grid/run pitch plus the character adjustments;
+ * vertical cells were planned with pitch, adjustments and floor already.
+ * Shared by measurement ({@link segAdvanceWidth}) and retained geometry. */
+export function condensedUnitAdvancesPx(
+  seg: LayoutTextSeg,
+  grid: DocGridCtx | undefined,
+  scale: number,
+  units: CondensedAdvanceUnits,
+): readonly number[] {
+  const gridPx = segmentCharacterGridDeltaPx(seg, grid, scale);
+  const spacingPx = charSpacingDeltaPx(seg, scale);
+  const charScale = charScaleFactor(seg);
+  const adjustmentPx = units.kind === 'natural-clusters'
+    ? condensedCharacterAdjustments(seg, grid, scale)
+    : undefined;
+  let offset = 0;
+  const list = units.kind === 'natural-clusters' ? units.clusters : units.cells;
+  const advances = list.map((unit) => {
+    const start = offset;
+    offset += unit.text.length;
+    return adjustmentPx
+      ? unit.advancePx * charScale
+        + countedSpacingAdvance(
+          countSpacingCharacters(unit.text), gridPx, spacingPx, gridPx + spacingPx,
+        )
+        + adjustmentPx(start, offset)
+      : unit.advancePx;
+  });
+  if (offset !== seg.text.length) {
+    throw new Error('Condensed advance units do not cover their segment');
+  }
+  return advances;
+}
+
+
+/** Whether {@link condensedUnitAdvancesPx} reaches the floor: a negative
+ * horizontal unit, or a vertical cell the planner floored. */
+export function condensedUnitsFloor(
+  units: CondensedAdvanceUnits,
+  advances: readonly number[],
+): boolean {
+  return units.kind === 'vertical-cells'
+    ? units.cells.some((cell) => cell.floored === true)
+    : advances.some((advance) => advance < 0);
+}
+
+
+/** The segment's advance as the sum of its floored unit advances, or
+ * `undefined` when no unit reaches the floor (callers then keep the signed
+ * whole-segment arithmetic unchanged). Summing the non-negative units directly
+ * keeps a fully floored run exactly zero. */
+function condensedFlooredAdvancePx(
+  seg: LayoutTextSeg,
+  grid: DocGridCtx | undefined,
+  scale: number,
+  units: CondensedAdvanceUnits,
+): number | undefined {
+  const advances = condensedUnitAdvancesPx(seg, grid, scale, units);
+  if (!condensedUnitsFloor(units, advances)) return undefined;
+  let total = 0;
+  for (const advance of advances) total += advance > 0 ? advance : 0;
+  return total;
+}
+
+
+/** The single contextual-advance authority for
+ * WORD_CONDENSED_SPACING_ADVANCE_FLOOR, used by line fitting and retained
+ * geometry alike: each grapheme of `segment.text[start, end)` measured with up
+ * to {@link CONDENSED_CONTEXT_GRAPHEMES} preceding graphemes of the same slice,
+ * minus that context. Linear in the slice length; every measured UTF-16 unit
+ * is charged to `reserveWork`. */
+export function contextualGraphemeAdvances(
+  segment: LayoutTextSeg,
+  start: number,
+  end: number,
+  fontSizePx: number,
+  measureFallback: (text: string) => number,
+  reserveWork: (utf16Units: number) => void,
+): readonly NaturalClusterAdvance[] {
+  const offsets = [...new Set([
+    start,
+    ...graphemeClusterOffsets(segment.text.slice(start, end)).map((offset) => start + offset),
+    end,
+  ])].sort((a, b) => a - b);
+  const width = (from: number, to: number): number => {
+    if (to <= from) return 0;
+    reserveWork(to - from);
+    if (segment.textLayoutService && segment.textShapeRequest) {
+      if (segment.textShapeRequest.text !== segment.text) {
+        throw new Error('Cluster measurement does not match its retained text range context');
+      }
+      return segment.textLayoutService.shape({
+        ...sliceTextShapeRequest(segment.textShapeRequest, from, to),
+        fontSizePt: fontSizePx,
+        measure: true,
+        clusterGeometry: false,
+      }).advancePt;
+    }
+    return measureFallback(segment.text.slice(from, to));
+  };
+  const clusters: NaturalClusterAdvance[] = [];
+  for (let index = 0; index < offsets.length - 1; index += 1) {
+    const clusterStart = offsets[index]!;
+    const clusterEnd = offsets[index + 1]!;
+    const contextStart = offsets[Math.max(0, index - CONDENSED_CONTEXT_GRAPHEMES)]!;
+    clusters.push({
+      text: segment.text.slice(clusterStart, clusterEnd),
+      advancePx: width(contextStart, clusterEnd) - width(contextStart, clusterStart),
+    });
+  }
+  return clusters;
+}
+
+
 /** A text segment's laid-out advance including the §17.3.2.43 horizontal scale
  *  and §17.3.2.35 character spacing on top of the docGrid delta. Scale natural
  *  glyph width first, then add run pitch per rendered character;
- *  these are independent OOXML properties. */
+ *  these are independent OOXML properties. Over-condensed characters take
+ *  the {@link condensedSpacingMayFloor} zero floor; callers that can reach it
+ *  pass the segment's {@link CondensedAdvanceUnits}. Without units the text
+ *  is one unit, which is exact for a single cluster. */
 export function segAdvanceWidth(
   seg: LayoutTextSeg,
   naturalWidthPx: number,
   grid: DocGridCtx | undefined,
   scale: number,
+  units?: CondensedAdvanceUnits,
 ): number {
   if (seg.fitTextPerGapPx !== undefined) {
     const charCount = [...seg.text].length;
@@ -487,7 +703,7 @@ export function segAdvanceWidth(
   // rotation — see vertical-text.ts and renderer's page transform.)
   if (seg.tateChuYoko) return seg.fontSize * scale;
   const segmentDelta = segmentCharacterGridDeltaPx(seg, grid, scale);
-  return textAdvanceWidth(
+  const signed = textAdvanceWidth(
     naturalWidthPx,
     seg.text,
     segmentDelta,
@@ -496,6 +712,9 @@ export function segAdvanceWidth(
   )
     + widthBalanceSpaceAdjustmentTotalPt(seg, grid) * scale * charScaleFactor(seg)
     + punctuationCompressionTotalPt(seg) * scale;
+  if (!condensedSpacingMayFloor(seg, grid, scale)) return signed;
+  if (!units) return signed > 0 ? signed : 0;
+  return condensedFlooredAdvancePx(seg, grid, scale, units) ?? signed;
 }
 
 

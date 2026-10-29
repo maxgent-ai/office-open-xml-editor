@@ -3,6 +3,8 @@ import { PNG } from 'pngjs';
 import pixelmatch from 'pixelmatch';
 // @ts-ignore - shared plain-JS test fixture builder.
 import { chartExXlsxBytes } from '../../../../tests/fixtures/chart-ex-packages.mjs';
+// @ts-ignore - shared plain-JS test fixture builder.
+import { frozenOverflowXlsxBytes } from '../../../../tests/fixtures/frozen-overflow-xlsx.mjs';
 
 // Worker mode must produce (near-)identical pixels to main mode: same
 // renderer, same per-sheet parse, same fonts, different thread. The only
@@ -148,4 +150,82 @@ test('worker mode matches main mode › ChartEx waterfall', async ({ page }) => 
   expect(coloured(worker)).toBeGreaterThan(500);
   const diff = pixelmatch(main.data, worker.data, undefined, main.width, main.height, { threshold: 0.1 });
   expect((diff / (main.width * main.height)) * 100).toBeLessThanOrEqual(0.1);
+});
+
+// Text overflow crosses the freeze line in both directions (#1973). Both
+// threads run the same renderer, so the unscrolled and scrolled frames must
+// match: the spill from a frozen column moves with the scrollable pane, and
+// leftward spill into the frozen pane stays after its column scrolls away.
+async function frozenOverflowFrames(
+  page: import('@playwright/test').Page,
+  query: string,
+): Promise<{ main: PNG; worker: PNG }> {
+  const bytes = frozenOverflowXlsxBytes();
+  await page.route('**/generated/frozen-overflow.xlsx', (route) => route.fulfill({
+    status: 200, contentType: 'application/octet-stream', body: Buffer.from(bytes),
+  }));
+  await page.goto(`/tests/visual/worker-fixture.html?xlsx=generated/frozen-overflow&sheet=0&${query}`);
+  await page.waitForFunction(
+    () => document.body.dataset.status === 'ready' || document.body.dataset.status === 'error',
+    { timeout: 60_000 },
+  );
+  const status = await page.evaluate(() => document.body.dataset.status);
+  if (status === 'error') {
+    throw new Error(await page.evaluate(() => document.body.dataset.errorMessage ?? ''));
+  }
+  const [mainUrl, workerUrl] = await page.evaluate(() => [
+    (document.getElementById('main-canvas') as HTMLCanvasElement).toDataURL('image/png'),
+    (document.getElementById('worker-canvas') as HTMLCanvasElement).toDataURL('image/png'),
+  ]);
+  return {
+    main: PNG.sync.read(Buffer.from(mainUrl.split(',')[1], 'base64')),
+    worker: PNG.sync.read(Buffer.from(workerUrl.split(',')[1], 'base64')),
+  };
+}
+
+for (const col of [4, 8]) {
+  test(`worker mode matches main mode › frozen-column overflow, scrollable pane at column ${col}`, async ({ page }) => {
+    const { main, worker } = await frozenOverflowFrames(
+      page, `row=2&col=${col}&freezeRows=1&freezeCols=3`,
+    );
+    expect(worker.width).toBe(main.width);
+    expect(worker.height).toBe(main.height);
+    const diff = pixelmatch(main.data, worker.data, undefined, main.width, main.height, { threshold: 0.1 });
+    expect((diff / (main.width * main.height)) * 100).toBeLessThanOrEqual(0.1);
+  });
+}
+
+test('unscrolled frozen panes paint overflow exactly like the unfrozen sheet', async ({ page }) => {
+  // Unscrolled, each pane's sheet coordinates coincide with the unfrozen
+  // sheet's, so every overflow (rightward from B, leftward from E, both ways
+  // from C) must be identical; only the freeze separator lines may differ.
+  const frozen = await frozenOverflowFrames(page, 'row=2&col=4&freezeRows=1&freezeCols=3');
+  // Same grid extent: 3 frozen + 12 scrollable columns, 1 frozen + 40 rows.
+  const unfrozen = await frozenOverflowFrames(page, 'row=1&col=1&cols=15&rows=41');
+  for (const [a, b] of [[frozen.main, unfrozen.main], [frozen.worker, unfrozen.worker]]) {
+    expect(a.width).toBe(b.width);
+    expect(a.height).toBe(b.height);
+    const { width, height } = a;
+    const differs = (x: number, y: number): boolean => {
+      const o = (y * width + x) * 4;
+      return a.data[o] !== b.data[o] || a.data[o + 1] !== b.data[o + 1] || a.data[o + 2] !== b.data[o + 2];
+    };
+    const colCounts = new Array<number>(width).fill(0);
+    const rowCounts = new Array<number>(height).fill(0);
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        if (differs(x, y)) { colCounts[x]++; rowCounts[y]++; }
+      }
+    }
+    // A separator spans the drawn grid; text overflow differences do not.
+    const near = (counts: number[], i: number, extent: number) =>
+      [i - 1, i, i + 1].some((j) => (counts[j] ?? 0) > extent / 4);
+    let stray = 0;
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        if (differs(x, y) && !near(colCounts, x, height) && !near(rowCounts, y, width)) stray++;
+      }
+    }
+    expect(stray).toBe(0);
+  }
 });

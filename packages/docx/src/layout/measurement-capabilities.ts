@@ -30,6 +30,10 @@ export interface VerticalGlyphMeasurementService {
     charScale: number;
     growTrRotateInk: boolean;
     writingMode: WritingMode;
+    /** Punctuation compression and width balance of a source range, floored
+     * with the cell (WORD_CONDENSED_SPACING_ADVANCE_FLOOR); when supplied,
+     * reported advances include it. */
+    characterAdjustmentPt?: (start: number, end: number) => number;
   }>): readonly Readonly<{
     range: Readonly<{ start: number; end: number }>;
     text: string;
@@ -39,5 +43,7 @@ export interface VerticalGlyphMeasurementService {
     drawOffsetPt: Readonly<{ xPt: number; yPt: number }>;
     verticalFeature: boolean;
     blockAxisInkBounds?: Readonly<{ startPt: number; endPt: number }>;
+    floored?: true;
+    naturalAdvancePt?: number;
   }>[];
 }

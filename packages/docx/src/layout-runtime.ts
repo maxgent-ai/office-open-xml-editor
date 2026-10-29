@@ -189,6 +189,7 @@ export function createLayoutServices(
             (cp) => verticalVertGlyphReachable(canvasContext, cp),
             input.writingMode,
             input.characterGridDeltaPt,
+            input.characterAdjustmentPt,
           );
         } finally {
           canvasContext.font = previousFont;

@@ -356,6 +356,10 @@ export interface TextPaintOp {
   readonly glyphOffsetPt?: PointPt;
   /** `kashida` permits acquisition-inserted U+0640 glyphs over one source range. */
   readonly sourceMapping?: 'identity' | 'kashida';
+  /** WORD_CONDENSED_SPACING_ADVANCE_FLOOR: this operation draws one cluster
+   * whose advance took the zero floor; its glyph's natural advance. RTL paint
+   * anchors the glyph's trailing (left) edge on the pen with it. */
+  readonly naturalAdvancePt?: number;
   /** Selected-face ink relative to this operation's alphabetic baseline.
    * Pagination may consume it, but paint must never reconstruct it. */
   readonly inkBounds?: GlyphInkBounds;
