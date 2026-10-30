@@ -88,6 +88,13 @@ impl Shading {
         self.pattern == "clear" && matches!(self.background, Color::Rgb(_))
     }
 
+    /// The `clear` pattern fills with its background only, so a cvAuto
+    /// background paints nothing whatever the foreground; ShdAuto
+    /// ([MS-DOC] 2.9.247) is the canonical form.
+    pub(in crate::doc) fn is_clear_auto_background(&self) -> bool {
+        self.pattern == "clear" && self.background == Color::Auto
+    }
+
     pub fn read(bytes: &[u8], old: bool) -> Result<Option<Self>, String> {
         if bytes.len() != if old { 2 } else { 10 } {
             return Err(unsupported("invalid Word shading length"));

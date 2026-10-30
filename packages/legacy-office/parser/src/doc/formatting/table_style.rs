@@ -313,8 +313,19 @@ impl Formatting<'_> {
             .filter(|style| style.kind == 3)
             .is_none()
         {
+            // Callers reach here only with ids that resolve_table_style_id
+            // already validated or mapped to istd 0x000B (MS-DOC 2.6.3
+            // sprmTIstd). A stylesheet that does not define even that slot
+            // leaves Table Normal itself undefined: Word opens such
+            // documents and applies no table style (on DOCX save the tables
+            // carry no w:tblStyle), so project an empty profile instead of
+            // refusing the document. Only an empty or nonexistent slot is
+            // covered by that observation: a 0x000B slot defined with another
+            // style type, and an unresolved non-fallback id, stay refused.
+            let undefined_default =
+                id == 0x000b && self.styles.get(id).and_then(Option::as_ref).is_none();
             return Ok(Profile {
-                unsupported_table: true,
+                unsupported_table: !undefined_default,
                 ..Profile::default()
             });
         }

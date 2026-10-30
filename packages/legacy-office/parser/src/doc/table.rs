@@ -24,6 +24,11 @@ pub(crate) use width::PreferredWidth;
 pub(in crate::doc) enum PreparedCellShading {
     StyleDeferred,
     Explicit(Shading),
+    /// A modern compatibility ShdAuto entry retained for an explicit Raw
+    /// ShdNil cell. Whether current Word lets it override a filled table
+    /// style is unverified, so it resolves only when the style gives the
+    /// cell no fill, where either precedence yields no fill.
+    CompatibilityAuto,
     Unsupported,
 }
 
@@ -648,6 +653,8 @@ impl Row {
     /// ShdAuto is an explicit no-fill value. The bounded current-Word fallback
     /// retains clear RGB modern arrays as the fallback for explicit Raw ShdNil,
     /// including when a later compatibility replacement changes that fallback.
+    /// A clear automatic-background entry there is admitted only where the
+    /// style also gives the cell no fill (see [`PreparedCellShading`]).
     pub(in crate::doc) fn apply_style_aware_shading(
         &mut self,
         code: u16,
@@ -710,6 +717,12 @@ impl Row {
                             }
                             Some(value) if value.is_clear_rgb_background() => {
                                 Some(PreparedCellShading::Explicit(value))
+                            }
+                            // [MS-DOC] 2.6.3 writes ShdAuto for non-shaded
+                            // cells of these arrays. Its fallback only agrees
+                            // with a style that gives the cell no fill.
+                            Some(value) if value.is_clear_auto_background() => {
+                                Some(PreparedCellShading::CompatibilityAuto)
                             }
                             Some(_) | None => {
                                 supported = false;
@@ -1946,6 +1959,45 @@ mod tests {
             Some(PreparedCellShading::Explicit(ref shading))
                 if shading.direct_background().as_deref() == Some("123456")
         ));
+    }
+
+    #[test]
+    fn modern_compatibility_clear_auto_shading_is_a_style_checked_fallback() {
+        // [MS-DOC] 2.6.3 writes ShdAuto (clear pattern, cvAuto colors) for
+        // non-shaded cells of the compatibility arrays. It is admitted as a
+        // Raw ShdNil fallback that the story resolves against the style fill
+        // instead of failing the whole document.
+        let auto = [0, 0, 0, 255, 0, 0, 0, 255, 0, 0];
+        let nil = [255, 255, 255, 255, 255, 255, 255, 255, 0, 0];
+        for compat in [0xd612, 0xd616, 0xd60c] {
+            let mut row = Row::default();
+            row.apply(0x7621, &[0, 46, 1, 0]).unwrap();
+            row.apply(0x563a, &1u16.to_le_bytes()).unwrap();
+            assert_eq!(
+                row.apply_style_aware_shading(compat, &raw_array(auto, 1), style_aware_policy())
+                    .unwrap(),
+                StyleAwareShadingApply::Handled
+            );
+            let raw = match compat {
+                0xd616 => 0xd671,
+                0xd60c => 0xd672,
+                _ => 0xd670,
+            };
+            assert_eq!(
+                row.apply_style_aware_shading(raw, &raw_array(nil, 1), style_aware_policy())
+                    .unwrap(),
+                StyleAwareShadingApply::Handled
+            );
+            let start = match compat {
+                0xd616 => 22,
+                0xd60c => 44,
+                _ => 0,
+            };
+            assert_eq!(
+                row.cells[start].prepared_shading,
+                Some(PreparedCellShading::CompatibilityAuto)
+            );
+        }
     }
 
     #[test]

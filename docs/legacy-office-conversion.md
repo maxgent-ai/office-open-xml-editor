@@ -192,6 +192,29 @@ Explicit values, including zero, win. Unlisted languages keep the
 unresolved-margin recovery. The host locale and the document's text language
 are not used to guess the producer's settings.
 
+A default character language of 0x007F (reserved in MS-LCID 2.2; Windows
+names it LOCALE_INVARIANT), stamped by some third-party producers, projects
+no language: Word opens such documents and writes an empty `w:lang
+w:val=""` on DOCX save, which the DOCX reader treats as no language. The
+other language axes have no Office evidence for this value and stay
+rejected, as do unlisted LCIDs.
+
+A table whose style selection resolves to istd 0x000B (MS-DOC 2.6.3
+sprmTIstd) in a stylesheet that does not define even that slot gets no
+table style: Word opens such documents and saves the tables without
+`w:tblStyle`. A 0x000B slot defined with another style type, and
+unsupported content inside a defined table style, stay rejected.
+
+A modern compatibility shading array (sprmTDefTableShd and its later
+segments, MS-DOC 2.6.3) marks non-shaded cells with ShdAuto, the clear
+pattern over automatic colors (MS-DOC 2.9.247). In a table-styled row
+such an entry, or any clear pattern over an automatic background, no
+longer rejects the document. It matters only as the fallback of an
+explicit Raw ShdNil cell: where the table style gives that cell no fill
+it projects no fill, which both possible precedence readings agree on.
+Over a style fill, whether current Word lets it clear the fill is not
+established, so that cell stays rejected, as do patterned entries.
+
 Fields in the direct DOC source are checked against each story's own field
 table: the main document, headers and footers, footnotes, endnotes and
 textboxes (MS-DOC 2.8.25). They map onto the fields the DOCX reader already

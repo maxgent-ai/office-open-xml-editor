@@ -1149,6 +1149,65 @@ mod tests {
         assert!(parsed.contains("descriptor compatibility"));
     }
 
+    #[test]
+    fn reserved_local_zip64_fields_parse() {
+        use std::io::Write;
+        let main = br#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>reserved ZIP64 local field</w:t></w:r></w:p></w:body></w:document>"#;
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        writer
+            .start_file(
+                "word/document.xml",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        writer.write_all(main).unwrap();
+        parser::write_test_content_types(&mut writer);
+        let bytes = reserve_local_zip64_fields(&writer.finish().unwrap().into_inner());
+        let parsed = parse_docx_native(&bytes).expect("reserved ZIP64 local fields are compatible");
+        assert!(parsed.contains("reserved ZIP64 local field"));
+    }
+
+    /// Rewrite every local header of a classic, descriptor-free ZIP as a
+    /// version 4.5 header with a reserved (zero) 16-byte ZIP64 field, keeping
+    /// the central directory with no extra field (#1976).
+    fn reserve_local_zip64_fields(bytes: &[u8]) -> Vec<u8> {
+        let le16 = |at: usize| u16::from_le_bytes([bytes[at], bytes[at + 1]]) as usize;
+        let le32 = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+        let eocd = bytes.len() - 22;
+        let directory = le32(eocd + 16);
+        let mut out = Vec::new();
+        let mut offsets = Vec::new();
+        let mut cursor = 0;
+        while cursor < directory {
+            assert_eq!(le16(cursor + 6) & (1 << 3), 0, "no data descriptors");
+            let header_end = cursor + 30 + le16(cursor + 26) + le16(cursor + 28);
+            let data_end = header_end + le32(cursor + 18);
+            offsets.push(out.len() as u32);
+            let mut header = bytes[cursor..header_end].to_vec();
+            header[4..6].copy_from_slice(&45u16.to_le_bytes());
+            header[28..30].copy_from_slice(&(le16(cursor + 28) as u16 + 20).to_le_bytes());
+            out.extend_from_slice(&header);
+            out.extend_from_slice(&[1, 0, 16, 0]);
+            out.extend_from_slice(&[0; 16]);
+            out.extend_from_slice(&bytes[header_end..data_end]);
+            cursor = data_end;
+        }
+        let new_directory = out.len() as u32;
+        let mut cursor = directory;
+        for offset in offsets {
+            assert!(le16(cursor + 6) < 45);
+            let end = cursor + 46 + le16(cursor + 28) + le16(cursor + 30) + le16(cursor + 32);
+            let mut header = bytes[cursor..end].to_vec();
+            header[42..46].copy_from_slice(&offset.to_le_bytes());
+            out.extend_from_slice(&header);
+            cursor = end;
+        }
+        let mut footer = bytes[eocd..].to_vec();
+        footer[16..20].copy_from_slice(&new_directory.to_le_bytes());
+        out.extend_from_slice(&footer);
+        out
+    }
+
     /// Input that is not a WordprocessingML package fails closed at every public
     /// Rust boundary instead of materializing a placeholder with a 0x0 section.
     #[test]
