@@ -34,6 +34,48 @@ is removed in 0.91.0. See the [0.89 to 0.90 migration guide](docs/migration-0.90
   `fonts` throws a `TypeError`. The VS Code extension keeps its
   `ooxmlViewer.useGoogleFonts` setting.
 
+## 0.89.7 — 2026-10-29
+
+Compatible patch release. No migration is required.
+
+- **Word documents with strongly condensed character spacing:** documents whose
+  condensed character spacing is wider than a character no longer fail to load
+  with "segment.measuredWidthPt must be finite and non-negative". As in Word,
+  each character advances by at least zero, so over-condensed characters stack
+  instead of moving text backwards (#1975). Over-condensed cursive scripts such
+  as Arabic keep their joined shapes and still paint at their natural advances
+  (#1981).
+- **Office files written with ZIP64 local headers:** packages whose local file
+  headers declare version 4.5 with a reserved ZIP64 field, while the central
+  directory is classic, open again instead of being refused as not Office Open
+  XML (#1976).
+- **Excel frozen panes:** text overflowing from a frozen column now continues
+  across the freeze line instead of being clipped there, in main-thread and
+  worker mode (#1973).
+- **Excel charts:** workbooks with many charts that use source-linked number
+  formats load faster; each chart source worksheet is now read once instead of
+  once per axis or series (#1971).
+- **Legacy Word 97-2003 documents (experimental):** documents from third-party
+  producers that use the invariant default language, omit the Table Normal
+  style, or mark unshaded table cells with automatic colors now open instead of
+  being rejected. Thanks to Vadim Kosin for the contributions (#1963, #1970).
+
+## 0.89.6 — 2026-10-27
+
+Compatible patch release. No migration is required.
+
+- **Excel sheet tab colors:** sheet tab colors and other workbook colors are
+  resolved to validated `#RRGGBB` values before they are used for styling;
+  other color text is ignored instead of being passed through to CSS (#1957).
+- **Excel merged cells:** workbooks with repeated or overlapping `mergeCell`
+  entries no longer freeze the page; merge handling now scales with the
+  distinct cells covered (#1958).
+- **Word VML pictures with tight or through wrapping:** floating VML pictures
+  with `<w10:wrap type="tight"/>` or `"through"` are painted again, and text
+  wraps around their `wrapcoords` polygon. Wrap polygon parsing (VML
+  `wrapcoords` and DrawingML `wp:wrapPolygon`) is bounded to the vertex limit
+  regardless of input size (#1959).
+
 ## 0.89.5 — 2026-10-26
 
 Compatible patch release. No migration is required.

@@ -279,6 +279,9 @@ pub(crate) struct WorksheetReferenceSession {
     remaining_indexed_string_bytes: usize,
     remaining_physical_indexed_cells: usize,
     remaining_physical_indexed_string_bytes: usize,
+    /// Chart source-linked number formats read the style of a reference's
+    /// first cell; the value index above deliberately keeps no styles.
+    pub(crate) chart_source_styles: crate::chart::ChartSourceStyleCache,
 }
 
 enum CurrentSheetLookupEntry {
@@ -304,6 +307,7 @@ impl Default for WorksheetReferenceSession {
             remaining_indexed_string_bytes: MAX_TOTAL_INDEXED_STRING_BYTES,
             remaining_physical_indexed_cells: MAX_TOTAL_INDEXED_CELLS,
             remaining_physical_indexed_string_bytes: MAX_TOTAL_INDEXED_STRING_BYTES,
+            chart_source_styles: Default::default(),
         }
     }
 }

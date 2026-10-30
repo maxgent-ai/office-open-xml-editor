@@ -292,6 +292,7 @@ function measureTextRange(
   // Keep physical word units intact; the same bounded boundary oracle used by
   // justified line layout preserves registered compound/Latin context here.
   let boundaryAdapter: LineMeasurementAdapter | undefined;
+  let condensedAdapter: LineMeasurementAdapter | undefined;
   let previousCandidate: LayoutTextSeg | undefined;
   let pendingSnapBlock: Readonly<{
     kind: 'latin' | 'complexScript';
@@ -352,6 +353,14 @@ function measureTextRange(
     }
     previousCandidate = candidate;
     const measureCandidate = (measured: LayoutTextSeg): number => {
+      // WORD_CONDENSED_SPACING_ADVANCE_FLOOR needs each cluster's advance.
+      condensedAdapter ??= new LineMeasurementAdapter(measurer.context, 1, s => buildFont(
+        s.bold, s.italic, calcEffectiveFontPx(s, 1), s.fontFamily,
+        measurer.fontFamilyClasses as Record<string, string>, s.fontRoute,
+      ));
+      const units = condensedAdapter.condensedAdvanceUnits(
+        measured, measured.text, 0, characterGrid, () => {},
+      );
       if (measured.textLayoutService && measured.textShapeRequest) {
         const shaped = measured.textLayoutService.shape({
           ...measured.textShapeRequest,
@@ -359,7 +368,7 @@ function measureTextRange(
           measure: true,
           clusterGeometry: false,
         });
-        return segAdvanceWidth(measured, shaped.advancePt, characterGrid, 1);
+        return segAdvanceWidth(measured, shaped.advancePt, characterGrid, 1, units);
       }
       measurer.context.font = buildFont(
         measured.bold,
@@ -374,6 +383,7 @@ function measureTextRange(
         measurer.context.measureText(measured.text).width,
         characterGrid,
         1,
+        units,
       );
     };
     const kind = snapToCharsClass(candidate, characterGrid);

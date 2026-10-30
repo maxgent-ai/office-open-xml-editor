@@ -2,8 +2,26 @@ import { wordArabicTextKerned, wordKerningApplies } from '../layout/line-compati
 import type { LayoutTextSeg } from '../line-layout.js';
 import type { MeasurementTextContext, VerticalGlyphMeasurementService } from '../layout/measurement-capabilities.js';
 import { calcEffectiveFontPx, semanticSlotStartIndex } from '../layout/text.js';
-import { charScaleFactor } from './advance.js';
+import {
+  charScaleFactor,
+  CONDENSED_CONTEXT_GRAPHEMES,
+  condensedCharacterAdjustments,
+  condensedSpacingMayFloor,
+  contextualGraphemeAdvances,
+  segLetterSpacingPx,
+  segmentCharacterGridDeltaPx,
+  type CondensedAdvanceUnits,
+  type NaturalClusterAdvance,
+} from './advance.js';
+import type { DocGridCtx } from './model.js';
 import { verticalRunInkExtra } from './vertical-text.js';
+
+/** Measured UTF-16 units per text unit charged for one vertical cell plan:
+ * routing probes (natural, vertical-form and ink probes) plus one
+ * {@link CONDENSED_CONTEXT_GRAPHEMES}-bounded context pair per sideways
+ * grapheme, the whole sideways piece and a floored cluster's drawn advance,
+ * plus the two bidi level passes of a split piece. */
+const VERTICAL_PLAN_WORK_PER_UNIT = 2 * (CONDENSED_CONTEXT_GRAPHEMES + 1) + 9;
 
 /** Ownership retains the source's slots even after emergency slicing. Only
  * overlapping slots describe the current physical seam; an all-ASCII suffix
@@ -52,15 +70,19 @@ export class LineMeasurementAdapter {
     // ECMA-376 §17.3.2.19: an absent w:kern disables pair kerning even when
     // Canvas would otherwise choose its automatic kerning behavior.
     const previous = this.selectedKerning;
-    // The acquisition request owns the mode-scoped decision; retained paint
-    // consumes that same value. Standalone segments have no compatibility mode.
-    const selected = (segment.textShapeRequest?.kerning ?? wordKerningApplies(segment.fontSize, segment.kerning))
-      || wordArabicTextKerned(segment.text)
-      ? 'normal'
-      : 'none';
+    const selected = this.segmentKerning(segment);
     this.context.fontKerning = selected;
     this.selectedKerning = selected;
     return previous;
+  }
+
+  private segmentKerning(segment: LayoutTextSeg): CanvasFontKerning {
+    // The acquisition request owns the mode-scoped decision; retained paint
+    // consumes that same value. Standalone segments have no compatibility mode.
+    return (segment.textShapeRequest?.kerning ?? wordKerningApplies(segment.fontSize, segment.kerning))
+      || wordArabicTextKerned(segment.text)
+      ? 'normal'
+      : 'none';
   }
 
   private restoreKerning(previous: CanvasFontKerning | null): void {
@@ -169,6 +191,100 @@ export class LineMeasurementAdapter {
     });
     if (physicalUnit && !(joined.spans.length === 1 && joined.spans[0]?.semanticSlotSpans)) return 0;
     return (joined.advancePt - measure(l).advancePt - measure(r).advancePt) * charScaleFactor(right);
+  }
+
+  /** WORD_CONDENSED_SPACING_ADVANCE_FLOOR units of `segment.text[start, start +
+   * text.length)`, or `undefined` when no character of the segment can reach a
+   * negative advance (the signed segment arithmetic is then exact).
+   *
+   * Vertical runs use the planned glyph cells paint draws. Horizontal text uses
+   * each grapheme cluster's contextual advance from {@link contextualGraphemeAdvances},
+   * the authority retained geometry shares, so a probe is linear in its length. Whole-segment
+   * units are computed once per segment text and reused by its prefixes (a
+   * cluster's context never looks forward). Work is charged to `reserveWork`
+   * in the UTF-16 units measured. */
+  condensedAdvanceUnits(
+    segment: LayoutTextSeg,
+    text: string,
+    start: number,
+    grid: DocGridCtx | undefined,
+    reserveWork: (utf16Units: number) => void,
+  ): CondensedAdvanceUnits | undefined {
+    if (!condensedSpacingMayFloor(segment, grid, this.scale)) return undefined;
+    if (segment.text.slice(start, start + text.length) !== text) {
+      throw new Error('Condensed advance units do not match their segment text range');
+    }
+    // The segment's adjustment table (built and charged once, then reused by
+    // every probe and by segAdvanceWidth).
+    const adjustmentPx = condensedCharacterAdjustments(segment, grid, this.scale, reserveWork);
+    // Measurement without the vertical capability (intrinsic table widths)
+    // already measures vertical text horizontally; keep that authority.
+    if (segment.verticalRun && this.verticalGlyphMeasurement) {
+      // Upper bound of the planner's measured UTF-16 units: per-character
+      // routing probes plus bounded-context sideways graphemes.
+      reserveWork(VERTICAL_PLAN_WORK_PER_UNIT * text.length);
+      const gridPx = segmentCharacterGridDeltaPx(segment, grid, this.scale);
+      const cells = this.verticalGlyphMeasurement.planRun({
+        text,
+        font: this.fontForSegment(segment),
+        fontKerning: this.segmentKerning(segment),
+        fontSizePt: calcEffectiveFontPx(segment, this.scale),
+        letterSpacingPt: segLetterSpacingPx(segment, grid, this.scale),
+        characterGridDeltaPt: gridPx,
+        charScale: charScaleFactor(segment),
+        growTrRotateInk: true,
+        writingMode: 'vertical-rl',
+        characterAdjustmentPt: (from: number, to: number) => adjustmentPx(start + from, start + to),
+      });
+      return {
+        kind: 'vertical-cells',
+        cells: cells.map((cell) => ({
+          text: text.slice(cell.range.start, cell.range.end),
+          advancePx: cell.advancePt,
+          ...(cell.floored ? { floored: true } : {}),
+        })),
+      };
+    }
+    if (start === 0) {
+      let whole = this.condensedClusterCache.get(segment);
+      if (!whole || whole.text !== segment.text) {
+        whole = { text: segment.text, clusters: this.contextualClusters(segment, 0, segment.text.length, reserveWork) };
+        this.condensedClusterCache.set(segment, whole);
+      }
+      let end = 0;
+      const clusters: NaturalClusterAdvance[] = [];
+      for (const cluster of whole.clusters) {
+        if (end + cluster.text.length > text.length) break;
+        clusters.push(cluster);
+        end += cluster.text.length;
+      }
+      if (end === text.length) {
+        reserveWork(clusters.length);
+        return { kind: 'natural-clusters', clusters };
+      }
+    }
+    return {
+      kind: 'natural-clusters',
+      clusters: this.contextualClusters(segment, start, start + text.length, reserveWork),
+    };
+  }
+
+  private readonly condensedClusterCache = new WeakMap<
+    LayoutTextSeg,
+    Readonly<{ text: string; clusters: readonly NaturalClusterAdvance[] }>
+  >();
+
+  private contextualClusters(
+    segment: LayoutTextSeg,
+    start: number,
+    end: number,
+    reserveWork: (utf16Units: number) => void,
+  ): readonly NaturalClusterAdvance[] {
+    return contextualGraphemeAdvances(
+      segment, start, end, calcEffectiveFontPx(segment, this.scale),
+      (text) => this.measureRunText(segment, text).width,
+      reserveWork,
+    );
   }
 
   measureRunText(segment: LayoutTextSeg, text: string): TextMetrics {

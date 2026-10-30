@@ -327,6 +327,38 @@ describe('run charSpacing/charScale reach the painted glyphs on every branch', (
     expect(ka - e).toBeCloseTo((22 + 20) / 2, 5);
   });
 
+  it('vertical tbRl path: over-condensed cells floor at zero and run2 stays flush (#1975)', async () => {
+    // WORD_CONDENSED_SPACING_ADVANCE_FLOOR: 20px cells at -30 pitch advance 0,
+    // so run1's cells stack and run2's pen (= run1 measuredWidth = 0) starts on
+    // them. Measurement sums the same planned cells paint draws.
+    const fills = await render(
+      [para([textRun('あいうえ', { charSpacing: -30 }), textRun('かき')])],
+      section({ textDirection: 'tbRl' }),
+    );
+    const [a, i, u, e, ka, ki] = glyphCenters(fills, ['あ', 'い', 'う', 'え', 'か', 'き']);
+    expect(i - a).toBeCloseTo(0, 5);
+    expect(u - i).toBeCloseTo(0, 5);
+    expect(e - u).toBeCloseTo(0, 5);
+    expect(ka - e).toBeCloseTo(10, 5);
+    expect(ki - ka).toBeCloseTo(20, 5);
+  });
+
+  it('vertical tbRl path: balanced spaces floor with their width adjustment (#1975)', async () => {
+    // §17.15.3.3 width balance is part of each floored cell's advance: two
+    // over-condensed balanced spaces advance zero, never a negative total.
+    const { canvas, fills } = makeRecordingCanvas();
+    const model = {
+      ...doc(
+        [para([textRun('あ'), textRun('  ', { charSpacing: -30 }), textRun('い')])],
+        section({ textDirection: 'tbRl' }),
+      ),
+      settings: { balanceSingleByteDoubleByteWidth: true },
+    } as DocxDocumentModel;
+    await renderDocumentToCanvas(model, canvas, 0, { dpr: 1, width: 600 });
+    const [a, i] = glyphCenters(fills, ['あ', 'い']);
+    expect(i - a).toBeCloseTo(20, 5);
+  });
+
   it('vertical tbRl path: w:w scales the along-column advance (measure==paint)', async () => {
     // §17.3.2.43 w:w in the rotate-layout vertical engine: the layout kernel is
     // direction-agnostic and has always scaled the LINE-AXIS advance by w:w

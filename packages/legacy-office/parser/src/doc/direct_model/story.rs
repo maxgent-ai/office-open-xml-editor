@@ -671,7 +671,17 @@ fn resolve_table_cell_shading(
                 cell.shading = match cell.prepared_shading.take() {
                     None | Some(table::PreparedCellShading::StyleDeferred) => style,
                     Some(table::PreparedCellShading::Explicit(value)) => Some(value),
-                    Some(table::PreparedCellShading::Unsupported) => {
+                    Some(table::PreparedCellShading::CompatibilityAuto)
+                        if style
+                            .as_ref()
+                            .is_none_or(|style| style.is_clear_auto_background()) =>
+                    {
+                        style
+                    }
+                    Some(
+                        table::PreparedCellShading::CompatibilityAuto
+                        | table::PreparedCellShading::Unsupported,
+                    ) => {
                         formatting.unsupported_table_properties = true;
                         None
                     }
@@ -3495,6 +3505,53 @@ mod tests {
         );
 
         assert_eq!(projected.backgrounds, [Some("0000ff".into())]);
+        assert!(!projected.unsupported_table);
+    }
+
+    #[test]
+    fn native_story_admits_compatibility_auto_fallback_only_where_style_has_no_fill() {
+        // Clear patterns over an automatic background, canonical ShdAuto first.
+        let auto = [10, 0, 0, 0, 255, 0, 0, 0, 255, 0, 0];
+        let rgb_foreground_auto = [10, 0x12, 0x34, 0x56, 0, 0, 0, 0, 255, 0, 0];
+        let raw_nil = [10, 255, 255, 255, 255, 255, 255, 255, 255, 0, 0];
+        let project = |compatibility: &[u8], raw: &[u8], shading| {
+            project_table(
+                "a\u{7}\u{7}\r",
+                &[
+                    (0, 2, cell()),
+                    (
+                        2,
+                        3,
+                        row_cells_with_compatibility_and_raw(0, 1, compatibility, raw),
+                    ),
+                    (3, 4, Vec::new()),
+                ],
+                StyleFixture {
+                    shading,
+                    modern_raw: true,
+                    ..StyleFixture::default()
+                },
+            )
+        };
+
+        // Without a style fill both precedence readings give no fill.
+        for compatibility in [&auto, &rgb_foreground_auto] {
+            let projected = project(compatibility, &raw_nil, ShadingFixture::None);
+            assert_eq!(projected.backgrounds, [None]);
+            assert!(!projected.unsupported_table);
+        }
+        // Over a style fill, Word's precedence is unverified: stay refused.
+        for shading in [ShadingFixture::Unconditional, ShadingFixture::Conditional] {
+            let projected = project(&auto, &raw_nil, shading);
+            assert!(projected.unsupported_table);
+        }
+        // An explicit Raw value never consults the compatibility entry.
+        let projected = project(
+            &auto,
+            &cell_shading([0xff, 0, 0]),
+            ShadingFixture::Unconditional,
+        );
+        assert_eq!(projected.backgrounds, [Some("ff0000".into())]);
         assert!(!projected.unsupported_table);
     }
 

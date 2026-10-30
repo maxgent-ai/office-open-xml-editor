@@ -580,7 +580,9 @@ function processImageSegment(context: BreakOpportunityIteratorContext, seg: Layo
  * measurement path preserves ordinary TOC/field allocation, while callers leave
  * oversized cells in the queue for normal legal-break and emergency fitting. */
 function commitAlignedTabCell(context: BreakOpportunityIteratorContext): void {
-  const { breakerState, scale, addToLine, measureText, verticalInkExtra, characterGrid } = context;
+  const {
+    breakerState, scale, addToLine, measureText, verticalInkExtra, characterGrid, measurement,
+  } = context;
   while (breakerState.queue.length > 0) {
     const q = breakerState.queue.peek()!;
     if ('isTab' in q || 'lineBreak' in q) break;
@@ -595,8 +597,13 @@ function commitAlignedTabCell(context: BreakOpportunityIteratorContext): void {
       const m = measureText(q);
       // #1014 — fold the vo=Tr ink deficit into the committed advance too.
       // The same-line WORD_EAST_ASIAN_AUTO_SPACE gap is part of the cell.
-      const w = segAdvanceWidth(q, m.width + verticalInkExtra(q, q.text), characterGrid, scale)
-        + leadingAutoSpacePx(context, q);
+      const w = segAdvanceWidth(
+        q,
+        m.width + verticalInkExtra(q, q.text),
+        characterGrid,
+        scale,
+        measurement.condensedAdvanceUnits(q, q.text, 0, characterGrid, context.reservePrefixWork),
+      ) + leadingAutoSpacePx(context, q);
       q.measuredWidth = w;
       const asc =
         m.fontBoundingBoxAscent ?? m.actualBoundingBoxAscent ?? q.fontSize * scale * SYNTHETIC_ASCENT_EM;

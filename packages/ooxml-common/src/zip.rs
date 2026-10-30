@@ -594,6 +594,80 @@ fn signed_descriptor_matches(
             .is_some_and(|crc| descriptor_fields_match(data, crc, directory_start, fields))
 }
 
+/// APPNOTE 4.4.3.2: version needed 4.5 marks ZIP64 format extensions.
+const ZIP64_VERSION_NEEDED: u16 = 45;
+
+/// ECMA-376 Part 2, Annex B.2 requires the local and central "version needed
+/// to extract" values to agree. Compatibility policy (#1976): a writer that
+/// reserves a local ZIP64 field before the sizes are known marks that header
+/// 4.5, then fills the real 32-bit sizes and writes a classic central entry.
+/// Unzip, Python's `zipfile`, LibreOffice and Word 16.114 on macOS (no repair
+/// prompt, zero or matching reserved sizes) read that form. Word also ignores
+/// conflicting reserved sizes; keep those excluded as in #1924. The version
+/// field selects nothing here (flags, method, CRC and sizes are compared
+/// separately), so accept only that explained difference:
+/// - the local header says exactly 4.5 and the central entry an older version;
+/// - bit 3 is clear, so the data-descriptor policy above is unchanged;
+/// - neither header uses a ZIP64 sentinel, so every size and offset comes from
+///   the classic fields, which must still equal each other exactly;
+/// - the local extra block holds one complete ZIP64 field of the local form
+///   (APPNOTE 4.5.3: both sizes, 16 bytes) and each reserved size is zero or
+///   equals the central value, so no reader can derive a conflicting size.
+fn local_version_needed_matches(
+    data: &[u8],
+    local: usize,
+    local_extra: NameRange,
+    entry: CentralEntry,
+    fields: CentralEntryFields,
+) -> bool {
+    let (Some(local_version), Some(central_version)) =
+        (le_u16(data, local + 4), le_u16(data, entry.header + 6))
+    else {
+        return false;
+    };
+    if local_version == central_version {
+        return true;
+    }
+    let classic_central = [20, 24, 42]
+        .into_iter()
+        .all(|field| le_u32(data, entry.header + field).is_some_and(|v| v != u32::MAX))
+        && le_u16(data, entry.header + 34).is_some_and(|disk| disk != u16::MAX);
+    let classic_local = [18, 22]
+        .into_iter()
+        .all(|field| le_u32(data, local + field).is_some_and(|v| v != u32::MAX));
+    if local_version != ZIP64_VERSION_NEEDED
+        || central_version >= ZIP64_VERSION_NEEDED
+        || fields.flags & (1 << 3) != 0
+        || !classic_central
+        || !classic_local
+    {
+        return false;
+    }
+    let mut cursor = local_extra.start;
+    let end = local_extra.start + local_extra.len;
+    let mut zip64 = None;
+    while cursor < end {
+        let (Some(id), Some(size)) = (le_u16(data, cursor), le_u16(data, cursor + 2)) else {
+            return false;
+        };
+        let value = cursor + 4;
+        cursor = value + usize::from(size);
+        if cursor > end {
+            return false;
+        }
+        if id == ZIP64_EXTRA_FIELD_ID && zip64.replace((value, size)).is_some() {
+            return false;
+        }
+    }
+    let Some((value, 16)) = zip64 else {
+        return false;
+    };
+    let reserved_or_equal =
+        |at: usize, size: u64| le_u64(data, at).is_some_and(|v| v == 0 || v == size);
+    reserved_or_equal(value, fields.uncompressed_size)
+        && reserved_or_equal(value + 8, fields.compressed_size)
+}
+
 fn validate_local_entry(
     data: &[u8],
     directory: CentralDirectory,
@@ -612,10 +686,14 @@ fn validate_local_entry(
     let local_name_start = local.checked_add(30)?;
     let local_extra_start = local_name_start.checked_add(local_name_len)?;
     let data_start = local_extra_start.checked_add(local_extra_len)?;
+    let local_extra = NameRange {
+        start: local_extra_start,
+        len: local_extra_len,
+    };
     if data_start > directory.start
         || data.get(local_name_start..local_extra_start)
             != data.get(entry.name.start..entry.name.start + entry.name.len)
-        || le_u16(data, local + 4) != le_u16(data, entry.header + 6)
+        || !local_version_needed_matches(data, local, local_extra, entry, fields)
         || le_u16(data, local + 6) != Some(fields.flags)
         || le_u16(data, local + 8) != Some(fields.compression_method)
     {
@@ -664,10 +742,6 @@ fn validate_local_entry(
             return None;
         }
     } else {
-        let local_extra = NameRange {
-            start: local_extra_start,
-            len: local_extra_len,
-        };
         let (local_compressed, local_uncompressed) = local_entry_sizes(
             data,
             local_extra,
@@ -2244,6 +2318,157 @@ mod tests {
                 assert_eq!(actual, body);
             }
         }
+    }
+
+    /// One Stored `word/document.xml` entry whose local header says
+    /// `local_version` and carries `local_extra`; the central entry says
+    /// `central_version` and has no extra field. With `descriptor`, bit 3 is set
+    /// and the CRC and sizes move to a signed data descriptor.
+    fn local_version_zip(
+        body: &[u8],
+        local_version: u16,
+        central_version: u16,
+        local_extra: &[u8],
+        descriptor: bool,
+    ) -> Vec<u8> {
+        const NAME: &[u8] = b"word/document.xml";
+        let crc = crc32fast::hash(body);
+        let size = body.len() as u32;
+        let flags: u16 = if descriptor { 1 << 3 } else { 0 };
+        let local_fields = if descriptor {
+            [0; 3]
+        } else {
+            [crc, size, size]
+        };
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&LOCAL_FILE_HEADER_SIGNATURE.to_le_bytes());
+        bytes.extend_from_slice(&local_version.to_le_bytes());
+        bytes.extend_from_slice(&flags.to_le_bytes());
+        bytes.extend_from_slice(&[0; 6]);
+        for field in local_fields {
+            bytes.extend_from_slice(&field.to_le_bytes());
+        }
+        bytes.extend_from_slice(&(NAME.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(&(local_extra.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(NAME);
+        bytes.extend_from_slice(local_extra);
+        bytes.extend_from_slice(body);
+        if descriptor {
+            bytes.extend_from_slice(&0x0807_4b50u32.to_le_bytes());
+            for field in [crc, size, size] {
+                bytes.extend_from_slice(&field.to_le_bytes());
+            }
+        }
+
+        let central_offset = bytes.len() as u32;
+        bytes.extend_from_slice(&CENTRAL_DIRECTORY_HEADER_SIGNATURE.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&central_version.to_le_bytes());
+        bytes.extend_from_slice(&flags.to_le_bytes());
+        bytes.extend_from_slice(&[0; 6]);
+        for field in [crc, size, size] {
+            bytes.extend_from_slice(&field.to_le_bytes());
+        }
+        bytes.extend_from_slice(&(NAME.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(&[0; 12]);
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(NAME);
+        let central_size = bytes.len() as u32 - central_offset;
+        append_classic_eocd(&mut bytes, central_offset, central_size, 1, &[]);
+        bytes
+    }
+
+    fn zip64_local_field(uncompressed: u64, compressed: u64) -> Vec<u8> {
+        let mut field = ZIP64_EXTRA_FIELD_ID.to_le_bytes().to_vec();
+        field.extend_from_slice(&16u16.to_le_bytes());
+        field.extend_from_slice(&uncompressed.to_le_bytes());
+        field.extend_from_slice(&compressed.to_le_bytes());
+        field
+    }
+
+    #[test]
+    fn compatibility_accepts_reserved_zip64_local_field_with_classic_central_entry() {
+        let body = b"reserved ZIP64 local field";
+        let size = body.len() as u64;
+        // Unrelated extra fields may surround the ZIP64 field.
+        let mut surrounded = vec![0x55, 0x54, 5, 0, 1, 0, 0, 0, 0];
+        surrounded.extend_from_slice(&zip64_local_field(0, 0));
+        surrounded.extend_from_slice(&[0x99, 0x99, 0, 0]);
+        for (central_version, extra) in [
+            (20, zip64_local_field(0, 0)),
+            (20, zip64_local_field(size, size)),
+            (20, zip64_local_field(size, 0)),
+            (20, zip64_local_field(0, size)),
+            (10, zip64_local_field(0, 0)),
+            (20, surrounded),
+        ] {
+            let bytes = local_version_zip(body, 45, central_version, &extra, false);
+            let mut archive = open_validated_zip(bytes)
+                .unwrap_or_else(|error| panic!("central {central_version} {extra:?}: {error}"));
+            let mut actual = Vec::new();
+            archive
+                .by_index(0)
+                .unwrap()
+                .read_to_end(&mut actual)
+                .unwrap();
+            assert_eq!(actual, body);
+        }
+    }
+
+    #[test]
+    fn compatibility_rejects_unexplained_version_needed_mismatches() {
+        let body = b"version needed mismatch";
+        let size = body.len() as u64;
+        let reserved = zip64_local_field(0, 0);
+        let mut long_field = ZIP64_EXTRA_FIELD_ID.to_le_bytes().to_vec();
+        long_field.extend_from_slice(&28u16.to_le_bytes());
+        long_field.extend_from_slice(&[0; 28]);
+        let mut short_field = ZIP64_EXTRA_FIELD_ID.to_le_bytes().to_vec();
+        short_field.extend_from_slice(&8u16.to_le_bytes());
+        short_field.extend_from_slice(&[0; 8]);
+        let mut duplicate = reserved.clone();
+        duplicate.extend_from_slice(&reserved);
+        let mut truncated = reserved.clone();
+        truncated.extend_from_slice(&[0x99, 0x99, 8, 0]);
+        for (case, local_version, central_version, extra) in [
+            (
+                "conflicting uncompressed",
+                45,
+                20,
+                zip64_local_field(size + 1, 0),
+            ),
+            (
+                "conflicting compressed",
+                45,
+                20,
+                zip64_local_field(0, size + 1),
+            ),
+            ("no ZIP64 field", 45, 20, Vec::new()),
+            ("long ZIP64 field", 45, 20, long_field),
+            ("short ZIP64 field", 45, 20, short_field),
+            ("duplicate ZIP64 field", 45, 20, duplicate),
+            ("truncated extra block", 45, 20, truncated),
+            ("local newer than 4.5", 46, 20, reserved.clone()),
+            ("central also ZIP64", 45, 46, reserved.clone()),
+            ("local older than central", 20, 45, reserved.clone()),
+            ("plain mismatch", 20, 10, Vec::new()),
+        ] {
+            let bytes = local_version_zip(body, local_version, central_version, &extra, false);
+            assert!(preflight_archive_limits(&bytes).is_err(), "{case}");
+        }
+
+        // The data-descriptor policy stays as it is.
+        let descriptor = local_version_zip(body, 45, 20, &reserved, true);
+        assert!(preflight_archive_limits(&descriptor).is_err());
+        assert!(preflight_archive_limits(&local_version_zip(body, 20, 20, &[], true)).is_ok());
+
+        // A local 32-bit sentinel takes its size from the ZIP64 field, which then
+        // really is needed; keep requiring the same version in that case.
+        let mut sentinel = local_version_zip(body, 45, 20, &zip64_local_field(size, size), false);
+        sentinel[18..26].fill(0xff);
+        assert!(preflight_archive_limits(&sentinel).is_err());
+        sentinel[4..6].copy_from_slice(&20u16.to_le_bytes());
+        assert!(preflight_archive_limits(&sentinel).is_ok());
     }
 
     #[test]

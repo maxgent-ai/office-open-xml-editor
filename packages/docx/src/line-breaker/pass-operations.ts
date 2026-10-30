@@ -42,6 +42,7 @@ import {
   leadingAutoSpacePx,
   segLetterSpacingPx,
   charSpacingDeltaPx,
+  type CondensedAdvanceUnits,
   protectedNoBreakOffsets,
   hardJoinPrefixEnd,
   legalTextSplitAtOrBefore,
@@ -1175,7 +1176,20 @@ export function performSegNaturalAdvance(
     measureText(s).width + verticalInkExtra(s, s.text),
     characterGrid,
     scale,
+    condensedNaturalClusters(operationState, s, s.text),
   ) + leadingAutoSpacePx(operationState, s);
+}
+
+/** WORD_CONDENSED_SPACING_ADVANCE_FLOOR units for `text` (a slice of `s` at
+ * `start`), only when the segment can reach the zero floor. */
+function condensedNaturalClusters(
+  operationState: Pick<PassOperationState, 'measurement' | 'characterGrid' | 'reservePrefixWork'>,
+  s: LayoutTextSeg,
+  text: string,
+  start = 0,
+): CondensedAdvanceUnits | undefined {
+  const { measurement, characterGrid, reservePrefixWork } = operationState;
+  return measurement.condensedAdvanceUnits(s, text, start, characterGrid, reservePrefixWork);
 }
 
 /** The committed line's last item is text: a following segment's automatic
@@ -1256,6 +1270,7 @@ export function performStrNaturalAdvance(
       shaped.advancePt + verticalInkExtra(s, text),
       characterGrid,
       scale,
+      condensedNaturalClusters(operationState, s, text, Math.max(0, start)),
     ) + leading;
   }
   const natural = measurement.measureRunText(s, text).width;
@@ -1264,6 +1279,7 @@ export function performStrNaturalAdvance(
     natural + verticalInkExtra(s, text),
     characterGrid,
     scale,
+    condensedNaturalClusters(operationState, s, text, Math.max(0, start)),
   ) + leading;
 }
 
@@ -1584,6 +1600,7 @@ export function performTextSegmentBox(
     measured.width + verticalInkExtra(s, s.text),
     characterGrid,
     scale,
+    condensedNaturalClusters(operationState, s, s.text),
   ) + leadingAutoSpacePx(operationState, s);
   s.snapGridNaturalWidthPx = width;
   // Max-content uses the unbroken native context, as its ordinary intrinsic

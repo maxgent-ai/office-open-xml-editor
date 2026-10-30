@@ -26,6 +26,9 @@
     const width = 1280;
     const height = 720;
     const dpr = 1;
+    // Freeze panes are a caller option (the viewer passes the sheet's pane).
+    const freezeRows = Math.max(0, parseInt(params.get('freezeRows') ?? '0', 10));
+    const freezeCols = Math.max(0, parseInt(params.get('freezeCols') ?? '0', 10));
     try {
       const resp = await fetch(`/${name}.xlsx`);
       if (!resp.ok) throw new Error(`fetch ${name}.xlsx -> ${resp.status}`);
@@ -41,11 +44,11 @@
 
       const renderers = { math, threeD, regionMap, chartEx };
       const main = await XlsxWorkbook.load(buf.slice(0), { fonts: [googleFonts()], ...renderers });
-      paint('main-canvas', await main.renderViewportToBitmap(sheet, viewport, { width, height, dpr }));
+      paint('main-canvas', await main.renderViewportToBitmap(sheet, viewport, { width, height, dpr, freezeRows, freezeCols }));
       main.destroy();
 
       const wk = await XlsxWorkbook.load(buf.slice(0), { mode: 'worker', fonts: [googleFonts()], ...renderers });
-      paint('worker-canvas', await wk.renderViewportToBitmap(sheet, viewport, { width, height, dpr }));
+      paint('worker-canvas', await wk.renderViewportToBitmap(sheet, viewport, { width, height, dpr, freezeRows, freezeCols }));
 
       // Exercises the worker `parseSheet` round-trip that getWorksheet /
       // resolveValidationList depend on. Rendering uses the worker's internal
